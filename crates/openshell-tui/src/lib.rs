@@ -20,12 +20,13 @@ use crossterm::terminal::{
 use miette::{IntoDiagnostic, Result};
 use openshell_bootstrap::list_gateways_with_source;
 use openshell_core::auth::EdgeAuthInterceptor;
-use openshell_core::metadata::{ObjectId, ObjectLabels, ObjectName};
+use openshell_core::metadata::{ObjectId, ObjectLabels, ObjectName, ObjectWorkspace};
 use openshell_core::proto::SandboxPhase;
 use openshell_core::proto::open_shell_client::OpenShellClient;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use tokio::sync::mpsc;
+use tonic::Code;
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
 
 use app::{App, Focus, GatewayEntry, LogLine, Screen};
@@ -33,6 +34,9 @@ use event::{Event, EventHandler};
 
 /// Duration to show the splash screen before auto-dismissing.
 const SPLASH_DURATION: Duration = Duration::from_secs(3);
+const PROVIDER_PROFILE_SCOPE_WORKSPACE: &str = "workspace";
+
+type ProviderProfileCache = HashMap<(String, String), openshell_core::proto::ProviderProfile>;
 
 // Re-export for use by the CLI crate.
 pub use theme::ThemeMode;
@@ -47,6 +51,7 @@ pub async fn run(
     interceptor: EdgeAuthInterceptor,
     gateway_name: &str,
     endpoint: &str,
+    workspace: &str,
     theme_mode: ThemeMode,
 ) -> Result<()> {
     // Detect theme *before* entering raw/alternate-screen mode.
@@ -59,6 +64,7 @@ pub async fn run(
         client,
         gateway_name.to_string(),
         endpoint.to_string(),
+        workspace.to_string(),
         detected_theme,
     );
 
@@ -72,6 +78,7 @@ pub async fn run(
 
     let mut events = EventHandler::new(Duration::from_secs(2));
 
+    fetch_providers_v2_setting(&mut app).await;
     refresh_gateway_list(&mut app);
     refresh_data(&mut app).await;
 
@@ -157,6 +164,11 @@ pub async fn run(
                     app.pending_draft_approve_all = false;
                     let snapshot = std::mem::take(&mut app.approve_all_confirm_chunks);
                     spawn_draft_approve_all(&app, snapshot, events.sender());
+                }
+                if app.pending_workspace_refresh {
+                    app.pending_workspace_refresh = false;
+                    refresh_providers(&mut app).await;
+                    refresh_sandboxes(&mut app).await;
                 }
             }
             Some(Event::LogLines(lines)) => {
@@ -343,7 +355,7 @@ pub async fn run(
                             h.abort();
                         }
                         match result {
-                            Some(Ok(name)) => {
+                            Some(Ok((name, create_workspace))) => {
                                 app.create_form = None;
                                 let ports = std::mem::take(&mut app.pending_forward_ports);
                                 let command = std::mem::take(&mut app.pending_exec_command);
@@ -368,6 +380,7 @@ pub async fn run(
                                         &mut events,
                                         &name,
                                         &command,
+                                        &create_workspace,
                                     )
                                     .await?;
                                 }
@@ -487,7 +500,10 @@ async fn handle_gateway_switch(app: &mut App) {
             app.gateway_name = name;
             app.endpoint = endpoint;
             app.reset_sandbox_state();
-            // Immediately refresh data for the new gateway.
+            // Re-fetch the providers_v2 capability for the new gateway
+            // before refreshing data, so provider CRUD controls reflect
+            // the correct mode.
+            fetch_providers_v2_setting(app).await;
             refresh_data(app).await;
         }
         Err(e) => {
@@ -625,6 +641,7 @@ fn spawn_log_stream(app: &mut App, tx: mpsc::UnboundedSender<Event>) {
     };
 
     let mut client = app.client.clone();
+    let workspace = app.selected_sandbox_workspace();
 
     let handle = tokio::spawn(async move {
         // Phase 1: Fetch initial history via unary RPC.
@@ -634,6 +651,7 @@ fn spawn_log_stream(app: &mut App, tx: mpsc::UnboundedSender<Event>) {
             since_ms: 0,
             sources: vec![],
             min_level: String::new(),
+            workspace,
         };
 
         match tokio::time::timeout(Duration::from_secs(5), client.get_sandbox_logs(req)).await {
@@ -734,7 +752,10 @@ async fn handle_sandbox_delete(app: &mut App) {
         );
     }
 
-    let req = openshell_core::proto::DeleteSandboxRequest { name: sandbox_name };
+    let req = openshell_core::proto::DeleteSandboxRequest {
+        name: sandbox_name,
+        workspace: app.selected_sandbox_workspace(),
+    };
     match app.client.delete_sandbox(req).await {
         Ok(_) => {
             app.cancel_log_stream();
@@ -766,6 +787,7 @@ async fn fetch_sandbox_detail(app: &mut App) {
 
     let req = openshell_core::proto::GetSandboxRequest {
         name: sandbox_name.clone(),
+        workspace: app.selected_sandbox_workspace(),
     };
 
     // Step 1: Fetch sandbox metadata (providers, sandbox ID).
@@ -851,6 +873,7 @@ async fn handle_shell_connect(
     let sandbox_id = {
         let req = openshell_core::proto::GetSandboxRequest {
             name: sandbox_name.clone(),
+            workspace: app.selected_sandbox_workspace(),
         };
         match tokio::time::timeout(Duration::from_secs(5), app.client.get_sandbox(req)).await {
             Ok(Ok(resp)) => {
@@ -1001,11 +1024,13 @@ async fn handle_exec_command(
     events: &mut EventHandler,
     sandbox_name: &str,
     command: &str,
+    workspace: &str,
 ) -> Result<()> {
     // Step 1: Resolve sandbox → SSH session (same as handle_shell_connect).
     let sandbox_id = {
         let req = openshell_core::proto::GetSandboxRequest {
             name: sandbox_name.to_string(),
+            workspace: workspace.to_string(),
         };
         match tokio::time::timeout(Duration::from_secs(5), app.client.get_sandbox(req)).await {
             Ok(Ok(resp)) => {
@@ -1347,6 +1372,7 @@ fn spawn_create_sandbox(app: &mut App, tx: mpsc::UnboundedSender<Event>) {
     let endpoint = app.endpoint.clone();
     let gateway_name = app.gateway_name.clone();
     let need_ready = !ports.is_empty() || !app.pending_exec_command.is_empty();
+    let workspace = app.current_workspace.clone();
 
     tokio::spawn(async move {
         let has_custom_image = !image.is_empty();
@@ -1379,6 +1405,8 @@ fn spawn_create_sandbox(app: &mut App, tx: mpsc::UnboundedSender<Event>) {
                 ..Default::default()
             }),
             labels: HashMap::new(),
+            annotations: HashMap::new(),
+            workspace: workspace.clone(),
         };
 
         let sandbox_name =
@@ -1419,6 +1447,7 @@ fn spawn_create_sandbox(app: &mut App, tx: mpsc::UnboundedSender<Event>) {
 
                 let req = openshell_core::proto::GetSandboxRequest {
                     name: sandbox_name.clone(),
+                    workspace: workspace.clone(),
                 };
                 // Retry on transient errors.
                 if let Ok(resp) = client.get_sandbox(req).await
@@ -1453,7 +1482,7 @@ fn spawn_create_sandbox(app: &mut App, tx: mpsc::UnboundedSender<Event>) {
             }
         }
 
-        let _ = tx.send(Event::CreateResult(Ok(sandbox_name)));
+        let _ = tx.send(Event::CreateResult(Ok((sandbox_name, workspace))));
     });
 }
 
@@ -1625,6 +1654,12 @@ fn spawn_create_provider(app: &App, tx: mpsc::UnboundedSender<Event>) {
         form.name.clone()
     };
     let credentials = form.discovered_credentials.clone().unwrap_or_default();
+    let workspace = app.current_workspace.clone();
+    let config: HashMap<String, String> = form
+        .config
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
 
     tokio::spawn(async move {
         // Try with the chosen name, retry with suffix on collision.
@@ -1643,12 +1678,18 @@ fn spawn_create_provider(app: &App, tx: mpsc::UnboundedSender<Event>) {
                         created_at_ms: 0,
                         labels: HashMap::new(),
                         resource_version: 0,
+                        annotations: HashMap::new(),
+                        workspace: workspace.clone(),
+                        deletion_timestamp_ms: 0,
                     }),
                     r#type: ptype.clone(),
                     credentials: credentials.clone(),
-                    config: HashMap::default(),
+                    config: config.clone(),
                     credential_expires_at_ms: HashMap::default(),
+                    profile_workspace: workspace.clone(),
+                    credential_handles: HashMap::default(),
                 }),
+                workspace: workspace.clone(),
             };
 
             match client.create_provider(req).await {
@@ -1664,7 +1705,7 @@ fn spawn_create_provider(app: &App, tx: mpsc::UnboundedSender<Event>) {
                     let _ = tx.send(Event::ProviderCreateResult(Ok(final_name)));
                     return;
                 }
-                Err(status) if status.code() == tonic::Code::AlreadyExists => {
+                Err(status) if status.code() == Code::AlreadyExists => {
                     // Retry with a different name.
                 }
                 Err(e) => {
@@ -1686,9 +1727,10 @@ fn spawn_get_provider(app: &App, tx: mpsc::UnboundedSender<Event>) {
         Some(n) => n.to_string(),
         None => return,
     };
+    let workspace = app.selected_provider_workspace();
 
     tokio::spawn(async move {
-        let req = openshell_core::proto::GetProviderRequest { name };
+        let req = openshell_core::proto::GetProviderRequest { name, workspace };
         match tokio::time::timeout(Duration::from_secs(5), client.get_provider(req)).await {
             Ok(Ok(resp)) => {
                 if let Some(provider) = resp.into_inner().provider {
@@ -1722,10 +1764,25 @@ fn spawn_update_provider(app: &App, tx: mpsc::UnboundedSender<Event>) {
     let ptype = form.provider_type.clone();
     let cred_key = form.credential_key.clone();
     let new_value = form.new_value.clone();
+    let workspace = app.selected_provider_workspace();
+    let mut config: HashMap<String, String> = form
+        .config
+        .iter()
+        .filter(|(k, v)| form.original_config.get(*k) != Some(*v))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    form.original_config
+        .keys()
+        .filter(|k| !form.config.contains_key(*k))
+        .for_each(|key| {
+            config.insert(key.clone(), String::new());
+        });
 
     tokio::spawn(async move {
         let mut credentials = HashMap::new();
-        credentials.insert(cred_key, new_value);
+        if !new_value.is_empty() {
+            credentials.insert(cred_key, new_value);
+        }
 
         let req = openshell_core::proto::UpdateProviderRequest {
             provider: Some(openshell_core::proto::Provider {
@@ -1735,13 +1792,19 @@ fn spawn_update_provider(app: &App, tx: mpsc::UnboundedSender<Event>) {
                     created_at_ms: 0,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
+                    workspace: workspace.clone(),
+                    deletion_timestamp_ms: 0,
                 }),
                 r#type: ptype,
                 credentials,
-                config: HashMap::default(),
+                config,
                 credential_expires_at_ms: HashMap::default(),
+                profile_workspace: String::new(),
+                credential_handles: HashMap::default(),
             }),
             credential_expires_at_ms: HashMap::default(),
+            workspace,
         };
 
         match tokio::time::timeout(Duration::from_secs(5), client.update_provider(req)).await {
@@ -1767,9 +1830,10 @@ fn spawn_delete_provider(app: &App, tx: mpsc::UnboundedSender<Event>) {
         Some(n) => n.to_string(),
         None => return,
     };
+    let workspace = app.selected_provider_workspace();
 
     tokio::spawn(async move {
-        let req = openshell_core::proto::DeleteProviderRequest { name };
+        let req = openshell_core::proto::DeleteProviderRequest { name, workspace };
         match tokio::time::timeout(Duration::from_secs(5), client.delete_provider(req)).await {
             Ok(Ok(resp)) => {
                 let _ = tx.send(Event::ProviderDeleteResult(Ok(resp.into_inner().deleted)));
@@ -1806,9 +1870,14 @@ fn spawn_draft_approve(app: &App, tx: mpsc::UnboundedSender<Event>) {
         .draft_chunks
         .get(abs)
         .map_or_else(String::new, |c| c.rule_name.clone());
+    let workspace = app.selected_sandbox_workspace();
 
     tokio::spawn(async move {
-        let req = openshell_core::proto::ApproveDraftChunkRequest { name, chunk_id };
+        let req = openshell_core::proto::ApproveDraftChunkRequest {
+            name,
+            chunk_id,
+            workspace,
+        };
         match tokio::time::timeout(Duration::from_secs(5), client.approve_draft_chunk(req)).await {
             Ok(Ok(resp)) => {
                 let inner = resp.into_inner();
@@ -1845,12 +1914,14 @@ fn spawn_draft_reject(app: &App, tx: mpsc::UnboundedSender<Event>) {
         .draft_chunks
         .get(abs)
         .map_or_else(String::new, |c| c.rule_name.clone());
+    let workspace = app.selected_sandbox_workspace();
 
     tokio::spawn(async move {
         let req = openshell_core::proto::RejectDraftChunkRequest {
             name,
             chunk_id,
             reason: String::new(),
+            workspace,
         };
         match tokio::time::timeout(Duration::from_secs(5), client.reject_draft_chunk(req)).await {
             Ok(Ok(_)) => {
@@ -1886,11 +1957,13 @@ fn spawn_draft_approve_all(
         Some(n) => n.to_string(),
         None => return,
     };
+    let workspace = app.selected_sandbox_workspace();
 
     tokio::spawn(async move {
         let req = openshell_core::proto::ApproveAllDraftChunksRequest {
             name,
             include_security_flagged: false,
+            workspace,
         };
         match tokio::time::timeout(
             Duration::from_secs(30),
@@ -1929,132 +2002,253 @@ fn spawn_draft_approve_all(
 // Data refresh
 // ---------------------------------------------------------------------------
 
+async fn fetch_providers_v2_setting(app: &mut App) {
+    let req = openshell_core::proto::GetGatewayConfigRequest {};
+    match tokio::time::timeout(Duration::from_secs(5), app.client.get_gateway_config(req)).await {
+        Ok(Ok(resp)) => {
+            let response = resp.into_inner();
+            let enabled = response
+                .settings
+                .get(openshell_core::settings::PROVIDERS_V2_ENABLED_KEY)
+                .and_then(|s| match &s.value {
+                    Some(openshell_core::proto::setting_value::Value::BoolValue(v)) => Some(*v),
+                    _ => None,
+                })
+                .unwrap_or(false);
+            app.providers_v2_enabled = enabled;
+        }
+        Ok(Err(e)) => {
+            app.status_text = format!("failed to fetch gateway config: {}", e.message());
+        }
+        Err(_) => {
+            app.status_text = "gateway config fetch timed out".to_string();
+        }
+    }
+}
+
 async fn refresh_data(app: &mut App) {
     refresh_health(app).await;
     refresh_global_settings(app).await;
+    refresh_workspaces(app).await;
     refresh_providers(app).await;
     refresh_sandboxes(app).await;
 }
 
-async fn refresh_providers(app: &mut App) {
-    let profiles = if app.providers_v2_enabled {
-        let req = openshell_core::proto::ListProviderProfilesRequest {
-            limit: 100,
-            offset: 0,
-        };
-        match tokio::time::timeout(
-            Duration::from_secs(5),
-            app.client.list_provider_profiles(req),
-        )
-        .await
-        {
-            Ok(Ok(resp)) => resp
-                .into_inner()
-                .profiles
-                .into_iter()
-                .map(|profile| (profile.id.clone(), profile))
-                .collect::<HashMap<_, _>>(),
-            Ok(Err(e)) => {
-                app.status_text = format!("failed to list provider profiles: {}", e.message());
-                HashMap::new()
-            }
-            Err(_) => {
-                app.status_text = "list provider profiles timed out".to_string();
-                HashMap::new()
-            }
-        }
-    } else {
-        HashMap::new()
-    };
-
-    let req = openshell_core::proto::ListProvidersRequest {
+async fn refresh_workspaces(app: &mut App) {
+    let req = openshell_core::proto::ListWorkspacesRequest {
         limit: 100,
         offset: 0,
+        label_selector: String::new(),
     };
-    let result = tokio::time::timeout(Duration::from_secs(5), app.client.list_providers(req)).await;
-    match result {
+    match tokio::time::timeout(Duration::from_secs(5), app.client.list_workspaces(req)).await {
+        Ok(Ok(resp)) => {
+            app.workspace_names = resp
+                .into_inner()
+                .workspaces
+                .into_iter()
+                .filter_map(|w| w.metadata.map(|m| m.name))
+                .collect();
+        }
         Ok(Err(e)) => {
-            app.status_text = format!("failed to list providers: {}", e.message());
+            app.status_text = format!("failed to list workspaces: {}", e.message());
         }
         Err(_) => {
-            app.status_text = "list providers timed out".to_string();
-        }
-        Ok(Ok(resp)) => {
-            let providers = resp.into_inner().providers;
-            app.provider_count = providers.len();
-            app.provider_entries = if app.providers_v2_enabled {
-                providers
-                    .iter()
-                    .cloned()
-                    .map(|provider| app::ProviderV2Entry {
-                        profile: profiles.get(&provider.r#type).cloned(),
-                        provider,
-                    })
-                    .collect()
-            } else {
-                Vec::new()
-            };
-            app.provider_names = providers
-                .iter()
-                .map(|p| app::provider_name(p).to_string())
-                .collect();
-            app.provider_types = providers.iter().map(|p| p.r#type.clone()).collect();
-            app.provider_cred_keys = providers
-                .iter()
-                .map(|p| {
-                    p.credentials
-                        .keys()
-                        .next()
-                        .cloned()
-                        .unwrap_or_else(|| "-".to_string())
-                })
-                .collect();
-            if app.provider_selected >= app.provider_count && app.provider_count > 0 {
-                app.provider_selected = app.provider_count - 1;
-            }
+            app.status_text = "list workspaces timed out".to_string();
         }
     }
 }
 
+fn provider_profile_query_workspace(provider: &openshell_core::proto::Provider) -> &str {
+    if provider.profile_workspace.is_empty() {
+        provider.object_workspace()
+    } else {
+        &provider.profile_workspace
+    }
+}
+
+fn provider_profile_cache_workspace<'a>(
+    query_workspace: &'a str,
+    profile: &openshell_core::proto::ProviderProfile,
+) -> &'a str {
+    if profile.scope == PROVIDER_PROFILE_SCOPE_WORKSPACE {
+        query_workspace
+    } else {
+        ""
+    }
+}
+
+fn cache_provider_profile(
+    profiles: &mut ProviderProfileCache,
+    query_workspace: &str,
+    profile: openshell_core::proto::ProviderProfile,
+) {
+    let profile_workspace = provider_profile_cache_workspace(query_workspace, &profile).to_string();
+    profiles.insert((profile_workspace, profile.id.clone()), profile);
+}
+
+fn cached_provider_profile(
+    profiles: &ProviderProfileCache,
+    provider: &openshell_core::proto::Provider,
+) -> Option<openshell_core::proto::ProviderProfile> {
+    let profile_id = provider.r#type.clone();
+    profiles
+        .get(&(
+            provider_profile_query_workspace(provider).to_string(),
+            profile_id.clone(),
+        ))
+        .or_else(|| profiles.get(&(String::new(), profile_id)))
+        .cloned()
+}
+
+async fn refresh_providers(app: &mut App) {
+    let req = openshell_core::proto::ListProvidersRequest {
+        limit: 100,
+        offset: 0,
+        workspace: if app.all_workspaces {
+            String::new()
+        } else {
+            app.current_workspace.clone()
+        },
+        all_workspaces: app.all_workspaces,
+    };
+    let response =
+        match tokio::time::timeout(Duration::from_secs(5), app.client.list_providers(req)).await {
+            Ok(Ok(resp)) => resp.into_inner(),
+            Ok(Err(e)) => {
+                app.status_text = format!("failed to list providers: {}", e.message());
+                return;
+            }
+            Err(_) => {
+                app.status_text = "list providers timed out".to_string();
+                return;
+            }
+        };
+    let providers = response.providers;
+
+    let profiles: ProviderProfileCache = if app.providers_v2_enabled {
+        let workspaces: std::collections::HashSet<String> = providers
+            .iter()
+            .map(|provider| provider_profile_query_workspace(provider).to_string())
+            // Legacy provider records can decode without an object workspace. Do not
+            // turn that missing context into a platform-scoped profile request.
+            .filter(|workspace| !workspace.is_empty())
+            .collect();
+        let mut all_profiles = HashMap::new();
+        for ws in &workspaces {
+            let req = openshell_core::proto::ListProviderProfilesRequest {
+                limit: 100,
+                offset: 0,
+                workspace: ws.clone(),
+            };
+            if let Ok(Ok(resp)) = tokio::time::timeout(
+                Duration::from_secs(5),
+                app.client.list_provider_profiles(req),
+            )
+            .await
+            {
+                for profile in resp.into_inner().profiles {
+                    cache_provider_profile(&mut all_profiles, ws, profile);
+                }
+            }
+        }
+        all_profiles
+    } else {
+        HashMap::new()
+    };
+
+    app.provider_count = providers.len();
+    app.provider_entries = providers
+        .iter()
+        .cloned()
+        .map(|provider| app::ProviderListEntry {
+            profile: cached_provider_profile(&profiles, &provider),
+            provider,
+        })
+        .collect();
+    app.provider_names = providers
+        .iter()
+        .map(|p| app::provider_name(p).to_string())
+        .collect();
+    app.provider_types = providers.iter().map(|p| p.r#type.clone()).collect();
+    app.provider_cred_keys = providers
+        .iter()
+        .map(|p| {
+            p.credentials
+                .keys()
+                .next()
+                .cloned()
+                .unwrap_or_else(|| "-".to_string())
+        })
+        .collect();
+    app.provider_workspaces = providers
+        .iter()
+        .map(|p| p.object_workspace().to_string())
+        .collect();
+    if app.provider_selected >= app.provider_count && app.provider_count > 0 {
+        app.provider_selected = app.provider_count - 1;
+    }
+}
+
 async fn refresh_global_settings(app: &mut App) {
-    let req = openshell_core::proto::GetGatewayConfigRequest {};
-    let result =
-        tokio::time::timeout(Duration::from_secs(5), app.client.get_gateway_config(req)).await;
-    match result {
-        Ok(Err(e)) => {
-            app.status_text = format!("failed to fetch global settings: {}", e.message());
-        }
-        Err(_) => {
-            app.status_text = "get gateway settings timed out".to_string();
-        }
-        Ok(Ok(resp)) => {
-            let inner = resp.into_inner();
-            app.apply_global_settings(inner.settings, inner.settings_revision);
+    if !app.global_settings_access_denied {
+        let req = openshell_core::proto::GetGatewayConfigRequest {};
+        let result =
+            tokio::time::timeout(Duration::from_secs(5), app.client.get_gateway_config(req)).await;
+        match result {
+            Ok(Err(status)) if status.code() == Code::PermissionDenied => {
+                app.deny_global_settings_access();
+            }
+            Ok(Err(status)) => {
+                app.status_text = format!("failed to fetch global settings: {}", status.message());
+            }
+            Err(_) => {
+                app.status_text = "get gateway settings timed out".to_string();
+            }
+            Ok(Ok(resp)) => {
+                let inner = resp.into_inner();
+                app.apply_global_settings(inner.settings, inner.settings_revision);
+            }
         }
     }
 
-    // Check for active global policy.
+    if app.global_policy_access_denied {
+        return;
+    }
+
+    // Check for an active global policy only while the caller can read it.
     let policy_req = openshell_core::proto::ListSandboxPoliciesRequest {
         name: String::new(),
         limit: 1,
         offset: 0,
         global: true,
+        workspace: String::new(),
     };
-    if let Ok(Ok(resp)) = tokio::time::timeout(
+    match tokio::time::timeout(
         Duration::from_secs(5),
         app.client.list_sandbox_policies(policy_req),
     )
     .await
     {
-        let revisions = resp.into_inner().revisions;
-        if let Some(latest) = revisions.first() {
-            let status =
-                openshell_core::proto::PolicyStatus::try_from(latest.status).unwrap_or_default();
-            app.global_policy_active = status == openshell_core::proto::PolicyStatus::Loaded;
-            app.global_policy_version = latest.version;
-        } else {
-            app.global_policy_active = false;
-            app.global_policy_version = 0;
+        Ok(Err(status)) if status.code() == Code::PermissionDenied => {
+            app.deny_global_policy_access();
+        }
+        Ok(Err(status)) => {
+            app.status_text = format!("failed to fetch global policy: {}", status.message());
+        }
+        Err(_) => {
+            app.status_text = "list global policies timed out".to_string();
+        }
+        Ok(Ok(resp)) => {
+            let revisions = resp.into_inner().revisions;
+            if let Some(latest) = revisions.first() {
+                let status = openshell_core::proto::PolicyStatus::try_from(latest.status)
+                    .unwrap_or_default();
+                app.global_policy_active = status == openshell_core::proto::PolicyStatus::Loaded;
+                app.global_policy_version = latest.version;
+            } else {
+                app.global_policy_active = false;
+                app.global_policy_version = 0;
+            }
         }
     }
 }
@@ -2104,13 +2298,11 @@ fn spawn_set_global_setting(app: &App, tx: mpsc::UnboundedSender<Event>) {
 
         let req = UpdateConfigRequest {
             name: String::new(),
-            policy: None,
             setting_key: key,
             setting_value: Some(SettingValue { value: Some(value) }),
-            delete_setting: false,
             global: true,
-            merge_operations: vec![],
-            expected_resource_version: 0,
+            workspace: String::new(),
+            ..Default::default()
         };
 
         let result = tokio::time::timeout(Duration::from_secs(5), client.update_config(req)).await;
@@ -2140,13 +2332,11 @@ fn spawn_delete_global_setting(app: &App, tx: mpsc::UnboundedSender<Event>) {
 
         let req = UpdateConfigRequest {
             name: String::new(),
-            policy: None,
             setting_key: key,
-            setting_value: None,
             delete_setting: true,
             global: true,
-            merge_operations: vec![],
-            expected_resource_version: 0,
+            workspace: String::new(),
+            ..Default::default()
         };
 
         let result = tokio::time::timeout(Duration::from_secs(5), client.update_config(req)).await;
@@ -2178,6 +2368,7 @@ fn spawn_set_sandbox_setting(app: &App, tx: mpsc::UnboundedSender<Event>) {
     let raw = edit.input.trim().to_string();
     let kind = entry.kind;
     let mut client = app.client.clone();
+    let workspace = app.selected_sandbox_workspace();
 
     tokio::spawn(async move {
         use openshell_core::proto::{SettingValue, UpdateConfigRequest, setting_value};
@@ -2210,13 +2401,10 @@ fn spawn_set_sandbox_setting(app: &App, tx: mpsc::UnboundedSender<Event>) {
 
         let req = UpdateConfigRequest {
             name,
-            policy: None,
             setting_key: key,
             setting_value: Some(SettingValue { value: Some(value) }),
-            delete_setting: false,
-            global: false,
-            merge_operations: vec![],
-            expected_resource_version: 0,
+            workspace,
+            ..Default::default()
         };
 
         let result = tokio::time::timeout(Duration::from_secs(5), client.update_config(req)).await;
@@ -2244,19 +2432,17 @@ fn spawn_delete_sandbox_setting(app: &App, tx: mpsc::UnboundedSender<Event>) {
     let name = sandbox_name.to_string();
     let key = entry.key.clone();
     let mut client = app.client.clone();
+    let workspace = app.selected_sandbox_workspace();
 
     tokio::spawn(async move {
         use openshell_core::proto::UpdateConfigRequest;
 
         let req = UpdateConfigRequest {
             name,
-            policy: None,
             setting_key: key,
-            setting_value: None,
             delete_setting: true,
-            global: false,
-            merge_operations: vec![],
-            expected_resource_version: 0,
+            workspace,
+            ..Default::default()
         };
 
         let result = tokio::time::timeout(Duration::from_secs(5), client.update_config(req)).await;
@@ -2299,6 +2485,12 @@ async fn refresh_sandboxes(app: &mut App) {
         limit: 100,
         offset: 0,
         label_selector: String::new(),
+        workspace: if app.all_workspaces {
+            String::new()
+        } else {
+            app.current_workspace.clone()
+        },
+        all_workspaces: app.all_workspaces,
     };
     let result = tokio::time::timeout(Duration::from_secs(5), app.client.list_sandboxes(req)).await;
     match result {
@@ -2375,6 +2567,21 @@ async fn refresh_sandboxes(app: &mut App) {
                 })
                 .collect();
 
+            app.sandbox_annotations = sandboxes
+                .iter()
+                .map(|s| {
+                    s.metadata
+                        .as_ref()
+                        .map(|metadata| app::format_annotations(&metadata.annotations))
+                        .unwrap_or_default()
+                })
+                .collect();
+
+            app.sandbox_workspaces = sandboxes
+                .iter()
+                .map(|s| s.object_workspace().to_string())
+                .collect();
+
             if app.sandbox_selected >= app.sandbox_count && app.sandbox_count > 0 {
                 app.sandbox_selected = app.sandbox_count - 1;
             }
@@ -2432,6 +2639,7 @@ async fn refresh_draft_chunks(app: &mut App) {
     let req = openshell_core::proto::GetDraftPolicyRequest {
         name: sandbox_name,
         status_filter: String::new(),
+        workspace: app.selected_sandbox_workspace(),
     };
 
     if let Ok(Ok(resp)) =
@@ -2452,11 +2660,17 @@ async fn refresh_draft_chunks(app: &mut App) {
 /// badges without entering the sandbox detail view.
 async fn refresh_sandbox_draft_counts(app: &mut App) {
     let names: Vec<String> = app.sandbox_names.clone();
+    let workspaces: Vec<String> = app.sandbox_workspaces.clone();
     let mut counts = vec![0usize; names.len()];
     for (i, name) in names.iter().enumerate() {
+        let ws = workspaces
+            .get(i)
+            .cloned()
+            .unwrap_or_else(|| app.current_workspace.clone());
         let req = openshell_core::proto::GetDraftPolicyRequest {
             name: name.clone(),
             status_filter: "pending".to_string(),
+            workspace: ws,
         };
         if let Ok(Ok(resp)) =
             tokio::time::timeout(Duration::from_secs(2), app.client.get_draft_policy(req)).await
@@ -2473,6 +2687,9 @@ fn phase_label(phase: i32) -> String {
         x if x == SandboxPhase::Ready as i32 => "Ready",
         x if x == SandboxPhase::Error as i32 => "Error",
         x if x == SandboxPhase::Deleting as i32 => "Deleting",
+        x if x == SandboxPhase::Stopping as i32 => "Stopping",
+        x if x == SandboxPhase::Stopped as i32 => "Stopped",
+        x if x == SandboxPhase::Starting as i32 => "Starting",
         _ => "Unknown",
     }
     .to_string()
@@ -2499,6 +2716,18 @@ fn format_age(epoch_ms: i64) -> String {
         format!("{}h {}m", diff / 3600, (diff % 3600) / 60)
     } else {
         format!("{}d {}h", diff / 86400, (diff % 86400) / 3600)
+    }
+}
+
+#[cfg(test)]
+mod phase_label_tests {
+    use super::*;
+
+    #[test]
+    fn phase_label_covers_stop_and_start_lifecycle() {
+        assert_eq!(phase_label(SandboxPhase::Stopping as i32), "Stopping");
+        assert_eq!(phase_label(SandboxPhase::Stopped as i32), "Stopped");
+        assert_eq!(phase_label(SandboxPhase::Starting as i32), "Starting");
     }
 }
 
@@ -2531,4 +2760,65 @@ fn days_to_ymd(days: i64) -> (i64, i64, i64) {
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = if m <= 2 { y + 1 } else { y };
     (y, m, d)
+}
+
+#[cfg(test)]
+mod provider_profile_workspace_tests {
+    use super::*;
+    use openshell_core::proto::datamodel::v1::ObjectMeta;
+    use openshell_core::proto::{Provider, ProviderProfile};
+
+    #[test]
+    fn platform_profile_queries_through_provider_workspace() {
+        let provider = Provider {
+            metadata: Some(ObjectMeta {
+                workspace: "team-a".to_string(),
+                ..ObjectMeta::default()
+            }),
+            profile_workspace: String::new(),
+            ..Provider::default()
+        };
+
+        assert_eq!(provider_profile_query_workspace(&provider), "team-a");
+    }
+
+    #[test]
+    fn cached_profile_round_trip_covers_static_platform_and_workspace_scopes() {
+        let cases = [
+            ("", "", "static profile with platform provider scope"),
+            ("team-a", "", "static profile with workspace provider scope"),
+            ("", "platform", "platform profile"),
+            ("team-a", "workspace", "workspace profile"),
+            (
+                "",
+                "workspace",
+                "legacy provider with empty profile_workspace and workspace-scoped profile",
+            ),
+        ];
+
+        for (provider_workspace, response_scope, label) in cases {
+            let provider = Provider {
+                metadata: Some(ObjectMeta {
+                    workspace: "team-a".to_string(),
+                    ..ObjectMeta::default()
+                }),
+                r#type: "claude-code".to_string(),
+                profile_workspace: provider_workspace.to_string(),
+                ..Provider::default()
+            };
+            let profile = ProviderProfile {
+                id: "claude-code".to_string(),
+                scope: response_scope.to_string(),
+                ..ProviderProfile::default()
+            };
+            let mut profiles = ProviderProfileCache::new();
+
+            cache_provider_profile(&mut profiles, "team-a", profile);
+
+            assert!(
+                cached_provider_profile(&profiles, &provider).is_some(),
+                "{label} did not survive cache insertion and lookup"
+            );
+        }
+    }
 }

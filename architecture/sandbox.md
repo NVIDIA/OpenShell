@@ -32,7 +32,7 @@ only when the set is already empty; any other outcome fails the spawn.
 4. It starts the policy proxy and local SSH server.
 5. It opens a supervisor session back to the gateway for connect, exec, file
    sync, config polling, and log push.
-6. It launches the agent command as the restricted sandbox user.
+6. It launches the agent command as the resolved restricted identity.
 
 ## Isolation Layers
 
@@ -53,7 +53,43 @@ paths, such as proxy support files or GPU device paths when a GPU is present.
 
 All ordinary agent egress is routed through the sandbox proxy. The proxy
 identifies the calling binary, checks trust-on-first-use binary identity, rejects
-unsafe internal destinations, and evaluates the active policy.
+unsafe internal destinations, and evaluates the active policy. On Linux, it
+maps an accepted proxy connection back to the workload socket by matching the
+complete local-to-remote TCP tuple before resolving every process that owns the
+socket inode.
+
+CONNECT and absolute-form forward HTTP are explicit-proxy adapters over the same
+egress pipeline. Each adapter normalizes its request into an egress intent, and
+the shared authorization result carries the process evidence used by destination
+validation and relay selection. During the compatibility migration, endpoint
+state is hydrated at the adapters' existing policy query points; it is not yet
+one atomic, generation-consistent authorization result. Destination validation
+returns an unopened connector so adapters retain their existing response and
+upstream-dial timing. CONNECT prepares a generation-pinned relay context before
+entering shared TLS-terminated or plaintext HTTP relays; non-HTTP traffic uses
+the shared raw byte relay after the existing adapter gates. Forward HTTP retains
+its guarded single-request relay while sharing authorization, request context,
+policy-pinning, and destination boundaries.
+Adapter-specific response and OCSF event shapes remain at the protocol boundary.
+
+Provider credential placeholders are resolved through the live provider state
+for each HTTP request, after destination and L7 policy admission. A static
+credential resolves only when the request host, port, and path match an endpoint
+in that provider's effective profile. CONNECT, absolute-form forward HTTP,
+request targets, headers, supported request bodies, SigV4 signing, and opted-in
+WebSocket text rewriting use the same scoped resolver. Provider refresh swaps
+credential values and endpoint bindings atomically. An invalid or unavailable
+refresh revokes the previous static credential state instead of leaving a
+partially active or last-known-good static set. Invalid metadata preserves the
+supplied dynamic snapshot, while a fetch failure preserves the currently active
+dynamic snapshot.
+
+Route selection and policy evaluation use a syntax-only redacted request target;
+they do not materialize real credentials. Cross-endpoint placeholder use returns
+HTTP 403. After a WebSocket upgrade it closes the connection with policy
+violation code 1008. Both paths emit a denied activity event and a detection
+finding without logging the placeholder, environment key, secret, or query.
+
 For inspected HTTP traffic, the proxy can enforce REST method/path rules,
 WebSocket upgrade and text-message rules, GraphQL operation rules, and
 MCP method, tool, and supported params rules or generic JSON-RPC method rules
@@ -66,6 +102,27 @@ matchers; generic JSON-RPC rules match only the method.
 JSON-RPC responses and server-to-client MCP messages on response or SSE streams
 are relayed but are not currently parsed for policy enforcement.
 
+For admitted HTTP requests, the proxy can run an ordered supervisor middleware
+chain after L7 policy evaluation and before credential injection. Destination
+host selectors choose the chain independently of the network rule that admitted
+the request. Policy-local map keys identify configs, while built-in names or
+operator-owned registration names identify implementations.
+
+Built-ins run in-process against a borrowed view of the chain's current request state. Operator services retain the bounded protobuf/gRPC contract, and the remote adapter materializes an owned evaluation only when the request crosses that transport boundary. `openshell-policy` validates policy-owned structure, and the active middleware registry validates implementation-owned config. The generic registry and chain runner live in `openshell-supervisor-middleware`; first-party implementations live in `openshell-supervisor-middleware-builtins`.
+
+The supervisor installs policy and middleware registry changes as one runtime
+generation and preserves the last-known-good generation if preparation fails.
+Policy-only updates reuse the connected registry, so an external middleware
+outage cannot block unrelated policy changes.
+
+Middleware cannot observe injected credentials or mutate supervisor-owned
+credential, routing, or framing headers. Body transformations are re-evaluated
+against body-aware L7 policy before later stages or the upstream can observe
+them. Requests, results, chain length, execution time, and diagnostics are
+bounded; external free-form diagnostic text is not exposed in responses or
+security logs. See [Supervisor Middleware](../docs/extensibility/supervisor-middleware.mdx)
+for configuration and protocol details.
+
 `https://inference.local` is special. It bypasses OPA network policy and is
 handled by the inference interception path:
 
@@ -77,6 +134,70 @@ handled by the inference interception path:
 
 External inference endpoints that do not use `inference.local` are treated like
 ordinary network traffic and must be allowed by policy.
+
+In proxy-required networks, the supervisor chains upstream TLS tunnels through
+a corporate forward proxy with HTTP CONNECT instead of connecting directly,
+once policy and SSRF checks pass. Only TLS (CONNECT) egress is chained:
+plain-HTTP requests always dial the destination directly, because forwarding
+plain HTTP through a proxy requires absolute-form request forwarding rather
+than CONNECT tunneling and is out of scope. The proxy configuration is an
+operator-owned boundary delivered on the supervisor's command line
+(`--upstream-proxy` and friends) by the compute driver; sandbox and template
+environment — and `ENV` values baked into the sandbox image — cannot
+influence it, since none of these can alter the argv the driver sets. The
+conventional `HTTPS_PROXY`/`HTTP_PROXY`/`NO_PROXY` variables a sandbox
+controls are ignored on this path. Operator `NO_PROXY` destinations and
+loopback always dial directly; add driver-injected host aliases (e.g.
+`host.containers.internal`) to the operator `NO_PROXY` list when the corporate
+proxy cannot reach the container host. `NO_PROXY` matching is port-aware and
+resolution-aware: an entry with a `:port` qualifier only bypasses that port,
+and IP/CIDR entries also match hostnames through their validated resolved
+addresses, with the direct dial limited to the addresses the entry contains. Only `http://` proxy URLs in explicit
+`http://host:port` form are supported — the scheme and port are both
+required, and a path, query, or fragment is rejected. Local DNS resolution
+and SSRF validation still run before the proxied dial, and the CONNECT
+target sent to the corporate proxy is a validated resolved address, so the
+proxy performs no DNS resolution of its own and the tunnel stays bound to
+the answer that passed SSRF and `allowed_ips` validation. The hostname still
+travels inside the tunnel (TLS SNI, application `Host`). In split-horizon
+networks, point the gateway host at the corporate resolver so internal names
+validate to their internal addresses; the `proxy_connect_by_hostname`
+opt-in exists as a
+last resort for proxies whose ACLs filter on hostnames and reject IP CONNECT
+targets — with it, the proxy resolves the name itself and its ACLs become
+the effective egress control for proxied TLS. (Resolving through the proxy's
+own DNS view, e.g. DoH tunneled via CONNECT, is a possible future
+enhancement and out of scope.) The workload child's proxy variables are
+unaffected — they are always rewritten to point at the local policy proxy.
+
+The configuration is fail-closed: a setting that is present but invalid — an
+empty value, an unsupported or malformed proxy URL, an unreadable auth file,
+a malformed credential, or an auth file or `NO_PROXY` list set while no proxy
+URL is configured — is fatal to supervisor startup instead of being treated
+as unset, so a misconfiguration can never silently degrade to direct dialing
+or unauthenticated proxy access. Only an omitted argument means "no proxy".
+The driver validates the same rules at sandbox-create time through
+validators shared with the supervisor
+(`openshell_core::driver_utils::parse_upstream_proxy_url` and
+`parse_upstream_proxy_credential`).
+
+Proxy credentials are never embedded in the URL: an inline `user:pass@` is
+rejected because it would be stored in `gateway.toml` and exposed in container
+metadata. Operators supply credentials via `proxy_auth_file`; the driver
+stages them as a root-only secret mounted at a fixed path and passes only
+that path on the supervisor's command line. The supervisor reads the
+file and builds the `Proxy-Authorization: Basic` header; a credential that is
+empty, contains control characters, or is not in `user:pass` form is fatal on
+both sides.
+
+The Basic header travels over the plain-TCP connection to the `http://` proxy,
+so it is readable on the network path between sandbox host and proxy.
+Configuring `proxy_auth_file` therefore requires the explicit opt-in
+`proxy_auth_allow_insecure = true`. Both the
+driver (at sandbox-create time) and the supervisor (at startup) reject an
+auth file without the acknowledgement, and the acknowledgement without an
+auth file, so credentials are never sent in cleartext without an explicit
+operator decision.
 
 ## Credentials
 
@@ -112,7 +233,12 @@ For AWS endpoints that require request-level signing, the proxy supports SigV4
 re-signing. When `credential_signing: sigv4` is set on an L7 endpoint, the proxy
 strips the client's placeholder-based AWS auth headers, re-signs with real
 credentials from the provider, and forwards the request upstream. The signing
-mode is auto-detected from the client SDK's `x-amz-content-sha256` header:
+endpoint must have a credential source before the policy generation activates:
+an attached endpoint-bearing AWS profile whose boundary covers the endpoint, or
+an attached endpointless AWS profile explicitly named by the endpoint's
+`credential_binding.provider`. Policy activation rejects missing or mismatched
+sources atomically. The signing mode is auto-detected from the client SDK's
+`x-amz-content-sha256` header:
 
 - **Signed body** (hex hash): buffers the request body (up to 10 MiB), computes
   its SHA-256, and includes the hash in the signature. Used by Bedrock and most
@@ -189,6 +315,15 @@ remains `Pending`. If the first poll returns a different revision, the superviso
 processes it through the normal reload path instead of treating it as already
 loaded.
 
+A newer sandbox-scoped revision can carry the same non-empty effective policy
+hash as the currently loaded revision, for example when provenance changes
+without changing enforcement content. The supervisor acknowledges that newer
+revision without reloading identical policy. If the revision also requires
+middleware or policy-runtime reconciliation, acknowledgement waits until that
+reconciliation succeeds. Global policies, local overrides, equal or older
+versions, and different hashes do not use this shortcut. Success telemetry is
+emitted only after the gateway accepts the resulting loaded-status report.
+
 Policy status delivery uses a FIFO background worker. Retryable delivery
 failures retain the ordered update and retry with capped exponential backoff;
 terminal errors are logged and discarded. The outbox is nonblocking and does
@@ -206,8 +341,10 @@ engine with a gateway policy revision.
 ## Failure Behavior
 
 - If gateway config polling fails, the sandbox keeps its last-known-good policy.
-- If a live policy update is invalid, the supervisor rejects it and keeps the
-  current policy.
+- If a live policy or middleware-registry update is invalid, the supervisor
+  rejects the combined update and keeps the current runtime pair.
+- If an operator-run middleware call fails, the selected config's `on_error`
+  behavior decides whether to deny the request or continue without that stage.
 - Existing raw byte streams are connection scoped. Dynamic policy changes apply
   to new connections or the next parsed HTTP request where the proxy can safely
   re-evaluate.

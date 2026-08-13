@@ -85,7 +85,7 @@ Generate certificates that include the server's hostname or IP in the
 SANs. See "Using externally-managed certificates" in CONFIGURATION.md.
 Then change `bind_address` in
 `~/.config/openshell/gateway.toml` to the interface the remote CLI
-can reach, for example `0.0.0.0:17670`, and restart the gateway.
+can reach, for example `192.168.1.10:17670`, and restart the gateway.
 
 After placing the server and client certs, register from the remote
 CLI:
@@ -274,11 +274,12 @@ Other breaking changes in this release:
 
 - **Default bind address changed from `0.0.0.0` to `127.0.0.1`.** If
   you relied on network-accessible access without an explicit bind
-  address, add the following to `~/.config/openshell/gateway.toml`:
+  address, bind the specific reachable interface in
+  `~/.config/openshell/gateway.toml`:
 
   ```toml
   [openshell.gateway]
-  bind_address = "0.0.0.0:17670"
+  bind_address = "192.168.1.10:17670"
   ```
 
   Also update your firewall rule if applicable:

@@ -20,6 +20,12 @@ Create a sandbox with a single command. For example, to create a sandbox with Cl
 openshell sandbox create -- claude
 ```
 
+For automation, use `--output json` or `--output yaml` to get machine-readable sandbox metadata after creation:
+
+```shell
+openshell sandbox create --output json
+```
+
 Every sandbox requires a gateway. Register or select one before running sandbox commands:
 
 ```shell
@@ -196,6 +202,8 @@ openshell sandbox create --env API_KEY=sk-test --env DEBUG=1 -- my-agent
 
 Variables set with `--env` are available to all processes in the sandbox, including interactive shells and exec commands.
 
+When an `--env` key looks like a credential — a known provider variable, or a name whose underscore-separated segments include a credential word such as `TOKEN`, `SECRET`, `PASSWORD`, `CREDENTIAL`, `API_KEY`, `ACCESS_KEY`, or `SECRET_KEY` (for example `DB_TOKEN` or `MY_ACCESS_KEY`) — `sandbox create` prints a non-blocking warning. Matching is on whole segments, so unrelated names like `TOKENIZERS_PARALLELISM` or `PASSWORDLESS_LOGIN` do not warn. The agent inside the sandbox can read plain environment values directly, so to hide a secret from the agent, attach it through a [provider](/sandboxes/providers-v2) with `--provider` instead. Suppress the warning with `--no-credential-warnings`. Detection uses the key name only; values are never inspected or printed.
+
 You can also set per-command environment variables with `sandbox exec`:
 
 ```shell
@@ -229,10 +237,10 @@ The Python SDK accepts the same gateway labels and selectors. Labels passed to
 from openshell import SandboxClient
 
 with SandboxClient.from_active_cluster() as client:
-    sandbox = client.create(name="deep-research-1", labels={"env": "dev", "team": "platform"})
+    sandbox = client.create(workspace="default", name="deep-research-1", labels={"env": "dev", "team": "platform"})
     assert sandbox.labels["team"] == "platform"
 
-    matches = client.list(label_selector="env=dev,team=platform")
+    matches = client.list(workspace="default", label_selector="env=dev,team=platform")
     assert sandbox.id in {s.id for s in matches}
 ```
 
@@ -309,6 +317,12 @@ Get detailed information about a specific sandbox. The output lists **Policy sou
 openshell sandbox get my-sandbox
 ```
 
+For automation, use `--output json` or `--output yaml` to get machine-readable sandbox details:
+
+```shell
+openshell sandbox get my-sandbox --output json
+```
+
 Print only that policy YAML for scripting (same effective policy, no metadata):
 
 ```shell
@@ -335,6 +349,8 @@ openshell term
 ```
 
 Use the terminal to spot blocked connections marked `action=deny` and inference-related proxy activity. If a connection is blocked unexpectedly, add the host to your network policy. Refer to [Policies](/sandboxes/policies) for the workflow.
+
+The dashboard has three panels stacked vertically: Gateways, Providers (or Global Settings), and Sandboxes. Navigate within a panel with `Up`/`Down` or `j`/`k`. At a list boundary the cursor overflows into the adjacent panel, skipping empty panels. Use `Tab`/`Shift+Tab` to cycle panels directly. Press `h`/`l` or `Left`/`Right` in the middle panel to switch between the Providers and Global Settings tabs.
 
 ## Port Forwarding
 
@@ -378,22 +394,31 @@ Append the output to `~/.ssh/config` or use `--editor` on `sandbox create`/`sand
 Upload files from your host into the sandbox:
 
 ```shell
-openshell sandbox upload my-sandbox ./src /sandbox/src
+openshell sandbox upload my-sandbox ./src
 ```
 
-When the local path is a named directory, OpenShell preserves that basename at the destination, matching `scp -r` and `cp -r`. The example above creates `/sandbox/src/src`.
+When you omit the destination, OpenShell discovers the sandbox's working
+directory and uploads there. For a named local directory, OpenShell preserves
+the basename, matching `scp -r` and `cp -r`. If that directory already exists,
+the upload merges into it and overwrites matching entries without deleting
+unrelated entries.
 
 OpenShell preserves symlinks during upload. A symlink arrives in the sandbox as a symlink with the same target path instead of an expanded copy of the target file or directory. Dangling symlinks are also preserved.
 
 Download files from the sandbox to your host:
 
 ```shell
-openshell sandbox download my-sandbox /sandbox/output ./local
+openshell sandbox download my-sandbox output ./local
 ```
 
 When the sandbox-side source is a single file, the destination follows `cp`-style placement: if the destination already exists as a directory or ends with `/`, the file lands inside it as `<dest>/<basename>`; otherwise the file is written at the exact destination path.
 
-The CLI only allows sandbox-side sources that resolve inside the writable workspace (`/sandbox`). Paths that escape lexically (`/etc/passwd`, `/sandbox/../etc/passwd`) and paths that escape through a symlink (`/sandbox/etc-link` pointing at `/etc`) are both refused before any data is transferred.
+The CLI discovers the sandbox's canonical working directory and only allows
+sandbox-side sources that resolve inside it. Paths that escape lexically, such
+as `/etc/passwd` or `/sandbox/../etc/passwd`, and paths that escape through a
+symlink are refused before any data is transferred. Relative sources are
+resolved from the working directory; absolute sources within the same canonical
+directory are also accepted.
 
 <Note>
 You can also upload files at creation time with the `--upload` flag on
@@ -413,6 +438,26 @@ back to an unfiltered upload and prints a warning. Pass `--no-git-ignore` to
 opt into unfiltered uploads explicitly, upload a path outside the Git work
 tree, or force-add the intended files if they should remain Git-aware.
 
+## Stop and Start Sandboxes
+
+Stop compute when you want to retain a sandbox and its persistent workspace
+without keeping its container, pod, or VM running:
+
+```shell
+openshell sandbox stop my-sandbox
+openshell sandbox start my-sandbox
+```
+
+The name is optional and defaults to the last-used sandbox. Stop stops local
+background forwards and waits for the `Stopped` phase. Start waits until the
+same sandbox returns to `Ready`. While stopped, you cannot connect, execute
+commands, transfer files, forward ports, or reach exposed services. Policies,
+provider attachments, settings, service definitions, and persistent workspace
+data remain associated with the sandbox.
+
+Stop and start are idempotent. Delete a stopped sandbox normally when you
+no longer need its retained state.
+
 ## Delete Sandboxes
 
 Deleting a sandbox stops all processes, releases resources, and purges injected credentials.
@@ -425,12 +470,22 @@ openshell sandbox delete my-sandbox
 
 Every sandbox moves through a defined set of phases:
 
-| Phase        | Description                                                                                                                            |
-| ------------ | -------------------------------------------------------------------------------------------------------------------------------------- |
-| Provisioning | The runtime is setting up the sandbox environment, injecting credentials, and applying your policy.                                    |
-| Ready        | The sandbox is running. The agent process is active and all isolation layers are enforced. You can connect, sync files, and view logs. |
-| Error        | Something went wrong during provisioning or execution. Check logs with `openshell logs` for details.                                   |
-| Deleting     | The sandbox is being torn down. The system releases resources and purges credentials.                                                  |
+| Phase        | Description                                                                                                                                                    |
+| ------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Provisioning | The runtime is setting up the sandbox environment, or the gateway is waiting for the sandbox supervisor to establish its authenticated control session.       |
+| Ready        | The sandbox is running and its supervisor control session is connected. You can connect, execute commands, sync files, and view logs.                          |
+| Stopping     | The gateway accepted a stop request and is stopping compute while retaining persistent state.                                                         |
+| Stopped      | Compute is stopped and access is unavailable. The sandbox record and driver-owned persistent workspace remain.                                       |
+| Starting     | Compute is starting. The sandbox becomes usable only after a fresh supervisor session connects.                                                       |
+| Error        | Something went wrong during provisioning or execution. Check logs with `openshell logs` for details.                                                           |
+| Deleting     | The sandbox is being torn down. The system releases resources and purges credentials.                                                                          |
+
+The compute backend can become ready before the sandbox supervisor connects to
+the gateway. During this interval, the sandbox remains in `Provisioning` and
+reports a `Ready=False` condition with the reason `SupervisorNotConnected`.
+After a gateway restart, an existing sandbox can return to `Provisioning`
+temporarily while its supervisor reconnects. Wait for the phase to return to
+`Ready` before you connect to the sandbox or execute commands.
 
 ## Sandbox Compute Drivers
 
@@ -441,6 +496,7 @@ For Docker, Podman, MicroVM, and Kubernetes behavior, refer to [Sandbox Compute 
 ## Next Steps
 
 - To follow a complete end-to-end example, refer to the [GitHub Sandbox](/get-started/tutorials/github-sandbox) tutorial.
+- To select a workspace or understand access roles, refer to [Manage Workspaces and Access](/sandboxes/manage-workspaces).
 - To supply API keys or tokens, refer to [Manage Providers](/sandboxes/manage-providers).
 - To control what the agent can access, refer to [Policies](/sandboxes/policies).
 - To use the default runtime image, refer to [Base Sandbox Container](#base-sandbox-container).

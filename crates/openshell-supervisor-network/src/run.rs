@@ -26,6 +26,7 @@ use openshell_ocsf::{
 
 use openshell_core::activity::ActivitySender;
 use openshell_core::denial::DenialEvent;
+use openshell_core::proposals::AgentProposals;
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::identity::BinaryIdentityCache;
@@ -83,9 +84,12 @@ pub async fn run_networking(
     sandbox_id: Option<&str>,
     sandbox_name: Option<&str>,
     openshell_endpoint: Option<&str>,
-    inference_routes: Option<&str>,
+    #[allow(unused_variables)] inference_routes: Option<&str>,
     denial_tx: Option<UnboundedSender<DenialEvent>>,
     activity_tx: Option<ActivitySender>,
+    agent_proposals: AgentProposals,
+    workspace_rx: tokio::sync::watch::Receiver<String>,
+    upstream_proxy_args: &crate::upstream_proxy::UpstreamProxyArgs,
 ) -> Result<Networking> {
     // Build the policy-local route context. The orchestrator's policy poll
     // loop also holds an `Arc` clone (via `Networking::policy_local_ctx`) so
@@ -96,6 +100,8 @@ pub async fn run_networking(
         sandbox_name
             .map(str::to_string)
             .or_else(|| sandbox_id.map(str::to_string)),
+        agent_proposals,
+        workspace_rx,
     ));
 
     // Readiness signal for the proxy accept loop: the proxy binds the TCP
@@ -202,7 +208,7 @@ pub async fn run_networking(
         match SandboxCa::generate() {
             Ok(ca) => {
                 let tls_dir = std::env::var(openshell_core::sandbox_env::PROXY_TLS_DIR)
-                    .unwrap_or_else(|_| "/etc/openshell-tls".to_string());
+                    .unwrap_or_else(|_| openshell_core::container_paths::TLS_ROOT.to_string());
                 let tls_dir = std::path::Path::new(&tls_dir);
                 let system_ca_bundle = read_system_ca_bundle();
                 match write_ca_files(&ca, tls_dir, &system_ca_bundle) {
@@ -211,7 +217,7 @@ pub async fn run_networking(
                         // path injected by enrich_*_baseline_paths(), so no
                         // explicit Landlock entry is needed here.
 
-                        let upstream_config = build_upstream_client_config(&system_ca_bundle);
+                        let upstream_config = build_upstream_client_config(&system_ca_bundle)?;
                         let cert_cache = CertCache::new(ca);
                         let state = Arc::new(ProxyTlsState::new(cert_cache, upstream_config));
                         ocsf_emit!(
@@ -309,6 +315,7 @@ pub async fn run_networking(
             denial_tx,
             activity_tx,
             engine_ready_rx,
+            upstream_proxy_args,
         )
         .await?;
         Some(proxy_handle)

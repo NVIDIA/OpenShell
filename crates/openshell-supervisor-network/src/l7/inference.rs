@@ -179,7 +179,10 @@ pub fn detect_inference_pattern<'a>(
             let Some(slash_at) = rest.find('/') else {
                 return false;
             };
-            return slash_at > 0 && rest[slash_at + 1..] == *after;
+            let Some(after_segment) = rest.get(slash_at + 1..) else {
+                return false;
+            };
+            return slash_at > 0 && after_segment == after;
         }
 
         path_only == p.path_glob

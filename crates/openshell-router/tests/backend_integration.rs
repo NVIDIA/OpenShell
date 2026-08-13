@@ -4,7 +4,7 @@
 use openshell_router::Router;
 use openshell_router::config::{AuthHeader, ResolvedRoute, RouteConfig, RouterConfig};
 use wiremock::matchers::{bearer_token, body_partial_json, header, method, path};
-use wiremock::{Mock, MockServer, ResponseTemplate};
+use wiremock::{Match, Mock, MockServer, Request, ResponseTemplate};
 
 fn mock_candidates(base_url: &str) -> Vec<ResolvedRoute> {
     vec![ResolvedRoute {
@@ -665,6 +665,119 @@ async fn proxy_vertex_anthropic_route_uses_model_path_suffix() {
     assert!(
         !received[0].headers.contains_key("anthropic-version"),
         "anthropic-version must be converted to body anthropic_version, not forwarded as a header"
+    );
+}
+
+/// Fields that Vertex AI rawPredict actually accepts for Anthropic models.
+const VERTEX_ACCEPTED_FIELDS: &[&str] = &[
+    "anthropic_version",
+    "messages",
+    "max_tokens",
+    "stop_sequences",
+    "stream",
+    "system",
+    "temperature",
+    "thinking",
+    "tool_choice",
+    "tools",
+    "top_k",
+    "top_p",
+    "metadata",
+];
+
+/// Simulates Vertex AI's strict pydantic validation: rejects any body field not
+/// in the known Anthropic Messages API schema. This is what causes the real 400
+/// error described in #2444.
+struct VertexStrictBodyValidator;
+
+impl Match for VertexStrictBodyValidator {
+    fn matches(&self, request: &Request) -> bool {
+        let Ok(body) = serde_json::from_slice::<serde_json::Value>(&request.body) else {
+            return false;
+        };
+        let Some(obj) = body.as_object() else {
+            return false;
+        };
+        obj.keys()
+            .all(|k| VERTEX_ACCEPTED_FIELDS.contains(&k.as_str()))
+    }
+}
+
+/// End-to-end reproduction of #2444: Claude Code sends `context_management` in
+/// the body, the router must strip it before it reaches Vertex. The mock uses
+/// strict body validation (like Vertex's pydantic) so the request only succeeds
+/// if the field was actually removed.
+#[tokio::test]
+async fn proxy_vertex_strips_beta_fields_e2e() {
+    let mock_server = MockServer::start().await;
+
+    let model_path = "/v1/projects/my-project/locations/us-east5/publishers/anthropic/models";
+    let model = "claude-sonnet-4-6@20250514";
+
+    // This mock only matches if the body passes strict validation —
+    // context_management would cause a mismatch (simulating a real 400).
+    Mock::given(method("POST"))
+        .and(path(format!("{model_path}/{model}:rawPredict")))
+        .and(VertexStrictBodyValidator)
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "msg_1",
+            "type": "message",
+            "role": "assistant",
+            "model": model,
+            "content": [{"type": "text", "text": "Pong"}]
+        })))
+        .mount(&mock_server)
+        .await;
+
+    let router = Router::new().unwrap();
+    let candidates = vec![ResolvedRoute {
+        name: "vertex-test".to_string(),
+        endpoint: format!("{}{model_path}", mock_server.uri()),
+        model: model.to_string(),
+        api_key: "ya29.token".to_string(),
+        protocols: vec!["anthropic_messages".to_string()],
+        auth: AuthHeader::Bearer,
+        default_headers: Vec::new(),
+        passthrough_headers: vec!["anthropic-beta".to_string()],
+        timeout: openshell_router::config::DEFAULT_ROUTE_TIMEOUT,
+        model_in_path: true,
+        request_path_override: Some(":rawPredict".to_string()),
+    }];
+
+    // Exact payload Claude Code v2.1.156+ sends: includes model,
+    // context_management, and anthropic-beta header.
+    let body = serde_json::to_vec(&serde_json::json!({
+        "model": "claude-sonnet-4-6-20250514",
+        "messages": [{"role": "user", "content": "say pong"}],
+        "max_tokens": 128,
+        "context_management": {"enabled": true},
+    }))
+    .unwrap();
+
+    let response = router
+        .proxy_with_candidates(
+            "anthropic_messages",
+            "POST",
+            "/v1/messages",
+            vec![
+                ("content-type".to_string(), "application/json".to_string()),
+                (
+                    "anthropic-beta".to_string(),
+                    "context-management-2025-06-27".to_string(),
+                ),
+            ],
+            bytes::Bytes::from(body),
+            &candidates,
+        )
+        .await
+        .unwrap();
+
+    // If context_management leaked through, the strict mock wouldn't match
+    // and wiremock would return 404.
+    assert_eq!(
+        response.status, 200,
+        "request must succeed — context_management should have been stripped. \
+         A 404 here means the strict body validator rejected an unsupported field."
     );
 }
 

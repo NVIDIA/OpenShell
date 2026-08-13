@@ -9,6 +9,10 @@
 
 set -euo pipefail
 
+# libkrun consumes this driver-owned switch before exec'ing this script as
+# PID 1. Do not leak the runtime control into the supervisor or workloads.
+unset KRUN_INIT_PID1
+
 BOOT_START=$(date +%s%3N 2>/dev/null || date +%s)
 # gvisor-tap-vsock subnet layout:
 #   192.168.127.1   — gateway: gvproxy's DNS / DHCP / HTTP API. Does NOT
@@ -243,6 +247,10 @@ setup_overlay_root() {
     if [ "${OPENSHELL_VM_INIT_MODE:-sandbox}" = "image-prep" ]; then
         prepare_guest_image_rootfs
         sync
+        if ! umount /overlay; then
+            ts "FATAL: failed to unmount /overlay cleanly after image-prep; refusing to produce a dirty image-cache disk"
+            exit 1
+        fi
         ts "image-prep complete"
         exit 0
     fi
@@ -252,7 +260,7 @@ setup_overlay_root() {
 
     local lower_root="/lower"
     if [ -b /dev/vdc ]; then
-        mount -t ext4 -o ro /dev/vdc /image-cache
+        mount -t ext4 -o ro,noload /dev/vdc /image-cache
         if [ -d /image-cache/image-rootfs ]; then
             lower_root="/image-cache/image-rootfs"
             ts "using prepared image rootfs lowerdir"

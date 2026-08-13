@@ -1,0 +1,6 @@
+load("@@//bazel/annotations/z3-sys:defs.bzl", "z3_sys")
+
+z3_sys(
+    name = "z3_sys_build_info",
+    z3 = "@z3//:z3",
+)

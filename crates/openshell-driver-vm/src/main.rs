@@ -6,6 +6,7 @@ use futures::Stream;
 use miette::{IntoDiagnostic, Result};
 use openshell_core::VERSION;
 use openshell_core::proto::compute::v1::compute_driver_server::ComputeDriverServer;
+use openshell_driver_vm::otel_tracing::compute_driver_rpc_layer;
 #[cfg(target_os = "macos")]
 use openshell_driver_vm::{VM_RUNTIME_DIR_ENV, configured_runtime_dir};
 use openshell_driver_vm::{VmBackend, VmDriver, VmDriverConfig, VmLaunchConfig, procguard, run_vm};
@@ -18,6 +19,7 @@ use std::task::{Context, Poll};
 use tokio::net::{UnixListener, UnixStream};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
+use tracing_subscriber::prelude::*;
 
 #[derive(Parser, Debug)]
 #[command(name = "openshell-driver-vm")]
@@ -85,6 +87,9 @@ struct Args {
 
     #[arg(long, env = "OPENSHELL_LOG_LEVEL", default_value = "info")]
     log_level: String,
+
+    #[arg(long, env = "OPENSHELL_OTLP_ENDPOINT")]
+    otlp_endpoint: Option<String>,
 
     #[arg(long, env = "OPENSHELL_GRPC_ENDPOINT")]
     openshell_endpoint: Option<String>,
@@ -181,11 +186,22 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&args.log_level)),
+    let (tracer_provider, setup_error) =
+        openshell_driver_vm::otel_tracing::provider_for(args.otlp_endpoint.as_deref());
+    tracing_subscriber::registry()
+        .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&args.log_level)))
+        .with(tracing_subscriber::fmt::layer())
+        .with(
+            tracer_provider
+                .as_ref()
+                .map(openshell_driver_vm::otel_tracing::layer),
         )
         .init();
+    if let Some(error) = setup_error {
+        tracing::error!(%error, "OTLP exporting could not be started");
+    } else if let Some(endpoint) = &args.otlp_endpoint {
+        info!(endpoint, "OTLP exporting enabled");
+    }
 
     let listen_mode = compute_driver_listen_mode(&args).map_err(|err| miette::miette!("{err}"))?;
 
@@ -226,7 +242,7 @@ async fn main() -> Result<()> {
     .await
     .map_err(|err| miette::miette!("{err}"))?;
 
-    match listen_mode {
+    let result = match listen_mode {
         ComputeDriverListenMode::Unix {
             socket_path,
             expected_peer_pid,
@@ -237,8 +253,12 @@ async fn main() -> Result<()> {
             let listener = UnixListener::bind(&socket_path).into_diagnostic()?;
             restrict_socket_permissions(&socket_path).map_err(|err| miette::miette!("{err}"))?;
             let result = tonic::transport::Server::builder()
+                .layer(compute_driver_rpc_layer())
                 .add_service(ComputeDriverServer::new(driver))
-                .serve_with_incoming(AuthenticatedUnixIncoming::new(listener, expected_peer_pid))
+                .serve_with_incoming_shutdown(
+                    AuthenticatedUnixIncoming::new(listener, expected_peer_pid),
+                    shutdown_signal(),
+                )
                 .await
                 .into_diagnostic();
             let _ = std::fs::remove_file(&socket_path);
@@ -247,12 +267,33 @@ async fn main() -> Result<()> {
         ComputeDriverListenMode::Tcp(bind_address) => {
             info!(address = %bind_address, "Starting unauthenticated dev vm compute driver");
             tonic::transport::Server::builder()
+                .layer(compute_driver_rpc_layer())
                 .add_service(ComputeDriverServer::new(driver))
-                .serve(bind_address)
+                .serve_with_shutdown(bind_address, shutdown_signal())
                 .await
                 .into_diagnostic()
         }
+    };
+    if let Some(provider) = &tracer_provider
+        && let Err(error) = provider.shutdown()
+    {
+        tracing::warn!(%error, "OTLP tracer provider shutdown failed");
     }
+    result
+}
+
+async fn shutdown_signal() {
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .expect("install SIGTERM handler");
+    tokio::select! {
+        result = tokio::signal::ctrl_c() => {
+            if let Err(error) = result {
+                tracing::warn!(%error, "failed to listen for Ctrl-C");
+            }
+        }
+        _ = terminate.recv() => {}
+    }
+    info!("Shutdown signal received; stopping vm compute driver");
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -647,6 +688,19 @@ mod tests {
         let args = Args::parse_from(["openshell-driver-vm"]);
         let err = compute_driver_listen_mode(&args).expect_err("default TCP should be disabled");
         assert!(err.contains("--bind-socket is required"));
+    }
+
+    #[test]
+    fn accepts_gateway_otlp_endpoint() {
+        let args = Args::try_parse_from([
+            "openshell-driver-vm",
+            "--otlp-endpoint",
+            "http://127.0.0.1:4317",
+        ]);
+        assert!(
+            args.is_ok(),
+            "VM driver should accept the gateway OTLP endpoint"
+        );
     }
 
     #[test]

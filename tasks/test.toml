@@ -1,11 +1,20 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# Test tasks (Rust + Python)
+# Test tasks (Rust + Python + TypeScript SDK)
 
 [test]
-description = "Run all tests (Rust + Python)"
-depends = ["test:rust", "test:python", "test:sbom", "test:install-sh", "test:packaging-assets", "test:docs-website"]
+description = "Run all tests (Rust + Python + TypeScript SDK)"
+depends = [
+  "test:rust",
+  "test:python",
+  "sdk:ts:test",
+  "test:sbom",
+  "test:install-sh",
+  "test:build-env",
+  "test:packaging-assets",
+  "test:docs-website",
+]
 
 ["test:docs-website"]
 description = "Test the docs-website sync script"
@@ -21,16 +30,28 @@ hide = true
 ["test:install-sh"]
 description = "Run focused install.sh shell tests"
 run = "tasks/scripts/test-install-sh.sh"
+run_windows = "echo Skipping test:install-sh: Linux glibc installer tests do not apply on Windows."
+hide = true
+
+["test:build-env"]
+description = "Run build-env.sh helper shell tests"
+run = "tasks/scripts/test-build-env.sh"
+run_windows = "echo Skipping test:build-env: the Unix build-env.sh helper does not apply on Windows."
 hide = true
 
 ["test:packaging-assets"]
 description = "Run static packaging asset tests"
 run = "tasks/scripts/test-packaging-assets.sh"
+run_windows = "echo Skipping test:packaging-assets: Linux service and RPM assets do not apply on Windows."
 hide = true
 
 [e2e]
 description = "Run all end-to-end tests (Rust + Python + MCP)"
 depends = ["e2e:rust", "e2e:python", "e2e:mcp"]
+
+["e2e:test"]
+description = "Build the current checkout and run a named host or Nix test-guest E2E suite"
+run = "e2e/run.sh"
 
 ["e2e:gpu"]
 description = "Run Docker GPU end-to-end tests"
@@ -42,12 +63,14 @@ run = "bash tasks/scripts/e2e-gpu-build-images.sh"
 
 ["test:rust"]
 description = "Run Rust tests"
+env = { OPENSHELL_TELEMETRY_ENABLED = "false" }
 run = [
   # Run the workspace once without openshell-server so we can run that crate
   # with test-only helpers enabled.
   "cargo test --workspace --exclude openshell-server",
   "cargo test -p openshell-server --features test-support",
 ]
+run_windows = "powershell -NoProfile -ExecutionPolicy Bypass -File tasks/scripts/windows-msvc.ps1 test-precommit native"
 hide = true
 
 ["test:python"]
@@ -60,14 +83,12 @@ hide = true
 ["e2e:rust"]
 description = "Run Rust CLI e2e tests against a Docker-backed gateway"
 run = [
-  "cargo build -p openshell-cli",
   "e2e/with-docker-gateway.sh cargo test --manifest-path e2e/rust/Cargo.toml --features e2e-docker",
 ]
 
 ["e2e:websocket-conformance"]
 description = "Run focused WebSocket conformance e2e tests against a Docker-backed gateway"
 run = [
-  "cargo build -p openshell-cli",
   "e2e/with-docker-gateway.sh cargo test --manifest-path e2e/rust/Cargo.toml --features e2e-docker --test websocket_conformance",
 ]
 
@@ -83,11 +104,31 @@ depends = ["e2e:mcp"]
 description = "Run Python e2e tests against a Docker-backed gateway (E2E_PARALLEL=N or 'auto'; default 5)"
 depends = ["python:proto"]
 env = { UV_NO_SYNC = "1", PYTHONPATH = "python" }
-run = "e2e/with-docker-gateway.sh uv run pytest -o python_files='test_*.py' -m 'not gpu' -n ${E2E_PARALLEL:-5} e2e/python"
+run = "e2e/with-docker-gateway.sh uv run pytest -o python_files='test_*.py *_test.py' -m 'not gpu' -n ${E2E_PARALLEL:-5} e2e/python"
 
 ["e2e:podman"]
 description = "Run Rust CLI e2e tests against a Podman-backed gateway"
 run = "e2e/rust/e2e-podman.sh"
+
+["e2e:oidc-pkce"]
+description = "Run Linux browser PKCE and RBAC e2e tests against Keycloak and a Podman gateway"
+run = [
+  "CONTAINER_RUNTIME=podman e2e/with-keycloak.sh env OPENSHELL_E2E_OIDC_GATEWAY=1 e2e/with-podman-gateway.sh cargo test --manifest-path e2e/rust/Cargo.toml --features e2e-oidc-pkce --test oidc_pkce",
+]
+
+["e2e:oidc-pkce:docker"]
+description = "Run Linux browser PKCE and RBAC e2e tests against Keycloak and a Docker gateway"
+run = [
+  "CONTAINER_RUNTIME=docker e2e/with-keycloak.sh env OPENSHELL_E2E_OIDC_GATEWAY=1 e2e/with-docker-gateway.sh cargo test --manifest-path e2e/rust/Cargo.toml --features e2e-oidc-pkce --test oidc_pkce",
+]
+
+["e2e:oidc-python:docker"]
+description = "Run Python OIDC and workspace authorization e2e tests against Keycloak and a Docker gateway"
+depends = ["python:proto"]
+env = { UV_NO_SYNC = "1", PYTHONPATH = "python" }
+run = [
+  "CONTAINER_RUNTIME=docker e2e/with-keycloak.sh env OPENSHELL_E2E_OIDC_GATEWAY=1 e2e/with-docker-gateway.sh uv run pytest -m 'not gpu' e2e/python/oidc",
+]
 
 ["e2e:podman:rootless"]
 description = "Run Rust CLI e2e tests against a rootless Podman-backed gateway"
@@ -129,8 +170,13 @@ description = "Run the full Kubernetes e2e suite through Envoy against two gatew
 env = { OPENSHELL_E2E_KUBE_EXTERNAL_POSTGRES_SECRET = "openshell-ha-pg", OPENSHELL_E2E_KUBE_EXTRA_VALUES = "deploy/helm/openshell/ci/values-high-availability.yaml", OPENSHELL_E2E_KUBE_USE_ENVOY = "1" }
 run = "e2e/rust/e2e-kubernetes.sh"
 
+["e2e:kubernetes:credential-drivers"]
+description = "Run Kubernetes e2e for provider credential storage backed by Kubernetes Secrets and Vault"
+env = { OPENSHELL_E2E_CREDENTIAL_DRIVERS = "1", OPENSHELL_E2E_KUBE_TEST = "credential_drivers", OPENSHELL_E2E_KUBERNETES_FEATURES = "e2e,e2e-kubernetes,e2e-kubernetes-credential-drivers" }
+run = "e2e/rust/e2e-kubernetes.sh"
+
 ["e2e:vm"]
-description = "Start openshell-gateway with the VM compute driver and run the cluster-agnostic smoke e2e"
+description = "Start openshell-gateway with the VM compute driver and run VM e2e tests"
 run = "e2e/rust/e2e-vm.sh"
 
 ["e2e:docker"]

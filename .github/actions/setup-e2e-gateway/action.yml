@@ -1,0 +1,29 @@
+name: Setup E2E Gateway
+description: Download an architecture-matched prebuilt OpenShell gateway for E2E tests
+
+inputs:
+  artifact-prefix:
+    description: Artifact name prefix; linux-<arch> is appended automatically
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Download prebuilt gateway
+      uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      with:
+        name: ${{ format('{0}-linux-{1}', inputs.artifact-prefix, runner.arch == 'X64' && 'amd64' || 'arm64') }}
+        path: .e2e/prebuilt-gateway
+
+    - name: Configure prebuilt gateway
+      shell: bash
+      run: |
+        set -euo pipefail
+        gateway="$GITHUB_WORKSPACE/.e2e/prebuilt-gateway/openshell-gateway"
+        if [[ ! -f "$gateway" ]]; then
+          echo "downloaded artifact is missing $gateway" >&2
+          exit 1
+        fi
+        chmod +x "$gateway"
+        "$gateway" --version
+        echo "OPENSHELL_GATEWAY_BIN=$gateway" >> "$GITHUB_ENV"

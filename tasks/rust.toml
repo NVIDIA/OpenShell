@@ -6,6 +6,7 @@
 ["rust:check"]
 description = "Check all Rust crates for errors"
 run = "cargo check --workspace"
+run_windows = "powershell -NoProfile -ExecutionPolicy Bypass -File tasks/scripts/windows-msvc.ps1 check native"
 hide = true
 
 ["rust:lint"]
@@ -14,17 +15,33 @@ run = [
   "cargo clippy --workspace --all-targets -- -D warnings",
   "cargo clippy --manifest-path e2e/rust/Cargo.toml --all-targets -- -D warnings",
 ]
+run_windows = "powershell -NoProfile -ExecutionPolicy Bypass -File tasks/scripts/windows-msvc.ps1 lint native"
 hide = true
 
 ["rust:format"]
 description = "Format Rust code"
-run = "cargo fmt --all"
+run = [
+  "cargo fmt --all",
+  "cargo fmt --manifest-path e2e/rust/Cargo.toml --all",
+]
 hide = true
 
 ["rust:format:check"]
 description = "Check Rust formatting"
-run = "cargo fmt --all -- --check"
+run = [
+  "cargo fmt --all -- --check",
+  "cargo fmt --manifest-path e2e/rust/Cargo.toml --all -- --check",
+]
 hide = true
+
+["rust:deny"]
+description = "Check dependencies for all cargo-deny rules"
+run = "cargo deny check"
+
+["rust:deny:policy"]
+description = "Check dependencies for license violations, bans, and source restrictions"
+run = "cargo deny check licenses bans sources"
+
 
 ["rust:verify:telemetry-off"]
 description = "Verify telemetry emission code is compiled out with --no-default-features"
@@ -36,6 +53,18 @@ run = [
   # Guard: telemetry-free builds must contain no telemetry markers.
   "cargo build -p openshell-server --bin openshell-gateway --no-default-features",
   "tasks/scripts/verify-telemetry-compiled-out.sh absent target/debug/openshell-gateway",
-  "cargo build -p openshell-sandbox --bin openshell-sandbox --no-default-features",
+  "cargo build -p openshell-sandbox --bin openshell-sandbox --no-default-features --features bundled-ca-roots",
   "tasks/scripts/verify-telemetry-compiled-out.sh absent target/debug/openshell-sandbox",
+]
+
+["rust:verify:system-ca-roots"]
+description = "Verify system CA roots build mode compiles and excludes bundled Mozilla root crates"
+run = [
+  # Check that the sandbox compiles cleanly in system CA roots mode (all
+  # defaults except bundled-ca-roots).
+  "cargo check -p openshell-sandbox --all-targets --no-default-features --features system-ca-roots",
+  # Guard: webpki-roots must not appear in the dependency graph.
+  "bash -c 'if cargo tree -p openshell-sandbox -i webpki-roots --no-default-features --features system-ca-roots 2>/dev/null | grep -q webpki-roots; then echo \"ERROR: webpki-roots found in system CA roots build\" >&2; exit 1; fi'",
+  # Guard: webpki-root-certs must not appear either (webpki-roots re-exports it).
+  "bash -c 'if cargo tree -p openshell-sandbox -i webpki-root-certs --no-default-features --features system-ca-roots 2>/dev/null | grep -q webpki-root-certs; then echo \"ERROR: webpki-root-certs found in system CA roots build\" >&2; exit 1; fi'",
 ]

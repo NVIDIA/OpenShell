@@ -20,6 +20,7 @@ SEMVER_TAG_RE = re.compile(r"^v?(?P<major>\d+)\.(?P<minor>\d+)\.(?P<patch>\d+)$"
 class Versions:
     python: str
     cargo: str
+    npm: str
     docker: str
     deb: str
     snap: str
@@ -106,6 +107,12 @@ def _versions_from_parts(
     # 0.1.0.dev3+gabcdef -> 0.1.0-dev.3+gabcdef
     cargo_version = re.sub(r"\.dev(\d+)", r"-dev.\1", python_version)
 
+    # npm follows SemVer 2.0 like Cargo, but fold the '+g<sha>' build metadata
+    # into the prerelease (npm/registries treat build metadata as insignificant
+    # for version identity, so each dev build must differ in the prerelease).
+    # 0.1.0-dev.3+gabcdef -> 0.1.0-dev.3.gabcdef ; a tagged release stays 0.1.0.
+    npm_version = cargo_version.replace("+", ".")
+
     # Docker tags can't contain '+'.
     docker_version = cargo_version.replace("+", "-")
 
@@ -123,6 +130,7 @@ def _versions_from_parts(
     return Versions(
         python=python_version,
         cargo=cargo_version,
+        npm=npm_version,
         docker=docker_version,
         deb=deb_version,
         snap=snap_version,
@@ -154,6 +162,7 @@ def _compute_versions() -> Versions:
 def _print_env(versions: Versions) -> None:
     print(f"VERSION_PY={versions.python}")
     print(f"VERSION_CARGO={versions.cargo}")
+    print(f"VERSION_NPM={versions.npm}")
     print(f"VERSION_DOCKER={versions.docker}")
     print(f"VERSION_DEB={versions.deb}")
     print(f"VERSION_SNAP={versions.snap}")
@@ -170,6 +179,8 @@ def get_version(format: str) -> None:
         print(versions.python)
     elif format == "cargo":
         print(versions.cargo)
+    elif format == "npm":
+        print(versions.npm)
     elif format == "docker":
         print(versions.docker)
     elif format == "deb":
@@ -329,6 +340,17 @@ class Openshell < Formula
     (var/"log/openshell").mkpath
     system bin/"openshell-gateway", "generate-certs", "--output-dir", var/"openshell/tls", "--server-san", "host.openshell.internal"
 
+    gateway_config = var/"openshell/gateway.toml"
+    unless gateway_config.exist?
+      gateway_config.write <<~TOML
+        [openshell]
+        version = 1
+
+        [openshell.gateway]
+        bind_address = "[::1]:{LOCAL_GATEWAY_PORT}"
+      TOML
+    end
+
     entitlements = var/"openshell/openshell-driver-vm.entitlements.plist"
     entitlements.atomic_write <<~XML
       <?xml version="1.0" encoding="UTF-8"?>
@@ -357,7 +379,7 @@ class Openshell < Formula
         brew services restart openshell
 
       Register it with the OpenShell CLI:
-        openshell gateway add https://127.0.0.1:{LOCAL_GATEWAY_PORT} --local --name openshell
+        openshell gateway add https://[::1]:{LOCAL_GATEWAY_PORT} --local --name openshell
     EOS
   end
 
@@ -407,6 +429,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     get_version_parser.add_argument(
         "--cargo", action="store_true", help="Print Cargo version only."
+    )
+    get_version_parser.add_argument(
+        "--npm", action="store_true", help="Print npm version only."
     )
     get_version_parser.add_argument(
         "--docker", action="store_true", help="Print Docker version only."
@@ -461,6 +486,8 @@ def main() -> None:
             get_version("python")
         elif args.cargo:
             get_version("cargo")
+        elif args.npm:
+            get_version("npm")
         elif args.docker:
             get_version("docker")
         elif args.deb:

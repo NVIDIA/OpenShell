@@ -1,4 +1,12 @@
-# NVIDIA OpenShell
+<!-- markdownlint-disable MD033 MD041 -->
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/brand/assets/openshell-banner-dark.png">
+  <source media="(prefers-color-scheme: light)" srcset="docs/brand/assets/openshell-banner-light.png">
+  <img alt="OpenShell" src="docs/brand/assets/openshell-banner-light.png" width="430">
+</picture>
+
+<!-- markdownlint-enable MD033 MD041 -->
 
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue)](https://github.com/NVIDIA/OpenShell/blob/main/LICENSE)
 [![PyPI](https://img.shields.io/badge/PyPI-openshell-orange?logo=pypi)](https://pypi.org/project/openshell/)
@@ -16,7 +24,7 @@ OpenShell is built agent-first. The project ships with agent skills for everythi
 
 ### Prerequisites
 
-- **A supported host** — macOS, Windows with WSL 2, or Linux.
+- **A supported host** — Linux, macOS (Apple Silicon), or Windows with WSL 2 (experimental).
 - **A local runtime** — Docker, Podman, or host virtualization enabled for MicroVM-backed sandboxes.
 
 ### Install
@@ -165,7 +173,7 @@ Docker-backed GPU sandboxes auto-select CDI when available and otherwise fall ba
 | `openshell sandbox create -- <agent>`                      | Create a sandbox and launch an agent.           |
 | `openshell sandbox connect [name]`                         | SSH into a running sandbox.                     |
 | `openshell sandbox list`                                   | List all sandboxes.                             |
-| `openshell provider create --type [type]] --from-existing` | Create a credential provider from env vars.     |
+| `openshell provider create --type [type] --from-existing`  | Create a credential provider from env vars.     |
 | `openshell policy set <name> --policy file.yaml`           | Apply or update a policy on a running sandbox.  |
 | `openshell policy get <name>`                              | Show the active policy.                         |
 | `openshell inference set --provider <p> --model <m>`       | Configure the `inference.local` endpoint.       |
@@ -198,7 +206,7 @@ openshell sandbox create --from ./my-sandbox-dir   # local Dockerfile
 openshell sandbox create --from registry.io/img:v1 # container image
 ```
 
-See the [community sandboxes](https://docs.nvidia.com/openshell/latest/sandboxes/community-sandboxes) catalog and the [BYOC example](https://github.com/NVIDIA/OpenShell/tree/main/examples/bring-your-own-container) for details.
+See the [OpenShell Community](https://github.com/NVIDIA/OpenShell-Community) catalog and the [BYOC example](https://github.com/NVIDIA/OpenShell/tree/main/examples/bring-your-own-container) for details.
 
 ## Explore with Your Agent
 
@@ -216,12 +224,12 @@ Your agent can load skills for CLI usage (`openshell-cli`), gateway troubleshoot
 
 OpenShell is developed using the same agent-driven workflows it enables. The `.agents/skills/` directory contains workflow automation that powers the project's development cycle:
 
-- **Spike and build:** Investigate a problem with `create-spike`, then implement it with `build-from-issue` once a human approves.
-- **Triage and route:** Community issues are assessed with `triage-issue`, classified, and routed into the spike-build pipeline.
+- **Spike and build:** Investigate a problem with `create-spike`; a human accepts or declines it and separately places it on the [roadmap](https://github.com/orgs/NVIDIA/projects/233). Accepted work can remain human-owned or enter the optional, human-gated `agent:*` planning and implementation workflow.
+- **Triage and route:** Community issues are assessed with `triage-issue`. Agents establish technical validity and impact; humans decide whether the project should act and where the work sits on the roadmap.
 - **Security review:** `review-security-issue` produces a severity assessment and remediation plan. `fix-security-issue` implements it.
 - **Policy authoring:** `generate-sandbox-policy` creates YAML policies from plain-language requirements or API documentation.
 
-All implementation work is human-gated — agents propose plans, humans approve, agents build. See [AGENTS.md](AGENTS.md) for the full workflow chain documentation.
+All agent implementation work is human-gated: maintainers explicitly request a plan, agents propose it, maintainers approve it, and agents build. See [AGENTS.md](AGENTS.md) for the full workflow chain documentation.
 
 ## Getting Help
 
@@ -234,7 +242,7 @@ All implementation work is human-gated — agents propose plans, humans approve,
 
 - [Full Documentation](https://docs.nvidia.com/openshell/latest/index.html) — overview, architecture, tutorials, and reference
 - [Quickstart](https://docs.nvidia.com/openshell/latest/get-started/quickstart) — detailed install and first sandbox walkthrough
-- [GitHub Sandbox Tutorial](https://docs.nvidia.com/openshell/latest/tutorials/github-sandbox) — end-to-end scoped GitHub repo access
+- [GitHub Sandbox Tutorial](https://docs.nvidia.com/openshell/latest/get-started/tutorials/github-sandbox) — end-to-end scoped GitHub repo access
 - [Architecture](https://github.com/NVIDIA/OpenShell/tree/main/architecture) — detailed architecture docs and design decisions
 - [Roadmap](https://github.com/orgs/NVIDIA/projects/233) — planned work and project priorities
 - [RFC Board](https://github.com/orgs/NVIDIA/projects/233/views/6) — RFC proposals tracked on the OpenShell Roadmap with the `rfc` label
@@ -250,7 +258,7 @@ OpenShell is built agent-first — your agent is your first collaborator. Before
 
 OpenShell collects anonymous telemetry to help improve the project for developers. This data is not used to track individual user behavior. It helps us understand aggregate usage of sandbox, provider, and policy workflows so we can prioritize product improvements and share usage trends with the community.
 
-Disable telemetry at runtime by setting `OPENSHELL_TELEMETRY_ENABLED=false` on the gateway deployment. OpenShell propagates this deployment setting into sandbox supervisor environments so sandbox-side telemetry collection is disabled as well.
+Disable telemetry at runtime by setting `OPENSHELL_TELEMETRY_ENABLED=false` on the gateway deployment. For Helm installs, set `server.telemetryEnabled=false`. OpenShell propagates this deployment setting into sandbox supervisor environments so sandbox-side telemetry collection is disabled as well.
 
 You can also compile telemetry out entirely. Telemetry support is a default-on `telemetry` Cargo feature; building with `--no-default-features` produces binaries that contain no telemetry endpoint, no telemetry HTTP client, and no emission code. Build telemetry-free artifacts with, for example, `cargo build --release -p openshell-server --no-default-features` (gateway) and the equivalent for `openshell-sandbox` and `openshell-driver-vm`. With telemetry compiled out, the gateway emits nothing and reports telemetry disabled to the sandboxes it launches.
 

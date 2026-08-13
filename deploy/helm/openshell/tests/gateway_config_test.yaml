@@ -44,6 +44,26 @@ tests:
           path: spec.template.spec.containers[0].name
           value: openshell-gateway
 
+  - it: enables anonymous telemetry by default
+    template: templates/statefulset.yaml
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: OPENSHELL_TELEMETRY_ENABLED
+            value: "true"
+
+  - it: disables anonymous telemetry when configured
+    template: templates/statefulset.yaml
+    set:
+      server.telemetryEnabled: false
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: OPENSHELL_TELEMETRY_ENABLED
+            value: "false"
+
   - it: mounts the OIDC CA bundle when TLS is disabled
     template: templates/statefulset.yaml
     set:
@@ -230,6 +250,22 @@ tests:
       - notMatchRegex:
           path: data["gateway.toml"]
           pattern: 'grpc_rate_limit_window_seconds\s*='
+
+  - it: renders fail-closed policy validation posture by default
+    template: templates/gateway-config.yaml
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.gateway\].*?policy_validation_failure_mode\s*=\s*"fail_closed"'
+
+  - it: renders retain-last-valid policy validation posture
+    template: templates/gateway-config.yaml
+    set:
+      server.policyValidationFailureMode: retain_last_valid
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.gateway\].*?policy_validation_failure_mode\s*=\s*"retain_last_valid"'
 
   - it: renders the gRPC rate limit under [openshell.gateway] when both values are positive
     template: templates/gateway-config.yaml
@@ -474,6 +510,7 @@ tests:
       workload.kind: deployment
       replicaCount: 2
       server.externalDbSecret: my-pg-secret
+      server.credentialDrivers.kubernetesSecrets.enabled: true
     asserts:
       - equal:
           path: kind
@@ -521,6 +558,7 @@ tests:
       replicaCount: 2
       server.externalDbSecret: my-pg-secret
       workload.allowMultiReplicaStatefulSet: true
+      server.credentialDrivers.kubernetesSecrets.enabled: true
     asserts:
       - equal:
           path: kind

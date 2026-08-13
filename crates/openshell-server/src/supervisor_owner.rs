@@ -213,6 +213,7 @@ impl SupervisorOwnerIndex {
                 OWNER_OBJECT_TYPE,
                 &owner_object_id(sandbox_id),
                 sandbox_id,
+                "",
                 &payload_bytes,
                 None,
                 condition,
@@ -269,7 +270,7 @@ mod tests {
         let index = test_index(OWNER_TTL).await;
         index
             .store
-            .put("sandbox", "sbx", "sandbox-a", br"{}", None)
+            .put("sandbox", "sbx", "sandbox-a", "default", br"{}", None)
             .await
             .unwrap();
 

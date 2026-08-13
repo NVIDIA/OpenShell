@@ -39,6 +39,30 @@ pub struct GraphqlHttpRequest {
     pub info: GraphqlRequestInfo,
 }
 
+pub(crate) fn log_summary(info: &GraphqlRequestInfo) -> String {
+    if let Some(error) = &info.error {
+        return format!("graphql_error={error:?}");
+    }
+    let operations = info.operations.iter().map(|operation| {
+        let name = operation.operation_name.as_deref().unwrap_or("-");
+        let fields = if operation.fields.is_empty() {
+            "-".to_string()
+        } else {
+            operation.fields.join(",")
+        };
+        let persisted = operation
+            .persisted_query_hash
+            .as_deref()
+            .or(operation.persisted_query_id.as_deref())
+            .unwrap_or("-");
+        format!(
+            "type={} name={} fields={} persisted={}",
+            operation.operation_type, name, fields, persisted
+        )
+    });
+    format!("graphql_ops={}", operations.collect::<Vec<_>>().join(";"))
+}
+
 pub async fn parse_graphql_http_request<C: AsyncRead + AsyncWrite + Unpin + Send>(
     client: &mut C,
     max_body_bytes: usize,
@@ -801,9 +825,7 @@ network_policies:
             ancestors: Vec::new(),
             cmdline_paths: Vec::new(),
             secret_resolver: None,
-            activity_tx: None,
-            dynamic_credentials: None,
-            token_grant_resolver: None,
+            ..Default::default()
         };
         let request_info = crate::l7::L7RequestInfo {
             action: req.action,

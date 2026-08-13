@@ -36,31 +36,32 @@ fn is_selinux_enabled() -> bool {
     false
 }
 
-/// Label key for the sandbox ID.
-pub const LABEL_SANDBOX_ID: &str = "openshell.sandbox-id";
-/// Label key for the sandbox name.
-pub const LABEL_SANDBOX_NAME: &str = "openshell.sandbox-name";
-/// Label key for the sandbox namespace.
-pub const LABEL_SANDBOX_NAMESPACE: &str = "openshell.sandbox-namespace";
+pub use openshell_core::driver_utils::{
+    LABEL_SANDBOX_ID, LABEL_SANDBOX_NAME, LABEL_SANDBOX_NAMESPACE, LABEL_SANDBOX_WORKSPACE,
+};
+
 /// Label applied to all managed containers.
 pub const LABEL_MANAGED: &str = "openshell.managed";
 /// Label filter string for list/event queries.
 pub const LABEL_MANAGED_FILTER: &str = "openshell.managed=true";
 
 /// Container name prefix to avoid collisions with user containers.
-const CONTAINER_PREFIX: &str = "openshell-sandbox-";
+const CONTAINER_PREFIX: &str = "openshell-";
 
 /// Volume name prefix.
 const VOLUME_PREFIX: &str = "openshell-sandbox-";
 
 /// Secret name prefix for per-sandbox gateway JWTs.
 const TOKEN_SECRET_PREFIX: &str = "openshell-token-";
+const PROXY_AUTH_SECRET_PREFIX: &str = "openshell-proxy-auth-";
 
 /// Container-side mount paths for client TLS materials and the sandbox token.
 const TLS_CA_MOUNT_PATH: &str = openshell_core::driver_utils::TLS_CA_MOUNT_PATH;
 const TLS_CERT_MOUNT_PATH: &str = openshell_core::driver_utils::TLS_CERT_MOUNT_PATH;
 const TLS_KEY_MOUNT_PATH: &str = openshell_core::driver_utils::TLS_KEY_MOUNT_PATH;
 const SANDBOX_TOKEN_MOUNT_PATH: &str = openshell_core::driver_utils::SANDBOX_TOKEN_MOUNT_PATH;
+const UPSTREAM_PROXY_AUTH_MOUNT_PATH: &str =
+    openshell_core::driver_utils::UPSTREAM_PROXY_AUTH_MOUNT_PATH;
 
 /// Directory inside sandbox containers where the supervisor binary is mounted.
 const SUPERVISOR_MOUNT_DIR: &str = openshell_core::driver_utils::SUPERVISOR_CONTAINER_DIR;
@@ -144,10 +145,12 @@ fn default_true() -> bool {
     true
 }
 
-/// Build a Podman container name from the sandbox name.
+/// Build a Podman container name from the sandbox workspace, name, and ID.
+///
+/// Format: `openshell-{workspace}--{name}-{id}`
 #[must_use]
-pub fn container_name(sandbox_name: &str) -> String {
-    format!("{CONTAINER_PREFIX}{sandbox_name}")
+pub fn container_name(workspace: &str, name: &str, id: &str) -> String {
+    format!("{CONTAINER_PREFIX}{workspace}--{name}-{id}")
 }
 
 /// Build the workspace volume name from the sandbox ID.
@@ -160,6 +163,12 @@ pub fn volume_name(sandbox_id: &str) -> String {
 #[must_use]
 pub fn token_secret_name(sandbox_id: &str) -> String {
     format!("{TOKEN_SECRET_PREFIX}{sandbox_id}")
+}
+
+/// Build the per-sandbox Podman secret name for the corporate proxy credentials.
+#[must_use]
+pub fn proxy_auth_secret_name(sandbox_id: &str) -> String {
+    format!("{PROXY_AUTH_SECRET_PREFIX}{sandbox_id}")
 }
 
 /// Truncate a container ID to 12 characters (standard short form).
@@ -349,10 +358,46 @@ pub fn resolve_image<'a>(sandbox: &'a DriverSandbox, config: &'a PodmanComputeCo
 /// User-supplied vars are inserted first so that the required driver
 /// vars always win -- preventing spec/template overrides of security-
 /// critical values like `OPENSHELL_ENDPOINT` or `OPENSHELL_SANDBOX_ID`.
+/// Build the corporate upstream-proxy command-line arguments passed to the
+/// supervisor.
+///
+/// This operator-owned egress boundary travels on argv, which sandbox
+/// spec/template environment and image `ENV` cannot influence. Credentials
+/// are never on argv — only the root-only mount path is passed; the
+/// supervisor reads the secret from the mount.
+fn upstream_proxy_cli_args(config: &PodmanComputeConfig) -> Vec<String> {
+    let mut args = Vec::new();
+    if let Some(url) = &config.https_proxy {
+        args.push("--upstream-proxy".to_string());
+        args.push(url.clone());
+    }
+    if let Some(list) = &config.no_proxy {
+        args.push("--upstream-no-proxy".to_string());
+        args.push(list.clone());
+    }
+    if config.proxy_auth_file.is_some() {
+        args.push("--upstream-proxy-auth-file".to_string());
+        args.push(UPSTREAM_PROXY_AUTH_MOUNT_PATH.to_string());
+    }
+    // Config validation guarantees the acknowledgement is `true` whenever an
+    // auth file is configured; the supervisor independently refuses
+    // credentials without it.
+    if config.proxy_auth_allow_insecure == Some(true) {
+        args.push("--upstream-proxy-auth-allow-insecure".to_string());
+    }
+    // Absent means the default validated-IP CONNECT binding; only the
+    // explicit hostname opt-in is passed through.
+    if config.proxy_connect_by_hostname == Some(true) {
+        args.push("--upstream-proxy-connect-by-hostname".to_string());
+    }
+    args
+}
+
 fn build_env(
     sandbox: &DriverSandbox,
     config: &PodmanComputeConfig,
     image: &str,
+    oci_user: &str,
 ) -> BTreeMap<String, String> {
     let spec = sandbox.spec.as_ref();
     let template = spec.and_then(|s| s.template.as_ref());
@@ -386,6 +431,12 @@ fn build_env(
     }
 
     // 2. Required driver vars (highest priority -- always overwrite).
+
+    // The operator's corporate egress proxy settings are not environment
+    // variables: they travel on the supervisor's argv (see
+    // `upstream_proxy_cli_args`), which sandbox spec/template environment
+    // and image ENV cannot influence.
+
     env.insert(
         openshell_core::sandbox_env::SANDBOX.into(),
         sandbox.name.clone(),
@@ -432,6 +483,18 @@ fn build_env(
 
     env.remove(openshell_core::sandbox_env::SANDBOX_TOKEN);
     env.remove(openshell_core::sandbox_env::SANDBOX_TOKEN_FILE);
+    env.insert(
+        openshell_core::sandbox_env::OCI_IMAGE_USER.into(),
+        oci_user.to_string(),
+    );
+    env.insert(
+        openshell_core::sandbox_env::SANDBOX_UID.into(),
+        String::new(),
+    );
+    env.insert(
+        openshell_core::sandbox_env::SANDBOX_GID.into(),
+        String::new(),
+    );
 
     // 4. Gateway-minted sandbox JWT. Keep the raw bearer out of container
     //    metadata; the supervisor reads it from a driver-owned bind mount.
@@ -464,6 +527,7 @@ fn build_labels(sandbox: &DriverSandbox) -> BTreeMap<String, String> {
     labels.insert(LABEL_SANDBOX_ID.into(), sandbox.id.clone());
     labels.insert(LABEL_SANDBOX_NAME.into(), sandbox.name.clone());
     labels.insert(LABEL_SANDBOX_NAMESPACE.into(), sandbox.namespace.clone());
+    labels.insert(LABEL_SANDBOX_WORKSPACE.into(), sandbox.workspace.clone());
     labels.insert(LABEL_MANAGED.into(), "true".into());
 
     labels
@@ -825,6 +889,7 @@ pub fn try_build_container_spec_with_token(
     build_container_spec_with_token_and_gpu_devices(sandbox, config, token_secret_name, cdi_devices)
 }
 
+#[cfg(test)]
 pub fn build_container_spec_with_token_and_gpu_devices(
     sandbox: &DriverSandbox,
     config: &PodmanComputeConfig,
@@ -832,10 +897,30 @@ pub fn build_container_spec_with_token_and_gpu_devices(
     gpu_device_ids: Option<&[String]>,
 ) -> Result<Value, ComputeDriverError> {
     let image = resolve_image(sandbox, config);
-    let name = container_name(&sandbox.name);
+    build_container_spec_for_image(
+        sandbox,
+        config,
+        token_secret_name,
+        gpu_device_ids,
+        image,
+        image,
+        "",
+    )
+}
+
+pub fn build_container_spec_for_image(
+    sandbox: &DriverSandbox,
+    config: &PodmanComputeConfig,
+    token_secret_name: Option<&str>,
+    gpu_device_ids: Option<&[String]>,
+    requested_image: &str,
+    image_id: &str,
+    oci_user: &str,
+) -> Result<Value, ComputeDriverError> {
+    let name = container_name(&sandbox.workspace, &sandbox.name, &sandbox.id);
     let vol = volume_name(&sandbox.id);
 
-    let env = build_env(sandbox, config, image);
+    let env = build_env(sandbox, config, requested_image, oci_user);
     let labels = build_labels(sandbox);
     let resource_limits = build_resource_limits(sandbox, config);
     let user_mounts = podman_user_mounts(sandbox, config.enable_bind_mounts)
@@ -878,10 +963,15 @@ pub fn build_container_spec_with_token_and_gpu_devices(
         rw: false,
     }];
     image_volumes.extend(user_mounts.image_volumes);
+    let mut command = vec![
+        "--workdir".to_string(),
+        driver_mounts::DEFAULT_WORKSPACE_ROOT.to_string(),
+    ];
+    command.extend(upstream_proxy_cli_args(config));
 
     let container_spec = ContainerSpec {
         name,
-        image: image.to_string(),
+        image: image_id.to_string(),
         labels,
         env,
         volumes,
@@ -899,7 +989,11 @@ pub fn build_container_spec_with_token_and_gpu_devices(
         // Without this, the container would run the entrypoint binary with
         // the supervisor path as an argument instead of executing it directly.
         entrypoint: vec![SUPERVISOR_BINARY_PATH.into()],
-        command: vec![],
+        // Keep Podman's existing /sandbox workspace contract explicit while
+        // the supervisor supports driver-selected workdirs. Operator-owned
+        // corporate proxy flags follow it; the workload command comes from
+        // the reserved environment variable.
+        command,
         // Force the supervisor to run as root (UID 0). Sandbox images may
         // set a non-root USER directive (e.g. `USER sandbox`), but the
         // supervisor needs root to create network namespaces, set up the
@@ -976,7 +1070,7 @@ pub fn build_container_spec_with_token_and_gpu_devices(
         // locks itself down.
         no_new_privileges: true,
         seccomp_profile_path: "unconfined".into(),
-        image_pull_policy: config.image_pull_policy.as_str().to_string(),
+        image_pull_policy: "never".to_string(),
         healthconfig: HealthConfig {
             test: vec![
                 "CMD-SHELL".into(),
@@ -993,15 +1087,32 @@ pub fn build_container_spec_with_token_and_gpu_devices(
         },
         resource_limits,
         secret_env: BTreeMap::new(),
-        secrets: token_secret_name.map_or_else(Vec::new, |source| {
-            vec![SecretMount {
-                source: source.to_string(),
-                target: SANDBOX_TOKEN_MOUNT_PATH.into(),
-                uid: 0,
-                gid: 0,
-                mode: 0o400,
-            }]
-        }),
+        secrets: {
+            let mut secrets = Vec::new();
+            if let Some(source) = token_secret_name {
+                secrets.push(SecretMount {
+                    source: source.to_string(),
+                    target: SANDBOX_TOKEN_MOUNT_PATH.into(),
+                    uid: 0,
+                    gid: 0,
+                    mode: 0o400,
+                });
+            }
+            // Corporate proxy credentials, when configured, are mounted as a
+            // root-only secret. The driver creates a matching Podman secret
+            // (see `create_sandbox_proxy_auth_secret`) named deterministically
+            // from the sandbox id, so no name needs threading through here.
+            if config.proxy_auth_file.is_some() {
+                secrets.push(SecretMount {
+                    source: proxy_auth_secret_name(&sandbox.id),
+                    target: UPSTREAM_PROXY_AUTH_MOUNT_PATH.into(),
+                    uid: 0,
+                    gid: 0,
+                    mode: 0o400,
+                });
+            }
+            secrets
+        },
         stop_timeout: config.stop_timeout_secs,
         // Inject stable host aliases into /etc/hosts so sandbox containers can
         // reach services on the host. `host.openshell.internal` is the driver-
@@ -1022,7 +1133,7 @@ pub fn build_container_spec_with_token_and_gpu_devices(
             let mut m = vec![Mount {
                 kind: "tmpfs".into(),
                 source: "tmpfs".into(),
-                destination: "/run/netns".into(),
+                destination: openshell_core::container_paths::NETNS_MOUNT_ROOT.into(),
                 options: vec!["rw".into(), "nosuid".into(), "nodev".into()],
             }];
             // Bind-mount client TLS materials into the container when mTLS
@@ -1155,40 +1266,11 @@ mod tests {
         std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
 
     fn json_struct(value: Value) -> prost_types::Struct {
-        match json_value(value).kind {
-            Some(prost_types::value::Kind::StructValue(value)) => value,
-            _ => panic!("expected JSON object"),
-        }
-    }
-
-    fn json_value(value: Value) -> prost_types::Value {
-        match value {
-            Value::Null => prost_types::Value { kind: None },
-            Value::Bool(value) => prost_types::Value {
-                kind: Some(prost_types::value::Kind::BoolValue(value)),
-            },
-            Value::Number(value) => prost_types::Value {
-                kind: value.as_f64().map(prost_types::value::Kind::NumberValue),
-            },
-            Value::String(value) => prost_types::Value {
-                kind: Some(prost_types::value::Kind::StringValue(value)),
-            },
-            Value::Array(values) => prost_types::Value {
-                kind: Some(prost_types::value::Kind::ListValue(
-                    prost_types::ListValue {
-                        values: values.into_iter().map(json_value).collect(),
-                    },
-                )),
-            },
-            Value::Object(values) => prost_types::Value {
-                kind: Some(prost_types::value::Kind::StructValue(prost_types::Struct {
-                    fields: values
-                        .into_iter()
-                        .map(|(key, value)| (key, json_value(value)))
-                        .collect(),
-                })),
-            },
-        }
+        let Value::Object(object) = value else {
+            panic!("expected JSON object");
+        };
+        proto_struct::json_object_to_struct(object)
+            .expect("test JSON must convert to a protobuf Struct")
     }
 
     fn gpu_resources(count: Option<u32>) -> ResourceRequirements {
@@ -1276,8 +1358,59 @@ mod tests {
     }
 
     #[test]
-    fn container_name_is_prefixed() {
-        assert_eq!(container_name("my-sandbox"), "openshell-sandbox-my-sandbox");
+    fn container_name_is_workspace_qualified() {
+        assert_eq!(
+            container_name("default", "my-sandbox", "abc-123"),
+            "openshell-default--my-sandbox-abc-123"
+        );
+    }
+
+    #[test]
+    fn container_spec_pins_inspected_image_and_protects_oci_identity() {
+        let mut sandbox = test_sandbox("test-id", "test-name");
+        let spec = sandbox.spec.get_or_insert_default();
+        for (key, value) in [
+            (openshell_core::sandbox_env::OCI_IMAGE_USER, "spoofed"),
+            (openshell_core::sandbox_env::SANDBOX_UID, "9999"),
+            (openshell_core::sandbox_env::SANDBOX_GID, "9999"),
+        ] {
+            spec.environment.insert(key.to_string(), value.to_string());
+        }
+
+        let container = build_container_spec_for_image(
+            &sandbox,
+            &test_config(),
+            None,
+            None,
+            "registry.example/app:latest",
+            "sha256:immutable",
+            "app:staff",
+        )
+        .unwrap();
+
+        assert_eq!(container["image"].as_str(), Some("sha256:immutable"));
+        assert_eq!(
+            container["env"]["OPENSHELL_CONTAINER_IMAGE"].as_str(),
+            Some("registry.example/app:latest")
+        );
+        assert_eq!(container["user"].as_str(), Some("0:0"));
+        assert_eq!(container["image_pull_policy"].as_str(), Some("never"));
+        assert_eq!(
+            container["env"][openshell_core::sandbox_env::OCI_IMAGE_USER].as_str(),
+            Some("app:staff")
+        );
+        assert_eq!(
+            container["env"][openshell_core::sandbox_env::SANDBOX_UID].as_str(),
+            Some("")
+        );
+        assert_eq!(
+            container["env"][openshell_core::sandbox_env::SANDBOX_GID].as_str(),
+            Some("")
+        );
+        assert_eq!(
+            container["command"],
+            serde_json::json!(["--workdir", "/sandbox"])
+        );
     }
 
     #[test]
@@ -1675,6 +1808,125 @@ mod tests {
         );
     }
 
+    /// Extract the container spec's supervisor argv (`command`) as strings.
+    fn spec_command(spec: &Value) -> Vec<String> {
+        spec["command"]
+            .as_array()
+            .expect("command should be an array")
+            .iter()
+            .map(|v| {
+                v.as_str()
+                    .expect("command arg should be a string")
+                    .to_string()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn container_spec_passes_operator_proxy_on_supervisor_argv() {
+        let sandbox = test_sandbox("test-id", "test-name");
+        let mut config = test_config();
+        config.https_proxy = Some("http://proxy.corp.com:8080".to_string());
+        config.no_proxy = Some("*.svc.cluster.local,10.0.0.0/8".to_string());
+
+        let spec = build_container_spec(&sandbox, &config);
+        let command = spec_command(&spec);
+
+        // Config travels on argv (the image cannot forge process arguments),
+        // as flag/value pairs.
+        let idx = command
+            .iter()
+            .position(|a| a == "--upstream-proxy")
+            .expect("proxy URL flag present");
+        assert_eq!(
+            command.get(idx + 1).map(String::as_str),
+            Some("http://proxy.corp.com:8080")
+        );
+        let idx = command
+            .iter()
+            .position(|a| a == "--upstream-no-proxy")
+            .expect("no_proxy flag present");
+        assert_eq!(
+            command.get(idx + 1).map(String::as_str),
+            Some("*.svc.cluster.local,10.0.0.0/8")
+        );
+
+        // The proxy settings are argv-only; nothing about them lands in the
+        // environment, and the conventional proxy variables (which belong to
+        // the sandbox creator) are not touched by operator config.
+        let env_map = spec["env"].as_object().expect("env should be an object");
+        for key in ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"] {
+            assert!(
+                !env_map.contains_key(key),
+                "{key} must not be populated from operator proxy config"
+            );
+        }
+    }
+
+    #[test]
+    fn container_spec_omits_proxy_argv_when_unconfigured() {
+        let sandbox = test_sandbox("test-id", "test-name");
+        let spec = build_container_spec(&sandbox, &test_config());
+        let command = spec_command(&spec);
+
+        assert!(
+            !command.iter().any(|a| a.starts_with("--upstream-proxy")),
+            "no proxy flags without operator proxy config: {command:?}"
+        );
+    }
+
+    #[test]
+    fn container_spec_sandbox_env_cannot_influence_proxy_argv() {
+        use openshell_core::proto::compute::v1::{DriverSandboxSpec, DriverSandboxTemplate};
+
+        // A sandbox creator tries to steer the egress boundary through spec
+        // and template environment (image-baked ENV behaves the same at the
+        // runtime layer). The supervisor takes proxy config only from the
+        // argv the driver builds out of operator config, so none of it has
+        // any effect.
+        let mut sandbox = test_sandbox("test-id", "test-name");
+        sandbox.spec = Some(DriverSandboxSpec {
+            environment: std::collections::HashMap::from([
+                (
+                    "HTTPS_PROXY".to_string(),
+                    "http://attacker:9999".to_string(),
+                ),
+                ("NO_PROXY".to_string(), "*".to_string()),
+            ]),
+            template: Some(DriverSandboxTemplate {
+                environment: std::collections::HashMap::from([(
+                    "NO_PROXY".to_string(),
+                    "*".to_string(),
+                )]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let mut config = test_config();
+        config.https_proxy = Some("http://proxy.corp.com:8080".to_string());
+
+        let spec = build_container_spec(&sandbox, &config);
+        let command = spec_command(&spec);
+
+        // Only the operator's proxy is delivered, and only on argv.
+        let idx = command
+            .iter()
+            .position(|a| a == "--upstream-proxy")
+            .expect("operator proxy flag present");
+        assert_eq!(
+            command.get(idx + 1).map(String::as_str),
+            Some("http://proxy.corp.com:8080")
+        );
+        assert!(
+            !command.iter().any(|a| a == "--upstream-no-proxy"),
+            "sandbox environment must not add a NO_PROXY bypass: {command:?}"
+        );
+        assert!(
+            !command.iter().any(|a| a.contains("attacker")),
+            "attacker proxy must not reach argv: {command:?}"
+        );
+    }
+
     #[test]
     fn container_spec_required_labels_cannot_be_overridden() {
         use openshell_core::proto::compute::v1::{DriverSandboxSpec, DriverSandboxTemplate};
@@ -1682,13 +1934,16 @@ mod tests {
         let mut sandbox = test_sandbox("real-id", "real-name");
         sandbox.namespace = "real-namespace".to_string();
         let mut label_overrides = std::collections::HashMap::new();
-        label_overrides.insert("openshell.sandbox-id".to_string(), "spoofed-id".to_string());
         label_overrides.insert(
-            "openshell.sandbox-name".to_string(),
+            "openshell.ai/sandbox-id".to_string(),
+            "spoofed-id".to_string(),
+        );
+        label_overrides.insert(
+            "openshell.ai/sandbox-name".to_string(),
             "spoofed-name".to_string(),
         );
         label_overrides.insert(
-            "openshell.sandbox-namespace".to_string(),
+            "openshell.ai/sandbox-namespace".to_string(),
             "spoofed-namespace".to_string(),
         );
         sandbox.spec = Some(DriverSandboxSpec {
@@ -1706,20 +1961,22 @@ mod tests {
             .as_object()
             .expect("labels should be an object");
         assert_eq!(
-            labels.get("openshell.sandbox-id").and_then(|v| v.as_str()),
+            labels
+                .get("openshell.ai/sandbox-id")
+                .and_then(|v| v.as_str()),
             Some("real-id"),
             "openshell.sandbox-id must not be overridden by template labels"
         );
         assert_eq!(
             labels
-                .get("openshell.sandbox-name")
+                .get("openshell.ai/sandbox-name")
                 .and_then(|v| v.as_str()),
             Some("real-name"),
             "openshell.sandbox-name must not be overridden by template labels"
         );
         assert_eq!(
             labels
-                .get("openshell.sandbox-namespace")
+                .get("openshell.ai/sandbox-namespace")
                 .and_then(|v| v.as_str()),
             Some("real-namespace"),
             "openshell.sandbox-namespace must not be overridden by template labels"
@@ -1772,6 +2029,7 @@ mod tests {
             namespace: String::new(),
             spec: None,
             status: None,
+            workspace: String::new(),
         }
     }
 
@@ -1808,7 +2066,7 @@ mod tests {
 
     fn test_config() -> PodmanComputeConfig {
         PodmanComputeConfig {
-            socket_path: std::path::PathBuf::from("/tmp/test.sock"),
+            socket_path: Some(std::path::PathBuf::from("/tmp/test.sock")),
             default_image: "test-image:latest".to_string(),
             grpc_endpoint: "http://localhost:50051".to_string(),
             host_gateway_ip: String::new(),
@@ -2258,7 +2516,7 @@ mod tests {
                     "mounts": [{
                         "type": "volume",
                         "source": "work-nfs",
-                        "target": "/etc/openshell/tls/custom"
+                        "target": "/etc/openshell/tls/client"
                     }]
                 }))),
                 ..Default::default()
@@ -2406,6 +2664,104 @@ mod tests {
             !mounts
                 .iter()
                 .any(|m| { m["destination"].as_str() == Some("/etc/openshell/auth/sandbox.jwt") })
+        );
+    }
+
+    #[test]
+    fn container_spec_proxy_auth_file_mounts_secret_and_sets_path_only() {
+        let sandbox = test_sandbox("proxy-id", "proxy-name");
+        let mut config = test_config();
+        config.https_proxy = Some("http://proxy.corp.com:8080".to_string());
+        config.proxy_auth_file = Some("/etc/openshell/secrets/proxy-auth".to_string());
+        config.proxy_auth_allow_insecure = Some(true);
+
+        let spec = build_container_spec(&sandbox, &config);
+        let command = spec_command(&spec);
+
+        // The supervisor gets only the mount *path* on argv, never the
+        // credential itself.
+        let idx = command
+            .iter()
+            .position(|a| a == "--upstream-proxy-auth-file")
+            .expect("auth-file flag present");
+        assert_eq!(
+            command.get(idx + 1).map(String::as_str),
+            Some(UPSTREAM_PROXY_AUTH_MOUNT_PATH)
+        );
+        // The cleartext-credential acknowledgement travels with the auth
+        // file so the supervisor's fail-closed pairing check passes.
+        assert!(
+            command
+                .iter()
+                .any(|a| a == "--upstream-proxy-auth-allow-insecure"),
+            "acknowledgement flag present: {command:?}"
+        );
+        // The raw credential path from config never appears anywhere in the
+        // spec (only the fixed mount path does).
+        assert!(
+            !command
+                .iter()
+                .any(|a| a == "/etc/openshell/secrets/proxy-auth"),
+            "host-side credential path must not reach the container: {command:?}"
+        );
+
+        let secrets = spec["secrets"]
+            .as_array()
+            .expect("secrets should be an array");
+        assert!(
+            secrets.iter().any(|secret| {
+                secret["source"].as_str() == Some(proxy_auth_secret_name(&sandbox.id).as_str())
+                    && secret["target"].as_str() == Some(UPSTREAM_PROXY_AUTH_MOUNT_PATH)
+                    && secret["mode"].as_u64() == Some(0o400)
+            }),
+            "proxy credentials must be delivered through a root-only secret mount"
+        );
+    }
+
+    #[test]
+    fn container_spec_omits_proxy_auth_mount_when_unconfigured() {
+        let sandbox = test_sandbox("proxy-id", "proxy-name");
+        let mut config = test_config();
+        config.https_proxy = Some("http://proxy.corp.com:8080".to_string());
+
+        let spec = build_container_spec(&sandbox, &config);
+        let command = spec_command(&spec);
+        assert!(
+            !command.iter().any(|a| a == "--upstream-proxy-auth-file"),
+            "auth-file flag must be absent when no proxy_auth_file is configured: {command:?}"
+        );
+        assert!(
+            !command
+                .iter()
+                .any(|a| a == "--upstream-proxy-auth-allow-insecure"),
+            "acknowledgement flag must be absent when no proxy_auth_file is configured: {command:?}"
+        );
+    }
+
+    #[test]
+    fn container_spec_connect_by_hostname_passed_only_on_opt_in() {
+        let sandbox = test_sandbox("proxy-id", "proxy-name");
+        let mut config = test_config();
+        config.https_proxy = Some("http://proxy.corp.com:8080".to_string());
+
+        // Default: no flag, the supervisor uses validated-IP CONNECT binding.
+        let spec = build_container_spec(&sandbox, &config);
+        let command = spec_command(&spec);
+        assert!(
+            !command
+                .iter()
+                .any(|a| a == "--upstream-proxy-connect-by-hostname"),
+            "hostname CONNECT must be absent without the operator opt-in: {command:?}"
+        );
+
+        config.proxy_connect_by_hostname = Some(true);
+        let spec = build_container_spec(&sandbox, &config);
+        let command = spec_command(&spec);
+        assert!(
+            command
+                .iter()
+                .any(|a| a == "--upstream-proxy-connect-by-hostname"),
+            "hostname CONNECT flag present on opt-in: {command:?}"
         );
     }
 

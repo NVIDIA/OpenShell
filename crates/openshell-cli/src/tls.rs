@@ -3,6 +3,7 @@
 
 use miette::{IntoDiagnostic, Result, WrapErr};
 use openshell_core::auth::EdgeAuthInterceptor;
+use openshell_core::net::set_tcp_nodelay_best_effort;
 use openshell_core::proto::inference_client::InferenceClient;
 use openshell_core::proto::open_shell_client::OpenShellClient;
 use rustls::{
@@ -295,6 +296,7 @@ impl tower::Service<hyper::Uri> for InsecureTlsConnector {
             let port = uri.port_u16().unwrap_or(443);
             let addr = format!("{host}:{port}");
             let tcp = tokio::net::TcpStream::connect(addr).await?;
+            set_tcp_nodelay_best_effort(&tcp);
             let server_name = ServerName::try_from(host)?;
             let tls_stream = tls_connector.connect(server_name, tcp).await?;
             Ok(hyper_util::rt::TokioIo::new(tls_stream))

@@ -131,11 +131,7 @@ impl KubeTarget {
         Ok(())
     }
 
-    async fn roll_gateway_pods(
-        &self,
-        pods: Vec<String>,
-        expected: usize,
-    ) -> Result<(), String> {
+    async fn roll_gateway_pods(&self, pods: Vec<String>, expected: usize) -> Result<(), String> {
         for pod in pods {
             self.delete_gateway_pod(&pod).await?;
             self.wait_for_gateway_pods(expected).await?;
@@ -202,8 +198,8 @@ impl KubeTarget {
                 .as_array()
                 .is_some_and(|conditions| {
                     conditions.iter().any(|condition| {
-                    condition["type"].as_str() == Some("Ready")
-                        && condition["status"].as_str() == Some("True")
+                        condition["type"].as_str() == Some("Ready")
+                            && condition["status"].as_str() == Some("True")
                     })
                 });
             pods.push(GatewayPod {
@@ -264,9 +260,8 @@ impl Drop for PortForward {
 }
 
 fn required_env(name: &str) -> String {
-    std::env::var(name).unwrap_or_else(|_| {
-        panic!("{name} is not set; run through e2e/rust/e2e-kubernetes.sh")
-    })
+    std::env::var(name)
+        .unwrap_or_else(|_| panic!("{name} is not set; run through e2e/rust/e2e-kubernetes.sh"))
 }
 
 async fn exec_through_pod(
@@ -349,9 +344,7 @@ async fn exec_through_configured_gateway(sandbox_name: &str, marker: &str) -> Re
     Ok(())
 }
 
-async fn create_sandbox_through_configured_gateway(
-    phase: &str,
-) -> Result<SandboxGuard, String> {
+async fn create_sandbox_through_configured_gateway(phase: &str) -> Result<SandboxGuard, String> {
     let marker = format!("ha-create-watch-{phase}");
     let guard = SandboxGuard::create(&["--", "printf", "%s", &marker]).await?;
     let output = strip_ansi(&guard.create_output);
@@ -538,10 +531,9 @@ async fn sandbox_exec_rebalances_across_gateway_scale_and_rollout() {
         kube.delete_gateway_pod(&pod)
             .await
             .unwrap_or_else(|err| panic!("delete gateway pod {pod}: {err}"));
-        pods = kube
-            .wait_for_gateway_pods(2)
-            .await
-            .unwrap_or_else(|err| panic!("gateway pods should recover after deleting {pod}: {err}"));
+        pods = kube.wait_for_gateway_pods(2).await.unwrap_or_else(|err| {
+            panic!("gateway pods should recover after deleting {pod}: {err}")
+        });
         assert_exec_through_all_pods(&kube, &pods, &sandbox.name, &format!("delete-{pod}"))
             .await
             .unwrap_or_else(|err| panic!("exec should work after deleting {pod}: {err}"));
@@ -589,8 +581,7 @@ async fn sandbox_file_sync_survives_gateway_pod_rolls() {
     let tmpdir = tempfile::tempdir().expect("create HA sync tmpdir");
     let upload_dir = tmpdir.path().join("ha-sync-upload");
     fs::create_dir_all(&upload_dir).expect("create HA sync upload dir");
-    fs::write(upload_dir.join("marker.txt"), "ha-sync-marker")
-        .expect("write HA sync marker");
+    fs::write(upload_dir.join("marker.txt"), "ha-sync-marker").expect("write HA sync marker");
 
     let payload = upload_dir.join("payload.bin");
     write_deterministic_payload(&payload, HA_SYNC_PAYLOAD_BYTES);

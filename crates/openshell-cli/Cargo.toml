@@ -19,7 +19,7 @@ openshell-bootstrap = { path = "../openshell-bootstrap" }
 openshell-core = { path = "../openshell-core", default-features = false }
 openshell-policy = { path = "../openshell-policy" }
 openshell-providers = { path = "../openshell-providers" }
-openshell-prover = { path = "../openshell-prover" }
+openshell-sdk = { path = "../openshell-sdk" }
 openshell-tui = { path = "../openshell-tui" }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -46,7 +46,7 @@ bytes = { workspace = true }
 http-body-util = { workspace = true }
 hyper = { workspace = true }
 hyper-util = { workspace = true }
-hyper-rustls = { version = "0.27", default-features = false, features = ["native-tokio", "http1", "http2", "tls12", "logging", "ring", "webpki-tokio"] }
+hyper-rustls = { version = "0.27", default-features = false, features = ["native-tokio", "http1", "http2", "tls12", "logging", "ring"] }
 rustls = { workspace = true }
 rustls-pemfile = { workspace = true }
 tokio-rustls = { workspace = true }
@@ -63,7 +63,7 @@ tar = "0.4"
 tempfile = "3"
 
 # OIDC/Auth
-oauth2 = "5"
+oauth2 = { version = "5", default-features = false, features = ["reqwest"] }
 base64 = { workspace = true }
 
 # WebSocket (Cloudflare tunnel proxy)
@@ -72,7 +72,6 @@ tokio-tungstenite = { workspace = true }
 # Streams
 futures = { workspace = true }
 tokio-stream = { workspace = true }
-nix = { workspace = true }
 
 # URL parsing
 url = { workspace = true }
@@ -84,8 +83,8 @@ tracing-subscriber = { workspace = true }
 [lints]
 workspace = true
 
-[features]
-bundled-z3 = ["openshell-prover/bundled-z3"]
+[target.'cfg(unix)'.dependencies]
+nix = { workspace = true }
 
 [dev-dependencies]
 futures = { workspace = true }

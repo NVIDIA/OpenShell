@@ -174,7 +174,7 @@ The policy separates filesystem paths into read-only and read-write groups.
 
 | Aspect | Detail |
 |---|---|
-| Default | System paths (`/usr`, `/lib`, `/etc`, `/var/log`) are read-only. Working paths (`/sandbox`, `/tmp`) are read-write. `/app` is conditionally included if it exists. |
+| Default | System paths (`/usr`, `/lib`, `/etc`, `/var/log`) are read-only. The resolved working directory and `/tmp` are read-write. `/app` is conditionally included if it exists. |
 | What you can change | Add or remove paths in `filesystem_policy.read_only` and `filesystem_policy.read_write`. |
 | Risk if relaxed | Making system paths writable lets the agent replace binaries, modify TLS trust stores, or change DNS resolution. Validation rejects broad read-write paths (like `/`). |
 | Recommendation | Keep system paths read-only. If the agent needs additional writable space, add a specific subdirectory. |
@@ -201,10 +201,10 @@ The sandbox process runs as a non-root user after explicit privilege dropping.
 
 | Aspect | Detail |
 |---|---|
-| Default | `run_as_user: sandbox`, `run_as_group: sandbox`. The supervisor calls `setuid()`/`setgid()` with post-condition verification, disables core dumps with `RLIMIT_CORE=0`, and on Linux sets `PR_SET_DUMPABLE=0`. |
-| What you can change | Set `run_as_user` and `run_as_group` in the `process` section. Validation rejects root (`root` or `0`). |
+| Default | The compute driver selects a non-root identity. Docker and Podman use the image's OCI `USER` as a per-field fallback. The supervisor calls `setuid()`/`setgid()` with post-condition verification, disables core dumps with `RLIMIT_CORE=0`, and on Linux sets `PR_SET_DUMPABLE=0`. |
+| What you can change | Set either or both `run_as_user` and `run_as_group` fields in the `process` section. Each explicit field takes precedence and must be `sandbox` or a numeric UID/GID value in the allowed sandbox range. Docker and Podman may use named identities or non-root system IDs only through OCI `USER` fallback. Root identities are always rejected. |
 | Risk if relaxed | Running as a higher-privilege user increases the impact of container escape vulnerabilities. |
-| Recommendation | Keep the `sandbox` user. Do not attempt to set root. |
+| Recommendation | Use a dedicated non-root image identity or explicit numeric policy identity. Do not attempt to set root. |
 
 ### Seccomp Filters
 

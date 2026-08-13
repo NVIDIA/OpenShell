@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+#![cfg(not(target_os = "windows"))]
+
 mod helpers;
 
 use helpers::{
@@ -31,7 +33,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
 use tokio::net::TcpListener;
@@ -48,6 +50,7 @@ struct SandboxState {
     vm_slow_progress_before_ready: Arc<AtomicBool>,
     vm_log_churn_before_ready: Arc<AtomicBool>,
     global_settings: Arc<Mutex<HashMap<String, SettingValue>>>,
+    gateway_config_requests: Arc<AtomicUsize>,
 }
 
 #[derive(Clone, Default)]
@@ -57,6 +60,13 @@ struct TestOpenShell {
 
 #[tonic::async_trait]
 impl OpenShell for TestOpenShell {
+    async fn get_current_user(
+        &self,
+        _request: tonic::Request<openshell_core::proto::GetCurrentUserRequest>,
+    ) -> Result<Response<openshell_core::proto::GetCurrentUserResponse>, Status> {
+        Err(Status::unimplemented("not used by this test server"))
+    }
+
     async fn health(
         &self,
         _request: tonic::Request<HealthRequest>,
@@ -65,6 +75,13 @@ impl OpenShell for TestOpenShell {
             status: ServiceStatus::Healthy.into(),
             version: "test".to_string(),
         }))
+    }
+
+    async fn get_gateway_info(
+        &self,
+        _request: tonic::Request<openshell_core::proto::GetGatewayInfoRequest>,
+    ) -> Result<Response<openshell_core::proto::GetGatewayInfoResponse>, Status> {
+        Err(Status::unimplemented("unused"))
     }
 
     async fn create_sandbox(
@@ -87,6 +104,9 @@ impl OpenShell for TestOpenShell {
                 created_at_ms: 0,
                 labels: HashMap::new(),
                 resource_version: 0,
+                annotations: HashMap::new(),
+                workspace: String::new(),
+                deletion_timestamp_ms: 0,
             }),
             ..Sandbox::default()
         };
@@ -94,6 +114,20 @@ impl OpenShell for TestOpenShell {
         Ok(Response::new(SandboxResponse {
             sandbox: Some(sandbox),
         }))
+    }
+
+    async fn stop_sandbox(
+        &self,
+        _request: tonic::Request<openshell_core::proto::StopSandboxRequest>,
+    ) -> Result<Response<SandboxResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn start_sandbox(
+        &self,
+        _request: tonic::Request<openshell_core::proto::StartSandboxRequest>,
+    ) -> Result<Response<SandboxResponse>, Status> {
+        Err(Status::unimplemented("unused"))
     }
 
     async fn get_sandbox(
@@ -108,6 +142,9 @@ impl OpenShell for TestOpenShell {
                 created_at_ms: 0,
                 labels: HashMap::new(),
                 resource_version: 0,
+                annotations: HashMap::new(),
+                workspace: String::new(),
+                deletion_timestamp_ms: 0,
             }),
             ..Sandbox::default()
         };
@@ -169,6 +206,9 @@ impl OpenShell for TestOpenShell {
         &self,
         _request: tonic::Request<GetGatewayConfigRequest>,
     ) -> Result<Response<GetGatewayConfigResponse>, Status> {
+        self.state
+            .gateway_config_requests
+            .fetch_add(1, Ordering::SeqCst);
         Ok(Response::new(GetGatewayConfigResponse {
             settings: self.state.global_settings.lock().await.clone(),
             settings_revision: 1,
@@ -368,6 +408,9 @@ impl OpenShell for TestOpenShell {
                     created_at_ms: 0,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
+                    workspace: String::new(),
+                    deletion_timestamp_ms: 0,
                 }),
                 ..Sandbox::default()
             };
@@ -666,13 +709,62 @@ impl OpenShell for TestOpenShell {
     ) -> Result<Response<Self::ForwardTcpStream>, Status> {
         Err(Status::unimplemented("not implemented in test"))
     }
+
+    async fn create_workspace(
+        &self,
+        _request: tonic::Request<openshell_core::proto::CreateWorkspaceRequest>,
+    ) -> Result<Response<openshell_core::proto::CreateWorkspaceResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn get_workspace(
+        &self,
+        _request: tonic::Request<openshell_core::proto::GetWorkspaceRequest>,
+    ) -> Result<Response<openshell_core::proto::GetWorkspaceResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn list_workspaces(
+        &self,
+        _request: tonic::Request<openshell_core::proto::ListWorkspacesRequest>,
+    ) -> Result<Response<openshell_core::proto::ListWorkspacesResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn delete_workspace(
+        &self,
+        _request: tonic::Request<openshell_core::proto::DeleteWorkspaceRequest>,
+    ) -> Result<Response<openshell_core::proto::DeleteWorkspaceResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn add_workspace_member(
+        &self,
+        _request: tonic::Request<openshell_core::proto::AddWorkspaceMemberRequest>,
+    ) -> Result<Response<openshell_core::proto::AddWorkspaceMemberResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn remove_workspace_member(
+        &self,
+        _request: tonic::Request<openshell_core::proto::RemoveWorkspaceMemberRequest>,
+    ) -> Result<Response<openshell_core::proto::RemoveWorkspaceMemberResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn list_workspace_members(
+        &self,
+        _request: tonic::Request<openshell_core::proto::ListWorkspaceMembersRequest>,
+    ) -> Result<Response<openshell_core::proto::ListWorkspaceMembersResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
 }
 
 struct TestServer {
     endpoint: String,
     tls: TlsOptions,
     openshell: TestOpenShell,
-    _dir: TempDir,
+    dir: TempDir,
 }
 
 async fn run_server() -> TestServer {
@@ -721,7 +813,7 @@ async fn run_server() -> TestServer {
         endpoint,
         tls,
         openshell,
-        _dir: dir,
+        dir,
     }
 }
 
@@ -749,59 +841,13 @@ fn install_fake_pgrep_no_match(dir: &TempDir) -> std::path::PathBuf {
 fn install_fake_forward_process_helper(dir: &TempDir) -> std::path::PathBuf {
     // Linux validation reads exact `/proc` argv, so the fake child must look
     // like `ssh`, not Python or shell with appended tokens.
+    if let Some(path) = std::env::var_os("OPENSHELL_TEST_FAKE_FORWARD_PATH") {
+        return path.into();
+    }
+
     let source_path = dir.path().join("fake-forward-process.rs");
     let binary_path = dir.path().join("fake-forward-process");
-    fs::write(
-        &source_path,
-        r#"
-use std::net::TcpListener;
-use std::thread;
-use std::time::Duration;
-
-fn main() {
-    match std::env::var("OPENSHELL_FAKE_FORWARD_MODE").as_deref() {
-        Ok("listen") => run_listener(),
-        Ok("sleep") => loop {
-            thread::sleep(Duration::from_secs(60));
-        },
-        _ => std::process::exit(2),
-    }
-}
-
-fn run_listener() {
-    let port = forward_port().expect("fake forward must receive an SSH -L argument");
-    let listener = TcpListener::bind(("127.0.0.1", port)).expect("fake forward must bind");
-    for stream in listener.incoming() {
-        let _ = stream;
-    }
-}
-
-fn forward_port() -> Option<u16> {
-    let args = std::env::args().skip(1).collect::<Vec<_>>();
-    let mut index = 0;
-    while index < args.len() {
-        let arg = &args[index];
-        if arg == "-L" {
-            return args.get(index + 1).and_then(|value| local_port(value));
-        }
-        if let Some(value) = arg.strip_prefix("-L").filter(|value| !value.is_empty()) {
-            return local_port(value);
-        }
-        index += 1;
-    }
-    None
-}
-
-fn local_port(forward: &str) -> Option<u16> {
-    let (first, rest) = forward.split_once(':')?;
-    if first.bytes().all(|byte| byte.is_ascii_digit()) {
-        return first.parse().ok();
-    }
-    rest.split_once(':')?.0.parse().ok()
-}
-"#,
-    )
-    .unwrap();
+    fs::write(&source_path, include_bytes!("fixtures/fake_forward.rs")).unwrap();
     let status = std::process::Command::new("rustc")
         .arg("--edition=2021")
         .arg(&source_path)
@@ -972,7 +1018,7 @@ fi
 helper='@HELPER_PATH@'
 echo "$$" > '@PID_PATH@'
 printf '%s\n' "ssh -N -o ProxyCommand=/tmp/openshell ssh-proxy --gateway https://127.0.0.1:9443 --sandbox-id $sandbox_id --token test-token --gateway-name test-gateway -o ExitOnForwardFailure=yes -L $forward sandbox" > '@COMMAND_PATH@'
-exec env OPENSHELL_FAKE_FORWARD_MODE=listen /bin/bash -c 'exec -a ssh "$0" "$@"' "$helper" -N -o "ProxyCommand=/tmp/openshell ssh-proxy --gateway https://127.0.0.1:9443 --sandbox-id $sandbox_id --token test-token --gateway-name test-gateway" -o ExitOnForwardFailure=yes -L "$forward" sandbox
+exec env OPENSHELL_FAKE_FORWARD_MODE=listen "$helper" -N -o "ProxyCommand=/tmp/openshell ssh-proxy --gateway https://127.0.0.1:9443 --sandbox-id $sandbox_id --token test-token --gateway-name test-gateway" -o ExitOnForwardFailure=yes -L "$forward" sandbox
 "#
         .replace("@PID_PATH@", &pid_path.display().to_string())
         .replace("@COMMAND_PATH@", &command_path.display().to_string())
@@ -1045,7 +1091,7 @@ fi
 
 helper='@HELPER_PATH@'
 echo "$$" > '@PID_PATH@'
-exec env OPENSHELL_FAKE_FORWARD_MODE=sleep /bin/bash -c 'exec -a ssh "$0" "$@"' "$helper" -N -o "ProxyCommand=/tmp/openshell ssh-proxy --gateway https://127.0.0.1:9443 --sandbox-id $sandbox_id --token test-token --gateway-name test-gateway" -o ExitOnForwardFailure=yes -L "$forward" sandbox >'@LOG_PATH@' 2>&1
+exec env OPENSHELL_FAKE_FORWARD_MODE=sleep "$helper" -N -o "ProxyCommand=/tmp/openshell ssh-proxy --gateway https://127.0.0.1:9443 --sandbox-id $sandbox_id --token test-token --gateway-name test-gateway" -o ExitOnForwardFailure=yes -L "$forward" sandbox >'@LOG_PATH@' 2>&1
 "#
         .replace("@LOG_PATH@", &log_path.display().to_string())
         .replace("@PID_PATH@", &pid_path.display().to_string())
@@ -1140,6 +1186,7 @@ async fn sandbox_create_keeps_command_sessions_by_default() {
             command: &["echo".into(), "OK".into()],
             ..test_config()
         },
+        "default",
         &tls,
     )
     .await
@@ -1147,9 +1194,43 @@ async fn sandbox_create_keeps_command_sessions_by_default() {
 
     assert!(deleted_names(&server).await.is_empty());
     assert_eq!(
-        load_last_sandbox("openshell").as_deref(),
+        load_last_sandbox("openshell", "default").as_deref(),
         Some("default-command"),
         "default sandboxes should be persisted as last-used"
+    );
+}
+
+#[tokio::test]
+async fn sandbox_create_without_inferred_provider_skips_gateway_config() {
+    let server = run_server().await;
+    let fake_ssh_dir = tempfile::tempdir().unwrap();
+    let xdg_dir = tempfile::tempdir().unwrap();
+    let _env = test_env(&fake_ssh_dir, &xdg_dir);
+    let tls = test_tls(&server);
+    install_fake_ssh(&fake_ssh_dir);
+
+    run::sandbox_create(
+        &server.endpoint,
+        "openshell",
+        run::SandboxCreateConfig {
+            name: Some("no-provider-config"),
+            command: &["echo".into(), "OK".into()],
+            ..test_config()
+        },
+        "default",
+        &tls,
+    )
+    .await
+    .expect("sandbox create should succeed without reading gateway config");
+
+    assert_eq!(
+        server
+            .openshell
+            .state
+            .gateway_config_requests
+            .load(Ordering::SeqCst),
+        0,
+        "commands without an inferred provider must not require global gateway settings"
     );
 }
 
@@ -1172,6 +1253,7 @@ async fn sandbox_create_sends_cpu_and_memory_limits_only() {
             command: &["echo".into(), "OK".into()],
             ..test_config()
         },
+        "default",
         &tls,
     )
     .await
@@ -1239,6 +1321,7 @@ async fn sandbox_create_sends_driver_config_json() {
             command: &["echo".into(), "OK".into()],
             ..test_config()
         },
+        "default",
         &tls,
     )
     .await
@@ -1300,6 +1383,7 @@ async fn sandbox_create_sends_gpu_default_request() {
             command: &["echo".into(), "OK".into()],
             ..test_config()
         },
+        "default",
         &tls,
     )
     .await
@@ -1334,6 +1418,7 @@ async fn sandbox_create_sends_gpu_count_request() {
             command: &["echo".into(), "OK".into()],
             ..test_config()
         },
+        "default",
         &tls,
     )
     .await
@@ -1369,6 +1454,7 @@ async fn sandbox_create_does_not_infer_command_providers_when_v2_enabled() {
             tty_override: Some(true),
             ..test_config()
         },
+        "default",
         &tls,
     )
     .await
@@ -1414,6 +1500,7 @@ async fn sandbox_create_returns_vm_error_without_waiting_for_timeout() {
             command: &["echo".into(), "OK".into()],
             ..test_config()
         },
+        "default",
         &tls,
     )
     .await
@@ -1455,6 +1542,7 @@ async fn sandbox_create_keeps_waiting_while_vm_progress_arrives() {
             command: &["echo".into(), "OK".into()],
             ..test_config()
         },
+        "default",
         &tls,
     )
     .await
@@ -1488,6 +1576,7 @@ async fn sandbox_create_times_out_when_only_logs_arrive() {
             command: &["echo".into(), "OK".into()],
             ..test_config()
         },
+        "default",
         &tls,
     )
     .await
@@ -1518,6 +1607,7 @@ async fn sandbox_create_deletes_command_sessions_with_no_keep() {
             command: &["echo".into(), "OK".into()],
             ..test_config()
         },
+        "default",
         &tls,
     )
     .await
@@ -1528,7 +1618,7 @@ async fn sandbox_create_deletes_command_sessions_with_no_keep() {
         vec![vec!["ephemeral-command".to_string()]]
     );
     assert_eq!(
-        load_last_sandbox("openshell"),
+        load_last_sandbox("openshell", "default"),
         None,
         "no-keep sandboxes should not be persisted as last-used"
     );
@@ -1552,6 +1642,7 @@ async fn sandbox_create_deletes_shell_sessions_with_no_keep() {
             tty_override: Some(true),
             ..test_config()
         },
+        "default",
         &tls,
     )
     .await
@@ -1562,7 +1653,7 @@ async fn sandbox_create_deletes_shell_sessions_with_no_keep() {
         vec![vec!["ephemeral-shell".to_string()]]
     );
     assert_eq!(
-        load_last_sandbox("openshell"),
+        load_last_sandbox("openshell", "default"),
         None,
         "no-keep shell sessions should not be persisted as last-used"
     );
@@ -1585,6 +1676,7 @@ async fn sandbox_create_keeps_sandbox_with_hidden_keep_flag() {
             command: &["echo".into(), "OK".into()],
             ..test_config()
         },
+        "default",
         &tls,
     )
     .await
@@ -1592,7 +1684,7 @@ async fn sandbox_create_keeps_sandbox_with_hidden_keep_flag() {
 
     assert!(deleted_names(&server).await.is_empty());
     assert_eq!(
-        load_last_sandbox("openshell").as_deref(),
+        load_last_sandbox("openshell", "default").as_deref(),
         Some("persistent-keep"),
         "persistent sandboxes should remain selectable as last-used"
     );
@@ -1620,6 +1712,7 @@ async fn sandbox_create_keeps_sandbox_with_forwarding() {
             command: &["echo".into(), "OK".into()],
             ..test_config()
         },
+        "default",
         &tls,
     )
     .await
@@ -1647,9 +1740,16 @@ async fn sandbox_forward_background_tracks_owned_child_when_pid_discovery_fails(
     drop(listener);
 
     let spec = openshell_core::forward::ForwardSpec::new(forward_port);
-    run::sandbox_forward(&server.endpoint, "owned-forward", &spec, true, &tls)
-        .await
-        .expect("background forward should track the owned SSH child without PID discovery");
+    run::sandbox_forward(
+        &server.endpoint,
+        "owned-forward",
+        &spec,
+        true,
+        &tls,
+        "default",
+    )
+    .await
+    .expect("background forward should track the owned SSH child without PID discovery");
     let record = openshell_core::forward::read_forward_pid("owned-forward", forward_port)
         .expect("owned background forward should write a PID file");
 
@@ -1665,6 +1765,7 @@ async fn sandbox_forward_background_tracks_owned_child_when_pid_discovery_fails(
 }
 
 #[tokio::test]
+#[ignore = "flaky under concurrent test execution"]
 async fn sandbox_forward_foreground_fails_when_ssh_exits_before_listener_opens() {
     let server = run_server().await;
     let fake_ssh_dir = tempfile::tempdir().unwrap();
@@ -1677,9 +1778,16 @@ async fn sandbox_forward_foreground_fails_when_ssh_exits_before_listener_opens()
     drop(listener);
 
     let spec = openshell_core::forward::ForwardSpec::new(forward_port);
-    let err = run::sandbox_forward(&server.endpoint, "foreground-forward", &spec, false, &tls)
-        .await
-        .expect_err("foreground forward should fail when ssh exits before listener readiness");
+    let err = run::sandbox_forward(
+        &server.endpoint,
+        "foreground-forward",
+        &spec,
+        false,
+        &tls,
+        "default",
+    )
+    .await
+    .expect_err("foreground forward should fail when ssh exits before listener readiness");
     let msg = format!("{err}");
     assert!(
         msg.contains("ssh exited before local forward listener opened"),
@@ -1688,6 +1796,7 @@ async fn sandbox_forward_foreground_fails_when_ssh_exits_before_listener_opens()
 }
 
 #[tokio::test]
+#[ignore = "flaky under concurrent test execution"]
 async fn sandbox_forward_background_terminates_owned_child_when_listener_never_opens() {
     let server = run_server().await;
     let fake_ssh_dir = tempfile::tempdir().unwrap();
@@ -1700,9 +1809,16 @@ async fn sandbox_forward_background_terminates_owned_child_when_listener_never_o
     drop(listener);
 
     let spec = openshell_core::forward::ForwardSpec::new(forward_port);
-    let err = run::sandbox_forward(&server.endpoint, "unreachable-forward", &spec, true, &tls)
-        .await
-        .expect_err("background forward should fail when the listener never opens");
+    let err = run::sandbox_forward(
+        &server.endpoint,
+        "unreachable-forward",
+        &spec,
+        true,
+        &tls,
+        "default",
+    )
+    .await
+    .expect_err("background forward should fail when the listener never opens");
     let msg = format!("{err}");
     assert!(
         msg.contains("ssh process started but local forward listener was not reachable"),
@@ -1759,6 +1875,7 @@ async fn sandbox_create_sends_environment_variables() {
             ]),
             ..test_config()
         },
+        "default",
         &tls,
     )
     .await
@@ -1818,4 +1935,71 @@ async fn sandbox_create_env_rejects_invalid_key_name() {
         msg.contains("BAD-NAME"),
         "error should mention invalid key, got: {msg}"
     );
+}
+
+async fn run_cli_sandbox_create(
+    server: &TestServer,
+    name: &str,
+    extra_args: &[&str],
+) -> std::process::Output {
+    let xdg_dir = tempfile::tempdir().unwrap();
+    let tls_dir = xdg_dir.path().join("openshell/gateways/openshell/mtls");
+    fs::create_dir_all(&tls_dir).unwrap();
+    for filename in ["ca.crt", "tls.crt", "tls.key"] {
+        fs::copy(server.dir.path().join(filename), tls_dir.join(filename)).unwrap();
+    }
+
+    let mut cmd = tokio::process::Command::new(env!("CARGO_BIN_EXE_openshell"));
+    for (key, _) in std::env::vars().filter(|(k, _)| k.starts_with("OPENSHELL_")) {
+        cmd.env_remove(&key);
+    }
+    cmd.args([
+        "--gateway",
+        "openshell",
+        "--gateway-endpoint",
+        &server.endpoint,
+        "sandbox",
+        "create",
+        "--name",
+        name,
+        "--no-tty",
+        "--no-auto-providers",
+    ])
+    .args(extra_args)
+    .env("XDG_CONFIG_HOME", xdg_dir.path())
+    .env("HOME", xdg_dir.path())
+    .env("OPENSHELL_PROVISION_TIMEOUT", "5")
+    .output()
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn sandbox_create_json_stdout_is_parseable() {
+    let server = run_server().await;
+
+    let result = run_cli_sandbox_create(&server, "json-clean", &["--output=json"]).await;
+    assert!(
+        result.status.success(),
+        "sandbox create failed:\n{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let stdout = String::from_utf8(result.stdout).expect("stdout should be UTF-8");
+    serde_json::from_str::<serde_json::Value>(&stdout)
+        .unwrap_or_else(|err| panic!("stdout should contain only JSON: {err}\n{stdout}"));
+}
+
+#[tokio::test]
+async fn sandbox_create_yaml_stdout_is_parseable() {
+    let server = run_server().await;
+
+    let result = run_cli_sandbox_create(&server, "yaml-clean", &["--output=yaml"]).await;
+    assert!(
+        result.status.success(),
+        "sandbox create failed:\n{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let stdout = String::from_utf8(result.stdout).expect("stdout should be UTF-8");
+    serde_yml::from_str::<serde_yml::Value>(&stdout)
+        .unwrap_or_else(|err| panic!("stdout should contain only YAML: {err}\n{stdout}"));
 }

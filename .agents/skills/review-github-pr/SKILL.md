@@ -111,6 +111,7 @@ Read through the full diff (and the PR description if available). Produce a summ
 - **Key Design Decisions**: Focus on _why_ something was done a particular way, not _what_ changed. Include `file_path:line_number` references. Examples: choice of algorithm, new abstraction introduced, API contract change, migration strategy.
 - **Notable Code**: Include only the most instructive or surprising snippets. Keep each snippet under 15 lines. Always include the file path above the code block.
 - **Potential Concerns**: Only include if there are genuine risks — missing error handling, breaking changes, performance implications, security issues. Do not fabricate concerns.
+- **Agent infrastructure**: When the PR changes behavior, commands, or development workflows, use the `sync-agent-infra` maintenance map to check that related skills were updated. When it adds, removes, or renames skills or crates; changes workflow relationships or skill coverage; modifies issue or PR templates; or changes agent cross-references, apply the full consistency checklist. Report missing companion updates or drift under **Potential Concerns**.
 
 ## Step 5: Output
 

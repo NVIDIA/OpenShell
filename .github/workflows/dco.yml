@@ -6,6 +6,9 @@ on:
   pull_request_target:
     types: [opened, closed, synchronize]
 
+env:
+  DCO_SIGN_COMMENT: "I have read the DCO document and I hereby sign the DCO."
+
 permissions:
   actions: write
   checks: none
@@ -29,7 +32,7 @@ jobs:
       - name: "DCO Assistant"
         if: |
           (github.event.comment.body == 'recheck' ||
-           github.event.comment.body == 'I have read the Contributor Agreement including DCO and I hereby sign the Contributor Agreement and DCO') ||
+           github.event.comment.body == env.DCO_SIGN_COMMENT) ||
           github.event_name == 'pull_request_target'
         uses: contributor-assistant/github-action@ca4a40a7d1004f18d9960b404b97e5f30a505a08
         env:
@@ -46,6 +49,6 @@ jobs:
             [Developer Certificate of Origin](https://github.com/NVIDIA/OpenShell/blob/main/DCO)
             before we can accept your contribution. You can sign the DCO by
             adding a comment below using this text:
-          custom-pr-sign-comment: "I have read the DCO document and I hereby sign the DCO."
+          custom-pr-sign-comment: ${{ env.DCO_SIGN_COMMENT }}
           lock-pullrequest-aftermerge: false
           use-dco-flag: true

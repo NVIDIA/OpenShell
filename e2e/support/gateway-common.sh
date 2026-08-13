@@ -5,8 +5,18 @@
 # Shared helpers for local gateway-backed e2e wrappers. Driver-specific setup,
 # cleanup, and runtime behavior stay in the Docker/Podman wrapper scripts.
 
+# E2E traffic is synthetic and must not contribute to product usage metrics.
+# Keep an explicit override so telemetry-specific tests can opt back in.
+export OPENSHELL_TELEMETRY_ENABLED="${OPENSHELL_TELEMETRY_ENABLED:-false}"
+
 e2e_cargo_target_dir() {
   local root=$1
+  shift
+  local cargo_command=(cargo)
+
+  if [ "$#" -gt 0 ]; then
+    cargo_command=("$@")
+  fi
 
   if [ -n "${CARGO_TARGET_DIR:-}" ]; then
     case "${CARGO_TARGET_DIR}" in
@@ -16,7 +26,7 @@ e2e_cargo_target_dir() {
     return 0
   fi
 
-  cargo metadata --format-version=1 --no-deps \
+  "${cargo_command[@]}" metadata --format-version=1 --no-deps \
     | python3 -c 'import json, sys; print(json.load(sys.stdin)["target_directory"])'
 }
 
@@ -112,18 +122,25 @@ e2e_register_mtls_gateway() {
   local endpoint=$3
   local port=$4
   local pki_dir=$5
+  local oidc_issuer="${6:-}"
   local gateway_config_dir="${config_home}/openshell/gateways/${name}"
 
   mkdir -p "${gateway_config_dir}/mtls"
   cp "${pki_dir}/ca.crt"         "${gateway_config_dir}/mtls/ca.crt"
   cp "${pki_dir}/client/tls.crt" "${gateway_config_dir}/mtls/tls.crt"
   cp "${pki_dir}/client/tls.key" "${gateway_config_dir}/mtls/tls.key"
+
+  local oidc_line=""
+  if [ -n "${oidc_issuer}" ]; then
+    oidc_line="$(printf ',\n  "oidc_issuer": "%s"' "${oidc_issuer}")"
+  fi
+
   cat >"${gateway_config_dir}/metadata.json" <<EOF
 {
   "name": "${name}",
   "gateway_endpoint": "${endpoint}",
   "is_remote": false,
-  "gateway_port": ${port}
+  "gateway_port": ${port}${oidc_line}
 }
 EOF
   printf '%s' "${name}" >"${config_home}/openshell/active_gateway"
@@ -167,6 +184,20 @@ e2e_write_gateway_mtls_auth_config() {
   printf 'enabled = true\n\n'
 }
 
+e2e_write_gateway_oidc_config() {
+  local issuer=$1
+  local scopes_claim="${2:-scope}"
+
+  printf '[openshell.gateway.oidc]\n'
+  printf 'issuer = %s\n'         "$(e2e_toml_string "${issuer}")"
+  printf 'audience = "openshell-cli"\n'
+  printf 'jwks_ttl_secs = 60\n'
+  printf 'roles_claim = "realm_access.roles"\n'
+  printf 'admin_role = "openshell-admin"\n'
+  printf 'user_role = "openshell-user"\n'
+  printf 'scopes_claim = %s\n\n' "$(e2e_toml_string "${scopes_claim}")"
+}
+
 e2e_build_gateway_binaries() {
   local root=$1
   local target_var=$2
@@ -181,23 +212,31 @@ e2e_build_gateway_binaries() {
 
   target_dir="$(e2e_cargo_target_dir "${root}")"
   printf -v "${target_var}" '%s' "${target_dir}"
-  printf -v "${gateway_var}" '%s' "${target_dir}/debug/openshell-gateway"
-  printf -v "${cli_var}" '%s' "${target_dir}/debug/openshell"
+  printf -v "${gateway_var}" '%s' "${OPENSHELL_GATEWAY_BIN:-${target_dir}/debug/openshell-gateway}"
+  printf -v "${cli_var}" '%s' "${OPENSHELL_BIN:-${target_dir}/debug/openshell}"
 
-  echo "Building openshell-gateway..."
-  cargo build "${jobs[@]}" \
-    -p openshell-server --bin openshell-gateway
+  if [ -z "${OPENSHELL_GATEWAY_BIN:-}" ]; then
+    echo "Building openshell-gateway..."
+    cargo build "${jobs[@]}" \
+      -p openshell-server --bin openshell-gateway
+  else
+    echo "Using prebuilt openshell gateway at ${OPENSHELL_GATEWAY_BIN}"
+  fi
 
-  echo "Building openshell-cli..."
-  cargo build "${jobs[@]}" \
-    -p openshell-cli
+  if [ -z "${OPENSHELL_BIN:-}" ]; then
+    echo "Building openshell-cli..."
+    cargo build "${jobs[@]}" \
+      -p openshell-cli
+  else
+    echo "Using prebuilt openshell CLI at ${OPENSHELL_BIN}"
+  fi
 
-  if [ ! -x "${target_dir}/debug/openshell-gateway" ]; then
-    echo "ERROR: expected openshell-gateway binary at ${target_dir}/debug/openshell-gateway" >&2
+  if [ ! -x "${!gateway_var}" ]; then
+    echo "ERROR: expected openshell-gateway binary at ${!gateway_var}" >&2
     exit 1
   fi
-  if [ ! -x "${target_dir}/debug/openshell" ]; then
-    echo "ERROR: expected openshell CLI binary at ${target_dir}/debug/openshell" >&2
+  if [ ! -x "${!cli_var}" ]; then
+    echo "ERROR: expected openshell CLI binary at ${!cli_var}" >&2
     exit 1
   fi
 }

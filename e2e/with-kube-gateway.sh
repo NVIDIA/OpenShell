@@ -39,6 +39,13 @@
 #   PostgreSQL Deployment and a matching Secret with a `uri` key before
 #   installing OpenShell. This is used by HA CI so the gateway can run multiple
 #   replicas without requiring the OpenShell chart to own a database.
+#
+# Credential-driver fixture:
+#   Set OPENSHELL_E2E_CREDENTIAL_DRIVERS=1 to enable one credential storage
+#   backend. Set OPENSHELL_E2E_CREDENTIAL_DRIVER to `kubernetes-secrets` or
+#   `vault`; the Rust `credential_drivers` e2e test validates the active
+#   backend. Vault mode installs a dev OpenBao fixture because it exposes the
+#   Vault-compatible API used by the driver.
 
 set -euo pipefail
 
@@ -70,6 +77,8 @@ NAMESPACE="openshell"
 RELEASE_NAME="openshell"
 PORTFORWARD_PID=""
 PORTFORWARD_LOG="${WORKDIR}/portforward.log"
+PORTFORWARD_HEALTH_PID=""
+PORTFORWARD_HEALTH_LOG="${WORKDIR}/portforward-health.log"
 HELM_INSTALLED=0
 EXTERNAL_PG_FIXTURE_DEPLOYED=0
 EXTERNAL_PG_FIXTURE_SECRET=""
@@ -84,6 +93,11 @@ ENVOY_CHART_VERSION="${OPENSHELL_E2E_ENVOY_VERSION:-v1.7.2}"
 ENVOY_GATEWAY_MANIFEST="${ROOT}/deploy/kube/manifests/envoy-gateway-openshell.yaml"
 ENVOY_HELM_INSTALLED=0
 ENVOY_GATEWAY_CONFIG_APPLIED=0
+VAULT_FIXTURE_DEPLOYED=0
+VAULT_NAMESPACE="${OPENSHELL_E2E_VAULT_NAMESPACE:-openbao}"
+VAULT_RELEASE_NAME="${OPENSHELL_E2E_VAULT_RELEASE_NAME:-openbao}"
+VAULT_CHART_VERSION="${OPENSHELL_E2E_OPENBAO_CHART_VERSION:-0.28.3}"
+VAULT_DEV_ROOT_TOKEN="${OPENSHELL_E2E_VAULT_DEV_ROOT_TOKEN:-root}"
 
 # Isolate CLI/SDK gateway metadata from the developer's real config.
 export XDG_CONFIG_HOME="${WORKDIR}/config"
@@ -117,6 +131,24 @@ wait_for_agent_sandbox_crd() {
 
 helmctl() {
   helm --kube-context "${KUBE_CONTEXT}" "$@"
+}
+
+# Return the resource reference for the gateway workload installed by the chart.
+# SQLite releases use a StatefulSet; external-database releases may use a Deployment.
+kube_workload_ref() {
+  local name="$1"
+  local namespace="${2:-${NAMESPACE}}"
+  local resource
+
+  for resource in "statefulset/${name}" "deployment/${name}"; do
+    if kctl -n "${namespace}" get "${resource}" >/dev/null 2>&1; then
+      printf '%s\n' "${resource}"
+      return 0
+    fi
+  done
+
+  echo "ERROR: gateway workload ${name} was not found in namespace ${namespace}" >&2
+  return 1
 }
 
 deploy_postgres_fixture() {
@@ -239,18 +271,22 @@ start_gateway_portforward() {
 }
 
 stop_gateway_portforward() {
-  [ -n "${PORTFORWARD_PID}" ] || return 0
-
-  kill "${PORTFORWARD_PID}" >/dev/null 2>&1 || true
-  for _ in $(seq 1 10); do
-    if ! kill -0 "${PORTFORWARD_PID}" >/dev/null 2>&1; then
-      break
-    fi
-    sleep 0.5
+  local pid
+  local pid_var
+  for pid_var in PORTFORWARD_PID PORTFORWARD_HEALTH_PID; do
+    pid="${!pid_var}"
+    [ -n "${pid}" ] || continue
+    kill "${pid}" >/dev/null 2>&1 || true
+    for _ in $(seq 1 10); do
+      if ! kill -0 "${pid}" >/dev/null 2>&1; then
+        break
+      fi
+      sleep 0.5
+    done
+    kill -KILL "${pid}" >/dev/null 2>&1 || true
+    wait "${pid}" >/dev/null 2>&1 || true
+    printf -v "${pid_var}" '%s' ""
   done
-  kill -KILL "${PORTFORWARD_PID}" >/dev/null 2>&1 || true
-  wait "${PORTFORWARD_PID}" >/dev/null 2>&1 || true
-  PORTFORWARD_PID=""
 }
 
 cleanup_postgres_fixture() {
@@ -266,6 +302,47 @@ cleanup_postgres_fixture() {
 
   EXTERNAL_PG_FIXTURE_DEPLOYED=0
   EXTERNAL_PG_FIXTURE_SECRET=""
+}
+
+deploy_vault_fixture() {
+  echo "Deploying OpenBao fixture for Vault credential-driver validation..."
+
+  helmctl repo add openbao https://openbao.github.io/openbao-helm \
+    >/dev/null 2>&1 || true
+  helmctl repo update openbao >/dev/null
+  helmctl upgrade --install "${VAULT_RELEASE_NAME}" openbao/openbao \
+    --namespace "${VAULT_NAMESPACE}" --create-namespace \
+    --version "${VAULT_CHART_VERSION}" \
+    --set "server.dev.enabled=true" \
+    --set "server.dev.devRootToken=${VAULT_DEV_ROOT_TOKEN}" \
+    --set "injector.enabled=false" \
+    --wait --timeout 5m
+  VAULT_FIXTURE_DEPLOYED=1
+
+  kctl -n "${VAULT_NAMESPACE}" wait \
+    --for=condition=Ready pod \
+    -l "app.kubernetes.io/name=openbao,component=server" \
+    --timeout=300s
+
+  export OPENSHELL_E2E_VAULT_NAMESPACE="${VAULT_NAMESPACE}"
+  export OPENSHELL_E2E_VAULT_POD="${VAULT_RELEASE_NAME}-0"
+  export OPENSHELL_E2E_VAULT_TOKEN="${VAULT_DEV_ROOT_TOKEN}"
+}
+
+cleanup_vault_fixture() {
+  [ -n "${KUBE_CONTEXT}" ] || return 0
+  [ -n "${VAULT_NAMESPACE}" ] || return 0
+
+  if command -v helm >/dev/null 2>&1; then
+    helmctl uninstall "${VAULT_RELEASE_NAME}" \
+      --namespace "${VAULT_NAMESPACE}" --wait --timeout 60s \
+      >/dev/null 2>&1 || true
+  fi
+  if command -v kubectl >/dev/null 2>&1; then
+    kctl delete namespace "${VAULT_NAMESPACE}" --wait=true --timeout=60s \
+      --ignore-not-found >/dev/null 2>&1 || true
+  fi
+  VAULT_FIXTURE_DEPLOYED=0
 }
 
 cleanup() {
@@ -292,6 +369,30 @@ cleanup() {
       cat "${PORTFORWARD_LOG}" || true
       echo "=== end port-forward log ==="
     fi
+    if [ -f "${PORTFORWARD_HEALTH_LOG}" ]; then
+      echo "=== health port-forward log ==="
+      cat "${PORTFORWARD_HEALTH_LOG}" || true
+      echo "=== end health port-forward log ==="
+    fi
+  fi
+
+  if [ "${EXTERNAL_PG_FIXTURE_DEPLOYED}" = "1" ]; then
+    cleanup_postgres_fixture "${EXTERNAL_PG_FIXTURE_SECRET}"
+  fi
+
+  if [ "${VAULT_FIXTURE_DEPLOYED}" = "1" ]; then
+    cleanup_vault_fixture
+  fi
+
+  if [ "${ENVOY_GATEWAY_CONFIG_APPLIED}" = "1" ] && [ -n "${KUBE_CONTEXT}" ]; then
+    if command -v kubectl >/dev/null 2>&1; then
+      kctl -n "${NAMESPACE}" delete backendtrafficpolicy.gateway.envoyproxy.io \
+        openshell-grpc-timeouts --ignore-not-found --wait=false \
+        >/dev/null 2>&1 || true
+      kctl delete gatewayclass.gateway.networking.k8s.io eg \
+        --ignore-not-found --wait=false >/dev/null 2>&1 || true
+    fi
+    ENVOY_GATEWAY_CONFIG_APPLIED=0
   fi
 
   if [ "${HELM_INSTALLED}" = "1" ] && [ -n "${KUBE_CONTEXT}" ] && [ -n "${NAMESPACE}" ]; then
@@ -305,21 +406,6 @@ cleanup() {
       kctl delete namespace "${NAMESPACE}" --wait=true --timeout=60s \
         --ignore-not-found >/dev/null 2>&1 || true
     fi
-  fi
-
-  if [ "${EXTERNAL_PG_FIXTURE_DEPLOYED}" = "1" ]; then
-    cleanup_postgres_fixture "${EXTERNAL_PG_FIXTURE_SECRET}"
-  fi
-
-  if [ "${ENVOY_GATEWAY_CONFIG_APPLIED}" = "1" ] && [ -n "${KUBE_CONTEXT}" ]; then
-    if command -v kubectl >/dev/null 2>&1; then
-      kctl -n "${NAMESPACE}" delete backendtrafficpolicy.gateway.envoyproxy.io \
-        openshell-grpc-timeouts --ignore-not-found --wait=false \
-        >/dev/null 2>&1 || true
-      kctl delete gatewayclass.gateway.networking.k8s.io eg \
-        --ignore-not-found --wait=false >/dev/null 2>&1 || true
-    fi
-    ENVOY_GATEWAY_CONFIG_APPLIED=0
   fi
 
   if [ "${ENVOY_HELM_INSTALLED}" = "1" ] && [ -n "${KUBE_CONTEXT}" ]; then
@@ -385,6 +471,8 @@ run_scenario() {
   local scenario_label="$1"
   shift 2
   local scenario_exit=0
+  local elapsed=0
+  local pf_timeout=30
 
   echo ""
   echo "========================================"
@@ -411,6 +499,43 @@ run_scenario() {
     return
   fi
 
+  HEALTH_LOCAL_PORT="$(e2e_pick_port)"
+  local workload_ref
+  workload_ref="$(kube_workload_ref "${RELEASE_NAME}")"
+  echo "Starting kubectl port-forward ${workload_ref} ${HEALTH_LOCAL_PORT}:health..."
+  kctl -n "${NAMESPACE}" port-forward "${workload_ref}" \
+    "${HEALTH_LOCAL_PORT}:health" >"${PORTFORWARD_HEALTH_LOG}" 2>&1 &
+  PORTFORWARD_HEALTH_PID=$!
+
+  elapsed=0
+  while [ "${elapsed}" -lt "${pf_timeout}" ]; do
+    if ! kill -0 "${PORTFORWARD_HEALTH_PID}" 2>/dev/null; then
+      echo "ERROR: kubectl health port-forward exited before becoming reachable" >&2
+      cat "${PORTFORWARD_HEALTH_LOG}" >&2 || true
+      DB_FAILED=$((DB_FAILED + 1))
+      DB_SCENARIOS_SUMMARY+=("FAIL  ${scenario_label}: health port-forward died")
+      scenario_stop_portforward
+      scenario_cleanup_release
+      return
+    fi
+    if curl -s -o /dev/null --connect-timeout 1 "http://127.0.0.1:${HEALTH_LOCAL_PORT}/healthz"; then
+      break
+    fi
+    sleep 1
+    elapsed=$((elapsed + 1))
+  done
+  if [ "${elapsed}" -ge "${pf_timeout}" ]; then
+    echo "ERROR: health port-forward did not accept TCP within ${pf_timeout}s" >&2
+    cat "${PORTFORWARD_HEALTH_LOG}" >&2 || true
+    DB_FAILED=$((DB_FAILED + 1))
+    DB_SCENARIOS_SUMMARY+=("FAIL  ${scenario_label}: health port-forward timeout")
+    scenario_stop_portforward
+    scenario_cleanup_release
+    return
+  fi
+
+  export OPENSHELL_E2E_HEALTH_PORT="${HEALTH_LOCAL_PORT}"
+
   GATEWAY_NAME="openshell-e2e-kube-${LOCAL_PORT}"
   GATEWAY_ENDPOINT="http://127.0.0.1:${LOCAL_PORT}"
   e2e_register_plaintext_gateway \
@@ -421,6 +546,12 @@ run_scenario() {
 
   export OPENSHELL_GATEWAY="${GATEWAY_NAME}"
   export OPENSHELL_E2E_DRIVER="kubernetes"
+  # Kubernetes e2e runs against k3d/kind-style Docker-backed clusters. Host
+  # fixture containers must use the same Docker host so published ports and
+  # cluster host-gateway aliases line up even on machines where Podman is also
+  # installed.
+  export CONTAINER_ENGINE="${CONTAINER_ENGINE:-docker}"
+  export OPENSHELL_E2E_KUBE_CONTEXT_ACTIVE="${KUBE_CONTEXT}"
   export OPENSHELL_E2E_SANDBOX_NAMESPACE="${NAMESPACE}"
   export OPENSHELL_E2E_KUBE_CONTEXT="${KUBE_CONTEXT}"
   export OPENSHELL_E2E_KUBE_NAMESPACE="${NAMESPACE}"
@@ -636,12 +767,34 @@ kctl apply -f "${_agent_sandbox_base}/manifest.yaml"
 wait_for_agent_sandbox_crd
 kctl -n agent-sandbox-system rollout status deployment/agent-sandbox-controller --timeout=300s
 
+ACTIVE_CREDENTIAL_DRIVER="${OPENSHELL_E2E_CREDENTIAL_DRIVER:-kubernetes-secrets}"
+if [ "${OPENSHELL_E2E_CREDENTIAL_DRIVERS:-0}" = "1" ] \
+   && [ "${ACTIVE_CREDENTIAL_DRIVER}" = "vault" ]; then
+  deploy_vault_fixture
+fi
+
 helm_extra_args=()
+helm_extra_args+=(--set "server.telemetryEnabled=${OPENSHELL_TELEMETRY_ENABLED}")
 if [ -n "${HOST_GATEWAY_IP}" ]; then
   helm_extra_args+=(--set "server.hostGatewayIP=${HOST_GATEWAY_IP}")
 fi
 
 helm_values_args=(--values "${ROOT}/deploy/helm/openshell/ci/values-skaffold.yaml")
+if [ "${OPENSHELL_E2E_CREDENTIAL_DRIVERS:-0}" = "1" ]; then
+  case "${ACTIVE_CREDENTIAL_DRIVER}" in
+    kubernetes-secrets)
+      helm_values_args+=(--values "${ROOT}/deploy/helm/openshell/ci/values-credential-driver-kubernetes-secrets.yaml")
+      ;;
+    vault)
+      helm_values_args+=(--values "${ROOT}/deploy/helm/openshell/ci/values-credential-driver-vault.yaml")
+      ;;
+    *)
+      echo "ERROR: OPENSHELL_E2E_CREDENTIAL_DRIVER must be kubernetes-secrets or vault, got '${ACTIVE_CREDENTIAL_DRIVER}'" >&2
+      exit 2
+      ;;
+  esac
+  export OPENSHELL_E2E_CREDENTIAL_DRIVER="${ACTIVE_CREDENTIAL_DRIVER}"
+fi
 if [ -n "${OPENSHELL_E2E_KUBE_EXTRA_VALUES:-}" ]; then
   IFS=':' read -r -a extra_values_files <<< "${OPENSHELL_E2E_KUBE_EXTRA_VALUES}"
   for values_file in "${extra_values_files[@]}"; do
@@ -708,6 +861,35 @@ else
 
   start_gateway_portforward
 
+  HEALTH_LOCAL_PORT="$(e2e_pick_port)"
+  WORKLOAD_REF="$(kube_workload_ref "${RELEASE_NAME}")"
+  echo "Starting kubectl port-forward ${WORKLOAD_REF} ${HEALTH_LOCAL_PORT}:health..."
+  kctl -n "${NAMESPACE}" port-forward "${WORKLOAD_REF}" \
+    "${HEALTH_LOCAL_PORT}:health" >"${PORTFORWARD_HEALTH_LOG}" 2>&1 &
+  PORTFORWARD_HEALTH_PID=$!
+
+  elapsed=0
+  timeout=30
+  while [ "${elapsed}" -lt "${timeout}" ]; do
+    if ! kill -0 "${PORTFORWARD_HEALTH_PID}" 2>/dev/null; then
+      echo "ERROR: kubectl health port-forward exited before becoming reachable" >&2
+      cat "${PORTFORWARD_HEALTH_LOG}" >&2 || true
+      exit 1
+    fi
+    if curl -s -o /dev/null --connect-timeout 1 "http://127.0.0.1:${HEALTH_LOCAL_PORT}/healthz"; then
+      break
+    fi
+    sleep 1
+    elapsed=$((elapsed + 1))
+  done
+  if [ "${elapsed}" -ge "${timeout}" ]; then
+    echo "ERROR: health port-forward did not accept TCP within ${timeout}s" >&2
+    cat "${PORTFORWARD_HEALTH_LOG}" >&2 || true
+    exit 1
+  fi
+
+  export OPENSHELL_E2E_HEALTH_PORT="${HEALTH_LOCAL_PORT}"
+
   GATEWAY_NAME="openshell-e2e-kube-${LOCAL_PORT}"
   GATEWAY_ENDPOINT="http://127.0.0.1:${LOCAL_PORT}"
   e2e_register_plaintext_gateway \
@@ -718,6 +900,12 @@ else
 
   export OPENSHELL_GATEWAY="${GATEWAY_NAME}"
   export OPENSHELL_E2E_DRIVER="kubernetes"
+  # Kubernetes e2e runs against k3d/kind-style Docker-backed clusters. Host
+  # fixture containers must use the same Docker host so published ports and
+  # cluster host-gateway aliases line up even on machines where Podman is also
+  # installed.
+  export CONTAINER_ENGINE="${CONTAINER_ENGINE:-docker}"
+  export OPENSHELL_E2E_KUBE_CONTEXT_ACTIVE="${KUBE_CONTEXT}"
   export OPENSHELL_E2E_SANDBOX_NAMESPACE="${NAMESPACE}"
   export OPENSHELL_E2E_KUBE_CONTEXT="${KUBE_CONTEXT}"
   export OPENSHELL_E2E_KUBE_NAMESPACE="${NAMESPACE}"

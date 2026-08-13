@@ -16,6 +16,7 @@ from typing import Any, cast
 
 import pytest
 
+import openshell.sandbox as sandbox_module
 from openshell._proto import openshell_pb2
 from openshell.sandbox import (
     _PYTHON_CLOUDPICKLE_BOOTSTRAP,
@@ -27,6 +28,7 @@ from openshell.sandbox import (
     SandboxRef,
     SandboxStatusRef,
     TlsConfig,
+    _atomic_replace,
     _BearerAuthInterceptor,
     _load_cluster_bearer_token,
     _make_cluster_bearer_provider,
@@ -55,16 +57,28 @@ class _FakeStub:
 
 class _FakeInferenceStub:
     def __init__(self) -> None:
-        self.request = None
+        self.set_request = None
+        self.get_request = None
 
-    def SetClusterInference(self, request: Any, timeout: float | None = None) -> Any:
-        self.request = request
+    def SetInferenceRoute(self, request: Any, timeout: float | None = None) -> Any:
+        self.set_request = request
         _ = timeout
 
         class _Response:
             provider_name = request.provider_name
             model_id = request.model_id
             version = 1
+
+        return _Response()
+
+    def GetInferenceRoute(self, request: Any, timeout: float | None = None) -> Any:
+        self.get_request = request
+        _ = timeout
+
+        class _Response:
+            provider_name = "openai-dev"
+            model_id = "gpt-4.1"
+            version = 2
 
         return _Response()
 
@@ -1269,6 +1283,65 @@ def test_refresher_concurrent_write_back_does_not_trample(tmp_path: Path) -> Non
         r.close()
 
 
+class _WindowsPermissionError(PermissionError):
+    winerror: int
+
+
+def test_atomic_replace_retries_windows_sharing_violations(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    source = tmp_path / "source"
+    destination = tmp_path / "destination"
+    source.write_text("new")
+    destination.write_text("old")
+    attempts = 0
+    delays: list[float] = []
+    real_replace = Path.replace
+
+    def replace(path: Path, target: Path) -> Path:
+        nonlocal attempts
+        attempts += 1
+        if attempts < 3:
+            error = _WindowsPermissionError("destination is busy")
+            error.winerror = 32
+            raise error
+        return real_replace(path, target)
+
+    monkeypatch.setattr(sandbox_module, "_IS_WINDOWS", True)
+    monkeypatch.setattr(Path, "replace", replace)
+    monkeypatch.setattr(time, "sleep", delays.append)
+
+    _atomic_replace(source, destination)
+
+    assert attempts == 3
+    assert delays == [0.005, 0.01]
+    assert destination.read_text() == "new"
+
+
+def test_atomic_replace_does_not_retry_permanent_windows_errors(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    source = tmp_path / "source"
+    destination = tmp_path / "destination"
+    source.write_text("new")
+    attempts = 0
+
+    def replace(_path: Path, _target: Path) -> Path:
+        nonlocal attempts
+        attempts += 1
+        error = _WindowsPermissionError("access denied")
+        error.winerror = 13
+        raise error
+
+    monkeypatch.setattr(sandbox_module, "_IS_WINDOWS", True)
+    monkeypatch.setattr(Path, "replace", replace)
+
+    with pytest.raises(PermissionError, match="access denied"):
+        _atomic_replace(source, destination)
+
+    assert attempts == 1
+
+
 def test_sandbox_wrapper_forwards_auth_kwargs_to_from_active_cluster(
     monkeypatch: Any,
 ) -> None:
@@ -1293,6 +1366,7 @@ def test_sandbox_wrapper_forwards_auth_kwargs_to_from_active_cluster(
     )
 
     sandbox = Sandbox(
+        workspace="default",
         cluster="my-gw",
         timeout=42.0,
         auto_refresh=False,
@@ -1334,27 +1408,44 @@ def test_sandbox_wrapper_defaults_match_from_active_cluster(
     import pytest as _pytest
 
     with _pytest.raises(_Sentinel):
-        Sandbox().__enter__()
+        Sandbox(workspace="default").__enter__()
 
     assert captured["auto_refresh"] is True
     assert captured["write_back"] is True
     assert captured["insecure"] is False
 
 
-def test_inference_set_cluster_forwards_no_verify_flag() -> None:
+def test_inference_set_route_forwards_workspace_and_no_verify() -> None:
     stub = _FakeInferenceStub()
     client = cast("InferenceRouteClient", object.__new__(InferenceRouteClient))
     client._timeout = 30.0
     client._stub = cast("Any", stub)
 
-    client.set_cluster(
+    client.set_route(
+        workspace="production",
         provider_name="openai-dev",
         model_id="gpt-4.1",
         no_verify=True,
     )
 
-    assert stub.request is not None
-    assert stub.request.no_verify is True
+    assert stub.set_request is not None
+    assert stub.set_request.no_verify is True
+    assert stub.set_request.workspace == "production"
+
+
+def test_inference_get_route_forwards_workspace() -> None:
+    stub = _FakeInferenceStub()
+    client = cast("InferenceRouteClient", object.__new__(InferenceRouteClient))
+    client._timeout = 30.0
+    client._stub = cast("Any", stub)
+
+    config = client.get_route(workspace="staging")
+
+    assert stub.get_request is not None
+    assert stub.get_request.workspace == "staging"
+    assert config.provider_name == "openai-dev"
+    assert config.model_id == "gpt-4.1"
+    assert config.version == 2
 
 
 # ---------------------------------------------------------------------------
@@ -1433,10 +1524,12 @@ def _make_sandbox_proto(
     labels: dict[str, str] | None = None,
     phase: openshell_pb2.SandboxPhase = openshell_pb2.SANDBOX_PHASE_READY,
     version: int = 0,
+    workspace: str = "default",
 ) -> openshell_pb2.Sandbox:
     sandbox = openshell_pb2.Sandbox()
     sandbox.metadata.id = id_
     sandbox.metadata.name = name
+    sandbox.metadata.workspace = workspace
     for key, value in (labels or {}).items():
         sandbox.metadata.labels[key] = value
     sandbox.status.phase = phase
@@ -1448,7 +1541,65 @@ class _FakeSandboxStub:
     def __init__(self, listed: list[openshell_pb2.Sandbox] | None = None) -> None:
         self.create_request: openshell_pb2.CreateSandboxRequest | None = None
         self.list_request: openshell_pb2.ListSandboxesRequest | None = None
+        self.get_request: openshell_pb2.GetSandboxRequest | None = None
+        self.delete_request: openshell_pb2.DeleteSandboxRequest | None = None
+        self.stop_request: openshell_pb2.StopSandboxRequest | None = None
+        self.start_request: openshell_pb2.StartSandboxRequest | None = None
         self._listed = listed or []
+
+    def GetSandbox(
+        self,
+        request: openshell_pb2.GetSandboxRequest,
+        timeout: float | None = None,
+    ) -> Any:
+        self.get_request = request
+        _ = timeout
+        return SimpleNamespace(
+            sandbox=_make_sandbox_proto(
+                "sandbox-1", request.name, workspace=request.workspace or "default"
+            )
+        )
+
+    def DeleteSandbox(
+        self,
+        request: openshell_pb2.DeleteSandboxRequest,
+        timeout: float | None = None,
+    ) -> Any:
+        self.delete_request = request
+        _ = timeout
+        return SimpleNamespace(deleted=True)
+
+    def StopSandbox(
+        self,
+        request: openshell_pb2.StopSandboxRequest,
+        timeout: float | None = None,
+    ) -> Any:
+        self.stop_request = request
+        _ = timeout
+        return SimpleNamespace(
+            sandbox=_make_sandbox_proto(
+                "sandbox-1",
+                request.name,
+                phase=openshell_pb2.SANDBOX_PHASE_STOPPED,
+                workspace=request.workspace,
+            )
+        )
+
+    def StartSandbox(
+        self,
+        request: openshell_pb2.StartSandboxRequest,
+        timeout: float | None = None,
+    ) -> Any:
+        self.start_request = request
+        _ = timeout
+        return SimpleNamespace(
+            sandbox=_make_sandbox_proto(
+                "sandbox-1",
+                request.name,
+                phase=openshell_pb2.SANDBOX_PHASE_STARTING,
+                workspace=request.workspace,
+            )
+        )
 
     def CreateSandbox(
         self,
@@ -1459,7 +1610,10 @@ class _FakeSandboxStub:
         _ = timeout
         return SimpleNamespace(
             sandbox=_make_sandbox_proto(
-                "sandbox-1", request.name or "generated", dict(request.labels)
+                "sandbox-1",
+                request.name or "generated",
+                dict(request.labels),
+                workspace=request.workspace or "default",
             )
         )
 
@@ -1482,18 +1636,27 @@ class _RecordingHighLevelClient:
     def create_session(
         self,
         *,
+        workspace: str,
         spec: Any = None,
         name: str | None = None,
         labels: Any = None,
     ) -> Any:
-        self.create_kwargs = {"spec": spec, "name": name, "labels": labels}
+        self.create_kwargs = {
+            "workspace": workspace,
+            "spec": spec,
+            "name": name,
+            "labels": labels,
+        }
         return SimpleNamespace(sandbox=SimpleNamespace(name=name or "generated"))
 
-    def wait_ready(self, name: str, *, timeout_seconds: float = 300.0) -> SandboxRef:
+    def wait_ready(
+        self, name: str, *, workspace: str, timeout_seconds: float = 300.0
+    ) -> SandboxRef:
         _ = timeout_seconds
         return SandboxRef(
             id="sandbox-1",
             name=name,
+            workspace=workspace,
             status=SandboxStatusRef(phase=2, current_policy_version=0),
         )
 
@@ -1502,7 +1665,9 @@ def test_create_forwards_name_and_labels() -> None:
     stub = _FakeSandboxStub()
     client = _client_with_fake_stub(stub)
 
-    ref = client.create(name="job-1", labels={"aiq": "deep-research"})
+    ref = client.create(
+        workspace="default", name="job-1", labels={"aiq": "deep-research"}
+    )
 
     assert stub.create_request is not None
     assert stub.create_request.name == "job-1"
@@ -1510,15 +1675,33 @@ def test_create_forwards_name_and_labels() -> None:
     assert dict(ref.labels) == {"aiq": "deep-research"}
 
 
+def test_stop_and_start_forward_workspace_and_return_phase() -> None:
+    stub = _FakeSandboxStub()
+    client = _client_with_fake_stub(stub)
+
+    stopped = client.stop("job-1", workspace="team-a")
+    assert stub.stop_request is not None
+    assert stub.stop_request.name == "job-1"
+    assert stub.stop_request.workspace == "team-a"
+    assert stopped.phase == openshell_pb2.SANDBOX_PHASE_STOPPED
+
+    starting = client.start("job-1", workspace="team-a")
+    assert stub.start_request is not None
+    assert stub.start_request.name == "job-1"
+    assert stub.start_request.workspace == "team-a"
+    assert starting.phase == openshell_pb2.SANDBOX_PHASE_STARTING
+
+
 def test_create_without_args_sends_empty_metadata() -> None:
     stub = _FakeSandboxStub()
     client = _client_with_fake_stub(stub)
 
-    client.create()
+    client.create(workspace="default")
 
     assert stub.create_request is not None
     assert stub.create_request.name == ""
     assert dict(stub.create_request.labels) == {}
+    assert stub.create_request.workspace == "default"
 
 
 def test_create_copies_caller_labels() -> None:
@@ -1526,7 +1709,7 @@ def test_create_copies_caller_labels() -> None:
     client = _client_with_fake_stub(stub)
 
     caller_labels = {"aiq": "deep-research"}
-    client.create(labels=caller_labels)
+    client.create(workspace="default", labels=caller_labels)
     caller_labels["aiq"] = "mutated"
 
     assert stub.create_request is not None
@@ -1537,7 +1720,9 @@ def test_create_session_forwards_name_and_labels() -> None:
     stub = _FakeSandboxStub()
     client = _client_with_fake_stub(stub)
 
-    session = client.create_session(name="job-2", labels={"team": "aiq"})
+    session = client.create_session(
+        workspace="default", name="job-2", labels={"team": "aiq"}
+    )
 
     assert stub.create_request is not None
     assert stub.create_request.name == "job-2"
@@ -1549,17 +1734,18 @@ def test_list_forwards_label_selector() -> None:
     stub = _FakeSandboxStub()
     client = _client_with_fake_stub(stub)
 
-    client.list(label_selector="aiq=deep-research")
+    client.list(workspace="default", label_selector="aiq=deep-research")
 
     assert stub.list_request is not None
     assert stub.list_request.label_selector == "aiq=deep-research"
+    assert stub.list_request.workspace == "default"
 
 
 def test_list_without_selector_sends_empty_string() -> None:
     stub = _FakeSandboxStub()
     client = _client_with_fake_stub(stub)
 
-    client.list()
+    client.list(workspace="default")
 
     assert stub.list_request is not None
     assert stub.list_request.label_selector == ""
@@ -1569,7 +1755,7 @@ def test_list_ids_forwards_label_selector() -> None:
     stub = _FakeSandboxStub(listed=[_make_sandbox_proto("sandbox-1", "job-1")])
     client = _client_with_fake_stub(stub)
 
-    ids = client.list_ids(label_selector="aiq=deep-research")
+    ids = client.list_ids(workspace="default", label_selector="aiq=deep-research")
 
     assert stub.list_request is not None
     assert stub.list_request.label_selector == "aiq=deep-research"
@@ -1598,6 +1784,7 @@ def test_direct_sandbox_ref_construction_defaults_labels() -> None:
     ref = SandboxRef(
         id="sandbox-1",
         name="job-1",
+        workspace="default",
         status=SandboxStatusRef(phase=2, current_policy_version=0),
     )
 
@@ -1629,6 +1816,7 @@ def test_default_sandbox_ref_labels_support_standard_serialization() -> None:
     ref = SandboxRef(
         id="sandbox-1",
         name="job-1",
+        workspace="default",
         status=SandboxStatusRef(phase=2, current_policy_version=0),
     )
 
@@ -1642,6 +1830,7 @@ def test_direct_sandbox_ref_copies_and_freezes_labels() -> None:
     ref = SandboxRef(
         id="sandbox-1",
         name="job-1",
+        workspace="default",
         status=SandboxStatusRef(phase=2, current_policy_version=0),
         labels=labels,
     )
@@ -1663,11 +1852,15 @@ def test_high_level_creation_forwards_name_and_labels(
     )
 
     sandbox = Sandbox(
-        name="job-1", labels={"aiq": "deep-research"}, delete_on_exit=False
+        workspace="staging",
+        name="job-1",
+        labels={"aiq": "deep-research"},
+        delete_on_exit=False,
     )
     sandbox.__enter__()
 
     assert recording.create_kwargs == {
+        "workspace": "staging",
         "spec": None,
         "name": "job-1",
         "labels": {"aiq": "deep-research"},
@@ -1675,7 +1868,7 @@ def test_high_level_creation_forwards_name_and_labels(
 
 
 def test_high_level_attach_rejects_name() -> None:
-    sandbox = Sandbox(sandbox="existing-sandbox", name="job-1")
+    sandbox = Sandbox(workspace="default", sandbox="existing-sandbox", name="job-1")
 
     with pytest.raises(SandboxError):
         sandbox.__enter__()
@@ -1685,9 +1878,97 @@ def test_high_level_attach_rejects_labels() -> None:
     ref = SandboxRef(
         id="sandbox-1",
         name="existing",
+        workspace="default",
         status=SandboxStatusRef(phase=2, current_policy_version=0),
     )
-    sandbox = Sandbox(sandbox=ref, labels={"aiq": "deep-research"})
+    sandbox = Sandbox(workspace="default", sandbox=ref, labels={"aiq": "deep-research"})
 
     with pytest.raises(SandboxError):
         sandbox.__enter__()
+
+
+# ---------------------------------------------------------------------------
+# Workspace support
+# ---------------------------------------------------------------------------
+
+
+def test_create_passes_workspace_to_proto() -> None:
+    stub = _FakeSandboxStub()
+    client = _client_with_fake_stub(stub)
+
+    ref = client.create(workspace="staging", name="job-1")
+
+    assert stub.create_request is not None
+    assert stub.create_request.workspace == "staging"
+    assert ref.workspace == "staging"
+
+
+def test_get_passes_workspace_to_proto() -> None:
+    stub = _FakeSandboxStub()
+    client = _client_with_fake_stub(stub)
+
+    ref = client.get("job-1", workspace="production")
+
+    assert stub.get_request is not None
+    assert stub.get_request.workspace == "production"
+    assert ref.workspace == "production"
+
+
+def test_delete_passes_workspace_to_proto() -> None:
+    stub = _FakeSandboxStub()
+    client = _client_with_fake_stub(stub)
+
+    result = client.delete("job-1", workspace="staging")
+
+    assert result is True
+    assert stub.delete_request is not None
+    assert stub.delete_request.workspace == "staging"
+
+
+def test_list_for_all_workspaces_sets_flag() -> None:
+    stub = _FakeSandboxStub()
+    client = _client_with_fake_stub(stub)
+
+    client.list_for_all_workspaces()
+
+    assert stub.list_request is not None
+    assert stub.list_request.all_workspaces is True
+    assert stub.list_request.workspace == ""
+
+
+def test_list_with_workspace_passes_workspace() -> None:
+    stub = _FakeSandboxStub()
+    client = _client_with_fake_stub(stub)
+
+    client.list(workspace="staging")
+
+    assert stub.list_request is not None
+    assert stub.list_request.workspace == "staging"
+    assert stub.list_request.all_workspaces is False
+
+
+def test_sandbox_ref_includes_workspace_from_proto() -> None:
+    proto = _make_sandbox_proto("sandbox-1", "job-1", workspace="production")
+
+    ref = _sandbox_ref(proto)
+
+    assert ref.workspace == "production"
+
+
+def test_sandbox_session_delete_passes_workspace() -> None:
+    from openshell.sandbox import SandboxSession
+
+    stub = _FakeSandboxStub()
+    client = _client_with_fake_stub(stub)
+    ref = SandboxRef(
+        id="sandbox-1",
+        name="job-1",
+        workspace="staging",
+        status=SandboxStatusRef(phase=2, current_policy_version=0),
+    )
+    session = SandboxSession(client, ref)
+
+    session.delete()
+
+    assert stub.delete_request is not None
+    assert stub.delete_request.workspace == "staging"

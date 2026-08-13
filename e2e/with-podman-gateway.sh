@@ -13,6 +13,10 @@
 #
 # HTTPS endpoint-only mode is intentionally unsupported here. Use a named
 # gateway config when mTLS materials are needed.
+#
+# Set OPENSHELL_E2E_PODMAN_STOP_TIMEOUT_SECS to override the managed gateway's
+# Podman sandbox stop timeout. The harness default is intentionally shorter
+# than the production driver default to keep CI teardown bounded.
 
 set -euo pipefail
 
@@ -95,6 +99,13 @@ PODMAN_SERVICE_PID=""
 PODMAN_SERVICE_LOG="${WORKDIR}/podman-service.log"
 PODMAN_SOCKET=""
 GPU_MODE="${OPENSHELL_E2E_PODMAN_GPU:-0}"
+OIDC_MODE="${OPENSHELL_E2E_OIDC_GATEWAY:-0}"
+OIDC_ISSUER="${OPENSHELL_E2E_OIDC_ISSUER:-}"
+
+if [ "${OIDC_MODE}" = "1" ] && [ -z "${OIDC_ISSUER}" ]; then
+  echo "ERROR: OPENSHELL_E2E_OIDC_ISSUER is required when OPENSHELL_E2E_OIDC_GATEWAY=1" >&2
+  exit 2
+fi
 
 # Isolate CLI/SDK gateway metadata from the developer's real config.
 export XDG_CONFIG_HOME="${WORKDIR}/config"
@@ -114,7 +125,7 @@ cleanup() {
     elif [ -n "${E2E_NAMESPACE}" ]; then
       sandbox_ids="$(podman_cmd ps -aq \
         --filter "label=openshell.managed=true" \
-        --filter "label=openshell.sandbox-namespace=${E2E_NAMESPACE}" \
+        --filter "label=openshell.ai/sandbox-namespace=${E2E_NAMESPACE}" \
         2>/dev/null || true)"
     fi
   fi
@@ -133,7 +144,7 @@ cleanup() {
   if [ -n "${sandbox_ids}" ]; then
     for id in ${sandbox_ids}; do
       local sandbox_id
-      sandbox_id="$(podman_cmd inspect --format '{{ index .Config.Labels "openshell.sandbox-id" }}' "${id}" 2>/dev/null || true)"
+      sandbox_id="$(podman_cmd inspect --format '{{ index .Config.Labels "openshell.ai/sandbox-id" }}' "${id}" 2>/dev/null || true)"
       podman_cmd rm -f "${id}" >/dev/null 2>&1 || true
       if [ -n "${sandbox_id}" ] && [ "${sandbox_id}" != "<no value>" ]; then
         podman_cmd volume rm -f "openshell-sandbox-${sandbox_id}-workspace" >/dev/null 2>&1 || true
@@ -173,7 +184,7 @@ ensure_e2e_podman_network() {
   podman_cmd network create \
     --driver bridge \
     --label openshell.managed=true \
-    --label "openshell.sandbox-namespace=${E2E_NAMESPACE}" \
+    --label "openshell.ai/sandbox-namespace=${E2E_NAMESPACE}" \
     "${network}" >/dev/null
   PODMAN_NETWORK_MANAGED=1
 }
@@ -359,6 +370,11 @@ echo "Using Podman supervisor image: ${SUPERVISOR_IMAGE}"
 
 DEFAULT_SANDBOX_IMAGE="ghcr.io/nvidia/openshell-community/sandboxes/base:latest"
 SANDBOX_IMAGE="${OPENSHELL_E2E_PODMAN_SANDBOX_IMAGE:-${OPENSHELL_SANDBOX_IMAGE:-${DEFAULT_SANDBOX_IMAGE}}}"
+PODMAN_STOP_TIMEOUT_SECS="${OPENSHELL_E2E_PODMAN_STOP_TIMEOUT_SECS:-15}"
+if ! [[ "${PODMAN_STOP_TIMEOUT_SECS}" =~ ^[0-9]+$ ]]; then
+  echo "ERROR: OPENSHELL_E2E_PODMAN_STOP_TIMEOUT_SECS must be a non-negative integer." >&2
+  exit 2
+fi
 if ! podman_cmd image exists "${SANDBOX_IMAGE}" 2>/dev/null; then
   echo "Pulling ${SANDBOX_IMAGE}..."
   podman_cmd pull "${SANDBOX_IMAGE}"
@@ -366,9 +382,20 @@ fi
 
 PKI_DIR="${WORKDIR}/pki"
 e2e_generate_pki "${GATEWAY_BIN}" "${PKI_DIR}" "host.containers.internal"
+export OPENSHELL_E2E_GATEWAY_CA_CERT="${PKI_DIR}/ca.crt"
 
 HOST_PORT=$(e2e_pick_port)
 HEALTH_PORT=$(e2e_pick_port)
+if [ "$(uname -s)" = "Darwin" ]; then
+  # Podman Machine reserves IPv4 loopback for its callback-only listener.
+  PRIMARY_BIND_IP="::1"
+  CLI_ENDPOINT_HOST="localhost"
+  HEALTH_ENDPOINT_HOST="[::1]"
+else
+  PRIMARY_BIND_IP="127.0.0.1"
+  CLI_ENDPOINT_HOST="127.0.0.1"
+  HEALTH_ENDPOINT_HOST="127.0.0.1"
+fi
 STATE_DIR="${WORKDIR}/state"
 mkdir -p "${STATE_DIR}"
 export XDG_STATE_HOME="${STATE_DIR}"
@@ -398,24 +425,32 @@ toml_string() {
 
 GATEWAY_CONFIG="${STATE_DIR}/gateway.toml"
 
-# Start from the RPM default template so this e2e test exercises the same
-# TOML config path that RPM users get on first start. The template sets
-# bind_address = "0.0.0.0:17670" and compute_drivers = ["podman"]; those
-# values must be correct for Podman e2e to pass, which means a regression
-# to the template (wrong bind address, wrong driver) will surface here.
+# Start from the RPM default template so this e2e test exercises the same TOML
+# config path that RPM users get on first start. The template leaves
+# bind_address unset and sets compute_drivers = ["podman"]. On Podman Machine,
+# the driver reserves IPv4 loopback for its callback-only listener, so the
+# primary listener uses IPv6 loopback. Native Linux keeps the IPv4 default.
 #
 # We append the driver-specific table and override the port via CLI flag
 # (CLI > TOML in the merge precedence) so the test can use an ephemeral port.
 cp "${ROOT}/deploy/rpm/gateway.toml.default" "${GATEWAY_CONFIG}"
 {
   e2e_write_gateway_jwt_config "${JWT_DIR}" "openshell-e2e-podman-${HOST_PORT}"
-  e2e_write_gateway_mtls_auth_config
+  if [ "${OIDC_MODE}" != "1" ]; then
+    e2e_write_gateway_mtls_auth_config
+    if [ -n "${OPENSHELL_OIDC_ISSUER:-}" ]; then
+      e2e_write_gateway_oidc_config "${OPENSHELL_OIDC_ISSUER}"
+    fi
+  fi
   printf '\n[openshell.drivers.podman]\n'
   # The Podman driver scopes isolation by network rather than namespace.
   printf 'network_name = %s\n'   "$(toml_string "${PODMAN_NETWORK_NAME}")"
   printf 'gateway_port = %s\n'   "${HOST_PORT}"
   printf 'default_image = %s\n'  "$(toml_string "${SANDBOX_IMAGE}")"
   printf 'image_pull_policy = "missing"\n'
+  # Keep CI teardown bounded while the production Podman driver default stays
+  # conservative for real user workloads.
+  printf 'stop_timeout_secs = %s\n' "${PODMAN_STOP_TIMEOUT_SECS}"
   printf 'supervisor_image = %s\n' "$(toml_string "${SUPERVISOR_IMAGE}")"
   printf 'guest_tls_ca = %s\n'     "$(toml_string "${PKI_DIR}/ca.crt")"
   printf 'guest_tls_cert = %s\n'   "$(toml_string "${PKI_DIR}/client/tls.crt")"
@@ -433,16 +468,28 @@ cp "${ROOT}/deploy/rpm/gateway.toml.default" "${GATEWAY_CONFIG}"
 
 GATEWAY_ARGS=(
   --config "${GATEWAY_CONFIG}"
-  # bind_address and compute_drivers come from the RPM template; no CLI flags
-  # needed. Port is overridden via CLI (CLI > TOML) for ephemeral port selection.
+  # compute_drivers comes from the RPM template. Override the loopback address
+  # and port so Podman Machine can keep its IPv4 callback listener distinct.
+  --bind-address "${PRIMARY_BIND_IP}"
   --port "${HOST_PORT}"
   --health-port "${HEALTH_PORT}"
   --tls-cert "${PKI_DIR}/server/tls.crt"
   --tls-key "${PKI_DIR}/server/tls.key"
-  --tls-client-ca "${PKI_DIR}/ca.crt"
   --db-url "sqlite:${STATE_DIR}/gateway.db?mode=rwc"
   --log-level info
 )
+
+if [ "${OIDC_MODE}" = "1" ]; then
+  GATEWAY_ARGS+=(
+    --oidc-issuer "${OIDC_ISSUER}"
+    --oidc-audience openshell-cli
+    --oidc-scopes-claim scope
+  )
+else
+  GATEWAY_ARGS+=(
+    --tls-client-ca "${PKI_DIR}/ca.crt"
+  )
+fi
 
 e2e_write_gateway_args_file "${GATEWAY_ARGS_FILE}" "${GATEWAY_ARGS[@]}"
 e2e_export_gateway_restart_metadata \
@@ -458,16 +505,27 @@ GATEWAY_PID=$!
 printf '%s\n' "${GATEWAY_PID}" >"${GATEWAY_PID_FILE}"
 
 GATEWAY_NAME="openshell-e2e-podman-${HOST_PORT}"
-CLI_GATEWAY_ENDPOINT="https://127.0.0.1:${HOST_PORT}"
-e2e_register_mtls_gateway \
-  "${XDG_CONFIG_HOME}" \
-  "${GATEWAY_NAME}" \
-  "${CLI_GATEWAY_ENDPOINT}" \
-  "${HOST_PORT}" \
-  "${PKI_DIR}"
+if [ "${OIDC_MODE}" = "1" ]; then
+  CLI_GATEWAY_ENDPOINT="https://${CLI_ENDPOINT_HOST}:${HOST_PORT}"
+  export OPENSHELL_E2E_OIDC_GATEWAY_ENDPOINT="${CLI_GATEWAY_ENDPOINT}"
+else
+  CLI_GATEWAY_ENDPOINT="https://${CLI_ENDPOINT_HOST}:${HOST_PORT}"
+  e2e_register_mtls_gateway \
+    "${XDG_CONFIG_HOME}" \
+    "${GATEWAY_NAME}" \
+    "${CLI_GATEWAY_ENDPOINT}" \
+    "${HOST_PORT}" \
+    "${PKI_DIR}" \
+    "${OPENSHELL_OIDC_ISSUER:-}"
+fi
 
 export OPENSHELL_GATEWAY="${GATEWAY_NAME}"
 export OPENSHELL_PROVISION_TIMEOUT="${OPENSHELL_PROVISION_TIMEOUT:-300}"
+
+if [ "${OIDC_MODE}" = "1" ] || [ -n "${OPENSHELL_OIDC_ISSUER:-}" ]; then
+  export OPENSHELL_E2E_OIDC=1
+  export OPENSHELL_E2E_OIDC_SCOPES=1
+fi
 
 echo "Waiting for gateway to become healthy..."
 elapsed=0
@@ -477,7 +535,8 @@ while [ "${elapsed}" -lt "${timeout}" ]; do
     echo "ERROR: openshell-gateway exited before becoming healthy"
     exit 1
   fi
-  if curl -sf "http://127.0.0.1:${HEALTH_PORT}/healthz" >/dev/null 2>&1; then
+  # Keep this loopback probe direct even when ::1 is absent from NO_PROXY.
+  if curl --noproxy '*' -sf "http://${HEALTH_ENDPOINT_HOST}:${HEALTH_PORT}/healthz" >/dev/null 2>&1; then
     echo "Gateway healthy after ${elapsed}s."
     break
   fi

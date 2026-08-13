@@ -1,0 +1,38 @@
+name: Setup E2E VM Driver
+description: Download a prebuilt OpenShell VM driver for E2E tests
+
+inputs:
+  artifact-name:
+    description: Artifact name to download, such as driver-vm-linux-amd64
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Download prebuilt VM driver
+      uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      with:
+        name: ${{ inputs.artifact-name }}
+        path: .e2e/prebuilt-vm-driver
+
+    - name: Configure prebuilt VM driver
+      shell: bash
+      run: |
+        set -euo pipefail
+        extract_dir="$GITHUB_WORKSPACE/.e2e/prebuilt-vm-driver/bin"
+        mkdir -p "$extract_dir"
+        archive="$(find "$GITHUB_WORKSPACE/.e2e/prebuilt-vm-driver" -maxdepth 1 -type f -name 'openshell-driver-vm-*.tar.gz' -print -quit)"
+        if [[ -z "$archive" ]]; then
+          echo "downloaded artifact is missing openshell-driver-vm-*.tar.gz" >&2
+          find "$GITHUB_WORKSPACE/.e2e/prebuilt-vm-driver" -maxdepth 2 -type f -print >&2 || true
+          exit 1
+        fi
+        tar -xzf "$archive" -C "$extract_dir"
+        driver="$extract_dir/openshell-driver-vm"
+        if [[ ! -f "$driver" ]]; then
+          echo "downloaded artifact is missing $driver" >&2
+          exit 1
+        fi
+        chmod +x "$driver"
+        "$driver" --version
+        echo "OPENSHELL_VM_DRIVER_BIN=$driver" >> "$GITHUB_ENV"

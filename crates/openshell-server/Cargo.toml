@@ -17,15 +17,18 @@ path = "src/main.rs"
 [dependencies]
 openshell-bootstrap = { path = "../openshell-bootstrap" }
 openshell-core = { path = "../openshell-core", default-features = false }
-openshell-driver-docker = { path = "../openshell-driver-docker" }
-openshell-driver-kubernetes = { path = "../openshell-driver-kubernetes" }
-openshell-driver-podman = { path = "../openshell-driver-podman" }
+openshell-driver-db-credstore = { path = "../openshell-driver-db-credstore" }
+openshell-driver-kubernetes-secrets = { path = "../openshell-driver-kubernetes-secrets" }
+openshell-driver-vault = { path = "../openshell-driver-vault" }
+openshell-gateway-interceptors = { path = "../openshell-gateway-interceptors" }
 openshell-ocsf = { path = "../openshell-ocsf" }
+openshell-otel = { path = "../openshell-otel" }
 openshell-policy = { path = "../openshell-policy" }
 openshell-prover = { path = "../openshell-prover" }
 openshell-providers = { path = "../openshell-providers" }
 openshell-router = { path = "../openshell-router" }
-openshell-server-macros = { path = "../openshell-server-macros" }
+openshell-supervisor-middleware = { path = "../openshell-supervisor-middleware" }
+openshell-supervisor-middleware-builtins = { path = "../openshell-supervisor-middleware-builtins" }
 
 # Kubernetes client (used by the `generate-certs` subcommand)
 kube = { workspace = true }
@@ -33,10 +36,13 @@ k8s-openapi = { workspace = true }
 
 # Async runtime
 tokio = { workspace = true }
+socket2 = { workspace = true }
+nix = { workspace = true }
 
 # gRPC
 tonic = { workspace = true, features = ["channel", "tls-native-roots"] }
 prost = { workspace = true }
+prost-reflect = { workspace = true }
 prost-types = { workspace = true }
 
 # HTTP server
@@ -66,20 +72,29 @@ anyhow = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 
+# OpenTelemetry (OTLP trace export, opt-in via [openshell.gateway.otlp])
+opentelemetry = { workspace = true }
+opentelemetry_sdk = { workspace = true }
+tracing-opentelemetry = { workspace = true }
+
 # Metrics
 metrics = { workspace = true }
 metrics-exporter-prometheus = { workspace = true }
 
 # Utilities
+base64 = { workspace = true }
 futures = { workspace = true }
 bytes = { workspace = true }
 pin-project-lite = { workspace = true }
+ring = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 toml = { workspace = true }
 tokio-stream = { workspace = true }
 sqlx = { workspace = true }
 reqwest = { workspace = true }
+aws-config = { workspace = true }
+aws-sdk-sts = { workspace = true }
 uuid = { workspace = true }
 hmac = "0.12"
 sha2 = { workspace = true }
@@ -88,7 +103,7 @@ async-trait = "0.1"
 url = { workspace = true }
 glob = { workspace = true }
 hex = "0.4"
-russh = "0.57"
+russh = "0.62"
 rand = { workspace = true }
 petname = "2"
 ipnet = "2"
@@ -97,6 +112,11 @@ rustix = { workspace = true }
 x509-parser = "0.16"
 arc-swap = "1"
 notify = "8"
+
+[target.'cfg(not(target_os = "windows"))'.dependencies]
+openshell-driver-docker = { path = "../openshell-driver-docker" }
+openshell-driver-kubernetes = { path = "../openshell-driver-kubernetes" }
+openshell-driver-podman = { path = "../openshell-driver-podman" }
 
 [features]
 default = ["telemetry"]
@@ -108,11 +128,15 @@ bundled-z3 = ["openshell-prover/bundled-z3"]
 test-support = []
 
 [dev-dependencies]
-hyper-rustls = { version = "0.27", default-features = false, features = ["native-tokio", "http1", "tls12", "logging", "ring", "webpki-tokio"] }
+hyper-rustls = { version = "0.27", default-features = false, features = ["native-tokio", "http1", "tls12", "logging", "ring"] }
 rcgen = { version = "0.13", features = ["crypto", "pem"] }
+rsa = { version = "0.9", features = ["pem"] }
+base64 = { workspace = true }
 tokio-tungstenite = { workspace = true }
 futures-util = "0.3"
 wiremock = "0.6"
-
+# `testing` provides InMemorySpanExporter, so span assertions do not need a
+# collector, a network hop, or a flush barrier.
+opentelemetry_sdk = { workspace = true, features = ["testing"] }
 [lints]
 workspace = true

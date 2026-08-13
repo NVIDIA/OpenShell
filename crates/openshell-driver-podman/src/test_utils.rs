@@ -13,7 +13,7 @@ use std::collections::VecDeque;
 use std::convert::Infallible;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::net::UnixListener;
 
 /// A canned HTTP response for the Podman stub server.
@@ -21,6 +21,7 @@ use tokio::net::UnixListener;
 pub struct StubResponse {
     pub status: StatusCode,
     pub body: String,
+    pub delay: Duration,
 }
 
 impl StubResponse {
@@ -28,7 +29,13 @@ impl StubResponse {
         Self {
             status,
             body: body.into(),
+            delay: Duration::ZERO,
         }
+    }
+
+    pub fn with_delay(mut self, delay: Duration) -> Self {
+        self.delay = delay;
+        self
     }
 }
 
@@ -97,6 +104,7 @@ pub fn spawn_podman_stub(
                                 .expect("response queue lock should not be poisoned")
                                 .pop_front()
                                 .expect("stub response should exist");
+                            tokio::time::sleep(response.delay).await;
                             Ok::<_, Infallible>(
                                 hyper::Response::builder()
                                     .status(response.status)

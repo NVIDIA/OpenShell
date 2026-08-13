@@ -10,7 +10,7 @@ use openshell_core::ComputeDriverKind;
 use openshell_core::config::DEFAULT_SERVER_PORT;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 use crate::certgen;
@@ -100,7 +100,7 @@ struct RunArgs {
     /// `kubernetes,podman`. The configuration format is future-proofed for
     /// multiple drivers, but the gateway currently requires exactly one.
     /// When unset, the gateway auto-detects the driver based on the runtime
-    /// environment (Kubernetes → Podman → Docker CLI or socket). VM is never
+    /// environment (Kubernetes → Podman → Docker). VM is never
     /// auto-detected and requires explicit configuration.
     #[arg(
         long,
@@ -372,8 +372,28 @@ fn prepare_server_config(args: &mut RunArgs, matches: &ArgMatches) -> Result<Ser
             args.grpc_rate_limit_requests,
             args.grpc_rate_limit_window_seconds,
         )
+        .with_gateway_interceptors(
+            file.as_ref()
+                .map(|f| f.openshell.gateway.interceptors.clone())
+                .unwrap_or_default(),
+        )
         .with_server_sans(args.server_sans.clone())
         .with_loopback_service_http(args.enable_loopback_service_http);
+    if let Some(sources) = file
+        .as_ref()
+        .and_then(|file| file.openshell.gateway.provider_profile_sources.clone())
+    {
+        config = config.with_provider_profile_sources(sources);
+    }
+
+    if let Some(gateway_file) = file.as_ref().map(|f| &f.openshell.gateway) {
+        if let Some(drivers) = &gateway_file.credential_drivers {
+            config = config.with_credential_drivers(drivers.clone());
+        }
+        if let Some(default_driver) = &gateway_file.default_credential_driver {
+            config = config.with_default_credential_driver(Some(default_driver.clone()));
+        }
+    }
     validate_grpc_rate_limit_args(
         args.grpc_rate_limit_requests,
         args.grpc_rate_limit_window_seconds,
@@ -391,6 +411,13 @@ fn prepare_server_config(args: &mut RunArgs, matches: &ArgMatches) -> Result<Ser
         .and_then(|f| f.openshell.gateway.ssh_session_ttl_secs)
     {
         config = config.with_ssh_session_ttl_secs(ttl);
+    }
+
+    if let Some(mode) = file
+        .as_ref()
+        .and_then(|f| f.openshell.gateway.policy_validation_failure_mode)
+    {
+        config.policy_validation_failure_mode = mode;
     }
 
     if let Some(issuer) = args.oidc_issuer.clone() {
@@ -429,9 +456,15 @@ async fn run_from_args(mut args: RunArgs, matches: ArgMatches) -> Result<()> {
     let prepared = prepare_server_config(&mut args, &matches)?;
 
     let tracing_log_bus = TracingLogBus::new();
-    tracing_log_bus.install_subscriber(
+    let otlp_config = prepared
+        .config_file
+        .as_ref()
+        .and_then(|f| f.openshell.gateway.otlp.as_ref());
+    let (tracing_handle, setup_error) = crate::tracing_setup::install(
         EnvFilter::try_from_default_env()
             .unwrap_or_else(|_| EnvFilter::new(&prepared.config.log_level)),
+        &tracing_log_bus,
+        otlp_config,
     );
 
     let has_client_ca = prepared
@@ -457,6 +490,18 @@ async fn run_from_args(mut args: RunArgs, matches: ArgMatches) -> Result<()> {
     if has_oidc {
         info!("OIDC authentication enabled");
     }
+    if let Some(err) = &setup_error {
+        error!(
+            error = %err,
+            "OTLP exporting is configured but could not be started; continuing without it"
+        );
+    } else if let Some(otlp) = prepared
+        .config_file
+        .as_ref()
+        .and_then(|f| f.openshell.gateway.otlp.as_ref())
+    {
+        info!(endpoint = %otlp.endpoint, "OTLP exporting enabled");
+    }
     if prepared.config.auth.allow_unauthenticated_users {
         warn!(
             "Unauthenticated user access enabled — only use this for trusted local development or a fully trusted fronting proxy"
@@ -476,9 +521,11 @@ async fn run_from_args(mut args: RunArgs, matches: ArgMatches) -> Result<()> {
 
     info!(bind = %prepared.config.bind_address, "Starting OpenShell server");
 
-    Box::pin(run_server(prepared, tracing_log_bus))
-        .await
-        .into_diagnostic()
+    let result = Box::pin(run_server(prepared, tracing_log_bus)).await;
+
+    tracing_handle.shutdown();
+
+    result.into_diagnostic()
 }
 
 fn parse_compute_driver(value: &str) -> std::result::Result<String, String> {
@@ -1160,11 +1207,15 @@ mod tests {
 
         let expected = format!(
             "sqlite:{}",
-            tmp.path().join("openshell/gateway/openshell.db").display()
+            tmp.path()
+                .join("openshell")
+                .join("gateway")
+                .join("openshell.db")
+                .display()
         );
         assert!(local_tls.is_none());
         assert_eq!(args.db_url.as_deref(), Some(expected.as_str()));
-        assert!(tmp.path().join("openshell/gateway").is_dir());
+        assert!(tmp.path().join("openshell").join("gateway").is_dir());
     }
 
     #[test]
@@ -1734,6 +1785,9 @@ enable_loopback_service_http = false
         std::fs::write(
             &config_path,
             r#"
+[openshell.gateway]
+policy_validation_failure_mode = "retain_last_valid"
+
 [openshell.drivers.docker]
 unknown_docker_key = true
 
@@ -1758,12 +1812,17 @@ mem_mib = "not-a-number"
             super::prepare_server_config(&mut args, &matches).expect("server config is prepared");
 
         assert_eq!(prepared.config.compute_drivers, vec!["podman".to_string()]);
+        assert_eq!(
+            prepared.config.policy_validation_failure_mode,
+            openshell_core::PolicyValidationFailureMode::RetainLastValid
+        );
         let file = prepared.config_file.expect("config file is preserved");
         assert!(file.openshell.drivers.contains_key("docker"));
         assert!(file.openshell.drivers.contains_key("vm"));
     }
 
     #[test]
+    #[cfg(not(target_os = "windows"))]
     fn driver_inherits_shared_image_from_gateway_section() {
         // [openshell.gateway].default_image inherits into the K8s driver
         // table when the driver-specific table does not set it.
@@ -1789,6 +1848,7 @@ namespace = "agents"
     }
 
     #[test]
+    #[cfg(not(target_os = "windows"))]
     fn driver_specific_value_overrides_gateway_inheritance() {
         let file = config_file_from_toml(
             r#"

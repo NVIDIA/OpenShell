@@ -11,16 +11,20 @@ use crate::config::{
 };
 use futures::{Stream, StreamExt, TryStreamExt};
 use k8s_openapi::api::core::v1::{
-    Event as KubeEventObj, Namespace, Node, PersistentVolumeClaimVolumeSource, Volume, VolumeMount,
+    Event as KubeEventObj, Namespace, Node, PersistentVolumeClaimVolumeSource, Pod, Volume,
+    VolumeMount,
 };
-use kube::api::{Api, ApiResource, DeleteParams, ListParams, PostParams};
+use kube::api::{
+    Api, ApiResource, DeleteParams, ListParams, Patch, PatchParams, PostParams, Preconditions,
+};
 use kube::core::gvk::GroupVersionKind;
 use kube::core::{DynamicObject, ObjectMeta};
 use kube::runtime::watcher::{self, Event};
 use kube::{Client, Error as KubeError};
 use openshell_core::driver_mounts;
 use openshell_core::driver_utils::{
-    LABEL_MANAGED_BY, LABEL_MANAGED_BY_VALUE, LABEL_SANDBOX_ID, SUPERVISOR_IMAGE_BINARY_PATH,
+    LABEL_MANAGED_BY, LABEL_MANAGED_BY_VALUE, LABEL_SANDBOX_ID, LABEL_SANDBOX_NAME,
+    LABEL_SANDBOX_WORKSPACE, SUPERVISOR_IMAGE_BINARY_PATH, openshell_sandbox_label_selector,
 };
 use openshell_core::gpu::{driver_gpu_requirements, effective_driver_gpu_count};
 use openshell_core::progress::{
@@ -86,11 +90,20 @@ impl From<KubernetesDriverError> for openshell_core::ComputeDriverError {
 /// API server is unreachable or slow.
 const KUBE_API_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Kubernetes defaults pod termination to 30 seconds when the pod template
+/// omits `terminationGracePeriodSeconds`.
+const DEFAULT_POD_TERMINATION_GRACE_PERIOD: Duration = Duration::from_secs(30);
+const STOP_INITIAL_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const STOP_MAX_POLL_INTERVAL: Duration = Duration::from_secs(2);
+
 const SANDBOX_GROUP: &str = "agents.x-k8s.io";
 const SANDBOX_VERSION_V1BETA1: &str = "v1beta1";
 const SANDBOX_VERSION_V1ALPHA1: &str = "v1alpha1";
 const SANDBOX_VERSIONS: &[&str] = &[SANDBOX_VERSION_V1BETA1, SANDBOX_VERSION_V1ALPHA1];
 pub const SANDBOX_KIND: &str = "Sandbox";
+const SANDBOX_POD_NAME_ANNOTATION: &str = "agents.x-k8s.io/pod-name";
+const SANDBOX_SUSPENDED_CONDITION: &str = "Suspended";
+const SANDBOX_SUSPENDED_POD_NOT_OWNED_REASON: &str = "PodNotOwned";
 
 const GPU_RESOURCE_NAME: &str = "nvidia.com/gpu";
 const SPIFFE_WORKLOAD_API_VOLUME_NAME: &str = "spiffe-workload-api";
@@ -311,6 +324,10 @@ fn validate_kubernetes_driver_volume_mounts(
         }
 
         driver_mounts::validate_container_mount_target(&mount.mount_path)?;
+        driver_mounts::validate_workspace_mount_target(
+            &mount.mount_path,
+            driver_mounts::DEFAULT_WORKSPACE_ROOT,
+        )?;
         let normalized_mount_path = driver_mounts::normalize_mount_target(&mount.mount_path);
         if !mount_paths.insert(normalized_mount_path.clone()) {
             return Err(format!(
@@ -667,6 +684,7 @@ impl KubernetesComputeDriver {
         let _ = self
             .validate_driver_config_for_sandbox(sandbox)
             .map_err(tonic::Status::invalid_argument)?;
+        validate_kube_resource_name_length(&sandbox.workspace, &sandbox.name)?;
         let gpu_requirements = sandbox
             .spec
             .as_ref()
@@ -684,9 +702,9 @@ impl KubernetesComputeDriver {
         Ok(())
     }
 
-    pub async fn get_sandbox(&self, name: &str) -> Result<Option<Sandbox>, String> {
+    pub async fn get_sandbox(&self, sandbox_id: &str) -> Result<Option<Sandbox>, String> {
         info!(
-            sandbox_name = %name,
+            sandbox_id = %sandbox_id,
             namespace = %self.config.namespace,
             "Fetching sandbox from Kubernetes"
         );
@@ -694,15 +712,24 @@ impl KubernetesComputeDriver {
         let agent_sandbox_api = self
             .supported_agent_sandbox_api(self.client.clone())
             .await?;
-        match tokio::time::timeout(KUBE_API_TIMEOUT, agent_sandbox_api.api.get(name)).await {
-            Ok(Ok(obj)) => sandbox_from_object(&self.config.namespace, obj).map(Some),
-            Ok(Err(KubeError::Api(err))) if err.code == 404 => {
-                debug!(sandbox_name = %name, "Sandbox not found in Kubernetes");
-                Ok(None)
-            }
+        let selector =
+            format!("{LABEL_MANAGED_BY}={LABEL_MANAGED_BY_VALUE},{LABEL_SANDBOX_ID}={sandbox_id}");
+        let lp = ListParams::default().labels(&selector);
+        match tokio::time::timeout(KUBE_API_TIMEOUT, agent_sandbox_api.api.list(&lp)).await {
+            Ok(Ok(list)) => list.items.into_iter().next().map_or_else(
+                || {
+                    debug!(sandbox_id = %sandbox_id, "Sandbox not found in Kubernetes");
+                    Ok(None)
+                },
+                |obj| {
+                    Ok(sandbox_from_object(&self.config.namespace, obj)
+                        .ok()
+                        .map(|(_, s)| s))
+                },
+            ),
             Ok(Err(err)) => {
                 warn!(
-                    sandbox_name = %name,
+                    sandbox_id = %sandbox_id,
                     error = %err,
                     "Failed to fetch sandbox from Kubernetes"
                 );
@@ -710,7 +737,7 @@ impl KubernetesComputeDriver {
             }
             Err(_elapsed) => {
                 warn!(
-                    sandbox_name = %name,
+                    sandbox_id = %sandbox_id,
                     timeout_secs = KUBE_API_TIMEOUT.as_secs(),
                     "Timed out fetching sandbox from Kubernetes"
                 );
@@ -733,16 +760,27 @@ impl KubernetesComputeDriver {
             .await?;
         match tokio::time::timeout(
             KUBE_API_TIMEOUT,
-            agent_sandbox_api.api.list(&ListParams::default()),
+            agent_sandbox_api
+                .api
+                .list(&ListParams::default().labels(&openshell_sandbox_label_selector())),
         )
         .await
         {
             Ok(Ok(list)) => {
-                let mut sandboxes = list
+                let mut sandboxes: Vec<Sandbox> = list
                     .items
                     .into_iter()
-                    .map(|obj| sandbox_from_object(&self.config.namespace, obj))
-                    .collect::<Result<Vec<_>, _>>()?;
+                    .filter_map(|obj| {
+                        let name = obj.metadata.name.clone().unwrap_or_default();
+                        match sandbox_from_object(&self.config.namespace, obj) {
+                            Ok((_, s)) => Some(s),
+                            Err(err) => {
+                                warn!(object_name = %name, error = %err, "skipping unrecognized Sandbox in list");
+                                None
+                            }
+                        }
+                    })
+                    .collect();
                 sandboxes.sort_by(|left, right| {
                     left.name
                         .cmp(&right.name)
@@ -781,6 +819,11 @@ impl KubernetesComputeDriver {
         validate_gpu_request(gpu_requirements).map_err(|status| {
             KubernetesDriverError::InvalidArgument(status.message().to_string())
         })?;
+
+        // Validate sandbox name against Kubernetes naming requirements
+        validate_kubernetes_dns1123_label(&sandbox.name, "sandbox name")
+            .map_err(KubernetesDriverError::InvalidArgument)?;
+
         let name = sandbox.name.as_str();
         info!(
             sandbox_id = %sandbox.id,
@@ -821,6 +864,7 @@ impl KubernetesComputeDriver {
             enable_user_namespaces: self.config.enable_user_namespaces,
             app_armor_profile: self.config.app_armor_profile.as_ref(),
             workspace_default_storage_size: &self.config.workspace_default_storage_size,
+            workspace_storage_class: &self.config.workspace_storage_class,
             default_runtime_class_name: &self.config.default_runtime_class_name,
             sa_token_ttl_secs: self.config.effective_sa_token_ttl_secs(),
             provider_spiffe_enabled: self.config.provider_spiffe_enabled(),
@@ -834,30 +878,25 @@ impl KubernetesComputeDriver {
 
         let data = sandbox_to_k8s_spec(sandbox.spec.as_ref(), &params)
             .map_err(KubernetesDriverError::InvalidArgument)?;
-        let mut obj = DynamicObject::new(name, &agent_sandbox_api.resource);
+        let kube_name = kube_resource_name(&sandbox.workspace, name);
+        let mut obj = DynamicObject::new(&kube_name, &agent_sandbox_api.resource);
         // Copy only the SCC-related annotations onto the Sandbox CR for
         // traceability. Copying the full namespace annotation map exposes
         // unrelated cluster metadata and can fail with oversized annotations.
-        let scc_annotations: BTreeMap<String, String> = [
+        let mut annotations = sandbox_annotations(sandbox);
+        for key in [
             crate::config::ANNOTATION_SCC_UID_RANGE,
             crate::config::ANNOTATION_SCC_SUPPLEMENTAL_GROUPS,
-        ]
-        .iter()
-        .filter_map(|key| {
-            ns_annotations
-                .get(*key)
-                .map(|v| ((*key).to_string(), v.clone()))
-        })
-        .collect();
+        ] {
+            if let Some(v) = ns_annotations.get(key) {
+                annotations.insert(key.to_string(), v.clone());
+            }
+        }
         obj.metadata = ObjectMeta {
-            name: Some(name.to_string()),
+            name: Some(kube_name),
             namespace: Some(self.config.namespace.clone()),
             labels: Some(sandbox_labels(sandbox)),
-            annotations: if scc_annotations.is_empty() {
-                None
-            } else {
-                Some(scc_annotations)
-            },
+            annotations: Some(annotations),
             ..Default::default()
         };
 
@@ -900,9 +939,141 @@ impl KubernetesComputeDriver {
         }
     }
 
-    pub async fn delete_sandbox(&self, name: &str) -> Result<bool, String> {
+    pub async fn stop_sandbox(&self, sandbox_id: &str) -> Result<(), String> {
+        let (agent_sandbox_api, kube_name, pod_name, stop_timeout) = self
+            .patch_sandbox_operating_state(sandbox_id, false)
+            .await?;
+        let legacy_pod_api = (agent_sandbox_api.resource.version == SANDBOX_VERSION_V1ALPHA1)
+            .then(|| Api::<Pod>::namespaced(self.client.clone(), &self.config.namespace));
+
+        let deadline = tokio::time::Instant::now() + stop_timeout;
+        let mut poll_interval = STOP_INITIAL_POLL_INTERVAL;
+        loop {
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                return Err(format!(
+                    "timed out after {}s waiting for Kubernetes sandbox to stop",
+                    stop_timeout.as_secs()
+                ));
+            }
+            let request_timeout = KUBE_API_TIMEOUT.min(deadline.saturating_duration_since(now));
+            let object = tokio::time::timeout(
+                request_timeout,
+                agent_sandbox_api.api.get(&kube_name),
+            )
+            .await
+            .map_err(|_| {
+                format!(
+                    "timed out after {}s waiting for Kubernetes API while checking sandbox stop",
+                    request_timeout.as_secs()
+                )
+            })?
+            .map_err(|err| err.to_string())?;
+            if kubernetes_sandbox_has_stopped_condition(&object) {
+                return Ok(());
+            }
+            if let Some(error) = kubernetes_sandbox_stop_failure(&object) {
+                return Err(error);
+            }
+            if let Some(pod_api) = legacy_pod_api.as_ref()
+                && kubernetes_sandbox_pod_is_gone(pod_api, &pod_name, deadline).await?
+            {
+                return Ok(());
+            }
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                return Err(format!(
+                    "timed out after {}s waiting for Kubernetes sandbox to stop",
+                    stop_timeout.as_secs()
+                ));
+            }
+            tokio::time::sleep(poll_interval.min(deadline.saturating_duration_since(now))).await;
+            poll_interval = next_stop_poll_interval(poll_interval);
+        }
+    }
+
+    pub async fn start_sandbox(&self, sandbox_id: &str) -> Result<(), String> {
+        self.patch_sandbox_operating_state(sandbox_id, true)
+            .await
+            .map(|_| ())
+    }
+
+    async fn patch_sandbox_operating_state(
+        &self,
+        sandbox_id: &str,
+        running: bool,
+    ) -> Result<(AgentSandboxApi, String, String, Duration), String> {
+        let agent_sandbox_api = self
+            .supported_agent_sandbox_api(self.client.clone())
+            .await?;
+        let selector =
+            format!("{LABEL_MANAGED_BY}={LABEL_MANAGED_BY_VALUE},{LABEL_SANDBOX_ID}={sandbox_id}");
+        let list = tokio::time::timeout(
+            KUBE_API_TIMEOUT,
+            agent_sandbox_api
+                .api
+                .list(&ListParams::default().labels(&selector)),
+        )
+        .await
+        .map_err(|_| {
+            format!(
+                "timed out after {}s waiting for Kubernetes API",
+                KUBE_API_TIMEOUT.as_secs()
+            )
+        })?
+        .map_err(|err| err.to_string())?;
+        let object = list
+            .items
+            .into_iter()
+            .next()
+            .ok_or_else(|| "sandbox not found".to_string())?;
+        let stop_timeout = kubernetes_sandbox_stop_timeout(&object);
+        let kube_name = object
+            .metadata
+            .name
+            .ok_or_else(|| "sandbox resource has no name".to_string())?;
+        let pod_name = object
+            .metadata
+            .annotations
+            .as_ref()
+            .and_then(|annotations| annotations.get(SANDBOX_POD_NAME_ANNOTATION))
+            .cloned()
+            .unwrap_or_else(|| kube_name.clone());
+        let resource_version = object.metadata.resource_version.unwrap_or_default();
+        let desired = sandbox_operating_state_patch(
+            &agent_sandbox_api.resource.version,
+            &resource_version,
+            running,
+        );
+        tokio::time::timeout(
+            KUBE_API_TIMEOUT,
+            agent_sandbox_api.api.patch(
+                &kube_name,
+                &PatchParams::default(),
+                &Patch::Merge(&desired),
+            ),
+        )
+        .await
+        .map_err(|_| {
+            format!(
+                "timed out after {}s waiting for Kubernetes API",
+                KUBE_API_TIMEOUT.as_secs()
+            )
+        })?
+        .map_err(|err| err.to_string())?;
+
         info!(
-            sandbox_name = %name,
+            sandbox_id,
+            sandbox_api_version = %agent_sandbox_api.resource.version,
+            running,
+            "Updated Kubernetes sandbox operating state"
+        );
+        Ok((agent_sandbox_api, kube_name, pod_name, stop_timeout))
+    }
+
+    pub async fn delete_sandbox(&self, sandbox_id: &str) -> Result<bool, String> {
+        info!(
+            sandbox_id = %sandbox_id,
             namespace = %self.config.namespace,
             "Deleting sandbox from Kubernetes"
         );
@@ -910,23 +1081,71 @@ impl KubernetesComputeDriver {
         let agent_sandbox_api = self
             .supported_agent_sandbox_api(self.client.clone())
             .await?;
+        let selector =
+            format!("{LABEL_MANAGED_BY}={LABEL_MANAGED_BY_VALUE},{LABEL_SANDBOX_ID}={sandbox_id}");
+        let lp = ListParams::default().labels(&selector);
+        let (kube_name, preconditions) = match tokio::time::timeout(
+            KUBE_API_TIMEOUT,
+            agent_sandbox_api.api.list(&lp),
+        )
+        .await
+        {
+            Ok(Ok(list)) => {
+                if let Some(obj) = list.items.into_iter().next() {
+                    match obj.metadata.name {
+                        Some(name) => {
+                            let pc = Preconditions {
+                                uid: obj.metadata.uid,
+                                resource_version: obj.metadata.resource_version,
+                            };
+                            (name, pc)
+                        }
+                        None => return Ok(false),
+                    }
+                } else {
+                    debug!(sandbox_id = %sandbox_id, "Sandbox not found in Kubernetes (already deleted)");
+                    return Ok(false);
+                }
+            }
+            Ok(Err(err)) => {
+                warn!(
+                    sandbox_id = %sandbox_id,
+                    error = %err,
+                    "Failed to list sandbox for deletion from Kubernetes"
+                );
+                return Err(err.to_string());
+            }
+            Err(_elapsed) => {
+                warn!(
+                    sandbox_id = %sandbox_id,
+                    timeout_secs = KUBE_API_TIMEOUT.as_secs(),
+                    "Timed out listing sandbox for deletion from Kubernetes"
+                );
+                return Err(format!(
+                    "timed out after {}s waiting for Kubernetes API",
+                    KUBE_API_TIMEOUT.as_secs()
+                ));
+            }
+        };
+
+        let dp = DeleteParams::default().preconditions(preconditions);
         match tokio::time::timeout(
             KUBE_API_TIMEOUT,
-            agent_sandbox_api.api.delete(name, &DeleteParams::default()),
+            agent_sandbox_api.api.delete(&kube_name, &dp),
         )
         .await
         {
             Ok(Ok(_response)) => {
-                info!(sandbox_name = %name, "Sandbox deleted from Kubernetes");
+                info!(sandbox_id = %sandbox_id, "Sandbox deleted from Kubernetes");
                 Ok(true)
             }
-            Ok(Err(KubeError::Api(err))) if err.code == 404 => {
-                debug!(sandbox_name = %name, "Sandbox not found in Kubernetes (already deleted)");
+            Ok(Err(KubeError::Api(err))) if err.code == 404 || err.code == 409 => {
+                debug!(sandbox_id = %sandbox_id, "Sandbox not found in Kubernetes (already deleted or replaced)");
                 Ok(false)
             }
             Ok(Err(err)) => {
                 warn!(
-                    sandbox_name = %name,
+                    sandbox_id = %sandbox_id,
                     error = %err,
                     "Failed to delete sandbox from Kubernetes"
                 );
@@ -934,7 +1153,7 @@ impl KubernetesComputeDriver {
             }
             Err(_elapsed) => {
                 warn!(
-                    sandbox_name = %name,
+                    sandbox_id = %sandbox_id,
                     timeout_secs = KUBE_API_TIMEOUT.as_secs(),
                     "Timed out deleting sandbox from Kubernetes"
                 );
@@ -946,13 +1165,15 @@ impl KubernetesComputeDriver {
         }
     }
 
-    pub async fn sandbox_exists(&self, name: &str) -> Result<bool, String> {
+    pub async fn sandbox_exists(&self, sandbox_id: &str) -> Result<bool, String> {
         let agent_sandbox_api = self
             .supported_agent_sandbox_api(self.client.clone())
             .await?;
-        match tokio::time::timeout(KUBE_API_TIMEOUT, agent_sandbox_api.api.get(name)).await {
-            Ok(Ok(_)) => Ok(true),
-            Ok(Err(KubeError::Api(err))) if err.code == 404 => Ok(false),
+        let selector =
+            format!("{LABEL_MANAGED_BY}={LABEL_MANAGED_BY_VALUE},{LABEL_SANDBOX_ID}={sandbox_id}");
+        let lp = ListParams::default().labels(&selector);
+        match tokio::time::timeout(KUBE_API_TIMEOUT, agent_sandbox_api.api.list(&lp)).await {
+            Ok(Ok(list)) => Ok(!list.items.is_empty()),
             Ok(Err(err)) => Err(err.to_string()),
             Err(_elapsed) => Err(format!(
                 "timed out after {}s waiting for Kubernetes API",
@@ -969,8 +1190,8 @@ impl KubernetesComputeDriver {
             .supported_agent_sandbox_api(self.watch_client.clone())
             .await?;
         let event_api: Api<KubeEventObj> = Api::namespaced(self.watch_client.clone(), &namespace);
-        let mut sandbox_stream =
-            watcher::watcher(agent_sandbox_api.api, watcher::Config::default()).boxed();
+        let watcher_config = watcher::Config::default().labels(&openshell_sandbox_label_selector());
+        let mut sandbox_stream = watcher::watcher(agent_sandbox_api.api, watcher_config).boxed();
         let mut event_stream = watcher::watcher(event_api, watcher::Config::default()).boxed();
         let (tx, rx) = mpsc::channel(256);
 
@@ -982,63 +1203,44 @@ impl KubernetesComputeDriver {
                 tokio::select! {
                     result = sandbox_stream.try_next() => match result {
                         Ok(Some(Event::Applied(obj))) => {
-                            match sandbox_from_object(&namespace, obj) {
-                                Ok(sandbox) => {
-                                    update_indexes(&mut sandbox_name_to_id, &mut agent_pod_to_id, &sandbox);
+                            if let Ok((kube_name, sandbox)) = sandbox_from_object(&namespace, obj) {
+                                update_indexes(&mut sandbox_name_to_id, &mut agent_pod_to_id, &kube_name, &sandbox);
+                                let event = WatchSandboxesEvent {
+                                    payload: Some(watch_sandboxes_event::Payload::Sandbox(
+                                        WatchSandboxesSandboxEvent { sandbox: Some(sandbox) }
+                                    )),
+                                };
+                                if tx.send(Ok(event)).await.is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                        Ok(Some(Event::Deleted(obj))) => {
+                            if is_openshell_managed(&obj)
+                                && let Ok(sandbox_id) = sandbox_id_from_object(&obj)
+                            {
+                                remove_indexes(&mut sandbox_name_to_id, &mut agent_pod_to_id, &sandbox_id);
+                                let event = WatchSandboxesEvent {
+                                    payload: Some(watch_sandboxes_event::Payload::Deleted(
+                                        WatchSandboxesDeletedEvent { sandbox_id }
+                                    )),
+                                };
+                                if tx.send(Ok(event)).await.is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                        Ok(Some(Event::Restarted(objs))) => {
+                            for obj in objs {
+                                if let Ok((kube_name, sandbox)) = sandbox_from_object(&namespace, obj) {
+                                    update_indexes(&mut sandbox_name_to_id, &mut agent_pod_to_id, &kube_name, &sandbox);
                                     let event = WatchSandboxesEvent {
                                         payload: Some(watch_sandboxes_event::Payload::Sandbox(
                                             WatchSandboxesSandboxEvent { sandbox: Some(sandbox) }
                                         )),
                                     };
                                     if tx.send(Ok(event)).await.is_err() {
-                                        break;
-                                    }
-                                }
-                                Err(err) => {
-                                    if tx.send(Err(KubernetesDriverError::Message(err))).await.is_err() {
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                        Ok(Some(Event::Deleted(obj))) => {
-                            match sandbox_id_from_object(&obj) {
-                                Ok(sandbox_id) => {
-                                    remove_indexes(&mut sandbox_name_to_id, &mut agent_pod_to_id, &sandbox_id);
-                                    let event = WatchSandboxesEvent {
-                                        payload: Some(watch_sandboxes_event::Payload::Deleted(
-                                            WatchSandboxesDeletedEvent { sandbox_id }
-                                        )),
-                                    };
-                                    if tx.send(Ok(event)).await.is_err() {
-                                        break;
-                                    }
-                                }
-                                Err(err) => {
-                                    if tx.send(Err(KubernetesDriverError::Message(err))).await.is_err() {
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                        Ok(Some(Event::Restarted(objs))) => {
-                            for obj in objs {
-                                match sandbox_from_object(&namespace, obj) {
-                                    Ok(sandbox) => {
-                                        update_indexes(&mut sandbox_name_to_id, &mut agent_pod_to_id, &sandbox);
-                                        let event = WatchSandboxesEvent {
-                                            payload: Some(watch_sandboxes_event::Payload::Sandbox(
-                                                WatchSandboxesSandboxEvent { sandbox: Some(sandbox) }
-                                            )),
-                                        };
-                                        if tx.send(Ok(event)).await.is_err() {
-                                            return;
-                                        }
-                                    }
-                                    Err(err) => {
-                                        if tx.send(Err(KubernetesDriverError::Message(err))).await.is_err() {
-                                            return;
-                                        }
+                                        return;
                                     }
                                 }
                             }
@@ -1085,7 +1287,8 @@ impl KubernetesComputeDriver {
                             let _ = tx.send(Err(KubernetesDriverError::Message(err.to_string()))).await;
                             break;
                         }
-                    }
+                    },
+                    () = tx.closed() => break,
                 }
             }
         });
@@ -1110,9 +1313,31 @@ fn validate_gpu_request(
     Ok(())
 }
 
+fn kube_resource_name(workspace: &str, name: &str) -> String {
+    format!("{workspace}--{name}")
+}
+
+const MAX_KUBE_NAME_LEN: usize = 63;
+
+fn validate_kube_resource_name_length(workspace: &str, name: &str) -> Result<(), tonic::Status> {
+    let combined = workspace.len() + 2 + name.len(); // "--" separator
+    if combined > MAX_KUBE_NAME_LEN {
+        return Err(tonic::Status::invalid_argument(format!(
+            "combined Kubernetes resource name '{workspace}--{name}' is {combined} characters, \
+             exceeding the DNS-1123 limit of {MAX_KUBE_NAME_LEN}"
+        )));
+    }
+    Ok(())
+}
+
 fn sandbox_labels(sandbox: &Sandbox) -> BTreeMap<String, String> {
     let mut labels = BTreeMap::new();
     labels.insert(LABEL_SANDBOX_ID.to_string(), sandbox.id.clone());
+    labels.insert(LABEL_SANDBOX_NAME.to_string(), sandbox.name.clone());
+    labels.insert(
+        LABEL_SANDBOX_WORKSPACE.to_string(),
+        sandbox.workspace.clone(),
+    );
     labels.insert(
         LABEL_MANAGED_BY.to_string(),
         LABEL_MANAGED_BY_VALUE.to_string(),
@@ -1120,24 +1345,70 @@ fn sandbox_labels(sandbox: &Sandbox) -> BTreeMap<String, String> {
     labels
 }
 
+fn sandbox_annotations(sandbox: &Sandbox) -> BTreeMap<String, String> {
+    let mut annotations = BTreeMap::new();
+    annotations.insert(LABEL_SANDBOX_ID.to_string(), sandbox.id.clone());
+    annotations.insert(LABEL_SANDBOX_NAME.to_string(), sandbox.name.clone());
+    annotations.insert(
+        LABEL_SANDBOX_WORKSPACE.to_string(),
+        sandbox.workspace.clone(),
+    );
+    annotations
+}
+
 fn sandbox_id_from_object(obj: &DynamicObject) -> Result<String, String> {
+    if let Some(annotations) = obj.metadata.annotations.as_ref()
+        && let Some(id) = annotations.get(LABEL_SANDBOX_ID)
+    {
+        return Ok(id.clone());
+    }
     if let Some(labels) = obj.metadata.labels.as_ref()
         && let Some(id) = labels.get(LABEL_SANDBOX_ID)
     {
         return Ok(id.clone());
     }
-
-    let name = obj.metadata.name.clone().unwrap_or_default();
-    if let Some(id) = name.strip_prefix("sandbox-") {
-        return Ok(id.to_string());
-    }
-
     Err("sandbox id not found on object".to_string())
 }
 
-fn sandbox_from_object(namespace: &str, obj: DynamicObject) -> Result<Sandbox, String> {
-    let id = sandbox_id_from_object(&obj)?;
-    let name = obj.metadata.name.clone().unwrap_or_default();
+fn annotation_or_label(obj: &DynamicObject, key: &str) -> Option<String> {
+    obj.metadata
+        .annotations
+        .as_ref()
+        .and_then(|a| a.get(key))
+        .or_else(|| obj.metadata.labels.as_ref().and_then(|l| l.get(key)))
+        .cloned()
+}
+
+fn is_openshell_managed(obj: &DynamicObject) -> bool {
+    annotation_or_label(obj, LABEL_MANAGED_BY).as_deref() == Some(LABEL_MANAGED_BY_VALUE)
+}
+
+/// Returns `(kube_resource_name, DriverSandbox)`.
+///
+/// Returns `Err` in two cases (callers should skip, not fail):
+/// - The object is not managed by `OpenShell` (missing/wrong `managed-by` label).
+/// - The object is managed by `OpenShell` but missing required fields (orphan).
+fn sandbox_from_object(namespace: &str, obj: DynamicObject) -> Result<(String, Sandbox), String> {
+    let kube_name = obj.metadata.name.clone().unwrap_or_default();
+
+    if !is_openshell_managed(&obj) {
+        debug!(object = %kube_name, "skipping sandbox CR not managed by openshell");
+        return Err(format!("object {kube_name} not managed by openshell"));
+    }
+
+    let Ok(id) = sandbox_id_from_object(&obj) else {
+        warn!(object = %kube_name, "openshell-managed sandbox CR missing id");
+        return Err(format!("object {kube_name} missing sandbox id"));
+    };
+    let Some(name) = annotation_or_label(&obj, LABEL_SANDBOX_NAME) else {
+        warn!(object = %kube_name, "openshell-managed sandbox CR missing name");
+        return Err(format!("object {kube_name} missing sandbox name"));
+    };
+    let Some(workspace) = annotation_or_label(&obj, LABEL_SANDBOX_WORKSPACE) else {
+        warn!(object = %kube_name, "openshell-managed sandbox CR missing workspace");
+        return Err(format!("object {kube_name} missing sandbox workspace"));
+    };
+
     let namespace = obj
         .metadata
         .namespace
@@ -1145,22 +1416,27 @@ fn sandbox_from_object(namespace: &str, obj: DynamicObject) -> Result<Sandbox, S
         .unwrap_or_else(|| namespace.to_string());
     let status = status_from_object(&obj);
 
-    Ok(Sandbox {
-        id,
-        name,
-        namespace,
-        spec: None,
-        status,
-    })
+    Ok((
+        kube_name,
+        Sandbox {
+            id,
+            name,
+            namespace,
+            spec: None,
+            status,
+            workspace,
+        },
+    ))
 }
 
 fn update_indexes(
     sandbox_name_to_id: &mut std::collections::HashMap<String, String>,
     agent_pod_to_id: &mut std::collections::HashMap<String, String>,
+    kube_name: &str,
     sandbox: &Sandbox,
 ) {
-    if !sandbox.name.is_empty() {
-        sandbox_name_to_id.insert(sandbox.name.clone(), sandbox.id.clone());
+    if !kube_name.is_empty() {
+        sandbox_name_to_id.insert(kube_name.to_string(), sandbox.id.clone());
     }
     if let Some(status) = sandbox.status.as_ref()
         && !status.instance_id.is_empty()
@@ -1304,8 +1580,8 @@ const BINARY_AWARE_SIDECAR_PROXY_UID: u32 = 0;
 /// Shared volume used by the network sidecar and process-only supervisor for
 /// local coordination in sidecar topology.
 const SIDECAR_STATE_VOLUME_NAME: &str = "openshell-sidecar-state";
-const SIDECAR_STATE_MOUNT_PATH: &str = "/run/openshell-sidecar";
-const SIDECAR_CONTROL_SOCKET: &str = "/run/openshell-sidecar/control.sock";
+const SIDECAR_STATE_MOUNT_PATH: &str = openshell_core::container_paths::SIDECAR_RUN_ROOT;
+const SIDECAR_CONTROL_SOCKET: &str = openshell_core::container_paths::SIDECAR_CONTROL_SOCKET;
 // Linux abstract socket names are scoped to the pod's shared network namespace.
 // Unlike a filesystem socket in the shared state volume, the workload cannot
 // unlink and replace this relay endpoint after the trusted supervisor binds it.
@@ -1314,8 +1590,8 @@ const SIDECAR_SSH_SOCKET_FILE: &str = "@openshell-sidecar-ssh";
 /// Shared TLS work directory. The network sidecar writes the proxy CA bundle
 /// here, while the agent container consumes it after sidecar bootstrap.
 const SIDECAR_TLS_VOLUME_NAME: &str = "openshell-supervisor-tls";
-const SIDECAR_TLS_MOUNT_PATH: &str = "/etc/openshell-tls/proxy";
-const SIDECAR_CLIENT_TLS_MOUNT_PATH: &str = "/etc/openshell-tls/proxy/client";
+const SIDECAR_TLS_MOUNT_PATH: &str = openshell_core::container_paths::SIDECAR_TLS_DIR;
+const SIDECAR_CLIENT_TLS_MOUNT_PATH: &str = openshell_core::container_paths::SIDECAR_CLIENT_TLS_DIR;
 
 /// Build the emptyDir volume that holds the supervisor binary.
 ///
@@ -1473,7 +1749,11 @@ fn apply_supervisor_sideload(
         // Override command to use the side-loaded supervisor binary
         container.insert(
             "command".to_string(),
-            serde_json::json!([format!("{}/openshell-sandbox", SUPERVISOR_MOUNT_PATH)]),
+            serde_json::json!([
+                format!("{}/openshell-sandbox", SUPERVISOR_MOUNT_PATH),
+                "--workdir",
+                driver_mounts::DEFAULT_WORKSPACE_ROOT
+            ]),
         );
 
         // Force the supervisor to run as root (UID 0). Sandbox images may set
@@ -1497,21 +1777,15 @@ fn apply_supervisor_sideload(
             volume_mounts.push(supervisor_volume_mount());
         }
 
-        // Inject resolved sandbox UID/GID as environment variables so the
-        // supervisor can use them directly without /etc/passwd lookups.
+        // Inject the protected resolved identity contract. Clearing the OCI
+        // input prevents image or user environment from selecting a
+        // conflicting identity path.
         let env = container
             .entry("env")
             .or_insert_with(|| serde_json::json!([]))
             .as_array_mut();
         if let Some(env) = env {
-            env.push(serde_json::json!({
-                "name": openshell_core::sandbox_env::SANDBOX_UID.to_string(),
-                "value": sandbox_uid.to_string(),
-            }));
-            env.push(serde_json::json!({
-                "name": openshell_core::sandbox_env::SANDBOX_GID.to_string(),
-                "value": sandbox_gid.to_string(),
-            }));
+            apply_resolved_identity_env(env, sandbox_uid, sandbox_gid);
         }
     }
 }
@@ -1601,16 +1875,7 @@ fn supervisor_sidecar_env(
         openshell_core::sandbox_env::PROXY_TLS_DIR,
         SIDECAR_TLS_MOUNT_PATH,
     );
-    upsert_env(
-        &mut env,
-        openshell_core::sandbox_env::SANDBOX_UID,
-        &params.sandbox_uid.to_string(),
-    );
-    upsert_env(
-        &mut env,
-        openshell_core::sandbox_env::SANDBOX_GID,
-        &params.sandbox_gid.to_string(),
-    );
+    apply_resolved_identity_env(&mut env, params.sandbox_uid, params.sandbox_gid);
     if !params.process_binary_aware_network_policy {
         upsert_env(
             &mut env,
@@ -1728,7 +1993,7 @@ fn supervisor_network_init_container(params: &SandboxPodParams<'_>) -> serde_jso
             .expect("volumeMounts is an array")
             .push(serde_json::json!({
                 "name": "openshell-client-tls",
-                "mountPath": "/etc/openshell-tls/client",
+                "mountPath": openshell_core::container_paths::CLIENT_TLS_DIR,
                 "readOnly": true
             }));
     }
@@ -1804,7 +2069,9 @@ fn apply_supervisor_sidecar_topology(
             "command".to_string(),
             serde_json::json!([
                 format!("{}/openshell-sandbox", SUPERVISOR_MOUNT_PATH),
-                "--mode=process"
+                "--mode=process",
+                "--workdir",
+                driver_mounts::DEFAULT_WORKSPACE_ROOT
             ]),
         );
 
@@ -1888,16 +2155,7 @@ fn apply_supervisor_sidecar_topology(
                 openshell_core::sandbox_env::PROXY_TLS_DIR,
                 SIDECAR_TLS_MOUNT_PATH,
             );
-            upsert_env(
-                env,
-                openshell_core::sandbox_env::SANDBOX_UID,
-                &params.sandbox_uid.to_string(),
-            );
-            upsert_env(
-                env,
-                openshell_core::sandbox_env::SANDBOX_GID,
-                &params.sandbox_gid.to_string(),
-            );
+            apply_resolved_identity_env(env, params.sandbox_uid, params.sandbox_gid);
         }
     }
 
@@ -2028,24 +2286,36 @@ fn apply_workspace_persistence(
 ///
 /// Provides a single PVC named "workspace" that backs the `/sandbox`
 /// directory.  The init container seeds it from the image on first use.
-fn default_workspace_volume_claim_templates(storage_size: &str) -> serde_json::Value {
+///
+/// When `storage_class` is non-empty, it is written to the PVC's
+/// `storageClassName`. An empty value omits the field so the cluster's
+/// default `StorageClass` applies. Clusters with no default `StorageClass`
+/// must set this to prevent the PVC from staying `Pending`.
+fn default_workspace_volume_claim_templates(
+    storage_size: &str,
+    storage_class: &str,
+) -> serde_json::Value {
     let size = if storage_size.is_empty() {
         DEFAULT_WORKSPACE_STORAGE_SIZE
     } else {
         storage_size
     };
+    let mut spec = serde_json::json!({
+        "accessModes": ["ReadWriteOnce"],
+        "resources": {
+            "requests": {
+                "storage": size
+            }
+        }
+    });
+    if !storage_class.is_empty() {
+        spec["storageClassName"] = serde_json::json!(storage_class);
+    }
     serde_json::json!([{
         "metadata": {
             "name": WORKSPACE_VOLUME_NAME
         },
-        "spec": {
-            "accessModes": ["ReadWriteOnce"],
-            "resources": {
-                "requests": {
-                    "storage": size
-                }
-            }
-        }
+        "spec": spec
     }])
 }
 
@@ -2070,6 +2340,7 @@ struct SandboxPodParams<'a> {
     enable_user_namespaces: bool,
     app_armor_profile: Option<&'a AppArmorProfile>,
     workspace_default_storage_size: &'a str,
+    workspace_storage_class: &'a str,
     default_runtime_class_name: &'a str,
     /// Lifetime (seconds) of the projected `ServiceAccount` token used
     /// for the bootstrap `IssueSandboxToken` exchange.
@@ -2104,6 +2375,7 @@ impl Default for SandboxPodParams<'_> {
             enable_user_namespaces: false,
             app_armor_profile: None,
             workspace_default_storage_size: DEFAULT_WORKSPACE_STORAGE_SIZE,
+            workspace_storage_class: "",
             default_runtime_class_name: "",
             sa_token_ttl_secs: 3600,
             provider_spiffe_enabled: false,
@@ -2201,7 +2473,10 @@ fn sandbox_to_k8s_spec(
     if inject_workspace {
         root.insert(
             "volumeClaimTemplates".to_string(),
-            default_workspace_volume_claim_templates(params.workspace_default_storage_size),
+            default_workspace_volume_claim_templates(
+                params.workspace_default_storage_size,
+                params.workspace_storage_class,
+            ),
         );
     }
 
@@ -2439,7 +2714,7 @@ fn sandbox_template_to_k8s_with_validated_config(
     if !params.client_tls_secret_name.is_empty() {
         volume_mounts.push(serde_json::json!({
             "name": CLIENT_TLS_VOLUME_NAME,
-            "mountPath": "/etc/openshell-tls/client",
+            "mountPath": openshell_core::container_paths::CLIENT_TLS_DIR,
             "readOnly": true
         }));
     }
@@ -2890,6 +3165,23 @@ fn upsert_env(env: &mut Vec<serde_json::Value>, name: &str, value: &str) {
     env.push(serde_json::json!({"name": name, "value": value}));
 }
 
+fn apply_resolved_identity_env(env: &mut Vec<serde_json::Value>, uid: u32, gid: u32) {
+    remove_env(env, openshell_core::sandbox_env::OCI_IMAGE_USER);
+    remove_env(env, openshell_core::sandbox_env::SANDBOX_UID);
+    remove_env(env, openshell_core::sandbox_env::SANDBOX_GID);
+    upsert_env(env, openshell_core::sandbox_env::OCI_IMAGE_USER, "");
+    upsert_env(
+        env,
+        openshell_core::sandbox_env::SANDBOX_UID,
+        &uid.to_string(),
+    );
+    upsert_env(
+        env,
+        openshell_core::sandbox_env::SANDBOX_GID,
+        &gid.to_string(),
+    );
+}
+
 fn remove_env(env: &mut Vec<serde_json::Value>, name: &str) {
     env.retain(|item| item.get("name").and_then(|value| value.as_str()) != Some(name));
 }
@@ -2973,6 +3265,111 @@ fn status_from_object(obj: &DynamicObject) -> Option<SandboxStatus> {
     })
 }
 
+fn kubernetes_sandbox_has_stopped_condition(obj: &DynamicObject) -> bool {
+    obj.data
+        .get("status")
+        .and_then(|status| status.get("conditions"))
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|conditions| {
+            conditions.iter().any(|condition| {
+                condition.get("type").and_then(serde_json::Value::as_str)
+                    == Some(SANDBOX_SUSPENDED_CONDITION)
+                    && condition
+                        .get("status")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|status| status.eq_ignore_ascii_case("true"))
+            })
+        })
+}
+
+fn kubernetes_sandbox_stop_failure(obj: &DynamicObject) -> Option<String> {
+    obj.data
+        .get("status")?
+        .get("conditions")?
+        .as_array()?
+        .iter()
+        .find_map(|condition| {
+            let is_terminal = condition.get("type").and_then(serde_json::Value::as_str)
+                == Some(SANDBOX_SUSPENDED_CONDITION)
+                && condition
+                    .get("status")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|status| status.eq_ignore_ascii_case("false"))
+                && condition.get("reason").and_then(serde_json::Value::as_str)
+                    == Some(SANDBOX_SUSPENDED_POD_NOT_OWNED_REASON);
+            if !is_terminal {
+                return None;
+            }
+
+            let message = condition
+                .get("message")
+                .and_then(serde_json::Value::as_str)
+                .filter(|message| !message.is_empty())
+                .unwrap_or("backing pod is not owned by this sandbox");
+            Some(format!("Kubernetes sandbox stop rejected: {message}"))
+        })
+}
+
+async fn kubernetes_sandbox_pod_is_gone(
+    pod_api: &Api<Pod>,
+    pod_name: &str,
+    deadline: tokio::time::Instant,
+) -> Result<bool, String> {
+    let request_timeout =
+        KUBE_API_TIMEOUT.min(deadline.saturating_duration_since(tokio::time::Instant::now()));
+    if request_timeout.is_zero() {
+        return Ok(false);
+    }
+
+    match tokio::time::timeout(request_timeout, pod_api.get(pod_name)).await {
+        Ok(Ok(_)) => Ok(false),
+        Ok(Err(KubeError::Api(err))) if err.code == 404 => Ok(true),
+        Ok(Err(err)) => Err(err.to_string()),
+        Err(_) => Err(format!(
+            "timed out after {}s waiting for Kubernetes API while checking sandbox pod termination",
+            request_timeout.as_secs()
+        )),
+    }
+}
+
+fn kubernetes_sandbox_stop_timeout(obj: &DynamicObject) -> Duration {
+    let termination_grace_period = obj
+        .data
+        .get("spec")
+        .and_then(|spec| spec.get("podTemplate"))
+        .and_then(|template| template.get("spec"))
+        .and_then(|spec| spec.get("terminationGracePeriodSeconds"))
+        .and_then(serde_json::Value::as_u64)
+        .map_or(DEFAULT_POD_TERMINATION_GRACE_PERIOD, Duration::from_secs);
+
+    // The controller must observe the desired state, wait for the pod grace
+    // period and kubelet teardown, then reconcile the deleted pod into the
+    // Sandbox status. Keep one API timeout of headroom around that grace.
+    termination_grace_period.saturating_add(KUBE_API_TIMEOUT)
+}
+
+fn next_stop_poll_interval(current: Duration) -> Duration {
+    current.saturating_mul(2).min(STOP_MAX_POLL_INTERVAL)
+}
+
+fn sandbox_operating_state_patch(
+    api_version: &str,
+    resource_version: &str,
+    running: bool,
+) -> serde_json::Value {
+    if api_version == SANDBOX_VERSION_V1BETA1 {
+        serde_json::json!({
+            "metadata": {"resourceVersion": resource_version},
+            "spec": {"operatingMode": if running { "Running" } else { "Suspended" }}
+        })
+    } else {
+        serde_json::json!({
+            "metadata": {"resourceVersion": resource_version},
+            "spec": {"replicas": i32::from(running)}
+        })
+    }
+}
+
 fn condition_from_value(value: &serde_json::Value) -> Option<SandboxCondition> {
     let obj = value.as_object()?;
     Some(SandboxCondition {
@@ -3010,38 +3407,11 @@ mod tests {
         std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
 
     fn json_struct(value: serde_json::Value) -> Struct {
-        match json_value(value).kind {
-            Some(Kind::StructValue(value)) => value,
-            _ => panic!("expected JSON object"),
-        }
-    }
-
-    fn json_value(value: serde_json::Value) -> Value {
-        match value {
-            serde_json::Value::Null => Value { kind: None },
-            serde_json::Value::Bool(value) => Value {
-                kind: Some(Kind::BoolValue(value)),
-            },
-            serde_json::Value::Number(value) => Value {
-                kind: value.as_f64().map(Kind::NumberValue),
-            },
-            serde_json::Value::String(value) => Value {
-                kind: Some(Kind::StringValue(value)),
-            },
-            serde_json::Value::Array(values) => Value {
-                kind: Some(Kind::ListValue(prost_types::ListValue {
-                    values: values.into_iter().map(json_value).collect(),
-                })),
-            },
-            serde_json::Value::Object(values) => Value {
-                kind: Some(Kind::StructValue(Struct {
-                    fields: values
-                        .into_iter()
-                        .map(|(key, value)| (key, json_value(value)))
-                        .collect(),
-                })),
-            },
-        }
+        let serde_json::Value::Object(object) = value else {
+            panic!("expected JSON object");
+        };
+        openshell_core::proto_struct::json_object_to_struct(object)
+            .expect("test JSON must convert to a protobuf Struct")
     }
 
     fn sandbox_to_k8s_spec_for_test(
@@ -3071,6 +3441,120 @@ mod tests {
 
         let raw = kube_api_error(404, "404 page not found\n");
         assert!(should_try_next_sandbox_api_version(&raw));
+    }
+
+    #[test]
+    fn lifecycle_patch_uses_version_specific_operating_state() {
+        let beta_stop = sandbox_operating_state_patch(SANDBOX_VERSION_V1BETA1, "42", false);
+        assert_eq!(beta_stop["metadata"]["resourceVersion"], "42");
+        assert_eq!(beta_stop["spec"]["operatingMode"], "Suspended");
+        assert!(beta_stop["spec"].get("replicas").is_none());
+
+        let alpha_start = sandbox_operating_state_patch(SANDBOX_VERSION_V1ALPHA1, "43", true);
+        assert_eq!(alpha_start["metadata"]["resourceVersion"], "43");
+        assert_eq!(alpha_start["spec"]["replicas"], 1);
+        assert!(alpha_start["spec"].get("operatingMode").is_none());
+    }
+
+    #[test]
+    fn stop_timeout_includes_pod_grace_period_and_reconcile_headroom() {
+        let resource = ApiResource::from_gvk(&GroupVersionKind::gvk(
+            SANDBOX_GROUP,
+            SANDBOX_VERSION_V1BETA1,
+            SANDBOX_KIND,
+        ));
+        let mut sandbox = DynamicObject::new("sandbox", &resource);
+
+        assert_eq!(
+            kubernetes_sandbox_stop_timeout(&sandbox),
+            Duration::from_secs(60),
+            "an omitted grace period uses the Kubernetes 30-second default"
+        );
+
+        sandbox.data = serde_json::json!({
+            "spec": {
+                "podTemplate": {
+                    "spec": {"terminationGracePeriodSeconds": 45}
+                }
+            }
+        });
+        assert_eq!(
+            kubernetes_sandbox_stop_timeout(&sandbox),
+            Duration::from_secs(75)
+        );
+    }
+
+    #[test]
+    fn stop_poll_interval_backs_off_to_cap() {
+        let mut interval = STOP_INITIAL_POLL_INTERVAL;
+        let expected = [
+            Duration::from_millis(500),
+            Duration::from_secs(1),
+            Duration::from_secs(2),
+            Duration::from_secs(2),
+        ];
+
+        for expected_interval in expected {
+            interval = next_stop_poll_interval(interval);
+            assert_eq!(interval, expected_interval);
+        }
+    }
+
+    #[test]
+    fn stopped_status_requires_published_condition() {
+        let resource = ApiResource::from_gvk(&GroupVersionKind::gvk(
+            SANDBOX_GROUP,
+            SANDBOX_VERSION_V1ALPHA1,
+            SANDBOX_KIND,
+        ));
+        let mut sandbox = DynamicObject::new("sandbox", &resource);
+        sandbox.data = serde_json::json!({"status": {"replicas": 0}});
+
+        assert!(
+            !kubernetes_sandbox_has_stopped_condition(&sandbox),
+            "v1alpha1 omits a zero status replica count on the wire; it is not a usable completion signal"
+        );
+
+        sandbox.data = serde_json::json!({
+            "status": {
+                "conditions": [{"type": "Suspended", "status": "True"}]
+            }
+        });
+        assert!(kubernetes_sandbox_has_stopped_condition(&sandbox));
+    }
+
+    #[test]
+    fn stop_failure_only_rejects_terminal_suspension_condition() {
+        let resource = ApiResource::from_gvk(&GroupVersionKind::gvk(
+            SANDBOX_GROUP,
+            SANDBOX_VERSION_V1BETA1,
+            SANDBOX_KIND,
+        ));
+        let mut sandbox = DynamicObject::new("sandbox", &resource);
+        sandbox.data = serde_json::json!({
+            "status": {
+                "conditions": [{
+                    "type": "Suspended",
+                    "status": "False",
+                    "reason": "PodNotOwned",
+                    "message": "Refused to delete pod because it is not owned by this sandbox"
+                }]
+            }
+        });
+
+        assert_eq!(
+            kubernetes_sandbox_stop_failure(&sandbox).as_deref(),
+            Some(
+                "Kubernetes sandbox stop rejected: Refused to delete pod because it is not owned by this sandbox"
+            )
+        );
+
+        sandbox.data["status"]["conditions"][0]["status"] = serde_json::json!("Unknown");
+        sandbox.data["status"]["conditions"][0]["reason"] = serde_json::json!("PodStateUnknown");
+        assert!(
+            kubernetes_sandbox_stop_failure(&sandbox).is_none(),
+            "an unknown pod state can recover on a later controller reconciliation"
+        );
     }
 
     #[test]
@@ -3809,6 +4293,59 @@ mod tests {
     }
 
     #[test]
+    fn supervisor_sideload_replaces_spoofed_identity_environment() {
+        let mut pod_template = serde_json::json!({
+            "spec": {
+                "containers": [{
+                    "name": "agent",
+                    "image": "custom-image:latest",
+                    "env": [
+                        {"name": openshell_core::sandbox_env::OCI_IMAGE_USER, "value": "spoofed"},
+                        {"name": openshell_core::sandbox_env::SANDBOX_UID, "value": "9999"},
+                        {"name": openshell_core::sandbox_env::SANDBOX_GID, "value": "9999"},
+                        {"name": openshell_core::sandbox_env::OCI_IMAGE_USER, "value": "duplicate"}
+                    ]
+                }]
+            }
+        });
+
+        apply_supervisor_sideload(
+            &mut pod_template,
+            "supervisor-image:latest",
+            "IfNotPresent",
+            SupervisorSideloadMethod::InitContainer,
+            1500,
+            1600,
+        );
+
+        let agent = &pod_template["spec"]["containers"][0];
+        let env = agent["env"].as_array().unwrap();
+        for name in [
+            openshell_core::sandbox_env::OCI_IMAGE_USER,
+            openshell_core::sandbox_env::SANDBOX_UID,
+            openshell_core::sandbox_env::SANDBOX_GID,
+        ] {
+            assert_eq!(
+                env.iter().filter(|item| item["name"] == name).count(),
+                1,
+                "{name} must have one driver-owned value"
+            );
+        }
+        assert_eq!(
+            rendered_env(agent, openshell_core::sandbox_env::OCI_IMAGE_USER),
+            Some("")
+        );
+        assert_eq!(
+            rendered_env(agent, openshell_core::sandbox_env::SANDBOX_UID),
+            Some("1500")
+        );
+        assert_eq!(
+            rendered_env(agent, openshell_core::sandbox_env::SANDBOX_GID),
+            Some("1600")
+        );
+    }
+
+    #[test]
     fn supervisor_sideload_adds_security_context_when_missing() {
         let mut pod_template = serde_json::json!({
             "spec": {
@@ -3892,13 +4429,24 @@ mod tests {
             "init container must not depend on a shell"
         );
 
-        // Agent container command should be overridden to the emptyDir path
+        // `--workdir` is optional for standalone supervisor invocations and
+        // has no implicit default, so Kubernetes must pass its fixed workspace.
         let command = pod_template["spec"]["containers"][0]["command"]
             .as_array()
             .expect("command should be set");
         assert_eq!(
             command[0].as_str().unwrap(),
             format!("{SUPERVISOR_MOUNT_PATH}/openshell-sandbox")
+        );
+        assert_eq!(
+            command,
+            serde_json::json!([
+                format!("{SUPERVISOR_MOUNT_PATH}/openshell-sandbox"),
+                "--workdir",
+                driver_mounts::DEFAULT_WORKSPACE_ROOT
+            ])
+            .as_array()
+            .unwrap()
         );
 
         // Agent volume mount should be read-only
@@ -4012,6 +4560,20 @@ mod tests {
         let pod_template = sandbox_template_to_k8s(
             &SandboxTemplate {
                 image: "agent-image:latest".to_string(),
+                environment: std::collections::HashMap::from([
+                    (
+                        openshell_core::sandbox_env::OCI_IMAGE_USER.to_string(),
+                        "spoofed".to_string(),
+                    ),
+                    (
+                        openshell_core::sandbox_env::SANDBOX_UID.to_string(),
+                        "9999".to_string(),
+                    ),
+                    (
+                        openshell_core::sandbox_env::SANDBOX_GID.to_string(),
+                        "9999".to_string(),
+                    ),
+                ]),
                 ..SandboxTemplate::default()
             },
             false,
@@ -4033,7 +4595,9 @@ mod tests {
             agent["command"],
             serde_json::json!([
                 format!("{SUPERVISOR_MOUNT_PATH}/openshell-sandbox"),
-                "--mode=process"
+                "--mode=process",
+                "--workdir",
+                driver_mounts::DEFAULT_WORKSPACE_ROOT
             ])
         );
         assert_eq!(agent["securityContext"]["runAsUser"], 1500);
@@ -4088,6 +4652,10 @@ mod tests {
             rendered_env(agent, openshell_core::sandbox_env::SANDBOX_UID),
             Some("1500")
         );
+        assert_eq!(
+            rendered_env(agent, openshell_core::sandbox_env::OCI_IMAGE_USER),
+            Some("")
+        );
 
         let sidecar = containers
             .iter()
@@ -4132,6 +4700,10 @@ mod tests {
         assert_eq!(
             rendered_env(sidecar, openshell_core::sandbox_env::SANDBOX_GID),
             Some("1500")
+        );
+        assert_eq!(
+            rendered_env(sidecar, openshell_core::sandbox_env::OCI_IMAGE_USER),
+            Some("")
         );
         assert_eq!(
             rendered_env(sidecar, openshell_core::sandbox_env::SIDECAR_CONTROL_SOCKET),
@@ -5614,15 +6186,249 @@ mod tests {
 
     #[test]
     fn default_workspace_vct_uses_provided_storage_size() {
-        let vct = default_workspace_volume_claim_templates("5Gi");
+        let vct = default_workspace_volume_claim_templates("5Gi", "");
         let storage = &vct[0]["spec"]["resources"]["requests"]["storage"];
         assert_eq!(storage, "5Gi");
     }
 
     #[test]
     fn default_workspace_vct_falls_back_to_const_when_empty() {
-        let vct = default_workspace_volume_claim_templates("");
+        let vct = default_workspace_volume_claim_templates("", "");
         let storage = &vct[0]["spec"]["resources"]["requests"]["storage"];
         assert_eq!(storage, DEFAULT_WORKSPACE_STORAGE_SIZE);
+    }
+
+    #[test]
+    fn sandbox_name_validation_accepts_valid_dns_labels() {
+        assert!(validate_kubernetes_dns1123_label("my-sandbox", "sandbox name").is_ok());
+        assert!(validate_kubernetes_dns1123_label("test123", "sandbox name").is_ok());
+        assert!(validate_kubernetes_dns1123_label("123abc", "sandbox name").is_ok());
+    }
+
+    #[test]
+    fn sandbox_name_validation_rejects_invalid_dns_labels() {
+        assert!(validate_kubernetes_dns1123_label("my_sandbox", "sandbox name").is_err());
+        assert!(validate_kubernetes_dns1123_label("MySandbox", "sandbox name").is_err());
+        assert!(validate_kubernetes_dns1123_label("dotted.name", "sandbox name").is_err());
+    }
+
+    #[test]
+    fn kube_resource_name_qualifies_with_workspace() {
+        assert_eq!(kube_resource_name("alpha", "work"), "alpha--work");
+        assert_eq!(
+            kube_resource_name("default", "my-sandbox"),
+            "default--my-sandbox"
+        );
+    }
+
+    #[test]
+    fn kube_resource_name_different_workspaces_produce_different_names() {
+        let alpha = kube_resource_name("alpha", "work");
+        let beta = kube_resource_name("beta", "work");
+        assert_ne!(alpha, beta);
+    }
+
+    #[test]
+    fn kube_resource_name_length_validation_accepts_short_names() {
+        validate_kube_resource_name_length("default", "my-sandbox").unwrap();
+    }
+
+    #[test]
+    fn kube_resource_name_length_validation_rejects_oversized_names() {
+        let long_ws = "a".repeat(40);
+        let long_name = "b".repeat(25);
+        let err = validate_kube_resource_name_length(&long_ws, &long_name).unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(err.message().contains("67"));
+    }
+
+    #[test]
+    fn sandbox_from_object_reads_annotations() {
+        let obj = DynamicObject {
+            types: None,
+            metadata: ObjectMeta {
+                name: Some("alpha--work".to_string()),
+                namespace: Some("default".to_string()),
+                annotations: Some(BTreeMap::from([
+                    (LABEL_SANDBOX_ID.to_string(), "uuid-123".to_string()),
+                    (LABEL_SANDBOX_NAME.to_string(), "work".to_string()),
+                    (LABEL_SANDBOX_WORKSPACE.to_string(), "alpha".to_string()),
+                ])),
+                labels: Some(BTreeMap::from([
+                    (LABEL_SANDBOX_ID.to_string(), "uuid-123".to_string()),
+                    (LABEL_SANDBOX_NAME.to_string(), "work".to_string()),
+                    (LABEL_SANDBOX_WORKSPACE.to_string(), "alpha".to_string()),
+                    (
+                        LABEL_MANAGED_BY.to_string(),
+                        LABEL_MANAGED_BY_VALUE.to_string(),
+                    ),
+                ])),
+                ..Default::default()
+            },
+            data: serde_json::json!({}),
+        };
+
+        let (kube_name, sandbox) = sandbox_from_object("default", obj).unwrap();
+        assert_eq!(kube_name, "alpha--work");
+        assert_eq!(sandbox.name, "work");
+        assert_eq!(sandbox.workspace, "alpha");
+        assert_eq!(sandbox.id, "uuid-123");
+    }
+
+    #[test]
+    fn sandbox_from_object_falls_back_to_labels() {
+        let obj = DynamicObject {
+            types: None,
+            metadata: ObjectMeta {
+                name: Some("alpha--work".to_string()),
+                namespace: Some("default".to_string()),
+                annotations: None,
+                labels: Some(BTreeMap::from([
+                    (LABEL_SANDBOX_ID.to_string(), "uuid-456".to_string()),
+                    (LABEL_SANDBOX_NAME.to_string(), "work".to_string()),
+                    (LABEL_SANDBOX_WORKSPACE.to_string(), "alpha".to_string()),
+                    (
+                        LABEL_MANAGED_BY.to_string(),
+                        LABEL_MANAGED_BY_VALUE.to_string(),
+                    ),
+                ])),
+                ..Default::default()
+            },
+            data: serde_json::json!({}),
+        };
+
+        let (_, sandbox) = sandbox_from_object("default", obj).unwrap();
+        assert_eq!(sandbox.name, "work");
+        assert_eq!(sandbox.workspace, "alpha");
+        assert_eq!(sandbox.id, "uuid-456");
+    }
+
+    #[test]
+    fn sandbox_from_object_skips_unmanaged_cr() {
+        let obj = DynamicObject {
+            types: None,
+            metadata: ObjectMeta {
+                name: Some("foreign-sandbox".to_string()),
+                namespace: Some("default".to_string()),
+                labels: Some(BTreeMap::from([(
+                    "some-other-label".to_string(),
+                    "value".to_string(),
+                )])),
+                ..Default::default()
+            },
+            data: serde_json::json!({}),
+        };
+
+        let result = sandbox_from_object("default", obj);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("not managed by openshell"));
+    }
+
+    #[test]
+    fn sandbox_from_object_warns_on_managed_cr_missing_workspace() {
+        let obj = DynamicObject {
+            types: None,
+            metadata: ObjectMeta {
+                name: Some("work".to_string()),
+                namespace: Some("default".to_string()),
+                labels: Some(BTreeMap::from([
+                    (LABEL_SANDBOX_ID.to_string(), "uuid-789".to_string()),
+                    (LABEL_SANDBOX_NAME.to_string(), "work".to_string()),
+                    (
+                        LABEL_MANAGED_BY.to_string(),
+                        LABEL_MANAGED_BY_VALUE.to_string(),
+                    ),
+                ])),
+                ..Default::default()
+            },
+            data: serde_json::json!({}),
+        };
+
+        let result = sandbox_from_object("default", obj);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("missing sandbox workspace"));
+    }
+
+    #[test]
+    fn sandbox_labels_includes_workspace_and_name() {
+        let sandbox = Sandbox {
+            id: "uuid-1".to_string(),
+            name: "work".to_string(),
+            workspace: "alpha".to_string(),
+            ..Default::default()
+        };
+        let labels = sandbox_labels(&sandbox);
+        assert_eq!(labels.get(LABEL_SANDBOX_ID).unwrap(), "uuid-1");
+        assert_eq!(labels.get(LABEL_SANDBOX_NAME).unwrap(), "work");
+        assert_eq!(labels.get(LABEL_SANDBOX_WORKSPACE).unwrap(), "alpha");
+        assert_eq!(
+            labels.get(LABEL_MANAGED_BY).unwrap(),
+            LABEL_MANAGED_BY_VALUE
+        );
+    }
+
+    #[test]
+    fn sandbox_annotations_stores_authoritative_values() {
+        let sandbox = Sandbox {
+            id: "uuid-2".to_string(),
+            name: "dev".to_string(),
+            workspace: "beta".to_string(),
+            ..Default::default()
+        };
+        let annotations = sandbox_annotations(&sandbox);
+        assert_eq!(annotations.get(LABEL_SANDBOX_ID).unwrap(), "uuid-2");
+        assert_eq!(annotations.get(LABEL_SANDBOX_NAME).unwrap(), "dev");
+        assert_eq!(annotations.get(LABEL_SANDBOX_WORKSPACE).unwrap(), "beta");
+    }
+
+    #[test]
+    fn sandbox_id_from_object_errors_without_label() {
+        let obj = DynamicObject {
+            types: None,
+            metadata: ObjectMeta {
+                name: Some("some-name".to_string()),
+                ..Default::default()
+            },
+            data: serde_json::json!({}),
+        };
+        assert!(sandbox_id_from_object(&obj).is_err());
+    }
+
+    #[test]
+    fn default_workspace_vct_sets_storage_class_when_provided() {
+        let vct = default_workspace_volume_claim_templates("5Gi", "fast-ssd");
+        assert_eq!(vct[0]["spec"]["storageClassName"], "fast-ssd");
+    }
+
+    #[test]
+    fn default_workspace_vct_omits_storage_class_when_empty() {
+        let vct = default_workspace_volume_claim_templates("5Gi", "");
+        assert!(vct[0]["spec"].get("storageClassName").is_none());
+    }
+
+    #[test]
+    fn workspace_storage_class_propagates_to_generated_cr_spec() {
+        let params = SandboxPodParams {
+            workspace_storage_class: "fast-ssd",
+            ..SandboxPodParams::default()
+        };
+        let cr = sandbox_to_k8s_spec_for_test(Some(&SandboxSpec::default()), &params);
+        assert_eq!(
+            cr["spec"]["volumeClaimTemplates"][0]["spec"]["storageClassName"],
+            "fast-ssd"
+        );
+    }
+
+    #[test]
+    fn workspace_storage_class_omitted_from_cr_spec_when_empty() {
+        let cr = sandbox_to_k8s_spec_for_test(
+            Some(&SandboxSpec::default()),
+            &SandboxPodParams::default(),
+        );
+        assert!(
+            cr["spec"]["volumeClaimTemplates"][0]["spec"]
+                .get("storageClassName")
+                .is_none()
+        );
     }
 }

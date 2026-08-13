@@ -16,12 +16,12 @@ Agent skills live in `.agents/skills/`. Your harness can discover and load them 
 
 These pipelines connect skills into end-to-end workflows. Individual skill files don't describe these relationships.
 
-- **Community inflow:** `triage-issue` → `create-spike` → `build-from-issue`
-  - Triage assesses and classifies community-filed issues. Spike investigates unknowns. Build implements.
-- **Internal development:** `create-spike` → `build-from-issue`
-  - Spike explores feasibility, then build executes once `state:agent-ready` is applied by a human.
+- **Community inflow:** `triage-issue` → human disposition and roadmap placement → `create-spike` when needed → `build-from-issue`
+  - Triage establishes facts and marks technically valid issues `state:validated`. A human applies `state:accepted` if the project should pursue the work and separately places it on the roadmap. The `agent:*` labels support unattended agents that scan for queued work: a human queues a plan with `agent:plan-requested`, the agent returns `agent:plan-ready`, and a human queues implementation with `agent:implementation-requested`. A direct user request to an agent authorizes the requested phase without those labels.
+- **Internal development:** `create-spike` → human disposition and roadmap placement → `build-from-issue`
+  - Spike explores feasibility and marks its issue `state:validated` when sufficient evidence exists. A human accepts it with `state:accepted` or declines it, separately places it on the roadmap, and optionally queues it through the `agent:*` workflow or directs an agent to it.
 - **Security:** `review-security-issue` → `fix-security-issue`
-  - Review produces a severity assessment and remediation plan. Fix implements it. Both require the `topic:security` label; fix also requires `state:agent-ready`.
+  - General build agents must not process `topic:security` issues. For unattended processing, a human queues specialized review with `agent:plan-requested`; review produces a severity assessment and remediation plan; a human queues remediation with `agent:implementation-requested`. Direct requests to the specialized skills do not require those labels.
 - **Policy iteration:** `openshell-cli` → `generate-sandbox-policy`
   - CLI manages the sandbox lifecycle; policy generation authors the YAML constraints.
 
@@ -35,14 +35,28 @@ These pipelines connect skills into end-to-end workflows. Individual skill files
 | `crates/openshell-policy/` | Policy engine | Filesystem, network, process, and inference constraints |
 | `crates/openshell-router/` | Privacy router | Privacy-aware LLM routing |
 | `crates/openshell-bootstrap/` | Gateway metadata | Gateway registration metadata, auth token storage, mTLS bundle storage |
+| `crates/openshell-gateway-interceptors/` | Gateway interceptors | Intercepts and transforms configured gRPC requests at the gateway routing boundary |
 | `crates/openshell-ocsf/` | OCSF logging | OCSF v1.7.0 event types, builders, shorthand/JSONL formatters, tracing layers |
+| `crates/openshell-otel/` | OpenTelemetry support | Shared OTLP trace provider, resource, and tracing-layer construction |
 | `crates/openshell-core/` | Shared core | Common types, configuration, error handling |
+| `crates/openshell-sdk/` | Shared client SDK | Async Rust gateway client (gRPC transport, TLS, OIDC refresh, edge tunnel); consumed by CLI, TUI, and `@openshell/sdk` |
 | `crates/openshell-providers/` | Provider management | Credential provider backends |
 | `crates/openshell-tui/` | Terminal UI | Ratatui-based dashboard for monitoring |
+| `crates/openshell-driver-kubernetes-secrets/` | Kubernetes Secrets credential driver | In-process `CredentialDriver` backend for OpenShell-managed K8s Secret storage |
+| `crates/openshell-driver-vault/` | Vault credential driver | In-process `CredentialDriver` backend for Vault-compatible KV storage |
 | `crates/openshell-driver-kubernetes/` | Kubernetes compute driver | In-process `ComputeDriver` backend for K8s sandbox pods |
 | `crates/openshell-driver-docker/` | Docker compute driver | In-process `ComputeDriver` backend for local Docker sandbox containers |
+| `crates/openshell-driver-podman/` | Podman compute driver | In-process `ComputeDriver` backend for local Podman sandbox containers |
 | `crates/openshell-driver-vm/` | VM compute driver | Standalone libkrun-backed `ComputeDriver` subprocess (embeds its own rootfs + runtime) |
+| `crates/openshell-prover/` | Policy prover | Policy verification and proof generation |
+| `crates/openshell-server-macros/` | Server macros | Compile-time helpers for gateway RPC authorization |
+| `crates/openshell-supervisor-middleware/` | Middleware runtime | Generic middleware registry, remote service integration, and chain execution |
+| `crates/openshell-supervisor-middleware-builtins/` | Built-in middleware | First-party in-process middleware implementations |
+| `crates/openshell-supervisor-network/` | Network supervisor | Proxying, L7 enforcement, policy evaluation, and inference routing |
+| `crates/openshell-supervisor-process/` | Process supervisor | Process lifecycle, namespace, and bypass monitoring |
+| `crates/openshell-vfio/` | VFIO support | PCI and GPU passthrough preparation and lifecycle |
 | `python/openshell/` | Python SDK | Python bindings and CLI packaging |
+| `sdk/typescript/` | TypeScript SDK | Native Connect client, curated sandbox API, and generated protobuf types |
 | `proto/` | Protobuf definitions | gRPC service contracts |
 | `deploy/` | Docker, Helm, K8s | Dockerfiles, Helm chart, manifests |
 | `docs/` | Published docs | MDX pages, navigation, and content assets |
@@ -63,7 +77,9 @@ These pipelines connect skills into end-to-end workflows. Individual skill files
 - **Bug reports** must include an agent diagnostic section — proof that the reporter's agent investigated the issue before filing. See the issue template.
 - **Feature requests** must include a design proposal, not just a "please build this" request. See the issue template.
 - **New features** must start as GitHub issues using the feature request template. Open an RFC only after an issue exists; maintainers decide when one is needed and assign RFC numbers from the issue.
+- **Issue triage** establishes technical validity and impact evidence. Agents never decide roadmap acceptance, apply `state:accepted`, place issues on the roadmap, or apply `agent:plan-requested` or `agent:implementation-requested`. Humans accept or decline validated work and separately place it on the roadmap. The request labels queue work for unattended agents; an explicit user instruction can instead authorize an agent to plan or implement a specific issue. OpenShell has no `priority:*` labels; roadmap association carries sequencing.
 - **PRs** must follow the PR template structure: Summary, Related Issue, Changes, Testing, Checklist.
+- **PRs for features, user-visible behavior, public APIs, architecture, or multi-PR efforts** must link an accepted issue. Small docs fixes, mechanical maintenance, and obvious localized bug fixes may state why no issue is required.
 - **PRs from unvouched external contributors** are automatically closed. See the Vouch System section above.
 - **Security vulnerabilities** must NOT be filed as GitHub issues. Follow [SECURITY.md](SECURITY.md).
 - Skills that create issues or PRs (`create-github-issue`, `create-github-pr`, `build-from-issue`) should produce output conforming to these templates.
@@ -156,6 +172,19 @@ ocsf_emit!(event);
 
 - If you change sandbox infrastructure, ensure the relevant sandbox e2e path succeeds.
 
+## Network Sockets
+
+- On latency-sensitive TCP streams, disable Nagle's algorithm so small
+  request/response frames don't stall on delayed ACKs. Use
+  `openshell_core::net::set_tcp_nodelay_best_effort` on an accepted or
+  already-connected stream, or `openshell_core::net::connect_tcp_nodelay_best_effort`
+  when dialing.
+- This applies to loopback/localhost TCP too — the delayed-ACK stall is a timer
+  behavior, not wire latency.
+- You should skip it for unix domain sockets (no Nagle). It's not critical for
+  test-only connections, though using it on any non-UDS TCP stream — tests
+  included — is fine and preferred.
+
 ## Commits
 
 - Always use [Conventional Commits](https://www.conventionalcommits.org/) format for commit messages
@@ -176,6 +205,23 @@ ocsf_emit!(event);
 - `mise run e2e` — End-to-end tests against a running gateway. Run for infrastructure, sandbox, or policy changes.
 - `mise run ci` — Full local CI (lint + compile/type checks + tests). Run before opening a PR.
 
+## Go SDK (`sdk/go/`)
+
+- The Go SDK lives in `sdk/go/` with module path `github.com/NVIDIA/OpenShell/sdk/go`.
+- Run `mise run go:ci` for the full SDK CI pipeline (lint, build, test, proto-check, docs-check).
+- Proto bindings are generated with `mise run go:proto:gen` from the `.proto` files in `proto/`.
+- Domain types in `sdk/go/openshell/v1/types/` must not import proto packages.
+- Converters in `sdk/go/openshell/v1/internal/converter/` deep-copy slices and maps at boundaries.
+- Tests use bufconn for in-process gRPC and testify for assertions.
+
+## TypeScript SDK (`sdk/typescript/`)
+
+- Run `mise run sdk:ts:ci` for codegen, proto lint, Biome lint, type checking, unit tests, coverage, and build validation.
+- Proto bindings are generated with `mise run sdk:ts:proto` from the files selected in `sdk/typescript/buf.gen.yaml`.
+- Generated files under `sdk/typescript/src/gen/` are build outputs and must not be committed.
+- Keep the curated API free of generated wire types; expose full generated messages and RPCs through `@nvidia/openshell-sdk/raw`.
+- The release workflow publishes the package to GitHub Packages. Branch checks exercise the publish path with `npm publish --dry-run`.
+
 ## Python
 
 - Always use `uv` for Python commands (e.g., `uv pip install`, `uv run`, `uv venv`)
@@ -187,6 +233,10 @@ ocsf_emit!(event);
 ## Cluster Infrastructure Changes
 
 - If you change gateway deployment infrastructure (e.g., Helm values/templates, gateway image packaging, or deploy logic in `openshell-cli`), update the `debug-openshell-cluster` skill in `.agents/skills/debug-openshell-cluster/SKILL.md` to reflect those changes.
+
+## Skill Maintenance
+
+When behavior, commands, or development workflows change, review the related agent skills in the same branch. Use the `sync-agent-infra` skill for the maintenance map and consistency checks.
 
 ## Documentation
 

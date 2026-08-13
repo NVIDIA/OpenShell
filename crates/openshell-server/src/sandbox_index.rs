@@ -15,7 +15,7 @@ pub struct SandboxIndex {
 
 #[derive(Debug, Default)]
 struct Inner {
-    sandbox_name_to_id: HashMap<String, String>,
+    sandbox_name_to_id: HashMap<(String, String), String>,
     agent_pod_to_id: HashMap<String, String>,
 }
 
@@ -29,9 +29,10 @@ impl SandboxIndex {
         let mut inner = self.inner.write().expect("sandbox index lock poisoned");
         if let Some(metadata) = &sandbox.metadata {
             if !metadata.name.is_empty() {
-                inner
-                    .sandbox_name_to_id
-                    .insert(metadata.name.clone(), metadata.id.clone());
+                inner.sandbox_name_to_id.insert(
+                    (metadata.workspace.clone(), metadata.name.clone()),
+                    metadata.id.clone(),
+                );
             }
 
             if let Some(status) = sandbox.status.as_ref()
@@ -51,9 +52,12 @@ impl SandboxIndex {
     }
 
     #[must_use]
-    pub fn sandbox_id_for_sandbox_name(&self, name: &str) -> Option<String> {
+    pub fn sandbox_id_for_sandbox_name(&self, workspace: &str, name: &str) -> Option<String> {
         let inner = self.inner.read().expect("sandbox index lock poisoned");
-        inner.sandbox_name_to_id.get(name).cloned()
+        inner
+            .sandbox_name_to_id
+            .get(&(workspace.to_string(), name.to_string()))
+            .cloned()
     }
 
     #[must_use]

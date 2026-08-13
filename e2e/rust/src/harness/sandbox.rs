@@ -7,6 +7,7 @@
 //! is dropped, replacing the `trap cleanup EXIT` pattern from the bash tests.
 
 use std::process::Stdio;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -20,8 +21,7 @@ use super::output::{extract_field, strip_ansi};
 /// The CLI prints `Created sandbox: <name>` (current format). Falls back to
 /// `Name: <name>` for compatibility with older output formats.
 fn extract_sandbox_name(output: &str) -> Option<String> {
-    extract_field(output, "Created sandbox")
-        .or_else(|| extract_field(output, "Name"))
+    extract_field(output, "Created sandbox").or_else(|| extract_field(output, "Name"))
 }
 
 /// Default timeout for waiting for a sandbox to become ready.
@@ -76,9 +76,7 @@ impl SandboxGuard {
 
         let output = timeout(SANDBOX_READY_TIMEOUT, cmd.output())
             .await
-            .map_err(|_| {
-                format!("sandbox create timed out after {SANDBOX_READY_TIMEOUT:?}")
-            })?
+            .map_err(|_| format!("sandbox create timed out after {SANDBOX_READY_TIMEOUT:?}"))?
             .map_err(|e| format!("failed to spawn openshell: {e}"))?;
 
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
@@ -123,10 +121,7 @@ impl SandboxGuard {
     /// Returns an error if the process exits prematurely, the ready marker is
     /// not seen within [`SANDBOX_READY_TIMEOUT`], or the sandbox name cannot
     /// be parsed.
-    pub async fn create_keep(
-        command: &[&str],
-        ready_marker: &str,
-    ) -> Result<Self, String> {
+    pub async fn create_keep(command: &[&str], ready_marker: &str) -> Result<Self, String> {
         Self::create_keep_with_args(&[], command, ready_marker).await
     }
 
@@ -159,6 +154,19 @@ impl SandboxGuard {
         let stdout = child.stdout.take().expect("stdout must be piped");
         let mut reader = BufReader::new(stdout).lines();
 
+        let stderr_handle = child.stderr.take().expect("stderr must be piped");
+        let stderr_buf = Arc::new(Mutex::new(String::new()));
+        let stderr_buf_clone = Arc::clone(&stderr_buf);
+        let stderr_task = tokio::spawn(async move {
+            let mut reader = BufReader::new(stderr_handle).lines();
+            while let Ok(Some(line)) = reader.next_line().await {
+                let clean = strip_ansi(&line);
+                let mut buf = stderr_buf_clone.lock().unwrap();
+                buf.push_str(&clean);
+                buf.push('\n');
+            }
+        });
+
         let mut accumulated = String::new();
         let mut name: Option<String> = None;
         let mut ready = false;
@@ -185,26 +193,38 @@ impl SandboxGuard {
         })
         .await;
 
+        let collect_stderr = || {
+            stderr_task.abort();
+            let buf = stderr_buf.lock().unwrap();
+            buf.clone()
+        };
+
         if poll_result.is_err() {
             // Timeout — kill the child and report.
             let _ = child.kill().await;
+            let stderr_output = collect_stderr();
             return Err(format!(
                 "sandbox did not become ready within {SANDBOX_READY_TIMEOUT:?}.\n\
-                 Output so far:\n{accumulated}"
+                 Stdout:\n{accumulated}\nStderr:\n{stderr_output}"
             ));
         }
 
         if !ready {
             // The line reader ended before seeing the marker (process exited).
             let _ = child.kill().await;
+            let stderr_output = collect_stderr();
             return Err(format!(
                 "sandbox create exited before ready marker '{ready_marker}' was seen.\n\
-                 Output:\n{accumulated}"
+                 Stdout:\n{accumulated}\nStderr:\n{stderr_output}"
             ));
         }
 
         let sandbox_name = name.ok_or_else(|| {
-            format!("could not parse sandbox name from create output:\n{accumulated}")
+            let stderr_output = collect_stderr();
+            format!(
+                "could not parse sandbox name from create output:\n\
+                 Stdout:\n{accumulated}\nStderr:\n{stderr_output}"
+            )
         })?;
 
         Ok(Self {
@@ -255,9 +275,7 @@ impl SandboxGuard {
         let output = timeout(SANDBOX_READY_TIMEOUT, cmd.output())
             .await
             .map_err(|_| {
-                format!(
-                    "sandbox create --upload timed out after {SANDBOX_READY_TIMEOUT:?}"
-                )
+                format!("sandbox create --upload timed out after {SANDBOX_READY_TIMEOUT:?}")
             })?
             .map_err(|e| format!("failed to spawn openshell: {e}"))?;
 
@@ -301,6 +319,39 @@ impl SandboxGuard {
             .arg(&self.name)
             .arg(local_path)
             .arg(dest)
+            .arg("--no-git-ignore");
+        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+
+        let output = cmd
+            .output()
+            .await
+            .map_err(|e| format!("failed to spawn openshell upload: {e}"))?;
+
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        let combined = format!("{stdout}{stderr}");
+
+        if !output.status.success() {
+            return Err(format!(
+                "sandbox upload failed (exit {:?}):\n{combined}",
+                output.status.code()
+            ));
+        }
+
+        Ok(combined)
+    }
+
+    /// Upload local files to the sandbox's discovered working directory.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the upload command fails.
+    pub async fn upload_to_workdir(&self, local_path: &str) -> Result<String, String> {
+        let mut cmd = openshell_cmd();
+        cmd.arg("sandbox")
+            .arg("upload")
+            .arg(&self.name)
+            .arg(local_path)
             .arg("--no-git-ignore");
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
@@ -429,11 +480,7 @@ impl SandboxGuard {
     /// # Errors
     ///
     /// Returns an error if the download command fails.
-    pub async fn download(
-        &self,
-        sandbox_path: &str,
-        local_dest: &str,
-    ) -> Result<String, String> {
+    pub async fn download(&self, sandbox_path: &str, local_dest: &str) -> Result<String, String> {
         let mut cmd = openshell_cmd();
         cmd.arg("sandbox")
             .arg("download")

@@ -1,0 +1,196 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+title: "Manage Workspaces and Access"
+sidebar-title: "Workspaces and Access"
+description: "Create OpenShell workspaces, assign members, and understand platform and workspace roles."
+keywords: "Generative AI, Cybersecurity, Workspaces, Access Control, RBAC, OIDC, Membership, CLI"
+position: 3
+---
+
+An OpenShell workspace is an access and resource isolation boundary. Sandboxes,
+providers, services, policies, settings, and inference routes belong to a
+workspace and are not visible to members of other workspaces.
+
+The CLI targets the `default` workspace unless you set `--workspace` or
+`OPENSHELL_WORKSPACE`. The logical OpenShell workspace described here is
+separate from the `/sandbox` filesystem directory inside a sandbox.
+
+## Understand the Role Model
+
+OpenShell combines an identity-provider role with a membership record for each
+workspace.
+
+| Role | Assignment | Access |
+|---|---|---|
+| Platform Admin | The OIDC role configured as `admin_role`. | Manages platform-scoped configuration and every workspace. Platform Admins bypass workspace membership checks. |
+| Workspace Admin | An `admin` membership stored by the gateway for one workspace. | Manages providers, provider profiles, policies, settings, and members in that workspace. |
+| Workspace User | A `user` membership stored by the gateway for one workspace. | Creates and uses sandboxes and services, reads providers, and uses provider attachments in that workspace. |
+
+OIDC users also need the role configured as `user_role` for ordinary workspace
+operations. The configured Platform Admin role satisfies this requirement.
+Membership does not grant access to another workspace, and a Workspace Admin
+cannot perform platform-scoped or cross-workspace operations.
+
+When the gateway enables scope enforcement through `scopes_claim`, the token
+must also contain the scope required by the operation. Common scopes include
+`workspace:read`, `workspace:write`, `sandbox:read`, `sandbox:write`,
+`provider:read`, `provider:write`, `config:read`, and `config:write`.
+`openshell:all` satisfies every scope requirement. For OIDC and scope
+configuration, refer to [Gateway Authentication](/reference/gateway-auth).
+
+The following table summarizes common operations.
+
+| Operation | Platform Admin | Workspace Admin | Workspace User |
+|---|---|---|---|
+| Create or delete a workspace | Any workspace | No | No |
+| View a workspace or list workspaces | All workspaces | Assigned workspaces | Assigned workspaces |
+| List workspace members | Any workspace | Assigned workspace | Assigned workspace |
+| Add Workspace Users or remove members | Any workspace | Assigned workspace | No |
+| Assign the Workspace Admin role | Any workspace | No | No |
+| Create, use, or delete sandboxes and services | Any workspace | Assigned workspace | Assigned workspace |
+| Create, update, or delete providers | Any workspace | Assigned workspace | No |
+| Change workspace policy or settings | Any workspace | Assigned workspace | No |
+| Manage platform profiles or global configuration | Yes | No | No |
+| List resources across workspaces | Yes | No | No |
+
+<Note>
+Local gateways without OIDC role configuration treat authenticated users as
+Platform Admins. Configure OIDC roles and workspace membership for shared
+gateways.
+</Note>
+
+## Inspect Your Identity
+
+Use the identity validated by the gateway when an administrator needs your
+membership subject.
+
+```shell
+openshell whoami
+openshell whoami --output json
+```
+
+The `subject` field is the stable identity used in workspace membership
+records. Each user can run this command even when they do not belong to a
+workspace.
+
+## Create a Workspace and Add Members
+
+A Platform Admin creates workspaces and assigns the first Workspace Admin.
+The gateway creates the `default` workspace automatically, but it does not add
+OIDC users to that workspace automatically.
+
+Create a workspace:
+
+```shell
+openshell workspace create --name team-ml
+```
+
+Ask the intended Workspace Admin to run `openshell whoami`, then add the
+reported subject:
+
+```shell
+openshell workspace member add \
+  --workspace team-ml \
+  --subject 'oidc-subject-for-admin' \
+  --role admin
+```
+
+The Workspace Admin can add Workspace Users:
+
+```shell
+openshell workspace member add \
+  --workspace team-ml \
+  --subject 'oidc-subject-for-user' \
+  --role user
+```
+
+Only a Platform Admin can assign the `admin` membership role. A Workspace
+Admin can add `user` members and remove members in their assigned workspace.
+
+## List and Remove Members
+
+All members can inspect membership in their workspace. Workspace Admins and
+Platform Admins can remove members.
+
+```shell
+openshell workspace member list --workspace team-ml
+
+openshell workspace member remove \
+  --workspace team-ml \
+  --subject 'oidc-subject-for-user'
+```
+
+To change a member's role, remove the existing membership and add it again
+with the new role. A Platform Admin must perform any change to `admin`.
+
+## Target a Workspace
+
+Pass `--workspace` to scope a resource operation. The flag is global, so it
+can appear before or after the subcommand.
+
+```shell
+openshell sandbox list --workspace team-ml
+openshell provider list --workspace team-ml
+openshell sandbox create --workspace team-ml --name research -- bash
+```
+
+Set a default for the current shell with `OPENSHELL_WORKSPACE`:
+
+```shell
+export OPENSHELL_WORKSPACE=team-ml
+openshell sandbox list
+```
+
+An empty workspace value resolves to `default`. It never means all
+workspaces.
+
+Platform Admins can opt into cross-workspace list operations:
+
+```shell
+openshell sandbox list --all-workspaces
+openshell provider list --all-workspaces
+openshell service list --all-workspaces
+```
+
+Provider profiles and policy also have explicit `--global` operations. Those
+operations target platform scope and require Platform Admin access. A
+Workspace Admin should use `--workspace` for workspace-scoped profiles and
+configuration.
+
+## Diagnose Access Denials
+
+If `openshell workspace list` returns no rows, the authenticated subject has no
+workspace memberships. Run `openshell whoami` and send the `subject` value to
+a Platform Admin.
+
+Workspace authorization errors include a copyable membership command. A
+non-member denial suggests `--role user`. If an operation requires Workspace
+Admin access, the denial suggests `--role admin`; only a Platform Admin can run
+that assignment successfully.
+
+If the membership is correct but the request is still denied, inspect `roles`
+and `scopes` with `openshell whoami --output json`. Confirm that the token has
+the configured OIDC user role and, when scope enforcement is enabled, the
+scope required by the operation.
+
+## Delete a Workspace
+
+Only a Platform Admin can delete a workspace. The `default` workspace cannot
+be deleted.
+
+```shell
+openshell workspace delete team-ml
+```
+
+A custom workspace must not contain sandboxes, providers, provider profiles,
+services, SSH sessions, settings, policies, draft policy chunks, or credential
+refresh state. Remove those resources before retrying deletion. OpenShell
+removes membership records and inference routes as part of successful
+workspace deletion.
+
+## Next Steps
+
+- To configure OIDC roles and scopes, refer to [Gateway Authentication](/reference/gateway-auth).
+- To create resources in a workspace, refer to [Manage Sandboxes](/sandboxes/manage-sandboxes).
+- To manage workspace credentials, refer to [Providers](/sandboxes/manage-providers).

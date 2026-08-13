@@ -41,6 +41,28 @@ Environment:
                           Podman supervisor sideload image. Defaults to
                           openshell/supervisor:dev and is built on demand.
 
+Corporate proxy (Podman driver only):
+  OPENSHELL_SANDBOX_HTTPS_PROXY
+                          Corporate forward proxy URL for sandbox TLS
+                          egress, in explicit http://host:port form.
+  OPENSHELL_SANDBOX_NO_PROXY
+                          Comma-separated NO_PROXY list (hostnames, domain
+                          suffixes, IPs, CIDRs, optional :port qualifiers)
+                          dialed directly instead of through the proxy.
+  OPENSHELL_SANDBOX_PROXY_AUTH_FILE
+                          Path to a file with proxy credentials as
+                          user:pass. Requires the acknowledgement below —
+                          the gateway refuses to start with one but not
+                          the other.
+  OPENSHELL_SANDBOX_PROXY_AUTH_ALLOW_INSECURE
+                          Set to true to acknowledge that the credential
+                          is sent as cleartext Basic auth over the
+                          plain-TCP connection to the http:// proxy.
+  OPENSHELL_SANDBOX_PROXY_CONNECT_BY_HOSTNAME
+                          Set to true to send the destination hostname in
+                          CONNECT instead of a validated IP. Last resort
+                          for hostname-filtering proxy ACLs.
+
 Docker and VM runs delegate to gateway:docker and gateway:vm setup scripts.
 EOF
 }
@@ -108,6 +130,19 @@ detect_driver() {
   echo "ERROR: no compute driver detected." >&2
   echo "       Start Podman or Docker, run inside Kubernetes, or set OPENSHELL_DRIVERS." >&2
   exit 2
+}
+
+# Escape a value for embedding in a double-quoted TOML basic string, so
+# quotes, backslashes, or control characters in an environment value cannot
+# corrupt gateway.toml or inject extra configuration keys.
+toml_escape() {
+  local s=$1
+  s=${s//\\/\\\\}
+  s=${s//\"/\\\"}
+  s=${s//$'\n'/\\n}
+  s=${s//$'\r'/\\r}
+  s=${s//$'\t'/\\t}
+  printf '%s' "${s}"
 }
 
 port_is_in_use() {
@@ -265,21 +300,22 @@ SANDBOX_IMAGE="${OPENSHELL_SANDBOX_IMAGE:-ghcr.io/nvidia/openshell-community/san
 SANDBOX_IMAGE_PULL_POLICY="${OPENSHELL_SANDBOX_IMAGE_PULL_POLICY:-IfNotPresent}"
 GRPC_ENDPOINT="${OPENSHELL_GRPC_ENDPOINT:-}"
 LOG_LEVEL="${OPENSHELL_LOG_LEVEL:-info}"
+PRIMARY_BIND_IP="127.0.0.1"
+CLI_ENDPOINT_HOST="127.0.0.1"
+
+if [[ "${DRIVER}" == "podman" && "$(uname -s)" == "Darwin" ]]; then
+  # Podman Machine reserves IPv4 loopback for its callback-only listener.
+  # Keep the primary listener distinct while using a hostname that resolves
+  # to IPv6 loopback for local CLI connections.
+  PRIMARY_BIND_IP="::1"
+  CLI_ENDPOINT_HOST="localhost"
+fi
 
 if [[ "${DRIVER}" == "podman" ]]; then
   require_podman_service
   SUPERVISOR_IMAGE="${OPENSHELL_SUPERVISOR_IMAGE:-openshell/supervisor:dev}"
   ensure_podman_supervisor_image "${SUPERVISOR_IMAGE}"
   export OPENSHELL_SUPERVISOR_IMAGE="${SUPERVISOR_IMAGE}"
-
-  # Rootless Podman containers reach the host via pasta's local connection
-  # bypass, which translates to host L4 sockets. The gateway must listen on
-  # 0.0.0.0 so pasta can reach it — 127.0.0.1 is not routable through pasta.
-  if [[ -z "${OPENSHELL_BIND_ADDRESS:-}" ]]; then
-    if podman info --format '{{.Host.Security.Rootless}}' 2>/dev/null | grep -q true; then
-      export OPENSHELL_BIND_ADDRESS="0.0.0.0"
-    fi
-  fi
 fi
 
 if [[ ! "${GATEWAY_NAME}" =~ ^[A-Za-z0-9._-]+$ ]]; then
@@ -310,6 +346,9 @@ echo "Generating local gateway credentials..."
 
 mkdir -p "${STATE_DIR}"
 CONFIG_PATH="${STATE_DIR}/gateway.toml"
+# The config may reference credential-bearing material (e.g. proxy_auth_file);
+# keep it owner-only regardless of the ambient umask.
+install -m 600 /dev/null "${CONFIG_PATH}"
 cat >"${CONFIG_PATH}" <<EOF
 [openshell]
 version = 1
@@ -352,10 +391,47 @@ EOF
     if [[ -n "${GRPC_ENDPOINT}" ]]; then
       printf 'grpc_endpoint = "%s"\n' "${GRPC_ENDPOINT}" >>"${CONFIG_PATH}"
     fi
+    # ${VAR+x} distinguishes unset from set-but-empty: an unset variable
+    # writes nothing, but an explicitly empty one is written through so the
+    # gateway's fail-closed proxy validation rejects it at startup instead of
+    # this script silently dropping it.
+    if [[ -n "${OPENSHELL_SANDBOX_HTTPS_PROXY+x}" ]]; then
+      printf 'https_proxy = "%s"\n' "$(toml_escape "${OPENSHELL_SANDBOX_HTTPS_PROXY}")" >>"${CONFIG_PATH}"
+    fi
+    if [[ -n "${OPENSHELL_SANDBOX_NO_PROXY+x}" ]]; then
+      printf 'no_proxy = "%s"\n' "$(toml_escape "${OPENSHELL_SANDBOX_NO_PROXY}")" >>"${CONFIG_PATH}"
+    fi
+    if [[ -n "${OPENSHELL_SANDBOX_PROXY_AUTH_FILE+x}" ]]; then
+      printf 'proxy_auth_file = "%s"\n' "$(toml_escape "${OPENSHELL_SANDBOX_PROXY_AUTH_FILE}")" >>"${CONFIG_PATH}"
+    fi
+    if [[ -n "${OPENSHELL_SANDBOX_PROXY_AUTH_ALLOW_INSECURE+x}" ]]; then
+      case "${OPENSHELL_SANDBOX_PROXY_AUTH_ALLOW_INSECURE}" in
+        true|false)
+          printf 'proxy_auth_allow_insecure = %s\n' "${OPENSHELL_SANDBOX_PROXY_AUTH_ALLOW_INSECURE}" >>"${CONFIG_PATH}"
+          ;;
+        *)
+          # Not a TOML boolean: write it as a quoted string so the gateway's
+          # config parser rejects it at startup (fail closed, no injection).
+          printf 'proxy_auth_allow_insecure = "%s"\n' "$(toml_escape "${OPENSHELL_SANDBOX_PROXY_AUTH_ALLOW_INSECURE}")" >>"${CONFIG_PATH}"
+          ;;
+      esac
+    fi
+    if [[ -n "${OPENSHELL_SANDBOX_PROXY_CONNECT_BY_HOSTNAME+x}" ]]; then
+      case "${OPENSHELL_SANDBOX_PROXY_CONNECT_BY_HOSTNAME}" in
+        true|false)
+          printf 'proxy_connect_by_hostname = %s\n' "${OPENSHELL_SANDBOX_PROXY_CONNECT_BY_HOSTNAME}" >>"${CONFIG_PATH}"
+          ;;
+        *)
+          # Not a TOML boolean: write it as a quoted string so the gateway's
+          # config parser rejects it at startup (fail closed, no injection).
+          printf 'proxy_connect_by_hostname = "%s"\n' "$(toml_escape "${OPENSHELL_SANDBOX_PROXY_CONNECT_BY_HOSTNAME}")" >>"${CONFIG_PATH}"
+          ;;
+      esac
+    fi
     ;;
 esac
 
-GATEWAY_ENDPOINT="http://127.0.0.1:${PORT}"
+GATEWAY_ENDPOINT="http://${CLI_ENDPOINT_HOST}:${PORT}"
 register_gateway_metadata "${GATEWAY_NAME}" "${GATEWAY_ENDPOINT}" "${PORT}"
 
 echo "Starting standalone ${DRIVER} gateway..."
@@ -372,6 +448,7 @@ echo
 
 exec "${GATEWAY_BIN}" \
   --config "${CONFIG_PATH}" \
+  --bind-address "${PRIMARY_BIND_IP}" \
   --port "${PORT}" \
   --log-level "${LOG_LEVEL}" \
   --drivers "${DRIVER}" \

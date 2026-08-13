@@ -10,6 +10,8 @@
 
 pub mod child_env;
 pub mod debug_rpc;
+#[cfg(unix)]
+pub mod identity;
 pub mod log_push;
 pub mod managed_children;
 pub mod process;

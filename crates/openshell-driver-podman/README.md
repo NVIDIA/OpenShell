@@ -7,7 +7,26 @@ driver runs in-process within the gateway server and delegates all sandbox
 isolation enforcement to the `openshell-sandbox` supervisor binary, which is
 sideloaded into each container via an OCI image volume mount.
 
+Before creating the container, the driver inspects the final sandbox image and
+captures its immutable image ID and raw OCI `Config.User`. Container creation
+uses that image ID with pulling disabled, preventing a mutable tag from changing
+between inspection and launch. The supervisor runs as root, resolves omitted
+policy identity fields from the image declaration, and drops only agent
+children to the completed identity. Named OCI components remain names after
+validation; a missing group is filled with the user's numeric primary GID. Explicit
+`process.run_as_user` and `process.run_as_group` values take precedence
+independently.
+
 For a rootless networking deep dive, see [NETWORKING.md](NETWORKING.md).
+
+## Stop and Start
+
+Stop stops the managed container without deleting it. The per-sandbox named
+workspace volume, token and proxy-auth secrets, labels, and container metadata
+remain intact. Start starts the same container and reuses the same named
+volume. Stopped managed containers remain visible through list and watch
+reconciliation. Delete remains responsible for removing the container,
+driver-owned secrets, and workspace volume.
 
 ## Architecture
 
@@ -186,7 +205,7 @@ graph TB
         subgraph Container["Sandbox Container"]
             SV["Supervisor<br/>(root in user ns)"]
             subgraph NestedNS["Nested Network Namespace"]
-                SP["Sandbox Process<br/>(sandbox user)"]
+                SP["Sandbox Process<br/>(resolved non-root identity)"]
                 VE2["veth1: 10.200.0.2"]
             end
             VE1["veth0: 10.200.0.1<br/>(CONNECT proxy)"]
@@ -331,7 +350,7 @@ Podman resources after out-of-band container removal or label drift.
 
 | Environment Variable | CLI Flag | Default | Description |
 |---|---|---|---|
-| `OPENSHELL_PODMAN_SOCKET` | `--podman-socket` | `$XDG_RUNTIME_DIR/podman/podman.sock` on Linux, `$HOME/.local/share/containers/podman/machine/podman.sock` on macOS | Podman API Unix socket path. |
+| `OPENSHELL_PODMAN_SOCKET` | `--podman-socket` | Probes known local Podman API sockets and uses the first responsive socket. Fails to start if none respond. | Podman API Unix socket path. |
 | `OPENSHELL_SANDBOX_IMAGE` | `--sandbox-image` | From gateway config | Default OCI image for sandboxes. |
 | `OPENSHELL_SANDBOX_IMAGE_PULL_POLICY` | `--sandbox-image-pull-policy` | `missing` | Pull policy: `always`, `missing`, `never`, or `newer`. |
 | `OPENSHELL_GRPC_ENDPOINT` | `--grpc-endpoint` | Auto-detected via `host.containers.internal` | Gateway gRPC endpoint for sandbox callbacks. |
@@ -339,12 +358,44 @@ Podman resources after out-of-band container removal or label drift.
 | `OPENSHELL_NETWORK_NAME` | `--network-name` | `openshell` | Podman bridge network name. |
 | `OPENSHELL_PODMAN_HOST_GATEWAY_IP` | `--host-gateway-ip` | empty on Linux, `192.168.127.254` on macOS | Host gateway IP used for sandbox host aliases. Empty uses Podman's `host-gateway` resolver. |
 | `OPENSHELL_SANDBOX_SSH_SOCKET_PATH` | `--sandbox-ssh-socket-path` | `/run/openshell/ssh.sock` | Supervisor Unix socket path in `PodmanComputeConfig`. |
-| `OPENSHELL_STOP_TIMEOUT` | `--stop-timeout` | `10` | Container stop timeout in seconds. |
+| `OPENSHELL_STOP_TIMEOUT` | `--stop-timeout` | `45` | Container stop timeout in seconds. |
 | `OPENSHELL_SANDBOX_PIDS_LIMIT` | `--sandbox-pids-limit` | `2048` | Podman cgroup PID limit for sandbox containers. Set `0` to inherit Podman's runtime/default PID limit. |
 | `OPENSHELL_SUPERVISOR_IMAGE` | `--supervisor-image` | `ghcr.io/nvidia/openshell/supervisor:latest` through the gateway, required standalone | OCI image containing the supervisor binary. |
 | `OPENSHELL_PODMAN_TLS_CA` | `--podman-tls-ca` | unset | Host path to the CA certificate mounted for sandbox mTLS. |
 | `OPENSHELL_PODMAN_TLS_CERT` | `--podman-tls-cert` | unset | Host path to the client certificate mounted for sandbox mTLS. |
 | `OPENSHELL_PODMAN_TLS_KEY` | `--podman-tls-key` | unset | Host path to the client private key mounted for sandbox mTLS. |
+| `OPENSHELL_SANDBOX_HTTPS_PROXY` | `--sandbox-https-proxy` | unset | Corporate forward proxy URL for the supervisor's upstream TLS dials, chained with HTTP CONNECT. Only credential-free `http://host:port` URLs are supported (scheme and port required). Plain-HTTP requests always dial directly. |
+| `OPENSHELL_SANDBOX_NO_PROXY` | `--sandbox-no-proxy` | unset | Comma-separated `NO_PROXY` list (hostnames, domain suffixes, IPs, CIDRs, each with an optional `:port` qualifier) dialed directly instead of through the corporate proxy. IP/CIDR entries also match hostnames through their validated DNS resolution. |
+| `OPENSHELL_SANDBOX_PROXY_AUTH_FILE` | `--sandbox-proxy-auth-file` | unset | Path to a file containing the proxy credentials as `user:pass`. Staged as a root-only Podman secret so credentials never appear in config or container metadata. Requires the insecure-auth acknowledgement below. |
+| `OPENSHELL_SANDBOX_PROXY_AUTH_ALLOW_INSECURE` | `--sandbox-proxy-auth-allow-insecure` | unset | Explicit acknowledgement (`true`) that the credential is sent as cleartext Basic auth over the plain-TCP connection to the `http://` proxy. Required when the auth file is set; rejected when it is not. |
+| `OPENSHELL_SANDBOX_PROXY_CONNECT_BY_HOSTNAME` | `--sandbox-proxy-connect-by-hostname` | unset | Send the destination hostname in CONNECT requests instead of a validated IP. Last resort for proxies whose ACLs filter on hostnames: the proxy then resolves the name itself, so sandbox SSRF/`allowed_ips` validation no longer binds the connection. |
+
+Through the gateway, the same settings are the `https_proxy`, `no_proxy`,
+`proxy_auth_file`, `proxy_auth_allow_insecure`, and
+`proxy_connect_by_hostname` keys under `[openshell.drivers.podman]`; see
+`docs/reference/gateway-config.mdx`.
+
+This is an operator-owned egress boundary: the driver passes the settings on
+the supervisor's command line, so sandbox and template environment — and any
+`ENV` baked into the sandbox image — cannot override them, and the
+conventional `HTTPS_PROXY`/`HTTP_PROXY`/`NO_PROXY` variables a sandbox
+controls do not steer it. Credentials must be supplied through
+`proxy_auth_file`; an inline `user:pass@` in the URL is rejected at startup.
+
+Basic auth over an `http://` proxy is cleartext on the wire: anyone on the
+network path between the sandbox host and the proxy can recover the
+credential. Setting `proxy_auth_file` therefore requires
+`proxy_auth_allow_insecure = true`; both the driver and the in-container
+supervisor reject credentials without that explicit acknowledgement.
+
+CONNECT requests target a validated resolved IP by default, so the proxy
+performs no DNS resolution and the tunnel stays bound to the address that
+passed the sandbox's SSRF and `allowed_ips` checks; the hostname still
+travels inside the tunnel (TLS SNI, application `Host`). In split-horizon
+networks, point the gateway host at the corporate resolver. Set
+`proxy_connect_by_hostname = true` only when the proxy's ACLs filter on
+hostnames and reject IP CONNECT targets — it re-opens proxy-side DNS
+resolution, making the proxy's ACLs the effective egress control.
 
 ## Rootless-Specific Adaptations
 
