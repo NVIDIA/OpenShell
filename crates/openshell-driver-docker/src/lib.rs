@@ -8,10 +8,10 @@
 use bollard::Docker;
 use bollard::errors::Error as BollardError;
 use bollard::models::{
-    ContainerCreateBody, ContainerSummary, ContainerSummaryStateEnum, CreateImageInfo,
-    DeviceRequest, EndpointSettings, HostConfig, Mount, MountTmpfsOptions, MountTypeEnum,
-    MountVolumeOptions, NetworkCreateRequest, NetworkingConfig, ProgressDetail, RestartPolicy,
-    RestartPolicyNameEnum, SystemInfo,
+    ContainerCreateBody, ContainerState, ContainerStateStatusEnum, ContainerSummary,
+    ContainerSummaryStateEnum, CreateImageInfo, DeviceRequest, EndpointSettings, HostConfig, Mount,
+    MountTmpfsOptions, MountTypeEnum, MountVolumeOptions, NetworkCreateRequest, NetworkingConfig,
+    ProgressDetail, RestartPolicy, RestartPolicyNameEnum, SystemInfo,
 };
 use bollard::query_parameters::{
     CreateContainerOptionsBuilder, CreateImageOptions, DownloadFromContainerOptionsBuilder,
@@ -42,11 +42,12 @@ use openshell_core::proto::compute::v1::{
     DriverSandboxTemplate, GatewayListenerRequirement, GetCapabilitiesRequest,
     GetCapabilitiesResponse, GetGatewayListenerRequirementsRequest,
     GetGatewayListenerRequirementsResponse, GetSandboxRequest, GetSandboxResponse,
-    GpuResourceRequirements, ListSandboxesRequest, ListSandboxesResponse, StopSandboxRequest,
-    StopSandboxResponse, ValidateSandboxCreateRequest, ValidateSandboxCreateResponse,
-    WatchSandboxesDeletedEvent, WatchSandboxesEvent, WatchSandboxesPlatformEvent,
-    WatchSandboxesRequest, WatchSandboxesSandboxEvent, compute_driver_server::ComputeDriver,
-    gateway_listener_requirement::Selector, watch_sandboxes_event,
+    GpuResourceRequirements, ListSandboxesRequest, ListSandboxesResponse, StartSandboxRequest,
+    StartSandboxResponse, StopSandboxRequest, StopSandboxResponse, ValidateSandboxCreateRequest,
+    ValidateSandboxCreateResponse, WatchSandboxesDeletedEvent, WatchSandboxesEvent,
+    WatchSandboxesPlatformEvent, WatchSandboxesRequest, WatchSandboxesSandboxEvent,
+    compute_driver_server::ComputeDriver, gateway_listener_requirement::Selector,
+    watch_sandboxes_event,
 };
 use openshell_core::proto_struct::{
     deserialize_optional_non_empty_string_list, struct_to_json_value,
@@ -63,7 +64,7 @@ use tokio::sync::{Mutex, broadcast, mpsc};
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use url::Url;
 
 const WATCH_BUFFER: usize = 128;
@@ -204,6 +205,85 @@ pub struct DockerComputeDriver {
     events: broadcast::Sender<WatchSandboxesEvent>,
     pending: Arc<Mutex<HashMap<String, PendingSandboxRecord>>>,
     gpu_selector: Arc<CdiGpuDefaultSelector>,
+    lifecycle_event_fences: DockerLifecycleEventFences,
+}
+
+/// Per-sandbox container exit timestamps that fence snapshots from an earlier run.
+///
+/// Docker's polling loop can observe the stopped container before a restart and
+/// publish that snapshot after the gateway has moved the sandbox to `Starting`.
+/// Comparing the container's transition timestamp prevents that old observation
+/// from regressing the new lifecycle operation to `Error`.
+#[derive(Clone, Debug, Default)]
+struct DockerLifecycleEventFences {
+    state: Arc<std::sync::Mutex<DockerLifecycleFenceState>>,
+}
+
+#[derive(Debug, Default)]
+struct DockerLifecycleFenceState {
+    previous_finished_at: HashMap<String, String>,
+    starts_in_progress: HashSet<String>,
+}
+
+impl DockerLifecycleEventFences {
+    fn begin_start(&self, sandbox_id: &str) {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .starts_in_progress
+            .insert(sandbox_id.to_string());
+    }
+
+    fn finish_start(&self, sandbox_id: &str) {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .starts_in_progress
+            .remove(sandbox_id);
+    }
+
+    fn start_in_progress(&self, sandbox_id: &str) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .starts_in_progress
+            .contains(sandbox_id)
+    }
+
+    fn record_previous_exit(&self, sandbox_id: &str, finished_at: Option<&str>) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match finished_at.filter(|finished_at| !finished_at.is_empty()) {
+            Some(finished_at) => {
+                state
+                    .previous_finished_at
+                    .insert(sandbox_id.to_string(), finished_at.to_string());
+            }
+            None => {
+                state.previous_finished_at.remove(sandbox_id);
+            }
+        }
+    }
+
+    fn previous_exit(&self, sandbox_id: &str) -> Option<String> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .previous_finished_at
+            .get(sandbox_id)
+            .cloned()
+    }
+
+    fn remove(&self, sandbox_id: &str) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.previous_finished_at.remove(sandbox_id);
+        state.starts_in_progress.remove(sandbox_id);
+    }
 }
 
 struct PendingSandboxRecord {
@@ -393,6 +473,7 @@ impl DockerComputeDriver {
                 cdi_gpu_inventory,
                 allow_all_default_gpu,
             )),
+            lifecycle_event_fences: DockerLifecycleEventFences::default(),
         };
 
         let poll_driver = driver.clone();
@@ -900,14 +981,27 @@ impl DockerComputeDriver {
     }
 
     /// Start a managed sandbox container that was previously stopped. Used
-    /// by the gateway to resume sandboxes after a restart so that running
+    /// by the gateway to start sandboxes after a restart so that running
     /// state in the gateway store is matched by an actually-running
     /// container.
     ///
     /// Returns `Ok(true)` when a container existed and was started (or was
     /// already running), `Ok(false)` when no managed container is found for
     /// the sandbox, and `Err(...)` for any Docker failure.
-    pub async fn resume_sandbox(
+    pub async fn start_sandbox(
+        &self,
+        sandbox_id: &str,
+        sandbox_name: &str,
+    ) -> Result<bool, Status> {
+        self.lifecycle_event_fences.begin_start(sandbox_id);
+        let result = self
+            .start_sandbox_with_lifecycle_fence(sandbox_id, sandbox_name)
+            .await;
+        self.lifecycle_event_fences.finish_start(sandbox_id);
+        result
+    }
+
+    async fn start_sandbox_with_lifecycle_fence(
         &self,
         sandbox_id: &str,
         sandbox_name: &str,
@@ -922,13 +1016,33 @@ impl DockerComputeDriver {
             return Ok(false);
         };
         let state = container.state.unwrap_or(ContainerSummaryStateEnum::EMPTY);
-        if !container_state_needs_resume(state) {
+        if !container_state_needs_start(state) {
             return Ok(true);
         }
 
+        // Fence a poll that observed this stopped run but has not published it
+        // yet. Use Docker's transition timestamp so a later, genuine exit from
+        // the restarted container remains observable.
+        let previous_finished_at = if state == ContainerSummaryStateEnum::EXITED {
+            let inspected = self
+                .docker
+                .inspect_container(&target, None)
+                .await
+                .map_err(|err| internal_status("inspect docker sandbox before start", err))?;
+            inspected
+                .state
+                .as_ref()
+                .filter(|state| state.status == Some(ContainerStateStatusEnum::EXITED))
+                .and_then(|state| state.finished_at.clone())
+        } else {
+            None
+        };
+        self.lifecycle_event_fences
+            .record_previous_exit(sandbox_id, previous_finished_at.as_deref());
+
         match self.docker.start_container(&target, None).await {
             Ok(()) => Ok(true),
-            // Already running — race with another resume path or the
+            // Already running — race with another start path or the
             // restart policy. Treat as success.
             Err(err) if is_not_modified_error(&err) => Ok(true),
             Err(err) if is_not_found_error(&err) => Ok(false),
@@ -1176,7 +1290,7 @@ impl DockerComputeDriver {
             tokio::time::sleep(backoff).await;
             match self.current_snapshot_map().await {
                 Ok(current) => {
-                    emit_snapshot_diff(&self.events, &previous, &current);
+                    self.publish_snapshot_diff(&previous, &current).await;
                     previous = current;
                     backoff = WATCH_POLL_INTERVAL;
                 }
@@ -1199,6 +1313,78 @@ impl DockerComputeDriver {
                 .map(|sandbox| (sandbox.id.clone(), sandbox))
                 .collect()
         })
+    }
+
+    async fn publish_snapshot_diff(
+        &self,
+        previous: &HashMap<String, DriverSandbox>,
+        current: &HashMap<String, DriverSandbox>,
+    ) {
+        for (sandbox_id, sandbox) in current {
+            if previous.get(sandbox_id) == Some(sandbox) {
+                continue;
+            }
+            if self.stale_polled_exit(sandbox).await {
+                continue;
+            }
+            self.publish_sandbox_snapshot(sandbox.clone());
+        }
+
+        for sandbox_id in previous.keys() {
+            if current.contains_key(sandbox_id) {
+                continue;
+            }
+            self.publish_deleted(sandbox_id.clone());
+        }
+    }
+
+    async fn stale_polled_exit(&self, sandbox: &DriverSandbox) -> bool {
+        if !driver_sandbox_reports_container_exit(sandbox) {
+            return false;
+        }
+        if self.lifecycle_event_fences.start_in_progress(&sandbox.id) {
+            debug!(
+                sandbox_id = %sandbox.id,
+                "Ignoring Docker container exit snapshot while sandbox start is in progress"
+            );
+            return true;
+        }
+        let Some(previous_finished_at) = self.lifecycle_event_fences.previous_exit(&sandbox.id)
+        else {
+            return false;
+        };
+        let Some(container_id) = sandbox
+            .status
+            .as_ref()
+            .map(|status| status.instance_id.as_str())
+            .filter(|container_id| !container_id.is_empty())
+        else {
+            return false;
+        };
+
+        let inspected = match self.docker.inspect_container(container_id, None).await {
+            Ok(inspected) => inspected,
+            Err(err) => {
+                debug!(
+                    sandbox_id = %sandbox.id,
+                    container_id,
+                    error = %err,
+                    "Could not verify whether polled Docker exit predates sandbox start"
+                );
+                return false;
+            }
+        };
+        if !docker_polled_exit_is_stale(&previous_finished_at, inspected.state.as_ref()) {
+            return false;
+        }
+
+        debug!(
+            sandbox_id = %sandbox.id,
+            container_id,
+            previous_finished_at,
+            "Ignoring Docker container exit snapshot from before the latest sandbox start"
+        );
+        true
     }
 
     async fn list_managed_container_summaries(&self) -> Result<Vec<ContainerSummary>, Status> {
@@ -1479,7 +1665,23 @@ impl ComputeDriver for DockerComputeDriver {
 
         self.stop_sandbox_inner(&request.sandbox_id, &request.sandbox_name)
             .await?;
+        self.publish_container_snapshot(&request.sandbox_id, &request.sandbox_name)
+            .await?;
         Ok(Response::new(StopSandboxResponse {}))
+    }
+
+    async fn start_sandbox(
+        &self,
+        request: Request<StartSandboxRequest>,
+    ) -> Result<Response<StartSandboxResponse>, Status> {
+        let request = request.into_inner();
+        require_sandbox_identifier(&request.sandbox_id, &request.sandbox_name)?;
+        if !Self::start_sandbox(self, &request.sandbox_id, &request.sandbox_name).await? {
+            return Err(Status::not_found("sandbox not found"));
+        }
+        self.publish_container_snapshot(&request.sandbox_id, &request.sandbox_name)
+            .await?;
+        Ok(Response::new(StartSandboxResponse {}))
     }
 
     async fn delete_sandbox(
@@ -1493,6 +1695,7 @@ impl ComputeDriver for DockerComputeDriver {
         let deleted = self
             .delete_sandbox_inner(&request.sandbox_id, &request.sandbox_name)
             .await?;
+        self.lifecycle_event_fences.remove(&event_sandbox_id);
         if deleted && !event_sandbox_id.is_empty() {
             let _ = self.events.send(WatchSandboxesEvent {
                 payload: Some(watch_sandboxes_event::Payload::Deleted(
@@ -2966,7 +3169,7 @@ fn container_state_needs_shutdown_stop(state: ContainerSummaryStateEnum) -> bool
 /// `start_container`. Skip `Restarting` (already coming up), `Removing`,
 /// `Dead` (terminal), `Paused` (needs `unpause`, not `start`), and
 /// `Running` (nothing to do).
-fn container_state_needs_resume(state: ContainerSummaryStateEnum) -> bool {
+fn container_state_needs_start(state: ContainerSummaryStateEnum) -> bool {
     matches!(
         state,
         ContainerSummaryStateEnum::EXITED | ContainerSummaryStateEnum::CREATED
@@ -2977,36 +3180,31 @@ fn docker_stop_timeout_secs(timeout_secs: u32) -> i32 {
     i32::try_from(timeout_secs).unwrap_or(i32::MAX)
 }
 
-fn emit_snapshot_diff(
-    events: &broadcast::Sender<WatchSandboxesEvent>,
-    previous: &HashMap<String, DriverSandbox>,
-    current: &HashMap<String, DriverSandbox>,
-) {
-    for (sandbox_id, sandbox) in current {
-        if previous.get(sandbox_id) == Some(sandbox) {
-            continue;
-        }
-        let _ = events.send(WatchSandboxesEvent {
-            payload: Some(watch_sandboxes_event::Payload::Sandbox(
-                WatchSandboxesSandboxEvent {
-                    sandbox: Some(sandbox.clone()),
-                },
-            )),
-        });
+fn driver_sandbox_reports_container_exit(sandbox: &DriverSandbox) -> bool {
+    sandbox.status.as_ref().is_some_and(|status| {
+        status.conditions.iter().any(|condition| {
+            condition.r#type == "Ready"
+                && condition.status.eq_ignore_ascii_case("false")
+                && condition.reason == "ContainerExited"
+        })
+    })
+}
+
+fn docker_polled_exit_is_stale(
+    previous_finished_at: &str,
+    current_state: Option<&ContainerState>,
+) -> bool {
+    let Some(current_state) = current_state else {
+        return false;
+    };
+
+    if current_state.status != Some(ContainerStateStatusEnum::EXITED) {
+        // The list response said Exited, but inspect has already observed a
+        // newer state. Publishing the older list result would regress it.
+        return true;
     }
 
-    for sandbox_id in previous.keys() {
-        if current.contains_key(sandbox_id) {
-            continue;
-        }
-        let _ = events.send(WatchSandboxesEvent {
-            payload: Some(watch_sandboxes_event::Payload::Deleted(
-                WatchSandboxesDeletedEvent {
-                    sandbox_id: sandbox_id.clone(),
-                },
-            )),
-        });
-    }
+    current_state.finished_at.as_deref() == Some(previous_finished_at)
 }
 
 fn label_filters(values: impl IntoIterator<Item = String>) -> HashMap<String, Vec<String>> {

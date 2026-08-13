@@ -91,6 +91,28 @@ func (s *sandboxClient) Delete(ctx context.Context, workspace, name string) erro
 	return nil
 }
 
+func (s *sandboxClient) Stop(ctx context.Context, workspace, name string) (*Sandbox, error) {
+	resp, err := s.client.StopSandbox(ctx, &pb.StopSandboxRequest{
+		Name:      name,
+		Workspace: workspace,
+	})
+	if err != nil {
+		return nil, converter.FromGRPCError(err)
+	}
+	return converter.SandboxFromProto(resp.GetSandbox()), nil
+}
+
+func (s *sandboxClient) Start(ctx context.Context, workspace, name string) (*Sandbox, error) {
+	resp, err := s.client.StartSandbox(ctx, &pb.StartSandboxRequest{
+		Name:      name,
+		Workspace: workspace,
+	})
+	if err != nil {
+		return nil, converter.FromGRPCError(err)
+	}
+	return converter.SandboxFromProto(resp.GetSandbox()), nil
+}
+
 func (s *sandboxClient) AttachProvider(ctx context.Context, workspace, sandboxName, providerName string, expectedResourceVersion uint64) (*AttachProviderResult, error) {
 	resp, err := s.client.AttachSandboxProvider(ctx, &pb.AttachSandboxProviderRequest{
 		SandboxName:             sandboxName,
@@ -140,6 +162,14 @@ func (s *sandboxClient) ListProviders(ctx context.Context, workspace, sandboxNam
 }
 
 func (s *sandboxClient) WaitReady(ctx context.Context, workspace, name string, opts ...WaitOptions) (*Sandbox, error) {
+	return s.waitForPhase(ctx, workspace, name, SandboxReady, opts...)
+}
+
+func (s *sandboxClient) WaitStopped(ctx context.Context, workspace, name string, opts ...WaitOptions) (*Sandbox, error) {
+	return s.waitForPhase(ctx, workspace, name, SandboxStopped, opts...)
+}
+
+func (s *sandboxClient) waitForPhase(ctx context.Context, workspace, name string, target SandboxPhase, opts ...WaitOptions) (*Sandbox, error) {
 	interval := defaultPollInterval
 	if len(opts) > 0 && opts[0].PollInterval > 0 {
 		interval = opts[0].PollInterval
@@ -150,7 +180,7 @@ func (s *sandboxClient) WaitReady(ctx context.Context, workspace, name string, o
 		return nil, err
 	}
 
-	if sb.Status.Phase == SandboxReady {
+	if sb.Status.Phase == target {
 		return sb, nil
 	}
 	if sb.Status.Phase == SandboxError {
@@ -172,7 +202,7 @@ func (s *sandboxClient) WaitReady(ctx context.Context, workspace, name string, o
 			if err != nil {
 				return nil, err
 			}
-			if sb.Status.Phase == SandboxReady {
+			if sb.Status.Phase == target {
 				return sb, nil
 			}
 			if sb.Status.Phase == SandboxError {

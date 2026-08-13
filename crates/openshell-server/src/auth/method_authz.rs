@@ -148,4 +148,18 @@ mod tests {
         // Unknown method falls through to AuthzPolicy::check.
         assert!(is_user_callable("/openshell.v1.OpenShell/FutureMethod"));
     }
+
+    #[test]
+    fn sandbox_lifecycle_mutations_require_user_write_authority() {
+        for path in [
+            "/openshell.v1.OpenShell/StopSandbox",
+            "/openshell.v1.OpenShell/StartSandbox",
+        ] {
+            let entry = lookup(path).expect("lifecycle RPC must have auth metadata");
+            assert_eq!(entry.auth_mode, AuthMode::Bearer);
+            assert_eq!(entry.scope.as_deref(), Some("sandbox:write"));
+            assert_eq!(entry.workspace_role.as_deref(), Some("user"));
+            assert!(!is_sandbox_callable(path));
+        }
+    }
 }
