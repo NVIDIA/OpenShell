@@ -16,6 +16,7 @@ from typing import Any, cast
 
 import pytest
 
+import openshell.sandbox as sandbox_module
 from openshell._proto import openshell_pb2
 from openshell.sandbox import (
     _PYTHON_CLOUDPICKLE_BOOTSTRAP,
@@ -27,6 +28,7 @@ from openshell.sandbox import (
     SandboxRef,
     SandboxStatusRef,
     TlsConfig,
+    _atomic_replace,
     _BearerAuthInterceptor,
     _load_cluster_bearer_token,
     _make_cluster_bearer_provider,
@@ -1279,6 +1281,65 @@ def test_refresher_concurrent_write_back_does_not_trample(tmp_path: Path) -> Non
         assert leftovers == [], f"orphan tmp files: {leftovers}"
     finally:
         r.close()
+
+
+class _WindowsPermissionError(PermissionError):
+    winerror: int
+
+
+def test_atomic_replace_retries_windows_sharing_violations(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    source = tmp_path / "source"
+    destination = tmp_path / "destination"
+    source.write_text("new")
+    destination.write_text("old")
+    attempts = 0
+    delays: list[float] = []
+    real_replace = Path.replace
+
+    def replace(path: Path, target: Path) -> Path:
+        nonlocal attempts
+        attempts += 1
+        if attempts < 3:
+            error = _WindowsPermissionError("destination is busy")
+            error.winerror = 32
+            raise error
+        return real_replace(path, target)
+
+    monkeypatch.setattr(sandbox_module, "_IS_WINDOWS", True)
+    monkeypatch.setattr(Path, "replace", replace)
+    monkeypatch.setattr(time, "sleep", delays.append)
+
+    _atomic_replace(source, destination)
+
+    assert attempts == 3
+    assert delays == [0.005, 0.01]
+    assert destination.read_text() == "new"
+
+
+def test_atomic_replace_does_not_retry_permanent_windows_errors(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    source = tmp_path / "source"
+    destination = tmp_path / "destination"
+    source.write_text("new")
+    attempts = 0
+
+    def replace(_path: Path, _target: Path) -> Path:
+        nonlocal attempts
+        attempts += 1
+        error = _WindowsPermissionError("access denied")
+        error.winerror = 13
+        raise error
+
+    monkeypatch.setattr(sandbox_module, "_IS_WINDOWS", True)
+    monkeypatch.setattr(Path, "replace", replace)
+
+    with pytest.raises(PermissionError, match="access denied"):
+        _atomic_replace(source, destination)
+
+    assert attempts == 1
 
 
 def test_sandbox_wrapper_forwards_auth_kwargs_to_from_active_cluster(

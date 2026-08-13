@@ -85,6 +85,11 @@ func policyNetworkEndpointFromProto(ep *sbv1.NetworkEndpoint) types.PolicyNetwor
 	if mcp := ep.GetMcp(); mcp != nil {
 		result.Mcp = mcpOptionsFromProto(mcp)
 	}
+	if binding := ep.GetCredentialBinding(); binding != nil {
+		result.CredentialBinding = &types.NetworkCredentialBinding{
+			Provider: binding.GetProvider(),
+		}
+	}
 	if ports := ep.GetPorts(); len(ports) > 0 {
 		result.Ports = make([]uint32, len(ports))
 		copy(result.Ports, ports)
@@ -141,6 +146,11 @@ func policyNetworkEndpointToProto(ep *types.PolicyNetworkEndpoint) *sbv1.Network
 	}
 	if ep.Mcp != nil {
 		result.Mcp = mcpOptionsToProto(ep.Mcp)
+	}
+	if ep.CredentialBinding != nil {
+		result.CredentialBinding = &sbv1.NetworkCredentialBinding{
+			Provider: ep.CredentialBinding.Provider,
+		}
 	}
 	if len(ep.Ports) > 0 {
 		result.Ports = make([]uint32, len(ep.Ports))

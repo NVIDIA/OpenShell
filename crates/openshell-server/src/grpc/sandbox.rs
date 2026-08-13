@@ -303,6 +303,17 @@ async fn handle_create_sandbox_inner(
 
     // Ensure metadata is valid (defense in depth - should always be true for server-constructed metadata)
     super::validation::validate_object_metadata(sandbox.metadata.as_ref(), "sandbox")?;
+    super::policy::validate_candidate_provider_attachments(
+        state,
+        sandbox.object_workspace(),
+        &sandbox,
+        sandbox
+            .spec
+            .as_ref()
+            .map(|spec| spec.providers.as_slice())
+            .unwrap_or_default(),
+    )
+    .await?;
 
     state
         .compute
@@ -644,10 +655,22 @@ pub(super) async fn handle_detach_sandbox_provider(
         .clone();
 
     // Pre-check: fail fast if sandbox spec is missing (invariant violation)
-    let _spec = sandbox
+    let spec = sandbox
         .spec
         .as_ref()
         .ok_or_else(|| Status::internal("sandbox spec is missing"))?;
+    let mut candidate_spec = spec.clone();
+    candidate_spec
+        .providers
+        .retain(|name| name != &request.provider_name);
+    dedupe_provider_names(&mut candidate_spec.providers);
+    super::policy::validate_candidate_provider_attachments(
+        state,
+        &workspace,
+        &sandbox,
+        &candidate_spec.providers,
+    )
+    .await?;
 
     let provider_name = request.provider_name.clone();
     let detached = Arc::new(AtomicBool::new(false));
@@ -2873,6 +2896,64 @@ mod tests {
         .unwrap()
         .into_inner();
         assert!(!response.detached);
+    }
+
+    #[tokio::test]
+    async fn detach_rejects_provider_referenced_by_policy_credential_binding() {
+        let state = test_server_state().await;
+        state
+            .store
+            .put_message(&test_provider("work-gcp", "google-cloud"))
+            .await
+            .unwrap();
+
+        let mut sandbox = test_sandbox("work", vec!["work-gcp".to_string()]);
+        let policy = sandbox
+            .spec
+            .as_mut()
+            .and_then(|spec| spec.policy.as_mut())
+            .unwrap();
+        policy.network_policies.insert(
+            "gcp_storage".to_string(),
+            openshell_core::proto::NetworkPolicyRule {
+                name: "gcp_storage".to_string(),
+                endpoints: vec![openshell_core::proto::NetworkEndpoint {
+                    host: "storage.googleapis.com".to_string(),
+                    port: 443,
+                    credential_binding: Some(openshell_core::proto::NetworkCredentialBinding {
+                        provider: "work-gcp".to_string(),
+                    }),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        state.store.put_message(&sandbox).await.unwrap();
+
+        let error = handle_detach_sandbox_provider(
+            &state,
+            authed_request(DetachSandboxProviderRequest {
+                sandbox_name: "work".to_string(),
+                provider_name: "work-gcp".to_string(),
+                expected_resource_version: 0,
+                workspace: String::new(),
+            }),
+        )
+        .await
+        .expect_err("a referenced provider must remain attached");
+
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert!(error.message().contains("not attached"));
+        let providers = state
+            .store
+            .get_message_by_name::<Sandbox>("default", "work")
+            .await
+            .unwrap()
+            .unwrap()
+            .spec
+            .unwrap()
+            .providers;
+        assert_eq!(providers, vec!["work-gcp"]);
     }
 
     #[tokio::test]

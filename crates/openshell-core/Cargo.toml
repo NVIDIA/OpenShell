@@ -11,6 +11,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+async-trait = "0.1"
 openshell-extension-core = { path = "../openshell-extension-core" }
 glob = { workspace = true }
 prost = { workspace = true }
@@ -41,7 +42,7 @@ telemetry = ["dep:reqwest", "dep:chrono"]
 
 [build-dependencies]
 tonic-prost-build = { workspace = true }
-protobuf-src = { workspace = true }
+protoc-bin-vendored = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"

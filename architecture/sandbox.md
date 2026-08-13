@@ -72,6 +72,24 @@ its guarded single-request relay while sharing authorization, request context,
 policy-pinning, and destination boundaries.
 Adapter-specific response and OCSF event shapes remain at the protocol boundary.
 
+Provider credential placeholders are resolved through the live provider state
+for each HTTP request, after destination and L7 policy admission. A static
+credential resolves only when the request host, port, and path match an endpoint
+in that provider's effective profile. CONNECT, absolute-form forward HTTP,
+request targets, headers, supported request bodies, SigV4 signing, and opted-in
+WebSocket text rewriting use the same scoped resolver. Provider refresh swaps
+credential values and endpoint bindings atomically. An invalid or unavailable
+refresh revokes the previous static credential state instead of leaving a
+partially active or last-known-good static set. Invalid metadata preserves the
+supplied dynamic snapshot, while a fetch failure preserves the currently active
+dynamic snapshot.
+
+Route selection and policy evaluation use a syntax-only redacted request target;
+they do not materialize real credentials. Cross-endpoint placeholder use returns
+HTTP 403. After a WebSocket upgrade it closes the connection with policy
+violation code 1008. Both paths emit a denied activity event and a detection
+finding without logging the placeholder, environment key, secret, or query.
+
 For inspected HTTP traffic, the proxy can enforce REST method/path rules,
 WebSocket upgrade and text-message rules, GraphQL operation rules, and
 MCP method, tool, and supported params rules or generic JSON-RPC method rules
@@ -90,11 +108,7 @@ host selectors choose the chain independently of the network rule that admitted
 the request. Policy-local map keys identify configs, while built-in names or
 operator-owned registration names identify implementations.
 
-Built-ins run in-process; operator services use the same bounded gRPC contract.
-`openshell-policy` validates policy-owned structure, and the active middleware
-registry validates implementation-owned config. The generic registry and chain
-runner live in `openshell-supervisor-middleware`; first-party implementations
-live in `openshell-supervisor-middleware-builtins`.
+Built-ins run in-process against a borrowed view of the chain's current request state. Operator services retain the bounded protobuf/gRPC contract, and the remote adapter materializes an owned evaluation only when the request crosses that transport boundary. `openshell-policy` validates policy-owned structure, and the active middleware registry validates implementation-owned config. The generic registry and chain runner live in `openshell-supervisor-middleware`; first-party implementations live in `openshell-supervisor-middleware-builtins`.
 
 The supervisor installs policy and middleware registry changes as one runtime
 generation and preserves the last-known-good generation if preparation fails.
@@ -233,7 +247,12 @@ For AWS endpoints that require request-level signing, the proxy supports SigV4
 re-signing. When `credential_signing: sigv4` is set on an L7 endpoint, the proxy
 strips the client's placeholder-based AWS auth headers, re-signs with real
 credentials from the provider, and forwards the request upstream. The signing
-mode is auto-detected from the client SDK's `x-amz-content-sha256` header:
+endpoint must have a credential source before the policy generation activates:
+an attached endpoint-bearing AWS profile whose boundary covers the endpoint, or
+an attached endpointless AWS profile explicitly named by the endpoint's
+`credential_binding.provider`. Policy activation rejects missing or mismatched
+sources atomically. The signing mode is auto-detected from the client SDK's
+`x-amz-content-sha256` header:
 
 - **Signed body** (hex hash): buffers the request body (up to 10 MiB), computes
   its SHA-256, and includes the hash in the signature. Used by Bedrock and most
@@ -309,6 +328,15 @@ revision it acknowledges, so a successfully constructed initial policy never
 remains `Pending`. If the first poll returns a different revision, the supervisor
 processes it through the normal reload path instead of treating it as already
 loaded.
+
+A newer sandbox-scoped revision can carry the same non-empty effective policy
+hash as the currently loaded revision, for example when provenance changes
+without changing enforcement content. The supervisor acknowledges that newer
+revision without reloading identical policy. If the revision also requires
+middleware or policy-runtime reconciliation, acknowledgement waits until that
+reconciliation succeeds. Global policies, local overrides, equal or older
+versions, and different hashes do not use this shortcut. Success telemetry is
+emitted only after the gateway accepts the resulting loaded-status report.
 
 Policy status delivery uses a FIFO background worker. Retryable delivery
 failures retain the ordered update and retry with capped exponential backoff;

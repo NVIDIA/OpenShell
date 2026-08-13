@@ -12,7 +12,8 @@ AWS SigV4 credential signing lets sandbox agents call AWS services (Bedrock, S3,
 ## Prerequisites
 
 - A provider with `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` credentials configured. Optionally include `AWS_SESSION_TOKEN` for STS temporary credentials.
-- A sandbox policy with `credential_signing` enabled on the target endpoint.
+- An endpointless `aws` provider profile when the sandbox policy defines the service endpoints, or an endpoint-bearing service profile such as `aws-s3`.
+- A sandbox policy with `credential_signing` enabled on the target endpoint. For the endpointless `aws` profile, the endpoint must also set `credential_binding.provider` to the attached provider name.
 
 ## Provider Setup
 
@@ -21,6 +22,7 @@ Create a provider with AWS credentials:
 ```shell
 openshell provider create \
   --name aws-prod \
+  --type aws \
   --credential AWS_ACCESS_KEY_ID=AKIA... \
   --credential AWS_SECRET_ACCESS_KEY=wJalr...
 ```
@@ -30,6 +32,7 @@ For STS temporary credentials, include the session token:
 ```shell
 openshell provider create \
   --name aws-sts \
+  --type aws \
   --credential AWS_ACCESS_KEY_ID=ASIA... \
   --credential AWS_SECRET_ACCESS_KEY=secret... \
   --credential AWS_SESSION_TOKEN=FwoGZX...
@@ -43,10 +46,13 @@ signer reads. See [Manage Providers](/sandboxes/manage-providers#aws-sts).
 
 ## Policy Configuration
 
-Enable SigV4 signing on a per-endpoint basis using three policy fields:
+Enable SigV4 signing on a per-endpoint basis. The binding selects which
+provider instance supplies credentials, while the signing fields control how
+the proxy applies them:
 
 | Field | Type | Required | Description |
 |---|---|---|---|
+| `credential_binding.provider` | string | For endpointless profiles | Exact name of the attached provider instance that supplies AWS credentials. |
 | `credential_signing` | string | Yes | Signing mode: `sigv4`, `sigv4:body`, or `sigv4:no_body`. |
 | `signing_service` | string | Yes | AWS service name for the SigV4 signature (e.g. `bedrock`, `s3`, `sts`). |
 | `signing_region` | string | No | AWS region override. When omitted, extracted from the endpoint hostname. Required for non-standard endpoints. |
@@ -60,6 +66,8 @@ network_policies:
       - host: bedrock-runtime.us-east-1.amazonaws.com
         port: 443
         protocol: rest
+        credential_binding:
+          provider: aws-prod
         credential_signing: sigv4
         signing_service: bedrock
         rules:
@@ -82,6 +90,8 @@ network_policies:
         port: 443
         protocol: rest
         access: full
+        credential_binding:
+          provider: aws-prod
         credential_signing: sigv4
         signing_service: s3
 ```
@@ -96,6 +106,8 @@ network_policies:
         port: 443
         protocol: rest
         access: full
+        credential_binding:
+          provider: aws-prod
         credential_signing: sigv4
         signing_service: sts
 ```
@@ -133,6 +145,8 @@ endpoints:
     port: 443
     protocol: rest
     access: full
+    credential_binding:
+      provider: aws-prod
     credential_signing: sigv4
     signing_service: s3
     signing_region: us-west-2
@@ -141,8 +155,10 @@ endpoints:
 ## Restrictions
 
 - `credential_signing` and `request_body_credential_rewrite` are mutually exclusive on the same endpoint. The policy validator rejects policies that set both.
+- `credential_binding.provider` must name a provider attached to that sandbox. Use it only when the selected provider profile has no endpoints. Endpoint-bearing profiles already define their credential boundary.
+- OpenShell rejects a signed sandbox policy before activation unless the endpoint has a resolvable AWS credential source. An endpoint-bearing profile must declare `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` and cover the signed host, port, and path. An endpointless profile must declare those keys and be selected with `credential_binding.provider` on the signed endpoint.
 - The `sigv4:body` mode buffers at most 10 MiB. Requests with larger bodies are rejected. Use `sigv4:no_body` or `sigv4` (auto-detect) for large payloads.
-- The proxy requires `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` in the provider. If either is missing, the request fails with an error.
+- The active provider must contain current `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` values. If either becomes unavailable after policy activation, the request fails closed.
 
 ## Use from a Sandbox
 

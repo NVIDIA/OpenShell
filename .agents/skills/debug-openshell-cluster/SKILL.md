@@ -208,9 +208,13 @@ Common findings:
   host's IPv4 default route. Rootless pasta uses the private source address
   selected by that route; rootful Podman uses the bridge gateway address.
 - Callback discovery reports that the requested address equals the primary
-  listener: configure a distinct primary address. For Podman Machine, keep the
-  IPv4 loopback callback separate by using an IPv6-loopback primary such as
-  `[::1]:17670`.
+  listener: configure a distinct primary address. For Podman Machine, bind the
+  primary listener to IPv6 loopback, for example
+  `bind_address = "[::1]:17670"`, and register the CLI endpoint as
+  `https://localhost:17670`. The generated certificate includes `localhost`,
+  while a raw `https://[::1]:17670` endpoint can fail TLS setup with
+  `invalid dns name`. This leaves `127.0.0.1:17670` available for the
+  callback-only listener.
 - Rootless slirp4netns, another named helper, or missing helper metadata
   requires an explicitly remote `grpc_endpoint`. An explicit `host_gateway_ip`
   cannot bypass slirp4netns host-loopback isolation. Do not work around
@@ -232,6 +236,9 @@ Use the log and rollout commands for the workload kind that exists in the
 release. Look for failed installs, unexpected values, missing namespace, wrong
 image tag, TLS settings that do not match the registered endpoint, and
 scheduling failures.
+
+`server.telemetryEnabled` renders `OPENSHELL_TELEMETRY_ENABLED` on the gateway
+pod, and the gateway propagates the effective value to sandbox supervisors.
 
 When no external credential driver is enabled, the Helm chart uses the
 gateway's default encrypted database credential storage. The chart creates a

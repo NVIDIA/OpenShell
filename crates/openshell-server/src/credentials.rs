@@ -1606,6 +1606,14 @@ mod tests {
         toml::from_str(toml).expect("driver table TOML")
     }
 
+    fn test_absolute_path(file_name: &str) -> PathBuf {
+        std::env::temp_dir().join(file_name)
+    }
+
+    fn toml_path(path: &Path) -> String {
+        toml::Value::String(path.display().to_string()).to_string()
+    }
+
     #[test]
     fn builtin_credential_driver_kind_resolves_known_names() {
         assert_eq!(
@@ -1879,15 +1887,15 @@ backend_specific = "ignored-by-gateway"
         let token_file = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(token_file.path(), "dev-token").unwrap();
         let config = Config::new(None).with_credential_drivers(["vault"]);
+        let token_path = toml_path(token_file.path());
         let file = config_file(&format!(
             r#"
 [openshell.credential_drivers.vault]
 transport = "in_tree"
 address = "http://127.0.0.1:8200"
 auth_method = "token_file"
-token_path = "{}"
+token_path = {token_path}
 "#,
-            token_file.path().display()
         ));
         let runtime = CredentialRuntime::from_config_file(&config, Some(&file))
             .await
@@ -1902,12 +1910,12 @@ token_path = "{}"
         let key_encryption_key_path = storage.path().join("key-encryption-key.bin");
         let store = Arc::new(crate::persistence::test_store().await);
         let config = Config::new(None);
+        let key_encryption_key_path_toml = toml_path(&key_encryption_key_path);
         let file = config_file(&format!(
-            r#"
+            r"
 [openshell.gateway.credential_storage]
-key_encryption_key_path = "{}"
-"#,
-            key_encryption_key_path.display()
+key_encryption_key_path = {key_encryption_key_path_toml}
+",
         ));
         let runtime = CredentialRuntime::from_config_file_with_store(
             &config,
@@ -2054,45 +2062,43 @@ transport = "tcp"
 
     #[test]
     fn parse_uds_driver_launch_settings() {
+        let socket_path = test_absolute_path("openshell-enterprise-secrets.sock");
+        let command = test_absolute_path("openshell-credential-driver-enterprise-secrets");
+        let socket_path_toml = toml_path(&socket_path);
+        let command_toml = toml_path(&command);
         let parsed = parse_driver_table(
             "enterprise-secrets",
-            &driver_table(
+            &driver_table(&format!(
                 r#"
 transport = "uds"
-socket_path = "/tmp/openshell-enterprise-secrets.sock"
-command = "/usr/local/libexec/openshell-credential-driver-enterprise-secrets"
+socket_path = {socket_path_toml}
+command = {command_toml}
 args = ["--profile", "dev"]
 startup_timeout_secs = 3
 "#,
-            ),
+            )),
         )
         .unwrap();
 
         assert_eq!(parsed.transport, CredentialDriverTransport::Uds);
-        assert_eq!(
-            parsed.socket_path.as_deref(),
-            Some(Path::new("/tmp/openshell-enterprise-secrets.sock"))
-        );
-        assert_eq!(
-            parsed.command.as_deref(),
-            Some(Path::new(
-                "/usr/local/libexec/openshell-credential-driver-enterprise-secrets"
-            ))
-        );
+        assert_eq!(parsed.socket_path.as_deref(), Some(socket_path.as_path()));
+        assert_eq!(parsed.command.as_deref(), Some(command.as_path()));
         assert_eq!(parsed.args, ["--profile", "dev"]);
         assert_eq!(parsed.startup_timeout_secs, 3);
     }
 
     #[test]
     fn parse_uds_driver_defaults_to_connect_only() {
+        let socket_path = test_absolute_path("openshell-enterprise-secrets.sock");
+        let socket_path_toml = toml_path(&socket_path);
         let parsed = parse_driver_table(
             "enterprise-secrets",
-            &driver_table(
+            &driver_table(&format!(
                 r#"
 transport = "uds"
-socket_path = "/tmp/openshell-enterprise-secrets.sock"
+socket_path = {socket_path_toml}
 "#,
-            ),
+            )),
         )
         .unwrap();
 
@@ -2156,15 +2162,16 @@ allow_reference_namespace = true
 
     #[test]
     fn parse_uds_driver_rejects_relative_command() {
+        let socket_path_toml = toml_path(&test_absolute_path("openshell-enterprise-secrets.sock"));
         let err = parse_driver_table(
             "enterprise-secrets",
-            &driver_table(
+            &driver_table(&format!(
                 r#"
 transport = "uds"
-socket_path = "/tmp/openshell-enterprise-secrets.sock"
+socket_path = {socket_path_toml}
 command = "openshell-credential-driver-enterprise-secrets"
 "#,
-            ),
+            )),
         )
         .unwrap_err();
 
@@ -2173,15 +2180,16 @@ command = "openshell-credential-driver-enterprise-secrets"
 
     #[test]
     fn parse_uds_driver_rejects_args_without_command() {
+        let socket_path_toml = toml_path(&test_absolute_path("openshell-enterprise-secrets.sock"));
         let err = parse_driver_table(
             "enterprise-secrets",
-            &driver_table(
+            &driver_table(&format!(
                 r#"
 transport = "uds"
-socket_path = "/tmp/openshell-enterprise-secrets.sock"
+socket_path = {socket_path_toml}
 args = ["--profile", "dev"]
 "#,
-            ),
+            )),
         )
         .unwrap_err();
 
@@ -2190,15 +2198,16 @@ args = ["--profile", "dev"]
 
     #[test]
     fn parse_uds_driver_rejects_timeout_without_command() {
+        let socket_path_toml = toml_path(&test_absolute_path("openshell-enterprise-secrets.sock"));
         let err = parse_driver_table(
             "enterprise-secrets",
-            &driver_table(
+            &driver_table(&format!(
                 r#"
 transport = "uds"
-socket_path = "/tmp/openshell-enterprise-secrets.sock"
+socket_path = {socket_path_toml}
 startup_timeout_secs = 3
 "#,
-            ),
+            )),
         )
         .unwrap_err();
 

@@ -81,6 +81,14 @@ with the sandbox's ephemeral CA and inspect method/path or protocol-specific
 metadata before forwarding. The proxy also supports credential injection on
 terminated HTTP streams when policy allows the endpoint.
 
+Static provider credentials have an independent endpoint-binding boundary.
+Provider profile endpoints define that boundary by default. An endpointless
+profile can delegate binding authority to sandbox policy through an endpoint
+that names the concrete attached provider instance. The gateway rejects
+unattached, profileless, endpointful, and gateway-global uses of that policy
+binding. Policy endpoint changes rotate the provider-environment revision so
+the supervisor installs policy and credential binding snapshots atomically.
+
 Raw streams and long-lived response bodies are connection scoped. Policy
 generation changes close relays pinned to the previous generation instead of
 allowing them to continue under stale authorization. HTTP upgrades switch to

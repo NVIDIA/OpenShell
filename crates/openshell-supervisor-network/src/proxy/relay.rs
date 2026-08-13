@@ -40,11 +40,19 @@ pub(super) struct RelayContext<'a> {
 /// Build the request-processing context shared by CONNECT and forward HTTP.
 pub(super) fn http_context(
     decision: &EgressDecision,
+    provider_credentials: Option<openshell_core::provider_credentials::ProviderCredentialState>,
     secret_resolver: Option<Arc<SecretResolver>>,
     activity_tx: Option<ActivitySender>,
     dynamic_credentials: Option<DynamicCredentials>,
     agent_proposals: openshell_core::proposals::AgentProposals,
 ) -> L7EvalContext {
+    // Provider-backed credentials must be acquired from the live state for
+    // each request after middleware/token-grant awaits. Keep only the legacy
+    // resolver fallback when no live provider state exists.
+    let secret_resolver = provider_credentials
+        .is_none()
+        .then_some(secret_resolver)
+        .flatten();
     let policy_name = match &decision.action {
         NetworkAction::Allow { matched_policy } => matched_policy.clone().unwrap_or_default(),
         NetworkAction::Deny { .. } => String::new(),
@@ -53,6 +61,7 @@ pub(super) fn http_context(
     L7EvalContext {
         host: decision.intent.destination.host.clone(),
         port: decision.intent.destination.port,
+        request_default_port: None,
         policy_name,
         binary_path: decision
             .binary
@@ -70,6 +79,8 @@ pub(super) fn http_context(
             .map(|path| path.to_string_lossy().into_owned())
             .collect(),
         secret_resolver,
+        provider_credentials,
+        provider_credential_revision: None,
         activity_tx,
         dynamic_credentials: dynamic_credentials.clone(),
         token_grant_resolver: dynamic_credentials
@@ -333,11 +344,14 @@ mod tests {
         L7EvalContext {
             host: "example.com".to_string(),
             port: 80,
+            request_default_port: Some(80),
             policy_name: "test".to_string(),
             binary_path: String::new(),
             ancestors: vec![],
             cmdline_paths: vec![],
             secret_resolver: None,
+            provider_credentials: None,
+            provider_credential_revision: None,
             activity_tx: None,
             dynamic_credentials: None,
             token_grant_resolver: None,

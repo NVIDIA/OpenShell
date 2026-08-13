@@ -6,6 +6,7 @@
 ["rust:check"]
 description = "Check all Rust crates for errors"
 run = "cargo check --workspace"
+run_windows = "powershell -NoProfile -ExecutionPolicy Bypass -File tasks/scripts/windows-msvc.ps1 check native"
 hide = true
 
 ["rust:lint"]
@@ -14,6 +15,7 @@ run = [
   "cargo clippy --workspace --all-targets -- -D warnings",
   "cargo clippy --manifest-path e2e/rust/Cargo.toml --all-targets -- -D warnings",
 ]
+run_windows = "powershell -NoProfile -ExecutionPolicy Bypass -File tasks/scripts/windows-msvc.ps1 lint native"
 hide = true
 
 ["rust:format"]

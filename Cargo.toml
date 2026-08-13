@@ -102,7 +102,7 @@ base64 = "0.22"
 # Crypto / Auth
 sha2 = "0.10"
 rand = "0.9"
-jsonwebtoken = "9"
+jsonwebtoken = { version = "10", features = ["aws_lc_rs"] }
 getrandom = "0.3"
 ring = "0.17"
 spiffe = { version = "0.15", default-features = false, features = ["workload-api-jwt", "tracing"] }
@@ -118,7 +118,7 @@ futures = "0.3"
 bytes = "1"
 pin-project-lite = "0.2"
 tokio-stream = "0.1"
-protobuf-src = "1.1.0"
+protoc-bin-vendored = "3.2.0"
 url = "2"
 indexmap = "2"
 

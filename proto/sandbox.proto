@@ -93,6 +93,13 @@ message MiddlewareEndpointSelector {
   repeated string exclude = 2;
 }
 
+// Binds a policy endpoint to static credentials from a sandbox provider.
+message NetworkCredentialBinding {
+  // Name of the provider attached to this sandbox whose static credentials
+  // may be resolved for requests admitted by this endpoint.
+  string provider = 1;
+}
+
 // A network endpoint (host + port) with optional L7 inspection config.
 message NetworkEndpoint {
   // Hostname or host glob pattern. Exact match is case-insensitive.
@@ -175,6 +182,10 @@ message NetworkEndpoint {
   uint32 json_rpc_max_body_bytes = 22;
   // MCP-only policy and inspection options. Only used when protocol is "mcp".
   McpOptions mcp = 23;
+  // Explicit binding authority for static credentials from an attached
+  // endpointless provider profile. Profiles that already define endpoints
+  // continue to use those profile endpoints as their credential boundary.
+  NetworkCredentialBinding credential_binding = 24;
 }
 
 // MCP options are grouped so MCP-specific policy can grow without adding more

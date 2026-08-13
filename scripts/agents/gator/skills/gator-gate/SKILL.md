@@ -66,13 +66,13 @@ All comments posted by this skill must begin with this marker:
 > **gator-agent**
 ```
 
-Use one canonical gator disposition per issue or PR head SHA for baseline state summaries. A disposition may be one issue comment or one submitted GitHub review. A submitted review, including its summary body and every inline comment in its `comments` array, counts as one disposition for the head SHA; do not count its inline comments separately.
+Use one canonical gator disposition per issue or PR head SHA for baseline review and status summaries. A disposition may be one issue comment or one submitted GitHub review. A submitted review, including its summary body and every inline comment in its `comments` array, counts as one disposition for the head SHA; do not count its inline comments separately. A rate-limited TTL state nudge is not a disposition: it may be posted on an unchanged SHA to request the already-known next human action, but never to restate findings, report CI, or re-review.
 
 For a PR review with any actionable line-specific finding that can be anchored to the current diff, use one batched GitHub review rather than an issue comment or standalone inline-comment requests. Begin the review summary and every inline comment body with the gator marker. Include the head SHA in the review summary so the wrapper can enforce the one-disposition rule. Do not post line comments individually through `POST /pulls/<pr>/comments`; a partially submitted set is not an acceptable baseline disposition.
 
 Edit a canonical issue comment only for housekeeping updates that do not respond to new human activity. GitHub reviews and their inline comments are immutable after submission; correct them only through a new-head review or an explicit same-SHA maintainer override.
 
-When gator is continuing a conversation after a human comment, review, or requested change, post a new marked comment only if the PR head SHA changed or no marked gator comment/review exists for the current head SHA. If a marked gator comment or PR review already exists for the current head SHA, do not post another public comment; record the state in the supervised result sentinel and wait for a new commit, maintainer override, merge, or closure.
+When gator is continuing a conversation after a human comment, review, or requested change, post a new marked disposition only if the PR head SHA changed or no marked gator disposition exists for the current head SHA. If a marked gator comment or PR review already exists for the current head SHA, do not post another public disposition; record the state in the supervised result sentinel and wait for a new commit, maintainer override, merge, or closure. The sole exception is a state-specific TTL nudge that is due under the watch rules.
 
 ## Human Comment Disposition
 
@@ -112,11 +112,11 @@ state, resolver, stable finding IDs, and review-head context:
 review-feedback-ledger NVIDIA OpenShell <pr-number> \
   > /tmp/gator-review-feedback-ledger.json
 jq -e '
-  .schema_version == 3 and
+  .schema_version == 4 and
   (.dispositions | type == "array") and
   (.threads | type == "array") and
   (.review_scope.mode |
-    IN("initial", "follow_up", "already_reviewed", "human_checkpoint"))
+    IN("initial", "follow_up", "already_reviewed", "critical_only"))
 ' \
   /tmp/gator-review-feedback-ledger.json >/dev/null
 ```
@@ -127,7 +127,7 @@ Treat the ledger as required reviewer input, not optional background:
 - Treat `review_scope.mode` and `previous_reviewed_sha` as authoritative. Use
   `initial` for a complete PR review, `follow_up` for an unresolved-feedback
   plus `<previous_reviewed_sha>..HEAD` delta review, and `already_reviewed` to
-  suppress another reviewer run. Use `human_checkpoint` after three
+  suppress another reviewer run. Use `critical_only` after three
   finding-bearing rounds as described below.
 - Use `current_patch_id`, `previous_reviewed_patch_id`, base SHA, and merge-base
   SHA to preserve review identity across rebases and merge-main commits. If
@@ -613,22 +613,45 @@ Keep reviews proportional, scope-bound, and convergent:
 
 ### Convergence and scope-growth checkpoint
 
-After three finding-bearing rounds, stop posting new Warnings. Set
-`review_scope.mode` to `human_checkpoint`, summarize the existing root causes,
-duplicate or waived history, remediation-driven scope growth, and remaining
-obligations, then ask a maintainer to choose one of: accept the current scope,
-split follow-up work, waive an obligation, or explicitly authorize another
-autonomous review round. Move to `gator:blocked` with reason
-`review_convergence_checkpoint` while waiting.
+After three finding-bearing rounds, the autonomous Warning budget is
+exhausted. Set `review_scope.mode` to `critical_only`, stop posting new
+Warnings, and inspect the latest author-only delta solely for a newly introduced
+Critical security, data-loss, or correctness defect. Review-budget exhaustion
+alone is not a process blocker and must not prevent required tests from
+starting.
 
-Only a new Critical security, data-loss, or correctness defect introduced by
-the latest author delta bypasses this checkpoint. Post that Critical with its
-complete evidence contract, then return to the checkpoint; do not add Warnings.
+After the critical-only review, separately determine whether a maintainer
+decision is actually required. Set `maintainer_decision_required` in the
+internal cycle summary to true only when at least one of these applies:
 
-Trigger the same checkpoint before another autonomous review when remediation
-introduces a new subsystem, crosses a linked issue or RFC non-goal, or expands
-the public configuration or policy surface. Do not let review feedback silently
-turn a focused PR into an architecture project.
+- A prior finding remains unresolved and unwaived.
+- Remediation introduced scope growth that crosses a linked issue or RFC
+  non-goal, adds a new subsystem, or expands the public configuration or policy
+  surface.
+- Gator has a specific proposed Warning that it may post only if a maintainer
+  explicitly authorizes another autonomous Warning-bearing round.
+
+When a maintainer decision is required, summarize the relevant root causes,
+dispositions, and scope growth; request only the concrete choice that is still
+needed; and move to `gator:blocked` with reason
+`review_convergence_decision_required`. Do not present generic choices that do
+not apply to the PR.
+
+When all prior findings are resolved or waived, no qualifying scope growth
+exists, and no new Critical was found, set `maintainer_decision_required` to
+false and continue directly to the E2E/test-label decision. Move to
+`gator:watch-pipeline` only after the required workflows are confirmed queued,
+running, or complete. Do not move to `gator:approval-needed` until every
+required check is green.
+
+A newly introduced Critical does not require a convergence decision. Post the
+Critical with its complete evidence contract and keep the PR in
+`gator:in-review`; do not add Warnings.
+
+Require the same concrete maintainer decision before another autonomous review
+when remediation introduces a new subsystem, crosses a linked issue or RFC
+non-goal, or expands the public configuration or policy surface. Do not let
+review feedback silently turn a focused PR into an architecture project.
 
 For security-sensitive state machines, construct one remediation matrix before
 requesting another fix. Cover the applicable protocol adapters, identity
@@ -654,12 +677,13 @@ Do not post them as author criticism.
 
 Before running the reviewer or posting any marked gator comment/review, build
 and validate the feedback ledger. If its review mode is `already_reviewed`, do
-not run the reviewer. If its mode is `human_checkpoint`, follow the checkpoint
+not run the reviewer. If its mode is `critical_only`, follow the review-budget
 rules above. Also check whether gator has already posted for the
 current PR head SHA. Search existing issue comments and PR reviews for the gator
 marker and either `Head SHA: <sha>`, `Head SHA: `<sha>``, or the current
 `headRefOid` anywhere in the body. Gator may post at most one marked public
-disposition for a given head SHA.
+disposition for a given head SHA. A state-specific TTL nudge is separately
+rate-limited and is not a disposition.
 
 The `gh` write wrapper independently re-reads the current head, issue comments,
 and reviews immediately before a marked POST. It fails closed when any lookup
@@ -668,15 +692,15 @@ Gator payload version. Do not bypass guard exits 21 or 22. Return a transient
 `gator_write_guard_failed` result and investigate stale payload or GitHub
 transport state instead.
 
-If the current head SHA already has a marked gator comment or PR review:
+If the current head SHA already has a marked gator disposition:
 
 - Do not run the reviewer sub-agent again for that SHA.
 - Do not post another marked issue comment, `PR Review Status`, `Re-check After ... Update`, CI update, duplicate findings summary, or PR review for that SHA.
 - Reuse the latest gator disposition for that SHA internally to decide whether the PR is still waiting on author action, ready for pipeline watch, or blocked.
-- For any same-SHA status update, including CI completion, failed checks, human replies, label changes, or maintainer/reviewer comments, do not post a public comment. Record the next state only in the supervised result sentinel.
-- Do not post author, maintainer, or blocker nudges for the same SHA. Wait for a new commit, merge, closure, or explicit maintainer override.
+- For any same-SHA status update, including CI completion, failed checks, human replies, label changes, or maintainer/reviewer comments, do not post a public status comment. Record the next state only in the supervised result sentinel.
+- Do post a state-specific TTL nudge when it is due under the watch rules, even on the same SHA. Use only the nudge templates below, name the responsible actor and outstanding action, and respect the 48-business-hour limit for the same state and actor. A nudge neither authorizes another reviewer run nor consumes, replaces, or alters the existing disposition.
 
-Only run a fresh review or post another marked public disposition when the PR head SHA changes, a maintainer explicitly asks gator to re-review or publicly respond on the same SHA, the PR reaches terminal merged/closed cleanup, or the earlier gator attempt failed before posting any marked disposition. A prior marked comment that only says the reviewer sub-agent failed before producing review output is a legacy infrastructure-failure report, not a valid current-head review disposition; ignore it for same-SHA review suppression and run the reviewer again. A prior marked `## Blocked` comment whose only blocker was that the PR was draft is also not a valid code-review disposition after the PR becomes ready for review; ignore it for same-SHA review suppression and run the reviewer once.
+Only run a fresh review or post another marked public disposition when the PR head SHA changes, a maintainer explicitly asks gator to re-review or publicly respond on the same SHA, the PR reaches terminal merged/closed cleanup, or the earlier gator attempt failed before posting any marked disposition. State-specific TTL nudges remain allowed on an unchanged SHA as described above. A prior marked comment that only says the reviewer sub-agent failed before producing review output is a legacy infrastructure-failure report, not a valid current-head review disposition; ignore it for same-SHA review suppression and run the reviewer again. A prior marked `## Blocked` comment whose only blocker was that the PR was draft is also not a valid code-review disposition after the PR becomes ready for review; ignore it for same-SHA review suppression and run the reviewer once.
 
 For PRs authored by `dependabot[bot]`, the primary gator responsibility is dependency-update validation, not normal feature review. Do a quick sanity check for suspicious changes outside expected dependency manifests or lockfiles, then ensure the full required test suite runs, including E2E, and watch for breakages caused by the update.
 
@@ -688,9 +712,9 @@ Use the `principal-engineer-reviewer` sub-agent. Include:
 - For `follow_up` mode, unresolved feedback plus the diff and affected-file
   context for `<previous_reviewed_sha>..HEAD`; include older code only when
   needed to understand that delta
-- For `human_checkpoint` mode, the latest author-only delta and explicit
+- For `critical_only` mode, the latest author-only delta and explicit
   instruction to return only newly introduced Critical defects; the main Gator
-  process, not the reviewer, produces the root-cause and scope-growth summary
+  process, not the reviewer, determines whether a maintainer decision is needed
 - An explicit instruction to carry open findings without duplicating them and
   to honor trusted resolved and waived findings across head SHAs
 - An explicit instruction to apply the pragmatic review calibration above
@@ -784,7 +808,8 @@ other dispositions without duplicating them. If the author replied without
 pushing a new commit, do not re-review, repost findings, or post a same-SHA
 disposition; inspect the response internally and wait for a new commit or
 maintainer override. If CI changes state without a new commit, do not post a
-same-SHA CI update.
+same-SHA CI update. A due TTL author nudge remains allowed when the unresolved
+feedback still requires an author action.
 
 If review feedback is waiting on the PR author for more than 48 business hours, post a single author nudge. Use the latest of these timestamps as the TTL start:
 
@@ -826,6 +851,20 @@ If a mirror is missing or stale and you have maintainer authority, post:
 The `/ok to test <sha>` comment must contain only that command. Do not include the `> **gator-agent**` marker, explanations, Markdown fences, or any other text in the same comment.
 
 If you do not have maintainer authority, move to `gator:blocked` and state that a maintainer must post `/ok to test <sha>`.
+
+Do not treat a test label or `/ok to test` comment as proof that testing
+started. Confirm that every required workflow has a check or run for the
+current head in `queued`, `in_progress`, or `completed` state before applying
+`gator:watch-pipeline`. If the E2E Label Help bot says **Re-run all jobs** is
+required:
+
+- If the operator explicitly authorized workflow reruns, identify the relevant
+  current-head run and rerun it with `gh run rerun <run-id>`, then verify that a
+  new attempt was queued before moving to `gator:watch-pipeline`.
+- If workflow reruns were not authorized or no rerunnable current-head run can
+  be identified, move to `gator:blocked` with reason
+  `test_dispatch_required` and state the exact maintainer action. Do not claim
+  that CI monitoring is active.
 
 ## Step 10: Pipeline Watch Loop
 
@@ -953,8 +992,10 @@ Base SHA: `<sha>`
 Merge base SHA: `<sha>`
 Patch ID: `<stable patch id>`
 Gator payload: `<payload version>`
-Review mode: `<initial|follow_up|human_checkpoint>`
+Review mode: `<initial|follow_up|critical_only>`
 Previous reviewed SHA: `<sha or none>`
+Review budget exhausted: `<yes|no>`
+Maintainer decision required: `<yes|no — concrete reason when yes>`
 
 Blocking findings:
 - `<finding-id>`: <finding or "No blocking findings remain">
@@ -970,12 +1011,12 @@ Docs: <Fern docs updated / not needed because ... / missing for direct UX change
 Next state: `<gator:in-review|gator:watch-pipeline|gator:follow-up-needed|gator:blocked>`
 ```
 
-### Review Convergence Checkpoint
+### Maintainer Convergence Decision
 
 ```markdown
 > **gator-agent**
 
-## Review Convergence Checkpoint
+## Maintainer Convergence Decision
 
 Head SHA: `<sha>`
 Base SHA: `<sha>`
@@ -983,7 +1024,8 @@ Merge base SHA: `<sha>`
 Patch ID: `<stable patch id>`
 Gator payload: `<payload version>`
 
-Three finding-bearing review rounds have completed.
+The autonomous Warning budget is exhausted, and a specific maintainer decision
+is required before review can proceed.
 
 Root-cause findings:
 - `<finding-id>`: <invariant and current disposition>
@@ -994,10 +1036,11 @@ Scope growth:
 Reviewer-quality signals:
 - <duplicate, waived re-raise, unchanged-code proposal, or "None">
 
-Maintainer action: accept the current scope, split follow-up work, waive a
-finding, or explicitly authorize another autonomous review round.
+Maintainer action: <state only the applicable choice, affected finding or scope
+boundary, and exact next action>
 
 Next state: `gator:blocked`
+Blocked reason: `review_convergence_decision_required`
 ```
 
 ### Human Response Disposition
