@@ -405,11 +405,20 @@ function Invoke-VsCargo {
     $targetArch = Get-VsTargetArch $RustTarget
     $hostArch = Get-HostArch
     $logPath = Join-Path $LogDir $LogName
+    $rustcWrapper = ""
+    if (-not [string]::IsNullOrWhiteSpace($env:RUSTC_WRAPPER)) {
+        $wrapperCommand = Get-Command $env:RUSTC_WRAPPER -ErrorAction SilentlyContinue
+        if ($wrapperCommand) {
+            $rustcWrapper = $wrapperCommand.Source
+        } else {
+            Write-Warning "RUSTC_WRAPPER '$env:RUSTC_WRAPPER' was not found; continuing without it."
+        }
+    }
     $environmentSetup = @(
         "set `"CARGO_TARGET_DIR=$TargetDir`"",
         "set `"CARGO_BUILD_JOBS=$WindowsBuildJobs`"",
         "set `"CARGO_INCREMENTAL=0`"",
-        "set `"RUSTC_WRAPPER=`""
+        "set `"RUSTC_WRAPPER=$rustcWrapper`""
     )
     if ($hostArch -eq "amd64" -and $RustTarget -eq "aarch64-pc-windows-msvc") {
         # Native ARM64 dependencies select their own compilers. Clear inherited

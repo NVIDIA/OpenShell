@@ -135,7 +135,7 @@ from this skill.
 | `Z3_SYS_Z3_HEADER` | unset | Full `z3.h` path required with a system Z3 library. |
 | `Z3_SYS_Z3_VERSION` | `4.16.0` | Pinned official prebuilt Z3 release selected by the wrapper. |
 | `READ_ONLY_GITHUB_TOKEN` | unset | Optional token for the Z3 release lookup; GitHub Actions supplies `github.token`. |
-| `RUSTC_WRAPPER` | cleared by wrapper | The wrapper clears inherited values because `--skip-tools` does not provision `sccache`. |
+| `RUSTC_WRAPPER` | inherited | The wrapper resolves an available command to an absolute path. If it is unavailable, the wrapper warns and continues without compiler caching. |
 
 Legacy fork variables such as `OPENSHELL_UPSTREAM`,
 `OPENSHELL_MXC_FORK_DIR`, and `OPENSHELL_MXC_FORK_BRANCH` are no longer part
@@ -188,10 +188,11 @@ order:
 6. Focused unsupported-driver contract tests.
 7. Artifact reporting.
 
-The GitHub Actions jobs use architecture-specific `Swatinem/rust-cache`
-entries for the Cargo registry and dependency target artifacts. Failed runs
-also save their usable dependency artifacts. The workflow remains manually
-dispatched until cache-hit runtimes justify restoring automatic triggers.
+The GitHub Actions jobs layer architecture-specific `Swatinem/rust-cache`
+entries for Cargo registry and dependency target artifacts with sccache's GHA
+backend for cacheable Rust compiler outputs. Failed runs also save their usable
+dependency artifacts. The workflow remains manually dispatched until cache-hit
+runtimes justify restoring automatic triggers.
 
 The ARM64 check/build steps in this x64-host contract are cross-builds. The
 wrapper discovers and adds host-native LLVM and Ninja to `PATH`, requires the
@@ -206,7 +207,8 @@ commands above on an ARM64 host.
 
 The repository-wide `mise run pre-commit` task is also supported on Windows.
 Its Rust check, Clippy, and test dependencies enter the same MSVC environment
-for the native host target and clear inherited `RUSTC_WRAPPER`. Linux glibc
+for the native host target and use an inherited compiler wrapper when it is
+available. Linux glibc
 installer tests and Linux service/RPM packaging-asset tests skip explicitly;
 the Linux build-environment shell-helper test also skips; cross-platform checks
 continue to run. The blocking Windows Clippy pass excludes unsupported
