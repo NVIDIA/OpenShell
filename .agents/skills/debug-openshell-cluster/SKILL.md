@@ -498,7 +498,11 @@ cluster actually invokes chained CNI plugins for the sandbox runtime class.
 The CNI installer is a **cluster singleton** with a fixed identity
 (`openshell-cni`). It is not necessarily in the release you are debugging — the
 owner is the release with `cni.enabled=true`; other gateway releases set
-`cni.external=true` and reuse it. Locate the owner and its resources cluster-wide:
+`cni.external=true` and reuse it. The owner may also be a dedicated CNI-only
+release installed with `cni.only=true` (renders just the DaemonSet + RBAC + SCC,
+often in its own namespace), in which case every gateway is `cni.external=true`.
+Either way, locate the DaemonSet and its resources cluster-wide, not just in the
+gateway's namespace:
 
 ```bash
 kubectl get daemonset -A -l app.kubernetes.io/name=openshell-cni

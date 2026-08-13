@@ -370,7 +370,12 @@ release-independent name, the plugin config carries a fixed `openshell` owner, a
 a `configVersion` (over the aggregated allowlist and config) binds readiness so a
 stale-version entry is repaired before the node is re-marked ready. Install the
 singleton (`cni.enabled=true`) in one release per cluster; additional releases set
-`cni.enabled=false` + `cni.external=true`. The installer treats any `openshell-cni`
+`cni.enabled=false` + `cni.external=true`. To decouple node enforcement from any
+gateway's lifecycle — the recommended layout for multi-gateway clusters — install
+the singleton as its own release with `cni.only=true`, which renders only the
+DaemonSet, its RBAC, and (on OpenShift) its SCC, and run every gateway as
+`cni.external=true`; uninstalling a gateway then never strips enforcement. The
+installer treats any `openshell-cni`
 chained entry as its own and upgrades it in place (the conflist patch preserves
 all other plugins). The `pods get` and `configmaps list` grants are cluster-scoped
 so the one installer can discover marker ConfigMaps and read sandbox pods in any
