@@ -31,6 +31,11 @@ rules:
   - apiGroups: [""]
     resources: ["secrets"]
     verbs: ["get", "create"]
+  {{- if .Values.grpcRoute.backendTLSPolicy.enabled }}
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "create"]
+  {{- end }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
@@ -112,6 +117,12 @@ spec:
             {{- end }}
             {{- range .Values.pkiInitJob.serverIpAddresses }}
             - --server-san={{ . }}
+            {{- end }}
+            {{- end }}
+            {{- if .Values.grpcRoute.backendTLSPolicy.enabled }}
+            - --backend-ca-configmap-name={{ include "openshell.backendCaConfigMapName" . }}
+            {{- if .Values.certManager.enabled }}
+            - --backend-ca-source-secret={{ .Values.server.tls.certSecretName }}
             {{- end }}
             {{- end }}
 {{- end }}

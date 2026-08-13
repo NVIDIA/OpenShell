@@ -24,7 +24,7 @@
 
 use clap::Args;
 use k8s_openapi::ByteString;
-use k8s_openapi::api::core::v1::Secret;
+use k8s_openapi::api::core::v1::{ConfigMap, Secret};
 use kube::Client;
 use kube::api::{Api, ObjectMeta, PostParams};
 use miette::{IntoDiagnostic, Result, WrapErr};
@@ -78,6 +78,20 @@ pub struct CertgenArgs {
     /// For local debugging.
     #[arg(long)]
     dry_run: bool,
+
+    /// Name of a ConfigMap to create containing the CA certificate (key: ca.crt)
+    /// for BackendTLSPolicy backend validation. In full PKI mode, the CA comes
+    /// from the generated bundle. In --jwt-only mode, the CA is read from
+    /// --backend-ca-source-secret.
+    #[arg(long, value_name = "NAME")]
+    backend_ca_configmap_name: Option<String>,
+
+    /// Name of an existing Secret containing a ca.crt key to populate the
+    /// backend CA ConfigMap from. Required with --jwt-only when
+    /// --backend-ca-configmap-name is set (typically the server TLS Secret
+    /// created by cert-manager).
+    #[arg(long, value_name = "NAME", requires = "backend_ca_configmap_name")]
+    backend_ca_source_secret: Option<String>,
 }
 
 pub async fn run(args: CertgenArgs) -> Result<()> {
@@ -97,7 +111,13 @@ pub async fn run(args: CertgenArgs) -> Result<()> {
         run_local(dir, &args.server_sans)
     } else {
         let bundle = generate_pki(&args.server_sans)?;
-        run_kubernetes(&args, &bundle).await
+        run_kubernetes(&args, &bundle).await?;
+
+        if let Some(ref cm_name) = args.backend_ca_configmap_name {
+            create_backend_ca_configmap_if_needed(&args, &bundle, cm_name).await?;
+        }
+
+        Ok(())
     }
 }
 
@@ -290,6 +310,97 @@ async fn create_tls_secrets(
         .await
         .into_diagnostic()
         .wrap_err_with(|| format!("failed to create secret {client_name}"))?;
+    Ok(())
+}
+
+async fn create_backend_ca_configmap_if_needed(
+    args: &CertgenArgs,
+    bundle: &PkiBundle,
+    configmap_name: &str,
+) -> Result<()> {
+    let namespace = args
+        .namespace
+        .as_deref()
+        .ok_or_else(|| miette::miette!("--namespace is required (or set POD_NAMESPACE)"))?;
+
+    let client = Client::try_default()
+        .await
+        .into_diagnostic()
+        .wrap_err("failed to construct Kubernetes client for backend CA ConfigMap")?;
+    let api: Api<ConfigMap> = Api::namespaced(client.clone(), namespace);
+
+    if api
+        .get_opt(configmap_name)
+        .await
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed to read configmap {configmap_name}"))?
+        .is_some()
+    {
+        info!(
+            namespace = %namespace,
+            configmap = %configmap_name,
+            "Backend CA ConfigMap already exists, skipping."
+        );
+        return Ok(());
+    }
+
+    let ca_pem = if !args.jwt_only {
+        bundle.ca_cert_pem.clone()
+    } else if let Some(source_secret) = &args.backend_ca_source_secret {
+        let secret_api: Api<Secret> = Api::namespaced(client, namespace);
+        match secret_api
+            .get_opt(source_secret)
+            .await
+            .into_diagnostic()
+            .wrap_err_with(|| format!("failed to read secret {source_secret}"))?
+        {
+            Some(secret) => {
+                let data = secret.data.ok_or_else(|| {
+                    miette::miette!("secret {source_secret} has no data")
+                })?;
+                let ca = data.get("ca.crt").ok_or_else(|| {
+                    miette::miette!("secret {source_secret} has no ca.crt key")
+                })?;
+                String::from_utf8(ca.0.clone())
+                    .into_diagnostic()
+                    .wrap_err("ca.crt is not valid UTF-8")?
+            }
+            None => {
+                warn!(
+                    secret = %source_secret,
+                    configmap = %configmap_name,
+                    "Backend CA source secret not found; ConfigMap not created. \
+                     Create it manually or run helm upgrade after the TLS secret exists."
+                );
+                return Ok(());
+            }
+        }
+    } else {
+        return Err(miette::miette!(
+            "--backend-ca-source-secret is required with --jwt-only \
+             and --backend-ca-configmap-name"
+        ));
+    };
+
+    let configmap = ConfigMap {
+        metadata: ObjectMeta {
+            name: Some(configmap_name.to_string()),
+            ..Default::default()
+        },
+        data: Some(BTreeMap::from([("ca.crt".to_string(), ca_pem)])),
+        ..Default::default()
+    };
+
+    api.create(&PostParams::default(), &configmap)
+        .await
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed to create configmap {configmap_name}"))?;
+
+    info!(
+        namespace = %namespace,
+        configmap = %configmap_name,
+        "Backend CA ConfigMap created."
+    );
     Ok(())
 }
 
