@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-{{- if or .Values.pkiInitJob.enabled .Values.certManager.enabled }}
+{{- if and (not .Values.cni.only) (or .Values.pkiInitJob.enabled .Values.certManager.enabled) }}
 {{- $hookName := printf "%s-certgen" (include "openshell.fullname" .) }}
 {{- $ns := .Release.Namespace }}
 apiVersion: v1

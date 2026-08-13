@@ -94,6 +94,13 @@ cni:
   # cni.enabled=false) on additional gateway releases that share the cluster's
   # existing OpenShell CNI installation.
   external: false
+  # -- Install ONLY the CNI singleton (DaemonSet + RBAC + SCC), with no gateway
+  # workload. Use this to run the CNI installer as its own release whose
+  # lifecycle is independent of any gateway, so uninstalling a gateway never
+  # strips node enforcement. Requires cni.enabled=true. In this mode every
+  # gateway release should set cni.external=true. See
+  # examples/cni-standalone.yaml.
+  only: false
   # -- Optional STATIC additions to the plugin's enforcement allowlist. The
   # allowlist is normally built automatically: each cni-sidecar release ships a
   # Helm-owned marker ConfigMap (openshell.ai/cni-registration=true) in its sandbox

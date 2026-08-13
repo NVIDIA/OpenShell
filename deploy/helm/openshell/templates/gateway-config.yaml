@@ -12,6 +12,7 @@ One value is intentionally NOT rendered here:
                                  when server.externalDbSecret is set, otherwise
                                  --db-url arg for SQLite
 */}}
+{{- if not .Values.cni.only }}
 {{- $credentialDrivers := list -}}
 {{- $otlp := .Values.server.otlp | default dict -}}
 {{- if .Values.server.credentialDrivers.kubernetesSecrets.enabled -}}
@@ -257,3 +258,4 @@ data:
     timeout_secs = {{ .Values.server.credentialDrivers.vault.timeoutSecs }}
     {{- end }}
     {{- end }}
+{{- end }}

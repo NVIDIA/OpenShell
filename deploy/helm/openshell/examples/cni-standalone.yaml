@@ -1,0 +1,32 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Example values for installing the OpenShell CNI singleton as its OWN release,
+# independent of any gateway.
+#
+# Use this on clusters that run more than one OpenShell gateway, or when you want
+# to lifecycle the node-level enforcement DaemonSet separately from gateways.
+# The CNI installer is a cluster singleton, so install it exactly once with this
+# file, then run every gateway release with cni.external=true (see
+# examples/cni-sidecar-openshift-extra-release.yaml). Uninstalling a gateway then
+# never strips node enforcement, because no gateway owns the DaemonSet.
+#
+#   helm install openshell-cni deploy/helm/openshell -n openshell-cni \
+#     -f deploy/helm/openshell/examples/cni-standalone.yaml
+#
+# cni.only renders only the CNI DaemonSet, its RBAC, and (on OpenShift) its SCC —
+# no gateway workload, service, or config. Adjust the host CNI paths for your
+# distro (see examples/cni-sidecar-k3s.yaml and examples/cni-sidecar-openshift.yaml).
+
+cni:
+  only: true
+  enabled: true
+  # conflist (default) appends the OpenShell plugin to an existing CNI .conflist
+  # (k3s / vanilla). Use multus-chain on OpenShift.
+  mode: conflist
+  # Uncomment and adjust for your distro, e.g. k3s:
+  #   binDir: /var/lib/rancher/k3s/data/cni
+  #   confDir: /var/lib/rancher/k3s/agent/etc/cni/net.d
+  # On OpenShift, grant the privileged SCC to the CNI ServiceAccount:
+  #   openshift:
+  #     privilegedSCC: true

@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 {{- $workspaceMode := .Values.server.drivers.kubernetes.workspaceMode | default "shared" }}
+{{- if not .Values.cni.only }}
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -147,3 +148,4 @@ rules:
       - update
   {{- end }}
   {{- end }}
+{{- end }}

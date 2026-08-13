@@ -2,6 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 
 {{- $mode := .Values.cni.mode | default "conflist" -}}
+{{- if and .Values.cni.only (not .Values.cni.enabled) -}}
+{{- fail "cni.only=true installs the standalone CNI singleton and requires cni.enabled=true" -}}
+{{- end }}
 {{- if and (eq (.Values.supervisor.topology | default "combined") "cni-sidecar") (not .Values.cni.enabled) (not .Values.cni.external) -}}
 {{- fail "supervisor.topology=cni-sidecar requires the OpenShell CNI installer: set cni.enabled=true to install the cluster singleton here, or cni.external=true if it is installed by another release" -}}
 {{- end }}

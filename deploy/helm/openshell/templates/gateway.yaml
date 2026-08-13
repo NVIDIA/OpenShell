@@ -1,4 +1,4 @@
-{{- if and .Values.grpcRoute.enabled .Values.grpcRoute.gateway.create }}
+{{- if and (not .Values.cni.only) .Values.grpcRoute.enabled .Values.grpcRoute.gateway.create }}
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 apiVersion: gateway.networking.k8s.io/v1

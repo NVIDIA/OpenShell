@@ -253,6 +253,24 @@ The installer treats any `openshell-cni` chained entry as its own and upgrades i
 in place.
 </Note>
 
+### Running multiple gateways
+
+Because the installer is a cluster singleton, only one release may own the CNI
+DaemonSet. For clusters with more than one gateway, install the CNI as its **own
+release** with `cni.only=true` (see `examples/cni-standalone.yaml`) and run every
+gateway with `cni.external=true`. This decouples the DaemonSet's lifecycle from
+any gateway: adding or removing a gateway never installs or strips node
+enforcement, and the standalone release is upgraded on its own schedule.
+
+If instead you let one gateway own the installer (`cni.enabled=true`), that
+release must be **installed first and uninstalled last** — uninstalling the owner
+deletes the singleton and drops egress enforcement for every other gateway still
+running.
+
+The singleton runs a single `openshell-cni` image. When gateways span multiple
+OpenShell versions, keep the singleton at a version compatible with all of them;
+the CNI-to-sandbox contract is not yet version-negotiated across releases.
+
 ## Credential Exposure
 
 Sidecar and cni-sidecar topologies keep gateway credentials in the network
