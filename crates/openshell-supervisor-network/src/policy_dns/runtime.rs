@@ -113,21 +113,26 @@ impl PolicyDnsRuntime {
                 set_tcp_nodelay_best_effort(&stream);
                 let service = service.clone();
                 tokio::spawn(async move {
-                    let Ok(wire_length) = stream.read_u16().await else {
-                        return;
-                    };
-                    let length = usize::from(wire_length);
-                    if length > MAX_DNS_MESSAGE_BYTES {
-                        return;
-                    }
-                    let mut frame = Vec::with_capacity(length + 2);
-                    frame.extend_from_slice(&wire_length.to_be_bytes());
-                    frame.resize(length + 2, 0);
-                    if stream.read_exact(&mut frame[2..]).await.is_err() {
-                        return;
-                    }
-                    if let Ok(response) = wire::handle_tcp_query(&service, &frame).await {
-                        let _ = stream.write_all(&response).await;
+                    // DNS-over-TCP connections may carry multiple sequential
+                    // length-prefixed messages. libc commonly reuses one
+                    // connection for A and AAAA during getaddrinfo().
+                    while let Ok(wire_length) = stream.read_u16().await {
+                        let length = usize::from(wire_length);
+                        if length > MAX_DNS_MESSAGE_BYTES {
+                            return;
+                        }
+                        let mut frame = Vec::with_capacity(length + 2);
+                        frame.extend_from_slice(&wire_length.to_be_bytes());
+                        frame.resize(length + 2, 0);
+                        if stream.read_exact(&mut frame[2..]).await.is_err() {
+                            return;
+                        }
+                        let Ok(response) = wire::handle_tcp_query(&service, &frame).await else {
+                            return;
+                        };
+                        if stream.write_all(&response).await.is_err() {
+                            return;
+                        }
                     }
                 });
             }
