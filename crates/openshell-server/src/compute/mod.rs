@@ -15,6 +15,7 @@ use crate::persistence::{
 };
 use crate::sandbox_index::SandboxIndex;
 use crate::sandbox_watch::SandboxWatchBus;
+use crate::storage_proto::SandboxDelegatedIdentityRecord;
 use crate::supervisor_session::SupervisorSessionRegistry;
 use crate::tracing_bus::TracingLogBus;
 use futures::{Stream, StreamExt};
@@ -3313,6 +3314,15 @@ impl ComputeRuntime {
             .await?;
         self.cleanup_sandbox_service_endpoints(sandbox.object_id(), sandbox.object_workspace())
             .await?;
+        self.store
+            .delete(
+                SandboxDelegatedIdentityRecord::object_type(),
+                &crate::delegated_identity::sandbox_delegated_identity_record_id(
+                    sandbox.object_id(),
+                ),
+            )
+            .await
+            .map_err(|e| format!("delete sandbox delegated identity: {e}"))?;
 
         self.store
             .delete_by_name(

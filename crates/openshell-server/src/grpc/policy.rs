@@ -3642,6 +3642,8 @@ async fn handle_update_config_inner(
         .await
         .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
         .ok_or_else(|| Status::not_found("sandbox not found"))?;
+    crate::delegated_identity::ensure_delegated_identity_sandbox_user(state, principal, &sandbox)
+        .await?;
     let sandbox_id = sandbox.object_id().to_string();
     let mut response_annotations = sandbox_metadata_annotations(&sandbox);
 
@@ -4486,6 +4488,8 @@ pub(super) async fn handle_submit_policy_analysis(
         &req.name,
     )
     .await?;
+    crate::delegated_identity::ensure_delegated_identity_sandbox_user(state, &principal, &sandbox)
+        .await?;
     let sandbox_id = sandbox.object_id().to_string();
     for summary in &req.network_activity_summaries {
         state
@@ -4999,6 +5003,8 @@ async fn handle_approve_draft_chunk_inner(
         .await
         .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
         .ok_or_else(|| Status::not_found("sandbox not found"))?;
+    crate::delegated_identity::ensure_delegated_identity_sandbox_user(state, &principal, &sandbox)
+        .await?;
     let sandbox_id = sandbox.object_id().to_string();
 
     let chunk = state
@@ -5152,6 +5158,8 @@ async fn handle_reject_draft_chunk_inner(
         .await
         .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
         .ok_or_else(|| Status::not_found("sandbox not found"))?;
+    crate::delegated_identity::ensure_delegated_identity_sandbox_user(state, &principal, &sandbox)
+        .await?;
     let sandbox_id = sandbox.object_id().to_string();
 
     let chunk = state
@@ -5261,6 +5269,8 @@ async fn handle_approve_all_draft_chunks_inner(
         .await
         .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
         .ok_or_else(|| Status::not_found("sandbox not found"))?;
+    crate::delegated_identity::ensure_delegated_identity_sandbox_user(state, &principal, &sandbox)
+        .await?;
     let sandbox_id = sandbox.object_id().to_string();
 
     let pending_chunks = state
@@ -5573,6 +5583,8 @@ pub(super) async fn handle_edit_draft_chunk(
         .await
         .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
         .ok_or_else(|| Status::not_found("sandbox not found"))?;
+    crate::delegated_identity::ensure_delegated_identity_sandbox_user(state, &principal, &sandbox)
+        .await?;
     let sandbox_id = sandbox.object_id().to_string();
 
     let chunk = state
@@ -5651,6 +5663,8 @@ async fn handle_undo_draft_chunk_inner(
         .await
         .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
         .ok_or_else(|| Status::not_found("sandbox not found"))?;
+    crate::delegated_identity::ensure_delegated_identity_sandbox_user(state, &principal, &sandbox)
+        .await?;
     let sandbox_id = sandbox.object_id().to_string();
 
     let chunk = state
@@ -5745,6 +5759,8 @@ pub(super) async fn handle_clear_draft_chunks(
         .await
         .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
         .ok_or_else(|| Status::not_found("sandbox not found"))?;
+    crate::delegated_identity::ensure_delegated_identity_sandbox_user(state, &principal, &sandbox)
+        .await?;
     let sandbox_id = sandbox.object_id().to_string();
 
     let deleted = state

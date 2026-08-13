@@ -135,6 +135,8 @@ compute_driver        = "kubernetes"
 credential_drivers        = ["kubernetes-secrets"]
 
 ssh_session_ttl_secs  = 3600
+# Maximum sandbox delegated identity window, in seconds.
+max_delegated_identity_duration_secs = 86400
 
 # Reject invalid policy generations securely by default. Set
 # "retain_last_valid" only when availability takes priority.
@@ -262,6 +264,8 @@ allow_reference_namespace = false
 Local Docker, Podman, and VM gateways can also set `[openshell.gateway.mtls_auth] enabled = true` to map a verified client certificate to a CLI user identity. This application-layer identity switch does not control the TLS handshake. When `client_ca_path` is set without OIDC, the listener requires a valid client certificate. When OIDC is configured, bearer-only clients may connect; the listener still validates any client certificate they present against the configured CA. Kubernetes deployments must leave `mtls_auth.enabled` unset and use OIDC or a trusted access proxy; the Helm chart does not render this table.
 
 The client-certificate handshake policy is derived and has no `require_client_auth` TOML field. This preserves bearer-only OIDC clients and prevents a file setting from silently weakening CA-only gateways.
+
+For Helm deployments, `server.maxDelegatedIdentityDurationSecs` renders `[openshell.gateway] max_delegated_identity_duration_secs`. The chart defaults it to `86400` seconds and rejects negative values.
 
 `[openshell.gateway.tls]` supports optional SNI-based dual-certificate mode for deployments that need separate internal and external server certificates. Set `external_cert_path` and `external_key_path` to point at the external (e.g. ACME/publicly-trusted) certificate and key. List the hostnames that should be served with the external certificate in `external_server_names`. Connections whose TLS SNI hostname matches one of those names receive the external certificate; all other connections (including those with no SNI) receive the primary internal certificate from `cert_path`/`key_path`. Both fields must be set together — providing only one is a configuration error. On Kubernetes with the Helm chart, the external certificate is managed automatically when `certManager.serverIssuerRef.name` is set; the chart populates these fields from the cert-manager-issued external server certificate.
 
@@ -415,7 +419,7 @@ The gateway validates snapshot structure and provider-profile semantics. It trea
 
 ## Credential Drivers
 
-Set `credential_drivers` only when the gateway should store provider secrets in an external credential backend. Provider secrets include injectable credentials and gateway-only refresh material such as OAuth refresh tokens, client secrets, and service-account private keys. OpenShell supports at most one enabled credential driver at a time. When `credential_drivers` is omitted, the gateway uses its default encrypted database credential storage. `credential_drivers = []` is invalid in the TOML file; omit the field for the default encrypted store, or select a backend such as `kubernetes-secrets` or `vault`.
+Set `credential_drivers` only when the gateway should store secrets in an external credential backend. Driver-owned secrets include injectable provider credentials, gateway-only provider refresh material such as OAuth refresh tokens, client secrets, and service-account private keys, and delegated identity access and refresh tokens. Generic provider, refresh-state, delegated-credential, and sandbox records contain opaque handles or non-secret metadata instead of those token values. OpenShell supports at most one enabled credential driver at a time. When `credential_drivers` is omitted, the gateway uses its default encrypted database credential storage. `credential_drivers = []` is invalid in the TOML file; omit the field for the default encrypted store, or select a backend such as `kubernetes-secrets` or `vault`.
 
 Credential driver tables are backend-owned and live under `[openshell.credential_drivers.<name>]`. Built-in drivers default to in-tree transport, so they do not need a `transport` field. Use `transport = "uds"` with an absolute `socket_path` only for a remote gRPC driver over a Unix domain socket.
 
@@ -449,7 +453,7 @@ role = "openshell-gateway"
 service_account_token_path = "/var/run/secrets/kubernetes.io/serviceaccount/token"
 ```
 
-For the default encrypted database store, OpenShell stores provider credentials as JSON envelopes encrypted with AES-256-GCM in the gateway database. Each credential gets a random data-encryption key; the gateway wraps that key with a local key-encryption key. By default, the key-encryption key is created at `$XDG_STATE_HOME/openshell/gateway/credentials/key-encryption-key.bin` with owner-only permissions. Use `[openshell.gateway.credential_storage] key_encryption_key_env` instead of `key_encryption_key_path` to load a base64-encoded 32-byte key-encryption key from an environment variable. Back up the database and key-encryption key together; losing either makes stored credentials unrecoverable. In Kubernetes, the Helm chart creates a retained Secret containing the shared key-encryption key, injects it as `OPENSHELL_GATEWAY_CREDENTIAL_KEY_ENCRYPTION_KEY`, and renders `key_encryption_key_env` for the gateway when no external credential driver is enabled. Multi-replica deployments need every replica to use the same database and key-encryption key; the chart default handles the key-encryption key side.
+For the default encrypted database store, OpenShell stores driver-owned secrets as JSON envelopes encrypted with AES-256-GCM in the gateway database. Each secret gets a random data-encryption key; the gateway wraps that key with a local key-encryption key. By default, the key-encryption key is created at `$XDG_STATE_HOME/openshell/gateway/credentials/key-encryption-key.bin` with owner-only permissions. Use `[openshell.gateway.credential_storage] key_encryption_key_env` instead of `key_encryption_key_path` to load a base64-encoded 32-byte key-encryption key from an environment variable. Back up the database and key-encryption key together; losing either makes stored credentials unrecoverable. In Kubernetes, the Helm chart creates a retained Secret containing the shared key-encryption key, injects it as `OPENSHELL_GATEWAY_CREDENTIAL_KEY_ENCRYPTION_KEY`, and renders `key_encryption_key_env` for the gateway when no external credential driver is enabled. Multi-replica deployments need every replica to use the same database and key-encryption key; the chart default handles the key-encryption key side.
 
 For GitOps and `helm template` workflows where `lookup` returns empty, the chart-generated KEK Secret gets a random value on every render, making credentials unrecoverable. Set `server.credentialStorage.existingSecret` to the name of a pre-provisioned Secret containing the key-encryption key under the `key-encryption-key` data key. When set, the chart skips KEK Secret generation and references the provided Secret directly.
 
@@ -459,7 +463,7 @@ server:
     existingSecret: my-preprovisioned-kek-secret
 ```
 
-For `kubernetes-secrets`, `namespace` sets where OpenShell-managed provider Secret objects are stored. When omitted, the driver uses the in-cluster ServiceAccount namespace when available, otherwise `default`. The Helm chart creates a Role granting the gateway access to all Secrets in the credential namespace because OpenShell-managed Secret names are dynamic SHA-256 hashes that cannot be restricted with `resourceNames`. Deploy credential Secrets in a dedicated namespace (`server.credentialDrivers.kubernetesSecrets.namespace`) to limit the RBAC blast radius.
+For `kubernetes-secrets`, `namespace` sets where gateway-global Secret objects are stored and, in shared workspace mode, where workspace-owned Secret objects are stored. Managed and operator workspace modes continue to place workspace-owned Secrets in their corresponding workspace namespaces. When `namespace` is omitted, the driver uses the in-cluster ServiceAccount namespace when available, otherwise `default`. The Helm chart creates a Role granting the gateway access to all Secrets in the credential namespace because OpenShell-managed Secret names are dynamic SHA-256 hashes that cannot be restricted with `resourceNames`. Deploy credential Secrets in a dedicated namespace (`server.credentialDrivers.kubernetesSecrets.namespace`) to limit the RBAC blast radius.
 
 For `vault`, `address` points at the Vault service, `mount` and `kv_version` describe the KV engine where OpenShell-managed provider secrets are stored, and `auth_method = "kubernetes"` logs in with the gateway Pod's ServiceAccount token. For local or development validation, use `auth_method = "token_file"` with `token_path = "/path/to/token"`. Do not put literal Vault tokens in TOML.
 

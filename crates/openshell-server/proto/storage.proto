@@ -68,6 +68,41 @@ message StoredRefreshMaterialDeletion {
   openshell.datamodel.v1.CredentialHandle handle = 2;
 }
 
+message DelegatedIdentityCredential {
+  openshell.datamodel.v1.ObjectMeta metadata = 1;
+  string issuer = 2;
+  string client_id = 3;
+  string principal_subject = 4;
+  reserved 5, 6;
+  reserved "refresh_token", "access_token";
+  int64 access_token_expires_at_ms = 7;
+  string scopes = 8;
+  string audience = 9;
+  int64 last_refresh_at_ms = 10;
+  int64 revoked_at_ms = 11;
+  // Delegated OAuth material is stored through the active credential driver.
+  // This record contains only opaque driver handles under fixed,
+  // gateway-owned material names.
+  map<string, openshell.datamodel.v1.CredentialHandle> secret_material_handles = 12;
+  // Superseded or revoked handles retained until credential-driver cleanup
+  // succeeds. Keeping retry references here prevents silent secret orphans
+  // across gateway restarts and temporary backend outages.
+  repeated StoredRefreshMaterialDeletion pending_secret_deletions = 13;
+  // Shared-store lease serializing refresh-token use across gateway replicas.
+  DelegatedIdentityRefreshLease refresh_lease = 14;
+}
+
+message DelegatedIdentityRefreshLease {
+  string owner_id = 1;
+  int64 expires_at_ms = 2;
+}
+
+message SandboxDelegatedIdentityRecord {
+  openshell.datamodel.v1.ObjectMeta metadata = 1;
+  string sandbox_id = 2;
+  openshell.v1.SandboxDelegatedIdentity delegated_identity = 3;
+}
+
 // Stored custom provider profile object.
 message StoredProviderProfile {
   openshell.datamodel.v1.ObjectMeta metadata = 1;

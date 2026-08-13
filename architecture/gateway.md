@@ -444,6 +444,18 @@ state is stored as a separate object scoped to the provider instance through
 `objects.scope`. Its non-secret configuration remains inline, while refresh
 tokens, client secrets, private keys, and other secret source material are
 stored through the active credential driver and represented by opaque handles.
+Delegated identity credentials use the same boundary: access and refresh token
+bytes exist only in the selected credential backend, while the generic
+delegated credential object retains issuer, subject, expiry, revocation state,
+and opaque handles. The sandbox record contains only its authorization window
+and a reference to that generic credential object. The CLI obtains delegated
+material through a browser Authorization Code flow with PKCE separate from its
+normal login. It transfers that bundle without writing it to the local login
+store and continues to authenticate gateway RPCs with the normal login. The
+gateway is therefore the sole owner of the delegated refresh-token chain. A
+healthy gateway-owned grant is shared by that user’s delegated sandboxes;
+create and extend carry only a relative duration, and the gateway derives the
+absolute authorization window from its own clock.
 The provider record keeps only the current injectable credential handles and
 optional per-credential expiry timestamps. A refresh normally mints one
 credential, but a strategy may co-mint several (AWS STS mints the access key,
@@ -456,6 +468,36 @@ credential driver is configured, gateways use server-owned encrypted database
 credential storage for defense in depth. Multi-replica deployments can use that
 default with a shared database and shared key-encryption key, or opt into an
 external backend such as Vault or Kubernetes Secrets.
+
+Credential-driver writes and generic object CAS writes form a compensating
+transaction. New delegated material is staged before its handles are committed.
+A failed CAS deletes the staged handles. If deletion fails, recording the staged
+handles as pending deletion retries CAS conflicts and merges into the latest
+credential without overwriting concurrent changes. A successful replacement
+records old handles as pending deletion before cleanup. Revocation and deletion
+first clear active handles and make the generic credential unusable, then delete backend
+material. Pending opaque handles remain durable across cleanup failures and a
+gateway worker retries them. Final deletion keeps a disabled tombstone until
+all recorded backend material is gone. This compensation is not atomic across
+stores: a missing parent credential or failed cleanup-record persistence can
+still leave untracked material; the gateway logs a cleanup warning.
+
+Delegated credential refresh also uses a short-lived lease in the generic
+credential record. Gateway replicas acquire the lease with object-store CAS
+before resolving or submitting the refresh token. Non-owners reload the record
+until the owner commits the rotated handles. The owner renews its lease with
+owner-checked CAS throughout exchange, validation, staging, and commit, and
+renews immediately before the bounded HTTP exchange. Renewal cannot revive an
+expired lease or overwrite a takeover. Safe reads, validation, renewal, and
+commit retries have bounded waits; credential writes finish before compensation
+rather than being cancelled mid-write. Renewal failure prevents further exchange
+or commit and triggers staged-handle cleanup. Renewal stops at commit or when
+the owning call ends; an expired lease permits recovery from a failed replica.
+The final CAS verifies that the credential is still active and that the writer
+owns an unexpired lease, so revocation cannot race with refresh and restore
+usable token handles. This does not make the OAuth exchange atomic with local
+persistence: a crash or partition after upstream rotation can still require
+reauthorization.
 
 Sandbox workload templates are workspace-scoped gateway resources. Workspace
 admins create and delete them; workspace users can read and list them. A
@@ -479,7 +521,9 @@ short-lived credentials still fail closed at their recorded expiry.
 Credential handles remain bound to the driver that created them. Before the
 0.1.0 compatibility boundary, gateways do not migrate inline refresh material
 or move handles between credential drivers; operators reconfigure affected
-grants when upgrading or changing backends.
+grants when upgrading or changing backends. Delegated identity has not shipped
+with inline token storage, so development deployments created from an earlier
+feature branch must delete and recreate those branch-only records.
 
 ### Optimistic Concurrency (CAS)
 

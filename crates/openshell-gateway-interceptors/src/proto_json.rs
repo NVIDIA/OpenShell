@@ -318,6 +318,7 @@ mod tests {
             workspace_scope: Some(workspace_selector("default")),
             await_main_process_attachment: false,
             workload_template_name: String::new(),
+            delegated_identity: None,
         };
         let bytes = request.encode_to_vec();
         let json = codec
@@ -379,6 +380,14 @@ mod tests {
             ("openshell.v1.SshSession", "token"),
             ("openshell.v1.ConfigureProviderRefreshRequest", "material"),
             (
+                "openshell.v1.DelegatedIdentityAuthorizationGrant",
+                "refresh_token",
+            ),
+            (
+                "openshell.v1.DelegatedIdentityAuthorizationGrant",
+                "access_token",
+            ),
+            (
                 "openshell.v1.GetSandboxProviderEnvironmentResponse",
                 "environment",
             ),
@@ -390,6 +399,41 @@ mod tests {
                 "{message_name}.{field_name} must be marked secret"
             );
         }
+    }
+
+    #[test]
+    fn delegated_identity_lifecycle_request_cannot_carry_oauth_material() {
+        let codec = ProtoJsonCodec::openshell().unwrap();
+        let message = codec
+            .message_descriptor("openshell.v1.DelegatedIdentityRequest")
+            .unwrap();
+
+        for field_name in [
+            "issuer",
+            "client_id",
+            "refresh_token",
+            "access_token",
+            "access_token_expires_at_ms",
+            "scopes",
+            "audience",
+        ] {
+            assert!(message.get_field_by_name(field_name).is_none());
+            assert!(
+                message
+                    .descriptor_proto()
+                    .reserved_name
+                    .iter()
+                    .any(|name| name == field_name),
+                "{field_name} must remain reserved"
+            );
+        }
+        assert_eq!(
+            message
+                .fields()
+                .map(|field| field.name().to_string())
+                .collect::<Vec<_>>(),
+            ["duration_ms"]
+        );
     }
 
     #[test]

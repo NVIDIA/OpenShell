@@ -97,3 +97,4 @@ serde_json = { workspace = true }
 temp-env = "0.3"
 tokio-stream = { workspace = true }
 url = { workspace = true }
+wiremock = "0.6"

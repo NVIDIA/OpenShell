@@ -53,6 +53,11 @@ data:
     {{- fail "server.policyValidationFailureMode must be fail_closed or retain_last_valid" }}
     {{- end }}
     policy_validation_failure_mode = {{ $policyValidationFailureMode | quote }}
+    {{- $maxDelegatedIdentityDurationSecs := int .Values.server.maxDelegatedIdentityDurationSecs }}
+    {{- if lt $maxDelegatedIdentityDurationSecs 0 }}
+    {{- fail "server.maxDelegatedIdentityDurationSecs must not be negative; it maps to an unsigned gateway setting" }}
+    {{- end }}
+    max_delegated_identity_duration_secs = {{ $maxDelegatedIdentityDurationSecs }}
     {{- if .Values.server.disableTls }}
     disable_tls            = true
     {{- end }}

@@ -152,6 +152,7 @@ pub struct TokenGrantProfile {
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct TokenGrantSubjectTokenProfile {
     pub source: String,
+    #[serde(default)]
     pub credential: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub subject_token_type: String,
@@ -1377,8 +1378,10 @@ fn token_grant_subject_token_to_proto(
     subject_token: &TokenGrantSubjectTokenProfile,
 ) -> ProviderCredentialTokenGrantSubjectToken {
     ProviderCredentialTokenGrantSubjectToken {
-        source: subject_token.source.clone(),
-        credential: subject_token.credential.clone(),
+        // Validation treats whitespace around these identifiers as insignificant.
+        // Lower canonical values so runtime exact matching uses the same semantics.
+        source: subject_token.source.trim().to_owned(),
+        credential: subject_token.credential.trim().to_owned(),
         subject_token_type: subject_token.subject_token_type.clone(),
     }
 }
@@ -2824,31 +2827,43 @@ fn validate_token_grant_subject_token(
                 return diagnostics;
             };
 
-            let source_value = subject_token.source.trim();
-            if source_value != "provider_credential" {
-                diagnostics.push(ProfileValidationDiagnostic::error(
-                    source,
-                    profile_id,
-                    "credentials.token_grant.subject_token.source",
-                    "subject_token.source must be provider_credential",
-                ));
-            }
-
             let subject_credential = subject_token.credential.trim();
-            if subject_credential.is_empty() {
-                diagnostics.push(ProfileValidationDiagnostic::error(
-                    source,
-                    profile_id,
-                    "credentials.token_grant.subject_token.credential",
-                    "subject_token.credential is required",
-                ));
-            } else if !credential_names.contains(subject_credential) {
-                diagnostics.push(ProfileValidationDiagnostic::error(
-                    source,
-                    profile_id,
-                    "credentials.token_grant.subject_token.credential",
-                    format!("unknown subject token credential: {subject_credential}"),
-                ));
+            match subject_token.source.trim() {
+                "provider_credential" => {
+                    if subject_credential.is_empty() {
+                        diagnostics.push(ProfileValidationDiagnostic::error(
+                            source,
+                            profile_id,
+                            "credentials.token_grant.subject_token.credential",
+                            "subject_token.credential is required",
+                        ));
+                    } else if !credential_names.contains(subject_credential) {
+                        diagnostics.push(ProfileValidationDiagnostic::error(
+                            source,
+                            profile_id,
+                            "credentials.token_grant.subject_token.credential",
+                            format!("unknown subject token credential: {subject_credential}"),
+                        ));
+                    }
+                }
+                "sandbox_delegated_identity" => {
+                    if !subject_credential.is_empty() {
+                        diagnostics.push(ProfileValidationDiagnostic::error(
+                            source,
+                            profile_id,
+                            "credentials.token_grant.subject_token.credential",
+                            "sandbox_delegated_identity subject_token must not set credential",
+                        ));
+                    }
+                }
+                _ => {
+                    diagnostics.push(ProfileValidationDiagnostic::error(
+                        source,
+                        profile_id,
+                        "credentials.token_grant.subject_token.source",
+                        "subject_token.source must be provider_credential or sandbox_delegated_identity",
+                    ));
+                }
             }
         }
         ProviderCredentialTokenGrantType::Unspecified => {
@@ -4665,6 +4680,97 @@ credentials:
         assert_eq!(
             reparsed.credentials[1].token_grant,
             profile.credentials[1].token_grant
+        );
+    }
+
+    #[test]
+    fn token_exchange_subject_identifiers_are_normalized_during_lowering() {
+        for (source, credential, expected_credential) in [
+            (
+                "provider_credential",
+                " USER_OIDC_TOKEN ",
+                "USER_OIDC_TOKEN",
+            ),
+            ("sandbox_delegated_identity", "   ", ""),
+        ] {
+            let yaml = format!(
+                r#"
+id: normalized-token-exchange
+display_name: Normalized Token Exchange
+credentials:
+  - name: USER_OIDC_TOKEN
+    required: true
+  - name: access_token
+    auth_style: bearer
+    header_name: Authorization
+    token_grant:
+      grant_type: token_exchange
+      token_endpoint: https://keycloak.example.com/realms/openshell/protocol/openid-connect/token
+      subject_token:
+        source: " {source} "
+        credential: "{credential}"
+        subject_token_type: " urn:ietf:params:oauth:token-type:access_token "
+"#
+            );
+            let yaml_profile = parse_profile_yaml(&yaml).expect("profile should parse");
+            let json = profile_to_json(&yaml_profile).expect("profile should serialize");
+            let json_profile = parse_profile_json(&json).expect("JSON profile should parse");
+
+            for profile in [yaml_profile, json_profile] {
+                let diagnostics =
+                    validate_profile_set(&[("normalized-profile".to_string(), profile.clone())]);
+                assert!(
+                    diagnostics.is_empty(),
+                    "unexpected diagnostics for {source}: {diagnostics:?}"
+                );
+
+                let proto = profile.to_proto();
+                let subject_token = proto.credentials[1]
+                    .token_grant
+                    .as_ref()
+                    .and_then(|grant| grant.subject_token.as_ref())
+                    .expect("subject token should lower");
+                assert_eq!(subject_token.source, source);
+                assert_eq!(subject_token.credential, expected_credential);
+                assert_eq!(
+                    subject_token.subject_token_type,
+                    " urn:ietf:params:oauth:token-type:access_token ",
+                    "lowering should not trim non-identifier fields"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn sandbox_delegated_identity_subject_token_defaults_credential() {
+        let profile = parse_profile_yaml(
+            r"
+id: delegated-identity-token-exchange
+display_name: Delegated Identity Token Exchange
+credentials:
+  - name: access_token
+    auth_style: bearer
+    header_name: Authorization
+    token_grant:
+      grant_type: token_exchange
+      token_endpoint: https://keycloak.example.com/realms/openshell/protocol/openid-connect/token
+      subject_token:
+        source: sandbox_delegated_identity
+",
+        )
+        .expect("profile should parse without an explicit subject credential");
+
+        let subject_token = profile.credentials[0]
+            .token_grant
+            .as_ref()
+            .and_then(|grant| grant.subject_token.as_ref())
+            .expect("subject token should parse");
+        assert!(subject_token.credential.is_empty());
+
+        let diagnostics = validate_profile_set(&[("delegated.yaml".to_string(), profile)]);
+        assert!(
+            diagnostics.is_empty(),
+            "unexpected diagnostics: {diagnostics:?}"
         );
     }
 

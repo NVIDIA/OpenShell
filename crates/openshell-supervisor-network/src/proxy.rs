@@ -12444,6 +12444,12 @@ network_policies:
             }
         }
 
+        if crate::procfs::run_fork_socket_test_in_subprocess(
+            "proxy::tests::resolve_process_identity_denies_fork_exec_shared_socket_ambiguity",
+        ) {
+            return;
+        }
+
         if !std::path::Path::new("/bin/sleep").exists() {
             eprintln!("skipping: /bin/sleep not available");
             return;
@@ -12467,18 +12473,6 @@ network_policies:
         let (_accepted, _) = listener.accept().expect("accept");
 
         let fd = stream.as_raw_fd();
-        // libc/syscall FFI requires unsafe
-        #[allow(unsafe_code)]
-        unsafe {
-            let flags = libc::fcntl(fd, libc::F_GETFD);
-            assert!(flags >= 0, "F_GETFD failed");
-            assert_eq!(
-                libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC),
-                0,
-                "F_SETFD failed"
-            );
-        }
-
         let sleep_path = CString::new("/bin/sleep").unwrap();
         let arg0 = CString::new("sleep").unwrap();
         let arg1 = CString::new("30").unwrap();
@@ -12490,6 +12484,12 @@ network_policies:
             // libc/syscall FFI requires unsafe
             #[allow(unsafe_code)]
             unsafe {
+                // Only the child needs this fd across exec. Keep the parent's
+                // copy CLOEXEC so other subprocesses cannot inherit it.
+                let flags = libc::fcntl(fd, libc::F_GETFD);
+                if flags < 0 || libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) != 0 {
+                    libc::_exit(126);
+                }
                 libc::execl(
                     sleep_path.as_ptr(),
                     arg0.as_ptr(),
