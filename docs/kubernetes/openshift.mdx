@@ -191,6 +191,11 @@ is routed through the OpenShell network sidecar and enforced by policy.
 To run **additional** gateway releases on the same cluster, do not install a
 second CNI — reuse the singleton with `cni.enabled=false`, `cni.external=true`
 (`-f deploy/helm/openshell/examples/cni-sidecar-openshift-extra-release.yaml`).
+For a multi-gateway cluster, prefer installing the CNI as its own release with
+`cni.only=true` (`-f deploy/helm/openshell/examples/cni-standalone.yaml`) so node
+enforcement is not tied to any gateway's lifecycle; every gateway then runs
+`cni.external=true`. See
+[Running multiple gateways](/kubernetes/topology#running-multiple-gateways).
 Registration is automatic and race-free: each `cni-sidecar` release ships a
 Helm-owned marker ConfigMap (`openshell.ai/cni-registration=true`) in its sandbox
 namespace, and the singleton discovers every marker's namespace and adds it to the
