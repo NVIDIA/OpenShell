@@ -93,7 +93,12 @@ instead of inheriting a new mapping. Policy reload, expiry, wrong ports, direct 
 mappings, or pool exhaustion fail closed. Resolver injection, DNS listeners,
 capture rules, and the transparent listener are all ready before workload
 execution. A runtime that cannot provide the complete contract rejects a policy
-containing explicit TCP endpoints rather than partially activating it.
+containing explicit TCP endpoints rather than partially activating it. Because
+that substrate is startup infrastructure, a sandbox created without explicit
+TCP endpoints rejects a hot reload that introduces one and keeps its complete
+previous policy active; recreating the sandbox installs the substrate before
+the workload starts. A sandbox that started with the substrate may continue to
+remove and re-add TCP endpoints through ordinary atomic policy reloads.
 
 Provider credential placeholders are resolved through the live provider state
 for each HTTP request, after destination and L7 policy admission. A static

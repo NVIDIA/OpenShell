@@ -68,6 +68,11 @@ The demo currently requires the Docker compute driver. Other compute drivers
 fail closed when a policy requests `protocol: tcp` until they implement the
 required namespace-local DNS and TCP capture contract.
 
+Create the sandbox with at least one explicit TCP endpoint. Adding the first
+`protocol: tcp` endpoint to a running sandbox that started without one is
+rejected atomically, with the previous policy left active; recreate the sandbox
+to install the DNS and transparent TCP substrate before the workload starts.
+
 The example policy allows any sandbox binary to use this one Redis endpoint so
 the demo works across base images with different Python installation paths. In
 a production policy, replace `/**` with the exact path of the client binary.
