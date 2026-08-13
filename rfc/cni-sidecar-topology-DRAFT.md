@@ -442,6 +442,27 @@ behavior is behind a default-off value.
   upgrade in place (the conflist patch preserves all other plugins). The
   singleton's `pods get` and `configmaps list` RBAC are cluster-scoped so it can
   discover marker ConfigMaps and read sandbox pods in any allowlisted namespace.
+- **Mixed-version clusters (CNI contract skew).** The singleton is one plugin
+  version per node, but the gateways scheduling sandboxes onto that node may span
+  OpenShell versions. Rather than assume compatibility, the CNI-to-pod contract
+  (the pod annotations the plugin reads plus the ruleset shape it installs) is
+  versioned. The gateway stamps `openshell.ai/cni-contract-version` on each
+  cni-sidecar pod, and the node plugin **fails closed** — refuses CNI `ADD`, so
+  the pod's network is not set up — when the pod requires a version the plugin
+  does not implement. It accepts any version at or below its own (the plugin stays
+  backward compatible within a contract-major) and treats an absent annotation as
+  a pre-versioning gateway. A newer gateway running against an older singleton
+  therefore fails safe — its sandboxes do not start — instead of running under a
+  ruleset that does not match its expectations. Mitigations for operators: the
+  plugin has an independent lifecycle (install it as its own `cni.only` release
+  with every gateway `cni.external=true`), so it can be upgraded to a version that
+  satisfies all gateways without touching them; where versions must be hard
+  isolated, scope the DaemonSet with a `nodeSelector` and pin matching gateway
+  versions to that node pool so incompatible versions never share a node.
+  Same-node coexistence of two incompatible contract-majors is out of scope — it
+  would require a per-major plugin fan-out — and cross-component version
+  negotiation ultimately belongs to the Isolation Backend contract version
+  (RFC 0012).
 - **Dependency on Multus aux chain.** `multus-chain` requires the Multus thick
   daemon to have `auxiliaryCNIChainName` set. It is default on OpenShift 4.x but
   not guaranteed everywhere. Mitigation: document the requirement; the chart does
@@ -460,9 +481,12 @@ behavior is behind a default-off value.
 - **SCC drift / cluster policy.** A cluster that further restricts SCC or blocks
   custom SCCs could reject the sandbox pod. Mitigation: the SCC is minimal and
   documented; the lower-privilege endpoint/L7 mode admits under `restricted-v2`.
-- **Non-destructive rule maintenance.** CNI `CHECK` is read-only (verifies the
-  rules without reinstalling), and `ADD` applies the nft ruleset in a single
-  atomic transaction (ensure→delete→recreate), so a failed apply/check never
+- **Non-destructive rule maintenance.** CNI `CHECK` is read-only and validates
+  the installed ruleset's **structure** — the OUTPUT hook, the proxy-UID
+  exemption, and TCP/UDP rejection across both address families — not merely that
+  the table or chain exists, so a partially damaged or empty ruleset is caught
+  instead of trusted. `ADD` applies the nft ruleset in a single atomic
+  transaction (ensure→delete→recreate), so a failed apply/check never
   leaves a running pod with the table deleted-but-not-recreated. All Kubernetes
   API calls from the plugin/installer use bounded connect/request timeouts so an
   API stall cannot wedge CNI `ADD`, the coverage wait, or reconciliation.
