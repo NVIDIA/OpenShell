@@ -698,6 +698,25 @@ fn resolve_vertex_ai_route(
         |p| p.eq_ignore_ascii_case("anthropic"),
     );
 
+    // Vertex's OpenAI-compatible endpoint requires the request body's `model`
+    // field to carry a publisher prefix: `<publisher>/<model_id>` (e.g.
+    // `google/gemini-2.5-flash`). The publisher is taken from the explicit
+    // VERTEX_AI_PUBLISHER config value (when set to a non-Anthropic value) or
+    // inferred from the model name. For unrecognised models with no explicit
+    // publisher, the bare model ID is forwarded unchanged; Vertex will return
+    // a 400 in that case, which is the correct observable signal to the caller.
+    // Anthropic rawPredict routes encode the model in the URL path, not the
+    // body, so they are unaffected.
+    let body_model_id: String = if !is_anthropic {
+        let publisher = explicit_publisher.or_else(|| infer_vertex_publisher(model_id));
+        match publisher {
+            Some(p) => format!("{p}/{model_id}"),
+            None => model_id.to_string(),
+        }
+    } else {
+        model_id.to_string()
+    };
+
     // Escape hatch: caller-supplied full base URL still uses the model-derived
     // protocol and path contract, but only for the OpenAI-compatible Vertex surface.
     // Anthropic-on-Vertex needs model-path shaping and body adaptation that a fully
@@ -721,7 +740,7 @@ fn resolve_vertex_ai_route(
         return Ok(build_vertex_route(
             route_name,
             base_url,
-            model_id,
+            &body_model_id,
             api_key,
             vec!["openai_chat_completions".to_string()],
             profile,
@@ -772,7 +791,7 @@ fn resolve_vertex_ai_route(
         Ok(build_vertex_route(
             route_name,
             endpoint,
-            model_id,
+            &body_model_id,
             api_key,
             protocols,
             profile,
@@ -2613,6 +2632,11 @@ mod tests {
                 .contains(&"anthropic_messages".to_string()),
             "must not have anthropic_messages protocol for gemini"
         );
+        // Vertex OpenAI-compatible endpoint requires publisher prefix in body model field
+        assert_eq!(
+            resolved.route.model, "google/gemini-pro",
+            "Vertex non-Anthropic body model must carry publisher prefix"
+        );
     }
 
     #[test]
@@ -2651,6 +2675,67 @@ mod tests {
                 .contains(&"anthropic_messages".to_string()),
             "must not have anthropic_messages for unknown model"
         );
+        // Unknown models have no inferred publisher; body model ID is unchanged
+        assert_eq!(resolved.route.model, "some-unknown-model");
+    }
+
+    #[test]
+    fn resolve_vertex_ai_route_non_anthropic_publisher_prefix_gemini() {
+        // Gemini models must get `google/<model>` in route.model so the
+        // OpenAI-compatible Vertex endpoint accepts the request body.
+        let config =
+            std::iter::once(("VERTEX_AI_PROJECT_ID".to_string(), "proj-abc".to_string())).collect();
+        let provider = make_vertex_provider_with_config("vertex-gemini-flash", config);
+
+        let resolved =
+            resolve_provider_route(&provider, "gemini-2.5-flash").expect("should resolve");
+
+        assert_eq!(resolved.route.model, "google/gemini-2.5-flash");
+    }
+
+    #[test]
+    fn resolve_vertex_ai_route_non_anthropic_publisher_prefix_llama() {
+        let config =
+            std::iter::once(("VERTEX_AI_PROJECT_ID".to_string(), "proj-abc".to_string())).collect();
+        let provider = make_vertex_provider_with_config("vertex-llama", config);
+
+        let resolved = resolve_provider_route(&provider, "llama-3-70b").expect("should resolve");
+
+        assert_eq!(resolved.route.model, "meta/llama-3-70b");
+    }
+
+    #[test]
+    fn resolve_vertex_ai_route_explicit_publisher_overrides_inference() {
+        // VERTEX_AI_PUBLISHER takes precedence over infer_vertex_publisher for
+        // unknown model names.
+        let config = [
+            ("VERTEX_AI_PROJECT_ID".to_string(), "proj-abc".to_string()),
+            ("VERTEX_AI_PUBLISHER".to_string(), "acme".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        let provider = make_vertex_provider_with_config("vertex-explicit", config);
+
+        let resolved =
+            resolve_provider_route(&provider, "some-acme-model").expect("should resolve");
+
+        assert_eq!(resolved.route.model, "acme/some-acme-model");
+    }
+
+    #[test]
+    fn resolve_vertex_ai_route_base_url_override_gemini_gets_publisher_prefix() {
+        // Publisher prefix must also be applied when a base URL override is used.
+        let config = std::iter::once((
+            "VERTEX_AI_BASE_URL".to_string(),
+            "https://us-central1-aiplatform.googleapis.com/v1beta1/projects/my-project/locations/us-central1/endpoints/openapi".to_string(),
+        ))
+        .collect();
+        let provider = make_vertex_provider_with_config("vertex-base-url-gemini", config);
+
+        let resolved =
+            resolve_provider_route(&provider, "gemini-2.0-flash").expect("should resolve");
+
+        assert_eq!(resolved.route.model, "google/gemini-2.0-flash");
     }
 
     #[test]
