@@ -84,6 +84,12 @@ tests:
             resources: ["secrets"]
             resourceNames: ["custom-client-tls", "registry-one", "registry-two"]
             verbs: ["get", "patch"]
+      - contains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: ["secrets"]
+            verbs: ["create"]
 
   - it: restricts managed copies to image-pull secrets when TLS is disabled
     set:
@@ -99,6 +105,12 @@ tests:
             resources: ["secrets"]
             resourceNames: ["registry-one"]
             verbs: ["get", "patch"]
+      - contains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: ["secrets"]
+            verbs: ["create"]
 
   - it: omits secrets rule entirely in shared mode
     set:

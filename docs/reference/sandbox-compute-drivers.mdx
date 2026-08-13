@@ -371,6 +371,13 @@ For maintainer-level implementation details, refer to the [Kubernetes driver REA
 | `workspace_storage_class` | `server.workspaceStorageClass` | Set the `StorageClass` for the workspace PVC. Empty (default) omits `storageClassName` and uses the cluster's default `StorageClass`. Set this on clusters with no default `StorageClass`, otherwise the workspace PVC stays `Pending` and the sandbox never starts. |
 | `sa_token_ttl_secs` | `server.sandboxJwt.k8sSaTokenTtlSecs` | Set the projected ServiceAccount token TTL used for the bootstrap token exchange. |
 
+Managed-mode Secret copying requires the gateway ServiceAccount to create
+Secrets. Kubernetes RBAC cannot restrict Secret `create` by resource name, so
+the Helm chart grants cluster-wide Secret `create`; Secret `get` and `patch`
+remain limited to the explicitly configured TLS and image-pull Secret names.
+The driver creates copies only in gateway-owned managed namespaces. Do not
+reuse the gateway ServiceAccount for unrelated workloads.
+
 In `combined` topology, the agent container carries the Linux capabilities
 needed by the supervisor for network namespace setup, Landlock filesystem
 policy, process privilege changes, and network policy enforcement. In `sidecar`
