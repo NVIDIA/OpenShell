@@ -325,6 +325,11 @@ dials subject to the terminal bypass fence. The Podman driver advertises this
 substrate through its driver-owned runtime capability; sandbox image and policy
 environment values cannot opt into it independently.
 
+The container spec sets Podman's DNS search list to `.`. Podman documents this
+value as disabling implicit search domains; direct bridge aliases still resolve
+through aardvark-dns. This keeps libc from expanding a policy endpoint into an
+unauthorized `<endpoint>.dns.podman` query after the exact lookup.
+
 A tmpfs is mounted at `/run/netns` in the container spec so the supervisor can
 create named network namespaces. In rootless Podman this directory does not
 exist on the host, so a private tmpfs gives the supervisor its own writable

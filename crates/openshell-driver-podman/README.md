@@ -247,7 +247,9 @@ Key points:
 - Policy DNS and transparent TCP: the driver advertises the complete
   `policy-dns-transparent-tcp` substrate. For explicit `protocol: tcp`
   endpoints, the supervisor installs namespace-local DNS listeners, synthetic
-  routes, and TCP redirect rules before starting the workload.
+  routes, and TCP redirect rules before starting the workload. The container
+  disables Podman's implicit DNS search suffix so policy DNS evaluates the
+  exact endpoint name requested by the workload.
 - Port publishing: the container spec still requests `host_port: 0` for the
   configured SSH port. The gateway SSH tunnel uses the supervisor relay rather
   than connecting directly to the published port.

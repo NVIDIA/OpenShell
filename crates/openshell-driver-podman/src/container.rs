@@ -228,6 +228,8 @@ struct ContainerSpec {
     /// via Podman's `host-gateway` magic so sandbox containers can reach
     /// the gateway server running on the host in rootless mode.
     hostadd: Vec<String>,
+    /// Search domains written to `/etc/resolv.conf` by Podman.
+    dns_search: Vec<String>,
     netns: NetNS,
     // Matches libpod's network spec format, which is `{name: {opts}}` where
     // empty opts is a unit struct rather than `()`. Keep as a map so JSON
@@ -1223,6 +1225,11 @@ pub fn build_container_spec_for_image(
         // reach services on the host. `host.openshell.internal` is the driver-
         // neutral alias used by policies and e2e tests.
         hostadd: hostadd_entries(config),
+        // Podman's documented `.` value removes implicit search domains while
+        // retaining its managed nameserver and direct network-alias lookups.
+        // Policy DNS must evaluate the exact endpoint names authored in policy;
+        // suffix-expanded names otherwise produce spurious policy denials.
+        dns_search: vec![".".into()],
         netns: NetNS {
             nsmode: "bridge".to_string(),
         },
@@ -1544,6 +1551,7 @@ mod tests {
         );
         assert_eq!(container["user"].as_str(), Some("0:0"));
         assert_eq!(container["image_pull_policy"].as_str(), Some("never"));
+        assert_eq!(container["dns_search"], serde_json::json!(["."]));
         assert_eq!(
             container["env"][openshell_core::sandbox_env::OCI_IMAGE_USER].as_str(),
             Some("app:staff")
