@@ -2,9 +2,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
 {{- if .Values.grpcRoute.backendTLSPolicy.enabled }}
-{{- if not .Values.grpcRoute.backendTLSPolicy.caCertificateConfigMapName }}
-{{- fail "grpcRoute.backendTLSPolicy.caCertificateConfigMapName is required when grpcRoute.backendTLSPolicy is enabled" }}
-{{- end }}
 {{- if .Values.server.disableTls }}
 {{- fail "grpcRoute.backendTLSPolicy requires the gateway pod to serve TLS; set server.disableTls=false" }}
 {{- end }}
@@ -24,6 +21,6 @@ spec:
     caCertificateRefs:
       - group: ""
         kind: ConfigMap
-        name: {{ .Values.grpcRoute.backendTLSPolicy.caCertificateConfigMapName }}
+        name: {{ include "openshell.backendCaConfigMapName" . }}
     hostname: {{ default (printf "%s.%s.svc.cluster.local" (include "openshell.fullname" .) .Release.Namespace) .Values.grpcRoute.backendTLSPolicy.hostname }}
 {{- end }}
