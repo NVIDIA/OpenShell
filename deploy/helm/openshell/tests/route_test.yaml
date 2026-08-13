@@ -58,6 +58,54 @@ tests:
       - failedTemplate:
           errorMessage: "openshiftRoute.enabled=true requires TLS (server.disableTls must be false) \u2014 a passthrough Route forwards encrypted traffic by SNI, so the gateway must terminate its own TLS."
 
+  - it: fails when external issuer is set but Route host is empty
+    set:
+      openshiftRoute.enabled: true
+      certManager.enabled: true
+      certManager.serverIssuerRef.name: letsencrypt-prod
+      certManager.serverDnsNames:
+        - openshell.example.com
+    asserts:
+      - failedTemplate:
+          errorMessage: "openshiftRoute.enabled=true with certManager.serverIssuerRef requires an explicit openshiftRoute.host \u2014 without one, OpenShift generates a hostname absent from certManager.serverDnsNames, causing the gateway to serve its internal certificate to external clients."
+
+  - it: accepts a Route host covered by a wildcard serverDnsNames entry
+    set:
+      openshiftRoute.enabled: true
+      openshiftRoute.host: gateway.example.com
+      certManager.enabled: true
+      certManager.serverIssuerRef.name: letsencrypt-prod
+      certManager.serverDnsNames:
+        - "*.example.com"
+    asserts:
+      - equal:
+          path: spec.host
+          value: gateway.example.com
+
+  - it: rejects a Route host not covered by wildcard or exact serverDnsNames
+    set:
+      openshiftRoute.enabled: true
+      openshiftRoute.host: gateway.other.com
+      certManager.enabled: true
+      certManager.serverIssuerRef.name: letsencrypt-prod
+      certManager.serverDnsNames:
+        - "*.example.com"
+    asserts:
+      - failedTemplate:
+          errorMessage: "openshiftRoute.host \"gateway.other.com\" is not covered by certManager.serverDnsNames [*.example.com] \u2014 the Route will forward SNI for a hostname the external certificate does not cover, causing TLS verification failures for CLI clients. Exact names and single-level wildcards (e.g. *.example.com) are checked."
+
+  - it: rejects a multi-level subdomain against a single-level wildcard
+    set:
+      openshiftRoute.enabled: true
+      openshiftRoute.host: deep.sub.example.com
+      certManager.enabled: true
+      certManager.serverIssuerRef.name: letsencrypt-prod
+      certManager.serverDnsNames:
+        - "*.example.com"
+    asserts:
+      - failedTemplate:
+          errorMessage: "openshiftRoute.host \"deep.sub.example.com\" is not covered by certManager.serverDnsNames [*.example.com] \u2014 the Route will forward SNI for a hostname the external certificate does not cover, causing TLS verification failures for CLI clients. Exact names and single-level wildcards (e.g. *.example.com) are checked."
+
   - it: renders custom annotations
     set:
       openshiftRoute.enabled: true

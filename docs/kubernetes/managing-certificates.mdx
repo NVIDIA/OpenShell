@@ -74,8 +74,6 @@ helm upgrade --install openshell \
   --version <version> \
   --namespace openshell \
   --set certManager.enabled=true \
-  --set certManager.clientCaFromServerTlsSecret=false \
-  --set server.tls.clientCaSecretName=openshell-ca-tls \
   --set certManager.serverIssuerRef.name=letsencrypt-prod \
   --set certManager.serverIssuerRef.kind=ClusterIssuer \
   --set certManager.serverDnsNames[0]=openshell.example.com
@@ -112,10 +110,10 @@ receive the ACME certificate (via SNI) which they cannot verify against the
 chart CA.
 </Note>
 
-Set `certManager.clientCaFromServerTlsSecret=false` whenever `serverIssuerRef`
-is set, and set `server.tls.clientCaSecretName` to a secret containing the
-client CA — by default that's `certManager.caSecretName` (`openshell-ca-tls`),
-the CA the chart issues the client certificate from.
+The default `clientCaFromServerTlsSecret=true` is correct even when
+`serverIssuerRef` is set: the internal server certificate is always signed
+by the chart CA (the same CA that signs the client certificate), so its
+`ca.crt` is the right trust anchor for mTLS verification.
 
 ## Next Steps
 

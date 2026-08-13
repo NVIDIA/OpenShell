@@ -19,6 +19,9 @@ One value is intentionally NOT rendered here:
 {{- if .Values.server.credentialDrivers.vault.enabled -}}
 {{- $credentialDrivers = append $credentialDrivers "vault" -}}
 {{- end -}}
+{{- if and .Values.certManager.serverIssuerRef.name (not .Values.certManager.enabled) }}
+{{- fail "certManager.serverIssuerRef.name is set but certManager.enabled is false \u2014 the external server certificate, its Secret mount, and the gateway TLS configuration all require cert-manager to be enabled. Set certManager.enabled=true or remove certManager.serverIssuerRef.name." }}
+{{- end }}
 apiVersion: v1
 kind: ConfigMap
 metadata:

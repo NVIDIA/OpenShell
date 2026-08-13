@@ -521,3 +521,12 @@ tests:
       - matchRegex:
           path: spec.template.spec.volumes[1].name
           pattern: '^sandbox-jwt$'
+
+  - it: fails when serverIssuerRef is set but certManager is disabled
+    template: templates/statefulset.yaml
+    set:
+      certManager.serverIssuerRef.name: letsencrypt-prod
+      certManager.enabled: false
+    asserts:
+      - failedTemplate:
+          errorMessage: "certManager.serverIssuerRef.name is set but certManager.enabled is false \u2014 the external server certificate, its Secret mount, and the gateway TLS configuration all require cert-manager to be enabled. Set certManager.enabled=true or remove certManager.serverIssuerRef.name."

@@ -110,8 +110,6 @@ helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart \
   --set securityContext.runAsUser=null \
   --set server.disableTls=false \
   --set certManager.enabled=true \
-  --set certManager.clientCaFromServerTlsSecret=false \
-  --set server.tls.clientCaSecretName=openshell-ca-tls \
   --set certManager.serverIssuerRef.name=<cluster-issuer-name> \
   --set certManager.serverIssuerRef.kind=ClusterIssuer \
   --set certManager.serverDnsNames[0]=<external-hostname> \
@@ -123,8 +121,7 @@ helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart \
 
 | Override | Reason |
 |---|---|
-| `certManager.clientCaFromServerTlsSecret=false` + `server.tls.clientCaSecretName` | Points the gateway's client-verification CA at `certManager.caSecretName` (the chart's own CA secret, `openshell-ca-tls` by default). Supervisors connect via internal service names and receive the internal certificate signed by this CA. |
-| `certManager.serverIssuerRef` | Creates a second server certificate from your Issuer or ClusterIssuer for external clients. The gateway uses SNI to present this cert for the external hostname while continuing to present the internal (chart CA) cert to supervisors. |
+| `certManager.serverIssuerRef` | Creates a second server certificate from your Issuer or ClusterIssuer for external clients. The gateway uses SNI to present this cert for the external hostname while continuing to present the internal (chart CA) cert to supervisors. The internal certificate's `ca.crt` is the chart CA that also signed the client cert, so the default `clientCaFromServerTlsSecret=true` is correct. |
 | `openshiftRoute.enabled` / `openshiftRoute.host` | Creates an OpenShift Route with TLS passthrough — the router forwards the encrypted connection by SNI without decrypting, so the gateway uses the SNI hostname to select the external certificate. |
 | `server.oidc.issuer` / `server.oidc.audience` | Configures server-side OIDC validation. Without these, the gateway expects mTLS client certificates and rejects OIDC-only CLI connections. See [Access Control](/kubernetes/access-control). |
 

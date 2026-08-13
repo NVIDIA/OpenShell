@@ -408,20 +408,22 @@ certManager:
   enabled: false
   # -- Secret created for the intermediate CA (Certificate with isCA: true).
   caSecretName: openshell-ca-tls
-  # -- Override the issuerRef for the server Certificate (e.g. a real ACME
-  # ClusterIssuer for a publicly-trusted cert on an external hostname). Leave
-  # name empty to use the chart's own self-signed CA issuer (default).
+  # -- Override the issuerRef for the external server Certificate (e.g. a real
+  # ACME ClusterIssuer for a publicly-trusted cert on an external hostname).
+  # When set, the chart creates a second server certificate from this issuer
+  # with only the hostnames in serverDnsNames; the internal server certificate
+  # is always signed by the chart's own CA. Leave name empty to use the chart
+  # CA for all server certificates (default). Requires certManager.enabled=true.
   serverIssuerRef:
     name: ""
     kind: ""
     group: ""
-  # -- Mount gateway client CA from the server TLS secret's ca.crt (populated by
-  # cert-manager for certs issued by a CA Issuer). Set to false when
-  # serverIssuerRef points at an external issuer (its secret's ca.crt would be
-  # that issuer's chain, not the CA that signs the client cert). When false,
-  # also set server.tls.clientCaSecretName to a secret containing the actual
-  # client CA — for example caSecretName's value, since that's the CA the
-  # client certificate above is issued from by default.
+  # -- Mount gateway client CA from the internal server TLS secret's ca.crt.
+  # The internal server certificate is always signed by the chart CA — the same
+  # CA that signs the client (mTLS) certificate — so the default (true) is
+  # correct for all configurations, including when serverIssuerRef is set.
+  # Only set to false if you mount the client CA from a separate secret via
+  # server.tls.clientCaSecretName.
   clientCaFromServerTlsSecret: true
   # -- Duration for cert-manager-issued certificates.
   certificateDuration: 8760h

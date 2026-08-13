@@ -318,15 +318,16 @@ helm -n openshell get values openshell | grep -E 'grpcEndpoint|clientCaFromServe
 ```
 
 Less commonly, `UnknownCA` can occur if the gateway's client-verification CA
-is misconfigured.  The chart fails at render time if
-`clientCaFromServerTlsSecret` is still true when `serverIssuerRef` is set, but
-this can still occur with pre-existing releases or manual overrides. Set
-`certManager.clientCaFromServerTlsSecret=false` and
-`server.tls.clientCaSecretName` to a secret that actually contains the CA that
-signs the client certificate (`certManager.caSecretName`'s value by default):
+is misconfigured.  The default `clientCaFromServerTlsSecret=true` is correct
+for all configurations — the internal server certificate is always signed by
+the chart CA (the same CA that signs the client cert), so its `ca.crt` is
+the right trust anchor.  Only override this if you intentionally mount a
+separate client CA via `server.tls.clientCaSecretName`.  Verify the mounted
+client CA matches the CA that signed the client certificate:
 
 ```bash
-kubectl -n openshell get secret openshell-ca-tls -o jsonpath='{.data.ca\.crt}' | base64 -d | openssl x509 -noout -subject
+kubectl -n openshell get statefulset openshell -o jsonpath='{.spec.template.spec.volumes[?(@.name=="tls-client-ca")]}' | jq .
+# Should show items filter for ca.crt from openshell-server-tls
 ```
 
 If `server.providerTokenGrants.spiffe.enabled=true`, the gateway should still
