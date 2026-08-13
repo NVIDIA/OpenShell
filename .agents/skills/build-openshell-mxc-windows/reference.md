@@ -46,8 +46,9 @@ if ($arch -eq [System.Runtime.InteropServices.Architecture]::Arm64) {
 The native test tasks reject a target that does not match the host architecture.
 Do not report x64 compatibility-under-emulation coverage from an ARM64 run.
 
-The wrapper adds missing rustup targets and clears inherited
-`RUSTC_WRAPPER`. It does not install Visual Studio, Rust, Docker, Kubernetes,
+The wrapper adds missing rustup targets and preserves an inherited
+`RUSTC_WRAPPER` when the command is available. Otherwise, it warns and clears
+the setting. It does not install Visual Studio, Rust, Docker, Kubernetes,
 Podman, WSL, Hyper-V, or VM tooling.
 
 On Windows, `mise run pre-commit` routes `rust:check`, `rust:lint`, and
