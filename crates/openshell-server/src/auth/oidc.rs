@@ -95,6 +95,8 @@ struct JwkKey {
 pub struct OidcClaims {
     pub sub: String,
     #[serde(default)]
+    pub exp: i64,
+    #[serde(default)]
     pub preferred_username: Option<String>,
     #[serde(default)]
     #[allow(dead_code)]
@@ -287,6 +289,11 @@ impl JwksCache {
     /// This is the authentication step — it verifies the caller's identity
     /// but does not check authorization (that's `authz::AuthzPolicy::check`).
     pub async fn validate_token(&self, token: &str) -> Result<Identity, Status> {
+        Ok(self.validate_token_details(token).await?.identity)
+    }
+
+    /// Validate a JWT and return the derived identity plus verified token metadata.
+    pub async fn validate_token_details(&self, token: &str) -> Result<ValidatedOidcToken, Status> {
         crate::install_jsonwebtoken_crypto_provider();
 
         self.refresh_if_stale().await.map_err(|e| {
@@ -334,6 +341,10 @@ impl JwksCache {
         })?;
 
         let mut claims = token_data.claims;
+        let expires_at_ms = claims.exp.saturating_mul(1000);
+        if expires_at_ms <= 0 {
+            return Err(Status::unauthenticated("invalid token: invalid exp"));
+        }
         claims.extract_roles(&self.config.roles_claim);
 
         let scopes = if self.config.scopes_claim.is_empty() {
@@ -342,14 +353,23 @@ impl JwksCache {
             claims.extract_scopes(&self.config.scopes_claim)
         };
 
-        Ok(Identity {
-            subject: claims.sub,
-            display_name: claims.preferred_username,
-            roles: claims.roles,
-            scopes,
-            provider: IdentityProvider::Oidc,
+        Ok(ValidatedOidcToken {
+            identity: Identity {
+                subject: claims.sub,
+                display_name: claims.preferred_username,
+                roles: claims.roles,
+                scopes,
+                provider: IdentityProvider::Oidc,
+            },
+            expires_at_ms,
         })
     }
+}
+
+/// A verified OIDC access token and server-derived metadata.
+pub struct ValidatedOidcToken {
+    pub identity: Identity,
+    pub expires_at_ms: i64,
 }
 
 /// Authenticator that validates `Authorization: Bearer <jwt>` headers against

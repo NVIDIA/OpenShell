@@ -195,6 +195,55 @@ impl OpenShell for TestOpenShell {
         }))
     }
 
+    async fn get_sandbox_delegated_identity_status(
+        &self,
+        _request: tonic::Request<proto::GetSandboxDelegatedIdentityStatusRequest>,
+    ) -> Result<Response<proto::GetSandboxDelegatedIdentityStatusResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn withdraw_sandbox_delegated_identity(
+        &self,
+        _request: tonic::Request<proto::WithdrawSandboxDelegatedIdentityRequest>,
+    ) -> Result<Response<proto::WithdrawSandboxDelegatedIdentityResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn extend_sandbox_delegated_identity(
+        &self,
+        _request: tonic::Request<proto::ExtendSandboxDelegatedIdentityRequest>,
+    ) -> Result<Response<proto::ExtendSandboxDelegatedIdentityResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn list_delegated_identity_credentials(
+        &self,
+        _request: tonic::Request<proto::ListDelegatedIdentityCredentialsRequest>,
+    ) -> Result<Response<proto::ListDelegatedIdentityCredentialsResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn get_delegated_identity_credential_status(
+        &self,
+        _request: tonic::Request<proto::GetDelegatedIdentityCredentialStatusRequest>,
+    ) -> Result<Response<proto::GetDelegatedIdentityCredentialStatusResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn revoke_delegated_identity_credential(
+        &self,
+        _request: tonic::Request<proto::RevokeDelegatedIdentityCredentialRequest>,
+    ) -> Result<Response<proto::RevokeDelegatedIdentityCredentialResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn delete_delegated_identity_credential(
+        &self,
+        _request: tonic::Request<proto::DeleteDelegatedIdentityCredentialRequest>,
+    ) -> Result<Response<proto::DeleteDelegatedIdentityCredentialResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
     async fn get_sandbox(
         &self,
         request: tonic::Request<proto::GetSandboxRequest>,

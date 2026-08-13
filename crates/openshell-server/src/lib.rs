@@ -30,6 +30,7 @@ mod compute;
 pub mod config_file;
 mod credentials;
 mod defaults;
+mod delegated_identity;
 mod gateway_listener;
 mod grpc;
 mod http;

@@ -85,6 +85,8 @@ credential_drivers        = ["kubernetes-secrets"]
 
 sandbox_namespace     = "openshell"
 ssh_session_ttl_secs  = 3600
+# Maximum sandbox delegated identity window, in seconds.
+max_delegated_identity_duration_secs = 86400
 
 # Reject invalid policy generations securely by default. Set
 # "retain_last_valid" only when availability takes priority.

@@ -1075,6 +1075,7 @@ mod tests {
             labels: HashMap::new(),
             annotations: HashMap::new(),
             workspace: String::new(),
+            delegated_identity: None,
         };
 
         let bytes = request.encode_to_vec();

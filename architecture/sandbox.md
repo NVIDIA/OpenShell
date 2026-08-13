@@ -265,13 +265,23 @@ Provider profiles can also declare dynamic token grants. For matching HTTP
 endpoints, the supervisor obtains or exchanges OAuth2 access tokens, caches
 them, and injects them before forwarding the request. `client_credentials`
 grants use the supervisor SPIFFE JWT-SVID directly as the client assertion.
-`token_exchange` grants ask the gateway to broker an intermediate token using a
-stored provider subject credential and the gateway's own SPIFFE JWT-SVID; the
-supervisor then exchanges that intermediate token for the final upstream token
-using its own JWT-SVID. The gateway validates that its own JWT-SVID has the
+`token_exchange` grants ask the gateway to broker an intermediate token using
+either a stored provider subject credential or the sandbox creator's delegated
+OIDC identity, plus the gateway's own SPIFFE JWT-SVID; the supervisor then
+exchanges that intermediate token for the final upstream token using its own
+JWT-SVID. Delegated identity is opt-in at sandbox creation, stores one
+gateway-scoped credential per issuer/client/user subject, and stores only a
+per-sandbox authorization window on the sandbox. Only the delegating user can
+extend or withdraw that window; workspace admins and platform admins can still
+delete the sandbox to recover workspace resources. The gateway rejects exchange
+after expiry, withdrawal, missing credential state, or credential revocation.
+The gateway validates that its own JWT-SVID has the
 requested audience, a SPIFFE subject, and a non-expired `exp` claim when
-present. It also validates that the stored subject credential is declared by the
-provider profile, and that the supervisor JWT-SVID is a well-formed
+present. For provider-credential subject tokens, it also validates that the
+stored subject credential is declared by the provider profile. For delegated
+identity subject tokens, it validates that the sandbox was created with active
+delegation for the stored credential principal. The gateway also verifies that
+the supervisor JWT-SVID is a well-formed
 three-segment JWT with a SPIFFE subject in the same trust domain as the gateway
 SVID. The gateway verifies the supervisor JWT-SVID signature with JWT bundles
 fetched from its SPIFFE Workload API. Token grant endpoints are HTTPS-only

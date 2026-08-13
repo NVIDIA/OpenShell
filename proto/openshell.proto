@@ -51,6 +51,36 @@ service OpenShell {
     };
   }
 
+  // Fetch delegated identity status for one sandbox.
+  rpc GetSandboxDelegatedIdentityStatus(GetSandboxDelegatedIdentityStatusRequest)
+      returns (GetSandboxDelegatedIdentityStatusResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "sandbox:read"
+      workspace_role: "user"
+    };
+  }
+
+  // Withdraw delegated identity from one sandbox.
+  rpc WithdrawSandboxDelegatedIdentity(WithdrawSandboxDelegatedIdentityRequest)
+      returns (WithdrawSandboxDelegatedIdentityResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "sandbox:write"
+      workspace_role: "user"
+    };
+  }
+
+  // Extend delegated identity for one sandbox.
+  rpc ExtendSandboxDelegatedIdentity(ExtendSandboxDelegatedIdentityRequest)
+      returns (ExtendSandboxDelegatedIdentityResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "sandbox:write"
+      workspace_role: "user"
+    };
+  }
+
   // Fetch a sandbox by name.
   rpc GetSandbox(GetSandboxRequest) returns (SandboxResponse) {
     option (openshell.options.v1.authorization) = {
@@ -322,6 +352,46 @@ service OpenShell {
       auth_mode: "bearer"
       scope: "provider:write"
       workspace_role: "admin"
+    };
+  }
+
+  // List delegated identity credentials visible to the caller.
+  rpc ListDelegatedIdentityCredentials(ListDelegatedIdentityCredentialsRequest)
+      returns (ListDelegatedIdentityCredentialsResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "provider:read"
+      global_role: "platform_admin"
+    };
+  }
+
+  // Fetch delegated identity credential status.
+  rpc GetDelegatedIdentityCredentialStatus(GetDelegatedIdentityCredentialStatusRequest)
+      returns (GetDelegatedIdentityCredentialStatusResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "provider:read"
+      global_role: "platform_admin"
+    };
+  }
+
+  // Revoke a delegated identity credential.
+  rpc RevokeDelegatedIdentityCredential(RevokeDelegatedIdentityCredentialRequest)
+      returns (RevokeDelegatedIdentityCredentialResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "provider:write"
+      global_role: "platform_admin"
+    };
+  }
+
+  // Delete a delegated identity credential.
+  rpc DeleteDelegatedIdentityCredential(DeleteDelegatedIdentityCredentialRequest)
+      returns (DeleteDelegatedIdentityCredentialResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "provider:write"
+      global_role: "platform_admin"
     };
   }
 
@@ -798,9 +868,21 @@ message Sandbox {
   SandboxSpec spec = 2;
   // Latest user-facing observed status derived by the gateway.
   SandboxStatus status = 3;
+  reserved 4, 5, 6;
+  reserved "phase", "current_policy_version", "delegated_identity";
+}
 
-  reserved 4, 5;
-  reserved "phase", "current_policy_version";
+message SandboxDelegatedIdentity {
+  string credential_id = 1;
+  string principal_subject = 2;
+  int64 delegated_until_ms = 3;
+  int64 withdrawn_at_ms = 4;
+}
+
+message SandboxDelegatedIdentityRecord {
+  openshell.datamodel.v1.ObjectMeta metadata = 1;
+  string sandbox_id = 2;
+  SandboxDelegatedIdentity delegated_identity = 3;
 }
 
 // Desired sandbox configuration provided through the public API.
@@ -948,6 +1030,54 @@ message CreateSandboxRequest {
   map<string, string> annotations = 4;
   // Workspace for the sandbox. Empty defaults to "default".
   string workspace = 5;
+  // Optional gateway-owned delegated identity material. The server persists
+  // this as a gateway-scoped credential and stores only delegation metadata on
+  // the sandbox.
+  DelegatedIdentityRequest delegated_identity = 6;
+}
+
+message DelegatedIdentityRequest {
+  int64 delegated_until_ms = 1;
+  string issuer = 2;
+  string client_id = 3;
+  string refresh_token = 4 [(openshell.options.v1.secret) = true];
+  string access_token = 5 [(openshell.options.v1.secret) = true];
+  reserved 6;
+  reserved "access_token_expires_at_ms";
+  string scopes = 7;
+  string audience = 8;
+}
+
+message GetSandboxDelegatedIdentityStatusRequest {
+  string name = 1;
+  string workspace = 2;
+}
+
+message GetSandboxDelegatedIdentityStatusResponse {
+  SandboxDelegatedIdentity delegated_identity = 1;
+  int64 now_ms = 2;
+  int64 credential_revoked_at_ms = 3;
+  bool credential_missing = 4;
+}
+
+message WithdrawSandboxDelegatedIdentityRequest {
+  string name = 1;
+  string workspace = 2;
+}
+
+message WithdrawSandboxDelegatedIdentityResponse {
+  Sandbox sandbox = 1;
+  bool withdrawn = 2;
+}
+
+message ExtendSandboxDelegatedIdentityRequest {
+  string name = 1;
+  string workspace = 2;
+  DelegatedIdentityRequest delegated_identity = 3;
+}
+
+message ExtendSandboxDelegatedIdentityResponse {
+  Sandbox sandbox = 1;
 }
 
 // Get sandbox request.
@@ -1633,6 +1763,73 @@ message StoredProviderCredentialRefreshState {
   // collision reservation, and env-key surfacing so later profile edits cannot
   // silently redirect writes.
   map<string, string> additional_output_keys = 17;
+}
+
+message DelegatedIdentityCredential {
+  openshell.datamodel.v1.ObjectMeta metadata = 1;
+  string issuer = 2;
+  string client_id = 3;
+  string principal_subject = 4;
+  string refresh_token = 5 [(openshell.options.v1.secret) = true];
+  string access_token = 6 [(openshell.options.v1.secret) = true];
+  int64 access_token_expires_at_ms = 7;
+  string scopes = 8;
+  string audience = 9;
+  int64 last_refresh_at_ms = 10;
+  int64 revoked_at_ms = 11;
+}
+
+message DelegatedIdentityCredentialSummary {
+  openshell.datamodel.v1.ObjectMeta metadata = 1;
+  string issuer = 2;
+  string client_id = 3;
+  string principal_subject = 4;
+  bool refresh_token_present = 5;
+  bool access_token_present = 6;
+  int64 access_token_expires_at_ms = 7;
+  string scopes = 8;
+  string audience = 9;
+  int64 last_refresh_at_ms = 10;
+  int64 revoked_at_ms = 11;
+}
+
+message ListDelegatedIdentityCredentialsRequest {
+  uint32 limit = 1;
+  uint32 offset = 2;
+}
+
+message ListDelegatedIdentityCredentialsResponse {
+  repeated DelegatedIdentityCredentialSummary credentials = 1;
+}
+
+message GetDelegatedIdentityCredentialStatusRequest {
+  string id = 1;
+}
+
+message GetDelegatedIdentityCredentialStatusResponse {
+  DelegatedIdentityCredentialSummary credential = 1;
+  int64 now_ms = 2;
+}
+
+message RevokeDelegatedIdentityCredentialRequest {
+  string id = 1;
+  uint64 expected_resource_version = 2;
+}
+
+message RevokeDelegatedIdentityCredentialResponse {
+  reserved 1;
+  bool revoked = 2;
+  int64 revoked_at_ms = 3;
+  uint64 resource_version = 4;
+}
+
+message DeleteDelegatedIdentityCredentialRequest {
+  string id = 1;
+  uint64 expected_resource_version = 2;
+}
+
+message DeleteDelegatedIdentityCredentialResponse {
+  bool deleted = 1;
 }
 
 message GetProviderRefreshStatusRequest {
