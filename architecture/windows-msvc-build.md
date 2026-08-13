@@ -162,10 +162,10 @@ The local aggregate `windows:ci` task cross-builds ARM64 on an x64 host. The
 GitHub x64 job runs only the x64 tasks, and native ARM64 tests remain exclusive
 to an ARM64 runner.
 
-The ARM64 job is scaffolded but disabled until a Windows ARM64 runner is
-available. Once enabled, it should run check, release build, native workspace
-tests, and the focused unsupported-driver contracts for
-`aarch64-pc-windows-msvc`.
+The ARM64 job uses the hosted `windows-11-arm` runner but remains disabled
+unless the repository variable `ENABLE_WINDOWS_ARM64` is set to `true`. Before
+enabling it, measure the native runner and extend it to follow the same
+lint/test seed and dependent-build split as x64.
 
 ## Validation Contract
 
