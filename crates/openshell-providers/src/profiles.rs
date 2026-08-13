@@ -2489,31 +2489,43 @@ fn validate_token_grant_subject_token(
                 return diagnostics;
             };
 
-            let source_value = subject_token.source.trim();
-            if source_value != "provider_credential" {
-                diagnostics.push(ProfileValidationDiagnostic::error(
-                    source,
-                    profile_id,
-                    "credentials.token_grant.subject_token.source",
-                    "subject_token.source must be provider_credential",
-                ));
-            }
-
             let subject_credential = subject_token.credential.trim();
-            if subject_credential.is_empty() {
-                diagnostics.push(ProfileValidationDiagnostic::error(
-                    source,
-                    profile_id,
-                    "credentials.token_grant.subject_token.credential",
-                    "subject_token.credential is required",
-                ));
-            } else if !credential_names.contains(subject_credential) {
-                diagnostics.push(ProfileValidationDiagnostic::error(
-                    source,
-                    profile_id,
-                    "credentials.token_grant.subject_token.credential",
-                    format!("unknown subject token credential: {subject_credential}"),
-                ));
+            match subject_token.source.trim() {
+                "provider_credential" => {
+                    if subject_credential.is_empty() {
+                        diagnostics.push(ProfileValidationDiagnostic::error(
+                            source,
+                            profile_id,
+                            "credentials.token_grant.subject_token.credential",
+                            "subject_token.credential is required",
+                        ));
+                    } else if !credential_names.contains(subject_credential) {
+                        diagnostics.push(ProfileValidationDiagnostic::error(
+                            source,
+                            profile_id,
+                            "credentials.token_grant.subject_token.credential",
+                            format!("unknown subject token credential: {subject_credential}"),
+                        ));
+                    }
+                }
+                "sandbox_delegated_identity" => {
+                    if !subject_credential.is_empty() {
+                        diagnostics.push(ProfileValidationDiagnostic::error(
+                            source,
+                            profile_id,
+                            "credentials.token_grant.subject_token.credential",
+                            "sandbox_delegated_identity subject_token must not set credential",
+                        ));
+                    }
+                }
+                _ => {
+                    diagnostics.push(ProfileValidationDiagnostic::error(
+                        source,
+                        profile_id,
+                        "credentials.token_grant.subject_token.source",
+                        "subject_token.source must be provider_credential or sandbox_delegated_identity",
+                    ));
+                }
             }
         }
         ProviderCredentialTokenGrantType::Unspecified => {

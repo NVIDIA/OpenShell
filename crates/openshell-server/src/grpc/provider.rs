@@ -3646,23 +3646,46 @@ pub(super) async fn handle_exchange_provider_subject_token(
         .subject_token
         .as_ref()
         .ok_or_else(|| Status::failed_precondition("token_exchange subject_token is missing"))?;
-    if subject_token.source != "provider_credential" {
-        return Err(Status::failed_precondition(
-            "unsupported subject_token source",
-        ));
-    }
-    if !profile_proto
-        .credentials
-        .iter()
-        .any(|credential| credential.name == subject_token.credential)
-    {
-        return Err(Status::failed_precondition(
-            "subject token credential not declared by provider profile",
-        ));
-    }
-    let stored_subject_token =
-        resolve_subject_token_credential(&state.credentials, &provider, &subject_token.credential)
-            .await?;
+    let (stored_subject_token, subject_token_expires_at_ms, subject_cache_key) =
+        match subject_token.source.as_str() {
+            "provider_credential" => {
+                if !profile_proto
+                    .credentials
+                    .iter()
+                    .any(|credential| credential.name == subject_token.credential)
+                {
+                    return Err(Status::failed_precondition(
+                        "subject token credential not declared by provider profile",
+                    ));
+                }
+                (
+                    resolve_subject_token_credential(
+                        &state.credentials,
+                        &provider,
+                        &subject_token.credential,
+                    )
+                    .await?,
+                    provider_credential_expires_at_ms(&provider, &subject_token.credential),
+                    subject_token.credential.clone(),
+                )
+            }
+            "sandbox_delegated_identity" => {
+                if !subject_token.credential.trim().is_empty() {
+                    return Err(Status::failed_precondition(
+                        "sandbox_delegated_identity subject_token must not set credential",
+                    ));
+                }
+                let (access_token, expires_at_ms, credential_id) =
+                    crate::delegated_identity::resolve_subject_access_token(state, &sandbox)
+                        .await?;
+                (access_token, expires_at_ms, credential_id)
+            }
+            _ => {
+                return Err(Status::failed_precondition(
+                    "unsupported subject_token source",
+                ));
+            }
+        };
 
     let jwt_svid_audience =
         effective_jwt_svid_audience(&token_grant.token_endpoint, &token_grant.jwt_svid_audience);
@@ -3679,7 +3702,7 @@ pub(super) async fn handle_exchange_provider_subject_token(
     let intermediate_cache_key = intermediate_token_cache_key(IntermediateTokenCacheKeyInput {
         provider: &provider,
         dynamic_credential: &req.credential_key,
-        subject_credential: &subject_token.credential,
+        subject_credential: &subject_cache_key,
         token_endpoint: &token_grant.token_endpoint,
         client_assertion_type: effective_client_assertion_type(&token_grant.client_assertion_type),
         subject_token_type: effective_token_type(&subject_token.subject_token_type),
@@ -3711,7 +3734,7 @@ pub(super) async fn handle_exchange_provider_subject_token(
             sandbox_id = %req.sandbox_id,
             provider = %req.provider,
             credential_key = %req.credential_key,
-            subject_credential = %subject_token.credential,
+            subject_credential = %subject_cache_key,
             client_assertion_type = %effective_client_assertion_type(&token_grant.client_assertion_type),
             gateway_svid_issuer = %gateway_claims.iss,
             gateway_svid_subject = %gateway_claims.sub,
@@ -3727,7 +3750,7 @@ pub(super) async fn handle_exchange_provider_subject_token(
     let cache_expires_at_ms = intermediate_token_cache_expires_at_ms(
         &token_response,
         token_grant.cache_ttl_seconds,
-        provider_credential_expires_at_ms(&provider, &subject_token.credential),
+        subject_token_expires_at_ms,
         supervisor_claims.exp,
     );
     if cache_expires_at_ms > crate::persistence::current_time_ms() {
