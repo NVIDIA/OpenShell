@@ -111,7 +111,7 @@ jobs:
       - name: Configure GHA sccache backend
         # Exposes ACTIONS_CACHE_URL / ACTIONS_RUNTIME_TOKEN before `mise install`
         # compiles cargo-installed tools through RUSTC_WRAPPER=sccache.
-        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
 
       - name: Install tools
         run: mise install --locked
