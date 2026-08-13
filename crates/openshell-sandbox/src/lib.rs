@@ -2229,7 +2229,8 @@ fn discover_policy_from_disk_or_default() -> openshell_core::proto::SandboxPolic
 /// hardcoded restrictive default if the file is missing or invalid.
 fn discover_policy_from_path(path: &std::path::Path) -> openshell_core::proto::SandboxPolicy {
     use openshell_policy::{
-        parse_sandbox_policy, restrictive_default_policy, validate_sandbox_policy,
+        SandboxIdentityLimits, parse_sandbox_policy, restrictive_default_policy,
+        validate_sandbox_policy_with_limits,
     };
 
     let Ok(yaml) = std::fs::read_to_string(path) else {
@@ -2260,7 +2261,9 @@ fn discover_policy_from_path(path: &std::path::Path) -> openshell_core::proto::S
     match parse_sandbox_policy(&yaml) {
         Ok(policy) => {
             // Validate the disk-loaded policy for safety.
-            if let Err(violations) = validate_sandbox_policy(&policy) {
+            if let Err(violations) =
+                validate_sandbox_policy_with_limits(&policy, SandboxIdentityLimits::from_env())
+            {
                 let messages: Vec<String> = violations.iter().map(ToString::to_string).collect();
                 ocsf_emit!(DetectionFindingBuilder::new(ocsf_ctx())
                     .activity(ActivityId::Open)

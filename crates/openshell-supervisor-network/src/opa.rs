@@ -369,7 +369,9 @@ impl OpaEngine {
     /// data under the `sandbox` key (matching `data.sandbox.*` references in
     /// the rego rules).
     ///
-    /// Expands access presets and validates L7 config.
+    /// Expands access presets and validates L7 config. Process identity
+    /// minima come from `OPENSHELL_MIN_SANDBOX_UID` and
+    /// `OPENSHELL_MIN_SANDBOX_GID`.
     pub fn from_proto(proto: &ProtoSandboxPolicy) -> Result<Self> {
         Self::from_proto_with_pid(proto, 0)
     }
@@ -407,7 +409,10 @@ impl OpaEngine {
         }
 
         emit_binary_identity_mode(require_binary_identity, "proto");
-        if let Err(violations) = openshell_policy::validate_sandbox_policy(proto) {
+        if let Err(violations) = openshell_policy::validate_sandbox_policy_with_limits(
+            proto,
+            openshell_policy::SandboxIdentityLimits::from_env(),
+        ) {
             let errors = violations
                 .iter()
                 .map(ToString::to_string)
@@ -1910,12 +1915,16 @@ fn proto_to_opa_data_json(proto: &ProtoSandboxPolicy, entrypoint_pid: u32) -> St
 )]
 mod tests {
     use super::*;
+    use std::sync::{LazyLock, Mutex};
 
     use openshell_core::proto::{
         FilesystemPolicy as ProtoFs, L7Allow, L7QueryMatcher, L7Rule, NetworkBinary,
         NetworkEndpoint, NetworkMiddlewareConfig, NetworkPolicyRule, ProcessPolicy as ProtoProc,
         SandboxPolicy as ProtoSandboxPolicy,
     };
+    use temp_env::with_vars;
+
+    static IDENTITY_LIMIT_ENV: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
     const TEST_POLICY: &str = include_str!("../data/sandbox-policy.rego");
     const TEST_DATA_YAML: &str = include_str!("../testdata/sandbox-policy.yaml");
@@ -2527,6 +2536,43 @@ network_policies:
         );
         assert_eq!(config.process.run_as_user.as_deref(), Some("sandbox"));
         assert_eq!(config.process.run_as_group.as_deref(), Some("sandbox"));
+    }
+
+    fn proto_with_numeric_identity(uid: &str, gid: &str) -> ProtoSandboxPolicy {
+        let mut proto = test_proto();
+        proto.process = Some(ProtoProc {
+            run_as_user: uid.to_string(),
+            run_as_group: gid.to_string(),
+        });
+        proto
+    }
+
+    #[test]
+    fn from_proto_accepts_system_ids_when_env_min_is_one() {
+        let _guard = IDENTITY_LIMIT_ENV.lock().unwrap();
+        with_vars(
+            [
+                (openshell_core::sandbox_env::MIN_SANDBOX_UID, Some("1")),
+                (openshell_core::sandbox_env::MIN_SANDBOX_GID, Some("1")),
+            ],
+            || {
+                assert!(
+                    OpaEngine::from_proto(&proto_with_numeric_identity("500", "500")).is_ok(),
+                    "UID 500 must be accepted when min_sandbox_uid is 1"
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn from_proto_rejects_uid_below_default_min() {
+        let _guard = IDENTITY_LIMIT_ENV.lock().unwrap();
+        let Err(error) = OpaEngine::from_proto(&proto_with_numeric_identity("500", "500")) else {
+            panic!("UID 500 is below the default minimum");
+        };
+        let message = error.to_string();
+        assert!(message.contains("run_as_user"));
+        assert!(message.contains("500"));
     }
 
     // ========================================================================
