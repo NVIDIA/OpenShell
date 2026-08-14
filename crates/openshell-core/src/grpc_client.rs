@@ -32,6 +32,7 @@ use crate::proto::{
 };
 use crate::sandbox_env;
 use miette::{IntoDiagnostic, Result, WrapErr};
+use openshell_extension_core::{BearerTokenSlot, ExtensionCredentialStore};
 use tonic::Status;
 use tonic::metadata::AsciiMetadataValue;
 use tonic::service::interceptor::InterceptedService;
@@ -349,7 +350,9 @@ async fn refresh_token_loop(
         let sleep = compute_refresh_delay(&slot);
         tokio::time::sleep(sleep).await;
         match client
-            .refresh_sandbox_token(RefreshSandboxTokenRequest {})
+            .refresh_sandbox_token(RefreshSandboxTokenRequest {
+                extension_service_names: Vec::new(),
+            })
             .await
         {
             Ok(resp) => {
@@ -412,6 +415,91 @@ async fn refresh_token_loop(
             }
         }
     }
+}
+
+fn now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| {
+            i64::try_from(duration.as_millis()).unwrap_or(i64::MAX)
+        })
+}
+
+/// Registration names to request credentials for.
+///
+/// Registrations the operator opted out of extension authentication have no
+/// credential to request; asking for one is rejected by the gateway.
+fn authenticated_service_names(
+    services: &[crate::proto::SupervisorMiddlewareService],
+) -> Vec<String> {
+    services
+        .iter()
+        .filter(|service| !service.allow_insecure_transport)
+        .map(|service| service.name.clone())
+        .collect()
+}
+
+async fn refresh_extension_credentials_with_client(
+    client: &mut OpenShellClient<AuthedChannel>,
+    store: &ExtensionCredentialStore,
+    services: &[crate::proto::SupervisorMiddlewareService],
+) -> Result<HashMap<String, BearerTokenSlot>> {
+    let names = authenticated_service_names(services);
+    if names.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let response = client
+        .refresh_sandbox_token(RefreshSandboxTokenRequest {
+            extension_service_names: names.clone(),
+        })
+        .await
+        .into_diagnostic()
+        .wrap_err("failed to refresh extension service credentials")?
+        .into_inner();
+
+    // The same refresh response renews the gateway credential. Install it
+    // before returning so all process-wide gateway clients stay current. This
+    // is a superset of what the dedicated renewal loop would do, so letting it
+    // land early is harmless.
+    install_token_slot(&response.token)?;
+
+    // Validate the whole response before mutating any slot, so a malformed or
+    // partial reply cannot leave the store half-rotated.
+    let expected = names
+        .iter()
+        .map(String::as_str)
+        .collect::<std::collections::HashSet<_>>();
+    let mut validated = HashMap::with_capacity(response.extension_credentials.len());
+    for credential in response.extension_credentials {
+        if !expected.contains(credential.service_name.as_str())
+            || validated.contains_key(&credential.service_name)
+        {
+            return Err(miette::miette!(
+                "gateway returned an unexpected or duplicate extension credential"
+            ));
+        }
+        validated.insert(
+            credential.service_name,
+            (credential.token, credential.expires_at_ms),
+        );
+    }
+    if validated.len() != expected.len() {
+        return Err(miette::miette!(
+            "gateway omitted one or more requested extension credentials"
+        ));
+    }
+
+    let now_ms = now_ms();
+    let mut selected = HashMap::with_capacity(validated.len());
+    for (name, (token, expires_at_ms)) in validated {
+        let slot = store
+            .install(&name, &token, expires_at_ms, now_ms)
+            .into_diagnostic()
+            .wrap_err("gateway returned an invalid extension credential")?;
+        selected.insert(name, slot);
+    }
+    Ok(selected)
 }
 
 /// Compute the next refresh delay: 80 % of the time remaining until the
@@ -776,6 +864,10 @@ pub async fn fetch_provider_environment(
 pub struct CachedOpenShellClient {
     client: OpenShellClient<AuthedChannel>,
     workspace: Arc<tokio::sync::OnceCell<String>>,
+    /// Extension credentials for this supervisor. Cloning the client shares
+    /// the store, so the middleware registry and the polling loop that rotates
+    /// it observe the same slots.
+    extension_credentials: ExtensionCredentialStore,
 }
 
 /// Settings poll result returned by [`CachedOpenShellClient::poll_settings`].
@@ -796,6 +888,8 @@ pub struct SettingsPollResult {
     pub workspace: String,
     /// Gateway-configured posture for rejected policy generations.
     pub policy_validation_failure_mode: crate::PolicyValidationFailureMode,
+    /// Whether the gateway can mint authenticated extension credentials.
+    pub extension_authentication_enabled: bool,
 }
 
 fn settings_poll_result(inner: crate::proto::GetSandboxConfigResponse) -> SettingsPollResult {
@@ -815,6 +909,7 @@ fn settings_poll_result(inner: crate::proto::GetSandboxConfigResponse) -> Settin
             .policy_validation_failure_mode
             .parse()
             .unwrap_or_default(),
+        extension_authentication_enabled: inner.extension_authentication_enabled,
     }
 }
 
@@ -847,6 +942,18 @@ mod settings_poll_tests {
             PolicyValidationFailureMode::FailClosed
         );
     }
+
+    #[test]
+    fn extension_authentication_capability_round_trips_and_defaults_disabled() {
+        let enabled = settings_poll_result(GetSandboxConfigResponse {
+            extension_authentication_enabled: true,
+            ..Default::default()
+        });
+        assert!(enabled.extension_authentication_enabled);
+
+        let legacy = settings_poll_result(GetSandboxConfigResponse::default());
+        assert!(!legacy.extension_authentication_enabled);
+    }
 }
 
 pub struct ProviderEnvironmentResult {
@@ -860,11 +967,25 @@ pub struct ProviderEnvironmentResult {
 
 impl CachedOpenShellClient {
     pub async fn connect(endpoint: &str) -> Result<Self> {
+        Self::connect_with_credentials(endpoint, ExtensionCredentialStore::new()).await
+    }
+
+    /// Connect while sharing an existing credential store.
+    ///
+    /// The supervisor opens the gateway channel more than once (policy load,
+    /// then the polling loop). Both must observe the same slots, otherwise the
+    /// credentials handed to the middleware registry are not the ones the loop
+    /// rotates.
+    pub async fn connect_with_credentials(
+        endpoint: &str,
+        extension_credentials: ExtensionCredentialStore,
+    ) -> Result<Self> {
         debug!(endpoint = %endpoint, "Connecting openshell gRPC client for policy polling");
         let client = connect(endpoint).await?;
         Ok(Self {
             client,
             workspace: Arc::new(tokio::sync::OnceCell::new()),
+            extension_credentials,
         })
     }
 
@@ -887,6 +1008,67 @@ impl CachedOpenShellClient {
         let result = settings_poll_result(response.into_inner());
         let _ = self.workspace.set(result.workspace.clone());
         Ok(result)
+    }
+
+    /// The credential store backing this connection's extension clients.
+    #[must_use]
+    pub fn extension_credentials(&self) -> &ExtensionCredentialStore {
+        &self.extension_credentials
+    }
+
+    /// Return the slots for `services`, rotating only when one is missing or
+    /// due.
+    ///
+    /// Configuration polling runs far more often than credentials expire, so
+    /// rotating unconditionally would mint tokens and re-run gateway policy
+    /// authorization roughly ninety times per useful rotation.
+    pub async fn extension_credentials_for(
+        &self,
+        services: &[crate::proto::SupervisorMiddlewareService],
+    ) -> Result<HashMap<String, BearerTokenSlot>> {
+        let names = authenticated_service_names(services);
+        if names.is_empty() {
+            return Ok(HashMap::new());
+        }
+        if !self.extension_credentials.needs_refresh(&names, now_ms())
+            && let Some(slots) = self.extension_credentials.slots_for(&names)
+        {
+            return Ok(slots);
+        }
+        self.refresh_extension_credentials(services).await
+    }
+
+    /// Rotate credentials for `services` unconditionally.
+    pub async fn refresh_extension_credentials(
+        &self,
+        services: &[crate::proto::SupervisorMiddlewareService],
+    ) -> Result<HashMap<String, BearerTokenSlot>> {
+        let mut client = self.client.clone();
+        refresh_extension_credentials_with_client(
+            &mut client,
+            &self.extension_credentials,
+            services,
+        )
+        .await
+    }
+
+    /// Rotate every credential currently retained by the installed registry.
+    /// This remains available when configuration polling fails independently.
+    pub async fn refresh_installed_extension_credentials(&self) -> Result<()> {
+        let names = self.extension_credentials.names();
+        if names.is_empty() || !self.extension_credentials.needs_refresh(&names, now_ms()) {
+            return Ok(());
+        }
+        let services = names
+            .into_iter()
+            .map(|name| crate::proto::SupervisorMiddlewareService {
+                name,
+                ..Default::default()
+            })
+            .collect::<Vec<_>>();
+        self.refresh_extension_credentials(&services)
+            .await
+            .map(drop)
     }
 
     /// Returns the workspace learned from the server, or empty if not yet polled.

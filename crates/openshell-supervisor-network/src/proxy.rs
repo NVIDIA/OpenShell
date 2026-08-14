@@ -5400,6 +5400,7 @@ mod tests {
                     max_body_bytes: 8192,
                     timeout: String::new(),
                 }],
+                expected_audience: String::new(),
             }
         }
 

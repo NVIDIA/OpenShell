@@ -128,6 +128,7 @@ impl SupervisorMiddleware for ContentGuard {
                 max_body_bytes: MAX_BODY_BYTES,
                 timeout: String::new(),
             }],
+            expected_audience: String::new(),
         }))
     }
 

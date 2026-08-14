@@ -3712,6 +3712,7 @@ dependencies = [
  "ipnet",
  "miette",
  "nix 0.29.0",
+ "openshell-extension-core",
  "prost",
  "prost-types",
  "protoc-bin-vendored",
@@ -3902,13 +3903,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "openshell-extension-core"
+version = "0.0.0"
+dependencies = [
+ "http 1.4.0",
+ "hyper-util",
+ "rcgen",
+ "rustls 0.23.38",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tower 0.5.3",
+]
+
+[[package]]
 name = "openshell-gateway-interceptors"
 version = "0.0.0"
 dependencies = [
- "hyper-util",
  "json-patch",
  "metrics",
  "openshell-core",
+ "openshell-extension-core",
  "prost",
  "prost-reflect",
  "prost-types",
@@ -3917,7 +3935,6 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tonic",
- "tower 0.5.3",
  "tracing",
  "tracing-subscriber",
 ]
@@ -4017,6 +4034,7 @@ dependencies = [
  "miette",
  "nix 0.29.0",
  "openshell-core",
+ "openshell-extension-core",
  "openshell-ocsf",
  "openshell-policy",
  "openshell-supervisor-middleware",
@@ -4105,6 +4123,7 @@ dependencies = [
  "openshell-driver-kubernetes-secrets",
  "openshell-driver-podman",
  "openshell-driver-vault",
+ "openshell-extension-core",
  "openshell-gateway-interceptors",
  "openshell-ocsf",
  "openshell-otel",
@@ -4169,6 +4188,7 @@ version = "0.0.0"
 dependencies = [
  "miette",
  "openshell-core",
+ "openshell-extension-core",
  "openshell-supervisor-middleware-builtins",
  "prost",
  "prost-types",

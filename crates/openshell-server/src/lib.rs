@@ -61,14 +61,17 @@ mod ws_tunnel;
 use metrics_exporter_prometheus::PrometheusBuilder;
 use openshell_core::net::set_tcp_nodelay_best_effort;
 use openshell_core::{ComputeDriverKind, Config, Error, ObjectLabels, Result};
+use openshell_extension_core::{
+    BearerTokenSlot, ExtensionAudience, ExtensionCallerKind, ExtensionKind, MAX_EXTENSION_TOKEN_TTL,
+};
 use openshell_supervisor_middleware::MiddlewareRegistry;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::ErrorKind;
 use std::net::SocketAddr;
 #[cfg(test)]
 use std::sync::LazyLock;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
 use tracing::{debug, error, info, warn};
@@ -84,6 +87,158 @@ use compute::ComputeRuntime;
 use gateway_listener::{BoundGatewayListener, GatewayListenerScope, bind_gateway_listeners};
 pub use grpc::OpenShellService;
 pub use http::{health_router, http_router, metrics_router, service_http_router};
+
+/// Deriving `Debug` is safe here: `BearerTokenSlot` renders only its expiry,
+/// and an extension audience is configuration rather than secret material.
+#[derive(Debug)]
+struct GatewayExtensionCredential {
+    name: String,
+    audience: ExtensionAudience,
+    slot: BearerTokenSlot,
+    ttl: Duration,
+}
+
+fn extension_token_ttl(issuer: &auth::sandbox_jwt::SandboxJwtIssuer) -> Duration {
+    if issuer.ttl().is_zero() {
+        Duration::from_secs(15 * 60)
+    } else {
+        issuer.ttl().min(MAX_EXTENSION_TOKEN_TTL)
+    }
+}
+
+/// Mint the gateway-caller credential for one extension registration.
+///
+/// Returns `Ok(None)` when the operator has explicitly opted the registration
+/// out of extension authentication. The opt-out is deliberately loud: it
+/// downgrades a security boundary, so it is reported once per registration at
+/// startup rather than being silently tolerated.
+fn mint_gateway_extension_credential(
+    issuer: &Arc<auth::sandbox_jwt::SandboxJwtIssuer>,
+    kind: ExtensionKind,
+    name: &str,
+    audience: &str,
+    endpoint: &str,
+    allow_insecure_transport: bool,
+) -> Result<Option<GatewayExtensionCredential>> {
+    // A middleware endpoint must be reachable from sandbox supervisors, so a
+    // gateway-local Unix socket is only an option for interceptors.
+    let (accepted, supports_unix) = match kind {
+        ExtensionKind::Middleware => ("https://", false),
+        ExtensionKind::Interceptor => ("https:// or unix://", true),
+        _ => {
+            return Err(Error::config(format!(
+                "extension kind '{kind}' is not supported by gateway authentication"
+            )));
+        }
+    };
+    if allow_insecure_transport {
+        warn!(
+            extension = %name,
+            endpoint = %endpoint,
+            "extension authentication is DISABLED for this registration by \
+             allow_insecure_transport; OpenShell attaches no caller credential \
+             and the service cannot distinguish OpenShell from any other \
+             network client. Use {accepted} with the opt-out removed outside \
+             trusted-network development deployments."
+        );
+        return Ok(None);
+    }
+    let transport_supported =
+        endpoint.starts_with("https://") || (supports_unix && endpoint.starts_with("unix://"));
+    if !transport_supported {
+        return Err(Error::config(format!(
+            "authenticated {kind} '{name}' must use {accepted}; set \
+             allow_insecure_transport = true to opt this registration out of \
+             extension authentication instead"
+        )));
+    }
+    let audience = ExtensionAudience::new(audience.to_string()).map_err(|error| {
+        Error::config(format!(
+            "extension '{name}' has an invalid audience: {error}"
+        ))
+    })?;
+    let ttl = extension_token_ttl(issuer);
+    let minted = issuer
+        .mint_extension_token(&audience, ExtensionCallerKind::Gateway, None, ttl)
+        .map_err(|status| {
+            Error::config(format!(
+                "failed to mint credential for extension '{name}': {}",
+                status.message()
+            ))
+        })?;
+    let slot = BearerTokenSlot::new(&minted.token, minted.expires_at_ms).map_err(|error| {
+        Error::config(format!(
+            "failed to install credential for extension '{name}': {error}"
+        ))
+    })?;
+    Ok(Some(GatewayExtensionCredential {
+        name: name.to_string(),
+        audience,
+        slot,
+        ttl,
+    }))
+}
+
+fn spawn_gateway_extension_token_refresh(
+    issuer: Arc<auth::sandbox_jwt::SandboxJwtIssuer>,
+    credentials: Vec<GatewayExtensionCredential>,
+) {
+    if credentials.is_empty() {
+        return;
+    }
+    tokio::spawn(async move {
+        loop {
+            let now_ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |duration| {
+                    i64::try_from(duration.as_millis()).unwrap_or(i64::MAX)
+                });
+            let remaining_ms = credentials
+                .iter()
+                .filter_map(|credential| credential.slot.expires_at_ms())
+                .min()
+                .map_or(60_000, |expiry_ms| expiry_ms.saturating_sub(now_ms));
+            let refresh_delay = if remaining_ms <= 0 {
+                Duration::from_millis(100)
+            } else {
+                Duration::from_millis(
+                    u64::try_from(remaining_ms)
+                        .unwrap_or(u64::MAX)
+                        .saturating_mul(4)
+                        .checked_div(5)
+                        .unwrap_or(100)
+                        .max(100),
+                )
+            };
+            tokio::time::sleep(refresh_delay).await;
+            for credential in &credentials {
+                match issuer.mint_extension_token(
+                    &credential.audience,
+                    ExtensionCallerKind::Gateway,
+                    None,
+                    credential.ttl,
+                ) {
+                    Ok(minted) => {
+                        if let Err(error) =
+                            credential.slot.update(&minted.token, minted.expires_at_ms)
+                        {
+                            warn!(
+                                extension = %credential.name,
+                                error = %error,
+                                "failed to rotate gateway extension credential"
+                            );
+                        }
+                    }
+                    Err(status) => warn!(
+                        extension = %credential.name,
+                        error = %status,
+                        "failed to mint gateway extension credential"
+                    ),
+                }
+            }
+        }
+    });
+}
 pub use multiplex::{MultiplexService, MultiplexedService};
 pub use persistence::Store;
 use sandbox_index::SandboxIndex;
@@ -177,6 +332,10 @@ pub struct ServerState {
     /// Gateway-wide gRPC request rate limiter shared by every multiplex path.
     pub(crate) grpc_rate_limiter: Option<multiplex::GrpcRateLimiter>,
 
+    /// Per-sandbox bound on extension credential minting, which resolves the
+    /// caller's effective policy on every request.
+    pub(crate) extension_mint_limiter: auth::extension_mint_limit::ExtensionMintLimiter,
+
     /// Immutable gateway interceptor execution plan. `None` when disabled.
     pub(crate) gateway_interceptors:
         Option<openshell_gateway_interceptors::GatewayInterceptorRuntime>,
@@ -268,6 +427,7 @@ impl ServerState {
             supervisor_sessions,
             replica_id,
             peer_endpoint,
+            extension_mint_limiter: auth::extension_mint_limit::ExtensionMintLimiter::default(),
             middleware_registry: Arc::new(MiddlewareRegistry::default()),
             oidc_cache,
             sandbox_jwt_issuer: None,
@@ -336,6 +496,60 @@ pub(crate) async fn run_server(
         return Err(Error::config("database_url is required"));
     }
 
+    // Load signing material before connecting remote extensions so their
+    // startup Describe calls can authenticate with gateway-caller tokens.
+    let (sandbox_jwt_issuer, sandbox_jwt_authenticator) = if let Some(ref jwt) = config.gateway_jwt
+    {
+        let signing_pem = std::fs::read(&jwt.signing_key_path).map_err(|e| {
+            Error::config(format!(
+                "failed to read sandbox JWT signing key from {}: {e}",
+                jwt.signing_key_path.display()
+            ))
+        })?;
+        let public_pem = std::fs::read(&jwt.public_key_path).map_err(|e| {
+            Error::config(format!(
+                "failed to read sandbox JWT public key from {}: {e}",
+                jwt.public_key_path.display()
+            ))
+        })?;
+        let kid = std::fs::read_to_string(&jwt.kid_path)
+            .map_err(|e| {
+                Error::config(format!(
+                    "failed to read sandbox JWT kid from {}: {e}",
+                    jwt.kid_path.display()
+                ))
+            })?
+            .trim()
+            .to_string();
+        if kid.is_empty() {
+            return Err(Error::config(format!(
+                "sandbox JWT kid file {} is empty",
+                jwt.kid_path.display()
+            )));
+        }
+        let issuer = Arc::new(
+            auth::sandbox_jwt::SandboxJwtIssuer::from_pem(
+                &signing_pem,
+                kid.clone(),
+                &jwt.gateway_id,
+                Duration::from_secs(jwt.ttl_secs),
+            )
+            .map_err(Error::config)?,
+        );
+        let authenticator = Arc::new(
+            auth::sandbox_jwt::SandboxJwtAuthenticator::from_pem(&public_pem, kid, &jwt.gateway_id)
+                .map_err(Error::config)?,
+        );
+        info!(
+            gateway_id = %jwt.gateway_id,
+            ttl_secs = jwt.ttl_secs,
+            "gateway-minted sandbox JWT enabled"
+        );
+        (Some(issuer), Some(authenticator))
+    } else {
+        (None, None)
+    };
+
     let middleware_registrations = config_file
         .as_ref()
         .map(|file| {
@@ -343,16 +557,42 @@ pub(crate) async fn run_server(
                 .supervisor
                 .middleware
                 .iter()
-                .map(Into::into)
-                .collect()
+                .map(openshell_core::proto::SupervisorMiddlewareService::try_from)
+                .collect::<std::result::Result<Vec<_>, _>>()
         })
+        .transpose()
+        .map_err(|error| Error::config(format!("middleware registration failed: {error}")))?
         .unwrap_or_default();
+    let mut gateway_extension_credentials = Vec::new();
     let middleware_registry = Arc::new(
-        MiddlewareRegistry::connect_services(
-            openshell_supervisor_middleware_builtins::services(),
-            middleware_registrations,
-        )
-        .await
+        if let Some(issuer) = sandbox_jwt_issuer.as_ref() {
+            let mut slots = HashMap::new();
+            for registration in &middleware_registrations {
+                if let Some(credential) = mint_gateway_extension_credential(
+                    issuer,
+                    ExtensionKind::Middleware,
+                    &registration.name,
+                    &registration.audience,
+                    &registration.grpc_endpoint,
+                    registration.allow_insecure_transport,
+                )? {
+                    slots.insert(registration.name.clone(), credential.slot.clone());
+                    gateway_extension_credentials.push(credential);
+                }
+            }
+            MiddlewareRegistry::connect_services_authenticated(
+                openshell_supervisor_middleware_builtins::services(),
+                middleware_registrations,
+                &slots,
+            )
+            .await
+        } else {
+            MiddlewareRegistry::connect_services(
+                openshell_supervisor_middleware_builtins::services(),
+                middleware_registrations,
+            )
+            .await
+        }
         .map_err(|error| Error::config(format!("middleware registration failed: {error}")))?,
     );
 
@@ -402,12 +642,31 @@ pub(crate) async fn run_server(
         supervisor_sessions.clone(),
     )
     .await?;
-    let gateway_interceptors =
-        openshell_gateway_interceptors::initialize(config.gateway_interceptors.clone())
-            .await
-            .map_err(|e| {
-                Error::config(format!("gateway interceptor initialization failed: {e}"))
-            })?;
+    let gateway_interceptors = if let Some(issuer) = sandbox_jwt_issuer.as_ref() {
+        let mut slots = BTreeMap::new();
+        for interceptor in &config.gateway_interceptors {
+            let audience = interceptor.resolved_audience();
+            if let Some(credential) = mint_gateway_extension_credential(
+                issuer,
+                ExtensionKind::Interceptor,
+                &interceptor.name,
+                audience.as_ref(),
+                &interceptor.grpc_endpoint,
+                interceptor.allow_insecure_transport,
+            )? {
+                slots.insert(interceptor.name.clone(), credential.slot.clone());
+                gateway_extension_credentials.push(credential);
+            }
+        }
+        openshell_gateway_interceptors::initialize_authenticated(
+            config.gateway_interceptors.clone(),
+            slots,
+        )
+        .await
+    } else {
+        openshell_gateway_interceptors::initialize(config.gateway_interceptors.clone()).await
+    }
+    .map_err(|e| Error::config(format!("gateway interceptor initialization failed: {e}")))?;
     let provider_profile_sources = provider_profile_sources::ProviderProfileSources::from_config(
         &config.provider_profile_sources,
         gateway_interceptors.as_ref(),
@@ -435,56 +694,10 @@ pub(crate) async fn run_server(
     state.middleware_registry = middleware_registry;
     state.gateway_interceptors = gateway_interceptors;
     state.provider_profile_sources = provider_profile_sources;
-
-    // Load the gateway-minted sandbox JWT signing key when configured.
-    // Optional so single-driver dev deployments without certgen continue
-    // to start. The helm-deployed gateway and the RPM init script populate
-    // `gateway_jwt` once `certgen` has produced the on-disk material.
-    if let Some(ref jwt) = config.gateway_jwt {
-        let signing_pem = std::fs::read(&jwt.signing_key_path).map_err(|e| {
-            Error::config(format!(
-                "failed to read sandbox JWT signing key from {}: {e}",
-                jwt.signing_key_path.display()
-            ))
-        })?;
-        let public_pem = std::fs::read(&jwt.public_key_path).map_err(|e| {
-            Error::config(format!(
-                "failed to read sandbox JWT public key from {}: {e}",
-                jwt.public_key_path.display()
-            ))
-        })?;
-        let kid = std::fs::read_to_string(&jwt.kid_path)
-            .map_err(|e| {
-                Error::config(format!(
-                    "failed to read sandbox JWT kid from {}: {e}",
-                    jwt.kid_path.display()
-                ))
-            })?
-            .trim()
-            .to_string();
-        if kid.is_empty() {
-            return Err(Error::config(format!(
-                "sandbox JWT kid file {} is empty",
-                jwt.kid_path.display()
-            )));
-        }
-        let issuer = auth::sandbox_jwt::SandboxJwtIssuer::from_pem(
-            &signing_pem,
-            kid.clone(),
-            &jwt.gateway_id,
-            Duration::from_secs(jwt.ttl_secs),
-        )
-        .map_err(Error::config)?;
-        let authenticator =
-            auth::sandbox_jwt::SandboxJwtAuthenticator::from_pem(&public_pem, kid, &jwt.gateway_id)
-                .map_err(Error::config)?;
-        info!(
-            gateway_id = %jwt.gateway_id,
-            ttl_secs = jwt.ttl_secs,
-            "gateway-minted sandbox JWT enabled"
-        );
-        state.sandbox_jwt_issuer = Some(Arc::new(issuer));
-        state.sandbox_jwt_authenticator = Some(Arc::new(authenticator));
+    state.sandbox_jwt_issuer = sandbox_jwt_issuer.clone();
+    state.sandbox_jwt_authenticator = sandbox_jwt_authenticator;
+    if let Some(issuer) = sandbox_jwt_issuer {
+        spawn_gateway_extension_token_refresh(issuer, gateway_extension_credentials);
     }
 
     // K8s ServiceAccount bootstrap authenticator. Only constructed when
@@ -1190,10 +1403,11 @@ pub(crate) async fn ensure_default_workspace(store: &Store) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        BoundGatewayListener, ConfiguredComputeDriver, ConnectionProtocol, GatewayListenerScope,
-        MultiplexService, ServerState, TlsAcceptor, allow_plaintext_service_http,
-        bind_gateway_listeners, classify_initial_bytes, configured_compute_driver,
-        is_benign_tls_handshake_failure, kubernetes_sandbox_jwt_expiry_disabled,
+        BoundGatewayListener, ConfiguredComputeDriver, ConnectionProtocol, ExtensionKind,
+        GatewayListenerScope, MultiplexService, ServerState, TlsAcceptor,
+        allow_plaintext_service_http, bind_gateway_listeners, classify_initial_bytes,
+        configured_compute_driver, is_benign_tls_handshake_failure,
+        kubernetes_sandbox_jwt_expiry_disabled, mint_gateway_extension_credential,
         serve_gateway_listener,
     };
     use openshell_core::{
@@ -1217,6 +1431,94 @@ mod tests {
         gateway_listener::GatewayListenerSpec,
         tls_test_utils::{generate_test_certs_with_ca, install_rustls_provider},
     };
+
+    fn extension_test_issuer() -> Arc<crate::auth::sandbox_jwt::SandboxJwtIssuer> {
+        let material = openshell_bootstrap::jwt::generate_jwt_key().expect("jwt key");
+        Arc::new(
+            crate::auth::sandbox_jwt::SandboxJwtIssuer::from_pem(
+                material.signing_key_pem.as_bytes(),
+                material.kid,
+                "gateway-a",
+                Duration::from_secs(900),
+            )
+            .expect("issuer"),
+        )
+    }
+
+    #[test]
+    fn plaintext_extension_endpoint_is_rejected_unless_explicitly_opted_out() {
+        let issuer = extension_test_issuer();
+
+        // Default posture: a plaintext endpoint cannot carry a bearer
+        // credential, so startup fails and names the opt-out.
+        let error = mint_gateway_extension_credential(
+            &issuer,
+            ExtensionKind::Middleware,
+            "content-guard",
+            "urn:openshell:extension:middleware:content-guard",
+            "http://host.openshell.internal:50051",
+            false,
+        )
+        .expect_err("plaintext endpoint must not silently downgrade");
+        assert!(error.to_string().contains("allow_insecure_transport"));
+
+        // Explicit opt-out starts the gateway with no credential attached.
+        assert!(
+            mint_gateway_extension_credential(
+                &issuer,
+                ExtensionKind::Middleware,
+                "content-guard",
+                "urn:openshell:extension:middleware:content-guard",
+                "http://host.openshell.internal:50051",
+                true,
+            )
+            .expect("opt-out must be permitted")
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn authenticated_extension_endpoints_mint_a_credential() {
+        let issuer = extension_test_issuer();
+        let credential = mint_gateway_extension_credential(
+            &issuer,
+            ExtensionKind::Middleware,
+            "content-guard",
+            "urn:openshell:extension:middleware:content-guard",
+            "https://content-guard.example:50051",
+            false,
+        )
+        .expect("credential")
+        .expect("authenticated endpoint mints a credential");
+        assert_eq!(credential.name, "content-guard");
+        assert!(credential.slot.expires_at_ms().is_some_and(|ms| ms > 0));
+
+        // Unix sockets are gateway-local, so only interceptors can use them.
+        // A middleware endpoint must also be reachable from every supervisor.
+        let error = mint_gateway_extension_credential(
+            &issuer,
+            ExtensionKind::Middleware,
+            "content-guard",
+            "urn:openshell:extension:middleware:content-guard",
+            "unix:///run/openshell/content-guard.sock",
+            false,
+        )
+        .expect_err("middleware cannot be reached over a gateway-local socket");
+        assert!(error.to_string().contains("must use https://"));
+
+        assert!(
+            mint_gateway_extension_credential(
+                &issuer,
+                ExtensionKind::Interceptor,
+                "quota",
+                "urn:openshell:extension:interceptor:quota",
+                "unix:///run/openshell/interceptors/quota.sock",
+                false,
+            )
+            .expect("credential")
+            .is_some()
+        );
+    }
 
     fn test_driver_startup<'a>(
         config: &'a Config,

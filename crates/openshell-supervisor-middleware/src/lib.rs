@@ -6,9 +6,7 @@
 mod headers;
 mod remote;
 
-#[cfg(test)]
-use std::collections::HashMap;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
@@ -592,12 +590,43 @@ fn validate_external_manifest(
     registration: &SupervisorMiddlewareService,
     manifest: &MiddlewareManifest,
     operator_max_body_bytes: usize,
+    authenticated: bool,
 ) -> Result<()> {
     validate_manifest_bindings(
         &format!("external middleware registration '{}'", registration.name),
         manifest,
         Some(operator_max_body_bytes),
+    )?;
+    validate_expected_audience(
+        &registration.name,
+        &registration.audience,
+        &manifest.expected_audience,
+        authenticated && !registration.allow_insecure_transport,
     )
+}
+
+/// After authenticated Describe succeeds, reject a registration whose
+/// configured audience differs from the one the service says it verifies.
+///
+/// This is a post-authentication consistency assertion, not audience discovery:
+/// a strict verifier may reject an incorrect audience before returning its
+/// manifest. A service that does not advertise an audience is accepted unchanged.
+fn validate_expected_audience(
+    registration_name: &str,
+    configured: &str,
+    advertised: &str,
+    authenticated: bool,
+) -> Result<()> {
+    if !authenticated || advertised.is_empty() {
+        return Ok(());
+    }
+    if advertised != configured {
+        return Err(miette!(
+            "middleware registration '{registration_name}' expects audience \
+             '{advertised}' but OpenShell is configured to mint '{configured}'"
+        ));
+    }
+    Ok(())
 }
 
 /// External diagnostic text is untrusted and may contain request data. Keep
@@ -714,6 +743,25 @@ impl MiddlewareRegistry {
         in_process_services: Vec<Arc<dyn InProcessMiddleware>>,
         registrations: Vec<SupervisorMiddlewareService>,
     ) -> Result<Self> {
+        Self::connect_services_inner(in_process_services, registrations, None).await
+    }
+
+    /// Connect services with optional refreshable credentials keyed by
+    /// operator registration name. A configured credential is shared by all
+    /// generated client clones and can rotate without rebuilding the registry.
+    pub async fn connect_services_authenticated(
+        in_process_services: Vec<Arc<dyn InProcessMiddleware>>,
+        registrations: Vec<SupervisorMiddlewareService>,
+        credentials: &HashMap<String, openshell_extension_core::BearerTokenSlot>,
+    ) -> Result<Self> {
+        Self::connect_services_inner(in_process_services, registrations, Some(credentials)).await
+    }
+
+    async fn connect_services_inner(
+        in_process_services: Vec<Arc<dyn InProcessMiddleware>>,
+        registrations: Vec<SupervisorMiddlewareService>,
+        credentials: Option<&HashMap<String, openshell_extension_core::BearerTokenSlot>>,
+    ) -> Result<Self> {
         let mut services = Vec::with_capacity(in_process_services.len() + registrations.len());
         let mut registered_services = Vec::with_capacity(registrations.len());
         let mut middleware_names = HashSet::new();
@@ -778,10 +826,28 @@ impl MiddlewareRegistry {
                         registration.name
                     )
                 })?;
+            // A registration the operator opted out of extension
+            // authentication carries no credential by design. Every other
+            // registration must have one, or the connection fails closed
+            // rather than silently downgrading to an unauthenticated call.
+            let bearer = credentials
+                .filter(|_| !registration.allow_insecure_transport)
+                .map(|credentials| {
+                    credentials.get(&registration.name).cloned().ok_or_else(|| {
+                        miette!(
+                            "middleware registration '{}' is missing its extension credential",
+                            registration.name
+                        )
+                    })
+                })
+                .transpose()?;
+            let authenticated = bearer.is_some();
             let service = MiddlewareService::Grpc(
                 remote::GrpcMiddlewareService::connect(
                     &registration.name,
                     &registration.grpc_endpoint,
+                    &registration.tls_ca_cert_pem,
+                    bearer,
                 )
                 .await?,
             );
@@ -795,7 +861,12 @@ impl MiddlewareRegistry {
                         safe_reason(&error.to_string())
                     )
                 })?;
-            validate_external_manifest(&registration, &manifest, operator_max_body_bytes)?;
+            validate_external_manifest(
+                &registration,
+                &manifest,
+                operator_max_body_bytes,
+                authenticated,
+            )?;
             let manifest_cell = OnceCell::new();
             manifest_cell
                 .set(manifest)
@@ -1475,6 +1546,32 @@ mod tests {
     use openshell_supervisor_middleware_builtins::{BUILTIN_REGEX, services};
     use tokio_stream::wrappers::TcpListenerStream;
 
+    #[test]
+    fn advertised_audience_mismatch_fails_registration() {
+        let configured = "urn:openshell:extension:middleware:content-guard";
+
+        // Matching and unadvertised audiences both pass.
+        validate_expected_audience("content-guard", configured, "", true)
+            .expect("unadvertised audience is accepted");
+        validate_expected_audience("content-guard", configured, configured, true)
+            .expect("matching audience is accepted");
+
+        // Once authenticated Describe succeeds, reject a manifest that
+        // contradicts the operator-owned audience configuration.
+        let error =
+            validate_expected_audience("content-guard", configured, "urn:example:stale", true)
+                .expect_err("mismatched audience must fail closed");
+        let message = error.to_string();
+        assert!(message.contains("urn:example:stale"));
+        assert!(message.contains(configured));
+
+        // The check does not apply where no credential is attached at all,
+        // whether because the registration opted out or because the gateway
+        // has no signing key configured.
+        validate_expected_audience("content-guard", configured, "urn:example:stale", false)
+            .expect("an unauthenticated call has no audience to mismatch");
+    }
+
     fn builtin_runner() -> ChainRunner {
         ChainRunner::new(
             services()
@@ -1564,6 +1661,7 @@ mod tests {
                     max_body_bytes: 4096,
                     timeout: String::new(),
                 }],
+                expected_audience: String::new(),
             }
         }
 
@@ -1699,6 +1797,7 @@ mod tests {
                     max_body_bytes: 4096,
                     timeout: String::new(),
                 }],
+                expected_audience: String::new(),
             }
         }
 
@@ -1789,6 +1888,7 @@ mod tests {
                     max_body_bytes: 4096,
                     timeout: "10ms".into(),
                 }],
+                expected_audience: String::new(),
             }
         }
 
@@ -2038,6 +2138,7 @@ mod tests {
                     max_body_bytes: self.max_body_bytes,
                     timeout: String::new(),
                 }],
+                expected_audience: String::new(),
             }))
         }
 
@@ -2082,6 +2183,7 @@ mod tests {
                     max_body_bytes: 4096,
                     timeout: self.binding_timeout.clone(),
                 }],
+                expected_audience: String::new(),
             }))
         }
 
@@ -2130,6 +2232,7 @@ mod tests {
                     max_body_bytes: 256 * 1024,
                     timeout: String::new(),
                 }],
+                expected_audience: String::new(),
             }))
         }
 
@@ -2389,6 +2492,7 @@ mod tests {
                     max_body_bytes: 4096,
                     timeout: String::new(),
                 }],
+                expected_audience: String::new(),
             }))
         }
 
@@ -2443,6 +2547,7 @@ mod tests {
                     max_body_bytes: 4096,
                     timeout: String::new(),
                 }],
+                expected_audience: String::new(),
             }))
         }
 
@@ -2672,7 +2777,7 @@ mod tests {
             .into_inner();
         let operator_max_body_bytes = usize::try_from(registration.max_body_bytes).unwrap();
         let operator_timeout = validate_registration(&registration).expect("valid registration");
-        validate_external_manifest(&registration, &manifest, operator_max_body_bytes)
+        validate_external_manifest(&registration, &manifest, operator_max_body_bytes, false)
             .expect("valid external manifest");
         let manifest_cell = OnceCell::new();
         manifest_cell.set(manifest).expect("manifest cache");
@@ -2891,8 +2996,9 @@ mod tests {
                 max_body_bytes: 4096,
                 timeout: String::new(),
             }],
+            expected_audience: String::new(),
         };
-        let error = validate_external_manifest(&registration, &manifest, 4097)
+        let error = validate_external_manifest(&registration, &manifest, 4097, false)
             .expect_err("operator limit must fit capability");
         assert!(error.to_string().contains("exceeds"));
     }
@@ -2917,8 +3023,9 @@ mod tests {
                 max_body_bytes: u64::MAX,
                 timeout: String::new(),
             }],
+            expected_audience: String::new(),
         };
-        let error = validate_external_manifest(&registration, &manifest, 4096)
+        let error = validate_external_manifest(&registration, &manifest, 4096, false)
             .expect_err("extreme advertised body limit must be rejected");
         assert!(error.to_string().contains("platform maximum"));
     }
@@ -2936,9 +3043,10 @@ mod tests {
             name: "example/service".into(),
             service_version: "test".into(),
             bindings: vec![binding(), binding()],
+            expected_audience: String::new(),
         };
 
-        let error = validate_external_manifest(&registration, &manifest, 4096)
+        let error = validate_external_manifest(&registration, &manifest, 4096, false)
             .expect_err("one service cannot advertise two bindings for the same pair");
         assert!(
             error
@@ -3013,8 +3121,9 @@ mod tests {
                     max_body_bytes: 4096,
                     timeout: timeout.into(),
                 }],
+                expected_audience: String::new(),
             };
-            let error = validate_external_manifest(&registration, &manifest, 4096)
+            let error = validate_external_manifest(&registration, &manifest, 4096, false)
                 .expect_err("out-of-bounds binding timeout must be rejected");
             assert!(error.to_string().contains("invalid timeout"));
         }

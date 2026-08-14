@@ -72,6 +72,26 @@ until deliberately added to this allowlist. Interception remains centralized:
 allowlisting a unary RPC does not require method-specific gateway
 instrumentation.
 
+Remote extension clients share `openshell-extension-core` transport and bearer
+primitives. When gateway JWT signing is configured, the gateway mints
+short-lived, exact-audience EdDSA credentials for middleware and interceptors,
+rotates their in-memory slots without rebuilding clients, and publishes the
+public verification key at `/.well-known/jwks.json` alongside OIDC-shaped
+discovery metadata at `/.well-known/openid-configuration`. HTTPS extensions can
+pin an operator-provided CA while retaining endpoint-hostname verification.
+
+Extension credentials reuse the sandbox signing key and are separated from
+sandbox-to-gateway admission tokens by exact audience and by an explicit
+`typ` of `openshell-ext+jwt`, so a verifier that checks either one alone
+cannot confuse the two. After authenticated `Describe` succeeds, a service may
+advertise `expected_audience` as a post-authentication consistency assertion;
+a mismatch against operator configuration fails gateway startup. A strict
+verifier may reject an incorrect audience before returning the manifest. A
+registration may opt out of extension authentication entirely with
+`allow_insecure_transport`, which permits a plaintext endpoint, attaches no
+credential, and warns at every startup. Credential minting is bounded per
+sandbox because it resolves the caller's effective policy.
+
 Each configured interceptor selects a binding policy. `dynamic` accepts valid
 manifest declarations and preserves the compatibility behavior. `allowlist`
 enables only operator-configured RPCs and phases, while `exact` requires the

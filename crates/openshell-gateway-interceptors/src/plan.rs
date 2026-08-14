@@ -4,11 +4,8 @@
 //! Interceptor configuration and immutable execution planning.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::path::PathBuf;
 use std::time::Duration;
 
-#[cfg(unix)]
-use hyper_util::rt::TokioIo;
 use openshell_core::config::{
     GatewayInterceptorBindingOverride, GatewayInterceptorBindingPolicy, GatewayInterceptorConfig,
     GatewayInterceptorFailurePolicy, GatewayInterceptorPhaseConfig,
@@ -17,23 +14,16 @@ use openshell_core::proto::gateway_interceptor::v1::{
     DescribeRequest, GatewayInterceptorPhase, InterceptorBinding, InterceptorSelector,
     gateway_interceptor_client::GatewayInterceptorClient,
 };
-#[cfg(unix)]
-use tokio::net::UnixStream;
+use openshell_extension_core::{
+    BearerTokenInterceptor, BearerTokenSlot, ExtensionChannelConfig, ExtensionServerTrust,
+    connect_channel,
+};
 use tonic::Request;
-#[cfg(unix)]
-use tonic::codegen::http::Uri;
-use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
-#[cfg(unix)]
-use tower::service_fn;
 use tracing::{info, warn};
 
 use crate::profile_source::GatewayInterceptorProfileSource;
 use crate::routes::OpenShellRouteIndex;
-use crate::{InterceptorError, Result};
-
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-const HTTP2_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(10);
-const KEEP_ALIVE_TIMEOUT: Duration = Duration::from_secs(20);
+use crate::{ExtensionChannel, InterceptorError, Result};
 
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_millis(500);
 pub const DEFAULT_MAX_RESPONSE_BYTES: usize = 1_048_576;
@@ -145,7 +135,7 @@ pub struct BindingPlan {
     pub(crate) timeout: Duration,
     pub(crate) max_response_bytes: usize,
     pub(crate) max_patches: usize,
-    pub(crate) client: GatewayInterceptorClient<Channel>,
+    pub(crate) client: GatewayInterceptorClient<ExtensionChannel>,
 }
 
 impl std::fmt::Debug for BindingPlan {
@@ -183,15 +173,31 @@ impl ExecutionPlan {
     pub(crate) async fn load(
         mut configs: Vec<GatewayInterceptorConfig>,
         routes: OpenShellRouteIndex,
+        token_slots: Option<BTreeMap<String, BearerTokenSlot>>,
     ) -> Result<Self> {
         validate_interceptor_configs(&configs)?;
+        validate_authenticated_slots(&configs, token_slots.as_ref())?;
         configs.sort_by(|a, b| a.order.cmp(&b.order).then_with(|| a.name.cmp(&b.name)));
 
         let mut bindings: BTreeMap<(RpcSelector, Phase), Vec<BindingPlan>> = BTreeMap::new();
         let mut profile_sources = BTreeMap::new();
 
         for config in configs {
-            let channel = connect_endpoint(&config.grpc_endpoint).await?;
+            let channel = connect_endpoint(&config).await?;
+            let interceptor = match token_slots.as_ref() {
+                Some(_) if config.allow_insecure_transport => BearerTokenInterceptor::disabled(),
+                Some(slots) => slots
+                    .get(&config.name)
+                    .ok_or_else(|| {
+                        InterceptorError::Config(format!(
+                            "authenticated interceptor '{}' is missing a bearer-token slot",
+                            config.name
+                        ))
+                    })?
+                    .interceptor(),
+                None => BearerTokenInterceptor::disabled(),
+            };
+            let channel = ExtensionChannel::new(channel, interceptor);
             let timeout = match config.timeout.as_deref() {
                 Some(timeout) => parse_duration(timeout)?,
                 None => DEFAULT_TIMEOUT,
@@ -218,6 +224,11 @@ impl ExecutionPlan {
                         ))
                     })?
                     .into_inner();
+            validate_expected_audience(
+                &config,
+                &manifest.expected_audience,
+                token_slots.is_some(),
+            )?;
             let service_default = match config.binding_policy {
                 GatewayInterceptorBindingPolicy::Dynamic => {
                     let manifest_default = parse_optional_failure_policy(&manifest.failure_policy)?;
@@ -354,6 +365,54 @@ impl ExecutionPlan {
     pub(crate) fn has_binding(&self, selector: &RpcSelector, phase: Phase) -> bool {
         self.bindings.contains_key(&(selector.clone(), phase))
     }
+}
+
+/// After authenticated Describe succeeds, reject an interceptor whose
+/// configured audience differs from the one the service says it verifies.
+///
+/// This is a post-authentication consistency assertion, not audience discovery:
+/// a strict verifier may reject an incorrect audience before returning its
+/// manifest. A service that does not advertise an audience is accepted unchanged.
+fn validate_expected_audience(
+    config: &GatewayInterceptorConfig,
+    advertised: &str,
+    authenticated: bool,
+) -> Result<()> {
+    if !authenticated || config.allow_insecure_transport || advertised.is_empty() {
+        return Ok(());
+    }
+    let configured = config.resolved_audience();
+    if advertised != configured {
+        return Err(InterceptorError::Config(format!(
+            "interceptor '{}' expects audience '{advertised}' but the gateway \
+             is configured to mint '{configured}'",
+            config.name
+        )));
+    }
+    Ok(())
+}
+
+fn validate_authenticated_slots(
+    configs: &[GatewayInterceptorConfig],
+    token_slots: Option<&BTreeMap<String, BearerTokenSlot>>,
+) -> Result<()> {
+    let Some(token_slots) = token_slots else {
+        return Ok(());
+    };
+    for config in configs {
+        // Registrations the operator opted out of extension authentication
+        // intentionally have no slot; everything else must fail closed.
+        if config.allow_insecure_transport {
+            continue;
+        }
+        if !token_slots.contains_key(&config.name) {
+            return Err(InterceptorError::Config(format!(
+                "authenticated interceptor '{}' is missing a bearer-token slot",
+                config.name
+            )));
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
@@ -865,63 +924,31 @@ pub fn parse_duration(value: &str) -> Result<Duration> {
     )))
 }
 
-/// Repo-standard channel tuning (matches `openshell-core` / `openshell-sdk`):
-/// bounded dial + HTTP/2 keepalive so idle interceptor channels survive
-/// intermediary idle timeouts and dead peers are detected proactively.
-fn tune_endpoint(endpoint: Endpoint) -> Endpoint {
-    endpoint
-        .connect_timeout(CONNECT_TIMEOUT)
-        .http2_keep_alive_interval(HTTP2_KEEP_ALIVE_INTERVAL)
-        .keep_alive_while_idle(true)
-        .keep_alive_timeout(KEEP_ALIVE_TIMEOUT)
-        .http2_adaptive_window(true)
-}
-
-async fn connect_endpoint(endpoint: &str) -> Result<Channel> {
-    let endpoint = endpoint.trim();
-    if let Some(path) = endpoint.strip_prefix("unix://") {
-        return connect_unix_endpoint(PathBuf::from(path)).await;
+async fn connect_endpoint(config: &GatewayInterceptorConfig) -> Result<tonic::transport::Channel> {
+    let endpoint = config.grpc_endpoint.trim();
+    let mut channel_config = ExtensionChannelConfig::new(endpoint);
+    if let Some(path) = &config.tls_ca_cert_path {
+        let pem = tokio::fs::read(path).await.map_err(|error| {
+            InterceptorError::Config(format!(
+                "failed to read TLS CA certificate for interceptor '{}' from {}: {error}",
+                config.name,
+                path.display()
+            ))
+        })?;
+        channel_config = channel_config.with_server_trust(ExtensionServerTrust::CustomCaPem(pem));
     }
-    let mut ep = Endpoint::from_shared(endpoint.to_string()).map_err(|e| {
-        InterceptorError::Config(format!("invalid interceptor endpoint '{endpoint}': {e}"))
-    })?;
-    if ep.uri().scheme_str() == Some("https") {
-        ep = ep
-            .tls_config(ClientTlsConfig::new().with_enabled_roots())
-            .map_err(|e| {
-                InterceptorError::Config(format!(
-                    "TLS config for interceptor endpoint '{endpoint}': {e}"
-                ))
-            })?;
-    }
-    tune_endpoint(ep)
-        .connect()
-        .await
-        .map_err(|e| InterceptorError::Transport(format!("connect {endpoint}: {e}")))
-}
-
-#[cfg(unix)]
-async fn connect_unix_endpoint(path: PathBuf) -> Result<Channel> {
-    let display = path.display().to_string();
-    tune_endpoint(Endpoint::from_static("http://[::]:50051"))
-        .connect_with_connector(service_fn(move |_: Uri| {
-            let path = path.clone();
-            async move { UnixStream::connect(path).await.map(TokioIo::new) }
-        }))
-        .await
-        .map_err(|e| InterceptorError::Transport(format!("connect unix://{display}: {e}")))
-}
-
-#[cfg(not(unix))]
-async fn connect_unix_endpoint(path: PathBuf) -> Result<Channel> {
-    Err(InterceptorError::Config(format!(
-        "unix interceptor endpoints are not supported on this platform: {}",
-        path.display()
-    )))
+    connect_channel(&channel_config).await.map_err(|error| {
+        InterceptorError::Transport(format!(
+            "connect interceptor '{}' at {endpoint}: {error}",
+            config.name
+        ))
+    })
 }
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use openshell_core::config::{
         GatewayInterceptorBindingOverride, GatewayInterceptorBindingPolicy,
         GatewayInterceptorConfig, GatewayInterceptorPhaseConfig,
@@ -990,6 +1017,92 @@ mod tests {
             err.to_string(),
             "invalid interceptor config: duplicate interceptor instance name 'governance'"
         );
+    }
+
+    #[test]
+    fn authenticated_interceptors_require_a_token_slot_per_registration() {
+        let config = GatewayInterceptorConfig {
+            name: "governance".to_string(),
+            grpc_endpoint: "http://127.0.0.1:18081".to_string(),
+            ..GatewayInterceptorConfig::default()
+        };
+        let error =
+            validate_authenticated_slots(std::slice::from_ref(&config), Some(&BTreeMap::new()))
+                .expect_err("missing token slot must fail closed");
+        assert_eq!(
+            error.to_string(),
+            "invalid interceptor config: authenticated interceptor 'governance' is missing a bearer-token slot"
+        );
+
+        let slots = BTreeMap::from([(config.name.clone(), BearerTokenSlot::empty())]);
+        validate_authenticated_slots(&[config], Some(&slots)).unwrap();
+    }
+
+    #[test]
+    fn advertised_audience_mismatch_fails_at_startup() {
+        let config = GatewayInterceptorConfig {
+            name: "governance".to_string(),
+            grpc_endpoint: "https://governance.example".to_string(),
+            ..GatewayInterceptorConfig::default()
+        };
+
+        // Matching and unadvertised audiences both pass.
+        validate_expected_audience(&config, "", true).expect("unadvertised audience is accepted");
+        validate_expected_audience(
+            &config,
+            "urn:openshell:extension:interceptor:governance",
+            true,
+        )
+        .expect("matching audience is accepted");
+
+        // Once authenticated Describe succeeds, reject a manifest that
+        // contradicts the operator-owned audience configuration.
+        let error = validate_expected_audience(&config, "urn:example:something-else", true)
+            .expect_err("mismatched audience must fail closed at startup");
+        let message = error.to_string();
+        assert!(message.contains("urn:example:something-else"));
+        assert!(message.contains("urn:openshell:extension:interceptor:governance"));
+
+        // With gateway JWT signing disabled no token is minted at all, so the
+        // advertised audience is not something OpenShell can be wrong about.
+        validate_expected_audience(&config, "urn:example:something-else", false)
+            .expect("unauthenticated gateways skip the handshake");
+
+        // The check likewise does not apply where the registration opted out.
+        let opted_out = GatewayInterceptorConfig {
+            allow_insecure_transport: true,
+            ..config
+        };
+        validate_expected_audience(&opted_out, "urn:example:something-else", true)
+            .expect("opted-out interceptors mint no token to mismatch");
+    }
+
+    #[test]
+    fn opted_out_interceptors_do_not_require_a_token_slot() {
+        let config = GatewayInterceptorConfig {
+            name: "governance".to_string(),
+            grpc_endpoint: "http://127.0.0.1:18081".to_string(),
+            allow_insecure_transport: true,
+            ..GatewayInterceptorConfig::default()
+        };
+        validate_authenticated_slots(&[config], Some(&BTreeMap::new()))
+            .expect("explicit opt-out needs no credential");
+    }
+
+    #[tokio::test]
+    async fn configured_ca_read_failure_names_interceptor_without_certificate_contents() {
+        let config = GatewayInterceptorConfig {
+            name: "governance".to_string(),
+            grpc_endpoint: "https://governance.example".to_string(),
+            tls_ca_cert_path: Some(PathBuf::from("/definitely/missing/openshell-ca.pem")),
+            ..GatewayInterceptorConfig::default()
+        };
+        let error = connect_endpoint(&config)
+            .await
+            .expect_err("missing CA must prevent connection");
+        let message = error.to_string();
+        assert!(message.contains("governance"));
+        assert!(message.contains("/definitely/missing/openshell-ca.pem"));
     }
 
     #[test]

@@ -34,6 +34,12 @@ message MiddlewareManifest {
   string service_version = 2;
   // Bindings exposed by this middleware service.
   repeated MiddlewareBinding bindings = 3;
+  // Exact JWT audience this service verifies on inbound OpenShell calls.
+  // After authenticated Describe succeeds, OpenShell rejects the registration
+  // unless this matches the operator-configured audience. A strict verifier may
+  // reject an incorrect audience before returning this manifest. Empty skips
+  // this post-authentication consistency check.
+  string expected_audience = 4;
 }
 
 // MiddlewareBinding declares one operation and phase supported by a service.

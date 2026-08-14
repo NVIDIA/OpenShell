@@ -1,0 +1,27 @@
+load("@crates//:defs.bzl", "aliases", "all_crate_deps")
+load("@rules_rs//rs:rust_library.bzl", "rust_library")
+load("@rules_rs//rs:rust_test.bzl", "rust_test")
+load("@rules_rust//rust:defs.bzl", "rustfmt_test")
+
+rust_library(
+    name = "openshell-extension-core",
+    srcs = glob(["src/**/*.rs"]),
+    aliases = aliases(),
+    visibility = ["//visibility:public"],
+    deps = all_crate_deps(normal = True),
+)
+
+rust_test(
+    name = "openshell-extension-core_test",
+    crate = ":openshell-extension-core",
+    deps = all_crate_deps(normal_dev = True),
+)
+
+rustfmt_test(
+    name = "rustfmt_test",
+    targets = [
+        ":openshell-extension-core",
+        ":openshell-extension-core_test",
+    ],
+    visibility = ["//crates:__pkg__"],
+)

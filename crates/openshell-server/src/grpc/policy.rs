@@ -1905,6 +1905,7 @@ pub(super) async fn handle_get_sandbox_config(
         policy_source,
         &supervisor_middleware_services,
         state.config.policy_validation_failure_mode,
+        state.sandbox_jwt_issuer.is_some(),
     );
     let policy_credential_bindings = policy_static_credential_endpoint_bindings(policy.as_ref())?;
     if let Some(policy) = policy.as_ref() {
@@ -1942,6 +1943,7 @@ pub(super) async fn handle_get_sandbox_config(
             .policy_validation_failure_mode
             .as_str()
             .to_string(),
+        extension_authentication_enabled: state.sandbox_jwt_issuer.is_some(),
     }))
 }
 
@@ -4438,10 +4440,12 @@ fn compute_config_revision_with_validation_mode(
     policy_source: PolicySource,
     supervisor_middleware_services: &[openshell_core::proto::SupervisorMiddlewareService],
     policy_validation_failure_mode: openshell_core::PolicyValidationFailureMode,
+    extension_authentication_enabled: bool,
 ) -> u64 {
     let mut hasher = Sha256::new();
     hasher.update((policy_source as i32).to_le_bytes());
     hasher.update(policy_validation_failure_mode.as_str().as_bytes());
+    hasher.update([u8::from(extension_authentication_enabled)]);
     if let Some(policy) = policy {
         hasher.update(deterministic_policy_hash(policy).as_bytes());
     }
@@ -4496,6 +4500,7 @@ fn compute_config_revision(
         policy_source,
         supervisor_middleware_services,
         openshell_core::PolicyValidationFailureMode::default(),
+        false,
     )
 }
 
@@ -13944,6 +13949,7 @@ mod tests {
             PolicySource::Sandbox,
             &[],
             openshell_core::PolicyValidationFailureMode::FailClosed,
+            false,
         );
         let retain_last_valid = compute_config_revision_with_validation_mode(
             Some(&policy),
@@ -13951,8 +13957,33 @@ mod tests {
             PolicySource::Sandbox,
             &[],
             openshell_core::PolicyValidationFailureMode::RetainLastValid,
+            false,
         );
         assert_ne!(fail_closed, retain_last_valid);
+    }
+
+    #[test]
+    fn config_revision_changes_when_extension_authentication_capability_changes() {
+        let policy = ProtoSandboxPolicy::default();
+        let settings = HashMap::new();
+
+        let disabled = compute_config_revision_with_validation_mode(
+            Some(&policy),
+            &settings,
+            PolicySource::Sandbox,
+            &[],
+            openshell_core::PolicyValidationFailureMode::FailClosed,
+            false,
+        );
+        let enabled = compute_config_revision_with_validation_mode(
+            Some(&policy),
+            &settings,
+            PolicySource::Sandbox,
+            &[],
+            openshell_core::PolicyValidationFailureMode::FailClosed,
+            true,
+        );
+        assert_ne!(disabled, enabled);
     }
 
     #[test]
