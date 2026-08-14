@@ -620,6 +620,14 @@ impl KubernetesComputeConfig {
     ///    `sa.scc.supplemental-groups`) — passed in as the optional
     ///    `namespace_annotations` map
     /// 3. Fallback defaults: UID=`1000`, GID=UID
+    ///
+    /// The resolved pair is authoritative for the in-pod supervisor. It is
+    /// injected as `OPENSHELL_SANDBOX_UID`/`GID` and overwrites policy
+    /// `process.run_as_user`/`run_as_group`. A gateway-accepted policy
+    /// identity takes effect only when this pair matches it. Lower
+    /// `[openshell.gateway]` minima so SCC starts such as `500/50000` and
+    /// `30/50000` are eligible; they still do not change the fallback of
+    /// `1000` when config and annotations are absent.
     pub fn resolve_sandbox_uid(
         &self,
         namespace_annotations: Option<&BTreeMap<String, String>>,
@@ -1394,6 +1402,28 @@ mod tests {
     }
 
     #[test]
+    fn validate_sandbox_identity_config_accepts_uid_500_gid_30_when_min_is_one() {
+        let cfg = KubernetesComputeConfig {
+            min_sandbox_uid: 1,
+            min_sandbox_gid: 1,
+            sandbox_uid: Some(500),
+            sandbox_gid: Some(30),
+            ..KubernetesComputeConfig::default()
+        };
+        assert!(cfg.validate_sandbox_identity_config().is_ok());
+    }
+
+    #[test]
+    fn validate_sandbox_identity_config_rejects_gid_below_default_min() {
+        let cfg = KubernetesComputeConfig {
+            sandbox_gid: Some(30),
+            ..KubernetesComputeConfig::default()
+        };
+        let err = cfg.validate_sandbox_identity_config().unwrap_err();
+        assert!(err.contains("sandbox_gid 30"));
+    }
+
+    #[test]
     fn validate_sandbox_identity_config_rejects_min_zero() {
         let cfg = KubernetesComputeConfig {
             min_sandbox_uid: 0,
@@ -1434,6 +1464,23 @@ mod tests {
         assert_eq!(
             KubernetesComputeConfig::default().from_open_shift_supplemental_groups("1000/50000"),
             Some(1000)
+        );
+        assert_eq!(
+            KubernetesComputeConfig::default().from_open_shift_supplemental_groups("30/50000"),
+            None
+        );
+    }
+
+    #[test]
+    fn parse_openshift_supplemental_groups_accepts_gid_30_when_min_is_one() {
+        let cfg = KubernetesComputeConfig {
+            min_sandbox_uid: 1,
+            min_sandbox_gid: 1,
+            ..KubernetesComputeConfig::default()
+        };
+        assert_eq!(
+            cfg.from_open_shift_supplemental_groups("30/50000"),
+            Some(30)
         );
     }
 

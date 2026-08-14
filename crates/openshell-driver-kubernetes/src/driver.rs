@@ -3226,9 +3226,11 @@ struct SandboxPodParams<'a> {
     sa_token_ttl_secs: i64,
     provider_spiffe_enabled: bool,
     provider_spiffe_workload_api_socket_path: &'a str,
-    /// Resolved sandbox UID for supervisor `runAsUser` and env var.
+    /// Resolved sandbox UID injected as `OPENSHELL_SANDBOX_UID`.
+    /// The supervisor overwrites policy `run_as_user` with this value.
     sandbox_uid: u32,
-    /// Resolved sandbox GID for PVC init container operations.
+    /// Resolved sandbox GID injected as `OPENSHELL_SANDBOX_GID`.
+    /// The supervisor overwrites policy `run_as_group` with this value.
     sandbox_gid: u32,
     /// Minimum accepted numeric UID injected into the supervisor environment.
     min_sandbox_uid: u32,
@@ -6013,6 +6015,86 @@ mod tests {
             .find(|container| container["name"] == SUPERVISOR_NETWORK_INIT_CONTAINER_NAME)
             .unwrap();
         for container in [agent, sidecar, network_init] {
+            assert_eq!(
+                rendered_env(container, openshell_core::sandbox_env::MIN_SANDBOX_UID),
+                Some("1")
+            );
+            assert_eq!(
+                rendered_env(container, openshell_core::sandbox_env::MIN_SANDBOX_GID),
+                Some("1")
+            );
+        }
+    }
+
+    #[test]
+    fn combined_and_sidecar_render_resolved_identity_500_30() {
+        let combined_params = SandboxPodParams {
+            sandbox_uid: 500,
+            sandbox_gid: 30,
+            min_sandbox_uid: 1,
+            min_sandbox_gid: 1,
+            ..SandboxPodParams::default()
+        };
+        let combined = sandbox_template_to_k8s(
+            &SandboxTemplate::default(),
+            false,
+            &std::collections::HashMap::new(),
+            false,
+            &combined_params,
+        );
+        let combined_agent = &combined["spec"]["containers"][0];
+        assert_eq!(
+            rendered_env(combined_agent, openshell_core::sandbox_env::SANDBOX_UID),
+            Some("500")
+        );
+        assert_eq!(
+            rendered_env(combined_agent, openshell_core::sandbox_env::SANDBOX_GID),
+            Some("30")
+        );
+        assert_eq!(
+            rendered_env(combined_agent, openshell_core::sandbox_env::MIN_SANDBOX_UID),
+            Some("1")
+        );
+        assert_eq!(
+            rendered_env(combined_agent, openshell_core::sandbox_env::MIN_SANDBOX_GID),
+            Some("1")
+        );
+
+        let sidecar_params = SandboxPodParams {
+            topology: SupervisorTopology::Sidecar,
+            sandbox_uid: 500,
+            sandbox_gid: 30,
+            min_sandbox_uid: 1,
+            min_sandbox_gid: 1,
+            ..SandboxPodParams::default()
+        };
+        let sidecar_pod = sandbox_template_to_k8s(
+            &SandboxTemplate::default(),
+            false,
+            &std::collections::HashMap::new(),
+            false,
+            &sidecar_params,
+        );
+        let containers = sidecar_pod["spec"]["containers"].as_array().unwrap();
+        let agent = containers
+            .iter()
+            .find(|container| container["name"] == "agent")
+            .unwrap();
+        let sidecar = containers
+            .iter()
+            .find(|container| container["name"] == SUPERVISOR_NETWORK_SIDECAR_NAME)
+            .unwrap();
+        assert_eq!(agent["securityContext"]["runAsUser"], 500);
+        assert_eq!(agent["securityContext"]["runAsGroup"], 30);
+        for container in [agent, sidecar] {
+            assert_eq!(
+                rendered_env(container, openshell_core::sandbox_env::SANDBOX_UID),
+                Some("500")
+            );
+            assert_eq!(
+                rendered_env(container, openshell_core::sandbox_env::SANDBOX_GID),
+                Some("30")
+            );
             assert_eq!(
                 rendered_env(container, openshell_core::sandbox_env::MIN_SANDBOX_UID),
                 Some("1")
