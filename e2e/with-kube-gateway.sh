@@ -92,6 +92,8 @@ VAULT_NAMESPACE="${OPENSHELL_E2E_VAULT_NAMESPACE:-openbao}"
 VAULT_RELEASE_NAME="${OPENSHELL_E2E_VAULT_RELEASE_NAME:-openbao}"
 VAULT_CHART_VERSION="${OPENSHELL_E2E_OPENBAO_CHART_VERSION:-0.28.3}"
 VAULT_DEV_ROOT_TOKEN="${OPENSHELL_E2E_VAULT_DEV_ROOT_TOKEN:-root}"
+CORPORATE_PROXY_FIXTURE_DEPLOYED=0
+CORPORATE_PROXY_FIXTURE_SECRET="openshell-e2e-proxy-auth"
 
 # Isolate CLI/SDK gateway metadata from the developer's real config.
 export XDG_CONFIG_HOME="${WORKDIR}/config"
@@ -268,6 +270,11 @@ cleanup() {
 
   if [ "${VAULT_FIXTURE_DEPLOYED}" = "1" ]; then
     cleanup_vault_fixture
+  fi
+
+  if [ "${CORPORATE_PROXY_FIXTURE_DEPLOYED}" = "1" ]; then
+    kctl -n "${NAMESPACE}" delete secret "${CORPORATE_PROXY_FIXTURE_SECRET}" \
+      --ignore-not-found >/dev/null 2>&1 || true
   fi
 
   if [ "${HELM_INSTALLED}" = "1" ] && [ -n "${KUBE_CONTEXT}" ] && [ -n "${NAMESPACE}" ]; then
@@ -672,6 +679,50 @@ if [ -n "${HOST_GATEWAY_IP}" ]; then
 fi
 
 helm_values_args=(--values "${ROOT}/deploy/helm/openshell/ci/values-skaffold.yaml")
+if [ "${OPENSHELL_E2E_KUBE_CORPORATE_PROXY:-0}" = "1" ]; then
+  if [ -z "${HOST_GATEWAY_IP}" ]; then
+    echo "ERROR: corporate proxy e2e requires a host gateway IP for host.openshell.internal" >&2
+    exit 2
+  fi
+  CORPORATE_PROXY_PORT="$(e2e_pick_port)"
+  CORPORATE_PROXY_MODE="${OPENSHELL_E2E_KUBE_CORPORATE_PROXY_MODE:-authenticated}"
+  CORPORATE_PROXY_UPSTREAM_PORT=""
+  if [ "${CORPORATE_PROXY_MODE}" = "missing-secret" ] || [ "${CORPORATE_PROXY_MODE}" = "malformed" ]; then
+    export OPENSHELL_PROVISION_TIMEOUT="${OPENSHELL_PROVISION_TIMEOUT:-45}"
+  fi
+  CORPORATE_PROXY_VALUES="${WORKDIR}/corporate-proxy-values.yaml"
+  cat >"${CORPORATE_PROXY_VALUES}" <<EOF
+upstreamProxy:
+  url: http://host.openshell.internal:${CORPORATE_PROXY_PORT}
+EOF
+  if [ "${CORPORATE_PROXY_MODE}" = "no-proxy" ]; then
+    CORPORATE_PROXY_UPSTREAM_PORT="$(e2e_pick_port)"
+    cat >>"${CORPORATE_PROXY_VALUES}" <<EOF
+  noProxy: host.openshell.internal
+EOF
+  fi
+  case "${CORPORATE_PROXY_MODE}" in
+    authenticated|no-proxy)
+      kctl create namespace "${NAMESPACE}" --dry-run=client -o yaml | kctl apply -f -
+      kctl -n "${NAMESPACE}" create secret generic "${CORPORATE_PROXY_FIXTURE_SECRET}" \
+        --from-literal=proxy-auth=proxyuser:proxypass --dry-run=client -o yaml | kctl apply -f -
+      CORPORATE_PROXY_FIXTURE_DEPLOYED=1
+      ;;
+    malformed)
+      kctl create namespace "${NAMESPACE}" --dry-run=client -o yaml | kctl apply -f -
+      kctl -n "${NAMESPACE}" create secret generic "${CORPORATE_PROXY_FIXTURE_SECRET}" \
+        --from-literal=proxy-auth=malformed --dry-run=client -o yaml | kctl apply -f -
+      CORPORATE_PROXY_FIXTURE_DEPLOYED=1
+      ;;
+    missing-secret) ;;
+    *) echo "ERROR: unknown corporate proxy e2e mode '${CORPORATE_PROXY_MODE}'" >&2; exit 2 ;;
+  esac
+  export OPENSHELL_E2E_CORPORATE_PROXY_PORT="${CORPORATE_PROXY_PORT}"
+  export OPENSHELL_E2E_CORPORATE_PROXY_UPSTREAM_PORT="${CORPORATE_PROXY_UPSTREAM_PORT}"
+  export OPENSHELL_E2E_CORPORATE_PROXY_MODE="${CORPORATE_PROXY_MODE}"
+  helm_values_args+=(--values "${ROOT}/deploy/helm/openshell/ci/values-corporate-proxy-e2e.yaml")
+  helm_values_args+=(--values "${CORPORATE_PROXY_VALUES}")
+fi
 if [ "${OPENSHELL_E2E_CREDENTIAL_DRIVERS:-0}" = "1" ]; then
   case "${ACTIVE_CREDENTIAL_DRIVER}" in
     kubernetes-secrets)

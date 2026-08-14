@@ -5550,6 +5550,7 @@ mod tests {
                         max_payload_bytes: 1024,
                         timeout: "1s".into(),
                     }],
+                    expected_audience: String::new(),
                 },
             ))
         }
@@ -5633,6 +5634,7 @@ mod tests {
                     max_payload_bytes: 8192,
                     timeout: String::new(),
                 }],
+                expected_audience: String::new(),
             }
         }
 

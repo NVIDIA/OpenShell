@@ -18,6 +18,15 @@ The gateway runs as a host process. The Docker driver creates one container per
 sandbox and starts the `openshell-sandbox` supervisor inside that container. The
 supervisor then creates the nested sandbox namespace for the agent process.
 
+## Stop and Start
+
+Stop stops the managed container without removing it. Docker retains the
+container writable layer, attached volumes, labels, token material, and restart
+policy. Start starts that same container, so files in the resolved OCI
+workspace remain available. A durably stopped sandbox is excluded from
+gateway startup recovery and stays stopped across gateway restarts. Delete
+continues to force-remove the container and clean up driver-owned material.
+
 Before creating the container, the driver inspects the final sandbox image and
 captures its immutable image ID, raw OCI `Config.User`, and OCI
 `Config.WorkingDir`. Container creation uses that image ID, preventing a
@@ -58,8 +67,10 @@ Docker containers join an OpenShell-managed bridge network. The driver injects
 `host.openshell.internal` and `host.docker.internal` so supervisors have stable
 names for reaching the gateway host. On Docker Desktop, Colima, Rancher
 Desktop, OrbStack, and macOS-hosted gateways, those names use Docker's
-`host-gateway` alias. On native Linux Docker, the gateway also binds the bridge
-gateway IP so containers can call back to the host process.
+`host-gateway` alias. The driver requests a separate IPv4 loopback callback
+listener when the primary listener does not already cover it. On native Linux
+Docker, the gateway also binds the bridge gateway IP so containers can call
+back to the host process.
 
 ## Container Contract
 

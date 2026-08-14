@@ -23,15 +23,15 @@ pub fn draw(frame: &mut Frame<'_>, app: &App, area: Rect) {
 
     let phase_style = match phase {
         "Ready" => t.status_ok,
-        "Provisioning" => t.status_warn,
+        "Provisioning" | "Stopping" | "Starting" => t.status_warn,
         "Error" => t.status_err,
         _ => t.muted,
     };
 
     let status_indicator = match phase {
         "Ready" => "●",
-        "Provisioning" => "◐",
-        "Error" => "○",
+        "Provisioning" | "Stopping" | "Starting" => "◐",
+        "Error" | "Stopped" => "○",
         _ => "…",
     };
 

@@ -294,11 +294,27 @@ fn prepare_server_config(args: &mut RunArgs, matches: &ArgMatches) -> Result<Ser
         let key_path = args.tls_key.clone().ok_or_else(|| {
             miette::miette!("--tls-key is required when TLS is enabled (use --disable-tls to skip)")
         })?;
+        // External cert config (SNI-based dual cert) is only configurable
+        // via the TOML file, not CLI flags — it's a deployment-time setting.
+        let (ext_cert, ext_key, ext_names) = file
+            .as_ref()
+            .and_then(|f| f.openshell.gateway.tls.as_ref())
+            .map(|tls| {
+                (
+                    tls.external_cert_path.clone(),
+                    tls.external_key_path.clone(),
+                    tls.external_server_names.clone(),
+                )
+            })
+            .unwrap_or_default();
         Some(openshell_core::TlsConfig {
             cert_path,
             key_path,
             require_client_auth: has_client_ca && !has_oidc,
             client_ca_path: args.tls_client_ca.clone(),
+            external_cert_path: ext_cert,
+            external_key_path: ext_key,
+            external_server_names: ext_names,
         })
     };
 
@@ -1207,11 +1223,15 @@ mod tests {
 
         let expected = format!(
             "sqlite:{}",
-            tmp.path().join("openshell/gateway/openshell.db").display()
+            tmp.path()
+                .join("openshell")
+                .join("gateway")
+                .join("openshell.db")
+                .display()
         );
         assert!(local_tls.is_none());
         assert_eq!(args.db_url.as_deref(), Some(expected.as_str()));
-        assert!(tmp.path().join("openshell/gateway").is_dir());
+        assert!(tmp.path().join("openshell").join("gateway").is_dir());
     }
 
     #[test]
@@ -1818,6 +1838,7 @@ mem_mib = "not-a-number"
     }
 
     #[test]
+    #[cfg(not(target_os = "windows"))]
     fn driver_inherits_shared_image_from_gateway_section() {
         // [openshell.gateway].default_image inherits into the K8s driver
         // table when the driver-specific table does not set it.
@@ -1843,6 +1864,7 @@ namespace = "agents"
     }
 
     #[test]
+    #[cfg(not(target_os = "windows"))]
     fn driver_specific_value_overrides_gateway_inheritance() {
         let file = config_file_from_toml(
             r#"

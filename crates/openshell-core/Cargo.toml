@@ -12,10 +12,11 @@ repository.workspace = true
 
 [dependencies]
 async-trait = "0.1"
+openshell-extension-core = { path = "../openshell-extension-core" }
 glob = { workspace = true }
 prost = { workspace = true }
 prost-types = { workspace = true }
-tonic = { workspace = true, features = ["channel", "tls-native-roots"] }
+tonic = { workspace = true, features = ["channel", "tls-ring"] }
 tonic-prost = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
@@ -42,7 +43,7 @@ telemetry = ["dep:reqwest", "dep:chrono"]
 
 [build-dependencies]
 tonic-prost-build = { workspace = true }
-protobuf-src = { workspace = true }
+protoc-bin-vendored = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"

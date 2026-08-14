@@ -5,7 +5,7 @@
 
 pub use crate::commands::common::{
     PolicyGetView, parse_credential_expiry_cli_value, parse_env_pairs, parse_key_value_pairs,
-    parse_secret_material_env_pairs,
+    parse_secret_material_env_pairs, warn_credential_env_vars,
 };
 use crate::commands::common::{
     ProvisioningDisplay, ProvisioningStep, confirm_global_setting_delete,
@@ -51,9 +51,9 @@ use openshell_core::proto::{
     ProviderProfileImportItem, RejectDraftChunkRequest, ResourceRequirements,
     RevokeSshSessionRequest, RotateProviderCredentialRequest, Sandbox, SandboxPhase, SandboxPolicy,
     SandboxSpec, SandboxTemplate, ServiceEndpointResponse, SetInferenceRouteRequest, SettingScope,
-    TcpForwardFrame, TcpForwardInit, TcpRelayTarget, UpdateConfigRequest,
-    UpdateProviderProfilesRequest, UpdateProviderRequest, WatchSandboxRequest, exec_sandbox_event,
-    setting_value, tcp_forward_init,
+    StartSandboxRequest, StopSandboxRequest, TcpForwardFrame, TcpForwardInit, TcpRelayTarget,
+    UpdateConfigRequest, UpdateProviderProfilesRequest, UpdateProviderRequest, WatchSandboxRequest,
+    exec_sandbox_event, setting_value, tcp_forward_init,
 };
 use openshell_core::settings;
 use openshell_core::{ObjectId, ObjectName, ObjectWorkspace};
@@ -1820,8 +1820,10 @@ impl Drop for RawModeGuard {
     }
 }
 
+#[cfg(unix)]
 struct TaskGuard(tokio::task::JoinHandle<()>);
 
+#[cfg(unix)]
 impl Drop for TaskGuard {
     fn drop(&mut self) {
         self.0.abort();
@@ -1836,7 +1838,9 @@ async fn sandbox_exec_interactive_grpc(
     timeout_seconds: u32,
     environment: &HashMap<String, String>,
 ) -> Result<i32> {
-    use openshell_core::proto::{ExecSandboxInput, ExecSandboxWindowResize, exec_sandbox_input};
+    #[cfg(unix)]
+    use openshell_core::proto::ExecSandboxWindowResize;
+    use openshell_core::proto::{ExecSandboxInput, exec_sandbox_input};
     use tokio_stream::wrappers::ReceiverStream;
 
     let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
@@ -1875,31 +1879,26 @@ async fn sandbox_exec_interactive_grpc(
     // spawn_blocking) so the tokio runtime shutdown doesn't wait for a
     // thread blocked on stdin.read(). The thread exits when the channel
     // closes (blocking_send returns Err) or stdin hits EOF.
-    #[cfg(unix)]
-    {
-        let stdin_tx = input_tx.clone();
-        std::thread::spawn(move || {
-            let mut stdin = std::io::stdin().lock();
-            let mut buf = [0u8; 4096];
-            loop {
-                match stdin.read(&mut buf) {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => {
-                        if stdin_tx
-                            .blocking_send(ExecSandboxInput {
-                                payload: Some(exec_sandbox_input::Payload::Stdin(
-                                    buf[..n].to_vec(),
-                                )),
-                            })
-                            .is_err()
-                        {
-                            break;
-                        }
+    let stdin_tx = input_tx.clone();
+    std::thread::spawn(move || {
+        let mut stdin = std::io::stdin().lock();
+        let mut buf = [0u8; 4096];
+        loop {
+            match stdin.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if stdin_tx
+                        .blocking_send(ExecSandboxInput {
+                            payload: Some(exec_sandbox_input::Payload::Stdin(buf[..n].to_vec())),
+                        })
+                        .is_err()
+                    {
+                        break;
                     }
                 }
             }
-        });
-    }
+        }
+    });
 
     // SIGWINCH handler: forward terminal resize events.
     #[cfg(unix)]
@@ -2417,6 +2416,135 @@ pub async fn sandbox_delete(
     }
 
     Ok(())
+}
+
+/// Stop a sandbox while retaining its persistent workspace.
+pub async fn sandbox_stop(
+    server: &str,
+    name: &str,
+    workspace: &str,
+    tls: &TlsOptions,
+) -> Result<()> {
+    if let Ok(stopped) = stop_forwards_for_sandbox(name) {
+        for port in stopped {
+            eprintln!(
+                "{} Stopped forward of port {port} for sandbox {name}",
+                "✓".green().bold(),
+            );
+        }
+    }
+
+    let mut client = grpc_client(server, tls).await?;
+    let sandbox = client
+        .stop_sandbox(StopSandboxRequest {
+            name: name.to_string(),
+            workspace: workspace.to_string(),
+        })
+        .await
+        .into_diagnostic()?
+        .into_inner()
+        .sandbox
+        .ok_or_else(|| miette!("gateway returned no sandbox after stop"))?;
+    wait_for_lifecycle_phase(&mut client, sandbox, SandboxPhase::Stopped).await?;
+    println!("{} Stopped sandbox {name}", "✓".green().bold());
+    Ok(())
+}
+
+/// Start a stopped sandbox and wait until it is ready.
+pub async fn sandbox_start(
+    server: &str,
+    name: &str,
+    workspace: &str,
+    tls: &TlsOptions,
+) -> Result<()> {
+    let mut client = grpc_client(server, tls).await?;
+    let sandbox = client
+        .start_sandbox(StartSandboxRequest {
+            name: name.to_string(),
+            workspace: workspace.to_string(),
+        })
+        .await
+        .into_diagnostic()?
+        .into_inner()
+        .sandbox
+        .ok_or_else(|| miette!("gateway returned no sandbox after start"))?;
+    wait_for_lifecycle_phase(&mut client, sandbox, SandboxPhase::Ready).await?;
+    println!("{} Started sandbox {name}", "✓".green().bold());
+    Ok(())
+}
+
+async fn wait_for_lifecycle_phase(
+    client: &mut crate::tls::GrpcClient,
+    sandbox: Sandbox,
+    target: SandboxPhase,
+) -> Result<Sandbox> {
+    let current = SandboxPhase::try_from(sandbox.phase()).unwrap_or(SandboxPhase::Unknown);
+    if current == target {
+        return Ok(sandbox);
+    }
+    if current == SandboxPhase::Error {
+        return Err(miette!(
+            "sandbox entered Error while waiting for {target:?}"
+        ));
+    }
+
+    let timeout = Duration::from_secs(
+        std::env::var("OPENSHELL_LIFECYCLE_TIMEOUT")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(300),
+    );
+    let sandbox_id = sandbox.object_id().to_string();
+    let mut stream = client
+        .watch_sandbox(WatchSandboxRequest {
+            id: sandbox_id,
+            follow_status: true,
+            follow_logs: false,
+            follow_events: false,
+            log_tail_lines: 0,
+            event_tail: 0,
+            stop_on_terminal: false,
+            log_since_ms: 0,
+            log_sources: Vec::new(),
+            log_min_level: String::new(),
+        })
+        .await
+        .into_diagnostic()?
+        .into_inner();
+
+    let deadline = Instant::now() + timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(miette!(
+                "timed out after {}s waiting for sandbox to reach {target:?}",
+                timeout.as_secs()
+            ));
+        }
+        let event = tokio::time::timeout(remaining, stream.next())
+            .await
+            .map_err(|_| {
+                miette!(
+                    "timed out after {}s waiting for sandbox to reach {target:?}",
+                    timeout.as_secs()
+                )
+            })?
+            .ok_or_else(|| miette!("sandbox watch ended before reaching {target:?}"))?
+            .into_diagnostic()?;
+        if let Some(openshell_core::proto::sandbox_stream_event::Payload::Sandbox(sandbox)) =
+            event.payload
+        {
+            let phase = SandboxPhase::try_from(sandbox.phase()).unwrap_or(SandboxPhase::Unknown);
+            if phase == target {
+                return Ok(sandbox);
+            }
+            if phase == SandboxPhase::Error {
+                let detail = ready_false_condition_message(sandbox.status.as_ref())
+                    .unwrap_or_else(|| "sandbox entered Error".to_string());
+                return Err(miette!(detail));
+            }
+        }
+    }
 }
 
 /// Return the provider type inferred from the trailing command, if any.

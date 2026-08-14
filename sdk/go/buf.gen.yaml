@@ -1,36 +1,35 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# Code generation for the Go SDK. The proto module boundary and validation
-# policy live in the repo-level buf.yaml; this template only drives generation.
-# buf compiles the module with its own compiler and runs protoc-gen-go /
-# protoc-gen-go-grpc from mise-managed binaries. Limited to the client-surface
-# closure (openshell, datamodel, sandbox, options); well-known types resolve
-# through google.golang.org/protobuf and are not generated.
+# Code generation for the Go SDK. buf compiles the proto module with its own
+# compiler and runs protoc-gen-go / protoc-gen-go-grpc from mise-managed
+# binaries. The public SDK entry points are declared here; imported schemas
+# are included automatically, so their canonical dependency closure is
+# generated without duplicating a filename list in the generation scripts.
 version: v2
 
 inputs:
-  - directory: ../../proto
-    paths:
-      - ../../proto/openshell.proto
-      - ../../proto/datamodel.proto
-      - ../../proto/sandbox.proto
-      - ../../proto/options.proto
+  - proto_file: proto/openshell.proto
+  - proto_file: proto/inference.proto
 
 plugins:
   - local: protoc-gen-go
-    out: .
+    out: sdk/go
+    include_imports: true
     opt:
       - module=github.com/NVIDIA/OpenShell/sdk/go
       - Mopenshell.proto=github.com/NVIDIA/OpenShell/sdk/go/proto/openshellv1
       - Mdatamodel.proto=github.com/NVIDIA/OpenShell/sdk/go/proto/datamodelv1
       - Msandbox.proto=github.com/NVIDIA/OpenShell/sdk/go/proto/sandboxv1
       - Moptions.proto=github.com/NVIDIA/OpenShell/sdk/go/proto/optionsv1
+      - Minference.proto=github.com/NVIDIA/OpenShell/sdk/go/proto/inferencev1
   - local: protoc-gen-go-grpc
-    out: .
+    out: sdk/go
+    include_imports: true
     opt:
       - module=github.com/NVIDIA/OpenShell/sdk/go
       - Mopenshell.proto=github.com/NVIDIA/OpenShell/sdk/go/proto/openshellv1
       - Mdatamodel.proto=github.com/NVIDIA/OpenShell/sdk/go/proto/datamodelv1
       - Msandbox.proto=github.com/NVIDIA/OpenShell/sdk/go/proto/sandboxv1
       - Moptions.proto=github.com/NVIDIA/OpenShell/sdk/go/proto/optionsv1
+      - Minference.proto=github.com/NVIDIA/OpenShell/sdk/go/proto/inferencev1

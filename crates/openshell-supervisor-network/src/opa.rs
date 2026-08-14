@@ -476,9 +476,7 @@ impl OpaEngine {
             });
         }
 
-        engine
-            .set_input_json(&input_json.to_string())
-            .map_err(|e| miette::miette!("{e}"))?;
+        set_regorus_input(&mut engine, input_json)?;
 
         let allowed = engine
             .eval_rule("data.openshell.sandbox.allow_network".into())
@@ -539,9 +537,7 @@ impl OpaEngine {
             return Ok((NetworkAction::Deny { reason }, generation));
         }
 
-        engine
-            .set_input_json(&input_json.to_string())
-            .map_err(|e| miette::miette!("{e}"))?;
+        set_regorus_input(&mut engine, input_json)?;
 
         let action_val = engine
             .eval_rule("data.openshell.sandbox.network_action".into())
@@ -837,9 +833,7 @@ impl OpaEngine {
             .map_err(|_| miette::miette!("OPA engine lock poisoned"))?;
         let generation = self.current_generation();
 
-        engine
-            .set_input_json(&input_json.to_string())
-            .map_err(|e| miette::miette!("{e}"))?;
+        set_regorus_input(&mut engine, input_json)?;
 
         let val = engine
             .eval_rule("data.openshell.sandbox._matching_endpoint_configs".into())
@@ -897,9 +891,7 @@ impl OpaEngine {
             .lock()
             .map_err(|_| miette::miette!("OPA engine lock poisoned"))?;
 
-        engine
-            .set_input_json(&input_json.to_string())
-            .map_err(|e| miette::miette!("{e}"))?;
+        set_regorus_input(&mut engine, input_json)?;
 
         let val = engine
             .eval_rule("data.openshell.sandbox.exact_declared_endpoint_host".into())
@@ -1013,6 +1005,20 @@ fn network_input_json(input: &NetworkInput) -> serde_json::Value {
             "port": input.port,
         }
     })
+}
+
+/// Sets an already-built JSON value as Regorus input without encoding and reparsing JSON text.
+///
+/// The explicit fallible conversion preserves evaluator errors because Regorus's infallible
+/// `From<serde_json::Value>` conversion maps failures to [`regorus::Value::Undefined`].
+pub(crate) fn set_regorus_input(
+    engine: &mut regorus::Engine,
+    input: serde_json::Value,
+) -> Result<()> {
+    let input =
+        serde_json::from_value::<regorus::Value>(input).map_err(|e| miette::miette!("{e}"))?;
+    engine.set_input(input);
+    Ok(())
 }
 
 fn query_middleware_chain_locked(
@@ -2803,7 +2809,7 @@ process:
 
     fn eval_l7(engine: &OpaEngine, input: &serde_json::Value) -> bool {
         let mut eng = engine.engine.lock().unwrap();
-        eng.set_input_json(&input.to_string()).unwrap();
+        set_regorus_input(&mut eng, input.clone()).unwrap();
         let val = eng
             .eval_rule("data.openshell.sandbox.allow_request".into())
             .unwrap();
@@ -2818,7 +2824,7 @@ process:
         engine
             .add_data_json(&data.to_string())
             .expect("add raw data json");
-        engine.set_input_json(&input.to_string()).unwrap();
+        set_regorus_input(&mut engine, input).unwrap();
         let val = engine
             .eval_rule("data.openshell.sandbox.allow_request".into())
             .unwrap();
@@ -3095,7 +3101,7 @@ process:
             }]),
         );
         let mut eng = engine.engine.lock().unwrap();
-        eng.set_input_json(&input.to_string()).unwrap();
+        set_regorus_input(&mut eng, input).unwrap();
         let val = eng
             .eval_rule("data.openshell.sandbox.request_deny_reason".into())
             .unwrap();
@@ -4398,7 +4404,7 @@ network_policies:
         let engine = l7_engine();
         let input = l7_input("api.example.com", 8080, "DELETE", "/repos/myorg/foo");
         let mut eng = engine.engine.lock().unwrap();
-        eng.set_input_json(&input.to_string()).unwrap();
+        set_regorus_input(&mut eng, input).unwrap();
         let val = eng
             .eval_rule("data.openshell.sandbox.request_deny_reason".into())
             .unwrap();
@@ -4792,7 +4798,7 @@ network_policies:
         // Verify the cloned engine can evaluate
         let input_json = l7_input("api.example.com", 8080, "GET", "/repos/myorg/foo");
         let mut eng = cloned.engine().lock().unwrap();
-        eng.set_input_json(&input_json.to_string()).unwrap();
+        set_regorus_input(&mut eng, input_json).unwrap();
         let val = eng
             .eval_rule("data.openshell.sandbox.allow_request".into())
             .unwrap();
@@ -4834,7 +4840,7 @@ network_policies:
             .clone_engine_for_tunnel(engine.current_generation())
             .unwrap();
         let mut eng = cloned.engine().lock().unwrap();
-        eng.set_input_json(&input_json.to_string()).unwrap();
+        set_regorus_input(&mut eng, input_json).unwrap();
         let val = eng
             .eval_rule("data.openshell.sandbox.allow_request".into())
             .unwrap();
@@ -5034,7 +5040,7 @@ process:
             "/repos/myorg/pulls/123/reviews",
         );
         let mut eng = engine.engine.lock().unwrap();
-        eng.set_input_json(&input.to_string()).unwrap();
+        set_regorus_input(&mut eng, input).unwrap();
         let val = eng
             .eval_rule("data.openshell.sandbox.allow_request".into())
             .unwrap();
@@ -5051,7 +5057,7 @@ process:
         // GET repos/issues is allowed and not denied
         let input = l7_input("api.github.com", 443, "GET", "/repos/myorg/issues");
         let mut eng = engine.engine.lock().unwrap();
-        eng.set_input_json(&input.to_string()).unwrap();
+        set_regorus_input(&mut eng, input).unwrap();
         let val = eng
             .eval_rule("data.openshell.sandbox.allow_request".into())
             .unwrap();
@@ -5068,7 +5074,7 @@ process:
         // POST to issues is allowed (deny only targets reviews)
         let input = l7_input("api.github.com", 443, "POST", "/repos/myorg/issues");
         let mut eng = engine.engine.lock().unwrap();
-        eng.set_input_json(&input.to_string()).unwrap();
+        set_regorus_input(&mut eng, input).unwrap();
         let val = eng
             .eval_rule("data.openshell.sandbox.allow_request".into())
             .unwrap();
@@ -5085,7 +5091,7 @@ process:
         // GET /repos/myorg/rulesets should be denied (method: "*")
         let input = l7_input("api.github.com", 443, "GET", "/repos/myorg/rulesets");
         let mut eng = engine.engine.lock().unwrap();
-        eng.set_input_json(&input.to_string()).unwrap();
+        set_regorus_input(&mut eng, input).unwrap();
         let val = eng
             .eval_rule("data.openshell.sandbox.allow_request".into())
             .unwrap();
@@ -5106,7 +5112,7 @@ process:
             "/repos/myorg/branches/main/protection",
         );
         let mut eng = engine.engine.lock().unwrap();
-        eng.set_input_json(&input.to_string()).unwrap();
+        set_regorus_input(&mut eng, input).unwrap();
         let val = eng
             .eval_rule("data.openshell.sandbox.allow_request".into())
             .unwrap();
@@ -5127,7 +5133,7 @@ process:
             "/repos/myorg/pulls/123/reviews",
         );
         let mut eng = engine.engine.lock().unwrap();
-        eng.set_input_json(&input.to_string()).unwrap();
+        set_regorus_input(&mut eng, input).unwrap();
         let val = eng
             .eval_rule("data.openshell.sandbox.request_deny_reason".into())
             .unwrap();
@@ -5153,7 +5159,7 @@ process:
             serde_json::json!({"force": ["true"]}),
         );
         let mut eng = engine.engine.lock().unwrap();
-        eng.set_input_json(&input.to_string()).unwrap();
+        set_regorus_input(&mut eng, input).unwrap();
         let val = eng
             .eval_rule("data.openshell.sandbox.allow_request".into())
             .unwrap();
@@ -5176,7 +5182,7 @@ process:
             serde_json::json!({"force": ["false"]}),
         );
         let mut eng = engine.engine.lock().unwrap();
-        eng.set_input_json(&input.to_string()).unwrap();
+        set_regorus_input(&mut eng, input).unwrap();
         let val = eng
             .eval_rule("data.openshell.sandbox.allow_request".into())
             .unwrap();
@@ -5201,7 +5207,7 @@ process:
             serde_json::json!({"force": ["true", "false"]}),
         );
         let mut eng = engine.engine.lock().unwrap();
-        eng.set_input_json(&input.to_string()).unwrap();
+        set_regorus_input(&mut eng, input).unwrap();
         let val = eng
             .eval_rule("data.openshell.sandbox.allow_request".into())
             .unwrap();
@@ -5219,7 +5225,7 @@ process:
         // so no match (key not present) and request should be allowed
         let input = l7_input("api.restricted.com", 443, "POST", "/admin/settings");
         let mut eng = engine.engine.lock().unwrap();
-        eng.set_input_json(&input.to_string()).unwrap();
+        set_regorus_input(&mut eng, input).unwrap();
         let val = eng
             .eval_rule("data.openshell.sandbox.allow_request".into())
             .unwrap();
@@ -7872,11 +7878,11 @@ host_match if {
         ];
         for (pattern, host) in cases {
             let rust = openshell_core::host_pattern::host_matches(pattern, host).unwrap();
-            engine
-                .set_input_json(
-                    &serde_json::json!({ "pattern": pattern, "host": host }).to_string(),
-                )
-                .unwrap();
+            set_regorus_input(
+                &mut engine,
+                serde_json::json!({ "pattern": pattern, "host": host }),
+            )
+            .unwrap();
             let rego = engine.eval_rule("data.test.host_match".into()).unwrap()
                 == regorus::Value::from(true);
             assert_eq!(

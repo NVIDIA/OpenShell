@@ -108,6 +108,24 @@ service OpenShell {
     };
   }
 
+  // Stop a sandbox while retaining its persistent state.
+  rpc StopSandbox(StopSandboxRequest) returns (SandboxResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "sandbox:write"
+      workspace_role: "user"
+    };
+  }
+
+  // Start a previously stopped sandbox.
+  rpc StartSandbox(StartSandboxRequest) returns (SandboxResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "sandbox:write"
+      workspace_role: "user"
+    };
+  }
+
   // Create a short-lived SSH session for a sandbox.
   rpc CreateSshSession(CreateSshSessionRequest) returns (CreateSshSessionResponse) {
     option (openshell.options.v1.authorization) = {
@@ -664,10 +682,16 @@ message IssueSandboxTokenResponse {
   int64 expires_at_ms = 2;
 }
 
-// RefreshSandboxToken request. Empty body; the calling principal must
-// already be a sandbox principal (i.e. the request carries a still-valid
-// gateway-minted JWT in its Authorization header).
-message RefreshSandboxTokenRequest {}
+// RefreshSandboxToken request. The calling principal must already be a
+// sandbox principal (i.e. the request carries a still-valid gateway-minted
+// JWT in its Authorization header). Extension service names are resolved
+// against server-owned registrations and the sandbox's effective policy;
+// callers never choose token audiences directly.
+message RefreshSandboxTokenRequest {
+  // Operator registration names for extension services selected by the
+  // sandbox's effective policy.
+  repeated string extension_service_names = 1;
+}
 
 // RefreshSandboxToken response. The new token replaces the supervisor's
 // in-memory bearer credential.
@@ -677,7 +701,11 @@ message RefreshSandboxTokenResponse {
   // Absolute expiry of the new token, milliseconds since the epoch. 0 means
   // the token is non-expiring.
   int64 expires_at_ms = 2;
+  // Fresh credentials for the requested, policy-authorized extension
+  // services. These remain in supervisor memory and are never persisted.
+  repeated ExtensionServiceCredential extension_credentials = 3;
 }
+
 
 // Health check request.
 message HealthRequest {}
@@ -879,6 +907,9 @@ enum SandboxPhase {
   SANDBOX_PHASE_ERROR = 3;
   SANDBOX_PHASE_DELETING = 4;
   SANDBOX_PHASE_UNKNOWN = 5;
+  SANDBOX_PHASE_STOPPING = 6;
+  SANDBOX_PHASE_STOPPED = 7;
+  SANDBOX_PHASE_STARTING = 8;
 }
 
 // Public platform event exposed on the sandbox watch stream.
@@ -970,6 +1001,22 @@ message DetachSandboxProviderRequest {
 
 // Delete sandbox request.
 message DeleteSandboxRequest {
+  // Sandbox name (canonical lookup key).
+  string name = 1;
+  // Workspace scope. Empty defaults to "default".
+  string workspace = 2;
+}
+
+// Stop sandbox request.
+message StopSandboxRequest {
+  // Sandbox name (canonical lookup key).
+  string name = 1;
+  // Workspace scope. Empty defaults to "default".
+  string workspace = 2;
+}
+
+// Start sandbox request.
+message StartSandboxRequest {
   // Sandbox name (canonical lookup key).
   string name = 1;
   // Workspace scope. Empty defaults to "default".
@@ -2625,4 +2672,17 @@ message ListWorkspaceMembersRequest {
 // List workspace members response.
 message ListWorkspaceMembersResponse {
   repeated WorkspaceMember members = 1;
+}
+
+// Short-lived credential for one policy-authorized extension service.
+// Kept at the end of the file so adding it does not renumber existing
+// generated message descriptors.
+message ExtensionServiceCredential {
+  // Operator registration name used to correlate the credential with the
+  // stable service registration delivered by GetSandboxConfig.
+  string service_name = 1;
+  // Gateway-minted JWT with an audience derived from the registration.
+  string token = 2 [(openshell.options.v1.secret) = true];
+  // Absolute expiry of the token, milliseconds since the epoch.
+  int64 expires_at_ms = 3;
 }

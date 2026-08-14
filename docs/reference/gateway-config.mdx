@@ -31,7 +31,7 @@ Package-managed gateways do not require a TOML file. Create one at the package's
 
 The Fedora/RHEL RPM template leaves `[openshell.gateway].bind_address` unset. The gateway therefore uses its built-in `127.0.0.1:17670` primary listener. The Podman driver negotiates separate, restricted listeners for sandbox callbacks, so the primary listener does not need a wildcard address. Set `bind_address` explicitly only when clients must reach the primary multiplexed API through another interface.
 
-The Homebrew formula creates its prefix config once with `bind_address = "[::1]:17670"`. Keeping the primary API on IPv6 loopback leaves IPv4 loopback available for Podman Machine's sandbox callback listener. A user config takes precedence, and upgrades do not overwrite either config.
+The Homebrew formula creates its prefix config without setting `bind_address`, so the gateway uses its built-in `127.0.0.1:17670` primary listener. Docker Desktop and Podman Machine reuse that listener for sandbox callbacks. A user config takes precedence. Upgrades preserve user-edited configs and migrate only an unchanged prefix config generated with the affected IPv6-loopback default.
 
 ## Layout
 
@@ -130,7 +130,9 @@ provider_profile_sources = [
 # both the gateway and sandbox supervisors.
 [[openshell.supervisor.middleware]]
 name = "local-content-guard"
-grpc_endpoint = "http://host.openshell.internal:50051"
+grpc_endpoint = "https://host.openshell.internal:50051"
+tls_ca_cert_path = "/etc/openshell/certs/content-guard-ca.pem"
+audience = "urn:openshell:middleware:local-content-guard"
 max_payload_bytes = 262144
 timeout = "500ms"
 
@@ -140,6 +142,10 @@ cert_path             = "/etc/openshell/certs/gateway.pem"
 key_path              = "/etc/openshell/certs/gateway-key.pem"
 client_ca_path        = "/etc/openshell/certs/client-ca.pem"
 require_client_auth   = false
+# Optional: SNI-based dual certificate for external (e.g. ACME) TLS.
+# external_cert_path    = "/etc/openshell/certs/external.pem"
+# external_key_path     = "/etc/openshell/certs/external-key.pem"
+# external_server_names = ["gateway.example.com"]
 
 [openshell.gateway.gateway_jwt]
 signing_key_path = "/etc/openshell/jwt/signing.pem"
@@ -172,6 +178,7 @@ scopes_claim  = ""
 [[openshell.gateway.interceptors]]
 name               = "quota"
 grpc_endpoint      = "unix:///run/openshell/interceptors/quota.sock"
+audience           = "urn:openshell:interceptor:quota"
 order              = 10
 failure_policy     = "fail_closed"
 binding_policy     = "allowlist"
@@ -194,6 +201,8 @@ allow_reference_namespace = false
 ```
 
 Local Docker, Podman, and VM gateways can also set `[openshell.gateway.mtls_auth] enabled = true` to authenticate CLI callers from verified client certificates. Kubernetes deployments must leave this unset and use OIDC or a trusted access proxy; the Helm chart does not render this table.
+
+`[openshell.gateway.tls]` supports optional SNI-based dual-certificate mode for deployments that need separate internal and external server certificates. Set `external_cert_path` and `external_key_path` to point at the external (e.g. ACME/publicly-trusted) certificate and key. List the hostnames that should be served with the external certificate in `external_server_names`. Connections whose TLS SNI hostname matches one of those names receive the external certificate; all other connections (including those with no SNI) receive the primary internal certificate from `cert_path`/`key_path`. Both fields must be set together — providing only one is a configuration error. On Kubernetes with the Helm chart, the external certificate is managed automatically when `certManager.serverIssuerRef.name` is set; the chart populates these fields from the cert-manager-issued external server certificate.
 
 `[openshell.gateway] policy_validation_failure_mode` controls what sandbox supervisors do when a complete candidate policy fails runtime validation. The default, `fail_closed`, deactivates the previous network policy, closes relays pinned to it, and denies new egress until a valid generation loads. `retain_last_valid` leaves the previous valid generation active. Both modes reject the candidate atomically; startup always fails closed when no previous valid generation exists. Gateway mutation paths that can preflight a known effective scope reject invalid candidates before persistence and leave the active policy unchanged regardless of this setting. Changing the value requires restarting the gateway so it can reload `gateway.toml` and distribute the new posture to sandbox supervisors.
 
@@ -255,7 +264,9 @@ Register operator-run supervisor middleware services with one or more `[[openshe
 ```toml
 [[openshell.supervisor.middleware]]
 name = "local-content-guard"
-grpc_endpoint = "http://host.openshell.internal:50051"
+grpc_endpoint = "https://host.openshell.internal:50051"
+tls_ca_cert_path = "/etc/openshell/certs/content-guard-ca.pem"
+audience = "urn:openshell:middleware:local-content-guard"
 max_payload_bytes = 262144
 timeout = "500ms"
 ```
@@ -268,13 +279,28 @@ The gateway connects to every registered service and validates `Describe` before
 
 `timeout` is the operator-configured service-wide RPC timeout. It accepts the same compact duration syntax as gateway interceptors: an integer followed by `ms` or `s`, such as `500ms` or `2s`. Values must be between `10ms` and `30s`, inclusive. Omit the field to use the 500 ms platform default. A binding may advertise a shorter `timeout` in the `Describe` manifest, but it cannot extend the operator-configured deadline; OpenShell uses the smaller value. OpenShell validates both levels before accepting the service. The operator-configured service timeout applies to `Describe` and `ValidateConfig`. The effective binding timeout applies only to `EvaluateHttpRequest`, WebSocket preflight, and each WebSocket message. An accepted WebSocket stream has no connection-wide RPC deadline.
 
-The service `grpc_endpoint` currently supports plaintext `http://` and TLS `https://` using the platform trust store. Custom trust roots, client authentication, health checks, and runtime registration are not currently supported. The endpoint must be reachable from both the gateway and sandbox supervisors; use `host.openshell.internal` or another shared address that can be resolved in both places.
+The service `grpc_endpoint` supports plaintext `http://` and TLS `https://`. HTTPS uses the platform trust store unless `tls_ca_cert_path` names a certificate-only PEM bundle. OpenShell rejects bundles containing private keys, loads the certificates at gateway startup, and distributes only public certificates to sandbox supervisors; normal TLS hostname verification still applies. `audience` sets the exact audience for gateway-minted service tokens and defaults to `urn:openshell:extension:middleware:<name>`. After authenticated `Describe` succeeds, OpenShell treats a non-empty manifest `expected_audience` as a consistency assertion and refuses to start when it differs from the configured audience. A strict verifier may reject an incorrect audience before returning the manifest.
+
+When `gateway_jwt` is configured, OpenShell attaches short-lived bearer credentials to gateway and supervisor calls and requires `https://`. A middleware endpoint must be reachable from sandbox supervisors, so Unix sockets are not an option here. Set `allow_insecure_transport = true` on a registration to keep a plaintext `http://` endpoint: OpenShell then attaches no credential, supervisors do not request one, and the gateway logs a warning naming the registration at every startup. mTLS client authentication, health checks, and runtime registration are not currently supported. The endpoint must be reachable from both the gateway and sandbox supervisors; use `host.openshell.internal` or another shared address that can be resolved in both places.
 
 See [Supervisor Middleware](/extensibility/supervisor-middleware) for selection, failure, payload-limit, and operational guidance.
 
 ## Gateway Interceptors
 
 `[[openshell.gateway.interceptors]]` configures gateway-side interceptor services. The gateway calls each service's `Describe` RPC at startup, validates its declared OpenShell RPC bindings against the compiled service descriptor, and applies matching phases from a central gRPC middleware path. Interceptors can target only methods in the gateway's built-in allowlist of unary mutation RPCs. New RPCs are non-interceptable until they are deliberately added to that allowlist; adding one does not require handler-specific interceptor code. Request bodies are exposed as protobuf JSON objects. Fields marked secret in the protobuf schema are recursively omitted from requests and post-commit responses. Interceptors cannot patch an omitted field or a containing object.
+
+HTTPS interceptor endpoints use the platform trust store by default. Set `tls_ca_cert_path` to a PEM certificate bundle for a private CA; normal TLS hostname verification still applies. `audience` sets the exact audience for gateway-minted service tokens and defaults to `urn:openshell:extension:interceptor:<name>`. After authenticated `Describe` succeeds, the gateway treats a non-empty manifest `expected_audience` as a consistency assertion and refuses to start when it differs from the configured audience. A strict verifier may reject an incorrect audience before returning the manifest. When `gateway_jwt` is configured, network interceptors must use HTTPS and receive short-lived gateway-caller bearer credentials; local Unix sockets are also supported. Set `allow_insecure_transport = true` to keep a plaintext `http://` interceptor endpoint with no credential attached and a startup warning.
+
+### Extension Token Verification Endpoints
+
+When `gateway_jwt` is configured the gateway publishes two unauthenticated documents that extension services use to verify OpenShell callers:
+
+| Path | Contents |
+| --- | --- |
+| `/.well-known/jwks.json` | Single-key JWKS holding the Ed25519 public key and its `kid`. |
+| `/.well-known/openid-configuration` | OIDC-shaped discovery metadata: the exact expected `iss`, an absolute `jwks_uri`, and `EdDSA` as the only supported signing algorithm. |
+
+The discovery document is OIDC-shaped rather than OIDC-compliant: `issuer` is the gateway identity (`openshell-gateway:<gateway_id>`), not the URL the document is served from. Verifiers compare `iss` against that value and must not infer trust from the document's location; the serving TLS connection is what authenticates the gateway. Both endpoints return `404` when `gateway_jwt` is not configured.
 
 `binding_policy` controls how the manifest and operator binding configuration combine:
 
@@ -411,6 +437,10 @@ compute_drivers       = ["kubernetes"]
 cert_path      = "/etc/openshell-tls/server/tls.crt"
 key_path       = "/etc/openshell-tls/server/tls.key"
 client_ca_path = "/etc/openshell-tls/client-ca/ca.crt"
+# When cert-manager serverIssuerRef is configured, these are populated by Helm:
+# external_cert_path    = "/etc/openshell-tls/server-external/tls.crt"
+# external_key_path     = "/etc/openshell-tls/server-external/tls.key"
+# external_server_names = ["gateway.example.com"]
 
 [openshell.drivers.kubernetes]
 namespace                      = "agents"
@@ -428,6 +458,32 @@ supervisor_sideload_method     = "image-volume"
 # filesystem, and network enforcement in the agent container. "sidecar" moves
 # pod-level network enforcement and gateway session handling into a network sidecar.
 topology                       = "combined"
+# Optional corporate HTTP forward proxy for policy-approved TLS egress. The
+# sandbox workload cannot select or override these settings. Only http:// proxy
+# endpoints and TLS CONNECT traffic are supported; plain HTTP egress remains
+# direct. `no_proxy` bypasses only the corporate proxy, never OpenShell policy.
+# https_proxy                  = "http://proxy.corp.example:8080"
+# no_proxy                     = ".svc,.svc.cluster.local,10.96.0.0/12,10.244.0.0/16"
+# Proxy credentials must be an existing Secret in the sandbox namespace. The
+# key contains a `user:pass` value and is mounted only in the network
+# supervisor container, never in workload environment or command arguments.
+# proxy_auth_secret_name       = "corporate-proxy-auth"
+# proxy_auth_secret_key        = "credentials"
+# The gateway validates the Secret name/key syntax and their configuration
+# relationship at startup; it does not read the Secret from the Kubernetes API.
+# Kubernetes resolves the Secret when the Sandbox Pod starts. A missing key or
+# Secret prevents that Pod from starting; unreadable or malformed `user:pass`
+# content is validated fail-closed by the supervisor at startup and never
+# falls back to direct egress.
+# Proxy credential Secrets require `topology = "sidecar"`. Combined topology
+# shares its credential mount with the workload and can make it readable by the
+# sandbox group through Kubernetes `fsGroup` volume permission handling.
+# Required with a credential Secret: Basic authentication to an http:// proxy
+# is cleartext on the connection to that proxy.
+# proxy_auth_allow_insecure    = true
+# Last resort for hostname-filtering proxy ACLs. The proxy resolves the target,
+# so its ACL becomes part of the egress boundary for proxied connections.
+# proxy_connect_by_hostname    = true
 grpc_endpoint                  = "https://openshell-gateway.agents.svc:8080"
 ssh_socket_path                = "/run/openshell/ssh.sock"
 client_tls_secret_name         = "openshell-client-tls"

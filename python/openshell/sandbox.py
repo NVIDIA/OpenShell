@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import base64
 import contextlib
+import errno
 import json
 import os
 import pathlib
@@ -249,6 +250,14 @@ class SandboxSession:
 
     def delete(self) -> bool:
         return self._client.delete(self.sandbox.name, workspace=self._workspace)
+
+    def stop(self) -> SandboxRef:
+        self.sandbox = self._client.stop(self.sandbox.name, workspace=self._workspace)
+        return self.sandbox
+
+    def start(self) -> SandboxRef:
+        self.sandbox = self._client.start(self.sandbox.name, workspace=self._workspace)
+        return self.sandbox
 
 
 class SandboxClient:
@@ -546,6 +555,20 @@ class SandboxClient:
         )
         return bool(response.deleted)
 
+    def stop(self, sandbox_name: str, *, workspace: str) -> SandboxRef:
+        response = self._stub.StopSandbox(
+            openshell_pb2.StopSandboxRequest(name=sandbox_name, workspace=workspace),
+            timeout=self._timeout,
+        )
+        return _sandbox_ref(response.sandbox)
+
+    def start(self, sandbox_name: str, *, workspace: str) -> SandboxRef:
+        response = self._stub.StartSandbox(
+            openshell_pb2.StartSandboxRequest(name=sandbox_name, workspace=workspace),
+            timeout=self._timeout,
+        )
+        return _sandbox_ref(response.sandbox)
+
     def wait_deleted(
         self, sandbox_name: str, *, workspace: str, timeout_seconds: float = 60.0
     ) -> None:
@@ -566,15 +589,45 @@ class SandboxClient:
     def wait_ready(
         self, sandbox_name: str, *, workspace: str, timeout_seconds: float = 300.0
     ) -> SandboxRef:
+        return self._wait_for_phase(
+            sandbox_name,
+            workspace=workspace,
+            target_phase=openshell_pb2.SANDBOX_PHASE_READY,
+            target_name="ready",
+            timeout_seconds=timeout_seconds,
+        )
+
+    def wait_stopped(
+        self, sandbox_name: str, *, workspace: str, timeout_seconds: float = 300.0
+    ) -> SandboxRef:
+        return self._wait_for_phase(
+            sandbox_name,
+            workspace=workspace,
+            target_phase=openshell_pb2.SANDBOX_PHASE_STOPPED,
+            target_name="stopped",
+            timeout_seconds=timeout_seconds,
+        )
+
+    def _wait_for_phase(
+        self,
+        sandbox_name: str,
+        *,
+        workspace: str,
+        target_phase: int,
+        target_name: str,
+        timeout_seconds: float,
+    ) -> SandboxRef:
         deadline = time.time() + timeout_seconds
         while time.time() < deadline:
             sandbox = self.get(sandbox_name, workspace=workspace)
-            if sandbox.status.phase == openshell_pb2.SANDBOX_PHASE_READY:
+            if sandbox.status.phase == target_phase:
                 return sandbox
             if sandbox.status.phase == openshell_pb2.SANDBOX_PHASE_ERROR:
                 raise SandboxError(f"sandbox {sandbox_name} entered error phase")
             time.sleep(1)
-        raise SandboxError(f"sandbox {sandbox_name} was not ready within timeout")
+        raise SandboxError(
+            f"sandbox {sandbox_name} was not {target_name} within timeout"
+        )
 
     def exec_stream(
         self,
@@ -1065,6 +1118,40 @@ def _xdg_config_home() -> pathlib.Path:
 # matches `openshell-bootstrap::oidc_token::is_token_expired`.
 _OIDC_TOKEN_EXPIRY_GRACE_SECONDS = 30
 
+_IS_WINDOWS = os.name == "nt"
+_WINDOWS_REPLACE_RETRYABLE_ERRORS = frozenset({5, 32})
+_WINDOWS_REPLACE_TIMEOUT_SECONDS = 0.25
+_WINDOWS_REPLACE_INITIAL_DELAY_SECONDS = 0.005
+_WINDOWS_REPLACE_MAX_DELAY_SECONDS = 0.05
+_WINDOWS_REPLACE_LOCK = threading.Lock()
+
+
+def _atomic_replace(source: pathlib.Path, destination: pathlib.Path) -> None:
+    """Atomically replace a file, retrying transient Windows sharing errors."""
+    if not _IS_WINDOWS:
+        source.replace(destination)
+        return
+
+    # Serialize writers in this process. The retry still handles other
+    # processes (including the Rust CLI) and filesystem scanners that briefly
+    # open the destination without delete sharing.
+    with _WINDOWS_REPLACE_LOCK:
+        deadline = time.monotonic() + _WINDOWS_REPLACE_TIMEOUT_SECONDS
+        delay = _WINDOWS_REPLACE_INITIAL_DELAY_SECONDS
+        while True:
+            try:
+                source.replace(destination)
+                return
+            except PermissionError as error:
+                winerror = getattr(error, "winerror", None)
+                retryable = winerror in _WINDOWS_REPLACE_RETRYABLE_ERRORS or (
+                    winerror is None and error.errno == errno.EACCES
+                )
+                if not retryable or time.monotonic() >= deadline:
+                    raise
+                time.sleep(delay)
+                delay = min(delay * 2, _WINDOWS_REPLACE_MAX_DELAY_SECONDS)
+
 
 def _read_oidc_token_bundle(gateway_dir: pathlib.Path) -> dict | None:
     """Read and parse `oidc_token.json` for a gateway.
@@ -1531,7 +1618,7 @@ class _OidcRefresher:
                 f.write(payload)
             with contextlib.suppress(OSError):
                 tmp_path.chmod(0o600)
-            tmp_path.replace(path)
+            _atomic_replace(tmp_path, path)
         except BaseException:
             # Clean up our tmp on failure so we don't leave orphaned
             # `.oidc_token.<rand>.tmp` files lying around. The replace

@@ -3393,6 +3393,7 @@ network_policies:
                         as u64,
                     timeout: "1s".into(),
                 }],
+                expected_audience: String::new(),
             }))
         }
 
@@ -3576,6 +3577,9 @@ network_policies:
                 max_payload_bytes: openshell_supervisor_middleware::MAX_MIDDLEWARE_PAYLOAD_BYTES
                     as u64,
                 timeout: "2s".into(),
+                tls_ca_cert_pem: Vec::new(),
+                audience: String::new(),
+                allow_insecure_transport: false,
             }],
         )
         .await
@@ -4457,6 +4461,9 @@ network_policies:
                 max_payload_bytes: openshell_supervisor_middleware::MAX_MIDDLEWARE_PAYLOAD_BYTES
                     as u64,
                 timeout: "2s".into(),
+                tls_ca_cert_pem: Vec::new(),
+                audience: String::new(),
+                allow_insecure_transport: false,
             }],
         )
         .await
@@ -4601,6 +4608,9 @@ network_policies:
                 max_payload_bytes: openshell_supervisor_middleware::MAX_MIDDLEWARE_PAYLOAD_BYTES
                     as u64,
                 timeout: "2s".into(),
+                tls_ca_cert_pem: Vec::new(),
+                audience: String::new(),
+                allow_insecure_transport: false,
             }],
         )
         .await

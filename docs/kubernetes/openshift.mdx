@@ -87,8 +87,56 @@ openshell gateway add http://127.0.0.1:8080 --local --name openshift
 openshell status
 ```
 
+## Production: expose externally with a real certificate
+
+The steps above run the gateway over plaintext HTTP for quick evaluation. For
+a real deployment, cert-manager can issue the gateway's server certificate
+from a real Issuer or ClusterIssuer (for example, an ACME issuer), and an
+OpenShift Route with TLS passthrough exposes it externally while the gateway
+keeps terminating its own TLS and mTLS.
+
+Install cert-manager and configure a working `ClusterIssuer` first — see
+[Managing Certificates](/kubernetes/managing-certificates) for the
+`certManager.serverIssuerRef` details. Configure an OIDC provider as described
+in [Access Control](/kubernetes/access-control) — remote gateways authenticate
+CLI users via OIDC, not mTLS, so the gateway must know the OIDC issuer URL.
+Install the chart with:
+
+```shell
+helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart \
+  --version <version> \
+  --namespace openshell \
+  --set podSecurityContext.fsGroup=null \
+  --set securityContext.runAsUser=null \
+  --set server.disableTls=false \
+  --set certManager.enabled=true \
+  --set certManager.serverIssuerRef.name=<cluster-issuer-name> \
+  --set certManager.serverIssuerRef.kind=ClusterIssuer \
+  --set certManager.serverDnsNames[0]=<external-hostname> \
+  --set openshiftRoute.enabled=true \
+  --set openshiftRoute.host=<external-hostname> \
+  --set server.oidc.issuer=<oidc-issuer-url> \
+  --set server.oidc.audience=<oidc-audience>
+```
+
+| Override | Reason |
+|---|---|
+| `certManager.serverIssuerRef` | Creates a second server certificate from your Issuer or ClusterIssuer for external clients. The gateway uses SNI to present this cert for the external hostname while continuing to present the internal (chart CA) cert to supervisors. The internal certificate's `ca.crt` is the chart CA that also signed the client cert, so the default `clientCaFromServerTlsSecret=true` is correct. |
+| `openshiftRoute.enabled` / `openshiftRoute.host` | Creates an OpenShift Route with TLS passthrough — the router forwards the encrypted connection by SNI without decrypting, so the gateway uses the SNI hostname to select the external certificate. |
+| `server.oidc.issuer` / `server.oidc.audience` | Configures server-side OIDC validation. Without these, the gateway expects mTLS client certificates and rejects OIDC-only CLI connections. See [Access Control](/kubernetes/access-control). |
+
+Register the gateway with the CLI over OIDC. Remote gateways authenticate CLI
+users via OIDC, not mTLS — see [Access Control](/kubernetes/access-control):
+
+```shell
+openshell gateway add https://<external-hostname> \
+  --name openshift \
+  --oidc-issuer <issuer-url>
+openshell gateway login openshift
+```
+
 ## Next Steps
 
-- For TLS-enabled deployments, refer to [Managing Certificates](/kubernetes/managing-certificates).
-- To expose the gateway externally, refer to [Ingress](/kubernetes/ingress).
+- For more on certificate provisioning modes, refer to [Managing Certificates](/kubernetes/managing-certificates).
+- To expose the gateway externally through the Kubernetes Gateway API instead of a Route, refer to [Ingress](/kubernetes/ingress).
 - To configure OIDC authentication, refer to [Access Control](/kubernetes/access-control).

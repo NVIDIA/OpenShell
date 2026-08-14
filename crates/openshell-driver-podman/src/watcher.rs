@@ -16,7 +16,9 @@ use openshell_core::proto::compute::v1::{
     DriverCondition, DriverSandbox, DriverSandboxStatus, WatchSandboxesDeletedEvent,
     WatchSandboxesEvent, WatchSandboxesSandboxEvent, watch_sandboxes_event,
 };
+use std::collections::HashMap;
 use std::pin::Pin;
+use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{debug, info, warn};
@@ -29,6 +31,63 @@ const CONDITION_STOPPED: &str = "ContainerStopped";
 
 pub type WatchStream =
     Pin<Box<dyn Stream<Item = Result<WatchSandboxesEvent, ComputeDriverError>> + Send>>;
+
+/// Per-sandbox container exit timestamps that fence state changes from an earlier run.
+///
+/// Podman can deliver a container's `die` or `stop` event after the stop API
+/// has returned. If a restart is already in progress, inspecting the container
+/// for that delayed event can report the previous exit and incorrectly regress
+/// the sandbox from `Starting` to `Error`.
+#[derive(Clone, Debug, Default)]
+pub struct LifecycleEventFences {
+    previous_finished_at: Arc<Mutex<HashMap<String, String>>>,
+}
+
+impl LifecycleEventFences {
+    pub fn record_previous_exit(&self, sandbox_id: &str, finished_at: Option<&str>) {
+        let mut fences = self
+            .previous_finished_at
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match finished_at.filter(|finished_at| !finished_at.is_empty()) {
+            Some(finished_at) => {
+                fences.insert(sandbox_id.to_string(), finished_at.to_string());
+            }
+            None => {
+                fences.remove(sandbox_id);
+            }
+        }
+    }
+
+    pub fn remove(&self, sandbox_id: &str) {
+        self.previous_finished_at
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(sandbox_id);
+    }
+
+    fn matches_previous_exit(
+        &self,
+        event: &PodmanEvent,
+        sandbox_id: &str,
+        state: &ContainerState,
+    ) -> bool {
+        if !matches!(event.action.as_str(), "die" | "stop")
+            || !matches!(state.status.as_str(), "exited" | "stopped")
+        {
+            return false;
+        }
+
+        let Some(finished_at) = state.finished_at.as_deref() else {
+            return false;
+        };
+        self.previous_finished_at
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(sandbox_id)
+            .is_some_and(|previous| previous == finished_at)
+    }
+}
 
 /// Build a `WatchSandboxesEvent` carrying a sandbox snapshot.
 fn sandbox_event(sandbox: DriverSandbox) -> WatchSandboxesEvent {
@@ -71,7 +130,10 @@ fn deleted_event(sandbox_id: String) -> WatchSandboxesEvent {
 /// **Do not add reconnection logic inside this function.**  A local reconnect
 /// would race with `watch_loop`'s retry and produce duplicate initial-sync
 /// events that corrupt the server's sandbox index.
-pub async fn start_watch(client: PodmanClient) -> Result<WatchStream, PodmanApiError> {
+pub async fn start_watch(
+    client: PodmanClient,
+    lifecycle_event_fences: LifecycleEventFences,
+) -> Result<WatchStream, PodmanApiError> {
     let (tx, rx) = mpsc::channel::<Result<WatchSandboxesEvent, ComputeDriverError>>(256);
 
     // 1. Subscribe to events first so we don't miss any during the list.
@@ -120,7 +182,8 @@ pub async fn start_watch(client: PodmanClient) -> Result<WatchStream, PodmanApiE
         while let Some(result) = event_rx.recv().await {
             match result {
                 Ok(event) => {
-                    if let Some(we) = map_podman_event(&event, &client).await
+                    if let Some(we) =
+                        map_podman_event(&event, &client, &lifecycle_event_fences).await
                         && tx.send(Ok(we)).await.is_err()
                     {
                         return;
@@ -165,6 +228,7 @@ pub async fn start_watch(client: PodmanClient) -> Result<WatchStream, PodmanApiE
 async fn map_podman_event(
     event: &PodmanEvent,
     client: &PodmanClient,
+    lifecycle_event_fences: &LifecycleEventFences,
 ) -> Option<WatchSandboxesEvent> {
     let container_id = &event.actor.id;
     let sandbox_id = event
@@ -188,7 +252,24 @@ async fn map_podman_event(
         "create" | "start" | "stop" | "die" | "health_status" => {
             // Inspect the container to get current state.
             match client.inspect_container(container_id).await {
-                Ok(inspect) => driver_sandbox_from_inspect(&inspect).map(sandbox_event),
+                Ok(inspect) => {
+                    if lifecycle_event_fences.matches_previous_exit(
+                        event,
+                        &sandbox_id,
+                        &inspect.state,
+                    ) {
+                        debug!(
+                            sandbox_id,
+                            container_id = %container_id,
+                            action = %event.action,
+                            finished_at = inspect.state.finished_at.as_deref().unwrap_or_default(),
+                            "Ignoring container stop event from before the latest sandbox start"
+                        );
+                        None
+                    } else {
+                        driver_sandbox_from_inspect(&inspect).map(sandbox_event)
+                    }
+                }
                 Err(PodmanApiError::NotFound(_)) => {
                     // The container is already gone by the time we inspected
                     // it. This is a normal race between the `die`/`stop` event
@@ -405,6 +486,66 @@ fn condition_from_state(state: &ContainerState) -> DriverCondition {
 mod tests {
     use super::*;
 
+    fn podman_event(action: &str, sandbox_id: &str, time_nano: i64) -> PodmanEvent {
+        PodmanEvent {
+            event_type: "container".to_string(),
+            action: action.to_string(),
+            actor: crate::client::EventActor {
+                id: "container-1".to_string(),
+                attributes: HashMap::from([(LABEL_SANDBOX_ID.to_string(), sandbox_id.to_string())]),
+            },
+            time_nano,
+        }
+    }
+
+    #[test]
+    fn lifecycle_fence_rejects_delayed_stop_events_from_before_restart() {
+        let fences = LifecycleEventFences::default();
+        fences.record_previous_exit("sandbox-1", Some("2026-08-12T16:39:13Z"));
+        let previous_exit = ContainerState {
+            status: "exited".to_string(),
+            running: false,
+            exit_code: 137,
+            oom_killed: false,
+            health: None,
+            started_at: Some("2026-08-12T16:38:58Z".to_string()),
+            finished_at: Some("2026-08-12T16:39:13Z".to_string()),
+        };
+
+        assert!(fences.matches_previous_exit(
+            &podman_event("die", "sandbox-1", 199),
+            "sandbox-1",
+            &previous_exit,
+        ));
+        assert!(fences.matches_previous_exit(
+            &podman_event("stop", "sandbox-1", 200),
+            "sandbox-1",
+            &previous_exit,
+        ));
+
+        let mut new_exit = previous_exit.clone();
+        new_exit.finished_at = Some("2026-08-12T16:40:00Z".to_string());
+        assert!(!fences.matches_previous_exit(
+            &podman_event("die", "sandbox-1", 201),
+            "sandbox-1",
+            &new_exit,
+        ));
+
+        let mut running = previous_exit.clone();
+        running.status = "running".to_string();
+        running.finished_at = None;
+        assert!(!fences.matches_previous_exit(
+            &podman_event("die", "sandbox-1", 201),
+            "sandbox-1",
+            &running,
+        ));
+        assert!(!fences.matches_previous_exit(
+            &podman_event("start", "sandbox-1", 199),
+            "sandbox-1",
+            &previous_exit,
+        ));
+    }
+
     #[test]
     fn condition_healthy_container() {
         let state = ContainerState {
@@ -467,7 +608,7 @@ mod tests {
 
     #[test]
     fn sandbox_event_from_list_entry_running() {
-        let mut labels = std::collections::HashMap::new();
+        let mut labels = HashMap::new();
         labels.insert(LABEL_SANDBOX_ID.to_string(), "test-id".to_string());
         labels.insert(LABEL_SANDBOX_NAME.to_string(), "test-name".to_string());
         labels.insert(LABEL_SANDBOX_WORKSPACE.to_string(), "default".to_string());

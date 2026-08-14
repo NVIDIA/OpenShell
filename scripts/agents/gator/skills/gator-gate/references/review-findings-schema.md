@@ -6,7 +6,7 @@ Before invoking the reviewer, require JSON with this envelope:
 {
   "schema_version": 1,
   "reviewed_head_sha": "<40-character head SHA>",
-  "review_mode": "<initial|follow_up|human_checkpoint>",
+  "review_mode": "<initial|follow_up|critical_only>",
   "findings": []
 }
 ```

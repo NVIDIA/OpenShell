@@ -66,11 +66,14 @@ pub fn validate_mount_subpath(subpath: &str) -> Result<(), String> {
         return Err("mount subpath must not contain NUL bytes".to_string());
     }
     let path = Path::new(subpath);
-    if path.is_absolute()
-        || path
-            .components()
-            .any(|component| matches!(component, std::path::Component::ParentDir))
-    {
+    if path.components().any(|component| {
+        matches!(
+            component,
+            std::path::Component::Prefix(_)
+                | std::path::Component::RootDir
+                | std::path::Component::ParentDir
+        )
+    }) {
         return Err("mount subpath must be relative and must not contain '..'".to_string());
     }
     Ok(())

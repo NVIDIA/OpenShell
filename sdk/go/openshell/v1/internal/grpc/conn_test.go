@@ -8,15 +8,14 @@ import (
 	"net"
 	"testing"
 
+	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 )
 
 func TestNewConnectionHTTPSchemeUsesPlaintext(t *testing.T) {
 	lis, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("listen: %v", err)
-	}
+	require.NoError(t, err)
 	defer func() { _ = lis.Close() }()
 
 	srv := grpc.NewServer()
@@ -24,55 +23,37 @@ func TestNewConnectionHTTPSchemeUsesPlaintext(t *testing.T) {
 	defer srv.Stop()
 
 	conn, err := NewConnection("http://"+lis.Addr().String(), nil, nil)
-	if err != nil {
-		t.Fatalf("NewConnection with http:// scheme failed: %v", err)
-	}
+	require.NoError(t, err)
 	defer func() { _ = conn.Close() }()
 }
 
 func TestNewConnectionHTTPSSchemeUsesTLS(t *testing.T) {
-	// https:// with nil TLS config should default to system TLS.
-	// We cannot dial a real TLS server here, but we can verify the
-	// connection is created (it will fail on handshake, not on dial).
 	conn, err := NewConnection("https://127.0.0.1:1", nil, nil)
-	if err != nil {
-		t.Fatalf("NewConnection with https:// scheme should not fail on create: %v", err)
-	}
+	require.NoError(t, err)
 	defer func() { _ = conn.Close() }()
 }
 
 func TestNewConnectionNoSchemeUsesTLS(t *testing.T) {
 	conn, err := NewConnection("127.0.0.1:1", nil, nil)
-	if err != nil {
-		t.Fatalf("NewConnection without scheme should not fail on create: %v", err)
-	}
+	require.NoError(t, err)
 	defer func() { _ = conn.Close() }()
 }
 
 func TestNewConnectionInsecureTLSConfig(t *testing.T) {
-	// Insecure: true means TLS with InsecureSkipVerify, not plaintext.
-	// We can verify the connection is created (handshake will fail since
-	// the server is not TLS, but NewClient itself should succeed).
 	conn, err := NewConnection("127.0.0.1:1", &TLSParams{Insecure: true}, nil)
-	if err != nil {
-		t.Fatalf("NewConnection with Insecure TLS config failed: %v", err)
-	}
+	require.NoError(t, err)
 	defer func() { _ = conn.Close() }()
 }
 
 func TestNewConnectionHTTPWithSecureAuthRejects(t *testing.T) {
 	auth := &testTokenAuth{token: "dev-token", requireSecurity: true}
 	_, err := NewConnection("http://127.0.0.1:1", nil, auth)
-	if err == nil {
-		t.Fatal("expected error when using http:// with auth that requires transport security")
-	}
+	require.Error(t, err)
 }
 
 func TestNewConnectionHTTPWithInsecureAuth(t *testing.T) {
 	lis, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("listen: %v", err)
-	}
+	require.NoError(t, err)
 	defer func() { _ = lis.Close() }()
 
 	srv := grpc.NewServer(grpc.Creds(insecure.NewCredentials()))
@@ -81,9 +62,27 @@ func TestNewConnectionHTTPWithInsecureAuth(t *testing.T) {
 
 	auth := &testTokenAuth{token: "dev-token", requireSecurity: false}
 	conn, err := NewConnection("http://"+lis.Addr().String(), nil, auth)
-	if err != nil {
-		t.Fatalf("NewConnection with http:// + insecure auth failed: %v", err)
-	}
+	require.NoError(t, err)
+	defer func() { _ = conn.Close() }()
+}
+
+func TestNewConnectionHTTPWithTLSParamsRejects(t *testing.T) {
+	_, err := NewConnection("http://127.0.0.1:1", &TLSParams{CAFile: "/some/ca.pem"}, nil)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "TLS parameters")
+}
+
+func TestNewConnectionHTTPWithEmptyTLSParamsAllowed(t *testing.T) {
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer func() { _ = lis.Close() }()
+
+	srv := grpc.NewServer()
+	go func() { _ = srv.Serve(lis) }()
+	defer srv.Stop()
+
+	conn, err := NewConnection("http://"+lis.Addr().String(), &TLSParams{}, nil)
+	require.NoError(t, err)
 	defer func() { _ = conn.Close() }()
 }
 

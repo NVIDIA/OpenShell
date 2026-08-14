@@ -133,6 +133,20 @@ generation and preserves the last-known-good generation if preparation fails.
 Policy-only updates reuse the connected registry, so an external middleware
 outage cannot block unrelated policy changes.
 
+For authenticated operator middleware, the supervisor requests credentials by
+registration name through `RefreshSandboxToken`. The gateway resolves names
+against the effective policy and mints exact-audience credentials. The
+supervisor keeps them in refreshable in-memory slots outside stable middleware
+configuration, so rotation neither changes `config_revision` nor reconnects
+the registry. Public custom-CA PEM travels with the stable registration.
+
+The slots live in a supervisor-owned `ExtensionCredentialStore` shared by every
+gateway connection the supervisor opens, so the registry's clients and the
+polling loop that rotates them observe the same credentials. Configuration
+polling runs far more frequently than credentials expire, so the loop rotates
+only when a credential is missing or has passed four fifths of its lifetime,
+and bounds its sleep by the soonest rotation deadline.
+
 Middleware cannot observe injected credentials or mutate supervisor-owned
 credential, routing, or framing headers. Body transformations are re-evaluated
 against body-aware L7 policy before later stages or the upstream can observe
@@ -208,6 +222,14 @@ that path on the supervisor's command line. The supervisor reads the
 file and builds the `Proxy-Authorization: Basic` header; a credential that is
 empty, contains control characters, or is not in `user:pass` form is fatal on
 both sides.
+
+For Kubernetes sandboxes, the operator configures a Secret name and key rather
+than a gateway-host file path. Kubernetes projects that Secret only into the
+container that runs network supervision. Proxy credential Secrets require the
+sidecar topology, which gives them a separate container boundary from the
+workload. Combined topology is rejected because Kubernetes `fsGroup` volume
+permission handling can make a shared credential mount readable by the sandbox
+group.
 
 The Basic header travels over the plain-TCP connection to the `http://` proxy,
 so it is readable on the network path between sandbox host and proxy.

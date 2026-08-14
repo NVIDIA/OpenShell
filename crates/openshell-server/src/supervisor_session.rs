@@ -141,6 +141,20 @@ impl SupervisorSessionRegistry {
         self.sessions.lock().unwrap().remove(sandbox_id);
     }
 
+    /// Disconnect the current supervisor session for a sandbox.
+    ///
+    /// Lifecycle stop uses this to ensure a later start must establish
+    /// a fresh session before the sandbox can return to Ready.
+    pub fn disconnect(&self, sandbox_id: &str) -> bool {
+        let session = self.sessions.lock().unwrap().remove(sandbox_id);
+        if let Some(session) = session {
+            let _ = session.shutdown.send(());
+            true
+        } else {
+            false
+        }
+    }
+
     /// Remove the session only if its `session_id` matches the one we are
     /// cleaning up. Returns `true` if the entry was removed.
     ///

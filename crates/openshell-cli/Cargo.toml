@@ -72,7 +72,6 @@ tokio-tungstenite = { workspace = true }
 # Streams
 futures = { workspace = true }
 tokio-stream = { workspace = true }
-nix = { workspace = true }
 
 # URL parsing
 url = { workspace = true }
@@ -83,6 +82,9 @@ tracing-subscriber = { workspace = true }
 
 [lints]
 workspace = true
+
+[target.'cfg(unix)'.dependencies]
+nix = { workspace = true }
 
 [dev-dependencies]
 futures = { workspace = true }

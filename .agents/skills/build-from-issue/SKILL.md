@@ -62,7 +62,7 @@ Fetch issue + comments
   ├─ Triage incomplete, awaiting information, or awaiting human disposition?
   │   → Report the blocking state and STOP
   │
-  ├─ state:accepted absent?
+  ├─ state:accepted and roadmap association both absent?
   │   → Human has not accepted the issue; STOP
   │
   ├─ No plan comment and no direct planning request and agent:plan-requested absent?
@@ -113,9 +113,9 @@ Stop before planning in any of these states:
 
 - `state:triage-needed`: the issue has not been assessed; use `triage-issue`.
 - `state:needs-info`: triage is waiting for evidence from the reporter.
-- `state:validated`: triage is complete, but a human has not yet decided whether OpenShell should invest in the work.
+- `state:validated` without roadmap placement: triage is complete, but a human has not yet decided whether OpenShell should invest in the work.
 
-Next, require `state:accepted`. It records the human decision to pursue the work. If no plan exists, require either a direct user request for planning or the human-applied `agent:plan-requested` label before generating one. Record any roadmap association as sequencing context, but do not require one. Never add or remove `state:accepted`, either human request label, or the `roadmap` label.
+Next, require a human acceptance signal: either `state:accepted` or placement on the roadmap. The label records acceptance without requiring scheduling; roadmap placement records acceptance and sequencing. If no plan exists, require either a direct user request for planning or the human-applied `agent:plan-requested` label before generating one. Never add or remove `state:accepted`, either human request label, or the `roadmap` label.
 
 ## Step 2: Fetch and Classify Comments
 
@@ -160,7 +160,7 @@ Task tool with subagent_type="principal-engineer-reviewer"
 
 In the prompt, instruct the reviewer to:
 
-1. Read the issue description thoroughly and identify what needs to change in the codebase.
+1. Read the issue's user story and identify what needs to change in the codebase. Treat reporter diagnostics or solution ideas as optional context, not as authoritative or current analysis.
 2. Map the requirements to existing code — read the relevant source files.
 3. Determine the **issue type** — one of: `feat` (new feature), `fix` (bug fix), `refactor`, `chore`, `perf`, `docs`.
 4. Propose the minimal set of changes that satisfies the requirements.
@@ -173,6 +173,8 @@ In the prompt, instruct the reviewer to:
 8. Call out risks, unknowns, and decisions that need stakeholder input.
 9. Assess **gateway config documentation impact** — if the change adds, removes, renames, or changes defaults for gateway TOML keys or driver-specific config options, the plan must include an update to `docs/reference/gateway-config.mdx`. If the change is surfaced through Helm or a compute-driver overview, also include `docs/reference/sandbox-compute-drivers.mdx` or the relevant deployment docs.
 10. Assess **LSM compatibility** — if the change touches process identity, `/proc` filesystem access, binary execution, or inter-process visibility, flag whether it will behave differently on hosts running SELinux (enforcing) or AppArmor. In particular, tests that fork+exec into system binaries will fail on SELinux-enforcing hosts due to cross-label `/proc/<pid>/exe` access restrictions.
+
+Perform this investigation against the current branch and current product behavior. If the issue contains earlier diagnostics, verify them rather than relying on them.
 
 ### A2: Post the Plan Comment
 

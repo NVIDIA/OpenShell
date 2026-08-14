@@ -11,9 +11,12 @@ use crate::config::{
 };
 use futures::{Stream, StreamExt, TryStreamExt};
 use k8s_openapi::api::core::v1::{
-    Event as KubeEventObj, Namespace, Node, PersistentVolumeClaimVolumeSource, Volume, VolumeMount,
+    Event as KubeEventObj, Namespace, Node, PersistentVolumeClaimVolumeSource, Pod, Volume,
+    VolumeMount,
 };
-use kube::api::{Api, ApiResource, DeleteParams, ListParams, PostParams, Preconditions};
+use kube::api::{
+    Api, ApiResource, DeleteParams, ListParams, Patch, PatchParams, PostParams, Preconditions,
+};
 use kube::core::gvk::GroupVersionKind;
 use kube::core::{DynamicObject, ObjectMeta};
 use kube::runtime::watcher::{self, Event};
@@ -87,11 +90,20 @@ impl From<KubernetesDriverError> for openshell_core::ComputeDriverError {
 /// API server is unreachable or slow.
 const KUBE_API_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Kubernetes defaults pod termination to 30 seconds when the pod template
+/// omits `terminationGracePeriodSeconds`.
+const DEFAULT_POD_TERMINATION_GRACE_PERIOD: Duration = Duration::from_secs(30);
+const STOP_INITIAL_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const STOP_MAX_POLL_INTERVAL: Duration = Duration::from_secs(2);
+
 const SANDBOX_GROUP: &str = "agents.x-k8s.io";
 const SANDBOX_VERSION_V1BETA1: &str = "v1beta1";
 const SANDBOX_VERSION_V1ALPHA1: &str = "v1alpha1";
 const SANDBOX_VERSIONS: &[&str] = &[SANDBOX_VERSION_V1BETA1, SANDBOX_VERSION_V1ALPHA1];
 pub const SANDBOX_KIND: &str = "Sandbox";
+const SANDBOX_POD_NAME_ANNOTATION: &str = "agents.x-k8s.io/pod-name";
+const SANDBOX_SUSPENDED_CONDITION: &str = "Suspended";
+const SANDBOX_SUSPENDED_POD_NOT_OWNED_REASON: &str = "PodNotOwned";
 
 const GPU_RESOURCE_NAME: &str = "nvidia.com/gpu";
 const SPIFFE_WORKLOAD_API_VOLUME_NAME: &str = "spiffe-workload-api";
@@ -246,11 +258,13 @@ impl From<&KubernetesDriverVolumeMountConfig> for VolumeMount {
 }
 
 const CLIENT_TLS_VOLUME_NAME: &str = "openshell-client-tls";
+const UPSTREAM_PROXY_AUTH_VOLUME_NAME: &str = "openshell-upstream-proxy-auth";
 const SERVICE_ACCOUNT_TOKEN_VOLUME_NAME: &str = "openshell-sa-token";
 const SERVICE_ACCOUNT_TOKEN_MOUNT_PATH: &str = "/var/run/secrets/openshell";
 
 const KUBERNETES_DRIVER_RESERVED_VOLUME_NAMES: &[&str] = &[
     CLIENT_TLS_VOLUME_NAME,
+    UPSTREAM_PROXY_AUTH_VOLUME_NAME,
     SERVICE_ACCOUNT_TOKEN_VOLUME_NAME,
     SPIFFE_WORKLOAD_API_VOLUME_NAME,
     SUPERVISOR_VOLUME_NAME,
@@ -458,6 +472,9 @@ impl KubernetesComputeDriver {
             .map_err(KubernetesDriverError::Precondition)?;
         config
             .validate_proxy_uid()
+            .map_err(KubernetesDriverError::Precondition)?;
+        config
+            .validate_upstream_proxy_config()
             .map_err(KubernetesDriverError::Precondition)?;
         let base_config = match kube::Config::incluster() {
             Ok(c) => c,
@@ -842,6 +859,12 @@ impl KubernetesComputeDriver {
                 .config
                 .sidecar
                 .process_binary_aware_network_policy,
+            https_proxy: self.config.https_proxy.as_deref(),
+            no_proxy: self.config.no_proxy.as_deref(),
+            proxy_auth_secret_name: self.config.proxy_auth_secret_name.as_deref(),
+            proxy_auth_secret_key: self.config.proxy_auth_secret_key.as_deref(),
+            proxy_auth_allow_insecure: self.config.proxy_auth_allow_insecure == Some(true),
+            proxy_connect_by_hostname: self.config.proxy_connect_by_hostname == Some(true),
             service_account_name: &self.config.service_account_name,
             sandbox_id: &sandbox.id,
             sandbox_name: &sandbox.name,
@@ -925,6 +948,138 @@ impl KubernetesComputeDriver {
                 )))
             }
         }
+    }
+
+    pub async fn stop_sandbox(&self, sandbox_id: &str) -> Result<(), String> {
+        let (agent_sandbox_api, kube_name, pod_name, stop_timeout) = self
+            .patch_sandbox_operating_state(sandbox_id, false)
+            .await?;
+        let legacy_pod_api = (agent_sandbox_api.resource.version == SANDBOX_VERSION_V1ALPHA1)
+            .then(|| Api::<Pod>::namespaced(self.client.clone(), &self.config.namespace));
+
+        let deadline = tokio::time::Instant::now() + stop_timeout;
+        let mut poll_interval = STOP_INITIAL_POLL_INTERVAL;
+        loop {
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                return Err(format!(
+                    "timed out after {}s waiting for Kubernetes sandbox to stop",
+                    stop_timeout.as_secs()
+                ));
+            }
+            let request_timeout = KUBE_API_TIMEOUT.min(deadline.saturating_duration_since(now));
+            let object = tokio::time::timeout(
+                request_timeout,
+                agent_sandbox_api.api.get(&kube_name),
+            )
+            .await
+            .map_err(|_| {
+                format!(
+                    "timed out after {}s waiting for Kubernetes API while checking sandbox stop",
+                    request_timeout.as_secs()
+                )
+            })?
+            .map_err(|err| err.to_string())?;
+            if kubernetes_sandbox_has_stopped_condition(&object) {
+                return Ok(());
+            }
+            if let Some(error) = kubernetes_sandbox_stop_failure(&object) {
+                return Err(error);
+            }
+            if let Some(pod_api) = legacy_pod_api.as_ref()
+                && kubernetes_sandbox_pod_is_gone(pod_api, &pod_name, deadline).await?
+            {
+                return Ok(());
+            }
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                return Err(format!(
+                    "timed out after {}s waiting for Kubernetes sandbox to stop",
+                    stop_timeout.as_secs()
+                ));
+            }
+            tokio::time::sleep(poll_interval.min(deadline.saturating_duration_since(now))).await;
+            poll_interval = next_stop_poll_interval(poll_interval);
+        }
+    }
+
+    pub async fn start_sandbox(&self, sandbox_id: &str) -> Result<(), String> {
+        self.patch_sandbox_operating_state(sandbox_id, true)
+            .await
+            .map(|_| ())
+    }
+
+    async fn patch_sandbox_operating_state(
+        &self,
+        sandbox_id: &str,
+        running: bool,
+    ) -> Result<(AgentSandboxApi, String, String, Duration), String> {
+        let agent_sandbox_api = self
+            .supported_agent_sandbox_api(self.client.clone())
+            .await?;
+        let selector =
+            format!("{LABEL_MANAGED_BY}={LABEL_MANAGED_BY_VALUE},{LABEL_SANDBOX_ID}={sandbox_id}");
+        let list = tokio::time::timeout(
+            KUBE_API_TIMEOUT,
+            agent_sandbox_api
+                .api
+                .list(&ListParams::default().labels(&selector)),
+        )
+        .await
+        .map_err(|_| {
+            format!(
+                "timed out after {}s waiting for Kubernetes API",
+                KUBE_API_TIMEOUT.as_secs()
+            )
+        })?
+        .map_err(|err| err.to_string())?;
+        let object = list
+            .items
+            .into_iter()
+            .next()
+            .ok_or_else(|| "sandbox not found".to_string())?;
+        let stop_timeout = kubernetes_sandbox_stop_timeout(&object);
+        let kube_name = object
+            .metadata
+            .name
+            .ok_or_else(|| "sandbox resource has no name".to_string())?;
+        let pod_name = object
+            .metadata
+            .annotations
+            .as_ref()
+            .and_then(|annotations| annotations.get(SANDBOX_POD_NAME_ANNOTATION))
+            .cloned()
+            .unwrap_or_else(|| kube_name.clone());
+        let resource_version = object.metadata.resource_version.unwrap_or_default();
+        let desired = sandbox_operating_state_patch(
+            &agent_sandbox_api.resource.version,
+            &resource_version,
+            running,
+        );
+        tokio::time::timeout(
+            KUBE_API_TIMEOUT,
+            agent_sandbox_api.api.patch(
+                &kube_name,
+                &PatchParams::default(),
+                &Patch::Merge(&desired),
+            ),
+        )
+        .await
+        .map_err(|_| {
+            format!(
+                "timed out after {}s waiting for Kubernetes API",
+                KUBE_API_TIMEOUT.as_secs()
+            )
+        })?
+        .map_err(|err| err.to_string())?;
+
+        info!(
+            sandbox_id,
+            sandbox_api_version = %agent_sandbox_api.resource.version,
+            running,
+            "Updated Kubernetes sandbox operating state"
+        );
+        Ok((agent_sandbox_api, kube_name, pod_name, stop_timeout))
     }
 
     pub async fn delete_sandbox(&self, sandbox_id: &str) -> Result<bool, String> {
@@ -1573,19 +1728,20 @@ fn apply_supervisor_binary_source(
 /// side-loaded binary as root so it can create network namespaces, set up the
 /// proxy, and configure Landlock/seccomp.
 #[allow(clippy::similar_names)]
-fn apply_supervisor_sideload(
+fn apply_supervisor_sideload_with_params(
     pod_template: &mut serde_json::Value,
-    supervisor_image: &str,
-    supervisor_image_pull_policy: &str,
-    method: SupervisorSideloadMethod,
-    sandbox_uid: u32,
-    sandbox_gid: u32,
+    params: &SandboxPodParams<'_>,
 ) {
     let Some(spec) = pod_template.get_mut("spec").and_then(|v| v.as_object_mut()) else {
         return;
     };
 
-    apply_supervisor_binary_source(spec, supervisor_image, supervisor_image_pull_policy, method);
+    apply_supervisor_binary_source(
+        spec,
+        params.supervisor_image,
+        params.supervisor_image_pull_policy,
+        params.supervisor_sideload_method,
+    );
 
     // Find the agent container and add volume mount + command override
     let Some(containers) = spec.get_mut("containers").and_then(|v| v.as_array_mut()) else {
@@ -1603,14 +1759,13 @@ fn apply_supervisor_sideload(
 
     if let Some(container) = containers.get_mut(index).and_then(|v| v.as_object_mut()) {
         // Override command to use the side-loaded supervisor binary
-        container.insert(
-            "command".to_string(),
-            serde_json::json!([
-                format!("{}/openshell-sandbox", SUPERVISOR_MOUNT_PATH),
-                "--workdir",
-                driver_mounts::DEFAULT_WORKSPACE_ROOT
-            ]),
-        );
+        let mut command = vec![
+            format!("{}/openshell-sandbox", SUPERVISOR_MOUNT_PATH),
+            "--workdir".to_string(),
+            driver_mounts::DEFAULT_WORKSPACE_ROOT.to_string(),
+        ];
+        command.extend(upstream_proxy_cli_args(params));
+        container.insert("command".to_string(), serde_json::json!(command));
 
         // Force the supervisor to run as root (UID 0). Sandbox images may set
         // a non-root USER directive (e.g. `USER sandbox`), but the supervisor
@@ -1641,9 +1796,88 @@ fn apply_supervisor_sideload(
             .or_insert_with(|| serde_json::json!([]))
             .as_array_mut();
         if let Some(env) = env {
-            apply_resolved_identity_env(env, sandbox_uid, sandbox_gid);
+            apply_resolved_identity_env(env, params.sandbox_uid, params.sandbox_gid);
+        }
+        if has_upstream_proxy_credentials(params) {
+            let volume_mounts = container
+                .entry("volumeMounts")
+                .or_insert_with(|| serde_json::json!([]))
+                .as_array_mut();
+            if let Some(volume_mounts) = volume_mounts {
+                volume_mounts.push(upstream_proxy_auth_volume_mount());
+            }
         }
     }
+}
+
+#[cfg(test)]
+#[allow(clippy::similar_names)]
+fn apply_supervisor_sideload(
+    pod_template: &mut serde_json::Value,
+    supervisor_image: &str,
+    supervisor_image_pull_policy: &str,
+    method: SupervisorSideloadMethod,
+    sandbox_uid: u32,
+    sandbox_gid: u32,
+) {
+    let params = SandboxPodParams {
+        supervisor_image,
+        supervisor_image_pull_policy,
+        supervisor_sideload_method: method,
+        sandbox_uid,
+        sandbox_gid,
+        ..SandboxPodParams::default()
+    };
+    apply_supervisor_sideload_with_params(pod_template, &params);
+}
+
+fn upstream_proxy_cli_args(params: &SandboxPodParams<'_>) -> Vec<String> {
+    let mut args = Vec::new();
+    if let Some(url) = params.https_proxy {
+        args.extend(["--upstream-proxy".to_string(), url.to_string()]);
+    }
+    if let Some(list) = params.no_proxy {
+        args.extend(["--upstream-no-proxy".to_string(), list.to_string()]);
+    }
+    if has_upstream_proxy_credentials(params) {
+        args.extend([
+            "--upstream-proxy-auth-file".to_string(),
+            openshell_core::container_paths::UPSTREAM_PROXY_AUTH_MOUNT_PATH.to_string(),
+        ]);
+    }
+    if params.proxy_auth_allow_insecure {
+        args.push("--upstream-proxy-auth-allow-insecure".to_string());
+    }
+    if params.proxy_connect_by_hostname {
+        args.push("--upstream-proxy-connect-by-hostname".to_string());
+    }
+    args
+}
+
+fn upstream_proxy_auth_volume_mount() -> serde_json::Value {
+    serde_json::json!({
+        "name": UPSTREAM_PROXY_AUTH_VOLUME_NAME,
+        "mountPath": upstream_proxy_auth_volume_mount_path(),
+        "readOnly": true,
+    })
+}
+
+fn upstream_proxy_auth_volume_mount_path() -> &'static str {
+    Path::new(openshell_core::container_paths::UPSTREAM_PROXY_AUTH_MOUNT_PATH)
+        .parent()
+        .and_then(Path::to_str)
+        .expect("upstream proxy auth path has a parent directory")
+}
+
+fn upstream_proxy_auth_file_name() -> &'static str {
+    Path::new(openshell_core::container_paths::UPSTREAM_PROXY_AUTH_MOUNT_PATH)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .expect("upstream proxy auth path has a UTF-8 file name")
+}
+
+fn has_upstream_proxy_credentials(params: &SandboxPodParams<'_>) -> bool {
+    params.proxy_auth_secret_name.is_some() && params.proxy_auth_secret_key.is_some()
 }
 
 fn sidecar_state_volume_mount() -> serde_json::Value {
@@ -1783,6 +2017,14 @@ fn supervisor_sidecar_container(
             }
         ]
     });
+    container["command"]
+        .as_array_mut()
+        .expect("network supervisor command is an array")
+        .extend(
+            upstream_proxy_cli_args(params)
+                .into_iter()
+                .map(serde_json::Value::String),
+        );
     if !params.supervisor_image_pull_policy.is_empty() {
         container["imagePullPolicy"] = serde_json::json!(params.supervisor_image_pull_policy);
     }
@@ -1795,6 +2037,12 @@ fn supervisor_sidecar_container(
                 "mountPath": spiffe_socket_mount_path(params.provider_spiffe_workload_api_socket_path),
                 "readOnly": true,
             }));
+    }
+    if has_upstream_proxy_credentials(params) {
+        container["volumeMounts"]
+            .as_array_mut()
+            .expect("volumeMounts is an array")
+            .push(upstream_proxy_auth_volume_mount());
     }
     if let Some(profile) = params.app_armor_profile {
         container["securityContext"]["appArmorProfile"] = app_armor_profile_to_k8s(profile);
@@ -2176,6 +2424,7 @@ fn default_workspace_volume_claim_templates(
 }
 
 /// Parameters shared by `sandbox_to_k8s_spec` and `sandbox_template_to_k8s`.
+#[allow(clippy::struct_excessive_bools)]
 struct SandboxPodParams<'a> {
     default_image: &'a str,
     image_pull_policy: &'a str,
@@ -2186,6 +2435,12 @@ struct SandboxPodParams<'a> {
     topology: SupervisorTopology,
     proxy_uid: u32,
     process_binary_aware_network_policy: bool,
+    https_proxy: Option<&'a str>,
+    no_proxy: Option<&'a str>,
+    proxy_auth_secret_name: Option<&'a str>,
+    proxy_auth_secret_key: Option<&'a str>,
+    proxy_auth_allow_insecure: bool,
+    proxy_connect_by_hostname: bool,
     service_account_name: &'a str,
     sandbox_id: &'a str,
     sandbox_name: &'a str,
@@ -2221,6 +2476,12 @@ impl Default for SandboxPodParams<'_> {
             topology: SupervisorTopology::default(),
             proxy_uid: DEFAULT_PROXY_UID,
             process_binary_aware_network_policy: true,
+            https_proxy: None,
+            no_proxy: None,
+            proxy_auth_secret_name: None,
+            proxy_auth_secret_key: None,
+            proxy_auth_allow_insecure: false,
+            proxy_connect_by_hostname: false,
             service_account_name: DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME,
             sandbox_id: "",
             sandbox_name: "",
@@ -2626,6 +2887,32 @@ fn sandbox_template_to_k8s_with_validated_config(
             }
         }));
     }
+    if has_upstream_proxy_credentials(params) {
+        let secret_name = params
+            .proxy_auth_secret_name
+            .expect("complete proxy credential reference has a Secret name");
+        let secret_key = params
+            .proxy_auth_secret_key
+            .expect("complete proxy credential reference has a Secret key");
+        // The credential volume is mounted only into the container that runs
+        // network supervision. Sidecar mode uses the pod fsGroup already
+        // required for its non-root network supervisor.
+        let default_mode = match params.topology {
+            SupervisorTopology::Combined => 0o400,
+            SupervisorTopology::Sidecar => 0o440,
+        };
+        volumes.push(serde_json::json!({
+            "name": UPSTREAM_PROXY_AUTH_VOLUME_NAME,
+            "secret": {
+                "secretName": secret_name,
+                "defaultMode": default_mode,
+                "items": [{
+                    "key": secret_key,
+                    "path": upstream_proxy_auth_file_name(),
+                }]
+            }
+        }));
+    }
     if params.provider_spiffe_enabled {
         volumes.push(serde_json::json!({
             "name": SPIFFE_WORKLOAD_API_VOLUME_NAME,
@@ -2686,14 +2973,7 @@ fn sandbox_template_to_k8s_with_validated_config(
 
     match params.topology {
         SupervisorTopology::Combined => {
-            apply_supervisor_sideload(
-                &mut result,
-                params.supervisor_image,
-                params.supervisor_image_pull_policy,
-                params.supervisor_sideload_method,
-                params.sandbox_uid,
-                params.sandbox_gid,
-            );
+            apply_supervisor_sideload_with_params(&mut result, params);
         }
         SupervisorTopology::Sidecar => {
             apply_supervisor_sidecar_topology(
@@ -3121,6 +3401,111 @@ fn status_from_object(obj: &DynamicObject) -> Option<SandboxStatus> {
     })
 }
 
+fn kubernetes_sandbox_has_stopped_condition(obj: &DynamicObject) -> bool {
+    obj.data
+        .get("status")
+        .and_then(|status| status.get("conditions"))
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|conditions| {
+            conditions.iter().any(|condition| {
+                condition.get("type").and_then(serde_json::Value::as_str)
+                    == Some(SANDBOX_SUSPENDED_CONDITION)
+                    && condition
+                        .get("status")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|status| status.eq_ignore_ascii_case("true"))
+            })
+        })
+}
+
+fn kubernetes_sandbox_stop_failure(obj: &DynamicObject) -> Option<String> {
+    obj.data
+        .get("status")?
+        .get("conditions")?
+        .as_array()?
+        .iter()
+        .find_map(|condition| {
+            let is_terminal = condition.get("type").and_then(serde_json::Value::as_str)
+                == Some(SANDBOX_SUSPENDED_CONDITION)
+                && condition
+                    .get("status")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|status| status.eq_ignore_ascii_case("false"))
+                && condition.get("reason").and_then(serde_json::Value::as_str)
+                    == Some(SANDBOX_SUSPENDED_POD_NOT_OWNED_REASON);
+            if !is_terminal {
+                return None;
+            }
+
+            let message = condition
+                .get("message")
+                .and_then(serde_json::Value::as_str)
+                .filter(|message| !message.is_empty())
+                .unwrap_or("backing pod is not owned by this sandbox");
+            Some(format!("Kubernetes sandbox stop rejected: {message}"))
+        })
+}
+
+async fn kubernetes_sandbox_pod_is_gone(
+    pod_api: &Api<Pod>,
+    pod_name: &str,
+    deadline: tokio::time::Instant,
+) -> Result<bool, String> {
+    let request_timeout =
+        KUBE_API_TIMEOUT.min(deadline.saturating_duration_since(tokio::time::Instant::now()));
+    if request_timeout.is_zero() {
+        return Ok(false);
+    }
+
+    match tokio::time::timeout(request_timeout, pod_api.get(pod_name)).await {
+        Ok(Ok(_)) => Ok(false),
+        Ok(Err(KubeError::Api(err))) if err.code == 404 => Ok(true),
+        Ok(Err(err)) => Err(err.to_string()),
+        Err(_) => Err(format!(
+            "timed out after {}s waiting for Kubernetes API while checking sandbox pod termination",
+            request_timeout.as_secs()
+        )),
+    }
+}
+
+fn kubernetes_sandbox_stop_timeout(obj: &DynamicObject) -> Duration {
+    let termination_grace_period = obj
+        .data
+        .get("spec")
+        .and_then(|spec| spec.get("podTemplate"))
+        .and_then(|template| template.get("spec"))
+        .and_then(|spec| spec.get("terminationGracePeriodSeconds"))
+        .and_then(serde_json::Value::as_u64)
+        .map_or(DEFAULT_POD_TERMINATION_GRACE_PERIOD, Duration::from_secs);
+
+    // The controller must observe the desired state, wait for the pod grace
+    // period and kubelet teardown, then reconcile the deleted pod into the
+    // Sandbox status. Keep one API timeout of headroom around that grace.
+    termination_grace_period.saturating_add(KUBE_API_TIMEOUT)
+}
+
+fn next_stop_poll_interval(current: Duration) -> Duration {
+    current.saturating_mul(2).min(STOP_MAX_POLL_INTERVAL)
+}
+
+fn sandbox_operating_state_patch(
+    api_version: &str,
+    resource_version: &str,
+    running: bool,
+) -> serde_json::Value {
+    if api_version == SANDBOX_VERSION_V1BETA1 {
+        serde_json::json!({
+            "metadata": {"resourceVersion": resource_version},
+            "spec": {"operatingMode": if running { "Running" } else { "Suspended" }}
+        })
+    } else {
+        serde_json::json!({
+            "metadata": {"resourceVersion": resource_version},
+            "spec": {"replicas": i32::from(running)}
+        })
+    }
+}
+
 fn condition_from_value(value: &serde_json::Value) -> Option<SandboxCondition> {
     let obj = value.as_object()?;
     Some(SandboxCondition {
@@ -3192,6 +3577,120 @@ mod tests {
 
         let raw = kube_api_error(404, "404 page not found\n");
         assert!(should_try_next_sandbox_api_version(&raw));
+    }
+
+    #[test]
+    fn lifecycle_patch_uses_version_specific_operating_state() {
+        let beta_stop = sandbox_operating_state_patch(SANDBOX_VERSION_V1BETA1, "42", false);
+        assert_eq!(beta_stop["metadata"]["resourceVersion"], "42");
+        assert_eq!(beta_stop["spec"]["operatingMode"], "Suspended");
+        assert!(beta_stop["spec"].get("replicas").is_none());
+
+        let alpha_start = sandbox_operating_state_patch(SANDBOX_VERSION_V1ALPHA1, "43", true);
+        assert_eq!(alpha_start["metadata"]["resourceVersion"], "43");
+        assert_eq!(alpha_start["spec"]["replicas"], 1);
+        assert!(alpha_start["spec"].get("operatingMode").is_none());
+    }
+
+    #[test]
+    fn stop_timeout_includes_pod_grace_period_and_reconcile_headroom() {
+        let resource = ApiResource::from_gvk(&GroupVersionKind::gvk(
+            SANDBOX_GROUP,
+            SANDBOX_VERSION_V1BETA1,
+            SANDBOX_KIND,
+        ));
+        let mut sandbox = DynamicObject::new("sandbox", &resource);
+
+        assert_eq!(
+            kubernetes_sandbox_stop_timeout(&sandbox),
+            Duration::from_secs(60),
+            "an omitted grace period uses the Kubernetes 30-second default"
+        );
+
+        sandbox.data = serde_json::json!({
+            "spec": {
+                "podTemplate": {
+                    "spec": {"terminationGracePeriodSeconds": 45}
+                }
+            }
+        });
+        assert_eq!(
+            kubernetes_sandbox_stop_timeout(&sandbox),
+            Duration::from_secs(75)
+        );
+    }
+
+    #[test]
+    fn stop_poll_interval_backs_off_to_cap() {
+        let mut interval = STOP_INITIAL_POLL_INTERVAL;
+        let expected = [
+            Duration::from_millis(500),
+            Duration::from_secs(1),
+            Duration::from_secs(2),
+            Duration::from_secs(2),
+        ];
+
+        for expected_interval in expected {
+            interval = next_stop_poll_interval(interval);
+            assert_eq!(interval, expected_interval);
+        }
+    }
+
+    #[test]
+    fn stopped_status_requires_published_condition() {
+        let resource = ApiResource::from_gvk(&GroupVersionKind::gvk(
+            SANDBOX_GROUP,
+            SANDBOX_VERSION_V1ALPHA1,
+            SANDBOX_KIND,
+        ));
+        let mut sandbox = DynamicObject::new("sandbox", &resource);
+        sandbox.data = serde_json::json!({"status": {"replicas": 0}});
+
+        assert!(
+            !kubernetes_sandbox_has_stopped_condition(&sandbox),
+            "v1alpha1 omits a zero status replica count on the wire; it is not a usable completion signal"
+        );
+
+        sandbox.data = serde_json::json!({
+            "status": {
+                "conditions": [{"type": "Suspended", "status": "True"}]
+            }
+        });
+        assert!(kubernetes_sandbox_has_stopped_condition(&sandbox));
+    }
+
+    #[test]
+    fn stop_failure_only_rejects_terminal_suspension_condition() {
+        let resource = ApiResource::from_gvk(&GroupVersionKind::gvk(
+            SANDBOX_GROUP,
+            SANDBOX_VERSION_V1BETA1,
+            SANDBOX_KIND,
+        ));
+        let mut sandbox = DynamicObject::new("sandbox", &resource);
+        sandbox.data = serde_json::json!({
+            "status": {
+                "conditions": [{
+                    "type": "Suspended",
+                    "status": "False",
+                    "reason": "PodNotOwned",
+                    "message": "Refused to delete pod because it is not owned by this sandbox"
+                }]
+            }
+        });
+
+        assert_eq!(
+            kubernetes_sandbox_stop_failure(&sandbox).as_deref(),
+            Some(
+                "Kubernetes sandbox stop rejected: Refused to delete pod because it is not owned by this sandbox"
+            )
+        );
+
+        sandbox.data["status"]["conditions"][0]["status"] = serde_json::json!("Unknown");
+        sandbox.data["status"]["conditions"][0]["reason"] = serde_json::json!("PodStateUnknown");
+        assert!(
+            kubernetes_sandbox_stop_failure(&sandbox).is_none(),
+            "an unknown pod state can recover on a later controller reconciliation"
+        );
     }
 
     #[test]
@@ -6067,5 +6566,102 @@ mod tests {
                 .get("storageClassName")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn upstream_proxy_is_injected_only_into_network_supervisors() {
+        let params = SandboxPodParams {
+            topology: SupervisorTopology::Sidecar,
+            supervisor_sideload_method: SupervisorSideloadMethod::InitContainer,
+            supervisor_image: "supervisor-image:latest",
+            https_proxy: Some("http://proxy.corp.example:8080"),
+            no_proxy: Some(".svc.cluster.local,10.96.0.0/12"),
+            proxy_auth_secret_name: Some("corporate-proxy-auth"),
+            proxy_auth_secret_key: Some("credentials"),
+            proxy_auth_allow_insecure: true,
+            proxy_connect_by_hostname: true,
+            sandbox_uid: 1500,
+            sandbox_gid: 1500,
+            ..SandboxPodParams::default()
+        };
+        let pod = sandbox_template_to_k8s(
+            &SandboxTemplate::default(),
+            false,
+            &std::collections::HashMap::new(),
+            false,
+            &params,
+        );
+        let containers = pod["spec"]["containers"].as_array().unwrap();
+        let network = containers
+            .iter()
+            .find(|container| container["name"] == SUPERVISOR_NETWORK_SIDECAR_NAME)
+            .unwrap();
+        let command = network["command"].as_array().unwrap();
+        assert!(command.iter().any(|arg| arg == "--upstream-proxy"));
+        assert!(command.iter().any(|arg| arg == "--upstream-no-proxy"));
+        let auth_file_index = command
+            .iter()
+            .position(|arg| arg == "--upstream-proxy-auth-file")
+            .unwrap();
+        assert_eq!(
+            command[auth_file_index + 1],
+            openshell_core::container_paths::UPSTREAM_PROXY_AUTH_MOUNT_PATH
+        );
+        assert!(
+            command
+                .iter()
+                .any(|arg| arg == "--upstream-proxy-auth-allow-insecure")
+        );
+        assert!(
+            command
+                .iter()
+                .any(|arg| arg == "--upstream-proxy-connect-by-hostname")
+        );
+        assert!(
+            network["volumeMounts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|mount| mount["name"] == UPSTREAM_PROXY_AUTH_VOLUME_NAME)
+        );
+
+        let init = pod["spec"]["initContainers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|container| container["name"] == SUPERVISOR_NETWORK_INIT_CONTAINER_NAME)
+            .unwrap();
+        assert!(!init["command"].as_array().unwrap().iter().any(|arg| {
+            arg.as_str()
+                .is_some_and(|arg| arg.starts_with("--upstream-"))
+        }));
+        let agent = containers
+            .iter()
+            .find(|container| container["name"] == "agent")
+            .unwrap();
+        assert!(
+            !agent["volumeMounts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|mount| mount["name"] == UPSTREAM_PROXY_AUTH_VOLUME_NAME)
+        );
+        assert!(!agent["env"].as_array().unwrap().iter().any(|entry| {
+            entry["value"] == "corporate-proxy-auth" || entry["value"] == "credentials"
+        }));
+
+        let volume = pod["spec"]["volumes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|volume| volume["name"] == UPSTREAM_PROXY_AUTH_VOLUME_NAME)
+            .unwrap();
+        assert_eq!(volume["secret"]["secretName"], "corporate-proxy-auth");
+        assert_eq!(volume["secret"]["items"][0]["key"], "credentials");
+        assert_eq!(
+            volume["secret"]["items"][0]["path"],
+            upstream_proxy_auth_file_name()
+        );
+        assert_eq!(volume["secret"]["defaultMode"], 0o440);
     }
 }

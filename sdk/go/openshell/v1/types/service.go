@@ -12,4 +12,5 @@ type ServiceEndpoint struct {
 	TargetPort  uint32
 	Domain      bool
 	URL         string
+	Workspace   string
 }

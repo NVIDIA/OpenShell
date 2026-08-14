@@ -483,6 +483,11 @@ fn build_env(
 
     env.remove(openshell_core::sandbox_env::SANDBOX_TOKEN);
     env.remove(openshell_core::sandbox_env::SANDBOX_TOKEN_FILE);
+    // Prevent user-supplied environment from overriding the TLS server name
+    // the supervisor verifies — a sandbox user who can redirect the gateway
+    // hostname could otherwise present a certificate for a name they control
+    // and intercept the sandbox JWT.
+    env.remove(openshell_core::sandbox_env::GATEWAY_TLS_SERVER_NAME);
     env.insert(
         openshell_core::sandbox_env::OCI_IMAGE_USER.into(),
         oci_user.to_string(),
@@ -1410,6 +1415,24 @@ mod tests {
         assert_eq!(
             container["command"],
             serde_json::json!(["--workdir", "/sandbox"])
+        );
+    }
+
+    #[test]
+    fn build_env_strips_gateway_tls_server_name() {
+        let mut sandbox = test_sandbox("test-id", "test-name");
+        let spec = sandbox.spec.get_or_insert_default();
+        spec.environment.insert(
+            openshell_core::sandbox_env::GATEWAY_TLS_SERVER_NAME.to_string(),
+            "evil.attacker.example.com".to_string(),
+        );
+
+        let container = build_container_spec(&sandbox, &test_config());
+
+        assert_eq!(
+            container["env"].get(openshell_core::sandbox_env::GATEWAY_TLS_SERVER_NAME),
+            None,
+            "GATEWAY_TLS_SERVER_NAME must be stripped from the supervisor environment"
         );
     }
 

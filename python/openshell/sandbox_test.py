@@ -16,6 +16,7 @@ from typing import Any, cast
 
 import pytest
 
+import openshell.sandbox as sandbox_module
 from openshell._proto import openshell_pb2
 from openshell.sandbox import (
     _PYTHON_CLOUDPICKLE_BOOTSTRAP,
@@ -27,6 +28,7 @@ from openshell.sandbox import (
     SandboxRef,
     SandboxStatusRef,
     TlsConfig,
+    _atomic_replace,
     _BearerAuthInterceptor,
     _load_cluster_bearer_token,
     _make_cluster_bearer_provider,
@@ -1281,6 +1283,65 @@ def test_refresher_concurrent_write_back_does_not_trample(tmp_path: Path) -> Non
         r.close()
 
 
+class _WindowsPermissionError(PermissionError):
+    winerror: int
+
+
+def test_atomic_replace_retries_windows_sharing_violations(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    source = tmp_path / "source"
+    destination = tmp_path / "destination"
+    source.write_text("new")
+    destination.write_text("old")
+    attempts = 0
+    delays: list[float] = []
+    real_replace = Path.replace
+
+    def replace(path: Path, target: Path) -> Path:
+        nonlocal attempts
+        attempts += 1
+        if attempts < 3:
+            error = _WindowsPermissionError("destination is busy")
+            error.winerror = 32
+            raise error
+        return real_replace(path, target)
+
+    monkeypatch.setattr(sandbox_module, "_IS_WINDOWS", True)
+    monkeypatch.setattr(Path, "replace", replace)
+    monkeypatch.setattr(time, "sleep", delays.append)
+
+    _atomic_replace(source, destination)
+
+    assert attempts == 3
+    assert delays == [0.005, 0.01]
+    assert destination.read_text() == "new"
+
+
+def test_atomic_replace_does_not_retry_permanent_windows_errors(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    source = tmp_path / "source"
+    destination = tmp_path / "destination"
+    source.write_text("new")
+    attempts = 0
+
+    def replace(_path: Path, _target: Path) -> Path:
+        nonlocal attempts
+        attempts += 1
+        error = _WindowsPermissionError("access denied")
+        error.winerror = 13
+        raise error
+
+    monkeypatch.setattr(sandbox_module, "_IS_WINDOWS", True)
+    monkeypatch.setattr(Path, "replace", replace)
+
+    with pytest.raises(PermissionError, match="access denied"):
+        _atomic_replace(source, destination)
+
+    assert attempts == 1
+
+
 def test_sandbox_wrapper_forwards_auth_kwargs_to_from_active_cluster(
     monkeypatch: Any,
 ) -> None:
@@ -1482,6 +1543,8 @@ class _FakeSandboxStub:
         self.list_request: openshell_pb2.ListSandboxesRequest | None = None
         self.get_request: openshell_pb2.GetSandboxRequest | None = None
         self.delete_request: openshell_pb2.DeleteSandboxRequest | None = None
+        self.stop_request: openshell_pb2.StopSandboxRequest | None = None
+        self.start_request: openshell_pb2.StartSandboxRequest | None = None
         self._listed = listed or []
 
     def GetSandbox(
@@ -1505,6 +1568,38 @@ class _FakeSandboxStub:
         self.delete_request = request
         _ = timeout
         return SimpleNamespace(deleted=True)
+
+    def StopSandbox(
+        self,
+        request: openshell_pb2.StopSandboxRequest,
+        timeout: float | None = None,
+    ) -> Any:
+        self.stop_request = request
+        _ = timeout
+        return SimpleNamespace(
+            sandbox=_make_sandbox_proto(
+                "sandbox-1",
+                request.name,
+                phase=openshell_pb2.SANDBOX_PHASE_STOPPED,
+                workspace=request.workspace,
+            )
+        )
+
+    def StartSandbox(
+        self,
+        request: openshell_pb2.StartSandboxRequest,
+        timeout: float | None = None,
+    ) -> Any:
+        self.start_request = request
+        _ = timeout
+        return SimpleNamespace(
+            sandbox=_make_sandbox_proto(
+                "sandbox-1",
+                request.name,
+                phase=openshell_pb2.SANDBOX_PHASE_STARTING,
+                workspace=request.workspace,
+            )
+        )
 
     def CreateSandbox(
         self,
@@ -1578,6 +1673,23 @@ def test_create_forwards_name_and_labels() -> None:
     assert stub.create_request.name == "job-1"
     assert dict(stub.create_request.labels) == {"aiq": "deep-research"}
     assert dict(ref.labels) == {"aiq": "deep-research"}
+
+
+def test_stop_and_start_forward_workspace_and_return_phase() -> None:
+    stub = _FakeSandboxStub()
+    client = _client_with_fake_stub(stub)
+
+    stopped = client.stop("job-1", workspace="team-a")
+    assert stub.stop_request is not None
+    assert stub.stop_request.name == "job-1"
+    assert stub.stop_request.workspace == "team-a"
+    assert stopped.phase == openshell_pb2.SANDBOX_PHASE_STOPPED
+
+    starting = client.start("job-1", workspace="team-a")
+    assert stub.start_request is not None
+    assert stub.start_request.name == "job-1"
+    assert stub.start_request.workspace == "team-a"
+    assert starting.phase == openshell_pb2.SANDBOX_PHASE_STARTING
 
 
 def test_create_without_args_sends_empty_metadata() -> None:

@@ -15,9 +15,12 @@
 #
 # Use tasks/scripts/docker-build-image.sh supervisor (or `mise run build:docker:supervisor`)
 # to stage the binary and build the image in one step. CI builds the binary
-# per-architecture via the `rust-native-build.yml` workflow (with the musl
-# target) and uploads it as an artifact, which is downloaded into the same
-# staging directory before the image build job runs.
+# per-architecture via the `rust-native-build.yml` workflow and uploads it as an
+# artifact, which is downloaded into the same staging directory before the image
+# build job runs.
+#
+# The binary is static under either supported libc variant (`SUPERVISOR_LIBC`:
+# musl by default, or glibc-static), so this Alpine base runs it unchanged.
 
 FROM alpine:3.22 AS supervisor
 

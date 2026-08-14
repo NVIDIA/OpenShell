@@ -239,6 +239,7 @@ impl SupervisorMiddleware for ContentGuard {
                     timeout: String::new(),
                 },
             ],
+            expected_audience: String::new(),
         }))
     }
 

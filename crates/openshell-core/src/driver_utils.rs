@@ -292,6 +292,20 @@ pub const MAX_UPSTREAM_PROXY_CREDENTIAL_BYTES: u64 = 4096;
 pub fn read_upstream_proxy_credential_file(path: &str) -> Result<String, String> {
     use std::io::Read as _;
 
+    // Windows rejects opening a directory before a file handle is available,
+    // while Unix permits the open and rejects it via handle metadata below.
+    // Preflight the path so every platform reports the intended non-regular
+    // file error. The post-open check remains necessary to close the TOCTOU
+    // window if the path is replaced between these operations.
+    #[cfg(target_os = "windows")]
+    {
+        let path_metadata = std::fs::metadata(path)
+            .map_err(|e| format!("failed to open proxy auth file '{path}': {e}"))?;
+        if !path_metadata.is_file() {
+            return Err(format!("proxy auth file '{path}' is not a regular file"));
+        }
+    }
+
     // On Unix, open non-blocking so a FIFO with no writer does not hang the
     // open() call indefinitely; the regular-file check below then rejects it.
     // O_NONBLOCK has no effect on the subsequent read of a regular file.

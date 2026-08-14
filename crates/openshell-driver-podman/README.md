@@ -19,6 +19,15 @@ independently.
 
 For a rootless networking deep dive, see [NETWORKING.md](NETWORKING.md).
 
+## Stop and Start
+
+Stop stops the managed container without deleting it. The per-sandbox named
+workspace volume, token and proxy-auth secrets, labels, and container metadata
+remain intact. Start starts the same container and reuses the same named
+volume. Stopped managed containers remain visible through list and watch
+reconciliation. Delete remains responsible for removing the container,
+driver-owned secrets, and workspace volume.
+
 ## Architecture
 
 The Podman driver communicates with the Podman daemon over a Unix socket and
