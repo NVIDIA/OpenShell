@@ -365,9 +365,14 @@ server:
   tls:
     # -- K8s secret (type kubernetes.io/tls) with tls.crt and tls.key for the server.
     certSecretName: openshell-server-tls
+    # -- Enable mTLS client certificate authentication. When false, the gateway
+    # runs HTTPS-only without requiring client certificates (use OIDC for auth
+    # instead). Must be false when using BackendTLSPolicy because ingress
+    # proxies cannot present client certificates to the backend.
+    enableMtls: true
     # -- K8s secret with ca.crt for client certificate verification (mTLS).
-    # Set to "" to disable mTLS and run HTTPS-only (use OIDC for auth instead).
-    # Do not set to null; omit the key to use the default secret name above.
+    # Only used when enableMtls is true. Set to "" to use the default client CA
+    # (from pkiInitJob or cert-manager).
     clientCaSecretName: openshell-server-client-ca
     # -- K8s secret mounted into sandbox pods for mTLS to the server.
     clientTlsSecretName: openshell-client-tls
@@ -555,8 +560,8 @@ grpcRoute:
     # -- Create a BackendTLSPolicy resource for end-to-end TLS between the
     # Gateway proxy and the OpenShell gateway pod. The traffic flow is:
     # client → HTTPS → Gateway (terminate) → TLS (re-encrypt) → gateway pod.
-    # Requires server.disableTls=false and a ConfigMap containing the CA
-    # certificate for backend validation.
+    # Requires server.disableTls=false and server.tls.enableMtls=false. The
+    # certgen hook auto-creates the backend CA ConfigMap.
     enabled: false
     # -- Name of the ConfigMap containing the CA certificate (key: ca.crt) used
     # to validate the gateway pod's TLS certificate. Defaults to

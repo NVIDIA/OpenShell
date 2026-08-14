@@ -143,7 +143,7 @@ As an alternative to the plaintext backend path above, the chart can create a `B
 client → HTTPS → Gateway (terminate TLS) → TLS (re-encrypt) → openshell gateway pod
 ```
 
-This keeps TLS on the gateway pod rather than disabling it with `server.disableTls=true`. The Gateway proxy validates the backend's certificate against a CA you supply in a ConfigMap.
+This keeps TLS on the gateway pod rather than disabling it with `server.disableTls=true`. The Gateway proxy validates the backend's certificate against a CA ConfigMap that the certgen hook auto-creates.
 
 BackendTLSPolicy is a standard Gateway API resource. It is supported on OpenShift 4.22+ (via the OpenShift gateway controller) and on other platforms where the Gateway API implementation supports it (check your controller's documentation).
 
@@ -156,6 +156,7 @@ helm upgrade --install openshell \
   oci://ghcr.io/nvidia/openshell/helm-chart \
   --version <version> \
   --namespace openshell \
+  --set server.tls.enableMtls=false \
   --set grpcRoute.enabled=true \
   --set grpcRoute.gateway.create=true \
   --set grpcRoute.gateway.className=eg \
@@ -167,7 +168,7 @@ helm upgrade --install openshell \
   --set 'grpcRoute.hostnames[0]=<external-hostname>'
 ```
 
-Note that `server.disableTls` is **not** set — the gateway pod continues to serve TLS. The BackendTLSPolicy hostname defaults to the service FQDN, which matches the SAN on the server certificate.
+Note that `server.disableTls` is **not** set — the gateway pod continues to serve TLS — but `server.tls.enableMtls=false` disables mTLS client certificate authentication because the Gateway proxy cannot present a client certificate to the backend. The BackendTLSPolicy hostname defaults to the service FQDN, which matches the SAN on the server certificate. Use OIDC for authentication (configured via `server.oidc.issuer`).
 
 For OpenShift 4.22+, see [OpenShift](/kubernetes/openshift#end-to-end-tls-openshift-422) for platform-specific instructions including Gateway and GatewayClass setup.
 

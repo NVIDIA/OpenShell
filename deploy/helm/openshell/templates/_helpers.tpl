@@ -104,6 +104,7 @@ defaults.
 */}}
 {{- define "openshell.gatewayClientCaEnabled" -}}
 {{- if .Values.server.disableTls -}}
+{{- else if not .Values.server.tls.enableMtls -}}
 {{- else if eq .Values.server.tls.clientCaSecretName "" -}}
 {{- else if or .Values.server.tls.clientCaSecretName (and .Values.pkiInitJob.enabled (not .Values.certManager.enabled)) (and .Values.certManager.enabled .Values.certManager.clientCaFromServerTlsSecret) -}}
 true

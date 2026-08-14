@@ -422,6 +422,24 @@ tests:
           path: data["gateway.toml"]
           pattern: '\[openshell\.gateway\.tls\]'
 
+  - it: omits client_ca_path from the TLS section when mTLS is disabled
+    template: templates/gateway-config.yaml
+    set:
+      server.tls.enableMtls: false
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '\[openshell\.gateway\.tls\]'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: 'cert_path\s*='
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: 'key_path\s*='
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: 'client_ca_path\s*='
+
   - it: renders client_ca_path for built-in PKI by default
     template: templates/gateway-config.yaml
     asserts:
