@@ -1149,9 +1149,7 @@ impl KubernetesComputeDriver {
                     || {
                         anns.get(crate::config::ANNOTATION_SCC_SUPPLEMENTAL_GROUPS)
                             .and_then(|sup_range| {
-                                KubernetesComputeConfig::from_open_shift_supplemental_groups(
-                                    sup_range,
-                                )
+                                self.config.from_open_shift_supplemental_groups(sup_range)
                             })
                             .unwrap_or(baseline_gid)
                     },
@@ -2826,6 +2824,8 @@ fn effective_sidecar_proxy_uid(params: &SandboxPodParams<'_>) -> u32 {
 
 fn supervisor_network_init_container(params: &SandboxPodParams<'_>) -> serde_json::Value {
     let proxy_uid = effective_sidecar_proxy_uid(params);
+    let mut env = Vec::new();
+    apply_identity_limit_env(&mut env, params);
     let mut container = serde_json::json!({
         "name": SUPERVISOR_NETWORK_INIT_CONTAINER_NAME,
         "image": params.supervisor_image,
@@ -2841,6 +2841,7 @@ fn supervisor_network_init_container(params: &SandboxPodParams<'_>) -> serde_jso
             "--sidecar-tls-dir",
             SIDECAR_TLS_MOUNT_PATH,
         ],
+        "env": env,
         "securityContext": {
             "runAsUser": 0,
             "allowPrivilegeEscalation": false,
@@ -3026,6 +3027,7 @@ fn apply_supervisor_sidecar_topology(
                 SIDECAR_TLS_MOUNT_PATH,
             );
             apply_resolved_identity_env(env, params.sandbox_uid, params.sandbox_gid);
+            apply_identity_limit_env(env, params);
         }
     }
 
@@ -5956,6 +5958,70 @@ mod tests {
             mount["name"] == "openshell-client-tls"
                 && mount["mountPath"] == "/etc/openshell-tls/client"
         }));
+    }
+
+    #[test]
+    fn combined_and_sidecar_inject_configured_identity_limits() {
+        let combined_params = SandboxPodParams {
+            min_sandbox_uid: 1,
+            min_sandbox_gid: 1,
+            ..SandboxPodParams::default()
+        };
+        let combined = sandbox_template_to_k8s(
+            &SandboxTemplate::default(),
+            false,
+            &std::collections::HashMap::new(),
+            false,
+            &combined_params,
+        );
+        let combined_agent = &combined["spec"]["containers"][0];
+        assert_eq!(
+            rendered_env(combined_agent, openshell_core::sandbox_env::MIN_SANDBOX_UID),
+            Some("1")
+        );
+        assert_eq!(
+            rendered_env(combined_agent, openshell_core::sandbox_env::MIN_SANDBOX_GID),
+            Some("1")
+        );
+
+        let sidecar_params = SandboxPodParams {
+            topology: SupervisorTopology::Sidecar,
+            min_sandbox_uid: 1,
+            min_sandbox_gid: 1,
+            ..SandboxPodParams::default()
+        };
+        let sidecar_pod = sandbox_template_to_k8s(
+            &SandboxTemplate::default(),
+            false,
+            &std::collections::HashMap::new(),
+            false,
+            &sidecar_params,
+        );
+        let containers = sidecar_pod["spec"]["containers"].as_array().unwrap();
+        let agent = containers
+            .iter()
+            .find(|container| container["name"] == "agent")
+            .unwrap();
+        let sidecar = containers
+            .iter()
+            .find(|container| container["name"] == SUPERVISOR_NETWORK_SIDECAR_NAME)
+            .unwrap();
+        let network_init = sidecar_pod["spec"]["initContainers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|container| container["name"] == SUPERVISOR_NETWORK_INIT_CONTAINER_NAME)
+            .unwrap();
+        for container in [agent, sidecar, network_init] {
+            assert_eq!(
+                rendered_env(container, openshell_core::sandbox_env::MIN_SANDBOX_UID),
+                Some("1")
+            );
+            assert_eq!(
+                rendered_env(container, openshell_core::sandbox_env::MIN_SANDBOX_GID),
+                Some("1")
+            );
+        }
     }
 
     #[test]

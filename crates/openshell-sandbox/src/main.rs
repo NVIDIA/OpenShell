@@ -441,7 +441,11 @@ fn run_network_init(
     sidecar_state_dir: &str,
     sidecar_tls_dir: &str,
 ) -> Result<()> {
-    validate_network_init_ids(proxy_user_id, proxy_primary_group_id)?;
+    validate_network_init_ids(
+        proxy_user_id,
+        proxy_primary_group_id,
+        openshell_policy::SandboxIdentityLimits::from_env(),
+    )?;
 
     let sidecar_state_dir = Path::new(sidecar_state_dir);
     let sidecar_tls_dir = Path::new(sidecar_tls_dir);
@@ -471,17 +475,21 @@ fn run_network_init(
 }
 
 #[cfg(target_os = "linux")]
-fn validate_network_init_ids(proxy_user_id: u32, proxy_primary_group_id: u32) -> Result<()> {
-    if proxy_user_id != 0 && proxy_user_id < openshell_policy::MIN_SANDBOX_UID {
+fn validate_network_init_ids(
+    proxy_user_id: u32,
+    proxy_primary_group_id: u32,
+    limits: openshell_policy::SandboxIdentityLimits,
+) -> Result<()> {
+    if proxy_user_id != 0 && !limits.contains_uid(proxy_user_id) {
         return Err(miette::miette!(
             "--proxy-uid must be 0 or at least {}",
-            openshell_policy::MIN_SANDBOX_UID
+            limits.min_uid
         ));
     }
-    if proxy_primary_group_id < openshell_policy::MIN_SANDBOX_UID {
+    if !limits.contains_gid(proxy_primary_group_id) {
         return Err(miette::miette!(
             "--proxy-gid must be at least {}",
-            openshell_policy::MIN_SANDBOX_UID
+            limits.min_gid
         ));
     }
     Ok(())
@@ -806,17 +814,39 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn network_init_accepts_root_proxy_uid_for_binary_aware_sidecar() {
-        validate_network_init_ids(0, openshell_policy::MIN_SANDBOX_UID).unwrap();
+        validate_network_init_ids(
+            0,
+            openshell_policy::MIN_SANDBOX_UID,
+            openshell_policy::SandboxIdentityLimits::default(),
+        )
+        .unwrap();
     }
 
     #[cfg(target_os = "linux")]
     #[test]
     fn network_init_still_rejects_low_non_root_proxy_ids() {
-        let uid_err =
-            validate_network_init_ids(999, openshell_policy::MIN_SANDBOX_UID).unwrap_err();
+        let uid_err = validate_network_init_ids(
+            999,
+            openshell_policy::MIN_SANDBOX_UID,
+            openshell_policy::SandboxIdentityLimits::default(),
+        )
+        .unwrap_err();
         assert!(uid_err.to_string().contains("--proxy-uid"));
 
-        let gid_err = validate_network_init_ids(0, 999).unwrap_err();
+        let gid_err =
+            validate_network_init_ids(0, 999, openshell_policy::SandboxIdentityLimits::default())
+                .unwrap_err();
         assert!(gid_err.to_string().contains("--proxy-gid"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn network_init_accepts_low_ids_when_min_is_one() {
+        validate_network_init_ids(
+            500,
+            500,
+            openshell_policy::SandboxIdentityLimits::from_mins(1, 1),
+        )
+        .unwrap();
     }
 }

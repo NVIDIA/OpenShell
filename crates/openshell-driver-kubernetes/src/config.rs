@@ -161,12 +161,9 @@ impl Default for KubernetesSidecarConfig {
 }
 
 impl KubernetesSidecarConfig {
-    pub fn validate_proxy_uid(&self) -> Result<(), String> {
-        if self.proxy_uid < openshell_policy::MIN_SANDBOX_UID {
-            return Err(format!(
-                "sidecar.proxy_uid must be at least {}",
-                openshell_policy::MIN_SANDBOX_UID
-            ));
+    pub fn validate_proxy_uid(&self, min_uid: u32) -> Result<(), String> {
+        if self.proxy_uid < min_uid {
+            return Err(format!("sidecar.proxy_uid must be at least {min_uid}"));
         }
         Ok(())
     }
@@ -510,7 +507,14 @@ impl KubernetesComputeConfig {
     }
 
     pub fn validate_proxy_uid(&self) -> Result<(), String> {
-        self.sidecar.validate_proxy_uid()
+        self.sidecar.validate_proxy_uid(self.min_sandbox_uid)
+    }
+
+    fn identity_limits(&self) -> openshell_policy::SandboxIdentityLimits {
+        openshell_policy::SandboxIdentityLimits::from_mins(
+            self.min_sandbox_uid,
+            self.min_sandbox_gid,
+        )
     }
 
     /// Validate the operator-owned corporate upstream proxy configuration.
@@ -626,7 +630,7 @@ impl KubernetesComputeConfig {
         // Try OpenShift SCC annotation.
         if let Some(anns) = namespace_annotations
             && let Some(range) = anns.get(ANNOTATION_SCC_UID_RANGE)
-            && let Some(uid) = Self::from_open_shift_uid_range(range)
+            && let Some(uid) = self.from_open_shift_uid_range(range)
         {
             return uid;
         }
@@ -646,42 +650,51 @@ impl KubernetesComputeConfig {
     /// Parse `OpenShift` SCC `sa.scc.uid-range` annotation.
     ///
     /// Format: `<start>/<size>` (e.g. `1000000000/10000`).
-    pub fn from_open_shift_uid_range(annotation: &str) -> Option<u32> {
+    pub fn from_open_shift_uid_range(&self, annotation: &str) -> Option<u32> {
         let (start, _) = annotation.split_once('/')?;
-        start.trim().parse::<u32>().ok().filter(|&uid| {
-            (openshell_policy::MIN_SANDBOX_UID..=openshell_policy::MAX_SANDBOX_UID).contains(&uid)
-        })
+        start
+            .trim()
+            .parse::<u32>()
+            .ok()
+            .filter(|&uid| self.identity_limits().contains_uid(uid))
     }
 
     /// Parse `OpenShift` SCC `sa.scc.supplemental-groups` annotation.
-    pub fn from_open_shift_supplemental_groups(annotation: &str) -> Option<u32> {
+    pub fn from_open_shift_supplemental_groups(&self, annotation: &str) -> Option<u32> {
         let (start, _) = annotation.split_once('/')?;
-        start.trim().parse::<u32>().ok().filter(|&gid| {
-            (openshell_policy::MIN_SANDBOX_UID..=openshell_policy::MAX_SANDBOX_UID).contains(&gid)
-        })
+        start
+            .trim()
+            .parse::<u32>()
+            .ok()
+            .filter(|&gid| self.identity_limits().contains_gid(gid))
     }
 
     /// Validate that configured `sandbox_uid` and `sandbox_gid` fall within
     /// the policy-enforced UID/GID range. Called during driver initialization
     /// before any pod parameters are rendered.
     pub fn validate_sandbox_identity_config(&self) -> Result<(), String> {
-        let range = openshell_policy::MIN_SANDBOX_UID..=openshell_policy::MAX_SANDBOX_UID;
+        if self.min_sandbox_uid == 0 {
+            return Err("min_sandbox_uid 0 is not allowed".to_string());
+        }
+        if self.min_sandbox_gid == 0 {
+            return Err("min_sandbox_gid 0 is not allowed".to_string());
+        }
+
+        let limits = self.identity_limits();
         if let Some(uid) = self.sandbox_uid
-            && !range.contains(&uid)
+            && !limits.contains_uid(uid)
         {
             return Err(format!(
                 "sandbox_uid {uid} is outside the allowed range [{}, {}]",
-                openshell_policy::MIN_SANDBOX_UID,
-                openshell_policy::MAX_SANDBOX_UID,
+                limits.min_uid, limits.max,
             ));
         }
         if let Some(gid) = self.sandbox_gid
-            && !range.contains(&gid)
+            && !limits.contains_gid(gid)
         {
             return Err(format!(
                 "sandbox_gid {gid} is outside the allowed range [{}, {}]",
-                openshell_policy::MIN_SANDBOX_UID,
-                openshell_policy::MAX_SANDBOX_UID,
+                limits.min_gid, limits.max,
             ));
         }
         Ok(())
@@ -1084,6 +1097,20 @@ mod tests {
     }
 
     #[test]
+    fn validate_proxy_uid_accepts_uid_when_min_is_one() {
+        let cfg = KubernetesComputeConfig {
+            min_sandbox_uid: 1,
+            min_sandbox_gid: 1,
+            sidecar: KubernetesSidecarConfig {
+                proxy_uid: 500,
+                ..KubernetesSidecarConfig::default()
+            },
+            ..KubernetesComputeConfig::default()
+        };
+        assert!(cfg.validate_proxy_uid().is_ok());
+    }
+
+    #[test]
     fn serde_rejects_invalid_topology() {
         let json = serde_json::json!({
             "topology": "unsupported"
@@ -1298,29 +1325,39 @@ mod tests {
     #[test]
     fn parse_openshift_uid_range() {
         assert_eq!(
-            KubernetesComputeConfig::from_open_shift_uid_range("1000000000/10000"),
+            KubernetesComputeConfig::default().from_open_shift_uid_range("1000000000/10000"),
             Some(1_000_000_000)
         );
         assert_eq!(
-            KubernetesComputeConfig::from_open_shift_uid_range("1000/50000"),
+            KubernetesComputeConfig::default().from_open_shift_uid_range("1000/50000"),
             Some(1000)
         );
     }
 
     #[test]
     fn parse_openshift_uid_range_rejects_below_min() {
-        // 999 is below MIN_SANDBOX_UID (1000) — should be rejected.
+        // 999 is below the default minimum (1000) — should be rejected.
         assert_eq!(
-            KubernetesComputeConfig::from_open_shift_uid_range("999/50000"),
+            KubernetesComputeConfig::default().from_open_shift_uid_range("999/50000"),
             None
         );
+    }
+
+    #[test]
+    fn parse_openshift_uid_range_accepts_below_default_min_when_configured() {
+        let cfg = KubernetesComputeConfig {
+            min_sandbox_uid: 1,
+            min_sandbox_gid: 1,
+            ..KubernetesComputeConfig::default()
+        };
+        assert_eq!(cfg.from_open_shift_uid_range("500/50000"), Some(500));
     }
 
     #[test]
     fn parse_openshift_uid_range_rejects_above_max() {
         // u32::MAX is well above MAX_SANDBOX_UID — should be rejected.
         assert_eq!(
-            KubernetesComputeConfig::from_open_shift_uid_range("4294967295/10000"),
+            KubernetesComputeConfig::default().from_open_shift_uid_range("4294967295/10000"),
             None
         );
     }
@@ -1333,6 +1370,37 @@ mod tests {
             ..KubernetesComputeConfig::default()
         };
         assert!(cfg.validate_sandbox_identity_config().is_ok());
+    }
+
+    #[test]
+    fn validate_sandbox_identity_config_rejects_uid_below_default_min() {
+        let cfg = KubernetesComputeConfig {
+            sandbox_uid: Some(999),
+            ..KubernetesComputeConfig::default()
+        };
+        let err = cfg.validate_sandbox_identity_config().unwrap_err();
+        assert!(err.contains("sandbox_uid 999"));
+    }
+
+    #[test]
+    fn validate_sandbox_identity_config_accepts_uid_when_min_is_one() {
+        let cfg = KubernetesComputeConfig {
+            min_sandbox_uid: 1,
+            min_sandbox_gid: 1,
+            sandbox_uid: Some(500),
+            ..KubernetesComputeConfig::default()
+        };
+        assert!(cfg.validate_sandbox_identity_config().is_ok());
+    }
+
+    #[test]
+    fn validate_sandbox_identity_config_rejects_min_zero() {
+        let cfg = KubernetesComputeConfig {
+            min_sandbox_uid: 0,
+            ..KubernetesComputeConfig::default()
+        };
+        let err = cfg.validate_sandbox_identity_config().unwrap_err();
+        assert!(err.contains("min_sandbox_uid 0"));
     }
 
     #[test]
@@ -1364,7 +1432,7 @@ mod tests {
     #[test]
     fn parse_openshift_supplemental_groups() {
         assert_eq!(
-            KubernetesComputeConfig::from_open_shift_supplemental_groups("1000/50000"),
+            KubernetesComputeConfig::default().from_open_shift_supplemental_groups("1000/50000"),
             Some(1000)
         );
     }
@@ -1393,6 +1461,21 @@ mod tests {
             "1000000000/10000".to_string(),
         );
         assert_eq!(cfg.resolve_sandbox_uid(Some(&anns)), 1_000_000_000);
+    }
+
+    #[test]
+    fn resolve_sandbox_uid_uses_openshift_start_when_min_is_one() {
+        let cfg = KubernetesComputeConfig {
+            min_sandbox_uid: 1,
+            min_sandbox_gid: 1,
+            ..KubernetesComputeConfig::default()
+        };
+        let mut anns: HashMap<String, String> = HashMap::new();
+        anns.insert(
+            ANNOTATION_SCC_UID_RANGE.to_string(),
+            "500/50000".to_string(),
+        );
+        assert_eq!(cfg.resolve_sandbox_uid(Some(&anns)), 500);
     }
 
     #[test]
