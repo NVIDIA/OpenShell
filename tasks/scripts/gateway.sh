@@ -35,8 +35,7 @@ Options:
 Environment:
   OPENSHELL_DRIVERS       Driver override used by openshell-gateway.
   OPENSHELL_GATEWAY_NAME  Gateway name for generic podman/kubernetes runs.
-  OPENSHELL_BIND_ADDRESS  Gateway listener address. Defaults to 127.0.0.1,
-                          or ::1 for Podman Machine on macOS.
+  OPENSHELL_BIND_ADDRESS  Gateway listener address. Defaults to 127.0.0.1.
   OPENSHELL_SERVER_PORT   Gateway port. Defaults to 8080 for Kubernetes,
                           18080 for Podman/Docker, and 18081 for VM.
   OPENSHELL_SUPERVISOR_IMAGE
@@ -304,17 +303,6 @@ GRPC_ENDPOINT="${OPENSHELL_GRPC_ENDPOINT:-}"
 LOG_LEVEL="${OPENSHELL_LOG_LEVEL:-info}"
 PRIMARY_BIND_IP="${OPENSHELL_BIND_ADDRESS:-127.0.0.1}"
 CLI_ENDPOINT_HOST="127.0.0.1"
-
-if [[ -z "${OPENSHELL_BIND_ADDRESS:-}" \
-  && "${DRIVER}" == "podman" \
-  && "$(uname -s)" == "Darwin" ]]; then
-  # Podman Machine reserves IPv4 loopback for its callback-only listener.
-  # Keep the primary listener distinct while using a hostname that resolves
-  # to IPv6 loopback for local CLI connections. An explicit bind address
-  # overrides this platform default.
-  PRIMARY_BIND_IP="::1"
-  CLI_ENDPOINT_HOST="localhost"
-fi
 
 if [[ "${DRIVER}" == "podman" ]]; then
   require_podman_service

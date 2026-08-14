@@ -386,16 +386,8 @@ export OPENSHELL_E2E_GATEWAY_CA_CERT="${PKI_DIR}/ca.crt"
 
 HOST_PORT=$(e2e_pick_port)
 HEALTH_PORT=$(e2e_pick_port)
-if [ "$(uname -s)" = "Darwin" ]; then
-  # Podman Machine reserves IPv4 loopback for its callback-only listener.
-  PRIMARY_BIND_IP="::1"
-  CLI_ENDPOINT_HOST="localhost"
-  HEALTH_ENDPOINT_HOST="[::1]"
-else
-  PRIMARY_BIND_IP="127.0.0.1"
-  CLI_ENDPOINT_HOST="127.0.0.1"
-  HEALTH_ENDPOINT_HOST="127.0.0.1"
-fi
+CLI_ENDPOINT_HOST="127.0.0.1"
+HEALTH_ENDPOINT_HOST="127.0.0.1"
 STATE_DIR="${WORKDIR}/state"
 mkdir -p "${STATE_DIR}"
 export XDG_STATE_HOME="${STATE_DIR}"
@@ -427,9 +419,11 @@ GATEWAY_CONFIG="${STATE_DIR}/gateway.toml"
 
 # Start from the RPM default template so this e2e test exercises the same TOML
 # config path that RPM users get on first start. The template leaves
-# bind_address unset and sets compute_drivers = ["podman"]. On Podman Machine,
-# the driver reserves IPv4 loopback for its callback-only listener, so the
-# primary listener uses IPv6 loopback. Native Linux keeps the IPv4 default.
+# bind_address unset and sets compute_drivers = ["podman"]. The built-in IPv4
+# loopback primary covers Podman Machine's callback address, so the gateway
+# reuses it and relies on sandbox JWT authorization for callback RPCs. Native
+# Linux still creates an additional callback-only listener when its bridge or
+# rootless topology requires another address.
 #
 # We append the driver-specific table and override the port via CLI flag
 # (CLI > TOML in the merge precedence) so the test can use an ephemeral port.
@@ -468,9 +462,8 @@ cp "${ROOT}/deploy/rpm/gateway.toml.default" "${GATEWAY_CONFIG}"
 
 GATEWAY_ARGS=(
   --config "${GATEWAY_CONFIG}"
-  # compute_drivers comes from the RPM template. Override the loopback address
-  # and port so Podman Machine can keep its IPv4 callback listener distinct.
-  --bind-address "${PRIMARY_BIND_IP}"
+  # compute_drivers comes from the RPM template. Override only the port so this
+  # path continues to exercise the gateway's built-in IPv4 loopback default.
   --port "${HOST_PORT}"
   --health-port "${HEALTH_PORT}"
   --tls-cert "${PKI_DIR}/server/tls.crt"
@@ -535,8 +528,7 @@ while [ "${elapsed}" -lt "${timeout}" ]; do
     echo "ERROR: openshell-gateway exited before becoming healthy"
     exit 1
   fi
-  # Keep this loopback probe direct even when ::1 is absent from NO_PROXY.
-  if curl --noproxy '*' -sf "http://${HEALTH_ENDPOINT_HOST}:${HEALTH_PORT}/healthz" >/dev/null 2>&1; then
+  if curl -sf "http://${HEALTH_ENDPOINT_HOST}:${HEALTH_PORT}/healthz" >/dev/null 2>&1; then
     echo "Gateway healthy after ${elapsed}s."
     break
   fi
