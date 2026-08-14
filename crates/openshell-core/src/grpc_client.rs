@@ -147,6 +147,10 @@ async fn build_plain_channel(endpoint: &str) -> Result<Channel> {
 
     let tls_enabled = endpoint.starts_with("https://");
 
+    // TODO: TLS certs are loaded once here and never re-read. The gateway
+    // server side supports hot-reload (ArcSwap + notify in tls.rs). The
+    // supervisor should do the same so that cert-manager rotations take
+    // effect without restarting the sandbox.
     if tls_enabled {
         let ca_path = std::env::var(sandbox_env::TLS_CA)
             .into_diagnostic()

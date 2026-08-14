@@ -26,6 +26,7 @@ use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use kube::Error as KubeError;
 use kube::api::{Api, ApiResource, PostParams};
 use kube::core::{DynamicObject, gvk::GroupVersionKind};
+use openshell_driver_kubernetes::OperatorNamespaceAllowlist;
 use std::sync::Arc;
 use tonic::Status;
 use tracing::{debug, info, warn};
@@ -135,8 +136,32 @@ impl Authenticator for K8sServiceAccountAuthenticator {
     }
 }
 
+/// Validates the namespace extracted from an SA token username against the
+/// expected set for the active workspace mode.
+#[derive(Debug, Clone)]
+pub enum NamespaceValidator {
+    /// Shared mode: accept only the single configured namespace.
+    Exact(String),
+    /// Managed mode: accept any namespace with the managed prefix
+    /// (`openshell-{gateway_id}-`).
+    Prefix(String),
+    /// Operator mode: accept namespaces in the dynamic allowlist.
+    Allowlist(OperatorNamespaceAllowlist),
+}
+
+impl NamespaceValidator {
+    pub fn accepts(&self, namespace: &str) -> bool {
+        match self {
+            Self::Exact(expected) => namespace == expected,
+            Self::Prefix(prefix) => namespace.starts_with(prefix.as_str()),
+            Self::Allowlist(al) => al.contains(namespace),
+        }
+    }
+}
+
 #[derive(Debug)]
 struct TokenReviewIdentity {
+    namespace: String,
     pod_name: String,
     pod_uid: String,
 }
@@ -151,59 +176,53 @@ struct SandboxOwnerReference {
 /// Resolver backed by the apiserver's `TokenReview` API and `kube::Client`
 /// for the per-pod annotation lookup.
 pub struct LiveK8sResolver {
+    client: kube::Client,
     token_reviews_api: Api<TokenReview>,
-    pods_api: Api<Pod>,
-    sandboxes_api_v1beta1: Api<DynamicObject>,
-    sandboxes_api_v1alpha1: Api<DynamicObject>,
     expected_audience: String,
-    sandbox_namespace: String,
+    namespace_validator: NamespaceValidator,
     expected_service_account: String,
 }
 
 impl LiveK8sResolver {
     pub fn new(
         client: kube::Client,
-        namespace: &str,
+        namespace_validator: NamespaceValidator,
         expected_audience: String,
         expected_service_account: String,
     ) -> Self {
         let token_reviews_api: Api<TokenReview> = Api::all(client.clone());
-        let pods_api: Api<Pod> = Api::namespaced(client.clone(), namespace);
-        let sandbox_gvk_v1beta1 =
-            GroupVersionKind::gvk(SANDBOX_API_GROUP, SANDBOX_API_VERSION_V1BETA1, SANDBOX_KIND);
-        let sandbox_resource_v1beta1 = ApiResource::from_gvk(&sandbox_gvk_v1beta1);
-        let sandbox_gvk_v1alpha1 = GroupVersionKind::gvk(
-            SANDBOX_API_GROUP,
-            SANDBOX_API_VERSION_V1ALPHA1,
-            SANDBOX_KIND,
-        );
-        let sandbox_resource_v1alpha1 = ApiResource::from_gvk(&sandbox_gvk_v1alpha1);
-        let sandboxes_api_v1beta1: Api<DynamicObject> =
-            Api::namespaced_with(client.clone(), namespace, &sandbox_resource_v1beta1);
-        let sandboxes_api_v1alpha1: Api<DynamicObject> =
-            Api::namespaced_with(client, namespace, &sandbox_resource_v1alpha1);
         Self {
+            client,
             token_reviews_api,
-            pods_api,
-            sandboxes_api_v1beta1,
-            sandboxes_api_v1alpha1,
             expected_audience,
-            sandbox_namespace: namespace.to_string(),
+            namespace_validator,
             expected_service_account,
         }
     }
 
+    fn pods_api(&self, namespace: &str) -> Api<Pod> {
+        Api::namespaced(self.client.clone(), namespace)
+    }
+
+    fn sandboxes_api(&self, namespace: &str, api_version: &str) -> Api<DynamicObject> {
+        let gvk = GroupVersionKind::gvk(SANDBOX_API_GROUP, api_version, SANDBOX_KIND);
+        let resource = ApiResource::from_gvk(&gvk);
+        Api::namespaced_with(self.client.clone(), namespace, &resource)
+    }
+
     async fn get_sandbox_cr_for_owner(
         &self,
+        namespace: &str,
         owner: &SandboxOwnerReference,
     ) -> Result<Option<DynamicObject>, KubeError> {
-        let apis = if owner.api_version == SANDBOX_API_VERSION_FULL_V1ALPHA1 {
-            [&self.sandboxes_api_v1alpha1, &self.sandboxes_api_v1beta1]
+        let versions = if owner.api_version == SANDBOX_API_VERSION_FULL_V1ALPHA1 {
+            [SANDBOX_API_VERSION_V1ALPHA1, SANDBOX_API_VERSION_V1BETA1]
         } else {
-            [&self.sandboxes_api_v1beta1, &self.sandboxes_api_v1alpha1]
+            [SANDBOX_API_VERSION_V1BETA1, SANDBOX_API_VERSION_V1ALPHA1]
         };
 
-        for api in apis {
+        for version in versions {
+            let api = self.sandboxes_api(namespace, version);
             match api.get_opt(&owner.name).await {
                 Ok(Some(sandbox_cr)) => return Ok(Some(sandbox_cr)),
                 Ok(None) => {}
@@ -242,7 +261,7 @@ impl K8sIdentityResolver for LiveK8sResolver {
         let Some(identity) = token_review_identity(
             &status,
             &self.expected_audience,
-            &self.sandbox_namespace,
+            &self.namespace_validator,
             &self.expected_service_account,
         )?
         else {
@@ -252,34 +271,30 @@ impl K8sIdentityResolver for LiveK8sResolver {
         info!(
             pod_name = %identity.pod_name,
             pod_uid = %identity.pod_uid,
+            namespace = %identity.namespace,
             service_account = %self.expected_service_account,
             "validated K8s SA token via TokenReview"
         );
 
-        // Look up the pod and read its sandbox-id annotation.
-        let pod = self
-            .pods_api
-            .get_opt(&identity.pod_name)
-            .await
-            .map_err(|e| {
-                warn!(
-                    pod = %identity.pod_name,
-                    error = %e,
-                    "failed to fetch sandbox pod for annotation lookup"
-                );
-                Status::internal(format!("pod GET failed: {e}"))
-            })?;
+        let pods_api = self.pods_api(&identity.namespace);
+        let pod = pods_api.get_opt(&identity.pod_name).await.map_err(|e| {
+            warn!(
+                pod = %identity.pod_name,
+                namespace = %identity.namespace,
+                error = %e,
+                "failed to fetch sandbox pod for annotation lookup"
+            );
+            Status::internal(format!("pod GET failed: {e}"))
+        })?;
         let Some(pod) = pod else {
             warn!(
                 pod = %identity.pod_name,
-                "sandbox pod referenced by SA token not found in this namespace"
+                namespace = %identity.namespace,
+                "sandbox pod referenced by SA token not found"
             );
             return Err(Status::not_found("sandbox pod not found"));
         };
 
-        // Defense-in-depth: confirm the pod UID matches the SA token's
-        // `kubernetes.io.pod.uid`. Prevents a replayed token from a
-        // recreated pod with the same name.
         let actual_uid = pod.metadata.uid.as_deref().unwrap_or_default();
         if actual_uid != identity.pod_uid {
             warn!(
@@ -294,16 +309,19 @@ impl K8sIdentityResolver for LiveK8sResolver {
         let sandbox_id = pod_sandbox_id(&pod)?;
 
         let owner = sandbox_owner_reference(&pod)?;
-        let sandbox_cr = self.get_sandbox_cr_for_owner(&owner).await.map_err(|e| {
-            warn!(
-                pod = %identity.pod_name,
-                sandbox_owner = %owner.name,
-                sandbox_owner_api_version = %owner.api_version,
-                error = %e,
-                "failed to fetch owning Sandbox CR for pod identity validation"
-            );
-            Status::internal(format!("sandbox GET failed: {e}"))
-        })?;
+        let sandbox_cr = self
+            .get_sandbox_cr_for_owner(&identity.namespace, &owner)
+            .await
+            .map_err(|e| {
+                warn!(
+                    pod = %identity.pod_name,
+                    sandbox_owner = %owner.name,
+                    sandbox_owner_api_version = %owner.api_version,
+                    error = %e,
+                    "failed to fetch owning Sandbox CR for pod identity validation"
+                );
+                Status::internal(format!("sandbox GET failed: {e}"))
+            })?;
         let Some(sandbox_cr) = sandbox_cr else {
             warn!(
                 pod = %identity.pod_name,
@@ -327,7 +345,7 @@ impl K8sIdentityResolver for LiveK8sResolver {
 fn token_review_identity(
     status: &TokenReviewStatus,
     expected_audience: &str,
-    sandbox_namespace: &str,
+    namespace_validator: &NamespaceValidator,
     expected_service_account: &str,
 ) -> Result<Option<TokenReviewIdentity>, Status> {
     if status.authenticated != Some(true) {
@@ -356,13 +374,20 @@ fn token_review_identity(
         .username
         .as_deref()
         .ok_or_else(|| Status::permission_denied("TokenReview response missing username"))?;
-    let expected_username =
-        format!("system:serviceaccount:{sandbox_namespace}:{expected_service_account}");
-    if username != expected_username {
+
+    let (namespace, sa_name) = parse_sa_username(username).ok_or_else(|| {
         warn!(
             username = %username,
-            sandbox_namespace = %sandbox_namespace,
-            service_account = %expected_service_account,
+            "K8s TokenReview username is not a service account"
+        );
+        Status::permission_denied("SA token username format not recognized")
+    })?;
+
+    if sa_name != expected_service_account {
+        warn!(
+            username = %username,
+            service_account = %sa_name,
+            expected = %expected_service_account,
             "K8s TokenReview principal is not the configured sandbox service account"
         );
         return Err(Status::permission_denied(
@@ -370,9 +395,33 @@ fn token_review_identity(
         ));
     }
 
+    if !namespace_validator.accepts(&namespace) {
+        warn!(
+            username = %username,
+            namespace = %namespace,
+            "K8s TokenReview SA namespace not accepted by workspace mode validator"
+        );
+        return Err(Status::permission_denied(
+            "SA token is not from an accepted sandbox namespace",
+        ));
+    }
+
     let pod_name = user_extra_one(user, POD_NAME_EXTRA)?;
     let pod_uid = user_extra_one(user, POD_UID_EXTRA)?;
-    Ok(Some(TokenReviewIdentity { pod_name, pod_uid }))
+    Ok(Some(TokenReviewIdentity {
+        namespace,
+        pod_name,
+        pod_uid,
+    }))
+}
+
+fn parse_sa_username(username: &str) -> Option<(String, String)> {
+    let rest = username.strip_prefix("system:serviceaccount:")?;
+    let (namespace, sa_name) = rest.split_once(':')?;
+    if namespace.is_empty() || sa_name.is_empty() {
+        return None;
+    }
+    Some((namespace.to_string(), sa_name.to_string()))
 }
 
 #[allow(clippy::result_large_err)]
@@ -664,6 +713,10 @@ mod tests {
         cr
     }
 
+    fn exact_validator(ns: &str) -> NamespaceValidator {
+        NamespaceValidator::Exact(ns.to_string())
+    }
+
     #[test]
     fn token_review_identity_extracts_pod_binding() {
         let status = token_review_status(
@@ -676,10 +729,12 @@ mod tests {
             ],
         );
 
-        let identity = token_review_identity(&status, "openshell-gateway", "openshell", "default")
+        let validator = exact_validator("openshell");
+        let identity = token_review_identity(&status, "openshell-gateway", &validator, "default")
             .unwrap()
             .expect("authenticated token should resolve");
 
+        assert_eq!(identity.namespace, "openshell");
         assert_eq!(identity.pod_name, "openshell-sandbox-a");
         assert_eq!(identity.pod_uid, "uid-a");
     }
@@ -691,9 +746,10 @@ mod tests {
             error: Some("invalid audience".to_string()),
             ..Default::default()
         };
+        let validator = exact_validator("openshell");
 
         assert!(
-            token_review_identity(&status, "openshell-gateway", "openshell", "default")
+            token_review_identity(&status, "openshell-gateway", &validator, "default")
                 .unwrap()
                 .is_none()
         );
@@ -710,8 +766,9 @@ mod tests {
                 (POD_UID_EXTRA, "uid-a"),
             ],
         );
+        let validator = exact_validator("openshell");
 
-        let err = token_review_identity(&status, "openshell-gateway", "openshell", "default")
+        let err = token_review_identity(&status, "openshell-gateway", &validator, "default")
             .expect_err("wrong audience must fail closed");
         assert_eq!(err.code(), tonic::Code::Unauthenticated);
     }
@@ -727,8 +784,9 @@ mod tests {
                 (POD_UID_EXTRA, "uid-a"),
             ],
         );
+        let validator = exact_validator("openshell");
 
-        let err = token_review_identity(&status, "openshell-gateway", "openshell", "default")
+        let err = token_review_identity(&status, "openshell-gateway", &validator, "default")
             .expect_err("other namespace must be rejected");
         assert_eq!(err.code(), tonic::Code::PermissionDenied);
     }
@@ -744,8 +802,9 @@ mod tests {
                 (POD_UID_EXTRA, "uid-a"),
             ],
         );
+        let validator = exact_validator("openshell");
 
-        let err = token_review_identity(&status, "openshell-gateway", "openshell", "default")
+        let err = token_review_identity(&status, "openshell-gateway", &validator, "default")
             .expect_err("other service account must be rejected");
         assert_eq!(err.code(), tonic::Code::PermissionDenied);
     }
@@ -758,10 +817,69 @@ mod tests {
             "system:serviceaccount:openshell:default",
             vec![],
         );
+        let validator = exact_validator("openshell");
 
-        let err = token_review_identity(&status, "openshell-gateway", "openshell", "default")
+        let err = token_review_identity(&status, "openshell-gateway", &validator, "default")
             .expect_err("non pod-bound tokens must be rejected");
         assert_eq!(err.code(), tonic::Code::PermissionDenied);
+    }
+
+    #[test]
+    fn namespace_validator_exact_accepts_matching() {
+        let v = NamespaceValidator::Exact("openshell".to_string());
+        assert!(v.accepts("openshell"));
+        assert!(!v.accepts("other"));
+    }
+
+    #[test]
+    fn namespace_validator_prefix_accepts_managed_namespaces() {
+        let v = NamespaceValidator::Prefix("openshell-gw1-".to_string());
+        assert!(v.accepts("openshell-gw1-workspace-a"));
+        assert!(v.accepts("openshell-gw1-default"));
+        assert!(!v.accepts("openshell-gw2-workspace-a"));
+        assert!(!v.accepts("other"));
+    }
+
+    #[test]
+    fn namespace_validator_allowlist_accepts_known_namespaces() {
+        let al = OperatorNamespaceAllowlist::from_set(std::collections::BTreeSet::from([
+            "ns-a".to_string(),
+            "ns-b".to_string(),
+        ]));
+        let v = NamespaceValidator::Allowlist(al);
+        assert!(v.accepts("ns-a"));
+        assert!(v.accepts("ns-b"));
+        assert!(!v.accepts("ns-c"));
+    }
+
+    #[test]
+    fn token_review_identity_prefix_validator_accepts_managed_namespace() {
+        let status = token_review_status(
+            true,
+            vec!["openshell-gateway"],
+            "system:serviceaccount:openshell-gw1-workspace-a:default",
+            vec![
+                (POD_NAME_EXTRA, "openshell-sandbox-a"),
+                (POD_UID_EXTRA, "uid-a"),
+            ],
+        );
+        let validator = NamespaceValidator::Prefix("openshell-gw1-".to_string());
+
+        let identity = token_review_identity(&status, "openshell-gateway", &validator, "default")
+            .unwrap()
+            .expect("managed namespace token should resolve");
+        assert_eq!(identity.namespace, "openshell-gw1-workspace-a");
+    }
+
+    #[test]
+    fn parse_sa_username_extracts_namespace_and_sa() {
+        let (ns, sa) = parse_sa_username("system:serviceaccount:openshell:default").unwrap();
+        assert_eq!(ns, "openshell");
+        assert_eq!(sa, "default");
+
+        assert!(parse_sa_username("system:node:nodename").is_none());
+        assert!(parse_sa_username("system:serviceaccount::default").is_none());
+        assert!(parse_sa_username("system:serviceaccount:ns:").is_none());
     }
 
     #[test]

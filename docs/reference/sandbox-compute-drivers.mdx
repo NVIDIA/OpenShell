@@ -328,6 +328,17 @@ On hosts with restrictive firewalls (e.g. firewalld), the host firewall may addi
 
 Kubernetes-backed sandboxes run as pods in the configured sandbox namespace. Use Kubernetes for shared clusters, remote compute, GPU scheduling, and operator-managed environments.
 
+<Warning>
+Kubernetes workspace namespaces are an administrative trust boundary. In
+shared and managed modes, only the OpenShell gateway and its trusted Agent
+Sandbox controller may administer Sandbox CRs, sandbox pods, or the configured
+sandbox ServiceAccount in those namespaces. In operator mode, allowlist only
+namespaces where the platform operator preserves that exclusive control.
+Untrusted principals must not be able to create sandbox pods with fabricated
+owner references or use the sandbox ServiceAccount. The operator namespace
+allowlist is a trust grant, not a tenant isolation mechanism.
+</Warning>
+
 Helm deployments set Kubernetes driver values through the chart.
 
 For maintainer-level implementation details, refer to the [Kubernetes driver README](https://github.com/NVIDIA/OpenShell/blob/main/crates/openshell-driver-kubernetes/README.md).
@@ -339,7 +350,8 @@ For maintainer-level implementation details, refer to the [Kubernetes driver REA
 | `service_account_name` | `sandboxServiceAccount.name` | Set the Kubernetes service account assigned to sandbox pods and accepted by the gateway TokenReview bootstrap path. The Helm chart creates a dedicated sandbox service account by default. |
 | `default_image` | `server.sandboxImage` | Set the default sandbox image. |
 | `image_pull_policy` | `server.sandboxImagePullPolicy` | Set the Kubernetes image pull policy for sandbox pods. |
-| `image_pull_secrets` | `server.sandboxImagePullSecrets` | Attach Kubernetes image pull secrets to sandbox pods. Referenced Secrets must exist in the sandbox namespace. |
+| `image_pull_secrets` | `server.sandboxImagePullSecrets` | Attach Kubernetes image-pull Secrets to sandbox pods. Managed mode copies these explicitly named Secrets from the configured source namespace into each workspace namespace. In shared and operator modes, the Secrets must already exist in the sandbox namespace. |
+| `[managed_ssh_ingress]` | `networkPolicy.enabled` | In managed mode, create an SSH ingress policy in every workspace namespace. Helm configures the gateway namespace and pod selector automatically. Operator mode leaves namespace policy management to the platform operator. |
 | `grpc_endpoint` | `server.grpcEndpoint` | Set the gateway callback endpoint reachable from sandbox pods. |
 | `client_tls_secret_name` | `server.tls.clientTlsSecretName` | Mount sandbox client TLS materials from a Kubernetes secret. |
 | `supervisor_image` | `supervisor.image.repository` / `supervisor.image.tag` | Override the supervisor image that provides the `openshell-sandbox` binary. The default repository with an empty tag uses the version-pinned image built into the gateway. Changing the repository uses the effective gateway image tag, while setting a tag pins that version explicitly. |
@@ -358,6 +370,13 @@ For maintainer-level implementation details, refer to the [Kubernetes driver REA
 | `workspace_default_storage_size` | `server.workspaceDefaultStorageSize` | Set the default workspace PVC size for new sandboxes. |
 | `workspace_storage_class` | `server.workspaceStorageClass` | Set the `StorageClass` for the workspace PVC. Empty (default) omits `storageClassName` and uses the cluster's default `StorageClass`. Set this on clusters with no default `StorageClass`, otherwise the workspace PVC stays `Pending` and the sandbox never starts. |
 | `sa_token_ttl_secs` | `server.sandboxJwt.k8sSaTokenTtlSecs` | Set the projected ServiceAccount token TTL used for the bootstrap token exchange. |
+
+Managed-mode Secret copying requires the gateway ServiceAccount to create
+Secrets. Kubernetes RBAC cannot restrict Secret `create` by resource name, so
+the Helm chart grants cluster-wide Secret `create`; Secret `get` and `patch`
+remain limited to the explicitly configured TLS and image-pull Secret names.
+The driver creates copies only in gateway-owned managed namespaces. Do not
+reuse the gateway ServiceAccount for unrelated workloads.
 
 In `combined` topology, the agent container carries the Linux capabilities
 needed by the supervisor for network namespace setup, Landlock filesystem

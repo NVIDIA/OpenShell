@@ -243,6 +243,20 @@ server:
   # the field, "RuntimeDefault" to force the runtime default profile, or
   # "Localhost/profile-name" for an operator-managed localhost profile.
   appArmorProfile: "Unconfined"
+  # Kubernetes compute driver settings.
+  drivers:
+    kubernetes:
+      # -- How workspaces map to Kubernetes namespaces.
+      # "shared" (default): all sandboxes in a single namespace.
+      # "managed": auto-creates per-workspace namespaces.
+      # "operator": uses pre-provisioned namespaces.
+      workspaceMode: "shared"
+      # -- K8s label selector for namespace discovery in operator mode.
+      # The driver watches namespaces matching this label.
+      operatorNamespaceLabel: ""
+      # -- Path to a JSON file containing an array of namespace names
+      # allowed in operator mode. Hot-reloaded on change.
+      operatorNamespaceFile: ""
   # -- Disable TLS entirely - the server listens on plaintext HTTP.
   # Set to true when a reverse proxy / tunnel terminates TLS at the edge.
   disableTls: false
@@ -389,7 +403,8 @@ server:
 
 # NetworkPolicy restricting SSH ingress on sandbox pods to the gateway only.
 networkPolicy:
-  # -- Create a NetworkPolicy restricting SSH ingress on sandbox pods to the gateway.
+  # -- Restrict SSH ingress on sandbox pods to the gateway. In managed mode,
+  # the driver applies the equivalent policy to each workspace namespace.
   enabled: true
 
 # Built-in TLS PKI bootstrap via a pre-install/pre-upgrade hook Job.

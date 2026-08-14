@@ -443,6 +443,14 @@ client_ca_path = "/etc/openshell-tls/client-ca/ca.crt"
 # external_server_names = ["gateway.example.com"]
 
 [openshell.drivers.kubernetes]
+# Workspace isolation mode. "shared" renders all sandboxes into a single
+# namespace. "managed" auto-creates a K8s namespace per workspace
+# (openshell-{gateway_id}-{workspace}). "operator" maps each workspace to a
+# pre-provisioned namespace discovered via label selector or drop-in file.
+workspace_mode                 = "shared"
+# Gateway identity used in managed-mode namespace naming. Defaults to the
+# gateway JWT gateway_id. Must be a DNS-1123 label.
+# gateway_id                   = "openshell"
 namespace                      = "agents"
 service_account_name           = "openshell-sandbox"
 default_image                  = "ghcr.io/nvidia/openshell/sandbox:latest"
@@ -451,6 +459,7 @@ image_pull_secrets             = ["regcred"]
 # Defaults to the gateway version; override to pin a specific build.
 # supervisor_image             = "ghcr.io/nvidia/openshell/supervisor:<version>"
 supervisor_image_pull_policy   = "IfNotPresent"
+
 # Use the image volume on Kubernetes >= 1.35 (GA in 1.36); switch to "init-container"
 # on older clusters or where the ImageVolume feature gate is off.
 supervisor_sideload_method     = "image-volume"
@@ -511,6 +520,18 @@ provider_spiffe_workload_api_socket_path = "/spiffe-workload-api/spire-agent.soc
 # back to 1000 on non-OpenShift clusters.
 # sandbox_uid = 1500
 # sandbox_gid = 1500
+# Operator-mode namespace discovery. At least one must be set when
+# workspace_mode = "operator". Both can be combined.
+# operator_namespace_label discovers namespaces matching a K8s label selector.
+# operator_namespace_label     = "openshell.ai/workspace=true"
+# operator_namespace_file reads allowed namespaces from a JSON/YAML file
+# (hot-reloaded on change, e.g. via ConfigMap volume mount).
+# operator_namespace_file      = "/etc/openshell/workspace-namespaces.json"
+
+[openshell.drivers.kubernetes.managed_ssh_ingress]
+enabled = true
+gateway_namespace = "openshell"
+gateway_pod_selector = { "app.kubernetes.io/name" = "openshell", "app.kubernetes.io/instance" = "openshell" }
 
 [openshell.drivers.kubernetes.sidecar]
 # UID used by relaxed long-running network sidecars. Strict process/binary-aware
@@ -524,6 +545,11 @@ proxy_uid                      = 1337
 # policy.binaries.
 process_binary_aware_network_policy = true
 ```
+
+In managed workspace mode, the Kubernetes driver copies each explicitly named
+`image_pull_secrets` Secret from `namespace` into the managed workspace
+namespace on sandbox creation. Shared and operator modes require the Secret to
+already exist in the sandbox namespace.
 
 ### Docker
 
