@@ -470,6 +470,19 @@ impl KubernetesComputeConfig {
                             .to_string(),
                     );
                 }
+                // Kubernetes rejects Secret keys longer than 253 bytes and the
+                // reserved `.`/`..` names. Reject them here so an invalid
+                // deployment setting fails at gateway startup instead of
+                // surfacing as repeated Pod-provisioning failures.
+                if key.len() > 253 {
+                    return Err(
+                        "proxy_auth_secret_key must be at most 253 bytes to satisfy Kubernetes Secret key limits"
+                            .to_string(),
+                    );
+                }
+                if key == "." || key == ".." {
+                    return Err("proxy_auth_secret_key must not be '.' or '..'".to_string());
+                }
                 if self.https_proxy.is_none() {
                     return Err(
                         "proxy credential Secret is set but no https_proxy is configured"
@@ -1184,6 +1197,45 @@ mod tests {
         };
         let err = cfg.validate_upstream_proxy_config().unwrap_err();
         assert!(err.contains("proxy_auth_secret_name"), "{err}");
+    }
+
+    #[test]
+    fn upstream_proxy_config_rejects_invalid_secret_key() {
+        // A key that Kubernetes cannot create must fail at gateway startup
+        // instead of surfacing as repeated Pod-provisioning failures.
+        for key in [
+            "a".repeat(254), // exceeds the 253-byte Secret key limit
+            ".".to_string(),
+            "..".to_string(),
+            "bad key".to_string(), // whitespace is outside the allowed charset
+        ] {
+            let cfg = KubernetesComputeConfig {
+                topology: SupervisorTopology::Sidecar,
+                https_proxy: Some("http://proxy.corp.example:8080".to_string()),
+                proxy_auth_secret_name: Some("corporate-proxy-auth".to_string()),
+                proxy_auth_secret_key: Some(key.clone()),
+                proxy_auth_allow_insecure: Some(true),
+                ..KubernetesComputeConfig::default()
+            };
+            let err = cfg.validate_upstream_proxy_config().unwrap_err();
+            assert!(
+                err.contains("proxy_auth_secret_key"),
+                "key {key:?} should be rejected with a key-specific error: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn upstream_proxy_config_accepts_max_length_secret_key() {
+        let cfg = KubernetesComputeConfig {
+            topology: SupervisorTopology::Sidecar,
+            https_proxy: Some("http://proxy.corp.example:8080".to_string()),
+            proxy_auth_secret_name: Some("corporate-proxy-auth".to_string()),
+            proxy_auth_secret_key: Some("a".repeat(253)),
+            proxy_auth_allow_insecure: Some(true),
+            ..KubernetesComputeConfig::default()
+        };
+        assert!(cfg.validate_upstream_proxy_config().is_ok());
     }
 
     #[test]
