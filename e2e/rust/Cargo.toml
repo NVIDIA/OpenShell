@@ -28,6 +28,7 @@ e2e-docker = ["e2e", "e2e-host-gateway", "e2e-local-container-driver"]
 e2e-gpu = ["e2e"]
 e2e-docker-gpu = ["e2e-docker", "e2e-gpu"]
 e2e-kubernetes = ["e2e"]
+e2e-kubernetes-ha = ["e2e-kubernetes"]
 e2e-kubernetes-credential-drivers = ["e2e-kubernetes"]
 e2e-podman = ["e2e", "e2e-host-gateway", "e2e-local-container-driver"]
 e2e-podman-gpu = ["e2e-podman", "e2e-gpu"]
@@ -87,7 +88,7 @@ required-features = ["e2e-vm"]
 [[test]]
 name = "kubernetes_ha_rebalancing"
 path = "tests/kubernetes_ha_rebalancing.rs"
-required-features = ["e2e-kubernetes"]
+required-features = ["e2e-kubernetes-ha"]
 
 [[test]]
 name = "kubernetes_corporate_proxy"
