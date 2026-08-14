@@ -282,7 +282,10 @@ pub(crate) async fn run_server(
     let ServerStartupConfig {
         config,
         config_file,
+        #[cfg(not(target_os = "windows"))]
         guest_tls,
+        #[cfg(target_os = "windows")]
+            guest_tls: _,
     } = startup;
 
     auth::descriptor_authz::init()
@@ -1019,7 +1022,7 @@ fn builtin_compute_driver(name: &str) -> Option<ComputeDriverKind> {
     name.parse().ok()
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(any(not(target_os = "windows"), test))]
 fn kubernetes_sandbox_jwt_expiry_disabled(config: &Config) -> bool {
     config
         .gateway_jwt
