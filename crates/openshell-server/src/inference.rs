@@ -1763,14 +1763,24 @@ mod tests {
         // not the bare "gemini-2.5-flash" that Vertex AI rejects with HTTP 400.
         let store = test_store().await;
         let config = [
-            ("VERTEX_AI_PROJECT_ID".to_string(), "my-gcp-project".to_string()),
+            (
+                "VERTEX_AI_PROJECT_ID".to_string(),
+                "my-gcp-project".to_string(),
+            ),
             ("VERTEX_AI_REGION".to_string(), "us-central1".to_string()),
         ]
         .into_iter()
         .collect();
         let provider = make_vertex_provider_with_config("vertex-dev", config);
-        store.put_message(&provider).await.expect("persist provider");
-        let route = make_route(CLUSTER_INFERENCE_ROUTE_NAME, "vertex-dev", "gemini-2.5-flash");
+        store
+            .put_message(&provider)
+            .await
+            .expect("persist provider");
+        let route = make_route(
+            CLUSTER_INFERENCE_ROUTE_NAME,
+            "vertex-dev",
+            "gemini-2.5-flash",
+        );
         store.put_message(&route).await.expect("persist route");
 
         let resp = resolve_inference_bundle(&store, "default")
