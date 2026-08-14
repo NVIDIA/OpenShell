@@ -14,7 +14,7 @@ use openshell_e2e::harness::sandbox::SandboxGuard;
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 
-const CREDENTIAL_KEY: &str = "OPENAI_API_KEY";
+const CREDENTIAL_KEY: &str = "ANTHROPIC_API_KEY";
 const VAULT_POLICY: &str = r#"path "secret/data/openshell/provider-credentials/*" {
   capabilities = ["create", "read", "update", "delete"]
 }
@@ -212,7 +212,7 @@ async fn create_provider(name: &str, secret_value: &str) -> Result<String, Strin
         "--name",
         name,
         "--type",
-        "openai",
+        "claude-code",
         "--credential",
         &credential,
     ])
