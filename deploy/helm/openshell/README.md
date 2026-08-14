@@ -178,10 +178,11 @@ add `ci/values-spire.yaml` to the OpenShell release values files.
 | certManager.caSecretName | string | `"openshell-ca-tls"` | Secret created for the intermediate CA (Certificate with isCA: true). |
 | certManager.certificateDuration | string | `"8760h"` | Duration for cert-manager-issued certificates. |
 | certManager.certificateRenewBefore | string | `"720h"` | Renewal window for cert-manager-issued certificates. |
-| certManager.clientCaFromServerTlsSecret | bool | `true` | Mount gateway client CA from the server TLS secret's ca.crt (populated by cert-manager for certs issued by a CA Issuer). Avoids a separate openshell-server-client-ca Secret. |
+| certManager.clientCaFromServerTlsSecret | bool | `true` | Mount gateway client CA from the internal server TLS secret's ca.crt. The internal server certificate is always signed by the chart CA — the same CA that signs the client (mTLS) certificate — so the default (true) is correct for all configurations, including when serverIssuerRef is set. Only set to false if you mount the client CA from a separate secret via server.tls.clientCaSecretName. |
 | certManager.enabled | bool | `false` | Create cert-manager Issuer and Certificate resources. When enabled, cert-manager owns TLS and the chart runs a JWT-only certgen hook to create the sandbox JWT signing Secret that cert-manager does not manage. |
 | certManager.serverDnsNames | list | `["openshell","openshell.openshell.svc","openshell.openshell.svc.cluster.local","localhost","openshell.localhost","*.openshell.localhost","host.docker.internal"]` | DNS SANs on the cert-manager-issued server certificate. |
 | certManager.serverIpAddresses | list | `["127.0.0.1"]` | IP SANs on the cert-manager-issued server certificate. |
+| certManager.serverIssuerRef | object | `{"group":"","kind":"","name":""}` | Override the issuerRef for the external server Certificate (e.g. a real ACME ClusterIssuer for a publicly-trusted cert on an external hostname). When set, the chart creates a second server certificate from this issuer with only the hostnames in serverDnsNames; the internal server certificate is always signed by the chart's own CA. Leave name empty to use the chart CA for all server certificates (default). Requires certManager.enabled=true. |
 | fullnameOverride | string | `""` | Override the full generated resource name. |
 | grpcRoute.enabled | bool | `false` | Create a Gateway API GRPCRoute for the gateway service. |
 | grpcRoute.gateway.className | string | `"eg"` | GatewayClass to reference. Envoy Gateway installs one named "eg". |
@@ -200,6 +201,9 @@ add `ci/values-spire.yaml` to the OpenShell release values files.
 | nameOverride | string | `"openshell"` | Override the chart name used in generated resource names. |
 | networkPolicy.enabled | bool | `true` | Create a NetworkPolicy restricting SSH ingress on sandbox pods to the gateway. |
 | nodeSelector | object | `{}` | Node selector for the gateway pod. |
+| openshiftRoute.annotations | object | `{}` | Extra annotations on the Route (e.g. haproxy.router.openshift.io/*). |
+| openshiftRoute.enabled | bool | `false` | Create an OpenShift Route with TLS passthrough. |
+| openshiftRoute.host | string | `""` | Hostname for the Route. Must match a SAN on the gateway's server cert. |
 | pkiInitJob.enabled | bool | `true` | Run a pre-install/pre-upgrade Job that creates gateway and client mTLS Secrets. When certManager.enabled=true, cert-manager owns TLS and this same hook runs in JWT-only mode even if pkiInitJob.enabled remains true. |
 | pkiInitJob.serverDnsNames | list | `[]` | Extra DNS SANs to append to the server certificate. |
 | pkiInitJob.serverIpAddresses | list | `[]` | Extra IP SANs to append to the server certificate. |
@@ -296,6 +300,13 @@ add `ci/values-spire.yaml` to the OpenShell release values files.
 | supervisor.sideloadMethod | string | `""` | How the supervisor binary is delivered into sandbox pods. Empty (default) = auto-detect from cluster version:   K8s >= v1.35 -> "image-volume" (ImageVolume enabled by default; GA in v1.36)   K8s < v1.35 -> "init-container" (copies via init container + emptyDir) On K8s v1.33-v1.34 with the ImageVolume feature gate manually enabled, set this to "image-volume" explicitly. |
 | supervisor.topology | string | `"combined"` | Supervisor pod topology for Kubernetes sandboxes. "combined" runs the current single supervisor container in the agent pod. "sidecar" runs network enforcement in a dedicated sidecar and the process supervisor as a low-capability wrapper in the agent container. |
 | tolerations | list | `[]` | Tolerations for the gateway pod. |
+| upstreamProxy | object | `{"authAllowInsecure":false,"authSecret":{"key":"","name":""},"connectByHostname":false,"noProxy":"","url":""}` | Operator-owned corporate forward proxy for policy-approved TLS egress from Kubernetes sandboxes. The workload cannot select or override it. |
+| upstreamProxy.authAllowInsecure | bool | `false` | Required when authSecret is configured because Basic auth to an HTTP proxy is cleartext. |
+| upstreamProxy.authSecret.key | string | `""` | Secret key containing the proxy credential. |
+| upstreamProxy.authSecret.name | string | `""` | Existing Secret in the sandbox namespace containing a user:pass value. |
+| upstreamProxy.connectByHostname | bool | `false` | Last-resort option for hostname-filtering proxy ACLs. It lets the proxy resolve CONNECT targets. |
+| upstreamProxy.noProxy | string | `""` | Comma-separated destinations that bypass only the corporate proxy. |
+| upstreamProxy.url | string | `""` | HTTP proxy URL in http://host:port form. HTTPS-to-proxy is not supported. |
 | workload.allowMultiReplicaStatefulSet | bool | `false` | Allow replicaCount > 1 while rendering a StatefulSet. Prefer workload.kind=deployment for external database-backed multi-replica gateways; this override exists for operators who explicitly require StatefulSet identity or storage semantics. |
 | workload.kind | string | `"statefulset"` | Gateway workload controller kind. Use `statefulset` for the default SQLite database, or `deployment` when server.externalDbSecret points at an external database. |
 

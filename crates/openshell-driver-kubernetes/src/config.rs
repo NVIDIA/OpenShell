@@ -253,6 +253,25 @@ pub struct KubernetesComputeConfig {
     pub topology: SupervisorTopology,
     /// Sidecar-only settings used when `topology = "sidecar"`.
     pub sidecar: KubernetesSidecarConfig,
+    /// Corporate HTTP forward proxy used by the network supervisor for
+    /// policy-approved TLS CONNECT egress.
+    pub https_proxy: Option<String>,
+    /// Comma-separated destinations that bypass the corporate proxy while
+    /// continuing through `OpenShell` policy evaluation.
+    pub no_proxy: Option<String>,
+    /// Name of the Kubernetes Secret holding the `user:pass` proxy credential.
+    /// The Secret is mounted only in the network-supervising container. The
+    /// driver validates this reference at startup; the supervisor validates
+    /// the Secret content when kubelet mounts it before accepting egress.
+    pub proxy_auth_secret_name: Option<String>,
+    /// Key in `proxy_auth_secret_name` containing the `user:pass` credential.
+    pub proxy_auth_secret_key: Option<String>,
+    /// Explicit acknowledgement that Basic authentication is cleartext over
+    /// the connection to an `http://` forward proxy.
+    pub proxy_auth_allow_insecure: Option<bool>,
+    /// Send hostnames rather than validated IPs in CONNECT requests. This is a
+    /// last-resort compatibility mode for hostname-filtering proxy ACLs.
+    pub proxy_connect_by_hostname: Option<bool>,
     pub grpc_endpoint: String,
     pub ssh_socket_path: String,
     pub client_tls_secret_name: String,
@@ -346,6 +365,12 @@ impl Default for KubernetesComputeConfig {
             supervisor_sideload_method: SupervisorSideloadMethod::default(),
             topology: SupervisorTopology::default(),
             sidecar: KubernetesSidecarConfig::default(),
+            https_proxy: None,
+            no_proxy: None,
+            proxy_auth_secret_name: None,
+            proxy_auth_secret_key: None,
+            proxy_auth_allow_insecure: None,
+            proxy_connect_by_hostname: None,
             grpc_endpoint: String::new(),
             ssh_socket_path: openshell_core::container_paths::SSH_SOCKET_PATH.to_string(),
             client_tls_secret_name: String::new(),
@@ -393,6 +418,101 @@ impl KubernetesComputeConfig {
 
     pub fn validate_proxy_uid(&self) -> Result<(), String> {
         self.sidecar.validate_proxy_uid()
+    }
+
+    /// Validate the operator-owned corporate upstream proxy configuration.
+    pub fn validate_upstream_proxy_config(&self) -> Result<(), String> {
+        use openshell_core::driver_utils::{UpstreamProxyUrlError, parse_upstream_proxy_url};
+
+        if let Some(url) = &self.https_proxy {
+            parse_upstream_proxy_url(url).map_err(|err| match err {
+                UpstreamProxyUrlError::Empty => "https_proxy must not be empty when set".to_string(),
+                UpstreamProxyUrlError::InlineCredentials => "https_proxy must not embed credentials in the URL; supply them through proxy_auth_secret_name and proxy_auth_secret_key".to_string(),
+                err => format!("https_proxy {err}"),
+            })?;
+        }
+
+        if let Some(list) = self.no_proxy.as_deref() {
+            if list.trim().is_empty() {
+                return Err("no_proxy must not be empty when set; omit it instead".to_string());
+            }
+            if self.https_proxy.is_none() {
+                return Err("no_proxy is set but no https_proxy is configured".to_string());
+            }
+        }
+
+        let secret_name = self.proxy_auth_secret_name.as_deref();
+        let secret_key = self.proxy_auth_secret_key.as_deref();
+        match (secret_name, secret_key) {
+            (None, None) => {
+                if self.proxy_auth_allow_insecure == Some(true) {
+                    return Err("proxy_auth_allow_insecure is set but no proxy credential Secret is configured".to_string());
+                }
+            }
+            (Some(name), Some(key)) => {
+                if name.trim().is_empty() || key.trim().is_empty() {
+                    return Err(
+                        "proxy credential Secret name and key must not be empty".to_string()
+                    );
+                }
+                if !is_dns1123_subdomain(name) {
+                    return Err(
+                        "proxy_auth_secret_name must be a valid Kubernetes DNS-1123 subdomain"
+                            .to_string(),
+                    );
+                }
+                if !key
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'))
+                {
+                    return Err(
+                        "proxy_auth_secret_key must contain only letters, digits, '.', '-', or '_'"
+                            .to_string(),
+                    );
+                }
+                // Kubernetes rejects Secret keys longer than 253 bytes and the
+                // reserved `.`/`..` names. Reject them here so an invalid
+                // deployment setting fails at gateway startup instead of
+                // surfacing as repeated Pod-provisioning failures.
+                if key.len() > 253 {
+                    return Err(
+                        "proxy_auth_secret_key must be at most 253 bytes to satisfy Kubernetes Secret key limits"
+                            .to_string(),
+                    );
+                }
+                if key == "." || key == ".." {
+                    return Err("proxy_auth_secret_key must not be '.' or '..'".to_string());
+                }
+                if self.https_proxy.is_none() {
+                    return Err(
+                        "proxy credential Secret is set but no https_proxy is configured"
+                            .to_string(),
+                    );
+                }
+                if self.proxy_auth_allow_insecure != Some(true) {
+                    return Err("proxy credentials use cleartext Basic auth over the connection to the http:// proxy; set proxy_auth_allow_insecure = true to accept that exposure, or remove the credential Secret".to_string());
+                }
+                if self.topology == SupervisorTopology::Combined {
+                    return Err(
+                        "proxy credential Secrets require topology = \"sidecar\"; combined topology shares the credential mount with the workload and fsGroup can make it readable by the sandbox user"
+                            .to_string(),
+                    );
+                }
+            }
+            _ => {
+                return Err(
+                    "proxy_auth_secret_name and proxy_auth_secret_key must be set together"
+                        .to_string(),
+                );
+            }
+        }
+
+        if self.proxy_connect_by_hostname.is_some() && self.https_proxy.is_none() {
+            return Err(
+                "proxy_connect_by_hostname is set but no https_proxy is configured".to_string(),
+            );
+        }
+        Ok(())
     }
 
     /// Resolve the sandbox UID/GID pair.
@@ -473,6 +593,20 @@ impl KubernetesComputeConfig {
         }
         Ok(())
     }
+}
+
+fn is_dns1123_subdomain(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 253
+        && value.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        })
 }
 
 fn validate_provider_spiffe_workload_api_socket_path_value(
@@ -965,5 +1099,166 @@ mod tests {
         // Both are None, should use the resolved UID.
         let uid = cfg.resolve_sandbox_uid(None);
         assert_eq!(cfg.resolve_sandbox_gid(uid, None), uid);
+    }
+
+    #[test]
+    fn upstream_proxy_config_accepts_http_proxy_without_credentials() {
+        let cfg = KubernetesComputeConfig {
+            https_proxy: Some("http://proxy.corp.example:8080".to_string()),
+            no_proxy: Some(".svc.cluster.local,10.96.0.0/12".to_string()),
+            ..KubernetesComputeConfig::default()
+        };
+        assert!(cfg.validate_upstream_proxy_config().is_ok());
+    }
+
+    #[test]
+    fn upstream_proxy_config_accepts_secret_credentials_with_acknowledgement() {
+        let cfg = KubernetesComputeConfig {
+            topology: SupervisorTopology::Sidecar,
+            https_proxy: Some("http://proxy.corp.example:8080".to_string()),
+            proxy_auth_secret_name: Some("corporate-proxy-auth".to_string()),
+            proxy_auth_secret_key: Some("credentials".to_string()),
+            proxy_auth_allow_insecure: Some(true),
+            ..KubernetesComputeConfig::default()
+        };
+        assert!(cfg.validate_upstream_proxy_config().is_ok());
+    }
+
+    #[test]
+    fn toml_deserializes_sidecar_upstream_proxy_settings() {
+        let cfg: KubernetesComputeConfig = toml::from_str(
+            r#"
+                topology = "sidecar"
+                https_proxy = "http://proxy.corp.example:8080"
+                no_proxy = ".svc.cluster.local,10.96.0.0/12"
+                proxy_auth_secret_name = "corporate-proxy-auth"
+                proxy_auth_secret_key = "credentials"
+                proxy_auth_allow_insecure = true
+                proxy_connect_by_hostname = true
+            "#,
+        )
+        .unwrap();
+        assert!(cfg.validate_upstream_proxy_config().is_ok());
+        assert_eq!(
+            cfg.https_proxy.as_deref(),
+            Some("http://proxy.corp.example:8080")
+        );
+        assert_eq!(
+            cfg.proxy_auth_secret_name.as_deref(),
+            Some("corporate-proxy-auth")
+        );
+    }
+
+    #[test]
+    fn upstream_proxy_config_rejects_incoherent_auxiliary_settings() {
+        for cfg in [
+            KubernetesComputeConfig {
+                no_proxy: Some(".svc".to_string()),
+                ..KubernetesComputeConfig::default()
+            },
+            KubernetesComputeConfig {
+                https_proxy: Some("http://proxy.corp.example:8080".to_string()),
+                proxy_auth_secret_name: Some("corporate-proxy-auth".to_string()),
+                ..KubernetesComputeConfig::default()
+            },
+            KubernetesComputeConfig {
+                https_proxy: Some("http://proxy.corp.example:8080".to_string()),
+                proxy_auth_secret_name: Some("corporate-proxy-auth".to_string()),
+                proxy_auth_secret_key: Some("credentials".to_string()),
+                ..KubernetesComputeConfig::default()
+            },
+            KubernetesComputeConfig {
+                proxy_connect_by_hostname: Some(true),
+                ..KubernetesComputeConfig::default()
+            },
+        ] {
+            assert!(cfg.validate_upstream_proxy_config().is_err());
+        }
+    }
+
+    #[test]
+    fn upstream_proxy_config_rejects_unsupported_proxy_scheme() {
+        let cfg = KubernetesComputeConfig {
+            https_proxy: Some("https://proxy.corp.example:8443".to_string()),
+            ..KubernetesComputeConfig::default()
+        };
+        let err = cfg.validate_upstream_proxy_config().unwrap_err();
+        assert!(err.contains("https_proxy"), "{err}");
+    }
+
+    #[test]
+    fn upstream_proxy_config_rejects_invalid_secret_name() {
+        let cfg = KubernetesComputeConfig {
+            https_proxy: Some("http://proxy.corp.example:8080".to_string()),
+            proxy_auth_secret_name: Some("Not_A_Secret".to_string()),
+            proxy_auth_secret_key: Some("credentials".to_string()),
+            proxy_auth_allow_insecure: Some(true),
+            ..KubernetesComputeConfig::default()
+        };
+        let err = cfg.validate_upstream_proxy_config().unwrap_err();
+        assert!(err.contains("proxy_auth_secret_name"), "{err}");
+    }
+
+    #[test]
+    fn upstream_proxy_config_rejects_invalid_secret_key() {
+        // A key that Kubernetes cannot create must fail at gateway startup
+        // instead of surfacing as repeated Pod-provisioning failures.
+        for key in [
+            "a".repeat(254), // exceeds the 253-byte Secret key limit
+            ".".to_string(),
+            "..".to_string(),
+            "bad key".to_string(), // whitespace is outside the allowed charset
+        ] {
+            let cfg = KubernetesComputeConfig {
+                topology: SupervisorTopology::Sidecar,
+                https_proxy: Some("http://proxy.corp.example:8080".to_string()),
+                proxy_auth_secret_name: Some("corporate-proxy-auth".to_string()),
+                proxy_auth_secret_key: Some(key.clone()),
+                proxy_auth_allow_insecure: Some(true),
+                ..KubernetesComputeConfig::default()
+            };
+            let err = cfg.validate_upstream_proxy_config().unwrap_err();
+            assert!(
+                err.contains("proxy_auth_secret_key"),
+                "key {key:?} should be rejected with a key-specific error: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn upstream_proxy_config_accepts_max_length_secret_key() {
+        let cfg = KubernetesComputeConfig {
+            topology: SupervisorTopology::Sidecar,
+            https_proxy: Some("http://proxy.corp.example:8080".to_string()),
+            proxy_auth_secret_name: Some("corporate-proxy-auth".to_string()),
+            proxy_auth_secret_key: Some("a".repeat(253)),
+            proxy_auth_allow_insecure: Some(true),
+            ..KubernetesComputeConfig::default()
+        };
+        assert!(cfg.validate_upstream_proxy_config().is_ok());
+    }
+
+    #[test]
+    fn upstream_proxy_config_rejects_credentials_in_combined_topology() {
+        let cfg = KubernetesComputeConfig {
+            topology: SupervisorTopology::Combined,
+            https_proxy: Some("http://proxy.corp.example:8080".to_string()),
+            proxy_auth_secret_name: Some("corporate-proxy-auth".to_string()),
+            proxy_auth_secret_key: Some("credentials".to_string()),
+            proxy_auth_allow_insecure: Some(true),
+            ..KubernetesComputeConfig::default()
+        };
+        let err = cfg.validate_upstream_proxy_config().unwrap_err();
+        assert!(err.contains("topology = \"sidecar\""), "{err}");
+    }
+
+    #[test]
+    fn upstream_proxy_config_allows_explicit_false_acknowledgement_without_credentials() {
+        let cfg = KubernetesComputeConfig {
+            https_proxy: Some("http://proxy.corp.example:8080".to_string()),
+            proxy_auth_allow_insecure: Some(false),
+            ..KubernetesComputeConfig::default()
+        };
+        assert!(cfg.validate_upstream_proxy_config().is_ok());
     }
 }

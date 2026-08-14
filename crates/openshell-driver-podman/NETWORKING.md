@@ -275,13 +275,11 @@ and rootless pasta because the driver maps both local callback aliases to that
 literal. Other rootless helpers still fail closed. Podman Machine requests
 gateway loopback because its configured address is guest-visible and gvproxy
 terminates that route on host loopback. The gateway validates and binds every
-accepted callback listener. A callback address cannot equal the exact primary
-listener address because the gateway could not distinguish their authorization
-scopes. In particular, a Podman Machine gateway using the IPv4 loopback
-callback must place its primary listener on another address, such as IPv6
-loopback (`[::1]:17670`). Negotiated callback listeners expose only the
-gateway's sandbox-callable gRPC methods. Operator, health, reflection, and HTTP
-requests must use the primary listener.
+accepted callback requirement. If the primary listener covers the requested
+address, the gateway reuses it and relies on sandbox JWT authorization to limit
+the supervisor's RPCs. Otherwise, it creates an additional listener that
+exposes only the gateway's sandbox-callable gRPC methods. Operator, health,
+reflection, and HTTP requests must use the primary listener.
 
 ### Layer 3 Inner Sandbox Network Namespace
 

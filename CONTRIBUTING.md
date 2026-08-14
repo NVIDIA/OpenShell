@@ -1,6 +1,6 @@
 # Contributing to OpenShell
 
-OpenShell is built agent-first. We design systems and use agents to implement them. Your agent is your first collaborator — point it at this repo before opening issues, asking questions, or submitting code.
+OpenShell is built agent-first. We use agents to design and implement systems, while humans manage product decisions and the project roadmap.
 
 ## The Critical Rule
 
@@ -34,30 +34,38 @@ We use a vouch system. This exists because AI makes it trivial to generate plaus
 
 Issues labeled [`good first issue`](https://github.com/NVIDIA/OpenShell/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22) are scoped, well-documented, and friendly to new contributors. Start there. If you need guidance, comment on the issue.
 
-An open issue is not necessarily accepted or ready to be worked on. Human contributors should look for `state:accepted`, `good first issue`, or `help wanted`, or ask a maintainer before starting. Unattended agents additionally require the appropriate human-applied `agent:*` request label; an agent directly asked to work on a specific issue does not. Roadmap placement describes sequencing and does not authorize work.
+An open issue is not necessarily accepted or ready to be worked on. Human contributors should look for `state:accepted`, roadmap placement, `good first issue`, or `help wanted`, or ask a maintainer before starting. Unattended agents additionally require the appropriate human-applied `agent:*` request label; an agent directly asked to work on a specific issue does not.
 
 ## Before You Open an Issue
 
-This project ships with [agent skills](#agent-skills-for-contributors) that can diagnose problems, explore the codebase, generate policies, and walk you through common workflows. Before filing an issue:
+Search open and closed issues for the same need. Bug reports and feature requests must include:
 
-1. Clone the repo and point your coding agent at it.
-2. Load the relevant skill - `debug-openshell-cluster` for gateway or deployment problems, `debug-inference` for inference setup problems, `openshell-cli` for usage questions, `generate-sandbox-policy` for policy help.
-3. Have your agent investigate. Let it run diagnostics, read the architecture docs, and attempt a fix.
-4. If the agent cannot resolve it, open an issue **with the agent's diagnostic output attached**. The issue template requires this.
+1. **User Story:** who needs the change and what they need to do.
+2. **Problem Statement:** a concise summary of what is broken or missing in the current behavior.
+3. **Impact / Why This Matters:** the consequences of the current behavior, the current workaround, and why that workaround is insufficient.
+4. **Acceptance Criteria:** specific, observable outcomes that define success.
+
+Feature requests must also propose a user-facing workflow and describe alternatives considered. Define the externally observable behavior and leave internal implementation choices open. Bug reports instead include minimal reproduction steps, the OpenShell version and relevant environment, and a small, redacted log excerpt when it materially clarifies the behavior.
+
+The project includes optional [agent skills](#agent-skills-for-contributors) for self-service troubleshooting and exploration. Use them when they help you, but summarize any useful result in your own words rather than pasting a diagnostic transcript.
 
 ### When to Open an Issue
 
-- A real bug that your agent confirmed and could not fix.
-- A feature proposal with a design — not a "please build this" request.
-- An infrastructure problem that the gateway deployment troubleshooting skill could not resolve.
-- An inference setup problem that the `debug-inference` skill could not resolve.
+- A workflow behaves differently from what you need or reasonably expect.
+- OpenShell does not support an outcome that matters to your workflow.
+- The available documentation or configuration does not explain how to complete a supported workflow.
 - Security vulnerabilities must follow [SECURITY.md](SECURITY.md) — **not** GitHub issues.
 
 ### When NOT to Open an Issue
 
-- Questions about how things work — your agent can answer these from the codebase and architecture docs.
-- Configuration problems - your agent can diagnose these with `openshell-cli`, `debug-openshell-cluster`, and `debug-inference`.
-- "How do I..." requests — the skills cover CLI usage, policy generation, TUI development, and more.
+- General questions or open-ended discussion — use [GitHub Discussions](https://github.com/NVIDIA/OpenShell/discussions).
+- Security vulnerabilities — follow [SECURITY.md](SECURITY.md) instead.
+
+## Before You Submit a Change
+
+Do not start substantial issue-backed work until a maintainer has accepted the issue, unless a maintainer directly asks you to investigate or implement it. Once the work is authorized, use your agent to investigate the current code and behavior. If the issue contains earlier diagnostics, verify them rather than relying on them.
+
+Use agents and the repository skills as needed to understand the affected code, evaluate tradeoffs, implement the smallest coherent change, and verify it. The pull request should explain what changed and how it was tested; it should not substitute an agent transcript for the contributor's understanding.
 
 ## Agent Skills for Contributors
 
@@ -111,11 +119,11 @@ Each issue can require four independent decisions:
 | Decision | Question | Recorded by |
 |---|---|---|
 | Assessment | Is the report technically valid, and is there enough evidence to act on it? | `state:*` |
-| Disposition | Should OpenShell pursue the work? | `state:accepted` or closure as not planned |
+| Disposition | Should OpenShell pursue the work? | `state:accepted`, roadmap placement, or closure as not planned |
 | Sequencing | Where does accepted work sit relative to everything else? | Placement on the [OpenShell Roadmap](https://github.com/orgs/NVIDIA/projects/233) |
 | Ownership | Will a human implement the issue, will a user directly instruct an agent, or will a maintainer queue it for an unattended agent? | Direct instruction or optional `agent:*` workflow |
 
-Completing one decision does not imply the others. `state:validated` confirms that the factual assessment is complete, but it does not mean the project has accepted the work. Roadmap placement communicates sequencing, but it does not authorize an agent to begin.
+`state:validated` confirms that the factual assessment is complete, but it does not mean the project has accepted the work. A maintainer signals acceptance with `state:accepted` or roadmap placement. Roadmap placement also communicates sequencing, but it does not assign an owner or queue an unattended agent.
 
 #### Who Controls Each Decision
 
@@ -126,7 +134,7 @@ Agents investigate issues, collect evidence, and report technical findings. Huma
 | Assess technical validity and impact | Triage agent or human triager |
 | Request missing evidence | Triage agent or human triager |
 | Mark the assessment complete with `state:validated` | Triage agent or human triager |
-| Accept or decline the work | Maintainer |
+| Accept or decline the work with `state:accepted`, roadmap placement, or closure | Maintainer |
 | Place the issue on the roadmap or move it | Maintainer |
 | Directly request an agent plan | User |
 | Queue an agent plan with `agent:plan-requested` | Maintainer |
@@ -153,7 +161,7 @@ Keep one of these states on an open issue. When new evidence resolves a `state:n
 
 #### Assessing an Incoming Issue
 
-Triage checks the report, its diagnostic evidence, related issues, current releases, and the relevant code paths. The assessment ends in one of these outcomes:
+Triage checks the user story, reproduction or workflow, environment, related issues, current releases, and the relevant code paths. The assessment ends in one of these outcomes:
 
 | Outcome | State or resolution |
 |---|---|
@@ -172,17 +180,17 @@ Triage establishes facts and impact. It does not decide whether the project shou
 
 When an issue reaches `state:validated`, a maintainer chooses one of three paths:
 
-- **Accept:** replace `state:validated` with `state:accepted` and place it on the roadmap.
+- **Accept:** apply `state:accepted`, place the issue on the roadmap, or do both. Either action signals that OpenShell should pursue the work; roadmap placement additionally records sequencing.
 - **Decline:** close it as not planned and record the rationale.
 - **Await more evidence:** replace `state:validated` with `state:needs-info` and leave it off the roadmap.
 
-Do not use `state:accepted` as shorthand for technical validity, roadmap sequencing, or agent authorization. It records only the human decision that OpenShell should pursue the work.
+Do not use `state:accepted` as shorthand for technical validity, roadmap sequencing, or agent authorization. It records the human decision that OpenShell should pursue the work. Roadmap placement records the same acceptance decision plus sequencing.
 
 #### Roadmap
 
-OpenShell does not use priority labels. Sequencing comes from the [OpenShell Roadmap](https://github.com/orgs/NVIDIA/projects/233): a maintainer associates an accepted issue with a roadmap item, and the roadmap item's own timing carries the urgency. Issues tracked on the roadmap carry the `roadmap` label.
+OpenShell does not use priority labels. Sequencing comes from the [OpenShell Roadmap](https://github.com/orgs/NVIDIA/projects/233): a maintainer associates an issue with a roadmap item, signaling acceptance and giving it timing. Issues tracked on the roadmap carry the `roadmap` label.
 
-An accepted issue with no roadmap association is real work the project intends to do, but it is not scheduled. Ask a maintainer before starting on one.
+An issue with `state:accepted` and no roadmap association is real work the project intends to do, but it is not scheduled. Ask a maintainer before starting on one.
 
 Roadmap placement does not assign an owner. A roadmap issue still needs a human contributor, a direct user instruction to an agent, or an unattended-agent queue label.
 
@@ -205,7 +213,7 @@ Maintainers use the `agent:*` workflow to queue work for always-on or unattended
 The normal delegated workflow is:
 
 ```text
-state:accepted
+(state:accepted OR roadmap placement)
   |
   +-- agent:plan-requested
         |
@@ -248,12 +256,12 @@ A user may instead directly request review or remediation from the specialized s
 
 | You are | Ready when |
 |---|---|
-| A human contributor | The issue has `state:accepted`, invites contribution or has maintainer confirmation, and has no conflicting owner or implementation. |
-| An unattended agent scanning for planning work | The issue has `state:accepted` and the human-applied `agent:plan-requested` label. |
-| An unattended agent scanning for implementation work | The issue has `state:accepted`, an approved plan, and the human-applied `agent:implementation-requested` label. |
-| An agent directly instructed by a user | The issue has `state:accepted`, no conflicting owner or implementation, and the instruction explicitly requests the phase the agent will perform. |
+| A human contributor | The issue has `state:accepted`, roadmap placement, an invitation to contribute, or maintainer confirmation, and has no conflicting owner or implementation. |
+| An unattended agent scanning for planning work | The issue has `state:accepted` or roadmap placement, plus the human-applied `agent:plan-requested` label. |
+| An unattended agent scanning for implementation work | The issue has `state:accepted` or roadmap placement, plus an approved plan and the human-applied `agent:implementation-requested` label. |
+| An agent directly instructed by a user | The issue has `state:accepted` or roadmap placement, no conflicting owner or implementation, and the instruction explicitly requests the phase the agent will perform. |
 
-Issues with `state:triage-needed`, `state:needs-info`, or `state:validated` are not ready for implementation. Roadmap placement alone never makes an issue ready.
+Issues with `state:triage-needed`, `state:needs-info`, or `state:validated` are not ready for implementation unless a maintainer has separately placed them on the roadmap. Either `state:accepted` or roadmap placement records the required human acceptance decision.
 
 #### Stale Issues
 

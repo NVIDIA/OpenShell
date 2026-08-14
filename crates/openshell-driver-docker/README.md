@@ -67,8 +67,10 @@ Docker containers join an OpenShell-managed bridge network. The driver injects
 `host.openshell.internal` and `host.docker.internal` so supervisors have stable
 names for reaching the gateway host. On Docker Desktop, Colima, Rancher
 Desktop, OrbStack, and macOS-hosted gateways, those names use Docker's
-`host-gateway` alias. On native Linux Docker, the gateway also binds the bridge
-gateway IP so containers can call back to the host process.
+`host-gateway` alias. The driver requests a separate IPv4 loopback callback
+listener when the primary listener does not already cover it. On native Linux
+Docker, the gateway also binds the bridge gateway IP so containers can call
+back to the host process.
 
 ## Container Contract
 

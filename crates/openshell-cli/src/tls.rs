@@ -22,6 +22,7 @@ use tokio::sync::Mutex;
 use tonic::service::interceptor::InterceptedService;
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
 use tracing::debug;
+use url::{Host, Url};
 
 /// Concrete gRPC client type used by all commands.
 pub type GrpcClient = OpenShellClient<InterceptedService<Channel, EdgeAuthInterceptor>>;
@@ -223,12 +224,33 @@ pub fn build_rustls_config(materials: &TlsMaterials) -> Result<rustls::ClientCon
         .into_diagnostic()
 }
 
-pub fn build_tonic_tls_config(materials: &TlsMaterials) -> ClientTlsConfig {
+pub fn build_tonic_tls_config(server: &str, materials: &TlsMaterials) -> Result<ClientTlsConfig> {
     let ca_cert = Certificate::from_pem(materials.ca.clone());
     let identity = Identity::from_pem(materials.cert.clone(), materials.key.clone());
-    ClientTlsConfig::new()
-        .ca_certificate(ca_cert)
-        .identity(identity)
+    tls_config_with_server_name(
+        server,
+        ClientTlsConfig::new()
+            .ca_certificate(ca_cert)
+            .identity(identity),
+    )
+}
+
+fn tls_config_with_server_name(server: &str, config: ClientTlsConfig) -> Result<ClientTlsConfig> {
+    Ok(config.domain_name(tls_server_name(server)?))
+}
+
+fn tls_server_name(server: &str) -> Result<String> {
+    let endpoint = Url::parse(server)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("invalid gateway endpoint '{server}'"))?;
+    let host = endpoint
+        .host()
+        .ok_or_else(|| miette::miette!("gateway endpoint '{server}' has no host"))?;
+    Ok(match host {
+        Host::Domain(domain) => domain.to_string(),
+        Host::Ipv4(address) => address.to_string(),
+        Host::Ipv6(address) => address.to_string(),
+    })
 }
 
 #[derive(Debug)]
@@ -402,22 +424,20 @@ pub async fn build_channel(server: &str, tls: &TlsOptions) -> Result<Channel> {
         // Bearer auth over HTTPS: use mTLS certs for the transport layer when
         // available (server may still require client certs), and layer the
         // Bearer token on top via the interceptor.
-        require_tls_materials(server, tls).map_or_else(
-            |_| {
-                let resolved = tls.with_default_paths(server);
-                resolved
-                    .ca
-                    .as_ref()
-                    .and_then(|ca_path| std::fs::read(ca_path).ok())
-                    .map_or_else(
-                        || ClientTlsConfig::new().with_enabled_roots(),
-                        |ca_pem| {
-                            ClientTlsConfig::new().ca_certificate(Certificate::from_pem(ca_pem))
-                        },
-                    )
-            },
-            |materials| build_tonic_tls_config(&materials),
-        )
+        if let Ok(materials) = require_tls_materials(server, tls) {
+            build_tonic_tls_config(server, &materials)?
+        } else {
+            let resolved = tls.with_default_paths(server);
+            let config = resolved
+                .ca
+                .as_ref()
+                .and_then(|ca_path| std::fs::read(ca_path).ok())
+                .map_or_else(
+                    || ClientTlsConfig::new().with_enabled_roots(),
+                    |ca_pem| ClientTlsConfig::new().ca_certificate(Certificate::from_pem(ca_pem)),
+                );
+            tls_config_with_server_name(server, config)?
+        }
     } else if tls.edge_token.is_some() {
         // Edge bearer mode — routed through tunnel above; if we reach here
         // the server is not HTTPS so connect plaintext.
@@ -425,7 +445,7 @@ pub async fn build_channel(server: &str, tls: &TlsOptions) -> Result<Channel> {
     } else {
         // Standard mTLS: private CA + client cert.
         let materials = require_tls_materials(server, tls)?;
-        build_tonic_tls_config(&materials)
+        build_tonic_tls_config(server, &materials)?
     };
     endpoint = endpoint.tls_config(tls_config).into_diagnostic()?;
     endpoint.connect().await.into_diagnostic()
@@ -450,4 +470,26 @@ pub async fn grpc_inference_client(server: &str, tls: &TlsOptions) -> Result<Grp
     let channel = build_channel(server, tls).await?;
     let interceptor = interceptor_from_tls(tls)?;
     Ok(InferenceClient::with_interceptor(channel, interceptor))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::tls_server_name;
+
+    #[test]
+    fn tls_server_name_normalizes_bracketed_ipv6_endpoint() {
+        assert_eq!(
+            tls_server_name("https://[::1]:17670").unwrap(),
+            "::1",
+            "rustls accepts an unbracketed IPv6 address as an IP server name"
+        );
+    }
+
+    #[test]
+    fn tls_server_name_preserves_dns_endpoint() {
+        assert_eq!(
+            tls_server_name("https://localhost:17670").unwrap(),
+            "localhost"
+        );
+    }
 }

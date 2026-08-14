@@ -224,7 +224,7 @@ Your agent can load skills for CLI usage (`openshell-cli`), gateway troubleshoot
 
 OpenShell is developed using the same agent-driven workflows it enables. The `.agents/skills/` directory contains workflow automation that powers the project's development cycle:
 
-- **Spike and build:** Investigate a problem with `create-spike`; a human accepts or declines it and separately places it on the [roadmap](https://github.com/orgs/NVIDIA/projects/233). Accepted work can remain human-owned or enter the optional, human-gated `agent:*` planning and implementation workflow.
+- **Spike and build:** Investigate a problem with `create-spike`; a human accepts it with `state:accepted` or [roadmap](https://github.com/orgs/NVIDIA/projects/233) placement, or declines it. Accepted work can remain human-owned or enter the optional, human-gated `agent:*` planning and implementation workflow.
 - **Triage and route:** Community issues are assessed with `triage-issue`. Agents establish technical validity and impact; humans decide whether the project should act and where the work sits on the roadmap.
 - **Security review:** `review-security-issue` produces a severity assessment and remediation plan. `fix-security-issue` implements it.
 - **Policy authoring:** `generate-sandbox-policy` creates YAML policies from plain-language requirements or API documentation.
@@ -252,7 +252,7 @@ All agent implementation work is human-gated: maintainers explicitly request a p
 
 ## Contributing
 
-OpenShell is built agent-first — your agent is your first collaborator. Before opening issues or submitting code, point your agent at the repo and let it use the skills in `.agents/skills/` to investigate, diagnose, and prototype. See [CONTRIBUTING.md](CONTRIBUTING.md) for the full agent skills table, contribution workflow, and development setup.
+OpenShell is built agent-first. Issues should include a user story, problem statement, impact, and acceptance criteria. The impact should explain the consequences of the current behavior and why existing workarounds are insufficient. Feature requests also require a workflow-level proposed design and alternatives; bug reports add reproduction steps, environment details, and relevant logs. Once maintainers accept work, contributors should use the skills in `.agents/skills/` to investigate the current code and behavior, implement the change, and verify it. If an issue contains earlier diagnostics, verify them rather than relying on them. See [CONTRIBUTING.md](CONTRIBUTING.md) for the full agent skills table, contribution workflow, and development setup.
 
 ## Telemetry
 

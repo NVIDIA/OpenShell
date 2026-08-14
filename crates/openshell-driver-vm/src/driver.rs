@@ -4447,6 +4447,11 @@ fn build_guest_environment(
     );
     environment.remove(openshell_core::sandbox_env::SANDBOX_TOKEN);
     environment.remove(openshell_core::sandbox_env::SANDBOX_TOKEN_FILE);
+    // Prevent user-supplied environment from overriding the TLS server name
+    // the supervisor verifies — a sandbox user who can redirect the gateway
+    // hostname could otherwise present a certificate for a name they control
+    // and intercept the sandbox JWT.
+    environment.remove(openshell_core::sandbox_env::GATEWAY_TLS_SERVER_NAME);
     if sandbox
         .spec
         .as_ref()
@@ -6959,6 +6964,36 @@ mod tests {
             "{}={GUEST_SANDBOX_TOKEN_PATH}",
             openshell_core::sandbox_env::SANDBOX_TOKEN_FILE
         )));
+    }
+
+    #[test]
+    fn build_guest_environment_strips_gateway_tls_server_name() {
+        let config = VmDriverConfig {
+            openshell_endpoint: "http://127.0.0.1:8080".to_string(),
+            ..Default::default()
+        };
+        let sandbox = Sandbox {
+            id: "sandbox-123".to_string(),
+            name: "sandbox-123".to_string(),
+            spec: Some(SandboxSpec {
+                environment: HashMap::from([(
+                    openshell_core::sandbox_env::GATEWAY_TLS_SERVER_NAME.to_string(),
+                    "evil.attacker.example.com".to_string(),
+                )]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let env = build_guest_environment(&sandbox, &config, None);
+
+        assert!(
+            !env.iter().any(|v| v.starts_with(&format!(
+                "{}=",
+                openshell_core::sandbox_env::GATEWAY_TLS_SERVER_NAME
+            ))),
+            "GATEWAY_TLS_SERVER_NAME must be stripped from the guest environment"
+        );
     }
 
     #[test]

@@ -178,6 +178,13 @@ Common findings:
 - A workdir rejected as a special filesystem or OpenShell control-path collision cannot be made valid with permissions. Move the image workdir away from kernel-backed mounts and the concrete supervisor, TLS, token, runtime, and socket paths named in the error.
 - Docker driver cannot initialize because it cannot find `openshell-sandbox`: verify `OPENSHELL_DOCKER_SUPERVISOR_BIN`, the sibling binary next to `openshell-gateway`, or the configured supervisor image contains `/openshell-sandbox`.
 - Sandbox never registers: check gateway logs and supervisor callback endpoint.
+- On macOS, repeated `Policy fetch failed after 5 attempts` messages with a
+  Homebrew gateway bound to `[::1]:17670` indicate that the Docker
+  `host-gateway` IPv4 route has no matching callback listener. Current releases
+  leave `bind_address` unset in the Homebrew config, use the built-in
+  `127.0.0.1:17670` primary listener, and reuse it for authenticated sandbox
+  callbacks. On an older release, set `bind_address = "127.0.0.1:17670"` or
+  upgrade.
 - Supervisor image exits before printing `openshell-sandbox --version`: the image should be the scratch supervisor image from `deploy/docker/Dockerfile.supervisor` and must contain a static executable at `/openshell-sandbox`.
 - `mise run e2e:docker:gpu` fails with `docker info --format json did not report any discovered NVIDIA CDI GPU devices`: Docker may report `CDISpecDirs` while still having no generated NVIDIA CDI specs. Verify `.DiscoveredDevices` contains entries such as `nvidia.com/gpu=all`, verify `/etc/cdi` or `/var/run/cdi` contains a generated NVIDIA spec, and check that `nvidia-cdi-refresh.service` and `nvidia-cdi-refresh.path` from NVIDIA Container Toolkit are enabled and healthy. The service is a one-shot unit, so `inactive (dead)` can be normal after a successful run; use `systemctl status` and `journalctl` to distinguish success from a skipped or failed refresh. NVIDIA recommends enabling the path and service units, and restarting `nvidia-cdi-refresh.service` to regenerate missing or stale CDI specs. If specs are generated but Docker still reports no discovered devices, restart Docker or reload the daemon and re-check `docker info`.
 
@@ -207,14 +214,9 @@ Common findings:
   error: inspect `podman info --debug`, the configured Podman network, and the
   host's IPv4 default route. Rootless pasta uses the private source address
   selected by that route; rootful Podman uses the bridge gateway address.
-- Callback discovery reports that the requested address equals the primary
-  listener: configure a distinct primary address. For Podman Machine, bind the
-  primary listener to IPv6 loopback, for example
-  `bind_address = "[::1]:17670"`, and register the CLI endpoint as
-  `https://localhost:17670`. The generated certificate includes `localhost`,
-  while a raw `https://[::1]:17670` endpoint can fail TLS setup with
-  `invalid dns name`. This leaves `127.0.0.1:17670` available for the
-  callback-only listener.
+- Current gateways reuse the primary listener when it covers Podman's callback
+  address. If the primary does not cover that address, inspect the gateway
+  startup logs for the additional callback-only listener and its provenance.
 - Rootless slirp4netns, another named helper, or missing helper metadata
   requires an explicitly remote `grpc_endpoint`. An explicit `host_gateway_ip`
   cannot bypass slirp4netns host-loopback isolation. Do not work around
@@ -318,6 +320,52 @@ If the gateway exits with `failed to read sandbox JWT signing key from
 `signing.pem`, `public.pem`, and `kid`, and that the gateway workload mounts the
 `sandbox-jwt` secret at `/etc/openshell-jwt`. The sandbox JWT mount is required
 even when local Helm values disable TLS.
+
+If `certManager.serverIssuerRef` points the server certificate at an external
+Issuer or ClusterIssuer (for example an ACME issuer, for a publicly-trusted
+cert on an OpenShift `Route` with TLS passthrough — see
+`openshiftRoute.enabled`), the chart creates **two** server certificates: an
+internal one (chart CA, internal SANs) and an external one (from the configured
+issuer, external SANs only).  The gateway uses SNI to present the right cert.
+
+Check the external `Certificate`/`CertificateRequest`/`Challenge` resources
+directly when the external secret never becomes Ready:
+
+```bash
+kubectl -n openshell get certificate,certificaterequest,challenge
+kubectl -n openshell describe certificate openshell-server-external
+oc -n openshell get route
+```
+
+ACME issuers reject certificate requests that include internal-only names
+(`*.svc.cluster.local`, `localhost`, loopback IPs) and require the
+`commonName` to also be a SAN — the external `Certificate` only requests the
+hostnames in `certManager.serverDnsNames`, for exactly this reason.
+
+If sandbox supervisors fail their TLS handshake to the gateway with
+`UnknownCA` after configuring `serverIssuerRef`, the most likely cause is
+`server.grpcEndpoint` set to the external hostname.  This forces supervisors
+to connect via the external hostname, receiving the ACME cert (via SNI) which
+they cannot verify against the chart CA.  Remove `server.grpcEndpoint` or set
+it to the internal service name so supervisors receive the internal cert:
+
+```bash
+helm -n openshell get values openshell | grep -E 'grpcEndpoint|clientCaFromServerTlsSecret|clientCaSecretName|serverIssuerRef|caSecretName'
+# server.grpcEndpoint should be unset or point to internal service name
+```
+
+Less commonly, `UnknownCA` can occur if the gateway's client-verification CA
+is misconfigured.  The default `clientCaFromServerTlsSecret=true` is correct
+for all configurations — the internal server certificate is always signed by
+the chart CA (the same CA that signs the client cert), so its `ca.crt` is
+the right trust anchor.  Only override this if you intentionally mount a
+separate client CA via `server.tls.clientCaSecretName`.  Verify the mounted
+client CA matches the CA that signed the client certificate:
+
+```bash
+kubectl -n openshell get statefulset openshell -o jsonpath='{.spec.template.spec.volumes[?(@.name=="tls-client-ca")]}' | jq .
+# Should show items filter for ca.crt from openshell-server-tls
+```
 
 If `server.providerTokenGrants.spiffe.enabled=true`, the gateway should still
 render `[openshell.gateway.gateway_jwt]` and mount the `sandbox-jwt` Secret.
@@ -460,6 +508,56 @@ kubectl -n <sandbox-namespace> logs <sandbox-pod> -c openshell-supervisor-networ
 kubectl -n <sandbox-namespace> logs <sandbox-pod> -c agent --tail=200
 ```
 
+#### Corporate upstream proxy
+
+When the deployment routes sandbox egress through a corporate HTTP forward
+proxy, the operator-owned settings render under `[openshell.drivers.kubernetes]`
+from the Helm `upstreamProxy` values. Absent proxy configuration preserves
+direct-dial egress; any present-but-invalid value fails closed at gateway
+startup (`validate_upstream_proxy_config`) rather than silently reverting to a
+direct connection. Confirm the rendered configuration first:
+
+```bash
+kubectl -n openshell get configmap openshell-config -o jsonpath='{.data.gateway\.toml}' | grep -E 'https_proxy|no_proxy|proxy_auth_secret_(name|key)|proxy_auth_allow_insecure|proxy_connect_by_hostname'
+helm -n openshell get values openshell | grep -A8 upstreamProxy
+```
+
+Only `http://host:port` forward proxies are supported; `https://` proxy URLs and
+plain-HTTP egress are out of scope and rejected. Proxy credentials require
+`topology = "sidecar"` — combined topology shares the credential mount with the
+workload, so the gateway rejects credentials there. The credential Secret named
+by `proxy_auth_secret_name` must exist in the sandbox namespace with the key
+named by `proxy_auth_secret_key`, and Kubernetes will not create keys longer
+than 253 bytes or named `.`/`..`.
+
+The proxy arguments and credential mount are injected only into the container
+that runs network supervision (the `agent` container in combined topology, the
+`openshell-supervisor-network` sidecar in sidecar topology). The one-shot
+`openshell-network-init` container and the process `agent` container in sidecar
+topology must never receive them. The credential is projected read-only as the
+`openshell-upstream-proxy-auth` volume at `/run/openshell/upstream-proxy-auth`
+and passed as `--upstream-proxy-auth-file`; it must never appear in env,
+annotations, or command arguments.
+
+```bash
+kubectl -n <sandbox-namespace> get secret <proxy-auth-secret> -o jsonpath='{.data}' >/dev/null && echo "secret present"
+kubectl -n <sandbox-namespace> get pod <sandbox-pod> -o jsonpath='{range .spec.containers[*]}{.name}{" "}{.command}{"\n"}{end}' | grep -- '--upstream-'
+kubectl -n <sandbox-namespace> get pod <sandbox-pod> -o jsonpath='{range .spec.containers[*]}{.name}{": "}{range .volumeMounts[*]}{.name}{" "}{end}{"\n"}{end}' | grep upstream-proxy-auth
+kubectl -n <sandbox-namespace> get events --sort-by=.lastTimestamp | grep -Ei 'secret|MountVolume' | tail -n 20
+```
+
+A missing Secret or wrong key leaves the pod stuck with a
+`MountVolume.SetUp failed` / `secret ... not found` event. If the pod starts but
+egress still fails, the corporate proxy itself is the next suspect: policy-
+approved TLS CONNECT requests that time out after policy evaluation usually mean
+the proxy URL is unreachable from the sandbox namespace, or a cluster-internal
+destination that should be direct is missing from `no_proxy`. Inspect the
+network supervisor logs for CONNECT and upstream-proxy decisions:
+
+```bash
+kubectl -n <sandbox-namespace> logs <sandbox-pod> -c openshell-supervisor-network --tail=200 | grep -Ei 'upstream|connect|proxy'
+```
+
 ### Step 7: Check VM-Backed Gateways
 
 Use the VM driver logs and host diagnostics available in the user's environment. Verify:
@@ -483,7 +581,7 @@ openshell logs <sandbox-name>
 | `openshell status` fails | Gateway endpoint unreachable or auth mismatch | `openshell gateway info`, gateway logs |
 | Gateway starts but sandbox create fails | Compute driver cannot reach runtime | Docker/Podman/Kubernetes/VM driver logs |
 | Gateway exits while resolving compute-driver listener requirements | Callback alias topology is unsupported, the Podman network cannot be inspected, or the selected address is not private/authorized | Gateway startup error, `podman info --debug`, Podman network inspection, host IPv4 default route |
-| Admin, health, reflection, or HTTP request is denied on a Docker/Podman callback address | Negotiated callback listeners intentionally expose only sandbox-callable gRPC methods | Retry through the gateway's primary endpoint; inspect the listener-purpose startup log if the address was unexpected |
+| Admin, health, reflection, or HTTP request is denied on an additional Docker/Podman callback-only listener | Additional callback listeners intentionally expose only sandbox-callable gRPC methods | Retry through the gateway's primary endpoint; inspect the listener-purpose startup log if the address was unexpected |
 | Docker or Podman sandbox never registers | Wrong callback endpoint or supervisor startup failure | Gateway logs and sandbox container logs |
 | Docker GPU e2e fails before GPU sandbox comparison | NVIDIA CDI specs are missing or Docker has not discovered them | `docker info --format '{{json .DiscoveredDevices}}'`, `/etc/cdi`, `/var/run/cdi`, `nvidia-cdi-refresh.service` |
 | Kubernetes gateway pod pending | PVC unbound, taint, selector, or insufficient resources | `kubectl -n openshell describe pod <pod>` |
@@ -504,6 +602,8 @@ openshell logs <sandbox-name>
 | `K8s namespace not ready` with `envoy-gateway-openshell.yaml: the server could not find the requested resource` | Optional Gateway API manifest was applied without Envoy Gateway CRDs, or k3s Helm controller startup exceeded the namespace wait | Apply `deploy/kube/manifests/envoy-gateway-openshell.yaml` manually only after Envoy Gateway is installed and `grpcRoute` is enabled |
 | HTTPS ingress (`grpcRoute.gateway.listener.protocol=HTTPS`) connection resets or TLS handshake hangs | Envoy terminates TLS but the gateway pod still expects TLS, so the plaintext backend hop fails | Set `server.disableTls=true` so Envoy forwards plaintext to the pod; verify the listener `certificateRefs` Secret exists in the release namespace and `openshell status` over `https://<host>` |
 | HTTPS ingress returns `Unauthenticated` after connecting | TLS terminates at Envoy, so the gateway never sees a client cert; no OIDC issuer is configured for identity | Configure `server.oidc.issuer` and register with `openshell gateway add https://<host> --oidc-issuer <url>`, or set `server.auth.allowUnauthenticatedUsers=true` for a trusted-proxy/dev cluster |
+| External server `Certificate` never becomes Ready with `certManager.serverIssuerRef` set | ACME issuer rejected internal-only SANs, a loopback IP, or a `commonName` absent from the SANs | `kubectl -n openshell describe certificate openshell-server-external`; confirm `certManager.serverDnsNames` lists only real, externally-resolvable hostnames |
+| Sandbox supervisors fail TLS handshake with `UnknownCA` after configuring `certManager.serverIssuerRef` | `server.grpcEndpoint` is set to the external hostname, forcing supervisors to receive the ACME cert (via SNI) which they can't verify against chart CA | Remove `server.grpcEndpoint` or set it to the internal service name; supervisors should connect via internal service name to receive the internal cert |
 
 ## Reporting
 

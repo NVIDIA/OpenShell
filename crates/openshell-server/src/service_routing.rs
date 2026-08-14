@@ -855,6 +855,9 @@ mod tests {
             key_path: "server.key".into(),
             client_ca_path: Some("ca.crt".into()),
             require_client_auth: false,
+            external_cert_path: None,
+            external_key_path: None,
+            external_server_names: Vec::new(),
         }
     }
 
