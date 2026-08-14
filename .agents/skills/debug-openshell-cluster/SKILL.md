@@ -260,6 +260,18 @@ kubectl -n openshell get deployment,service,pod -l app.kubernetes.io/name=opensh
 kubectl -n openshell logs deployment/openshell-e2e-postgres --tail=200
 ```
 
+Multi-replica gateways serialize cross-object sandbox and provider mutations
+with a PostgreSQL advisory lock. If those RPCs stall while ordinary reads and
+health checks remain responsive, inspect long-running database sessions and
+advisory-lock waiters. Do not print the database URI or Secret contents into
+logs:
+
+```sql
+SELECT pid, granted, waitstart
+FROM pg_locks
+WHERE locktype = 'advisory';
+```
+
 For multi-replica gateway installs, supervisor and client session traffic may
 be served by a non-owner gateway replica and relayed to the current supervisor
 owner over the internal `PeerRelay` RPC. Check the headless peer Service,

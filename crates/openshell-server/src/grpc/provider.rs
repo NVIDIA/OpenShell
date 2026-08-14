@@ -2256,7 +2256,10 @@ pub(super) async fn handle_import_provider_profiles(
     .ensure_active()?;
     let (profiles, mut diagnostics) = profiles_from_import_items(&request.profiles);
     add_empty_profile_set_diagnostic(&profiles, &mut diagnostics);
-    let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await;
+    let _sandbox_sync_guard =
+        state.compute.sandbox_sync_guard().await.map_err(|err| {
+            super::persistence_error_to_status(err, "acquire provider mutation lock")
+        })?;
     let catalog = state
         .provider_profile_sources
         .snapshot_catalog(state.store.as_ref(), &workspace)
@@ -2346,7 +2349,10 @@ pub(super) async fn handle_update_provider_profiles(
     let (profiles, mut diagnostics) = profiles_from_import_items(&items);
     add_empty_profile_set_diagnostic(&profiles, &mut diagnostics);
     let target_id = normalize_profile_id_request(&request.id)?;
-    let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await;
+    let _sandbox_sync_guard =
+        state.compute.sandbox_sync_guard().await.map_err(|err| {
+            super::persistence_error_to_status(err, "acquire provider mutation lock")
+        })?;
     let catalog = state
         .provider_profile_sources
         .snapshot_catalog(state.store.as_ref(), &workspace)
@@ -2505,7 +2511,10 @@ pub(super) async fn handle_delete_provider_profile(
     .name;
     let id = req.id;
     let id = normalize_profile_id_request(&id)?;
-    let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await;
+    let _sandbox_sync_guard =
+        state.compute.sandbox_sync_guard().await.map_err(|err| {
+            super::persistence_error_to_status(err, "acquire provider mutation lock")
+        })?;
     let catalog = state
         .provider_profile_sources
         .snapshot_catalog(state.store.as_ref(), &workspace)
@@ -3471,7 +3480,10 @@ pub(super) async fn handle_configure_provider_refresh(
     // configures of providers attached to the same sandbox could each pass
     // validation before either persisted and both reserve the same key (CWE-362).
     // This is the same guard sandbox create/attach and profile changes take.
-    let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await;
+    let _sandbox_sync_guard =
+        state.compute.sandbox_sync_guard().await.map_err(|err| {
+            super::persistence_error_to_status(err, "acquire provider mutation lock")
+        })?;
 
     let provider = state
         .store
@@ -4202,7 +4214,7 @@ mod tests {
     #[tokio::test]
     async fn import_provider_profile_waits_for_sandbox_sync_guard() {
         let state = test_server_state().await;
-        let guard = state.compute.sandbox_sync_guard().await;
+        let guard = state.compute.sandbox_sync_guard().await.unwrap();
         let task_state = state.clone();
         let task = tokio::spawn(async move {
             handle_import_provider_profiles(
@@ -6496,7 +6508,7 @@ mod tests {
             .await
             .unwrap();
 
-        let guard = state.compute.sandbox_sync_guard().await;
+        let guard = state.compute.sandbox_sync_guard().await.unwrap();
         let task_state = state.clone();
         let task = tokio::spawn(async move {
             handle_delete_provider_profile(

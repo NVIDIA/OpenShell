@@ -246,7 +246,9 @@ async fn handle_create_sandbox_inner(
     let _sandbox_sync_guard = if spec.providers.is_empty() {
         None
     } else {
-        Some(state.compute.sandbox_sync_guard().await)
+        Some(state.compute.sandbox_sync_guard().await.map_err(|err| {
+            super::persistence_error_to_status(err, "acquire sandbox mutation lock")
+        })?)
     };
 
     // Validate provider names exist (fail fast).
@@ -523,7 +525,10 @@ pub(super) async fn handle_attach_sandbox_provider(
             }
         })?;
 
-    let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await;
+    let _sandbox_sync_guard =
+        state.compute.sandbox_sync_guard().await.map_err(|err| {
+            super::persistence_error_to_status(err, "acquire sandbox mutation lock")
+        })?;
     let sandbox = sandbox_by_name(state, &workspace, &request.sandbox_name).await?;
     let sandbox_id = sandbox
         .metadata
@@ -646,7 +651,10 @@ pub(super) async fn handle_detach_sandbox_provider(
         )));
     }
 
-    let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await;
+    let _sandbox_sync_guard =
+        state.compute.sandbox_sync_guard().await.map_err(|err| {
+            super::persistence_error_to_status(err, "acquire sandbox mutation lock")
+        })?;
     let sandbox = sandbox_by_name(state, &workspace, &request.sandbox_name).await?;
     let sandbox_id = sandbox
         .metadata
@@ -2808,7 +2816,7 @@ mod tests {
 
         // Hold the global guard so the handler can resolve the original ID and
         // acquire its delete gate, but cannot yet revalidate or mutate it.
-        let global_guard = state.compute.sandbox_sync_guard().await;
+        let global_guard = state.compute.sandbox_sync_guard().await.unwrap();
         let delete_state = state.clone();
         let delete = tokio::spawn(async move {
             handle_delete_sandbox_inner(
@@ -3507,7 +3515,7 @@ mod tests {
             .await
             .unwrap();
 
-        let guard = state.compute.sandbox_sync_guard().await;
+        let guard = state.compute.sandbox_sync_guard().await.unwrap();
         let task_state = state.clone();
         let task = tokio::spawn(async move {
             handle_create_sandbox(

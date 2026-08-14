@@ -865,22 +865,29 @@ pub async fn open_routed_relay_with_message(
     ),
     Status,
 > {
-    if state.supervisor_sessions.has_session(sandbox_id) {
-        return state
-            .supervisor_sessions
-            .open_relay_with_message(sandbox_id, relay_open, session_wait_timeout)
-            .await;
-    }
-
     let deadline = Instant::now() + session_wait_timeout;
     let mut backoff = SESSION_WAIT_INITIAL_BACKOFF;
     let owner_index = SupervisorOwnerIndex::new(state.store.clone(), OWNER_TTL);
     loop {
         if state.supervisor_sessions.has_session(sandbox_id) {
-            return state
+            match state
                 .supervisor_sessions
-                .open_relay_with_message(sandbox_id, relay_open, session_wait_timeout)
-                .await;
+                .open_relay_with_message(sandbox_id, relay_open.clone(), Duration::ZERO)
+                .await
+            {
+                Ok(relay) => return Ok(relay),
+                Err(status) if status.code() == tonic::Code::Unavailable => {
+                    // The session can migrate after `has_session` but before
+                    // RelayOpen reaches its sender. Fall through and reread the
+                    // persisted owner instead of surfacing a handoff race.
+                    warn!(
+                        sandbox_id,
+                        error = %status,
+                        "local supervisor relay disappeared during open; resolving owner again"
+                    );
+                }
+                Err(status) => return Err(status),
+            }
         }
 
         if let Some(owner) = owner_index

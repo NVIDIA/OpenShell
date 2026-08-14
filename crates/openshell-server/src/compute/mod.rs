@@ -588,6 +588,13 @@ pub struct ComputeRuntime {
     replica_id: String,
 }
 
+pub struct SandboxSyncGuard {
+    // Drop the database guard before the local mutex so another local waiter
+    // cannot race ahead while this replica still owns the cluster-wide lock.
+    _distributed: crate::persistence::DistributedMutationGuard,
+    _local: tokio::sync::OwnedMutexGuard<()>,
+}
+
 impl fmt::Debug for ComputeRuntime {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ComputeRuntime").finish_non_exhaustive()
@@ -711,13 +718,21 @@ impl ComputeRuntime {
     }
 
     /// Serializes sandbox/provider-profile invariant checks and object writes
-    /// within this gateway process.
+    /// across gateway replicas.
     ///
-    /// This is a temporary single-gateway guard for cross-object invariants.
-    /// It is not HA-safe; replace it with DB-backed CAS/resource-version writes
-    /// tracked by #1255 before enabling multiple gateway writers.
-    pub(crate) async fn sandbox_sync_guard(&self) -> tokio::sync::OwnedMutexGuard<()> {
-        self.sync_lock.clone().lock_owned().await
+    /// The local mutex preserves lock ordering within one process. `PostgreSQL`
+    /// deployments additionally acquire a database advisory lock so the
+    /// validation and related writes remain atomic with respect to other
+    /// gateway replicas.
+    pub(crate) async fn sandbox_sync_guard(
+        &self,
+    ) -> crate::persistence::PersistenceResult<SandboxSyncGuard> {
+        let local = self.sync_lock.clone().lock_owned().await;
+        let distributed = self.store.acquire_distributed_mutation_guard().await?;
+        Ok(SandboxSyncGuard {
+            _distributed: distributed,
+            _local: local,
+        })
     }
 
     /// Acquires the process-wide lock for code that already holds the
@@ -7119,7 +7134,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             SandboxPhase::try_from(stored.phase()).unwrap(),
-            SandboxPhase::Provisioning
+            SandboxPhase::Ready
         );
         assert_eq!(stored.current_policy_version(), 7);
         let ready = stored
@@ -7132,9 +7147,9 @@ mod tests {
                     .find(|condition| condition.r#type == "Ready")
             })
             .unwrap();
-        assert_eq!(ready.status, "False");
-        assert_eq!(ready.reason, "DependenciesNotReady");
-        assert_eq!(ready.message, "Supervisor session not connected");
+        assert_eq!(ready.status, "True");
+        assert_eq!(ready.reason, "DependenciesReady");
+        assert_eq!(ready.message, "Pod is Ready");
     }
 
     #[tokio::test]
@@ -7644,7 +7659,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             SandboxPhase::try_from(stored.phase()).unwrap(),
-            SandboxPhase::Provisioning
+            SandboxPhase::Ready
         );
         assert!(stored.spec.as_ref().is_some_and(|spec| {
             openshell_core::gpu::sandbox_gpu_requested(spec.resource_requirements.as_ref())
@@ -7849,7 +7864,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             SandboxPhase::try_from(stored.phase()).unwrap(),
-            SandboxPhase::Provisioning
+            SandboxPhase::Ready
         );
     }
 

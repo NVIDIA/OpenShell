@@ -70,6 +70,7 @@ const (
 	OpenShell_PushSandboxLogs_FullMethodName               = "/openshell.v1.OpenShell/PushSandboxLogs"
 	OpenShell_ConnectSupervisor_FullMethodName             = "/openshell.v1.OpenShell/ConnectSupervisor"
 	OpenShell_RelayStream_FullMethodName                   = "/openshell.v1.OpenShell/RelayStream"
+	OpenShell_PeerRelay_FullMethodName                     = "/openshell.v1.OpenShell/PeerRelay"
 	OpenShell_WatchSandbox_FullMethodName                  = "/openshell.v1.OpenShell/WatchSandbox"
 	OpenShell_SubmitPolicyAnalysis_FullMethodName          = "/openshell.v1.OpenShell/SubmitPolicyAnalysis"
 	OpenShell_GetDraftPolicy_FullMethodName                = "/openshell.v1.OpenShell/GetDraftPolicy"
@@ -223,6 +224,14 @@ type OpenShellClient interface {
 	// This rides the same TCP+TLS+HTTP/2 connection as ConnectSupervisor —
 	// no new TLS handshake, no reverse HTTP CONNECT.
 	RelayStream(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[RelayFrame, RelayFrame], error)
+	// Internal gateway-to-gateway relay forwarding.
+	//
+	// A gateway replica that receives a user request for a sandbox whose
+	// supervisor session is owned by a different replica opens this stream to the
+	// owner. The first frame carries PeerRelayInit; subsequent frames carry raw
+	// bytes in either direction. This RPC is authenticated as a gateway peer, not
+	// as a user or sandbox supervisor.
+	PeerRelay(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[PeerRelayFrame, PeerRelayFrame], error)
 	// Watch a sandbox and stream updates.
 	//
 	// This stream can include:
@@ -779,9 +788,22 @@ func (c *openShellClient) RelayStream(ctx context.Context, opts ...grpc.CallOpti
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type OpenShell_RelayStreamClient = grpc.BidiStreamingClient[RelayFrame, RelayFrame]
 
+func (c *openShellClient) PeerRelay(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[PeerRelayFrame, PeerRelayFrame], error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	stream, err := c.cc.NewStream(ctx, &OpenShell_ServiceDesc.Streams[6], OpenShell_PeerRelay_FullMethodName, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &grpc.GenericClientStream[PeerRelayFrame, PeerRelayFrame]{ClientStream: stream}
+	return x, nil
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type OpenShell_PeerRelayClient = grpc.BidiStreamingClient[PeerRelayFrame, PeerRelayFrame]
+
 func (c *openShellClient) WatchSandbox(ctx context.Context, in *WatchSandboxRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[SandboxStreamEvent], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &OpenShell_ServiceDesc.Streams[6], OpenShell_WatchSandbox_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &OpenShell_ServiceDesc.Streams[7], OpenShell_WatchSandbox_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -1110,6 +1132,14 @@ type OpenShellServer interface {
 	// This rides the same TCP+TLS+HTTP/2 connection as ConnectSupervisor —
 	// no new TLS handshake, no reverse HTTP CONNECT.
 	RelayStream(grpc.BidiStreamingServer[RelayFrame, RelayFrame]) error
+	// Internal gateway-to-gateway relay forwarding.
+	//
+	// A gateway replica that receives a user request for a sandbox whose
+	// supervisor session is owned by a different replica opens this stream to the
+	// owner. The first frame carries PeerRelayInit; subsequent frames carry raw
+	// bytes in either direction. This RPC is authenticated as a gateway peer, not
+	// as a user or sandbox supervisor.
+	PeerRelay(grpc.BidiStreamingServer[PeerRelayFrame, PeerRelayFrame]) error
 	// Watch a sandbox and stream updates.
 	//
 	// This stream can include:
@@ -1312,6 +1342,9 @@ func (UnimplementedOpenShellServer) ConnectSupervisor(grpc.BidiStreamingServer[S
 }
 func (UnimplementedOpenShellServer) RelayStream(grpc.BidiStreamingServer[RelayFrame, RelayFrame]) error {
 	return status.Error(codes.Unimplemented, "method RelayStream not implemented")
+}
+func (UnimplementedOpenShellServer) PeerRelay(grpc.BidiStreamingServer[PeerRelayFrame, PeerRelayFrame]) error {
+	return status.Error(codes.Unimplemented, "method PeerRelay not implemented")
 }
 func (UnimplementedOpenShellServer) WatchSandbox(*WatchSandboxRequest, grpc.ServerStreamingServer[SandboxStreamEvent]) error {
 	return status.Error(codes.Unimplemented, "method WatchSandbox not implemented")
@@ -2175,6 +2208,13 @@ func _OpenShell_RelayStream_Handler(srv interface{}, stream grpc.ServerStream) e
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type OpenShell_RelayStreamServer = grpc.BidiStreamingServer[RelayFrame, RelayFrame]
 
+func _OpenShell_PeerRelay_Handler(srv interface{}, stream grpc.ServerStream) error {
+	return srv.(OpenShellServer).PeerRelay(&grpc.GenericServerStream[PeerRelayFrame, PeerRelayFrame]{ServerStream: stream})
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type OpenShell_PeerRelayServer = grpc.BidiStreamingServer[PeerRelayFrame, PeerRelayFrame]
+
 func _OpenShell_WatchSandbox_Handler(srv interface{}, stream grpc.ServerStream) error {
 	m := new(WatchSandboxRequest)
 	if err := stream.RecvMsg(m); err != nil {
@@ -2786,6 +2826,12 @@ var OpenShell_ServiceDesc = grpc.ServiceDesc{
 		{
 			StreamName:    "RelayStream",
 			Handler:       _OpenShell_RelayStream_Handler,
+			ServerStreams: true,
+			ClientStreams: true,
+		},
+		{
+			StreamName:    "PeerRelay",
+			Handler:       _OpenShell_PeerRelay_Handler,
 			ServerStreams: true,
 			ClientStreams: true,
 		},

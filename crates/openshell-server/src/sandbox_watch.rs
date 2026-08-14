@@ -193,6 +193,7 @@ mod tests {
             metadata: Some(ObjectMeta {
                 id: "sb-1".to_string(),
                 name: "sandbox-a".to_string(),
+                workspace: "default".to_string(),
                 ..Default::default()
             }),
             ..Default::default()
