@@ -48,11 +48,12 @@ creating misleading Windows driver artifacts.
 
 ## Mise Lane
 
-The GitHub Actions workflow runs x64 Windows Clippy and Rust tests for
-pull-request mirror branches and merge queues. On pushes to `main`, a cache-seed
-job runs the same lint and test commands before a dependent job builds the
-release binaries. Manual dispatches exercise the same seed-then-build path.
-The binaries remain CI validation artifacts and are not uploaded or published.
+The GitHub Actions workflow runs Clippy for the Windows-sensitive sandbox,
+core, and CLI crates plus Rust tests for pull-request mirror branches and merge
+queues. On pushes to `main`, a cache-seed job runs the same lint and test
+commands before a dependent job builds the release binaries. Manual dispatches
+exercise the same seed-then-build path. The binaries remain CI validation
+artifacts and are not uploaded or published.
 
 Each job restores and saves a dedicated Rust cache containing the Cargo
 registry and dependency build artifacts, including artifacts from failed runs.
@@ -138,7 +139,7 @@ The x64 GitHub Actions jobs run on `windows-2025`. Pull-request mirrors and
 merge queues execute:
 
 ```powershell
-mise run --skip-tools rust:lint
+cargo clippy -p openshell-sandbox -p openshell-core -p openshell-cli --all-targets -- -D warnings
 mise run --skip-tools test:rust
 ```
 
