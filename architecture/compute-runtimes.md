@@ -110,6 +110,15 @@ compute to zero, and VM retains its launch request and writable overlay beside
 a stop marker. Delete remains a separate operation that removes these
 resources.
 
+Gateway shutdown does not stop Docker or Podman sandbox containers. The
+gateway-owned VM driver process exits, so its running VM launchers exit with
+it. On gateway startup, persisted running intent for Docker, Podman, and VM is
+reconciled through the shared idempotent `StartSandbox` RPC before watch
+processing begins. This restarts a retained local resource when necessary and
+is a no-op when it is already running. Explicitly `Stopped` sandboxes are
+excluded from the sweep. Kubernetes workloads are cluster-owned and continue
+running without a startup `StartSandbox` call.
+
 ## Deletion Lifecycle
 
 Lifecycle requests use per-sandbox gates to serialize stop, start, and

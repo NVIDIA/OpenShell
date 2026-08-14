@@ -716,10 +716,9 @@ pub(crate) async fn run_server(
 
     let state = Arc::new(state);
 
-    // Start sandboxes that were stopped during the previous gateway
-    // shutdown so the running compute state matches the persisted store.
-    // Runs before watchers spawn so the watch loop sees the post-start
-    // snapshot on its first poll.
+    // Reconcile local-driver running intent before watchers spawn so their
+    // first snapshots observe the post-start backend state. Explicitly stopped
+    // sandboxes remain stopped.
     ensure_default_workspace(&store).await?;
 
     let gateway_listeners = bind_gateway_listeners(

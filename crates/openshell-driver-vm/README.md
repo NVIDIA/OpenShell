@@ -197,7 +197,11 @@ The driver also writes the accepted `DriverSandbox` launch request to
 new VM driver process; that process scans the sandbox state directories,
 restarts each persisted VM launcher, and preserves any existing `overlay.ext4`
 instead of cloning a fresh overlay template. If a restart happened before the
-overlay was created, the driver creates it during the start attempt.
+overlay was created, the driver creates it during the start attempt. After
+driver initialization, the gateway also sends the shared idempotent
+`StartSandbox` request for each persisted running-intent sandbox. Already
+restored VMs are unchanged, while stopped markers continue to exclude
+explicitly stopped sandboxes from startup.
 
 Stop writes a marker in the sandbox state directory before terminating
 the launcher and releasing host GPU and network allocations. It retains

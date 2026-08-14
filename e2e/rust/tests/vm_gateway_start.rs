@@ -12,16 +12,18 @@
 use std::time::Duration;
 
 use openshell_e2e::harness::cli::{
-    sandbox_names, wait_for_healthy, wait_for_sandbox_exec_contains,
+    run_cli, sandbox_names, wait_for_healthy, wait_for_sandbox_exec_contains,
+    wait_for_sandbox_phase,
 };
 use openshell_e2e::harness::gateway::ManagedGateway;
 use openshell_e2e::harness::sandbox::SandboxGuard;
 
 const READY_MARKER: &str = "vm-gateway-start-ready";
+const STOPPED_READY_MARKER: &str = "vm-gateway-start-stopped-ready";
 const START_FILE: &str = "/sandbox/vm-gateway-start-state";
 
 #[tokio::test]
-async fn vm_gateway_restart_starts_running_sandbox() {
+async fn vm_gateway_restart_preserves_running_and_stopped_intent() {
     if std::env::var("OPENSHELL_E2E_DRIVER").as_deref() != Ok("vm") {
         eprintln!("Skipping VM gateway start test: e2e driver is not vm");
         return;
@@ -55,6 +57,17 @@ async fn vm_gateway_restart_starts_running_sandbox() {
         "VM sandbox state was not written before restart:\n{before_restart}"
     );
 
+    let stopped_script = format!("echo {STOPPED_READY_MARKER}; while true; do sleep 1; done");
+    let mut stopped_sandbox =
+        SandboxGuard::create_keep(&["sh", "-lc", &stopped_script], STOPPED_READY_MARKER)
+            .await
+            .expect("create VM sandbox that will remain stopped");
+    let (stop_output, stop_code) = run_cli(&["sandbox", "stop", &stopped_sandbox.name]).await;
+    assert_eq!(stop_code, 0, "sandbox stop should succeed:\n{stop_output}");
+    wait_for_sandbox_phase(&stopped_sandbox.name, "Stopped", Duration::from_secs(120))
+        .await
+        .expect("VM sandbox should be stopped before gateway restart");
+
     gateway.stop().expect("stop e2e gateway");
     gateway.start().expect("restart e2e gateway");
     wait_for_healthy(Duration::from_secs(120))
@@ -67,6 +80,9 @@ async fn vm_gateway_restart_starts_running_sandbox() {
         "sandbox '{}' should still be listed after gateway restart. Names: {names:?}",
         sandbox.name
     );
+    wait_for_sandbox_phase(&stopped_sandbox.name, "Stopped", Duration::from_secs(120))
+        .await
+        .expect("explicitly stopped VM sandbox should remain stopped after restart");
 
     wait_for_sandbox_exec_contains(
         &sandbox.name,
@@ -78,4 +94,5 @@ async fn vm_gateway_restart_starts_running_sandbox() {
     .expect("VM sandbox should become ready again with its overlay state preserved");
 
     sandbox.cleanup().await;
+    stopped_sandbox.cleanup().await;
 }

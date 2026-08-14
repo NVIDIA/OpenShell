@@ -26,6 +26,10 @@ policy. Start starts that same container, so files in the resolved OCI
 workspace remain available. A durably stopped sandbox is excluded from
 gateway startup recovery and stays stopped across gateway restarts. Delete
 continues to force-remove the container and clean up driver-owned material.
+Gateway shutdown does not stop running Docker containers. On startup, the
+gateway sends an idempotent `StartSandbox` request for each sandbox whose
+persisted phase requires running compute, recovering a retained container if
+the Docker runtime stopped it while the gateway was offline.
 
 Before creating the container, the driver inspects the final sandbox image and
 captures its immutable image ID, raw OCI `Config.User`, and OCI

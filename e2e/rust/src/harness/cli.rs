@@ -66,6 +66,40 @@ pub async fn sandbox_names() -> Result<Vec<String>, String> {
         .collect())
 }
 
+pub async fn wait_for_sandbox_phase(
+    sandbox_name: &str,
+    expected_phase: &str,
+    timeout: Duration,
+) -> Result<(), String> {
+    let start = Instant::now();
+    let mut last_output: String;
+
+    loop {
+        let (output, code) = run_cli(&["sandbox", "get", sandbox_name, "--output", "json"]).await;
+        last_output = strip_ansi(&output);
+        let phase_matches = serde_json::from_str::<serde_json::Value>(&last_output)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("phase")
+                    .and_then(|phase| phase.as_str())
+                    .map(str::to_owned)
+            })
+            .is_some_and(|phase| phase == expected_phase);
+        if code == 0 && phase_matches {
+            return Ok(());
+        }
+
+        if start.elapsed() > timeout {
+            return Err(format!(
+                "sandbox '{sandbox_name}' did not reach phase '{expected_phase}' within {}s. Last output:\n{last_output}",
+                timeout.as_secs()
+            ));
+        }
+        sleep(Duration::from_secs(2)).await;
+    }
+}
+
 pub async fn wait_for_sandbox_exec_contains(
     sandbox_name: &str,
     command: &[&str],
