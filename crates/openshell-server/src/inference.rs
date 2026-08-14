@@ -1159,7 +1159,7 @@ async fn resolve_route_by_name_with_credentials(
     Ok(Some(ResolvedRoute {
         name: route_name.to_string(),
         base_url: resolved.route.endpoint,
-        model_id: config.model_id.clone(),
+        model_id: resolved.route.model.clone(),
         api_key: resolved.route.api_key,
         protocols: resolved.route.protocols,
         provider_type: resolved.provider_type,
@@ -1749,10 +1749,38 @@ mod tests {
             route.request_path_override,
             Some("/chat/completions".to_string())
         );
-        assert_eq!(route.model_id, "gemini-2.0-flash-001");
+        assert_eq!(route.model_id, "google/gemini-2.0-flash-001");
         assert_eq!(
             route.base_url,
             "https://us-central1-aiplatform.googleapis.com/v1beta1/projects/my-gcp-project/locations/us-central1/endpoints/openapi"
+        );
+    }
+
+    #[tokio::test]
+    async fn bundle_vertex_ai_non_anthropic_model_id_carries_publisher_prefix() {
+        // Regression test: the bundle's model_id must carry the publisher prefix
+        // so the router sends e.g. "google/gemini-2.5-flash" in the request body,
+        // not the bare "gemini-2.5-flash" that Vertex AI rejects with HTTP 400.
+        let store = test_store().await;
+        let config = [
+            ("VERTEX_AI_PROJECT_ID".to_string(), "my-gcp-project".to_string()),
+            ("VERTEX_AI_REGION".to_string(), "us-central1".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        let provider = make_vertex_provider_with_config("vertex-dev", config);
+        store.put_message(&provider).await.expect("persist provider");
+        let route = make_route(CLUSTER_INFERENCE_ROUTE_NAME, "vertex-dev", "gemini-2.5-flash");
+        store.put_message(&route).await.expect("persist route");
+
+        let resp = resolve_inference_bundle(&store, "default")
+            .await
+            .expect("bundle should resolve");
+
+        assert_eq!(resp.routes.len(), 1);
+        assert_eq!(
+            resp.routes[0].model_id, "google/gemini-2.5-flash",
+            "bundle model_id must carry publisher prefix for non-Anthropic Vertex routes"
         );
     }
 
