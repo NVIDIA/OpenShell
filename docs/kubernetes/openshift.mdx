@@ -166,6 +166,7 @@ helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart \
   --namespace openshell \
   --set podSecurityContext.fsGroup=null \
   --set securityContext.runAsUser=null \
+  --set server.tls.enableMtls=false \
   --set grpcRoute.enabled=true \
   --set grpcRoute.gateway.name=openshell-gateway \
   --set grpcRoute.gateway.namespace=openshift-ingress \
@@ -177,12 +178,13 @@ helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart \
 | Override | Reason |
 |---|---|
 | `podSecurityContext.fsGroup=null` / `securityContext.runAsUser=null` | Let OpenShift's SCC admission assign UIDs. |
+| `server.tls.enableMtls=false` | Disable mTLS client certificate authentication. BackendTLSPolicy only validates the server certificate; the ingress proxy cannot present a client certificate to the backend. Use OIDC for authentication instead. |
 | `grpcRoute.enabled=true` | Create a GRPCRoute pointing at the external Gateway. |
 | `grpcRoute.gateway.name` / `namespace` | Reference the Gateway created above in `openshift-ingress`. |
 | `grpcRoute.backendTLSPolicy.enabled=true` | Create a BackendTLSPolicy for TLS re-encryption to the gateway pod. The certgen hook auto-creates the backend CA ConfigMap. |
 | `pkiInitJob.serverDnsNames` | Add the external hostname to the server certificate SANs. |
 
-Note that `server.disableTls` is **not** set — the gateway pod serves TLS, and the BackendTLSPolicy tells the OpenShift router to connect over TLS.
+Note that `server.disableTls` is **not** set — the gateway pod serves TLS over HTTPS without requiring client certificates. Use OIDC for authentication (see [Access Control](/kubernetes/access-control)).
 
 To use cert-manager instead of the built-in PKI, add `--set certManager.enabled=true` and configure `certManager.serverDnsNames` with the external hostname. On first install with cert-manager, the backend CA ConfigMap is created on the first `helm upgrade` after cert-manager issues the server certificate.
 
