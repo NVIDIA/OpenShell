@@ -284,9 +284,8 @@ async fn assert_provider_placeholder_available_in_sandbox(
         "--no-auto-providers",
         "--no-tty",
         "--",
-        "bash",
-        "-lc",
-        r#"printf '%s\n' "$OPENAI_API_KEY""#,
+        "printenv",
+        CREDENTIAL_KEY,
     ])
     .await?;
     let clean = strip_ansi(&guard.create_output);
