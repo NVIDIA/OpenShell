@@ -452,7 +452,8 @@ async fn provider_credentials_are_stored_in_configured_backend() {
     let suffix = unique_suffix();
     let driver_slug = driver.replace('-', "");
     let provider_name = format!("cred-storage-{driver_slug}-{suffix}");
-    let sandbox_name = format!("cred-storage-sandbox-{driver_slug}-{suffix}");
+    let sandbox_hash = format!("{:x}", Sha256::digest(suffix.as_bytes()));
+    let sandbox_name = format!("cred-{}", &sandbox_hash[..14]);
     let secret_value = format!("example-e2e-{driver_slug}-{suffix}");
 
     delete_provider(&provider_name).await;
