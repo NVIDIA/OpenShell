@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Bypass detection monitor — reads kernel log messages from `/dev/kmsg` to
+//! Bypass detection monitor — follows kernel log messages with `dmesg` to
 //! detect and report direct connection attempts that bypass the HTTP CONNECT
 //! proxy.
 //!
@@ -12,9 +12,9 @@
 //!
 //! ## Graceful degradation
 //!
-//! If `/dev/kmsg` cannot be opened (e.g., restricted container environment),
-//! the monitor logs a one-time warning and returns. The nftables reject rules
-//! still provide fast-fail UX — the monitor only adds diagnostic visibility.
+//! If an approved `dmesg` binary is unavailable, the monitor logs a one-time
+//! warning and returns. The nftables reject rules still provide fast-fail UX —
+//! the monitor only adds diagnostic visibility.
 
 mod procfs;
 
@@ -29,7 +29,21 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use tokio::sync::mpsc;
 use tracing::debug;
 
-/// A parsed nftables log entry from `/dev/kmsg`.
+const DMESG_PATHS: &[&str] = &[
+    "/usr/bin/dmesg",
+    "/bin/dmesg",
+    "/usr/sbin/dmesg",
+    "/sbin/dmesg",
+];
+
+fn find_dmesg_binary<'a>(candidates: &'a [&'a str]) -> Option<&'a str> {
+    candidates.iter().copied().find(|candidate| {
+        let path = std::path::Path::new(candidate);
+        path.is_absolute() && path.is_file()
+    })
+}
+
+/// A parsed nftables kernel log entry.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BypassEvent {
     /// Destination IP address.
@@ -181,8 +195,23 @@ pub fn spawn(
     use std::io::BufRead;
     use std::process::{Command, Stdio};
 
-    // Verify dmesg is available before spawning the monitor.
-    let dmesg_check = Command::new("dmesg")
+    // Use only known system locations. The sandbox image's PATH is controlled
+    // by the image author and may include the writable workspace.
+    let Some(dmesg_path) = find_dmesg_binary(DMESG_PATHS) else {
+        let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
+            .activity(ActivityId::Other)
+            .severity(SeverityId::Low)
+            .message(
+                "dmesg not available at an approved system path; bypass detection monitor will not run. \
+                 Bypass REJECT rules still provide fast-fail behavior.",
+            )
+            .build();
+        ocsf_emit!(event);
+        return None;
+    };
+
+    // Verify dmesg works before spawning the monitor.
+    let dmesg_check = Command::new(dmesg_path)
         .arg("--version")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -209,7 +238,7 @@ pub fn spawn(
 
     let handle = tokio::task::spawn_blocking(move || {
         // Start dmesg in follow mode to tail new kernel messages.
-        let mut child = match Command::new("dmesg")
+        let mut child = match Command::new(dmesg_path)
             .args(["--follow", "--notime"])
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -381,6 +410,23 @@ fn resolve_process_identity(entrypoint_pid: u32, src_port: u16) -> (String, Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dmesg_lookup_uses_only_existing_absolute_candidates() {
+        let dir = tempfile::tempdir().unwrap();
+        let binary = dir.path().join("dmesg");
+        std::fs::write(&binary, "test").unwrap();
+        let binary = binary.to_str().unwrap();
+
+        assert_eq!(
+            find_dmesg_binary(&["relative/dmesg", "/definitely/missing/dmesg", binary]),
+            Some(binary)
+        );
+        assert_eq!(
+            find_dmesg_binary(&["relative/dmesg", "/definitely/missing/dmesg"]),
+            None
+        );
+    }
 
     #[test]
     fn parse_kmsg_line_tcp_bypass() {

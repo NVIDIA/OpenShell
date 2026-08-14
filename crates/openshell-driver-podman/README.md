@@ -88,7 +88,7 @@ read-only by default; set `read_only: false` to make them writable. Podman
 image and volume mounts do not support `subpath` in OpenShell driver config.
 Mount `source` and `target` values must not contain surrounding whitespace.
 Mount targets must be absolute container paths and must not replace
-the workspace root (`/sandbox`) or overlap OpenShell supervisor files,
+the resolved workspace root or overlap OpenShell supervisor files,
 `/etc/openshell`, `/etc/openshell-tls`, or `/run/netns`.
 
 Example named-volume usage:
@@ -119,6 +119,35 @@ setup so `drop_privileges()` can clear the child capability bounding set before
 exec. It drops unneeded defaults such as
 `DAC_OVERRIDE`, `FSETID`, `KILL`, `NET_BIND_SERVICE`, `NET_RAW`, `SETFCAP`,
 and `SYS_CHROOT`.
+
+## OCI Working Directory
+
+The driver inspects and pins the sandbox image, then resolves its OCI
+`Config.WorkingDir`. An empty value, `/`, or `/sandbox` uses the managed
+`/sandbox` compatibility workspace. Otherwise, the persistent Podman named
+volume is mounted at the normalized absolute workdir and Podman performs its
+normal initial copy-up.
+
+Podman applies its normal runtime semantics for image-declared `VOLUME`
+metadata. OpenShell validates the resulting visible workdir.
+
+The final supervisor rejects missing or symlink components, non-directories,
+and OpenShell control paths. The driver also
+rejects a workdir that overlaps `/proc`, `/sys`, `/dev`, or the supervisor's
+minimal executable and library roots in either direction. This prevents
+OpenShell from placing its persistent workspace over those paths; it does not
+attempt to establish the integrity of a custom image or validate workdir
+permissions. The resolved path becomes both cwd and `HOME` for direct and SSH
+children.
+
+OpenShell does not create, chown, or chmod a non-default workdir. Podman may
+initialize or adjust a named-volume mountpoint as part of its own volume
+semantics, but OpenShell does not repair the result. Image authors must make
+the declared `USER` able to use the declared `WORKDIR`; unusable images fail
+naturally when the workload changes directory or writes. Rootless, rootful,
+user-namespace, and SELinux configurations can differ in volume initialization
+behavior, so validate custom images in the deployment's actual Podman
+configuration.
 
 ## Supervisor Sideloading
 
@@ -291,11 +320,13 @@ sequenceDiagram
 
     D->>P: pull_image(supervisor, "missing")
     D->>P: pull_image(sandbox_image, policy)
+    D->>P: inspect_image(sandbox_image)
+    Note over D: Pin image ID and resolve OCI USER + WORKDIR
 
     D->>P: create_volume(workspace)
     Note over D: On failure below, rollback volume
 
-    D->>P: create_container(spec)
+    D->>P: create_container(spec with volume at WORKDIR)
     alt Conflict (409)
         D->>P: remove_volume
         D-->>GW: AlreadyExists
@@ -303,6 +334,8 @@ sequenceDiagram
     Note over D: On failure below, rollback container + volume
 
     D->>P: start_container
+    Note over P: Podman performs named-volume copy-up
+    Note over P: Supervisor validates the copied-up workspace structure
     D-->>GW: Ok
 ```
 

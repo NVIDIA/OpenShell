@@ -5,7 +5,7 @@
 
 use std::path::Path;
 
-use crate::container_paths::{CONTROL_ROOTS, OCI_RUNTIME_MOUNT_ROOTS};
+use crate::container_paths::{CONTROL_ROOTS, FORBIDDEN_WORKSPACE_ROOTS};
 
 /// `SELinux` relabelling mode for bind mounts.
 ///
@@ -110,13 +110,16 @@ pub fn resolve_oci_workspace_root(working_dir: &str) -> Result<String, String> {
         return Ok(DEFAULT_WORKSPACE_ROOT.to_string());
     }
     let workspace_root = normalize_absolute_container_path(working_dir, "OCI WorkingDir")?;
-    for runtime_path in OCI_RUNTIME_MOUNT_ROOTS {
-        validate_workspace_reserved_path(&workspace_root, runtime_path, "OCI runtime mount")?;
+    for forbidden_root in FORBIDDEN_WORKSPACE_ROOTS {
+        validate_workspace_reserved_path(
+            &workspace_root,
+            forbidden_root,
+            "forbidden workspace root",
+        )?;
     }
     for control_path in CONTROL_ROOTS {
         validate_workspace_control_path(&workspace_root, control_path)?;
     }
-
     Ok(workspace_root)
 }
 
@@ -278,7 +281,7 @@ mod tests {
     }
 
     #[test]
-    fn oci_workspace_root_rejects_runtime_and_openshell_control_path_collisions() {
+    fn oci_workspace_root_rejects_forbidden_and_openshell_control_path_collisions() {
         for invalid in [
             "/proc",
             "/proc/self",
@@ -299,6 +302,17 @@ mod tests {
             "/run/openshell-sidecar/control.sock",
             "/run/netns/project",
             "/var/run/netns/project",
+            "/bin",
+            "/bin/project",
+            "/sbin",
+            "/lib",
+            "/lib/project",
+            "/lib64",
+            "/usr",
+            "/usr/bin",
+            "/usr/bin/project",
+            "/usr/lib",
+            "/usr/lib64",
         ] {
             assert!(
                 resolve_oci_workspace_root(invalid).is_err(),
@@ -310,9 +324,17 @@ mod tests {
             "/app",
             "/etc/project",
             "/home/app",
+            "/lib32/app",
+            "/libx32/app",
             "/opt/app",
-            "/usr/bin/project",
+            "/usr/lib32/app",
+            "/usr/libexec/app",
+            "/usr/libx32/app",
             "/usr/src/app",
+            "/usr/local",
+            "/usr/local/app",
+            "/usr/local/bin",
+            "/usr/local/lib",
             "/var/lib/app",
             "/var/app/current",
             "/var/task",

@@ -31,26 +31,23 @@ numeric primary GID. Explicit `process.run_as_user` and
 An absolute OCI working directory becomes the agent workspace. An empty,
 root (`/`), or explicit `/sandbox` declaration uses `/sandbox`, which OpenShell
 creates when necessary and owns as a compatibility workspace. Any other image
-workdir must already exist without symlink components. The completed identity,
-including supplementary groups, must already be able to traverse every parent
-and write and enter the workdir. OpenShell does not change its ownership or
-mode.
+workdir must already exist without symlink components. OpenShell does not
+create it or change its ownership or mode. Image authors are responsible for
+making the final OCI/policy identity able to traverse and write it; an unusable
+image fails naturally when its workload changes directory or writes.
 
-OpenShell deliberately asks the Linux kernel to make this access decision
-under the completed sandbox identity instead of reproducing permission rules
-from ownership and mode bits. Mode-bit inspection alone can reject authority
-granted by a POSIX ACL or overlook a denial imposed by a Linux Security Module
-such as SELinux or AppArmor. OpenShell does not configure or otherwise manage
-ACLs or LSM policy here; the one-shot validator only observes the kernel's
-effective decision. This keeps the no-authority-expansion invariant aligned
-with the access the eventual workload will receive without adding a separate,
-incomplete permission model to OpenShell.
+Before loading policy, credentials, TLS, or networking state, the supervisor
+performs a no-follow structural walk. It rejects missing components, symlinks,
+non-directories, and OpenShell control paths. This check protects workspace
+mount placement; it does not validate custom-image
+integrity or workdir permissions.
 
 Image `VOLUME` declarations must not cover the workdir or one of its parents
 because Docker would mount the volume before the supervisor could validate the
 immutable image path.
 Workdirs under the standard OCI runtime namespaces `/proc`, `/sys`, and `/dev`
-are rejected, as are paths that overlap concrete OpenShell control resources.
+are rejected, as are paths that overlap protected executable and library roots
+or concrete OpenShell control resources.
 The workspace is the child cwd and `HOME`. The supervisor starts from `/`, then
 reports an invalid workdir as a readiness failure.
 
