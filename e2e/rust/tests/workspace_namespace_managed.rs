@@ -669,6 +669,23 @@ async fn managed_full_lifecycle_with_multiple_sandboxes() {
 
 #[tokio::test]
 async fn managed_stop_waits_for_workspace_pod_to_disappear() {
+    let (ok, sandbox_api_version) = kubectl(&[
+        "get",
+        "crd",
+        "sandboxes.agents.x-k8s.io",
+        "-o",
+        "jsonpath={.spec.versions[?(@.storage==true)].name}",
+    ])
+    .await;
+    assert!(
+        ok,
+        "failed to resolve Sandbox API version: {sandbox_api_version}"
+    );
+    if sandbox_api_version.trim() != "v1alpha1" {
+        eprintln!("SKIP: legacy pod-disappearance fallback applies only to Sandbox API v1alpha1");
+        return;
+    }
+
     let ws = unique_workspace("mgdstop");
     let ns = managed_namespace(&ws);
     let sandbox = "stop-sb";
