@@ -25,6 +25,7 @@ pub const NETNS_IPROUTE2_ROOT: &str = "/var/run/netns";
 ///
 /// TODO: Make the supervisor's helper functionality self-contained so it no
 /// longer depends on executable and library paths shared with the image.
+/// <https://github.com/NVIDIA/OpenShell/pull/2715>
 pub const FORBIDDEN_WORKSPACE_ROOTS: &[&str] = &[
     // Kernel-managed OCI runtime mounts.
     "/proc",

@@ -1036,6 +1036,11 @@ pub fn build_container_spec_for_image(
         // /openshell-sandbox, so it appears at /opt/openshell/bin/openshell-sandbox.
         image_volumes,
         hostname: format!("sandbox-{}", sandbox.name),
+        // This is the supervisor's startup cwd, not the workload cwd. Starting
+        // at the image-selected workspace would let a malformed or inaccessible
+        // WORKDIR prevent the OCI runtime from launching the supervisor before
+        // it can validate the mounted workspace and report readiness. Direct and
+        // SSH children use the resolved workspace passed through `--workdir`.
         work_dir: "/".to_string(),
         // Override the image's ENTRYPOINT so the supervisor binary runs
         // directly. Sandbox images (e.g. the community base image) set
