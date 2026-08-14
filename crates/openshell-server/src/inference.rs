@@ -707,14 +707,11 @@ fn resolve_vertex_ai_route(
     // a 400 in that case, which is the correct observable signal to the caller.
     // Anthropic rawPredict routes encode the model in the URL path, not the
     // body, so they are unaffected.
-    let body_model_id: String = if !is_anthropic {
-        let publisher = explicit_publisher.or_else(|| infer_vertex_publisher(model_id));
-        match publisher {
-            Some(p) => format!("{p}/{model_id}"),
-            None => model_id.to_string(),
-        }
-    } else {
+    let body_model_id: String = if is_anthropic {
         model_id.to_string()
+    } else {
+        let publisher = explicit_publisher.or_else(|| infer_vertex_publisher(model_id));
+        publisher.map_or_else(|| model_id.to_string(), |p| format!("{p}/{model_id}"))
     };
 
     // Escape hatch: caller-supplied full base URL still uses the model-derived
