@@ -115,9 +115,9 @@ struct RunArgs {
     /// implementing `compute_driver.proto`.
     ///
     /// When set, the socket is associated with the single driver name supplied
-    /// by `--drivers` or `OPENSHELL_DRIVERS`. Reserved built-in driver names
-    /// such as Docker, Podman, Kubernetes, and VM do not accept socket
-    /// endpoints.
+    /// by `--drivers` or `OPENSHELL_DRIVERS`. The endpoint overrides built-in
+    /// construction when the selected name is Docker, Podman, Kubernetes, or
+    /// VM.
     #[arg(long, env = "OPENSHELL_COMPUTE_DRIVER_SOCKET")]
     compute_driver_socket: Option<PathBuf>,
 
@@ -755,7 +755,7 @@ fn normalize_compute_driver_socket_args(args: &mut RunArgs, matches: &ArgMatches
     }
     if arg_defaulted(matches, "drivers") {
         return Err(miette::miette!(
-            "--compute-driver-socket requires --drivers <name> or OPENSHELL_DRIVERS=<name> to select a non-reserved compute driver name"
+            "--compute-driver-socket requires --drivers <name> or OPENSHELL_DRIVERS=<name> to select a compute driver name"
         ));
     }
 
@@ -763,19 +763,6 @@ fn normalize_compute_driver_socket_args(args: &mut RunArgs, matches: &ArgMatches
         [driver] => {
             let driver = openshell_core::config::normalize_compute_driver_name(driver)
                 .map_err(|err| miette::miette!("{err}"))?;
-            if matches!(
-                driver.parse::<ComputeDriverKind>().ok(),
-                Some(
-                    ComputeDriverKind::Docker
-                        | ComputeDriverKind::Podman
-                        | ComputeDriverKind::Kubernetes
-                        | ComputeDriverKind::Vm
-                )
-            ) {
-                return Err(miette::miette!(
-                    "--compute-driver-socket cannot be combined with reserved built-in compute driver '{driver}'"
-                ));
-            }
             args.drivers[0] = driver;
             Ok(())
         }
@@ -1663,7 +1650,7 @@ ssh_session_ttl_secs = 1234
     }
 
     #[test]
-    fn compute_driver_socket_rejects_reserved_builtin_drivers() {
+    fn compute_driver_socket_accepts_canonical_builtin_driver_name() {
         let _lock = ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -1679,16 +1666,12 @@ ssh_session_ttl_secs = 1234
             "--compute-driver-socket",
             "/run/openshell/extension.sock",
         ]);
-        let err = super::normalize_compute_driver_socket_args(&mut args, &matches).unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("cannot be combined with reserved built-in compute driver 'docker'"),
-            "unexpected error: {err}"
-        );
+        super::normalize_compute_driver_socket_args(&mut args, &matches).unwrap();
+        assert_eq!(args.drivers, ["docker"]);
     }
 
     #[test]
-    fn compute_driver_socket_rejects_vm_endpoint() {
+    fn compute_driver_socket_accepts_vm_endpoint() {
         let _lock = ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -1704,12 +1687,8 @@ ssh_session_ttl_secs = 1234
             "--compute-driver-socket",
             "/run/openshell/vm.sock",
         ]);
-        let err = super::normalize_compute_driver_socket_args(&mut args, &matches).unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("cannot be combined with reserved built-in compute driver 'vm'"),
-            "unexpected error: {err}"
-        );
+        super::normalize_compute_driver_socket_args(&mut args, &matches).unwrap();
+        assert_eq!(args.drivers, ["vm"]);
     }
 
     #[test]

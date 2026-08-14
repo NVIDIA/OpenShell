@@ -268,11 +268,14 @@ async fn handle_create_sandbox_inner(
         template.image = state.compute.default_image().to_string();
     }
 
-    // Docker and Podman preserve omitted identity fields for OCI USER
-    // fallback. Other drivers retain the legacy persisted sandbox defaults.
+    // Drivers with native image/runtime identity handling preserve omitted
+    // fields. Other drivers retain the legacy persisted sandbox defaults.
     if let Some(ref mut policy) = spec.policy {
         super::policy::clear_provider_credentialed_markers(policy);
-        normalize_process_identity_for_driver(policy, state.compute.driver_kind());
+        normalize_process_identity_for_driver(
+            policy,
+            state.compute.preserves_unspecified_process_identity(),
+        );
         validate_no_reserved_provider_policy_keys(policy)?;
         validate_policy_safety(policy)?;
         crate::middleware::validate_policy(state.middleware_registry.as_ref(), policy).await?;

@@ -37,12 +37,12 @@ use openshell_core::progress::{
     format_bytes, mark_progress_active, mark_progress_complete, mark_progress_detail,
 };
 use openshell_core::proto::compute::v1::{
-    CreateSandboxRequest, CreateSandboxResponse, DeleteSandboxRequest, DeleteSandboxResponse,
-    DeleteWorkspaceRequest, DeleteWorkspaceResponse, DriverCondition as SandboxCondition,
-    DriverPlatformEvent as PlatformEvent, DriverSandbox as Sandbox,
-    DriverSandboxStatus as SandboxStatus, DriverSandboxTemplate as SandboxTemplate,
-    EnsureWorkspaceRequest, EnsureWorkspaceResponse, GetCapabilitiesRequest,
-    GetCapabilitiesResponse, GetGatewayListenerRequirementsRequest,
+    ComputeDriverFeature, CreateSandboxRequest, CreateSandboxResponse, DeleteSandboxRequest,
+    DeleteSandboxResponse, DeleteWorkspaceRequest, DeleteWorkspaceResponse,
+    DriverCondition as SandboxCondition, DriverPlatformEvent as PlatformEvent,
+    DriverSandbox as Sandbox, DriverSandboxStatus as SandboxStatus,
+    DriverSandboxTemplate as SandboxTemplate, EnsureWorkspaceRequest, EnsureWorkspaceResponse,
+    GetCapabilitiesRequest, GetCapabilitiesResponse, GetGatewayListenerRequirementsRequest,
     GetGatewayListenerRequirementsResponse, GetSandboxRequest, GetSandboxResponse,
     ListSandboxesRequest, ListSandboxesResponse, StartSandboxRequest, StartSandboxResponse,
     StopSandboxRequest, StopSandboxResponse, ValidateSandboxCreateRequest,
@@ -520,6 +520,7 @@ impl VmDriver {
             driver_name: DRIVER_NAME.to_string(),
             driver_version: openshell_core::VERSION.to_string(),
             default_image: self.config.default_image.clone(),
+            features: vec![ComputeDriverFeature::GatewayStartReconciliation.into()],
         }
     }
 

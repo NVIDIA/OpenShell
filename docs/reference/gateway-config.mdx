@@ -746,10 +746,9 @@ guest_tls_key    = "/var/lib/openshell/guest-tls/client-key.pem"
 ### Extension Driver
 
 Extension drivers run outside the gateway and expose the
-`compute_driver.proto` gRPC service on a Unix socket. Use a non-reserved driver
-name; built-in names such as `vm`, `docker`, `podman`, and `kubernetes` cannot
-be selected through unmanaged socket endpoints. The selected driver name is the
-key used for driver-owned sandbox config such as `template.driver_config.<name>`.
+supported `compute_driver.proto` gRPC service on a Unix socket. The selected
+driver name is the key used for driver-owned sandbox config such as
+`template.driver_config.<name>`.
 
 ```toml
 [openshell]
@@ -763,3 +762,16 @@ compute_drivers = ["kyma"]
 [openshell.drivers.kyma]
 socket_path = "/run/openshell/kyma-compute-driver.sock"
 ```
+
+At launch time, `--compute-driver-socket` can override the implementation for
+any explicitly selected name, including `docker`, `podman`, `kubernetes`, and
+`vm`. The override takes precedence over built-in construction:
+
+```shell
+openshell-gateway --drivers docker \
+  --compute-driver-socket /run/openshell/docker-driver.sock
+```
+
+Do not use `[openshell.drivers.docker].socket_path` for this purpose; that
+existing field selects the Docker daemon socket. Operator-supplied driver
+processes and Unix sockets are not created or supervised by the gateway.

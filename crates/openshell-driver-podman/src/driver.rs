@@ -471,6 +471,10 @@ impl PodmanComputeDriver {
             "podman",
             openshell_core::VERSION,
             &self.config.default_image,
+            [
+                openshell_core::proto::compute::v1::ComputeDriverFeature::GatewayStartReconciliation,
+                openshell_core::proto::compute::v1::ComputeDriverFeature::PreserveUnspecifiedProcessIdentity,
+            ],
         ))
     }
 

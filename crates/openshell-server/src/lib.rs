@@ -1249,10 +1249,8 @@ fn resolve_configured_compute_driver(
     let name = openshell_core::config::normalize_compute_driver_name(driver_name)
         .map_err(Error::config)?;
     let driver_kind = builtin_compute_driver(&name);
-    if driver_kind.is_some() && driver_startup.endpoint_overrides.contains_key(&name) {
-        return Err(Error::config(format!(
-            "compute driver '{name}' is a reserved built-in driver and cannot be selected with a socket endpoint"
-        )));
+    if driver_startup.endpoint_overrides.contains_key(&name) {
+        return Ok(ConfiguredComputeDriver::Remote { name });
     }
 
     if let Some(kind) = driver_kind {
@@ -1877,35 +1875,31 @@ mod tests {
     }
 
     #[test]
-    fn configured_compute_driver_rejects_vm_endpoint_from_config() {
+    fn configured_compute_driver_uses_vm_endpoint_override() {
         let config = Config::new(None)
             .with_compute_drivers([ComputeDriverKind::Vm])
             .with_compute_driver_endpoint("vm", "/run/openshell/vm.sock");
 
-        let err =
-            configured_compute_driver(&config, test_driver_startup(&config, None)).unwrap_err();
-
-        assert!(
-            err.to_string()
-                .contains("reserved built-in driver and cannot be selected with a socket endpoint"),
-            "unexpected error: {err}"
-        );
+        let driver =
+            configured_compute_driver(&config, test_driver_startup(&config, None)).unwrap();
+        assert!(matches!(
+            driver,
+            ConfiguredComputeDriver::Remote { name } if name == "vm"
+        ));
     }
 
     #[test]
-    fn configured_compute_driver_rejects_builtin_endpoint() {
+    fn configured_compute_driver_uses_builtin_endpoint_override() {
         let config = Config::new(None)
             .with_compute_drivers([ComputeDriverKind::Docker])
             .with_compute_driver_endpoint("docker", "/run/openshell/docker.sock");
 
-        let err =
-            configured_compute_driver(&config, test_driver_startup(&config, None)).unwrap_err();
-
-        assert!(
-            err.to_string()
-                .contains("cannot be selected with a socket endpoint"),
-            "unexpected error: {err}"
-        );
+        let driver =
+            configured_compute_driver(&config, test_driver_startup(&config, None)).unwrap();
+        assert!(matches!(
+            driver,
+            ConfiguredComputeDriver::Remote { name } if name == "docker"
+        ));
     }
 
     #[test]

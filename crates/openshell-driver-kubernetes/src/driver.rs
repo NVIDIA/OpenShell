@@ -548,6 +548,7 @@ impl KubernetesComputeDriver {
             "kubernetes",
             openshell_core::VERSION,
             &self.config.default_image,
+            [],
         ))
     }
 

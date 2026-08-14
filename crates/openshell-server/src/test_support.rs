@@ -74,6 +74,7 @@ struct FakeComputeDriverState {
     driver_name: String,
     driver_version: String,
     default_image: String,
+    features: Vec<i32>,
     gateway_listener_requirements: Vec<GatewayListenerRequirement>,
     gateway_listener_requirements_supported: bool,
     sandboxes: HashMap<String, DriverSandbox>,
@@ -95,6 +96,7 @@ impl FakeComputeDriver {
                 driver_name: "fake-compute-driver".to_string(),
                 driver_version: "test".to_string(),
                 default_image: "openshell/sandbox:test".to_string(),
+                features: Vec::new(),
                 gateway_listener_requirements: Vec::new(),
                 gateway_listener_requirements_supported: true,
                 sandboxes: HashMap::new(),
@@ -119,6 +121,17 @@ impl FakeComputeDriver {
     #[must_use]
     pub fn with_default_image(self, default_image: impl Into<String>) -> Self {
         self.with_state(|state| state.default_image = default_image.into());
+        self
+    }
+
+    #[must_use]
+    pub fn with_features(
+        self,
+        features: impl IntoIterator<Item = openshell_core::proto::compute::v1::ComputeDriverFeature>,
+    ) -> Self {
+        self.with_state(|state| {
+            state.features = features.into_iter().map(i32::from).collect();
+        });
         self
     }
 
@@ -241,6 +254,7 @@ impl ComputeDriver for FakeComputeDriver {
                 driver_name: state.driver_name.clone(),
                 driver_version: state.driver_version.clone(),
                 default_image: state.default_image.clone(),
+                features: state.features.clone(),
             }
         });
         Ok(Response::new(response))

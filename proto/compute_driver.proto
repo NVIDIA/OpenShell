@@ -8,14 +8,17 @@ package openshell.compute.v1;
 import "google/protobuf/struct.proto";
 import "options.proto";
 
-// Internal compute-driver contract used by the gateway.
+// Gateway/compute-driver extension contract.
 //
 // Conventions:
 // - This file owns driver-native request, response, and observation types.
 // - Compute drivers must not import or return the public `openshell.v1.Sandbox`
 //   resource model.
-// - The gateway translates between these internal driver-native messages and
+// - The gateway translates between these driver-native messages and
 //   the public OpenShell API resource model.
+// - Capability fields are additive. Drivers and gateways must ignore unknown
+//   feature values so independently versioned external drivers remain
+//   forward-compatible.
 service ComputeDriver {
   // Report driver capabilities and defaults.
   rpc GetCapabilities(GetCapabilitiesRequest) returns (GetCapabilitiesResponse);
@@ -72,6 +75,19 @@ message GetCapabilitiesResponse {
   string driver_version = 2;
   // Default sandbox image recommended by the driver.
   string default_image = 3;
+  // Optional behavior supported by this driver instance. Unknown values are
+  // ignored and omitted features retain conservative gateway behavior.
+  repeated ComputeDriverFeature features = 6;
+}
+
+enum ComputeDriverFeature {
+  COMPUTE_DRIVER_FEATURE_UNSPECIFIED = 0;
+  // Reconcile persisted running intent by calling StartSandbox when the
+  // gateway starts.
+  COMPUTE_DRIVER_FEATURE_GATEWAY_START_RECONCILIATION = 1;
+  // Preserve omitted process user/group fields so the runtime can apply its
+  // native image or OCI identity defaults.
+  COMPUTE_DRIVER_FEATURE_PRESERVE_UNSPECIFIED_PROCESS_IDENTITY = 2;
 }
 
 message GetGatewayListenerRequirementsRequest {}

@@ -71,7 +71,7 @@ Use gateway metadata, deployment values, or the user's setup notes to identify t
 
 Before debugging the compute platform, inspect gateway logs for failures in dependencies initialized before the listener becomes ready.
 
-For out-of-tree compute drivers, confirm the custom driver name and socket agree across CLI flags or `gateway.toml`, and that the operator-owned driver is running before the gateway starts:
+For out-of-tree compute drivers, confirm the selected driver name and socket agree across CLI flags or `gateway.toml`, and that the operator-owned driver is running before the gateway starts:
 
 ```bash
 rg -n 'compute_drivers|socket_path' /etc/openshell/gateway.toml
@@ -80,7 +80,7 @@ journalctl -u <driver-service> --no-pager --lines=200
 journalctl -u openshell-gateway --no-pager --lines=200
 ```
 
-The custom driver name must not be a reserved built-in name (`docker`, `podman`, `kubernetes`, or `vm`). The socket must be accessible only to the intended gateway identity. Check gateway logs for connection errors, `GetCapabilities` failures, or an unexpected advertised driver name. The gateway does not create or supervise out-of-tree driver processes or sockets.
+Custom names use `[openshell.drivers.<name>].socket_path`. A launch-time `--compute-driver-socket` override may also use `docker`, `podman`, `kubernetes`, or `vm`; the endpoint then takes precedence over built-in construction. The socket must be accessible only to the intended gateway identity. Check gateway logs for connection errors, `GetCapabilities` failures, or an unexpected advertised driver name. The advertised name is diagnostic metadata; negotiated features control optional behavior. The gateway does not create or supervise operator-supplied driver processes or sockets.
 
 For configured gateway interceptors, inspect `[[openshell.gateway.interceptors]]`, their Unix or network endpoints, and gateway startup logs:
 
@@ -595,7 +595,7 @@ openshell logs <sandbox-name>
 | Binary WebSocket message passes without a middleware RPC | Binary is unsupported by the V1 text-message binding under both `on_error` modes | `WEBSOCKET_MIDDLEWARE_COVERAGE state=unsupported_message_type`; the next text RPC may have a valid sequence gap |
 | WebSocket messages stop reaching middleware after one failure | A fail-open stage stream was disabled for the rest of the connection | `openshell.middleware.websocket_stage_disabled`; middleware timeout/stream/protocol logs. A per-message capacity bypass alone leaves the stage active. Reconnect to create a fresh stream after a genuine stream failure |
 | Supervisor repeatedly fails to install middleware after enabling gateway JWT signing | Extension credential minting, distribution, or authenticated service connection failed; last-known-good registry remains active | Gateway `RefreshSandboxToken` logs, sandbox configuration events, service token-verification logs, registration TLS/audience settings |
-| Custom compute driver is unavailable | Driver process/socket missing, inaccessible, or configured with a reserved/mismatched name | Socket ownership/mode, driver service logs, gateway `GetCapabilities` logs |
+| Custom compute driver is unavailable | Driver process/socket missing, inaccessible, or selected name does not match its endpoint/config key | Socket ownership/mode, driver service logs, gateway `GetCapabilities` logs |
 | Sandbox remains `Stopping` or `Starting` | Driver stop/start failed, retained resource is missing, or a fresh supervisor has not connected | Gateway and driver logs; `docker inspect`, `podman inspect`, Agent Sandbox status/PVC, or VM state marker and launcher process |
 | Image pull failure | Gateway or sandbox image cannot be pulled | Runtime events and image pull credentials |
 | `K8s namespace not ready` with `envoy-gateway-openshell.yaml: the server could not find the requested resource` | Optional Gateway API manifest was applied without Envoy Gateway CRDs, or k3s Helm controller startup exceeded the namespace wait | Apply `deploy/kube/manifests/envoy-gateway-openshell.yaml` manually only after Envoy Gateway is installed and `grpcRoute` is enabled |

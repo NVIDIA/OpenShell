@@ -8,7 +8,6 @@
 
 #![allow(clippy::result_large_err)] // Validation returns Result<_, Status>
 
-use openshell_core::ComputeDriverKind;
 use openshell_core::proto::{
     CredentialHandle, ExecSandboxRequest, Provider, SandboxPolicy as ProtoSandboxPolicy,
     SandboxTemplate,
@@ -28,19 +27,14 @@ use super::{
 // Exec request validation
 // ---------------------------------------------------------------------------
 
-/// Preserve process-identity omission only for the local OCI-aware drivers.
-///
-/// Kubernetes, VM, and unknown/remote drivers retain the legacy persisted
-/// `sandbox:sandbox` defaults so existing policy hashes and live-update
-/// workflows do not change.
+/// Preserve process-identity omission only when the compute driver advertises
+/// native image/runtime identity handling. Drivers without the feature retain
+/// the legacy persisted `sandbox:sandbox` defaults.
 pub(super) fn normalize_process_identity_for_driver(
     policy: &mut ProtoSandboxPolicy,
-    driver_kind: Option<ComputeDriverKind>,
+    preserves_unspecified_process_identity: bool,
 ) {
-    if !matches!(
-        driver_kind,
-        Some(ComputeDriverKind::Docker | ComputeDriverKind::Podman)
-    ) {
+    if !preserves_unspecified_process_identity {
         openshell_policy::ensure_sandbox_process_identity(policy);
     }
 }
@@ -1854,41 +1848,30 @@ mod tests {
     // ---- Policy safety ----
 
     #[test]
-    fn process_identity_omission_is_driver_scoped() {
+    fn process_identity_omission_is_feature_scoped() {
         use openshell_core::proto::ProcessPolicy;
 
-        for driver in [ComputeDriverKind::Docker, ComputeDriverKind::Podman] {
-            let mut policy = ProtoSandboxPolicy {
-                process: Some(ProcessPolicy {
-                    run_as_user: "1234".into(),
-                    run_as_group: String::new(),
-                }),
-                ..Default::default()
-            };
-            normalize_process_identity_for_driver(&mut policy, Some(driver));
-            assert!(
-                policy.process.unwrap().run_as_group.is_empty(),
-                "{driver:?} must preserve omission"
-            );
-        }
+        let mut policy = ProtoSandboxPolicy {
+            process: Some(ProcessPolicy {
+                run_as_user: "1234".into(),
+                run_as_group: String::new(),
+            }),
+            ..Default::default()
+        };
+        normalize_process_identity_for_driver(&mut policy, true);
+        assert!(policy.process.unwrap().run_as_group.is_empty());
 
-        for driver in [
-            Some(ComputeDriverKind::Kubernetes),
-            Some(ComputeDriverKind::Vm),
-            None,
-        ] {
-            let mut policy = ProtoSandboxPolicy {
-                process: Some(ProcessPolicy {
-                    run_as_user: "1234".into(),
-                    run_as_group: String::new(),
-                }),
-                ..Default::default()
-            };
-            normalize_process_identity_for_driver(&mut policy, driver);
-            let process = policy.process.unwrap();
-            assert_eq!(process.run_as_user, "1234");
-            assert_eq!(process.run_as_group, "sandbox");
-        }
+        let mut policy = ProtoSandboxPolicy {
+            process: Some(ProcessPolicy {
+                run_as_user: "1234".into(),
+                run_as_group: String::new(),
+            }),
+            ..Default::default()
+        };
+        normalize_process_identity_for_driver(&mut policy, false);
+        let process = policy.process.unwrap();
+        assert_eq!(process.run_as_user, "1234");
+        assert_eq!(process.run_as_group, "sandbox");
     }
 
     #[test]

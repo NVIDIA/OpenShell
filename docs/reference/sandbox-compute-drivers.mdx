@@ -20,10 +20,12 @@ remain unavailable.
 
 Restarting the gateway preserves this intent. The gateway does not stop Docker
 or Podman containers during shutdown. At startup it sends idempotent start
-requests for Docker, Podman, and MicroVM sandboxes that were intended to run;
-already-running resources are unchanged, retained stopped compute is restarted,
-and explicitly stopped sandboxes remain stopped. Kubernetes workloads continue
-running independently of the gateway process.
+requests for drivers that advertise startup reconciliation. The built-in
+Docker, Podman, and MicroVM implementations advertise this feature, so
+sandboxes that were intended to run are reconciled. Already-running resources
+are unchanged, retained stopped compute is restarted, and explicitly stopped
+sandboxes remain stopped. Kubernetes workloads continue running independently
+of the gateway process.
 
 ## Configure a Compute Driver
 
@@ -34,8 +36,8 @@ Configure the compute driver on the gateway. Current releases accept one driver 
 compute_drivers = ["docker"]
 ```
 
-Reserved built-in values are `docker`, `podman`, `kubernetes`, and `vm`.
-Non-reserved names select an extension driver and require a
+Built-in values are `docker`, `podman`, `kubernetes`, and `vm`.
+Other names select an extension driver and require a
 `socket_path` in `[openshell.drivers.<name>]`.
 
 When `compute_drivers` is unset, the gateway auto-detects Kubernetes, then Podman, then Docker. Local container runtimes must respond to an API probe before the gateway selects them. The VM driver is never auto-detected; configure it explicitly with `compute_drivers = ["vm"]` or set `OPENSHELL_DRIVERS=vm` in the launch environment.
@@ -48,8 +50,8 @@ Common gateway options:
 
 Set driver-specific values such as sandbox images, callback endpoints, network names, TLS material, and VM sizing in the gateway TOML file. See the [Gateway Configuration File](./gateway-config) reference for the full `[openshell.drivers.<name>]` schema.
 
-Extension drivers use the same `compute_driver.proto` gRPC surface as the
-managed VM driver. For an out-of-tree driver, choose a driver name and point
+External drivers use the same supported `compute_driver.proto` gRPC surface as
+the managed VM driver. For an out-of-tree driver, choose a driver name and point
 the gateway at the Unix socket the operator has already provisioned:
 
 ```toml
@@ -60,16 +62,27 @@ compute_drivers = ["kyma"]
 socket_path = "/run/openshell/kyma.sock"
 ```
 
-For a launch-time socket override, pass the same non-reserved driver name with
-the socket path:
+For a launch-time socket override, pass the selected driver name with the
+socket path:
 
 ```shell
 openshell-gateway --drivers kyma --compute-driver-socket /run/openshell/kyma.sock
 ```
 
-The gateway does not spawn, supervise, or delete extension drivers. The
+The override also accepts a built-in name. This lets an operator provide, for
+example, a Docker-compatible implementation through the external contract
+without changing driver-owned config keys:
+
+```shell
+openshell-gateway --drivers docker --compute-driver-socket /run/openshell/docker-driver.sock
+```
+
+The endpoint override takes precedence over built-in construction. The gateway
+does not spawn, supervise, or delete an operator-supplied driver. The
 operator must protect the socket so only the gateway uid can access it.
-Reserved built-in names cannot be selected through unmanaged socket endpoints.
+The driver's advertised name is diagnostic metadata and does not authorize
+special behavior. Drivers negotiate optional startup and process-identity
+behavior through `GetCapabilities`; unknown features are ignored.
 
 Sandbox create supports `--cpu` and `--memory` for per-sandbox compute sizing.
 Docker and Podman apply them as runtime limits. Kubernetes applies them as both
@@ -120,15 +133,16 @@ It overrides the gateway's configured default runtime class for that sandbox,
 while a typed `SandboxTemplate.runtime_class_name` value from the API still
 takes precedence.
 
-Docker and Podman report the address through which their sandboxes can reach
-the gateway. If the primary listener covers that address, the gateway reuses
+Compute drivers can report the address through which their sandboxes reach the
+gateway. If the primary listener covers a requested address, the gateway reuses
 it and sandbox JWT authentication restricts the supervisor to its callback RPC
-allowlist. If the primary listener is not reachable through that address, the
-gateway creates an additional callback-only listener. Use the primary endpoint
-for CLI, administrator, health, reflection, inference-route management, and
-HTTP requests. A `PermissionDenied` response from an additional callback-only
-listener is expected for those requests. Do not broaden the primary listener
-to `0.0.0.0` solely to make sandbox callbacks reachable.
+allowlist. Otherwise, the gateway creates an additional callback-only listener.
+Listener requirements are structurally validated independently of the selected
+driver name. Use the primary endpoint for CLI, administrator, health,
+reflection, inference-route management, and HTTP requests. A `PermissionDenied`
+response from an additional callback-only listener is expected for those
+requests. Do not broaden the primary listener to `0.0.0.0` solely to make
+sandbox callbacks reachable.
 
 ## Docker Driver
 

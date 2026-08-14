@@ -32,17 +32,18 @@ use futures::{Stream, StreamExt};
 use hyper_util::rt::TokioIo;
 use openshell_core::ComputeDriverKind;
 use openshell_core::proto::compute::v1::{
-    CreateSandboxRequest, DeleteSandboxRequest, DeleteWorkspaceRequest, DeleteWorkspaceResponse,
-    DriverCondition, DriverPlatformEvent, DriverResourceRequirements, DriverSandbox,
-    DriverSandboxSpec, DriverSandboxStatus, DriverSandboxTemplate, EnsureWorkspaceRequest,
-    EnsureWorkspaceResponse, GatewayListenerRequirement as ProtoGatewayListenerRequirement,
-    GetCapabilitiesRequest, GetGatewayListenerRequirementsRequest,
-    GetGatewayListenerRequirementsResponse, GetSandboxRequest,
-    GpuResourceRequirements as DriverGpuResourceRequirements, ListSandboxesRequest,
-    ResourceRequirements as DriverSandboxResourceRequirements, StartSandboxRequest,
-    StopSandboxRequest, ValidateSandboxCreateRequest, WatchSandboxesEvent, WatchSandboxesRequest,
-    compute_driver_client::ComputeDriverClient, compute_driver_server::ComputeDriver,
-    gateway_listener_requirement::Selector, watch_sandboxes_event,
+    ComputeDriverFeature, CreateSandboxRequest, DeleteSandboxRequest, DeleteWorkspaceRequest,
+    DeleteWorkspaceResponse, DriverCondition, DriverPlatformEvent, DriverResourceRequirements,
+    DriverSandbox, DriverSandboxSpec, DriverSandboxStatus, DriverSandboxTemplate,
+    EnsureWorkspaceRequest, EnsureWorkspaceResponse,
+    GatewayListenerRequirement as ProtoGatewayListenerRequirement, GetCapabilitiesRequest,
+    GetGatewayListenerRequirementsRequest, GetGatewayListenerRequirementsResponse,
+    GetSandboxRequest, GpuResourceRequirements as DriverGpuResourceRequirements,
+    ListSandboxesRequest, ResourceRequirements as DriverSandboxResourceRequirements,
+    StartSandboxRequest, StopSandboxRequest, ValidateSandboxCreateRequest, WatchSandboxesEvent,
+    WatchSandboxesRequest, compute_driver_client::ComputeDriverClient,
+    compute_driver_server::ComputeDriver, gateway_listener_requirement::Selector,
+    watch_sandboxes_event,
 };
 use openshell_core::proto::{
     PlatformEvent, Sandbox, SandboxCondition, SandboxPhase, SandboxSpec, SandboxStatus,
@@ -277,6 +278,8 @@ pub struct ComputeDriverInfoSnapshot {
     pub driver_name: String,
     /// Driver-reported implementation version from the startup capability snapshot.
     pub driver_version: String,
+    /// Feature values negotiated from the startup capability snapshot.
+    pub features: Vec<i32>,
 }
 
 /// Interval between store-vs-backend reconciliation sweeps.
@@ -612,6 +615,7 @@ impl ComputeRuntime {
             name: driver_name.clone(),
             driver_name: capabilities.driver_name,
             driver_version: capabilities.driver_version,
+            features: capabilities.features,
         };
         let default_image = capabilities.default_image;
         let gateway_listener_requirements = match driver
@@ -827,6 +831,16 @@ impl ComputeRuntime {
     #[must_use]
     pub fn driver_kind(&self) -> Option<ComputeDriverKind> {
         self.driver_info.name.parse().ok()
+    }
+
+    #[must_use]
+    pub(crate) fn supports_feature(&self, feature: ComputeDriverFeature) -> bool {
+        self.driver_info.features.contains(&i32::from(feature))
+    }
+
+    #[must_use]
+    pub(crate) fn preserves_unspecified_process_identity(&self) -> bool {
+        self.supports_feature(ComputeDriverFeature::PreserveUnspecifiedProcessIdentity)
     }
 
     #[must_use]
@@ -2137,20 +2151,16 @@ impl ComputeRuntime {
 
     /// Reconcile running intent for local compute after a gateway restart.
     ///
-    /// Docker and Podman resources can outlive the gateway but may have been
-    /// stopped by their runtime, while VM compute exits with its gateway-owned
-    /// driver process. `StartSandbox` is idempotent for all three drivers, so
-    /// call it for every persisted phase that requires running compute. Stable
-    /// stopped, deleting, and error states are deliberately left alone.
+    /// Drivers opt into this sweep through their startup capability snapshot.
+    /// `StartSandbox` is idempotent, so call it for every persisted phase that
+    /// requires running compute. Stable stopped, deleting, and error states are
+    /// deliberately left alone.
     ///
     /// Should be called once at gateway startup, before watchers spawn,
     /// so the watch loop sees the post-start state on its first poll.
     pub async fn start_persisted_sandboxes(&self) -> Result<(), String> {
         self.recover_persisted_lifecycle_transitions().await?;
-        if !matches!(
-            self.driver_kind(),
-            Some(ComputeDriverKind::Docker | ComputeDriverKind::Podman | ComputeDriverKind::Vm)
-        ) {
+        if !self.supports_feature(ComputeDriverFeature::GatewayStartReconciliation) {
             return Ok(());
         }
 
@@ -3949,6 +3959,7 @@ impl ComputeDriver for NoopTestDriver {
                 driver_name: "noop-test-driver".to_string(),
                 driver_version: "test".to_string(),
                 default_image: "openshell/sandbox:test".to_string(),
+                features: Vec::new(),
             },
         ))
     }
@@ -4083,12 +4094,23 @@ pub async fn new_test_runtime_with_driver(
     driver_name: &str,
     driver: Arc<NoopTestDriver>,
 ) -> ComputeRuntime {
+    let features = match driver_name.parse::<ComputeDriverKind>().ok() {
+        Some(ComputeDriverKind::Docker | ComputeDriverKind::Podman) => vec![
+            i32::from(ComputeDriverFeature::GatewayStartReconciliation),
+            i32::from(ComputeDriverFeature::PreserveUnspecifiedProcessIdentity),
+        ],
+        Some(ComputeDriverKind::Vm) => {
+            vec![i32::from(ComputeDriverFeature::GatewayStartReconciliation)]
+        }
+        _ => Vec::new(),
+    };
     ComputeRuntime {
         driver: TracedDriver::new(driver, "test".to_string()),
         driver_info: ComputeDriverInfoSnapshot {
             name: driver_name.to_string(),
             driver_name: driver_name.to_string(),
             driver_version: "test".to_string(),
+            features,
         },
         driver_process: None,
         default_image: "openshell/sandbox:test".to_string(),
@@ -4251,6 +4273,7 @@ mod tests {
                 driver_name: "test-driver".to_string(),
                 driver_version: "test".to_string(),
                 default_image: "openshell/sandbox:test".to_string(),
+                features: Vec::new(),
             }))
         }
 
@@ -4568,6 +4591,7 @@ mod tests {
                 driver_name: "controlled-test-driver".to_string(),
                 driver_version: "test".to_string(),
                 default_image: "openshell/sandbox:test".to_string(),
+                features: Vec::new(),
             }))
         }
 
@@ -4763,6 +4787,14 @@ mod tests {
         driver: SharedComputeDriver,
         driver_name: &str,
     ) -> ComputeRuntime {
+        test_runtime_for_driver_with_features(driver, driver_name, Vec::new()).await
+    }
+
+    async fn test_runtime_for_driver_with_features(
+        driver: SharedComputeDriver,
+        driver_name: &str,
+        features: Vec<ComputeDriverFeature>,
+    ) -> ComputeRuntime {
         let store = Arc::new(Store::connect("sqlite::memory:").await.unwrap());
         ComputeRuntime {
             driver: TracedDriver::new(driver, "test-driver".to_string()),
@@ -4770,6 +4802,7 @@ mod tests {
                 name: driver_name.to_string(),
                 driver_name: driver_name.to_string(),
                 driver_version: "test".to_string(),
+                features: features.into_iter().map(i32::from).collect(),
             },
             driver_process: None,
             default_image: "openshell/sandbox:test".to_string(),
@@ -8352,7 +8385,12 @@ mod tests {
     #[tokio::test]
     async fn start_persisted_sandboxes_starts_running_phases() {
         let driver = ControlledDriver::new();
-        let runtime = test_runtime_for_driver(driver.clone(), "docker").await;
+        let runtime = test_runtime_for_driver_with_features(
+            driver.clone(),
+            "extension",
+            vec![ComputeDriverFeature::GatewayStartReconciliation],
+        )
+        .await;
 
         for (id, name, phase) in [
             ("sb-unspecified", "unspecified", SandboxPhase::Unspecified),
@@ -8454,7 +8492,12 @@ mod tests {
     async fn start_persisted_sandboxes_marks_missing_backend_as_error() {
         let driver = ControlledDriver::new();
         driver.set_start_outcome(ControlledLifecycleOutcome::NotFound);
-        let runtime = test_runtime_for_driver(driver, "podman").await;
+        let runtime = test_runtime_for_driver_with_features(
+            driver,
+            "extension",
+            vec![ComputeDriverFeature::GatewayStartReconciliation],
+        )
+        .await;
 
         let sandbox = sandbox_record("sb-1", "missing", SandboxPhase::Ready);
         runtime.store.put_message(&sandbox).await.unwrap();
@@ -8484,7 +8527,12 @@ mod tests {
     async fn start_persisted_sandboxes_marks_failed_start_as_error() {
         let driver = ControlledDriver::new();
         driver.set_start_outcome(ControlledLifecycleOutcome::Error("runtime angry"));
-        let runtime = test_runtime_for_driver(driver, "vm").await;
+        let runtime = test_runtime_for_driver_with_features(
+            driver,
+            "extension",
+            vec![ComputeDriverFeature::GatewayStartReconciliation],
+        )
+        .await;
 
         let sandbox = sandbox_record("sb-1", "broken", SandboxPhase::Provisioning);
         runtime.store.put_message(&sandbox).await.unwrap();
@@ -8511,10 +8559,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn start_persisted_sandboxes_runs_for_each_local_driver() {
-        for driver_name in ["docker", "podman", "vm"] {
+    async fn start_persisted_sandboxes_runs_for_any_capable_driver() {
+        for driver_name in ["docker", "podman", "vm", "extension"] {
             let driver = ControlledDriver::new();
-            let runtime = test_runtime_for_driver(driver.clone(), driver_name).await;
+            let runtime = test_runtime_for_driver_with_features(
+                driver.clone(),
+                driver_name,
+                vec![ComputeDriverFeature::GatewayStartReconciliation],
+            )
+            .await;
             let sandbox = sandbox_record("sb-1", "local", SandboxPhase::Ready);
             runtime.store.put_message(&sandbox).await.unwrap();
 
@@ -8529,8 +8582,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn start_persisted_sandboxes_skips_kubernetes_and_extension_drivers() {
-        for driver_name in ["kubernetes", "extension"] {
+    async fn start_persisted_sandboxes_skips_drivers_without_feature() {
+        for driver_name in ["kubernetes", "docker", "extension"] {
             let driver = ControlledDriver::new();
             let runtime = test_runtime_for_driver(driver.clone(), driver_name).await;
             let sandbox = sandbox_record("sb-1", "remote", SandboxPhase::Ready);
@@ -8757,13 +8810,17 @@ mod tests {
         let driver = FakeComputeDriver::new()
             .with_driver_name("fake-remote-driver")
             .with_default_image("openshell/sandbox:remote")
+            .with_features([
+                ComputeDriverFeature::GatewayStartReconciliation,
+                ComputeDriverFeature::PreserveUnspecifiedProcessIdentity,
+            ])
             .with_gateway_listener_requirement(
                 "172.19.0.1:17670",
                 "external driver managed bridge",
             );
         let _server = driver.serve_uds(&socket_path).unwrap();
 
-        let endpoint = connect_remote_compute_driver("external-test", &socket_path)
+        let endpoint = connect_remote_compute_driver("docker", &socket_path)
             .await
             .unwrap();
         let store = Arc::new(Store::connect("sqlite::memory:").await.unwrap());
@@ -8777,11 +8834,12 @@ mod tests {
         )
         .await
         .unwrap();
+        assert!(runtime.preserves_unspecified_process_identity());
         assert_eq!(
             runtime.gateway_listener_requirements(),
             &[GatewayListenerRequirement::Exact {
                 address: "172.19.0.1:17670".parse().unwrap(),
-                driver_name: "external-test".to_string(),
+                driver_name: "docker".to_string(),
                 reason: "external driver managed bridge".to_string(),
             }]
         );
@@ -8794,11 +8852,11 @@ mod tests {
                 driver_config: Some(prost_types::Struct {
                     fields: [
                         (
-                            "external-test".to_string(),
+                            "docker".to_string(),
                             struct_value([("pool", string_value("ci"))]),
                         ),
                         (
-                            "docker".to_string(),
+                            "kubernetes".to_string(),
                             struct_value([("network_mode", string_value("bridge"))]),
                         ),
                     ]
@@ -8812,30 +8870,14 @@ mod tests {
 
         runtime.validate_sandbox_create(&sandbox).await.unwrap();
         runtime.create_sandbox(sandbox, None).await.unwrap();
-        assert!(
-            runtime
-                .delete_sandbox("default", "uds-sandbox")
-                .await
-                .unwrap()
-                .deleted
-        );
-
         let calls = driver.calls();
-        assert_eq!(calls.len(), 5, "unexpected calls: {calls:?}");
-        assert!(matches!(calls[0], FakeComputeDriverCall::GetCapabilities));
-        assert!(matches!(
-            calls[1],
-            FakeComputeDriverCall::GetGatewayListenerRequirements
-        ));
-
+        assert_eq!(calls.len(), 4, "unexpected calls: {calls:?}");
         let validated = match &calls[2] {
             FakeComputeDriverCall::ValidateSandboxCreate {
                 sandbox: Some(sandbox),
             } => sandbox,
             other => panic!("expected ValidateSandboxCreate call, got {other:?}"),
         };
-        assert_eq!(validated.id, "sb-uds");
-        assert_eq!(validated.name, "uds-sandbox");
         let driver_config = validated
             .spec
             .as_ref()
@@ -8845,16 +8887,25 @@ mod tests {
         assert!(driver_config.fields.contains_key("pool"));
         assert!(!driver_config.fields.contains_key("network_mode"));
 
-        let created = match &calls[3] {
-            FakeComputeDriverCall::CreateSandbox {
-                sandbox: Some(sandbox),
-            } => sandbox,
-            other => panic!("expected CreateSandbox call, got {other:?}"),
-        };
-        assert_eq!(created.id, "sb-uds");
-        assert_eq!(created.name, "uds-sandbox");
+        driver.clear_calls();
+        runtime.start_persisted_sandboxes().await.unwrap();
+        assert!(matches!(
+            driver.calls().as_slice(),
+            [FakeComputeDriverCall::StartSandbox { sandbox_id, sandbox_name }]
+                if sandbox_id == "sb-uds" && sandbox_name == "uds-sandbox"
+        ));
+        driver.clear_calls();
+        assert!(
+            runtime
+                .delete_sandbox("default", "uds-sandbox")
+                .await
+                .unwrap()
+                .deleted
+        );
 
-        match &calls[4] {
+        let calls = driver.calls();
+        assert_eq!(calls.len(), 1, "unexpected calls: {calls:?}");
+        match &calls[0] {
             FakeComputeDriverCall::DeleteSandbox {
                 sandbox_id,
                 sandbox_name,
