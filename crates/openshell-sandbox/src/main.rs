@@ -32,7 +32,6 @@ const COPY_SELF_SUBCOMMAND: &str = "copy-self";
 /// run `openshell-sandbox debug-rpc get-sandbox-config --sandbox-id <other>`
 /// to confirm the cross-sandbox IDOR guard fires.
 const DEBUG_RPC_SUBCOMMAND: &str = "debug-rpc";
-const VALIDATE_WORKSPACE_SUBCOMMAND: &str = "validate-workspace";
 
 /// Default `--mode` value: run both supervisor leaves in a single binary.
 const DEFAULT_MODE: &str = "network,process";
@@ -232,50 +231,6 @@ struct Args {
     upstream_proxy_connect_by_hostname: bool,
 }
 
-/// Internal one-shot command used by the privileged supervisor to validate an
-/// image-provided workdir as the final sandbox identity.
-#[derive(Parser, Debug)]
-#[command(name = "validate-workspace", hide = true)]
-struct ValidateWorkspaceArgs {
-    #[arg(long)]
-    workdir: String,
-    #[arg(long)]
-    expected_uid: u32,
-    #[arg(long)]
-    expected_gid: u32,
-}
-
-#[cfg(target_os = "linux")]
-fn validate_workspace(args: &[String]) -> Result<()> {
-    let args = ValidateWorkspaceArgs::try_parse_from(
-        std::iter::once(VALIDATE_WORKSPACE_SUBCOMMAND.to_string()).chain(args.iter().cloned()),
-    )
-    .into_diagnostic()?;
-    let actual = (
-        nix::unistd::geteuid().as_raw(),
-        nix::unistd::getegid().as_raw(),
-    );
-    if actual != (args.expected_uid, args.expected_gid) {
-        return Err(miette::miette!(
-            "workspace validator privilege drop failed: expected {}:{}, got {}:{}",
-            args.expected_uid,
-            args.expected_gid,
-            actual.0,
-            actual.1
-        ));
-    }
-    openshell_supervisor_process::process::validate_oci_workspace_as_effective_identity(Path::new(
-        &args.workdir,
-    ))
-}
-
-#[cfg(not(target_os = "linux"))]
-fn validate_workspace(_args: &[String]) -> Result<()> {
-    Err(miette::miette!(
-        "workspace validation is only supported on Unix"
-    ))
-}
-
 /// Copy the running executable to `dest`, creating parent directories as
 /// needed and ensuring the result is executable (mode `0755`).
 ///
@@ -313,6 +268,17 @@ fn copy_self(dest: &str) -> Result<()> {
         std::fs::set_permissions(&final_path, perms).into_diagnostic()?;
     }
 
+    Ok(())
+}
+
+fn validate_workspace_structure(workdir: Option<&str>) -> Result<()> {
+    let Some(workdir) = workdir else {
+        return Ok(());
+    };
+    if workdir == openshell_core::driver_mounts::DEFAULT_WORKSPACE_ROOT {
+        return Ok(());
+    }
+    openshell_supervisor_process::process::validate_oci_workspace_structure(Path::new(workdir))?;
     Ok(())
 }
 
@@ -524,10 +490,6 @@ fn main() -> Result<()> {
             std::process::exit(exit);
         });
     }
-    if raw_args.get(1).map(String::as_str) == Some(VALIDATE_WORKSPACE_SUBCOMMAND) {
-        return validate_workspace(&raw_args[2..]);
-    }
-
     let args = Args::parse();
 
     if args.mode.network_init {
@@ -539,6 +501,10 @@ fn main() -> Result<()> {
             &args.sidecar_tls_dir,
         );
     }
+
+    // Validate any non-default workspace independently of OCI/policy identity
+    // so explicit run_as fields cannot bypass the structural check.
+    validate_workspace_structure(args.workdir.as_deref())?;
 
     // Try to open a rolling log file; fall back to stderr-only logging if it fails
     // (e.g., /var/log is not writable in custom workload images).
@@ -696,31 +662,6 @@ mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
 
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn workspace_validation_subcommand_uses_final_policy_identity() {
-        let uid = nix::unistd::geteuid().as_raw();
-        let gid = nix::unistd::getegid().as_raw();
-        if uid < 1000 || gid < 1000 {
-            return;
-        }
-        let dir = tempfile::tempdir_in("/tmp").unwrap();
-        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o711)).unwrap();
-        let root = dir.path().canonicalize().unwrap().join("workspace");
-        std::fs::create_dir(&root).unwrap();
-        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let args = vec![
-            "--workdir".to_string(),
-            root.display().to_string(),
-            "--expected-uid".to_string(),
-            uid.to_string(),
-            "--expected-gid".to_string(),
-            gid.to_string(),
-        ];
-
-        validate_workspace(&args).expect("current identity should retain workspace authority");
-    }
-
     /// Drives `copy_self`'s file-copy logic against an arbitrary source path
     /// so tests don't depend on `current_exe()`.
     fn copy_executable(src: &Path, dest: &Path) -> Result<()> {
@@ -757,6 +698,20 @@ mod tests {
         assert_eq!(mode & 0o777, 0o755, "destination must be 0755");
         let copied = std::fs::read(&dest).unwrap();
         assert_eq!(copied, b"#!/bin/false\n");
+    }
+
+    #[test]
+    fn workspace_structure_validation_skips_absent_and_compatibility_workdirs() {
+        validate_workspace_structure(None).expect("standalone invocations need no workdir");
+        validate_workspace_structure(Some(openshell_core::driver_mounts::DEFAULT_WORKSPACE_ROOT))
+            .expect("the managed compatibility workspace needs no structural walk");
+
+        let directory = tempfile::tempdir().unwrap();
+        let directory = directory.path().canonicalize().unwrap();
+        validate_workspace_structure(directory.to_str())
+            .expect("a non-default existing directory should be checked");
+        let missing = directory.join("missing");
+        assert!(validate_workspace_structure(missing.to_str()).is_err());
     }
 
     #[test]

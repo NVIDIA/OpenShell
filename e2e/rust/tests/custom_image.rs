@@ -114,7 +114,7 @@ async fn sandbox_from_custom_dockerfile() {
              touch ssh-oci-user-write; echo ssh-write-ok",
         ])
         .await
-        .expect("SSH child should write to prepared workspace");
+        .expect("SSH child should write to the image-owned workspace");
     assert!(
         ssh_output.contains("ssh-write-ok"),
         "expected SSH write marker:\n{ssh_output}"
@@ -218,30 +218,23 @@ async fn sandbox_from_passwd_less_numeric_oci_user() {
 
 #[tokio::test]
 #[serial(custom_image)]
-async fn sandbox_rejects_image_workdir_that_would_require_new_authority() {
+async fn sandbox_does_not_repair_unwritable_image_workdir() {
     let tmpdir = tempfile::tempdir().expect("create tmpdir");
     let dockerfile_path = tmpdir.path().join("Dockerfile");
     fs::write(&dockerfile_path, UNWRITABLE_WORKDIR_DOCKERFILE_CONTENT).expect("write Dockerfile");
     let dockerfile_str = dockerfile_path.to_str().expect("Dockerfile path is UTF-8");
 
-    let result = SandboxGuard::create_keep_with_args(
+    let mut guard = SandboxGuard::create_keep_with_args(
         &["--from", dockerfile_str, "--no-tty"],
-        &["sh", "-c", "echo should-not-run"],
-        "should-not-run",
+        &[
+            "sh",
+            "-c",
+            "set -eu; test ! -w .; test \"$(stat -c %a .)\" = 755; echo Ready; sleep infinity",
+        ],
+        "Ready",
     )
-    .await;
-    let error = match result {
-        Ok(mut guard) => {
-            guard.cleanup().await;
-            panic!("root-owned workdir must not be made writable for the image user");
-        }
-        Err(error) => error,
-    };
-    let message = error.to_string();
-    assert!(
-        message.contains("WorkingDir")
-            || message.contains("workspace")
-            || message.contains("readiness"),
-        "expected workspace authority failure, got: {message}"
-    );
+    .await
+    .expect("structurally safe workdir should not be rejected or repaired");
+
+    guard.cleanup().await;
 }

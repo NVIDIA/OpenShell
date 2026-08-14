@@ -695,10 +695,8 @@ impl PodmanComputeDriver {
                 "podman image '{image}' inspection did not return an immutable image ID"
             )));
         }
-        let image_user = inspected_image
-            .config
-            .as_ref()
-            .map_or("", |config| config.user.as_str());
+        let resolved_image =
+            container::ResolvedPodmanImage::from_inspect(&inspected_image, &self.config)?;
 
         for image in
             container::podman_driver_image_mount_sources(sandbox, self.config.enable_bind_mounts)
@@ -764,8 +762,7 @@ impl PodmanComputeDriver {
             token_secret_name.as_deref(),
             gpu_devices.as_deref(),
             image,
-            &inspected_image.id,
-            image_user,
+            &resolved_image,
         ) {
             Ok(spec) => spec,
             Err(e) => {
@@ -789,7 +786,7 @@ impl PodmanComputeDriver {
             }
         }
 
-        // 5. Start container.
+        // 4. Start container.
         if let Err(e) = self.client.start_container(&name).await {
             warn!(
                 sandbox_name = %sandbox.name,

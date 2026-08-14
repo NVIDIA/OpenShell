@@ -189,8 +189,8 @@ pub async fn run_sandbox(
 
     // Normalize the active driver's identity contract once, while both the
     // policy and launched image filesystem are available. Kubernetes and
-    // OpenShift retain their authoritative numeric pair; Docker fills only
-    // omitted policy fields from OCI Config.User.
+    // OpenShift retain their authoritative numeric pair; Docker and Podman
+    // fill only omitted policy fields from OCI Config.User.
     #[cfg(unix)]
     let (resolved_process_identity, workspace) = {
         let driver_identity = openshell_supervisor_process::identity::DriverIdentity::from_env()?;

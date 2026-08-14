@@ -689,6 +689,38 @@ fn container_creation_rejects_openshell_control_path_working_dir() {
 }
 
 #[test]
+fn container_creation_protects_forbidden_roots_but_allows_usr_application_paths() {
+    let rejected = DockerImageMetadata {
+        id: "sha256:immutable".to_string(),
+        user: "1234:1235".to_string(),
+        working_dir: "/usr".to_string(),
+        volumes: Vec::new(),
+    };
+    let error = build_container_create_body_for_image(
+        &test_sandbox(),
+        &runtime_config(),
+        &DockerSandboxDriverConfig::default(),
+        None,
+        &rejected,
+    )
+    .unwrap_err();
+    assert!(error.message().contains("forbidden workspace root"));
+
+    let allowed = DockerImageMetadata {
+        working_dir: "/usr/src/app".to_string(),
+        ..rejected
+    };
+    build_container_create_body_for_image(
+        &test_sandbox(),
+        &runtime_config(),
+        &DockerSandboxDriverConfig::default(),
+        None,
+        &allowed,
+    )
+    .expect("application workdirs below /usr remain valid");
+}
+
+#[test]
 fn container_creation_rejects_image_volume_that_masks_working_dir() {
     let sandbox = test_sandbox();
     let metadata = DockerImageMetadata {
@@ -1481,7 +1513,7 @@ fn build_container_create_body_replaces_inherited_cmd_with_workspace_arg() {
     );
     assert_eq!(
         create_body.cmd,
-        Some(vec!["--workdir".to_string(), "/sandbox".to_string()])
+        Some(vec!["--workdir".to_string(), "/sandbox".to_string(),])
     );
     assert_eq!(
         create_body
