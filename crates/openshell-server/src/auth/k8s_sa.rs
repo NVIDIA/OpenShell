@@ -18,17 +18,21 @@
 use super::authenticator::Authenticator;
 use super::principal::{Principal, SandboxIdentitySource, SandboxPrincipal};
 use async_trait::async_trait;
+#[cfg(not(target_os = "windows"))]
+use k8s_openapi::api::authentication::v1::{TokenReview, TokenReviewSpec};
 #[cfg(any(not(target_os = "windows"), test))]
 use k8s_openapi::api::{
-    authentication::v1::{TokenReview, TokenReviewSpec, TokenReviewStatus, UserInfo},
+    authentication::v1::{TokenReviewStatus, UserInfo},
     core::v1::Pod,
 };
 #[cfg(any(not(target_os = "windows"), test))]
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 #[cfg(any(not(target_os = "windows"), test))]
 use kube::Error as KubeError;
+#[cfg(any(not(target_os = "windows"), test))]
+use kube::api::ApiResource;
 #[cfg(not(target_os = "windows"))]
-use kube::api::{Api, ApiResource, PostParams};
+use kube::api::{Api, PostParams};
 #[cfg(any(not(target_os = "windows"), test))]
 use kube::core::DynamicObject;
 #[cfg(any(not(target_os = "windows"), test))]
