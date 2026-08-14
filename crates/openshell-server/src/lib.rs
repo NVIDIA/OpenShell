@@ -284,6 +284,7 @@ pub(crate) async fn run_server(
         config_file,
         guest_tls,
     } = startup;
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
     auth::descriptor_authz::init()
         .map_err(|error| Error::config(format!("invalid gRPC authorization metadata: {error}")))?;
@@ -357,6 +358,7 @@ pub(crate) async fn run_server(
         sandbox_watch_bus.clone(),
         tracing_log_bus.clone(),
         supervisor_sessions.clone(),
+        shutdown_rx.clone(),
     )
     .await?;
     let gateway_interceptors =
@@ -500,8 +502,6 @@ pub(crate) async fn run_server(
     }
 
     let state = Arc::new(state);
-
-    let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
     // Start sandboxes that were stopped during the previous gateway
     // shutdown so the running compute state matches the persisted store.
@@ -872,6 +872,7 @@ fn unsupported_builtin_compute_driver(driver: ComputeDriverKind) -> compute::Com
 #[allow(clippy::too_many_arguments)]
 type OperatorAllowlistArc = Option<openshell_driver_kubernetes::OperatorNamespaceAllowlist>;
 
+#[allow(clippy::too_many_arguments)]
 async fn build_compute_runtime(
     config: &Config,
     driver_startup: compute::driver_config::DriverStartupContext<'_>,
@@ -880,6 +881,7 @@ async fn build_compute_runtime(
     sandbox_watch_bus: SandboxWatchBus,
     tracing_log_bus: TracingLogBus,
     supervisor_sessions: Arc<supervisor_session::SupervisorSessionRegistry>,
+    shutdown_rx: watch::Receiver<bool>,
 ) -> Result<(ComputeRuntime, OperatorAllowlistArc)> {
     let driver = configured_compute_driver(config, driver_startup)?;
     info!(driver = %driver.name(), "Using compute driver");
@@ -903,6 +905,7 @@ async fn build_compute_runtime(
                 sandbox_watch_bus,
                 tracing_log_bus,
                 supervisor_sessions.clone(),
+                shutdown_rx,
             )
             .await
             .map_err(|e| Error::execution(format!("failed to create compute runtime: {e}")))?;

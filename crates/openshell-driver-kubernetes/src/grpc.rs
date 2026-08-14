@@ -124,7 +124,7 @@ impl ComputeDriver for ComputeDriverService {
         self.driver
             .stop_sandbox(&request.sandbox_id)
             .await
-            .map_err(kubernetes_lifecycle_status)?;
+            .map_err(|error| Status::from(openshell_core::ComputeDriverError::from(error)))?;
         Ok(Response::new(StopSandboxResponse {}))
     }
 
@@ -139,7 +139,7 @@ impl ComputeDriver for ComputeDriverService {
         self.driver
             .start_sandbox(&request.sandbox_id)
             .await
-            .map_err(kubernetes_lifecycle_status)?;
+            .map_err(|error| Status::from(openshell_core::ComputeDriverError::from(error)))?;
         Ok(Response::new(StartSandboxResponse {}))
     }
 
@@ -215,41 +215,26 @@ impl ComputeDriver for ComputeDriverService {
         if workspace.is_empty() {
             return Err(Status::invalid_argument("workspace is required"));
         }
-        self.driver
-            .validate_workspace_namespace(&workspace)
-            .map_err(|error| Status::from(openshell_core::ComputeDriverError::from(error)))?;
-        match self.driver.workspace_mode() {
-            WorkspaceMode::Managed => {
-                self.driver
-                    .delete_namespace(&workspace)
-                    .await
-                    .map_err(|e| Status::internal(e.to_string()))?;
-            }
-            WorkspaceMode::Operator => {
-                if let Some(allowlist) = self.driver.operator_allowlist()
-                    && !allowlist.contains(&workspace)
-                {
-                    return Err(Status::permission_denied(format!(
-                        "workspace '{workspace}' is not in the operator namespace allowlist"
-                    )));
-                }
-            }
-            WorkspaceMode::Shared => {}
+        if workspace_delete_requires_namespace_access(self.driver.workspace_mode()) {
+            self.driver
+                .validate_workspace_namespace(&workspace)
+                .map_err(|error| Status::from(openshell_core::ComputeDriverError::from(error)))?;
+            self.driver
+                .delete_namespace(&workspace)
+                .await
+                .map_err(|e| Status::internal(e.to_string()))?;
         }
         Ok(Response::new(DeleteWorkspaceResponse {}))
     }
 }
 
-fn kubernetes_lifecycle_status(message: String) -> Status {
-    if message == "sandbox not found" {
-        Status::not_found(message)
-    } else {
-        Status::internal(message)
-    }
+fn workspace_delete_requires_namespace_access(mode: WorkspaceMode) -> bool {
+    matches!(mode, WorkspaceMode::Managed)
 }
 
 #[cfg(test)]
 mod tests {
+    use super::{WorkspaceMode, workspace_delete_requires_namespace_access};
     use crate::KubernetesDriverError;
     use openshell_core::ComputeDriverError;
     use tonic::Status;
@@ -282,5 +267,26 @@ mod tests {
 
         assert_eq!(status.code(), tonic::Code::AlreadyExists);
         assert_eq!(status.message(), "sandbox already exists");
+    }
+
+    #[test]
+    fn not_found_driver_errors_map_to_not_found_status() {
+        let status: Status = ComputeDriverError::from(KubernetesDriverError::NotFound).into();
+
+        assert_eq!(status.code(), tonic::Code::NotFound);
+        assert_eq!(status.message(), "sandbox not found");
+    }
+
+    #[test]
+    fn only_managed_workspace_delete_accesses_the_namespace() {
+        assert!(workspace_delete_requires_namespace_access(
+            WorkspaceMode::Managed
+        ));
+        assert!(!workspace_delete_requires_namespace_access(
+            WorkspaceMode::Operator
+        ));
+        assert!(!workspace_delete_requires_namespace_access(
+            WorkspaceMode::Shared
+        ));
     }
 }

@@ -793,8 +793,9 @@ impl ComputeRuntime {
         sandbox_watch_bus: SandboxWatchBus,
         tracing_log_bus: TracingLogBus,
         supervisor_sessions: Arc<SupervisorSessionRegistry>,
+        shutdown_rx: watch::Receiver<bool>,
     ) -> Result<(Self, Option<OperatorNamespaceAllowlist>), ComputeError> {
-        let driver = KubernetesComputeDriver::new(config)
+        let driver = KubernetesComputeDriver::new(config, shutdown_rx)
             .await
             .map_err(|err| ComputeError::Message(err.to_string()))?;
         let operator_allowlist_arc = driver.operator_allowlist().cloned();

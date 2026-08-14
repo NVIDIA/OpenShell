@@ -849,6 +849,18 @@ pub struct OperatorNamespaceAllowlist {
 }
 
 impl OperatorNamespaceAllowlist {
+    fn read_guard(&self) -> std::sync::RwLockReadGuard<'_, BTreeSet<String>> {
+        self.inner
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn write_guard(&self) -> std::sync::RwLockWriteGuard<'_, BTreeSet<String>> {
+        self.inner
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -865,44 +877,35 @@ impl OperatorNamespaceAllowlist {
 
     /// Replace the entire allowlist (used by background watchers on refresh).
     pub fn replace(&self, new_set: BTreeSet<String>) {
-        let mut guard = self.inner.write().expect("allowlist lock poisoned");
+        let mut guard = self.write_guard();
         *guard = new_set;
     }
 
     /// Merge additional namespaces into the allowlist.
     pub fn merge(&self, additional: &BTreeSet<String>) {
-        let mut guard = self.inner.write().expect("allowlist lock poisoned");
+        let mut guard = self.write_guard();
         guard.extend(additional.iter().cloned());
     }
 
     /// Read the current allowlist snapshot.
     pub fn read(&self) -> std::sync::RwLockReadGuard<'_, BTreeSet<String>> {
-        self.inner.read().expect("allowlist lock poisoned")
+        self.read_guard()
     }
 
     /// Check whether a namespace is in the allowlist.
     #[must_use]
     pub fn contains(&self, namespace: &str) -> bool {
-        self.inner
-            .read()
-            .expect("allowlist lock poisoned")
-            .contains(namespace)
+        self.read_guard().contains(namespace)
     }
 
     /// Insert a namespace into the allowlist. Returns `true` if it was new.
     pub fn insert(&self, name: String) -> bool {
-        self.inner
-            .write()
-            .expect("allowlist lock poisoned")
-            .insert(name)
+        self.write_guard().insert(name)
     }
 
     /// Remove a namespace from the allowlist. Returns `true` if it was present.
     pub fn remove(&self, name: &str) -> bool {
-        self.inner
-            .write()
-            .expect("allowlist lock poisoned")
-            .remove(name)
+        self.write_guard().remove(name)
     }
 
     /// Return a clone of the inner `Arc` for sharing with background tasks.
@@ -1675,6 +1678,18 @@ mod tests {
     }
 
     #[test]
+    fn namespace_for_workspace_operator_requires_allowlist() {
+        let cfg = KubernetesComputeConfig {
+            workspace_mode: WorkspaceMode::Operator,
+            operator_namespace_label: Some("openshell.ai/workspace=true".to_string()),
+            ..KubernetesComputeConfig::default()
+        };
+
+        let err = cfg.namespace_for_workspace("prod", None).unwrap_err();
+        assert_eq!(err, "operator mode requires a namespace allowlist");
+    }
+
+    #[test]
     fn kube_resource_name_shared_prefixes_workspace() {
         let cfg = KubernetesComputeConfig::default();
         assert_eq!(cfg.kube_resource_name("ws", "box1"), "ws--box1");
@@ -1831,6 +1846,19 @@ mod tests {
     }
 
     #[test]
+    fn validate_workspace_mode_operator_rejects_label_and_file() {
+        let cfg = KubernetesComputeConfig {
+            workspace_mode: WorkspaceMode::Operator,
+            operator_namespace_label: Some("openshell.ai/workspace=true".to_string()),
+            operator_namespace_file: Some("/etc/openshell/namespaces.json".to_string()),
+            ..KubernetesComputeConfig::default()
+        };
+
+        let err = cfg.validate_workspace_mode().unwrap_err();
+        assert!(err.contains("not both"), "{err}");
+    }
+
+    #[test]
     fn dns_1123_label_validation() {
         assert!(is_dns_1123_label("openshell"));
         assert!(is_dns_1123_label("my-gateway-1"));
@@ -1884,5 +1912,21 @@ mod tests {
 
         al.replace(BTreeSet::new());
         assert!(!al.contains("ns1"));
+    }
+
+    #[test]
+    fn operator_allowlist_recovers_from_poisoned_lock() {
+        let al = OperatorNamespaceAllowlist::from_set(BTreeSet::from(["ns1".to_string()]));
+        let shared = al.shared();
+        let _ = std::thread::spawn(move || {
+            let _guard = shared.write().unwrap();
+            panic!("poison allowlist lock");
+        })
+        .join();
+
+        assert!(al.contains("ns1"));
+        assert!(al.insert("ns2".to_string()));
+        assert!(al.read().contains("ns2"));
+        assert!(al.remove("ns1"));
     }
 }

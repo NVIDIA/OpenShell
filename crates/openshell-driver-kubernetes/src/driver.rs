@@ -7,8 +7,8 @@ use super::AppArmorProfile;
 use crate::config::{
     DEFAULT_PROXY_UID, DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME, DEFAULT_SANDBOX_UID,
     DEFAULT_WORKSPACE_STORAGE_SIZE, KubernetesComputeConfig, OperatorNamespaceAllowlist,
-    SupervisorSideloadMethod, SupervisorTopology, WorkspaceMode, managed_namespace,
-    validate_managed_namespace_name,
+    SupervisorSideloadMethod, SupervisorTopology, WorkspaceMode, is_dns_1123_label,
+    managed_namespace, validate_managed_namespace_name,
 };
 use futures::{Stream, StreamExt, TryStreamExt};
 use k8s_openapi::api::core::v1::{
@@ -53,7 +53,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 use tokio::sync::{OnceCell, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{debug, info, warn};
@@ -67,6 +67,8 @@ const MANAGED_SSH_NETWORK_POLICY_NAME: &str = "openshell-sandbox-ssh";
 pub enum KubernetesDriverError {
     #[error("sandbox already exists")]
     AlreadyExists,
+    #[error("sandbox not found")]
+    NotFound,
     #[error("{0}")]
     InvalidArgument(String),
     #[error("{0}")]
@@ -88,6 +90,7 @@ impl From<KubernetesDriverError> for openshell_core::ComputeDriverError {
     fn from(err: KubernetesDriverError) -> Self {
         match err {
             KubernetesDriverError::AlreadyExists => Self::AlreadyExists,
+            KubernetesDriverError::NotFound => Self::NotFound,
             KubernetesDriverError::InvalidArgument(m) => Self::InvalidArgument(m),
             KubernetesDriverError::Precondition(m) => Self::Precondition(m),
             KubernetesDriverError::Message(m) => Self::Message(m),
@@ -355,22 +358,12 @@ fn validate_kubernetes_driver_volume_mounts(
 }
 
 // TODO: replace with an openshell_core Kubernetes-name helper once available.
-fn is_dns_label(label: &str) -> bool {
-    if label.is_empty() || label.len() > 63 || label.starts_with('-') || label.ends_with('-') {
-        return false;
-    }
-    label
-        .bytes()
-        .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
-}
-
-// TODO: replace with an openshell_core Kubernetes-name helper once available.
 fn is_dns_subdomain(value: &str) -> bool {
-    value.len() <= 253 && value.split('.').all(is_dns_label)
+    value.len() <= 253 && value.split('.').all(is_dns_1123_label)
 }
 
 fn validate_kubernetes_dns1123_label(value: &str, field: &str) -> Result<(), String> {
-    if !is_dns_label(value) {
+    if !is_dns_1123_label(value) {
         return Err(format!(
             "{field} must be a DNS-1123 label: use lowercase alphanumeric characters or '-', start and end with an alphanumeric character, and use at most 63 characters"
         ));
@@ -474,7 +467,10 @@ impl std::fmt::Debug for KubernetesComputeDriver {
 }
 
 impl KubernetesComputeDriver {
-    pub async fn new(config: KubernetesComputeConfig) -> Result<Self, KubernetesDriverError> {
+    pub async fn new(
+        config: KubernetesComputeConfig,
+        shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    ) -> Result<Self, KubernetesDriverError> {
         config
             .validate_workspace_mode()
             .map_err(KubernetesDriverError::Precondition)?;
@@ -519,11 +515,12 @@ impl KubernetesComputeDriver {
                     watch_client.clone(),
                     label.clone(),
                     allowlist.clone(),
+                    shutdown_rx.clone(),
                 );
             }
 
             if let Some(ref path) = config.operator_namespace_file {
-                spawn_namespace_file_watcher(path.into(), allowlist.clone());
+                spawn_namespace_file_watcher(path.into(), allowlist.clone(), shutdown_rx.clone());
             }
 
             Some(allowlist)
@@ -660,15 +657,20 @@ impl KubernetesComputeDriver {
         let ns_name = managed_namespace(&self.config.gateway_id, workspace);
         let ns_api: Api<Namespace> = Api::all(self.client.clone());
 
-        let gateway_ns_api: Api<Namespace> = Api::all(self.client.clone());
         let gateway_ns_annotations = match tokio::time::timeout(
             KUBE_API_TIMEOUT,
-            gateway_ns_api.get(&self.config.namespace),
+            ns_api.get(&self.config.namespace),
         )
         .await
         {
             Ok(Ok(ns)) => ns.metadata.annotations.unwrap_or_default(),
-            _ => BTreeMap::new(),
+            Ok(Err(error)) => return Err(KubernetesDriverError::from_kube(error)),
+            Err(_) => {
+                return Err(KubernetesDriverError::Message(format!(
+                    "timeout getting gateway namespace {} for SCC annotations",
+                    self.config.namespace
+                )));
+            }
         };
 
         let mut labels = BTreeMap::new();
@@ -1496,7 +1498,7 @@ impl KubernetesComputeDriver {
         }
     }
 
-    pub async fn stop_sandbox(&self, sandbox_id: &str) -> Result<(), String> {
+    pub async fn stop_sandbox(&self, sandbox_id: &str) -> Result<(), KubernetesDriverError> {
         let (agent_sandbox_api, kube_name, pod_name, namespace, stop_timeout) = self
             .patch_sandbox_operating_state(sandbox_id, false)
             .await?;
@@ -1508,10 +1510,10 @@ impl KubernetesComputeDriver {
         loop {
             let now = tokio::time::Instant::now();
             if now >= deadline {
-                return Err(format!(
+                return Err(KubernetesDriverError::Message(format!(
                     "timed out after {}s waiting for Kubernetes sandbox to stop",
                     stop_timeout.as_secs()
-                ));
+                )));
             }
             let request_timeout = KUBE_API_TIMEOUT.min(deadline.saturating_duration_since(now));
             let object = tokio::time::timeout(
@@ -1520,36 +1522,38 @@ impl KubernetesComputeDriver {
             )
             .await
             .map_err(|_| {
-                format!(
+                KubernetesDriverError::Message(format!(
                     "timed out after {}s waiting for Kubernetes API while checking sandbox stop",
                     request_timeout.as_secs()
-                )
+                ))
             })?
-            .map_err(|err| err.to_string())?;
+            .map_err(KubernetesDriverError::from_kube)?;
             if kubernetes_sandbox_has_stopped_condition(&object) {
                 return Ok(());
             }
             if let Some(error) = kubernetes_sandbox_stop_failure(&object) {
-                return Err(error);
+                return Err(KubernetesDriverError::Message(error));
             }
             if let Some(pod_api) = legacy_pod_api.as_ref()
-                && kubernetes_sandbox_pod_is_gone(pod_api, &pod_name, deadline).await?
+                && kubernetes_sandbox_pod_is_gone(pod_api, &pod_name, deadline)
+                    .await
+                    .map_err(KubernetesDriverError::Message)?
             {
                 return Ok(());
             }
             let now = tokio::time::Instant::now();
             if now >= deadline {
-                return Err(format!(
+                return Err(KubernetesDriverError::Message(format!(
                     "timed out after {}s waiting for Kubernetes sandbox to stop",
                     stop_timeout.as_secs()
-                ));
+                )));
             }
             tokio::time::sleep(poll_interval.min(deadline.saturating_duration_since(now))).await;
             poll_interval = next_stop_poll_interval(poll_interval);
         }
     }
 
-    pub async fn start_sandbox(&self, sandbox_id: &str) -> Result<(), String> {
+    pub async fn start_sandbox(&self, sandbox_id: &str) -> Result<(), KubernetesDriverError> {
         self.patch_sandbox_operating_state(sandbox_id, true)
             .await
             .map(|_| ())
@@ -1559,10 +1563,11 @@ impl KubernetesComputeDriver {
         &self,
         sandbox_id: &str,
         running: bool,
-    ) -> Result<(AgentSandboxApi, String, String, String, Duration), String> {
+    ) -> Result<(AgentSandboxApi, String, String, String, Duration), KubernetesDriverError> {
         let lookup_api = self
             .supported_sandbox_api_for_lookup(self.client.clone())
-            .await?;
+            .await
+            .map_err(KubernetesDriverError::Message)?;
         let selector = self.sandbox_lookup_selector(sandbox_id);
         let list = tokio::time::timeout(
             KUBE_API_TIMEOUT,
@@ -1572,17 +1577,17 @@ impl KubernetesComputeDriver {
         )
         .await
         .map_err(|_| {
-            format!(
+            KubernetesDriverError::Message(format!(
                 "timed out after {}s waiting for Kubernetes API",
                 KUBE_API_TIMEOUT.as_secs()
-            )
+            ))
         })?
-        .map_err(|err| err.to_string())?;
+        .map_err(KubernetesDriverError::from_kube)?;
         let object = list
             .items
             .into_iter()
             .next()
-            .ok_or_else(|| "sandbox not found".to_string())?;
+            .ok_or(KubernetesDriverError::NotFound)?;
         let namespace = object
             .metadata
             .namespace
@@ -1594,10 +1599,9 @@ impl KubernetesComputeDriver {
             &namespace,
         );
         let stop_timeout = kubernetes_sandbox_stop_timeout(&object);
-        let kube_name = object
-            .metadata
-            .name
-            .ok_or_else(|| "sandbox resource has no name".to_string())?;
+        let kube_name = object.metadata.name.ok_or_else(|| {
+            KubernetesDriverError::Message("sandbox resource has no name".to_string())
+        })?;
         let pod_name = object
             .metadata
             .annotations
@@ -1621,12 +1625,12 @@ impl KubernetesComputeDriver {
         )
         .await
         .map_err(|_| {
-            format!(
+            KubernetesDriverError::Message(format!(
                 "timed out after {}s waiting for Kubernetes API",
                 KUBE_API_TIMEOUT.as_secs()
-            )
+            ))
         })?
-        .map_err(|err| err.to_string())?;
+        .map_err(KubernetesDriverError::from_kube)?;
 
         info!(
             sandbox_id,
@@ -4292,17 +4296,34 @@ fn spawn_namespace_label_watcher(
     client: Client,
     label_selector: String,
     allowlist: OperatorNamespaceAllowlist,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) {
     let ns_api: Api<Namespace> = Api::all(client);
     let watcher_config = watcher::Config::default().labels(&label_selector);
+    let jitter_seed = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |duration| {
+            duration.as_secs() ^ u64::from(duration.subsec_nanos())
+        });
 
     tokio::spawn(async move {
+        let mut retry_attempt = 0;
         loop {
             let mut stream = watcher::watcher(ns_api.clone(), watcher_config.clone()).boxed();
 
             loop {
-                match stream.try_next().await {
+                let event = tokio::select! {
+                    result = stream.try_next() => result,
+                    changed = shutdown_rx.changed() => {
+                        if changed.is_err() || *shutdown_rx.borrow() {
+                            return;
+                        }
+                        continue;
+                    }
+                };
+                match event {
                     Ok(Some(Event::Applied(ns))) => {
+                        retry_attempt = 0;
                         if let Some(name) = ns.metadata.name.as_deref()
                             && allowlist.insert(name.to_string())
                         {
@@ -4310,6 +4331,7 @@ fn spawn_namespace_label_watcher(
                         }
                     }
                     Ok(Some(Event::Deleted(ns))) => {
+                        retry_attempt = 0;
                         if let Some(name) = ns.metadata.name.as_deref()
                             && allowlist.remove(name)
                         {
@@ -4320,6 +4342,7 @@ fn spawn_namespace_label_watcher(
                         }
                     }
                     Ok(Some(Event::Restarted(namespaces))) => {
+                        retry_attempt = 0;
                         let names: std::collections::BTreeSet<String> = namespaces
                             .into_iter()
                             .filter_map(|ns| ns.metadata.name)
@@ -4342,7 +4365,17 @@ fn spawn_namespace_label_watcher(
                 }
             }
 
-            tokio::time::sleep(Duration::from_secs(2)).await;
+            let retry_delay = namespace_watcher_retry_delay(retry_attempt, jitter_seed);
+            warn!(?retry_delay, "operator namespace watcher reconnecting");
+            tokio::select! {
+                () = tokio::time::sleep(retry_delay) => {}
+                changed = shutdown_rx.changed() => {
+                    if changed.is_err() || *shutdown_rx.borrow() {
+                        return;
+                    }
+                }
+            }
+            retry_attempt = retry_attempt.saturating_add(1);
         }
     });
 
@@ -4350,6 +4383,15 @@ fn spawn_namespace_label_watcher(
         label_selector = %label_selector,
         "operator namespace label watcher spawned"
     );
+}
+
+fn namespace_watcher_retry_delay(attempt: u32, jitter_seed: u64) -> Duration {
+    let base_secs = 2_u64.saturating_mul(1_u64 << attempt.min(4)).min(24);
+    let max_jitter_secs = base_secs / 4;
+    let mixed_seed =
+        jitter_seed.wrapping_add(u64::from(attempt).wrapping_mul(0x9e37_79b9_7f4a_7c15));
+    let jitter_secs = mixed_seed % (max_jitter_secs + 1);
+    Duration::from_secs(base_secs + jitter_secs)
 }
 
 fn load_namespace_file(path: &Path) -> Result<std::collections::BTreeSet<String>, String> {
@@ -4360,7 +4402,11 @@ fn load_namespace_file(path: &Path) -> Result<std::collections::BTreeSet<String>
     Ok(names.into_iter().collect())
 }
 
-fn spawn_namespace_file_watcher(path: PathBuf, allowlist: OperatorNamespaceAllowlist) {
+fn spawn_namespace_file_watcher(
+    path: PathBuf,
+    allowlist: OperatorNamespaceAllowlist,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) {
     match load_namespace_file(&path) {
         Ok(names) => {
             let count = names.len();
@@ -4428,7 +4474,15 @@ fn spawn_namespace_file_watcher(path: PathBuf, allowlist: OperatorNamespaceAllow
         );
 
         loop {
-            let got_event = rx.recv().await.is_some();
+            let got_event = tokio::select! {
+                event = rx.recv() => event.is_some(),
+                changed = shutdown_rx.changed() => {
+                    if changed.is_err() || *shutdown_rx.borrow() {
+                        return;
+                    }
+                    continue;
+                }
+            };
             if !got_event {
                 warn!("operator namespace file watcher disconnected");
                 break;
@@ -4461,6 +4515,11 @@ fn spawn_namespace_file_watcher(path: PathBuf, allowlist: OperatorNamespaceAllow
                         }
                         warn!("operator namespace file watcher disconnected");
                         return;
+                    }
+                    changed = shutdown_rx.changed() => {
+                        if changed.is_err() || *shutdown_rx.borrow() {
+                            return;
+                        }
                     }
                 }
             }
@@ -7822,6 +7881,29 @@ mod tests {
                 .preconditions
                 .and_then(|preconditions| preconditions.uid),
             Some("namespace-uid".to_string())
+        );
+    }
+
+    #[test]
+    fn namespace_watcher_retry_delay_is_bounded_exponential_with_jitter() {
+        let seed = 42;
+        let expected_ranges = [(2, 2), (4, 5), (8, 10), (16, 20), (24, 30), (24, 30)];
+
+        for (attempt, (minimum, maximum)) in expected_ranges.into_iter().enumerate() {
+            let attempt = u32::try_from(attempt).unwrap();
+            let delay = namespace_watcher_retry_delay(attempt, seed).as_secs();
+            assert!(
+                (minimum..=maximum).contains(&delay),
+                "attempt {attempt} produced {delay}s"
+            );
+        }
+    }
+
+    #[test]
+    fn namespace_watcher_retry_delay_uses_seeded_jitter() {
+        assert_ne!(
+            namespace_watcher_retry_delay(3, 1),
+            namespace_watcher_retry_delay(3, 2)
         );
     }
 }
