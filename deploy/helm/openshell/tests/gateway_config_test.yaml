@@ -380,6 +380,33 @@ tests:
           path: data["gateway.toml"]
           pattern: '\[openshell\.gateway\.tls\]'
 
+  - it: omits client_ca_path from the TLS section when mTLS is disabled
+    template: templates/gateway-config.yaml
+    set:
+      server.tls.enableMtls: false
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '\[openshell\.gateway\.tls\]'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: 'cert_path\s*='
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: 'key_path\s*='
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: 'client_ca_path\s*='
+
+  - it: renders client_ca_path when mTLS is enabled
+    template: templates/gateway-config.yaml
+    set:
+      server.tls.enableMtls: true
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: 'client_ca_path\s*=\s*"/etc/openshell-tls/client-ca/ca\.crt"'
+
   - it: renders server_sans from certManager.serverDnsNames
     set:
       certManager.enabled: true
