@@ -471,6 +471,56 @@ kubectl -n <sandbox-namespace> logs <sandbox-pod> -c openshell-supervisor-networ
 kubectl -n <sandbox-namespace> logs <sandbox-pod> -c agent --tail=200
 ```
 
+#### Corporate upstream proxy
+
+When the deployment routes sandbox egress through a corporate HTTP forward
+proxy, the operator-owned settings render under `[openshell.drivers.kubernetes]`
+from the Helm `upstreamProxy` values. Absent proxy configuration preserves
+direct-dial egress; any present-but-invalid value fails closed at gateway
+startup (`validate_upstream_proxy_config`) rather than silently reverting to a
+direct connection. Confirm the rendered configuration first:
+
+```bash
+kubectl -n openshell get configmap openshell-config -o jsonpath='{.data.gateway\.toml}' | grep -E 'https_proxy|no_proxy|proxy_auth_secret_(name|key)|proxy_auth_allow_insecure|proxy_connect_by_hostname'
+helm -n openshell get values openshell | grep -A8 upstreamProxy
+```
+
+Only `http://host:port` forward proxies are supported; `https://` proxy URLs and
+plain-HTTP egress are out of scope and rejected. Proxy credentials require
+`topology = "sidecar"` — combined topology shares the credential mount with the
+workload, so the gateway rejects credentials there. The credential Secret named
+by `proxy_auth_secret_name` must exist in the sandbox namespace with the key
+named by `proxy_auth_secret_key`, and Kubernetes will not create keys longer
+than 253 bytes or named `.`/`..`.
+
+The proxy arguments and credential mount are injected only into the container
+that runs network supervision (the `agent` container in combined topology, the
+`openshell-supervisor-network` sidecar in sidecar topology). The one-shot
+`openshell-network-init` container and the process `agent` container in sidecar
+topology must never receive them. The credential is projected read-only as the
+`openshell-upstream-proxy-auth` volume at `/run/openshell/upstream-proxy-auth`
+and passed as `--upstream-proxy-auth-file`; it must never appear in env,
+annotations, or command arguments.
+
+```bash
+kubectl -n <sandbox-namespace> get secret <proxy-auth-secret> -o jsonpath='{.data}' >/dev/null && echo "secret present"
+kubectl -n <sandbox-namespace> get pod <sandbox-pod> -o jsonpath='{range .spec.containers[*]}{.name}{" "}{.command}{"\n"}{end}' | grep -- '--upstream-'
+kubectl -n <sandbox-namespace> get pod <sandbox-pod> -o jsonpath='{range .spec.containers[*]}{.name}{": "}{range .volumeMounts[*]}{.name}{" "}{end}{"\n"}{end}' | grep upstream-proxy-auth
+kubectl -n <sandbox-namespace> get events --sort-by=.lastTimestamp | grep -Ei 'secret|MountVolume' | tail -n 20
+```
+
+A missing Secret or wrong key leaves the pod stuck with a
+`MountVolume.SetUp failed` / `secret ... not found` event. If the pod starts but
+egress still fails, the corporate proxy itself is the next suspect: policy-
+approved TLS CONNECT requests that time out after policy evaluation usually mean
+the proxy URL is unreachable from the sandbox namespace, or a cluster-internal
+destination that should be direct is missing from `no_proxy`. Inspect the
+network supervisor logs for CONNECT and upstream-proxy decisions:
+
+```bash
+kubectl -n <sandbox-namespace> logs <sandbox-pod> -c openshell-supervisor-network --tail=200 | grep -Ei 'upstream|connect|proxy'
+```
+
 ### Step 7: Check VM-Backed Gateways
 
 Use the VM driver logs and host diagnostics available in the user's environment. Verify:
