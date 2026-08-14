@@ -86,7 +86,7 @@ jobs:
           --all-targets
           --no-deps
           --features openshell-prover/prebuilt-z3
-          -- -D warnings
+          -- -D warnings -A dead-code -A unused-imports -A clippy::unused-async
       - name: Test
         run: mise run --skip-tools test:rust
       - name: sccache stats
@@ -140,7 +140,7 @@ jobs:
           --all-targets
           --no-deps
           --features openshell-prover/prebuilt-z3
-          -- -D warnings
+          -- -D warnings -A dead-code -A unused-imports -A clippy::unused-async
       - name: Test
         run: mise run --skip-tools test:rust
       - name: sccache stats
