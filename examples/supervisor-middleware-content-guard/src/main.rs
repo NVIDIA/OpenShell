@@ -14,9 +14,9 @@ use openshell_core::proto::{
     Decision, Finding, HttpRequestEvaluation, HttpRequestResult, MiddlewareBinding,
     MiddlewareManifest, SupervisorMiddlewareOperation, SupervisorMiddlewarePhase,
     ValidateConfigRequest, ValidateConfigResponse, WebSocketMessage, WebSocketMessageResult,
-    WebSocketMessageType, WebSocketPreflightAction, WebSocketPreflightDecision,
-    WebSocketSessionEvent, WebSocketSessionEventResult, web_socket_session_event,
-    web_socket_session_event_result,
+    WebSocketPreflightAction, WebSocketPreflightDecision, WebSocketSessionEvent,
+    WebSocketSessionEventResult, web_socket_message, web_socket_message_result,
+    web_socket_session_event, web_socket_session_event_result,
 };
 use prost_types::Struct;
 use prost_types::value::Kind;
@@ -342,12 +342,12 @@ fn evaluate_websocket_message(
     config: &GuardConfig,
     message: &WebSocketMessage,
 ) -> Result<WebSocketMessageResult, Status> {
-    if message.message_type != WebSocketMessageType::Text as i32 {
+    let Some(web_socket_message::Payload::Text(payload)) = message.payload.as_ref() else {
         return Err(Status::invalid_argument(
             "content guard supports only WebSocket text messages",
         ));
-    }
-    let payload_bytes = u64::try_from(message.payload.len()).map_err(|_| {
+    };
+    let payload_bytes = u64::try_from(payload.len()).map_err(|_| {
         Status::invalid_argument("WebSocket text message length is not representable")
     })?;
     if payload_bytes > MAX_PAYLOAD_BYTES {
@@ -355,14 +355,19 @@ fn evaluate_websocket_message(
             "WebSocket text message exceeds {MAX_PAYLOAD_BYTES} bytes"
         )));
     }
-    let payload = std::str::from_utf8(&message.payload)
-        .map_err(|_| Status::invalid_argument("content guard requires a UTF-8 message"))?;
     let result = evaluate(config, payload);
+    let replacement = if result.has_body {
+        Some(web_socket_message_result::Replacement::Text(
+            String::from_utf8(result.body)
+                .expect("content guard replacements are constructed from UTF-8 text"),
+        ))
+    } else {
+        None
+    };
     Ok(WebSocketMessageResult {
         sequence: message.sequence,
         decision: result.decision,
-        replacement: result.body,
-        has_replacement: result.has_body,
+        replacement,
         reason: result.reason,
         findings: result.findings,
         metadata: result.metadata,
@@ -539,8 +544,9 @@ mod tests {
             )),
             event(web_socket_session_event::Event::Message(WebSocketMessage {
                 sequence: 1,
-                message_type: WebSocketMessageType::Text as i32,
-                payload: b"contains prototype-secret".to_vec(),
+                payload: Some(web_socket_message::Payload::Text(
+                    "contains prototype-secret".into(),
+                )),
             })),
             event(web_socket_session_event::Event::SessionEnd(
                 WebSocketSessionEnd::default(),
@@ -570,10 +576,11 @@ mod tests {
             panic!("expected message result");
         };
         assert_eq!(message.decision, Decision::Allow as i32);
-        assert!(message.has_replacement);
         assert_eq!(
-            String::from_utf8(message.replacement).expect("UTF-8 replacement"),
-            "contains [FILTERED]"
+            message.replacement,
+            Some(web_socket_message_result::Replacement::Text(
+                "contains [FILTERED]".into()
+            ))
         );
         assert_eq!(message.findings[0].count, 1);
         assert!(results.next().await.is_none());
@@ -587,8 +594,9 @@ mod tests {
             &config,
             &WebSocketMessage {
                 sequence: 7,
-                message_type: WebSocketMessageType::Text as i32,
-                payload: b"contains prototype-secret".to_vec(),
+                payload: Some(web_socket_message::Payload::Text(
+                    "contains prototype-secret".into(),
+                )),
             },
         )
         .expect("message result");
@@ -597,7 +605,7 @@ mod tests {
         assert_eq!(result.decision, Decision::Deny as i32);
         assert_eq!(result.reason_code, "content_match");
         assert!(!result.reason.contains("prototype-secret"));
-        assert!(!result.has_replacement);
+        assert!(result.replacement.is_none());
     }
 
     #[test]

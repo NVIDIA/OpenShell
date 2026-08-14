@@ -817,7 +817,7 @@ where
                     .as_mut()
                     .map(|session| {
                         session.observe_unsupported_message(
-                            openshell_core::proto::WebSocketMessageType::Binary,
+                            openshell_supervisor_middleware::WebSocketMessageType::Binary,
                             initial_size,
                         )
                     })
@@ -1189,9 +1189,7 @@ where
                 miette!("websocket middleware message missing work admission"),
             )
         })?;
-        let outcome = session
-            .evaluate_text_admitted(text.into_bytes(), admission)
-            .await;
+        let outcome = session.evaluate_text_admitted(text, admission).await;
         ensure_generation_current(host, port, options)?;
         if let Some(ctx) = options.middleware_context {
             crate::l7::middleware::emit_websocket_message_events(ctx, &outcome);
@@ -1217,12 +1215,7 @@ where
             .invocations
             .iter()
             .any(|invocation| invocation.transformed);
-        text = String::from_utf8(outcome.payload).map_err(|_| {
-            terminate(
-                WebSocketTerminationCause::MiddlewareFailure,
-                miette!("websocket middleware returned invalid UTF-8"),
-            )
-        })?;
+        text = outcome.payload;
     }
 
     if middleware_transformed && let Some(inspector) = options.inspector.as_ref() {
@@ -3364,7 +3357,7 @@ network_policies:
     #[derive(Debug)]
     enum ObservedWebSocketRequest {
         SessionStart,
-        Message { sequence: u64, payload: Vec<u8> },
+        Message { sequence: u64, payload: String },
         SessionEnd(openshell_core::proto::WebSocketSessionEndReason),
     }
 
@@ -3430,7 +3423,8 @@ network_policies:
         ) -> std::result::Result<Response<Self::EvaluateWebSocketSessionStream>, Status> {
             use openshell_core::proto::{
                 Decision, WebSocketMessageResult, WebSocketPreflightAction,
-                WebSocketPreflightDecision, WebSocketSessionEventResult, web_socket_session_event,
+                WebSocketPreflightDecision, WebSocketSessionEventResult, web_socket_message,
+                web_socket_message_result, web_socket_session_event,
                 web_socket_session_event_result,
             };
             let mut requests = request.into_inner();
@@ -3455,10 +3449,15 @@ network_policies:
                             })
                         }
                         Some(web_socket_session_event::Event::Message(message)) => {
+                            let web_socket_message::Payload::Text(text) =
+                                message.payload.expect("OpenAI event payload")
+                            else {
+                                panic!("OpenAI event must be text");
+                            };
                             if let Some(observed) = &observed {
                                 let _ = observed.send(ObservedWebSocketRequest::Message {
                                     sequence: message.sequence,
-                                    payload: message.payload.clone(),
+                                    payload: text.clone(),
                                 });
                             }
                             if close_on_first_message {
@@ -3470,11 +3469,8 @@ network_policies:
                             if let Some(release) = &release_message {
                                 release.notified().await;
                             }
-                            let text =
-                                String::from_utf8(message.payload).expect("OpenAI event UTF-8");
                             let deny = text.contains("deny-me");
-                            let replacement =
-                                text.replace("customer-secret", "[REDACTED]").into_bytes();
+                            let replacement = text.replace("customer-secret", "[REDACTED]");
                             Some(WebSocketSessionEventResult {
                                 result: Some(
                                     web_socket_session_event_result::Result::MessageResult(
@@ -3485,12 +3481,11 @@ network_policies:
                                             } else {
                                                 Decision::Allow as i32
                                             },
-                                            replacement: if deny {
-                                                Vec::new()
-                                            } else {
-                                                replacement
-                                            },
-                                            has_replacement: !deny,
+                                            replacement: (!deny).then_some(
+                                                web_socket_message_result::Replacement::Text(
+                                                    replacement,
+                                                ),
+                                            ),
                                             reason_code: if deny {
                                                 "blocked".into()
                                             } else {
@@ -3926,7 +3921,7 @@ network_policies:
             Some(ObservedWebSocketRequest::Message {
                 sequence: 2,
                 payload,
-            }) if payload == br#"{"type":"response.create"}"#
+            }) if payload == r#"{"type":"response.create"}"#
         ));
 
         drop(client_app);
@@ -4641,7 +4636,7 @@ network_policies:
         ));
 
         let failed = session
-            .evaluate_text(br#"{"type":"response.create"}"#.to_vec())
+            .evaluate_text(r#"{"type":"response.create"}"#.into())
             .await;
         assert!(failed.allowed);
         assert!(failed.invocations[0].stage_disabled);

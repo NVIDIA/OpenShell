@@ -9,8 +9,9 @@ mod websocket;
 
 pub use websocket::{
     WebSocketCoverage, WebSocketCoverageState, WebSocketInvocation, WebSocketInvocationOutcome,
-    WebSocketMessageAdmission, WebSocketMessageOutcome, WebSocketPreflightInput,
-    WebSocketPreflightResult, WebSocketSession, WebSocketSessionStartOutcome,
+    WebSocketMessageAdmission, WebSocketMessageOutcome, WebSocketMessageType,
+    WebSocketPreflightInput, WebSocketPreflightResult, WebSocketSession,
+    WebSocketSessionStartOutcome,
 };
 
 #[cfg(test)]
@@ -4467,8 +4468,8 @@ mod tests {
         {
             use openshell_core::proto::{
                 WebSocketMessageResult, WebSocketPreflightAction, WebSocketPreflightDecision,
-                WebSocketSessionEventResult, web_socket_session_event,
-                web_socket_session_event_result,
+                WebSocketSessionEventResult, web_socket_message, web_socket_message_result,
+                web_socket_session_event, web_socket_session_event_result,
             };
 
             let preflight = Arc::clone(&self.preflight);
@@ -4512,17 +4513,23 @@ mod tests {
                             if close_on_first_message {
                                 break;
                             }
-                            let payload = String::from_utf8(value.payload)
-                                .expect("test OpenAI event must be UTF-8")
-                                .replace("customer-secret", "[REDACTED]");
+                            let web_socket_message::Payload::Text(payload) =
+                                value.payload.expect("test OpenAI event payload")
+                            else {
+                                panic!("test OpenAI event must be text");
+                            };
+                            let payload = payload.replace("customer-secret", "[REDACTED]");
                             Some(WebSocketSessionEventResult {
                                 result: Some(
                                     web_socket_session_event_result::Result::MessageResult(
                                         WebSocketMessageResult {
                                             sequence: value.sequence,
                                             decision: Decision::Allow as i32,
-                                            replacement: payload.into_bytes(),
-                                            has_replacement: true,
+                                            replacement: Some(
+                                                web_socket_message_result::Replacement::Text(
+                                                    payload,
+                                                ),
+                                            ),
                                             reason_code: "redacted".into(),
                                             ..Default::default()
                                         },
@@ -4797,10 +4804,7 @@ mod tests {
             let mut session = preflight.session.expect("built-in inspects text");
             assert!(session.start("").await.allowed);
 
-            let coverage = session.observe_unsupported_message(
-                openshell_core::proto::WebSocketMessageType::Binary,
-                23,
-            );
+            let coverage = session.observe_unsupported_message(WebSocketMessageType::Binary, 23);
             assert_eq!(
                 coverage,
                 [WebSocketCoverage {
@@ -4808,12 +4812,12 @@ mod tests {
                     implementation: BUILTIN_REGEX.into(),
                     state: WebSocketCoverageState::UnsupportedMessageType,
                     sequence: Some(1),
-                    message_type: Some(openshell_core::proto::WebSocketMessageType::Binary),
+                    message_type: Some(WebSocketMessageType::Binary),
                     original_size: 23,
                 }]
             );
 
-            let text = session.evaluate_text(br#"{"input":"safe"}"#.to_vec()).await;
+            let text = session.evaluate_text(r#"{"input":"safe"}"#.into()).await;
             assert!(text.allowed);
             assert_eq!(text.invocations[0].sequence, Some(2));
             assert!(!text.invocations[0].failed);
@@ -5011,11 +5015,11 @@ mod tests {
         let mut session = preflight.session.expect("built-in chose to inspect");
         assert!(session.start("realtime").await.allowed);
 
-        let original = br#"{"type":"response.create","response":{"input":"sk-ABCDEFGHIJKLMNOP"}}"#;
-        let redacted = session.evaluate_text(original.to_vec()).await;
+        let original = r#"{"type":"response.create","response":{"input":"sk-ABCDEFGHIJKLMNOP"}}"#;
+        let redacted = session.evaluate_text(original.into()).await;
         assert!(redacted.allowed);
         assert_eq!(
-            String::from_utf8(redacted.payload).expect("transformed UTF-8"),
+            redacted.payload,
             r#"{"type":"response.create","response":{"input":"[REDACTED]"}}"#
         );
         assert_eq!(redacted.invocations[0].sequence, Some(1));
@@ -5029,16 +5033,16 @@ mod tests {
         );
 
         let unchanged = session
-            .evaluate_text(br#"{"type":"response.cancel"}"#.to_vec())
+            .evaluate_text(r#"{"type":"response.cancel"}"#.into())
             .await;
         assert!(unchanged.allowed);
-        assert_eq!(unchanged.payload, br#"{"type":"response.cancel"}"#);
+        assert_eq!(unchanged.payload, r#"{"type":"response.cancel"}"#);
         assert_eq!(unchanged.invocations[0].sequence, Some(2));
         assert!(!unchanged.invocations[0].transformed);
         assert!(unchanged.findings.is_empty());
         assert!(unchanged.metadata.is_empty());
 
-        let oversized = session.evaluate_text(vec![b'a'; 256 * 1024 + 1]).await;
+        let oversized = session.evaluate_text("a".repeat(256 * 1024 + 1)).await;
         assert!(!oversized.allowed);
         assert_eq!(
             oversized.reason,
@@ -5073,7 +5077,7 @@ mod tests {
         let mut session = preflight.session.expect("built-in chose to inspect");
         assert!(session.start("realtime").await.allowed);
 
-        let oversized_payload = vec![b'a'; 256 * 1024 + 1];
+        let oversized_payload = "a".repeat(256 * 1024 + 1);
         let oversized = session.evaluate_text(oversized_payload.clone()).await;
         assert!(oversized.allowed);
         assert_eq!(oversized.payload, oversized_payload);
@@ -5084,11 +5088,11 @@ mod tests {
         );
         assert!(!oversized.invocations[0].stage_disabled);
 
-        let original = br#"{"type":"response.create","response":{"input":"sk-ABCDEFGHIJKLMNOP"}}"#;
-        let redacted = session.evaluate_text(original.to_vec()).await;
+        let original = r#"{"type":"response.create","response":{"input":"sk-ABCDEFGHIJKLMNOP"}}"#;
+        let redacted = session.evaluate_text(original.into()).await;
         assert!(redacted.allowed);
         assert_eq!(
-            String::from_utf8(redacted.payload).expect("transformed UTF-8"),
+            redacted.payload,
             r#"{"type":"response.create","response":{"input":"[REDACTED]"}}"#
         );
         assert_eq!(redacted.invocations[0].sequence, Some(2));
@@ -5135,11 +5139,11 @@ mod tests {
         let mut session = preflight.session.expect("middleware chose to inspect");
         assert!(session.start("realtime").await.allowed);
 
-        let original = br#"{"type":"response.create","response":{"input":"customer-secret"}}"#;
-        let outcome = session.evaluate_text(original.to_vec()).await;
+        let original = r#"{"type":"response.create","response":{"input":"customer-secret"}}"#;
+        let outcome = session.evaluate_text(original.into()).await;
         assert!(outcome.allowed);
         assert_eq!(
-            String::from_utf8(outcome.payload).expect("transformed UTF-8"),
+            outcome.payload,
             r#"{"type":"response.create","response":{"input":"[REDACTED]"}}"#
         );
         assert!(outcome.invocations[0].transformed);
@@ -5206,10 +5210,10 @@ mod tests {
         let mut session = preflight.session.expect("middleware chose to inspect");
         assert!(session.start("realtime").await.allowed);
 
-        let original = br#"{"type":"response.create","response":{"input":"customer-secret"}}"#;
-        let outcome = session.evaluate_text(original.to_vec()).await;
+        let original = r#"{"type":"response.create","response":{"input":"customer-secret"}}"#;
+        let outcome = session.evaluate_text(original.into()).await;
         assert!(outcome.allowed);
-        let transformed = String::from_utf8(outcome.payload).expect("transformed UTF-8");
+        let transformed = outcome.payload;
         assert!(transformed.contains("[REDACTED]"));
         assert!(!transformed.contains("customer-secret"));
         assert!(outcome.invocations[0].transformed);
@@ -5302,7 +5306,7 @@ mod tests {
         );
 
         let first = session
-            .evaluate_text(br#"{"type":"response.create"}"#.to_vec())
+            .evaluate_text(r#"{"type":"response.create"}"#.into())
             .await;
         assert!(first.allowed, "fail-open should bypass the broken stage");
         assert_eq!(first.invocations.len(), 1);
@@ -5325,7 +5329,7 @@ mod tests {
         }
 
         let second = session
-            .evaluate_text(br#"{"type":"response.cancel"}"#.to_vec())
+            .evaluate_text(r#"{"type":"response.cancel"}"#.into())
             .now_or_never()
             .expect("fully disabled session must bypass without waiting for work admission");
         assert!(second.allowed);
@@ -5379,7 +5383,7 @@ mod tests {
         assert!(session.start("").await.allowed);
 
         let first = session
-            .evaluate_text(br#"{"input":"sk-ABCDEFGHIJKLMNOP"}"#.to_vec())
+            .evaluate_text(r#"{"input":"sk-ABCDEFGHIJKLMNOP"}"#.into())
             .await;
         assert!(first.allowed);
         assert!(first.invocations[0].stage_disabled);
@@ -5404,7 +5408,7 @@ mod tests {
         drop(work);
 
         let second = session
-            .evaluate_text(br#"{"input":"sk-QRSTUVWXYZabcdef"}"#.to_vec())
+            .evaluate_text(r#"{"input":"sk-QRSTUVWXYZabcdef"}"#.into())
             .await;
         assert!(second.allowed);
         assert_eq!(second.invocations.len(), 1);

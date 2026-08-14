@@ -95,7 +95,9 @@ pub fn emit_websocket_preflight_events(
 ) {
     emit_websocket_invocations(ctx, &outcome.invocations);
     emit_websocket_coverage(ctx, &outcome.coverage);
-    emit_websocket_findings(ctx, &outcome.findings);
+    for event in websocket_preflight_finding_events(outcome) {
+        ocsf_emit!(event);
+    }
     if outcome.saturated {
         emit_websocket_saturation(ctx);
     }
@@ -132,9 +134,9 @@ pub(super) fn websocket_coverage_events(
                 .sequence
                 .map_or_else(|| "-".to_string(), |sequence| sequence.to_string());
             let message_type = match coverage.message_type {
-                Some(openshell_core::proto::WebSocketMessageType::Text) => "text",
-                Some(openshell_core::proto::WebSocketMessageType::Binary) => "binary",
-                Some(openshell_core::proto::WebSocketMessageType::Unspecified) | None => "-",
+                Some(openshell_supervisor_middleware::WebSocketMessageType::Text) => "text",
+                Some(openshell_supervisor_middleware::WebSocketMessageType::Binary) => "binary",
+                None => "-",
             };
             NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
                 .activity(ActivityId::Other)
@@ -178,29 +180,53 @@ pub(super) fn emit_websocket_message_events(
     if outcome.saturated {
         emit_websocket_saturation(ctx);
     }
-    emit_websocket_findings(ctx, &outcome.findings);
-}
-
-fn emit_websocket_findings(
-    ctx: &L7EvalContext,
-    findings: &[openshell_supervisor_middleware::NamespacedFinding],
-) {
-    for finding in findings {
-        let event = DetectionFindingBuilder::new(openshell_ocsf::ctx::ctx())
-            .severity(SeverityId::Medium)
-            .finding_info(FindingInfo::new(
-                "openshell.middleware.websocket_finding",
-                "WebSocket middleware finding",
-            ))
-            .evidence_pairs(&[
-                ("policy", ctx.policy_name.as_str()),
-                ("host", ctx.host.as_str()),
-                ("middleware", finding.middleware.as_str()),
-            ])
-            .message("WebSocket middleware reported a finding")
-            .build();
+    for event in websocket_message_finding_events(outcome) {
         ocsf_emit!(event);
     }
+}
+
+pub(super) fn websocket_preflight_finding_events(
+    outcome: &openshell_supervisor_middleware::WebSocketPreflightResult,
+) -> Vec<openshell_ocsf::OcsfEvent> {
+    middleware_finding_events(&outcome.findings)
+}
+
+pub(super) fn websocket_message_finding_events(
+    outcome: &openshell_supervisor_middleware::WebSocketMessageOutcome,
+) -> Vec<openshell_ocsf::OcsfEvent> {
+    middleware_finding_events(&outcome.findings)
+}
+
+fn middleware_finding_events(
+    findings: &[openshell_supervisor_middleware::NamespacedFinding],
+) -> Vec<openshell_ocsf::OcsfEvent> {
+    findings
+        .iter()
+        .take(openshell_supervisor_middleware::MAX_MIDDLEWARE_CHAIN_FINDINGS)
+        .map(|finding| {
+            DetectionFindingBuilder::new(openshell_ocsf::ctx::ctx())
+                .severity(match finding.finding.severity.as_str() {
+                    "high" => SeverityId::High,
+                    "low" => SeverityId::Low,
+                    _ => SeverityId::Medium,
+                })
+                .finding_info(FindingInfo::new(
+                    &finding.finding.r#type,
+                    &finding.finding.label,
+                ))
+                .evidence_pairs(&[
+                    ("middleware", &finding.middleware),
+                    ("count", &finding.finding.count.to_string()),
+                ])
+                .unmapped("middleware", finding.middleware.as_str())
+                .unmapped("count", finding.finding.count)
+                .message(format!(
+                    "Middleware finding {} count={}",
+                    finding.finding.r#type, finding.finding.count
+                ))
+                .build()
+        })
+        .collect()
 }
 
 fn emit_websocket_invocations(
@@ -842,34 +868,7 @@ pub(super) fn middleware_events(
     // Each stage and the selected chain are independently bounded by the
     // runner. Keep the derived chain-wide emission bound as defense in depth
     // for manually constructed or future outcome producers.
-    for finding in outcome
-        .findings
-        .iter()
-        .take(openshell_supervisor_middleware::MAX_MIDDLEWARE_CHAIN_FINDINGS)
-    {
-        let event = DetectionFindingBuilder::new(openshell_ocsf::ctx::ctx())
-            .severity(match finding.finding.severity.as_str() {
-                "high" => SeverityId::High,
-                "low" => SeverityId::Low,
-                _ => SeverityId::Medium,
-            })
-            .finding_info(FindingInfo::new(
-                &finding.finding.r#type,
-                &finding.finding.label,
-            ))
-            .evidence_pairs(&[
-                ("middleware", &finding.middleware),
-                ("count", &finding.finding.count.to_string()),
-            ])
-            .unmapped("middleware", finding.middleware.as_str())
-            .unmapped("count", finding.finding.count)
-            .message(format!(
-                "Middleware finding {} count={}",
-                finding.finding.r#type, finding.finding.count
-            ))
-            .build();
-        events.push(event);
-    }
+    events.extend(middleware_finding_events(&outcome.findings));
     events
 }
 
@@ -890,6 +889,7 @@ mod tests {
     use super::{
         middleware_admission_exhausted_event, safe_middleware_headers,
         send_middleware_rejection_response, websocket_coverage_events,
+        websocket_message_finding_events, websocket_preflight_finding_events,
     };
     use crate::l7::relay::L7EvalContext;
     use tokio::io::AsyncReadExt;
@@ -919,9 +919,10 @@ mod tests {
 
     #[test]
     fn websocket_coverage_events_distinguish_selection_from_message_support() {
-        use openshell_core::proto::WebSocketMessageType;
         use openshell_ocsf::SeverityId;
-        use openshell_supervisor_middleware::{WebSocketCoverage, WebSocketCoverageState as State};
+        use openshell_supervisor_middleware::{
+            WebSocketCoverage, WebSocketCoverageState as State, WebSocketMessageType,
+        };
 
         let ctx = L7EvalContext {
             host: "api.example.test".into(),
@@ -966,6 +967,70 @@ mod tests {
         assert!(serialized.contains("\"input_bytes\":23"));
         assert!(!serialized.contains("fail_open"));
         assert!(!serialized.contains("fail_closed"));
+    }
+
+    #[test]
+    fn websocket_preflight_findings_match_http_mapping() {
+        let outcome = openshell_supervisor_middleware::WebSocketPreflightResult {
+            allowed: true,
+            terminal_reason: None,
+            reason: "allowed".into(),
+            denial: None,
+            session: None,
+            findings: vec![test_namespaced_finding()],
+            metadata: std::collections::BTreeMap::new(),
+            invocations: Vec::new(),
+            coverage: Vec::new(),
+            saturated: false,
+            session_capacity_exhausted: false,
+        };
+
+        assert_middleware_finding_mapping(websocket_preflight_finding_events(&outcome));
+    }
+
+    #[test]
+    fn websocket_message_findings_match_http_mapping() {
+        let outcome = openshell_supervisor_middleware::WebSocketMessageOutcome {
+            allowed: true,
+            reason: "allowed".into(),
+            payload: "hello".into(),
+            findings: vec![test_namespaced_finding()],
+            metadata: std::collections::BTreeMap::new(),
+            invocations: Vec::new(),
+            denial: None,
+            saturated: false,
+            platform_oversize: false,
+        };
+
+        assert_middleware_finding_mapping(websocket_message_finding_events(&outcome));
+    }
+
+    fn test_namespaced_finding() -> openshell_supervisor_middleware::NamespacedFinding {
+        openshell_supervisor_middleware::NamespacedFinding {
+            middleware: "content-guard".into(),
+            finding: openshell_core::proto::Finding {
+                r#type: "regex.api_key".into(),
+                label: "API key".into(),
+                count: 3,
+                confidence: "high".into(),
+                severity: "high".into(),
+            },
+        }
+    }
+
+    fn assert_middleware_finding_mapping(events: Vec<openshell_ocsf::OcsfEvent>) {
+        use openshell_ocsf::SeverityId;
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].class_uid(), 2004);
+        assert_eq!(events[0].base().severity, SeverityId::High);
+        let serialized = serde_json::to_string(&events[0]).expect("serialize finding event");
+        assert!(serialized.contains("regex.api_key"));
+        assert!(serialized.contains("API key"));
+        assert!(serialized.contains("content-guard"));
+        assert!(serialized.contains("\"count\":3"));
+        assert!(serialized.contains("Middleware finding regex.api_key count=3"));
+        assert!(!serialized.contains("openshell.middleware.websocket_finding"));
     }
 
     #[tokio::test]

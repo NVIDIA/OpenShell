@@ -129,13 +129,6 @@ enum SupervisorMiddlewarePhase {
   SUPERVISOR_MIDDLEWARE_PHASE_PRE_RETURN = 2;
 }
 
-// Logical WebSocket message type. Raw frame mechanics are never exposed.
-enum WebSocketMessageType {
-  WEB_SOCKET_MESSAGE_TYPE_UNSPECIFIED = 0;
-  WEB_SOCKET_MESSAGE_TYPE_TEXT = 1;
-  WEB_SOCKET_MESSAGE_TYPE_BINARY = 2;
-}
-
 // Why OpenShell is ending a middleware stream.
 enum WebSocketSessionEndReason {
   WEB_SOCKET_SESSION_END_REASON_UNSPECIFIED = 0;
@@ -195,9 +188,13 @@ message WebSocketMessage {
   // strictly increase but need not be contiguous. Reject zero, duplicates, and
   // regressions; accept gaps.
   uint64 sequence = 1;
-  WebSocketMessageType message_type = 2;
-  // Limited to 4 MiB by the platform and the binding-specific cap.
-  bytes payload = 3;
+  // One complete logical payload. Protobuf string decoding enforces UTF-8 for
+  // text messages. Raw frame mechanics are never exposed. Limited to 4 MiB by
+  // the platform and the binding-specific cap.
+  oneof payload {
+    string text = 2;
+    bytes binary = 3;
+  }
 }
 
 // WebSocketSessionEnd is OpenShell's best-effort terminal notification for one
@@ -239,15 +236,17 @@ message WebSocketPreflightDecision {
 }
 
 // WebSocketMessageResult contains the decision and optional replacement for
-// one message. A replacement preserves the input message type; text
-// replacements must be valid UTF-8.
+// one message. A replacement must use the same variant as the input payload.
 message WebSocketMessageResult {
   // Must exactly match the sequence of the corresponding WebSocketMessage.
   uint64 sequence = 1;
   Decision decision = 2;
-  bytes replacement = 3;
-  // True when replacement should be used, including an empty replacement.
-  bool has_replacement = 4;
+  // Absence preserves the input unchanged. Oneof presence distinguishes an
+  // empty replacement from no replacement, and string decoding enforces UTF-8.
+  oneof replacement {
+    string text = 3;
+    bytes binary = 4;
+  }
   // Free-form service diagnostic. OpenShell never exposes this to the
   // workload or security logs. Limited to 4 KiB before discarding.
   string reason = 5;

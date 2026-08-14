@@ -15,7 +15,7 @@ use std::sync::LazyLock;
 use miette::{Result, miette};
 use openshell_core::proto::{
     Decision, Finding, HttpRequestResult, MiddlewareBinding, SupervisorMiddlewareOperation,
-    SupervisorMiddlewarePhase, WebSocketMessageResult,
+    SupervisorMiddlewarePhase, WebSocketMessageResult, web_socket_message_result,
 };
 use regex::Regex;
 use serde::Deserialize;
@@ -120,7 +120,7 @@ pub fn evaluate_http_request(
 
 pub fn evaluate_websocket_text(
     sequence: u64,
-    payload: &[u8],
+    payload: &str,
     config: &prost_types::Struct,
 ) -> Result<WebSocketMessageResult> {
     validate_config(config)?;
@@ -131,20 +131,14 @@ pub fn evaluate_websocket_text(
             "{NAME} WebSocket text message exceeds {MAX_PAYLOAD_BYTES} bytes"
         ));
     }
-    let text = std::str::from_utf8(payload)
-        .map_err(|_| miette!("{NAME} requires UTF-8 WebSocket text messages"))?;
-    let (replacement, matches) = apply_replacements(text);
+    let (replacement, matches) = apply_replacements(payload);
     let (findings, metadata) = findings_and_metadata(&matches);
-    let has_replacement = !matches.is_empty();
+    let replacement = (!matches.is_empty())
+        .then(|| web_socket_message_result::Replacement::Text(replacement.into_owned()));
     Ok(WebSocketMessageResult {
         sequence,
         decision: Decision::Allow as i32,
-        replacement: if has_replacement {
-            replacement.into_owned().into_bytes()
-        } else {
-            Vec::new()
-        },
-        has_replacement,
+        replacement,
         reason: String::new(),
         findings,
         metadata,

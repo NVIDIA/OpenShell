@@ -10,9 +10,9 @@ use std::sync::Arc;
 use miette::{Result, miette};
 use openshell_core::middleware::{HttpRequestView, InProcessMiddleware, WebSocketResponseStream};
 use openshell_core::proto::{
-    HttpRequestResult, MiddlewareManifest, SupervisorMiddlewarePhase, WebSocketMessageType,
-    WebSocketPreflightAction, WebSocketPreflightDecision, WebSocketSessionEvent,
-    WebSocketSessionEventResult, web_socket_session_event, web_socket_session_event_result,
+    HttpRequestResult, MiddlewareManifest, SupervisorMiddlewarePhase, WebSocketPreflightAction,
+    WebSocketPreflightDecision, WebSocketSessionEvent, WebSocketSessionEventResult,
+    web_socket_message, web_socket_session_event, web_socket_session_event_result,
 };
 use tokio_stream::{Stream, StreamExt};
 use tonic::Status;
@@ -111,26 +111,33 @@ impl BuiltinMiddlewareService {
                             message.sequence,
                         ) {
                             Err(error)
-                        } else if message.message_type != WebSocketMessageType::Text as i32 {
-                            Err(Status::invalid_argument(
-                                "openshell/regex supports only client-to-upstream WebSocket text messages",
-                            ))
                         } else {
-                            let selected_config =
-                                config.as_ref().expect("started stream has config");
-                            match regex::evaluate_websocket_text(
-                                message.sequence,
-                                &message.payload,
-                                selected_config,
-                            ) {
-                                Ok(result) => Ok(Some(WebSocketSessionEventResult {
-                                    result: Some(
-                                        web_socket_session_event_result::Result::MessageResult(
-                                            result,
-                                        ),
-                                    ),
-                                })),
-                                Err(error) => Err(Status::invalid_argument(error.to_string())),
+                            match message.payload {
+                                Some(web_socket_message::Payload::Text(payload)) => {
+                                    let selected_config =
+                                        config.as_ref().expect("started stream has config");
+                                    match regex::evaluate_websocket_text(
+                                        message.sequence,
+                                        &payload,
+                                        selected_config,
+                                    ) {
+                                        Ok(result) => Ok(Some(WebSocketSessionEventResult {
+                                            result: Some(
+                                                web_socket_session_event_result::Result::MessageResult(
+                                                    result,
+                                                ),
+                                            ),
+                                        })),
+                                        Err(error) => {
+                                            Err(Status::invalid_argument(error.to_string()))
+                                        }
+                                    }
+                                }
+                                Some(web_socket_message::Payload::Binary(_)) | None => {
+                                    Err(Status::invalid_argument(
+                                        "openshell/regex supports only client-to-upstream WebSocket text messages",
+                                    ))
+                                }
                             }
                         }
                     }
@@ -390,16 +397,19 @@ mod tests {
     #[test]
     fn regex_websocket_text_reuses_findings_and_metadata_semantics() {
         let payload =
-            br#"{"type":"response.create","input":"sk-ABCDEFGHIJKLMNOP sk-QRSTUVWXYZabcdef"}"#;
+            r#"{"type":"response.create","input":"sk-ABCDEFGHIJKLMNOP sk-QRSTUVWXYZabcdef"}"#;
         let result = regex::evaluate_websocket_text(7, payload, &prost_types::Struct::default())
             .expect("evaluate WebSocket text");
 
         assert_eq!(result.sequence, 7);
         assert_eq!(result.decision, Decision::Allow as i32);
-        assert!(result.has_replacement);
         assert_eq!(
-            String::from_utf8(result.replacement).expect("replacement UTF-8"),
-            r#"{"type":"response.create","input":"[REDACTED] [REDACTED]"}"#
+            result.replacement,
+            Some(
+                openshell_core::proto::web_socket_message_result::Replacement::Text(
+                    r#"{"type":"response.create","input":"[REDACTED] [REDACTED]"}"#.into()
+                )
+            )
         );
         assert_eq!(result.findings.len(), 1);
         assert_eq!(result.findings[0].r#type, "regex.openai");
@@ -414,26 +424,22 @@ mod tests {
     fn regex_websocket_no_match_returns_no_replacement_or_findings() {
         let result = regex::evaluate_websocket_text(
             1,
-            br#"{"type":"response.create","input":"public"}"#,
+            r#"{"type":"response.create","input":"public"}"#,
             &prost_types::Struct::default(),
         )
         .expect("evaluate WebSocket text");
 
-        assert!(!result.has_replacement);
-        assert!(result.replacement.is_empty());
+        assert!(result.replacement.is_none());
         assert!(result.findings.is_empty());
         assert!(result.metadata.is_empty());
     }
 
     #[test]
-    fn regex_websocket_rejects_invalid_utf8_and_oversize_messages() {
-        assert!(
-            regex::evaluate_websocket_text(1, &[0xff], &prost_types::Struct::default()).is_err()
-        );
+    fn regex_websocket_rejects_oversize_messages() {
         assert!(
             regex::evaluate_websocket_text(
                 1,
-                &vec![b'a'; 256 * 1024 + 1],
+                &"a".repeat(256 * 1024 + 1),
                 &prost_types::Struct::default(),
             )
             .is_err()

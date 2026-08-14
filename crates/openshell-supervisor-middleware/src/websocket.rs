@@ -13,10 +13,10 @@ use tokio::time::Instant;
 
 use openshell_core::proto::{
     Decision, HttpRequestTarget, RequestContext, SupervisorMiddlewarePhase, WebSocketMessage,
-    WebSocketMessageResult, WebSocketMessageType, WebSocketPreflight, WebSocketPreflightAction,
+    WebSocketMessageResult, WebSocketPreflight, WebSocketPreflightAction,
     WebSocketPreflightDecision, WebSocketSessionEnd, WebSocketSessionEndReason,
-    WebSocketSessionEvent, WebSocketSessionStart, web_socket_session_event,
-    web_socket_session_event_result,
+    WebSocketSessionEvent, WebSocketSessionStart, web_socket_message, web_socket_message_result,
+    web_socket_session_event, web_socket_session_event_result,
 };
 
 use super::{
@@ -84,6 +84,12 @@ pub enum WebSocketCoverageState {
     UnsupportedMessageType,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WebSocketMessageType {
+    Text,
+    Binary,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WebSocketCoverage {
     pub config_name: String,
@@ -123,7 +129,7 @@ pub struct WebSocketSessionStartOutcome {
 pub struct WebSocketMessageOutcome {
     pub allowed: bool,
     pub reason: String,
-    pub payload: Vec<u8>,
+    pub payload: String,
     pub findings: Vec<NamespacedFinding>,
     pub metadata: BTreeMap<String, BTreeMap<String, String>>,
     pub invocations: Vec<WebSocketInvocation>,
@@ -507,7 +513,7 @@ impl WebSocketSession {
             .collect()
     }
 
-    pub async fn evaluate_text(&mut self, payload: Vec<u8>) -> WebSocketMessageOutcome {
+    pub async fn evaluate_text(&mut self, payload: String) -> WebSocketMessageOutcome {
         if payload.len() > MAX_MIDDLEWARE_PAYLOAD_BYTES {
             return platform_oversize_outcome(payload);
         }
@@ -522,7 +528,7 @@ impl WebSocketSession {
 
     pub async fn evaluate_text_admitted(
         &mut self,
-        payload: Vec<u8>,
+        payload: String,
         admission: MiddlewareWorkAdmission,
     ) -> WebSocketMessageOutcome {
         let outcome = self.evaluate_text_admitted_inner(payload, admission).await;
@@ -532,7 +538,7 @@ impl WebSocketSession {
 
     async fn evaluate_text_admitted_inner(
         &mut self,
-        payload: Vec<u8>,
+        payload: String,
         admission: MiddlewareWorkAdmission,
     ) -> WebSocketMessageOutcome {
         if payload.len() > MAX_MIDDLEWARE_PAYLOAD_BYTES {
@@ -599,8 +605,7 @@ impl WebSocketSession {
             let request = WebSocketSessionEvent {
                 event: Some(web_socket_session_event::Event::Message(WebSocketMessage {
                     sequence,
-                    message_type: WebSocketMessageType::Text as i32,
-                    payload: current.clone(),
+                    payload: Some(web_socket_message::Payload::Text(current.clone())),
                 })),
             };
             let response = {
@@ -700,28 +705,32 @@ impl WebSocketSession {
                 }
             };
 
-            let result =
-                match validate_message_result(result, sequence, stage.entry.max_payload_bytes) {
-                    Ok(result) => result,
-                    Err(reason) => {
-                        if let Some(outcome) = handle_stage_failure(
-                            stage,
-                            sequence,
-                            original_size,
-                            reason,
-                            &current,
-                            &findings,
-                            &metadata,
-                            &mut invocations,
-                            saturated,
-                        )
-                        .await
-                        {
-                            return outcome;
-                        }
-                        continue;
+            let result = match validate_message_result(
+                result,
+                sequence,
+                WebSocketMessageType::Text,
+                stage.entry.max_payload_bytes,
+            ) {
+                Ok(result) => result,
+                Err(reason) => {
+                    if let Some(outcome) = handle_stage_failure(
+                        stage,
+                        sequence,
+                        original_size,
+                        reason,
+                        &current,
+                        &findings,
+                        &metadata,
+                        &mut invocations,
+                        saturated,
+                    )
+                    .await
+                    {
+                        return outcome;
                     }
-                };
+                    continue;
+                }
+            };
 
             let decision = Decision::try_from(result.decision).expect("validated decision");
             let reason_code = (!result.reason_code.is_empty()).then(|| result.reason_code.clone());
@@ -762,9 +771,12 @@ impl WebSocketSession {
                 );
             }
 
-            let replacement_size = result.has_replacement.then_some(result.replacement.len());
-            if result.has_replacement {
-                current = result.replacement;
+            let replacement_size = result.replacement.as_ref().map(websocket_replacement_len);
+            let transformed = result.replacement.is_some();
+            if let Some(web_socket_message_result::Replacement::Text(replacement)) =
+                result.replacement
+            {
+                current = replacement;
             }
             invocations.push(success_invocation(
                 &stage.entry,
@@ -772,7 +784,7 @@ impl WebSocketSession {
                 sequence,
                 original_size,
                 replacement_size,
-                result.has_replacement,
+                transformed,
                 reason_code,
             ));
         }
@@ -803,7 +815,7 @@ impl Drop for WebSocketSession {
     }
 }
 
-fn platform_oversize_outcome(payload: Vec<u8>) -> WebSocketMessageOutcome {
+fn platform_oversize_outcome(payload: String) -> WebSocketMessageOutcome {
     WebSocketMessageOutcome {
         allowed: false,
         reason: "websocket_message_over_platform_capacity".to_string(),
@@ -817,7 +829,7 @@ fn platform_oversize_outcome(payload: Vec<u8>) -> WebSocketMessageOutcome {
     }
 }
 
-fn admission_failure_outcome(payload: Vec<u8>) -> WebSocketMessageOutcome {
+fn admission_failure_outcome(payload: String) -> WebSocketMessageOutcome {
     WebSocketMessageOutcome {
         allowed: false,
         reason: "middleware_admission_over_capacity".to_string(),
@@ -831,7 +843,7 @@ fn admission_failure_outcome(payload: Vec<u8>) -> WebSocketMessageOutcome {
     }
 }
 
-fn bypassed_message_outcome(payload: Vec<u8>) -> WebSocketMessageOutcome {
+fn bypassed_message_outcome(payload: String) -> WebSocketMessageOutcome {
     WebSocketMessageOutcome {
         allowed: true,
         reason: String::new(),
@@ -1116,6 +1128,7 @@ fn validate_preflight_decision(
 fn validate_message_result(
     result: WebSocketMessageResult,
     sequence: u64,
+    message_type: WebSocketMessageType,
     stage_limit: usize,
 ) -> Result<WebSocketMessageResult, &'static str> {
     if result.sequence != sequence {
@@ -1133,18 +1146,25 @@ fn validate_message_result(
     if !result.reason_code.is_empty() && !is_stable_reason_code(&result.reason_code) {
         return Err("response_reason_code_invalid");
     }
-    if !result.has_replacement && !result.replacement.is_empty() {
-        return Err("unsolicited_replacement");
-    }
-    if result.has_replacement {
-        if result.replacement.len() > MAX_MIDDLEWARE_PAYLOAD_BYTES {
+    if let Some(replacement) = &result.replacement {
+        if !matches!(
+            (message_type, replacement),
+            (
+                WebSocketMessageType::Text,
+                web_socket_message_result::Replacement::Text(_)
+            ) | (
+                WebSocketMessageType::Binary,
+                web_socket_message_result::Replacement::Binary(_)
+            )
+        ) {
+            return Err("replacement_type_mismatch");
+        }
+        let replacement_len = websocket_replacement_len(replacement);
+        if replacement_len > MAX_MIDDLEWARE_PAYLOAD_BYTES {
             return Err("response_message_over_platform_capacity");
         }
-        if result.replacement.len() > stage_limit {
+        if replacement_len > stage_limit {
             return Err("response_message_over_capacity");
-        }
-        if std::str::from_utf8(&result.replacement).is_err() {
-            return Err("text_replacement_invalid_utf8");
         }
     }
     if result.findings.len() > MAX_MIDDLEWARE_FINDINGS_PER_STAGE
@@ -1170,13 +1190,20 @@ fn validate_message_result(
     Ok(result)
 }
 
+fn websocket_replacement_len(replacement: &web_socket_message_result::Replacement) -> usize {
+    match replacement {
+        web_socket_message_result::Replacement::Text(text) => text.len(),
+        web_socket_message_result::Replacement::Binary(binary) => binary.len(),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn handle_stage_failure(
     stage: &mut WebSocketStage,
     sequence: u64,
     original_size: usize,
     reason: &str,
-    current: &[u8],
+    current: &str,
     findings: &[NamespacedFinding],
     metadata: &BTreeMap<String, BTreeMap<String, String>>,
     invocations: &mut Vec<WebSocketInvocation>,
@@ -1188,7 +1215,7 @@ async fn handle_stage_failure(
     invocations.push(invocation);
     (stage.entry.entry.on_error == OnError::FailClosed).then(|| {
         denied_message_outcome(
-            current.to_vec(),
+            current.to_owned(),
             findings.to_vec(),
             metadata.clone(),
             invocations.clone(),
@@ -1200,7 +1227,7 @@ async fn handle_stage_failure(
 }
 
 fn denied_message_outcome(
-    payload: Vec<u8>,
+    payload: String,
     findings: Vec<NamespacedFinding>,
     metadata: BTreeMap<String, BTreeMap<String, String>>,
     invocations: Vec<WebSocketInvocation>,
@@ -1295,6 +1322,49 @@ fn session_end_request(reason: WebSocketSessionEndReason) -> WebSocketSessionEve
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn protobuf_rejects_invalid_utf8_text_payload() {
+        let encoded_text_with_invalid_utf8 = [0x12, 0x01, 0xff];
+        assert!(WebSocketMessage::decode(encoded_text_with_invalid_utf8.as_slice()).is_err());
+    }
+
+    #[test]
+    fn replacement_presence_preserves_empty_text_and_rejects_type_changes() {
+        let empty_text = WebSocketMessageResult {
+            sequence: 7,
+            decision: Decision::Allow as i32,
+            replacement: Some(web_socket_message_result::Replacement::Text(String::new())),
+            ..Default::default()
+        };
+        let validated = validate_message_result(
+            empty_text,
+            7,
+            WebSocketMessageType::Text,
+            MAX_MIDDLEWARE_PAYLOAD_BYTES,
+        )
+        .expect("empty text replacement must retain oneof presence");
+        assert_eq!(
+            validated.replacement,
+            Some(web_socket_message_result::Replacement::Text(String::new()))
+        );
+
+        let binary_replacement = WebSocketMessageResult {
+            sequence: 7,
+            decision: Decision::Allow as i32,
+            replacement: Some(web_socket_message_result::Replacement::Binary(Vec::new())),
+            ..Default::default()
+        };
+        assert_eq!(
+            validate_message_result(
+                binary_replacement,
+                7,
+                WebSocketMessageType::Text,
+                MAX_MIDDLEWARE_PAYLOAD_BYTES,
+            ),
+            Err("replacement_type_mismatch")
+        );
+    }
 
     #[tokio::test]
     async fn disabling_stage_sends_middleware_failure_once() {
