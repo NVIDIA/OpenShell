@@ -178,6 +178,13 @@ Common findings:
 - A workdir rejected as a special filesystem or OpenShell control-path collision cannot be made valid with permissions. Move the image workdir away from kernel-backed mounts and the concrete supervisor, TLS, token, runtime, and socket paths named in the error.
 - Docker driver cannot initialize because it cannot find `openshell-sandbox`: verify `OPENSHELL_DOCKER_SUPERVISOR_BIN`, the sibling binary next to `openshell-gateway`, or the configured supervisor image contains `/openshell-sandbox`.
 - Sandbox never registers: check gateway logs and supervisor callback endpoint.
+- On macOS, repeated `Policy fetch failed after 5 attempts` messages with a
+  Homebrew gateway bound to `[::1]:17670` indicate that the Docker
+  `host-gateway` IPv4 route has no matching callback listener. Current releases
+  leave `bind_address` unset in the Homebrew config, use the built-in
+  `127.0.0.1:17670` primary listener, and reuse it for authenticated sandbox
+  callbacks. On an older release, set `bind_address = "127.0.0.1:17670"` or
+  upgrade.
 - Supervisor image exits before printing `openshell-sandbox --version`: the image should be the scratch supervisor image from `deploy/docker/Dockerfile.supervisor` and must contain a static executable at `/openshell-sandbox`.
 - `mise run e2e:docker:gpu` fails with `docker info --format json did not report any discovered NVIDIA CDI GPU devices`: Docker may report `CDISpecDirs` while still having no generated NVIDIA CDI specs. Verify `.DiscoveredDevices` contains entries such as `nvidia.com/gpu=all`, verify `/etc/cdi` or `/var/run/cdi` contains a generated NVIDIA spec, and check that `nvidia-cdi-refresh.service` and `nvidia-cdi-refresh.path` from NVIDIA Container Toolkit are enabled and healthy. The service is a one-shot unit, so `inactive (dead)` can be normal after a successful run; use `systemctl status` and `journalctl` to distinguish success from a skipped or failed refresh. NVIDIA recommends enabling the path and service units, and restarting `nvidia-cdi-refresh.service` to regenerate missing or stale CDI specs. If specs are generated but Docker still reports no discovered devices, restart Docker or reload the daemon and re-check `docker info`.
 
@@ -207,14 +214,9 @@ Common findings:
   error: inspect `podman info --debug`, the configured Podman network, and the
   host's IPv4 default route. Rootless pasta uses the private source address
   selected by that route; rootful Podman uses the bridge gateway address.
-- Callback discovery reports that the requested address equals the primary
-  listener: configure a distinct primary address. For Podman Machine, bind the
-  primary listener to IPv6 loopback, for example
-  `bind_address = "[::1]:17670"`, and register the CLI endpoint as
-  `https://localhost:17670`. The generated certificate includes `localhost`,
-  while a raw `https://[::1]:17670` endpoint can fail TLS setup with
-  `invalid dns name`. This leaves `127.0.0.1:17670` available for the
-  callback-only listener.
+- Current gateways reuse the primary listener when it covers Podman's callback
+  address. If the primary does not cover that address, inspect the gateway
+  startup logs for the additional callback-only listener and its provenance.
 - Rootless slirp4netns, another named helper, or missing helper metadata
   requires an explicitly remote `grpc_endpoint`. An explicit `host_gateway_ip`
   cannot bypass slirp4netns host-loopback isolation. Do not work around
@@ -471,6 +473,56 @@ kubectl -n <sandbox-namespace> logs <sandbox-pod> -c openshell-supervisor-networ
 kubectl -n <sandbox-namespace> logs <sandbox-pod> -c agent --tail=200
 ```
 
+#### Corporate upstream proxy
+
+When the deployment routes sandbox egress through a corporate HTTP forward
+proxy, the operator-owned settings render under `[openshell.drivers.kubernetes]`
+from the Helm `upstreamProxy` values. Absent proxy configuration preserves
+direct-dial egress; any present-but-invalid value fails closed at gateway
+startup (`validate_upstream_proxy_config`) rather than silently reverting to a
+direct connection. Confirm the rendered configuration first:
+
+```bash
+kubectl -n openshell get configmap openshell-config -o jsonpath='{.data.gateway\.toml}' | grep -E 'https_proxy|no_proxy|proxy_auth_secret_(name|key)|proxy_auth_allow_insecure|proxy_connect_by_hostname'
+helm -n openshell get values openshell | grep -A8 upstreamProxy
+```
+
+Only `http://host:port` forward proxies are supported; `https://` proxy URLs and
+plain-HTTP egress are out of scope and rejected. Proxy credentials require
+`topology = "sidecar"` — combined topology shares the credential mount with the
+workload, so the gateway rejects credentials there. The credential Secret named
+by `proxy_auth_secret_name` must exist in the sandbox namespace with the key
+named by `proxy_auth_secret_key`, and Kubernetes will not create keys longer
+than 253 bytes or named `.`/`..`.
+
+The proxy arguments and credential mount are injected only into the container
+that runs network supervision (the `agent` container in combined topology, the
+`openshell-supervisor-network` sidecar in sidecar topology). The one-shot
+`openshell-network-init` container and the process `agent` container in sidecar
+topology must never receive them. The credential is projected read-only as the
+`openshell-upstream-proxy-auth` volume at `/run/openshell/upstream-proxy-auth`
+and passed as `--upstream-proxy-auth-file`; it must never appear in env,
+annotations, or command arguments.
+
+```bash
+kubectl -n <sandbox-namespace> get secret <proxy-auth-secret> -o jsonpath='{.data}' >/dev/null && echo "secret present"
+kubectl -n <sandbox-namespace> get pod <sandbox-pod> -o jsonpath='{range .spec.containers[*]}{.name}{" "}{.command}{"\n"}{end}' | grep -- '--upstream-'
+kubectl -n <sandbox-namespace> get pod <sandbox-pod> -o jsonpath='{range .spec.containers[*]}{.name}{": "}{range .volumeMounts[*]}{.name}{" "}{end}{"\n"}{end}' | grep upstream-proxy-auth
+kubectl -n <sandbox-namespace> get events --sort-by=.lastTimestamp | grep -Ei 'secret|MountVolume' | tail -n 20
+```
+
+A missing Secret or wrong key leaves the pod stuck with a
+`MountVolume.SetUp failed` / `secret ... not found` event. If the pod starts but
+egress still fails, the corporate proxy itself is the next suspect: policy-
+approved TLS CONNECT requests that time out after policy evaluation usually mean
+the proxy URL is unreachable from the sandbox namespace, or a cluster-internal
+destination that should be direct is missing from `no_proxy`. Inspect the
+network supervisor logs for CONNECT and upstream-proxy decisions:
+
+```bash
+kubectl -n <sandbox-namespace> logs <sandbox-pod> -c openshell-supervisor-network --tail=200 | grep -Ei 'upstream|connect|proxy'
+```
+
 ### Step 7: Check VM-Backed Gateways
 
 Use the VM driver logs and host diagnostics available in the user's environment. Verify:
@@ -494,7 +546,7 @@ openshell logs <sandbox-name>
 | `openshell status` fails | Gateway endpoint unreachable or auth mismatch | `openshell gateway info`, gateway logs |
 | Gateway starts but sandbox create fails | Compute driver cannot reach runtime | Docker/Podman/Kubernetes/VM driver logs |
 | Gateway exits while resolving compute-driver listener requirements | Callback alias topology is unsupported, the Podman network cannot be inspected, or the selected address is not private/authorized | Gateway startup error, `podman info --debug`, Podman network inspection, host IPv4 default route |
-| Admin, health, reflection, or HTTP request is denied on a Docker/Podman callback address | Negotiated callback listeners intentionally expose only sandbox-callable gRPC methods | Retry through the gateway's primary endpoint; inspect the listener-purpose startup log if the address was unexpected |
+| Admin, health, reflection, or HTTP request is denied on an additional Docker/Podman callback-only listener | Additional callback listeners intentionally expose only sandbox-callable gRPC methods | Retry through the gateway's primary endpoint; inspect the listener-purpose startup log if the address was unexpected |
 | Docker or Podman sandbox never registers | Wrong callback endpoint or supervisor startup failure | Gateway logs and sandbox container logs |
 | Docker GPU e2e fails before GPU sandbox comparison | NVIDIA CDI specs are missing or Docker has not discovered them | `docker info --format '{{json .DiscoveredDevices}}'`, `/etc/cdi`, `/var/run/cdi`, `nvidia-cdi-refresh.service` |
 | Kubernetes gateway pod pending | PVC unbound, taint, selector, or insufficient resources | `kubectl -n openshell describe pod <pod>` |

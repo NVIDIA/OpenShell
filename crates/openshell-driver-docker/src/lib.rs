@@ -55,7 +55,7 @@ use openshell_core::proto_struct::{
 use openshell_core::{Config, Error, Result as CoreResult};
 use std::collections::{HashMap, HashSet};
 use std::io::Read;
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -177,6 +177,7 @@ struct DockerDriverRuntimeConfig {
     grpc_endpoint: String,
     network_name: String,
     gateway_route: DockerGatewayRoute,
+    gateway_callback_bind_address: Option<SocketAddr>,
     ssh_socket_path: String,
     stop_timeout_secs: u32,
     log_level: String,
@@ -428,6 +429,8 @@ impl DockerComputeDriver {
         let host_gateway_ip = parse_optional_host_gateway_ip(&docker_config.host_gateway_ip)?;
         let gateway_route =
             docker_gateway_route(&info, bridge_gateway_ip, gateway_port, host_gateway_ip);
+        let gateway_callback_bind_address =
+            docker_gateway_callback_bind_address(&gateway_route, config.bind_address);
         let mut docker_config = docker_config.clone();
         if docker_config.grpc_endpoint.trim().is_empty() {
             let scheme = if docker_guest_tls_configured(&docker_config) {
@@ -456,6 +459,7 @@ impl DockerComputeDriver {
                 grpc_endpoint,
                 network_name,
                 gateway_route,
+                gateway_callback_bind_address,
                 ssh_socket_path: docker_config.ssh_socket_path.clone(),
                 stop_timeout_secs: DEFAULT_STOP_TIMEOUT_SECS,
                 log_level: config.log_level.clone(),
@@ -1577,15 +1581,19 @@ impl ComputeDriver for DockerComputeDriver {
         &self,
         _request: Request<GetGatewayListenerRequirementsRequest>,
     ) -> Result<Response<GetGatewayListenerRequirementsResponse>, Status> {
-        let requirements = match self.config.gateway_route {
-            DockerGatewayRoute::Bridge { bind_address, .. } => {
-                vec![GatewayListenerRequirement {
-                    reason: "docker managed bridge gateway".to_string(),
-                    selector: Some(Selector::ExactBindAddress(bind_address.to_string())),
-                }]
-            }
-            DockerGatewayRoute::HostGateway => Vec::new(),
-        };
+        let requirements =
+            self.config
+                .gateway_callback_bind_address
+                .map_or_else(Vec::new, |bind_address| {
+                    vec![GatewayListenerRequirement {
+                        reason: match self.config.gateway_route {
+                            DockerGatewayRoute::Bridge { .. } => "docker managed bridge gateway",
+                            DockerGatewayRoute::HostGateway => "docker host-gateway IPv4 loopback",
+                        }
+                        .to_string(),
+                        selector: Some(Selector::ExactBindAddress(bind_address.to_string())),
+                    }]
+                });
         Ok(Response::new(GetGatewayListenerRequirementsResponse {
             requirements,
         }))
@@ -2790,6 +2798,22 @@ fn docker_gateway_route_for_host(
             bind_address: SocketAddr::new(bridge_gateway_ip, port),
             host_alias_ip: bridge_gateway_ip,
         }
+    }
+}
+
+fn docker_gateway_callback_bind_address(
+    route: &DockerGatewayRoute,
+    primary_bind_address: SocketAddr,
+) -> Option<SocketAddr> {
+    match route {
+        DockerGatewayRoute::Bridge { bind_address, .. } => Some(*bind_address),
+        DockerGatewayRoute::HostGateway => match primary_bind_address.ip() {
+            IpAddr::V4(ip) if ip.is_unspecified() || ip == Ipv4Addr::LOCALHOST => None,
+            _ => Some(SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::LOCALHOST),
+                primary_bind_address.port(),
+            )),
+        },
     }
 }
 

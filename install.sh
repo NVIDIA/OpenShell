@@ -470,7 +470,7 @@ detect_platform() {
 local_gateway_endpoint() {
   case "${PLATFORM:-$(detect_platform)}" in
     darwin)
-      printf 'https://[::1]:%s\n' "$LOCAL_GATEWAY_PORT"
+      printf 'https://localhost:%s\n' "$LOCAL_GATEWAY_PORT"
       ;;
     *)
       printf 'https://127.0.0.1:%s\n' "$LOCAL_GATEWAY_PORT"

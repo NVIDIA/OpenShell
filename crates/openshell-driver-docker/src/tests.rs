@@ -102,6 +102,10 @@ fn runtime_config() -> DockerDriverRuntimeConfig {
             ),
             host_alias_ip: IpAddr::V4(Ipv4Addr::new(172, 18, 0, 1)),
         },
+        gateway_callback_bind_address: Some(SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::new(172, 18, 0, 1)),
+            DEFAULT_SERVER_PORT,
+        )),
         ssh_socket_path: "/run/openshell/ssh.sock".to_string(),
         stop_timeout_secs: DEFAULT_STOP_TIMEOUT_SECS,
         log_level: "info".to_string(),
@@ -186,6 +190,7 @@ async fn gateway_listener_requirements_report_managed_bridge_address() {
 async fn gateway_listener_requirements_are_empty_for_host_gateway_route() {
     let mut config = runtime_config();
     config.gateway_route = DockerGatewayRoute::HostGateway;
+    config.gateway_callback_bind_address = None;
     let driver = test_driver_with_config(config);
 
     let response = driver
@@ -195,6 +200,26 @@ async fn gateway_listener_requirements_are_empty_for_host_gateway_route() {
         .into_inner();
 
     assert!(response.requirements.is_empty());
+}
+
+#[tokio::test]
+async fn host_gateway_route_reports_ipv4_loopback_callback_listener() {
+    let mut config = runtime_config();
+    config.gateway_route = DockerGatewayRoute::HostGateway;
+    config.gateway_callback_bind_address = Some("127.0.0.1:17670".parse().unwrap());
+    let driver = test_driver_with_config(config);
+
+    let response = driver
+        .get_gateway_listener_requirements(Request::new(GetGatewayListenerRequirementsRequest {}))
+        .await
+        .unwrap()
+        .into_inner();
+
+    assert_eq!(response.requirements.len(), 1);
+    assert_eq!(
+        response.requirements[0].selector,
+        Some(Selector::ExactBindAddress("127.0.0.1:17670".to_string()))
+    );
 }
 
 #[test]
@@ -296,6 +321,31 @@ fn docker_gateway_route_uses_host_gateway_for_docker_desktop() {
             "host.openshell.internal:host-gateway".to_string()
         ]
     );
+}
+
+#[test]
+fn host_gateway_route_requests_ipv4_loopback_for_ipv6_primary() {
+    assert_eq!(
+        docker_gateway_callback_bind_address(
+            &DockerGatewayRoute::HostGateway,
+            "[::1]:17670".parse().unwrap(),
+        ),
+        Some("127.0.0.1:17670".parse().unwrap())
+    );
+}
+
+#[test]
+fn host_gateway_route_reuses_ipv4_primary_when_it_covers_loopback() {
+    for primary in ["127.0.0.1:17670", "0.0.0.0:17670"] {
+        assert_eq!(
+            docker_gateway_callback_bind_address(
+                &DockerGatewayRoute::HostGateway,
+                primary.parse().unwrap(),
+            ),
+            None,
+            "{primary} already covers the IPv4 loopback callback"
+        );
+    }
 }
 
 #[test]

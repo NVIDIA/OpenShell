@@ -37,18 +37,16 @@ health, metrics, or tunnel routes. The plaintext service router also rejects
 browser requests whose Fetch Metadata, Origin, or Referer headers indicate a
 cross-origin or sibling-subdomain request.
 
-Docker and Podman may negotiate additional listeners that make the gateway
-reachable from their local sandbox network topology. Those listeners accept
+Docker and Podman report the local address through which their sandboxes can
+reach the gateway. When the primary listener covers that address, the gateway
+reuses it; sandbox JWT authentication and its RPC allowlist remain the callback
+authorization boundary. When the primary listener does not cover the address,
+the gateway adds a callback-only listener. Additional callback listeners accept
 only gRPC methods classified as sandbox-callable by the gateway's generated
 authorization metadata. They reject user and administrator APIs, health,
 reflection, non-callback inference APIs, and HTTP routes before normal request
 authentication. The operator-configured primary listener retains the full
 multiplexed API surface.
-
-The gateway rejects a callback requirement that resolves to the exact primary
-listener address because one socket cannot preserve two authorization scopes.
-A wildcard primary listener may cover a callback address because the accepted
-connection's concrete local address still selects the callback-only scope.
 
 The `rpc_auth` classification is also the source of truth for negotiated
 listener exposure: marking an RPC as `sandbox` or `dual` makes it callable on
@@ -699,8 +697,10 @@ system entry instead of pretending to delete package-manager owned state.
 - Compute runtimes own the mechanics of starting workloads and injecting
   callback configuration.
 - Docker-backed local gateways use Docker's `host-gateway` callback alias on
-  macOS and Docker Desktop-style runtimes. Native Linux Docker may expose an
-  additional bridge-gateway listener because the host can bind that bridge IP.
+  macOS and Docker Desktop-style runtimes. They request IPv4 loopback callback
+  reachability and add a listener only when the primary does not cover it.
+  Native Linux Docker may expose an additional bridge-gateway listener because
+  the host can bind that bridge IP.
 - Podman-backed macOS gateways use gvproxy's host-loopback IP for sandbox host
   aliases by default so stale Podman machine images do not need Podman's
   `host-gateway` resolver. Linux Podman keeps the resolver unless

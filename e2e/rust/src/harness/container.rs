@@ -197,6 +197,115 @@ pub struct SupportContainer {
     engine: ContainerEngine,
 }
 
+/// A TCP fixture published on the test host for Kubernetes sandbox e2e tests.
+///
+/// Kubernetes sandboxes reach it through the chart-provided
+/// `host.openshell.internal` alias. Unlike [`SupportContainer`], this does not
+/// require the Docker e2e network used by local-container driver tests.
+pub struct HostSupportContainer {
+    pub port: u16,
+    container_id: String,
+    engine: ContainerEngine,
+}
+
+impl HostSupportContainer {
+    /// Start a Python fixture and publish `container_port` on a free host port.
+    pub async fn start_python(script: &str, container_port: u16) -> Result<Self, String> {
+        Self::start_python_on_host_port(script, container_port, find_free_port()).await
+    }
+
+    /// Start a Python fixture on a caller-selected host port.
+    ///
+    /// Use this when the fixture endpoint must be known before the Helm chart
+    /// starts the gateway, such as the configured corporate forward proxy.
+    pub async fn start_python_on_host_port(
+        script: &str,
+        container_port: u16,
+        port: u16,
+    ) -> Result<Self, String> {
+        let engine = ContainerEngine::from_env()?;
+        let output = engine
+            .command()
+            .args([
+                "run",
+                "--detach",
+                "--entrypoint",
+                "python3",
+                "-p",
+                &format!("{port}:{container_port}"),
+                DEFAULT_TEST_SERVER_IMAGE,
+                "-c",
+                script,
+            ])
+            .output()
+            .map_err(|err| format!("start {} host fixture: {err}", engine.name()))?;
+        if !output.status.success() {
+            return Err(format!(
+                "{} run failed (exit {:?}):\n{}",
+                engine.name(),
+                output.status.code(),
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+        let fixture = Self {
+            port,
+            container_id: String::from_utf8_lossy(&output.stdout).trim().to_string(),
+            engine,
+        };
+        fixture.wait_until_listening(container_port).await?;
+        Ok(fixture)
+    }
+
+    async fn wait_until_listening(&self, container_port: u16) -> Result<(), String> {
+        let deadline = timeout(Duration::from_secs(60), async {
+            let mut tick = interval(Duration::from_millis(500));
+            loop {
+                tick.tick().await;
+                let output = self
+                    .engine
+                    .command()
+                    .args(["exec", &self.container_id, "python3", "-c", &format!("import socket; socket.create_connection(('127.0.0.1', {container_port}), timeout=1).close()")])
+                    .output()
+                    .ok();
+                if output.is_some_and(|output| output.status.success()) {
+                    return;
+                }
+            }
+        })
+        .await;
+        deadline.map_err(|_| {
+            format!(
+                "host fixture did not listen within 60s. Logs:\n{}",
+                self.logs().unwrap_or_else(|err| err)
+            )
+        })
+    }
+
+    pub fn logs(&self) -> Result<String, String> {
+        let output = self
+            .engine
+            .command()
+            .args(["logs", &self.container_id])
+            .output()
+            .map_err(|err| format!("read {} fixture logs: {err}", self.engine.name()))?;
+        Ok(format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        ))
+    }
+}
+
+impl Drop for HostSupportContainer {
+    fn drop(&mut self) {
+        let _ = self
+            .engine
+            .command()
+            .args(["rm", "-f", &self.container_id])
+            .output();
+    }
+}
+
 impl SupportContainer {
     /// Start a `python3 -c <script>` container with `alias` on the shared e2e
     /// network and wait until `ready_port` accepts TCP connections inside the

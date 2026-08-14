@@ -113,6 +113,35 @@ tests:
           path: data["gateway.toml"]
           pattern: 'supervisor[_]topology\s*='
 
+  - it: renders operator-owned upstream proxy settings under the Kubernetes driver
+    template: templates/gateway-config.yaml
+    set:
+      upstreamProxy.url: http://proxy.corp.example:8080
+      upstreamProxy.noProxy: .svc.cluster.local,10.96.0.0/12
+      upstreamProxy.authSecret.name: corporate-proxy-auth
+      upstreamProxy.authSecret.key: credentials
+      upstreamProxy.authAllowInsecure: true
+      upstreamProxy.connectByHostname: true
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.drivers\.kubernetes\].*?https_proxy\s*=\s*"http://proxy\.corp\.example:8080"'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: 'proxy_auth_secret_name\s*=\s*"corporate-proxy-auth"'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: 'proxy_auth_secret_key\s*=\s*"credentials"'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: 'proxy_auth_allow_insecure\s*=\s*true'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: 'no_proxy\s*=\s*"\.svc\.cluster\.local,10\.96\.0\.0/12"'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: 'proxy_connect_by_hostname\s*=\s*true'
+
   - it: uses the gateway built-in supervisor image by default
     template: templates/gateway-config.yaml
     asserts:

@@ -140,6 +140,24 @@ data:
     supervisor_sideload_method   = {{ include "openshell.supervisorSideloadMethod" . | quote }}
     topology                     = {{ .Values.supervisor.topology | default "combined" | quote }}
     sa_token_ttl_secs            = {{ .Values.server.sandboxJwt.k8sSaTokenTtlSecs | default 3600 }}
+    {{- if .Values.upstreamProxy.url }}
+    https_proxy                  = {{ .Values.upstreamProxy.url | quote }}
+    {{- end }}
+    {{- if .Values.upstreamProxy.noProxy }}
+    no_proxy                     = {{ .Values.upstreamProxy.noProxy | quote }}
+    {{- end }}
+    {{- if .Values.upstreamProxy.authSecret.name }}
+    proxy_auth_secret_name       = {{ .Values.upstreamProxy.authSecret.name | quote }}
+    {{- end }}
+    {{- if .Values.upstreamProxy.authSecret.key }}
+    proxy_auth_secret_key        = {{ .Values.upstreamProxy.authSecret.key | quote }}
+    {{- end }}
+    {{- if and .Values.upstreamProxy.authSecret.name .Values.upstreamProxy.authSecret.key }}
+    proxy_auth_allow_insecure    = {{ .Values.upstreamProxy.authAllowInsecure }}
+    {{- end }}
+    {{- if .Values.upstreamProxy.connectByHostname }}
+    proxy_connect_by_hostname    = true
+    {{- end }}
     {{- if .Values.server.providerTokenGrants.spiffe.enabled }}
     provider_spiffe_workload_api_socket_path = {{ .Values.server.providerTokenGrants.spiffe.workloadApiSocketPath | quote }}
     {{- end }}

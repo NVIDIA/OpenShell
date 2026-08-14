@@ -31,7 +31,7 @@ Package-managed gateways do not require a TOML file. Create one at the package's
 
 The Fedora/RHEL RPM template leaves `[openshell.gateway].bind_address` unset. The gateway therefore uses its built-in `127.0.0.1:17670` primary listener. The Podman driver negotiates separate, restricted listeners for sandbox callbacks, so the primary listener does not need a wildcard address. Set `bind_address` explicitly only when clients must reach the primary multiplexed API through another interface.
 
-The Homebrew formula creates its prefix config once with `bind_address = "[::1]:17670"`. Keeping the primary API on IPv6 loopback leaves IPv4 loopback available for Podman Machine's sandbox callback listener. A user config takes precedence, and upgrades do not overwrite either config.
+The Homebrew formula creates its prefix config without setting `bind_address`, so the gateway uses its built-in `127.0.0.1:17670` primary listener. Docker Desktop and Podman Machine reuse that listener for sandbox callbacks. A user config takes precedence. Upgrades preserve user-edited configs and migrate only an unchanged prefix config generated with the affected IPv6-loopback default.
 
 ## Layout
 
@@ -438,6 +438,32 @@ supervisor_sideload_method     = "image-volume"
 # filesystem, and network enforcement in the agent container. "sidecar" moves
 # pod-level network enforcement and gateway session handling into a network sidecar.
 topology                       = "combined"
+# Optional corporate HTTP forward proxy for policy-approved TLS egress. The
+# sandbox workload cannot select or override these settings. Only http:// proxy
+# endpoints and TLS CONNECT traffic are supported; plain HTTP egress remains
+# direct. `no_proxy` bypasses only the corporate proxy, never OpenShell policy.
+# https_proxy                  = "http://proxy.corp.example:8080"
+# no_proxy                     = ".svc,.svc.cluster.local,10.96.0.0/12,10.244.0.0/16"
+# Proxy credentials must be an existing Secret in the sandbox namespace. The
+# key contains a `user:pass` value and is mounted only in the network
+# supervisor container, never in workload environment or command arguments.
+# proxy_auth_secret_name       = "corporate-proxy-auth"
+# proxy_auth_secret_key        = "credentials"
+# The gateway validates the Secret name/key syntax and their configuration
+# relationship at startup; it does not read the Secret from the Kubernetes API.
+# Kubernetes resolves the Secret when the Sandbox Pod starts. A missing key or
+# Secret prevents that Pod from starting; unreadable or malformed `user:pass`
+# content is validated fail-closed by the supervisor at startup and never
+# falls back to direct egress.
+# Proxy credential Secrets require `topology = "sidecar"`. Combined topology
+# shares its credential mount with the workload and can make it readable by the
+# sandbox group through Kubernetes `fsGroup` volume permission handling.
+# Required with a credential Secret: Basic authentication to an http:// proxy
+# is cleartext on the connection to that proxy.
+# proxy_auth_allow_insecure    = true
+# Last resort for hostname-filtering proxy ACLs. The proxy resolves the target,
+# so its ACL becomes part of the egress boundary for proxied connections.
+# proxy_connect_by_hostname    = true
 grpc_endpoint                  = "https://openshell-gateway.agents.svc:8080"
 ssh_socket_path                = "/run/openshell/ssh.sock"
 client_tls_secret_name         = "openshell-client-tls"

@@ -258,11 +258,13 @@ impl From<&KubernetesDriverVolumeMountConfig> for VolumeMount {
 }
 
 const CLIENT_TLS_VOLUME_NAME: &str = "openshell-client-tls";
+const UPSTREAM_PROXY_AUTH_VOLUME_NAME: &str = "openshell-upstream-proxy-auth";
 const SERVICE_ACCOUNT_TOKEN_VOLUME_NAME: &str = "openshell-sa-token";
 const SERVICE_ACCOUNT_TOKEN_MOUNT_PATH: &str = "/var/run/secrets/openshell";
 
 const KUBERNETES_DRIVER_RESERVED_VOLUME_NAMES: &[&str] = &[
     CLIENT_TLS_VOLUME_NAME,
+    UPSTREAM_PROXY_AUTH_VOLUME_NAME,
     SERVICE_ACCOUNT_TOKEN_VOLUME_NAME,
     SPIFFE_WORKLOAD_API_VOLUME_NAME,
     SUPERVISOR_VOLUME_NAME,
@@ -470,6 +472,9 @@ impl KubernetesComputeDriver {
             .map_err(KubernetesDriverError::Precondition)?;
         config
             .validate_proxy_uid()
+            .map_err(KubernetesDriverError::Precondition)?;
+        config
+            .validate_upstream_proxy_config()
             .map_err(KubernetesDriverError::Precondition)?;
         let base_config = match kube::Config::incluster() {
             Ok(c) => c,
@@ -854,6 +859,12 @@ impl KubernetesComputeDriver {
                 .config
                 .sidecar
                 .process_binary_aware_network_policy,
+            https_proxy: self.config.https_proxy.as_deref(),
+            no_proxy: self.config.no_proxy.as_deref(),
+            proxy_auth_secret_name: self.config.proxy_auth_secret_name.as_deref(),
+            proxy_auth_secret_key: self.config.proxy_auth_secret_key.as_deref(),
+            proxy_auth_allow_insecure: self.config.proxy_auth_allow_insecure == Some(true),
+            proxy_connect_by_hostname: self.config.proxy_connect_by_hostname == Some(true),
             service_account_name: &self.config.service_account_name,
             sandbox_id: &sandbox.id,
             sandbox_name: &sandbox.name,
@@ -1717,19 +1728,20 @@ fn apply_supervisor_binary_source(
 /// side-loaded binary as root so it can create network namespaces, set up the
 /// proxy, and configure Landlock/seccomp.
 #[allow(clippy::similar_names)]
-fn apply_supervisor_sideload(
+fn apply_supervisor_sideload_with_params(
     pod_template: &mut serde_json::Value,
-    supervisor_image: &str,
-    supervisor_image_pull_policy: &str,
-    method: SupervisorSideloadMethod,
-    sandbox_uid: u32,
-    sandbox_gid: u32,
+    params: &SandboxPodParams<'_>,
 ) {
     let Some(spec) = pod_template.get_mut("spec").and_then(|v| v.as_object_mut()) else {
         return;
     };
 
-    apply_supervisor_binary_source(spec, supervisor_image, supervisor_image_pull_policy, method);
+    apply_supervisor_binary_source(
+        spec,
+        params.supervisor_image,
+        params.supervisor_image_pull_policy,
+        params.supervisor_sideload_method,
+    );
 
     // Find the agent container and add volume mount + command override
     let Some(containers) = spec.get_mut("containers").and_then(|v| v.as_array_mut()) else {
@@ -1747,14 +1759,13 @@ fn apply_supervisor_sideload(
 
     if let Some(container) = containers.get_mut(index).and_then(|v| v.as_object_mut()) {
         // Override command to use the side-loaded supervisor binary
-        container.insert(
-            "command".to_string(),
-            serde_json::json!([
-                format!("{}/openshell-sandbox", SUPERVISOR_MOUNT_PATH),
-                "--workdir",
-                driver_mounts::DEFAULT_WORKSPACE_ROOT
-            ]),
-        );
+        let mut command = vec![
+            format!("{}/openshell-sandbox", SUPERVISOR_MOUNT_PATH),
+            "--workdir".to_string(),
+            driver_mounts::DEFAULT_WORKSPACE_ROOT.to_string(),
+        ];
+        command.extend(upstream_proxy_cli_args(params));
+        container.insert("command".to_string(), serde_json::json!(command));
 
         // Force the supervisor to run as root (UID 0). Sandbox images may set
         // a non-root USER directive (e.g. `USER sandbox`), but the supervisor
@@ -1785,9 +1796,88 @@ fn apply_supervisor_sideload(
             .or_insert_with(|| serde_json::json!([]))
             .as_array_mut();
         if let Some(env) = env {
-            apply_resolved_identity_env(env, sandbox_uid, sandbox_gid);
+            apply_resolved_identity_env(env, params.sandbox_uid, params.sandbox_gid);
+        }
+        if has_upstream_proxy_credentials(params) {
+            let volume_mounts = container
+                .entry("volumeMounts")
+                .or_insert_with(|| serde_json::json!([]))
+                .as_array_mut();
+            if let Some(volume_mounts) = volume_mounts {
+                volume_mounts.push(upstream_proxy_auth_volume_mount());
+            }
         }
     }
+}
+
+#[cfg(test)]
+#[allow(clippy::similar_names)]
+fn apply_supervisor_sideload(
+    pod_template: &mut serde_json::Value,
+    supervisor_image: &str,
+    supervisor_image_pull_policy: &str,
+    method: SupervisorSideloadMethod,
+    sandbox_uid: u32,
+    sandbox_gid: u32,
+) {
+    let params = SandboxPodParams {
+        supervisor_image,
+        supervisor_image_pull_policy,
+        supervisor_sideload_method: method,
+        sandbox_uid,
+        sandbox_gid,
+        ..SandboxPodParams::default()
+    };
+    apply_supervisor_sideload_with_params(pod_template, &params);
+}
+
+fn upstream_proxy_cli_args(params: &SandboxPodParams<'_>) -> Vec<String> {
+    let mut args = Vec::new();
+    if let Some(url) = params.https_proxy {
+        args.extend(["--upstream-proxy".to_string(), url.to_string()]);
+    }
+    if let Some(list) = params.no_proxy {
+        args.extend(["--upstream-no-proxy".to_string(), list.to_string()]);
+    }
+    if has_upstream_proxy_credentials(params) {
+        args.extend([
+            "--upstream-proxy-auth-file".to_string(),
+            openshell_core::container_paths::UPSTREAM_PROXY_AUTH_MOUNT_PATH.to_string(),
+        ]);
+    }
+    if params.proxy_auth_allow_insecure {
+        args.push("--upstream-proxy-auth-allow-insecure".to_string());
+    }
+    if params.proxy_connect_by_hostname {
+        args.push("--upstream-proxy-connect-by-hostname".to_string());
+    }
+    args
+}
+
+fn upstream_proxy_auth_volume_mount() -> serde_json::Value {
+    serde_json::json!({
+        "name": UPSTREAM_PROXY_AUTH_VOLUME_NAME,
+        "mountPath": upstream_proxy_auth_volume_mount_path(),
+        "readOnly": true,
+    })
+}
+
+fn upstream_proxy_auth_volume_mount_path() -> &'static str {
+    Path::new(openshell_core::container_paths::UPSTREAM_PROXY_AUTH_MOUNT_PATH)
+        .parent()
+        .and_then(Path::to_str)
+        .expect("upstream proxy auth path has a parent directory")
+}
+
+fn upstream_proxy_auth_file_name() -> &'static str {
+    Path::new(openshell_core::container_paths::UPSTREAM_PROXY_AUTH_MOUNT_PATH)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .expect("upstream proxy auth path has a UTF-8 file name")
+}
+
+fn has_upstream_proxy_credentials(params: &SandboxPodParams<'_>) -> bool {
+    params.proxy_auth_secret_name.is_some() && params.proxy_auth_secret_key.is_some()
 }
 
 fn sidecar_state_volume_mount() -> serde_json::Value {
@@ -1927,6 +2017,14 @@ fn supervisor_sidecar_container(
             }
         ]
     });
+    container["command"]
+        .as_array_mut()
+        .expect("network supervisor command is an array")
+        .extend(
+            upstream_proxy_cli_args(params)
+                .into_iter()
+                .map(serde_json::Value::String),
+        );
     if !params.supervisor_image_pull_policy.is_empty() {
         container["imagePullPolicy"] = serde_json::json!(params.supervisor_image_pull_policy);
     }
@@ -1939,6 +2037,12 @@ fn supervisor_sidecar_container(
                 "mountPath": spiffe_socket_mount_path(params.provider_spiffe_workload_api_socket_path),
                 "readOnly": true,
             }));
+    }
+    if has_upstream_proxy_credentials(params) {
+        container["volumeMounts"]
+            .as_array_mut()
+            .expect("volumeMounts is an array")
+            .push(upstream_proxy_auth_volume_mount());
     }
     if let Some(profile) = params.app_armor_profile {
         container["securityContext"]["appArmorProfile"] = app_armor_profile_to_k8s(profile);
@@ -2320,6 +2424,7 @@ fn default_workspace_volume_claim_templates(
 }
 
 /// Parameters shared by `sandbox_to_k8s_spec` and `sandbox_template_to_k8s`.
+#[allow(clippy::struct_excessive_bools)]
 struct SandboxPodParams<'a> {
     default_image: &'a str,
     image_pull_policy: &'a str,
@@ -2330,6 +2435,12 @@ struct SandboxPodParams<'a> {
     topology: SupervisorTopology,
     proxy_uid: u32,
     process_binary_aware_network_policy: bool,
+    https_proxy: Option<&'a str>,
+    no_proxy: Option<&'a str>,
+    proxy_auth_secret_name: Option<&'a str>,
+    proxy_auth_secret_key: Option<&'a str>,
+    proxy_auth_allow_insecure: bool,
+    proxy_connect_by_hostname: bool,
     service_account_name: &'a str,
     sandbox_id: &'a str,
     sandbox_name: &'a str,
@@ -2365,6 +2476,12 @@ impl Default for SandboxPodParams<'_> {
             topology: SupervisorTopology::default(),
             proxy_uid: DEFAULT_PROXY_UID,
             process_binary_aware_network_policy: true,
+            https_proxy: None,
+            no_proxy: None,
+            proxy_auth_secret_name: None,
+            proxy_auth_secret_key: None,
+            proxy_auth_allow_insecure: false,
+            proxy_connect_by_hostname: false,
             service_account_name: DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME,
             sandbox_id: "",
             sandbox_name: "",
@@ -2770,6 +2887,32 @@ fn sandbox_template_to_k8s_with_validated_config(
             }
         }));
     }
+    if has_upstream_proxy_credentials(params) {
+        let secret_name = params
+            .proxy_auth_secret_name
+            .expect("complete proxy credential reference has a Secret name");
+        let secret_key = params
+            .proxy_auth_secret_key
+            .expect("complete proxy credential reference has a Secret key");
+        // The credential volume is mounted only into the container that runs
+        // network supervision. Sidecar mode uses the pod fsGroup already
+        // required for its non-root network supervisor.
+        let default_mode = match params.topology {
+            SupervisorTopology::Combined => 0o400,
+            SupervisorTopology::Sidecar => 0o440,
+        };
+        volumes.push(serde_json::json!({
+            "name": UPSTREAM_PROXY_AUTH_VOLUME_NAME,
+            "secret": {
+                "secretName": secret_name,
+                "defaultMode": default_mode,
+                "items": [{
+                    "key": secret_key,
+                    "path": upstream_proxy_auth_file_name(),
+                }]
+            }
+        }));
+    }
     if params.provider_spiffe_enabled {
         volumes.push(serde_json::json!({
             "name": SPIFFE_WORKLOAD_API_VOLUME_NAME,
@@ -2830,14 +2973,7 @@ fn sandbox_template_to_k8s_with_validated_config(
 
     match params.topology {
         SupervisorTopology::Combined => {
-            apply_supervisor_sideload(
-                &mut result,
-                params.supervisor_image,
-                params.supervisor_image_pull_policy,
-                params.supervisor_sideload_method,
-                params.sandbox_uid,
-                params.sandbox_gid,
-            );
+            apply_supervisor_sideload_with_params(&mut result, params);
         }
         SupervisorTopology::Sidecar => {
             apply_supervisor_sidecar_topology(
@@ -6430,5 +6566,102 @@ mod tests {
                 .get("storageClassName")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn upstream_proxy_is_injected_only_into_network_supervisors() {
+        let params = SandboxPodParams {
+            topology: SupervisorTopology::Sidecar,
+            supervisor_sideload_method: SupervisorSideloadMethod::InitContainer,
+            supervisor_image: "supervisor-image:latest",
+            https_proxy: Some("http://proxy.corp.example:8080"),
+            no_proxy: Some(".svc.cluster.local,10.96.0.0/12"),
+            proxy_auth_secret_name: Some("corporate-proxy-auth"),
+            proxy_auth_secret_key: Some("credentials"),
+            proxy_auth_allow_insecure: true,
+            proxy_connect_by_hostname: true,
+            sandbox_uid: 1500,
+            sandbox_gid: 1500,
+            ..SandboxPodParams::default()
+        };
+        let pod = sandbox_template_to_k8s(
+            &SandboxTemplate::default(),
+            false,
+            &std::collections::HashMap::new(),
+            false,
+            &params,
+        );
+        let containers = pod["spec"]["containers"].as_array().unwrap();
+        let network = containers
+            .iter()
+            .find(|container| container["name"] == SUPERVISOR_NETWORK_SIDECAR_NAME)
+            .unwrap();
+        let command = network["command"].as_array().unwrap();
+        assert!(command.iter().any(|arg| arg == "--upstream-proxy"));
+        assert!(command.iter().any(|arg| arg == "--upstream-no-proxy"));
+        let auth_file_index = command
+            .iter()
+            .position(|arg| arg == "--upstream-proxy-auth-file")
+            .unwrap();
+        assert_eq!(
+            command[auth_file_index + 1],
+            openshell_core::container_paths::UPSTREAM_PROXY_AUTH_MOUNT_PATH
+        );
+        assert!(
+            command
+                .iter()
+                .any(|arg| arg == "--upstream-proxy-auth-allow-insecure")
+        );
+        assert!(
+            command
+                .iter()
+                .any(|arg| arg == "--upstream-proxy-connect-by-hostname")
+        );
+        assert!(
+            network["volumeMounts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|mount| mount["name"] == UPSTREAM_PROXY_AUTH_VOLUME_NAME)
+        );
+
+        let init = pod["spec"]["initContainers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|container| container["name"] == SUPERVISOR_NETWORK_INIT_CONTAINER_NAME)
+            .unwrap();
+        assert!(!init["command"].as_array().unwrap().iter().any(|arg| {
+            arg.as_str()
+                .is_some_and(|arg| arg.starts_with("--upstream-"))
+        }));
+        let agent = containers
+            .iter()
+            .find(|container| container["name"] == "agent")
+            .unwrap();
+        assert!(
+            !agent["volumeMounts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|mount| mount["name"] == UPSTREAM_PROXY_AUTH_VOLUME_NAME)
+        );
+        assert!(!agent["env"].as_array().unwrap().iter().any(|entry| {
+            entry["value"] == "corporate-proxy-auth" || entry["value"] == "credentials"
+        }));
+
+        let volume = pod["spec"]["volumes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|volume| volume["name"] == UPSTREAM_PROXY_AUTH_VOLUME_NAME)
+            .unwrap();
+        assert_eq!(volume["secret"]["secretName"], "corporate-proxy-auth");
+        assert_eq!(volume["secret"]["items"][0]["key"], "credentials");
+        assert_eq!(
+            volume["secret"]["items"][0]["path"],
+            upstream_proxy_auth_file_name()
+        );
+        assert_eq!(volume["secret"]["defaultMode"], 0o440);
     }
 }
