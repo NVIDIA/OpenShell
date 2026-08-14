@@ -3790,7 +3790,9 @@ fn sandbox_template_to_k8s_with_validated_config(
         // required for its non-root network supervisor.
         let default_mode = match params.topology {
             SupervisorTopology::Combined => 0o400,
-            SupervisorTopology::Sidecar => 0o440,
+            // cni-sidecar uses the same sidecar runtime model as Sidecar: the
+            // non-root network supervisor reads the credential via the pod fsGroup.
+            SupervisorTopology::Sidecar | SupervisorTopology::CniSidecar => 0o440,
         };
         volumes.push(serde_json::json!({
             "name": UPSTREAM_PROXY_AUTH_VOLUME_NAME,
