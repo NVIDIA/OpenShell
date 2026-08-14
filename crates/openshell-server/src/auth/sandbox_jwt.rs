@@ -166,6 +166,11 @@ impl SandboxJwtIssuer {
         sandbox_id: Option<&str>,
         ttl: Duration,
     ) -> Result<MintedToken, Status> {
+        if audience.as_str() == self.audience {
+            return Err(Status::invalid_argument(
+                "extension audience must not equal the gateway sandbox audience",
+            ));
+        }
         if ttl.is_zero() || ttl > MAX_EXTENSION_TOKEN_TTL {
             return Err(Status::invalid_argument(format!(
                 "extension token TTL must be between 1 and {} seconds",
@@ -275,6 +280,16 @@ impl SandboxJwtAuthenticator {
             debug!(error = %e, "sandbox JWT header decode failed");
             Status::unauthenticated("invalid token")
         })?;
+
+        // Extension credentials share this signing key during alpha, but are
+        // never valid sandbox admission credentials. Check the explicit type
+        // before `kid` fallthrough so another authenticator cannot accept one.
+        // Legacy and untyped sandbox JWTs remain valid for rolling upgrades.
+        if header.typ.as_deref() == Some(EXTENSION_JWT_TYP) {
+            return Err(Status::unauthenticated(
+                "extension tokens cannot authenticate to the gateway",
+            ));
+        }
 
         // Fall through to other authenticators when the kid does not match —
         // OIDC issuers may share the Bearer slot.
@@ -440,6 +455,54 @@ mod tests {
             }
             _ => panic!("expected Sandbox principal"),
         }
+    }
+
+    #[tokio::test]
+    async fn extension_token_cannot_authenticate_as_a_sandbox() {
+        let mat = generate_jwt_key().expect("jwt key");
+        let issuer = SandboxJwtIssuer::from_pem(
+            mat.signing_key_pem.as_bytes(),
+            mat.kid.clone(),
+            "test-gateway",
+            Duration::from_secs(3600),
+        )
+        .expect("issuer");
+        let auth = SandboxJwtAuthenticator::from_pem(
+            mat.public_key_pem.as_bytes(),
+            mat.kid.clone(),
+            "test-gateway",
+        )
+        .expect("authenticator");
+
+        // Build the token directly to model a credential minted before the
+        // reserved-audience guard was added. Its claims otherwise satisfy the
+        // sandbox authenticator's issuer, audience, subject, and expiry checks.
+        let sandbox_id = "sandbox-a";
+        let now = now_secs();
+        let claims = ExtensionJwtClaims {
+            iss: "openshell-gateway:test-gateway".to_string(),
+            aud: "openshell-gateway:test-gateway".to_string(),
+            sub: format!("{SPIFFE_SUBJECT_PREFIX}{sandbox_id}"),
+            iat: now,
+            exp: now + 300,
+            jti: uuid::Uuid::new_v4().to_string(),
+            caller_kind: ExtensionCallerKind::Supervisor,
+            sandbox_id: Some(sandbox_id.to_string()),
+        };
+        let mut header = Header::new(Algorithm::EdDSA);
+        header.kid = Some(mat.kid);
+        header.typ = Some(EXTENSION_JWT_TYP.to_string());
+        let token = encode(&header, &claims, &issuer.encoding_key).expect("extension token");
+
+        let error = auth
+            .authenticate(&header_map_with_bearer(&token), "/anything")
+            .await
+            .expect_err("extension token must not authenticate as a sandbox");
+        assert_eq!(error.code(), tonic::Code::Unauthenticated);
+        assert_eq!(
+            error.message(),
+            "extension tokens cannot authenticate to the gateway"
+        );
     }
 
     #[tokio::test]
@@ -641,6 +704,24 @@ mod tests {
         validation.set_issuer(&["openshell-gateway:gateway-a"]);
         validation.set_audience(&["service-b"]);
         assert!(decode::<ExtensionJwtClaims>(&minted.token, &decoding_key, &validation).is_err());
+    }
+
+    #[test]
+    fn extension_token_rejects_gateway_sandbox_audience() {
+        let (issuer, _) = pair();
+        let error = issuer
+            .mint_extension_token(
+                &extension_audience("openshell-gateway:test-gateway"),
+                ExtensionCallerKind::Supervisor,
+                Some("sandbox-a"),
+                Duration::from_secs(60),
+            )
+            .expect_err("gateway sandbox audience must be reserved");
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        assert_eq!(
+            error.message(),
+            "extension audience must not equal the gateway sandbox audience"
+        );
     }
 
     #[test]
