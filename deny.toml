@@ -41,6 +41,8 @@ allow = [
     "BSD-2-Clause",
     "BSD-3-Clause",
     "BSL-1.0",
+    # Permissive, non-copyleft license pulled in by the prebuilt Z3 archive
+    # path (z3-sys -> zip -> bzip2); compatible with this Apache-2.0 project.
     "bzip2-1.0.6",
     "ISC",
     "Zlib",
