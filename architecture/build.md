@@ -12,6 +12,7 @@ OpenShell builds these main artifacts:
 |---|---|
 | Gateway binary | `crates/openshell-server` |
 | CLI package and Python SDK | `python/openshell` plus Rust binaries where packaged |
+| TypeScript SDK package | `sdk/typescript` |
 | Gateway container image | `deploy/docker/Dockerfile.gateway` |
 | Supervisor container image | `deploy/docker/Dockerfile.supervisor` |
 | Helm chart | `deploy/helm/openshell` |
@@ -212,6 +213,20 @@ wheel. `pyproject.toml`
 pins them back in with `[tool.maturin].include` globs. The release workflows
 install each Linux wheel in a clean image and import `openshell.sandbox` as a
 smoke check.
+
+## TypeScript SDK Packaging
+
+The native TypeScript SDK in `sdk/typescript` uses Connect over the generated
+OpenShell protobuf surface. `sdk/typescript/buf.gen.yaml` selects the client
+proto closure, and `mise run sdk:ts:proto` generates gitignored sources under
+`src/gen`. TypeScript compilation includes those sources in `dist`, so package
+consumers do not run code generation.
+
+Branch checks run `mise run sdk:ts:ci`, enforce an 80% line-coverage floor, and
+exercise version stamping plus `npm publish --dry-run`. Tagged releases publish
+`@nvidia/openshell-sdk` to GitHub Packages. The repository keeps package version
+`0.0.0`; the release task derives and temporarily stamps the npm version from
+the release tag.
 
 ## CI and E2E
 

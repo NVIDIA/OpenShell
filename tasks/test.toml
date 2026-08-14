@@ -1,11 +1,20 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# Test tasks (Rust + Python)
+# Test tasks (Rust + Python + TypeScript SDK)
 
 [test]
-description = "Run all tests (Rust + Python)"
-depends = ["test:rust", "test:python", "test:sbom", "test:install-sh", "test:build-env", "test:packaging-assets", "test:docs-website"]
+description = "Run all tests (Rust + Python + TypeScript SDK)"
+depends = [
+  "test:rust",
+  "test:python",
+  "sdk:ts:test",
+  "test:sbom",
+  "test:install-sh",
+  "test:build-env",
+  "test:packaging-assets",
+  "test:docs-website",
+]
 
 ["test:docs-website"]
 description = "Test the docs-website sync script"

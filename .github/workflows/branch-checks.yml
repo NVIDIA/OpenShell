@@ -125,7 +125,7 @@ jobs:
         run: mise install --locked
 
       - name: Cache Rust target and registry
-        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           # Keep branch-check caches partitioned by runner architecture; lint
           # and test intentionally share the same job-local target directory.
@@ -185,7 +185,7 @@ jobs:
           rustup component add clippy
 
       - name: Cache Rust target and registry
-        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           shared-key: rust-clippy-macos
           cache-on-failure: "true"
@@ -274,3 +274,32 @@ jobs:
 
       - name: Lint
         run: mise run markdown:lint
+
+  sdk-typescript:
+    name: TypeScript SDK
+    needs: pr_metadata
+    if: needs.pr_metadata.outputs.should_run == 'true'
+    runs-on: linux-amd64-cpu8
+    container:
+      image: ghcr.io/nvidia/openshell/ci:latest
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Install tools
+        run: mise install --locked
+
+      - name: Check TypeScript SDK
+        run: mise run sdk:ts:ci
+
+      # Exercise the full release publish path (version stamp, dist-tag,
+      # prepublishOnly, tarball) without uploading. Uses the off-tag dev
+      # version, which validates the prerelease dist-tag branch too.
+      - name: Verify publishable artifact (dry-run)
+        env:
+          OPENSHELL_NPM_PUBLISH_ARGS: --dry-run
+        run: |
+          OPENSHELL_NPM_VERSION="$(uv run python tasks/scripts/release.py get-version --npm)" \
+            mise run sdk:ts:publish
