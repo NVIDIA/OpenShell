@@ -583,6 +583,11 @@ guest_tls_key           = "/etc/openshell/certs/client-key.pem"
 # bind-backed volumes, expose gateway-host paths inside sandboxes and can
 # negate OpenShell isolation and filesystem controls.
 enable_bind_mounts      = false
+# Opt-in to per-sandbox user namespace selection via userns_mode in driver
+# config. When false (default), any non-empty userns_mode is rejected.
+# Only the safe modes keep-id, auto, and nomap are ever permitted; escape
+# modes such as host and ns: are blocked unconditionally.
+allow_userns            = false
 # Set to 0 to leave Podman's runtime default unchanged.
 sandbox_pids_limit      = 2048
 # Health check interval in seconds. Lower values detect readiness faster

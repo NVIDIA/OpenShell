@@ -216,6 +216,21 @@ For proxy-required networks, the Podman driver also accepts the corporate egress
 
 On macOS with `podman machine`, the driver uses gvproxy's host-loopback IP, `192.168.127.254`, for sandbox host aliases by default. Set `host_gateway_ip` only when your Podman machine uses a non-standard host-loopback address. On Linux, an empty `host_gateway_ip` keeps Podman's `host-gateway` resolver behavior. Direct local callbacks from rootless Podman require Podman to report the pasta network helper. Slirp4netns, other helpers, and Podman versions that do not report their helper require an explicitly remote `grpc_endpoint`; otherwise the gateway fails startup rather than leaving sandbox callbacks unreachable. Rootful Podman continues to use the configured network's bridge gateway address.
 
+### Podman User Namespace Mode
+
+Pass `userns_mode` in per-sandbox driver config to run a sandbox container inside a user namespace. Requires `allow_userns = true` in `[openshell.drivers.podman]` in `gateway.toml` (disabled by default). Permitted modes are `keep-id`, `auto`, and `nomap`; escape modes such as `host` and `ns:` are blocked unconditionally.
+
+`keep-id` maps a specific container UID/GID to the gateway user on the host, which is useful for rootless Podman when the image runs as a non-default UID. The `uid` and `gid` options must be non-negative integers.
+
+```shell
+# Enable the gate in gateway.toml first:
+# allow_userns = true
+
+openshell sandbox create \
+  --driver-config-json '{"podman":{"userns_mode":"keep-id:uid=998,gid=998"}}' \
+  -- claude
+```
+
 ### Podman Driver Config Mounts
 
 Podman driver config accepts user-supplied `volume`, `tmpfs`, and `image`
