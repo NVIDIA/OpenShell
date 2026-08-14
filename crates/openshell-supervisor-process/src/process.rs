@@ -386,8 +386,12 @@ fn create_supervisor_identity_mount_namespace(target: &Path) -> Result<OwnedFd> 
         // overlay so the SPIFFE workload API socket stays reachable in the
         // namespace PID 1 is stuck in.
         #[allow(unsafe_code)]
-        unsafe {
-            libc::umount2(target.as_ptr(), libc::MNT_DETACH);
+        let umount_rc = unsafe { libc::umount2(target.as_ptr(), libc::MNT_DETACH) };
+        if umount_rc != 0 {
+            tracing::warn!(
+                errno = ?std::io::Error::last_os_error(),
+                "umount2 cleanup failed after setns error; SPIFFE socket may remain hidden"
+            );
         }
         let result_msg = result.as_ref().err().map_or_else(
             || "sanitized namespace was created".to_string(),
