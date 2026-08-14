@@ -1,4 +1,4 @@
-name: Windows MSVC (build-only)
+name: Windows MSVC
 
 on:
   merge_group:
