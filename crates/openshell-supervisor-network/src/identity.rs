@@ -18,48 +18,52 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use tracing::debug;
 
-#[derive(Clone, PartialEq)]
+#[derive(Clone)]
 struct FileFingerprint {
     len: u64,
-    #[cfg(unix)]
     mtime_sec: i64,
-    #[cfg(unix)]
     mtime_nsec: i64,
-    #[cfg(unix)]
     ctime_sec: i64,
-    #[cfg(unix)]
     ctime_nsec: i64,
     #[cfg(unix)]
     dev: u64,
     #[cfg(unix)]
     ino: u64,
-    #[cfg(not(unix))]
-    modified: Option<std::time::SystemTime>,
-    #[cfg(not(unix))]
-    created: Option<std::time::SystemTime>,
 }
 
 impl FileFingerprint {
     fn from_metadata(metadata: &Metadata) -> Self {
         Self {
             len: metadata.len(),
-            #[cfg(unix)]
             mtime_sec: metadata.mtime(),
-            #[cfg(unix)]
             mtime_nsec: metadata.mtime_nsec(),
-            #[cfg(unix)]
             ctime_sec: metadata.ctime(),
-            #[cfg(unix)]
             ctime_nsec: metadata.ctime_nsec(),
             #[cfg(unix)]
             dev: metadata.dev(),
             #[cfg(unix)]
             ino: metadata.ino(),
-            #[cfg(not(unix))]
-            modified: metadata.modified().ok(),
-            #[cfg(not(unix))]
-            created: metadata.created().ok(),
         }
+    }
+}
+
+impl PartialEq for FileFingerprint {
+    fn eq(&self, other: &Self) -> bool {
+        self.len == other.len
+            && self.mtime_sec == other.mtime_sec
+            && self.mtime_nsec == other.mtime_nsec
+            && self.ctime_sec == other.ctime_sec
+            && self.ctime_nsec == other.ctime_nsec
+            && {
+                #[cfg(unix)]
+                {
+                    self.dev == other.dev && self.ino == other.ino
+                }
+                #[cfg(not(unix))]
+                {
+                    true
+                }
+            }
     }
 }
 
