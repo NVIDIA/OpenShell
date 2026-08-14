@@ -479,6 +479,7 @@ pub async fn spawn(
         .arg(std::process::id().to_string());
     command.arg("--log-level").arg(&config.log_level);
     append_otlp_args(&mut command, otlp_config);
+    append_identity_limit_args(&mut command, config);
     command
         .arg("--openshell-endpoint")
         .arg(&vm_config.grpc_endpoint);
@@ -525,6 +526,16 @@ fn append_otlp_args(command: &mut Command, otlp_config: Option<&OtlpConfig>) {
     if let Some(config) = otlp_config {
         command.arg("--otlp-endpoint").arg(&config.endpoint);
     }
+}
+
+#[cfg(unix)]
+fn append_identity_limit_args(command: &mut Command, config: &Config) {
+    command
+        .arg("--min-sandbox-uid")
+        .arg(config.min_sandbox_uid.to_string());
+    command
+        .arg("--min-sandbox-gid")
+        .arg(config.min_sandbox_gid.to_string());
 }
 
 #[cfg(not(unix))]
@@ -609,12 +620,13 @@ async fn connect_compute_driver(socket_path: &Path) -> Result<Channel> {
 #[cfg(all(test, unix))]
 mod tests {
     use super::{
-        VmComputeConfig, append_otlp_args, compute_driver_guest_tls_paths,
-        compute_driver_socket_path, current_euid, prepare_compute_driver_socket_path,
-        prepare_vm_state_dir, resolve_compute_driver_bin, resolve_driver_search_dirs,
-        wait_for_compute_driver,
+        VmComputeConfig, append_identity_limit_args, append_otlp_args,
+        compute_driver_guest_tls_paths, compute_driver_socket_path, current_euid,
+        prepare_compute_driver_socket_path, prepare_vm_state_dir, resolve_compute_driver_bin,
+        resolve_driver_search_dirs, wait_for_compute_driver,
     };
     use crate::config_file::OtlpConfig;
+    use openshell_core::Config;
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::net::UnixListener as StdUnixListener;
     use std::path::PathBuf;
@@ -637,6 +649,22 @@ mod tests {
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect::<Vec<_>>();
         assert_eq!(args, ["--otlp-endpoint", "http://collector.internal:4317"]);
+    }
+
+    #[test]
+    fn vm_driver_command_includes_identity_limits() {
+        let mut command = tokio::process::Command::new("openshell-driver-vm");
+        let config = Config::new(None)
+            .with_min_sandbox_uid(1)
+            .with_min_sandbox_gid(1);
+        append_identity_limit_args(&mut command, &config);
+
+        let args = command
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(args, ["--min-sandbox-uid", "1", "--min-sandbox-gid", "1"]);
     }
 
     #[tokio::test]

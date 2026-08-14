@@ -240,10 +240,20 @@ pub struct VmDriverConfig {
     /// When empty, defaults to the resolved UID.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sandbox_gid: Option<u32>,
+    /// Inclusive minimum UID accepted for sandbox process identity.
+    #[serde(default = "default_min_sandbox_identity")]
+    pub min_sandbox_uid: u32,
+    /// Inclusive minimum GID accepted for sandbox process identity.
+    #[serde(default = "default_min_sandbox_identity")]
+    pub min_sandbox_gid: u32,
 }
 
 /// Default sandbox UID used by the VM driver when no config value is set.
 pub const DEFAULT_SANDBOX_UID: u32 = 10001;
+
+const fn default_min_sandbox_identity() -> u32 {
+    openshell_core::config::DEFAULT_MIN_SANDBOX_IDENTITY
+}
 
 impl Default for VmDriverConfig {
     fn default() -> Self {
@@ -266,6 +276,8 @@ impl Default for VmDriverConfig {
             gpu_vcpus: 4,
             sandbox_uid: None,
             sandbox_gid: None,
+            min_sandbox_uid: default_min_sandbox_identity(),
+            min_sandbox_gid: default_min_sandbox_identity(),
         }
     }
 }
@@ -282,23 +294,31 @@ impl VmDriverConfig {
     }
 
     pub fn validate_sandbox_identity(&self) -> Result<(), String> {
-        let range = openshell_policy::MIN_SANDBOX_UID..=openshell_policy::MAX_SANDBOX_UID;
+        if self.min_sandbox_uid == 0 {
+            return Err("min_sandbox_uid 0 is not allowed".to_string());
+        }
+        if self.min_sandbox_gid == 0 {
+            return Err("min_sandbox_gid 0 is not allowed".to_string());
+        }
+
+        let limits = openshell_policy::SandboxIdentityLimits::from_mins(
+            self.min_sandbox_uid,
+            self.min_sandbox_gid,
+        );
         if let Some(uid) = self.sandbox_uid
-            && !range.contains(&uid)
+            && !limits.contains_uid(uid)
         {
             return Err(format!(
                 "sandbox_uid {uid} is outside the allowed range [{}, {}]",
-                openshell_policy::MIN_SANDBOX_UID,
-                openshell_policy::MAX_SANDBOX_UID,
+                limits.min_uid, limits.max,
             ));
         }
         if let Some(gid) = self.sandbox_gid
-            && !range.contains(&gid)
+            && !limits.contains_gid(gid)
         {
             return Err(format!(
                 "sandbox_gid {gid} is outside the allowed range [{}, {}]",
-                openshell_policy::MIN_SANDBOX_UID,
-                openshell_policy::MAX_SANDBOX_UID,
+                limits.min_gid, limits.max,
             ));
         }
         Ok(())
@@ -4458,6 +4478,14 @@ fn build_guest_environment(
         );
     }
     environment.insert(
+        openshell_core::sandbox_env::MIN_SANDBOX_UID.to_string(),
+        config.min_sandbox_uid.to_string(),
+    );
+    environment.insert(
+        openshell_core::sandbox_env::MIN_SANDBOX_GID.to_string(),
+        config.min_sandbox_gid.to_string(),
+    );
+    environment.insert(
         openshell_core::sandbox_env::TELEMETRY_ENABLED.to_string(),
         openshell_core::telemetry::enabled_env_value().to_string(),
     );
@@ -6948,6 +6976,83 @@ mod tests {
         assert!(env.contains(&format!(
             "OPENSHELL_SSH_SOCKET_PATH={GUEST_SSH_SOCKET_PATH}"
         )));
+        assert!(env.contains(&format!(
+            "{}=1000",
+            openshell_core::sandbox_env::MIN_SANDBOX_UID
+        )));
+        assert!(env.contains(&format!(
+            "{}=1000",
+            openshell_core::sandbox_env::MIN_SANDBOX_GID
+        )));
+    }
+
+    #[test]
+    fn build_guest_environment_includes_configured_identity_limits() {
+        let config = VmDriverConfig {
+            openshell_endpoint: "http://127.0.0.1:8080".to_string(),
+            min_sandbox_uid: 1,
+            min_sandbox_gid: 1,
+            ..Default::default()
+        };
+        let sandbox = Sandbox {
+            id: "sandbox-123".to_string(),
+            name: "breezy-rhinoceros".to_string(),
+            spec: Some(SandboxSpec::default()),
+            ..Default::default()
+        };
+
+        let env = build_guest_environment(&sandbox, &config, None);
+        assert!(env.contains(&format!(
+            "{}=1",
+            openshell_core::sandbox_env::MIN_SANDBOX_UID
+        )));
+        assert!(env.contains(&format!(
+            "{}=1",
+            openshell_core::sandbox_env::MIN_SANDBOX_GID
+        )));
+    }
+
+    #[test]
+    fn validate_sandbox_identity_rejects_uid_below_default_min() {
+        let config = VmDriverConfig {
+            sandbox_uid: Some(999),
+            ..Default::default()
+        };
+        let err = config.validate_sandbox_identity().unwrap_err();
+        assert!(err.contains("sandbox_uid 999"));
+    }
+
+    #[test]
+    fn validate_sandbox_identity_accepts_uid_when_min_is_one() {
+        let config = VmDriverConfig {
+            min_sandbox_uid: 1,
+            min_sandbox_gid: 1,
+            sandbox_uid: Some(500),
+            ..Default::default()
+        };
+        assert!(config.validate_sandbox_identity().is_ok());
+    }
+
+    #[test]
+    fn validate_sandbox_identity_rejects_root_uid() {
+        let config = VmDriverConfig {
+            min_sandbox_uid: 1,
+            min_sandbox_gid: 1,
+            sandbox_uid: Some(0),
+            ..Default::default()
+        };
+        let err = config.validate_sandbox_identity().unwrap_err();
+        assert!(err.contains("sandbox_uid 0"));
+    }
+
+    #[test]
+    fn validate_sandbox_identity_rejects_min_zero() {
+        let config = VmDriverConfig {
+            min_sandbox_uid: 0,
+            ..Default::default()
+        };
+        let err = config.validate_sandbox_identity().unwrap_err();
+        assert!(err.contains("min_sandbox_uid 0"));
     }
 
     #[test]

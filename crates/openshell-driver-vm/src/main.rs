@@ -143,6 +143,20 @@ struct Args {
     #[arg(long, env = "OPENSHELL_VM_SANDBOX_GID")]
     sandbox_gid: Option<u32>,
 
+    #[arg(
+        long,
+        env = "OPENSHELL_MIN_SANDBOX_UID",
+        default_value_t = openshell_core::config::DEFAULT_MIN_SANDBOX_IDENTITY
+    )]
+    min_sandbox_uid: u32,
+
+    #[arg(
+        long,
+        env = "OPENSHELL_MIN_SANDBOX_GID",
+        default_value_t = openshell_core::config::DEFAULT_MIN_SANDBOX_IDENTITY
+    )]
+    min_sandbox_gid: u32,
+
     #[arg(long, hide = true)]
     vm_backend: Option<String>,
 
@@ -238,6 +252,8 @@ async fn main() -> Result<()> {
         gpu_vcpus: args.gpu_vcpus,
         sandbox_uid: args.sandbox_uid,
         sandbox_gid: args.sandbox_gid,
+        min_sandbox_uid: args.min_sandbox_uid,
+        min_sandbox_gid: args.min_sandbox_gid,
     })
     .await
     .map_err(|err| miette::miette!("{err}"))?;
