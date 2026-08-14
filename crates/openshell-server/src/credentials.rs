@@ -26,9 +26,12 @@ use async_trait::async_trait;
 #[cfg(unix)]
 use hyper_util::rt::TokioIo;
 use openshell_core::proto::credentials::v1::{
-    DeleteCredentialRequest, GetCredentialDriverCapabilitiesRequest,
-    GetCredentialDriverCapabilitiesResponse, ResolveCredentialRequest, ResolveCredentialsRequest,
-    ResolvedCredential, StoreCredentialRequest, credential_driver_client::CredentialDriverClient,
+    DeleteCredentialRequest, ResolveCredentialRequest, ResolvedCredential, StoreCredentialRequest,
+};
+#[cfg(unix)]
+use openshell_core::proto::credentials::v1::{
+    GetCredentialDriverCapabilitiesRequest, GetCredentialDriverCapabilitiesResponse,
+    ResolveCredentialsRequest, credential_driver_client::CredentialDriverClient,
 };
 use openshell_core::proto::{CredentialHandle, Provider};
 use openshell_core::{Config, Error, Result as CoreResult};
@@ -43,8 +46,10 @@ use tokio::net::UnixStream;
 #[cfg(unix)]
 use tokio::process::Command;
 #[cfg(unix)]
+use tonic::Request;
+use tonic::Status;
+#[cfg(unix)]
 use tonic::transport::{Channel, Endpoint};
-use tonic::{Request, Status};
 #[cfg(unix)]
 use tower::service_fn;
 use tracing::warn;
@@ -52,6 +57,7 @@ use tracing::warn;
 use crate::persistence::{PersistenceError, Store, WriteCondition};
 
 const DEFAULT_CREDENTIAL_DRIVER_STARTUP_TIMEOUT_SECS: u64 = 10;
+#[cfg(unix)]
 const DEFAULT_CREDENTIAL_DRIVER_RPC_TIMEOUT_SECS: u64 = 30;
 const COMMON_CREDENTIAL_DRIVER_FIELDS: &[&str] = &[
     "transport",
@@ -1253,14 +1259,14 @@ async fn connect_uds_driver(
 }
 
 #[cfg(not(unix))]
-async fn connect_uds_driver(
+fn connect_uds_driver(
     driver_name: &str,
     _config: ConfiguredCredentialDriver,
     _socket_path: &Path,
-) -> CoreResult<BuiltCredentialDriver> {
-    Err(Error::config(format!(
+) -> std::future::Ready<CoreResult<BuiltCredentialDriver>> {
+    std::future::ready(Err(Error::config(format!(
         "credential driver '{driver_name}' uses transport = 'uds', but this platform does not support Unix domain sockets"
-    )))
+    ))))
 }
 
 #[cfg(unix)]

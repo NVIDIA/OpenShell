@@ -344,8 +344,11 @@ pub(crate) async fn run_server(
     let supervisor_sessions = Arc::new(supervisor_session::SupervisorSessionRegistry::new());
     let driver_startup = compute::driver_config::DriverStartupContext {
         file: config_file.as_ref(),
+        #[cfg(not(target_os = "windows"))]
         guest_tls: guest_tls.as_ref(),
+        #[cfg(not(target_os = "windows"))]
         gateway_port: config.bind_address.port(),
+        #[cfg(not(target_os = "windows"))]
         gateway_tls_enabled: config.tls.is_some(),
         endpoint_overrides: &config.compute_driver_endpoints,
     };
@@ -1016,6 +1019,7 @@ fn builtin_compute_driver(name: &str) -> Option<ComputeDriverKind> {
     name.parse().ok()
 }
 
+#[cfg(not(target_os = "windows"))]
 fn kubernetes_sandbox_jwt_expiry_disabled(config: &Config) -> bool {
     config
         .gateway_jwt
@@ -1023,6 +1027,7 @@ fn kubernetes_sandbox_jwt_expiry_disabled(config: &Config) -> bool {
         .is_some_and(|jwt| jwt.ttl_secs == 0)
 }
 
+#[cfg(not(target_os = "windows"))]
 fn warn_if_kubernetes_sandbox_jwt_expiry_disabled(config: &Config) {
     if kubernetes_sandbox_jwt_expiry_disabled(config) {
         warn!(
@@ -1127,8 +1132,11 @@ mod tests {
     ) -> crate::compute::driver_config::DriverStartupContext<'a> {
         crate::compute::driver_config::DriverStartupContext {
             file,
+            #[cfg(not(target_os = "windows"))]
             guest_tls: None,
+            #[cfg(not(target_os = "windows"))]
             gateway_port: openshell_core::config::DEFAULT_SERVER_PORT,
+            #[cfg(not(target_os = "windows"))]
             gateway_tls_enabled: false,
             endpoint_overrides: &config.compute_driver_endpoints,
         }

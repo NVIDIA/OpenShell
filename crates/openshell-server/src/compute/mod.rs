@@ -429,6 +429,7 @@ pub struct AcquiredRemoteDriverEndpoint {
 }
 
 impl AcquiredRemoteDriverEndpoint {
+    #[cfg(unix)]
     pub(crate) fn managed_builtin(
         driver_kind: ComputeDriverKind,
         channel: Channel,
@@ -441,6 +442,7 @@ impl AcquiredRemoteDriverEndpoint {
         }
     }
 
+    #[cfg(unix)]
     pub(crate) fn unmanaged(name: impl Into<String>, channel: Channel) -> Self {
         Self {
             name: name.into(),
@@ -574,6 +576,7 @@ pub struct ComputeRuntime {
     driver_info: ComputeDriverInfoSnapshot,
     shutdown_cleanup: Option<Arc<dyn ShutdownCleanup>>,
     startup_starter: Option<Arc<dyn StartupSandboxStarter>>,
+    #[cfg(unix)]
     driver_process: Option<Arc<ManagedDriverProcess>>,
     default_image: String,
     store: Arc<Store>,
@@ -616,6 +619,8 @@ impl ComputeRuntime {
         tracing_log_bus: TracingLogBus,
         supervisor_sessions: Arc<SupervisorSessionRegistry>,
     ) -> Result<Self, ComputeError> {
+        #[cfg(not(unix))]
+        let _ = driver_process;
         let capabilities = driver
             .get_capabilities(Request::new(GetCapabilitiesRequest {}))
             .await
@@ -695,6 +700,7 @@ impl ComputeRuntime {
             driver_info,
             shutdown_cleanup,
             startup_starter,
+            #[cfg(unix)]
             driver_process,
             default_image,
             store,
@@ -3107,13 +3113,13 @@ pub async fn connect_remote_compute_driver(
 }
 
 #[cfg(not(unix))]
-pub async fn connect_remote_compute_driver(
+pub fn connect_remote_compute_driver(
     _name: impl Into<String>,
     _socket_path: &Path,
-) -> Result<AcquiredRemoteDriverEndpoint, ComputeError> {
-    Err(ComputeError::Message(
+) -> std::future::Ready<Result<AcquiredRemoteDriverEndpoint, ComputeError>> {
+    std::future::ready(Err(ComputeError::Message(
         "remote compute driver endpoints require unix domain socket support".to_string(),
-    ))
+    )))
 }
 
 fn driver_sandbox_from_public(
@@ -3896,6 +3902,7 @@ pub async fn new_test_runtime_for_driver(store: Arc<Store>, driver_name: &str) -
         },
         shutdown_cleanup: None,
         startup_starter: None,
+        #[cfg(unix)]
         driver_process: None,
         default_image: "openshell/sandbox:test".to_string(),
         store,
@@ -4501,6 +4508,7 @@ mod tests {
             },
             shutdown_cleanup: None,
             startup_starter,
+            #[cfg(unix)]
             driver_process: None,
             default_image: "openshell/sandbox:test".to_string(),
             store,

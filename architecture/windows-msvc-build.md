@@ -139,7 +139,7 @@ The x64 GitHub Actions jobs run on `windows-2025`. Pull-request mirrors and
 merge queues execute:
 
 ```powershell
-cargo clippy -p openshell-server -p openshell-core -p openshell-cli --all-targets --no-deps --features openshell-prover/prebuilt-z3 -- -D warnings -A dead-code -A unused-imports -A clippy::unused-async
+cargo clippy -p openshell-server -p openshell-core -p openshell-cli --all-targets --no-deps --features openshell-prover/prebuilt-z3 -- -D warnings
 mise run --skip-tools test:rust
 ```
 
