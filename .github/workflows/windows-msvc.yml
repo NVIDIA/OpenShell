@@ -77,13 +77,15 @@ jobs:
           cache-bin: "false"
       - name: Lint Windows-sensitive crates
         # Formatting is target-independent and already checked by the Linux jobs.
-        # Keep this guard focused on Windows cfgs, matching the macOS lane.
+        # Keep this guard focused on the gateway and CLI deliverables plus core.
         run: >-
           cargo clippy
-          -p openshell-sandbox
+          -p openshell-server
           -p openshell-core
           -p openshell-cli
           --all-targets
+          --no-deps
+          --features openshell-prover/prebuilt-z3
           -- -D warnings
       - name: Test
         run: mise run --skip-tools test:rust
@@ -132,10 +134,12 @@ jobs:
         # target and compiler caches are reusable by subsequent pull requests.
         run: >-
           cargo clippy
-          -p openshell-sandbox
+          -p openshell-server
           -p openshell-core
           -p openshell-cli
           --all-targets
+          --no-deps
+          --features openshell-prover/prebuilt-z3
           -- -D warnings
       - name: Test
         run: mise run --skip-tools test:rust
