@@ -42,9 +42,11 @@ A service may advertise the audience it verifies in the `expected_audience` fiel
 
 ## Verification key distribution
 
-The gateway publishes its public signing key as a single-key JWKS at `/.well-known/jwks.json`, and OIDC-shaped discovery metadata at `/.well-known/openid-configuration` carrying the expected `iss`, an absolute `jwks_uri`, and `EdDSA` as the only supported algorithm.
+The operator-provisioned public key or JWKS is the authoritative cold-start trust anchor. Deploy it alongside the extension service through the same trusted configuration path used for the gateway URL, expected gateway ID, and private CA. This lets a service verify its first authenticated call without trusting key material learned from that call's peer.
 
-The discovery document is OIDC-shaped rather than OIDC-compliant, in the same way and for the same reason as the equivalent Kubernetes endpoint: `issuer` is the gateway identity, not the URL the document is served from. Verifiers compare `iss` against that value. Fetching the document does not establish gateway identity; the serving TLS connection does. Deployments where the service cannot reach the gateway provision the public key out of band instead.
+The gateway also publishes its public signing key as a single-key JWKS at `/.well-known/jwks.json`, and OIDC-shaped discovery metadata at `/.well-known/openid-configuration` carrying the expected `iss`, an absolute `jwks_uri`, and `EdDSA` as the only supported algorithm. After initial trust is established, extensions may use these endpoints for steady-state key refresh and operational convenience.
+
+The discovery document is OIDC-shaped rather than OIDC-compliant, in the same way and for the same reason as the equivalent Kubernetes endpoint: `issuer` is the gateway identity, not the URL the document is served from. Verifiers compare `iss` against that value. Fetching the document does not establish gateway identity; the preconfigured gateway identity and authenticated TLS connection do. The well-known endpoints are therefore not a replacement for operator-provisioned first-contact trust.
 
 ## Compatibility
 

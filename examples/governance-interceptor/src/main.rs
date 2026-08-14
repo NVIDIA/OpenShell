@@ -336,8 +336,8 @@ impl GovernanceInterceptorService {
                     &[GatewayInterceptorPhase::Validate],
                 ),
             ],
+            expected_audience: String::new(),
         }
-        expected_audience: String::new(),
     }
 
     fn evaluate_inner(

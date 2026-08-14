@@ -1800,8 +1800,12 @@ type GetSandboxConfigResponse struct {
 	// are "fail_closed" and "retain_last_valid". Unknown or empty values must
 	// be treated as fail_closed by the supervisor.
 	PolicyValidationFailureMode string `protobuf:"bytes,11,opt,name=policy_validation_failure_mode,json=policyValidationFailureMode,proto3" json:"policy_validation_failure_mode,omitempty"`
-	unknownFields               protoimpl.UnknownFields
-	sizeCache                   protoimpl.SizeCache
+	// Whether this gateway can mint authenticated extension credentials.
+	// False also covers older gateways that do not advertise this capability;
+	// supervisors preserve their legacy unauthenticated connection behavior.
+	ExtensionAuthenticationEnabled bool `protobuf:"varint,12,opt,name=extension_authentication_enabled,json=extensionAuthenticationEnabled,proto3" json:"extension_authentication_enabled,omitempty"`
+	unknownFields                  protoimpl.UnknownFields
+	sizeCache                      protoimpl.SizeCache
 }
 
 func (x *GetSandboxConfigResponse) Reset() {
@@ -1909,6 +1913,13 @@ func (x *GetSandboxConfigResponse) GetPolicyValidationFailureMode() string {
 		return x.PolicyValidationFailureMode
 	}
 	return ""
+}
+
+func (x *GetSandboxConfigResponse) GetExtensionAuthenticationEnabled() bool {
+	if x != nil {
+		return x.ExtensionAuthenticationEnabled
+	}
+	return false
 }
 
 // Connection details for one operator-registered supervisor middleware service.
@@ -2171,7 +2182,7 @@ const file_sandbox_proto_rawDesc = "" +
 	"\x05value\"\x86\x01\n" +
 	"\x10EffectiveSetting\x128\n" +
 	"\x05value\x18\x01 \x01(\v2\".openshell.sandbox.v1.SettingValueR\x05value\x128\n" +
-	"\x05scope\x18\x02 \x01(\x0e2\".openshell.sandbox.v1.SettingScopeR\x05scope\"\x87\x06\n" +
+	"\x05scope\x18\x02 \x01(\x0e2\".openshell.sandbox.v1.SettingScopeR\x05scope\"\xd1\x06\n" +
 	"\x18GetSandboxConfigResponse\x12;\n" +
 	"\x06policy\x18\x01 \x01(\v2#.openshell.sandbox.v1.SandboxPolicyR\x06policy\x12\x18\n" +
 	"\aversion\x18\x02 \x01(\rR\aversion\x12\x1f\n" +
@@ -2185,7 +2196,8 @@ const file_sandbox_proto_rawDesc = "" +
 	"\x1esupervisor_middleware_services\x18\t \x03(\v21.openshell.sandbox.v1.SupervisorMiddlewareServiceR\x1csupervisorMiddlewareServices\x12\x1c\n" +
 	"\tworkspace\x18\n" +
 	" \x01(\tR\tworkspace\x12C\n" +
-	"\x1epolicy_validation_failure_mode\x18\v \x01(\tR\x1bpolicyValidationFailureMode\x1ac\n" +
+	"\x1epolicy_validation_failure_mode\x18\v \x01(\tR\x1bpolicyValidationFailureMode\x12H\n" +
+	" extension_authentication_enabled\x18\f \x01(\bR\x1eextensionAuthenticationEnabled\x1ac\n" +
 	"\rSettingsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12<\n" +
 	"\x05value\x18\x02 \x01(\v2&.openshell.sandbox.v1.EffectiveSettingR\x05value:\x028\x01\"\x93\x02\n" +

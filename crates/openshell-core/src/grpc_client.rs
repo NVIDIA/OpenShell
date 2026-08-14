@@ -877,6 +877,8 @@ pub struct SettingsPollResult {
     pub workspace: String,
     /// Gateway-configured posture for rejected policy generations.
     pub policy_validation_failure_mode: crate::PolicyValidationFailureMode,
+    /// Whether the gateway can mint authenticated extension credentials.
+    pub extension_authentication_enabled: bool,
 }
 
 fn settings_poll_result(inner: crate::proto::GetSandboxConfigResponse) -> SettingsPollResult {
@@ -896,6 +898,7 @@ fn settings_poll_result(inner: crate::proto::GetSandboxConfigResponse) -> Settin
             .policy_validation_failure_mode
             .parse()
             .unwrap_or_default(),
+        extension_authentication_enabled: inner.extension_authentication_enabled,
     }
 }
 
@@ -927,6 +930,18 @@ mod settings_poll_tests {
             result.policy_validation_failure_mode,
             PolicyValidationFailureMode::FailClosed
         );
+    }
+
+    #[test]
+    fn extension_authentication_capability_round_trips_and_defaults_disabled() {
+        let enabled = settings_poll_result(GetSandboxConfigResponse {
+            extension_authentication_enabled: true,
+            ..Default::default()
+        });
+        assert!(enabled.extension_authentication_enabled);
+
+        let legacy = settings_poll_result(GetSandboxConfigResponse::default());
+        assert!(!legacy.extension_authentication_enabled);
     }
 }
 

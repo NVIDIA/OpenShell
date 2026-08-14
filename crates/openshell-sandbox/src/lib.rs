@@ -170,6 +170,7 @@ pub async fn run_sandbox(
         middleware_registry_status,
         loaded_policy_origin,
         initial_agent_proposals_enabled,
+        initial_extension_authentication_enabled,
     ) = if let Some(bootstrap) = sidecar_bootstrap.as_ref() {
         let (policy, opa_engine, retained_proto, loaded_policy_origin) =
             load_policy_from_sidecar_bootstrap(bootstrap)?;
@@ -180,6 +181,7 @@ pub async fn run_sandbox(
             MiddlewareRegistryStatus::Synchronized,
             loaded_policy_origin,
             bootstrap.agent_proposals_enabled,
+            false,
         )
     } else {
         load_policy(
@@ -636,6 +638,7 @@ pub async fn run_sandbox(
             sidecar_control_publisher: sidecar_control_publisher.clone(),
             workspace_tx,
             extension_credentials: extension_credentials.clone(),
+            extension_authentication_enabled: initial_extension_authentication_enabled,
             middleware_connector: default_middleware_connector(),
         };
 
@@ -1898,6 +1901,7 @@ async fn load_policy(
     MiddlewareRegistryStatus,
     LoadedPolicyOrigin,
     bool,
+    bool,
 )> {
     // File mode: load OPA engine from rego rules + YAML data (dev override)
     if let (Some(policy_file), Some(data_file)) = (&policy_rules, &policy_data) {
@@ -1946,6 +1950,7 @@ async fn load_policy(
             None,
             MiddlewareRegistryStatus::Synchronized,
             LoadedPolicyOrigin::LocalOverride,
+            false,
             false,
         ));
     }
@@ -2111,21 +2116,27 @@ async fn load_policy(
         } else if let Err(error) = grpc_retry("Middleware connect", || {
             let middleware_services = middleware_services.clone();
             let extension_credentials = extension_credentials.clone();
+            let extension_authentication_enabled = snapshot.extension_authentication_enabled;
             async move {
-                // Share the supervisor's store so the slots installed here are
-                // the ones the policy poll loop later rotates in place.
-                let credentials =
+                let credentials = if extension_authentication_enabled {
+                    // Share the supervisor's store so the slots installed here
+                    // are the ones the policy poll loop later rotates in place.
                     openshell_core::grpc_client::CachedOpenShellClient::connect_with_credentials(
                         endpoint,
                         extension_credentials,
                     )
                     .await?
                     .refresh_extension_credentials(&middleware_services)
-                    .await?;
-                openshell_supervisor_middleware::MiddlewareRegistry::connect_services_authenticated(
-                    openshell_supervisor_middleware_builtins::services(),
-                    middleware_services,
-                    &credentials,
+                    .await?
+                } else {
+                    std::collections::HashMap::new()
+                };
+                connect_middleware_registry(
+                    &middleware_services,
+                    &MiddlewareAuthentication {
+                        credentials,
+                        enabled: extension_authentication_enabled,
+                    },
                 )
                 .await
             }
@@ -2171,6 +2182,7 @@ async fn load_policy(
                 has_last_valid_policy,
             },
             agent_proposals_enabled_from_settings(&snapshot.settings),
+            snapshot.extension_authentication_enabled,
         ));
     }
 
@@ -2339,17 +2351,14 @@ async fn reload_gateway_policy_runtime(
     policy: Option<&openshell_core::proto::SandboxPolicy>,
     entrypoint_pid: u32,
     desired_services: &[openshell_core::proto::SupervisorMiddlewareService],
-    middleware_credentials: &std::collections::HashMap<
-        String,
-        openshell_extension_core::BearerTokenSlot,
-    >,
+    middleware_authentication: &MiddlewareAuthentication,
     middleware_registry_changed: bool,
     middleware_connector: &MiddlewareConnector,
 ) -> std::result::Result<(), GatewayRuntimeReloadError> {
     match policy {
         Some(policy) if middleware_registry_changed => {
             let registry =
-                middleware_connector(desired_services.to_vec(), middleware_credentials.clone())
+                middleware_connector(desired_services.to_vec(), middleware_authentication.clone())
                     .await
                     .map_err(GatewayRuntimeReloadError::MiddlewareRegistry)?;
             engine
@@ -2825,13 +2834,14 @@ struct PolicyPollLoopContext {
     sidecar_control_publisher: Option<sidecar_control::Publisher>,
     workspace_tx: tokio::sync::watch::Sender<String>,
     extension_credentials: openshell_extension_core::ExtensionCredentialStore,
+    extension_authentication_enabled: bool,
     middleware_connector: MiddlewareConnector,
 }
 
 type MiddlewareConnector = Arc<
     dyn Fn(
             Vec<openshell_core::proto::SupervisorMiddlewareService>,
-            std::collections::HashMap<String, openshell_extension_core::BearerTokenSlot>,
+            MiddlewareAuthentication,
         ) -> std::pin::Pin<
             Box<
                 dyn std::future::Future<
@@ -2842,35 +2852,36 @@ type MiddlewareConnector = Arc<
         + Sync,
 >;
 
+#[derive(Clone, Default)]
+struct MiddlewareAuthentication {
+    credentials: std::collections::HashMap<String, openshell_extension_core::BearerTokenSlot>,
+    enabled: bool,
+}
+
 fn default_middleware_connector() -> MiddlewareConnector {
-    Arc::new(|services, credentials| {
-        Box::pin(
-            async move { connect_middleware_registry_authenticated(&services, &credentials).await },
-        )
+    Arc::new(|services, authentication| {
+        Box::pin(async move { connect_middleware_registry(&services, &authentication).await })
     })
 }
 
-#[cfg(test)]
 async fn connect_middleware_registry(
     services: &[openshell_core::proto::SupervisorMiddlewareService],
+    authentication: &MiddlewareAuthentication,
 ) -> Result<openshell_supervisor_middleware::MiddlewareRegistry> {
-    openshell_supervisor_middleware::MiddlewareRegistry::connect_services(
-        openshell_supervisor_middleware_builtins::services(),
-        services.to_vec(),
-    )
-    .await
-}
-
-async fn connect_middleware_registry_authenticated(
-    services: &[openshell_core::proto::SupervisorMiddlewareService],
-    credentials: &std::collections::HashMap<String, openshell_extension_core::BearerTokenSlot>,
-) -> Result<openshell_supervisor_middleware::MiddlewareRegistry> {
-    openshell_supervisor_middleware::MiddlewareRegistry::connect_services_authenticated(
-        openshell_supervisor_middleware_builtins::services(),
-        services.to_vec(),
-        credentials,
-    )
-    .await
+    if authentication.enabled {
+        openshell_supervisor_middleware::MiddlewareRegistry::connect_services_authenticated(
+            openshell_supervisor_middleware_builtins::services(),
+            services.to_vec(),
+            &authentication.credentials,
+        )
+        .await
+    } else {
+        openshell_supervisor_middleware::MiddlewareRegistry::connect_services(
+            openshell_supervisor_middleware_builtins::services(),
+            services.to_vec(),
+        )
+        .await
+    }
 }
 
 async fn install_builtin_middleware_registry(opa_engine: &OpaEngine) -> Result<()> {
@@ -2903,39 +2914,55 @@ fn next_poll_delay(
 fn retain_extension_credentials(
     store: &openshell_extension_core::ExtensionCredentialStore,
     installed: &[openshell_core::proto::SupervisorMiddlewareService],
+    extension_authentication_enabled: bool,
 ) {
-    store.retain(
-        &installed
+    let retained = if extension_authentication_enabled {
+        installed
             .iter()
             .map(|service| service.name.as_str())
-            .collect(),
-    );
+            .collect()
+    } else {
+        std::collections::HashSet::default()
+    };
+    store.retain(&retained);
+}
+
+struct MiddlewareRegistryReconciliation<'a> {
+    desired_services: &'a [openshell_core::proto::SupervisorMiddlewareService],
+    authentication: MiddlewareAuthentication,
+    registry_changed: bool,
+    extension_credentials: &'a openshell_extension_core::ExtensionCredentialStore,
+    current_services: &'a mut Vec<openshell_core::proto::SupervisorMiddlewareService>,
+    status: &'a mut MiddlewareRegistryStatus,
 }
 
 async fn reconcile_middleware_registry(
     opa_engine: &OpaEngine,
     middleware_connector: &MiddlewareConnector,
-    desired_services: &[openshell_core::proto::SupervisorMiddlewareService],
-    credentials: &std::collections::HashMap<String, openshell_extension_core::BearerTokenSlot>,
-    extension_credentials: &openshell_extension_core::ExtensionCredentialStore,
-    current_services: &mut Vec<openshell_core::proto::SupervisorMiddlewareService>,
-    status: &mut MiddlewareRegistryStatus,
+    reconciliation: MiddlewareRegistryReconciliation<'_>,
 ) {
-    if *status == MiddlewareRegistryStatus::Synchronized
-        && desired_services == current_services.as_slice()
-    {
+    if !reconciliation.registry_changed {
         return;
     }
 
-    match middleware_connector(desired_services.to_vec(), credentials.clone())
-        .await
-        .and_then(|registry| opa_engine.replace_middleware_registry(registry))
+    match middleware_connector(
+        reconciliation.desired_services.to_vec(),
+        reconciliation.authentication.clone(),
+    )
+    .await
+    .and_then(|registry| opa_engine.replace_middleware_registry(registry))
     {
         Ok(()) => {
-            retain_extension_credentials(extension_credentials, desired_services);
-            current_services.clear();
-            current_services.extend_from_slice(desired_services);
-            *status = MiddlewareRegistryStatus::Synchronized;
+            retain_extension_credentials(
+                reconciliation.extension_credentials,
+                reconciliation.desired_services,
+                reconciliation.authentication.enabled,
+            );
+            reconciliation.current_services.clear();
+            reconciliation
+                .current_services
+                .extend_from_slice(reconciliation.desired_services);
+            *reconciliation.status = MiddlewareRegistryStatus::Synchronized;
             ocsf_emit!(
                 ConfigStateChangeBuilder::new(ocsf_ctx())
                     .severity(SeverityId::Informational)
@@ -2943,11 +2970,11 @@ async fn reconcile_middleware_registry(
                     .state(StateId::Enabled, "loaded")
                     .unmapped(
                         "supervisor_middleware_service_count",
-                        serde_json::json!(current_services.len())
+                        serde_json::json!(reconciliation.current_services.len())
                     )
                     .message(format!(
                         "Supervisor middleware registry reloaded [service_count:{}]",
-                        current_services.len()
+                        reconciliation.current_services.len()
                     ))
                     .build()
             );
@@ -2955,7 +2982,7 @@ async fn reconcile_middleware_registry(
         Err(error) => {
             // Emit only on the transition into the failed state to avoid
             // repeating the same finding on every poll during an outage.
-            if *status == MiddlewareRegistryStatus::Synchronized {
+            if *reconciliation.status == MiddlewareRegistryStatus::Synchronized {
                 ocsf_emit!(
                     ConfigStateChangeBuilder::new(ocsf_ctx())
                         .severity(SeverityId::Medium)
@@ -2967,7 +2994,7 @@ async fn reconcile_middleware_registry(
                         .build()
                 );
             }
-            *status = MiddlewareRegistryStatus::NeedsReconciliation;
+            *reconciliation.status = MiddlewareRegistryStatus::NeedsReconciliation;
         }
     }
 }
@@ -3181,6 +3208,7 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
     let mut current_policy_version: u32 = 0;
     let mut current_policy_hash = String::new();
     let mut current_middleware_services = Vec::new();
+    let mut current_extension_authentication_enabled = ctx.extension_authentication_enabled;
     let mut middleware_registry_status = ctx.middleware_registry_status;
     let mut current_settings: std::collections::HashMap<
         String,
@@ -3217,6 +3245,8 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
                     current_policy_version = candidate.version;
                     current_policy_hash.clone_from(&candidate.policy_hash);
                     current_middleware_services = result.supervisor_middleware_services;
+                    current_extension_authentication_enabled =
+                        result.extension_authentication_enabled;
                     current_settings = result.settings;
                     enqueue_policy_status(
                         &status_sender,
@@ -3241,6 +3271,8 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
                     current_config_revision = result.config_revision;
                     current_policy_hash = result.policy_hash.clone();
                     current_middleware_services = result.supervisor_middleware_services;
+                    current_extension_authentication_enabled =
+                        result.extension_authentication_enabled;
                     current_settings = result.settings;
                     debug!(
                         config_revision = current_config_revision,
@@ -3267,8 +3299,9 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
                 }
                 Err(e) => {
                     debug!(error = %e, "Settings poll: server unreachable, will retry");
-                    if let Err(refresh_error) =
-                        client.refresh_installed_extension_credentials().await
+                    if current_extension_authentication_enabled
+                        && let Err(refresh_error) =
+                            client.refresh_installed_extension_credentials().await
                     {
                         warn!(
                             error = %refresh_error,
@@ -3284,25 +3317,32 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
         // missing or due. Rotation happens on the existing gateway channel and
         // updates slots in place, so it is independent of config revision and
         // registry equality.
-        let middleware_credentials = match client
-            .extension_credentials_for(&result.supervisor_middleware_services)
-            .await
-        {
-            Ok(credentials) => credentials,
-            Err(error) => {
-                warn!(error = %error, "Settings poll: extension credential refresh failed");
-                std::collections::HashMap::new()
+        let middleware_credentials = if result.extension_authentication_enabled {
+            match client
+                .extension_credentials_for(&result.supervisor_middleware_services)
+                .await
+            {
+                Ok(credentials) => credentials,
+                Err(error) => {
+                    warn!(error = %error, "Settings poll: extension credential refresh failed");
+                    std::collections::HashMap::new()
+                }
             }
+        } else {
+            std::collections::HashMap::new()
         };
 
         let config_changed = result.config_revision != current_config_revision;
         let provider_env_changed = result.provider_env_revision != current_provider_env_revision;
         let policy_changed = result.policy_hash != current_policy_hash;
-        let middleware_registry_changed = middleware_registry_needs_rebuild(
-            middleware_registry_status,
-            &current_middleware_services,
-            &result.supervisor_middleware_services,
-        );
+        let extension_authentication_changed =
+            current_extension_authentication_enabled != result.extension_authentication_enabled;
+        let middleware_registry_changed = extension_authentication_changed
+            || middleware_registry_needs_rebuild(
+                middleware_registry_status,
+                &current_middleware_services,
+                &result.supervisor_middleware_services,
+            );
         // A valid candidate may intentionally restore byte-for-byte policy
         // content that was active before a rejected update. Its hash then
         // equals `current_policy_hash`, but the runtime is still quarantined
@@ -3312,6 +3352,7 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
                 .as_ref()
                 .is_some_and(|rejected| rejected.policy_hash != result.policy_hash);
         let policy_runtime_changed = recovering_rejected_policy
+            || extension_authentication_changed
             || gateway_policy_runtime_needs_reconciliation(
                 reloads_gateway_policy,
                 &current_policy_hash,
@@ -3340,13 +3381,22 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
             reconcile_middleware_registry(
                 &ctx.opa_engine,
                 &ctx.middleware_connector,
-                &result.supervisor_middleware_services,
-                &middleware_credentials,
-                &ctx.extension_credentials,
-                &mut current_middleware_services,
-                &mut middleware_registry_status,
+                MiddlewareRegistryReconciliation {
+                    desired_services: &result.supervisor_middleware_services,
+                    authentication: MiddlewareAuthentication {
+                        credentials: middleware_credentials.clone(),
+                        enabled: result.extension_authentication_enabled,
+                    },
+                    registry_changed: middleware_registry_changed,
+                    extension_credentials: &ctx.extension_credentials,
+                    current_services: &mut current_middleware_services,
+                    status: &mut middleware_registry_status,
+                },
             )
             .await;
+            if middleware_registry_status == MiddlewareRegistryStatus::Synchronized {
+                current_extension_authentication_enabled = result.extension_authentication_enabled;
+            }
         }
 
         if !config_changed
@@ -3481,7 +3531,10 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
                 result.policy.as_ref(),
                 pid,
                 &result.supervisor_middleware_services,
-                &middleware_credentials,
+                &MiddlewareAuthentication {
+                    credentials: middleware_credentials.clone(),
+                    enabled: result.extension_authentication_enabled,
+                },
                 middleware_registry_changed,
                 &ctx.middleware_connector,
             )
@@ -3582,9 +3635,12 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
 
                     current_policy_hash.clone_from(&result.policy_hash);
                     current_middleware_services.clone_from(&result.supervisor_middleware_services);
+                    current_extension_authentication_enabled =
+                        result.extension_authentication_enabled;
                     retain_extension_credentials(
                         &ctx.extension_credentials,
                         &result.supervisor_middleware_services,
+                        result.extension_authentication_enabled,
                     );
                     middleware_registry_status = MiddlewareRegistryStatus::Synchronized;
                     last_failed_runtime_revision = None;
@@ -4195,6 +4251,7 @@ filesystem_policy:
             supervisor_middleware_services: Vec::new(),
             workspace: String::new(),
             policy_validation_failure_mode: PolicyValidationFailureMode::default(),
+            extension_authentication_enabled: false,
         }
     }
 
@@ -4241,6 +4298,49 @@ filesystem_policy:
         }
     }
 
+    #[derive(Clone)]
+    struct CredentialRejectingPolicyGateway {
+        inner: ScriptedPolicyGateway,
+        credential_requests: Arc<AtomicUsize>,
+    }
+
+    #[tonic::async_trait]
+    impl PolicyGatewayClient for CredentialRejectingPolicyGateway {
+        async fn poll_settings(
+            &self,
+            sandbox_id: &str,
+        ) -> Result<openshell_core::grpc_client::SettingsPollResult> {
+            self.inner.poll_settings(sandbox_id).await
+        }
+
+        async fn report_policy_status(
+            &self,
+            sandbox_id: &str,
+            version: u32,
+            loaded: bool,
+            error: &str,
+        ) -> Result<()> {
+            self.inner
+                .report_policy_status(sandbox_id, version, loaded, error)
+                .await
+        }
+
+        async fn extension_credentials_for(
+            &self,
+            _services: &[openshell_core::proto::SupervisorMiddlewareService],
+        ) -> Result<std::collections::HashMap<String, openshell_extension_core::BearerTokenSlot>>
+        {
+            self.credential_requests.fetch_add(1, Ordering::SeqCst);
+            Err(miette::miette!(
+                "gateway extension authentication is unavailable"
+            ))
+        }
+
+        fn workspace(&self) -> String {
+            self.inner.workspace()
+        }
+    }
+
     fn scripted_policy_gateway() -> (
         ScriptedPolicyGateway,
         UnboundedSender<openshell_core::grpc_client::SettingsPollResult>,
@@ -4282,6 +4382,7 @@ filesystem_policy:
             sidecar_control_publisher: None,
             workspace_tx,
             extension_credentials: openshell_extension_core::ExtensionCredentialStore::new(),
+            extension_authentication_enabled: false,
             middleware_connector,
         }
     }
@@ -4372,14 +4473,14 @@ filesystem_policy:
         let (attempt_tx, mut attempt_rx) = tokio::sync::mpsc::unbounded_channel();
         let middleware_connector: MiddlewareConnector = {
             let connector_attempts = connector_attempts.clone();
-            Arc::new(move |_services, _credentials| {
+            Arc::new(move |_services, _authentication| {
                 let attempt = connector_attempts.fetch_add(1, Ordering::SeqCst) + 1;
                 attempt_tx.send(attempt).unwrap();
                 Box::pin(async move {
                     if attempt == 1 {
                         Err(miette::miette!("scripted middleware connection failure"))
                     } else {
-                        connect_middleware_registry(&[]).await
+                        connect_middleware_registry(&[], &MiddlewareAuthentication::default()).await
                     }
                 })
             })
@@ -4425,6 +4526,134 @@ filesystem_policy:
         polls.send(v2).unwrap();
         expect_no_policy_report(&mut reports).await;
         assert_eq!(connector_attempts.load(Ordering::SeqCst), 2);
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn no_signer_capability_uses_legacy_middleware_connector_without_credentials() {
+        let mut v1 = settings_poll_result(
+            Some(proto_policy_fixture()),
+            1,
+            openshell_core::proto::PolicySource::Sandbox,
+        );
+        v1.policy_hash = "same-policy".to_string();
+        let mut v2 = v1.clone();
+        v2.version = 2;
+        v2.config_revision = 200;
+        v2.supervisor_middleware_services =
+            vec![openshell_core::proto::SupervisorMiddlewareService {
+                name: "legacy-guard".to_string(),
+                grpc_endpoint: "http://legacy.invalid".to_string(),
+                ..Default::default()
+            }];
+        assert!(!v2.extension_authentication_enabled);
+
+        let (inner, polls, mut reports) = scripted_policy_gateway();
+        let credential_requests = Arc::new(AtomicUsize::new(0));
+        let client = CredentialRejectingPolicyGateway {
+            inner,
+            credential_requests: credential_requests.clone(),
+        };
+        let (connector_tx, mut connector_rx) = tokio::sync::mpsc::unbounded_channel();
+        let connector: MiddlewareConnector = Arc::new(move |_services, authentication| {
+            connector_tx
+                .send((authentication.credentials.len(), authentication.enabled))
+                .unwrap();
+            Box::pin(async move {
+                connect_middleware_registry(&[], &MiddlewareAuthentication::default()).await
+            })
+        });
+        let engine =
+            Arc::new(OpaEngine::from_proto(&proto_policy_fixture()).expect("build OPA engine"));
+        let loaded_revision = LoadedPolicyRevision::from_snapshot(&v1);
+        let ctx = policy_poll_test_context(
+            engine,
+            LoadedPolicyOrigin::Gateway {
+                revision: Some(loaded_revision),
+                has_last_valid_policy: true,
+            },
+            connector,
+        );
+
+        polls.send(v1).unwrap();
+        let handle = tokio::spawn(run_policy_poll_loop_with_client(ctx, client));
+        expect_policy_report(&mut reports, 1).await;
+        polls.send(v2).unwrap();
+        assert_eq!(
+            timeout(Duration::from_secs(1), connector_rx.recv())
+                .await
+                .unwrap(),
+            Some((0, false))
+        );
+        expect_policy_report(&mut reports, 2).await;
+        assert_eq!(credential_requests.load(Ordering::SeqCst), 0);
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn enabled_extension_authentication_keeps_credential_failure_fail_closed() {
+        let mut v1 = settings_poll_result(
+            Some(proto_policy_fixture()),
+            1,
+            openshell_core::proto::PolicySource::Sandbox,
+        );
+        v1.policy_hash = "same-policy".to_string();
+        let mut v2 = v1.clone();
+        v2.version = 2;
+        v2.config_revision = 200;
+        v2.extension_authentication_enabled = true;
+        v2.supervisor_middleware_services =
+            vec![openshell_core::proto::SupervisorMiddlewareService {
+                name: "authenticated-guard".to_string(),
+                grpc_endpoint: "https://guard.invalid".to_string(),
+                ..Default::default()
+            }];
+
+        let (inner, polls, mut reports) = scripted_policy_gateway();
+        let credential_requests = Arc::new(AtomicUsize::new(0));
+        let client = CredentialRejectingPolicyGateway {
+            inner,
+            credential_requests: credential_requests.clone(),
+        };
+        let (connector_tx, mut connector_rx) = tokio::sync::mpsc::unbounded_channel();
+        let connector: MiddlewareConnector = Arc::new(move |_services, authentication| {
+            connector_tx
+                .send((authentication.credentials.len(), authentication.enabled))
+                .unwrap();
+            Box::pin(async move {
+                if authentication.enabled && authentication.credentials.is_empty() {
+                    Err(miette::miette!(
+                        "missing authenticated middleware credential"
+                    ))
+                } else {
+                    connect_middleware_registry(&[], &authentication).await
+                }
+            })
+        });
+        let engine =
+            Arc::new(OpaEngine::from_proto(&proto_policy_fixture()).expect("build OPA engine"));
+        let loaded_revision = LoadedPolicyRevision::from_snapshot(&v1);
+        let ctx = policy_poll_test_context(
+            engine,
+            LoadedPolicyOrigin::Gateway {
+                revision: Some(loaded_revision),
+                has_last_valid_policy: true,
+            },
+            connector,
+        );
+
+        polls.send(v1).unwrap();
+        let handle = tokio::spawn(run_policy_poll_loop_with_client(ctx, client));
+        expect_policy_report(&mut reports, 1).await;
+        polls.send(v2).unwrap();
+        assert_eq!(
+            timeout(Duration::from_secs(1), connector_rx.recv())
+                .await
+                .unwrap(),
+            Some((0, true))
+        );
+        expect_no_policy_report(&mut reports).await;
+        assert_eq!(credential_requests.load(Ordering::SeqCst), 1);
         handle.abort();
     }
 
@@ -4584,7 +4813,7 @@ filesystem_policy:
             max_body_bytes: 1024,
             ..Default::default()
         };
-        connect_middleware_registry(&[invalid_external])
+        connect_middleware_registry(&[invalid_external], &MiddlewareAuthentication::default())
             .await
             .expect_err("unavailable external service must not replace built-ins");
 
@@ -4610,7 +4839,7 @@ filesystem_policy:
             Some(&proto_policy_fixture()),
             0,
             &[unavailable_service],
-            &std::collections::HashMap::new(),
+            &MiddlewareAuthentication::default(),
             true,
             &default_middleware_connector(),
         )
