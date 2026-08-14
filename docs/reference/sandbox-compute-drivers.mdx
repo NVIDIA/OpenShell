@@ -113,18 +113,15 @@ It overrides the gateway's configured default runtime class for that sandbox,
 while a typed `SandboxTemplate.runtime_class_name` value from the API still
 takes precedence.
 
-Docker and Podman callback listeners accept only supervisor callback gRPC
-methods. Use the gateway's primary endpoint for CLI, administrator, health,
-reflection, inference-route management, and HTTP requests. A
-`PermissionDenied` response from one of the sandbox-visible callback addresses
-is expected for those requests. The gateway fails startup if a callback
-requirement resolves to the exact primary listener address because one socket
-cannot preserve both authorization scopes. For the IPv4-loopback callback used
-by Docker Desktop and Podman Machine, set `bind_address = "[::1]:17670"` for the primary listener
-and register `https://localhost:17670` as the CLI endpoint. The hostname matches
-the generated certificate and is the package-managed default. The CLI also
-normalizes raw IPv6-literal endpoints for TLS. Do not broaden the primary
-listener to `0.0.0.0`.
+Docker and Podman report the address through which their sandboxes can reach
+the gateway. If the primary listener covers that address, the gateway reuses
+it and sandbox JWT authentication restricts the supervisor to its callback RPC
+allowlist. If the primary listener is not reachable through that address, the
+gateway creates an additional callback-only listener. Use the primary endpoint
+for CLI, administrator, health, reflection, inference-route management, and
+HTTP requests. A `PermissionDenied` response from an additional callback-only
+listener is expected for those requests. Do not broaden the primary listener
+to `0.0.0.0` solely to make sandbox callbacks reachable.
 
 ## Docker Driver
 
@@ -133,8 +130,8 @@ listener to `0.0.0.0`.
 The gateway talks to the Docker daemon to create sandbox containers. Docker is also required for local image builds from directories or Dockerfiles.
 
 Docker Desktop and compatible macOS runtimes route `host.openshell.internal`
-through an IPv4 host-gateway alias. When the primary gateway listener does not
-already cover IPv4 loopback, the Docker driver requests a separate
+through an IPv4 host-gateway alias. The gateway reuses an IPv4 primary listener
+that already covers loopback. Otherwise, the Docker driver requests a separate
 `127.0.0.1:<gateway-port>` callback-only listener.
 
 For maintainer-level implementation details, refer to the [Docker driver README](https://github.com/NVIDIA/OpenShell/blob/main/crates/openshell-driver-docker/README.md).

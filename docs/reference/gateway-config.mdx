@@ -31,7 +31,7 @@ Package-managed gateways do not require a TOML file. Create one at the package's
 
 The Fedora/RHEL RPM template leaves `[openshell.gateway].bind_address` unset. The gateway therefore uses its built-in `127.0.0.1:17670` primary listener. The Podman driver negotiates separate, restricted listeners for sandbox callbacks, so the primary listener does not need a wildcard address. Set `bind_address` explicitly only when clients must reach the primary multiplexed API through another interface.
 
-The Homebrew formula creates its prefix config once with `bind_address = "[::1]:17670"`. Keeping the primary API on IPv6 loopback leaves IPv4 loopback available for Podman Machine's sandbox callback listener. A user config takes precedence, and upgrades do not overwrite either config.
+The Homebrew formula creates its prefix config without setting `bind_address`, so the gateway uses its built-in `127.0.0.1:17670` primary listener. Docker Desktop and Podman Machine reuse that listener for sandbox callbacks. A user config takes precedence. Upgrades preserve user-edited configs and migrate only an unchanged prefix config generated with the affected IPv6-loopback default.
 
 ## Layout
 

@@ -181,9 +181,10 @@ Common findings:
 - On macOS, repeated `Policy fetch failed after 5 attempts` messages with a
   Homebrew gateway bound to `[::1]:17670` indicate that the Docker
   `host-gateway` IPv4 route has no matching callback listener. Current releases
-  negotiate `127.0.0.1:17670` as a separate callback-only listener. On an older
-  release, use `bind_address = "127.0.0.1:17670"` as a Docker-only workaround or
-  upgrade; do not apply that workaround to a Podman Machine gateway.
+  leave `bind_address` unset in the Homebrew config, use the built-in
+  `127.0.0.1:17670` primary listener, and reuse it for authenticated sandbox
+  callbacks. On an older release, set `bind_address = "127.0.0.1:17670"` or
+  upgrade.
 - Supervisor image exits before printing `openshell-sandbox --version`: the image should be the scratch supervisor image from `deploy/docker/Dockerfile.supervisor` and must contain a static executable at `/openshell-sandbox`.
 - `mise run e2e:docker:gpu` fails with `docker info --format json did not report any discovered NVIDIA CDI GPU devices`: Docker may report `CDISpecDirs` while still having no generated NVIDIA CDI specs. Verify `.DiscoveredDevices` contains entries such as `nvidia.com/gpu=all`, verify `/etc/cdi` or `/var/run/cdi` contains a generated NVIDIA spec, and check that `nvidia-cdi-refresh.service` and `nvidia-cdi-refresh.path` from NVIDIA Container Toolkit are enabled and healthy. The service is a one-shot unit, so `inactive (dead)` can be normal after a successful run; use `systemctl status` and `journalctl` to distinguish success from a skipped or failed refresh. NVIDIA recommends enabling the path and service units, and restarting `nvidia-cdi-refresh.service` to regenerate missing or stale CDI specs. If specs are generated but Docker still reports no discovered devices, restart Docker or reload the daemon and re-check `docker info`.
 
@@ -213,13 +214,9 @@ Common findings:
   error: inspect `podman info --debug`, the configured Podman network, and the
   host's IPv4 default route. Rootless pasta uses the private source address
   selected by that route; rootful Podman uses the bridge gateway address.
-- Callback discovery reports that the requested address equals the primary
-  listener: configure a distinct primary address. For Podman Machine, bind the
-  primary listener to IPv6 loopback, for example
-  `bind_address = "[::1]:17670"`, and register the CLI endpoint as
-  `https://localhost:17670`. The generated certificate includes `localhost`,
-  and current CLIs also normalize a raw `https://[::1]:17670` endpoint for TLS.
-  This leaves `127.0.0.1:17670` available for the callback-only listener.
+- Current gateways reuse the primary listener when it covers Podman's callback
+  address. If the primary does not cover that address, inspect the gateway
+  startup logs for the additional callback-only listener and its provenance.
 - Rootless slirp4netns, another named helper, or missing helper metadata
   requires an explicitly remote `grpc_endpoint`. An explicit `host_gateway_ip`
   cannot bypass slirp4netns host-loopback isolation. Do not work around
@@ -453,7 +450,7 @@ openshell logs <sandbox-name>
 | `openshell status` fails | Gateway endpoint unreachable or auth mismatch | `openshell gateway info`, gateway logs |
 | Gateway starts but sandbox create fails | Compute driver cannot reach runtime | Docker/Podman/Kubernetes/VM driver logs |
 | Gateway exits while resolving compute-driver listener requirements | Callback alias topology is unsupported, the Podman network cannot be inspected, or the selected address is not private/authorized | Gateway startup error, `podman info --debug`, Podman network inspection, host IPv4 default route |
-| Admin, health, reflection, or HTTP request is denied on a Docker/Podman callback address | Negotiated callback listeners intentionally expose only sandbox-callable gRPC methods | Retry through the gateway's primary endpoint; inspect the listener-purpose startup log if the address was unexpected |
+| Admin, health, reflection, or HTTP request is denied on an additional Docker/Podman callback-only listener | Additional callback listeners intentionally expose only sandbox-callable gRPC methods | Retry through the gateway's primary endpoint; inspect the listener-purpose startup log if the address was unexpected |
 | Docker or Podman sandbox never registers | Wrong callback endpoint or supervisor startup failure | Gateway logs and sandbox container logs |
 | Docker GPU e2e fails before GPU sandbox comparison | NVIDIA CDI specs are missing or Docker has not discovered them | `docker info --format '{{json .DiscoveredDevices}}'`, `/etc/cdi`, `/var/run/cdi`, `nvidia-cdi-refresh.service` |
 | Kubernetes gateway pod pending | PVC unbound, taint, selector, or insufficient resources | `kubectl -n openshell describe pod <pod>` |
