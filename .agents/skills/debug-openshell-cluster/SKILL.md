@@ -178,6 +178,12 @@ Common findings:
 - A workdir rejected as a special filesystem or OpenShell control-path collision cannot be made valid with permissions. Move the image workdir away from kernel-backed mounts and the concrete supervisor, TLS, token, runtime, and socket paths named in the error.
 - Docker driver cannot initialize because it cannot find `openshell-sandbox`: verify `OPENSHELL_DOCKER_SUPERVISOR_BIN`, the sibling binary next to `openshell-gateway`, or the configured supervisor image contains `/openshell-sandbox`.
 - Sandbox never registers: check gateway logs and supervisor callback endpoint.
+- On macOS, repeated `Policy fetch failed after 5 attempts` messages with a
+  Homebrew gateway bound to `[::1]:17670` indicate that the Docker
+  `host-gateway` IPv4 route has no matching callback listener. Current releases
+  negotiate `127.0.0.1:17670` as a separate callback-only listener. On an older
+  release, use `bind_address = "127.0.0.1:17670"` as a Docker-only workaround or
+  upgrade; do not apply that workaround to a Podman Machine gateway.
 - Supervisor image exits before printing `openshell-sandbox --version`: the image should be the scratch supervisor image from `deploy/docker/Dockerfile.supervisor` and must contain a static executable at `/openshell-sandbox`.
 - `mise run e2e:docker:gpu` fails with `docker info --format json did not report any discovered NVIDIA CDI GPU devices`: Docker may report `CDISpecDirs` while still having no generated NVIDIA CDI specs. Verify `.DiscoveredDevices` contains entries such as `nvidia.com/gpu=all`, verify `/etc/cdi` or `/var/run/cdi` contains a generated NVIDIA spec, and check that `nvidia-cdi-refresh.service` and `nvidia-cdi-refresh.path` from NVIDIA Container Toolkit are enabled and healthy. The service is a one-shot unit, so `inactive (dead)` can be normal after a successful run; use `systemctl status` and `journalctl` to distinguish success from a skipped or failed refresh. NVIDIA recommends enabling the path and service units, and restarting `nvidia-cdi-refresh.service` to regenerate missing or stale CDI specs. If specs are generated but Docker still reports no discovered devices, restart Docker or reload the daemon and re-check `docker info`.
 
@@ -212,9 +218,8 @@ Common findings:
   primary listener to IPv6 loopback, for example
   `bind_address = "[::1]:17670"`, and register the CLI endpoint as
   `https://localhost:17670`. The generated certificate includes `localhost`,
-  while a raw `https://[::1]:17670` endpoint can fail TLS setup with
-  `invalid dns name`. This leaves `127.0.0.1:17670` available for the
-  callback-only listener.
+  and current CLIs also normalize a raw `https://[::1]:17670` endpoint for TLS.
+  This leaves `127.0.0.1:17670` available for the callback-only listener.
 - Rootless slirp4netns, another named helper, or missing helper metadata
   requires an explicitly remote `grpc_endpoint`. An explicit `host_gateway_ip`
   cannot bypass slirp4netns host-loopback isolation. Do not work around

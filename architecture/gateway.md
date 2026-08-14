@@ -699,8 +699,10 @@ system entry instead of pretending to delete package-manager owned state.
 - Compute runtimes own the mechanics of starting workloads and injecting
   callback configuration.
 - Docker-backed local gateways use Docker's `host-gateway` callback alias on
-  macOS and Docker Desktop-style runtimes. Native Linux Docker may expose an
-  additional bridge-gateway listener because the host can bind that bridge IP.
+  macOS and Docker Desktop-style runtimes. They negotiate an IPv4 loopback
+  callback listener when the primary listener does not already cover it.
+  Native Linux Docker may expose an additional bridge-gateway listener because
+  the host can bind that bridge IP.
 - Podman-backed macOS gateways use gvproxy's host-loopback IP for sandbox host
   aliases by default so stale Podman machine images do not need Podman's
   `host-gateway` resolver. Linux Podman keeps the resolver unless

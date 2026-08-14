@@ -60,7 +60,8 @@ def test_generate_homebrew_formula_uses_tagged_macos_driver_asset_without_defaul
     assert 'bind_address = "[::1]:17670"' in formula
     assert '# compute_drivers = ["vm"]' not in formula
     assert (
-        "openshell gateway add https://[::1]:17670 --local --name openshell" in formula
+        "openshell gateway add https://localhost:17670 --local --name openshell"
+        in formula
     )
     assert 'run opt_libexec/"openshell-gateway-homebrew-service"' in formula
     assert 'xdg_config_home="${XDG_CONFIG_HOME:-${HOME}/.config}"' in formula

@@ -379,7 +379,7 @@ class Openshell < Formula
         brew services restart openshell
 
       Register it with the OpenShell CLI:
-        openshell gateway add https://[::1]:{LOCAL_GATEWAY_PORT} --local --name openshell
+        openshell gateway add https://localhost:{LOCAL_GATEWAY_PORT} --local --name openshell
     EOS
   end
 

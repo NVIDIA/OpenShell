@@ -38,7 +38,7 @@ For detailed driver behavior, refer to [Sandbox Compute Drivers](/reference/sand
 
 On macOS, the install script uses Homebrew. The Homebrew package installs the `openshell` CLI, the gateway binary, and a Homebrew-managed gateway service.
 
-The Homebrew service listens on `https://[::1]:17670` and generates a local mTLS bundle on install. The formula creates a Homebrew prefix config, such as `/opt/homebrew/var/openshell/gateway.toml`, with this IPv6 loopback default so Podman can use its separate IPv4 loopback callback listener. The gateway reads `~/.config/openshell/gateway.toml` instead when that file exists. Homebrew preserves existing prefix and user configs during upgrades.
+The Homebrew service listens on `https://[::1]:17670` and generates a local mTLS bundle on install. The installer registers `https://localhost:17670` with the CLI so TLS uses a DNS name while macOS resolves the connection to IPv6 loopback. The formula creates a Homebrew prefix config, such as `/opt/homebrew/var/openshell/gateway.toml`, with this IPv6 loopback default so Docker Desktop and Podman Machine can use separate IPv4 loopback callback listeners. The gateway reads `~/.config/openshell/gateway.toml` instead when that file exists. Homebrew preserves existing prefix and user configs during upgrades.
 
 The CLI reads the client bundle from `~/.config/openshell/gateways/openshell/mtls/`.
 
