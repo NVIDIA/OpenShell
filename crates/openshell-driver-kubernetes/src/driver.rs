@@ -1497,11 +1497,11 @@ impl KubernetesComputeDriver {
     }
 
     pub async fn stop_sandbox(&self, sandbox_id: &str) -> Result<(), String> {
-        let (agent_sandbox_api, kube_name, pod_name, stop_timeout) = self
+        let (agent_sandbox_api, kube_name, pod_name, namespace, stop_timeout) = self
             .patch_sandbox_operating_state(sandbox_id, false)
             .await?;
         let legacy_pod_api = (agent_sandbox_api.resource.version == SANDBOX_VERSION_V1ALPHA1)
-            .then(|| Api::<Pod>::namespaced(self.client.clone(), &self.config.namespace));
+            .then(|| Api::<Pod>::namespaced(self.client.clone(), &namespace));
 
         let deadline = tokio::time::Instant::now() + stop_timeout;
         let mut poll_interval = STOP_INITIAL_POLL_INTERVAL;
@@ -1559,7 +1559,7 @@ impl KubernetesComputeDriver {
         &self,
         sandbox_id: &str,
         running: bool,
-    ) -> Result<(AgentSandboxApi, String, String, Duration), String> {
+    ) -> Result<(AgentSandboxApi, String, String, String, Duration), String> {
         let lookup_api = self
             .supported_sandbox_api_for_lookup(self.client.clone())
             .await?;
@@ -1634,7 +1634,13 @@ impl KubernetesComputeDriver {
             running,
             "Updated Kubernetes sandbox operating state"
         );
-        Ok((agent_sandbox_api, kube_name, pod_name, stop_timeout))
+        Ok((
+            agent_sandbox_api,
+            kube_name,
+            pod_name,
+            namespace,
+            stop_timeout,
+        ))
     }
 
     pub async fn delete_sandbox(&self, sandbox_id: &str) -> Result<bool, String> {

@@ -668,6 +668,57 @@ async fn managed_full_lifecycle_with_multiple_sandboxes() {
 }
 
 #[tokio::test]
+async fn managed_stop_waits_for_workspace_pod_to_disappear() {
+    let ws = unique_workspace("mgdstop");
+    let ns = managed_namespace(&ws);
+    let sandbox = "stop-sb";
+    let _cleanup = ManagedCleanup {
+        workspace: ws.clone(),
+        sandboxes: vec![sandbox.into()],
+    };
+
+    let (ok, out) = run_cli(&["workspace", "create", "--name", &ws]).await;
+    assert!(ok, "workspace create failed: {out}");
+
+    let (ok, out) = run_cli(&[
+        "sandbox",
+        "create",
+        "--workspace",
+        &ws,
+        "--name",
+        sandbox,
+        "--",
+        "echo",
+        "ready",
+    ])
+    .await;
+    assert!(ok, "sandbox create failed: {out}");
+
+    let (ok, pod_name) = kubectl(&[
+        "get",
+        "sandbox",
+        sandbox,
+        "-n",
+        &ns,
+        "-o",
+        "jsonpath={.metadata.annotations.agents\\.x-k8s\\.io/pod-name}",
+    ])
+    .await;
+    assert!(ok, "failed to resolve sandbox pod name: {pod_name}");
+    let pod_name = pod_name.trim();
+    assert!(!pod_name.is_empty(), "sandbox pod annotation was empty");
+
+    let (ok, out) = run_cli(&["sandbox", "stop", sandbox, "--workspace", &ws]).await;
+    assert!(ok, "sandbox stop failed: {out}");
+
+    let (exists, out) = kubectl(&["get", "pod", pod_name, "-n", &ns]).await;
+    assert!(
+        !exists,
+        "sandbox stop returned before workspace pod {pod_name} disappeared: {out}"
+    );
+}
+
+#[tokio::test]
 async fn managed_rejects_invalid_dns1123_sandbox_name() {
     let ws = unique_workspace("mgddns");
     let _cleanup = ManagedCleanup {
