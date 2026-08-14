@@ -284,6 +284,52 @@ If the gateway exits with `failed to read sandbox JWT signing key from
 `sandbox-jwt` secret at `/etc/openshell-jwt`. The sandbox JWT mount is required
 even when local Helm values disable TLS.
 
+If `certManager.serverIssuerRef` points the server certificate at an external
+Issuer or ClusterIssuer (for example an ACME issuer, for a publicly-trusted
+cert on an OpenShift `Route` with TLS passthrough — see
+`openshiftRoute.enabled`), the chart creates **two** server certificates: an
+internal one (chart CA, internal SANs) and an external one (from the configured
+issuer, external SANs only).  The gateway uses SNI to present the right cert.
+
+Check the external `Certificate`/`CertificateRequest`/`Challenge` resources
+directly when the external secret never becomes Ready:
+
+```bash
+kubectl -n openshell get certificate,certificaterequest,challenge
+kubectl -n openshell describe certificate openshell-server-external
+oc -n openshell get route
+```
+
+ACME issuers reject certificate requests that include internal-only names
+(`*.svc.cluster.local`, `localhost`, loopback IPs) and require the
+`commonName` to also be a SAN — the external `Certificate` only requests the
+hostnames in `certManager.serverDnsNames`, for exactly this reason.
+
+If sandbox supervisors fail their TLS handshake to the gateway with
+`UnknownCA` after configuring `serverIssuerRef`, the most likely cause is
+`server.grpcEndpoint` set to the external hostname.  This forces supervisors
+to connect via the external hostname, receiving the ACME cert (via SNI) which
+they cannot verify against the chart CA.  Remove `server.grpcEndpoint` or set
+it to the internal service name so supervisors receive the internal cert:
+
+```bash
+helm -n openshell get values openshell | grep -E 'grpcEndpoint|clientCaFromServerTlsSecret|clientCaSecretName|serverIssuerRef|caSecretName'
+# server.grpcEndpoint should be unset or point to internal service name
+```
+
+Less commonly, `UnknownCA` can occur if the gateway's client-verification CA
+is misconfigured.  The default `clientCaFromServerTlsSecret=true` is correct
+for all configurations — the internal server certificate is always signed by
+the chart CA (the same CA that signs the client cert), so its `ca.crt` is
+the right trust anchor.  Only override this if you intentionally mount a
+separate client CA via `server.tls.clientCaSecretName`.  Verify the mounted
+client CA matches the CA that signed the client certificate:
+
+```bash
+kubectl -n openshell get statefulset openshell -o jsonpath='{.spec.template.spec.volumes[?(@.name=="tls-client-ca")]}' | jq .
+# Should show items filter for ca.crt from openshell-server-tls
+```
+
 If `server.providerTokenGrants.spiffe.enabled=true`, the gateway should still
 render `[openshell.gateway.gateway_jwt]` and mount the `sandbox-jwt` Secret.
 SPIRE is used only by sandbox pods for dynamic provider token grants. Verify
@@ -469,6 +515,8 @@ openshell logs <sandbox-name>
 | `K8s namespace not ready` with `envoy-gateway-openshell.yaml: the server could not find the requested resource` | Optional Gateway API manifest was applied without Envoy Gateway CRDs, or k3s Helm controller startup exceeded the namespace wait | Apply `deploy/kube/manifests/envoy-gateway-openshell.yaml` manually only after Envoy Gateway is installed and `grpcRoute` is enabled |
 | HTTPS ingress (`grpcRoute.gateway.listener.protocol=HTTPS`) connection resets or TLS handshake hangs | Envoy terminates TLS but the gateway pod still expects TLS, so the plaintext backend hop fails | Set `server.disableTls=true` so Envoy forwards plaintext to the pod; verify the listener `certificateRefs` Secret exists in the release namespace and `openshell status` over `https://<host>` |
 | HTTPS ingress returns `Unauthenticated` after connecting | TLS terminates at Envoy, so the gateway never sees a client cert; no OIDC issuer is configured for identity | Configure `server.oidc.issuer` and register with `openshell gateway add https://<host> --oidc-issuer <url>`, or set `server.auth.allowUnauthenticatedUsers=true` for a trusted-proxy/dev cluster |
+| External server `Certificate` never becomes Ready with `certManager.serverIssuerRef` set | ACME issuer rejected internal-only SANs, a loopback IP, or a `commonName` absent from the SANs | `kubectl -n openshell describe certificate openshell-server-external`; confirm `certManager.serverDnsNames` lists only real, externally-resolvable hostnames |
+| Sandbox supervisors fail TLS handshake with `UnknownCA` after configuring `certManager.serverIssuerRef` | `server.grpcEndpoint` is set to the external hostname, forcing supervisors to receive the ACME cert (via SNI) which they can't verify against chart CA | Remove `server.grpcEndpoint` or set it to the internal service name; supervisors should connect via internal service name to receive the internal cert |
 
 ## Reporting
 

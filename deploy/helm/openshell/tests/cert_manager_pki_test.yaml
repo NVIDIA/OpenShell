@@ -1,0 +1,171 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+suite: cert-manager PKI issuerRef overrides
+templates:
+  - templates/cert-manager-pki.yaml
+release:
+  name: openshell
+  namespace: my-namespace
+
+tests:
+  - it: defaults both server and client Certificates to the chart's own CA issuer
+    template: templates/cert-manager-pki.yaml
+    set:
+      certManager.enabled: true
+    asserts:
+      - equal:
+          path: spec.issuerRef.name
+          value: openshell-ca-issuer
+        documentIndex: 3
+      - equal:
+          path: spec.issuerRef.kind
+          value: Issuer
+        documentIndex: 3
+      - equal:
+          path: spec.issuerRef.name
+          value: openshell-ca-issuer
+        documentIndex: 4
+      - equal:
+          path: spec.issuerRef.kind
+          value: Issuer
+        documentIndex: 4
+
+  - it: default server Certificate includes internal SANs, IPs, and a fixed commonName
+    template: templates/cert-manager-pki.yaml
+    set:
+      certManager.enabled: true
+    asserts:
+      - equal:
+          path: spec.commonName
+          value: openshell
+        documentIndex: 3
+      - contains:
+          path: spec.dnsNames
+          content: openshell.my-namespace.svc.cluster.local
+        documentIndex: 3
+      - contains:
+          path: spec.dnsNames
+          content: localhost
+        documentIndex: 3
+      - equal:
+          path: spec.ipAddresses[0]
+          value: 127.0.0.1
+        documentIndex: 3
+
+  - it: internal server cert keeps chart CA issuer and internal SANs when serverIssuerRef is set
+    template: templates/cert-manager-pki.yaml
+    set:
+      certManager.enabled: true
+      certManager.serverIssuerRef.name: letsencrypt-prod
+      certManager.serverIssuerRef.kind: ClusterIssuer
+      certManager.serverDnsNames:
+        - openshell.example.com
+    asserts:
+      # Internal cert (doc 3) stays on chart CA
+      - equal:
+          path: spec.issuerRef.name
+          value: openshell-ca-issuer
+        documentIndex: 3
+      - equal:
+          path: spec.issuerRef.kind
+          value: Issuer
+        documentIndex: 3
+      # Internal cert has internal SANs
+      - equal:
+          path: spec.commonName
+          value: openshell
+        documentIndex: 3
+      - contains:
+          path: spec.dnsNames
+          content: openshell.my-namespace.svc.cluster.local
+        documentIndex: 3
+      - contains:
+          path: spec.dnsNames
+          content: localhost
+        documentIndex: 3
+      # Internal cert does NOT include external-only hostnames
+      - notContains:
+          path: spec.dnsNames
+          content: openshell.example.com
+        documentIndex: 3
+
+  - it: creates external server Certificate from serverIssuerRef with external SANs only
+    template: templates/cert-manager-pki.yaml
+    set:
+      certManager.enabled: true
+      certManager.serverIssuerRef.name: letsencrypt-prod
+      certManager.serverIssuerRef.kind: ClusterIssuer
+      certManager.serverDnsNames:
+        - openshell.example.com
+    asserts:
+      # External cert (doc 4) uses the external issuer
+      - equal:
+          path: spec.issuerRef.name
+          value: letsencrypt-prod
+        documentIndex: 4
+      - equal:
+          path: spec.issuerRef.kind
+          value: ClusterIssuer
+        documentIndex: 4
+      - equal:
+          path: spec.issuerRef.group
+          value: cert-manager.io
+        documentIndex: 4
+      # External cert has only external SANs
+      - equal:
+          path: spec.commonName
+          value: openshell.example.com
+        documentIndex: 4
+      - equal:
+          path: spec.dnsNames
+          value:
+            - openshell.example.com
+        documentIndex: 4
+      # External cert has no IP addresses
+      - notExists:
+          path: spec.ipAddresses
+        documentIndex: 4
+      # External cert has no internal names
+      - notContains:
+          path: spec.dnsNames
+          content: localhost
+        documentIndex: 4
+
+  - it: fails when serverIssuerRef is set but serverDnsNames contains internal-only names
+    template: templates/cert-manager-pki.yaml
+    set:
+      certManager.enabled: true
+      certManager.serverIssuerRef.name: letsencrypt-prod
+      # serverDnsNames is left at the default which contains "openshell.openshell.svc", "localhost", etc.
+    asserts:
+      - failedTemplate:
+          errorMessage: "certManager.serverIssuerRef.name is set (external issuer) but certManager.serverDnsNames contains \"openshell.openshell.svc\" \u2014 external CAs (e.g. ACME / Let's Encrypt) reject internal-only names per CA/Browser Forum baseline requirements. Override certManager.serverDnsNames with your externally-resolvable hostname(s)."
+
+  - it: fails when clientCaFromServerTlsSecret is false but clientCaSecretName is the default
+    template: templates/cert-manager-pki.yaml
+    set:
+      certManager.enabled: true
+      certManager.clientCaFromServerTlsSecret: false
+    asserts:
+      - failedTemplate:
+          errorMessage: "certManager.clientCaFromServerTlsSecret is false but server.tls.clientCaSecretName is still the default (openshell-server-client-ca), which nothing creates when cert-manager owns TLS. Set server.tls.clientCaSecretName to the secret containing the client CA (e.g. the value of certManager.caSecretName, which defaults to openshell-ca-tls), or set it to empty to disable mTLS client verification."
+
+  - it: client Certificate issuerRef is unaffected by serverIssuerRef
+    template: templates/cert-manager-pki.yaml
+    set:
+      certManager.enabled: true
+      certManager.serverIssuerRef.name: letsencrypt-prod
+      certManager.serverIssuerRef.kind: ClusterIssuer
+      certManager.serverDnsNames:
+        - openshell.example.com
+    asserts:
+      # Client cert is now doc 5 (after internal + external server certs)
+      - equal:
+          path: spec.issuerRef.name
+          value: openshell-ca-issuer
+        documentIndex: 5
+      - equal:
+          path: spec.issuerRef.kind
+          value: Issuer
+        documentIndex: 5

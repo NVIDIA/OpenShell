@@ -400,7 +400,7 @@ pkiInitJob:
   serverIpAddresses: []
 
 # cert-manager Certificate/Issuer resources (requires cert-manager CRDs in-cluster).
-# Uses namespaced Issuers only (no ClusterIssuer). Does not install cert-manager itself.
+# Does not install cert-manager itself.
 certManager:
   # -- Create cert-manager Issuer and Certificate resources. When enabled,
   # cert-manager owns TLS and the chart runs a JWT-only certgen hook to create
@@ -408,9 +408,22 @@ certManager:
   enabled: false
   # -- Secret created for the intermediate CA (Certificate with isCA: true).
   caSecretName: openshell-ca-tls
-  # -- Mount gateway client CA from the server TLS secret's ca.crt (populated by
-  # cert-manager for certs issued by a CA Issuer). Avoids a separate
-  # openshell-server-client-ca Secret.
+  # -- Override the issuerRef for the external server Certificate (e.g. a real
+  # ACME ClusterIssuer for a publicly-trusted cert on an external hostname).
+  # When set, the chart creates a second server certificate from this issuer
+  # with only the hostnames in serverDnsNames; the internal server certificate
+  # is always signed by the chart's own CA. Leave name empty to use the chart
+  # CA for all server certificates (default). Requires certManager.enabled=true.
+  serverIssuerRef:
+    name: ""
+    kind: ""
+    group: ""
+  # -- Mount gateway client CA from the internal server TLS secret's ca.crt.
+  # The internal server certificate is always signed by the chart CA — the same
+  # CA that signs the client (mTLS) certificate — so the default (true) is
+  # correct for all configurations, including when serverIssuerRef is set.
+  # Only set to false if you mount the client CA from a separate secret via
+  # server.tls.clientCaSecretName.
   clientCaFromServerTlsSecret: true
   # -- Duration for cert-manager-issued certificates.
   certificateDuration: 8760h
@@ -470,3 +483,15 @@ grpcRoute:
         # or the existing openshell-server-tls Secret (its SANs must include the
         # external hostname).
         certificateRefs: []
+
+# OpenShift Route with TLS passthrough. The gateway terminates its own
+# TLS/mTLS; the router only forwards based on SNI, so it never sees plaintext
+# or the client certificate. Requires server.disableTls=false and a server
+# cert whose SANs include the Route host (see certManager.serverIssuerRef).
+openshiftRoute:
+  # -- Create an OpenShift Route with TLS passthrough.
+  enabled: false
+  # -- Hostname for the Route. Must match a SAN on the gateway's server cert.
+  host: ""
+  # -- Extra annotations on the Route (e.g. haproxy.router.openshift.io/*).
+  annotations: {}

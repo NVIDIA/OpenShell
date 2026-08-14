@@ -15,7 +15,7 @@ async-trait = "0.1"
 glob = { workspace = true }
 prost = { workspace = true }
 prost-types = { workspace = true }
-tonic = { workspace = true, features = ["channel", "tls-native-roots"] }
+tonic = { workspace = true, features = ["channel", "tls-ring"] }
 tonic-prost = { workspace = true }
 tokio = { workspace = true }
 thiserror = { workspace = true }

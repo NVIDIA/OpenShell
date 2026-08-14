@@ -596,6 +596,26 @@ fn build_environment_protects_oci_identity_metadata() {
 }
 
 #[test]
+fn build_environment_strips_gateway_tls_server_name() {
+    let mut sandbox = test_sandbox();
+    let spec = sandbox.spec.as_mut().unwrap();
+    spec.environment.insert(
+        openshell_core::sandbox_env::GATEWAY_TLS_SERVER_NAME.to_string(),
+        "evil.attacker.example.com".to_string(),
+    );
+
+    let env = build_environment(&sandbox, &runtime_config());
+
+    assert!(
+        !env.iter().any(|entry| entry.starts_with(&format!(
+            "{}=",
+            openshell_core::sandbox_env::GATEWAY_TLS_SERVER_NAME
+        ))),
+        "GATEWAY_TLS_SERVER_NAME must be stripped from the supervisor environment"
+    );
+}
+
+#[test]
 fn container_creation_uses_inspected_immutable_image() {
     let sandbox = test_sandbox();
     let metadata = DockerImageMetadata {

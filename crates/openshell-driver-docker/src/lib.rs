@@ -2453,6 +2453,11 @@ fn build_environment_for_oci_user(
 
     environment.remove(openshell_core::sandbox_env::SANDBOX_TOKEN);
     environment.remove(openshell_core::sandbox_env::SANDBOX_TOKEN_FILE);
+    // Prevent user-supplied environment from overriding the TLS server name
+    // the supervisor verifies — a sandbox user who can redirect the gateway
+    // hostname could otherwise present a certificate for a name they control
+    // and intercept the sandbox JWT.
+    environment.remove(openshell_core::sandbox_env::GATEWAY_TLS_SERVER_NAME);
     environment.insert(
         openshell_core::sandbox_env::OCI_IMAGE_USER.to_string(),
         oci_user.to_string(),

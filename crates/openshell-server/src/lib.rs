@@ -564,6 +564,9 @@ pub(crate) async fn run_server(
             &tls.key_path,
             tls.client_ca_path.as_deref(),
             tls.require_client_auth,
+            tls.external_cert_path.as_deref(),
+            tls.external_key_path.as_deref(),
+            tls.external_server_names.clone(),
         )?;
 
         // Spawn file-watcher-based TLS certificate reload worker.
@@ -1145,6 +1148,9 @@ mod tests {
             &dir.path().join("server-key.pem"),
             Some(&dir.path().join("ca.pem")),
             false,
+            None,
+            None,
+            Vec::new(),
         )
         .expect("failed to build tls acceptor");
 

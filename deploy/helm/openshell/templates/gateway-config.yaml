@@ -19,6 +19,9 @@ One value is intentionally NOT rendered here:
 {{- if .Values.server.credentialDrivers.vault.enabled -}}
 {{- $credentialDrivers = append $credentialDrivers "vault" -}}
 {{- end -}}
+{{- if and .Values.certManager.serverIssuerRef.name (not .Values.certManager.enabled) }}
+{{- fail "certManager.serverIssuerRef.name is set but certManager.enabled is false \u2014 the external server certificate, its Secret mount, and the gateway TLS configuration all require cert-manager to be enabled. Set certManager.enabled=true or remove certManager.serverIssuerRef.name." }}
+{{- end }}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -91,6 +94,11 @@ data:
     cert_path             = "/etc/openshell-tls/server/tls.crt"
     key_path              = "/etc/openshell-tls/server/tls.key"
     client_ca_path        = "/etc/openshell-tls/client-ca/ca.crt"
+    {{- if .Values.certManager.serverIssuerRef.name }}
+    external_cert_path    = "/etc/openshell-tls/server-external/tls.crt"
+    external_key_path     = "/etc/openshell-tls/server-external/tls.key"
+    external_server_names = [{{- range $i, $name := .Values.certManager.serverDnsNames }}{{ if $i }}, {{ end }}{{ $name | quote }}{{- end }}]
+    {{- end }}
     {{- end }}
 
     {{- if .Values.server.auth.allowUnauthenticatedUsers }}
