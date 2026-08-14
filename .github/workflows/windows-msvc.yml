@@ -74,8 +74,16 @@ jobs:
           cache-targets: "true"
           cache-on-failure: "true"
           cache-bin: "false"
-      - name: Lint
-        run: mise run --skip-tools rust:lint
+      - name: Lint Windows-sensitive crates
+        # Formatting is target-independent and already checked by the Linux jobs.
+        # Keep this guard focused on Windows cfgs, matching the macOS lane.
+        run: >-
+          cargo clippy
+          -p openshell-sandbox
+          -p openshell-core
+          -p openshell-cli
+          --all-targets
+          -- -D warnings
       - name: Test
         run: mise run --skip-tools test:rust
       - name: sccache stats
@@ -117,8 +125,16 @@ jobs:
           cache-targets: "true"
           cache-on-failure: "true"
           cache-bin: "false"
-      - name: Lint
-        run: mise run --skip-tools rust:lint
+      - name: Lint Windows-sensitive crates
+        # Keep the seed workload identical to the pull-request workload so its
+        # target and compiler caches are reusable by subsequent pull requests.
+        run: >-
+          cargo clippy
+          -p openshell-sandbox
+          -p openshell-core
+          -p openshell-cli
+          --all-targets
+          -- -D warnings
       - name: Test
         run: mise run --skip-tools test:rust
       - name: sccache stats
