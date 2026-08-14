@@ -1616,7 +1616,7 @@ async fn handle_tcp_connection(
 
                 relay::relay_http_stream(&mut tls_client, &mut tls_upstream, relay_context).await
             };
-            if let Err(e) = tls_result.await {
+            if let Err(e) = Box::pin(tls_result).await {
                 if is_benign_relay_error(&e) {
                     debug!(
                         host = %host_lc,
@@ -4496,7 +4496,7 @@ async fn handle_forward_proxy(
         }
         forward_websocket_request =
             crate::l7::rest::request_is_websocket_upgrade(&forward_request_bytes);
-        websocket_extensions = crate::l7::relay::websocket_extension_mode(&l7_config.config);
+        websocket_extensions = crate::l7::relay::websocket_extension_mode(&l7_config.config, false);
         request_body_credential_rewrite = l7_config.config.protocol == crate::l7::L7Protocol::Rest
             && l7_config.config.request_body_credential_rewrite;
         forward_upgrade_config = Some(l7_config.config.clone());
@@ -4842,46 +4842,6 @@ async fn handle_forward_proxy(
         return Ok(());
     }
 
-    // 6. Connect upstream. Plain-HTTP requests always dial the destination
-    //    directly: only TLS (CONNECT) tunnels chain through the corporate
-    //    proxy, since plain-HTTP forwarding would need absolute-form requests
-    //    rather than a CONNECT tunnel.
-    let mut upstream = match connector.connect().await {
-        Ok(s) => s,
-        Err(e) => {
-            let event = HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
-                .activity(ActivityId::Fail)
-                .severity(SeverityId::Low)
-                .status(StatusId::Failure)
-                .http_request(HttpRequest::new(
-                    method,
-                    OcsfUrl::new("http", &host_lc, &telemetry_path, port),
-                ))
-                .dst_endpoint(Endpoint::from_domain(&host_lc, port))
-                .src_endpoint(Endpoint::from_ip(workload_addr.ip(), workload_addr.port()))
-                .actor_process(
-                    Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
-                        .with_cmd_line(&cmdline_str),
-                )
-                .message(format!(
-                    "FORWARD upstream connect failed for {host_lc}:{port}: {e}"
-                ))
-                .build();
-            ocsf_emit!(event);
-            respond(
-                client,
-                &build_json_error_response(
-                    502,
-                    "Bad Gateway",
-                    "upstream_unreachable",
-                    &format!("connection to {host_lc}:{port} failed"),
-                ),
-            )
-            .await?;
-            return Ok(());
-        }
-    };
-
     let middleware_path = path.split_once('?').map_or(path.as_str(), |(path, _)| path);
     let middleware_input = crate::opa::NetworkInput {
         host: host_lc.clone(),
@@ -4915,6 +4875,7 @@ async fn handle_forward_proxy(
         .await?;
         return Ok(());
     }
+    let websocket_chain = forward_websocket_request.then(|| chain.clone());
     if !chain.is_empty() {
         let middleware_runner = opa_engine.middleware_runner()?;
         let request = crate::l7::rest::request_from_buffered_http(
@@ -4949,7 +4910,62 @@ async fn handle_forward_proxy(
                 respond(client, &response).await?;
                 return Ok(());
             }
+            crate::l7::middleware::MiddlewareApplyResult::AdmissionExhausted => {
+                emit_activity_simple(activity_tx, true, "middleware");
+                let response = build_middleware_unavailable_response(&l7_ctx.policy_name);
+                respond(client, &response).await?;
+                return Ok(());
+            }
         };
+    }
+    let mut middleware_session = if let Some(chain) = websocket_chain.as_deref() {
+        let request = crate::l7::rest::request_from_buffered_http(
+            method,
+            middleware_path,
+            &upstream_target,
+            forward_request_bytes.clone(),
+        )?;
+        let middleware_runner = opa_engine.middleware_runner()?;
+        let preflight = crate::l7::relay::websocket_middleware_preflight(
+            &request,
+            chain,
+            &middleware_runner,
+            &l7_ctx,
+            "ws",
+        )
+        .await;
+        let preflight = match preflight {
+            Ok(preflight) => preflight,
+            Err(error) => {
+                warn!(error = %error, "Plaintext WebSocket middleware preflight failed");
+                respond(
+                    client,
+                    &build_json_error_response(
+                        502,
+                        "Bad Gateway",
+                        "middleware_failed",
+                        "WebSocket middleware preflight failed",
+                    ),
+                )
+                .await?;
+                return Ok(());
+            }
+        };
+        crate::l7::middleware::emit_websocket_preflight_events(&l7_ctx, &preflight);
+        if preflight.terminal_reason.is_some() {
+            let response = preflight.denial.as_ref().map_or_else(
+                || build_middleware_failure_response(&l7_ctx.policy_name),
+                |denial| build_middleware_deny_response(&l7_ctx.policy_name, denial),
+            );
+            respond(client, &response).await?;
+            return Ok(());
+        }
+        preflight.session
+    } else {
+        None
+    };
+    if middleware_session.is_some() {
+        websocket_extensions = crate::l7::rest::WebSocketExtensionMode::PermessageDeflate;
     }
     forward_request_bytes = match inject_token_grant_for_forward_request(
         method,
@@ -4967,6 +4983,11 @@ async fn handle_forward_proxy(
                 error = %e,
                 "token grant failed in forward proxy"
             );
+            if let Some(session) = middleware_session.take() {
+                session
+                    .end(openshell_core::proto::WebSocketSessionEndReason::Cancellation)
+                    .await;
+            }
             respond(
                 client,
                 &build_json_error_response(
@@ -5022,6 +5043,11 @@ async fn handle_forward_proxy(
                 error = %e,
                 "credential injection failed in forward proxy"
             );
+            if let Some(session) = middleware_session.take() {
+                session
+                    .end(openshell_core::proto::WebSocketSessionEndReason::Cancellation)
+                    .await;
+            }
             if e.is_endpoint_mismatch() {
                 emit_credential_endpoint_mismatch(&host_lc, port, policy_str);
                 respond(
@@ -5060,6 +5086,11 @@ async fn handle_forward_proxy(
             "Forward proxy rejected request because policy changed before relay"
         );
         emit_l7_tunnel_close_after_policy_change(&host_lc, port, e);
+        if let Some(session) = middleware_session.take() {
+            session
+                .end(openshell_core::proto::WebSocketSessionEndReason::PolicyReload)
+                .await;
+        }
         respond(
             client,
             &build_json_error_response(
@@ -5072,6 +5103,81 @@ async fn handle_forward_proxy(
         .await?;
         return Ok(());
     }
+    // Plain-HTTP requests dial the destination directly: only TLS (CONNECT)
+    // tunnels chain through the corporate proxy, since plain-HTTP forwarding
+    // would need absolute-form requests rather than a CONNECT tunnel. Dial
+    // only after every local authorization and transformation step so a
+    // rejected WebSocket preflight cannot contact the destination.
+    let dial_result = connector.connect().await;
+    let mut upstream = match dial_result {
+        Ok(s) => s,
+        Err(e) => {
+            let event = HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
+                .activity(ActivityId::Fail)
+                .severity(SeverityId::Low)
+                .status(StatusId::Failure)
+                .http_request(HttpRequest::new(
+                    method,
+                    OcsfUrl::new("http", &host_lc, &path, port),
+                ))
+                .dst_endpoint(Endpoint::from_domain(&host_lc, port))
+                .src_endpoint(Endpoint::from_ip(workload_addr.ip(), workload_addr.port()))
+                .actor_process(
+                    Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
+                        .with_cmd_line(&cmdline_str),
+                )
+                .message(format!(
+                    "FORWARD upstream connect failed for {host_lc}:{port}: {e}"
+                ))
+                .build();
+            ocsf_emit!(event);
+            if let Some(session) = middleware_session.take() {
+                session
+                    .end(openshell_core::proto::WebSocketSessionEndReason::UpstreamRejected)
+                    .await;
+            }
+            respond(
+                client,
+                &build_json_error_response(
+                    502,
+                    "Bad Gateway",
+                    "upstream_unreachable",
+                    &format!("connection to {host_lc}:{port} failed"),
+                ),
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+
+    if let Err(e) = forward_generation_guard.ensure_current() {
+        warn!(
+            host = %host_lc,
+            port,
+            captured_generation = forward_generation_guard.captured_generation(),
+            current_generation = forward_generation_guard.current_generation(),
+            error = %e,
+            "Forward proxy rejected request because policy changed during upstream connect"
+        );
+        emit_l7_tunnel_close_after_policy_change(&host_lc, port, e);
+        if let Some(session) = middleware_session.take() {
+            session
+                .end(openshell_core::proto::WebSocketSessionEndReason::PolicyReload)
+                .await;
+        }
+        respond(
+            client,
+            &build_json_error_response(
+                403,
+                "Forbidden",
+                "policy_denied",
+                &format!("{method} {host_lc}:{port}{path} not permitted by policy"),
+            ),
+        )
+        .await?;
+        return Ok(());
+    }
+
     let credential_signing = forward_upgrade_config
         .as_ref()
         .map_or(crate::l7::CredentialSigning::None, |config| {
@@ -5083,7 +5189,7 @@ async fn handle_forward_proxy(
     let signing_region = forward_upgrade_config
         .as_ref()
         .map_or("", |config| config.signing_region.as_str());
-    let outcome = match relay_rewritten_forward_request(
+    let outcome_result = relay_rewritten_forward_request(
         method,
         &upstream_target,
         rewritten,
@@ -5102,17 +5208,31 @@ async fn handle_forward_proxy(
             port,
         },
     )
-    .await
-    {
-        Ok(outcome) => outcome,
+    .await;
+    let outcome_result = match outcome_result {
         Err(report) => {
             if let Some(error) = report.downcast_ref::<secrets::UnresolvedPlaceholderError>() {
+                if let Some(session) = middleware_session.take() {
+                    session
+                        .end(openshell_core::proto::WebSocketSessionEndReason::Cancellation)
+                        .await;
+                }
                 crate::l7::relay::reject_credential_resolution(client, &l7_ctx, error).await?;
                 return Ok(());
             }
-            return Err(report);
+            Err(report)
         }
+        outcome => outcome,
     };
+    let outcome = crate::l7::relay::finalize_websocket_pre_upgrade(
+        &mut middleware_session,
+        &forward_generation_guard,
+        &host_lc,
+        port,
+        policy_str,
+        outcome_result,
+    )
+    .await?;
 
     // The request has now survived middleware, token grant, credential
     // rewriting, generation checks, and the HTTP relay. Only now record the
@@ -5131,39 +5251,55 @@ async fn handle_forward_proxy(
     ));
     emit_forward_success_activity(activity_tx, l7_activity_pending);
 
-    if let crate::l7::provider::RelayOutcome::Upgraded {
-        overflow,
-        websocket_permessage_deflate,
-    } = outcome
-    {
-        let mut upgrade_options = if let (Some(config), Some(engine)) = (
-            forward_upgrade_config.as_ref(),
-            forward_tunnel_engine.as_ref(),
-        ) {
-            crate::l7::relay::upgrade_options(
-                config,
-                &l7_ctx,
-                forward_websocket_request,
-                &forward_upgrade_target,
-                &forward_upgrade_query_params,
-                Some(engine),
-            )
-        } else {
-            crate::l7::relay::UpgradeRelayOptions {
-                websocket_request: forward_websocket_request,
-                ..Default::default()
+    match outcome {
+        crate::l7::provider::RelayOutcome::Reusable
+        | crate::l7::provider::RelayOutcome::Consumed => {
+            if let Some(session) = middleware_session.take() {
+                session
+                    .end(openshell_core::proto::WebSocketSessionEndReason::UpstreamRejected)
+                    .await;
             }
-        };
-        upgrade_options.websocket.permessage_deflate = websocket_permessage_deflate;
-        crate::l7::relay::handle_upgrade(
-            client,
-            &mut upstream,
+        }
+        crate::l7::provider::RelayOutcome::Upgraded {
             overflow,
-            &host_lc,
-            port,
-            upgrade_options,
-        )
-        .await?;
+            websocket_permessage_deflate,
+            websocket_subprotocol,
+        } => {
+            let mut upgrade_options = if let (Some(config), Some(engine)) = (
+                forward_upgrade_config.as_ref(),
+                forward_tunnel_engine.as_ref(),
+            ) {
+                crate::l7::relay::upgrade_options(
+                    config,
+                    &l7_ctx,
+                    forward_websocket_request,
+                    &forward_upgrade_target,
+                    &forward_upgrade_query_params,
+                    Some(engine),
+                )
+            } else {
+                crate::l7::relay::UpgradeRelayOptions {
+                    websocket_request: forward_websocket_request,
+                    ctx: Some(&l7_ctx),
+                    policy_name: l7_ctx.policy_name.clone(),
+                    ..Default::default()
+                }
+            };
+            upgrade_options.generation_guard = Some(&forward_generation_guard);
+            upgrade_options.assembly_budget = Some(opa_engine.websocket_assembly_budget());
+            upgrade_options.websocket.permessage_deflate = websocket_permessage_deflate;
+            upgrade_options.middleware_session = middleware_session.take();
+            upgrade_options.selected_subprotocol = websocket_subprotocol;
+            crate::l7::relay::handle_upgrade(
+                client,
+                &mut upstream,
+                overflow,
+                &host_lc,
+                port,
+                upgrade_options,
+            )
+            .await?;
+        }
     }
 
     Ok(())
@@ -5285,6 +5421,14 @@ fn build_middleware_deny_response(
 }
 
 fn build_middleware_failure_response(policy_name: &str) -> Vec<u8> {
+    build_middleware_platform_response(policy_name, "403 Forbidden")
+}
+
+fn build_middleware_unavailable_response(policy_name: &str) -> Vec<u8> {
+    build_middleware_platform_response(policy_name, "503 Service Unavailable")
+}
+
+fn build_middleware_platform_response(policy_name: &str, status: &str) -> Vec<u8> {
     let body = serde_json::json!({
         "error": "middleware_failed",
         "detail": "Request could not be processed by configured middleware",
@@ -5292,7 +5436,7 @@ fn build_middleware_failure_response(policy_name: &str) -> Vec<u8> {
     });
     let body_str = body.to_string();
     format!(
-        "HTTP/1.1 403 Forbidden\r\n\
+        "HTTP/1.1 {status}\r\n\
          Content-Type: application/json\r\n\
          Content-Length: {}\r\n\
          Connection: close\r\n\
@@ -5382,6 +5526,96 @@ mod tests {
     use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
 
+    struct DenyWebSocketPreflight;
+
+    #[tonic::async_trait]
+    impl openshell_core::middleware::SupervisorMiddlewareEndpoint for DenyWebSocketPreflight {
+        async fn describe(
+            &self,
+            _request: tonic::Request<()>,
+        ) -> std::result::Result<
+            tonic::Response<openshell_core::proto::MiddlewareManifest>,
+            tonic::Status,
+        > {
+            Ok(tonic::Response::new(
+                openshell_core::proto::MiddlewareManifest {
+                    name: "test/deny-websocket".into(),
+                    service_version: "test".into(),
+                    bindings: vec![openshell_core::proto::MiddlewareBinding {
+                        operation:
+                            openshell_core::proto::SupervisorMiddlewareOperation::WebsocketMessage
+                                as i32,
+                        phase: openshell_core::proto::SupervisorMiddlewarePhase::PreCredentials
+                            as i32,
+                        max_payload_bytes: 1024,
+                        timeout: "1s".into(),
+                    }],
+                    expected_audience: String::new(),
+                },
+            ))
+        }
+
+        async fn validate_config(
+            &self,
+            _request: tonic::Request<openshell_core::proto::ValidateConfigRequest>,
+        ) -> std::result::Result<
+            tonic::Response<openshell_core::proto::ValidateConfigResponse>,
+            tonic::Status,
+        > {
+            Ok(tonic::Response::new(
+                openshell_core::proto::ValidateConfigResponse {
+                    valid: true,
+                    reason: String::new(),
+                },
+            ))
+        }
+
+        async fn evaluate_http_request(
+            &self,
+            _request: tonic::Request<openshell_core::proto::HttpRequestEvaluation>,
+        ) -> std::result::Result<
+            tonic::Response<openshell_core::proto::HttpRequestResult>,
+            tonic::Status,
+        > {
+            Err(tonic::Status::unimplemented("WebSocket-only test service"))
+        }
+
+        async fn open_websocket_session(
+            &self,
+            mut receiver: mpsc::Receiver<openshell_core::proto::WebSocketSessionEvent>,
+        ) -> std::result::Result<openshell_core::middleware::WebSocketResponseStream, tonic::Status>
+        {
+            let (responses, response_stream) = mpsc::channel(1);
+            tokio::spawn(async move {
+                while let Some(event) = receiver.recv().await {
+                    if matches!(
+                        event.event,
+                        Some(openshell_core::proto::web_socket_session_event::Event::Preflight(_))
+                    ) {
+                        let _ = responses
+                            .send(Ok(openshell_core::proto::WebSocketSessionEventResult {
+                                result: Some(
+                                    openshell_core::proto::web_socket_session_event_result::Result::PreflightDecision(
+                                        openshell_core::proto::WebSocketPreflightDecision {
+                                            action: openshell_core::proto::WebSocketPreflightAction::Deny as i32,
+                                            reason: "test denial".into(),
+                                            reason_code: "test_denial".into(),
+                                            ..Default::default()
+                                        },
+                                    ),
+                                ),
+                            }))
+                            .await;
+                        break;
+                    }
+                }
+            });
+            Ok(Box::pin(tokio_stream::wrappers::ReceiverStream::new(
+                response_stream,
+            )))
+        }
+    }
+
     struct BlockingForwardMiddleware {
         entered: Arc<tokio::sync::Notify>,
         release: Arc<tokio::sync::Notify>,
@@ -5397,7 +5631,7 @@ mod tests {
                     operation: openshell_core::proto::SupervisorMiddlewareOperation::HttpRequest
                         as i32,
                     phase: openshell_core::proto::SupervisorMiddlewarePhase::PreCredentials as i32,
-                    max_body_bytes: 8192,
+                    max_payload_bytes: 8192,
                     timeout: String::new(),
                 }],
                 expected_audience: String::new(),
@@ -5422,6 +5656,15 @@ mod tests {
                 decision: openshell_core::proto::Decision::Allow as i32,
                 ..Default::default()
             })
+        }
+    }
+
+    fn non_loopback_test_ipv4() -> Option<Ipv4Addr> {
+        let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+        socket.connect("192.0.2.1:9").ok()?;
+        match socket.local_addr().ok()?.ip() {
+            IpAddr::V4(ip) if !ip.is_loopback() && !ip.is_unspecified() => Some(ip),
+            _ => None,
         }
     }
 
@@ -5482,6 +5725,254 @@ network_policies: {}
                 "malformed request for {host} must fail at ingress"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn plaintext_websocket_preflight_denial_does_not_connect_upstream() {
+        if !cfg!(target_os = "linux") {
+            eprintln!("skipping: handler identity binding requires /proc (Linux)");
+            return;
+        }
+        let Some(upstream_ip) = non_loopback_test_ipv4() else {
+            eprintln!("skipping: no routable non-loopback IPv4 test address");
+            return;
+        };
+
+        let upstream_listener = TcpListener::bind((upstream_ip, 0))
+            .await
+            .expect("bind upstream listener");
+        let upstream_port = upstream_listener.local_addr().unwrap().port();
+        let executable = std::env::current_exe().expect("current executable");
+        let data = format!(
+            r#"
+network_middlewares:
+  deny-upgrade:
+    middleware: test/deny-websocket
+    on_error: fail_closed
+    endpoints:
+      include: ["{upstream_ip}"]
+network_policies:
+  allow-upstream:
+    name: allow-upstream
+    endpoints:
+      - host: "{upstream_ip}"
+        port: {upstream_port}
+    binaries:
+      - {{ path: "{executable}" }}
+"#,
+            executable = executable.display(),
+        );
+        let engine = Arc::new(
+            OpaEngine::from_strings(include_str!("../data/sandbox-policy.rego"), &data)
+                .expect("load policy"),
+        );
+        let registry = openshell_supervisor_middleware::MiddlewareRegistry::connect_services(
+            vec![openshell_supervisor_middleware::in_process_endpoint(
+                Arc::new(DenyWebSocketPreflight),
+            )],
+            Vec::new(),
+        )
+        .await
+        .expect("connect test middleware");
+        engine
+            .replace_middleware_registry(registry)
+            .expect("install test middleware");
+
+        let proxy_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind proxy listener");
+        let proxy_address = proxy_listener.local_addr().unwrap();
+        let target = format!("http://{upstream_ip}:{upstream_port}/ws");
+        let request = format!(
+            "GET {target} HTTP/1.1\r\nHost: {upstream_ip}:{upstream_port}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n"
+        );
+        let client = tokio::spawn(async move {
+            let mut socket = TcpStream::connect(proxy_address)
+                .await
+                .expect("connect proxy");
+            let mut response = Vec::new();
+            socket
+                .read_to_end(&mut response)
+                .await
+                .expect("read proxy response");
+            response
+        });
+        let (mut proxy_connection, _) = proxy_listener.accept().await.unwrap();
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            handle_forward_proxy(
+                "GET",
+                &target,
+                request.as_bytes(),
+                request.len(),
+                &mut proxy_connection,
+                engine,
+                Arc::new(BinaryIdentityCache::new()),
+                Arc::new(AtomicU32::new(std::process::id())),
+                None,
+                AgentProposals::default(),
+                Arc::new(None),
+                None,
+                None,
+                None,
+                None,
+                None,
+            ),
+        )
+        .await
+        .expect("denied preflight must complete without an upstream response")
+        .expect("handle denied plaintext WebSocket upgrade");
+        drop(proxy_connection);
+
+        let response = String::from_utf8(client.await.unwrap()).expect("UTF-8 response");
+        assert!(
+            response.contains("\"error\":\"middleware_denied\""),
+            "preflight must deny the upgrade: {response}"
+        );
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                upstream_listener.accept()
+            )
+            .await
+            .is_err(),
+            "denied preflight must not establish an upstream connection"
+        );
+    }
+
+    #[tokio::test]
+    async fn plaintext_websocket_middleware_inspects_compressed_ws_messages() {
+        if !cfg!(target_os = "linux") {
+            eprintln!("skipping: handler identity binding requires /proc (Linux)");
+            return;
+        }
+        let Some(upstream_ip) = non_loopback_test_ipv4() else {
+            eprintln!("skipping: no routable non-loopback IPv4 test address");
+            return;
+        };
+
+        let upstream_listener = TcpListener::bind((upstream_ip, 0))
+            .await
+            .expect("bind upstream listener");
+        let upstream_port = upstream_listener.local_addr().unwrap().port();
+        let executable = std::env::current_exe().expect("current executable");
+        let data = format!(
+            r#"
+network_middlewares:
+  redact:
+    middleware: openshell/regex
+    on_error: fail_closed
+    endpoints:
+      include: ["{upstream_ip}"]
+network_policies:
+  allow-upstream:
+    name: allow-upstream
+    endpoints:
+      - host: "{upstream_ip}"
+        port: {upstream_port}
+    binaries:
+      - {{ path: "{executable}" }}
+"#,
+            executable = executable.display(),
+        );
+        let engine = Arc::new(
+            OpaEngine::from_strings(include_str!("../data/sandbox-policy.rego"), &data)
+                .expect("load policy"),
+        );
+        let registry = openshell_supervisor_middleware::MiddlewareRegistry::connect_services(
+            openshell_supervisor_middleware_builtins::services(),
+            Vec::new(),
+        )
+        .await
+        .expect("connect built-in middleware");
+        engine
+            .replace_middleware_registry(registry)
+            .expect("install built-in middleware");
+
+        let upstream = tokio::spawn(async move {
+            let (mut socket, _) = upstream_listener.accept().await.unwrap();
+            let request = read_http_headers_unbounded(&mut socket).await;
+            let request = String::from_utf8_lossy(&request);
+            assert!(request.starts_with("GET /ws HTTP/1.1\r\n"));
+            assert!(request.contains(
+                "Sec-WebSocket-Extensions: permessage-deflate; client_no_context_takeover\r\n"
+            ));
+            socket
+                .write_all(
+                    b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\nSec-WebSocket-Extensions: permessage-deflate; client_no_context_takeover\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            let frame = crate::l7::websocket::read_frame_for_test(&mut socket).await;
+            crate::l7::websocket::decode_compressed_masked_text_frame_for_test(&frame)
+        });
+
+        let proxy_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind proxy listener");
+        let proxy_address = proxy_listener.local_addr().unwrap();
+        let target = format!("http://{upstream_ip}:{upstream_port}/ws");
+        let request = format!(
+            "GET {target} HTTP/1.1\r\nHost: {upstream_ip}:{upstream_port}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Extensions: permessage-deflate; client_no_context_takeover\r\n\r\n"
+        );
+        let client = tokio::spawn(async move {
+            let mut socket = TcpStream::connect(proxy_address)
+                .await
+                .expect("connect proxy");
+            let response = read_http_headers_unbounded(&mut socket).await;
+            assert!(String::from_utf8_lossy(&response).contains("101 Switching Protocols"));
+            socket
+                .write_all(
+                    &crate::l7::websocket::compressed_masked_text_frame_for_test(
+                        br#"{"token":"sk-1234567890abcdef"}"#,
+                    ),
+                )
+                .await
+                .unwrap();
+        });
+        let (mut proxy_connection, _) = proxy_listener.accept().await.unwrap();
+
+        let handler = tokio::spawn(async move {
+            handle_forward_proxy(
+                "GET",
+                &target,
+                request.as_bytes(),
+                request.len(),
+                &mut proxy_connection,
+                engine,
+                Arc::new(BinaryIdentityCache::new()),
+                Arc::new(AtomicU32::new(std::process::id())),
+                None,
+                AgentProposals::default(),
+                Arc::new(None),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+        });
+        let scenario = tokio::time::timeout(std::time::Duration::from_secs(60), async {
+            let (client, upstream) = tokio::join!(client, upstream);
+            client.expect("join plaintext WebSocket client");
+            assert_eq!(
+                upstream.expect("join plaintext WebSocket upstream"),
+                r#"{"token":"[REDACTED]"}"#
+            );
+        })
+        .await;
+        if handler.is_finished() {
+            handler
+                .await
+                .expect("join plaintext WebSocket handler")
+                .expect("handle compressed plaintext WebSocket upgrade");
+        } else {
+            handler.abort();
+            let _ = handler.await;
+        }
+        scenario.expect("compressed plaintext WebSocket scenario should complete");
     }
 
     #[tokio::test]
@@ -5547,6 +6038,28 @@ network_policies: {}
         assert!(body.get("rule_missing").is_none());
         assert!(body.get("next_steps").is_none());
         assert!(body.get("agent_guidance").is_none());
+    }
+
+    #[test]
+    fn middleware_unavailable_response_is_complete_and_has_no_retry_hint() {
+        let response = build_middleware_unavailable_response("api-policy");
+        let response = String::from_utf8(response).expect("UTF-8 error response");
+        assert!(response.starts_with("HTTP/1.1 503 Service Unavailable\r\n"));
+        assert!(!response.to_ascii_lowercase().contains("retry-after"));
+        let (headers, body) = response.split_once("\r\n\r\n").expect("HTTP response");
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix("Content-Length: ")
+                    .and_then(|value| value.parse::<usize>().ok())
+            })
+            .expect("Content-Length");
+        assert_eq!(content_length, body.len());
+        let body: serde_json::Value = serde_json::from_str(body).expect("JSON response");
+        assert_eq!(body["error"], "middleware_failed");
+        assert_eq!(body["policy"], "api-policy");
+        assert!(body.get("middleware").is_none());
+        assert!(body.get("reason_code").is_none());
     }
 
     #[test]
@@ -6117,6 +6630,9 @@ network_policies:
             crate::l7::middleware::MiddlewareApplyResult::Allowed(_) => {
                 panic!("policy-invalid transformed request must be denied")
             }
+            crate::l7::middleware::MiddlewareApplyResult::AdmissionExhausted => {
+                panic!("test middleware work admission must be available")
+            }
         }
     }
 
@@ -6204,6 +6720,9 @@ network_policies:
             crate::l7::middleware::MiddlewareApplyResult::Allowed(request) => request,
             crate::l7::middleware::MiddlewareApplyResult::Denied { .. } => {
                 panic!("blocking middleware should allow after release")
+            }
+            crate::l7::middleware::MiddlewareApplyResult::AdmissionExhausted => {
+                panic!("blocking middleware should already hold admission")
             }
         };
 
@@ -6500,14 +7019,36 @@ network_policies:
     }
 
     async fn read_http_headers<R: TokioAsyncRead + Unpin>(reader: &mut R) -> Vec<u8> {
+        read_http_headers_with_timeout(reader, std::time::Duration::from_secs(1)).await
+    }
+
+    async fn read_http_headers_with_timeout<R: TokioAsyncRead + Unpin>(
+        reader: &mut R,
+        timeout: std::time::Duration,
+    ) -> Vec<u8> {
         let mut bytes = Vec::new();
         let mut chunk = [0u8; 256];
         loop {
-            let n =
-                tokio::time::timeout(std::time::Duration::from_secs(1), reader.read(&mut chunk))
-                    .await
-                    .expect("HTTP headers should arrive")
-                    .expect("header read should succeed");
+            let n = tokio::time::timeout(timeout, reader.read(&mut chunk))
+                .await
+                .expect("HTTP headers should arrive")
+                .expect("header read should succeed");
+            assert!(n > 0, "stream closed before HTTP headers");
+            bytes.extend_from_slice(&chunk[..n]);
+            if bytes.windows(4).any(|w| w == b"\r\n\r\n") {
+                return bytes;
+            }
+        }
+    }
+
+    async fn read_http_headers_unbounded<R: TokioAsyncRead + Unpin>(reader: &mut R) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        let mut chunk = [0u8; 256];
+        loop {
+            let n = reader
+                .read(&mut chunk)
+                .await
+                .expect("header read should succeed");
             assert!(n > 0, "stream closed before HTTP headers");
             bytes.extend_from_slice(&chunk[..n]);
             if bytes.windows(4).any(|w| w == b"\r\n\r\n") {
@@ -6532,6 +7073,14 @@ network_policies:
                 .map(|(idx, byte)| byte ^ mask[idx % 4]),
         );
         frame
+    }
+
+    fn masked_close_code(frame: &[u8]) -> u16 {
+        assert_eq!(frame[0] & 0x0f, 0x08, "expected a close frame");
+        assert_eq!(frame[1] & 0x7f, 2, "expected a two-byte close code");
+        assert_ne!(frame[1] & 0x80, 0, "client-to-upstream close is masked");
+        let decoded = [frame[6] ^ frame[2], frame[7] ^ frame[3]];
+        u16::from_be_bytes(decoded)
     }
 
     async fn forward_websocket_denied_after_upgrade(
@@ -6560,7 +7109,7 @@ network_policies:
             false,
         )
         .expect("forward websocket request should rewrite to origin form");
-        let websocket_extensions = crate::l7::relay::websocket_extension_mode(&config);
+        let websocket_extensions = crate::l7::relay::websocket_extension_mode(&config, false);
         let target = path.to_string();
         let query_params = std::collections::HashMap::new();
         let (mut proxy_to_upstream, mut upstream) = tokio::io::duplex(8192);
@@ -6591,6 +7140,7 @@ network_policies:
             if let crate::l7::provider::RelayOutcome::Upgraded {
                 overflow,
                 websocket_permessage_deflate,
+                ..
             } = outcome
             {
                 let mut options = crate::l7::relay::upgrade_options(
@@ -6678,10 +7228,10 @@ network_policies:
         };
         let query_params = std::collections::HashMap::new();
 
-        let extensions = crate::l7::relay::websocket_extension_mode(&websocket_l7_config(
-            crate::l7::L7Protocol::Websocket,
-            true,
-        ));
+        let extensions = crate::l7::relay::websocket_extension_mode(
+            &websocket_l7_config(crate::l7::L7Protocol::Websocket, true),
+            false,
+        );
         let options = crate::l7::relay::upgrade_options(
             &websocket_l7_config(crate::l7::L7Protocol::Websocket, true),
             &ctx,
@@ -6697,6 +7247,7 @@ network_policies:
         );
         assert!(options.websocket.credential_rewrite);
         assert!(options.secret_resolver.is_some());
+        assert!(options.generation_guard.is_some());
         assert!(options.engine.is_some());
         assert!(options.ctx.is_some());
         assert!(matches!(
@@ -6720,7 +7271,7 @@ network_policies:
         };
         let query_params = std::collections::HashMap::new();
         let config = websocket_l7_config(crate::l7::L7Protocol::Rest, false);
-        let extensions = crate::l7::relay::websocket_extension_mode(&config);
+        let extensions = crate::l7::relay::websocket_extension_mode(&config, false);
         let options =
             crate::l7::relay::upgrade_options(&config, &ctx, true, "/ws", &query_params, None);
 
@@ -6736,6 +7287,41 @@ network_policies:
             options.websocket.message_policy,
             crate::l7::relay::WebSocketMessagePolicy::None
         ));
+    }
+
+    #[test]
+    fn rest_websocket_upgrade_carries_guard_without_message_inspector() {
+        let engine = OpaEngine::from_strings(
+            include_str!("../data/sandbox-policy.rego"),
+            "network_policies: {}\n",
+        )
+        .expect("test policy");
+        let tunnel_engine = engine
+            .clone_engine_for_tunnel(engine.current_generation())
+            .expect("tunnel engine");
+        let ctx = crate::l7::relay::L7EvalContext {
+            host: "gateway.example.test".into(),
+            port: 443,
+            policy_name: "rest_api".into(),
+            binary_path: "/usr/bin/node".into(),
+            ..Default::default()
+        };
+        let config = websocket_l7_config(crate::l7::L7Protocol::Rest, false);
+        let options = crate::l7::relay::upgrade_options(
+            &config,
+            &ctx,
+            true,
+            "/ws",
+            &std::collections::HashMap::new(),
+            Some(&tunnel_engine),
+        );
+
+        assert!(matches!(
+            options.websocket.message_policy,
+            crate::l7::relay::WebSocketMessagePolicy::None
+        ));
+        assert!(options.generation_guard.is_some());
+        assert!(options.engine.is_some());
     }
 
     #[tokio::test]
@@ -6776,9 +7362,10 @@ network_policies:
         .await;
 
         assert!(err.to_string().contains("websocket text message denied"));
-        assert!(
-            leaked.is_empty(),
-            "denied forward-proxy WebSocket text frames must not reach upstream"
+        assert_eq!(
+            masked_close_code(&leaked),
+            1008,
+            "only a policy close, not the denied text frame, may reach upstream"
         );
     }
 
@@ -6829,9 +7416,10 @@ network_policies:
         .await;
 
         assert!(err.to_string().contains("websocket GraphQL message denied"));
-        assert!(
-            leaked.is_empty(),
-            "denied forward-proxy GraphQL WebSocket operations must not reach upstream"
+        assert_eq!(
+            masked_close_code(&leaked),
+            1008,
+            "only a policy close, not the denied GraphQL operation, may reach upstream"
         );
     }
 

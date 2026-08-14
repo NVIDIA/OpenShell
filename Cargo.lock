@@ -3722,6 +3722,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-stream",
  "tonic",
  "tonic-prost",
  "tonic-prost-build",
@@ -4187,6 +4188,7 @@ dependencies = [
 name = "openshell-supervisor-middleware"
 version = "0.0.0"
 dependencies = [
+ "futures",
  "miette",
  "openshell-core",
  "openshell-extension-core",
@@ -4210,6 +4212,8 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "tokio-stream",
+ "tonic",
 ]
 
 [[package]]
@@ -4254,6 +4258,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tokio-rustls 0.26.4",
+ "tokio-stream",
  "tokio-tungstenite 0.26.2",
  "tonic",
  "tower-mcp-types",

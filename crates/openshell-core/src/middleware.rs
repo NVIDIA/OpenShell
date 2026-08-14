@@ -1,16 +1,53 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Supervisor middleware in-process contracts and platform-wide limits.
+//! Supervisor middleware contracts and platform-wide limits.
 
+use std::pin::Pin;
 use std::time::Duration;
 
 use miette::Result;
+use tokio::sync::mpsc;
+use tonic::{Request, Response, Status};
 
 use crate::proto::{
-    HttpHeader, HttpRequestResult, HttpRequestTarget, MiddlewareManifest, RequestContext,
-    SupervisorMiddlewarePhase,
+    HttpHeader, HttpRequestEvaluation, HttpRequestResult, HttpRequestTarget, MiddlewareManifest,
+    RequestContext, SupervisorMiddlewarePhase, ValidateConfigRequest, ValidateConfigResponse,
+    WebSocketSessionEvent, WebSocketSessionEventResult,
 };
+
+/// Transport-neutral response stream for one WebSocket middleware stage.
+pub type WebSocketResponseStream = Pin<
+    Box<
+        dyn tokio_stream::Stream<Item = Result<WebSocketSessionEventResult, Status>>
+            + Send
+            + 'static,
+    >,
+>;
+
+/// A middleware implementation reachable either in-process or over a transport.
+///
+/// Capability is defined by the implementation's manifest. The endpoint hides
+/// whether invocations are direct calls or serialized gRPC requests.
+#[tonic::async_trait]
+pub trait SupervisorMiddlewareEndpoint: Send + Sync {
+    async fn describe(&self, request: Request<()>) -> Result<Response<MiddlewareManifest>, Status>;
+
+    async fn validate_config(
+        &self,
+        request: Request<ValidateConfigRequest>,
+    ) -> Result<Response<ValidateConfigResponse>, Status>;
+
+    async fn evaluate_http_request(
+        &self,
+        request: Request<HttpRequestEvaluation>,
+    ) -> Result<Response<HttpRequestResult>, Status>;
+
+    async fn open_websocket_session(
+        &self,
+        requests: mpsc::Receiver<WebSocketSessionEvent>,
+    ) -> Result<WebSocketResponseStream, Status>;
+}
 
 /// Borrowed request state exposed to one in-process middleware invocation.
 ///
@@ -94,11 +131,13 @@ impl<'a> HttpRequestView<'a> {
     }
 }
 
-/// Asynchronous contract for supervisor middleware that runs in the process.
+/// Asynchronous contract for supervisor middleware that runs in-process.
 ///
 /// Remote services use the protobuf `SupervisorMiddleware` contract instead.
 /// The borrowed view remains valid for the evaluation future, so implementations
 /// can yield without constructing an owned protobuf request envelope.
+/// WebSocket sessions already use bounded channel and stream ownership, so that
+/// operation is shared with the transport-neutral endpoint contract.
 ///
 /// Downstream implementations must apply `#[async_trait::async_trait]` to each
 /// `impl InProcessMiddleware` block. The macro's default expansion creates
@@ -135,7 +174,7 @@ impl<'a> HttpRequestView<'a> {
 ///             bindings: vec![MiddlewareBinding {
 ///                 operation: SupervisorMiddlewareOperation::HttpRequest as i32,
 ///                 phase: SupervisorMiddlewarePhase::PreCredentials as i32,
-///                 max_body_bytes: 1024,
+///                 max_payload_bytes: 1024,
 ///                 timeout: String::new(),
 ///             }],
 ///             expected_audience: String::new(),
@@ -191,6 +230,18 @@ pub trait InProcessMiddleware: Send + Sync {
         &self,
         request: HttpRequestView<'_>,
     ) -> Result<HttpRequestResult>;
+
+    /// Open one persistent WebSocket middleware session.
+    ///
+    /// HTTP-only implementations may keep the default unsupported response.
+    async fn open_websocket_session(
+        &self,
+        _requests: mpsc::Receiver<WebSocketSessionEvent>,
+    ) -> std::result::Result<WebSocketResponseStream, Status> {
+        Err(Status::unimplemented(
+            "middleware does not implement WebSocket sessions",
+        ))
+    }
 }
 
 /// Default timeout for one supervisor middleware RPC.
@@ -199,6 +250,18 @@ pub const DEFAULT_MIDDLEWARE_TIMEOUT: Duration = Duration::from_millis(500);
 pub const MIN_MIDDLEWARE_TIMEOUT: Duration = Duration::from_millis(10);
 /// Largest operator-configured supervisor middleware RPC timeout.
 pub const MAX_MIDDLEWARE_TIMEOUT: Duration = Duration::from_secs(30);
+/// Maximum time a complete message may spend in all middleware stages.
+pub const MAX_MIDDLEWARE_CHAIN_TIMEOUT: Duration = Duration::from_secs(30);
+/// Maximum time WebSocket preflight may delay an upstream handshake.
+pub const MAX_MIDDLEWARE_PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(1);
+/// Process-wide safety valve for concurrently buffered middleware work.
+pub const MAX_CONCURRENT_MIDDLEWARE_WORK: usize = 32;
+/// Process-wide safety valve for retained streaming middleware sessions.
+///
+/// A session consumes one permit regardless of its protocol or stage fan-out.
+/// Persistent middleware protocols must acquire from this shared budget before
+/// opening streams and retain the permit while any stage remains active.
+pub const MAX_CONCURRENT_MIDDLEWARE_SESSIONS: usize = 32;
 
 /// Largest number of middleware configurations accepted in one sandbox policy.
 pub const MAX_MIDDLEWARE_CONFIGS: usize = 10;

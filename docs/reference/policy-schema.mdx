@@ -30,7 +30,7 @@ network_middlewares: { ... }
 | `landlock` | object | No | Static | Configures Landlock LSM enforcement behavior. |
 | `process` | object | No | Static | Sets the user and group the agent process runs as. |
 | `network_policies` | map | No | Dynamic | Declares which binaries can reach which network endpoints. |
-| `network_middlewares` | map | No | Dynamic | Selects ordered HTTP request middleware by destination host. |
+| `network_middlewares` | map | No | Dynamic | Attaches ordered middleware by destination host; each implementation's manifest selects its supported HTTP and WebSocket operations. |
 
 Static fields are set at sandbox creation time. Changing them requires destroying and recreating the sandbox. Dynamic fields can be updated on a running sandbox with `openshell policy update` for incremental merges or `openshell policy set` for full replacement, and take effect without restarting.
 
@@ -525,7 +525,7 @@ Identifies an executable that is permitted to use the associated endpoints.
 
 **Category:** Dynamic
 
-A map of up to 10 middleware configs selected after network and L7 policy admit an HTTP request. Each map key is the stable policy-local config identity. Middleware selection is independent of the network policy entry that admitted the request. Every matching config runs once by ascending `order` before provider credential injection. Order values must be unique across the policy, and runtime selection also enforces the 10-stage maximum.
+A map of up to 10 middleware configs selected after network and L7 policy admit an HTTP request or WebSocket upgrade. Each map key is the stable policy-local config identity. Middleware selection is independent of the network policy entry that admitted the traffic. Every matching config runs once by ascending `order` before provider credential injection. WebSocket-capable bindings continue on client text messages after the upgrade. Order values must be unique across the policy, and runtime selection also enforces the 10-stage maximum.
 
 ```yaml showLineNumbers={false}
 network_middlewares:
@@ -547,10 +547,10 @@ network_middlewares:
 | `middleware` | string | Yes | Built-in middleware name or operator-owned registration name. `openshell/` is reserved for built-ins. |
 | `order` | integer | No | Execution priority. Lower values run first, and values must be unique across the policy. Defaults to `0`; therefore, policies with multiple configs normally specify it explicitly. |
 | `config` | object | No | Implementation-owned configuration validated by the selected middleware. |
-| `on_error` | string | No | `fail_closed` denies the request when the stage fails; `fail_open` skips the failed stage. Defaults to `fail_closed`. |
+| `on_error` | string | No | Applies only after an advertised operation binding is selected. `fail_closed` denies the HTTP request or closes the WebSocket when that stage fails; `fail_open` skips a failed HTTP stage or disables a broken WebSocket stage for the rest of that connection. Defaults to `fail_closed`. |
 | `endpoints` | object | Yes | Host selector with required non-empty `include` and optional `exclude` lists, limited to 32 combined patterns. Exclusions take precedence. |
 
-Host selectors use the same case-insensitive exact and DNS glob semantics as network endpoints: `*` matches exactly one DNS label and `**` matches one or more labels, so `**.example.com` covers subdomains but not `example.com` itself. Brace alternates are rejected at validation. Middleware runs only on HTTP requests the supervisor parses. A fail-closed selector that can cover a `tls: skip` endpoint is rejected because OpenShell cannot inspect that traffic. An all-`fail_open` match may cover the endpoint; the supervisor bypasses the middleware and emits a detection finding.
+Host selectors use the same case-insensitive exact and DNS glob semantics as network endpoints: `*` matches exactly one DNS label and `**` matches one or more labels, so `**.example.com` covers subdomains but not `example.com` itself. Brace alternates are rejected at validation. A matching attachment joins only the operation chains its implementation advertises. An HTTP-only attachment may inspect a WebSocket upgrade GET without joining the post-upgrade chain; OpenShell permits the messages and records `binding_not_selected` coverage regardless of `on_error`. WebSocket bindings inspect complete client text messages. Binary messages pass with `unsupported_message_type` coverage for active stages. A fail-closed selector that can cover a `tls: skip` endpoint is rejected because OpenShell cannot inspect that traffic through any operation. An all-`fail_open` match may cover the endpoint; the supervisor bypasses the middleware and emits a detection finding.
 
 See [Supervisor Middleware](/extensibility/supervisor-middleware) for registration, failure behavior, body limits, and operational guidance.
 

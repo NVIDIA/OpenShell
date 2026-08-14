@@ -395,8 +395,9 @@ message SupervisorMiddlewareService {
   string name = 1;
   // gRPC endpoint reachable from the sandbox supervisor.
   string grpc_endpoint = 2;
-  // Operator-owned body limit applied to every binding exposed by the service.
-  uint64 max_body_bytes = 3;
+  // Operator-owned logical payload limit applied to every binding exposed by
+  // the service. This caps HTTP bodies and complete WebSocket messages.
+  uint64 max_payload_bytes = 3;
   // Default RPC timeout for this service. Empty uses the platform default of
   // 500ms. Values use an integer with an `ms` or `s` suffix and must be
   // between 10ms and 30s.

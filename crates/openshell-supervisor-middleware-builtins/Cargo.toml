@@ -19,9 +19,9 @@ prost-types = { workspace = true }
 regex = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-
-[dev-dependencies]
 tokio = { workspace = true }
+tokio-stream = { workspace = true }
+tonic = { workspace = true, features = ["server"] }
 
 [lints]
 workspace = true

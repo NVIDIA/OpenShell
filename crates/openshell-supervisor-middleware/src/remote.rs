@@ -2,12 +2,13 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use miette::{IntoDiagnostic, Result, WrapErr};
-use openshell_core::middleware::HttpRequestView;
+use openshell_core::middleware::{
+    HttpRequestView, SupervisorMiddlewareEndpoint, WebSocketResponseStream,
+};
 use openshell_core::proto::middleware::v1::supervisor_middleware_client::SupervisorMiddlewareClient;
-use openshell_core::proto::middleware::v1::supervisor_middleware_server::SupervisorMiddleware;
 use openshell_core::proto::{
     HttpRequestEvaluation, HttpRequestResult, MiddlewareManifest, ValidateConfigRequest,
-    ValidateConfigResponse,
+    ValidateConfigResponse, WebSocketSessionEvent,
 };
 use openshell_extension_core::{
     BearerTokenInterceptor, BearerTokenSlot, ExtensionChannelConfig, ExtensionServerTrust,
@@ -26,7 +27,7 @@ type ExtensionChannel = InterceptedService<Channel, BearerTokenInterceptor>;
 /// contract only when dispatch crosses a gRPC-shaped boundary.
 #[derive(Clone)]
 pub struct GrpcMiddlewareService {
-    service: Arc<dyn SupervisorMiddleware>,
+    service: Arc<dyn SupervisorMiddlewareEndpoint>,
 }
 
 impl GrpcMiddlewareService {
@@ -52,7 +53,7 @@ impl GrpcMiddlewareService {
 
     /// Wrap a protobuf-shaped service used by transport-boundary tests.
     #[cfg(test)]
-    pub fn from_service(service: Arc<dyn SupervisorMiddleware>) -> Self {
+    pub fn from_service(service: Arc<dyn SupervisorMiddlewareEndpoint>) -> Self {
         Self { service }
     }
 
@@ -91,6 +92,14 @@ impl GrpcMiddlewareService {
                 middleware_name: request.middleware_name().to_string(),
             }))
             .await
+    }
+
+    /// Open a remote WebSocket middleware stream through the gRPC adapter.
+    pub async fn open_websocket_session(
+        &self,
+        receiver: tokio::sync::mpsc::Receiver<WebSocketSessionEvent>,
+    ) -> std::result::Result<WebSocketResponseStream, Status> {
+        self.service.open_websocket_session(receiver).await
     }
 }
 
@@ -132,7 +141,7 @@ impl RemoteMiddlewareService {
 }
 
 #[tonic::async_trait]
-impl SupervisorMiddleware for RemoteMiddlewareService {
+impl SupervisorMiddlewareEndpoint for RemoteMiddlewareService {
     async fn describe(
         &self,
         request: Request<()>,
@@ -155,5 +164,19 @@ impl SupervisorMiddleware for RemoteMiddlewareService {
     ) -> std::result::Result<Response<HttpRequestResult>, Status> {
         let mut client = self.client.clone();
         client.evaluate_http_request(request).await
+    }
+
+    async fn open_websocket_session(
+        &self,
+        receiver: tokio::sync::mpsc::Receiver<WebSocketSessionEvent>,
+    ) -> std::result::Result<WebSocketResponseStream, Status> {
+        let mut client = self.client.clone();
+        let responses = client
+            .evaluate_web_socket_session(Request::new(tokio_stream::wrappers::ReceiverStream::new(
+                receiver,
+            )))
+            .await?
+            .into_inner();
+        Ok(Box::pin(responses))
     }
 }

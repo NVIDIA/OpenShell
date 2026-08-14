@@ -8,10 +8,10 @@ SPDX-License-Identifier: Apache-2.0
 > [!WARNING]
 > Supervisor middleware is a research preview. Its policy and service contracts may change without compatibility guarantees. Use it only to prototype and evaluate middleware integrations.
 
-This example implements an operator-run supervisor middleware service. It scans UTF-8 HTTP request bodies for configured literal strings, then either replaces every match or denies the request. Findings report only aggregate counts and never include configured terms or request content.
+This example implements an operator-run supervisor middleware service. It scans UTF-8 HTTP request bodies and complete client-to-upstream WebSocket text messages for configured literal strings, then either replaces every match or denies the request or message. Findings report only aggregate counts and never include configured terms or inspected content.
 
 > [!WARNING]
-> This intentionally simple implementation demonstrates the supervisor middleware service contract. It is not a complete or reliable content guard and must not be used as a security control. It handles only UTF-8 request bodies and case-sensitive literal terms, merges overlapping literal match ranges before redaction, and does not address the encodings, transformations, normalization, streaming, or adversarial inputs that a production content guard must handle.
+> This intentionally simple implementation demonstrates the supervisor middleware service contract. It is not a complete or reliable content guard and must not be used as a security control. It handles only UTF-8 HTTP request bodies and WebSocket text messages with case-sensitive literal terms, merges overlapping literal match ranges before redaction, and does not address encodings, transformations, normalization, binary WebSocket messages, upstream-to-client messages, or adversarial inputs that a production content guard must handle.
 
 ## Prerequisites
 
@@ -54,7 +54,7 @@ Add the service registration to your local gateway TOML:
 [[openshell.supervisor.middleware]]
 name = "content-guard-example"
 grpc_endpoint = "http://host.openshell.internal:50051"
-max_body_bytes = 262144
+max_payload_bytes = 262144
 timeout = "500ms"
 ```
 
@@ -84,6 +84,12 @@ curl -sS https://httpbin.org/anything \
 
 The echoed JSON body contains `[FILTERED]` instead of the configured term.
 
+## WebSocket behavior
+
+For a selected WebSocket upgrade, the service accepts preflight, waits for the session-start notification, and evaluates each complete client-to-upstream text message. Redact mode returns a replacement message, while deny mode returns `content_match` and OpenShell closes the session according to middleware policy. Session-start and session-end events are notifications and do not produce results.
+
+The service advertises a 256 KiB limit for complete WebSocket text messages. OpenShell does not send binary messages, control frames, or upstream-to-client messages to this binding. The smoke script exercises the HTTP path; the example's unit tests cover the WebSocket lifecycle and both redact and deny results.
+
 ## Configuration
 
 | Field | Required | Description |
@@ -101,4 +107,4 @@ config:
     - prototype-secret
 ```
 
-The implementation supports only `HttpRequest/pre_credentials`, advertises a 256 KiB body limit, and inherits the service-wide RPC timeout. The gateway registration may set a smaller body limit. A binding can advertise a shorter timeout, but it cannot extend the operator-configured timeout.
+The implementation supports `HTTP_REQUEST/PRE_CREDENTIALS` and `WEBSOCKET_MESSAGE/PRE_CREDENTIALS`, advertises a 256 KiB limit for each operation, and inherits the service-wide RPC timeout. The gateway registration's `max_payload_bytes` may set a smaller shared limit. A binding can advertise a shorter timeout, but it cannot extend the operator-configured timeout.

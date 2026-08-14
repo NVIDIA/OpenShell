@@ -137,6 +137,21 @@ OCSF HTTP:POST [INFO] ALLOWED POST http://httpbin.org:443/anything [policy:httpb
 OCSF FINDING:CREATE [MED] "configured content matched" [type:content_guard.match count:1 middleware:prototype-content-guard]
 ```
 
+WebSocket middleware emits one safe event per preflight, session-start, or client text-message decision. The event includes the policy-local config, registered implementation, sequence, byte counts, transformation flag, and validated reason code. It never includes the message payload or service-provided free-form reason:
+
+```text
+OCSF NET:OTHER [INFO] WEBSOCKET_MIDDLEWARE allow config=api-redactor implementation=openshell/regex sequence=3 input_bytes=128 replacement_bytes=96 transformed=true reason_code=-
+```
+
+Coverage events are separate from invocation decisions. `binding_not_selected` means a host-matched attachment did not advertise the WebSocket operation. `unsupported_message_type` means an active WebSocket stage encountered a binary message, which V1 passes through without inspection. Both are informational, do not apply `on_error`, and never claim the traffic was inspected:
+
+```text
+OCSF NET:OTHER [INFO] WEBSOCKET_MIDDLEWARE_COVERAGE state=binding_not_selected config=http-dlp implementation=example/http-dlp sequence=- message_type=- input_bytes=0
+OCSF NET:OTHER [INFO] WEBSOCKET_MIDDLEWARE_COVERAGE state=unsupported_message_type config=api-redactor implementation=openshell/regex sequence=4 message_type=binary input_bytes=512
+```
+
+A fail-open stream error emits both a middleware failure and `openshell.middleware.websocket_stage_disabled`. The latter records that OpenShell will bypass that stage for later messages on the same connection. Waiting for saturated admission capacity also emits a detection finding without payload content. When both active capacity and the bounded wait queue are full, HTTP work is rejected before its payload is buffered, returns `503 Service Unavailable`, and emits `openshell.middleware.admission_exhausted`.
+
 Proxy and SSH servers ready:
 
 ```text
@@ -167,7 +182,7 @@ OCSF CONFIG:LOADED [INFO] Policy reloaded successfully [policy_hash:0cc0c2b52557
 
 Denied `NET:` and `HTTP:` events carry a `[reason:...]` suffix that surfaces the decision detail from the event's `status_detail` field. The reason helps distinguish between policy misses, SSRF hardening, and L7 enforcement without inspecting the full OCSF JSONL record.
 
-For supervisor middleware denials, `status_detail` contains a platform-owned reason derived from the policy-local middleware config name and optional validated reason code. Middleware failure details also use platform-owned error codes. OpenShell does not copy per-request service text into logs.
+For supervisor middleware denials, `status_detail` contains a platform-owned reason derived from the policy-local middleware config name and optional validated reason code. Middleware failure details also use platform-owned error codes. OpenShell does not copy per-request service text or WebSocket message content into logs.
 
 Common reason phrases emitted by the sandbox include:
 

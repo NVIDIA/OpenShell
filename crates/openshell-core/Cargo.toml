@@ -19,6 +19,7 @@ prost-types = { workspace = true }
 tonic = { workspace = true, features = ["channel", "tls-ring"] }
 tonic-prost = { workspace = true }
 tokio = { workspace = true }
+tokio-stream = { workspace = true }
 thiserror = { workspace = true }
 miette = { workspace = true }
 serde = { workspace = true }

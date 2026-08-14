@@ -9,7 +9,8 @@ import "google/protobuf/empty.proto";
 import "google/protobuf/struct.proto";
 
 // SupervisorMiddleware lets an operator-run service inspect and transform
-// sandbox HTTP egress before OpenShell injects credentials.
+// sandbox HTTP requests and client WebSocket text messages before OpenShell
+// injects credentials.
 service SupervisorMiddleware {
   // Describe returns the service manifest and declared bindings.
   rpc Describe(google.protobuf.Empty) returns (MiddlewareManifest);
@@ -20,6 +21,16 @@ service SupervisorMiddleware {
   // EvaluateHttpRequest returns an allow, deny, or mutation decision for one
   // buffered HTTP request.
   rpc EvaluateHttpRequest(HttpRequestEvaluation) returns (HttpRequestResult);
+
+  // EvaluateWebSocketSession opens one ordered, phase-specific stream for a
+  // single middleware stage and WebSocket upgrade attempt. The current
+  // implementation supports client-to-upstream text messages at
+  // PRE_CREDENTIALS; PRE_RETURN is reserved for upstream-to-client messages.
+  // A request may go unanswered when the session terminates. For every opened
+  // stage stream, OpenShell attempts at most one session_end before closing the
+  // stream when its transport is still writable.
+  rpc EvaluateWebSocketSession(stream WebSocketSessionEvent)
+      returns (stream WebSocketSessionEventResult);
 }
 
 // MiddlewareManifest describes one middleware service and the bindings it
@@ -44,12 +55,16 @@ message MiddlewareManifest {
 
 // MiddlewareBinding declares one operation and phase supported by a service.
 message MiddlewareBinding {
-  // Supported operation. V1 supports HTTP_REQUEST.
+  // Supported operation.
   SupervisorMiddlewareOperation operation = 1;
-  // Supported evaluation phase. V1 supports PRE_CREDENTIALS.
+  // Supported evaluation phase. PR 1 supports PRE_CREDENTIALS. PRE_RETURN is
+  // reserved for the return-path follow-up and is rejected by current
+  // manifest validation.
   SupervisorMiddlewarePhase phase = 2;
-  // Maximum request or replacement body this binding can process.
-  uint64 max_body_bytes = 3;
+  // Maximum logical payload or replacement this binding can process. For
+  // HTTP_REQUEST this is the request body; for WEBSOCKET_MESSAGE this is one
+  // complete message. Required for every payload-bearing operation.
+  uint64 max_payload_bytes = 3;
   // Optional binding-specific RPC timeout. Empty uses the operator-configured
   // service timeout, or the 500ms platform default when that is also omitted.
   // A non-empty value may shorten but cannot extend the operator timeout.
@@ -110,12 +125,151 @@ message HttpHeader {
 enum SupervisorMiddlewareOperation {
   SUPERVISOR_MIDDLEWARE_OPERATION_UNSPECIFIED = 0;
   SUPERVISOR_MIDDLEWARE_OPERATION_HTTP_REQUEST = 1;
+  SUPERVISOR_MIDDLEWARE_OPERATION_WEBSOCKET_MESSAGE = 2;
 }
 
 // Ordered phase within a supervisor operation.
 enum SupervisorMiddlewarePhase {
   SUPERVISOR_MIDDLEWARE_PHASE_UNSPECIFIED = 0;
   SUPERVISOR_MIDDLEWARE_PHASE_PRE_CREDENTIALS = 1;
+  SUPERVISOR_MIDDLEWARE_PHASE_PRE_RETURN = 2;
+}
+
+// Why OpenShell is ending a middleware stream.
+enum WebSocketSessionEndReason {
+  WEB_SOCKET_SESSION_END_REASON_UNSPECIFIED = 0;
+  WEB_SOCKET_SESSION_END_REASON_NORMAL_CLOSE = 1;
+  WEB_SOCKET_SESSION_END_REASON_PEER_DISCONNECT = 2;
+  WEB_SOCKET_SESSION_END_REASON_POLICY_RELOAD = 3;
+  WEB_SOCKET_SESSION_END_REASON_MIDDLEWARE_DENIAL = 4;
+  WEB_SOCKET_SESSION_END_REASON_MIDDLEWARE_FAILURE = 5;
+  WEB_SOCKET_SESSION_END_REASON_PROTOCOL_ERROR = 6;
+  WEB_SOCKET_SESSION_END_REASON_CANCELLATION = 7;
+  WEB_SOCKET_SESSION_END_REASON_UPSTREAM_REJECTED = 8;
+  WEB_SOCKET_SESSION_END_REASON_POLICY_DENIAL = 9;
+  // The middleware stage voluntarily declined inspection during preflight.
+  // This is a successful stage-local outcome, not a cancellation or denial of
+  // the WebSocket upgrade.
+  WEB_SOCKET_SESSION_END_REASON_STAGE_SKIPPED = 10;
+}
+
+// WebSocketSessionEvent is one ordered event in a stage-local stream.
+// Message sequence numbers identify logical messages session-wide. A stage
+// receives a strictly increasing subset of those numbers; gaps are valid when
+// session messages are not delivered to that stage.
+message WebSocketSessionEvent {
+  oneof event {
+    WebSocketPreflight preflight = 1;
+    WebSocketSessionStart session_start = 2;
+    WebSocketMessage message = 3;
+    WebSocketSessionEnd session_end = 4;
+  }
+}
+
+// WebSocketPreflight lets a service decline this upgrade before OpenShell
+// contacts upstream. It deliberately excludes query data, arbitrary request
+// headers, and message payloads.
+message WebSocketPreflight {
+  string session_id = 1;
+  SupervisorMiddlewarePhase phase = 2;
+  RequestContext context = 3;
+  // Admitted HTTP WebSocket-upgrade target. The method is GET, query is always
+  // empty, and path never includes a query string.
+  HttpRequestTarget target = 4;
+  repeated string requested_subprotocols = 5;
+  // Built-in middleware name or operator-owned registration name.
+  string middleware_name = 6;
+  google.protobuf.Struct config = 7;
+}
+
+// WebSocketSessionStart reports bounded metadata known only after the
+// upstream 101 response validates. Empty selected_subprotocol means none.
+message WebSocketSessionStart {
+  string selected_subprotocol = 1;
+}
+
+// WebSocketMessage contains one complete reconstructed logical message.
+message WebSocketMessage {
+  // Session-global sequence starting at 1. Values delivered to one stage must
+  // strictly increase but need not be contiguous. Reject zero, duplicates, and
+  // regressions; accept gaps.
+  uint64 sequence = 1;
+  // One complete logical payload. Protobuf string decoding enforces UTF-8 for
+  // text messages. Raw frame mechanics are never exposed. Limited to 4 MiB by
+  // the platform and the binding-specific cap.
+  oneof payload {
+    string text = 2;
+    bytes binary = 3;
+  }
+}
+
+// WebSocketSessionEnd is OpenShell's best-effort terminal notification for one
+// opened stage stream. A stage receives at most one such notification.
+message WebSocketSessionEnd {
+  WebSocketSessionEndReason reason = 1;
+}
+
+// WebSocketPreflightAction is the service's one-time scoping decision.
+enum WebSocketPreflightAction {
+  // Invalid response value handled according to the policy failure mode.
+  WEB_SOCKET_PREFLIGHT_ACTION_UNSPECIFIED = 0;
+  // Inspect this session after the upstream accepts the upgrade.
+  WEB_SOCKET_PREFLIGHT_ACTION_INSPECT = 1;
+  // Voluntarily decline inspection without denying the upgrade. This is a
+  // successful decision and does not engage on_error.
+  WEB_SOCKET_PREFLIGHT_ACTION_SKIP = 2;
+  // Authoritatively deny the upgrade before upstream contact. This is a
+  // successful decision and is enforced regardless of on_error.
+  WEB_SOCKET_PREFLIGHT_ACTION_DENY = 3;
+}
+
+message WebSocketPreflightDecision {
+  WebSocketPreflightAction action = 1;
+  // Free-form service diagnostic. OpenShell never exposes this to the
+  // workload or security logs. Limited to 4 KiB before discarding.
+  string reason = 2;
+  // Optional stable machine-readable code for a deny decision. Because
+  // preflight runs before the HTTP upgrade completes, OpenShell may return
+  // this code to the requester. Codes follow the same format and 64-byte
+  // maximum as HttpRequestResult.reason_code.
+  string reason_code = 3;
+  // Audit-safe findings produced during preflight. At most 32 findings of at
+  // most 4 KiB encoded each are accepted.
+  repeated Finding findings = 4;
+  // Non-secret service-defined metadata included in diagnostics. At most 64
+  // entries and 32 KiB of combined key/value data are accepted.
+  map<string, string> metadata = 5;
+}
+
+// WebSocketMessageResult contains the decision and optional replacement for
+// one message. A replacement must use the same variant as the input payload.
+message WebSocketMessageResult {
+  // Must exactly match the sequence of the corresponding WebSocketMessage.
+  uint64 sequence = 1;
+  Decision decision = 2;
+  // Absence preserves the input unchanged. Oneof presence distinguishes an
+  // empty replacement from no replacement, and string decoding enforces UTF-8.
+  oneof replacement {
+    string text = 3;
+    bytes binary = 4;
+  }
+  // Free-form service diagnostic. OpenShell never exposes this to the
+  // workload or security logs. Limited to 4 KiB before discarding.
+  string reason = 5;
+  // Optional stable machine-readable code for OCSF only. Unlike the HTTP
+  // reason_code, this value is never put in a WebSocket close frame.
+  string reason_code = 6;
+  repeated Finding findings = 7;
+  map<string, string> metadata = 8;
+}
+
+// WebSocketSessionEventResult is an evaluation result for a preflight or message
+// event. Session start and end events do not produce results.
+message WebSocketSessionEventResult {
+  oneof result {
+    WebSocketPreflightDecision preflight_decision = 1;
+    WebSocketMessageResult message_result = 2;
+  }
 }
 
 // RequestContext identifies the sandbox request being evaluated.
@@ -130,7 +284,7 @@ message RequestContext {
 
 // HttpRequestTarget describes the admitted HTTP destination and request target.
 message HttpRequestTarget {
-  // Request scheme, such as "http" or "https".
+  // Request scheme, such as "http", "https", "ws", or "wss".
   string scheme = 1;
   // Destination hostname selected by network policy.
   string host = 2;
@@ -154,13 +308,16 @@ message Process {
   repeated string ancestors = 3;
 }
 
-// Decision controls whether OpenShell continues processing the request.
+// Decision controls whether OpenShell continues processing the current
+// evaluation unit.
 enum Decision {
   // Invalid response value handled according to the policy failure mode.
   DECISION_UNSPECIFIED = 0;
-  // Continue processing the request and apply any returned mutations.
+  // Continue processing the current request or message and apply any returned
+  // mutations.
   DECISION_ALLOW = 1;
-  // Deny the request before credentials are injected or data is sent upstream.
+  // Reject the current request or message. The operation-specific result
+  // defines the enclosing protocol behavior.
   DECISION_DENY = 2;
 }
 

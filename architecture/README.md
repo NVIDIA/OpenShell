@@ -163,6 +163,7 @@ that crate's `README.md`.
 |---|---|
 | [Gateway](gateway.md) | Gateway control plane, auth, APIs, persistence, settings, and relay coordination. |
 | [Sandbox](sandbox.md) | Sandbox supervisor, child process isolation, proxy, credentials, inference, connect, and logs. |
+| [Sandbox Limits](sandbox-limits.md) | Sandbox supervisor and egress safety ceilings, ownership rules, current enforcement, and known gaps. |
 | [Security Policy](security-policy.md) | Policy model, enforcement layers, policy updates, policy advisor, and security logging. |
 | [Compute Runtimes](compute-runtimes.md) | Docker, Podman, Kubernetes, VM, sandbox images, and runtime-specific responsibilities. |
 | [Build](build.md) | Build artifacts, CI/E2E, docs site validation, and release packaging. |

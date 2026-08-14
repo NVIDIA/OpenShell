@@ -494,6 +494,9 @@ each service and validates its described bindings and operator body limit.
 Policies attach a complete external middleware by its operator-owned registration
 name. Manifest bindings are identified by operation and phase, and each manifest
 may declare at most one binding for an operation and phase pair.
+Attaching a registration does not require it to advertise every supported
+operation. Supervisors select only the manifest bindings that match the current
+operation; policy-local config identity remains internal audit metadata.
 Before persisting a policy, the gateway asks each selected implementation to
 validate its config. The effective sandbox config contains only the registered
 services required by that policy; supervisors invoke those services directly on

@@ -124,6 +124,7 @@ pub struct OpaEngine {
     engine: Mutex<regorus::Engine>,
     generation: Arc<AtomicU64>,
     middleware_runner: RwLock<ChainRunner>,
+    websocket_assembly_budget: crate::l7::websocket::WebSocketAssemblyBudget,
     generation_tx: watch::Sender<u64>,
     fail_closed_reason: RwLock<Option<String>>,
 }
@@ -198,6 +199,7 @@ pub struct TunnelPolicyEngine {
     engine: Mutex<regorus::Engine>,
     generation_guard: PolicyGenerationGuard,
     middleware_runner: ChainRunner,
+    websocket_assembly_budget: crate::l7::websocket::WebSocketAssemblyBudget,
 }
 
 impl TunnelPolicyEngine {
@@ -225,6 +227,12 @@ impl TunnelPolicyEngine {
         &self.middleware_runner
     }
 
+    pub(crate) fn websocket_assembly_budget(
+        &self,
+    ) -> crate::l7::websocket::WebSocketAssemblyBudget {
+        self.websocket_assembly_budget.clone()
+    }
+
     /// Query the ordered middleware chain for a destination within this tunnel.
     pub fn query_middleware_chain(&self, input: &NetworkInput) -> Result<Vec<ChainEntry>> {
         let mut engine = self
@@ -236,6 +244,12 @@ impl TunnelPolicyEngine {
 }
 
 impl OpaEngine {
+    pub(crate) fn websocket_assembly_budget(
+        &self,
+    ) -> crate::l7::websocket::WebSocketAssemblyBudget {
+        self.websocket_assembly_budget.clone()
+    }
+
     fn with_engine(engine: regorus::Engine) -> Self {
         let generation = Arc::new(AtomicU64::new(0));
         let (generation_tx, _) = watch::channel(0);
@@ -243,6 +257,7 @@ impl OpaEngine {
             engine: Mutex::new(engine),
             generation,
             middleware_runner: RwLock::new(ChainRunner::default()),
+            websocket_assembly_budget: crate::l7::websocket::WebSocketAssemblyBudget::default(),
             generation_tx,
             fail_closed_reason: RwLock::new(None),
         }
@@ -630,8 +645,6 @@ impl OpaEngine {
             .engine
             .into_inner()
             .map_err(|_| miette::miette!("lock poisoned on new engine"))?;
-        let new_runner = ChainRunner::from_registry(registry);
-
         // Match clone_engine_for_tunnel's lock order (engine, then runner) so
         // readers can observe only the old pair or the new pair.
         let mut engine = self
@@ -642,6 +655,7 @@ impl OpaEngine {
             .middleware_runner
             .write()
             .map_err(|_| miette::miette!("middleware runner lock poisoned"))?;
+        let new_runner = runner.with_replacement_registry(registry);
         *engine = new_engine;
         *runner = new_runner;
         *self
@@ -711,7 +725,7 @@ impl OpaEngine {
             .middleware_runner
             .write()
             .map_err(|_| miette::miette!("middleware runner lock poisoned"))?;
-        *runner = ChainRunner::from_registry(registry);
+        *runner = runner.with_replacement_registry(registry);
         self.advance_generation();
         Ok(())
     }
@@ -910,6 +924,7 @@ impl OpaEngine {
                 generation_rx: self.generation_tx.subscribe(),
             },
             middleware_runner: self.middleware_runner()?,
+            websocket_assembly_budget: self.websocket_assembly_budget(),
         })
     }
 }
@@ -7072,6 +7087,142 @@ network_policies:
             .await
             .expect("describe chain");
         assert!(described[0].is_resolved());
+    }
+
+    #[tokio::test]
+    async fn middleware_session_budget_survives_atomic_registry_reload() {
+        let proto = test_proto();
+        let engine = OpaEngine::from_proto(&proto).expect("initial load should succeed");
+        let registry = MiddlewareRegistry::connect_services(
+            openshell_supervisor_middleware_builtins::services(),
+            Vec::new(),
+        )
+        .await
+        .expect("built-in registry");
+        engine
+            .replace_middleware_registry(registry)
+            .expect("install registry");
+        let old_runner = engine.middleware_runner().expect("old runner");
+        let entry = ChainEntry {
+            name: "regex".into(),
+            implementation: openshell_supervisor_middleware_builtins::BUILTIN_REGEX.into(),
+            order: 0,
+            config: prost_types::Struct {
+                fields: std::iter::once((
+                    "mode".into(),
+                    prost_types::Value {
+                        kind: Some(prost_types::value::Kind::StringValue("redact".into())),
+                    },
+                ))
+                .collect(),
+            },
+            on_error: openshell_supervisor_middleware::OnError::FailClosed,
+        };
+        let preflight_input =
+            |session_id: String| openshell_supervisor_middleware::WebSocketPreflightInput {
+                session_id,
+                request_id: "request".into(),
+                sandbox_id: "sandbox".into(),
+                scheme: "wss".into(),
+                host: "api.openai.com".into(),
+                port: 443,
+                path: "/v1/responses".into(),
+                requested_subprotocols: Vec::new(),
+            };
+        let mut old_sessions = Vec::new();
+        for index in 0..openshell_supervisor_middleware::MAX_CONCURRENT_MIDDLEWARE_SESSIONS {
+            let preflight = old_runner
+                .preflight_websocket(
+                    std::slice::from_ref(&entry),
+                    preflight_input(format!("old-generation-{index}")),
+                )
+                .await
+                .expect("admit old-generation session");
+            old_sessions.push(preflight.session.expect("built-in inspects session"));
+        }
+
+        let replacement = MiddlewareRegistry::connect_services(
+            openshell_supervisor_middleware_builtins::services(),
+            Vec::new(),
+        )
+        .await
+        .expect("replacement registry");
+        engine
+            .reload_policy_and_middleware_from_proto_with_pid(&proto, 0, replacement)
+            .expect("atomic policy and registry reload");
+        let current_runner = engine.middleware_runner().expect("current runner");
+        let overflow = current_runner
+            .preflight_websocket(
+                std::slice::from_ref(&entry),
+                preflight_input("new-generation-overflow".into()),
+            )
+            .await
+            .expect("capacity exhaustion is a typed preflight outcome");
+        assert!(!overflow.allowed);
+        assert!(overflow.session_capacity_exhausted);
+
+        old_sessions
+            .pop()
+            .expect("old-generation session")
+            .end(openshell_core::proto::WebSocketSessionEndReason::PolicyReload)
+            .await;
+        let admitted = current_runner
+            .preflight_websocket(
+                std::slice::from_ref(&entry),
+                preflight_input("new-generation-admitted".into()),
+            )
+            .await
+            .expect("released capacity is reusable after reload");
+        assert!(admitted.allowed);
+        assert!(admitted.session.is_some());
+    }
+
+    #[tokio::test]
+    async fn websocket_assembly_budget_survives_policy_reload() {
+        use crate::l7::websocket::{
+            MAX_CONCURRENT_WEBSOCKET_ASSEMBLIES, WebSocketAssemblyAdmissionOutcome,
+        };
+
+        let proto = test_proto();
+        let engine = OpaEngine::from_proto(&proto).expect("initial policy");
+        let old_tunnel = engine
+            .clone_engine_for_tunnel(engine.current_generation())
+            .expect("old tunnel");
+        let old_budget = old_tunnel.websocket_assembly_budget();
+        let mut old_admissions = Vec::new();
+        for _ in 0..MAX_CONCURRENT_WEBSOCKET_ASSEMBLIES {
+            match old_budget.reserve().await.expect("reserve old assembly") {
+                WebSocketAssemblyAdmissionOutcome::Admitted(admission) => {
+                    old_admissions.push(admission);
+                }
+                WebSocketAssemblyAdmissionOutcome::QueueExhausted => {
+                    panic!("active assembly capacity exhausted too early")
+                }
+            }
+        }
+
+        engine
+            .reload_from_proto_with_pid(&proto, 0)
+            .expect("policy reload");
+        let new_tunnel = engine
+            .clone_engine_for_tunnel(engine.current_generation())
+            .expect("new tunnel");
+        let new_budget = new_tunnel.websocket_assembly_budget();
+        let waiting = tokio::spawn(async move { new_budget.reserve().await });
+        tokio::task::yield_now().await;
+        assert!(
+            !waiting.is_finished(),
+            "new generation must share old generation assembly capacity"
+        );
+
+        drop(old_admissions.pop());
+        assert!(matches!(
+            waiting
+                .await
+                .expect("join waiting assembly")
+                .expect("waiting assembly result"),
+            WebSocketAssemblyAdmissionOutcome::Admitted(_)
+        ));
     }
 
     #[tokio::test]

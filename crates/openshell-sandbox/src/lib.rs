@@ -4810,7 +4810,7 @@ filesystem_policy:
         let invalid_external = openshell_core::proto::SupervisorMiddlewareService {
             name: "unavailable-guard".into(),
             grpc_endpoint: "http://127.0.0.1:1".into(),
-            max_body_bytes: 1024,
+            max_payload_bytes: 1024,
             ..Default::default()
         };
         connect_middleware_registry(&[invalid_external], &MiddlewareAuthentication::default())
@@ -4830,7 +4830,7 @@ filesystem_policy:
         let unavailable_service = openshell_core::proto::SupervisorMiddlewareService {
             name: "unavailable-guard".into(),
             grpc_endpoint: "http://127.0.0.1:1".into(),
-            max_body_bytes: 1024,
+            max_payload_bytes: 1024,
             ..Default::default()
         };
 

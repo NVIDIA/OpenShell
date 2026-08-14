@@ -59,9 +59,11 @@ openshell-supervisor-middleware-builtins = { path = "../openshell-supervisor-mid
 tempfile = "3"
 tonic = { workspace = true }
 temp-env = "0.3"
+tokio = { workspace = true, features = ["test-util"] }
 tokio-tungstenite = { workspace = true }
 futures = { workspace = true }
 tracing-subscriber = { workspace = true }
+tokio-stream = { workspace = true, features = ["net"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

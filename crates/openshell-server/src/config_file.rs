@@ -236,8 +236,10 @@ pub struct MiddlewareServiceFileConfig {
     /// trusted-network deployments only.
     #[serde(default)]
     pub allow_insecure_transport: bool,
-    /// Operator-owned body limit for every binding exposed by this service.
-    pub max_body_bytes: u64,
+    /// Operator-owned logical payload limit for every binding exposed by this
+    /// service, including HTTP bodies and complete WebSocket messages.
+    #[serde(alias = "max_body_bytes")]
+    pub max_payload_bytes: u64,
     /// Default RPC timeout using an integer with an `ms` or `s` suffix.
     #[serde(default)]
     pub timeout: Option<String>,
@@ -263,7 +265,7 @@ impl TryFrom<&MiddlewareServiceFileConfig> for SupervisorMiddlewareService {
         Ok(Self {
             name: config.name.clone(),
             grpc_endpoint: config.grpc_endpoint.clone(),
-            max_body_bytes: config.max_body_bytes,
+            max_payload_bytes: config.max_payload_bytes,
             timeout: config.timeout.clone().unwrap_or_default(),
             tls_ca_cert_pem,
             audience: config
@@ -712,7 +714,7 @@ name = "local-guard"
 grpc_endpoint = "https://127.0.0.1:50051"
 tls_ca_cert_path = "CA_PATH"
 audience = "urn:openshell:middleware:local-guard"
-max_body_bytes = 262144
+max_payload_bytes = 262144
 timeout = "2s"
 "#
         .replace("CA_PATH", &ca.path().display().to_string());
@@ -726,7 +728,7 @@ timeout = "2s"
                 tls_ca_cert_path: Some(ca.path().to_path_buf()),
                 audience: Some("urn:openshell:middleware:local-guard".into()),
                 allow_insecure_transport: false,
-                max_body_bytes: 262_144,
+                max_payload_bytes: 262_144,
                 timeout: Some("2s".into()),
             }]
         );
@@ -752,7 +754,7 @@ timeout = "2s"
             tls_ca_cert_path: None,
             audience: None,
             allow_insecure_transport: false,
-            max_body_bytes: 262_144,
+            max_payload_bytes: 262_144,
             timeout: None,
         };
 
@@ -784,7 +786,7 @@ timeout = "2s"
             tls_ca_cert_path: Some(ca.path().to_path_buf()),
             audience: None,
             allow_insecure_transport: false,
-            max_body_bytes: 262_144,
+            max_payload_bytes: 262_144,
             timeout: None,
         };
 
@@ -816,7 +818,7 @@ timeout = "2s"
             tls_ca_cert_path: Some(ca.path().to_path_buf()),
             audience: None,
             allow_insecure_transport: false,
-            max_body_bytes: 262_144,
+            max_payload_bytes: 262_144,
             timeout: None,
         };
 
@@ -850,6 +852,22 @@ audience = "urn:openshell:interceptor:quota"
         assert_eq!(
             interceptor.resolved_audience(),
             "urn:openshell:interceptor:quota"
+        );
+    }
+
+    #[test]
+    fn parses_legacy_supervisor_middleware_payload_limit() {
+        let toml = r#"
+[[openshell.supervisor.middleware]]
+name = "local-guard"
+grpc_endpoint = "http://127.0.0.1:50051"
+max_body_bytes = 262144
+"#;
+        let tmp = write_tmp(toml);
+        let file = load(tmp.path()).expect("legacy middleware registration parses");
+        assert_eq!(
+            file.openshell.supervisor.middleware[0].max_payload_bytes,
+            262_144
         );
     }
 
