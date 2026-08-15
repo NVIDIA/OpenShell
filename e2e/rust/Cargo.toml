@@ -82,6 +82,11 @@ path = "tests/podman_oci_identity.rs"
 required-features = ["e2e-podman"]
 
 [[test]]
+name = "podman_userns"
+path = "tests/podman_userns.rs"
+required-features = ["e2e-podman"]
+
+[[test]]
 name = "vm_gateway_start"
 path = "tests/vm_gateway_start.rs"
 required-features = ["e2e-vm"]
@@ -175,6 +180,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yml = "0.0.12"
 url = "2"
+nix = { version = "0.29", features = ["user"] }
 
 [dev-dependencies]
 serial_test = "3"

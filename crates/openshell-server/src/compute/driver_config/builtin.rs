@@ -143,6 +143,9 @@ fn apply_podman_env_overrides(podman: &mut PodmanComputeConfig) {
     if let Ok(ip) = std::env::var("OPENSHELL_PODMAN_HOST_GATEWAY_IP") {
         podman.host_gateway_ip = ip;
     }
+    if let Ok(mode) = std::env::var("OPENSHELL_PODMAN_USERNS") {
+        podman.userns = Some(mode);
+    }
 }
 
 #[cfg(test)]
