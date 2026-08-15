@@ -222,6 +222,26 @@ Common findings:
   cannot bypass slirp4netns host-loopback isolation. Do not work around
   discovery failures by broadening the primary gateway listener to `0.0.0.0`.
 
+When `userns` is configured (e.g. `userns = "auto"` or `userns = "keep-id"`):
+
+- Supervisor delivery uses bind-mount fallback instead of image volumes because
+  overlay mounts do not support `idmapped` mounts. The supervisor binary is
+  extracted from the supervisor image and cached at
+  `$XDG_DATA_HOME/openshell/podman-supervisor/` (typically
+  `~/.local/share/openshell/podman-supervisor/`).
+- Stale cache: if the supervisor image is updated but the cached binary is not
+  refreshed, sandbox creation may fail with an ELF validation error or version
+  mismatch. Remove the cache directory and retry.
+- `auto` mode requires subuid/subgid ranges for the current user in
+  `/etc/subuid` and `/etc/subgid`. If missing, Podman returns a user-namespace
+  mapping error at container creation.
+- `private` mode requires explicit `uidmap` and `gidmap` arrays in the TOML
+  config. Without both, the gateway rejects the config at startup.
+  Rootless Podman uses intermediate IDs (e.g. `uidmap = ["0:0:1", "1:1:65535"]`);
+  rootful Podman uses absolute host IDs (e.g. `uidmap = ["0:1000:1", "1:100000:65536"]`).
+- `nomap` (without hyphen) is accepted as input but canonicalized to `no-map`
+  for Podman's API.
+
 ### Step 6: Check Kubernetes Helm Gateways
 
 ```bash

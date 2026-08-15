@@ -26,7 +26,8 @@ use openshell_core::driver_mounts;
 use openshell_core::driver_utils::{
     LABEL_MANAGED_BY, LABEL_MANAGED_BY_VALUE, LABEL_SANDBOX_ID, LABEL_SANDBOX_NAME,
     LABEL_SANDBOX_NAMESPACE, LABEL_SANDBOX_WORKSPACE, SUPERVISOR_IMAGE_BINARY_PATH,
-    supervisor_image_should_refresh,
+    extract_first_tar_entry, supervisor_image_should_refresh, temp_extract_container_name,
+    validate_linux_elf_binary, write_cache_binary_atomic,
 };
 use openshell_core::gpu::{
     CdiGpuDefaultSelector, CdiGpuInventory, CdiGpuSelectionError, driver_gpu_requirements,
@@ -55,7 +56,6 @@ use openshell_core::proto_struct::{
 };
 use openshell_core::{Config, Error, Result as CoreResult};
 use std::collections::{HashMap, HashSet};
-use std::io::Read;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -3358,7 +3358,7 @@ fn resolve_supervisor_bin_source(
     // Tier 1: explicit supervisor_bin in [openshell.drivers.docker].
     if let Some(path) = docker_config.supervisor_bin.clone() {
         let path = canonicalize_existing_file(&path, "docker supervisor binary")?;
-        validate_linux_elf_binary(&path)?;
+        validate_linux_elf_binary(&path).map_err(Error::config)?;
         return Ok(SupervisorBinSource::Binary(path));
     }
 
@@ -3498,24 +3498,13 @@ async fn extract_supervisor_bin_from_image(docker: &Docker, image: &str) -> Core
         ))
     })?;
 
-    let cache_path = supervisor_cache_path(&digest)?;
+    let cache_path =
+        openshell_core::driver_utils::supervisor_cache_path("docker-supervisor", &digest)
+            .map_err(Error::config)?;
     if cache_path.is_file() {
-        validate_linux_elf_binary(&cache_path)?;
+        validate_linux_elf_binary(&cache_path).map_err(Error::config)?;
         return Ok(cache_path);
     }
-
-    let cache_dir = cache_path.parent().ok_or_else(|| {
-        Error::config(format!(
-            "docker supervisor cache path '{}' has no parent directory",
-            cache_path.display(),
-        ))
-    })?;
-    std::fs::create_dir_all(cache_dir).map_err(|err| {
-        Error::config(format!(
-            "failed to create docker supervisor cache dir '{}': {err}",
-            cache_dir.display(),
-        ))
-    })?;
 
     info!(
         image = image,
@@ -3525,8 +3514,8 @@ async fn extract_supervisor_bin_from_image(docker: &Docker, image: &str) -> Core
     );
 
     let binary_bytes = extract_supervisor_binary_bytes(docker, image).await?;
-    write_cache_binary_atomic(&cache_path, &binary_bytes)?;
-    validate_linux_elf_binary(&cache_path)?;
+    write_cache_binary_atomic(&cache_path, &binary_bytes).map_err(Error::config)?;
+    validate_linux_elf_binary(&cache_path).map_err(Error::config)?;
     Ok(cache_path)
 }
 
@@ -3619,98 +3608,6 @@ async fn download_binary_from_container(
     })
 }
 
-/// Extract the payload of the first regular-file entry in a tar archive.
-/// Docker's `/containers/<id>/archive` endpoint returns a single-file tar
-/// when `path` points to a file, so we only need the first entry.
-fn extract_first_tar_entry(tar_bytes: &[u8]) -> Result<Vec<u8>, String> {
-    let mut archive = tar::Archive::new(std::io::Cursor::new(tar_bytes));
-    let mut entries = archive
-        .entries()
-        .map_err(|err| format!("open tar archive: {err}"))?;
-    let mut entry = entries
-        .next()
-        .ok_or_else(|| "tar archive was empty".to_string())?
-        .map_err(|err| format!("read tar entry: {err}"))?;
-    let mut bytes = Vec::new();
-    entry
-        .read_to_end(&mut bytes)
-        .map_err(|err| format!("read tar entry payload: {err}"))?;
-    Ok(bytes)
-}
-
-fn write_cache_binary_atomic(final_path: &Path, bytes: &[u8]) -> CoreResult<()> {
-    let dir = final_path.parent().ok_or_else(|| {
-        Error::config(format!(
-            "docker supervisor cache path '{}' has no parent directory",
-            final_path.display(),
-        ))
-    })?;
-    let mut temp = tempfile::Builder::new()
-        .prefix(".openshell-sandbox-")
-        .tempfile_in(dir)
-        .map_err(|err| {
-            Error::config(format!(
-                "failed to create temp file for supervisor binary in '{}': {err}",
-                dir.display(),
-            ))
-        })?;
-    std::io::Write::write_all(&mut temp, bytes).map_err(|err| {
-        Error::config(format!(
-            "failed to write supervisor binary to temp file: {err}",
-        ))
-    })?;
-    temp.as_file().sync_all().map_err(|err| {
-        Error::config(format!("failed to sync supervisor binary temp file: {err}"))
-    })?;
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o755)).map_err(
-            |err| {
-                Error::config(format!(
-                    "failed to chmod supervisor binary temp file: {err}",
-                ))
-            },
-        )?;
-    }
-
-    temp.persist(final_path).map_err(|err| {
-        Error::config(format!(
-            "failed to rename supervisor binary into '{}': {}",
-            final_path.display(),
-            err.error,
-        ))
-    })?;
-    Ok(())
-}
-
-/// Cache path for an extracted supervisor binary, keyed by the image's
-/// content-addressable digest (e.g. `sha256:abc123…`). The digest-prefixed
-/// directory keeps stale extractions from earlier releases isolated so they
-/// can be GC'd without affecting the active binary.
-fn supervisor_cache_path(digest: &str) -> CoreResult<PathBuf> {
-    let base = openshell_core::paths::xdg_data_dir()
-        .map_err(|err| Error::config(format!("failed to resolve XDG data dir: {err}")))?;
-    Ok(supervisor_cache_path_with_base(&base, digest))
-}
-
-fn supervisor_cache_path_with_base(base: &Path, digest: &str) -> PathBuf {
-    let sanitized = digest.replace(':', "-");
-    base.join("openshell")
-        .join("docker-supervisor")
-        .join(sanitized)
-        .join("openshell-sandbox")
-}
-
-fn temp_extract_container_name() -> String {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static SEQ: AtomicU64 = AtomicU64::new(0);
-    let pid = std::process::id();
-    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
-    format!("openshell-supervisor-extract-{pid}-{seq}")
-}
-
 fn canonicalize_existing_file(path: &Path, description: &str) -> CoreResult<PathBuf> {
     if !path.is_file() {
         return Err(Error::config(format!(
@@ -3724,29 +3621,6 @@ fn canonicalize_existing_file(path: &Path, description: &str) -> CoreResult<Path
             path.display()
         ))
     })
-}
-
-pub(crate) fn validate_linux_elf_binary(path: &Path) -> CoreResult<()> {
-    let mut file = std::fs::File::open(path).map_err(|err| {
-        Error::config(format!(
-            "failed to open docker supervisor binary '{}': {err}",
-            path.display()
-        ))
-    })?;
-    let mut magic = [0_u8; 4];
-    file.read_exact(&mut magic).map_err(|err| {
-        Error::config(format!(
-            "failed to read docker supervisor binary '{}': {err}",
-            path.display()
-        ))
-    })?;
-    if magic != [0x7f, b'E', b'L', b'F'] {
-        return Err(Error::config(format!(
-            "docker supervisor binary '{}' must be a Linux ELF executable",
-            path.display()
-        )));
-    }
-    Ok(())
 }
 
 fn docker_guest_tls_configured(docker_config: &DockerComputeConfig) -> bool {

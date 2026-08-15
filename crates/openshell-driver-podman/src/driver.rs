@@ -12,7 +12,10 @@ use crate::watcher::{
 };
 use openshell_core::ComputeDriverError;
 use openshell_core::config::CDI_GPU_DEVICE_ALL;
-use openshell_core::driver_utils::supervisor_image_should_refresh;
+use openshell_core::driver_utils::{
+    SUPERVISOR_IMAGE_BINARY_PATH, extract_first_tar_entry, supervisor_image_should_refresh,
+    temp_extract_container_name, validate_linux_elf_binary, write_cache_binary_atomic,
+};
 use openshell_core::gpu::{
     CdiGpuDefaultSelector, CdiGpuInventory, CdiGpuSelectionError, driver_gpu_requirements,
     effective_driver_gpu_count, validate_specific_gpu_device_request,
@@ -181,6 +184,52 @@ async fn cleanup_sandbox_proxy_auth_secret(client: &PodmanClient, secret_name: &
     }
 }
 
+async fn create_tls_secrets(
+    client: &PodmanClient,
+    config: &PodmanComputeConfig,
+    names: &[String; 3],
+) -> Result<(), ComputeDriverError> {
+    let paths = [
+        config.guest_tls_ca.as_deref(),
+        config.guest_tls_cert.as_deref(),
+        config.guest_tls_key.as_deref(),
+    ];
+    let mut created = 0usize;
+    for (name, path) in names.iter().zip(paths.iter()) {
+        let Some(p) = path else { continue };
+        let result = async {
+            let data = std::fs::read(p).map_err(|e| {
+                ComputeDriverError::Message(format!("read TLS file '{}': {e}", p.display()))
+            })?;
+            client
+                .create_secret(name, &data)
+                .await
+                .map_err(ComputeDriverError::from)
+        }
+        .await;
+        if let Err(e) = result {
+            for prev in &names[..created] {
+                let _ = client.remove_secret(prev).await;
+            }
+            return Err(e);
+        }
+        created += 1;
+    }
+    Ok(())
+}
+
+async fn cleanup_tls_secrets(client: &PodmanClient, names: &[String; 3]) {
+    for name in names {
+        if let Err(err) = client.remove_secret(name).await {
+            warn!(
+                secret = %name,
+                error = %err,
+                "Failed to remove TLS secret"
+            );
+        }
+    }
+}
+
 fn local_podman_cdi_gpu_inventory_from(dev_root: &Path) -> CdiGpuInventory {
     let mut device_ids = std::fs::read_dir(dev_root)
         .ok()
@@ -279,6 +328,8 @@ impl PodmanComputeDriver {
         config.validate_runtime_limits()?;
         config.validate_host_gateway_ip()?;
         config.validate_proxy_config()?;
+        config.canonicalize_userns()?;
+        config.validate_userns_mappings()?;
 
         let client = PodmanClient::new(socket_path);
 
@@ -758,6 +809,37 @@ impl PodmanComputeDriver {
                 return Err(e);
             }
         };
+        let supervisor_bin_path = if userns_needs_extraction(self.config.userns.as_deref()) {
+            match extract_supervisor_bin(&self.client, &self.config).await {
+                Ok(path) => Some(path),
+                Err(e) => {
+                    cleanup_created().await;
+                    return Err(e);
+                }
+            }
+        } else {
+            None
+        };
+
+        let tls_secret_names =
+            if userns_remaps_uids(self.config.userns.as_deref()) && self.config.tls_enabled() {
+                let names = container::tls_secret_names(&sandbox.id);
+                if let Err(e) = create_tls_secrets(&self.client, &self.config, &names).await {
+                    cleanup_created().await;
+                    return Err(e);
+                }
+                Some(names)
+            } else {
+                None
+            };
+
+        let cleanup_all = || async {
+            cleanup_created().await;
+            if let Some(names) = &tls_secret_names {
+                cleanup_tls_secrets(&self.client, names).await;
+            }
+        };
+
         let spec = match container::build_container_spec_for_image(
             sandbox,
             &self.config,
@@ -766,25 +848,23 @@ impl PodmanComputeDriver {
             image,
             &inspected_image.id,
             image_user,
+            supervisor_bin_path.as_deref(),
+            tls_secret_names.as_ref(),
         ) {
             Ok(spec) => spec,
             Err(e) => {
-                cleanup_created().await;
+                cleanup_all().await;
                 return Err(e);
             }
         };
         match self.client.create_container(&spec).await {
             Ok(_) => {}
             Err(PodmanApiError::Conflict(_)) => {
-                // Clean up the volume we just created. It is keyed by *this*
-                // sandbox's ID, not the conflicting container's ID (which
-                // has the same name but a different ID), so it would be
-                // orphaned otherwise.
-                cleanup_created().await;
+                cleanup_all().await;
                 return Err(ComputeDriverError::AlreadyExists);
             }
             Err(e) => {
-                cleanup_created().await;
+                cleanup_all().await;
                 return Err(ComputeDriverError::from(e));
             }
         }
@@ -800,7 +880,7 @@ impl PodmanComputeDriver {
                 .client
                 .remove_container(&name, self.config.stop_timeout_secs)
                 .await;
-            cleanup_created().await;
+            cleanup_all().await;
             return Err(ComputeDriverError::from(e));
         }
 
@@ -903,6 +983,7 @@ impl PodmanComputeDriver {
                 &container::proxy_auth_secret_name(sandbox_id),
             )
             .await;
+            cleanup_tls_secrets(&self.client, &container::tls_secret_names(sandbox_id)).await;
             self.lifecycle_event_fences.remove(sandbox_id);
             return Ok(false);
         };
@@ -937,6 +1018,7 @@ impl PodmanComputeDriver {
             &container::proxy_auth_secret_name(sandbox_id),
         )
         .await;
+        cleanup_tls_secrets(&self.client, &container::tls_secret_names(sandbox_id)).await;
         self.lifecycle_event_fences.remove(sandbox_id);
 
         Ok(container_existed)
@@ -1138,6 +1220,131 @@ fn validate_rootless_local_callback_helper(
     Err(ComputeDriverError::Precondition(format!(
         "Podman rootless network helper '{reported}' does not support direct local gateway callbacks; configure pasta or use an explicitly remote grpc_endpoint"
     )))
+}
+
+// ── Supervisor binary extraction (userns fallback) ─────────────────────
+
+async fn extract_supervisor_bin(
+    client: &PodmanClient,
+    config: &PodmanComputeConfig,
+) -> Result<PathBuf, ComputeDriverError> {
+    let mut inspect = client
+        .inspect_image(&config.supervisor_image)
+        .await
+        .map_err(ComputeDriverError::from)?;
+
+    if supervisor_image_should_refresh(&config.supervisor_image) {
+        info!(
+            image = %config.supervisor_image,
+            "Refreshing mutable podman supervisor image"
+        );
+        match client.pull_image(&config.supervisor_image, "always").await {
+            Ok(()) => {
+                inspect = client
+                    .inspect_image(&config.supervisor_image)
+                    .await
+                    .map_err(ComputeDriverError::from)?;
+            }
+            Err(err) => {
+                warn!(
+                    image = %config.supervisor_image,
+                    error = %err,
+                    "Failed to refresh mutable podman supervisor image; \
+                     falling back to local image if present",
+                );
+            }
+        }
+    }
+
+    let digest = if inspect.id.is_empty() {
+        return Err(ComputeDriverError::Precondition(format!(
+            "supervisor image '{}' has no ID",
+            config.supervisor_image,
+        )));
+    } else {
+        &inspect.id
+    };
+
+    let cache_path =
+        openshell_core::driver_utils::supervisor_cache_path("podman-supervisor", digest)
+            .map_err(ComputeDriverError::Precondition)?;
+    if cache_path.is_file() {
+        validate_linux_elf_binary(&cache_path).map_err(ComputeDriverError::Precondition)?;
+        info!(
+            cache_path = %cache_path.display(),
+            "Using cached supervisor binary"
+        );
+        return Ok(cache_path);
+    }
+
+    info!(
+        image = %config.supervisor_image,
+        cache_path = %cache_path.display(),
+        "Extracting supervisor binary from image"
+    );
+
+    let container_name = temp_extract_container_name();
+    let spec = serde_json::json!({
+        "image": config.supervisor_image,
+        "name": container_name,
+        "entrypoint": [SUPERVISOR_IMAGE_BINARY_PATH],
+        "command": [],
+    });
+    client
+        .create_container(&spec)
+        .await
+        .map_err(ComputeDriverError::from)?;
+
+    let result = extract_binary_from_container(client, &container_name, &cache_path).await;
+
+    if let Err(err) = client.remove_container(&container_name, 0).await {
+        warn!(
+            container = container_name,
+            error = %err,
+            "Failed to remove supervisor extractor container"
+        );
+    }
+
+    result
+}
+
+async fn extract_binary_from_container(
+    client: &PodmanClient,
+    container_name: &str,
+    cache_path: &Path,
+) -> Result<PathBuf, ComputeDriverError> {
+    let tar_bytes = client
+        .copy_from_container(container_name, SUPERVISOR_IMAGE_BINARY_PATH)
+        .await
+        .map_err(ComputeDriverError::from)?;
+
+    let binary_bytes = extract_first_tar_entry(&tar_bytes).map_err(|err| {
+        ComputeDriverError::Precondition(format!(
+            "failed to extract supervisor binary from tar: {err}"
+        ))
+    })?;
+
+    write_cache_binary_atomic(cache_path, &binary_bytes)
+        .map_err(ComputeDriverError::Precondition)?;
+    validate_linux_elf_binary(cache_path).map_err(ComputeDriverError::Precondition)?;
+    Ok(cache_path.to_path_buf())
+}
+
+fn userns_needs_extraction(userns: Option<&str>) -> bool {
+    userns.is_some_and(|mode| {
+        let base = mode.split(':').next().unwrap_or(mode);
+        !base.eq_ignore_ascii_case("host")
+    })
+}
+
+/// Returns `true` when userns remaps all UIDs, making host-owned bind mounts
+/// unreadable from inside the container. `auto` and `no-map` remap every UID;
+/// `keep-id` preserves the host user's UID; `host` uses the host namespace.
+fn userns_remaps_uids(userns: Option<&str>) -> bool {
+    userns.is_some_and(|mode| {
+        let base = mode.split(':').next().unwrap_or(mode);
+        !matches!(base.to_ascii_lowercase().as_str(), "host" | "keep-id")
+    })
 }
 
 #[cfg(test)]
@@ -2349,5 +2556,29 @@ mod tests {
             )
         );
         let _ = fs::remove_file(socket_path);
+    }
+
+    #[test]
+    fn userns_needs_extraction_cases() {
+        assert!(!userns_needs_extraction(None));
+        assert!(!userns_needs_extraction(Some("host")));
+        assert!(!userns_needs_extraction(Some("Host")));
+        assert!(userns_needs_extraction(Some("auto")));
+        assert!(userns_needs_extraction(Some("auto:size=65536")));
+        assert!(userns_needs_extraction(Some("keep-id")));
+        assert!(userns_needs_extraction(Some("keep-id:uid=1000")));
+        assert!(userns_needs_extraction(Some("no-map")));
+        assert!(userns_needs_extraction(Some("private")));
+    }
+
+    #[test]
+    fn userns_remaps_uids_cases() {
+        assert!(!userns_remaps_uids(None));
+        assert!(!userns_remaps_uids(Some("host")));
+        assert!(!userns_remaps_uids(Some("keep-id")));
+        assert!(userns_remaps_uids(Some("auto")));
+        assert!(userns_remaps_uids(Some("auto:size=65536")));
+        assert!(userns_remaps_uids(Some("no-map")));
+        assert!(userns_remaps_uids(Some("private")));
     }
 }

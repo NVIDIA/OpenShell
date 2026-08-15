@@ -133,6 +133,21 @@ struct Args {
     /// SSRF/`allowed_ips` validation no longer binds the connection.
     #[arg(long, env = "OPENSHELL_SANDBOX_PROXY_CONNECT_BY_HOSTNAME")]
     sandbox_proxy_connect_by_hostname: Option<bool>,
+
+    /// User namespace mode for sandbox containers (e.g. `auto`).
+    /// When unset, containers use the default user namespace.
+    #[arg(long, env = "OPENSHELL_PODMAN_USERNS")]
+    userns: Option<String>,
+
+    /// Explicit UID mappings for `userns = "private"`.
+    /// Each entry is `"container_id:host_id:size"`.
+    #[arg(long = "uidmap")]
+    uidmap: Vec<String>,
+
+    /// Explicit GID mappings for `userns = "private"`.
+    /// Each entry is `"container_id:host_id:size"`.
+    #[arg(long = "gidmap")]
+    gidmap: Vec<String>,
 }
 
 #[tokio::main]
@@ -168,6 +183,9 @@ async fn main() -> Result<()> {
         proxy_auth_file: args.sandbox_proxy_auth_file,
         proxy_auth_allow_insecure: args.sandbox_proxy_auth_allow_insecure,
         proxy_connect_by_hostname: args.sandbox_proxy_connect_by_hostname,
+        userns: args.userns,
+        uidmap: args.uidmap,
+        gidmap: args.gidmap,
         ..PodmanComputeConfig::default()
     })
     .await

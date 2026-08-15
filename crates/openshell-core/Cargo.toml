@@ -30,6 +30,8 @@ ipnet = "2"
 base64 = { workspace = true }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"], optional = true }
 reqwest = { workspace = true, features = ["blocking", "rustls-tls-native-roots"], optional = true }
+tar = { version = "0.4", optional = true }
+tempfile = { version = "3", optional = true }
 
 [target.'cfg(unix)'.dependencies]
 nix = { workspace = true }
@@ -39,6 +41,7 @@ default = ["telemetry"]
 ## Compile in anonymous telemetry emission support. On by default; disable with
 ## `--no-default-features` (plus any other features you need) for a build that
 ## contains no telemetry endpoint, no HTTP client, and no emission code at all.
+driver-extraction = ["dep:tar", "dep:tempfile"]
 telemetry = ["dep:reqwest", "dep:chrono"]
 
 [build-dependencies]
