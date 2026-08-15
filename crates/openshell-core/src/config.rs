@@ -4,6 +4,7 @@
 //! Configuration management for `OpenShell` components.
 
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::fmt;
 #[cfg(unix)]
@@ -642,6 +643,19 @@ pub struct GatewayInterceptorConfig {
     /// Interceptor gRPC endpoint. Supports `http://`, `https://`, and
     /// `unix://` endpoints.
     pub grpc_endpoint: String,
+    /// Optional PEM trust-root bundle for an HTTPS endpoint. The gateway
+    /// loads this file during interceptor initialization.
+    #[serde(default)]
+    pub tls_ca_cert_path: Option<PathBuf>,
+    /// Exact JWT audience for this service. When omitted, a kind-scoped value
+    /// is derived from the configured registration name.
+    #[serde(default)]
+    pub audience: Option<String>,
+    /// Opt out of extension authentication for this interceptor, permitting a
+    /// plaintext `http://` endpoint with no bearer credential. Development and
+    /// trusted-network deployments only.
+    #[serde(default)]
+    pub allow_insecure_transport: bool,
     /// Deterministic service ordering. Lower values run first.
     #[serde(default)]
     pub order: i32,
@@ -665,6 +679,19 @@ pub struct GatewayInterceptorConfig {
     /// selected by `binding_policy`.
     #[serde(default)]
     pub bindings: Vec<GatewayInterceptorBindingOverride>,
+}
+
+impl GatewayInterceptorConfig {
+    /// Resolve the configured JWT audience to its deterministic default.
+    pub fn resolved_audience(&self) -> Cow<'_, str> {
+        self.audience
+            .as_deref()
+            .filter(|audience| !audience.is_empty())
+            .map_or_else(
+                || Cow::Owned(format!("urn:openshell:extension:interceptor:{}", self.name)),
+                Cow::Borrowed,
+            )
+    }
 }
 
 /// Operator policy for authorizing interceptor manifest bindings.
@@ -1216,6 +1243,19 @@ mod tests {
         assert_eq!(
             defaulted.binding_policy,
             GatewayInterceptorBindingPolicy::Dynamic
+        );
+        assert_eq!(
+            defaulted.resolved_audience(),
+            "urn:openshell:extension:interceptor:governance"
+        );
+        let explicitly_empty = GatewayInterceptorConfig {
+            name: "governance".to_string(),
+            audience: Some(String::new()),
+            ..GatewayInterceptorConfig::default()
+        };
+        assert_eq!(
+            explicitly_empty.resolved_audience(),
+            "urn:openshell:extension:interceptor:governance"
         );
         assert_eq!(allowlist, GatewayInterceptorBindingPolicy::Allowlist);
         assert_eq!(exact, GatewayInterceptorBindingPolicy::Exact);

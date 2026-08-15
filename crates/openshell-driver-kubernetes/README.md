@@ -3,8 +3,31 @@
 Kubernetes-backed compute driver for OpenShell cluster deployments.
 
 The driver uses the Kubernetes API to create, delete, fetch, and watch sandbox
-custom resources in the configured namespace. It runs in-process with the
-gateway server.
+custom resources. It runs in-process with the gateway server and supports three
+workspace namespace modes via `workspace_mode`:
+
+- **Shared** (default): All sandboxes render into a single static namespace.
+  Resource names use `{workspace}--{name}` for collision avoidance.
+- **Managed**: The driver auto-creates/deletes a K8s namespace per workspace
+  (`openshell-{gateway_id}-{workspace_name}`), creates a ServiceAccount in each,
+  and copies OpenShift SCC annotations from the gateway namespace when present.
+- **Operator**: Workspace names map 1:1 to pre-provisioned namespaces discovered
+  through exactly one source: either a label selector
+  (`operator_namespace_label`) or a drop-in allowlist file
+  (`operator_namespace_file`). Sandbox creation fails closed if the workspace
+  namespace is not in the current allowlist. Workspace deletion only removes
+  gateway state; it never deletes or otherwise accesses the operator-managed
+  Kubernetes namespace.
+
+Workspace namespace modes assume exclusive control of the sandbox identity
+resource chain. In shared and managed modes, only the gateway and its trusted
+Agent Sandbox controller may administer the sandbox namespace, Sandbox CRs,
+sandbox pods, or configured sandbox ServiceAccount. In operator mode, the
+platform operator owns namespace lifecycle but must prevent other principals
+from creating or mutating Sandbox CRs, creating sandbox pods with fabricated
+owner references, or using the configured sandbox ServiceAccount. Treat adding
+a namespace to the operator allowlist as granting this trust; the allowlist is
+not a tenant isolation boundary.
 
 ## Runtime Model
 

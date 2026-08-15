@@ -3712,6 +3712,7 @@ dependencies = [
  "ipnet",
  "miette",
  "nix 0.29.0",
+ "openshell-extension-core",
  "prost",
  "prost-types",
  "protoc-bin-vendored",
@@ -3721,6 +3722,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-stream",
  "tonic",
  "tonic-prost",
  "tonic-prost-build",
@@ -3777,6 +3779,7 @@ dependencies = [
  "kube",
  "kube-runtime",
  "miette",
+ "notify",
  "openshell-core",
  "openshell-policy",
  "prost",
@@ -3902,13 +3905,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "openshell-extension-core"
+version = "0.0.0"
+dependencies = [
+ "http 1.4.0",
+ "hyper-util",
+ "rcgen",
+ "rustls 0.23.38",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tower 0.5.3",
+]
+
+[[package]]
 name = "openshell-gateway-interceptors"
 version = "0.0.0"
 dependencies = [
- "hyper-util",
  "json-patch",
  "metrics",
  "openshell-core",
+ "openshell-extension-core",
  "prost",
  "prost-reflect",
  "prost-types",
@@ -3917,7 +3937,6 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tonic",
- "tower 0.5.3",
  "tracing",
  "tracing-subscriber",
 ]
@@ -4017,6 +4036,7 @@ dependencies = [
  "miette",
  "nix 0.29.0",
  "openshell-core",
+ "openshell-extension-core",
  "openshell-ocsf",
  "openshell-policy",
  "openshell-supervisor-middleware",
@@ -4105,6 +4125,7 @@ dependencies = [
  "openshell-driver-kubernetes-secrets",
  "openshell-driver-podman",
  "openshell-driver-vault",
+ "openshell-extension-core",
  "openshell-gateway-interceptors",
  "openshell-ocsf",
  "openshell-otel",
@@ -4167,8 +4188,10 @@ dependencies = [
 name = "openshell-supervisor-middleware"
 version = "0.0.0"
 dependencies = [
+ "futures",
  "miette",
  "openshell-core",
+ "openshell-extension-core",
  "openshell-supervisor-middleware-builtins",
  "prost",
  "prost-types",
@@ -4189,6 +4212,8 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "tokio-stream",
+ "tonic",
 ]
 
 [[package]]
@@ -4233,6 +4258,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tokio-rustls 0.26.4",
+ "tokio-stream",
  "tokio-tungstenite 0.26.2",
  "tonic",
  "tower-mcp-types",

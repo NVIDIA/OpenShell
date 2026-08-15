@@ -3,6 +3,7 @@
 
 use clap::{ArgAction, Parser};
 use miette::{IntoDiagnostic, Result};
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
@@ -10,9 +11,10 @@ use tracing_subscriber::EnvFilter;
 use openshell_core::VERSION;
 use openshell_core::proto::compute::v1::compute_driver_server::ComputeDriverServer;
 use openshell_driver_kubernetes::{
-    AppArmorProfile, ComputeDriverService, DEFAULT_PROXY_UID, DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME,
-    KubernetesComputeConfig, KubernetesComputeDriver, KubernetesSidecarConfig,
-    SupervisorSideloadMethod, SupervisorTopology,
+    AppArmorProfile, ComputeDriverService, DEFAULT_GATEWAY_ID, DEFAULT_PROXY_UID,
+    DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME, KubernetesComputeConfig, KubernetesComputeDriver,
+    KubernetesSidecarConfig, ManagedSshIngressConfig, SupervisorSideloadMethod, SupervisorTopology,
+    WorkspaceMode,
 };
 
 #[derive(Parser, Debug)]
@@ -30,8 +32,24 @@ struct Args {
     #[arg(long, env = "OPENSHELL_LOG_LEVEL", default_value = "info")]
     log_level: String,
 
+    #[arg(long, env = "OPENSHELL_WORKSPACE_MODE", default_value = "shared")]
+    workspace_mode: WorkspaceMode,
+
+    #[arg(
+        long,
+        env = "OPENSHELL_GATEWAY_ID",
+        default_value = DEFAULT_GATEWAY_ID
+    )]
+    gateway_id: String,
+
     #[arg(long, env = "OPENSHELL_SANDBOX_NAMESPACE", default_value = "default")]
     sandbox_namespace: String,
+
+    #[arg(long, env = "OPENSHELL_OPERATOR_NAMESPACE_LABEL")]
+    operator_namespace_label: Option<String>,
+
+    #[arg(long, env = "OPENSHELL_OPERATOR_NAMESPACE_FILE")]
+    operator_namespace_file: Option<String>,
 
     #[arg(
         long,
@@ -52,6 +70,19 @@ struct Args {
         value_delimiter = ','
     )]
     sandbox_image_pull_secrets: Vec<String>,
+
+    #[arg(long, env = "OPENSHELL_MANAGED_SSH_INGRESS_ENABLED")]
+    managed_ssh_ingress_enabled: bool,
+
+    #[arg(long, env = "OPENSHELL_MANAGED_SSH_GATEWAY_NAMESPACE")]
+    managed_ssh_gateway_namespace: Option<String>,
+
+    #[arg(
+        long,
+        env = "OPENSHELL_MANAGED_SSH_GATEWAY_POD_SELECTOR",
+        value_delimiter = ','
+    )]
+    managed_ssh_gateway_pod_selector: Vec<String>,
 
     #[arg(long, env = "OPENSHELL_GRPC_ENDPOINT")]
     grpc_endpoint: Option<String>,
@@ -148,6 +179,29 @@ struct Args {
     sandbox_gid: Option<u32>,
 }
 
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        let terminate = async {
+            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+                Ok(mut signal) => {
+                    signal.recv().await;
+                }
+                Err(_) => std::future::pending::<()>().await,
+            }
+        };
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            () = terminate => {}
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
@@ -157,58 +211,88 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    let driver = KubernetesComputeDriver::new(KubernetesComputeConfig {
-        namespace: args.sandbox_namespace,
-        service_account_name: args.sandbox_service_account,
-        default_image: args.sandbox_image.unwrap_or_default(),
-        image_pull_policy: args.sandbox_image_pull_policy.unwrap_or_default(),
-        image_pull_secrets: args.sandbox_image_pull_secrets,
-        supervisor_image: args
-            .supervisor_image
-            .unwrap_or_else(openshell_core::config::default_supervisor_image),
-        supervisor_image_pull_policy: args.supervisor_image_pull_policy.unwrap_or_default(),
-        supervisor_sideload_method: args.supervisor_sideload_method,
-        topology: args.topology,
-        sidecar: KubernetesSidecarConfig {
-            proxy_uid: args.sidecar_proxy_uid,
-            process_binary_aware_network_policy: args.sidecar_process_binary_aware_network_policy,
+    let managed_ssh_gateway_pod_selector = args
+        .managed_ssh_gateway_pod_selector
+        .iter()
+        .map(|entry| {
+            entry
+                .split_once('=')
+                .map(|(key, value)| (key.to_string(), value.to_string()))
+                .ok_or_else(|| {
+                    miette::miette!("managed SSH gateway pod selector must use key=value: {entry}")
+                })
+        })
+        .collect::<Result<BTreeMap<_, _>>>()?;
+
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let driver = KubernetesComputeDriver::new(
+        KubernetesComputeConfig {
+            workspace_mode: args.workspace_mode,
+            gateway_id: args.gateway_id,
+            namespace: args.sandbox_namespace,
+            operator_namespace_label: args.operator_namespace_label,
+            operator_namespace_file: args.operator_namespace_file,
+            service_account_name: args.sandbox_service_account,
+            default_image: args.sandbox_image.unwrap_or_default(),
+            image_pull_policy: args.sandbox_image_pull_policy.unwrap_or_default(),
+            image_pull_secrets: args.sandbox_image_pull_secrets,
+            managed_ssh_ingress: ManagedSshIngressConfig {
+                enabled: args.managed_ssh_ingress_enabled,
+                gateway_namespace: args.managed_ssh_gateway_namespace.unwrap_or_default(),
+                gateway_pod_selector: managed_ssh_gateway_pod_selector,
+            },
+            supervisor_image: args
+                .supervisor_image
+                .unwrap_or_else(openshell_core::config::default_supervisor_image),
+            supervisor_image_pull_policy: args.supervisor_image_pull_policy.unwrap_or_default(),
+            supervisor_sideload_method: args.supervisor_sideload_method,
+            topology: args.topology,
+            sidecar: KubernetesSidecarConfig {
+                proxy_uid: args.sidecar_proxy_uid,
+                process_binary_aware_network_policy: args
+                    .sidecar_process_binary_aware_network_policy,
+            },
+            https_proxy: args.https_proxy,
+            no_proxy: args.no_proxy,
+            proxy_auth_secret_name: args.proxy_auth_secret_name,
+            proxy_auth_secret_key: args.proxy_auth_secret_key,
+            proxy_auth_allow_insecure: args.proxy_auth_allow_insecure.then_some(true),
+            proxy_connect_by_hostname: args.proxy_connect_by_hostname.then_some(true),
+            grpc_endpoint: args.grpc_endpoint.unwrap_or_default(),
+            ssh_socket_path: args.sandbox_ssh_socket_path,
+            client_tls_secret_name: args.client_tls_secret_name.unwrap_or_default(),
+            host_gateway_ip: args.host_gateway_ip.unwrap_or_default(),
+            enable_user_namespaces: args.enable_user_namespaces,
+            app_armor_profile: args.app_armor_profile,
+            workspace_default_storage_size: std::env::var(
+                "OPENSHELL_K8S_WORKSPACE_DEFAULT_STORAGE_SIZE",
+            )
+            .unwrap_or_else(|_| {
+                openshell_driver_kubernetes::DEFAULT_WORKSPACE_STORAGE_SIZE.to_string()
+            }),
+            workspace_storage_class: std::env::var("OPENSHELL_K8S_WORKSPACE_STORAGE_CLASS")
+                .unwrap_or_default(),
+            default_runtime_class_name: std::env::var("OPENSHELL_K8S_DEFAULT_RUNTIME_CLASS_NAME")
+                .unwrap_or_default(),
+            sa_token_ttl_secs: args.sa_token_ttl_secs,
+            provider_spiffe_workload_api_socket_path: args
+                .provider_spiffe_workload_api_socket_path
+                .unwrap_or_default(),
+            sandbox_uid: args.sandbox_uid,
+            sandbox_gid: args.sandbox_gid,
         },
-        https_proxy: args.https_proxy,
-        no_proxy: args.no_proxy,
-        proxy_auth_secret_name: args.proxy_auth_secret_name,
-        proxy_auth_secret_key: args.proxy_auth_secret_key,
-        proxy_auth_allow_insecure: args.proxy_auth_allow_insecure.then_some(true),
-        proxy_connect_by_hostname: args.proxy_connect_by_hostname.then_some(true),
-        grpc_endpoint: args.grpc_endpoint.unwrap_or_default(),
-        ssh_socket_path: args.sandbox_ssh_socket_path,
-        client_tls_secret_name: args.client_tls_secret_name.unwrap_or_default(),
-        host_gateway_ip: args.host_gateway_ip.unwrap_or_default(),
-        enable_user_namespaces: args.enable_user_namespaces,
-        app_armor_profile: args.app_armor_profile,
-        workspace_default_storage_size: std::env::var(
-            "OPENSHELL_K8S_WORKSPACE_DEFAULT_STORAGE_SIZE",
-        )
-        .unwrap_or_else(|_| {
-            openshell_driver_kubernetes::DEFAULT_WORKSPACE_STORAGE_SIZE.to_string()
-        }),
-        workspace_storage_class: std::env::var("OPENSHELL_K8S_WORKSPACE_STORAGE_CLASS")
-            .unwrap_or_default(),
-        default_runtime_class_name: std::env::var("OPENSHELL_K8S_DEFAULT_RUNTIME_CLASS_NAME")
-            .unwrap_or_default(),
-        sa_token_ttl_secs: args.sa_token_ttl_secs,
-        provider_spiffe_workload_api_socket_path: args
-            .provider_spiffe_workload_api_socket_path
-            .unwrap_or_default(),
-        sandbox_uid: args.sandbox_uid,
-        sandbox_gid: args.sandbox_gid,
-    })
+        shutdown_rx,
+    )
     .await
     .into_diagnostic()?;
 
     info!(address = %args.bind_address, "Starting Kubernetes compute driver");
     tonic::transport::Server::builder()
         .add_service(ComputeDriverServer::new(ComputeDriverService::new(driver)))
-        .serve(args.bind_address)
+        .serve_with_shutdown(args.bind_address, async move {
+            shutdown_signal().await;
+            let _ = shutdown_tx.send(true);
+        })
         .await
         .into_diagnostic()
 }

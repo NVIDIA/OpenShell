@@ -48,10 +48,33 @@ impl CredentialDriverService {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum WorkspaceMode {
+    #[default]
+    Shared,
+    Managed,
+    Operator,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct KubernetesSecretsDriverSettings {
     namespace: String,
     allow_reference_namespace: bool,
+    workspace_mode: WorkspaceMode,
+    gateway_id: String,
+}
+
+impl KubernetesSecretsDriverSettings {
+    fn target_namespace(&self, workspace: &str) -> String {
+        match self.workspace_mode {
+            WorkspaceMode::Shared => self.namespace.clone(),
+            WorkspaceMode::Managed => {
+                format!("openshell-{}-{}", self.gateway_id, workspace)
+            }
+            WorkspaceMode::Operator => workspace.to_string(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, serde::Deserialize)]
@@ -59,6 +82,8 @@ struct KubernetesSecretsDriverSettings {
 struct KubernetesSecretsDriverConfig {
     namespace: Option<String>,
     allow_reference_namespace: bool,
+    workspace_mode: WorkspaceMode,
+    gateway_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -134,7 +159,10 @@ impl KubernetesSecretsCredentialDriver {
         credential_key: &str,
     ) -> Result<KubernetesSecretReference, Status> {
         let reference = Self::parse_handle(handle, credential_key)?;
-        if reference.namespace != self.settings.namespace
+        // In managed/operator modes secrets live in workspace-specific
+        // namespaces so cross-namespace handles are expected.
+        if self.settings.workspace_mode == WorkspaceMode::Shared
+            && reference.namespace != self.settings.namespace
             && !self.settings.allow_reference_namespace
         {
             return Err(Status::permission_denied(format!(
@@ -175,7 +203,7 @@ impl KubernetesSecretsCredentialDriver {
             reference
         } else {
             KubernetesSecretReference {
-                namespace: self.settings.namespace.clone(),
+                namespace: self.settings.target_namespace(&request.workspace),
                 secret_name: managed_secret_name(
                     &request.workspace,
                     &request.provider_id,
@@ -504,10 +532,29 @@ impl KubernetesSecretsDriverSettings {
             }
             None => default_namespace(),
         };
+        let gateway_id = config.gateway_id.unwrap_or_default();
+        if config.workspace_mode == WorkspaceMode::Managed {
+            let gateway_id = trimmed_config_string("gateway_id", &gateway_id)?;
+            if !is_dns_label(gateway_id) {
+                return Err(Error::config(
+                    "[openshell.credential_drivers.kubernetes-secrets] gateway_id must be a DNS-1123 label in managed workspace mode",
+                ));
+            }
+            // Workspace names are limited to 19 characters by the gateway.
+            // Keep the longest generated namespace within Kubernetes' 63-char
+            // DNS label limit, matching the Kubernetes compute driver.
+            if "openshell-".len() + gateway_id.len() + 1 + 19 > 63 {
+                return Err(Error::config(
+                    "[openshell.credential_drivers.kubernetes-secrets] gateway_id is too long for managed workspace mode",
+                ));
+            }
+        }
 
         Ok(Self {
             namespace,
             allow_reference_namespace: config.allow_reference_namespace,
+            workspace_mode: config.workspace_mode,
+            gateway_id,
         })
     }
 }
@@ -779,6 +826,50 @@ mod tests {
     }
 
     #[test]
+    fn settings_managed_mode_requires_gateway_id() {
+        let err = KubernetesSecretsDriverSettings::from_table(&toml::toml! {
+            workspace_mode = "managed"
+        })
+        .unwrap_err();
+
+        assert!(err.to_string().contains("gateway_id"));
+    }
+
+    #[test]
+    fn settings_managed_mode_rejects_invalid_gateway_id() {
+        let err = KubernetesSecretsDriverSettings::from_table(&toml::toml! {
+            workspace_mode = "managed"
+            gateway_id = "Invalid_Gateway"
+        })
+        .unwrap_err();
+
+        assert!(err.to_string().contains("DNS-1123"));
+    }
+
+    #[test]
+    fn settings_managed_mode_rejects_gateway_id_that_is_too_long() {
+        let gateway_id = "a".repeat(35);
+        let err = KubernetesSecretsDriverSettings::from_table(&toml::toml! {
+            workspace_mode = "managed"
+            gateway_id = gateway_id
+        })
+        .unwrap_err();
+
+        assert!(err.to_string().contains("too long"));
+    }
+
+    #[test]
+    fn settings_managed_mode_accepts_valid_gateway_id() {
+        let settings = KubernetesSecretsDriverSettings::from_table(&toml::toml! {
+            workspace_mode = "managed"
+            gateway_id = "gateway-1"
+        })
+        .unwrap();
+
+        assert_eq!(settings.gateway_id, "gateway-1");
+    }
+
+    #[test]
     fn handle_resolves_secret_reference() {
         let reference = KubernetesSecretsCredentialDriver::parse_handle(
             &handle("v1:openshell:provider-secret"),
@@ -842,6 +933,8 @@ mod tests {
         let settings = KubernetesSecretsDriverSettings {
             namespace: "openshell".to_string(),
             allow_reference_namespace: false,
+            workspace_mode: WorkspaceMode::Shared,
+            gateway_id: String::new(),
         };
         let reference = KubernetesSecretsCredentialDriver::parse_handle(
             &handle("v1:other-namespace:provider-secret"),
@@ -865,6 +958,8 @@ mod tests {
         let settings = KubernetesSecretsDriverSettings {
             namespace: "openshell".to_string(),
             allow_reference_namespace: true,
+            workspace_mode: WorkspaceMode::Shared,
+            gateway_id: String::new(),
         };
         let reference = KubernetesSecretsCredentialDriver::parse_handle(
             &handle("v1:other-namespace:provider-secret"),
@@ -1064,5 +1159,41 @@ mod tests {
         let err = ensure_secret_is_managed_for(&secret, &reference, &owner_id).unwrap_err();
         assert_eq!(err.code(), Code::FailedPrecondition);
         assert!(err.message().contains("is not managed by OpenShell"));
+    }
+
+    #[test]
+    fn target_namespace_shared_returns_static_namespace() {
+        let settings = KubernetesSecretsDriverSettings {
+            namespace: "openshell".to_string(),
+            allow_reference_namespace: false,
+            workspace_mode: WorkspaceMode::Shared,
+            gateway_id: String::new(),
+        };
+        assert_eq!(settings.target_namespace("team-a"), "openshell");
+        assert_eq!(settings.target_namespace("team-b"), "openshell");
+    }
+
+    #[test]
+    fn target_namespace_managed_computes_from_workspace() {
+        let settings = KubernetesSecretsDriverSettings {
+            namespace: "openshell".to_string(),
+            allow_reference_namespace: false,
+            workspace_mode: WorkspaceMode::Managed,
+            gateway_id: "gw1".to_string(),
+        };
+        assert_eq!(settings.target_namespace("team-a"), "openshell-gw1-team-a");
+        assert_eq!(settings.target_namespace("team-b"), "openshell-gw1-team-b");
+    }
+
+    #[test]
+    fn target_namespace_operator_uses_workspace_name() {
+        let settings = KubernetesSecretsDriverSettings {
+            namespace: "openshell".to_string(),
+            allow_reference_namespace: false,
+            workspace_mode: WorkspaceMode::Operator,
+            gateway_id: String::new(),
+        };
+        assert_eq!(settings.target_namespace("team-a"), "team-a");
+        assert_eq!(settings.target_namespace("prod-ns"), "prod-ns");
     }
 }

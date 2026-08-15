@@ -51,6 +51,9 @@ paths, such as proxy support files or GPU device paths when a GPU is present.
 
 ## Network and Inference
 
+See [Sandbox Limits](sandbox-limits.md) for the current numeric safety ceilings,
+their ownership, terminal behavior, and known gaps.
+
 All ordinary agent egress is routed through the sandbox proxy. The proxy
 identifies the calling binary, checks trust-on-first-use binary identity, rejects
 unsafe internal destinations, and evaluates the active policy. On Linux, it
@@ -93,12 +96,11 @@ finding without logging the placeholder, environment key, secret, or query.
 For inspected HTTP traffic, the proxy can enforce REST method/path rules,
 WebSocket upgrade and text-message rules, GraphQL operation rules, and
 MCP method, tool, and supported params rules or generic JSON-RPC method rules
-on sandbox-to-server request bodies. MCP and JSON-RPC inspection buffers up to
-the endpoint `mcp.max_body_bytes` or `json_rpc.max_body_bytes` limit. MCP
-`tools/call` tool names are checked against the spec-recommended syntax by
-default before policy evaluation, with a per-endpoint `mcp.strict_tool_names`
-compatibility opt-out. Generic JSON-RPC policies do not support `params`
-matchers; generic JSON-RPC rules match only the method.
+on sandbox-to-server request bodies. MCP and JSON-RPC inspection buffers
+bounded request bodies. MCP `tools/call` tool names are checked against the
+spec-recommended syntax by default before policy evaluation, with a per-endpoint
+`mcp.strict_tool_names` compatibility opt-out. Generic JSON-RPC policies do not
+support `params` matchers; generic JSON-RPC rules match only the method.
 JSON-RPC responses and server-to-client MCP messages on response or SSE streams
 are relayed but are not currently parsed for policy enforcement.
 
@@ -108,20 +110,51 @@ host selectors choose the chain independently of the network rule that admitted
 the request. Policy-local map keys identify configs, while built-in names or
 operator-owned registration names identify implementations.
 
-Built-ins run in-process against a borrowed view of the chain's current request state. Operator services retain the bounded protobuf/gRPC contract, and the remote adapter materializes an owned evaluation only when the request crosses that transport boundary. `openshell-policy` validates policy-owned structure, and the active middleware registry validates implementation-owned config. The generic registry and chain runner live in `openshell-supervisor-middleware`; first-party implementations live in `openshell-supervisor-middleware-builtins`.
+Built-ins run in-process against a borrowed view of the chain's current HTTP
+request state. Operator services retain the bounded protobuf/gRPC contract, and
+the remote adapter materializes an owned HTTP evaluation only when a request
+crosses that transport boundary. Both paths support bounded bidirectional
+WebSocket sessions, so a manifest advertises capabilities independently of
+transport.
+The runtime keeps three states distinct: host selection attaches policy configs,
+manifest operation and phase bindings select the active chain, and the parsed
+message type determines whether that chain can inspect an individual payload.
+An attachment without a WebSocket binding is not a failed WebSocket stage.
+Binary messages are outside the V1 text-message binding. Both cases pass through
+with informational coverage telemetry rather than applying `on_error`.
+The chain runner owns shared sequencing, deadlines, backpressure, and response
+validation. `openshell-policy` validates policy-owned structure, and the active
+middleware registry validates implementation-owned config. The generic
+registry and chain runner live in `openshell-supervisor-middleware`; first-party
+implementations live in `openshell-supervisor-middleware-builtins`.
 
 The supervisor installs policy and middleware registry changes as one runtime
 generation and preserves the last-known-good generation if preparation fails.
 Policy-only updates reuse the connected registry, so an external middleware
 outage cannot block unrelated policy changes.
 
+For authenticated operator middleware, the supervisor requests credentials by
+registration name through `RefreshSandboxToken`. The gateway resolves names
+against the effective policy and mints exact-audience credentials. The
+supervisor keeps them in refreshable in-memory slots outside stable middleware
+configuration, so rotation neither changes `config_revision` nor reconnects
+the registry. Public custom-CA PEM travels with the stable registration.
+
+The slots live in a supervisor-owned `ExtensionCredentialStore` shared by every
+gateway connection the supervisor opens, so the registry's clients and the
+polling loop that rotates them observe the same credentials. Configuration
+polling runs far more frequently than credentials expire, so the loop rotates
+only when a credential is missing or has passed four fifths of its lifetime,
+and bounds its sleep by the soonest rotation deadline.
+
 Middleware cannot observe injected credentials or mutate supervisor-owned
 credential, routing, or framing headers. Body transformations are re-evaluated
 against body-aware L7 policy before later stages or the upstream can observe
 them. Requests, results, chain length, execution time, and diagnostics are
 bounded; external free-form diagnostic text is not exposed in responses or
-security logs. See [Supervisor Middleware](../docs/extensibility/supervisor-middleware.mdx)
-for configuration and protocol details.
+security logs. See
+[Supervisor Middleware](../docs/extensibility/supervisor-middleware.mdx) for
+configuration and protocol details.
 
 `https://inference.local` is special. It bypasses OPA network policy and is
 handled by the inference interception path:
@@ -234,8 +267,7 @@ exchanges it for an OAuth2 access token, caches the token, and injects it as an
 `Authorization: Bearer` header before forwarding the request. Token grant
 endpoints are HTTPS-only except for loopback and Kubernetes service DNS hosts,
 and returned access tokens must be bearer-compatible before they are cached or
-injected. Token response lifetimes are capped and cached with an expiry margin
-unless a profile supplies an explicit cache TTL override.
+injected. Token caching follows response-derived and profile override TTL rules.
 
 For AWS endpoints that require request-level signing, the proxy supports SigV4
 re-signing. When `credential_signing: sigv4` is set on an L7 endpoint, the proxy
@@ -248,9 +280,8 @@ an attached endpointless AWS profile explicitly named by the endpoint's
 sources atomically. The signing mode is auto-detected from the client SDK's
 `x-amz-content-sha256` header:
 
-- **Signed body** (hex hash): buffers the request body (up to 10 MiB), computes
-  its SHA-256, and includes the hash in the signature. Used by Bedrock and most
-  AWS services.
+- **Signed body** (hex hash): buffers the request body, computes its SHA-256,
+  and includes the hash in the signature. Used by Bedrock and most AWS services.
 - **Streaming unsigned** (`STREAMING-UNSIGNED-PAYLOAD-TRAILER`): signs headers
   only and streams the body through without buffering. Used by S3 uploads with
   `aws-chunked` encoding.

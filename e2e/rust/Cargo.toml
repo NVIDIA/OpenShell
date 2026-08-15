@@ -29,6 +29,8 @@ e2e-gpu = ["e2e"]
 e2e-docker-gpu = ["e2e-docker", "e2e-gpu"]
 e2e-kubernetes = ["e2e"]
 e2e-kubernetes-credential-drivers = ["e2e-kubernetes"]
+e2e-kubernetes-workspace-managed = ["e2e-kubernetes"]
+e2e-kubernetes-workspace-operator = ["e2e-kubernetes"]
 e2e-podman = ["e2e", "e2e-host-gateway", "e2e-local-container-driver"]
 e2e-podman-gpu = ["e2e-podman", "e2e-gpu"]
 e2e-oidc-pkce = []
@@ -138,6 +140,16 @@ required-features = ["e2e"]
 name = "proxy_egress_pipeline"
 path = "tests/proxy_egress_pipeline.rs"
 required-features = ["e2e-host-gateway"]
+
+[[test]]
+name = "workspace_namespace_managed"
+path = "tests/workspace_namespace_managed.rs"
+required-features = ["e2e-kubernetes-workspace-managed"]
+
+[[test]]
+name = "workspace_namespace_operator"
+path = "tests/workspace_namespace_operator.rs"
+required-features = ["e2e-kubernetes-workspace-operator"]
 
 [[test]]
 name = "gpu"

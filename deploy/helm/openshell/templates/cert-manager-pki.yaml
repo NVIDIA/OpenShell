@@ -1,7 +1,6 @@
+{{- if .Values.certManager.enabled }}
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-
-{{- if .Values.certManager.enabled }}
 apiVersion: cert-manager.io/v1
 kind: Issuer
 metadata:

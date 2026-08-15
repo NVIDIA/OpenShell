@@ -130,8 +130,10 @@ provider_profile_sources = [
 # both the gateway and sandbox supervisors.
 [[openshell.supervisor.middleware]]
 name = "local-content-guard"
-grpc_endpoint = "http://host.openshell.internal:50051"
-max_body_bytes = 262144
+grpc_endpoint = "https://host.openshell.internal:50051"
+tls_ca_cert_path = "/etc/openshell/certs/content-guard-ca.pem"
+audience = "urn:openshell:middleware:local-content-guard"
+max_payload_bytes = 262144
 timeout = "500ms"
 
 # Gateway listener TLS (distinct from the per-driver guest_tls_*).
@@ -176,6 +178,7 @@ scopes_claim  = ""
 [[openshell.gateway.interceptors]]
 name               = "quota"
 grpc_endpoint      = "unix:///run/openshell/interceptors/quota.sock"
+audience           = "urn:openshell:interceptor:quota"
 order              = 10
 failure_policy     = "fail_closed"
 binding_policy     = "allowlist"
@@ -261,26 +264,43 @@ Register operator-run supervisor middleware services with one or more `[[openshe
 ```toml
 [[openshell.supervisor.middleware]]
 name = "local-content-guard"
-grpc_endpoint = "http://host.openshell.internal:50051"
-max_body_bytes = 262144
+grpc_endpoint = "https://host.openshell.internal:50051"
+tls_ca_cert_path = "/etc/openshell/certs/content-guard-ca.pem"
+audience = "urn:openshell:middleware:local-content-guard"
+max_payload_bytes = 262144
 timeout = "500ms"
 ```
 
-Each service implements the supervisor middleware gRPC contract and exposes bindings through `Describe`. Policies reference the operator-owned registration `name`, attaching the complete middleware and all of its bindings. Bindings are identified by operation and phase. A manifest may expose at most one binding for each operation and phase pair; V1 supports only `HttpRequest/pre_credentials`, so a service currently exposes one binding. Registration names must be unique, and operator-run registrations cannot claim the reserved `openshell/` namespace. The service-reported manifest name is diagnostic metadata and does not need to match the registration name.
+Each service implements the supervisor middleware gRPC contract and exposes bindings through `Describe`. Policies reference the operator-owned registration `name`, attaching the complete middleware and all of its bindings. Bindings are identified by operation and phase. A manifest may expose at most one binding for each operation and phase pair. V1 supports `HttpRequest/pre_credentials` and `WebSocketMessage/pre_credentials`, so a service can inspect HTTP, WebSocket, or both. Registration names must be unique, and operator-run registrations cannot claim the reserved `openshell/` namespace. The service-reported manifest name is diagnostic metadata and does not need to match the registration name.
 
 The gateway connects to every registered service and validates `Describe` before it starts. The service must therefore be running before the gateway. Policy creation and full policy updates call `ValidateConfig`; an unavailable service or invalid middleware configuration rejects the policy before persistence.
 
-`max_body_bytes` is the operator limit for every binding exposed by the service. It must be greater than zero, no larger than each binding's advertised limit, and no larger than the 4 MiB platform maximum. OpenShell rejects an oversized value instead of silently clamping it. Middleware gRPC servers should allow messages of at least 4 MiB plus 293 KiB so a maximum-size body and its protobuf envelope fit on the transport.
+`max_payload_bytes` is the shared operator limit for inspectable logical payloads across every binding exposed by the service. It caps HTTP request and replacement bodies as well as complete WebSocket text messages and replacements. The value must be greater than zero, no larger than each binding's advertised `max_payload_bytes` capability, and no larger than the 4 MiB platform maximum. OpenShell rejects oversized values instead of silently clamping them. Binary WebSocket messages are not exposed to V1 middleware, so this field does not limit binary pass-through. Middleware gRPC servers should allow messages of at least 4 MiB plus 293 KiB so a maximum-size payload and its protobuf envelope fit on the transport.
 
-`timeout` is the operator-configured service-wide RPC timeout. It accepts the same compact duration syntax as gateway interceptors: an integer followed by `ms` or `s`, such as `500ms` or `2s`. Values must be between `10ms` and `30s`, inclusive. Omit the field to use the 500 ms platform default. A binding may advertise a shorter `timeout` in the `Describe` manifest, but it cannot extend the operator-configured deadline; OpenShell uses the smaller value. OpenShell validates both levels before accepting the service. The effective timeout covers `ValidateConfig` and `EvaluateHttpRequest`; `Describe` uses the service timeout because binding metadata is not available yet.
+`timeout` is the operator-configured service-wide RPC timeout. It accepts the same compact duration syntax as gateway interceptors: an integer followed by `ms` or `s`, such as `500ms` or `2s`. Values must be between `10ms` and `30s`, inclusive. Omit the field to use the 500 ms platform default. A binding may advertise a shorter `timeout` in the `Describe` manifest, but it cannot extend the operator-configured deadline; OpenShell uses the smaller value. OpenShell validates both levels before accepting the service. The operator-configured service timeout applies to `Describe` and `ValidateConfig`. The effective binding timeout applies only to `EvaluateHttpRequest`, WebSocket preflight, and each WebSocket message. An accepted WebSocket stream has no connection-wide RPC deadline.
 
-The service `grpc_endpoint` currently supports plaintext `http://` and TLS `https://` using the platform trust store. Custom trust roots, client authentication, health checks, and runtime registration are not currently supported. The endpoint must be reachable from both the gateway and sandbox supervisors; use `host.openshell.internal` or another shared address that can be resolved in both places.
+The service `grpc_endpoint` supports plaintext `http://` and TLS `https://`. HTTPS uses the platform trust store unless `tls_ca_cert_path` names a certificate-only PEM bundle. OpenShell rejects bundles containing private keys, loads the certificates at gateway startup, and distributes only public certificates to sandbox supervisors; normal TLS hostname verification still applies. `audience` sets the exact audience for gateway-minted service tokens and defaults to `urn:openshell:extension:middleware:<name>`. After authenticated `Describe` succeeds, OpenShell treats a non-empty manifest `expected_audience` as a consistency assertion and refuses to start when it differs from the configured audience. A strict verifier may reject an incorrect audience before returning the manifest.
 
-See [Supervisor Middleware](/extensibility/supervisor-middleware) for selection, failure, body-limit, and operational guidance.
+When `gateway_jwt` is configured, OpenShell attaches short-lived bearer credentials to gateway and supervisor calls and requires `https://`. A middleware endpoint must be reachable from sandbox supervisors, so Unix sockets are not an option here. Set `allow_insecure_transport = true` on a registration to keep a plaintext `http://` endpoint: OpenShell then attaches no credential, supervisors do not request one, and the gateway logs a warning naming the registration at every startup. mTLS client authentication, health checks, and runtime registration are not currently supported. The endpoint must be reachable from both the gateway and sandbox supervisors; use `host.openshell.internal` or another shared address that can be resolved in both places.
+
+See [Supervisor Middleware](/extensibility/supervisor-middleware) for selection, failure, payload-limit, and operational guidance.
 
 ## Gateway Interceptors
 
 `[[openshell.gateway.interceptors]]` configures gateway-side interceptor services. The gateway calls each service's `Describe` RPC at startup, validates its declared OpenShell RPC bindings against the compiled service descriptor, and applies matching phases from a central gRPC middleware path. Interceptors can target only methods in the gateway's built-in allowlist of unary mutation RPCs. New RPCs are non-interceptable until they are deliberately added to that allowlist; adding one does not require handler-specific interceptor code. Request bodies are exposed as protobuf JSON objects. Fields marked secret in the protobuf schema are recursively omitted from requests and post-commit responses. Interceptors cannot patch an omitted field or a containing object.
+
+HTTPS interceptor endpoints use the platform trust store by default. Set `tls_ca_cert_path` to a PEM certificate bundle for a private CA; normal TLS hostname verification still applies. `audience` sets the exact audience for gateway-minted service tokens and defaults to `urn:openshell:extension:interceptor:<name>`. After authenticated `Describe` succeeds, the gateway treats a non-empty manifest `expected_audience` as a consistency assertion and refuses to start when it differs from the configured audience. A strict verifier may reject an incorrect audience before returning the manifest. When `gateway_jwt` is configured, network interceptors must use HTTPS and receive short-lived gateway-caller bearer credentials; local Unix sockets are also supported. Set `allow_insecure_transport = true` to keep a plaintext `http://` interceptor endpoint with no credential attached and a startup warning.
+
+### Extension Token Verification Endpoints
+
+When `gateway_jwt` is configured the gateway publishes two unauthenticated documents that extension services use to verify OpenShell callers:
+
+| Path | Contents |
+| --- | --- |
+| `/.well-known/jwks.json` | Single-key JWKS holding the Ed25519 public key and its `kid`. |
+| `/.well-known/openid-configuration` | OIDC-shaped discovery metadata: the exact expected `iss`, an absolute `jwks_uri`, and `EdDSA` as the only supported signing algorithm. |
+
+The discovery document is OIDC-shaped rather than OIDC-compliant: `issuer` is the gateway identity (`openshell-gateway:<gateway_id>`), not the URL the document is served from. Verifiers compare `iss` against that value and must not infer trust from the document's location; the serving TLS connection is what authenticates the gateway. Both endpoints return `404` when `gateway_jwt` is not configured.
 
 `binding_policy` controls how the manifest and operator binding configuration combine:
 
@@ -423,6 +443,14 @@ client_ca_path = "/etc/openshell-tls/client-ca/ca.crt"
 # external_server_names = ["gateway.example.com"]
 
 [openshell.drivers.kubernetes]
+# Workspace isolation mode. "shared" renders all sandboxes into a single
+# namespace. "managed" auto-creates a K8s namespace per workspace
+# (openshell-{gateway_id}-{workspace}). "operator" maps each workspace to a
+# pre-provisioned namespace discovered via label selector or drop-in file.
+workspace_mode                 = "shared"
+# Gateway identity used in managed-mode namespace naming. Defaults to the
+# gateway JWT gateway_id. Must be a DNS-1123 label.
+# gateway_id                   = "openshell"
 namespace                      = "agents"
 service_account_name           = "openshell-sandbox"
 default_image                  = "ghcr.io/nvidia/openshell/sandbox:latest"
@@ -431,6 +459,7 @@ image_pull_secrets             = ["regcred"]
 # Defaults to the gateway version; override to pin a specific build.
 # supervisor_image             = "ghcr.io/nvidia/openshell/supervisor:<version>"
 supervisor_image_pull_policy   = "IfNotPresent"
+
 # Use the image volume on Kubernetes >= 1.35 (GA in 1.36); switch to "init-container"
 # on older clusters or where the ImageVolume feature gate is off.
 supervisor_sideload_method     = "image-volume"
@@ -491,6 +520,18 @@ provider_spiffe_workload_api_socket_path = "/spiffe-workload-api/spire-agent.soc
 # back to 1000 on non-OpenShift clusters.
 # sandbox_uid = 1500
 # sandbox_gid = 1500
+# Operator-mode namespace discovery. At least one must be set when
+# workspace_mode = "operator". Both can be combined.
+# operator_namespace_label discovers namespaces matching a K8s label selector.
+# operator_namespace_label     = "openshell.ai/workspace=true"
+# operator_namespace_file reads allowed namespaces from a JSON/YAML file
+# (hot-reloaded on change, e.g. via ConfigMap volume mount).
+# operator_namespace_file      = "/etc/openshell/workspace-namespaces.json"
+
+[openshell.drivers.kubernetes.managed_ssh_ingress]
+enabled = true
+gateway_namespace = "openshell"
+gateway_pod_selector = { "app.kubernetes.io/name" = "openshell", "app.kubernetes.io/instance" = "openshell" }
 
 [openshell.drivers.kubernetes.sidecar]
 # UID used by relaxed long-running network sidecars. Strict process/binary-aware
@@ -504,6 +545,11 @@ proxy_uid                      = 1337
 # policy.binaries.
 process_binary_aware_network_policy = true
 ```
+
+In managed workspace mode, the Kubernetes driver copies each explicitly named
+`image_pull_secrets` Secret from `namespace` into the managed workspace
+namespace on sandbox creation. Shared and operator modes require the Secret to
+already exist in the sandbox namespace.
 
 ### Docker
 

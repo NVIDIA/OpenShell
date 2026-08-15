@@ -309,5 +309,99 @@ Standalone local deployments start the gateway with a selected runtime such as
 Docker, Podman, or VM. The CLI can register multiple gateways and switch between
 them without changing the sandbox architecture.
 
+## Workspace Namespace Modes (Kubernetes)
+
+The Kubernetes driver maps workspaces to namespaces through the `workspace_mode`
+configuration field (`WorkspaceMode` in `crates/openshell-driver-kubernetes/src/config.rs`).
+The mode controls namespace resolution, resource naming, sandbox CR watching, SA
+token authentication, and RBAC requirements.
+
+| Mode | Namespace resolution | Resource name | Namespace lifecycle |
+|---|---|---|---|
+| **Shared** (default) | Single static namespace from config | `{workspace}--{name}` | None |
+| **Managed** | `openshell-{gateway_id}-{workspace}` | bare sandbox name | Driver creates and deletes |
+| **Operator** | Workspace name maps 1:1 to a pre-provisioned namespace | bare sandbox name | External (platform team) |
+
+**Shared** renders all sandboxes into one configured namespace. Resource names
+embed the workspace prefix for collision avoidance. No namespace lifecycle
+management. RBAC uses a namespace-scoped Role.
+
+**Managed** auto-creates a K8s namespace per workspace on first sandbox create.
+Each new namespace receives a ServiceAccount and the configured gateway-only
+SSH ingress NetworkPolicy. Configured image-pull Secrets are copied from the
+driver's source namespace on every sandbox create so registry credential
+rotations propagate. The namespace also copies OpenShift SCC UID-range and
+supplemental-group annotations from the gateway namespace when present. The
+driver deletes the namespace during workspace deletion. The workspace remains
+durably `Terminating` until the Kubernetes API accepts namespace cleanup, so a
+transient failure can be retried. Namespace deletion uses the fetched UID as a
+precondition to avoid deleting a replacement namespace. Requires a non-empty
+`gateway_id` (validated as a
+DNS-1123 label at startup) so the namespace prefix fits within the K8s 63-character
+limit. RBAC promotes sandbox CRD permissions to a ClusterRole and adds namespace
+`create`/`delete` and ServiceAccount `create`/`get` permissions.
+
+Secret copies use server-side apply. Kubernetes authorizes an apply to an
+existing Secret as `patch`, but also requires `create` authorization when the
+target does not exist. RBAC cannot constrain `create` by `resourceNames`, so
+managed mode grants cluster-wide Secret `create` while keeping source reads and
+subsequent patches restricted to the explicitly configured TLS and image-pull
+Secret names. The driver exercises `create` only in gateway-owned managed
+namespaces. This depends on the managed-mode ownership invariant described
+below; the gateway ServiceAccount must not be shared with unrelated workloads.
+
+Operator mode does not create NetworkPolicies or copy image-pull Secrets.
+Platform teams must apply the gateway ingress boundary and provision configured
+image-pull Secrets in every operator-managed namespace.
+
+**Operator** uses pre-provisioned namespaces discovered through two optional
+sources: a K8s label selector (`operator_namespace_label`) and a drop-in
+allowlist file (`operator_namespace_file`). At least one must be configured.
+The `OperatorNamespaceAllowlist` (`Arc<RwLock<BTreeSet<String>>>`) is populated
+at runtime by background watchers and read by the namespace resolver. Sandbox
+creation fails closed if the workspace is not in the current allowlist. Platform
+teams manage namespace lifecycle externally. RBAC uses the same ClusterRole as
+managed mode but without namespace `create`/`delete` or ServiceAccount
+permissions.
+
+### Watching and Querying
+
+Managed and operator modes set `is_multi_namespace() == true`, which switches
+sandbox CR watchers from namespace-scoped `Api::namespaced` to cluster-wide
+`Api::all_with`. In managed mode the driver scopes cluster-wide queries with a
+`LABEL_GATEWAY_ID` label selector to support multiple gateways on the same
+cluster. K8s Events are not watched in cluster-wide mode — the cluster-wide
+watcher emits only sandbox CR changes, not platform events.
+
+### SA Token Authentication
+
+The gateway's `K8sServiceAccountAuthenticator` adapts its `NamespaceValidator`
+per mode (`crates/openshell-server/src/auth/k8s_sa.rs`):
+
+- **Shared:** `Exact` — accepts only the single configured namespace.
+- **Managed:** `Prefix` — accepts any namespace starting with `openshell-{gateway_id}-`.
+- **Operator:** `Allowlist` — accepts namespaces present in the dynamic
+  `BTreeSet` populated by the label/file watchers. Starts empty (fail-closed)
+  until the first watcher update.
+
+These checks rely on an ownership invariant. In shared and managed modes, the
+gateway and its trusted Agent Sandbox controller exclusively administer the
+sandbox namespace, Sandbox CRs, sandbox pods, and configured sandbox
+ServiceAccount. Other principals must not create or mutate those resources or
+use that ServiceAccount. In operator mode, the platform operator retains
+namespace lifecycle ownership, but must preserve the same exclusive control of
+Sandbox CRs and the pods and ServiceAccount used for sandbox token bootstrap.
+An allowlisted namespace is therefore a trust grant, not a tenant isolation
+boundary. Kubernetes owner references alone do not prove which controller
+created a pod, so admitting principals that can fabricate that resource chain
+would allow them to claim an existing sandbox identity.
+
+### Credential Driver Integration
+
+The Kubernetes Secrets credential driver (`openshell-driver-kubernetes-secrets`)
+stores secrets in workspace-specific namespaces when `workspace_mode` is managed
+or operator. In shared mode, all secrets render into the single configured
+namespace.
+
 When runtime infrastructure changes, validate the relevant sandbox e2e path and
 update the matching driver README if a maintainer-facing constraint changes.

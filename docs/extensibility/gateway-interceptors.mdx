@@ -73,7 +73,9 @@ Start the interceptor before the gateway, then register it in gateway TOML:
 ```toml
 [[openshell.gateway.interceptors]]
 name               = "policy-governance"
-grpc_endpoint      = "http://127.0.0.1:18081"
+grpc_endpoint      = "https://governance.example:18081"
+tls_ca_cert_path   = "/etc/openshell/governance-ca.pem"
+audience           = "urn:example:governance"
 order              = 10
 failure_policy     = "fail_closed"
 binding_policy     = "allowlist"
@@ -90,7 +92,15 @@ rpc    = "openshell.v1.OpenShell/UpdateConfig"
 phases = ["validate"]
 ```
 
-The gateway supports `http://`, `https://`, and `unix://` interceptor endpoints. It calls `Describe` and builds an immutable execution plan during startup. An unavailable service, invalid manifest, or unauthorized configured binding prevents the gateway from starting.
+The gateway supports `http://`, `https://`, and `unix://` interceptor endpoints. When gateway JWT signing is configured, authenticated network interceptors use `https://`; Unix sockets remain available for local integrations. HTTPS uses platform trust roots unless `tls_ca_cert_path` supplies a private CA, and normal hostname verification remains enabled. The gateway calls `Describe` and builds an immutable execution plan during startup. An unavailable service, invalid manifest, missing credential, or unauthorized configured binding prevents the gateway from starting.
+
+The gateway attaches a short-lived EdDSA bearer token to `Describe`, `Evaluate`, and provider-profile snapshot calls. The token uses the configured `audience` (defaulting to `urn:openshell:extension:interceptor:<name>`) and `caller_kind: gateway`.
+
+Return your expected audience in the `expected_audience` field of your `Describe` manifest. After authenticated `Describe` succeeds, the gateway compares the advertised value with its operator-configured audience and refuses to start when they differ. This is a post-authentication consistency assertion, not audience discovery: a strict verifier may reject an incorrect audience before returning the manifest, in which case startup reports an authentication failure. Leave the field empty to skip the consistency check.
+
+Provision the trusted gateway URL, expected gateway ID, and public key or JWKS through the deployment. This operator-provisioned key material is the authoritative cold-start trust anchor. The expected issuer is exactly `openshell-gateway:<gateway_id>`; fetching JWKS does not establish that identity by itself. After initial trust is established, `GET /.well-known/openid-configuration` and its `jwks_uri` provide steady-state key refresh and operational convenience. The document is OIDC-shaped rather than OIDC-compliant because `issuer` is the gateway identity rather than the serving URL; compare `iss` against the configured value and fetch updates only over authenticated TLS at the trusted gateway URL. Pin `alg` to `EdDSA`, require `typ` to be exactly `openshell-ext+jwt`, and validate `kid`, signature, expected issuer, exact audience, positive expiry, and caller kind.
+
+Set `allow_insecure_transport = true` on an interceptor to keep a plaintext `http://` endpoint working with no credential attached. The gateway logs a warning naming the interceptor at every startup, and the service cannot distinguish the gateway from any other client that can reach it.
 
 Registration is static. Restart the gateway after adding, removing, or changing an interceptor. See [Gateway Configuration](/reference/gateway-config#gateway-interceptors) for the complete field reference.
 
@@ -163,5 +173,6 @@ The gateway emits structured evaluation logs containing the interceptor name, bi
 - Only explicitly allowlisted unary write RPCs are interceptable. New gateway RPCs are non-interceptable until added to the allowlist.
 - `current_state` is available only in the `validate` contract. The gateway does not yet populate it with method-specific state.
 - Registration changes require a gateway restart.
-- Custom TLS roots, client authentication, service health checks, and runtime registration are not available.
+- mTLS client authentication, service health checks, runtime registration, and overlapping signing-key rotation are not available.
+- Extension tokens and sandbox-to-gateway tokens are signed by the same key, separated by audience and `typ`. The extension credential path cannot yet be rotated or revoked independently of sandbox admission.
 - Interceptors cannot receive or mutate protobuf fields marked secret.

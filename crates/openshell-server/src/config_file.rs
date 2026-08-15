@@ -21,9 +21,11 @@
 //! values.
 
 use std::collections::BTreeMap;
+use std::io::Cursor;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
+use base64::Engine as _;
 use openshell_core::config::ComputeDriverKind;
 use openshell_core::proto::SupervisorMiddlewareService;
 use openshell_core::{
@@ -220,24 +222,98 @@ pub struct SupervisorFileSection {
 pub struct MiddlewareServiceFileConfig {
     /// Operator-facing name used for diagnostics.
     pub name: String,
-    /// Plaintext gRPC endpoint reachable by the gateway and supervisors.
+    /// HTTP or HTTPS gRPC endpoint reachable by the gateway and supervisors.
     pub grpc_endpoint: String,
-    /// Operator-owned body limit for every binding exposed by this service.
-    pub max_body_bytes: u64,
+    /// Optional PEM trust-root bundle for an HTTPS endpoint.
+    #[serde(default)]
+    pub tls_ca_cert_path: Option<PathBuf>,
+    /// Exact JWT audience for this service. Defaults to a kind-scoped value
+    /// derived from the registration name.
+    #[serde(default)]
+    pub audience: Option<String>,
+    /// Opt out of extension authentication for this registration, permitting a
+    /// plaintext `http://` endpoint with no bearer credential. Development and
+    /// trusted-network deployments only.
+    #[serde(default)]
+    pub allow_insecure_transport: bool,
+    /// Operator-owned logical payload limit for every binding exposed by this
+    /// service, including HTTP bodies and complete WebSocket messages.
+    #[serde(alias = "max_body_bytes")]
+    pub max_payload_bytes: u64,
     /// Default RPC timeout using an integer with an `ms` or `s` suffix.
     #[serde(default)]
     pub timeout: Option<String>,
 }
 
-impl From<&MiddlewareServiceFileConfig> for SupervisorMiddlewareService {
-    fn from(config: &MiddlewareServiceFileConfig) -> Self {
-        Self {
+impl TryFrom<&MiddlewareServiceFileConfig> for SupervisorMiddlewareService {
+    type Error = ConfigFileError;
+
+    fn try_from(config: &MiddlewareServiceFileConfig) -> Result<Self, Self::Error> {
+        let tls_ca_cert_pem = match &config.tls_ca_cert_path {
+            Some(path) => {
+                let pem =
+                    std::fs::read(path).map_err(|source| ConfigFileError::MiddlewareTlsCaRead {
+                        name: config.name.clone(),
+                        path: path.clone(),
+                        source,
+                    })?;
+                sanitize_ca_cert_pem(&config.name, path, &pem)?
+            }
+            None => Vec::new(),
+        };
+
+        Ok(Self {
             name: config.name.clone(),
             grpc_endpoint: config.grpc_endpoint.clone(),
-            max_body_bytes: config.max_body_bytes,
+            max_payload_bytes: config.max_payload_bytes,
             timeout: config.timeout.clone().unwrap_or_default(),
-        }
+            tls_ca_cert_pem,
+            audience: config
+                .audience
+                .as_deref()
+                .filter(|audience| !audience.is_empty())
+                .map_or_else(
+                    || format!("urn:openshell:extension:middleware:{}", config.name),
+                    ToString::to_string,
+                ),
+            allow_insecure_transport: config.allow_insecure_transport,
+        })
     }
+}
+
+fn sanitize_ca_cert_pem(name: &str, path: &Path, pem: &[u8]) -> Result<Vec<u8>, ConfigFileError> {
+    let mut sanitized = Vec::new();
+    let mut certificate_count = 0;
+    for item in rustls_pemfile::read_all(&mut Cursor::new(pem)) {
+        let item = item.map_err(|source| ConfigFileError::MiddlewareTlsCaInvalid {
+            name: name.to_string(),
+            path: path.to_path_buf(),
+            message: source.to_string(),
+        })?;
+        let rustls_pemfile::Item::X509Certificate(certificate) = item else {
+            return Err(ConfigFileError::MiddlewareTlsCaInvalid {
+                name: name.to_string(),
+                path: path.to_path_buf(),
+                message: "PEM bundle contains a non-certificate block".to_string(),
+            });
+        };
+        certificate_count += 1;
+        sanitized.extend_from_slice(b"-----BEGIN CERTIFICATE-----\n");
+        let encoded = base64::engine::general_purpose::STANDARD.encode(certificate.as_ref());
+        for line in encoded.as_bytes().chunks(64) {
+            sanitized.extend_from_slice(line);
+            sanitized.push(b'\n');
+        }
+        sanitized.extend_from_slice(b"-----END CERTIFICATE-----\n");
+    }
+    if certificate_count == 0 {
+        return Err(ConfigFileError::MiddlewareTlsCaInvalid {
+            name: name.to_string(),
+            path: path.to_path_buf(),
+            message: "PEM bundle does not contain a certificate".to_string(),
+        });
+    }
+    Ok(sanitized)
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -270,6 +346,25 @@ pub enum ConfigFileError {
     InvalidValue {
         field: &'static str,
         message: &'static str,
+    },
+    #[error(
+        "failed to read TLS CA certificate for supervisor middleware '{name}' from '{}': {source}",
+        path.display()
+    )]
+    MiddlewareTlsCaRead {
+        name: String,
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error(
+        "invalid TLS CA certificate for supervisor middleware '{name}' at '{}': {message}",
+        path.display()
+    )]
+    MiddlewareTlsCaInvalid {
+        name: String,
+        path: PathBuf,
+        message: String,
     },
 }
 
@@ -605,27 +700,175 @@ allow_unauthenticated_users = true
 
     #[test]
     fn parses_supervisor_middleware_registration() {
+        let certificate = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
+            .expect("test certificate");
+        let mut ca = tempfile::Builder::new()
+            .suffix(".pem")
+            .tempfile()
+            .expect("CA tempfile");
+        ca.write_all(certificate.cert.pem().as_bytes())
+            .expect("write CA");
         let toml = r#"
 [[openshell.supervisor.middleware]]
 name = "local-guard"
-grpc_endpoint = "http://127.0.0.1:50051"
-max_body_bytes = 262144
+grpc_endpoint = "https://127.0.0.1:50051"
+tls_ca_cert_path = "CA_PATH"
+audience = "urn:openshell:middleware:local-guard"
+max_payload_bytes = 262144
 timeout = "2s"
-"#;
-        let tmp = write_tmp(toml);
+"#
+        .replace("CA_PATH", &ca.path().display().to_string());
+        let tmp = write_tmp(&toml);
         let file = load(tmp.path()).expect("valid middleware registration parses");
         assert_eq!(
             file.openshell.supervisor.middleware,
             vec![MiddlewareServiceFileConfig {
                 name: "local-guard".into(),
-                grpc_endpoint: "http://127.0.0.1:50051".into(),
-                max_body_bytes: 262_144,
+                grpc_endpoint: "https://127.0.0.1:50051".into(),
+                tls_ca_cert_path: Some(ca.path().to_path_buf()),
+                audience: Some("urn:openshell:middleware:local-guard".into()),
+                allow_insecure_transport: false,
+                max_payload_bytes: 262_144,
                 timeout: Some("2s".into()),
             }]
         );
         let registration =
-            SupervisorMiddlewareService::from(&file.openshell.supervisor.middleware[0]);
+            SupervisorMiddlewareService::try_from(&file.openshell.supervisor.middleware[0])
+                .expect("valid CA resolves");
         assert_eq!(registration.timeout, "2s");
+        assert_eq!(
+            registration.tls_ca_cert_pem,
+            certificate.cert.pem().as_bytes()
+        );
+        assert_eq!(
+            registration.audience,
+            "urn:openshell:middleware:local-guard"
+        );
+    }
+
+    #[test]
+    fn middleware_registration_defaults_audience_to_name() {
+        let mut config = MiddlewareServiceFileConfig {
+            name: "local-guard".into(),
+            grpc_endpoint: "https://guard.example:50051".into(),
+            tls_ca_cert_path: None,
+            audience: None,
+            allow_insecure_transport: false,
+            max_payload_bytes: 262_144,
+            timeout: None,
+        };
+
+        let registration = SupervisorMiddlewareService::try_from(&config).unwrap();
+        assert_eq!(
+            registration.audience,
+            "urn:openshell:extension:middleware:local-guard"
+        );
+        assert!(registration.tls_ca_cert_pem.is_empty());
+
+        config.audience = Some(String::new());
+        let registration = SupervisorMiddlewareService::try_from(&config).unwrap();
+        assert_eq!(
+            registration.audience,
+            "urn:openshell:extension:middleware:local-guard"
+        );
+    }
+
+    #[test]
+    fn middleware_registration_rejects_invalid_ca_pem() {
+        let mut ca = tempfile::Builder::new()
+            .suffix(".pem")
+            .tempfile()
+            .expect("CA tempfile");
+        ca.write_all(b"not a certificate").expect("write CA");
+        let config = MiddlewareServiceFileConfig {
+            name: "local-guard".into(),
+            grpc_endpoint: "https://guard.example:50051".into(),
+            tls_ca_cert_path: Some(ca.path().to_path_buf()),
+            audience: None,
+            allow_insecure_transport: false,
+            max_payload_bytes: 262_144,
+            timeout: None,
+        };
+
+        let error = SupervisorMiddlewareService::try_from(&config)
+            .expect_err("invalid CA must fail before service connection");
+        assert!(matches!(
+            error,
+            ConfigFileError::MiddlewareTlsCaInvalid { .. }
+        ));
+    }
+
+    #[test]
+    fn middleware_registration_rejects_ca_bundle_with_private_key() {
+        use std::io::Write as _;
+
+        let certificate =
+            rcgen::generate_simple_self_signed(vec!["localhost".into()]).expect("test certificate");
+        let mut ca = tempfile::Builder::new()
+            .suffix(".pem")
+            .tempfile()
+            .expect("CA tempfile");
+        ca.write_all(certificate.cert.pem().as_bytes())
+            .expect("write certificate");
+        ca.write_all(certificate.key_pair.serialize_pem().as_bytes())
+            .expect("write private key");
+        let config = MiddlewareServiceFileConfig {
+            name: "local-guard".into(),
+            grpc_endpoint: "https://guard.example:50051".into(),
+            tls_ca_cert_path: Some(ca.path().to_path_buf()),
+            audience: None,
+            allow_insecure_transport: false,
+            max_payload_bytes: 262_144,
+            timeout: None,
+        };
+
+        let error = SupervisorMiddlewareService::try_from(&config)
+            .expect_err("private key material must never be distributed to a sandbox");
+        assert!(matches!(
+            error,
+            ConfigFileError::MiddlewareTlsCaInvalid { .. }
+        ));
+        assert!(error.to_string().contains("non-certificate block"));
+    }
+
+    #[test]
+    fn parses_gateway_interceptor_tls_and_audience() {
+        let tmp = write_tmp(
+            r#"
+[[openshell.gateway.interceptors]]
+name = "quota"
+grpc_endpoint = "https://quota.example:50051"
+tls_ca_cert_path = "/etc/openshell/quota-ca.pem"
+audience = "urn:openshell:interceptor:quota"
+"#,
+        );
+
+        let file = load(tmp.path()).expect("valid interceptor config parses");
+        let interceptor = &file.openshell.gateway.interceptors[0];
+        assert_eq!(
+            interceptor.tls_ca_cert_path.as_deref(),
+            Some(Path::new("/etc/openshell/quota-ca.pem"))
+        );
+        assert_eq!(
+            interceptor.resolved_audience(),
+            "urn:openshell:interceptor:quota"
+        );
+    }
+
+    #[test]
+    fn parses_legacy_supervisor_middleware_payload_limit() {
+        let toml = r#"
+[[openshell.supervisor.middleware]]
+name = "local-guard"
+grpc_endpoint = "http://127.0.0.1:50051"
+max_body_bytes = 262144
+"#;
+        let tmp = write_tmp(toml);
+        let file = load(tmp.path()).expect("legacy middleware registration parses");
+        assert_eq!(
+            file.openshell.supervisor.middleware[0].max_payload_bytes,
+            262_144
+        );
     }
 
     #[test]

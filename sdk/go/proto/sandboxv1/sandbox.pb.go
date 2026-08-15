@@ -1800,8 +1800,12 @@ type GetSandboxConfigResponse struct {
 	// are "fail_closed" and "retain_last_valid". Unknown or empty values must
 	// be treated as fail_closed by the supervisor.
 	PolicyValidationFailureMode string `protobuf:"bytes,11,opt,name=policy_validation_failure_mode,json=policyValidationFailureMode,proto3" json:"policy_validation_failure_mode,omitempty"`
-	unknownFields               protoimpl.UnknownFields
-	sizeCache                   protoimpl.SizeCache
+	// Whether this gateway can mint authenticated extension credentials.
+	// False also covers older gateways that do not advertise this capability;
+	// supervisors preserve their legacy unauthenticated connection behavior.
+	ExtensionAuthenticationEnabled bool `protobuf:"varint,12,opt,name=extension_authentication_enabled,json=extensionAuthenticationEnabled,proto3" json:"extension_authentication_enabled,omitempty"`
+	unknownFields                  protoimpl.UnknownFields
+	sizeCache                      protoimpl.SizeCache
 }
 
 func (x *GetSandboxConfigResponse) Reset() {
@@ -1911,6 +1915,13 @@ func (x *GetSandboxConfigResponse) GetPolicyValidationFailureMode() string {
 	return ""
 }
 
+func (x *GetSandboxConfigResponse) GetExtensionAuthenticationEnabled() bool {
+	if x != nil {
+		return x.ExtensionAuthenticationEnabled
+	}
+	return false
+}
+
 // Connection details for one operator-registered supervisor middleware service.
 // V1 supports plaintext and server-authenticated TLS gRPC.
 type SupervisorMiddlewareService struct {
@@ -1919,14 +1930,27 @@ type SupervisorMiddlewareService struct {
 	Name string `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
 	// gRPC endpoint reachable from the sandbox supervisor.
 	GrpcEndpoint string `protobuf:"bytes,2,opt,name=grpc_endpoint,json=grpcEndpoint,proto3" json:"grpc_endpoint,omitempty"`
-	// Operator-owned body limit applied to every binding exposed by the service.
-	MaxBodyBytes uint64 `protobuf:"varint,3,opt,name=max_body_bytes,json=maxBodyBytes,proto3" json:"max_body_bytes,omitempty"`
+	// Operator-owned logical payload limit applied to every binding exposed by
+	// the service. This caps HTTP bodies and complete WebSocket messages.
+	MaxPayloadBytes uint64 `protobuf:"varint,3,opt,name=max_payload_bytes,json=maxPayloadBytes,proto3" json:"max_payload_bytes,omitempty"`
 	// Default RPC timeout for this service. Empty uses the platform default of
 	// 500ms. Values use an integer with an `ms` or `s` suffix and must be
 	// between 10ms and 30s.
-	Timeout       string `protobuf:"bytes,4,opt,name=timeout,proto3" json:"timeout,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	Timeout string `protobuf:"bytes,4,opt,name=timeout,proto3" json:"timeout,omitempty"`
+	// PEM-encoded trust roots loaded by the gateway from the operator-configured
+	// tls_ca_cert_path. Empty uses the platform trust store.
+	TlsCaCertPem []byte `protobuf:"bytes,5,opt,name=tls_ca_cert_pem,json=tlsCaCertPem,proto3" json:"tls_ca_cert_pem,omitempty"`
+	// Exact JWT audience for this service. The gateway resolves an omitted
+	// operator value to a kind-scoped audience derived from the registration
+	// name before sending sandbox config.
+	Audience string `protobuf:"bytes,6,opt,name=audience,proto3" json:"audience,omitempty"`
+	// Operator opt-out from extension authentication for this registration.
+	// When true the service may use a plaintext endpoint and OpenShell attaches
+	// no bearer credential; supervisors must not request one. Intended only for
+	// trusted-network development deployments.
+	AllowInsecureTransport bool `protobuf:"varint,7,opt,name=allow_insecure_transport,json=allowInsecureTransport,proto3" json:"allow_insecure_transport,omitempty"`
+	unknownFields          protoimpl.UnknownFields
+	sizeCache              protoimpl.SizeCache
 }
 
 func (x *SupervisorMiddlewareService) Reset() {
@@ -1973,9 +1997,9 @@ func (x *SupervisorMiddlewareService) GetGrpcEndpoint() string {
 	return ""
 }
 
-func (x *SupervisorMiddlewareService) GetMaxBodyBytes() uint64 {
+func (x *SupervisorMiddlewareService) GetMaxPayloadBytes() uint64 {
 	if x != nil {
-		return x.MaxBodyBytes
+		return x.MaxPayloadBytes
 	}
 	return 0
 }
@@ -1985,6 +2009,27 @@ func (x *SupervisorMiddlewareService) GetTimeout() string {
 		return x.Timeout
 	}
 	return ""
+}
+
+func (x *SupervisorMiddlewareService) GetTlsCaCertPem() []byte {
+	if x != nil {
+		return x.TlsCaCertPem
+	}
+	return nil
+}
+
+func (x *SupervisorMiddlewareService) GetAudience() string {
+	if x != nil {
+		return x.Audience
+	}
+	return ""
+}
+
+func (x *SupervisorMiddlewareService) GetAllowInsecureTransport() bool {
+	if x != nil {
+		return x.AllowInsecureTransport
+	}
+	return false
 }
 
 var File_sandbox_proto protoreflect.FileDescriptor
@@ -2138,7 +2183,7 @@ const file_sandbox_proto_rawDesc = "" +
 	"\x05value\"\x86\x01\n" +
 	"\x10EffectiveSetting\x128\n" +
 	"\x05value\x18\x01 \x01(\v2\".openshell.sandbox.v1.SettingValueR\x05value\x128\n" +
-	"\x05scope\x18\x02 \x01(\x0e2\".openshell.sandbox.v1.SettingScopeR\x05scope\"\x87\x06\n" +
+	"\x05scope\x18\x02 \x01(\x0e2\".openshell.sandbox.v1.SettingScopeR\x05scope\"\xd1\x06\n" +
 	"\x18GetSandboxConfigResponse\x12;\n" +
 	"\x06policy\x18\x01 \x01(\v2#.openshell.sandbox.v1.SandboxPolicyR\x06policy\x12\x18\n" +
 	"\aversion\x18\x02 \x01(\rR\aversion\x12\x1f\n" +
@@ -2152,15 +2197,19 @@ const file_sandbox_proto_rawDesc = "" +
 	"\x1esupervisor_middleware_services\x18\t \x03(\v21.openshell.sandbox.v1.SupervisorMiddlewareServiceR\x1csupervisorMiddlewareServices\x12\x1c\n" +
 	"\tworkspace\x18\n" +
 	" \x01(\tR\tworkspace\x12C\n" +
-	"\x1epolicy_validation_failure_mode\x18\v \x01(\tR\x1bpolicyValidationFailureMode\x1ac\n" +
+	"\x1epolicy_validation_failure_mode\x18\v \x01(\tR\x1bpolicyValidationFailureMode\x12H\n" +
+	" extension_authentication_enabled\x18\f \x01(\bR\x1eextensionAuthenticationEnabled\x1ac\n" +
 	"\rSettingsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12<\n" +
-	"\x05value\x18\x02 \x01(\v2&.openshell.sandbox.v1.EffectiveSettingR\x05value:\x028\x01\"\x96\x01\n" +
+	"\x05value\x18\x02 \x01(\v2&.openshell.sandbox.v1.EffectiveSettingR\x05value:\x028\x01\"\x99\x02\n" +
 	"\x1bSupervisorMiddlewareService\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12#\n" +
-	"\rgrpc_endpoint\x18\x02 \x01(\tR\fgrpcEndpoint\x12$\n" +
-	"\x0emax_body_bytes\x18\x03 \x01(\x04R\fmaxBodyBytes\x12\x18\n" +
-	"\atimeout\x18\x04 \x01(\tR\atimeout*b\n" +
+	"\rgrpc_endpoint\x18\x02 \x01(\tR\fgrpcEndpoint\x12*\n" +
+	"\x11max_payload_bytes\x18\x03 \x01(\x04R\x0fmaxPayloadBytes\x12\x18\n" +
+	"\atimeout\x18\x04 \x01(\tR\atimeout\x12%\n" +
+	"\x0ftls_ca_cert_pem\x18\x05 \x01(\fR\ftlsCaCertPem\x12\x1a\n" +
+	"\baudience\x18\x06 \x01(\tR\baudience\x128\n" +
+	"\x18allow_insecure_transport\x18\a \x01(\bR\x16allowInsecureTransport*b\n" +
 	"\fSettingScope\x12\x1d\n" +
 	"\x19SETTING_SCOPE_UNSPECIFIED\x10\x00\x12\x19\n" +
 	"\x15SETTING_SCOPE_SANDBOX\x10\x01\x12\x18\n" +

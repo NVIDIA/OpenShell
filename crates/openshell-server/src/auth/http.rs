@@ -18,7 +18,7 @@
 use axum::{
     Json, Router,
     extract::{Query, State},
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, StatusCode, Uri},
     response::{Html, IntoResponse},
     routing::get,
 };
@@ -59,7 +59,102 @@ pub fn router(state: Arc<ServerState>) -> Router {
     Router::new()
         .route("/auth/connect", get(auth_connect))
         .route("/auth/oidc-config", get(oidc_config_handler))
+        .route("/.well-known/jwks.json", get(gateway_jwks_handler))
+        .route(
+            "/.well-known/openid-configuration",
+            get(gateway_discovery_handler),
+        )
         .with_state(state)
+}
+
+/// Publish OIDC-shaped discovery metadata for extension services.
+///
+/// This lets an extension be configured with only the trusted gateway URL:
+/// it learns the exact expected `iss` and the `jwks_uri` from one document
+/// instead of having both provisioned separately.
+///
+/// Like the equivalent Kubernetes endpoint, this is OIDC-shaped rather than
+/// OIDC-compliant: `issuer` is the gateway identity (`openshell-gateway:<id>`),
+/// not the URL this document is served from. Verifiers must compare `iss`
+/// against that value, and must not infer trust from the document's location
+/// alone. The serving TLS connection is what authenticates the gateway.
+async fn gateway_discovery_handler(
+    State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
+    uri: Uri,
+) -> impl IntoResponse {
+    gateway_discovery_response(
+        state.sandbox_jwt_authenticator.as_deref(),
+        &document_base_url(&headers, &uri),
+    )
+}
+
+/// Reconstruct the externally visible base URL for absolute discovery links.
+///
+/// HTTP/1.1 carries `Host`; HTTP/2 carries `:authority`, which axum surfaces
+/// on the request URI. A terminating proxy may report the original scheme in
+/// `X-Forwarded-Proto`; otherwise assume TLS, since the extension contract
+/// requires fetching this document over an authenticated connection.
+fn document_base_url(headers: &HeaderMap, uri: &Uri) -> Option<String> {
+    let authority = headers
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .filter(|host| !host.is_empty())
+        .map(ToString::to_string)
+        .or_else(|| uri.authority().map(ToString::to_string))?;
+    let scheme = headers
+        .get("x-forwarded-proto")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|proto| proto.split(',').next())
+        .map(str::trim)
+        .filter(|proto| !proto.is_empty())
+        .unwrap_or("https");
+    Some(format!("{scheme}://{authority}"))
+}
+
+fn gateway_discovery_response(
+    authenticator: Option<&crate::auth::sandbox_jwt::SandboxJwtAuthenticator>,
+    base_url: &Option<String>,
+) -> axum::response::Response {
+    let Some(authenticator) = authenticator else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let Some(base_url) = base_url else {
+        // Without a usable authority the `jwks_uri` cannot be absolute, and a
+        // relative value would be worse than none: a verifier could resolve it
+        // against the wrong origin.
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    Json(serde_json::json!({
+        "issuer": authenticator.issuer(),
+        "jwks_uri": format!("{base_url}/.well-known/jwks.json"),
+        "id_token_signing_alg_values_supported": ["EdDSA"],
+        "response_types_supported": ["id_token"],
+        "subject_types_supported": ["public"],
+        "scopes_supported": ["openid"],
+        "claims_supported": [
+            "iss", "aud", "sub", "iat", "exp", "jti", "caller_kind", "sandbox_id"
+        ],
+    }))
+    .into_response()
+}
+
+/// Publish the gateway's JWT verification key for extension services.
+///
+/// Public keys are not secret. The HTTPS connection authenticates the
+/// gateway from which an integration bootstraps this document; integrations
+/// then cache keys by `kid` and refresh when an unfamiliar `kid` appears.
+async fn gateway_jwks_handler(State(state): State<Arc<ServerState>>) -> impl IntoResponse {
+    gateway_jwks_response(state.sandbox_jwt_authenticator.as_deref())
+}
+
+fn gateway_jwks_response(
+    authenticator: Option<&crate::auth::sandbox_jwt::SandboxJwtAuthenticator>,
+) -> axum::response::Response {
+    authenticator.map_or_else(
+        || StatusCode::NOT_FOUND.into_response(),
+        |authenticator| Json(authenticator.jwks()).into_response(),
+    )
 }
 
 /// OIDC configuration discovery endpoint.
@@ -474,6 +569,8 @@ fn render_waiting_page(callback_port: u16, code: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::body::to_bytes;
+    use openshell_bootstrap::jwt::generate_jwt_key;
 
     #[test]
     fn extract_cookie_finds_value() {
@@ -585,5 +682,110 @@ mod tests {
         assert_eq!(html_escape("a&b"), "a&amp;b");
         assert_eq!(html_escape("a\"b"), "a&quot;b");
         assert_eq!(html_escape("a'b"), "a&#x27;b");
+    }
+
+    #[test]
+    fn jwks_response_publishes_configured_gateway_key() {
+        let material = generate_jwt_key().expect("key");
+        let authenticator = crate::auth::sandbox_jwt::SandboxJwtAuthenticator::from_pem(
+            material.public_key_pem.as_bytes(),
+            material.kid.clone(),
+            "gateway-a",
+        )
+        .expect("authenticator");
+
+        let response = gateway_jwks_response(Some(&authenticator));
+        assert_eq!(response.status(), StatusCode::OK);
+        let key = &authenticator.jwks().keys[0];
+        assert_eq!(key.kid, material.kid);
+        assert_eq!(key.kty, "OKP");
+        assert_eq!(key.crv, "Ed25519");
+        assert_eq!(key.alg, "EdDSA");
+        assert_eq!(key.key_use, "sig");
+    }
+
+    #[test]
+    fn jwks_response_is_not_found_without_gateway_key() {
+        assert_eq!(gateway_jwks_response(None).status(), StatusCode::NOT_FOUND);
+    }
+
+    fn test_authenticator() -> crate::auth::sandbox_jwt::SandboxJwtAuthenticator {
+        let material = generate_jwt_key().expect("key");
+        crate::auth::sandbox_jwt::SandboxJwtAuthenticator::from_pem(
+            material.public_key_pem.as_bytes(),
+            material.kid,
+            "gateway-a",
+        )
+        .expect("authenticator")
+    }
+
+    #[tokio::test]
+    async fn discovery_document_advertises_issuer_identity_and_absolute_jwks_uri() {
+        let authenticator = test_authenticator();
+        let response = gateway_discovery_response(
+            Some(&authenticator),
+            &Some("https://gateway.example:8443".to_string()),
+        );
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("body");
+        let document: serde_json::Value = serde_json::from_slice(&body).expect("json");
+
+        // The issuer is the gateway identity, not the serving URL. Extensions
+        // compare `iss` against this exact value.
+        assert_eq!(document["issuer"], "openshell-gateway:gateway-a");
+        assert_eq!(
+            document["jwks_uri"],
+            "https://gateway.example:8443/.well-known/jwks.json"
+        );
+        assert_eq!(
+            document["id_token_signing_alg_values_supported"][0],
+            "EdDSA"
+        );
+    }
+
+    #[test]
+    fn discovery_document_requires_a_key_and_a_resolvable_authority() {
+        assert_eq!(
+            gateway_discovery_response(None, &Some("https://gateway.example".to_string())).status(),
+            StatusCode::NOT_FOUND
+        );
+        // A relative jwks_uri could be resolved against the wrong origin, so
+        // refuse to emit a document rather than emit an ambiguous one.
+        assert_eq!(
+            gateway_discovery_response(Some(&test_authenticator()), &None).status(),
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[test]
+    fn base_url_prefers_host_header_and_honours_forwarded_scheme() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, "gateway.example:8443".parse().unwrap());
+        assert_eq!(
+            document_base_url(&headers, &Uri::from_static("/")),
+            Some("https://gateway.example:8443".to_string())
+        );
+
+        headers.insert("x-forwarded-proto", "http, https".parse().unwrap());
+        assert_eq!(
+            document_base_url(&headers, &Uri::from_static("/")),
+            Some("http://gateway.example:8443".to_string())
+        );
+
+        // HTTP/2 has no Host header; axum surfaces `:authority` on the URI.
+        assert_eq!(
+            document_base_url(
+                &HeaderMap::new(),
+                &Uri::from_static("https://h2.example/.well-known/openid-configuration")
+            ),
+            Some("https://h2.example".to_string())
+        );
+        assert_eq!(
+            document_base_url(&HeaderMap::new(), &Uri::from_static("/")),
+            None
+        );
     }
 }

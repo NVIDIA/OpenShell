@@ -230,11 +230,13 @@ preload_sandbox_image() {
     docker pull --platform "${platform}" "${PRELOAD_SANDBOX_IMAGE}"
   fi
 
+  # Save without --platform: the platform-specific pull already constrained the
+  # local image, and --platform fails on OCI index (multi-arch) manifests.
   tmp="$(mktemp "${TMPDIR:-/tmp}/openshell-sandbox-image.XXXXXX")"
-  if ! docker image save --platform "${platform}" -o "${tmp}" "${PRELOAD_SANDBOX_IMAGE}"; then
+  if ! docker image save -o "${tmp}" "${PRELOAD_SANDBOX_IMAGE}"; then
     echo "Pulling sandbox image for ${platform}..."
     docker pull --platform "${platform}" "${PRELOAD_SANDBOX_IMAGE}"
-    docker image save --platform "${platform}" -o "${tmp}" "${PRELOAD_SANDBOX_IMAGE}"
+    docker image save -o "${tmp}" "${PRELOAD_SANDBOX_IMAGE}"
   fi
 
   if ! k3d image import "${tmp}" --cluster "${CLUSTER_NAME}"; then

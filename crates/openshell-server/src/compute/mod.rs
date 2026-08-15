@@ -32,9 +32,10 @@ use futures::{Stream, StreamExt};
 use hyper_util::rt::TokioIo;
 use openshell_core::ComputeDriverKind;
 use openshell_core::proto::compute::v1::{
-    CreateSandboxRequest, DeleteSandboxRequest, DriverCondition, DriverPlatformEvent,
-    DriverResourceRequirements, DriverSandbox, DriverSandboxSpec, DriverSandboxStatus,
-    DriverSandboxTemplate, GatewayListenerRequirement as ProtoGatewayListenerRequirement,
+    CreateSandboxRequest, DeleteSandboxRequest, DeleteWorkspaceRequest, DeleteWorkspaceResponse,
+    DriverCondition, DriverPlatformEvent, DriverResourceRequirements, DriverSandbox,
+    DriverSandboxSpec, DriverSandboxStatus, DriverSandboxTemplate, EnsureWorkspaceRequest,
+    EnsureWorkspaceResponse, GatewayListenerRequirement as ProtoGatewayListenerRequirement,
     GetCapabilitiesRequest, GetGatewayListenerRequirementsRequest,
     GetGatewayListenerRequirementsResponse, GetSandboxRequest,
     GpuResourceRequirements as DriverGpuResourceRequirements, ListSandboxesRequest,
@@ -53,6 +54,7 @@ use openshell_driver_docker::DockerComputeDriver;
 #[cfg(not(target_os = "windows"))]
 use openshell_driver_kubernetes::{
     ComputeDriverService as KubernetesDriverService, KubernetesComputeDriver,
+    OperatorNamespaceAllowlist,
 };
 #[cfg(not(target_os = "windows"))]
 use openshell_driver_podman::{ComputeDriverService as PodmanDriverService, PodmanComputeDriver};
@@ -566,6 +568,22 @@ impl ComputeDriver for RemoteComputeDriver {
         let stream = response.into_inner();
         Ok(tonic::Response::new(Box::pin(stream)))
     }
+
+    async fn ensure_workspace(
+        &self,
+        request: Request<EnsureWorkspaceRequest>,
+    ) -> Result<tonic::Response<EnsureWorkspaceResponse>, Status> {
+        let mut client = self.client();
+        client.ensure_workspace(request).await
+    }
+
+    async fn delete_workspace(
+        &self,
+        request: Request<DeleteWorkspaceRequest>,
+    ) -> Result<tonic::Response<DeleteWorkspaceResponse>, Status> {
+        let mut client = self.client();
+        client.delete_workspace(request).await
+    }
 }
 
 #[derive(Clone)]
@@ -775,12 +793,14 @@ impl ComputeRuntime {
         sandbox_watch_bus: SandboxWatchBus,
         tracing_log_bus: TracingLogBus,
         supervisor_sessions: Arc<SupervisorSessionRegistry>,
-    ) -> Result<Self, ComputeError> {
-        let driver = KubernetesComputeDriver::new(config)
+        shutdown_rx: watch::Receiver<bool>,
+    ) -> Result<(Self, Option<OperatorNamespaceAllowlist>), ComputeError> {
+        let driver = KubernetesComputeDriver::new(config, shutdown_rx)
             .await
             .map_err(|err| ComputeError::Message(err.to_string()))?;
+        let operator_allowlist_arc = driver.operator_allowlist().cloned();
         let driver: SharedComputeDriver = Arc::new(KubernetesDriverService::new(driver));
-        Self::from_driver(
+        let runtime = Self::from_driver(
             ComputeDriverKind::Kubernetes.as_str().to_string(),
             driver,
             None,
@@ -792,7 +812,8 @@ impl ComputeRuntime {
             tracing_log_bus,
             supervisor_sessions,
         )
-        .await
+        .await?;
+        Ok((runtime, operator_allowlist_arc))
     }
 
     pub(crate) async fn new_remote_driver(
@@ -865,6 +886,40 @@ impl ComputeRuntime {
     #[must_use]
     pub(crate) fn gateway_listener_requirements(&self) -> &[GatewayListenerRequirement] {
         &self.gateway_listener_requirements
+    }
+
+    pub(crate) async fn ensure_workspace(&self, workspace: &str) -> Result<(), Status> {
+        let workspace = workspace.to_string();
+        match self
+            .driver
+            .call("driver.ensure_workspace", None, |driver| async move {
+                driver
+                    .ensure_workspace(Request::new(EnsureWorkspaceRequest { workspace }))
+                    .await
+            })
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(status) if status.code() == Code::Unimplemented => Ok(()),
+            Err(status) => Err(status),
+        }
+    }
+
+    pub(crate) async fn delete_workspace(&self, workspace: &str) -> Result<(), Status> {
+        let workspace = workspace.to_string();
+        match self
+            .driver
+            .call("driver.delete_workspace", None, |driver| async move {
+                driver
+                    .delete_workspace(Request::new(DeleteWorkspaceRequest { workspace }))
+                    .await
+            })
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(status) if status.code() == Code::Unimplemented => Ok(()),
+            Err(status) => Err(status),
+        }
     }
 
     pub async fn validate_sandbox_create(&self, sandbox: &Sandbox) -> Result<(), Status> {
@@ -3770,7 +3825,18 @@ fn is_terminal_failure_reason(reason: &str) -> bool {
 
 #[cfg(test)]
 #[derive(Debug, Default)]
-pub struct NoopTestDriver;
+pub struct NoopTestDriver {
+    workspace_delete_failures: std::sync::atomic::AtomicUsize,
+}
+
+#[cfg(test)]
+impl NoopTestDriver {
+    pub fn failing_workspace_deletes(count: usize) -> Self {
+        Self {
+            workspace_delete_failures: std::sync::atomic::AtomicUsize::new(count),
+        }
+    }
+}
 
 #[cfg(test)]
 #[tonic::async_trait]
@@ -3878,6 +3944,31 @@ impl ComputeDriver for NoopTestDriver {
     ) -> Result<tonic::Response<Self::WatchSandboxesStream>, Status> {
         Ok(tonic::Response::new(Box::pin(futures::stream::empty())))
     }
+
+    async fn ensure_workspace(
+        &self,
+        _request: Request<EnsureWorkspaceRequest>,
+    ) -> Result<tonic::Response<EnsureWorkspaceResponse>, Status> {
+        Ok(tonic::Response::new(EnsureWorkspaceResponse {}))
+    }
+
+    async fn delete_workspace(
+        &self,
+        _request: Request<DeleteWorkspaceRequest>,
+    ) -> Result<tonic::Response<DeleteWorkspaceResponse>, Status> {
+        if self
+            .workspace_delete_failures
+            .fetch_update(
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+                |remaining| remaining.checked_sub(1),
+            )
+            .is_ok()
+        {
+            return Err(Status::unavailable("injected workspace cleanup failure"));
+        }
+        Ok(tonic::Response::new(DeleteWorkspaceResponse {}))
+    }
 }
 
 #[cfg(test)]
@@ -3887,8 +3978,17 @@ pub async fn new_test_runtime(store: Arc<Store>) -> ComputeRuntime {
 
 #[cfg(test)]
 pub async fn new_test_runtime_for_driver(store: Arc<Store>, driver_name: &str) -> ComputeRuntime {
+    new_test_runtime_with_driver(store, driver_name, Arc::new(NoopTestDriver::default())).await
+}
+
+#[cfg(test)]
+pub async fn new_test_runtime_with_driver(
+    store: Arc<Store>,
+    driver_name: &str,
+    driver: Arc<NoopTestDriver>,
+) -> ComputeRuntime {
     ComputeRuntime {
-        driver: TracedDriver::new(Arc::new(NoopTestDriver), "test".to_string()),
+        driver: TracedDriver::new(driver, "test".to_string()),
         driver_info: ComputeDriverInfoSnapshot {
             name: driver_name.to_string(),
             driver_name: driver_name.to_string(),
@@ -4042,6 +4142,7 @@ mod tests {
     struct TestDriver {
         listed_sandboxes: Vec<DriverSandbox>,
         current_sandboxes: Vec<DriverSandbox>,
+        workspace_rpcs_unimplemented: bool,
     }
 
     #[tonic::async_trait]
@@ -4155,6 +4256,38 @@ mod tests {
         ) -> Result<tonic::Response<Self::WatchSandboxesStream>, Status> {
             Ok(tonic::Response::new(Box::pin(stream::empty())))
         }
+
+        async fn ensure_workspace(
+            &self,
+            _request: Request<EnsureWorkspaceRequest>,
+        ) -> Result<tonic::Response<EnsureWorkspaceResponse>, Status> {
+            if self.workspace_rpcs_unimplemented {
+                return Err(Status::unimplemented("workspace lifecycle is unsupported"));
+            }
+            Ok(tonic::Response::new(EnsureWorkspaceResponse {}))
+        }
+
+        async fn delete_workspace(
+            &self,
+            _request: Request<DeleteWorkspaceRequest>,
+        ) -> Result<tonic::Response<DeleteWorkspaceResponse>, Status> {
+            if self.workspace_rpcs_unimplemented {
+                return Err(Status::unimplemented("workspace lifecycle is unsupported"));
+            }
+            Ok(tonic::Response::new(DeleteWorkspaceResponse {}))
+        }
+    }
+
+    #[tokio::test]
+    async fn workspace_lifecycle_allows_legacy_driver_without_workspace_rpcs() {
+        let runtime = test_runtime(Arc::new(TestDriver {
+            workspace_rpcs_unimplemented: true,
+            ..Default::default()
+        }))
+        .await;
+
+        runtime.ensure_workspace("legacy").await.unwrap();
+        runtime.delete_workspace("legacy").await.unwrap();
     }
 
     #[derive(Clone)]
@@ -4480,6 +4613,20 @@ mod tests {
             Ok(tonic::Response::new(Box::pin(
                 UnboundedReceiverStream::new(receiver),
             )))
+        }
+
+        async fn ensure_workspace(
+            &self,
+            _request: Request<EnsureWorkspaceRequest>,
+        ) -> Result<tonic::Response<EnsureWorkspaceResponse>, Status> {
+            Ok(tonic::Response::new(EnsureWorkspaceResponse {}))
+        }
+
+        async fn delete_workspace(
+            &self,
+            _request: Request<DeleteWorkspaceRequest>,
+        ) -> Result<tonic::Response<DeleteWorkspaceResponse>, Status> {
+            Ok(tonic::Response::new(DeleteWorkspaceResponse {}))
         }
     }
 
@@ -5246,6 +5393,20 @@ mod tests {
                 request: Request<WatchSandboxesRequest>,
             ) -> Result<tonic::Response<Self::WatchSandboxesStream>, Status> {
                 self.0.watch_sandboxes(request).await
+            }
+
+            async fn ensure_workspace(
+                &self,
+                request: Request<EnsureWorkspaceRequest>,
+            ) -> Result<tonic::Response<EnsureWorkspaceResponse>, Status> {
+                self.0.ensure_workspace(request).await
+            }
+
+            async fn delete_workspace(
+                &self,
+                request: Request<DeleteWorkspaceRequest>,
+            ) -> Result<tonic::Response<DeleteWorkspaceResponse>, Status> {
+                self.0.delete_workspace(request).await
             }
         }
 
@@ -7487,6 +7648,7 @@ mod tests {
     #[tokio::test]
     async fn reconcile_store_with_backend_applies_driver_snapshot() {
         let runtime = test_runtime(Arc::new(TestDriver {
+            workspace_rpcs_unimplemented: false,
             listed_sandboxes: vec![DriverSandbox {
                 id: "sb-1".to_string(),
                 name: "sandbox-a".to_string(),
@@ -7674,6 +7836,7 @@ mod tests {
     #[tokio::test]
     async fn reconcile_store_with_backend_does_not_recreate_missing_record_from_snapshot() {
         let runtime = test_runtime(Arc::new(TestDriver {
+            workspace_rpcs_unimplemented: false,
             listed_sandboxes: vec![DriverSandbox {
                 id: "sb-1".to_string(),
                 name: "sandbox-a".to_string(),

@@ -208,6 +208,13 @@ tests:
           path: data["gateway.toml"]
           pattern: '(?ms)\[openshell\.drivers\.kubernetes\.sidecar\].*?process_binary_aware_network_policy\s*=\s*false'
 
+  - it: configures managed SSH isolation with the gateway peer
+    template: templates/gateway-config.yaml
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.drivers\.kubernetes\.managed_ssh_ingress\].*?enabled\s*=\s*true.*?gateway_namespace\s*=\s*"my-namespace".*?gateway_pod_selector\s*=.*?app\.kubernetes\.io/name.*?openshell'
+
   - it: renders sandbox image pull secrets under [openshell.drivers.kubernetes]
     template: templates/gateway-config.yaml
     set:

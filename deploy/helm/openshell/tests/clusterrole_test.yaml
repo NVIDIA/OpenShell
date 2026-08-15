@@ -1,0 +1,124 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+suite: ClusterRole RBAC
+templates:
+  - templates/clusterrole.yaml
+release:
+  name: openshell
+  namespace: my-namespace
+
+tests:
+  - it: grants managed namespace NetworkPolicy apply permissions
+    set:
+      server.drivers.kubernetes.workspaceMode: managed
+    asserts:
+      - contains:
+          path: rules
+          content:
+            apiGroups: ["networking.k8s.io"]
+            resources: ["networkpolicies"]
+            verbs: ["get", "create", "patch", "update"]
+
+  - it: omits managed NetworkPolicy permissions when isolation is disabled
+    set:
+      server.drivers.kubernetes.workspaceMode: managed
+      networkPolicy.enabled: false
+    asserts:
+      - notContains:
+          path: rules
+          content:
+            apiGroups: ["networking.k8s.io"]
+            resources: ["networkpolicies"]
+          any: true
+
+  - it: grants broad secret access when credential driver is enabled (operator)
+    set:
+      server.drivers.kubernetes.workspaceMode: operator
+      server.credentialDrivers.kubernetesSecrets.enabled: true
+    asserts:
+      - contains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: ["secrets"]
+            verbs: ["get", "create", "patch", "delete"]
+
+  - it: restricts operator TLS sync to the configured secret
+    set:
+      server.drivers.kubernetes.workspaceMode: operator
+      server.tls.clientTlsSecretName: custom-client-tls
+    asserts:
+      - contains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: ["secrets"]
+            resourceNames: ["custom-client-tls"]
+            verbs: ["get", "patch"]
+
+  - it: omits operator secret access when TLS and credential storage are disabled
+    set:
+      server.drivers.kubernetes.workspaceMode: operator
+      server.disableTls: true
+    asserts:
+      - notContains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: ["secrets"]
+          any: true
+
+  - it: restricts managed copies to TLS and configured image-pull secrets
+    set:
+      server.drivers.kubernetes.workspaceMode: managed
+      server.tls.clientTlsSecretName: custom-client-tls
+      server.sandboxImagePullSecrets:
+        - name: registry-one
+        - name: registry-two
+    asserts:
+      - contains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: ["secrets"]
+            resourceNames: ["custom-client-tls", "registry-one", "registry-two"]
+            verbs: ["get", "patch"]
+      - contains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: ["secrets"]
+            verbs: ["create"]
+
+  - it: restricts managed copies to image-pull secrets when TLS is disabled
+    set:
+      server.drivers.kubernetes.workspaceMode: managed
+      server.disableTls: true
+      server.sandboxImagePullSecrets:
+        - name: registry-one
+    asserts:
+      - contains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: ["secrets"]
+            resourceNames: ["registry-one"]
+            verbs: ["get", "patch"]
+      - contains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: ["secrets"]
+            verbs: ["create"]
+
+  - it: omits secrets rule entirely in shared mode
+    set:
+      server.drivers.kubernetes.workspaceMode: shared
+    asserts:
+      - notContains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: ["secrets"]
+          any: true

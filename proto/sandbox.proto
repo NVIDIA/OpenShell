@@ -382,6 +382,10 @@ message GetSandboxConfigResponse {
   // are "fail_closed" and "retain_last_valid". Unknown or empty values must
   // be treated as fail_closed by the supervisor.
   string policy_validation_failure_mode = 11;
+  // Whether this gateway can mint authenticated extension credentials.
+  // False also covers older gateways that do not advertise this capability;
+  // supervisors preserve their legacy unauthenticated connection behavior.
+  bool extension_authentication_enabled = 12;
 }
 
 // Connection details for one operator-registered supervisor middleware service.
@@ -391,10 +395,23 @@ message SupervisorMiddlewareService {
   string name = 1;
   // gRPC endpoint reachable from the sandbox supervisor.
   string grpc_endpoint = 2;
-  // Operator-owned body limit applied to every binding exposed by the service.
-  uint64 max_body_bytes = 3;
+  // Operator-owned logical payload limit applied to every binding exposed by
+  // the service. This caps HTTP bodies and complete WebSocket messages.
+  uint64 max_payload_bytes = 3;
   // Default RPC timeout for this service. Empty uses the platform default of
   // 500ms. Values use an integer with an `ms` or `s` suffix and must be
   // between 10ms and 30s.
   string timeout = 4;
+  // PEM-encoded trust roots loaded by the gateway from the operator-configured
+  // tls_ca_cert_path. Empty uses the platform trust store.
+  bytes tls_ca_cert_pem = 5;
+  // Exact JWT audience for this service. The gateway resolves an omitted
+  // operator value to a kind-scoped audience derived from the registration
+  // name before sending sandbox config.
+  string audience = 6;
+  // Operator opt-out from extension authentication for this registration.
+  // When true the service may use a plaintext endpoint and OpenShell attaches
+  // no bearer credential; supervisors must not request one. Intended only for
+  // trusted-network development deployments.
+  bool allow_insecure_transport = 7;
 }
