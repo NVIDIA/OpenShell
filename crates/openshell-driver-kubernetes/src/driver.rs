@@ -3048,11 +3048,15 @@ fn apply_supervisor_sidecar_topology(
 /// The init container mounts the PVC at a temporary path so it can still see
 /// the image's `/sandbox` directory.  It checks for a sentinel file and skips
 /// the copy if the PVC was already initialised.
+///
+/// Seeded content is written as `sandbox_uid`/`sandbox_gid` so the workload can
+/// use it.  See the extended note on the tar invocation below.
 #[allow(clippy::similar_names)]
 fn apply_workspace_persistence(
     pod_template: &mut serde_json::Value,
     image: &str,
     image_pull_policy: &str,
+    sandbox_uid: u32,
     sandbox_gid: u32,
 ) {
     let Some(spec) = pod_template.get_mut("spec").and_then(|v| v.as_object_mut()) else {
@@ -3110,8 +3114,24 @@ fn apply_workspace_persistence(
         // is valid. `tar` copies the tree without dereferencing those links.
         // Archive only the contents, not the `/sandbox` directory entry
         // itself, so extraction never tries to chmod the PVC mount root.
-        // Extract without restoring owner, mode, or timestamps so the
-        // non-root init container can seed kubelet-owned PVCs.
+        //
+        // Ownership is rewritten to the resolved sandbox identity while
+        // *building* the archive (`--owner`/`--group`/`--numeric-owner`), and
+        // extraction then restores it. Seeding as root with `--no-same-owner`
+        // used to leave every seeded path owned by uid 0; a mode-0700 home
+        // directory from the image (`~/.config`, `~/.cache`) was then
+        // unreachable for the workload. `fsGroup` does not compensate: kubelet
+        // applies it when the volume is mounted, which is before this init
+        // container writes anything.
+        //
+        // Rewriting at archive time — rather than extracting as the sandbox
+        // user, or chowning the tree afterwards — keeps root's ability to read
+        // every source path, so images that ship root-owned private content
+        // still seed. It also avoids a recursive chown over the workspace, the
+        // pattern that broke on read-only submounts in #2294.
+        //
+        // Modes and timestamps are still not restored, so a nested read-only
+        // mount under the PVC is never chmod'ed during seeding.
         //
         // The inner `[ -d ... ]` guard handles custom images that don't have
         // a /sandbox directory — the copy is skipped but the sentinel is
@@ -3120,9 +3140,9 @@ fn apply_workspace_persistence(
             "if [ ! -f {WORKSPACE_INIT_MOUNT_PATH}/{WORKSPACE_SENTINEL} ]; then \
                if [ -d {WORKSPACE_MOUNT_PATH} ]; then \
                  tmp=$(mktemp) && rm -f \"$tmp\" && \
-                   (cd {WORKSPACE_MOUNT_PATH} && find . -mindepth 1 -maxdepth 1 -exec tar -cf \"$tmp\" {{}} +) && \
+                   (cd {WORKSPACE_MOUNT_PATH} && find . -mindepth 1 -maxdepth 1 -exec tar --owner={sandbox_uid} --group={sandbox_gid} --numeric-owner -cf \"$tmp\" {{}} +) && \
                    if [ -f \"$tmp\" ]; then \
-                     tar -C {WORKSPACE_INIT_MOUNT_PATH} --no-same-owner --no-same-permissions --touch -xf \"$tmp\" && \
+                     tar -C {WORKSPACE_INIT_MOUNT_PATH} --numeric-owner --no-same-permissions --touch -xf \"$tmp\" && \
                      rm -f \"$tmp\"; \
                    fi; \
                fi && \
@@ -3756,6 +3776,7 @@ fn sandbox_template_to_k8s_with_validated_config(
             &mut result,
             image,
             params.image_pull_policy,
+            params.sandbox_uid,
             params.sandbox_gid,
         );
     }
@@ -6562,6 +6583,7 @@ mod tests {
             &mut pod_template,
             "openshell/sandbox:latest",
             "IfNotPresent",
+            1000, // sandbox_uid
             1000, // sandbox_gid
         );
 
@@ -6622,6 +6644,7 @@ mod tests {
             "my-custom-image:v2",
             "IfNotPresent",
             1000,
+            1000,
         );
 
         let init_image = pod_template["spec"]["initContainers"][0]["image"]
@@ -6644,7 +6667,7 @@ mod tests {
             }
         });
 
-        apply_workspace_persistence(&mut pod_template, "img:latest", "Always", 1000);
+        apply_workspace_persistence(&mut pod_template, "img:latest", "Always", 1000, 1000);
 
         let cmd = pod_template["spec"]["initContainers"][0]["command"]
             .as_array()
@@ -6663,10 +6686,89 @@ mod tests {
             "init script must archive sandbox contents without the mount root entry"
         );
         assert!(
-            script.contains("--no-same-owner")
-                && script.contains("--no-same-permissions")
-                && script.contains("--touch"),
-            "init script must avoid restoring metadata onto the PVC root"
+            script.contains("--no-same-permissions") && script.contains("--touch"),
+            "init script must not restore modes or timestamps onto the PVC"
+        );
+    }
+
+    /// Regression: seeding the PVC as root with `--no-same-owner` left every
+    /// seeded path owned by uid 0, so a mode-0700 home directory from the
+    /// image (`~/.config`, `~/.cache`) was unreachable for the workload.
+    /// Ownership must be rewritten to the resolved sandbox identity instead.
+    #[test]
+    fn workspace_init_seeds_content_owned_by_the_sandbox_identity() {
+        let mut pod_template = serde_json::json!({
+            "spec": {
+                "containers": [{
+                    "name": "agent",
+                    "image": "img:latest"
+                }]
+            }
+        });
+
+        apply_workspace_persistence(&mut pod_template, "img:latest", "Always", 1234, 5678);
+
+        let script = pod_template["spec"]["initContainers"][0]["command"][2]
+            .as_str()
+            .expect("init script should be the third command element")
+            .to_string();
+
+        assert!(
+            script.contains("--owner=1234") && script.contains("--group=5678"),
+            "init script must rewrite seeded ownership to the resolved sandbox identity, got: {script}"
+        );
+        assert!(
+            script.contains("--numeric-owner"),
+            "ownership rewrite must be numeric so it does not depend on image account files"
+        );
+        assert!(
+            !script.contains("--no-same-owner"),
+            "extraction must restore the rewritten ownership, not discard it"
+        );
+        assert!(
+            !script.contains("chown"),
+            "seeding must not chown the workspace tree — that pattern broke on \
+             read-only submounts (#2294)"
+        );
+    }
+
+    /// The seeded identity must track the driver-resolved UID/GID rather than
+    /// a hardcoded 1000, so images built for a different UID range (or an
+    /// OpenShift-allocated one) still produce a usable workspace.
+    #[test]
+    fn workspace_init_ownership_tracks_resolved_identity() {
+        let params = SandboxPodParams {
+            sandbox_uid: 1_000_660_000,
+            sandbox_gid: 1_000_660_000,
+            ..SandboxPodParams::default()
+        };
+
+        let pod_template = sandbox_template_to_k8s(
+            &SandboxTemplate {
+                image: "img:latest".to_string(),
+                ..SandboxTemplate::default()
+            },
+            false,
+            &std::collections::HashMap::new(),
+            true,
+            &params,
+        );
+
+        let init_containers = pod_template["spec"]["initContainers"]
+            .as_array()
+            .expect("initContainers should exist");
+        let workspace_init = init_containers
+            .iter()
+            .find(|c| c["name"] == WORKSPACE_INIT_CONTAINER_NAME)
+            .expect("workspace init container should exist");
+
+        let script = workspace_init["command"][2]
+            .as_str()
+            .expect("init script should be the third command element");
+
+        assert!(
+            script.contains("--owner=1000660000") && script.contains("--group=1000660000"),
+            "seeded ownership must follow the resolved sandbox identity, got: {script}"
         );
     }
 
