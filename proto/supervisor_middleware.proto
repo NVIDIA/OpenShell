@@ -280,6 +280,8 @@ message RequestContext {
   string sandbox_id = 2;
   // Workload process that originated the request, when available.
   Process originating_process = 3;
+  // Sandbox name that originated the request.
+  string sandbox_name = 4;
 }
 
 // HttpRequestTarget describes the admitted HTTP destination and request target.

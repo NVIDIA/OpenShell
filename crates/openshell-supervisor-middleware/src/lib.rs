@@ -437,6 +437,7 @@ pub enum TransformedBodyPolicy<'a> {
 pub struct HttpRequestInput {
     pub request_id: String,
     pub sandbox_id: String,
+    pub sandbox_name: String,
     pub scheme: String,
     pub host: String,
     pub port: u16,
@@ -1581,6 +1582,7 @@ impl ChainRunner {
         let HttpRequestInput {
             request_id,
             sandbox_id,
+            sandbox_name,
             scheme,
             host,
             port,
@@ -1597,6 +1599,7 @@ impl ChainRunner {
         let context = RequestContext {
             request_id,
             sandbox_id,
+            sandbox_name,
             originating_process: None,
         };
         let target = HttpRequestTarget {
@@ -2047,7 +2050,8 @@ mod tests {
     fn input(body: &str) -> HttpRequestInput {
         HttpRequestInput {
             request_id: "req".into(),
-            sandbox_id: "sbx".into(),
+            sandbox_id: "sbx-id".into(),
+            sandbox_name: "sbx-name".into(),
             scheme: "https".into(),
             host: "api.example.com".into(),
             port: 443,
@@ -3215,7 +3219,8 @@ mod tests {
         assert_eq!(received[0].config.as_ref(), Some(&evaluation_config));
         let context = received[0].context.as_ref().expect("request context");
         assert_eq!(context.request_id, "req");
-        assert_eq!(context.sandbox_id, "sbx");
+        assert_eq!(context.sandbox_id, "sbx-id");
+        assert_eq!(context.sandbox_name, "sbx-name");
         assert!(context.originating_process.is_none());
         let target = received[0].target.as_ref().expect("request target");
         assert_eq!(target.scheme, "https");
