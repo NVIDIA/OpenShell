@@ -37,6 +37,9 @@ tempfile = { version = "3", optional = true }
 nix = { workspace = true }
 rustix = { workspace = true }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+container-device-interface = { workspace = true }
+
 [features]
 default = ["telemetry"]
 ## Compile in anonymous telemetry emission support. On by default; disable with
