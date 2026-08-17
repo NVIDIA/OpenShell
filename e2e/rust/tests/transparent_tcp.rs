@@ -23,6 +23,14 @@ fn write_policy() -> Result<NamedTempFile, String> {
 }
 
 fn write_policy_for(host: &str) -> Result<NamedTempFile, String> {
+    write_policy_for_identity(host, "sandbox", "sandbox")
+}
+
+fn write_policy_for_identity(
+    host: &str,
+    run_as_user: &str,
+    run_as_group: &str,
+) -> Result<NamedTempFile, String> {
     let mut file = NamedTempFile::new().map_err(|error| format!("create policy: {error}"))?;
     let policy = format!(
         r#"version: 1
@@ -31,7 +39,7 @@ filesystem_policy:
   read_only: [/usr, /lib, /proc, /dev/urandom, /app, /etc, /var/log]
   read_write: [/sandbox, /tmp, /dev/null]
 landlock: {{ compatibility: best_effort }}
-process: {{ run_as_user: sandbox, run_as_group: sandbox }}
+process: {{ run_as_user: {run_as_user}, run_as_group: {run_as_group} }}
 network_policies:
   native_database:
     name: native_database
@@ -77,17 +85,20 @@ while True:
     .await
     .expect("start musl TCP fixture");
 
-    let image = tempfile::tempdir().expect("create Alpine build context");
-    std::fs::write(
-        image.path().join("Dockerfile"),
-        "FROM docker.io/library/alpine:3.22\nRUN addgroup -g 1000 sandbox && adduser -D -u 1000 -G sandbox sandbox\n",
-    )
-    .expect("write Alpine Dockerfile");
-    let policy = write_policy_for(MUSL_FIXTURE_ALIAS).expect("write musl policy");
+    // Use the registry image directly so the Podman gateway can pull it. A
+    // local --from build is performed by the CLI's Docker daemon and is not
+    // visible in Podman's separate image store.
+    let policy =
+        write_policy_for_identity(MUSL_FIXTURE_ALIAS, "65534", "65534").expect("write musl policy");
     let policy_path = policy.path().to_string_lossy().into_owned();
-    let image_path = image.path().to_string_lossy().into_owned();
     let mut sandbox = SandboxGuard::create_keep_with_args(
-        &["--from", &image_path, "--policy", &policy_path, "--no-tty"],
+        &[
+            "--from",
+            "docker.io/library/alpine:3.22",
+            "--policy",
+            &policy_path,
+            "--no-tty",
+        ],
         &["sh", "-c", "echo Ready; sleep infinity"],
         "Ready",
     )

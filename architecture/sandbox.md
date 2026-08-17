@@ -100,10 +100,11 @@ previous policy active; recreating the sandbox installs the substrate before
 the workload starts. A sandbox that started with the substrate may continue to
 remove and re-add TCP endpoints through ordinary atomic policy reloads.
 Workload DNS targets port 53, while nftables redirects eligible IPv4 DNS traffic
-to an unprivileged supervisor listener. The filter admits only TCP that the
-kernel records as DNATed to the transparent listener; `SO_ORIGINAL_DST`,
-synthetic mapping lookup, endpoint correlation, and generation-pinned
-authorization form the security boundary.
+to an unprivileged supervisor listener. The filter admits DNS and transparent
+TCP only when the kernel records the traffic as DNATed to the corresponding
+supervisor listener, so direct dials to either unprivileged listener port remain
+fenced. `SO_ORIGINAL_DST`, synthetic mapping lookup, endpoint correlation, and
+generation-pinned authorization form the transparent TCP security boundary.
 Docker and Podman do not currently advertise usable IPv6 egress for this
 substrate, so AAAA queries return NOERROR/NODATA and IPv6 DNS remains fenced.
 
