@@ -536,6 +536,9 @@ gateway_pod_selector = { "app.kubernetes.io/name" = "openshell", "app.kubernetes
 [openshell.drivers.kubernetes.warm_pooling]
 # When enabled, compatible creates may use v1beta1 SandboxClaim resources
 # backed by the driver's cache of OpenShell-enabled SandboxWarmPool resources.
+# Requires the Agent Sandbox extensions.yaml APIs. If they are unavailable at
+# gateway startup, OpenShell disables warm pooling and template reconciliation
+# for this driver instance and falls back to direct Sandbox creation.
 enabled = true
 
 [openshell.drivers.kubernetes.warm_pooling.templates]
