@@ -462,6 +462,13 @@ OpenShell workspace. The current shared-namespace mapping selects the configured
 `openshell.drivers.kubernetes.warm_pooling.enabled = false` to force direct
 `Sandbox` creation.
 
+Warm pooling requires the Agent Sandbox extension APIs from `extensions.yaml`.
+The OpenShell chart grants RBAC for those APIs, but it does not install the
+`SandboxClaim`, `SandboxTemplate`, or `SandboxWarmPool` CRDs. If the
+extension APIs are unavailable when the Kubernetes driver starts, OpenShell
+disables warm pooling and template reconciliation for that driver instance and
+continues with direct `Sandbox` creation.
+
 When `openshell.drivers.kubernetes.warm_pooling.templates.enabled = true`, the
 gateway notifies the Kubernetes driver when OpenShell `SandboxTemplate`
 resources are created, deleted, or synced at gateway startup. The driver

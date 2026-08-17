@@ -17,6 +17,12 @@ The Kubernetes Agent Sandbox CRDs and controller must be installed on the cluste
 kubectl apply -f https://github.com/kubernetes-sigs/agent-sandbox/releases/latest/download/manifest.yaml
 ```
 
+The chart defaults Kubernetes warm pooling on. Install the Agent Sandbox extension APIs too, or set `server.warmPooling.enabled=false`:
+
+```shell
+kubectl apply -f https://github.com/kubernetes-sigs/agent-sandbox/releases/latest/download/extensions.yaml
+```
+
 ## Install on Kubernetes
 
 ```shell

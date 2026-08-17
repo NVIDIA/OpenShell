@@ -618,6 +618,7 @@ pub struct KubernetesComputeDriver {
     watch_client: Client,
     sandbox_api_version: Arc<OnceCell<&'static str>>,
     warm_pool_cache: WarmPoolCache,
+    warm_pool_extension_apis_available: bool,
     config: KubernetesComputeConfig,
     operator_allowlist: Option<OperatorNamespaceAllowlist>,
 }
@@ -699,15 +700,42 @@ impl KubernetesComputeDriver {
             watch_client,
             sandbox_api_version: Arc::new(OnceCell::new()),
             warm_pool_cache: WarmPoolCache::default(),
+            warm_pool_extension_apis_available: false,
             config,
             operator_allowlist,
+        };
+        let warm_pool_extension_apis_available = if driver.config.warm_pooling.enabled {
+            match driver.validate_warm_pool_extension_apis().await {
+                Ok(true) => true,
+                Ok(false) => {
+                    warn!(
+                        namespace = %driver.config.namespace,
+                        "Agent Sandbox extension APIs are unavailable; Kubernetes warm pooling and template reconciliation are disabled. Install Agent Sandbox extensions.yaml or disable warm_pooling."
+                    );
+                    false
+                }
+                Err(err) => {
+                    warn!(
+                        namespace = %driver.config.namespace,
+                        error = %err,
+                        "Could not validate Agent Sandbox extension APIs; Kubernetes warm pooling and template reconciliation are disabled"
+                    );
+                    false
+                }
+            }
+        } else {
+            false
+        };
+        let driver = Self {
+            warm_pool_extension_apis_available,
+            ..driver
         };
 
         if driver.workspace_mode() == WorkspaceMode::Shared {
             driver.backfill_gateway_id_labels().await?;
         }
 
-        if driver.config.warm_pooling.enabled {
+        if driver.config.warm_pooling.enabled && driver.warm_pool_extension_apis_available {
             driver.spawn_warm_pool_cache_controller();
         }
         Ok(driver)
@@ -719,7 +747,9 @@ impl KubernetesComputeDriver {
                 "kubernetes",
                 openshell_core::VERSION,
                 &self.config.default_image,
-                self.config.warm_pooling.enabled && self.config.warm_pooling.templates.enabled,
+                self.config.warm_pooling.enabled
+                    && self.config.warm_pooling.templates.enabled
+                    && self.warm_pool_extension_apis_available,
             ),
         )
     }
@@ -1175,6 +1205,15 @@ impl KubernetesComputeDriver {
         &self,
         template: &DriverSandboxTemplateResource,
     ) -> Result<(), KubernetesDriverError> {
+        if !self.warm_pool_extension_apis_available {
+            debug!(
+                template_id = %template.id,
+                template_name = %template.name,
+                workspace = %template.workspace,
+                "Skipping sandbox template warm-pool reconciliation because Agent Sandbox extension APIs are unavailable"
+            );
+            return Ok(());
+        }
         let maybe_rendered = render_warm_pool_template(self.client.clone(), &self.config, template)
             .await
             .map_err(KubernetesDriverError::InvalidArgument)?;
@@ -1211,6 +1250,14 @@ impl KubernetesComputeDriver {
         template_id: &str,
         workspace: &str,
     ) -> Result<(), KubernetesDriverError> {
+        if !self.warm_pool_extension_apis_available {
+            debug!(
+                template_id,
+                workspace,
+                "Skipping sandbox template warm-pool cleanup because Agent Sandbox extension APIs are unavailable"
+            );
+            return Ok(());
+        }
         garbage_collect_warm_pool_template(
             self.client.clone(),
             &self.config,
@@ -1314,6 +1361,68 @@ impl KubernetesComputeDriver {
 
     fn sandbox_template_api(client: Client, namespace: &str) -> ExtensionApi {
         Self::namespaced_extension_api(client, namespace, SANDBOX_TEMPLATE_KIND)
+    }
+
+    async fn validate_warm_pool_extension_apis(&self) -> Result<bool, String> {
+        for kind in [
+            SANDBOX_CLAIM_KIND,
+            SANDBOX_TEMPLATE_KIND,
+            SANDBOX_WARM_POOL_KIND,
+        ] {
+            if !Self::extension_api_available(self.client.clone(), &self.config.namespace, kind)
+                .await?
+            {
+                debug!(
+                    namespace = %self.config.namespace,
+                    kind,
+                    api_group = EXTENSIONS_GROUP,
+                    api_version = EXTENSIONS_VERSION_V1BETA1,
+                    "Agent Sandbox extension API is unavailable"
+                );
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    async fn extension_api_available(
+        client: Client,
+        fallback_namespace: &str,
+        kind: &str,
+    ) -> Result<bool, String> {
+        let all_api = Self::all_extension_api(client.clone(), kind);
+        match tokio::time::timeout(
+            KUBE_API_TIMEOUT,
+            all_api.api.list(&ListParams::default().limit(1)),
+        )
+        .await
+        {
+            Ok(Ok(_)) => Ok(true),
+            Ok(Err(err)) if extension_api_unavailable(&err) => Ok(false),
+            Ok(Err(KubeError::Api(err))) if err.code == 403 => {
+                let namespaced_api =
+                    Self::namespaced_extension_api(client, fallback_namespace, kind);
+                match tokio::time::timeout(
+                    KUBE_API_TIMEOUT,
+                    namespaced_api.api.list(&ListParams::default().limit(1)),
+                )
+                .await
+                {
+                    Ok(Ok(_)) => Ok(true),
+                    Ok(Err(err)) if extension_api_unavailable(&err) => Ok(false),
+                    Ok(Err(err)) => Err(err.to_string()),
+                    Err(_) => Err(format!(
+                        "timed out after {}s waiting for Kubernetes API",
+                        KUBE_API_TIMEOUT.as_secs()
+                    )),
+                }
+            }
+            Ok(Err(err)) => Err(err.to_string()),
+            Err(_) => Err(format!(
+                "timed out after {}s waiting for Kubernetes API",
+                KUBE_API_TIMEOUT.as_secs()
+            )),
+        }
     }
 
     fn spawn_warm_pool_cache_controller(&self) {
@@ -1833,7 +1942,7 @@ impl KubernetesComputeDriver {
         sandbox_template: &DriverSandboxTemplateRef,
         request_fingerprint: &str,
     ) -> Result<bool, KubernetesDriverError> {
-        if !self.config.warm_pooling.enabled {
+        if !self.config.warm_pooling.enabled || !self.warm_pool_extension_apis_available {
             return Ok(false);
         }
 
@@ -2183,6 +2292,7 @@ impl KubernetesComputeDriver {
         let data = sandbox_to_k8s_spec(sandbox.spec.as_ref(), &params)
             .map_err(KubernetesDriverError::InvalidArgument)?;
         if self.config.warm_pooling.enabled
+            && self.warm_pool_extension_apis_available
             && let Some(sandbox_template) = sandbox_template
         {
             match sandbox_spec_fingerprint(&data) {
@@ -2572,47 +2682,48 @@ impl KubernetesComputeDriver {
         let mut sandbox_stream = watcher::watcher(agent_sandbox_api.api, watcher_config).boxed();
         let claim_watcher_config = watcher::Config::default()
             .labels(&format!("{LABEL_MANAGED_BY}={LABEL_MANAGED_BY_VALUE}"));
-        let claim_api = if self.config.warm_pooling.enabled {
-            let all_api = Self::sandbox_claim_api_all(self.watch_client.clone());
-            match tokio::time::timeout(
-                KUBE_API_TIMEOUT,
-                all_api.api.list(&ListParams::default().limit(1)),
-            )
-            .await
-            {
-                Ok(Ok(_)) => Some(all_api.api),
-                Ok(Err(KubeError::Api(err))) if err.code == 403 => {
-                    let namespaced_api =
-                        Self::sandbox_claim_api(self.watch_client.clone(), &namespace);
-                    match tokio::time::timeout(
-                        KUBE_API_TIMEOUT,
-                        namespaced_api.api.list(&ListParams::default().limit(1)),
-                    )
-                    .await
-                    {
-                        Ok(Ok(_)) => Some(namespaced_api.api),
-                        Ok(Err(err)) if extension_api_unavailable(&err) => None,
-                        Ok(Err(err)) => return Err(err.to_string()),
-                        Err(_) => {
-                            return Err(format!(
-                                "timed out after {}s waiting for Kubernetes API",
-                                KUBE_API_TIMEOUT.as_secs()
-                            ));
+        let claim_api =
+            if self.config.warm_pooling.enabled && self.warm_pool_extension_apis_available {
+                let all_api = Self::sandbox_claim_api_all(self.watch_client.clone());
+                match tokio::time::timeout(
+                    KUBE_API_TIMEOUT,
+                    all_api.api.list(&ListParams::default().limit(1)),
+                )
+                .await
+                {
+                    Ok(Ok(_)) => Some(all_api.api),
+                    Ok(Err(KubeError::Api(err))) if err.code == 403 => {
+                        let namespaced_api =
+                            Self::sandbox_claim_api(self.watch_client.clone(), &namespace);
+                        match tokio::time::timeout(
+                            KUBE_API_TIMEOUT,
+                            namespaced_api.api.list(&ListParams::default().limit(1)),
+                        )
+                        .await
+                        {
+                            Ok(Ok(_)) => Some(namespaced_api.api),
+                            Ok(Err(err)) if extension_api_unavailable(&err) => None,
+                            Ok(Err(err)) => return Err(err.to_string()),
+                            Err(_) => {
+                                return Err(format!(
+                                    "timed out after {}s waiting for Kubernetes API",
+                                    KUBE_API_TIMEOUT.as_secs()
+                                ));
+                            }
                         }
                     }
+                    Ok(Err(err)) if extension_api_unavailable(&err) => None,
+                    Ok(Err(err)) => return Err(err.to_string()),
+                    Err(_) => {
+                        return Err(format!(
+                            "timed out after {}s waiting for Kubernetes API",
+                            KUBE_API_TIMEOUT.as_secs()
+                        ));
+                    }
                 }
-                Ok(Err(err)) if extension_api_unavailable(&err) => None,
-                Ok(Err(err)) => return Err(err.to_string()),
-                Err(_) => {
-                    return Err(format!(
-                        "timed out after {}s waiting for Kubernetes API",
-                        KUBE_API_TIMEOUT.as_secs()
-                    ));
-                }
-            }
-        } else {
-            None
-        };
+            } else {
+                None
+            };
         let mut claim_stream = claim_api.map_or_else(
             || stream::pending().boxed(),
             |api| watcher::watcher(api, claim_watcher_config).boxed(),
