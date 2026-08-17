@@ -12,7 +12,10 @@ rust_library(
         "//proto:openshell_proto_descriptor_set",
         "//proto:openshell_rust_proto_src",
     ],
-    crate_features = ["telemetry"],
+    crate_features = [
+        "driver-extraction",
+        "telemetry",
+    ],
     rustc_env = {
         "OPENSHELL_DESCRIPTOR_PATH": "$(execpath //proto:openshell_proto_descriptor_set)",
         "OPENSHELL_PROTO_PATH": "$(execpath //proto:openshell_rust_proto_src)",
@@ -30,7 +33,10 @@ rust_library(
 rust_test(
     name = "openshell-core_test",
     crate = ":openshell-core",
-    crate_features = ["telemetry"],
+    crate_features = [
+        "driver-extraction",
+        "telemetry",
+    ],
     rustc_flags = ["--cfg=bazel"],
     deps = all_crate_deps(normal_dev = True),
 )
