@@ -9,6 +9,12 @@ use serde::{Deserialize, Serialize};
 
 pub const CDI_CONTEXT_VERSION: u32 = 1;
 
+/// Absolute supervisor path for the CDI context file mounted by a compute driver.
+pub const CDI_CONTEXT_PATH: &str = "/run/openshell/supervisor/cdi-context.json";
+
+/// Base supervisor path under which compute drivers mount CDI specification directories.
+pub const CDI_SPEC_DIR_BASE: &str = "/run/openshell/supervisor/cdi-specs";
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CdiContext {
     pub version: u32,
