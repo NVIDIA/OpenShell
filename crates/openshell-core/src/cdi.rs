@@ -9,11 +9,20 @@ use serde::{Deserialize, Serialize};
 
 pub const CDI_CONTEXT_VERSION: u32 = 1;
 
+/// File name used for the serialized CDI context.
+pub const CDI_CONTEXT_FILE_NAME: &str = "cdi-context.json";
+
 /// Absolute supervisor path for the CDI context file mounted by a compute driver.
 pub const CDI_CONTEXT_PATH: &str = "/run/openshell/supervisor/cdi-context.json";
 
 /// Base supervisor path under which compute drivers mount CDI specification directories.
 pub const CDI_SPEC_DIR_BASE: &str = "/run/openshell/supervisor/cdi-specs";
+
+/// Return the supervisor path used for a CDI specification directory.
+#[must_use]
+pub fn cdi_spec_mount_path(index: usize) -> String {
+    format!("{CDI_SPEC_DIR_BASE}/{index}")
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CdiContext {

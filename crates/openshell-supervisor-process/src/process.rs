@@ -2067,6 +2067,9 @@ pub fn drop_privileges_with_identity(
 
     #[cfg(target_os = "linux")]
     if target_uid != nix::unistd::geteuid() {
+        // Resolve the name for initgroups only for the existing explicit-policy
+        // path. OCI-derived users carry a numeric UID from the bounded parser and
+        // must not be looked up again through NSS.
         let user_name_is_numeric = user_name.is_some_and(|n| n.parse::<u32>().is_ok());
         let initgroups_name =
             if user_name.is_some() && !user_name_is_numeric && resolved_identity.uid().is_none() {

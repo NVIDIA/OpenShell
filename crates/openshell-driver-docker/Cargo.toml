@@ -24,10 +24,10 @@ serde_json = { workspace = true }
 prost-types = { workspace = true }
 bollard = { version = "0.20" }
 url = { workspace = true }
+tar = "0.4"
 
 [dev-dependencies]
 prost-types = { workspace = true }
-tar = "0.4"
 temp-env = "0.3"
 tempfile = "3"
 
