@@ -7,6 +7,12 @@ driver runs in-process within the gateway server and delegates all sandbox
 isolation enforcement to the `openshell-sandbox` supervisor binary, which is
 sideloaded into each container via an OCI image volume mount.
 
+When the gateway configures `[openshell.gateway.otlp]`, Podman compute-driver
+spans export to the same OTLP/gRPC collector with the service name
+`openshell-driver-podman`. The driver preserves the gateway trace context and
+uses the same compute-driver RPC span names in its in-process and standalone
+forms.
+
 Before creating the container, the driver inspects the final sandbox image and
 captures its immutable image ID and raw OCI `Config.User`. Container creation
 uses that image ID with pulling disabled, preventing a mutable tag from changing

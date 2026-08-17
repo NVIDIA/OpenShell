@@ -803,7 +803,7 @@ impl ComputeRuntime {
         let driver = PodmanComputeDriver::new(config)
             .await
             .map_err(|err| ComputeError::Message(err.to_string()))?;
-        let driver: SharedComputeDriver = Arc::new(PodmanDriverService::new(driver));
+        let driver: SharedComputeDriver = Arc::new(PodmanDriverService::new_in_process(driver));
         Self::from_driver(
             ComputeDriverKind::Podman.as_str().to_string(),
             driver,

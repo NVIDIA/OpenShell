@@ -1,14 +1,14 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! OpenTelemetry trace exporting.
+//! OpenTelemetry trace exporting for the Podman compute driver.
 
 use http::Request;
 use openshell_otel::{
     HeaderMapExtractor, OtlpTraceConfig, RecordGrpcFailure, RecordGrpcStatus, SdkTracerProvider,
     ServiceName, SetupError,
 };
-use opentelemetry::propagation::TextMapPropagator;
+use opentelemetry::propagation::TextMapPropagator as _;
 use opentelemetry::trace::TraceContextExt as _;
 use opentelemetry_sdk::propagation::TraceContextPropagator;
 use tower_http::trace::{GrpcMakeClassifier, MakeSpan, TraceLayer};
@@ -16,11 +16,11 @@ use tracing::{Span, Subscriber};
 use tracing_opentelemetry::OpenTelemetrySpanExt as _;
 use tracing_subscriber::registry::LookupSpan;
 
-const SERVICE_NAME: &str = "openshell-driver-vm";
-const INSTRUMENTATION_SCOPE: &str = "openshell-driver-vm";
+const SERVICE_NAME: &str = "openshell-driver-podman";
+const INSTRUMENTATION_SCOPE: &str = "openshell-driver-podman";
 const COMPUTE_DRIVER_SERVICE: &str = "openshell.compute.v1.ComputeDriver";
+pub const IN_PROCESS_TARGET_PREFIX: &str = "openshell_driver_podman";
 
-/// Trace every inbound compute-driver RPC at the tonic service boundary.
 pub fn compute_driver_rpc_layer() -> TraceLayer<
     GrpcMakeClassifier,
     ComputeDriverRpcSpan,
@@ -39,7 +39,6 @@ pub fn compute_driver_rpc_layer() -> TraceLayer<
         .on_failure(RecordGrpcFailure)
 }
 
-/// Creates the server span for an inbound compute-driver request.
 #[derive(Debug, Clone, Copy)]
 pub struct ComputeDriverRpcSpan;
 
@@ -67,7 +66,7 @@ impl<B> MakeSpan<B> for ComputeDriverRpcSpan {
     }
 }
 
-fn compute_driver_rpc_operation(path: &str) -> (&'static str, &'static str) {
+pub(crate) fn compute_driver_rpc_operation(path: &str) -> (&'static str, &'static str) {
     match path.rsplit('/').next() {
         Some("GetCapabilities") => ("driver.get_capabilities", "get_capabilities"),
         Some("GetGatewayListenerRequirements") => (
@@ -84,11 +83,12 @@ fn compute_driver_rpc_operation(path: &str) -> (&'static str, &'static str) {
         Some("StartSandbox") => ("driver.start_sandbox", "start_sandbox"),
         Some("DeleteSandbox") => ("driver.delete_sandbox", "delete_sandbox"),
         Some("WatchSandboxes") => ("driver.watch_sandboxes", "watch_sandboxes"),
+        Some("EnsureWorkspace") => ("driver.ensure_workspace", "ensure_workspace"),
+        Some("DeleteWorkspace") => ("driver.delete_workspace", "delete_workspace"),
         _ => ("driver.unknown", "unknown"),
     }
 }
 
-/// Build a tracer provider for the configured OTLP/gRPC endpoint.
 #[must_use]
 pub fn provider_for(endpoint: Option<&str>) -> (Option<SdkTracerProvider>, Option<SetupError>) {
     openshell_otel::provider_for(endpoint.map(|endpoint| OtlpTraceConfig {
@@ -99,12 +99,35 @@ pub fn provider_for(endpoint: Option<&str>) -> (Option<SdkTracerProvider>, Optio
     }))
 }
 
-/// Build the tracing layer that exports VM-driver spans.
 pub fn layer<S>(provider: &SdkTracerProvider) -> openshell_otel::OtlpLayer<S>
 where
     S: Subscriber + for<'span> LookupSpan<'span>,
 {
     openshell_otel::layer(provider, INSTRUMENTATION_SCOPE)
+}
+
+pub fn in_process_layer<S>(provider: &SdkTracerProvider) -> openshell_otel::TargetOtlpLayer<S>
+where
+    S: Subscriber + for<'span> LookupSpan<'span>,
+{
+    openshell_otel::layer_for_target_prefix(
+        provider,
+        INSTRUMENTATION_SCOPE,
+        IN_PROCESS_TARGET_PREFIX,
+    )
+}
+
+#[cfg(test)]
+pub(crate) async fn test_lock() -> tokio::sync::MutexGuard<'static, ()> {
+    static LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    static INITIALIZED: std::sync::LazyLock<()> = std::sync::LazyLock::new(|| {
+        tracing::subscriber::set_global_default(tracing_subscriber::registry())
+            .expect("test tracing subscriber installs once");
+    });
+
+    let guard = LOCK.lock().await;
+    std::sync::LazyLock::force(&INITIALIZED);
+    guard
 }
 
 #[cfg(test)]
@@ -136,28 +159,27 @@ mod tests {
             &self,
             request: tonic::Request<ExportTraceServiceRequest>,
         ) -> Result<tonic::Response<ExportTraceServiceResponse>, tonic::Status> {
-            {
-                let mut received = self.received.lock().unwrap();
-                for resource_span in request.into_inner().resource_spans {
-                    if let Some(resource) = resource_span.resource {
-                        received.service_names.extend(
-                            resource
-                                .attributes
-                                .into_iter()
-                                .filter(|attribute| attribute.key == "service.name")
-                                .filter_map(|attribute| attribute.value)
-                                .filter_map(|value| value.value)
-                                .filter_map(|value| match value {
-                                    opentelemetry_proto::tonic::common::v1::any_value::Value::StringValue(value) => Some(value),
-                                    _ => None,
-                                }),
-                        );
-                    }
-                    for scope_span in resource_span.scope_spans {
-                        received.spans.extend(scope_span.spans);
-                    }
+            let mut received = self.received.lock().unwrap();
+            for resource_span in request.into_inner().resource_spans {
+                if let Some(resource) = resource_span.resource {
+                    received.service_names.extend(
+                        resource
+                            .attributes
+                            .into_iter()
+                            .filter(|attribute| attribute.key == "service.name")
+                            .filter_map(|attribute| attribute.value)
+                            .filter_map(|value| value.value)
+                            .filter_map(|value| match value {
+                                opentelemetry_proto::tonic::common::v1::any_value::Value::StringValue(value) => Some(value),
+                                _ => None,
+                            }),
+                    );
+                }
+                for scope_span in resource_span.scope_spans {
+                    received.spans.extend(scope_span.spans);
                 }
             }
+            drop(received);
             self.exported.notify_one();
             Ok(tonic::Response::new(ExportTraceServiceResponse::default()))
         }
@@ -192,13 +214,22 @@ mod tests {
                 "driver.watch_sandboxes",
                 "watch_sandboxes",
             ),
+            (
+                "EnsureWorkspace",
+                "driver.ensure_workspace",
+                "ensure_workspace",
+            ),
+            (
+                "DeleteWorkspace",
+                "driver.delete_workspace",
+                "delete_workspace",
+            ),
         ] {
             assert_eq!(
                 super::compute_driver_rpc_operation(&format!(
                     "/openshell.compute.v1.ComputeDriver/{rpc}"
                 )),
                 (operation, method),
-                "{rpc} must keep an explicit low-cardinality span identity"
             );
         }
         assert_eq!(
@@ -206,12 +237,12 @@ mod tests {
                 "/openshell.compute.v1.ComputeDriver/AttackerControlled12345"
             ),
             ("driver.unknown", "unknown"),
-            "paths absent from the protobuf schema must not create span names"
         );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn vm_driver_spans_reach_otlp_collector_with_distinct_service_name() {
+    async fn podman_driver_spans_reach_otlp_collector_with_distinct_service_name() {
+        let _tracing_lock = super::test_lock().await;
         let received = Arc::new(Mutex::new(Received::default()));
         let exported = Arc::new(tokio::sync::Notify::new());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -234,11 +265,11 @@ mod tests {
         });
 
         let (provider, error) = super::provider_for(Some(&format!("http://{address}")));
-        assert!(error.is_none(), "valid OTLP endpoint should configure");
+        assert!(error.is_none());
         let provider = provider.expect("provider");
         let subscriber = tracing_subscriber::registry().with(super::layer(&provider));
         tracing::subscriber::with_default(subscriber, || {
-            let span = tracing::info_span!("vm.provision", sandbox.id = "sb-otlp");
+            let span = tracing::info_span!("podman.create_sandbox", sandbox.id = "sb-otlp");
             drop(span.enter());
             drop(span);
         });
@@ -248,29 +279,21 @@ mod tests {
             .await
             .expect("OTLP export should complete");
         provider.shutdown().unwrap();
-
-        shutdown_tx
-            .send(())
-            .expect("collector server should be running");
-        tokio::time::timeout(std::time::Duration::from_secs(5), server)
-            .await
-            .expect("collector server shutdown should not deadlock")
-            .expect("collector server task should not panic")
-            .expect("collector server should shut down cleanly");
+        shutdown_tx.send(()).unwrap();
+        server.await.unwrap().unwrap();
 
         let received = received.lock().unwrap();
-        received
-            .spans
-            .iter()
-            .find(|span| span.name == "vm.provision")
-            .expect("VM span should reach collector");
+        assert!(
+            received
+                .spans
+                .iter()
+                .any(|span| span.name == "podman.create_sandbox")
+        );
         assert!(
             received
                 .service_names
                 .iter()
-                .any(|name| name == "openshell-driver-vm"),
-            "VM spans should use a distinct service name, got {:?}",
-            received.service_names
+                .any(|name| name == "openshell-driver-podman")
         );
     }
 }

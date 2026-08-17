@@ -17,7 +17,10 @@ use crate::certgen;
 use crate::compute::driver_config::GuestTlsPaths;
 use crate::config_file::{self, ConfigFile, GatewayFileSection};
 use crate::defaults::{self, LocalTlsPaths};
-use crate::{ServerStartupConfig, run_server, tracing_bus::TracingLogBus};
+use crate::{
+    ServerStartupConfig, configured_compute_driver_for_startup, run_server,
+    tracing_bus::TracingLogBus,
+};
 
 /// `OpenShell` gateway process - gRPC and HTTP server with protocol multiplexing.
 ///
@@ -471,6 +474,7 @@ fn prepare_server_config(args: &mut RunArgs, matches: &ArgMatches) -> Result<Ser
 
 async fn run_from_args(mut args: RunArgs, matches: ArgMatches) -> Result<()> {
     let prepared = prepare_server_config(&mut args, &matches)?;
+    let compute_driver = configured_compute_driver_for_startup(&prepared)?;
 
     let tracing_log_bus = TracingLogBus::new();
     let otlp_config = prepared
@@ -482,6 +486,7 @@ async fn run_from_args(mut args: RunArgs, matches: ArgMatches) -> Result<()> {
             .unwrap_or_else(|_| EnvFilter::new(&prepared.config.log_level)),
         &tracing_log_bus,
         otlp_config,
+        crate::tracing_setup::podman_export_enabled(&compute_driver),
     );
 
     let has_client_ca = prepared
@@ -538,7 +543,7 @@ async fn run_from_args(mut args: RunArgs, matches: ArgMatches) -> Result<()> {
 
     info!(bind = %prepared.config.bind_address, "Starting OpenShell server");
 
-    let result = Box::pin(run_server(prepared, tracing_log_bus)).await;
+    let result = Box::pin(run_server(prepared, compute_driver, tracing_log_bus)).await;
 
     tracing_handle.shutdown();
 
