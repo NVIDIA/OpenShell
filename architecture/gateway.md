@@ -87,6 +87,10 @@ rotates their in-memory slots without rebuilding clients, and publishes the
 public verification key at `/.well-known/jwks.json` alongside OIDC-shaped
 discovery metadata at `/.well-known/openid-configuration`. HTTPS extensions can
 pin an operator-provided CA while retaining endpoint-hostname verification.
+Rust extension services use the opt-in `openshell-sdk::extension` surface to
+verify these credentials from operator-provisioned Ed25519 public keys or JWKS
+documents and normalize gateway and supervisor caller identities. Key refresh
+remains a service deployment concern.
 
 Extension credentials reuse the sandbox signing key and are separated from
 sandbox-to-gateway admission tokens by exact audience and by an explicit

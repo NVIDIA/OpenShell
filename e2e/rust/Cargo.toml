@@ -157,6 +157,11 @@ path = "tests/proxy_egress_pipeline.rs"
 required-features = ["e2e-host-gateway"]
 
 [[test]]
+name = "supervisor_middleware"
+path = "tests/supervisor_middleware.rs"
+required-features = ["e2e-docker"]
+
+[[test]]
 name = "workspace_namespace_managed"
 path = "tests/workspace_namespace_managed.rs"
 required-features = ["e2e-kubernetes-workspace-managed"]
