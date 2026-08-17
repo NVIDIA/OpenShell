@@ -107,7 +107,7 @@ while True:
             &policy_path,
             "--no-tty",
         ],
-        &["sh", "-c", "echo Ready; sleep infinity"],
+        &["sh", "-c", "echo Ready; sleep 2147483647"],
         "Ready",
     )
     .await
