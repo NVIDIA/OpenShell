@@ -23,20 +23,25 @@ fn write_policy() -> Result<NamedTempFile, String> {
 }
 
 fn write_policy_for(host: &str) -> Result<NamedTempFile, String> {
-    write_policy_for_identity(host, "sandbox", "sandbox")
+    write_policy_for_identity(host, "sandbox", "sandbox", &[])
 }
 
 fn write_policy_for_identity(
     host: &str,
     run_as_user: &str,
     run_as_group: &str,
+    extra_read_only: &[&str],
 ) -> Result<NamedTempFile, String> {
     let mut file = NamedTempFile::new().map_err(|error| format!("create policy: {error}"))?;
+    let extra_read_only = extra_read_only
+        .iter()
+        .map(|path| format!(", {path}"))
+        .collect::<String>();
     let policy = format!(
         r#"version: 1
 filesystem_policy:
   include_workdir: true
-  read_only: [/usr, /lib, /proc, /dev/urandom, /app, /etc, /var/log]
+  read_only: [/usr, /lib, /proc, /dev/urandom, /app, /etc, /var/log{extra_read_only}]
   read_write: [/sandbox, /tmp, /dev/null]
 landlock: {{ compatibility: best_effort }}
 process: {{ run_as_user: {run_as_user}, run_as_group: {run_as_group} }}
@@ -88,8 +93,11 @@ while True:
     // Use the registry image directly so the Podman gateway can pull it. A
     // local --from build is performed by the CLI's Docker daemon and is not
     // visible in Podman's separate image store.
-    let policy =
-        write_policy_for_identity(MUSL_FIXTURE_ALIAS, "65534", "65534").expect("write musl policy");
+    // Alpine does not use Debian's /bin -> /usr/bin merge. Landlock therefore
+    // needs the real /bin tree for /bin/sh and the BusyBox executable used by
+    // nslookup and nc; this fixture does not execute anything from /sbin.
+    let policy = write_policy_for_identity(MUSL_FIXTURE_ALIAS, "65534", "65534", &["/bin"])
+        .expect("write musl policy");
     let policy_path = policy.path().to_string_lossy().into_owned();
     let mut sandbox = SandboxGuard::create_keep_with_args(
         &[
