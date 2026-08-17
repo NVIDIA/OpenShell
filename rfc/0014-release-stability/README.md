@@ -17,7 +17,7 @@ predictable release cycle for production users and ecosystem developers.
 We propose
 
 - Development releases for every commit to `main`, nightly release candidates, and qualified stable releases every Tuesday.
-- Preview and Stable API maturity, compatibility, and versioning
+- Stable and Experimental API maturity, compatibility, and versioning
   rules, and maintenance for the latest and N-1 minor release lines.
 - A release qualification pipeline covering conformance, upgrades,
   API changes, and security reviews across the supported release matrix.
@@ -25,12 +25,12 @@ We propose
 ## Motivation
 
 The goal is to exit alpha without slowing OpenShell's development. Releases
-should remain frequent and automated, and Preview APIs should be able to
+should remain frequent and automated, and Experimental APIs should be able to
 evolve quickly enough to keep pace with the ecosystem. At the same time, users
 need Stable interfaces they can confidently build on.
 
 Starting with `0.1.0`, OpenShell provides both: a defined compatibility contract
-for Stable interfaces and room to evolve Preview APIs and features.
+for Stable interfaces and room to evolve Experimental APIs and features.
 Releases are suitable for production use within the published support matrix
 only after passing conformance, upgrade, compatibility, artifact, and security
 checks.
@@ -66,24 +66,24 @@ the `0.x` series:
 
 ### API and feature maturity
 
-OpenShell designates public Protobuf definitions and their corresponding SDK
-interfaces as Preview or Stable. Protobuf packages encode the designation in
-their version name. SDKs use language-appropriate package, module, namespace,
-or symbol naming to expose the same designation.
+Public APIs are Stable by default. APIs that are expected to change frequently
+must be explicitly designated Experimental. Protobuf packages encode the
+designation in their version name. SDKs use language-appropriate package,
+module, namespace, or symbol naming to expose the same designation.
 
 | Maturity | Protobuf naming | SDK naming | Compatibility |
 | --- | --- | --- | --- |
-| Preview | `v1preview` or `v1preview1` | Language-specific Preview package, module, namespace, or symbol | May change or be removed in any release |
-| Stable | `v1` or `v2` | Default Stable package, module, namespace, or symbol | Covered by the release compatibility contract |
+| Stable | `v1` or `v2` | Default Stable package, module, namespace, or symbol | Backward-compatible across patch releases; may change in a minor release with notice and migration guidance |
+| Experimental | `v1experimental` | Language-specific Experimental package, module, namespace, or symbol | May change or be removed in a patch release without notice |
 
-Every API and feature is Preview or Stable, regardless of whether it
+Every API and feature is Stable or Experimental, regardless of whether it
 appears in stable, release candidate, or development artifacts. Each SDK must
-document its language-specific naming convention, and Preview interfaces must
-not appear to be Stable.
+document its language-specific naming convention, and Experimental interfaces
+must not appear to be Stable.
 
-Preview APIs are intended for public evaluation and rapid iteration. They may
-change in place without a compatibility guarantee. Graduation adds a Stable
-`v1` package instead of renaming the Preview package in place.
+Experimental APIs are intended for rapid iteration and may change in place
+without a compatibility guarantee. Graduation adds a Stable `v1` package
+instead of renaming the Experimental package in place.
 
 Unreleased features use named compile-time flags such as `unstable-<feature>`,
 collected under a `dev` compilation flag. Development releases enable them; stable
@@ -94,18 +94,11 @@ their maturity.
 
 ### Breaking changes and API versioning
 
-If a breaking change affects a stable OpenShell surface, the release moves to
-the next minor version. If the same change is incompatible with a Stable
-protobuf contract, the protocol must move to a new major-versioned package,
-for example `openshell.v1` to `openshell.v2`. The supported server retains the
-old protocol for a defined maintenance window and supplies an explicit migration path.
-
-A breaking Stable SDK interface must move to a corresponding versioned SDK
-surface and retain the old interface for the same maintenance window. A
-breaking CLI, configuration, policy, Helm, or state change requires a minor
-project release even when no Protobuf package changes. Conversely, a breaking
-Preview API change does not require a minor project release when it does not
-break any Stable interface.
+A breaking change to a Stable API or other stable OpenShell surface requires a
+minor release with notice and migration guidance. This applies to Protobuf,
+SDK, CLI, configuration, policy, Helm, and state interfaces. A breaking
+Experimental API change may ship in a patch release without notice when it does
+not break a Stable interface.
 
 Breaking-change detection runs during code review and again during release
 candidate qualification. Stable protobuf packages use Buf's `FILE` rules
@@ -118,7 +111,7 @@ The following examples illustrate how these rules affect a release candidate:
 | Example | Concrete change | Release treatment |
 | --- | --- | --- |
 | Breaking Stable Protobuf contract | `string policy = 7` to `PolicyReference policy = 7` | Blocks a patch RC and requires a minor OpenShell release. |
-| Breaking Preview Python SDK method | `create_sandbox(timeout=30)` to `create_sandbox(deadline=...)` | May ship in any release with release notes and migration guidance. |
+| Breaking Experimental Python SDK method | `create_sandbox(timeout=30)` to `create_sandbox(deadline=...)` | May ship in a patch release without notice. |
 | Breaking stable policy document | `endpoints:` to `destinations:` | Blocks a patch RC unless both fields remain supported. |
 | Breaking stable CLI contract | `--policy policy.yaml` to `--policy-file policy.yaml` | Requires retaining the old flag as an alias or shipping a minor release. |
 
@@ -190,7 +183,7 @@ the next Tuesday release.
    commit to `main` with all development features, and publish sequential
    `0.1.0-rc.N` candidates with the release feature set leading to 0.1.0.
 2. **Make the necessary breaking API changes.** Use the pre-0.1.0 window to
-   finalize Stable interfaces, move evolving APIs to Preview packages,
+   finalize Stable interfaces, move evolving APIs to Experimental packages,
    and establish the compatibility baseline.
 3. **Build qualification tests and release machinery.** Automate compatibility
    detection, conformance, upgrade, breaking API change review, security
