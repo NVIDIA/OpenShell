@@ -99,6 +99,12 @@ TCP endpoints rejects a hot reload that introduces one and keeps its complete
 previous policy active; recreating the sandbox installs the substrate before
 the workload starts. A sandbox that started with the substrate may continue to
 remove and re-add TCP endpoints through ordinary atomic policy reloads.
+Workload DNS targets port 53, while nftables redirects eligible IPv4 DNS traffic
+to an unprivileged supervisor listener. The ordinary loopback accept rule admits
+the redirected socket; `SO_ORIGINAL_DST`, synthetic mapping lookup, endpoint
+correlation, and generation-pinned authorization form the security boundary.
+Docker and Podman do not currently advertise usable IPv6 egress for this
+substrate, so AAAA queries return NOERROR/NODATA and IPv6 DNS remains fenced.
 
 Provider credential placeholders are resolved through the live provider state
 for each HTTP request, after destination and L7 policy admission. A static

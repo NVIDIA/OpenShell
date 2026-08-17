@@ -131,9 +131,15 @@ network_policies:
 
 OpenShell answers DNS only for hostnames eligible under an active `protocol: tcp` endpoint. It validates upstream answers against destination and SSRF controls, returns a supervisor-owned synthetic address, and records the validated real addresses. When the application connects to the synthetic address, OpenShell recovers the hostname and port, evaluates the calling process against the current policy generation, and dials only an address pinned by that DNS result.
 
+Applications must honor the returned DNS TTL and resolve the hostname again before reconnecting after that TTL expires. A client that caches the synthetic address indefinitely can receive a connection failure after the mapping expires. Docker and Podman currently advertise only IPv4 egress for this feature, so OpenShell returns an empty successful answer for AAAA queries and lets dual-stack clients use the working A record.
+
 DNS resolution does not authorize a connection by itself. Unknown names, wrong ports, stale mappings, disallowed destination addresses, and binaries outside the matching policy fail closed. Applications cannot inherit access by connecting directly to a real IP returned by an upstream resolver.
 
 Do not combine `protocol: tcp` with L7-only fields such as `path`, `enforcement`, `access`, `rules`, `deny_rules`, request rewriting, or credential signing. Docker and Podman sandboxes support policy DNS and transparent TCP capture. Other compute drivers reject policies containing `protocol: tcp` until they provide the required runtime capability.
+
+Prefer exact hostnames for TCP endpoints. A wildcard authorizes DNS queries for every matching name, which means a compromised process can encode data into matching DNS labels even when the lookup does not return an address. OpenShell records failed eligible lookups for operators, but logging does not remove that exfiltration channel.
+
+The first TCP endpoint is a deliberate exception to ordinary dynamic network policy updates. A sandbox created without any `protocol: tcp` endpoint does not install the DNS and transparent-capture substrate. A hot reload that introduces the first TCP endpoint is rejected atomically and leaves the previous policy active; recreate the sandbox with a TCP endpoint to install the substrate. A sandbox that started with TCP support can remove and later re-add TCP endpoints through normal policy reloads.
 
 ## Apply a Custom Policy
 
