@@ -191,6 +191,12 @@ affinity: {}
 server:
   # -- Gateway log level.
   logLevel: info
+  # OpenTelemetry trace export over OTLP/gRPC. Leave endpoint empty to disable.
+  otlp:
+    # -- OTLP/gRPC collector endpoint, conventionally using port 4317.
+    endpoint: ""
+    # -- Gateway OpenTelemetry service name. Empty uses openshell-gateway.
+    serviceName: ""
   # -- Enable anonymous OpenShell telemetry from the gateway and the sandbox
   # supervisors it launches.
   telemetryEnabled: true

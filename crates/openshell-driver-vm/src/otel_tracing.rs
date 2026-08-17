@@ -3,90 +3,13 @@
 
 //! OpenTelemetry trace exporting.
 
-use http::Request;
-use openshell_otel::{
-    HeaderMapExtractor, OtlpTraceConfig, RecordGrpcFailure, RecordGrpcStatus, SdkTracerProvider,
-    ServiceName, SetupError,
-};
-use opentelemetry::propagation::TextMapPropagator;
-use opentelemetry::trace::TraceContextExt as _;
-use opentelemetry_sdk::propagation::TraceContextPropagator;
-use tower_http::trace::{GrpcMakeClassifier, MakeSpan, TraceLayer};
-use tracing::{Span, Subscriber};
-use tracing_opentelemetry::OpenTelemetrySpanExt as _;
+use openshell_otel::{OtlpTraceConfig, SdkTracerProvider, ServiceName, SetupError};
+pub use openshell_otel::{compute_driver_rpc_layer, compute_driver_rpc_operation};
+use tracing::Subscriber;
 use tracing_subscriber::registry::LookupSpan;
 
 const SERVICE_NAME: &str = "openshell-driver-vm";
 const INSTRUMENTATION_SCOPE: &str = "openshell-driver-vm";
-const COMPUTE_DRIVER_SERVICE: &str = "openshell.compute.v1.ComputeDriver";
-
-/// Trace every inbound compute-driver RPC at the tonic service boundary.
-pub fn compute_driver_rpc_layer() -> TraceLayer<
-    GrpcMakeClassifier,
-    ComputeDriverRpcSpan,
-    (),
-    RecordGrpcStatus,
-    (),
-    RecordGrpcStatus,
-    RecordGrpcFailure,
-> {
-    TraceLayer::new_for_grpc()
-        .make_span_with(ComputeDriverRpcSpan)
-        .on_request(())
-        .on_response(RecordGrpcStatus)
-        .on_body_chunk(())
-        .on_eos(RecordGrpcStatus)
-        .on_failure(RecordGrpcFailure)
-}
-
-/// Creates the server span for an inbound compute-driver request.
-#[derive(Debug, Clone, Copy)]
-pub struct ComputeDriverRpcSpan;
-
-impl<B> MakeSpan<B> for ComputeDriverRpcSpan {
-    fn make_span(&mut self, request: &Request<B>) -> Span {
-        let (operation, method) = compute_driver_rpc_operation(request.uri().path());
-        let span = tracing::info_span!(
-            "driver_rpc",
-            otel.name = operation,
-            otel.kind = "server",
-            otel.status_code = tracing::field::Empty,
-            rpc.system = "grpc",
-            rpc.service = COMPUTE_DRIVER_SERVICE,
-            rpc.method = method,
-            rpc.grpc.status_code = tracing::field::Empty,
-        );
-        let parent = TraceContextPropagator::new().extract_with_context(
-            &opentelemetry::Context::new(),
-            &HeaderMapExtractor::new(request.headers()),
-        );
-        if parent.span().span_context().is_valid() {
-            let _ = span.set_parent(parent);
-        }
-        span
-    }
-}
-
-fn compute_driver_rpc_operation(path: &str) -> (&'static str, &'static str) {
-    match path.rsplit('/').next() {
-        Some("GetCapabilities") => ("driver.get_capabilities", "get_capabilities"),
-        Some("GetGatewayListenerRequirements") => (
-            "driver.get_gateway_listener_requirements",
-            "get_gateway_listener_requirements",
-        ),
-        Some("ValidateSandboxCreate") => {
-            ("driver.validate_sandbox_create", "validate_sandbox_create")
-        }
-        Some("CreateSandbox") => ("driver.create_sandbox", "create_sandbox"),
-        Some("GetSandbox") => ("driver.get_sandbox", "get_sandbox"),
-        Some("ListSandboxes") => ("driver.list_sandboxes", "list_sandboxes"),
-        Some("StopSandbox") => ("driver.stop_sandbox", "stop_sandbox"),
-        Some("StartSandbox") => ("driver.start_sandbox", "start_sandbox"),
-        Some("DeleteSandbox") => ("driver.delete_sandbox", "delete_sandbox"),
-        Some("WatchSandboxes") => ("driver.watch_sandboxes", "watch_sandboxes"),
-        _ => ("driver.unknown", "unknown"),
-    }
-}
 
 /// Build a tracer provider for the configured OTLP/gRPC endpoint.
 #[must_use]

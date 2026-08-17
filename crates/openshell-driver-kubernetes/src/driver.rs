@@ -62,6 +62,7 @@ pub type WatchStream =
     Pin<Box<dyn Stream<Item = Result<WatchSandboxesEvent, KubernetesDriverError>> + Send>>;
 
 const MANAGED_SSH_NETWORK_POLICY_NAME: &str = "openshell-sandbox-ssh";
+const AGENT_SANDBOX_TRACE_CONTEXT_ANNOTATION: &str = "opentelemetry.io/trace-context";
 
 #[derive(Debug, thiserror::Error)]
 pub enum KubernetesDriverError {
@@ -467,6 +468,23 @@ impl std::fmt::Debug for KubernetesComputeDriver {
 }
 
 impl KubernetesComputeDriver {
+    #[cfg(test)]
+    pub(crate) fn new_for_test(config: KubernetesComputeConfig) -> Self {
+        let service = tower::service_fn(|_request: http::Request<kube::client::Body>| async {
+            Ok::<_, std::convert::Infallible>(http::Response::new(http_body_util::Empty::<
+                bytes::Bytes,
+            >::new()))
+        });
+        let client = Client::new(service, "default");
+        Self {
+            client: client.clone(),
+            watch_client: client,
+            sandbox_api_version: Arc::new(OnceCell::new()),
+            config,
+            operator_allowlist: None,
+        }
+    }
+
     pub async fn new(
         config: KubernetesComputeConfig,
         shutdown_rx: tokio::sync::watch::Receiver<bool>,
@@ -1339,7 +1357,24 @@ impl KubernetesComputeDriver {
     }
 
     #[allow(clippy::similar_names)]
+    #[tracing::instrument(
+        name = "kubernetes.create_sandbox",
+        skip(self, sandbox),
+        fields(
+            otel.name = "kubernetes.create_sandbox",
+            otel.status_code = tracing::field::Empty,
+            sandbox.id = %sandbox.id,
+            sandbox.name = %sandbox.name,
+        )
+    )]
     pub async fn create_sandbox(&self, sandbox: &Sandbox) -> Result<(), KubernetesDriverError> {
+        let span_status = openshell_otel::ErrorStatusGuard::current();
+        let result = self.create_sandbox_inner(sandbox).await;
+        span_status.finish(result)
+    }
+
+    #[allow(clippy::similar_names)]
+    async fn create_sandbox_inner(&self, sandbox: &Sandbox) -> Result<(), KubernetesDriverError> {
         let gpu_requirements = sandbox
             .spec
             .as_ref()
@@ -1444,6 +1479,7 @@ impl KubernetesComputeDriver {
         let kube_name = self.config.kube_resource_name(workspace, name);
         let mut obj = DynamicObject::new(&kube_name, &agent_sandbox_api.resource);
         let mut annotations = sandbox_annotations(sandbox);
+        add_trace_context_annotation(&mut annotations);
         for key in [
             crate::config::ANNOTATION_SCC_UID_RANGE,
             crate::config::ANNOTATION_SCC_SUPPLEMENTAL_GROUPS,
@@ -1499,7 +1535,22 @@ impl KubernetesComputeDriver {
         }
     }
 
+    #[tracing::instrument(
+        name = "kubernetes.stop_sandbox",
+        skip(self),
+        fields(
+            otel.name = "kubernetes.stop_sandbox",
+            otel.status_code = tracing::field::Empty,
+            sandbox.id = %sandbox_id,
+        )
+    )]
     pub async fn stop_sandbox(&self, sandbox_id: &str) -> Result<(), KubernetesDriverError> {
+        let span_status = openshell_otel::ErrorStatusGuard::current();
+        let result = self.stop_sandbox_inner(sandbox_id).await;
+        span_status.finish(result)
+    }
+
+    async fn stop_sandbox_inner(&self, sandbox_id: &str) -> Result<(), KubernetesDriverError> {
         let (agent_sandbox_api, kube_name, pod_name, namespace, stop_timeout) = self
             .patch_sandbox_operating_state(sandbox_id, false)
             .await?;
@@ -1554,10 +1605,22 @@ impl KubernetesComputeDriver {
         }
     }
 
+    #[tracing::instrument(
+        name = "kubernetes.start_sandbox",
+        skip(self),
+        fields(
+            otel.name = "kubernetes.start_sandbox",
+            otel.status_code = tracing::field::Empty,
+            sandbox.id = %sandbox_id,
+        )
+    )]
     pub async fn start_sandbox(&self, sandbox_id: &str) -> Result<(), KubernetesDriverError> {
-        self.patch_sandbox_operating_state(sandbox_id, true)
+        let span_status = openshell_otel::ErrorStatusGuard::current();
+        let result = self
+            .patch_sandbox_operating_state(sandbox_id, true)
             .await
-            .map(|_| ())
+            .map(|_| ());
+        span_status.finish(result)
     }
 
     async fn patch_sandbox_operating_state(
@@ -1648,7 +1711,22 @@ impl KubernetesComputeDriver {
         ))
     }
 
+    #[tracing::instrument(
+        name = "kubernetes.delete_sandbox",
+        skip(self),
+        fields(
+            otel.name = "kubernetes.delete_sandbox",
+            otel.status_code = tracing::field::Empty,
+            sandbox.id = %sandbox_id,
+        )
+    )]
     pub async fn delete_sandbox(&self, sandbox_id: &str) -> Result<bool, String> {
+        let span_status = openshell_otel::ErrorStatusGuard::current();
+        let result = self.delete_sandbox_inner(sandbox_id).await;
+        span_status.finish(result)
+    }
+
+    async fn delete_sandbox_inner(&self, sandbox_id: &str) -> Result<bool, String> {
         info!(
             sandbox_id = %sandbox_id,
             workspace_mode = %self.config.workspace_mode,
@@ -1965,6 +2043,15 @@ impl KubernetesComputeDriver {
         });
 
         Ok(Box::pin(ReceiverStream::new(rx)))
+    }
+}
+
+fn add_trace_context_annotation(annotations: &mut BTreeMap<String, String>) {
+    let Some(carrier) = openshell_otel::current_trace_context_carrier() else {
+        return;
+    };
+    if let Ok(value) = serde_json::to_string(&carrier) {
+        annotations.insert(AGENT_SANDBOX_TRACE_CONTEXT_ANNOTATION.to_string(), value);
     }
 }
 
@@ -4560,6 +4647,74 @@ mod tests {
 
     static ENV_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
         std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
+
+    #[tokio::test]
+    async fn tracing_create_sandbox_failure_exports_a_kubernetes_operation_span() {
+        use opentelemetry_sdk::trace::{InMemorySpanExporterBuilder, SdkTracerProvider};
+        use tracing::instrument::WithSubscriber as _;
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let _tracing_lock = crate::otel_tracing::test_lock().await;
+        let exporter = InMemorySpanExporterBuilder::new().build();
+        let provider = SdkTracerProvider::builder()
+            .with_simple_exporter(exporter.clone())
+            .build();
+        let subscriber = tracing_subscriber::registry().with(crate::otel_tracing::layer(&provider));
+        let driver = KubernetesComputeDriver::new_for_test(KubernetesComputeConfig::default());
+
+        driver
+            .create_sandbox(&Sandbox::default())
+            .with_subscriber(subscriber)
+            .await
+            .expect_err("missing sandbox name should fail");
+        provider.force_flush().unwrap();
+
+        let spans = exporter.get_finished_spans().unwrap();
+        let span = spans
+            .iter()
+            .find(|span| span.name == "kubernetes.create_sandbox")
+            .expect("create operation span");
+        assert!(matches!(
+            span.status,
+            opentelemetry::trace::Status::Error { .. }
+        ));
+        provider.shutdown().unwrap();
+    }
+
+    #[tokio::test]
+    async fn sandbox_annotation_propagates_the_active_w3c_trace_context() {
+        use opentelemetry_sdk::trace::{InMemorySpanExporterBuilder, SdkTracerProvider};
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let _tracing_lock = crate::otel_tracing::test_lock().await;
+        let exporter = InMemorySpanExporterBuilder::new().build();
+        let provider = SdkTracerProvider::builder()
+            .with_simple_exporter(exporter)
+            .build();
+        let subscriber = tracing_subscriber::registry().with(crate::otel_tracing::layer(&provider));
+
+        let annotations = tracing::subscriber::with_default(subscriber, || {
+            let span = tracing::info_span!("kubernetes.create_sandbox");
+            let _entered = span.enter();
+            let mut annotations = BTreeMap::new();
+            add_trace_context_annotation(&mut annotations);
+            annotations
+        });
+
+        let carrier: serde_json::Value = serde_json::from_str(
+            annotations
+                .get("opentelemetry.io/trace-context")
+                .expect("agent-sandbox trace-context annotation"),
+        )
+        .expect("annotation should contain a JSON propagation carrier");
+        let traceparent = carrier["traceparent"]
+            .as_str()
+            .expect("carrier should contain traceparent");
+        assert!(traceparent.starts_with("00-"));
+        assert_eq!(traceparent.len(), 55);
+
+        provider.shutdown().unwrap();
+    }
 
     fn json_struct(value: serde_json::Value) -> Struct {
         let serde_json::Value::Object(object) = value else {

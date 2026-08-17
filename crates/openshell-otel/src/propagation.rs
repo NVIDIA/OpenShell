@@ -3,6 +3,8 @@
 
 //! W3C trace-context propagation for HTTP and tonic transports.
 
+use std::collections::BTreeMap;
+
 use http::HeaderMap;
 use opentelemetry::propagation::{Extractor, Injector, TextMapPropagator};
 use opentelemetry_sdk::propagation::TraceContextPropagator;
@@ -50,6 +52,27 @@ impl Injector for MetadataMapInjector<'_> {
         };
         self.0.insert(key, value);
     }
+}
+
+#[derive(Debug)]
+struct TraceContextMapInjector<'a>(&'a mut BTreeMap<String, String>);
+
+impl Injector for TraceContextMapInjector<'_> {
+    fn set(&mut self, key: &str, value: String) {
+        self.0.insert(key.to_string(), value);
+    }
+}
+
+/// Serialize the active span's W3C propagation fields into a string map.
+///
+/// Returns `None` when the current span has no valid OpenTelemetry context.
+#[must_use]
+pub fn current_trace_context_carrier() -> Option<BTreeMap<String, String>> {
+    let context = tracing::Span::current().context();
+    let mut carrier = BTreeMap::new();
+    TraceContextPropagator::new()
+        .inject_context(&context, &mut TraceContextMapInjector(&mut carrier));
+    carrier.contains_key("traceparent").then_some(carrier)
 }
 
 /// Injects the active W3C trace context into an outbound tonic request.

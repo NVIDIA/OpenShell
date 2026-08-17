@@ -13,6 +13,7 @@ One value is intentionally NOT rendered here:
                                  --db-url arg for SQLite
 */}}
 {{- $credentialDrivers := list -}}
+{{- $otlp := .Values.server.otlp | default dict -}}
 {{- if .Values.server.credentialDrivers.kubernetesSecrets.enabled -}}
 {{- $credentialDrivers = append $credentialDrivers "kubernetes-secrets" -}}
 {{- end -}}
@@ -86,6 +87,15 @@ data:
     grpc_rate_limit_window_seconds = {{ $rlWindowSeconds }}
     {{- else if or (gt $rlRequests 0) (gt $rlWindowSeconds 0) }}
     {{- fail "server.grpcRateLimit requires both requests and windowSeconds to be positive to enable rate limiting, or both 0/unset to disable it" }}
+    {{- end }}
+
+    {{- if $otlp.endpoint }}
+
+    [openshell.gateway.otlp]
+    endpoint = {{ $otlp.endpoint | quote }}
+    {{- if $otlp.serviceName }}
+    service_name = {{ $otlp.serviceName | quote }}
+    {{- end }}
     {{- end }}
 
     {{- if not .Values.server.disableTls }}

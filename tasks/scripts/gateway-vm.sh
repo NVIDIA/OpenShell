@@ -327,6 +327,9 @@ version = 1
 compute_drivers = ["vm"]
 disable_tls = ${DISABLE_TLS}
 
+[openshell.gateway.otlp]
+endpoint = "http://127.0.0.1:4317"
+
 [openshell.gateway.auth]
 allow_unauthenticated_users = true
 

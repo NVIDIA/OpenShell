@@ -234,6 +234,22 @@ Only OpenTelemetry traces are exported. Inbound gRPC and HTTP requests produce s
 
 The gateway forwards the OTLP configuration and W3C trace context to managed external drivers. Built-in Docker and Podman drivers also export their spans to the same collector through dedicated in-process providers. Driver spans retain the gateway trace context and use a distinct service name such as `openshell-driver-docker` or `openshell-driver-podman`.
 
+For Helm deployments, set `server.otlp.endpoint` to render this table. The
+optional `server.otlp.serviceName` value overrides the gateway service name;
+driver service names remain fixed.
+
+The local `mise run helm:k3s:create` workflow installs a trace collector and UI,
+enables Agent Sandbox controller tracing on supported releases, and configures
+both the controller and the existing Skaffold deployment to export traces to it
+automatically.
+Run `mise run helm:k3s:forward` to forward OTLP/gRPC to local port `4317` and
+the trace UI to local port `18888`. When Skaffold has deployed a Kubernetes
+gateway, the task also forwards it to local port `8090`; otherwise it continues
+with the collector ports only. The Skaffold run task registers the forwarded
+gateway under the worktree-specific k3d cluster name; select it with
+`openshell gateway select <name>`. The local Podman, Docker, and VM gateway
+tasks export to the forwarded receiver automatically.
+
 ### Tuning
 
 This table decides whether and where to export. How the SDK exports is controlled by the standard OpenTelemetry environment variables, which the gateway reads through the SDK rather than mirroring as TOML keys:
