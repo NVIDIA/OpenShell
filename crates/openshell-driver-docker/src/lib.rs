@@ -18,9 +18,12 @@ use bollard::models::{
 use bollard::query_parameters::{
     CreateContainerOptionsBuilder, CreateImageOptions, DownloadFromContainerOptionsBuilder,
     ListContainersOptionsBuilder, RemoveContainerOptionsBuilder, StopContainerOptionsBuilder,
+    UploadToContainerOptionsBuilder,
 };
+use bollard::{Docker, body_full};
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
+use openshell_core::cdi::{CdiContext, CdiSpecDirectory, cdi_spec_mount_path};
 use openshell_core::config::{DEFAULT_SANDBOX_PIDS_LIMIT, DEFAULT_STOP_TIMEOUT_SECS};
 use openshell_core::driver_mounts;
 use openshell_core::driver_utils::{
@@ -59,6 +62,8 @@ use openshell_core::proto_struct::{
 use openshell_core::{Error, Result as CoreResult};
 use opentelemetry::trace::TraceContextExt as _;
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
+use std::io::Cursor;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -210,15 +215,62 @@ struct DockerDriverRuntimeConfig {
     supervisor_bin: PathBuf,
     guest_tls: Option<DockerGuestTlsPaths>,
     daemon_version: String,
-    gpu: DockerGpuRuntimeCapabilities,
+    gpu: DockerGpuRuntimeConfig,
     sandbox_pids_limit: i64,
     enable_bind_mounts: bool,
 }
 
-#[derive(Debug, Clone, Copy)]
-struct DockerGpuRuntimeCapabilities {
-    cdi_supported: bool,
+#[derive(Debug, Clone, Default)]
+struct DockerGpuRuntimeConfig {
+    cdi_spec_dirs: Vec<String>,
     wsl_all_gpu_fallback_enabled: bool,
+}
+
+impl DockerGpuRuntimeConfig {
+    fn supports_gpu(&self) -> bool {
+        !self.cdi_spec_dirs.is_empty()
+    }
+
+    fn cdi_context(&self, gpu_device_ids: Option<&[String]>) -> Result<Option<CdiContext>, Status> {
+        let Some(gpu_device_ids) = gpu_device_ids.filter(|device_ids| !device_ids.is_empty())
+        else {
+            return Ok(None);
+        };
+        self.require_cdi_spec_dirs()?;
+        Ok(Some(CdiContext::new(
+            gpu_device_ids.to_vec(),
+            self.cdi_spec_dirs
+                .iter()
+                .enumerate()
+                .map(|(index, source)| CdiSpecDirectory::new(cdi_spec_mount_path(index), source))
+                .collect(),
+        )))
+    }
+
+    fn cdi_spec_bind_strings(
+        &self,
+        gpu_device_ids: Option<&[String]>,
+    ) -> Result<Vec<String>, Status> {
+        let Some(_) = gpu_device_ids.filter(|device_ids| !device_ids.is_empty()) else {
+            return Ok(Vec::new());
+        };
+        self.require_cdi_spec_dirs()?;
+        Ok(self
+            .cdi_spec_dirs
+            .iter()
+            .enumerate()
+            .map(|(index, source)| format!("{source}:{}:ro,z", cdi_spec_mount_path(index)))
+            .collect())
+    }
+
+    fn require_cdi_spec_dirs(&self) -> Result<(), Status> {
+        if self.cdi_spec_dirs.is_empty() {
+            return Err(Status::failed_precondition(
+                "docker GPU sandboxes require Docker CDI spec directories reported by the daemon",
+            ));
+        }
+        Ok(())
+}
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -504,16 +556,11 @@ impl DockerComputeDriver {
         let info = docker.info().await.map_err(|err| {
             Error::execution(format!("failed to query Docker daemon info: {err}"))
         })?;
-        let cdi_supported = info
-            .cdi_spec_dirs
-            .as_ref()
-            .is_some_and(|dirs| !dirs.is_empty());
-        let cdi_gpu_inventory = docker_cdi_gpu_inventory(&info);
-        let wsl_all_gpu_fallback_enabled = docker_info_reports_wsl2(&info);
-        let gpu = DockerGpuRuntimeCapabilities {
-            cdi_supported,
-            wsl_all_gpu_fallback_enabled,
+        let gpu = DockerGpuRuntimeConfig {
+            cdi_spec_dirs: info.cdi_spec_dirs.clone().unwrap_or_default(),
+            wsl_all_gpu_fallback_enabled: docker_info_reports_wsl2(&info),
         };
+        let cdi_gpu_inventory = docker_cdi_gpu_inventory(&info);
         validate_sandbox_pids_limit(docker_config.sandbox_pids_limit)?;
         let gateway_port = gateway_bind_address.port();
         if gateway_port == 0 {
@@ -563,7 +610,7 @@ impl DockerComputeDriver {
                 supervisor_bin,
                 guest_tls,
                 daemon_version: version.version.unwrap_or_else(|| "unknown".to_string()),
-                gpu,
+                gpu: gpu.clone(),
                 sandbox_pids_limit: docker_config.sandbox_pids_limit,
                 enable_bind_mounts: docker_config.enable_bind_mounts,
             },
@@ -600,8 +647,8 @@ impl DockerComputeDriver {
                     limit_supported: true,
                 }),
                 gpu: Some(GpuResourceCapabilities {
-                    default_selection_supported: self.config.gpu.cdi_supported,
-                    count_selection_supported: self.config.gpu.cdi_supported,
+                    default_selection_supported: self.config.gpu.supports_gpu(),
+                    count_selection_supported: self.config.gpu.supports_gpu(),
                 }),
             }),
             rootfs_tar_staging_dir: String::new(),
@@ -637,7 +684,7 @@ impl DockerComputeDriver {
             DockerSandboxDriverConfig::from_template(template).map_err(Status::invalid_argument)?;
         validate_docker_driver_mounts(&driver_config.mounts, config.enable_bind_mounts)?;
         let gpu_requirements = driver_gpu_requirements(spec.resource_requirements.as_ref());
-        Self::validate_gpu_request(gpu_requirements, config.gpu.cdi_supported, &driver_config)?;
+        Self::validate_gpu_request(gpu_requirements, config.gpu.supports_gpu(), &driver_config)?;
         Ok(ValidatedDockerSandbox {
             template,
             driver_config,
@@ -950,9 +997,13 @@ impl DockerComputeDriver {
             )
             .await
             .map_err(|status| {
-                if token_file_created {
-                    cleanup_sandbox_token_file(sandbox, &self.config);
-                }
+                DockerProvisioningFailure::new("ContainerCreateFailed", status.message())
+            })?;
+        let cdi_context = self
+            .config
+            .gpu
+            .cdi_context(gpu_devices.as_deref())
+            .map_err(|status| {
                 DockerProvisioningFailure::new("ContainerCreateFailed", status.message())
             })?;
         let create_body = build_container_create_body_for_image(
@@ -963,9 +1014,6 @@ impl DockerComputeDriver {
             &image,
         )
         .map_err(|status| {
-            if token_file_created {
-                cleanup_sandbox_token_file(sandbox, &self.config);
-            }
             DockerProvisioningFailure::new("ContainerCreateFailed", status.message())
         })?;
         async {
@@ -1006,6 +1054,24 @@ impl DockerComputeDriver {
             HashMap::from([("container_name".to_string(), container_name.clone())]),
         );
 
+        if let Some(cdi_context) = cdi_context
+            && let Err(err) = self.upload_cdi_context(&container_name, &cdi_context).await
+        {
+            self.cleanup_created_container_after_failure(
+                &sandbox.id,
+                &container_name,
+                "CDI context upload failure",
+            )
+            .await;
+            if token_file_created {
+                cleanup_sandbox_token_file(sandbox, &self.config);
+            }
+            return Err(DockerProvisioningFailure::from_status(
+                "CdiContextUploadFailed",
+                err,
+            ));
+        }
+
         let start_result = async {
             openshell_otel::record_error_result(
                 self.docker.start_container(&container_name, None).await,
@@ -1020,21 +1086,12 @@ impl DockerComputeDriver {
         ))
         .await;
         if let Err(err) = start_result {
-            let cleanup = self
-                .docker
-                .remove_container(
-                    &container_name,
-                    Some(RemoveContainerOptionsBuilder::default().force(true).build()),
-                )
-                .await;
-            if let Err(cleanup_err) = cleanup {
-                warn!(
-                    sandbox_id = %sandbox.id,
-                    container_name,
-                    error = %cleanup_err,
-                    "Failed to clean up Docker container after start failure"
-                );
-            }
+            self.cleanup_created_container_after_failure(
+                &sandbox.id,
+                &container_name,
+                "container start failure",
+            )
+            .await;
             if token_file_created {
                 cleanup_sandbox_token_file(sandbox, &self.config);
             }
@@ -1061,6 +1118,51 @@ impl DockerComputeDriver {
         }
 
         span_status.finish(Ok(()))
+    }
+
+    async fn cleanup_created_container_after_failure(
+        &self,
+        sandbox_id: &str,
+        container_name: &str,
+        phase: &'static str,
+    ) {
+        let cleanup = self
+            .docker
+            .remove_container(
+                container_name,
+                Some(RemoveContainerOptionsBuilder::default().force(true).build()),
+            )
+            .await;
+        if let Err(cleanup_err) = cleanup {
+            warn!(
+                sandbox_id = %sandbox_id,
+                container_name = %container_name,
+                phase,
+                error = %cleanup_err,
+                "Failed to clean up Docker container after provisioning failure"
+            );
+        }
+    }
+
+    async fn upload_cdi_context(
+        &self,
+        container_name: &str,
+        context: &CdiContext,
+    ) -> Result<(), Status> {
+        let archive = build_cdi_context_archive(context).map_err(Status::internal)?;
+        self.docker
+            .upload_to_container(
+                container_name,
+                Some(
+                    UploadToContainerOptionsBuilder::default()
+                        .path("/run")
+                        .no_overwrite_dir_non_dir("true")
+                        .build(),
+                ),
+                body_full(Bytes::from(archive)),
+            )
+            .await
+            .map_err(|err| internal_status("upload CDI context to Docker container", err))
     }
 
     async fn delete_sandbox_inner(
@@ -2736,14 +2838,19 @@ fn cleanup_sandbox_token_file_by_id(sandbox_id: &str, config: &DockerDriverRunti
 }
 
 #[cfg(test)]
-fn build_environment(sandbox: &DriverSandbox, config: &DockerDriverRuntimeConfig) -> Vec<String> {
-    build_environment_for_oci_user(sandbox, config, "")
+fn build_environment(
+    sandbox: &DriverSandbox,
+    config: &DockerDriverRuntimeConfig,
+    include_cdi_context: bool,
+) -> Vec<String> {
+    build_environment_for_oci_user(sandbox, config, "", include_cdi_context)
 }
 
 fn build_environment_for_oci_user(
     sandbox: &DriverSandbox,
     config: &DockerDriverRuntimeConfig,
     oci_user: &str,
+    include_cdi_context: bool,
 ) -> Vec<String> {
     let mut environment = HashMap::from([
         ("HOME".to_string(), "/root".to_string()),
@@ -2802,6 +2909,14 @@ fn build_environment_for_oci_user(
     environment.insert(
         openshell_core::sandbox_env::NETWORK_RUNTIME_CAPABILITIES.to_string(),
         openshell_core::sandbox_env::POLICY_DNS_TRANSPARENT_TCP_CAPABILITY.to_string(),
+    );
+    environment.insert(
+        openshell_core::sandbox_env::CDI_CONTEXT.to_string(),
+        if include_cdi_context {
+            openshell_core::cdi::CDI_CONTEXT_PATH.to_string()
+        } else {
+            String::new()
+        },
     );
     // The root supervisor executes namespace helpers during bootstrap; keep
     // their search path driver-owned even when the template/spec set PATH.
@@ -2888,6 +3003,68 @@ fn os_or_kernel_reports_wsl2(value: &str) -> bool {
 
 fn docker_gpu_selection_status(err: CdiGpuSelectionError) -> Status {
     Status::failed_precondition(err.to_string())
+}
+
+fn cdi_context_requested(gpu_device_ids: Option<&[String]>) -> bool {
+    gpu_device_ids.is_some_and(|device_ids| !device_ids.is_empty())
+}
+
+fn build_cdi_context_archive(context: &CdiContext) -> Result<Vec<u8>, String> {
+    let json = serde_json::to_vec_pretty(context).map_err(|err| err.to_string())?;
+    let mut archive = DockerTarArchiveBuilder::new();
+    archive.append_dir("openshell", 0o700)?;
+    archive.append_dir("openshell/supervisor", 0o700)?;
+    archive.append_file(
+        &format!(
+            "openshell/supervisor/{}",
+            openshell_core::cdi::CDI_CONTEXT_FILE_NAME
+        ),
+        0o600,
+        json,
+    )?;
+    archive.into_inner()
+}
+
+struct DockerTarArchiveBuilder {
+    inner: tar::Builder<Vec<u8>>,
+}
+
+impl DockerTarArchiveBuilder {
+    fn new() -> Self {
+        Self {
+            inner: tar::Builder::new(Vec::new()),
+        }
+    }
+
+    fn append_dir(&mut self, path: &str, mode: u32) -> Result<(), String> {
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Directory);
+        header.set_size(0);
+        header.set_mode(mode);
+        header.set_uid(0);
+        header.set_gid(0);
+        header.set_cksum();
+        self.inner
+            .append_data(&mut header, path, std::io::empty())
+            .map_err(|err| err.to_string())
+    }
+
+    fn append_file(&mut self, path: &str, mode: u32, contents: Vec<u8>) -> Result<(), String> {
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Regular);
+        header.set_size(u64::try_from(contents.len()).map_err(|err| err.to_string())?);
+        header.set_mode(mode);
+        header.set_uid(0);
+        header.set_gid(0);
+        header.set_cksum();
+        self.inner
+            .append_data(&mut header, path, Cursor::new(contents))
+            .map_err(|err| err.to_string())
+    }
+
+    fn into_inner(self) -> Result<Vec<u8>, String> {
+        self.inner.into_inner().map_err(|err| err.to_string())
+    }
 }
 
 #[cfg(test)]
@@ -3026,7 +3203,12 @@ fn build_container_create_body_for_image(
         // The image workspace may need to be created or rejected by the
         // supervisor, so do not let the OCI runtime chdir there first.
         working_dir: Some("/".to_string()),
-        env: Some(build_environment_for_oci_user(sandbox, config, &image.user)),
+        env: Some(build_environment_for_oci_user(
+            sandbox,
+            config,
+            &image.user,
+            cdi_context_requested(gpu_device_ids),
+        )),
         entrypoint: Some(vec![SUPERVISOR_MOUNT_PATH.to_string()]),
         // Replace the image CMD with the supervisor's resolved workspace
         // argument so Docker cannot append inherited image arguments.
@@ -3039,6 +3221,7 @@ fn build_container_create_body_for_image(
             device_requests,
             binds: {
                 let mut binds = build_binds(sandbox, config)?;
+                binds.extend(config.gpu.cdi_spec_bind_strings(gpu_device_ids)?);
                 binds.extend(user_bind_strings);
                 Some(binds)
             },
