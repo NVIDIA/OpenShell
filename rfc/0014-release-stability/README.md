@@ -41,9 +41,10 @@ checks.
 
 Starting with `0.1.0`, OpenShell publishes stable tagged releases intended for production use within
 the published support matrix. Stable releases occur every Tuesday and increment
-the patch version, for example `0.1.1` followed by `0.1.2`. A stable tag is
-published only when there are changes and every blocking qualification suite
-passes.
+the patch version by default, for example `0.1.1` followed by `0.1.2`. A release
+may instead increment the minor version when it introduces notable new features
+or documented breaking changes. A stable tag is published only when there are
+changes and every blocking qualification suite passes.
 
 OpenShell publishes a development release for every commit to `main`. Each
 development release identifies its source commit and artifact manifest, and the
@@ -61,8 +62,9 @@ the `0.x` series:
 
 - Patch releases may contain bug fixes and additive, backward-compatible
   functionality. They do not intentionally break a stable interface.
-- An unavoidable breaking change to any stable interface starts a new minor
-  release and resets the patch version, for example `0.1.x` to `0.2.0`.
+- Minor releases may represent notable new features even when they remain
+  backward-compatible. They may also contain documented breaking changes to
+  stable interfaces, for example `0.1.x` to `0.2.0`.
 
 ### API and feature maturity
 
