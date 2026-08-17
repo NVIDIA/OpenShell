@@ -982,8 +982,8 @@ fn is_vertex_anthropic_rawpredict_route(route: &ResolvedRoute) -> bool {
 mod tests {
     use super::{
         ValidationFailure, ValidationFailureKind, build_backend_url, build_provider_url,
-        parse_bedrock_invocation_path, prepare_backend_request, rewrite_bedrock_path,
-        route_is_bedrock, verify_backend_endpoint,
+        parse_bedrock_invocation_path, prepare_backend_request, proxy_to_backend,
+        rewrite_bedrock_path, route_is_bedrock, verify_backend_endpoint,
     };
     use crate::RouterError;
     use crate::config::{DEFAULT_ROUTE_TIMEOUT, ResolvedRoute};
@@ -2594,6 +2594,90 @@ mod tests {
         assert!(
             received_body.get("messages").is_some(),
             "messages field should pass through unchanged"
+        );
+    }
+
+    /// Vertex AI's OpenAI-compatible endpoint requires the body `model` field to
+    /// carry a publisher prefix (e.g. `google/gemini-2.5-flash`). This test
+    /// simulates the fix: `resolve_vertex_ai_route` sets `route.model` to the
+    /// prefixed form, and the body rewrite here forwards that value to Vertex.
+    ///
+    /// The mock server only accepts the prefixed form — matching Vertex's
+    /// behaviour — and returns 400 "Malformed publisher model" for the bare name.
+    #[tokio::test]
+    async fn vertex_openai_compat_rewrites_body_model_to_publisher_prefixed_form() {
+        let mock_server = MockServer::start().await;
+
+        // Simulate Vertex accepting only the publisher-prefixed model name.
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(body_partial_json(
+                serde_json::json!({"model": "google/gemini-2.5-flash"}),
+            ))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({"choices": [{"message": {"content": "hi"}}]}),
+                ),
+            )
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        // Simulate Vertex rejecting the bare model name — the pre-fix failure.
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(body_partial_json(
+                serde_json::json!({"model": "gemini-2.5-flash"}),
+            ))
+            .respond_with(ResponseTemplate::new(400).set_body_json(
+                serde_json::json!({"error": {"message": "Malformed publisher model"}}),
+            ))
+            .expect(0) // must never be reached after the fix
+            .mount(&mock_server)
+            .await;
+
+        // Route as produced by resolve_vertex_ai_route after the fix:
+        // route.model carries the publisher prefix.
+        let route = ResolvedRoute {
+            name: "vertex-gemini".to_string(),
+            endpoint: mock_server.uri(),
+            model: "google/gemini-2.5-flash".to_string(),
+            api_key: "ya29.token".to_string(),
+            protocols: vec!["openai_chat_completions".to_string()],
+            auth: AuthHeader::Bearer,
+            default_headers: vec![],
+            passthrough_headers: vec![],
+            timeout: DEFAULT_ROUTE_TIMEOUT,
+            model_in_path: false,
+            request_path_override: Some("/chat/completions".to_string()),
+        };
+
+        // The client sends the bare model name; the body rewrite must replace it
+        // with route.model (the publisher-prefixed form) before forwarding.
+        let client_body = serde_json::to_vec(&serde_json::json!({
+            "model": "gemini-2.5-flash",
+            "messages": [{"role": "user", "content": "hello"}]
+        }))
+        .unwrap();
+
+        let client = reqwest::Client::new();
+        let result = proxy_to_backend(
+            &client,
+            &route,
+            "openai_chat_completions",
+            "POST",
+            "/chat/completions",
+            vec![("content-type".to_string(), "application/json".to_string())],
+            bytes::Bytes::from(client_body),
+        )
+        .await
+        .expect("proxy should succeed");
+
+        assert_eq!(
+            result.status, 200,
+            "Vertex mock must accept the publisher-prefixed model; \
+             got {}: body rewrite did not apply the prefix",
+            result.status
         );
     }
 
