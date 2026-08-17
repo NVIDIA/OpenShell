@@ -15,10 +15,11 @@ use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::task::JoinHandle;
 
-const IPV4_POOL_PREFIX: u8 = 25;
-const IPV6_POOL_PREFIX: u8 = 120;
+const IPV4_POOL_PREFIX: u8 = 23;
+const IPV6_POOL_PREFIX: u8 = 119;
 const IPV4_EPOCH_WINDOWS: u64 = 1 << (IPV4_POOL_PREFIX - 15);
-const MAX_MAPPINGS: usize = 256;
+const MAX_MAPPINGS: usize = 1024;
+const MAX_CONCURRENT_UDP_QUERIES: usize = 64;
 
 #[derive(Debug, Clone)]
 pub(crate) struct PolicyDnsRuntimeConfig {
@@ -84,6 +85,8 @@ impl PolicyDnsRuntime {
         let address = udp.local_addr().into_diagnostic()?;
 
         let udp_service = service.clone();
+        let udp = Arc::new(udp);
+        let udp_concurrency = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_UDP_QUERIES));
         let mut udp_engine_ready = engine_ready.clone();
         let udp_task = tokio::spawn(async move {
             if udp_engine_ready.wait_for(|ready| *ready).await.is_err() {
@@ -91,13 +94,26 @@ impl PolicyDnsRuntime {
             }
             let mut request = vec![0_u8; MAX_DNS_MESSAGE_BYTES + 1];
             loop {
+                let Ok(permit) = udp_concurrency.clone().acquire_owned().await else {
+                    break;
+                };
                 let Ok((length, peer)) = udp.recv_from(&mut request).await else {
                     break;
                 };
-                if let Ok(response) = wire::handle_udp_query(&udp_service, &request[..length]).await
-                {
-                    let _ = udp.send_to(&response, peer).await;
-                }
+                let request = request[..length].to_vec();
+                let service = udp_service.clone();
+                let udp = udp.clone();
+                tokio::spawn(async move {
+                    let _permit = permit;
+                    // Docker and Podman do not currently prove usable IPv6
+                    // egress. Return NOERROR/NODATA for AAAA so dual-stack
+                    // clients can fall back to the usable IPv4 path.
+                    if let Ok(response) =
+                        wire::handle_udp_query_with_ipv6(&service, &request, false).await
+                    {
+                        let _ = udp.send_to(&response, peer).await;
+                    }
+                });
             }
         });
 
@@ -127,7 +143,9 @@ impl PolicyDnsRuntime {
                         if stream.read_exact(&mut frame[2..]).await.is_err() {
                             return;
                         }
-                        let Ok(response) = wire::handle_tcp_query(&service, &frame).await else {
+                        let Ok(response) =
+                            wire::handle_tcp_query_with_ipv6(&service, &frame, false).await
+                        else {
                             return;
                         };
                         if stream.write_all(&response).await.is_err() {
@@ -217,5 +235,15 @@ mod tests {
         for address in [first.ipv4_cidr.network(), second.ipv4_cidr.broadcast()] {
             assert!(parent.contains(&address));
         }
+    }
+
+    #[test]
+    fn production_pools_and_store_capacity_expand_together() {
+        let config = PolicyDnsRuntimeConfig::for_epoch(7).unwrap();
+        let ipv4_capacity = 1_usize << (32 - config.ipv4_cidr.prefix_len());
+        let ipv6_capacity = 1_usize << (128 - config.ipv6_cidr.prefix_len());
+        assert_eq!(ipv4_capacity, 512);
+        assert_eq!(ipv6_capacity, 512);
+        assert_eq!(MAX_MAPPINGS, ipv4_capacity + ipv6_capacity);
     }
 }

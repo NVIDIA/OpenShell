@@ -13,10 +13,7 @@
 //! `ct state` without `nf_conntrack`, `log` without `nf_log`) rolls back the
 //! entire transaction including table/chain creation.
 
-/// Packet mark applied only to synthetic-destination TCP before REDIRECT.
-/// The filter chain uses it to distinguish legitimate redirected listener
-/// traffic from a direct dial to an arbitrary real address on the same port.
-const TRANSPARENT_TCP_MARK: &str = "0x4f535450";
+const DNS_DESTINATION_PORT: &str = "53";
 
 /// A single nft command with metadata about whether it is required.
 pub struct NftCommand {
@@ -244,9 +241,12 @@ pub fn generate_transparent_tcp_commands(
                 "inet",
                 "openshell_transparent",
                 "output",
+                "meta",
+                "nfproto",
+                "ipv4",
                 "udp",
                 "dport",
-                &dns_port.to_string(),
+                DNS_DESTINATION_PORT,
                 "redirect",
                 "to",
                 &format!(":{dns_port}"),
@@ -260,9 +260,12 @@ pub fn generate_transparent_tcp_commands(
                 "inet",
                 "openshell_transparent",
                 "output",
+                "meta",
+                "nfproto",
+                "ipv4",
                 "tcp",
                 "dport",
-                &dns_port.to_string(),
+                DNS_DESTINATION_PORT,
                 "redirect",
                 "to",
                 &format!(":{dns_port}"),
@@ -282,10 +285,6 @@ pub fn generate_transparent_tcp_commands(
                 "tcp",
                 "dport",
                 "1-65535",
-                "meta",
-                "mark",
-                "set",
-                TRANSPARENT_TCP_MARK,
                 "redirect",
                 "to",
                 &format!(":{transparent_port}"),
@@ -305,72 +304,18 @@ pub fn generate_transparent_tcp_commands(
                 "tcp",
                 "dport",
                 "1-65535",
-                "meta",
-                "mark",
-                "set",
-                TRANSPARENT_TCP_MARK,
                 "redirect",
                 "to",
                 &format!(":{transparent_port}"),
             ],
         ),
     ];
-    let mut bypass = generate_bypass_commands(host_ip, proxy_port, log_prefix);
-    let insertion = bypass
-        .iter()
-        .position(|command| {
-            command.args.iter().any(|arg| arg == "log")
-                || command.args.iter().any(|arg| arg == "reject")
-        })
-        .unwrap_or(bypass.len());
-    let rules = [
-        nft_cmd(
-            true,
-            &[
-                "add",
-                "rule",
-                "inet",
-                "openshell_bypass",
-                "output",
-                "udp",
-                "dport",
-                &dns_port.to_string(),
-                "accept",
-            ],
-        ),
-        nft_cmd(
-            true,
-            &[
-                "add",
-                "rule",
-                "inet",
-                "openshell_bypass",
-                "output",
-                "tcp",
-                "dport",
-                &dns_port.to_string(),
-                "accept",
-            ],
-        ),
-        nft_cmd(
-            true,
-            &[
-                "add",
-                "rule",
-                "inet",
-                "openshell_bypass",
-                "output",
-                "meta",
-                "mark",
-                TRANSPARENT_TCP_MARK,
-                "tcp",
-                "dport",
-                &transparent_port.to_string(),
-                "accept",
-            ],
-        ),
-    ];
-    bypass.splice(insertion..insertion, rules);
+    let bypass = generate_bypass_commands(host_ip, proxy_port, log_prefix);
+    // NAT REDIRECT rewrites both DNS and synthetic TCP to loopback before the
+    // filter hook. The existing `oifname lo accept` is therefore the only
+    // filter exception required. Authorization is enforced after accept by
+    // SO_ORIGINAL_DST plus the synthetic-address mapping; packet marks do not
+    // survive as a meaningful security boundary here.
     cmds.extend(bypass);
     cmds
 }
@@ -610,46 +555,30 @@ mod tests {
         let commands = generate_transparent_tcp_commands(
             "10.200.0.1",
             3128,
-            53,
+            15053,
             15001,
             "198.18.0.0/24",
             "fd23:6f70:656e::/48",
             None,
         );
         let text = all_strs(&commands);
-        assert!(text.contains("udp dport 53 redirect to :53"));
-        assert!(text.contains("tcp dport 53 redirect to :53"));
-        assert!(text.contains("udp dport 53 accept"));
-        assert!(text.contains(
-            "ip daddr 198.18.0.0/24 tcp dport 1-65535 meta mark set 0x4f535450 redirect to :15001"
-        ));
+        assert!(text.contains("meta nfproto ipv4 udp dport 53 redirect to :15053"));
+        assert!(text.contains("meta nfproto ipv4 tcp dport 53 redirect to :15053"));
+        assert!(!text.contains("udp dport 53 accept"));
+        assert!(text.contains("ip daddr 198.18.0.0/24 tcp dport 1-65535 redirect to :15001"));
         assert!(
-            text.contains("ip6 daddr fd23:6f70:656e::/48 tcp dport 1-65535 meta mark set 0x4f535450 redirect to :15001")
+            text.contains("ip6 daddr fd23:6f70:656e::/48 tcp dport 1-65535 redirect to :15001")
         );
-        assert!(text.contains("meta mark 0x4f535450 tcp dport 15001 accept"));
-        assert!(!commands.iter().any(|command| {
-            command.args.ends_with(&[
-                "tcp".to_string(),
-                "dport".to_string(),
-                "15001".to_string(),
-                "accept".to_string(),
-            ]) && !command.args.windows(3).any(|window| {
-                window
-                    == [
-                        "meta".to_string(),
-                        "mark".to_string(),
-                        "0x4f535450".to_string(),
-                    ]
-            })
-        }));
+        assert!(!text.contains("meta mark"));
         assert!(text.contains("oifname lo accept"));
         assert!(
-            text.find("ip daddr 198.18.0.0/24 tcp dport 1-65535 meta mark set 0x4f535450 redirect to :15001")
+            text.find("ip daddr 198.18.0.0/24 tcp dport 1-65535 redirect to :15001")
                 .unwrap()
                 < text
                     .find("meta nfproto ipv4 meta l4proto tcp reject")
                     .unwrap()
         );
+        assert!(!text.contains("meta nfproto ipv6 udp dport 53 redirect"));
     }
 
     #[test]

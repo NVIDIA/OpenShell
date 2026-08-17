@@ -24,6 +24,14 @@ pub(crate) async fn handle_udp_query<R: TrustedResolver>(
     service: &PolicyDnsService<R>,
     wire: &[u8],
 ) -> Result<Vec<u8>, WireError> {
+    handle_udp_query_with_ipv6(service, wire, true).await
+}
+
+pub(crate) async fn handle_udp_query_with_ipv6<R: TrustedResolver>(
+    service: &PolicyDnsService<R>,
+    wire: &[u8],
+    ipv6_egress: bool,
+) -> Result<Vec<u8>, WireError> {
     let fallback_id = wire
         .get(..2)
         .map(|bytes| u16::from_be_bytes([bytes[0], bytes[1]]))
@@ -55,6 +63,9 @@ pub(crate) async fn handle_udp_query<R: TrustedResolver>(
     };
 
     let raw_name = query.name.to_ascii();
+    if family == AddressFamily::Ipv6 && !ipv6_egress {
+        return encode_message(response_with_code(&request, ResponseCode::NoError));
+    }
     match service
         .answer_query(&raw_name, family, Instant::now())
         .await
@@ -100,6 +111,14 @@ pub(crate) async fn handle_tcp_query<R: TrustedResolver>(
     service: &PolicyDnsService<R>,
     frame: &[u8],
 ) -> Result<Vec<u8>, WireError> {
+    handle_tcp_query_with_ipv6(service, frame, true).await
+}
+
+pub(crate) async fn handle_tcp_query_with_ipv6<R: TrustedResolver>(
+    service: &PolicyDnsService<R>,
+    frame: &[u8],
+    ipv6_egress: bool,
+) -> Result<Vec<u8>, WireError> {
     let declared = frame
         .get(..2)
         .map(|bytes| usize::from(u16::from_be_bytes([bytes[0], bytes[1]])))
@@ -107,7 +126,7 @@ pub(crate) async fn handle_tcp_query<R: TrustedResolver>(
     if declared > MAX_DNS_MESSAGE_BYTES || frame.len() != declared + 2 {
         return Err(WireError::InvalidTcpFrame);
     }
-    let response = handle_udp_query(service, &frame[2..]).await?;
+    let response = handle_udp_query_with_ipv6(service, &frame[2..], ipv6_egress).await?;
     let length = u16::try_from(response.len()).map_err(|_| WireError::Encode)?;
     let mut framed = Vec::with_capacity(response.len() + 2);
     framed.extend_from_slice(&length.to_be_bytes());
@@ -291,6 +310,19 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
         let response = Message::from_vec(&wire).unwrap();
         assert_eq!(response.metadata.response_code, ResponseCode::NoError);
         assert!(response.answers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn runtime_without_ipv6_egress_suppresses_aaaa_without_resolving() {
+        let service = service();
+        let wire =
+            handle_udp_query_with_ipv6(&service, &request("db.example.", RecordType::AAAA), false)
+                .await
+                .unwrap();
+        let response = Message::from_vec(&wire).unwrap();
+        assert_eq!(response.metadata.response_code, ResponseCode::NoError);
+        assert!(response.answers.is_empty());
+        assert_eq!(service.resolver.calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

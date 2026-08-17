@@ -587,6 +587,7 @@ async fn handle_transparent_tcp_connection(
             original,
             MappingLookupError::InvalidMapping,
         );
+        emit_activity(&activity_tx, true, "transparent_tcp_mapping");
         return Ok(());
     };
 
@@ -705,7 +706,25 @@ async fn handle_transparent_tcp_connection(
             "upstream_proxy_validated_ip",
         ),
         Some(upstream_proxy::ConnectTarget::Hostname) => {
-            unreachable!("transparent TCP must bind corporate-proxy CONNECT to a validated address")
+            // Transparent TCP authorization is correlated to the resolver's
+            // validated address set. A hostname-mode CONNECT would make the
+            // corporate proxy resolve again and break that binding. Treat a
+            // future invariant regression as an audited denial, not a panic.
+            emit_transparent_policy_denial(&decision, workload_addr, &host, port);
+            emit_denial(
+                &denial_tx,
+                &host,
+                port,
+                decision
+                    .binary
+                    .as_ref()
+                    .map_or("-", |path| path.to_str().unwrap_or("-")),
+                &decision,
+                "upstream proxy did not preserve the validated IP target",
+                "transparent-tcp",
+            );
+            emit_activity(&activity_tx, true, "transparent_tcp_destination");
+            return Ok(());
         }
         None => (Some(upstream_socket_peer), "direct"),
     };

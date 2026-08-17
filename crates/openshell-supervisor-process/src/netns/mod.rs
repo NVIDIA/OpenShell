@@ -21,7 +21,10 @@ use uuid::Uuid;
 const SUBNET_PREFIX: &str = "10.200.0";
 const HOST_IP_SUFFIX: u8 = 1;
 const SANDBOX_IP_SUFFIX: u8 = 2;
-pub const POLICY_DNS_PORT: u16 = 53;
+/// Unprivileged port owned by the supervisor's policy DNS service. Workload
+/// queries still target the standard DNS port and nftables redirects them to
+/// this listener before the bypass fence runs.
+pub const POLICY_DNS_PORT: u16 = 15_053;
 pub const TRANSPARENT_TCP_PORT: u16 = 15_001;
 const IP_SEARCH_PATHS: &[&str] = &["/usr/sbin/ip", "/sbin/ip", "/usr/bin/ip", "/bin/ip"];
 const NSENTER_SEARCH_PATHS: &[&str] = &[
@@ -336,7 +339,7 @@ impl NetworkNamespace {
         // the local transparent listener.
         run_ip_netns(
             &self.name,
-            &["-6", "route", "add", synthetic_ipv6_cidr, "dev", "lo"],
+            &["-6", "route", "replace", synthetic_ipv6_cidr, "dev", "lo"],
         )?;
         let nft_path = find_nft().ok_or_else(|| {
             miette::miette!(
@@ -465,7 +468,11 @@ impl NetworkNamespace {
                 if unsafe { libc::setns(ns_fd, libc::CLONE_NEWNET) } != 0 {
                     return Err(std::io::Error::last_os_error());
                 }
-                let address: std::net::SocketAddr = format!("0.0.0.0:{POLICY_DNS_PORT}")
+                // Bind the exact REDIRECT destination instead of INADDR_ANY.
+                // For UDP this keeps replies sourced from loopback so
+                // conntrack can reverse the port/address translation before
+                // delivering them to libc in nested rootless namespaces.
+                let address: std::net::SocketAddr = format!("127.0.0.1:{POLICY_DNS_PORT}")
                     .parse()
                     .map_err(|error| {
                         std::io::Error::other(format!("invalid DNS listener address: {error}"))

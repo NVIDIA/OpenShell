@@ -13,6 +13,7 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::ops::RangeInclusive;
 use std::sync::RwLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
@@ -224,6 +225,7 @@ struct StoreState {
 pub(crate) struct ResolvedEndpointStore {
     state: RwLock<StoreState>,
     config: StoreConfig,
+    pool_high_water_emitted: AtomicBool,
 }
 
 impl ResolvedEndpointStore {
@@ -244,6 +246,7 @@ impl ResolvedEndpointStore {
                 next_mapping_generation: 0,
             }),
             config,
+            pool_high_water_emitted: AtomicBool::new(false),
         }
     }
 
@@ -285,6 +288,15 @@ impl ResolvedEndpointStore {
             let address =
                 allocate_address(&mut state, request.family).ok_or(PublishError::PoolExhausted)?;
             state.allocations.insert(key, address);
+            let allocated = state.allocations.len();
+            if allocated.saturating_mul(5) >= self.config.max_mappings.saturating_mul(4)
+                && !self.pool_high_water_emitted.swap(true, Ordering::Relaxed)
+            {
+                openshell_ocsf::ocsf_emit!(build_pool_high_water_event(
+                    allocated,
+                    self.config.max_mappings,
+                ));
+            }
             address
         };
 
@@ -370,6 +382,21 @@ impl ResolvedEndpointStore {
         }
         Ok(expired.len())
     }
+}
+
+fn build_pool_high_water_event(allocated: usize, capacity: usize) -> openshell_ocsf::OcsfEvent {
+    use openshell_ocsf::{ConfigStateChangeBuilder, SeverityId, StateId, StatusId};
+
+    ConfigStateChangeBuilder::new(openshell_ocsf::ctx::ctx())
+        .severity(SeverityId::Low)
+        .status(StatusId::Success)
+        .state(StateId::Enabled, "high_water")
+        .unmapped("allocated_identities", allocated)
+        .unmapped("mapping_capacity", capacity)
+        .message(format!(
+            "Policy DNS synthetic pool reached high water: {allocated}/{capacity} identities allocated"
+        ))
+        .build()
 }
 
 fn allocate_address(state: &mut StoreState, family: AddressFamily) -> Option<IpAddr> {
@@ -554,6 +581,15 @@ mod tests {
             store.lookup("198.18.0.2".parse().unwrap(), 5432, 2, now),
             Err(MappingLookupError::Missing)
         ));
+    }
+
+    #[test]
+    fn pool_high_water_event_reports_capacity_without_reclaiming_addresses() {
+        let event = build_pool_high_water_event(4, 5);
+        let json = serde_json::to_value(event).unwrap();
+        assert_eq!(json["unmapped"]["allocated_identities"], 4);
+        assert_eq!(json["unmapped"]["mapping_capacity"], 5);
+        assert_eq!(json["state"], "high_water");
     }
 
     #[test]
