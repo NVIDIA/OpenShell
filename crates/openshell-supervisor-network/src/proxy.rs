@@ -574,25 +574,8 @@ async fn handle_transparent_tcp_connection(
     };
     let host = mapping.record.normalized_name.as_str().to_string();
     let port = original.port();
-    let Some(pinned_ip) = mapping
-        .record
-        .contracts
-        .iter()
-        .filter(|contract| contract.port == port)
-        .flat_map(|contract| contract.pinned_addresses.iter().copied())
-        .next()
-    else {
-        emit_transparent_mapping_denial(
-            workload_addr,
-            original,
-            MappingLookupError::InvalidMapping,
-        );
-        emit_activity(&activity_tx, true, "transparent_tcp_mapping");
-        return Ok(());
-    };
-
     let connection = crate::procfs::WorkloadProxyTcpConnection::new(workload_addr, original);
-    let intent = EgressIntent::transparent_tcp(host.clone(), port, pinned_ip);
+    let intent = EgressIntent::transparent_tcp(host.clone(), port);
     let engine = opa_engine.clone();
     let cache = identity_cache.clone();
     let pid = entrypoint_pid.clone();
