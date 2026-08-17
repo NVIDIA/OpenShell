@@ -11,7 +11,6 @@
 
 use super::destination::DestinationValidationPlan;
 use crate::opa::NetworkAction;
-use std::net::IpAddr;
 use std::path::PathBuf;
 
 #[derive(Debug, Clone)]
@@ -84,9 +83,6 @@ pub(super) enum EgressTransport {
 pub(super) struct RequestedDestination {
     pub(super) host: String,
     pub(super) port: u16,
-    /// Address selected from a policy-authorized DNS answer. Explicit proxy
-    /// adapters leave this empty; the transparent adapter will require it.
-    pub(super) pinned_ip: Option<IpAddr>,
 }
 
 /// Transport-neutral description of an external egress request.
@@ -106,25 +102,17 @@ impl EgressIntent {
     }
 
     #[cfg(test)]
-    pub(super) fn transparent_tcp(host: String, port: u16, pinned_ip: IpAddr) -> Self {
+    pub(super) fn transparent_tcp(host: String, port: u16) -> Self {
         Self {
             transport: EgressTransport::TransparentTcp,
-            destination: RequestedDestination {
-                host,
-                port,
-                pinned_ip: Some(pinned_ip),
-            },
+            destination: RequestedDestination { host, port },
         }
     }
 
     fn new(transport: EgressTransport, host: String, port: u16) -> Self {
         Self {
             transport,
-            destination: RequestedDestination {
-                host,
-                port,
-                pinned_ip: None,
-            },
+            destination: RequestedDestination { host, port },
         }
     }
 }
@@ -182,14 +170,12 @@ mod tests {
         assert_eq!(connect.transport, EgressTransport::Connect);
         assert_eq!(connect.destination.host, "api.example.com");
         assert_eq!(connect.destination.port, 443);
-        assert_eq!(connect.destination.pinned_ip, None);
         assert_eq!(forward.transport, EgressTransport::ForwardHttp);
         assert_eq!(forward.destination.port, 80);
 
-        let pinned_ip = "203.0.113.8".parse().unwrap();
-        let transparent =
-            EgressIntent::transparent_tcp("db.example.com".to_string(), 5432, pinned_ip);
+        let transparent = EgressIntent::transparent_tcp("db.example.com".to_string(), 5432);
         assert_eq!(transparent.transport, EgressTransport::TransparentTcp);
-        assert_eq!(transparent.destination.pinned_ip, Some(pinned_ip));
+        assert_eq!(transparent.destination.host, "db.example.com");
+        assert_eq!(transparent.destination.port, 5432);
     }
 }

@@ -307,6 +307,40 @@ fn missing_authorized_exact_host_preserves_false_fallback() {
 }
 
 #[test]
+fn authoritative_evaluation_error_denies_without_metadata_fallback() {
+    let engine = OpaEngine::from_strings(
+        include_str!("../../../data/sandbox-policy.rego"),
+        r#"
+network_policies:
+  proxy_compatibility:
+    name: proxy_compatibility
+    endpoints:
+      - host: "*.example.com"
+        port: 443
+    binaries:
+      - path: /**
+"#,
+    )
+    .unwrap();
+
+    // Regorus rejects the NUL byte used internally by its glob matcher. The
+    // combined authorization query must deny rather than preserve the old
+    // multi-query behavior that could fall back to an L4-only allow.
+    let decision = evaluate_endpoint_only_opa(
+        &engine,
+        EgressIntent::connect("sub\0.example.com".to_string(), 443),
+    );
+
+    let NetworkAction::Deny { reason } = decision.action else {
+        panic!("evaluation errors must deny the request");
+    };
+    assert!(reason.starts_with("policy evaluation error:"));
+    assert!(decision.endpoint.policy_configs.is_empty());
+    assert!(decision.endpoint.matched_endpoints.is_empty());
+    assert!(decision.endpoint.destination.is_none());
+}
+
+#[test]
 fn identity_required_policy_accepts_real_binary_and_rejects_empty_exec_path() {
     let engine = OpaEngine::from_strings(
         include_str!("../../../data/sandbox-policy.rego"),
