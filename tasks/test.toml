@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# Test tasks (Rust + Python + TypeScript SDK)
+# Test tasks
 
 [test]
 description = "Run all tests (Rust + Python + TypeScript SDK)"
@@ -61,8 +61,8 @@ run = "uv run --no-project --with pytest pytest -o \"python_files=*_test.py\" ta
 hide = true
 
 [e2e]
-description = "Run all end-to-end tests (Rust + Python + MCP)"
-depends = ["e2e:rust", "e2e:python", "e2e:mcp"]
+description = "Run all end-to-end tests (Rust + Python + Go + MCP)"
+depends = ["e2e:rust", "e2e:python", "e2e:go:docker", "e2e:mcp"]
 
 ["e2e:test"]
 description = "Build the current checkout and run a named host or Nix test-guest E2E suite"
@@ -134,6 +134,18 @@ description = "Run Python e2e tests against a Docker-backed gateway (E2E_PARALLE
 depends = ["python:proto"]
 env = { UV_NO_SYNC = "1", PYTHONPATH = "python" }
 run = "e2e/with-docker-gateway.sh uv run pytest -o python_files='test_*.py *_test.py' -m 'not gpu' -n ${E2E_PARALLEL:-5} e2e/python"
+
+["e2e:go"]
+description = "Run Go SDK e2e tests against a Podman-backed gateway"
+run = [
+  "e2e/with-podman-gateway.sh bash -c 'cd e2e/go && go vet -tags=e2e ./... && go test -tags=e2e -timeout 8m -parallel ${E2E_PARALLEL:-5} ./...'",
+]
+
+["e2e:go:docker"]
+description = "Run Go SDK e2e tests against a Docker-backed gateway"
+run = [
+  "e2e/with-docker-gateway.sh bash -c 'cd e2e/go && go vet -tags=e2e ./... && go test -tags=e2e -timeout 8m -parallel ${E2E_PARALLEL:-5} ./...'",
+]
 
 ["e2e:podman"]
 description = "Run Rust CLI e2e tests against a Podman-backed gateway"
