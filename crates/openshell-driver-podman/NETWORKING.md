@@ -325,15 +325,10 @@ dials subject to the terminal bypass fence. The Podman driver advertises this
 substrate through its driver-owned runtime capability; sandbox image and policy
 environment values cannot opt into it independently.
 
-The container spec sets Podman's DNS search list to `.`. Podman documents this
-value as disabling implicit search domains; direct bridge aliases still resolve
-through aardvark-dns. This keeps libc from expanding a policy endpoint into an
-unauthorized `<endpoint>.dns.podman` query after the exact lookup.
-
-The spec also sets the resolver option `use-vc`, directing libc through the
-policy DNS TCP listener. Rootless Podman's nested UDP REDIRECT path delivers
-queries to the supervisor but can lose the translated reply; TCP avoids that
-runtime-specific return-path failure while preserving policy DNS behavior.
+The container spec preserves Podman's resolver search domains and options.
+Policy DNS captures both UDP and TCP in the inner namespace, so it does not
+depend on libc honoring `use-vc` and does not change ordinary short-name
+resolution for sandboxes that do not use native TCP.
 
 A tmpfs is mounted at `/run/netns` in the container spec so the supervisor can
 create named network namespaces. In rootless Podman this directory does not

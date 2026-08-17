@@ -14,10 +14,15 @@ use tempfile::NamedTempFile;
 // Use a qualified policy hostname so runtime-provided resolver search domains
 // (for example Podman's `dns.podman`) cannot rewrite the policy identity.
 const FIXTURE_ALIAS: &str = "transparent-tcp-fixture.openshell.test";
+const MUSL_FIXTURE_ALIAS: &str = "transparent-tcp-musl.openshell.test";
 const FIXTURE_PORT: u16 = 5432;
 const TRANSPARENT_LISTENER_PORT: u16 = 15001;
 
 fn write_policy() -> Result<NamedTempFile, String> {
+    write_policy_for(FIXTURE_ALIAS)
+}
+
+fn write_policy_for(host: &str) -> Result<NamedTempFile, String> {
     let mut file = NamedTempFile::new().map_err(|error| format!("create policy: {error}"))?;
     let policy = format!(
         r#"version: 1
@@ -31,7 +36,7 @@ network_policies:
   native_database:
     name: native_database
     endpoints:
-      - host: {FIXTURE_ALIAS}
+      - host: {host}
         port: {FIXTURE_PORT}
         protocol: tcp
         allowed_ips: ["10.0.0.0/8", "172.0.0.0/8", "192.168.0.0/16"]
@@ -44,6 +49,62 @@ network_policies:
     file.flush()
         .map_err(|error| format!("flush policy: {error}"))?;
     Ok(file)
+}
+
+#[tokio::test]
+async fn rootless_podman_musl_client_uses_udp_policy_dns() {
+    if !is_e2e_driver("podman") {
+        return;
+    }
+
+    let fixture = SupportContainer::start_python(
+        MUSL_FIXTURE_ALIAS,
+        &format!(
+            r#"import socket
+s = socket.socket()
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(('0.0.0.0', {FIXTURE_PORT}))
+s.listen()
+while True:
+  c, _ = s.accept()
+  data = c.recv(1024)
+  c.sendall(b'musl-native-tcp-ok:' + data)
+  c.close()
+"#
+        ),
+        FIXTURE_PORT,
+    )
+    .await
+    .expect("start musl TCP fixture");
+
+    let image = tempfile::tempdir().expect("create Alpine build context");
+    std::fs::write(
+        image.path().join("Dockerfile"),
+        "FROM docker.io/library/alpine:3.22\nRUN addgroup -g 1000 sandbox && adduser -D -u 1000 -G sandbox sandbox\n",
+    )
+    .expect("write Alpine Dockerfile");
+    let policy = write_policy_for(MUSL_FIXTURE_ALIAS).expect("write musl policy");
+    let policy_path = policy.path().to_string_lossy().into_owned();
+    let image_path = image.path().to_string_lossy().into_owned();
+    let mut sandbox = SandboxGuard::create_keep_with_args(
+        &["--from", &image_path, "--policy", &policy_path, "--no-tty"],
+        &["sh", "-c", "echo Ready; sleep infinity"],
+        "Ready",
+    )
+    .await
+    .expect("create Alpine/musl sandbox");
+
+    let script = format!(
+        "set -eu; nslookup {MUSL_FIXTURE_ALIAS} | grep -E 'Address: 198\\.1[89]\\.'; printf probe | nc -w 5 {MUSL_FIXTURE_ALIAS} {FIXTURE_PORT} | grep musl-native-tcp-ok:probe; echo musl-policy-dns-ok"
+    );
+    let output = sandbox
+        .exec(&["sh", "-c", &script])
+        .await
+        .expect("exercise musl UDP policy DNS");
+    assert!(output.contains("musl-policy-dns-ok"), "{output}");
+
+    sandbox.cleanup().await;
+    drop(fixture);
 }
 
 async fn run_cli(args: &[&str]) -> Result<String, String> {

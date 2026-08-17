@@ -1111,8 +1111,6 @@ pub fn build_container_spec_for_image(
             "SYS_ADMIN".into(),
             // Network namespace veth setup, IP/route configuration.
             "NET_ADMIN".into(),
-            // Policy DNS binds TCP and UDP port 53 inside the nested namespace.
-            "NET_BIND_SERVICE".into(),
             // Reading /proc/<pid>/exe and ancestor walk for process identity in policy.
             "SYS_PTRACE".into(),
             // Reading /dev/kmsg for bypass-detection diagnostics.
@@ -1227,16 +1225,11 @@ pub fn build_container_spec_for_image(
         // reach services on the host. `host.openshell.internal` is the driver-
         // neutral alias used by policies and e2e tests.
         hostadd: hostadd_entries(config),
-        // Podman's documented `.` value removes implicit search domains while
-        // retaining its managed nameserver and direct network-alias lookups.
-        // Policy DNS must evaluate the exact endpoint names authored in policy;
-        // suffix-expanded names otherwise produce spurious policy denials.
-        dns_search: vec![".".into()],
-        // Rootless Podman's nested UDP REDIRECT path can receive policy DNS
-        // queries without delivering the translated reply to libc. Use the
-        // policy DNS TCP listener, which preserves the same exact-name and
-        // fail-closed behavior without relying on that UDP NAT return path.
-        dns_option: vec!["use-vc".into()],
+        // Preserve Podman's resolver defaults for both policy-DNS and ordinary
+        // sandboxes. Namespace-local capture supports UDP and TCP, so it must
+        // not depend on a libc-specific option or alter short-name searches.
+        dns_search: Vec::new(),
+        dns_option: Vec::new(),
         netns: NetNS {
             nsmode: "bridge".to_string(),
         },
@@ -1558,8 +1551,8 @@ mod tests {
         );
         assert_eq!(container["user"].as_str(), Some("0:0"));
         assert_eq!(container["image_pull_policy"].as_str(), Some("never"));
-        assert_eq!(container["dns_search"], serde_json::json!(["."]));
-        assert_eq!(container["dns_option"], serde_json::json!(["use-vc"]));
+        assert_eq!(container["dns_search"], serde_json::json!([]));
+        assert_eq!(container["dns_option"], serde_json::json!([]));
         assert_eq!(
             container["env"][openshell_core::sandbox_env::OCI_IMAGE_USER].as_str(),
             Some("app:staff")
@@ -1809,10 +1802,7 @@ mod tests {
             .collect();
         assert!(added.contains(&"SYS_ADMIN"), "missing SYS_ADMIN");
         assert!(added.contains(&"NET_ADMIN"), "missing NET_ADMIN");
-        assert!(
-            added.contains(&"NET_BIND_SERVICE"),
-            "missing NET_BIND_SERVICE for policy DNS port 53"
-        );
+        assert!(!added.contains(&"NET_BIND_SERVICE"));
         assert!(added.contains(&"SYS_PTRACE"), "missing SYS_PTRACE");
         assert!(added.contains(&"SYSLOG"), "missing SYSLOG");
         assert!(
