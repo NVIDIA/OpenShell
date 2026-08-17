@@ -30,6 +30,13 @@ pub(crate) enum AddressFamily {
 }
 
 impl AddressFamily {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Ipv4 => "ipv4",
+            Self::Ipv6 => "ipv6",
+        }
+    }
+
     pub(crate) fn record_type(self) -> RecordType {
         match self {
             Self::Ipv4 => RecordType::A,

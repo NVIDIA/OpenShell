@@ -26,9 +26,9 @@ mod wire;
 pub(crate) use name::NormalizedName;
 pub(crate) use resolver::{AddressFamily, SocketTrustedResolver, TrustedAnswer, TrustedResolver};
 pub(crate) use store::{
-    MappingLookup, MappingLookupError, PolicyDnsMetricsSnapshot, PolicyEndpointId, PublishError,
-    PublishRequest, ResolvedEndpointRecord, ResolvedEndpointStore, ResolvedPortContract,
-    StoreConfig, SyntheticPools,
+    MappingLookup, MappingLookupError, PolicyEndpointId, PublishError, PublishRequest,
+    ResolvedEndpointRecord, ResolvedEndpointStore, ResolvedPortContract, StoreConfig,
+    SyntheticPools,
 };
 
 use crate::opa::OpaEngine;
@@ -107,11 +107,9 @@ impl<R: TrustedResolver> PolicyDnsService<R> {
         family: AddressFamily,
         now: Instant,
     ) -> Result<SyntheticAnswer, PolicyDnsError> {
-        self.store.note_query();
         let normalized_name =
             NormalizedName::parse(raw_name).map_err(|_| PolicyDnsError::InvalidName)?;
         if is_host_gateway_alias(normalized_name.as_str()) && self.trusted_host_gateway.is_none() {
-            self.store.note_refused();
             emit_dns_denial(
                 &normalized_name,
                 "policy_dns_trusted_gateway_unavailable",
@@ -129,7 +127,6 @@ impl<R: TrustedResolver> PolicyDnsService<R> {
             self.trusted_host_gateway,
         )?;
         if eligible.is_empty() {
-            self.store.note_refused();
             emit_dns_denial(
                 &normalized_name,
                 "policy_dns_ineligible",
@@ -140,8 +137,21 @@ impl<R: TrustedResolver> PolicyDnsService<R> {
 
         // The trusted resolver is invoked only after the immutable snapshot
         // proved policy eligibility. It never consults sandbox resolver state.
-        self.store.note_upstream_query();
-        let trusted_answer = self.resolver.resolve(&normalized_name, family).await?;
+        let endpoint_context = eligible_endpoint_context(&eligible);
+        let trusted_answer = match self.resolver.resolve(&normalized_name, family).await {
+            Ok(answer) => answer,
+            Err(error) => {
+                emit_dns_failure(
+                    &normalized_name,
+                    family,
+                    &endpoint_context,
+                    snapshot.generation,
+                    resolver_failure_detail(&error),
+                    "Policy DNS trusted resolver query failed",
+                );
+                return Err(PolicyDnsError::Resolver(error));
+            }
+        };
         let ttl = clamp_mapping_ttl(trusted_answer.ttl);
         let allocation_identity = allocation_identity(&eligible);
         let mut contracts = Vec::new();
@@ -167,7 +177,6 @@ impl<R: TrustedResolver> PolicyDnsService<R> {
             (&left.endpoint_id, left.port).cmp(&(&right.endpoint_id, right.port))
         });
         if contracts.is_empty() {
-            self.store.note_no_valid_address();
             emit_dns_denial(
                 &normalized_name,
                 "policy_dns_no_valid_address",
@@ -184,14 +193,50 @@ impl<R: TrustedResolver> PolicyDnsService<R> {
             ttl,
             contracts,
         };
-        let publication = self
+        let record = match self
             .policy
             .with_current_generation(snapshot.generation, |current_generation| {
                 self.store.publish(request, current_generation, now)
-            })
-            .map_err(|error| PolicyDnsError::Policy(error.to_string()))?
-            .ok_or(PolicyDnsError::StalePolicy)?;
-        let record = publication?;
+            }) {
+            Ok(Some(Ok(record))) => record,
+            Ok(Some(Err(error))) => {
+                // InvalidMapping is unreachable for the well-formed request
+                // assembled above, and LockPoisoned requires a prior panic
+                // while holding the store lock. Keep both defensive outcomes
+                // observable because the store API intentionally rejects them.
+                emit_dns_failure(
+                    &normalized_name,
+                    family,
+                    &endpoint_context,
+                    snapshot.generation,
+                    publication_failure_detail(error),
+                    "Policy DNS resolved-endpoint mapping publication failed",
+                );
+                return Err(PolicyDnsError::Publish(error));
+            }
+            Ok(None) => {
+                emit_dns_failure(
+                    &normalized_name,
+                    family,
+                    &endpoint_context,
+                    snapshot.generation,
+                    "policy_dns_publication_stale_generation",
+                    "Policy DNS discarded a stale resolved-endpoint mapping",
+                );
+                return Err(PolicyDnsError::StalePolicy);
+            }
+            Err(error) => {
+                emit_dns_failure(
+                    &normalized_name,
+                    family,
+                    &endpoint_context,
+                    snapshot.generation,
+                    "policy_dns_publication_generation_check_failed",
+                    "Policy DNS could not validate the active policy generation before publication",
+                );
+                return Err(PolicyDnsError::Policy(error.to_string()));
+            }
+        };
         emit_mapping_publication(&record);
         Ok(SyntheticAnswer {
             address: record.synthetic_address,
@@ -278,6 +323,16 @@ fn allocation_identity(endpoints: &[EligibleEndpoint]) -> [u8; 32] {
     hasher.finalize().into()
 }
 
+fn eligible_endpoint_context(endpoints: &[EligibleEndpoint]) -> Vec<PolicyEndpointId> {
+    let mut endpoint_ids = endpoints
+        .iter()
+        .map(|endpoint| endpoint.endpoint_id.clone())
+        .collect::<Vec<_>>();
+    endpoint_ids.sort();
+    endpoint_ids.dedup();
+    endpoint_ids
+}
+
 fn value_field<'a>(value: &'a regorus::Value, key: &str) -> Option<&'a regorus::Value> {
     let regorus::Value::Object(fields) = value else {
         return None;
@@ -343,6 +398,82 @@ fn emit_dns_denial(name: &NormalizedName, detail: &str, message: &str) {
     );
 }
 
+fn resolver_failure_detail(error: &resolver::ResolveError) -> &'static str {
+    match error {
+        resolver::ResolveError::Timeout => "policy_dns_upstream_timeout",
+        resolver::ResolveError::Io(_) => "policy_dns_upstream_io_failed",
+        resolver::ResolveError::Oversized => "policy_dns_upstream_oversized_response",
+        resolver::ResolveError::Malformed => "policy_dns_upstream_malformed_response",
+        resolver::ResolveError::NxDomain => "policy_dns_upstream_nxdomain",
+        resolver::ResolveError::Response(_) => "policy_dns_upstream_error_response",
+        resolver::ResolveError::NoData => "policy_dns_upstream_no_data",
+        resolver::ResolveError::CnameLimit => "policy_dns_upstream_cname_limit",
+    }
+}
+
+fn publication_failure_detail(error: PublishError) -> &'static str {
+    match error {
+        PublishError::StalePolicy => "policy_dns_publication_stale_generation",
+        PublishError::InvalidMapping => "policy_dns_publication_invalid_mapping",
+        PublishError::PoolExhausted => "policy_dns_publication_pool_exhausted",
+        PublishError::LockPoisoned => "policy_dns_publication_store_unavailable",
+    }
+}
+
+fn build_dns_failure_event(
+    name: &NormalizedName,
+    family: AddressFamily,
+    eligible_endpoints: &[PolicyEndpointId],
+    policy_generation: u64,
+    detail: &str,
+    message: &str,
+) -> openshell_ocsf::OcsfEvent {
+    let endpoint_context = eligible_endpoints
+        .iter()
+        .map(|endpoint| {
+            serde_json::json!({
+                "policy_name": endpoint.policy_name.as_str(),
+                "endpoint_index": endpoint.endpoint_index,
+            })
+        })
+        .collect::<Vec<_>>();
+    NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
+        .activity(ActivityId::Refuse)
+        .action(ActionId::Denied)
+        .disposition(DispositionId::Blocked)
+        .severity(SeverityId::Low)
+        .status(StatusId::Failure)
+        .dst_endpoint(Endpoint::from_domain(name.as_str(), 53))
+        .status_detail(detail)
+        .unmapped("normalized_name", name.as_str())
+        .unmapped("address_family", family.as_str())
+        .unmapped(
+            "eligible_endpoints",
+            serde_json::Value::Array(endpoint_context),
+        )
+        .unmapped("policy_generation", policy_generation)
+        .message(message)
+        .build()
+}
+
+fn emit_dns_failure(
+    name: &NormalizedName,
+    family: AddressFamily,
+    eligible_endpoints: &[PolicyEndpointId],
+    policy_generation: u64,
+    detail: &str,
+    message: &str,
+) {
+    ocsf_emit!(build_dns_failure_event(
+        name,
+        family,
+        eligible_endpoints,
+        policy_generation,
+        detail,
+        message,
+    ));
+}
+
 fn emit_mapping_publication(record: &ResolvedEndpointRecord) {
     ocsf_emit!(
         ConfigStateChangeBuilder::new(openshell_ocsf::ctx::ctx())
@@ -370,6 +501,18 @@ mod tests {
     struct FakeResolver {
         calls: AtomicUsize,
         answer: TrustedAnswer,
+    }
+
+    struct NxDomainResolver;
+
+    impl TrustedResolver for NxDomainResolver {
+        async fn resolve(
+            &self,
+            _name: &NormalizedName,
+            _family: AddressFamily,
+        ) -> Result<TrustedAnswer, resolver::ResolveError> {
+            Err(resolver::ResolveError::NxDomain)
+        }
     }
 
     impl TrustedResolver for FakeResolver {
@@ -437,7 +580,41 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
             .await;
         assert!(matches!(result, Err(PolicyDnsError::Ineligible)));
         assert_eq!(service.resolver.calls.load(Ordering::SeqCst), 0);
-        assert_eq!(service.store.metrics(Instant::now()).refused, 1);
+    }
+
+    #[tokio::test]
+    async fn eligible_nxdomain_fails_without_publishing_a_mapping() {
+        let policy = Arc::new(
+            OpaEngine::from_strings(include_str!("../../data/sandbox-policy.rego"), BASE_POLICY)
+                .unwrap(),
+        );
+        let pools = SyntheticPools::new(
+            Ipv4Addr::new(198, 18, 0, 1)..=Ipv4Addr::new(198, 18, 0, 1),
+            "fd00:1::1".parse::<Ipv6Addr>().unwrap()..="fd00:1::1".parse::<Ipv6Addr>().unwrap(),
+        )
+        .unwrap();
+        let store = Arc::new(ResolvedEndpointStore::new(
+            StoreConfig::new(pools, 1).unwrap(),
+        ));
+        let service = PolicyDnsService::new(policy, NxDomainResolver, store.clone(), None);
+
+        let result = service
+            .answer_query("DB.EXAMPLE.", AddressFamily::Ipv4, Instant::now())
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(PolicyDnsError::Resolver(resolver::ResolveError::NxDomain))
+        ));
+        assert!(matches!(
+            store.lookup(
+                "198.18.0.1".parse().unwrap(),
+                5432,
+                service.policy.current_generation(),
+                Instant::now()
+            ),
+            Err(MappingLookupError::Missing)
+        ));
     }
 
     #[tokio::test]
@@ -670,9 +847,67 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
             mapping.record.contracts[0].pinned_addresses,
             ["8.8.4.4".parse::<IpAddr>().unwrap()]
         );
-        let metrics = store.metrics(now);
-        assert_eq!(metrics.active_mappings, 1);
-        assert_eq!(metrics.allocated_identities, 1);
+    }
+
+    #[test]
+    fn policy_dns_failure_events_have_stable_actionable_context() {
+        let name = NormalizedName::parse("DB.EXAMPLE.").unwrap();
+        let endpoints = vec![PolicyEndpointId {
+            policy_name: "database".to_string(),
+            endpoint_index: 2,
+        }];
+        let event = build_dns_failure_event(
+            &name,
+            AddressFamily::Ipv4,
+            &endpoints,
+            7,
+            "policy_dns_upstream_nxdomain",
+            "Policy DNS trusted resolver query failed",
+        );
+        let json = serde_json::to_value(event).unwrap();
+
+        assert_eq!(json["activity_name"], "Refuse");
+        assert_eq!(json["action"], "Denied");
+        assert_eq!(json["severity"], "Low");
+        assert_eq!(json["status"], "Failure");
+        assert_eq!(json["status_detail"], "policy_dns_upstream_nxdomain");
+        assert_eq!(json["dst_endpoint"]["domain"], "db.example");
+        assert_eq!(json["dst_endpoint"]["port"], 53);
+        assert_eq!(json["unmapped"]["normalized_name"], "db.example");
+        assert_eq!(json["unmapped"]["address_family"], "ipv4");
+        assert_eq!(json["unmapped"]["policy_generation"], 7);
+        assert_eq!(
+            json["unmapped"]["eligible_endpoints"],
+            serde_json::json!([{"policy_name": "database", "endpoint_index": 2}])
+        );
+    }
+
+    #[test]
+    fn resolver_and_publication_failures_have_stable_reason_codes() {
+        assert_eq!(
+            resolver_failure_detail(&resolver::ResolveError::NxDomain),
+            "policy_dns_upstream_nxdomain"
+        );
+        assert_eq!(
+            resolver_failure_detail(&resolver::ResolveError::Timeout),
+            "policy_dns_upstream_timeout"
+        );
+        assert_eq!(
+            publication_failure_detail(PublishError::StalePolicy),
+            "policy_dns_publication_stale_generation"
+        );
+        assert_eq!(
+            publication_failure_detail(PublishError::InvalidMapping),
+            "policy_dns_publication_invalid_mapping"
+        );
+        assert_eq!(
+            publication_failure_detail(PublishError::PoolExhausted),
+            "policy_dns_publication_pool_exhausted"
+        );
+        assert_eq!(
+            publication_failure_detail(PublishError::LockPoisoned),
+            "policy_dns_publication_store_unavailable"
+        );
     }
 
     #[test]

@@ -27,6 +27,9 @@ impl NormalizedName {
             return Err(NameError);
         }
 
+        // DNS names are case-insensitive. Canonicalizing to lowercase also
+        // prevents DNS 0x20 case variation from becoming an unobserved data
+        // channel in policy matching and synthetic-allocation identities.
         let normalized = parsed.to_ascii().trim_end_matches('.').to_ascii_lowercase();
         if normalized.is_empty() {
             return Err(NameError);

@@ -12,8 +12,7 @@ use crate::proxy::destination::{
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::ops::RangeInclusive;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::RwLock;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
@@ -204,30 +203,6 @@ pub(crate) enum MappingLookupError {
     LockPoisoned,
 }
 
-#[derive(Default)]
-struct PolicyDnsMetrics {
-    queries: AtomicU64,
-    refused: AtomicU64,
-    upstream_queries: AtomicU64,
-    no_valid_address: AtomicU64,
-    mappings_published: AtomicU64,
-    mappings_expired: AtomicU64,
-    pool_exhausted: AtomicU64,
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) struct PolicyDnsMetricsSnapshot {
-    pub(crate) queries: u64,
-    pub(crate) refused: u64,
-    pub(crate) upstream_queries: u64,
-    pub(crate) no_valid_address: u64,
-    pub(crate) mappings_published: u64,
-    pub(crate) mappings_expired: u64,
-    pub(crate) pool_exhausted: u64,
-    pub(crate) active_mappings: usize,
-    pub(crate) allocated_identities: usize,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct AllocationKey {
     normalized_name: NormalizedName,
@@ -249,7 +224,6 @@ struct StoreState {
 pub(crate) struct ResolvedEndpointStore {
     state: RwLock<StoreState>,
     config: StoreConfig,
-    metrics: Arc<PolicyDnsMetrics>,
 }
 
 impl ResolvedEndpointStore {
@@ -270,28 +244,7 @@ impl ResolvedEndpointStore {
                 next_mapping_generation: 0,
             }),
             config,
-            metrics: Arc::new(PolicyDnsMetrics::default()),
         }
-    }
-
-    pub(crate) fn note_query(&self) {
-        self.metrics.queries.fetch_add(1, Ordering::Relaxed);
-    }
-
-    pub(crate) fn note_refused(&self) {
-        self.metrics.refused.fetch_add(1, Ordering::Relaxed);
-    }
-
-    pub(crate) fn note_upstream_query(&self) {
-        self.metrics
-            .upstream_queries
-            .fetch_add(1, Ordering::Relaxed);
-    }
-
-    pub(crate) fn note_no_valid_address(&self) {
-        self.metrics
-            .no_valid_address
-            .fetch_add(1, Ordering::Relaxed);
     }
 
     pub(crate) fn publish(
@@ -327,13 +280,10 @@ impl ResolvedEndpointStore {
             *address
         } else {
             if state.allocations.len() >= self.config.max_mappings {
-                self.metrics.pool_exhausted.fetch_add(1, Ordering::Relaxed);
                 return Err(PublishError::PoolExhausted);
             }
-            let address = allocate_address(&mut state, request.family).ok_or_else(|| {
-                self.metrics.pool_exhausted.fetch_add(1, Ordering::Relaxed);
-                PublishError::PoolExhausted
-            })?;
+            let address =
+                allocate_address(&mut state, request.family).ok_or(PublishError::PoolExhausted)?;
             state.allocations.insert(key, address);
             address
         };
@@ -363,9 +313,6 @@ impl ResolvedEndpointStore {
         };
         state.expired_allocations.remove(&synthetic_address);
         state.records.insert(synthetic_address, record.clone());
-        self.metrics
-            .mappings_published
-            .fetch_add(1, Ordering::Relaxed);
         Ok(record)
     }
 
@@ -421,32 +368,7 @@ impl ResolvedEndpointStore {
             state.records.remove(address);
             state.expired_allocations.insert(*address);
         }
-        self.metrics
-            .mappings_expired
-            .fetch_add(expired.len() as u64, Ordering::Relaxed);
         Ok(expired.len())
-    }
-
-    pub(crate) fn metrics(&self, now: Instant) -> PolicyDnsMetricsSnapshot {
-        let state = self
-            .state
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        PolicyDnsMetricsSnapshot {
-            queries: self.metrics.queries.load(Ordering::Relaxed),
-            refused: self.metrics.refused.load(Ordering::Relaxed),
-            upstream_queries: self.metrics.upstream_queries.load(Ordering::Relaxed),
-            no_valid_address: self.metrics.no_valid_address.load(Ordering::Relaxed),
-            mappings_published: self.metrics.mappings_published.load(Ordering::Relaxed),
-            mappings_expired: self.metrics.mappings_expired.load(Ordering::Relaxed),
-            pool_exhausted: self.metrics.pool_exhausted.load(Ordering::Relaxed),
-            active_mappings: state
-                .records
-                .values()
-                .filter(|record| now < record.expires_at)
-                .count(),
-            allocated_identities: state.allocations.len(),
-        }
     }
 }
 
@@ -470,7 +392,7 @@ fn allocate_address(state: &mut StoreState, family: AddressFamily) -> Option<IpA
 mod tests {
     use super::*;
     use crate::proxy::destination::{AddressAuthorization, DestinationValidationPlan};
-    use std::sync::Barrier;
+    use std::sync::{Arc, Barrier};
 
     fn store(max_mappings: usize) -> ResolvedEndpointStore {
         let pools = SyntheticPools::new(
@@ -617,17 +539,21 @@ mod tests {
             store.publish(request("stale.example", 1, Duration::from_secs(5)), 2, now),
             Err(PublishError::StalePolicy)
         ));
-        store
+        let first = store
             .publish(request("first.example", 2, Duration::from_secs(5)), 2, now)
             .unwrap();
         assert!(matches!(
             store.publish(request("second.example", 2, Duration::from_secs(5)), 2, now),
             Err(PublishError::PoolExhausted)
         ));
-        let metrics = store.metrics(now);
-        assert_eq!(metrics.allocated_identities, 1);
-        assert_eq!(metrics.active_mappings, 1);
-        assert_eq!(metrics.pool_exhausted, 1);
+        let preserved = store
+            .lookup(first.synthetic_address, 5432, 2, now)
+            .expect("pool exhaustion must preserve the existing mapping");
+        assert_eq!(preserved.record.mapping_id, first.mapping_id);
+        assert!(matches!(
+            store.lookup("198.18.0.2".parse().unwrap(), 5432, 2, now),
+            Err(MappingLookupError::Missing)
+        ));
     }
 
     #[test]
@@ -708,7 +634,7 @@ mod tests {
             .unwrap();
         assert!(!lookup.record.contracts.is_empty());
         assert!(!lookup.record.contracts[0].pinned_addresses.is_empty());
-        assert_eq!(store.metrics(now).allocated_identities, 1);
+        assert!(records.iter().all(|record| record.mapping_generation > 0));
     }
 
     #[tokio::test]
