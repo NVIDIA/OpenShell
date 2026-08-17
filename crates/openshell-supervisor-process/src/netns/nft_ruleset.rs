@@ -310,12 +310,41 @@ pub fn generate_transparent_tcp_commands(
             ],
         ),
     ];
-    let bypass = generate_bypass_commands(host_ip, proxy_port, log_prefix);
+    let mut bypass = generate_bypass_commands(host_ip, proxy_port, log_prefix);
     // NAT REDIRECT rewrites both DNS and synthetic TCP to loopback before the
-    // filter hook. The existing `oifname lo accept` is therefore the only
-    // filter exception required. Authorization is enforced after accept by
-    // SO_ORIGINAL_DST plus the synthetic-address mapping; packet marks do not
-    // survive as a meaningful security boundary here.
+    // filter hook. Some kernels retain the packet's pre-REDIRECT output
+    // interface for filter matching, so `oifname lo accept` alone is not
+    // portable. Admit only connections that the kernel records as DNATed to
+    // the transparent listener. A direct dial to that port has no DNAT status
+    // and still reaches the terminal bypass reject. Authorization after accept
+    // remains bound by SO_ORIGINAL_DST plus the synthetic-address mapping.
+    let insertion = bypass
+        .iter()
+        .position(|command| {
+            command.args.iter().any(|arg| arg == "log")
+                || command.args.iter().any(|arg| arg == "reject")
+        })
+        .unwrap_or(bypass.len());
+    bypass.insert(
+        insertion,
+        nft_cmd(
+            true,
+            &[
+                "add",
+                "rule",
+                "inet",
+                "openshell_bypass",
+                "output",
+                "ct",
+                "status",
+                "dnat",
+                "tcp",
+                "dport",
+                &transparent_port.to_string(),
+                "accept",
+            ],
+        ),
+    );
     cmds.extend(bypass);
     cmds
 }
@@ -570,7 +599,24 @@ mod tests {
             text.contains("ip6 daddr fd23:6f70:656e::/48 tcp dport 1-65535 redirect to :15001")
         );
         assert!(!text.contains("meta mark"));
+        assert!(text.contains("ct status dnat tcp dport 15001 accept"));
+        assert!(!commands.iter().any(|command| {
+            command.args.ends_with(&[
+                "tcp".to_string(),
+                "dport".to_string(),
+                "15001".to_string(),
+                "accept".to_string(),
+            ]) && !command.args.windows(3).any(|window| {
+                window == ["ct".to_string(), "status".to_string(), "dnat".to_string()]
+            })
+        }));
         assert!(text.contains("oifname lo accept"));
+        assert!(
+            text.find("ct status dnat tcp dport 15001 accept").unwrap()
+                < text
+                    .find("meta nfproto ipv4 meta l4proto tcp reject")
+                    .unwrap()
+        );
         assert!(
             text.find("ip daddr 198.18.0.0/24 tcp dport 1-65535 redirect to :15001")
                 .unwrap()
