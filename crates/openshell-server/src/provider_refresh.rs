@@ -39,6 +39,28 @@ pub fn refresh_state_name(provider_id: &str, credential_key: &str) -> String {
     format!("provider-refresh-{provider_id}-{key}")
 }
 
+/// Return the durable authorization epoch for one configured refresh grant.
+///
+/// Records created before the explicit epoch field was introduced use their
+/// gateway-generated object ID as a stable migration epoch. An explicit
+/// reconfiguration writes a new random epoch while preserving object metadata,
+/// so reauthorization still revokes handles derived from the legacy value.
+pub fn effective_authorization_epoch(
+    state: &StoredProviderCredentialRefreshState,
+) -> Result<&str, Status> {
+    if !state.authorization_epoch.is_empty() {
+        return Ok(&state.authorization_epoch);
+    }
+    state
+        .metadata
+        .as_ref()
+        .map(|metadata| metadata.id.as_str())
+        .filter(|id| !id.is_empty())
+        .ok_or_else(|| {
+            Status::failed_precondition("provider refresh state has no authorization epoch")
+        })
+}
+
 pub async fn put_refresh_state(
     store: &Store,
     state: &StoredProviderCredentialRefreshState,
@@ -270,6 +292,7 @@ pub fn new_refresh_state(
         refresh_before_seconds: config.refresh_before_seconds,
         max_lifetime_seconds: config.max_lifetime_seconds,
         additional_output_keys: config.additional_output_keys,
+        authorization_epoch: uuid::Uuid::new_v4().to_string(),
     })
 }
 
@@ -1234,9 +1257,9 @@ async fn run_refresh_worker_tick(
 #[cfg(test)]
 mod tests {
     use super::{
-        NewRefreshStateConfig, delete_refresh_state, get_refresh_state, new_refresh_state,
-        put_refresh_state, refresh_provider_credential, refresh_state_name, refresh_strategy_name,
-        run_refresh_worker_tick, seconds_until_ms,
+        NewRefreshStateConfig, delete_refresh_state, effective_authorization_epoch,
+        get_refresh_state, new_refresh_state, put_refresh_state, refresh_provider_credential,
+        refresh_state_name, refresh_strategy_name, run_refresh_worker_tick, seconds_until_ms,
     };
     use crate::credentials::CredentialRuntime;
     use crate::persistence::{current_time_ms, test_store};
@@ -1265,6 +1288,43 @@ mod tests {
         assert_ne!(
             refresh_state_name(provider_id, "Alex-API"),
             refresh_state_name(provider_id, "alex-api")
+        );
+    }
+
+    #[test]
+    fn new_refresh_configuration_rotates_authorization_epoch_and_legacy_state_is_stable() {
+        let provider = Provider {
+            metadata: Some(ObjectMeta {
+                id: "provider-id".to_string(),
+                name: "provider".to_string(),
+                workspace: "default".to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let config = || NewRefreshStateConfig {
+            strategy: ProviderCredentialRefreshStrategy::Oauth2RefreshToken,
+            material: HashMap::new(),
+            secret_material_keys: Vec::new(),
+            expires_at_ms: 0,
+            token_url: "https://issuer.example/token".to_string(),
+            scopes: vec!["scope".to_string()],
+            refresh_before_seconds: 300,
+            max_lifetime_seconds: 3600,
+            additional_output_keys: HashMap::new(),
+        };
+        let first = new_refresh_state(&provider, "default", "ACCESS_TOKEN", config())
+            .expect("first refresh configuration");
+        let second = new_refresh_state(&provider, "default", "ACCESS_TOKEN", config())
+            .expect("second refresh configuration");
+        assert!(!first.authorization_epoch.is_empty());
+        assert_ne!(first.authorization_epoch, second.authorization_epoch);
+
+        let mut legacy = first;
+        legacy.authorization_epoch.clear();
+        assert_eq!(
+            effective_authorization_epoch(&legacy).expect("legacy migration epoch"),
+            legacy.metadata.as_ref().expect("metadata").id
         );
     }
 
@@ -1335,6 +1395,7 @@ mod tests {
         )
         .unwrap();
         put_refresh_state(&store, &state).await.unwrap();
+        let authorization_epoch = state.authorization_epoch.clone();
 
         let refreshed = refresh_provider_credential(
             &store,
@@ -1346,6 +1407,7 @@ mod tests {
         )
         .await
         .unwrap();
+        assert_eq!(refreshed.authorization_epoch, authorization_epoch);
         assert_eq!(refreshed.status, "refreshed");
         assert!(refreshed.expires_at_ms > 0);
         assert!(refreshed.next_refresh_at_ms > 0);
@@ -1404,6 +1466,7 @@ mod tests {
         )
         .unwrap();
         put_refresh_state(&store, &state).await.unwrap();
+        let authorization_epoch = state.authorization_epoch.clone();
         let config = Config::new(None).with_credential_drivers(["test-static"]);
         let credentials = CredentialRuntime::from_config(&config).unwrap();
 
@@ -1417,6 +1480,7 @@ mod tests {
         )
         .await
         .unwrap();
+        assert_eq!(refreshed.authorization_epoch, authorization_epoch);
 
         let stored = store
             .get_message_by_name::<Provider>("default", "my-stored-graph")

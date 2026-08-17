@@ -2639,6 +2639,7 @@ network_policies:
                         path: "/socket".to_string(),
                     }],
                     credential_identity: "provider-a:DISCORD_BOT_TOKEN".to_string(),
+                    workload_credential_handle: String::new(),
                 },
             )]),
             Vec::new(),

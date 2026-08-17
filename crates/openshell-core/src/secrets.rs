@@ -173,32 +173,73 @@ impl SecretResolver {
         credential_expires_at_ms: HashMap<String, i64>,
         revision: u64,
     ) -> (HashMap<String, String>, Option<Self>, Option<Self>) {
-        if revision == 0 {
-            let (child_env, current_resolver) =
-                Self::from_provider_env_for_revision_with_current_aliases(
-                    provider_env,
-                    credential_expires_at_ms,
-                    0,
-                    true,
-                );
-            return (child_env, None, current_resolver);
-        }
-        let provider_env_for_current = provider_env.clone();
-        let credential_expires_at_ms_for_current = credential_expires_at_ms.clone();
-        let (child_env, revision_resolver) =
-            Self::from_provider_env_for_revision_with_current_aliases(
-                provider_env,
-                credential_expires_at_ms,
-                revision,
-                false,
-            );
-        let (_, current_resolver) = Self::from_provider_env_for_revision_with_current_aliases(
-            provider_env_for_current,
-            credential_expires_at_ms_for_current,
+        Self::from_provider_env_for_current_revision_with_stable_handles(
+            provider_env,
+            credential_expires_at_ms,
             revision,
-            true,
-        );
-        (child_env, revision_resolver, current_resolver)
+            &HashMap::new(),
+        )
+    }
+
+    /// Build workload environment and resolver snapshots with gateway-issued
+    /// stable handles for selected refresh-managed credentials.
+    ///
+    /// Stable credentials are registered only in the current resolver. Their
+    /// previous values never enter the bounded revision-generation queue, so a
+    /// revoked or replaced handle cannot resolve an older access token.
+    pub(crate) fn from_provider_env_for_current_revision_with_stable_handles(
+        provider_env: HashMap<String, String>,
+        credential_expires_at_ms: HashMap<String, i64>,
+        revision: u64,
+        stable_handles: &HashMap<String, String>,
+    ) -> (HashMap<String, String>, Option<Self>, Option<Self>) {
+        let mut child_env = HashMap::with_capacity(provider_env.len());
+        let mut generation_values = HashMap::new();
+        let mut current_values = HashMap::new();
+
+        for (key, value) in provider_env {
+            if uses_reserved_revision_namespace(&key) {
+                tracing::warn!(
+                    provider_env_key = %key,
+                    "skipping provider credential env var in reserved placeholder namespace"
+                );
+                continue;
+            }
+            let secret = SecretValue {
+                value: Arc::from(value),
+                expires_at_ms: credential_expires_at_ms
+                    .get(&key)
+                    .copied()
+                    .unwrap_or_default(),
+            };
+            let placeholder = stable_handles.get(&key).map_or_else(
+                || {
+                    let placeholder = placeholder_for_env_key_for_revision(&key, revision);
+                    if revision != 0 {
+                        generation_values.insert(placeholder.clone(), secret.clone());
+                    }
+                    placeholder
+                },
+                |handle| placeholder_for_env_key_for_stable_handle(&key, handle),
+            );
+            child_env.insert(key.clone(), placeholder.clone());
+            current_values.insert(placeholder, secret.clone());
+            current_values.insert(placeholder_for_env_key(&key), secret);
+        }
+
+        let resolver = |by_placeholder: HashMap<String, SecretValue>| {
+            (!by_placeholder.is_empty()).then_some(Self {
+                by_placeholder,
+                denied_env_keys: HashSet::new(),
+                identity_bound_env_keys: HashSet::new(),
+                revision_fallback_allowed_revisions: HashMap::new(),
+            })
+        };
+        (
+            child_env,
+            resolver(generation_values),
+            resolver(current_values),
+        )
     }
 
     fn from_provider_env_for_revision_with_current_aliases(
@@ -330,6 +371,7 @@ impl SecretResolver {
     pub fn resolve_placeholder(&self, value: &str) -> Option<&str> {
         if placeholder_env_key(value).is_some_and(|key| self.identity_bound_env_keys.contains(key))
             && revisioned_placeholder_parts(value).is_none()
+            && stable_placeholder_parts(value).is_none()
         {
             // Canonical placeholders and provider-shaped aliases carry no
             // credential identity. Endpoint-bound request input must use the
@@ -673,14 +715,22 @@ fn revisioned_placeholder_parts(token: &str) -> Option<(u64, &str)> {
     Some((revision.parse().ok()?, key))
 }
 
+fn stable_placeholder_parts(token: &str) -> Option<(&str, &str)> {
+    let suffix = token.strip_prefix(PLACEHOLDER_PREFIX)?;
+    let (handle, key) = split_stable_env_key(suffix)?;
+    Some((handle, key))
+}
+
 fn placeholder_env_key(token: &str) -> Option<&str> {
-    revisioned_placeholder_env_key(token)
+    stable_placeholder_parts(token)
+        .map(|(_, key)| key)
+        .or_else(|| revisioned_placeholder_env_key(token))
         .or_else(|| token.strip_prefix(PLACEHOLDER_PREFIX))
         .or_else(|| alias_env_key(token))
 }
 
 pub fn uses_reserved_revision_namespace(key: &str) -> bool {
-    split_revisioned_env_key(key).is_some()
+    split_revisioned_env_key(key).is_some() || split_stable_env_key(key).is_some()
 }
 
 fn split_revisioned_env_key(key: &str) -> Option<(&str, &str)> {
@@ -694,6 +744,21 @@ fn split_revisioned_env_key(key: &str) -> Option<(&str, &str)> {
         return None;
     }
     Some((revision, env_key))
+}
+
+fn split_stable_env_key(key: &str) -> Option<(&str, &str)> {
+    let suffix = key.strip_prefix('s')?;
+    let (handle, env_key) = suffix.split_once('_')?;
+    if handle.len() != 64
+        || !handle
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        || env_key.is_empty()
+        || !env_key.bytes().all(is_env_key_char)
+    {
+        return None;
+    }
+    Some((handle, env_key))
 }
 
 fn token_boundary_ok(text: &str, abs_start: usize, token_end: usize, token: &str) -> bool {
@@ -717,6 +782,10 @@ pub fn placeholder_for_env_key_for_revision(key: &str, revision: u64) -> String 
     } else {
         format!("{PLACEHOLDER_PREFIX}v{revision}_{key}")
     }
+}
+
+pub(crate) fn placeholder_for_env_key_for_stable_handle(key: &str, handle: &str) -> String {
+    format!("{PLACEHOLDER_PREFIX}s{handle}_{key}")
 }
 
 // ---------------------------------------------------------------------------
@@ -1341,8 +1410,12 @@ mod tests {
     fn reserved_revision_namespace_requires_version_and_key() {
         assert!(uses_reserved_revision_namespace("v10_GITHUB_TOKEN"));
         assert!(uses_reserved_revision_namespace("v999999_very_unlikely"));
+        assert!(uses_reserved_revision_namespace(
+            "saaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa_GITHUB_TOKEN"
+        ));
         assert!(!uses_reserved_revision_namespace("v_GITHUB_TOKEN"));
         assert!(!uses_reserved_revision_namespace("v10_"));
+        assert!(!uses_reserved_revision_namespace("sshort_GITHUB_TOKEN"));
         assert!(!uses_reserved_revision_namespace("very_unlikely"));
         assert!(!uses_reserved_revision_namespace("GITHUB_TOKEN"));
     }

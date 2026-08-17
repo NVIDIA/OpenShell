@@ -1981,7 +1981,7 @@ async fn compute_provider_env_revision_with_catalog_and_policy_bindings(
     policy_bindings: &HashMap<String, Vec<StaticCredentialEndpointBinding>>,
 ) -> Result<u64, Status> {
     let mut hasher = Sha256::new();
-    hasher.update(b"openshell-provider-env-revision-v3");
+    hasher.update(b"openshell-provider-env-revision-v4");
 
     for provider_name in provider_names {
         hasher.update(provider_name.as_bytes());
@@ -1998,6 +1998,10 @@ async fn compute_provider_env_revision_with_catalog_and_policy_bindings(
                 let provider = Provider::decode(record.payload.as_slice()).map_err(|e| {
                     Status::internal(format!("decode provider '{provider_name}' failed: {e}"))
                 })?;
+                let refresh_states =
+                    crate::provider_refresh::list_refresh_states_for_provider(store, &record.id)
+                        .await?;
+                hash_provider_refresh_states(&refresh_states, &mut hasher)?;
                 hasher.update(provider.r#type.as_bytes());
                 hash_provider_profile_revision(
                     catalog,
@@ -2050,7 +2054,7 @@ fn compute_provider_env_revision_from_records_and_policy_bindings(
     policy_bindings: &HashMap<String, Vec<StaticCredentialEndpointBinding>>,
 ) -> Result<u64, Status> {
     let mut hasher = Sha256::new();
-    hasher.update(b"openshell-provider-env-revision-v3");
+    hasher.update(b"openshell-provider-env-revision-v4");
 
     for record in records {
         hasher.update(record.name.as_bytes());
@@ -2058,6 +2062,7 @@ fn compute_provider_env_revision_from_records_and_policy_bindings(
         hasher.update(record.resource_version.to_le_bytes());
 
         let provider = &record.provider;
+        hash_provider_refresh_states(&record.refresh_states, &mut hasher)?;
         hasher.update(provider.r#type.as_bytes());
         hash_provider_profile_revision(
             catalog,
@@ -2085,6 +2090,40 @@ fn compute_provider_env_revision_from_records_and_policy_bindings(
     Ok(u64::from_le_bytes(digest[..8].try_into().map_err(
         |_| Status::internal("provider env revision digest too short"),
     )?))
+}
+
+fn hash_provider_refresh_states(
+    states: &[openshell_core::proto::StoredProviderCredentialRefreshState],
+    hasher: &mut Sha256,
+) -> Result<(), Status> {
+    let mut states = states.iter().collect::<Vec<_>>();
+    states.sort_by(|left, right| {
+        left.credential_key
+            .cmp(&right.credential_key)
+            .then_with(|| {
+                left.metadata
+                    .as_ref()
+                    .map(|metadata| metadata.id.as_str())
+                    .cmp(&right.metadata.as_ref().map(|metadata| metadata.id.as_str()))
+            })
+    });
+    for state in states {
+        hasher.update(b"provider-refresh-state");
+        hasher.update(state.credential_key.as_bytes());
+        hasher.update(state.strategy.to_le_bytes());
+        hasher.update(crate::provider_refresh::effective_authorization_epoch(state)?.as_bytes());
+        if let Some(metadata) = &state.metadata {
+            hasher.update(metadata.id.as_bytes());
+            hasher.update(metadata.resource_version.to_le_bytes());
+        }
+        let mut outputs = state.additional_output_keys.iter().collect::<Vec<_>>();
+        outputs.sort();
+        for (output, key) in outputs {
+            hasher.update(output.as_bytes());
+            hasher.update(key.as_bytes());
+        }
+    }
+    Ok(())
 }
 
 fn hash_policy_credential_bindings(
@@ -2252,6 +2291,7 @@ pub(super) async fn handle_get_sandbox_provider_environment(
             &provider_records,
             &policy_credential_bindings,
             &state.credentials,
+            Some(&sandbox_id),
         )
         .await?;
 
