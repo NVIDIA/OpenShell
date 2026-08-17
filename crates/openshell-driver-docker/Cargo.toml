@@ -38,13 +38,13 @@ miette = { workspace = true }
 toml = { workspace = true }
 tower-http = { workspace = true }
 http = { workspace = true }
+tar = "0.4"
 
 [dev-dependencies]
 openshell-otel-test-support = { path = "../openshell-otel-test-support" }
 opentelemetry = { workspace = true }
 opentelemetry_sdk = { workspace = true, features = ["testing"] }
 prost-types = { workspace = true }
-tar = "0.4"
 temp-env = "0.3"
 tempfile = "3"
 tracing-subscriber = { workspace = true }

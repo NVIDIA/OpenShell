@@ -169,6 +169,15 @@ idempotent start request. Explicitly stopped sandboxes remain stopped.
 
 For GPU-backed Docker sandboxes, configure Docker CDI before starting the gateway so OpenShell can detect the daemon capability.
 
+For Docker GPU/CDI sandboxes, OpenShell uses Docker's selected CDI device IDs
+and daemon-reported CDI spec directories to build a supervisor-only CDI
+context. The driver mounts the spec directories read-only into the sandbox
+container, uploads `cdi-context.json` before starting the container, and removes
+the created container if that upload fails. The supervisor resolves the context
+inside the sandbox and derives the inner filesystem and supplemental group
+requirements from CDI specs. Non-GPU Docker sandboxes do not receive the CDI
+context, spec mounts, or CDI-derived policy changes.
+
 ### Docker Driver Config Mounts
 
 Docker driver config accepts user-supplied `volume` and `tmpfs` mounts. It also
