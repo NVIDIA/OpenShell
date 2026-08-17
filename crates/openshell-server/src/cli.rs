@@ -500,7 +500,7 @@ async fn run_from_args(
             .unwrap_or_else(|_| EnvFilter::new(&prepared.config.log_level)),
         &tracing_log_bus,
         otlp_config,
-        crate::tracing_setup::podman_export_enabled(&compute_driver),
+        &compute_driver,
     );
 
     let has_client_ca = prepared
