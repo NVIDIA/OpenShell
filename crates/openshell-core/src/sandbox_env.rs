@@ -85,6 +85,14 @@ pub const SANDBOX_TOKEN_FILE: &str = "OPENSHELL_SANDBOX_TOKEN_FILE";
 /// SSH child processes (which use `env_clear()` for security isolation).
 pub const USER_ENVIRONMENT: &str = "OPENSHELL_USER_ENVIRONMENT";
 
+/// Path to the supervisor-only CDI context JSON file.
+///
+/// Set by CDI-capable compute drivers only when a sandbox requested GPU/CDI
+/// devices. The sandbox supervisor reads this file before policy construction
+/// and derives inner filesystem and process requirements from mounted CDI
+/// specs.
+pub const CDI_CONTEXT: &str = "OPENSHELL_CDI_CONTEXT";
+
 /// Path to the projected `ServiceAccount` JWT (Kubernetes driver).
 ///
 /// Used to bootstrap a gateway-minted JWT via `IssueSandboxToken`. Kubelet
