@@ -29,17 +29,22 @@ For each driver, the suite:
    persisted resources are removed.
 
 Conformance passes only when every driver workflow completes without an
-unexpected skip or retry-dependent result. A workflow may exercise relevant
-GPU, authentication, credential-driver, interceptor, middleware, and
-client/server skew variants as subcases without creating separate workflows.
-Unsupported capabilities must return documented errors rather than fail
-silently.
+undeclared skip or retry-dependent result. A configuration may opt out of a
+specific conformance test when it does not support the capability under test.
+The opt-out and unsupported capability must be declared in the test
+configuration before qualification runs; any other skip fails qualification.
+A workflow may exercise relevant GPU, authentication, credential-driver,
+interceptor, middleware, and client/server skew variants as subcases without
+creating separate workflows. Unsupported capabilities must return documented
+errors rather than fail silently.
 
 Each workflow uses one representative environment for the configuration under test. It
 may run multiple capability subcases inside that environment without creating
 additional workflows.
 
 ### Configurations to test
+
+The goal is to provide test coverage for each documented driver, topology, and environment configuration.
 
 | ID | Compute driver | Representative environment | Gateway configuration |
 | --- | --- | --- | --- |
