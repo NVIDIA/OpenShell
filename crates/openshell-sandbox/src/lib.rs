@@ -2453,14 +2453,18 @@ impl FailedRuntimeRevision {
     }
 }
 
+struct MiddlewareReloadContext<'a> {
+    desired_services: &'a [openshell_core::proto::SupervisorMiddlewareService],
+    authentication: &'a MiddlewareAuthentication,
+    registry_changed: bool,
+    connector: &'a MiddlewareConnector,
+}
+
 async fn reload_gateway_policy_runtime(
     engine: &OpaEngine,
     policy: Option<&openshell_core::proto::SandboxPolicy>,
     entrypoint_pid: u32,
-    desired_services: &[openshell_core::proto::SupervisorMiddlewareService],
-    middleware_authentication: &MiddlewareAuthentication,
-    middleware_registry_changed: bool,
-    middleware_connector: &MiddlewareConnector,
+    middleware: MiddlewareReloadContext<'_>,
     transparent_tcp: TransparentTcpReloadState,
 ) -> std::result::Result<(), GatewayRuntimeReloadError> {
     if let Some(policy) = policy
@@ -2482,11 +2486,13 @@ async fn reload_gateway_policy_runtime(
         }
     }
     match policy {
-        Some(policy) if middleware_registry_changed => {
-            let registry =
-                middleware_connector(desired_services.to_vec(), middleware_authentication.clone())
-                    .await
-                    .map_err(GatewayRuntimeReloadError::MiddlewareRegistry)?;
+        Some(policy) if middleware.registry_changed => {
+            let registry = (middleware.connector)(
+                middleware.desired_services.to_vec(),
+                middleware.authentication.clone(),
+            )
+            .await
+            .map_err(GatewayRuntimeReloadError::MiddlewareRegistry)?;
             engine
                 .reload_policy_and_middleware_from_proto_with_pid(policy, entrypoint_pid, registry)
                 .map_err(GatewayRuntimeReloadError::PolicyValidation)
@@ -3763,13 +3769,15 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
                 &ctx.opa_engine,
                 result.policy.as_ref(),
                 pid,
-                &result.supervisor_middleware_services,
-                &MiddlewareAuthentication {
-                    credentials: middleware_credentials.clone(),
-                    enabled: result.extension_authentication_enabled,
+                MiddlewareReloadContext {
+                    desired_services: &result.supervisor_middleware_services,
+                    authentication: &MiddlewareAuthentication {
+                        credentials: middleware_credentials.clone(),
+                        enabled: result.extension_authentication_enabled,
+                    },
+                    registry_changed: middleware_registry_changed,
+                    connector: &ctx.middleware_connector,
                 },
-                middleware_registry_changed,
-                &ctx.middleware_connector,
                 ctx.transparent_tcp,
             )
             .await;
@@ -5174,10 +5182,12 @@ network_policies:
             &engine,
             Some(&proto_policy_fixture()),
             0,
-            &[unavailable_service],
-            &MiddlewareAuthentication::default(),
-            true,
-            &default_middleware_connector(),
+            MiddlewareReloadContext {
+                desired_services: &[unavailable_service],
+                authentication: &MiddlewareAuthentication::default(),
+                registry_changed: true,
+                connector: &default_middleware_connector(),
+            },
             TransparentTcpReloadState::default(),
         )
         .await
@@ -5208,9 +5218,12 @@ network_policies:
             &engine,
             Some(&proto_tcp_policy_fixture()),
             0,
-            &[],
-            false,
-            &default_middleware_connector(),
+            MiddlewareReloadContext {
+                desired_services: &[],
+                authentication: &MiddlewareAuthentication::default(),
+                registry_changed: false,
+                connector: &default_middleware_connector(),
+            },
             TransparentTcpReloadState {
                 capable: true,
                 substrate_ready: false,
@@ -5246,9 +5259,12 @@ network_policies:
             &engine,
             Some(&proto_tcp_policy_fixture()),
             0,
-            &[],
-            false,
-            &default_middleware_connector(),
+            MiddlewareReloadContext {
+                desired_services: &[],
+                authentication: &MiddlewareAuthentication::default(),
+                registry_changed: false,
+                connector: &default_middleware_connector(),
+            },
             TransparentTcpReloadState::default(),
         )
         .await
