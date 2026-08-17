@@ -1725,6 +1725,7 @@ mod tests {
             process: ProcessPolicy {
                 run_as_user: Some("1000".into()),
                 run_as_group: None,
+                ..Default::default()
             },
         };
         let (user, home) = session_user_and_home(&policy, None);
@@ -1746,6 +1747,7 @@ mod tests {
             process: ProcessPolicy {
                 run_as_user: Some("1234".into()),
                 run_as_group: Some("1235".into()),
+                ..Default::default()
             },
         };
 
@@ -1767,6 +1769,7 @@ mod tests {
             process: ProcessPolicy {
                 run_as_user: Some("sandbox".into()),
                 run_as_group: None,
+                ..Default::default()
             },
         };
         let (user, home) = session_user_and_home(&policy, None);
@@ -1788,6 +1791,7 @@ mod tests {
             process: ProcessPolicy {
                 run_as_user: Some(String::new()),
                 run_as_group: None,
+                ..Default::default()
             },
         };
         let (user, home) = session_user_and_home(&policy, None);
@@ -1808,6 +1812,7 @@ mod tests {
             process: ProcessPolicy {
                 run_as_user: None,
                 run_as_group: None,
+                ..Default::default()
             },
         };
         let (user, home) = session_user_and_home(&policy, None);
@@ -1828,6 +1833,7 @@ mod tests {
             process: ProcessPolicy {
                 run_as_user: Some("1000660000".into()),
                 run_as_group: None,
+                ..Default::default()
             },
         };
         let (user, home) = session_user_and_home(&policy, None);
@@ -1857,6 +1863,7 @@ mod tests {
             process: ProcessPolicy {
                 run_as_user: None,
                 run_as_group: None,
+                ..Default::default()
             },
         };
 
@@ -1888,6 +1895,7 @@ mod tests {
                         process: ProcessPolicy {
                             run_as_user: None,
                             run_as_group: None,
+                            ..Default::default()
                         },
                     },
                     None,
@@ -1930,6 +1938,7 @@ mod tests {
             process: ProcessPolicy {
                 run_as_user: Some("__oci_user_not_in_host_nss__".into()),
                 run_as_group: Some("__oci_group_not_in_host_nss__".into()),
+                ..Default::default()
             },
         };
         let resolved = ResolvedProcessIdentity::new(
@@ -2002,6 +2011,7 @@ mod tests {
             process: ProcessPolicy {
                 run_as_user: None,
                 run_as_group: None,
+                ..Default::default()
             },
         }
     }

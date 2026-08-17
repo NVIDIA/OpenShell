@@ -15,7 +15,9 @@ mod metadata_server;
 mod sidecar_control;
 
 use miette::{IntoDiagnostic, Result, WrapErr};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::future::Future;
+use std::path::PathBuf;
 use std::sync::Arc;
 #[cfg(target_os = "linux")]
 use std::sync::atomic::Ordering;
@@ -510,7 +512,7 @@ pub async fn run_sandbox(
             retained_proto.clone(),
             openshell_endpoint.clone(),
             sandbox_id.clone(),
-            std::path::PathBuf::from(trusted_ssh_socket_path),
+            PathBuf::from(trusted_ssh_socket_path),
         );
     }
 
@@ -877,11 +879,11 @@ fn process_enforcement_mode() -> ProcessEnforcementMode {
     }
 }
 
-fn sidecar_control_socket() -> Option<std::path::PathBuf> {
+fn sidecar_control_socket() -> Option<PathBuf> {
     std::env::var(openshell_core::sandbox_env::SIDECAR_CONTROL_SOCKET)
         .ok()
         .filter(|path| !path.is_empty())
-        .map(std::path::PathBuf::from)
+        .map(PathBuf::from)
 }
 
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -993,7 +995,7 @@ fn spawn_sidecar_entrypoint_handler(
     retained_proto: Option<openshell_core::proto::SandboxPolicy>,
     openshell_endpoint: Option<String>,
     sandbox_id: Option<String>,
-    trusted_ssh_socket_path: std::path::PathBuf,
+    trusted_ssh_socket_path: PathBuf,
 ) {
     tokio::spawn(async move {
         let mut session_started = false;
@@ -1057,7 +1059,7 @@ fn spawn_sidecar_entrypoint_handler(
     });
 }
 
-fn sidecar_ca_file_paths() -> Option<(std::path::PathBuf, std::path::PathBuf)> {
+fn sidecar_ca_file_paths() -> Option<(PathBuf, PathBuf)> {
     let tls_dir = std::env::var(openshell_core::sandbox_env::PROXY_TLS_DIR)
         .unwrap_or_else(|_| SIDECAR_TLS_DIR.to_string());
     let cert = std::path::Path::new(&tls_dir).join(SIDECAR_CA_CERT);
@@ -1225,42 +1227,33 @@ const PROXY_BASELINE_READ_ONLY: &[&str] = &[
 /// The active workspace is granted separately through `include_workdir`.
 const PROXY_BASELINE_READ_WRITE: &[&str] = &["/tmp"];
 
-/// GPU read-only paths.
+/// GPU read-only paths for the legacy device-scan fallback.
 ///
 /// `/run/nvidia-persistenced`: NVML tries to connect to the persistenced
 /// socket at init time.  If the directory exists but Landlock denies traversal
 /// (EACCES vs ECONNREFUSED), NVML returns `NVML_ERROR_INSUFFICIENT_PERMISSIONS`
 /// even though the daemon is optional.  Only read/traversal access is needed.
 ///
-/// `/usr/lib/wsl`: On WSL2, CDI bind-mounts GPU libraries (libdxcore.so,
-/// libcuda.so.1.1, etc.) into paths under `/usr/lib/wsl/`.  Although `/usr`
-/// is already in `PROXY_BASELINE_READ_ONLY`, individual file bind-mounts may
-/// not be covered by the parent-directory Landlock rule when the mount crosses
-/// a filesystem boundary.  Listing `/usr/lib/wsl` explicitly ensures traversal
-/// is permitted regardless of Landlock's cross-mount behaviour.
+/// `/usr/lib/wsl`: retained for the legacy device-scan fallback. CDI
+/// sandboxes use resolved mount destinations instead of this broad directory
+/// baseline.
 const GPU_BASELINE_READ_ONLY: &[&str] = &[
     "/run/nvidia-persistenced",
-    "/usr/lib/wsl", // WSL2: CDI-injected GPU library directory
+    "/usr/lib/wsl", // Legacy fallback; CDI uses resolved mount destinations.
 ];
 
-/// GPU read-write paths (static).
+/// GPU read-write paths for the legacy device-scan fallback.
 ///
 /// `/dev/nvidiactl`, `/dev/nvidia-uvm`, `/dev/nvidia-uvm-tools`,
-/// `/dev/nvidia-modeset`: control and UVM devices injected by CDI on native
-/// Linux.  Landlock restricts `open(2)` on device files even when DAC allows
-/// it; these need read-write because NVML/CUDA opens them with `O_RDWR`.
-/// These devices do not exist on WSL2 and will be skipped by the existence
-/// check in `enrich_proto_baseline_paths()`.
+/// `/dev/nvidia-modeset`: control and UVM devices. Landlock restricts
+/// `open(2)` on device files even when DAC allows it; these need read-write
+/// because NVML/CUDA opens them with `O_RDWR`. CDI sandboxes derive device
+/// nodes from the selected CDI specs instead of this hard-coded list.
 ///
 /// `/dev/dxg`: On WSL2, NVIDIA GPUs are exposed through the DXG kernel driver
-/// (DirectX Graphics) rather than the native nvidia* devices.  CDI injects
-/// `/dev/dxg` as the sole GPU device node; it does not exist on native Linux
-/// and will be skipped there by the existence check.
-///
-/// `/proc`: CUDA writes to `/proc/<pid>/task/<tid>/comm` during `cuInit()`
-/// to set thread names.  Without write access, `cuInit()` returns error 304.
-/// Must use `/proc` (not `/proc/self/task`) because Landlock rules bind to
-/// inodes and child processes have different procfs inodes than the parent.
+/// (DirectX Graphics) rather than the native nvidia* devices. This is retained
+/// for the legacy device-scan fallback; CDI sandboxes derive it from specs when
+/// needed.
 ///
 /// Per-GPU device files (`/dev/nvidia0`, …) are enumerated at runtime by
 /// `enumerate_gpu_device_nodes()` since the count varies.
@@ -1269,15 +1262,473 @@ const GPU_BASELINE_READ_WRITE: &[&str] = &[
     "/dev/nvidia-uvm",
     "/dev/nvidia-uvm-tools",
     "/dev/nvidia-modeset",
-    "/dev/dxg", // WSL2: DXG device (GPU via DirectX kernel driver, injected by CDI)
-    "/proc",
+    "/dev/dxg", // WSL2: DXG device exposed through the DirectX kernel driver.
 ];
+
+/// CUDA writes to `/proc/<pid>/task/<tid>/comm` during `cuInit()` to set thread
+/// names. Without write access, `cuInit()` returns error 304. Must use `/proc`
+/// (not `/proc/self/task`) because Landlock rules bind to inodes and child
+/// processes have different procfs inodes than the parent.
+const GPU_PROC_READ_WRITE: &str = "/proc";
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct EnrichmentPathSources {
+    baseline: bool,
+    runtime: bool,
+}
+
+impl EnrichmentPathSources {
+    fn baseline() -> Self {
+        Self {
+            baseline: true,
+            runtime: false,
+        }
+    }
+
+    fn runtime() -> Self {
+        Self {
+            baseline: false,
+            runtime: true,
+        }
+    }
+
+    fn merge(&mut self, other: Self) {
+        self.baseline |= other.baseline;
+        self.runtime |= other.runtime;
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MissingPathBehavior {
+    Skip,
+    Error,
+}
+
+impl MissingPathBehavior {
+    fn merge(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Error, _) | (_, Self::Error) => Self::Error,
+            (Self::Skip, Self::Skip) => Self::Skip,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReadOnlyConflictBehavior {
+    KeepReadOnly,
+    PromoteToReadWrite,
+    Reject,
+}
+
+impl ReadOnlyConflictBehavior {
+    fn merge(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Reject, _) | (_, Self::Reject) => Self::Reject,
+            (Self::PromoteToReadWrite, _) | (_, Self::PromoteToReadWrite) => {
+                Self::PromoteToReadWrite
+            }
+            (Self::KeepReadOnly, Self::KeepReadOnly) => Self::KeepReadOnly,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct EnrichmentPathPolicy {
+    sources: EnrichmentPathSources,
+    missing_path: MissingPathBehavior,
+    read_only_conflict: ReadOnlyConflictBehavior,
+}
+
+impl EnrichmentPathPolicy {
+    fn baseline() -> Self {
+        Self {
+            sources: EnrichmentPathSources::baseline(),
+            missing_path: MissingPathBehavior::Skip,
+            read_only_conflict: ReadOnlyConflictBehavior::KeepReadOnly,
+        }
+    }
+
+    fn runtime_device_node() -> Self {
+        Self {
+            sources: EnrichmentPathSources::runtime(),
+            missing_path: MissingPathBehavior::Error,
+            read_only_conflict: ReadOnlyConflictBehavior::KeepReadOnly,
+        }
+    }
+
+    fn runtime_mount() -> Self {
+        Self {
+            sources: EnrichmentPathSources::runtime(),
+            missing_path: MissingPathBehavior::Error,
+            read_only_conflict: ReadOnlyConflictBehavior::KeepReadOnly,
+        }
+    }
+
+    fn runtime_writable_mount() -> Self {
+        Self {
+            sources: EnrichmentPathSources::runtime(),
+            missing_path: MissingPathBehavior::Error,
+            read_only_conflict: ReadOnlyConflictBehavior::Reject,
+        }
+    }
+
+    fn gpu_proc(sources: EnrichmentPathSources) -> Self {
+        Self {
+            sources,
+            missing_path: MissingPathBehavior::Error,
+            read_only_conflict: ReadOnlyConflictBehavior::PromoteToReadWrite,
+        }
+    }
+
+    fn merge(&mut self, other: Self) {
+        self.sources.merge(other.sources);
+        self.missing_path = self.missing_path.merge(other.missing_path);
+        self.read_only_conflict = self.read_only_conflict.merge(other.read_only_conflict);
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EnrichmentPath {
+    path: String,
+    policy: EnrichmentPathPolicy,
+}
+
+impl EnrichmentPath {
+    fn should_apply<F>(&self, access: &str, path_exists: &F) -> Result<bool>
+    where
+        F: Fn(&str) -> bool,
+    {
+        if path_exists(&self.path) {
+            return Ok(true);
+        }
+
+        match self.policy.missing_path {
+            MissingPathBehavior::Skip => {
+                debug!(
+                    path = %self.path,
+                    access,
+                    "Baseline enrichment path does not exist, skipping"
+                );
+                Ok(false)
+            }
+            MissingPathBehavior::Error => Err(miette::miette!(
+                "Runtime-derived enrichment path '{}' does not exist",
+                self.path
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct EnrichmentPlan {
+    read_only: BTreeMap<String, EnrichmentPathPolicy>,
+    read_write: BTreeMap<String, EnrichmentPathPolicy>,
+    additional_gids: BTreeSet<u32>,
+}
+
+impl EnrichmentPlan {
+    fn for_proto_policy(
+        proto: &openshell_core::proto::SandboxPolicy,
+        cdi_requirements: Option<&openshell_core::cdi::CdiDerivedRequirements>,
+    ) -> Self {
+        Self::active(!proto.network_policies.is_empty(), cdi_requirements)
+    }
+
+    fn for_sandbox_policy(
+        policy: &SandboxPolicy,
+        cdi_requirements: Option<&openshell_core::cdi::CdiDerivedRequirements>,
+    ) -> Self {
+        Self::active(
+            matches!(policy.network.mode, NetworkMode::Proxy),
+            cdi_requirements,
+        )
+    }
+
+    fn active(
+        include_proxy: bool,
+        cdi_requirements: Option<&openshell_core::cdi::CdiDerivedRequirements>,
+    ) -> Self {
+        let mut plan = Self::default();
+        if include_proxy {
+            plan = plan.merge(Self::proxy_baseline());
+        }
+        let gpu_plan = cdi_requirements.map_or_else(
+            || {
+                if has_gpu_devices() {
+                    Self::legacy_gpu_fallback(enumerate_gpu_device_nodes())
+                } else {
+                    Self::default()
+                }
+            },
+            Self::cdi_gpu,
+        );
+        plan.merge(gpu_plan)
+    }
+
+    fn proxy_baseline() -> Self {
+        Self::from_baseline_paths(PROXY_BASELINE_READ_ONLY, PROXY_BASELINE_READ_WRITE)
+    }
+
+    fn legacy_gpu_fallback(gpu_device_nodes: Vec<String>) -> Self {
+        let mut plan = Self::from_baseline_paths(GPU_BASELINE_READ_ONLY, GPU_BASELINE_READ_WRITE);
+        for path in gpu_device_nodes {
+            plan.insert_read_write_path(path, EnrichmentPathPolicy::baseline());
+        }
+        plan.insert_read_write_path(
+            GPU_PROC_READ_WRITE,
+            EnrichmentPathPolicy::gpu_proc(EnrichmentPathSources::baseline()),
+        );
+        plan
+    }
+
+    fn cdi_gpu(requirements: &openshell_core::cdi::CdiDerivedRequirements) -> Self {
+        let mut plan = Self::default();
+        for path in &requirements.read_only_mount_paths {
+            plan.insert_read_only_path(path, EnrichmentPathPolicy::runtime_mount());
+        }
+        for path in &requirements.device_node_paths {
+            plan.insert_read_write_path(path, EnrichmentPathPolicy::runtime_device_node());
+        }
+        for path in &requirements.read_write_mount_paths {
+            plan.insert_read_write_path(path, EnrichmentPathPolicy::runtime_writable_mount());
+        }
+        plan.insert_read_write_path(
+            GPU_PROC_READ_WRITE,
+            EnrichmentPathPolicy::gpu_proc(EnrichmentPathSources::runtime()),
+        );
+        for gid in &requirements.additional_gids {
+            plan.insert_additional_gid(*gid);
+        }
+        plan
+    }
+
+    fn from_baseline_paths(read_only: &[&str], read_write: &[&str]) -> Self {
+        let mut plan = Self::default();
+        for &path in read_only {
+            plan.insert_read_only_path(path, EnrichmentPathPolicy::baseline());
+        }
+        for &path in read_write {
+            plan.insert_read_write_path(path, EnrichmentPathPolicy::baseline());
+        }
+        plan
+    }
+
+    fn merge(mut self, other: Self) -> Self {
+        for (path, policy) in other.read_only {
+            self.insert_read_only_path(path, policy);
+        }
+        for (path, policy) in other.read_write {
+            self.insert_read_write_path(path, policy);
+        }
+        for gid in other.additional_gids {
+            self.insert_additional_gid(gid);
+        }
+        self
+    }
+
+    fn insert_read_only_path(&mut self, path: impl Into<String>, policy: EnrichmentPathPolicy) {
+        insert_enrichment_path(&mut self.read_only, path.into(), policy);
+    }
+
+    fn insert_read_write_path(&mut self, path: impl Into<String>, policy: EnrichmentPathPolicy) {
+        insert_enrichment_path(&mut self.read_write, path.into(), policy);
+    }
+
+    fn insert_additional_gid(&mut self, gid: u32) {
+        self.additional_gids.insert(gid);
+    }
+
+    fn entries(&self) -> (Vec<EnrichmentPath>, Vec<EnrichmentPath>) {
+        let mut read_write = self.read_write.clone();
+        let mut read_only = Vec::new();
+
+        // A path promoted to read_write (e.g. /proc for GPU) should not also
+        // appear in read_only — Landlock handles the overlap correctly but the
+        // duplicate is confusing when inspecting the effective policy.
+        for (path, policy) in &self.read_only {
+            if let Some(read_write_policy) = read_write.get_mut(path) {
+                read_write_policy.merge(*policy);
+            } else {
+                read_only.push(EnrichmentPath {
+                    path: path.clone(),
+                    policy: *policy,
+                });
+            }
+        }
+
+        let read_write = read_write
+            .into_iter()
+            .map(|(path, policy)| EnrichmentPath { path, policy })
+            .collect();
+        (read_only, read_write)
+    }
+
+    fn has_additional_gids(&self) -> bool {
+        !self.additional_gids.is_empty()
+    }
+
+    fn additional_gids(&self) -> Vec<u32> {
+        self.additional_gids.iter().copied().collect()
+    }
+
+    fn apply_to_proto_policy(
+        &self,
+        proto: &mut openshell_core::proto::SandboxPolicy,
+    ) -> Result<EnrichmentApplication> {
+        // Baseline paths are system-injected, not user-specified. Skip paths
+        // that do not exist in this container image to avoid noisy warnings
+        // from Landlock and, more critically, to prevent a single missing
+        // baseline path from abandoning the entire Landlock ruleset under
+        // best-effort mode (see issue #664).
+        self.apply_to_proto_policy_with(proto, |path| std::path::Path::new(path).exists())
+    }
+
+    fn apply_to_proto_policy_with<F>(
+        &self,
+        proto: &mut openshell_core::proto::SandboxPolicy,
+        path_exists: F,
+    ) -> Result<EnrichmentApplication>
+    where
+        F: Fn(&str) -> bool,
+    {
+        let (read_only, read_write) = self.entries();
+        if read_only.is_empty() && read_write.is_empty() {
+            return Ok(EnrichmentApplication::default());
+        }
+
+        let fs = proto
+            .filesystem
+            .get_or_insert_with(|| openshell_core::proto::FilesystemPolicy {
+                include_workdir: true,
+                ..Default::default()
+            });
+
+        let mut application = EnrichmentApplication::default();
+        for addition in read_only {
+            if !addition.should_apply("read_only", &path_exists)? {
+                continue;
+            }
+            if !fs.read_only.iter().any(|p| p == &addition.path)
+                && !fs.read_write.iter().any(|p| p == &addition.path)
+            {
+                fs.read_only.push(addition.path);
+                application.record(addition.policy.sources);
+            }
+        }
+        for addition in read_write {
+            if !addition.should_apply("read_write", &path_exists)? {
+                continue;
+            }
+            if fs.read_write.iter().any(|p| p == &addition.path) {
+                continue;
+            }
+            if fs.read_only.iter().any(|p| p == &addition.path) {
+                match addition.policy.read_only_conflict {
+                    ReadOnlyConflictBehavior::KeepReadOnly => {}
+                    ReadOnlyConflictBehavior::PromoteToReadWrite => {
+                        info!(
+                            path = %addition.path,
+                            "Promoting /proc from read-only to read-write for GPU runtime compatibility"
+                        );
+                        fs.read_only.retain(|p| p != &addition.path);
+                        fs.read_write.push(addition.path);
+                        application.record(addition.policy.sources);
+                    }
+                    ReadOnlyConflictBehavior::Reject => {
+                        return Err(miette::miette!(
+                            "Runtime-derived read-write path '{}' conflicts with sandbox policy read_only",
+                            addition.path
+                        ));
+                    }
+                }
+                continue;
+            }
+            fs.read_write.push(addition.path);
+            application.record(addition.policy.sources);
+        }
+
+        Ok(application)
+    }
+
+    fn apply_to_sandbox_policy(&self, policy: &mut SandboxPolicy) -> Result<EnrichmentApplication> {
+        let (read_only, read_write) = self.entries();
+        let mut application = EnrichmentApplication::default();
+
+        for addition in read_only {
+            if !addition.should_apply("read_only", &|path| std::path::Path::new(path).exists())? {
+                continue;
+            }
+            let p = PathBuf::from(&addition.path);
+            if !policy.filesystem.read_only.contains(&p)
+                && !policy.filesystem.read_write.contains(&p)
+            {
+                policy.filesystem.read_only.push(p);
+                application.record(addition.policy.sources);
+            }
+        }
+        for addition in read_write {
+            if !addition.should_apply("read_write", &|path| std::path::Path::new(path).exists())? {
+                continue;
+            }
+            let p = PathBuf::from(&addition.path);
+            if policy.filesystem.read_write.contains(&p) {
+                continue;
+            }
+            if policy.filesystem.read_only.contains(&p) {
+                match addition.policy.read_only_conflict {
+                    ReadOnlyConflictBehavior::KeepReadOnly => {}
+                    ReadOnlyConflictBehavior::PromoteToReadWrite => {
+                        info!(
+                            path = %addition.path,
+                            "Promoting /proc from read-only to read-write for GPU runtime compatibility"
+                        );
+                        policy
+                            .filesystem
+                            .read_only
+                            .retain(|existing| existing != &p);
+                        policy.filesystem.read_write.push(p);
+                        application.record(addition.policy.sources);
+                    }
+                    ReadOnlyConflictBehavior::Reject => {
+                        return Err(miette::miette!(
+                            "Runtime-derived read-write path '{}' conflicts with sandbox policy read_only",
+                            addition.path
+                        ));
+                    }
+                }
+                continue;
+            }
+            policy.filesystem.read_write.push(p);
+            application.record(addition.policy.sources);
+        }
+
+        if self.has_additional_gids() {
+            let additional_gids = self.additional_gids();
+            if policy.process.supplemental_groups != additional_gids {
+                // CDI calls these `additionalGids`; the supervisor applies them
+                // as Linux supplemental groups before dropping privileges.
+                policy.process.supplemental_groups = additional_gids;
+                application.record(EnrichmentPathSources::runtime());
+            }
+        }
+
+        Ok(application)
+    }
+
+    #[cfg(test)]
+    fn paths(&self) -> (Vec<String>, Vec<String>) {
+        let (read_only, read_write) = self.entries();
+        (
+            read_only.into_iter().map(|path| path.path).collect(),
+            read_write.into_iter().map(|path| path.path).collect(),
+        )
+    }
+}
 
 /// Returns true if GPU devices are present in the container.
 ///
 /// Checks both the native Linux NVIDIA control device (`/dev/nvidiactl`) and
-/// the WSL2 DXG device (`/dev/dxg`).  CDI injects exactly one of these
-/// depending on the host kernel; the other will not exist.
+/// the WSL2 DXG device (`/dev/dxg`) for the legacy fallback path.
 fn has_gpu_devices() -> bool {
     std::path::Path::new("/dev/nvidiactl").exists() || std::path::Path::new("/dev/dxg").exists()
 }
@@ -1300,159 +1751,44 @@ fn enumerate_gpu_device_nodes() -> Vec<String> {
     paths
 }
 
-fn push_unique(paths: &mut Vec<String>, path: String) {
-    if !paths.iter().any(|p| p == &path) {
-        paths.push(path);
-    }
-}
-
-fn collect_baseline_enrichment_paths(
-    include_proxy: bool,
-    include_gpu: bool,
-    gpu_device_nodes: Vec<String>,
-) -> (Vec<String>, Vec<String>) {
-    let mut ro = Vec::new();
-    let mut rw = Vec::new();
-
-    if include_proxy {
-        for &path in PROXY_BASELINE_READ_ONLY {
-            push_unique(&mut ro, path.to_string());
-        }
-        for &path in PROXY_BASELINE_READ_WRITE {
-            push_unique(&mut rw, path.to_string());
-        }
-    }
-
-    if include_gpu {
-        for &path in GPU_BASELINE_READ_ONLY {
-            push_unique(&mut ro, path.to_string());
-        }
-        for &path in GPU_BASELINE_READ_WRITE {
-            push_unique(&mut rw, path.to_string());
-        }
-        for path in gpu_device_nodes {
-            push_unique(&mut rw, path);
-        }
-    }
-
-    // A path promoted to read_write (e.g. /proc for GPU) should not also
-    // appear in read_only — Landlock handles the overlap correctly but the
-    // duplicate is confusing when inspecting the effective policy.
-    ro.retain(|p| !rw.contains(p));
-
-    (ro, rw)
-}
-
-fn active_baseline_enrichment_paths(include_proxy: bool) -> (Vec<String>, Vec<String>) {
-    let include_gpu = has_gpu_devices();
-    let gpu_device_nodes = if include_gpu {
-        enumerate_gpu_device_nodes()
+fn insert_enrichment_path(
+    paths: &mut BTreeMap<String, EnrichmentPathPolicy>,
+    path: String,
+    policy: EnrichmentPathPolicy,
+) {
+    if let Some(existing) = paths.get_mut(&path) {
+        existing.merge(policy);
     } else {
-        Vec::new()
-    };
-    collect_baseline_enrichment_paths(include_proxy, include_gpu, gpu_device_nodes)
+        paths.insert(path, policy);
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct EnrichmentApplication {
+    baseline_modified: bool,
+    runtime_modified: bool,
+}
+
+impl EnrichmentApplication {
+    fn modified(self) -> bool {
+        self.baseline_modified || self.runtime_modified
+    }
+
+    fn record(&mut self, sources: EnrichmentPathSources) {
+        if sources.baseline {
+            self.baseline_modified = true;
+        }
+        if sources.runtime {
+            self.runtime_modified = true;
+        }
+    }
 }
 
 /// Collect all active baseline paths for tests and diagnostics.
 /// Returns `(read_only, read_write)` as owned `String` vecs.
 #[cfg(test)]
 fn baseline_enrichment_paths() -> (Vec<String>, Vec<String>) {
-    active_baseline_enrichment_paths(true)
-}
-
-fn enrich_proto_baseline_paths_with<F>(
-    proto: &mut openshell_core::proto::SandboxPolicy,
-    ro: &[String],
-    rw: &[String],
-    path_exists: F,
-) -> bool
-where
-    F: Fn(&str) -> bool,
-{
-    if ro.is_empty() && rw.is_empty() {
-        return false;
-    }
-
-    let fs = proto
-        .filesystem
-        .get_or_insert_with(|| openshell_core::proto::FilesystemPolicy {
-            include_workdir: true,
-            ..Default::default()
-        });
-
-    let mut modified = false;
-    for path in ro {
-        if !fs.read_only.iter().any(|p| p == path) && !fs.read_write.iter().any(|p| p == path) {
-            if !path_exists(path) {
-                debug!(
-                    path,
-                    "Baseline read-only path does not exist, skipping enrichment"
-                );
-                continue;
-            }
-            fs.read_only.push(path.clone());
-            modified = true;
-        }
-    }
-    for path in rw {
-        if fs.read_write.iter().any(|p| p == path) {
-            continue;
-        }
-        if !path_exists(path) {
-            debug!(
-                path,
-                "Baseline read-write path does not exist, skipping enrichment"
-            );
-            continue;
-        }
-        if fs.read_only.iter().any(|p| p == path) {
-            if path == "/proc" {
-                info!(
-                    path,
-                    "Promoting /proc from read-only to read-write for GPU runtime compatibility"
-                );
-                fs.read_only.retain(|p| p != path);
-                fs.read_write.push(path.clone());
-                modified = true;
-            }
-            continue;
-        }
-        fs.read_write.push(path.clone());
-        modified = true;
-    }
-
-    modified
-}
-
-/// Ensure a proto `SandboxPolicy` includes the baseline filesystem paths
-/// required by proxy-mode sandboxes and GPU runtimes. Paths are only added if
-/// missing; user-specified paths are never removed.
-///
-/// Returns `true` if the policy was modified (caller may want to sync back).
-fn enrich_proto_baseline_paths(proto: &mut openshell_core::proto::SandboxPolicy) -> bool {
-    let (ro, rw) = active_baseline_enrichment_paths(!proto.network_policies.is_empty());
-
-    // Baseline paths are system-injected, not user-specified.  Skip paths
-    // that do not exist in this container image to avoid noisy warnings from
-    // Landlock and, more critically, to prevent a single missing baseline
-    // path from abandoning the entire Landlock ruleset under best-effort
-    // mode (see issue #664).
-    let modified = enrich_proto_baseline_paths_with(proto, &ro, &rw, |path| {
-        std::path::Path::new(path).exists()
-    });
-
-    if modified {
-        ocsf_emit!(
-            ConfigStateChangeBuilder::new(ocsf_ctx())
-                .severity(SeverityId::Informational)
-                .status(StatusId::Success)
-                .state(StateId::Enabled, "enriched")
-                .message("Enriched policy with baseline filesystem paths for proxy mode")
-                .build()
-        );
-    }
-
-    modified
+    EnrichmentPlan::active(true, None).paths()
 }
 
 fn strip_proto_provider_policy_entries(proto: &mut openshell_core::proto::SandboxPolicy) -> bool {
@@ -1472,57 +1808,186 @@ fn proto_sync_payload_for_enriched_policy(
     Some(sync_policy)
 }
 
-/// Ensure a `SandboxPolicy` (Rust type) includes the baseline filesystem
-/// paths required by proxy-mode sandboxes and GPU runtimes. Used for the
-/// local-file code path where no proto is available.
-fn enrich_sandbox_baseline_paths(policy: &mut SandboxPolicy) {
-    let (ro, rw) =
-        active_baseline_enrichment_paths(matches!(policy.network.mode, NetworkMode::Proxy));
-    if ro.is_empty() && rw.is_empty() {
-        return;
-    }
+fn cdi_writable_file_allowlist_from_proto(
+    proto: &openshell_core::proto::SandboxPolicy,
+) -> HashSet<String> {
+    proto
+        .filesystem
+        .as_ref()
+        .map(|fs| fs.read_write.iter().cloned().collect())
+        .unwrap_or_default()
+}
 
-    let mut modified = false;
-    for path in &ro {
-        let p = std::path::PathBuf::from(path);
-        if !policy.filesystem.read_only.contains(&p) && !policy.filesystem.read_write.contains(&p) {
-            if !p.exists() {
-                debug!(
-                    path,
-                    "Baseline read-only path does not exist, skipping enrichment"
-                );
-                continue;
-            }
-            policy.filesystem.read_only.push(p);
-            modified = true;
-        }
-    }
-    for path in &rw {
-        let p = std::path::PathBuf::from(path);
-        if policy.filesystem.read_only.contains(&p) || policy.filesystem.read_write.contains(&p) {
-            continue;
-        }
-        if !p.exists() {
-            debug!(
-                path,
-                "Baseline read-write path does not exist, skipping enrichment"
-            );
-            continue;
-        }
-        policy.filesystem.read_write.push(p);
-        modified = true;
-    }
+fn cdi_writable_file_allowlist_from_policy(policy: &SandboxPolicy) -> HashSet<String> {
+    policy
+        .filesystem
+        .read_write
+        .iter()
+        .map(|path| path.to_string_lossy().into_owned())
+        .collect()
+}
 
-    if modified {
-        ocsf_emit!(
-            ConfigStateChangeBuilder::new(ocsf_ctx())
-                .severity(SeverityId::Informational)
-                .status(StatusId::Success)
-                .state(StateId::Enabled, "enriched")
-                .message("Enriched policy with baseline filesystem paths for proxy mode")
-                .build()
+struct CdiPolicyEnrichment {
+    enriched: bool,
+    additional_gids: Vec<u32>,
+}
+
+fn enrich_sandbox_policy_with_baseline_and_cdi(policy: &mut SandboxPolicy) -> Result<()> {
+    let cdi_writable_file_allowlist = cdi_writable_file_allowlist_from_policy(policy);
+    let requirements = resolve_cdi_requirements_from_env(&cdi_writable_file_allowlist)?;
+    let plan = EnrichmentPlan::for_sandbox_policy(policy, requirements.as_ref());
+    let application = plan.apply_to_sandbox_policy(policy)?;
+    emit_policy_enrichment_events(application, requirements.as_ref(), &plan);
+    Ok(())
+}
+
+fn enrich_proto_policy_with_baseline_and_cdi(
+    proto: &mut openshell_core::proto::SandboxPolicy,
+) -> Result<CdiPolicyEnrichment> {
+    let cdi_writable_file_allowlist = cdi_writable_file_allowlist_from_proto(proto);
+    let requirements = resolve_cdi_requirements_from_env(&cdi_writable_file_allowlist)?;
+    let plan = EnrichmentPlan::for_proto_policy(proto, requirements.as_ref());
+    let application = plan.apply_to_proto_policy(proto)?;
+    emit_policy_enrichment_events(application, requirements.as_ref(), &plan);
+
+    Ok(CdiPolicyEnrichment {
+        enriched: application.modified(),
+        additional_gids: plan.additional_gids(),
+    })
+}
+
+fn resolve_cdi_requirements_from_env(
+    writable_file_allowlist: &HashSet<String>,
+) -> Result<Option<openshell_core::cdi::CdiDerivedRequirements>> {
+    let Ok(context_path) = std::env::var(openshell_core::sandbox_env::CDI_CONTEXT) else {
+        return Ok(None);
+    };
+    let context_path = context_path.trim();
+    if context_path.is_empty() {
+        return Ok(None);
+    }
+    if context_path != openshell_core::cdi::CDI_CONTEXT_PATH {
+        let message = format!(
+            "CDI context path must be '{}', got '{context_path}'",
+            openshell_core::cdi::CDI_CONTEXT_PATH
         );
+        emit_cdi_validation_failure(&message);
+        return Err(miette::miette!("{message}"));
     }
+
+    let context = openshell_core::cdi::read_context(context_path).map_err(|err| {
+        emit_cdi_validation_failure(&err.to_string());
+        miette::miette!("Failed to load CDI context from {context_path}: {err}")
+    })?;
+    validate_cdi_context_mount_roots(&context)?;
+    ocsf_emit!(
+        ConfigStateChangeBuilder::new(ocsf_ctx())
+            .severity(SeverityId::Informational)
+            .status(StatusId::Success)
+            .state(StateId::Enabled, "loaded")
+            .unmapped(
+                "cdi_selected_device_count",
+                serde_json::json!(context.selected_devices.len())
+            )
+            .message(format!("Loaded CDI context [path:{context_path}]"))
+            .build()
+    );
+
+    let requirements = openshell_core::cdi::resolve_cdi_context(&context, writable_file_allowlist)
+        .map_err(|err| {
+            emit_cdi_validation_failure(&err.to_string());
+            miette::miette!("Failed to resolve CDI requirements: {err}")
+        })?;
+    Ok(Some(requirements))
+}
+
+fn validate_cdi_context_mount_roots(context: &openshell_core::cdi::CdiContext) -> Result<()> {
+    let expected_prefix = format!("{}/", openshell_core::cdi::CDI_SPEC_DIR_BASE);
+    for spec_dir in &context.spec_dirs {
+        let normalized = openshell_core::paths::normalize_path(&spec_dir.path);
+        if !normalized.starts_with(&expected_prefix) {
+            let message = format!(
+                "CDI spec dir must be under '{}', got '{}'",
+                openshell_core::cdi::CDI_SPEC_DIR_BASE,
+                spec_dir.path
+            );
+            emit_cdi_validation_failure(&message);
+            return Err(miette::miette!("{message}"));
+        }
+    }
+    Ok(())
+}
+
+fn emit_cdi_validation_failure(message: &str) {
+    ocsf_emit!(
+        DetectionFindingBuilder::new(ocsf_ctx())
+            .activity(ActivityId::Open)
+            .severity(SeverityId::High)
+            .action(ActionId::Denied)
+            .disposition(DispositionId::Blocked)
+            .finding_info(
+                FindingInfo::new(
+                    "cdi-policy-validation-failed",
+                    "CDI Policy Validation Failed",
+                )
+                .with_desc(message),
+            )
+            .message(format!("CDI validation failed: {message}"))
+            .build()
+    );
+}
+
+fn emit_baseline_enrichment_event() {
+    ocsf_emit!(
+        ConfigStateChangeBuilder::new(ocsf_ctx())
+            .severity(SeverityId::Informational)
+            .status(StatusId::Success)
+            .state(StateId::Enabled, "enriched")
+            .message("Enriched policy with baseline filesystem paths")
+            .build()
+    );
+}
+
+fn emit_policy_enrichment_events(
+    application: EnrichmentApplication,
+    cdi_requirements: Option<&openshell_core::cdi::CdiDerivedRequirements>,
+    plan: &EnrichmentPlan,
+) {
+    if application.baseline_modified {
+        emit_baseline_enrichment_event();
+    }
+    if let Some(requirements) = cdi_requirements
+        && (application.runtime_modified || plan.has_additional_gids())
+    {
+        emit_cdi_enrichment_event(requirements);
+    }
+}
+
+fn emit_cdi_enrichment_event(requirements: &openshell_core::cdi::CdiDerivedRequirements) {
+    ocsf_emit!(
+        ConfigStateChangeBuilder::new(ocsf_ctx())
+            .severity(SeverityId::Informational)
+            .status(StatusId::Success)
+            .state(StateId::Enabled, "enriched")
+            .unmapped(
+                "cdi_device_node_count",
+                serde_json::json!(requirements.device_node_paths.len())
+            )
+            .unmapped(
+                "cdi_read_only_mount_count",
+                serde_json::json!(requirements.read_only_mount_paths.len())
+            )
+            .unmapped(
+                "cdi_read_write_mount_count",
+                serde_json::json!(requirements.read_write_mount_paths.len())
+            )
+            .unmapped(
+                "cdi_additional_gid_count",
+                serde_json::json!(requirements.additional_gids.len())
+            )
+            .message("Enriched policy with CDI-derived filesystem and process requirements")
+            .build()
+    );
 }
 
 #[cfg(test)]
@@ -1623,7 +2088,8 @@ mod baseline_tests {
             },
         );
 
-        enrich_proto_baseline_paths(&mut policy);
+        let plan = EnrichmentPlan::for_proto_policy(&policy, None);
+        plan.apply_to_proto_policy(&mut policy).unwrap();
 
         let filesystem = policy.filesystem.expect("filesystem policy");
         assert!(
@@ -1726,16 +2192,17 @@ mod baseline_tests {
             policy.network_policies.is_empty(),
             "regression setup must exercise the no-network default path"
         );
-        let (ro, rw) =
-            collect_baseline_enrichment_paths(false, true, vec!["/dev/nvidia0".to_string()]);
+        let plan = EnrichmentPlan::legacy_gpu_fallback(vec!["/dev/nvidia0".to_string()]);
 
-        let enriched = enrich_proto_baseline_paths_with(&mut policy, &ro, &rw, |path| {
-            matches!(path, "/proc" | "/dev/nvidia0")
-        });
+        let application = plan
+            .apply_to_proto_policy_with(&mut policy, |path| {
+                matches!(path, "/proc" | "/dev/nvidia0")
+            })
+            .unwrap();
 
         let filesystem = policy.filesystem.expect("filesystem policy");
         assert!(
-            enriched,
+            application.modified(),
             "GPU enrichment should not require network policies"
         );
         assert!(
@@ -1753,13 +2220,235 @@ mod baseline_tests {
     }
 
     #[test]
-    fn gpu_baseline_read_write_contains_dxg() {
-        // /dev/dxg must be present so WSL2 sandboxes get the Landlock
-        // read-write rule for the CDI-injected DXG device.  The existence
-        // check in enrich_proto_baseline_paths() skips it on native Linux.
+    fn cdi_gpu_baseline_uses_proc_without_legacy_gpu_paths() {
+        let requirements = openshell_core::cdi::CdiDerivedRequirements::default();
+        let (ro, rw) = EnrichmentPlan::cdi_gpu(&requirements).paths();
+
+        assert!(
+            rw.contains(&GPU_PROC_READ_WRITE.to_string()),
+            "CDI GPU baseline should keep the CUDA procfs write exception"
+        );
+        for path in [
+            "/dev/nvidiactl",
+            "/dev/nvidia-uvm",
+            "/dev/dxg",
+            "/dev/nvidia0",
+        ] {
+            assert!(
+                !rw.contains(&path.to_string()),
+                "CDI GPU baseline should not include legacy read-write path {path}"
+            );
+        }
+        for path in ["/run/nvidia-persistenced", "/usr/lib/wsl"] {
+            assert!(
+                !ro.contains(&path.to_string()),
+                "CDI GPU baseline should not include legacy read-only path {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn active_cdi_gpu_baseline_ignores_detected_gpu_devices() {
+        let requirements = openshell_core::cdi::CdiDerivedRequirements::default();
+        let (ro, rw) = EnrichmentPlan::active(false, Some(&requirements)).paths();
+
+        assert!(
+            ro.is_empty(),
+            "CDI-only GPU baseline should not add read-only legacy paths"
+        );
+        assert_eq!(rw, vec![GPU_PROC_READ_WRITE.to_string()]);
+    }
+
+    #[test]
+    fn enrichment_plan_composes_proxy_baseline_and_cdi_gpu_paths() {
+        let requirements = openshell_core::cdi::CdiDerivedRequirements {
+            device_node_paths: vec!["/dev/dxg".to_string()],
+            read_only_mount_paths: vec!["/usr/lib/wsl/lib/libcuda.so.1".to_string()],
+            read_write_mount_paths: Vec::new(),
+            additional_gids: vec![44],
+        };
+        let plan = EnrichmentPlan::proxy_baseline().merge(EnrichmentPlan::cdi_gpu(&requirements));
+        let (ro, rw) = plan.paths();
+
+        assert!(ro.contains(&"/usr".to_string()));
+        assert!(ro.contains(&"/usr/lib/wsl/lib/libcuda.so.1".to_string()));
+        assert!(rw.contains(&"/tmp".to_string()));
+        assert!(rw.contains(&"/dev/dxg".to_string()));
+        assert!(rw.contains(&GPU_PROC_READ_WRITE.to_string()));
+        assert!(
+            !ro.contains(&GPU_PROC_READ_WRITE.to_string()),
+            "read_write /proc should normalize away proxy read_only /proc"
+        );
+        assert_eq!(plan.additional_gids(), vec![44]);
+    }
+
+    #[test]
+    fn enrichment_plan_merges_baseline_and_runtime_path_sources() {
+        let mut plan = EnrichmentPlan::default();
+        plan.insert_read_write_path("/shared", EnrichmentPathPolicy::baseline());
+        plan.insert_read_write_path("/shared", EnrichmentPathPolicy::runtime_device_node());
+
+        let (_ro, rw) = plan.entries();
+        assert_eq!(rw.len(), 1);
+        assert!(rw[0].policy.sources.baseline);
+        assert!(rw[0].policy.sources.runtime);
+    }
+
+    #[test]
+    fn proto_cdi_enrichment_adds_derived_paths() {
+        let mut policy = openshell_policy::restrictive_default_policy();
+        let requirements = openshell_core::cdi::CdiDerivedRequirements {
+            device_node_paths: vec!["/dev/dxg".to_string()],
+            read_only_mount_paths: vec!["/usr/lib/wsl/lib/libcuda.so.1".to_string()],
+            read_write_mount_paths: Vec::new(),
+            additional_gids: Vec::new(),
+        };
+
+        let plan = EnrichmentPlan::cdi_gpu(&requirements);
+        assert!(
+            plan.apply_to_proto_policy_with(&mut policy, |path| {
+                matches!(path, "/usr/lib/wsl/lib/libcuda.so.1" | "/dev/dxg" | "/proc")
+            })
+            .unwrap()
+            .modified()
+        );
+        let filesystem = policy.filesystem.expect("filesystem policy");
+        assert!(
+            filesystem
+                .read_only
+                .contains(&"/usr/lib/wsl/lib/libcuda.so.1".to_string())
+        );
+        assert!(filesystem.read_write.contains(&"/dev/dxg".to_string()));
+    }
+
+    #[test]
+    fn proto_cdi_enrichment_errors_for_missing_runtime_path() {
+        let mut policy = openshell_policy::restrictive_default_policy();
+        let requirements = openshell_core::cdi::CdiDerivedRequirements {
+            device_node_paths: vec!["/dev/dxg".to_string()],
+            read_only_mount_paths: Vec::new(),
+            read_write_mount_paths: Vec::new(),
+            additional_gids: Vec::new(),
+        };
+
+        let plan = EnrichmentPlan::cdi_gpu(&requirements);
+        let err = plan
+            .apply_to_proto_policy_with(&mut policy, |path| path == "/proc")
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("does not exist"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn proto_cdi_device_node_conflict_keeps_explicit_read_only() {
+        let mut policy = openshell_policy::restrictive_default_policy();
+        policy.filesystem = Some(openshell_core::proto::FilesystemPolicy {
+            read_only: vec!["/dev/nvidia0".to_string()],
+            read_write: Vec::new(),
+            include_workdir: false,
+        });
+        let requirements = openshell_core::cdi::CdiDerivedRequirements {
+            device_node_paths: vec!["/dev/nvidia0".to_string()],
+            read_only_mount_paths: Vec::new(),
+            read_write_mount_paths: Vec::new(),
+            additional_gids: Vec::new(),
+        };
+
+        let plan = EnrichmentPlan::cdi_gpu(&requirements);
+        plan.apply_to_proto_policy_with(&mut policy, |path| {
+            matches!(path, "/dev/nvidia0" | "/proc")
+        })
+        .unwrap();
+        let filesystem = policy.filesystem.expect("filesystem policy");
+        assert!(
+            filesystem.read_only.contains(&"/dev/nvidia0".to_string()),
+            "CDI device nodes should not promote existing read_only policy entries"
+        );
+        assert!(
+            !filesystem.read_write.contains(&"/dev/nvidia0".to_string()),
+            "existing read_only device node should remain read_only"
+        );
+    }
+
+    #[test]
+    fn proto_cdi_writable_mount_rejects_read_write_conflict() {
+        let mut policy = openshell_policy::restrictive_default_policy();
+        policy.filesystem = Some(openshell_core::proto::FilesystemPolicy {
+            read_only: vec!["/opt/nvidia/cache.db".to_string()],
+            read_write: Vec::new(),
+            include_workdir: false,
+        });
+        let requirements = openshell_core::cdi::CdiDerivedRequirements {
+            device_node_paths: Vec::new(),
+            read_only_mount_paths: Vec::new(),
+            read_write_mount_paths: vec!["/opt/nvidia/cache.db".to_string()],
+            additional_gids: Vec::new(),
+        };
+
+        let plan = EnrichmentPlan::cdi_gpu(&requirements);
+        let err = plan
+            .apply_to_proto_policy_with(&mut policy, |path| {
+                matches!(path, "/opt/nvidia/cache.db" | "/proc")
+            })
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("conflicts"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn proto_cdi_enrichment_promotes_proc_read_write() {
+        let mut policy = openshell_policy::restrictive_default_policy();
+        policy.filesystem = Some(openshell_core::proto::FilesystemPolicy {
+            read_only: vec!["/proc".to_string()],
+            read_write: Vec::new(),
+            include_workdir: false,
+        });
+        let requirements = openshell_core::cdi::CdiDerivedRequirements {
+            device_node_paths: vec!["/proc".to_string()],
+            read_only_mount_paths: Vec::new(),
+            read_write_mount_paths: Vec::new(),
+            additional_gids: Vec::new(),
+        };
+
+        let plan = EnrichmentPlan::cdi_gpu(&requirements);
+        assert!(plan.apply_to_proto_policy(&mut policy).unwrap().modified());
+        let filesystem = policy.filesystem.expect("filesystem policy");
+        assert!(!filesystem.read_only.contains(&"/proc".to_string()));
+        assert!(filesystem.read_write.contains(&"/proc".to_string()));
+    }
+
+    #[test]
+    fn local_cdi_enrichment_applies_additional_gids_as_supplemental_groups() {
+        let mut policy = SandboxPolicy {
+            version: 1,
+            filesystem: FilesystemPolicy::default(),
+            network: NetworkPolicy::default(),
+            landlock: LandlockPolicy::default(),
+            process: ProcessPolicy::default(),
+        };
+        let requirements = openshell_core::cdi::CdiDerivedRequirements {
+            device_node_paths: Vec::new(),
+            read_only_mount_paths: Vec::new(),
+            read_write_mount_paths: Vec::new(),
+            additional_gids: vec![44, 107],
+        };
+
+        let plan = EnrichmentPlan::cdi_gpu(&requirements);
+        plan.apply_to_sandbox_policy(&mut policy).unwrap();
+        assert_eq!(policy.process.supplemental_groups, vec![44, 107]);
+    }
+
+    #[test]
+    fn legacy_gpu_baseline_read_write_contains_dxg() {
+        // /dev/dxg stays in the legacy device-scan fallback. CDI mode derives
+        // device nodes from the selected specs instead of this list.
         assert!(
             GPU_BASELINE_READ_WRITE.contains(&"/dev/dxg"),
-            "/dev/dxg must be in GPU_BASELINE_READ_WRITE for WSL2 support"
+            "/dev/dxg should remain in the legacy GPU read-write fallback"
         );
     }
 
@@ -1768,7 +2457,7 @@ mod baseline_tests {
         let mut policy = SandboxPolicy {
             version: 1,
             filesystem: FilesystemPolicy {
-                read_only: vec![std::path::PathBuf::from("/tmp")],
+                read_only: vec![PathBuf::from("/tmp")],
                 read_write: vec![],
                 include_workdir: false,
             },
@@ -1780,31 +2469,61 @@ mod baseline_tests {
             process: ProcessPolicy::default(),
         };
 
-        enrich_sandbox_baseline_paths(&mut policy);
+        let plan = EnrichmentPlan::for_sandbox_policy(&policy, None);
+        plan.apply_to_sandbox_policy(&mut policy).unwrap();
 
         assert!(
-            policy
-                .filesystem
-                .read_only
-                .contains(&std::path::PathBuf::from("/tmp")),
+            policy.filesystem.read_only.contains(&PathBuf::from("/tmp")),
             "explicit read_only baseline path should be preserved"
         );
         assert!(
             !policy
                 .filesystem
                 .read_write
-                .contains(&std::path::PathBuf::from("/tmp")),
+                .contains(&PathBuf::from("/tmp")),
             "baseline enrichment must not promote explicit read_only /tmp to read_write"
         );
     }
 
     #[test]
-    fn gpu_baseline_read_only_contains_usr_lib_wsl() {
-        // /usr/lib/wsl must be present so CDI-injected WSL2 GPU library
-        // bind-mounts are accessible under Landlock.  Skipped on native Linux.
+    fn legacy_gpu_baseline_read_only_contains_usr_lib_wsl() {
+        // /usr/lib/wsl stays in the legacy device-scan fallback. CDI mode uses
+        // resolved mount destinations instead of this broad directory.
         assert!(
             GPU_BASELINE_READ_ONLY.contains(&"/usr/lib/wsl"),
-            "/usr/lib/wsl must be in GPU_BASELINE_READ_ONLY for WSL2 CDI library paths"
+            "/usr/lib/wsl should remain in the legacy GPU read-only fallback"
+        );
+    }
+
+    #[test]
+    fn local_cdi_baseline_promotes_proc_read_write() {
+        let mut policy = SandboxPolicy {
+            version: 1,
+            filesystem: FilesystemPolicy {
+                read_only: vec![PathBuf::from(GPU_PROC_READ_WRITE)],
+                read_write: Vec::new(),
+                include_workdir: false,
+            },
+            network: NetworkPolicy::default(),
+            landlock: LandlockPolicy::default(),
+            process: ProcessPolicy::default(),
+        };
+
+        let requirements = openshell_core::cdi::CdiDerivedRequirements::default();
+        let plan = EnrichmentPlan::for_sandbox_policy(&policy, Some(&requirements));
+        plan.apply_to_sandbox_policy(&mut policy).unwrap();
+
+        assert!(
+            !policy
+                .filesystem
+                .read_only
+                .contains(&PathBuf::from(GPU_PROC_READ_WRITE))
+        );
+        assert!(
+            policy
+                .filesystem
+                .read_write
+                .contains(&PathBuf::from(GPU_PROC_READ_WRITE))
         );
     }
 
@@ -1950,7 +2669,7 @@ async fn load_policy(
             landlock: config.landlock,
             process: config.process,
         };
-        enrich_sandbox_baseline_paths(&mut policy);
+        enrich_sandbox_policy_with_baseline_and_cdi(&mut policy)?;
         // File mode has no operator-registered middleware to connect.
         return Ok((
             policy,
@@ -1992,7 +2711,7 @@ async fn load_policy(
             let mut discovered = discover_policy_from_disk_or_default();
             // Enrich before syncing so the gateway baseline includes
             // baseline paths from the start.
-            enrich_proto_baseline_paths(&mut discovered);
+            enrich_proto_policy_with_baseline_and_cdi(&mut discovered)?;
             strip_proto_provider_policy_entries(&mut discovered);
             let sandbox = sandbox.as_deref().ok_or_else(|| {
                 miette::miette!(
@@ -2028,7 +2747,8 @@ async fn load_policy(
         // Ensure baseline filesystem paths are present for proxy-mode
         // sandboxes.  If the policy was enriched, sync the updated version
         // back to the gateway so users can see the effective policy.
-        let enriched = enrich_proto_baseline_paths(&mut proto_policy);
+        let cdi_enrichment = enrich_proto_policy_with_baseline_and_cdi(&mut proto_policy)?;
+        let enriched = cdi_enrichment.enriched;
         let sync_policy = proto_sync_payload_for_enriched_policy(&proto_policy, enriched);
         if let Some(sync_policy) = sync_policy {
             if let Some(sandbox_name) = sandbox.as_deref() {
@@ -2172,7 +2892,7 @@ async fn load_policy(
         };
         let opa_engine = Some(engine);
 
-        let policy = match SandboxPolicy::try_from(proto_policy.clone()) {
+        let mut policy = match SandboxPolicy::try_from(proto_policy.clone()) {
             Ok(policy) => policy,
             Err(e) => {
                 report_initial_policy_failure(endpoint, id, loaded_policy_revision.as_ref(), &e)
@@ -2180,6 +2900,9 @@ async fn load_policy(
                 return Err(e);
             }
         };
+        if !cdi_enrichment.additional_gids.is_empty() {
+            policy.process.supplemental_groups = cdi_enrichment.additional_gids;
+        }
         return Ok((
             policy,
             opa_engine,
@@ -2987,7 +3710,7 @@ fn retain_extension_credentials(
             .map(|service| service.name.as_str())
             .collect()
     } else {
-        std::collections::HashSet::default()
+        HashSet::default()
     };
     store.retain(&retained);
 }
@@ -4131,8 +4854,8 @@ mod tests {
         apply_agent_proposals_enabled(&agent_proposals, true, "test", Some(1), None, || {
             installs.fetch_add(1, Ordering::Relaxed);
             Ok(skills::InstalledSkills {
-                policy_advisor: std::path::PathBuf::from("/tmp/policy_advisor.md"),
-                policy_advisor_skill: std::path::PathBuf::from("/tmp/SKILL.md"),
+                policy_advisor: PathBuf::from("/tmp/policy_advisor.md"),
+                policy_advisor_skill: PathBuf::from("/tmp/SKILL.md"),
                 agents: None,
             })
         });
@@ -4142,8 +4865,8 @@ mod tests {
         apply_agent_proposals_enabled(&agent_proposals, true, "test", Some(2), None, || {
             installs.fetch_add(1, Ordering::Relaxed);
             Ok(skills::InstalledSkills {
-                policy_advisor: std::path::PathBuf::from("/tmp/policy_advisor.md"),
-                policy_advisor_skill: std::path::PathBuf::from("/tmp/SKILL.md"),
+                policy_advisor: PathBuf::from("/tmp/policy_advisor.md"),
+                policy_advisor_skill: PathBuf::from("/tmp/SKILL.md"),
                 agents: None,
             })
         });
@@ -4152,8 +4875,8 @@ mod tests {
         apply_agent_proposals_enabled(&agent_proposals, false, "test", Some(3), None, || {
             installs.fetch_add(1, Ordering::Relaxed);
             Ok(skills::InstalledSkills {
-                policy_advisor: std::path::PathBuf::from("/tmp/policy_advisor.md"),
-                policy_advisor_skill: std::path::PathBuf::from("/tmp/SKILL.md"),
+                policy_advisor: PathBuf::from("/tmp/policy_advisor.md"),
+                policy_advisor_skill: PathBuf::from("/tmp/SKILL.md"),
                 agents: None,
             })
         });

@@ -13,7 +13,13 @@ use miette::{IntoDiagnostic, Result};
 use nix::sys::signal::{self, Signal};
 use nix::unistd::{Gid, Group, Pid, Uid, User};
 use openshell_core::policy::{NetworkMode, SandboxPolicy};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
+#[cfg(not(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "haiku",
+    target_os = "redox"
+)))]
 use std::ffi::CString;
 #[cfg(target_os = "linux")]
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
@@ -1943,7 +1949,11 @@ fn resolve_filesystem_identity(
         _ => Vec::new(),
     };
 
-    Ok((uid, gid, supplementary_gids))
+    Ok((
+        uid,
+        gid,
+        merged_supplemental_gids(supplementary_gids, &policy.process.supplemental_groups)?,
+    ))
 }
 
 #[cfg(not(unix))]
@@ -1953,6 +1963,24 @@ pub fn prepare_filesystem(_policy: &SandboxPolicy) -> Result<()> {
 
 // `effective_gid`/`effective_uid` are intentionally parallel names (same role
 // for different identifiers) and the noise from renaming would obscure intent.
+#[cfg(unix)]
+fn merged_supplemental_gids(base: Vec<Gid>, extra: &[u32]) -> Result<Vec<Gid>> {
+    let mut groups = base
+        .into_iter()
+        .map(Gid::as_raw)
+        .filter(|gid| *gid != 0)
+        .collect::<BTreeSet<_>>();
+
+    for raw_gid in extra {
+        if *raw_gid == 0 {
+            return Err(miette::miette!("Supplemental group GID 0 is not allowed"));
+        }
+        groups.insert(*raw_gid);
+    }
+
+    Ok(groups.into_iter().map(Gid::from_raw).collect())
+}
+
 #[cfg(unix)]
 #[allow(clippy::similar_names)]
 pub fn drop_privileges(policy: &SandboxPolicy) -> Result<()> {
@@ -1984,6 +2012,11 @@ pub fn drop_privileges_with_identity(
             fallback.process.run_as_user = Some("sandbox".into());
             fallback.process.run_as_group = Some("sandbox".into());
             return drop_privileges_with_identity(&fallback, resolved_identity);
+        }
+        if !policy.process.supplemental_groups.is_empty() {
+            return Err(miette::miette!(
+                "Supplemental groups require a privileged supervisor process"
+            ));
         }
         return Ok(());
     }
@@ -2035,61 +2068,46 @@ pub fn drop_privileges_with_identity(
         },
     };
 
-    // Resolve the name for initgroups only for the existing explicit-policy
-    // path. OCI-derived users carry a numeric UID from the bounded parser and
-    // must not be looked up again through NSS.
-    let user_name_is_numeric = user_name.is_some_and(|n| n.parse::<u32>().is_ok());
-    let initgroups_name =
-        if user_name.is_some() && !user_name_is_numeric && resolved_identity.uid().is_none() {
-            Some(
-                User::from_uid(target_uid)
-                    .into_diagnostic()?
-                    .ok_or_else(|| {
-                        miette::miette!("Failed to resolve user record for UID {target_uid}")
-                    })?
-                    .name,
-            )
-        } else {
-            None
-        };
-
+    #[cfg(not(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "haiku",
+        target_os = "redox"
+    )))]
     if target_uid != nix::unistd::geteuid() {
-        if resolved_identity.uses_oci_user_fallback() {
+        let user_name_is_numeric = user_name.is_some_and(|n| n.parse::<u32>().is_ok());
+        let initgroups_name =
+            if user_name.is_some() && !user_name_is_numeric && resolved_identity.uid().is_none() {
+                Some(
+                    User::from_uid(target_uid)
+                        .into_diagnostic()?
+                        .ok_or_else(|| {
+                            miette::miette!("Failed to resolve user record for UID {target_uid}")
+                        })?
+                        .name,
+                )
+            } else {
+                None
+            };
+        let supplemental_groups = if resolved_identity.uses_oci_user_fallback() {
             // OCI named users use the bounded /etc/group parser shared with
             // workspace validation. Numeric OCI users resolve to an empty
             // list. Never retain the root supervisor's inherited groups.
-            #[cfg(not(any(
-                target_os = "macos",
-                target_os = "ios",
-                target_os = "haiku",
-                target_os = "redox"
-            )))]
-            {
-                let (_, _, supplementary_gids) =
-                    resolve_filesystem_identity(policy, resolved_identity)?;
-                nix::unistd::setgroups(&supplementary_gids).into_diagnostic()?;
-            }
+            resolve_filesystem_identity(policy, resolved_identity)?.2
         } else if let Some(ref user_name) = initgroups_name {
             let user_cstr = CString::new(user_name.as_str())
                 .map_err(|_| miette::miette!("Invalid user name"))?;
-            #[cfg(any(
-                target_os = "macos",
-                target_os = "ios",
-                target_os = "haiku",
-                target_os = "redox"
-            ))]
-            {
-                let _ = user_cstr;
-            }
-            #[cfg(not(any(
-                target_os = "macos",
-                target_os = "ios",
-                target_os = "haiku",
-                target_os = "redox"
-            )))]
-            {
-                nix::unistd::initgroups(user_cstr.as_c_str(), target_gid).into_diagnostic()?;
-            }
+            nix::unistd::initgroups(user_cstr.as_c_str(), target_gid).into_diagnostic()?;
+            merged_supplemental_gids(
+                nix::unistd::getgroups().into_diagnostic()?,
+                &policy.process.supplemental_groups,
+            )?
+        } else {
+            merged_supplemental_gids(Vec::new(), &policy.process.supplemental_groups)?
+        };
+
+        if !supplemental_groups.is_empty() || resolved_identity.uses_oci_user_fallback() {
+            nix::unistd::setgroups(&supplemental_groups).into_diagnostic()?;
         }
     }
 
@@ -2234,6 +2252,7 @@ mod tests {
         let policy = policy_with_process(ProcessPolicy {
             run_as_user: Some("101".into()),
             run_as_group: Some("102".into()),
+            ..Default::default()
         });
 
         assert!(validate_sandbox_user(&policy).is_ok());
@@ -2246,6 +2265,7 @@ mod tests {
         let policy = policy_with_process(ProcessPolicy {
             run_as_user: Some("app".into()),
             run_as_group: Some("staff".into()),
+            ..Default::default()
         });
         let resolved = ResolvedProcessIdentity::new(Some(101), Some(102));
 
@@ -2259,10 +2279,12 @@ mod tests {
         let root_user = policy_with_process(ProcessPolicy {
             run_as_user: Some("0".into()),
             run_as_group: Some("102".into()),
+            ..Default::default()
         });
         let root_group = policy_with_process(ProcessPolicy {
             run_as_user: Some("101".into()),
             run_as_group: Some("0".into()),
+            ..Default::default()
         });
 
         assert!(validate_sandbox_user(&root_user).is_err());
@@ -2275,6 +2297,7 @@ mod tests {
         let policy = policy_with_process(ProcessPolicy {
             run_as_user: Some("__oci_name_not_in_host_nss__".into()),
             run_as_group: Some("__oci_group_not_in_host_nss__".into()),
+            ..Default::default()
         });
         let resolved = ResolvedProcessIdentity::new(Some(1234), Some(1235));
 
@@ -2288,6 +2311,7 @@ mod tests {
         let policy = policy_with_process(ProcessPolicy {
             run_as_user: Some("__explicit_name_not_in_host_nss__".into()),
             run_as_group: Some("__oci_group_not_in_host_nss__".into()),
+            ..Default::default()
         });
         let resolved = ResolvedProcessIdentity::new(None, Some(1235));
 
@@ -2407,6 +2431,7 @@ mod tests {
         let policy = policy_with_process(ProcessPolicy {
             run_as_user: None,
             run_as_group: None,
+            ..Default::default()
         });
         if nix::unistd::geteuid().is_root() {
             // As root, drop_privileges falls back to "sandbox:sandbox".
@@ -2424,6 +2449,7 @@ mod tests {
         let policy = policy_with_process(ProcessPolicy {
             run_as_user: Some(String::new()),
             run_as_group: Some(String::new()),
+            ..Default::default()
         });
         if nix::unistd::geteuid().is_root() {
             let has_sandbox = User::from_name("sandbox").ok().flatten().is_some();
@@ -2431,6 +2457,21 @@ mod tests {
         } else {
             assert!(drop_privileges(&policy).is_ok());
         }
+    }
+
+    #[test]
+    fn merged_supplemental_gids_deduplicates_and_rejects_root() {
+        let merged = merged_supplemental_gids(
+            vec![Gid::from_raw(44), Gid::from_raw(44), Gid::from_raw(0)],
+            &[44, 107],
+        )
+        .unwrap();
+
+        assert_eq!(
+            merged.iter().map(|gid| gid.as_raw()).collect::<Vec<_>>(),
+            vec![44, 107]
+        );
+        assert!(merged_supplemental_gids(Vec::new(), &[0]).is_err());
     }
 
     #[test]
@@ -2447,6 +2488,7 @@ mod tests {
         let policy = policy_with_process(ProcessPolicy {
             run_as_user: None,
             run_as_group: Some(current_group.name),
+            ..Default::default()
         });
 
         let result = drop_privileges(&policy);
@@ -2484,6 +2526,7 @@ mod tests {
         let policy = policy_with_process(ProcessPolicy {
             run_as_user: None,
             run_as_group: Some(current_group.name),
+            ..Default::default()
         });
 
         let mut cmd = std::process::Command::new(std::env::current_exe().expect("current exe"));
@@ -2525,6 +2568,7 @@ mod tests {
         let policy = policy_with_process(ProcessPolicy {
             run_as_user: Some(current_user.name),
             run_as_group: Some(current_group.name),
+            ..Default::default()
         });
 
         assert!(drop_privileges(&policy).is_ok());
@@ -2535,6 +2579,7 @@ mod tests {
         let policy = policy_with_process(ProcessPolicy {
             run_as_user: Some("__nonexistent_test_user_42__".to_string()),
             run_as_group: None,
+            ..Default::default()
         });
 
         let result = drop_privileges(&policy);
@@ -2548,6 +2593,7 @@ mod tests {
         let policy = policy_with_process(ProcessPolicy {
             run_as_user: None,
             run_as_group: Some("__nonexistent_test_group_42__".to_string()),
+            ..Default::default()
         });
 
         let result = drop_privileges(&policy);
@@ -2721,6 +2767,7 @@ mod tests {
             process: ProcessPolicy {
                 run_as_user,
                 run_as_group,
+                ..Default::default()
             },
         }
     }
@@ -3683,6 +3730,7 @@ mod tests {
         let policy = policy_with_process(ProcessPolicy {
             run_as_user: Some(uid_raw.to_string()),
             run_as_group: Some(gid_raw.to_string()),
+            ..Default::default()
         });
 
         assert!(
@@ -3709,6 +3757,7 @@ mod tests {
         let policy = policy_with_process(ProcessPolicy {
             run_as_user: Some(current_uid.to_string()), // numeric UID, no passwd entry needed
             run_as_group: Some(current_group.name),     // name-based group
+            ..Default::default()
         });
 
         assert!(
@@ -3725,6 +3774,7 @@ mod tests {
         let policy = policy_with_process(ProcessPolicy {
             run_as_user: Some("999999".into()),
             run_as_group: Some("999999".into()),
+            ..Default::default()
         });
         match drop_privileges(&policy) {
             Ok(()) => {}
