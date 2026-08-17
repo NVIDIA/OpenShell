@@ -38,6 +38,7 @@ miette = { workspace = true }
 toml = { workspace = true }
 tower-http = { workspace = true }
 http = { workspace = true }
+tar = "0.4"
 
 [dev-dependencies]
 openshell-otel-test-support = { path = "../openshell-otel-test-support" }
