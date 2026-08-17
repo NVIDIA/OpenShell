@@ -364,7 +364,7 @@ For maintainer-level implementation details, refer to the [Kubernetes driver REA
 | `proxy_auth_secret_key` | `upstreamProxy.authSecret.key` | Set the Secret key containing the `user:pass` credential. Requires `sidecar` topology. |
 | `proxy_auth_allow_insecure` | `upstreamProxy.authAllowInsecure` | Set `true` to acknowledge that Basic authentication to an HTTP proxy is cleartext. Required with a proxy credential Secret. |
 | `proxy_connect_by_hostname` | `upstreamProxy.connectByHostname` | Send hostnames rather than validated IPs in CONNECT requests. Use only when proxy ACLs require hostname targets. |
-| `sidecar.proxy_uid` | `supervisor.sidecar.proxyUid` | Non-root UID used by the relaxed sidecar when process/binary-aware network policy is disabled. The default binary-aware sidecar runs as UID 0. The network init container exempts the effective sidecar UID from proxy redirection. |
+| `sidecar.proxy_uid` | `supervisor.sidecar.proxyUid` | Dedicated UID of at least `1000` used by the relaxed sidecar when process/binary-aware network policy is disabled. It must not match the workload UID. The default binary-aware sidecar runs as UID 0. The network init container exempts the effective sidecar UID from proxy redirection. |
 | `sidecar.process_binary_aware_network_policy` | `supervisor.sidecar.processBinaryAwareNetworkPolicy` | Keep process/binary-aware network policy enabled in `sidecar` topology. The default runs the sidecar as UID 0 with `SYS_PTRACE` and `DAC_READ_SEARCH`. Set false to run as `proxy_uid`, drop both capabilities, and enforce endpoint/L7 policy without matching `policy.binaries`. |
 | `app_armor_profile` | `server.appArmorProfile` | Set the sandbox agent container's AppArmor profile. Helm defaults this to `Unconfined` so AppArmor-enabled nodes do not block supervisor network namespace setup. Set the Helm value to an empty string to omit the field, or use `RuntimeDefault` or `Localhost/<profile-name>` for operator-managed profiles. |
 | `workspace_default_storage_size` | `server.workspaceDefaultStorageSize` | Set the default workspace PVC size for new sandboxes. |
@@ -484,6 +484,12 @@ image.
 The policy can set `process.run_as_user` and `process.run_as_group`
 independently. Each explicit field wins. The active compute driver supplies the
 identity for omitted fields.
+
+Explicit numeric values may use any non-root Linux UID/GID from `1` through
+`4294967294`. OpenShell rejects `0` as root and `4294967295` as the invalid
+identity sentinel. Low numeric identities can inherit permissions from matching
+accounts, files, volumes, or devices, so choose them with the same care as any
+other runtime identity.
 
 ### Docker / Podman
 

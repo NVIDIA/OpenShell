@@ -122,9 +122,9 @@ Sets the OS-level identity for the agent process inside the sandbox.
 | `run_as_group` | string | No | Overrides the group name or GID selected by the compute driver. Docker and Podman fall back to the image's OCI `USER`. |
 
 **Validation constraint:** An explicit policy value must be `sandbox` or a
-numeric UID/GID in the allowed sandbox range. Docker and Podman may select
-other named identities or non-root system IDs only through OCI `USER`
-fallback. Root identities are always rejected.
+numeric UID/GID from `1` through `4294967294`. OpenShell rejects `0` as root
+and `4294967295` as the invalid identity sentinel. Docker and Podman may select
+other named identities through OCI `USER` fallback.
 
 Omission is preserved independently for each field. For example, setting only
 `run_as_user` keeps that explicit user while allowing the active driver to

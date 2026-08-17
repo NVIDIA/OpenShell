@@ -479,7 +479,10 @@ For Docker and Podman gateways, custom images should declare a non-root OCI
 `USER`. Each explicit `process.run_as_user` or `process.run_as_group` policy
 field wins independently; omitted fields fall back to the image declaration.
 An image with no `USER` fails before readiness unless policy supplies both
-fields.
+fields. Explicit numeric fields may use any UID/GID from `1` through
+`4294967294`; `0` is root and `4294967295` is the invalid identity sentinel.
+Warn users that low IDs can inherit permissions from matching accounts, image
+files, mounted volumes, or devices.
 
 ### Forward ports
 

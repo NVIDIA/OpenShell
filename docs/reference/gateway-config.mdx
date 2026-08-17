@@ -517,7 +517,7 @@ provider_spiffe_workload_api_socket_path = "/spiffe-workload-api/spire-agent.soc
 # Explicit sandbox UID/GID for the supervisor container securityContext and
 # PVC init container. When unset, the driver auto-detects from OpenShift SCC
 # namespace annotations (openshift.io/sa.scc.uid-range) if present, falling
-# back to 1000 on non-OpenShift clusters.
+# back to 1000 on non-OpenShift clusters. Any non-root Linux UID/GID is valid.
 # sandbox_uid = 1500
 # sandbox_gid = 1500
 # Operator-mode namespace discovery. At least one must be set when
@@ -537,7 +537,9 @@ gateway_pod_selector = { "app.kubernetes.io/name" = "openshell", "app.kubernetes
 # UID used by relaxed long-running network sidecars. Strict process/binary-aware
 # sidecars run as UID 0 so Kubernetes grants the required /proc inspection
 # capabilities into the effective set. In sidecar topology the network init
-# container installs nftables rules that exempt the effective sidecar UID.
+# container installs nftables rules that exempt the effective sidecar UID, so
+# this dedicated infrastructure UID must remain at least 1000 and must not
+# match the sandbox workload UID.
 proxy_uid                      = 1337
 # Keep process/binary-aware network policy enabled in sidecar topology. Set
 # false to run the sidecar as proxy_uid, drop the sidecar's extra /proc
@@ -737,6 +739,7 @@ guest_tls_cert   = "/var/lib/openshell/guest-tls/client.pem"
 guest_tls_key    = "/var/lib/openshell/guest-tls/client-key.pem"
 # Resolved sandbox UID/GID for the rootfs /etc/passwd entry.
 # Defaults to 10001 when unset; matching GID is used if sandbox_gid is empty.
+# Any non-root Linux UID/GID is valid.
 # sandbox_uid = 20001
 ```
 
