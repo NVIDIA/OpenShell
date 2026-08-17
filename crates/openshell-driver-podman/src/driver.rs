@@ -955,9 +955,16 @@ impl PodmanComputeDriver {
             .ok_or(ComputeDriverError::NotFound)?;
         let container_id = container.id;
         if container.state == "stopping" {
-            return self
-                .wait_for_container_stopped(sandbox_id, &container_id)
-                .await;
+            self.wait_for_container_stopped(sandbox_id, &container_id)
+                .await?;
+            let stopped = self
+                .client
+                .inspect_container(&container_id)
+                .await
+                .map_err(ComputeDriverError::from)?;
+            self.lifecycle_event_fences
+                .record_previous_exit(sandbox_id, stopped.state.finished_at.as_deref());
+            return Ok(());
         }
         if container.state != "running" {
             return Ok(());
@@ -975,7 +982,22 @@ impl PodmanComputeDriver {
         // the same sandbox to Starting, causing it to regress to Error. Wait
         // for the terminal container state before allowing a restart.
         self.wait_for_container_stopped(sandbox_id, &container_id)
+            .await?;
+
+        // Record the completed run before returning the stop RPC. The server
+        // may begin a restart as soon as this method returns, while Podman's
+        // stop/die event can still be queued. Recording the fence here keeps
+        // that delayed event from regressing the new run from Starting to
+        // Error. Keep the start-side recording as a fallback for restarts
+        // after a driver or gateway process restart.
+        let stopped = self
+            .client
+            .inspect_container(&container_id)
             .await
+            .map_err(ComputeDriverError::from)?;
+        self.lifecycle_event_fences
+            .record_previous_exit(sandbox_id, stopped.state.finished_at.as_deref());
+        Ok(())
     }
 
     /// Start a previously stopped sandbox container.
