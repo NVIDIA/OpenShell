@@ -3881,7 +3881,7 @@ fn generate_security_notes(rule: &NetworkPolicyRule) -> String {
         };
         for raw_port in ports {
             let port = u16::try_from(*raw_port).unwrap_or(0);
-            if port > 49152 {
+            if port >= 49152 {
                 notes.push(format!(
                     "Port {port} is in the ephemeral range — this may be a temporary service."
                 ));
@@ -4820,6 +4820,36 @@ mod tests {
         assert!(notes.contains("Port 5432 is a well-known database/service port."));
         assert!(notes.contains("Port 50000 is in the ephemeral range"));
         assert!(!notes.contains("Port 3306"));
+    }
+
+    #[test]
+    fn security_notes_ephemeral_range_boundary_49152_inclusive() {
+        // IANA dynamic/private range is 49152-65535 inclusive.
+        let below = generate_security_notes(&NetworkPolicyRule {
+            endpoints: vec![NetworkEndpoint {
+                host: "api.example.com".to_string(),
+                port: 49151,
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        assert!(
+            !below.contains("ephemeral"),
+            "49151 should not be flagged: {below}"
+        );
+
+        let at = generate_security_notes(&NetworkPolicyRule {
+            endpoints: vec![NetworkEndpoint {
+                host: "api.example.com".to_string(),
+                port: 49152,
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        assert!(
+            at.contains("Port 49152 is in the ephemeral range"),
+            "49152 should be flagged: {at}"
+        );
     }
 
     #[test]
