@@ -654,37 +654,21 @@ fn main() -> Result<()> {
         // drivers otherwise provide a versioned JSON transport so argument
         // boundaries are never reconstructed with shell parsing.
         let policy_workdir = args.workdir.clone();
-        let (command, main_workdir, interactive, main_environment) = if !args.command.is_empty() {
-            (
-                args.command,
-                policy_workdir.clone(),
-                args.interactive,
-                std::collections::HashMap::default(),
-            )
+        let (command, main_workdir, interactive) = if !args.command.is_empty() {
+            (args.command, policy_workdir.clone(), args.interactive)
         } else if let Ok(json) = std::env::var(openshell_core::sandbox_env::MAIN_PROCESS_SPEC) {
             let config = openshell_core::sandbox_env::MainProcessConfig::decode(&json)
                 .map_err(|error| miette::miette!("{error}"))?;
-            let workdir = if config.working_directory.is_empty() {
-                policy_workdir.clone()
-            } else {
-                Some(config.working_directory)
-            };
-            (config.command, workdir, config.terminal, config.environment)
+            (config.command, policy_workdir.clone(), config.tty)
         } else if let Ok(c) = std::env::var(openshell_core::sandbox_env::SANDBOX_COMMAND) {
             (
                 c.split_whitespace().map(String::from).collect(),
                 policy_workdir.clone(),
                 args.interactive,
-                std::collections::HashMap::default(),
             )
         } else {
             let config = openshell_core::sandbox_env::MainProcessConfig::scratch();
-            (
-                config.command,
-                policy_workdir.clone(),
-                config.terminal,
-                config.environment,
-            )
+            (config.command, policy_workdir.clone(), config.tty)
         };
 
         info!(command = ?command, "Starting sandbox");
@@ -706,7 +690,6 @@ fn main() -> Result<()> {
             main_workdir,
             args.timeout,
             interactive,
-            main_environment,
             args.sandbox_id,
             args.sandbox,
             args.openshell_endpoint,

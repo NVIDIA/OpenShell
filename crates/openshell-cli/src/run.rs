@@ -543,11 +543,8 @@ pub async fn sandbox_create(
             policy,
             providers: configured_providers,
             template,
-            main_process: Some(openshell_core::proto::MainProcessSpec {
-                command: main_command,
-                terminal: main_terminal,
-                ..Default::default()
-            }),
+            command: main_command,
+            tty: main_terminal,
             ..SandboxSpec::default()
         }),
         name: name.unwrap_or_default().to_string(),

@@ -29,7 +29,8 @@ func TestConverterCoversAllProtoFields_SandboxSpec(t *testing.T) {
 		"policy":                true,
 		"providers":             true,
 		"resource_requirements": true,
-		"main_process":          true,
+		"command":               true,
+		"tty":                   true,
 	}
 
 	assertAllFieldsCovered(t, (&pb.SandboxSpec{}).ProtoReflect().Descriptor(), handled, nil)
@@ -53,14 +54,15 @@ func TestConverterCoversAllProtoFields_SandboxTemplate(t *testing.T) {
 
 func TestConverterCoversAllProtoFields_SandboxStatus(t *testing.T) {
 	handled := fieldSet{
-		"sandbox_name":           true,
-		"agent_pod":              true,
-		"agent_fd":               true,
-		"sandbox_fd":             true,
-		"phase":                  true,
-		"conditions":             true,
-		"current_policy_version": true,
-		"main_process":           true,
+		"sandbox_name":             true,
+		"agent_pod":                true,
+		"agent_fd":                 true,
+		"sandbox_fd":               true,
+		"phase":                    true,
+		"conditions":               true,
+		"current_policy_version":   true,
+		"main_process_instance_id": true,
+		"exit_code":                true,
 	}
 
 	assertAllFieldsCovered(t, (&pb.SandboxStatus{}).ProtoReflect().Descriptor(), handled, nil)

@@ -232,6 +232,7 @@ Key flags:
 - `--driver-config-json`: Pass experimental driver-specific sandbox configuration
 - `--label KEY=VALUE`: Add labels for later selection (repeatable)
 - `--env KEY=VALUE`: Set non-secret sandbox environment variables (repeatable); use `--provider` for credentials
+- `--tty`: Allocate a retained PTY for the canonical main process
 - `--approval-mode manual|auto`: Control handling of agent-authored policy proposals; `manual` is the default
 - `--upload <PATH>[:<DEST>]`: Upload local files into the container working directory or an explicit destination
 - `--no-git-ignore`: Disable `.gitignore` filtering for uploads
@@ -262,7 +263,7 @@ openshell sandbox connect my-sandbox --editor vscode
 ```
 
 Attaches to the sandbox's existing canonical main process. Disconnecting leaves
-that process running; reconnecting targets the same generation and replays
+that process running; reconnecting targets the same process instance and replays
 recent output. Use `sandbox exec --tty -- /bin/bash -l` for a new shell. To
 configure VS Code Remote-SSH:
 

@@ -3,8 +3,6 @@ from . import datamodel_pb2, openshell_pb2
 # Sandbox messages and phase enums moved into openshell.proto. Keep aliases on
 # datamodel_pb2 so existing Python callers and E2E tests continue to work.
 for _name in (
-    "MainProcessSpec",
-    "MainProcessStatus",
     "Sandbox",
     "SandboxSpec",
     "SandboxTemplate",

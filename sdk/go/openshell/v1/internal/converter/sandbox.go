@@ -76,14 +76,8 @@ func sandboxSpecFromProto(spec *pb.SandboxSpec) types.SandboxSpec {
 			result.GPUCount = gpu.Count
 		}
 	}
-	if main := spec.GetMainProcess(); main != nil {
-		result.MainProcess = &types.MainProcessSpec{
-			Command:          CopyStringSlice(main.GetCommand()),
-			Environment:      CopyStringMap(main.GetEnvironment()),
-			WorkingDirectory: main.GetWorkingDirectory(),
-			Terminal:         main.GetTerminal(),
-		}
-	}
+	result.Command = CopyStringSlice(spec.GetCommand())
+	result.TTY = spec.GetTty()
 
 	return result
 }
@@ -107,16 +101,8 @@ func sandboxStatusFromProto(status *pb.SandboxStatus) types.SandboxStatus {
 			LastTransitionTime: c.GetLastTransitionTime(),
 		})
 	}
-	if main := status.GetMainProcess(); main != nil {
-		result.MainProcess = &types.MainProcessStatus{
-			State:      int32(main.GetState()),
-			Generation: main.GetGeneration(),
-			ExitCode:   CopyInt32Ptr(main.ExitCode),
-			Signal:     CopyInt32Ptr(main.Signal),
-			StartedAt:  TimeFromMillis(main.GetStartedAtMs()),
-			FinishedAt: TimeFromMillis(main.GetFinishedAtMs()),
-		}
-	}
+	result.MainProcessInstanceID = status.GetMainProcessInstanceId()
+	result.ExitCode = CopyInt32Ptr(status.ExitCode)
 
 	return result
 }
@@ -238,14 +224,8 @@ func SandboxSpecToProto(spec *types.SandboxSpec) *pb.SandboxSpec {
 		}
 	}
 
-	if spec.MainProcess != nil {
-		result.MainProcess = &pb.MainProcessSpec{
-			Command:          CopyStringSlice(spec.MainProcess.Command),
-			Environment:      CopyStringMap(spec.MainProcess.Environment),
-			WorkingDirectory: spec.MainProcess.WorkingDirectory,
-			Terminal:         spec.MainProcess.Terminal,
-		}
-	}
+	result.Command = CopyStringSlice(spec.Command)
+	result.Tty = spec.TTY
 
 	return result
 }

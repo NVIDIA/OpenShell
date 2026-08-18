@@ -13,7 +13,6 @@ use miette::{IntoDiagnostic, Result};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
-use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::time::timeout;
 use tracing::info;
 
@@ -41,7 +40,8 @@ use crate::process::{
 };
 
 pub type SidecarExitReport = (
-    openshell_core::proto::MainProcessExit,
+    String,
+    i32,
     tokio::sync::oneshot::Sender<Result<(), String>>,
 );
 
@@ -258,8 +258,7 @@ pub async fn run_process(
 
     let main_pid = handle.pid();
     let main_session = crate::main_session::MainSession::new(handle.take_io(), main_pid);
-    let main_generation = uuid::Uuid::new_v4().to_string();
-    let main_started_at_ms = current_time_ms();
+    let main_instance_id = uuid::Uuid::new_v4().to_string();
 
     // SSH-spawned shells get http_proxy=http://<host_ip>:<port> exported into
     // their env so cooperative tools (curl, npm, Node) route through the
@@ -366,7 +365,7 @@ pub async fn run_process(
             ssh_netns_fd,
             None,
             Arc::clone(&supervisor_terminating),
-            main_generation.clone(),
+            main_instance_id.clone(),
         );
         info!("supervisor session task spawned");
         Some(task)
@@ -379,7 +378,7 @@ pub async fn run_process(
     if early_exit.is_none()
         && let Some(tx) = entrypoint_started_tx
     {
-        let _ = tx.send((handle.pid(), main_generation.clone()));
+        let _ = tx.send((handle.pid(), main_instance_id.clone()));
     }
     ocsf_emit!(
         ProcessActivityBuilder::new(ocsf_ctx())
@@ -401,8 +400,8 @@ pub async fn run_process(
             .await?
     };
 
-    let (exit_code, signal, rendered_code) = match outcome {
-        ProcessWaitOutcome::Exited(status) => (status.exit_code(), status.signal(), status.code()),
+    let rendered_code = match outcome {
+        ProcessWaitOutcome::Exited(status) => status.code(),
         ProcessWaitOutcome::TimedOut => {
             ocsf_emit!(
                 ProcessActivityBuilder::new(ocsf_ctx())
@@ -414,7 +413,7 @@ pub async fn run_process(
                     .message("Process timed out, killing")
                     .build()
             );
-            (Some(124), None, 124)
+            124
         }
         ProcessWaitOutcome::ShutdownSignal { signal, status } => {
             info!(
@@ -422,7 +421,7 @@ pub async fn run_process(
                 exit_code = status.code(),
                 "Entrypoint exited after supervisor shutdown signal"
             );
-            (status.exit_code(), status.signal(), status.code())
+            status.code()
         }
     };
     supervisor_terminating.store(true, Ordering::Release);
@@ -443,16 +442,9 @@ pub async fn run_process(
     if let Some(task) = supervisor_session_task {
         task.abort();
     }
-    let exit = openshell_core::proto::MainProcessExit {
-        generation: main_generation.clone(),
-        exit_code,
-        signal,
-        started_at_ms: main_started_at_ms,
-        finished_at_ms: current_time_ms(),
-    };
     if let Some(tx) = sidecar_exit_tx {
         let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
-        tx.send((exit, ack_tx))
+        tx.send((main_instance_id.clone(), rendered_code, ack_tx))
             .await
             .map_err(|_| miette::miette!("sidecar exit reporter closed"))?;
         ack_rx
@@ -460,8 +452,8 @@ pub async fn run_process(
             .map_err(|_| miette::miette!("sidecar exit reporter dropped acknowledgement"))?
             .map_err(|error| miette::miette!(error))?;
     } else if let (Some(endpoint), Some(id)) = (openshell_endpoint, sandbox_id) {
-        report_main_process_exit_until_ack(endpoint, id, &main_generation, exit).await;
-        info!(generation = %main_generation, "main-process exit acknowledged");
+        report_main_process_exit_until_ack(endpoint, id, &main_instance_id, rendered_code).await;
+        info!(instance_id = %main_instance_id, "main-process exit acknowledged");
     }
 
     Ok(rendered_code)
@@ -470,16 +462,16 @@ pub async fn run_process(
 async fn report_main_process_exit_until_ack(
     endpoint: &str,
     sandbox_id: &str,
-    generation: &str,
-    exit: openshell_core::proto::MainProcessExit,
+    instance_id: &str,
+    exit_code: i32,
 ) {
     let mut retry_delay = Duration::from_millis(250);
     loop {
         match crate::supervisor_session::report_main_process_exit(
             endpoint,
             sandbox_id,
-            generation,
-            exit.clone(),
+            instance_id,
+            exit_code,
         )
         .await
         {
@@ -491,14 +483,6 @@ async fn report_main_process_exit_until_ack(
             }
         }
     }
-}
-
-fn current_time_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |duration| {
-            i64::try_from(duration.as_millis()).unwrap_or(i64::MAX)
-        })
 }
 
 enum ProcessWaitOutcome {

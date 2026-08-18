@@ -8,8 +8,6 @@
 //! supervisor process (which reads them on startup).  Using constants here
 //! prevents typos from producing silently broken sandboxes.
 
-use std::collections::HashMap;
-
 use serde::{Deserialize, Serialize};
 
 /// Name of the sandbox (used for policy sync and identification).
@@ -38,9 +36,7 @@ pub const MAIN_PROCESS_SPEC: &str = "OPENSHELL_MAIN_PROCESS_SPEC";
 pub struct MainProcessConfig {
     pub version: u32,
     pub command: Vec<String>,
-    pub environment: HashMap<String, String>,
-    pub working_directory: String,
-    pub terminal: bool,
+    pub tty: bool,
 }
 
 impl MainProcessConfig {
@@ -51,20 +47,16 @@ impl MainProcessConfig {
         Self {
             version: Self::VERSION,
             command: vec!["/bin/bash".to_string(), "-l".to_string()],
-            environment: HashMap::new(),
-            working_directory: String::new(),
-            terminal: true,
+            tty: true,
         }
     }
 
     #[must_use]
-    pub fn from_driver_spec(spec: Option<&crate::proto::compute::v1::MainProcessSpec>) -> Self {
+    pub fn from_driver_spec(spec: Option<&crate::proto::compute::v1::DriverSandboxSpec>) -> Self {
         spec.map_or_else(Self::scratch, |spec| Self {
             version: Self::VERSION,
             command: spec.command.clone(),
-            environment: spec.environment.clone(),
-            working_directory: spec.working_directory.clone(),
-            terminal: spec.terminal,
+            tty: spec.tty,
         })
     }
 
@@ -86,7 +78,7 @@ impl MainProcessConfig {
 
     /// Encode the versioned driver-to-supervisor transport.
     pub fn encode_driver_spec(
-        spec: Option<&crate::proto::compute::v1::MainProcessSpec>,
+        spec: Option<&crate::proto::compute::v1::DriverSandboxSpec>,
     ) -> Result<String, serde_json::Error> {
         serde_json::to_string(&Self::from_driver_spec(spec))
     }
@@ -211,26 +203,22 @@ mod tests {
 
     #[test]
     fn main_process_transport_preserves_argument_boundaries() {
-        let spec = crate::proto::compute::v1::MainProcessSpec {
+        let spec = crate::proto::compute::v1::DriverSandboxSpec {
             command: vec!["/bin/sh".into(), "-c".into(), "printf '%s' 'a b'".into()],
-            environment: HashMap::from([("MODE".into(), "a b".into())]),
-            working_directory: "/sandbox/work".into(),
-            terminal: false,
+            tty: false,
+            ..Default::default()
         };
         let encoded = MainProcessConfig::encode_driver_spec(Some(&spec)).unwrap();
         let decoded = MainProcessConfig::decode(&encoded).unwrap();
         assert_eq!(decoded.command, spec.command);
-        assert_eq!(decoded.environment, spec.environment);
-        assert_eq!(decoded.working_directory, spec.working_directory);
-        assert!(!decoded.terminal);
+        assert!(!decoded.tty);
     }
 
     #[test]
     fn main_process_transport_rejects_unknown_version() {
-        let error = MainProcessConfig::decode(
-            r#"{"version":2,"command":["/bin/true"],"environment":{},"working_directory":"","terminal":false}"#,
-        )
-        .unwrap_err();
+        let error =
+            MainProcessConfig::decode(r#"{"version":2,"command":["/bin/true"],"tty":false}"#)
+                .unwrap_err();
         assert!(error.contains("unsupported"));
     }
 }

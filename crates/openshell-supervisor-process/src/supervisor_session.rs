@@ -19,9 +19,9 @@ use std::time::Duration;
 
 use openshell_core::proto::open_shell_client::OpenShellClient;
 use openshell_core::proto::{
-    GatewayMessage, MainProcessExit, RelayFrame, RelayInit, RelayOpen, RelayOpenResult,
-    SupervisorHeartbeat, SupervisorHello, SupervisorMessage, TcpRelayTarget, gateway_message,
-    relay_open, supervisor_message,
+    GatewayMessage, RelayFrame, RelayInit, RelayOpen, RelayOpenResult,
+    ReportMainProcessExitRequest, SupervisorHeartbeat, SupervisorHello, SupervisorMessage,
+    TcpRelayTarget, gateway_message, relay_open, supervisor_message,
 };
 use openshell_ocsf::{
     ActivityId, ConnectionInfo, Endpoint, NetworkActivityBuilder, OcsfEvent, SandboxContext,
@@ -368,7 +368,6 @@ async fn run_single_session(
         payload: Some(supervisor_message::Payload::Hello(SupervisorHello {
             sandbox_id: sandbox_id.to_string(),
             instance_id: instance_id.to_string(),
-            exit_report_only: false,
         })),
     })
     .await
@@ -448,54 +447,25 @@ async fn run_single_session(
     }
 }
 
-/// Report the canonical process result on a short-lived authenticated session
-/// and wait until the gateway acknowledges durable handling.
+/// Report the canonical process result and wait for durable handling.
 pub async fn report_main_process_exit(
     endpoint: &str,
     sandbox_id: &str,
     instance_id: &str,
-    exit: MainProcessExit,
+    exit_code: i32,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let channel = grpc_client::connect_channel_pub(endpoint)
         .await
         .map_err(|error| format!("connect failed: {error}"))?;
     let mut client = OpenShellClient::new(channel);
-    let (tx, rx) = mpsc::channel::<SupervisorMessage>(4);
-    tx.send(SupervisorMessage {
-        payload: Some(supervisor_message::Payload::Hello(SupervisorHello {
+    client
+        .report_main_process_exit(ReportMainProcessExitRequest {
             sandbox_id: sandbox_id.to_string(),
             instance_id: instance_id.to_string(),
-            exit_report_only: true,
-        })),
-    })
-    .await
-    .map_err(|_| "failed to queue supervisor hello")?;
-    let response = client
-        .connect_supervisor(tokio_stream::wrappers::ReceiverStream::new(rx))
+            exit_code,
+        })
         .await?;
-    let mut inbound = response.into_inner();
-    let accepted = inbound
-        .message()
-        .await?
-        .and_then(|message| message.payload)
-        .is_some_and(|payload| matches!(payload, gateway_message::Payload::SessionAccepted(_)));
-    if !accepted {
-        return Err("gateway did not accept exit-report session".into());
-    }
-    let generation = exit.generation.clone();
-    tx.send(SupervisorMessage {
-        payload: Some(supervisor_message::Payload::MainProcessExit(exit)),
-    })
-    .await
-    .map_err(|_| "failed to queue main-process exit")?;
-    while let Some(message) = inbound.message().await? {
-        if let Some(gateway_message::Payload::MainProcessExitAck(ack)) = message.payload
-            && ack.generation == generation
-        {
-            return Ok(());
-        }
-    }
-    Err("gateway closed before acknowledging main-process exit".into())
+    Ok(())
 }
 
 struct GatewayMessageContext<'a> {

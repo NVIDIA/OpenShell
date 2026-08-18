@@ -22,10 +22,10 @@ use openshell_core::proto::{
     DetachSandboxProviderRequest, DetachSandboxProviderResponse, ExecSandboxEvent, ExecSandboxExit,
     ExecSandboxInput, ExecSandboxRequest, ExecSandboxStderr, ExecSandboxStdout, GetSandboxRequest,
     ListSandboxProvidersRequest, ListSandboxProvidersResponse, ListSandboxesRequest,
-    ListSandboxesResponse, MainProcessSpec, Provider, RevokeSshSessionRequest,
-    RevokeSshSessionResponse, SandboxResponse, SandboxStreamEvent, SshRelayTarget,
-    StartSandboxRequest, StopSandboxRequest, TcpForwardFrame, TcpForwardInit, TcpRelayTarget,
-    WatchSandboxRequest, relay_open, tcp_forward_init,
+    ListSandboxesResponse, Provider, RevokeSshSessionRequest, RevokeSshSessionResponse,
+    SandboxResponse, SandboxStreamEvent, SshRelayTarget, StartSandboxRequest, StopSandboxRequest,
+    TcpForwardFrame, TcpForwardInit, TcpRelayTarget, WatchSandboxRequest, relay_open,
+    tcp_forward_init,
 };
 use openshell_core::proto::{Sandbox, SandboxPhase, SandboxTemplate, SshSession};
 use openshell_core::telemetry::{
@@ -223,11 +223,10 @@ async fn handle_create_sandbox_inner(
     // Every newly persisted sandbox has one explicit canonical process. This
     // portable default also preserves compatibility with callers compiled
     // before the main-process field was introduced.
-    spec.main_process.get_or_insert_with(|| MainProcessSpec {
-        command: vec!["/bin/bash".to_string(), "-l".to_string()],
-        terminal: true,
-        ..MainProcessSpec::default()
-    });
+    if spec.command.is_empty() {
+        spec.command = vec!["/bin/bash".to_string(), "-l".to_string()];
+        spec.tty = true;
+    }
 
     // Validate field sizes before any I/O (fail fast on oversized payloads).
     validate_sandbox_spec(&request.name, &spec)?;

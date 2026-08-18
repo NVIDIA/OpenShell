@@ -3337,7 +3337,7 @@ fn sandbox_to_k8s_spec(
                     template,
                     driver_gpu_requirements(spec.resource_requirements.as_ref()),
                     &pod_env,
-                    spec.main_process.as_ref(),
+                    Some(spec),
                     &driver_config,
                     inject_workspace,
                     params,
@@ -3371,7 +3371,7 @@ fn sandbox_to_k8s_spec(
                 &SandboxTemplate::default(),
                 driver_gpu_requirements(spec.and_then(|s| s.resource_requirements.as_ref())),
                 &pod_env,
-                spec.and_then(|spec| spec.main_process.as_ref()),
+                spec,
                 &driver_config,
                 inject_workspace,
                 params,
@@ -3431,7 +3431,7 @@ fn sandbox_template_to_k8s_with_validated_config(
     template: &SandboxTemplate,
     gpu_requirements: Option<&GpuResourceRequirements>,
     spec_environment: &std::collections::HashMap<String, String>,
-    main_process: Option<&openshell_core::proto::compute::v1::MainProcessSpec>,
+    sandbox_spec: Option<&openshell_core::proto::compute::v1::DriverSandboxSpec>,
     driver_config: &KubernetesSandboxDriverConfig,
     inject_workspace: bool,
     params: &SandboxPodParams<'_>,
@@ -3568,7 +3568,7 @@ fn sandbox_template_to_k8s_with_validated_config(
         None,
         &template.environment,
         spec_environment,
-        main_process,
+        sandbox_spec,
         params.sandbox_id,
         params.sandbox_name,
         params.grpc_endpoint,
@@ -3938,7 +3938,7 @@ fn build_env_list(
     existing_env: Option<&Vec<serde_json::Value>>,
     template_environment: &std::collections::HashMap<String, String>,
     spec_environment: &std::collections::HashMap<String, String>,
-    main_process: Option<&openshell_core::proto::compute::v1::MainProcessSpec>,
+    sandbox_spec: Option<&openshell_core::proto::compute::v1::DriverSandboxSpec>,
     sandbox_id: &str,
     sandbox_name: &str,
     grpc_endpoint: &str,
@@ -3961,7 +3961,7 @@ fn build_env_list(
         );
     }
     let main_process =
-        openshell_core::sandbox_env::MainProcessConfig::encode_driver_spec(main_process)
+        openshell_core::sandbox_env::MainProcessConfig::encode_driver_spec(sandbox_spec)
             .expect("main process config serialization cannot fail");
     upsert_env(
         &mut env,

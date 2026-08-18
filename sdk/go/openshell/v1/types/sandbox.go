@@ -27,16 +27,9 @@ type SandboxSpec struct {
 	Providers   []string
 	GPUCount    *uint32
 	// Policy is the security policy for the sandbox. Nil means no policy specified.
-	Policy      *SandboxPolicy
-	MainProcess *MainProcessSpec
-}
-
-// MainProcessSpec is the exact canonical process launched once per sandbox.
-type MainProcessSpec struct {
-	Command          []string
-	Environment      map[string]string
-	WorkingDirectory string
-	Terminal         bool
+	Policy  *SandboxPolicy
+	Command []string
+	TTY     bool
 }
 
 // SandboxTemplate defines the container template for a sandbox.
@@ -54,24 +47,15 @@ type SandboxTemplate struct {
 
 // SandboxStatus holds the observed state of a sandbox.
 type SandboxStatus struct {
-	SandboxName          string
-	AgentPod             string
-	AgentFd              string
-	SandboxFd            string
-	Phase                SandboxPhase
-	Conditions           []SandboxCondition
-	CurrentPolicyVersion uint32
-	MainProcess          *MainProcessStatus
-}
-
-// MainProcessStatus records the active or terminal canonical-process generation.
-type MainProcessStatus struct {
-	State      int32
-	Generation string
-	ExitCode   *int32
-	Signal     *int32
-	StartedAt  time.Time
-	FinishedAt time.Time
+	SandboxName           string
+	AgentPod              string
+	AgentFd               string
+	SandboxFd             string
+	Phase                 SandboxPhase
+	Conditions            []SandboxCondition
+	CurrentPolicyVersion  uint32
+	MainProcessInstanceID string
+	ExitCode              *int32
 }
 
 // SandboxCondition describes an observed condition of a sandbox.

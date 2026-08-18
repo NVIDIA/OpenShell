@@ -2385,13 +2385,9 @@ fn build_environment_for_oci_user(
         openshell_core::sandbox_env::SSH_SOCKET_PATH.to_string(),
         config.ssh_socket_path.clone(),
     );
-    let main_process = openshell_core::sandbox_env::MainProcessConfig::encode_driver_spec(
-        sandbox
-            .spec
-            .as_ref()
-            .and_then(|spec| spec.main_process.as_ref()),
-    )
-    .expect("main process config serialization cannot fail");
+    let main_process =
+        openshell_core::sandbox_env::MainProcessConfig::encode_driver_spec(sandbox.spec.as_ref())
+            .expect("main process config serialization cannot fail");
     environment.insert(
         openshell_core::sandbox_env::MAIN_PROCESS_SPEC.to_string(),
         main_process,

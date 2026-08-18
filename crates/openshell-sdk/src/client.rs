@@ -799,7 +799,8 @@ fn create_sandbox_request(spec: SandboxSpec) -> proto::CreateSandboxRequest {
         environment,
         providers,
         gpu,
-        main_process,
+        command,
+        tty,
     } = spec;
     let template = image.map(|image| proto::SandboxTemplate {
         image,
@@ -814,12 +815,8 @@ fn create_sandbox_request(spec: SandboxSpec) -> proto::CreateSandboxRequest {
             template,
             providers,
             resource_requirements,
-            main_process: main_process.map(|main| proto::MainProcessSpec {
-                command: main.command,
-                environment: main.environment,
-                working_directory: main.working_directory.unwrap_or_default(),
-                terminal: main.terminal,
-            }),
+            command,
+            tty,
             ..proto::SandboxSpec::default()
         }),
         name: name.unwrap_or_default(),
@@ -1003,25 +1000,13 @@ mod tests {
     #[test]
     fn create_request_preserves_canonical_main_process() {
         let request = create_sandbox_request(SandboxSpec {
-            main_process: Some(crate::types::MainProcessSpec {
-                command: vec!["/opt/agent binary".into(), "--serve exactly".into()],
-                environment: HashMap::from([("MODE".into(), "worker".into())]),
-                working_directory: Some("/sandbox/app".into()),
-                terminal: false,
-            }),
+            command: vec!["/opt/agent binary".into(), "--serve exactly".into()],
+            tty: false,
             ..SandboxSpec::default()
         });
 
-        let main = request
-            .spec
-            .and_then(|spec| spec.main_process)
-            .expect("main process should be present");
-        assert_eq!(main.command, ["/opt/agent binary", "--serve exactly"]);
-        assert_eq!(
-            main.environment.get("MODE").map(String::as_str),
-            Some("worker")
-        );
-        assert_eq!(main.working_directory, "/sandbox/app");
-        assert!(!main.terminal);
+        let spec = request.spec.expect("sandbox spec should be present");
+        assert_eq!(spec.command, ["/opt/agent binary", "--serve exactly"]);
+        assert!(!spec.tty);
     }
 }

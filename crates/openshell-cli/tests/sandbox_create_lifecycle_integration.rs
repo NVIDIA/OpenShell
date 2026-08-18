@@ -60,6 +60,13 @@ struct TestOpenShell {
 
 #[tonic::async_trait]
 impl OpenShell for TestOpenShell {
+    async fn report_main_process_exit(
+        &self,
+        _request: tonic::Request<openshell_core::proto::ReportMainProcessExitRequest>,
+    ) -> Result<Response<openshell_core::proto::ReportMainProcessExitResponse>, Status> {
+        Err(Status::unimplemented("not used by this test server"))
+    }
+
     async fn get_current_user(
         &self,
         _request: tonic::Request<openshell_core::proto::GetCurrentUserRequest>,
@@ -1320,13 +1327,12 @@ async fn sandbox_create_persists_exact_trailing_argv_as_main_process() {
     .expect("sandbox create should succeed");
 
     let requests = create_requests(&server).await;
-    let main = requests[0]
+    let spec = requests[0]
         .spec
         .as_ref()
-        .and_then(|spec| spec.main_process.as_ref())
-        .expect("main process should be persisted at create time");
-    assert_eq!(main.command, command);
-    assert!(!main.terminal);
+        .expect("sandbox spec should be persisted at create time");
+    assert_eq!(spec.command, command);
+    assert!(!spec.tty);
 }
 
 #[tokio::test]

@@ -102,7 +102,6 @@ pub async fn run_sandbox(
     main_workdir: Option<String>,
     timeout_secs: u64,
     interactive: bool,
-    main_environment: std::collections::HashMap<String, String>,
     sandbox_id: Option<String>,
     sandbox: Option<String>,
     openshell_endpoint: Option<String>,
@@ -812,8 +811,7 @@ pub async fn run_sandbox(
     }
 
     let process_policy = process_policy_for_topology(&policy, sidecar_network_enforcement)?;
-    let mut main_env = provider_env.clone();
-    main_env.extend(main_environment);
+    let main_env = provider_env.clone();
     let sidecar_bootstrap_ca_file_paths = sidecar_bootstrap.as_ref().and_then(|bootstrap| {
         bootstrap
             .proxy_ca_cert_path
@@ -835,28 +833,28 @@ pub async fn run_sandbox(
                 }
             });
 
-        let entrypoint_started_tx = if process_uses_sidecar_control
-            && let Some(writer) = process_control_writer.clone()
-        {
-            let (tx, rx) = tokio::sync::oneshot::channel();
-            tokio::spawn(async move {
-                match rx.await {
-                    Ok((pid, generation)) => {
-                        if let Err(err) =
-                            sidecar_control::send_entrypoint_started(&writer, pid, generation).await
-                        {
-                            warn!(error = %err, "Failed to send sidecar entrypoint event");
+        let entrypoint_started_tx =
+            if process_uses_sidecar_control && let Some(writer) = process_control_writer.clone() {
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                tokio::spawn(async move {
+                    match rx.await {
+                        Ok((pid, instance_id)) => {
+                            if let Err(err) =
+                                sidecar_control::send_entrypoint_started(&writer, pid, instance_id)
+                                    .await
+                            {
+                                warn!(error = %err, "Failed to send sidecar entrypoint event");
+                            }
+                        }
+                        Err(_closed) => {
+                            debug!("Entrypoint exited before sidecar entrypoint event was sent");
                         }
                     }
-                    Err(_closed) => {
-                        debug!("Entrypoint exited before sidecar entrypoint event was sent");
-                    }
-                }
-            });
-            Some(tx)
-        } else {
-            None
-        };
+                });
+                Some(tx)
+            } else {
+                None
+            };
         let sidecar_exit_tx =
             if process_uses_sidecar_control && let Some(writer) = process_control_writer.clone() {
                 let exit_ack = Arc::clone(&process_exit_ack);
@@ -864,17 +862,21 @@ pub async fn run_sandbox(
                     openshell_supervisor_process::run::SidecarExitReport,
                 >(1);
                 tokio::spawn(async move {
-                    while let Some((exit, ack)) = rx.recv().await {
-                        let generation = exit.generation.clone();
+                    while let Some((instance_id, exit_code, ack)) = rx.recv().await {
                         let (durable_tx, durable_rx) = tokio::sync::oneshot::channel();
-                        *exit_ack.lock().await = Some((generation, durable_tx));
-                        let result =
-                            match sidecar_control::send_main_process_exited(&writer, exit).await {
-                                Ok(()) => durable_rx.await.map_err(|_| {
-                                    "sidecar durable exit acknowledgement closed".to_string()
-                                }),
-                                Err(error) => Err(error.to_string()),
-                            };
+                        *exit_ack.lock().await = Some((instance_id.clone(), durable_tx));
+                        let result = match sidecar_control::send_main_process_exited(
+                            &writer,
+                            instance_id,
+                            exit_code,
+                        )
+                        .await
+                        {
+                            Ok(()) => durable_rx.await.map_err(|_| {
+                                "sidecar durable exit acknowledgement closed".to_string()
+                            }),
+                            Err(error) => Err(error.to_string()),
+                        };
                         let _ = ack.send(result);
                     }
                 });
@@ -1122,11 +1124,11 @@ fn spawn_sidecar_control_update_watcher(
                         skills::install_static_skills,
                     );
                 }
-                sidecar_control::ControlUpdate::MainProcessExitAck { generation } => {
+                sidecar_control::ControlUpdate::MainProcessExitAck { instance_id } => {
                     let mut waiter = exit_ack.lock().await;
                     if waiter
                         .as_ref()
-                        .is_some_and(|(expected, _)| expected == &generation)
+                        .is_some_and(|(expected, _)| expected == &instance_id)
                         && let Some((_, ack)) = waiter.take()
                     {
                         let _ = ack.send(());
@@ -1167,7 +1169,7 @@ fn spawn_sidecar_entrypoint_handler(
         let mut trusted_supervisor_pid = None;
         let terminating = Arc::new(AtomicBool::new(false));
         while let Some(started) = entrypoint_rx.recv().await {
-            if let Some(exit) = started.exit {
+            if let Some(exit_code) = started.exit_code {
                 terminating.store(true, Ordering::Release);
                 if let (Some(endpoint), Some(id)) =
                     (openshell_endpoint.as_ref(), sandbox_id.as_ref())
@@ -1177,8 +1179,8 @@ fn spawn_sidecar_entrypoint_handler(
                         match openshell_supervisor_process::supervisor_session::report_main_process_exit(
                             endpoint,
                             id,
-                            &exit.generation,
-                            exit.clone(),
+                            &started.instance_id,
+                            exit_code,
                         )
                         .await
                         {
@@ -1191,7 +1193,7 @@ fn spawn_sidecar_entrypoint_handler(
                         }
                     }
                     if let Some(publisher) = control_publisher.as_ref() {
-                        publisher.publish_main_process_exit_ack(exit.generation.clone());
+                        publisher.publish_main_process_exit_ack(started.instance_id.clone());
                     }
                 }
                 break;
@@ -1244,7 +1246,7 @@ fn spawn_sidecar_entrypoint_handler(
                     None,
                     Some(supervisor_pid),
                     Arc::clone(&terminating),
-                    started.generation.clone(),
+                    started.instance_id.clone(),
                 );
                 session_started = true;
                 info!("sidecar supervisor session task spawned");

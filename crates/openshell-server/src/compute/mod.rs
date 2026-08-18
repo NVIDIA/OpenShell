@@ -45,8 +45,8 @@ use openshell_core::proto::compute::v1::{
     gateway_listener_requirement::Selector, watch_sandboxes_event,
 };
 use openshell_core::proto::{
-    MainProcessExit, MainProcessState, MainProcessStatus, PlatformEvent, Sandbox, SandboxCondition,
-    SandboxPhase, SandboxSpec, SandboxStatus, SandboxTemplate, ServiceEndpoint, SshSession,
+    PlatformEvent, Sandbox, SandboxCondition, SandboxPhase, SandboxSpec, SandboxStatus,
+    SandboxTemplate, ServiceEndpoint, SshSession,
 };
 use openshell_core::{ObjectLabels, ObjectWorkspace};
 #[cfg(not(target_os = "windows"))]
@@ -558,7 +558,6 @@ pub struct ComputeRuntime {
     driver_info: ComputeDriverInfoSnapshot,
     driver_process: Option<Arc<ManagedDriverProcess>>,
     default_image: String,
-    supports_main_process: bool,
     store: Arc<Store>,
     sandbox_index: SandboxIndex,
     sandbox_watch_bus: SandboxWatchBus,
@@ -619,7 +618,6 @@ impl ComputeRuntime {
             gateway_manages_lifecycle: capabilities.gateway_manages_lifecycle,
         };
         let default_image = capabilities.default_image;
-        let supports_main_process = capabilities.supports_main_process;
         let gateway_listener_requirements = match driver
             .get_gateway_listener_requirements(Request::new(
                 GetGatewayListenerRequirementsRequest {},
@@ -678,7 +676,6 @@ impl ComputeRuntime {
             driver_info,
             driver_process,
             default_image,
-            supports_main_process,
             store,
             sandbox_index,
             sandbox_watch_bus,
@@ -876,18 +873,6 @@ impl ComputeRuntime {
     }
 
     pub async fn validate_sandbox_create(&self, sandbox: &Sandbox) -> Result<(), Status> {
-        if sandbox
-            .spec
-            .as_ref()
-            .and_then(|spec| spec.main_process.as_ref())
-            .is_some()
-            && !self.supports_main_process
-        {
-            return Err(Status::failed_precondition(format!(
-                "compute driver '{}' does not support canonical main processes; upgrade the driver before creating sandboxes",
-                self.driver_info.name
-            )));
-        }
         let driver_sandbox = driver_sandbox_from_public(sandbox, &self.driver_info.name)
             .map_err(|status| *status)?;
         self.driver
@@ -1406,6 +1391,11 @@ impl ComputeRuntime {
                 move |sandbox| {
                     sandbox.set_phase(phase as i32);
                     let name = sandbox.object_name().to_string();
+                    if matches!(phase, SandboxPhase::Stopping | SandboxPhase::Starting) {
+                        let status = sandbox.status.get_or_insert_with(Default::default);
+                        status.main_process_instance_id.clear();
+                        status.exit_code = None;
+                    }
                     upsert_ready_condition(
                         &mut sandbox.status,
                         &name,
@@ -2808,9 +2798,9 @@ impl ComputeRuntime {
     pub async fn supervisor_session_connected(
         &self,
         sandbox_id: &str,
-        generation: &str,
+        instance_id: &str,
     ) -> Result<(), String> {
-        self.set_supervisor_session_state(sandbox_id, true, Some(generation))
+        self.set_supervisor_session_state(sandbox_id, true, Some(instance_id))
             .await
     }
 
@@ -2823,7 +2813,7 @@ impl ComputeRuntime {
         &self,
         sandbox_id: &str,
         connected: bool,
-        generation: Option<&str>,
+        instance_id: Option<&str>,
     ) -> Result<(), String> {
         let _guard = self.sync_lock.lock().await;
 
@@ -2859,12 +2849,8 @@ impl ComputeRuntime {
                 if connected {
                     ensure_supervisor_ready_status(&mut sandbox.status, &sandbox_name);
                     let status = sandbox.status.get_or_insert_with(Default::default);
-                    status.main_process = Some(MainProcessStatus {
-                        state: MainProcessState::Running as i32,
-                        generation: generation.unwrap_or_default().to_string(),
-                        started_at_ms: crate::persistence::current_time_ms(),
-                        ..Default::default()
-                    });
+                    status.main_process_instance_id = instance_id.unwrap_or_default().to_string();
+                    status.exit_code = None;
                     sandbox.set_phase(SandboxPhase::Ready as i32);
                 } else {
                     ensure_supervisor_not_ready_status(&mut sandbox.status, &sandbox_name);
@@ -2903,7 +2889,8 @@ impl ComputeRuntime {
     pub async fn main_process_exited(
         &self,
         sandbox_id: &str,
-        exit: &MainProcessExit,
+        instance_id: &str,
+        exit_code: i32,
     ) -> Result<(), String> {
         let _guard = self.sync_lock.lock().await;
         let Some(existing) = self
@@ -2921,43 +2908,30 @@ impl ComputeRuntime {
         ) {
             return Ok(());
         }
-        let current = existing
-            .status
-            .as_ref()
-            .and_then(|status| status.main_process.as_ref());
-        if let Some(current) = current {
-            if current.generation != exit.generation {
+        if let Some(status) = existing.status.as_ref() {
+            if !status.main_process_instance_id.is_empty()
+                && status.main_process_instance_id != instance_id
+            {
                 return Err(format!(
-                    "stale main-process exit generation '{}' (active generation is '{}')",
-                    exit.generation, current.generation
+                    "stale main-process exit instance '{instance_id}' (active instance is '{}')",
+                    status.main_process_instance_id
                 ));
             }
-            if MainProcessState::try_from(current.state).unwrap_or(MainProcessState::Unspecified)
-                == MainProcessState::Exited
-            {
-                let current_has_precise_result =
-                    current.exit_code.is_some() || current.signal.is_some();
-                let incoming_has_precise_result = exit.exit_code.is_some() || exit.signal.is_some();
-                if !current_has_precise_result && incoming_has_precise_result {
-                    // A terminal driver snapshot can beat the supervisor report
-                    // and record only that the process exited. Let the durable
-                    // supervisor report enrich that fallback with the exact
-                    // result instead of treating it as a duplicate.
-                } else if current.exit_code == exit.exit_code && current.signal == exit.signal {
-                    return Ok(());
+            if let Some(current_exit_code) = status.exit_code {
+                return if current_exit_code == exit_code {
+                    Ok(())
                 } else {
-                    return Err(format!(
-                        "conflicting main-process exit result for generation '{}'",
-                        exit.generation
-                    ));
-                }
+                    Err(format!(
+                        "conflicting main-process exit result for instance '{instance_id}'"
+                    ))
+                };
             }
         }
         let expected_resource_version = sandbox_resource_version(&existing);
         let sandbox = self
             .store
             .update_message_cas::<Sandbox, _>(sandbox_id, expected_resource_version, |sandbox| {
-                apply_main_process_exit(sandbox, exit);
+                apply_main_process_exit(sandbox, instance_id, exit_code);
             })
             .await
             .map_err(|error| error.to_string())?;
@@ -3320,20 +3294,14 @@ impl ComputeRuntime {
     }
 }
 
-fn apply_main_process_exit(sandbox: &mut Sandbox, exit: &MainProcessExit) {
+fn apply_main_process_exit(sandbox: &mut Sandbox, instance_id: &str, exit_code: i32) {
     let sandbox_name = sandbox.object_name().to_string();
     let status = sandbox.status.get_or_insert_with(|| SandboxStatus {
         sandbox_name: sandbox_name.clone(),
         ..Default::default()
     });
-    status.main_process = Some(MainProcessStatus {
-        state: MainProcessState::Exited as i32,
-        generation: exit.generation.clone(),
-        exit_code: exit.exit_code,
-        signal: exit.signal,
-        started_at_ms: exit.started_at_ms,
-        finished_at_ms: exit.finished_at_ms,
-    });
+    status.main_process_instance_id = instance_id.to_string();
+    status.exit_code = Some(exit_code);
     upsert_ready_condition(
         &mut sandbox.status,
         &sandbox_name,
@@ -3426,19 +3394,8 @@ fn driver_sandbox_spec_from_public(
             }
         }),
         sandbox_token: String::new(),
-        main_process: Some(spec.main_process.as_ref().map_or_else(
-            || openshell_core::proto::compute::v1::MainProcessSpec {
-                command: vec!["/bin/bash".to_string(), "-l".to_string()],
-                terminal: true,
-                ..Default::default()
-            },
-            |main_process| openshell_core::proto::compute::v1::MainProcessSpec {
-                command: main_process.command.clone(),
-                environment: main_process.environment.clone(),
-                working_directory: main_process.working_directory.clone(),
-                terminal: main_process.terminal,
-            },
-        )),
+        command: spec.command.clone(),
+        tty: spec.tty,
     })
 }
 
@@ -3710,7 +3667,8 @@ fn public_status_from_driver(
             .collect(),
         phase: phase as i32,
         current_policy_version,
-        main_process: None,
+        main_process_instance_id: String::new(),
+        exit_code: None,
     }
 }
 
@@ -3783,24 +3741,6 @@ fn apply_driver_snapshot(sandbox: &mut Sandbox, incoming: &DriverSandbox, sessio
     {
         status.sandbox_name.clone_from(sandbox_name);
     }
-    if let Some(status) = status.as_mut() {
-        let mut main_process = sandbox
-            .status
-            .as_ref()
-            .and_then(|current| current.main_process.clone());
-        if phase == SandboxPhase::Error
-            && let Some(terminal) = main_process.as_mut()
-            && MainProcessState::try_from(terminal.state).unwrap_or(MainProcessState::Unspecified)
-                == MainProcessState::Running
-        {
-            terminal.state = MainProcessState::Exited as i32;
-            terminal.exit_code = None;
-            terminal.signal = None;
-            terminal.finished_at_ms = crate::persistence::current_time_ms();
-        }
-        status.main_process = main_process;
-    }
-
     if old_phase != phase {
         info!(
             sandbox_id = %incoming.id,
@@ -4255,7 +4195,6 @@ pub async fn new_test_runtime_with_driver(
         },
         driver_process: None,
         default_image: "openshell/sandbox:test".to_string(),
-        supports_main_process: true,
         store,
         sandbox_index: SandboxIndex::new(),
         sandbox_watch_bus: SandboxWatchBus::new(),
@@ -4940,7 +4879,6 @@ mod tests {
             },
             driver_process: None,
             default_image: "openshell/sandbox:test".to_string(),
-            supports_main_process: true,
             store,
             sandbox_index: SandboxIndex::new(),
             sandbox_watch_bus: SandboxWatchBus::new(),
@@ -4973,25 +4911,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn canonical_process_requires_driver_capability() {
-        let mut runtime = test_runtime(Arc::new(TestDriver::default())).await;
-        runtime.supports_main_process = false;
-        let mut sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Provisioning);
-        sandbox.spec = Some(SandboxSpec {
-            main_process: Some(openshell_core::proto::MainProcessSpec::default()),
-            ..Default::default()
-        });
-
-        let error = runtime.validate_sandbox_create(&sandbox).await.unwrap_err();
-        assert_eq!(error.code(), Code::FailedPrecondition);
-        assert!(
-            error
-                .message()
-                .contains("does not support canonical main processes")
-        );
-    }
-
     fn sandbox_record(id: &str, name: &str, phase: SandboxPhase) -> Sandbox {
         let mut sandbox = Sandbox {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
@@ -5013,25 +4932,15 @@ mod tests {
     #[test]
     fn main_process_exit_zero_is_terminal_error() {
         let mut sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Ready);
-        apply_main_process_exit(
-            &mut sandbox,
-            &MainProcessExit {
-                generation: "generation-1".into(),
-                exit_code: Some(0),
-                signal: None,
-                started_at_ms: 10,
-                finished_at_ms: 20,
-            },
-        );
+        apply_main_process_exit(&mut sandbox, "instance-1", 0);
 
         assert_eq!(
             SandboxPhase::try_from(sandbox.phase()),
             Ok(SandboxPhase::Error)
         );
         let status = sandbox.status.as_ref().unwrap();
-        let main = status.main_process.as_ref().unwrap();
-        assert_eq!(main.exit_code, Some(0));
-        assert_eq!(main.state, MainProcessState::Exited as i32);
+        assert_eq!(status.exit_code, Some(0));
+        assert_eq!(status.main_process_instance_id, "instance-1");
         assert!(status.conditions.iter().any(|condition| {
             condition.r#type == "Ready"
                 && condition.status == "False"
@@ -5040,29 +4949,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stale_main_process_exit_cannot_replace_active_generation() {
+    async fn stale_main_process_exit_cannot_replace_active_instance() {
         let runtime = test_runtime(Arc::new(TestDriver::default())).await;
         let sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Provisioning);
         runtime.store.put_message(&sandbox).await.unwrap();
         runtime
-            .supervisor_session_connected("sb-1", "generation-2")
+            .supervisor_session_connected("sb-1", "instance-2")
             .await
             .unwrap();
 
         let error = runtime
-            .main_process_exited(
-                "sb-1",
-                &MainProcessExit {
-                    generation: "generation-1".into(),
-                    exit_code: Some(0),
-                    signal: None,
-                    started_at_ms: 10,
-                    finished_at_ms: 20,
-                },
-            )
+            .main_process_exited("sb-1", "instance-1", 0)
             .await
             .unwrap_err();
-        assert!(error.contains("stale main-process exit generation"));
+        assert!(error.contains("stale main-process exit instance"));
         let stored = runtime
             .store
             .get_message::<Sandbox>("sb-1")
@@ -5071,8 +4971,8 @@ mod tests {
             .unwrap();
         assert_eq!(stored.phase(), SandboxPhase::Ready as i32);
         assert_eq!(
-            stored.status.unwrap().main_process.unwrap().generation,
-            "generation-2"
+            stored.status.unwrap().main_process_instance_id,
+            "instance-2"
         );
     }
 
@@ -5082,19 +4982,17 @@ mod tests {
         let sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Provisioning);
         runtime.store.put_message(&sandbox).await.unwrap();
         runtime
-            .supervisor_session_connected("sb-1", "generation-1")
+            .supervisor_session_connected("sb-1", "instance-1")
             .await
             .unwrap();
-        let exit = MainProcessExit {
-            generation: "generation-1".into(),
-            exit_code: Some(9),
-            signal: None,
-            started_at_ms: 10,
-            finished_at_ms: 20,
-        };
-
-        runtime.main_process_exited("sb-1", &exit).await.unwrap();
-        runtime.main_process_exited("sb-1", &exit).await.unwrap();
+        runtime
+            .main_process_exited("sb-1", "instance-1", 9)
+            .await
+            .unwrap();
+        runtime
+            .main_process_exited("sb-1", "instance-1", 9)
+            .await
+            .unwrap();
         let stored = runtime
             .store
             .get_message::<Sandbox>("sb-1")
@@ -5102,10 +5000,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(stored.phase(), SandboxPhase::Error as i32);
-        assert_eq!(
-            stored.status.unwrap().main_process.unwrap().exit_code,
-            Some(9)
-        );
+        assert_eq!(stored.status.unwrap().exit_code, Some(9));
     }
 
     #[tokio::test]
@@ -5114,28 +5009,13 @@ mod tests {
         let mut sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Error);
         sandbox.status = Some(SandboxStatus {
             phase: SandboxPhase::Error as i32,
-            main_process: Some(MainProcessStatus {
-                state: MainProcessState::Exited as i32,
-                generation: "generation-1".into(),
-                started_at_ms: 10,
-                finished_at_ms: 15,
-                ..Default::default()
-            }),
+            main_process_instance_id: "instance-1".into(),
             ..Default::default()
         });
         runtime.store.put_message(&sandbox).await.unwrap();
 
         runtime
-            .main_process_exited(
-                "sb-1",
-                &MainProcessExit {
-                    generation: "generation-1".into(),
-                    exit_code: Some(7),
-                    signal: None,
-                    started_at_ms: 10,
-                    finished_at_ms: 20,
-                },
-            )
+            .main_process_exited("sb-1", "instance-1", 7)
             .await
             .unwrap();
 
@@ -5146,9 +5026,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(stored.phase(), SandboxPhase::Error as i32);
-        let main = stored.status.unwrap().main_process.unwrap();
-        assert_eq!(main.exit_code, Some(7));
-        assert_eq!(main.finished_at_ms, 20);
+        assert_eq!(stored.status.unwrap().exit_code, Some(7));
     }
 
     #[tokio::test]
@@ -5161,27 +5039,13 @@ mod tests {
             let mut sandbox = sandbox_record(id, id, phase);
             sandbox.status = Some(SandboxStatus {
                 phase: phase as i32,
-                main_process: Some(MainProcessStatus {
-                    state: MainProcessState::Running as i32,
-                    generation: "generation-1".into(),
-                    started_at_ms: 10,
-                    ..Default::default()
-                }),
+                main_process_instance_id: "instance-1".into(),
                 ..Default::default()
             });
             runtime.store.put_message(&sandbox).await.unwrap();
 
             runtime
-                .main_process_exited(
-                    id,
-                    &MainProcessExit {
-                        generation: "generation-1".into(),
-                        exit_code: None,
-                        signal: Some(15),
-                        started_at_ms: 10,
-                        finished_at_ms: 20,
-                    },
-                )
+                .main_process_exited(id, "instance-1", 143)
                 .await
                 .unwrap();
 
@@ -5192,10 +5056,7 @@ mod tests {
                 .unwrap()
                 .unwrap();
             assert_eq!(stored.phase(), phase as i32);
-            assert_eq!(
-                stored.status.unwrap().main_process.unwrap().state,
-                MainProcessState::Running as i32
-            );
+            assert_eq!(stored.status.unwrap().exit_code, None);
         }
     }
 
@@ -7680,12 +7541,7 @@ mod tests {
         let mut sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Ready);
         sandbox.status = Some(SandboxStatus {
             sandbox_name: "sandbox-a".to_string(),
-            main_process: Some(MainProcessStatus {
-                state: MainProcessState::Running as i32,
-                generation: "generation-1".to_string(),
-                started_at_ms: 10,
-                ..Default::default()
-            }),
+            main_process_instance_id: "instance-1".to_string(),
             ..Default::default()
         });
         runtime.store.put_message(&sandbox).await.unwrap();
@@ -7707,12 +7563,9 @@ mod tests {
             SandboxPhase::try_from(stored.phase()).unwrap(),
             SandboxPhase::Error
         );
-        let main = stored.status.unwrap().main_process.unwrap();
-        assert_eq!(main.state, MainProcessState::Exited as i32);
-        assert_eq!(main.generation, "generation-1");
-        assert_eq!(main.started_at_ms, 10);
-        assert_eq!(main.exit_code, None);
-        assert_eq!(main.signal, None);
+        let status = stored.status.unwrap();
+        assert_eq!(status.main_process_instance_id, "instance-1");
+        assert_eq!(status.exit_code, None);
     }
 
     #[tokio::test]
@@ -8073,7 +7926,7 @@ mod tests {
             SandboxPhase::Error
         );
         assert!(
-            stored.status.unwrap().main_process.is_none(),
+            stored.status.unwrap().main_process_instance_id.is_empty(),
             "a provisioning failure must not fabricate a main-process exit"
         );
     }

@@ -15,16 +15,18 @@ workloads.
 - Resolve provider credentials and inference bundles for sandbox supervisors.
 - Coordinate supervisor relay sessions for connect, exec, file sync, and
   service forwarding.
-- Persist the canonical main-process generation and terminal result. Any main
-  process exit transitions the sandbox to `Error`, including exit code zero.
+- Persist the canonical main-process instance ID and normalized exit code on
+  sandbox status. Any main process exit transitions the sandbox to `Error`,
+  including exit code zero.
 
 The gateway does not enforce agent network policy at request time. That happens
 inside each sandbox, where the supervisor and proxy can observe local process
 identity.
 
 The live supervisor session is the readiness authority for its main-process
-generation. Short-lived exit-report sessions never replace that session or
-mark the sandbox ready, and the gateway rejects stale generation results.
+instance. The supervisor reports its normalized result through the
+sandbox-authenticated `ReportMainProcessExit` RPC, and the gateway rejects
+results from stale instance IDs.
 
 ## Protocol and Auth
 

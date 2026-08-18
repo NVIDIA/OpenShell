@@ -13,9 +13,9 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use openshell_core::proto::{
-    GatewayMessage, MainProcessExitAck, RelayFrame, RelayInit, RelayOpen, Sandbox, SandboxPhase,
-    SessionAccepted, SshRelayTarget, SupervisorMessage, gateway_message, relay_open,
-    supervisor_message,
+    GatewayMessage, RelayFrame, RelayInit, RelayOpen, ReportMainProcessExitRequest,
+    ReportMainProcessExitResponse, Sandbox, SandboxPhase, SessionAccepted, SshRelayTarget,
+    SupervisorMessage, gateway_message, relay_open, supervisor_message,
 };
 use openshell_core::transport_errors::is_expected_transport_close_status;
 
@@ -714,23 +714,15 @@ pub async fn handle_connect_supervisor(
         "supervisor session: accepted"
     );
 
-    // Step 2: Create the outbound channel. Exit-report-only sessions are
-    // deliberately not registered: they must not supersede the live relay
-    // session or mutate sandbox readiness.
+    // Step 2: Create and register the outbound channel.
     let (tx, rx) = mpsc::channel::<GatewayMessage>(64);
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
-    let mut exit_report_guard = None;
-    let superseded = if hello.exit_report_only {
-        exit_report_guard = Some(shutdown_tx);
-        false
-    } else {
-        state.supervisor_sessions.register(
-            sandbox_id.clone(),
-            session_id.clone(),
-            tx.clone(),
-            shutdown_tx,
-        )
-    };
+    let superseded = state.supervisor_sessions.register(
+        sandbox_id.clone(),
+        session_id.clone(),
+        tx.clone(),
+        shutdown_tx,
+    );
     if superseded {
         info!(
             sandbox_id = %sandbox_id,
@@ -762,28 +754,25 @@ pub async fn handle_connect_supervisor(
             .await;
     }
 
-    if !hello.exit_report_only {
-        if let Err(err) = state
-            .compute
-            .supervisor_session_connected(&sandbox_id, &hello.instance_id)
-            .await
-        {
-            warn!(
-                sandbox_id = %sandbox_id,
-                session_id = %session_id,
-                error = %err,
-                "supervisor session: failed to mark sandbox ready"
-            );
-        } else {
-            state.telemetry.sandbox_session_connected(&sandbox_id);
-        }
+    if let Err(err) = state
+        .compute
+        .supervisor_session_connected(&sandbox_id, &hello.instance_id)
+        .await
+    {
+        warn!(
+            sandbox_id = %sandbox_id,
+            session_id = %session_id,
+            error = %err,
+            "supervisor session: failed to mark sandbox ready"
+        );
+    } else {
+        state.telemetry.sandbox_session_connected(&sandbox_id);
     }
 
     // Step 4: Spawn the session loop that reads inbound messages.
     let state_clone = Arc::clone(state);
     let sandbox_id_clone = sandbox_id.clone();
     tokio::spawn(async move {
-        let _exit_report_guard = exit_report_guard;
         run_session_loop(
             &state_clone,
             &sandbox_id_clone,
@@ -793,10 +782,9 @@ pub async fn handle_connect_supervisor(
             shutdown_rx,
         )
         .await;
-        let still_ours = !hello.exit_report_only
-            && state_clone
-                .supervisor_sessions
-                .remove_if_current(&sandbox_id_clone, &session_id);
+        let still_ours = state_clone
+            .supervisor_sessions
+            .remove_if_current(&sandbox_id_clone, &session_id);
         if still_ours {
             info!(sandbox_id = %sandbox_id_clone, session_id = %session_id, "supervisor session: ended");
             state_clone
@@ -828,6 +816,30 @@ pub async fn handle_connect_supervisor(
     Ok(Response::new(stream))
 }
 
+pub async fn handle_report_main_process_exit(
+    state: &Arc<ServerState>,
+    request: Request<ReportMainProcessExitRequest>,
+) -> Result<Response<ReportMainProcessExitResponse>, Status> {
+    let principal = request.extensions().get::<Principal>().cloned();
+    let report = request.into_inner();
+    if report.sandbox_id.is_empty() {
+        return Err(Status::invalid_argument("sandbox_id is required"));
+    }
+    if report.instance_id.is_empty() {
+        return Err(Status::invalid_argument("instance_id is required"));
+    }
+    if let Some(principal) = principal.as_ref() {
+        crate::auth::guard::ensure_sandbox_principal_scope(principal, &report.sandbox_id)?;
+    }
+    require_persisted_sandbox(&state.store, &report.sandbox_id).await?;
+    state
+        .compute
+        .main_process_exited(&report.sandbox_id, &report.instance_id, report.exit_code)
+        .await
+        .map_err(Status::failed_precondition)?;
+    Ok(Response::new(ReportMainProcessExitResponse {}))
+}
+
 async fn run_session_loop(
     state: &Arc<ServerState>,
     sandbox_id: &str,
@@ -850,7 +862,7 @@ async fn run_session_loop(
             msg = inbound.message() => {
                 match msg {
                     Ok(Some(msg)) => {
-                        handle_supervisor_message(state, sandbox_id, session_id, tx, msg).await;
+                        handle_supervisor_message(state, sandbox_id, session_id, msg);
                     }
                     Ok(None) => {
                         info!(sandbox_id = %sandbox_id, session_id = %session_id, "supervisor session: stream closed by supervisor");
@@ -893,11 +905,10 @@ async fn run_session_loop(
     }
 }
 
-async fn handle_supervisor_message(
+fn handle_supervisor_message(
     state: &Arc<ServerState>,
     sandbox_id: &str,
     session_id: &str,
-    tx: &mpsc::Sender<GatewayMessage>,
     msg: SupervisorMessage,
 ) {
     match msg.payload {
@@ -934,29 +945,6 @@ async fn handle_supervisor_message(
                 reason = %close.reason,
                 "supervisor session: relay closed by supervisor"
             );
-        }
-        Some(supervisor_message::Payload::MainProcessExit(exit)) => {
-            match state.compute.main_process_exited(sandbox_id, &exit).await {
-                Ok(()) => {
-                    let _ = tx
-                        .send(GatewayMessage {
-                            payload: Some(gateway_message::Payload::MainProcessExitAck(
-                                MainProcessExitAck {
-                                    generation: exit.generation,
-                                },
-                            )),
-                        })
-                        .await;
-                }
-                Err(error) => {
-                    warn!(
-                        sandbox_id,
-                        session_id,
-                        %error,
-                        "supervisor session: failed to persist main-process exit"
-                    );
-                }
-            }
         }
         _ => {
             warn!(

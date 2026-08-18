@@ -140,11 +140,7 @@ async fn ssh_session_config(
         sandbox_id: session.sandbox_id.clone(),
         gateway_url,
         token: session.token,
-        main_terminal: sandbox
-            .spec
-            .as_ref()
-            .and_then(|spec| spec.main_process.as_ref())
-            .is_none_or(|main| main.terminal),
+        main_terminal: sandbox.spec.as_ref().is_none_or(|spec| spec.tty),
     })
 }
 
