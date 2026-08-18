@@ -299,6 +299,50 @@ impl OcsfEvent {
                 format!("HTTP:{method} {sev}{detail}{rule_ctx}{outcome_ctx}{message_ctx}")
             }
 
+            Self::ApiActivity(e) => {
+                let model_ctx = e
+                    .base
+                    .ai_model
+                    .as_ref()
+                    .map(|m| {
+                        format!(
+                            " {}",
+                            escape_context_field(&truncate_with_ellipsis(&m.name, MAX_REASON_LEN))
+                        )
+                    })
+                    .unwrap_or_default();
+                let provider_ctx = e
+                    .base
+                    .ai_model
+                    .as_ref()
+                    .map(|m| {
+                        format!(
+                            " via {}",
+                            escape_context_field(&truncate_with_ellipsis(
+                                &m.ai_provider,
+                                MAX_REASON_LEN
+                            ))
+                        )
+                    })
+                    .unwrap_or_default();
+                let latency = e
+                    .base
+                    .unmapped
+                    .as_ref()
+                    .and_then(|u| u.get("latency_ms"))
+                    .and_then(serde_json::Value::as_u64)
+                    .map(|ms| format!(" {ms}ms"))
+                    .unwrap_or_default();
+                let op =
+                    escape_context_field(&truncate_with_ellipsis(&e.api.operation, MAX_REASON_LEN));
+                let status_ctx = e
+                    .base
+                    .status
+                    .map(|s| format!(" {}", s.label()))
+                    .unwrap_or_default();
+                format!("API:INFERENCE {sev}{status_ctx}{model_ctx}{provider_ctx}{latency} [{op}]")
+            }
+
             Self::SshActivity(e) => {
                 let activity = e.base.activity_name.to_uppercase();
                 let action = e.action.map_or(String::new(), |a| a.label().to_uppercase());
@@ -481,7 +525,7 @@ mod tests {
 
     fn test_metadata() -> Metadata {
         Metadata {
-            version: "1.7.0".to_string(),
+            version: "1.8.0".to_string(),
             product: Product::openshell_sandbox("0.1.0"),
             profiles: vec!["security_control".to_string()],
             uid: Some("sandbox-abc123".to_string()),

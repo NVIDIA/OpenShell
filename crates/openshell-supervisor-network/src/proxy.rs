@@ -23,8 +23,9 @@ use openshell_core::policy::ProxyPolicy;
 use openshell_core::provider_credentials::ProviderCredentialState;
 use openshell_core::secrets::{self, SecretResolver, rewrite_header_line_checked};
 use openshell_ocsf::{
-    ActionId, ActivityId, DispositionId, Endpoint, HttpActivityBuilder, HttpRequest,
-    NetworkActivityBuilder, Process, SeverityId, StatusId, Url as OcsfUrl, ocsf_emit,
+    ActionId, ActivityId, AiModel, ApiActivityBuilder, DispositionId, Endpoint,
+    HttpActivityBuilder, HttpRequest, NetworkActivityBuilder, Process, SeverityId, StatusId,
+    Url as OcsfUrl, ocsf_emit,
 };
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
@@ -2380,6 +2381,90 @@ async fn process_inference_keepalive<S: tokio::io::AsyncRead + tokio::io::AsyncW
     Ok(InferenceOutcome::Routed)
 }
 
+/// Extract the model name from an inference request body.
+fn extract_model_from_request(body: &[u8]) -> Option<String> {
+    #[derive(serde::Deserialize)]
+    struct Req {
+        model: Option<String>,
+    }
+    serde_json::from_slice::<Req>(body)
+        .ok()
+        .and_then(|r| r.model)
+        .filter(|m| !m.is_empty())
+}
+
+/// Extract token usage from an inference response body.
+fn extract_usage_from_response(body: &[u8]) -> (Option<u64>, Option<u64>) {
+    #[derive(serde::Deserialize)]
+    struct Resp {
+        usage: Option<Usage>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Usage {
+        prompt_tokens: Option<u64>,
+        completion_tokens: Option<u64>,
+    }
+    match serde_json::from_slice::<Resp>(body) {
+        Ok(r) => {
+            let u = r.usage.unwrap_or(Usage {
+                prompt_tokens: None,
+                completion_tokens: None,
+            });
+            (u.prompt_tokens, u.completion_tokens)
+        }
+        Err(_) => (None, None),
+    }
+}
+
+/// Emit an OCSF API Activity [6003] event with the `ai_operation` profile after an inference call.
+#[allow(clippy::too_many_arguments)]
+fn emit_ai_inference(
+    method: &str,
+    path: &str,
+    route_model: Option<&str>,
+    route_provider: Option<&str>,
+    status: StatusId,
+    input_tokens: Option<u64>,
+    output_tokens: Option<u64>,
+    latency: std::time::Duration,
+) {
+    let model_name = route_model.unwrap_or("unknown");
+    let provider_name = route_provider.unwrap_or("unknown");
+    let latency_ms = u64::try_from(latency.as_millis()).unwrap_or(u64::MAX);
+
+    let operation = format!("{method} {path}");
+
+    let mut builder = ApiActivityBuilder::new(openshell_ocsf::ctx::ctx(), &operation)
+        .severity(SeverityId::Informational)
+        .status(status)
+        .ai_model(AiModel::new(model_name, provider_name))
+        .http_request(HttpRequest::new(
+            method,
+            OcsfUrl::new("https", INFERENCE_LOCAL_HOST, path, 443),
+        ))
+        .dst_endpoint(Endpoint::from_domain(
+            INFERENCE_LOCAL_HOST,
+            INFERENCE_LOCAL_PORT,
+        ))
+        .unmapped("latency_ms", latency_ms);
+
+    if let Some(t) = input_tokens {
+        builder = builder.unmapped("input_tokens", t);
+    }
+    if let Some(t) = output_tokens {
+        builder = builder.unmapped("output_tokens", t);
+    }
+
+    let msg = format!(
+        "Model call: {model_name} via {provider_name} ({}in, {}out)",
+        input_tokens.map_or_else(|| "?".to_string(), |t| t.to_string()),
+        output_tokens.map_or_else(|| "?".to_string(), |t| t.to_string()),
+    );
+    builder = builder.message(msg);
+
+    ocsf_emit!(builder.build());
+}
+
 /// Route a parsed inference request locally via the sandbox router, or deny it.
 ///
 /// Returns `Ok(true)` if the request was routed to an inference backend,
@@ -2435,6 +2520,16 @@ async fn route_inference_request(
         // the body on a size-cap or idle-timeout truncation, corrupting a
         // payload the client parses as one JSON object. Framing is declared per
         // protocol on the matched pattern.
+        let _req_model = extract_model_from_request(&request.body);
+        let normalized_protocol = pattern.protocol.to_ascii_lowercase();
+        let selected_route = routes
+            .iter()
+            .find(|r| r.protocols.iter().any(|p| p == &normalized_protocol))
+            .or_else(|| routes.first());
+        let route_model = selected_route.map(|r| r.model.clone());
+        let route_endpoint = selected_route.map(|r| r.endpoint.clone());
+        let infer_start = std::time::Instant::now();
+
         if pattern.is_buffered() {
             match ctx
                 .router
@@ -2449,11 +2544,40 @@ async fn route_inference_request(
                 .await
             {
                 Ok(resp) => {
+                    let (input_tokens, output_tokens) = extract_usage_from_response(&resp.body);
+                    let resp_status = if (200..300).contains(&resp.status) {
+                        StatusId::Success
+                    } else {
+                        StatusId::Failure
+                    };
+                    emit_ai_inference(
+                        &request.method,
+                        &normalized_path,
+                        resp.route_model.as_deref(),
+                        resp.route_endpoint.as_deref(),
+                        resp_status,
+                        input_tokens,
+                        output_tokens,
+                        infer_start.elapsed(),
+                    );
+
                     let resp_headers = sanitize_inference_response_headers(resp.headers);
                     let response = format_http_response(resp.status, &resp_headers, &resp.body);
                     write_all(tls_client, &response).await?;
                 }
-                Err(e) => write_inference_router_error(tls_client, &e).await?,
+                Err(e) => {
+                    emit_ai_inference(
+                        &request.method,
+                        &normalized_path,
+                        route_model.as_deref(),
+                        route_endpoint.as_deref(),
+                        StatusId::Failure,
+                        None,
+                        None,
+                        infer_start.elapsed(),
+                    );
+                    write_inference_router_error(tls_client, &e).await?;
+                }
             }
             return Ok(true);
         }
@@ -2476,6 +2600,9 @@ async fn route_inference_request(
                     format_sse_error,
                 };
 
+                let stream_route_model = resp.route_model.take();
+                let stream_route_endpoint = resp.route_endpoint.take();
+
                 let resp_headers = sanitize_inference_response_headers(
                     std::mem::take(&mut resp.headers).into_iter().collect(),
                 );
@@ -2492,7 +2619,9 @@ async fn route_inference_request(
                 // coalesce the framing header + data + trailer into a single
                 // write_all call, reducing the number of TLS records per chunk
                 // from 3 to 1 while preserving incremental delivery.
+                let resp_status_ok = (200..300).contains(&resp.status);
                 let mut total_bytes: usize = 0;
+                let mut stream_failed = false;
                 loop {
                     match tokio::time::timeout(CHUNK_IDLE_TIMEOUT, resp.next_chunk()).await {
                         Ok(Ok(Some(chunk))) => {
@@ -2507,6 +2636,7 @@ async fn route_inference_request(
                                     "response truncated: exceeded maximum streaming body size",
                                 );
                                 let _ = write_all(tls_client, &format_chunk(&err)).await;
+                                stream_failed = true;
                                 break;
                             }
                             let encoded = format_chunk(&chunk);
@@ -2527,6 +2657,7 @@ async fn route_inference_request(
                             ocsf_emit!(event);
                             let err = format_sse_error("response truncated: upstream read error");
                             let _ = write_all(tls_client, &format_chunk(&err)).await;
+                            stream_failed = true;
                             break;
                         }
                         Err(_) => {
@@ -2544,6 +2675,7 @@ async fn route_inference_request(
                             let err =
                                 format_sse_error("response truncated: chunk idle timeout exceeded");
                             let _ = write_all(tls_client, &format_chunk(&err)).await;
+                            stream_failed = true;
                             break;
                         }
                     }
@@ -2551,8 +2683,37 @@ async fn route_inference_request(
 
                 // Terminate the chunked stream.
                 write_all(tls_client, format_chunk_terminator()).await?;
+
+                // Emit API Activity for the completed streaming call.
+                let stream_status = if stream_failed || !resp_status_ok {
+                    StatusId::Failure
+                } else {
+                    StatusId::Success
+                };
+                emit_ai_inference(
+                    &request.method,
+                    &normalized_path,
+                    stream_route_model.as_deref(),
+                    stream_route_endpoint.as_deref(),
+                    stream_status,
+                    None,
+                    None,
+                    infer_start.elapsed(),
+                );
             }
-            Err(e) => write_inference_router_error(tls_client, &e).await?,
+            Err(e) => {
+                emit_ai_inference(
+                    &request.method,
+                    &normalized_path,
+                    route_model.as_deref(),
+                    route_endpoint.as_deref(),
+                    StatusId::Failure,
+                    None,
+                    None,
+                    infer_start.elapsed(),
+                );
+                write_inference_router_error(tls_client, &e).await?;
+            }
         }
         Ok(true)
     } else {

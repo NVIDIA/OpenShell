@@ -6,7 +6,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::enums::{SeverityId, StatusId};
-use crate::objects::{Container, Device, Metadata};
+use crate::objects::{AiModel, Container, Device, Metadata};
 
 /// Common fields shared by all OCSF event classes.
 ///
@@ -67,6 +67,10 @@ pub struct BaseEventData {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub container: Option<Container>,
 
+    /// AI model info (`ai_operation` profile, OCSF v1.8.0+).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ai_model: Option<AiModel>,
+
     /// Unmapped fields that don't fit the OCSF schema.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub unmapped: Option<serde_json::Value>,
@@ -112,6 +116,9 @@ impl Serialize for BaseEventData {
         if let Some(ref container) = self.container {
             map.serialize_entry("container", container)?;
         }
+        if let Some(ref ai_model) = self.ai_model {
+            map.serialize_entry("ai_model", ai_model)?;
+        }
         if let Some(ref unmapped) = self.unmapped {
             map.serialize_entry("unmapped", unmapped)?;
         }
@@ -154,6 +161,7 @@ impl BaseEventData {
             metadata,
             device: None,
             container: None,
+            ai_model: None,
             unmapped: None,
         }
     }
@@ -188,6 +196,11 @@ impl BaseEventData {
         self.container = Some(container);
     }
 
+    /// Set AI model info (`ai_operation` profile).
+    pub fn set_ai_model(&mut self, ai_model: AiModel) {
+        self.ai_model = Some(ai_model);
+    }
+
     /// Add an unmapped field.
     pub fn add_unmapped(&mut self, key: &str, value: impl Into<serde_json::Value>) {
         let map = self
@@ -214,7 +227,7 @@ mod tests {
 
     fn test_metadata() -> Metadata {
         Metadata {
-            version: "1.7.0".to_string(),
+            version: "1.8.0".to_string(),
             product: Product::openshell_sandbox("0.1.0"),
             profiles: vec!["container".to_string(), "host".to_string()],
             uid: Some("sandbox-abc123".to_string()),
