@@ -815,9 +815,19 @@ fn from_proto(policy: &SandboxPolicy) -> PolicyFile {
     });
 
     let landlock = policy.landlock.as_ref().map(|ll| LandlockDef {
-        compatibility: match ll.compatibility.as_str() {
-            "hard_requirement" => LandlockCompatibilityDef::HardRequirement,
-            _ => LandlockCompatibilityDef::BestEffort,
+        compatibility: {
+            // Persisted values are validated at create time
+            // (`validate_sandbox_policy`), so an unknown value here indicates a
+            // regression rather than untrusted input.
+            debug_assert!(
+                openshell_core::policy::is_valid_landlock_compatibility(&ll.compatibility),
+                "unvalidated landlock.compatibility reached from_proto: {:?}",
+                ll.compatibility,
+            );
+            match ll.compatibility.as_str() {
+                "hard_requirement" => LandlockCompatibilityDef::HardRequirement,
+                _ => LandlockCompatibilityDef::BestEffort,
+            }
         },
     });
 
@@ -1170,6 +1180,8 @@ pub enum PolicyViolation {
         policy_name: String,
         host: String,
     },
+    /// `landlock.compatibility` has an unrecognized value.
+    InvalidLandlockCompatibility { value: String },
 }
 
 impl fmt::Display for PolicyViolation {
@@ -1280,6 +1292,13 @@ impl fmt::Display for PolicyViolation {
                      '{policy_name}' tls: skip endpoint '{host}'"
                 )
             }
+            Self::InvalidLandlockCompatibility { value } => {
+                write!(
+                    f,
+                    "invalid landlock.compatibility '{value}'; accepted: {}",
+                    openshell_core::policy::LANDLOCK_COMPATIBILITY_VALUES.join(", ")
+                )
+            }
         }
     }
 }
@@ -1323,6 +1342,17 @@ pub fn validate_sandbox_policy(
                 value: process.run_as_group.clone(),
             });
         }
+    }
+
+    // Check landlock compatibility mode is a recognized value. Direct gRPC/SDK
+    // clients bypass YAML serde validation, so reject invalid values here at the
+    // gateway create path rather than deferring rejection to sandbox startup.
+    if let Some(ref landlock) = policy.landlock
+        && !openshell_core::policy::is_valid_landlock_compatibility(&landlock.compatibility)
+    {
+        violations.push(PolicyViolation::InvalidLandlockCompatibility {
+            value: landlock.compatibility.clone(),
+        });
     }
 
     // Check filesystem paths
@@ -1977,6 +2007,54 @@ network_policies:
         });
         let violations = validate_sandbox_policy(&policy).unwrap_err();
         assert_eq!(violations.len(), 2);
+    }
+
+    #[test]
+    fn parse_rejects_invalid_landlock_compatibility() {
+        let err = parse_sandbox_policy("version: 1\nlandlock:\n  compatibility: bogus\n")
+            .expect_err("should reject invalid YAML enum value");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("best_effort") && msg.contains("hard_requirement"),
+            "error should list accepted values, got: {msg}",
+        );
+    }
+
+    #[test]
+    fn parse_accepts_known_landlock_compatibility() {
+        for value in ["best_effort", "hard_requirement"] {
+            let yaml = format!("version: 1\nlandlock:\n  compatibility: {value}\n");
+            let policy = parse_sandbox_policy(&yaml).expect("should parse");
+            assert_eq!(
+                policy.landlock.as_ref().expect("landlock").compatibility,
+                value,
+            );
+        }
+    }
+
+    #[test]
+    fn validate_rejects_invalid_landlock_compatibility_proto() {
+        let mut policy = restrictive_default_policy();
+        policy.landlock = Some(LandlockPolicy {
+            compatibility: "nope".into(),
+        });
+        let violations = validate_sandbox_policy(&policy).unwrap_err();
+        assert!(
+            violations
+                .iter()
+                .any(|v| matches!(v, PolicyViolation::InvalidLandlockCompatibility { .. })),
+            "expected InvalidLandlockCompatibility, got: {violations:?}",
+        );
+    }
+
+    #[test]
+    fn validate_accepts_empty_landlock_compatibility() {
+        // Empty string is the proto default and maps to best_effort.
+        let mut policy = restrictive_default_policy();
+        policy.landlock = Some(LandlockPolicy {
+            compatibility: String::new(),
+        });
+        assert!(validate_sandbox_policy(&policy).is_ok());
     }
 
     #[test]
