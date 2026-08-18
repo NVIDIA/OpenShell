@@ -2374,6 +2374,10 @@ fn validate_cdi_projection_mounts_with(
 }
 
 #[cfg(not(target_os = "linux"))]
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "matches the Linux implementation so shared CDI validation can propagate errors uniformly"
+)]
 fn validate_cdi_projection_mounts(_context: &openshell_core::cdi::CdiContext) -> Result<()> {
     Ok(())
 }
