@@ -91,6 +91,28 @@ The gateway records driver identity and version from the startup capability
 response. Elevated gateway info reports that initialized driver snapshot instead
 of re-querying drivers on each request.
 
+## Compiled Driver Selection
+
+The gateway binary explicitly installs the compute drivers compiled into that
+binary before entering server startup. The server selects a configured driver
+by normalized registry name. When no driver is configured, it evaluates only
+the installed drivers' probes in registered priority order, records every
+available registration, and selects the first. Drivers without a probe,
+including VM, remain opt-in.
+
+Startup computes this selection once after merging configuration. The same
+selection drives authentication defaults and runtime construction, so a probe
+result cannot change which driver is constructed later in startup.
+
+This follows the same composition model as SQLx's `Any` drivers: the binary
+defines the available implementation set, while the runtime consumes a generic
+registry. Adding or removing a compiled driver therefore changes registration
+rather than the server's selection flow. Alternate gateway binaries can install
+their own `ComputeDriverFactory` registrations and hand the completed registry
+to `run_cli_with_compute_drivers`; factories receive merged driver config and
+finish through the same in-process runtime adapter. A configured UDS endpoint
+still takes precedence over a compiled registration with the same name.
+
 ## Stop and Start Lifecycle
 
 The gateway persists lifecycle intent before mutating compute:

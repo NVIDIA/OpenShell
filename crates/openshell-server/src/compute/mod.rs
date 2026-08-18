@@ -77,8 +77,9 @@ use tonic::{Code, Request, Status};
 use tower::service_fn;
 use tracing::{Instrument as _, debug, info, warn};
 
-type DriverWatchStream = Pin<Box<dyn Stream<Item = Result<WatchSandboxesEvent, Status>> + Send>>;
-type SharedComputeDriver =
+pub type DriverWatchStream =
+    Pin<Box<dyn Stream<Item = Result<WatchSandboxesEvent, Status>> + Send>>;
+pub type SharedComputeDriver =
     Arc<dyn ComputeDriver<WatchSandboxesStream = DriverWatchStream> + Send + Sync>;
 
 use traced_driver::TracedDriver;
@@ -585,7 +586,7 @@ impl ComputeRuntime {
             driver.name = %driver_name,
         )
     )]
-    async fn from_driver(
+    pub(crate) async fn from_driver(
         driver_name: String,
         driver: SharedComputeDriver,
         driver_process: Option<Arc<ManagedDriverProcess>>,
