@@ -4,10 +4,11 @@
 #![cfg(feature = "e2e")]
 
 use std::io::Write;
-use std::process::Stdio;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 
 use openshell_e2e::harness::binary::openshell_cmd;
-use openshell_e2e::harness::container::{ContainerEngine, SupportContainer, is_e2e_driver};
+use openshell_e2e::harness::container::{SupportContainer, is_e2e_driver};
 use openshell_e2e::harness::sandbox::SandboxGuard;
 use tempfile::NamedTempFile;
 
@@ -18,73 +19,61 @@ const MUSL_FIXTURE_ALIAS: &str = "transparent-tcp-musl.openshell.test";
 const FIXTURE_PORT: u16 = 5432;
 const TRANSPARENT_LISTENER_PORT: u16 = 15001;
 
-struct MuslSandboxImage {
-    engine: ContainerEngine,
-    tag: String,
+struct MuslDnsProbe {
+    _tempdir: tempfile::TempDir,
+    path: PathBuf,
 }
 
-impl MuslSandboxImage {
+impl MuslDnsProbe {
     fn build() -> Result<Self, String> {
-        let engine = ContainerEngine::from_env()?;
-        if engine.name() != "podman" {
-            return Err(format!(
-                "musl transparent TCP E2E requires podman, got {}",
-                engine.name()
-            ));
-        }
+        let target = match std::env::consts::ARCH {
+            "x86_64" => "x86_64-linux-musl",
+            "aarch64" => "aarch64-linux-musl",
+            arch => return Err(format!("unsupported musl DNS probe architecture: {arch}")),
+        };
+        let tempdir =
+            tempfile::tempdir().map_err(|error| format!("create probe directory: {error}"))?;
+        let path = tempdir.path().join("musl-dns-probe");
+        let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../support/musl-dns-probe.c")
+            .canonicalize()
+            .map_err(|error| format!("locate musl DNS probe source: {error}"))?;
 
-        let context =
-            tempfile::tempdir().map_err(|error| format!("create build context: {error}"))?;
-        let containerfile = context.path().join("Containerfile");
-        std::fs::write(
-            &containerfile,
-            "FROM docker.io/library/alpine:3.22\nRUN apk add --no-cache iproute2\n",
-        )
-        .map_err(|error| format!("write Containerfile: {error}"))?;
-
-        let tag = format!(
-            "localhost/openshell-e2e-transparent-tcp-musl:{}",
-            std::process::id()
-        );
-        let output = engine
-            .command()
+        let output = Command::new("mise")
             .args([
-                "build",
-                "--file",
-                containerfile
+                "x",
+                "--",
+                "zig",
+                "cc",
+                "-target",
+                target,
+                "-static",
+                "-O2",
+                "-Wall",
+                "-Wextra",
+                "-Werror",
+                source
                     .to_str()
-                    .ok_or_else(|| "Containerfile path is not UTF-8".to_string())?,
-                "--tag",
-                &tag,
-                context
-                    .path()
-                    .to_str()
-                    .ok_or_else(|| "build context path is not UTF-8".to_string())?,
+                    .ok_or_else(|| "probe source path is not UTF-8".to_string())?,
+                "-o",
+                path.to_str()
+                    .ok_or_else(|| "probe output path is not UTF-8".to_string())?,
             ])
             .output()
-            .map_err(|error| format!("build musl sandbox image: {error}"))?;
+            .map_err(|error| format!("build static musl DNS probe: {error}"))?;
         if !output.status.success() {
             return Err(format!(
-                "podman build failed (exit {:?}):\n{}{}",
+                "musl DNS probe build failed (exit {:?}):\n{}{}",
                 output.status.code(),
                 String::from_utf8_lossy(&output.stdout),
                 String::from_utf8_lossy(&output.stderr)
             ));
         }
 
-        Ok(Self { engine, tag })
-    }
-}
-
-impl Drop for MuslSandboxImage {
-    fn drop(&mut self) {
-        let _ = self
-            .engine
-            .command()
-            .args(["image", "rm", "--force", &self.tag])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+        Ok(Self {
+            _tempdir: tempdir,
+            path,
+        })
     }
 }
 
@@ -135,12 +124,12 @@ network_policies:
 }
 
 #[tokio::test]
-async fn rootless_podman_musl_client_uses_udp_policy_dns() {
+async fn rootless_podman_musl_getaddrinfo_uses_udp_policy_dns() {
     if !is_e2e_driver("podman") {
         return;
     }
 
-    let image = MuslSandboxImage::build().expect("build Alpine/musl sandbox image");
+    let probe = MuslDnsProbe::build().expect("build static musl DNS probe");
     let fixture = SupportContainer::start_python(
         MUSL_FIXTURE_ALIAS,
         &format!(
@@ -161,29 +150,35 @@ while True:
     .await
     .expect("start musl TCP fixture");
 
-    // Build through Podman so the gateway sees the image in the same store.
-    // Plain Alpine's BusyBox `ip` lacks `ip netns`; full iproute2 is part of
-    // the sandbox runtime contract. Alpine also has real /bin and /sbin trees
-    // rather than Debian-style usr-merge symlinks.
-    let policy =
-        write_policy_for_identity(MUSL_FIXTURE_ALIAS, "65534", "65534", &["/bin", "/sbin"])
-            .expect("write musl policy");
+    // Keep sandbox-image compatibility out of this test. The statically linked
+    // probe executes musl's getaddrinfo inside the normal, known-good sandbox
+    // image, so this test isolates rootless Podman's UDP policy-DNS path.
+    let policy = write_policy_for(MUSL_FIXTURE_ALIAS).expect("write musl policy");
     let policy_path = policy.path().to_string_lossy().into_owned();
     let mut sandbox = SandboxGuard::create_keep_with_args(
-        &["--from", &image.tag, "--policy", &policy_path, "--no-tty"],
+        &["--policy", &policy_path, "--no-tty"],
         &["sh", "-c", "echo Ready; sleep 2147483647"],
         "Ready",
     )
     .await
-    .expect("create Alpine/musl sandbox");
+    .expect("create sandbox for musl DNS probe");
 
-    let script = format!(
-        "set -eu; nslookup {MUSL_FIXTURE_ALIAS} | grep -E 'Address: 198\\.1[89]\\.'; printf probe | nc -w 5 {MUSL_FIXTURE_ALIAS} {FIXTURE_PORT} | grep musl-native-tcp-ok:probe; echo musl-policy-dns-ok"
-    );
-    let output = sandbox
-        .exec(&["sh", "-c", &script])
+    sandbox
+        .upload(
+            probe.path.to_str().expect("probe path is UTF-8"),
+            "/sandbox/musl-dns-probe",
+        )
         .await
-        .expect("exercise musl UDP policy DNS");
+        .expect("upload musl DNS probe");
+
+    let output = sandbox
+        .exec(&[
+            "/sandbox/musl-dns-probe",
+            MUSL_FIXTURE_ALIAS,
+            &FIXTURE_PORT.to_string(),
+        ])
+        .await
+        .expect("exercise musl getaddrinfo over policy DNS");
     assert!(output.contains("musl-policy-dns-ok"), "{output}");
 
     sandbox.cleanup().await;
