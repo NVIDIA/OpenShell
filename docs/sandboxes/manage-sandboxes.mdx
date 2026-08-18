@@ -64,6 +64,29 @@ openshell sandbox template create gpu-kata \
 openshell sandbox create --template gpu-kata -- claude
 ```
 
+The Python SDK exposes the same workflow through `SandboxTemplateClient` and
+`create_from_template`:
+
+```python
+from openshell import SandboxClient, SandboxTemplate, SandboxTemplateClient, SandboxWorkloadConfig
+
+with SandboxClient.from_active_cluster() as sandboxes:
+    templates = SandboxTemplateClient.from_sandbox_client(sandboxes)
+    template = SandboxTemplate()
+    template.metadata.name = "gpu-kata"
+    template.spec.workload.CopyFrom(SandboxWorkloadConfig(image="cuda:latest"))
+    template.spec.driver_config.update(
+        {"kubernetes": {"pod": {"runtime_class_name": "kata-containers"}}}
+    )
+    templates.create(workspace="default", template=template)
+
+    sandbox = sandboxes.create_from_template(
+        workspace="default",
+        template_name="gpu-kata",
+        name="gpu-job",
+    )
+```
+
 Template `driver_config` values are JSON objects keyed by driver name. The
 gateway forwards only the block for its configured compute driver:
 

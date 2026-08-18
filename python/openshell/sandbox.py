@@ -440,13 +440,43 @@ class SandboxClient:
         self,
         *,
         workspace: str,
-        spec: openshell_pb2.SandboxSpec | None = None,
+        workload: openshell_pb2.SandboxWorkloadConfig | None = None,
+        policy: Any | None = None,
+        providers: Sequence[str] | None = None,
         name: str | None = None,
         labels: Mapping[str, str] | None = None,
     ) -> SandboxRef:
-        request_spec = spec if spec is not None else _default_spec()
         request = _create_sandbox_request(
-            spec=request_spec,
+            workload=workload,
+            policy=policy,
+            providers=providers,
+            name=name or "",
+            labels=dict(labels) if labels else {},
+            workspace=workspace,
+        )
+        response = self._stub.CreateSandbox(
+            request,
+            timeout=self._timeout,
+        )
+        sandbox_ref = _sandbox_ref(response.sandbox)
+        if sandbox_ref.id == "":
+            raise SandboxError("CreateSandbox returned empty sandbox id")
+        return sandbox_ref
+
+    def create_from_template(
+        self,
+        *,
+        workspace: str,
+        template_name: str,
+        policy: Any | None = None,
+        providers: Sequence[str] | None = None,
+        name: str | None = None,
+        labels: Mapping[str, str] | None = None,
+    ) -> SandboxRef:
+        request = _create_sandbox_from_template_request(
+            template_name=template_name,
+            policy=policy,
+            providers=providers,
             name=name or "",
             labels=dict(labels) if labels else {},
             workspace=workspace,
@@ -464,12 +494,44 @@ class SandboxClient:
         self,
         *,
         workspace: str,
-        spec: openshell_pb2.SandboxSpec | None = None,
+        workload: openshell_pb2.SandboxWorkloadConfig | None = None,
+        policy: Any | None = None,
+        providers: Sequence[str] | None = None,
         name: str | None = None,
         labels: Mapping[str, str] | None = None,
     ) -> SandboxSession:
         return SandboxSession(
-            self, self.create(workspace=workspace, spec=spec, name=name, labels=labels)
+            self,
+            self.create(
+                workspace=workspace,
+                workload=workload,
+                policy=policy,
+                providers=providers,
+                name=name,
+                labels=labels,
+            ),
+        )
+
+    def create_session_from_template(
+        self,
+        *,
+        workspace: str,
+        template_name: str,
+        policy: Any | None = None,
+        providers: Sequence[str] | None = None,
+        name: str | None = None,
+        labels: Mapping[str, str] | None = None,
+    ) -> SandboxSession:
+        return SandboxSession(
+            self,
+            self.create_from_template(
+                workspace=workspace,
+                template_name=template_name,
+                policy=policy,
+                providers=providers,
+                name=name,
+                labels=labels,
+            ),
         )
 
     def get(self, sandbox_name: str, *, workspace: str) -> SandboxRef:
@@ -745,6 +807,80 @@ class SandboxClient:
         )
 
 
+class SandboxTemplateClient:
+    """gRPC client for reusable sandbox template lifecycle operations."""
+
+    def __init__(self, channel: grpc.Channel, *, timeout: float = 30.0) -> None:
+        self._stub = openshell_pb2_grpc.OpenShellStub(channel)
+        self._timeout = timeout
+
+    @classmethod
+    def from_sandbox_client(cls, client: SandboxClient) -> SandboxTemplateClient:
+        return cls(client._channel, timeout=client._timeout)
+
+    def create(
+        self,
+        *,
+        workspace: str,
+        template: openshell_pb2.SandboxTemplate,
+    ) -> openshell_pb2.SandboxTemplate:
+        response = self._stub.CreateSandboxTemplate(
+            openshell_pb2.CreateSandboxTemplateRequest(
+                workspace=workspace,
+                template=template,
+            ),
+            timeout=self._timeout,
+        )
+        return response.template
+
+    def get(self, name: str, *, workspace: str) -> openshell_pb2.SandboxTemplate:
+        response = self._stub.GetSandboxTemplate(
+            openshell_pb2.GetSandboxTemplateRequest(name=name, workspace=workspace),
+            timeout=self._timeout,
+        )
+        return response.template
+
+    def list(
+        self,
+        *,
+        workspace: str,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> builtins.list[openshell_pb2.SandboxTemplate]:
+        response = self._stub.ListSandboxTemplates(
+            openshell_pb2.ListSandboxTemplatesRequest(
+                workspace=workspace,
+                limit=limit,
+                offset=offset,
+            ),
+            timeout=self._timeout,
+        )
+        return list(response.templates)
+
+    def list_for_all_workspaces(
+        self,
+        *,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> builtins.list[openshell_pb2.SandboxTemplate]:
+        response = self._stub.ListSandboxTemplates(
+            openshell_pb2.ListSandboxTemplatesRequest(
+                all_workspaces=True,
+                limit=limit,
+                offset=offset,
+            ),
+            timeout=self._timeout,
+        )
+        return list(response.templates)
+
+    def delete(self, name: str, *, workspace: str) -> bool:
+        response = self._stub.DeleteSandboxTemplate(
+            openshell_pb2.DeleteSandboxTemplateRequest(name=name, workspace=workspace),
+            timeout=self._timeout,
+        )
+        return bool(response.deleted)
+
+
 @dataclass(frozen=True)
 class InferenceRouteConfig:
     provider_name: str
@@ -897,7 +1033,10 @@ class Sandbox:
         cluster: str | None = None,
         sandbox: str | SandboxRef | None = None,
         delete_on_exit: bool = True,
-        spec: openshell_pb2.SandboxSpec | None = None,
+        workload: openshell_pb2.SandboxWorkloadConfig | None = None,
+        template_name: str | None = None,
+        policy: Any | None = None,
+        providers: Sequence[str] | None = None,
         name: str | None = None,
         labels: Mapping[str, str] | None = None,
         timeout: float = 30.0,
@@ -919,7 +1058,10 @@ class Sandbox:
         self._cluster = cluster
         self._sandbox_input = sandbox
         self._delete_on_exit = delete_on_exit
-        self._spec = spec
+        self._workload = workload
+        self._template_name = template_name
+        self._policy = policy
+        self._providers = tuple(providers) if providers is not None else None
         self._name = name
         # Copy so later caller mutation cannot change what gets sent on enter.
         self._labels = dict(labels) if labels is not None else None
@@ -947,10 +1089,15 @@ class Sandbox:
         # Creation metadata cannot be applied when attaching to an existing
         # sandbox; reject it before opening a connection.
         if self._sandbox_input is not None and (
-            self._name is not None or self._labels is not None
+            self._name is not None
+            or self._labels is not None
+            or self._workload is not None
+            or self._template_name is not None
+            or self._policy is not None
+            or self._providers is not None
         ):
             raise SandboxError(
-                "name and labels cannot be set when attaching to an existing sandbox"
+                "create options cannot be set when attaching to an existing sandbox"
             )
 
         client = SandboxClient.from_active_cluster(
@@ -963,12 +1110,28 @@ class Sandbox:
         self._client = client
 
         if self._sandbox_input is None:
-            self._session = client.create_session(
-                workspace=self._workspace,
-                spec=self._spec,
-                name=self._name,
-                labels=self._labels,
-            )
+            if self._template_name is not None:
+                if self._workload is not None:
+                    raise SandboxError(
+                        "workload cannot be set when creating from a template"
+                    )
+                self._session = client.create_session_from_template(
+                    workspace=self._workspace,
+                    template_name=self._template_name,
+                    policy=self._policy,
+                    providers=self._providers,
+                    name=self._name,
+                    labels=self._labels,
+                )
+            else:
+                self._session = client.create_session(
+                    workspace=self._workspace,
+                    workload=self._workload,
+                    policy=self._policy,
+                    providers=self._providers,
+                    name=self._name,
+                    labels=self._labels,
+                )
         elif isinstance(self._sandbox_input, SandboxRef):
             self._session = SandboxSession(client, self._sandbox_input)
         else:
@@ -1098,18 +1261,11 @@ def _sandbox_ref(sandbox: openshell_pb2.Sandbox) -> SandboxRef:
     )
 
 
-def _default_spec() -> openshell_pb2.SandboxSpec:
-    # Omit the policy field so the sandbox container discovers its policy
-    # from /etc/openshell/policy.yaml (baked into the image at build time).
-    # This avoids duplicating policy defaults between the SDK and the
-    # container image and ensures sandboxes get the full dev-sandbox-policy
-    # (including network_policies) out of the box.
-    return openshell_pb2.SandboxSpec()
-
-
 def _create_sandbox_request(
     *,
-    spec: openshell_pb2.SandboxSpec,
+    workload: openshell_pb2.SandboxWorkloadConfig | None,
+    policy: Any | None,
+    providers: Sequence[str] | None,
     name: str,
     labels: Mapping[str, str],
     workspace: str,
@@ -1119,13 +1275,33 @@ def _create_sandbox_request(
         labels=dict(labels),
         workspace=workspace,
     )
-    if spec.HasField("workload"):
-        request.workload.CopyFrom(spec.workload)
-    else:
-        request.workload.CopyFrom(openshell_pb2.SandboxWorkloadConfig())
-    if spec.HasField("policy"):
-        request.policy.CopyFrom(spec.policy)
-    request.providers.extend(spec.providers)
+    request.workload.CopyFrom(workload or openshell_pb2.SandboxWorkloadConfig())
+    if policy is not None:
+        request.policy.CopyFrom(policy)
+    request.providers.extend(providers or [])
+    return request
+
+
+def _create_sandbox_from_template_request(
+    *,
+    template_name: str,
+    policy: Any | None,
+    providers: Sequence[str] | None,
+    name: str,
+    labels: Mapping[str, str],
+    workspace: str,
+) -> openshell_pb2.CreateSandboxRequest:
+    if template_name == "":
+        raise SandboxError("template_name is required")
+    request = openshell_pb2.CreateSandboxRequest(
+        name=name,
+        labels=dict(labels),
+        workspace=workspace,
+        workload_template_name=template_name,
+    )
+    if policy is not None:
+        request.policy.CopyFrom(policy)
+    request.providers.extend(providers or [])
     return request
 
 

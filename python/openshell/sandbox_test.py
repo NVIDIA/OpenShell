@@ -27,6 +27,7 @@ from openshell.sandbox import (
     SandboxError,
     SandboxRef,
     SandboxStatusRef,
+    SandboxTemplateClient,
     TlsConfig,
     _atomic_replace,
     _BearerAuthInterceptor,
@@ -85,6 +86,13 @@ class _FakeInferenceStub:
 
 def _client_with_fake_stub(stub: object) -> SandboxClient:
     client = cast("SandboxClient", object.__new__(SandboxClient))
+    client._timeout = 30.0
+    client._stub = cast("Any", stub)
+    return client
+
+
+def _template_client_with_fake_stub(stub: object) -> SandboxTemplateClient:
+    client = cast("SandboxTemplateClient", object.__new__(SandboxTemplateClient))
     client._timeout = 30.0
     client._stub = cast("Any", stub)
     return client
@@ -1545,7 +1553,18 @@ class _FakeSandboxStub:
         self.delete_request: openshell_pb2.DeleteSandboxRequest | None = None
         self.stop_request: openshell_pb2.StopSandboxRequest | None = None
         self.start_request: openshell_pb2.StartSandboxRequest | None = None
+        self.create_template_request: (
+            openshell_pb2.CreateSandboxTemplateRequest | None
+        ) = None
+        self.get_template_request: openshell_pb2.GetSandboxTemplateRequest | None = None
+        self.list_template_request: openshell_pb2.ListSandboxTemplatesRequest | None = (
+            None
+        )
+        self.delete_template_request: (
+            openshell_pb2.DeleteSandboxTemplateRequest | None
+        ) = None
         self._listed = listed or []
+        self._templates: list[openshell_pb2.SandboxTemplate] = []
 
     def GetSandbox(
         self,
@@ -1626,6 +1645,46 @@ class _FakeSandboxStub:
         _ = timeout
         return SimpleNamespace(sandboxes=list(self._listed))
 
+    def CreateSandboxTemplate(
+        self,
+        request: openshell_pb2.CreateSandboxTemplateRequest,
+        timeout: float | None = None,
+    ) -> Any:
+        self.create_template_request = request
+        _ = timeout
+        self._templates.append(request.template)
+        return SimpleNamespace(template=request.template)
+
+    def GetSandboxTemplate(
+        self,
+        request: openshell_pb2.GetSandboxTemplateRequest,
+        timeout: float | None = None,
+    ) -> Any:
+        self.get_template_request = request
+        _ = timeout
+        template = openshell_pb2.SandboxTemplate()
+        template.metadata.name = request.name
+        template.metadata.workspace = request.workspace
+        return SimpleNamespace(template=template)
+
+    def ListSandboxTemplates(
+        self,
+        request: openshell_pb2.ListSandboxTemplatesRequest,
+        timeout: float | None = None,
+    ) -> Any:
+        self.list_template_request = request
+        _ = timeout
+        return SimpleNamespace(templates=list(self._templates))
+
+    def DeleteSandboxTemplate(
+        self,
+        request: openshell_pb2.DeleteSandboxTemplateRequest,
+        timeout: float | None = None,
+    ) -> Any:
+        self.delete_template_request = request
+        _ = timeout
+        return SimpleNamespace(deleted=True)
+
 
 class _RecordingHighLevelClient:
     """A stand-in for SandboxClient used to observe high-level forwarding."""
@@ -1637,13 +1696,39 @@ class _RecordingHighLevelClient:
         self,
         *,
         workspace: str,
-        spec: Any = None,
+        workload: Any = None,
+        policy: Any = None,
+        providers: Any = None,
         name: str | None = None,
         labels: Any = None,
     ) -> Any:
         self.create_kwargs = {
             "workspace": workspace,
-            "spec": spec,
+            "workload": workload,
+            "policy": policy,
+            "providers": providers,
+            "template_name": None,
+            "name": name,
+            "labels": labels,
+        }
+        return SimpleNamespace(sandbox=SimpleNamespace(name=name or "generated"))
+
+    def create_session_from_template(
+        self,
+        *,
+        workspace: str,
+        template_name: str,
+        policy: Any = None,
+        providers: Any = None,
+        name: str | None = None,
+        labels: Any = None,
+    ) -> Any:
+        self.create_kwargs = {
+            "workspace": workspace,
+            "workload": None,
+            "policy": policy,
+            "providers": providers,
+            "template_name": template_name,
             "name": name,
             "labels": labels,
         }
@@ -1717,24 +1802,103 @@ def test_create_copies_caller_labels() -> None:
     assert dict(stub.create_request.labels) == {"aiq": "deep-research"}
 
 
-def test_create_forwards_spec_workload_and_providers() -> None:
+def test_create_forwards_workload_and_providers() -> None:
     stub = _FakeSandboxStub()
     client = _client_with_fake_stub(stub)
-    spec = openshell_pb2.SandboxSpec(
-        workload=openshell_pb2.SandboxWorkloadConfig(
-            image="python:3.12",
-            environment={"LANG": "C.UTF-8"},
-        ),
-        providers=["github"],
+    workload = openshell_pb2.SandboxWorkloadConfig(
+        image="python:3.12",
+        environment={"LANG": "C.UTF-8"},
     )
 
-    client.create(workspace="default", spec=spec)
+    client.create(workspace="default", workload=workload, providers=["github"])
 
     assert stub.create_request is not None
     assert stub.create_request.HasField("workload")
     assert stub.create_request.workload.image == "python:3.12"
     assert dict(stub.create_request.workload.environment) == {"LANG": "C.UTF-8"}
     assert list(stub.create_request.providers) == ["github"]
+
+
+def test_create_from_template_forwards_template_name_and_providers() -> None:
+    stub = _FakeSandboxStub()
+    client = _client_with_fake_stub(stub)
+
+    client.create_from_template(
+        workspace="default",
+        template_name="gpu-kata",
+        name="job-1",
+        providers=["github"],
+        labels={"team": "aiq"},
+    )
+
+    assert stub.create_request is not None
+    assert stub.create_request.workload_template_name == "gpu-kata"
+    assert not stub.create_request.HasField("workload")
+    assert stub.create_request.name == "job-1"
+    assert list(stub.create_request.providers) == ["github"]
+    assert dict(stub.create_request.labels) == {"team": "aiq"}
+
+
+def test_create_from_template_rejects_empty_template_name() -> None:
+    stub = _FakeSandboxStub()
+    client = _client_with_fake_stub(stub)
+
+    with pytest.raises(SandboxError):
+        client.create_from_template(workspace="default", template_name="")
+
+
+def test_sandbox_template_client_crud_forwards_requests() -> None:
+    stub = _FakeSandboxStub()
+    client = _template_client_with_fake_stub(stub)
+    template = openshell_pb2.SandboxTemplate()
+    template.metadata.name = "gpu-kata"
+    template.spec.workload.image = "python:3.12"
+    template.spec.driver_config.update({"kubernetes": {"runtime_class_name": "kata"}})
+
+    created = client.create(workspace="default", template=template)
+
+    assert created.metadata.name == "gpu-kata"
+    assert stub.create_template_request is not None
+    assert stub.create_template_request.workspace == "default"
+    assert stub.create_template_request.template.spec.workload.image == "python:3.12"
+    assert (
+        stub.create_template_request.template.spec.driver_config["kubernetes"][
+            "runtime_class_name"
+        ]
+        == "kata"
+    )
+
+    got = client.get("gpu-kata", workspace="default")
+    assert got.metadata.name == "gpu-kata"
+    assert stub.get_template_request is not None
+    assert stub.get_template_request.name == "gpu-kata"
+    assert stub.get_template_request.workspace == "default"
+
+    listed = client.list(workspace="default", limit=50, offset=10)
+    assert len(listed) == 1
+    assert stub.list_template_request is not None
+    assert stub.list_template_request.workspace == "default"
+    assert stub.list_template_request.limit == 50
+    assert stub.list_template_request.offset == 10
+    assert not stub.list_template_request.all_workspaces
+
+    assert client.delete("gpu-kata", workspace="default") is True
+    assert stub.delete_template_request is not None
+    assert stub.delete_template_request.name == "gpu-kata"
+    assert stub.delete_template_request.workspace == "default"
+
+
+def test_sandbox_template_list_for_all_workspaces_clears_workspace() -> None:
+    stub = _FakeSandboxStub()
+    client = _template_client_with_fake_stub(stub)
+
+    client.list_for_all_workspaces(limit=100, offset=5)
+
+    assert stub.list_template_request is not None
+    assert stub.list_template_request.all_workspaces
+    assert stub.list_template_request.workspace == ""
+    assert stub.list_template_request.limit == 100
+    assert stub.list_template_request.offset == 5
 
 
 def test_create_session_forwards_name_and_labels() -> None:
@@ -1882,9 +2046,42 @@ def test_high_level_creation_forwards_name_and_labels(
 
     assert recording.create_kwargs == {
         "workspace": "staging",
-        "spec": None,
+        "workload": None,
+        "policy": None,
+        "providers": None,
+        "template_name": None,
         "name": "job-1",
         "labels": {"aiq": "deep-research"},
+    }
+
+
+def test_high_level_creation_from_template_forwards_template_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recording = _RecordingHighLevelClient()
+    monkeypatch.setattr(
+        SandboxClient,
+        "from_active_cluster",
+        classmethod(lambda _cls, **_kwargs: recording),
+    )
+
+    sandbox = Sandbox(
+        workspace="staging",
+        template_name="gpu-kata",
+        name="job-1",
+        providers=["github"],
+        delete_on_exit=False,
+    )
+    sandbox.__enter__()
+
+    assert recording.create_kwargs == {
+        "workspace": "staging",
+        "workload": None,
+        "policy": None,
+        "providers": ("github",),
+        "template_name": "gpu-kata",
+        "name": "job-1",
+        "labels": None,
     }
 
 

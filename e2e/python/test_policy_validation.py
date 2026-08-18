@@ -64,11 +64,15 @@ def test_create_sandbox_rejects_root_user(
             run_as_group="sandbox",
         ),
     )
-    spec = datamodel_pb2.SandboxSpec(policy=policy)
-
     stub = sandbox_client._stub
     with pytest.raises(grpc.RpcError) as exc_info:
-        stub.CreateSandbox(openshell_pb2.CreateSandboxRequest(name="", spec=spec))
+        stub.CreateSandbox(
+            openshell_pb2.CreateSandboxRequest(
+                name="",
+                workload=openshell_pb2.SandboxWorkloadConfig(),
+                policy=policy,
+            )
+        )
 
     assert exc_info.value.code() == grpc.StatusCode.INVALID_ARGUMENT
     assert "root" in exc_info.value.details().lower()
@@ -88,11 +92,15 @@ def test_create_sandbox_rejects_path_traversal(
         landlock=_SAFE_LANDLOCK,
         process=_SAFE_PROCESS,
     )
-    spec = datamodel_pb2.SandboxSpec(policy=policy)
-
     stub = sandbox_client._stub
     with pytest.raises(grpc.RpcError) as exc_info:
-        stub.CreateSandbox(openshell_pb2.CreateSandboxRequest(name="", spec=spec))
+        stub.CreateSandbox(
+            openshell_pb2.CreateSandboxRequest(
+                name="",
+                workload=openshell_pb2.SandboxWorkloadConfig(),
+                policy=policy,
+            )
+        )
 
     assert exc_info.value.code() == grpc.StatusCode.INVALID_ARGUMENT
     assert "traversal" in exc_info.value.details().lower()
@@ -112,11 +120,15 @@ def test_create_sandbox_rejects_overly_broad_paths(
         landlock=_SAFE_LANDLOCK,
         process=_SAFE_PROCESS,
     )
-    spec = datamodel_pb2.SandboxSpec(policy=policy)
-
     stub = sandbox_client._stub
     with pytest.raises(grpc.RpcError) as exc_info:
-        stub.CreateSandbox(openshell_pb2.CreateSandboxRequest(name="", spec=spec))
+        stub.CreateSandbox(
+            openshell_pb2.CreateSandboxRequest(
+                name="",
+                workload=openshell_pb2.SandboxWorkloadConfig(),
+                policy=policy,
+            )
+        )
 
     assert exc_info.value.code() == grpc.StatusCode.INVALID_ARGUMENT
     assert "broad" in exc_info.value.details().lower()
