@@ -14,7 +14,7 @@ use hyper::{Method, Response, StatusCode};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto::Builder;
 use miette::{IntoDiagnostic, Result};
-use oauth2::basic::BasicClient;
+use oauth2::basic::{BasicClient, BasicTokenResponse};
 use oauth2::{
     AuthType, AuthUrl, AuthorizationCode, ClientId, ClientSecret, CsrfToken, PkceCodeChallenge,
     RedirectUrl, Scope, TokenResponse, TokenUrl,
@@ -371,14 +371,14 @@ pub async fn oidc_device_code_flow(
         let status = poll_resp.status();
 
         if status.is_success() {
-            // Success! Parse the token response
-            let token_response: serde_json::Value = poll_resp.json().await.into_diagnostic()?;
+            // A successful HTTP status is not sufficient: require a valid OAuth
+            // token response before persisting credentials.
+            let token_response: BasicTokenResponse = poll_resp
+                .json()
+                .await
+                .map_err(|error| miette::miette!("invalid device token response: {error}"))?;
 
-            return Ok(bundle_from_device_token_response(
-                &token_response,
-                issuer,
-                client_id,
-            ));
+            return bundle_from_device_token_response(&token_response, issuer, client_id);
         }
 
         // Parse error response
@@ -509,7 +509,7 @@ pub async fn ensure_valid_oidc_token(gateway_name: &str, insecure: bool) -> Resu
 // ── Helpers ──────────────────────────────────────────────────────────
 
 fn bundle_from_oauth2_response(
-    resp: &oauth2::basic::BasicTokenResponse,
+    resp: &BasicTokenResponse,
     issuer: &str,
     client_id: &str,
 ) -> OidcTokenBundle {
@@ -528,26 +528,17 @@ fn bundle_from_oauth2_response(
 }
 
 fn bundle_from_device_token_response(
-    resp: &serde_json::Value,
+    resp: &BasicTokenResponse,
     issuer: &str,
     client_id: &str,
-) -> OidcTokenBundle {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-
-    let access_token = resp["access_token"].as_str().unwrap_or("").to_string();
-    let refresh_token = resp["refresh_token"].as_str().map(String::from);
-    let expires_in = resp["expires_in"].as_u64();
-
-    OidcTokenBundle {
-        access_token,
-        refresh_token,
-        expires_at: expires_in.map(|ei| now + ei),
-        issuer: issuer.to_string(),
-        client_id: client_id.to_string(),
+) -> Result<OidcTokenBundle> {
+    if resp.access_token().secret().trim().is_empty() {
+        return Err(miette::miette!(
+            "invalid device token response: access_token is empty"
+        ));
     }
+
+    Ok(bundle_from_oauth2_response(resp, issuer, client_id))
 }
 
 /// Percent-decode a URL query parameter value.
@@ -878,15 +869,17 @@ mod tests {
     }
 
     #[test]
-    fn bundle_from_device_token_response_complete() {
-        let json = serde_json::json!({
+    fn device_token_response_complete_is_typed() {
+        let response: BasicTokenResponse = serde_json::from_value(serde_json::json!({
             "access_token": "device-access-token",
             "token_type": "Bearer",
             "expires_in": 3600,
             "refresh_token": "device-refresh-token"
-        });
+        }))
+        .unwrap();
         let bundle =
-            bundle_from_device_token_response(&json, "https://issuer.example", "test-client");
+            bundle_from_device_token_response(&response, "https://issuer.example", "test-client")
+                .unwrap();
         assert_eq!(bundle.access_token, "device-access-token");
         assert_eq!(
             bundle.refresh_token.as_deref(),
@@ -898,15 +891,46 @@ mod tests {
     }
 
     #[test]
-    fn bundle_from_device_token_response_minimal() {
-        let json = serde_json::json!({
+    fn device_token_response_minimal_is_typed() {
+        let response: BasicTokenResponse = serde_json::from_value(serde_json::json!({
             "access_token": "device-access-only",
             "token_type": "Bearer"
-        });
+        }))
+        .unwrap();
         let bundle =
-            bundle_from_device_token_response(&json, "https://issuer.example", "test-client");
+            bundle_from_device_token_response(&response, "https://issuer.example", "test-client")
+                .unwrap();
         assert_eq!(bundle.access_token, "device-access-only");
         assert!(bundle.refresh_token.is_none());
         assert!(bundle.expires_at.is_none());
+    }
+
+    #[test]
+    fn device_token_response_requires_access_token() {
+        let result = serde_json::from_value::<BasicTokenResponse>(serde_json::json!({
+            "token_type": "Bearer"
+        }));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn device_token_response_requires_token_type() {
+        let result = serde_json::from_value::<BasicTokenResponse>(serde_json::json!({
+            "access_token": "device-access-token"
+        }));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn device_token_response_rejects_empty_access_token() {
+        let response: BasicTokenResponse = serde_json::from_value(serde_json::json!({
+            "access_token": "",
+            "token_type": "Bearer"
+        }))
+        .unwrap();
+
+        let result =
+            bundle_from_device_token_response(&response, "https://issuer.example", "test-client");
+        assert!(result.is_err());
     }
 }
