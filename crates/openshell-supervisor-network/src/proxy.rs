@@ -59,6 +59,8 @@ const TUNNEL_PROTOCOL_PEEK_POLL: std::time::Duration = std::time::Duration::from
 const TUNNEL_PROTOCOL_PEEK_POLL: std::time::Duration = std::time::Duration::from_millis(1);
 const INFERENCE_LOCAL_HOST: &str = "inference.local";
 const INFERENCE_LOCAL_PORT: u16 = 443;
+const FORWARD_ENCODED_SLASH_REJECTION_DETAIL: &str =
+    "request-target contains an encoded '/' (%2F) which is not allowed on this endpoint";
 #[cfg(target_os = "linux")]
 const SIDECAR_SUPERVISOR_TOPOLOGY: &str = "sidecar";
 
@@ -905,6 +907,41 @@ fn build_forward_parse_error_ocsf_event(path: &str) -> openshell_ocsf::OcsfEvent
         .severity(SeverityId::Low)
         .status(StatusId::Failure)
         .message(format!("FORWARD parse error for {path}"))
+        .build()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_forward_l7_parse_rejection_ocsf_event(
+    peer_addr: SocketAddr,
+    method: &str,
+    host: &str,
+    port: u16,
+    path: &str,
+    binary: &str,
+    pid: &str,
+    ancestors: &str,
+    cmdline: &str,
+    policy: &str,
+    detail: &str,
+) -> openshell_ocsf::OcsfEvent {
+    HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
+        .activity(ActivityId::Other)
+        .action(ActionId::Denied)
+        .disposition(DispositionId::Blocked)
+        .severity(SeverityId::Medium)
+        .status(StatusId::Failure)
+        .http_request(HttpRequest::new(
+            method,
+            OcsfUrl::new("http", host, path, port),
+        ))
+        .dst_endpoint(Endpoint::from_domain(host, port))
+        .src_endpoint(Endpoint::from_ip(peer_addr.ip(), peer_addr.port()))
+        .actor_process(Process::from_bypass(binary, pid, ancestors).with_cmd_line(cmdline))
+        .firewall_rule(policy, "l7")
+        .message(format!(
+            "FORWARD_L7 denied non-canonical request-target for {method} {host}:{port}{path}"
+        ))
+        .status_detail(detail)
         .build()
 }
 
@@ -4448,6 +4485,42 @@ async fn handle_forward_proxy(
             .await?;
             return Ok(());
         };
+        // `canonicalize_options` was built before the matching config was
+        // known, so `allow_encoded_slash` was taken permissively across every
+        // config on this route. Re-check it against the config that actually
+        // matched: the opt-in is per-endpoint, and one endpoint enabling it
+        // must not loosen parsing for the others. Rejecting here yields the
+        // same response the parser would have produced had the option been
+        // scoped correctly from the start.
+        if !l7_config.config.allow_encoded_slash
+            && crate::l7::path::canonical_path_has_encoded_slash(&path)
+        {
+            ocsf_emit!(build_forward_l7_parse_rejection_ocsf_event(
+                workload_addr,
+                method,
+                &host_lc,
+                port,
+                &telemetry_path,
+                &binary_str,
+                &pid_str,
+                &ancestors_str,
+                &cmdline_str,
+                policy_str,
+                FORWARD_ENCODED_SLASH_REJECTION_DETAIL,
+            ));
+            emit_activity_simple(activity_tx, true, "forward_parse_rejection");
+            respond(
+                client,
+                &build_json_error_response(
+                    400,
+                    "Bad Request",
+                    "invalid_request_target",
+                    "request-target must be canonical",
+                ),
+            )
+            .await?;
+            return Ok(());
+        }
         if crate::l7::rest::request_is_h2c_upgrade(&forward_request_bytes) {
             let event = HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
                 .activity(ActivityId::Other)
@@ -6124,6 +6197,42 @@ network_policies:
         assert_eq!(json["status_detail"], reason);
         assert_eq!(json["action"], "Denied");
         assert_eq!(json["disposition"], "Blocked");
+    }
+
+    #[test]
+    fn forward_l7_parse_rejection_ocsf_includes_denial_context() {
+        let event = build_forward_l7_parse_rejection_ocsf_event(
+            "127.0.0.1:45123".parse().unwrap(),
+            "GET",
+            "api.example.com",
+            80,
+            "/admin/x%2Fy",
+            "/usr/bin/curl",
+            "42",
+            "/usr/bin/bash",
+            "curl http://api.example.com/admin/x%2Fy",
+            "allow_api",
+            FORWARD_ENCODED_SLASH_REJECTION_DETAIL,
+        );
+        let json = event.to_json().unwrap();
+
+        assert_eq!(json["class_name"], "HTTP Activity");
+        assert_eq!(json["activity_name"], "Other");
+        assert_eq!(json["action"], "Denied");
+        assert_eq!(json["disposition"], "Blocked");
+        assert_eq!(json["severity"], "Medium");
+        assert_eq!(json["status"], "Failure");
+        assert_eq!(json["http_request"]["http_method"], "GET");
+        assert_eq!(json["http_request"]["url"]["path"], "/admin/x%2Fy");
+        assert_eq!(json["dst_endpoint"]["domain"], "api.example.com");
+        assert_eq!(json["dst_endpoint"]["port"], 80);
+        assert_eq!(json["actor"]["process"]["name"], "/usr/bin/curl");
+        assert_eq!(json["firewall_rule"]["name"], "allow_api");
+        assert_eq!(json["firewall_rule"]["type"], "l7");
+        assert_eq!(
+            json["status_detail"],
+            FORWARD_ENCODED_SLASH_REJECTION_DETAIL
+        );
     }
 
     #[test]
