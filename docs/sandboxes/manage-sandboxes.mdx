@@ -29,6 +29,24 @@ the sandbox without attaching:
 openshell sandbox create --name worker --detach -- ./worker
 ```
 
+By default, the sandbox enters `Error` when its main process exits. Set a
+Kubernetes-style restart policy when the main process should be restarted with
+the sandbox compute resource:
+
+```shell
+openshell sandbox create --name worker --detach --restart-policy on-failure -- ./worker
+```
+
+`never` is the default. `on-failure` restarts only after a nonzero normalized
+exit code, and `always` restarts after every exit. OpenShell applies exponential
+backoff from 10 seconds to 5 minutes and resets the backoff after the main
+process runs successfully for 10 minutes.
+
+A restart replaces the sandbox compute runtime, supervisor, main process, and
+retained PTY history. The sandbox identity and configuration remain stable;
+filesystem persistence follows the selected compute driver's existing
+stop/start behavior. This does not checkpoint or restore process state.
+
 `--upload` cannot yet be combined with a trailing main command because uploads
 finish after the canonical process starts. Create a scratch sandbox, upload the
 files, then launch the workload with `sandbox exec`, or build the files into the
@@ -512,7 +530,8 @@ Every sandbox moves through a defined set of phases:
 | Stopping     | The gateway accepted a stop request and is stopping compute while retaining persistent state.                                                         |
 | Stopped      | Compute is stopped and access is unavailable. The sandbox record and driver-owned persistent workspace remain.                                       |
 | Starting     | Compute is starting. The sandbox becomes usable only after a fresh supervisor session connects.                                                       |
-| Error        | Provisioning failed or the canonical main process exited unexpectedly. Main-process exit is terminal even with exit code 0. Check logs with `openshell logs`.       |
+| Restarting   | The main process exited and its restart policy selected a restart. OpenShell is waiting for backoff or for the new supervisor session.                 |
+| Error        | Provisioning failed, a restart failed terminally, or the main process exited without a selected restart. Check logs with `openshell logs`.              |
 | Deleting     | The sandbox is being torn down. The system releases resources and purges credentials.                                                                          |
 
 The compute backend can become ready before the sandbox supervisor connects to
@@ -522,10 +541,17 @@ After a gateway restart, an existing sandbox can return to `Provisioning`
 temporarily while its supervisor reconnects. Wait for the phase to return to
 `Ready` before you connect to the sandbox or execute commands.
 
-The gateway records a canonical main-process exit as `Ready=False` with reason
-`MainProcessExited`. It also sets `status.exit_code`; signal exits use the
-standard `128 + signal` convention. Compute runtimes do not automatically
-restart that process.
+The gateway records the normalized main-process result in `status.exit_code`;
+signal exits use the standard `128 + signal` convention. If policy selects a
+restart, status also exposes the restart count and next restart deadline while
+the sandbox is `Restarting`. Connect and exec operations remain unavailable
+until the replacement supervisor session returns the sandbox to `Ready`.
+Use `openshell sandbox get <name>` to inspect the policy, most recent exit code,
+restart count, and next attempt time.
+
+`sandbox stop` is an explicit user action and cancels pending restart intent.
+Starting the sandbox again resets its restart count and launches a fresh main
+process generation.
 
 ## Sandbox Compute Drivers
 

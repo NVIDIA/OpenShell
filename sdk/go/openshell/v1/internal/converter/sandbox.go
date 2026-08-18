@@ -46,10 +46,11 @@ func SandboxFromProto(s *pb.Sandbox) *types.Sandbox {
 
 func sandboxSpecFromProto(spec *pb.SandboxSpec) types.SandboxSpec {
 	result := types.SandboxSpec{
-		LogLevel:    spec.GetLogLevel(),
-		Environment: CopyStringMap(spec.GetEnvironment()),
-		Providers:   CopyStringSlice(spec.GetProviders()),
-		Policy:      SandboxPolicyFromProto(spec.GetPolicy()),
+		LogLevel:      spec.GetLogLevel(),
+		Environment:   CopyStringMap(spec.GetEnvironment()),
+		Providers:     CopyStringSlice(spec.GetProviders()),
+		Policy:        SandboxPolicyFromProto(spec.GetPolicy()),
+		RestartPolicy: SandboxRestartPolicyFromProto(spec.GetRestartPolicy()),
 	}
 
 	if tmpl := spec.GetTemplate(); tmpl != nil {
@@ -102,6 +103,9 @@ func sandboxStatusFromProto(status *pb.SandboxStatus) types.SandboxStatus {
 		})
 	}
 	result.ExitCode = CopyInt32Ptr(status.ExitCode)
+	result.RestartCount = status.GetRestartCount()
+	result.NextRestartAtMs = status.GetNextRestartAtMs()
+	result.MainProcessStartedAtMs = status.GetMainProcessStartedAtMs()
 
 	return result
 }
@@ -125,6 +129,8 @@ func SandboxPhaseFromProto(phase pb.SandboxPhase) types.SandboxPhase {
 		return types.SandboxStopped
 	case pb.SandboxPhase_SANDBOX_PHASE_STARTING:
 		return types.SandboxStarting
+	case pb.SandboxPhase_SANDBOX_PHASE_RESTARTING:
+		return types.SandboxRestarting
 	default:
 		return types.SandboxUnknown
 	}
@@ -149,6 +155,8 @@ func SandboxPhaseToProto(phase types.SandboxPhase) pb.SandboxPhase {
 		return pb.SandboxPhase_SANDBOX_PHASE_STOPPED
 	case types.SandboxStarting:
 		return pb.SandboxPhase_SANDBOX_PHASE_STARTING
+	case types.SandboxRestarting:
+		return pb.SandboxPhase_SANDBOX_PHASE_RESTARTING
 	default:
 		return pb.SandboxPhase_SANDBOX_PHASE_UNKNOWN
 	}
@@ -225,8 +233,33 @@ func SandboxSpecToProto(spec *types.SandboxSpec) *pb.SandboxSpec {
 
 	result.Command = CopyStringSlice(spec.Command)
 	result.Tty = spec.TTY
+	result.RestartPolicy = SandboxRestartPolicyToProto(spec.RestartPolicy)
 
 	return result
+}
+
+// SandboxRestartPolicyFromProto converts the restart policy to the curated SDK type.
+func SandboxRestartPolicyFromProto(policy pb.SandboxRestartPolicy) types.SandboxRestartPolicy {
+	switch policy {
+	case pb.SandboxRestartPolicy_SANDBOX_RESTART_POLICY_ON_FAILURE:
+		return types.SandboxRestartOnFailure
+	case pb.SandboxRestartPolicy_SANDBOX_RESTART_POLICY_ALWAYS:
+		return types.SandboxRestartAlways
+	default:
+		return types.SandboxRestartNever
+	}
+}
+
+// SandboxRestartPolicyToProto converts the curated SDK restart policy to protobuf.
+func SandboxRestartPolicyToProto(policy types.SandboxRestartPolicy) pb.SandboxRestartPolicy {
+	switch policy {
+	case types.SandboxRestartOnFailure:
+		return pb.SandboxRestartPolicy_SANDBOX_RESTART_POLICY_ON_FAILURE
+	case types.SandboxRestartAlways:
+		return pb.SandboxRestartPolicy_SANDBOX_RESTART_POLICY_ALWAYS
+	default:
+		return pb.SandboxRestartPolicy_SANDBOX_RESTART_POLICY_NEVER
+	}
 }
 
 // SandboxSpecToProtoChecked converts an SDK SandboxSpec and reports values

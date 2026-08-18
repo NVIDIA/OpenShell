@@ -481,7 +481,11 @@ engine with a gateway policy revision.
   re-evaluate.
 - If the supervisor relay drops, the sandbox can keep running, but connect and
   exec operations fail until the supervisor registers again.
-- If the canonical main process exits, including with code 0, the supervisor
-  reports its normalized exit code before shutdown. The gateway persists the
-  code on sandbox status, records `MainProcessExited`, and makes the sandbox
-  terminal `Error`; runtime restart policies must not replace the process.
+- If the canonical main process exits, the supervisor reports its normalized
+  exit code before shutdown. The gateway persists the result and evaluates the
+  sandbox's `Never`, `OnFailure`, or `Always` restart policy. A selected restart
+  moves the sandbox to `Restarting` and recreates its compute resource after
+  bounded exponential backoff; otherwise the sandbox becomes terminal `Error`.
+- Compute runtimes keep their native restart mechanisms disabled. This gives
+  the gateway one durable restart counter, deadline, and policy decision across
+  Docker, Podman, Kubernetes, and VM drivers.

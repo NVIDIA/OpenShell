@@ -79,6 +79,7 @@ The container spec in `container.rs` sets these security-critical fields:
 | `cap_drop` | Selected unneeded defaults | Podman's default capability set is already restricted. The driver drops capabilities the supervisor does not need. |
 | `cap_add` | `SYS_ADMIN`, `NET_ADMIN`, `SYS_PTRACE`, `SYSLOG`, `DAC_READ_SEARCH`, `SETPCAP` | Grants supervisor-only capabilities required for namespace setup, process identity, bypass diagnostics, and child bounding-set cleanup. Policy DNS binds an unprivileged supervisor port and does not require `NET_BIND_SERVICE`. |
 | `no_new_privileges` | `true` | Prevents privilege escalation after exec. |
+| `restart_policy` | `no` | Keeps the gateway authoritative for canonical-main restart decisions. |
 | `seccomp_profile_path` | `unconfined` | The supervisor installs its own policy-aware BPF filter. A container-level profile can block Landlock/seccomp syscalls during setup. |
 | `mounts` | Private tmpfs at `/run/netns` | Lets the supervisor create named network namespaces in rootless Podman. |
 | CDI GPU devices | Opaque `driver_config.cdi_devices` values when set, otherwise the requested count of NVIDIA CDI GPUs selected in round-robin order. Local `/dev/dxg` permits `nvidia.com/gpu=all` as a WSL2 all-only compatibility fallback, where it counts as one selectable device. | Exposes requested GPUs to GPU-enabled sandbox containers. Exact CDI device lists must not contain duplicates and must match the effective GPU count. |

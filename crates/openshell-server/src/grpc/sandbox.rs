@@ -27,7 +27,9 @@ use openshell_core::proto::{
     TcpForwardFrame, TcpForwardInit, TcpRelayTarget, WatchSandboxRequest, relay_open,
     tcp_forward_init,
 };
-use openshell_core::proto::{Sandbox, SandboxPhase, SandboxTemplate, SshSession};
+use openshell_core::proto::{
+    Sandbox, SandboxPhase, SandboxRestartPolicy, SandboxTemplate, SshSession,
+};
 use openshell_core::telemetry::{
     LifecycleOperation, LifecycleResource, SandboxTemplateSource, TelemetryComputeDriver,
     TelemetryOutcome,
@@ -141,6 +143,14 @@ pub(super) async fn fetch_and_authorize_sandbox(
     Ok(sandbox)
 }
 
+fn require_ready_sandbox(sandbox: &Sandbox) -> Result<(), Status> {
+    match SandboxPhase::try_from(sandbox.phase()).ok() {
+        Some(SandboxPhase::Ready) => Ok(()),
+        Some(SandboxPhase::Restarting) => Err(Status::failed_precondition("sandbox is restarting")),
+        _ => Err(Status::failed_precondition("sandbox is not ready")),
+    }
+}
+
 fn generate_routable_name() -> String {
     let name = petname::petname(2, "-").unwrap_or_else(generate_name);
     let mut truncated = &name[..name.len().min(MAX_ROUTABLE_NAME_LEN)];
@@ -226,6 +236,9 @@ async fn handle_create_sandbox_inner(
     if spec.command.is_empty() {
         spec.command = vec!["/bin/bash".to_string(), "-l".to_string()];
         spec.tty = true;
+    }
+    if spec.restart_policy == SandboxRestartPolicy::Unspecified as i32 {
+        spec.restart_policy = SandboxRestartPolicy::Never as i32;
     }
 
     // Validate field sizes before any I/O (fail fast on oversized payloads).
@@ -1206,9 +1219,7 @@ pub(super) async fn handle_exec_sandbox(
 
     let sandbox = fetch_and_authorize_sandbox(state, &principal, &req.sandbox_id).await?;
 
-    if SandboxPhase::try_from(sandbox.phase()).ok() != Some(SandboxPhase::Ready) {
-        return Err(Status::failed_precondition("sandbox is not ready"));
-    }
+    require_ready_sandbox(&sandbox)?;
 
     // Open a relay channel through the supervisor session. Use a 15s
     // session-wait timeout, enough to cover a transient supervisor reconnect
@@ -1316,9 +1327,7 @@ pub(super) async fn handle_forward_tcp(
 
     let sandbox = fetch_and_authorize_sandbox(state, &principal, &init.sandbox_id).await?;
 
-    if SandboxPhase::try_from(sandbox.phase()).ok() != Some(SandboxPhase::Ready) {
-        return Err(Status::failed_precondition("sandbox is not ready"));
-    }
+    require_ready_sandbox(&sandbox)?;
 
     let connection_guard = acquire_forward_connection_guard(state, &init, &sandbox).await?;
     let (channel_id, relay_rx) = state
@@ -1638,9 +1647,7 @@ pub(super) async fn handle_exec_sandbox_interactive(
 
     let sandbox = fetch_and_authorize_sandbox(state, &principal, &req.sandbox_id).await?;
 
-    if SandboxPhase::try_from(sandbox.phase()).ok() != Some(SandboxPhase::Ready) {
-        return Err(Status::failed_precondition("sandbox is not ready"));
-    }
+    require_ready_sandbox(&sandbox)?;
 
     let (channel_id, relay_rx) = state
         .supervisor_sessions
@@ -1709,9 +1716,7 @@ pub(super) async fn handle_create_ssh_session(
 
     let sandbox = fetch_and_authorize_sandbox(state, &principal, &req.sandbox_id).await?;
 
-    if SandboxPhase::try_from(sandbox.phase()).ok() != Some(SandboxPhase::Ready) {
-        return Err(Status::failed_precondition("sandbox is not ready"));
-    }
+    require_ready_sandbox(&sandbox)?;
 
     let token = uuid::Uuid::new_v4().to_string();
     let now_ms = current_time_ms();
@@ -3450,6 +3455,10 @@ mod tests {
         .into_inner();
 
         let created = response.sandbox.expect("created sandbox");
+        assert_eq!(
+            created.spec.as_ref().unwrap().restart_policy(),
+            SandboxRestartPolicy::Never
+        );
         assert_eq!(
             created
                 .metadata

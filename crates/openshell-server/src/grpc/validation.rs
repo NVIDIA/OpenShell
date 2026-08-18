@@ -154,6 +154,13 @@ pub(super) fn validate_sandbox_spec(
     name: &str,
     spec: &openshell_core::proto::SandboxSpec,
 ) -> Result<(), Status> {
+    openshell_core::proto::SandboxRestartPolicy::try_from(spec.restart_policy).map_err(|_| {
+        Status::invalid_argument(format!(
+            "spec.restart_policy has unknown value {}",
+            spec.restart_policy
+        ))
+    })?;
+
     // --- request.name ---
     if !name.is_empty() && name.len() > MAX_ROUTABLE_NAME_LEN {
         return Err(Status::invalid_argument(format!(
@@ -1037,6 +1044,17 @@ mod tests {
     #[test]
     fn validate_sandbox_spec_accepts_empty_defaults() {
         assert!(validate_sandbox_spec("", &default_spec()).is_ok());
+    }
+
+    #[test]
+    fn validate_sandbox_spec_rejects_unknown_restart_policy() {
+        let spec = SandboxSpec {
+            restart_policy: 99,
+            ..Default::default()
+        };
+        let err = validate_sandbox_spec("", &spec).unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("restart_policy"));
     }
 
     #[test]

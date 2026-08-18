@@ -31,6 +31,7 @@ func TestConverterCoversAllProtoFields_SandboxSpec(t *testing.T) {
 		"resource_requirements": true,
 		"command":               true,
 		"tty":                   true,
+		"restart_policy":        true,
 	}
 
 	assertAllFieldsCovered(t, (&pb.SandboxSpec{}).ProtoReflect().Descriptor(), handled, nil)
@@ -54,14 +55,17 @@ func TestConverterCoversAllProtoFields_SandboxTemplate(t *testing.T) {
 
 func TestConverterCoversAllProtoFields_SandboxStatus(t *testing.T) {
 	handled := fieldSet{
-		"sandbox_name":           true,
-		"agent_pod":              true,
-		"agent_fd":               true,
-		"sandbox_fd":             true,
-		"phase":                  true,
-		"conditions":             true,
-		"current_policy_version": true,
-		"exit_code":              true,
+		"sandbox_name":               true,
+		"agent_pod":                  true,
+		"agent_fd":                   true,
+		"sandbox_fd":                 true,
+		"phase":                      true,
+		"conditions":                 true,
+		"current_policy_version":     true,
+		"exit_code":                  true,
+		"restart_count":              true,
+		"next_restart_at_ms":         true,
+		"main_process_started_at_ms": true,
 	}
 	// The instance ID is an internal gateway/supervisor fencing token exposed
 	// only through the raw protobuf API.
