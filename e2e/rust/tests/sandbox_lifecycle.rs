@@ -14,6 +14,7 @@ use tokio::time::{Instant, sleep};
 
 const SANDBOX_PRESENCE_TIMEOUT: Duration = Duration::from_secs(30);
 const SANDBOX_LIST_POLL_INTERVAL: Duration = Duration::from_millis(500);
+const SANDBOX_RESTART_TIMEOUT: Duration = Duration::from_secs(60);
 
 fn normalize_output(output: &str) -> String {
     let stripped = strip_ansi(output).replace('\r', "");
@@ -125,6 +126,26 @@ async fn run_sandbox_lifecycle_command(operation: &str, name: &str) -> String {
     assert!(
         output.status.success(),
         "sandbox {operation} should succeed (exit {:?}):\n{combined}",
+        output.status.code(),
+    );
+    combined
+}
+
+async fn sandbox_details(name: &str) -> String {
+    let mut cmd = openshell_cmd();
+    cmd.args(["sandbox", "get", name])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let output = cmd.output().await.expect("spawn openshell sandbox get");
+    let combined = normalize_output(&format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    ));
+    assert!(
+        output.status.success(),
+        "sandbox get should succeed (exit {:?}):\n{combined}",
         output.status.code(),
     );
     combined
@@ -418,6 +439,71 @@ async fn canonical_main_disconnect_reconnect_replays_history_for_same_process() 
         .wait()
         .await
         .expect("wait for reconnect disconnect");
+    sandbox.cleanup().await;
+}
+
+#[tokio::test]
+async fn on_failure_policy_replaces_runtime_and_preserves_workspace() {
+    const FIRST_MARKER: &str = "initial-main-ready";
+    const SCRIPT: &str = r#"
+marker=/sandbox/.openshell-restart-e2e
+if [ -e "$marker" ]; then
+  printf 'replacement-%s\n' "$(cat /proc/sys/kernel/random/uuid)" > /sandbox/replacement-run
+  printf 'replacement-main-ready\n'
+  sleep 300
+else
+  touch "$marker"
+  printf 'initial-%s\n' "$(cat /proc/sys/kernel/random/uuid)" > /sandbox/initial-run
+  printf 'initial-main-ready\n'
+  sleep 2
+  exit 17
+fi
+"#;
+
+    let mut sandbox = SandboxGuard::create_keep_with_args(
+        &["--restart-policy", "on-failure"],
+        &["sh", "-lc", SCRIPT],
+        FIRST_MARKER,
+    )
+    .await
+    .expect("create sandbox with OnFailure restart policy");
+
+    let deadline = Instant::now() + SANDBOX_RESTART_TIMEOUT;
+    let mut observed_restarting = false;
+    let final_details = loop {
+        let details = sandbox_details(&sandbox.name).await;
+        observed_restarting |= details.contains("Phase: Restarting");
+        if observed_restarting
+            && details.contains("Phase: Ready")
+            && details.contains("Restart count: 1")
+        {
+            break details;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "sandbox did not complete its policy-driven restart within \
+             {SANDBOX_RESTART_TIMEOUT:?}; last details:\n{details}"
+        );
+        sleep(Duration::from_millis(250)).await;
+    };
+
+    assert!(
+        final_details.contains("Restart policy: on-failure"),
+        "restart policy should remain visible after replacement:\n{final_details}"
+    );
+    let runs = sandbox
+        .exec(&["cat", "/sandbox/initial-run", "/sandbox/replacement-run"])
+        .await
+        .expect("replacement sandbox should retain the first run's workspace");
+    assert!(
+        runs.contains("initial-"),
+        "missing initial run marker:\n{runs}"
+    );
+    assert!(
+        runs.contains("replacement-"),
+        "missing replacement run marker:\n{runs}"
+    );
+
     sandbox.cleanup().await;
 }
 

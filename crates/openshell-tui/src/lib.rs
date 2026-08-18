@@ -2690,6 +2690,7 @@ fn phase_label(phase: i32) -> String {
         x if x == SandboxPhase::Stopping as i32 => "Stopping",
         x if x == SandboxPhase::Stopped as i32 => "Stopped",
         x if x == SandboxPhase::Starting as i32 => "Starting",
+        x if x == SandboxPhase::Restarting as i32 => "Restarting",
         _ => "Unknown",
     }
     .to_string()
@@ -2728,6 +2729,7 @@ mod phase_label_tests {
         assert_eq!(phase_label(SandboxPhase::Stopping as i32), "Stopping");
         assert_eq!(phase_label(SandboxPhase::Stopped as i32), "Stopped");
         assert_eq!(phase_label(SandboxPhase::Starting as i32), "Starting");
+        assert_eq!(phase_label(SandboxPhase::Restarting as i32), "Restarting");
     }
 }
 

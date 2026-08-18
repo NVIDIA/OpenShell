@@ -224,6 +224,8 @@ struct ContainerSpec {
     /// File-mounted Podman secrets.
     secrets: Vec<SecretMount>,
     stop_timeout: u32,
+    /// Native restart stays disabled; the gateway owns sandbox restart policy.
+    restart_policy: String,
     /// Extra /etc/hosts entries. Used to inject `host.containers.internal`
     /// via Podman's `host-gateway` magic so sandbox containers can reach
     /// the gateway server running on the host in rootless mode.
@@ -1225,6 +1227,7 @@ pub fn build_container_spec_for_image(
             secrets
         },
         stop_timeout: config.stop_timeout_secs,
+        restart_policy: "no".to_string(),
         // Inject stable host aliases into /etc/hosts so sandbox containers can
         // reach services on the host. `host.openshell.internal` is the driver-
         // neutral alias used by policies and e2e tests.
@@ -2740,6 +2743,12 @@ mod tests {
         let mut config = test_config();
         config.host_gateway_ip = "192.168.127.254".to_string();
         let spec = build_container_spec(&sandbox, &config);
+
+        assert_eq!(
+            spec["restart_policy"].as_str(),
+            Some("no"),
+            "the gateway owns sandbox restart policy"
+        );
 
         let hostadd: Vec<&str> = spec["hostadd"]
             .as_array()

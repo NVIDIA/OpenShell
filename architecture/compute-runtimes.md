@@ -37,6 +37,13 @@ Canonical main-process support is part of the `ComputeDriver` contract. Every
 in-tree and extension driver must forward the exact specification; it is not an
 optional capability that drivers can omit or negotiate.
 
+The gateway also owns canonical main-process restart policy. Drivers disable
+native container, pod, or VM restart behavior and implement the existing stop
+and start operations. When policy selects a restart, the gateway persists the
+`Restarting` phase and backoff deadline, stops compute, starts it again after
+the deadline, and waits for a new supervisor session before returning to
+`Ready`. Driver snapshots cannot override that gateway-owned transition.
+
 Drivers own runtime-specific platform event interpretation. When an event should
 drive client provisioning UI, the driver attaches the shared
 `openshell.progress.*` metadata defined in `openshell-core` instead of requiring

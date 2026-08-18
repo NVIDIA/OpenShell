@@ -57,18 +57,22 @@ func TestSandboxFromProto(t *testing.T) {
 					Count: &gpuCount,
 				},
 			},
-			Command: []string{"/opt/agent", "--serve"},
-			Tty:     false,
+			Command:       []string{"/opt/agent", "--serve"},
+			Tty:           false,
+			RestartPolicy: pb.SandboxRestartPolicy_SANDBOX_RESTART_POLICY_ON_FAILURE,
 		},
 		Status: &pb.SandboxStatus{
-			SandboxName:           "sb-compute-1",
-			AgentPod:              "agent-pod-xyz",
-			AgentFd:               "fd-agent",
-			SandboxFd:             "fd-sandbox",
-			Phase:                 pb.SandboxPhase_SANDBOX_PHASE_READY,
-			CurrentPolicyVersion:  7,
-			MainProcessInstanceId: "instance-1",
-			ExitCode:              &exitCode,
+			SandboxName:            "sb-compute-1",
+			AgentPod:               "agent-pod-xyz",
+			AgentFd:                "fd-agent",
+			SandboxFd:              "fd-sandbox",
+			Phase:                  pb.SandboxPhase_SANDBOX_PHASE_READY,
+			CurrentPolicyVersion:   7,
+			MainProcessInstanceId:  "instance-1",
+			ExitCode:               &exitCode,
+			RestartCount:           3,
+			NextRestartAtMs:        1700000070000,
+			MainProcessStartedAtMs: 1700000010000,
 			Conditions: []*pb.SandboxCondition{
 				{
 					Type:               "Ready",
@@ -102,6 +106,7 @@ func TestSandboxFromProto(t *testing.T) {
 	assert.Equal(t, uint32(2), *s.Spec.GPUCount)
 	assert.Equal(t, []string{"/opt/agent", "--serve"}, s.Spec.Command)
 	assert.False(t, s.Spec.TTY)
+	assert.Equal(t, v1.SandboxRestartOnFailure, s.Spec.RestartPolicy)
 
 	// Template
 	require.NotNil(t, s.Spec.Template)
@@ -134,6 +139,9 @@ func TestSandboxFromProto(t *testing.T) {
 	assert.Equal(t, "2024-01-01T00:00:00Z", s.Status.Conditions[0].LastTransitionTime)
 	require.NotNil(t, s.Status.ExitCode)
 	assert.Equal(t, int32(0), *s.Status.ExitCode)
+	assert.Equal(t, uint32(3), s.Status.RestartCount)
+	assert.Equal(t, int64(1700000070000), s.Status.NextRestartAtMs)
+	assert.Equal(t, int64(1700000010000), s.Status.MainProcessStartedAtMs)
 }
 
 func TestSandboxFromProto_TemplateResourcesDeepCopy(t *testing.T) {
