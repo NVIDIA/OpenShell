@@ -188,6 +188,12 @@ placeholders. A later `provider refresh configure` call is an explicit
 reauthorization boundary: it revokes the previous handle, and processes holding
 that handle fail closed until restarted.
 
+While gateway-managed refresh is configured, `provider update --credential`
+cannot replace or delete the refresh-owned primary credential or any co-minted
+output. Use `provider refresh rotate`, reconfigure refresh, or delete refresh
+before returning those keys to manual management. Unrelated provider fields
+remain updateable.
+
 ---
 
 ## Workflow 3: Sandbox Lifecycle

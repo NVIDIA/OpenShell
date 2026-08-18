@@ -305,6 +305,46 @@ pub(super) async fn update_provider_record_with_catalog(
     update_provider_record_validating(store, workspace, catalog, provider, None).await
 }
 
+async fn reject_refresh_owned_credential_updates(
+    store: &Store,
+    provider_id: &str,
+    credential_updates: &HashMap<String, String>,
+) -> Result<(), Status> {
+    if credential_updates.is_empty() {
+        return Ok(());
+    }
+
+    let mut refresh_owned_keys = HashSet::new();
+    for refresh_state in
+        crate::provider_refresh::list_refresh_states_for_provider(store, provider_id).await?
+    {
+        let strategy =
+            ProviderCredentialRefreshStrategy::try_from(refresh_state.strategy).unwrap_or_default();
+        if !crate::provider_refresh::is_gateway_mintable_strategy(strategy) {
+            continue;
+        }
+
+        for key in std::iter::once(refresh_state.credential_key)
+            .chain(refresh_state.additional_output_keys.into_values())
+        {
+            if credential_updates.contains_key(&key) {
+                refresh_owned_keys.insert(key);
+            }
+        }
+    }
+
+    if refresh_owned_keys.is_empty() {
+        return Ok(());
+    }
+
+    let mut refresh_owned_keys: Vec<_> = refresh_owned_keys.into_iter().collect();
+    refresh_owned_keys.sort();
+    Err(Status::failed_precondition(format!(
+        "credentials managed by provider refresh cannot be updated or deleted with provider update: {}; use provider refresh rotate, configure, or delete",
+        refresh_owned_keys.join(", ")
+    )))
+}
+
 async fn update_provider_record_validating(
     store: &Store,
     workspace: &str,
@@ -351,6 +391,9 @@ async fn update_provider_record_validating(
             "provider.credential_handles is internal gateway state and cannot be supplied",
         ));
     }
+
+    reject_refresh_owned_credential_updates(store, existing.object_id(), &provider.credentials)
+        .await?;
 
     let current_version = existing.metadata.as_ref().map_or(0, |m| m.resource_version);
 
@@ -8073,8 +8116,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn refresh_managed_handle_survives_rotation_and_reconstruction_then_reconfigure_revokes()
-    {
+    async fn refresh_managed_handle_rejects_manual_replacement_survives_rotation_and_reconstruction_then_reconfigure_revokes()
+     {
         let state = test_server_state().await;
         let mut profile = custom_profile("stable-refresh-provider");
         profile.credentials = vec![refreshable_credential("access_token", "ACCESS_TOKEN")];
@@ -8174,21 +8217,84 @@ mod tests {
             .unwrap();
         let original_placeholder = credential_state.snapshot().child_env["ACCESS_TOKEN"].clone();
 
-        update_provider_record_with_catalog(
-            state.store.as_ref(),
-            &catalog,
-            "default",
-            Provider {
-                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
-                    name: "stable-refresh".to_string(),
-                    ..Default::default()
+        for value in ["token-2", ""] {
+            let err = handle_update_provider(
+                &state,
+                authed_request(UpdateProviderRequest {
+                    provider: Some(Provider {
+                        metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                            name: "stable-refresh".to_string(),
+                            ..Default::default()
+                        }),
+                        credentials: HashMap::from([(
+                            "ACCESS_TOKEN".to_string(),
+                            value.to_string(),
+                        )]),
+                        ..Default::default()
+                    }),
+                    credential_expires_at_ms: HashMap::new(),
+                    workspace: "default".to_string(),
                 }),
-                credentials: HashMap::from([("ACCESS_TOKEN".to_string(), "token-2".to_string())]),
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap();
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(err.code(), Code::FailedPrecondition);
+            assert!(err.message().contains("provider refresh"));
+            assert!(err.message().contains("ACCESS_TOKEN"));
+        }
+
+        let unchanged = state
+            .store
+            .get_message_by_name::<Provider>("default", "stable-refresh")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(unchanged.credentials["ACCESS_TOKEN"], "token-1");
+        let unchanged_records =
+            load_provider_environment_records(state.store.as_ref(), "default", &names)
+                .await
+                .unwrap();
+        let unchanged_environment =
+            resolve_provider_environment_from_records_with_policy_bindings_and_credentials(
+                state.store.as_ref(),
+                &catalog,
+                &unchanged_records,
+                &HashMap::new(),
+                &state.credentials,
+                Some("sandbox-id"),
+            )
+            .await
+            .unwrap();
+        credential_state
+            .install_bound_environment(
+                revision_1,
+                unchanged_environment.environment,
+                unchanged_environment.credential_expires_at_ms,
+                unchanged_environment.dynamic_credentials,
+                unchanged_environment.static_credential_bindings,
+                Vec::new(),
+            )
+            .unwrap();
+        assert_eq!(
+            credential_state
+                .resolver_for_endpoint("api.example.com", 443, "/v1/messages")
+                .unwrap()
+                .resolve_placeholder(&original_placeholder),
+            Some("token-1")
+        );
+
+        // The gateway refresh path owns credential rotation and writes the
+        // minted value with an internal CAS, preserving the authorization
+        // epoch and therefore the workload handle.
+        state
+            .store
+            .update_message_cas::<Provider, _>(provider.object_id(), 0, |current| {
+                current
+                    .credentials
+                    .insert("ACCESS_TOKEN".to_string(), "token-2".to_string());
+            })
+            .await
+            .unwrap();
         let records = load_provider_environment_records(state.store.as_ref(), "default", &names)
             .await
             .unwrap();
@@ -10539,6 +10645,106 @@ mod tests {
             stored.additional_output_keys.get("session_token"),
             Some(&"AWS_SESSION_TOKEN".to_string())
         );
+    }
+
+    #[tokio::test]
+    async fn update_provider_rejects_gateway_refresh_primary_and_additional_output_keys() {
+        use crate::grpc::policy::set_global_bool_setting_for_test;
+
+        let state = test_server_state().await;
+        set_global_bool_setting_for_test(
+            state.store.as_ref(),
+            openshell_core::settings::PROVIDERS_V2_ENABLED_KEY,
+            true,
+        )
+        .await
+        .unwrap();
+
+        let original_credentials = HashMap::from([
+            (
+                "AWS_ACCESS_KEY_ID".to_string(),
+                "original-access-key".to_string(),
+            ),
+            (
+                "AWS_SECRET_ACCESS_KEY".to_string(),
+                "original-secret-key".to_string(),
+            ),
+            (
+                "AWS_SESSION_TOKEN".to_string(),
+                "original-session-token".to_string(),
+            ),
+        ]);
+        let provider = create_provider_record(
+            state.store.as_ref(),
+            "default",
+            Provider {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    name: "aws-update-guard".to_string(),
+                    workspace: "default".to_string(),
+                    ..Default::default()
+                }),
+                r#type: "aws".to_string(),
+                credentials: original_credentials.clone(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        handle_configure_provider_refresh(
+            &state,
+            authed_request(ConfigureProviderRefreshRequest {
+                provider: "aws-update-guard".to_string(),
+                credential_key: "AWS_ACCESS_KEY_ID".to_string(),
+                strategy: ProviderCredentialRefreshStrategy::AwsStsAssumeRole as i32,
+                material: HashMap::from([(
+                    "role_arn".to_string(),
+                    "arn:aws:iam::123456789012:role/Test".to_string(),
+                )]),
+                secret_material_keys: Vec::new(),
+                expires_at_ms: None,
+                workspace: "default".to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+
+        for key in [
+            "AWS_ACCESS_KEY_ID",
+            "AWS_SECRET_ACCESS_KEY",
+            "AWS_SESSION_TOKEN",
+        ] {
+            for value in ["replacement", ""] {
+                let err = handle_update_provider(
+                    &state,
+                    authed_request(UpdateProviderRequest {
+                        provider: Some(Provider {
+                            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                                name: "aws-update-guard".to_string(),
+                                ..Default::default()
+                            }),
+                            credentials: HashMap::from([(key.to_string(), value.to_string())]),
+                            ..Default::default()
+                        }),
+                        credential_expires_at_ms: HashMap::new(),
+                        workspace: "default".to_string(),
+                    }),
+                )
+                .await
+                .unwrap_err();
+                assert_eq!(err.code(), Code::FailedPrecondition);
+                assert!(err.message().contains("provider refresh"));
+                assert!(err.message().contains(key));
+            }
+        }
+
+        let unchanged = state
+            .store
+            .get_message::<Provider>(provider.object_id())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(unchanged.credentials, original_credentials);
     }
 
     #[tokio::test]

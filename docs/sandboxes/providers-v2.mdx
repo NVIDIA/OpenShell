@@ -625,6 +625,14 @@ so running workloads keep the same opaque credential handle while the short-live
 token changes. Configuring refresh again is a revocation boundary and causes
 running workloads that still hold the previous handle to fail closed.
 
+While gateway-managed refresh is configured, `provider update --credential`
+cannot replace or delete its primary credential or any co-minted output. Use
+`provider refresh rotate` to mint a new short-lived value. Re-run
+`provider refresh configure` to start a new authorization, or use
+`provider refresh delete` before returning those credential keys to manual
+management. You can still update unrelated credentials, configuration, and
+credential expiry metadata.
+
 For a complete Microsoft Graph OAuth2 refresh-token walkthrough, see [Refresh Microsoft Graph Credentials with Providers v2](/get-started/tutorials/microsoft-graph-provider-refresh).
 
 The profile YAML strategy values use underscores, while the CLI `--strategy` values use kebab-case:

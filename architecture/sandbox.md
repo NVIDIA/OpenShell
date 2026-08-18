@@ -94,8 +94,10 @@ rotates the short-lived value, so an already-running process keeps one
 placeholder and each request resolves against the current token. Explicit
 refresh reconfiguration, provider replacement or detachment, and endpoint
 boundary changes produce a new handle and revoke the old one. Supervisors do
-not retain old values for these handles. Unmanaged static credentials retain
-the bounded revision-generation behavior.
+not retain old values for these handles. Public provider updates cannot replace
+or delete the refresh-owned primary credential or co-minted outputs; internal
+CAS rotation and explicit refresh lifecycle operations own those values.
+Unmanaged static credentials retain the bounded revision-generation behavior.
 
 Route selection and policy evaluation use a syntax-only redacted request target;
 they do not materialize real credentials. Cross-endpoint placeholder use returns
