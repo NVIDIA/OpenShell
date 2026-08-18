@@ -28,6 +28,7 @@ type mockSandboxServer struct {
 	sandboxes          map[string]*pb.Sandbox
 	providers          map[string][]*dm.Provider
 	createErr          error
+	lastCreate         *pb.CreateSandboxRequest
 	getErr             error
 	listErr            error
 	deleteErr          error
@@ -59,6 +60,7 @@ func (s *mockSandboxServer) CreateSandbox(_ context.Context, req *pb.CreateSandb
 	if s.createErr != nil {
 		return nil, s.createErr
 	}
+	s.lastCreate = proto.Clone(req).(*pb.CreateSandboxRequest)
 	spec := &pb.SandboxSpec{
 		Workload:  req.GetWorkload(),
 		Policy:    req.GetPolicy(),
@@ -253,13 +255,11 @@ func TestSandboxCreate(t *testing.T) {
 	client, cleanup := setupSandboxTest(t, mock)
 	defer cleanup()
 
-	spec := &SandboxSpec{
-		Workload:  &SandboxWorkloadConfig{Image: "python:3.12", Environment: map[string]string{"FOO": "bar"}},
-		Providers: []string{"claude"},
-	}
+	workload := &SandboxWorkloadConfig{Image: "python:3.12", Environment: map[string]string{"FOO": "bar"}}
+	providers := []string{"claude"}
 	labels := map[string]string{"env": "dev"}
 
-	result, err := client.Create(context.Background(), "default", "my-sandbox", spec, labels)
+	result, err := client.Create(context.Background(), "default", "my-sandbox", workload, nil, providers, labels)
 
 	require.NoError(t, err)
 	require.NotNil(t, result)
@@ -267,16 +267,41 @@ func TestSandboxCreate(t *testing.T) {
 	assert.Equal(t, "sb-my-sandbox", result.ID)
 	assert.Equal(t, map[string]string{"env": "dev"}, result.Labels)
 	assert.Equal(t, SandboxProvisioning, result.Status.Phase)
+	mock.mu.Lock()
+	req := mock.lastCreate
+	mock.mu.Unlock()
+	require.NotNil(t, req)
+	assert.Equal(t, "default", req.GetWorkspace())
+	assert.Equal(t, "python:3.12", req.GetWorkload().GetImage())
+	assert.Equal(t, map[string]string{"FOO": "bar"}, req.GetWorkload().GetEnvironment())
+	assert.Equal(t, []string{"claude"}, req.GetProviders())
+	assert.Empty(t, req.GetWorkloadTemplateName())
 }
 
-func TestSandboxCreate_RejectsUnrepresentableResourcesBeforeRPC(t *testing.T) {
+func TestSandboxCreateFromTemplate(t *testing.T) {
 	mock := newMockSandboxServer()
 	client, cleanup := setupSandboxTest(t, mock)
 	defer cleanup()
 
-	_, err := client.Create(context.Background(), "default", "bad", &SandboxSpec{
-		DriverConfig: map[string]any{"invalid": make(chan int)},
-	}, nil)
+	result, err := client.CreateFromTemplate(context.Background(), "default", "templated", "gpu-kata", nil, []string{"claude"}, map[string]string{"env": "dev"})
+
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	mock.mu.Lock()
+	req := mock.lastCreate
+	mock.mu.Unlock()
+	require.NotNil(t, req)
+	assert.Equal(t, "gpu-kata", req.GetWorkloadTemplateName())
+	assert.Nil(t, req.GetWorkload())
+	assert.Equal(t, []string{"claude"}, req.GetProviders())
+}
+
+func TestSandboxCreateFromTemplate_RejectsEmptyTemplateName(t *testing.T) {
+	mock := newMockSandboxServer()
+	client, cleanup := setupSandboxTest(t, mock)
+	defer cleanup()
+
+	_, err := client.CreateFromTemplate(context.Background(), "default", "bad", "", nil, nil, nil)
 	require.Error(t, err)
 	assert.True(t, IsInvalidArgument(err))
 	mock.mu.Lock()
@@ -290,7 +315,7 @@ func TestSandboxCreate_AlreadyExists(t *testing.T) {
 	client, cleanup := setupSandboxTest(t, mock)
 	defer cleanup()
 
-	_, err := client.Create(context.Background(), "default", "dup", &SandboxSpec{}, nil)
+	_, err := client.Create(context.Background(), "default", "dup", nil, nil, nil, nil)
 
 	require.Error(t, err)
 	assert.True(t, IsAlreadyExists(err))

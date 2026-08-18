@@ -19,7 +19,7 @@ func TestSandboxLifecycle(t *testing.T) {
 
     ctx := context.Background()
 
-    sb, err := client.Sandboxes().Create(ctx, "default", "my-sandbox", &v1.SandboxSpec{}, nil)
+    sb, err := client.Sandboxes().Create(ctx, "default", "my-sandbox", nil, nil, nil, nil)
     require.NoError(t, err)
     assert.Equal(t, types.SandboxProvisioning, sb.Status.Phase)
 
@@ -83,6 +83,7 @@ The fake client implements every interface in `v1.ClientInterface`:
 | Accessor | Interface | Behavior |
 |----------|-----------|----------|
 | `Sandboxes()` | `SandboxInterface` | Full CRUD, Watch, WaitReady |
+| `SandboxTemplates()` | `SandboxTemplateInterface` | Full CRUD |
 | `Providers()` | `ProviderInterface` | Full CRUD, Ensure |
 | `Workspaces()` | `WorkspaceInterface` | Full CRUD, Members |
 | `Health()` | `HealthInterface` | Configurable result |

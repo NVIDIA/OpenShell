@@ -15,12 +15,14 @@ import (
 // real gRPC connection. Create one with NewClient.
 type Client struct {
 	sandboxStore       *objectStore[*types.Sandbox]
+	templateStore      *objectStore[*types.SandboxTemplate]
 	providerStore      *objectStore[*types.Provider]
 	workspaceStore     *objectStore[*types.Workspace]
 	memberStore        *objectStore[*types.WorkspaceMember]
 	sandboxBroadcaster *watchBroadcaster[*types.Sandbox]
 
 	sandboxes  v1.SandboxInterface
+	templates  v1.SandboxTemplateInterface
 	providers  v1.ProviderInterface
 	services   v1.ServiceInterface
 	exec       v1.ExecInterface
@@ -70,13 +72,15 @@ func WithCurrentUser(user *types.CurrentUser) ClientOption {
 func NewClient(opts ...ClientOption) *Client {
 	fc := &Client{
 		sandboxStore:       newobjectStore(sandboxName, copySandbox),
+		templateStore:      newobjectStore(sandboxTemplateName, copySandboxTemplatePtr),
 		providerStore:      newobjectStore(providerName, copyProvider),
 		workspaceStore:     newobjectStore(workspaceName, copyWorkspace),
 		memberStore:        newobjectStore(memberName, copyMember),
 		sandboxBroadcaster: newWatchBroadcaster[*types.Sandbox](),
 	}
 
-	fc.sandboxes = newFakeSandboxClient(fc.sandboxStore, fc.sandboxBroadcaster, fc.isClosed)
+	fc.sandboxes = newFakeSandboxClient(fc.sandboxStore, fc.templateStore, fc.sandboxBroadcaster, fc.isClosed)
+	fc.templates = newFakeSandboxTemplateClient(fc.templateStore, fc.isClosed)
 	fc.providers = newFakeProviderClient(fc.providerStore, fc.isClosed)
 	fc.services = newFakeServiceClient(fc.isClosed)
 	fc.exec = newFakeExecClient(fc.isClosed)
@@ -106,6 +110,9 @@ func (fc *Client) isClosed() bool {
 
 // Sandboxes returns the sandbox sub-client.
 func (fc *Client) Sandboxes() v1.SandboxInterface { return fc.sandboxes }
+
+// SandboxTemplates returns the sandbox template sub-client.
+func (fc *Client) SandboxTemplates() v1.SandboxTemplateInterface { return fc.templates }
 
 // Providers returns the provider sub-client.
 func (fc *Client) Providers() v1.ProviderInterface { return fc.providers }

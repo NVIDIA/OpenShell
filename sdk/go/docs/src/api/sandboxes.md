@@ -7,17 +7,18 @@ wait for readiness, watch state changes, and retrieve logs.
 
 ## Create
 
-Creates a new sandbox with the given name, spec, and labels.
+Creates a new sandbox with the given name, portable workload, policy, providers, and labels.
 
 ```go
-sb, err := client.Sandboxes().Create(ctx, "default", "my-sandbox", &v1.SandboxSpec{
-    Template: &v1.SandboxTemplate{
-        Image: "nvcr.io/nvidia/openshell:latest",
-    },
-    Providers: []string{"openai"},
-}, map[string]string{
-    "team": "platform",
-})
+workload := &v1.SandboxWorkloadConfig{Image: "nvcr.io/nvidia/openshell:latest"}
+labels := map[string]string{"team": "platform"}
+sb, err := client.Sandboxes().Create(ctx, "default", "my-sandbox", workload, nil, []string{"openai"}, labels)
+```
+
+Create from a workspace-scoped named template:
+
+```go
+sb, err := client.Sandboxes().CreateFromTemplate(ctx, "default", "gpu-job", "gpu-kata", nil, []string{"openai"}, nil)
 ```
 
 ## Get

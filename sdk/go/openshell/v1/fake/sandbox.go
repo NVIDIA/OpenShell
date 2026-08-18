@@ -291,47 +291,83 @@ func copyStringSlice(s []string) []string {
 // fakeSandboxClient implements v1.SandboxInterface backed by an in-memory
 // objectStore and watchBroadcaster.
 type fakeSandboxClient struct {
-	store       *objectStore[*types.Sandbox]
-	broadcaster *watchBroadcaster[*types.Sandbox]
-	closedFunc  func() bool
+	store         *objectStore[*types.Sandbox]
+	templateStore *objectStore[*types.SandboxTemplate]
+	broadcaster   *watchBroadcaster[*types.Sandbox]
+	closedFunc    func() bool
 }
 
 // newFakeSandboxClient creates a new fakeSandboxClient.
 func newFakeSandboxClient(
 	store *objectStore[*types.Sandbox],
+	templateStore *objectStore[*types.SandboxTemplate],
 	broadcaster *watchBroadcaster[*types.Sandbox],
 	closedFunc func() bool,
 ) *fakeSandboxClient {
 	return &fakeSandboxClient{
-		store:       store,
-		broadcaster: broadcaster,
-		closedFunc:  closedFunc,
+		store:         store,
+		templateStore: templateStore,
+		broadcaster:   broadcaster,
+		closedFunc:    closedFunc,
 	}
 }
 
-// Create creates a new sandbox with Provisioning phase.
-func (c *fakeSandboxClient) Create(_ context.Context, workspace, name string, spec *types.SandboxSpec, labels map[string]string, opts ...types.CreateOptions) (*types.Sandbox, error) {
+// Create creates a new sandbox from an inline workload with Provisioning phase.
+func (c *fakeSandboxClient) Create(_ context.Context, workspace, name string, workload *types.SandboxWorkloadConfig, policy *types.SandboxPolicy, providers []string, labels map[string]string, opts ...types.CreateOptions) (*types.Sandbox, error) {
+	spec := types.SandboxSpec{
+		Workload:  copySandboxWorkloadConfig(workload),
+		Providers: copyStringSlice(providers),
+		Policy:    copySandboxPolicy(policy),
+	}
+	return c.create(workspace, name, spec, nil, labels, opts...)
+}
+
+// CreateFromTemplate creates a new sandbox from a named template with Provisioning phase.
+func (c *fakeSandboxClient) CreateFromTemplate(_ context.Context, workspace, name, templateName string, policy *types.SandboxPolicy, providers []string, labels map[string]string, opts ...types.CreateOptions) (*types.Sandbox, error) {
+	if templateName == "" {
+		return nil, &types.StatusError{Code: types.ErrorInvalidArgument, Message: "template name is required"}
+	}
 	if c.closedFunc() {
 		return nil, &types.StatusError{Code: types.ErrorUnavailable, Message: "client is closed"}
 	}
-
-	if spec == nil {
-		spec = &types.SandboxSpec{}
+	if c.templateStore == nil {
+		return nil, &types.StatusError{Code: types.ErrorNotFound, Message: fmt.Sprintf("%s not found", templateName)}
 	}
+	template, err := c.templateStore.Get(workspace, templateName)
+	if err != nil {
+		return nil, err
+	}
+	spec := types.SandboxSpec{
+		Workload:     copySandboxWorkloadConfig(template.Spec.Workload),
+		DriverConfig: copyAnyMap(template.Spec.DriverConfig),
+		Providers:    copyStringSlice(providers),
+		Policy:       copySandboxPolicy(policy),
+	}
+	provenance := &types.SandboxTemplateProvenance{
+		Name:            template.Name,
+		ResourceVersion: fmt.Sprintf("%d", template.ResourceVersion),
+	}
+	return c.create(workspace, name, spec, provenance, labels, opts...)
+}
 
+func (c *fakeSandboxClient) create(workspace, name string, spec types.SandboxSpec, provenance *types.SandboxTemplateProvenance, labels map[string]string, opts ...types.CreateOptions) (*types.Sandbox, error) {
+	if c.closedFunc() {
+		return nil, &types.StatusError{Code: types.ErrorUnavailable, Message: "client is closed"}
+	}
 	var annotations map[string]string
 	if len(opts) > 0 {
 		annotations = copyStringMap(opts[0].Annotations)
 	}
 
 	sb := &types.Sandbox{
-		Name:            name,
-		Workspace:       workspace,
-		CreatedAt:       time.Now(),
-		Labels:          copyStringMap(labels),
-		Annotations:     annotations,
-		ResourceVersion: 1,
-		Spec:            copySandboxSpec(*spec),
+		Name:                name,
+		Workspace:           workspace,
+		CreatedAt:           time.Now(),
+		Labels:              copyStringMap(labels),
+		Annotations:         annotations,
+		ResourceVersion:     1,
+		CreatedFromTemplate: provenance,
+		Spec:                copySandboxSpec(spec),
 		Status: types.SandboxStatus{
 			SandboxName: name,
 			Phase:       types.SandboxProvisioning,

@@ -20,8 +20,9 @@ import (
 // helper to build a minimal fake sandbox client for testing.
 func newTestSandboxClient() *fakeSandboxClient {
 	store := newobjectStore(sandboxName, copySandbox)
+	templateStore := newobjectStore(sandboxTemplateName, copySandboxTemplatePtr)
 	broadcaster := newWatchBroadcaster[*types.Sandbox]()
-	return newFakeSandboxClient(store, broadcaster, func() bool { return false })
+	return newFakeSandboxClient(store, templateStore, broadcaster, func() bool { return false })
 }
 
 // --- T008: Sandbox CRUD tests ---
@@ -30,9 +31,7 @@ func TestSandbox_Create(t *testing.T) {
 	sc := newTestSandboxClient()
 	ctx := context.Background()
 
-	sb, err := sc.Create(ctx, "default", "test-sb", &types.SandboxSpec{
-		Workload: &types.SandboxWorkloadConfig{Image: "img:v1"},
-	}, map[string]string{"env": "test"})
+	sb, err := sc.Create(ctx, "default", "test-sb", &types.SandboxWorkloadConfig{Image: "img:v1"}, nil, nil, map[string]string{"env": "test"})
 	require.NoError(t, err)
 	assert.Equal(t, "test-sb", sb.Name)
 	require.NotNil(t, sb.Spec.Workload)
@@ -47,10 +46,10 @@ func TestSandbox_Create_AlreadyExists(t *testing.T) {
 	sc := newTestSandboxClient()
 	ctx := context.Background()
 
-	_, err := sc.Create(ctx, "default", "test-sb", &types.SandboxSpec{}, nil)
+	_, err := sc.Create(ctx, "default", "test-sb", nil, nil, nil, nil)
 	require.NoError(t, err)
 
-	_, err = sc.Create(ctx, "default", "test-sb", &types.SandboxSpec{}, nil)
+	_, err = sc.Create(ctx, "default", "test-sb", nil, nil, nil, nil)
 	require.Error(t, err)
 	assert.True(t, types.IsAlreadyExists(err))
 }
@@ -59,7 +58,7 @@ func TestSandbox_Create_WithAnnotations(t *testing.T) {
 	sc := newTestSandboxClient()
 	ctx := context.Background()
 
-	sb, err := sc.Create(ctx, "default", "annotated", &types.SandboxSpec{}, nil,
+	sb, err := sc.Create(ctx, "default", "annotated", nil, nil, nil, nil,
 		types.CreateOptions{Annotations: map[string]string{"source": "cli", "user": "admin"}})
 	require.NoError(t, err)
 	assert.Equal(t, "cli", sb.Annotations["source"])
@@ -75,7 +74,7 @@ func TestSandbox_Create_WithAnnotationsDeepCopy(t *testing.T) {
 	ctx := context.Background()
 
 	input := map[string]string{"key": "original"}
-	sb, err := sc.Create(ctx, "default", "dc-test", &types.SandboxSpec{}, nil,
+	sb, err := sc.Create(ctx, "default", "dc-test", nil, nil, nil, nil,
 		types.CreateOptions{Annotations: input})
 	require.NoError(t, err)
 
@@ -87,7 +86,7 @@ func TestSandbox_Create_NoAnnotations(t *testing.T) {
 	sc := newTestSandboxClient()
 	ctx := context.Background()
 
-	sb, err := sc.Create(ctx, "default", "no-ann", &types.SandboxSpec{}, nil)
+	sb, err := sc.Create(ctx, "default", "no-ann", nil, nil, nil, nil)
 	require.NoError(t, err)
 	assert.Nil(t, sb.Annotations)
 }
@@ -165,22 +164,113 @@ func TestCopySandboxTemplate_ResourcesDeepCopy(t *testing.T) {
 	assert.Equal(t, "val", copiedNested["key"])
 }
 
-func TestSandbox_Create_NilSpec(t *testing.T) {
+func TestSandbox_Create_NilWorkload(t *testing.T) {
 	sc := newTestSandboxClient()
 	ctx := context.Background()
 
-	sb, err := sc.Create(ctx, "default", "test-sb", nil, nil)
+	sb, err := sc.Create(ctx, "default", "test-sb", nil, nil, nil, nil)
 	require.NoError(t, err)
 	assert.Equal(t, "test-sb", sb.Name)
+}
+
+func TestSandbox_CreateFromTemplate(t *testing.T) {
+	sc := newTestSandboxClient()
+	ctx := context.Background()
+	gpuCount := uint32(1)
+	sc.templateStore.Insert("default", &types.SandboxTemplate{
+		Name:            "gpu-kata",
+		ResourceVersion: 7,
+		Spec: types.SandboxTemplateSpec{
+			Workload: &types.SandboxWorkloadConfig{
+				Image:       "python:3.12",
+				Environment: map[string]string{"MODE": "template"},
+				Resources: &types.SandboxResources{
+					CPU:      "2",
+					Memory:   "4Gi",
+					GPUCount: &gpuCount,
+				},
+			},
+			DriverConfig: map[string]any{
+				"kubernetes": map[string]any{"runtime_class_name": "kata"},
+			},
+		},
+	})
+
+	sb, err := sc.CreateFromTemplate(ctx, "default", "templated", "gpu-kata", nil, []string{"openai"}, map[string]string{"env": "test"})
+	require.NoError(t, err)
+	assert.Equal(t, "templated", sb.Name)
+	require.NotNil(t, sb.CreatedFromTemplate)
+	assert.Equal(t, "gpu-kata", sb.CreatedFromTemplate.Name)
+	assert.Equal(t, "7", sb.CreatedFromTemplate.ResourceVersion)
+	require.NotNil(t, sb.Spec.Workload)
+	assert.Equal(t, "python:3.12", sb.Spec.Workload.Image)
+	assert.Equal(t, "template", sb.Spec.Workload.Environment["MODE"])
+	require.NotNil(t, sb.Spec.Workload.Resources)
+	assert.Equal(t, "2", sb.Spec.Workload.Resources.CPU)
+	assert.Equal(t, "4Gi", sb.Spec.Workload.Resources.Memory)
+	require.NotNil(t, sb.Spec.Workload.Resources.GPUCount)
+	assert.Equal(t, uint32(1), *sb.Spec.Workload.Resources.GPUCount)
+	assert.Equal(t, "kata", sb.Spec.DriverConfig["kubernetes"].(map[string]any)["runtime_class_name"])
+	assert.Equal(t, []string{"openai"}, sb.Spec.Providers)
+	assert.Equal(t, "test", sb.Labels["env"])
+
+	storedTemplate, err := sc.templateStore.Get("default", "gpu-kata")
+	require.NoError(t, err)
+	storedTemplate.Spec.Workload.Image = "mutated"
+	storedTemplate.Spec.DriverConfig["kubernetes"].(map[string]any)["runtime_class_name"] = "mutated"
+	assert.Equal(t, "python:3.12", sb.Spec.Workload.Image)
+	assert.Equal(t, "kata", sb.Spec.DriverConfig["kubernetes"].(map[string]any)["runtime_class_name"])
+}
+
+func TestSandbox_CreateFromTemplate_EmptyTemplateName(t *testing.T) {
+	sc := newTestSandboxClient()
+	ctx := context.Background()
+
+	_, err := sc.CreateFromTemplate(ctx, "default", "templated", "", nil, nil, nil)
+	require.Error(t, err)
+	assert.True(t, types.IsInvalidArgument(err))
+}
+
+func TestSandbox_CreateFromTemplate_NotFound(t *testing.T) {
+	sc := newTestSandboxClient()
+	ctx := context.Background()
+
+	_, err := sc.CreateFromTemplate(ctx, "default", "templated", "missing-template", nil, nil, nil)
+	require.Error(t, err)
+	assert.True(t, types.IsNotFound(err))
+}
+
+func TestSandbox_CreateFromTemplate_UsesWorkspaceScopedTemplate(t *testing.T) {
+	sc := newTestSandboxClient()
+	ctx := context.Background()
+
+	sc.templateStore.Insert("team-a", &types.SandboxTemplate{
+		Name:            "gpu-kata",
+		ResourceVersion: 3,
+		Spec: types.SandboxTemplateSpec{
+			Workload:     &types.SandboxWorkloadConfig{Image: "team-a:latest"},
+			DriverConfig: map[string]any{"kubernetes": map[string]any{"runtime_class_name": "team-a"}},
+		},
+	})
+
+	_, err := sc.CreateFromTemplate(ctx, "default", "templated", "gpu-kata", nil, nil, nil)
+	require.Error(t, err)
+	assert.True(t, types.IsNotFound(err))
+
+	sb, err := sc.CreateFromTemplate(ctx, "team-a", "templated", "gpu-kata", nil, nil, nil)
+	require.NoError(t, err)
+	require.NotNil(t, sb.Spec.Workload)
+	assert.Equal(t, "team-a:latest", sb.Spec.Workload.Image)
+	require.NotNil(t, sb.CreatedFromTemplate)
+	assert.Equal(t, "3", sb.CreatedFromTemplate.ResourceVersion)
+	assert.Equal(t, "team-a", sb.Spec.DriverConfig["kubernetes"].(map[string]any)["runtime_class_name"])
 }
 
 func TestSandbox_Get(t *testing.T) {
 	sc := newTestSandboxClient()
 	ctx := context.Background()
 
-	_, err := sc.Create(ctx, "default", "test-sb", &types.SandboxSpec{
-		Workload: &types.SandboxWorkloadConfig{Image: "img:v1"},
-	}, nil)
+	_, err := sc.Create(ctx, "default", "test-sb", &types.SandboxWorkloadConfig{Image: "img:v1"}, nil, nil, nil)
 	require.NoError(t, err)
 
 	got, err := sc.Get(ctx, "default", "test-sb")
@@ -212,8 +302,8 @@ func TestSandbox_List(t *testing.T) {
 	sc := newTestSandboxClient()
 	ctx := context.Background()
 
-	_, _ = sc.Create(ctx, "default", "sb-1", &types.SandboxSpec{}, nil)
-	_, _ = sc.Create(ctx, "default", "sb-2", &types.SandboxSpec{}, nil)
+	_, _ = sc.Create(ctx, "default", "sb-1", nil, nil, nil, nil)
+	_, _ = sc.Create(ctx, "default", "sb-2", nil, nil, nil, nil)
 
 	list, err := sc.List(ctx, "default")
 	require.NoError(t, err)
@@ -224,7 +314,7 @@ func TestSandbox_Delete(t *testing.T) {
 	sc := newTestSandboxClient()
 	ctx := context.Background()
 
-	_, _ = sc.Create(ctx, "default", "test-sb", &types.SandboxSpec{}, nil)
+	_, _ = sc.Create(ctx, "default", "test-sb", nil, nil, nil, nil)
 
 	err := sc.Delete(ctx, "default", "test-sb")
 	require.NoError(t, err)
@@ -255,7 +345,7 @@ func TestSandbox_DeepCopy_OnCreate(t *testing.T) {
 		},
 	}
 
-	sb, err := sc.Create(ctx, "default", "test-sb", spec, labels)
+	sb, err := sc.Create(ctx, "default", "test-sb", spec.Workload, spec.Policy, spec.Providers, labels)
 	require.NoError(t, err)
 
 	// Mutating inputs should not affect stored object
@@ -281,11 +371,9 @@ func TestSandbox_DeepCopy_OnGet(t *testing.T) {
 	sc := newTestSandboxClient()
 	ctx := context.Background()
 
-	_, _ = sc.Create(ctx, "default", "test-sb", &types.SandboxSpec{
-		Workload: &types.SandboxWorkloadConfig{
-			Environment: map[string]string{"KEY": "value"},
-		},
-	}, nil)
+	_, _ = sc.Create(ctx, "default", "test-sb", &types.SandboxWorkloadConfig{
+		Environment: map[string]string{"KEY": "value"},
+	}, nil, nil, nil)
 
 	got, err := sc.Get(ctx, "default", "test-sb")
 	require.NoError(t, err)
@@ -303,7 +391,7 @@ func TestSandbox_WaitReady(t *testing.T) {
 	sc := newTestSandboxClient()
 	ctx := context.Background()
 
-	_, err := sc.Create(ctx, "default", "test-sb", &types.SandboxSpec{}, nil)
+	_, err := sc.Create(ctx, "default", "test-sb", nil, nil, nil, nil)
 	require.NoError(t, err)
 
 	sb, err := sc.WaitReady(ctx, "default", "test-sb")
@@ -328,7 +416,7 @@ func TestSandbox_WaitReady_NotFound(t *testing.T) {
 func TestSandbox_WaitReady_ContextCancellation(t *testing.T) {
 	sc := newTestSandboxClient()
 
-	_, err := sc.Create(context.Background(), "default", "test-sb", &types.SandboxSpec{}, nil)
+	_, err := sc.Create(context.Background(), "default", "test-sb", nil, nil, nil, nil)
 	require.NoError(t, err)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -343,7 +431,7 @@ func TestSandbox_WaitReady_ContextCancellation(t *testing.T) {
 func TestSandbox_WaitReady_ContextDeadlineExceeded(t *testing.T) {
 	sc := newTestSandboxClient()
 
-	_, err := sc.Create(context.Background(), "default", "test-sb", &types.SandboxSpec{}, nil)
+	_, err := sc.Create(context.Background(), "default", "test-sb", nil, nil, nil, nil)
 	require.NoError(t, err)
 
 	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
@@ -358,7 +446,7 @@ func TestSandbox_WaitReady_AlreadyReady(t *testing.T) {
 	sc := newTestSandboxClient()
 	ctx := context.Background()
 
-	_, _ = sc.Create(ctx, "default", "test-sb", &types.SandboxSpec{}, nil)
+	_, _ = sc.Create(ctx, "default", "test-sb", nil, nil, nil, nil)
 
 	// Make it ready
 	_, err := sc.WaitReady(ctx, "default", "test-sb")
@@ -374,7 +462,7 @@ func TestSandbox_WaitReady_IncrementsResourceVersion(t *testing.T) {
 	sc := newTestSandboxClient()
 	ctx := context.Background()
 
-	created, err := sc.Create(ctx, "default", "test-sb", &types.SandboxSpec{}, nil)
+	created, err := sc.Create(ctx, "default", "test-sb", nil, nil, nil, nil)
 	require.NoError(t, err)
 	initialVersion := created.ResourceVersion
 
@@ -386,7 +474,7 @@ func TestSandbox_WaitReady_IncrementsResourceVersion(t *testing.T) {
 func TestSandbox_WaitReady_ContextTimeout(t *testing.T) {
 	sc := newTestSandboxClient()
 
-	_, err := sc.Create(context.Background(), "default", "test-sb", &types.SandboxSpec{}, nil)
+	_, err := sc.Create(context.Background(), "default", "test-sb", nil, nil, nil, nil)
 	require.NoError(t, err)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
@@ -410,9 +498,7 @@ func TestSandbox_Watch_AddedOnCreate(t *testing.T) {
 	require.NoError(t, err)
 	defer w.Stop()
 
-	_, err = sc.Create(ctx, "default", "test-sb", &types.SandboxSpec{
-		Workload: &types.SandboxWorkloadConfig{Image: "watch:v1"},
-	}, nil)
+	_, err = sc.Create(ctx, "default", "test-sb", &types.SandboxWorkloadConfig{Image: "watch:v1"}, nil, nil, nil)
 	require.NoError(t, err)
 
 	select {
@@ -430,7 +516,7 @@ func TestSandbox_Watch_DeletedOnDelete(t *testing.T) {
 	sc := newTestSandboxClient()
 	ctx := context.Background()
 
-	_, _ = sc.Create(ctx, "default", "test-sb", &types.SandboxSpec{}, nil)
+	_, _ = sc.Create(ctx, "default", "test-sb", nil, nil, nil, nil)
 
 	w, err := sc.Watch(ctx, "default", "")
 	require.NoError(t, err)
@@ -452,7 +538,7 @@ func TestSandbox_Watch_ModifiedOnWaitReady(t *testing.T) {
 	sc := newTestSandboxClient()
 	ctx := context.Background()
 
-	_, _ = sc.Create(ctx, "default", "test-sb", &types.SandboxSpec{}, nil)
+	_, _ = sc.Create(ctx, "default", "test-sb", nil, nil, nil, nil)
 
 	w, err := sc.Watch(ctx, "default", "")
 	require.NoError(t, err)
@@ -480,10 +566,10 @@ func TestSandbox_Watch_NameFiltering(t *testing.T) {
 	defer w.Stop()
 
 	// Create "beta" — should not be received
-	_, _ = sc.Create(ctx, "default", "beta", &types.SandboxSpec{}, nil)
+	_, _ = sc.Create(ctx, "default", "beta", nil, nil, nil, nil)
 
 	// Create "alpha" — should be received
-	_, _ = sc.Create(ctx, "default", "alpha", &types.SandboxSpec{}, nil)
+	_, _ = sc.Create(ctx, "default", "alpha", nil, nil, nil, nil)
 
 	select {
 	case ev := <-w.ResultChan():
@@ -506,7 +592,7 @@ func TestSandbox_Watch_MultipleWatchers(t *testing.T) {
 	require.NoError(t, err)
 	defer w2.Stop()
 
-	_, _ = sc.Create(ctx, "default", "test-sb", &types.SandboxSpec{}, nil)
+	_, _ = sc.Create(ctx, "default", "test-sb", nil, nil, nil, nil)
 
 	for _, w := range []types.WatchInterface[*types.Sandbox]{w1, w2} {
 		select {
@@ -536,9 +622,7 @@ func TestSandbox_Watch_DeletedEventContainsFullObject(t *testing.T) {
 	sc := newTestSandboxClient()
 	ctx := context.Background()
 
-	_, _ = sc.Create(ctx, "default", "test-sb", &types.SandboxSpec{
-		Workload: &types.SandboxWorkloadConfig{Image: "deleted:v1"},
-	}, map[string]string{"env": "test"})
+	_, _ = sc.Create(ctx, "default", "test-sb", &types.SandboxWorkloadConfig{Image: "deleted:v1"}, nil, nil, map[string]string{"env": "test"})
 
 	w, err := sc.Watch(ctx, "default", "")
 	require.NoError(t, err)
@@ -587,9 +671,7 @@ func TestSandbox_ConcurrentCreateGetDeleteWatch(t *testing.T) {
 			defer wg.Done()
 			for j := 0; j < opsPerGoroutine; j++ {
 				name := fmt.Sprintf("sb-%d-%d", id, j)
-				_, _ = sc.Create(ctx, "default", name, &types.SandboxSpec{
-					Workload: &types.SandboxWorkloadConfig{Image: "concurrent:v1"},
-				}, nil)
+				_, _ = sc.Create(ctx, "default", name, &types.SandboxWorkloadConfig{Image: "concurrent:v1"}, nil, nil, nil)
 				_, _ = sc.Get(ctx, "default", name)
 				_, _ = sc.List(ctx, "default")
 				_, _ = sc.WaitReady(ctx, "default", name)
@@ -610,7 +692,7 @@ func TestSandbox_AttachProvider(t *testing.T) {
 	sc := newTestSandboxClient()
 	ctx := context.Background()
 
-	sb, err := sc.Create(ctx, "default", "test-sb", &types.SandboxSpec{}, nil)
+	sb, err := sc.Create(ctx, "default", "test-sb", nil, nil, nil, nil)
 	require.NoError(t, err)
 
 	result, err := sc.AttachProvider(ctx, "default", "test-sb", "openai", sb.ResourceVersion)
@@ -624,7 +706,7 @@ func TestSandbox_AttachProvider_AlreadyAttached(t *testing.T) {
 	sc := newTestSandboxClient()
 	ctx := context.Background()
 
-	sb, err := sc.Create(ctx, "default", "test-sb", &types.SandboxSpec{}, nil)
+	sb, err := sc.Create(ctx, "default", "test-sb", nil, nil, nil, nil)
 	require.NoError(t, err)
 
 	result, err := sc.AttachProvider(ctx, "default", "test-sb", "openai", sb.ResourceVersion)
@@ -650,7 +732,7 @@ func TestSandbox_DetachProvider(t *testing.T) {
 	sc := newTestSandboxClient()
 	ctx := context.Background()
 
-	sb, err := sc.Create(ctx, "default", "test-sb", &types.SandboxSpec{}, nil)
+	sb, err := sc.Create(ctx, "default", "test-sb", nil, nil, nil, nil)
 	require.NoError(t, err)
 
 	result, err := sc.AttachProvider(ctx, "default", "test-sb", "openai", sb.ResourceVersion)
@@ -666,7 +748,7 @@ func TestSandbox_DetachProvider_NotAttached(t *testing.T) {
 	sc := newTestSandboxClient()
 	ctx := context.Background()
 
-	sb, err := sc.Create(ctx, "default", "test-sb", &types.SandboxSpec{}, nil)
+	sb, err := sc.Create(ctx, "default", "test-sb", nil, nil, nil, nil)
 	require.NoError(t, err)
 
 	result, err := sc.DetachProvider(ctx, "default", "test-sb", "openai", sb.ResourceVersion)
@@ -687,7 +769,7 @@ func TestSandbox_ListProviders(t *testing.T) {
 	sc := newTestSandboxClient()
 	ctx := context.Background()
 
-	sb, err := sc.Create(ctx, "default", "test-sb", &types.SandboxSpec{}, nil)
+	sb, err := sc.Create(ctx, "default", "test-sb", nil, nil, nil, nil)
 	require.NoError(t, err)
 
 	// No providers yet
@@ -727,7 +809,7 @@ func TestSandbox_AttachProvider_BroadcastsModified(t *testing.T) {
 	sc := newTestSandboxClient()
 	ctx := context.Background()
 
-	sb, err := sc.Create(ctx, "default", "test-sb", &types.SandboxSpec{}, nil)
+	sb, err := sc.Create(ctx, "default", "test-sb", nil, nil, nil, nil)
 	require.NoError(t, err)
 
 	w, err := sc.Watch(ctx, "default", "")
@@ -752,7 +834,7 @@ func TestSandbox_Watch_StopOnTerminal_Ready(t *testing.T) {
 	sc := newTestSandboxClient()
 	ctx := context.Background()
 
-	_, err := sc.Create(ctx, "default", "test-sb", &types.SandboxSpec{}, nil)
+	_, err := sc.Create(ctx, "default", "test-sb", nil, nil, nil, nil)
 	require.NoError(t, err)
 
 	w, err := sc.Watch(ctx, "default", "test-sb", v1.WatchOptions{StopOnTerminal: true})
@@ -777,7 +859,7 @@ func TestSandbox_Watch_StopOnTerminal_Error(t *testing.T) {
 	sc := newTestSandboxClient()
 	ctx := context.Background()
 
-	sb, err := sc.Create(ctx, "default", "test-sb", &types.SandboxSpec{}, nil)
+	sb, err := sc.Create(ctx, "default", "test-sb", nil, nil, nil, nil)
 	require.NoError(t, err)
 
 	w, err := sc.Watch(ctx, "default", "test-sb", v1.WatchOptions{StopOnTerminal: true})
@@ -807,7 +889,7 @@ func TestSandbox_Watch_StopOnTerminal_False_DoesNotClose(t *testing.T) {
 	sc := newTestSandboxClient()
 	ctx := context.Background()
 
-	_, err := sc.Create(ctx, "default", "test-sb", &types.SandboxSpec{}, nil)
+	_, err := sc.Create(ctx, "default", "test-sb", nil, nil, nil, nil)
 	require.NoError(t, err)
 
 	// Watch WITHOUT StopOnTerminal
@@ -872,7 +954,7 @@ func TestFakeSandboxCreateWithPolicy(t *testing.T) {
 		},
 	}
 
-	created, err := sc.Create(ctx, "default", "policy-sb", spec, nil)
+	created, err := sc.Create(ctx, "default", "policy-sb", spec.Workload, spec.Policy, spec.Providers, nil)
 	require.NoError(t, err)
 
 	// Verify created sandbox has policy
@@ -929,9 +1011,7 @@ func TestFakeSandboxCreateWithNilPolicy(t *testing.T) {
 	sc := newTestSandboxClient()
 	ctx := context.Background()
 
-	created, err := sc.Create(ctx, "default", "no-policy-sb", &types.SandboxSpec{
-		Workload: &types.SandboxWorkloadConfig{Image: "no-policy:v1"},
-	}, nil)
+	created, err := sc.Create(ctx, "default", "no-policy-sb", &types.SandboxWorkloadConfig{Image: "no-policy:v1"}, nil, nil, nil)
 	require.NoError(t, err)
 	assert.Nil(t, created.Spec.Policy)
 
@@ -951,8 +1031,9 @@ func TestSandbox_GetLogs_ReturnsUnimplemented(t *testing.T) {
 
 func TestSandbox_GetLogs_ClosedReturnsUnavailable(t *testing.T) {
 	store := newobjectStore(sandboxName, copySandbox)
+	templateStore := newobjectStore(sandboxTemplateName, copySandboxTemplatePtr)
 	broadcaster := newWatchBroadcaster[*types.Sandbox]()
-	sc := newFakeSandboxClient(store, broadcaster, func() bool { return true })
+	sc := newFakeSandboxClient(store, templateStore, broadcaster, func() bool { return true })
 	_, err := sc.GetLogs(context.Background(), "default", "sb-1")
 	require.Error(t, err)
 	assert.True(t, types.IsUnavailable(err))

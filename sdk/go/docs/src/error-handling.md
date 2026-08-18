@@ -55,7 +55,7 @@ Handle missing resources gracefully:
 sb, err := client.Sandboxes().Get(ctx, "default", "my-sandbox")
 if v1.IsNotFound(err) {
     fmt.Println("Sandbox does not exist, creating...")
-    sb, err = client.Sandboxes().Create(ctx, "default", "my-sandbox", &v1.SandboxSpec{}, nil)
+    sb, err = client.Sandboxes().Create(ctx, "default", "my-sandbox", nil, nil, nil, nil)
 }
 if err != nil {
     log.Fatal(err)

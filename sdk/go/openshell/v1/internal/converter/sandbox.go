@@ -212,6 +212,11 @@ func SandboxSpecToProtoChecked(spec *types.SandboxSpec) (*pb.SandboxSpec, error)
 	return SandboxSpecToProto(spec)
 }
 
+// SandboxWorkloadToProto converts an SDK SandboxWorkloadConfig to proto.
+func SandboxWorkloadToProto(workload *types.SandboxWorkloadConfig) *pb.SandboxWorkloadConfig {
+	return sandboxWorkloadToProto(workload)
+}
+
 func sandboxWorkloadToProto(workload *types.SandboxWorkloadConfig) *pb.SandboxWorkloadConfig {
 	if workload == nil {
 		return nil

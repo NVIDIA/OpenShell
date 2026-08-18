@@ -18,6 +18,7 @@ type Config = types.Config
 // ClientInterface defines the top-level SDK surface.
 type ClientInterface interface {
 	Sandboxes() SandboxInterface
+	SandboxTemplates() SandboxTemplateInterface
 	Providers() ProviderInterface
 	Services() ServiceInterface
 	Exec() ExecInterface
@@ -50,6 +51,7 @@ type Client struct {
 	closeErr  error
 
 	sandboxes  SandboxInterface
+	templates  SandboxTemplateInterface
 	providers  ProviderInterface
 	services   ServiceInterface
 	exec       ExecInterface
@@ -94,6 +96,7 @@ func NewClient(cfg Config) (*Client, error) {
 	}
 
 	c.sandboxes = newSandboxClient(conn)
+	c.templates = newSandboxTemplateClient(conn)
 	c.providers = newProviderClient(conn)
 	c.services = newServiceClient(conn)
 	c.exec = newExecClient(conn, c.sandboxes)
@@ -111,6 +114,9 @@ func NewClient(cfg Config) (*Client, error) {
 
 // Sandboxes returns the sandbox sub-client.
 func (c *Client) Sandboxes() SandboxInterface { return c.sandboxes }
+
+// SandboxTemplates returns the sandbox template sub-client.
+func (c *Client) SandboxTemplates() SandboxTemplateInterface { return c.templates }
 
 // Providers returns the provider sub-client.
 func (c *Client) Providers() ProviderInterface { return c.providers }

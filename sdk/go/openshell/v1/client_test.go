@@ -26,6 +26,7 @@ func TestNewClient_ValidConfig(t *testing.T) {
 	require.NotNil(t, client)
 
 	assert.NotNil(t, client.Sandboxes())
+	assert.NotNil(t, client.SandboxTemplates())
 	assert.NotNil(t, client.Providers())
 	assert.NotNil(t, client.Exec())
 	assert.NotNil(t, client.Files())

@@ -38,7 +38,18 @@ func TestFakeClient_Sandboxes_AfterClose(t *testing.T) {
 
 	_ = fc.Close()
 
-	_, err := fc.Sandboxes().Create(ctx, "default", "test", &types.SandboxSpec{}, nil)
+	_, err := fc.Sandboxes().Create(ctx, "default", "test", nil, nil, nil, nil)
+	require.Error(t, err)
+	assert.True(t, types.IsUnavailable(err))
+}
+
+func TestFakeClient_SandboxTemplates_AfterClose(t *testing.T) {
+	fc := NewClient()
+	ctx := context.Background()
+
+	_ = fc.Close()
+
+	_, err := fc.SandboxTemplates().Create(ctx, "default", &types.SandboxTemplate{Name: "gpu-kata"})
 	require.Error(t, err)
 	assert.True(t, types.IsUnavailable(err))
 }
@@ -116,6 +127,7 @@ func TestFakeClient_SubClients(t *testing.T) {
 	fc := NewClient()
 
 	assert.NotNil(t, fc.Sandboxes())
+	assert.NotNil(t, fc.SandboxTemplates())
 	assert.NotNil(t, fc.Providers())
 	assert.NotNil(t, fc.Exec())
 	assert.NotNil(t, fc.Files())

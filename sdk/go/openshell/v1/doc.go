@@ -21,12 +21,11 @@
 //
 // # Sandbox Lifecycle
 //
-//	sandbox, err := client.Sandboxes().Create(ctx, "default", "my-sandbox", &v1.SandboxSpec{
-//	    Workload: &v1.SandboxWorkloadConfig{
-//	        Image:       "python:3.12",
-//	        Environment: map[string]string{"LANG": "en_US.UTF-8"},
-//	    },
-//	}, nil)
+//	workload := &v1.SandboxWorkloadConfig{
+//	    Image:       "python:3.12",
+//	    Environment: map[string]string{"LANG": "en_US.UTF-8"},
+//	}
+//	sandbox, err := client.Sandboxes().Create(ctx, "default", "my-sandbox", workload, nil, nil, nil)
 //	if err != nil {
 //	    log.Fatal(err)
 //	}
@@ -279,28 +278,34 @@
 //
 // Set an initial security policy when creating a sandbox:
 //
-//	sandbox, err := client.Sandboxes().Create(ctx, "default", "secure-sandbox", &v1.SandboxSpec{
-//	    Workload: &v1.SandboxWorkloadConfig{Image: "python:3.12"},
-//	    Policy: &v1.SandboxPolicy{
-//	        Version: 1,
-//	        Filesystem: &v1.FilesystemPolicy{
-//	            IncludeWorkdir: true,
-//	            ReadOnly:       []string{"/usr", "/lib"},
-//	        },
-//	        Process: &v1.ProcessPolicy{
-//	            RunAsUser:  "sandbox",
-//	            RunAsGroup: "sandbox",
-//	        },
-//	        NetworkPolicies: map[string]v1.NetworkPolicyRule{
-//	            "allow-api": {
-//	                Name: "allow-api",
-//	                Endpoints: []v1.PolicyNetworkEndpoint{
-//	                    {Host: "api.example.com", Port: 443, Protocol: "tcp"},
-//	                },
+//	policy := &v1.SandboxPolicy{
+//	    Version: 1,
+//	    Filesystem: &v1.FilesystemPolicy{
+//	        IncludeWorkdir: true,
+//	        ReadOnly:       []string{"/usr", "/lib"},
+//	    },
+//	    Process: &v1.ProcessPolicy{
+//	        RunAsUser:  "sandbox",
+//	        RunAsGroup: "sandbox",
+//	    },
+//	    NetworkPolicies: map[string]v1.NetworkPolicyRule{
+//	        "allow-api": {
+//	            Name: "allow-api",
+//	            Endpoints: []v1.PolicyNetworkEndpoint{
+//	                {Host: "api.example.com", Port: 443, Protocol: "tcp"},
 //	            },
 //	        },
 //	    },
-//	}, nil)
+//	}
+//	sandbox, err := client.Sandboxes().Create(
+//	    ctx,
+//	    "default",
+//	    "secure-sandbox",
+//	    &v1.SandboxWorkloadConfig{Image: "python:3.12"},
+//	    policy,
+//	    nil,
+//	    nil,
+//	)
 //
 // Replace the full policy at runtime via configuration update:
 //
