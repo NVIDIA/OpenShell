@@ -9,7 +9,8 @@ use openshell_core::proto::{
     GraphqlOperation, L7Allow, L7DenyRule, L7QueryMatcher, L7Rule, McpOptions, NetworkBinary,
     NetworkEndpoint, NetworkPolicyRule, ProviderCredentialRefresh,
     ProviderCredentialRefreshMaterial, ProviderCredentialRefreshOutput,
-    ProviderCredentialRefreshStrategy, ProviderProfile, ProviderProfileCategory,
+    ProviderCredentialRefreshStrategy, ProviderCredentialTokenGrantSubjectToken,
+    ProviderCredentialTokenGrantType, ProviderProfile, ProviderProfileCategory,
     ProviderProfileCredential, ProviderProfileDiscovery,
 };
 use openshell_core::secrets::uses_reserved_revision_namespace;
@@ -111,6 +112,13 @@ pub struct CredentialProfile {
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct TokenGrantProfile {
+    #[serde(
+        default = "default_token_grant_type",
+        deserialize_with = "deserialize_token_grant_type",
+        serialize_with = "serialize_token_grant_type",
+        skip_serializing_if = "is_client_credentials_grant"
+    )]
+    pub grant_type: ProviderCredentialTokenGrantType,
     pub token_endpoint: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub audience: String,
@@ -124,6 +132,18 @@ pub struct TokenGrantProfile {
     pub cache_ttl_seconds: i64,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub audience_overrides: Vec<TokenGrantAudienceOverrideProfile>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject_token: Option<TokenGrantSubjectTokenProfile>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub requested_token_type: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct TokenGrantSubjectTokenProfile {
+    pub source: String,
+    pub credential: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub subject_token_type: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -816,6 +836,26 @@ fn default_refresh_strategy() -> ProviderCredentialRefreshStrategy {
     ProviderCredentialRefreshStrategy::Unspecified
 }
 
+fn default_token_grant_type() -> ProviderCredentialTokenGrantType {
+    ProviderCredentialTokenGrantType::ClientCredentials
+}
+
+fn effective_token_grant_type(
+    grant_type: ProviderCredentialTokenGrantType,
+) -> ProviderCredentialTokenGrantType {
+    match grant_type {
+        ProviderCredentialTokenGrantType::Unspecified => {
+            ProviderCredentialTokenGrantType::ClientCredentials
+        }
+        other => other,
+    }
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_client_credentials_grant(value: &ProviderCredentialTokenGrantType) -> bool {
+    effective_token_grant_type(*value) == ProviderCredentialTokenGrantType::ClientCredentials
+}
+
 fn deserialize_category<'de, D>(deserializer: D) -> Result<ProviderProfileCategory, D::Error>
 where
     D: Deserializer<'de>,
@@ -856,6 +896,28 @@ where
     S: Serializer,
 {
     serializer.serialize_str(provider_refresh_strategy_to_yaml(*strategy))
+}
+
+fn deserialize_token_grant_type<'de, D>(
+    deserializer: D,
+) -> Result<ProviderCredentialTokenGrantType, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let raw = String::deserialize(deserializer)?;
+    provider_token_grant_type_from_yaml(&raw)
+        .ok_or_else(|| de::Error::custom(format!("unsupported provider token grant type: {raw}")))
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn serialize_token_grant_type<S>(
+    grant_type: &ProviderCredentialTokenGrantType,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    serializer.serialize_str(provider_token_grant_type_to_yaml(*grant_type))
 }
 
 #[must_use]
@@ -915,6 +977,26 @@ pub fn provider_refresh_strategy_to_yaml(
         ProviderCredentialRefreshStrategy::GoogleServiceAccountJwt => "google_service_account_jwt",
         ProviderCredentialRefreshStrategy::AwsStsAssumeRole => "aws_sts_assume_role",
         ProviderCredentialRefreshStrategy::Unspecified => "unspecified",
+    }
+}
+
+#[must_use]
+pub fn provider_token_grant_type_from_yaml(raw: &str) -> Option<ProviderCredentialTokenGrantType> {
+    match raw.trim().to_ascii_lowercase().replace('-', "_").as_str() {
+        "" | "client_credentials" => Some(ProviderCredentialTokenGrantType::ClientCredentials),
+        "token_exchange" => Some(ProviderCredentialTokenGrantType::TokenExchange),
+        _ => None,
+    }
+}
+
+#[must_use]
+pub fn provider_token_grant_type_to_yaml(
+    grant_type: ProviderCredentialTokenGrantType,
+) -> &'static str {
+    match grant_type {
+        ProviderCredentialTokenGrantType::TokenExchange => "token_exchange",
+        ProviderCredentialTokenGrantType::ClientCredentials
+        | ProviderCredentialTokenGrantType::Unspecified => "client_credentials",
     }
 }
 
@@ -979,6 +1061,10 @@ fn token_grant_from_proto(
     token_grant: &openshell_core::proto::ProviderCredentialTokenGrant,
 ) -> TokenGrantProfile {
     TokenGrantProfile {
+        grant_type: effective_token_grant_type(
+            ProviderCredentialTokenGrantType::try_from(token_grant.grant_type)
+                .unwrap_or(ProviderCredentialTokenGrantType::ClientCredentials),
+        ),
         token_endpoint: token_grant.token_endpoint.clone(),
         audience: token_grant.audience.clone(),
         jwt_svid_audience: token_grant.jwt_svid_audience.clone(),
@@ -990,6 +1076,11 @@ fn token_grant_from_proto(
             .iter()
             .map(token_grant_audience_override_from_proto)
             .collect(),
+        subject_token: token_grant
+            .subject_token
+            .as_ref()
+            .map(token_grant_subject_token_from_proto),
+        requested_token_type: token_grant.requested_token_type.clone(),
     }
 }
 
@@ -997,6 +1088,7 @@ fn token_grant_to_proto(
     token_grant: &TokenGrantProfile,
 ) -> openshell_core::proto::ProviderCredentialTokenGrant {
     openshell_core::proto::ProviderCredentialTokenGrant {
+        grant_type: token_grant.grant_type as i32,
         token_endpoint: token_grant.token_endpoint.clone(),
         audience: token_grant.audience.clone(),
         jwt_svid_audience: token_grant.jwt_svid_audience.clone(),
@@ -1008,6 +1100,31 @@ fn token_grant_to_proto(
             .iter()
             .map(token_grant_audience_override_to_proto)
             .collect(),
+        subject_token: token_grant
+            .subject_token
+            .as_ref()
+            .map(token_grant_subject_token_to_proto),
+        requested_token_type: token_grant.requested_token_type.clone(),
+    }
+}
+
+fn token_grant_subject_token_from_proto(
+    subject_token: &ProviderCredentialTokenGrantSubjectToken,
+) -> TokenGrantSubjectTokenProfile {
+    TokenGrantSubjectTokenProfile {
+        source: subject_token.source.clone(),
+        credential: subject_token.credential.clone(),
+        subject_token_type: subject_token.subject_token_type.clone(),
+    }
+}
+
+fn token_grant_subject_token_to_proto(
+    subject_token: &TokenGrantSubjectTokenProfile,
+) -> ProviderCredentialTokenGrantSubjectToken {
+    ProviderCredentialTokenGrantSubjectToken {
+        source: subject_token.source.clone(),
+        credential: subject_token.credential.clone(),
+        subject_token_type: subject_token.subject_token_type.clone(),
     }
 }
 
@@ -1816,6 +1933,12 @@ pub fn validate_profile_set(
                     message,
                 ));
             }
+            diagnostics.extend(validate_token_grant_subject_token(
+                source,
+                profile_id,
+                credential,
+                &credential_names,
+            ));
             diagnostics.extend(validate_token_grant_audience_overrides(
                 source,
                 profile_id,
@@ -2227,6 +2350,87 @@ struct TokenGrantOverrideBinding {
     score: u32,
 }
 
+fn validate_token_grant_subject_token(
+    source: &str,
+    profile_id: &str,
+    credential: &CredentialProfile,
+    credential_names: &HashSet<String>,
+) -> Vec<ProfileValidationDiagnostic> {
+    let Some(token_grant) = credential.token_grant.as_ref() else {
+        return Vec::new();
+    };
+    let grant_type = effective_token_grant_type(token_grant.grant_type);
+    let mut diagnostics = Vec::new();
+
+    match grant_type {
+        ProviderCredentialTokenGrantType::ClientCredentials => {
+            if token_grant.subject_token.is_some() {
+                diagnostics.push(ProfileValidationDiagnostic::error(
+                    source,
+                    profile_id,
+                    "credentials.token_grant.subject_token",
+                    "subject_token is only valid for token_exchange grants",
+                ));
+            }
+        }
+        ProviderCredentialTokenGrantType::TokenExchange => {
+            let Some(subject_token) = token_grant.subject_token.as_ref() else {
+                diagnostics.push(ProfileValidationDiagnostic::error(
+                    source,
+                    profile_id,
+                    "credentials.token_grant.subject_token",
+                    "token_exchange grants require subject_token",
+                ));
+                return diagnostics;
+            };
+
+            let subject_credential = subject_token.credential.trim();
+            match subject_token.source.trim() {
+                "provider_credential" => {
+                    if subject_credential.is_empty() {
+                        diagnostics.push(ProfileValidationDiagnostic::error(
+                            source,
+                            profile_id,
+                            "credentials.token_grant.subject_token.credential",
+                            "subject_token.credential is required",
+                        ));
+                    } else if !credential_names.contains(subject_credential) {
+                        diagnostics.push(ProfileValidationDiagnostic::error(
+                            source,
+                            profile_id,
+                            "credentials.token_grant.subject_token.credential",
+                            format!("unknown subject token credential: {subject_credential}"),
+                        ));
+                    }
+                }
+                "sandbox_delegated_identity" => {
+                    if !subject_credential.is_empty() {
+                        diagnostics.push(ProfileValidationDiagnostic::error(
+                            source,
+                            profile_id,
+                            "credentials.token_grant.subject_token.credential",
+                            "sandbox_delegated_identity subject_token must not set credential",
+                        ));
+                    }
+                }
+                _ => {
+                    diagnostics.push(ProfileValidationDiagnostic::error(
+                        source,
+                        profile_id,
+                        "credentials.token_grant.subject_token.source",
+                        "subject_token.source must be provider_credential or sandbox_delegated_identity",
+                    ));
+                }
+            }
+        }
+        ProviderCredentialTokenGrantType::Unspecified => {
+            unreachable!("effective_token_grant_type must normalize unspecified token grant type")
+        }
+    }
+
+    diagnostics
+}
+
 fn validate_token_grant_audience_overrides(
     source: &str,
     profile_id: &str,
@@ -2556,7 +2760,7 @@ pub fn builtin_profiles() -> &'static [ProviderTypeProfile] {
 mod tests {
     use std::collections::HashMap;
 
-    use openshell_core::proto::ProviderProfileCategory;
+    use openshell_core::proto::{ProviderCredentialTokenGrantType, ProviderProfileCategory};
 
     use super::{
         DiscoveryProfile, L7AllowProfile, L7QueryMatcherProfile, ProfileError, ProviderTypeProfile,
@@ -3137,6 +3341,166 @@ credentials:
         assert_eq!(
             reparsed_token_grant.audience_overrides,
             token_grant.audience_overrides
+        );
+    }
+
+    #[test]
+    fn token_exchange_grant_round_trips_through_proto_and_yaml() {
+        let profile = parse_profile_yaml(
+            r"
+id: keycloak-token-exchange
+display_name: Keycloak Token Exchange
+credentials:
+  - name: USER_OIDC_TOKEN
+    required: true
+  - name: access_token
+    auth_style: bearer
+    header_name: Authorization
+    token_grant:
+      grant_type: token_exchange
+      token_endpoint: https://keycloak.example.com/realms/openshell/protocol/openid-connect/token
+      subject_token:
+        source: provider_credential
+        credential: USER_OIDC_TOKEN
+        subject_token_type: urn:ietf:params:oauth:token-type:access_token
+      jwt_svid_audience: https://keycloak.example.com/realms/openshell
+      client_assertion_type: urn:ietf:params:oauth:client-assertion-type:jwt-bearer
+      audience: https://graph.example.com
+      scopes: [graph.read]
+      requested_token_type: urn:ietf:params:oauth:token-type:access_token
+",
+        )
+        .expect("profile should parse");
+
+        let diagnostics =
+            validate_profile_set(&[("keycloak-token-exchange.yaml".to_string(), profile.clone())]);
+        assert!(
+            diagnostics.is_empty(),
+            "unexpected diagnostics: {diagnostics:?}"
+        );
+
+        let token_grant = profile.credentials[1]
+            .token_grant
+            .as_ref()
+            .expect("token grant should parse");
+        assert_eq!(
+            token_grant.grant_type,
+            ProviderCredentialTokenGrantType::TokenExchange
+        );
+        assert_eq!(
+            token_grant
+                .subject_token
+                .as_ref()
+                .map(|subject| subject.credential.as_str()),
+            Some("USER_OIDC_TOKEN")
+        );
+
+        let from_proto = ProviderTypeProfile::from_proto(&profile.to_proto());
+        assert_eq!(
+            from_proto.credentials[1].token_grant,
+            profile.credentials[1].token_grant
+        );
+
+        let exported = profile_to_yaml(&from_proto).expect("yaml");
+        assert!(exported.contains("grant_type: token_exchange"));
+        assert!(exported.contains("subject_token:"));
+        let reparsed = parse_profile_yaml(&exported).expect("re-parse");
+        assert_eq!(
+            reparsed.credentials[1].token_grant,
+            profile.credentials[1].token_grant
+        );
+    }
+
+    #[test]
+    fn validate_profile_set_rejects_token_exchange_without_subject_token() {
+        let profile = parse_profile_yaml(
+            r"
+id: missing-subject-token
+display_name: Missing Subject Token
+credentials:
+  - name: access_token
+    auth_style: bearer
+    header_name: Authorization
+    token_grant:
+      grant_type: token_exchange
+      token_endpoint: https://keycloak.example.com/realms/openshell/protocol/openid-connect/token
+",
+        )
+        .expect("profile should parse");
+
+        let diagnostics = validate_profile_set(&[("missing.yaml".to_string(), profile)]);
+        let diagnostic = diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.field == "credentials.token_grant.subject_token")
+            .expect("expected subject_token diagnostic");
+        assert_eq!(
+            diagnostic.message,
+            "token_exchange grants require subject_token"
+        );
+    }
+
+    #[test]
+    fn validate_profile_set_rejects_token_exchange_unknown_subject_credential() {
+        let profile = parse_profile_yaml(
+            r"
+id: unknown-subject-token
+display_name: Unknown Subject Token
+credentials:
+  - name: access_token
+    auth_style: bearer
+    header_name: Authorization
+    token_grant:
+      grant_type: token_exchange
+      token_endpoint: https://keycloak.example.com/realms/openshell/protocol/openid-connect/token
+      subject_token:
+        source: provider_credential
+        credential: USER_OIDC_TOKEN
+",
+        )
+        .expect("profile should parse");
+
+        let diagnostics = validate_profile_set(&[("unknown.yaml".to_string(), profile)]);
+        let diagnostic = diagnostics
+            .iter()
+            .find(|diagnostic| {
+                diagnostic.field == "credentials.token_grant.subject_token.credential"
+            })
+            .expect("expected subject token credential diagnostic");
+        assert!(
+            diagnostic
+                .message
+                .contains("unknown subject token credential: USER_OIDC_TOKEN")
+        );
+    }
+
+    #[test]
+    fn validate_profile_set_rejects_subject_token_on_client_credentials_grant() {
+        let profile = parse_profile_yaml(
+            r"
+id: misplaced-subject-token
+display_name: Misplaced Subject Token
+credentials:
+  - name: USER_OIDC_TOKEN
+  - name: access_token
+    auth_style: bearer
+    header_name: Authorization
+    token_grant:
+      token_endpoint: https://keycloak.example.com/realms/openshell/protocol/openid-connect/token
+      subject_token:
+        source: provider_credential
+        credential: USER_OIDC_TOKEN
+",
+        )
+        .expect("profile should parse");
+
+        let diagnostics = validate_profile_set(&[("misplaced.yaml".to_string(), profile)]);
+        let diagnostic = diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.field == "credentials.token_grant.subject_token")
+            .expect("expected subject_token diagnostic");
+        assert_eq!(
+            diagnostic.message,
+            "subject_token is only valid for token_exchange grants"
         );
     }
 

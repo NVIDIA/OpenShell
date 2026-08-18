@@ -819,6 +819,7 @@ fn create_sandbox_request(spec: SandboxSpec) -> proto::CreateSandboxRequest {
         labels,
         annotations: HashMap::new(),
         workspace: String::new(),
+        delegated_identity: None,
     }
 }
 

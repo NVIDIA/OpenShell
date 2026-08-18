@@ -95,6 +95,8 @@ struct JwkKey {
 pub struct OidcClaims {
     pub sub: String,
     #[serde(default)]
+    pub exp: i64,
+    #[serde(default)]
     pub preferred_username: Option<String>,
     #[serde(default)]
     #[allow(dead_code)]
@@ -240,6 +242,7 @@ impl JwksCache {
             let Some(ref kid) = key.kid else {
                 continue;
             };
+            crate::install_jsonwebtoken_crypto_provider();
             match DecodingKey::from_rsa_components(&key.n, &key.e) {
                 Ok(dk) => {
                     new_keys.insert(kid.clone(), dk);
@@ -286,6 +289,13 @@ impl JwksCache {
     /// This is the authentication step — it verifies the caller's identity
     /// but does not check authorization (that's `authz::AuthzPolicy::check`).
     pub async fn validate_token(&self, token: &str) -> Result<Identity, Status> {
+        Ok(self.validate_token_details(token).await?.identity)
+    }
+
+    /// Validate a JWT and return the derived identity plus verified token metadata.
+    pub async fn validate_token_details(&self, token: &str) -> Result<ValidatedOidcToken, Status> {
+        crate::install_jsonwebtoken_crypto_provider();
+
         self.refresh_if_stale().await.map_err(|e| {
             warn!(error = %e, "JWKS refresh failed");
             Status::internal("OIDC key refresh failed")
@@ -331,6 +341,10 @@ impl JwksCache {
         })?;
 
         let mut claims = token_data.claims;
+        let expires_at_ms = claims.exp.saturating_mul(1000);
+        if expires_at_ms <= 0 {
+            return Err(Status::unauthenticated("invalid token: invalid exp"));
+        }
         claims.extract_roles(&self.config.roles_claim);
 
         let scopes = if self.config.scopes_claim.is_empty() {
@@ -339,14 +353,23 @@ impl JwksCache {
             claims.extract_scopes(&self.config.scopes_claim)
         };
 
-        Ok(Identity {
-            subject: claims.sub,
-            display_name: claims.preferred_username,
-            roles: claims.roles,
-            scopes,
-            provider: IdentityProvider::Oidc,
+        Ok(ValidatedOidcToken {
+            identity: Identity {
+                subject: claims.sub,
+                display_name: claims.preferred_username,
+                roles: claims.roles,
+                scopes,
+                provider: IdentityProvider::Oidc,
+            },
+            expires_at_ms,
         })
     }
+}
+
+/// A verified OIDC access token and server-derived metadata.
+pub struct ValidatedOidcToken {
+    pub identity: Identity,
+    pub expires_at_ms: i64,
 }
 
 /// Authenticator that validates `Authorization: Bearer <jwt>` headers against
@@ -568,6 +591,8 @@ mod tests {
 
     /// Sign `claims` with the test key, tagging the header with `kid`.
     fn mint_rs256(claims: &serde_json::Value, kid: &str) -> String {
+        crate::install_jsonwebtoken_crypto_provider();
+
         let mut header = jsonwebtoken::Header::new(Algorithm::RS256);
         header.kid = Some(kid.to_owned());
         let key = jsonwebtoken::EncodingKey::from_rsa_pem(TEST_RSA_KEY.private_pem.as_bytes())
@@ -682,6 +707,7 @@ mod tests {
         let cache = cache_with_mock_issuer(&server).await;
 
         let other = TestRsaKey::generate();
+        crate::install_jsonwebtoken_crypto_provider();
         let mut header = jsonwebtoken::Header::new(Algorithm::RS256);
         header.kid = Some(TEST_KID.to_owned());
         let token = jsonwebtoken::encode(

@@ -13,10 +13,11 @@ use openshell_cli::{
 };
 use openshell_core::proto::{
     CreateProviderRequest, CreateSshSessionRequest, CreateSshSessionResponse,
-    DeleteProviderRequest, DeleteProviderResponse, ExecSandboxEvent, ExecSandboxInput,
-    ExecSandboxRequest, GetProviderRequest, HealthRequest, HealthResponse, ListProvidersRequest,
-    ListProvidersResponse, ProviderResponse, RevokeSshSessionRequest, RevokeSshSessionResponse,
-    ServiceStatus, UpdateProviderRequest,
+    DeleteProviderRequest, DeleteProviderResponse, ExchangeProviderSubjectTokenRequest,
+    ExchangeProviderSubjectTokenResponse, ExecSandboxEvent, ExecSandboxInput, ExecSandboxRequest,
+    GetProviderRequest, HealthRequest, HealthResponse, ListProvidersRequest, ListProvidersResponse,
+    ProviderResponse, RevokeSshSessionRequest, RevokeSshSessionResponse, ServiceStatus,
+    UpdateProviderRequest,
     open_shell_server::{OpenShell, OpenShellServer},
 };
 use tempfile::tempdir;
@@ -77,6 +78,64 @@ impl OpenShell for TestOpenShell {
         &self,
         _request: tonic::Request<openshell_core::proto::StartSandboxRequest>,
     ) -> Result<Response<openshell_core::proto::SandboxResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn get_sandbox_delegated_identity_status(
+        &self,
+        _request: tonic::Request<openshell_core::proto::GetSandboxDelegatedIdentityStatusRequest>,
+    ) -> Result<Response<openshell_core::proto::GetSandboxDelegatedIdentityStatusResponse>, Status>
+    {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn withdraw_sandbox_delegated_identity(
+        &self,
+        _request: tonic::Request<openshell_core::proto::WithdrawSandboxDelegatedIdentityRequest>,
+    ) -> Result<Response<openshell_core::proto::WithdrawSandboxDelegatedIdentityResponse>, Status>
+    {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn extend_sandbox_delegated_identity(
+        &self,
+        _request: tonic::Request<openshell_core::proto::ExtendSandboxDelegatedIdentityRequest>,
+    ) -> Result<Response<openshell_core::proto::ExtendSandboxDelegatedIdentityResponse>, Status>
+    {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn list_delegated_identity_credentials(
+        &self,
+        _request: tonic::Request<openshell_core::proto::ListDelegatedIdentityCredentialsRequest>,
+    ) -> Result<Response<openshell_core::proto::ListDelegatedIdentityCredentialsResponse>, Status>
+    {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn get_delegated_identity_credential_status(
+        &self,
+        _request: tonic::Request<
+            openshell_core::proto::GetDelegatedIdentityCredentialStatusRequest,
+        >,
+    ) -> Result<Response<openshell_core::proto::GetDelegatedIdentityCredentialStatusResponse>, Status>
+    {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn revoke_delegated_identity_credential(
+        &self,
+        _request: tonic::Request<openshell_core::proto::RevokeDelegatedIdentityCredentialRequest>,
+    ) -> Result<Response<openshell_core::proto::RevokeDelegatedIdentityCredentialResponse>, Status>
+    {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn delete_delegated_identity_credential(
+        &self,
+        _request: tonic::Request<openshell_core::proto::DeleteDelegatedIdentityCredentialRequest>,
+    ) -> Result<Response<openshell_core::proto::DeleteDelegatedIdentityCredentialResponse>, Status>
+    {
         Err(Status::unimplemented("unused"))
     }
 
@@ -204,6 +263,13 @@ impl OpenShell for TestOpenShell {
         _request: tonic::Request<RevokeSshSessionRequest>,
     ) -> Result<Response<RevokeSshSessionResponse>, Status> {
         Ok(Response::new(RevokeSshSessionResponse::default()))
+    }
+
+    async fn exchange_provider_subject_token(
+        &self,
+        _request: tonic::Request<ExchangeProviderSubjectTokenRequest>,
+    ) -> Result<Response<ExchangeProviderSubjectTokenResponse>, Status> {
+        Err(Status::unimplemented("unused"))
     }
 
     async fn create_provider(

@@ -564,6 +564,13 @@ enum Commands {
         command: Option<ProviderCommands>,
     },
 
+    /// Manage delegated identity credential records.
+    #[command(help_template = SUBCOMMAND_HELP_TEMPLATE)]
+    DelegatedCredential {
+        #[command(subcommand)]
+        command: Option<DelegatedCredentialCommands>,
+    },
+
     /// Manage workspaces.
     #[command(alias = "ws", after_help = WORKSPACE_EXAMPLES, help_template = SUBCOMMAND_HELP_TEMPLATE)]
     Workspace {
@@ -811,7 +818,7 @@ impl From<CliEditor> for openshell_cli::ssh::Editor {
 #[derive(Subcommand, Debug)]
 enum ProviderCommands {
     /// Create a provider config.
-    #[command(group = clap::ArgGroup::new("cred_source").required(true).args(["from_existing", "credentials", "from_gcloud_adc", "runtime_credentials"]), help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    #[command(group = clap::ArgGroup::new("cred_source").required(true).multiple(true).args(["from_existing", "credentials", "from_gcloud_adc", "runtime_credentials", "from_oidc_token"]), help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Create {
         /// Provider name.
         #[arg(long)]
@@ -822,7 +829,7 @@ enum ProviderCommands {
         provider_type: String,
 
         /// Load provider credentials/config from existing local state.
-        #[arg(long, conflicts_with_all = ["credentials", "from_gcloud_adc", "runtime_credentials"])]
+        #[arg(long, conflicts_with_all = ["credentials", "from_gcloud_adc", "runtime_credentials", "from_oidc_token"])]
         from_existing: bool,
 
         /// Provider credential pair (`KEY=VALUE`) or env lookup key (`KEY`).
@@ -836,11 +843,15 @@ enum ProviderCommands {
         /// Configure credentials from gcloud Application Default Credentials
         /// (`~/.config/gcloud/application_default_credentials.json`).
         /// Valid for providers whose profile declares an ADC-compatible credential.
-        #[arg(long, group = "cred_source", conflicts_with_all = ["from_existing", "credentials", "runtime_credentials"])]
+        #[arg(long, group = "cred_source", conflicts_with_all = ["from_existing", "credentials", "runtime_credentials", "from_oidc_token"])]
         from_gcloud_adc: bool,
 
+        /// Store the active gateway OIDC access token as the named provider credential.
+        #[arg(long, group = "cred_source", conflicts_with_all = ["from_existing", "from_gcloud_adc", "runtime_credentials"])]
+        from_oidc_token: bool,
+
         /// Create a provider whose required credentials are resolved at runtime by the gateway/sandbox.
-        #[arg(long, conflicts_with_all = ["from_existing", "credentials", "from_gcloud_adc"])]
+        #[arg(long, conflicts_with_all = ["from_existing", "credentials", "from_gcloud_adc", "from_oidc_token"])]
         runtime_credentials: bool,
 
         /// Provider config key/value pair.
@@ -913,8 +924,12 @@ enum ProviderCommands {
         name: String,
 
         /// Re-discover credentials from existing local state (e.g. env vars, config files).
-        #[arg(long, conflicts_with = "credentials")]
+        #[arg(long, conflicts_with_all = ["credentials", "from_oidc_token"])]
         from_existing: bool,
+
+        /// Store the active gateway OIDC access token as the named provider credential.
+        #[arg(long, conflicts_with = "from_existing")]
+        from_oidc_token: bool,
 
         /// Provider credential pair (`KEY=VALUE`) or env lookup key (`KEY`).
         #[arg(
@@ -1091,6 +1106,62 @@ enum ProviderProfileCommands {
         /// Target platform-scoped profile (ignores --workspace).
         #[arg(long)]
         global: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum DelegatedCredentialCommands {
+    /// List delegated identity credentials.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    List {
+        /// Maximum number of credentials to return.
+        #[arg(long, default_value_t = 100)]
+        limit: u32,
+
+        /// Number of credentials to skip.
+        #[arg(long, default_value_t = 0)]
+        offset: u32,
+
+        /// Output only credential IDs.
+        #[arg(long, conflicts_with = "output")]
+        ids: bool,
+
+        /// Output format.
+        #[arg(short = 'o', long = "output", value_enum, default_value_t = OutputFormat::Table, conflicts_with = "ids")]
+        output: OutputFormat,
+    },
+
+    /// Show delegated identity credential status.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Status {
+        /// Delegated identity credential ID.
+        id: String,
+
+        /// Output format.
+        #[arg(short = 'o', long = "output", value_enum, default_value_t = OutputFormat::Table)]
+        output: OutputFormat,
+    },
+
+    /// Revoke a delegated identity credential.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Revoke {
+        /// Delegated identity credential ID.
+        id: String,
+
+        /// Expected resource version for compare-and-swap updates.
+        #[arg(long = "resource-version", default_value_t = 0)]
+        resource_version: u64,
+    },
+
+    /// Delete a delegated identity credential record.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Delete {
+        /// Delegated identity credential ID.
+        id: String,
+
+        /// Expected resource version for compare-and-swap deletes.
+        #[arg(long = "resource-version", default_value_t = 0)]
+        resource_version: u64,
     },
 }
 
@@ -1397,6 +1468,11 @@ enum SandboxCommands {
         #[arg(long = "provider")]
         providers: Vec<String>,
 
+        /// Delegate the current OIDC identity to the sandbox for a bounded duration.
+        /// Accepts positive durations with m, h, or d suffixes, for example 30m, 8h, or 7d.
+        #[arg(long = "delegate-identity-for", value_name = "DURATION")]
+        delegate_identity_for: Option<String>,
+
         /// Path to a custom sandbox policy YAML file.
         /// Overrides the built-in default and the `OPENSHELL_SANDBOX_POLICY` env var.
         #[arg(long, value_hint = ValueHint::FilePath)]
@@ -1651,6 +1727,41 @@ enum SandboxCommands {
     /// Manage providers attached to a sandbox.
     #[command(subcommand)]
     Provider(SandboxProviderCommands),
+
+    /// Manage sandbox delegated identity.
+    #[command(subcommand, name = "delegated-identity")]
+    DelegatedIdentity(SandboxDelegatedIdentityCommands),
+}
+
+#[derive(Subcommand, Debug)]
+enum SandboxDelegatedIdentityCommands {
+    /// Show delegated identity status for a sandbox.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Status {
+        /// Sandbox name.
+        #[arg(add = ArgValueCompleter::new(completers::complete_sandbox_names))]
+        name: String,
+    },
+
+    /// Withdraw delegated identity from a sandbox.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Withdraw {
+        /// Sandbox name.
+        #[arg(add = ArgValueCompleter::new(completers::complete_sandbox_names))]
+        name: String,
+    },
+
+    /// Set delegated identity expiry to now plus the requested duration.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Extend {
+        /// Sandbox name.
+        #[arg(add = ArgValueCompleter::new(completers::complete_sandbox_names))]
+        name: String,
+
+        /// New authorization window, for example 24h.
+        #[arg(long = "for", value_name = "DURATION")]
+        duration: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -2971,6 +3082,7 @@ async fn run_async() -> Result<()> {
                     memory,
                     driver_config_json,
                     providers,
+                    delegate_identity_for,
                     policy,
                     forward,
                     tty,
@@ -3061,6 +3173,7 @@ async fn run_async() -> Result<()> {
                             driver_config_json: driver_config_json.as_deref(),
                             editor,
                             providers: &providers,
+                            delegate_identity_for: delegate_identity_for.as_deref(),
                             policy: policy.as_deref(),
                             forward,
                             command: &command,
@@ -3271,6 +3384,37 @@ async fn run_async() -> Result<()> {
                                 .await?;
                             }
                         },
+                        SandboxCommands::DelegatedIdentity(command) => match command {
+                            SandboxDelegatedIdentityCommands::Status { name } => {
+                                run::sandbox_delegated_identity_status(
+                                    endpoint,
+                                    &name,
+                                    &cli.workspace,
+                                    &tls,
+                                )
+                                .await?;
+                            }
+                            SandboxDelegatedIdentityCommands::Withdraw { name } => {
+                                run::sandbox_delegated_identity_withdraw(
+                                    endpoint,
+                                    &name,
+                                    &cli.workspace,
+                                    &tls,
+                                )
+                                .await?;
+                            }
+                            SandboxDelegatedIdentityCommands::Extend { name, duration } => {
+                                run::sandbox_delegated_identity_extend(
+                                    endpoint,
+                                    &ctx.name,
+                                    &name,
+                                    &duration,
+                                    &cli.workspace,
+                                    &tls,
+                                )
+                                .await?;
+                            }
+                        },
                     }
                 }
             }
@@ -3352,24 +3496,34 @@ async fn run_async() -> Result<()> {
                     from_existing,
                     credentials,
                     from_gcloud_adc,
+                    from_oidc_token,
                     runtime_credentials,
                     config,
                     global_profile,
                 } => {
                     let profile_ws = if global_profile { "" } else { &cli.workspace };
-                    run::provider_create_with_options(
-                        endpoint,
-                        &name,
-                        provider_type.as_str(),
-                        from_existing,
-                        &credentials,
-                        from_gcloud_adc,
-                        runtime_credentials,
-                        &config,
-                        &cli.workspace,
-                        profile_ws,
-                        &tls,
-                    )
+                    let credential_source = if from_existing {
+                        run::ProviderCreateCredentialSource::Existing
+                    } else if from_gcloud_adc {
+                        run::ProviderCreateCredentialSource::GcloudAdc
+                    } else if from_oidc_token {
+                        run::ProviderCreateCredentialSource::OidcToken
+                    } else if runtime_credentials {
+                        run::ProviderCreateCredentialSource::Runtime
+                    } else {
+                        run::ProviderCreateCredentialSource::ExplicitCredentials
+                    };
+                    run::provider_create_with_options(run::ProviderCreateOptions {
+                        server: endpoint,
+                        name: &name,
+                        provider_type: provider_type.as_str(),
+                        credentials: &credentials,
+                        credential_source,
+                        config: &config,
+                        workspace: &cli.workspace,
+                        profile_workspace: profile_ws,
+                        tls: &tls,
+                    })
                     .await?;
                 }
                 ProviderCommands::Refresh(command) => match command {
@@ -3522,24 +3676,81 @@ async fn run_async() -> Result<()> {
                 ProviderCommands::Update {
                     name,
                     from_existing,
+                    from_oidc_token,
                     credentials,
                     config,
                     credential_expires_at,
                 } => {
-                    run::provider_update(
-                        endpoint,
-                        &name,
+                    run::provider_update(run::ProviderUpdateOptions {
+                        server: endpoint,
+                        name: &name,
                         from_existing,
-                        &credentials,
-                        &config,
-                        &credential_expires_at,
-                        &cli.workspace,
-                        &tls,
-                    )
+                        from_oidc_token,
+                        credentials: &credentials,
+                        config: &config,
+                        credential_expires_at: &credential_expires_at,
+                        workspace: &cli.workspace,
+                        tls: &tls,
+                    })
                     .await?;
                 }
                 ProviderCommands::Delete { names } => {
                     run::provider_delete(endpoint, &names, &cli.workspace, &tls).await?;
+                }
+            }
+        }
+        Some(Commands::DelegatedCredential {
+            command: Some(command),
+        }) => {
+            let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
+            let endpoint = &ctx.endpoint;
+            let mut tls = tls.with_gateway_name(&ctx.name);
+            apply_auth(&mut tls, &ctx.name);
+
+            match command {
+                DelegatedCredentialCommands::List {
+                    limit,
+                    offset,
+                    ids,
+                    output,
+                } => {
+                    run::delegated_identity_credential_list(
+                        endpoint,
+                        limit,
+                        offset,
+                        ids,
+                        output.as_str(),
+                        &tls,
+                    )
+                    .await?;
+                }
+                DelegatedCredentialCommands::Status { id, output } => {
+                    run::delegated_identity_credential_status(endpoint, &id, output.as_str(), &tls)
+                        .await?;
+                }
+                DelegatedCredentialCommands::Revoke {
+                    id,
+                    resource_version,
+                } => {
+                    run::delegated_identity_credential_revoke(
+                        endpoint,
+                        &id,
+                        resource_version,
+                        &tls,
+                    )
+                    .await?;
+                }
+                DelegatedCredentialCommands::Delete {
+                    id,
+                    resource_version,
+                } => {
+                    run::delegated_identity_credential_delete(
+                        endpoint,
+                        &id,
+                        resource_version,
+                        &tls,
+                    )
+                    .await?;
                 }
             }
         }
@@ -3671,6 +3882,13 @@ async fn run_async() -> Result<()> {
             Cli::command()
                 .find_subcommand_mut("provider")
                 .expect("provider subcommand exists")
+                .print_help()
+                .expect("Failed to print help");
+        }
+        Some(Commands::DelegatedCredential { command: None }) => {
+            Cli::command()
+                .find_subcommand_mut("delegated-credential")
+                .expect("delegated-credential subcommand exists")
                 .print_help()
                 .expect("Failed to print help");
         }
@@ -4391,6 +4609,60 @@ mod tests {
                     global: false,
                 })
             })
+        ));
+    }
+
+    #[test]
+    fn delegated_credential_commands_parse() {
+        let list = Cli::try_parse_from(["openshell", "delegated-credential", "list", "--ids"])
+            .expect("delegated credential list should parse");
+        assert!(matches!(
+            list.command,
+            Some(Commands::DelegatedCredential {
+                command: Some(DelegatedCredentialCommands::List {
+                    ids: true,
+                    output: OutputFormat::Table,
+                    ..
+                })
+            })
+        ));
+
+        let status = Cli::try_parse_from([
+            "openshell",
+            "delegated-credential",
+            "status",
+            "delegated-identity-123",
+            "-o",
+            "json",
+        ])
+        .expect("delegated credential status should parse");
+        assert!(matches!(
+            status.command,
+            Some(Commands::DelegatedCredential {
+                command: Some(DelegatedCredentialCommands::Status {
+                    id,
+                    output: OutputFormat::Json,
+                })
+            }) if id == "delegated-identity-123"
+        ));
+
+        let revoke = Cli::try_parse_from([
+            "openshell",
+            "delegated-credential",
+            "revoke",
+            "delegated-identity-123",
+            "--resource-version",
+            "7",
+        ])
+        .expect("delegated credential revoke should parse");
+        assert!(matches!(
+            revoke.command,
+            Some(Commands::DelegatedCredential {
+                command: Some(DelegatedCredentialCommands::Revoke {
+                    id,
+                    resource_version: 7,
+                })
+            }) if id == "delegated-identity-123"
         ));
     }
 

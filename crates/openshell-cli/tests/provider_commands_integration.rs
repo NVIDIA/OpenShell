@@ -14,7 +14,8 @@ use openshell_core::proto::{
     CreateSandboxRequest, CreateSshSessionRequest, CreateSshSessionResponse,
     DeleteProviderRefreshRequest, DeleteProviderRefreshResponse, DeleteProviderRequest,
     DeleteProviderResponse, DeleteSandboxRequest, DeleteSandboxResponse,
-    DetachSandboxProviderRequest, DetachSandboxProviderResponse, ExecSandboxEvent,
+    DetachSandboxProviderRequest, DetachSandboxProviderResponse,
+    ExchangeProviderSubjectTokenRequest, ExchangeProviderSubjectTokenResponse, ExecSandboxEvent,
     ExecSandboxInput, ExecSandboxRequest, GatewayMessage, GetGatewayConfigRequest,
     GetGatewayConfigResponse, GetProviderRefreshStatusRequest, GetProviderRefreshStatusResponse,
     GetProviderRequest, GetSandboxConfigRequest, GetSandboxConfigResponse,
@@ -140,6 +141,64 @@ impl OpenShell for TestOpenShell {
         &self,
         _request: tonic::Request<openshell_core::proto::StartSandboxRequest>,
     ) -> Result<Response<SandboxResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn get_sandbox_delegated_identity_status(
+        &self,
+        _request: tonic::Request<openshell_core::proto::GetSandboxDelegatedIdentityStatusRequest>,
+    ) -> Result<Response<openshell_core::proto::GetSandboxDelegatedIdentityStatusResponse>, Status>
+    {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn withdraw_sandbox_delegated_identity(
+        &self,
+        _request: tonic::Request<openshell_core::proto::WithdrawSandboxDelegatedIdentityRequest>,
+    ) -> Result<Response<openshell_core::proto::WithdrawSandboxDelegatedIdentityResponse>, Status>
+    {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn extend_sandbox_delegated_identity(
+        &self,
+        _request: tonic::Request<openshell_core::proto::ExtendSandboxDelegatedIdentityRequest>,
+    ) -> Result<Response<openshell_core::proto::ExtendSandboxDelegatedIdentityResponse>, Status>
+    {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn list_delegated_identity_credentials(
+        &self,
+        _request: tonic::Request<openshell_core::proto::ListDelegatedIdentityCredentialsRequest>,
+    ) -> Result<Response<openshell_core::proto::ListDelegatedIdentityCredentialsResponse>, Status>
+    {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn get_delegated_identity_credential_status(
+        &self,
+        _request: tonic::Request<
+            openshell_core::proto::GetDelegatedIdentityCredentialStatusRequest,
+        >,
+    ) -> Result<Response<openshell_core::proto::GetDelegatedIdentityCredentialStatusResponse>, Status>
+    {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn revoke_delegated_identity_credential(
+        &self,
+        _request: tonic::Request<openshell_core::proto::RevokeDelegatedIdentityCredentialRequest>,
+    ) -> Result<Response<openshell_core::proto::RevokeDelegatedIdentityCredentialResponse>, Status>
+    {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn delete_delegated_identity_credential(
+        &self,
+        _request: tonic::Request<openshell_core::proto::DeleteDelegatedIdentityCredentialRequest>,
+    ) -> Result<Response<openshell_core::proto::DeleteDelegatedIdentityCredentialResponse>, Status>
+    {
         Err(Status::unimplemented("unused"))
     }
 
@@ -363,6 +422,13 @@ impl OpenShell for TestOpenShell {
         _request: tonic::Request<RevokeSshSessionRequest>,
     ) -> Result<Response<RevokeSshSessionResponse>, Status> {
         Ok(Response::new(RevokeSshSessionResponse::default()))
+    }
+
+    async fn exchange_provider_subject_token(
+        &self,
+        _request: tonic::Request<ExchangeProviderSubjectTokenRequest>,
+    ) -> Result<Response<ExchangeProviderSubjectTokenResponse>, Status> {
+        Err(Status::unimplemented("unused"))
     }
 
     async fn create_provider(
@@ -1179,16 +1245,17 @@ async fn provider_cli_run_functions_support_full_crud_flow() {
     .await
     .expect("provider list");
 
-    run::provider_update(
-        &ts.endpoint,
-        "my-claude",
-        false,
-        &["API_KEY=rotated".to_string()],
-        &["profile=prod".to_string()],
-        &[],
-        "default",
-        &ts.tls,
-    )
+    run::provider_update(run::ProviderUpdateOptions {
+        server: &ts.endpoint,
+        name: "my-claude",
+        from_existing: false,
+        from_oidc_token: false,
+        credentials: &["API_KEY=rotated".to_string()],
+        config: &["profile=prod".to_string()],
+        credential_expires_at: &[],
+        workspace: "default",
+        tls: &ts.tls,
+    })
     .await
     .expect("provider update");
 
@@ -1537,19 +1604,17 @@ async fn provider_create_allows_empty_credentials_for_gateway_refresh_profiles()
         },
     );
 
-    run::provider_create_with_options(
-        &ts.endpoint,
-        "custom-refresh-provider",
-        "custom-refresh",
-        false,
-        &[],
-        false,
-        true,
-        &[],
-        "default",
-        "default",
-        &ts.tls,
-    )
+    run::provider_create_with_options(run::ProviderCreateOptions {
+        server: &ts.endpoint,
+        name: "custom-refresh-provider",
+        provider_type: "custom-refresh",
+        credentials: &[],
+        credential_source: run::ProviderCreateCredentialSource::Runtime,
+        config: &[],
+        workspace: "default",
+        profile_workspace: "default",
+        tls: &ts.tls,
+    })
     .await
     .expect("provider create");
 
@@ -2093,16 +2158,17 @@ async fn provider_update_from_existing_uses_profile_discovery_when_v2_enabled() 
     );
     let _env = EnvVarGuard::set(&[("CUSTOM_UPDATE_DISCOVERY_API_KEY", "updated-profile-secret")]);
 
-    run::provider_update(
-        &ts.endpoint,
-        "custom-update",
-        true,
-        &[],
-        &[],
-        &[],
-        "default",
-        &ts.tls,
-    )
+    run::provider_update(run::ProviderUpdateOptions {
+        server: &ts.endpoint,
+        name: "custom-update",
+        from_existing: true,
+        from_oidc_token: false,
+        credentials: &[],
+        config: &[],
+        credential_expires_at: &[],
+        workspace: "default",
+        tls: &ts.tls,
+    })
     .await
     .expect("profile-backed provider update --from-existing");
 
@@ -2357,19 +2423,17 @@ async fn provider_create_supports_generic_type_and_env_lookup_credentials() {
 async fn provider_create_sends_inline_credentials() {
     let ts = run_server().await;
 
-    run::provider_create_with_options(
-        &ts.endpoint,
-        "openai-inline",
-        "openai",
-        false,
-        &["OPENAI_API_KEY=sk-test".to_string()],
-        false,
-        false,
-        &[],
-        "default",
-        "default",
-        &ts.tls,
-    )
+    run::provider_create_with_options(run::ProviderCreateOptions {
+        server: &ts.endpoint,
+        name: "openai-inline",
+        provider_type: "openai",
+        credentials: &["OPENAI_API_KEY=sk-test".to_string()],
+        credential_source: run::ProviderCreateCredentialSource::ExplicitCredentials,
+        config: &[],
+        workspace: "default",
+        profile_workspace: "default",
+        tls: &ts.tls,
+    })
     .await
     .expect("provider create with inline credential");
 
@@ -2435,7 +2499,7 @@ async fn provider_create_rejects_combined_from_gcloud_adc_and_from_existing() {
 
     assert!(
         err.to_string()
-            .contains("--from-gcloud-adc cannot be combined with --from-existing, --credential"),
+            .contains("--from-gcloud-adc cannot be combined with --from-existing, --from-oidc-token, or --credential"),
         "unexpected error: {err}"
     );
     assert!(ts.state.providers.lock().await.is_empty());
@@ -2461,7 +2525,7 @@ async fn provider_create_rejects_combined_from_gcloud_adc_and_credentials() {
 
     assert!(
         err.to_string()
-            .contains("--from-gcloud-adc cannot be combined with --from-existing, --credential"),
+            .contains("--from-gcloud-adc cannot be combined with --from-existing, --from-oidc-token, or --credential"),
         "unexpected error: {err}"
     );
     assert!(ts.state.providers.lock().await.is_empty());
