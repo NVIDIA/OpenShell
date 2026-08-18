@@ -2273,7 +2273,7 @@ fn resolve_cdi_requirements_from_env(
         emit_cdi_validation_failure(&err.to_string());
         miette::miette!("Failed to load CDI context from {context_path}: {err}")
     })?;
-    validate_cdi_context_mount_roots(&context)?;
+    validate_cdi_context_projection(&context)?;
     ocsf_emit!(
         ConfigStateChangeBuilder::new(ocsf_ctx())
             .severity(SeverityId::Informational)
@@ -2295,9 +2295,23 @@ fn resolve_cdi_requirements_from_env(
     Ok(Some(requirements))
 }
 
-fn validate_cdi_context_mount_roots(context: &openshell_core::cdi::CdiContext) -> Result<()> {
+fn validate_cdi_context_projection(context: &openshell_core::cdi::CdiContext) -> Result<()> {
+    if !context
+        .selected_devices
+        .iter()
+        .any(|device| !device.trim().is_empty())
+    {
+        let message = "CDI context must select at least one device";
+        emit_cdi_validation_failure(message);
+        return Err(miette::miette!(message));
+    }
+    if context.spec_dirs.is_empty() {
+        let message = "CDI context must list at least one spec directory";
+        emit_cdi_validation_failure(message);
+        return Err(miette::miette!(message));
+    }
     let expected_prefix = format!("{}/", openshell_core::cdi::CDI_SPEC_DIR_BASE);
-    for spec_dir in &context.spec_dirs {
+    for (index, spec_dir) in context.spec_dirs.iter().enumerate() {
         let normalized = openshell_core::paths::normalize_path(&spec_dir.path);
         if !normalized.starts_with(&expected_prefix) {
             let message = format!(
@@ -2308,8 +2322,117 @@ fn validate_cdi_context_mount_roots(context: &openshell_core::cdi::CdiContext) -
             emit_cdi_validation_failure(&message);
             return Err(miette::miette!("{message}"));
         }
+        let expected_path = cdi_spec_mount_path(index);
+        if spec_dir.path != expected_path {
+            let message = format!(
+                "CDI spec dir at index {index} must be '{expected_path}', got '{}'",
+                spec_dir.path
+            );
+            emit_cdi_validation_failure(&message);
+            return Err(miette::miette!("{message}"));
+        }
+    }
+    validate_cdi_projection_mounts(context)
+}
+
+#[cfg(target_os = "linux")]
+fn validate_cdi_projection_mounts(context: &openshell_core::cdi::CdiContext) -> Result<()> {
+    let mounts = read_mount_info()?;
+    validate_cdi_projection_mounts_with(context, &mounts)
+}
+
+#[cfg(target_os = "linux")]
+fn validate_cdi_projection_mounts_with(
+    context: &openshell_core::cdi::CdiContext,
+    mounts: &[MountInfoEntry],
+) -> Result<()> {
+    let mut expected_mounts = Vec::with_capacity(context.spec_dirs.len() + 1);
+    expected_mounts.push(openshell_core::cdi::CDI_CONTEXT_PATH);
+    expected_mounts.extend(
+        context
+            .spec_dirs
+            .iter()
+            .map(|spec_dir| spec_dir.path.as_str()),
+    );
+
+    for expected_path in expected_mounts {
+        let Some(mount) = mounts
+            .iter()
+            .find(|mount| mount.mount_point == expected_path)
+        else {
+            let message = format!("CDI projection path '{expected_path}' is not a mount");
+            emit_cdi_validation_failure(&message);
+            return Err(miette::miette!("{message}"));
+        };
+        if !mount.read_only {
+            let message = format!("CDI projection mount '{expected_path}' must be read-only");
+            emit_cdi_validation_failure(&message);
+            return Err(miette::miette!("{message}"));
+        }
     }
     Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn validate_cdi_projection_mounts(_context: &openshell_core::cdi::CdiContext) -> Result<()> {
+    Ok(())
+}
+
+fn cdi_spec_mount_path(index: usize) -> String {
+    format!("{}/{index}", openshell_core::cdi::CDI_SPEC_DIR_BASE)
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, PartialEq, Eq)]
+struct MountInfoEntry {
+    mount_point: String,
+    read_only: bool,
+}
+
+#[cfg(target_os = "linux")]
+fn read_mount_info() -> Result<Vec<MountInfoEntry>> {
+    let mount_info = std::fs::read_to_string("/proc/self/mountinfo")
+        .into_diagnostic()
+        .wrap_err("read /proc/self/mountinfo")?;
+    mount_info.lines().map(parse_mount_info_entry).collect()
+}
+
+#[cfg(target_os = "linux")]
+fn parse_mount_info_entry(line: &str) -> Result<MountInfoEntry> {
+    let fields = line.split_whitespace().collect::<Vec<_>>();
+    let mount_point = fields
+        .get(4)
+        .ok_or_else(|| miette::miette!("mountinfo entry is missing a mount point: {line}"))?;
+    let mount_options = fields
+        .get(5)
+        .ok_or_else(|| miette::miette!("mountinfo entry is missing mount options: {line}"))?;
+    Ok(MountInfoEntry {
+        mount_point: unescape_mount_info_path(mount_point)?,
+        read_only: mount_options.split(',').any(|option| option == "ro"),
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn unescape_mount_info_path(path: &str) -> Result<String> {
+    let mut decoded = Vec::with_capacity(path.len());
+    let bytes = path.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] != b'\\' {
+            decoded.push(bytes[index]);
+            index += 1;
+            continue;
+        }
+        let octal = bytes
+            .get(index + 1..index + 4)
+            .ok_or_else(|| miette::miette!("invalid mountinfo path escape in '{path}'"))?;
+        if !octal.iter().all(|byte| matches!(byte, b'0'..=b'7')) {
+            return Err(miette::miette!("invalid mountinfo path escape in '{path}'"));
+        }
+        decoded.push((octal[0] - b'0') * 64 + (octal[1] - b'0') * 8 + (octal[2] - b'0'));
+        index += 4;
+    }
+    String::from_utf8(decoded).into_diagnostic()
 }
 
 fn emit_cdi_validation_failure(message: &str) {
@@ -5231,6 +5354,52 @@ mod tests {
             }),
             scope: openshell_core::proto::SettingScope::Global.into(),
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cdi_projection_requires_read_only_context_and_spec_mounts() {
+        let context = openshell_core::cdi::CdiContext::new(
+            vec!["nvidia.com/gpu=0".to_string()],
+            vec![openshell_core::cdi::CdiSpecDirectory::new(
+                cdi_spec_mount_path(0),
+                "/host/cdi",
+            )],
+        );
+        let mounts = vec![
+            MountInfoEntry {
+                mount_point: openshell_core::cdi::CDI_CONTEXT_PATH.to_string(),
+                read_only: true,
+            },
+            MountInfoEntry {
+                mount_point: cdi_spec_mount_path(0),
+                read_only: true,
+            },
+        ];
+
+        validate_cdi_projection_mounts_with(&context, &mounts)
+            .expect("read-only CDI context and spec mounts should be accepted");
+
+        let mut writable_mounts = mounts;
+        writable_mounts[1].read_only = false;
+        let err = validate_cdi_projection_mounts_with(&context, &writable_mounts)
+            .expect_err("writable CDI spec mount must be rejected");
+        assert!(err.to_string().contains("must be read-only"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn parse_mount_info_entry_decodes_mount_path_and_access_mode() {
+        let mount = parse_mount_info_entry(
+            "42 35 0:42 / /run/openshell/supervisor/cdi-specs/0\\040with-space ro,nosuid - tmpfs tmpfs rw",
+        )
+        .expect("mountinfo fixture should parse");
+
+        assert_eq!(
+            mount.mount_point,
+            "/run/openshell/supervisor/cdi-specs/0 with-space"
+        );
+        assert!(mount.read_only);
     }
 
     #[test]
