@@ -905,6 +905,26 @@ pub async fn gateway_add(
                     false
                 }
             }
+        } else if is_browser_suppressed() {
+            match crate::oidc_auth::oidc_device_code_flow(
+                issuer,
+                oidc_client_id,
+                oidc_audience,
+                oidc_scopes,
+                gateway_insecure,
+            )
+            .await
+            {
+                Ok(bundle) => {
+                    openshell_bootstrap::oidc_token::store_oidc_token(name, &bundle)?;
+                    eprintln!("{} Authenticated via device code", "✓".green().bold());
+                    true
+                }
+                Err(e) => {
+                    eprintln!("{} Authentication failed: {e}", "!".yellow());
+                    false
+                }
+            }
         } else {
             match crate::oidc_auth::oidc_browser_auth_flow(
                 issuer,
@@ -1122,6 +1142,15 @@ pub async fn gateway_login(name: &str, gateway_insecure: bool) -> Result<()> {
 
             let bundle = if std::env::var("OPENSHELL_OIDC_CLIENT_SECRET").is_ok() {
                 crate::oidc_auth::oidc_client_credentials_flow(
+                    issuer,
+                    client_id,
+                    audience,
+                    scopes,
+                    gateway_insecure,
+                )
+                .await?
+            } else if is_browser_suppressed() {
+                crate::oidc_auth::oidc_device_code_flow(
                     issuer,
                     client_id,
                     audience,

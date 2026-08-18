@@ -3,10 +3,10 @@
 
 //! OIDC authentication flows for CLI gateway login.
 //!
-//! Implements Authorization Code + PKCE (interactive browser flow) and
-//! Client Credentials (CI/automation) `OAuth2` grant types against a
-//! Keycloak-compatible OIDC provider.
-
+//! Implements Authorization Code + PKCE (interactive browser flow),
+//! Device Authorization Grant (headless flow), and Client Credentials
+//! (CI/automation) `OAuth2` grant types against a Keycloak-compatible
+//! OIDC provider.
 use bytes::Bytes;
 use http_body_util::Full;
 use hyper::service::service_fn;
@@ -37,6 +37,31 @@ struct OidcDiscovery {
     issuer: String,
     authorization_endpoint: String,
     token_endpoint: String,
+    device_authorization_endpoint: Option<String>,
+}
+
+/// Device authorization response from the provider.
+#[derive(Debug, Deserialize)]
+struct DeviceAuthorizationResponse {
+    device_code: String,
+    user_code: String,
+    verification_uri: String,
+    verification_uri_complete: Option<String>,
+    expires_in: u64,
+    #[serde(default = "default_interval")]
+    interval: u64,
+}
+
+fn default_interval() -> u64 {
+    5
+}
+
+/// Device token polling error responses (RFC 8628).
+#[derive(Debug, Deserialize)]
+struct DeviceTokenErrorResponse {
+    error: String,
+    #[serde(default)]
+    error_description: String,
 }
 
 /// Discover OIDC endpoints from the issuer's well-known configuration.
@@ -245,6 +270,163 @@ pub async fn oidc_client_credentials_flow(
     ))
 }
 
+/// Run the OIDC Device Authorization Grant flow (RFC 8628).
+///
+/// Prompts the user to visit a verification URL and enter a code on any device
+/// with a browser. Polls the token endpoint until the user completes authorization
+/// or the device code expires.
+pub async fn oidc_device_code_flow(
+    issuer: &str,
+    client_id: &str,
+    audience: Option<&str>,
+    scopes: Option<&str>,
+    insecure: bool,
+) -> Result<OidcTokenBundle> {
+    let discovery = discover(issuer, insecure).await?;
+
+    let device_auth_endpoint = discovery.device_authorization_endpoint.as_deref().ok_or_else(|| {
+        miette::miette!(
+            "The OIDC provider does not advertise a device_authorization_endpoint.\n\
+             Enable the device authorization grant on this client, or use client credentials for headless automation."
+        )
+    })?;
+
+    // Step 1: Request device and user codes
+    let http = http_client(insecure);
+    let scopes_param = build_scopes(scopes)
+        .iter()
+        .map(|s| s.to_string())
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    let mut form_params = vec![("client_id", client_id), ("scope", &scopes_param)];
+
+    // Add audience if present
+    let audience_str;
+    if let Some(aud) = audience {
+        audience_str = aud.to_string();
+        form_params.push(("audience", &audience_str));
+    }
+
+    let device_auth_resp = http
+        .post(device_auth_endpoint)
+        .form(&form_params)
+        .send()
+        .await
+        .into_diagnostic()?;
+
+    if !device_auth_resp.status().is_success() {
+        let status = device_auth_resp.status();
+        let body = device_auth_resp.text().await.unwrap_or_default();
+        return Err(miette::miette!(
+            "Device authorization request failed (status {status}): {body}"
+        ));
+    }
+
+    let device_auth: DeviceAuthorizationResponse =
+        device_auth_resp.json().await.into_diagnostic()?;
+
+    // Step 2: Display instructions to the user
+    eprintln!();
+    eprintln!("  To authenticate, visit:");
+    if let Some(uri_complete) = &device_auth.verification_uri_complete {
+        eprintln!("    {uri_complete}");
+    } else {
+        eprintln!("    {}", device_auth.verification_uri);
+        eprintln!();
+        eprintln!("  And enter this code:");
+        eprintln!("    {}", device_auth.user_code);
+    }
+    eprintln!();
+    eprintln!("  Waiting for authorization...");
+
+    // Step 3: Poll the token endpoint
+    let start_time = std::time::Instant::now();
+    let expires_duration = Duration::from_secs(device_auth.expires_in);
+    let mut poll_interval = Duration::from_secs(device_auth.interval);
+
+    loop {
+        if start_time.elapsed() >= expires_duration {
+            return Err(miette::miette!(
+                "Device code expired after {} seconds. Please try again.",
+                device_auth.expires_in
+            ));
+        }
+
+        tokio::time::sleep(poll_interval).await;
+
+        let token_params = vec![
+            ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
+            ("device_code", &device_auth.device_code),
+            ("client_id", client_id),
+        ];
+
+        let poll_resp = http
+            .post(&discovery.token_endpoint)
+            .form(&token_params)
+            .send()
+            .await
+            .into_diagnostic()?;
+
+        let status = poll_resp.status();
+
+        if status.is_success() {
+            // Success! Parse the token response
+            let token_response: serde_json::Value = poll_resp.json().await.into_diagnostic()?;
+
+            return Ok(bundle_from_device_token_response(
+                &token_response,
+                issuer,
+                client_id,
+            ));
+        }
+
+        // Parse error response
+        let error_resp: DeviceTokenErrorResponse = match poll_resp.json().await {
+            Ok(e) => e,
+            Err(_) => {
+                return Err(miette::miette!(
+                    "Token polling failed with status {status} and unparseable response"
+                ));
+            }
+        };
+
+        match error_resp.error.as_str() {
+            "authorization_pending" => {
+                // Keep polling
+                debug!("Device authorization pending, continuing to poll");
+            }
+            "slow_down" => {
+                // Increase polling interval per RFC 8628
+                poll_interval += Duration::from_secs(5);
+                debug!(
+                    "Received slow_down, increasing interval to {:?}",
+                    poll_interval
+                );
+            }
+            "access_denied" => {
+                return Err(miette::miette!(
+                    "Authorization was denied by the user or administrator"
+                ));
+            }
+            "expired_token" => {
+                return Err(miette::miette!("Device code expired. Please try again."));
+            }
+            _ => {
+                let desc = if error_resp.error_description.is_empty() {
+                    String::new()
+                } else {
+                    format!(": {}", error_resp.error_description)
+                };
+                return Err(miette::miette!(
+                    "Device authorization failed: {}{desc}",
+                    error_resp.error
+                ));
+            }
+        }
+    }
+}
+
 /// Refresh an OIDC token using the `refresh_token` grant.
 ///
 /// Reuses the configured login scopes when supplied so providers can select
@@ -340,6 +522,29 @@ fn bundle_from_oauth2_response(
         access_token: resp.access_token().secret().clone(),
         refresh_token: resp.refresh_token().map(|rt| rt.secret().clone()),
         expires_at: resp.expires_in().map(|ei| now + ei.as_secs()),
+        issuer: issuer.to_string(),
+        client_id: client_id.to_string(),
+    }
+}
+
+fn bundle_from_device_token_response(
+    resp: &serde_json::Value,
+    issuer: &str,
+    client_id: &str,
+) -> OidcTokenBundle {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    let access_token = resp["access_token"].as_str().unwrap_or("").to_string();
+    let refresh_token = resp["refresh_token"].as_str().map(String::from);
+    let expires_in = resp["expires_in"].as_u64();
+
+    OidcTokenBundle {
+        access_token,
+        refresh_token,
+        expires_at: expires_in.map(|ei| now + ei),
         issuer: issuer.to_string(),
         client_id: client_id.to_string(),
     }
@@ -610,5 +815,98 @@ mod tests {
         assert_eq!(refreshed.issuer, previous.issuer);
         assert_eq!(refreshed.client_id, previous.client_id);
         assert_eq!(refreshed.expires_at, Some(300));
+    }
+
+    #[test]
+    fn discovery_missing_device_endpoint_is_optional() {
+        let discovery_json = "{\"issuer\":\"https://issuer.example\",\"authorization_endpoint\":\"https://issuer.example/auth\",\"token_endpoint\":\"https://issuer.example/token\"}";
+        let discovery: OidcDiscovery = serde_json::from_str(discovery_json).unwrap();
+        assert!(discovery.device_authorization_endpoint.is_none());
+        assert_eq!(discovery.issuer, "https://issuer.example");
+    }
+
+    #[test]
+    fn discovery_with_device_endpoint_is_captured() {
+        let discovery_json = "{\"issuer\":\"https://issuer.example\",\"authorization_endpoint\":\"https://issuer.example/auth\",\"token_endpoint\":\"https://issuer.example/token\",\"device_authorization_endpoint\":\"https://issuer.example/device\"}";
+        let discovery: OidcDiscovery = serde_json::from_str(discovery_json).unwrap();
+        assert_eq!(
+            discovery.device_authorization_endpoint.as_deref(),
+            Some("https://issuer.example/device")
+        );
+    }
+
+    #[test]
+    fn device_auth_response_parses_minimal() {
+        let json = "{\"device_code\":\"GmRhmhcxhwAzkoEqiMEg_DnyEysNkuNhszIySk9eS\",\"user_code\":\"WDJB-MJHT\",\"verification_uri\":\"https://example.com/device\",\"expires_in\":1800}";
+        let resp: DeviceAuthorizationResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            resp.device_code,
+            "GmRhmhcxhwAzkoEqiMEg_DnyEysNkuNhszIySk9eS"
+        );
+        assert_eq!(resp.user_code, "WDJB-MJHT");
+        assert_eq!(resp.verification_uri, "https://example.com/device");
+        assert_eq!(resp.expires_in, 1800);
+        assert_eq!(resp.interval, 5);
+        assert!(resp.verification_uri_complete.is_none());
+    }
+
+    #[test]
+    fn device_auth_response_parses_complete() {
+        let json = "{\"device_code\":\"test-device-code\",\"user_code\":\"TEST-CODE\",\"verification_uri\":\"https://example.com/device\",\"verification_uri_complete\":\"https://example.com/device?user_code=TEST-CODE\",\"expires_in\":900,\"interval\":10}";
+        let resp: DeviceAuthorizationResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.interval, 10);
+        assert_eq!(
+            resp.verification_uri_complete.as_deref(),
+            Some("https://example.com/device?user_code=TEST-CODE")
+        );
+    }
+
+    #[test]
+    fn device_token_error_response_parses() {
+        let json = "{\"error\":\"authorization_pending\",\"error_description\":\"User has not authorized yet\"}";
+        let resp: DeviceTokenErrorResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.error, "authorization_pending");
+        assert_eq!(resp.error_description, "User has not authorized yet");
+    }
+
+    #[test]
+    fn device_token_error_response_defaults_empty_description() {
+        let json = "{\"error\":\"slow_down\"}";
+        let resp: DeviceTokenErrorResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.error, "slow_down");
+        assert_eq!(resp.error_description, "");
+    }
+
+    #[test]
+    fn bundle_from_device_token_response_complete() {
+        let json = serde_json::json!({
+            "access_token": "device-access-token",
+            "token_type": "Bearer",
+            "expires_in": 3600,
+            "refresh_token": "device-refresh-token"
+        });
+        let bundle =
+            bundle_from_device_token_response(&json, "https://issuer.example", "test-client");
+        assert_eq!(bundle.access_token, "device-access-token");
+        assert_eq!(
+            bundle.refresh_token.as_deref(),
+            Some("device-refresh-token")
+        );
+        assert_eq!(bundle.issuer, "https://issuer.example");
+        assert_eq!(bundle.client_id, "test-client");
+        assert!(bundle.expires_at.is_some());
+    }
+
+    #[test]
+    fn bundle_from_device_token_response_minimal() {
+        let json = serde_json::json!({
+            "access_token": "device-access-only",
+            "token_type": "Bearer"
+        });
+        let bundle =
+            bundle_from_device_token_response(&json, "https://issuer.example", "test-client");
+        assert_eq!(bundle.access_token, "device-access-only");
+        assert!(bundle.refresh_token.is_none());
+        assert!(bundle.expires_at.is_none());
     }
 }
