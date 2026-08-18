@@ -7,7 +7,7 @@ use std::io::Write;
 use std::process::Stdio;
 
 use openshell_e2e::harness::binary::openshell_cmd;
-use openshell_e2e::harness::container::{SupportContainer, is_e2e_driver};
+use openshell_e2e::harness::container::{ContainerEngine, SupportContainer, is_e2e_driver};
 use openshell_e2e::harness::sandbox::SandboxGuard;
 use tempfile::NamedTempFile;
 
@@ -17,6 +17,76 @@ const FIXTURE_ALIAS: &str = "transparent-tcp-fixture.openshell.test";
 const MUSL_FIXTURE_ALIAS: &str = "transparent-tcp-musl.openshell.test";
 const FIXTURE_PORT: u16 = 5432;
 const TRANSPARENT_LISTENER_PORT: u16 = 15001;
+
+struct MuslSandboxImage {
+    engine: ContainerEngine,
+    tag: String,
+}
+
+impl MuslSandboxImage {
+    fn build() -> Result<Self, String> {
+        let engine = ContainerEngine::from_env()?;
+        if engine.name() != "podman" {
+            return Err(format!(
+                "musl transparent TCP E2E requires podman, got {}",
+                engine.name()
+            ));
+        }
+
+        let context =
+            tempfile::tempdir().map_err(|error| format!("create build context: {error}"))?;
+        let containerfile = context.path().join("Containerfile");
+        std::fs::write(
+            &containerfile,
+            "FROM docker.io/library/alpine:3.22\nRUN apk add --no-cache iproute2\n",
+        )
+        .map_err(|error| format!("write Containerfile: {error}"))?;
+
+        let tag = format!(
+            "localhost/openshell-e2e-transparent-tcp-musl:{}",
+            std::process::id()
+        );
+        let output = engine
+            .command()
+            .args([
+                "build",
+                "--file",
+                containerfile
+                    .to_str()
+                    .ok_or_else(|| "Containerfile path is not UTF-8".to_string())?,
+                "--tag",
+                &tag,
+                context
+                    .path()
+                    .to_str()
+                    .ok_or_else(|| "build context path is not UTF-8".to_string())?,
+            ])
+            .output()
+            .map_err(|error| format!("build musl sandbox image: {error}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "podman build failed (exit {:?}):\n{}{}",
+                output.status.code(),
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+
+        Ok(Self { engine, tag })
+    }
+}
+
+impl Drop for MuslSandboxImage {
+    fn drop(&mut self) {
+        let _ = self
+            .engine
+            .command()
+            .args(["image", "rm", "--force", &self.tag])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+}
 
 fn write_policy() -> Result<NamedTempFile, String> {
     write_policy_for(FIXTURE_ALIAS)
@@ -70,6 +140,7 @@ async fn rootless_podman_musl_client_uses_udp_policy_dns() {
         return;
     }
 
+    let image = MuslSandboxImage::build().expect("build Alpine/musl sandbox image");
     let fixture = SupportContainer::start_python(
         MUSL_FIXTURE_ALIAS,
         &format!(
@@ -90,23 +161,16 @@ while True:
     .await
     .expect("start musl TCP fixture");
 
-    // Use the registry image directly so the Podman gateway can pull it. A
-    // local --from build is performed by the CLI's Docker daemon and is not
-    // visible in Podman's separate image store.
-    // Alpine does not use Debian's /bin -> /usr/bin merge. Landlock therefore
-    // needs the real /bin tree for /bin/sh and the BusyBox executable used by
-    // nslookup and nc; this fixture does not execute anything from /sbin.
-    let policy = write_policy_for_identity(MUSL_FIXTURE_ALIAS, "65534", "65534", &["/bin"])
-        .expect("write musl policy");
+    // Build through Podman so the gateway sees the image in the same store.
+    // Plain Alpine's BusyBox `ip` lacks `ip netns`; full iproute2 is part of
+    // the sandbox runtime contract. Alpine also has real /bin and /sbin trees
+    // rather than Debian-style usr-merge symlinks.
+    let policy =
+        write_policy_for_identity(MUSL_FIXTURE_ALIAS, "65534", "65534", &["/bin", "/sbin"])
+            .expect("write musl policy");
     let policy_path = policy.path().to_string_lossy().into_owned();
     let mut sandbox = SandboxGuard::create_keep_with_args(
-        &[
-            "--from",
-            "docker.io/library/alpine:3.22",
-            "--policy",
-            &policy_path,
-            "--no-tty",
-        ],
+        &["--from", &image.tag, "--policy", &policy_path, "--no-tty"],
         &["sh", "-c", "echo Ready; sleep 2147483647"],
         "Ready",
     )
