@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 title: "OCSF JSON Export"
 sidebar-title: "OCSF JSON Export"
-description: "How to enable full OCSF JSON logging for SIEM integration, compliance, and structured analysis."
+description: "How to enable full OCSF JSON logging for SIEM integration, compliance, and structured analysis. Includes schema version downgrade for AWS Security Lake, Splunk, and CrowdStrike compatibility."
 keywords: "Generative AI, Cybersecurity, OCSF, JSON, SIEM, Compliance, Observability"
 ---
 
@@ -141,14 +141,59 @@ The `class_uid` field identifies the event type:
 | 5019 | Device Config State Change | `CONFIG:` |
 | 6002 | Application Lifecycle | `LIFECYCLE:` |
 
+## SIEM Schema Version Compatibility
+
+OpenShell emits OCSF v1.7.0 events internally, but many SIEMs only support older schema versions. The `ocsf_schema_version` setting tells the JSONL layer to downgrade events before writing, stripping fields and profiles that don't exist in the target version.
+
+Set the target version globally:
+
+```shell
+openshell settings set --global --key ocsf_schema_version --value "1.1"
+```
+
+Or per-sandbox:
+
+```shell
+openshell settings set my-sandbox --key ocsf_schema_version --value "1.3"
+```
+
+The setting can also be configured in `gateway.toml`:
+
+```toml
+[openshell.gateway]
+ocsf_schema_version = "1.1"
+```
+
+When set, the JSONL layer applies the following transformations:
+
+- Strips fields added after the target version: `ai_model`, `container`, `observation_point_id`
+- Removes unknown profile names from `metadata.profiles`: `ai_operation`, `container`
+- Rewrites `metadata.version` to match the target version
+
+The shorthand log output is unaffected. The internal event model stays at v1.7.0; only the serialized JSONL is transformed.
+
+When unset or empty, no downgrade is applied and events are written at the current schema version.
+
+| SIEM | Required OCSF Version | `ocsf_schema_version` Value |
+|---|---|---|
+| AWS Security Lake | v1.1.0 | `1.1` |
+| Splunk CIM Add-On | v1.1-v1.3 | `1.1` or `1.3` |
+| CrowdStrike FDR | v1.5.0 | `1.5` |
+| Datadog Cloud SIEM | v1.5.0 (selectable) | `1.5` if needed |
+
+<Note>
+The core OCSF event structure (class UIDs, activity IDs, HTTP/network fields) is identical across v1.1 through v1.7. The differences are all profile-gated additions, so downgrading does not lose security-relevant data.
+</Note>
+
 ## Integration with External Tools
 
 The JSONL file can be shipped to any tool that accepts OCSF-formatted data:
 
 | Tool | Integration Path |
 |---|---|
-| Splunk | Use the [Splunk OCSF Add-on](https://splunkbase.splunk.com/app/6943) to ingest OCSF JSONL files. |
-| Amazon Security Lake | OCSF is the native schema for Security Lake. |
+| Splunk | Use the [Splunk OCSF Add-on](https://splunkbase.splunk.com/app/6943) to ingest OCSF JSONL files. Set `ocsf_schema_version = "1.3"` for CIM Add-On compatibility. |
+| Amazon Security Lake | OCSF is the native schema for Security Lake. Set `ocsf_schema_version = "1.1"` for v1.1.0 compatibility. |
+| CrowdStrike FDR | Ship JSONL files to Falcon Data Replicator. Set `ocsf_schema_version = "1.5"` for v1.5.0 compatibility. |
 | Elastic | Use Filebeat to ship JSONL files with the OCSF field mappings. |
 | Custom pipelines | Parse the JSONL file with `jq`, Python, or any JSON-capable tool. |
 
