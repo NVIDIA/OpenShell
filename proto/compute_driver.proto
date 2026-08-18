@@ -82,9 +82,9 @@ message GetCapabilitiesResponse {
 
 enum ComputeDriverFeature {
   COMPUTE_DRIVER_FEATURE_UNSPECIFIED = 0;
-  // Reconcile persisted running intent by calling StartSandbox when the
-  // gateway starts.
-  COMPUTE_DRIVER_FEATURE_GATEWAY_START_RECONCILIATION = 1;
+  // Let the gateway stop persisted running intent during graceful shutdown
+  // and restart that intent when the gateway starts.
+  COMPUTE_DRIVER_FEATURE_GATEWAY_MANAGED_LIFECYCLE = 1;
   // Preserve omitted process user/group fields so the runtime can apply its
   // native image or OCI identity defaults.
   COMPUTE_DRIVER_FEATURE_PRESERVE_UNSPECIFIED_PROCESS_IDENTITY = 2;

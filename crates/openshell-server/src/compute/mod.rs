@@ -839,6 +839,11 @@ impl ComputeRuntime {
     }
 
     #[must_use]
+    pub(crate) fn uses_gateway_managed_lifecycle(&self) -> bool {
+        self.supports_feature(ComputeDriverFeature::GatewayManagedLifecycle)
+    }
+
+    #[must_use]
     pub(crate) fn preserves_unspecified_process_identity(&self) -> bool {
         self.supports_feature(ComputeDriverFeature::PreserveUnspecifiedProcessIdentity)
     }
@@ -2056,14 +2061,10 @@ impl ComputeRuntime {
     /// persisted lifecycle intent.
     ///
     /// An explicit sandbox stop persists `Stopped`; gateway shutdown does not.
-    /// Docker, Podman, and VM compute is stopped through the same public driver
-    /// RPC and restarted from the retained running-intent phase on gateway
-    /// startup. Kubernetes compute remains cluster-owned and is excluded.
+    /// Drivers opt into stop/start ownership through their public capability
+    /// snapshot. Kubernetes and legacy extension drivers omit that capability.
     async fn stop_persisted_sandboxes_on_shutdown(&self) -> Result<(), String> {
-        if !matches!(
-            self.driver_kind(),
-            Some(ComputeDriverKind::Docker | ComputeDriverKind::Podman | ComputeDriverKind::Vm)
-        ) {
+        if !self.uses_gateway_managed_lifecycle() {
             return Ok(());
         }
 
@@ -2151,7 +2152,7 @@ impl ComputeRuntime {
 
     /// Reconcile running intent for local compute after a gateway restart.
     ///
-    /// Drivers opt into this sweep through their startup capability snapshot.
+    /// Drivers opt into this sweep through their lifecycle capability snapshot.
     /// `StartSandbox` is idempotent, so call it for every persisted phase that
     /// requires running compute. Stable stopped, deleting, and error states are
     /// deliberately left alone.
@@ -2160,7 +2161,7 @@ impl ComputeRuntime {
     /// so the watch loop sees the post-start state on its first poll.
     pub async fn start_persisted_sandboxes(&self) -> Result<(), String> {
         self.recover_persisted_lifecycle_transitions().await?;
-        if !self.supports_feature(ComputeDriverFeature::GatewayStartReconciliation) {
+        if !self.uses_gateway_managed_lifecycle() {
             return Ok(());
         }
 
@@ -4096,11 +4097,11 @@ pub async fn new_test_runtime_with_driver(
 ) -> ComputeRuntime {
     let features = match driver_name.parse::<ComputeDriverKind>().ok() {
         Some(ComputeDriverKind::Docker | ComputeDriverKind::Podman) => vec![
-            i32::from(ComputeDriverFeature::GatewayStartReconciliation),
+            i32::from(ComputeDriverFeature::GatewayManagedLifecycle),
             i32::from(ComputeDriverFeature::PreserveUnspecifiedProcessIdentity),
         ],
         Some(ComputeDriverKind::Vm) => {
-            vec![i32::from(ComputeDriverFeature::GatewayStartReconciliation)]
+            vec![i32::from(ComputeDriverFeature::GatewayManagedLifecycle)]
         }
         _ => Vec::new(),
     };
@@ -8198,7 +8199,12 @@ mod tests {
     #[tokio::test]
     async fn shutdown_stops_running_intent_without_changing_persisted_phase() {
         let driver = ControlledDriver::new();
-        let runtime = test_runtime_for_driver(driver.clone(), "docker").await;
+        let runtime = test_runtime_for_driver_with_features(
+            driver.clone(),
+            "extension",
+            vec![ComputeDriverFeature::GatewayManagedLifecycle],
+        )
+        .await;
 
         for (id, name, phase) in [
             ("sb-unspecified", "unspecified", SandboxPhase::Unspecified),
@@ -8257,7 +8263,12 @@ mod tests {
     async fn shutdown_stop_sweep_continues_after_driver_errors() {
         let driver = ControlledDriver::new();
         driver.set_stop_outcome(ControlledLifecycleOutcome::Error("runtime angry"));
-        let runtime = test_runtime_for_driver(driver.clone(), "podman").await;
+        let runtime = test_runtime_for_driver_with_features(
+            driver.clone(),
+            "extension",
+            vec![ComputeDriverFeature::GatewayManagedLifecycle],
+        )
+        .await;
         for (id, name) in [("sb-1", "one"), ("sb-2", "two")] {
             runtime
                 .store
@@ -8279,7 +8290,12 @@ mod tests {
     async fn shutdown_stop_sweep_bounds_driver_concurrency() {
         let driver = ControlledDriver::new();
         driver.block_stop();
-        let runtime = test_runtime_for_driver(driver.clone(), "docker").await;
+        let runtime = test_runtime_for_driver_with_features(
+            driver.clone(),
+            "extension",
+            vec![ComputeDriverFeature::GatewayManagedLifecycle],
+        )
+        .await;
         for index in 0..=SHUTDOWN_STOP_CONCURRENCY {
             runtime
                 .store
@@ -8318,7 +8334,12 @@ mod tests {
     #[tokio::test]
     async fn shutdown_stop_sweep_rechecks_intent_after_acquiring_gate() {
         let driver = ControlledDriver::new();
-        let runtime = test_runtime_for_driver(driver.clone(), "docker").await;
+        let runtime = test_runtime_for_driver_with_features(
+            driver.clone(),
+            "extension",
+            vec![ComputeDriverFeature::GatewayManagedLifecycle],
+        )
+        .await;
         runtime
             .store
             .put_message(&sandbox_record("sb-1", "sandbox", SandboxPhase::Ready))
@@ -8353,14 +8374,37 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shutdown_stop_sweep_runs_for_each_local_driver_only() {
-        for (driver_name, expected_calls) in [
-            ("docker", 1),
-            ("podman", 1),
-            ("vm", 1),
-            ("kubernetes", 0),
-            ("extension", 0),
-        ] {
+    async fn shutdown_stop_sweep_runs_for_any_capable_driver() {
+        for driver_name in ["docker", "podman", "vm", "extension"] {
+            let driver = ControlledDriver::new();
+            let runtime = test_runtime_for_driver_with_features(
+                driver.clone(),
+                driver_name,
+                vec![ComputeDriverFeature::GatewayManagedLifecycle],
+            )
+            .await;
+            runtime
+                .store
+                .put_message(&sandbox_record("sb-1", "sandbox", SandboxPhase::Ready))
+                .await
+                .unwrap();
+
+            runtime
+                .stop_persisted_sandboxes_on_shutdown()
+                .await
+                .unwrap();
+
+            assert_eq!(
+                driver.stop_calls(),
+                1,
+                "unexpected shutdown behavior for {driver_name}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_stop_sweep_skips_drivers_without_feature() {
+        for driver_name in ["kubernetes", "docker", "extension"] {
             let driver = ControlledDriver::new();
             let runtime = test_runtime_for_driver(driver.clone(), driver_name).await;
             runtime
@@ -8376,8 +8420,8 @@ mod tests {
 
             assert_eq!(
                 driver.stop_calls(),
-                expected_calls,
-                "unexpected shutdown behavior for {driver_name}"
+                0,
+                "{driver_name} should retain operator-owned lifecycle"
             );
         }
     }
@@ -8388,7 +8432,7 @@ mod tests {
         let runtime = test_runtime_for_driver_with_features(
             driver.clone(),
             "extension",
-            vec![ComputeDriverFeature::GatewayStartReconciliation],
+            vec![ComputeDriverFeature::GatewayManagedLifecycle],
         )
         .await;
 
@@ -8495,7 +8539,7 @@ mod tests {
         let runtime = test_runtime_for_driver_with_features(
             driver,
             "extension",
-            vec![ComputeDriverFeature::GatewayStartReconciliation],
+            vec![ComputeDriverFeature::GatewayManagedLifecycle],
         )
         .await;
 
@@ -8530,7 +8574,7 @@ mod tests {
         let runtime = test_runtime_for_driver_with_features(
             driver,
             "extension",
-            vec![ComputeDriverFeature::GatewayStartReconciliation],
+            vec![ComputeDriverFeature::GatewayManagedLifecycle],
         )
         .await;
 
@@ -8565,7 +8609,7 @@ mod tests {
             let runtime = test_runtime_for_driver_with_features(
                 driver.clone(),
                 driver_name,
-                vec![ComputeDriverFeature::GatewayStartReconciliation],
+                vec![ComputeDriverFeature::GatewayManagedLifecycle],
             )
             .await;
             let sandbox = sandbox_record("sb-1", "local", SandboxPhase::Ready);
@@ -8811,7 +8855,7 @@ mod tests {
             .with_driver_name("fake-remote-driver")
             .with_default_image("openshell/sandbox:remote")
             .with_features([
-                ComputeDriverFeature::GatewayStartReconciliation,
+                ComputeDriverFeature::GatewayManagedLifecycle,
                 ComputeDriverFeature::PreserveUnspecifiedProcessIdentity,
             ])
             .with_gateway_listener_requirement(
@@ -8886,6 +8930,17 @@ mod tests {
             .expect("selected driver_config should be forwarded");
         assert!(driver_config.fields.contains_key("pool"));
         assert!(!driver_config.fields.contains_key("network_mode"));
+
+        driver.clear_calls();
+        runtime
+            .stop_persisted_sandboxes_on_shutdown()
+            .await
+            .unwrap();
+        assert!(matches!(
+            driver.calls().as_slice(),
+            [FakeComputeDriverCall::StopSandbox { sandbox_id, sandbox_name }]
+                if sandbox_id == "sb-uds" && sandbox_name == "uds-sandbox"
+        ));
 
         driver.clear_calls();
         runtime.start_persisted_sandboxes().await.unwrap();

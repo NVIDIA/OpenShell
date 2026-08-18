@@ -520,7 +520,7 @@ impl VmDriver {
             driver_name: DRIVER_NAME.to_string(),
             driver_version: openshell_core::VERSION.to_string(),
             default_image: self.config.default_image.clone(),
-            features: vec![ComputeDriverFeature::GatewayStartReconciliation.into()],
+            features: vec![ComputeDriverFeature::GatewayManagedLifecycle.into()],
         }
     }
 

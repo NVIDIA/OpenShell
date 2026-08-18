@@ -589,7 +589,7 @@ mod tests {
             "1.0.0",
             "sandbox:latest",
             [
-                ComputeDriverFeature::GatewayStartReconciliation,
+                ComputeDriverFeature::GatewayManagedLifecycle,
                 ComputeDriverFeature::PreserveUnspecifiedProcessIdentity,
             ],
         );
@@ -597,7 +597,7 @@ mod tests {
         assert_eq!(
             capabilities.features,
             vec![
-                i32::from(ComputeDriverFeature::GatewayStartReconciliation),
+                i32::from(ComputeDriverFeature::GatewayManagedLifecycle),
                 i32::from(ComputeDriverFeature::PreserveUnspecifiedProcessIdentity),
             ]
         );

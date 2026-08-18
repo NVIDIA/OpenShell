@@ -27,9 +27,10 @@ implementing `ComputeDriver` out of tree.
 At initialization the gateway snapshots additive feature values from
 `GetCapabilities`; unknown values are ignored. Post-initialization lifecycle
 and policy behavior does not depend on the configured or advertised driver
-name. Startup intent reconciliation and native process-identity defaults are
-enabled only by their corresponding features. Driver-requested listeners are
-structurally validated and remain restricted to sandbox callback RPCs.
+name. Gateway-managed shutdown/start lifecycle and native process-identity
+defaults are enabled only by their corresponding features. Driver-requested
+listeners are structurally validated and remain restricted to sandbox callback
+RPCs.
 
 Drivers own runtime-specific platform event interpretation. When an event should
 drive client provisioning UI, the driver attaches the shared
