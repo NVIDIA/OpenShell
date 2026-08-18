@@ -13,13 +13,10 @@ use miette::{IntoDiagnostic, Result};
 use nix::sys::signal::{self, Signal};
 use nix::unistd::{Gid, Group, Pid, Uid, User};
 use openshell_core::policy::{NetworkMode, SandboxPolicy};
-use std::collections::{BTreeSet, HashMap};
-#[cfg(not(any(
-    target_os = "macos",
-    target_os = "ios",
-    target_os = "haiku",
-    target_os = "redox"
-)))]
+#[cfg(unix)]
+use std::collections::BTreeSet;
+use std::collections::HashMap;
+#[cfg(target_os = "linux")]
 use std::ffi::CString;
 #[cfg(target_os = "linux")]
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
