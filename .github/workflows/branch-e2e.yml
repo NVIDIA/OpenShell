@@ -162,14 +162,22 @@ jobs:
             agent_sandbox_version: v0.5.0
             topology: combined
             extra_helm_values: ""
+            use_envoy_gateway: false
           - agent_sandbox_api: v1alpha1
             agent_sandbox_version: v0.4.6
             topology: combined
             extra_helm_values: ""
+            use_envoy_gateway: false
           - agent_sandbox_api: v1beta1
             agent_sandbox_version: v0.5.0
             topology: sidecar
             extra_helm_values: deploy/helm/openshell/ci/values-sidecar.yaml
+            use_envoy_gateway: false
+          - agent_sandbox_api: v1beta1
+            agent_sandbox_version: v0.5.0
+            topology: envoy
+            extra_helm_values: ""
+            use_envoy_gateway: true
     permissions:
       actions: read
       contents: read
@@ -180,6 +188,7 @@ jobs:
       job-name: Kubernetes E2E (Rust smoke, ${{ matrix.topology }}, Agent Sandbox ${{ matrix.agent_sandbox_api }})
       agent-sandbox-version: ${{ matrix.agent_sandbox_version }}
       extra-helm-values: ${{ matrix.extra_helm_values }}
+      use-envoy-gateway: ${{ matrix.use_envoy_gateway }}
       cli-artifact-prefix: rust-binary-cli
 
   kubernetes-workspace-managed-e2e:
