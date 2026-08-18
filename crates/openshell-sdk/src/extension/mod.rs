@@ -1,10 +1,10 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! APIs for implementing operator-run `OpenShell` extension services.
+//! APIs for building `OpenShell` extension services.
 //!
-//! Enable the `extension` Cargo feature to verify gateway-minted extension
-//! credentials and authorize callers without depending on gateway internals.
+//! This feature is the home for shared extension interfaces, verification, and
+//! observability. It currently provides gateway-minted credential verification.
 
 mod verification;
 

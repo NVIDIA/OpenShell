@@ -279,6 +279,9 @@ connect_current_container_to_docker_network() {
   GATEWAY_HOST_ALIAS_IP="${container_ip}"
 }
 
+# Build and launch an authenticated TLS extension service that is reachable
+# from the host gateway and sandbox containers. The focused middleware E2E lane
+# opts into this fixture; other Docker E2E callers retain the existing setup.
 start_middleware_fixture() {
   local manifest="${ROOT}/e2e/supervisor-middleware-fixture/Cargo.toml"
   local binary="${TARGET_DIR}/debug/openshell-e2e-middleware-fixture"
@@ -290,8 +293,12 @@ start_middleware_fixture() {
   CARGO_TARGET_DIR="${TARGET_DIR}" cargo build --locked --manifest-path "${manifest}"
 
   if [ -n "${GATEWAY_HOST_ALIAS_IP}" ]; then
+    # In GitHub Actions, the fixture and gateway run in the job container. The
+    # wrapper has already attached that container to the sandbox network.
     fixture_host="${GATEWAY_HOST_ALIAS_IP}"
   elif [ "$(uname -s)" = "Linux" ]; then
+    # In a native Linux run, the fixture and gateway run on the host. The
+    # bridge gateway address is reachable from both the host and containers.
     fixture_host="$(docker network inspect \
       --format '{{(index .IPAM.Config 0).Gateway}}' \
       "${DOCKER_NETWORK_NAME}")"
@@ -306,6 +313,8 @@ start_middleware_fixture() {
   fi
 
   mkdir -p "${fixture_dir}"
+  # Generate a one-run CA and a CA-signed server certificate whose IP SAN
+  # matches the shared address used by the gateway and sandbox supervisor.
   openssl req -x509 -newkey rsa:2048 -nodes \
     -keyout "${fixture_dir}/ca.key" \
     -out "${fixture_dir}/ca.crt" \
@@ -335,6 +344,8 @@ start_middleware_fixture() {
 
   fixture_port="$(e2e_pick_port)"
   echo "Starting supervisor middleware E2E fixture on ${fixture_host}:${fixture_port}..."
+  # Give the fixture both sides of the trust relationship: its TLS identity and
+  # the gateway identity/audience required to verify extension bearer tokens.
   OPENSHELL_E2E_MIDDLEWARE_LISTEN="0.0.0.0:${fixture_port}" \
   OPENSHELL_E2E_MIDDLEWARE_TLS_CERT="${fixture_dir}/tls.crt" \
   OPENSHELL_E2E_MIDDLEWARE_TLS_KEY="${fixture_dir}/tls.key" \
@@ -345,6 +356,8 @@ start_middleware_fixture() {
     "${binary}" >"${MIDDLEWARE_FIXTURE_LOG}" 2>&1 &
   MIDDLEWARE_FIXTURE_PID=$!
 
+  # A TCP readiness probe is sufficient here: the gateway performs the
+  # authenticated gRPC Describe call when it starts immediately afterward.
   local attempt
   for attempt in $(seq 1 100); do
     if ! kill -0 "${MIDDLEWARE_FIXTURE_PID}" 2>/dev/null; then
@@ -587,6 +600,8 @@ echo "Starting openshell-gateway on port ${HOST_PORT} (namespace: ${E2E_NAMESPAC
 echo "Using sandbox image: ${SANDBOX_IMAGE} (pull policy: ${SANDBOX_IMAGE_PULL_POLICY})"
 e2e_generate_gateway_jwt "${JWT_DIR}"
 if [ "${OPENSHELL_E2E_MIDDLEWARE_FIXTURE:-0}" = "1" ]; then
+  # The gateway validates middleware with Describe during startup, so the
+  # extension service and its trust material must exist first.
   start_middleware_fixture
 fi
 
@@ -615,6 +630,8 @@ GATEWAY_CONFIG="${STATE_DIR}/gateway.toml"
     fi
   fi
   if [ -n "${MIDDLEWARE_FIXTURE_ENDPOINT}" ]; then
+    # Register only the opt-in fixture, pinning its ephemeral CA and the exact
+    # audience that both the gateway token issuer and fixture verifier expect.
     printf '[[openshell.supervisor.middleware]]\n'
     printf 'name = "e2e-scripted"\n'
     printf 'grpc_endpoint = %s\n' "$(toml_string "${MIDDLEWARE_FIXTURE_ENDPOINT}")"

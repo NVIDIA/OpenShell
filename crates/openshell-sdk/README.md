@@ -49,19 +49,16 @@ mTLS (client certificates) is not supported.
 SDK-shaped enums rather than raw proto integers. Failures map to a typed
 `SdkError` with a discriminable kind.
 
-Enable the `extension` Cargo feature when implementing an operator-run
-OpenShell extension service:
+Enable the `extension` Cargo feature when building an OpenShell extension
+service:
 
 ```toml
 openshell-sdk = { version = "...", features = ["extension"] }
 ```
 
-The `extension` module verifies gateway-minted EdDSA extension JWTs from a
-trusted public key or JWKS document. `GatewayJwtAuthenticator` pins the token
-type, algorithm, issuer, audience, lifetime, and caller identity shape, then
-returns an `AuthenticatedCaller` that service handlers can authorize by caller
-kind. This feature is opt-in so gateway-only SDK consumers do not compile the
-extension verification dependencies.
+The `extension` module provides common SDK building blocks for extension
+services. It currently handles caller verification; shared service interfaces
+and observability support will follow.
 
 ## Modules
 
@@ -74,7 +71,7 @@ extension verification dependencies.
 | `oidc` | OIDC token handling at the transport layer. |
 | `refresh` | `Refresh` trait and single-flight refresh coalescing. |
 | `edge_tunnel` | Cloudflare Access tunnel dialer. |
-| `extension` | Opt-in service-side authentication and identity types for operator-run extensions. |
+| `extension` | Opt-in SDK building blocks for extension services. |
 | `error` | `SdkError` taxonomy. |
 | `types` | Curated request/response types and proto conversions. |
 | `raw` | Escape hatch re-exporting the generated tonic clients. |
