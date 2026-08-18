@@ -23,6 +23,7 @@ import {
   type ExecSandboxInputSchema,
   OpenShell,
   SandboxPhase,
+  SandboxRestartPolicy,
   type SandboxSpecSchema,
   type SandboxWorkloadTemplateSchema,
   ServiceStatus,
@@ -83,6 +84,10 @@ export type SandboxPhaseName =
   | 'stopped'
   | 'starting'
   | 'completed';
+  | 'restarting';
+
+/** Restart behavior after the canonical main process exits. */
+export type SandboxRestartPolicyName = 'never' | 'on-failure' | 'always';
 
 /** Lowercase mirror of the generated `ServiceStatus` enum. Hand-maintained. */
 export type HealthStatus = 'unspecified' | 'healthy' | 'degraded' | 'unhealthy';
@@ -141,6 +146,8 @@ export interface SandboxSpec {
   tty?: boolean;
   /** Loopback HTTP services to expose when the sandbox is created. */
   serviceExposures?: ServiceExposure[];
+  /** Restart behavior after the canonical main process exits. */
+  restartPolicy?: SandboxRestartPolicyName;
   /**
    * Create-time sandbox policy (the safety boundary). Sandbox-scoped
    * `setPolicy` cannot introduce static fields later, so express filesystem,
@@ -197,6 +204,9 @@ export interface SandboxRef {
   createdFromWorkloadTemplate?: SandboxWorkloadTemplateProvenance;
   /** Service URLs returned by creation, keyed by service name. */
   serviceUrls: Record<string, string>;
+  restartCount: number;
+  nextRestartAtMs?: number;
+  mainProcessStartedAtMs?: number;
 }
 
 export interface SandboxWorkloadTemplateProvenance {
@@ -451,6 +461,7 @@ export const PHASE_NAMES: Record<SandboxPhase, SandboxPhaseName> = {
   [SandboxPhase.STOPPED]: 'stopped',
   [SandboxPhase.STARTING]: 'starting',
   [SandboxPhase.COMPLETED]: 'completed',
+  [SandboxPhase.RESTARTING]: 'restarting',
 };
 export const STATUS_NAMES: Record<ServiceStatus, HealthStatus> = {
   [ServiceStatus.UNSPECIFIED]: 'unspecified',
@@ -471,6 +482,17 @@ export const POLICY_SOURCE_NAMES: Record<PolicySource, PolicySourceName> = {
 
 function phaseName(p: SandboxPhase): SandboxPhaseName {
   return PHASE_NAMES[p] ?? 'unspecified';
+}
+
+function restartPolicyValue(policy: SandboxRestartPolicyName | undefined): SandboxRestartPolicy {
+  switch (policy) {
+    case 'on-failure':
+      return SandboxRestartPolicy.ON_FAILURE;
+    case 'always':
+      return SandboxRestartPolicy.ALWAYS;
+    default:
+      return SandboxRestartPolicy.NEVER;
+  }
 }
 function statusName(s: ServiceStatus): HealthStatus {
   return STATUS_NAMES[s] ?? 'unspecified';
@@ -504,6 +526,13 @@ function sandboxRef(sandbox: Sandbox | undefined, serviceUrls: Record<string, st
         }
       : undefined,
     serviceUrls,
+    restartCount: sandbox.status?.restartCount ?? 0,
+    nextRestartAtMs:
+      sandbox.status && sandbox.status.nextRestartAtMs > 0n ? Number(sandbox.status.nextRestartAtMs) : undefined,
+    mainProcessStartedAtMs:
+      sandbox.status && sandbox.status.mainProcessStartedAtMs > 0n
+        ? Number(sandbox.status.mainProcessStartedAtMs)
+        : undefined,
   };
 }
 
@@ -985,6 +1014,7 @@ export class SandboxClient {
         policy: spec.policy,
         command: spec.command ?? [],
         tty: spec.tty ?? false,
+        restartPolicy: restartPolicyValue(spec.restartPolicy),
       };
       if (spec.rawSpec) Object.assign(specInit, spec.rawSpec);
 

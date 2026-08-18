@@ -1045,6 +1045,9 @@ message SandboxSpec {
   // Gateway-owned attachment identity, changed atomically with the provider set.
   // Equality only: detach and reattach must not revive an older receipt.
   string provider_attachment_epoch = 14;
+  // Gateway-owned policy for replacing the sandbox runtime after the canonical
+  // main process exits. Unspecified is normalized to Never before persistence.
+  SandboxRestartPolicy restart_policy = 15;
 }
 
 message ResourceRequirements {
@@ -1170,9 +1173,8 @@ message SandboxStatus {
   // Supervisor instance currently associated with the canonical main process.
   // The gateway uses this to reject stale exit reports after a restart.
   string main_process_instance_id = 8;
-  // Normalized main process result. Signal exits use 128 + signal number.
-  // Presence indicates that the canonical main process exited. Exit code 0
-  // produces Completed; nonzero and signal-normalized exits produce Error.
+  // Most recent normalized main process result. Signal exits use 128 + signal number.
+  // Cleared when a replacement main process becomes ready.
   optional int32 exit_code = 9;
   // Last accepted network result for each configured tool server endpoint.
   // Currently populated for MCP-over-HTTP endpoints. These passive results
@@ -1184,6 +1186,12 @@ message SandboxStatus {
   optional bool configuration_activated = 12;
   // Gateway-owned repair window. Retained after timeout for inspection and retry.
   SandboxProvisioning provisioning = 13;
+  // Consecutive policy-driven restart number in the current crash loop.
+  uint32 restart_count = 14;
+  // Unix epoch deadline for the next restart attempt or recovery check.
+  int64 next_restart_at_ms = 15;
+  // Unix epoch time when the current main process became ready.
+  int64 main_process_started_at_ms = 16;
 }
 
 // User-facing sandbox condition derived from platform or gateway observations.
@@ -1218,6 +1226,8 @@ enum SandboxPhase {
   SANDBOX_PHASE_STARTING = 8;
   // The canonical main process exited successfully and its result is final.
   SANDBOX_PHASE_COMPLETED = 9;
+  reserved 10;
+  reserved "SANDBOX_PHASE_RESTARTING";
 }
 
 // Public platform event exposed on the sandbox watch stream.
@@ -3550,6 +3560,16 @@ enum ProviderCredentialRefreshRecoveryAction {
   PROVIDER_CREDENTIAL_REFRESH_RECOVERY_ACTION_REAUTHORIZE = 2;
   PROVIDER_CREDENTIAL_REFRESH_RECOVERY_ACTION_FIX_CONFIGURATION = 3;
   PROVIDER_CREDENTIAL_REFRESH_RECOVERY_ACTION_INVESTIGATE = 4;
+}
+
+// Policy applied when the canonical main process exits outside an intentional
+// stop or delete operation. Kept after existing enums so generated enum
+// descriptors remain stable.
+enum SandboxRestartPolicy {
+  SANDBOX_RESTART_POLICY_UNSPECIFIED = 0;
+  SANDBOX_RESTART_POLICY_NEVER = 1;
+  SANDBOX_RESTART_POLICY_ON_FAILURE = 2;
+  SANDBOX_RESTART_POLICY_ALWAYS = 3;
 }
 
 // Workspace membership record.

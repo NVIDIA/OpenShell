@@ -40,6 +40,8 @@ use openshell_core::proto::compute::v1::{
 use openshell_core::proto::{
     PlatformEvent, Sandbox, SandboxCondition, SandboxPhase, SandboxSpec, SandboxStatus,
     SandboxTemplate, SandboxWorkloadTemplate, ServiceEndpoint, SshSession,
+    PlatformEvent, Sandbox, SandboxCondition, SandboxPhase, SandboxRestartPolicy, SandboxSpec,
+    SandboxStatus, SandboxTemplate, ServiceEndpoint, SshSession,
 };
 use openshell_core::telemetry::TelemetryComputeDriver;
 use openshell_core::{ObjectLabels, ObjectWorkspace};
@@ -318,6 +320,15 @@ async fn wait_for_startup(
 
 /// Interval between store-vs-backend reconciliation sweeps.
 const RECONCILE_INTERVAL: Duration = Duration::from_mins(1);
+
+/// Restart intents live in sandbox rows. A lightweight holder-only scan makes
+/// cross-replica writes and lost wakeups recover without changing the general
+/// backend reconciliation cadence.
+const RESTART_SCAN_INTERVAL: Duration = Duration::from_secs(1);
+const RESTART_INITIAL_DELAY_MS: i64 = 10_000;
+const RESTART_MAX_DELAY_MS: i64 = 300_000;
+const RESTART_STABILITY_WINDOW_MS: i64 = 600_000;
+const RESTART_READINESS_TIMEOUT_MS: i64 = 120_000;
 
 /// How long a sandbox can remain provisioning in the store without a
 /// corresponding backend resource before it is considered orphaned.
@@ -1341,9 +1352,12 @@ impl ComputeRuntime {
                 .map_err(Status::internal)?;
             return Ok(current);
         }
-        if !matches!(phase, SandboxPhase::Ready | SandboxPhase::Stopping) {
+        if !matches!(
+            phase,
+            SandboxPhase::Ready | SandboxPhase::Stopping | SandboxPhase::Restarting
+        ) {
             return Err(Status::failed_precondition(format!(
-                "sandbox must be Ready to stop (current phase: {phase:?})"
+                "sandbox must be Ready or Restarting to stop (current phase: {phase:?})"
             )));
         }
 
@@ -2766,11 +2780,17 @@ impl ComputeRuntime {
                 }
                 Box::pin(watch_runtime.watch_loop(watch_shutdown)).await;
             });
+            let reconcile_runtime = runtime.clone();
+            let reconcile_shutdown = shutdown_rx.clone();
             tokio::spawn(async move {
                 if !wait_for_startup(startup_rx, shutdown_rx.clone()).await {
                     return;
                 }
                 runtime.reconcile_loop(shutdown_rx).await;
+                reconcile_runtime.reconcile_loop(reconcile_shutdown).await;
+            });
+            tokio::spawn(async move {
+                runtime.restart_loop(shutdown_rx).await;
             });
         } else {
             tokio::spawn(async move {
@@ -3468,6 +3488,14 @@ impl ComputeRuntime {
                 return;
             }
             runtime.reconcile_loop(cancel_rx).await;
+        let reconcile_cancel = cancel_rx.clone();
+        let reconcile_handle = tokio::spawn(async move {
+            runtime.reconcile_loop(reconcile_cancel).await;
+        });
+
+        let runtime = self.clone();
+        let restart_handle = tokio::spawn(async move {
+            runtime.restart_loop(cancel_rx).await;
         });
 
         loop {
@@ -3497,6 +3525,7 @@ impl ComputeRuntime {
                         let _ = watch_handle.await;
                         let _ = reconcile_handle.await;
                         let _ = deadline_handle.await;
+                        let _ = restart_handle.await;
                         return;
                     }
                 }
@@ -3507,6 +3536,7 @@ impl ComputeRuntime {
         let _ = watch_handle.await;
         let _ = reconcile_handle.await;
         let _ = deadline_handle.await;
+        let _ = restart_handle.await;
         info!(replica = %lease.replica_id(), "reconciler lease lost — returning to standby");
     }
 
@@ -3566,6 +3596,226 @@ impl ComputeRuntime {
                 _ = cancel.changed() => return,
             }
         }
+    }
+
+    async fn restart_loop(self: Arc<Self>, mut cancel: watch::Receiver<bool>) {
+        loop {
+            if let Err(err) = self.restart_due_sandboxes().await {
+                warn!(error = %err, "Sandbox restart sweep failed");
+            }
+            tokio::select! {
+                () = tokio::time::sleep(RESTART_SCAN_INTERVAL) => {}
+                _ = cancel.changed() => return,
+            }
+        }
+    }
+
+    async fn restart_due_sandboxes(&self) -> Result<(), String> {
+        let now_ms = openshell_core::time::now_ms();
+        let mut offset = 0;
+        loop {
+            let records = self
+                .store
+                .list_by_type(Sandbox::object_type(), 1000, offset)
+                .await
+                .map_err(|err| err.to_string())?;
+            let page_len = records.len();
+            for record in records {
+                let sandbox = match Sandbox::decode(record.payload.as_slice()) {
+                    Ok(sandbox) => sandbox,
+                    Err(err) => {
+                        warn!(error = %err, "Failed to decode sandbox during restart sweep");
+                        continue;
+                    }
+                };
+                let phase =
+                    SandboxPhase::try_from(sandbox.phase()).unwrap_or(SandboxPhase::Unknown);
+                let due = sandbox.status.as_ref().is_some_and(|status| {
+                    status.next_restart_at_ms > 0 && status.next_restart_at_ms <= now_ms
+                });
+                if phase == SandboxPhase::Restarting
+                    && due
+                    && let Err(err) = self.restart_sandbox_runtime(sandbox.object_id()).await
+                {
+                    warn!(
+                        sandbox_id = %sandbox.object_id(),
+                        sandbox_name = %sandbox.object_name(),
+                        error = %err,
+                        "Automatic sandbox restart attempt failed"
+                    );
+                }
+            }
+            if page_len < 1000 {
+                break;
+            }
+            offset += u32::try_from(page_len).expect("restart scan page length is capped at 1000");
+        }
+        Ok(())
+    }
+
+    async fn restart_sandbox_runtime(&self, sandbox_id: &str) -> Result<(), String> {
+        let lifecycle_guard = self.lifecycle_gates.lock_for(sandbox_id).await;
+        let global_guard = self.lock_global_for_lifecycle(&lifecycle_guard).await;
+        let Some(current) = self
+            .store
+            .get_message::<Sandbox>(sandbox_id)
+            .await
+            .map_err(|err| err.to_string())?
+        else {
+            return Ok(());
+        };
+        let phase = SandboxPhase::try_from(current.phase()).unwrap_or(SandboxPhase::Unknown);
+        let now_ms = openshell_core::time::now_ms();
+        let due = current.status.as_ref().is_some_and(|status| {
+            status.next_restart_at_ms > 0 && status.next_restart_at_ms <= now_ms
+        });
+        if phase != SandboxPhase::Restarting || !due {
+            return Ok(());
+        }
+
+        let sandbox_name = current.object_name().to_string();
+        let claimed = self
+            .store
+            .update_message_cas::<Sandbox, _>(
+                sandbox_id,
+                sandbox_resource_version(&current),
+                |sandbox| {
+                    let name = sandbox.object_name().to_string();
+                    let status = sandbox.status.get_or_insert_with(Default::default);
+                    // This deadline is a durable readiness watchdog. A fresh
+                    // supervisor clears it when the replacement becomes Ready.
+                    status.next_restart_at_ms = now_ms.saturating_add(RESTART_READINESS_TIMEOUT_MS);
+                    upsert_ready_condition(
+                        &mut sandbox.status,
+                        &name,
+                        SandboxCondition {
+                            r#type: "Ready".to_string(),
+                            status: "False".to_string(),
+                            reason: "SandboxRestarting".to_string(),
+                            message: "Replacing sandbox runtime after canonical main process exit"
+                                .to_string(),
+                            last_transition_time: String::new(),
+                        },
+                    );
+                },
+            )
+            .await
+            .map_err(|err| err.to_string())?;
+        self.sandbox_index.update_from_sandbox(&claimed);
+        self.sandbox_watch_bus.notify(sandbox_id);
+        drop(global_guard);
+
+        let stop_result = self
+            .driver
+            .call("driver.stop_sandbox", Some(sandbox_id), |driver| {
+                let sandbox_id = sandbox_id.to_string();
+                let sandbox_name = sandbox_name.clone();
+                async move {
+                    driver
+                        .stop_sandbox(Request::new(StopSandboxRequest {
+                            sandbox_id,
+                            sandbox_name,
+                        }))
+                        .await
+                }
+            })
+            .await;
+        if let Err(status) = stop_result {
+            return self
+                .record_restart_driver_failure(&lifecycle_guard, sandbox_id, "stop", status)
+                .await;
+        }
+
+        self.cleanup_stopped_sandbox_sessions(&claimed).await?;
+
+        let start_result = self
+            .driver
+            .call("driver.start_sandbox", Some(sandbox_id), |driver| {
+                let sandbox_id = sandbox_id.to_string();
+                let sandbox_name = sandbox_name.clone();
+                async move {
+                    driver
+                        .start_sandbox(Request::new(StartSandboxRequest {
+                            sandbox_id,
+                            sandbox_name,
+                        }))
+                        .await
+                }
+            })
+            .await;
+        if let Err(status) = start_result {
+            return self
+                .record_restart_driver_failure(&lifecycle_guard, sandbox_id, "start", status)
+                .await;
+        }
+
+        info!(
+            sandbox_id,
+            sandbox_name, "Sandbox runtime restarted; waiting for replacement supervisor"
+        );
+        Ok(())
+    }
+
+    async fn record_restart_driver_failure(
+        &self,
+        lifecycle_guard: &SandboxLifecycleGuard,
+        sandbox_id: &str,
+        operation: &str,
+        driver_status: Status,
+    ) -> Result<(), String> {
+        let _global_guard = self.lock_global_for_lifecycle(lifecycle_guard).await;
+        let Some(current) = self
+            .store
+            .get_message::<Sandbox>(sandbox_id)
+            .await
+            .map_err(|err| err.to_string())?
+        else {
+            return Ok(());
+        };
+        if SandboxPhase::try_from(current.phase()) != Ok(SandboxPhase::Restarting) {
+            return Ok(());
+        }
+        let terminal = driver_status.code() == Code::NotFound;
+        let operation = operation.to_string();
+        let driver_message = driver_status.message().to_string();
+        let now_ms = openshell_core::time::now_ms();
+        let updated = self
+            .store
+            .update_message_cas::<Sandbox, _>(
+                sandbox_id,
+                sandbox_resource_version(&current),
+                |sandbox| {
+                    let name = sandbox.object_name().to_string();
+                    let status = sandbox.status.get_or_insert_with(Default::default);
+                    if terminal {
+                        status.next_restart_at_ms = 0;
+                        sandbox.set_phase(SandboxPhase::Error as i32);
+                    } else {
+                        status.next_restart_at_ms =
+                            now_ms.saturating_add(restart_delay_ms(status.restart_count.max(1)));
+                    }
+                    upsert_ready_condition(
+                        &mut sandbox.status,
+                        &name,
+                        SandboxCondition {
+                            r#type: "Ready".to_string(),
+                            status: "False".to_string(),
+                            reason: "SandboxRestartFailed".to_string(),
+                            message: format!(
+                                "Sandbox restart {operation} failed: {driver_message}"
+                            ),
+                            last_transition_time: String::new(),
+                        },
+                    );
+                },
+            )
+            .await
+            .map_err(|err| err.to_string())?;
+        self.sandbox_index.update_from_sandbox(&updated);
+        self.sandbox_watch_bus.notify(sandbox_id);
+        Err(format!(
+            "driver {operation} failed during sandbox restart: {driver_status}"
+        ))
     }
 
     #[tracing::instrument(
@@ -4148,11 +4398,20 @@ impl ComputeRuntime {
                 return Ok(());
             }
         }
+        let restart = existing
+            .spec
+            .as_ref()
+            .is_some_and(|spec| should_restart_main_process(spec.restart_policy, exit_code));
+        let now_ms = openshell_core::time::now_ms();
         let expected_resource_version = sandbox_resource_version(&existing);
         let sandbox = self
             .store
             .update_message_cas::<Sandbox, _>(sandbox_id, expected_resource_version, |sandbox| {
-                apply_main_process_exit(sandbox, instance_id, exit_code);
+                if restart {
+                    apply_main_process_restart(sandbox, instance_id, exit_code, now_ms);
+                } else {
+                    apply_main_process_exit(sandbox, instance_id, exit_code);
+                }
             })
             .await
             .map_err(|error| error.to_string())?;
@@ -4635,7 +4894,10 @@ impl ComputeRuntime {
         }
         if matches!(
             phase,
-            SandboxPhase::Stopping | SandboxPhase::Stopped | SandboxPhase::Starting
+            SandboxPhase::Stopping
+                | SandboxPhase::Stopped
+                | SandboxPhase::Starting
+                | SandboxPhase::Restarting
         ) {
             let updated = self
                 .store
@@ -4797,6 +5059,8 @@ fn apply_main_process_exit(sandbox: &mut Sandbox, instance_id: &str, exit_code: 
             format!("Canonical main process exited with status {exit_code}"),
         )
     };
+    status.next_restart_at_ms = 0;
+    status.main_process_started_at_ms = 0;
     upsert_ready_condition(
         &mut sandbox.status,
         SandboxCondition {
@@ -4820,6 +5084,63 @@ fn is_failed_main_process_result(sandbox: &Sandbox) -> bool {
                         && condition.reason == "MainProcessFailed"
                 })
         })
+}
+
+fn should_restart_main_process(policy: i32, exit_code: i32) -> bool {
+    match SandboxRestartPolicy::try_from(policy).unwrap_or(SandboxRestartPolicy::Never) {
+        SandboxRestartPolicy::Always => true,
+        SandboxRestartPolicy::OnFailure => exit_code != 0,
+        SandboxRestartPolicy::Unspecified | SandboxRestartPolicy::Never => false,
+    }
+}
+
+fn restart_delay_ms(restart_count: u32) -> i64 {
+    let shift = restart_count.saturating_sub(1).min(31);
+    RESTART_INITIAL_DELAY_MS
+        .saturating_mul(1_i64.checked_shl(shift).unwrap_or(i64::MAX))
+        .min(RESTART_MAX_DELAY_MS)
+}
+
+fn apply_main_process_restart(
+    sandbox: &mut Sandbox,
+    instance_id: &str,
+    exit_code: i32,
+    now_ms: i64,
+) {
+    let sandbox_name = sandbox.object_name().to_string();
+    let status = sandbox.status.get_or_insert_with(|| SandboxStatus {
+        sandbox_name: sandbox_name.clone(),
+        ..Default::default()
+    });
+    let stable_run = status.main_process_started_at_ms > 0
+        && now_ms.saturating_sub(status.main_process_started_at_ms) >= RESTART_STABILITY_WINDOW_MS;
+    status.restart_count = if stable_run || status.restart_count == 0 {
+        1
+    } else {
+        status.restart_count.saturating_add(1)
+    };
+    let delay_ms = restart_delay_ms(status.restart_count);
+    status.main_process_instance_id = instance_id.to_string();
+    status.exit_code = Some(exit_code);
+    status.main_process_started_at_ms = 0;
+    status.next_restart_at_ms = now_ms.saturating_add(delay_ms);
+    let restart_count = status.restart_count;
+    upsert_ready_condition(
+        &mut sandbox.status,
+        &sandbox_name,
+        SandboxCondition {
+            r#type: "Ready".to_string(),
+            status: "False".to_string(),
+            reason: "MainProcessRestartBackoff".to_string(),
+            message: format!(
+                "Canonical main process exited; restart {} scheduled in {} seconds",
+                restart_count,
+                delay_ms / 1000
+            ),
+            last_transition_time: String::new(),
+        },
+    );
+    sandbox.set_phase(SandboxPhase::Restarting as i32);
 }
 
 /// Connect to an unmanaged remote compute driver that is already listening on
@@ -5300,6 +5621,9 @@ fn public_status_from_driver(
         configuration_admission: None,
         configuration_activated: None,
         provisioning: None,
+        restart_count: 0,
+        next_restart_at_ms: 0,
+        main_process_started_at_ms: 0,
     }
 }
 
@@ -5365,6 +5689,18 @@ fn apply_driver_snapshot(
         },
     );
 
+    // Driver status has no canonical-main fields. Preserve the gateway-owned
+    // process generation and restart controller state across every snapshot.
+    if let (Some(old_status), Some(new_status)) = (sandbox.status.as_ref(), status.as_mut()) {
+        new_status
+            .main_process_instance_id
+            .clone_from(&old_status.main_process_instance_id);
+        new_status.exit_code = old_status.exit_code;
+        new_status.restart_count = old_status.restart_count;
+        new_status.next_restart_at_ms = old_status.next_restart_at_ms;
+        new_status.main_process_started_at_ms = old_status.main_process_started_at_ms;
+    }
+
     phase = match old_phase {
         // SIGTERM-driven runtime exits are reported as a runtime restart by
         // Docker and Podman. While an explicit stop owns this durable
@@ -5408,6 +5744,7 @@ fn apply_driver_snapshot(
         SandboxPhase::Starting if !matches!(phase, SandboxPhase::Ready | SandboxPhase::Error) => {
             SandboxPhase::Starting
         }
+        SandboxPhase::Restarting => SandboxPhase::Restarting,
         _ => phase,
     };
 
@@ -5776,9 +6113,9 @@ fn rewrite_user_facing_conditions(status: &mut Option<SandboxStatus>, spec: Opti
 }
 
 /// Phases for which a sandbox should have a running compute resource.
-/// `Deleting` and `Error` are intentionally excluded: deletion is in
-/// progress, or the sandbox has already failed and should not be
-/// silently revived. `Unspecified` is included because it is the proto
+/// Terminal and lifecycle-controller-owned phases are intentionally excluded:
+/// they must not be silently revived or bypass a persisted transition/backoff.
+/// `Unspecified` is included because it is the proto
 /// default value; persisted rows with that value should be reconciled
 /// from the live driver state rather than skipped forever.
 fn sandbox_phase_should_be_running(phase: SandboxPhase) -> bool {
@@ -7905,6 +8242,295 @@ mod tests {
         assert!(status.conditions.iter().any(|condition| {
             condition.r#type == "Ready" && condition.reason == "BackendResourceMissing"
         }));
+    }
+
+    #[test]
+    fn restart_policy_matches_kubernetes_exit_semantics() {
+        assert!(!should_restart_main_process(
+            SandboxRestartPolicy::Never as i32,
+            1
+        ));
+        assert!(!should_restart_main_process(
+            SandboxRestartPolicy::OnFailure as i32,
+            0
+        ));
+        assert!(should_restart_main_process(
+            SandboxRestartPolicy::OnFailure as i32,
+            1
+        ));
+        assert!(should_restart_main_process(
+            SandboxRestartPolicy::Always as i32,
+            0
+        ));
+    }
+
+    #[test]
+    fn restart_backoff_matches_kubernetes_defaults_and_cap() {
+        assert_eq!(restart_delay_ms(1), 10_000);
+        assert_eq!(restart_delay_ms(2), 20_000);
+        assert_eq!(restart_delay_ms(3), 40_000);
+        assert_eq!(restart_delay_ms(4), 80_000);
+        assert_eq!(restart_delay_ms(5), 160_000);
+        assert_eq!(restart_delay_ms(6), 300_000);
+        assert_eq!(restart_delay_ms(20), 300_000);
+    }
+
+    #[tokio::test]
+    async fn always_policy_schedules_zero_exit_once_and_new_supervisor_becomes_ready() {
+        let runtime = test_runtime(Arc::new(TestDriver::default())).await;
+        let mut sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Ready);
+        sandbox.spec = Some(SandboxSpec {
+            restart_policy: SandboxRestartPolicy::Always as i32,
+            ..Default::default()
+        });
+        sandbox.status = Some(SandboxStatus {
+            phase: SandboxPhase::Ready as i32,
+            main_process_instance_id: "instance-1".into(),
+            main_process_started_at_ms: openshell_core::time::now_ms(),
+            ..Default::default()
+        });
+        runtime.store.put_message(&sandbox).await.unwrap();
+
+        runtime
+            .main_process_exited("sb-1", "instance-1", 0)
+            .await
+            .unwrap();
+        runtime
+            .main_process_exited("sb-1", "instance-1", 0)
+            .await
+            .unwrap();
+
+        let restarting = runtime
+            .store
+            .get_message::<Sandbox>("sb-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(restarting.phase(), SandboxPhase::Restarting as i32);
+        let status = restarting.status.unwrap();
+        assert_eq!(status.restart_count, 1);
+        assert_eq!(status.exit_code, Some(0));
+        assert!(status.next_restart_at_ms > openshell_core::time::now_ms());
+
+        runtime
+            .supervisor_session_connected("sb-1", "instance-2")
+            .await
+            .unwrap();
+        let ready = runtime
+            .store
+            .get_message::<Sandbox>("sb-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(ready.phase(), SandboxPhase::Ready as i32);
+        let status = ready.status.unwrap();
+        assert_eq!(status.main_process_instance_id, "instance-2");
+        assert_eq!(status.exit_code, None);
+        assert_eq!(status.next_restart_at_ms, 0);
+        assert!(status.main_process_started_at_ms > 0);
+    }
+
+    #[tokio::test]
+    async fn restarting_sandbox_rejects_previous_supervisor_instance() {
+        let runtime = test_runtime(Arc::new(TestDriver::default())).await;
+        let mut sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Restarting);
+        sandbox.status = Some(SandboxStatus {
+            phase: SandboxPhase::Restarting as i32,
+            main_process_instance_id: "instance-1".into(),
+            exit_code: Some(9),
+            restart_count: 1,
+            next_restart_at_ms: openshell_core::time::now_ms() + 10_000,
+            ..Default::default()
+        });
+        runtime.store.put_message(&sandbox).await.unwrap();
+
+        let error = runtime
+            .supervisor_session_connected("sb-1", "instance-1")
+            .await
+            .unwrap_err();
+
+        assert!(error.contains("requires a fresh supervisor instance"));
+        let stored = runtime
+            .store
+            .get_message::<Sandbox>("sb-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.phase(), SandboxPhase::Restarting as i32);
+        assert_eq!(
+            stored.status.unwrap().main_process_instance_id,
+            "instance-1"
+        );
+    }
+
+    #[tokio::test]
+    async fn on_failure_policy_keeps_zero_exit_terminal() {
+        let runtime = test_runtime(Arc::new(TestDriver::default())).await;
+        let mut sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Ready);
+        sandbox.spec = Some(SandboxSpec {
+            restart_policy: SandboxRestartPolicy::OnFailure as i32,
+            ..Default::default()
+        });
+        sandbox.status = Some(SandboxStatus {
+            phase: SandboxPhase::Ready as i32,
+            main_process_instance_id: "instance-1".into(),
+            ..Default::default()
+        });
+        runtime.store.put_message(&sandbox).await.unwrap();
+
+        runtime
+            .main_process_exited("sb-1", "instance-1", 0)
+            .await
+            .unwrap();
+
+        let stored = runtime
+            .store
+            .get_message::<Sandbox>("sb-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.phase(), SandboxPhase::Error as i32);
+        assert_eq!(stored.status.unwrap().restart_count, 0);
+    }
+
+    #[test]
+    fn stable_main_run_resets_restart_backoff_count() {
+        let now_ms = openshell_core::time::now_ms();
+        let mut sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Ready);
+        sandbox.status = Some(SandboxStatus {
+            restart_count: 5,
+            main_process_started_at_ms: now_ms - RESTART_STABILITY_WINDOW_MS,
+            ..Default::default()
+        });
+
+        apply_main_process_restart(&mut sandbox, "instance-6", 9, now_ms);
+
+        let status = sandbox.status.unwrap();
+        assert_eq!(status.restart_count, 1);
+        assert_eq!(status.next_restart_at_ms, now_ms + RESTART_INITIAL_DELAY_MS);
+    }
+
+    #[tokio::test]
+    async fn due_restart_stops_and_starts_driver_without_exposing_stopped_phase() {
+        let driver = ControlledDriver::new();
+        let runtime = test_runtime(driver.clone()).await;
+        let mut sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Restarting);
+        sandbox.spec = Some(SandboxSpec {
+            restart_policy: SandboxRestartPolicy::OnFailure as i32,
+            ..Default::default()
+        });
+        sandbox.status = Some(SandboxStatus {
+            phase: SandboxPhase::Restarting as i32,
+            main_process_instance_id: "instance-1".into(),
+            exit_code: Some(9),
+            restart_count: 1,
+            next_restart_at_ms: openshell_core::time::now_ms() - 1,
+            ..Default::default()
+        });
+        runtime.store.put_message(&sandbox).await.unwrap();
+
+        runtime.restart_sandbox_runtime("sb-1").await.unwrap();
+
+        assert_eq!(driver.stop_calls(), 1);
+        assert_eq!(driver.start_calls(), 1);
+        let stored = runtime
+            .store
+            .get_message::<Sandbox>("sb-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.phase(), SandboxPhase::Restarting as i32);
+        let status = stored.status.unwrap();
+        assert_eq!(status.exit_code, Some(9));
+        assert!(status.next_restart_at_ms > openshell_core::time::now_ms());
+        assert!(status.conditions.iter().any(|condition| {
+            condition.r#type == "Ready" && condition.reason == "SandboxRestarting"
+        }));
+    }
+
+    #[tokio::test]
+    async fn retryable_restart_driver_failure_reschedules_attempt() {
+        let driver = ControlledDriver::new();
+        driver.set_stop_outcome(ControlledLifecycleOutcome::Error("transport unavailable"));
+        let runtime = test_runtime(driver).await;
+        let mut sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Restarting);
+        sandbox.status = Some(SandboxStatus {
+            phase: SandboxPhase::Restarting as i32,
+            exit_code: Some(9),
+            restart_count: 2,
+            next_restart_at_ms: openshell_core::time::now_ms() - 1,
+            ..Default::default()
+        });
+        runtime.store.put_message(&sandbox).await.unwrap();
+
+        let error = runtime.restart_sandbox_runtime("sb-1").await.unwrap_err();
+
+        assert!(error.contains("transport unavailable"));
+        let stored = runtime
+            .store
+            .get_message::<Sandbox>("sb-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.phase(), SandboxPhase::Restarting as i32);
+        let status = stored.status.unwrap();
+        assert!(status.next_restart_at_ms > openshell_core::time::now_ms());
+        assert!(status.conditions.iter().any(|condition| {
+            condition.r#type == "Ready" && condition.reason == "SandboxRestartFailed"
+        }));
+    }
+
+    #[tokio::test]
+    async fn missing_runtime_during_restart_is_terminal() {
+        let driver = ControlledDriver::new();
+        driver.set_stop_outcome(ControlledLifecycleOutcome::NotFound);
+        let runtime = test_runtime(driver).await;
+        let mut sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Restarting);
+        sandbox.status = Some(SandboxStatus {
+            phase: SandboxPhase::Restarting as i32,
+            exit_code: Some(9),
+            restart_count: 1,
+            next_restart_at_ms: openshell_core::time::now_ms() - 1,
+            ..Default::default()
+        });
+        runtime.store.put_message(&sandbox).await.unwrap();
+
+        runtime.restart_sandbox_runtime("sb-1").await.unwrap_err();
+
+        let stored = runtime
+            .store
+            .get_message::<Sandbox>("sb-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.phase(), SandboxPhase::Error as i32);
+        let status = stored.status.unwrap();
+        assert_eq!(status.next_restart_at_ms, 0);
+        assert_eq!(status.exit_code, Some(9));
+    }
+
+    #[tokio::test]
+    async fn manual_stop_cancels_pending_restart() {
+        let driver = ControlledDriver::new();
+        let runtime = test_runtime(driver.clone()).await;
+        let mut sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Restarting);
+        sandbox.status = Some(SandboxStatus {
+            phase: SandboxPhase::Restarting as i32,
+            exit_code: Some(9),
+            restart_count: 2,
+            next_restart_at_ms: openshell_core::time::now_ms() + 60_000,
+            ..Default::default()
+        });
+        runtime.store.put_message(&sandbox).await.unwrap();
+
+        let stopped = runtime.stop_sandbox("default", "sandbox-a").await.unwrap();
+
+        assert_eq!(stopped.phase(), SandboxPhase::Stopped as i32);
+        let status = stopped.status.unwrap();
+        assert_eq!(status.exit_code, None);
+        assert_eq!(status.restart_count, 0);
+        assert_eq!(status.next_restart_at_ms, 0);
+        assert_eq!(driver.stop_calls(), 1);
     }
 
     #[tokio::test]

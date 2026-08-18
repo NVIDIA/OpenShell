@@ -1228,6 +1228,17 @@ mod tests {
     }
 
     #[test]
+    fn validate_sandbox_spec_rejects_unknown_restart_policy() {
+        let spec = SandboxSpec {
+            restart_policy: 99,
+            ..Default::default()
+        };
+        let err = validate_sandbox_spec("", &spec).unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("restart_policy"));
+    }
+
+    #[test]
     fn validate_sandbox_spec_accepts_exact_main_process_argv() {
         let spec = SandboxSpec {
             command: vec!["/bin/sh".into(), "-c".into(), "printf 'a b'".into()],

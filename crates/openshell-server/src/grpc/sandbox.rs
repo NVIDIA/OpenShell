@@ -42,6 +42,9 @@ use openshell_core::proto::{
     BeginRootfsTarStagingRequest, BeginRootfsTarStagingResponse, Sandbox, SandboxPhase,
     SandboxTemplate, SshSession,
 };
+use openshell_core::proto::{
+    Sandbox, SandboxPhase, SandboxRestartPolicy, SandboxTemplate, SshSession,
+};
 use openshell_core::telemetry::{
     LifecycleOperation, LifecycleResource, SandboxTemplateSource, TelemetryOutcome,
 };
@@ -238,6 +241,14 @@ pub(super) async fn resolve_and_authorize_sandbox_name(
     Ok(sandbox)
 }
 
+fn require_ready_sandbox(sandbox: &Sandbox) -> Result<(), Status> {
+    match SandboxPhase::try_from(sandbox.phase()).ok() {
+        Some(SandboxPhase::Ready) => Ok(()),
+        Some(SandboxPhase::Restarting) => Err(Status::failed_precondition("sandbox is restarting")),
+        _ => Err(Status::failed_precondition("sandbox is not ready")),
+    }
+}
+
 fn generate_routable_name() -> String {
     let name = petname::petname(2, "-").unwrap_or_else(generate_name);
     let mut truncated = &name[..name.len().min(MAX_ROUTABLE_NAME_LEN)];
@@ -419,6 +430,26 @@ async fn handle_create_sandbox_inner(
     let workload_template_name = request.workload_template.trim().to_string();
 
     validate_create_sandbox_request_pre_io(&request, &workload_template_name)?;
+    // Every newly persisted sandbox has one explicit canonical process. This
+    // portable default also preserves compatibility with callers compiled
+    // before the main-process field was introduced.
+    if spec.command.is_empty() {
+        spec.command = vec!["/bin/bash".to_string(), "-l".to_string()];
+        spec.tty = true;
+    }
+    if spec.restart_policy == SandboxRestartPolicy::Unspecified as i32 {
+        spec.restart_policy = SandboxRestartPolicy::Never as i32;
+    }
+
+    // Validate field sizes before any I/O (fail fast on oversized payloads).
+    validate_sandbox_spec(&request.name, &spec)?;
+
+    // Validate labels (keys and values must meet Kubernetes requirements).
+    for (key, value) in &request.labels {
+        crate::grpc::validation::validate_label_key(key)?;
+        crate::grpc::validation::validate_label_value(value)?;
+    }
+    crate::grpc::validation::validate_annotations(&request.annotations, "annotations")?;
 
     let authz = authorize_workspace(
         &state.store,
@@ -2416,9 +2447,7 @@ pub(super) async fn handle_exec_sandbox(
         completion.ensure_target(sandbox.object_id())?;
     }
 
-    if SandboxPhase::try_from(sandbox.phase()).ok() != Some(SandboxPhase::Ready) {
-        return Err(Status::failed_precondition("sandbox is not ready"));
-    }
+    require_ready_sandbox(&sandbox)?;
 
     // Open a relay channel through the supervisor session. Use a 15s
     // session-wait timeout, enough to cover a transient supervisor reconnect
@@ -2931,9 +2960,7 @@ pub(super) async fn handle_exec_sandbox_interactive_start(
         completion.ensure_target(sandbox.object_id())?;
     }
 
-    if SandboxPhase::try_from(sandbox.phase()).ok() != Some(SandboxPhase::Ready) {
-        return Err(Status::failed_precondition("sandbox is not ready"));
-    }
+    require_ready_sandbox(&sandbox)?;
 
     let (channel_id, relay_rx) = crate::supervisor_session::open_routed_relay_with_target(
         state,
@@ -6657,6 +6684,10 @@ mod tests {
         .into_inner();
 
         let created = response.sandbox.expect("created sandbox");
+        assert_eq!(
+            created.spec.as_ref().unwrap().restart_policy(),
+            SandboxRestartPolicy::Never
+        );
         assert_eq!(
             created
                 .metadata

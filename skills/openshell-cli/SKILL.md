@@ -277,6 +277,7 @@ Key flags:
 - `--label KEY=VALUE`: Add labels for later selection (repeatable)
 - `--env KEY=VALUE`: Set non-secret sandbox environment variables (repeatable); use `--provider` for credentials
 - `--tty`: Allocate a retained PTY for the canonical main process
+- `--restart-policy never|on-failure|always`: Select gateway-owned main-process restart behavior; `never` is the default
 - `--approval-mode manual|auto`: Control handling of agent-authored policy proposals; `manual` is the default
 - `--upload <PATH>[:<DEST>]`: Upload local files into the container working directory or an explicit destination
 - `--no-git-ignore`: Disable `.gitignore` filtering for uploads
@@ -377,9 +378,12 @@ openshell sandbox ssh-config my-sandbox >> ~/.ssh/config
 ```
 
 If `connect` reports `canonical main process already finished`, inspect the
-result with `sandbox get`. A pending
-foreground attachment can still retrieve retained output in `Completed` or
-`Error`; phase alone does not determine whether attachment is available.
+result with `sandbox get`. A pending foreground attachment can still retrieve
+retained output in `Completed` or `Error`; phase alone does not determine
+whether attachment is available. When policy selects a replacement, the
+sandbox enters `Starting` during backoff and resource replacement. Connect
+and exec commands resume after the new supervisor session makes it `Ready`.
+An explicit `sandbox stop` cancels a pending restart.
 
 ### Upload and download files
 

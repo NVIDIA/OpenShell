@@ -1142,6 +1142,61 @@ func (EndpointResult) EnumDescriptor() ([]byte, []int) {
 	return file_openshell_proto_rawDescGZIP(), []int{17}
 }
 
+// Policy applied when the canonical main process exits outside an intentional
+// stop or delete operation. Kept after existing enums so generated enum
+// descriptors remain stable.
+type SandboxRestartPolicy int32
+
+const (
+	SandboxRestartPolicy_SANDBOX_RESTART_POLICY_UNSPECIFIED SandboxRestartPolicy = 0
+	SandboxRestartPolicy_SANDBOX_RESTART_POLICY_NEVER       SandboxRestartPolicy = 1
+	SandboxRestartPolicy_SANDBOX_RESTART_POLICY_ON_FAILURE  SandboxRestartPolicy = 2
+	SandboxRestartPolicy_SANDBOX_RESTART_POLICY_ALWAYS      SandboxRestartPolicy = 3
+)
+
+// Enum value maps for SandboxRestartPolicy.
+var (
+	SandboxRestartPolicy_name = map[int32]string{
+		0: "SANDBOX_RESTART_POLICY_UNSPECIFIED",
+		1: "SANDBOX_RESTART_POLICY_NEVER",
+		2: "SANDBOX_RESTART_POLICY_ON_FAILURE",
+		3: "SANDBOX_RESTART_POLICY_ALWAYS",
+	}
+	SandboxRestartPolicy_value = map[string]int32{
+		"SANDBOX_RESTART_POLICY_UNSPECIFIED": 0,
+		"SANDBOX_RESTART_POLICY_NEVER":       1,
+		"SANDBOX_RESTART_POLICY_ON_FAILURE":  2,
+		"SANDBOX_RESTART_POLICY_ALWAYS":      3,
+	}
+)
+
+func (x SandboxRestartPolicy) Enum() *SandboxRestartPolicy {
+	p := new(SandboxRestartPolicy)
+	*p = x
+	return p
+}
+
+func (x SandboxRestartPolicy) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (SandboxRestartPolicy) Descriptor() protoreflect.EnumDescriptor {
+	return file_openshell_proto_enumTypes[8].Descriptor()
+}
+
+func (SandboxRestartPolicy) Type() protoreflect.EnumType {
+	return &file_openshell_proto_enumTypes[8]
+}
+
+func (x SandboxRestartPolicy) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use SandboxRestartPolicy.Descriptor instead.
+func (SandboxRestartPolicy) EnumDescriptor() ([]byte, []int) {
+	return file_openshell_proto_rawDescGZIP(), []int{8}
+}
+
 // IssueSandboxToken request. Empty body; identity is established by the
 // authentication credentials carried in the request headers (a projected
 // Kubernetes ServiceAccount JWT in the K8s driver path).

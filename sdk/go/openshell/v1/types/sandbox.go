@@ -34,9 +34,10 @@ type SandboxSpec struct {
 	GPU      bool
 	GPUCount *uint32
 	// Policy is the security policy for the sandbox. Nil means no policy specified.
-	Policy  *SandboxPolicy
-	Command []string
-	TTY     bool
+	Policy        *SandboxPolicy
+	Command       []string
+	TTY           bool
+	RestartPolicy SandboxRestartPolicy
 }
 
 // SandboxTemplate defines the container template for a sandbox.
@@ -123,6 +124,17 @@ type SandboxStatus struct {
 	// last accepted network results, independently of sandbox readiness.
 	EndpointStatuses       []EndpointStatus
 	ConfigurationAdmission *SandboxConfigurationAdmission
+	SandboxName            string
+	AgentPod               string
+	AgentFd                string
+	SandboxFd              string
+	Phase                  SandboxPhase
+	Conditions             []SandboxCondition
+	CurrentPolicyVersion   uint32
+	ExitCode               *int32
+	RestartCount           uint32
+	NextRestartAtMs        int64
+	MainProcessStartedAtMs int64
 }
 
 // ConfigurationAdmissionState describes validation of an effective configuration.

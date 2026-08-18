@@ -31,6 +31,7 @@ func TestConverterCoversAllProtoFields_SandboxSpec(t *testing.T) {
 		"resource_requirements": true,
 		"command":               true,
 		"tty":                   true,
+		"restart_policy":        true,
 	}
 
 	// The gateway owns this identity. Provider status exposes it through the

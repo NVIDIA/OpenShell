@@ -367,6 +367,18 @@ impl SandboxRef {
                     name: p.name,
                     resource_version: p.resource_version,
                 });
+        let (exit_code, restart_count, next_restart_at_ms, main_process_started_at_ms) = sandbox
+            .status
+            .as_ref()
+            .map_or((None, 0, None, None), |status| {
+                (
+                    status.exit_code,
+                    status.restart_count,
+                    (status.next_restart_at_ms > 0).then_some(status.next_restart_at_ms),
+                    (status.main_process_started_at_ms > 0)
+                        .then_some(status.main_process_started_at_ms),
+                )
+            });
         let meta = sandbox.metadata.unwrap_or_default();
         Self {
             id: meta.id,
@@ -378,6 +390,9 @@ impl SandboxRef {
             exit_code,
             created_from_workload_template,
             service_urls: HashMap::new(),
+            restart_count,
+            next_restart_at_ms,
+            main_process_started_at_ms,
         }
     }
 }

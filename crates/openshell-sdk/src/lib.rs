@@ -56,4 +56,6 @@ pub use types::{
     SandboxWorkloadConfig, SandboxWorkloadTemplate, SandboxWorkloadTemplateProvenance,
     SandboxWorkloadTemplateSpec, ServiceExposure, ServiceStatus, WatchEvent, WatchOptions,
     WorkspaceRef,
+    ExecOptions, ExecResult, Health, ListOptions, SandboxPhase, SandboxRef, SandboxRestartPolicy,
+    SandboxSpec, ServiceStatus, WorkspaceRef,
 };

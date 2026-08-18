@@ -34,6 +34,7 @@ export type {
   SandboxRef,
   SandboxResources,
   SandboxServiceLevel,
+  SandboxRestartPolicyName,
   SandboxSpec,
   SandboxStartup,
   SandboxTemplateListOptions,
