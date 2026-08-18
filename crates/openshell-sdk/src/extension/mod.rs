@@ -6,8 +6,8 @@
 //! This feature is the home for shared extension interfaces, verification, and
 //! observability. It currently provides gateway-minted credential verification.
 
-mod verification;
+mod auth;
 
-pub use verification::{
+pub use auth::{
     AuthenticatedCaller, ExtensionCallerKind, GatewayJwtAuthenticator, VerificationError,
 };
