@@ -9,6 +9,40 @@ release:
   namespace: my-namespace
 
 tests:
+  - it: grants PodDisruptionBudget cleanup in multi-namespace mode while protection is disabled
+    set:
+      server.drivers.kubernetes.workspaceMode: managed
+    asserts:
+      - contains:
+          path: rules
+          content:
+            apiGroups: ["policy"]
+            resources: ["poddisruptionbudgets"]
+            verbs: ["delete", "get", "list"]
+
+  - it: grants PodDisruptionBudget mutation in multi-namespace mode when protection is enabled
+    set:
+      server.drivers.kubernetes.workspaceMode: operator
+      server.disruptionProtection.enabled: true
+    asserts:
+      - contains:
+          path: rules
+          content:
+            apiGroups: ["policy"]
+            resources: ["poddisruptionbudgets"]
+            verbs: ["delete", "get", "list", "create", "patch"]
+
+  - it: omits cluster-wide PodDisruptionBudget access in shared mode
+    set:
+      server.drivers.kubernetes.workspaceMode: shared
+    asserts:
+      - notContains:
+          path: rules
+          content:
+            apiGroups: ["policy"]
+            resources: ["poddisruptionbudgets"]
+          any: true
+
   - it: grants managed namespace NetworkPolicy apply permissions
     set:
       server.drivers.kubernetes.workspaceMode: managed

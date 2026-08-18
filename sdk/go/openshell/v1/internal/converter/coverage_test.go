@@ -31,6 +31,7 @@ func TestConverterCoversAllProtoFields_SandboxSpec(t *testing.T) {
 		"resource_requirements": true,
 		"command":               true,
 		"tty":                   true,
+		"disruption_protection": true,
 	}
 
 	assertAllFieldsCovered(t, (&pb.SandboxSpec{}).ProtoReflect().Descriptor(), handled, nil)

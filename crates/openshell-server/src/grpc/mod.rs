@@ -30,6 +30,7 @@ use openshell_core::proto::{
     ExposeServiceRequest, FinalizeMainProcessExitRequest, FinalizeMainProcessExitResponse,
     GatewayMessage, GetCurrentUserRequest, GetCurrentUserResponse, GetDraftHistoryRequest,
     GetDraftHistoryResponse, GetDraftPolicyRequest, GetDraftPolicyResponse,
+    DisruptionProtectionCapability,
     GetGatewayConfigRequest, GetGatewayConfigResponse, GetGatewayInfoRequest,
     GetGatewayInfoResponse, GetProviderProfileRequest, GetProviderRefreshStatusRequest,
     GetProviderRefreshStatusResponse, GetProviderRequest, GetSandboxConfigRequest,
@@ -264,6 +265,13 @@ impl OpenShell for OpenShellService {
                         .resource_capabilities
                         .as_ref()
                         .map(|resources| public_resource_capabilities(*resources)),
+                    disruption_protection: driver.disruption_protection.as_ref().map(
+                        |capability| DisruptionProtectionCapability {
+                            support: capability.support,
+                            enabled: capability.enabled,
+                            max_duration: capability.max_duration,
+                        },
+                    ),
                 }),
             })
             .collect();

@@ -12,6 +12,7 @@ repository.workspace = true
 
 [dependencies]
 openshell-core = { path = "../openshell-core" }
+prost-types = { workspace = true }
 async-trait = "0.1"
 futures = { workspace = true }
 hyper = { workspace = true }

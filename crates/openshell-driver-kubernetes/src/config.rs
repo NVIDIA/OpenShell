@@ -9,7 +9,6 @@ use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::path::Path;
 use std::str::FromStr;
-use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 /// Default gateway identity used in managed-mode namespace naming.

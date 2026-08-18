@@ -59,6 +59,7 @@ use openshell_core::proto::{
     SandboxWorkloadTemplate, SandboxWorkloadTemplateSpec, ServiceEndpointResponse,
     SetInferenceRouteRequest, SettingScope, StartSandboxRequest, StopSandboxRequest,
     TcpForwardFrame, TcpForwardInit, TcpRelayTarget, UpdateConfigRequest, WatchSandboxRequest,
+    DisruptionProtectionRequest,
     exec_sandbox_event, tcp_forward_init,
 };
 use openshell_core::settings;
@@ -406,6 +407,7 @@ pub struct SandboxCreateConfig<'a> {
     pub cpu: Option<&'a str>,
     pub memory: Option<&'a str>,
     pub driver_config_json: Option<&'a str>,
+    pub disruption_protection: Option<&'a str>,
     pub editor: Option<Editor>,
     pub providers: &'a [String],
     pub policy: Option<&'a str>,
@@ -432,6 +434,7 @@ impl Default for SandboxCreateConfig<'_> {
             cpu: None,
             memory: None,
             driver_config_json: None,
+            disruption_protection: None,
             editor: None,
             providers: &[],
             policy: None,
@@ -466,6 +469,7 @@ pub async fn sandbox_create(
         cpu,
         memory,
         driver_config_json,
+        disruption_protection,
         editor,
         providers,
         policy,
@@ -572,6 +576,9 @@ pub async fn sandbox_create(
     } else {
         None
     };
+    let disruption_protection = disruption_protection
+        .map(parse_disruption_protection)
+        .transpose()?;
 
     let inline_template = if image.is_some() || resource_limits.is_some() || driver_config.is_some()
     {
@@ -621,6 +628,7 @@ pub async fn sandbox_create(
             template: inline_template,
             command: main_command,
             tty: main_terminal,
+            disruption_protection,
             ..SandboxSpec::default()
         }),
         name: name.unwrap_or_default().to_string(),
@@ -1137,6 +1145,22 @@ pub async fn sandbox_create(
             "sandbox provisioning stream ended before reaching terminal phase"
         )),
     }
+}
+
+fn parse_disruption_protection(value: &str) -> Result<DisruptionProtectionRequest> {
+    let duration_ms = parse_duration_to_ms(value)?;
+    if duration_ms <= 0 {
+        return Err(miette!(
+            "disruption protection duration must be greater than zero"
+        ));
+    }
+
+    Ok(DisruptionProtectionRequest {
+        duration: Some(prost_types::Duration {
+            seconds: duration_ms / 1_000,
+            nanos: i32::try_from((duration_ms % 1_000) * 1_000_000).into_diagnostic()?,
+        }),
+    })
 }
 
 /// Resolved source for the `--from` flag on `sandbox create`.
@@ -5968,7 +5992,8 @@ mod tests {
         PolicyGetView, ProvisioningStep, build_sandbox_resource_limits,
         dockerfile_sources_supported_for_gateway, format_endpoint, format_log_line, git_sync_files,
         has_main_process_result, parse_cli_setting_value, parse_credential_expiry_cli_value,
-        parse_driver_config_json, parse_secret_material_env_pairs, policy_revision_list_json,
+        parse_disruption_protection, parse_driver_config_json, parse_secret_material_env_pairs,
+        policy_revision_list_json,
         policy_revision_to_json, provisioning_timeout_message, ready_false_condition_message,
         resolve_from, sandbox_should_persist, sandbox_upload_plan, service_endpoint_to_json,
         service_expose_status_error, service_url_for_gateway, workspace_member_to_json,
@@ -6425,6 +6450,21 @@ mod tests {
             err.to_string().contains("must be valid JSON"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn parse_disruption_protection_builds_protobuf_duration() {
+        let request = parse_disruption_protection("90m").expect("duration should parse");
+        let duration = request.duration.expect("duration should be present");
+
+        assert_eq!(duration.seconds, 5_400);
+        assert_eq!(duration.nanos, 0);
+    }
+
+    #[test]
+    fn parse_disruption_protection_rejects_non_positive_duration() {
+        let err = parse_disruption_protection("0s").expect_err("zero must be rejected");
+        assert!(err.to_string().contains("greater than zero"));
     }
 
     #[test]

@@ -98,6 +98,7 @@ impl FakeComputeDriver {
                     supports_sandbox_authentication: false,
                     driver_reports_runtime_readiness: false,
                     resource_capabilities: None,
+                    disruption_protection: None,
                 },
                 gateway_listener_requirements: Vec::new(),
                 gateway_listener_requirements_supported: true,

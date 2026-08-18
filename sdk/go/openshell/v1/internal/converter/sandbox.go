@@ -90,6 +90,10 @@ func sandboxSpecFromProto(spec *pb.SandboxSpec) types.SandboxSpec {
 	}
 	result.Command = CopyStringSlice(spec.GetCommand())
 	result.TTY = spec.GetTty()
+	if request := spec.GetDisruptionProtection(); request != nil && request.GetDuration() != nil {
+		duration := request.GetDuration().AsDuration()
+		result.DisruptionProtectionDuration = &duration
+	}
 
 	return result
 }
@@ -238,6 +242,11 @@ func SandboxSpecToProto(spec *types.SandboxSpec) *pb.SandboxSpec {
 			},
 		}
 	}
+	if spec.DisruptionProtectionDuration != nil {
+		result.DisruptionProtection = &pb.DisruptionProtectionRequest{
+			Duration: durationpb.New(*spec.DisruptionProtectionDuration),
+		}
+	}
 
 	result.Command = CopyStringSlice(spec.Command)
 	result.Tty = spec.TTY
@@ -257,6 +266,14 @@ func SandboxSpecToProtoChecked(spec *types.SandboxSpec) (*pb.SandboxSpec, error)
 		return nil, fmt.Errorf("policy: %w", err)
 	}
 	result.Policy = policy
+	if spec.DisruptionProtectionDuration != nil {
+		if err := result.GetDisruptionProtection().GetDuration().CheckValid(); err != nil {
+			return nil, fmt.Errorf("disruption protection duration: %w", err)
+		}
+		if *spec.DisruptionProtectionDuration <= 0 {
+			return nil, fmt.Errorf("disruption protection duration must be greater than zero")
+		}
+	}
 	if spec.Template == nil {
 		return result, nil
 	}

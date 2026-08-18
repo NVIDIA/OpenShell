@@ -18,6 +18,7 @@ use openshell_sdk::{
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 use tokio_stream::wrappers::TcpListenerStream;
@@ -887,6 +888,7 @@ async fn create_sandbox_passes_spec_through() {
         image: Some("ghcr.io/foo:bar".to_string()),
         labels: labels.clone(),
         gpu: true,
+        disruption_protection: Some(Duration::from_secs(3_600)),
         ..Default::default()
     };
 
@@ -909,6 +911,13 @@ async fn create_sandbox_passes_spec_through() {
     assert_eq!(
         observed_spec.template.as_ref().unwrap().image,
         "ghcr.io/foo:bar"
+    );
+    assert_eq!(
+        observed_spec
+            .disruption_protection
+            .and_then(|request| request.duration)
+            .map(|duration| duration.seconds),
+        Some(3_600)
     );
 }
 
@@ -1104,7 +1113,7 @@ async fn wait_ready_transitions_through_phases() {
     let client = connect(&endpoint).await;
 
     let sandbox = client
-        .wait_ready("my-box", std::time::Duration::from_secs(5))
+        .wait_ready("my-box", Duration::from_secs(5))
         .await
         .unwrap();
     assert_eq!(sandbox.phase, SandboxPhase::Ready);
@@ -1156,7 +1165,7 @@ async fn wait_ready_surfaces_error_phase() {
     let client = connect(&endpoint).await;
 
     let err = client
-        .wait_ready("my-box", std::time::Duration::from_secs(5))
+        .wait_ready("my-box", Duration::from_secs(5))
         .await
         .unwrap_err();
     assert_eq!(err.code(), "connect");
@@ -1173,7 +1182,7 @@ async fn wait_deleted_returns_when_get_reports_not_found() {
     let client = connect(&endpoint).await;
 
     client
-        .wait_deleted("my-box", std::time::Duration::from_secs(5))
+        .wait_deleted("my-box", Duration::from_secs(5))
         .await
         .unwrap();
     assert!(state.get_calls.load(Ordering::SeqCst) >= 3);
@@ -1207,7 +1216,7 @@ async fn exec_buffers_stdout_stderr_and_exit() {
             &["echo".to_string(), "hello".to_string()],
             ExecOptions {
                 workdir: Some("/work".to_string()),
-                timeout: Some(std::time::Duration::from_secs(10)),
+                timeout: Some(Duration::from_secs(10)),
                 ..Default::default()
             },
         )

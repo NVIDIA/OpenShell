@@ -584,14 +584,13 @@ impl DockerComputeDriver {
     }
 
     fn capabilities(&self) -> GetCapabilitiesResponse {
-        GetCapabilitiesResponse {
-            driver_name: "docker".to_string(),
-            driver_version: self.config.daemon_version.clone(),
-            default_image: self.config.default_image.clone(),
-            gateway_manages_lifecycle: true,
-            supports_sandbox_authentication: false,
-            driver_reports_runtime_readiness: false,
-            resource_capabilities: Some(ResourceCapabilities {
+        let mut capabilities = openshell_core::driver_utils::build_capabilities_response(
+            "docker",
+            &self.config.daemon_version,
+            &self.config.default_image,
+            true,
+        );
+        capabilities.resource_capabilities = Some(ResourceCapabilities {
                 cpu: Some(CpuResourceCapabilities {
                     limit_supported: true,
                 }),
@@ -602,8 +601,8 @@ impl DockerComputeDriver {
                     default_selection_supported: self.config.gpu.cdi_supported,
                     count_selection_supported: self.config.gpu.cdi_supported,
                 }),
-            }),
-        }
+        });
+        capabilities
     }
 
     #[cfg(test)]
@@ -623,6 +622,11 @@ impl DockerComputeDriver {
             .spec
             .as_ref()
             .ok_or_else(|| Status::invalid_argument("sandbox.spec is required"))?;
+        if spec.disruption_protection.is_some() {
+            return Err(Status::failed_precondition(
+                "docker sandboxes do not support disruption protection",
+            ));
+        }
         let template = spec
             .template
             .as_ref()
