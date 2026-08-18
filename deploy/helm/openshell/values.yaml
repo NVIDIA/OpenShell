@@ -245,7 +245,8 @@ server:
   # must also request a duration through the Sandbox API before OpenShell
   # creates a PDB.
   disruptionProtection:
-    # -- Allow individual sandboxes to request disruption protection.
+    # -- Allow new sandbox disruption-protection requests. Turning this off
+    # retains existing PDBs until their deadlines but disables their repair.
     enabled: false
     # -- Maximum accepted sandbox protection duration. Supports s, m, and h.
     maxDuration: "24h"

@@ -73,6 +73,9 @@ sandbox sets the first-class `disruption_protection` duration through the API
 or `openshell sandbox create --disruption-protection`.
 The operator's `max_duration` limits each request. Durations are positive
 integer seconds, minutes, or hours, such as `30m` or `4h`.
+Disabling the operator gate rejects new requests without shortening previously
+accepted intervals. Existing PDBs remain until their deadlines, but the driver
+does not recreate or patch them while the gate and mutation RBAC are disabled.
 
 OpenShell calculates an absolute UTC deadline and stores it in the
 `openshell.io/disruption-protected-until` annotation on both the Sandbox and
