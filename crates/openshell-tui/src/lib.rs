@@ -2698,11 +2698,10 @@ fn format_age(epoch_ms: i64) -> String {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs().cast_signed());
-    let diff = now - created_secs;
-    if diff < 0 {
+    if created_secs > now {
         return String::from("-");
     }
-    let diff = diff.cast_unsigned();
+    let diff = (now - created_secs).cast_unsigned();
     if diff < 60 {
         format!("{diff}s")
     } else if diff < 3600 {
@@ -2803,5 +2802,33 @@ mod provider_profile_workspace_tests {
                 "{label} did not survive cache insertion and lookup"
             );
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn format_age_handles_future_timestamp() {
+        let future_ms = i64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis(),
+        )
+        .unwrap()
+            + 10_000;
+        assert_eq!(format_age(future_ms), "-");
+    }
+
+    #[test]
+    fn format_age_handles_zero_and_negative() {
+        assert_eq!(format_age(0), "-");
+        assert_eq!(format_age(-1), "-");
     }
 }

@@ -2750,7 +2750,9 @@ fn parse_cpu_limit(value: &str) -> Result<Option<i64>, Status> {
                 "docker cpu_limit must be greater than zero",
             ));
         }
-        return Ok(Some(millicores.saturating_mul(1_000_000)));
+        return millicores.checked_mul(1_000_000).map(Some).ok_or_else(|| {
+            Status::failed_precondition(format!("docker cpu_limit '{value}' is too large"))
+        });
     }
 
     let cores = value.parse::<f64>().map_err(|_| {
@@ -2764,7 +2766,15 @@ fn parse_cpu_limit(value: &str) -> Result<Option<i64>, Status> {
         ));
     }
 
-    Ok(Some((cores * 1_000_000_000.0).round() as i64))
+    let nano_cpus = (cores * 1_000_000_000.0).round();
+    #[allow(clippy::cast_precision_loss)]
+    if !nano_cpus.is_finite() || nano_cpus < i64::MIN as f64 || nano_cpus >= i64::MAX as f64 {
+        return Err(Status::failed_precondition(format!(
+            "docker cpu_limit '{value}' is too large",
+        )));
+    }
+
+    Ok(Some(nano_cpus as i64))
 }
 
 #[allow(clippy::cast_possible_truncation)]
@@ -2810,7 +2820,15 @@ fn parse_memory_limit(value: &str) -> Result<Option<i64>, Status> {
         }
     };
 
-    Ok(Some((amount * multiplier).round() as i64))
+    let bytes = (amount * multiplier).round();
+    #[allow(clippy::cast_precision_loss)]
+    if !bytes.is_finite() || bytes < i64::MIN as f64 || bytes >= i64::MAX as f64 {
+        return Err(Status::failed_precondition(format!(
+            "docker memory_limit '{value}' is too large",
+        )));
+    }
+
+    Ok(Some(bytes as i64))
 }
 
 fn sandbox_from_container_summary(summary: &ContainerSummary) -> Option<DriverSandbox> {

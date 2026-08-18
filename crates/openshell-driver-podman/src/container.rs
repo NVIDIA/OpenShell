@@ -1074,7 +1074,25 @@ pub fn build_container_spec_for_image(
                     openshell_core::config::DEFAULT_SSH_PORT
                 ),
             ],
-            interval: config.health_check_interval_secs * 1_000_000_000,
+            interval: {
+                const NS_PER_S: u64 = 1_000_000_000;
+                let max_secs = (i64::MAX as u64) / NS_PER_S;
+                if config.health_check_interval_secs > max_secs {
+                    return Err(ComputeDriverError::InvalidArgument(format!(
+                        "health_check_interval_secs {} exceeds maximum allowed nanoseconds",
+                        config.health_check_interval_secs
+                    )));
+                }
+                config
+                    .health_check_interval_secs
+                    .checked_mul(NS_PER_S)
+                    .ok_or_else(|| {
+                        ComputeDriverError::InvalidArgument(format!(
+                            "health_check_interval_secs {} exceeds maximum allowed nanoseconds",
+                            config.health_check_interval_secs
+                        ))
+                    })?
+            },
             timeout: 2_000_000_000,
             retries: 10,
             start_period: 5_000_000_000,
@@ -1211,8 +1229,13 @@ fn parse_cpu_to_microseconds(quantity: &str) -> Option<u64> {
         if cores <= 0.0 || cores.is_nan() || cores.is_infinite() {
             return None;
         }
+        let micros_f = cores * 100_000.0;
+        #[allow(clippy::cast_precision_loss)]
+        if !micros_f.is_finite() || micros_f >= u64::MAX as f64 {
+            return None;
+        }
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        let val = (cores * 100_000.0) as u64;
+        let val = micros_f as u64;
         val
     };
     // A quota of 0 microseconds is invalid — treat as no limit.
@@ -1285,6 +1308,56 @@ mod tests {
         assert_eq!(parse_cpu_to_microseconds("1"), Some(100_000));
         assert_eq!(parse_cpu_to_microseconds("2"), Some(200_000));
         assert_eq!(parse_cpu_to_microseconds("0.5"), Some(50_000));
+    }
+
+    #[test]
+    fn parse_cpu_huge_value_returns_none_instead_of_overflow() {
+        // A finite f64 whose product with 100_000 overflows to infinity.
+        assert_eq!(parse_cpu_to_microseconds("1e300"), None);
+    }
+
+    #[test]
+    fn parse_cpu_rejects_u64_max_boundary() {
+        // 184_467_440_737_095.51616 cores * 100_000 rounds exactly to 2^64,
+        // which used to pass the > check and silently saturate to u64::MAX.
+        // It must now be rejected. The previous value (184467440737095520)
+        // was ~1000x larger and did not exercise the equality boundary.
+        assert_eq!(parse_cpu_to_microseconds("184467440737095.51616"), None);
+
+        // Just below the boundary is still valid.
+        assert_eq!(
+            parse_cpu_to_microseconds("184467440737095"),
+            Some(18_446_744_073_709_500_416)
+        );
+    }
+
+    #[test]
+    fn container_spec_rejects_health_check_interval_overflow() {
+        let sandbox = test_sandbox("test-id", "test-name");
+        let mut config = test_config();
+        // i64::MAX nanoseconds / 1_000_000_000 ns/s = 9_223_372_036 seconds.
+        // One second over must be rejected before it can saturate.
+        config.health_check_interval_secs = 9_223_372_037;
+        let err = try_build_container_spec_with_token(&sandbox, &config, None).unwrap_err();
+        assert!(
+            matches!(err, ComputeDriverError::InvalidArgument(_)),
+            "expected InvalidArgument, got {err:?}"
+        );
+        assert!(format!("{err}").contains("health_check_interval_secs"));
+    }
+
+    #[test]
+    fn container_spec_accepts_health_check_interval_at_boundary() {
+        let sandbox = test_sandbox("test-id", "test-name");
+        let mut config = test_config();
+        // i64::MAX nanoseconds / 1_000_000_000 ns/s = 9_223_372_036 seconds.
+        const NS_PER_S: u64 = 1_000_000_000;
+        config.health_check_interval_secs = (i64::MAX as u64) / NS_PER_S;
+        let spec = try_build_container_spec_with_token(&sandbox, &config, None).unwrap();
+        let interval = spec["healthconfig"]["Interval"]
+            .as_u64()
+            .expect("healthcheck interval should be a u64");
+        assert_eq!(interval, config.health_check_interval_secs * NS_PER_S);
     }
 
     #[test]
