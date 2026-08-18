@@ -1845,7 +1845,7 @@ mem_mib = "not-a-number"
         let file = config_file_from_toml(
             r#"
 [openshell.gateway]
-default_image = "ghcr.io/nvidia/openshell/sandbox:1.0"
+default_image = "ghcr.io/nvidia/openshell-community/sandboxes/base:latest"
 
 [openshell.drivers.kubernetes]
 namespace = "agents"
@@ -1859,7 +1859,10 @@ namespace = "agents"
         let parsed = merged
             .try_into::<openshell_driver_kubernetes::KubernetesComputeConfig>()
             .expect("merged table deserializes");
-        assert_eq!(parsed.default_image, "ghcr.io/nvidia/openshell/sandbox:1.0");
+        assert_eq!(
+            parsed.default_image,
+            "ghcr.io/nvidia/openshell-community/sandboxes/base:latest"
+        );
         assert_eq!(parsed.namespace, "agents");
     }
 
