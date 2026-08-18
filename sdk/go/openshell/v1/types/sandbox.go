@@ -26,10 +26,13 @@ type SandboxSpec struct {
 	Environment map[string]string
 	Template    *SandboxTemplate
 	Providers   []string
-	// GPU requests GPU resources using the active driver's default GPU assignment
-	// when GPUCount is nil. GPUCount implies GPU for backward compatibility.
-	GPU      bool
-	GPUCount *uint32
+    // GPU requests GPU resources using the active driver's default GPU assignment
+    // when GPUCount is nil. GPUCount implies GPU for backward compatibility.
+    GPU      bool
+    GPUCount *uint32
+    // DisruptionProtectionDuration requests protection from voluntary platform
+    // disruption. The gateway enforces driver support and the admin maximum.
+    DisruptionProtectionDuration *time.Duration
 	// Policy is the security policy for the sandbox. Nil means no policy specified.
 	Policy  *SandboxPolicy
 	Command []string

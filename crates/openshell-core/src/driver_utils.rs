@@ -5,7 +5,10 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::proto::compute::v1::DriverSandbox;
+use crate::proto::compute::v1::{
+    DisruptionProtectionCapability, DisruptionProtectionSupport, DriverSandbox,
+    GetCapabilitiesResponse,
+};
 
 // ---------------------------------------------------------------------------
 // Sandbox container/pod label keys (openshell.ai/ namespace)
@@ -685,6 +688,31 @@ pub fn sandbox_token_path(
         path = path.join(ns.replace(['/', '\\'], "-"));
     }
     Ok(path.join(sandbox_id).join("sandbox.jwt"))
+}
+
+/// Build a [`GetCapabilitiesResponse`] from the common driver capability fields.
+///
+/// Every compute driver constructs this response with the same fields. Shared
+/// here to avoid repeating the struct literal in each driver crate.
+pub fn build_capabilities_response(
+    driver_name: &str,
+    driver_version: impl Into<String>,
+    default_image: impl Into<String>,
+    gateway_manages_lifecycle: bool,
+) -> GetCapabilitiesResponse {
+    GetCapabilitiesResponse {
+        driver_name: driver_name.to_string(),
+        driver_version: driver_version.into(),
+        default_image: default_image.into(),
+        gateway_manages_lifecycle,
+        supports_sandbox_authentication: false,
+        driver_reports_runtime_readiness: false,
+        disruption_protection: Some(DisruptionProtectionCapability {
+            support: DisruptionProtectionSupport::Unsupported.into(),
+            enabled: false,
+            max_duration: None,
+        }),
+    }
 }
 
 /// Return the effective log level for a sandbox.

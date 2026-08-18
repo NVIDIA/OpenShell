@@ -837,6 +837,23 @@ message ComputeDriverCapabilities {
   // Driver-reported implementation version from the startup capability snapshot.
   string driver_version = 2;
 
+  // Driver and operator support for voluntary-disruption protection.
+  DisruptionProtectionCapability disruption_protection = 3;
+}
+
+enum DisruptionProtectionSupport {
+  DISRUPTION_PROTECTION_SUPPORT_UNSPECIFIED = 0;
+  DISRUPTION_PROTECTION_SUPPORT_UNSUPPORTED = 1;
+  DISRUPTION_PROTECTION_SUPPORT_APPROXIMATED = 2;
+  DISRUPTION_PROTECTION_SUPPORT_SUPPORTED = 3;
+}
+
+message DisruptionProtectionCapability {
+  DisruptionProtectionSupport support = 1;
+  // Whether the platform administrator currently allows new requests.
+  bool enabled = 2;
+  // Maximum request accepted by this driver instance when enabled.
+  google.protobuf.Duration max_duration = 3;
 }
 
 // Public sandbox resource exposed by the OpenShell API.
@@ -890,6 +907,14 @@ message SandboxSpec {
   repeated string command = 12;
   // Allocate a retained pseudo-terminal for the main process.
   bool tty = 13;
+  // Optional create-time request to prevent platform-initiated voluntary
+  // disruption for a bounded interval. This does not protect against node
+  // failure, resource pressure, direct deletion, or workload failure.
+  DisruptionProtectionRequest disruption_protection = 14;
+}
+
+message DisruptionProtectionRequest {
+  google.protobuf.Duration duration = 1;
 }
 
 message ResourceRequirements {

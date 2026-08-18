@@ -660,14 +660,12 @@ impl VmDriver {
 
     #[must_use]
     pub fn capabilities(&self) -> GetCapabilitiesResponse {
-        GetCapabilitiesResponse {
-            driver_name: DRIVER_NAME.to_string(),
-            driver_version: openshell_core::VERSION.to_string(),
-            default_image: self.config.default_image.clone(),
-            gateway_manages_lifecycle: true,
-            supports_sandbox_authentication: false,
-            driver_reports_runtime_readiness: false,
-        }
+        openshell_core::driver_utils::build_capabilities_response(
+            DRIVER_NAME,
+            openshell_core::VERSION,
+            &self.config.default_image,
+            true,
+        )
     }
 
     // `tonic::Status` is large but is the standard error type across the
@@ -3707,6 +3705,12 @@ fn validate_vm_sandbox(sandbox: &Sandbox, gpu_enabled: bool) -> Result<(), Statu
         .spec
         .as_ref()
         .ok_or_else(|| Status::invalid_argument("sandbox spec is required"))?;
+
+    if spec.disruption_protection.is_some() {
+        return Err(Status::failed_precondition(
+            "vm sandboxes do not support disruption protection",
+        ));
+    }
 
     if let Some(template) = spec.template.as_ref() {
         validate_vm_sandbox_template(template)?;

@@ -78,6 +78,20 @@ value as both the request and the limit so the scheduler reserves the same
 amount the sandbox can use. The VM driver currently accepts these flags but
 does not change VM allocation.
 
+### Disruption Protection
+
+Request bounded protection from voluntary platform disruption:
+
+```shell
+openshell sandbox create --disruption-protection 4h -- claude
+```
+
+The gateway rejects the request when the selected compute driver does not
+support it, the administrator has not enabled it, or it exceeds the configured
+maximum. Kubernetes implements the request with a PodDisruptionBudget. Docker,
+Podman, and VM drivers currently report it as unsupported. This does not protect
+against node failure, direct deletion, workload failure, or resource pressure.
+
 ### Driver-Specific Configuration
 
 Pass experimental driver-owned settings with `--driver-config-json`. The value
@@ -94,8 +108,8 @@ openshell sandbox create \
 ```
 
 Use this only for driver-specific fields that do not have a stable CLI flag.
-Prefer stable flags such as `--cpu`, `--memory`, and `--gpu` when they cover
-the same behavior.
+Prefer stable flags such as `--cpu`, `--memory`, `--gpu`, and
+`--disruption-protection` when they cover the same behavior.
 
 ### GPU Resources
 

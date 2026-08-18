@@ -53,6 +53,10 @@ func copySandboxSpec(s types.SandboxSpec) types.SandboxSpec {
 		v := *s.GPUCount
 		s.GPUCount = &v
 	}
+	if s.DisruptionProtectionDuration != nil {
+		v := *s.DisruptionProtectionDuration
+		s.DisruptionProtectionDuration = &v
+	}
 	s.Policy = copySandboxPolicy(s.Policy)
 	return s
 }

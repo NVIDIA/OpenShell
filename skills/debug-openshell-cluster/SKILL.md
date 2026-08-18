@@ -501,9 +501,9 @@ done
 ```
 
 Both opt-ins are required: Helm
-`server.disruptionProtection.enabled=true` and sandbox driver config
-`kubernetes.disruption_protection.duration`. A request over `maxDuration` is
-rejected. The PDB should use `minAvailable: 1`,
+`server.disruptionProtection.enabled=true` and sandbox creation with
+`--disruption-protection <duration>` (or the corresponding Sandbox API field).
+A request over `maxDuration` is rejected. The PDB should use `minAvailable: 1`,
 `unhealthyPodEvictionPolicy: AlwaysAllow`, and an owner reference to the
 Sandbox CR. OpenShell stores an absolute UTC deadline in
 `openshell.io/disruption-protected-until`; an expired PDB can remain while all

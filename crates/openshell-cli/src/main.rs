@@ -1423,6 +1423,13 @@ enum SandboxCommands {
         #[arg(long, value_name = "JSON")]
         driver_config_json: Option<String>,
 
+        /// Protect the sandbox from voluntary platform disruption for this duration.
+        ///
+        /// The request is subject to the gateway administrator's configured maximum
+        /// and is rejected when the selected compute driver does not support it.
+        #[arg(long, value_name = "DURATION")]
+        disruption_protection: Option<String>,
+
         /// Attach a configured credential provider to the sandbox.
         /// Use providers for API keys, tokens, and other secrets so commands in
         /// the sandbox do not receive the real credential values. Repeatable.
@@ -3198,6 +3205,7 @@ async fn run_async() -> Result<()> {
                     cpu,
                     memory,
                     driver_config_json,
+                    disruption_protection,
                     providers,
                     policy,
                     forward,
@@ -3289,6 +3297,7 @@ async fn run_async() -> Result<()> {
                             cpu: cpu.as_deref(),
                             memory: memory.as_deref(),
                             driver_config_json: driver_config_json.as_deref(),
+                            disruption_protection: disruption_protection.as_deref(),
                             editor,
                             providers: &providers,
                             policy: policy.as_deref(),
@@ -5845,6 +5854,30 @@ mod tests {
                 assert_eq!(template.as_deref(), Some("gpu-kata"));
                 assert_eq!(providers, vec!["github".to_string()]);
             }
+            other => panic!("expected SandboxCommands::Create, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sandbox_create_disruption_protection_flag_parses() {
+        let cli = Cli::try_parse_from([
+            "openshell",
+            "sandbox",
+            "create",
+            "--disruption-protection",
+            "4h",
+        ])
+        .expect("sandbox create disruption protection flag should parse");
+
+        match cli.command {
+            Some(Commands::Sandbox {
+                command:
+                    Some(SandboxCommands::Create {
+                        disruption_protection,
+                        ..
+                    }),
+                ..
+            }) => assert_eq!(disruption_protection.as_deref(), Some("4h")),
             other => panic!("expected SandboxCommands::Create, got: {other:?}"),
         }
     }

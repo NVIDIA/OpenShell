@@ -97,6 +97,8 @@ export interface SandboxSpec {
   command?: string[];
   /** Allocate a retained pseudo-terminal for the canonical command. */
   tty?: boolean;
+  /** Requested protection from voluntary platform disruption, in seconds. */
+  disruptionProtectionSeconds?: number;
   /**
    * Create-time sandbox policy (the safety boundary). Sandbox-scoped
    * `setPolicy` cannot introduce static fields later, so express filesystem,
@@ -733,6 +735,12 @@ export class SandboxClient {
 
   async create(spec: SandboxSpec): Promise<SandboxRef> {
     try {
+      if (
+        spec.disruptionProtectionSeconds !== undefined &&
+        (!Number.isSafeInteger(spec.disruptionProtectionSeconds) || spec.disruptionProtectionSeconds <= 0)
+      ) {
+        throw new SdkError('invalid_config', 'disruptionProtectionSeconds must be a positive safe integer');
+      }
       // Curated fields build the base spec; rawSpec then shallow-overrides at
       // the top spec level (Object.assign, so any field it sets wins). The
       // runtime assign avoids the generated $typeName upgrading the literal and
@@ -742,6 +750,10 @@ export class SandboxClient {
         providers: spec.providers ?? [],
         template: spec.image ? { image: spec.image } : undefined,
         resourceRequirements: spec.gpu ? { gpu: {} } : undefined,
+        disruptionProtection:
+          spec.disruptionProtectionSeconds === undefined
+            ? undefined
+            : { duration: { seconds: BigInt(spec.disruptionProtectionSeconds), nanos: 0 } },
         policy: spec.policy,
         command: spec.command ?? [],
         tty: spec.tty ?? false,

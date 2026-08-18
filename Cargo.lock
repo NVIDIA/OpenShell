@@ -4303,6 +4303,7 @@ dependencies = [
  "miette",
  "oauth2",
  "openshell-core",
+ "prost-types",
  "reqwest 0.12.28",
  "rustls",
  "serde",
