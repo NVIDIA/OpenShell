@@ -9,6 +9,8 @@
 //! This test is gated behind the `e2e-vm` feature because it requires the VM
 //! driver runtime prepared by `e2e/rust/e2e-vm.sh`.
 
+use std::fs;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use openshell_e2e::harness::cli::{
@@ -17,10 +19,69 @@ use openshell_e2e::harness::cli::{
 };
 use openshell_e2e::harness::gateway::ManagedGateway;
 use openshell_e2e::harness::sandbox::SandboxGuard;
+use prost::Message;
+use tokio::time::sleep;
 
 const READY_MARKER: &str = "vm-gateway-start-ready";
 const STOPPED_READY_MARKER: &str = "vm-gateway-start-stopped-ready";
 const START_FILE: &str = "/sandbox/vm-gateway-start-state";
+const VM_STATE_DIR_ENV: &str = "OPENSHELL_E2E_VM_STATE_DIR";
+
+#[derive(Clone, PartialEq, Message)]
+struct PersistedDriverSandbox {
+    #[prost(string, tag = "2")]
+    name: String,
+}
+
+fn vm_sandbox_stopped(sandbox_name: &str) -> Result<bool, String> {
+    let state_dir = std::env::var_os(VM_STATE_DIR_ENV)
+        .map(PathBuf::from)
+        .ok_or_else(|| format!("{VM_STATE_DIR_ENV} must be set"))?;
+    let sandboxes_dir = state_dir.join("sandboxes");
+    for entry in fs::read_dir(&sandboxes_dir)
+        .map_err(|err| format!("read '{}': {err}", sandboxes_dir.display()))?
+    {
+        let path = entry
+            .map_err(|err| format!("read VM sandbox entry: {err}"))?
+            .path();
+        let request_path = path.join("sandbox.pb");
+        let bytes = match fs::read(&request_path) {
+            Ok(bytes) => bytes,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => return Err(format!("read '{}': {err}", request_path.display())),
+        };
+        let sandbox = PersistedDriverSandbox::decode(bytes.as_slice())
+            .map_err(|err| format!("decode '{}': {err}", request_path.display()))?;
+        if sandbox.name == sandbox_name {
+            return Ok(path.join("stopped").exists());
+        }
+    }
+    Err(format!(
+        "VM state for sandbox '{sandbox_name}' was not found"
+    ))
+}
+
+async fn wait_for_vm_stopped_marker(
+    sandbox_name: &str,
+    expected: bool,
+    timeout: Duration,
+) -> Result<(), String> {
+    let start = std::time::Instant::now();
+    let mut last_state;
+    loop {
+        match vm_sandbox_stopped(sandbox_name) {
+            Ok(stopped) if stopped == expected => return Ok(()),
+            Ok(stopped) => last_state = format!("stopped={stopped}"),
+            Err(err) => last_state = err,
+        }
+        if start.elapsed() > timeout {
+            return Err(format!(
+                "VM '{sandbox_name}' did not reach stopped={expected}: {last_state}"
+            ));
+        }
+        sleep(Duration::from_secs(1)).await;
+    }
+}
 
 #[tokio::test]
 async fn vm_gateway_restart_preserves_running_and_stopped_intent() {
@@ -69,10 +130,16 @@ async fn vm_gateway_restart_preserves_running_and_stopped_intent() {
         .expect("VM sandbox should be stopped before gateway restart");
 
     gateway.stop().expect("stop e2e gateway");
+    wait_for_vm_stopped_marker(&sandbox.name, true, Duration::from_secs(60))
+        .await
+        .expect("gateway shutdown should stop the running-intent VM through its driver");
     gateway.start().expect("restart e2e gateway");
     wait_for_healthy(Duration::from_secs(120))
         .await
         .expect("gateway should become healthy after restart");
+    wait_for_vm_stopped_marker(&sandbox.name, false, Duration::from_secs(120))
+        .await
+        .expect("gateway startup should restart the running-intent VM");
 
     let names = sandbox_names().await.expect("list sandboxes after restart");
     assert!(

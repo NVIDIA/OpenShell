@@ -177,9 +177,9 @@ async fn docker_gateway_restart_preserves_running_and_stopped_intent() {
     .expect("stopped Docker sandbox container should not be running");
 
     gateway.stop().expect("stop e2e gateway");
-    wait_for_container_running(&namespace, &sandbox.name, true, Duration::from_secs(30))
+    wait_for_container_running(&namespace, &sandbox.name, false, Duration::from_secs(30))
         .await
-        .expect("gateway shutdown should not stop a running Docker sandbox");
+        .expect("gateway shutdown should stop a running-intent Docker sandbox");
 
     gateway.start().expect("restart e2e gateway");
     wait_for_healthy(Duration::from_secs(120))
@@ -187,7 +187,7 @@ async fn docker_gateway_restart_preserves_running_and_stopped_intent() {
         .expect("gateway should become healthy after restart");
     wait_for_container_running(&namespace, &sandbox.name, true, Duration::from_secs(120))
         .await
-        .expect("gateway startup should preserve the running Docker sandbox container");
+        .expect("gateway startup should restart the running-intent Docker sandbox container");
     wait_for_sandbox_phase(&stopped_sandbox.name, "Stopped", Duration::from_secs(120))
         .await
         .expect("explicitly stopped Docker sandbox should remain stopped after restart");

@@ -2013,11 +2013,117 @@ impl ComputeRuntime {
     }
 
     pub async fn cleanup_on_shutdown(&self) -> Result<(), String> {
+        let stop_result = self.stop_persisted_sandboxes_on_shutdown().await;
+
         #[cfg(unix)]
-        if let Some(process) = &self.driver_process {
-            process.shutdown().await?;
+        let process_result = if let Some(process) = &self.driver_process {
+            process.shutdown().await
+        } else {
+            Ok(())
+        };
+
+        #[cfg(not(unix))]
+        let process_result: Result<(), String> = Ok(());
+
+        match (stop_result, process_result) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(stop_err), Ok(())) => Err(stop_err),
+            (Ok(()), Err(process_err)) => Err(process_err),
+            (Err(stop_err), Err(process_err)) => Err(format!(
+                "{stop_err}; managed driver process shutdown failed: {process_err}"
+            )),
         }
-        Ok(())
+    }
+
+    /// Stop local compute during graceful gateway shutdown without changing
+    /// persisted lifecycle intent.
+    ///
+    /// An explicit sandbox stop persists `Stopped`; gateway shutdown does not.
+    /// Docker, Podman, and VM compute is stopped through the same public driver
+    /// RPC and restarted from the retained running-intent phase on gateway
+    /// startup. Kubernetes compute remains cluster-owned and is excluded.
+    async fn stop_persisted_sandboxes_on_shutdown(&self) -> Result<(), String> {
+        if !matches!(
+            self.driver_kind(),
+            Some(ComputeDriverKind::Docker | ComputeDriverKind::Podman | ComputeDriverKind::Vm)
+        ) {
+            return Ok(());
+        }
+
+        let records = self
+            .store
+            .list_by_type(Sandbox::object_type(), 1000, 0)
+            .await
+            .map_err(|err| format!("failed to list sandboxes for shutdown: {err}"))?;
+
+        let mut stopped = 0usize;
+        let mut failed = 0usize;
+
+        for record in records {
+            let sandbox = match Sandbox::decode(record.payload.as_slice()) {
+                Ok(sandbox) => sandbox,
+                Err(err) => {
+                    warn!(error = %err, "Failed to decode sandbox record during gateway shutdown");
+                    failed += 1;
+                    continue;
+                }
+            };
+
+            let phase = SandboxPhase::try_from(sandbox.phase()).unwrap_or(SandboxPhase::Unknown);
+            if !sandbox_phase_should_be_running(phase) {
+                continue;
+            }
+
+            let sandbox_id = sandbox.object_id().to_string();
+            let sandbox_name = sandbox.object_name().to_string();
+            let _lifecycle_guard = self.lifecycle_gates.lock_for(&sandbox_id).await;
+            match self
+                .driver
+                .call("driver.stop_sandbox", Some(&sandbox_id), |driver| {
+                    let sandbox_id = sandbox_id.clone();
+                    let sandbox_name = sandbox_name.clone();
+                    async move {
+                        driver
+                            .stop_sandbox(Request::new(StopSandboxRequest {
+                                sandbox_id,
+                                sandbox_name,
+                            }))
+                            .await
+                    }
+                })
+                .await
+            {
+                Ok(_) => {
+                    info!(
+                        sandbox_id = %sandbox.object_id(),
+                        sandbox_name = %sandbox.object_name(),
+                        ?phase,
+                        "Stopped sandbox during gateway shutdown"
+                    );
+                    stopped += 1;
+                }
+                Err(err) => {
+                    warn!(
+                        sandbox_id = %sandbox.object_id(),
+                        sandbox_name = %sandbox.object_name(),
+                        error = %err,
+                        "Failed to stop sandbox during gateway shutdown"
+                    );
+                    failed += 1;
+                }
+            }
+        }
+
+        if stopped > 0 || failed > 0 {
+            info!(stopped, failed, "Sandbox shutdown stop sweep complete");
+        }
+        if failed > 0 {
+            Err(format!(
+                "failed to stop {failed} sandbox(es) during gateway shutdown"
+            ))
+        } else {
+            Ok(())
+        }
     }
 
     /// Reconcile running intent for local compute after a gateway restart.
@@ -4275,6 +4381,7 @@ mod tests {
         stop_release: Semaphore,
         stop_blocked: AtomicBool,
         stop_calls: AtomicUsize,
+        stop_requests: TestMutex<Vec<(String, String)>>,
         stop_outcome: TestMutex<ControlledLifecycleOutcome>,
         start_started: Notify,
         start_finished: Notify,
@@ -4306,6 +4413,7 @@ mod tests {
                 stop_release: Semaphore::new(0),
                 stop_blocked: AtomicBool::new(false),
                 stop_calls: AtomicUsize::new(0),
+                stop_requests: TestMutex::new(Vec::new()),
                 stop_outcome: TestMutex::new(ControlledLifecycleOutcome::Ok),
                 start_started: Notify::new(),
                 start_finished: Notify::new(),
@@ -4384,6 +4492,13 @@ mod tests {
 
         fn stop_calls(&self) -> usize {
             self.stop_calls.load(Ordering::SeqCst)
+        }
+
+        fn stop_requests(&self) -> Vec<(String, String)> {
+            self.stop_requests
+                .lock()
+                .expect("stop requests lock poisoned")
+                .clone()
         }
 
         fn start_calls(&self) -> usize {
@@ -4486,8 +4601,13 @@ mod tests {
 
         async fn stop_sandbox(
             &self,
-            _request: Request<StopSandboxRequest>,
+            request: Request<StopSandboxRequest>,
         ) -> Result<tonic::Response<StopSandboxResponse>, Status> {
+            let request = request.into_inner();
+            self.stop_requests
+                .lock()
+                .expect("stop requests lock poisoned")
+                .push((request.sandbox_id, request.sandbox_name));
             self.stop_calls.fetch_add(1, Ordering::SeqCst);
             self.stop_started.notify_one();
             if self.stop_blocked.load(Ordering::SeqCst) {
@@ -8003,6 +8123,116 @@ mod tests {
             watch_rx.try_recv(),
             Err(tokio::sync::broadcast::error::TryRecvError::Closed)
         ));
+    }
+
+    #[tokio::test]
+    async fn shutdown_stops_running_intent_without_changing_persisted_phase() {
+        let driver = ControlledDriver::new();
+        let runtime = test_runtime_for_driver(driver.clone(), "docker").await;
+
+        for (id, name, phase) in [
+            ("sb-unspecified", "unspecified", SandboxPhase::Unspecified),
+            ("sb-prov", "prov", SandboxPhase::Provisioning),
+            ("sb-ready", "ready", SandboxPhase::Ready),
+            ("sb-starting", "starting", SandboxPhase::Starting),
+            ("sb-unknown", "unknown", SandboxPhase::Unknown),
+            ("sb-stopping", "stopping", SandboxPhase::Stopping),
+            ("sb-stopped", "stopped", SandboxPhase::Stopped),
+            ("sb-deleting", "deleting", SandboxPhase::Deleting),
+            ("sb-error", "error", SandboxPhase::Error),
+        ] {
+            runtime
+                .store
+                .put_message(&sandbox_record(id, name, phase))
+                .await
+                .unwrap();
+        }
+
+        runtime
+            .stop_persisted_sandboxes_on_shutdown()
+            .await
+            .unwrap();
+
+        let mut called_ids = driver
+            .stop_requests()
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect::<Vec<_>>();
+        called_ids.sort();
+        assert_eq!(
+            called_ids,
+            vec![
+                "sb-prov".to_string(),
+                "sb-ready".to_string(),
+                "sb-starting".to_string(),
+                "sb-unknown".to_string(),
+                "sb-unspecified".to_string(),
+            ]
+        );
+
+        let stored = runtime
+            .store
+            .get_message::<Sandbox>("sb-ready")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            SandboxPhase::try_from(stored.phase()).unwrap(),
+            SandboxPhase::Ready,
+            "gateway shutdown must retain logical running intent"
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_stop_sweep_continues_after_driver_errors() {
+        let driver = ControlledDriver::new();
+        driver.set_stop_outcome(ControlledLifecycleOutcome::Error("runtime angry"));
+        let runtime = test_runtime_for_driver(driver.clone(), "podman").await;
+        for (id, name) in [("sb-1", "one"), ("sb-2", "two")] {
+            runtime
+                .store
+                .put_message(&sandbox_record(id, name, SandboxPhase::Ready))
+                .await
+                .unwrap();
+        }
+
+        let err = runtime
+            .stop_persisted_sandboxes_on_shutdown()
+            .await
+            .unwrap_err();
+
+        assert!(err.contains("failed to stop 2 sandbox(es)"));
+        assert_eq!(driver.stop_calls(), 2);
+    }
+
+    #[tokio::test]
+    async fn shutdown_stop_sweep_runs_for_each_local_driver_only() {
+        for (driver_name, expected_calls) in [
+            ("docker", 1),
+            ("podman", 1),
+            ("vm", 1),
+            ("kubernetes", 0),
+            ("extension", 0),
+        ] {
+            let driver = ControlledDriver::new();
+            let runtime = test_runtime_for_driver(driver.clone(), driver_name).await;
+            runtime
+                .store
+                .put_message(&sandbox_record("sb-1", "sandbox", SandboxPhase::Ready))
+                .await
+                .unwrap();
+
+            runtime
+                .stop_persisted_sandboxes_on_shutdown()
+                .await
+                .unwrap();
+
+            assert_eq!(
+                driver.stop_calls(),
+                expected_calls,
+                "unexpected shutdown behavior for {driver_name}"
+            );
+        }
     }
 
     #[tokio::test]
