@@ -43,6 +43,7 @@ use openshell_core::progress::{
     format_bytes, mark_progress_active, mark_progress_complete, mark_progress_detail,
 };
 use openshell_core::proto::compute::v1::{
+    DisruptionProtectionCapability, DisruptionProtectionRequest, DisruptionProtectionSupport,
     DriverCondition as SandboxCondition, DriverPlatformEvent as PlatformEvent,
     DriverSandbox as Sandbox, DriverSandboxSpec as SandboxSpec,
     DriverSandboxStatus as SandboxStatus, DriverSandboxTemplate as SandboxTemplate,
@@ -131,6 +132,7 @@ const DISRUPTION_PROTECTION_RETRY_MAX: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone)]
 struct DisruptionProtectionDeadline {
+    namespace: String,
     sandbox_id: String,
     protected_until: String,
     next_attempt: DateTime<Utc>,
@@ -180,13 +182,6 @@ struct KubernetesSandboxDriverConfig {
     pod: KubernetesPodDriverConfig,
     containers: KubernetesDriverContainersConfig,
     volumes: Vec<KubernetesDriverVolumeConfig>,
-    disruption_protection: Option<KubernetesDisruptionProtectionRequest>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct KubernetesDisruptionProtectionRequest {
-    duration: String,
 }
 
 impl KubernetesSandboxDriverConfig {
@@ -224,9 +219,9 @@ impl KubernetesSandboxDriverConfig {
 
 fn validate_disruption_protection_request(
     operator_config: &KubernetesDisruptionProtectionConfig,
-    driver_config: &KubernetesSandboxDriverConfig,
+    request: Option<&DisruptionProtectionRequest>,
 ) -> Result<Option<Duration>, String> {
-    let Some(request) = driver_config.disruption_protection.as_ref() else {
+    let Some(request) = request else {
         return Ok(None);
     };
     if !operator_config.enabled {
@@ -235,14 +230,30 @@ fn validate_disruption_protection_request(
         );
     }
 
-    let requested = parse_disruption_protection_duration(&request.duration)
-        .map_err(|err| format!("disruption_protection.duration: {err}"))?;
+    let duration = request
+        .duration
+        .as_ref()
+        .ok_or_else(|| "disruption_protection.duration is required".to_string())?;
+    if duration.seconds < 0
+        || !(0..1_000_000_000).contains(&duration.nanos)
+        || (duration.seconds == 0 && duration.nanos == 0)
+    {
+        return Err(
+            "disruption_protection.duration must be a positive protobuf duration".to_string(),
+        );
+    }
+    let requested = Duration::new(
+        u64::try_from(duration.seconds)
+            .map_err(|_| "disruption_protection.duration is out of range")?,
+        u32::try_from(duration.nanos)
+            .map_err(|_| "disruption_protection.duration is out of range")?,
+    );
     let maximum = parse_disruption_protection_duration(&operator_config.max_duration)
         .map_err(|err| format!("disruption_protection.max_duration: {err}"))?;
     if requested > maximum {
         return Err(format!(
-            "disruption_protection.duration '{}' exceeds the operator maximum '{}'",
-            request.duration, operator_config.max_duration
+            "disruption_protection.duration exceeds the operator maximum '{}'",
+            operator_config.max_duration
         ));
     }
     Ok(Some(requested))
@@ -622,11 +633,24 @@ impl KubernetesComputeDriver {
     }
 
     pub fn capabilities(&self) -> Result<GetCapabilitiesResponse, String> {
-        Ok(openshell_core::driver_utils::build_capabilities_response(
+        let maximum =
+            parse_disruption_protection_duration(&self.config.disruption_protection.max_duration)?;
+        let maximum_seconds = i64::try_from(maximum.as_secs())
+            .map_err(|_| "disruption protection maximum exceeds protobuf duration range")?;
+        let mut capabilities = openshell_core::driver_utils::build_capabilities_response(
             "kubernetes",
             openshell_core::VERSION,
             &self.config.default_image,
-        ))
+        );
+        capabilities.disruption_protection = Some(DisruptionProtectionCapability {
+            support: DisruptionProtectionSupport::Supported.into(),
+            enabled: self.config.disruption_protection.enabled,
+            max_duration: Some(prost_types::Duration {
+                seconds: maximum_seconds,
+                nanos: 0,
+            }),
+        });
+        Ok(capabilities)
     }
 
     pub fn operator_allowlist(&self) -> Option<&OperatorNamespaceAllowlist> {
@@ -1090,7 +1114,10 @@ impl KubernetesComputeDriver {
         )?;
         let protection_duration = validate_disruption_protection_request(
             &self.config.disruption_protection,
-            &driver_config,
+            sandbox
+                .spec
+                .as_ref()
+                .and_then(|spec| spec.disruption_protection.as_ref()),
         )?;
         Ok((driver_config, protection_duration))
     }
@@ -1113,8 +1140,8 @@ impl KubernetesComputeDriver {
         AgentSandboxApi { api, resource }
     }
 
-    fn disruption_protection_api(&self) -> Api<PodDisruptionBudget> {
-        Api::namespaced(self.client.clone(), &self.config.namespace)
+    fn disruption_protection_api(&self, namespace: &str) -> Api<PodDisruptionBudget> {
+        Api::namespaced(self.client.clone(), namespace)
     }
 
     fn verify_managed_disruption_protection_pdb(
@@ -1151,7 +1178,12 @@ impl KubernetesComputeDriver {
                 "generated PodDisruptionBudget is missing metadata.name".to_string(),
             )
         })?;
-        let api = self.disruption_protection_api();
+        let namespace = pdb.metadata.namespace.as_deref().ok_or_else(|| {
+            KubernetesDriverError::Message(
+                "generated PodDisruptionBudget is missing metadata.namespace".to_string(),
+            )
+        })?;
+        let api = self.disruption_protection_api(namespace);
         match tokio::time::timeout(KUBE_API_TIMEOUT, api.create(&PostParams::default(), pdb)).await
         {
             Ok(Ok(_)) => Ok(true),
@@ -1271,16 +1303,14 @@ impl KubernetesComputeDriver {
         let name = sandbox.metadata.name.as_deref().ok_or_else(|| {
             KubernetesDriverError::Message("Sandbox is missing metadata.name".to_string())
         })?;
+        let namespace = sandbox.metadata.namespace.as_deref().ok_or_else(|| {
+            KubernetesDriverError::Message("Sandbox is missing metadata.namespace".to_string())
+        })?;
         let owner = disruption_protection_owner_reference(sandbox, resource)
             .map_err(KubernetesDriverError::Message)?;
-        let desired = disruption_protection_pdb(
-            name,
-            &self.config.namespace,
-            sandbox_id,
-            protected_until,
-            Some(owner),
-        );
-        let api = self.disruption_protection_api();
+        let desired =
+            disruption_protection_pdb(name, namespace, sandbox_id, protected_until, Some(owner));
+        let api = self.disruption_protection_api(namespace);
         if let Some(existing) = existing {
             return self
                 .reconcile_existing_disruption_protection_pdb(&api, existing, sandbox_id, desired)
@@ -1329,7 +1359,10 @@ impl KubernetesComputeDriver {
         let name = sandbox.metadata.name.as_deref().ok_or_else(|| {
             KubernetesDriverError::Message("Sandbox is missing metadata.name".to_string())
         })?;
-        let api = self.disruption_protection_api();
+        let namespace = sandbox.metadata.namespace.as_deref().ok_or_else(|| {
+            KubernetesDriverError::Message("Sandbox is missing metadata.namespace".to_string())
+        })?;
+        let api = self.disruption_protection_api(namespace);
         let existing = tokio::time::timeout(KUBE_API_TIMEOUT, api.get_opt(name))
             .await
             .map_err(|_| {
@@ -1376,7 +1409,11 @@ impl KubernetesComputeDriver {
         pdb: &PodDisruptionBudget,
     ) -> Result<(), String> {
         let (name, delete_params) = Self::disruption_protection_delete_params(pdb)?;
-        let api = self.disruption_protection_api();
+        let namespace =
+            pdb.metadata.namespace.as_deref().ok_or_else(|| {
+                format!("PodDisruptionBudget '{name}' is missing metadata.namespace")
+            })?;
+        let api = self.disruption_protection_api(namespace);
         match tokio::time::timeout(KUBE_API_TIMEOUT, api.delete(name, &delete_params)).await {
             Ok(Ok(_) | Err(KubeError::Api(kube::error::ErrorResponse { code: 404, .. }))) => Ok(()),
             Ok(Err(err)) => Err(err.to_string()),
@@ -1386,11 +1423,12 @@ impl KubernetesComputeDriver {
 
     async fn delete_owned_disruption_protection_pdb(
         &self,
+        namespace: &str,
         name: &str,
         sandbox_id: &str,
         expected_deadline: Option<&str>,
     ) -> Result<(), String> {
-        let api = self.disruption_protection_api();
+        let api = self.disruption_protection_api(namespace);
         let existing = tokio::time::timeout(KUBE_API_TIMEOUT, api.get_opt(name))
             .await
             .map_err(|_| format!("timed out fetching PodDisruptionBudget '{name}'"))?
@@ -1422,12 +1460,13 @@ impl KubernetesComputeDriver {
 
     async fn delete_expired_disruption_protection_pdb(
         &self,
+        namespace: &str,
         name: &str,
         sandbox_id: &str,
         expected_deadline: &str,
     ) -> Result<(), String> {
         let agent_sandbox_api = self
-            .supported_agent_sandbox_api(self.client.clone())
+            .supported_agent_sandbox_api(self.client.clone(), namespace)
             .await?;
         let sandbox = tokio::time::timeout(KUBE_API_TIMEOUT, agent_sandbox_api.api.get_opt(name))
             .await
@@ -1462,8 +1501,13 @@ impl KubernetesComputeDriver {
                 return Ok(());
             }
         }
-        self.delete_owned_disruption_protection_pdb(name, sandbox_id, Some(expected_deadline))
-            .await
+        self.delete_owned_disruption_protection_pdb(
+            namespace,
+            name,
+            sandbox_id,
+            Some(expected_deadline),
+        )
+        .await
     }
 
     async fn delete_observed_disruption_protection_pdb(
@@ -1479,6 +1523,7 @@ impl KubernetesComputeDriver {
     async fn reconcile_disruption_protection_after_create_conflict(
         &self,
         agent_sandbox_api: &AgentSandboxApi,
+        namespace: &str,
         name: &str,
         attempted_sandbox_id: &str,
     ) -> Result<(), String> {
@@ -1488,20 +1533,20 @@ impl KubernetesComputeDriver {
             .map_err(|err| err.to_string())?;
         let Some(live) = live else {
             return self
-                .delete_owned_disruption_protection_pdb(name, attempted_sandbox_id, None)
+                .delete_owned_disruption_protection_pdb(namespace, name, attempted_sandbox_id, None)
                 .await;
         };
 
         let live_sandbox_id = sandbox_id_from_object(&live)?;
         if live_sandbox_id != attempted_sandbox_id {
             return self
-                .delete_owned_disruption_protection_pdb(name, attempted_sandbox_id, None)
+                .delete_owned_disruption_protection_pdb(namespace, name, attempted_sandbox_id, None)
                 .await;
         }
 
         let Some(protected_until) = live_disruption_protection_deadline(&live, Utc::now()) else {
             return self
-                .delete_owned_disruption_protection_pdb(name, attempted_sandbox_id, None)
+                .delete_owned_disruption_protection_pdb(namespace, name, attempted_sandbox_id, None)
                 .await;
         };
         self.ensure_owned_disruption_protection_pdb(
@@ -1518,14 +1563,19 @@ impl KubernetesComputeDriver {
         &self,
         agent_sandbox_api: &AgentSandboxApi,
         sandbox: &DynamicObject,
-        existing_by_name: &mut BTreeMap<String, PodDisruptionBudget>,
+        existing_by_name: &mut BTreeMap<(String, String), PodDisruptionBudget>,
         now: DateTime<Utc>,
     ) -> Result<(), String> {
         let Some(name) = sandbox.metadata.name.as_deref() else {
             return Ok(());
         };
+        let namespace = sandbox
+            .metadata
+            .namespace
+            .as_deref()
+            .ok_or_else(|| format!("Sandbox '{name}' is missing metadata.namespace"))?;
         let sandbox_id = sandbox_id_from_object(sandbox)?;
-        let existing = existing_by_name.remove(name);
+        let existing = existing_by_name.remove(&(namespace.to_string(), name.to_string()));
         let Some(protected_until) = sandbox
             .metadata
             .annotations
@@ -1592,7 +1642,11 @@ impl KubernetesComputeDriver {
         agent_sandbox_api: &AgentSandboxApi,
         sandboxes: &[DynamicObject],
     ) -> Result<(), String> {
-        let api = self.disruption_protection_api();
+        let api: Api<PodDisruptionBudget> = if self.config.is_multi_namespace() {
+            Api::all(self.client.clone())
+        } else {
+            self.disruption_protection_api(&self.config.namespace)
+        };
         let selector = format!(
             "{LABEL_MANAGED_BY}={LABEL_MANAGED_BY_VALUE},{DISRUPTION_PROTECTION_LABEL}={DISRUPTION_PROTECTION_LABEL_VALUE}"
         );
@@ -1606,7 +1660,11 @@ impl KubernetesComputeDriver {
         let mut existing_by_name = existing
             .items
             .into_iter()
-            .filter_map(|pdb| pdb.metadata.name.clone().map(|name| (name, pdb)))
+            .filter_map(|pdb| {
+                let namespace = pdb.metadata.namespace.clone()?;
+                let name = pdb.metadata.name.clone()?;
+                Some(((namespace, name), pdb))
+            })
             .collect::<BTreeMap<_, _>>();
         let now = Utc::now();
 
@@ -1627,7 +1685,7 @@ impl KubernetesComputeDriver {
             }
         }
 
-        for (name, pdb) in existing_by_name {
+        for ((namespace, name), pdb) in existing_by_name {
             let within_grace_period = pdb
                 .metadata
                 .creation_timestamp
@@ -1638,8 +1696,8 @@ impl KubernetesComputeDriver {
                 continue;
             }
             if let Err(err) = self.delete_disruption_protection_pdb(&pdb).await {
-                warn!(pdb = %name, error = %err, "Failed to remove orphaned disruption protection PDB");
-                errors.push(format!("orphaned PDB '{name}': {err}"));
+                warn!(namespace = %namespace, pdb = %name, error = %err, "Failed to remove orphaned disruption protection PDB");
+                errors.push(format!("orphaned PDB '{namespace}/{name}': {err}"));
             }
         }
         if errors.is_empty() {
@@ -2060,6 +2118,7 @@ impl KubernetesComputeDriver {
             service_account_name: &self.config.service_account_name,
             sandbox_id: &sandbox.id,
             sandbox_name: &sandbox.name,
+            disruption_protection_enabled: protected_until.is_some(),
             grpc_endpoint: &self.config.grpc_endpoint,
             ssh_socket_path: self.ssh_socket_path(),
             client_tls_secret_name: &self.config.client_tls_secret_name,
@@ -2110,7 +2169,7 @@ impl KubernetesComputeDriver {
         let initial_pdb = protected_until.as_ref().map(|protected_until| {
             disruption_protection_pdb(
                 &kube_name,
-                &self.config.namespace,
+                &target_namespace,
                 &sandbox.id,
                 protected_until,
                 None,
@@ -2166,13 +2225,19 @@ impl KubernetesComputeDriver {
                         // request or deleting a concurrently adopted PDB.
                         self.reconcile_disruption_protection_after_create_conflict(
                             &agent_sandbox_api,
+                            &target_namespace,
                             &kube_name,
                             &sandbox.id,
                         )
                         .await
                     } else {
-                        self.delete_owned_disruption_protection_pdb(&kube_name, &sandbox.id, None)
-                            .await
+                        self.delete_owned_disruption_protection_pdb(
+                            &target_namespace,
+                            &kube_name,
+                            &sandbox.id,
+                            None,
+                        )
+                        .await
                     };
                     if let Err(cleanup_err) = cleanup_result {
                         warn!(
@@ -2429,7 +2494,12 @@ impl KubernetesComputeDriver {
         match tokio::time::timeout(KUBE_API_TIMEOUT, delete_api.api.delete(&kube_name, &dp)).await {
             Ok(Ok(_response)) => {
                 if let Err(err) = self
-                    .delete_owned_disruption_protection_pdb(&kube_name, sandbox_id, None)
+                    .delete_owned_disruption_protection_pdb(
+                        &obj_namespace,
+                        &kube_name,
+                        sandbox_id,
+                        None,
+                    )
                     .await
                 {
                     warn!(
@@ -2509,7 +2579,8 @@ impl KubernetesComputeDriver {
         tokio::spawn(async move {
             let mut sandbox_name_to_id = std::collections::HashMap::<String, String>::new();
             let mut agent_pod_to_id = std::collections::HashMap::<String, String>::new();
-            let mut disruption_deadlines = BTreeMap::<String, DisruptionProtectionDeadline>::new();
+            let mut disruption_deadlines =
+                BTreeMap::<(String, String), DisruptionProtectionDeadline>::new();
             let (expiration_result_tx, mut expiration_result_rx) = mpsc::channel(256);
             let mut expiration_batch_active = false;
             let expiration_sleep = tokio::time::sleep(DISRUPTION_PROTECTION_IDLE_TIMER);
@@ -2546,7 +2617,13 @@ impl KubernetesComputeDriver {
                         Ok(Some(Event::Deleted(obj))) => {
                             if let Some(name) = obj.metadata.name.as_ref() {
                                 deadlines_changed = true;
-                                disruption_deadlines.remove(name);
+                                let object_namespace = obj
+                                    .metadata
+                                    .namespace
+                                    .as_deref()
+                                    .unwrap_or(&namespace);
+                                disruption_deadlines
+                                    .remove(&(object_namespace.to_string(), name.clone()));
                             }
                             if is_openshell_managed(&obj)
                                 && let Ok(sandbox_id) = sandbox_id_from_object(&obj)
@@ -2645,15 +2722,16 @@ impl KubernetesComputeDriver {
                                     retry_count = entry.retry_count.saturating_add(1),
                                     "Failed deadline-driven disruption protection cleanup; scheduling retry"
                                 );
+                                let key = (entry.namespace.clone(), name.clone());
                                 let may_requeue = disruption_deadlines
-                                    .get(&name)
+                                    .get(&key)
                                     .is_none_or(|current| {
                                         current.protected_until == entry.protected_until
                                             && current.sandbox_id == entry.sandbox_id
                                     });
                                 if may_requeue {
                                     entry.schedule_retry(Utc::now());
-                                    disruption_deadlines.insert(name, entry);
+                                    disruption_deadlines.insert(key, entry);
                                     deadlines_changed = true;
                                 }
                             }
@@ -2671,10 +2749,12 @@ impl KubernetesComputeDriver {
                             let expired = disruption_deadlines
                                 .iter()
                                 .filter(|(_, entry)| entry.next_attempt <= now)
-                                .map(|(name, entry)| (name.clone(), entry.clone()))
+                                .map(|((namespace, name), entry)| {
+                                    ((namespace.clone(), name.clone()), entry.clone())
+                                })
                                 .collect::<Vec<_>>();
-                            for (name, _) in &expired {
-                                disruption_deadlines.remove(name);
+                            for (key, _) in &expired {
+                                disruption_deadlines.remove(key);
                             }
                             if !expired.is_empty() {
                                 expiration_batch_active = true;
@@ -2682,11 +2762,12 @@ impl KubernetesComputeDriver {
                                 let result_tx = expiration_result_tx.clone();
                                 tokio::spawn(async move {
                                 let attempts = futures::stream::iter(expired.into_iter().map(
-                                    |(name, entry)| {
+                                    |((_namespace, name), entry)| {
                                         let driver = driver.clone();
                                         async move {
                                             let result = driver
                                                 .delete_expired_disruption_protection_pdb(
+                                                    &entry.namespace,
                                                     &name,
                                                     &entry.sandbox_id,
                                                     &entry.protected_until,
@@ -2748,12 +2829,33 @@ impl KubernetesComputeDriver {
         let mut sandbox_stream = watcher::watcher(cluster_api.api, watcher_config).boxed();
         let (tx, rx) = mpsc::channel(256);
         let default_namespace = self.config.namespace.clone();
+        let expiration_driver = self.clone();
 
         tokio::spawn(async move {
+            let mut disruption_deadlines =
+                BTreeMap::<(String, String), DisruptionProtectionDeadline>::new();
+            let (expiration_result_tx, mut expiration_result_rx) = mpsc::channel(256);
+            let mut expiration_batch_active = false;
+            let expiration_sleep = tokio::time::sleep(DISRUPTION_PROTECTION_IDLE_TIMER);
+            tokio::pin!(expiration_sleep);
+
             loop {
+                let mut deadlines_changed = false;
                 tokio::select! {
                     result = sandbox_stream.try_next() => match result {
                         Ok(Some(Event::Applied(obj))) => {
+                            deadlines_changed = true;
+                            if let Err(err) = update_disruption_protection_deadline(
+                                &mut disruption_deadlines,
+                                &obj,
+                            ) {
+                                warn!(
+                                    namespace = obj.metadata.namespace.as_deref().unwrap_or("<unknown>"),
+                                    sandbox = obj.metadata.name.as_deref().unwrap_or("<unknown>"),
+                                    error = %err,
+                                    "Could not schedule disruption protection expiration"
+                                );
+                            }
                             let ns = obj.metadata.namespace.clone()
                                 .unwrap_or_else(|| default_namespace.clone());
                             if let Ok((_kube_name, sandbox)) = sandbox_from_object(&ns, obj) {
@@ -2768,6 +2870,12 @@ impl KubernetesComputeDriver {
                             }
                         }
                         Ok(Some(Event::Deleted(obj))) => {
+                            if let (Some(namespace), Some(name)) =
+                                (obj.metadata.namespace.as_ref(), obj.metadata.name.as_ref())
+                            {
+                                deadlines_changed = true;
+                                disruption_deadlines.remove(&(namespace.clone(), name.clone()));
+                            }
                             if is_openshell_managed(&obj)
                                 && let Ok(sandbox_id) = sandbox_id_from_object(&obj)
                             {
@@ -2782,7 +2890,20 @@ impl KubernetesComputeDriver {
                             }
                         }
                         Ok(Some(Event::Restarted(objs))) => {
+                            deadlines_changed = true;
+                            disruption_deadlines.clear();
                             for obj in objs {
+                                if let Err(err) = update_disruption_protection_deadline(
+                                    &mut disruption_deadlines,
+                                    &obj,
+                                ) {
+                                    warn!(
+                                        namespace = obj.metadata.namespace.as_deref().unwrap_or("<unknown>"),
+                                        sandbox = obj.metadata.name.as_deref().unwrap_or("<unknown>"),
+                                        error = %err,
+                                        "Could not restore disruption protection expiration"
+                                    );
+                                }
                                 let ns = obj.metadata.namespace.clone()
                                     .unwrap_or_else(|| default_namespace.clone());
                                 if let Ok((_kube_name, sandbox)) = sandbox_from_object(&ns, obj) {
@@ -2808,7 +2929,109 @@ impl KubernetesComputeDriver {
                             break;
                         }
                     },
+                    outcome = expiration_result_rx.recv() => match outcome {
+                        Some(DisruptionProtectionExpirationResult::Attempt {
+                            name,
+                            mut entry,
+                            result,
+                        }) => {
+                            if let Err(err) = result {
+                                warn!(
+                                    namespace = %entry.namespace,
+                                    pdb = %name,
+                                    error = %err,
+                                    retry_count = entry.retry_count.saturating_add(1),
+                                    "Failed deadline-driven disruption protection cleanup; scheduling retry"
+                                );
+                                let key = (entry.namespace.clone(), name.clone());
+                                let may_requeue = disruption_deadlines
+                                    .get(&key)
+                                    .is_none_or(|current| {
+                                        current.protected_until == entry.protected_until
+                                            && current.sandbox_id == entry.sandbox_id
+                                    });
+                                if may_requeue {
+                                    entry.schedule_retry(Utc::now());
+                                    disruption_deadlines.insert(key, entry);
+                                    deadlines_changed = true;
+                                }
+                            }
+                        }
+                        Some(DisruptionProtectionExpirationResult::BatchComplete) => {
+                            expiration_batch_active = false;
+                            deadlines_changed = true;
+                        }
+                        None => break,
+                    },
+                    () = &mut expiration_sleep => {
+                        deadlines_changed = true;
+                        if !expiration_batch_active {
+                            let now = Utc::now();
+                            let expired = disruption_deadlines
+                                .iter()
+                                .filter(|(_, entry)| entry.next_attempt <= now)
+                                .map(|((namespace, name), entry)| {
+                                    ((namespace.clone(), name.clone()), entry.clone())
+                                })
+                                .collect::<Vec<_>>();
+                            for (key, _) in &expired {
+                                disruption_deadlines.remove(key);
+                            }
+                            if !expired.is_empty() {
+                                expiration_batch_active = true;
+                                let driver = expiration_driver.clone();
+                                let result_tx = expiration_result_tx.clone();
+                                tokio::spawn(async move {
+                                    let attempts = futures::stream::iter(expired.into_iter().map(
+                                        |((_namespace, name), entry)| {
+                                            let driver = driver.clone();
+                                            async move {
+                                                let result = driver
+                                                    .delete_expired_disruption_protection_pdb(
+                                                        &entry.namespace,
+                                                        &name,
+                                                        &entry.sandbox_id,
+                                                        &entry.protected_until,
+                                                    )
+                                                    .await;
+                                                DisruptionProtectionExpirationResult::Attempt {
+                                                    name,
+                                                    entry,
+                                                    result,
+                                                }
+                                            }
+                                        },
+                                    ))
+                                    .buffer_unordered(
+                                        DISRUPTION_PROTECTION_EXPIRATION_CONCURRENCY,
+                                    );
+                                    futures::pin_mut!(attempts);
+                                    while let Some(outcome) = attempts.next().await {
+                                        if result_tx.send(outcome).await.is_err() {
+                                            return;
+                                        }
+                                    }
+                                    let _ = result_tx
+                                        .send(DisruptionProtectionExpirationResult::BatchComplete)
+                                        .await;
+                                });
+                            }
+                        }
+                    },
                     () = tx.closed() => break,
+                }
+                if deadlines_changed {
+                    let delay = if expiration_batch_active {
+                        DISRUPTION_PROTECTION_IDLE_TIMER
+                    } else {
+                        next_disruption_protection_expiration_delay(
+                            &disruption_deadlines,
+                            Utc::now(),
+                        )
+                    };
+                    expiration_sleep
+                        .as_mut()
+                        .reset(tokio::time::Instant::now() + delay);
                 }
             }
         });
@@ -3014,29 +3237,36 @@ fn live_disruption_protection_deadline(
 }
 
 fn update_disruption_protection_deadline(
-    deadlines: &mut BTreeMap<String, DisruptionProtectionDeadline>,
+    deadlines: &mut BTreeMap<(String, String), DisruptionProtectionDeadline>,
     sandbox: &DynamicObject,
 ) -> Result<(), String> {
     let Some(name) = sandbox.metadata.name.as_deref() else {
         return Ok(());
     };
+    let namespace = sandbox
+        .metadata
+        .namespace
+        .as_deref()
+        .ok_or_else(|| format!("Sandbox '{name}' is missing metadata.namespace"))?;
+    let key = (namespace.to_string(), name.to_string());
     let Some(protected_until) = sandbox
         .metadata
         .annotations
         .as_ref()
         .and_then(|annotations| annotations.get(DISRUPTION_PROTECTED_UNTIL_ANNOTATION))
     else {
-        deadlines.remove(name);
+        deadlines.remove(&key);
         return Ok(());
     };
     // Remove the previous schedule before parsing the new annotation so an
     // invalid update cannot leave an older deadline armed for this name.
-    deadlines.remove(name);
+    deadlines.remove(&key);
     let deadline = parse_disruption_protected_until(protected_until)?;
     let sandbox_id = sandbox_id_from_object(sandbox)?;
     deadlines.insert(
-        name.to_string(),
+        key,
         DisruptionProtectionDeadline {
+            namespace: namespace.to_string(),
             sandbox_id,
             protected_until: protected_until.clone(),
             next_attempt: deadline,
@@ -3047,7 +3277,7 @@ fn update_disruption_protection_deadline(
 }
 
 fn next_disruption_protection_expiration_delay(
-    deadlines: &BTreeMap<String, DisruptionProtectionDeadline>,
+    deadlines: &BTreeMap<(String, String), DisruptionProtectionDeadline>,
     now: DateTime<Utc>,
 ) -> Duration {
     deadlines
@@ -4207,6 +4437,7 @@ struct SandboxPodParams<'a> {
     service_account_name: &'a str,
     sandbox_id: &'a str,
     sandbox_name: &'a str,
+    disruption_protection_enabled: bool,
     grpc_endpoint: &'a str,
     ssh_socket_path: &'a str,
     client_tls_secret_name: &'a str,
@@ -4248,6 +4479,7 @@ impl Default for SandboxPodParams<'_> {
             service_account_name: DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME,
             sandbox_id: "",
             sandbox_name: "",
+            disruption_protection_enabled: false,
             grpc_endpoint: "",
             ssh_socket_path: "",
             client_tls_secret_name: "",
@@ -4458,7 +4690,7 @@ fn sandbox_template_to_k8s_with_validated_config(
             );
         }
     }
-    if driver_config.disruption_protection.is_some() {
+    if params.disruption_protection_enabled {
         pod_labels.insert(
             LABEL_MANAGED_BY.to_string(),
             serde_json::Value::String(LABEL_MANAGED_BY_VALUE.to_string()),
@@ -5762,20 +5994,19 @@ mod tests {
 
     #[test]
     fn disruption_protection_requires_both_operator_and_sandbox_opt_in() {
-        let no_request = KubernetesSandboxDriverConfig::default();
         let disabled = KubernetesDisruptionProtectionConfig::default();
         assert_eq!(
-            validate_disruption_protection_request(&disabled, &no_request).unwrap(),
+            validate_disruption_protection_request(&disabled, None).unwrap(),
             None
         );
 
-        let request = KubernetesSandboxDriverConfig {
-            disruption_protection: Some(KubernetesDisruptionProtectionRequest {
-                duration: "4h".to_string(),
+        let request = DisruptionProtectionRequest {
+            duration: Some(prost_types::Duration {
+                seconds: 4 * 60 * 60,
+                nanos: 0,
             }),
-            ..Default::default()
         };
-        let err = validate_disruption_protection_request(&disabled, &request).unwrap_err();
+        let err = validate_disruption_protection_request(&disabled, Some(&request)).unwrap_err();
         assert!(err.contains("disabled by the gateway operator"));
 
         let enabled = KubernetesDisruptionProtectionConfig {
@@ -5783,7 +6014,7 @@ mod tests {
             max_duration: "24h".to_string(),
         };
         assert_eq!(
-            validate_disruption_protection_request(&enabled, &request).unwrap(),
+            validate_disruption_protection_request(&enabled, Some(&request)).unwrap(),
             Some(Duration::from_secs(4 * 60 * 60))
         );
     }
@@ -5794,14 +6025,14 @@ mod tests {
             enabled: true,
             max_duration: "4h".to_string(),
         };
-        let request = KubernetesSandboxDriverConfig {
-            disruption_protection: Some(KubernetesDisruptionProtectionRequest {
-                duration: "5h".to_string(),
+        let request = DisruptionProtectionRequest {
+            duration: Some(prost_types::Duration {
+                seconds: 5 * 60 * 60,
+                nanos: 0,
             }),
-            ..Default::default()
         };
 
-        let err = validate_disruption_protection_request(&operator, &request).unwrap_err();
+        let err = validate_disruption_protection_request(&operator, Some(&request)).unwrap_err();
         assert!(err.contains("exceeds the operator maximum '4h'"));
     }
 
@@ -5880,6 +6111,7 @@ mod tests {
             SANDBOX_KIND,
         ));
         let mut sandbox = DynamicObject::new("workspace--tool", &resource);
+        sandbox.metadata.namespace = Some("sandbox-ns".to_string());
         sandbox.metadata.annotations = Some(BTreeMap::from([
             (LABEL_SANDBOX_ID.to_string(), "sandbox-id".to_string()),
             (
@@ -5916,6 +6148,7 @@ mod tests {
             SANDBOX_KIND,
         ));
         let mut sandbox = DynamicObject::new("workspace--tool", &resource);
+        sandbox.metadata.namespace = Some("sandbox-ns".to_string());
         sandbox.metadata.annotations = Some(BTreeMap::from([
             (LABEL_SANDBOX_ID.to_string(), "sandbox-id".to_string()),
             (
@@ -5935,11 +6168,42 @@ mod tests {
     }
 
     #[test]
+    fn disruption_protection_deadlines_are_scoped_by_namespace() {
+        let resource = ApiResource::from_gvk(&GroupVersionKind::gvk(
+            SANDBOX_GROUP,
+            SANDBOX_VERSION_V1BETA1,
+            SANDBOX_KIND,
+        ));
+        let annotations = BTreeMap::from([
+            (LABEL_SANDBOX_ID.to_string(), "sandbox-id".to_string()),
+            (
+                DISRUPTION_PROTECTED_UNTIL_ANNOTATION.to_string(),
+                "2026-08-10T16:00:00Z".to_string(),
+            ),
+        ]);
+        let mut first = DynamicObject::new("tool", &resource);
+        first.metadata.namespace = Some("workspace-a".to_string());
+        first.metadata.annotations = Some(annotations.clone());
+        let mut second = DynamicObject::new("tool", &resource);
+        second.metadata.namespace = Some("workspace-b".to_string());
+        second.metadata.annotations = Some(annotations);
+        let mut deadlines = BTreeMap::new();
+
+        update_disruption_protection_deadline(&mut deadlines, &first).unwrap();
+        update_disruption_protection_deadline(&mut deadlines, &second).unwrap();
+
+        assert_eq!(deadlines.len(), 2);
+        assert!(deadlines.contains_key(&("workspace-a".to_string(), "tool".to_string())));
+        assert!(deadlines.contains_key(&("workspace-b".to_string(), "tool".to_string())));
+    }
+
+    #[test]
     fn disruption_protection_expiration_retries_with_bounded_backoff() {
         let now = DateTime::parse_from_rfc3339("2026-08-10T12:00:00Z")
             .unwrap()
             .with_timezone(&Utc);
         let mut entry = DisruptionProtectionDeadline {
+            namespace: "default".to_string(),
             sandbox_id: "sandbox-id".to_string(),
             protected_until: "2026-08-10T12:00:00Z".to_string(),
             next_attempt: now,
@@ -6112,15 +6376,11 @@ mod tests {
                     "spoofed-state".to_string(),
                 ),
             ]),
-            driver_config: Some(json_struct(serde_json::json!({
-                "disruption_protection": {
-                    "duration": "4h"
-                }
-            }))),
             ..Default::default()
         };
         let params = SandboxPodParams {
             sandbox_id: "sandbox-id",
+            disruption_protection_enabled: true,
             ..Default::default()
         };
 

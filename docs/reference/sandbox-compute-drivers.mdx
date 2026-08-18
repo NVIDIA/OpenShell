@@ -426,16 +426,21 @@ server:
     maxDuration: "24h"
 ```
 
-The sandbox must also opt in through Kubernetes driver config:
+The sandbox must also opt in through the portable sandbox API:
 
 ```shell
 openshell sandbox create \
-  --driver-config-json '{"kubernetes":{"disruption_protection":{"duration":"4h"}}}' \
+  --disruption-protection 4h \
   -- claude
 ```
 
 OpenShell rejects sandbox creation if the operator gate is disabled, the
 duration is invalid, or the request exceeds `maxDuration`.
+
+The request is part of `SandboxSpec`, not the immutable sandbox template or
+driver JSON. Compute drivers advertise whether they support, approximate, or
+reject the intent. Kubernetes supports it with a PDB; Docker, Podman, and the
+VM driver currently reject it as unsupported.
 
 OpenShell creates a `policy/v1` PodDisruptionBudget with `minAvailable: 1` and
 persists an absolute UTC deadline on the Sandbox CR. The gateway reconciles the

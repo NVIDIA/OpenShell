@@ -22,15 +22,15 @@ use openshell_core::proto::{
     DeleteProviderProfileResponse, DeleteProviderRefreshRequest, DeleteProviderRefreshResponse,
     DeleteProviderRequest, DeleteProviderResponse, DeleteSandboxRequest, DeleteSandboxResponse,
     DeleteServiceRequest, DeleteServiceResponse, DeleteWorkspaceRequest, DeleteWorkspaceResponse,
-    DetachSandboxProviderRequest, DetachSandboxProviderResponse, EditDraftChunkRequest,
-    EditDraftChunkResponse, ExecSandboxEvent, ExecSandboxInput, ExecSandboxRequest,
-    ExposeServiceRequest, GatewayMessage, GetCurrentUserRequest, GetCurrentUserResponse,
-    GetDraftHistoryRequest, GetDraftHistoryResponse, GetDraftPolicyRequest, GetDraftPolicyResponse,
-    GetGatewayConfigRequest, GetGatewayConfigResponse, GetGatewayInfoRequest,
-    GetGatewayInfoResponse, GetProviderProfileRequest, GetProviderRefreshStatusRequest,
-    GetProviderRefreshStatusResponse, GetProviderRequest, GetSandboxConfigRequest,
-    GetSandboxConfigResponse, GetSandboxLogsRequest, GetSandboxLogsResponse,
-    GetSandboxPolicyStatusRequest, GetSandboxPolicyStatusResponse,
+    DetachSandboxProviderRequest, DetachSandboxProviderResponse, DisruptionProtectionCapability,
+    EditDraftChunkRequest, EditDraftChunkResponse, ExecSandboxEvent, ExecSandboxInput,
+    ExecSandboxRequest, ExposeServiceRequest, GatewayMessage, GetCurrentUserRequest,
+    GetCurrentUserResponse, GetDraftHistoryRequest, GetDraftHistoryResponse, GetDraftPolicyRequest,
+    GetDraftPolicyResponse, GetGatewayConfigRequest, GetGatewayConfigResponse,
+    GetGatewayInfoRequest, GetGatewayInfoResponse, GetProviderProfileRequest,
+    GetProviderRefreshStatusRequest, GetProviderRefreshStatusResponse, GetProviderRequest,
+    GetSandboxConfigRequest, GetSandboxConfigResponse, GetSandboxLogsRequest,
+    GetSandboxLogsResponse, GetSandboxPolicyStatusRequest, GetSandboxPolicyStatusResponse,
     GetSandboxProviderEnvironmentRequest, GetSandboxProviderEnvironmentResponse, GetSandboxRequest,
     GetServiceRequest, GetWorkspaceRequest, GetWorkspaceResponse, HealthRequest, HealthResponse,
     ImportProviderProfilesRequest, ImportProviderProfilesResponse, IssueSandboxTokenRequest,
@@ -253,6 +253,13 @@ impl OpenShell for OpenShellService {
                 capabilities: Some(ComputeDriverCapabilities {
                     driver_name: driver.driver_name.clone(),
                     driver_version: driver.driver_version.clone(),
+                    disruption_protection: driver.disruption_protection.as_ref().map(
+                        |capability| DisruptionProtectionCapability {
+                            support: capability.support,
+                            enabled: capability.enabled,
+                            max_duration: capability.max_duration,
+                        },
+                    ),
                 }),
             })
             .collect();

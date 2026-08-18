@@ -4071,6 +4071,7 @@ dependencies = [
  "miette",
  "oauth2",
  "openshell-core",
+ "prost-types",
  "reqwest 0.12.28",
  "rustls 0.23.38",
  "serde",

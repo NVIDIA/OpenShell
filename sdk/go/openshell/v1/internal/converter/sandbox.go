@@ -9,6 +9,7 @@ import (
 	"github.com/NVIDIA/OpenShell/sdk/go/openshell/v1/types"
 	dm "github.com/NVIDIA/OpenShell/sdk/go/proto/datamodelv1"
 	pb "github.com/NVIDIA/OpenShell/sdk/go/proto/openshellv1"
+	"google.golang.org/protobuf/types/known/durationpb"
 	"google.golang.org/protobuf/types/known/structpb"
 )
 
@@ -75,6 +76,10 @@ func sandboxSpecFromProto(spec *pb.SandboxSpec) types.SandboxSpec {
 		if gpu := rr.GetGpu(); gpu != nil && gpu.Count != nil {
 			result.GPUCount = gpu.Count
 		}
+	}
+	if request := spec.GetDisruptionProtection(); request != nil && request.GetDuration() != nil {
+		duration := request.GetDuration().AsDuration()
+		result.DisruptionProtectionDuration = &duration
 	}
 
 	return result
@@ -219,6 +224,11 @@ func SandboxSpecToProto(spec *types.SandboxSpec) *pb.SandboxSpec {
 			},
 		}
 	}
+	if spec.DisruptionProtectionDuration != nil {
+		result.DisruptionProtection = &pb.DisruptionProtectionRequest{
+			Duration: durationpb.New(*spec.DisruptionProtectionDuration),
+		}
+	}
 
 	return result
 }
@@ -235,6 +245,14 @@ func SandboxSpecToProtoChecked(spec *types.SandboxSpec) (*pb.SandboxSpec, error)
 		return nil, fmt.Errorf("policy: %w", err)
 	}
 	result.Policy = policy
+	if spec.DisruptionProtectionDuration != nil {
+		if err := result.GetDisruptionProtection().GetDuration().CheckValid(); err != nil {
+			return nil, fmt.Errorf("disruption protection duration: %w", err)
+		}
+		if *spec.DisruptionProtectionDuration <= 0 {
+			return nil, fmt.Errorf("disruption protection duration must be greater than zero")
+		}
+	}
 	if spec.Template == nil {
 		return result, nil
 	}

@@ -5,7 +5,10 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::proto::compute::v1::{DriverSandbox, GetCapabilitiesResponse};
+use crate::proto::compute::v1::{
+    DisruptionProtectionCapability, DisruptionProtectionSupport, DriverSandbox,
+    GetCapabilitiesResponse,
+};
 
 pub use crate::container_paths::{
     SANDBOX_TOKEN_MOUNT_PATH, SUPERVISOR_CONTAINER_BINARY, SUPERVISOR_CONTAINER_DIR,
@@ -385,6 +388,11 @@ pub fn build_capabilities_response(
         driver_name: driver_name.to_string(),
         driver_version: driver_version.into(),
         default_image: default_image.into(),
+        disruption_protection: Some(DisruptionProtectionCapability {
+            support: DisruptionProtectionSupport::Unsupported.into(),
+            enabled: false,
+            max_duration: None,
+        }),
     }
 }
 

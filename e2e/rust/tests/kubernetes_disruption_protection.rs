@@ -22,14 +22,8 @@ async fn sandbox_disruption_protection_denies_eviction_and_expires() {
         .as_millis()
         % 1_000_000;
     let sandbox_name = format!("pdb-e2e-{suffix}");
-    let driver_config = r#"{"kubernetes":{"disruption_protection":{"duration":"30m"}}}"#;
     let mut sandbox = SandboxGuard::create_keep_with_args(
-        &[
-            "--name",
-            &sandbox_name,
-            "--driver-config-json",
-            driver_config,
-        ],
+        &["--name", &sandbox_name, "--disruption-protection", "30m"],
         &["sh", "-lc", "echo pdb-ready; sleep infinity"],
         "pdb-ready",
     )
@@ -107,14 +101,8 @@ async fn sandbox_delete_removes_active_disruption_protection() {
         .as_nanos()
         % 1_000_000_000;
     let sandbox_name = format!("pdb-delete-e2e-{suffix}");
-    let driver_config = r#"{"kubernetes":{"disruption_protection":{"duration":"30m"}}}"#;
     let mut sandbox = SandboxGuard::create_keep_with_args(
-        &[
-            "--name",
-            &sandbox_name,
-            "--driver-config-json",
-            driver_config,
-        ],
+        &["--name", &sandbox_name, "--disruption-protection", "30m"],
         &["sh", "-lc", "echo pdb-delete-ready; sleep infinity"],
         "pdb-delete-ready",
     )

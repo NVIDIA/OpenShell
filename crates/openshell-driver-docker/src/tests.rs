@@ -45,6 +45,7 @@ fn test_sandbox() -> DriverSandbox {
             }),
             resource_requirements: None,
             sandbox_token: String::new(),
+            disruption_protection: None,
         }),
         status: None,
         workspace: String::new(),

@@ -26,6 +26,9 @@ type SandboxSpec struct {
 	Template    *SandboxTemplate
 	Providers   []string
 	GPUCount    *uint32
+	// DisruptionProtectionDuration requests protection from voluntary platform
+	// disruption. The gateway enforces driver support and the admin maximum.
+	DisruptionProtectionDuration *time.Duration
 	// Policy is the security policy for the sandbox. Nil means no policy specified.
 	Policy *SandboxPolicy
 }

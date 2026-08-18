@@ -54,7 +54,8 @@ indefinitely when the API server is slow or unavailable.
 The driver can create a `policy/v1` `PodDisruptionBudget` with a fail-closed
 expiration target for an individual sandbox. This capability uses two explicit
 opt-ins: the operator sets `disruption_protection.enabled = true`, and the
-sandbox requests `driver_config.kubernetes.disruption_protection.duration`.
+sandbox sets the first-class `disruption_protection` duration through the API
+or `openshell sandbox create --disruption-protection`.
 The operator's `max_duration` limits each request. Durations are positive
 integer seconds, minutes, or hours, such as `30m` or `4h`.
 
@@ -195,7 +196,6 @@ nested schema and currently accepts:
 - `volumes[].name`
 - `volumes[].persistent_volume_claim.claim_name`
 - `volumes[].persistent_volume_claim.read_only`
-- `disruption_protection.duration`
 
 Nested keys inside the `kubernetes` block use snake_case. The top-level
 `driver_config` envelope is keyed by driver names, so `kubernetes` is not part
@@ -214,7 +214,7 @@ When the operator enables disruption protection, request it for one sandbox:
 
 ```shell
 openshell sandbox create \
-  --driver-config-json '{"kubernetes":{"disruption_protection":{"duration":"4h"}}}' \
+  --disruption-protection 4h \
   -- claude
 ```
 

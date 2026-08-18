@@ -577,10 +577,17 @@ impl PodmanComputeDriver {
         &self,
         sandbox: &'a DriverSandbox,
     ) -> Result<ValidatedPodmanSandbox<'a>, ComputeDriverError> {
-        let gpu_requirements = sandbox
-            .spec
+        let spec = sandbox.spec.as_ref().ok_or_else(|| {
+            ComputeDriverError::InvalidArgument("sandbox.spec is required".into())
+        })?;
+        if spec.disruption_protection.is_some() {
+            return Err(ComputeDriverError::Precondition(
+                "podman sandboxes do not support disruption protection".into(),
+            ));
+        }
+        let gpu_requirements = spec
+            .resource_requirements
             .as_ref()
-            .and_then(|spec| spec.resource_requirements.as_ref())
             .and_then(|requirements| driver_gpu_requirements(Some(requirements)));
         let driver_config = PodmanSandboxDriverConfig::from_sandbox(sandbox)?;
         Self::validate_gpu_request(gpu_requirements, &driver_config)?;

@@ -212,6 +212,9 @@ pub(super) fn validate_sandbox_spec(
     // --- spec.resource_requirements.gpu ---
     validate_gpu_request_fields(spec)?;
 
+    // --- spec.disruption_protection ---
+    validate_disruption_protection_request(spec)?;
+
     // --- spec.policy serialized size ---
     if let Some(ref policy) = spec.policy {
         let size = policy.encoded_len();
@@ -230,6 +233,30 @@ fn validate_gpu_request_fields(spec: &openshell_core::proto::SandboxSpec) -> Res
         return Err(Status::invalid_argument("gpu count must be greater than 0"));
     }
 
+    Ok(())
+}
+
+fn validate_disruption_protection_request(
+    spec: &openshell_core::proto::SandboxSpec,
+) -> Result<(), Status> {
+    const PROTOBUF_DURATION_MAX_SECONDS: i64 = 315_576_000_000;
+
+    let Some(request) = spec.disruption_protection.as_ref() else {
+        return Ok(());
+    };
+    let duration = request
+        .duration
+        .as_ref()
+        .ok_or_else(|| Status::invalid_argument("disruption_protection.duration is required"))?;
+    if duration.seconds < 0
+        || duration.seconds > PROTOBUF_DURATION_MAX_SECONDS
+        || !(0..1_000_000_000).contains(&duration.nanos)
+        || (duration.seconds == 0 && duration.nanos == 0)
+    {
+        return Err(Status::invalid_argument(
+            "disruption_protection.duration must be a positive protobuf duration",
+        ));
+    }
     Ok(())
 }
 
@@ -989,6 +1016,48 @@ mod tests {
             ..Default::default()
         };
         assert!(validate_sandbox_spec("gpu-sandbox", &spec).is_ok());
+    }
+
+    #[test]
+    fn validate_sandbox_spec_accepts_disruption_protection() {
+        let spec = SandboxSpec {
+            disruption_protection: Some(openshell_core::proto::DisruptionProtectionRequest {
+                duration: Some(prost_types::Duration {
+                    seconds: 3_600,
+                    nanos: 0,
+                }),
+            }),
+            ..Default::default()
+        };
+
+        assert!(validate_sandbox_spec("protected", &spec).is_ok());
+    }
+
+    #[test]
+    fn validate_sandbox_spec_rejects_invalid_disruption_protection() {
+        for duration in [
+            None,
+            Some(prost_types::Duration {
+                seconds: 0,
+                nanos: 0,
+            }),
+            Some(prost_types::Duration {
+                seconds: -1,
+                nanos: 0,
+            }),
+            Some(prost_types::Duration {
+                seconds: 1,
+                nanos: 1_000_000_000,
+            }),
+        ] {
+            let spec = SandboxSpec {
+                disruption_protection: Some(openshell_core::proto::DisruptionProtectionRequest {
+                    duration,
+                }),
+                ..Default::default()
+            };
+            assert!(validate_sandbox_spec("protected", &spec).is_err());
+        }
     }
 
     #[test]

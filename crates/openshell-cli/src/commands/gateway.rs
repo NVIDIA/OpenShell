@@ -19,7 +19,9 @@ use openshell_bootstrap::{
     save_active_gateway, store_gateway_metadata,
 };
 use openshell_bootstrap::{GatewayMetadataSource, ListedGateway};
-use openshell_core::proto::{GetGatewayInfoRequest, HealthRequest, ServiceStatus};
+use openshell_core::proto::{
+    DisruptionProtectionSupport, GetGatewayInfoRequest, HealthRequest, ServiceStatus,
+};
 use owo_colors::OwoColorize;
 use std::io::IsTerminal;
 use std::path::PathBuf;
@@ -45,6 +47,15 @@ struct ComputeDriverInfoView {
 struct ComputeDriverCapabilitiesView {
     driver_name: String,
     driver_version: String,
+    disruption_protection: Option<DisruptionProtectionCapabilityView>,
+}
+
+#[derive(Debug, Clone)]
+struct DisruptionProtectionCapabilityView {
+    support: &'static str,
+    enabled: bool,
+    max_duration_seconds: Option<i64>,
+    max_duration_nanos: Option<i32>,
 }
 
 /// Show gateway status.
@@ -387,11 +398,24 @@ pub async fn gateway_info(
             .into_iter()
             .map(|driver| {
                 let capabilities = driver.capabilities.unwrap_or_default();
+                let disruption_protection = capabilities.disruption_protection.map(|capability| {
+                    let support = DisruptionProtectionSupport::try_from(capability.support)
+                        .unwrap_or(DisruptionProtectionSupport::Unspecified);
+                    DisruptionProtectionCapabilityView {
+                        support: disruption_protection_support_name(support),
+                        enabled: capability.enabled,
+                        max_duration_seconds: capability
+                            .max_duration
+                            .map(|duration| duration.seconds),
+                        max_duration_nanos: capability.max_duration.map(|duration| duration.nanos),
+                    }
+                });
                 ComputeDriverInfoView {
                     name: driver.name,
                     capabilities: ComputeDriverCapabilitiesView {
                         driver_name: capabilities.driver_name,
                         driver_version: capabilities.driver_version,
+                        disruption_protection,
                     },
                 }
             })
@@ -446,6 +470,25 @@ fn print_compute_driver_info(drivers: &[ComputeDriverInfoView]) {
             "Driver version:".dimmed(),
             driver.capabilities.driver_version
         );
+        if let Some(capability) = &driver.capabilities.disruption_protection {
+            println!(
+                "      {} {} (enabled: {}, maximum: {})",
+                "Disruption protection:".dimmed(),
+                capability.support,
+                capability.enabled,
+                capability.max_duration_seconds.map_or_else(
+                    || "not set".to_string(),
+                    |seconds| {
+                        let nanos = capability.max_duration_nanos.unwrap_or_default();
+                        if nanos == 0 {
+                            format!("{seconds}s")
+                        } else {
+                            format!("{seconds}.{nanos:09}s")
+                        }
+                    }
+                ),
+            );
+        }
     }
 }
 
@@ -464,10 +507,25 @@ fn gateway_info_to_json(view: &GatewayInfoView) -> serde_json::Value {
                 "capabilities": {
                     "driver_name": &driver.capabilities.driver_name,
                     "driver_version": &driver.capabilities.driver_version,
+                    "disruption_protection": driver.capabilities.disruption_protection.as_ref().map(|capability| serde_json::json!({
+                        "support": capability.support,
+                        "enabled": capability.enabled,
+                        "max_duration_seconds": capability.max_duration_seconds,
+                        "max_duration_nanos": capability.max_duration_nanos,
+                    })),
                 },
             }))
             .collect::<Vec<_>>(),
     })
+}
+
+fn disruption_protection_support_name(support: DisruptionProtectionSupport) -> &'static str {
+    match support {
+        DisruptionProtectionSupport::Unsupported => "unsupported",
+        DisruptionProtectionSupport::Approximated => "approximated",
+        DisruptionProtectionSupport::Supported => "supported",
+        DisruptionProtectionSupport::Unspecified => "unspecified",
+    }
 }
 
 /// Set the active gateway.
@@ -1469,9 +1527,9 @@ pub fn gateway_remove(name: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ComputeDriverCapabilitiesView, ComputeDriverInfoView, GatewayAuthenticationState,
-        GatewayInfoView, TlsOptions, format_gateway_select_header, format_gateway_select_items,
-        gateway_add, gateway_auth_label, gateway_authentication_state,
+        ComputeDriverCapabilitiesView, ComputeDriverInfoView, DisruptionProtectionCapabilityView,
+        GatewayAuthenticationState, GatewayInfoView, TlsOptions, format_gateway_select_header,
+        format_gateway_select_items, gateway_add, gateway_auth_label, gateway_authentication_state,
         gateway_env_override_warning, gateway_info_to_json, gateway_remote_label,
         gateway_select_with, gateway_to_json, gateway_type_label, http_health_check,
         import_local_package_mtls_bundle, mtls_certs_exist_for_gateway, package_managed_tls_dirs,
@@ -1784,6 +1842,12 @@ mod tests {
                 capabilities: ComputeDriverCapabilitiesView {
                     driver_name: "podman".to_string(),
                     driver_version: "0.0.75".to_string(),
+                    disruption_protection: Some(DisruptionProtectionCapabilityView {
+                        support: "unsupported",
+                        enabled: false,
+                        max_duration_seconds: None,
+                        max_duration_nanos: None,
+                    }),
                 },
             }],
         };
@@ -1801,6 +1865,10 @@ mod tests {
         assert_eq!(
             json["compute_drivers"][0]["capabilities"]["driver_version"],
             "0.0.75"
+        );
+        assert_eq!(
+            json["compute_drivers"][0]["capabilities"]["disruption_protection"]["support"],
+            "unsupported"
         );
     }
 
