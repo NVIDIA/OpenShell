@@ -105,7 +105,7 @@ disable_tls = false
 
 # Shared driver defaults. These inherit into [openshell.drivers.<name>] tables
 # when the driver-specific table does not override them.
-default_image           = "ghcr.io/nvidia/openshell/sandbox:latest"
+default_image           = "ghcr.io/nvidia/openshell-community/sandboxes/base:latest"
 # Defaults to the gateway version; override to pin a specific build.
 # supervisor_image      = "ghcr.io/nvidia/openshell/supervisor:<version>"
 client_tls_secret_name  = "openshell-client-tls"
@@ -481,7 +481,7 @@ workspace_mode                 = "shared"
 # gateway_id                   = "openshell"
 namespace                      = "agents"
 service_account_name           = "openshell-sandbox"
-default_image                  = "ghcr.io/nvidia/openshell/sandbox:latest"
+default_image                  = "ghcr.io/nvidia/openshell-community/sandboxes/base:latest"
 image_pull_policy              = "IfNotPresent"
 image_pull_secrets             = ["regcred"]
 # Defaults to the gateway version; override to pin a specific build.
@@ -604,7 +604,7 @@ compute_drivers = ["docker"]
 
 [openshell.drivers.docker]
 socket_path        = "/var/run/docker.sock"
-default_image      = "ghcr.io/nvidia/openshell/sandbox:latest"
+default_image      = "ghcr.io/nvidia/openshell-community/sandboxes/base:latest"
 # Docker vocabulary: Always | IfNotPresent | Never. Empty behaves like IfNotPresent.
 image_pull_policy  = "IfNotPresent"
 sandbox_namespace  = "docker-dev"
@@ -648,7 +648,7 @@ compute_drivers = ["podman"]
 # asks the podman CLI where its socket is, and fails to start if neither finds
 # one. Set this to pin a specific Podman machine instead.
 socket_path             = "/run/user/1000/podman/podman.sock"
-default_image           = "ghcr.io/nvidia/openshell/sandbox:latest"
+default_image           = "ghcr.io/nvidia/openshell-community/sandboxes/base:latest"
 image_pull_policy       = "missing"   # always | missing | never | newer
 grpc_endpoint           = "https://host.containers.internal:17670"
 # The gateway overwrites gateway_port from bind_address at runtime.
@@ -781,10 +781,10 @@ compute_drivers = ["vm"]
 state_dir        = "/var/lib/openshell/vm"
 # Where the gateway looks for the openshell-driver-vm subprocess binary.
 driver_dir       = "/usr/local/libexec/openshell"
-default_image    = "ghcr.io/nvidia/openshell/sandbox:latest"
+default_image    = "ghcr.io/nvidia/openshell-community/sandboxes/base:latest"
 grpc_endpoint    = "https://host.containers.internal:17670"
 # Empty falls back to default_image.
-bootstrap_image  = "ghcr.io/nvidia/openshell/sandbox:latest"
+bootstrap_image  = "ghcr.io/nvidia/openshell-community/sandboxes/base:latest"
 krun_log_level   = 1
 vcpus            = 2
 mem_mib          = 2048

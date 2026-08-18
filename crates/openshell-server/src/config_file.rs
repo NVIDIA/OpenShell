@@ -522,7 +522,7 @@ sandbox_namespace = "agents"
 grpc_rate_limit_requests = 120
 grpc_rate_limit_window_seconds = 60
 policy_validation_failure_mode = "retain_last_valid"
-default_image = "ghcr.io/nvidia/openshell/sandbox:latest"
+default_image = "ghcr.io/nvidia/openshell-community/sandboxes/base:latest"
 supervisor_image = "ghcr.io/nvidia/openshell/supervisor:latest"
 client_tls_secret_name = "openshell-sandbox-tls"
 service_account_name = "openshell-sandbox"
@@ -549,7 +549,7 @@ namespace = "agents"
         assert_eq!(gw.log_level.as_deref(), Some("info"));
         assert_eq!(
             gw.default_image.as_deref(),
-            Some("ghcr.io/nvidia/openshell/sandbox:latest")
+            Some("ghcr.io/nvidia/openshell-community/sandboxes/base:latest")
         );
         assert_eq!(gw.grpc_rate_limit_requests, Some(120));
         assert_eq!(gw.grpc_rate_limit_window_seconds, Some(60));
@@ -943,7 +943,9 @@ version = 2
     #[test]
     fn driver_table_inherits_gateway_defaults() {
         let gateway = GatewayFileSection {
-            default_image: Some("ghcr.io/nvidia/openshell/sandbox:0.9".to_string()),
+            default_image: Some(
+                "ghcr.io/nvidia/openshell-community/sandboxes/base:latest".to_string(),
+            ),
             supervisor_image: Some("ghcr.io/nvidia/openshell/supervisor:0.9".to_string()),
             ..Default::default()
         };
@@ -963,7 +965,7 @@ version = 2
         );
         assert_eq!(
             table.get("default_image").and_then(|v| v.as_str()),
-            Some("ghcr.io/nvidia/openshell/sandbox:0.9")
+            Some("ghcr.io/nvidia/openshell-community/sandboxes/base:latest")
         );
         assert_eq!(
             table.get("supervisor_image").and_then(|v| v.as_str()),
@@ -975,7 +977,9 @@ version = 2
     fn registered_driver_table_inherits_selected_gateway_defaults() {
         let gateway = GatewayFileSection {
             sandbox_namespace: Some("agents".to_string()),
-            default_image: Some("ghcr.io/nvidia/openshell/sandbox:0.9".to_string()),
+            default_image: Some(
+                "ghcr.io/nvidia/openshell-community/sandboxes/base:latest".to_string(),
+            ),
             host_gateway_ip: Some("10.0.0.1".to_string()),
             ..Default::default()
         };
@@ -992,7 +996,7 @@ version = 2
         );
         assert_eq!(
             table.get("default_image").and_then(|v| v.as_str()),
-            Some("ghcr.io/nvidia/openshell/sandbox:0.9")
+            Some("ghcr.io/nvidia/openshell-community/sandboxes/base:latest")
         );
         assert_eq!(
             table.get("host_gateway_ip").and_then(|v| v.as_str()),
@@ -1003,7 +1007,9 @@ version = 2
     #[test]
     fn registered_driver_table_can_select_network_defaults() {
         let gateway = GatewayFileSection {
-            default_image: Some("ghcr.io/nvidia/openshell/sandbox:0.9".to_string()),
+            default_image: Some(
+                "ghcr.io/nvidia/openshell-community/sandboxes/base:latest".to_string(),
+            ),
             host_gateway_ip: Some("192.168.127.254".to_string()),
             ..Default::default()
         };
@@ -1016,7 +1022,7 @@ version = 2
         let table = merged.as_table().expect("table");
         assert_eq!(
             table.get("default_image").and_then(|v| v.as_str()),
-            Some("ghcr.io/nvidia/openshell/sandbox:0.9")
+            Some("ghcr.io/nvidia/openshell-community/sandboxes/base:latest")
         );
         assert_eq!(
             table.get("host_gateway_ip").and_then(|v| v.as_str()),
