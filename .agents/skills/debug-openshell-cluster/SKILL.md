@@ -452,6 +452,9 @@ A request over `maxDuration` is rejected. The PDB should use `minAvailable: 1`,
 Sandbox CR. OpenShell stores an absolute UTC deadline in
 `openshell.io/disruption-protected-until`; an expired PDB can remain while all
 gateways are down but should be removed after gateway reconciliation resumes.
+Turning the operator gate off rejects new requests but retains existing PDBs
+until their deadlines; because mutation RBAC is disabled, missing or drifted
+PDBs are not repaired while the gate is off.
 PDBs apply only to voluntary Eviction API operations, not node failure,
 preemption, direct deletion, backup, or restore.
 

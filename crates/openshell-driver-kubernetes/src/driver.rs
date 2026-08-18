@@ -162,6 +162,19 @@ enum DisruptionProtectionExpirationResult {
     BatchComplete,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DisruptionProtectionReconcileAction {
+    Remove,
+    Retain,
+    Ensure,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DisruptionProtectionCreateTimeoutResolution {
+    Reconciled,
+    RetainedProvisional,
+}
+
 const GPU_RESOURCE_NAME: &str = "nvidia.com/gpu";
 const SPIFFE_WORKLOAD_API_VOLUME_NAME: &str = "spiffe-workload-api";
 
@@ -1559,6 +1572,58 @@ impl KubernetesComputeDriver {
         .map_err(|err| err.to_string())
     }
 
+    async fn reconcile_disruption_protection_after_create_timeout(
+        &self,
+        agent_sandbox_api: &AgentSandboxApi,
+        namespace: &str,
+        name: &str,
+        attempted_sandbox_id: &str,
+    ) -> Result<DisruptionProtectionCreateTimeoutResolution, String> {
+        let live = tokio::time::timeout(KUBE_API_TIMEOUT, agent_sandbox_api.api.get_opt(name))
+            .await
+            .map_err(|_| format!("timed out fetching Sandbox '{name}' after create timeout"))?
+            .map_err(|err| err.to_string())?;
+        let Some(live) = live else {
+            // The timed-out create may still complete in the API server after
+            // the client future is cancelled. Retain the provisional PDB and
+            // let the bounded orphan sweep remove it once the outcome is no
+            // longer ambiguous.
+            return Ok(DisruptionProtectionCreateTimeoutResolution::RetainedProvisional);
+        };
+
+        let live_sandbox_id = sandbox_id_from_object(&live)?;
+        if live_sandbox_id != attempted_sandbox_id {
+            self.delete_owned_disruption_protection_pdb(
+                namespace,
+                name,
+                attempted_sandbox_id,
+                None,
+            )
+            .await?;
+            return Ok(DisruptionProtectionCreateTimeoutResolution::Reconciled);
+        }
+
+        let Some(protected_until) = live_disruption_protection_deadline(&live, Utc::now()) else {
+            self.delete_owned_disruption_protection_pdb(
+                namespace,
+                name,
+                attempted_sandbox_id,
+                None,
+            )
+            .await?;
+            return Ok(DisruptionProtectionCreateTimeoutResolution::Reconciled);
+        };
+        self.ensure_owned_disruption_protection_pdb(
+            &live,
+            &agent_sandbox_api.resource,
+            &live_sandbox_id,
+            protected_until,
+        )
+        .await
+        .map_err(|err| err.to_string())?;
+        Ok(DisruptionProtectionCreateTimeoutResolution::Reconciled)
+    }
+
     async fn reconcile_disruption_protection_for_sandbox(
         &self,
         agent_sandbox_api: &AgentSandboxApi,
@@ -1588,20 +1653,29 @@ impl KubernetesComputeDriver {
             }
             return Ok(());
         };
-        if !self.config.disruption_protection.enabled {
-            if let Some(pdb) = existing {
-                self.delete_observed_disruption_protection_pdb(&pdb, &sandbox_id)
-                    .await?;
-            }
-            return Ok(());
-        }
-        let deadline = match parse_disruption_protected_until(protected_until) {
-            Ok(deadline) => deadline,
+        let action = match disruption_protection_reconcile_action(
+            self.config.disruption_protection.enabled,
+            protected_until,
+            now,
+        ) {
+            Ok(action) => action,
             Err(err) => {
                 // The deadline is authoritative, but an invalid value does not
                 // prove protection expired. Keep or repair the PDB so metadata
                 // corruption fails closed until an operator supplies a valid
                 // deadline or removes protection explicitly.
+                if !self.config.disruption_protection.enabled {
+                    if let Some(pdb) = existing.as_ref() {
+                        Self::verify_managed_disruption_protection_pdb(pdb, &sandbox_id)
+                            .map_err(|verify_err| verify_err.to_string())?;
+                        return Err(format!(
+                            "{err}; existing disruption protection was retained without repair because new requests are disabled"
+                        ));
+                    }
+                    return Err(format!(
+                        "{err}; disruption protection is missing and cannot be repaired while new requests are disabled"
+                    ));
+                }
                 self.ensure_owned_disruption_protection_pdb_from_observed(
                     sandbox,
                     &agent_sandbox_api.resource,
@@ -1618,23 +1692,43 @@ impl KubernetesComputeDriver {
                 ));
             }
         };
-        if deadline <= now {
-            if let Some(pdb) = existing {
-                self.delete_observed_disruption_protection_pdb(&pdb, &sandbox_id)
-                    .await?;
-            }
-            return Ok(());
-        }
 
-        self.ensure_owned_disruption_protection_pdb_from_observed(
-            sandbox,
-            &agent_sandbox_api.resource,
-            &sandbox_id,
-            protected_until,
-            existing,
-        )
-        .await
-        .map_err(|err| err.to_string())
+        match action {
+            DisruptionProtectionReconcileAction::Remove => {
+                if let Some(pdb) = existing {
+                    self.delete_observed_disruption_protection_pdb(&pdb, &sandbox_id)
+                        .await?;
+                }
+                Ok(())
+            }
+            DisruptionProtectionReconcileAction::Retain => {
+                let Some(pdb) = existing.as_ref() else {
+                    return Err(
+                        "active disruption protection is missing and cannot be repaired while new requests are disabled"
+                            .to_string(),
+                    );
+                };
+                Self::verify_managed_disruption_protection_pdb(pdb, &sandbox_id)
+                    .map_err(|err| err.to_string())?;
+                debug!(
+                    namespace,
+                    sandbox = name,
+                    protected_until,
+                    "Retaining existing disruption protection while new requests are disabled"
+                );
+                Ok(())
+            }
+            DisruptionProtectionReconcileAction::Ensure => self
+                .ensure_owned_disruption_protection_pdb_from_observed(
+                    sandbox,
+                    &agent_sandbox_api.resource,
+                    &sandbox_id,
+                    protected_until,
+                    existing,
+                )
+                .await
+                .map_err(|err| err.to_string()),
+        }
     }
 
     async fn reconcile_disruption_protection(
@@ -2257,6 +2351,34 @@ impl KubernetesComputeDriver {
                 Err(KubernetesDriverError::from_kube(err))
             }
             Err(_elapsed) => {
+                if initial_pdb.is_some() {
+                    match self
+                        .reconcile_disruption_protection_after_create_timeout(
+                            &agent_sandbox_api,
+                            &target_namespace,
+                            &kube_name,
+                            &sandbox.id,
+                        )
+                        .await
+                    {
+                        Ok(DisruptionProtectionCreateTimeoutResolution::Reconciled) => {}
+                        Ok(DisruptionProtectionCreateTimeoutResolution::RetainedProvisional) => {
+                            warn!(
+                                sandbox_id = %sandbox.id,
+                                pdb = %kube_name,
+                                "Retaining provisional PodDisruptionBudget after ambiguous Sandbox create timeout; orphan reconciliation will remove it if the Sandbox was not created"
+                            );
+                        }
+                        Err(cleanup_err) => {
+                            warn!(
+                                sandbox_id = %sandbox.id,
+                                pdb = %kube_name,
+                                error = %cleanup_err,
+                                "Failed to reconcile PodDisruptionBudget after Sandbox create timeout"
+                            );
+                        }
+                    }
+                }
                 warn!(
                     sandbox_id = %sandbox.id,
                     sandbox_name = %name,
@@ -3218,6 +3340,23 @@ fn parse_disruption_protected_until(value: &str) -> Result<DateTime<Utc>, String
     DateTime::parse_from_rfc3339(value)
         .map(|deadline| deadline.with_timezone(&Utc))
         .map_err(|err| format!("invalid disruption protection deadline '{value}': {err}"))
+}
+
+fn disruption_protection_reconcile_action(
+    operator_enabled: bool,
+    protected_until: &str,
+    now: DateTime<Utc>,
+) -> Result<DisruptionProtectionReconcileAction, String> {
+    let deadline = parse_disruption_protected_until(protected_until)?;
+    if deadline <= now {
+        Ok(DisruptionProtectionReconcileAction::Remove)
+    } else if operator_enabled {
+        Ok(DisruptionProtectionReconcileAction::Ensure)
+    } else {
+        // `enabled` is an admission gate. Turning it off must not revoke a
+        // previously accepted protection interval before its deadline.
+        Ok(DisruptionProtectionReconcileAction::Retain)
+    }
 }
 
 fn live_disruption_protection_deadline(
@@ -6063,6 +6202,26 @@ mod tests {
         assert_eq!(
             parse_disruption_protected_until(&protected_until).unwrap(),
             now + chrono::Duration::seconds(1)
+        );
+    }
+
+    #[test]
+    fn disabling_new_requests_retains_active_protection_until_deadline() {
+        let now = DateTime::parse_from_rfc3339("2026-08-10T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        assert_eq!(
+            disruption_protection_reconcile_action(false, "2026-08-10T16:00:00Z", now,).unwrap(),
+            DisruptionProtectionReconcileAction::Retain
+        );
+        assert_eq!(
+            disruption_protection_reconcile_action(true, "2026-08-10T16:00:00Z", now,).unwrap(),
+            DisruptionProtectionReconcileAction::Ensure
+        );
+        assert_eq!(
+            disruption_protection_reconcile_action(false, "2026-08-10T11:59:59Z", now,).unwrap(),
+            DisruptionProtectionReconcileAction::Remove
         );
     }
 

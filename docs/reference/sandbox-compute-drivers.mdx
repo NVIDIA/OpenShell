@@ -369,7 +369,7 @@ For maintainer-level implementation details, refer to the [Kubernetes driver REA
 | `app_armor_profile` | `server.appArmorProfile` | Set the sandbox agent container's AppArmor profile. Helm defaults this to `Unconfined` so AppArmor-enabled nodes do not block supervisor network namespace setup. Set the Helm value to an empty string to omit the field, or use `RuntimeDefault` or `Localhost/<profile-name>` for operator-managed profiles. |
 | `workspace_default_storage_size` | `server.workspaceDefaultStorageSize` | Set the default workspace PVC size for new sandboxes. |
 | `workspace_storage_class` | `server.workspaceStorageClass` | Set the `StorageClass` for the workspace PVC. Empty (default) omits `storageClassName` and uses the cluster's default `StorageClass`. Set this on clusters with no default `StorageClass`, otherwise the workspace PVC stays `Pending` and the sandbox never starts. |
-| `disruption_protection.enabled` | `server.disruptionProtection.enabled` | Allow individual sandboxes to request a PodDisruptionBudget with a fail-closed expiration target. Disabled by default. Enabling it does not protect sandboxes that omit a duration request. |
+| `disruption_protection.enabled` | `server.disruptionProtection.enabled` | Allow individual sandboxes to request a PodDisruptionBudget with a fail-closed expiration target. Disabled by default. Disabling it rejects new requests; existing PDBs remain until their deadlines but are not repaired while mutation RBAC is disabled. |
 | `disruption_protection.max_duration` | `server.disruptionProtection.maxDuration` | Set the maximum accepted per-sandbox protection duration. The default is `24h`; values support positive integer seconds, minutes, or hours. |
 | `sa_token_ttl_secs` | `server.sandboxJwt.k8sSaTokenTtlSecs` | Set the projected ServiceAccount token TTL used for the bootstrap token exchange. |
 
@@ -462,7 +462,9 @@ Non-Helm deployments must grant the gateway service account `create`, `delete`,
 `get`, `list`, and `patch` on `policy/v1` PodDisruptionBudgets in the sandbox
 namespace. The OpenShell Helm chart grants mutation permissions when
 `server.disruptionProtection.enabled` is true and retains cleanup permissions
-when it is false.
+when it is false. Turning the gate off rejects new requests without shortening
+previously accepted intervals. Existing PDBs expire normally, but OpenShell does
+not recreate or patch them while mutation permissions are disabled.
 
 <Note>
 `Sandbox.spec.volumeClaimTemplates` is immutable after creation. To change storage configuration, delete the sandbox and create a new one with the updated spec.

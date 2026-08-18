@@ -547,7 +547,8 @@ process_binary_aware_network_policy = true
 
 [openshell.drivers.kubernetes.disruption_protection]
 # Disabled by default. Enabling this permits, but does not automatically add,
-# per-sandbox PodDisruptionBudgets. Requests are rejected while disabled.
+# per-sandbox PodDisruptionBudgets. New requests are rejected while disabled;
+# previously accepted PDBs remain until their deadlines but are not repaired.
 enabled      = false
 # Maximum duration accepted from the first-class Sandbox API request. This is a
 # fail-closed expiration target: if every gateway is unavailable at the

@@ -34,7 +34,7 @@ pub struct KubernetesDisruptionProtectionConfig {
     /// Allow callers to request a time-bounded `PodDisruptionBudget` for an
     /// individual Kubernetes sandbox. Enabling this capability alone does not
     /// protect any sandbox; the caller must also provide a duration in the
-    /// per-sandbox Kubernetes driver config.
+    /// first-class sandbox API request.
     pub enabled: bool,
     /// Upper bound for a caller-provided protection duration.
     pub max_duration: String,
