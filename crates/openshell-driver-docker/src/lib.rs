@@ -5,6 +5,7 @@
 
 #![allow(clippy::result_large_err)]
 
+use bollard::Docker;
 use bollard::errors::Error as BollardError;
 use bollard::models::{
     ContainerCreateBody, ContainerState, ContainerStateStatusEnum, ContainerSummary,
@@ -15,9 +16,7 @@ use bollard::models::{
 use bollard::query_parameters::{
     CreateContainerOptionsBuilder, CreateImageOptions, DownloadFromContainerOptionsBuilder,
     ListContainersOptionsBuilder, RemoveContainerOptionsBuilder, StopContainerOptionsBuilder,
-    UploadToContainerOptionsBuilder,
 };
-use bollard::{Docker, body_full};
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
 use openshell_core::cdi::{CdiContext, CdiSpecDirectory, cdi_spec_mount_path};
@@ -58,7 +57,6 @@ use openshell_core::proto_struct::{
 };
 use openshell_core::{Config, Error, Result as CoreResult};
 use std::collections::{HashMap, HashSet};
-use std::io::Cursor;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -861,11 +859,22 @@ impl DockerComputeDriver {
         .map_err(|status| {
             DockerProvisioningFailure::new("ContainerCreateFailed", status.message())
         })?;
-        write_sandbox_token_file(sandbox, &self.config)
-            .await
-            .map_err(|status| {
-                DockerProvisioningFailure::new("SandboxTokenWriteFailed", status.message())
-            })?;
+        if let Some(cdi_context) = cdi_context.as_ref()
+            && let Err(status) = write_cdi_context_file(sandbox, &self.config, cdi_context)
+        {
+            cleanup_cdi_context_file(sandbox, &self.config);
+            return Err(DockerProvisioningFailure::new(
+                "CdiContextWriteFailed",
+                status.message(),
+            ));
+        }
+        if let Err(status) = write_sandbox_token_file(sandbox, &self.config).await {
+            cleanup_cdi_context_file(sandbox, &self.config);
+            return Err(DockerProvisioningFailure::new(
+                "SandboxTokenWriteFailed",
+                status.message(),
+            ));
+        }
         if let Err(err) = self
             .docker
             .create_container(
@@ -878,7 +887,7 @@ impl DockerComputeDriver {
             )
             .await
         {
-            cleanup_sandbox_token_file(sandbox, &self.config);
+            cleanup_sandbox_state_files(sandbox, &self.config);
             return Err(DockerProvisioningFailure::from_status(
                 "ContainerCreateFailed",
                 create_status_from_docker_error("create docker sandbox container", err),
@@ -891,22 +900,6 @@ impl DockerComputeDriver {
             HashMap::from([("container_name".to_string(), container_name.clone())]),
         );
 
-        if let Some(cdi_context) = cdi_context
-            && let Err(err) = self.upload_cdi_context(&container_name, &cdi_context).await
-        {
-            self.cleanup_created_container_after_failure(
-                &sandbox.id,
-                &container_name,
-                "CDI context upload failure",
-            )
-            .await;
-            cleanup_sandbox_token_file(sandbox, &self.config);
-            return Err(DockerProvisioningFailure::from_status(
-                "CdiContextUploadFailed",
-                err,
-            ));
-        }
-
         if let Err(err) = self.docker.start_container(&container_name, None).await {
             self.cleanup_created_container_after_failure(
                 &sandbox.id,
@@ -914,7 +907,7 @@ impl DockerComputeDriver {
                 "container start failure",
             )
             .await;
-            cleanup_sandbox_token_file(sandbox, &self.config);
+            cleanup_sandbox_state_files(sandbox, &self.config);
             return Err(DockerProvisioningFailure::from_status(
                 "ContainerStartFailed",
                 create_status_from_docker_error("start docker sandbox container", err),
@@ -964,27 +957,6 @@ impl DockerComputeDriver {
         }
     }
 
-    async fn upload_cdi_context(
-        &self,
-        container_name: &str,
-        context: &CdiContext,
-    ) -> Result<(), Status> {
-        let archive = build_cdi_context_archive(context).map_err(Status::internal)?;
-        self.docker
-            .upload_to_container(
-                container_name,
-                Some(
-                    UploadToContainerOptionsBuilder::default()
-                        .path("/run")
-                        .no_overwrite_dir_non_dir("true")
-                        .build(),
-                ),
-                body_full(Bytes::from(archive)),
-            )
-            .await
-            .map_err(|err| internal_status("upload CDI context to Docker container", err))
-    }
-
     async fn delete_sandbox_inner(
         &self,
         sandbox_id: &str,
@@ -1012,11 +984,11 @@ impl DockerComputeDriver {
                     .await
                 {
                     Ok(()) => {
-                        cleanup_sandbox_token_file(&record.sandbox, &self.config);
+                        cleanup_sandbox_state_files(&record.sandbox, &self.config);
                         return Ok(true);
                     }
                     Err(err) if is_not_found_error(&err) => {
-                        cleanup_sandbox_token_file(&record.sandbox, &self.config);
+                        cleanup_sandbox_state_files(&record.sandbox, &self.config);
                         return Ok(true);
                     }
                     Err(err) => {
@@ -1039,11 +1011,11 @@ impl DockerComputeDriver {
             .await
         {
             Ok(()) => {
-                cleanup_sandbox_token_file_for_delete(sandbox_id, pending.as_ref(), &self.config);
+                cleanup_sandbox_state_files_for_delete(sandbox_id, pending.as_ref(), &self.config);
                 Ok(true)
             }
             Err(err) if is_not_found_error(&err) => {
-                cleanup_sandbox_token_file_for_delete(sandbox_id, pending.as_ref(), &self.config);
+                cleanup_sandbox_state_files_for_delete(sandbox_id, pending.as_ref(), &self.config);
                 Ok(pending.is_some())
             }
             Err(err) => Err(internal_status("delete docker sandbox container", err)),
@@ -1059,7 +1031,7 @@ impl DockerComputeDriver {
                 if let Some(task) = record.task {
                     task.abort();
                 }
-                cleanup_sandbox_token_file(&record.sandbox, &self.config);
+                cleanup_sandbox_state_files(&record.sandbox, &self.config);
                 self.publish_deleted(record.sandbox.id);
                 return Ok(());
             }
@@ -1224,7 +1196,7 @@ impl DockerComputeDriver {
         sandbox: &DriverSandbox,
         failure: &DockerProvisioningFailure,
     ) {
-        cleanup_sandbox_token_file(sandbox, &self.config);
+        cleanup_sandbox_state_files(sandbox, &self.config);
         let snapshot = pending_sandbox_snapshot(
             sandbox,
             &self.config.sandbox_namespace,
@@ -2312,6 +2284,7 @@ fn docker_volume_is_bind_backed(volume: &bollard::models::Volume) -> bool {
 fn build_binds(
     sandbox: &DriverSandbox,
     config: &DockerDriverRuntimeConfig,
+    gpu_device_ids: Option<&[String]>,
 ) -> Result<Vec<String>, Status> {
     let mut binds = vec![format!(
         "{}:{}:ro,z",
@@ -2338,6 +2311,13 @@ fn build_binds(
             SANDBOX_TOKEN_MOUNT_PATH
         ));
     }
+    if cdi_context_requested(gpu_device_ids) {
+        binds.push(format!(
+            "{}:{}:ro,z",
+            cdi_context_host_path(sandbox, config)?.display(),
+            openshell_core::cdi::CDI_CONTEXT_PATH
+        ));
+    }
     Ok(binds)
 }
 
@@ -2362,6 +2342,57 @@ fn sandbox_token_host_path_by_id(
             "resolve sandbox token state directory failed: {err}"
         ))
     })
+}
+
+fn cdi_context_host_path(
+    sandbox: &DriverSandbox,
+    config: &DockerDriverRuntimeConfig,
+) -> Result<PathBuf, Status> {
+    cdi_context_host_path_by_id(&sandbox.id, config)
+}
+
+fn cdi_context_host_path_by_id(
+    sandbox_id: &str,
+    config: &DockerDriverRuntimeConfig,
+) -> Result<PathBuf, Status> {
+    openshell_core::driver_utils::sandbox_token_path(
+        "docker-cdi-contexts",
+        Some(&config.sandbox_namespace),
+        sandbox_id,
+    )
+    .map(|path| path.with_file_name(openshell_core::cdi::CDI_CONTEXT_FILE_NAME))
+    .map_err(|err| Status::internal(format!("resolve CDI context state directory failed: {err}")))
+}
+
+fn write_cdi_context_file(
+    sandbox: &DriverSandbox,
+    config: &DockerDriverRuntimeConfig,
+    context: &CdiContext,
+) -> Result<(), Status> {
+    let path = cdi_context_host_path(sandbox, config)?;
+    if let Some(parent) = path.parent() {
+        openshell_core::paths::create_dir_restricted(parent).map_err(|err| {
+            Status::internal(format!(
+                "create CDI context directory {} failed: {err}",
+                parent.display()
+            ))
+        })?;
+    }
+    let json = serde_json::to_vec(context)
+        .map_err(|err| Status::internal(format!("encode CDI context failed: {err}")))?;
+    std::fs::write(&path, json).map_err(|err| {
+        Status::internal(format!(
+            "write CDI context file {} failed: {err}",
+            path.display()
+        ))
+    })?;
+    openshell_core::paths::set_file_owner_only(&path).map_err(|err| {
+        Status::internal(format!(
+            "restrict CDI context file {} failed: {err}",
+            path.display()
+        ))
+    })?;
+    Ok(())
 }
 
 async fn write_sandbox_token_file(
@@ -2404,6 +2435,15 @@ fn cleanup_sandbox_token_file(sandbox: &DriverSandbox, config: &DockerDriverRunt
     cleanup_sandbox_token_file_by_id(&sandbox.id, config);
 }
 
+fn cleanup_cdi_context_file(sandbox: &DriverSandbox, config: &DockerDriverRuntimeConfig) {
+    cleanup_cdi_context_file_by_id(&sandbox.id, config);
+}
+
+fn cleanup_sandbox_state_files(sandbox: &DriverSandbox, config: &DockerDriverRuntimeConfig) {
+    cleanup_sandbox_token_file(sandbox, config);
+    cleanup_cdi_context_file(sandbox, config);
+}
+
 fn cleanup_sandbox_token_file_for_delete(
     sandbox_id: &str,
     pending: Option<&PendingSandboxRecord>,
@@ -2414,6 +2454,27 @@ fn cleanup_sandbox_token_file_for_delete(
     } else if let Some(record) = pending {
         cleanup_sandbox_token_file(&record.sandbox, config);
     }
+}
+
+fn cleanup_cdi_context_file_for_delete(
+    sandbox_id: &str,
+    pending: Option<&PendingSandboxRecord>,
+    config: &DockerDriverRuntimeConfig,
+) {
+    if !sandbox_id.is_empty() {
+        cleanup_cdi_context_file_by_id(sandbox_id, config);
+    } else if let Some(record) = pending {
+        cleanup_cdi_context_file(&record.sandbox, config);
+    }
+}
+
+fn cleanup_sandbox_state_files_for_delete(
+    sandbox_id: &str,
+    pending: Option<&PendingSandboxRecord>,
+    config: &DockerDriverRuntimeConfig,
+) {
+    cleanup_sandbox_token_file_for_delete(sandbox_id, pending, config);
+    cleanup_cdi_context_file_for_delete(sandbox_id, pending, config);
 }
 
 fn cleanup_sandbox_token_file_by_id(sandbox_id: &str, config: &DockerDriverRuntimeConfig) {
@@ -2428,6 +2489,25 @@ fn cleanup_sandbox_token_file_by_id(sandbox_id: &str, config: &DockerDriverRunti
             path = %path.display(),
             error = %err,
             "Failed to remove Docker sandbox token file"
+        );
+    }
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::remove_dir(dir);
+    }
+}
+
+fn cleanup_cdi_context_file_by_id(sandbox_id: &str, config: &DockerDriverRuntimeConfig) {
+    let Ok(path) = cdi_context_host_path_by_id(sandbox_id, config) else {
+        return;
+    };
+    if let Err(err) = std::fs::remove_file(&path)
+        && err.kind() != std::io::ErrorKind::NotFound
+    {
+        warn!(
+            sandbox_id = %sandbox_id,
+            path = %path.display(),
+            error = %err,
+            "Failed to remove Docker CDI context file"
         );
     }
     if let Some(dir) = path.parent() {
@@ -2600,64 +2680,6 @@ fn cdi_context_requested(gpu_device_ids: Option<&[String]>) -> bool {
     gpu_device_ids.is_some_and(|device_ids| !device_ids.is_empty())
 }
 
-fn build_cdi_context_archive(context: &CdiContext) -> Result<Vec<u8>, String> {
-    let json = serde_json::to_vec_pretty(context).map_err(|err| err.to_string())?;
-    let mut archive = DockerTarArchiveBuilder::new();
-    archive.append_dir("openshell", 0o700)?;
-    archive.append_dir("openshell/supervisor", 0o700)?;
-    archive.append_file(
-        &format!(
-            "openshell/supervisor/{}",
-            openshell_core::cdi::CDI_CONTEXT_FILE_NAME
-        ),
-        0o600,
-        json,
-    )?;
-    archive.into_inner()
-}
-
-struct DockerTarArchiveBuilder {
-    inner: tar::Builder<Vec<u8>>,
-}
-
-impl DockerTarArchiveBuilder {
-    fn new() -> Self {
-        Self {
-            inner: tar::Builder::new(Vec::new()),
-        }
-    }
-
-    fn append_dir(&mut self, path: &str, mode: u32) -> Result<(), String> {
-        let mut header = tar::Header::new_gnu();
-        header.set_entry_type(tar::EntryType::Directory);
-        header.set_size(0);
-        header.set_mode(mode);
-        header.set_uid(0);
-        header.set_gid(0);
-        header.set_cksum();
-        self.inner
-            .append_data(&mut header, path, std::io::empty())
-            .map_err(|err| err.to_string())
-    }
-
-    fn append_file(&mut self, path: &str, mode: u32, contents: Vec<u8>) -> Result<(), String> {
-        let mut header = tar::Header::new_gnu();
-        header.set_entry_type(tar::EntryType::Regular);
-        header.set_size(u64::try_from(contents.len()).map_err(|err| err.to_string())?);
-        header.set_mode(mode);
-        header.set_uid(0);
-        header.set_gid(0);
-        header.set_cksum();
-        self.inner
-            .append_data(&mut header, path, Cursor::new(contents))
-            .map_err(|err| err.to_string())
-    }
-
-    fn into_inner(self) -> Result<Vec<u8>, String> {
-        self.inner.into_inner().map_err(|err| err.to_string())
-    }
-}
-
 #[cfg(test)]
 fn build_container_create_body(
     sandbox: &DriverSandbox,
@@ -2811,7 +2833,7 @@ fn build_container_create_body_for_image(
             pids_limit: docker_pids_limit(config.sandbox_pids_limit)?,
             device_requests,
             binds: {
-                let mut binds = build_binds(sandbox, config)?;
+                let mut binds = build_binds(sandbox, config, gpu_device_ids)?;
                 binds.extend(config.gpu.cdi_spec_bind_strings(gpu_device_ids)?);
                 binds.extend(user_bind_strings);
                 Some(binds)

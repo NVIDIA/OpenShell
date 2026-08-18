@@ -944,7 +944,7 @@ fn build_environment_keeps_telemetry_toggle_driver_controlled() {
 
 #[test]
 fn build_binds_uses_docker_tls_directory() {
-    let binds = build_binds(&test_sandbox(), &runtime_config(false)).unwrap();
+    let binds = build_binds(&test_sandbox(), &runtime_config(false), None).unwrap();
     let targets = binds
         .iter()
         .filter_map(|bind| bind.split(':').nth(1).map(String::from))
@@ -1847,6 +1847,13 @@ fn build_container_create_body_adds_cdi_context_env_and_spec_mounts_for_gpu() {
     assert!(binds.iter().any(|bind| {
         bind == &format!("{TEST_CDI_SPEC_DIR_ALT}:{}:ro,z", cdi_spec_mount_path(1))
     }));
+    assert!(binds.iter().any(|bind| {
+        bind == &format!(
+            "{}:{}:ro,z",
+            cdi_context_host_path(&sandbox, &config).unwrap().display(),
+            openshell_core::cdi::CDI_CONTEXT_PATH
+        )
+    }));
 }
 
 #[test]
@@ -1874,9 +1881,11 @@ fn build_container_create_body_clears_cdi_context_for_non_gpu() {
 }
 
 #[test]
-fn build_cdi_context_archive_contains_context_json() {
-    use std::io::Read as _;
-
+fn write_cdi_context_file_materializes_owned_host_context() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    let state_dir = tempfile::tempdir().unwrap();
+    let sandbox = test_sandbox();
+    let config = runtime_config(true);
     let context = CdiContext::new(
         vec!["nvidia.com/gpu=0".to_string()],
         vec![CdiSpecDirectory::new(
@@ -1884,20 +1893,16 @@ fn build_cdi_context_archive_contains_context_json() {
             TEST_CDI_SPEC_DIR,
         )],
     );
-    let bytes = build_cdi_context_archive(&context).unwrap();
-    let mut archive = tar::Archive::new(Cursor::new(bytes));
-    let mut found = false;
-    for entry in archive.entries().unwrap() {
-        let mut entry = entry.unwrap();
-        if entry.path().unwrap().as_ref() == Path::new("openshell/supervisor/cdi-context.json") {
-            let mut payload = String::new();
-            entry.read_to_string(&mut payload).unwrap();
-            let parsed: CdiContext = serde_json::from_str(&payload).unwrap();
-            assert_eq!(parsed, context);
-            found = true;
-        }
-    }
-    assert!(found, "archive must include cdi-context.json");
+
+    temp_env::with_var("XDG_STATE_HOME", Some(state_dir.path()), || {
+        write_cdi_context_file(&sandbox, &config, &context).expect("write CDI context");
+        let path = cdi_context_host_path(&sandbox, &config).expect("context path");
+        let contents = fs::read(&path).expect("read CDI context");
+        let parsed: CdiContext = serde_json::from_slice(&contents).expect("parse CDI context");
+        assert_eq!(parsed, context);
+        cleanup_cdi_context_file(&sandbox, &config);
+        assert!(!path.exists());
+    });
 }
 
 #[test]
