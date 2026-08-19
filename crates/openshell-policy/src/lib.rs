@@ -1172,6 +1172,16 @@ pub enum PolicyViolation {
     TooManyPaths { count: usize },
     /// A network endpoint uses a TLD wildcard (e.g. `*.com`).
     TldWildcard { policy_name: String, host: String },
+    /// A network endpoint has no hostname.
+    MissingEndpointHost { policy_name: String },
+    /// A network endpoint has no effective destination port.
+    MissingEndpointPort { policy_name: String, host: String },
+    /// A network endpoint contains a port outside the TCP/UDP range.
+    InvalidEndpointPort {
+        policy_name: String,
+        host: String,
+        port: u32,
+    },
     /// A network endpoint uses a wildcard shape that does not match runtime semantics.
     InvalidHostWildcard { policy_name: String, host: String },
     /// `credential_signing` is set but `signing_service` is missing.
@@ -1239,6 +1249,28 @@ impl fmt::Display for PolicyViolation {
                     f,
                     "network policy '{policy_name}': TLD wildcard '{host}' is not allowed; \
                      use subdomain wildcards like '*.example.com' instead"
+                )
+            }
+            Self::MissingEndpointHost { policy_name } => {
+                write!(
+                    f,
+                    "network policy '{policy_name}': endpoint host must not be empty"
+                )
+            }
+            Self::MissingEndpointPort { policy_name, host } => {
+                write!(
+                    f,
+                    "network policy '{policy_name}': endpoint '{host}' must declare at least one port"
+                )
+            }
+            Self::InvalidEndpointPort {
+                policy_name,
+                host,
+                port,
+            } => {
+                write!(
+                    f,
+                    "network policy '{policy_name}': endpoint '{host}' has invalid port {port}; expected 1..=65535"
                 )
             }
             Self::InvalidHostWildcard { policy_name, host } => {
@@ -1410,6 +1442,31 @@ pub fn validate_sandbox_policy(
             rule.name.clone()
         };
         for ep in &rule.endpoints {
+            if ep.host.trim().is_empty() {
+                violations.push(PolicyViolation::MissingEndpointHost {
+                    policy_name: name.clone(),
+                });
+            }
+            let effective_ports: Vec<u32> = if ep.ports.is_empty() {
+                (ep.port != 0).then_some(ep.port).into_iter().collect()
+            } else {
+                ep.ports.clone()
+            };
+            if effective_ports.is_empty() {
+                violations.push(PolicyViolation::MissingEndpointPort {
+                    policy_name: name.clone(),
+                    host: ep.host.clone(),
+                });
+            }
+            for port in effective_ports {
+                if !(1..=u16::MAX.into()).contains(&port) {
+                    violations.push(PolicyViolation::InvalidEndpointPort {
+                        policy_name: name.clone(),
+                        host: ep.host.clone(),
+                        port,
+                    });
+                }
+            }
             if ep.host.contains('*') && (ep.host.starts_with("*.") || ep.host.starts_with("**.")) {
                 let label_count = ep.host.split('.').count();
                 if label_count <= 2 {
@@ -2398,6 +2455,82 @@ network_policies:
     fn validate_accepts_valid_policy() {
         let policy = restrictive_default_policy();
         assert!(validate_sandbox_policy(&policy).is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_yaml_endpoint_without_host_or_port() {
+        let policy = parse_sandbox_policy(
+            r#"
+version: 1
+network_policies:
+  invalid:
+    endpoints:
+      - host: ""
+        protocol: tcp
+"#,
+        )
+        .expect("policy syntax should parse before semantic validation");
+
+        let violations = validate_sandbox_policy(&policy).expect_err("endpoint is incomplete");
+        assert!(violations.iter().any(|violation| matches!(
+            violation,
+            PolicyViolation::MissingEndpointHost { policy_name } if policy_name == "invalid"
+        )));
+        assert!(violations.iter().any(|violation| matches!(
+            violation,
+            PolicyViolation::MissingEndpointPort { policy_name, .. } if policy_name == "invalid"
+        )));
+    }
+
+    #[test]
+    fn validate_rejects_raw_endpoint_zero_and_out_of_range_ports() {
+        let mut policy = restrictive_default_policy();
+        policy.network_policies.insert(
+            "invalid".into(),
+            NetworkPolicyRule {
+                name: "invalid".into(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "database.example.com".into(),
+                    ports: vec![0, u32::from(u16::MAX) + 1],
+                    protocol: "tcp".into(),
+                    ..Default::default()
+                }],
+                binaries: Vec::new(),
+            },
+        );
+
+        let violations = validate_sandbox_policy(&policy).expect_err("ports are invalid");
+        assert!(violations.iter().any(|violation| matches!(
+            violation,
+            PolicyViolation::InvalidEndpointPort { port: 0, .. }
+        )));
+        assert!(violations.iter().any(|violation| matches!(
+            violation,
+            PolicyViolation::InvalidEndpointPort { port: 65_536, .. }
+        )));
+    }
+
+    #[test]
+    fn validate_rejects_raw_endpoint_without_effective_port() {
+        let mut policy = restrictive_default_policy();
+        policy.network_policies.insert(
+            "invalid".into(),
+            NetworkPolicyRule {
+                name: "invalid".into(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "database.example.com".into(),
+                    ..Default::default()
+                }],
+                binaries: Vec::new(),
+            },
+        );
+
+        let violations = validate_sandbox_policy(&policy).expect_err("port is missing");
+        assert!(violations.iter().any(|violation| matches!(
+            violation,
+            PolicyViolation::MissingEndpointPort { policy_name, host }
+                if policy_name == "invalid" && host == "database.example.com"
+        )));
     }
 
     #[test]
