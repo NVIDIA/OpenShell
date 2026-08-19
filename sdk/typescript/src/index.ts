@@ -32,7 +32,15 @@ export type {
   SandboxPhaseName,
   SandboxPolicy,
   SandboxRef,
+  SandboxResources,
+  SandboxServiceLevel,
   SandboxSpec,
+  SandboxStartup,
+  SandboxTemplateListOptions,
+  SandboxTemplateWorkspaceOptions,
+  SandboxWorkloadConfig,
+  SandboxWorkloadTemplate,
+  SandboxWorkloadTemplateSpec,
   SetPolicyOptions,
   SettingScopeName,
   SettingValue,
@@ -40,6 +48,6 @@ export type {
   UpdateConfigResult,
   WaitOptions,
 } from './client.js';
-export { errorCode, OpenShellClient, SandboxClient } from './client.js';
+export { errorCode, OpenShellClient, SandboxClient, SandboxTemplateClient } from './client.js';
 export type { SdkErrorCode } from './errors.js';
 export { SdkError } from './errors.js';
