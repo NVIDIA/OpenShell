@@ -27,18 +27,6 @@ use super::{
 // Exec request validation
 // ---------------------------------------------------------------------------
 
-/// Preserve process-identity omission only when the compute driver advertises
-/// native image/runtime identity handling. Drivers without the feature retain
-/// the legacy persisted `sandbox:sandbox` defaults.
-pub(super) fn normalize_process_identity_for_driver(
-    policy: &mut ProtoSandboxPolicy,
-    preserves_unspecified_process_identity: bool,
-) {
-    if !preserves_unspecified_process_identity {
-        openshell_policy::ensure_sandbox_process_identity(policy);
-    }
-}
-
 /// Maximum number of arguments in the command array.
 pub(super) const MAX_EXEC_COMMAND_ARGS: usize = 1024;
 /// Maximum length of a single command argument or environment value (bytes).
@@ -1846,33 +1834,6 @@ mod tests {
     }
 
     // ---- Policy safety ----
-
-    #[test]
-    fn process_identity_omission_is_feature_scoped() {
-        use openshell_core::proto::ProcessPolicy;
-
-        let mut policy = ProtoSandboxPolicy {
-            process: Some(ProcessPolicy {
-                run_as_user: "1234".into(),
-                run_as_group: String::new(),
-            }),
-            ..Default::default()
-        };
-        normalize_process_identity_for_driver(&mut policy, true);
-        assert!(policy.process.unwrap().run_as_group.is_empty());
-
-        let mut policy = ProtoSandboxPolicy {
-            process: Some(ProcessPolicy {
-                run_as_user: "1234".into(),
-                run_as_group: String::new(),
-            }),
-            ..Default::default()
-        };
-        normalize_process_identity_for_driver(&mut policy, false);
-        let process = policy.process.unwrap();
-        assert_eq!(process.run_as_user, "1234");
-        assert_eq!(process.run_as_group, "sandbox");
-    }
 
     #[test]
     fn validate_policy_safety_rejects_root_user() {

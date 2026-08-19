@@ -199,8 +199,8 @@ running intent should stop before the gateway exits and restart after it
 returns. Check for `Stopped sandbox during gateway shutdown` and `Started
 sandbox during gateway startup` in gateway logs. A sandbox explicitly stopped
 through the CLI remains stopped. Kubernetes sandboxes are cluster-owned and do
-not follow this local gateway lifecycle. An external driver follows it only
-when `GetCapabilities` advertises `GATEWAY_MANAGED_LIFECYCLE`.
+not follow this local gateway lifecycle. An external driver configured under a
+different name is not included in the local gateway lifecycle sweep.
 
 ### Step 5: Check Podman-Backed Gateways
 

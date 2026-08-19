@@ -24,13 +24,11 @@ references to gateway-internal types. The gateway owns the public
 implementing `ComputeDriver` out of tree.
 
 `compute_driver.proto` is the supported gateway/driver extension boundary.
-At initialization the gateway snapshots additive feature values from
-`GetCapabilities`; unknown values are ignored. Post-initialization lifecycle
-and policy behavior does not depend on the configured or advertised driver
-name. Gateway-managed shutdown/start lifecycle and native process-identity
-defaults are enabled only by their corresponding features. Driver-requested
-listeners are structurally validated and remain restricted to sandbox callback
-RPCs.
+At initialization the gateway snapshots the driver's identity, version, and
+default image from `GetCapabilities`. Process-identity omissions are preserved
+across this boundary so every driver can apply its native image or runtime
+defaults. Driver-requested listeners are structurally validated and remain
+restricted to sandbox callback RPCs.
 
 Drivers own runtime-specific platform event interpretation. When an event should
 drive client provisioning UI, the driver attaches the shared

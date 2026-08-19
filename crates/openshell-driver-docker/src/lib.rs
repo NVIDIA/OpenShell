@@ -494,10 +494,6 @@ impl DockerComputeDriver {
             "docker",
             &self.config.daemon_version,
             &self.config.default_image,
-            [
-                openshell_core::proto::compute::v1::ComputeDriverFeature::GatewayManagedLifecycle,
-                openshell_core::proto::compute::v1::ComputeDriverFeature::PreserveUnspecifiedProcessIdentity,
-            ],
         )
     }
 

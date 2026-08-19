@@ -17,7 +17,7 @@ import "options.proto";
 // - The gateway translates between these driver-native messages and
 //   the public OpenShell API resource model.
 // - Capability fields are additive. Drivers and gateways must ignore unknown
-//   feature values so independently versioned external drivers remain
+//   fields so independently versioned external drivers remain
 //   forward-compatible.
 service ComputeDriver {
   // Report driver capabilities and defaults.
@@ -75,19 +75,6 @@ message GetCapabilitiesResponse {
   string driver_version = 2;
   // Default sandbox image recommended by the driver.
   string default_image = 3;
-  // Optional behavior supported by this driver instance. Unknown values are
-  // ignored and omitted features retain conservative gateway behavior.
-  repeated ComputeDriverFeature features = 6;
-}
-
-enum ComputeDriverFeature {
-  COMPUTE_DRIVER_FEATURE_UNSPECIFIED = 0;
-  // Let the gateway stop persisted running intent during graceful shutdown
-  // and restart that intent when the gateway starts.
-  COMPUTE_DRIVER_FEATURE_GATEWAY_MANAGED_LIFECYCLE = 1;
-  // Preserve omitted process user/group fields so the runtime can apply its
-  // native image or OCI identity defaults.
-  COMPUTE_DRIVER_FEATURE_PRESERVE_UNSPECIFIED_PROCESS_IDENTITY = 2;
 }
 
 message GetGatewayListenerRequirementsRequest {}
