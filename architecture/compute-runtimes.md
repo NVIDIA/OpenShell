@@ -24,11 +24,11 @@ references to gateway-internal types. The gateway owns the public
 implementing `ComputeDriver` out of tree.
 
 `compute_driver.proto` is the supported gateway/driver extension boundary.
-At initialization the gateway snapshots the driver's identity, version, and
-default image from `GetCapabilities`. Process-identity omissions are preserved
-across this boundary so every driver can apply its native image or runtime
-defaults. Driver-requested listeners are structurally validated and remain
-restricted to sandbox callback RPCs.
+At initialization the gateway snapshots the driver's identity, version,
+default image, and gateway-lifecycle preference from `GetCapabilities`.
+Process-identity omissions are preserved across this boundary so every driver
+can apply its native image or runtime defaults. Driver-requested listeners are
+structurally validated and remain restricted to sandbox callback RPCs.
 
 Drivers own runtime-specific platform event interpretation. When an event should
 drive client provisioning UI, the driver attaches the shared
@@ -125,6 +125,11 @@ shared idempotent `StartSandbox` RPC before watch processing begins. Explicitly
 `Stopped` sandboxes are excluded from both sweeps. Kubernetes workloads are
 cluster-owned and continue running without gateway shutdown or startup
 lifecycle calls.
+
+The driver reports this behavior through
+`GetCapabilities.gateway_managed_lifecycle`. The same declaration works for
+in-process and external drivers. Older drivers omit the field and retain the
+conservative operator-managed behavior.
 
 ## Deletion Lifecycle
 

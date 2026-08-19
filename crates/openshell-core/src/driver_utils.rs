@@ -380,11 +380,13 @@ pub fn build_capabilities_response(
     driver_name: &str,
     driver_version: impl Into<String>,
     default_image: impl Into<String>,
+    gateway_managed_lifecycle: bool,
 ) -> GetCapabilitiesResponse {
     GetCapabilitiesResponse {
         driver_name: driver_name.to_string(),
         driver_version: driver_version.into(),
         default_image: default_image.into(),
+        gateway_managed_lifecycle,
     }
 }
 

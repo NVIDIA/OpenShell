@@ -494,6 +494,7 @@ impl DockerComputeDriver {
             "docker",
             &self.config.daemon_version,
             &self.config.default_image,
+            true,
         )
     }
 

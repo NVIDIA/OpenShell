@@ -75,6 +75,9 @@ message GetCapabilitiesResponse {
   string driver_version = 2;
   // Default sandbox image recommended by the driver.
   string default_image = 3;
+  // Whether the gateway should stop running sandbox compute during graceful
+  // shutdown and restart the retained running intent on startup.
+  bool gateway_managed_lifecycle = 6;
 }
 
 message GetGatewayListenerRequirementsRequest {}

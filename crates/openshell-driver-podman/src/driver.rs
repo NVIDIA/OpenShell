@@ -471,6 +471,7 @@ impl PodmanComputeDriver {
             "podman",
             openshell_core::VERSION,
             &self.config.default_image,
+            true,
         ))
     }
 
