@@ -576,7 +576,7 @@ impl russh::server::Handler for SshHandler {
             };
             state.main_attached = true;
             state.input_sender = input;
-            let (replay, mut output) = self.main_session.subscribe();
+            let mut output = self.main_session.subscribe();
             let handle = session.handle();
             session.channel_success(channel)?;
             if let Some(error) = input_warning {
@@ -589,14 +589,6 @@ impl russh::server::Handler for SshHandler {
                     .await;
             }
             let output_task = tokio::spawn(async move {
-                let mut replay_exited = false;
-                for event in replay {
-                    replay_exited |= matches!(event, MainOutput::Exit(_));
-                    send_main_output(&handle, channel, event).await;
-                }
-                if replay_exited {
-                    return;
-                }
                 loop {
                     match output.recv().await {
                         Ok(event) => {
@@ -606,13 +598,14 @@ impl russh::server::Handler for SshHandler {
                                 break;
                             }
                         }
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                        Err(error) => {
                             let _ = handle
                                 .extended_data(
                                     channel,
                                     1,
                                     format!(
-                                        "openshell: attachment fell behind by {skipped} output chunks; reconnect for buffered output\n"
+                                        "openshell: attachment fell behind by {} output chunks; reconnect for buffered output\n",
+                                        error.skipped
                                     )
                                     .into_bytes(),
                                 )
@@ -620,7 +613,6 @@ impl russh::server::Handler for SshHandler {
                             let _ = handle.close(channel).await;
                             break;
                         }
-                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                     }
                 }
             });

@@ -9,20 +9,22 @@ use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
+use bytes::Bytes;
+use nix::fcntl::{FcntlArg, OFlag, fcntl};
 use nix::pty::Winsize;
+use tokio::io::unix::AsyncFd;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Notify;
-use tokio::sync::broadcast;
+use tokio::sync::watch;
 
 use crate::process::ProcessIo;
 
 const OUTPUT_BUFFER_BYTES: usize = 1024 * 1024;
-const OUTPUT_CHANNEL_CHUNKS: usize = 512;
 
 #[derive(Clone, Debug)]
 pub enum MainOutput {
-    Stdout(Vec<u8>),
-    Stderr(Vec<u8>),
+    Stdout(Bytes),
+    Stderr(Bytes),
     Exit(i32),
 }
 
@@ -35,12 +37,134 @@ impl MainOutput {
     }
 }
 
+#[derive(Clone, Debug)]
+struct SequencedOutput {
+    sequence: u64,
+    event: MainOutput,
+}
+
+#[derive(Debug)]
+struct OutputLogState {
+    events: VecDeque<SequencedOutput>,
+    retained_bytes: usize,
+    next_sequence: u64,
+}
+
+#[derive(Debug)]
+struct OutputLog {
+    state: Mutex<OutputLogState>,
+    version: watch::Sender<u64>,
+}
+
+impl OutputLog {
+    fn new() -> Arc<Self> {
+        let (version, _) = watch::channel(0);
+        Arc::new(Self {
+            state: Mutex::new(OutputLogState {
+                events: VecDeque::new(),
+                retained_bytes: 0,
+                next_sequence: 0,
+            }),
+            version,
+        })
+    }
+
+    fn publish(&self, event: MainOutput) {
+        let version = {
+            let mut state = self.state.lock().expect("main output log lock poisoned");
+            let sequence = state.next_sequence;
+            state.next_sequence = state
+                .next_sequence
+                .checked_add(1)
+                .expect("main output sequence exhausted");
+            state.retained_bytes += event.len();
+            state.events.push_back(SequencedOutput { sequence, event });
+            while state.retained_bytes > OUTPUT_BUFFER_BYTES {
+                let Some(removed) = state.events.pop_front() else {
+                    break;
+                };
+                state.retained_bytes = state.retained_bytes.saturating_sub(removed.event.len());
+            }
+            state.next_sequence
+        };
+        self.version.send_replace(version);
+    }
+
+    fn subscribe(self: &Arc<Self>) -> MainOutputCursor {
+        let version = self.version.subscribe();
+        let state = self.state.lock().expect("main output log lock poisoned");
+        let next_sequence = state
+            .events
+            .front()
+            .map_or(state.next_sequence, |retained| retained.sequence);
+        drop(state);
+        MainOutputCursor {
+            output: Arc::clone(self),
+            next_sequence,
+            version,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MainOutputLagged {
+    pub skipped: u64,
+}
+
+pub struct MainOutputCursor {
+    output: Arc<OutputLog>,
+    next_sequence: u64,
+    version: watch::Receiver<u64>,
+}
+
+impl MainOutputCursor {
+    pub async fn recv(&mut self) -> Result<MainOutput, MainOutputLagged> {
+        loop {
+            let next = {
+                let state = self
+                    .output
+                    .state
+                    .lock()
+                    .expect("main output log lock poisoned");
+                let oldest = state
+                    .events
+                    .front()
+                    .map_or(state.next_sequence, |event| event.sequence);
+                if self.next_sequence < oldest {
+                    let skipped = oldest - self.next_sequence;
+                    self.next_sequence = oldest;
+                    return Err(MainOutputLagged { skipped });
+                }
+                if self.next_sequence >= state.next_sequence {
+                    None
+                } else {
+                    let offset = usize::try_from(self.next_sequence - oldest)
+                        .expect("main output cursor offset exceeds usize");
+                    let event = state
+                        .events
+                        .get(offset)
+                        .expect("main output cursor references retained event")
+                        .event
+                        .clone();
+                    self.next_sequence += 1;
+                    Some(event)
+                }
+            };
+            if let Some(event) = next {
+                return Ok(event);
+            }
+            // The log owns a sender for the cursor lifetime, so closure is not
+            // expected. A changed version means there is another event to read.
+            let _ = self.version.changed().await;
+        }
+    }
+}
+
 pub struct MainSession {
     pid: u32,
     terminal: bool,
     input: tokio::sync::mpsc::Sender<Vec<u8>>,
-    output: broadcast::Sender<MainOutput>,
-    replay: Mutex<(VecDeque<MainOutput>, usize)>,
+    output: Arc<OutputLog>,
     input_owner: Mutex<Option<u64>>,
     next_owner: AtomicU64,
     pty_master: Option<Arc<std::fs::File>>,
@@ -52,13 +176,11 @@ impl MainSession {
     #[cfg(test)]
     pub fn inert() -> Arc<Self> {
         let (input, _input_rx) = tokio::sync::mpsc::channel(64);
-        let (output, _) = broadcast::channel(OUTPUT_CHANNEL_CHUNKS);
         Arc::new(Self {
             pid: 1,
             terminal: false,
             input,
-            output,
-            replay: Mutex::new((VecDeque::new(), 0)),
+            output: OutputLog::new(),
             input_owner: Mutex::new(None),
             next_owner: AtomicU64::new(1),
             pty_master: None,
@@ -91,17 +213,18 @@ impl MainSession {
     pub fn new(io: ProcessIo, pid: u32) -> Arc<Self> {
         let terminal = matches!(io, ProcessIo::Pty(_));
         let (input, input_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
-        let (output, _) = broadcast::channel(OUTPUT_CHANNEL_CHUNKS);
         let pty_master = match &io {
-            ProcessIo::Pty(master) => master.try_clone().ok().map(Arc::new),
+            ProcessIo::Pty(master) => {
+                set_nonblocking(master).expect("set canonical PTY master nonblocking");
+                master.try_clone().ok().map(Arc::new)
+            }
             ProcessIo::Pipes { .. } => None,
         };
         let session = Arc::new(Self {
             pid,
             terminal,
             input,
-            output,
-            replay: Mutex::new((VecDeque::new(), 0)),
+            output: OutputLog::new(),
             input_owner: Mutex::new(None),
             next_owner: AtomicU64::new(1),
             pty_master,
@@ -119,25 +242,44 @@ impl MainSession {
     ) {
         match io {
             ProcessIo::Pty(master) => {
-                let mut reader = master.try_clone().expect("PTY master clone");
-                let mut writer = master;
+                let master = Arc::new(AsyncFd::new(master).expect("register canonical PTY master"));
+                let reader = Arc::clone(&master);
                 let output = Arc::clone(this);
-                std::thread::spawn(move || {
+                tokio::spawn(async move {
                     let mut buffer = [0u8; 4096];
                     loop {
-                        match reader.read(&mut buffer) {
-                            Ok(0) | Err(_) => break,
-                            Ok(read) => output.publish(MainOutput::Stdout(buffer[..read].to_vec())),
+                        let Ok(mut ready) = reader.readable().await else {
+                            break;
+                        };
+                        match ready.try_io(|inner| {
+                            let mut file = inner.get_ref();
+                            file.read(&mut buffer)
+                        }) {
+                            Ok(Ok(0) | Err(_)) => break,
+                            Ok(Ok(read)) => output.publish(MainOutput::Stdout(
+                                Bytes::copy_from_slice(&buffer[..read]),
+                            )),
+                            Err(_would_block) => {}
                         }
                     }
                     output.reader_finished();
                 });
-                std::thread::spawn(move || {
-                    while let Some(data) = input_rx.blocking_recv() {
-                        if writer.write_all(&data).is_err() {
-                            break;
+                tokio::spawn(async move {
+                    while let Some(data) = input_rx.recv().await {
+                        let mut remaining = data.as_slice();
+                        while !remaining.is_empty() {
+                            let Ok(mut ready) = master.writable().await else {
+                                return;
+                            };
+                            match ready.try_io(|inner| {
+                                let mut file = inner.get_ref();
+                                file.write(remaining)
+                            }) {
+                                Ok(Ok(0) | Err(_)) => return,
+                                Ok(Ok(written)) => remaining = &remaining[written..],
+                                Err(_would_block) => {}
+                            }
                         }
-                        let _ = writer.flush();
                     }
                 });
             }
@@ -153,7 +295,9 @@ impl MainSession {
                         match stdout.read(&mut buffer).await {
                             Ok(0) | Err(_) => break,
                             Ok(read) => {
-                                stdout_session.publish(MainOutput::Stdout(buffer[..read].to_vec()));
+                                stdout_session.publish(MainOutput::Stdout(Bytes::copy_from_slice(
+                                    &buffer[..read],
+                                )));
                             }
                         }
                     }
@@ -166,7 +310,9 @@ impl MainSession {
                         match stderr.read(&mut buffer).await {
                             Ok(0) | Err(_) => break,
                             Ok(read) => {
-                                stderr_session.publish(MainOutput::Stderr(buffer[..read].to_vec()));
+                                stderr_session.publish(MainOutput::Stderr(Bytes::copy_from_slice(
+                                    &buffer[..read],
+                                )));
                             }
                         }
                     }
@@ -185,22 +331,7 @@ impl MainSession {
     }
 
     fn publish(&self, event: MainOutput) {
-        // Keep replay insertion and live publication under one lock. A new
-        // subscriber takes this same lock before subscribing, so an event is
-        // observed either in the replay snapshot or on the live channel,
-        // never both.
-        {
-            let mut replay = self.replay.lock().expect("main replay lock poisoned");
-            replay.1 += event.len();
-            replay.0.push_back(event.clone());
-            while replay.1 > OUTPUT_BUFFER_BYTES {
-                let Some(removed) = replay.0.pop_front() else {
-                    break;
-                };
-                replay.1 = replay.1.saturating_sub(removed.len());
-            }
-            let _ = self.output.send(event);
-        }
+        self.output.publish(event);
     }
 
     fn reader_finished(&self) {
@@ -217,11 +348,8 @@ impl MainSession {
         self.publish(MainOutput::Exit(exit_code));
     }
 
-    pub fn subscribe(&self) -> (Vec<MainOutput>, broadcast::Receiver<MainOutput>) {
-        let replay = self.replay.lock().expect("main replay lock poisoned");
-        let receiver = self.output.subscribe();
-        let replay = replay.0.iter().cloned().collect();
-        (replay, receiver)
+    pub fn subscribe(&self) -> MainOutputCursor {
+        self.output.subscribe()
     }
 
     pub fn acquire_input(&self) -> Result<(u64, tokio::sync::mpsc::Sender<Vec<u8>>), &'static str> {
@@ -268,6 +396,16 @@ impl MainSession {
     }
 }
 
+fn set_nonblocking(file: &std::fs::File) -> Result<(), nix::errno::Errno> {
+    let flags = fcntl(file.as_raw_fd(), FcntlArg::F_GETFL)?;
+    let flags = OFlag::from_bits_truncate(flags);
+    fcntl(
+        file.as_raw_fd(),
+        FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK),
+    )?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -286,18 +424,18 @@ mod tests {
     #[tokio::test]
     async fn subscribers_receive_replay_then_live_output() {
         let session = MainSession::inert();
-        session.publish(MainOutput::Stdout(b"before".to_vec()));
+        session.publish(MainOutput::Stdout(Bytes::from_static(b"before")));
 
-        let (replay, mut live) = session.subscribe();
+        let mut output = session.subscribe();
         assert!(matches!(
-            replay.as_slice(),
-            [MainOutput::Stdout(data)] if data == b"before"
+            output.recv().await.expect("replayed output"),
+            MainOutput::Stdout(data) if data == b"before"[..]
         ));
 
-        session.publish(MainOutput::Stderr(b"after".to_vec()));
+        session.publish(MainOutput::Stderr(Bytes::from_static(b"after")));
         assert!(matches!(
-            live.recv().await.expect("live output"),
-            MainOutput::Stderr(data) if data == b"after"
+            output.recv().await.expect("live output"),
+            MainOutput::Stderr(data) if data == b"after"[..]
         ));
     }
 
@@ -306,7 +444,68 @@ mod tests {
         let session = MainSession::inert();
         session.finish(0).await;
 
-        let (replay, _live) = session.subscribe();
-        assert!(matches!(replay.as_slice(), [MainOutput::Exit(0)]));
+        let mut output = session.subscribe();
+        assert!(matches!(
+            output.recv().await.expect("replayed exit"),
+            MainOutput::Exit(0)
+        ));
+    }
+
+    #[tokio::test]
+    async fn slow_subscriber_reports_evicted_events_then_resumes() {
+        let session = MainSession::inert();
+        let mut output = session.subscribe();
+        let chunk = Bytes::from(vec![0; 4096]);
+        for _ in 0..=(OUTPUT_BUFFER_BYTES / chunk.len()) {
+            session.publish(MainOutput::Stdout(chunk.clone()));
+        }
+
+        let lag = output.recv().await.expect_err("oldest event was evicted");
+        assert_eq!(lag.skipped, 1);
+        assert!(matches!(
+            output.recv().await.expect("resume at oldest retained event"),
+            MainOutput::Stdout(data) if data.len() == chunk.len()
+        ));
+    }
+
+    #[tokio::test]
+    async fn terminal_pump_reads_output_and_writes_input() {
+        let (session, mut slave) = MainSession::terminal_for_test();
+        set_nonblocking(&slave).expect("set test PTY slave nonblocking");
+        let mut output = session.subscribe();
+
+        slave
+            .write_all(b"process output")
+            .expect("write PTY output");
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), output.recv())
+            .await
+            .expect("PTY output timed out")
+            .expect("PTY output was retained");
+        assert!(matches!(
+            event,
+            MainOutput::Stdout(data) if data == b"process output"[..]
+        ));
+
+        let (owner, input) = session.acquire_input().expect("acquire PTY input");
+        input
+            .send(b"client input\n".to_vec())
+            .await
+            .expect("queue PTY input");
+        let mut received = [0; 64];
+        let read = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                match slave.read(&mut received) {
+                    Ok(read) => break read,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        tokio::task::yield_now().await;
+                    }
+                    Err(error) => panic!("read PTY input: {error}"),
+                }
+            }
+        })
+        .await
+        .expect("PTY input timed out");
+        assert_eq!(&received[..read], b"client input\n");
+        session.release_input(owner);
     }
 }
