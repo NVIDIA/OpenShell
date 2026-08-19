@@ -1603,6 +1603,8 @@ enum SandboxCommands {
     /// Connect to a sandbox.
     ///
     /// When no name is given, reconnects to the last-used sandbox.
+    /// For a TTY main process, Ctrl-C interrupts a foreground job or disconnects
+    /// when the canonical main process owns the terminal foreground.
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Connect {
         /// Sandbox name (defaults to last-used sandbox).

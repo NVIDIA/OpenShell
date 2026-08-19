@@ -688,6 +688,44 @@ impl russh::server::Handler for SshHandler {
             warn!("data on unknown channel {channel:?}");
             return Ok(());
         };
+
+        // OpenSSH sends Ctrl-C as the terminal interrupt byte for a PTY
+        // session. Preserve normal job-control behavior while a foreground
+        // child owns the PTY, but treat Ctrl-C as detach once the canonical
+        // main process group has reclaimed the foreground. This lets a user
+        // interrupt `tail -f`, then press Ctrl-C again at the main shell to
+        // disconnect without terminating the sandbox.
+        let detach_at = state
+            .main_attached
+            .then(|| data.iter().position(|byte| *byte == 0x03))
+            .flatten()
+            .filter(
+                |_| match self.main_session.main_owns_terminal_foreground() {
+                    Ok(owns_foreground) => owns_foreground,
+                    Err(error) => {
+                        tracing::debug!(%error, "failed to read canonical PTY foreground group");
+                        false
+                    }
+                },
+            );
+
+        if let Some(detach_at) = detach_at {
+            // Preserve bytes preceding Ctrl-C in the same SSH data frame, but
+            // suppress the interrupt byte and anything after it because the
+            // attachment is closing.
+            if detach_at > 0
+                && let Some(sender) = state.input_sender.as_ref()
+                && let Err(error) = sender.send(data[..detach_at].to_vec())
+            {
+                self.close_main_attachment(channel, session.handle(), Some(error))
+                    .await;
+                return Ok(());
+            }
+            self.close_main_attachment(channel, session.handle(), None)
+                .await;
+            return Ok(());
+        }
+
         if let Some(sender) = state.input_sender.as_ref()
             && let Err(error) = sender.send(data.to_vec())
         {
@@ -775,6 +813,36 @@ async fn send_main_output(handle: &Handle, channel: ChannelId, event: MainOutput
 }
 
 impl SshHandler {
+    async fn close_main_attachment(
+        &mut self,
+        channel: ChannelId,
+        handle: Handle,
+        error: Option<&str>,
+    ) {
+        if let Some(state) = self.channels.get_mut(&channel) {
+            if let Some(owner) = state.main_input_owner.take() {
+                self.main_session.release_input(owner);
+            }
+            state.input_sender.take();
+            if let Some(task) = state.main_output_task.take() {
+                task.abort();
+            }
+            state.main_attached = false;
+        }
+        if let Some(error) = error {
+            let _ = handle
+                .extended_data(
+                    channel,
+                    1,
+                    format!("openshell: {error}; closing attachment\n").into_bytes(),
+                )
+                .await;
+        }
+        let _ = handle.eof(channel).await;
+        let _ = handle.exit_status_request(channel, 0).await;
+        let _ = handle.close(channel).await;
+    }
+
     fn start_shell(
         &mut self,
         channel: ChannelId,

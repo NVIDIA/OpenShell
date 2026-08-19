@@ -385,6 +385,21 @@ impl MainSession {
         }
     }
 
+    /// Return whether the canonical process group currently owns the PTY
+    /// foreground. Interactive shells give foreground jobs their own process
+    /// groups and reclaim the foreground after those jobs exit.
+    ///
+    /// A pipe-backed process has no terminal foreground and therefore never
+    /// qualifies for Ctrl-C detach behavior.
+    pub fn main_owns_terminal_foreground(&self) -> Result<bool, nix::errno::Errno> {
+        let Some(master) = self.pty_master.as_ref() else {
+            return Ok(false);
+        };
+        let foreground = nix::unistd::tcgetpgrp(master.as_ref())?;
+        let main_pid = i32::try_from(self.pid).unwrap_or(i32::MAX);
+        Ok(foreground == nix::unistd::Pid::from_raw(main_pid))
+    }
+
     pub fn signal_group(&self, signal: nix::sys::signal::Signal) -> Result<(), nix::errno::Errno> {
         let pid = i32::try_from(self.pid).unwrap_or(i32::MAX);
         nix::sys::signal::kill(nix::unistd::Pid::from_raw(-pid), signal)
@@ -419,6 +434,71 @@ mod tests {
         session.release_input(first);
         let (second, _) = session.acquire_input().expect("replacement owner");
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn pipe_main_never_owns_a_terminal_foreground() {
+        let session = MainSession::inert();
+        assert_eq!(session.main_owns_terminal_foreground(), Ok(false));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[allow(
+        unsafe_code,
+        clippy::useless_conversion,
+        reason = "TIOCSCTTY request type differs across Unix libc targets"
+    )]
+    async fn terminal_session_leader_owns_foreground() {
+        use std::os::unix::process::CommandExt;
+        use std::process::{Command, Stdio};
+
+        let pty = nix::pty::openpty(None, None).expect("open test PTY");
+        let master = std::fs::File::from(pty.master);
+        let slave = std::fs::File::from(pty.slave);
+        let slave_fd = slave.as_raw_fd();
+        let mut command = Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg("sleep 30")
+            .stdin(Stdio::from(slave.try_clone().expect("clone PTY stdin")))
+            .stdout(Stdio::from(slave.try_clone().expect("clone PTY stdout")))
+            .stderr(Stdio::from(slave.try_clone().expect("clone PTY stderr")));
+        unsafe {
+            command.pre_exec(move || {
+                if libc::setsid() < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::ioctl(slave_fd, libc::TIOCSCTTY.into(), 0) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::tcsetpgrp(slave_fd, libc::getpid()) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = command.spawn().expect("spawn PTY session leader");
+        drop(slave);
+
+        let session = MainSession::new(ProcessIo::Pty(master), child.id());
+        let observed = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if session.main_owns_terminal_foreground() == Ok(true) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .is_ok();
+
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(
+            observed,
+            "canonical process group did not own PTY foreground"
+        );
     }
 
     #[tokio::test]
