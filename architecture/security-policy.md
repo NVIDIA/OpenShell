@@ -100,17 +100,34 @@ protocols remain raw passthrough.
 ## Credentialed Endpoints
 
 OpenShell keeps provider credentials on paths it can inspect or rewrite by
-default. The gateway derives credential provenance from attached provider
-profiles and stamps it onto the effective policy at composition time. This
-provenance is internal, contains no credential identifiers or values, and is
-never trusted from user-authored policy.
+default. The gateway derives credential provenance from the attached providers
+and stamps it onto the effective policy at composition time. This provenance is
+internal, contains no credential identifiers or values, and is never trusted
+from user-authored policy.
 
 Every evaluation clears provenance across the whole policy and re-derives it
-from the full set of attached provider profiles. The stamp is an assignment,
-not an accumulation, so an endpoint that stops matching a credentialed scope
-loses its marker in the same pass. This must remain a full recomputation: a
-delta-based derivation would let a series of individually valid edits reach a
-state no single edit would have admitted.
+from two sources:
+
+- the endpoints of attached provider profiles that carry credentials, and
+- the valid `credential_binding` entries of the sandbox policy that name an
+  attached provider whose profile is endpointless.
+
+A binding reduces to a host and port scope only. Dropping the path is
+deliberate: a path is not observable on an L4 or `tls: skip` endpoint, so a
+path-scoped derivation would omit the marker on exactly the surfaces the
+uninspected-credential gate exists to catch. A malformed binding — empty
+provider, missing host, or a port outside `1..=65535` — fails the evaluation
+instead of contributing a scope. Bindings naming an endpointful profile or an
+unattached provider contribute nothing; the gateway rejects those uses
+separately.
+
+Both sources merge into one deduplicated scope set, and each endpoint is
+stamped once per evaluation from that set, so binding-derived scopes reach the
+same gates as profile-derived ones. The stamp is an assignment, not an
+accumulation, so an endpoint that stops matching a credentialed scope — or
+whose binding was removed — loses its marker in the same pass. This must remain
+a full recomputation: a delta-based derivation would let a series of
+individually valid edits reach a state no single edit would have admitted.
 
 Credentialed L4-only and `tls: skip` endpoints fail policy validation unless the
 public `allow_uninspected_credentials` escape hatch is explicitly enabled. The

@@ -998,19 +998,23 @@ async fn auto_approve_chunk(
         .as_ref()
         .map(|spec| spec.providers.as_slice())
         .unwrap_or_default();
-    let provider_layers = provider_policy_layers_for_sandbox(
+    let merge_validation = sandbox_policy_merge_validation_data(
         state,
         context.workspace,
         context.sandbox,
         provider_names,
     )
     .await?;
-    let (version, hash) = merge_chunk_into_policy(
+    let credential_binding_context = merge_validation.credential_binding_context();
+    let (version, hash) = merge_chunk_into_policy_with_validation(
         state.store.as_ref(),
         sandbox_id,
         context.workspace,
         &chunk,
-        &provider_layers,
+        PolicyMergeValidationContext {
+            provider_layers: &merge_validation.provider_layers,
+            credential_binding: Some(&credential_binding_context),
+        },
     )
     .await?;
     let chunk_summary = summarize_draft_chunk_rule(&chunk)?;
@@ -1109,7 +1113,7 @@ async fn effective_policy_for_source(
     let providers_v2_enabled =
         bool_setting_enabled(&global_settings, settings::PROVIDERS_V2_ENABLED_KEY)?;
     clear_provider_credentialed_markers(&mut policy);
-    let provider_context = provider_policy_context_with_catalog(
+    let mut provider_context = provider_policy_context_with_catalog(
         state.store.as_ref(),
         catalog,
         workspace,
@@ -1122,6 +1126,12 @@ async fn effective_policy_for_source(
     {
         policy = compose_effective_policy(&policy, &provider_context.layers);
     }
+    let policy_credential_bindings = policy_static_credential_endpoint_bindings(Some(&policy))?;
+    extend_credentialed_scopes_from_policy_bindings(
+        &mut provider_context.credentialed_scopes,
+        &policy_credential_bindings,
+        &provider_context.endpointless_provider_names,
+    );
     stamp_provider_credentialed_endpoints(&mut policy, &provider_context.credentialed_scopes);
 
     Ok(policy)
@@ -1878,7 +1888,7 @@ pub(super) async fn handle_get_sandbox_config(
         load_sandbox_settings(state.store.as_ref(), &workspace, sandbox.object_name()).await?;
     let providers_v2_enabled =
         bool_setting_enabled(&global_settings, settings::PROVIDERS_V2_ENABLED_KEY)?;
-    let provider_policy_context = provider_policy_context_with_catalog(
+    let mut provider_policy_context = provider_policy_context_with_catalog(
         state.store.as_ref(),
         &provider_profile_catalog,
         &workspace,
@@ -1927,6 +1937,12 @@ pub(super) async fn handle_get_sandbox_config(
         policy = Some(effective_policy);
     }
 
+    let policy_credential_bindings = policy_static_credential_endpoint_bindings(policy.as_ref())?;
+    extend_credentialed_scopes_from_policy_bindings(
+        &mut provider_policy_context.credentialed_scopes,
+        &policy_credential_bindings,
+        &provider_policy_context.endpointless_provider_names,
+    );
     if let Some(effective_policy) = policy.as_mut() {
         stamp_provider_credentialed_endpoints(
             effective_policy,
@@ -1958,7 +1974,6 @@ pub(super) async fn handle_get_sandbox_config(
         state.config.policy_validation_failure_mode,
         state.sandbox_jwt_issuer.is_some(),
     );
-    let policy_credential_bindings = policy_static_credential_endpoint_bindings(policy.as_ref())?;
     if let Some(policy) = policy.as_ref() {
         validate_policy_credential_bindings_for_sandbox(
             state.as_ref(),
@@ -2207,6 +2222,7 @@ pub(super) struct CredentialedEndpointScope {
 struct ProviderPolicyContext {
     layers: Vec<ProviderPolicyLayer>,
     credentialed_scopes: Vec<CredentialedEndpointScope>,
+    endpointless_provider_names: HashSet<String>,
 }
 
 async fn provider_policy_context_with_catalog(
@@ -2217,6 +2233,7 @@ async fn provider_policy_context_with_catalog(
 ) -> Result<ProviderPolicyContext, Status> {
     let mut layers = Vec::new();
     let mut credentialed_scopes = Vec::new();
+    let mut endpointless_provider_names = HashSet::new();
 
     for name in provider_names {
         let provider = store
@@ -2242,6 +2259,9 @@ async fn provider_policy_context_with_catalog(
 
         let rule_name = openshell_policy::provider_rule_name(provider.object_name());
         let mut rule = profile.network_policy_rule(&rule_name);
+        if rule.endpoints.is_empty() {
+            endpointless_provider_names.insert(name.clone());
+        }
         if profile.has_credentialed_endpoints() {
             for endpoint in &mut rule.endpoints {
                 endpoint.provider_credentialed = true;
@@ -2263,6 +2283,7 @@ async fn provider_policy_context_with_catalog(
     Ok(ProviderPolicyContext {
         layers,
         credentialed_scopes,
+        endpointless_provider_names,
     })
 }
 
@@ -2274,6 +2295,27 @@ fn endpoint_ports(endpoint: &NetworkEndpoint) -> Vec<u32> {
             .collect()
     } else {
         endpoint.ports.clone()
+    }
+}
+
+fn extend_credentialed_scopes_from_policy_bindings(
+    scopes: &mut Vec<CredentialedEndpointScope>,
+    bindings: &HashMap<String, Vec<StaticCredentialEndpointBinding>>,
+    endpointless_provider_names: &HashSet<String>,
+) {
+    for (provider_name, provider_bindings) in bindings {
+        if !endpointless_provider_names.contains(provider_name) {
+            continue;
+        }
+        for binding in provider_bindings {
+            let scope = CredentialedEndpointScope {
+                host: binding.host.to_ascii_lowercase(),
+                ports: vec![binding.port],
+            };
+            if !scopes.contains(&scope) {
+                scopes.push(scope);
+            }
+        }
     }
 }
 
@@ -2908,23 +2950,10 @@ async fn handle_update_config_inner(
             .ok_or_else(|| Status::internal("sandbox has no spec"))?;
         let merge_ops = parse_merge_operations(&req.merge_operations)?;
         validate_merge_operations_for_server(&merge_ops)?;
-        let provider_layers =
-            provider_policy_layers_for_sandbox(state, &workspace, &sandbox, &spec.providers)
+        let merge_validation =
+            sandbox_policy_merge_validation_data(state, &workspace, &sandbox, &spec.providers)
                 .await?;
-        let provider_profile_catalog = state
-            .provider_profile_sources
-            .snapshot_catalog(state.store.as_ref(), &workspace)
-            .await?;
-        let provider_records = super::provider::load_provider_environment_records(
-            state.store.as_ref(),
-            &workspace,
-            &spec.providers,
-        )
-        .await?;
-        let credential_binding_context = PolicyCredentialBindingValidationContext {
-            catalog: &provider_profile_catalog,
-            records: &provider_records,
-        };
+        let credential_binding_context = merge_validation.credential_binding_context();
         let atomic_context = AtomicPolicyWriteContext {
             expected_resource_version: req.expected_resource_version,
             provenance: &req.annotations,
@@ -2941,7 +2970,7 @@ async fn handle_update_config_inner(
             baseline_policy.as_ref(),
             &merge_ops,
             PolicyMergeValidationContext {
-                provider_layers: &provider_layers,
+                provider_layers: &merge_validation.provider_layers,
                 credential_binding: Some(&credential_binding_context),
             },
             Some(&atomic_context),
@@ -4004,14 +4033,18 @@ async fn handle_approve_draft_chunk_inner(
         .as_ref()
         .map(|spec| spec.providers.as_slice())
         .unwrap_or_default();
-    let provider_layers =
-        provider_policy_layers_for_sandbox(state, &workspace, &sandbox, provider_names).await?;
-    let (version, hash) = merge_chunk_into_policy(
+    let merge_validation =
+        sandbox_policy_merge_validation_data(state, &workspace, &sandbox, provider_names).await?;
+    let credential_binding_context = merge_validation.credential_binding_context();
+    let (version, hash) = merge_chunk_into_policy_with_validation(
         state.store.as_ref(),
         &sandbox_id,
         &workspace,
         &chunk,
-        &provider_layers,
+        PolicyMergeValidationContext {
+            provider_layers: &merge_validation.provider_layers,
+            credential_binding: Some(&credential_binding_context),
+        },
     )
     .await?;
     let chunk_summary = summarize_draft_chunk_rule(&chunk)?;
@@ -4231,8 +4264,13 @@ async fn handle_approve_all_draft_chunks_inner(
         .as_ref()
         .map(|spec| spec.providers.as_slice())
         .unwrap_or_default();
-    let provider_layers =
-        provider_policy_layers_for_sandbox(state, &workspace, &sandbox, provider_names).await?;
+    let merge_validation =
+        sandbox_policy_merge_validation_data(state, &workspace, &sandbox, provider_names).await?;
+    let credential_binding_context = merge_validation.credential_binding_context();
+    let merge_validation_context = PolicyMergeValidationContext {
+        provider_layers: &merge_validation.provider_layers,
+        credential_binding: Some(&credential_binding_context),
+    };
     let mut bulk_candidate =
         current_base_policy_for_sandbox(state.store.as_ref(), &sandbox).await?;
     for chunk in &pending_chunks {
@@ -4250,9 +4288,21 @@ async fn handle_approve_all_draft_chunks_inner(
         bulk_candidate = merge_policy(bulk_candidate, &operations)
             .map_err(map_policy_merge_error)?
             .policy;
+        validate_policy_safety(&bulk_candidate)?;
+        validate_candidate_effective_policy(&bulk_candidate, &merge_validation.provider_layers)?;
+        let mut prefix_effective_policy = if merge_validation.provider_layers.is_empty() {
+            bulk_candidate.clone()
+        } else {
+            compose_effective_policy(&bulk_candidate, &merge_validation.provider_layers)
+        };
+        let prefix_bindings =
+            policy_static_credential_endpoint_bindings(Some(&prefix_effective_policy))?;
+        validate_operator_merged_credential_policy(
+            &mut prefix_effective_policy,
+            &prefix_bindings,
+            &credential_binding_context,
+        )?;
     }
-    validate_policy_safety(&bulk_candidate)?;
-    validate_candidate_effective_policy(&bulk_candidate, &provider_layers)?;
 
     for chunk in &pending_chunks {
         let security_notes = current_draft_chunk_security_notes(chunk)?;
@@ -4277,12 +4327,12 @@ async fn handle_approve_all_draft_chunks_inner(
             "ApproveAllDraftChunks: merging chunk"
         );
 
-        let (version, hash) = merge_chunk_into_policy(
+        let (version, hash) = merge_chunk_into_policy_with_validation(
             state.store.as_ref(),
             &sandbox_id,
             &workspace,
             chunk,
-            &provider_layers,
+            merge_validation_context,
         )
         .await?;
         last_version = version;
@@ -5172,11 +5222,103 @@ struct AtomicPolicyWriteContext<'a> {
 struct PolicyCredentialBindingValidationContext<'a> {
     catalog: &'a EffectiveProviderProfileCatalog,
     records: &'a [super::provider::ProviderEnvironmentRecord],
+    credentialed_scopes: &'a [CredentialedEndpointScope],
+    endpointless_provider_names: &'a HashSet<String>,
 }
 
+struct SandboxPolicyMergeValidationData {
+    provider_layers: Vec<ProviderPolicyLayer>,
+    catalog: EffectiveProviderProfileCatalog,
+    records: Vec<super::provider::ProviderEnvironmentRecord>,
+    credentialed_scopes: Vec<CredentialedEndpointScope>,
+    endpointless_provider_names: HashSet<String>,
+}
+
+impl SandboxPolicyMergeValidationData {
+    fn credential_binding_context(&self) -> PolicyCredentialBindingValidationContext<'_> {
+        PolicyCredentialBindingValidationContext {
+            catalog: &self.catalog,
+            records: &self.records,
+            credentialed_scopes: &self.credentialed_scopes,
+            endpointless_provider_names: &self.endpointless_provider_names,
+        }
+    }
+}
+
+async fn sandbox_policy_merge_validation_data(
+    state: &ServerState,
+    workspace: &str,
+    sandbox: &Sandbox,
+    provider_names: &[String],
+) -> Result<SandboxPolicyMergeValidationData, Status> {
+    let global_settings = load_global_settings(state.store.as_ref()).await?;
+    let composition_enabled = provider_policy_composition_enabled_in(&global_settings)?;
+    let catalog = state
+        .provider_profile_sources
+        .snapshot_catalog(state.store.as_ref(), workspace)
+        .await?;
+    let ProviderPolicyContext {
+        layers,
+        credentialed_scopes,
+        endpointless_provider_names,
+    } = provider_policy_context_with_catalog(
+        state.store.as_ref(),
+        &catalog,
+        workspace,
+        provider_names,
+    )
+    .await?;
+    let provider_layers = if composition_enabled {
+        layers
+    } else {
+        Vec::new()
+    };
+    debug!(
+        sandbox_id = %sandbox.object_id(),
+        provider_layer_count = provider_layers.len(),
+        "Composed provider policy and credential context for merge validation"
+    );
+    let records = super::provider::load_provider_environment_records(
+        state.store.as_ref(),
+        workspace,
+        provider_names,
+    )
+    .await?;
+    Ok(SandboxPolicyMergeValidationData {
+        provider_layers,
+        catalog,
+        records,
+        credentialed_scopes,
+        endpointless_provider_names,
+    })
+}
+
+#[derive(Clone, Copy)]
 struct PolicyMergeValidationContext<'a> {
     provider_layers: &'a [ProviderPolicyLayer],
     credential_binding: Option<&'a PolicyCredentialBindingValidationContext<'a>>,
+}
+
+fn validate_operator_merged_credential_policy(
+    effective_policy: &mut ProtoSandboxPolicy,
+    bindings: &HashMap<String, Vec<StaticCredentialEndpointBinding>>,
+    context: &PolicyCredentialBindingValidationContext<'_>,
+) -> Result<(), Status> {
+    validate_policy_credential_binding_context(
+        context.catalog,
+        context.records,
+        effective_policy,
+        bindings,
+    )?;
+    let mut credentialed_scopes = context.credentialed_scopes.to_vec();
+    extend_credentialed_scopes_from_policy_bindings(
+        &mut credentialed_scopes,
+        bindings,
+        context.endpointless_provider_names,
+    );
+    clear_provider_credentialed_markers(effective_policy);
+    stamp_provider_credentialed_endpoints(effective_policy, &credentialed_scopes);
+    validate_uninspected_credentialed_endpoints(effective_policy)
 }
 
 async fn apply_merge_operations_with_retry(
@@ -5211,19 +5353,14 @@ async fn apply_merge_operations_with_retry(
         }
         validate_policy_safety(&new_policy)?;
         validate_candidate_effective_policy(&new_policy, provider_layers)?;
-        let effective_policy = if provider_layers.is_empty() {
+        let mut effective_policy = if provider_layers.is_empty() {
             new_policy.clone()
         } else {
             compose_effective_policy(&new_policy, provider_layers)
         };
         let bindings = policy_static_credential_endpoint_bindings(Some(&effective_policy))?;
         if let Some(context) = validation_context.credential_binding {
-            validate_policy_credential_binding_context(
-                context.catalog,
-                context.records,
-                &effective_policy,
-                &bindings,
-            )?;
+            validate_operator_merged_credential_policy(&mut effective_policy, &bindings, context)?;
         }
 
         if let Some(ref current) = latest
@@ -5315,12 +5452,12 @@ async fn apply_merge_operations_with_retry(
     )))
 }
 
-pub(super) async fn merge_chunk_into_policy(
+async fn merge_chunk_into_policy_with_validation(
     store: &Store,
     sandbox_id: &str,
     workspace: &str,
     chunk: &DraftChunkRecord,
-    provider_layers: &[ProviderPolicyLayer],
+    validation_context: PolicyMergeValidationContext<'_>,
 ) -> Result<(i64, String), Status> {
     let rule = NetworkPolicyRule::decode(chunk.proposed_rule.as_slice())
         .map_err(|e| Status::internal(format!("decode proposed_rule failed: {e}")))?;
@@ -5335,14 +5472,32 @@ pub(super) async fn merge_chunk_into_policy(
         workspace,
         None,
         &operations,
-        PolicyMergeValidationContext {
-            provider_layers,
-            credential_binding: None,
-        },
+        validation_context,
         None,
     )
     .await
     .map(|(version, hash, _)| (version, hash))
+}
+
+#[cfg(test)]
+async fn merge_chunk_into_policy(
+    store: &Store,
+    sandbox_id: &str,
+    workspace: &str,
+    chunk: &DraftChunkRecord,
+    provider_layers: &[ProviderPolicyLayer],
+) -> Result<(i64, String), Status> {
+    merge_chunk_into_policy_with_validation(
+        store,
+        sandbox_id,
+        workspace,
+        chunk,
+        PolicyMergeValidationContext {
+            provider_layers,
+            credential_binding: None,
+        },
+    )
+    .await
 }
 
 async fn remove_chunk_from_policy(
@@ -5783,6 +5938,67 @@ mod tests {
         assert!(endpoints[0].provider_credentialed);
         assert!(!endpoints[1].provider_credentialed);
         assert!(!endpoints[2].provider_credentialed);
+    }
+
+    #[test]
+    fn policy_bindings_add_scopes_only_for_attached_endpointless_providers() {
+        let mut scopes = vec![CredentialedEndpointScope {
+            host: "profile.example.com".to_string(),
+            ports: vec![443],
+        }];
+        let bindings = HashMap::from([
+            (
+                "bound".to_string(),
+                vec![
+                    StaticCredentialEndpointBinding {
+                        host: "API.Bound.Example".to_string(),
+                        port: 8443,
+                        path: "/v1".to_string(),
+                    },
+                    StaticCredentialEndpointBinding {
+                        host: "api.bound.example".to_string(),
+                        port: 8443,
+                        path: "/v2".to_string(),
+                    },
+                ],
+            ),
+            (
+                "endpointful".to_string(),
+                vec![StaticCredentialEndpointBinding {
+                    host: "profile-bound.example".to_string(),
+                    port: 443,
+                    path: String::new(),
+                }],
+            ),
+            (
+                "unattached".to_string(),
+                vec![StaticCredentialEndpointBinding {
+                    host: "unattached.example".to_string(),
+                    port: 443,
+                    path: String::new(),
+                }],
+            ),
+        ]);
+
+        extend_credentialed_scopes_from_policy_bindings(
+            &mut scopes,
+            &bindings,
+            &HashSet::from(["bound".to_string()]),
+        );
+
+        assert_eq!(
+            scopes,
+            vec![
+                CredentialedEndpointScope {
+                    host: "profile.example.com".to_string(),
+                    ports: vec![443],
+                },
+                CredentialedEndpointScope {
+                    host: "api.bound.example".to_string(),
+                    ports: vec![8443],
+                },
+            ]
+        );
     }
 
     #[test]
@@ -7567,6 +7783,159 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn update_config_gates_uninspected_endpointless_credential_binding() {
+        use openshell_core::proto::{
+            ProviderProfile, ProviderProfileCategory, StoredProviderProfile,
+        };
+
+        let state = test_server_state().await;
+        state
+            .store
+            .put_message(&StoredProviderProfile {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: "profile-endpointless-gating".to_string(),
+                    name: "endpointless-gating".to_string(),
+                    workspace: "default".to_string(),
+                    ..Default::default()
+                }),
+                profile: Some(ProviderProfile {
+                    id: "endpointless-gating".to_string(),
+                    display_name: "Endpointless Gating".to_string(),
+                    category: ProviderProfileCategory::Other as i32,
+                    endpoints: Vec::new(),
+                    ..Default::default()
+                }),
+            })
+            .await
+            .unwrap();
+        state
+            .store
+            .put_message(&test_provider("work-endpointless", "endpointless-gating"))
+            .await
+            .unwrap();
+        let mut sandbox = test_sandbox(
+            "sb-endpointless-gating",
+            "endpointless-gating",
+            ProtoSandboxPolicy::default(),
+            vec!["work-endpointless".to_string()],
+        );
+        sandbox.spec.as_mut().unwrap().policy = None;
+        state.store.put_message(&sandbox).await.unwrap();
+
+        let l4 =
+            test_policy_with_credential_binding("bound", "api.bound.example", "work-endpointless");
+        let add_bound_rule = |policy: &ProtoSandboxPolicy| PolicyMergeOperation {
+            operation: Some(policy_merge_operation::Operation::AddRule(
+                openshell_core::proto::AddNetworkRule {
+                    rule_name: "bound".to_string(),
+                    rule: Some(policy.network_policies["bound"].clone()),
+                },
+            )),
+        };
+        let l4_error = handle_update_config(
+            &state,
+            with_user(Request::new(UpdateConfigRequest {
+                name: "endpointless-gating".to_string(),
+                workspace: "default".to_string(),
+                policy: Some(l4.clone()),
+                ..Default::default()
+            })),
+        )
+        .await
+        .expect_err("L4-only credential binding must be rejected");
+        assert_eq!(l4_error.code(), Code::FailedPrecondition);
+        assert!(l4_error.message().contains("L4-only"));
+
+        let mut tls_skip = l4.clone();
+        let tls_endpoint = &mut tls_skip
+            .network_policies
+            .get_mut("bound")
+            .unwrap()
+            .endpoints[0];
+        tls_endpoint.protocol = "rest".to_string();
+        tls_endpoint.access = "full".to_string();
+        tls_endpoint.tls = "skip".to_string();
+        let tls_error = handle_update_config(
+            &state,
+            with_user(Request::new(UpdateConfigRequest {
+                name: "endpointless-gating".to_string(),
+                workspace: "default".to_string(),
+                policy: Some(tls_skip.clone()),
+                ..Default::default()
+            })),
+        )
+        .await
+        .expect_err("tls: skip credential binding must be rejected");
+        assert_eq!(tls_error.code(), Code::FailedPrecondition);
+        assert!(tls_error.message().contains("tls: skip"));
+
+        let merge_l4_error = handle_update_config(
+            &state,
+            with_user(Request::new(UpdateConfigRequest {
+                name: "endpointless-gating".to_string(),
+                workspace: "default".to_string(),
+                merge_operations: vec![add_bound_rule(&l4)],
+                ..Default::default()
+            })),
+        )
+        .await
+        .expect_err("L4-only credential binding merge must be rejected");
+        assert_eq!(merge_l4_error.code(), Code::FailedPrecondition);
+        assert!(merge_l4_error.message().contains("L4-only"));
+
+        let merge_tls_error = handle_update_config(
+            &state,
+            with_user(Request::new(UpdateConfigRequest {
+                name: "endpointless-gating".to_string(),
+                workspace: "default".to_string(),
+                merge_operations: vec![add_bound_rule(&tls_skip)],
+                ..Default::default()
+            })),
+        )
+        .await
+        .expect_err("tls: skip credential binding merge must be rejected");
+        assert_eq!(merge_tls_error.code(), Code::FailedPrecondition);
+        assert!(merge_tls_error.message().contains("tls: skip"));
+
+        assert!(
+            state
+                .store
+                .get_latest_policy("sb-endpointless-gating")
+                .await
+                .unwrap()
+                .is_none(),
+            "rejected policies must not leave a revision in history"
+        );
+
+        let mut opted_in = l4;
+        opted_in
+            .network_policies
+            .get_mut("bound")
+            .unwrap()
+            .endpoints[0]
+            .allow_uninspected_credentials = true;
+        handle_update_config(
+            &state,
+            with_user(Request::new(UpdateConfigRequest {
+                name: "endpointless-gating".to_string(),
+                workspace: "default".to_string(),
+                merge_operations: vec![add_bound_rule(&opted_in)],
+                ..Default::default()
+            })),
+        )
+        .await
+        .expect("explicit opt-in must admit the endpointless credential binding merge");
+        assert!(
+            state
+                .store
+                .get_latest_policy("sb-endpointless-gating")
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
     async fn update_config_rejects_sigv4_without_credential_source_before_persisting_revision() {
         let state = test_server_state().await;
         let mut sandbox = test_sandbox(
@@ -8346,6 +8715,14 @@ mod tests {
             .credential_binding = Some(NetworkCredentialBinding {
             provider: "work-cloud".to_string(),
         });
+        let bound_endpoint = &mut policy
+            .network_policies
+            .get_mut("cloud_api")
+            .unwrap()
+            .endpoints[0];
+        bound_endpoint.protocol = "rest".to_string();
+        bound_endpoint.access = "full".to_string();
+        bound_endpoint.tls = "terminate".to_string();
         openshell_policy::ensure_sandbox_process_identity(&mut policy);
         state
             .store
@@ -8378,6 +8755,11 @@ mod tests {
         .unwrap()
         .into_inner();
 
+        assert!(
+            config.policy.as_ref().unwrap().network_policies["cloud_api"].endpoints[0]
+                .provider_credentialed,
+            "config delivery must derive provenance from the endpointless binding"
+        );
         assert_eq!(
             environment.environment.get("CLOUD_TOKEN"),
             Some(&"cloud-secret".to_string())
@@ -8433,6 +8815,10 @@ mod tests {
         .unwrap()
         .into_inner();
 
+        assert!(
+            next_config.policy.as_ref().unwrap().network_policies["cloud_api"].endpoints[0]
+                .provider_credentialed
+        );
         assert_ne!(
             config.provider_env_revision, next_config.provider_env_revision,
             "changing the policy binding must rotate the provider environment revision"
@@ -8464,6 +8850,15 @@ mod tests {
         )
         .await
         .expect("removing a policy binding must succeed");
+        let unbound_config = handle_get_sandbox_config(
+            &state,
+            with_user(Request::new(GetSandboxConfigRequest {
+                sandbox_id: "sb-policy-binding".to_string(),
+            })),
+        )
+        .await
+        .unwrap()
+        .into_inner();
         let unbound_environment = handle_get_sandbox_provider_environment(
             &state,
             with_user(Request::new(GetSandboxProviderEnvironmentRequest {
@@ -8475,6 +8870,11 @@ mod tests {
         .unwrap()
         .into_inner();
 
+        assert!(
+            !unbound_config.policy.as_ref().unwrap().network_policies["cloud_api"].endpoints[0]
+                .provider_credentialed,
+            "removing the binding must clear the derived provenance"
+        );
         assert_ne!(
             next_environment.provider_env_revision, unbound_environment.provider_env_revision,
             "removing the binding must rotate the provider environment revision"
@@ -10099,6 +10499,7 @@ mod tests {
             endpoints: vec![NetworkEndpoint {
                 host: "api.github.com".to_string(),
                 port: 443,
+                allow_uninspected_credentials: true,
                 ..Default::default()
             }],
             binaries: vec![NetworkBinary {
@@ -10146,8 +10547,8 @@ mod tests {
         .into_inner();
         assert_eq!(draft_policy.draft_version, 1);
         assert_eq!(draft_policy.chunks.len(), 1);
-        // The proposal is L4 to a host with a credential in scope, so the
-        // prover emits a HIGH finding and the chunk stays pending for the
+        // The proposal explicitly opts in to L4 credentials. The prover emits
+        // a HIGH finding and the security note keeps the chunk pending for the
         // manual approve path this test exercises.
         assert_eq!(draft_policy.chunks[0].status, "pending");
         let chunk_id = draft_policy.chunks[0].id.clone();
@@ -12844,9 +13245,9 @@ mod tests {
         use openshell_core::proto::{NetworkBinary, NetworkEndpoint, SandboxPhase, SandboxSpec};
 
         let state = test_server_state().await;
-        // Attach a github provider so the L4 proposal below has a credential
-        // in scope and the prover emits a HIGH finding — keeps the chunk
-        // pending so this cross-sandbox approve check is reachable.
+        // Attach a github provider so the explicitly opted-in L4 proposal
+        // below has a credential in scope and stays pending, keeping this
+        // cross-sandbox approve check reachable.
         state
             .store
             .put_message(&test_provider("github-pat", "github"))
@@ -12897,6 +13298,7 @@ mod tests {
             endpoints: vec![NetworkEndpoint {
                 host: "api.github.com".to_string(),
                 port: 443,
+                allow_uninspected_credentials: true,
                 ..Default::default()
             }],
             binaries: vec![NetworkBinary {

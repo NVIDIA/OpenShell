@@ -213,11 +213,20 @@ enum EndpointMode {
     TlsSkip,
     L4OptIn,
     RestBody { rewrite: bool },
-    RestBodyBound,
     WebSocket,
 }
 
-fn write_policy(port: u16, mode: EndpointMode) -> Result<NamedTempFile, String> {
+#[derive(Clone, Copy)]
+enum CredentialSource {
+    ProviderProfile,
+    PolicyBinding,
+}
+
+fn write_policy(
+    port: u16,
+    mode: EndpointMode,
+    credential_source: CredentialSource,
+) -> Result<NamedTempFile, String> {
     let mut file = NamedTempFile::new().map_err(|error| format!("create policy: {error}"))?;
     let endpoint_options = match mode {
         EndpointMode::L4 => String::new(),
@@ -228,11 +237,14 @@ fn write_policy(port: u16, mode: EndpointMode) -> Result<NamedTempFile, String> 
         EndpointMode::RestBody { rewrite } => format!(
             "        protocol: rest\n        access: full\n        request_body_credential_rewrite: {rewrite}\n"
         ),
-        EndpointMode::RestBodyBound => format!(
-            "        protocol: rest\n        access: full\n        request_body_credential_rewrite: false\n        credential_binding:\n          provider: {PROVIDER_NAME}\n"
-        ),
         EndpointMode::WebSocket => {
             "        protocol: websocket\n        access: read-write\n".to_string()
+        }
+    };
+    let credential_binding = match credential_source {
+        CredentialSource::ProviderProfile => String::new(),
+        CredentialSource::PolicyBinding => {
+            format!("        credential_binding:\n          provider: {PROVIDER_NAME}\n")
         }
     };
     let policy = format!(
@@ -252,7 +264,7 @@ network_policies:
     endpoints:
       - host: {TEST_HOST}
         port: {port}
-{endpoint_options}        allowed_ips:
+{endpoint_options}{credential_binding}        allowed_ips:
           - "10.0.0.0/8"
           - "172.0.0.0/8"
           - "192.168.0.0/16"
@@ -656,13 +668,16 @@ async fn sandbox_create_failure(policy: &NamedTempFile) -> String {
     output
 }
 
-async fn assert_gateway_admission(port: u16) -> Result<(), String> {
-    let l4 = write_policy(port, EndpointMode::L4)?;
+async fn assert_gateway_admission(
+    port: u16,
+    credential_source: CredentialSource,
+) -> Result<(), String> {
+    let l4 = write_policy(port, EndpointMode::L4, credential_source)?;
     let l4_error = sandbox_create_failure(&l4).await;
     assert!(l4_error.contains("credentialed endpoint"), "{l4_error}");
     assert!(l4_error.contains("L4-only"), "{l4_error}");
 
-    let tls_skip = write_policy(port, EndpointMode::TlsSkip)?;
+    let tls_skip = write_policy(port, EndpointMode::TlsSkip, credential_source)?;
     let tls_error = sandbox_create_failure(&tls_skip).await;
     assert!(tls_error.contains("credentialed endpoint"), "{tls_error}");
     assert!(
@@ -670,11 +685,15 @@ async fn assert_gateway_admission(port: u16) -> Result<(), String> {
         "{tls_error}"
     );
 
-    let opt_in = write_policy(port, EndpointMode::L4OptIn)?;
+    let opt_in = write_policy(port, EndpointMode::L4OptIn, credential_source)?;
     let opt_in_path = opt_in
         .path()
         .to_str()
         .ok_or_else(|| "opt-in policy path is not UTF-8".to_string())?;
+    let accepted_marker = match credential_source {
+        CredentialSource::ProviderProfile => "OPT_IN_ACCEPTED",
+        CredentialSource::PolicyBinding => "ENDPOINTLESS_OPT_IN_ACCEPTED",
+    };
     let mut sandbox = SandboxGuard::create(&[
         "--policy",
         opt_in_path,
@@ -682,16 +701,20 @@ async fn assert_gateway_admission(port: u16) -> Result<(), String> {
         PROVIDER_NAME,
         "--",
         "echo",
-        "OPT_IN_ACCEPTED",
+        accepted_marker,
     ])
     .await?;
-    assert!(sandbox.create_output.contains("OPT_IN_ACCEPTED"));
+    assert!(sandbox.create_output.contains(accepted_marker));
     sandbox.cleanup().await;
     Ok(())
 }
 
-async fn run_body_sandbox(port: u16, mode: EndpointMode) -> Result<String, String> {
-    let policy = write_policy(port, mode)?;
+async fn run_body_sandbox(
+    port: u16,
+    mode: EndpointMode,
+    credential_source: CredentialSource,
+) -> Result<String, String> {
+    let policy = write_policy(port, mode, credential_source)?;
     let policy_path = policy
         .path()
         .to_str()
@@ -714,10 +737,20 @@ async fn run_body_sandbox(port: u16, mode: EndpointMode) -> Result<String, Strin
 }
 
 async fn assert_rest_body_backstop(server: &HttpProbeServer) -> Result<(), String> {
-    let denied = run_body_sandbox(server.port, EndpointMode::RestBody { rewrite: false }).await?;
+    let denied = run_body_sandbox(
+        server.port,
+        EndpointMode::RestBody { rewrite: false },
+        CredentialSource::ProviderProfile,
+    )
+    .await?;
     assert!(denied.contains("BODY_DENIED"));
 
-    let rewritten = run_body_sandbox(server.port, EndpointMode::RestBody { rewrite: true }).await?;
+    let rewritten = run_body_sandbox(
+        server.port,
+        EndpointMode::RestBody { rewrite: true },
+        CredentialSource::ProviderProfile,
+    )
+    .await?;
     assert!(rewritten.contains("BODY_REWRITTEN"));
     assert!(!rewritten.contains(TEST_SECRET));
     assert!(!rewritten.contains(PLACEHOLDER_PREFIX));
@@ -732,7 +765,11 @@ async fn assert_rest_body_backstop(server: &HttpProbeServer) -> Result<(), Strin
 }
 
 async fn assert_websocket_binary_denied(server: &BinaryWebSocketProbeServer) -> Result<(), String> {
-    let policy = write_policy(server.port, EndpointMode::WebSocket)?;
+    let policy = write_policy(
+        server.port,
+        EndpointMode::WebSocket,
+        CredentialSource::ProviderProfile,
+    )?;
     let policy_path = policy
         .path()
         .to_str()
@@ -773,7 +810,7 @@ async fn credentialed_endpoint_gates_work_end_to_end() {
         .expect("install credentialed provider");
 
     let result = async {
-        assert_gateway_admission(server.port).await?;
+        assert_gateway_admission(server.port, CredentialSource::ProviderProfile).await?;
         assert_rest_body_backstop(&server).await?;
         assert_websocket_binary_denied(&websocket_server).await
     }
@@ -786,7 +823,13 @@ async fn credentialed_endpoint_gates_work_end_to_end() {
         .await
         .expect("install endpointless provider");
     let endpointless_result = async {
-        let denied = run_body_sandbox(server.port, EndpointMode::RestBodyBound).await?;
+        assert_gateway_admission(server.port, CredentialSource::PolicyBinding).await?;
+        let denied = run_body_sandbox(
+            server.port,
+            EndpointMode::RestBody { rewrite: false },
+            CredentialSource::PolicyBinding,
+        )
+        .await?;
         assert!(denied.contains("BODY_DENIED"));
         let observations = server.wait_for_observations(3).await;
         assert_eq!(observations.len(), 3, "observations: {observations:?}");
@@ -796,5 +839,5 @@ async fn credentialed_endpoint_gates_work_end_to_end() {
     }
     .await;
     cleanup_provider_resources().await;
-    endpointless_result.expect("endpointless provider REST backstop E2E");
+    endpointless_result.expect("endpointless provider credential gating E2E");
 }
