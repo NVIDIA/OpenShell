@@ -3251,7 +3251,7 @@ type MiddlewareConnector = Arc<
     dyn Fn(
             Vec<openshell_core::proto::SupervisorMiddlewareService>,
             MiddlewareAuthentication,
-        ) -> std::pin::Pin<
+        ) -> Pin<
             Box<
                 dyn std::future::Future<
                         Output = Result<openshell_supervisor_middleware::MiddlewareRegistry>,
