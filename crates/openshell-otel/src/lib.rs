@@ -7,7 +7,9 @@ mod grpc;
 mod propagation;
 
 pub use grpc::RecordGrpcFailure;
-pub use propagation::{HeaderMapExtractor, MetadataMapInjector, TraceContextInterceptor};
+pub use propagation::{
+    EnvTraceContextInterceptor, HeaderMapExtractor, MetadataMapInjector, TraceContextInterceptor,
+};
 
 use opentelemetry::KeyValue;
 use opentelemetry::trace::TracerProvider as _;

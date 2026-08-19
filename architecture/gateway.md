@@ -660,7 +660,11 @@ gRPC failure recording.
 
 The `tower_http` `TraceLayer` in `multiplex.rs` opens a span per inbound request,
 and that span continues incoming W3C trace context when present or starts a new
-trace otherwise. It is named for the RPC and carries the request ID that also
+trace otherwise. The CLI supplies that inbound context passively: its gateway
+gRPC channel carries an `EnvTraceContextInterceptor` (`openshell-otel`) that
+forwards `TRACEPARENT`/`TRACESTATE` from the environment as request metadata, so
+a CI pipeline's trace parents the gateway span without any collector or provider
+on the CLI side. It is named for the RPC and carries the request ID that also
 appears in the gateway's logs — the identifier that lets an operator pivot
 between a trace and its log lines. Store and compute-driver spans become
 children of the request span. Reconciliation, provider refresh, and
