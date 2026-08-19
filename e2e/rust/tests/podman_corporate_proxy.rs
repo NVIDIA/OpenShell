@@ -137,34 +137,61 @@ while True:
     )
 }
 
-// Delimits the proxy's self-signed CA certificate in its stdout, so the test
-// can recover it and hand it back as the corporate CA bundle.
+// Delimits the proxy's CA certificate in its stdout, so the test can recover
+// it and hand it back as the corporate CA bundle.
 const CA_BEGIN: &str = "---PROXY-CA-BEGIN---";
 const CA_END: &str = "---PROXY-CA-END---";
 
-/// A forward proxy that terminates TLS with a self-signed certificate and logs
+/// A forward proxy that terminates TLS with a CA-signed certificate and logs
 /// every CONNECT it sees.
 ///
-/// The certificate is generated in-container (SAN = the proxy alias, which is
-/// the name the supervisor uses for SNI) and printed to stdout between
-/// [`CA_BEGIN`]/[`CA_END`] so the test can trust it via `proxy_ca_bundle`. No
-/// Basic auth: this test isolates the `https://` proxy + corporate-CA path;
-/// credential delivery is covered by the plaintext-proxy test.
+/// The container generates a corporate CA and a separate listener leaf signed
+/// by it (SAN = the proxy alias, which is the name the supervisor uses for
+/// SNI), serves the leaf, and prints the CA between [`CA_BEGIN`]/[`CA_END`] so
+/// the test can trust it via `proxy_ca_bundle`. The listener certificate must
+/// be a leaf: rustls rejects a `CA:TRUE` certificate presented as an
+/// end-entity certificate (`CaUsedAsEndEntity`), so a single self-signed
+/// `openssl req -x509` certificate — which is a CA by default — cannot serve
+/// as both the anchor and the listener identity. Signing a leaf also matches
+/// what a real intercepting proxy does. No Basic auth: this test isolates the
+/// `https://` proxy + corporate-CA path; credential delivery is covered by the
+/// plaintext-proxy test.
 fn tls_proxy_script() -> String {
     format!(
         r"
 import os, select, socket, ssl, subprocess, tempfile, threading
 
 workdir = tempfile.mkdtemp()
-key = os.path.join(workdir, 'key.pem')
-crt = os.path.join(workdir, 'cert.pem')
-subprocess.run(
-    ['openssl', 'req', '-x509', '-newkey', 'rsa:2048', '-nodes',
-     '-keyout', key, '-out', crt, '-days', '1', '-subj', '/CN={PROXY_ALIAS}',
-     '-addext', 'subjectAltName=DNS:{PROXY_ALIAS}'],
-    check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+ca_key = os.path.join(workdir, 'ca-key.pem')
+ca_crt = os.path.join(workdir, 'ca.pem')
+leaf_key = os.path.join(workdir, 'leaf-key.pem')
+leaf_csr = os.path.join(workdir, 'leaf.csr')
+leaf_crt = os.path.join(workdir, 'leaf.pem')
+chain = os.path.join(workdir, 'chain.pem')
+ext = os.path.join(workdir, 'leaf.ext')
 
-with open(crt) as fh:
+def run(*args):
+    subprocess.run(args, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+run('openssl', 'req', '-x509', '-newkey', 'rsa:2048', '-nodes',
+    '-keyout', ca_key, '-out', ca_crt, '-days', '1',
+    '-subj', '/CN=corp-proxy-e2e-ca')
+
+with open(ext, 'w') as fh:
+    fh.write('basicConstraints=critical,CA:FALSE\n'
+             'subjectAltName=DNS:{PROXY_ALIAS}\n'
+             'extendedKeyUsage=serverAuth\n')
+run('openssl', 'req', '-newkey', 'rsa:2048', '-nodes',
+    '-keyout', leaf_key, '-out', leaf_csr, '-subj', '/CN={PROXY_ALIAS}')
+run('openssl', 'x509', '-req', '-in', leaf_csr, '-CA', ca_crt, '-CAkey', ca_key,
+    '-CAcreateserial', '-out', leaf_crt, '-days', '1', '-extfile', ext)
+
+with open(chain, 'w') as out:
+    for part in (leaf_crt, ca_crt):
+        with open(part) as fh:
+            out.write(fh.read())
+
+with open(ca_crt) as fh:
     print('{CA_BEGIN}\n' + fh.read() + '{CA_END}', flush=True)
 
 def log(msg):
@@ -223,7 +250,7 @@ def handle(conn):
         conn.close()
 
 ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-ctx.load_cert_chain(crt, key)
+ctx.load_cert_chain(chain, leaf_key)
 server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 server.bind(('0.0.0.0', {PROXY_PORT}))
@@ -243,7 +270,7 @@ while True:
     )
 }
 
-/// Extract the proxy's self-signed CA certificate PEM from its stdout.
+/// Extract the proxy's CA certificate PEM from its stdout.
 fn ca_cert_from_logs(logs: &str) -> Result<String, String> {
     let start = logs
         .find(CA_BEGIN)
