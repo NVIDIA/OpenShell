@@ -461,11 +461,10 @@ impl UpstreamProxyConfig {
         };
 
         // Cleartext-credential acknowledgement. `Proxy-Authorization: Basic`
-        // travels over plain TCP to the http:// proxy, so credentials are
-        // only sent when the operator explicitly opted in. The compute driver
-        // enforces the same pairing at sandbox-create time; enforcing it here
-        // as well keeps the supervisor fail-closed against a bypassed or
-        // foreign driver.
+        // travels over plain TCP to an http:// proxy, so credentials are
+        // only sent when the operator explicitly opted in. For an https://
+        // proxy the credential is inside the verified TLS session, so the
+        // acknowledgement is unnecessary (but tolerated).
         let allow_insecure = match auth_allow_insecure.as_deref().map(str::trim) {
             None => false,
             Some("true") => true,
@@ -480,7 +479,7 @@ impl UpstreamProxyConfig {
                 "{ARG_PROXY_AUTH_ALLOW_INSECURE} is set but no {ARG_PROXY_AUTH_FILE} is configured"
             ));
         }
-        if auth_file.is_some() && !allow_insecure {
+        if auth_file.is_some() && !allow_insecure && !secure {
             return Err(format!(
                 "{ARG_PROXY_AUTH_FILE} sends the credential as cleartext Basic auth \
                  over the plain-TCP proxy connection; refusing without \
@@ -1443,7 +1442,7 @@ mod tests {
     }
 
     #[test]
-    fn auth_file_without_insecure_acknowledgement_is_fatal() {
+    fn auth_file_without_insecure_acknowledgement_is_fatal_for_http_proxy() {
         // Basic auth over the plain-TCP proxy connection is readable on the
         // network path; sending it requires the explicit opt-in.
         let err = config_from(&[
@@ -1453,6 +1452,23 @@ mod tests {
         .unwrap_err();
         assert!(err.contains(PROXY_AUTH_ALLOW_INSECURE), "{err}");
         assert!(err.contains("cleartext"), "{err}");
+    }
+
+    #[test]
+    fn auth_file_without_insecure_acknowledgement_is_allowed_for_https_proxy() {
+        install_crypto_provider();
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), "user:secret\n").unwrap();
+        let path = file.path().to_str().unwrap().to_string();
+        let cfg = config_ok(&[
+            (HTTPS_PROXY, "https://proxy.corp.com:3130"),
+            (PROXY_AUTH_FILE, &path),
+        ]);
+        let ep = proxy_endpoint(&cfg, "example.com").unwrap();
+        assert!(
+            ep.proxy_authorization.is_some(),
+            "https:// proxy must accept auth without the insecure acknowledgement"
+        );
     }
 
     #[test]

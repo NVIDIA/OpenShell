@@ -703,14 +703,16 @@ health_check_interval_secs = 10
 # supervisor, so a credential accepted here is never rejected in-container.
 # Keep gateway.toml and the auth file owner-readable only (mode 0600).
 #
-# WARNING: the supervisor sends the credential as a Proxy-Authorization:
-# Basic header over the plain-TCP connection to the http:// proxy. Basic
+# WARNING: with an http:// proxy the supervisor sends the credential as a
+# Proxy-Authorization: Basic header over the plain-TCP connection. Basic
 # auth is base64, not encryption: anyone on the network path between the
 # sandbox host and the proxy can recover the credential. Because of that,
-# proxy_auth_file requires the explicit acknowledgement
-# proxy_auth_allow_insecure = true; without it the configuration is
-# rejected at gateway startup. Only opt in when the path to the proxy is a
-# trusted network segment.
+# proxy_auth_file with an http:// proxy requires the explicit
+# acknowledgement proxy_auth_allow_insecure = true; without it the
+# configuration is rejected at gateway startup. Only opt in when the path
+# to the proxy is a trusted network segment. For an https:// proxy the
+# credential is sent inside the verified TLS session, so the
+# acknowledgement is not required (but tolerated if set).
 #
 # proxy_ca_bundle points at a PEM CA bundle (on the gateway host) trusted for
 # the corporate proxy. A CA certificate is not secret, so the gateway
