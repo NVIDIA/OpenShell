@@ -1634,18 +1634,6 @@ async fn run_refresh_worker_tick(
             }
             continue;
         }
-        let strategy = ProviderCredentialRefreshStrategy::try_from(state.strategy)
-            .unwrap_or(ProviderCredentialRefreshStrategy::Unspecified);
-        if !is_gateway_mintable_strategy(strategy) {
-            warn!(
-                provider = %state.provider_name,
-                credential_key = %state.credential_key,
-                strategy = %refresh_strategy_name(state.strategy),
-                status = %state.status,
-                "skipping non-gateway-mintable provider credential refresh state"
-            );
-            continue;
-        }
         let mut state = match migrate_inline_secret_material(store, credentials, &state).await {
             Ok(state) => state,
             Err(err) => {
@@ -1671,6 +1659,18 @@ async fn run_refresh_worker_tick(
                 error = %err,
                 "provider refresh material cleanup failed; continuing with live refresh"
             );
+        }
+        let strategy = ProviderCredentialRefreshStrategy::try_from(state.strategy)
+            .unwrap_or(ProviderCredentialRefreshStrategy::Unspecified);
+        if !is_gateway_mintable_strategy(strategy) {
+            warn!(
+                provider = %state.provider_name,
+                credential_key = %state.credential_key,
+                strategy = %refresh_strategy_name(state.strategy),
+                status = %state.status,
+                "skipping non-gateway-mintable provider credential refresh state"
+            );
+            continue;
         }
         let due = state.next_refresh_at_ms <= 0 || state.next_refresh_at_ms <= now_ms;
         let rotation_requested = state.status == "rotation_requested";
@@ -2689,6 +2689,63 @@ mod tests {
             !stored_provider
                 .credentials
                 .contains_key("MS_GRAPH_ACCESS_TOKEN")
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_worker_migrates_legacy_secrets_before_skipping_non_mintable_state() {
+        let store = test_store().await;
+        let provider = provider("legacy-external", "outlook");
+        store.put_message(&provider).await.unwrap();
+        let state = new_refresh_state(
+            &provider,
+            "default",
+            "MS_GRAPH_ACCESS_TOKEN",
+            NewRefreshStateConfig {
+                strategy: ProviderCredentialRefreshStrategy::External,
+                material: HashMap::from([(
+                    "legacy_secret".to_string(),
+                    "move-me-out-of-the-database".to_string(),
+                )]),
+                secret_material_keys: vec!["legacy_secret".to_string()],
+                expires_at_ms: 0,
+                token_url: String::new(),
+                scopes: Vec::new(),
+                refresh_before_seconds: 0,
+                max_lifetime_seconds: 0,
+                additional_output_keys: HashMap::new(),
+            },
+        )
+        .unwrap();
+        put_refresh_state(&store, &state).await.unwrap();
+        let credentials = test_credentials();
+
+        run_refresh_worker_tick(&store, Some(&credentials), None)
+            .await
+            .unwrap();
+
+        let stored = get_refresh_state(
+            &store,
+            "default",
+            provider.object_id(),
+            "MS_GRAPH_ACCESS_TOKEN",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(!stored.material.contains_key("legacy_secret"));
+        assert!(stored.secret_material_handles.contains_key("legacy_secret"));
+        assert_eq!(stored.status, "configured");
+        assert_eq!(
+            credentials
+                .resolve_refresh_material(
+                    refresh_material_scope(&stored),
+                    &stored.secret_material_handles,
+                )
+                .await
+                .unwrap()
+                .get("legacy_secret"),
+            Some(&"move-me-out-of-the-database".to_string())
         );
     }
 
