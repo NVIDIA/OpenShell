@@ -48,6 +48,13 @@ struct RelayGateway {
 
 #[tonic::async_trait]
 impl OpenShell for RelayGateway {
+    async fn get_current_user(
+        &self,
+        _request: tonic::Request<openshell_core::proto::GetCurrentUserRequest>,
+    ) -> Result<Response<openshell_core::proto::GetCurrentUserResponse>, Status> {
+        Err(Status::unimplemented("not used by this test server"))
+    }
+
     type RelayStreamStream = std::pin::Pin<
         Box<dyn tokio_stream::Stream<Item = Result<RelayFrame, Status>> + Send + 'static>,
     >;
@@ -120,6 +127,18 @@ impl OpenShell for RelayGateway {
     async fn create_sandbox(
         &self,
         _: tonic::Request<openshell_core::proto::CreateSandboxRequest>,
+    ) -> Result<Response<openshell_core::proto::SandboxResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+    async fn stop_sandbox(
+        &self,
+        _: tonic::Request<openshell_core::proto::StopSandboxRequest>,
+    ) -> Result<Response<openshell_core::proto::SandboxResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+    async fn start_sandbox(
+        &self,
+        _: tonic::Request<openshell_core::proto::StartSandboxRequest>,
     ) -> Result<Response<openshell_core::proto::SandboxResponse>, Status> {
         Err(Status::unimplemented("unused"))
     }

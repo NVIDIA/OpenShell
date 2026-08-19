@@ -64,6 +64,8 @@ pip-log.txt
 pip-delete-this-directory.txt
 
 # Unit test / coverage reports
+coverage.out
+coverage/
 htmlcov/
 .tox/
 .nox/
@@ -230,3 +232,6 @@ scripts/lint-mermaid/node_modules/
 # Nix
 /result
 /result-*
+
+# Bazel
+bazel-*

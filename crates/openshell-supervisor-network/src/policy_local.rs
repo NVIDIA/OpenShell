@@ -24,7 +24,7 @@ pub const POLICY_LOCAL_HOST: &str = "policy.local";
 /// Single source of truth: the skill installer writes here, the L7 deny body
 /// references this path in `next_steps`, and the skill's own documentation
 /// renders the same path. Changing the location is a one-line update here.
-pub const SKILL_PATH: &str = "/etc/openshell/skills/policy_advisor.md";
+pub use openshell_core::container_paths::POLICY_ADVISOR_SKILL_PATH as SKILL_PATH;
 
 /// Human-readable guidance for agents that are more likely to follow plain
 /// instructions than structured next-step JSON alone.
@@ -1167,6 +1167,8 @@ fn network_endpoint_from_json(
         allow_encoded_slash: endpoint.allow_encoded_slash,
         websocket_credential_rewrite: false,
         request_body_credential_rewrite: false,
+        allow_uninspected_credentials: false,
+        provider_credentialed: false,
         advisor_proposed: false,
         // GraphQL persisted-query knobs and path scoping default empty —
         // agent proposals don't author them today.
@@ -1179,6 +1181,8 @@ fn network_endpoint_from_json(
         credential_signing: String::new(),
         signing_service: String::new(),
         signing_region: String::new(),
+        // policy.local proposals cannot reference a concrete sandbox provider.
+        credential_binding: None,
     })
 }
 

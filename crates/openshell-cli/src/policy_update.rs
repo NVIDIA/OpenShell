@@ -351,6 +351,8 @@ fn parse_add_endpoint_spec(spec: &str) -> Result<NetworkEndpoint> {
     Ok(endpoint)
 }
 
+const ALLOWED_IP_OPTION_PREFIX: &str = "allowed-ip=";
+
 fn apply_add_endpoint_options(
     spec: &str,
     endpoint: &mut NetworkEndpoint,
@@ -368,6 +370,9 @@ fn apply_add_endpoint_options(
             ));
         }
         match option {
+            "allow-uninspected-credentials" => {
+                endpoint.allow_uninspected_credentials = true;
+            }
             "websocket-credential-rewrite" => {
                 ensure_websocket_credential_rewrite_protocol(spec, endpoint)?;
                 endpoint.websocket_credential_rewrite = true;
@@ -376,35 +381,38 @@ fn apply_add_endpoint_options(
                 ensure_request_body_credential_rewrite_protocol(spec, endpoint)?;
                 endpoint.request_body_credential_rewrite = true;
             }
+            _ if option.starts_with(ALLOWED_IP_OPTION_PREFIX) => {
+                let allowed_ip =
+                    parse_allowed_ip_value(spec, &option[ALLOWED_IP_OPTION_PREFIX.len()..])?;
+                if !endpoint.allowed_ips.contains(&allowed_ip) {
+                    endpoint.allowed_ips.push(allowed_ip);
+                }
+            }
             _ => {
-                let Some(allowed_ip) = option.strip_prefix("allowed-ip=") else {
-                    return Err(miette!(
-                        "--add-endpoint options segment supports only 'websocket-credential-rewrite', 'request-body-credential-rewrite', and 'allowed-ip=<CIDR-or-IP>'; got '{option}' in '{spec}'"
-                    ));
-                };
-                let allowed_ip = allowed_ip.trim();
-                if allowed_ip.is_empty() {
-                    return Err(miette!(
-                        "--add-endpoint allowed-ip option must include a CIDR or IP value in '{spec}'"
-                    ));
-                }
-                if allowed_ip.contains(char::is_whitespace) {
-                    return Err(miette!(
-                        "--add-endpoint allowed-ip option must not contain whitespace in '{spec}'"
-                    ));
-                }
-                if !endpoint
-                    .allowed_ips
-                    .iter()
-                    .any(|existing| existing == allowed_ip)
-                {
-                    endpoint.allowed_ips.push(allowed_ip.to_string());
-                }
+                return Err(miette!(
+                    "--add-endpoint options segment supports only 'allow-uninspected-credentials', 'websocket-credential-rewrite', 'request-body-credential-rewrite', and 'allowed-ip=<CIDR-or-IP>'; got '{option}' in '{spec}'"
+                ));
             }
         }
     }
 
     Ok(())
+}
+
+/// Validate the value part of an `allowed-ip=<CIDR-or-IP>` endpoint option.
+fn parse_allowed_ip_value(spec: &str, value: &str) -> Result<String> {
+    let allowed_ip = value.trim();
+    if allowed_ip.is_empty() {
+        return Err(miette!(
+            "--add-endpoint allowed-ip option must include a CIDR or IP value in '{spec}'"
+        ));
+    }
+    if allowed_ip.contains(char::is_whitespace) {
+        return Err(miette!(
+            "--add-endpoint allowed-ip option must not contain whitespace in '{spec}'"
+        ));
+    }
+    Ok(allowed_ip.to_string())
 }
 
 fn parse_host(flag: &str, spec: &str, host: &str) -> Result<String> {
@@ -454,6 +462,7 @@ fn dedup_strings(values: &[String]) -> Vec<String> {
 mod tests {
     use super::{
         PolicyUpdatePlan, build_policy_update_plan as build_policy_update_plan_with_options,
+        parse_allowed_ip_value,
     };
     use openshell_policy::PolicyMergeOp;
 
@@ -605,6 +614,25 @@ mod tests {
     }
 
     #[test]
+    fn parse_add_endpoint_enables_allow_uninspected_credentials() {
+        let plan = build_policy_update_plan(
+            &["api.vendor.example:443::::allow-uninspected-credentials".to_string()],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            None,
+        )
+        .expect("plan should build");
+
+        let PolicyMergeOp::AddRule { rule, .. } = &plan.preview_operations[0] else {
+            panic!("expected add-rule preview");
+        };
+        assert!(rule.endpoints[0].allow_uninspected_credentials);
+    }
+
+    #[test]
     fn parse_add_endpoint_merges_allowed_ips_with_websocket_options() {
         let plan = build_policy_update_plan(
             &[
@@ -663,6 +691,28 @@ mod tests {
         )
         .expect_err("plan should fail");
         assert!(error.to_string().contains("allowed-ip option"));
+    }
+
+    #[test]
+    fn parse_allowed_ip_value_accepts_trimmed_cidr_and_ip() {
+        assert_eq!(
+            parse_allowed_ip_value("spec", "10.0.0.0/8").expect("CIDR should parse"),
+            "10.0.0.0/8"
+        );
+        assert_eq!(
+            parse_allowed_ip_value("spec", "  192.168.1.10  ").expect("IP should parse"),
+            "192.168.1.10"
+        );
+    }
+
+    #[test]
+    fn parse_allowed_ip_value_rejects_empty_and_interior_whitespace() {
+        let empty = parse_allowed_ip_value("spec", "   ").expect_err("empty value must fail");
+        assert!(empty.to_string().contains("must include a CIDR or IP"));
+
+        let spaced =
+            parse_allowed_ip_value("spec", "10.0.0.0/8 172.16.0.0/12").expect_err("must fail");
+        assert!(spaced.to_string().contains("must not contain whitespace"));
     }
 
     #[test]

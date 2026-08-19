@@ -54,6 +54,10 @@ pub struct ProxyResponse {
     pub status: u16,
     pub headers: Vec<(String, String)>,
     pub body: bytes::Bytes,
+    /// Model identity of the route that produced this response.
+    pub route_model: Option<String>,
+    /// Endpoint of the route that produced this response.
+    pub route_endpoint: Option<String>,
 }
 
 /// Response from a proxied HTTP request where the body can be streamed
@@ -61,6 +65,10 @@ pub struct ProxyResponse {
 pub struct StreamingProxyResponse {
     pub status: u16,
     pub headers: Vec<(String, String)>,
+    /// Model identity of the route that produced this response.
+    pub route_model: Option<String>,
+    /// Endpoint of the route that produced this response.
+    pub route_endpoint: Option<String>,
     /// Either a live response to stream from, or a pre-buffered body (for mock routes).
     body: StreamingBody,
 }
@@ -82,12 +90,24 @@ const VERTEX_ANTHROPIC_VERSION: &str = "vertex-2023-10-16";
 const COMMON_INFERENCE_REQUEST_HEADERS: [&str; 4] =
     ["content-type", "accept", "accept-encoding", "user-agent"];
 
+/// Anthropic-SDK-only body fields that Vertex AI rawPredict does not accept.
+/// Vertex AI's rawPredict endpoint uses strict pydantic validation and rejects
+/// any extra inputs not in its schema. The Anthropic SDKs' native Vertex
+/// transport (`AnthropicVertex`) strips these automatically; we must do the same
+/// when proxying through `inference.local`.
+///
+/// `model` is handled separately (rewritten or stripped depending on route type)
+/// and is intentionally omitted here.
+const VERTEX_UNSUPPORTED_BODY_FIELDS: &[&str] = &["context_management"];
+
 impl StreamingProxyResponse {
     /// Create from a fully-buffered [`ProxyResponse`] (for mock routes).
     pub fn from_buffered(resp: ProxyResponse) -> Self {
         Self {
             status: resp.status,
             headers: resp.headers,
+            route_model: resp.route_model,
+            route_endpoint: resp.route_endpoint,
             body: StreamingBody::Buffered(Some(resp.body)),
         }
     }
@@ -281,11 +301,12 @@ fn prepare_backend_request(
                 let needs_vertex_anthropic_version = is_vertex_anthropic_rawpredict_route(route);
                 if needs_vertex_anthropic_version {
                     // Vertex AI rawPredict encodes the model in the URL path, not
-                    // the request body. Clients using the standard Anthropic API
-                    // (e.g. Claude Code via inference.local) always send "model"
-                    // in the body; strip it so Vertex AI does not reject the
-                    // request with "Extra inputs are not permitted".
+                    // the request body. Strip "model" and any Anthropic-SDK-only
+                    // beta fields that Vertex's strict pydantic validation rejects.
                     obj.remove("model");
+                    for field in VERTEX_UNSUPPORTED_BODY_FIELDS {
+                        obj.remove(*field);
+                    }
                 } else if route_is_bedrock(route) {
                     // AWS Bedrock InvokeModel encodes the model in the URL
                     // path; the request body is the raw provider-specific
@@ -674,6 +695,8 @@ pub async fn proxy_to_backend(
         status,
         headers: resp_headers,
         body,
+        route_model: Some(route.model.clone()),
+        route_endpoint: Some(route.endpoint.clone()),
     })
 }
 
@@ -741,6 +764,8 @@ pub async fn proxy_to_backend_streaming(
     Ok(StreamingProxyResponse {
         status,
         headers: resp_headers,
+        route_model: Some(route.model.clone()),
+        route_endpoint: Some(route.endpoint.clone()),
         body: StreamingBody::Live(response),
     })
 }
@@ -824,8 +849,12 @@ fn build_backend_url(endpoint: &str, path: &str) -> String {
             let base_path = &base[path_start..];
             base_path.starts_with("/v1/") || base_path.ends_with("/v1")
         });
-    if base_path_has_v1_edge_segment && (path == "/v1" || path.starts_with("/v1/")) {
-        return format!("{base}{}", &path[3..]);
+    if base_path_has_v1_edge_segment
+        && let Some(rest) = path
+            .strip_prefix("/v1")
+            .filter(|rest| rest.is_empty() || rest.starts_with('/'))
+    {
+        return format!("{base}{rest}");
     }
 
     format!("{base}{path}")
@@ -967,8 +996,8 @@ fn is_vertex_anthropic_rawpredict_route(route: &ResolvedRoute) -> bool {
 mod tests {
     use super::{
         ValidationFailure, ValidationFailureKind, build_backend_url, build_provider_url,
-        parse_bedrock_invocation_path, prepare_backend_request, rewrite_bedrock_path,
-        route_is_bedrock, verify_backend_endpoint,
+        parse_bedrock_invocation_path, prepare_backend_request, proxy_to_backend,
+        rewrite_bedrock_path, route_is_bedrock, verify_backend_endpoint,
     };
     use crate::RouterError;
     use crate::config::{DEFAULT_ROUTE_TIMEOUT, ResolvedRoute};
@@ -1971,6 +2000,128 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn vertex_ai_body_strips_unsupported_beta_fields() {
+        let mock_server = MockServer::start().await;
+
+        let base_path = "/v1/projects/my-project/locations/us-east5/publishers/anthropic/models";
+        let route = ResolvedRoute {
+            name: "vertex-anthropic".to_string(),
+            endpoint: format!("{}{base_path}", mock_server.uri()),
+            model: "claude-sonnet-4-6@20250514".to_string(),
+            api_key: "ya29.token".to_string(),
+            protocols: vec!["anthropic_messages".to_string()],
+            auth: AuthHeader::Bearer,
+            default_headers: Vec::new(),
+            passthrough_headers: Vec::new(),
+            timeout: DEFAULT_ROUTE_TIMEOUT,
+            model_in_path: true,
+            request_path_override: Some(":rawPredict".to_string()),
+        };
+
+        Mock::given(method("POST"))
+            .and(path(format!(
+                "{base_path}/claude-sonnet-4-6@20250514:rawPredict"
+            )))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"id": "msg_1"})),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let client = reqwest::Client::builder().build().unwrap();
+        let body = bytes::Bytes::from(
+            serde_json::to_vec(&serde_json::json!({
+                "model": "claude-sonnet-4-6-20250514",
+                "messages": [{"role": "user", "content": "ping"}],
+                "max_tokens": 32,
+                "context_management": {"enabled": true},
+            }))
+            .unwrap(),
+        );
+        let headers = vec![("content-type".to_string(), "application/json".to_string())];
+
+        let (builder, _url) = prepare_backend_request(
+            &client,
+            &route,
+            "POST",
+            "/v1/messages",
+            &headers,
+            body,
+            false,
+        )
+        .unwrap();
+
+        let response = builder.send().await.unwrap();
+        assert_eq!(response.status().as_u16(), 200);
+        let received = mock_server.received_requests().await.unwrap();
+        let received_body: serde_json::Value = serde_json::from_slice(&received[0].body).unwrap();
+        let obj = received_body.as_object().unwrap();
+        assert!(
+            !obj.contains_key("context_management"),
+            "context_management must be stripped for Vertex AI rawPredict, got: {received_body}"
+        );
+        assert!(
+            !obj.contains_key("model"),
+            "model must also be stripped for Vertex AI rawPredict, got: {received_body}"
+        );
+        assert!(
+            obj.contains_key("messages"),
+            "standard fields must be preserved, got: {received_body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn direct_anthropic_preserves_beta_fields() {
+        let route = ResolvedRoute {
+            name: "direct-anthropic".to_string(),
+            endpoint: "https://api.anthropic.com/v1".to_string(),
+            model: "claude-sonnet-4-6-20250514".to_string(),
+            api_key: "sk-test".to_string(),
+            protocols: vec!["anthropic_messages".to_string()],
+            auth: AuthHeader::Custom("x-api-key"),
+            default_headers: Vec::new(),
+            passthrough_headers: Vec::new(),
+            timeout: DEFAULT_ROUTE_TIMEOUT,
+            model_in_path: false,
+            request_path_override: None,
+        };
+
+        let client = reqwest::Client::builder().build().unwrap();
+        let body = bytes::Bytes::from(
+            serde_json::to_vec(&serde_json::json!({
+                "model": "claude-sonnet-4-6-20250514",
+                "messages": [{"role": "user", "content": "ping"}],
+                "max_tokens": 32,
+                "context_management": {"enabled": true},
+            }))
+            .unwrap(),
+        );
+        let headers = vec![("content-type".to_string(), "application/json".to_string())];
+
+        let (builder, _url) = prepare_backend_request(
+            &client,
+            &route,
+            "POST",
+            "/v1/messages",
+            &headers,
+            body,
+            false,
+        )
+        .unwrap();
+
+        let request = builder.build().unwrap();
+        let sent_body: serde_json::Value =
+            serde_json::from_slice(request.body().unwrap().as_bytes().unwrap()).unwrap();
+        assert!(
+            sent_body
+                .as_object()
+                .unwrap()
+                .contains_key("context_management"),
+            "context_management must be preserved for direct Anthropic API routes"
+        );
+    }
+
+    #[tokio::test]
     async fn vertex_ai_body_preserves_client_anthropic_version() {
         // When the client already sends anthropic_version, the router must NOT overwrite it.
         let mock_server = MockServer::start().await;
@@ -2457,6 +2608,90 @@ mod tests {
         assert!(
             received_body.get("messages").is_some(),
             "messages field should pass through unchanged"
+        );
+    }
+
+    /// Vertex AI's OpenAI-compatible endpoint requires the body `model` field to
+    /// carry a publisher prefix (e.g. `google/gemini-2.5-flash`). This test
+    /// simulates the fix: `resolve_vertex_ai_route` sets `route.model` to the
+    /// prefixed form, and the body rewrite here forwards that value to Vertex.
+    ///
+    /// The mock server only accepts the prefixed form — matching Vertex's
+    /// behaviour — and returns 400 "Malformed publisher model" for the bare name.
+    #[tokio::test]
+    async fn vertex_openai_compat_rewrites_body_model_to_publisher_prefixed_form() {
+        let mock_server = MockServer::start().await;
+
+        // Simulate Vertex accepting only the publisher-prefixed model name.
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(body_partial_json(
+                serde_json::json!({"model": "google/gemini-2.5-flash"}),
+            ))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({"choices": [{"message": {"content": "hi"}}]}),
+                ),
+            )
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        // Simulate Vertex rejecting the bare model name — the pre-fix failure.
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(body_partial_json(
+                serde_json::json!({"model": "gemini-2.5-flash"}),
+            ))
+            .respond_with(ResponseTemplate::new(400).set_body_json(
+                serde_json::json!({"error": {"message": "Malformed publisher model"}}),
+            ))
+            .expect(0) // must never be reached after the fix
+            .mount(&mock_server)
+            .await;
+
+        // Route as produced by resolve_vertex_ai_route after the fix:
+        // route.model carries the publisher prefix.
+        let route = ResolvedRoute {
+            name: "vertex-gemini".to_string(),
+            endpoint: mock_server.uri(),
+            model: "google/gemini-2.5-flash".to_string(),
+            api_key: "ya29.token".to_string(),
+            protocols: vec!["openai_chat_completions".to_string()],
+            auth: AuthHeader::Bearer,
+            default_headers: vec![],
+            passthrough_headers: vec![],
+            timeout: DEFAULT_ROUTE_TIMEOUT,
+            model_in_path: false,
+            request_path_override: Some("/chat/completions".to_string()),
+        };
+
+        // The client sends the bare model name; the body rewrite must replace it
+        // with route.model (the publisher-prefixed form) before forwarding.
+        let client_body = serde_json::to_vec(&serde_json::json!({
+            "model": "gemini-2.5-flash",
+            "messages": [{"role": "user", "content": "hello"}]
+        }))
+        .unwrap();
+
+        let client = reqwest::Client::new();
+        let result = proxy_to_backend(
+            &client,
+            &route,
+            "openai_chat_completions",
+            "POST",
+            "/chat/completions",
+            vec![("content-type".to_string(), "application/json".to_string())],
+            bytes::Bytes::from(client_body),
+        )
+        .await
+        .expect("proxy should succeed");
+
+        assert_eq!(
+            result.status, 200,
+            "Vertex mock must accept the publisher-prefixed model; \
+             got {}: body rewrite did not apply the prefix",
+            result.status
         );
     }
 

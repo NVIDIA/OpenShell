@@ -52,12 +52,15 @@ Use an `http://` endpoint only for trusted local port-forwarding or a protected 
 
 ```bash
 openshell status
+openshell whoami
 ```
 
 Confirm the gateway is reachable, authentication is valid or not required, and
 the output shows a version. `Status: Connected` only proves the public health
 endpoint is reachable; inspect the separate `Authentication` line before
-running protected commands.
+running protected commands. `openshell whoami` reports the identity validated
+by the gateway, including the subject an administrator uses for workspace
+membership. Add `--output json` for automation.
 
 ### Step 3: Create a sandbox
 
@@ -119,7 +122,22 @@ Bare `KEY` reads the value from the environment variable of that name and avoids
 
 Other credential sources are `--from-gcloud-adc` for compatible profiles and `--runtime-credentials` when the gateway or sandbox resolves the required credentials at runtime.
 
-Profile-backed provider policy and composition are controlled by the gateway-global `providers_v2_enabled` setting:
+Static provider credentials resolve only for hosts, ports, and paths declared by
+the provider profile. Use `provider profile export` to inspect that boundary
+when a placeholder is present but requests receive
+`credential_endpoint_mismatch`. A profileless static provider fails closed
+because the gateway cannot construct a binding.
+
+When an inspected request receives `request_authority_mismatch`, compare its
+HTTP authority with the CONNECT tunnel endpoint. The host and effective port
+must match. For a tunnel to `api.example.com:8443`, send
+`Host: api.example.com:8443`; `Host: api.example.com` omits the non-default
+port and is rejected. An absolute-form request target must use the same
+authority.
+
+Profile-backed provider policy composition is controlled by the gateway-global
+`providers_v2_enabled` setting. Static credential endpoint binding remains
+active even when policy composition is disabled:
 
 ```bash
 openshell settings get --global
@@ -162,6 +180,20 @@ openshell provider refresh rotate my-outlook --credential-key MS_GRAPH_ACCESS_TO
 
 Prefer `--secret-material-env KEY[=ENVVAR]` for secret refresh material. `--material KEY=VALUE` is for non-secret material; `--secret-material-key` marks supplied material keys as secret.
 
+Gateway-managed refresh credentials use an identity-stable workload handle.
+Routine automatic refresh and `provider refresh rotate` update the access token
+behind that handle, so long-running processes do not need to restart. Running
+processes must be restarted once when upgrading from revision-scoped
+placeholders. A later `provider refresh configure` call is an explicit
+reauthorization boundary: it revokes the previous handle, and processes holding
+that handle fail closed until restarted.
+
+While gateway-managed refresh is configured, `provider update --credential`
+cannot replace or delete the refresh-owned primary credential or any co-minted
+output. Use `provider refresh rotate`, reconfigure refresh, or delete refresh
+before returning those keys to manual management. Unrelated provider fields
+remain updateable.
+
 ---
 
 ## Workflow 3: Sandbox Lifecycle
@@ -180,13 +212,13 @@ openshell sandbox create \
 ```
 
 Key flags:
-- `--provider`: Attach one or more providers (repeatable)
+- `--provider`: Attach configured credential providers for API keys, tokens, and other secrets (repeatable)
 - `--policy`: Custom policy YAML (otherwise uses built-in default or `OPENSHELL_SANDBOX_POLICY` env var)
 - `--gpu [COUNT]`: Request the driver's default GPU selection or a specific GPU count
 - `--cpu`, `--memory`: Set per-sandbox compute sizing. Docker/Podman apply limits; Kubernetes applies matching requests and limits.
 - `--driver-config-json`: Pass experimental driver-specific sandbox configuration
 - `--label KEY=VALUE`: Add labels for later selection (repeatable)
-- `--env KEY=VALUE`: Inject sandbox environment variables (repeatable)
+- `--env KEY=VALUE`: Set non-secret sandbox environment variables (repeatable); use `--provider` for credentials
 - `--approval-mode manual|auto`: Control handling of agent-authored policy proposals; `manual` is the default
 - `--upload <PATH>[:<DEST>]`: Upload local files into the container working directory or an explicit destination
 - `--no-git-ignore`: Disable `.gitignore` filtering for uploads
@@ -220,16 +252,22 @@ openshell sandbox ssh-config my-sandbox >> ~/.ssh/config
 ### Upload and download files
 
 ```bash
-# Upload local files to sandbox
-openshell sandbox upload my-sandbox ./src /sandbox/src
+# Upload local files to the sandbox working directory
+openshell sandbox upload my-sandbox ./src
 
-# Download files from sandbox
-openshell sandbox download my-sandbox /sandbox/output ./local-output
+# Download a path relative to the sandbox working directory
+openshell sandbox download my-sandbox output ./local-output
 ```
 
 Uploads honor `.gitignore` by default. Add `--no-git-ignore` only when ignored files are intentionally in scope.
 
 Uploads preserve symlinks, including dangling symlinks, instead of dereferencing their targets. A symlink source bypasses Git-aware filtering so the link itself is archived.
+
+When the upload destination is omitted, the CLI discovers the remote working
+directory. Uploading a named directory merges it into an existing directory of
+the same name, overwriting matching entries without deleting unrelated entries.
+Downloads accept paths relative to that working directory or absolute paths
+within it.
 
 ### Execute a non-interactive command
 
@@ -239,6 +277,8 @@ openshell sandbox exec --name my-sandbox --env MODE=test -- cargo test
 ```
 
 `sandbox exec` streams output and exits with the remote command's exit code. Use `sandbox connect` for an interactive shell.
+Use `--env` only for non-secret values. Attach credentials to the sandbox with a
+provider instead of passing API keys, tokens, or other secrets to `sandbox exec`.
 
 ### Change attached providers
 
@@ -271,6 +311,21 @@ openshell sandbox delete my-sandbox
 openshell sandbox delete sandbox-1 sandbox-2 sandbox-3   # Multiple at once
 openshell sandbox delete --all
 ```
+
+### Stop and start sandboxes
+
+Use stop to halt compute while retaining the sandbox and its persistent
+workspace:
+
+```bash
+openshell sandbox stop [name]
+openshell sandbox start [name]
+```
+
+Both commands default to the last-used sandbox. Stop stops background
+forwards and waits for `Stopped`; start waits for `Ready`. Connect, exec,
+file transfer, forwarding, and exposed services are unavailable while
+stopped. Delete remains the operation that removes retained state.
 
 ---
 
@@ -341,15 +396,27 @@ Edit `current-policy.yaml` to allow the blocked actions. **For policy content au
 - TLS termination configuration
 - Enforcement modes (`audit` vs `enforce`)
 - Binary matching patterns
-- Ordered `network_middlewares`, host selection, and `fail_open` or `fail_closed` behavior
+- Ordered `network_middlewares`, host selection, HTTP and WebSocket bindings, and `fail_open` or `fail_closed` behavior
 
 `network_policies` and `network_middlewares` can be modified at runtime. If `filesystem_policy`, `landlock`, or `process` need changes, the sandbox must be recreated. Built-in middleware such as `openshell/regex` needs no gateway registration. An operator-run middleware must already be registered under `[[openshell.supervisor.middleware]]`; changing that static registration requires a gateway restart.
+
+Middleware can inspect parsed HTTP request bodies and complete client-to-upstream WebSocket text messages over both `ws://` and `wss://` when the implementation advertises the matching binding. The built-in `openshell/regex` advertises both bindings and applies its fixed patterns to UTF-8 text. A host-matched HTTP-only attachment can inspect the upgrade GET but does not join the WebSocket chain; look for `binding_not_selected` coverage. Binary messages pass under both `on_error` modes and active stages emit `unsupported_message_type` coverage; upstream-to-client messages remain uninspected. A broken fail-open WebSocket stage is disabled for the rest of that connection; inspect sandbox OCSF logs for `openshell.middleware.websocket_stage_disabled`.
 
 ### Step 5: Push the updated policy
 
 ```bash
 openshell policy set dev --policy current-policy.yaml --wait
 ```
+
+The gateway validates the complete effective candidate—including attached
+provider-profile policy—before it stores a direct update, incremental merge,
+approved proposal, provider attachment, or profile update that affects attached
+sandboxes. An ambiguity failure returns `FAILED_PRECONDITION`; the rejected
+candidate does not create a policy revision or partially update affected
+sandboxes. The same fail-closed response applies when `credential_signing`
+does not have an attached AWS profile whose credential boundary covers the
+endpoint, or an explicit binding to an endpointless AWS profile. Fix the
+conflicting endpoint selectors or credential source and submit again.
 
 The `--wait` flag blocks until the sandbox confirms the policy is loaded (polls every second). Exit codes:
 - **0**: Policy loaded successfully
@@ -422,6 +489,12 @@ The `--from` flag accepts a Dockerfile path, a directory containing a Dockerfile
 
 Local Dockerfile and directory builds require a local gateway because the CLI builds through the local Docker daemon. Use a registry image reference for remote gateways. Bare community names resolve under `ghcr.io/nvidia/openshell-community/sandboxes` unless `OPENSHELL_COMMUNITY_REGISTRY` overrides the prefix.
 
+For Docker and Podman gateways, custom images should declare a non-root OCI
+`USER`. Each explicit `process.run_as_user` or `process.run_as_group` policy
+field wins independently; omitted fields fall back to the image declaration.
+An image with no `USER` fails before readiness unless policy supplies both
+fields.
+
 ### Forward ports
 
 ```bash
@@ -483,7 +556,22 @@ When denied actions appear:
 1. Prefer incremental updates for additive network changes:
    `openshell policy update work-session --add-endpoint api.github.com:443:read-only:rest:enforce --binary /usr/bin/gh --wait`
    `openshell policy update work-session --add-allow 'api.github.com:443:POST:/repos/*/issues' --wait`
-2. Use full YAML replacement for broad changes or non-network fields:
+
+   A rule authorizes every binary it lists to reach every endpoint it lists, so
+   an update that adds a binary or an endpoint to an existing rule must declare
+   that rule's whole binary and endpoint scope. The gateway rejects an update
+   that would grant a binary-to-endpoint pair the update never asked for, and
+   the error names the binaries still missing. To grant one binary access to
+   only part of a rule's endpoints, send the narrow authorization under its own
+   `--rule-name`; it stays on its own rule instead of folding into the broader
+   one.
+
+   `--add-allow` and `--add-deny` select an endpoint by host and port alone. If
+   that host and port appears in more than one rule, or twice in one rule under
+   different paths, the update is rejected as ambiguous. Fall back to full YAML
+   replacement for those endpoints.
+2. Use full YAML replacement for broad changes or non-network fields, including
+   any change that would otherwise require restating a large existing scope:
    `openshell policy get work-session --full > policy.yaml`
    Modify the policy with the `generate-sandbox-policy` skill.
    `openshell policy set work-session --policy policy.yaml --wait`
@@ -569,6 +657,13 @@ openshell settings set --global --key providers_v2_enabled --value true
 
 Global mutations prompt for confirmation. Use `--yes` only in reviewed automation.
 
+`policy_validation_failure_mode` is gateway startup configuration, not a
+mutable `openshell settings` key. Set it under `[openshell.gateway]` in
+`gateway.toml` and restart the gateway. The security-first default is
+`fail_closed`; `retain_last_valid` is an explicit availability tradeoff. OCSF
+configuration events state whether the previous generation is active after a
+runtime validation failure.
+
 ## Workflow 10: Service Access
 
 Use `forward` for local access and `service` for a gateway-managed HTTP endpoint:
@@ -605,7 +700,7 @@ The CLI help is always authoritative. If the help output contradicts this skill,
 
 ```bash
 $ openshell sandbox --help
-# Shows: create, get, list, delete, exec, connect, upload, download, ssh-config, provider
+# Shows: create, get, list, stop, start, delete, exec, connect, upload, download, ssh-config, provider
 
 $ openshell sandbox upload --help
 # Shows: positional arguments (name, path, dest), usage examples
@@ -619,6 +714,7 @@ $ openshell sandbox upload --help
 |------|---------|
 | Register local port-forwarded gateway | `openshell gateway add http://127.0.0.1:8080 --local --name local` |
 | Check gateway health and authentication | `openshell status` |
+| Show authenticated identity and subject | `openshell whoami` |
 | List/switch gateways | `openshell gateway select [name]` |
 | Connect directly to a gateway | `openshell --gateway-endpoint <url> status` |
 | Create sandbox (interactive) | `openshell sandbox create` |
@@ -626,6 +722,8 @@ $ openshell sandbox upload --help
 | Create sandbox with GPUs | `openshell sandbox create --gpu 1` |
 | Create with custom policy | `openshell sandbox create --policy ./p.yaml` |
 | Connect to sandbox | `openshell sandbox connect <name>` |
+| Stop sandbox compute | `openshell sandbox stop [name]` |
+| Start sandbox compute | `openshell sandbox start [name]` |
 | Execute in sandbox | `openshell sandbox exec --name <name> -- <command>` |
 | Stream live logs | `openshell logs <name> --tail` |
 | Incremental policy update | `openshell policy update <name> --add-endpoint host:443:read-only:rest:enforce --binary /usr/bin/curl --wait` |

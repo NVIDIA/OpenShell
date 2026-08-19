@@ -12,6 +12,7 @@ OpenShell builds these main artifacts:
 |---|---|
 | Gateway binary | `crates/openshell-server` |
 | CLI package and Python SDK | `python/openshell` plus Rust binaries where packaged |
+| TypeScript SDK package | `sdk/typescript` |
 | Gateway container image | `deploy/docker/Dockerfile.gateway` |
 | Supervisor container image | `deploy/docker/Dockerfile.supervisor` |
 | Helm chart | `deploy/helm/openshell` |
@@ -39,6 +40,24 @@ are no-ops, so the data-model types stay available and dependent crates compile
 unchanged. The runtime `OPENSHELL_TELEMETRY_ENABLED` switch remains the way to
 disable telemetry in a default (telemetry-enabled) build.
 
+Supervisor upstream TLS root-store selection is controlled by the
+`bundled-ca-roots` Cargo feature (on by default). Default builds use Mozilla
+roots through `webpki-roots` plus locally-installed CAs from the system bundle.
+Building without `bundled-ca-roots` switches to the platform trust store via
+`rustls-native-certs` and excludes bundled Mozilla root crates such as
+`webpki-roots` and `webpki-root-certs` from the dependency graph. The
+`system-ca-roots` feature alias on `openshell-sandbox` includes all other
+defaults (currently `telemetry`) except `bundled-ca-roots`, so Linux
+distribution builds (e.g. RPM) can use
+`--no-default-features --features system-ca-roots` without manually re-adding
+unrelated defaults. Other Rustls clients use native roots directly because that
+already satisfies Linux distribution trust-store policy.
+
+The workspace uses `z3` versions whose `z3-sys` dependency keeps downloader
+HTTP/TLS support behind explicit build features, so default system-Z3 builds do
+not reintroduce bundled Mozilla roots. Release builds that need bundled Z3
+continue to opt in with `bundled-z3`.
+
 ## Linux Runtime Environments
 
 OpenShell uses different Linux libc environments for different host artifacts.
@@ -49,6 +68,31 @@ runtime binaries that use the GNU/Linux runtime environment are GNU-linked.
 The gateway bundles z3 into the release binary so Linux packages, standalone
 tarballs, and gateway images do not depend on distro-specific z3 shared-library
 SONAMEs.
+
+The supervisor is the one binary whose libc is selectable, because it is the one
+binary executed inside a userland OpenShell does not control. `SUPERVISOR_LIBC`
+chooses between `musl` (default) and `glibc-static`. Both produce a fully static
+binary; the choice does not change the runtime layout or the supervisor image base.
+Static linkage is a hard requirement rather than a preference, so both variants
+are verified by `tasks/scripts/verify-static-binary.sh`, which fails the build on
+any `PT_INTERP` or `DT_NEEDED` entry.
+
+The two variants differ only in build-time constraints:
+
+| | `musl` (default) | `glibc-static` |
+|---|---|---|
+| Cross-compiles | yes, via `cargo zigbuild` | no — must build natively per architecture |
+| Host requirement | zig + cargo-zigbuild | glibc static libraries (`glibc-static` on Fedora/RHEL, `libc6-dev` on Debian/Ubuntu) |
+| libc license | MIT | LGPL-2.1-or-later, statically linked |
+
+`cargo zigbuild` cannot produce the `glibc-static` variant: `zig cc` accepts
+`-static` for `*-linux-gnu` targets and emits a dynamically linked binary
+anyway. The staging script therefore refuses to cross-compile that variant
+instead of silently degrading linkage.
+
+Selecting `glibc-static` statically links LGPL glibc into a redistributed
+binary, which carries relinking obligations that musl (MIT) does not. Treat the
+default as the shipping configuration unless that has been reviewed.
 
 ## Container Builds
 
@@ -73,9 +117,11 @@ package-managed VM support does not raise the package runtime requirement.
 Gateway staging and release workflows set up the Zig C/C++ wrapper before
 bundled Z3 builds and verify the maximum referenced `GLIBC_*` symbol version
 before publishing or copying artifacts.
-Supervisor binaries remain static musl and use `cargo zigbuild` when available,
-including native CPU architectures, so C dependencies are compiled for the musl
-target instead of the host GNU libc target. Local Docker image tasks infer the
+Supervisor binaries are static in every configuration. The default `musl`
+variant uses `cargo zigbuild` when available, including native CPU
+architectures, so C dependencies are compiled for the musl target instead of the
+host GNU libc target. The `glibc-static` variant uses plain `cargo build` with
+`+crt-static` and requires a native per-architecture build. Local Docker image tasks infer the
 target architecture from `DOCKER_PLATFORM` when set. Otherwise, they require
 valid container engine host metadata and fail when the engine query is
 unavailable or reports an unsupported architecture, avoiding host-kernel
@@ -96,11 +142,15 @@ Runtime layout:
   as a release artifact. Linux GNU VM driver binaries must not reference
   `GLIBC_*` symbols newer than `GLIBC_2.28`; release workflows verify this
   before publishing artifacts.
-- **Supervisor**: Alpine base with `nftables`, static musl binary at
-  `/openshell-sandbox`. Static linkage keeps the binary usable when the image
-  is mounted/extracted into sandbox environments (Docker extraction, Podman
-  image volumes, Kubernetes init-container copy-self), while `nftables` supports
-  Kubernetes supervisor sidecar egress enforcement.
+- **Supervisor**: Alpine base with `nftables`, static binary at
+  `/openshell-sandbox` (musl by default; see `SUPERVISOR_LIBC` above). Static
+  linkage keeps the binary usable when the image is mounted/extracted into
+  sandbox environments (Docker extraction, Podman image volumes, Kubernetes
+  init-container copy-self), whose libc and glibc version are not known at build
+  time, while `nftables` supports Kubernetes supervisor sidecar egress
+  enforcement. The VM driver bundles its own supervisor build
+  (`tasks/scripts/vm/build-supervisor-bundle.sh`) and does not read
+  `SUPERVISOR_LIBC`.
 
 Gateway image builds bake the corresponding supervisor image tag into the
 gateway binary so Docker sandboxes do not depend on `:latest` by default.
@@ -135,6 +185,23 @@ contexts use `KIND_EXPERIMENTAL_PROVIDER=docker|podman` when set, and ambiguous
 or unknown contexts require an explicit `CONTAINER_ENGINE`. Other image builds
 do not infer from kube context.
 
+## Disposable Test Guests
+
+The Nix test guest harness under `nix/test-guest` boots native-architecture cloud images
+through QEMU for package, release, and E2E validation. A prepared cache entry is
+captured after the exact ordered Ansible configuration list and before
+test-specific packages, copied binaries, forwarded ports, or commands.
+
+Prepared disks are flattened, sanitized QCOW2 images. The local cache keeps them
+read-only and each test receives a fresh writable overlay and cloud-init
+identity. The optional shared cache stores the compressed standalone disk and
+its compatibility metadata as a custom OCI artifact. Normal test runs ensure
+the exact local entry exists, invoking the cache builder automatically on a
+miss before booting a disposable overlay. The separate cache app owns OCI
+pulls and explicit publication. OCI pulls require a trusted manifest digest
+and retain that provenance with the local entry; mutable tags are used only
+for explicit publication.
+
 ## Python Wheel Packaging
 
 The generated protobuf/gRPC stubs under `python/openshell/_proto/` are gitignored
@@ -146,6 +213,20 @@ wheel. `pyproject.toml`
 pins them back in with `[tool.maturin].include` globs. The release workflows
 install each Linux wheel in a clean image and import `openshell.sandbox` as a
 smoke check.
+
+## TypeScript SDK Packaging
+
+The native TypeScript SDK in `sdk/typescript` uses Connect over the generated
+OpenShell protobuf surface. `sdk/typescript/buf.gen.yaml` selects the client
+proto closure, and `mise run sdk:ts:proto` generates gitignored sources under
+`src/gen`. TypeScript compilation includes those sources in `dist`, so package
+consumers do not run code generation.
+
+Branch checks run `mise run sdk:ts:ci`, enforce an 80% line-coverage floor, and
+exercise version stamping plus `npm publish --dry-run`. Tagged releases publish
+`@nvidia/openshell-sdk` to GitHub Packages. The repository keeps package version
+`0.0.0`; the release task derives and temporarily stamps the npm version from
+the release tag.
 
 ## CI and E2E
 
@@ -160,6 +241,10 @@ The high-level CI model:
 4. Merge-group checks run against GitHub's temporary queue branch for the final integration state.
 5. Gate jobs verify that the mirror branch matches the PR head, or that the merge-group workflow ran for the queued SHA, and that the expected non-gate workflow actually ran.
 6. Release workflows rebuild and publish binaries, wheels, images, and docs.
+
+Repository CI keeps telemetry compiled into release-parity artifacts but
+disables emission for Rust tests, E2E runs, and release canaries. This prevents
+synthetic activity from contributing to product usage metrics.
 
 See `CI.md` for the contributor workflow, labels, and maintainer merge-queue workflow.
 

@@ -79,7 +79,7 @@ Regardless of tier, extract (or infer) these from the user's description:
 | **Paths** | Specific URL paths or patterns | Only for custom/fine-grained |
 | **Enforcement** | `enforce` or `audit`? Default to `enforce`. | No — has a default |
 | **Binary** | Which binary/process should have access | Yes — ask if not stated |
-| **Middleware** | Whether admitted HTTP requests need an ordered built-in or operator-run processing stage | No |
+| **Middleware** | Whether admitted HTTP requests or client WebSocket text messages need an ordered built-in or operator-run processing stage | No |
 
 If the host and access level are clear but binaries are not specified, ask the user which binary or process will be making the requests. Suggest common defaults like `/usr/bin/curl`, `/usr/local/bin/claude`, etc.
 
@@ -216,10 +216,14 @@ Is L7 inspection needed?
 
 ### Middleware Decision
 
-Add `network_middlewares` only when the user asks to inspect, transform, redact, or independently authorize admitted HTTP requests. Middleware runs after network and L7 policy admission and before provider credential injection.
+Add `network_middlewares` only when the user asks to inspect, transform, redact, or independently authorize admitted HTTP requests or client WebSocket text messages. Middleware runs after network and L7 policy admission and before provider credential injection.
 
-- Use a built-in name such as `openshell/regex` without gateway registration.
+- Use `openshell/regex` without gateway registration for fixed-pattern redaction of UTF-8 HTTP request bodies or complete client-to-upstream WebSocket text messages.
 - Use an operator-owned middleware name only when it is already registered under `[[openshell.supervisor.middleware]]` and reachable from both the gateway and sandbox supervisors.
+- Confirm that a requested WebSocket implementation exposes a `WEBSOCKET_MESSAGE/PRE_CREDENTIALS` binding. `openshell/regex` exposes this binding. A host-matched HTTP-only implementation may inspect the upgrade GET but does not join the post-upgrade chain; messages pass and OpenShell emits `binding_not_selected` coverage regardless of `on_error`.
+- WebSocket middleware runs for both `ws://` and `wss://` and receives complete client text messages only. Binary messages pass under both error modes and emit `unsupported_message_type` coverage for active stages. Upstream-to-client messages remain uninspected. Do not claim that V1 provides all-message WebSocket inspection.
+- Treat `fail_open` on WebSocket as a session-scoped bypass: if the stage stream fails, OpenShell disables it for later messages on that connection and emits a state-change finding. Prefer `fail_closed` for required redaction or authorization.
+- `on_error` governs failures after an advertised operation binding is selected. It does not apply to an unadvertised WebSocket binding or binary-message pass-through. An explicit HTTP, WebSocket preflight, or WebSocket message denial is authoritative under both `fail_open` and `fail_closed`.
 - Default `on_error` to `fail_closed`. Use `fail_open` only when bypassing the stage preserves the user's stated security requirement.
 - Assign unique `order` values across the complete policy. Lower values run first, and at most 10 configs may be selected.
 - Match the narrowest destination hosts possible with `endpoints.include`; use `exclude` when a broad selector has trusted exceptions.
@@ -237,7 +241,10 @@ Only needed for the **Moderate** and **Full** tiers. Translate API path paramete
 | `/api/v1/models/{model_id}/versions/{version}` | `/api/v1/models/*/versions/*` |
 | All sub-paths under `/api/v1/` | `/api/v1/**` |
 
-Remember: `*` does not cross `/` boundaries. Use `**` for recursive matching across path segments.
+Path matching uses the runtime `glob` engine. Both `*` and `**` may cross `/`
+boundaries; `?` matches one character, and bracket classes such as `[0-9]` and
+`[!0]` are supported. Prefer segment-shaped patterns such as
+`/repos/*/issues` for readability, but do not rely on `*` to stop at `/`.
 
 ### Building the Explicit Rules List
 
@@ -376,11 +383,16 @@ Before presenting the policy to the user, verify correctness **and** flag breadt
 - [ ] Every middleware config has a non-empty `middleware` name and non-empty `endpoints.include`
 - [ ] Middleware `order` values are unique and no selected chain exceeds 10 stages
 - [ ] No fail-closed middleware selector can cover a `tls: skip` endpoint
+- [ ] Any required WebSocket control advertises `WEBSOCKET_MESSAGE/PRE_CREDENTIALS`, and the user understands that V1 does not inspect binary messages
+- [ ] Endpoints contributed by a credentialed provider are not L4-only or `tls: skip` unless `allow_uninspected_credentials: true` explicitly records the exception
 
 ### Schema Warnings (log-only, but should be fixed)
 
 - [ ] `protocol: rest` on port 443 should have `tls: terminate`
 - [ ] HTTP methods are standard: GET, HEAD, POST, PUT, DELETE, PATCH, OPTIONS, or `*`
+- [ ] Credentialed destinations are also covered by the attached provider
+      profile endpoint; policy admission alone does not authorize credential
+      resolution
 
 ### Structural Checks
 
@@ -406,7 +418,8 @@ Evaluate the generated policy for overly broad access and **include warnings in 
 | **Hostless `allowed_ips`** (no `host` field) | "This endpoint has no `host` — any domain resolving to the allowed IP range on this port will be permitted. Consider adding a `host` field to restrict which domains can use this allowlist." |
 | **Broad CIDR** in `allowed_ips` (e.g., `10.0.0.0/8`) | "This `allowed_ips` entry covers a very broad range. Consider narrowing to a specific subnet (e.g., `10.0.5.0/24`) to minimize exposure." |
 | **`on_error: fail_open`** | "This middleware can be bypassed when it is unavailable, rejects configuration, returns an invalid result, or exceeds its body limit. Use `fail_closed` unless availability is more important than this control." |
-| **Broad middleware host selector** | "This middleware applies independently of the admitting network rule to every matching HTTP destination. Narrow `endpoints.include` or add exclusions if the stage is not required for every matching host." |
+| **Broad middleware host selector** | "This middleware attaches independently of the admitting network rule to every matching destination, then runs only for operation bindings its implementation advertises. Narrow `endpoints.include` or add exclusions if the attachment is not required for every matching host." |
+| **`allow_uninspected_credentials: true`** | "This endpoint may carry provider credentials on traffic OpenShell cannot inspect or rewrite. Prefer an inspected protocol and credential rewrite; keep this exception only when raw traffic is required." |
 
 Format breadth warnings clearly in the output, e.g.:
 
@@ -439,11 +452,18 @@ The policy needs to go somewhere. Determine which mode applies:
 
 2. **Check for conflicts**:
    - Does a policy with the same key already exist? If so, ask the user whether to **replace** it, **merge** new endpoints/binaries into it, or use a different key.
-   - Does an existing policy already cover the same host:port? Warn the user — overlapping endpoint coverage across policies causes OPA evaluation errors (complete rule conflict).
+   - Does an existing endpoint selector overlap the new selector? Compatible overlaps are allowed and can intentionally aggregate allow and deny rules. Reject or revise equally specific overlaps that disagree on connection or request-processing metadata, including TLS, destination constraints, protocol/parser behavior, enforcement, or credential handling. A more-specific path selector may override broader request-processing metadata.
+   - If the sandbox uses an attached provider credential, confirm the provider
+     profile also declares the intended host, port, and path. A sandbox policy
+     allow cannot expand the profile's static credential binding.
+   - For `credential_signing`, confirm an attached endpoint-bearing profile
+     declares `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` and covers the
+     signed endpoint. For an endpointless AWS profile, add
+     `credential_binding.provider` with the exact attached provider name.
 
 3. **Apply the change**:
    - **Adding a new policy**: Insert the new policy block under `network_policies`, maintaining the file's existing indentation and style.
-   - **Modifying an existing policy**: Edit the specific policy in place — add/remove endpoints, change access presets, update rules, add binaries, etc.
+   - **Modifying an existing policy**: Edit the specific policy in place — add/remove endpoints, change access presets, update rules, add binaries, etc. A rule authorizes every binary it lists to reach every endpoint and port it lists, so adding one binary grants it all of that rule's endpoints, and adding one endpoint grants it to all of that rule's binaries. State the resulting pairs to the user before writing them. When the user wants a binary to reach only part of a rule's endpoints, put that binary and those endpoints in a separate rule instead of extending the existing one. An empty `binaries` list means any binary, so leaving it off widens the rule to every process.
    - **Removing a policy**: Delete the policy block if the user asks.
 
 4. **Preserve everything else**: Do not modify `filesystem_policy`, `landlock`, `process`, or other policies unless the user explicitly asks.
@@ -466,22 +486,23 @@ filesystem_policy:
     - /etc
     - /var/log
   read_write:
-    - /sandbox
     - /tmp
     - /dev/null
 
 landlock:
   compatibility: best_effort
 
-process:
-  run_as_user: sandbox
-  run_as_group: sandbox
-
 network_policies:
   # <generated policies go here>
 ```
 
-The `filesystem_policy`, `landlock`, and `process` sections above are sensible defaults. Tell the user these are defaults and may need adjustment for their environment. Gateway inference is configured separately through `openshell inference set/get`. The generated `network_policies` block is the primary output.
+The `filesystem_policy` and `landlock` sections above are sensible defaults.
+Process identity is omitted so the selected compute driver can choose it. For
+Docker and Podman, each omitted identity field falls back to the image's OCI
+`USER`. Tell the user these are defaults and may need adjustment for their
+environment. Gateway inference is configured separately through `openshell
+inference set/get`. The generated `network_policies` block is the primary
+output.
 
 If the user provides a file path, write to it. Otherwise, ask where to place it. A common convention is a project-local policy file (e.g., `sandbox-policy.yaml`) passed to `openshell sandbox create --policy <path>` or set via the `OPENSHELL_SANDBOX_POLICY` env var.
 

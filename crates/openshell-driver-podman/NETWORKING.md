@@ -255,6 +255,32 @@ if config.grpc_endpoint.is_empty() {
 The bridge gateway IP is not a stable substitute in rootless mode because it
 can live inside the user namespace rather than on the host.
 
+Before the gateway binds its serving sockets, the driver reports the callback
+listener required by the selected topology:
+
+- Rootful Linux Podman reports the configured bridge's gateway address exactly.
+- Rootless Linux Podman explicitly reporting pasta requests the private IPv4
+  source address selected by the host's default route. This avoids guessing
+  among private interfaces on a multihomed host.
+- Rootless Linux Podman reporting slirp4netns, another named helper, or no
+  helper cannot use a direct local callback listener. The driver fails startup
+  unless `grpc_endpoint` names an explicitly remote endpoint. Supporting
+  slirp4netns requires a relay inside Podman's rootless network namespace.
+- Podman Machine requests IPv4 loopback because gvproxy terminates the host
+  forwarding path there.
+- An explicitly remote callback endpoint requests no additional local listener.
+
+On Linux, an explicit `host_gateway_ip` is reported exactly for rootful Podman
+and rootless pasta because the driver maps both local callback aliases to that
+literal. Other rootless helpers still fail closed. Podman Machine requests
+gateway loopback because its configured address is guest-visible and gvproxy
+terminates that route on host loopback. The gateway validates and binds every
+accepted callback requirement. If the primary listener covers the requested
+address, the gateway reuses it and relies on sandbox JWT authorization to limit
+the supervisor's RPCs. Otherwise, it creates an additional listener that
+exposes only the gateway's sandbox-callable gRPC methods. Operator, health,
+reflection, and HTTP requests must use the primary listener.
+
 ### Layer 3 Inner Sandbox Network Namespace
 
 Inside the container, the supervisor creates another network namespace for the

@@ -24,22 +24,36 @@ The OpenShell TUI is a ratatui-based terminal UI for the OpenShell platform. It 
 
 ## 2. Domain Object Hierarchy
 
-The data model follows a strict hierarchy: **Gateway > Sandboxes > Logs**.
+The data model follows a strict hierarchy: **Gateway > Workspace > Sandboxes/Providers/Settings > Logs**.
 
 ```
 Gateway (discovered via openshell_bootstrap::list_gateways())
-  └── Sandboxes (fetched via gRPC ListSandboxes)
+  ├── Global Settings (fetched via GetGatewayConfig)
+  ├── Global Policy indicator (fetched via ListSandboxPolicies global=true)
+  ├── Workspaces (fetched via ListWorkspaces)
+  ├── Provider Profiles (fetched via ListProviderProfiles, workspace-scoped)
+  ├── Providers (fetched via ListProviders, workspace-scoped)
+  │     └── cached ProviderProfile (matched by type + workspace)
+  └── Sandboxes (fetched via ListSandboxes, workspace-scoped)
+        ├── Policy (fetched via GetSandboxConfig)
+        ├── Settings (effective settings with scope, from GetSandboxConfig)
+        ├── Draft recommendations (fetched via GetDraftPolicy)
         └── Logs (fetched via GetSandboxLogs + streamed via WatchSandbox)
 ```
 
-- **Gateways** are discovered from on-disk config via `openshell_bootstrap::list_gateways()`. Each gateway has a name, endpoint, and local/remote flag.
-- **Sandboxes** belong to the active gateway. Fetched via `ListSandboxes` gRPC call with a periodic tick refresh. Each sandbox has: `id`, `name`, `phase`, `created_at_ms`, and `spec.template.image`.
+- **Gateways** are discovered from on-disk config via `openshell_bootstrap::list_gateways()`. Each gateway has a name, endpoint, local/remote flag, and source label.
+- **Workspaces** are fetched via `ListWorkspaces`. The user cycles through workspaces with `[w]`, or views all workspaces at once. The current workspace scopes provider and sandbox lists.
+- **Provider Profiles** are fetched per-workspace via `ListProviderProfiles` when `providers_v2_enabled` is true. Profiles are cached in a `ProviderProfileCache` keyed by `(workspace, profile_id)` and matched to providers by type. They provide category, credential metadata, endpoint/binary counts, and inference capability.
+- **Providers** are fetched via `ListProviders` scoped to the current workspace. Each `ProviderListEntry` pairs a provider with its optional cached profile. When `providers_v2_enabled` is true, CRUD operations are read-only in the TUI; when false, the TUI supports create/update/delete.
+- **Global Settings** are fetched via `GetGatewayConfig` and displayed in a tabbed pane alongside providers on the dashboard. Each setting is a registered key with a typed value (bool/int/string). Platform-admin access is required; `PermissionDenied` disables the pane.
+- **Sandboxes** belong to the active gateway and workspace. Fetched via `ListSandboxes` with a periodic tick refresh.
+- **Sandbox Settings** are effective settings returned by `GetSandboxConfig`, each with a scope (sandbox, global, or unset). Globally-managed settings are blocked from sandbox-level edits.
 - **Logs** belong to a single sandbox. Initial batch fetched via `GetSandboxLogs` (500 lines), then live-tailed via `WatchSandbox` with `follow_logs: true`.
 
 The **title bar** always reflects this hierarchy, reading left-to-right from general to specific:
 
 ```
- OpenShell │ Current Gateway: <name> (<status>) │ <screen/context>
+ OpenShell │ Current Gateway: <name> [source] (<status>) │ Workspace: <name|all> │ <screen/context>
 ```
 
 ## 3. Navigation & Screen Architecture
@@ -50,8 +64,9 @@ Top-level layouts that own the full content area. Each has its own nav bar hints
 
 | Screen | Description | Module |
 | --- | --- | --- |
-| `Dashboard` | Gateway list (top) + sandbox table (bottom) | `ui/dashboard.rs` |
-| `Sandbox` | Single-sandbox view — detail or logs depending on `Focus` | `ui/sandbox_detail.rs`, `ui/sandbox_logs.rs` |
+| `Splash` | Boot screen shown on startup, auto-dismissed after 3 seconds | `ui/splash.rs` |
+| `Dashboard` | Gateway list (top) + providers/settings (middle) + sandbox table (bottom) | `ui/dashboard.rs` |
+| `Sandbox` | Single-sandbox view — metadata (top) + policy/settings/logs/drafts (bottom) | `ui/sandbox_detail.rs`, `ui/sandbox_policy.rs`, `ui/sandbox_settings.rs`, `ui/sandbox_logs.rs`, `ui/sandbox_draft.rs` |
 
 ### Focus (`Focus` enum)
 
@@ -60,9 +75,18 @@ Tracks which panel currently receives keyboard input.
 | Focus | Screen | Description |
 | --- | --- | --- |
 | `Gateways` | Dashboard | Gateway list panel has input focus |
+| `Providers` | Dashboard | Provider list or global settings pane (depends on `MiddlePaneTab`) |
 | `Sandboxes` | Dashboard | Sandbox table panel has input focus |
-| `SandboxDetail` | Sandbox | Sandbox detail view (name, status, image, age) |
+| `SandboxPolicy` | Sandbox | Policy viewer or settings table (depends on `SandboxPolicyTab`) |
 | `SandboxLogs` | Sandbox | Log viewer with structured rendering |
+| `SandboxDraft` | Sandbox | Draft policy recommendations list |
+
+### Tab enums
+
+Two tab enums control which sub-view renders within a focus area:
+
+- **`MiddlePaneTab`** (`Providers` | `GlobalSettings`): toggles the middle dashboard pane between the provider list and the global settings table. Switched with `[h/l]`.
+- **`SandboxPolicyTab`** (`Policy` | `Settings`): toggles the sandbox bottom pane between the policy viewer and the sandbox settings table. Switched with `[h]`.
 
 ### Screen dispatch
 
@@ -70,17 +94,31 @@ The top-level `ui::draw()` function (`ui/mod.rs`) handles the chrome (title bar,
 
 ```rust
 match app.screen {
+    Screen::Splash => unreachable!(),
     Screen::Dashboard => dashboard::draw(frame, app, chunks[1]),
     Screen::Sandbox => draw_sandbox_screen(frame, app, chunks[1]),
 }
 ```
 
-Within the `Sandbox` screen, focus determines which sub-view renders:
+Within the `Sandbox` screen, the top 20% renders sandbox metadata (`sandbox_detail`), and the bottom 80% dispatches based on focus and tab state:
 
 ```rust
 match app.focus {
-    Focus::SandboxLogs => sandbox_logs::draw(frame, app, area),
-    _ => sandbox_detail::draw(frame, app, area),
+    Focus::SandboxLogs => sandbox_logs::draw(frame, app, chunks[1]),
+    Focus::SandboxDraft => sandbox_draft::draw(frame, app, chunks[1]),
+    _ => match app.sandbox_policy_tab {
+        SandboxPolicyTab::Settings => sandbox_settings::draw(frame, app, chunks[1]),
+        SandboxPolicyTab::Policy => sandbox_policy::draw(frame, app, chunks[1]),
+    },
+}
+```
+
+On the dashboard, the middle pane dispatches by `MiddlePaneTab`:
+
+```rust
+match app.middle_pane_tab {
+    MiddlePaneTab::Providers => providers::draw(frame, app, chunks[1], mid_focused),
+    MiddlePaneTab::GlobalSettings => global_settings::draw(frame, app, chunks[1], mid_focused),
 }
 ```
 
@@ -104,8 +142,8 @@ Every frame renders four vertical regions:
 
 ### Title bar examples
 
-- Dashboard: ` OpenShell │ Current Gateway: openshell (Healthy) │ Dashboard`
-- Sandbox detail: ` OpenShell │ Current Gateway: openshell (Healthy) │ Sandbox: my-sandbox`
+- Dashboard: ` >_ OpenShell  ALPHA  | Current Gateway: openshell [local] (Healthy) | Workspace: default | Dashboard`
+- Sandbox detail: ` >_ OpenShell  ALPHA  | Current Gateway: openshell [local] (Healthy) | Workspace: team-a | Sandbox: my-sandbox`
 
 ### Adding a new screen
 
@@ -130,7 +168,13 @@ Phase 1: GetSandboxLogs  →  500 initial lines  →  send via Event::LogLines
 Phase 2: WatchSandbox(follow_logs: true)  →  live tail  →  send via Event::LogLines
 ```
 
-**Sandboxes**: Currently fetched via `ListSandboxes` on a 2-second tick. Could be enhanced with a watch mechanism.
+**Sandboxes**: Fetched via `ListSandboxes` on a 2-second tick, scoped to the current workspace (or all workspaces).
+
+**Providers**: Fetched via `ListProviders` on each tick. When `providers_v2_enabled` is true, provider profiles are also fetched per-workspace via `ListProviderProfiles` and cached in a `ProviderProfileCache` keyed by `(workspace, profile_id)`.
+
+**Settings**: Global settings are fetched via `GetGatewayConfig` on each tick. Sandbox settings are fetched alongside the sandbox policy via `GetSandboxConfig` and refreshed on each tick when viewing a sandbox.
+
+**Workspaces**: The workspace list is fetched via `ListWorkspaces` on each tick.
 
 ### Never block the event loop
 
@@ -152,7 +196,7 @@ Show `"Loading..."` while async data is in flight (see `sandbox_logs.rs` — ren
 
 ### Event channel
 
-Background tasks communicate with the event loop via `mpsc::UnboundedSender<Event>`. The `EventHandler` provides a `sender()` method to clone the transmit handle:
+Background tasks communicate with the event loop via `mpsc::UnboundedSender<Event>`. The `EventHandler` provides a `sender()` method to clone the transmit handle. There are many `Event` variants for different async results (log lines, create results, provider CRUD results, setting CRUD results, draft action results, forward warnings):
 
 ```rust
 // In lib.rs
@@ -161,6 +205,10 @@ spawn_log_stream(&mut app, events.sender());
 // In the spawned task
 let _ = tx.send(Event::LogLines(lines));
 ```
+
+### Access denial handling
+
+Global settings and global policy queries may return `PermissionDenied` when the user lacks platform-admin access. The TUI sets `global_settings_access_denied` / `global_policy_access_denied` flags to stop retrying these calls on subsequent ticks, and clears the corresponding UI state.
 
 ### gRPC timeouts
 
@@ -269,7 +317,11 @@ TUI actions should parallel `openshell` CLI commands so users have familiar ment
 | --- | --- |
 | `openshell sandbox list` | Sandbox table on Dashboard |
 | `openshell sandbox delete <name>` | `[d]` on sandbox detail, then `[y]` to confirm |
+| `openshell sandbox create` | `[c]` on sandbox panel to open create form |
+| `openshell sandbox connect` | `[s]` on sandbox policy view to launch SSH shell |
 | `openshell logs <name>` | `[l]` on sandbox detail to open log viewer |
+| `openshell provider list` | Provider table on Dashboard (middle pane) |
+| `openshell provider create` | `[c]` on provider panel (when not providers_v2) |
 | `openshell status` | Status in title bar + gateway list |
 
 When adding new TUI features, check what the CLI offers and maintain consistency.
@@ -331,43 +383,76 @@ All actions are accessible via keyboard shortcuts displayed in the nav bar. The 
 **Dashboard (Gateways focus):**
 `[Tab] Switch Panel  [Enter] Select  [j/k] Navigate  │  [:] Command  [q] Quit`
 
-**Dashboard (Sandboxes focus):**
-Same as above.
+**Dashboard (Providers focus, providers_v2):**
+`[Tab] Switch Panel  [h/l] Switch Tab  [j/k] Navigate  [Enter] Detail  read-only  │  [:] Command  [q] Quit`
 
-**Sandbox (Detail focus):**
-`[l] Logs  [d] Delete  │  [Esc] Back to Dashboard  [q] Quit`
+**Dashboard (Providers focus, legacy):**
+`[Tab] Switch Panel  [h/l] Switch Tab  [j/k] Navigate  [Enter] Detail  [c] Create  [u] Update  [d] Delete  │  [:] Command  [q] Quit`
+
+**Dashboard (Global Settings focus):**
+`[Tab] Switch Panel  [h/l] Switch Tab  [j/k] Navigate  [Enter] Edit  [d] Delete  │  [:] Command  [q] Quit`
+
+**Dashboard (Sandboxes focus):**
+`[Tab] Switch Panel  [j/k] Navigate  [Enter] Select  [c] Create Sandbox  [w] Workspace  │  [:] Command  [q] Quit`
+
+**Sandbox (Policy focus):**
+`[h] Switch Tab  [j/k] Scroll  [g/G] Top/Bottom  [s] Shell  [l] Logs  [r] Rules  [d] Delete  │  [Esc] Back  [q] Quit`
+
+**Sandbox (Settings focus):**
+`[h/l] Switch Tab  [j/k] Navigate  [Enter] Edit  [d] Delete  │  [Esc] Back  [q] Quit`
 
 **Sandbox (Logs focus):**
-`[j/k] Scroll  [Enter] Detail  [g/G] Top/Bottom  [f] Follow  [s] Source: <filter>  │  [Esc] Back  [q] Quit`
+`[j/k] Navigate  [Enter] Detail  [g/G] Top/Bottom  [f] Follow  [s] Source: <filter>  [y] Copy  [Y] Copy All  [v] Select  [r] Rules  │  [Esc] Policy  [q] Quit`
+
+**Sandbox (Draft focus):**
+`[j/k] Navigate  [Enter] Detail  [a] Approve  [x] Reject  [A] Approve All  [p] Policy  [l] Logs  │  [Esc] Back  [q] Quit`
 
 ## 7. Architecture & Key Files
 
 | File | Purpose |
 | --- | --- |
 | `crates/openshell-tui/Cargo.toml` | Crate manifest — dependencies on `openshell-core`, `openshell-bootstrap`, `ratatui`, `crossterm`, `tonic`, `tokio` |
-| `crates/openshell-tui/src/lib.rs` | Entry point. Event loop, gRPC calls (`refresh_health`, `refresh_sandboxes`, `spawn_log_stream`, `handle_sandbox_delete`), gateway switching, mTLS channel building |
-| `crates/openshell-tui/src/app.rs` | `App` state struct, `Screen`/`Focus`/`InputMode`/`LogSourceFilter` enums, `LogLine` struct, `GatewayEntry`, all key handling logic |
-| `crates/openshell-tui/src/event.rs` | `Event` enum (`Key`, `Mouse`, `Tick`, `Resize`, `LogLines`), `EventHandler` with mpsc channels and crossterm polling |
+| `crates/openshell-tui/src/lib.rs` | Entry point. Event loop, gRPC calls (`refresh_data`, `refresh_providers`, `refresh_global_settings`, `refresh_workspaces`, `refresh_sandboxes`, `spawn_log_stream`, `handle_sandbox_delete`, `fetch_providers_v2_setting`), gateway switching, mTLS channel building, provider CRUD spawners, settings CRUD spawners, draft approval spawners |
+| `crates/openshell-tui/src/app.rs` | `App` state struct, `Screen`/`Focus`/`InputMode`/`LogSourceFilter`/`MiddlePaneTab`/`SandboxPolicyTab` enums, `LogLine`/`GatewayEntry`/`GlobalSettingEntry`/`SandboxSettingEntry`/`ProviderListEntry`/`ProviderDetailView` structs, create sandbox/provider form state, all key handling logic |
+| `crates/openshell-tui/src/event.rs` | `Event` enum (`Key`, `Mouse`, `Tick`, `Redraw`, `Resize`, `LogLines`, `CreateResult`, `ProviderCreateResult`, `ProviderDetailFetched`, `ProviderUpdateResult`, `ProviderDeleteResult`, `DraftActionResult`, `GlobalSettingsFetched`, `GlobalSettingSetResult`, `GlobalSettingDeleteResult`, `SandboxSettingSetResult`, `SandboxSettingDeleteResult`, `ForwardWarnings`), `EventHandler` with mpsc channels and crossterm polling |
 | `crates/openshell-tui/src/theme.rs` | `colors` module (NVIDIA_GREEN, EVERGLADE, BG, FG) and `styles` module (all `Style` constants) |
-| `crates/openshell-tui/src/ui/mod.rs` | Top-level `draw()` dispatcher, `draw_title_bar`, `draw_nav_bar`, `draw_command_bar`, screen routing |
-| `crates/openshell-tui/src/ui/dashboard.rs` | Dashboard screen — gateway list table (top) + sandbox table (bottom) |
-| `crates/openshell-tui/src/ui/sandboxes.rs` | Reusable sandbox table widget with columns: Name, Status, Created, Age, Image |
-| `crates/openshell-tui/src/ui/sandbox_detail.rs` | Sandbox detail view — name, status, image, created, age, delete confirmation dialog |
-| `crates/openshell-tui/src/ui/sandbox_logs.rs` | Structured log viewer — timestamp, source, level, target, message, key=value fields, scroll position, source filter |
+| `crates/openshell-tui/src/clipboard.rs` | Clipboard copy support for log lines |
+| `crates/openshell-tui/src/ui/mod.rs` | Top-level `draw()` dispatcher, `draw_title_bar` (with workspace display), `draw_nav_bar`, `draw_command_bar`, screen routing, shared setting-edit overlay, modal helpers |
+| `crates/openshell-tui/src/ui/dashboard.rs` | Dashboard screen — 3-pane vertical layout: gateway list (25%) + provider/settings middle pane (25%) + sandbox table (50%) |
+| `crates/openshell-tui/src/ui/providers.rs` | Provider list table with profile-aware columns: Name, Category, Type, Credentials, Workspace |
+| `crates/openshell-tui/src/ui/global_settings.rs` | Global settings table: Key, Type, Value. Includes edit overlay, confirm-set, and confirm-delete popups |
+| `crates/openshell-tui/src/ui/sandboxes.rs` | Reusable sandbox table widget with columns: Name, Status, Created, Age, Image, Workspace, Notes |
+| `crates/openshell-tui/src/ui/sandbox_detail.rs` | Sandbox metadata view — name, status, image, created, age, providers, policy version |
+| `crates/openshell-tui/src/ui/sandbox_policy.rs` | Policy viewer — rendered policy lines with scroll support, tab title |
+| `crates/openshell-tui/src/ui/sandbox_settings.rs` | Sandbox settings table: Key, Type, Value, Scope. Includes edit overlay and confirm popups |
+| `crates/openshell-tui/src/ui/sandbox_logs.rs` | Structured log viewer — timestamp, source, level, target, message, key=value fields, scroll position, source filter, visual selection mode, clipboard copy |
+| `crates/openshell-tui/src/ui/sandbox_draft.rs` | Draft policy recommendations — chunk list, detail popup, approve/reject/approve-all flows |
+| `crates/openshell-tui/src/ui/create_sandbox.rs` | Create sandbox modal form with name, image, command, providers, ports |
+| `crates/openshell-tui/src/ui/create_provider.rs` | Create provider modal, provider detail popup, update provider form |
+| `crates/openshell-tui/src/ui/splash.rs` | Splash/boot screen |
 
 ### Module dependency flow
 
 ```
-lib.rs (event loop, gRPC, async tasks)
-  ├── app.rs (state + key handling)
+lib.rs (event loop, gRPC, async tasks, capability fetch)
+  ├── app.rs (state + key handling + tab/workspace logic)
   ├── event.rs (Event enum + EventHandler)
+  ├── clipboard.rs (copy support)
   ├── theme.rs (colors + styles)
   └── ui/
-        ├── mod.rs (draw dispatcher, chrome)
-        ├── dashboard.rs (gateway list + sandbox table layout)
+        ├── mod.rs (draw dispatcher, chrome, shared overlays)
+        ├── splash.rs (boot screen)
+        ├── dashboard.rs (3-pane layout: gateways + middle + sandboxes)
+        ├── providers.rs (provider list with profile awareness)
+        ├── global_settings.rs (settings table + edit/confirm overlays)
         ├── sandboxes.rs (sandbox table widget)
-        ├── sandbox_detail.rs (detail view)
-        └── sandbox_logs.rs (log viewer)
+        ├── sandbox_detail.rs (metadata view)
+        ├── sandbox_policy.rs (policy viewer)
+        ├── sandbox_settings.rs (sandbox settings table + overlays)
+        ├── sandbox_logs.rs (log viewer + visual selection)
+        ├── sandbox_draft.rs (draft recommendations)
+        ├── create_sandbox.rs (create sandbox modal)
+        └── create_provider.rs (create/detail/update provider modals)
 ```
 
 ## 8. Technical Notes
@@ -375,7 +460,9 @@ lib.rs (event loop, gRPC, async tasks)
 ### Dependency constraints
 
 - **`openshell-tui` cannot depend on `openshell-cli`** — this would create a circular dependency. TLS channel building for gateway switching is done directly in `lib.rs` using `tonic::transport` primitives (`Certificate`, `Identity`, `ClientTlsConfig`, `Endpoint`).
+- Gateway authentication supports both mTLS and OIDC. `connect_to_gateway()` reads gateway metadata to determine the auth mode, then builds an `EdgeAuthInterceptor` (bearer token for OIDC, noop for mTLS).
 - mTLS certs are read from `~/.config/openshell/gateways/<name>/mtls/` (ca.crt, tls.crt, tls.key).
+- OIDC tokens are loaded via `openshell_bootstrap::oidc_token::load_oidc_token()` and checked for expiry.
 
 ### Proto generated code
 
@@ -404,8 +491,12 @@ use openshell_core::proto::{ListSandboxesRequest, GetSandboxLogsRequest, ...};
   };
   ```
 - `SandboxLogLine` proto fields: `sandbox_id`, `timestamp_ms`, `level`, `target`, `message`, `source`, `fields` (HashMap<String, String>).
-- `GetSandboxLogsRequest` fields: `sandbox_id`, `lines` (u32), `since_ms` (i64), `sources` (Vec<String>), `min_level` (String).
-- `ListSandboxesRequest` fields: `limit` (i64), `offset` (i64).
+- `GetSandboxLogsRequest` fields: `sandbox_id`, `lines` (u32), `since_ms` (i64), `sources` (Vec<String>), `min_level` (String), `workspace` (String).
+- `ListSandboxesRequest` fields: `limit` (i64), `offset` (i64), `label_selector` (String), `workspace` (String), `all_workspaces` (bool).
+- `ListProvidersRequest` fields: `limit` (i64), `offset` (i64), `workspace` (String), `all_workspaces` (bool).
+- `ListWorkspacesRequest` fields: `limit` (i64), `offset` (i64), `label_selector` (String).
+- `UpdateConfigRequest` fields: `name` (String, sandbox name or empty for global), `setting_key`, `setting_value`, `delete_setting` (bool), `global` (bool), `workspace`.
+- Most resource requests include a `workspace` field that scopes the operation to the current workspace.
 
 ### gRPC timeouts
 
@@ -431,9 +522,38 @@ The connect timeout for gateway switching is 10 seconds with HTTP/2 keepalive at
 
 1. User selects a different gateway and presses `Enter` → `pending_gateway_switch = Some(name)`
 2. Event loop calls `handle_gateway_switch()`
-3. New mTLS channel is built via `connect_to_gateway()`
-4. On success: `app.client` is replaced, `reset_sandbox_state()` clears all sandbox data, `refresh_data()` fetches health + sandboxes for the new gateway
+3. New channel is built via `connect_to_gateway()` (mTLS or OIDC depending on gateway metadata)
+4. On success:
+   - `app.client` is replaced with a new intercepted client
+   - `reset_sandbox_state()` clears all sandbox/log/draft/policy data
+   - `fetch_providers_v2_setting()` probes the new gateway's `GetGatewayConfig` to determine whether providers_v2 mode is enabled, so provider CRUD controls render correctly
+   - `refresh_data()` runs the full capability refresh sequence: `refresh_health` → `refresh_global_settings` → `refresh_workspaces` → `refresh_providers` → `refresh_sandboxes`
 5. On failure: `status_text` shows the error
+
+### Initial startup lifecycle
+
+On launch, before the event loop starts:
+
+1. `fetch_providers_v2_setting()` — probe gateway capability
+2. `refresh_gateway_list()` — discover gateways from disk
+3. `refresh_data()` — full refresh (health, global settings, workspaces, providers, sandboxes)
+
+### Workspace switching lifecycle
+
+1. User presses `[w]` on the sandboxes panel → `cycle_workspace()` advances through discovered workspace names, then "all"
+2. `pending_workspace_refresh = true` is set, cursor indices are reset
+3. Event loop calls `refresh_providers()` and `refresh_sandboxes()` with the new workspace scope
+
+### Settings CRUD lifecycle (global and sandbox)
+
+1. User presses `[Enter]` on a setting → edit overlay opens (bool types toggle inline and jump to confirmation)
+2. Text input with validation (int, bool, string with allowed-values check)
+3. `[Enter]` opens a confirmation popup → `[y]` fires the pending flag
+4. Event loop spawns `spawn_set_global_setting()` or `spawn_set_sandbox_setting()` → `UpdateConfig` RPC
+5. On success: re-fetches settings to reflect the change
+6. `[d]` on a setting with a value → confirmation popup → `spawn_delete_*_setting()` → `UpdateConfig` with `delete_setting: true`
+
+For sandbox settings, globally-managed entries (scope = global) are blocked from editing or deletion at the sandbox level.
 
 ## 9. Development Workflow
 

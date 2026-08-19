@@ -8,22 +8,42 @@
 
 #![allow(clippy::result_large_err)] // Validation returns Result<_, Status>
 
+use openshell_core::ComputeDriverKind;
 use openshell_core::proto::{
-    ExecSandboxRequest, Provider, SandboxPolicy as ProtoSandboxPolicy, SandboxTemplate,
+    CredentialHandle, ExecSandboxRequest, Provider, SandboxPolicy as ProtoSandboxPolicy,
+    SandboxTemplate,
 };
 use prost::Message;
 use tonic::Status;
 
 use super::{
-    MAX_ENVIRONMENT_ENTRIES, MAX_LOG_LEVEL_LEN, MAX_MAP_KEY_LEN, MAX_MAP_VALUE_LEN,
-    MAX_METADATA_ANNOTATIONS_ENTRIES, MAX_NAME_LEN, MAX_POLICY_SIZE, MAX_PROVIDER_CONFIG_ENTRIES,
-    MAX_PROVIDER_CREDENTIALS_ENTRIES, MAX_PROVIDER_TYPE_LEN, MAX_PROVIDERS, MAX_ROUTABLE_NAME_LEN,
-    MAX_TEMPLATE_MAP_ENTRIES, MAX_TEMPLATE_STRING_LEN, MAX_TEMPLATE_STRUCT_SIZE,
+    MAX_ENVIRONMENT_ENTRIES, MAX_LABEL_SELECTOR_PAIRS, MAX_LOG_LEVEL_LEN, MAX_MAP_KEY_LEN,
+    MAX_MAP_VALUE_LEN, MAX_METADATA_ANNOTATIONS_ENTRIES, MAX_NAME_LEN, MAX_POLICY_SIZE,
+    MAX_PROVIDER_CONFIG_ENTRIES, MAX_PROVIDER_CREDENTIALS_ENTRIES, MAX_PROVIDER_TYPE_LEN,
+    MAX_PROVIDERS, MAX_ROUTABLE_NAME_LEN, MAX_TEMPLATE_MAP_ENTRIES, MAX_TEMPLATE_STRING_LEN,
+    MAX_TEMPLATE_STRUCT_SIZE,
 };
 
 // ---------------------------------------------------------------------------
 // Exec request validation
 // ---------------------------------------------------------------------------
+
+/// Preserve process-identity omission only for the local OCI-aware drivers.
+///
+/// Kubernetes, VM, and unknown/remote drivers retain the legacy persisted
+/// `sandbox:sandbox` defaults so existing policy hashes and live-update
+/// workflows do not change.
+pub(super) fn normalize_process_identity_for_driver(
+    policy: &mut ProtoSandboxPolicy,
+    driver_kind: Option<ComputeDriverKind>,
+) {
+    if !matches!(
+        driver_kind,
+        Some(ComputeDriverKind::Docker | ComputeDriverKind::Podman)
+    ) {
+        openshell_policy::ensure_sandbox_process_identity(policy);
+    }
+}
 
 /// Maximum number of arguments in the command array.
 pub(super) const MAX_EXEC_COMMAND_ARGS: usize = 1024;
@@ -413,6 +433,8 @@ pub(super) fn validate_provider_mutable_fields(provider: &Provider) -> Result<()
         MAX_MAP_VALUE_LEN,
         "provider.credentials",
     )?;
+    validate_provider_credential_handles(&provider.credential_handles)?;
+    validate_provider_credential_sources(provider)?;
     validate_string_map(
         &provider.config,
         MAX_PROVIDER_CONFIG_ENTRIES,
@@ -440,6 +462,99 @@ pub(super) fn validate_provider_mutable_fields(provider: &Provider) -> Result<()
         }
     }
     Ok(())
+}
+
+fn validate_provider_credential_sources(provider: &Provider) -> Result<(), Status> {
+    let total_credentials = provider.credentials.len() + provider.credential_handles.len();
+    if total_credentials > MAX_PROVIDER_CREDENTIALS_ENTRIES {
+        return Err(Status::invalid_argument(format!(
+            "provider credential sources exceed maximum entries ({total_credentials} > {MAX_PROVIDER_CREDENTIALS_ENTRIES})"
+        )));
+    }
+
+    for key in provider.credential_handles.keys() {
+        if provider.credentials.contains_key(key) {
+            return Err(Status::invalid_argument(format!(
+                "provider credential key '{key}' cannot be present in both provider.credentials and provider.credential_handles"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_provider_credential_handles(
+    credential_handles: &std::collections::HashMap<String, CredentialHandle>,
+) -> Result<(), Status> {
+    if credential_handles.len() > MAX_PROVIDER_CREDENTIALS_ENTRIES {
+        return Err(Status::invalid_argument(format!(
+            "provider.credential_handles exceeds maximum entries ({} > {MAX_PROVIDER_CREDENTIALS_ENTRIES})",
+            credential_handles.len()
+        )));
+    }
+
+    for (credential_key, handle) in credential_handles {
+        if credential_key.len() > MAX_MAP_KEY_LEN {
+            return Err(Status::invalid_argument(format!(
+                "provider.credential_handles key exceeds maximum length ({} > {MAX_MAP_KEY_LEN})",
+                credential_key.len()
+            )));
+        }
+        if !super::provider::is_valid_env_key(credential_key) {
+            return Err(Status::invalid_argument(format!(
+                "provider.credential_handles keys must match ^[A-Za-z_][A-Za-z0-9_]*$; got '{credential_key}'"
+            )));
+        }
+        validate_credential_handle(
+            handle,
+            &format!("provider.credential_handles['{credential_key}']"),
+        )?;
+    }
+
+    Ok(())
+}
+
+fn validate_credential_handle(handle: &CredentialHandle, field_name: &str) -> Result<(), Status> {
+    validate_required_credential_handle_string(&handle.driver, field_name, "driver")?;
+    validate_required_credential_handle_string(&handle.handle, field_name, "handle")?;
+    validate_string_map(
+        &handle.metadata,
+        MAX_PROVIDER_CONFIG_ENTRIES,
+        MAX_MAP_KEY_LEN,
+        MAX_MAP_VALUE_LEN,
+        &format!("{field_name}.metadata"),
+    )?;
+    for (key, value) in &handle.metadata {
+        reject_control_chars(key, &format!("{field_name}.metadata key"))?;
+        reject_control_chars(value, &format!("{field_name}.metadata value for '{key}'"))?;
+    }
+    Ok(())
+}
+
+fn validate_required_credential_handle_string(
+    value: &str,
+    field_name: &str,
+    component: &str,
+) -> Result<(), Status> {
+    if value.trim().is_empty() {
+        return Err(Status::invalid_argument(format!(
+            "{field_name}.{component} is required"
+        )));
+    }
+    validate_optional_credential_handle_string(value, field_name, component)
+}
+
+fn validate_optional_credential_handle_string(
+    value: &str,
+    field_name: &str,
+    component: &str,
+) -> Result<(), Status> {
+    if value.len() > MAX_MAP_VALUE_LEN {
+        return Err(Status::invalid_argument(format!(
+            "{field_name}.{component} exceeds maximum length ({} > {MAX_MAP_VALUE_LEN})",
+            value.len()
+        )));
+    }
+    reject_control_chars(value, &format!("{field_name}.{component}"))
 }
 
 // ---------------------------------------------------------------------------
@@ -619,10 +734,17 @@ pub(super) fn validate_label_selector(selector: &str) -> Result<(), Status> {
         return Ok(());
     }
 
+    let mut count = 0usize;
     for pair in selector.split(',') {
         let pair = pair.trim();
         if pair.is_empty() {
             continue;
+        }
+        count += 1;
+        if count > MAX_LABEL_SELECTOR_PAIRS {
+            return Err(Status::invalid_argument(format!(
+                "label selector exceeds {MAX_LABEL_SELECTOR_PAIRS} pair limit"
+            )));
         }
 
         let parts: Vec<&str> = pair.splitn(2, '=').collect();
@@ -1231,6 +1353,18 @@ mod tests {
         std::iter::once(("KEY".to_string(), "val".to_string())).collect()
     }
 
+    fn one_credential_handle() -> HashMap<String, CredentialHandle> {
+        std::iter::once((
+            "API_KEY".to_string(),
+            CredentialHandle {
+                driver: "kubernetes-secrets".to_string(),
+                handle: "v1:openshell:provider-secret".to_string(),
+                metadata: HashMap::new(),
+            },
+        ))
+        .collect()
+    }
+
     fn make_test_provider(
         name: &str,
         provider_type: &str,
@@ -1253,6 +1387,7 @@ mod tests {
             config,
             credential_expires_at_ms: HashMap::new(),
             profile_workspace: "default".to_string(),
+            credential_handles: HashMap::new(),
         }
     }
 
@@ -1265,6 +1400,72 @@ mod tests {
             std::iter::once(("endpoint".to_string(), "https://example.com".to_string())).collect(),
         );
         assert!(validate_provider_fields(&provider).is_ok());
+    }
+
+    #[test]
+    fn validate_provider_fields_accepts_credential_handles() {
+        let mut provider =
+            make_test_provider("my-provider", "claude", HashMap::new(), HashMap::new());
+        provider.credential_handles = one_credential_handle();
+
+        assert!(validate_provider_fields(&provider).is_ok());
+    }
+
+    #[test]
+    fn validate_provider_fields_rejects_duplicate_inline_and_referenced_key() {
+        let mut provider = make_test_provider(
+            "my-provider",
+            "claude",
+            std::iter::once(("API_KEY".to_string(), "inline".to_string())).collect(),
+            HashMap::new(),
+        );
+        provider.credential_handles = one_credential_handle();
+
+        let err = validate_provider_fields(&provider).unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("provider.credentials"));
+        assert!(err.message().contains("provider.credential_handles"));
+    }
+
+    #[test]
+    fn validate_provider_fields_rejects_too_many_combined_credential_sources() {
+        let refs: HashMap<String, CredentialHandle> = (0..MAX_PROVIDER_CREDENTIALS_ENTRIES)
+            .map(|i| {
+                (
+                    format!("REF_{i}"),
+                    CredentialHandle {
+                        driver: "test".to_string(),
+                        handle: format!("handle-{i}"),
+                        metadata: HashMap::new(),
+                    },
+                )
+            })
+            .collect();
+        let mut provider = make_test_provider("ok", "claude", one_credential(), HashMap::new());
+        provider.credential_handles = refs;
+
+        let err = validate_provider_fields(&provider).unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("credential sources"));
+    }
+
+    #[test]
+    fn validate_provider_fields_rejects_credential_handle_missing_handle() {
+        let mut provider =
+            make_test_provider("my-provider", "claude", HashMap::new(), HashMap::new());
+        provider.credential_handles = std::iter::once((
+            "API_KEY".to_string(),
+            CredentialHandle {
+                driver: "test".to_string(),
+                handle: String::new(),
+                metadata: HashMap::new(),
+            },
+        ))
+        .collect();
+
+        let err = validate_provider_fields(&provider).unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("handle is required"));
     }
 
     #[test]
@@ -1634,7 +1835,61 @@ mod tests {
         assert!(err.message().contains("exceeds 63 characters"));
     }
 
+    #[test]
+    fn validate_label_selector_rejects_too_many_pairs() {
+        let pairs: Vec<String> = (0..65).map(|i| format!("k{i}=v{i}")).collect();
+        let selector = pairs.join(",");
+        let err = validate_label_selector(&selector).unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("64 pair limit"));
+    }
+
+    #[test]
+    fn validate_label_selector_accepts_max_pairs() {
+        let pairs: Vec<String> = (0..64).map(|i| format!("k{i}=v{i}")).collect();
+        let selector = pairs.join(",");
+        assert!(validate_label_selector(&selector).is_ok());
+    }
+
     // ---- Policy safety ----
+
+    #[test]
+    fn process_identity_omission_is_driver_scoped() {
+        use openshell_core::proto::ProcessPolicy;
+
+        for driver in [ComputeDriverKind::Docker, ComputeDriverKind::Podman] {
+            let mut policy = ProtoSandboxPolicy {
+                process: Some(ProcessPolicy {
+                    run_as_user: "1234".into(),
+                    run_as_group: String::new(),
+                }),
+                ..Default::default()
+            };
+            normalize_process_identity_for_driver(&mut policy, Some(driver));
+            assert!(
+                policy.process.unwrap().run_as_group.is_empty(),
+                "{driver:?} must preserve omission"
+            );
+        }
+
+        for driver in [
+            Some(ComputeDriverKind::Kubernetes),
+            Some(ComputeDriverKind::Vm),
+            None,
+        ] {
+            let mut policy = ProtoSandboxPolicy {
+                process: Some(ProcessPolicy {
+                    run_as_user: "1234".into(),
+                    run_as_group: String::new(),
+                }),
+                ..Default::default()
+            };
+            normalize_process_identity_for_driver(&mut policy, driver);
+            let process = policy.process.unwrap();
+            assert_eq!(process.run_as_user, "1234");
+            assert_eq!(process.run_as_group, "sandbox");
+        }
+    }
 
     #[test]
     fn validate_policy_safety_rejects_root_user() {

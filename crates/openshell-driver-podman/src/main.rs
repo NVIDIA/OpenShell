@@ -9,10 +9,10 @@ use tracing::info;
 use tracing_subscriber::EnvFilter;
 
 use openshell_core::VERSION;
-use openshell_core::config::DEFAULT_STOP_TIMEOUT_SECS;
 use openshell_core::proto::compute::v1::compute_driver_server::ComputeDriverServer;
 use openshell_driver_podman::config::{
-    DEFAULT_NETWORK_NAME, DEFAULT_SANDBOX_PIDS_LIMIT, ImagePullPolicy,
+    DEFAULT_NETWORK_NAME, DEFAULT_PODMAN_STOP_TIMEOUT_SECS, DEFAULT_SANDBOX_PIDS_LIMIT,
+    ImagePullPolicy,
 };
 use openshell_driver_podman::{ComputeDriverService, PodmanComputeConfig, PodmanComputeDriver};
 
@@ -67,7 +67,7 @@ struct Args {
     #[arg(
         long,
         env = "OPENSHELL_SANDBOX_SSH_SOCKET_PATH",
-        default_value = "/run/openshell/ssh.sock"
+        default_value = openshell_core::container_paths::SSH_SOCKET_PATH
     )]
     sandbox_ssh_socket_path: String,
 
@@ -76,7 +76,7 @@ struct Args {
     network_name: String,
 
     /// Container stop timeout in seconds (SIGTERM → SIGKILL).
-    #[arg(long, env = "OPENSHELL_STOP_TIMEOUT", default_value_t = DEFAULT_STOP_TIMEOUT_SECS)]
+    #[arg(long, env = "OPENSHELL_STOP_TIMEOUT", default_value_t = DEFAULT_PODMAN_STOP_TIMEOUT_SECS)]
     stop_timeout: u32,
 
     /// Container cgroup PID limit for sandbox containers. Set 0 to inherit
@@ -133,6 +133,21 @@ struct Args {
     /// SSRF/`allowed_ips` validation no longer binds the connection.
     #[arg(long, env = "OPENSHELL_SANDBOX_PROXY_CONNECT_BY_HOSTNAME")]
     sandbox_proxy_connect_by_hostname: Option<bool>,
+
+    /// User namespace mode for sandbox containers (e.g. `auto`).
+    /// When unset, containers use the default user namespace.
+    #[arg(long, env = "OPENSHELL_PODMAN_USERNS")]
+    userns: Option<String>,
+
+    /// Explicit UID mappings for `userns = "private"`.
+    /// Each entry is `"container_id:host_id:size"`.
+    #[arg(long = "uidmap")]
+    uidmap: Vec<String>,
+
+    /// Explicit GID mappings for `userns = "private"`.
+    /// Each entry is `"container_id:host_id:size"`.
+    #[arg(long = "gidmap")]
+    gidmap: Vec<String>,
 }
 
 #[tokio::main]
@@ -168,6 +183,9 @@ async fn main() -> Result<()> {
         proxy_auth_file: args.sandbox_proxy_auth_file,
         proxy_auth_allow_insecure: args.sandbox_proxy_auth_allow_insecure,
         proxy_connect_by_hostname: args.sandbox_proxy_connect_by_hostname,
+        userns: args.userns,
+        uidmap: args.uidmap,
+        gidmap: args.gidmap,
         ..PodmanComputeConfig::default()
     })
     .await

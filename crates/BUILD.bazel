@@ -1,0 +1,7 @@
+test_suite(
+    name = "rustfmt_test",
+    tests = [
+        "//crates/{package}:rustfmt_test".format(package = package)
+        for package in subpackages(include = ["openshell-*"])
+    ],
+)

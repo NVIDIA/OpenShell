@@ -5,7 +5,7 @@ use super::*;
 use openshell_core::config::DEFAULT_SERVER_PORT;
 use openshell_core::driver_utils::{
     LABEL_MANAGED_BY, LABEL_MANAGED_BY_VALUE, LABEL_SANDBOX_ID, LABEL_SANDBOX_NAME,
-    LABEL_SANDBOX_NAMESPACE,
+    LABEL_SANDBOX_NAMESPACE, supervisor_cache_path_with_base,
 };
 use openshell_core::progress::{
     PROGRESS_ACTIVE_DETAIL_KEY, PROGRESS_ACTIVE_STEP_KEY, PROGRESS_COMPLETE_LABEL_KEY,
@@ -13,8 +13,9 @@ use openshell_core::progress::{
     PROGRESS_STEP_STARTING_SANDBOX,
 };
 use openshell_core::proto::compute::v1::{
-    DriverResourceRequirements, DriverSandboxSpec, DriverSandboxTemplate, GpuResourceRequirements,
-    ResourceRequirements,
+    DriverResourceRequirements, DriverSandboxSpec, DriverSandboxTemplate,
+    GetGatewayListenerRequirementsRequest, GpuResourceRequirements, ResourceRequirements,
+    gateway_listener_requirement::Selector,
 };
 use std::fs;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -101,6 +102,10 @@ fn runtime_config() -> DockerDriverRuntimeConfig {
             ),
             host_alias_ip: IpAddr::V4(Ipv4Addr::new(172, 18, 0, 1)),
         },
+        gateway_callback_bind_address: Some(SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::new(172, 18, 0, 1)),
+            DEFAULT_SERVER_PORT,
+        )),
         ssh_socket_path: "/run/openshell/ssh.sock".to_string(),
         stop_timeout_secs: DEFAULT_STOP_TIMEOUT_SECS,
         log_level: "info".to_string(),
@@ -141,14 +146,6 @@ fn inspected_volume(driver: &str, options: HashMap<String, String>) -> bollard::
     }
 }
 
-struct DisconnectedSupervisorReadiness;
-
-impl SupervisorReadiness for DisconnectedSupervisorReadiness {
-    fn is_supervisor_connected(&self, _sandbox_id: &str) -> bool {
-        false
-    }
-}
-
 fn test_driver_with_config(config: DockerDriverRuntimeConfig) -> DockerComputeDriver {
     let allow_all_default_gpu = config.allow_all_default_gpu;
     DockerComputeDriver {
@@ -159,12 +156,70 @@ fn test_driver_with_config(config: DockerDriverRuntimeConfig) -> DockerComputeDr
         config,
         events: broadcast::channel(WATCH_BUFFER).0,
         pending: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
-        supervisor_readiness: Arc::new(DisconnectedSupervisorReadiness),
         gpu_selector: Arc::new(CdiGpuDefaultSelector::new(
             CdiGpuInventory::default(),
             allow_all_default_gpu,
         )),
+        lifecycle_event_fences: DockerLifecycleEventFences::default(),
     }
+}
+
+#[tokio::test]
+async fn gateway_listener_requirements_report_managed_bridge_address() {
+    let config = runtime_config();
+    let expected_address = match config.gateway_route {
+        DockerGatewayRoute::Bridge { bind_address, .. } => bind_address,
+        DockerGatewayRoute::HostGateway => panic!("test config must use a managed bridge"),
+    };
+    let driver = test_driver_with_config(config);
+
+    let response = driver
+        .get_gateway_listener_requirements(Request::new(GetGatewayListenerRequirementsRequest {}))
+        .await
+        .unwrap()
+        .into_inner();
+
+    assert_eq!(response.requirements.len(), 1);
+    assert_eq!(
+        response.requirements[0].selector,
+        Some(Selector::ExactBindAddress(expected_address.to_string()))
+    );
+}
+
+#[tokio::test]
+async fn gateway_listener_requirements_are_empty_for_host_gateway_route() {
+    let mut config = runtime_config();
+    config.gateway_route = DockerGatewayRoute::HostGateway;
+    config.gateway_callback_bind_address = None;
+    let driver = test_driver_with_config(config);
+
+    let response = driver
+        .get_gateway_listener_requirements(Request::new(GetGatewayListenerRequirementsRequest {}))
+        .await
+        .unwrap()
+        .into_inner();
+
+    assert!(response.requirements.is_empty());
+}
+
+#[tokio::test]
+async fn host_gateway_route_reports_ipv4_loopback_callback_listener() {
+    let mut config = runtime_config();
+    config.gateway_route = DockerGatewayRoute::HostGateway;
+    config.gateway_callback_bind_address = Some("127.0.0.1:17670".parse().unwrap());
+    let driver = test_driver_with_config(config);
+
+    let response = driver
+        .get_gateway_listener_requirements(Request::new(GetGatewayListenerRequirementsRequest {}))
+        .await
+        .unwrap()
+        .into_inner();
+
+    assert_eq!(response.requirements.len(), 1);
+    assert_eq!(
+        response.requirements[0].selector,
+        Some(Selector::ExactBindAddress("127.0.0.1:17670".to_string()))
+    );
 }
 
 #[test]
@@ -266,6 +321,31 @@ fn docker_gateway_route_uses_host_gateway_for_docker_desktop() {
             "host.openshell.internal:host-gateway".to_string()
         ]
     );
+}
+
+#[test]
+fn host_gateway_route_requests_ipv4_loopback_for_ipv6_primary() {
+    assert_eq!(
+        docker_gateway_callback_bind_address(
+            &DockerGatewayRoute::HostGateway,
+            "[::1]:17670".parse().unwrap(),
+        ),
+        Some("127.0.0.1:17670".parse().unwrap())
+    );
+}
+
+#[test]
+fn host_gateway_route_reuses_ipv4_primary_when_it_covers_loopback() {
+    for primary in ["127.0.0.1:17670", "0.0.0.0:17670"] {
+        assert_eq!(
+            docker_gateway_callback_bind_address(
+                &DockerGatewayRoute::HostGateway,
+                primary.parse().unwrap(),
+            ),
+            None,
+            "{primary} already covers the IPv4 loopback callback"
+        );
+    }
 }
 
 #[test]
@@ -539,6 +619,247 @@ fn build_environment_sets_docker_tls_paths() {
     assert!(env.contains(&"TEMPLATE_ENV=template".to_string()));
     assert!(env.contains(&"SPEC_ENV=spec".to_string()));
     assert!(env.contains(&"OPENSHELL_SANDBOX_COMMAND=sleep infinity".to_string()));
+}
+
+#[test]
+fn build_environment_protects_oci_identity_metadata() {
+    let mut sandbox = test_sandbox();
+    let spec = sandbox.spec.as_mut().unwrap();
+    for (key, value) in [
+        (openshell_core::sandbox_env::OCI_IMAGE_USER, "spoofed"),
+        (openshell_core::sandbox_env::SANDBOX_UID, "9999"),
+        (openshell_core::sandbox_env::SANDBOX_GID, "9999"),
+    ] {
+        spec.environment.insert(key.to_string(), value.to_string());
+    }
+
+    let env = build_environment_for_oci_user(&sandbox, &runtime_config(), "app:staff");
+
+    assert!(env.contains(&format!(
+        "{}=app:staff",
+        openshell_core::sandbox_env::OCI_IMAGE_USER
+    )));
+    assert!(env.contains(&format!("{}=", openshell_core::sandbox_env::SANDBOX_UID)));
+    assert!(env.contains(&format!("{}=", openshell_core::sandbox_env::SANDBOX_GID)));
+    assert!(!env.iter().any(|entry| entry.ends_with("=spoofed")));
+    assert!(!env.iter().any(|entry| entry.ends_with("=9999")));
+}
+
+#[test]
+fn build_environment_strips_gateway_tls_server_name() {
+    let mut sandbox = test_sandbox();
+    let spec = sandbox.spec.as_mut().unwrap();
+    spec.environment.insert(
+        openshell_core::sandbox_env::GATEWAY_TLS_SERVER_NAME.to_string(),
+        "evil.attacker.example.com".to_string(),
+    );
+
+    let env = build_environment(&sandbox, &runtime_config());
+
+    assert!(
+        !env.iter().any(|entry| entry.starts_with(&format!(
+            "{}=",
+            openshell_core::sandbox_env::GATEWAY_TLS_SERVER_NAME
+        ))),
+        "GATEWAY_TLS_SERVER_NAME must be stripped from the supervisor environment"
+    );
+}
+
+#[test]
+fn container_creation_uses_inspected_immutable_image() {
+    let sandbox = test_sandbox();
+    let metadata = DockerImageMetadata {
+        id: "sha256:immutable".to_string(),
+        user: "1234:1235".to_string(),
+        working_dir: "/workspace/project".to_string(),
+        volumes: Vec::new(),
+    };
+    let body = build_container_create_body_for_image(
+        &sandbox,
+        &runtime_config(),
+        &DockerSandboxDriverConfig::default(),
+        None,
+        &metadata,
+    )
+    .unwrap();
+
+    assert_eq!(body.image.as_deref(), Some("sha256:immutable"));
+    assert_eq!(body.user.as_deref(), Some("0"));
+    assert_eq!(body.working_dir.as_deref(), Some("/"));
+    assert_eq!(
+        body.cmd.as_deref(),
+        Some(&["--workdir".to_string(), "/workspace/project".to_string()][..])
+    );
+    assert!(body.env.unwrap().contains(&format!(
+        "{}=1234:1235",
+        openshell_core::sandbox_env::OCI_IMAGE_USER
+    )));
+}
+
+#[test]
+fn container_creation_rejects_invalid_oci_working_dir() {
+    let metadata = DockerImageMetadata {
+        id: "sha256:immutable".to_string(),
+        user: "1234:1235".to_string(),
+        working_dir: "relative/workspace".to_string(),
+        volumes: Vec::new(),
+    };
+    let err = build_container_create_body_for_image(
+        &test_sandbox(),
+        &runtime_config(),
+        &DockerSandboxDriverConfig::default(),
+        None,
+        &metadata,
+    )
+    .unwrap_err();
+
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+    assert!(err.message().contains("must be an absolute container path"));
+}
+
+#[test]
+fn container_creation_rejects_openshell_control_path_working_dir() {
+    let metadata = DockerImageMetadata {
+        id: "sha256:immutable".to_string(),
+        user: "1234:1235".to_string(),
+        working_dir: "/opt/openshell/bin/project".to_string(),
+        volumes: Vec::new(),
+    };
+    let err = build_container_create_body_for_image(
+        &test_sandbox(),
+        &runtime_config(),
+        &DockerSandboxDriverConfig::default(),
+        None,
+        &metadata,
+    )
+    .unwrap_err();
+
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+    assert!(err.message().contains("OpenShell control path"));
+}
+
+#[test]
+fn container_creation_rejects_image_volume_that_masks_working_dir() {
+    let sandbox = test_sandbox();
+    let metadata = DockerImageMetadata {
+        id: "sha256:immutable".to_string(),
+        user: "1234:1235".to_string(),
+        working_dir: "/workspace/project".to_string(),
+        volumes: vec!["/workspace".to_string()],
+    };
+
+    let error = build_container_create_body_for_image(
+        &sandbox,
+        &runtime_config(),
+        &DockerSandboxDriverConfig::default(),
+        None,
+        &metadata,
+    )
+    .unwrap_err();
+
+    assert!(
+        error
+            .message()
+            .contains("masks OCI WorkingDir '/workspace/project'")
+    );
+}
+
+#[test]
+fn container_creation_rejects_image_volume_over_configured_ssh_socket() {
+    let metadata = DockerImageMetadata {
+        id: "sha256:immutable".to_string(),
+        user: "1234:1235".to_string(),
+        working_dir: "/workspace".to_string(),
+        volumes: vec!["/custom-runtime".to_string()],
+    };
+    let mut config = runtime_config();
+    config.ssh_socket_path = "/custom-runtime/ssh.sock".to_string();
+
+    let error = build_container_create_body_for_image(
+        &test_sandbox(),
+        &config,
+        &DockerSandboxDriverConfig::default(),
+        None,
+        &metadata,
+    )
+    .unwrap_err();
+
+    assert!(error.message().contains("OpenShell control path"));
+}
+
+#[test]
+fn container_creation_reserves_resolved_workspace_root_but_allows_nested_mounts() {
+    let metadata = DockerImageMetadata {
+        id: "sha256:immutable".to_string(),
+        user: "1234:1235".to_string(),
+        working_dir: "/workspace".to_string(),
+        volumes: Vec::new(),
+    };
+    let root_mount: DockerSandboxDriverConfig = serde_json::from_value(serde_json::json!({
+        "mounts": [{"type": "tmpfs", "target": "/workspace"}]
+    }))
+    .unwrap();
+    let err = build_container_create_body_for_image(
+        &test_sandbox(),
+        &runtime_config(),
+        &root_mount,
+        None,
+        &metadata,
+    )
+    .unwrap_err();
+    assert!(
+        err.message()
+            .contains("reserved for the OpenShell workspace")
+    );
+
+    let ancestor_mount: DockerSandboxDriverConfig = serde_json::from_value(serde_json::json!({
+        "mounts": [{"type": "tmpfs", "target": "/workspace"}]
+    }))
+    .unwrap();
+    let nested_metadata = DockerImageMetadata {
+        working_dir: "/workspace/project".to_string(),
+        volumes: Vec::new(),
+        ..metadata.clone()
+    };
+    let err = build_container_create_body_for_image(
+        &test_sandbox(),
+        &runtime_config(),
+        &ancestor_mount,
+        None,
+        &nested_metadata,
+    )
+    .unwrap_err();
+    assert!(
+        err.message()
+            .contains("reserved for the OpenShell workspace")
+    );
+
+    let nested_mount: DockerSandboxDriverConfig = serde_json::from_value(serde_json::json!({
+        "mounts": [{"type": "tmpfs", "target": "/workspace/cache"}]
+    }))
+    .unwrap();
+    build_container_create_body_for_image(
+        &test_sandbox(),
+        &runtime_config(),
+        &nested_mount,
+        None,
+        &metadata,
+    )
+    .expect("nested workspace mounts remain supported");
+
+    let compatibility_path_mount: DockerSandboxDriverConfig =
+        serde_json::from_value(serde_json::json!({
+            "mounts": [{"type": "tmpfs", "target": "/sandbox"}]
+        }))
+        .unwrap();
+    build_container_create_body_for_image(
+        &test_sandbox(),
+        &runtime_config(),
+        &compatibility_path_mount,
+        None,
+        &metadata,
+    )
+    .expect("/sandbox remains mountable when the inspected workspace is elsewhere");
 }
 
 #[test]
@@ -1076,7 +1397,7 @@ fn driver_config_rejects_reserved_mount_targets() {
         "mounts": [{
             "type": "volume",
             "source": "work-nfs",
-            "target": "/etc/openshell/auth/custom"
+            "target": "/etc/openshell/auth"
         }]
     })));
 
@@ -1084,6 +1405,36 @@ fn driver_config_rejects_reserved_mount_targets() {
 
     assert_eq!(err.code(), tonic::Code::FailedPrecondition);
     assert!(err.message().contains("reserved OpenShell path"));
+}
+
+#[test]
+fn driver_config_rejects_mount_over_configured_ssh_socket() {
+    let mount_config: DockerSandboxDriverConfig = serde_json::from_value(serde_json::json!({
+        "mounts": [{
+            "type": "tmpfs",
+            "target": "/custom-runtime"
+        }]
+    }))
+    .unwrap();
+    let metadata = DockerImageMetadata {
+        id: "sha256:immutable".to_string(),
+        user: "1234:1235".to_string(),
+        working_dir: "/workspace".to_string(),
+        volumes: Vec::new(),
+    };
+    let mut config = runtime_config();
+    config.ssh_socket_path = "/custom-runtime/ssh.sock".to_string();
+
+    let error = build_container_create_body_for_image(
+        &test_sandbox(),
+        &config,
+        &mount_config,
+        None,
+        &metadata,
+    )
+    .unwrap_err();
+
+    assert!(error.message().contains("OpenShell control path"));
 }
 
 #[test]
@@ -1171,14 +1522,17 @@ fn managed_container_label_filters_include_gateway_namespace() {
 }
 
 #[test]
-fn build_container_create_body_clears_inherited_cmd() {
+fn build_container_create_body_replaces_inherited_cmd_with_workspace_arg() {
     let create_body = build_container_create_body(&test_sandbox(), &runtime_config()).unwrap();
 
     assert_eq!(
         create_body.entrypoint,
         Some(vec![SUPERVISOR_MOUNT_PATH.to_string()])
     );
-    assert_eq!(create_body.cmd, Some(Vec::new()));
+    assert_eq!(
+        create_body.cmd,
+        Some(vec!["--workdir".to_string(), "/sandbox".to_string()])
+    );
     assert_eq!(
         create_body
             .labels
@@ -1728,34 +2082,19 @@ fn driver_status_keeps_running_sandboxes_provisioning_with_stable_message() {
         ..running.clone()
     };
 
-    let running_status = driver_status_from_summary(&running, "demo", false);
-    let running_later_status = driver_status_from_summary(&running_later, "demo", false);
-    assert_eq!(running_status.conditions[0].status, "False");
-    assert_eq!(running_status.conditions[0].reason, "DependenciesNotReady");
-    assert_eq!(
-        running_status.conditions[0].message,
-        "Container is running; waiting for supervisor relay"
-    );
+    // A running container always emits Ready=True with BackendReady. The gateway
+    // composes this with supervisor-session presence to decide public SandboxPhase.
+    let running_status = driver_status_from_summary(&running, "demo");
+    let running_later_status = driver_status_from_summary(&running_later, "demo");
+    assert_eq!(running_status.conditions[0].status, "True");
+    assert_eq!(running_status.conditions[0].reason, "BackendReady");
+    assert_eq!(running_status.conditions[0].message, "Container is running");
     assert_eq!(running_status.conditions, running_later_status.conditions);
 
-    let exited_status = driver_status_from_summary(&exited, "demo", false);
+    let exited_status = driver_status_from_summary(&exited, "demo");
     assert_eq!(exited_status.conditions[0].status, "False");
     assert_eq!(exited_status.conditions[0].reason, "ContainerExited");
     assert_eq!(exited_status.conditions[0].message, "Container exited");
-
-    // With a live supervisor session, a RUNNING container flips Ready=True
-    // so ExecSandbox and other "sandbox must be ready" gates can proceed.
-    let running_connected = driver_status_from_summary(&running, "demo", true);
-    assert_eq!(running_connected.conditions[0].status, "True");
-    assert_eq!(
-        running_connected.conditions[0].reason,
-        "SupervisorConnected"
-    );
-
-    // Supervisor readiness is ignored for non-RUNNING states -- an exited
-    // container must not report Ready=True.
-    let exited_connected = driver_status_from_summary(&exited, "demo", true);
-    assert_eq!(exited_connected.conditions[0].status, "False");
 }
 
 #[test]
@@ -1773,7 +2112,7 @@ fn driver_status_marks_restarting_sandboxes_as_error() {
         ..Default::default()
     };
 
-    let status = driver_status_from_summary(&restarting, "demo", false);
+    let status = driver_status_from_summary(&restarting, "demo");
     assert_eq!(status.conditions[0].status, "False");
     assert_eq!(status.conditions[0].reason, "ContainerRestarting");
     assert_eq!(
@@ -1906,7 +2245,7 @@ fn validate_linux_elf_binary_rejects_non_elf_files() {
     fs::write(&path, b"not-elf").unwrap();
 
     let err = validate_linux_elf_binary(&path).unwrap_err();
-    assert!(err.to_string().contains("Linux ELF executable"));
+    assert!(err.contains("Linux ELF executable"));
 }
 
 #[test]
@@ -2112,8 +2451,11 @@ fn docker_supervisor_image_refreshes_mutable_tags_only() {
 #[test]
 fn supervisor_cache_path_namespaces_by_digest_under_openshell_data_dir() {
     let base = PathBuf::from("/var/cache/share");
-    let path =
-        supervisor_cache_path_with_base(&base, "sha256:abc123deadbeef0123456789cafe0123456789fe");
+    let path = supervisor_cache_path_with_base(
+        &base,
+        "docker-supervisor",
+        "sha256:abc123deadbeef0123456789cafe0123456789fe",
+    );
 
     assert_eq!(
         path,
@@ -2126,8 +2468,8 @@ fn supervisor_cache_path_namespaces_by_digest_under_openshell_data_dir() {
 #[test]
 fn supervisor_cache_path_isolates_different_digests() {
     let base = PathBuf::from("/data");
-    let left = supervisor_cache_path_with_base(&base, "sha256:aaaaaaaa");
-    let right = supervisor_cache_path_with_base(&base, "sha256:bbbbbbbb");
+    let left = supervisor_cache_path_with_base(&base, "docker-supervisor", "sha256:aaaaaaaa");
+    let right = supervisor_cache_path_with_base(&base, "docker-supervisor", "sha256:bbbbbbbb");
     assert_ne!(
         left.parent().unwrap(),
         right.parent().unwrap(),
@@ -2201,14 +2543,14 @@ fn extract_first_tar_entry_rejects_empty_archive() {
 }
 
 #[test]
-fn container_state_needs_resume_matches_startable_states() {
+fn container_state_needs_start_matches_startable_states() {
     for state in [
         ContainerSummaryStateEnum::EXITED,
         ContainerSummaryStateEnum::CREATED,
     ] {
         assert!(
-            container_state_needs_resume(state),
-            "{state:?} should be resumed with Docker start",
+            container_state_needs_start(state),
+            "{state:?} should be started with Docker start",
         );
     }
 
@@ -2221,8 +2563,54 @@ fn container_state_needs_resume_matches_startable_states() {
         ContainerSummaryStateEnum::EMPTY,
     ] {
         assert!(
-            !container_state_needs_resume(state),
-            "{state:?} should not be resumed with Docker start",
+            !container_state_needs_start(state),
+            "{state:?} should not be started with Docker start",
         );
     }
+}
+
+#[test]
+fn lifecycle_fence_rejects_polled_exit_from_before_restart() {
+    let fences = DockerLifecycleEventFences::default();
+    fences.begin_start("sandbox-1");
+    assert!(fences.start_in_progress("sandbox-1"));
+    fences.finish_start("sandbox-1");
+    assert!(!fences.start_in_progress("sandbox-1"));
+
+    fences.record_previous_exit("sandbox-1", Some("2026-08-12T16:39:13Z"));
+    assert_eq!(
+        fences.previous_exit("sandbox-1").as_deref(),
+        Some("2026-08-12T16:39:13Z")
+    );
+
+    let previous_exit = ContainerState {
+        status: Some(ContainerStateStatusEnum::EXITED),
+        finished_at: Some("2026-08-12T16:39:13Z".to_string()),
+        ..Default::default()
+    };
+    assert!(docker_polled_exit_is_stale(
+        "2026-08-12T16:39:13Z",
+        Some(&previous_exit),
+    ));
+
+    let running = ContainerState {
+        status: Some(ContainerStateStatusEnum::RUNNING),
+        ..previous_exit.clone()
+    };
+    assert!(docker_polled_exit_is_stale(
+        "2026-08-12T16:39:13Z",
+        Some(&running),
+    ));
+
+    let new_exit = ContainerState {
+        finished_at: Some("2026-08-12T16:40:00Z".to_string()),
+        ..previous_exit
+    };
+    assert!(!docker_polled_exit_is_stale(
+        "2026-08-12T16:39:13Z",
+        Some(&new_exit),
+    ));
+
+    fences.remove("sandbox-1");
+    assert!(fences.previous_exit("sandbox-1").is_none());
 }

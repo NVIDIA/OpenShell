@@ -12,6 +12,16 @@ One value is intentionally NOT rendered here:
                                  when server.externalDbSecret is set, otherwise
                                  --db-url arg for SQLite
 */}}
+{{- $credentialDrivers := list -}}
+{{- if .Values.server.credentialDrivers.kubernetesSecrets.enabled -}}
+{{- $credentialDrivers = append $credentialDrivers "kubernetes-secrets" -}}
+{{- end -}}
+{{- if .Values.server.credentialDrivers.vault.enabled -}}
+{{- $credentialDrivers = append $credentialDrivers "vault" -}}
+{{- end -}}
+{{- if and .Values.certManager.serverIssuerRef.name (not .Values.certManager.enabled) }}
+{{- fail "certManager.serverIssuerRef.name is set but certManager.enabled is false \u2014 the external server certificate, its Secret mount, and the gateway TLS configuration all require cert-manager to be enabled. Set certManager.enabled=true or remove certManager.serverIssuerRef.name." }}
+{{- end }}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -32,7 +42,15 @@ data:
     metrics_bind_address  = "0.0.0.0:{{ .Values.service.metricsPort }}"
     {{- end }}
     log_level             = {{ .Values.server.logLevel | quote }}
+    {{- if $credentialDrivers }}
+    credential_drivers    = [{{- range $i, $driver := $credentialDrivers }}{{ if $i }}, {{ end }}{{ $driver | quote }}{{- end }}]
+    {{- end }}
     sandbox_namespace     = {{ include "openshell.sandboxNamespace" . | quote }}
+    {{- $policyValidationFailureMode := .Values.server.policyValidationFailureMode }}
+    {{- if not (has $policyValidationFailureMode (list "fail_closed" "retain_last_valid")) }}
+    {{- fail "server.policyValidationFailureMode must be fail_closed or retain_last_valid" }}
+    {{- end }}
+    policy_validation_failure_mode = {{ $policyValidationFailureMode | quote }}
     default_image         = {{ .Values.server.sandboxImage | quote }}
     {{- if include "openshell.supervisorImageOverrideEnabled" . }}
     supervisor_image      = {{ include "openshell.supervisorImage" . | quote }}
@@ -76,6 +94,11 @@ data:
     cert_path             = "/etc/openshell-tls/server/tls.crt"
     key_path              = "/etc/openshell-tls/server/tls.key"
     client_ca_path        = "/etc/openshell-tls/client-ca/ca.crt"
+    {{- if .Values.certManager.serverIssuerRef.name }}
+    external_cert_path    = "/etc/openshell-tls/server-external/tls.crt"
+    external_key_path     = "/etc/openshell-tls/server-external/tls.key"
+    external_server_names = [{{- range $i, $name := .Values.certManager.serverDnsNames }}{{ if $i }}, {{ end }}{{ $name | quote }}{{- end }}]
+    {{- end }}
     {{- end }}
 
     {{- if .Values.server.auth.allowUnauthenticatedUsers }}
@@ -112,11 +135,37 @@ data:
     {{- end }}
 
     [openshell.drivers.kubernetes]
+    workspace_mode               = {{ .Values.server.drivers.kubernetes.workspaceMode | default "shared" | quote }}
+    gateway_id                   = {{ .Values.server.sandboxJwt.gatewayId | default (include "openshell.fullname" .) | quote }}
     grpc_endpoint                = {{ include "openshell.grpcEndpoint" . | quote }}
     service_account_name         = {{ include "openshell.sandboxServiceAccountName" . | quote }}
+    {{- if .Values.server.drivers.kubernetes.operatorNamespaceLabel }}
+    operator_namespace_label     = {{ .Values.server.drivers.kubernetes.operatorNamespaceLabel | quote }}
+    {{- end }}
+    {{- if .Values.server.drivers.kubernetes.operatorNamespaceFile }}
+    operator_namespace_file      = {{ .Values.server.drivers.kubernetes.operatorNamespaceFile | quote }}
+    {{- end }}
     supervisor_sideload_method   = {{ include "openshell.supervisorSideloadMethod" . | quote }}
     topology                     = {{ .Values.supervisor.topology | default "combined" | quote }}
     sa_token_ttl_secs            = {{ .Values.server.sandboxJwt.k8sSaTokenTtlSecs | default 3600 }}
+    {{- if .Values.upstreamProxy.url }}
+    https_proxy                  = {{ .Values.upstreamProxy.url | quote }}
+    {{- end }}
+    {{- if .Values.upstreamProxy.noProxy }}
+    no_proxy                     = {{ .Values.upstreamProxy.noProxy | quote }}
+    {{- end }}
+    {{- if .Values.upstreamProxy.authSecret.name }}
+    proxy_auth_secret_name       = {{ .Values.upstreamProxy.authSecret.name | quote }}
+    {{- end }}
+    {{- if .Values.upstreamProxy.authSecret.key }}
+    proxy_auth_secret_key        = {{ .Values.upstreamProxy.authSecret.key | quote }}
+    {{- end }}
+    {{- if and .Values.upstreamProxy.authSecret.name .Values.upstreamProxy.authSecret.key }}
+    proxy_auth_allow_insecure    = {{ .Values.upstreamProxy.authAllowInsecure }}
+    {{- end }}
+    {{- if .Values.upstreamProxy.connectByHostname }}
+    proxy_connect_by_hostname    = true
+    {{- end }}
     {{- if .Values.server.providerTokenGrants.spiffe.enabled }}
     provider_spiffe_workload_api_socket_path = {{ .Values.server.providerTokenGrants.spiffe.workloadApiSocketPath | quote }}
     {{- end }}
@@ -135,6 +184,9 @@ data:
     {{- if .Values.server.workspaceDefaultStorageSize }}
     workspace_default_storage_size = {{ .Values.server.workspaceDefaultStorageSize | quote }}
     {{- end }}
+    {{- if .Values.server.workspaceStorageClass }}
+    workspace_storage_class      = {{ .Values.server.workspaceStorageClass | quote }}
+    {{- end }}
     {{- if .Values.server.defaultRuntimeClassName }}
     default_runtime_class_name   = {{ .Values.server.defaultRuntimeClassName | quote }}
     {{- end }}
@@ -145,6 +197,50 @@ data:
     supervisor_image_pull_policy = {{ .Values.supervisor.image.pullPolicy | quote }}
     {{- end }}
 
+    [openshell.drivers.kubernetes.managed_ssh_ingress]
+    enabled                       = {{ .Values.networkPolicy.enabled }}
+    gateway_namespace             = {{ .Release.Namespace | quote }}
+    gateway_pod_selector          = { "app.kubernetes.io/name" = {{ include "openshell.name" . | quote }}, "app.kubernetes.io/instance" = {{ .Release.Name | quote }} }
+
     [openshell.drivers.kubernetes.sidecar]
     proxy_uid                    = {{ .Values.supervisor.sidecar.proxyUid | default 1337 }}
     process_binary_aware_network_policy = {{ .Values.supervisor.sidecar.processBinaryAwareNetworkPolicy }}
+
+    {{- if not $credentialDrivers }}
+
+    [openshell.gateway.credential_storage]
+    key_encryption_key_env = {{ include "openshell.credentialStorageKeyEncryptionKeyEnvName" . | quote }}
+    {{- end }}
+
+    {{- if .Values.server.credentialDrivers.kubernetesSecrets.enabled }}
+
+    [openshell.credential_drivers.kubernetes-secrets]
+    namespace = {{ include "openshell.credentialKubernetesSecretsNamespace" . | quote }}
+    allow_reference_namespace = {{ .Values.server.credentialDrivers.kubernetesSecrets.allowReferenceNamespace }}
+    workspace_mode               = {{ .Values.server.drivers.kubernetes.workspaceMode | default "shared" | quote }}
+    gateway_id                   = {{ .Values.server.sandboxJwt.gatewayId | default (include "openshell.fullname" .) | quote }}
+    {{- end }}
+
+    {{- if .Values.server.credentialDrivers.vault.enabled }}
+
+    [openshell.credential_drivers.vault]
+    address = {{ .Values.server.credentialDrivers.vault.address | quote }}
+    mount = {{ .Values.server.credentialDrivers.vault.mount | quote }}
+    kv_version = {{ .Values.server.credentialDrivers.vault.kvVersion | quote }}
+    auth_method = {{ .Values.server.credentialDrivers.vault.authMethod | quote }}
+    {{- if .Values.server.credentialDrivers.vault.role }}
+    role = {{ .Values.server.credentialDrivers.vault.role | quote }}
+    {{- end }}
+    {{- if .Values.server.credentialDrivers.vault.kubernetesAuthMount }}
+    kubernetes_auth_mount = {{ .Values.server.credentialDrivers.vault.kubernetesAuthMount | quote }}
+    {{- end }}
+    {{- if .Values.server.credentialDrivers.vault.serviceAccountTokenPath }}
+    service_account_token_path = {{ .Values.server.credentialDrivers.vault.serviceAccountTokenPath | quote }}
+    {{- end }}
+    {{- if .Values.server.credentialDrivers.vault.tokenPath }}
+    token_path = {{ .Values.server.credentialDrivers.vault.tokenPath | quote }}
+    {{- end }}
+    {{- if .Values.server.credentialDrivers.vault.timeoutSecs }}
+    timeout_secs = {{ .Values.server.credentialDrivers.vault.timeoutSecs }}
+    {{- end }}
+    {{- end }}

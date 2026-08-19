@@ -81,13 +81,85 @@ with the sandbox's ephemeral CA and inspect method/path or protocol-specific
 metadata before forwarding. The proxy also supports credential injection on
 terminated HTTP streams when policy allows the endpoint.
 
+Static provider credentials have an independent endpoint-binding boundary.
+Provider profile endpoints define that boundary by default. An endpointless
+profile can delegate binding authority to sandbox policy through an endpoint
+that names the concrete attached provider instance. The gateway rejects
+unattached, profileless, endpointful, and gateway-global uses of that policy
+binding. Policy endpoint changes rotate the provider-environment revision so
+the supervisor installs policy and credential binding snapshots atomically.
+
 Raw streams and long-lived response bodies are connection scoped. Policy
-reloads affect the next connection or the next parsed HTTP request; they do not
-rewrite bytes already being relayed. HTTP upgrades switch to raw relay by
-default. A `protocol: rest` endpoint can opt in to
+generation changes close relays pinned to the previous generation instead of
+allowing them to continue under stale authorization. HTTP upgrades switch to
+raw relay by default. A `protocol: rest` endpoint can opt in to
 `websocket_credential_rewrite` for client-to-server WebSocket text messages
 after an allowed `101` upgrade; server-to-client traffic and all other upgraded
 protocols remain raw passthrough.
+
+## Credentialed Endpoints
+
+OpenShell keeps provider credentials on paths it can inspect or rewrite by
+default. The gateway derives credential provenance from the attached providers
+and stamps it onto the effective policy at composition time. This provenance is
+internal, contains no credential identifiers or values, and is never trusted
+from user-authored policy.
+
+Every evaluation clears provenance across the whole policy and re-derives it
+from two sources:
+
+- the endpoints of attached provider profiles that carry credentials, and
+- the valid `credential_binding` entries of the sandbox policy that name an
+  attached provider whose profile is endpointless.
+
+A binding reduces to a host and port scope only. Dropping the path is
+deliberate: a path is not observable on an L4 or `tls: skip` endpoint, so a
+path-scoped derivation would omit the marker on exactly the surfaces the
+uninspected-credential gate exists to catch. A malformed binding — empty
+provider, missing host, or a port outside `1..=65535` — fails the evaluation
+instead of contributing a scope. Bindings naming an endpointful profile or an
+unattached provider contribute nothing; the gateway rejects those uses
+separately.
+
+Both sources merge into one deduplicated scope set, and each endpoint is
+stamped once per evaluation from that set, so binding-derived scopes reach the
+same gates as profile-derived ones. The stamp is an assignment, not an
+accumulation, so an endpoint that stops matching a credentialed scope — or
+whose binding was removed — loses its marker in the same pass. This must remain
+a full recomputation: a delta-based derivation would let a series of
+individually valid edits reach a state no single edit would have admitted.
+
+Credentialed L4-only and `tls: skip` endpoints fail policy validation unless the
+public `allow_uninspected_credentials` escape hatch is explicitly enabled. The
+flag defaults to `false` and is security-flagged in policy approval flows.
+Incremental merges only ever add the flag to a matching endpoint; clearing it
+requires removing the endpoint or replacing the policy.
+
+The network supervisor independently enforces the same boundary. Credentialed
+WebSocket upgrades use the parsed relay, binary frames fail closed, and text
+placeholders require rewrite. REST bodies can continue streaming when body
+rewrite is disabled, but the relay withholds enough trailing bytes to detect a
+placeholder split across reads before forwarding its marker. Explicitly opted-in
+endpoints retain raw passthrough behavior.
+
+Denials emit both the relevant network activity and a detection finding. Events
+identify only the destination, policy, and traffic surface; they never include
+credential names, placeholders, body content, or secret values.
+
+Credential provenance is gateway-derived and deliberately absent from the policy
+YAML schema, so it does not survive a policy that never transits the gateway.
+Gateway-delivered policy is the authoritative source for this control, and a
+policy without provenance applies neither the raw-tunnel refusal nor the
+WebSocket binary-frame refusal. The request-body backstop still applies, because
+it keys off the presence of a secret resolver rather than endpoint provenance.
+
+Two paths load a policy without provenance. A supervisor booting from a
+container-image policy is a bounded window: that policy is resynchronized to the
+gateway, which then serves a stamped effective policy. An explicit local Rego and
+data override is permanent, because gateway revisions are observed for settings
+and providers but never replace the local policy. When that override is combined
+with injected provider credentials, the supervisor emits a high-severity
+detection finding at startup naming the inactive controls.
 
 ## Live Updates
 
@@ -98,10 +170,37 @@ supervisor polls for config revisions and attempts to load new dynamic policy
 into the in-process OPA engine; CLI reads of the latest sandbox policy use the
 same effective configuration path.
 
-If a new policy fails validation or loading, the supervisor reports the failure
-and keeps the last-known-good policy. Static controls, such as filesystem
-allowlists and process identity, require a new sandbox because they are applied
-before the child process starts.
+The supervisor validates complete effective policy generations before
+activation. Overlapping endpoint selectors may contribute request allow and
+deny rules only when their connection and request-processing metadata agree;
+conflicting TLS, destination, credential, parser, or enforcement metadata
+rejects the complete generation. Plain L4 endpoints do not contribute
+request-processing metadata, so they may overlap an L7 endpoint when their
+connection metadata agrees. When request paths overlap, a path endpoint with a
+higher specificity rank deterministically overrides broader request-processing
+metadata. Equally specific overlapping endpoints must agree.
+
+Gateway mutation paths validate the complete effective candidate before
+persistence when the affected sandbox scope is known. Direct replacements,
+incremental merges and approvals, provider attachment, and profile fanout reject
+ambiguity atomically, without creating an invalid revision or partially
+activating an update. Supervisor validation remains the defense-in-depth
+boundary for startup, concurrent changes, and sources outside those mutations.
+
+The `[openshell.gateway] policy_validation_failure_mode` configuration controls
+candidates rejected by supervisor runtime validation. Gateway preflight
+rejections never become generations and leave the active policy unchanged. The
+runtime mode defaults to `fail_closed`, which publishes a quarantine generation,
+denies new egress, invalidates existing relays, and leaves the previous policy
+inactive. Operators may explicitly select
+`retain_last_valid`, which keeps the previous generation active. With no
+previous valid generation, the effective mode remains `fail_closed` regardless
+of the configured mode. The gateway distributes this startup configuration to
+sandbox supervisors with each effective policy snapshot. OCSF configuration and finding events state the
+candidate version, validation rationale, configured and effective modes, active
+generation, and whether the previous policy is active. Static controls,
+such as filesystem allowlists and process identity, require a new sandbox
+because they are applied before the child process starts.
 
 Gateway-global policy can override sandbox-scoped policy. Use it sparingly
 because it changes the effective access model for every sandbox on the gateway.

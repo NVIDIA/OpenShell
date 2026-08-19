@@ -1,5 +1,5 @@
-# Installed dependencies
 node_modules/
-
-# Generated protobuf bindings (build output, see AGENTS.md)
 src/gen/
+dist/
+*.tsbuildinfo
+.npmrc

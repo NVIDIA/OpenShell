@@ -6,8 +6,11 @@
 use futures::{Stream, StreamExt};
 use openshell_core::proto::compute::v1::{
     CreateSandboxRequest, CreateSandboxResponse, DeleteSandboxRequest, DeleteSandboxResponse,
-    GetCapabilitiesRequest, GetCapabilitiesResponse, GetSandboxRequest, GetSandboxResponse,
-    ListSandboxesRequest, ListSandboxesResponse, StopSandboxRequest, StopSandboxResponse,
+    DeleteWorkspaceRequest, DeleteWorkspaceResponse, EnsureWorkspaceRequest,
+    EnsureWorkspaceResponse, GetCapabilitiesRequest, GetCapabilitiesResponse,
+    GetGatewayListenerRequirementsRequest, GetGatewayListenerRequirementsResponse,
+    GetSandboxRequest, GetSandboxResponse, ListSandboxesRequest, ListSandboxesResponse,
+    StartSandboxRequest, StartSandboxResponse, StopSandboxRequest, StopSandboxResponse,
     ValidateSandboxCreateRequest, ValidateSandboxCreateResponse, WatchSandboxesEvent,
     WatchSandboxesRequest, compute_driver_server::ComputeDriver,
 };
@@ -38,6 +41,18 @@ impl ComputeDriver for ComputeDriverService {
             .capabilities()
             .map(Response::new)
             .map_err(Status::from)
+    }
+
+    async fn get_gateway_listener_requirements(
+        &self,
+        _request: Request<GetGatewayListenerRequirementsRequest>,
+    ) -> Result<Response<GetGatewayListenerRequirementsResponse>, Status> {
+        Ok(Response::new(GetGatewayListenerRequirementsResponse {
+            requirements: self
+                .driver
+                .gateway_listener_requirements()
+                .map_err(Status::from)?,
+        }))
     }
 
     async fn validate_sandbox_create(
@@ -114,6 +129,21 @@ impl ComputeDriver for ComputeDriverService {
         Ok(Response::new(StopSandboxResponse {}))
     }
 
+    async fn start_sandbox(
+        &self,
+        request: Request<StartSandboxRequest>,
+    ) -> Result<Response<StartSandboxResponse>, Status> {
+        let request = request.into_inner();
+        if request.sandbox_id.is_empty() {
+            return Err(Status::invalid_argument("sandbox_id is required"));
+        }
+        self.driver
+            .start_sandbox(&request.sandbox_id)
+            .await
+            .map_err(Status::from)?;
+        Ok(Response::new(StartSandboxResponse {}))
+    }
+
     async fn delete_sandbox(
         &self,
         request: Request<DeleteSandboxRequest>,
@@ -141,6 +171,20 @@ impl ComputeDriver for ComputeDriverService {
         let stream = stream.map(|item| item.map_err(|err| Status::internal(err.to_string())));
         Ok(Response::new(Box::pin(stream)))
     }
+
+    async fn ensure_workspace(
+        &self,
+        _request: Request<EnsureWorkspaceRequest>,
+    ) -> Result<Response<EnsureWorkspaceResponse>, Status> {
+        Ok(Response::new(EnsureWorkspaceResponse {}))
+    }
+
+    async fn delete_workspace(
+        &self,
+        _request: Request<DeleteWorkspaceRequest>,
+    ) -> Result<Response<DeleteWorkspaceResponse>, Status> {
+        Ok(Response::new(DeleteWorkspaceResponse {}))
+    }
 }
 
 #[cfg(test)]
@@ -166,6 +210,12 @@ mod tests {
     fn already_exists_driver_errors_map_to_already_exists_status() {
         let status: Status = ComputeDriverError::AlreadyExists.into();
         assert_eq!(status.code(), tonic::Code::AlreadyExists);
+    }
+
+    #[test]
+    fn not_found_driver_errors_map_to_not_found_status() {
+        let status: Status = ComputeDriverError::NotFound.into();
+        assert_eq!(status.code(), tonic::Code::NotFound);
     }
 
     fn test_service(socket_path: PathBuf) -> ComputeDriverService {

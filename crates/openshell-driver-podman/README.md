@@ -7,7 +7,26 @@ driver runs in-process within the gateway server and delegates all sandbox
 isolation enforcement to the `openshell-sandbox` supervisor binary, which is
 sideloaded into each container via an OCI image volume mount.
 
+Before creating the container, the driver inspects the final sandbox image and
+captures its immutable image ID and raw OCI `Config.User`. Container creation
+uses that image ID with pulling disabled, preventing a mutable tag from changing
+between inspection and launch. The supervisor runs as root, resolves omitted
+policy identity fields from the image declaration, and drops only agent
+children to the completed identity. Named OCI components remain names after
+validation; a missing group is filled with the user's numeric primary GID. Explicit
+`process.run_as_user` and `process.run_as_group` values take precedence
+independently.
+
 For a rootless networking deep dive, see [NETWORKING.md](NETWORKING.md).
+
+## Stop and Start
+
+Stop stops the managed container without deleting it. The per-sandbox named
+workspace volume, token and proxy-auth secrets, labels, and container metadata
+remain intact. Start starts the same container and reuses the same named
+volume. Stopped managed containers remain visible through list and watch
+reconciliation. Delete remains responsible for removing the container,
+driver-owned secrets, and workspace volume.
 
 ## Architecture
 
@@ -186,7 +205,7 @@ graph TB
         subgraph Container["Sandbox Container"]
             SV["Supervisor<br/>(root in user ns)"]
             subgraph NestedNS["Nested Network Namespace"]
-                SP["Sandbox Process<br/>(sandbox user)"]
+                SP["Sandbox Process<br/>(resolved non-root identity)"]
                 VE2["veth1: 10.200.0.2"]
             end
             VE1["veth0: 10.200.0.1<br/>(CONNECT proxy)"]
@@ -339,7 +358,7 @@ Podman resources after out-of-band container removal or label drift.
 | `OPENSHELL_NETWORK_NAME` | `--network-name` | `openshell` | Podman bridge network name. |
 | `OPENSHELL_PODMAN_HOST_GATEWAY_IP` | `--host-gateway-ip` | empty on Linux, `192.168.127.254` on macOS | Host gateway IP used for sandbox host aliases. Empty uses Podman's `host-gateway` resolver. |
 | `OPENSHELL_SANDBOX_SSH_SOCKET_PATH` | `--sandbox-ssh-socket-path` | `/run/openshell/ssh.sock` | Supervisor Unix socket path in `PodmanComputeConfig`. |
-| `OPENSHELL_STOP_TIMEOUT` | `--stop-timeout` | `10` | Container stop timeout in seconds. |
+| `OPENSHELL_STOP_TIMEOUT` | `--stop-timeout` | `45` | Container stop timeout in seconds. |
 | `OPENSHELL_SANDBOX_PIDS_LIMIT` | `--sandbox-pids-limit` | `2048` | Podman cgroup PID limit for sandbox containers. Set `0` to inherit Podman's runtime/default PID limit. |
 | `OPENSHELL_SUPERVISOR_IMAGE` | `--supervisor-image` | `ghcr.io/nvidia/openshell/supervisor:latest` through the gateway, required standalone | OCI image containing the supervisor binary. |
 | `OPENSHELL_PODMAN_TLS_CA` | `--podman-tls-ca` | unset | Host path to the CA certificate mounted for sandbox mTLS. |
@@ -350,6 +369,7 @@ Podman resources after out-of-band container removal or label drift.
 | `OPENSHELL_SANDBOX_PROXY_AUTH_FILE` | `--sandbox-proxy-auth-file` | unset | Path to a file containing the proxy credentials as `user:pass`. Staged as a root-only Podman secret so credentials never appear in config or container metadata. Requires the insecure-auth acknowledgement below. |
 | `OPENSHELL_SANDBOX_PROXY_AUTH_ALLOW_INSECURE` | `--sandbox-proxy-auth-allow-insecure` | unset | Explicit acknowledgement (`true`) that the credential is sent as cleartext Basic auth over the plain-TCP connection to the `http://` proxy. Required when the auth file is set; rejected when it is not. |
 | `OPENSHELL_SANDBOX_PROXY_CONNECT_BY_HOSTNAME` | `--sandbox-proxy-connect-by-hostname` | unset | Send the destination hostname in CONNECT requests instead of a validated IP. Last resort for proxies whose ACLs filter on hostnames: the proxy then resolves the name itself, so sandbox SSRF/`allowed_ips` validation no longer binds the connection. |
+| `OPENSHELL_PODMAN_USERNS` | `--userns` | unset | User namespace mode for sandbox containers (e.g. `auto`). When unset, containers use the default user namespace. |
 
 Through the gateway, the same settings are the `https_proxy`, `no_proxy`,
 `proxy_auth_file`, `proxy_auth_allow_insecure`, and

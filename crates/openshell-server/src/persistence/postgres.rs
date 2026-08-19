@@ -457,6 +457,87 @@ LIMIT $2 OFFSET $3
         Ok(rows.into_iter().map(row_to_object_record).collect())
     }
 
+    pub async fn list_with_membership(
+        &self,
+        object_type: &str,
+        member_type: &str,
+        member_name: &str,
+        limit: u32,
+        offset: u32,
+    ) -> PersistenceResult<Vec<ObjectRecord>> {
+        let rows = sqlx::query(
+            r"
+SELECT w.object_type, w.id, w.name, w.workspace, w.payload,
+       w.created_at_ms, w.updated_at_ms, w.labels, w.resource_version
+FROM objects w
+WHERE w.object_type = $1 AND w.workspace = ''
+AND EXISTS (
+    SELECT 1 FROM objects m
+    WHERE m.object_type = $2
+    AND m.workspace = w.name
+    AND m.name = $3
+)
+ORDER BY w.created_at_ms ASC, w.name ASC
+LIMIT $4 OFFSET $5
+",
+        )
+        .bind(object_type)
+        .bind(member_type)
+        .bind(member_name)
+        .bind(i64::from(limit))
+        .bind(i64::from(offset))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| map_db_error(&e))?;
+
+        Ok(rows.into_iter().map(row_to_object_record).collect())
+    }
+
+    pub async fn list_with_membership_and_selector(
+        &self,
+        object_type: &str,
+        member_type: &str,
+        member_name: &str,
+        label_selector: &str,
+        limit: u32,
+        offset: u32,
+    ) -> PersistenceResult<Vec<ObjectRecord>> {
+        use super::parse_label_selector;
+
+        let required_labels = parse_label_selector(label_selector)?;
+        let labels_jsonb = serde_json::to_value(&required_labels)
+            .map_err(|e| PersistenceError::Encode(format!("failed to serialize labels: {e}")))?;
+
+        let rows = sqlx::query(
+            r"
+SELECT w.object_type, w.id, w.name, w.workspace, w.payload,
+       w.created_at_ms, w.updated_at_ms, w.labels, w.resource_version
+FROM objects w
+WHERE w.object_type = $1 AND w.workspace = ''
+AND EXISTS (
+    SELECT 1 FROM objects m
+    WHERE m.object_type = $2
+    AND m.workspace = w.name
+    AND m.name = $3
+)
+AND w.labels @> $4
+ORDER BY w.created_at_ms ASC, w.name ASC
+LIMIT $5 OFFSET $6
+",
+        )
+        .bind(object_type)
+        .bind(member_type)
+        .bind(member_name)
+        .bind(&labels_jsonb)
+        .bind(i64::from(limit))
+        .bind(i64::from(offset))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| map_db_error(&e))?;
+
+        Ok(rows.into_iter().map(row_to_object_record).collect())
+    }
+
     pub async fn list_by_scope(
         &self,
         object_type: &str,

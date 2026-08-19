@@ -268,7 +268,7 @@ impl ReachabilityModel {
     }
 
     fn encode_filesystem(&mut self) {
-        for path in self.policy.filesystem_policy.readable_paths() {
+        for path in self.policy.filesystem_policy.readable_paths(None) {
             let var = Bool::new_const(format!("fs_readable_{path}"));
             self.solver.assert(&var);
             self.filesystem_readable.insert(path, var);

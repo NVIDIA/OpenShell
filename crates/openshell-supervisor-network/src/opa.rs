@@ -20,6 +20,7 @@ use std::sync::{
     Arc, Mutex, RwLock,
     atomic::{AtomicU64, Ordering},
 };
+use tokio::sync::watch;
 use tracing::info;
 
 /// Baked-in rego rules for OPA policy evaluation.
@@ -123,6 +124,27 @@ pub struct OpaEngine {
     engine: Mutex<regorus::Engine>,
     generation: Arc<AtomicU64>,
     middleware_runner: RwLock<ChainRunner>,
+    websocket_assembly_budget: crate::l7::websocket::WebSocketAssemblyBudget,
+    generation_tx: watch::Sender<u64>,
+    fail_closed_reason: RwLock<Option<String>>,
+}
+
+#[cfg(test)]
+static TEST_OPA_QUERY_COUNT: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(test)]
+fn record_test_opa_query() {
+    TEST_OPA_QUERY_COUNT.fetch_add(1, Ordering::Relaxed);
+}
+
+#[cfg(test)]
+pub(crate) fn reset_test_opa_query_count() {
+    TEST_OPA_QUERY_COUNT.store(0, Ordering::SeqCst);
+}
+
+#[cfg(test)]
+pub(crate) fn test_opa_query_count() -> u64 {
+    TEST_OPA_QUERY_COUNT.load(Ordering::SeqCst)
 }
 
 /// Generation guard captured when an HTTP tunnel or request path starts.
@@ -130,6 +152,7 @@ pub struct OpaEngine {
 pub struct PolicyGenerationGuard {
     captured_generation: u64,
     current_generation: Arc<AtomicU64>,
+    generation_rx: watch::Receiver<u64>,
 }
 
 impl PolicyGenerationGuard {
@@ -155,6 +178,19 @@ impl PolicyGenerationGuard {
         }
         Ok(())
     }
+
+    /// Wait until the policy generation changes.
+    ///
+    /// Relay boundaries use this to close even an idle or raw stream as soon
+    /// as a new generation (including fail-closed quarantine) is published.
+    pub async fn wait_until_stale(&self) {
+        let mut receiver = self.generation_rx.clone();
+        while !self.is_stale() {
+            if receiver.changed().await.is_err() {
+                return;
+            }
+        }
+    }
 }
 
 /// Per-tunnel L7 policy evaluator bound to the engine generation captured when
@@ -163,6 +199,7 @@ pub struct TunnelPolicyEngine {
     engine: Mutex<regorus::Engine>,
     generation_guard: PolicyGenerationGuard,
     middleware_runner: ChainRunner,
+    websocket_assembly_budget: crate::l7::websocket::WebSocketAssemblyBudget,
 }
 
 impl TunnelPolicyEngine {
@@ -190,6 +227,12 @@ impl TunnelPolicyEngine {
         &self.middleware_runner
     }
 
+    pub(crate) fn websocket_assembly_budget(
+        &self,
+    ) -> crate::l7::websocket::WebSocketAssemblyBudget {
+        self.websocket_assembly_budget.clone()
+    }
+
     /// Query the ordered middleware chain for a destination within this tunnel.
     pub fn query_middleware_chain(&self, input: &NetworkInput) -> Result<Vec<ChainEntry>> {
         let mut engine = self
@@ -201,6 +244,40 @@ impl TunnelPolicyEngine {
 }
 
 impl OpaEngine {
+    pub(crate) fn websocket_assembly_budget(
+        &self,
+    ) -> crate::l7::websocket::WebSocketAssemblyBudget {
+        self.websocket_assembly_budget.clone()
+    }
+
+    fn with_engine(engine: regorus::Engine) -> Self {
+        let generation = Arc::new(AtomicU64::new(0));
+        let (generation_tx, _) = watch::channel(0);
+        Self {
+            engine: Mutex::new(engine),
+            generation,
+            middleware_runner: RwLock::new(ChainRunner::default()),
+            websocket_assembly_budget: crate::l7::websocket::WebSocketAssemblyBudget::default(),
+            generation_tx,
+            fail_closed_reason: RwLock::new(None),
+        }
+    }
+
+    fn advance_generation(&self) -> u64 {
+        let generation = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
+        self.generation_tx.send_replace(generation);
+        generation
+    }
+
+    #[cfg(test)]
+    pub(crate) fn poison_lock_for_test(&self) {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = self.engine.lock().expect("test engine lock");
+            panic!("poison OPA engine lock for compatibility fallback test");
+        }));
+        assert!(self.engine.is_poisoned());
+    }
+
     /// Load policy from a `.rego` rules file and data from a YAML file.
     ///
     /// Preprocesses the YAML data to expand access presets and validate L7 config.
@@ -232,11 +309,7 @@ impl OpaEngine {
         engine
             .add_data_json(&data_json)
             .map_err(|e| miette::miette!("{e}"))?;
-        Ok(Self {
-            engine: Mutex::new(engine),
-            generation: Arc::new(AtomicU64::new(0)),
-            middleware_runner: RwLock::new(ChainRunner::default()),
-        })
+        Ok(Self::with_engine(engine))
     }
 
     /// Load policy rules and data from strings (data is YAML).
@@ -287,11 +360,7 @@ impl OpaEngine {
         engine
             .add_data_json(&data_json)
             .map_err(|e| miette::miette!("{e}"))?;
-        Ok(Self {
-            engine: Mutex::new(engine),
-            generation: Arc::new(AtomicU64::new(0)),
-            middleware_runner: RwLock::new(ChainRunner::default()),
-        })
+        Ok(Self::with_engine(engine))
     }
 
     /// Create OPA engine from a typed proto policy.
@@ -325,6 +394,18 @@ impl OpaEngine {
         entrypoint_pid: u32,
         require_binary_identity: bool,
     ) -> Result<Self> {
+        let ambiguities = openshell_policy::find_endpoint_ambiguities(proto);
+        if !ambiguities.is_empty() {
+            return Err(miette::miette!(
+                "network endpoint ambiguity validation failed:\n{}",
+                ambiguities
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            ));
+        }
+
         emit_binary_identity_mode(require_binary_identity, "proto");
         if let Err(violations) = openshell_policy::validate_sandbox_policy(proto) {
             let errors = violations
@@ -366,11 +447,7 @@ impl OpaEngine {
         engine
             .add_data_json(&data_json)
             .map_err(|e| miette::miette!("{e}"))?;
-        Ok(Self {
-            engine: Mutex::new(engine),
-            generation: Arc::new(AtomicU64::new(0)),
-            middleware_runner: RwLock::new(ChainRunner::default()),
-        })
+        Ok(Self::with_engine(engine))
     }
 
     /// Evaluate a network access request against the loaded policy.
@@ -386,9 +463,20 @@ impl OpaEngine {
             .lock()
             .map_err(|_| miette::miette!("OPA engine lock poisoned"))?;
 
-        engine
-            .set_input_json(&input_json.to_string())
-            .map_err(|e| miette::miette!("{e}"))?;
+        let fail_closed_reason = self
+            .fail_closed_reason
+            .read()
+            .map_err(|_| miette::miette!("OPA fail-closed state lock poisoned"))?
+            .clone();
+        if let Some(reason) = fail_closed_reason {
+            return Ok(PolicyDecision {
+                allowed: false,
+                reason,
+                matched_policy: None,
+            });
+        }
+
+        set_regorus_input(&mut engine, input_json)?;
 
         let allowed = engine
             .eval_rule("data.openshell.sandbox.allow_network".into())
@@ -429,6 +517,9 @@ impl OpaEngine {
         &self,
         input: &NetworkInput,
     ) -> Result<(NetworkAction, u64)> {
+        #[cfg(test)]
+        record_test_opa_query();
+
         let input_json = network_input_json(input);
 
         let mut engine = self
@@ -437,9 +528,16 @@ impl OpaEngine {
             .map_err(|_| miette::miette!("OPA engine lock poisoned"))?;
         let generation = self.current_generation();
 
-        engine
-            .set_input_json(&input_json.to_string())
-            .map_err(|e| miette::miette!("{e}"))?;
+        let fail_closed_reason = self
+            .fail_closed_reason
+            .read()
+            .map_err(|_| miette::miette!("OPA fail-closed state lock poisoned"))?
+            .clone();
+        if let Some(reason) = fail_closed_reason {
+            return Ok((NetworkAction::Deny { reason }, generation));
+        }
+
+        set_regorus_input(&mut engine, input_json)?;
 
         let action_val = engine
             .eval_rule("data.openshell.sandbox.network_action".into())
@@ -483,7 +581,11 @@ impl OpaEngine {
             .lock()
             .map_err(|_| miette::miette!("OPA engine lock poisoned"))?;
         *engine = new_engine;
-        self.generation.fetch_add(1, Ordering::AcqRel);
+        *self
+            .fail_closed_reason
+            .write()
+            .map_err(|_| miette::miette!("OPA fail-closed state lock poisoned"))? = None;
+        self.advance_generation();
         Ok(())
     }
 
@@ -518,7 +620,11 @@ impl OpaEngine {
             .lock()
             .map_err(|_| miette::miette!("OPA engine lock poisoned"))?;
         *engine = new_engine;
-        self.generation.fetch_add(1, Ordering::AcqRel);
+        *self
+            .fail_closed_reason
+            .write()
+            .map_err(|_| miette::miette!("OPA fail-closed state lock poisoned"))? = None;
+        self.advance_generation();
         Ok(())
     }
 
@@ -539,8 +645,6 @@ impl OpaEngine {
             .engine
             .into_inner()
             .map_err(|_| miette::miette!("lock poisoned on new engine"))?;
-        let new_runner = ChainRunner::from_registry(registry);
-
         // Match clone_engine_for_tunnel's lock order (engine, then runner) so
         // readers can observe only the old pair or the new pair.
         let mut engine = self
@@ -551,10 +655,62 @@ impl OpaEngine {
             .middleware_runner
             .write()
             .map_err(|_| miette::miette!("middleware runner lock poisoned"))?;
+        let new_runner = runner.with_replacement_registry(registry);
         *engine = new_engine;
         *runner = new_runner;
-        self.generation.fetch_add(1, Ordering::AcqRel);
+        *self
+            .fail_closed_reason
+            .write()
+            .map_err(|_| miette::miette!("OPA fail-closed state lock poisoned"))? = None;
+        self.advance_generation();
         Ok(())
+    }
+
+    /// Publish a deny-all quarantine generation without activating any part
+    /// of the invalid candidate policy.
+    ///
+    /// The existing compiled engine remains available for an explicit
+    /// `retain_last_valid` posture or a later valid reload, but all new network
+    /// decisions deny with `reason` while the quarantine is active. Advancing
+    /// the generation invalidates and wakes every pinned relay.
+    pub fn enter_fail_closed(&self, reason: impl Into<String>) -> Result<u64> {
+        let _engine = self
+            .engine
+            .lock()
+            .map_err(|_| miette::miette!("OPA engine lock poisoned"))?;
+        *self
+            .fail_closed_reason
+            .write()
+            .map_err(|_| miette::miette!("OPA fail-closed state lock poisoned"))? =
+            Some(reason.into());
+        Ok(self.advance_generation())
+    }
+
+    pub fn fail_closed_reason(&self) -> Option<String> {
+        self.fail_closed_reason
+            .read()
+            .ok()
+            .and_then(|reason| reason.clone())
+    }
+
+    /// Reactivate the compiled last-known-good engine after an operator
+    /// explicitly selects the availability-oriented retention posture.
+    pub fn exit_fail_closed(&self) -> Result<u64> {
+        let _engine = self
+            .engine
+            .lock()
+            .map_err(|_| miette::miette!("OPA engine lock poisoned"))?;
+        let was_fail_closed = self
+            .fail_closed_reason
+            .write()
+            .map_err(|_| miette::miette!("OPA fail-closed state lock poisoned"))?
+            .take()
+            .is_some();
+        if was_fail_closed {
+            Ok(self.advance_generation())
+        } else {
+            Ok(self.current_generation())
+        }
     }
 
     /// Current policy generation. Successful reloads increment this value.
@@ -569,8 +725,8 @@ impl OpaEngine {
             .middleware_runner
             .write()
             .map_err(|_| miette::miette!("middleware runner lock poisoned"))?;
-        *runner = ChainRunner::from_registry(registry);
-        self.generation.fetch_add(1, Ordering::AcqRel);
+        *runner = runner.with_replacement_registry(registry);
+        self.advance_generation();
         Ok(())
     }
 
@@ -603,6 +759,7 @@ impl OpaEngine {
         Ok(PolicyGenerationGuard {
             captured_generation: generation,
             current_generation: Arc::clone(&self.generation),
+            generation_rx: self.generation_tx.subscribe(),
         })
     }
 
@@ -665,6 +822,9 @@ impl OpaEngine {
         &self,
         input: &NetworkInput,
     ) -> Result<(Vec<regorus::Value>, u64)> {
+        #[cfg(test)]
+        record_test_opa_query();
+
         let input_json = network_input_json(input);
 
         let mut engine = self
@@ -673,9 +833,7 @@ impl OpaEngine {
             .map_err(|_| miette::miette!("OPA engine lock poisoned"))?;
         let generation = self.current_generation();
 
-        engine
-            .set_input_json(&input_json.to_string())
-            .map_err(|e| miette::miette!("{e}"))?;
+        set_regorus_input(&mut engine, input_json)?;
 
         let val = engine
             .eval_rule("data.openshell.sandbox._matching_endpoint_configs".into())
@@ -685,6 +843,38 @@ impl OpaEngine {
             regorus::Value::Undefined => Ok((Vec::new(), generation)),
             regorus::Value::Array(values) => Ok((values.to_vec(), generation)),
             other => Ok((vec![other], generation)),
+        }
+    }
+
+    /// Query every matching endpoint for credential-provenance gating.
+    ///
+    /// Unlike [`Self::query_endpoint_configs_with_generation`], this includes
+    /// L4-only endpoints, which carry no extended L7 config. It is answered by
+    /// a dedicated Rego rule so credential gating cannot alter which endpoint
+    /// the TLS mode and SSRF allowlist are read from.
+    pub fn query_endpoint_credential_guards(
+        &self,
+        input: &NetworkInput,
+    ) -> Result<Vec<regorus::Value>> {
+        let input_json = network_input_json(input);
+
+        let mut engine = self
+            .engine
+            .lock()
+            .map_err(|_| miette::miette!("OPA engine lock poisoned"))?;
+
+        engine
+            .set_input_json(&input_json.to_string())
+            .map_err(|e| miette::miette!("{e}"))?;
+
+        let val = engine
+            .eval_rule("data.openshell.sandbox.endpoint_credential_guards".into())
+            .map_err(|e| miette::miette!("{e}"))?;
+
+        match val {
+            regorus::Value::Undefined => Ok(Vec::new()),
+            regorus::Value::Array(values) => Ok(values.to_vec()),
+            other => Ok(vec![other]),
         }
     }
 
@@ -723,6 +913,9 @@ impl OpaEngine {
     /// denial while preserving separate handling for `allowed_ips` and advisor
     /// proposals.
     pub fn query_exact_declared_endpoint_host(&self, input: &NetworkInput) -> Result<bool> {
+        #[cfg(test)]
+        record_test_opa_query();
+
         let input_json = network_input_json(input);
 
         let mut engine = self
@@ -730,9 +923,7 @@ impl OpaEngine {
             .lock()
             .map_err(|_| miette::miette!("OPA engine lock poisoned"))?;
 
-        engine
-            .set_input_json(&input_json.to_string())
-            .map_err(|e| miette::miette!("{e}"))?;
+        set_regorus_input(&mut engine, input_json)?;
 
         let val = engine
             .eval_rule("data.openshell.sandbox.exact_declared_endpoint_host".into())
@@ -762,8 +953,10 @@ impl OpaEngine {
             generation_guard: PolicyGenerationGuard {
                 captured_generation: generation,
                 current_generation: Arc::clone(&self.generation),
+                generation_rx: self.generation_tx.subscribe(),
             },
             middleware_runner: self.middleware_runner()?,
+            websocket_assembly_budget: self.websocket_assembly_budget(),
         })
     }
 }
@@ -844,6 +1037,20 @@ fn network_input_json(input: &NetworkInput) -> serde_json::Value {
             "port": input.port,
         }
     })
+}
+
+/// Sets an already-built JSON value as Regorus input without encoding and reparsing JSON text.
+///
+/// The explicit fallible conversion preserves evaluator errors because Regorus's infallible
+/// `From<serde_json::Value>` conversion maps failures to [`regorus::Value::Undefined`].
+pub(crate) fn set_regorus_input(
+    engine: &mut regorus::Engine,
+    input: serde_json::Value,
+) -> Result<()> {
+    let input =
+        serde_json::from_value::<regorus::Value>(input).map_err(|e| miette::miette!("{e}"))?;
+    engine.set_input(input);
+    Ok(())
 }
 
 fn query_middleware_chain_locked(
@@ -1604,6 +1811,12 @@ fn proto_to_opa_data_json(proto: &ProtoSandboxPolicy, entrypoint_pid: u32) -> St
                     }
                     if e.request_body_credential_rewrite {
                         ep["request_body_credential_rewrite"] = true.into();
+                    }
+                    if e.allow_uninspected_credentials {
+                        ep["allow_uninspected_credentials"] = true.into();
+                    }
+                    if e.provider_credentialed {
+                        ep["provider_credentialed"] = true.into();
                     }
                     if !e.credential_signing.is_empty() {
                         ep["credential_signing"] = e.credential_signing.clone().into();
@@ -2634,7 +2847,7 @@ process:
 
     fn eval_l7(engine: &OpaEngine, input: &serde_json::Value) -> bool {
         let mut eng = engine.engine.lock().unwrap();
-        eng.set_input_json(&input.to_string()).unwrap();
+        set_regorus_input(&mut eng, input.clone()).unwrap();
         let val = eng
             .eval_rule("data.openshell.sandbox.allow_request".into())
             .unwrap();
@@ -2649,7 +2862,7 @@ process:
         engine
             .add_data_json(&data.to_string())
             .expect("add raw data json");
-        engine.set_input_json(&input.to_string()).unwrap();
+        set_regorus_input(&mut engine, input).unwrap();
         let val = engine
             .eval_rule("data.openshell.sandbox.allow_request".into())
             .unwrap();
@@ -2926,7 +3139,7 @@ process:
             }]),
         );
         let mut eng = engine.engine.lock().unwrap();
-        eng.set_input_json(&input.to_string()).unwrap();
+        set_regorus_input(&mut eng, input).unwrap();
         let val = eng
             .eval_rule("data.openshell.sandbox.request_deny_reason".into())
             .unwrap();
@@ -3043,11 +3256,7 @@ network_policies:
             .expect("policy should load");
         rego.add_data_json(&data_json.to_string())
             .expect("data should load");
-        let engine = OpaEngine {
-            engine: Mutex::new(rego),
-            generation: Arc::new(AtomicU64::new(0)),
-            middleware_runner: RwLock::new(ChainRunner::default()),
-        };
+        let engine = OpaEngine::with_engine(rego);
         let input = l7_websocket_graphql_input(
             "realtime.graphql.com",
             serde_json::json!([{
@@ -4233,7 +4442,7 @@ network_policies:
         let engine = l7_engine();
         let input = l7_input("api.example.com", 8080, "DELETE", "/repos/myorg/foo");
         let mut eng = engine.engine.lock().unwrap();
-        eng.set_input_json(&input.to_string()).unwrap();
+        set_regorus_input(&mut eng, input).unwrap();
         let val = eng
             .eval_rule("data.openshell.sandbox.request_deny_reason".into())
             .unwrap();
@@ -4627,7 +4836,7 @@ network_policies:
         // Verify the cloned engine can evaluate
         let input_json = l7_input("api.example.com", 8080, "GET", "/repos/myorg/foo");
         let mut eng = cloned.engine().lock().unwrap();
-        eng.set_input_json(&input_json.to_string()).unwrap();
+        set_regorus_input(&mut eng, input_json).unwrap();
         let val = eng
             .eval_rule("data.openshell.sandbox.allow_request".into())
             .unwrap();
@@ -4669,11 +4878,102 @@ network_policies:
             .clone_engine_for_tunnel(engine.current_generation())
             .unwrap();
         let mut eng = cloned.engine().lock().unwrap();
-        eng.set_input_json(&input_json.to_string()).unwrap();
+        set_regorus_input(&mut eng, input_json).unwrap();
         let val = eng
             .eval_rule("data.openshell.sandbox.allow_request".into())
             .unwrap();
         assert_eq!(val, regorus::Value::from(true));
+    }
+
+    #[test]
+    fn proto_load_rejects_ambiguous_endpoint_metadata_with_rationale() {
+        let mut policy = ProtoSandboxPolicy::default();
+        policy.network_policies.insert(
+            "wildcard".to_string(),
+            NetworkPolicyRule {
+                name: "wildcard".to_string(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "*.example.com".to_string(),
+                    port: 443,
+                    tls: "skip".to_string(),
+                    ..Default::default()
+                }],
+                binaries: vec![NetworkBinary {
+                    path: "/usr/bin/curl".to_string(),
+                    ..Default::default()
+                }],
+            },
+        );
+        policy.network_policies.insert(
+            "exact".to_string(),
+            NetworkPolicyRule {
+                name: "exact".to_string(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "api.example.com".to_string(),
+                    port: 443,
+                    ..Default::default()
+                }],
+                binaries: vec![NetworkBinary {
+                    path: "/usr/bin/bash".to_string(),
+                    ..Default::default()
+                }],
+            },
+        );
+
+        let Err(error) = OpaEngine::from_proto(&policy) else {
+            panic!("ambiguity must reject activation");
+        };
+        let message = error.to_string();
+        assert!(message.contains("ambiguity validation failed"));
+        assert!(message.contains("wildcard"));
+        assert!(message.contains("exact"));
+        assert!(message.contains("tls"));
+    }
+
+    #[tokio::test]
+    async fn fail_closed_quarantine_denies_and_wakes_generation_guards() {
+        let engine = test_engine();
+        let guard = engine
+            .generation_guard(engine.current_generation())
+            .unwrap();
+        let stale = guard.wait_until_stale();
+
+        let generation = engine
+            .enter_fail_closed("candidate policy validation failed: conflicting tls")
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), stale)
+            .await
+            .expect("generation waiter should wake");
+        assert_eq!(generation, 1);
+        assert!(guard.is_stale());
+
+        let input = NetworkInput {
+            host: "api.anthropic.com".to_string(),
+            port: 443,
+            binary_path: PathBuf::from("/usr/bin/curl"),
+            binary_sha256: String::new(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+        let action = engine.evaluate_network_action(&input).unwrap();
+        assert_eq!(
+            action,
+            NetworkAction::Deny {
+                reason: "candidate policy validation failed: conflicting tls".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn valid_reload_exits_fail_closed_quarantine() {
+        let engine = test_engine();
+        engine.enter_fail_closed("invalid candidate").unwrap();
+        assert!(engine.fail_closed_reason().is_some());
+
+        engine.reload(TEST_POLICY, TEST_DATA_YAML).unwrap();
+
+        assert!(engine.fail_closed_reason().is_none());
+        assert_eq!(engine.current_generation(), 2);
     }
 
     #[test]
@@ -4778,7 +5078,7 @@ process:
             "/repos/myorg/pulls/123/reviews",
         );
         let mut eng = engine.engine.lock().unwrap();
-        eng.set_input_json(&input.to_string()).unwrap();
+        set_regorus_input(&mut eng, input).unwrap();
         let val = eng
             .eval_rule("data.openshell.sandbox.allow_request".into())
             .unwrap();
@@ -4795,7 +5095,7 @@ process:
         // GET repos/issues is allowed and not denied
         let input = l7_input("api.github.com", 443, "GET", "/repos/myorg/issues");
         let mut eng = engine.engine.lock().unwrap();
-        eng.set_input_json(&input.to_string()).unwrap();
+        set_regorus_input(&mut eng, input).unwrap();
         let val = eng
             .eval_rule("data.openshell.sandbox.allow_request".into())
             .unwrap();
@@ -4812,7 +5112,7 @@ process:
         // POST to issues is allowed (deny only targets reviews)
         let input = l7_input("api.github.com", 443, "POST", "/repos/myorg/issues");
         let mut eng = engine.engine.lock().unwrap();
-        eng.set_input_json(&input.to_string()).unwrap();
+        set_regorus_input(&mut eng, input).unwrap();
         let val = eng
             .eval_rule("data.openshell.sandbox.allow_request".into())
             .unwrap();
@@ -4829,7 +5129,7 @@ process:
         // GET /repos/myorg/rulesets should be denied (method: "*")
         let input = l7_input("api.github.com", 443, "GET", "/repos/myorg/rulesets");
         let mut eng = engine.engine.lock().unwrap();
-        eng.set_input_json(&input.to_string()).unwrap();
+        set_regorus_input(&mut eng, input).unwrap();
         let val = eng
             .eval_rule("data.openshell.sandbox.allow_request".into())
             .unwrap();
@@ -4850,7 +5150,7 @@ process:
             "/repos/myorg/branches/main/protection",
         );
         let mut eng = engine.engine.lock().unwrap();
-        eng.set_input_json(&input.to_string()).unwrap();
+        set_regorus_input(&mut eng, input).unwrap();
         let val = eng
             .eval_rule("data.openshell.sandbox.allow_request".into())
             .unwrap();
@@ -4871,7 +5171,7 @@ process:
             "/repos/myorg/pulls/123/reviews",
         );
         let mut eng = engine.engine.lock().unwrap();
-        eng.set_input_json(&input.to_string()).unwrap();
+        set_regorus_input(&mut eng, input).unwrap();
         let val = eng
             .eval_rule("data.openshell.sandbox.request_deny_reason".into())
             .unwrap();
@@ -4897,7 +5197,7 @@ process:
             serde_json::json!({"force": ["true"]}),
         );
         let mut eng = engine.engine.lock().unwrap();
-        eng.set_input_json(&input.to_string()).unwrap();
+        set_regorus_input(&mut eng, input).unwrap();
         let val = eng
             .eval_rule("data.openshell.sandbox.allow_request".into())
             .unwrap();
@@ -4920,7 +5220,7 @@ process:
             serde_json::json!({"force": ["false"]}),
         );
         let mut eng = engine.engine.lock().unwrap();
-        eng.set_input_json(&input.to_string()).unwrap();
+        set_regorus_input(&mut eng, input).unwrap();
         let val = eng
             .eval_rule("data.openshell.sandbox.allow_request".into())
             .unwrap();
@@ -4945,7 +5245,7 @@ process:
             serde_json::json!({"force": ["true", "false"]}),
         );
         let mut eng = engine.engine.lock().unwrap();
-        eng.set_input_json(&input.to_string()).unwrap();
+        set_regorus_input(&mut eng, input).unwrap();
         let val = eng
             .eval_rule("data.openshell.sandbox.allow_request".into())
             .unwrap();
@@ -4963,7 +5263,7 @@ process:
         // so no match (key not present) and request should be allowed
         let input = l7_input("api.restricted.com", 443, "POST", "/admin/settings");
         let mut eng = engine.engine.lock().unwrap();
-        eng.set_input_json(&input.to_string()).unwrap();
+        set_regorus_input(&mut eng, input).unwrap();
         let val = eng
             .eval_rule("data.openshell.sandbox.allow_request".into())
             .unwrap();
@@ -5003,6 +5303,7 @@ network_policies:
         port: 8567
         protocol: rest
         enforcement: enforce
+        tls: skip
         allowed_ips:
           - 192.168.1.100
         rules:
@@ -5041,7 +5342,7 @@ process:
     }
 
     #[test]
-    fn overlapping_policies_endpoint_config_returns_result() {
+    fn overlapping_policy_outputs_are_snapshotted_independently() {
         let engine = OpaEngine::from_strings(TEST_POLICY, OVERLAPPING_L7_TEST_DATA)
             .expect("engine should load overlapping data");
         let input = NetworkInput {
@@ -5052,12 +5353,29 @@ process:
             ancestors: vec![],
             cmdline_paths: vec![],
         };
-        // Should return config from one of the entries without error.
-        let config = engine.query_endpoint_config(&input).unwrap();
-        assert!(
-            config.is_some(),
-            "Expected endpoint config for overlapping policies"
+        assert_eq!(
+            engine.evaluate_network_action(&input).unwrap(),
+            NetworkAction::Allow {
+                matched_policy: Some("allow_192_168_1_100_8567".to_string())
+            }
         );
+
+        let (configs, generation) = engine
+            .query_endpoint_configs_with_generation(&input)
+            .unwrap();
+        assert_eq!(generation, engine.current_generation());
+        assert_eq!(configs.len(), 2);
+        assert_eq!(get_str(&configs[0], "tls").as_deref(), Some("skip"));
+        assert_eq!(get_str_array(&configs[0], "allowed_ips"), ["192.168.1.100"]);
+        assert_eq!(get_str(&configs[1], "tls"), None);
+
+        let selected = engine.query_endpoint_config(&input).unwrap().unwrap();
+        assert_eq!(
+            crate::l7::parse_tls_mode(&selected),
+            crate::l7::TlsMode::Skip
+        );
+        assert_eq!(engine.query_allowed_ips(&input).unwrap(), ["192.168.1.100"]);
+        assert!(engine.query_exact_declared_endpoint_host(&input).unwrap());
     }
 
     // ========================================================================
@@ -5381,6 +5699,87 @@ process:
     fn allowed_ips_engine() -> OpaEngine {
         OpaEngine::from_strings(TEST_POLICY, ALLOWED_IPS_TEST_DATA)
             .expect("Failed to load allowed_ips test data")
+    }
+
+    /// An L4-only credentialed endpoint must not join the shared endpoint-config
+    /// list: `query_endpoint_config` returns only its first element, so joining
+    /// it would let the L4 endpoint shadow the inspected endpoint's TLS mode and
+    /// SSRF allowlist on the same host:port.
+    #[test]
+    fn credential_guard_does_not_shadow_inspected_endpoint_config() {
+        const OVERLAPPING_DATA: &str = r#"
+network_policies:
+  telemetry_l4:
+    name: telemetry_l4
+    endpoints:
+      - host: api.example.com
+        port: 443
+        provider_credentialed: true
+        allow_uninspected_credentials: true
+    binaries:
+      - { path: /usr/bin/curl }
+  inspected_api:
+    name: inspected_api
+    endpoints:
+      - host: api.example.com
+        port: 443
+        protocol: rest
+        access: full
+        tls: skip
+        allowed_ips: ["10.0.5.0/24"]
+    binaries:
+      - { path: /usr/bin/curl }
+filesystem_policy:
+  include_workdir: true
+  read_only: []
+  read_write: []
+landlock:
+  compatibility: best_effort
+process:
+  run_as_user: sandbox
+  run_as_group: sandbox
+"#;
+        let engine = OpaEngine::from_strings(TEST_POLICY, OVERLAPPING_DATA)
+            .expect("overlapping endpoint policy should load");
+        let input = NetworkInput {
+            host: "api.example.com".into(),
+            port: 443,
+            binary_path: PathBuf::from("/usr/bin/curl"),
+            binary_sha256: "unused".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+
+        let configs = engine
+            .query_endpoint_configs_with_generation(&input)
+            .unwrap()
+            .0;
+        assert_eq!(
+            configs.len(),
+            1,
+            "only the inspected endpoint carries extended config"
+        );
+        let config = crate::l7::parse_l7_config(&configs[0]).expect("inspected endpoint config");
+        assert_eq!(config.protocol, crate::l7::L7Protocol::Rest);
+        assert_eq!(config.tls, crate::l7::TlsMode::Skip);
+        assert_eq!(
+            engine.query_allowed_ips(&input).unwrap(),
+            vec!["10.0.5.0/24"],
+            "SSRF allowlist must still come from the inspected endpoint"
+        );
+
+        let guards = engine.query_endpoint_credential_guards(&input).unwrap();
+        assert_eq!(
+            guards.len(),
+            2,
+            "credential gating must still see the L4-only endpoint"
+        );
+        assert!(
+            guards
+                .iter()
+                .map(crate::l7::parse_endpoint_credential_guard)
+                .any(|guard| guard.provider_credentialed)
+        );
     }
 
     #[test]
@@ -6810,6 +7209,142 @@ network_policies:
     }
 
     #[tokio::test]
+    async fn middleware_session_budget_survives_atomic_registry_reload() {
+        let proto = test_proto();
+        let engine = OpaEngine::from_proto(&proto).expect("initial load should succeed");
+        let registry = MiddlewareRegistry::connect_services(
+            openshell_supervisor_middleware_builtins::services(),
+            Vec::new(),
+        )
+        .await
+        .expect("built-in registry");
+        engine
+            .replace_middleware_registry(registry)
+            .expect("install registry");
+        let old_runner = engine.middleware_runner().expect("old runner");
+        let entry = ChainEntry {
+            name: "regex".into(),
+            implementation: openshell_supervisor_middleware_builtins::BUILTIN_REGEX.into(),
+            order: 0,
+            config: prost_types::Struct {
+                fields: std::iter::once((
+                    "mode".into(),
+                    prost_types::Value {
+                        kind: Some(prost_types::value::Kind::StringValue("redact".into())),
+                    },
+                ))
+                .collect(),
+            },
+            on_error: openshell_supervisor_middleware::OnError::FailClosed,
+        };
+        let preflight_input =
+            |session_id: String| openshell_supervisor_middleware::WebSocketPreflightInput {
+                session_id,
+                request_id: "request".into(),
+                sandbox_id: "sandbox".into(),
+                scheme: "wss".into(),
+                host: "api.openai.com".into(),
+                port: 443,
+                path: "/v1/responses".into(),
+                requested_subprotocols: Vec::new(),
+            };
+        let mut old_sessions = Vec::new();
+        for index in 0..openshell_supervisor_middleware::MAX_CONCURRENT_MIDDLEWARE_SESSIONS {
+            let preflight = old_runner
+                .preflight_websocket(
+                    std::slice::from_ref(&entry),
+                    preflight_input(format!("old-generation-{index}")),
+                )
+                .await
+                .expect("admit old-generation session");
+            old_sessions.push(preflight.session.expect("built-in inspects session"));
+        }
+
+        let replacement = MiddlewareRegistry::connect_services(
+            openshell_supervisor_middleware_builtins::services(),
+            Vec::new(),
+        )
+        .await
+        .expect("replacement registry");
+        engine
+            .reload_policy_and_middleware_from_proto_with_pid(&proto, 0, replacement)
+            .expect("atomic policy and registry reload");
+        let current_runner = engine.middleware_runner().expect("current runner");
+        let overflow = current_runner
+            .preflight_websocket(
+                std::slice::from_ref(&entry),
+                preflight_input("new-generation-overflow".into()),
+            )
+            .await
+            .expect("capacity exhaustion is a typed preflight outcome");
+        assert!(!overflow.allowed);
+        assert!(overflow.session_capacity_exhausted);
+
+        old_sessions
+            .pop()
+            .expect("old-generation session")
+            .end(openshell_core::proto::WebSocketSessionEndReason::PolicyReload)
+            .await;
+        let admitted = current_runner
+            .preflight_websocket(
+                std::slice::from_ref(&entry),
+                preflight_input("new-generation-admitted".into()),
+            )
+            .await
+            .expect("released capacity is reusable after reload");
+        assert!(admitted.allowed);
+        assert!(admitted.session.is_some());
+    }
+
+    #[tokio::test]
+    async fn websocket_assembly_budget_survives_policy_reload() {
+        use crate::l7::websocket::{
+            MAX_CONCURRENT_WEBSOCKET_ASSEMBLIES, WebSocketAssemblyAdmissionOutcome,
+        };
+
+        let proto = test_proto();
+        let engine = OpaEngine::from_proto(&proto).expect("initial policy");
+        let old_tunnel = engine
+            .clone_engine_for_tunnel(engine.current_generation())
+            .expect("old tunnel");
+        let old_budget = old_tunnel.websocket_assembly_budget();
+        let mut old_admissions = Vec::new();
+        for _ in 0..MAX_CONCURRENT_WEBSOCKET_ASSEMBLIES {
+            match old_budget.reserve().await.expect("reserve old assembly") {
+                WebSocketAssemblyAdmissionOutcome::Admitted(admission) => {
+                    old_admissions.push(admission);
+                }
+                WebSocketAssemblyAdmissionOutcome::QueueExhausted => {
+                    panic!("active assembly capacity exhausted too early")
+                }
+            }
+        }
+
+        engine
+            .reload_from_proto_with_pid(&proto, 0)
+            .expect("policy reload");
+        let new_tunnel = engine
+            .clone_engine_for_tunnel(engine.current_generation())
+            .expect("new tunnel");
+        let new_budget = new_tunnel.websocket_assembly_budget();
+        let waiting = tokio::spawn(async move { new_budget.reserve().await });
+        tokio::task::yield_now().await;
+        assert!(
+            !waiting.is_finished(),
+            "new generation must share old generation assembly capacity"
+        );
+
+        drop(old_admissions.pop());
+        assert!(matches!(
+            waiting
+                .await
+                .expect("join waiting assembly")
+                .expect("waiting assembly result"),
+            WebSocketAssemblyAdmissionOutcome::Admitted(_)
+        ));
+    }
+
+    #[tokio::test]
     async fn policy_only_reload_keeps_connected_middleware_registry() {
         let proto = test_proto();
         let engine = OpaEngine::from_proto(&proto).expect("initial load should succeed");
@@ -7462,11 +7997,11 @@ host_match if {
         ];
         for (pattern, host) in cases {
             let rust = openshell_core::host_pattern::host_matches(pattern, host).unwrap();
-            engine
-                .set_input_json(
-                    &serde_json::json!({ "pattern": pattern, "host": host }).to_string(),
-                )
-                .unwrap();
+            set_regorus_input(
+                &mut engine,
+                serde_json::json!({ "pattern": pattern, "host": host }),
+            )
+            .unwrap();
             let rego = engine.eval_rule("data.test.host_match".into()).unwrap()
                 == regorus::Value::from(true);
             assert_eq!(

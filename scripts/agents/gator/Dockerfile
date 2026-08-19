@@ -84,9 +84,12 @@ ENV PATH="/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin"
 RUN mkdir -p /etc/openshell
 COPY policy.yaml /etc/openshell/policy.yaml
 COPY bin/gh /usr/local/bin/gh-gator
+COPY bin/review-feedback-ledger /usr/local/bin/review-feedback-ledger
+COPY bin/validate-review-findings /usr/local/bin/validate-review-findings
 RUN rm -f /usr/local/bin/gh && \
     cp /usr/local/bin/gh-gator /usr/local/bin/gh && \
-    chmod 755 /usr/local/bin/gh
+    chmod 755 /usr/local/bin/gh /usr/local/bin/review-feedback-ledger \
+        /usr/local/bin/validate-review-findings
 
 RUN printf 'export PATH="/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin"\nexport PS1="\\u@\\h:\\w\\$ "\n' \
         > /sandbox/.bashrc && \

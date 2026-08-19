@@ -263,6 +263,7 @@ const HELP_TEMPLATE: &str = "\
 \x1b[1mGATEWAY COMMANDS\x1b[0m
   gateway:     Manage gateways
   status:      Show gateway status and information
+  whoami:      Show the authenticated user identity
   inference:   Manage inference configuration
   doctor:      Diagnose gateway issues
 
@@ -583,6 +584,14 @@ enum Commands {
     /// Show gateway status and information.
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Status {
+        /// Output format.
+        #[arg(short = 'o', long = "output", value_enum, default_value_t = OutputFormat::Table)]
+        output: OutputFormat,
+    },
+
+    /// Show the identity validated by the gateway.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Whoami {
         /// Output format.
         #[arg(short = 'o', long = "output", value_enum, default_value_t = OutputFormat::Table)]
         output: OutputFormat,
@@ -1163,7 +1172,8 @@ enum GatewayCommands {
     /// Authenticate with an edge-authenticated or OIDC gateway.
     ///
     /// Opens a browser for the edge proxy's login flow and stores the
-    /// token locally. Use this to re-authenticate when a token expires.
+    /// token locally. After `gateway logout`, OIDC browser login requests a
+    /// fresh identity-provider prompt so you can switch users.
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Login {
         /// Gateway name (defaults to the active gateway).
@@ -1174,7 +1184,9 @@ enum GatewayCommands {
     /// Clear stored authentication credentials for a gateway.
     ///
     /// Removes the locally stored OIDC token or edge token so subsequent
-    /// commands require re-authentication via `gateway login`.
+    /// commands require re-authentication via `gateway login`. For OIDC
+    /// gateways, the next browser login asks the identity provider for a fresh
+    /// login instead of silently reusing an existing browser session.
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Logout {
         /// Gateway name (defaults to the active gateway).
@@ -1382,7 +1394,9 @@ enum SandboxCommands {
         #[arg(long, value_name = "JSON")]
         driver_config_json: Option<String>,
 
-        /// Provider names to attach to this sandbox.
+        /// Attach a configured credential provider to the sandbox.
+        /// Use providers for API keys, tokens, and other secrets so commands in
+        /// the sandbox do not receive the real credential values. Repeatable.
         #[arg(long = "provider")]
         providers: Vec<String>,
 
@@ -1422,9 +1436,15 @@ enum SandboxCommands {
         #[arg(long = "label")]
         labels: Vec<String>,
 
-        /// Environment variables to inject into the sandbox (KEY=VALUE format, repeatable).
+        /// Set a non-secret environment variable in the sandbox.
+        /// Do not use this option for API keys, tokens, or other secrets; create
+        /// a provider and attach it with `--provider` instead. Repeatable.
         #[arg(long = "env", value_name = "KEY=VALUE")]
         envs: Vec<String>,
+
+        /// Suppress warnings when --env values look like credentials.
+        #[arg(long = "no-credential-warnings")]
+        no_credential_warnings: bool,
 
         /// Approval mode for agent-authored policy proposals.
         ///
@@ -1507,6 +1527,22 @@ enum SandboxCommands {
         all: bool,
     },
 
+    /// Stop a sandbox while preserving its workspace.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Stop {
+        /// Sandbox name (defaults to last-used sandbox).
+        #[arg(add = ArgValueCompleter::new(completers::complete_sandbox_names))]
+        name: Option<String>,
+    },
+
+    /// Start a stopped sandbox.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Start {
+        /// Sandbox name (defaults to last-used sandbox).
+        #[arg(add = ArgValueCompleter::new(completers::complete_sandbox_names))]
+        name: Option<String>,
+    },
+
     /// Execute a command in a running sandbox.
     ///
     /// Runs a command inside an existing sandbox using the gRPC exec endpoint.
@@ -1544,7 +1580,9 @@ enum SandboxCommands {
         #[arg(long, overrides_with = "tty")]
         no_tty: bool,
 
-        /// Environment variables to set for the command (KEY=VALUE format, repeatable).
+        /// Set a non-secret environment variable for the command.
+        /// Do not use this option for API keys, tokens, or other secrets; attach
+        /// a provider to the sandbox instead. Repeatable.
         #[arg(long = "env", value_name = "KEY=VALUE")]
         envs: Vec<String>,
 
@@ -1756,6 +1794,8 @@ enum PolicyCommands {
         name: Option<String>,
 
         /// Add or merge an endpoint: host:port[:access[:protocol[:enforcement[:options]]]].
+        /// Options include allowed-ip=..., credential rewrite flags, and
+        /// allow-uninspected-credentials.
         #[arg(long = "add-endpoint")]
         add_endpoints: Vec<String>,
 
@@ -2131,9 +2171,34 @@ enum WorkspaceMemberCommands {
     },
 }
 
+#[cfg(target_os = "windows")]
+fn main() -> Result<()> {
+    std::thread::Builder::new()
+        .name("openshell-main".to_string())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(run_main)
+        .map_err(|err| miette::miette!("failed to start OpenShell main thread: {err}"))?
+        .join()
+        .map_err(|_| miette::miette!("OpenShell main thread panicked"))?
+}
+
+#[cfg(not(target_os = "windows"))]
 #[tokio::main]
-#[allow(clippy::large_stack_frames)] // CLI dispatch holds many futures; OK at top level.
 async fn main() -> Result<()> {
+    run_async().await
+}
+
+#[cfg(target_os = "windows")]
+fn run_main() -> Result<()> {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|err| miette::miette!("failed to build Tokio runtime: {err}"))?
+        .block_on(run_async())
+}
+
+#[allow(clippy::large_stack_frames)] // CLI dispatch holds many futures; run on an expanded Windows stack.
+async fn run_async() -> Result<()> {
     // Install the rustls crypto provider before completion runs — completers may
     // establish TLS connections to the gateway.
     rustls::crypto::ring::default_provider()
@@ -2310,6 +2375,16 @@ async fn main() -> Result<()> {
                     "openshell gateway add <endpoint>".dimmed()
                 );
             }
+        }
+
+        // -----------------------------------------------------------
+        // Top-level current identity
+        // -----------------------------------------------------------
+        Some(Commands::Whoami { output }) => {
+            let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
+            let mut tls = tls.with_gateway_name(&ctx.name);
+            apply_auth(&mut tls, &ctx.name);
+            run::whoami(&ctx.endpoint, &tls, output.as_str()).await?;
         }
 
         // -----------------------------------------------------------
@@ -2909,6 +2984,7 @@ async fn main() -> Result<()> {
                     no_auto_providers,
                     labels,
                     envs,
+                    no_credential_warnings,
                     approval_mode,
                     output,
                     command,
@@ -2946,6 +3022,7 @@ async fn main() -> Result<()> {
 
                     // Parse --env flags into a HashMap<String, String>.
                     let env_map = run::parse_env_pairs(&envs)?;
+                    run::warn_credential_env_vars(&env_map, no_credential_warnings);
 
                     // Parse --upload specs into [(local_path, sandbox_path, git_ignore)].
                     let upload_specs: Vec<(String, Option<String>, bool)> = upload
@@ -3106,6 +3183,14 @@ async fn main() -> Result<()> {
                                 &ctx.name,
                             )
                             .await?;
+                        }
+                        SandboxCommands::Stop { name } => {
+                            let name = resolve_sandbox_name(name, &ctx.name, &cli.workspace)?;
+                            run::sandbox_stop(endpoint, &name, &cli.workspace, &tls).await?;
+                        }
+                        SandboxCommands::Start { name } => {
+                            let name = resolve_sandbox_name(name, &ctx.name, &cli.workspace)?;
+                            run::sandbox_start(endpoint, &name, &cli.workspace, &tls).await?;
                         }
                         SandboxCommands::Connect { name, editor } => {
                             let name = resolve_sandbox_name(name, &ctx.name, &cli.workspace)?;
@@ -3925,6 +4010,19 @@ mod tests {
     }
 
     #[test]
+    fn whoami_accepts_output_json() {
+        let cli = Cli::try_parse_from(["openshell", "whoami", "--output", "json"])
+            .expect("whoami --output json should parse");
+
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Whoami {
+                output: OutputFormat::Json
+            })
+        ));
+    }
+
+    #[test]
     fn gateway_info_accepts_output_json() {
         let cli = Cli::try_parse_from(["openshell", "gateway", "info", "-o", "json"])
             .expect("gateway info -o json should parse");
@@ -4390,6 +4488,27 @@ mod tests {
                     output: OutputFormat::Table,
                     ..
                 })
+            })
+        ));
+    }
+
+    #[test]
+    fn sandbox_stop_and_start_accept_optional_names() {
+        let stop = Cli::try_parse_from(["openshell", "sandbox", "stop", "demo"])
+            .expect("stop command should parse");
+        assert!(matches!(
+            stop.command,
+            Some(Commands::Sandbox {
+                command: Some(SandboxCommands::Stop { name: Some(ref name) }),
+            }) if name == "demo"
+        ));
+
+        let start = Cli::try_parse_from(["openshell", "sandbox", "start"])
+            .expect("start command should parse");
+        assert!(matches!(
+            start.command,
+            Some(Commands::Sandbox {
+                command: Some(SandboxCommands::Start { name: None }),
             })
         ));
     }

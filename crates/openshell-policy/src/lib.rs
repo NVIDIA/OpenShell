@@ -18,6 +18,10 @@ use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::path::Path;
 
+mod ambiguity;
+
+pub use ambiguity::{EndpointAmbiguity, find_endpoint_ambiguities};
+
 use miette::{IntoDiagnostic, Result, WrapErr};
 use openshell_core::proto::{
     FilesystemPolicy, GraphqlOperation, L7Allow, L7DenyRule, L7QueryMatcher, L7Rule,
@@ -107,6 +111,10 @@ struct NetworkPolicyRuleDef {
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "Endpoint DTO mirrors independent policy schema toggles."
+)]
 struct NetworkEndpointDef {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     host: String,
@@ -148,6 +156,10 @@ struct NetworkEndpointDef {
     /// placeholders before forwarding upstream. Defaults to false.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     request_body_credential_rewrite: bool,
+    /// Explicitly permits credentials on traffic paths that `OpenShell` cannot
+    /// inspect or rewrite. Defaults to false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    allow_uninspected_credentials: bool,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     persisted_queries: String,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -161,9 +173,17 @@ struct NetworkEndpointDef {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     signing_region: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    credential_binding: Option<NetworkCredentialBindingDef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     json_rpc: Option<JsonRpcConfigDef>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     mcp: Option<McpConfigDef>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NetworkCredentialBindingDef {
+    provider: String,
 }
 
 // Signature dictated by serde's `skip_serializing_if`, which requires `&T`.
@@ -741,6 +761,10 @@ fn to_proto(raw: PolicyFile) -> Result<SandboxPolicy> {
                             allow_encoded_slash: e.allow_encoded_slash,
                             websocket_credential_rewrite: e.websocket_credential_rewrite,
                             request_body_credential_rewrite: e.request_body_credential_rewrite,
+                            allow_uninspected_credentials: e.allow_uninspected_credentials,
+                            // Provider credential provenance is derived by the
+                            // gateway and cannot be authored in policy YAML.
+                            provider_credentialed: false,
                             // Advisor provenance is internal runtime state, not
                             // a user-authored policy schema field.
                             advisor_proposed: false,
@@ -763,6 +787,11 @@ fn to_proto(raw: PolicyFile) -> Result<SandboxPolicy> {
                             credential_signing: e.credential_signing,
                             signing_service: e.signing_service,
                             signing_region: e.signing_region,
+                            credential_binding: e.credential_binding.map(|binding| {
+                                openshell_core::proto::NetworkCredentialBinding {
+                                    provider: binding.provider,
+                                }
+                            }),
                             json_rpc_max_body_bytes: json_rpc_max_body_bytes(&e.json_rpc, &e.mcp),
                             mcp: mcp_options(&e.mcp),
                         }
@@ -907,6 +936,7 @@ fn from_proto(policy: &SandboxPolicy) -> Result<PolicyFile> {
                             allow_encoded_slash: e.allow_encoded_slash,
                             websocket_credential_rewrite: e.websocket_credential_rewrite,
                             request_body_credential_rewrite: e.request_body_credential_rewrite,
+                            allow_uninspected_credentials: e.allow_uninspected_credentials,
                             persisted_queries: e.persisted_queries.clone(),
                             graphql_persisted_queries: e
                                 .graphql_persisted_queries
@@ -926,6 +956,11 @@ fn from_proto(policy: &SandboxPolicy) -> Result<PolicyFile> {
                             credential_signing: e.credential_signing.clone(),
                             signing_service: e.signing_service.clone(),
                             signing_region: e.signing_region.clone(),
+                            credential_binding: e.credential_binding.as_ref().map(|binding| {
+                                NetworkCredentialBindingDef {
+                                    provider: binding.provider.clone(),
+                                }
+                            }),
                             json_rpc,
                             mcp,
                         }
@@ -977,8 +1012,7 @@ const SANDBOX_NAME: &str = "sandbox";
 /// `u32` within the range `[MIN_SANDBOX_UID, MAX_SANDBOX_UID]`.
 ///
 /// Rejects:
-/// - The empty string (callers should use `ensure_sandbox_process_identity`
-///   to fill defaults before validation)
+/// - The empty string (represents an omitted policy field)
 /// - UID 0 or values below `MIN_SANDBOX_UID`
 /// - Values above `MAX_SANDBOX_UID`
 /// - Non-numeric strings other than `"sandbox"` (e.g. `"root"`, `"nobody"`)
@@ -1064,7 +1098,7 @@ pub fn load_sandbox_policy(cli_path: Option<&str>) -> Result<Option<SandboxPolic
 ///
 /// When the gateway provides no policy at sandbox creation time, the sandbox
 /// supervisor probes this path before falling back to the restrictive default.
-pub const CONTAINER_POLICY_PATH: &str = "/etc/openshell/policy.yaml";
+pub use openshell_core::container_paths::CONTAINER_POLICY_PATH;
 
 /// Legacy path used before the navigator → openshell rename.
 ///
@@ -1076,9 +1110,10 @@ pub const LEGACY_CONTAINER_POLICY_PATH: &str = "/etc/navigator/policy.yaml";
 /// Return a restrictive default policy suitable for sandboxes that have no
 /// explicit policy configured.
 ///
-/// This policy grants filesystem access to standard system paths, runs as the
-/// `sandbox` user, enables Landlock in best-effort mode, and **blocks all
-/// network access** (no network policies, no inference routing).
+/// This policy grants filesystem access to standard system paths, leaves
+/// process identity selection to the compute runtime, enables Landlock in
+/// best-effort mode, and **blocks all network access** (no network policies,
+/// no inference routing).
 pub fn restrictive_default_policy() -> SandboxPolicy {
     SandboxPolicy {
         version: 1,
@@ -1093,25 +1128,22 @@ pub fn restrictive_default_policy() -> SandboxPolicy {
                 "/etc".into(),
                 "/var/log".into(),
             ],
-            read_write: vec!["/sandbox".into(), "/tmp".into(), "/dev/null".into()],
+            read_write: vec!["/tmp".into(), "/dev/null".into()],
         }),
         landlock: Some(LandlockPolicy {
             compatibility: "best_effort".into(),
         }),
-        process: Some(ProcessPolicy {
-            run_as_user: "sandbox".into(),
-            run_as_group: "sandbox".into(),
-        }),
+        process: None,
         network_policies: HashMap::new(),
         network_middlewares: HashMap::default(),
     }
 }
 
-/// Ensure the policy has `run_as_user: sandbox` and `run_as_group: sandbox`.
+/// Fill omitted process identity fields with the legacy `sandbox` defaults.
 ///
-/// If the process section is missing, or either field is empty, this fills in
-/// the required `"sandbox"` value. Call this before validation so that
-/// policies without an explicit process section get the correct default.
+/// Docker and Podman preserve omission so their supervisors can fall back to
+/// OCI `Config.User`. Other drivers call this before validation and
+/// persistence to retain the existing public policy representation.
 pub fn ensure_sandbox_process_identity(policy: &mut SandboxPolicy) {
     let process = policy.process.get_or_insert_with(ProcessPolicy::default);
     if process.run_as_user.is_empty() {
@@ -1135,7 +1167,7 @@ const MAX_PATH_LENGTH: usize = 4096;
 /// A safety violation found in a sandbox policy.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PolicyViolation {
-    /// `run_as_user` or `run_as_group` is not "sandbox".
+    /// An explicit `run_as_user` or `run_as_group` is unsafe.
     InvalidProcessIdentity { field: &'static str, value: String },
     /// A filesystem path contains `..` components.
     PathTraversal { path: String },
@@ -1309,7 +1341,7 @@ impl fmt::Display for PolicyViolation {
 /// error vs. logged warning).
 ///
 /// Checks performed:
-/// - `run_as_user` / `run_as_group` must be "sandbox"
+/// - Explicit `run_as_user` / `run_as_group` fields must be safe identities
 /// - Filesystem paths must be absolute (start with `/`)
 /// - Filesystem paths must not contain `..` components
 /// - Read-write paths must not be overly broad (just `/`)
@@ -1324,18 +1356,17 @@ pub fn validate_sandbox_policy(
 ) -> std::result::Result<(), Vec<PolicyViolation>> {
     let mut violations = Vec::new();
 
-    // Check process identity — must be "sandbox" or a numeric UID/GID
-    // within the acceptable sandbox range.
-    // `ensure_sandbox_process_identity` should be called before this to
-    // fill in defaults; any invalid value is rejected.
+    // Omitted process identity fields are resolved by the compute runtime.
+    // Explicit fields must be "sandbox" or a numeric UID/GID within the
+    // acceptable sandbox range.
     if let Some(ref process) = policy.process {
-        if !is_valid_sandbox_identity(&process.run_as_user) {
+        if !process.run_as_user.is_empty() && !is_valid_sandbox_identity(&process.run_as_user) {
             violations.push(PolicyViolation::InvalidProcessIdentity {
                 field: "run_as_user",
                 value: process.run_as_user.clone(),
             });
         }
-        if !is_valid_sandbox_identity(&process.run_as_group) {
+        if !process.run_as_group.is_empty() && !is_valid_sandbox_identity(&process.run_as_group) {
             violations.push(PolicyViolation::InvalidProcessIdentity {
                 field: "run_as_group",
                 value: process.run_as_group.clone(),
@@ -1483,7 +1514,13 @@ fn truncate_for_display(s: &str) -> String {
     if s.len() <= 80 {
         s.to_string()
     } else {
-        format!("{}...", &s[..77])
+        // Back off to a char boundary: slicing at a fixed byte index panics
+        // on multi-byte UTF-8 (e.g. non-ASCII characters in policy paths).
+        let mut end = 77;
+        while !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}...", &s[..end])
     }
 }
 
@@ -1504,6 +1541,21 @@ pub use openshell_core::paths::normalize_path;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn truncate_for_display_handles_multi_byte_utf8_without_panicking() {
+        // Byte index 77 falls inside the multi-byte 'é'.
+        let s = format!("/{}{}", "a".repeat(75), "é".repeat(100));
+        let truncated = truncate_for_display(&s);
+        assert!(truncated.ends_with("..."));
+        assert!(truncated.len() <= 80);
+    }
+
+    #[test]
+    fn truncate_for_display_leaves_short_strings_untouched() {
+        let s = "short path";
+        assert_eq!(truncate_for_display(s), s);
+    }
 
     /// Verify that the serialized YAML uses `filesystem_policy` (not
     /// `filesystem`) so it can be fed back to `parse_sandbox_policy`.
@@ -1676,8 +1728,8 @@ network_policies:
             "read_only should contain /usr"
         );
         assert!(
-            fs.read_write.iter().any(|p| p == "/sandbox"),
-            "read_write should contain /sandbox"
+            !fs.read_write.iter().any(|p| p == "/sandbox"),
+            "the workspace should be granted through include_workdir, not a literal /sandbox path"
         );
         assert!(
             fs.read_write.iter().any(|p| p == "/tmp"),
@@ -1686,11 +1738,9 @@ network_policies:
     }
 
     #[test]
-    fn restrictive_default_has_process_identity() {
+    fn restrictive_default_omits_process_identity() {
         let policy = restrictive_default_policy();
-        let proc = policy.process.expect("must have process policy");
-        assert_eq!(proc.run_as_user, "sandbox");
-        assert_eq!(proc.run_as_group, "sandbox");
+        assert!(policy.process.is_none());
     }
 
     #[test]
@@ -1713,6 +1763,46 @@ network_policies:
         assert_eq!(policy.version, 1);
         assert!(policy.network_policies.is_empty());
         assert!(policy.filesystem.is_none());
+    }
+
+    #[test]
+    fn process_identity_omission_survives_yaml_round_trip() {
+        let policy = parse_sandbox_policy("version: 1\nprocess:\n  run_as_user: \"1234\"\n")
+            .expect("partial process identity should parse");
+        let process = policy.process.as_ref().expect("process section");
+        assert_eq!(process.run_as_user, "1234");
+        assert!(process.run_as_group.is_empty());
+        assert!(validate_sandbox_policy(&policy).is_ok());
+
+        let yaml = serialize_sandbox_policy(&policy).expect("partial identity should serialize");
+        assert!(yaml.contains("run_as_user"));
+        assert!(!yaml.contains("run_as_group"));
+        let reparsed = parse_sandbox_policy(&yaml).expect("round trip should parse");
+        assert!(reparsed.process.unwrap().run_as_group.is_empty());
+    }
+
+    #[test]
+    fn ensure_sandbox_process_identity_fills_each_omitted_field() {
+        let cases = [
+            (None, None, "sandbox", "sandbox"),
+            (Some("1234"), None, "1234", "sandbox"),
+            (None, Some("1235"), "sandbox", "1235"),
+            (Some("1234"), Some("1235"), "1234", "1235"),
+        ];
+
+        for (user, group, expected_user, expected_group) in cases {
+            let mut policy = restrictive_default_policy();
+            policy.process = Some(ProcessPolicy {
+                run_as_user: user.unwrap_or_default().to_string(),
+                run_as_group: group.unwrap_or_default().to_string(),
+            });
+
+            ensure_sandbox_process_identity(&mut policy);
+
+            let process = policy.process.expect("normalized process policy");
+            assert_eq!(process.run_as_user, expected_user);
+            assert_eq!(process.run_as_group, expected_group);
+        }
     }
 
     #[test]
@@ -1839,38 +1929,6 @@ network_policies:
         )
         .expect_err("unknown JSON-RPC config fields must be rejected");
         assert!(err.to_string().contains("on_parse_error"));
-    }
-
-    #[test]
-    fn ensure_sandbox_process_identity_fills_defaults() {
-        let mut policy = restrictive_default_policy();
-        policy.process = None;
-        ensure_sandbox_process_identity(&mut policy);
-        let proc = policy.process.unwrap();
-        assert_eq!(proc.run_as_user, "sandbox");
-        assert_eq!(proc.run_as_group, "sandbox");
-    }
-
-    #[test]
-    fn ensure_sandbox_process_identity_fills_empty_strings() {
-        let mut policy = restrictive_default_policy();
-        policy.process = Some(ProcessPolicy {
-            run_as_user: String::new(),
-            run_as_group: String::new(),
-        });
-        ensure_sandbox_process_identity(&mut policy);
-        let proc = policy.process.unwrap();
-        assert_eq!(proc.run_as_user, "sandbox");
-        assert_eq!(proc.run_as_group, "sandbox");
-    }
-
-    #[test]
-    fn ensure_sandbox_process_identity_preserves_sandbox() {
-        let mut policy = restrictive_default_policy();
-        ensure_sandbox_process_identity(&mut policy);
-        let proc = policy.process.unwrap();
-        assert_eq!(proc.run_as_user, "sandbox");
-        assert_eq!(proc.run_as_group, "sandbox");
     }
 
     #[test]
@@ -2459,14 +2517,25 @@ network_policies:
     }
 
     #[test]
-    fn validate_rejects_empty_run_as_user() {
+    fn validate_accepts_omitted_process_fields() {
         let mut policy = restrictive_default_policy();
         policy.process = Some(ProcessPolicy {
             run_as_user: String::new(),
             run_as_group: String::new(),
         });
-        let violations = validate_sandbox_policy(&policy).unwrap_err();
-        assert_eq!(violations.len(), 2);
+        assert!(validate_sandbox_policy(&policy).is_ok());
+
+        policy.process = Some(ProcessPolicy {
+            run_as_user: "sandbox".into(),
+            run_as_group: String::new(),
+        });
+        assert!(validate_sandbox_policy(&policy).is_ok());
+
+        policy.process = Some(ProcessPolicy {
+            run_as_user: String::new(),
+            run_as_group: "1234".into(),
+        });
+        assert!(validate_sandbox_policy(&policy).is_ok());
     }
 
     #[test]
@@ -3084,6 +3153,37 @@ network_policies:
     }
 
     #[test]
+    fn round_trip_preserves_endpoint_credential_binding() {
+        let yaml = r"
+version: 1
+network_policies:
+  gcp_storage:
+    endpoints:
+      - host: storage.googleapis.com
+        port: 443
+        protocol: rest
+        credential_binding:
+          provider: work-gcp
+";
+
+        let proto1 = parse_sandbox_policy(yaml).expect("parse failed");
+        let endpoint = &proto1.network_policies["gcp_storage"].endpoints[0];
+        assert_eq!(
+            endpoint
+                .credential_binding
+                .as_ref()
+                .map(|binding| binding.provider.as_str()),
+            Some("work-gcp")
+        );
+
+        let yaml_out = serialize_sandbox_policy(&proto1).expect("serialize failed");
+        let proto2 = parse_sandbox_policy(&yaml_out).expect("re-parse failed");
+        assert_eq!(proto1, proto2);
+        assert!(yaml_out.contains("credential_binding:"));
+        assert!(yaml_out.contains("provider: work-gcp"));
+    }
+
+    #[test]
     fn round_trip_preserves_multi_port() {
         let yaml = r"
 version: 1
@@ -3517,6 +3617,32 @@ network_policies:
     }
 
     #[test]
+    fn round_trip_preserves_allow_uninspected_credentials() {
+        let yaml = r"
+version: 1
+network_policies:
+  vendor_api:
+    endpoints:
+      - host: api.vendor.example
+        port: 443
+        tls: skip
+        allow_uninspected_credentials: true
+";
+        let proto1 = parse_sandbox_policy(yaml).expect("parse failed");
+        let yaml_out = serialize_sandbox_policy(&proto1).expect("serialize failed");
+        let proto2 = parse_sandbox_policy(&yaml_out).expect("re-parse failed");
+
+        let ep = &proto2.network_policies["vendor_api"].endpoints[0];
+        assert!(ep.allow_uninspected_credentials);
+        assert!(
+            !ep.provider_credentialed,
+            "provider provenance must not be authorable from policy YAML"
+        );
+        assert!(yaml_out.contains("allow_uninspected_credentials: true"));
+        assert!(!yaml_out.contains("provider_credentialed"));
+    }
+
+    #[test]
     fn websocket_credential_rewrite_defaults_false() {
         let yaml = r"
 version: 1
@@ -3534,6 +3660,8 @@ network_policies:
         let ep = &proto.network_policies["gateway"].endpoints[0];
         assert!(!ep.websocket_credential_rewrite);
         assert!(!ep.request_body_credential_rewrite);
+        assert!(!ep.allow_uninspected_credentials);
+        assert!(!ep.provider_credentialed);
     }
 
     #[test]

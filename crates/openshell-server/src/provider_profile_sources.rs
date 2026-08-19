@@ -439,23 +439,30 @@ impl EffectiveProviderProfileCatalog {
         id: &str,
         profile_workspace: &str,
     ) -> Option<ProviderTypeProfile> {
+        self.scoped_type_profile_for_scope(id, profile_workspace)
+            .map(|entry| entry.profile.clone())
+    }
+
+    fn scoped_type_profile_for_scope(
+        &self,
+        id: &str,
+        profile_workspace: &str,
+    ) -> Option<&ScopedProfileEntry> {
         let id = normalize_profile_id(id)?;
         let entry = self.profiles.get(&id)?;
 
         if entry.effective.scope == ProfileScope::Static {
-            return Some(entry.effective.profile.clone());
+            return Some(&entry.effective);
         }
 
         if profile_workspace.is_empty() {
             match &entry.platform_fallback {
-                Some(fallback) => Some(fallback.profile.clone()),
-                None if entry.effective.scope == ProfileScope::Platform => {
-                    Some(entry.effective.profile.clone())
-                }
+                Some(fallback) => Some(fallback),
+                None if entry.effective.scope == ProfileScope::Platform => Some(&entry.effective),
                 None => None,
             }
         } else {
-            Some(entry.effective.profile.clone())
+            Some(&entry.effective)
         }
     }
 
@@ -467,34 +474,38 @@ impl EffectiveProviderProfileCatalog {
             .map(|entry| entry.effective.source_id.clone())
     }
 
-    pub(crate) fn hash_profile_revision(&self, profile_id: &str, hasher: &mut Sha256) {
-        let Some(profile_id) = normalize_profile_id(profile_id) else {
-            hasher.update(b"invalid-profile-id");
-            return;
-        };
-
-        let Some(entry) = self.profiles.get(&profile_id) else {
+    pub(crate) fn hash_type_profile_revision_for_scope(
+        &self,
+        profile_id: &str,
+        profile_workspace: &str,
+        hasher: &mut Sha256,
+    ) {
+        let Some(entry) = self.scoped_type_profile_for_scope(profile_id, profile_workspace) else {
             hasher.update(b"missing");
             return;
         };
 
-        hasher.update(b"provider-profile-source-entry");
-        hasher.update(entry.effective.source_id.as_bytes());
-        hasher.update(entry.effective.source_revision.as_bytes());
-        let scope_tag: &[u8] = match entry.effective.scope {
-            ProfileScope::Static => b"static",
-            ProfileScope::Platform => b"platform",
-            ProfileScope::Workspace => b"workspace",
-        };
-        hasher.update(scope_tag);
-        let ownership_tag: &[u8] = if entry.effective.user_managed {
-            b"user-managed"
-        } else {
-            b"source-managed"
-        };
-        hasher.update(ownership_tag);
-        hasher.update(entry.effective.response.encode_to_vec());
+        hash_scoped_profile_revision(entry, hasher);
     }
+}
+
+fn hash_scoped_profile_revision(entry: &ScopedProfileEntry, hasher: &mut Sha256) {
+    hasher.update(b"provider-profile-source-entry");
+    hasher.update(entry.source_id.as_bytes());
+    hasher.update(entry.source_revision.as_bytes());
+    let scope_tag: &[u8] = match entry.scope {
+        ProfileScope::Static => b"static",
+        ProfileScope::Platform => b"platform",
+        ProfileScope::Workspace => b"workspace",
+    };
+    hasher.update(scope_tag);
+    let ownership_tag: &[u8] = if entry.user_managed {
+        b"user-managed"
+    } else {
+        b"source-managed"
+    };
+    hasher.update(ownership_tag);
+    hasher.update(entry.response.encode_to_vec());
 }
 
 fn scope_to_string(scope: ProfileScope) -> &'static str {
@@ -921,7 +932,11 @@ mod tests {
         );
         assert!(first.get_type_profile("moving-profile").is_some());
         let mut first_profile_hash = Sha256::new();
-        first.hash_profile_revision("moving-profile", &mut first_profile_hash);
+        first.hash_type_profile_revision_for_scope(
+            "moving-profile",
+            "default",
+            &mut first_profile_hash,
+        );
         let first_profile_hash = first_profile_hash.finalize();
         assert_eq!(fetch_count.load(Ordering::SeqCst), 1);
 
@@ -932,7 +947,11 @@ mod tests {
             "revision-b"
         );
         let mut second_profile_hash = Sha256::new();
-        second.hash_profile_revision("moving-profile", &mut second_profile_hash);
+        second.hash_type_profile_revision_for_scope(
+            "moving-profile",
+            "default",
+            &mut second_profile_hash,
+        );
         assert_ne!(first_profile_hash, second_profile_hash.finalize());
         assert_ne!(first.revision(), second.revision());
     }
@@ -1631,6 +1650,65 @@ mod tests {
         let result = catalog.get_type_profile_for_scope("anthropic", "");
         assert!(result.is_some());
         assert_eq!(result.unwrap().display_name, "Platform Anthropic");
+    }
+
+    #[test]
+    fn scoped_profile_revision_hashes_platform_fallback_beneath_workspace_override() {
+        let catalog = |platform_path: &str| {
+            let mut platform = profile("anthropic");
+            platform.endpoints.truncate(1);
+            platform.endpoints[0].path = platform_path.to_string();
+            let mut workspace = profile("anthropic");
+            workspace.display_name = "Workspace Anthropic".to_string();
+
+            build_effective_profiles(vec![CollectedProviderProfileSnapshot {
+                source_id: "user".to_string(),
+                revision: "same-source-revision".to_string(),
+                profiles: vec![
+                    ScopedSnapshotProfile {
+                        scope: ProfileScope::Platform,
+                        profile: platform,
+                    },
+                    ScopedSnapshotProfile {
+                        scope: ProfileScope::Workspace,
+                        profile: workspace,
+                    },
+                ],
+                user_managed: true,
+                allow_empty: true,
+            }])
+            .unwrap()
+        };
+
+        let broad = catalog("/**");
+        let narrow = catalog("/v1/**");
+        let mut broad_platform_hash = Sha256::new();
+        broad.hash_type_profile_revision_for_scope("anthropic", "", &mut broad_platform_hash);
+        let mut narrow_platform_hash = Sha256::new();
+        narrow.hash_type_profile_revision_for_scope("anthropic", "", &mut narrow_platform_hash);
+        assert_ne!(
+            broad_platform_hash.finalize(),
+            narrow_platform_hash.finalize(),
+            "platform-scoped providers must hash the selected platform fallback"
+        );
+
+        let mut broad_workspace_hash = Sha256::new();
+        broad.hash_type_profile_revision_for_scope(
+            "anthropic",
+            "default",
+            &mut broad_workspace_hash,
+        );
+        let mut narrow_workspace_hash = Sha256::new();
+        narrow.hash_type_profile_revision_for_scope(
+            "anthropic",
+            "default",
+            &mut narrow_workspace_hash,
+        );
+        assert_eq!(
+            broad_workspace_hash.finalize(),
+            narrow_workspace_hash.finalize(),
+            "workspace-scoped providers must remain keyed to the workspace override"
+        );
     }
 
     #[test]

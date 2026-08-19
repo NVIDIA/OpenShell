@@ -3,8 +3,9 @@
 
 use crate::time::now_ms;
 use base64::Engine as _;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::sync::Arc;
 
 const PLACEHOLDER_PREFIX: &str = "openshell:resolve:env:";
 const PROVIDER_ALIAS_MARKER: &str = "OPENSHELL-RESOLVE-ENV-";
@@ -12,6 +13,24 @@ const PROVIDER_ALIAS_MARKER: &str = "OPENSHELL-RESOLVE-ENV-";
 /// Public access to the placeholder prefix for fail-closed scanning in other modules.
 pub const PLACEHOLDER_PREFIX_PUBLIC: &str = PLACEHOLDER_PREFIX;
 pub const PROVIDER_ALIAS_MARKER_PUBLIC: &str = PROVIDER_ALIAS_MARKER;
+/// Longest wire form of a reserved marker: percent-encoding expands every
+/// marker byte to three bytes (`%XX`), and detection decodes in a single pass.
+const LONGEST_RESERVED_MARKER_WIRE_BYTES: usize =
+    3 * if PLACEHOLDER_PREFIX.len() > PROVIDER_ALIAS_MARKER.len() {
+        PLACEHOLDER_PREFIX.len()
+    } else {
+        PROVIDER_ALIAS_MARKER.len()
+    };
+
+/// Retain this many trailing bytes when scanning a streamed request body so a
+/// reserved marker split across reads cannot be forwarded before detection.
+///
+/// A marker is only detected while all of its wire bytes sit in the scan buffer
+/// at once, so the retained window must hold every byte of the longest form but
+/// the last. A window shorter than that lets a caller split a fully
+/// percent-encoded marker so its leading bytes are forwarded before the rest
+/// arrives, and the reassembled remainder no longer decodes to the marker.
+pub const CREDENTIAL_MARKER_SCAN_TAIL_BYTES: usize = LONGEST_RESERVED_MARKER_WIRE_BYTES;
 
 /// Characters that are valid in an env var key name (used to extract
 /// placeholder boundaries within concatenated strings like path segments).
@@ -35,24 +54,67 @@ pub fn contains_reserved_credential_marker(value: &str) -> bool {
     contains_raw_reserved_marker(&decoded)
 }
 
+pub fn contains_reserved_credential_marker_bytes(value: &[u8]) -> bool {
+    if value.is_empty() {
+        return false;
+    }
+    String::from_utf8_lossy(value)
+        .split('\0')
+        .any(contains_reserved_credential_marker)
+}
+
 // ---------------------------------------------------------------------------
 // Error and result types
 // ---------------------------------------------------------------------------
 
 /// Error returned when a placeholder cannot be resolved or a resolved secret
 /// contains prohibited characters.
-#[derive(Debug)]
+#[derive(Debug, miette::Diagnostic)]
 pub struct UnresolvedPlaceholderError {
     pub location: &'static str, // "header", "query_param", "path"
+    reason: UnresolvedPlaceholderReason,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UnresolvedPlaceholderReason {
+    Unavailable,
+    EndpointMismatch,
+}
+
+impl UnresolvedPlaceholderError {
+    #[must_use]
+    pub fn unavailable(location: &'static str) -> Self {
+        unresolved(location)
+    }
+
+    #[must_use]
+    pub fn is_endpoint_mismatch(&self) -> bool {
+        self.reason == UnresolvedPlaceholderReason::EndpointMismatch
+    }
 }
 
 impl fmt::Display for UnresolvedPlaceholderError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "unresolved credential placeholder in {}: detected reserved credential token that could not be resolved",
-            self.location
+            "{} in {}",
+            match self.reason {
+                UnresolvedPlaceholderReason::Unavailable =>
+                    "credential placeholder could not be resolved",
+                UnresolvedPlaceholderReason::EndpointMismatch =>
+                    "credential is not authorized for the request endpoint",
+            },
+            self.location,
         )
+    }
+}
+
+impl std::error::Error for UnresolvedPlaceholderError {}
+
+fn unresolved(location: &'static str) -> UnresolvedPlaceholderError {
+    UnresolvedPlaceholderError {
+        location,
+        reason: UnresolvedPlaceholderReason::Unavailable,
     }
 }
 
@@ -86,11 +148,14 @@ pub struct RewriteTargetResult {
 #[derive(Clone, Default)]
 pub struct SecretResolver {
     by_placeholder: HashMap<String, SecretValue>,
+    denied_env_keys: HashSet<String>,
+    identity_bound_env_keys: HashSet<String>,
+    revision_fallback_allowed_revisions: HashMap<String, Arc<HashSet<u64>>>,
 }
 
 #[derive(Clone)]
 struct SecretValue {
-    value: String,
+    value: Arc<str>,
     expires_at_ms: i64,
 }
 
@@ -135,32 +200,73 @@ impl SecretResolver {
         credential_expires_at_ms: HashMap<String, i64>,
         revision: u64,
     ) -> (HashMap<String, String>, Option<Self>, Option<Self>) {
-        if revision == 0 {
-            let (child_env, current_resolver) =
-                Self::from_provider_env_for_revision_with_current_aliases(
-                    provider_env,
-                    credential_expires_at_ms,
-                    0,
-                    true,
-                );
-            return (child_env, None, current_resolver);
-        }
-        let provider_env_for_current = provider_env.clone();
-        let credential_expires_at_ms_for_current = credential_expires_at_ms.clone();
-        let (child_env, revision_resolver) =
-            Self::from_provider_env_for_revision_with_current_aliases(
-                provider_env,
-                credential_expires_at_ms,
-                revision,
-                false,
-            );
-        let (_, current_resolver) = Self::from_provider_env_for_revision_with_current_aliases(
-            provider_env_for_current,
-            credential_expires_at_ms_for_current,
+        Self::from_provider_env_for_current_revision_with_stable_handles(
+            provider_env,
+            credential_expires_at_ms,
             revision,
-            true,
-        );
-        (child_env, revision_resolver, current_resolver)
+            &HashMap::new(),
+        )
+    }
+
+    /// Build workload environment and resolver snapshots with gateway-issued
+    /// stable handles for selected refresh-managed credentials.
+    ///
+    /// Stable credentials are registered only in the current resolver. Their
+    /// previous values never enter the bounded revision-generation queue, so a
+    /// revoked or replaced handle cannot resolve an older access token.
+    pub(crate) fn from_provider_env_for_current_revision_with_stable_handles(
+        provider_env: HashMap<String, String>,
+        credential_expires_at_ms: HashMap<String, i64>,
+        revision: u64,
+        stable_handles: &HashMap<String, String>,
+    ) -> (HashMap<String, String>, Option<Self>, Option<Self>) {
+        let mut child_env = HashMap::with_capacity(provider_env.len());
+        let mut generation_values = HashMap::new();
+        let mut current_values = HashMap::new();
+
+        for (key, value) in provider_env {
+            if uses_reserved_revision_namespace(&key) {
+                tracing::warn!(
+                    provider_env_key = %key,
+                    "skipping provider credential env var in reserved placeholder namespace"
+                );
+                continue;
+            }
+            let secret = SecretValue {
+                value: Arc::from(value),
+                expires_at_ms: credential_expires_at_ms
+                    .get(&key)
+                    .copied()
+                    .unwrap_or_default(),
+            };
+            let placeholder = stable_handles.get(&key).map_or_else(
+                || {
+                    let placeholder = placeholder_for_env_key_for_revision(&key, revision);
+                    if revision != 0 {
+                        generation_values.insert(placeholder.clone(), secret.clone());
+                    }
+                    placeholder
+                },
+                |handle| placeholder_for_env_key_for_stable_handle(&key, handle),
+            );
+            child_env.insert(key.clone(), placeholder.clone());
+            current_values.insert(placeholder, secret.clone());
+            current_values.insert(placeholder_for_env_key(&key), secret);
+        }
+
+        let resolver = |by_placeholder: HashMap<String, SecretValue>| {
+            (!by_placeholder.is_empty()).then_some(Self {
+                by_placeholder,
+                denied_env_keys: HashSet::new(),
+                identity_bound_env_keys: HashSet::new(),
+                revision_fallback_allowed_revisions: HashMap::new(),
+            })
+        };
+        (
+            child_env,
+            resolver(generation_values),
+            resolver(current_values),
+        )
     }
 
     fn from_provider_env_for_revision_with_current_aliases(
@@ -186,7 +292,7 @@ impl SecretResolver {
             }
             let placeholder = placeholder_for_env_key_for_revision(&key, revision);
             let secret = SecretValue {
-                value,
+                value: Arc::from(value),
                 expires_at_ms: credential_expires_at_ms
                     .get(&key)
                     .copied()
@@ -202,20 +308,87 @@ impl SecretResolver {
         if by_placeholder.is_empty() {
             (child_env, None)
         } else {
-            (child_env, Some(Self { by_placeholder }))
+            (
+                child_env,
+                Some(Self {
+                    by_placeholder,
+                    denied_env_keys: HashSet::new(),
+                    identity_bound_env_keys: HashSet::new(),
+                    revision_fallback_allowed_revisions: HashMap::new(),
+                }),
+            )
         }
     }
 
     pub fn merge<'a>(resolvers: impl IntoIterator<Item = &'a Self>) -> Option<Self> {
         let mut by_placeholder = HashMap::new();
+        let mut denied_env_keys = HashSet::new();
+        let mut identity_bound_env_keys = HashSet::new();
+        let mut revision_fallback_allowed_revisions = HashMap::new();
         for resolver in resolvers {
             by_placeholder.extend(resolver.by_placeholder.clone());
+            denied_env_keys.extend(resolver.denied_env_keys.iter().cloned());
+            identity_bound_env_keys.extend(resolver.identity_bound_env_keys.iter().cloned());
+            revision_fallback_allowed_revisions
+                .extend(resolver.revision_fallback_allowed_revisions.clone());
         }
         if by_placeholder.is_empty() {
             None
         } else {
-            Some(Self { by_placeholder })
+            Some(Self {
+                by_placeholder,
+                denied_env_keys,
+                identity_bound_env_keys,
+                revision_fallback_allowed_revisions,
+            })
         }
+    }
+
+    /// Return a cheap endpoint-scoped resolver view.
+    ///
+    /// Secret strings are shared through cloned resolver entries. Credential
+    /// keys listed in `bound_keys` resolve only when also present in
+    /// `allowed_bound_keys`; unbound provider configuration remains available.
+    #[must_use]
+    pub fn scoped_to_env_keys(
+        &self,
+        bound_keys: &HashSet<String>,
+        allowed_bound_keys: &HashSet<String>,
+        revision_fallback_allowed_revisions: HashMap<String, Arc<HashSet<u64>>>,
+    ) -> Self {
+        let denied_env_keys = bound_keys
+            .difference(allowed_bound_keys)
+            .cloned()
+            .collect::<HashSet<_>>();
+        let by_placeholder = self
+            .by_placeholder
+            .iter()
+            .filter(|(placeholder, _)| {
+                placeholder_env_key(placeholder).is_none_or(|key| !denied_env_keys.contains(key))
+            })
+            .map(|(placeholder, secret)| (placeholder.clone(), secret.clone()))
+            .collect();
+        Self {
+            by_placeholder,
+            denied_env_keys,
+            identity_bound_env_keys: bound_keys.clone(),
+            revision_fallback_allowed_revisions,
+        }
+    }
+
+    fn unresolved_for(
+        &self,
+        location: &'static str,
+        placeholder: &str,
+    ) -> UnresolvedPlaceholderError {
+        let reason = if placeholder_env_key(placeholder)
+            .is_some_and(|key| self.denied_env_keys.contains(key))
+        {
+            UnresolvedPlaceholderReason::EndpointMismatch
+        } else {
+            UnresolvedPlaceholderReason::Unavailable
+        };
+        UnresolvedPlaceholderError { location, reason }
     }
 
     /// Resolve a placeholder string to the real secret value.
@@ -223,34 +396,83 @@ impl SecretResolver {
     /// Returns `None` if the placeholder is unknown or the resolved value
     /// contains prohibited control characters (CRLF, null byte).
     pub fn resolve_placeholder(&self, value: &str) -> Option<&str> {
+        if placeholder_env_key(value).is_some_and(|key| self.identity_bound_env_keys.contains(key))
+            && revisioned_placeholder_parts(value).is_none()
+            && stable_placeholder_parts(value).is_none()
+        {
+            // Canonical placeholders and provider-shaped aliases carry no
+            // credential identity. Endpoint-bound request input must use the
+            // revision-scoped placeholder issued to the workload so a stale
+            // process cannot resolve a replacement provider's credential.
+            return None;
+        }
         let secret = if let Some(secret) = self.by_placeholder.get(value) {
             secret
         } else {
-            // Once an old generation ages out, the revision number is only a
-            // namespace marker. Fall back by key to the current credential so
-            // long-running child processes survive provider credential refresh.
+            // Once an old generation ages out, fall back by key to the current
+            // credential so long-running child processes survive provider
+            // credential refresh. For endpoint-bound credentials, permit that
+            // fallback only when the exact opaque revision belongs to the
+            // current provider-identity epoch.
             let key = revisioned_placeholder_env_key(value).or_else(|| alias_env_key(value))?;
+            if let Some((revision, key)) = revisioned_placeholder_parts(value)
+                && self.identity_bound_env_keys.contains(key)
+                && self
+                    .revision_fallback_allowed_revisions
+                    .get(key)
+                    .is_none_or(|revisions| !revisions.contains(&revision))
+            {
+                return None;
+            }
             let canonical = placeholder_for_env_key(key);
             self.by_placeholder.get(&canonical)?
         };
-        if secret.expires_at_ms > 0 && secret.expires_at_ms <= now_ms() {
-            tracing::warn!(
-                location = "resolve_placeholder",
-                "credential resolution rejected: credential is expired"
-            );
-            return None;
+        resolve_secret_value(secret)
+    }
+
+    /// Resolve the current value for an environment key selected by trusted
+    /// supervisor code.
+    ///
+    /// Unlike [`Self::resolve_placeholder_checked`], this method accepts an
+    /// environment key rather than a user-provided placeholder token. Internal
+    /// request transforms such as `SigV4` can therefore select the endpoint-bound
+    /// current credential without making identityless placeholder aliases
+    /// available to sandbox request input.
+    pub fn resolve_current_env_key_checked(
+        &self,
+        key: &str,
+        location: &'static str,
+    ) -> Result<Option<&str>, UnresolvedPlaceholderError> {
+        if self.denied_env_keys.contains(key) {
+            return Err(UnresolvedPlaceholderError {
+                location,
+                reason: UnresolvedPlaceholderReason::EndpointMismatch,
+            });
         }
-        match validate_resolved_secret(&secret.value) {
-            Ok(s) => Some(s),
-            Err(reason) => {
-                tracing::warn!(
-                    location = "resolve_placeholder",
-                    reason,
-                    "credential resolution rejected: resolved value contains prohibited characters"
-                );
-                None
-            }
+        let placeholder = placeholder_for_env_key(key);
+        Ok(self
+            .by_placeholder
+            .get(&placeholder)
+            .and_then(resolve_secret_value))
+    }
+
+    /// Resolve a placeholder while preserving endpoint-denial information.
+    ///
+    /// `None` means the credential is genuinely unavailable. An endpoint-bound
+    /// key denied by the scoped resolver returns a typed mismatch so callers
+    /// can emit the security denial instead of treating it as missing config.
+    pub fn resolve_placeholder_checked(
+        &self,
+        value: &str,
+        location: &'static str,
+    ) -> Result<Option<&str>, UnresolvedPlaceholderError> {
+        if placeholder_env_key(value).is_some_and(|key| self.denied_env_keys.contains(key)) {
+            return Err(UnresolvedPlaceholderError {
+                location,
+                reason: UnresolvedPlaceholderReason::EndpointMismatch,
+            });
         }
+        Ok(self.resolve_placeholder(value))
     }
 
     pub fn expires_at_ms_for_placeholder(&self, placeholder: &str) -> Option<i64> {
@@ -284,7 +506,7 @@ impl SecretResolver {
         // Prefixed placeholder: `Bearer openshell:resolve:env:KEY`
         let Some(split_at) = trimmed.find(char::is_whitespace) else {
             if contains_reserved_credential_marker(trimmed) {
-                return Err(UnresolvedPlaceholderError { location: "header" });
+                return Err(self.unresolved_for("header", trimmed));
             }
             return Ok(None);
         };
@@ -295,7 +517,7 @@ impl SecretResolver {
         }
 
         if contains_reserved_credential_marker(candidate) {
-            return Err(UnresolvedPlaceholderError { location: "header" });
+            return Err(self.unresolved_for("header", candidate));
         }
 
         Ok(None)
@@ -329,10 +551,10 @@ impl SecretResolver {
 
             if text[abs_start..].starts_with(PLACEHOLDER_PREFIX) {
                 let Some((token_end, token)) = self.credential_token_at(text, abs_start) else {
-                    return Err(UnresolvedPlaceholderError { location });
+                    return Err(unresolved(location));
                 };
                 let Some(secret) = self.resolve_placeholder(token) else {
-                    return Err(UnresolvedPlaceholderError { location });
+                    return Err(self.unresolved_for(location, token));
                 };
                 rewritten.push_str(secret);
                 replacements += 1;
@@ -342,7 +564,7 @@ impl SecretResolver {
 
             if let Some((token_end, token)) = alias_token_at(text, abs_start) {
                 let Some(secret) = self.resolve_placeholder(token) else {
-                    return Err(UnresolvedPlaceholderError { location });
+                    return Err(self.unresolved_for(location, token));
                 };
                 rewritten.push_str(secret);
                 replacements += 1;
@@ -350,11 +572,11 @@ impl SecretResolver {
                 continue;
             }
 
-            return Err(UnresolvedPlaceholderError { location });
+            return Err(unresolved(location));
         }
 
         if contains_raw_reserved_marker(&rewritten) {
-            return Err(UnresolvedPlaceholderError { location });
+            return Err(unresolved(location));
         }
 
         *text = rewritten;
@@ -433,6 +655,27 @@ impl SecretResolver {
     }
 }
 
+fn resolve_secret_value(secret: &SecretValue) -> Option<&str> {
+    if secret.expires_at_ms > 0 && secret.expires_at_ms <= now_ms() {
+        tracing::warn!(
+            location = "resolve_placeholder",
+            "credential resolution rejected: credential is expired"
+        );
+        return None;
+    }
+    match validate_resolved_secret(secret.value.as_ref()) {
+        Ok(s) => Some(s),
+        Err(reason) => {
+            tracing::warn!(
+                location = "resolve_placeholder",
+                reason,
+                "credential resolution rejected: resolved value contains prohibited characters"
+            );
+            None
+        }
+    }
+}
+
 fn alias_start_for_marker(text: &str, marker_abs: usize) -> usize {
     let mut start = marker_abs;
     let bytes = text.as_bytes();
@@ -490,13 +733,31 @@ fn alias_env_key(token: &str) -> Option<&str> {
 }
 
 fn revisioned_placeholder_env_key(token: &str) -> Option<&str> {
+    revisioned_placeholder_parts(token).map(|(_, key)| key)
+}
+
+fn revisioned_placeholder_parts(token: &str) -> Option<(u64, &str)> {
     let suffix = token.strip_prefix(PLACEHOLDER_PREFIX)?;
-    let (_, key) = split_revisioned_env_key(suffix)?;
-    Some(key)
+    let (revision, key) = split_revisioned_env_key(suffix)?;
+    Some((revision.parse().ok()?, key))
+}
+
+fn stable_placeholder_parts(token: &str) -> Option<(&str, &str)> {
+    let suffix = token.strip_prefix(PLACEHOLDER_PREFIX)?;
+    let (handle, key) = split_stable_env_key(suffix)?;
+    Some((handle, key))
+}
+
+fn placeholder_env_key(token: &str) -> Option<&str> {
+    stable_placeholder_parts(token)
+        .map(|(_, key)| key)
+        .or_else(|| revisioned_placeholder_env_key(token))
+        .or_else(|| token.strip_prefix(PLACEHOLDER_PREFIX))
+        .or_else(|| alias_env_key(token))
 }
 
 pub fn uses_reserved_revision_namespace(key: &str) -> bool {
-    split_revisioned_env_key(key).is_some()
+    split_revisioned_env_key(key).is_some() || split_stable_env_key(key).is_some()
 }
 
 fn split_revisioned_env_key(key: &str) -> Option<(&str, &str)> {
@@ -510,6 +771,21 @@ fn split_revisioned_env_key(key: &str) -> Option<(&str, &str)> {
         return None;
     }
     Some((revision, env_key))
+}
+
+fn split_stable_env_key(key: &str) -> Option<(&str, &str)> {
+    let suffix = key.strip_prefix('s')?;
+    let (handle, env_key) = suffix.split_once('_')?;
+    if handle.len() != 64
+        || !handle
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        || env_key.is_empty()
+        || !env_key.bytes().all(is_env_key_char)
+    {
+        return None;
+    }
+    Some((handle, env_key))
 }
 
 fn token_boundary_ok(text: &str, abs_start: usize, token_end: usize, token: &str) -> bool {
@@ -533,6 +809,10 @@ pub fn placeholder_for_env_key_for_revision(key: &str, revision: u64) -> String 
     } else {
         format!("{PLACEHOLDER_PREFIX}v{revision}_{key}")
     }
+}
+
+pub(crate) fn placeholder_for_env_key_for_stable_handle(key: &str, handle: &str) -> String {
+    format!("{PLACEHOLDER_PREFIX}s{handle}_{key}")
 }
 
 // ---------------------------------------------------------------------------
@@ -836,7 +1116,7 @@ fn rewrite_path_segment(
             let Some((token_end, full_placeholder)) = canonical_token_at(segment, abs_start)
                 .or_else(|| alias_token_at(segment, abs_start))
             else {
-                return Err(UnresolvedPlaceholderError { location: "path" });
+                return Err(unresolved("path"));
             };
             if let Some(secret) = resolver.resolve_placeholder(full_placeholder) {
                 validate_credential_for_path(secret).map_err(|reason| {
@@ -845,12 +1125,12 @@ fn rewrite_path_segment(
                         %reason,
                         "credential resolution rejected: resolved value unsafe for path"
                     );
-                    UnresolvedPlaceholderError { location: "path" }
+                    unresolved("path")
                 })?;
                 resolved.push_str(secret);
                 redacted.push_str("[CREDENTIAL]");
             } else {
-                return Err(UnresolvedPlaceholderError { location: "path" });
+                return Err(resolver.unresolved_for("path", full_placeholder));
             }
             pos = token_end;
         } else {
@@ -887,9 +1167,7 @@ fn rewrite_uri_query_params(
                 let replacements =
                     resolver.rewrite_text_placeholders(&mut rewritten, "query_param")?;
                 if replacements == 0 || contains_raw_reserved_marker(&rewritten) {
-                    return Err(UnresolvedPlaceholderError {
-                        location: "query_param",
-                    });
+                    return Err(unresolved("query_param"));
                 }
                 resolved_params.push(format!("{key}={}", percent_encode_query(&rewritten)));
                 redacted_params.push(format!("{key}=[CREDENTIAL]"));
@@ -941,7 +1219,7 @@ pub fn rewrite_http_header_block(
             .map_or(raw.len(), |p| raw.len().min(p + 4 + 256));
         let header_region = String::from_utf8_lossy(&raw[..scan_end]);
         if contains_reserved_credential_marker(&header_region) {
-            return Err(UnresolvedPlaceholderError { location: "header" });
+            return Err(unresolved("header"));
         }
         return Ok(RewriteResult {
             rewritten: raw.to_vec(),
@@ -988,7 +1266,7 @@ pub fn rewrite_http_header_block(
     // provider-shaped aliases in both raw and percent-decoded header bytes.
     let output_header = String::from_utf8_lossy(&output[..output.len().min(header_end + 256)]);
     if contains_reserved_credential_marker(&output_header) {
-        return Err(UnresolvedPlaceholderError { location: "header" });
+        return Err(unresolved("header"));
     }
 
     Ok(RewriteResult {
@@ -1066,6 +1344,48 @@ pub fn rewrite_target_for_eval(
     Ok(RewriteTargetResult { resolved, redacted })
 }
 
+/// Produce the policy/logging representation of a request target without
+/// consulting or materializing credential values.
+///
+/// This validates placeholder syntax using the same URI-aware rewrite path as
+/// upstream injection, but resolves every referenced key to a fixed redaction
+/// marker. Callers can therefore select routes and evaluate policy before the
+/// real endpoint-scoped resolver is touched.
+pub fn redact_target_for_policy(target: &str) -> Result<String, UnresolvedPlaceholderError> {
+    if !contains_reserved_credential_marker(target) {
+        return Ok(target.to_string());
+    }
+
+    let decoded = percent_decode(target);
+    let mut provider_env = HashMap::new();
+    let mut pos = 0;
+    while pos < decoded.len() {
+        let next_canonical = decoded[pos..].find(PLACEHOLDER_PREFIX).map(|p| pos + p);
+        let next_alias = decoded[pos..]
+            .find(PROVIDER_ALIAS_MARKER)
+            .map(|marker_pos| alias_start_for_marker(&decoded, pos + marker_pos));
+        let Some(start) = [next_canonical, next_alias].into_iter().flatten().min() else {
+            break;
+        };
+        let Some((end, token)) =
+            canonical_token_at(&decoded, start).or_else(|| alias_token_at(&decoded, start))
+        else {
+            return Err(unresolved("request_target"));
+        };
+        let Some(key) = placeholder_env_key(token) else {
+            return Err(unresolved("request_target"));
+        };
+        provider_env.insert(key.to_string(), "[CREDENTIAL]".to_string());
+        pos = end;
+    }
+
+    let (_, resolver) = SecretResolver::from_provider_env(provider_env);
+    let Some(resolver) = resolver else {
+        return Err(unresolved("request_target"));
+    };
+    rewrite_target_for_eval(target, &resolver).map(|result| result.redacted)
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -1079,6 +1399,45 @@ mod tests {
     use super::*;
 
     // === Existing tests (preserved) ===
+
+    #[test]
+    fn byte_marker_detection_handles_raw_encoded_and_binary_input() {
+        assert!(contains_reserved_credential_marker_bytes(
+            b"openshell:resolve:env:API_TOKEN"
+        ));
+        assert!(contains_reserved_credential_marker_bytes(
+            b"openshell%3Aresolve%3Aenv%3AAPI_TOKEN"
+        ));
+        assert!(!contains_reserved_credential_marker_bytes(&[
+            0xff, 0x00, 0x01, 0x02
+        ]));
+    }
+
+    fn fully_percent_encoded(marker: &str) -> String {
+        const HEX: &[u8; 16] = b"0123456789ABCDEF";
+        let mut encoded = String::with_capacity(marker.len() * 3);
+        for byte in marker.bytes() {
+            encoded.push('%');
+            encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+            encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+        }
+        encoded
+    }
+
+    #[test]
+    fn scan_tail_window_covers_longest_encoded_marker_form() {
+        for marker in [PLACEHOLDER_PREFIX, PROVIDER_ALIAS_MARKER] {
+            let encoded = fully_percent_encoded(marker);
+            assert!(
+                contains_reserved_credential_marker(&encoded),
+                "fully encoded {marker} must be detected"
+            );
+            assert!(
+                CREDENTIAL_MARKER_SCAN_TAIL_BYTES >= encoded.len() - 1,
+                "scan window must retain every byte of {encoded} but the last"
+            );
+        }
+    }
 
     #[test]
     fn provider_env_is_replaced_with_placeholders() {
@@ -1117,8 +1476,12 @@ mod tests {
     fn reserved_revision_namespace_requires_version_and_key() {
         assert!(uses_reserved_revision_namespace("v10_GITHUB_TOKEN"));
         assert!(uses_reserved_revision_namespace("v999999_very_unlikely"));
+        assert!(uses_reserved_revision_namespace(
+            "saaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa_GITHUB_TOKEN"
+        ));
         assert!(!uses_reserved_revision_namespace("v_GITHUB_TOKEN"));
         assert!(!uses_reserved_revision_namespace("v10_"));
+        assert!(!uses_reserved_revision_namespace("sshort_GITHUB_TOKEN"));
         assert!(!uses_reserved_revision_namespace("very_unlikely"));
         assert!(!uses_reserved_revision_namespace("GITHUB_TOKEN"));
     }
@@ -2200,5 +2563,13 @@ mod tests {
 
         assert_eq!(result.resolved, "/bottok123/method?key=key456");
         assert_eq!(result.redacted, "/bot[CREDENTIAL]/method?key=[CREDENTIAL]");
+    }
+
+    #[test]
+    fn policy_target_redaction_never_requires_real_secret_material() {
+        let target = "/v1/openshell:resolve:env:v9_API_KEY/messages?token=provider-OPENSHELL-RESOLVE-ENV-API_KEY";
+        let redacted = redact_target_for_policy(target).expect("valid placeholder syntax");
+        assert_eq!(redacted, "/v1/[CREDENTIAL]/messages?token=[CREDENTIAL]");
+        assert!(!redacted.contains("API_KEY"));
     }
 }

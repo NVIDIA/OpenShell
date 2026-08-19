@@ -16,7 +16,17 @@ The Release Canary (`.github/workflows/release-canary.yml`) smoke-tests the arti
 | `fedora` | `fedora:latest` container | `install.sh` installs the RPM packages, the local gateway starts under Podman, and `openshell status` succeeds. |
 | `kubernetes` | `ubuntu-latest` + kind | `helm install oci://ghcr.io/nvidia/openshell/helm-chart --version 0.0.0-dev` succeeds in a kind cluster, the gateway pod becomes Ready, port-forward exposes 8080, and the released CLI registers the in-cluster gateway and runs `openshell status` against it. |
 
+All canary jobs disable anonymous OpenShell telemetry. Host package jobs inject
+`OPENSHELL_TELEMETRY_ENABLED=false` through the service environment, and the
+Kubernetes job installs with `server.telemetryEnabled=false`, so smoke traffic
+does not contribute to product usage metrics.
+
 `install.sh` defaults to the *latest tagged* release — the canary is therefore checking that the most recent public release still installs, not the just-published `dev` build. The `kubernetes` job is the exception: it pins to `0.0.0-dev` chart + `:dev` images.
+
+The canary does not install or import `@nvidia/openshell-sdk`. TypeScript SDK
+validation lives in the `TypeScript SDK` branch check, including a publish
+dry-run. The tagged release workflow publishes the package to GitHub Packages;
+verify that job directly when diagnosing SDK publication failures.
 
 ## Trigger paths
 
@@ -83,6 +93,7 @@ helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart \
   --version 0.0.0-dev \
   --namespace openshell --create-namespace \
   --set server.disableTls=true \
+  --set server.telemetryEnabled=false \
   --wait --timeout 5m
 
 kubectl wait --namespace openshell \

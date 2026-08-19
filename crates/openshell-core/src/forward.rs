@@ -8,6 +8,7 @@
 
 use crate::paths::{create_dir_restricted, xdg_config_dir};
 use miette::{IntoDiagnostic, Result, WrapErr};
+use std::borrow::Cow;
 use std::net::TcpListener;
 use std::path::PathBuf;
 use std::process::Command;
@@ -580,18 +581,28 @@ impl ForwardSpec {
     }
 
     /// The SSH `-L` local-forward argument: `bind_addr:port:127.0.0.1:port`.
+    ///
+    /// IPv6 bind literals are bracketed (`::1` → `[::1]`) because OpenSSH
+    /// rejects an unbracketed IPv6 address in a forward specification.
     pub fn ssh_forward_arg(&self) -> String {
-        format!("{}:{}:127.0.0.1:{}", self.bind_addr, self.port, self.port)
+        format!(
+            "{}:{}:127.0.0.1:{}",
+            bracket_ipv6_host(&self.bind_addr),
+            self.port,
+            self.port
+        )
     }
 
     /// A human-readable URL for the forwarded port.
     pub fn access_url(&self) -> String {
+        // Wildcard binds are not connectable targets, so display a reachable
+        // loopback host instead.
         let host = if self.bind_addr == "0.0.0.0" || self.bind_addr == "::" {
             "localhost"
         } else {
             &self.bind_addr
         };
-        format!("http://{host}:{}/", self.port)
+        format!("{}/", format_gateway_url("http", host, self.port))
     }
 }
 
@@ -734,11 +745,11 @@ pub fn resolve_ssh_gateway(
             // Remote cluster: use the remote host but keep the cluster URL port.
             return (host.to_string(), cluster_port);
         }
-        // Both endpoints loopback. The unspecified addresses (0.0.0.0 / ::)
-        // are bind-only — they aren't valid connect targets and aren't in TLS
-        // cert SANs, so fall back to the cluster URL's host (which the CLI
-        // is already using to reach the gateway).
-        if gateway_host == "0.0.0.0" || gateway_host == "::" {
+        // Unspecified addresses are bind-only, and tonic cannot use an IPv6
+        // literal as a TLS DNS name. In those cases, keep the cluster URL's
+        // already-reachable authority. Other loopback addresses retain the
+        // gateway-reported host.
+        if matches!(gateway_host, "0.0.0.0" | "::" | "::1") {
             return (host.to_string(), cluster_port);
         }
         return (gateway_host.to_string(), cluster_port);
@@ -747,18 +758,24 @@ pub fn resolve_ssh_gateway(
     (gateway_host.to_string(), gateway_port)
 }
 
-/// Format a gateway URL, bracketing IPv6 literals when needed.
-pub fn format_gateway_url(scheme: &str, host: &str, port: u16) -> String {
-    let host = if host
+/// Bracket a bare IPv6 literal (e.g. `::1` → `[::1]`) so it can be embedded in
+/// `host:port` syntax. Non-IPv6 hosts (DNS names, IPv4) and already-bracketed
+/// literals are returned unchanged.
+fn bracket_ipv6_host(host: &str) -> Cow<'_, str> {
+    if host
         .parse::<std::net::IpAddr>()
         .is_ok_and(|ip| ip.is_ipv6())
         && !host.starts_with('[')
     {
-        format!("[{host}]")
+        Cow::Owned(format!("[{host}]"))
     } else {
-        host.to_string()
-    };
-    format!("{scheme}://{host}:{port}")
+        Cow::Borrowed(host)
+    }
+}
+
+/// Format a gateway URL, bracketing IPv6 literals when needed.
+pub fn format_gateway_url(scheme: &str, host: &str, port: u16) -> String {
+    format!("{scheme}://{}:{port}", bracket_ipv6_host(host))
 }
 
 /// Shell-escape a value for use inside a `ProxyCommand` string.
@@ -1007,6 +1024,13 @@ mod tests {
         let (host, port) = resolve_ssh_gateway("127.0.0.1", 8080, "https://127.0.0.1:443");
         assert_eq!(host, "127.0.0.1");
         assert_eq!(port, 443);
+    }
+
+    #[test]
+    fn resolve_ssh_gateway_preserves_loopback_tls_authority() {
+        let (host, port) = resolve_ssh_gateway("::1", 8080, "https://localhost:8443");
+        assert_eq!(host, "localhost");
+        assert_eq!(port, 8443);
     }
 
     #[test]
@@ -1341,6 +1365,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(target_os = "windows"))]
     #[test]
     fn check_port_available_occupied_ipv6_wildcard() {
         // Bind on [::]:0 (IPv6 wildcard) — this simulates a server like
@@ -1411,6 +1436,17 @@ mod tests {
 
         let spec = ForwardSpec::parse("8080").unwrap();
         assert_eq!(spec.ssh_forward_arg(), "127.0.0.1:8080:127.0.0.1:8080");
+    }
+
+    #[test]
+    fn forward_spec_ssh_forward_arg_brackets_ipv6_literal() {
+        // OpenSSH rejects an unbracketed IPv6 bind address in a `-L`
+        // specification; the literal must be wrapped in brackets.
+        let spec = ForwardSpec::parse("::1:8080").unwrap();
+        assert_eq!(spec.ssh_forward_arg(), "[::1]:8080:127.0.0.1:8080");
+
+        let spec = ForwardSpec::parse(":::8080").unwrap();
+        assert_eq!(spec.ssh_forward_arg(), "[::]:8080:127.0.0.1:8080");
     }
 
     #[test]
@@ -1660,6 +1696,18 @@ mod tests {
         assert_eq!(spec.access_url(), "http://127.0.0.1:8080/");
 
         let spec = ForwardSpec::parse("0.0.0.0:8080").unwrap();
+        assert_eq!(spec.access_url(), "http://localhost:8080/");
+    }
+
+    #[test]
+    fn forward_spec_access_url_ipv6() {
+        // A specific IPv6 loopback literal must be bracketed for a valid URL.
+        let spec = ForwardSpec::parse("::1:8080").unwrap();
+        assert_eq!(spec.access_url(), "http://[::1]:8080/");
+
+        // The IPv6 wildcard bind is not a connectable target, so it maps to a
+        // reachable host for display.
+        let spec = ForwardSpec::parse(":::8080").unwrap();
         assert_eq!(spec.access_url(), "http://localhost:8080/");
     }
 

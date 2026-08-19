@@ -37,6 +37,25 @@ health, metrics, or tunnel routes. The plaintext service router also rejects
 browser requests whose Fetch Metadata, Origin, or Referer headers indicate a
 cross-origin or sibling-subdomain request.
 
+Docker and Podman report the local address through which their sandboxes can
+reach the gateway. When the primary listener covers that address, the gateway
+reuses it; sandbox JWT authentication and its RPC allowlist remain the callback
+authorization boundary. When the primary listener does not cover the address,
+the gateway adds a callback-only listener. Additional callback listeners accept
+only gRPC methods classified as sandbox-callable by the gateway's generated
+authorization metadata. They reject user and administrator APIs, health,
+reflection, non-callback inference APIs, and HTTP routes before normal request
+authentication. The operator-configured primary listener retains the full
+multiplexed API surface.
+
+The `rpc_auth` classification is also the source of truth for negotiated
+listener exposure: marking an RPC as `sandbox` or `dual` makes it callable on
+these listeners. Review such changes as both authorization and network-surface
+changes. Listener requirements are currently authorized only for the built-in
+Docker and Podman drivers. Operator-granted listener capabilities for external
+drivers are tracked in
+[#2539](https://github.com/NVIDIA/OpenShell/issues/2539).
+
 Operators can configure a gateway-wide gRPC request rate limit. The limit is
 applied only to gRPC API traffic after protocol multiplexing; health, metrics,
 and local sandbox-service HTTP routes are not rate limited by this control.
@@ -52,6 +71,26 @@ re-encoded before the handler sees the request. New RPCs are non-interceptable
 until deliberately added to this allowlist. Interception remains centralized:
 allowlisting a unary RPC does not require method-specific gateway
 instrumentation.
+
+Remote extension clients share `openshell-extension-core` transport and bearer
+primitives. When gateway JWT signing is configured, the gateway mints
+short-lived, exact-audience EdDSA credentials for middleware and interceptors,
+rotates their in-memory slots without rebuilding clients, and publishes the
+public verification key at `/.well-known/jwks.json` alongside OIDC-shaped
+discovery metadata at `/.well-known/openid-configuration`. HTTPS extensions can
+pin an operator-provided CA while retaining endpoint-hostname verification.
+
+Extension credentials reuse the sandbox signing key and are separated from
+sandbox-to-gateway admission tokens by exact audience and by an explicit
+`typ` of `openshell-ext+jwt`, so a verifier that checks either one alone
+cannot confuse the two. After authenticated `Describe` succeeds, a service may
+advertise `expected_audience` as a post-authentication consistency assertion;
+a mismatch against operator configuration fails gateway startup. A strict
+verifier may reject an incorrect audience before returning the manifest. A
+registration may opt out of extension authentication entirely with
+`allow_insecure_transport`, which permits a plaintext endpoint, attaches no
+credential, and warns at every startup. Credential minting is bounded per
+sandbox because it resolves the caller's effective policy.
 
 Each configured interceptor selects a binding policy. `dynamic` accepts valid
 manifest declarations and preserves the compatibility behavior. `allowlist`
@@ -135,7 +174,7 @@ Supported auth modes:
 | Plaintext | Local development or a trusted reverse proxy boundary. |
 | Unauthenticated local users | Trusted Kubernetes dev or fully trusted proxy deployments only. |
 | Cloudflare JWT | Edge-authenticated deployments where Cloudflare Access supplies identity. |
-| OIDC | Bearer-token auth for users, with browser PKCE or client credentials login. |
+| OIDC | Bearer-token auth for users, with browser or device-code PKCE and client credentials login. |
 
 The CLI persists the scopes requested during OIDC login in gateway metadata and
 reuses them when refreshing an access token. This preserves the intended API
@@ -157,8 +196,15 @@ does not grant sandbox identity. Kubernetes deployments use the
 gateway-minted JWT bootstrap path: the supervisor starts with a projected
 ServiceAccount token, exchanges it for a gateway-minted sandbox JWT, and uses
 that JWT on subsequent gateway RPCs.
-User-facing mutations are authorized by role policy when OIDC or edge identity
-is enabled.
+User-facing RPCs are authorized by descriptor-declared role and scope policy
+when OIDC or edge identity is enabled. The OIDC admin role grants platform-wide
+access and bypasses workspace membership checks. Workspace Admin and Workspace
+User roles are durable membership records keyed by workspace and authenticated
+subject. Handlers resolve the resource workspace and require sufficient
+membership after the middleware validates the global role and optional scope.
+The authenticated `GetCurrentUser` endpoint exposes the gateway's validated
+user subject, display name, roles, scopes, and identity provider for CLI
+identity inspection without client-side token decoding.
 
 Sandbox secrets are gateway-signed JWTs bound to a single sandbox ID. Docker,
 Podman, and VM drivers deliver the initial token through supervisor-only
@@ -277,7 +323,13 @@ keeps only the current injectable credential values and optional per-credential
 expiry timestamps. A refresh normally mints one credential, but a strategy may
 co-mint several (AWS STS mints the access key, secret key, and session token in
 one call); the refresh state pins the resolved set of env keys it owns so
-collision checks reserve all of them before the first mint.
+collision checks reserve all of them before the first mint. Provider records
+keep inline credential values only for legacy records created before credential
+driver storage. New provider writes keep driver-owned credential handles. When
+no external credential driver is configured, gateways use server-owned encrypted
+database credential storage for defense in depth. Multi-replica deployments can
+use that default with a shared database and shared key-encryption key, or opt
+into an external backend such as Vault or Kubernetes Secrets.
 
 ### Optimistic Concurrency (CAS)
 
@@ -390,6 +442,9 @@ each service and validates its described bindings and operator body limit.
 Policies attach a complete external middleware by its operator-owned registration
 name. Manifest bindings are identified by operation and phase, and each manifest
 may declare at most one binding for an operation and phase pair.
+Attaching a registration does not require it to advertise every supported
+operation. Supervisors select only the manifest bindings that match the current
+operation; policy-local config identity remains internal audit metadata.
 Before persisting a policy, the gateway asks each selected implementation to
 validate its config. The effective sandbox config contains only the registered
 services required by that policy; supervisors invoke those services directly on
@@ -399,6 +454,18 @@ Provider credential expiry is enforced during gateway-to-sandbox credential
 resolution and again by the sandbox placeholder resolver. This keeps expired
 credentials from resolving even when a running sandbox still has retained
 placeholder generations from an earlier provider credential snapshot.
+
+Static credential delivery is capability-negotiated and endpoint-bound. The
+gateway classifies each returned environment entry as either a credential or
+non-secret provider configuration and associates every credential key with the
+host, port, and path selectors from its effective provider profile. It withholds
+static credential material from supervisors that do not advertise binding
+support. If a selected provider profile has no usable endpoint, the gateway
+withholds only that profile's static credential keys and their expiry and
+binding metadata. It continues to return provider-generated non-secret
+configuration, valid endpoint-bound static credentials from other attached
+providers, and the dynamic credential snapshot. Provider environment revisions
+include profile endpoint and binding changes.
 
 ## Inference Resolution
 
@@ -596,6 +663,41 @@ Driver-specific values that are not part of the inheritance allowlist
 (e.g. Podman `socket_path`, VM `vcpus`) only come from the driver's own
 table.
 
+### OTLP export
+
+The gateway already uses Rust's `tracing` framework for structured log events
+and request-span context consumed by stdout and the sandbox log bus. OTLP export
+adds an OpenTelemetry layer to the same subscriber. That layer turns selected
+`tracing` spans into distributed traces; it does not export log events or
+replace the existing logging paths.
+
+`[openshell.gateway.otlp]` is the only enablement path for OpenTelemetry
+export: the table's presence is the on-switch, and `OTEL_EXPORTER_OTLP_ENDPOINT`
+is ignored so enablement has a single source. TOML decides whether and where
+to export; the SDK's `OTEL_*` variables tune how. Transport is OTLP over gRPC
+only. Shared provider, resource, and tracing-layer construction lives in
+`openshell-otel`, along with shared HTTP/tonic trace-context propagation and
+gRPC failure recording.
+
+The `tower_http` `TraceLayer` in `multiplex.rs` opens a span per inbound request,
+and that span continues incoming W3C trace context when present or starts a new
+trace otherwise. It is named for the RPC and carries the request ID that also
+appears in the gateway's logs — the identifier that lets an operator pivot
+between a trace and its log lines. Store and compute-driver spans become
+children of the request span. Reconciliation, provider refresh, and
+driver-watch loops create their own operation spans because they have no
+inbound request to provide a parent. gRPC status is recorded when response
+trailers arrive.
+
+The gateway forwards OTLP configuration and W3C trace context to managed
+external drivers. Each driver exports under its own service name.
+
+Two invariants shape the failure behavior. Telemetry is diagnostic, so no OTLP
+failure stops the gateway from serving: a malformed endpoint is logged at
+startup and disables export. Export is best-effort — the SDK logs runtime
+failures, and a failed batch is dropped rather than retried. Buffered spans
+flush after the server loop exits so `SIGTERM` does not drop in-flight traces.
+
 ### Package-managed gateway registry
 
 The CLI reads its active-gateway and per-gateway metadata from
@@ -618,12 +720,19 @@ system entry instead of pretending to delete package-manager owned state.
 - Compute runtimes own the mechanics of starting workloads and injecting
   callback configuration.
 - Docker-backed local gateways use Docker's `host-gateway` callback alias on
-  macOS and Docker Desktop-style runtimes. Native Linux Docker may expose an
-  additional bridge-gateway listener because the host can bind that bridge IP.
+  macOS and Docker Desktop-style runtimes. They request IPv4 loopback callback
+  reachability and add a listener only when the primary does not cover it.
+  Native Linux Docker may expose an additional bridge-gateway listener because
+  the host can bind that bridge IP.
 - Podman-backed macOS gateways use gvproxy's host-loopback IP for sandbox host
   aliases by default so stale Podman machine images do not need Podman's
   `host-gateway` resolver. Linux Podman keeps the resolver unless
-  `host_gateway_ip` is configured.
+  `host_gateway_ip` is configured. Rootful Podman can request its exact bridge
+  gateway listener. Rootless Podman explicitly reporting pasta requests the
+  private IPv4 source selected by the host default route rather than an
+  arbitrary private interface. Slirp4netns, other helpers, and missing helper
+  metadata fail closed for local callbacks until a rootless-network namespace
+  relay is available.
 - Gateway restarts recover persisted objects from storage, but live relay
   streams must be re-established by supervisors.
 - User-facing behavior changes must update published docs in `docs/`; this file

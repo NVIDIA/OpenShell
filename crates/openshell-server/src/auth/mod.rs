@@ -10,6 +10,8 @@
 
 pub mod authenticator;
 pub mod authz;
+pub mod descriptor_authz;
+pub mod extension_mint_limit;
 pub mod guard;
 mod http;
 pub mod identity;
@@ -19,5 +21,6 @@ pub mod oidc;
 pub mod principal;
 pub mod sandbox_jwt;
 pub mod sandbox_methods;
+pub mod workspace_authz;
 
 pub use http::router;

@@ -419,6 +419,14 @@ pub mod test_support {
             self.resolver.clone()
         }
 
+        pub fn assert_no_requests(&self) {
+            let requests = self
+                .requests
+                .lock()
+                .expect("fake token grant requests lock poisoned");
+            assert!(requests.is_empty(), "unexpected token grant requests");
+        }
+
         pub fn assert_one_request(&self, expected_provider_key: &str) {
             let requests = self
                 .requests

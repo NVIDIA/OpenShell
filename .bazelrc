@@ -1,0 +1,6 @@
+build --@rules_rs//rs/private/prost:compile_well_known_types=false
+test  --test_env=PATH
+
+build:release --compilation_mode=opt
+build:release --@rules_rust//rust/settings:codegen_units=1
+build:release --@rules_rust//rust/settings:extra_rustc_flag=-Cstrip=symbols

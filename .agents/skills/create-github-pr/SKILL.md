@@ -11,7 +11,7 @@ Create pull requests on GitHub using the `gh` CLI.
 
 - The `gh` CLI must be authenticated (`gh auth status`)
 - You must have commits on a branch that's pushed to the remote
-- Branch should follow naming convention: `<issue-number>-<description>/<username>`
+- For issue-backed work, the branch should follow `<issue-number>-<description>/<username>`. Exempt issue-less changes may use `<description>/<username>`.
 
 ## Before Creating a PR
 
@@ -47,7 +47,7 @@ Before creating a PR, verify:
    git branch --show-current
    ```
 
-2. **Branch follows naming convention** - Format: `<issue-number>-<description>/<initials>`
+2. **Branch follows naming convention** - Use `<issue-number>-<description>/<initials>` for issue-backed work or `<description>/<initials>` for an exempt issue-less change.
 
    ```bash
    # Example: 1234-add-pagination/jd
@@ -114,7 +114,7 @@ gh pr create --title "PR title" --body "PR description"
 
 ### Link to an Issue
 
-Use `Closes #<issue-number>` in the body to auto-close the issue when merged:
+Features, user-visible behavior changes, public API changes, architecture changes, and multi-PR efforts must link an accepted issue. Use `Closes #<issue-number>` in the body to auto-close the issue when merged:
 
 ```bash
 gh pr create \
@@ -125,6 +125,8 @@ gh pr create \
 - Added validation for empty request bodies
 - Returns 400 instead of 500"
 ```
+
+Small documentation fixes, mechanical maintenance, and obvious localized bug fixes may omit a separate issue when the PR contains enough context to review the decision and implementation together. In that case, write `No issue required: <brief reason>` in the Related Issue section. Do not use this exception for security fixes; follow `SECURITY.md`.
 
 ### Create as Draft
 
@@ -157,7 +159,7 @@ PR descriptions must follow the project's [PR template](.github/PULL_REQUEST_TEM
 <!-- 1-3 sentences: what this PR does and why -->
 
 ## Related Issue
-<!-- Fixes #NNN or Closes #NNN -->
+<!-- Fixes #NNN / Closes #NNN, or "No issue required: <reason>" for an exempt change -->
 
 ## Changes
 <!-- Bullet list of key changes -->

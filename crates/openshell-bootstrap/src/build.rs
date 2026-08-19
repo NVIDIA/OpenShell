@@ -398,7 +398,9 @@ fn glob_match(pattern: &str, path: &str, is_dir: bool) -> bool {
             return true;
         }
         for (idx, _) in path.match_indices('/') {
-            if glob_match(rest, &path[idx + 1..], is_dir) {
+            if let Some(suffix) = path.get(idx + 1..)
+                && glob_match(rest, suffix, is_dir)
+            {
                 return true;
             }
         }
@@ -592,6 +594,7 @@ mod tests {
         assert!(glob_match("**/*.log", "a/b/c.log", false));
         assert!(glob_match("**/*.log", "c.log", false));
         assert!(!glob_match("**/*.log", "c.txt", false));
+        assert!(glob_match("**/föö.log", "a/b/föö.log", false));
     }
 
     #[test]

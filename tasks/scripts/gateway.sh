@@ -35,6 +35,8 @@ Options:
 Environment:
   OPENSHELL_DRIVERS       Driver override used by openshell-gateway.
   OPENSHELL_GATEWAY_NAME  Gateway name for generic podman/kubernetes runs.
+  OPENSHELL_BIND_ADDRESS  Gateway listener address. Defaults to 127.0.0.1,
+                          or ::1 for Podman Machine on macOS.
   OPENSHELL_SERVER_PORT   Gateway port. Defaults to 8080 for Kubernetes,
                           18080 for Podman/Docker, and 18081 for VM.
   OPENSHELL_SUPERVISOR_IMAGE
@@ -300,21 +302,25 @@ SANDBOX_IMAGE="${OPENSHELL_SANDBOX_IMAGE:-ghcr.io/nvidia/openshell-community/san
 SANDBOX_IMAGE_PULL_POLICY="${OPENSHELL_SANDBOX_IMAGE_PULL_POLICY:-IfNotPresent}"
 GRPC_ENDPOINT="${OPENSHELL_GRPC_ENDPOINT:-}"
 LOG_LEVEL="${OPENSHELL_LOG_LEVEL:-info}"
+PRIMARY_BIND_IP="${OPENSHELL_BIND_ADDRESS:-127.0.0.1}"
+CLI_ENDPOINT_HOST="127.0.0.1"
+
+if [[ -z "${OPENSHELL_BIND_ADDRESS:-}" \
+  && "${DRIVER}" == "podman" \
+  && "$(uname -s)" == "Darwin" ]]; then
+  # Podman Machine reserves IPv4 loopback for its callback-only listener.
+  # Keep the primary listener distinct while using a hostname that resolves
+  # to IPv6 loopback for local CLI connections. An explicit bind address
+  # overrides this platform default.
+  PRIMARY_BIND_IP="::1"
+  CLI_ENDPOINT_HOST="localhost"
+fi
 
 if [[ "${DRIVER}" == "podman" ]]; then
   require_podman_service
   SUPERVISOR_IMAGE="${OPENSHELL_SUPERVISOR_IMAGE:-openshell/supervisor:dev}"
   ensure_podman_supervisor_image "${SUPERVISOR_IMAGE}"
   export OPENSHELL_SUPERVISOR_IMAGE="${SUPERVISOR_IMAGE}"
-
-  # Rootless Podman containers reach the host via pasta's local connection
-  # bypass, which translates to host L4 sockets. The gateway must listen on
-  # 0.0.0.0 so pasta can reach it — 127.0.0.1 is not routable through pasta.
-  if [[ -z "${OPENSHELL_BIND_ADDRESS:-}" ]]; then
-    if podman info --format '{{.Host.Security.Rootless}}' 2>/dev/null | grep -q true; then
-      export OPENSHELL_BIND_ADDRESS="0.0.0.0"
-    fi
-  fi
 fi
 
 if [[ ! "${GATEWAY_NAME}" =~ ^[A-Za-z0-9._-]+$ ]]; then
@@ -430,12 +436,13 @@ EOF
     ;;
 esac
 
-GATEWAY_ENDPOINT="http://127.0.0.1:${PORT}"
+GATEWAY_ENDPOINT="http://${CLI_ENDPOINT_HOST}:${PORT}"
 register_gateway_metadata "${GATEWAY_NAME}" "${GATEWAY_ENDPOINT}" "${PORT}"
 
 echo "Starting standalone ${DRIVER} gateway..."
 echo "  gateway:   ${GATEWAY_NAME}"
 echo "  endpoint:  ${GATEWAY_ENDPOINT}"
+echo "  bind:      ${PRIMARY_BIND_IP}:${PORT}"
 echo "  namespace: ${SANDBOX_NAMESPACE}"
 echo "  state dir: ${STATE_DIR}"
 if [[ "${DRIVER}" == "podman" ]]; then
@@ -447,6 +454,7 @@ echo
 
 exec "${GATEWAY_BIN}" \
   --config "${CONFIG_PATH}" \
+  --bind-address "${PRIMARY_BIND_IP}" \
   --port "${PORT}" \
   --log-level "${LOG_LEVEL}" \
   --drivers "${DRIVER}" \

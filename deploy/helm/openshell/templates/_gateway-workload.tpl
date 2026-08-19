@@ -50,6 +50,13 @@ spec:
         - {{ .Values.server.dbUrl | quote }}
         {{- end }}
       env:
+        {{- if not (or .Values.server.credentialDrivers.kubernetesSecrets.enabled .Values.server.credentialDrivers.vault.enabled) }}
+        - name: {{ include "openshell.credentialStorageKeyEncryptionKeyEnvName" . }}
+          valueFrom:
+            secretKeyRef:
+              name: {{ include "openshell.credentialStorageKeyEncryptionKeySecretName" . }}
+              key: {{ include "openshell.credentialStorageKeyEncryptionKeySecretKey" . }}
+        {{- end }}
         {{- if .Values.server.externalDbSecret }}
         - name: OPENSHELL_DB_URL
           valueFrom:
@@ -57,10 +64,9 @@ spec:
               name: {{ .Values.server.externalDbSecret }}
               key: uri
         {{- end }}
-        # All gateway settings live in the ConfigMap-backed TOML file
-        # mounted at /etc/openshell/gateway.toml. The only env var below
-        # is a process-level setting consumed by libraries outside
-        # gateway code (currently just SSL_CERT_FILE for OIDC issuer TLS).
+        # Most gateway settings live in the ConfigMap-backed TOML file
+        # mounted at /etc/openshell/gateway.toml. Secret-bearing settings use
+        # env vars that the TOML references by name.
         {{- if and .Values.server.oidc.issuer .Values.server.oidc.caConfigMapName }}
         # OIDC issuer custom-CA: rustls/reqwest read SSL_CERT_FILE for
         # outbound TLS verification. This is a process-level env var
@@ -69,6 +75,8 @@ spec:
         - name: SSL_CERT_FILE
           value: /etc/openshell-tls/oidc-ca/ca.crt
         {{- end }}
+        - name: OPENSHELL_TELEMETRY_ENABLED
+          value: {{ .Values.server.telemetryEnabled | quote }}
       volumeMounts:
         {{- if eq (include "openshell.workloadKind" .) "statefulset" }}
         - name: openshell-data
@@ -84,6 +92,11 @@ spec:
         - name: tls-cert
           mountPath: /etc/openshell-tls/server
           readOnly: true
+        {{- if .Values.certManager.serverIssuerRef.name }}
+        - name: tls-external-cert
+          mountPath: /etc/openshell-tls/server-external
+          readOnly: true
+        {{- end }}
         {{- if or .Values.server.tls.clientCaSecretName (and .Values.pkiInitJob.enabled (not .Values.certManager.enabled)) (and .Values.certManager.enabled .Values.certManager.clientCaFromServerTlsSecret) }}
         - name: tls-client-ca
           mountPath: /etc/openshell-tls/client-ca
@@ -144,6 +157,11 @@ spec:
     - name: tls-cert
       secret:
         secretName: {{ .Values.server.tls.certSecretName }}
+    {{- if .Values.certManager.serverIssuerRef.name }}
+    - name: tls-external-cert
+      secret:
+        secretName: {{ include "openshell.fullname" . }}-server-external-tls
+    {{- end }}
     {{- if or .Values.server.tls.clientCaSecretName (and .Values.pkiInitJob.enabled (not .Values.certManager.enabled)) (and .Values.certManager.enabled .Values.certManager.clientCaFromServerTlsSecret) }}
     - name: tls-client-ca
       secret:

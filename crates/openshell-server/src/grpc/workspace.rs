@@ -22,6 +22,8 @@ use prost::Message;
 use tonic::{Request, Response, Status};
 
 use crate::ServerState;
+use crate::auth::principal::Principal;
+use crate::auth::workspace_authz::{AuthGrant, MinWorkspaceRole, authorize_workspace};
 use crate::persistence::{
     DRAFT_CHUNK_OBJECT_TYPE, ObjectLabels, ObjectType, POLICY_OBJECT_TYPE, WriteCondition,
     current_time_ms,
@@ -43,6 +45,28 @@ impl ObjectType for Workspace {
 impl ObjectType for WorkspaceMember {
     fn object_type() -> &'static str {
         "workspace_member"
+    }
+}
+
+/// Extract the subject that needs membership filtering, or `None` if the
+/// principal has unrestricted visibility (platform admin, sandbox caller).
+fn membership_filter_subject<'a>(
+    state: &ServerState,
+    principal: &'a Principal,
+) -> Result<Option<&'a str>, Status> {
+    match principal {
+        Principal::User(u) => {
+            if crate::auth::workspace_authz::is_platform_admin_principal(
+                &u.identity.roles,
+                &state.admin_role,
+            ) {
+                Ok(None)
+            } else {
+                Ok(Some(&u.identity.subject))
+            }
+        }
+        Principal::Sandbox(_) => Ok(None),
+        Principal::Anonymous => Err(Status::unauthenticated("authentication required")),
     }
 }
 
@@ -81,25 +105,6 @@ impl ResolvedWorkspace {
     }
 }
 
-/// Resolve a workspace for provider profile operations.
-///
-/// Provider profiles support a platform scope where `""` is a distinct,
-/// meaningful value (not an alias for `"default"`). This function preserves
-/// `""` as-is for platform-scoped operations. Non-empty workspace values are
-/// validated for existence via [`resolve_workspace`].
-pub async fn resolve_profile_workspace(
-    store: &crate::persistence::Store,
-    workspace: &str,
-) -> Result<ResolvedWorkspace, Status> {
-    if workspace.is_empty() {
-        return Ok(ResolvedWorkspace {
-            name: String::new(),
-            terminating: false,
-        });
-    }
-    resolve_workspace(store, workspace).await
-}
-
 /// Resolve and validate a workspace name from a request field.
 ///
 /// Empty strings are normalized to `"default"`. The workspace must exist in the
@@ -107,9 +112,6 @@ pub async fn resolve_profile_workspace(
 /// carries the workspace's termination state so create-path handlers can reject
 /// operations on workspaces that are being deleted.
 ///
-/// TODO(phase2): this only validates existence. Workspace membership enforcement
-/// (checking the caller is a member of the resolved workspace) is deferred to
-/// Phase 2.
 pub async fn resolve_workspace(
     store: &crate::persistence::Store,
     workspace: &str,
@@ -213,10 +215,19 @@ pub(super) async fn handle_get_workspace(
     state: &Arc<ServerState>,
     request: Request<GetWorkspaceRequest>,
 ) -> Result<Response<GetWorkspaceResponse>, Status> {
+    let principal = super::extract_principal(&request)?;
     let name = request.into_inner().name;
     if name.is_empty() {
         return Err(Status::invalid_argument("name is required"));
     }
+    authorize_workspace(
+        &state.store,
+        &state.admin_role,
+        &principal,
+        &name,
+        MinWorkspaceRole::User,
+    )
+    .await?;
 
     let workspace: Workspace = state
         .store
@@ -234,21 +245,40 @@ pub(super) async fn handle_list_workspaces(
     state: &Arc<ServerState>,
     request: Request<ListWorkspacesRequest>,
 ) -> Result<Response<ListWorkspacesResponse>, Status> {
+    let principal = super::extract_principal(&request)?;
     let req = request.into_inner();
+    super::validation::validate_label_selector(&req.label_selector)?;
     let limit = clamp_limit(req.limit, 100, MAX_PAGE_SIZE);
+    let subject = membership_filter_subject(state, &principal)?;
 
-    let workspaces: Vec<Workspace> = if req.label_selector.is_empty() {
-        state
+    let member_type = WorkspaceMember::object_type();
+    let workspaces = match subject {
+        Some(subject) if req.label_selector.is_empty() => state
+            .store
+            .list_messages_with_membership::<Workspace>(member_type, subject, limit, req.offset)
+            .await
+            .map_err(|e| Status::internal(format!("list workspaces failed: {e}")))?,
+        Some(subject) => state
+            .store
+            .list_messages_with_membership_and_selector::<Workspace>(
+                member_type,
+                subject,
+                &req.label_selector,
+                limit,
+                req.offset,
+            )
+            .await
+            .map_err(|e| Status::internal(format!("list workspaces failed: {e}")))?,
+        None if req.label_selector.is_empty() => state
             .store
             .list_messages("", limit, req.offset)
             .await
-            .map_err(|e| Status::internal(format!("list workspaces failed: {e}")))?
-    } else {
-        state
+            .map_err(|e| Status::internal(format!("list workspaces failed: {e}")))?,
+        None => state
             .store
             .list_messages_with_selector("", &req.label_selector, limit, req.offset)
             .await
-            .map_err(|e| Status::internal(format!("list workspaces failed: {e}")))?
+            .map_err(|e| Status::internal(format!("list workspaces failed: {e}")))?,
     };
 
     Ok(Response::new(ListWorkspacesResponse { workspaces }))
@@ -393,6 +423,15 @@ pub(super) async fn handle_delete_workspace(
         .await
         .map_err(|e| Status::internal(format!("delete workspace members failed: {e}")))?;
 
+    // Keep the terminating workspace durable until platform cleanup has been
+    // accepted. A failed cleanup can then be retried through this same path.
+    state.compute.delete_workspace(&name).await.map_err(|e| {
+        Status::new(
+            e.code(),
+            format!("delete workspace platform resources failed: {e}"),
+        )
+    })?;
+
     let deleted = state
         .store
         .delete_if(Workspace::object_type(), &ws_id, delete_version)
@@ -412,9 +451,18 @@ pub(super) async fn handle_add_workspace_member(
     state: &Arc<ServerState>,
     request: Request<AddWorkspaceMemberRequest>,
 ) -> Result<Response<AddWorkspaceMemberResponse>, Status> {
+    let principal = super::extract_principal(&request)?;
     let req = request.into_inner();
 
-    let workspace = resolve_workspace(&state.store, &req.workspace)
+    let authz = authorize_workspace(
+        &state.store,
+        &state.admin_role,
+        &principal,
+        &req.workspace,
+        MinWorkspaceRole::Admin,
+    )
+    .await?;
+    let workspace = resolve_workspace(&state.store, &authz.workspace)
         .await?
         .ensure_active()?;
 
@@ -426,6 +474,11 @@ pub(super) async fn handle_add_workspace_member(
     if role == WorkspaceRole::Unspecified {
         return Err(Status::invalid_argument(
             "role must be USER or ADMIN, not UNSPECIFIED",
+        ));
+    }
+    if role == WorkspaceRole::Admin && authz.grant != AuthGrant::PlatformAdmin {
+        return Err(Status::permission_denied(
+            "only platform admins can assign the workspace admin role",
         ));
     }
 
@@ -504,9 +557,20 @@ pub(super) async fn handle_remove_workspace_member(
     state: &Arc<ServerState>,
     request: Request<RemoveWorkspaceMemberRequest>,
 ) -> Result<Response<RemoveWorkspaceMemberResponse>, Status> {
+    let principal = super::extract_principal(&request)?;
     let req = request.into_inner();
 
-    let workspace = resolve_workspace(&state.store, &req.workspace).await?.name;
+    let authz = authorize_workspace(
+        &state.store,
+        &state.admin_role,
+        &principal,
+        &req.workspace,
+        MinWorkspaceRole::Admin,
+    )
+    .await?;
+    let workspace = resolve_workspace(&state.store, &authz.workspace)
+        .await?
+        .name;
 
     if req.principal_subject.is_empty() {
         return Err(Status::invalid_argument("principal_subject is required"));
@@ -529,9 +593,20 @@ pub(super) async fn handle_list_workspace_members(
     state: &Arc<ServerState>,
     request: Request<ListWorkspaceMembersRequest>,
 ) -> Result<Response<ListWorkspaceMembersResponse>, Status> {
+    let principal = super::extract_principal(&request)?;
     let req = request.into_inner();
 
-    let workspace = resolve_workspace(&state.store, &req.workspace).await?.name;
+    let authz = authorize_workspace(
+        &state.store,
+        &state.admin_role,
+        &principal,
+        &req.workspace,
+        MinWorkspaceRole::User,
+    )
+    .await?;
+    let workspace = resolve_workspace(&state.store, &authz.workspace)
+        .await?
+        .name;
 
     let limit = clamp_limit(req.limit, 100, MAX_PAGE_SIZE);
 
@@ -550,7 +625,9 @@ mod tests {
     use openshell_core::proto::datamodel::v1::ObjectMeta;
     use tonic::{Code, Request};
 
-    use crate::grpc::test_support::test_server_state;
+    use crate::grpc::test_support::{
+        authed_request, test_server_state, test_server_state_with_workspace_cleanup_failures,
+    };
 
     #[tokio::test]
     async fn create_workspace_returns_metadata() {
@@ -623,7 +700,7 @@ mod tests {
 
         let resp = handle_get_workspace(
             &state,
-            Request::new(GetWorkspaceRequest {
+            authed_request(GetWorkspaceRequest {
                 name: "fetch-me".to_string(),
             }),
         )
@@ -643,7 +720,7 @@ mod tests {
 
         let err = handle_get_workspace(
             &state,
-            Request::new(GetWorkspaceRequest {
+            authed_request(GetWorkspaceRequest {
                 name: "no-such-ws".to_string(),
             }),
         )
@@ -659,7 +736,7 @@ mod tests {
 
         let err = handle_get_workspace(
             &state,
-            Request::new(GetWorkspaceRequest {
+            authed_request(GetWorkspaceRequest {
                 name: String::new(),
             }),
         )
@@ -877,7 +954,7 @@ mod tests {
 
         let resp = handle_add_workspace_member(
             &state,
-            Request::new(AddWorkspaceMemberRequest {
+            authed_request(AddWorkspaceMemberRequest {
                 workspace: "default".to_string(),
                 principal_subject: "alice@example.com".to_string(),
                 role: WorkspaceRole::Admin.into(),
@@ -893,7 +970,7 @@ mod tests {
 
         handle_add_workspace_member(
             &state,
-            Request::new(AddWorkspaceMemberRequest {
+            authed_request(AddWorkspaceMemberRequest {
                 workspace: "default".to_string(),
                 principal_subject: "bob@example.com".to_string(),
                 role: WorkspaceRole::User.into(),
@@ -904,7 +981,7 @@ mod tests {
 
         let list = handle_list_workspace_members(
             &state,
-            Request::new(ListWorkspaceMembersRequest {
+            authed_request(ListWorkspaceMembersRequest {
                 workspace: "default".to_string(),
                 limit: 100,
                 offset: 0,
@@ -923,7 +1000,7 @@ mod tests {
 
         handle_add_workspace_member(
             &state,
-            Request::new(AddWorkspaceMemberRequest {
+            authed_request(AddWorkspaceMemberRequest {
                 workspace: "default".to_string(),
                 principal_subject: "charlie@example.com".to_string(),
                 role: WorkspaceRole::User.into(),
@@ -934,7 +1011,7 @@ mod tests {
 
         let resp = handle_remove_workspace_member(
             &state,
-            Request::new(RemoveWorkspaceMemberRequest {
+            authed_request(RemoveWorkspaceMemberRequest {
                 workspace: "default".to_string(),
                 principal_subject: "charlie@example.com".to_string(),
             }),
@@ -946,7 +1023,7 @@ mod tests {
 
         let list = handle_list_workspace_members(
             &state,
-            Request::new(ListWorkspaceMembersRequest {
+            authed_request(ListWorkspaceMembersRequest {
                 workspace: "default".to_string(),
                 limit: 100,
                 offset: 0,
@@ -965,7 +1042,7 @@ mod tests {
 
         handle_add_workspace_member(
             &state,
-            Request::new(AddWorkspaceMemberRequest {
+            authed_request(AddWorkspaceMemberRequest {
                 workspace: "default".to_string(),
                 principal_subject: "dave@example.com".to_string(),
                 role: WorkspaceRole::User.into(),
@@ -976,7 +1053,7 @@ mod tests {
 
         let err = handle_add_workspace_member(
             &state,
-            Request::new(AddWorkspaceMemberRequest {
+            authed_request(AddWorkspaceMemberRequest {
                 workspace: "default".to_string(),
                 principal_subject: "dave@example.com".to_string(),
                 role: WorkspaceRole::Admin.into(),
@@ -1004,7 +1081,7 @@ mod tests {
 
         handle_add_workspace_member(
             &state,
-            Request::new(AddWorkspaceMemberRequest {
+            authed_request(AddWorkspaceMemberRequest {
                 workspace: "cleanup-test".to_string(),
                 principal_subject: "alice@example.com".to_string(),
                 role: WorkspaceRole::Admin.into(),
@@ -1015,7 +1092,7 @@ mod tests {
 
         handle_add_workspace_member(
             &state,
-            Request::new(AddWorkspaceMemberRequest {
+            authed_request(AddWorkspaceMemberRequest {
                 workspace: "cleanup-test".to_string(),
                 principal_subject: "bob@example.com".to_string(),
                 role: WorkspaceRole::User.into(),
@@ -1026,7 +1103,7 @@ mod tests {
 
         let list = handle_list_workspace_members(
             &state,
-            Request::new(ListWorkspaceMembersRequest {
+            authed_request(ListWorkspaceMembersRequest {
                 workspace: "cleanup-test".to_string(),
                 limit: 100,
                 offset: 0,
@@ -1257,6 +1334,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delete_workspace_retains_terminating_record_when_platform_cleanup_fails() {
+        let state = test_server_state_with_workspace_cleanup_failures(1).await;
+
+        handle_create_workspace(
+            &state,
+            Request::new(CreateWorkspaceRequest {
+                name: "cleanup-retry".to_string(),
+                labels: HashMap::new(),
+            }),
+        )
+        .await
+        .unwrap();
+
+        let err = handle_delete_workspace(
+            &state,
+            Request::new(DeleteWorkspaceRequest {
+                name: "cleanup-retry".to_string(),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code(), Code::Unavailable);
+
+        let retained: Workspace = state
+            .store
+            .get_message_by_name("", "cleanup-retry")
+            .await
+            .unwrap()
+            .expect("workspace must remain durable after cleanup failure");
+        assert_ne!(
+            retained.metadata.unwrap().deletion_timestamp_ms,
+            0,
+            "retained workspace must remain terminating"
+        );
+
+        let retry = handle_delete_workspace(
+            &state,
+            Request::new(DeleteWorkspaceRequest {
+                name: "cleanup-retry".to_string(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert!(retry.deleted);
+        assert!(
+            state
+                .store
+                .get_message_by_name::<Workspace>("", "cleanup-retry")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
     async fn create_workspace_persists_labels_for_selector() {
         let state = test_server_state().await;
 
@@ -1275,7 +1408,7 @@ mod tests {
 
         let resp = handle_list_workspaces(
             &state,
-            Request::new(ListWorkspacesRequest {
+            authed_request(ListWorkspacesRequest {
                 label_selector: "env=staging".to_string(),
                 ..Default::default()
             }),
@@ -1293,7 +1426,7 @@ mod tests {
 
         let empty = handle_list_workspaces(
             &state,
-            Request::new(ListWorkspacesRequest {
+            authed_request(ListWorkspacesRequest {
                 label_selector: "env=production".to_string(),
                 ..Default::default()
             }),
@@ -1381,5 +1514,121 @@ mod tests {
             remaining.is_empty(),
             "inference routes should be cascade-deleted with workspace"
         );
+    }
+
+    /// Non-member callers must receive `PERMISSION_DENIED` — not `NOT_FOUND` —
+    /// when targeting a workspace that does not exist. Returning `NOT_FOUND`
+    /// would create a CWE-203 workspace-name oracle.
+    #[tokio::test]
+    async fn non_member_gets_permission_denied_not_workspace_oracle() {
+        use crate::auth::identity::{Identity, IdentityProvider};
+        use crate::auth::principal::{Principal, UserPrincipal};
+
+        fn non_member_request<T>(inner: T) -> Request<T> {
+            let mut req = Request::new(inner);
+            req.extensions_mut().insert(Principal::User(UserPrincipal {
+                identity: Identity {
+                    subject: "non-member".to_string(),
+                    display_name: None,
+                    roles: vec![],
+                    scopes: vec![],
+                    provider: IdentityProvider::Oidc,
+                },
+            }));
+            req
+        }
+
+        let mut state = test_server_state().await;
+        Arc::get_mut(&mut state).unwrap().admin_role = "openshell-admin".to_string();
+
+        let err = handle_get_workspace(
+            &state,
+            non_member_request(GetWorkspaceRequest {
+                name: "no-such-ws".into(),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            err.code(),
+            Code::PermissionDenied,
+            "handle_get_workspace should return PermissionDenied, got {:?}",
+            err.code()
+        );
+
+        let err = handle_add_workspace_member(
+            &state,
+            non_member_request(AddWorkspaceMemberRequest {
+                workspace: "no-such-ws".into(),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            err.code(),
+            Code::PermissionDenied,
+            "handle_add_workspace_member should return PermissionDenied, got {:?}",
+            err.code()
+        );
+
+        let err = handle_remove_workspace_member(
+            &state,
+            non_member_request(RemoveWorkspaceMemberRequest {
+                workspace: "no-such-ws".into(),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            err.code(),
+            Code::PermissionDenied,
+            "handle_remove_workspace_member should return PermissionDenied, got {:?}",
+            err.code()
+        );
+
+        let err = handle_list_workspace_members(
+            &state,
+            non_member_request(ListWorkspaceMembersRequest {
+                workspace: "no-such-ws".into(),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            err.code(),
+            Code::PermissionDenied,
+            "handle_list_workspace_members should return PermissionDenied, got {:?}",
+            err.code()
+        );
+    }
+
+    #[tokio::test]
+    async fn list_workspaces_rejects_invalid_label_selector() {
+        let state = test_server_state().await;
+
+        let err = handle_list_workspaces(
+            &state,
+            authed_request(ListWorkspacesRequest {
+                label_selector: "=no-key".into(),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+
+        let err = handle_list_workspaces(
+            &state,
+            authed_request(ListWorkspacesRequest {
+                label_selector: "no-equals-sign".into(),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
     }
 }

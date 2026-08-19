@@ -39,6 +39,7 @@ openshell
 │   ├── list
 │   └── select [name]
 ├── status
+├── whoami [--output <format>]
 ├── inference
 │   ├── set --provider --model
 │   ├── update [--provider] [--model]
@@ -47,6 +48,8 @@ openshell
 │   ├── create [opts] [-- CMD...]
 │   ├── get [name]
 │   ├── list [opts]
+│   ├── stop [name]
+│   ├── start [name]
 │   ├── delete [name]... [--all]
 │   ├── exec [--name <name>] [opts] -- CMD...
 │   ├── connect [name] [--editor <editor>]
@@ -186,6 +189,15 @@ gateway. Connectivity uses the public health RPC; authentication is checked
 with the protected gateway-info capability query and can fail while the gateway
 remains connected.
 
+### `openshell whoami`
+
+Show the authenticated user identity: subject, display name, roles, scopes, and
+identity provider. Requires an authenticated gateway connection.
+
+| Flag | Description |
+|------|-------------|
+| `--output <FORMAT>` | Output format: `table` (default), `json`, or `yaml` |
+
 ---
 
 ## Sandbox Commands
@@ -240,6 +252,17 @@ Show sandbox details and the active policy. Metadata identifies sandbox or globa
 
 Delete one or more named sandboxes, or use `--all`. Deletion stops background port forwards.
 
+### `openshell sandbox stop [name]`
+
+Stop sandbox compute while retaining the sandbox and persistent workspace. The
+name defaults to the last-used sandbox. The command stops background forwards
+and waits for the `Stopped` phase.
+
+### `openshell sandbox start [name]`
+
+Start a stopped sandbox and wait for `Ready`. The name defaults to the
+last-used sandbox.
+
 ### `openshell sandbox exec [OPTIONS] -- COMMAND...`
 
 Execute a command through the gRPC exec endpoint, stream its output, and exit with the remote command's exit code.
@@ -258,11 +281,11 @@ Open an interactive SSH shell. The name defaults to the last-used sandbox. `--ed
 
 ### `openshell sandbox upload <name> <path> [dest]`
 
-Upload files using tar-over-SSH. The destination defaults to the container working directory. `.gitignore` filtering is enabled unless `--no-git-ignore` is passed.
+Upload files using tar-over-SSH. The CLI discovers the canonical remote working directory when the destination is omitted. A named directory merges into an existing directory of the same name, overwriting matching entries without deleting unrelated entries. `.gitignore` filtering is enabled unless `--no-git-ignore` is passed.
 
 ### `openshell sandbox download <name> <path> [dest]`
 
-Download files using tar-over-SSH. The local destination defaults to `.`.
+Download files using tar-over-SSH. The sandbox source may be relative to the canonical remote working directory or an absolute path within it. The local destination defaults to `.`.
 
 ### `openshell sandbox ssh-config [name]`
 
@@ -361,6 +384,7 @@ Incrementally merge live network policy changes into the current sandbox policy.
 Notes:
 
 - The sandbox name defaults to the last-used sandbox.
+- `--add-endpoint` options are comma-separated: `allowed-ip=<CIDR-or-IP>`, `websocket-credential-rewrite`, `request-body-credential-rewrite`, and `allow-uninspected-credentials`. The last option is a security-sensitive exception for provider-credentialed L4-only, `tls: skip`, or otherwise uninspectable traffic.
 - `--add-allow` and `--add-deny` operate on REST and WebSocket endpoints. Use full YAML for JSON-RPC, MCP, SQL, or other policy structure.
 - `--wait` cannot be combined with `--dry-run`.
 - Use `policy set` when replacing the full policy or changing static sections.

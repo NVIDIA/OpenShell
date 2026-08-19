@@ -1,4 +1,12 @@
-# ![OpenShell](docs/brand/assets/openshell-lockup-horizontal.svg)
+<!-- markdownlint-disable MD033 MD041 -->
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/brand/assets/openshell-banner-dark.png">
+  <source media="(prefers-color-scheme: light)" srcset="docs/brand/assets/openshell-banner-light.png">
+  <img alt="OpenShell" src="docs/brand/assets/openshell-banner-light.png" width="430">
+</picture>
+
+<!-- markdownlint-enable MD033 MD041 -->
 
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue)](https://github.com/NVIDIA/OpenShell/blob/main/LICENSE)
 [![PyPI](https://img.shields.io/badge/PyPI-openshell-orange?logo=pypi)](https://pypi.org/project/openshell/)
@@ -9,8 +17,6 @@
 OpenShell is the safe, private runtime for autonomous AI agents. It provides sandboxed execution environments that protect your data, credentials, and infrastructure — governed by declarative YAML policies that prevent unauthorized file access, data exfiltration, and uncontrolled network activity.
 
 OpenShell is built agent-first. The project ships with agent skills for everything from gateway troubleshooting to policy generation, and we expect contributors to use them.
-
-> **Alpha software — single-player mode.** OpenShell is proof-of-life: one developer, one environment, one gateway. We are building toward multi-tenant enterprise deployments, but the starting point is getting your own environment up and running. Expect rough edges. Bring your agent.
 
 ## Quickstart
 
@@ -216,12 +222,12 @@ Your agent can load skills for CLI usage (`openshell-cli`), gateway troubleshoot
 
 OpenShell is developed using the same agent-driven workflows it enables. The `.agents/skills/` directory contains workflow automation that powers the project's development cycle:
 
-- **Spike and build:** Investigate a problem with `create-spike`, then implement it with `build-from-issue` once a human approves.
-- **Triage and route:** Community issues are assessed with `triage-issue`, classified, and routed into the spike-build pipeline.
+- **Spike and build:** Investigate a problem with `create-spike`; a human accepts it with `state:accepted` or [roadmap](https://github.com/orgs/NVIDIA/projects/233) placement, or declines it. Accepted work can remain human-owned or enter the optional, human-gated `agent:*` planning and implementation workflow.
+- **Triage and route:** Community issues are assessed with `triage-issue`. Agents establish technical validity and impact; humans decide whether the project should act and where the work sits on the roadmap.
 - **Security review:** `review-security-issue` produces a severity assessment and remediation plan. `fix-security-issue` implements it.
 - **Policy authoring:** `generate-sandbox-policy` creates YAML policies from plain-language requirements or API documentation.
 
-All implementation work is human-gated — agents propose plans, humans approve, agents build. See [AGENTS.md](AGENTS.md) for the full workflow chain documentation.
+All agent implementation work is human-gated: maintainers explicitly request a plan, agents propose it, maintainers approve it, and agents build. See [AGENTS.md](AGENTS.md) for the full workflow chain documentation.
 
 ## Getting Help
 
@@ -244,13 +250,13 @@ All implementation work is human-gated — agents propose plans, humans approve,
 
 ## Contributing
 
-OpenShell is built agent-first — your agent is your first collaborator. Before opening issues or submitting code, point your agent at the repo and let it use the skills in `.agents/skills/` to investigate, diagnose, and prototype. See [CONTRIBUTING.md](CONTRIBUTING.md) for the full agent skills table, contribution workflow, and development setup.
+OpenShell is built agent-first. Issues should include a user story, problem statement, impact, and acceptance criteria. The impact should explain the consequences of the current behavior and why existing workarounds are insufficient. Feature requests also require a workflow-level proposed design and alternatives; bug reports add reproduction steps, environment details, and relevant logs. Once maintainers accept work, contributors should use the skills in `.agents/skills/` to investigate the current code and behavior, implement the change, and verify it. If an issue contains earlier diagnostics, verify them rather than relying on them. See [CONTRIBUTING.md](CONTRIBUTING.md) for the full agent skills table, contribution workflow, and development setup.
 
 ## Telemetry
 
 OpenShell collects anonymous telemetry to help improve the project for developers. This data is not used to track individual user behavior. It helps us understand aggregate usage of sandbox, provider, and policy workflows so we can prioritize product improvements and share usage trends with the community.
 
-Disable telemetry at runtime by setting `OPENSHELL_TELEMETRY_ENABLED=false` on the gateway deployment. OpenShell propagates this deployment setting into sandbox supervisor environments so sandbox-side telemetry collection is disabled as well.
+Disable telemetry at runtime by setting `OPENSHELL_TELEMETRY_ENABLED=false` on the gateway deployment. For Helm installs, set `server.telemetryEnabled=false`. OpenShell propagates this deployment setting into sandbox supervisor environments so sandbox-side telemetry collection is disabled as well.
 
 You can also compile telemetry out entirely. Telemetry support is a default-on `telemetry` Cargo feature; building with `--no-default-features` produces binaries that contain no telemetry endpoint, no telemetry HTTP client, and no emission code. Build telemetry-free artifacts with, for example, `cargo build --release -p openshell-server --no-default-features` (gateway) and the equivalent for `openshell-sandbox` and `openshell-driver-vm`. With telemetry compiled out, the gateway emits nothing and reports telemetry disabled to the sandboxes it launches.
 

@@ -34,9 +34,11 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 thiserror = { workspace = true }
 miette = { workspace = true }
+notify = "8"
 
 [dev-dependencies]
 temp-env = "0.3"
+toml = { workspace = true }
 
 [lints]
 workspace = true
