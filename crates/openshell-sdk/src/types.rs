@@ -128,6 +128,41 @@ pub struct SandboxTemplateCreateSpec {
     pub labels: HashMap<String, String>,
     /// Provider names to attach.
     pub providers: Vec<String>,
+    /// Create-time sandbox policy. The named workload template supplies runtime
+    /// workload fields; policy remains part of the sandbox's governance spec.
+    pub policy: Option<proto::SandboxPolicy>,
+}
+
+/// Reusable sandbox workload template resource.
+///
+/// This is a raw proto alias because template specs intentionally expose the
+/// full portable workload shape plus driver-owned config.
+pub type SandboxWorkloadTemplate = proto::SandboxWorkloadTemplate;
+
+/// Desired reusable workload shape for a [`SandboxWorkloadTemplate`].
+pub type SandboxWorkloadTemplateSpec = proto::SandboxWorkloadTemplateSpec;
+
+/// Portable sandbox workload configuration for template-backed sandboxes.
+pub type SandboxWorkloadConfig = proto::SandboxWorkloadConfig;
+
+/// Portable resource requirements for template-backed sandboxes.
+pub type SandboxResources = proto::SandboxResources;
+
+/// Desired service level for sandboxes created from a template.
+pub type SandboxServiceLevel = proto::SandboxServiceLevel;
+
+/// Startup service-level settings for template-backed sandboxes.
+pub type SandboxStartup = proto::SandboxStartup;
+
+/// Options for listing reusable sandbox templates.
+#[derive(Clone, Debug, Default)]
+pub struct SandboxTemplateListOptions {
+    /// Maximum templates to return. `0` defers to the server default.
+    pub limit: u32,
+    /// Offset into the result list.
+    pub offset: u32,
+    /// List templates across all workspaces.
+    pub all_workspaces: bool,
 }
 
 /// Reference to a sandbox owned by the gateway.
