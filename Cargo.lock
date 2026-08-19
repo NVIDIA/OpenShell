@@ -1754,6 +1754,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "fake-driver-rs"
+version = "0.0.0"
+dependencies = [
+ "clap",
+ "futures",
+ "miette",
+ "openshell-core",
+ "serde",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-stream",
+ "toml",
+ "tonic",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "fastrand"
 version = "2.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

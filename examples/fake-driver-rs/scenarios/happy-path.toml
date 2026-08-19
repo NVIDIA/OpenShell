@@ -1,0 +1,75 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Happy-path scenario: all RPCs succeed.
+#
+# Each [[rpc_name]] block is one entry in the scripted sequence. The driver
+# advances through the list on each call; when the list is exhausted the last
+# entry repeats (with a warning logged).
+#
+# To return a gRPC error instead of a success response, add:
+#
+#   [rpc_name.error]
+#   code = "NOT_FOUND"
+#   message = "sandbox not found"
+
+[[validate_sandbox_create]]
+# success — no error field
+
+[[create_sandbox]]
+# success — no error field
+
+[[get_sandbox]]
+[get_sandbox.sandbox]
+id = "sandbox-abc123"
+name = "test-sandbox"
+namespace = "default"
+
+[get_sandbox.sandbox.status]
+sandbox_name = "test-sandbox"
+instance_id  = "instance-1"
+agent_fd     = "127.0.0.1:12345"
+sandbox_fd   = "127.0.0.1:12346"
+
+[[list_sandboxes]]
+# Empty list on first call.
+sandboxes = []
+
+[[list_sandboxes]]
+# Populated list on subsequent calls (last entry repeats).
+[[list_sandboxes.sandboxes]]
+id        = "sandbox-abc123"
+name      = "test-sandbox"
+namespace = "default"
+
+[list_sandboxes.sandboxes.status]
+sandbox_name = "test-sandbox"
+instance_id  = "instance-1"
+agent_fd     = "127.0.0.1:12345"
+sandbox_fd   = "127.0.0.1:12346"
+
+[[stop_sandbox]]
+# success — no error field
+
+[[delete_sandbox]]
+deleted = true
+
+# WatchSandboxes streams these events in order, then closes.
+[watch_sandboxes]
+delay_ms = 100
+
+[[watch_sandboxes.events]]
+[watch_sandboxes.events.sandbox]
+id        = "sandbox-abc123"
+name      = "test-sandbox"
+namespace = "default"
+
+[watch_sandboxes.events.sandbox.status]
+sandbox_name = "test-sandbox"
+instance_id  = "instance-1"
+agent_fd     = "127.0.0.1:12345"
+sandbox_fd   = "127.0.0.1:12346"
+
+[[watch_sandboxes.events]]
+[watch_sandboxes.events.deleted]
+sandbox_id = "sandbox-abc123"
