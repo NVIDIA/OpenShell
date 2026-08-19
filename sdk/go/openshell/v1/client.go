@@ -4,6 +4,7 @@
 package v1
 
 import (
+	"context"
 	"sync"
 
 	"github.com/NVIDIA/OpenShell/sdk/go/openshell/v1/types"
@@ -111,6 +112,12 @@ func NewClient(cfg Config) (*Client, error) {
 
 // Sandboxes returns the sandbox sub-client.
 func (c *Client) Sandboxes() SandboxInterface { return c.sandboxes }
+
+// CreateSandboxFromTemplate creates a sandbox from a named workload template
+// without changing the legacy Sandboxes() interface.
+func (c *Client) CreateSandboxFromTemplate(ctx context.Context, workspace, name, templateName string, spec *SandboxSpec, labels map[string]string, opts ...CreateOptions) (*Sandbox, error) {
+	return c.sandboxes.(SandboxTemplateCreateInterface).CreateFromTemplate(ctx, workspace, name, templateName, spec, labels, opts...)
+}
 
 // Providers returns the provider sub-client.
 func (c *Client) Providers() ProviderInterface { return c.providers }

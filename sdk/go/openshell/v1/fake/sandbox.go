@@ -260,6 +260,9 @@ type fakeSandboxClient struct {
 	closedFunc  func() bool
 }
 
+var _ v1.SandboxInterface = (*fakeSandboxClient)(nil)
+var _ v1.SandboxTemplateCreateInterface = (*fakeSandboxClient)(nil)
+
 // newFakeSandboxClient creates a new fakeSandboxClient.
 func newFakeSandboxClient(
 	store *objectStore[*types.Sandbox],
@@ -296,6 +299,52 @@ func (c *fakeSandboxClient) Create(_ context.Context, workspace, name string, sp
 		Annotations:     annotations,
 		ResourceVersion: 1,
 		Spec:            copySandboxSpec(*spec),
+		Status: types.SandboxStatus{
+			SandboxName: name,
+			Phase:       types.SandboxProvisioning,
+		},
+	}
+
+	result, err := c.store.Create(workspace, sb)
+	if err != nil {
+		return nil, err
+	}
+
+	c.broadcaster.Broadcast(types.Event[*types.Sandbox]{
+		Type:   types.EventAdded,
+		Object: copySandbox(result),
+	}, name)
+
+	return result, nil
+}
+
+// CreateFromTemplate creates a new sandbox from a named template with Provisioning phase.
+func (c *fakeSandboxClient) CreateFromTemplate(_ context.Context, workspace, name, templateName string, spec *types.SandboxSpec, labels map[string]string, opts ...types.CreateOptions) (*types.Sandbox, error) {
+	if c.closedFunc() {
+		return nil, &types.StatusError{Code: types.ErrorUnavailable, Message: "client is closed"}
+	}
+	if templateName == "" {
+		return nil, &types.StatusError{Code: types.ErrorInvalidArgument, Message: "template name is required"}
+	}
+	if spec == nil {
+		spec = &types.SandboxSpec{}
+	}
+
+	var annotations map[string]string
+	if len(opts) > 0 {
+		annotations = copyStringMap(opts[0].Annotations)
+	}
+
+	sb := &types.Sandbox{
+		Name:        name,
+		Workspace:   workspace,
+		CreatedAt:   time.Now(),
+		Labels:      copyStringMap(labels),
+		Annotations: annotations,
+		Spec: types.SandboxSpec{
+			Providers: copyStringSlice(spec.Providers),
+			Policy:    copySandboxPolicy(spec.Policy),
+		},
 		Status: types.SandboxStatus{
 			SandboxName: name,
 			Phase:       types.SandboxProvisioning,

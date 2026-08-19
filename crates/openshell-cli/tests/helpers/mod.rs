@@ -8,6 +8,95 @@
 //! mod helpers;
 //! ```
 
+#[macro_export]
+macro_rules! unimplemented_sandbox_template_rpcs {
+    () => {
+        fn create_sandbox_template<'life0, 'async_trait>(
+            &'life0 self,
+            _request: tonic::Request<openshell_core::proto::CreateSandboxTemplateRequest>,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<
+                            tonic::Response<openshell_core::proto::SandboxTemplateResponse>,
+                            tonic::Status,
+                        >,
+                    > + Send
+                    + 'async_trait,
+            >,
+        >
+        where
+            'life0: 'async_trait,
+            Self: 'async_trait,
+        {
+            Box::pin(async { Err(tonic::Status::unimplemented("unused")) })
+        }
+
+        fn get_sandbox_template<'life0, 'async_trait>(
+            &'life0 self,
+            _request: tonic::Request<openshell_core::proto::GetSandboxTemplateRequest>,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<
+                            tonic::Response<openshell_core::proto::SandboxTemplateResponse>,
+                            tonic::Status,
+                        >,
+                    > + Send
+                    + 'async_trait,
+            >,
+        >
+        where
+            'life0: 'async_trait,
+            Self: 'async_trait,
+        {
+            Box::pin(async { Err(tonic::Status::unimplemented("unused")) })
+        }
+
+        fn list_sandbox_templates<'life0, 'async_trait>(
+            &'life0 self,
+            _request: tonic::Request<openshell_core::proto::ListSandboxTemplatesRequest>,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<
+                            tonic::Response<openshell_core::proto::ListSandboxTemplatesResponse>,
+                            tonic::Status,
+                        >,
+                    > + Send
+                    + 'async_trait,
+            >,
+        >
+        where
+            'life0: 'async_trait,
+            Self: 'async_trait,
+        {
+            Box::pin(async { Err(tonic::Status::unimplemented("unused")) })
+        }
+
+        fn delete_sandbox_template<'life0, 'async_trait>(
+            &'life0 self,
+            _request: tonic::Request<openshell_core::proto::DeleteSandboxTemplateRequest>,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<
+                            tonic::Response<openshell_core::proto::DeleteSandboxTemplateResponse>,
+                            tonic::Status,
+                        >,
+                    > + Send
+                    + 'async_trait,
+            >,
+        >
+        where
+            'life0: 'async_trait,
+            Self: 'async_trait,
+        {
+            Box::pin(async { Err(tonic::Status::unimplemented("unused")) })
+        }
+    };
+}
+
 use rcgen::{
     BasicConstraints, Certificate, CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair,
 };

@@ -1709,6 +1709,7 @@ async fn cas_update_message_cas_succeeds() {
         }),
         spec: None,
         status: None,
+        ..Sandbox::default()
     };
 
     store.put_message(&sandbox).await.unwrap();
@@ -1751,6 +1752,7 @@ async fn cas_update_message_cas_conflicts_on_concurrent_updates() {
         }),
         spec: None,
         status: None,
+        ..Sandbox::default()
     };
 
     store.put_message(&sandbox).await.unwrap();
@@ -1821,6 +1823,7 @@ async fn cas_update_message_cas_rejects_workspace_change() {
         }),
         spec: None,
         status: None,
+        ..Sandbox::default()
     };
 
     store.put_message(&sandbox).await.unwrap();
@@ -1863,6 +1866,7 @@ async fn cas_update_message_cas_rejects_name_change() {
         }),
         spec: None,
         status: None,
+        ..Sandbox::default()
     };
 
     store.put_message(&sandbox).await.unwrap();

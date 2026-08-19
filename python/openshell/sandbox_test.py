@@ -1632,6 +1632,7 @@ class _RecordingHighLevelClient:
 
     def __init__(self) -> None:
         self.create_kwargs: dict[str, Any] | None = None
+        self.create_template_kwargs: dict[str, Any] | None = None
 
     def create_session(
         self,
@@ -1643,6 +1644,24 @@ class _RecordingHighLevelClient:
     ) -> Any:
         self.create_kwargs = {
             "workspace": workspace,
+            "spec": spec,
+            "name": name,
+            "labels": labels,
+        }
+        return SimpleNamespace(sandbox=SimpleNamespace(name=name or "generated"))
+
+    def create_session_from_template(
+        self,
+        *,
+        workspace: str,
+        template_name: str,
+        spec: Any = None,
+        name: str | None = None,
+        labels: Any = None,
+    ) -> Any:
+        self.create_template_kwargs = {
+            "workspace": workspace,
+            "template_name": template_name,
             "spec": spec,
             "name": name,
             "labels": labels,
@@ -1673,6 +1692,37 @@ def test_create_forwards_name_and_labels() -> None:
     assert stub.create_request.name == "job-1"
     assert dict(stub.create_request.labels) == {"aiq": "deep-research"}
     assert dict(ref.labels) == {"aiq": "deep-research"}
+
+
+def test_create_from_template_forwards_workload_template_name() -> None:
+    stub = _FakeSandboxStub()
+    client = _client_with_fake_stub(stub)
+    spec = openshell_pb2.SandboxSpec(providers=["github"])
+
+    ref = client.create_from_template(
+        workspace="default",
+        template_name="gpu-kata",
+        spec=spec,
+        name="job-1",
+        labels={"team": "runtime"},
+    )
+
+    assert stub.create_request is not None
+    assert stub.create_request.name == "job-1"
+    assert stub.create_request.workload_template_name == "gpu-kata"
+    assert dict(stub.create_request.labels) == {"team": "runtime"}
+    assert list(stub.create_request.spec.providers) == ["github"]
+    assert dict(ref.labels) == {"team": "runtime"}
+
+
+def test_create_from_template_rejects_empty_template_name() -> None:
+    stub = _FakeSandboxStub()
+    client = _client_with_fake_stub(stub)
+
+    with pytest.raises(SandboxError):
+        client.create_from_template(workspace="default", template_name=" ")
+
+    assert stub.create_request is None
 
 
 def test_stop_and_start_forward_workspace_and_return_phase() -> None:
@@ -1876,6 +1926,36 @@ def test_high_level_creation_forwards_name_and_labels(
     }
 
 
+def test_high_level_template_creation_forwards_template_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recording = _RecordingHighLevelClient()
+    monkeypatch.setattr(
+        SandboxClient,
+        "from_active_cluster",
+        classmethod(lambda _cls, **_kwargs: recording),
+    )
+
+    spec = openshell_pb2.SandboxSpec(providers=["github"])
+    sandbox = Sandbox(
+        workspace="staging",
+        template_name="gpu-kata",
+        spec=spec,
+        name="job-1",
+        labels={"team": "runtime"},
+        delete_on_exit=False,
+    )
+    sandbox.__enter__()
+
+    assert recording.create_template_kwargs == {
+        "workspace": "staging",
+        "template_name": "gpu-kata",
+        "spec": spec,
+        "name": "job-1",
+        "labels": {"team": "runtime"},
+    }
+
+
 def test_high_level_attach_rejects_name() -> None:
     sandbox = Sandbox(workspace="default", sandbox="existing-sandbox", name="job-1")
 
@@ -1891,6 +1971,15 @@ def test_high_level_attach_rejects_labels() -> None:
         status=SandboxStatusRef(phase=2, current_policy_version=0),
     )
     sandbox = Sandbox(workspace="default", sandbox=ref, labels={"aiq": "deep-research"})
+
+    with pytest.raises(SandboxError):
+        sandbox.__enter__()
+
+
+def test_high_level_attach_rejects_template_name() -> None:
+    sandbox = Sandbox(
+        workspace="default", sandbox="existing-sandbox", template_name="gpu-kata"
+    )
 
     with pytest.raises(SandboxError):
         sandbox.__enter__()
