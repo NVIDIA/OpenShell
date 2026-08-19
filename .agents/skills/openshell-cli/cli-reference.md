@@ -215,6 +215,7 @@ without one, the default is `/bin/bash -l` with a PTY.
 | `--from <SOURCE>` | Community name, Dockerfile path, directory, or image reference (BYOC) |
 | `--no-keep` | Delete the sandbox after the initial command or shell exits |
 | `--detach` | Start the canonical main process without attaching |
+| `--restart-policy never|on-failure|always` | Restart behavior for canonical main exit; default: `never` |
 | `--editor vscode|cursor` | Launch a remote editor and keep the sandbox alive |
 | `--gpu [COUNT]` | Request the driver's default GPU selection or a specific count |
 | `--cpu <QUANTITY>` | CPU limit (for example: `500m`, `1`, `2.5`) |
@@ -293,6 +294,11 @@ new shell. The name defaults to the last-used sandbox.
 
 `--editor vscode|cursor` launches a supported remote editor instead of
 attaching to the canonical main process.
+
+With `on-failure` or `always`, a main-process exit moves the sandbox through
+`Restarting` while the gateway applies exponential backoff and replaces the
+runtime. A successful replacement returns to `Ready` with a new main-process
+instance and empty PTY history.
 
 ### `openshell sandbox upload <name> <path> [dest]`
 

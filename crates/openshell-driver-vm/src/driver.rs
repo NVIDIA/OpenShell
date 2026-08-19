@@ -1529,21 +1529,15 @@ impl VmDriver {
             );
         }
 
-        if clear_stop_marker {
-            match tokio::fs::remove_file(state_dir.join(SANDBOX_STOPPED_FILE)).await {
-                Ok(()) => {}
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-                Err(err) => {
-                    self.registry.lock().await.remove(&sandbox.id);
-                    warn!(
-                        sandbox_id = %sandbox.id,
-                        state_dir = %state_dir.display(),
-                        error = %err,
-                        "vm driver: cannot clear stop marker for persisted sandbox restore"
-                    );
-                    return false;
-                }
-            }
+        if clear_stop_marker && let Err(err) = clear_explicit_start_markers(&state_dir).await {
+            self.registry.lock().await.remove(&sandbox.id);
+            warn!(
+                sandbox_id = %sandbox.id,
+                state_dir = %state_dir.display(),
+                error = %err,
+                "vm driver: cannot clear lifecycle markers for persisted sandbox restore"
+            );
+            return false;
         }
 
         self.publish_platform_event(
@@ -4841,6 +4835,19 @@ async fn write_private_file(path: &Path, bytes: Vec<u8>) -> Result<(), std::io::
     restrict_owner_read_write(path).await
 }
 
+async fn clear_explicit_start_markers(state_dir: &Path) -> Result<(), std::io::Error> {
+    // Remove the terminal marker first. If clearing the durable stop marker
+    // fails, the sandbox remains stopped and a later start can safely retry.
+    for marker in [MAIN_PROCESS_EXITED_FILE, SANDBOX_STOPPED_FILE] {
+        match tokio::fs::remove_file(state_dir.join(marker)).await {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(())
+}
+
 #[cfg(unix)]
 async fn restrict_owner_read_write(path: &Path) -> Result<(), std::io::Error> {
     tokio::fs::set_permissions(path, fs::Permissions::from_mode(0o600)).await
@@ -6728,6 +6735,9 @@ mod tests {
         tokio::fs::write(state_dir.join(SANDBOX_STOPPED_FILE), b"stopped\n")
             .await
             .unwrap();
+        tokio::fs::write(state_dir.join(MAIN_PROCESS_EXITED_FILE), b"terminal\n")
+            .await
+            .unwrap();
         let snapshot = sandbox_snapshot(&sandbox, stopped_condition(), false);
         driver.registry.lock().await.insert(
             sandbox.id.clone(),
@@ -6754,6 +6764,12 @@ mod tests {
                 .is_ok(),
             "failed start must retain its durable stop marker"
         );
+        assert!(
+            tokio::fs::metadata(state_dir.join(MAIN_PROCESS_EXITED_FILE))
+                .await
+                .is_ok(),
+            "failed start must retain its terminal marker"
+        );
         let restored = driver
             .get_sandbox(&sandbox.id, &sandbox.name)
             .await
@@ -6766,6 +6782,32 @@ mod tests {
             .expect("stopped condition");
         assert_eq!(condition.r#type, "Stopped");
         assert_eq!(condition.status, "True");
+    }
+
+    #[tokio::test]
+    async fn explicit_start_clears_stop_and_terminal_markers() {
+        let temp = tempfile::tempdir().unwrap();
+        let state_dir = temp.path().join("sandbox");
+        tokio::fs::create_dir_all(&state_dir).await.unwrap();
+        tokio::fs::write(state_dir.join(SANDBOX_STOPPED_FILE), b"stopped\n")
+            .await
+            .unwrap();
+        tokio::fs::write(state_dir.join(MAIN_PROCESS_EXITED_FILE), b"terminal\n")
+            .await
+            .unwrap();
+
+        clear_explicit_start_markers(&state_dir).await.unwrap();
+
+        assert!(
+            !tokio::fs::try_exists(state_dir.join(SANDBOX_STOPPED_FILE))
+                .await
+                .unwrap()
+        );
+        assert!(
+            !tokio::fs::try_exists(state_dir.join(MAIN_PROCESS_EXITED_FILE))
+                .await
+                .unwrap()
+        );
     }
 
     #[test]
