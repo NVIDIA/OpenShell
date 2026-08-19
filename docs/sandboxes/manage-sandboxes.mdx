@@ -173,6 +173,10 @@ openshell sandbox template create gpu-kata \
   --env FEATURE_FLAG=on
 ```
 
+Use `--gpu` without a count when the template should request the active
+driver's default GPU assignment. Use `--gpu COUNT` when the template needs a
+specific number of GPUs.
+
 Add driver-specific settings when the active compute driver needs them:
 
 ```shell
