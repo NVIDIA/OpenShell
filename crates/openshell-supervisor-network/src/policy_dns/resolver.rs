@@ -11,7 +11,7 @@ use super::name::NormalizedName;
 use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
 use hickory_proto::rr::{Name, RData, RecordType};
 use openshell_core::net::connect_tcp_nodelay_best_effort;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -204,8 +204,7 @@ impl TrustedResolver for SocketTrustedResolver {
                         .iter()
                         .map(|(address, _)| *address)
                         .collect::<Vec<_>>();
-                    addresses.sort_unstable();
-                    addresses.dedup();
+                    retain_first_addresses(&mut addresses);
                     addresses.truncate(MAX_RETAINED_ADDRESSES);
                     let address_ttl = records.iter().map(|(_, ttl)| *ttl).min().unwrap_or(1);
                     return Ok(TrustedAnswer {
@@ -237,6 +236,11 @@ impl TrustedResolver for SocketTrustedResolver {
 
         Err(ResolveError::CnameLimit)
     }
+}
+
+fn retain_first_addresses(addresses: &mut Vec<IpAddr>) {
+    let mut seen = HashSet::new();
+    addresses.retain(|address| seen.insert(*address));
 }
 
 fn parse_response(wire: &[u8], id: u16, query: &Query) -> Result<Message, ResolveError> {
@@ -310,6 +314,25 @@ mod tests {
     use hickory_proto::rr::rdata::{A, CNAME};
     use openshell_core::net::set_tcp_nodelay_best_effort;
     use tokio::net::TcpListener;
+
+    #[test]
+    fn resolver_address_deduplication_preserves_answer_order() {
+        let mut addresses = vec![
+            "203.0.113.20".parse().unwrap(),
+            "203.0.113.10".parse().unwrap(),
+            "203.0.113.20".parse().unwrap(),
+        ];
+
+        retain_first_addresses(&mut addresses);
+
+        assert_eq!(
+            addresses,
+            vec![
+                "203.0.113.20".parse::<IpAddr>().unwrap(),
+                "203.0.113.10".parse::<IpAddr>().unwrap(),
+            ]
+        );
+    }
 
     #[test]
     fn answer_parser_keeps_only_requested_family_and_bounds_are_constants() {

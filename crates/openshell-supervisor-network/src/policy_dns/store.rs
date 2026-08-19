@@ -9,7 +9,7 @@ use crate::proxy::destination::{
     DestinationRequest, DestinationValidationPlan, UpstreamConnector, build_pinned_validation_plan,
     validate_destination,
 };
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::ops::RangeInclusive;
 use std::sync::RwLock;
@@ -89,14 +89,14 @@ impl MappingLookup {
         &self,
         endpoint_id: &PolicyEndpointId,
     ) -> Result<UpstreamConnector, MappingLookupError> {
+        let mut seen = HashSet::new();
         let addresses = self
             .record
             .contracts
             .iter()
             .filter(|contract| contract.port == self.port && &contract.endpoint_id == endpoint_id)
             .flat_map(|contract| contract.pinned_addresses.iter().copied())
-            .collect::<BTreeSet<_>>()
-            .into_iter()
+            .filter(|address| seen.insert(*address))
             .collect::<Vec<_>>();
         if addresses.is_empty() {
             return Err(MappingLookupError::EndpointMismatch);
@@ -654,5 +654,32 @@ mod tests {
         let endpoint = lookup.endpoint_ids().next().unwrap().clone();
         let connector = lookup.connector_for(&endpoint).await.unwrap();
         assert_eq!(connector.addrs(), &["203.0.113.8:5432".parse().unwrap()]);
+    }
+
+    #[tokio::test]
+    async fn connector_preserves_resolver_address_order_while_deduplicating() {
+        let store = store(1);
+        let now = Instant::now();
+        let mut request = request("must-not-resolve.invalid", 1, Duration::from_secs(5));
+        request.contracts[0].pinned_addresses = vec![
+            "203.0.113.20".parse().unwrap(),
+            "203.0.113.10".parse().unwrap(),
+            "203.0.113.20".parse().unwrap(),
+        ];
+        let record = store.publish(request, 1, now).unwrap();
+        let lookup = store
+            .lookup(record.synthetic_address, 5432, 1, now)
+            .unwrap();
+        let endpoint = lookup.endpoint_ids().next().unwrap().clone();
+
+        let connector = lookup.connector_for(&endpoint).await.unwrap();
+
+        assert_eq!(
+            connector.addrs(),
+            &[
+                "203.0.113.20:5432".parse().unwrap(),
+                "203.0.113.10:5432".parse().unwrap(),
+            ]
+        );
     }
 }
