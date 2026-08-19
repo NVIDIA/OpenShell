@@ -38,6 +38,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::{Mutex, mpsc};
 use tokio_stream::wrappers::TcpListenerStream;
@@ -2571,18 +2572,20 @@ async fn sandbox_create_env_rejects_invalid_key_name() {
     );
 }
 
-async fn run_cli_sandbox_create(
-    server: &TestServer,
-    name: &str,
-    extra_args: &[&str],
-) -> std::process::Output {
-    let xdg_dir = tempfile::tempdir().unwrap();
+fn prepare_cli_xdg(server: &TestServer, xdg_dir: &TempDir) {
     let tls_dir = xdg_dir.path().join("openshell/gateways/openshell/mtls");
     fs::create_dir_all(&tls_dir).unwrap();
     for filename in ["ca.crt", "tls.crt", "tls.key"] {
         fs::copy(server.dir.path().join(filename), tls_dir.join(filename)).unwrap();
     }
+}
 
+async fn run_cli_sandbox_create_with_xdg(
+    server: &TestServer,
+    xdg_dir: &TempDir,
+    name: &str,
+    extra_args: &[&str],
+) -> std::process::Output {
     let mut cmd = tokio::process::Command::new(env!("CARGO_BIN_EXE_openshell"));
     for (key, _) in std::env::vars().filter(|(k, _)| k.starts_with("OPENSHELL_")) {
         cmd.env_remove(&key);
@@ -2606,6 +2609,16 @@ async fn run_cli_sandbox_create(
     .output()
     .await
     .unwrap()
+}
+
+async fn run_cli_sandbox_create(
+    server: &TestServer,
+    name: &str,
+    extra_args: &[&str],
+) -> std::process::Output {
+    let xdg_dir = tempfile::tempdir().unwrap();
+    prepare_cli_xdg(server, &xdg_dir);
+    run_cli_sandbox_create_with_xdg(server, &xdg_dir, name, extra_args).await
 }
 
 async fn run_cli_sandbox_template_create(
@@ -2644,6 +2657,122 @@ async fn run_cli_sandbox_template_create(
     .output()
     .await
     .unwrap()
+}
+
+async fn run_rejected_oidc_refresh_server() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let issuer = format!("http://{}", listener.local_addr().unwrap());
+    let task_issuer = issuer.clone();
+
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let issuer = task_issuer.clone();
+            tokio::spawn(async move {
+                let mut request = vec![0; 8192];
+                let Ok(read) = stream.read(&mut request).await else {
+                    return;
+                };
+                let request = String::from_utf8_lossy(&request[..read]);
+                let (status, body) =
+                    if request.starts_with("GET /.well-known/openid-configuration ") {
+                        (
+                            "200 OK",
+                            serde_json::json!({
+                                "issuer": issuer,
+                                "authorization_endpoint": format!("{issuer}/authorize"),
+                                "token_endpoint": format!("{issuer}/token"),
+                            })
+                            .to_string(),
+                        )
+                    } else if request.starts_with("POST /token ") {
+                        (
+                            "400 Bad Request",
+                            serde_json::json!({
+                                "error": "invalid_grant",
+                                "error_description": "Token is not active",
+                            })
+                            .to_string(),
+                        )
+                    } else {
+                        ("404 Not Found", "{}".to_string())
+                    };
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len(),
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+            });
+        }
+    });
+
+    issuer
+}
+
+/// Models the gateway's JWT-expiration leeway by using a test gateway that
+/// still accepts the stale bearer. Before the CLI failed closed, the rejected
+/// refresh was only logged and `CreateSandbox` reached this gateway anyway.
+#[tokio::test]
+async fn sandbox_create_fails_before_mutation_when_expired_oidc_refresh_is_rejected() {
+    let server = run_server().await;
+    let issuer = run_rejected_oidc_refresh_server().await;
+    let xdg_dir = tempfile::tempdir().unwrap();
+    prepare_cli_xdg(&server, &xdg_dir);
+
+    let gateway_dir = xdg_dir.path().join("openshell/gateways/openshell");
+    fs::write(
+        gateway_dir.join("metadata.json"),
+        serde_json::to_vec_pretty(&openshell_bootstrap::GatewayMetadata {
+            name: "openshell".to_string(),
+            gateway_endpoint: server.endpoint.clone(),
+            auth_mode: Some("oidc".to_string()),
+            oidc_issuer: Some(issuer.clone()),
+            oidc_client_id: Some("openshell-cli".to_string()),
+            ..Default::default()
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        gateway_dir.join("oidc_token.json"),
+        serde_json::to_vec_pretty(&openshell_bootstrap::oidc_token::OidcTokenBundle {
+            access_token: "expired-access-token".to_string(),
+            refresh_token: Some("inactive-refresh-token".to_string()),
+            expires_at: Some(0),
+            issuer,
+            client_id: "openshell-cli".to_string(),
+        })
+        .unwrap(),
+    )
+    .unwrap();
+
+    let result = run_cli_sandbox_create_with_xdg(
+        &server,
+        &xdg_dir,
+        "must-not-be-created",
+        &["--output=json"],
+    )
+    .await;
+
+    assert!(
+        !result.status.success(),
+        "refresh failure must abort create"
+    );
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        stderr.contains("invalid_grant"),
+        "unexpected error: {stderr}"
+    );
+    assert!(
+        stderr.contains("openshell gateway login openshell"),
+        "error should explain how to re-authenticate: {stderr}"
+    );
+    assert!(
+        create_requests(&server).await.is_empty(),
+        "CreateSandbox must not be called after OIDC refresh fails"
+    );
 }
 
 #[tokio::test]
