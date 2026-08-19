@@ -116,12 +116,12 @@ impl RequirementAccumulator {
         }
     }
 
-    fn add_gid(&mut self, gid: u32) {
+    fn add_gid(&mut self, gid: u32) -> Result<(), CdiError> {
         if gid == 0 {
-            tracing::debug!("Skipping CDI additionalGids entry for root GID 0");
-            return;
+            return Err(CdiError::RootAdditionalGid);
         }
         self.additional_gids.insert(gid);
+        Ok(())
     }
 
     fn validate_writable_mounts<F>(
@@ -235,6 +235,9 @@ fn resolve_container_edits(
     selected_devices: &[String],
 ) -> Result<CdiContainerEdits, CdiError> {
     let (mut cache, refresh_error) = build_cache(&context.spec_dirs);
+    if let Some(device) = conflicting_selected_device(refresh_error.as_deref(), selected_devices) {
+        return Err(CdiError::DuplicateDevice(device));
+    }
     let mut merged = UpstreamContainerEdits::new();
     let mut applied_specs = BTreeSet::new();
 
@@ -266,6 +269,21 @@ fn resolve_container_edits(
     let value = serde_json::to_value(&merged.container_edits)
         .map_err(|source| CdiError::EditEncode { source })?;
     serde_json::from_value(value).map_err(|source| CdiError::EditDecode { source })
+}
+
+// Temporary compatibility check for the Rust CDI cache revision pinned by
+// OpenShell. That revision records same-priority device conflicts but leaves
+// the conflicted device resolvable. Remove this once OpenShell uses the
+// upstream fix that excludes conflicts from the cache's device map.
+fn conflicting_selected_device(
+    refresh_error: Option<&str>,
+    selected_devices: &[String],
+) -> Option<String> {
+    let refresh_error = refresh_error?;
+    selected_devices
+        .iter()
+        .find(|device| refresh_error.contains(&format!("conflicting device {device} (specs ")))
+        .cloned()
 }
 
 fn missing_device_error(device: &str, refresh_error: Option<&str>) -> CdiError {
@@ -319,7 +337,7 @@ where
     }
 
     for gid in &edits.additional_gids {
-        accumulator.add_gid(*gid);
+        accumulator.add_gid(*gid)?;
     }
 
     accumulator.validate_writable_mounts(normalized_writable_file_allowlist, path_kind)?;
@@ -685,6 +703,37 @@ devices:
     }
 
     #[test]
+    fn rejects_duplicate_cdi_device_names() {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, value) in [("first.yaml", "FIRST"), ("second.yaml", "SECOND")] {
+            write_spec(
+                dir.path(),
+                name,
+                &format!(
+                    r#"
+cdiVersion: 1.1.0
+kind: nvidia.com/gpu
+devices:
+  - name: "0"
+    containerEdits:
+      env:
+        - OPEN_SHELL_TEST={value}
+"#
+                ),
+            );
+        }
+
+        let err = resolve_with_kind(
+            &context(dir.path(), &["nvidia.com/gpu=0"]),
+            &[],
+            always_missing,
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, CdiError::DuplicateDevice(device) if device == "nvidia.com/gpu=0"));
+    }
+
+    #[test]
     fn empty_selection_is_noop() {
         let dir = tempfile::tempdir().unwrap();
         let requirements = resolve_with_kind(&context(dir.path(), &[]), &[], always_missing)
@@ -794,7 +843,7 @@ devices:
     }
 
     #[test]
-    fn skips_root_additional_gid() {
+    fn rejects_root_additional_gid() {
         let dir = tempfile::tempdir().unwrap();
         write_spec(
             dir.path(),
@@ -809,14 +858,14 @@ devices:
 "#,
         );
 
-        let requirements = resolve_with_kind(
+        let err = resolve_with_kind(
             &context(dir.path(), &["nvidia.com/gpu=0"]),
             &[],
             always_missing,
         )
-        .unwrap();
+        .unwrap_err();
 
-        assert_eq!(requirements.additional_gids, vec![44]);
+        assert!(matches!(err, CdiError::RootAdditionalGid));
     }
 
     #[test]

@@ -82,6 +82,8 @@ pub enum CdiError {
         device: String,
         refresh_error: String,
     },
+    #[error("selected CDI device '{0}' is defined by multiple mounted CDI specs")]
+    DuplicateDevice(String),
     #[error("failed to merge CDI edits for '{device}': {error}")]
     EditMerge { device: String, error: String },
     #[error("failed to encode resolved CDI edits: {source}")]
@@ -100,6 +102,8 @@ pub enum CdiError {
     WritableMountNotFile { path: String, kind: String },
     #[error("CDI device node '{path}' must target a character or block device, found {kind}")]
     DeviceNodeNotDevice { path: String, kind: String },
+    #[error("CDI additionalGids must not contain root GID 0")]
+    RootAdditionalGid,
     #[error("CDI mount '{path}' has conflicting ro/rw options")]
     ConflictingMountOptions { path: String },
 }
