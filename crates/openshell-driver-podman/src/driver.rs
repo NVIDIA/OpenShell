@@ -921,7 +921,7 @@ impl PodmanComputeDriver {
         &self,
         sandbox_id: &str,
         container_id: &str,
-    ) -> Result<(), ComputeDriverError> {
+    ) -> Result<Option<String>, ComputeDriverError> {
         let timeout = Duration::from_secs(u64::from(self.config.stop_timeout_secs))
             + STOP_COMPLETION_TIMEOUT_HEADROOM;
         let deadline = tokio::time::Instant::now() + timeout;
@@ -933,7 +933,7 @@ impl PodmanComputeDriver {
                 .await
                 .map_err(ComputeDriverError::from)?;
             if matches!(inspect.state.status.as_str(), "exited" | "stopped") {
-                return Ok(());
+                return Ok(inspect.state.finished_at);
             }
 
             let now = tokio::time::Instant::now();
@@ -955,15 +955,11 @@ impl PodmanComputeDriver {
             .ok_or(ComputeDriverError::NotFound)?;
         let container_id = container.id;
         if container.state == "stopping" {
-            self.wait_for_container_stopped(sandbox_id, &container_id)
+            let finished_at = self
+                .wait_for_container_stopped(sandbox_id, &container_id)
                 .await?;
-            let stopped = self
-                .client
-                .inspect_container(&container_id)
-                .await
-                .map_err(ComputeDriverError::from)?;
             self.lifecycle_event_fences
-                .record_previous_exit(sandbox_id, stopped.state.finished_at.as_deref());
+                .record_previous_exit(sandbox_id, finished_at.as_deref());
             return Ok(());
         }
         if container.state != "running" {
@@ -981,7 +977,8 @@ impl PodmanComputeDriver {
         // event from the previous run can arrive after the gateway has moved
         // the same sandbox to Starting, causing it to regress to Error. Wait
         // for the terminal container state before allowing a restart.
-        self.wait_for_container_stopped(sandbox_id, &container_id)
+        let finished_at = self
+            .wait_for_container_stopped(sandbox_id, &container_id)
             .await?;
 
         // Record the completed run before returning the stop RPC. The server
@@ -990,13 +987,8 @@ impl PodmanComputeDriver {
         // that delayed event from regressing the new run from Starting to
         // Error. Keep the start-side recording as a fallback for restarts
         // after a driver or gateway process restart.
-        let stopped = self
-            .client
-            .inspect_container(&container_id)
-            .await
-            .map_err(ComputeDriverError::from)?;
         self.lifecycle_event_fences
-            .record_previous_exit(sandbox_id, stopped.state.finished_at.as_deref());
+            .record_previous_exit(sandbox_id, finished_at.as_deref());
         Ok(())
     }
 

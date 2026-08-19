@@ -5495,11 +5495,21 @@ filesystem_policy:
             "fail_closed"
         );
         assert_eq!(config["unmapped"]["previous_policy_active"], false);
+        assert_eq!(
+            config["unmapped"]["validation_error"],
+            "conflicting tls metadata"
+        );
         assert!(
             config["message"]
                 .as_str()
                 .unwrap()
                 .contains("previous policy IS NOT active")
+        );
+        assert!(
+            config["message"]
+                .as_str()
+                .unwrap()
+                .contains("error:conflicting tls metadata")
         );
 
         let finding = finding.to_json().unwrap();

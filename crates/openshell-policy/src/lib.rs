@@ -16,12 +16,14 @@ mod middleware;
 
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
+use std::net::IpAddr;
 use std::path::Path;
 
 mod ambiguity;
 
 pub use ambiguity::{EndpointAmbiguity, find_endpoint_ambiguities};
 
+use hickory_proto::rr::Name;
 use miette::{IntoDiagnostic, Result, WrapErr};
 use openshell_core::proto::{
     FilesystemPolicy, GraphqlOperation, L7Allow, L7DenyRule, L7QueryMatcher, L7Rule,
@@ -1174,6 +1176,16 @@ pub enum PolicyViolation {
     TldWildcard { policy_name: String, host: String },
     /// A network endpoint has no hostname.
     MissingEndpointHost { policy_name: String },
+    /// An explicit TCP endpoint has no DNS hostname.
+    MissingTcpEndpointHost { policy_name: String },
+    /// An explicit TCP endpoint uses an IP literal instead of a DNS hostname.
+    TcpEndpointIpLiteral { policy_name: String, host: String },
+    /// An explicit TCP endpoint has a hostname that policy DNS cannot resolve.
+    InvalidTcpEndpointHost {
+        policy_name: String,
+        host: String,
+        reason: String,
+    },
     /// A network endpoint has no effective destination port.
     MissingEndpointPort { policy_name: String, host: String },
     /// A network endpoint contains a port outside the TCP/UDP range.
@@ -1254,7 +1266,29 @@ impl fmt::Display for PolicyViolation {
             Self::MissingEndpointHost { policy_name } => {
                 write!(
                     f,
-                    "network policy '{policy_name}': endpoint host must not be empty"
+                    "network policy '{policy_name}': endpoint host must not be empty unless allowed_ips constrains a non-TCP proxy endpoint"
+                )
+            }
+            Self::MissingTcpEndpointHost { policy_name } => {
+                write!(
+                    f,
+                    "network policy '{policy_name}': protocol tcp requires a DNS hostname; hostless allowed_ips endpoints are supported only by the forward proxy"
+                )
+            }
+            Self::TcpEndpointIpLiteral { policy_name, host } => {
+                write!(
+                    f,
+                    "network policy '{policy_name}': protocol tcp endpoint '{host}' must use a DNS hostname, not an IP literal; direct IP connections bypass policy DNS and are blocked"
+                )
+            }
+            Self::InvalidTcpEndpointHost {
+                policy_name,
+                host,
+                reason,
+            } => {
+                write!(
+                    f,
+                    "network policy '{policy_name}': protocol tcp endpoint has invalid DNS host selector '{host}': {reason}"
                 )
             }
             Self::MissingEndpointPort { policy_name, host } => {
@@ -1442,10 +1476,28 @@ pub fn validate_sandbox_policy(
             rule.name.clone()
         };
         for ep in &rule.endpoints {
-            if ep.host.trim().is_empty() {
+            let explicit_tcp = l7_validate::is_explicit_tcp_protocol(&ep.protocol);
+            if ep.host.trim().is_empty() && explicit_tcp {
+                violations.push(PolicyViolation::MissingTcpEndpointHost {
+                    policy_name: name.clone(),
+                });
+            } else if ep.host.trim().is_empty() && ep.allowed_ips.is_empty() {
                 violations.push(PolicyViolation::MissingEndpointHost {
                     policy_name: name.clone(),
                 });
+            } else if explicit_tcp {
+                if ep.host.parse::<IpAddr>().is_ok() {
+                    violations.push(PolicyViolation::TcpEndpointIpLiteral {
+                        policy_name: name.clone(),
+                        host: ep.host.clone(),
+                    });
+                } else if let Err(reason) = validate_tcp_dns_host_selector(&ep.host) {
+                    violations.push(PolicyViolation::InvalidTcpEndpointHost {
+                        policy_name: name.clone(),
+                        host: ep.host.clone(),
+                        reason,
+                    });
+                }
             }
             let effective_ports: Vec<u32> = if ep.ports.is_empty() {
                 (ep.port != 0).then_some(ep.port).into_iter().collect()
@@ -1535,6 +1587,39 @@ fn host_wildcard_shape_invalid(host: &str) -> bool {
         .skip(1)
         .copied()
         .any(|label| label.contains("**") || (label.contains('*') && label != "*"))
+}
+
+/// Validate that an explicit-TCP host selector can produce names accepted by
+/// policy DNS. Wildcards are replaced with a representative DNS label before
+/// parsing because the authored selector itself is not a concrete DNS name.
+fn validate_tcp_dns_host_selector(host: &str) -> std::result::Result<(), String> {
+    if host.trim() != host {
+        return Err("leading or trailing whitespace is not allowed".to_string());
+    }
+    if host.ends_with('.') {
+        return Err("omit the trailing DNS root dot".to_string());
+    }
+
+    openshell_core::host_pattern::HostSelector::new(&[host.to_string()], &[])?;
+
+    let representative = host
+        .split('.')
+        .map(|label| {
+            if label == "**" {
+                "x".to_string()
+            } else {
+                label.replace('*', "x")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(".");
+    let absolute = format!("{representative}.");
+    let parsed = Name::from_ascii(&absolute)
+        .map_err(|error| format!("selector cannot represent a valid DNS name: {error}"))?;
+    if parsed.is_root() {
+        return Err("DNS root is not a destination hostname".to_string());
+    }
+    Ok(())
 }
 
 /// Truncate a string for safe inclusion in error messages.
@@ -2458,7 +2543,7 @@ network_policies:
     }
 
     #[test]
-    fn validate_rejects_yaml_endpoint_without_host_or_port() {
+    fn validate_rejects_yaml_tcp_endpoint_without_host_or_port() {
         let policy = parse_sandbox_policy(
             r#"
 version: 1
@@ -2474,12 +2559,139 @@ network_policies:
         let violations = validate_sandbox_policy(&policy).expect_err("endpoint is incomplete");
         assert!(violations.iter().any(|violation| matches!(
             violation,
-            PolicyViolation::MissingEndpointHost { policy_name } if policy_name == "invalid"
+            PolicyViolation::MissingTcpEndpointHost { policy_name } if policy_name == "invalid"
         )));
+        assert!(violations.iter().any(|violation| {
+            violation.to_string().contains(
+                "protocol tcp requires a DNS hostname; hostless allowed_ips endpoints are supported only by the forward proxy",
+            )
+        }));
         assert!(violations.iter().any(|violation| matches!(
             violation,
             PolicyViolation::MissingEndpointPort { policy_name, .. } if policy_name == "invalid"
         )));
+    }
+
+    #[test]
+    fn validate_accepts_hostless_allowed_ips_for_non_tcp_proxy_endpoint() {
+        let policy = parse_sandbox_policy(
+            r"
+version: 1
+network_policies:
+  legacy-proxy:
+    endpoints:
+      - port: 9443
+        allowed_ips:
+          - 10.0.5.0/24
+",
+        )
+        .expect("policy syntax should parse before semantic validation");
+
+        validate_sandbox_policy(&policy)
+            .expect("hostless allowed_ips remains valid for non-TCP proxy endpoints");
+    }
+
+    #[test]
+    fn validate_rejects_hostless_allowed_ips_for_explicit_tcp() {
+        let policy = parse_sandbox_policy(
+            r"
+version: 1
+network_policies:
+  native-tcp:
+    endpoints:
+      - port: 6379
+        protocol: tcp
+        allowed_ips:
+          - 10.0.5.0/24
+",
+        )
+        .expect("policy syntax should parse before semantic validation");
+
+        let violations =
+            validate_sandbox_policy(&policy).expect_err("transparent TCP requires a DNS hostname");
+        let violation = violations
+            .iter()
+            .find(|violation| matches!(violation, PolicyViolation::MissingTcpEndpointHost { .. }))
+            .expect("missing TCP hostname violation");
+        assert_eq!(
+            violation.to_string(),
+            "network policy 'native-tcp': protocol tcp requires a DNS hostname; hostless allowed_ips endpoints are supported only by the forward proxy"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_ip_literal_hosts_for_explicit_tcp() {
+        for host in ["192.0.2.10", "2001:db8::10"] {
+            let mut policy = restrictive_default_policy();
+            policy.network_policies.insert(
+                "native-tcp".into(),
+                NetworkPolicyRule {
+                    name: "native-tcp".into(),
+                    endpoints: vec![NetworkEndpoint {
+                        host: host.into(),
+                        port: 6379,
+                        protocol: "tcp".into(),
+                        ..Default::default()
+                    }],
+                    binaries: Vec::new(),
+                },
+            );
+
+            let violations = validate_sandbox_policy(&policy)
+                .expect_err("transparent TCP must reject direct IP destinations");
+            let violation = violations
+                .iter()
+                .find(|violation| matches!(violation, PolicyViolation::TcpEndpointIpLiteral { .. }))
+                .expect("TCP IP-literal violation");
+            assert!(
+                violation
+                    .to_string()
+                    .contains("direct IP connections bypass policy DNS and are blocked"),
+                "unexpected diagnostic: {violation}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_rejects_malformed_dns_selectors_for_explicit_tcp() {
+        for (host, expected_reason) in [
+            (" db.example.com", "leading or trailing whitespace"),
+            ("db.example.com.", "omit the trailing DNS root dot"),
+            ("db..example.com", "empty DNS labels"),
+            ("bad name.example.com", "whitespace"),
+            (
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.example.com",
+                "cannot represent a valid DNS name",
+            ),
+        ] {
+            let mut policy = restrictive_default_policy();
+            policy.network_policies.insert(
+                "native-tcp".into(),
+                NetworkPolicyRule {
+                    name: "native-tcp".into(),
+                    endpoints: vec![NetworkEndpoint {
+                        host: host.into(),
+                        port: 6379,
+                        protocol: "tcp".into(),
+                        ..Default::default()
+                    }],
+                    binaries: Vec::new(),
+                },
+            );
+
+            let violations = validate_sandbox_policy(&policy)
+                .expect_err("malformed transparent TCP hostname must be rejected");
+            let violation = violations
+                .iter()
+                .find(|violation| {
+                    matches!(violation, PolicyViolation::InvalidTcpEndpointHost { .. })
+                })
+                .expect("invalid TCP hostname violation");
+            assert!(
+                violation.to_string().contains(expected_reason),
+                "expected {expected_reason:?} in diagnostic for {host:?}, got {violation}"
+            );
+        }
     }
 
     #[test]

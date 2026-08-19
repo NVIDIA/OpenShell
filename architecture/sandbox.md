@@ -75,9 +75,11 @@ its guarded single-request relay while sharing authorization, request context,
 policy-pinning, and destination boundaries.
 Adapter-specific response and OCSF event shapes remain at the protocol boundary.
 Policy authors may use `protocol: tcp` as an explicit spelling of the existing
-L4 passthrough behavior. Omitting `protocol` remains equivalent. The egress
-intent reserves a transparent TCP adapter and a policy-DNS-pinned address, but
-DNS serving and transparent TCP capture are not active yet.
+L4 passthrough behavior. Explicit TCP endpoints require a valid DNS hostname;
+hostless `allowed_ips` and literal-IP selectors remain available only to the
+legacy forward-proxy path when `protocol` is omitted. The egress intent reserves
+a transparent TCP adapter and a policy-DNS-pinned address, but DNS serving and
+transparent TCP capture are not active yet.
 
 Provider credential placeholders are resolved through the live provider state
 for each HTTP request, after destination and L7 policy admission. A static

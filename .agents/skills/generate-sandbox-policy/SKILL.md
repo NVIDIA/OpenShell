@@ -44,8 +44,9 @@ For this tier, default to:
 - `access: full` when the user says "full access", "everything", "unrestricted"
 - L4-only (omit `protocol`, or use explicit `protocol: tcp`) when the user says
   "just allow it", "pass through", "no inspection". Prefer omission unless the
-  user wants the transport intent stated explicitly; both currently have the
-  same host/port enforcement behavior.
+  user wants the transport intent stated explicitly. Explicit TCP requires a
+  valid DNS hostname; omit `protocol` for a legacy hostless `allowed_ips`
+  proxy endpoint.
 
 ### Moderate Tier (host + partial path knowledge)
 
@@ -191,7 +192,7 @@ Follow this decision tree based on the detail tier and user intent:
 ```
 Is L7 inspection needed?
 ├─ No (user wants pass-through / "just allow it")
-│   └─ Generate L4-only policy (no protocol, or protocol: tcp; no tls/rules/access)
+│   └─ Generate L4-only policy (no protocol, or protocol: tcp with a DNS hostname; no tls/rules/access)
 │
 └─ Yes (user wants method/path control)
     │
@@ -381,6 +382,8 @@ Before presenting the policy to the user, verify correctness **and** flag breadt
 - [ ] `rules` and `access` are NOT both present on the same endpoint
 - [ ] If an L7 `protocol` is set, either `rules` or `access` is also present;
       `protocol: tcp` is L4-only and must not contain either field
+- [ ] Every `protocol: tcp` endpoint has a valid DNS hostname; it is not
+      hostless, an IP literal, a trailing-dot name, or a malformed DNS selector
 - [ ] If `tls: terminate` is set, `protocol` is also set
 - [ ] `rules` list is not empty when present
 - [ ] If `protocol: sql`, `enforcement` is not `enforce`
@@ -419,7 +422,7 @@ Evaluate the generated policy for overly broad access and **include warnings in 
 | **Wildcard binary** (`*` or `**` in binary path) | "This policy allows any binary matching the glob pattern. A compromised or unexpected binary in that directory could use this policy. Consider listing specific binary paths." |
 | **`**` path glob** on all explicit rules | "All rules use `**` path patterns, which match any URL path. This is equivalent to a preset — consider using `access: read-only` (or similar) for clarity, or narrowing paths if you know the API structure." |
 | **Multiple broad endpoints** in one policy | "This policy grants the same broad access to N different hosts. If any of these hosts needs tighter restrictions later, you'll need to split the policy." |
-| **Hostless `allowed_ips`** (no `host` field) | "This endpoint has no `host` — any domain resolving to the allowed IP range on this port will be permitted. Consider adding a `host` field to restrict which domains can use this allowlist." |
+| **Hostless `allowed_ips`** (no `host` field and no `protocol: tcp`) | "This endpoint has no `host` — any domain resolving to the allowed IP range on this port will be permitted through the legacy proxy. Consider adding a `host` field to restrict which domains can use this allowlist." |
 | **Broad CIDR** in `allowed_ips` (e.g., `10.0.0.0/8`) | "This `allowed_ips` entry covers a very broad range. Consider narrowing to a specific subnet (e.g., `10.0.5.0/24`) to minimize exposure." |
 | **`on_error: fail_open`** | "This middleware can be bypassed when it is unavailable, rejects configuration, returns an invalid result, or exceeds its body limit. Use `fail_closed` unless availability is more important than this control." |
 | **Broad middleware host selector** | "This middleware attaches independently of the admitting network rule to every matching destination, then runs only for operation bindings its implementation advertises. Narrow `endpoints.include` or add exclusions if the attachment is not required for every matching host." |
