@@ -32,11 +32,17 @@ use std::sync::OnceLock;
 use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
 use tracing::{debug, info};
 
-// `TIOCSCTTY` is `c_ulong` on Linux but `c_uint` on macOS, while `ioctl`
-// accepts `c_ulong` on both platforms.
+// `libc::TIOCSCTTY` and the request parameter accepted by `ioctl` vary across
+// glibc, musl, and BSD targets. The conversion is a no-op on some targets but
+// is required on others.
 #[cfg(unix)]
-#[allow(trivial_numeric_casts)]
-const TIOCSCTTY_REQUEST: libc::c_ulong = libc::TIOCSCTTY as libc::c_ulong;
+#[allow(unsafe_code, clippy::useless_conversion)]
+fn set_controlling_tty(fd: libc::c_int) -> std::io::Result<()> {
+    if unsafe { libc::ioctl(fd, libc::TIOCSCTTY.into(), 0) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
 
 /// Process/filesystem enforcement performed by the process supervisor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -764,9 +770,7 @@ impl ProcessHandle {
                         if libc::setsid() < 0 {
                             return Err(std::io::Error::last_os_error());
                         }
-                        if libc::ioctl(slave_fd, TIOCSCTTY_REQUEST, 0) < 0 {
-                            return Err(std::io::Error::last_os_error());
-                        }
+                        set_controlling_tty(slave_fd)?;
                     } else if libc::setpgid(0, 0) < 0 {
                         return Err(std::io::Error::last_os_error());
                     }
@@ -924,9 +928,7 @@ impl ProcessHandle {
                         if libc::setsid() < 0 {
                             return Err(std::io::Error::last_os_error());
                         }
-                        if libc::ioctl(slave_fd, TIOCSCTTY_REQUEST, 0) < 0 {
-                            return Err(std::io::Error::last_os_error());
-                        }
+                        set_controlling_tty(slave_fd)?;
                     } else if libc::setpgid(0, 0) < 0 {
                         return Err(std::io::Error::last_os_error());
                     }
