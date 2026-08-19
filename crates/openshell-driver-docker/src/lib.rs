@@ -490,12 +490,12 @@ impl DockerComputeDriver {
     }
 
     fn capabilities(&self) -> GetCapabilitiesResponse {
-        openshell_core::driver_utils::build_capabilities_response(
-            "docker",
-            &self.config.daemon_version,
-            &self.config.default_image,
-            true,
-        )
+        GetCapabilitiesResponse {
+            driver_name: "docker".to_string(),
+            driver_version: self.config.daemon_version.clone(),
+            default_image: self.config.default_image.clone(),
+            gateway_manages_lifecycle: true,
+        }
     }
 
     #[cfg(test)]

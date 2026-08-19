@@ -127,7 +127,7 @@ cluster-owned and continue running without gateway shutdown or startup
 lifecycle calls.
 
 The driver reports this behavior through
-`GetCapabilities.gateway_managed_lifecycle`. The same declaration works for
+`GetCapabilities.gateway_manages_lifecycle`. The same declaration works for
 in-process and external drivers. Older drivers omit the field and retain the
 conservative operator-managed behavior.
 

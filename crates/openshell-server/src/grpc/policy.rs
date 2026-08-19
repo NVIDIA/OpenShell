@@ -2700,7 +2700,7 @@ async fn handle_update_config_inner(
                     "delete_setting cannot be combined with policy payload",
                 ));
             }
-            let new_policy = req.policy.ok_or_else(|| {
+            let mut new_policy = req.policy.ok_or_else(|| {
                 Status::invalid_argument("policy is required for global policy update")
             })?;
             clear_provider_credentialed_markers(&mut new_policy);

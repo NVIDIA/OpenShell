@@ -1248,11 +1248,14 @@ fn resolve_configured_compute_driver(
 ) -> Result<ConfiguredComputeDriver> {
     let name = openshell_core::config::normalize_compute_driver_name(driver_name)
         .map_err(Error::config)?;
-    let driver_kind = builtin_compute_driver(&name);
+    // An operator-provided endpoint replaces normal construction for the
+    // selected name. The gateway connects to it; it does not provision a
+    // remote implementation for canonical built-in names.
     if driver_startup.endpoint_overrides.contains_key(&name) {
         return Ok(ConfiguredComputeDriver::Remote { name });
     }
 
+    let driver_kind = builtin_compute_driver(&name);
     if let Some(kind) = driver_kind {
         return Ok(ConfiguredComputeDriver::Builtin(kind));
     }

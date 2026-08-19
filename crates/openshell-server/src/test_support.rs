@@ -71,10 +71,7 @@ pub struct FakeComputeDriver {
 
 #[derive(Debug)]
 struct FakeComputeDriverState {
-    driver_name: String,
-    driver_version: String,
-    default_image: String,
-    gateway_managed_lifecycle: bool,
+    capabilities: GetCapabilitiesResponse,
     gateway_listener_requirements: Vec<GatewayListenerRequirement>,
     gateway_listener_requirements_supported: bool,
     sandboxes: HashMap<String, DriverSandbox>,
@@ -93,10 +90,12 @@ impl FakeComputeDriver {
     pub fn new() -> Self {
         Self {
             state: Arc::new(Mutex::new(FakeComputeDriverState {
-                driver_name: "fake-compute-driver".to_string(),
-                driver_version: "test".to_string(),
-                default_image: "openshell/sandbox:test".to_string(),
-                gateway_managed_lifecycle: false,
+                capabilities: GetCapabilitiesResponse {
+                    driver_name: "fake-compute-driver".to_string(),
+                    driver_version: "test".to_string(),
+                    default_image: "openshell/sandbox:test".to_string(),
+                    gateway_manages_lifecycle: false,
+                },
                 gateway_listener_requirements: Vec::new(),
                 gateway_listener_requirements_supported: true,
                 sandboxes: HashMap::new(),
@@ -108,25 +107,25 @@ impl FakeComputeDriver {
 
     #[must_use]
     pub fn with_driver_name(self, driver_name: impl Into<String>) -> Self {
-        self.with_state(|state| state.driver_name = driver_name.into());
+        self.with_state(|state| state.capabilities.driver_name = driver_name.into());
         self
     }
 
     #[must_use]
     pub fn with_driver_version(self, driver_version: impl Into<String>) -> Self {
-        self.with_state(|state| state.driver_version = driver_version.into());
+        self.with_state(|state| state.capabilities.driver_version = driver_version.into());
         self
     }
 
     #[must_use]
     pub fn with_default_image(self, default_image: impl Into<String>) -> Self {
-        self.with_state(|state| state.default_image = default_image.into());
+        self.with_state(|state| state.capabilities.default_image = default_image.into());
         self
     }
 
     #[must_use]
-    pub fn with_gateway_managed_lifecycle(self) -> Self {
-        self.with_state(|state| state.gateway_managed_lifecycle = true);
+    pub fn with_gateway_manages_lifecycle(self) -> Self {
+        self.with_state(|state| state.capabilities.gateway_manages_lifecycle = true);
         self
     }
 
@@ -245,12 +244,7 @@ impl ComputeDriver for FakeComputeDriver {
         self.record_traceparent(request.metadata());
         let response = self.with_state(|state| {
             state.calls.push(FakeComputeDriverCall::GetCapabilities);
-            GetCapabilitiesResponse {
-                driver_name: state.driver_name.clone(),
-                driver_version: state.driver_version.clone(),
-                default_image: state.default_image.clone(),
-                gateway_managed_lifecycle: state.gateway_managed_lifecycle,
-            }
+            state.capabilities.clone()
         });
         Ok(Response::new(response))
     }

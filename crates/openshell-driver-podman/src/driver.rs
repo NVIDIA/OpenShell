@@ -467,12 +467,12 @@ impl PodmanComputeDriver {
 
     /// Report driver capabilities.
     pub fn capabilities(&self) -> Result<GetCapabilitiesResponse, ComputeDriverError> {
-        Ok(openshell_core::driver_utils::build_capabilities_response(
-            "podman",
-            openshell_core::VERSION,
-            &self.config.default_image,
-            true,
-        ))
+        Ok(GetCapabilitiesResponse {
+            driver_name: "podman".to_string(),
+            driver_version: openshell_core::VERSION.to_string(),
+            default_image: self.config.default_image.clone(),
+            gateway_manages_lifecycle: true,
+        })
     }
 
     /// Report the gateway exposure needed by Podman's standard local callback aliases.

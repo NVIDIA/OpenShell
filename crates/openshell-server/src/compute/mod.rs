@@ -278,7 +278,7 @@ pub struct ComputeDriverInfoSnapshot {
     /// Driver-reported implementation version from the startup capability snapshot.
     pub driver_version: String,
     /// Whether the driver asks the gateway to reconcile compute across restarts.
-    pub gateway_managed_lifecycle: bool,
+    pub gateway_manages_lifecycle: bool,
 }
 
 /// Interval between store-vs-backend reconciliation sweeps.
@@ -614,7 +614,7 @@ impl ComputeRuntime {
             name: driver_name.clone(),
             driver_name: capabilities.driver_name,
             driver_version: capabilities.driver_version,
-            gateway_managed_lifecycle: capabilities.gateway_managed_lifecycle,
+            gateway_manages_lifecycle: capabilities.gateway_manages_lifecycle,
         };
         let default_image = capabilities.default_image;
         let gateway_listener_requirements = match driver
@@ -2047,7 +2047,7 @@ impl ComputeRuntime {
     /// An explicit sandbox stop persists `Stopped`; gateway shutdown does not.
     /// Drivers request this sweep through their startup capability snapshot.
     async fn stop_persisted_sandboxes_on_shutdown(&self) -> Result<(), String> {
-        if !self.driver_info.gateway_managed_lifecycle {
+        if !self.driver_info.gateway_manages_lifecycle {
             return Ok(());
         }
 
@@ -2144,7 +2144,7 @@ impl ComputeRuntime {
     /// so the watch loop sees the post-start state on its first poll.
     pub async fn start_persisted_sandboxes(&self) -> Result<(), String> {
         self.recover_persisted_lifecycle_transitions().await?;
-        if !self.driver_info.gateway_managed_lifecycle {
+        if !self.driver_info.gateway_manages_lifecycle {
             return Ok(());
         }
 
@@ -3943,7 +3943,7 @@ impl ComputeDriver for NoopTestDriver {
                 driver_name: "noop-test-driver".to_string(),
                 driver_version: "test".to_string(),
                 default_image: "openshell/sandbox:test".to_string(),
-                gateway_managed_lifecycle: false,
+                gateway_manages_lifecycle: false,
             },
         ))
     }
@@ -4084,7 +4084,7 @@ pub async fn new_test_runtime_with_driver(
             name: driver_name.to_string(),
             driver_name: driver_name.to_string(),
             driver_version: "test".to_string(),
-            gateway_managed_lifecycle: false,
+            gateway_manages_lifecycle: false,
         },
         driver_process: None,
         default_image: "openshell/sandbox:test".to_string(),
@@ -4247,7 +4247,7 @@ mod tests {
                 driver_name: "test-driver".to_string(),
                 driver_version: "test".to_string(),
                 default_image: "openshell/sandbox:test".to_string(),
-                gateway_managed_lifecycle: false,
+                gateway_manages_lifecycle: false,
             }))
         }
 
@@ -4565,7 +4565,7 @@ mod tests {
                 driver_name: "controlled-test-driver".to_string(),
                 driver_version: "test".to_string(),
                 default_image: "openshell/sandbox:test".to_string(),
-                gateway_managed_lifecycle: false,
+                gateway_manages_lifecycle: false,
             }))
         }
 
@@ -4768,7 +4768,7 @@ mod tests {
                 name: driver_name.to_string(),
                 driver_name: driver_name.to_string(),
                 driver_version: "test".to_string(),
-                gateway_managed_lifecycle: false,
+                gateway_manages_lifecycle: false,
             },
             driver_process: None,
             default_image: "openshell/sandbox:test".to_string(),
@@ -4789,7 +4789,7 @@ mod tests {
         driver_name: &str,
     ) -> ComputeRuntime {
         let mut runtime = test_runtime_for_driver(driver, driver_name).await;
-        runtime.driver_info.gateway_managed_lifecycle = true;
+        runtime.driver_info.gateway_manages_lifecycle = true;
         runtime
     }
 
@@ -8422,7 +8422,8 @@ mod tests {
     #[tokio::test]
     async fn startup_sweep_rechecks_intent_after_acquiring_gate() {
         let driver = ControlledDriver::new();
-        let runtime = test_runtime_for_driver(driver.clone(), "docker").await;
+        let runtime =
+            test_runtime_with_gateway_managed_lifecycle(driver.clone(), "arbitrary").await;
         runtime
             .store
             .put_message(&sandbox_record("sb-1", "sandbox", SandboxPhase::Ready))
@@ -8458,7 +8459,8 @@ mod tests {
     #[tokio::test]
     async fn lifecycle_sweeps_page_through_all_persisted_sandboxes() {
         let driver = ControlledDriver::new();
-        let runtime = test_runtime_for_driver(driver.clone(), "docker").await;
+        let runtime =
+            test_runtime_with_gateway_managed_lifecycle(driver.clone(), "arbitrary").await;
         let sandbox_count = LIFECYCLE_SWEEP_PAGE_SIZE + 1;
         for index in 0..sandbox_count {
             runtime
@@ -8790,7 +8792,7 @@ mod tests {
         let driver = FakeComputeDriver::new()
             .with_driver_name("fake-remote-driver")
             .with_default_image("openshell/sandbox:remote")
-            .with_gateway_managed_lifecycle()
+            .with_gateway_manages_lifecycle()
             .with_gateway_listener_requirement(
                 "172.19.0.1:17670",
                 "external driver managed bridge",

@@ -115,9 +115,10 @@ struct RunArgs {
     /// implementing `compute_driver.proto`.
     ///
     /// When set, the socket is associated with the single driver name supplied
-    /// by `--drivers` or `OPENSHELL_DRIVERS`. The endpoint overrides built-in
-    /// construction when the selected name is Docker, Podman, Kubernetes, or
-    /// VM.
+    /// by `--drivers` or `OPENSHELL_DRIVERS` and replaces normal construction
+    /// for that selected name, including canonical built-in names. The gateway
+    /// connects to this operator-provided endpoint; it does not provision the
+    /// remote driver.
     #[arg(long, env = "OPENSHELL_COMPUTE_DRIVER_SOCKET")]
     compute_driver_socket: Option<PathBuf>,
 

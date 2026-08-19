@@ -544,12 +544,12 @@ impl KubernetesComputeDriver {
     }
 
     pub fn capabilities(&self) -> Result<GetCapabilitiesResponse, String> {
-        Ok(openshell_core::driver_utils::build_capabilities_response(
-            "kubernetes",
-            openshell_core::VERSION,
-            &self.config.default_image,
-            false,
-        ))
+        Ok(GetCapabilitiesResponse {
+            driver_name: "kubernetes".to_string(),
+            driver_version: openshell_core::VERSION.to_string(),
+            default_image: self.config.default_image.clone(),
+            gateway_manages_lifecycle: false,
+        })
     }
 
     pub fn operator_allowlist(&self) -> Option<&OperatorNamespaceAllowlist> {

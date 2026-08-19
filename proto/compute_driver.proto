@@ -77,7 +77,7 @@ message GetCapabilitiesResponse {
   string default_image = 3;
   // Whether the gateway should stop running sandbox compute during graceful
   // shutdown and restart the retained running intent on startup.
-  bool gateway_managed_lifecycle = 6;
+  bool gateway_manages_lifecycle = 6;
 }
 
 message GetGatewayListenerRequirementsRequest {}
