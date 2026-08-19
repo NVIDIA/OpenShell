@@ -143,6 +143,19 @@ impl SyntheticPools {
         }
         Ok(Self { ipv4, ipv6 })
     }
+
+    fn capacity(&self, family: AddressFamily) -> usize {
+        let capacity = match family {
+            AddressFamily::Ipv4 => {
+                u128::from(u32::from(*self.ipv4.end())) - u128::from(u32::from(*self.ipv4.start()))
+                    + 1
+            }
+            AddressFamily::Ipv6 => {
+                u128::from(*self.ipv6.end()) - u128::from(*self.ipv6.start()) + 1
+            }
+        };
+        usize::try_from(capacity).unwrap_or(usize::MAX)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -225,7 +238,8 @@ struct StoreState {
 pub(crate) struct ResolvedEndpointStore {
     state: RwLock<StoreState>,
     config: StoreConfig,
-    pool_high_water_emitted: AtomicBool,
+    ipv4_pool_high_water_emitted: AtomicBool,
+    ipv6_pool_high_water_emitted: AtomicBool,
 }
 
 impl ResolvedEndpointStore {
@@ -246,7 +260,8 @@ impl ResolvedEndpointStore {
                 next_mapping_generation: 0,
             }),
             config,
-            pool_high_water_emitted: AtomicBool::new(false),
+            ipv4_pool_high_water_emitted: AtomicBool::new(false),
+            ipv6_pool_high_water_emitted: AtomicBool::new(false),
         }
     }
 
@@ -288,13 +303,27 @@ impl ResolvedEndpointStore {
             let address =
                 allocate_address(&mut state, request.family).ok_or(PublishError::PoolExhausted)?;
             state.allocations.insert(key, address);
-            let allocated = state.allocations.len();
-            if allocated.saturating_mul(5) >= self.config.max_mappings.saturating_mul(4)
-                && !self.pool_high_water_emitted.swap(true, Ordering::Relaxed)
+            let allocated = state
+                .allocations
+                .keys()
+                .filter(|key| key.family == request.family)
+                .count();
+            let capacity = self
+                .config
+                .pools
+                .capacity(request.family)
+                .min(self.config.max_mappings);
+            let emitted = match request.family {
+                AddressFamily::Ipv4 => &self.ipv4_pool_high_water_emitted,
+                AddressFamily::Ipv6 => &self.ipv6_pool_high_water_emitted,
+            };
+            if allocated.saturating_mul(5) >= capacity.saturating_mul(4)
+                && !emitted.swap(true, Ordering::Relaxed)
             {
                 openshell_ocsf::ocsf_emit!(build_pool_high_water_event(
                     allocated,
-                    self.config.max_mappings,
+                    capacity,
+                    request.family,
                 ));
             }
             address
@@ -384,7 +413,11 @@ impl ResolvedEndpointStore {
     }
 }
 
-fn build_pool_high_water_event(allocated: usize, capacity: usize) -> openshell_ocsf::OcsfEvent {
+fn build_pool_high_water_event(
+    allocated: usize,
+    capacity: usize,
+    family: AddressFamily,
+) -> openshell_ocsf::OcsfEvent {
     use openshell_ocsf::{ConfigStateChangeBuilder, SeverityId, StateId, StatusId};
 
     ConfigStateChangeBuilder::new(openshell_ocsf::ctx::ctx())
@@ -393,8 +426,10 @@ fn build_pool_high_water_event(allocated: usize, capacity: usize) -> openshell_o
         .state(StateId::Enabled, "high_water")
         .unmapped("allocated_identities", allocated)
         .unmapped("mapping_capacity", capacity)
+        .unmapped("address_family", family.as_str())
         .message(format!(
-            "Policy DNS synthetic pool reached high water: {allocated}/{capacity} identities allocated"
+            "Policy DNS {} synthetic pool reached high water: {allocated}/{capacity} identities allocated",
+            family.as_str()
         ))
         .build()
 }
@@ -585,11 +620,38 @@ mod tests {
 
     #[test]
     fn pool_high_water_event_reports_capacity_without_reclaiming_addresses() {
-        let event = build_pool_high_water_event(4, 5);
+        let event = build_pool_high_water_event(4, 5, AddressFamily::Ipv4);
         let json = serde_json::to_value(event).unwrap();
         assert_eq!(json["unmapped"]["allocated_identities"], 4);
         assert_eq!(json["unmapped"]["mapping_capacity"], 5);
+        assert_eq!(json["unmapped"]["address_family"], "ipv4");
         assert_eq!(json["state"], "high_water");
+    }
+
+    #[test]
+    fn production_sized_ipv4_pool_reaches_its_own_high_water_mark() {
+        let pools = SyntheticPools::new(
+            Ipv4Addr::new(198, 18, 0, 0)..=Ipv4Addr::new(198, 18, 1, 255),
+            "fd23:6f70:656e::".parse().unwrap()..="fd23:6f70:656e::1ff".parse().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(pools.capacity(AddressFamily::Ipv4), 512);
+        assert_eq!(pools.capacity(AddressFamily::Ipv6), 512);
+        let store = ResolvedEndpointStore::new(StoreConfig::new(pools, 1024).unwrap());
+        let now = Instant::now();
+
+        for index in 0..410 {
+            store
+                .publish(
+                    request(&format!("host-{index}.example"), 1, Duration::from_secs(5)),
+                    1,
+                    now,
+                )
+                .unwrap();
+        }
+
+        assert!(store.ipv4_pool_high_water_emitted.load(Ordering::Relaxed));
+        assert!(!store.ipv6_pool_high_water_emitted.load(Ordering::Relaxed));
     }
 
     #[test]
