@@ -1,7 +1,7 @@
 # RFC 0014 Supplement - Release Qualification
 
-A release candidate is eligible for stable release only after its published
-artifacts pass every required [conformance test](#conformance-tests) and
+A pre-release is eligible for stable publication only after its artifacts pass
+every required [conformance test](#conformance-tests) and
 [upgrade test](#upgrade-tests), its
 [breaking API change review](#breaking-api-change-review), and its
 [security review](#security-review).
@@ -9,13 +9,13 @@ artifacts pass every required [conformance test](#conformance-tests) and
 ## Conformance tests
 
 Conformance tests run for different OpenShell driver, gateway, and host
-configurations. Each workflow installs the candidate in one representative
+configurations. Each workflow installs the pre-release in one representative
 environment and verifies the supported OpenShell behavior for that
 configuration.
 
 For each driver, the suite:
 
-1. Installs the candidate artifacts and starts the gateway and selected runtime.
+1. Installs the pre-release artifacts and starts the gateway and selected runtime.
 2. Verifies gateway health, version reporting, TLS, authentication, and
    authorization.
 3. Creates a sandbox, connects to it, executes commands, and exercises stop,
@@ -59,7 +59,7 @@ The goal is to provide test coverage for each documented driver, topology, and e
 ## Upgrade tests
 
 Upgrade tests run once per supported product installation package. They verify
-that users can move from every supported source release to the candidate
+that users can move from every supported source release to the pre-release
 without reinstalling or losing supported state.
 
 For each installation package, the suite:
@@ -67,7 +67,7 @@ For each installation package, the suite:
 1. Installs the source release and creates representative gateways, sandboxes,
    policies, providers, credentials, and persisted state.
 2. Exercises the source installation to establish a known-good baseline.
-3. Performs the documented in-place upgrade using the published candidate
+3. Performs the documented in-place upgrade using the pre-release
    artifacts.
 4. Verifies schema and state migrations, gateway health, existing resources,
    policy behavior, and new sandbox creation.
@@ -79,16 +79,16 @@ For each installation package, the suite:
 
 | ID | Installation package | Representative environment | Drivers | Upgrade path |
 | --- | --- | --- | --- | --- |
-| U01 | Homebrew formula | macOS on Apple Silicon | MicroVM | Previous stable formula to candidate formula |
-| U02 | DEB through APT | Ubuntu x86_64 | Docker | Previous stable repository package to candidate package |
-| U03 | RPM | Fedora x86_64 | Podman | Previous stable repository package to candidate package |
-| U04 | Snap | Ubuntu x86_64 | Docker | Previous stable revision to candidate revision |
-| U05 | Windows MSI through WinGet | Windows x86_64 | Docker Desktop | Previous stable MSI to candidate MSI |
-| U06 | Helm chart | Kubernetes 1.29 | Kubernetes | Previous stable chart and images to candidate chart and image digests |
+| U01 | Homebrew formula | macOS on Apple Silicon | MicroVM | Previous stable formula to pre-release formula |
+| U02 | DEB through APT | Ubuntu x86_64 | Docker | Previous stable repository package to pre-release package |
+| U03 | RPM | Fedora x86_64 | Podman | Previous stable repository package to pre-release package |
+| U04 | Snap | Ubuntu x86_64 | Docker | Previous stable revision to pre-release revision |
+| U05 | Windows MSI through WinGet | Windows x86_64 | Docker Desktop | Previous stable MSI to pre-release MSI |
+| U06 | Helm chart | Kubernetes 1.29 | Kubernetes | Previous stable chart and images to pre-release chart and image digests |
 
 ## Breaking API change review
 
-Breaking API change review runs once per candidate. It compares the candidate's
+Breaking API change review runs once per pre-release. It compares its
 stable protobuf and public SDK interfaces with the latest stable baseline and
 any additional baseline required by the N-1 maintenance promise. The review:
 
@@ -104,10 +104,10 @@ versioning and migration requirements.
 
 ## Security review
 
-Security review runs once per candidate and will:
+Security review runs once per pre-release and will:
 
 1. Produce vulnerability, dependency, container, and infrastructure scan
-   results for the candidate artifacts.
+   results for the pre-release artifacts.
 2. Run an agent-based security scanner, such as Codex Security, against changes
    since the previous stable release.
 

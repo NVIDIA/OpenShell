@@ -1,7 +1,7 @@
 # RFC 0014 Supplement - Release Version Selection
 
-This supplement defines how OpenShell selects the next release candidate
-version after a stable release during the `0.x` series.
+This supplement defines how OpenShell selects the next pre-release version
+after a stable release during the `0.x` series.
 
 ## Algorithm
 
@@ -13,20 +13,29 @@ version after a stable release during the `0.x` series.
    - `fix:` and `deps:` request a patch release.
    - Other commit types do not request a release by default.
 3. Select the highest requested bump. Minor takes precedence over patch. If no
-   commit requests a release, do not create a release candidate.
-4. Increment the stable version to obtain the candidate base version. From
+   commit requests a release, do not create a pre-release.
+4. Increment the stable version to obtain the pre-release base version. From
    `0.2.0`, a patch becomes `0.2.1` and a minor becomes `0.3.0`.
-5. Publish `-rc.1` for a new base version. If that base already has a release
-   candidate, increment the RC number instead.
-6. Fail the branch check if the candidate base version is not greater than the
+5. Create a `-pre.1` Git tag before building and qualifying a new base version.
+   If that base already has a pre-release, increment the pre-release number.
+6. Treat that base version as fixed for the weekly train. If a patch train has
+   started, stage any later breaking change that requires a minor release for
+   the following week's train.
+7. Fail the branch check if the pre-release base version is not greater than the
    latest stable version.
 
-| Latest stable | Commits since stable | Next candidate |
+| Latest stable | Commits since stable | Next pre-release |
 | --- | --- | --- |
-| `0.2.0` | `fix:` | `0.2.1-rc.1` |
-| `0.2.0` | `feat:` | `0.3.0-rc.1` |
-| `0.2.0` | `feat!:` | `0.3.0-rc.1` |
-| `0.2.0` | Only `docs:` or `chore:` | No candidate |
+| `0.2.0` | `fix:` | `0.2.1-pre.1` |
+| `0.2.0` | `feat:` | `0.3.0-pre.1` |
+| `0.2.0` | `feat!:` | `0.3.0-pre.1` |
+| `0.2.0` | Only `docs:` or `chore:` | No pre-release |
+
+Git tags are the version source of truth; release versions are never committed
+to source. If a commit has multiple tags, select stable over pre-release, then
+use Semantic Version order; use the commit SHA when neither exists. After
+tagging the selected commit with its stable version, delete its `-pre.N` tags.
+Stored pre-release artifacts retain their provenance metadata.
 
 ## Release Please
 
@@ -41,6 +50,6 @@ implement the commit classification and base-version calculation. During
 }
 ```
 
-The release workflow owns the `-rc.N` suffix and stable promotion. An explicit
+The release workflow owns the `-pre.N` suffix and stable publication. An explicit
 `Release-As: x.y.z` footer may override the calculation with maintainer
 approval.

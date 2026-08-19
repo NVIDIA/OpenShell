@@ -12,7 +12,7 @@ topology, and capability is supported. The
 minimal blocking release gate. It contains one conformance workflow per compute
 driver, one Kubernetes conformance workflow per supported gateway topology, and
 one upgrade workflow per installation package, plus one breaking API change
-review and one security review per candidate. Other supported dimensions are
+review and one security review per pre-release. Other supported dimensions are
 exercised as subcases or separate CI controls rather than as a Cartesian product
 of release jobs.
 

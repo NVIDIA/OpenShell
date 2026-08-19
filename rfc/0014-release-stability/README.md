@@ -16,7 +16,8 @@ predictable release cycle for production users and ecosystem developers.
 
 We propose
 
-- Development releases for every commit to `main`, nightly release candidates, and qualified stable releases every Tuesday.
+- Development releases for every commit to `main`, nightly pre-releases, and
+  qualified stable releases every Tuesday.
 - Stable and Experimental API maturity, compatibility, and versioning
   rules, and maintenance for the latest and N-1 minor release lines.
 - A release qualification pipeline covering conformance, upgrades,
@@ -57,22 +58,25 @@ unfinished feature in the stable release track. Development releases have
 passed normal CI, but have not passed release qualification and are not
 intended for production use.
 
-OpenShell builds a release candidate nightly for the next expected stable
-release when `main` has changed and normal CI passes. After `0.1.1`, candidates
-are numbered `0.1.2-rc.1`, `0.1.2-rc.2`, and so on. A release candidate is promoted to a stable release tag as part of the weekly release pipeline once the candidate has passed qualification.
+OpenShell builds a pre-release nightly for the next expected stable release
+when `main` has changed and normal CI passes. After `0.1.1`, pre-releases are
+numbered `0.1.2-pre.1`, `0.1.2-pre.2`, and so on. Features may land between
+pre-releases. The first pre-release locks the version for that weekly release
+train. Once a patch train starts, breaking changes that require a minor release
+are staged for the following week; the train never switches from patch to minor.
 
-Release candidates give the automated release qualification and QA systems an
+Pre-releases give the automated release qualification and QA systems an
 immutable artifact set to evaluate. They are also available to maintainers and
-integration owners who need to validate the prospective stable release. An RC
-uses the same release feature set as stable and may still fail qualification;
-it is not intended for production use. A new RC is built nightly when eligible
-changes are available so failures can be fixed and reevaluated before Tuesday.
+integration owners who need to validate the prospective stable release. A
+pre-release uses the same release feature set as stable and may still fail
+qualification; it is not intended for production use. Building one nightly
+allows failures to be fixed and reevaluated before Tuesday.
 
 | Release | Intended users | Contents and expectations |
 | --- | --- | --- |
 | Development | Feature authors, early adopters, and integration owners testing upcoming functionality | Published for every commit to `main`; enables development features; passes normal CI but not release qualification |
-| Release candidate | Automated qualification, maintainers, and integration owners validating the next stable release | Built nightly from eligible `main`; uses the stable feature set; immutable but not yet qualified for production |
-| Stable | Production users and downstream integrations that require the published compatibility and support contract | Published Tuesday by promoting an RC that passed every blocking qualification suite |
+| Pre-release | Automated qualification, maintainers, and integration owners validating the next stable release | Built nightly from eligible `main`; uses the stable feature set; immutable but not yet qualified for production |
+| Stable | Production users and downstream integrations that require the published compatibility and support contract | Published Tuesday from a pre-release that passed every blocking qualification suite |
 
 ### Project version and compatibility contract
 
@@ -87,7 +91,7 @@ the `0.x` series:
 
 The [release version selection supplement](release-version-selection.md)
 defines how Conventional Commits select the next patch or minor release
-candidate.
+pre-release.
 
 ### API and feature maturity
 
@@ -102,7 +106,7 @@ module, namespace, or symbol naming to expose the same designation.
 | Experimental | `v1experimental` | Language-specific Experimental package, module, namespace, or symbol | May change or be removed in a patch release without notice |
 
 Every API and feature is Stable or Experimental, regardless of whether it
-appears in stable, release candidate, or development artifacts. Each SDK must
+appears in stable, pre-release, or development artifacts. Each SDK must
 document its language-specific naming convention, and Experimental interfaces
 must not appear to be Stable.
 
@@ -112,7 +116,7 @@ instead of renaming the Experimental package in place.
 
 Unreleased features use named compile-time flags such as `unstable-<feature>`,
 collected under a `dev` compilation flag. Development releases enable them; stable
-releases and release candidates exclude them from service binaries, the CLI,
+releases and pre-releases exclude them from service binaries, the CLI,
 configuration, and documentation. For now, SDK distributions may include their
 generated types and client methods when the SDK naming convention communicates
 their maturity.
@@ -125,49 +129,47 @@ SDK, CLI, configuration, policy, Helm, and state interfaces. A breaking
 Experimental API change may ship in a patch release without notice when it does
 not break a Stable interface.
 
-Breaking-change detection runs during code review and again during release
-candidate qualification. Stable protobuf packages use Buf's `FILE` rules
+Breaking-change detection runs during code review and again during pre-release
+qualification. Stable protobuf packages use Buf's `FILE` rules
 against the latest stable baseline and any additional supported baseline needed
 for the N-1 maintenance promise. Language-specific API checks or agent review
 skills cover the public SDKs.
 
-The following examples illustrate how these rules affect a release candidate:
+The following examples illustrate how these rules affect a pre-release:
 
 | Example | Concrete change | Release treatment |
 | --- | --- | --- |
-| Breaking Stable Protobuf contract | `string policy = 7` to `PolicyReference policy = 7` | Blocks a patch RC and requires a minor OpenShell release. |
+| Breaking Stable Protobuf contract | `string policy = 7` to `PolicyReference policy = 7` | Blocks a patch release and requires a minor OpenShell release. |
 | Breaking Experimental Python SDK method | `create_sandbox(timeout=30)` to `create_sandbox(deadline=...)` | May ship in a patch release without notice. |
-| Breaking stable policy document | `endpoints:` to `destinations:` | Blocks a patch RC unless both fields remain supported. |
+| Breaking stable policy document | `endpoints:` to `destinations:` | Blocks a patch release unless both fields remain supported. |
 | Breaking stable CLI contract | `--policy policy.yaml` to `--policy-file policy.yaml` | Requires retaining the old flag as an alias or shipping a minor release. |
 
-### Release candidate qualification and stable release promotion
+### Pre-release qualification and stable publication
 
-The release system separates candidate creation, qualification, and stable
+The release system separates pre-release creation, qualification, and stable
 publication:
 
 ```mermaid
 flowchart LR
     A["Commit to main"] --> B["Dev release<br/>dev features enabled"]
     A --> C["Normal CI passes"]
-    C --> D["Nightly RC build<br/>release feature set"]
-    D --> E["RC qualification"]
-    E -->|"pass"| F["Eligible Tuesday candidate"]
+    C --> D["Tag and build nightly pre-release<br/>release feature set"]
+    D --> E["Pre-release qualification"]
+    E -->|"pass"| F["Eligible Tuesday pre-release"]
     E -->|"fail"| G["No stable release"]
-    F --> H["Promote exact RC artifacts"]
+    F --> H["Publish stable artifacts"]
     H --> I["Final artifact checks"]
     I -->|"pass"| J["Create tag and publish"]
     I -->|"fail"| G
 ```
 
-Every release candidate produces a manifest containing its version,
-full source commit, build inputs, artifact names and digests, SBOM and provenance
-references, and qualification results. Qualification installs and exercises the
-candidate artifacts wherever practical rather than substituting a source build.
-The candidate manifest carries the RC identifier so promotable binaries and
-content-addressable artifacts can be built with the prospective stable version.
-Once qualification begins, an RC is immutable: any source, dependency, build
-input, or artifact change creates a new RC. Stable publication adds the stable
-release references to the qualified artifacts without recompiling them.
+Every pre-release is tagged before qualification and produces a manifest with
+its version, source commit, build inputs, artifact digests, SBOM, provenance,
+and qualification results. Qualification exercises those artifacts rather than
+a substitute source build. Pre-releases are stored in artifact storage instead
+of published as GitHub Releases, following the
+[Bazel rolling release model](https://bazel.build/release/rolling). Any change
+creates a new pre-release.
 
 Release qualification consists of four suites defined in the
 [release qualification supplement](release-qualification.md):
@@ -177,9 +179,9 @@ Release qualification consists of four suites defined in the
 - **Upgrade** runs once per supported installation package and verifies its
   upgrade path, state migration, post-upgrade health, and rollback where
   promised.
-- **Breaking API change review** runs once per candidate and compares stable
+- **Breaking API change review** runs once per pre-release and compares stable
   protobuf and SDK interfaces with every applicable compatibility baseline.
-- **Security review** runs once per candidate and verifies security scan
+- **Security review** runs once per pre-release and verifies security scan
   results, reviews changes to security-sensitive boundaries, and confirms that
   every finding has the required disposition.
 
@@ -187,7 +189,8 @@ The initial release targets are defined in the [build matrix](build-matrix.md),
 and blocking coverage is defined in the
 [release qualification supplement](release-qualification.md).
 
-The weekly release selects the newest eligible release candidate and promotes it to the next stable release.
+The weekly release tags the newest eligible pre-release commit with the next
+stable version and publishes the stable artifacts.
 
 ### Maintenance and backports
 
@@ -209,14 +212,14 @@ the next Tuesday release.
 
 ## Implementation plan
 
-1. **Keep per-commit dev releases and build 0.1.0 RCs nightly.** Build every
-   commit to `main` with all development features, and publish sequential
-   `0.1.0-rc.N` candidates with the release feature set leading to 0.1.0.
+1. **Keep per-commit dev releases and build 0.1.0 pre-releases nightly.** Build
+   every commit to `main` with all development features, and publish sequential
+   `0.1.0-pre.N` artifacts with the release feature set leading to 0.1.0.
 2. **Make the necessary breaking API changes.** Use the pre-0.1.0 window to
    finalize Stable interfaces, move evolving APIs to Experimental packages,
    and establish the compatibility baseline.
 3. **Build qualification tests and release machinery.** Automate compatibility
    detection, conformance, upgrade, breaking API change review, security
    qualification, artifact validation, and release publication gates.
-4. **Release 0.1.0.** Promote a qualified release candidate, publish the stable
+4. **Release 0.1.0.** Select a qualified pre-release, publish the stable
    artifacts and support guidance, and begin the weekly release cadence.
