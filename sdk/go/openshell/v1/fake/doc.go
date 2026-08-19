@@ -22,12 +22,12 @@
 //	    ctx := context.Background()
 //
 //	    // Create a sandbox — starts in Provisioning phase
-//	    sb, err := client.Sandboxes().Create(ctx, "my-sandbox", &v1.SandboxSpec{}, nil)
+//	    sb, err := client.Sandboxes().Create(ctx, "default", "my-sandbox", nil, nil, nil, nil)
 //	    require.NoError(t, err)
 //	    assert.Equal(t, types.SandboxProvisioning, sb.Status.Phase)
 //
 //	    // Wait until ready — transitions synchronously in the fake
-//	    sb, err = client.Sandboxes().WaitReady(ctx, "my-sandbox")
+//	    sb, err = client.Sandboxes().WaitReady(ctx, "default", "my-sandbox")
 //	    require.NoError(t, err)
 //	    assert.Equal(t, types.SandboxReady, sb.Status.Phase)
 //

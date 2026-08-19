@@ -29,6 +29,10 @@ const (
 	OpenShell_CreateSandbox_FullMethodName                 = "/openshell.v1.OpenShell/CreateSandbox"
 	OpenShell_GetSandbox_FullMethodName                    = "/openshell.v1.OpenShell/GetSandbox"
 	OpenShell_ListSandboxes_FullMethodName                 = "/openshell.v1.OpenShell/ListSandboxes"
+	OpenShell_CreateSandboxTemplate_FullMethodName         = "/openshell.v1.OpenShell/CreateSandboxTemplate"
+	OpenShell_GetSandboxTemplate_FullMethodName            = "/openshell.v1.OpenShell/GetSandboxTemplate"
+	OpenShell_ListSandboxTemplates_FullMethodName          = "/openshell.v1.OpenShell/ListSandboxTemplates"
+	OpenShell_DeleteSandboxTemplate_FullMethodName         = "/openshell.v1.OpenShell/DeleteSandboxTemplate"
 	OpenShell_ListSandboxProviders_FullMethodName          = "/openshell.v1.OpenShell/ListSandboxProviders"
 	OpenShell_AttachSandboxProvider_FullMethodName         = "/openshell.v1.OpenShell/AttachSandboxProvider"
 	OpenShell_DetachSandboxProvider_FullMethodName         = "/openshell.v1.OpenShell/DetachSandboxProvider"
@@ -81,6 +85,7 @@ const (
 	OpenShell_ClearDraftChunks_FullMethodName              = "/openshell.v1.OpenShell/ClearDraftChunks"
 	OpenShell_GetDraftHistory_FullMethodName               = "/openshell.v1.OpenShell/GetDraftHistory"
 	OpenShell_IssueSandboxToken_FullMethodName             = "/openshell.v1.OpenShell/IssueSandboxToken"
+	OpenShell_RegisterSupervisor_FullMethodName            = "/openshell.v1.OpenShell/RegisterSupervisor"
 	OpenShell_RefreshSandboxToken_FullMethodName           = "/openshell.v1.OpenShell/RefreshSandboxToken"
 	OpenShell_CreateWorkspace_FullMethodName               = "/openshell.v1.OpenShell/CreateWorkspace"
 	OpenShell_GetWorkspace_FullMethodName                  = "/openshell.v1.OpenShell/GetWorkspace"
@@ -116,6 +121,14 @@ type OpenShellClient interface {
 	GetSandbox(ctx context.Context, in *GetSandboxRequest, opts ...grpc.CallOption) (*SandboxResponse, error)
 	// List sandboxes.
 	ListSandboxes(ctx context.Context, in *ListSandboxesRequest, opts ...grpc.CallOption) (*ListSandboxesResponse, error)
+	// Create a reusable sandbox workload template.
+	CreateSandboxTemplate(ctx context.Context, in *CreateSandboxTemplateRequest, opts ...grpc.CallOption) (*SandboxTemplateResponse, error)
+	// Fetch a sandbox workload template by name.
+	GetSandboxTemplate(ctx context.Context, in *GetSandboxTemplateRequest, opts ...grpc.CallOption) (*SandboxTemplateResponse, error)
+	// List sandbox workload templates.
+	ListSandboxTemplates(ctx context.Context, in *ListSandboxTemplatesRequest, opts ...grpc.CallOption) (*ListSandboxTemplatesResponse, error)
+	// Delete a sandbox workload template by name.
+	DeleteSandboxTemplate(ctx context.Context, in *DeleteSandboxTemplateRequest, opts ...grpc.CallOption) (*DeleteSandboxTemplateResponse, error)
 	// List provider records attached to a sandbox.
 	ListSandboxProviders(ctx context.Context, in *ListSandboxProvidersRequest, opts ...grpc.CallOption) (*ListSandboxProvidersResponse, error)
 	// Attach a provider record to an existing sandbox.
@@ -254,6 +267,12 @@ type OpenShellClient interface {
 	// drivers receive the gateway JWT directly from the create-sandbox flow
 	// and never call this RPC.
 	IssueSandboxToken(ctx context.Context, in *IssueSandboxTokenRequest, opts ...grpc.CallOption) (*IssueSandboxTokenResponse, error)
+	// Register a supervisor instance and wait for gateway activation.
+	//
+	// The initial trial activates already-bound supervisor instances immediately. Later
+	// warm-pool stages keep this stream pending until a SandboxClaim adopts the
+	// registered instance.
+	RegisterSupervisor(ctx context.Context, in *RegisterSupervisorRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[SupervisorActivationMessage], error)
 	// Renew the calling sandbox's gateway JWT. Older tokens remain valid
 	// until their own expiry; deployments should keep token TTLs short to
 	// bound replay exposure. The supervisor calls this from a background
@@ -339,6 +358,46 @@ func (c *openShellClient) ListSandboxes(ctx context.Context, in *ListSandboxesRe
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(ListSandboxesResponse)
 	err := c.cc.Invoke(ctx, OpenShell_ListSandboxes_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *openShellClient) CreateSandboxTemplate(ctx context.Context, in *CreateSandboxTemplateRequest, opts ...grpc.CallOption) (*SandboxTemplateResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(SandboxTemplateResponse)
+	err := c.cc.Invoke(ctx, OpenShell_CreateSandboxTemplate_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *openShellClient) GetSandboxTemplate(ctx context.Context, in *GetSandboxTemplateRequest, opts ...grpc.CallOption) (*SandboxTemplateResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(SandboxTemplateResponse)
+	err := c.cc.Invoke(ctx, OpenShell_GetSandboxTemplate_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *openShellClient) ListSandboxTemplates(ctx context.Context, in *ListSandboxTemplatesRequest, opts ...grpc.CallOption) (*ListSandboxTemplatesResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ListSandboxTemplatesResponse)
+	err := c.cc.Invoke(ctx, OpenShell_ListSandboxTemplates_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *openShellClient) DeleteSandboxTemplate(ctx context.Context, in *DeleteSandboxTemplateRequest, opts ...grpc.CallOption) (*DeleteSandboxTemplateResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(DeleteSandboxTemplateResponse)
+	err := c.cc.Invoke(ctx, OpenShell_DeleteSandboxTemplate_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -898,6 +957,25 @@ func (c *openShellClient) IssueSandboxToken(ctx context.Context, in *IssueSandbo
 	return out, nil
 }
 
+func (c *openShellClient) RegisterSupervisor(ctx context.Context, in *RegisterSupervisorRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[SupervisorActivationMessage], error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	stream, err := c.cc.NewStream(ctx, &OpenShell_ServiceDesc.Streams[7], OpenShell_RegisterSupervisor_FullMethodName, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &grpc.GenericClientStream[RegisterSupervisorRequest, SupervisorActivationMessage]{ClientStream: stream}
+	if err := x.ClientStream.SendMsg(in); err != nil {
+		return nil, err
+	}
+	if err := x.ClientStream.CloseSend(); err != nil {
+		return nil, err
+	}
+	return x, nil
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type OpenShell_RegisterSupervisorClient = grpc.ServerStreamingClient[SupervisorActivationMessage]
+
 func (c *openShellClient) RefreshSandboxToken(ctx context.Context, in *RefreshSandboxTokenRequest, opts ...grpc.CallOption) (*RefreshSandboxTokenResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(RefreshSandboxTokenResponse)
@@ -1003,6 +1081,14 @@ type OpenShellServer interface {
 	GetSandbox(context.Context, *GetSandboxRequest) (*SandboxResponse, error)
 	// List sandboxes.
 	ListSandboxes(context.Context, *ListSandboxesRequest) (*ListSandboxesResponse, error)
+	// Create a reusable sandbox workload template.
+	CreateSandboxTemplate(context.Context, *CreateSandboxTemplateRequest) (*SandboxTemplateResponse, error)
+	// Fetch a sandbox workload template by name.
+	GetSandboxTemplate(context.Context, *GetSandboxTemplateRequest) (*SandboxTemplateResponse, error)
+	// List sandbox workload templates.
+	ListSandboxTemplates(context.Context, *ListSandboxTemplatesRequest) (*ListSandboxTemplatesResponse, error)
+	// Delete a sandbox workload template by name.
+	DeleteSandboxTemplate(context.Context, *DeleteSandboxTemplateRequest) (*DeleteSandboxTemplateResponse, error)
 	// List provider records attached to a sandbox.
 	ListSandboxProviders(context.Context, *ListSandboxProvidersRequest) (*ListSandboxProvidersResponse, error)
 	// Attach a provider record to an existing sandbox.
@@ -1141,6 +1227,12 @@ type OpenShellServer interface {
 	// drivers receive the gateway JWT directly from the create-sandbox flow
 	// and never call this RPC.
 	IssueSandboxToken(context.Context, *IssueSandboxTokenRequest) (*IssueSandboxTokenResponse, error)
+	// Register a supervisor instance and wait for gateway activation.
+	//
+	// The initial trial activates already-bound supervisor instances immediately. Later
+	// warm-pool stages keep this stream pending until a SandboxClaim adopts the
+	// registered instance.
+	RegisterSupervisor(*RegisterSupervisorRequest, grpc.ServerStreamingServer[SupervisorActivationMessage]) error
 	// Renew the calling sandbox's gateway JWT. Older tokens remain valid
 	// until their own expiry; deployments should keep token TTLs short to
 	// bound replay exposure. The supervisor calls this from a background
@@ -1189,6 +1281,18 @@ func (UnimplementedOpenShellServer) GetSandbox(context.Context, *GetSandboxReque
 }
 func (UnimplementedOpenShellServer) ListSandboxes(context.Context, *ListSandboxesRequest) (*ListSandboxesResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ListSandboxes not implemented")
+}
+func (UnimplementedOpenShellServer) CreateSandboxTemplate(context.Context, *CreateSandboxTemplateRequest) (*SandboxTemplateResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method CreateSandboxTemplate not implemented")
+}
+func (UnimplementedOpenShellServer) GetSandboxTemplate(context.Context, *GetSandboxTemplateRequest) (*SandboxTemplateResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetSandboxTemplate not implemented")
+}
+func (UnimplementedOpenShellServer) ListSandboxTemplates(context.Context, *ListSandboxTemplatesRequest) (*ListSandboxTemplatesResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ListSandboxTemplates not implemented")
+}
+func (UnimplementedOpenShellServer) DeleteSandboxTemplate(context.Context, *DeleteSandboxTemplateRequest) (*DeleteSandboxTemplateResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method DeleteSandboxTemplate not implemented")
 }
 func (UnimplementedOpenShellServer) ListSandboxProviders(context.Context, *ListSandboxProvidersRequest) (*ListSandboxProvidersResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ListSandboxProviders not implemented")
@@ -1346,6 +1450,9 @@ func (UnimplementedOpenShellServer) GetDraftHistory(context.Context, *GetDraftHi
 func (UnimplementedOpenShellServer) IssueSandboxToken(context.Context, *IssueSandboxTokenRequest) (*IssueSandboxTokenResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method IssueSandboxToken not implemented")
 }
+func (UnimplementedOpenShellServer) RegisterSupervisor(*RegisterSupervisorRequest, grpc.ServerStreamingServer[SupervisorActivationMessage]) error {
+	return status.Error(codes.Unimplemented, "method RegisterSupervisor not implemented")
+}
 func (UnimplementedOpenShellServer) RefreshSandboxToken(context.Context, *RefreshSandboxTokenRequest) (*RefreshSandboxTokenResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method RefreshSandboxToken not implemented")
 }
@@ -1495,6 +1602,78 @@ func _OpenShell_ListSandboxes_Handler(srv interface{}, ctx context.Context, dec 
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(OpenShellServer).ListSandboxes(ctx, req.(*ListSandboxesRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _OpenShell_CreateSandboxTemplate_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(CreateSandboxTemplateRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(OpenShellServer).CreateSandboxTemplate(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: OpenShell_CreateSandboxTemplate_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(OpenShellServer).CreateSandboxTemplate(ctx, req.(*CreateSandboxTemplateRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _OpenShell_GetSandboxTemplate_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetSandboxTemplateRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(OpenShellServer).GetSandboxTemplate(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: OpenShell_GetSandboxTemplate_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(OpenShellServer).GetSandboxTemplate(ctx, req.(*GetSandboxTemplateRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _OpenShell_ListSandboxTemplates_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ListSandboxTemplatesRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(OpenShellServer).ListSandboxTemplates(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: OpenShell_ListSandboxTemplates_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(OpenShellServer).ListSandboxTemplates(ctx, req.(*ListSandboxTemplatesRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _OpenShell_DeleteSandboxTemplate_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(DeleteSandboxTemplateRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(OpenShellServer).DeleteSandboxTemplate(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: OpenShell_DeleteSandboxTemplate_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(OpenShellServer).DeleteSandboxTemplate(ctx, req.(*DeleteSandboxTemplateRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -2366,6 +2545,17 @@ func _OpenShell_IssueSandboxToken_Handler(srv interface{}, ctx context.Context, 
 	return interceptor(ctx, in, info, handler)
 }
 
+func _OpenShell_RegisterSupervisor_Handler(srv interface{}, stream grpc.ServerStream) error {
+	m := new(RegisterSupervisorRequest)
+	if err := stream.RecvMsg(m); err != nil {
+		return err
+	}
+	return srv.(OpenShellServer).RegisterSupervisor(m, &grpc.GenericServerStream[RegisterSupervisorRequest, SupervisorActivationMessage]{ServerStream: stream})
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type OpenShell_RegisterSupervisorServer = grpc.ServerStreamingServer[SupervisorActivationMessage]
+
 func _OpenShell_RefreshSandboxToken_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(RefreshSandboxTokenRequest)
 	if err := dec(in); err != nil {
@@ -2540,6 +2730,22 @@ var OpenShell_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "ListSandboxes",
 			Handler:    _OpenShell_ListSandboxes_Handler,
+		},
+		{
+			MethodName: "CreateSandboxTemplate",
+			Handler:    _OpenShell_CreateSandboxTemplate_Handler,
+		},
+		{
+			MethodName: "GetSandboxTemplate",
+			Handler:    _OpenShell_GetSandboxTemplate_Handler,
+		},
+		{
+			MethodName: "ListSandboxTemplates",
+			Handler:    _OpenShell_ListSandboxTemplates_Handler,
+		},
+		{
+			MethodName: "DeleteSandboxTemplate",
+			Handler:    _OpenShell_DeleteSandboxTemplate_Handler,
 		},
 		{
 			MethodName: "ListSandboxProviders",
@@ -2792,6 +2998,11 @@ var OpenShell_ServiceDesc = grpc.ServiceDesc{
 		{
 			StreamName:    "WatchSandbox",
 			Handler:       _OpenShell_WatchSandbox_Handler,
+			ServerStreams: true,
+		},
+		{
+			StreamName:    "RegisterSupervisor",
+			Handler:       _OpenShell_RegisterSupervisor_Handler,
 			ServerStreams: true,
 		},
 	},

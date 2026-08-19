@@ -114,6 +114,10 @@ pub async fn run_process(
     // tasks. By this point the orchestrator has finished privileged startup
     // helpers (network namespace setup, nftables probes via run_networking),
     // and the SSH listener and entrypoint child have not been exposed yet.
+    #[cfg(target_os = "linux")]
+    if enforcement_mode.uses_privileged_process_setup() {
+        crate::process::prepare_supervisor_identity_mount_namespace_from_env()?;
+    }
     crate::sandbox::apply_supervisor_startup_hardening()?;
 
     // Spawn the bypass detection monitor. It tails dmesg for nftables LOG

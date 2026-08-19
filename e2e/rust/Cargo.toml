@@ -132,6 +132,11 @@ path = "tests/host_gateway_alias.rs"
 required-features = ["e2e-host-gateway"]
 
 [[test]]
+name = "kubernetes_warm_pool"
+path = "tests/kubernetes_warm_pool.rs"
+required-features = ["e2e-kubernetes"]
+
+[[test]]
 name = "forward_proxy_l7_bypass"
 path = "tests/forward_proxy_l7_bypass.rs"
 required-features = ["e2e-host-gateway"]

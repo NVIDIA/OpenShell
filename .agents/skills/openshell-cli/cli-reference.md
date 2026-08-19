@@ -209,13 +209,13 @@ Create a sandbox through the selected gateway, wait for readiness, then connect,
 | Flag | Description |
 |------|-------------|
 | `--name <NAME>` | Sandbox name (auto-generated if omitted) |
+| `--template <NAME>` | Create from a named sandbox template |
 | `--from <SOURCE>` | Community name, Dockerfile path, directory, or image reference (BYOC) |
 | `--no-keep` | Delete the sandbox after the initial command or shell exits |
 | `--editor vscode|cursor` | Launch a remote editor and keep the sandbox alive |
 | `--gpu [COUNT]` | Request the driver's default GPU selection or a specific count |
 | `--cpu <QUANTITY>` | CPU limit (for example: `500m`, `1`, `2.5`) |
 | `--memory <QUANTITY>` | Memory limit (for example: `512Mi`, `4Gi`, `8G`) |
-| `--driver-config-json <JSON>` | Experimental driver-keyed configuration object |
 | `--provider <NAME>` | Provider to attach (repeatable) |
 | `--policy <PATH>` | Custom policy YAML; overrides the built-in default and `OPENSHELL_SANDBOX_POLICY` |
 | `--forward <[BIND:]PORT>` | Start a local port forward and keep the sandbox alive |
@@ -228,6 +228,53 @@ Create a sandbox through the selected gateway, wait for readiness, then connect,
 | `--upload <PATH>[:<DEST>]` | Upload local files to the working directory or an explicit destination (repeatable) |
 | `--no-git-ignore` | Disable `.gitignore` filtering for `--upload` |
 | `[-- COMMAND...]` | Initial command (defaults to an interactive shell) |
+
+Direct sandbox create rejects `--driver-config-json`; use `sandbox template
+create --driver-config-json` and then `sandbox create --template <NAME>`.
+`--template` conflicts with inline workload flags: `--from`, `--gpu`, `--cpu`,
+`--memory`, `--env`, and `--driver-config-json`.
+
+### `openshell sandbox template create NAME [OPTIONS]`
+
+Create a reusable sandbox template. Templates hold workload defaults and
+driver-specific configuration for later `sandbox create --template NAME` calls.
+
+| Flag | Description |
+|------|-------------|
+| `--from <SOURCE>` | Image reference or community sandbox name; local Dockerfiles/directories are not supported for templates |
+| `--env <KEY=VALUE>` | Set a non-secret template workload environment variable (repeatable) |
+| `--cpu <QUANTITY>` | CPU limit for sandboxes created from the template |
+| `--memory <QUANTITY>` | Memory limit for sandboxes created from the template |
+| `--gpu [COUNT]` | Request GPU resources for sandboxes created from the template |
+| `--driver-config-json <JSON>` | Driver-keyed configuration object owned by the template |
+| `--ready-within <DURATION>` | Desired time for template-created sandboxes to become ready |
+| `--max-burst <N>` | Maximum expected startup burst for this template |
+| `--label <KEY=VALUE>` | Attach a template label (repeatable) |
+| `--annotation <KEY=VALUE>` | Attach a template annotation (repeatable) |
+| `--output table|yaml|json` | Output format |
+
+### `openshell sandbox template get NAME`
+
+Show a sandbox template.
+
+| Flag | Description |
+|------|-------------|
+| `--output table|yaml|json` | Output format |
+
+### `openshell sandbox template list`
+
+List sandbox templates.
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--limit <N>` | 100 | Maximum templates |
+| `--offset <N>` | 0 | Pagination offset |
+| `--all-workspaces` | false | List templates across all workspaces; requires platform-admin permissions |
+| `--output table|yaml|json` | `table` | Output format |
+
+### `openshell sandbox template delete NAME...`
+
+Delete one or more sandbox templates by name.
 
 ### `openshell sandbox get [name]`
 

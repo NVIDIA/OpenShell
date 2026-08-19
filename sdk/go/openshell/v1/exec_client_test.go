@@ -34,7 +34,10 @@ func (r *stubSandboxResolver) Get(_ context.Context, _, name string) (*Sandbox, 
 	return &Sandbox{ID: "sb-" + name, Name: name}, nil
 }
 
-func (r *stubSandboxResolver) Create(context.Context, string, string, *SandboxSpec, map[string]string, ...CreateOptions) (*Sandbox, error) {
+func (r *stubSandboxResolver) Create(context.Context, string, string, *SandboxWorkloadConfig, *SandboxPolicy, []string, map[string]string, ...CreateOptions) (*Sandbox, error) {
+	panic("not implemented")
+}
+func (r *stubSandboxResolver) CreateFromTemplate(context.Context, string, string, string, *SandboxPolicy, []string, map[string]string, ...CreateOptions) (*Sandbox, error) {
 	panic("not implemented")
 }
 func (r *stubSandboxResolver) List(context.Context, string, ...ListOptions) ([]*Sandbox, error) {

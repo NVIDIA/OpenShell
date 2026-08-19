@@ -98,6 +98,34 @@ impl OpenShell for TestOpenShell {
         ))
     }
 
+    async fn create_sandbox_template(
+        &self,
+        _: tonic::Request<openshell_core::proto::CreateSandboxTemplateRequest>,
+    ) -> Result<Response<openshell_core::proto::SandboxTemplateResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn get_sandbox_template(
+        &self,
+        _: tonic::Request<openshell_core::proto::GetSandboxTemplateRequest>,
+    ) -> Result<Response<openshell_core::proto::SandboxTemplateResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn list_sandbox_templates(
+        &self,
+        _: tonic::Request<openshell_core::proto::ListSandboxTemplatesRequest>,
+    ) -> Result<Response<openshell_core::proto::ListSandboxTemplatesResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn delete_sandbox_template(
+        &self,
+        _: tonic::Request<openshell_core::proto::DeleteSandboxTemplateRequest>,
+    ) -> Result<Response<openshell_core::proto::DeleteSandboxTemplateResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
     async fn list_sandbox_providers(
         &self,
         _request: tonic::Request<openshell_core::proto::ListSandboxProvidersRequest>,
@@ -467,6 +495,17 @@ impl OpenShell for TestOpenShell {
         &self,
         _request: tonic::Request<openshell_core::proto::IssueSandboxTokenRequest>,
     ) -> Result<Response<openshell_core::proto::IssueSandboxTokenResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    type RegisterSupervisorStream = tokio_stream::wrappers::ReceiverStream<
+        Result<openshell_core::proto::SupervisorActivationMessage, Status>,
+    >;
+
+    async fn register_supervisor(
+        &self,
+        _request: tonic::Request<openshell_core::proto::RegisterSupervisorRequest>,
+    ) -> Result<Response<Self::RegisterSupervisorStream>, Status> {
         Err(Status::unimplemented("not implemented in test"))
     }
 

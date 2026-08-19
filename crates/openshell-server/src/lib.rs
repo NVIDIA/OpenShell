@@ -46,6 +46,7 @@ mod sandbox_index;
 mod sandbox_watch;
 mod service_routing;
 mod ssh_sessions;
+mod supervisor_pod_registration;
 pub mod supervisor_session;
 mod telemetry;
 #[cfg(any(test, feature = "test-support"))]
@@ -55,6 +56,7 @@ mod tls;
 pub(crate) mod tls_test_utils;
 pub mod tracing_bus;
 mod tracing_setup;
+pub(crate) mod warm_pod_activation;
 mod ws_tunnel;
 
 use metrics_exporter_prometheus::PrometheusBuilder;
@@ -300,11 +302,16 @@ pub struct ServerState {
     /// Validated built-in and operator-registered supervisor middleware.
     pub middleware_registry: Arc<MiddlewareRegistry>,
 
+    /// Pending supervisor registrations awaiting warm-pool
+    /// activation.
+    pub(crate) supervisor_pod_registrations:
+        Arc<supervisor_pod_registration::SupervisorPodRegistrationRegistry>,
+
     /// OIDC JWKS cache for JWT validation. `None` when OIDC is not configured.
     pub oidc_cache: Option<Arc<auth::oidc::JwksCache>>,
 
     /// Gateway-minted sandbox JWT issuer. `None` when `config.gateway_jwt`
-    /// is not configured; in that mode `IssueSandboxToken` returns
+    /// is not configured; in that mode Kubernetes bootstrap RPCs return
     /// `Status::unavailable`. Populated at startup from the on-disk key
     /// material that `certgen` writes.
     pub sandbox_jwt_issuer: Option<Arc<auth::sandbox_jwt::SandboxJwtIssuer>>,
@@ -313,11 +320,6 @@ pub struct ServerState {
     /// inbound request. Always set when `sandbox_jwt_issuer` is, so callers
     /// presenting a freshly minted token are recognized.
     pub sandbox_jwt_authenticator: Option<Arc<auth::sandbox_jwt::SandboxJwtAuthenticator>>,
-
-    /// Optional K8s `ServiceAccount` authenticator that backs the
-    /// `IssueSandboxToken` bootstrap path. Only present when the gateway
-    /// runs in-cluster.
-    pub k8s_sa_authenticator: Option<Arc<auth::k8s_sa::K8sServiceAccountAuthenticator>>,
 
     /// Gateway-wide gRPC request rate limiter shared by every multiplex path.
     pub(crate) grpc_rate_limiter: Option<multiplex::GrpcRateLimiter>,
@@ -415,10 +417,12 @@ impl ServerState {
             supervisor_sessions,
             extension_mint_limiter: auth::extension_mint_limit::ExtensionMintLimiter::default(),
             middleware_registry: Arc::new(MiddlewareRegistry::default()),
+            supervisor_pod_registrations: Arc::new(
+                supervisor_pod_registration::SupervisorPodRegistrationRegistry::new(),
+            ),
             oidc_cache,
             sandbox_jwt_issuer: None,
             sandbox_jwt_authenticator: None,
-            k8s_sa_authenticator: None,
             grpc_rate_limiter,
             gateway_interceptors: None,
             provider_profile_sources:
@@ -590,7 +594,7 @@ pub(crate) async fn run_server(
         gateway_tls_enabled: config.tls.is_some(),
         endpoint_overrides: &config.compute_driver_endpoints,
     };
-    let (compute, operator_allowlist) = build_compute_runtime(
+    let (compute, _operator_allowlist) = build_compute_runtime(
         &config,
         driver_startup,
         store.clone(),
@@ -659,61 +663,6 @@ pub(crate) async fn run_server(
         spawn_gateway_extension_token_refresh(issuer, gateway_extension_credentials);
     }
 
-    // K8s ServiceAccount bootstrap authenticator. Only constructed when
-    // the gateway is running in-cluster (kubelet provides the API host
-    // env var) and has a sandbox JWT issuer to mint replacements against;
-    // outside the cluster we can't call the apiserver's TokenReview API,
-    // and without the issuer there's nothing to exchange the SA token for.
-    #[cfg(not(target_os = "windows"))]
-    if state.sandbox_jwt_issuer.is_some() && std::env::var_os("KUBERNETES_SERVICE_HOST").is_some() {
-        // Pod lookups and TokenReview identity checks must match the sandbox
-        // namespace and service account used by the Kubernetes driver.
-        let kubernetes_config =
-            compute::driver_config::builtin::kubernetes_config_for_k8s_sa_bootstrap(
-                config_file.as_ref(),
-            )?;
-        let sandbox_namespace = kubernetes_config.namespace.clone();
-        let sandbox_service_account = kubernetes_config.service_account_name.clone();
-        let namespace_validator = match kubernetes_config.workspace_mode {
-            openshell_driver_kubernetes::WorkspaceMode::Shared => {
-                auth::k8s_sa::NamespaceValidator::Exact(kubernetes_config.namespace)
-            }
-            openshell_driver_kubernetes::WorkspaceMode::Managed => {
-                auth::k8s_sa::NamespaceValidator::Prefix(
-                    openshell_driver_kubernetes::managed_namespace_prefix(
-                        &kubernetes_config.gateway_id,
-                    ),
-                )
-            }
-            openshell_driver_kubernetes::WorkspaceMode::Operator => {
-                let allowlist = operator_allowlist.clone().unwrap_or_default();
-                auth::k8s_sa::NamespaceValidator::Allowlist(allowlist)
-            }
-        };
-        match kube::Client::try_default().await {
-            Ok(client) => {
-                let resolver = Arc::new(auth::k8s_sa::LiveK8sResolver::new(
-                    client,
-                    namespace_validator,
-                    "openshell-gateway".to_string(),
-                    sandbox_service_account.clone(),
-                ));
-                let authenticator = auth::k8s_sa::K8sServiceAccountAuthenticator::new(resolver);
-                state.k8s_sa_authenticator = Some(Arc::new(authenticator));
-                info!(
-                    namespace = %sandbox_namespace,
-                    service_account = %sandbox_service_account,
-                    "K8s ServiceAccount bootstrap authenticator enabled"
-                );
-            }
-            Err(e) => warn!(
-                error = %e,
-                "in-cluster K8s client construction failed; \
-                 K8s ServiceAccount bootstrap is disabled"
-            ),
-        }
-    }
-
     let state = Arc::new(state);
 
     // Start sandboxes that were stopped during the previous gateway
@@ -728,11 +677,21 @@ pub(crate) async fn run_server(
     )
     .await?;
 
+    if let Err(err) = state.compute.sync_sandbox_templates().await {
+        warn!(error = %err, "Failed to sync sandbox templates during startup");
+    }
+
     if let Err(err) = state.compute.start_persisted_sandboxes().await {
         warn!(error = %err, "Failed to start persisted sandboxes during startup");
     }
 
     state.compute.spawn_watchers(shutdown_rx.clone());
+    let supervisor_registration_rx = state.supervisor_pod_registrations.subscribe();
+    state.compute.spawn_sandbox_claim_activation(
+        Arc::new(warm_pod_activation::GatewaySupervisorBootstrapActivator::new(state.clone())),
+        supervisor_registration_rx,
+        shutdown_rx.clone(),
+    );
     ssh_sessions::spawn_session_reaper(store.clone(), Duration::from_secs(3600));
     supervisor_session::spawn_relay_reaper(state.clone(), Duration::from_secs(30));
     provider_refresh::spawn_refresh_worker(state.clone(), Duration::from_secs(60));

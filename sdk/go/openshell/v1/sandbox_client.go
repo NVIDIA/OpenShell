@@ -25,17 +25,46 @@ func newSandboxClient(conn grpc.ClientConnInterface) *sandboxClient {
 	return &sandboxClient{client: pb.NewOpenShellClient(conn)}
 }
 
-func (s *sandboxClient) Create(ctx context.Context, workspace, name string, spec *SandboxSpec, labels map[string]string, opts ...CreateOptions) (*Sandbox, error) {
-	protoSpec, err := converter.SandboxSpecToProtoChecked(spec)
+func (s *sandboxClient) Create(ctx context.Context, workspace, name string, workload *SandboxWorkloadConfig, policy *SandboxPolicy, providers []string, labels map[string]string, opts ...CreateOptions) (*Sandbox, error) {
+	protoPolicy, err := converter.SandboxPolicyToProtoChecked(policy)
 	if err != nil {
 		return nil, &StatusError{Code: ErrorInvalidArgument, Message: err.Error()}
 	}
 	req := &pb.CreateSandboxRequest{
+		WorkloadSource: &pb.CreateSandboxRequest_Workload{
+			Workload: converter.SandboxWorkloadToProto(workload),
+		},
+		Policy:    protoPolicy,
+		Providers: converter.CopyStringSlice(providers),
 		Name:      name,
-		Spec:      protoSpec,
-		Labels:    labels,
+		Labels:    converter.CopyStringMap(labels),
 		Workspace: workspace,
 	}
+	return s.create(ctx, req, opts...)
+}
+
+func (s *sandboxClient) CreateFromTemplate(ctx context.Context, workspace, name, templateName string, policy *SandboxPolicy, providers []string, labels map[string]string, opts ...CreateOptions) (*Sandbox, error) {
+	if templateName == "" {
+		return nil, &StatusError{Code: ErrorInvalidArgument, Message: "template name is required"}
+	}
+	protoPolicy, err := converter.SandboxPolicyToProtoChecked(policy)
+	if err != nil {
+		return nil, &StatusError{Code: ErrorInvalidArgument, Message: err.Error()}
+	}
+	req := &pb.CreateSandboxRequest{
+		WorkloadSource: &pb.CreateSandboxRequest_WorkloadTemplateName{
+			WorkloadTemplateName: templateName,
+		},
+		Policy:    protoPolicy,
+		Providers: converter.CopyStringSlice(providers),
+		Name:      name,
+		Labels:    converter.CopyStringMap(labels),
+		Workspace: workspace,
+	}
+	return s.create(ctx, req, opts...)
+}
+
+func (s *sandboxClient) create(ctx context.Context, req *pb.CreateSandboxRequest, opts ...CreateOptions) (*Sandbox, error) {
 	if len(opts) > 0 {
 		req.Annotations = converter.CopyStringMap(opts[0].Annotations)
 	}

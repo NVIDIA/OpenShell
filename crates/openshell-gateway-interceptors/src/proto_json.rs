@@ -290,8 +290,8 @@ mod tests {
     use std::collections::HashMap;
 
     use openshell_core::proto::{
-        CreateProviderRequest, CreateSandboxRequest, GpuResourceRequirements, Provider,
-        SandboxSpec, UpdateConfigRequest,
+        CreateProviderRequest, CreateSandboxRequest, Provider, SandboxResources,
+        SandboxWorkloadConfig, UpdateConfigRequest, create_sandbox_request,
     };
     use prost::Message as _;
     use prost_types::{
@@ -308,10 +308,11 @@ mod tests {
         let codec =
             ProtoJsonCodec::from_descriptor_set(openshell_core::FILE_DESCRIPTOR_SET).unwrap();
         let request = CreateSandboxRequest {
-            spec: Some(SandboxSpec {
-                providers: vec!["github".to_string()],
-                ..SandboxSpec::default()
-            }),
+            workload_source: Some(create_sandbox_request::WorkloadSource::Workload(
+                SandboxWorkloadConfig::default(),
+            )),
+            policy: None,
+            providers: vec!["github".to_string()],
             name: "demo".to_string(),
             labels: HashMap::from([("team".to_string(), "agent".to_string())]),
             annotations: HashMap::new(),
@@ -321,7 +322,7 @@ mod tests {
         let json = codec
             .decode_bytes_to_json("openshell.v1.CreateSandboxRequest", &bytes)
             .unwrap();
-        assert_eq!(json["spec"]["providers"][0], "github");
+        assert_eq!(json["providers"][0], "github");
         assert_eq!(json["labels"]["team"], "agent");
         let encoded = codec
             .encode_json_to_message("openshell.v1.CreateSandboxRequest", &json)
@@ -399,10 +400,12 @@ mod tests {
     fn generic_sandbox_environment_remains_visible() {
         let codec = ProtoJsonCodec::openshell().unwrap();
         let request = CreateSandboxRequest {
-            spec: Some(SandboxSpec {
-                environment: HashMap::from([("FEATURE_FLAG".to_string(), "on".to_string())]),
-                ..SandboxSpec::default()
-            }),
+            workload_source: Some(create_sandbox_request::WorkloadSource::Workload(
+                SandboxWorkloadConfig {
+                    environment: HashMap::from([("FEATURE_FLAG".to_string(), "on".to_string())]),
+                    ..Default::default()
+                },
+            )),
             ..CreateSandboxRequest::default()
         };
 
@@ -413,7 +416,7 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(interceptor["spec"]["environment"]["FEATURE_FLAG"], "on");
+        assert_eq!(interceptor["workload"]["environment"]["FEATURE_FLAG"], "on");
     }
 
     #[test]
@@ -624,20 +627,26 @@ mod tests {
             ProtoJsonCodec::from_descriptor_set(openshell_core::FILE_DESCRIPTOR_SET).unwrap();
 
         for request in [
-            GpuResourceRequirements { count: None },
-            GpuResourceRequirements { count: Some(0) },
-            GpuResourceRequirements { count: Some(2) },
+            SandboxResources {
+                gpu_count: None,
+                ..Default::default()
+            },
+            SandboxResources {
+                gpu_count: Some(0),
+                ..Default::default()
+            },
+            SandboxResources {
+                gpu_count: Some(2),
+                ..Default::default()
+            },
         ] {
             let json = codec
-                .decode_bytes_to_json(
-                    "openshell.v1.GpuResourceRequirements",
-                    &request.encode_to_vec(),
-                )
+                .decode_bytes_to_json("openshell.v1.SandboxResources", &request.encode_to_vec())
                 .unwrap();
             let encoded = codec
-                .encode_json_to_message("openshell.v1.GpuResourceRequirements", &json)
+                .encode_json_to_message("openshell.v1.SandboxResources", &json)
                 .unwrap();
-            let decoded = GpuResourceRequirements::decode(encoded.as_slice()).unwrap();
+            let decoded = SandboxResources::decode(encoded.as_slice()).unwrap();
             assert_eq!(decoded, request);
         }
     }

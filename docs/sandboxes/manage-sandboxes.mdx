@@ -51,22 +51,87 @@ does not change VM allocation.
 
 ### Driver-Specific Configuration
 
-Pass experimental driver-owned settings with `--driver-config-json`. The value
-must be a JSON object keyed by driver name. The gateway forwards only the block
-for its configured compute driver:
+Driver-specific sandbox settings belong in named sandbox templates, not direct
+sandbox create requests. Create the template with an image and driver-keyed
+JSON, then create sandboxes from the template:
+
+```shell
+openshell sandbox template create gpu-kata \
+  --from cuda:latest \
+  --gpu 1 \
+  --driver-config-json '{"kubernetes":{"pod":{"runtime_class_name":"kata-containers","node_selector":{"pool":"gpu"}}}}'
+
+openshell sandbox create --template gpu-kata -- claude
+```
+
+The Python SDK exposes the same workflow through `SandboxTemplateClient` and
+`create_from_template`:
+
+```python
+from openshell import SandboxClient, SandboxTemplate, SandboxTemplateClient, SandboxWorkloadConfig
+
+with SandboxClient.from_active_cluster() as sandboxes:
+    templates = SandboxTemplateClient.from_sandbox_client(sandboxes)
+    template = SandboxTemplate()
+    template.metadata.name = "gpu-kata"
+    template.spec.workload.CopyFrom(SandboxWorkloadConfig(image="cuda:latest"))
+    template.spec.driver_config.update(
+        {"kubernetes": {"pod": {"runtime_class_name": "kata-containers"}}}
+    )
+    templates.create(workspace="default", template=template)
+
+    sandbox = sandboxes.create_from_template(
+        workspace="default",
+        template_name="gpu-kata",
+        name="gpu-job",
+    )
+```
+
+Template `driver_config` values are JSON objects keyed by driver name. The
+gateway forwards only the block for its configured compute driver:
 
 Nested keys inside each driver block use snake_case. The top-level envelope keys
 are driver names, such as `kubernetes`, and are not part of the nested schema.
 
-```shell
-openshell sandbox create \
-  --driver-config-json '{"kubernetes":{"pod":{"runtime_class_name":"kata-containers","node_selector":{"pool":"gpu"}}}}' \
-  -- claude
+```json
+{
+  "kubernetes": {
+    "pod": {
+      "runtime_class_name": "kata-containers",
+      "node_selector": {"pool": "gpu"}
+    }
+  }
+}
 ```
 
-Use this only for driver-specific fields that do not have a stable CLI flag.
-Prefer stable flags such as `--cpu`, `--memory`, and `--gpu` when they cover
-the same behavior.
+Use template driver config only for driver-specific fields that do not have a
+stable CLI flag. Prefer stable direct-create flags such as `--cpu`, `--memory`,
+and `--gpu` when they cover the same behavior.
+
+### Sandbox Templates
+
+Use templates when multiple sandboxes should share the same image, resources,
+driver-specific settings, or startup service objective:
+
+```shell
+openshell sandbox template create python-fast \
+  --cpu 2 \
+  --memory 4Gi \
+  --ready-within 30s \
+  --max-burst 5
+
+openshell sandbox template list
+openshell sandbox template get python-fast
+openshell sandbox create --template python-fast --provider github -- claude
+openshell sandbox template delete python-fast
+```
+
+Templates own workload shape, so `sandbox create --template` cannot be combined
+with `--from`, `--cpu`, `--memory`, `--gpu`, `--env`, or
+`--driver-config-json`. Sandbox create still owns sandbox-specific metadata,
+policy, providers, and the command to run after creation.
+
+Omit `--from` when the template should use the gateway's default sandbox image.
 
 ### GPU Resources
 
@@ -98,18 +163,12 @@ be reflected in later sandbox creates. On WSL2 all-only runtimes, the default
 can fall back to `nvidia.com/gpu=all`; that fallback counts as one selectable
 device.
 
-Exact GPU device selection is driver-specific and still requires `--gpu`. For
-Docker or Podman, pass CDI IDs through `cdi_devices`. The top-level key must
-match the active driver; replace `docker` with `podman` when using Podman. CDI
-IDs are treated as opaque strings. The list must not contain duplicate IDs, and
-its length must match the effective GPU count:
-
-```shell
-openshell sandbox create \
-  --gpu \
-  --driver-config-json '{"docker":{"cdi_devices":["nvidia.com/gpu=0"]}}' \
-  -- claude
-```
+Exact GPU device selection is driver-specific and still requires `--gpu`
+resource intent. For Docker or Podman, put CDI IDs in template driver config
+through `cdi_devices`. The top-level key must match the active driver; replace
+`docker` with `podman` when using Podman. CDI IDs are treated as opaque strings.
+The list must not contain duplicate IDs, and its length must match the
+effective GPU count.
 
 ### Custom Containers
 

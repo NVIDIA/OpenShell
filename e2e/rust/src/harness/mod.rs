@@ -7,6 +7,7 @@ pub mod binary;
 pub mod cli;
 pub mod container;
 pub mod gateway;
+pub mod kubernetes;
 pub mod output;
 pub mod port;
 pub mod sandbox;

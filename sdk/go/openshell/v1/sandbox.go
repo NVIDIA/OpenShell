@@ -18,6 +18,24 @@ type SandboxSpec = types.SandboxSpec
 // SandboxTemplate defines the container template for a sandbox.
 type SandboxTemplate = types.SandboxTemplate
 
+// SandboxWorkloadConfig defines the portable workload for a sandbox.
+type SandboxWorkloadConfig = types.SandboxWorkloadConfig
+
+// SandboxResources defines portable sandbox resource requirements.
+type SandboxResources = types.SandboxResources
+
+// SandboxTemplateSpec holds reusable sandbox template settings.
+type SandboxTemplateSpec = types.SandboxTemplateSpec
+
+// SandboxServiceLevel describes desired operational characteristics.
+type SandboxServiceLevel = types.SandboxServiceLevel
+
+// SandboxStartup describes desired startup characteristics.
+type SandboxStartup = types.SandboxStartup
+
+// SandboxTemplateProvenance identifies the template revision used to create a sandbox.
+type SandboxTemplateProvenance = types.SandboxTemplateProvenance
+
 // SandboxStatus holds the observed state of a sandbox.
 type SandboxStatus = types.SandboxStatus
 
@@ -53,7 +71,8 @@ var WithLogMinLevel = types.WithLogMinLevel
 
 // SandboxInterface defines lifecycle operations on sandboxes.
 type SandboxInterface interface {
-	Create(ctx context.Context, workspace, name string, spec *SandboxSpec, labels map[string]string, opts ...CreateOptions) (*Sandbox, error)
+	Create(ctx context.Context, workspace, name string, workload *SandboxWorkloadConfig, policy *SandboxPolicy, providers []string, labels map[string]string, opts ...CreateOptions) (*Sandbox, error)
+	CreateFromTemplate(ctx context.Context, workspace, name, templateName string, policy *SandboxPolicy, providers []string, labels map[string]string, opts ...CreateOptions) (*Sandbox, error)
 	Get(ctx context.Context, workspace, name string) (*Sandbox, error)
 	List(ctx context.Context, workspace string, opts ...ListOptions) ([]*Sandbox, error)
 	Stop(ctx context.Context, workspace, name string) (*Sandbox, error)

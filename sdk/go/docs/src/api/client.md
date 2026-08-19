@@ -10,6 +10,7 @@ typed accessors for each resource domain and manages the underlying gRPC connect
 | Accessor | Returns | Description |
 |----------|---------|-------------|
 | `Sandboxes()` | `SandboxInterface` | Sandbox lifecycle management |
+| `SandboxTemplates()` | `SandboxTemplateInterface` | Sandbox template management |
 | `Providers()` | `ProviderInterface` | Provider CRUD and idempotent ensure |
 | `Services()` | `ServiceInterface` | Service exposure and management |
 | `Exec()` | `ExecInterface` | Command execution (run, stream, interactive) |

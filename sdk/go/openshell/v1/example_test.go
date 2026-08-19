@@ -21,7 +21,7 @@ func ExampleClient_Sandboxes() {
 	ctx := context.Background()
 
 	// Create a sandbox
-	sb, err := client.Sandboxes().Create(ctx, "default", "my-sandbox", &v1.SandboxSpec{}, nil)
+	sb, err := client.Sandboxes().Create(ctx, "default", "my-sandbox", nil, nil, nil, nil)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -154,13 +154,13 @@ func ExampleIsAlreadyExists() {
 	ctx := context.Background()
 
 	// Create a sandbox
-	_, err := client.Sandboxes().Create(ctx, "default", "my-sandbox", &v1.SandboxSpec{}, nil)
+	_, err := client.Sandboxes().Create(ctx, "default", "my-sandbox", nil, nil, nil, nil)
 	if err != nil {
 		log.Fatal(err)
 	}
 
 	// Try to create the same sandbox again
-	_, err = client.Sandboxes().Create(ctx, "default", "my-sandbox", &v1.SandboxSpec{}, nil)
+	_, err = client.Sandboxes().Create(ctx, "default", "my-sandbox", nil, nil, nil, nil)
 	if v1.IsAlreadyExists(err) {
 		fmt.Println("Sandbox already exists")
 	}

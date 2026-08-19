@@ -22,7 +22,7 @@ Make sure the following are in place before you install.
 |---|---|---|
 | Kubernetes 1.29+ with RBAC enabled | Yes | No additional notes. |
 | Helm 3.x | Yes | No additional notes. |
-| Agent Sandbox controller and CRDs | Yes | Install before the OpenShell chart. Refer to [Install Agent Sandbox](#install-agent-sandbox). |
+| Agent Sandbox controller and CRDs | Yes | Install before the OpenShell chart. Refer to [Install Agent Sandbox](#install-agent-sandbox). Install `extensions.yaml` too when warm pooling is enabled. |
 | cert-manager | No | Refer to [Managing Certificates](/kubernetes/managing-certificates). Use cert-manager only if you prefer it over the built-in PKI job. |
 | Kubernetes Gateway API | No | Refer to [Ingress](/kubernetes/ingress). Use it only for external access without port-forwarding. |
 
@@ -37,6 +37,14 @@ kubectl apply -f https://github.com/kubernetes-sigs/agent-sandbox/releases/lates
 ```
 
 This creates the `agent-sandbox-system` namespace, installs the `sandboxes.agents.x-k8s.io` CRD, and starts the controller.
+
+Install the Agent Sandbox extension APIs when Kubernetes warm pooling is enabled. The OpenShell chart defaults warm pooling on, but it does not install the `SandboxClaim`, `SandboxTemplate`, or `SandboxWarmPool` CRDs:
+
+```shell
+kubectl apply -f https://github.com/kubernetes-sigs/agent-sandbox/releases/latest/download/extensions.yaml
+```
+
+If you do not install `extensions.yaml`, set `server.warmPooling.enabled=false`. Otherwise OpenShell disables warm pooling and template reconciliation at startup and falls back to direct `Sandbox` creation.
 
 <Note>
 **Air-gapped clusters:** mirror the manifest above and the `registry.k8s.io/agent-sandbox/agent-sandbox-controller` image referenced inside it to your internal registry, then point the manifest's image reference at your mirror before applying. You will also need to mirror the OpenShell gateway and sandbox images — see the chart's `image.repository` value for the gateway and `server.sandboxImage` / `server.supervisorImage` for the sandbox runtime.
@@ -248,12 +256,17 @@ The namespaced Role covers sandbox lifecycle and identity:
 | `""` | `events` | get, list, watch |
 | `""` | `pods` | get |
 
-The ClusterRole grants node inspection and token validation:
+The ClusterRole grants node inspection, token validation, namespace reads, and
+warm-pool extension access. The chart grants `sandboxclaims` create/delete only
+when `server.warmPooling.enabled=true`:
 
 | API Group | Resource | Verbs |
 |---|---|---|
 | `authentication.k8s.io` | `tokenreviews` | create |
 | `""` | `nodes` | get, list, watch |
+| `""` | `namespaces` | get |
+| `extensions.agents.x-k8s.io` | `sandboxclaims` | get, list, watch; create, delete when warm pooling is enabled |
+| `extensions.agents.x-k8s.io` | `sandboxtemplates`, `sandboxwarmpools` | get, list, watch; create, patch, update, delete when template reconciliation is enabled |
 
 To use an existing ServiceAccount instead of creating one, set `serviceAccount.create=false` and supply its name:
 

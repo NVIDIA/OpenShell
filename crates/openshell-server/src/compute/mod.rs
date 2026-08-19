@@ -32,21 +32,28 @@ use futures::{Stream, StreamExt};
 use hyper_util::rt::TokioIo;
 use openshell_core::ComputeDriverKind;
 use openshell_core::proto::compute::v1::{
-    CreateSandboxRequest, DeleteSandboxRequest, DeleteWorkspaceRequest, DeleteWorkspaceResponse,
-    DriverCondition, DriverPlatformEvent, DriverResourceRequirements, DriverSandbox,
-    DriverSandboxSpec, DriverSandboxStatus, DriverSandboxTemplate, EnsureWorkspaceRequest,
+    CreateSandboxRequest, DeleteSandboxRequest, DeleteSandboxTemplateRequest,
+    DeleteWorkspaceRequest, DeleteWorkspaceResponse, DriverCondition, DriverPlatformEvent,
+    DriverResourceRequirements, DriverSandbox, DriverSandboxSpec, DriverSandboxStatus,
+    DriverSandboxTemplate, DriverSandboxTemplateRef, DriverSandboxTemplateResource,
+    DriverSandboxTemplateServiceLevel, DriverSandboxTemplateStartup, EnsureWorkspaceRequest,
     EnsureWorkspaceResponse, GatewayListenerRequirement as ProtoGatewayListenerRequirement,
     GetCapabilitiesRequest, GetGatewayListenerRequirementsRequest,
     GetGatewayListenerRequirementsResponse, GetSandboxRequest,
     GpuResourceRequirements as DriverGpuResourceRequirements, ListSandboxesRequest,
     ResourceRequirements as DriverSandboxResourceRequirements, StartSandboxRequest,
-    StopSandboxRequest, ValidateSandboxCreateRequest, WatchSandboxesEvent, WatchSandboxesRequest,
-    compute_driver_client::ComputeDriverClient, compute_driver_server::ComputeDriver,
-    gateway_listener_requirement::Selector, watch_sandboxes_event,
+    StopSandboxRequest, UpsertSandboxTemplateRequest, ValidateSandboxCreateRequest,
+    WatchSandboxesEvent, WatchSandboxesRequest, compute_driver_client::ComputeDriverClient,
+    compute_driver_server::ComputeDriver, gateway_listener_requirement::Selector,
+    watch_sandboxes_event,
 };
 use openshell_core::proto::{
-    PlatformEvent, Sandbox, SandboxCondition, SandboxPhase, SandboxSpec, SandboxStatus,
-    SandboxTemplate, ServiceEndpoint, SshSession,
+    PlatformEvent, Sandbox, SandboxCondition, SandboxPhase, SandboxResources, SandboxServiceLevel,
+    SandboxSpec, SandboxStartup, SandboxStatus, SandboxTemplate as PublicSandboxTemplate,
+    SandboxWorkloadConfig, ServiceEndpoint, SshSession,
+};
+use openshell_core::supervisor_bootstrap::{
+    SupervisorBootstrapActivator, SupervisorBootstrapIdentityProvider,
 };
 use openshell_core::{ObjectLabels, ObjectWorkspace};
 #[cfg(not(target_os = "windows"))]
@@ -54,7 +61,8 @@ use openshell_driver_docker::DockerComputeDriver;
 #[cfg(not(target_os = "windows"))]
 use openshell_driver_kubernetes::{
     ComputeDriverService as KubernetesDriverService, KubernetesComputeDriver,
-    OperatorNamespaceAllowlist,
+    KubernetesSupervisorBootstrapIdentityProvider, LiveK8sResolver, OperatorNamespaceAllowlist,
+    SandboxClaimActivationController,
 };
 #[cfg(not(target_os = "windows"))]
 use openshell_driver_podman::{ComputeDriverService as PodmanDriverService, PodmanComputeDriver};
@@ -274,6 +282,8 @@ pub struct ComputeDriverInfoSnapshot {
     pub driver_name: String,
     /// Driver-reported implementation version from the startup capability snapshot.
     pub driver_version: String,
+    /// Driver opted into gateway sandbox-template lifecycle notifications.
+    pub supports_sandbox_template_lifecycle: bool,
 }
 
 #[tonic::async_trait]
@@ -316,6 +326,12 @@ impl StartupSandboxStarter for DockerComputeDriver {
             .map_err(|err| err.to_string())
     }
 }
+
+#[tonic::async_trait]
+trait LeaseScopedReconciler: Send + Sync {
+    async fn run(&self, cancel: watch::Receiver<bool>);
+}
+
 /// Interval between store-vs-backend reconciliation sweeps.
 const RECONCILE_INTERVAL: Duration = Duration::from_secs(60);
 
@@ -423,6 +439,45 @@ async fn managed_driver_shutdown_sends_sigterm_before_forcing_exit() {
     assert_eq!(std::fs::read_to_string(terminated).unwrap(), "terminated");
 }
 
+async fn kubernetes_in_cluster_client() -> Option<kube::Client> {
+    std::env::var_os("KUBERNETES_SERVICE_HOST")?;
+
+    match kube::Client::try_default().await {
+        Ok(client) => Some(client),
+        Err(err) => {
+            warn!(
+                error = %err,
+                "in-cluster K8s client construction failed; Kubernetes supervisor bootstrap and SandboxClaim activation are disabled"
+            );
+            None
+        }
+    }
+}
+
+fn kubernetes_supervisor_bootstrap_identity_provider(
+    config: &KubernetesComputeConfig,
+    client: kube::Client,
+) -> Arc<dyn SupervisorBootstrapIdentityProvider> {
+    let resolver = Arc::new(LiveK8sResolver::new(
+        client,
+        &config.namespace,
+        "openshell-gateway".to_string(),
+        config.service_account_name.clone(),
+    ));
+    Arc::new(KubernetesSupervisorBootstrapIdentityProvider::new(resolver))
+}
+
+fn kubernetes_sandbox_claim_activation_controller(
+    config: &KubernetesComputeConfig,
+    client: kube::Client,
+) -> Arc<SandboxClaimActivationController> {
+    Arc::new(SandboxClaimActivationController::new(
+        client.clone(),
+        client,
+        config.namespace.clone(),
+    ))
+}
+
 #[derive(Debug)]
 pub struct AcquiredRemoteDriverEndpoint {
     pub(crate) name: String,
@@ -503,6 +558,28 @@ impl ComputeDriver for RemoteComputeDriver {
     > {
         let mut client = self.client();
         client.validate_sandbox_create(request).await
+    }
+
+    async fn upsert_sandbox_template(
+        &self,
+        request: Request<UpsertSandboxTemplateRequest>,
+    ) -> Result<
+        tonic::Response<openshell_core::proto::compute::v1::UpsertSandboxTemplateResponse>,
+        Status,
+    > {
+        let mut client = self.client();
+        client.upsert_sandbox_template(request).await
+    }
+
+    async fn delete_sandbox_template(
+        &self,
+        request: Request<DeleteSandboxTemplateRequest>,
+    ) -> Result<
+        tonic::Response<openshell_core::proto::compute::v1::DeleteSandboxTemplateResponse>,
+        Status,
+    > {
+        let mut client = self.client();
+        client.delete_sandbox_template(request).await
     }
 
     async fn get_sandbox(
@@ -599,6 +676,9 @@ pub struct ComputeRuntime {
     sandbox_watch_bus: SandboxWatchBus,
     tracing_log_bus: TracingLogBus,
     supervisor_sessions: Arc<SupervisorSessionRegistry>,
+    supervisor_bootstrap_identity: Option<Arc<dyn SupervisorBootstrapIdentityProvider>>,
+    sandbox_claim_activation: Option<Arc<SandboxClaimActivationController>>,
+    lease_scoped_reconciler: Option<Arc<dyn LeaseScopedReconciler>>,
     sync_lock: Arc<Mutex<()>>,
     lifecycle_gates: Arc<LifecycleGateRegistry>,
     gateway_listener_requirements: Vec<GatewayListenerRequirement>,
@@ -633,6 +713,8 @@ impl ComputeRuntime {
         sandbox_watch_bus: SandboxWatchBus,
         tracing_log_bus: TracingLogBus,
         supervisor_sessions: Arc<SupervisorSessionRegistry>,
+        supervisor_bootstrap_identity: Option<Arc<dyn SupervisorBootstrapIdentityProvider>>,
+        sandbox_claim_activation: Option<Arc<SandboxClaimActivationController>>,
     ) -> Result<Self, ComputeError> {
         let capabilities = driver
             .get_capabilities(Request::new(GetCapabilitiesRequest {}))
@@ -653,6 +735,7 @@ impl ComputeRuntime {
             name: driver_name.clone(),
             driver_name: capabilities.driver_name,
             driver_version: capabilities.driver_version,
+            supports_sandbox_template_lifecycle: capabilities.supports_sandbox_template_lifecycle,
         };
         let default_image = capabilities.default_image;
         let gateway_listener_requirements = match driver
@@ -720,6 +803,9 @@ impl ComputeRuntime {
             sandbox_watch_bus,
             tracing_log_bus,
             supervisor_sessions,
+            supervisor_bootstrap_identity,
+            sandbox_claim_activation,
+            lease_scoped_reconciler: None,
             sync_lock: Arc::new(Mutex::new(())),
             lifecycle_gates: Arc::new(LifecycleGateRegistry::default()),
             gateway_listener_requirements,
@@ -781,6 +867,8 @@ impl ComputeRuntime {
             sandbox_watch_bus,
             tracing_log_bus,
             supervisor_sessions,
+            None,
+            None,
         )
         .await
     }
@@ -795,6 +883,12 @@ impl ComputeRuntime {
         supervisor_sessions: Arc<SupervisorSessionRegistry>,
         shutdown_rx: watch::Receiver<bool>,
     ) -> Result<(Self, Option<OperatorNamespaceAllowlist>), ComputeError> {
+        let kubernetes_client = kubernetes_in_cluster_client().await;
+        let supervisor_bootstrap_identity = kubernetes_client
+            .clone()
+            .map(|client| kubernetes_supervisor_bootstrap_identity_provider(&config, client));
+        let sandbox_claim_activation = kubernetes_client
+            .map(|client| kubernetes_sandbox_claim_activation_controller(&config, client));
         let driver = KubernetesComputeDriver::new(config, shutdown_rx)
             .await
             .map_err(|err| ComputeError::Message(err.to_string()))?;
@@ -811,6 +905,8 @@ impl ComputeRuntime {
             sandbox_watch_bus,
             tracing_log_bus,
             supervisor_sessions,
+            supervisor_bootstrap_identity,
+            sandbox_claim_activation,
         )
         .await?;
         Ok((runtime, operator_allowlist_arc))
@@ -836,6 +932,8 @@ impl ComputeRuntime {
             sandbox_watch_bus,
             tracing_log_bus,
             supervisor_sessions,
+            None,
+            None,
         )
         .await
     }
@@ -864,6 +962,8 @@ impl ComputeRuntime {
             sandbox_watch_bus,
             tracing_log_bus,
             supervisor_sessions,
+            None,
+            None,
         )
         .await
     }
@@ -876,6 +976,24 @@ impl ComputeRuntime {
     #[must_use]
     pub fn driver_info_snapshots(&self) -> &[ComputeDriverInfoSnapshot] {
         std::slice::from_ref(&self.driver_info)
+    }
+
+    #[must_use]
+    pub fn supervisor_bootstrap_identity_provider(
+        &self,
+    ) -> Option<Arc<dyn SupervisorBootstrapIdentityProvider>> {
+        self.supervisor_bootstrap_identity.clone()
+    }
+
+    pub(crate) fn spawn_sandbox_claim_activation(
+        &self,
+        activator: Arc<dyn SupervisorBootstrapActivator>,
+        registration_rx: watch::Receiver<u64>,
+        shutdown_rx: watch::Receiver<bool>,
+    ) {
+        if let Some(controller) = self.sandbox_claim_activation.clone() {
+            controller.spawn(activator, registration_rx, shutdown_rx);
+        }
     }
 
     #[must_use]
@@ -993,6 +1111,7 @@ impl ComputeRuntime {
         {
             spec.sandbox_token = token;
         }
+        let driver_sandbox_template = driver_sandbox_template_ref_from_public(&sandbox);
         match self
             .driver
             .call(
@@ -1002,6 +1121,7 @@ impl ComputeRuntime {
                     driver
                         .create_sandbox(Request::new(CreateSandboxRequest {
                             sandbox: Some(driver_sandbox),
+                            sandbox_template: driver_sandbox_template,
                         }))
                         .await
                 },
@@ -1030,6 +1150,20 @@ impl ComputeRuntime {
                     .await;
                 self.sandbox_index.remove_sandbox(sandbox.object_id());
                 Err(Status::failed_precondition(status.message().to_string()))
+            }
+            Err(status) if status.code() == Code::Unavailable => {
+                // The driver may have committed the backend create. Keep the
+                // durable Provisioning row so its watcher can reconcile the
+                // accepted resource instead of allowing a new sandbox ID to
+                // reuse the same name. If no backend resource appears, the
+                // store-vs-backend reconciler prunes the stale Provisioning
+                // row after ORPHAN_GRACE_PERIOD and clears the name index.
+                warn!(
+                    sandbox_id = %sandbox.object_id(),
+                    error = %status,
+                    "sandbox create outcome is ambiguous; preserving provisioning state"
+                );
+                Err(Status::unavailable(status.message().to_string()))
             }
             Err(err) => {
                 let _ = self
@@ -2054,6 +2188,7 @@ impl ComputeRuntime {
     pub fn spawn_watchers(&self, shutdown_rx: watch::Receiver<bool>) {
         let runtime = Arc::new(self.clone());
         if self.store.is_single_replica() {
+            let _lease_scoped_handle = self.spawn_lease_scoped_reconciler(shutdown_rx.clone());
             let watch_runtime = runtime.clone();
             let watch_shutdown = shutdown_rx.clone();
             tokio::spawn(async move {
@@ -2067,6 +2202,17 @@ impl ComputeRuntime {
                 runtime.lease_coordinator(shutdown_rx).await;
             });
         }
+    }
+
+    fn spawn_lease_scoped_reconciler(
+        &self,
+        cancel: watch::Receiver<bool>,
+    ) -> Option<tokio::task::JoinHandle<()>> {
+        self.lease_scoped_reconciler.clone().map(|reconciler| {
+            tokio::spawn(async move {
+                reconciler.run(cancel).await;
+            })
+        })
     }
 
     pub async fn cleanup_on_shutdown(&self) -> Result<(), String> {
@@ -2083,6 +2229,105 @@ impl ComputeRuntime {
         cleanup_result?;
         #[cfg(unix)]
         process_result?;
+        Ok(())
+    }
+
+    /// Re-send persisted sandbox templates to drivers that opted into template
+    /// lifecycle notifications. Called once during gateway startup before
+    /// watchers begin processing ordinary sandbox state.
+    pub async fn sync_sandbox_templates(&self) -> Result<(), String> {
+        if !self.driver_info.supports_sandbox_template_lifecycle {
+            return Ok(());
+        }
+
+        let records = self
+            .store
+            .list_by_type(PublicSandboxTemplate::object_type(), 1000, 0)
+            .await
+            .map_err(|e| e.to_string())?;
+        let mut synced = 0usize;
+        let mut failed = 0usize;
+        for record in records {
+            let template = match PublicSandboxTemplate::decode(record.payload.as_slice()) {
+                Ok(template) => template,
+                Err(err) => {
+                    warn!(error = %err, "Failed to decode sandbox template during gateway startup");
+                    failed += 1;
+                    continue;
+                }
+            };
+            match self.upsert_sandbox_template(&template).await {
+                Ok(()) => synced += 1,
+                Err(err) => {
+                    warn!(
+                        template_id = %template.object_id(),
+                        template_name = %template.object_name(),
+                        workspace = %template.object_workspace(),
+                        error = %err,
+                        "Failed to sync sandbox template to compute driver"
+                    );
+                    failed += 1;
+                }
+            }
+        }
+        if synced > 0 || failed > 0 {
+            info!(synced, failed, "Sandbox template sync complete");
+        }
+        Ok(())
+    }
+
+    pub async fn upsert_sandbox_template(
+        &self,
+        template: &PublicSandboxTemplate,
+    ) -> Result<(), Status> {
+        if !self.driver_info.supports_sandbox_template_lifecycle {
+            return Ok(());
+        }
+        let driver_template =
+            driver_sandbox_template_resource_from_public(template, &self.driver_info.name)
+                .map_err(|err| *err)?;
+        self.driver
+            .call(
+                "driver.upsert_sandbox_template",
+                None,
+                |driver| async move {
+                    driver
+                        .upsert_sandbox_template(Request::new(UpsertSandboxTemplateRequest {
+                            template: Some(driver_template),
+                        }))
+                        .await
+                },
+            )
+            .await?;
+        Ok(())
+    }
+
+    pub async fn delete_sandbox_template(
+        &self,
+        id: String,
+        name: String,
+        workspace: String,
+        resource_version: u64,
+    ) -> Result<(), Status> {
+        if !self.driver_info.supports_sandbox_template_lifecycle {
+            return Ok(());
+        }
+        self.driver
+            .call(
+                "driver.delete_sandbox_template",
+                None,
+                |driver| async move {
+                    driver
+                        .delete_sandbox_template(Request::new(DeleteSandboxTemplateRequest {
+                            id,
+                            name,
+                            workspace,
+                            resource_version,
+                        }))
+                        .await
+                },
+            )
+            .await?;
         Ok(())
     }
 
@@ -2381,6 +2626,8 @@ impl ComputeRuntime {
             runtime.reconcile_loop(cancel_rx).await;
         });
 
+        let lease_scoped_handle = self.spawn_lease_scoped_reconciler(cancel_tx.subscribe());
+
         loop {
             tokio::select! {
                 () = tokio::time::sleep(LEASE_RENEWAL_INTERVAL) => {
@@ -2407,6 +2654,9 @@ impl ComputeRuntime {
                         let _ = cancel_tx.send(true);
                         let _ = watch_handle.await;
                         let _ = reconcile_handle.await;
+                        if let Some(handle) = lease_scoped_handle {
+                            let _ = handle.await;
+                        }
                         return;
                     }
                 }
@@ -2416,6 +2666,9 @@ impl ComputeRuntime {
         let _ = cancel_tx.send(true);
         let _ = watch_handle.await;
         let _ = reconcile_handle.await;
+        if let Some(handle) = lease_scoped_handle {
+            let _ = handle.await;
+        }
         info!(replica = %lease.replica_id(), "reconciler lease lost — returning to standby");
     }
 
@@ -3189,42 +3442,123 @@ fn driver_sandbox_from_public(
     })
 }
 
+fn driver_sandbox_template_ref_from_public(sandbox: &Sandbox) -> Option<DriverSandboxTemplateRef> {
+    let provenance = sandbox.created_from_template.as_ref()?;
+    Some(DriverSandboxTemplateRef {
+        id: provenance.id.clone(),
+        name: provenance.name.clone(),
+        workspace: sandbox.object_workspace().to_string(),
+        resource_version: provenance.resource_version.parse::<u64>().unwrap_or(0),
+    })
+}
+
 fn driver_sandbox_spec_from_public(
     spec: &SandboxSpec,
     driver_name: &str,
 ) -> Result<DriverSandboxSpec, Box<Status>> {
     Ok(DriverSandboxSpec {
-        log_level: spec.log_level.clone(),
-        environment: spec.environment.clone(),
-        template: spec
-            .template
+        log_level: String::new(),
+        environment: spec
+            .workload
             .as_ref()
-            .map(|template| driver_sandbox_template_from_public(template, driver_name))
+            .map_or_else(Default::default, |workload| workload.environment.clone()),
+        template: spec
+            .workload
+            .as_ref()
+            .map(|workload| {
+                driver_sandbox_template_from_public(workload, &spec.driver_config, driver_name)
+            })
             .transpose()?,
-        resource_requirements: spec.resource_requirements.as_ref().map(|requirements| {
-            DriverSandboxResourceRequirements {
-                gpu: requirements
-                    .gpu
-                    .as_ref()
-                    .map(|gpu| DriverGpuResourceRequirements { count: gpu.count }),
-            }
-        }),
+        resource_requirements: spec
+            .workload
+            .as_ref()
+            .and_then(driver_resource_requirements_from_workload),
         sandbox_token: String::new(),
     })
 }
 
+fn driver_sandbox_template_resource_from_public(
+    template: &PublicSandboxTemplate,
+    driver_name: &str,
+) -> Result<DriverSandboxTemplateResource, Box<Status>> {
+    let metadata = template
+        .metadata
+        .as_ref()
+        .ok_or_else(|| Box::new(Status::invalid_argument("template metadata is required")))?;
+    let spec = template
+        .spec
+        .as_ref()
+        .ok_or_else(|| Box::new(Status::invalid_argument("template spec is required")))?;
+    let workload = spec
+        .workload
+        .as_ref()
+        .ok_or_else(|| Box::new(Status::invalid_argument("template workload is required")))?;
+
+    Ok(DriverSandboxTemplateResource {
+        id: metadata.id.clone(),
+        name: metadata.name.clone(),
+        workspace: metadata.workspace.clone(),
+        resource_version: metadata.resource_version,
+        labels: metadata.labels.clone(),
+        annotations: metadata.annotations.clone(),
+        deletion_timestamp_ms: metadata.deletion_timestamp_ms,
+        template: Some(driver_sandbox_template_from_public(
+            workload,
+            &spec.driver_config,
+            driver_name,
+        )?),
+        desired_service_level: spec
+            .desired_service_level
+            .as_ref()
+            .map(driver_template_service_level_from_public),
+        resource_requirements: driver_resource_requirements_from_workload(workload),
+    })
+}
+
+fn driver_template_service_level_from_public(
+    service_level: &SandboxServiceLevel,
+) -> DriverSandboxTemplateServiceLevel {
+    DriverSandboxTemplateServiceLevel {
+        startup: service_level
+            .startup
+            .as_ref()
+            .map(driver_template_startup_from_public),
+    }
+}
+
+fn driver_template_startup_from_public(startup: &SandboxStartup) -> DriverSandboxTemplateStartup {
+    DriverSandboxTemplateStartup {
+        ready_within: startup.ready_within,
+        max_burst: startup.max_burst,
+    }
+}
+
+fn driver_resource_requirements_from_workload(
+    workload: &SandboxWorkloadConfig,
+) -> Option<DriverSandboxResourceRequirements> {
+    let resources = workload.resources.as_ref()?;
+    openshell_core::gpu::sandbox_gpu_requested(Some(resources)).then_some(
+        DriverSandboxResourceRequirements {
+            gpu: Some(DriverGpuResourceRequirements {
+                count: resources.gpu_count,
+            }),
+        },
+    )
+}
+
 fn driver_sandbox_template_from_public(
-    template: &SandboxTemplate,
+    workload: &SandboxWorkloadConfig,
+    driver_config: &Option<prost_types::Struct>,
     driver_name: &str,
 ) -> Result<DriverSandboxTemplate, Box<Status>> {
     Ok(DriverSandboxTemplate {
-        image: template.image.clone(),
-        agent_socket_path: template.agent_socket.clone(),
-        labels: template.labels.clone(),
-        environment: template.environment.clone(),
-        resources: extract_typed_resources(&template.resources),
-        platform_config: build_platform_config(template),
-        driver_config: select_driver_config(&template.driver_config, driver_name)?,
+        image: workload.image.clone(),
+        agent_socket_path: String::new(),
+        labels: HashMap::default(),
+        environment: workload.environment.clone(),
+        resources: extract_typed_resources(workload.resources.as_ref()),
+        platform_config: None,
+        driver_config: select_driver_config(driver_config, driver_name)?,
     })
 }
 
@@ -3241,40 +3575,21 @@ fn select_driver_config(
     match value.kind.as_ref() {
         Some(prost_types::value::Kind::StructValue(inner)) => Ok(Some(inner.clone())),
         _ => Err(Box::new(Status::invalid_argument(format!(
-            "template.driver_config.{driver_name} must be an object"
+            "driver_config.{driver_name} must be an object"
         )))),
     }
 }
 
-/// Extract typed CPU/memory quantities from the public `resources` Struct.
-///
-/// The public API exposes resources as an untyped `google.protobuf.Struct`
-/// with the Kubernetes limits/requests shape. We pull out the well-known
-/// keys into the typed `DriverResourceRequirements` message.
+/// Extract typed CPU/memory quantities from portable public resources.
 fn extract_typed_resources(
-    resources: &Option<prost_types::Struct>,
+    resources: Option<&SandboxResources>,
 ) -> Option<DriverResourceRequirements> {
-    fn get_quantity(s: &prost_types::Struct, section: &str, key: &str) -> String {
-        s.fields
-            .get(section)
-            .and_then(|v| match v.kind.as_ref() {
-                Some(prost_types::value::Kind::StructValue(inner)) => inner.fields.get(key),
-                _ => None,
-            })
-            .and_then(|v| match v.kind.as_ref() {
-                Some(prost_types::value::Kind::StringValue(val)) => Some(val.clone()),
-                _ => None,
-            })
-            .unwrap_or_default()
-    }
-
-    let s = resources.as_ref()?;
-
+    let resources = resources?;
     let req = DriverResourceRequirements {
-        cpu_request: get_quantity(s, "requests", "cpu"),
-        cpu_limit: get_quantity(s, "limits", "cpu"),
-        memory_request: get_quantity(s, "requests", "memory"),
-        memory_limit: get_quantity(s, "limits", "memory"),
+        cpu_request: resources.cpu.clone(),
+        cpu_limit: resources.cpu.clone(),
+        memory_request: resources.memory.clone(),
+        memory_limit: resources.memory.clone(),
     };
 
     // Return None when all fields are empty so drivers can distinguish
@@ -3287,130 +3602,6 @@ fn extract_typed_resources(
         None
     } else {
         Some(req)
-    }
-}
-
-/// Build the opaque `platform_config` Struct from platform-specific public
-/// template fields (`runtime_class_name`, annotations) plus any resource fields
-/// beyond CPU/memory.
-fn build_platform_config(template: &SandboxTemplate) -> Option<prost_types::Struct> {
-    use prost_types::{Struct, Value, value::Kind};
-
-    let mut fields = std::collections::BTreeMap::new();
-
-    if !template.runtime_class_name.is_empty() {
-        fields.insert(
-            "runtime_class_name".to_string(),
-            Value {
-                kind: Some(Kind::StringValue(template.runtime_class_name.clone())),
-            },
-        );
-    }
-
-    if !template.annotations.is_empty() {
-        let annotation_fields = template
-            .annotations
-            .iter()
-            .map(|(k, v)| {
-                (
-                    k.clone(),
-                    Value {
-                        kind: Some(Kind::StringValue(v.clone())),
-                    },
-                )
-            })
-            .collect();
-        fields.insert(
-            "annotations".to_string(),
-            Value {
-                kind: Some(Kind::StructValue(Struct {
-                    fields: annotation_fields,
-                })),
-            },
-        );
-    }
-
-    // Invert: the public API uses `user_namespaces: true` (positive sense)
-    // while the K8s driver expects `host_users: false` (K8s convention).
-    // The driver inverts this back via `!host_users` to resolve the final
-    // pod-level `hostUsers` field.
-    if let Some(user_ns) = template.user_namespaces {
-        fields.insert(
-            "host_users".to_string(),
-            Value {
-                kind: Some(Kind::BoolValue(!user_ns)),
-            },
-        );
-    }
-
-    // Pass through any resource fields that do not map to the typed
-    // DriverResourceRequirements so platform-specific drivers can still see
-    // custom resources such as GPU limits.
-    if let Some(res) = build_platform_resources_config(&template.resources) {
-        fields.insert(
-            "resources_raw".to_string(),
-            Value {
-                kind: Some(Kind::StructValue(res)),
-            },
-        );
-    }
-
-    if fields.is_empty() {
-        None
-    } else {
-        Some(Struct { fields })
-    }
-}
-
-fn build_platform_resources_config(
-    resources: &Option<prost_types::Struct>,
-) -> Option<prost_types::Struct> {
-    use prost_types::{Struct, Value, value::Kind};
-
-    let resources = resources.as_ref()?;
-    let mut fields = std::collections::BTreeMap::new();
-
-    for (section_name, value) in &resources.fields {
-        if !matches!(section_name.as_str(), "limits" | "requests") {
-            fields.insert(section_name.clone(), value.clone());
-            continue;
-        }
-
-        let Some(Kind::StructValue(section)) = value.kind.as_ref() else {
-            fields.insert(section_name.clone(), value.clone());
-            continue;
-        };
-
-        let section_fields = section
-            .fields
-            .iter()
-            .filter_map(|(resource_name, resource_value)| {
-                let is_typed_quantity = matches!(resource_name.as_str(), "cpu" | "memory")
-                    && matches!(resource_value.kind.as_ref(), Some(Kind::StringValue(_)));
-                if is_typed_quantity {
-                    None
-                } else {
-                    Some((resource_name.clone(), resource_value.clone()))
-                }
-            })
-            .collect::<std::collections::BTreeMap<_, _>>();
-
-        if !section_fields.is_empty() {
-            fields.insert(
-                section_name.clone(),
-                Value {
-                    kind: Some(Kind::StructValue(Struct {
-                        fields: section_fields,
-                    })),
-                },
-            );
-        }
-    }
-
-    if fields.is_empty() {
-        None
-    } else {
-        Some(Struct { fields })
     }
 }
 
@@ -3442,6 +3633,12 @@ fn driver_condition_from_public(condition: &SandboxCondition) -> DriverCondition
 impl ObjectType for Sandbox {
     fn object_type() -> &'static str {
         "sandbox"
+    }
+}
+
+impl ObjectType for openshell_core::proto::SandboxTemplate {
+    fn object_type() -> &'static str {
+        "sandbox_template"
     }
 }
 
@@ -3773,7 +3970,8 @@ fn derive_phase(status: Option<&DriverSandboxStatus>) -> SandboxPhase {
 
 fn rewrite_user_facing_conditions(status: &mut Option<SandboxStatus>, spec: Option<&SandboxSpec>) {
     let gpu_requested = spec
-        .and_then(|sandbox_spec| sandbox_spec.resource_requirements.as_ref())
+        .and_then(|sandbox_spec| sandbox_spec.workload.as_ref())
+        .and_then(|workload| workload.resources.as_ref())
         .is_some_and(|requirements| openshell_core::gpu::sandbox_gpu_requested(Some(requirements)));
     if !gpu_requested {
         return;
@@ -3853,6 +4051,7 @@ impl ComputeDriver for NoopTestDriver {
                 driver_name: "noop-test-driver".to_string(),
                 driver_version: "test".to_string(),
                 default_image: "openshell/sandbox:test".to_string(),
+                supports_sandbox_template_lifecycle: false,
             },
         ))
     }
@@ -3875,6 +4074,30 @@ impl ComputeDriver for NoopTestDriver {
     > {
         Ok(tonic::Response::new(
             openshell_core::proto::compute::v1::ValidateSandboxCreateResponse {},
+        ))
+    }
+
+    async fn upsert_sandbox_template(
+        &self,
+        _request: Request<UpsertSandboxTemplateRequest>,
+    ) -> Result<
+        tonic::Response<openshell_core::proto::compute::v1::UpsertSandboxTemplateResponse>,
+        Status,
+    > {
+        Ok(tonic::Response::new(
+            openshell_core::proto::compute::v1::UpsertSandboxTemplateResponse {},
+        ))
+    }
+
+    async fn delete_sandbox_template(
+        &self,
+        _request: Request<DeleteSandboxTemplateRequest>,
+    ) -> Result<
+        tonic::Response<openshell_core::proto::compute::v1::DeleteSandboxTemplateResponse>,
+        Status,
+    > {
+        Ok(tonic::Response::new(
+            openshell_core::proto::compute::v1::DeleteSandboxTemplateResponse { deleted: false },
         ))
     }
 
@@ -3993,6 +4216,7 @@ pub async fn new_test_runtime_with_driver(
             name: driver_name.to_string(),
             driver_name: driver_name.to_string(),
             driver_version: "test".to_string(),
+            supports_sandbox_template_lifecycle: false,
         },
         shutdown_cleanup: None,
         startup_starter: None,
@@ -4003,6 +4227,9 @@ pub async fn new_test_runtime_with_driver(
         sandbox_watch_bus: SandboxWatchBus::new(),
         tracing_log_bus: TracingLogBus::new(),
         supervisor_sessions: Arc::new(SupervisorSessionRegistry::new()),
+        supervisor_bootstrap_identity: None,
+        sandbox_claim_activation: None,
+        lease_scoped_reconciler: None,
         sync_lock: Arc::new(Mutex::new(())),
         lifecycle_gates: Arc::new(LifecycleGateRegistry::default()),
         gateway_listener_requirements: Vec::new(),
@@ -4025,15 +4252,25 @@ mod tests {
     use tokio::sync::{Notify, Semaphore, mpsc, oneshot};
     use tokio_stream::wrappers::UnboundedReceiverStream;
 
-    fn string_value(value: &str) -> prost_types::Value {
-        prost_types::Value {
-            kind: Some(prost_types::value::Kind::StringValue(value.to_string())),
+    struct TestLeaseScopedReconciler {
+        started: Arc<Notify>,
+        stopped: Arc<Notify>,
+    }
+
+    #[tonic::async_trait]
+    impl LeaseScopedReconciler for TestLeaseScopedReconciler {
+        async fn run(&self, mut cancel: watch::Receiver<bool>) {
+            self.started.notify_one();
+            if !*cancel.borrow() {
+                let _ = cancel.changed().await;
+            }
+            self.stopped.notify_one();
         }
     }
 
-    fn number_value(value: f64) -> prost_types::Value {
+    fn string_value(value: &str) -> prost_types::Value {
         prost_types::Value {
-            kind: Some(prost_types::value::Kind::NumberValue(value)),
+            kind: Some(prost_types::value::Kind::StringValue(value.to_string())),
         }
     }
 
@@ -4053,8 +4290,12 @@ mod tests {
     #[test]
     fn driver_sandbox_spec_from_public_preserves_gpu_requirement() {
         let public = SandboxSpec {
-            resource_requirements: Some(openshell_core::proto::ResourceRequirements {
-                gpu: Some(openshell_core::proto::GpuResourceRequirements { count: Some(2) }),
+            workload: Some(SandboxWorkloadConfig {
+                resources: Some(SandboxResources {
+                    gpu_count: Some(2),
+                    ..Default::default()
+                }),
+                ..Default::default()
             }),
             ..Default::default()
         };
@@ -4135,7 +4376,7 @@ mod tests {
         let err = select_driver_config(&Some(config), "kubernetes").unwrap_err();
 
         assert_eq!(err.code(), Code::InvalidArgument);
-        assert!(err.message().contains("template.driver_config.kubernetes"));
+        assert!(err.message().contains("driver_config.kubernetes"));
     }
 
     #[derive(Debug, Default)]
@@ -4143,6 +4384,7 @@ mod tests {
         listed_sandboxes: Vec<DriverSandbox>,
         current_sandboxes: Vec<DriverSandbox>,
         workspace_rpcs_unimplemented: bool,
+        create_error: Option<Code>,
     }
 
     #[tonic::async_trait]
@@ -4157,6 +4399,7 @@ mod tests {
                 driver_name: "test-driver".to_string(),
                 driver_version: "test".to_string(),
                 default_image: "openshell/sandbox:test".to_string(),
+                supports_sandbox_template_lifecycle: false,
             }))
         }
 
@@ -4174,6 +4417,32 @@ mod tests {
             _request: Request<ValidateSandboxCreateRequest>,
         ) -> Result<tonic::Response<ValidateSandboxCreateResponse>, Status> {
             Ok(tonic::Response::new(ValidateSandboxCreateResponse {}))
+        }
+
+        async fn upsert_sandbox_template(
+            &self,
+            _request: Request<UpsertSandboxTemplateRequest>,
+        ) -> Result<
+            tonic::Response<openshell_core::proto::compute::v1::UpsertSandboxTemplateResponse>,
+            Status,
+        > {
+            Ok(tonic::Response::new(
+                openshell_core::proto::compute::v1::UpsertSandboxTemplateResponse {},
+            ))
+        }
+
+        async fn delete_sandbox_template(
+            &self,
+            _request: Request<DeleteSandboxTemplateRequest>,
+        ) -> Result<
+            tonic::Response<openshell_core::proto::compute::v1::DeleteSandboxTemplateResponse>,
+            Status,
+        > {
+            Ok(tonic::Response::new(
+                openshell_core::proto::compute::v1::DeleteSandboxTemplateResponse {
+                    deleted: false,
+                },
+            ))
         }
 
         async fn get_sandbox(
@@ -4224,6 +4493,9 @@ mod tests {
             &self,
             _request: Request<CreateSandboxRequest>,
         ) -> Result<tonic::Response<CreateSandboxResponse>, Status> {
+            if let Some(code) = self.create_error {
+                return Err(Status::new(code, "controlled create error"));
+            }
             Ok(tonic::Response::new(CreateSandboxResponse {}))
         }
 
@@ -4455,6 +4727,7 @@ mod tests {
                 driver_name: "controlled-test-driver".to_string(),
                 driver_version: "test".to_string(),
                 default_image: "openshell/sandbox:test".to_string(),
+                supports_sandbox_template_lifecycle: false,
             }))
         }
 
@@ -4472,6 +4745,32 @@ mod tests {
             _request: Request<ValidateSandboxCreateRequest>,
         ) -> Result<tonic::Response<ValidateSandboxCreateResponse>, Status> {
             Ok(tonic::Response::new(ValidateSandboxCreateResponse {}))
+        }
+
+        async fn upsert_sandbox_template(
+            &self,
+            _request: Request<UpsertSandboxTemplateRequest>,
+        ) -> Result<
+            tonic::Response<openshell_core::proto::compute::v1::UpsertSandboxTemplateResponse>,
+            Status,
+        > {
+            Ok(tonic::Response::new(
+                openshell_core::proto::compute::v1::UpsertSandboxTemplateResponse {},
+            ))
+        }
+
+        async fn delete_sandbox_template(
+            &self,
+            _request: Request<DeleteSandboxTemplateRequest>,
+        ) -> Result<
+            tonic::Response<openshell_core::proto::compute::v1::DeleteSandboxTemplateResponse>,
+            Status,
+        > {
+            Ok(tonic::Response::new(
+                openshell_core::proto::compute::v1::DeleteSandboxTemplateResponse {
+                    deleted: false,
+                },
+            ))
         }
 
         async fn get_sandbox(
@@ -4645,6 +4944,7 @@ mod tests {
                 name: "test-driver".to_string(),
                 driver_name: "test-driver".to_string(),
                 driver_version: "test".to_string(),
+                supports_sandbox_template_lifecycle: false,
             },
             shutdown_cleanup: None,
             startup_starter,
@@ -4655,11 +4955,72 @@ mod tests {
             sandbox_watch_bus: SandboxWatchBus::new(),
             tracing_log_bus: TracingLogBus::new(),
             supervisor_sessions: Arc::new(SupervisorSessionRegistry::new()),
+            supervisor_bootstrap_identity: None,
+            sandbox_claim_activation: None,
+            lease_scoped_reconciler: None,
             sync_lock: Arc::new(Mutex::new(())),
             lifecycle_gates: Arc::new(LifecycleGateRegistry::default()),
             gateway_listener_requirements: Vec::new(),
             replica_id: "test-replica".to_string(),
         }
+    }
+
+    #[tokio::test]
+    async fn lease_scoped_reconciler_stops_when_cancelled() {
+        let mut runtime = test_runtime(Arc::new(TestDriver::default())).await;
+        let started = Arc::new(Notify::new());
+        let stopped = Arc::new(Notify::new());
+        runtime.lease_scoped_reconciler = Some(Arc::new(TestLeaseScopedReconciler {
+            started: started.clone(),
+            stopped: stopped.clone(),
+        }));
+
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+        let handle = runtime
+            .spawn_lease_scoped_reconciler(cancel_rx)
+            .expect("configured reconciler should start");
+        tokio::time::timeout(Duration::from_secs(1), started.notified())
+            .await
+            .expect("reconciler should start");
+
+        cancel_tx.send(true).unwrap();
+        handle.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), stopped.notified())
+            .await
+            .expect("reconciler should stop after cancellation");
+    }
+
+    #[tokio::test]
+    async fn lease_holder_runs_and_awaits_lease_scoped_reconciler() {
+        let driver = ControlledDriver::new();
+        let mut runtime = test_runtime(driver).await;
+        let started = Arc::new(Notify::new());
+        let stopped = Arc::new(Notify::new());
+        runtime.lease_scoped_reconciler = Some(Arc::new(TestLeaseScopedReconciler {
+            started: started.clone(),
+            stopped: stopped.clone(),
+        }));
+
+        let lease = lease::ReconcilerLease::new(
+            runtime.store.clone(),
+            runtime.replica_id.clone(),
+            lease::LEASE_TTL,
+        );
+        let guard = lease.acquire_or_steal().await.unwrap();
+        let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        let runtime = Arc::new(runtime);
+        let holder = tokio::spawn(async move {
+            runtime.run_as_holder(&lease, guard, &mut shutdown_rx).await;
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), started.notified())
+            .await
+            .expect("lease holder should start the reconciler");
+        shutdown_tx.send(true).unwrap();
+        holder.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), stopped.notified())
+            .await
+            .expect("lease holder should await reconciler shutdown");
     }
 
     fn register_test_supervisor_session(runtime: &ComputeRuntime, sandbox_id: &str) {
@@ -4689,6 +5050,81 @@ mod tests {
         };
         sandbox.set_phase(phase as i32);
         sandbox
+    }
+
+    #[tokio::test]
+    async fn ambiguous_create_preserves_provisioning_record() {
+        let runtime = test_runtime(Arc::new(TestDriver {
+            create_error: Some(Code::Unavailable),
+            ..Default::default()
+        }))
+        .await;
+        let sandbox = sandbox_record("sb-ambiguous", "sandbox-a", SandboxPhase::Provisioning);
+
+        let err = runtime
+            .create_sandbox(sandbox, None)
+            .await
+            .expect_err("ambiguous create should remain unavailable");
+
+        assert_eq!(err.code(), Code::Unavailable);
+        let stored = runtime
+            .store
+            .get_message::<Sandbox>("sb-ambiguous")
+            .await
+            .unwrap()
+            .expect("provisioning record must be retained");
+        assert_eq!(stored.phase(), SandboxPhase::Provisioning as i32);
+        assert_eq!(stored.object_name(), "sandbox-a");
+        assert_eq!(
+            runtime
+                .sandbox_index
+                .sandbox_id_for_sandbox_name("default", "sandbox-a")
+                .as_deref(),
+            Some("sb-ambiguous")
+        );
+    }
+
+    #[tokio::test]
+    async fn ambiguous_create_is_pruned_when_backend_resource_never_appears() {
+        let runtime = test_runtime(Arc::new(TestDriver {
+            create_error: Some(Code::Unavailable),
+            ..Default::default()
+        }))
+        .await;
+        let sandbox = sandbox_record("sb-ambiguous", "sandbox-a", SandboxPhase::Provisioning);
+
+        let err = runtime
+            .create_sandbox(sandbox, None)
+            .await
+            .expect_err("ambiguous create should remain unavailable");
+        assert_eq!(err.code(), Code::Unavailable);
+        assert_eq!(
+            runtime
+                .sandbox_index
+                .sandbox_id_for_sandbox_name("default", "sandbox-a")
+                .as_deref(),
+            Some("sb-ambiguous")
+        );
+
+        runtime
+            .reconcile_store_with_backend(Duration::ZERO)
+            .await
+            .unwrap();
+
+        assert!(
+            runtime
+                .store
+                .get_message::<Sandbox>("sb-ambiguous")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            runtime
+                .sandbox_index
+                .sandbox_id_for_sandbox_name("default", "sandbox-a")
+                .is_none()
+        );
     }
 
     fn ssh_session_record(id: &str, sandbox_id: &str) -> SshSession {
@@ -5075,123 +5511,6 @@ mod tests {
     }
 
     #[test]
-    fn build_platform_config_omits_typed_cpu_and_memory_resources() {
-        let template = SandboxTemplate {
-            resources: Some(prost_types::Struct {
-                fields: [
-                    (
-                        "limits",
-                        struct_value([("cpu", string_value("2")), ("memory", string_value("1Gi"))]),
-                    ),
-                    (
-                        "requests",
-                        struct_value([
-                            ("cpu", string_value("500m")),
-                            ("memory", string_value("512Mi")),
-                        ]),
-                    ),
-                ]
-                .into_iter()
-                .map(|(key, value)| (key.to_string(), value))
-                .collect(),
-            }),
-            ..Default::default()
-        };
-
-        assert!(build_platform_config(&template).is_none());
-    }
-
-    #[test]
-    fn build_platform_config_preserves_non_typed_resource_fields() {
-        let template = SandboxTemplate {
-            resources: Some(prost_types::Struct {
-                fields: [
-                    (
-                        "limits",
-                        struct_value([
-                            ("cpu", string_value("2")),
-                            ("memory", string_value("1Gi")),
-                            ("nvidia.com/gpu", string_value("1")),
-                        ]),
-                    ),
-                    (
-                        "requests",
-                        struct_value([
-                            ("cpu", string_value("500m")),
-                            ("memory", string_value("512Mi")),
-                            ("hugepages-2Mi", string_value("4Mi")),
-                        ]),
-                    ),
-                    ("opaque_cpu", number_value(2.0)),
-                ]
-                .into_iter()
-                .map(|(key, value)| (key.to_string(), value))
-                .collect(),
-            }),
-            ..Default::default()
-        };
-
-        let platform_config = build_platform_config(&template).unwrap();
-        let resources_raw = platform_config
-            .fields
-            .get("resources_raw")
-            .and_then(|value| value.kind.as_ref())
-            .and_then(|kind| match kind {
-                prost_types::value::Kind::StructValue(inner) => Some(inner),
-                _ => None,
-            })
-            .unwrap();
-
-        let limits = resources_raw
-            .fields
-            .get("limits")
-            .and_then(|value| value.kind.as_ref())
-            .and_then(|kind| match kind {
-                prost_types::value::Kind::StructValue(inner) => Some(inner),
-                _ => None,
-            })
-            .unwrap();
-        assert!(!limits.fields.contains_key("cpu"));
-        assert!(!limits.fields.contains_key("memory"));
-        assert_eq!(
-            limits
-                .fields
-                .get("nvidia.com/gpu")
-                .and_then(|value| value.kind.as_ref())
-                .and_then(|kind| match kind {
-                    prost_types::value::Kind::StringValue(value) => Some(value.as_str()),
-                    _ => None,
-                }),
-            Some("1")
-        );
-
-        let requests = resources_raw
-            .fields
-            .get("requests")
-            .and_then(|value| value.kind.as_ref())
-            .and_then(|kind| match kind {
-                prost_types::value::Kind::StructValue(inner) => Some(inner),
-                _ => None,
-            })
-            .unwrap();
-        assert!(!requests.fields.contains_key("cpu"));
-        assert!(!requests.fields.contains_key("memory"));
-        assert_eq!(
-            requests
-                .fields
-                .get("hugepages-2Mi")
-                .and_then(|value| value.kind.as_ref())
-                .and_then(|kind| match kind {
-                    prost_types::value::Kind::StringValue(value) => Some(value.as_str()),
-                    _ => None,
-                }),
-            Some("4Mi")
-        );
-
-        assert!(resources_raw.fields.contains_key("opaque_cpu"));
-    }
-
-    #[test]
     fn rewrite_user_facing_conditions_rewrites_gpu_unschedulable_message() {
         let mut status = Some(SandboxStatus {
             sandbox_name: "test".to_string(),
@@ -5209,8 +5528,12 @@ mod tests {
         rewrite_user_facing_conditions(
             &mut status,
             Some(&SandboxSpec {
-                resource_requirements: Some(openshell_core::proto::ResourceRequirements {
-                    gpu: Some(openshell_core::proto::GpuResourceRequirements { count: None }),
+                workload: Some(SandboxWorkloadConfig {
+                    resources: Some(SandboxResources {
+                        gpu_count: Some(1),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
                 }),
                 ..Default::default()
             }),
@@ -5348,6 +5671,26 @@ mod tests {
                 request: Request<ValidateSandboxCreateRequest>,
             ) -> Result<tonic::Response<ValidateSandboxCreateResponse>, Status> {
                 self.0.validate_sandbox_create(request).await
+            }
+
+            async fn upsert_sandbox_template(
+                &self,
+                request: Request<UpsertSandboxTemplateRequest>,
+            ) -> Result<
+                tonic::Response<openshell_core::proto::compute::v1::UpsertSandboxTemplateResponse>,
+                Status,
+            > {
+                self.0.upsert_sandbox_template(request).await
+            }
+
+            async fn delete_sandbox_template(
+                &self,
+                request: Request<DeleteSandboxTemplateRequest>,
+            ) -> Result<
+                tonic::Response<openshell_core::proto::compute::v1::DeleteSandboxTemplateResponse>,
+                Status,
+            > {
+                self.0.delete_sandbox_template(request).await
             }
 
             async fn get_sandbox(
@@ -6156,8 +6499,7 @@ mod tests {
         let runtime = test_runtime(Arc::new(TestDriver::default())).await;
         let mut sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Provisioning);
         sandbox.spec = Some(SandboxSpec {
-            log_level: "debug".to_string(),
-            template: Some(SandboxTemplate {
+            workload: Some(SandboxWorkloadConfig {
                 image: "example.test/sandbox:complete".to_string(),
                 ..Default::default()
             }),
@@ -6180,8 +6522,8 @@ mod tests {
             stored
                 .spec
                 .as_ref()
-                .and_then(|spec| spec.template.as_ref())
-                .map(|template| template.image.as_str()),
+                .and_then(|spec| spec.workload.as_ref())
+                .map(|workload| workload.image.as_str()),
             Some("example.test/sandbox:complete")
         );
         assert_eq!(
@@ -6937,7 +7279,10 @@ mod tests {
         let runtime = test_runtime(driver).await;
         let mut sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Ready);
         sandbox.spec = Some(SandboxSpec {
-            log_level: "debug".to_string(),
+            workload: Some(SandboxWorkloadConfig {
+                environment: HashMap::from([("DEBUG_MARKER".to_string(), "true".to_string())]),
+                ..Default::default()
+            }),
             ..Default::default()
         });
         runtime.store.put_message(&sandbox).await.unwrap();
@@ -6961,8 +7306,13 @@ mod tests {
         );
         assert_sandbox_owned_records(&runtime, &sandbox, &session, true).await;
         assert_eq!(
-            stored.spec.as_ref().map(|spec| spec.log_level.as_str()),
-            Some("debug")
+            stored
+                .spec
+                .as_ref()
+                .and_then(|spec| spec.workload.as_ref())
+                .and_then(|workload| workload.environment.get("DEBUG_MARKER"))
+                .map(String::as_str),
+            Some("true")
         );
     }
 
@@ -7691,13 +8041,18 @@ mod tests {
                 }),
                 workspace: "default".to_string(),
             }],
+            ..Default::default()
         }))
         .await;
 
         let sandbox = Sandbox {
             spec: Some(SandboxSpec {
-                resource_requirements: Some(openshell_core::proto::ResourceRequirements {
-                    gpu: Some(openshell_core::proto::GpuResourceRequirements { count: None }),
+                workload: Some(SandboxWorkloadConfig {
+                    resources: Some(SandboxResources {
+                        gpu_count: Some(1),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
                 }),
                 ..Default::default()
             }),
@@ -7723,7 +8078,12 @@ mod tests {
             SandboxPhase::Ready
         );
         assert!(stored.spec.as_ref().is_some_and(|spec| {
-            openshell_core::gpu::sandbox_gpu_requested(spec.resource_requirements.as_ref())
+            spec.workload
+                .as_ref()
+                .and_then(|workload| workload.resources.as_ref())
+                .is_some_and(|resources| {
+                    openshell_core::gpu::sandbox_gpu_requested(Some(resources))
+                })
         }));
     }
 
@@ -7862,6 +8222,7 @@ mod tests {
                 })),
                 workspace: "default".to_string(),
             }],
+            ..Default::default()
         }))
         .await;
 
@@ -8199,48 +8560,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn build_platform_config_inverts_user_namespaces_to_host_users() {
-        use prost_types::value::Kind;
-
-        // user_namespaces: true  → host_users: false
-        let mut template = SandboxTemplate {
-            user_namespaces: Some(true),
-            ..SandboxTemplate::default()
-        };
-        let config = build_platform_config(&template).expect("config should be Some");
-        let host_users = config
-            .fields
-            .get("host_users")
-            .expect("host_users must exist");
-        assert_eq!(
-            host_users.kind,
-            Some(Kind::BoolValue(false)),
-            "user_namespaces: true must produce host_users: false"
-        );
-
-        // user_namespaces: false → host_users: true
-        template.user_namespaces = Some(false);
-        let config = build_platform_config(&template).expect("config should be Some");
-        let host_users = config
-            .fields
-            .get("host_users")
-            .expect("host_users must exist");
-        assert_eq!(
-            host_users.kind,
-            Some(Kind::BoolValue(true)),
-            "user_namespaces: false must produce host_users: true"
-        );
-
-        // user_namespaces: None → host_users absent
-        template.user_namespaces = None;
-        let config = build_platform_config(&template);
-        assert!(
-            config.is_none() || !config.as_ref().unwrap().fields.contains_key("host_users"),
-            "unset user_namespaces must not produce host_users"
-        );
-    }
-
     #[tokio::test]
     async fn compute_driver_initialization_records_an_operation_span() {
         use crate::otel_tracing::test_exporter;
@@ -8258,6 +8577,8 @@ mod tests {
             SandboxWatchBus::new(),
             TracingLogBus::new(),
             Arc::new(SupervisorSessionRegistry::new()),
+            None,
+            None,
         )
         .await
         .unwrap();
@@ -8307,6 +8628,7 @@ mod tests {
             remote
                 .create_sandbox(Request::new(CreateSandboxRequest {
                     sandbox: Some(sandbox.clone()),
+                    sandbox_template: None,
                 }))
                 .await
                 .unwrap();
@@ -8443,25 +8765,29 @@ mod tests {
         );
 
         let mut sandbox = sandbox_record("sb-uds", "uds-sandbox", SandboxPhase::Provisioning);
+        sandbox.created_from_template = Some(openshell_core::proto::SandboxTemplateProvenance {
+            id: "template-id-a".to_string(),
+            name: "template-a".to_string(),
+            resource_version: "42".to_string(),
+        });
         sandbox.spec = Some(SandboxSpec {
-            log_level: "debug".to_string(),
-            template: Some(SandboxTemplate {
+            workload: Some(SandboxWorkloadConfig {
                 image: "ghcr.io/nvidia/openshell/sandbox:test".to_string(),
-                driver_config: Some(prost_types::Struct {
-                    fields: [
-                        (
-                            "external-test".to_string(),
-                            struct_value([("pool", string_value("ci"))]),
-                        ),
-                        (
-                            "docker".to_string(),
-                            struct_value([("network_mode", string_value("bridge"))]),
-                        ),
-                    ]
-                    .into_iter()
-                    .collect(),
-                }),
                 ..Default::default()
+            }),
+            driver_config: Some(prost_types::Struct {
+                fields: [
+                    (
+                        "external-test".to_string(),
+                        struct_value([("pool", string_value("ci"))]),
+                    ),
+                    (
+                        "docker".to_string(),
+                        struct_value([("network_mode", string_value("bridge"))]),
+                    ),
+                ]
+                .into_iter()
+                .collect(),
             }),
             ..Default::default()
         });
@@ -8501,14 +8827,22 @@ mod tests {
         assert!(driver_config.fields.contains_key("pool"));
         assert!(!driver_config.fields.contains_key("network_mode"));
 
-        let created = match &calls[3] {
+        let (created, sandbox_template) = match &calls[3] {
             FakeComputeDriverCall::CreateSandbox {
                 sandbox: Some(sandbox),
-            } => sandbox,
+                sandbox_template,
+            } => (sandbox, sandbox_template),
             other => panic!("expected CreateSandbox call, got {other:?}"),
         };
         assert_eq!(created.id, "sb-uds");
         assert_eq!(created.name, "uds-sandbox");
+        let sandbox_template = sandbox_template
+            .as_ref()
+            .expect("template-created sandbox should forward template ref");
+        assert_eq!(sandbox_template.id, "template-id-a");
+        assert_eq!(sandbox_template.name, "template-a");
+        assert_eq!(sandbox_template.workspace, "default");
+        assert_eq!(sandbox_template.resource_version, 42);
 
         match &calls[4] {
             FakeComputeDriverCall::DeleteSandbox {

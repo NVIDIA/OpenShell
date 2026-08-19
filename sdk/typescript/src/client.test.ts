@@ -20,7 +20,7 @@ import {
   SCOPE_NAMES,
   STATUS_NAMES,
 } from './client.js';
-import { OpenShell, SandboxPhase, ServiceStatus } from './gen/openshell_pb.js';
+import { type CreateSandboxRequest, OpenShell, SandboxPhase, ServiceStatus } from './gen/openshell_pb.js';
 import { PolicySource, SettingScope } from './gen/sandbox_pb.js';
 
 function client(impl: Partial<ServiceImpl<typeof OpenShell>>): SandboxClient {
@@ -203,8 +203,8 @@ describe('exec / execStream', () => {
 });
 
 describe('create', () => {
-  it('sends the curated policy through spec.policy', async () => {
-    let created: { spec?: { policy?: { version?: number } } } = {};
+  it('sends the curated policy through the create request', async () => {
+    let created: CreateSandboxRequest | undefined;
     const sandbox = client({
       createSandbox: (req) => {
         created = req;
@@ -212,17 +212,11 @@ describe('create', () => {
       },
     });
     await sandbox.create({ image: 'img', policy: { version: 1, networkPolicies: {} } });
-    expect(created.spec?.policy?.version).toBe(1);
+    expect(created?.policy?.version).toBe(1);
   });
 
-  it('rawSpec reaches an ungated field and overrides a curated one', async () => {
-    let created: {
-      spec?: {
-        logLevel?: string;
-        template?: { image?: string };
-        providers?: string[];
-      };
-    } = {};
+  it('rawCreateRequest reaches ungated fields and overrides curated ones', async () => {
+    let created: CreateSandboxRequest | undefined;
     const sandbox = client({
       createSandbox: (req) => {
         created = req;
@@ -232,14 +226,23 @@ describe('create', () => {
     await sandbox.create({
       image: 'curated-image',
       providers: ['claude'],
-      rawSpec: { logLevel: 'debug', template: { image: 'raw-image' } },
+      rawCreateRequest: {
+        annotations: { owner: 'sdk-test' },
+        workloadSource: {
+          case: 'workload',
+          value: { image: 'raw-image' },
+        },
+      },
     });
-    // Ungated field only reachable via rawSpec.
-    expect(created.spec?.logLevel).toBe('debug');
-    // rawSpec wins on a field the curated shape also sets.
-    expect(created.spec?.template?.image).toBe('raw-image');
-    // Curated fields rawSpec does not touch survive.
-    expect(created.spec?.providers).toEqual(['claude']);
+    // Ungated field only reachable via rawCreateRequest.
+    expect(created?.annotations?.owner).toBe('sdk-test');
+    // rawCreateRequest wins on a field the curated shape also sets.
+    expect(created?.workloadSource.case).toBe('workload');
+    expect(created?.workloadSource.case === 'workload' ? created.workloadSource.value.image : undefined).toBe(
+      'raw-image',
+    );
+    // Curated fields rawCreateRequest does not touch survive.
+    expect(created?.providers).toEqual(['claude']);
   });
 
   it('rejects gateway sandboxes missing required metadata', async () => {

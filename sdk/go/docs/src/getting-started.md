@@ -65,10 +65,11 @@ Verify the gateway is reachable:
 Create a sandbox with a Python image:
 
 ```go
-    sandbox, err := client.Sandboxes().Create(ctx, "default", "my-sandbox", &v1.SandboxSpec{
-        Template: &v1.SandboxTemplate{Image: "python:3.12"},
+    workload := &v1.SandboxWorkloadConfig{
+        Image: "python:3.12",
         Environment: map[string]string{"LANG": "en_US.UTF-8"},
-    }, nil)
+    }
+    sandbox, err := client.Sandboxes().Create(ctx, "default", "my-sandbox", workload, nil, nil, nil)
     if err != nil {
         log.Fatal(err)
     }

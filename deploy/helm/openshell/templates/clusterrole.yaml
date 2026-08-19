@@ -73,6 +73,36 @@ rules:
     verbs:
       - get
   {{- end }}
+  # Discover OpenShell-enabled Agent Sandbox warm pools across namespaces.
+  # SandboxClaim create/delete is namespaced, but the ClusterRoleBinding lets
+  # workspace-to-namespace mappings use warm pools outside the release namespace.
+  - apiGroups:
+      - extensions.agents.x-k8s.io
+    resources:
+      - sandboxclaims
+    verbs:
+      {{- if .Values.server.warmPooling.enabled }}
+      - create
+      - delete
+      {{- end }}
+      - get
+      - list
+      - watch
+  - apiGroups:
+      - extensions.agents.x-k8s.io
+    resources:
+      - sandboxtemplates
+      - sandboxwarmpools
+    verbs:
+      - get
+      - list
+      - watch
+      {{- if .Values.server.warmPooling.templates.enabled }}
+      - create
+      - patch
+      - update
+      - delete
+      {{- end }}
   {{- $copiedSecretNames := list }}
   {{- if and (ne $workspaceMode "shared") (not .Values.server.disableTls) }}
   {{- $copiedSecretNames = append $copiedSecretNames .Values.server.tls.clientTlsSecretName }}

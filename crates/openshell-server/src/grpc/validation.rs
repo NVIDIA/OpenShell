@@ -11,17 +11,16 @@
 use openshell_core::ComputeDriverKind;
 use openshell_core::proto::{
     CredentialHandle, ExecSandboxRequest, Provider, SandboxPolicy as ProtoSandboxPolicy,
-    SandboxTemplate,
+    SandboxTemplate, SandboxTemplateSpec, SandboxWorkloadConfig, create_sandbox_request,
 };
 use prost::Message;
 use tonic::Status;
 
 use super::{
-    MAX_ENVIRONMENT_ENTRIES, MAX_LABEL_SELECTOR_PAIRS, MAX_LOG_LEVEL_LEN, MAX_MAP_KEY_LEN,
-    MAX_MAP_VALUE_LEN, MAX_METADATA_ANNOTATIONS_ENTRIES, MAX_NAME_LEN, MAX_POLICY_SIZE,
-    MAX_PROVIDER_CONFIG_ENTRIES, MAX_PROVIDER_CREDENTIALS_ENTRIES, MAX_PROVIDER_TYPE_LEN,
-    MAX_PROVIDERS, MAX_ROUTABLE_NAME_LEN, MAX_TEMPLATE_MAP_ENTRIES, MAX_TEMPLATE_STRING_LEN,
-    MAX_TEMPLATE_STRUCT_SIZE,
+    MAX_ENVIRONMENT_ENTRIES, MAX_LABEL_SELECTOR_PAIRS, MAX_MAP_KEY_LEN, MAX_MAP_VALUE_LEN,
+    MAX_METADATA_ANNOTATIONS_ENTRIES, MAX_NAME_LEN, MAX_POLICY_SIZE, MAX_PROVIDER_CONFIG_ENTRIES,
+    MAX_PROVIDER_CREDENTIALS_ENTRIES, MAX_PROVIDER_TYPE_LEN, MAX_PROVIDERS, MAX_ROUTABLE_NAME_LEN,
+    MAX_TEMPLATE_STRING_LEN, MAX_TEMPLATE_STRUCT_SIZE,
 };
 
 // ---------------------------------------------------------------------------
@@ -164,11 +163,67 @@ pub(super) fn validate_dns1123_label(name: &str, field: &str) -> Result<(), Stat
 /// Validate field sizes on a `CreateSandboxRequest` before persisting.
 ///
 /// Returns `INVALID_ARGUMENT` on the first field that exceeds its limit.
+pub(super) fn validate_create_sandbox_request(
+    request: &openshell_core::proto::CreateSandboxRequest,
+) -> Result<(), Status> {
+    // --- request.name ---
+    if !request.name.is_empty() && request.name.len() > MAX_ROUTABLE_NAME_LEN {
+        return Err(Status::invalid_argument(format!(
+            "name exceeds maximum length ({} > {MAX_ROUTABLE_NAME_LEN})",
+            request.name.len()
+        )));
+    }
+    validate_dns1123_label(&request.name, "name")?;
+
+    // --- request.providers ---
+    if request.providers.len() > MAX_PROVIDERS {
+        return Err(Status::invalid_argument(format!(
+            "providers list exceeds maximum ({} > {MAX_PROVIDERS})",
+            request.providers.len()
+        )));
+    }
+
+    match request.workload_source.as_ref() {
+        Some(create_sandbox_request::WorkloadSource::Workload(workload)) => {
+            validate_sandbox_workload(workload, "workload")?;
+        }
+        Some(create_sandbox_request::WorkloadSource::WorkloadTemplateName(template_name)) => {
+            if template_name.trim().is_empty() {
+                return Err(Status::invalid_argument(
+                    "workload_template_name must not be empty",
+                ));
+            }
+            if template_name.len() > MAX_TEMPLATE_STRING_LEN {
+                return Err(Status::invalid_argument(format!(
+                    "workload_template_name exceeds maximum length ({} > {MAX_TEMPLATE_STRING_LEN})",
+                    template_name.len()
+                )));
+            }
+        }
+        None => {
+            return Err(Status::invalid_argument(
+                "one of workload or workload_template_name is required",
+            ));
+        }
+    }
+
+    // --- spec.policy serialized size ---
+    if let Some(ref policy) = request.policy {
+        let size = policy.encoded_len();
+        if size > MAX_POLICY_SIZE {
+            return Err(Status::invalid_argument(format!(
+                "policy serialized size exceeds maximum ({size} > {MAX_POLICY_SIZE})"
+            )));
+        }
+    }
+
+    Ok(())
+}
+
 pub(super) fn validate_sandbox_spec(
     name: &str,
     spec: &openshell_core::proto::SandboxSpec,
 ) -> Result<(), Status> {
-    // --- request.name ---
     if !name.is_empty() && name.len() > MAX_ROUTABLE_NAME_LEN {
         return Err(Status::invalid_argument(format!(
             "name exceeds maximum length ({} > {MAX_ROUTABLE_NAME_LEN})",
@@ -177,7 +232,6 @@ pub(super) fn validate_sandbox_spec(
     }
     validate_dns1123_label(name, "name")?;
 
-    // --- spec.providers ---
     if spec.providers.len() > MAX_PROVIDERS {
         return Err(Status::invalid_argument(format!(
             "providers list exceeds maximum ({} > {MAX_PROVIDERS})",
@@ -185,34 +239,19 @@ pub(super) fn validate_sandbox_spec(
         )));
     }
 
-    // --- spec.log_level ---
-    if spec.log_level.len() > MAX_LOG_LEVEL_LEN {
-        return Err(Status::invalid_argument(format!(
-            "log_level exceeds maximum length ({} > {MAX_LOG_LEVEL_LEN})",
-            spec.log_level.len()
-        )));
+    if let Some(workload) = spec.workload.as_ref() {
+        validate_sandbox_workload(workload, "spec.workload")?;
     }
 
-    // --- spec.environment ---
-    validate_string_map(
-        &spec.environment,
-        MAX_ENVIRONMENT_ENTRIES,
-        MAX_MAP_KEY_LEN,
-        MAX_MAP_VALUE_LEN,
-        "spec.environment",
-    )?;
-    validate_env_entries(&spec.environment, "spec.environment")?;
-
-    // --- spec.template ---
-    if let Some(ref tmpl) = spec.template {
-        validate_sandbox_template(tmpl)?;
-        validate_env_entries(&tmpl.environment, "spec.template.environment")?;
+    if let Some(ref s) = spec.driver_config {
+        let size = s.encoded_len();
+        if size > MAX_TEMPLATE_STRUCT_SIZE {
+            return Err(Status::invalid_argument(format!(
+                "spec.driver_config serialized size exceeds maximum ({size} > {MAX_TEMPLATE_STRUCT_SIZE})"
+            )));
+        }
     }
 
-    // --- spec.resource_requirements.gpu ---
-    validate_gpu_request_fields(spec)?;
-
-    // --- spec.policy serialized size ---
     if let Some(ref policy) = spec.policy {
         let size = policy.encoded_len();
         if size > MAX_POLICY_SIZE {
@@ -225,8 +264,23 @@ pub(super) fn validate_sandbox_spec(
     Ok(())
 }
 
-fn validate_gpu_request_fields(spec: &openshell_core::proto::SandboxSpec) -> Result<(), Status> {
-    if openshell_core::gpu::sandbox_gpu_count(spec.resource_requirements.as_ref()) == Some(0) {
+fn validate_sandbox_workload(workload: &SandboxWorkloadConfig, field: &str) -> Result<(), Status> {
+    if workload.image.len() > MAX_TEMPLATE_STRING_LEN {
+        return Err(Status::invalid_argument(format!(
+            "{field}.image exceeds maximum length ({} > {MAX_TEMPLATE_STRING_LEN})",
+            workload.image.len()
+        )));
+    }
+    validate_string_map(
+        &workload.environment,
+        MAX_ENVIRONMENT_ENTRIES,
+        MAX_MAP_KEY_LEN,
+        MAX_MAP_VALUE_LEN,
+        &format!("{field}.environment"),
+    )?;
+    validate_env_entries(&workload.environment, &format!("{field}.environment"))?;
+
+    if openshell_core::gpu::sandbox_gpu_count(workload.resources.as_ref()) == Some(0) {
         return Err(Status::invalid_argument("gpu count must be greater than 0"));
     }
 
@@ -234,58 +288,26 @@ fn validate_gpu_request_fields(spec: &openshell_core::proto::SandboxSpec) -> Res
 }
 
 /// Validate template-level field sizes.
-fn validate_sandbox_template(tmpl: &SandboxTemplate) -> Result<(), Status> {
-    // String fields.
-    for (field, value) in [
-        ("template.image", &tmpl.image),
-        ("template.runtime_class_name", &tmpl.runtime_class_name),
-        ("template.agent_socket", &tmpl.agent_socket),
-    ] {
-        if value.len() > MAX_TEMPLATE_STRING_LEN {
-            return Err(Status::invalid_argument(format!(
-                "{field} exceeds maximum length ({} > {MAX_TEMPLATE_STRING_LEN})",
-                value.len()
-            )));
-        }
-    }
+pub(super) fn validate_sandbox_template(tmpl: &SandboxTemplate) -> Result<(), Status> {
+    validate_sandbox_template_spec(
+        tmpl.spec
+            .as_ref()
+            .ok_or_else(|| Status::invalid_argument("template spec is required"))?,
+    )
+}
 
-    // Map fields.
-    validate_string_map(
-        &tmpl.labels,
-        MAX_TEMPLATE_MAP_ENTRIES,
-        MAX_MAP_KEY_LEN,
-        MAX_MAP_VALUE_LEN,
-        "template.labels",
-    )?;
-    validate_string_map(
-        &tmpl.annotations,
-        MAX_TEMPLATE_MAP_ENTRIES,
-        MAX_MAP_KEY_LEN,
-        MAX_MAP_VALUE_LEN,
-        "template.annotations",
-    )?;
-    validate_string_map(
-        &tmpl.environment,
-        MAX_TEMPLATE_MAP_ENTRIES,
-        MAX_MAP_KEY_LEN,
-        MAX_MAP_VALUE_LEN,
-        "template.environment",
-    )?;
+pub(super) fn validate_sandbox_template_spec(spec: &SandboxTemplateSpec) -> Result<(), Status> {
+    let workload = spec
+        .workload
+        .as_ref()
+        .ok_or_else(|| Status::invalid_argument("template workload is required"))?;
+    validate_sandbox_workload(workload, "template.spec.workload")?;
 
-    // Struct fields (serialized size).
-    if let Some(ref s) = tmpl.resources {
+    if let Some(ref s) = spec.driver_config {
         let size = s.encoded_len();
         if size > MAX_TEMPLATE_STRUCT_SIZE {
             return Err(Status::invalid_argument(format!(
-                "template.resources serialized size exceeds maximum ({size} > {MAX_TEMPLATE_STRUCT_SIZE})"
-            )));
-        }
-    }
-    if let Some(ref s) = tmpl.driver_config {
-        let size = s.encoded_len();
-        if size > MAX_TEMPLATE_STRUCT_SIZE {
-            return Err(Status::invalid_argument(format!(
-                "template.driver_config serialized size exceeds maximum ({size} > {MAX_TEMPLATE_STRUCT_SIZE})"
+                "template.spec.driver_config serialized size exceeds maximum ({size} > {MAX_TEMPLATE_STRUCT_SIZE})"
             )));
         }
     }
@@ -957,21 +979,30 @@ pub(super) fn level_matches(log_level: &str, min_level: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use openshell_core::proto::SandboxSpec;
+    use openshell_core::proto::{SandboxResources, SandboxSpec};
     use std::collections::HashMap;
     use tonic::Code;
 
     use crate::grpc::{
-        MAX_ENVIRONMENT_ENTRIES, MAX_LOG_LEVEL_LEN, MAX_MAP_KEY_LEN, MAX_MAP_VALUE_LEN,
-        MAX_NAME_LEN, MAX_POLICY_SIZE, MAX_PROVIDER_CONFIG_ENTRIES,
-        MAX_PROVIDER_CREDENTIALS_ENTRIES, MAX_PROVIDER_TYPE_LEN, MAX_PROVIDERS,
-        MAX_TEMPLATE_MAP_ENTRIES, MAX_TEMPLATE_STRING_LEN, MAX_TEMPLATE_STRUCT_SIZE,
+        MAX_ENVIRONMENT_ENTRIES, MAX_MAP_KEY_LEN, MAX_MAP_VALUE_LEN, MAX_NAME_LEN, MAX_POLICY_SIZE,
+        MAX_PROVIDER_CONFIG_ENTRIES, MAX_PROVIDER_CREDENTIALS_ENTRIES, MAX_PROVIDER_TYPE_LEN,
+        MAX_PROVIDERS, MAX_TEMPLATE_STRING_LEN, MAX_TEMPLATE_STRUCT_SIZE,
     };
 
     // ---- Sandbox spec validation ----
 
     fn default_spec() -> SandboxSpec {
         SandboxSpec::default()
+    }
+
+    fn spec_with_env(env: HashMap<String, String>) -> SandboxSpec {
+        SandboxSpec {
+            workload: Some(SandboxWorkloadConfig {
+                environment: env,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
     }
 
     #[test]
@@ -983,8 +1014,12 @@ mod tests {
     #[test]
     fn validate_sandbox_spec_accepts_gpu_flag() {
         let spec = SandboxSpec {
-            resource_requirements: Some(openshell_core::proto::ResourceRequirements {
-                gpu: Some(openshell_core::proto::GpuResourceRequirements { count: None }),
+            workload: Some(SandboxWorkloadConfig {
+                resources: Some(SandboxResources {
+                    gpu_count: Some(1),
+                    ..Default::default()
+                }),
+                ..Default::default()
             }),
             ..Default::default()
         };
@@ -994,8 +1029,12 @@ mod tests {
     #[test]
     fn validate_sandbox_spec_accepts_gpu_count() {
         let spec = SandboxSpec {
-            resource_requirements: Some(openshell_core::proto::ResourceRequirements {
-                gpu: Some(openshell_core::proto::GpuResourceRequirements { count: Some(2) }),
+            workload: Some(SandboxWorkloadConfig {
+                resources: Some(SandboxResources {
+                    gpu_count: Some(2),
+                    ..Default::default()
+                }),
+                ..Default::default()
             }),
             ..Default::default()
         };
@@ -1005,8 +1044,12 @@ mod tests {
     #[test]
     fn validate_sandbox_spec_rejects_zero_gpu_count() {
         let spec = SandboxSpec {
-            resource_requirements: Some(openshell_core::proto::ResourceRequirements {
-                gpu: Some(openshell_core::proto::GpuResourceRequirements { count: Some(0) }),
+            workload: Some(SandboxWorkloadConfig {
+                resources: Some(SandboxResources {
+                    gpu_count: Some(0),
+                    ..Default::default()
+                }),
+                ..Default::default()
             }),
             ..Default::default()
         };
@@ -1078,25 +1121,11 @@ mod tests {
     }
 
     #[test]
-    fn validate_sandbox_spec_rejects_over_limit_log_level() {
-        let spec = SandboxSpec {
-            log_level: "x".repeat(MAX_LOG_LEVEL_LEN + 1),
-            ..Default::default()
-        };
-        let err = validate_sandbox_spec("ok", &spec).unwrap_err();
-        assert_eq!(err.code(), Code::InvalidArgument);
-        assert!(err.message().contains("log_level"));
-    }
-
-    #[test]
     fn validate_sandbox_spec_rejects_too_many_env_entries() {
         let env: HashMap<String, String> = (0..=MAX_ENVIRONMENT_ENTRIES)
             .map(|i| (format!("K{i}"), "v".to_string()))
             .collect();
-        let spec = SandboxSpec {
-            environment: env,
-            ..Default::default()
-        };
+        let spec = spec_with_env(env);
         let err = validate_sandbox_spec("ok", &spec).unwrap_err();
         assert_eq!(err.code(), Code::InvalidArgument);
         assert!(err.message().contains("environment"));
@@ -1106,10 +1135,7 @@ mod tests {
     fn validate_sandbox_spec_rejects_oversized_env_key() {
         let mut env = HashMap::new();
         env.insert("k".repeat(MAX_MAP_KEY_LEN + 1), "v".to_string());
-        let spec = SandboxSpec {
-            environment: env,
-            ..Default::default()
-        };
+        let spec = spec_with_env(env);
         let err = validate_sandbox_spec("ok", &spec).unwrap_err();
         assert_eq!(err.code(), Code::InvalidArgument);
         assert!(err.message().contains("key"));
@@ -1119,10 +1145,7 @@ mod tests {
     fn validate_sandbox_spec_rejects_oversized_env_value() {
         let mut env = HashMap::new();
         env.insert("KEY".to_string(), "v".repeat(MAX_MAP_VALUE_LEN + 1));
-        let spec = SandboxSpec {
-            environment: env,
-            ..Default::default()
-        };
+        let spec = spec_with_env(env);
         let err = validate_sandbox_spec("ok", &spec).unwrap_err();
         assert_eq!(err.code(), Code::InvalidArgument);
         assert!(err.message().contains("value"));
@@ -1131,7 +1154,7 @@ mod tests {
     #[test]
     fn validate_sandbox_spec_rejects_oversized_template_image() {
         let spec = SandboxSpec {
-            template: Some(SandboxTemplate {
+            workload: Some(SandboxWorkloadConfig {
                 image: "x".repeat(MAX_TEMPLATE_STRING_LEN + 1),
                 ..Default::default()
             }),
@@ -1139,28 +1162,11 @@ mod tests {
         };
         let err = validate_sandbox_spec("ok", &spec).unwrap_err();
         assert_eq!(err.code(), Code::InvalidArgument);
-        assert!(err.message().contains("template.image"));
+        assert!(err.message().contains("spec.workload.image"));
     }
 
     #[test]
-    fn validate_sandbox_spec_rejects_too_many_template_labels() {
-        let labels: HashMap<String, String> = (0..=MAX_TEMPLATE_MAP_ENTRIES)
-            .map(|i| (format!("k{i}"), "v".to_string()))
-            .collect();
-        let spec = SandboxSpec {
-            template: Some(SandboxTemplate {
-                labels,
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-        let err = validate_sandbox_spec("ok", &spec).unwrap_err();
-        assert_eq!(err.code(), Code::InvalidArgument);
-        assert!(err.message().contains("template.labels"));
-    }
-
-    #[test]
-    fn validate_sandbox_spec_rejects_oversized_template_struct() {
+    fn validate_sandbox_spec_rejects_oversized_driver_config_struct() {
         use prost_types::{Struct, Value, value::Kind};
 
         let mut fields = std::collections::BTreeMap::new();
@@ -1173,15 +1179,12 @@ mod tests {
         );
         let big_struct = Struct { fields };
         let spec = SandboxSpec {
-            template: Some(SandboxTemplate {
-                resources: Some(big_struct),
-                ..Default::default()
-            }),
+            driver_config: Some(big_struct),
             ..Default::default()
         };
         let err = validate_sandbox_spec("ok", &spec).unwrap_err();
         assert_eq!(err.code(), Code::InvalidArgument);
-        assert!(err.message().contains("template.resources"));
+        assert!(err.message().contains("spec.driver_config"));
     }
 
     #[test]
@@ -1206,13 +1209,10 @@ mod tests {
     #[test]
     fn validate_sandbox_spec_accepts_valid_spec() {
         let spec = SandboxSpec {
-            log_level: "debug".to_string(),
             providers: vec!["p1".to_string()],
-            environment: std::iter::once(("KEY".to_string(), "val".to_string())).collect(),
-            template: Some(SandboxTemplate {
+            workload: Some(SandboxWorkloadConfig {
                 image: "nvcr.io/test:latest".to_string(),
-                runtime_class_name: "kata".to_string(),
-                labels: std::iter::once(("app".to_string(), "test".to_string())).collect(),
+                environment: std::iter::once(("KEY".to_string(), "val".to_string())).collect(),
                 ..Default::default()
             }),
             ..Default::default()
@@ -1222,32 +1222,9 @@ mod tests {
 
     #[test]
     fn validate_sandbox_spec_rejects_reserved_env_key() {
-        let spec = SandboxSpec {
-            environment: std::iter::once(("OPENSHELL_SECRET".to_string(), "val".to_string()))
-                .collect(),
-            ..Default::default()
-        };
-        let err = validate_sandbox_spec("s", &spec).unwrap_err();
-        assert!(
-            err.message().contains("OPENSHELL_") && err.message().contains("reserved"),
-            "expected reserved key error, got: {}",
-            err.message()
+        let spec = spec_with_env(
+            std::iter::once(("OPENSHELL_SECRET".to_string(), "val".to_string())).collect(),
         );
-    }
-
-    #[test]
-    fn validate_sandbox_spec_rejects_reserved_template_env_key() {
-        let spec = SandboxSpec {
-            template: Some(SandboxTemplate {
-                environment: std::iter::once((
-                    "OPENSHELL_ENDPOINT".to_string(),
-                    "evil".to_string(),
-                ))
-                .collect(),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
         let err = validate_sandbox_spec("s", &spec).unwrap_err();
         assert!(
             err.message().contains("OPENSHELL_") && err.message().contains("reserved"),
@@ -1286,28 +1263,9 @@ mod tests {
     }
 
     #[test]
-    fn validate_sandbox_spec_rejects_template_env_value_with_control_chars() {
-        let spec = SandboxSpec {
-            template: Some(SandboxTemplate {
-                environment: std::iter::once(("KEY".to_string(), "val\nue".to_string())).collect(),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-        let err = validate_sandbox_spec("s", &spec).unwrap_err();
-        assert!(
-            err.message().contains("newline"),
-            "expected control char error, got: {}",
-            err.message()
-        );
-    }
-
-    #[test]
     fn validate_sandbox_spec_rejects_invalid_env_key_name() {
-        let spec = SandboxSpec {
-            environment: std::iter::once(("1BAD".to_string(), "val".to_string())).collect(),
-            ..Default::default()
-        };
+        let spec =
+            spec_with_env(std::iter::once(("1BAD".to_string(), "val".to_string())).collect());
         let err = validate_sandbox_spec("s", &spec).unwrap_err();
         assert!(
             err.message().contains("1BAD"),
@@ -1318,31 +1276,12 @@ mod tests {
 
     #[test]
     fn validate_sandbox_spec_rejects_env_value_with_control_chars() {
-        let spec = SandboxSpec {
-            environment: std::iter::once(("KEY".to_string(), "val\nue".to_string())).collect(),
-            ..Default::default()
-        };
+        let spec =
+            spec_with_env(std::iter::once(("KEY".to_string(), "val\nue".to_string())).collect());
         let err = validate_sandbox_spec("s", &spec).unwrap_err();
         assert!(
             err.message().contains("newline"),
             "expected control char error, got: {}",
-            err.message()
-        );
-    }
-
-    #[test]
-    fn validate_sandbox_spec_rejects_invalid_template_env_key_name() {
-        let spec = SandboxSpec {
-            template: Some(SandboxTemplate {
-                environment: std::iter::once(("BAD-NAME".to_string(), "val".to_string())).collect(),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-        let err = validate_sandbox_spec("s", &spec).unwrap_err();
-        assert!(
-            err.message().contains("BAD-NAME"),
-            "expected invalid key error, got: {}",
             err.message()
         );
     }

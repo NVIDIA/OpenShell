@@ -7,6 +7,44 @@ import "time"
 
 // Sandbox represents a sandbox instance.
 type Sandbox struct {
+	ID                  string
+	Name                string
+	CreatedAt           time.Time
+	Labels              map[string]string
+	Annotations         map[string]string
+	ResourceVersion     uint64
+	Workspace           string
+	DeletionTimestamp   *time.Time
+	CreatedFromTemplate *SandboxTemplateProvenance
+	Spec                SandboxSpec
+	Status              SandboxStatus
+}
+
+// SandboxSpec holds the desired state of a sandbox.
+type SandboxSpec struct {
+	Workload     *SandboxWorkloadConfig
+	DriverConfig map[string]any
+	Providers    []string
+	// Policy is the security policy for the sandbox. Nil means no policy specified.
+	Policy *SandboxPolicy
+}
+
+// SandboxWorkloadConfig defines the portable workload for a sandbox.
+type SandboxWorkloadConfig struct {
+	Image       string
+	Environment map[string]string
+	Resources   *SandboxResources
+}
+
+// SandboxResources defines portable sandbox resource requirements.
+type SandboxResources struct {
+	CPU      string
+	Memory   string
+	GPUCount *uint32
+}
+
+// SandboxTemplate is a reusable workspace-scoped sandbox template resource.
+type SandboxTemplate struct {
 	ID                string
 	Name              string
 	CreatedAt         time.Time
@@ -15,32 +53,32 @@ type Sandbox struct {
 	ResourceVersion   uint64
 	Workspace         string
 	DeletionTimestamp *time.Time
-	Spec              SandboxSpec
-	Status            SandboxStatus
+	Spec              SandboxTemplateSpec
 }
 
-// SandboxSpec holds the desired state of a sandbox.
-type SandboxSpec struct {
-	LogLevel    string
-	Environment map[string]string
-	Template    *SandboxTemplate
-	Providers   []string
-	GPUCount    *uint32
-	// Policy is the security policy for the sandbox. Nil means no policy specified.
-	Policy *SandboxPolicy
+// SandboxTemplateSpec holds reusable sandbox template settings.
+type SandboxTemplateSpec struct {
+	Workload            *SandboxWorkloadConfig
+	DriverConfig        map[string]any
+	DesiredServiceLevel *SandboxServiceLevel
 }
 
-// SandboxTemplate defines the container template for a sandbox.
-type SandboxTemplate struct {
-	Image            string
-	RuntimeClassName string
-	AgentSocket      string
-	Labels           map[string]string
-	Annotations      map[string]string
-	Environment      map[string]string
-	UserNamespaces   *bool
-	Resources        map[string]any
-	DriverConfig     map[string]any
+// SandboxServiceLevel describes desired operational characteristics.
+type SandboxServiceLevel struct {
+	Startup *SandboxStartup
+}
+
+// SandboxStartup describes desired startup characteristics.
+type SandboxStartup struct {
+	ReadyWithin time.Duration
+	MaxBurst    uint32
+}
+
+// SandboxTemplateProvenance identifies the template revision used to create a sandbox.
+type SandboxTemplateProvenance struct {
+	ID              string
+	Name            string
+	ResourceVersion string
 }
 
 // SandboxStatus holds the observed state of a sandbox.

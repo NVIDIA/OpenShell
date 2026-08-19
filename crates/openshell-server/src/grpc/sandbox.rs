@@ -18,21 +18,24 @@ use futures::future;
 use openshell_core::net::set_tcp_nodelay_best_effort;
 use openshell_core::proto::{
     AttachSandboxProviderRequest, AttachSandboxProviderResponse, CreateSandboxRequest,
-    CreateSshSessionRequest, CreateSshSessionResponse, DeleteSandboxRequest, DeleteSandboxResponse,
-    DetachSandboxProviderRequest, DetachSandboxProviderResponse, ExecSandboxEvent, ExecSandboxExit,
-    ExecSandboxInput, ExecSandboxRequest, ExecSandboxStderr, ExecSandboxStdout, GetSandboxRequest,
-    ListSandboxProvidersRequest, ListSandboxProvidersResponse, ListSandboxesRequest,
-    ListSandboxesResponse, Provider, RevokeSshSessionRequest, RevokeSshSessionResponse,
-    SandboxResponse, SandboxStreamEvent, SshRelayTarget, StartSandboxRequest, StopSandboxRequest,
-    TcpForwardFrame, TcpForwardInit, TcpRelayTarget, WatchSandboxRequest, relay_open,
-    tcp_forward_init,
+    CreateSandboxTemplateRequest, CreateSshSessionRequest, CreateSshSessionResponse,
+    DeleteSandboxRequest, DeleteSandboxResponse, DeleteSandboxTemplateRequest,
+    DeleteSandboxTemplateResponse, DetachSandboxProviderRequest, DetachSandboxProviderResponse,
+    ExecSandboxEvent, ExecSandboxExit, ExecSandboxInput, ExecSandboxRequest, ExecSandboxStderr,
+    ExecSandboxStdout, GetSandboxRequest, GetSandboxTemplateRequest, ListSandboxProvidersRequest,
+    ListSandboxProvidersResponse, ListSandboxTemplatesRequest, ListSandboxTemplatesResponse,
+    ListSandboxesRequest, ListSandboxesResponse, Provider, RevokeSshSessionRequest,
+    RevokeSshSessionResponse, SandboxResponse, SandboxSpec, SandboxStreamEvent,
+    SandboxTemplateProvenance, SandboxTemplateResponse, SshRelayTarget, StartSandboxRequest,
+    StopSandboxRequest, TcpForwardFrame, TcpForwardInit, TcpRelayTarget, WatchSandboxRequest,
+    create_sandbox_request, relay_open, tcp_forward_init,
 };
 use openshell_core::proto::{Sandbox, SandboxPhase, SandboxTemplate, SshSession};
 use openshell_core::telemetry::{
     LifecycleOperation, LifecycleResource, SandboxTemplateSource, TelemetryComputeDriver,
     TelemetryOutcome,
 };
-use openshell_core::{ObjectId, ObjectName, ObjectWorkspace};
+use openshell_core::{ObjectId, ObjectName, ObjectWorkspace, SetResourceVersion};
 use prost::Message;
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -54,8 +57,8 @@ use super::provider::{
 };
 use super::validation::{
     level_matches, normalize_process_identity_for_driver, source_matches,
-    validate_exec_request_fields, validate_no_reserved_provider_policy_keys,
-    validate_policy_safety, validate_sandbox_spec,
+    validate_create_sandbox_request, validate_exec_request_fields,
+    validate_no_reserved_provider_policy_keys, validate_policy_safety, validate_sandbox_spec,
 };
 use super::{MAX_PAGE_SIZE, MAX_PROVIDERS, MAX_ROUTABLE_NAME_LEN, clamp_limit};
 use crate::persistence::current_time_ms;
@@ -173,33 +176,28 @@ fn emit_sandbox_create_telemetry(
     outcome: TelemetryOutcome,
 ) {
     let compute_driver = telemetry_compute_driver(state.compute.driver_kind());
-    let Some(spec) = request.spec.as_ref() else {
-        openshell_core::telemetry::emit_sandbox_create(
-            outcome,
-            false,
-            0,
-            false,
-            SandboxTemplateSource::Undefined,
-            compute_driver,
-        );
-        return;
+    let (gpu_requested, template_source) = match request.workload_source.as_ref() {
+        Some(create_sandbox_request::WorkloadSource::Workload(workload)) => {
+            let gpu_requested = workload.resources.as_ref().is_some_and(|resources| {
+                openshell_core::gpu::sandbox_gpu_requested(Some(resources))
+            });
+            let template_source = if workload.image.trim().is_empty() {
+                SandboxTemplateSource::Default
+            } else {
+                SandboxTemplateSource::Image
+            };
+            (gpu_requested, template_source)
+        }
+        Some(create_sandbox_request::WorkloadSource::WorkloadTemplateName(_)) => {
+            (false, SandboxTemplateSource::Image)
+        }
+        None => (false, SandboxTemplateSource::Undefined),
     };
-    let template_source = if spec
-        .template
-        .as_ref()
-        .is_some_and(|template| !template.image.trim().is_empty())
-    {
-        SandboxTemplateSource::Image
-    } else {
-        SandboxTemplateSource::Default
-    };
-    let gpu_requested =
-        openshell_core::gpu::sandbox_gpu_requested(spec.resource_requirements.as_ref());
     openshell_core::telemetry::emit_sandbox_create(
         outcome,
         gpu_requested,
-        spec.providers.len() as u64,
-        spec.policy.is_some(),
+        request.providers.len() as u64,
+        request.policy.is_some(),
         template_source,
         compute_driver,
     );
@@ -217,12 +215,9 @@ async fn handle_create_sandbox_inner(
 ) -> Result<Response<SandboxResponse>, Status> {
     let principal = super::extract_principal(&request)?;
     let request = request.into_inner();
-    let spec = request
-        .spec
-        .ok_or_else(|| Status::invalid_argument("spec is required"))?;
 
     // Validate field sizes before any I/O (fail fast on oversized payloads).
-    validate_sandbox_spec(&request.name, &spec)?;
+    validate_create_sandbox_request(&request)?;
 
     // Validate labels (keys and values must meet Kubernetes requirements).
     for (key, value) in &request.labels {
@@ -243,14 +238,14 @@ async fn handle_create_sandbox_inner(
         .await?
         .ensure_active()?;
 
-    let _sandbox_sync_guard = if spec.providers.is_empty() {
+    let _sandbox_sync_guard = if request.providers.is_empty() {
         None
     } else {
         Some(state.compute.sandbox_sync_guard().await)
     };
 
     // Validate provider names exist (fail fast).
-    for name in &spec.providers {
+    for name in &request.providers {
         state
             .store
             .get_message_by_name::<Provider>(&workspace, name)
@@ -258,15 +253,59 @@ async fn handle_create_sandbox_inner(
             .map_err(|e| Status::internal(format!("fetch provider failed: {e}")))?
             .ok_or_else(|| Status::failed_precondition(format!("provider '{name}' not found")))?;
     }
-    validate_provider_environment_keys_unique(state.store.as_ref(), &workspace, &spec.providers)
+    validate_provider_environment_keys_unique(state.store.as_ref(), &workspace, &request.providers)
         .await?;
 
-    // Ensure the template always carries the resolved image.
-    let mut spec = spec;
-    let template = spec.template.get_or_insert_with(SandboxTemplate::default);
-    if template.image.is_empty() {
-        template.image = state.compute.default_image().to_string();
+    let mut created_from_template = None;
+    let (mut workload, driver_config) = match request.workload_source.clone() {
+        Some(create_sandbox_request::WorkloadSource::Workload(workload)) => (workload, None),
+        Some(create_sandbox_request::WorkloadSource::WorkloadTemplateName(template_name)) => {
+            let template_name = template_name.trim();
+            if template_name.is_empty() {
+                return Err(Status::invalid_argument(
+                    "workload_template_name must not be empty",
+                ));
+            }
+            let template = state
+                .store
+                .get_message_by_name::<SandboxTemplate>(&workspace, template_name)
+                .await
+                .map_err(|e| Status::internal(format!("fetch sandbox template failed: {e}")))?
+                .ok_or_else(|| Status::not_found("sandbox template not found"))?;
+            let template_id = template.object_id().to_string();
+            let spec = template
+                .spec
+                .ok_or_else(|| Status::failed_precondition("sandbox template spec is required"))?;
+            let metadata = template.metadata.as_ref();
+            created_from_template = Some(SandboxTemplateProvenance {
+                id: template_id,
+                name: template_name.to_string(),
+                resource_version: metadata
+                    .map_or(0, |metadata| metadata.resource_version)
+                    .to_string(),
+            });
+            let workload = spec.workload.ok_or_else(|| {
+                Status::failed_precondition("sandbox template workload is required")
+            })?;
+            (workload, spec.driver_config)
+        }
+        None => {
+            return Err(Status::invalid_argument(
+                "one of workload or workload_template_name is required",
+            ));
+        }
+    };
+
+    if workload.image.trim().is_empty() {
+        workload.image = state.compute.default_image().to_string();
     }
+
+    let mut spec = SandboxSpec {
+        workload: Some(workload),
+        driver_config,
+        policy: request.policy.clone(),
+        providers: request.providers.clone(),
+    };
 
     // Docker and Podman preserve omitted identity fields for OCI USER
     // fallback. Other drivers retain the legacy persisted sandbox defaults.
@@ -307,6 +346,7 @@ async fn handle_create_sandbox_inner(
         }),
         spec: Some(spec),
         status: None,
+        created_from_template,
     };
     sandbox.set_phase(SandboxPhase::Provisioning as i32);
 
@@ -334,7 +374,7 @@ async fn handle_create_sandbox_inner(
         })?;
 
     // Mint the gateway JWT for singleplayer drivers. K8s sandboxes skip
-    // this mint and bootstrap via `IssueSandboxToken` at supervisor
+    // this mint and bootstrap via `RegisterSupervisor` at supervisor
     // startup; identifying "is this K8s?" lives in the compute layer, so
     // we mint unconditionally here when the issuer is configured and let
     // the K8s driver simply ignore the field.
@@ -463,6 +503,207 @@ pub(super) async fn handle_list_sandboxes(
     };
 
     Ok(Response::new(ListSandboxesResponse { sandboxes }))
+}
+
+pub(super) async fn handle_create_sandbox_template(
+    state: &Arc<ServerState>,
+    request: Request<CreateSandboxTemplateRequest>,
+) -> Result<Response<SandboxTemplateResponse>, Status> {
+    let principal = super::extract_principal(&request)?;
+    let req = request.into_inner();
+    let authz = authorize_workspace(
+        &state.store,
+        &state.admin_role,
+        &principal,
+        &req.workspace,
+        MinWorkspaceRole::Admin,
+    )
+    .await?;
+    let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &authz.workspace)
+        .await?
+        .ensure_active()?;
+
+    let Some(mut template) = req.template else {
+        return Err(Status::invalid_argument("template is required"));
+    };
+    crate::grpc::validation::validate_sandbox_template(&template)?;
+
+    let metadata = template
+        .metadata
+        .get_or_insert_with(openshell_core::proto::datamodel::v1::ObjectMeta::default);
+    if metadata.name.is_empty() {
+        return Err(Status::invalid_argument(
+            "template metadata.name is required",
+        ));
+    }
+    metadata.id = uuid::Uuid::new_v4().to_string();
+    metadata.created_at_ms = current_time_ms();
+    metadata.resource_version = 0;
+    metadata.workspace = workspace;
+    metadata.deletion_timestamp_ms = 0;
+    super::validation::validate_object_metadata(template.metadata.as_ref(), "sandbox_template")?;
+
+    let labels_json = template.object_labels().and_then(|labels| {
+        (!labels.is_empty())
+            .then(|| serde_json::to_string(&labels).ok())
+            .flatten()
+    });
+    let result = state
+        .store
+        .put_if(
+            SandboxTemplate::object_type(),
+            template.object_id(),
+            template.object_name(),
+            template.object_workspace(),
+            &template.encode_to_vec(),
+            labels_json.as_deref(),
+            WriteCondition::MustCreate,
+        )
+        .await
+        .map_err(|e| Status::internal(format!("create sandbox template failed: {e}")))?;
+    template.set_resource_version(result.resource_version);
+
+    if let Err(err) = state.compute.upsert_sandbox_template(&template).await {
+        warn!(
+            template_id = %template.object_id(),
+            template_name = %template.object_name(),
+            workspace = %template.object_workspace(),
+            error = %err,
+            "Failed to notify compute driver about sandbox template upsert"
+        );
+    }
+
+    Ok(Response::new(SandboxTemplateResponse {
+        template: Some(template),
+    }))
+}
+
+pub(super) async fn handle_get_sandbox_template(
+    state: &Arc<ServerState>,
+    request: Request<GetSandboxTemplateRequest>,
+) -> Result<Response<SandboxTemplateResponse>, Status> {
+    let principal = super::extract_principal(&request)?;
+    let req = request.into_inner();
+    if req.name.is_empty() {
+        return Err(Status::invalid_argument("name is required"));
+    }
+    let authz = authorize_workspace(
+        &state.store,
+        &state.admin_role,
+        &principal,
+        &req.workspace,
+        MinWorkspaceRole::User,
+    )
+    .await?;
+    let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &authz.workspace)
+        .await?
+        .name;
+    let template = state
+        .store
+        .get_message_by_name::<SandboxTemplate>(&workspace, &req.name)
+        .await
+        .map_err(|e| Status::internal(format!("fetch sandbox template failed: {e}")))?
+        .ok_or_else(|| Status::not_found("sandbox template not found"))?;
+    Ok(Response::new(SandboxTemplateResponse {
+        template: Some(template),
+    }))
+}
+
+pub(super) async fn handle_list_sandbox_templates(
+    state: &Arc<ServerState>,
+    request: Request<ListSandboxTemplatesRequest>,
+) -> Result<Response<ListSandboxTemplatesResponse>, Status> {
+    let principal = super::extract_principal(&request)?;
+    let request = request.into_inner();
+    if request.all_workspaces && !request.workspace.is_empty() {
+        return Err(Status::invalid_argument(
+            "all_workspaces and workspace are mutually exclusive",
+        ));
+    }
+    let limit = clamp_limit(request.limit, 100, MAX_PAGE_SIZE);
+    let templates = if request.all_workspaces {
+        require_platform_admin(&state.admin_role, &principal)?;
+        state
+            .store
+            .list_all_messages(limit, request.offset)
+            .await
+            .map_err(|e| Status::internal(format!("list sandbox templates failed: {e}")))?
+    } else {
+        let authz = authorize_workspace(
+            &state.store,
+            &state.admin_role,
+            &principal,
+            &request.workspace,
+            MinWorkspaceRole::User,
+        )
+        .await?;
+        let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &authz.workspace)
+            .await?
+            .name;
+        state
+            .store
+            .list_messages(&workspace, limit, request.offset)
+            .await
+            .map_err(|e| Status::internal(format!("list sandbox templates failed: {e}")))?
+    };
+
+    Ok(Response::new(ListSandboxTemplatesResponse { templates }))
+}
+
+pub(super) async fn handle_delete_sandbox_template(
+    state: &Arc<ServerState>,
+    request: Request<DeleteSandboxTemplateRequest>,
+) -> Result<Response<DeleteSandboxTemplateResponse>, Status> {
+    let principal = super::extract_principal(&request)?;
+    let req = request.into_inner();
+    if req.name.is_empty() {
+        return Err(Status::invalid_argument("name is required"));
+    }
+    let authz = authorize_workspace(
+        &state.store,
+        &state.admin_role,
+        &principal,
+        &req.workspace,
+        MinWorkspaceRole::Admin,
+    )
+    .await?;
+    let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &authz.workspace)
+        .await?
+        .name;
+    let existing = state
+        .store
+        .get_message_by_name::<SandboxTemplate>(&workspace, &req.name)
+        .await
+        .map_err(|e| Status::internal(format!("fetch sandbox template failed: {e}")))?;
+    let deleted = state
+        .store
+        .delete_by_name(SandboxTemplate::object_type(), &workspace, &req.name)
+        .await
+        .map_err(|e| Status::internal(format!("delete sandbox template failed: {e}")))?;
+    if deleted
+        && let Some(template) = existing
+        && let Err(err) = state
+            .compute
+            .delete_sandbox_template(
+                template.object_id().to_string(),
+                template.object_name().to_string(),
+                template.object_workspace().to_string(),
+                template
+                    .metadata
+                    .as_ref()
+                    .map_or(0, |metadata| metadata.resource_version),
+            )
+            .await
+    {
+        warn!(
+            template_id = %template.object_id(),
+            template_name = %template.object_name(),
+            workspace = %template.object_workspace(),
+            error = %err,
+            "Failed to notify compute driver about sandbox template delete"
+        );
+    }
+    Ok(Response::new(DeleteSandboxTemplateResponse { deleted }))
 }
 
 pub(super) async fn handle_list_sandbox_providers(
@@ -2749,8 +2990,7 @@ mod tests {
                 workspace: "default".to_string(),
                 deletion_timestamp_ms: 0,
             }),
-            spec: Some(openshell_core::proto::SandboxSpec {
-                log_level: "debug".to_string(),
+            spec: Some(SandboxSpec {
                 policy: Some(openshell_core::proto::SandboxPolicy::default()),
                 providers,
                 ..Default::default()
@@ -2760,6 +3000,20 @@ mod tests {
         sandbox.set_phase(SandboxPhase::Ready as i32);
         sandbox.set_current_policy_version(7);
         sandbox
+    }
+
+    fn test_create_sandbox_request(name: &str) -> CreateSandboxRequest {
+        CreateSandboxRequest {
+            workload_source: Some(create_sandbox_request::WorkloadSource::Workload(
+                openshell_core::proto::SandboxWorkloadConfig::default(),
+            )),
+            policy: None,
+            providers: Vec::new(),
+            name: name.to_string(),
+            labels: HashMap::new(),
+            annotations: HashMap::new(),
+            workspace: String::new(),
+        }
     }
 
     #[tokio::test]
@@ -2900,7 +3154,6 @@ mod tests {
         assert_eq!(sandbox.current_policy_version(), 7);
         let spec = sandbox.spec.unwrap();
         assert_eq!(spec.providers, vec!["work-github"]);
-        assert_eq!(spec.log_level, "debug");
     }
 
     #[tokio::test]
@@ -3277,13 +3530,8 @@ mod tests {
             &state,
             authed_request(CreateSandboxRequest {
                 name: "collision".to_string(),
-                spec: Some(openshell_core::proto::SandboxSpec {
-                    providers: vec!["provider-a".to_string(), "provider-b".to_string()],
-                    ..Default::default()
-                }),
-                labels: HashMap::new(),
-                annotations: HashMap::new(),
-                workspace: String::new(),
+                providers: vec!["provider-a".to_string(), "provider-b".to_string()],
+                ..test_create_sandbox_request("")
             }),
         )
         .await
@@ -3311,13 +3559,8 @@ mod tests {
             &state,
             authed_request(CreateSandboxRequest {
                 name: "reserved-policy-key".to_string(),
-                spec: Some(openshell_core::proto::SandboxSpec {
-                    policy: Some(policy),
-                    ..Default::default()
-                }),
-                labels: HashMap::new(),
-                annotations: HashMap::new(),
-                workspace: String::new(),
+                policy: Some(policy),
+                ..test_create_sandbox_request("")
             }),
         )
         .await
@@ -3338,10 +3581,8 @@ mod tests {
             &state,
             authed_request(CreateSandboxRequest {
                 name: "annotated".to_string(),
-                spec: Some(openshell_core::proto::SandboxSpec::default()),
-                labels: HashMap::new(),
                 annotations: HashMap::from([(annotation_key.clone(), annotation_value.clone())]),
-                workspace: String::new(),
+                ..test_create_sandbox_request("")
             }),
         )
         .await
@@ -3395,13 +3636,8 @@ mod tests {
             &state,
             authed_request(CreateSandboxRequest {
                 name: "partial-id".to_string(),
-                spec: Some(openshell_core::proto::SandboxSpec {
-                    policy: Some(policy),
-                    ..Default::default()
-                }),
-                labels: HashMap::new(),
-                annotations: HashMap::new(),
-                workspace: String::new(),
+                policy: Some(policy),
+                ..test_create_sandbox_request("")
             }),
         )
         .await
@@ -3460,13 +3696,8 @@ mod tests {
             &state,
             authed_request(CreateSandboxRequest {
                 name: "kube-partial-id".to_string(),
-                spec: Some(openshell_core::proto::SandboxSpec {
-                    policy: Some(policy),
-                    ..Default::default()
-                }),
-                labels: HashMap::new(),
-                annotations: HashMap::new(),
-                workspace: String::new(),
+                policy: Some(policy),
+                ..test_create_sandbox_request("")
             }),
         )
         .await
@@ -3493,10 +3724,8 @@ mod tests {
             &state,
             authed_request(CreateSandboxRequest {
                 name: "bad-label".to_string(),
-                spec: Some(openshell_core::proto::SandboxSpec::default()),
                 labels: HashMap::from([("team".to_string(), "x".repeat(512))]),
-                annotations: HashMap::new(),
-                workspace: String::new(),
+                ..test_create_sandbox_request("")
             }),
         )
         .await
@@ -3504,6 +3733,69 @@ mod tests {
 
         assert_eq!(err.code(), tonic::Code::InvalidArgument);
         assert!(err.message().contains("label value exceeds"));
+    }
+
+    #[tokio::test]
+    async fn create_sandbox_from_template_defaults_empty_image() {
+        let state = test_server_state().await;
+        let template = SandboxTemplate {
+            metadata: Some(ObjectMeta {
+                id: "template-default-image".to_string(),
+                name: "default-image".to_string(),
+                created_at_ms: 1_000_000,
+                labels: HashMap::new(),
+                resource_version: 42,
+                annotations: HashMap::new(),
+                workspace: "default".to_string(),
+                deletion_timestamp_ms: 0,
+            }),
+            spec: Some(openshell_core::proto::SandboxTemplateSpec {
+                workload: Some(openshell_core::proto::SandboxWorkloadConfig {
+                    image: "  ".to_string(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+        };
+        state.store.put_message(&template).await.unwrap();
+
+        let response = handle_create_sandbox(
+            &state,
+            authed_request(CreateSandboxRequest {
+                name: "from-template".to_string(),
+                workload_source: Some(
+                    create_sandbox_request::WorkloadSource::WorkloadTemplateName(
+                        "default-image".to_string(),
+                    ),
+                ),
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect("template create should default image")
+        .into_inner();
+
+        let sandbox = response.sandbox.expect("created sandbox");
+        let workload = sandbox
+            .spec
+            .as_ref()
+            .and_then(|spec| spec.workload.as_ref())
+            .expect("created sandbox should persist workload");
+        assert_eq!(workload.image, state.compute.default_image());
+        assert_eq!(
+            sandbox
+                .created_from_template
+                .as_ref()
+                .map(|provenance| provenance.name.as_str()),
+            Some("default-image")
+        );
+        assert_eq!(
+            sandbox
+                .created_from_template
+                .as_ref()
+                .map(|provenance| provenance.id.as_str()),
+            Some("template-default-image")
+        );
     }
 
     #[tokio::test]
@@ -3522,13 +3814,8 @@ mod tests {
                 &task_state,
                 authed_request(CreateSandboxRequest {
                     name: "guarded-create".to_string(),
-                    spec: Some(openshell_core::proto::SandboxSpec {
-                        providers: vec!["work-github".to_string()],
-                        ..Default::default()
-                    }),
-                    labels: HashMap::new(),
-                    annotations: HashMap::new(),
-                    workspace: String::new(),
+                    providers: vec!["work-github".to_string()],
+                    ..test_create_sandbox_request("")
                 }),
             )
             .await
@@ -4421,8 +4708,7 @@ mod tests {
             &state,
             non_member_request(CreateSandboxRequest {
                 workspace: "no-such-ws".into(),
-                spec: Some(openshell_core::proto::SandboxSpec::default()),
-                ..Default::default()
+                ..test_create_sandbox_request("")
             }),
         )
         .await

@@ -19,10 +19,10 @@ import { errorCode, fromConnect, SdkError } from './errors.js';
 import type { Provider } from './gen/datamodel_pb.js';
 import type { Sandbox, UpdateConfigResponse } from './gen/openshell_pb.js';
 import {
+  type CreateSandboxRequestSchema,
   type ExecSandboxInputSchema,
   OpenShell,
   SandboxPhase,
-  type SandboxSpecSchema,
   ServiceStatus,
   type TcpForwardFrameSchema,
 } from './gen/openshell_pb.js';
@@ -89,13 +89,11 @@ export interface SandboxSpec {
    */
   policy?: MessageInitShape<typeof SandboxPolicySchema>;
   /**
-   * Advanced escape hatch: the full generated proto spec. Curated fields build
-   * the base spec, then `rawSpec` shallow-overrides at the top spec level, so
-   * any field it sets wins. Use it to reach proto spec fields the curated shape
-   * does not surface (template runtime class, resource limits, log level, and
-   * future additions) without an SDK change.
+   * Advanced escape hatch: the full generated create request. Curated fields
+   * build the base request, then `rawCreateRequest` shallow-overrides at the
+   * top request level, so any field it sets wins.
    */
-  rawSpec?: MessageInitShape<typeof SandboxSpecSchema>;
+  rawCreateRequest?: MessageInitShape<typeof CreateSandboxRequestSchema>;
 }
 
 export interface SandboxRef {
@@ -551,24 +549,23 @@ export class SandboxClient {
 
   async create(spec: SandboxSpec): Promise<SandboxRef> {
     try {
-      // Curated fields build the base spec; rawSpec then shallow-overrides at
-      // the top spec level (Object.assign, so any field it sets wins). The
-      // runtime assign avoids the generated $typeName upgrading the literal and
-      // rejecting the curated `template: { image }` init shorthand.
-      const specInit: MessageInitShape<typeof SandboxSpecSchema> = {
-        environment: spec.environment ?? {},
-        providers: spec.providers ?? [],
-        template: spec.image ? { image: spec.image } : undefined,
-        resourceRequirements: spec.gpu ? { gpu: {} } : undefined,
-        policy: spec.policy,
-      };
-      if (spec.rawSpec) Object.assign(specInit, spec.rawSpec);
-
-      const resp = await this.grpc.createSandbox({
+      const createInit: MessageInitShape<typeof CreateSandboxRequestSchema> = {
         name: spec.name ?? '',
         labels: spec.labels ?? {},
-        spec: specInit,
-      });
+        workloadSource: {
+          case: 'workload',
+          value: {
+            image: spec.image ?? '',
+            environment: spec.environment ?? {},
+            resources: spec.gpu ? { gpuCount: 1 } : undefined,
+          },
+        },
+        providers: spec.providers ?? [],
+        policy: spec.policy,
+      };
+      if (spec.rawCreateRequest) Object.assign(createInit, spec.rawCreateRequest);
+
+      const resp = await this.grpc.createSandbox(createInit);
       return sandboxRef(resp.sandbox);
     } catch (e) {
       throw fromConnect(e);

@@ -202,6 +202,14 @@ data:
     gateway_namespace             = {{ .Release.Namespace | quote }}
     gateway_pod_selector          = { "app.kubernetes.io/name" = {{ include "openshell.name" . | quote }}, "app.kubernetes.io/instance" = {{ .Release.Name | quote }} }
 
+    [openshell.drivers.kubernetes.warm_pooling]
+    enabled = {{ .Values.server.warmPooling.enabled }}
+
+    [openshell.drivers.kubernetes.warm_pooling.templates]
+    enabled                     = {{ .Values.server.warmPooling.templates.enabled }}
+    ready_within_threshold_secs = {{ .Values.server.warmPooling.templates.readyWithinThresholdSecs | default 5 }}
+    max_replicas                = {{ .Values.server.warmPooling.templates.maxReplicas | default 20 }}
+
     [openshell.drivers.kubernetes.sidecar]
     proxy_uid                    = {{ .Values.supervisor.sidecar.proxyUid | default 1337 }}
     process_binary_aware_network_policy = {{ .Values.supervisor.sidecar.processBinaryAwareNetworkPolicy }}

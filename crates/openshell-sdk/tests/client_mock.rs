@@ -10,9 +10,11 @@
 
 use openshell_core::proto;
 use openshell_core::proto::open_shell_server::{OpenShell, OpenShellServer};
+use openshell_core::proto_struct::json_object_to_struct;
 use openshell_sdk::{
     AuthConfig, ClientConfig, ExecOptions, ListOptions, OpenShellClient, Refresh, RefreshError,
-    RefreshedToken, SandboxPhase, SandboxSpec, ServiceStatus as SdkServiceStatus,
+    RefreshedToken, SandboxPhase, SandboxSpec, SandboxTemplateCreateSpec,
+    SandboxTemplateListOptions, ServiceStatus as SdkServiceStatus,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -34,6 +36,10 @@ struct MockState {
     last_stop: Mutex<Option<proto::StopSandboxRequest>>,
     last_start: Mutex<Option<proto::StartSandboxRequest>>,
     last_list_request: Mutex<Option<proto::ListSandboxesRequest>>,
+    last_create_template: Mutex<Option<proto::CreateSandboxTemplateRequest>>,
+    last_get_template: Mutex<Option<proto::GetSandboxTemplateRequest>>,
+    last_list_templates: Mutex<Option<proto::ListSandboxTemplatesRequest>>,
+    last_delete_template: Mutex<Option<proto::DeleteSandboxTemplateRequest>>,
     last_exec_request: Mutex<Option<proto::ExecSandboxRequest>>,
     last_workspace_request: Mutex<Option<String>>,
     get_calls: AtomicU32,
@@ -77,6 +83,7 @@ fn sandbox_with_phase_ws(
             phase: phase.into(),
             ..Default::default()
         }),
+        created_from_template: None,
     }
 }
 
@@ -94,6 +101,38 @@ fn workspace_proto(name: &str, phase: proto::datamodel::v1::WorkspacePhase) -> p
         }),
         status: Some(proto::datamodel::v1::WorkspaceStatus {
             phase: phase.into(),
+        }),
+    }
+}
+
+fn sandbox_template_proto(name: &str, workspace: &str) -> proto::SandboxTemplate {
+    let driver_config = serde_json::json!({"kubernetes": {}});
+    proto::SandboxTemplate {
+        metadata: Some(proto::datamodel::v1::ObjectMeta {
+            id: format!("template-{name}"),
+            name: name.to_string(),
+            created_at_ms: 1_000_000,
+            labels: HashMap::new(),
+            annotations: HashMap::new(),
+            resource_version: 1,
+            deletion_timestamp_ms: 0,
+            workspace: workspace.to_string(),
+        }),
+        spec: Some(proto::SandboxTemplateSpec {
+            workload: Some(proto::SandboxWorkloadConfig {
+                image: "ghcr.io/nvidia/openshell/python:latest".to_string(),
+                ..Default::default()
+            }),
+            driver_config: Some(
+                json_object_to_struct(
+                    driver_config
+                        .as_object()
+                        .expect("driver config object")
+                        .clone(),
+                )
+                .expect("driver config should convert to protobuf Struct"),
+            ),
+            desired_service_level: None,
         }),
     }
 }
@@ -240,6 +279,47 @@ impl OpenShell for TestOpenShell {
         }))
     }
 
+    async fn create_sandbox_template(
+        &self,
+        request: tonic::Request<proto::CreateSandboxTemplateRequest>,
+    ) -> Result<Response<proto::SandboxTemplateResponse>, Status> {
+        let request = request.into_inner();
+        let template = request.template.clone();
+        *self.state.last_create_template.lock().await = Some(request);
+        Ok(Response::new(proto::SandboxTemplateResponse { template }))
+    }
+
+    async fn get_sandbox_template(
+        &self,
+        request: tonic::Request<proto::GetSandboxTemplateRequest>,
+    ) -> Result<Response<proto::SandboxTemplateResponse>, Status> {
+        let request = request.into_inner();
+        let template = Some(sandbox_template_proto(&request.name, &request.workspace));
+        *self.state.last_get_template.lock().await = Some(request);
+        Ok(Response::new(proto::SandboxTemplateResponse { template }))
+    }
+
+    async fn list_sandbox_templates(
+        &self,
+        request: tonic::Request<proto::ListSandboxTemplatesRequest>,
+    ) -> Result<Response<proto::ListSandboxTemplatesResponse>, Status> {
+        let request = request.into_inner();
+        *self.state.last_list_templates.lock().await = Some(request);
+        Ok(Response::new(proto::ListSandboxTemplatesResponse {
+            templates: vec![sandbox_template_proto("gpu-kata", "default")],
+        }))
+    }
+
+    async fn delete_sandbox_template(
+        &self,
+        request: tonic::Request<proto::DeleteSandboxTemplateRequest>,
+    ) -> Result<Response<proto::DeleteSandboxTemplateResponse>, Status> {
+        *self.state.last_delete_template.lock().await = Some(request.into_inner());
+        Ok(Response::new(proto::DeleteSandboxTemplateResponse {
+            deleted: true,
+        }))
+    }
+
     async fn list_sandbox_providers(
         &self,
         _: tonic::Request<proto::ListSandboxProvidersRequest>,
@@ -282,6 +362,16 @@ impl OpenShell for TestOpenShell {
         _: tonic::Request<proto::CreateSshSessionRequest>,
     ) -> Result<Response<proto::CreateSshSessionResponse>, Status> {
         Ok(Response::new(proto::CreateSshSessionResponse::default()))
+    }
+
+    type RegisterSupervisorStream =
+        tokio_stream::wrappers::ReceiverStream<Result<proto::SupervisorActivationMessage, Status>>;
+
+    async fn register_supervisor(
+        &self,
+        _: tonic::Request<proto::RegisterSupervisorRequest>,
+    ) -> Result<Response<Self::RegisterSupervisorStream>, Status> {
+        Err(Status::unimplemented("unused"))
     }
 
     async fn expose_service(
@@ -782,18 +872,48 @@ async fn create_sandbox_passes_spec_through() {
     assert_eq!(observed.name, "my-box");
     assert_eq!(observed.labels, labels);
     assert!(observed.annotations.is_empty());
-    let observed_spec = observed.spec.unwrap();
-    assert!(
-        observed_spec
-            .resource_requirements
-            .as_ref()
-            .and_then(|r| r.gpu.as_ref())
-            .is_some()
-    );
+    let workload = match observed.workload_source.as_ref() {
+        Some(proto::create_sandbox_request::WorkloadSource::Workload(workload)) => workload,
+        other => panic!("expected inline workload, got {other:?}"),
+    };
     assert_eq!(
-        observed_spec.template.as_ref().unwrap().image,
-        "ghcr.io/foo:bar"
+        workload
+            .resources
+            .as_ref()
+            .and_then(|resources| resources.gpu_count),
+        Some(1)
     );
+    assert_eq!(workload.image, "ghcr.io/foo:bar");
+}
+
+#[tokio::test]
+async fn create_sandbox_from_template_sends_template_name() {
+    let state = Arc::new(MockState::default());
+    let endpoint = start_mock(state.clone()).await;
+    let client = connect(&endpoint).await;
+
+    let labels = HashMap::from([("team".to_string(), "core".to_string())]);
+    let spec = SandboxTemplateCreateSpec {
+        name: Some("templated-box".to_string()),
+        template_name: "gpu-kata".to_string(),
+        labels: labels.clone(),
+        providers: vec!["aws".to_string()],
+    };
+
+    let sandbox = client.create_sandbox_from_template(spec).await.unwrap();
+    assert_eq!(sandbox.name, "templated-box");
+
+    let observed = state.last_create.lock().await.clone().unwrap();
+    assert_eq!(observed.name, "templated-box");
+    assert_eq!(observed.labels, labels);
+    assert_eq!(observed.providers, vec!["aws".to_string()]);
+    assert!(observed.workspace.is_empty());
+    match observed.workload_source.as_ref() {
+        Some(proto::create_sandbox_request::WorkloadSource::WorkloadTemplateName(name)) => {
+            assert_eq!(name, "gpu-kata");
+        }
+        other => panic!("expected template workload source, got {other:?}"),
+    }
 }
 
 #[tokio::test]
@@ -1140,6 +1260,120 @@ async fn list_sandboxes_all_workspaces_sets_flag() {
     assert_eq!(items.len(), 2);
 
     let observed = state.last_list_request.lock().await.clone().unwrap();
+    assert!(observed.all_workspaces);
+    assert!(observed.workspace.is_empty());
+}
+
+#[tokio::test]
+async fn workspace_scoped_create_sandbox_from_template_passes_workspace() {
+    let state = Arc::new(MockState::default());
+    let endpoint = start_mock(state.clone()).await;
+    let client = connect(&endpoint).await;
+
+    client
+        .workspace("team-a")
+        .create_sandbox_from_template(SandboxTemplateCreateSpec {
+            name: Some("templated-box".to_string()),
+            template_name: "gpu-kata".to_string(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    let observed = state.last_create.lock().await.clone().unwrap();
+    assert_eq!(observed.workspace, "team-a");
+    match observed.workload_source.as_ref() {
+        Some(proto::create_sandbox_request::WorkloadSource::WorkloadTemplateName(name)) => {
+            assert_eq!(name, "gpu-kata");
+        }
+        other => panic!("expected template workload source, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn sandbox_template_crud_sends_requests() {
+    let state = Arc::new(MockState::default());
+    let endpoint = start_mock(state.clone()).await;
+    let client = connect(&endpoint).await;
+    let workspace = client.workspace("team-a");
+
+    let template = sandbox_template_proto("gpu-kata", "team-a");
+    let created = workspace
+        .create_sandbox_template(template.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        created.metadata.as_ref().expect("template metadata").name,
+        "gpu-kata"
+    );
+
+    let observed_create = state.last_create_template.lock().await.clone().unwrap();
+    assert_eq!(observed_create.workspace, "team-a");
+    let observed_template = observed_create.template.expect("created template");
+    assert_eq!(
+        observed_template
+            .metadata
+            .as_ref()
+            .expect("template metadata")
+            .name,
+        "gpu-kata"
+    );
+    assert!(
+        observed_template
+            .spec
+            .as_ref()
+            .and_then(|spec| spec.driver_config.as_ref())
+            .is_some_and(|driver_config| driver_config.fields.contains_key("kubernetes"))
+    );
+
+    let got = workspace.get_sandbox_template("gpu-kata").await.unwrap();
+    assert_eq!(
+        got.metadata.as_ref().expect("template metadata").name,
+        "gpu-kata"
+    );
+    let observed_get = state.last_get_template.lock().await.clone().unwrap();
+    assert_eq!(observed_get.name, "gpu-kata");
+    assert_eq!(observed_get.workspace, "team-a");
+
+    let templates = workspace
+        .list_sandbox_templates(SandboxTemplateListOptions {
+            limit: 10,
+            offset: 2,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(templates.len(), 1);
+    let observed_list = state.last_list_templates.lock().await.clone().unwrap();
+    assert_eq!(observed_list.limit, 10);
+    assert_eq!(observed_list.offset, 2);
+    assert_eq!(observed_list.workspace, "team-a");
+    assert!(!observed_list.all_workspaces);
+
+    let deleted = workspace.delete_sandbox_template("gpu-kata").await.unwrap();
+    assert!(deleted);
+    let observed_delete = state.last_delete_template.lock().await.clone().unwrap();
+    assert_eq!(observed_delete.name, "gpu-kata");
+    assert_eq!(observed_delete.workspace, "team-a");
+}
+
+#[tokio::test]
+async fn sandbox_template_list_all_workspaces_clears_workspace() {
+    let state = Arc::new(MockState::default());
+    let endpoint = start_mock(state.clone()).await;
+    let client = connect(&endpoint).await;
+
+    let templates = client
+        .workspace("team-a")
+        .list_sandbox_templates(SandboxTemplateListOptions {
+            all_workspaces: true,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(templates.len(), 1);
+
+    let observed = state.last_list_templates.lock().await.clone().unwrap();
     assert!(observed.all_workspaces);
     assert!(observed.workspace.is_empty());
 }

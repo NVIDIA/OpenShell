@@ -87,9 +87,10 @@ pub const USER_ENVIRONMENT: &str = "OPENSHELL_USER_ENVIRONMENT";
 
 /// Path to the projected `ServiceAccount` JWT (Kubernetes driver).
 ///
-/// Used to bootstrap a gateway-minted JWT via `IssueSandboxToken`. Kubelet
-/// writes and rotates this file; the supervisor exchanges its contents
-/// for a gateway JWT at startup and on refresh.
+/// Used to register the supervisor pod and receive a gateway-minted JWT via
+/// `RegisterSupervisor`. Kubelet writes and rotates this file; the
+/// supervisor presents its contents at startup and when rebootstrap is needed
+/// after refresh authentication failure.
 pub const K8S_SA_TOKEN_FILE: &str = "OPENSHELL_K8S_SA_TOKEN_FILE";
 
 /// Filesystem path to the SPIFFE Workload API UNIX socket used for provider

@@ -21,7 +21,7 @@ This SDK is modeled after
 Kubernetes client library that every Go operator developer already knows. The
 patterns will look familiar:
 
-- **Typed sub-clients per resource**: `client.Sandboxes()`, `client.Providers()`,
+- **Typed sub-clients per resource**: `client.Sandboxes()`, `client.SandboxTemplates()`, `client.Providers()`,
   `client.Exec()`, just like `clientset.CoreV1().Pods()`
 - **Domain types separated from wire formats**: clean Go structs in a `types`
   package, no proto leakage into the public API (like `k8s.io/api`)
@@ -52,9 +52,15 @@ if err != nil {
 defer client.Close()
 
 // Create a sandbox and wait until it's ready
-sandbox, err := client.Sandboxes().Create(ctx, "default", "my-sandbox", &v1.SandboxSpec{
-    Template: &v1.SandboxTemplate{Image: "python:3.12"},
-}, nil)
+sandbox, err := client.Sandboxes().Create(
+    ctx,
+    "default",
+    "my-sandbox",
+    &v1.SandboxWorkloadConfig{Image: "python:3.12"},
+    nil,
+    nil,
+    nil,
+)
 if err != nil {
     log.Fatal(err)
 }
@@ -242,6 +248,7 @@ if err != nil {
 ```
 Client
   ├── Sandboxes()   → SandboxInterface    (create, get, list, delete, watch, wait, logs)
+  ├── SandboxTemplates() → SandboxTemplateInterface (create, get, list, delete)
   ├── Exec()        → ExecInterface       (run, stream, interactive)
   ├── Files()       → FileInterface       (upload, download)
   ├── Health()      → HealthInterface     (health check, gateway info, current user)
@@ -263,6 +270,7 @@ consumers import a single package. See the [Architecture](https://ro14nd.de/open
 | Feature | Interface | Docs |
 |---------|-----------|------|
 | Sandbox lifecycle (create, get, list, delete, watch, wait) | `SandboxInterface` | [Sandboxes](https://ro14nd.de/openshell-sdk-go/api/sandboxes.html) |
+| Sandbox templates (create, get, list, delete) | `SandboxTemplateInterface` | [Sandbox Templates](https://ro14nd.de/openshell-sdk-go/api/sandbox-templates.html) |
 | Command execution (collected, streamed, interactive PTY) | `ExecInterface` | [Exec](https://ro14nd.de/openshell-sdk-go/api/exec.html) |
 | Provider management (CRUD + idempotent ensure) | `ProviderInterface` | [Providers](https://ro14nd.de/openshell-sdk-go/api/providers.html) |
 | Provider profiles (list, import, lint, update) | `ProfileInterface` | [Profiles](https://ro14nd.de/openshell-sdk-go/api/profiles.html) |

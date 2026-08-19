@@ -15,6 +15,7 @@
 - [Overview](api/overview.md)
 - [Client](api/client.md)
 - [Sandboxes](api/sandboxes.md)
+- [Sandbox Templates](api/sandbox-templates.md)
 - [Exec](api/exec.md)
 - [Providers](api/providers.md)
 - [Profiles](api/profiles.md)

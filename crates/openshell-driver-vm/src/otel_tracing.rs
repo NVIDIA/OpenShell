@@ -70,6 +70,12 @@ fn compute_driver_rpc_operation(path: &str) -> (&'static str, &'static str) {
         Some("ValidateSandboxCreate") => {
             ("driver.validate_sandbox_create", "validate_sandbox_create")
         }
+        Some("UpsertSandboxTemplate") => {
+            ("driver.upsert_sandbox_template", "upsert_sandbox_template")
+        }
+        Some("DeleteSandboxTemplate") => {
+            ("driver.delete_sandbox_template", "delete_sandbox_template")
+        }
         Some("CreateSandbox") => ("driver.create_sandbox", "create_sandbox"),
         Some("GetSandbox") => ("driver.get_sandbox", "get_sandbox"),
         Some("ListSandboxes") => ("driver.list_sandboxes", "list_sandboxes"),
@@ -173,6 +179,16 @@ mod tests {
                 "ValidateSandboxCreate",
                 "driver.validate_sandbox_create",
                 "validate_sandbox_create",
+            ),
+            (
+                "UpsertSandboxTemplate",
+                "driver.upsert_sandbox_template",
+                "upsert_sandbox_template",
+            ),
+            (
+                "DeleteSandboxTemplate",
+                "driver.delete_sandbox_template",
+                "delete_sandbox_template",
             ),
             ("CreateSandbox", "driver.create_sandbox", "create_sandbox"),
             ("GetSandbox", "driver.get_sandbox", "get_sandbox"),

@@ -108,6 +108,8 @@ pub async fn run_sandbox(
     let (program, args) = command
         .split_first()
         .ok_or_else(|| miette::miette!("No command specified"))?;
+    let mut sandbox_id = sandbox_id;
+    let mut sandbox = sandbox;
 
     // Initialize the process-wide OCSF context early so that events emitted
     // during policy loading (filesystem config, validation) have a context.
@@ -162,6 +164,19 @@ pub async fn run_sandbox(
 
     // Load policy and initialize OPA engine
     let openshell_endpoint_for_proxy = openshell_endpoint.clone();
+    if sidecar_bootstrap.is_none()
+        && sandbox_id.is_none()
+        && let Some(endpoint) = openshell_endpoint.as_deref()
+        && std::env::var(openshell_core::sandbox_env::K8S_SA_TOKEN_FILE)
+            .ok()
+            .is_some_and(|path| !path.is_empty())
+    {
+        let activation = openshell_core::grpc_client::register_supervisor(endpoint).await?;
+        if sandbox.is_none() && !activation.sandbox_name.is_empty() {
+            sandbox = Some(activation.sandbox_name);
+        }
+        sandbox_id = Some(activation.sandbox_id);
+    }
     let sandbox_name_for_agg = sandbox.clone();
     let (
         mut policy,
@@ -2198,7 +2213,8 @@ async fn load_policy(
     Err(miette::miette!(
         "Sandbox policy required. Provide one of:\n\
          - --policy-rules and --policy-data (or OPENSHELL_POLICY_RULES and OPENSHELL_POLICY_DATA env vars)\n\
-         - --sandbox-id and --openshell-endpoint (or OPENSHELL_SANDBOX_ID and OPENSHELL_ENDPOINT env vars)"
+         - --sandbox-id and --openshell-endpoint (or OPENSHELL_SANDBOX_ID and OPENSHELL_ENDPOINT env vars)\n\
+         - OPENSHELL_ENDPOINT and OPENSHELL_K8S_SA_TOKEN_FILE for Kubernetes supervisor registration"
     ))
 }
 
