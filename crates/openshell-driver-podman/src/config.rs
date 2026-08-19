@@ -316,8 +316,8 @@ impl PodmanComputeConfig {
     /// `gateway.toml` and exposed in container metadata.
     pub fn validate_proxy_config(&self) -> Result<(), crate::client::PodmanApiError> {
         use openshell_core::driver_utils::{UpstreamProxyUrlError, parse_upstream_proxy_url};
-        if let Some(url) = &self.https_proxy {
-            parse_upstream_proxy_url(url).map_err(|err| {
+        let proxy_secure = if let Some(url) = &self.https_proxy {
+            let addr = parse_upstream_proxy_url(url).map_err(|err| {
                 crate::client::PodmanApiError::InvalidInput(match err {
                     UpstreamProxyUrlError::Empty => {
                         "https_proxy must not be empty when set".to_string()
@@ -330,7 +330,10 @@ impl PodmanComputeConfig {
                     err => format!("https_proxy {err}"),
                 })
             })?;
-        }
+            addr.secure
+        } else {
+            false
+        };
 
         // The supervisor treats a present-but-empty driver-supplied argument
         // as a fatal misconfiguration, so never accept (and later pass) one.
@@ -364,8 +367,10 @@ impl PodmanComputeConfig {
             // Basic auth over the plain-TCP proxy connection is readable by
             // anyone on the network path; sending it requires an explicit
             // operator acknowledgement rather than being an implicit side
-            // effect of configuring credentials.
-            if self.proxy_auth_allow_insecure != Some(true) {
+            // effect of configuring credentials. For an https:// proxy the
+            // credential is inside the verified TLS session, so the
+            // acknowledgement is unnecessary (but tolerated).
+            if self.proxy_auth_allow_insecure != Some(true) && !proxy_secure {
                 return Err(crate::client::PodmanApiError::InvalidInput(
                     "proxy_auth_file sends the credential as cleartext Basic auth over the \
                      plain-TCP connection to the http:// proxy; set proxy_auth_allow_insecure \
@@ -852,6 +857,16 @@ mod tests {
             );
             assert!(err.to_string().contains("cleartext"), "{allow:?}: {err}");
         }
+    }
+
+    #[test]
+    fn validate_proxy_config_accepts_auth_file_without_acknowledgement_for_https_proxy() {
+        let cfg = PodmanComputeConfig {
+            https_proxy: Some("https://proxy.corp.com:3130".to_string()),
+            proxy_auth_file: Some("/etc/openshell/secrets/proxy-auth".to_string()),
+            ..PodmanComputeConfig::default()
+        };
+        assert!(cfg.validate_proxy_config().is_ok());
     }
 
     #[test]
