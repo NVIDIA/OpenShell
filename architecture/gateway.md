@@ -241,6 +241,58 @@ authenticated sandbox ID with any sandbox ID or name resolved from the request.
 Supervisor control and relay streams require a matching sandbox principal before
 the gateway registers the session or bridges relay bytes.
 
+## HA Supervisor Ownership
+
+In multi-replica Kubernetes deployments, every gateway pod can accept client
+RPCs, but a sandbox supervisor maintains one active stream to one gateway
+replica at a time. The connected replica publishes a short-lived supervisor
+owner record in the shared Postgres object store with its replica id, peer DNS
+endpoint, supervisor instance id, and connection epoch. Ownership does not move
+because another gateway receives a client request. It changes only when the
+supervisor opens a new control stream, usually after the previous owner pod is
+terminated or the stream breaks. A reconnect from the same supervisor instance
+with a newer epoch can supersede the previous owner before the TTL expires, and
+heartbeats from the active connection renew that current owner record.
+Cleanup from an older connection checks the shared owner record before and
+after changing sandbox readiness. It cannot demote a sandbox after a newer
+replica has published replacement ownership.
+
+Session-bound operations such as exec, TCP forwarding, file sync, and sandbox
+service routing first check the local session registry. If the supervisor is
+owned by another gateway replica, the serving gateway opens an internal
+`PeerRelay` stream to that owner and asks it to open the supervisor relay. This
+keeps client traffic working when a Kubernetes Service routes the client to a
+non-owner gateway pod. If a peer owner is stale or unreachable during a rollout,
+the serving gateway retries ownership lookup until the normal relay wait
+deadline. Each retry re-reads the owner record, so a supervisor reconnect or
+heartbeat can surface a new owner; if no fresh reachable owner appears before
+the deadline, the client operation fails rather than electing an owner itself.
+
+File upload and download use tar-over-SSH through the same relay path. A gateway
+pod termination drops the active SSH proxy byte stream, so the CLI retries the
+whole sync operation with a fresh SSH session instead of attempting mid-stream
+resume.
+
+Gateway peer RPCs authenticate with Kubernetes ServiceAccount identity rather
+than a shared secret. Helm mounts a projected, pod-bound token with audience
+`openshell-gateway-peer`; the receiving gateway validates it through
+TokenReview, checks the live pod UID and chart selector labels, and authorizes
+only the internal peer relay method. When gateway TLS is enabled, peer clients
+also trust the chart CA, present the chart-generated client certificate for
+mTLS, and verify the stable gateway Service DNS name even when connecting to a
+Deployment pod IP.
+
+`WatchSandbox` uses the local update bus for same-replica writes. One shared
+poller per gateway observes resource-version changes made by other replicas and
+feeds that bus for all local watchers, avoiding a database poll per client
+stream.
+
+Mutations whose invariants span sandbox, provider-profile, policy, or provider
+records take a process-local mutex and a shared PostgreSQL advisory lock. The
+database session remains dedicated to the request and closes when the guard is
+dropped, which releases the lock on normal completion, cancellation, or error.
+SQLite deployments use only the local mutex because they are single-replica.
+
 ## API Surface
 
 The gateway API is organized around platform objects and operational streams:
@@ -426,7 +478,7 @@ migrations backfill existing rows with version 1.
 Provider profile imports, updates, and deletes hold the sandbox synchronization
 guard while checking attached-sandbox dynamic token grant ambiguity or in-use
 state and writing the profile record. Sandbox creation with initial providers and
-sandbox provider attach/detach use the same guard, so one gateway process cannot
+sandbox provider attach/detach use the same guard, so gateway replicas cannot
 interleave a profile mutation with a sandbox provider-set mutation that would
 leave an ambiguous final dynamic-token state or a deleted custom profile that is
 still referenced by a sandbox.

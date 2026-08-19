@@ -223,6 +223,8 @@ jobs:
       job-name: Kubernetes HA E2E (Rust smoke)
       extra-helm-values: deploy/helm/openshell/ci/values-high-availability.yaml
       external-postgres-secret: openshell-ha-pg
+      kubernetes-features: e2e,e2e-host-gateway,e2e-kubernetes,e2e-kubernetes-ha
+      use-envoy-gateway: true
       cli-artifact-prefix: rust-binary-cli
 
   kubernetes-credential-drivers-e2e:

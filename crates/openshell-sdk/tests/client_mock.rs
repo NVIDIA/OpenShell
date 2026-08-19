@@ -370,6 +370,16 @@ impl OpenShell for TestOpenShell {
         Err(Status::unimplemented("unused"))
     }
 
+    type PeerRelayStream =
+        tokio_stream::wrappers::ReceiverStream<Result<proto::PeerRelayFrame, Status>>;
+
+    async fn peer_relay(
+        &self,
+        _: tonic::Request<tonic::Streaming<proto::PeerRelayFrame>>,
+    ) -> Result<Response<Self::PeerRelayStream>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
     type ExecSandboxInteractiveStream =
         tokio_stream::wrappers::ReceiverStream<Result<proto::ExecSandboxEvent, Status>>;
 

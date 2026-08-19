@@ -124,6 +124,9 @@ pub async fn authorize_workspace(
             workspace,
             grant: AuthGrant::Sandbox,
         }),
+        Principal::Peer(_) => Err(Status::permission_denied(
+            "gateway peer principals cannot perform workspace operations",
+        )),
         Principal::Anonymous => Err(Status::unauthenticated("authentication required")),
     }
 }
@@ -158,6 +161,9 @@ pub fn require_platform_admin(admin_role: &str, principal: &Principal) -> Result
         )),
         Principal::Sandbox(_) => Err(Status::permission_denied(
             "sandbox principals cannot perform cross-workspace operations",
+        )),
+        Principal::Peer(_) => Err(Status::permission_denied(
+            "gateway peer principals cannot perform cross-workspace operations",
         )),
         Principal::Anonymous => Err(Status::unauthenticated("authentication required")),
     }

@@ -143,6 +143,25 @@ profiles:
         path: /deploy/helm/releases/0/setValues
         value:
           server.disableTls: "false"
+  # Full HA test path: installs Envoy Gateway and layers both HA replicas and
+  # Gateway API routing values onto the OpenShell release.
+  - name: high-availability
+    patches:
+      - op: add
+        path: /deploy/helm/releases/0
+        value:
+          name: envoy-gateway
+          remoteChart: oci://docker.io/envoyproxy/gateway-helm
+          version: v1.7.2
+          namespace: envoy-gateway-system
+          createNamespace: true
+          wait: true
+      - op: add
+        path: /deploy/helm/releases/1/valuesFiles/-
+        value: ci/values-high-availability.yaml
+      - op: add
+        path: /deploy/helm/releases/1/valuesFiles/-
+        value: ci/values-gateway.yaml
   - name: credential-driver-kubernetes-secrets
     patches:
       - op: add
