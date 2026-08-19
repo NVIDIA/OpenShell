@@ -87,6 +87,11 @@ path = "tests/podman_userns.rs"
 required-features = ["e2e-podman"]
 
 [[test]]
+name = "provider_refresh_handles"
+path = "tests/provider_refresh_handles.rs"
+required-features = ["e2e-podman"]
+
+[[test]]
 name = "vm_gateway_start"
 path = "tests/vm_gateway_start.rs"
 required-features = ["e2e-vm"]

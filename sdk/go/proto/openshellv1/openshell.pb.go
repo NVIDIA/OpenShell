@@ -5854,8 +5854,13 @@ type StoredProviderCredentialRefreshState struct {
 	// collision reservation, and env-key surfacing so later profile edits cannot
 	// silently redirect writes.
 	AdditionalOutputKeys map[string]string `protobuf:"bytes,17,rep,name=additional_output_keys,json=additionalOutputKeys,proto3" json:"additional_output_keys,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
-	unknownFields        protoimpl.UnknownFields
-	sizeCache            protoimpl.SizeCache
+	// Opaque gateway-owned authorization epoch for the configured refresh
+	// grant. Explicit refresh configuration creates a new epoch; automatic and
+	// manual token rotation preserve it. It is never derived from or exposed
+	// with refresh material.
+	AuthorizationEpoch string `protobuf:"bytes,18,opt,name=authorization_epoch,json=authorizationEpoch,proto3" json:"authorization_epoch,omitempty"`
+	unknownFields      protoimpl.UnknownFields
+	sizeCache          protoimpl.SizeCache
 }
 
 func (x *StoredProviderCredentialRefreshState) Reset() {
@@ -6005,6 +6010,13 @@ func (x *StoredProviderCredentialRefreshState) GetAdditionalOutputKeys() map[str
 		return x.AdditionalOutputKeys
 	}
 	return nil
+}
+
+func (x *StoredProviderCredentialRefreshState) GetAuthorizationEpoch() string {
+	if x != nil {
+		return x.AuthorizationEpoch
+	}
+	return ""
 }
 
 type GetProviderRefreshStatusRequest struct {
@@ -7383,8 +7395,14 @@ type StaticCredentialBinding struct {
 	// Supervisors use it to retain old revision placeholders only across
 	// rotations of the same provider credential.
 	CredentialIdentity string `protobuf:"bytes,2,opt,name=credential_identity,json=credentialIdentity,proto3" json:"credential_identity,omitempty"`
-	unknownFields      protoimpl.UnknownFields
-	sizeCache          protoimpl.SizeCache
+	// Opaque gateway-issued handle for a refresh-managed credential identity
+	// epoch. When non-empty, supervisors keep the workload placeholder stable
+	// across access-token rotations and replace only the resolver value. The
+	// handle changes when the sandbox, provider, credential key, refresh
+	// authorization epoch, or endpoint authorization boundary changes.
+	WorkloadCredentialHandle string `protobuf:"bytes,3,opt,name=workload_credential_handle,json=workloadCredentialHandle,proto3" json:"workload_credential_handle,omitempty"`
+	unknownFields            protoimpl.UnknownFields
+	sizeCache                protoimpl.SizeCache
 }
 
 func (x *StaticCredentialBinding) Reset() {
@@ -7427,6 +7445,13 @@ func (x *StaticCredentialBinding) GetEndpoints() []*StaticCredentialEndpointBind
 func (x *StaticCredentialBinding) GetCredentialIdentity() string {
 	if x != nil {
 		return x.CredentialIdentity
+	}
+	return ""
+}
+
+func (x *StaticCredentialBinding) GetWorkloadCredentialHandle() string {
+	if x != nil {
+		return x.WorkloadCredentialHandle
 	}
 	return ""
 }
@@ -13481,7 +13506,7 @@ const file_openshell_proto_rawDesc = "" +
 	"\n" +
 	"last_error\x18\t \x01(\tR\tlastError\"<\n" +
 	"\x18ProviderProfileDiscovery\x12 \n" +
-	"\vcredentials\x18\x01 \x03(\tR\vcredentials\"\x93\b\n" +
+	"\vcredentials\x18\x01 \x03(\tR\vcredentials\"\xc4\b\n" +
 	"$StoredProviderCredentialRefreshState\x12>\n" +
 	"\bmetadata\x18\x01 \x01(\v2\".openshell.datamodel.v1.ObjectMetaR\bmetadata\x12\x1f\n" +
 	"\vprovider_id\x18\x02 \x01(\tR\n" +
@@ -13502,7 +13527,8 @@ const file_openshell_proto_rawDesc = "" +
 	"\x06scopes\x18\x0e \x03(\tR\x06scopes\x124\n" +
 	"\x16refresh_before_seconds\x18\x0f \x01(\x03R\x14refreshBeforeSeconds\x120\n" +
 	"\x14max_lifetime_seconds\x18\x10 \x01(\x03R\x12maxLifetimeSeconds\x12\x82\x01\n" +
-	"\x16additional_output_keys\x18\x11 \x03(\v2L.openshell.v1.StoredProviderCredentialRefreshState.AdditionalOutputKeysEntryR\x14additionalOutputKeys\x1a;\n" +
+	"\x16additional_output_keys\x18\x11 \x03(\v2L.openshell.v1.StoredProviderCredentialRefreshState.AdditionalOutputKeysEntryR\x14additionalOutputKeys\x12/\n" +
+	"\x13authorization_epoch\x18\x12 \x01(\tR\x12authorizationEpoch\x1a;\n" +
 	"\rMaterialEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\x1aG\n" +
@@ -13602,10 +13628,11 @@ const file_openshell_proto_rawDesc = "" +
 	"\x1fStaticCredentialEndpointBinding\x12\x12\n" +
 	"\x04host\x18\x01 \x01(\tR\x04host\x12\x12\n" +
 	"\x04port\x18\x02 \x01(\rR\x04port\x12\x12\n" +
-	"\x04path\x18\x03 \x01(\tR\x04path\"\x97\x01\n" +
+	"\x04path\x18\x03 \x01(\tR\x04path\"\xd5\x01\n" +
 	"\x17StaticCredentialBinding\x12K\n" +
 	"\tendpoints\x18\x01 \x03(\v2-.openshell.v1.StaticCredentialEndpointBindingR\tendpoints\x12/\n" +
-	"\x13credential_identity\x18\x02 \x01(\tR\x12credentialIdentity\"\x90\b\n" +
+	"\x13credential_identity\x18\x02 \x01(\tR\x12credentialIdentity\x12<\n" +
+	"\x1aworkload_credential_handle\x18\x03 \x01(\tR\x18workloadCredentialHandle\"\x90\b\n" +
 	"%GetSandboxProviderEnvironmentResponse\x12l\n" +
 	"\venvironment\x18\x01 \x03(\v2D.openshell.v1.GetSandboxProviderEnvironmentResponse.EnvironmentEntryB\x04\x88\xb5\x18\x01R\venvironment\x122\n" +
 	"\x15provider_env_revision\x18\x02 \x01(\x04R\x13providerEnvRevision\x12\x87\x01\n" +

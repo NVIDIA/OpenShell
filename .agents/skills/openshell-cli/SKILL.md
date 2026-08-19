@@ -180,6 +180,20 @@ openshell provider refresh rotate my-outlook --credential-key MS_GRAPH_ACCESS_TO
 
 Prefer `--secret-material-env KEY[=ENVVAR]` for secret refresh material. `--material KEY=VALUE` is for non-secret material; `--secret-material-key` marks supplied material keys as secret.
 
+Gateway-managed refresh credentials use an identity-stable workload handle.
+Routine automatic refresh and `provider refresh rotate` update the access token
+behind that handle, so long-running processes do not need to restart. Running
+processes must be restarted once when upgrading from revision-scoped
+placeholders. A later `provider refresh configure` call is an explicit
+reauthorization boundary: it revokes the previous handle, and processes holding
+that handle fail closed until restarted.
+
+While gateway-managed refresh is configured, `provider update --credential`
+cannot replace or delete the refresh-owned primary credential or any co-minted
+output. Use `provider refresh rotate`, reconfigure refresh, or delete refresh
+before returning those keys to manual management. Unrelated provider fields
+remain updateable.
+
 ---
 
 ## Workflow 3: Sandbox Lifecycle

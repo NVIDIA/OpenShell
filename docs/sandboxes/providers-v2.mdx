@@ -177,10 +177,17 @@ HTTP 101 upgrade has completed. OpenShell closes that WebSocket with policy
 violation code 1008 instead of returning an HTTP response.
 
 Binding updates apply to both current and retained placeholder generations.
-Credential rotation keeps the current endpoint set. Updating a provider profile
-changes the binding on the next sandbox provider-environment sync, and detaching
-the provider revokes resolution for placeholders already held by running
-processes.
+For gateway-managed refresh credentials, automatic and manual token rotation
+keep one opaque workload placeholder and replace only its current resolver
+value. This lets a long-running process use each newly minted access token
+without restarting. OpenShell does not retain older values behind this stable
+placeholder.
+
+Explicitly configuring refresh again starts a new authorization epoch, even
+when the provider and credential key are unchanged. Reconfiguration, provider
+replacement or detachment, refresh deletion, and endpoint-boundary changes
+revoke the old placeholder. Updating a provider profile changes the binding on
+the next sandbox provider-environment sync.
 
 <Warning>
 Static credentials require at least one usable binding. OpenShell withholds only
@@ -195,6 +202,10 @@ restart or recreate older running sandboxes. A new gateway withholds static
 credential material from supervisors that do not advertise binding support.
 Rotate attached static credentials after upgrading when an older sandbox may
 have received their real values.
+
+When upgrading from revision-scoped refresh placeholders to stable refresh
+handles, restart each existing workload once so it receives the new placeholder.
+Later access-token rotations do not require workload restarts.
 
 ## Roadmap
 
@@ -607,6 +618,20 @@ The gateway sends a complete host, port, and path binding for every emitted stat
 ## Configure Credential Refresh
 
 Refresh configuration is stored separately from the current injectable credential value. The gateway refresh worker reads refresh state, mints a new short-lived token for supported strategies, writes the token back to the provider record, and updates credential expiry metadata.
+
+Each explicit `refresh configure` call also starts a new gateway-owned
+authorization epoch. Automatic refresh and `refresh rotate` preserve that epoch,
+so running workloads keep the same opaque credential handle while the short-lived
+token changes. Configuring refresh again is a revocation boundary and causes
+running workloads that still hold the previous handle to fail closed.
+
+While gateway-managed refresh is configured, `provider update --credential`
+cannot replace or delete its primary credential or any co-minted output. Use
+`provider refresh rotate` to mint a new short-lived value. Re-run
+`provider refresh configure` to start a new authorization, or use
+`provider refresh delete` before returning those credential keys to manual
+management. You can still update unrelated credentials, configuration, and
+credential expiry metadata.
 
 For a complete Microsoft Graph OAuth2 refresh-token walkthrough, see [Refresh Microsoft Graph Credentials with Providers v2](/get-started/tutorials/microsoft-graph-provider-refresh).
 

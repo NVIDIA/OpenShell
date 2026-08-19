@@ -2833,6 +2833,7 @@ mod tests {
                 path: "/allowed/**".to_string(),
             }],
             credential_identity: identity.to_string(),
+            workload_credential_handle: String::new(),
         }
     }
 
@@ -4400,6 +4401,7 @@ network_policies:
                         path: "/v1/**".to_string(),
                     }],
                     credential_identity: "provider-a:API_TOKEN".to_string(),
+                    workload_credential_handle: String::new(),
                 },
             )]),
             Vec::new(),
@@ -4503,6 +4505,7 @@ network_policies:
                         path: "/v1/**".to_string(),
                     }],
                     credential_identity: "provider-a:API_TOKEN".to_string(),
+                    workload_credential_handle: String::new(),
                 },
             )]),
             Vec::new(),
@@ -5151,6 +5154,7 @@ network_policies:
                         path: "/allowed".to_string(),
                     }],
                     credential_identity: "provider-a:API_TOKEN".to_string(),
+                    workload_credential_handle: String::new(),
                 },
             )]),
             Vec::new(),
@@ -7397,6 +7401,7 @@ network_policies:
                         path: "/allowed/**".to_string(),
                     }],
                     credential_identity: "provider-a:API_TOKEN".to_string(),
+                    workload_credential_handle: String::new(),
                 },
             )]),
             Vec::new(),

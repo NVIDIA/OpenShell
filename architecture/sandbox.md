@@ -87,6 +87,18 @@ partially active or last-known-good static set. Invalid metadata preserves the
 supplied dynamic snapshot, while a fetch failure preserves the currently active
 dynamic snapshot.
 
+Gateway-managed refresh credentials use an opaque workload handle derived from
+the sandbox, provider identity, credential key, refresh authorization epoch,
+and canonical endpoint boundary. The handle remains stable while the gateway
+rotates the short-lived value, so an already-running process keeps one
+placeholder and each request resolves against the current token. Explicit
+refresh reconfiguration, provider replacement or detachment, and endpoint
+boundary changes produce a new handle and revoke the old one. Supervisors do
+not retain old values for these handles. Public provider updates cannot replace
+or delete the refresh-owned primary credential or co-minted outputs; internal
+CAS rotation and explicit refresh lifecycle operations own those values.
+Unmanaged static credentials retain the bounded revision-generation behavior.
+
 Route selection and policy evaluation use a syntax-only redacted request target;
 they do not materialize real credentials. Cross-endpoint placeholder use returns
 HTTP 403. After a WebSocket upgrade it closes the connection with policy
@@ -258,8 +270,10 @@ when policy allows the target endpoint. For GCP providers, a loopback metadata
 server inside the network namespace serves placeholders to SDKs that bypass the
 proxy (e.g. Go's `cloud.google.com/go/compute/metadata`). Secrets must not be
 logged in OCSF or plain tracing output. The supervisor uses revision-scoped
-placeholders for rotating provider credentials; provider environment keys
-beginning with `v<digits>_` are reserved for that placeholder namespace.
+placeholders for unmanaged rotating credentials and identity-stable opaque
+handles for gateway-managed refresh credentials. Provider environment keys
+beginning with `v<digits>_` or `s<64 lowercase hex characters>_` are reserved
+for those placeholder namespaces.
 
 Provider profiles can also declare dynamic token grants. For matching HTTP
 endpoints, the supervisor obtains a SPIFFE JWT-SVID from the local Workload API,
