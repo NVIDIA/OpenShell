@@ -103,6 +103,18 @@ export interface SandboxSpec {
   rawSpec?: MessageInitShape<typeof SandboxSpecSchema>;
 }
 
+export interface SandboxFromTemplateSpec {
+  name?: string;
+  templateName: string;
+  labels?: Record<string, string>;
+  providers?: string[];
+  /**
+   * Create-time sandbox policy (the safety boundary). The named workload
+   * template supplies runtime workload fields.
+   */
+  policy?: MessageInitShape<typeof SandboxPolicySchema>;
+}
+
 export interface SandboxRef {
   id: string;
   name: string;
@@ -591,6 +603,24 @@ export class SandboxClient {
         name: spec.name ?? '',
         labels: spec.labels ?? {},
         spec: specInit,
+      });
+      return sandboxRef(resp.sandbox);
+    } catch (e) {
+      throw fromConnect(e);
+    }
+  }
+
+  async createFromTemplate(spec: SandboxFromTemplateSpec): Promise<SandboxRef> {
+    if (spec.templateName.trim() === '') throw new SdkError('invalid_config', 'templateName is required');
+    try {
+      const resp = await this.grpc.createSandbox({
+        name: spec.name ?? '',
+        labels: spec.labels ?? {},
+        spec: {
+          providers: spec.providers ?? [],
+          policy: spec.policy,
+        },
+        workloadTemplateName: spec.templateName,
       });
       return sandboxRef(resp.sandbox);
     } catch (e) {

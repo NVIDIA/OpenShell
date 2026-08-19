@@ -23,6 +23,7 @@ export type {
   ProviderChangeOptions,
   ProviderRef,
   SandboxConfig,
+  SandboxFromTemplateSpec,
   SandboxPhaseName,
   SandboxPolicy,
   SandboxRef,

@@ -77,6 +77,7 @@ fn sandbox_with_phase_ws(
             phase: phase.into(),
             ..Default::default()
         }),
+        ..proto::Sandbox::default()
     }
 }
 
@@ -175,6 +176,34 @@ impl OpenShell for TestOpenShell {
         Ok(Response::new(proto::SandboxResponse {
             sandbox: Some(sandbox_with_phase(&name, proto::SandboxPhase::Provisioning)),
         }))
+    }
+
+    async fn create_sandbox_template(
+        &self,
+        _: tonic::Request<proto::CreateSandboxTemplateRequest>,
+    ) -> Result<Response<proto::SandboxTemplateResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn get_sandbox_template(
+        &self,
+        _: tonic::Request<proto::GetSandboxTemplateRequest>,
+    ) -> Result<Response<proto::SandboxTemplateResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn list_sandbox_templates(
+        &self,
+        _: tonic::Request<proto::ListSandboxTemplatesRequest>,
+    ) -> Result<Response<proto::ListSandboxTemplatesResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn delete_sandbox_template(
+        &self,
+        _: tonic::Request<proto::DeleteSandboxTemplateRequest>,
+    ) -> Result<Response<proto::DeleteSandboxTemplateResponse>, Status> {
+        Err(Status::unimplemented("unused"))
     }
 
     async fn stop_sandbox(

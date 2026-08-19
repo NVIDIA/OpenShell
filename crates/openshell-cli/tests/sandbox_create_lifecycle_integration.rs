@@ -14,20 +14,22 @@ use openshell_cli::tls::TlsOptions;
 use openshell_core::proto::open_shell_server::{OpenShell, OpenShellServer};
 use openshell_core::proto::{
     AttachSandboxProviderRequest, AttachSandboxProviderResponse, CreateProviderRequest,
-    CreateSandboxRequest, CreateSshSessionRequest, CreateSshSessionResponse, DeleteProviderRequest,
-    DeleteProviderResponse, DeleteSandboxRequest, DeleteSandboxResponse,
-    DetachSandboxProviderRequest, DetachSandboxProviderResponse,
-    ExchangeProviderSubjectTokenRequest, ExchangeProviderSubjectTokenResponse, ExecSandboxEvent,
-    ExecSandboxInput, ExecSandboxRequest, GatewayMessage, GetGatewayConfigRequest,
-    GetGatewayConfigResponse, GetProviderRequest, GetSandboxConfigRequest,
-    GetSandboxConfigResponse, GetSandboxProviderEnvironmentRequest,
-    GetSandboxProviderEnvironmentResponse, GetSandboxRequest, GpuResourceRequirements,
-    HealthRequest, HealthResponse, ListProvidersRequest, ListProvidersResponse,
-    ListSandboxProvidersRequest, ListSandboxProvidersResponse, ListSandboxesRequest,
-    ListSandboxesResponse, PlatformEvent, ProviderResponse, RevokeSshSessionRequest,
+    CreateSandboxRequest, CreateSandboxTemplateRequest, CreateSshSessionRequest,
+    CreateSshSessionResponse, DeleteProviderRequest, DeleteProviderResponse, DeleteSandboxRequest,
+    DeleteSandboxResponse, DeleteSandboxTemplateRequest, DetachSandboxProviderRequest,
+    DetachSandboxProviderResponse, ExchangeProviderSubjectTokenRequest,
+    ExchangeProviderSubjectTokenResponse, ExecSandboxEvent, ExecSandboxInput, ExecSandboxRequest,
+    GatewayMessage, GetGatewayConfigRequest, GetGatewayConfigResponse, GetProviderRequest,
+    GetSandboxConfigRequest, GetSandboxConfigResponse, GetSandboxProviderEnvironmentRequest,
+    GetSandboxProviderEnvironmentResponse, GetSandboxRequest, GetSandboxTemplateRequest,
+    GpuResourceRequirements, HealthRequest, HealthResponse, ListProvidersRequest,
+    ListProvidersResponse, ListSandboxProvidersRequest, ListSandboxProvidersResponse,
+    ListSandboxTemplatesRequest, ListSandboxTemplatesResponse, ListSandboxesRequest,
+    ListSandboxesResponse, PlatformEvent, Provider, ProviderResponse, RevokeSshSessionRequest,
     RevokeSshSessionResponse, Sandbox, SandboxCondition, SandboxLogLine, SandboxPhase,
-    SandboxResponse, SandboxStatus, SandboxStreamEvent, ServiceStatus, SettingValue,
-    SupervisorMessage, UpdateProviderRequest, WatchSandboxRequest, sandbox_stream_event,
+    SandboxResponse, SandboxStatus, SandboxStreamEvent, SandboxTemplateResponse,
+    SandboxWorkloadTemplate, ServiceStatus, SettingValue, SupervisorMessage, UpdateProviderRequest,
+    WatchSandboxRequest, sandbox_stream_event,
 };
 use std::collections::HashMap;
 use std::fs;
@@ -55,6 +57,11 @@ struct SandboxState {
     ssh_session_requests: Arc<AtomicUsize>,
     global_settings: Arc<Mutex<HashMap<String, SettingValue>>>,
     gateway_config_requests: Arc<AtomicUsize>,
+    providers: Arc<Mutex<Vec<Provider>>>,
+    template_create_requests: Arc<Mutex<Vec<CreateSandboxTemplateRequest>>>,
+    template_get_requests: Arc<Mutex<Vec<GetSandboxTemplateRequest>>>,
+    template_list_requests: Arc<Mutex<Vec<ListSandboxTemplatesRequest>>>,
+    template_delete_requests: Arc<Mutex<Vec<DeleteSandboxTemplateRequest>>>,
 }
 
 #[derive(Clone, Default)]
@@ -177,6 +184,95 @@ impl OpenShell for TestOpenShell {
         _request: tonic::Request<ListSandboxesRequest>,
     ) -> Result<Response<ListSandboxesResponse>, Status> {
         Ok(Response::new(ListSandboxesResponse::default()))
+    }
+
+    async fn create_sandbox_template(
+        &self,
+        request: tonic::Request<CreateSandboxTemplateRequest>,
+    ) -> Result<Response<SandboxTemplateResponse>, Status> {
+        let request = request.into_inner();
+        let mut template = request.template.clone().unwrap_or_default();
+        let name = template
+            .metadata
+            .as_ref()
+            .map_or_else(|| "template".to_string(), |metadata| metadata.name.clone());
+        template.metadata = Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+            id: format!("template-{name}"),
+            name,
+            created_at_ms: 0,
+            labels: template
+                .metadata
+                .as_ref()
+                .map(|metadata| metadata.labels.clone())
+                .unwrap_or_default(),
+            resource_version: 1,
+            annotations: HashMap::new(),
+            workspace: request.workspace.clone(),
+            deletion_timestamp_ms: 0,
+        });
+        self.state
+            .template_create_requests
+            .lock()
+            .await
+            .push(request);
+        Ok(Response::new(SandboxTemplateResponse {
+            template: Some(template),
+        }))
+    }
+
+    async fn get_sandbox_template(
+        &self,
+        request: tonic::Request<GetSandboxTemplateRequest>,
+    ) -> Result<Response<SandboxTemplateResponse>, Status> {
+        let request = request.into_inner();
+        self.state
+            .template_get_requests
+            .lock()
+            .await
+            .push(request.clone());
+        Ok(Response::new(SandboxTemplateResponse {
+            template: Some(SandboxWorkloadTemplate {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: format!("template-{}", request.name),
+                    name: request.name,
+                    created_at_ms: 0,
+                    labels: HashMap::new(),
+                    resource_version: 1,
+                    annotations: HashMap::new(),
+                    workspace: request.workspace,
+                    deletion_timestamp_ms: 0,
+                }),
+                spec: None,
+            }),
+        }))
+    }
+
+    async fn list_sandbox_templates(
+        &self,
+        request: tonic::Request<ListSandboxTemplatesRequest>,
+    ) -> Result<Response<ListSandboxTemplatesResponse>, Status> {
+        self.state
+            .template_list_requests
+            .lock()
+            .await
+            .push(request.into_inner());
+        Ok(Response::new(ListSandboxTemplatesResponse {
+            templates: Vec::new(),
+        }))
+    }
+
+    async fn delete_sandbox_template(
+        &self,
+        request: tonic::Request<DeleteSandboxTemplateRequest>,
+    ) -> Result<Response<openshell_core::proto::DeleteSandboxTemplateResponse>, Status> {
+        self.state
+            .template_delete_requests
+            .lock()
+            .await
+            .push(request.into_inner());
+        Ok(Response::new(
+            openshell_core::proto::DeleteSandboxTemplateResponse { deleted: true },
+        ))
     }
 
     async fn list_sandbox_providers(
@@ -332,7 +428,9 @@ impl OpenShell for TestOpenShell {
         &self,
         _request: tonic::Request<ListProvidersRequest>,
     ) -> Result<Response<ListProvidersResponse>, Status> {
-        Ok(Response::new(ListProvidersResponse::default()))
+        Ok(Response::new(ListProvidersResponse {
+            providers: self.state.providers.lock().await.clone(),
+        }))
     }
 
     async fn list_provider_profiles(
@@ -1204,6 +1302,63 @@ async fn create_requests(server: &TestServer) -> Vec<CreateSandboxRequest> {
     server.openshell.state.create_requests.lock().await.clone()
 }
 
+async fn template_create_requests(server: &TestServer) -> Vec<CreateSandboxTemplateRequest> {
+    server
+        .openshell
+        .state
+        .template_create_requests
+        .lock()
+        .await
+        .clone()
+}
+
+async fn template_list_requests(server: &TestServer) -> Vec<ListSandboxTemplatesRequest> {
+    server
+        .openshell
+        .state
+        .template_list_requests
+        .lock()
+        .await
+        .clone()
+}
+
+async fn template_delete_requests(server: &TestServer) -> Vec<DeleteSandboxTemplateRequest> {
+    server
+        .openshell
+        .state
+        .template_delete_requests
+        .lock()
+        .await
+        .clone()
+}
+
+async fn add_provider(server: &TestServer, name: &str, provider_type: &str) {
+    server
+        .openshell
+        .state
+        .providers
+        .lock()
+        .await
+        .push(Provider {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: format!("provider-{name}"),
+                name: name.to_string(),
+                created_at_ms: 0,
+                labels: HashMap::new(),
+                resource_version: 0,
+                annotations: HashMap::new(),
+                workspace: "default".to_string(),
+                deletion_timestamp_ms: 0,
+            }),
+            r#type: provider_type.to_string(),
+            credentials: HashMap::new(),
+            config: HashMap::new(),
+            credential_expires_at_ms: HashMap::new(),
+            profile_workspace: "default".to_string(),
+            credential_handles: HashMap::new(),
+        });
+}
+
 fn test_tls(server: &TestServer) -> TlsOptions {
     server.tls.with_gateway_name("openshell")
 }
@@ -1486,6 +1641,199 @@ async fn sandbox_create_sends_driver_config_json() {
             }),
         Some("batch-low")
     );
+}
+
+#[tokio::test]
+async fn sandbox_create_with_template_sends_workload_template_name() {
+    let server = run_server().await;
+    add_provider(&server, "github", "github").await;
+    let fake_ssh_dir = tempfile::tempdir().unwrap();
+    let xdg_dir = tempfile::tempdir().unwrap();
+    let _env = test_env(&fake_ssh_dir, &xdg_dir);
+    let tls = test_tls(&server);
+    install_fake_ssh(&fake_ssh_dir);
+
+    run::sandbox_create(
+        &server.endpoint,
+        "openshell",
+        run::SandboxCreateConfig {
+            name: Some("from-template"),
+            template: Some("gpu-kata"),
+            providers: &["github".to_string()],
+            command: &["echo".into(), "OK".into()],
+            ..test_config()
+        },
+        "default",
+        &tls,
+    )
+    .await
+    .expect("sandbox create should succeed");
+
+    let requests = create_requests(&server).await;
+    let request = requests.first().expect("create request should be recorded");
+    assert_eq!(request.workload_template_name, "gpu-kata");
+    let spec = request
+        .spec
+        .as_ref()
+        .expect("governance spec should be sent");
+    assert_eq!(spec.providers, vec!["github".to_string()]);
+    assert!(spec.template.is_none());
+    assert!(spec.environment.is_empty());
+    assert!(spec.resource_requirements.is_none());
+}
+
+#[tokio::test]
+async fn sandbox_template_create_sends_workload_template_resource() {
+    let server = run_server().await;
+    let fake_ssh_dir = tempfile::tempdir().unwrap();
+    let xdg_dir = tempfile::tempdir().unwrap();
+    let _env = test_env(&fake_ssh_dir, &xdg_dir);
+    let tls = test_tls(&server);
+
+    run::sandbox_template_create(
+        &server.endpoint,
+        "gpu-kata",
+        Some("registry.example.com/agent:latest"),
+        Some("2"),
+        Some("4Gi"),
+        Some(1),
+        Some(r#"{"kubernetes":{"pod":{"node_selector":{"pool":"gpu"}}}}"#),
+        Some("5m"),
+        Some(3),
+        HashMap::from([("team".to_string(), "runtime".to_string())]),
+        HashMap::from([("owner".to_string(), "platform".to_string())]),
+        HashMap::from([("FEATURE_FLAG".to_string(), "on".to_string())]),
+        "table",
+        "default",
+        &tls,
+    )
+    .await
+    .expect("template create should succeed");
+
+    let requests = template_create_requests(&server).await;
+    let request = requests
+        .first()
+        .expect("template create request should be recorded");
+    assert_eq!(request.workspace, "default");
+    let template = request.template.as_ref().expect("template should be sent");
+    let metadata = template.metadata.as_ref().expect("metadata should be sent");
+    assert_eq!(metadata.name, "gpu-kata");
+    assert_eq!(metadata.labels.get("team"), Some(&"runtime".to_string()));
+    assert_eq!(
+        metadata.annotations.get("owner"),
+        Some(&"platform".to_string())
+    );
+
+    let spec = template.spec.as_ref().expect("spec should be sent");
+    let workload = spec.workload.as_ref().expect("workload should be sent");
+    assert_eq!(workload.image, "registry.example.com/agent:latest");
+    assert_eq!(
+        workload.environment.get("FEATURE_FLAG"),
+        Some(&"on".to_string())
+    );
+    let resources = workload
+        .resources
+        .as_ref()
+        .expect("resources should be sent");
+    assert_eq!(resources.cpu, "2");
+    assert_eq!(resources.memory, "4Gi");
+    assert_eq!(resources.gpu_count, Some(1));
+    assert!(spec.driver_config.is_some());
+    let startup = spec
+        .desired_service_level
+        .as_ref()
+        .and_then(|service_level| service_level.startup.as_ref())
+        .expect("startup service level should be sent");
+    assert_eq!(startup.max_burst, 3);
+    assert_eq!(
+        startup
+            .ready_within
+            .as_ref()
+            .map(|duration| duration.seconds),
+        Some(300)
+    );
+}
+
+#[tokio::test]
+async fn sandbox_template_list_and_delete_send_workspace_requests() {
+    let server = run_server().await;
+    let fake_ssh_dir = tempfile::tempdir().unwrap();
+    let xdg_dir = tempfile::tempdir().unwrap();
+    let _env = test_env(&fake_ssh_dir, &xdg_dir);
+    let tls = test_tls(&server);
+
+    run::sandbox_template_list(
+        &server.endpoint,
+        25,
+        5,
+        false,
+        "table",
+        "default",
+        false,
+        &tls,
+    )
+    .await
+    .expect("template list should succeed");
+    run::sandbox_template_delete(&server.endpoint, &["gpu-kata".to_string()], "default", &tls)
+        .await
+        .expect("template delete should succeed");
+
+    let list_requests = template_list_requests(&server).await;
+    let list_request = list_requests
+        .first()
+        .expect("template list request should be recorded");
+    assert_eq!(list_request.limit, 25);
+    assert_eq!(list_request.offset, 5);
+    assert_eq!(list_request.workspace, "default");
+    assert!(!list_request.all_workspaces);
+
+    let delete_requests = template_delete_requests(&server).await;
+    let delete_request = delete_requests
+        .first()
+        .expect("template delete request should be recorded");
+    assert_eq!(delete_request.name, "gpu-kata");
+    assert_eq!(delete_request.workspace, "default");
+}
+
+#[tokio::test]
+async fn sandbox_template_create_allows_omitted_image() {
+    let server = run_server().await;
+    let fake_ssh_dir = tempfile::tempdir().unwrap();
+    let xdg_dir = tempfile::tempdir().unwrap();
+    let _env = test_env(&fake_ssh_dir, &xdg_dir);
+    let tls = test_tls(&server);
+
+    run::sandbox_template_create(
+        &server.endpoint,
+        "base",
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        HashMap::new(),
+        HashMap::new(),
+        HashMap::new(),
+        "table",
+        "default",
+        &tls,
+    )
+    .await
+    .expect("template create without image should succeed");
+
+    let requests = template_create_requests(&server).await;
+    let request = requests
+        .first()
+        .expect("template create request should be recorded");
+    let workload = request
+        .template
+        .as_ref()
+        .and_then(|template| template.spec.as_ref())
+        .and_then(|spec| spec.workload.as_ref())
+        .expect("workload should be sent");
+    assert_eq!(workload.image, "");
 }
 
 #[tokio::test]

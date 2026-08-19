@@ -261,6 +261,46 @@ describe('create', () => {
     expect(created.spec?.providers).toEqual(['claude']);
   });
 
+  it('createFromTemplate sends the workload template name with governance fields only', async () => {
+    let created: {
+      workloadTemplateName?: string;
+      name?: string;
+      labels?: Record<string, string>;
+      spec?: {
+        policy?: { version?: number };
+        providers?: string[];
+        template?: { image?: string };
+      };
+    } = {};
+    const sandbox = client({
+      createSandbox: (req) => {
+        created = req;
+        return readySandbox('sb', 'sb-id');
+      },
+    });
+    await sandbox.createFromTemplate({
+      name: 'job-1',
+      templateName: 'gpu-kata',
+      labels: { team: 'runtime' },
+      providers: ['github'],
+      policy: { version: 1, networkPolicies: {} },
+    });
+
+    expect(created.workloadTemplateName).toBe('gpu-kata');
+    expect(created.name).toBe('job-1');
+    expect(created.labels).toEqual({ team: 'runtime' });
+    expect(created.spec?.providers).toEqual(['github']);
+    expect(created.spec?.policy?.version).toBe(1);
+    expect(created.spec?.template).toBeUndefined();
+  });
+
+  it('createFromTemplate rejects an empty template name locally', async () => {
+    const sandbox = client({});
+    await expect(sandbox.createFromTemplate({ templateName: ' ' })).rejects.toMatchObject({
+      code: 'invalid_config',
+    });
+  });
+
   it('rejects gateway sandboxes missing required metadata', async () => {
     const sandbox = client({
       getSandbox: () => ({ sandbox: { status: { phase: SandboxPhase.READY } } }),

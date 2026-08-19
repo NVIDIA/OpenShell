@@ -4,6 +4,7 @@
 package fake
 
 import (
+	"context"
 	"sync"
 
 	v1 "github.com/NVIDIA/OpenShell/sdk/go/openshell/v1"
@@ -106,6 +107,12 @@ func (fc *Client) isClosed() bool {
 
 // Sandboxes returns the sandbox sub-client.
 func (fc *Client) Sandboxes() v1.SandboxInterface { return fc.sandboxes }
+
+// CreateSandboxFromTemplate creates a sandbox from a named workload template
+// without changing the legacy Sandboxes() interface.
+func (fc *Client) CreateSandboxFromTemplate(ctx context.Context, workspace, name, templateName string, spec *types.SandboxSpec, labels map[string]string, opts ...types.CreateOptions) (*types.Sandbox, error) {
+	return fc.sandboxes.(v1.SandboxTemplateCreateInterface).CreateFromTemplate(ctx, workspace, name, templateName, spec, labels, opts...)
+}
 
 // Providers returns the provider sub-client.
 func (fc *Client) Providers() v1.ProviderInterface { return fc.providers }

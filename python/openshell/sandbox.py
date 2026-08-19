@@ -726,6 +726,33 @@ class SandboxClient:
             raise SandboxError("CreateSandbox returned empty sandbox id")
         return sandbox_ref
 
+    def create_from_template(
+        self,
+        *,
+        workspace: str,
+        template_name: str,
+        spec: openshell_pb2.SandboxSpec | None = None,
+        name: str | None = None,
+        labels: Mapping[str, str] | None = None,
+    ) -> SandboxRef:
+        if not template_name.strip():
+            raise SandboxError("template_name is required")
+        request_spec = spec if spec is not None else openshell_pb2.SandboxSpec()
+        response = self._stub.CreateSandbox(
+            openshell_pb2.CreateSandboxRequest(
+                spec=request_spec,
+                name=name or "",
+                labels=dict(labels) if labels else {},
+                workspace=workspace,
+                workload_template_name=template_name,
+            ),
+            timeout=self._timeout,
+        )
+        sandbox_ref = _sandbox_ref(response.sandbox)
+        if sandbox_ref.id == "":
+            raise SandboxError("CreateSandbox returned empty sandbox id")
+        return sandbox_ref
+
     def create_session(
         self,
         *,
@@ -736,6 +763,26 @@ class SandboxClient:
     ) -> SandboxSession:
         return SandboxSession(
             self, self.create(workspace=workspace, spec=spec, name=name, labels=labels)
+        )
+
+    def create_session_from_template(
+        self,
+        *,
+        workspace: str,
+        template_name: str,
+        spec: openshell_pb2.SandboxSpec | None = None,
+        name: str | None = None,
+        labels: Mapping[str, str] | None = None,
+    ) -> SandboxSession:
+        return SandboxSession(
+            self,
+            self.create_from_template(
+                workspace=workspace,
+                template_name=template_name,
+                spec=spec,
+                name=name,
+                labels=labels,
+            ),
         )
 
     def get(self, sandbox_name: str, *, workspace: str) -> SandboxRef:
@@ -1182,6 +1229,7 @@ class Sandbox:
         spec: openshell_pb2.SandboxSpec | None = None,
         name: str | None = None,
         labels: Mapping[str, str] | None = None,
+        template_name: str | None = None,
         timeout: float = 30.0,
         ready_timeout_seconds: float = 120.0,
         auto_refresh: bool = True,
@@ -1207,6 +1255,7 @@ class Sandbox:
         self._name = name
         # Copy so later caller mutation cannot change what gets sent on enter.
         self._labels = dict(labels) if labels is not None else None
+        self._template_name = template_name
         self._timeout = timeout
         self._ready_timeout_seconds = ready_timeout_seconds
         self._auto_refresh = auto_refresh
@@ -1232,10 +1281,12 @@ class Sandbox:
         # Creation metadata cannot be applied when attaching to an existing
         # sandbox; reject it before opening a connection.
         if self._sandbox_input is not None and (
-            self._name is not None or self._labels is not None
+            self._name is not None
+            or self._labels is not None
+            or self._template_name is not None
         ):
             raise SandboxError(
-                "name and labels cannot be set when attaching to an existing sandbox"
+                "name, labels, and template_name cannot be set when attaching to an existing sandbox"
             )
 
         client = SandboxClient.from_active_cluster(
@@ -1248,7 +1299,15 @@ class Sandbox:
         )
         self._client = client
 
-        if self._sandbox_input is None:
+        if self._sandbox_input is None and self._template_name is not None:
+            self._session = client.create_session_from_template(
+                workspace=self._workspace,
+                template_name=self._template_name,
+                spec=self._spec,
+                name=self._name,
+                labels=self._labels,
+            )
+        elif self._sandbox_input is None:
             self._session = client.create_session(
                 workspace=self._workspace,
                 spec=self._spec,

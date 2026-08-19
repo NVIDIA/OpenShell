@@ -117,6 +117,19 @@ pub struct SandboxSpec {
     pub tty: bool,
 }
 
+/// Caller intent for creating a sandbox from a named workload template.
+#[derive(Clone, Debug, Default)]
+pub struct SandboxTemplateCreateSpec {
+    /// Optional user-supplied sandbox name. When empty the server generates one.
+    pub name: Option<String>,
+    /// Workspace-scoped template name to resolve at creation time.
+    pub template_name: String,
+    /// Labels attached to the sandbox.
+    pub labels: HashMap<String, String>,
+    /// Provider names to attach.
+    pub providers: Vec<String>,
+}
+
 /// Reference to a sandbox owned by the gateway.
 #[derive(Clone, Debug)]
 #[non_exhaustive]
