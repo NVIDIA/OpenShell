@@ -1,0 +1,431 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+{{- $mode := .Values.cni.mode | default "conflist" -}}
+{{- if and .Values.cni.only (not .Values.cni.enabled) -}}
+{{- fail "cni.only=true installs the standalone CNI singleton and requires cni.enabled=true" -}}
+{{- end }}
+{{- if and (eq (.Values.supervisor.topology | default "combined") "cni-sidecar") (not .Values.cni.enabled) (not .Values.cni.external) -}}
+{{- fail "supervisor.topology=cni-sidecar requires the OpenShell CNI installer: set cni.enabled=true to install the cluster singleton here, or cni.external=true if it is installed by another release" -}}
+{{- end }}
+{{- if .Values.cni.enabled }}
+{{- if not (has $mode (list "conflist" "multus-chain")) -}}
+{{- fail "cni.mode must be \"conflist\" or \"multus-chain\"" -}}
+{{- end }}
+{{- if and (eq $mode "multus-chain") (not .Values.cni.chainDir) -}}
+{{- fail "cni.mode=multus-chain requires cni.chainDir" -}}
+{{- end }}
+{{- $sandboxNamespace := .Values.server.sandboxNamespace | default .Release.Namespace }}
+{{- $cniSandboxNamespaces := .Values.cni.sandboxNamespaces | default (list $sandboxNamespace) }}
+{{- $cniLogFile := .Values.cni.logFile | default "/var/log/openshell-cni.log" }}
+{{- $cniLogDir := dir $cniLogFile }}
+{{- $stateDir := .Values.cni.confDir }}
+{{- if eq $mode "multus-chain" }}
+{{- $stateDir = .Values.cni.stateDir | default .Values.cni.confDir }}
+{{- end }}
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ include "openshell.cniName" . }}
+  labels:
+    {{- include "openshell.cniLabels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "openshell.cniSelectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "openshell.cniLabels" . | nindent 8 }}
+    spec:
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      serviceAccountName: {{ include "openshell.cniServiceAccountName" . }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: install-cni
+          image: {{ include "openshell.cniImage" . | quote }}
+          imagePullPolicy: {{ include "openshell.cniImagePullPolicy" . | quote }}
+          env:
+            # Used by `openshell-cni node-ready` to label this node ready/unready
+            # so the gateway can gate sandbox scheduling on per-node enforcement.
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            # Used by `openshell-cni daemonset-active` so the preStop hook can tell
+            # an ordinary pod restart from a real teardown (helm uninstall).
+            - name: DS_NAME
+              value: {{ include "openshell.cniName" . }}
+            - name: DS_NAMESPACE
+              value: {{ .Release.Namespace | quote }}
+          command:
+            - sh
+            - -ec
+            - |
+              bin_dir="/host{{ .Values.cni.binDir }}"
+              state_dir="/host{{ $stateDir }}"
+              host_state_dir="{{ $stateDir }}"
+              log_file="{{ $cniLogFile }}"
+              host_log_file="/host${log_file}"
+              kubeconfig="${state_dir}/openshell-cni-kubeconfig"
+              token_file="${state_dir}/openshell-cni-token"
+              ca_file="${state_dir}/openshell-cni-ca.crt"
+              plugin_config="${state_dir}/openshell-cni-plugin.json"
+              mkdir -p "${bin_dir}" "${state_dir}"
+              touch "${host_log_file}"
+              chmod 0644 "${host_log_file}"
+              install -m 0755 /openshell-cni "${bin_dir}/openshell-cni"
+              # Create the token atomically at mode 0600 (install, not cp+chmod) so
+              # this node-patch-capable credential is never briefly world-readable.
+              install -m 0644 /var/run/secrets/kubernetes.io/serviceaccount/ca.crt "${ca_file}"
+              install -m 0600 /var/run/secrets/kubernetes.io/serviceaccount/token "${token_file}"
+              cat > "${kubeconfig}" <<EOF
+              apiVersion: v1
+              kind: Config
+              current-context: openshell-cni
+              clusters:
+              - name: cluster
+                cluster:
+                  server: https://${KUBERNETES_SERVICE_HOST}:${KUBERNETES_SERVICE_PORT}
+                  certificate-authority: ${host_state_dir}/openshell-cni-ca.crt
+              users:
+              - name: openshell-cni
+                user:
+                  token-file: ${host_state_dir}/openshell-cni-token
+              contexts:
+              - name: openshell-cni
+                context:
+                  cluster: cluster
+                  user: openshell-cni
+              EOF
+              # The CNI installer is a cluster singleton with a fixed "openshell"
+              # owner. Its plugin enforces any pod carrying the OpenShell
+              # annotations (set only by a gateway on its sandbox pods), scoped to
+              # the sandboxNamespaces allowlist. The allowlist is a blast-radius
+              # guard: pods in namespaces NOT listed are passed through WITHOUT a
+              # Kubernetes API lookup, so control-plane latency or an RBAC/token
+              # problem cannot block unrelated workloads' pod creation.
+              #
+              # The allowlist is computed automatically as the union of: the static
+              # cni.sandboxNamespaces value; every namespace containing a Helm-owned
+              # registration marker ConfigMap (openshell.ai/cni-registration=true,
+              # one per gateway release); and every namespace that still has a
+              # running OpenShell-managed sandbox pod (openshell.ai/managed-by=
+              # openshell), which keeps a namespace enforced until it drains. So an
+              # additional cni.external release is discovered and enforced
+              # automatically — no manual allowlist edit. `configVersion` binds node
+              # readiness to the desired config, so when the discovered set changes
+              # the reconcile repairs the entry before re-marking the node ready.
+              owner="openshell"
+              openshell_cni="/openshell-cni"
+              sandbox_static_json='{{ $cniSandboxNamespaces | toJson }}'
+              # (Re)write the plugin config with the current aggregated allowlist.
+              # On a discovery failure we keep the already-installed config rather
+              # than shrinking the allowlist (which would fail a running external
+              # namespace open); at first run with no config we fall back to static.
+              write_plugin_config() {
+                if discovered="$("${openshell_cni}" list-sandbox-namespaces 2>/dev/null)"; then
+                  :
+                elif [ -f "${plugin_config}" ]; then
+                  echo "OpenShell CNI: namespace discovery failed; keeping installed allowlist" >&2
+                  return 0
+                else
+                  discovered=""
+                fi
+                allowlist_json="$(
+                  { printf '%s' "${sandbox_static_json}" | jq -r '.[]'; printf '%s\n' "${discovered}"; } \
+                    | grep -v '^$' | sort -u | jq -R . | jq -s .
+                )"
+                config_version="$(printf '%s|%s|%s|%s|v3' "${owner}" "${host_state_dir}/openshell-cni-kubeconfig" "{{ .Values.cni.logLevel }}" "${allowlist_json}" | sha256sum | cut -d' ' -f1 | cut -c1-16)"
+                _pc_tmp="$(mktemp "${state_dir}/openshell-cni-plugin.XXXXXX")"
+                cat > "${_pc_tmp}" <<EOF
+              {
+                "type": "openshell-cni",
+                "openshell": {
+                  "kubeconfig": "${host_state_dir}/openshell-cni-kubeconfig",
+                  "sandboxNamespaces": ${allowlist_json},
+                  "owner": "${owner}",
+                  "configVersion": "${config_version}",
+                  "logLevel": {{ .Values.cni.logLevel | quote }},
+                  "logFile": "${log_file}"
+                }
+              }
+              EOF
+                mv "${_pc_tmp}" "${plugin_config}"
+              }
+              write_plugin_config
+              # Per-node readiness gate. The gateway sets a required nodeAffinity
+              # on sandbox pods for this label, so a node is only eligible once
+              # the chained plugin is installed.
+              mark_ready() {
+                "${openshell_cni}" node-ready --set \
+                  || echo "OpenShell CNI: failed to mark node ready" >&2
+                publish_coverage
+              }
+              # Publish, on this node, the CSV of namespaces we currently enforce
+              # (from the installed plugin config) so gateways can wait for
+              # cluster-wide acknowledgement of their namespace before serving.
+              publish_coverage() {
+                _csv="$(jq -r '(.openshell.sandboxNamespaces // []) | join(",")' "${plugin_config}" 2>/dev/null || echo "")"
+                "${openshell_cni}" set-node-coverage "${_csv}" \
+                  || echo "OpenShell CNI: failed to publish coverage" >&2
+              }
+              # Fencing (clearing readiness) is security-critical: while enforcement
+              # is not in place the node must not advertise readiness. Retry a few
+              # times so a transient API error does not silently leave stale
+              # readiness; log loudly if it ultimately fails.
+              mark_unready() {
+                _i=0
+                while [ "${_i}" -lt 5 ]; do
+                  if "${openshell_cni}" node-ready --clear; then
+                    return 0
+                  fi
+                  _i=$((_i + 1))
+                  sleep 2
+                done
+                echo "OpenShell CNI: FAILED to fence node after retries; readiness may be stale" >&2
+                return 1
+              }
+              {{- if eq $mode "conflist" }}
+              conf_dir="/host{{ .Values.cni.confDir }}"
+              resolve_conflist_target() {
+              {{- if .Values.cni.configFile }}
+                printf '%s' "${conf_dir}/{{ .Values.cni.configFile }}"
+              {{- else }}
+                find "${conf_dir}" -maxdepth 1 -type f -name '*.conflist' ! -name '*openshell*' | sort | head -n 1
+              {{- end }}
+              }
+              # True when the target already carries our openshell-cni plugin at the
+              # desired config version. Readiness is bound to configVersion so a
+              # stale same-owner entry (e.g. after a config change) is treated as
+              # unhealthy and repaired before the node is re-marked ready.
+              conflist_ours() {
+                _t="$1"
+                [ -n "${_t}" ] && [ -f "${_t}" ] && jq -e --arg o "${owner}" --arg v "${config_version}" \
+                  'any((.plugins // [])[]; .type == "openshell-cni" and .openshell.owner == $o and .openshell.configVersion == $v)' \
+                  "${_t}" >/dev/null 2>&1
+              }
+              patch_conflist() {
+                target="$(resolve_conflist_target)"
+                if [ -z "${target}" ] || [ ! -f "${target}" ]; then
+                  echo "OpenShell CNI requires an existing CNI .conflist in ${conf_dir}" >&2
+                  return 1
+                fi
+                # The patch below preserves every non-openshell-cni plugin and
+                # replaces only the openshell-cni entry, so it never clobbers a
+                # foreign plugin. The plugin type is itself the ownership signal
+                # (the cluster singleton always writes owner "openshell"), so any
+                # existing openshell-cni entry — including one from an older owner
+                # format — is ours to upgrade in place.
+                if [ ! -f "${target}.openshell-backup" ]; then
+                  cp "${target}" "${target}.openshell-backup"
+                fi
+                tmp="$(mktemp "${conf_dir}/openshell-cni.XXXXXX")"
+                # Only replace the live conflist when jq succeeded AND wrote a
+                # non-empty file. This function is invoked through `||`, which
+                # disables `set -e` inside it, so a bare `jq; mv` would clobber a
+                # working host conflist with an empty file on jq failure and break
+                # node networking. Fail closed instead: leave the target intact.
+                if jq --slurpfile openshell "${plugin_config}" '
+                  .plugins = ((.plugins // []) | map(select(.type != "openshell-cni")) + [$openshell[0]])
+                ' "${target}" > "${tmp}" && [ -s "${tmp}" ]; then
+                  mv "${tmp}" "${target}"
+                else
+                  rm -f "${tmp}"
+                  echo "OpenShell CNI conflist patch failed (jq error); left ${target} unchanged" >&2
+                  return 1
+                fi
+              }
+              # Fence before the initial patch too: if a stale readiness label
+              # survives from a previous incarnation and this patch fails, the node
+              # must not keep advertising readiness.
+              if ! conflist_ours "$(resolve_conflist_target)"; then
+                mark_unready
+              fi
+              patch_conflist || exit 1
+              mark_ready
+              echo "OpenShell CNI installed (conflist mode); plugin log ${log_file}; firewall backend selected during CNI ADD"
+              {{- else }}
+              chain_dir="/host{{ .Values.cni.chainDir }}"
+              chain_conf="${chain_dir}/openshell-cni.conf"
+              mkdir -p "${chain_dir}"
+              # True only when the chain conf is a well-formed openshell-cni config
+              # at the desired config version. Mere file existence is not enough —
+              # an empty, corrupt, stale-version, or foreign file must NOT mark the
+              # node ready.
+              chain_conf_healthy() {
+                [ -f "${chain_conf}" ] && jq -e --arg o "${owner}" --arg v "${config_version}" '
+                  .type == "openshell-cni"
+                  and .openshell.owner == $o
+                  and .openshell.configVersion == $v
+                  and (.openshell.kubeconfig // "") != ""
+                ' "${chain_conf}" >/dev/null 2>&1
+              }
+              write_chain_conf() {
+                # openshell-cni.conf is an OpenShell-owned file (fixed name, our
+                # plugin type); the cluster singleton always writes owner
+                # "openshell", so overwriting an existing one — including from an
+                # older owner format — is an in-place upgrade, not a clobber.
+                _tmp="$(mktemp "${chain_dir}/openshell-cni.XXXXXX")"
+                # Same fail-closed contract as patch_conflist: never install a
+                # truncated chain config if jq fails.
+                if jq -n --slurpfile openshell "${plugin_config}" \
+                  '{"cniVersion": "1.0.0", "name": "openshell-cni"} + $openshell[0]' > "${_tmp}" && [ -s "${_tmp}" ]; then
+                  mv "${_tmp}" "${chain_conf}"
+                else
+                  rm -f "${_tmp}"
+                  echo "OpenShell CNI chain conf generation failed (jq error); left ${chain_conf} unchanged" >&2
+                  return 1
+                fi
+              }
+              # Fence before the initial write too (see conflist path).
+              if ! chain_conf_healthy; then
+                mark_unready
+              fi
+              write_chain_conf || exit 1
+              mark_ready
+              echo "OpenShell CNI installed (multus-chain mode) at ${chain_conf}; plugin log ${log_file}; firewall backend selected during CNI ADD"
+              {{- end }}
+              tail -n 0 -F "${host_log_file}" &
+              tail_pid="$!"
+              trap 'kill "${tail_pid}" 2>/dev/null || true; exit 0' INT TERM
+              trap 'kill "${tail_pid}" 2>/dev/null || true' EXIT
+              while true; do
+                cp /var/run/secrets/kubernetes.io/serviceaccount/token "${token_file}"
+                chmod 0600 "${token_file}"
+                # Refresh the aggregated allowlist (picks up newly registered or
+                # drained sandbox namespaces); config_version changes when the set
+                # does, so the health check below repairs the entry and re-enforces.
+                write_plugin_config
+                # Fence before repair: the instant enforcement is not verifiably in
+                # place, clear readiness so no new sandbox pod schedules here, then
+                # attempt repair and only re-mark ready once it is healthy again.
+                {{- if eq $mode "conflist" }}
+                if conflist_ours "$(resolve_conflist_target)"; then
+                  mark_ready
+                else
+                  mark_unready
+                  if patch_conflist; then mark_ready; fi
+                fi
+                {{- else }}
+                if chain_conf_healthy; then
+                  mark_ready
+                else
+                  mark_unready
+                  if write_chain_conf; then mark_ready; fi
+                fi
+                {{- end }}
+                sleep 30
+              done
+          securityContext:
+            privileged: true
+            allowPrivilegeEscalation: true
+          lifecycle:
+            preStop:
+              exec:
+                command:
+                  - sh
+                  - -ec
+                  - |
+                    # Enforcement lives in the host CNI config and survives pod
+                    # restarts, so an ordinary restart/rolling update must NOT strip
+                    # it (that would fail open for running sandboxes). Only tear it
+                    # down on a real teardown: daemonset-active exits 0 (preserve)
+                    # unless the owning DaemonSet is confirmed gone/terminating.
+                    if /openshell-cni daemonset-active; then
+                      echo "OpenShell CNI: DaemonSet still active; preserving enforcement across restart" >&2
+                      exit 0
+                    fi
+                    # Teardown: fence the node first and only remove enforcement if
+                    # fencing succeeded, so we never strip enforcement while the node
+                    # still advertises readiness.
+                    if ! /openshell-cni node-ready --clear; then
+                      echo "OpenShell CNI: fencing failed during teardown; leaving enforcement in place" >&2
+                      exit 0
+                    fi
+                    {{- if eq $mode "conflist" }}
+                    conf_dir="/host{{ .Values.cni.confDir }}"
+                    for target in "${conf_dir}"/*.conflist; do
+                      [ -f "${target}" ] || continue
+                      tmp="$(mktemp "${conf_dir}/openshell-cni-cleanup.XXXXXX")"
+                      jq '
+                        if .plugins then
+                          .plugins = (.plugins | map(select(.type != "openshell-cni")))
+                        else
+                          .
+                        end
+                      ' "${target}" > "${tmp}"
+                      mv "${tmp}" "${target}"
+                    done
+                    {{- else }}
+                    rm -f "/host{{ .Values.cni.chainDir }}/openshell-cni.conf"
+                    {{- end }}
+                    rm -f \
+                      "/host{{ $stateDir }}/openshell-cni-ca.crt" \
+                      "/host{{ $stateDir }}/openshell-cni-kubeconfig" \
+                      "/host{{ $stateDir }}/openshell-cni-plugin.json" \
+                      "/host{{ $stateDir }}/openshell-cni-token"
+          volumeMounts:
+            - name: cni-bin
+              mountPath: /host{{ .Values.cni.binDir }}
+            {{- if eq $mode "conflist" }}
+            - name: cni-conf
+              mountPath: /host{{ .Values.cni.confDir }}
+            {{- else }}
+            - name: cni-chain
+              mountPath: /host{{ .Values.cni.chainDir }}
+            - name: cni-state
+              mountPath: /host{{ $stateDir }}
+            {{- end }}
+            - name: cni-log
+              mountPath: /host{{ $cniLogDir }}
+          {{- with .Values.cni.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+      volumes:
+        - name: cni-bin
+          hostPath:
+            path: {{ .Values.cni.binDir | quote }}
+            type: DirectoryOrCreate
+        {{- if eq $mode "conflist" }}
+        - name: cni-conf
+          hostPath:
+            path: {{ .Values.cni.confDir | quote }}
+            type: Directory
+        {{- else }}
+        - name: cni-chain
+          hostPath:
+            path: {{ .Values.cni.chainDir | quote }}
+            type: DirectoryOrCreate
+        - name: cni-state
+          hostPath:
+            path: {{ $stateDir | quote }}
+            type: DirectoryOrCreate
+        {{- end }}
+        - name: cni-log
+          hostPath:
+            path: {{ $cniLogDir | quote }}
+            type: DirectoryOrCreate
+      {{- with .Values.cni.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      tolerations:
+        # Tolerate the boot-time not-ready taint so the installer can run on a
+        # freshly rebooted node and remove the taint once enforcement is ready.
+        - key: openshell.ai/cni-not-ready
+          operator: Exists
+          effect: NoSchedule
+        {{- with .Values.cni.tolerations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with .Values.cni.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}

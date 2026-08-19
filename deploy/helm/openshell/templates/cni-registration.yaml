@@ -1,0 +1,24 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+{{- if and (not .Values.cni.only) (eq (.Values.supervisor.topology | default "combined") "cni-sidecar") }}
+{{- $sandboxNamespace := .Values.server.sandboxNamespace | default .Release.Namespace }}
+# Helm-owned registration marker for this release's sandbox namespace. The CNI
+# singleton lists ConfigMaps labeled openshell.ai/cni-registration=true and
+# aggregates their namespaces into the enforcement allowlist, so every
+# cni-sidecar release (owner or cni.external) is discovered automatically. As a
+# normal Helm resource it is deleted on uninstall and moved on a sandboxNamespace
+# change, so registrations have proper lifecycle — no orphaned state.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "openshell.fullname" . }}-cni-registration
+  namespace: {{ $sandboxNamespace }}
+  labels:
+    {{- include "openshell.labels" . | nindent 4 }}
+    app.kubernetes.io/component: cni
+    openshell.ai/cni-registration: "true"
+data:
+  release: {{ .Release.Name | quote }}
+  releaseNamespace: {{ .Release.Namespace | quote }}
+{{- end }}

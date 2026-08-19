@@ -1,0 +1,30 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Example values for the cni-sidecar topology on vanilla Kubernetes / k3s.
+#
+# The OpenShell CNI installer is a CLUSTER SINGLETON: one installation enforces
+# every OpenShell release's sandbox pods across all namespaces. Enable it in
+# exactly one release per cluster.
+#
+# Copy and adjust the host CNI paths for your distro, then:
+#   helm install openshell deploy/helm/openshell -n openshell \
+#     -f deploy/helm/openshell/examples/cni-sidecar-k3s.yaml
+
+cni:
+  enabled: true
+  # conflist (default) appends the OpenShell plugin to an existing CNI .conflist.
+  mode: conflist
+  # k3s configures containerd with k3s-specific CNI paths. On upstream Kubernetes
+  # the defaults (/opt/cni/bin, /etc/cni/net.d) usually apply — drop these two.
+  #
+  # k3s does NOT search /opt/cni/bin. Its containerd looks in the k3s data CNI
+  # directory; recent k3s exposes the stable, upgrade-safe path below (older
+  # releases used a versioned /var/lib/rancher/k3s/data/<id>/bin that changed on
+  # every upgrade). Install the plugin into the stable path so it survives k3s
+  # upgrades. See https://github.com/k3s-io/k3s/issues/10869.
+  binDir: /var/lib/rancher/k3s/data/cni
+  confDir: /var/lib/rancher/k3s/agent/etc/cni/net.d
+
+supervisor:
+  topology: cni-sidecar

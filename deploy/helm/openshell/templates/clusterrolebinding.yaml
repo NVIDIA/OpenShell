@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+{{- if not .Values.cni.only }}
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
@@ -15,3 +16,4 @@ subjects:
   - kind: ServiceAccount
     name: {{ include "openshell.serviceAccountName" . }}
     namespace: {{ .Release.Namespace }}
+{{- end }}

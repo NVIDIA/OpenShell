@@ -1,0 +1,237 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+suite: cni daemonset
+templates:
+  - templates/cni-daemonset.yaml
+release:
+  name: openshell
+  namespace: openshell
+tests:
+  - it: does not render by default
+    template: templates/cni-daemonset.yaml
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: renders privileged cni installer daemonset when enabled
+    template: templates/cni-daemonset.yaml
+    set:
+      cni.enabled: true
+    asserts:
+      - isKind:
+          of: DaemonSet
+      - equal:
+          path: spec.template.spec.hostNetwork
+          value: true
+      - equal:
+          path: spec.template.spec.containers[0].securityContext.privileged
+          value: true
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: cni-bin
+            mountPath: /host/opt/cni/bin
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: cni-conf
+            mountPath: /host/etc/cni/net.d
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: cni-log
+            mountPath: /host/var/log
+      # Tolerates the boot-time not-ready taint so it can run on a rebooted node
+      # and remove the taint once enforcement is ready.
+      - contains:
+          path: spec.template.spec.tolerations
+          content:
+            key: openshell.ai/cni-not-ready
+            operator: Exists
+            effect: NoSchedule
+      # Singleton owner + namespace allowlist defaulting to the release namespace.
+      - matchRegex:
+          path: spec.template.spec.containers[0].command[2]
+          pattern: 'sandbox_static_json=.\["openshell"\].'
+      - matchRegex:
+          path: spec.template.spec.containers[0].command[2]
+          pattern: 'owner="openshell"'
+      - matchRegex:
+          path: spec.template.spec.containers[0].command[2]
+          pattern: '"logFile": "\$\{log_file\}"'
+      - matchRegex:
+          path: spec.template.spec.containers[0].command[2]
+          pattern: "firewall backend selected during CNI ADD"
+      - matchRegex:
+          path: spec.template.spec.containers[0].lifecycle.preStop.exec.command[2]
+          pattern: 'select\(\.type != "openshell-cni"\)'
+      - matchRegex:
+          path: spec.template.spec.serviceAccountName
+          pattern: -cni$
+      # The CNI DaemonSet uses a distinct app name so the gateway Service and
+      # workload base selectors (name + instance) never match CNI pods.
+      - equal:
+          path: spec.selector.matchLabels["app.kubernetes.io/name"]
+          value: openshell-cni
+      - notExists:
+          path: spec.selector.matchLabels["app.kubernetes.io/component"]
+      - equal:
+          path: spec.template.metadata.labels["app.kubernetes.io/name"]
+          value: openshell-cni
+      - equal:
+          path: spec.template.metadata.labels["app.kubernetes.io/component"]
+          value: cni
+      # Readiness gate: the installer needs its node name and marks the node
+      # ready/unready so the gateway can gate sandbox scheduling.
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: NODE_NAME
+            valueFrom:
+              fieldRef:
+                fieldPath: spec.nodeName
+      - matchRegex:
+          path: spec.template.spec.containers[0].command[2]
+          pattern: 'node-ready --set'
+      - matchRegex:
+          path: spec.template.spec.containers[0].command[2]
+          pattern: 'node-ready --clear'
+      - matchRegex:
+          path: spec.template.spec.containers[0].lifecycle.preStop.exec.command[2]
+          pattern: 'node-ready --clear'
+      # preStop preserves enforcement across ordinary restarts (only tears down
+      # on real teardown, gated by daemonset-active).
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: DS_NAME
+            value: openshell-cni
+      - matchRegex:
+          path: spec.template.spec.containers[0].lifecycle.preStop.exec.command[2]
+          pattern: 'daemonset-active'
+      # Singleton owner stamp.
+      - matchRegex:
+          path: spec.template.spec.containers[0].command[2]
+          pattern: 'owner="openshell"'
+      # Auto-discovery: reconcile aggregates marker-ConfigMap namespaces, and
+      # publishes per-node coverage for the gateway wait-for-ack gate.
+      - matchRegex:
+          path: spec.template.spec.containers[0].command[2]
+          pattern: 'list-sandbox-namespaces'
+      - matchRegex:
+          path: spec.template.spec.containers[0].command[2]
+          pattern: 'set-node-coverage'
+
+  - it: aggregates multiple sandbox namespaces into the allowlist
+    template: templates/cni-daemonset.yaml
+    set:
+      cni.enabled: true
+      cni.sandboxNamespaces:
+        - team-a
+        - team-b
+    asserts:
+      - matchRegex:
+          path: spec.template.spec.containers[0].command[2]
+          pattern: 'sandbox_static_json=.\["team-a","team-b"\].'
+
+  - it: binds readiness to a config version
+    template: templates/cni-daemonset.yaml
+    set:
+      cni.enabled: true
+    asserts:
+      - matchRegex:
+          path: spec.template.spec.containers[0].command[2]
+          pattern: 'config_version='
+      - matchRegex:
+          path: spec.template.spec.containers[0].command[2]
+          pattern: '"configVersion": "'
+
+  - it: creates the host token atomically at mode 0600
+    template: templates/cni-daemonset.yaml
+    set:
+      cni.enabled: true
+    asserts:
+      - matchRegex:
+          path: spec.template.spec.containers[0].command[2]
+          pattern: 'install -m 0600 /var/run/secrets/kubernetes.io/serviceaccount/token'
+
+  - it: fails cni-sidecar topology when no CNI installer is available
+    template: templates/cni-daemonset.yaml
+    set:
+      supervisor.topology: cni-sidecar
+    asserts:
+      - failedTemplate:
+          errorMessage: "supervisor.topology=cni-sidecar requires the OpenShell CNI installer: set cni.enabled=true to install the cluster singleton here, or cni.external=true if it is installed by another release"
+
+  - it: allows cni-sidecar with an external singleton and renders no installer
+    template: templates/cni-daemonset.yaml
+    set:
+      supervisor.topology: cni-sidecar
+      cni.enabled: false
+      cni.external: true
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: renders multus-chain conf and state volumes when mode is multus-chain
+    template: templates/cni-daemonset.yaml
+    set:
+      cni.enabled: true
+      cni.mode: multus-chain
+      cni.chainDir: /run/multus/cni/net.d/vendor-cni-chain
+      cni.stateDir: /etc/kubernetes/cni/openshell
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: cni-chain
+            mountPath: /host/run/multus/cni/net.d/vendor-cni-chain
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: cni-state
+            mountPath: /host/etc/kubernetes/cni/openshell
+      - notContains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: cni-conf
+            mountPath: /host/etc/cni/net.d
+      - matchRegex:
+          path: spec.template.spec.containers[0].command[2]
+          pattern: 'multus-chain mode'
+      - matchRegex:
+          path: spec.template.spec.containers[0].command[2]
+          pattern: '"name": "openshell-cni"'
+      - matchRegex:
+          path: spec.template.spec.containers[0].lifecycle.preStop.exec.command[2]
+          pattern: 'openshell-cni\.conf'
+      - matchRegex:
+          path: spec.template.spec.containers[0].command[2]
+          pattern: 'host_state_dir="/etc/kubernetes/cni/openshell"'
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: cni-state
+            hostPath:
+              path: /etc/kubernetes/cni/openshell
+              type: DirectoryOrCreate
+
+  - it: fails multus-chain mode without a chain dir
+    template: templates/cni-daemonset.yaml
+    set:
+      cni.enabled: true
+      cni.mode: multus-chain
+      cni.chainDir: ""
+    asserts:
+      - failedTemplate:
+          errorMessage: cni.mode=multus-chain requires cni.chainDir
+
+  - it: fails on an unknown cni mode
+    template: templates/cni-daemonset.yaml
+    set:
+      cni.enabled: true
+      cni.mode: bogus
+    asserts:
+      - failedTemplate:
+          errorMessage: cni.mode must be "conflist" or "multus-chain"

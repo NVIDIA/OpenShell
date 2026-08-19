@@ -130,6 +130,28 @@ abstract socket whose peer PID must match that authenticated supervisor. Both
 supervisors exit if the control connection closes, coupling their container
 restart lifecycle before a new authoritative client can be established.
 
+The `cni-sidecar` supervisor topology keeps the sidecar runtime model, but
+removes the pod-local network init container and its `NET_ADMIN`. The driver
+annotates sandbox pods for the OpenShell chained CNI plugin, and the privileged
+OpenShell CNI DaemonSet installs the sidecar bypass-prevention rules during CNI
+`ADD` before the workload starts. Because the node CNI programs the firewall, no
+container in the sandbox pod holds `NET_ADMIN`. The network sidecar otherwise
+keeps the same privilege profile as the other sidecar topologies: in the default
+binary-aware mode it runs as UID 0 with `SYS_PTRACE` and `DAC_READ_SEARCH` to
+resolve cross-UID `/proc`, and is non-root with no added capabilities only when
+`process_binary_aware_network_policy` is disabled. The agent container is non-root
+with no added Linux capabilities in either mode.
+
+The driver also sets a required `nodeAffinity` on the CNI installer's
+`openshell.ai/cni-ready` node label for cni-sidecar pods, so a sandbox cannot
+schedule onto a node before that node's chained plugin is active.
+
+Sidecar and cni-sidecar modes use the pod `fsGroup` to make the projected
+service-account token and sandbox client TLS secret group-readable so the
+non-root process supervisor can authenticate to the gateway. Treat the agent
+container as trusted with respect to those in-pod gateway credentials until a
+narrower credential handoff exists.
+
 The driver can request a Kubernetes AppArmor profile through
 `app_armor_profile`.
 

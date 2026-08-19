@@ -1,0 +1,85 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+{{- if and (not .Values.cni.only) .Values.sandboxServiceAccount.openshift.binaryAwareSCC }}
+apiVersion: security.openshift.io/v1
+kind: SecurityContextConstraints
+metadata:
+  name: {{ include "openshell.sandboxSccName" . }}
+  labels:
+    {{- include "openshell.labels" . | nindent 4 }}
+    app.kubernetes.io/component: sandbox
+# Minimal SCC for binary-aware network sidecars: the restricted-v2 baseline
+# plus exactly what cross-UID /proc inspection requires — UID 0 and the two
+# capabilities SYS_PTRACE and DAC_READ_SEARCH — and the image volume type used
+# to sideload the supervisor binary. Everything else stays locked down.
+allowPrivilegedContainer: false
+allowPrivilegeEscalation: false
+allowHostNetwork: false
+allowHostPorts: false
+allowHostPID: false
+allowHostIPC: false
+allowHostDirVolumePlugin: false
+readOnlyRootFilesystem: false
+defaultAddCapabilities: null
+requiredDropCapabilities:
+  - ALL
+allowedCapabilities:
+  - SYS_PTRACE
+  - DAC_READ_SEARCH
+runAsUser:
+  type: RunAsAny
+seLinuxContext:
+  type: MustRunAs
+fsGroup:
+  type: RunAsAny
+supplementalGroups:
+  type: RunAsAny
+seccompProfiles:
+  - runtime/default
+volumes:
+  - configMap
+  - csi
+  - downwardAPI
+  - emptyDir
+  - ephemeral
+  - image
+  - persistentVolumeClaim
+  - projected
+  - secret
+users: []
+groups: []
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "openshell.sandboxSccName" . }}-scc
+  labels:
+    {{- include "openshell.labels" . | nindent 4 }}
+    app.kubernetes.io/component: sandbox
+rules:
+  - apiGroups:
+      - security.openshift.io
+    resources:
+      - securitycontextconstraints
+    resourceNames:
+      - {{ include "openshell.sandboxSccName" . }}
+    verbs:
+      - use
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "openshell.sandboxSccName" . }}-scc
+  labels:
+    {{- include "openshell.labels" . | nindent 4 }}
+    app.kubernetes.io/component: sandbox
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "openshell.sandboxSccName" . }}-scc
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "openshell.sandboxServiceAccountName" . }}
+    namespace: {{ include "openshell.sandboxNamespace" . }}
+{{- end }}

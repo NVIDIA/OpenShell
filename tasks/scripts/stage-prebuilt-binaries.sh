@@ -12,7 +12,7 @@ ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 source "${SCRIPT_DIR}/build-env.sh"
 
 usage() {
-  echo "Usage: stage-prebuilt-binaries.sh <gateway|sandbox|supervisor|supervisor-output|all>" >&2
+  echo "Usage: stage-prebuilt-binaries.sh <gateway|sandbox|supervisor|supervisor-output|cni|all>" >&2
 }
 
 normalize_arch() {
@@ -109,10 +109,15 @@ components_for_target() {
       echo "gateway"
       ;;
     sandbox|supervisor|supervisor-output)
-      echo "supervisor"
+      echo "supervisor cni"
+      ;;
+    cni)
+      echo "cni"
       ;;
     all)
-      echo "gateway supervisor"
+      # The supervisor image bundles openshell-cni, so the aggregate prebuilt
+      # target must stage it too (kept in sync with the supervisor target above).
+      echo "gateway supervisor cni"
       ;;
     *)
       usage
@@ -132,6 +137,11 @@ resolve_component() {
       crate=openshell-sandbox
       binary=openshell-sandbox
       target_libc=$(supervisor_libc)
+      ;;
+    cni)
+      crate=openshell-cni
+      binary=openshell-cni
+      target_libc=musl
       ;;
     *)
       echo "unsupported binary component: $1" >&2

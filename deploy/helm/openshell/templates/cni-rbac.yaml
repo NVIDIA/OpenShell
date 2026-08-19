@@ -1,0 +1,76 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+{{- if .Values.cni.enabled }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "openshell.cniServiceAccountName" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "openshell.cniLabels" . | nindent 4 }}
+---
+# The CNI installer is a cluster singleton: one chained plugin enforces every
+# OpenShell release's sandbox pods (keyed on pod annotations) across all
+# namespaces. Its RBAC is therefore cluster-scoped. It is still minimal:
+#   - pods get: read a sandbox pod's annotations during CNI ADD (any namespace,
+#     because the singleton serves all sandbox namespaces).
+#   - nodes get/patch: set/clear the per-node readiness label for the gate.
+#   - daemonsets get (this DaemonSet only): let preStop tell an ordinary restart
+#     from a real teardown.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "openshell.cniName" . }}
+  labels:
+    {{- include "openshell.cniLabels" . | nindent 4 }}
+rules:
+  - apiGroups:
+      - ""
+    resources:
+      - pods
+    verbs:
+      - get
+      # list sandbox pods (openshell.ai/managed-by=openshell) to keep a namespace
+      # enforced while its sandboxes are still running (drain-gated prune).
+      - list
+  # list registration marker ConfigMaps (openshell.ai/cni-registration=true) to
+  # aggregate their namespaces into the plugin allowlist (automatic multi-release
+  # discovery with Helm-owned lifecycle).
+  - apiGroups:
+      - ""
+    resources:
+      - configmaps
+    verbs:
+      - list
+  - apiGroups:
+      - ""
+    resources:
+      - nodes
+    verbs:
+      - get
+      - patch
+  - apiGroups:
+      - apps
+    resources:
+      - daemonsets
+    resourceNames:
+      - {{ include "openshell.cniName" . }}
+    verbs:
+      - get
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "openshell.cniName" . }}
+  labels:
+    {{- include "openshell.cniLabels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "openshell.cniName" . }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "openshell.cniServiceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}

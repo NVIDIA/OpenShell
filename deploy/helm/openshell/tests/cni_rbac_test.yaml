@@ -1,0 +1,107 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+suite: cni rbac
+templates:
+  - templates/cni-rbac.yaml
+release:
+  name: openshell
+tests:
+  - it: does not render by default
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  # The CNI installer is a cluster singleton, so its RBAC is a ServiceAccount
+  # plus a cluster-scoped ClusterRole/ClusterRoleBinding (no namespaced Role).
+  - it: renders singleton service account and cluster-scoped rbac when cni enabled
+    set:
+      cni.enabled: true
+    asserts:
+      - hasDocuments:
+          count: 3
+      - documentIndex: 0
+        isKind:
+          of: ServiceAccount
+      - documentIndex: 0
+        equal:
+          path: metadata.name
+          value: openshell-cni
+      - documentIndex: 1
+        isKind:
+          of: ClusterRole
+      - documentIndex: 1
+        equal:
+          path: metadata.name
+          value: openshell-cni
+      # pods get is cluster-wide because one installer serves all sandbox namespaces.
+      - documentIndex: 1
+        contains:
+          path: rules
+          content:
+            apiGroups:
+              - ""
+            resources:
+              - pods
+            verbs:
+              - get
+              - list
+      # configmaps list: aggregate registration-marker namespaces into the allowlist.
+      - documentIndex: 1
+        contains:
+          path: rules
+          content:
+            apiGroups:
+              - ""
+            resources:
+              - configmaps
+            verbs:
+              - list
+      - documentIndex: 1
+        contains:
+          path: rules
+          content:
+            apiGroups:
+              - ""
+            resources:
+              - nodes
+            verbs:
+              - get
+              - patch
+      # daemonsets get, scoped by resourceNames to the singleton DaemonSet.
+      - documentIndex: 1
+        contains:
+          path: rules
+          content:
+            apiGroups:
+              - apps
+            resources:
+              - daemonsets
+            resourceNames:
+              - openshell-cni
+            verbs:
+              - get
+      - documentIndex: 2
+        isKind:
+          of: ClusterRoleBinding
+      - documentIndex: 2
+        equal:
+          path: roleRef.name
+          value: openshell-cni
+      - documentIndex: 2
+        equal:
+          path: subjects[0].name
+          value: openshell-cni
+
+  # The singleton name is release-independent (chart name), so a different
+  # release name still yields the fixed cluster-singleton name.
+  - it: uses a release-independent singleton name
+    release:
+      name: my-gateway
+    set:
+      cni.enabled: true
+    asserts:
+      - documentIndex: 1
+        equal:
+          path: metadata.name
+          value: openshell-cni

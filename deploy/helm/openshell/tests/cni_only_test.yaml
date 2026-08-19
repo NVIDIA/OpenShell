@@ -1,0 +1,107 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+suite: cni only mode
+release:
+  name: openshell
+tests:
+  # cni.only installs just the CNI singleton so its lifecycle is independent of
+  # any gateway. The DaemonSet + its RBAC still render.
+  - it: renders the CNI DaemonSet in cni-only mode
+    templates:
+      - templates/cni-daemonset.yaml
+    set:
+      cni.only: true
+      cni.enabled: true
+    asserts:
+      - hasDocuments:
+          count: 1
+      - isKind:
+          of: DaemonSet
+      - equal:
+          path: metadata.name
+          value: openshell-cni
+
+  - it: renders the singleton CNI RBAC in cni-only mode
+    templates:
+      - templates/cni-rbac.yaml
+    set:
+      cni.only: true
+      cni.enabled: true
+    asserts:
+      - hasDocuments:
+          count: 3
+
+  # No gateway workload or gateway-support resources render in cni-only mode.
+  - it: does not render the gateway workload in cni-only mode
+    templates:
+      - templates/statefulset.yaml
+    set:
+      cni.only: true
+      cni.enabled: true
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: does not render the gateway service in cni-only mode
+    templates:
+      - templates/service.yaml
+    set:
+      cni.only: true
+      cni.enabled: true
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: does not render the gateway config in cni-only mode
+    templates:
+      - templates/gateway-config.yaml
+    set:
+      cni.only: true
+      cni.enabled: true
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: does not render gateway service accounts in cni-only mode
+    templates:
+      - templates/serviceaccount.yaml
+    set:
+      cni.only: true
+      cni.enabled: true
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: does not render the gateway node-reader ClusterRole in cni-only mode
+    templates:
+      - templates/clusterrole.yaml
+    set:
+      cni.only: true
+      cni.enabled: true
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  # A standalone CNI release must not register its own namespace, even if a
+  # topology value leaks in — it renders ONLY the CNI singleton.
+  - it: does not render a registration marker in cni-only mode
+    templates:
+      - templates/cni-registration.yaml
+    set:
+      cni.only: true
+      cni.enabled: true
+      supervisor.topology: cni-sidecar
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  # cni.only is meaningless without installing the singleton.
+  - it: fails when cni.only is set without cni.enabled
+    templates:
+      - templates/cni-daemonset.yaml
+    set:
+      cni.only: true
+    asserts:
+      - failedTemplate:
+          errorMessage: "cni.only=true installs the standalone CNI singleton and requires cni.enabled=true"

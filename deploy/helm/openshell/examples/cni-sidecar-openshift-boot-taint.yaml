@@ -1,0 +1,75 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# OPTIONAL, OpenShift-specific: reduce the node-reboot fail-open window for the
+# cni-sidecar topology.
+#
+# Why: on OpenShift (multus-chain) the chained plugin config lives under /run
+# (tmpfs) and is wiped on reboot, but the persistent `openshell.ai/cni-ready`
+# Node label survives. Between a node coming back up and the OpenShell CNI
+# DaemonSet re-installing the plugin, a sandbox pod could schedule onto a node
+# with no egress enforcement. A NoSchedule taint repels workloads until
+# enforcement is back; the OpenShell CNI DaemonSet tolerates it and REMOVES it
+# once enforcement is ready (it never re-adds it, so a transient reconcile
+# failure does not over-repel a running node).
+#
+# HONEST LIMITATION: there is no chart-shippable mechanism that is fully
+# race-free. A taint must exist before the kubelet reports the node schedulable,
+# which only node-level config can influence. This example uses two layers:
+#   1. kubelet `--register-with-taints` — applied when the kubelet FIRST registers
+#      the node, so a freshly joined node is tainted with no window. (Configure it
+#      via a KubeletConfig / MachineConfig for your pool; see OpenShift docs.)
+#   2. A boot systemd unit that re-asserts the taint on every boot and RETRIES
+#      until it succeeds — because kubelet does not re-apply register-with-taints
+#      when an existing Node object is re-registered after reboot.
+# A small residual window remains on reboot (kubelet may mark Ready before the
+# unit re-taints). `conflist` mode stores the plugin on persistent disk and is
+# unaffected by reboot; prefer it, or cordon/drain before rebooting nodes, if the
+# residual window is unacceptable.
+#
+# CAVEATS / prerequisites:
+#   * Tradeoff: a NoSchedule taint repels ALL non-tolerating pods on the node
+#     until the OpenShell CNI is ready. Scope this to a sandbox-dedicated
+#     MachineConfigPool if that is undesirable on shared nodes.
+#   * RBAC: the taint command must authenticate as an identity allowed to patch
+#     node taints. The kubelet's own identity is restricted by NodeRestriction,
+#     so provision a dedicated ServiceAccount kubeconfig (bound to a ClusterRole
+#     granting nodes get/patch) at the path referenced below.
+#   * `oc`/`kubectl` is assumed on the node image; adjust for your RHCOS tooling.
+#
+# The taint key/effect MUST match what the OpenShell CNI removes:
+#   openshell.ai/cni-not-ready=:NoSchedule
+apiVersion: machineconfiguration.openshift.io/v1
+kind: MachineConfig
+metadata:
+  labels:
+    machineconfiguration.openshift.io/role: worker
+  name: 50-openshell-cni-boot-taint
+spec:
+  config:
+    ignition:
+      version: 3.4.0
+    systemd:
+      units:
+        - name: openshell-cni-boot-taint.service
+          enabled: true
+          contents: |
+            [Unit]
+            Description=Taint node not-ready for OpenShell CNI until enforcement is up
+            # Order as early as possible after the kubelet/API client is available.
+            # A residual race remains (see the file header); the retry loop below
+            # keeps trying so a transient failure never leaves the node untainted.
+            After=kubelet.service
+            Wants=kubelet.service
+            [Service]
+            Type=oneshot
+            RemainAfterExit=yes
+            # KUBECONFIG must authenticate as an identity allowed to patch node
+            # taints (see CAVEATS). Adjust the path/tooling for your nodes.
+            Environment=KUBECONFIG=/var/lib/openshell/cni-boot-taint.kubeconfig
+            # Retry until the taint is applied; never give up silently.
+            ExecStart=/bin/sh -c 'until /usr/bin/oc adm taint node "$(hostname)" openshell.ai/cni-not-ready=:NoSchedule --overwrite; do echo "retrying node taint..."; sleep 2; done'
+            Restart=on-failure
+            RestartSec=2
+            [Install]
+            WantedBy=multi-user.target

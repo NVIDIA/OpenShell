@@ -135,6 +135,95 @@ openshell gateway add https://<external-hostname> \
 openshell gateway login openshift
 ```
 
+## Enable the cni-sidecar topology
+
+The `cni-sidecar` topology moves pod-network egress enforcement out of the
+sandbox pod and onto a node-level CNI plugin, removing the per-pod privileged
+network-init container. See [Supervisor Topology](/kubernetes/topology) for the
+model. On OpenShift it uses Multus `multus-chain` mode plus purpose-built SCCs.
+
+The CNI installer is a **cluster singleton**: one installation enforces every
+OpenShell release's sandbox pods across all namespaces. Enable it in exactly one
+release per cluster.
+
+<Steps>
+
+### Install with the cni-sidecar example values
+
+```shell
+helm install openshell deploy/helm/openshell \
+  --namespace openshell \
+  -f deploy/helm/openshell/examples/cni-sidecar-openshift.yaml
+```
+
+The example sets `cni.mode: multus-chain`, the OpenShift CNI paths, and the two
+SCC grants (`cni.openshift.privilegedSCC`, `sandboxServiceAccount.openshift.binaryAwareSCC`).
+It requires a Multus thick daemon with `auxiliaryCNIChainName` configured
+(default on OpenShift 4.x).
+
+### Verify the CNI installer is Ready on every node
+
+```shell
+oc -n openshell rollout status daemonset/openshell-cni
+oc get nodes -L openshell.ai/cni-ready
+```
+
+Every schedulable node should show `cni-ready=true`. Sandbox pods carry a
+required `nodeAffinity` on this label, so they will not schedule onto a node
+before its egress enforcement is active.
+
+### Create a sandbox and confirm enforcement
+
+```shell
+openshell sandbox create --name probe -- sleep infinity
+# The pod reaches 2/2 (agent + network sidecar) only on a cni-ready node:
+oc get pod default--probe -n openshell
+# Default-deny egress: a disallowed destination is blocked.
+oc exec default--probe -n openshell -c agent -- \
+  sh -c 'curl -sS -m 10 https://example.com; echo "exit=$?"'
+```
+
+A blocked request (connection/resolution failure) confirms the sandbox's egress
+is routed through the OpenShell network sidecar and enforced by policy.
+
+</Steps>
+
+To run **additional** gateway releases on the same cluster, do not install a
+second CNI — reuse the singleton with `cni.enabled=false`, `cni.external=true`
+(`-f deploy/helm/openshell/examples/cni-sidecar-openshift-extra-release.yaml`).
+For a multi-gateway cluster, prefer installing the CNI as its own release with
+`cni.only=true` (`-f deploy/helm/openshell/examples/cni-standalone.yaml`) so node
+enforcement is not tied to any gateway's lifecycle; every gateway then runs
+`cni.external=true`. See
+[Running multiple gateways](/kubernetes/topology#running-multiple-gateways).
+Registration is automatic and race-free: each `cni-sidecar` release ships a
+Helm-owned marker ConfigMap (`openshell.ai/cni-registration=true`) in its sandbox
+namespace, and the singleton discovers every marker's namespace and adds it to the
+enforcement allowlist — no manual edit of the singleton owner is required. Because
+the marker is a normal Helm resource, uninstalling the release (or changing its
+`sandboxNamespace`) removes it — but deregistration is drain-gated: the singleton
+keeps a namespace enforced while it still has running sandbox pods
+(`openshell.ai/managed-by=openshell`) and only prunes it once drained, so a
+surviving sandbox is never left unenforced. The gateway does not
+serve until enforcement is acknowledged: a `wait-cni-coverage` init container
+blocks the gateway pod until every enforcement-ready node reports the namespace,
+so an additional release never creates sandboxes during the discovery window.
+(`cni.sandboxNamespaces` remains available as an optional static addition.)
+
+<Warning>
+On node reboot the Multus chain file (under `/run`, tmpfs) is wiped while the
+`openshell.ai/cni-ready` Node label persists, so a sandbox could briefly schedule
+onto a node before enforcement is re-established. To **narrow** this window, apply
+the boot-time taint MachineConfig at
+`deploy/helm/openshell/examples/cni-sidecar-openshift-boot-taint.yaml` (read its
+caveats first — it is operator-provided node config and requires taint RBAC). The
+CNI DaemonSet tolerates the taint and removes it once enforcement is ready. This
+does not fully close the window: the taint is applied after the kubelet starts, so
+a brief reboot race remains. Use `conflist` mode (plugin stored on persistent
+disk, unaffected by reboot), or cordon/drain nodes before rebooting, to avoid it
+entirely.
+</Warning>
+
 ## Next Steps
 
 - For more on certificate provisioning modes, refer to [Managing Certificates](/kubernetes/managing-certificates).
