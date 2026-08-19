@@ -1774,12 +1774,10 @@ def test_sandbox_ref_retains_gateway_labels() -> None:
 
 def test_sandbox_ref_includes_main_process_result() -> None:
     proto = _make_sandbox_proto("sandbox-1", "job-1")
-    proto.status.main_process_instance_id = "instance-1"
     proto.status.exit_code = 0
 
     status = _sandbox_ref(proto).status
 
-    assert status.main_process_instance_id == "instance-1"
     assert status.exit_code == 0
 
 

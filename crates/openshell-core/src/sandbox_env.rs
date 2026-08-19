@@ -25,9 +25,6 @@ pub const SSH_SOCKET_PATH: &str = "OPENSHELL_SSH_SOCKET_PATH";
 /// Log level for the sandbox supervisor (e.g. `"debug"`, `"info"`, `"warn"`).
 pub const LOG_LEVEL: &str = "OPENSHELL_LOG_LEVEL";
 
-/// Shell command to run inside the sandbox.
-pub const SANDBOX_COMMAND: &str = "OPENSHELL_SANDBOX_COMMAND";
-
 /// Versioned JSON specification for the exact canonical main process.
 pub const MAIN_PROCESS_SPEC: &str = "OPENSHELL_MAIN_PROCESS_SPEC";
 

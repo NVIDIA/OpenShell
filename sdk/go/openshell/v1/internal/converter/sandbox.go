@@ -101,7 +101,6 @@ func sandboxStatusFromProto(status *pb.SandboxStatus) types.SandboxStatus {
 			LastTransitionTime: c.GetLastTransitionTime(),
 		})
 	}
-	result.MainProcessInstanceID = status.GetMainProcessInstanceId()
 	result.ExitCode = CopyInt32Ptr(status.ExitCode)
 
 	return result

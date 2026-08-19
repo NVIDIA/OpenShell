@@ -831,7 +831,6 @@ pub async fn handle_report_main_process_exit(
     if let Some(principal) = principal.as_ref() {
         crate::auth::guard::ensure_sandbox_principal_scope(principal, &report.sandbox_id)?;
     }
-    require_persisted_sandbox(&state.store, &report.sandbox_id).await?;
     state
         .compute
         .main_process_exited(&report.sandbox_id, &report.instance_id, report.exit_code)

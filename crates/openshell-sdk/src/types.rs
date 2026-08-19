@@ -125,21 +125,13 @@ pub struct SandboxRef {
     pub phase: SandboxPhase,
     pub labels: HashMap<String, String>,
     pub resource_version: u64,
-    pub main_process_instance_id: Option<String>,
     pub exit_code: Option<i32>,
 }
 
 impl SandboxRef {
     pub(crate) fn from_proto(sandbox: proto::Sandbox) -> Self {
         let phase = sandbox.phase().into();
-        let (main_process_instance_id, exit_code) =
-            sandbox.status.as_ref().map_or((None, None), |status| {
-                (
-                    (!status.main_process_instance_id.is_empty())
-                        .then(|| status.main_process_instance_id.clone()),
-                    status.exit_code,
-                )
-            });
+        let exit_code = sandbox.status.as_ref().and_then(|status| status.exit_code);
         let meta = sandbox.metadata.unwrap_or_default();
         Self {
             id: meta.id,
@@ -148,7 +140,6 @@ impl SandboxRef {
             phase,
             labels: meta.labels,
             resource_version: meta.resource_version,
-            main_process_instance_id,
             exit_code,
         }
     }

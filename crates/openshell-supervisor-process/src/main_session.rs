@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use nix::pty::Winsize;
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Notify;
 use tokio::sync::broadcast;
 
@@ -46,7 +46,6 @@ pub struct MainSession {
     pty_master: Option<Arc<std::fs::File>>,
     readers_remaining: AtomicUsize,
     readers_done: Notify,
-    exit_code: Mutex<Option<i32>>,
 }
 
 impl MainSession {
@@ -65,7 +64,6 @@ impl MainSession {
             pty_master: None,
             readers_remaining: AtomicUsize::new(0),
             readers_done: Notify::new(),
-            exit_code: Mutex::new(None),
         })
     }
 
@@ -109,7 +107,6 @@ impl MainSession {
             pty_master,
             readers_remaining: AtomicUsize::new(if terminal { 1 } else { 2 }),
             readers_done: Notify::new(),
-            exit_code: Mutex::new(None),
         });
         Self::start_io(&session, io, input_rx);
         session
@@ -175,16 +172,12 @@ impl MainSession {
                     }
                     stderr_session.reader_finished();
                 });
-                let runtime = tokio::runtime::Handle::current();
-                std::thread::spawn(move || {
-                    while let Some(data) = input_rx.blocking_recv() {
-                        if runtime
-                            .block_on(tokio::io::AsyncWriteExt::write_all(&mut stdin, &data))
-                            .is_err()
-                        {
+                tokio::spawn(async move {
+                    while let Some(data) = input_rx.recv().await {
+                        if stdin.write_all(&data).await.is_err() {
                             break;
                         }
-                        let _ = runtime.block_on(tokio::io::AsyncWriteExt::flush(&mut stdin));
+                        let _ = stdin.flush().await;
                     }
                 });
             }
@@ -221,7 +214,6 @@ impl MainSession {
         if self.readers_remaining.load(Ordering::Acquire) != 0 {
             let _ = tokio::time::timeout(std::time::Duration::from_secs(2), notified).await;
         }
-        *self.exit_code.lock().expect("main exit lock poisoned") = Some(exit_code);
         self.publish(MainOutput::Exit(exit_code));
     }
 

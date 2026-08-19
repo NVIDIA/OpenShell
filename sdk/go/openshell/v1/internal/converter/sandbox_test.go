@@ -132,7 +132,6 @@ func TestSandboxFromProto(t *testing.T) {
 	assert.Equal(t, "AllGood", s.Status.Conditions[0].Reason)
 	assert.Equal(t, "Sandbox is ready", s.Status.Conditions[0].Message)
 	assert.Equal(t, "2024-01-01T00:00:00Z", s.Status.Conditions[0].LastTransitionTime)
-	assert.Equal(t, "instance-1", s.Status.MainProcessInstanceID)
 	require.NotNil(t, s.Status.ExitCode)
 	assert.Equal(t, int32(0), *s.Status.ExitCode)
 }

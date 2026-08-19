@@ -130,7 +130,6 @@ def _normalize_bearer(
 class SandboxStatusRef:
     phase: int
     current_policy_version: int
-    main_process_instance_id: str | None = None
     exit_code: int | None = None
 
 
@@ -1094,9 +1093,6 @@ def _sandbox_ref(sandbox: openshell_pb2.Sandbox) -> SandboxRef:
         status=SandboxStatusRef(
             phase=status.phase if status else 0,
             current_policy_version=status.current_policy_version if status else 0,
-            main_process_instance_id=(status.main_process_instance_id or None)
-            if status
-            else None,
             exit_code=status.exit_code
             if status is not None and status.HasField("exit_code")
             else None,

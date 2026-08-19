@@ -580,7 +580,6 @@ impl ProcessHandle {
         program: &str,
         args: &[String],
         workspace: &ResolvedWorkspace,
-        main_workdir: Option<&str>,
         interactive: bool,
         policy: &SandboxPolicy,
         resolved_identity: ResolvedProcessIdentity,
@@ -593,7 +592,6 @@ impl ProcessHandle {
             program,
             args,
             workspace,
-            main_workdir,
             interactive,
             policy,
             resolved_identity,
@@ -615,7 +613,6 @@ impl ProcessHandle {
         program: &str,
         args: &[String],
         workspace: &ResolvedWorkspace,
-        main_workdir: Option<&str>,
         interactive: bool,
         policy: &SandboxPolicy,
         resolved_identity: ResolvedProcessIdentity,
@@ -627,7 +624,6 @@ impl ProcessHandle {
             program,
             args,
             workspace,
-            main_workdir,
             interactive,
             policy,
             resolved_identity,
@@ -643,7 +639,6 @@ impl ProcessHandle {
         program: &str,
         args: &[String],
         workspace: &ResolvedWorkspace,
-        main_workdir: Option<&str>,
         interactive: bool,
         policy: &SandboxPolicy,
         resolved_identity: ResolvedProcessIdentity,
@@ -688,7 +683,7 @@ impl ProcessHandle {
 
         inject_provider_env(&mut cmd, provider_env);
 
-        if let Some(dir) = main_workdir.or_else(|| workspace.root()) {
+        if let Some(dir) = workspace.root() {
             cmd.current_dir(dir);
         }
         if let Some(home) = workspace.home() {
@@ -842,7 +837,6 @@ impl ProcessHandle {
         program: &str,
         args: &[String],
         workspace: &ResolvedWorkspace,
-        main_workdir: Option<&str>,
         interactive: bool,
         policy: &SandboxPolicy,
         resolved_identity: ResolvedProcessIdentity,
@@ -886,7 +880,7 @@ impl ProcessHandle {
 
         inject_provider_env(&mut cmd, provider_env);
 
-        if let Some(dir) = main_workdir.or_else(|| workspace.root()) {
+        if let Some(dir) = workspace.root() {
             cmd.current_dir(dir);
         }
         if let Some(home) = workspace.home() {

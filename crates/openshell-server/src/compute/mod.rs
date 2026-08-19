@@ -2912,19 +2912,25 @@ impl ComputeRuntime {
             if !status.main_process_instance_id.is_empty()
                 && status.main_process_instance_id != instance_id
             {
-                return Err(format!(
-                    "stale main-process exit instance '{instance_id}' (active instance is '{}')",
-                    status.main_process_instance_id
-                ));
+                tracing::warn!(
+                    sandbox_id,
+                    instance_id,
+                    active_instance_id = %status.main_process_instance_id,
+                    "ignoring stale main-process exit report"
+                );
+                return Ok(());
             }
             if let Some(current_exit_code) = status.exit_code {
-                return if current_exit_code == exit_code {
-                    Ok(())
-                } else {
-                    Err(format!(
-                        "conflicting main-process exit result for instance '{instance_id}'"
-                    ))
-                };
+                if current_exit_code != exit_code {
+                    tracing::warn!(
+                        sandbox_id,
+                        instance_id,
+                        current_exit_code,
+                        reported_exit_code = exit_code,
+                        "ignoring conflicting duplicate main-process exit report"
+                    );
+                }
+                return Ok(());
             }
         }
         let expected_resource_version = sandbox_resource_version(&existing);
@@ -4955,7 +4961,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stale_main_process_exit_cannot_replace_active_instance() {
+    async fn stale_main_process_exit_is_acknowledged_without_replacing_active_instance() {
         let runtime = test_runtime(Arc::new(TestDriver::default())).await;
         let sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Provisioning);
         runtime.store.put_message(&sandbox).await.unwrap();
@@ -4964,11 +4970,10 @@ mod tests {
             .await
             .unwrap();
 
-        let error = runtime
+        runtime
             .main_process_exited("sb-1", "instance-1", 0)
             .await
-            .unwrap_err();
-        assert!(error.contains("stale main-process exit instance"));
+            .unwrap();
         let stored = runtime
             .store
             .get_message::<Sandbox>("sb-1")
@@ -4980,6 +4985,16 @@ mod tests {
             stored.status.unwrap().main_process_instance_id,
             "instance-2"
         );
+    }
+
+    #[tokio::test]
+    async fn missing_sandbox_main_process_exit_is_acknowledged() {
+        let runtime = test_runtime(Arc::new(TestDriver::default())).await;
+
+        runtime
+            .main_process_exited("missing", "instance-1", 0)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -5006,6 +5021,33 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(stored.phase(), SandboxPhase::Error as i32);
+        assert_eq!(stored.status.unwrap().exit_code, Some(9));
+    }
+
+    #[tokio::test]
+    async fn conflicting_duplicate_main_process_exit_is_acknowledged() {
+        let runtime = test_runtime(Arc::new(TestDriver::default())).await;
+        let sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Provisioning);
+        runtime.store.put_message(&sandbox).await.unwrap();
+        runtime
+            .supervisor_session_connected("sb-1", "instance-1")
+            .await
+            .unwrap();
+        runtime
+            .main_process_exited("sb-1", "instance-1", 9)
+            .await
+            .unwrap();
+        runtime
+            .main_process_exited("sb-1", "instance-1", 7)
+            .await
+            .unwrap();
+
+        let stored = runtime
+            .store
+            .get_message::<Sandbox>("sb-1")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(stored.status.unwrap().exit_code, Some(9));
     }
 

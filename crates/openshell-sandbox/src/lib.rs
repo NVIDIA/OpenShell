@@ -99,7 +99,6 @@ const SIDECAR_READY_TIMEOUT_SECS: u64 = 120;
 pub async fn run_sandbox(
     command: Vec<String>,
     workdir: Option<String>,
-    main_workdir: Option<String>,
     timeout_secs: u64,
     interactive: bool,
     sandbox_id: Option<String>,
@@ -889,7 +888,6 @@ pub async fn run_sandbox(
             program,
             args,
             workspace,
-            main_workdir,
             timeout_secs,
             interactive,
             sandbox_id.as_deref(),

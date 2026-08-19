@@ -47,15 +47,14 @@ type SandboxTemplate struct {
 
 // SandboxStatus holds the observed state of a sandbox.
 type SandboxStatus struct {
-	SandboxName           string
-	AgentPod              string
-	AgentFd               string
-	SandboxFd             string
-	Phase                 SandboxPhase
-	Conditions            []SandboxCondition
-	CurrentPolicyVersion  uint32
-	MainProcessInstanceID string
-	ExitCode              *int32
+	SandboxName          string
+	AgentPod             string
+	AgentFd              string
+	SandboxFd            string
+	Phase                SandboxPhase
+	Conditions           []SandboxCondition
+	CurrentPolicyVersion uint32
+	ExitCode             *int32
 }
 
 // SandboxCondition describes an observed condition of a sandbox.
