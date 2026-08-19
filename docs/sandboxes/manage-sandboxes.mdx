@@ -343,6 +343,24 @@ with SandboxClient.from_active_cluster() as client:
     assert sandbox.id in {s.id for s in matches}
 ```
 
+Create reusable sandbox templates through the Python SDK when several runs
+should share the same workload shape:
+
+```python
+from openshell import SandboxClient
+
+with SandboxClient.from_active_cluster() as client:
+    templates = client.sandbox_templates()
+
+    templates.create(
+        workspace="default",
+        name="python",
+        image="ghcr.io/nvidia/openshell-community/sandboxes/python:latest",
+    )
+
+    sandbox = client.create_from_template(workspace="default", template_name="python")
+```
+
 For non-interactive automation, pass a renewable client-credentials provider.
 Omitted issuer, client ID, audience, and scopes are read from the active
 gateway's metadata. The client requires TLS for non-loopback gateways:

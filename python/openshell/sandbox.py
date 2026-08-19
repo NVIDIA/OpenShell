@@ -785,6 +785,9 @@ class SandboxClient:
             ),
         )
 
+    def sandbox_templates(self) -> SandboxTemplateClient:
+        return SandboxTemplateClient(self._channel, timeout=self._timeout)
+
     def get(self, sandbox_name: str, *, workspace: str) -> SandboxRef:
         response = self._stub.GetSandbox(
             openshell_pb2.GetSandboxRequest(name=sandbox_name, workspace=workspace),
@@ -1072,6 +1075,131 @@ class SandboxClient:
             env=exec_env,
             timeout_seconds=timeout_seconds,
         )
+
+
+class SandboxTemplateClient:
+    """gRPC client for reusable sandbox template lifecycle operations."""
+
+    def __init__(self, channel: grpc.Channel, *, timeout: float = 30.0) -> None:
+        self._stub = openshell_pb2_grpc.OpenShellStub(channel)
+        self._timeout = timeout
+
+    @classmethod
+    def from_sandbox_client(cls, client: SandboxClient) -> SandboxTemplateClient:
+        return client.sandbox_templates()
+
+    def create(
+        self,
+        *,
+        workspace: str,
+        template: openshell_pb2.SandboxWorkloadTemplate | None = None,
+        name: str | None = None,
+        image: str | None = None,
+        labels: Mapping[str, str] | None = None,
+        annotations: Mapping[str, str] | None = None,
+        environment: Mapping[str, str] | None = None,
+        cpu: str | None = None,
+        memory: str | None = None,
+        gpu_count: int | None = None,
+        gpu: bool = False,
+        driver_config: Mapping[str, Any] | None = None,
+    ) -> openshell_pb2.SandboxWorkloadTemplate:
+        if template is None:
+            if name is None or not name.strip():
+                raise SandboxError("name is required when template is omitted")
+            template = _sandbox_workload_template(
+                name=name,
+                image=image,
+                labels=labels,
+                annotations=annotations,
+                environment=environment,
+                cpu=cpu,
+                memory=memory,
+                gpu_count=gpu_count,
+                gpu=gpu,
+                driver_config=driver_config,
+            )
+        elif (
+            any(
+                value is not None
+                for value in (
+                    name,
+                    image,
+                    labels,
+                    annotations,
+                    environment,
+                    cpu,
+                    memory,
+                    gpu_count,
+                    driver_config,
+                )
+            )
+            or gpu
+        ):
+            raise SandboxError(
+                "template cannot be combined with template builder fields"
+            )
+
+        response = self._stub.CreateSandboxTemplate(
+            openshell_pb2.CreateSandboxTemplateRequest(
+                workspace=workspace,
+                template=template,
+            ),
+            timeout=self._timeout,
+        )
+        return response.template
+
+    def get(
+        self,
+        name: str,
+        *,
+        workspace: str,
+    ) -> openshell_pb2.SandboxWorkloadTemplate:
+        response = self._stub.GetSandboxTemplate(
+            openshell_pb2.GetSandboxTemplateRequest(name=name, workspace=workspace),
+            timeout=self._timeout,
+        )
+        return response.template
+
+    def list(
+        self,
+        *,
+        workspace: str,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> builtins.list[openshell_pb2.SandboxWorkloadTemplate]:
+        response = self._stub.ListSandboxTemplates(
+            openshell_pb2.ListSandboxTemplatesRequest(
+                workspace=workspace,
+                limit=limit,
+                offset=offset,
+            ),
+            timeout=self._timeout,
+        )
+        return list(response.templates)
+
+    def list_for_all_workspaces(
+        self,
+        *,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> builtins.list[openshell_pb2.SandboxWorkloadTemplate]:
+        response = self._stub.ListSandboxTemplates(
+            openshell_pb2.ListSandboxTemplatesRequest(
+                all_workspaces=True,
+                limit=limit,
+                offset=offset,
+            ),
+            timeout=self._timeout,
+        )
+        return list(response.templates)
+
+    def delete(self, name: str, *, workspace: str) -> bool:
+        response = self._stub.DeleteSandboxTemplate(
+            openshell_pb2.DeleteSandboxTemplateRequest(name=name, workspace=workspace),
+            timeout=self._timeout,
+        )
+        return bool(response.deleted)
 
 
 @dataclass(frozen=True)
@@ -1455,6 +1583,50 @@ def _default_spec() -> openshell_pb2.SandboxSpec:
     # container image and ensures sandboxes get the full dev-sandbox-policy
     # (including network_policies) out of the box.
     return openshell_pb2.SandboxSpec()
+
+
+def _sandbox_workload_template(
+    *,
+    name: str,
+    image: str | None = None,
+    labels: Mapping[str, str] | None = None,
+    annotations: Mapping[str, str] | None = None,
+    environment: Mapping[str, str] | None = None,
+    cpu: str | None = None,
+    memory: str | None = None,
+    gpu_count: int | None = None,
+    gpu: bool = False,
+    driver_config: Mapping[str, Any] | None = None,
+) -> openshell_pb2.SandboxWorkloadTemplate:
+    if gpu_count is not None and gpu_count <= 0:
+        raise SandboxError("gpu_count must be greater than zero")
+
+    template = openshell_pb2.SandboxWorkloadTemplate()
+    template.metadata.name = name
+    # The gateway permits an empty workload so it can apply the default image
+    # at sandbox create time, but the workload message itself is required.
+    template.spec.workload.SetInParent()
+    if labels:
+        template.metadata.labels.update(dict(labels))
+    if annotations:
+        template.metadata.annotations.update(dict(annotations))
+
+    if image is not None:
+        template.spec.workload.image = image
+    if environment:
+        template.spec.workload.environment.update(dict(environment))
+    if cpu is not None:
+        template.spec.workload.resources.cpu = cpu
+    if memory is not None:
+        template.spec.workload.resources.memory = memory
+    if gpu_count is not None:
+        template.spec.workload.resources.gpu_count = gpu_count
+    elif gpu:
+        template.spec.workload.resources.gpu_count = 1
+    if driver_config:
+        template.spec.driver_config.update(dict(driver_config))
+
+    return template
 
 
 def _xdg_config_home() -> pathlib.Path:
