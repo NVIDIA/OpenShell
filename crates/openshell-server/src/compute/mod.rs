@@ -8364,6 +8364,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn same_main_reconnect_preserves_process_start_time() {
+        let runtime = test_runtime(Arc::new(TestDriver::default())).await;
+        let mut sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Ready);
+        sandbox.status = Some(SandboxStatus {
+            phase: SandboxPhase::Ready as i32,
+            main_process_instance_id: "instance-1".into(),
+            main_process_started_at_ms: 12_345,
+            ..Default::default()
+        });
+        runtime.store.put_message(&sandbox).await.unwrap();
+
+        runtime
+            .supervisor_session_connected("sb-1", "instance-1")
+            .await
+            .unwrap();
+
+        let reconnected = runtime
+            .store
+            .get_message::<Sandbox>("sb-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            reconnected.status.unwrap().main_process_started_at_ms,
+            12_345
+        );
+    }
+
+    #[tokio::test]
     async fn on_failure_policy_keeps_zero_exit_terminal() {
         let runtime = test_runtime(Arc::new(TestDriver::default())).await;
         let mut sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Ready);
