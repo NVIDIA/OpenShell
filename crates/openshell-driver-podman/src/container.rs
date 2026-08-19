@@ -1098,6 +1098,8 @@ pub fn build_container_spec_for_image(
             "FSETID".into(),
             // Not needed: the supervisor does not send signals to arbitrary processes.
             "KILL".into(),
+            // Not needed: the supervisor does not bind privileged ports (<1024).
+            "NET_BIND_SERVICE".into(),
             // Not in Podman's default set but explicitly denied in case the image
             // or runtime adds it; raw sockets are not required.
             "NET_RAW".into(),
@@ -1802,7 +1804,6 @@ mod tests {
             .collect();
         assert!(added.contains(&"SYS_ADMIN"), "missing SYS_ADMIN");
         assert!(added.contains(&"NET_ADMIN"), "missing NET_ADMIN");
-        assert!(!added.contains(&"NET_BIND_SERVICE"));
         assert!(added.contains(&"SYS_PTRACE"), "missing SYS_PTRACE");
         assert!(added.contains(&"SYSLOG"), "missing SYSLOG");
         assert!(
@@ -1825,6 +1826,10 @@ mod tests {
             .collect();
         assert!(!dropped.contains(&"SETUID"), "SETUID must not be dropped");
         assert!(!dropped.contains(&"SETGID"), "SETGID must not be dropped");
+        assert!(
+            dropped.contains(&"NET_BIND_SERVICE"),
+            "NET_BIND_SERVICE must stay dropped; policy DNS binds an unprivileged port"
+        );
         assert!(
             !dropped.contains(&"CHOWN"),
             "CHOWN must not be dropped (needed for prepare_filesystem chown)"
