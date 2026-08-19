@@ -164,14 +164,14 @@ async fn docker_gateway_restart_preserves_running_and_stopped_intent() {
             .expect("create Docker sandbox that will remain stopped");
     let (stop_output, stop_code) = run_cli(&["sandbox", "stop", &stopped_sandbox.name]).await;
     assert_eq!(stop_code, 0, "sandbox stop should succeed:\n{stop_output}");
-    wait_for_sandbox_phase(&stopped_sandbox.name, "Stopped", Duration::from_secs(120))
+    wait_for_sandbox_phase(&stopped_sandbox.name, "Stopped", Duration::from_secs(30))
         .await
         .expect("sandbox should be stopped before gateway restart");
     wait_for_container_running(
         &namespace,
         &stopped_sandbox.name,
         false,
-        Duration::from_secs(120),
+        Duration::from_secs(30),
     )
     .await
     .expect("stopped Docker sandbox container should not be running");

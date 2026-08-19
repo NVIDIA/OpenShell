@@ -83,6 +83,9 @@ type SharedComputeDriver =
 
 use traced_driver::TracedDriver;
 
+const LIFECYCLE_SWEEP_PAGE_SIZE: u32 = 1000;
+const SHUTDOWN_STOP_CONCURRENCY: usize = 16;
+
 /// Instrumenting wrapper around the compute driver.
 mod traced_driver {
     use std::future::Future;
@@ -2050,69 +2053,75 @@ impl ComputeRuntime {
             return Ok(());
         }
 
-        let records = self
-            .store
-            .list_by_type(Sandbox::object_type(), 1000, 0)
-            .await
-            .map_err(|err| format!("failed to list sandboxes for shutdown: {err}"))?;
+        let sandbox_ids = self.list_persisted_sandbox_ids("gateway shutdown").await?;
 
-        let mut stopped = 0usize;
-        let mut failed = 0usize;
-
-        for record in records {
-            let sandbox = match Sandbox::decode(record.payload.as_slice()) {
-                Ok(sandbox) => sandbox,
-                Err(err) => {
-                    warn!(error = %err, "Failed to decode sandbox record during gateway shutdown");
-                    failed += 1;
-                    continue;
-                }
-            };
-
-            let phase = SandboxPhase::try_from(sandbox.phase()).unwrap_or(SandboxPhase::Unknown);
-            if !sandbox_phase_should_be_running(phase) {
-                continue;
-            }
-
-            let sandbox_id = sandbox.object_id().to_string();
-            let sandbox_name = sandbox.object_name().to_string();
-            let _lifecycle_guard = self.lifecycle_gates.lock_for(&sandbox_id).await;
-            match self
-                .driver
-                .call("driver.stop_sandbox", Some(&sandbox_id), |driver| {
-                    let sandbox_id = sandbox_id.clone();
-                    let sandbox_name = sandbox_name.clone();
-                    async move {
-                        driver
-                            .stop_sandbox(Request::new(StopSandboxRequest {
-                                sandbox_id,
-                                sandbox_name,
-                            }))
-                            .await
+        let outcomes = futures::stream::iter(sandbox_ids)
+            .map(|sandbox_id| async move {
+                let _lifecycle_guard = self.lifecycle_gates.lock_for(&sandbox_id).await;
+                let sandbox = match self.store.get_message::<Sandbox>(&sandbox_id).await {
+                    Ok(Some(sandbox)) => sandbox,
+                    Ok(None) => return (0usize, 0usize),
+                    Err(err) => {
+                        warn!(
+                            sandbox_id,
+                            error = %err,
+                            "Failed to re-read sandbox during gateway shutdown"
+                        );
+                        return (0, 1);
                     }
-                })
-                .await
-            {
-                Ok(_) => {
-                    info!(
-                        sandbox_id = %sandbox.object_id(),
-                        sandbox_name = %sandbox.object_name(),
-                        ?phase,
-                        "Stopped sandbox during gateway shutdown"
-                    );
-                    stopped += 1;
+                };
+
+                let phase =
+                    SandboxPhase::try_from(sandbox.phase()).unwrap_or(SandboxPhase::Unknown);
+                if !sandbox_phase_should_be_running(phase) {
+                    return (0, 0);
                 }
-                Err(err) => {
-                    warn!(
-                        sandbox_id = %sandbox.object_id(),
-                        sandbox_name = %sandbox.object_name(),
-                        error = %err,
-                        "Failed to stop sandbox during gateway shutdown"
-                    );
-                    failed += 1;
+
+                let sandbox_name = sandbox.object_name().to_string();
+                match self
+                    .driver
+                    .call("driver.stop_sandbox", Some(&sandbox_id), |driver| {
+                        let sandbox_id = sandbox_id.clone();
+                        let sandbox_name = sandbox_name.clone();
+                        async move {
+                            driver
+                                .stop_sandbox(Request::new(StopSandboxRequest {
+                                    sandbox_id,
+                                    sandbox_name,
+                                }))
+                                .await
+                        }
+                    })
+                    .await
+                {
+                    Ok(_) => {
+                        info!(
+                            sandbox_id,
+                            sandbox_name,
+                            ?phase,
+                            "Stopped sandbox during gateway shutdown"
+                        );
+                        (1, 0)
+                    }
+                    Err(err) => {
+                        warn!(
+                            sandbox_id,
+                            sandbox_name,
+                            error = %err,
+                            "Failed to stop sandbox during gateway shutdown"
+                        );
+                        (0, 1)
+                    }
                 }
-            }
-        }
+            })
+            .buffer_unordered(SHUTDOWN_STOP_CONCURRENCY)
+            .collect::<Vec<_>>()
+            .await;
+        let (stopped, failed) = outcomes
+            .into_iter()
+            .fold((0usize, 0usize), |(stopped, failed), outcome| {
+                (stopped + outcome.0, failed + outcome.1)
+            });
 
         if stopped > 0 || failed > 0 {
             info!(stopped, failed, "Sandbox shutdown stop sweep complete");
@@ -2145,21 +2154,24 @@ impl ComputeRuntime {
             return Ok(());
         }
 
-        let records = self
-            .store
-            .list_by_type(Sandbox::object_type(), 1000, 0)
-            .await
-            .map_err(|e| e.to_string())?;
+        let sandbox_ids = self.list_persisted_sandbox_ids("gateway startup").await?;
 
         let mut started = 0usize;
         let mut missing = 0usize;
         let mut failed = 0usize;
 
-        for record in records {
-            let sandbox = match Sandbox::decode(record.payload.as_slice()) {
-                Ok(sandbox) => sandbox,
+        for sandbox_id in sandbox_ids {
+            let _lifecycle_guard = self.lifecycle_gates.lock_for(&sandbox_id).await;
+            let sandbox = match self.store.get_message::<Sandbox>(&sandbox_id).await {
+                Ok(Some(sandbox)) => sandbox,
+                Ok(None) => continue,
                 Err(err) => {
-                    warn!(error = %err, "Failed to decode sandbox record during gateway startup");
+                    warn!(
+                        sandbox_id,
+                        error = %err,
+                        "Failed to re-read sandbox during gateway startup"
+                    );
+                    failed += 1;
                     continue;
                 }
             };
@@ -2169,7 +2181,6 @@ impl ComputeRuntime {
                 continue;
             }
 
-            let sandbox_id = sandbox.object_id().to_string();
             let sandbox_name = sandbox.object_name().to_string();
             match self
                 .driver
@@ -2248,16 +2259,20 @@ impl ComputeRuntime {
     }
 
     async fn recover_persisted_lifecycle_transitions(&self) -> Result<(), String> {
-        let records = self
-            .store
-            .list_by_type(Sandbox::object_type(), 1000, 0)
-            .await
-            .map_err(|e| e.to_string())?;
-        for record in records {
-            let sandbox = match Sandbox::decode(record.payload.as_slice()) {
-                Ok(sandbox) => sandbox,
+        let sandbox_ids = self
+            .list_persisted_sandbox_ids("lifecycle recovery")
+            .await?;
+        for sandbox_id in sandbox_ids {
+            let _lifecycle_guard = self.lifecycle_gates.lock_for(&sandbox_id).await;
+            let sandbox = match self.store.get_message::<Sandbox>(&sandbox_id).await {
+                Ok(Some(sandbox)) => sandbox,
+                Ok(None) => continue,
                 Err(err) => {
-                    warn!(error = %err, "Failed to decode sandbox during lifecycle recovery");
+                    warn!(
+                        sandbox_id,
+                        error = %err,
+                        "Failed to re-read sandbox during lifecycle recovery"
+                    );
                     continue;
                 }
             };
@@ -2342,6 +2357,28 @@ impl ComputeRuntime {
             }
         }
         Ok(())
+    }
+
+    async fn list_persisted_sandbox_ids(&self, operation: &str) -> Result<Vec<String>, String> {
+        let mut sandbox_ids = Vec::new();
+        let mut offset = 0u32;
+        loop {
+            let records = self
+                .store
+                .list_by_type(Sandbox::object_type(), LIFECYCLE_SWEEP_PAGE_SIZE, offset)
+                .await
+                .map_err(|err| format!("failed to list sandboxes for {operation}: {err}"))?;
+            let page_len = u32::try_from(records.len())
+                .map_err(|_| format!("sandbox page size overflow during {operation}"))?;
+            sandbox_ids.extend(records.into_iter().map(|record| record.id));
+            if page_len < LIFECYCLE_SWEEP_PAGE_SIZE {
+                break;
+            }
+            offset = offset
+                .checked_add(page_len)
+                .ok_or_else(|| format!("sandbox pagination offset overflow during {operation}"))?;
+        }
+        Ok(sandbox_ids)
     }
 
     async fn mark_sandbox_error(&self, sandbox: &Sandbox, reason: &str, message: &str) {
@@ -8206,6 +8243,83 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn shutdown_stop_sweep_bounds_driver_concurrency() {
+        let driver = ControlledDriver::new();
+        driver.block_stop();
+        let runtime = test_runtime_for_driver(driver.clone(), "docker").await;
+        for index in 0..=SHUTDOWN_STOP_CONCURRENCY {
+            runtime
+                .store
+                .put_message(&sandbox_record(
+                    &format!("sb-{index}"),
+                    &format!("sandbox-{index}"),
+                    SandboxPhase::Ready,
+                ))
+                .await
+                .unwrap();
+        }
+
+        let sweep_runtime = runtime.clone();
+        let sweep =
+            tokio::spawn(async move { sweep_runtime.stop_persisted_sandboxes_on_shutdown().await });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while driver.stop_calls() < SHUTDOWN_STOP_CONCURRENCY {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("shutdown sweep did not fill its concurrency window");
+        assert_eq!(driver.stop_calls(), SHUTDOWN_STOP_CONCURRENCY);
+
+        for _ in 0..=SHUTDOWN_STOP_CONCURRENCY {
+            driver.release_stop();
+        }
+        tokio::time::timeout(Duration::from_secs(1), sweep)
+            .await
+            .expect("shutdown sweep did not finish")
+            .unwrap()
+            .unwrap();
+        assert_eq!(driver.stop_calls(), SHUTDOWN_STOP_CONCURRENCY + 1);
+    }
+
+    #[tokio::test]
+    async fn shutdown_stop_sweep_rechecks_intent_after_acquiring_gate() {
+        let driver = ControlledDriver::new();
+        let runtime = test_runtime_for_driver(driver.clone(), "docker").await;
+        runtime
+            .store
+            .put_message(&sandbox_record("sb-1", "sandbox", SandboxPhase::Ready))
+            .await
+            .unwrap();
+
+        let gate = runtime.lifecycle_gates.gate_for("sb-1");
+        let guard = gate.clone().lock_owned().await;
+        let sweep_runtime = runtime.clone();
+        let sweep =
+            tokio::spawn(async move { sweep_runtime.stop_persisted_sandboxes_on_shutdown().await });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while Arc::strong_count(&gate) < 3 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("shutdown sweep did not wait on the lifecycle gate");
+
+        runtime
+            .store
+            .put_message(&sandbox_record("sb-1", "sandbox", SandboxPhase::Stopped))
+            .await
+            .unwrap();
+        drop(guard);
+        tokio::time::timeout(Duration::from_secs(1), sweep)
+            .await
+            .expect("shutdown sweep did not finish")
+            .unwrap()
+            .unwrap();
+        assert_eq!(driver.stop_calls(), 0);
+    }
+
+    #[tokio::test]
     async fn shutdown_stop_sweep_runs_for_each_local_driver_only() {
         for (driver_name, expected_calls) in [
             ("docker", 1),
@@ -8271,6 +8385,69 @@ mod tests {
                 "sb-unspecified".to_string(),
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn startup_sweep_rechecks_intent_after_acquiring_gate() {
+        let driver = ControlledDriver::new();
+        let runtime = test_runtime_for_driver(driver.clone(), "docker").await;
+        runtime
+            .store
+            .put_message(&sandbox_record("sb-1", "sandbox", SandboxPhase::Ready))
+            .await
+            .unwrap();
+
+        let gate = runtime.lifecycle_gates.gate_for("sb-1");
+        let guard = gate.clone().lock_owned().await;
+        let sweep_runtime = runtime.clone();
+        let sweep = tokio::spawn(async move { sweep_runtime.start_persisted_sandboxes().await });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while Arc::strong_count(&gate) < 3 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("startup sweep did not wait on the lifecycle gate");
+
+        runtime
+            .store
+            .put_message(&sandbox_record("sb-1", "sandbox", SandboxPhase::Deleting))
+            .await
+            .unwrap();
+        drop(guard);
+        tokio::time::timeout(Duration::from_secs(1), sweep)
+            .await
+            .expect("startup sweep did not finish")
+            .unwrap()
+            .unwrap();
+        assert_eq!(driver.start_calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn lifecycle_sweeps_page_through_all_persisted_sandboxes() {
+        let driver = ControlledDriver::new();
+        let runtime = test_runtime_for_driver(driver.clone(), "docker").await;
+        let sandbox_count = LIFECYCLE_SWEEP_PAGE_SIZE + 1;
+        for index in 0..sandbox_count {
+            runtime
+                .store
+                .put_message(&sandbox_record(
+                    &format!("sb-{index:04}"),
+                    &format!("sandbox-{index:04}"),
+                    SandboxPhase::Ready,
+                ))
+                .await
+                .unwrap();
+        }
+
+        runtime.start_persisted_sandboxes().await.unwrap();
+        assert_eq!(driver.start_calls(), sandbox_count as usize);
+
+        runtime
+            .stop_persisted_sandboxes_on_shutdown()
+            .await
+            .unwrap();
+        assert_eq!(driver.stop_calls(), sandbox_count as usize);
     }
 
     #[tokio::test]
