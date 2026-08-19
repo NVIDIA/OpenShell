@@ -227,9 +227,6 @@ rfc.md
 # Markdown/mermaid lint tooling deps
 scripts/lint-mermaid/node_modules/
 
-# JS/TS dependencies
-node_modules/
-
 # Nix
 /result
 /result-*
