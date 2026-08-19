@@ -125,7 +125,7 @@ When you register or log in to an OIDC gateway, the CLI uses the Authorization C
 The connection flow:
 
 1. The CLI loads the stored OIDC token bundle.
-2. If the access token is expired and a refresh token is available, the CLI refreshes it with the OIDC scopes saved in the gateway metadata.
+2. If the access token is expired or near expiry, the CLI refreshes it with the OIDC scopes saved in the gateway metadata. If refresh fails, the command stops before sending a protected request and directs you to run `openshell gateway login <name>`.
 3. The CLI connects to the gateway and attaches `authorization: Bearer <token>` metadata to each gRPC request.
 4. The gateway validates the JWT signature, issuer, audience, expiration, and key ID against the issuer's JWKS.
 5. The gateway extracts roles and optional scopes from the configured claim paths.
