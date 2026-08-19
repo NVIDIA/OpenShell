@@ -4,6 +4,7 @@
 //! gRPC service implementation.
 
 mod auth_rpc;
+mod image_build;
 pub mod policy;
 pub mod provider;
 mod sandbox;
@@ -14,10 +15,10 @@ pub mod workspace;
 use openshell_core::proto::{
     AddWorkspaceMemberRequest, AddWorkspaceMemberResponse, ApproveAllDraftChunksRequest,
     ApproveAllDraftChunksResponse, ApproveDraftChunkRequest, ApproveDraftChunkResponse,
-    AttachSandboxProviderRequest, AttachSandboxProviderResponse, ClearDraftChunksRequest,
-    ClearDraftChunksResponse, ComputeDriverCapabilities, ComputeDriverInfo,
-    ConfigureProviderRefreshRequest, ConfigureProviderRefreshResponse, CreateProviderRequest,
-    CreateSandboxRequest, CreateSshSessionRequest, CreateSshSessionResponse,
+    AttachSandboxProviderRequest, AttachSandboxProviderResponse, BuildSandboxImageRequest,
+    ClearDraftChunksRequest, ClearDraftChunksResponse, ComputeDriverCapabilities,
+    ComputeDriverInfo, ConfigureProviderRefreshRequest, ConfigureProviderRefreshResponse,
+    CreateProviderRequest, CreateSandboxRequest, CreateSshSessionRequest, CreateSshSessionResponse,
     CreateWorkspaceRequest, CreateWorkspaceResponse, DeleteProviderProfileRequest,
     DeleteProviderProfileResponse, DeleteProviderRefreshRequest, DeleteProviderRefreshResponse,
     DeleteProviderRequest, DeleteProviderResponse, DeleteSandboxRequest, DeleteSandboxResponse,
@@ -265,6 +266,18 @@ impl OpenShell for OpenShellService {
     }
 
     // --- Sandbox lifecycle ---
+
+    type BuildSandboxImageStream = image_build::BuildSandboxImageStream;
+
+    async fn build_sandbox_image(
+        &self,
+        request: Request<tonic::Streaming<BuildSandboxImageRequest>>,
+    ) -> Result<Response<Self::BuildSandboxImageStream>, Status> {
+        Ok(image_build::handle_build_sandbox_image(
+            self.state.clone(),
+            request,
+        ))
+    }
 
     async fn create_sandbox(
         &self,

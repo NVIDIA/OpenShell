@@ -4,6 +4,7 @@
 //! Gateway-owned compute orchestration over a pluggable compute backend.
 
 pub mod driver_config;
+mod image_build;
 pub mod lease;
 #[cfg(not(target_os = "windows"))]
 pub mod vm;
@@ -80,6 +81,8 @@ use tracing::{Instrument as _, debug, info, warn};
 type DriverWatchStream = Pin<Box<dyn Stream<Item = Result<WatchSandboxesEvent, Status>> + Send>>;
 type SharedComputeDriver =
     Arc<dyn ComputeDriver<WatchSandboxesStream = DriverWatchStream> + Send + Sync>;
+
+use image_build::ImageBuilder;
 
 use traced_driver::TracedDriver;
 
@@ -602,6 +605,7 @@ pub struct ComputeRuntime {
     sync_lock: Arc<Mutex<()>>,
     lifecycle_gates: Arc<LifecycleGateRegistry>,
     gateway_listener_requirements: Vec<GatewayListenerRequirement>,
+    image_builder: Option<Arc<dyn ImageBuilder>>,
     replica_id: String,
 }
 
@@ -723,6 +727,7 @@ impl ComputeRuntime {
             sync_lock: Arc::new(Mutex::new(())),
             lifecycle_gates: Arc::new(LifecycleGateRegistry::default()),
             gateway_listener_requirements,
+            image_builder: None,
             replica_id: lease::replica_id(),
         })
     }
@@ -849,13 +854,17 @@ impl ComputeRuntime {
         tracing_log_bus: TracingLogBus,
         supervisor_sessions: Arc<SupervisorSessionRegistry>,
     ) -> Result<Self, ComputeError> {
-        let driver = PodmanComputeDriver::new(config)
-            .await
-            .map_err(|err| ComputeError::Message(err.to_string()))?;
-        let driver: SharedComputeDriver = Arc::new(PodmanDriverService::new(driver));
-        Self::from_driver(
+        let driver = Arc::new(
+            PodmanComputeDriver::new(config)
+                .await
+                .map_err(|err| ComputeError::Message(err.to_string()))?,
+        );
+        let image_builder: Arc<dyn ImageBuilder> = driver.clone();
+        let grpc_driver: SharedComputeDriver =
+            Arc::new(PodmanDriverService::new((*driver).clone()));
+        let mut runtime = Self::from_driver(
             ComputeDriverKind::Podman.as_str().to_string(),
-            driver,
+            grpc_driver,
             None,
             None,
             None,
@@ -865,7 +874,9 @@ impl ComputeRuntime {
             tracing_log_bus,
             supervisor_sessions,
         )
-        .await
+        .await?;
+        runtime.image_builder = Some(image_builder);
+        Ok(runtime)
     }
 
     #[must_use]
@@ -4006,6 +4017,7 @@ pub async fn new_test_runtime_with_driver(
         sync_lock: Arc::new(Mutex::new(())),
         lifecycle_gates: Arc::new(LifecycleGateRegistry::default()),
         gateway_listener_requirements: Vec::new(),
+        image_builder: None,
         replica_id: "test-replica".to_string(),
     }
 }
@@ -4658,6 +4670,7 @@ mod tests {
             sync_lock: Arc::new(Mutex::new(())),
             lifecycle_gates: Arc::new(LifecycleGateRegistry::default()),
             gateway_listener_requirements: Vec::new(),
+            image_builder: None,
             replica_id: "test-replica".to_string(),
         }
     }

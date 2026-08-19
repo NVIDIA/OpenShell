@@ -127,7 +127,7 @@ to `0.0.0.0` solely to make sandbox callbacks reachable.
 
 [Docker](https://www.docker.com/get-started/)-backed sandboxes run as containers on the gateway host. Use Docker for local development, single-machine gateways, and hosts that already use Docker Desktop or Docker Engine.
 
-The gateway talks to the Docker daemon to create sandbox containers. Docker is also required for local image builds from directories or Dockerfiles.
+The gateway talks to the Docker daemon to create sandbox containers. The Docker driver does not currently implement gateway-owned builds from local directories or Dockerfiles; use a registry image reference.
 
 Docker Desktop and compatible macOS runtimes route `host.openshell.internal`
 through an IPv4 host-gateway alias. The gateway reuses an IPv4 primary listener
@@ -204,6 +204,8 @@ namespace roots. These checks do not make host bind mounts safe.
 [Podman](https://podman.io/)-backed sandboxes run as rootless containers on the gateway host. Use Podman for Linux workstation workflows that avoid a rootful Docker daemon.
 
 The gateway talks to the Podman API socket. The Podman driver requires Podman 5.x, cgroups v2, rootless networking, and an active Podman user socket. When `socket_path` is not set, the driver probes for a responsive Podman socket and fails to start if none respond.
+
+The Podman driver supports gateway-owned builds for `openshell sandbox create --from <Dockerfile-or-directory>` when the operator sets `enable_image_builds = true` in `[openshell.drivers.podman]`. The option is disabled by default because authenticated sandbox users can cause the gateway's Podman service to execute arbitrary Dockerfile build steps. The CLI streams a tar-formatted build context to the gateway, and the driver builds through its configured Podman socket. The workflow sends the build context, not an exported image archive, and the resulting tag remains in the selected Podman image store.
 
 For maintainer-level implementation details, refer to the [Podman driver README](https://github.com/NVIDIA/OpenShell/blob/main/crates/openshell-driver-podman/README.md) and [Podman networking notes](https://github.com/NVIDIA/OpenShell/blob/main/crates/openshell-driver-podman/NETWORKING.md).
 

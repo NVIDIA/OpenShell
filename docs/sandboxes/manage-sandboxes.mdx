@@ -124,9 +124,12 @@ openshell sandbox create --from my-registry.example.com/my-image:latest
 
 Bare names such as `base` and `ollama` resolve to images under `ghcr.io/nvidia/openshell-community/sandboxes`. Set `OPENSHELL_COMMUNITY_REGISTRY` when you need to use an internal mirror.
 
-Local directories and Dockerfiles require a local gateway because the CLI builds
-through the local Docker daemon. Use a registry image reference for remote
-gateways.
+For local directories and Dockerfiles, the CLI streams the build context to the
+gateway. A Podman gateway with operator-controlled `enable_image_builds = true`
+builds it through the Podman socket selected by the driver, so explicit
+`socket_path` configuration and auto-detection use the same image store that
+starts the sandbox. Other compute drivers do not currently
+support gateway-owned builds; use a registry image reference with those drivers.
 
 ## Base Sandbox Container
 

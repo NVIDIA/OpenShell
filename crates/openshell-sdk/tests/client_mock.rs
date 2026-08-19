@@ -147,6 +147,18 @@ impl OpenShell for TestOpenShell {
         ))
     }
 
+    type BuildSandboxImageStream =
+        tokio_stream::Empty<Result<proto::BuildSandboxImageEvent, Status>>;
+
+    async fn build_sandbox_image(
+        &self,
+        _request: tonic::Request<tonic::Streaming<proto::BuildSandboxImageRequest>>,
+    ) -> Result<Response<Self::BuildSandboxImageStream>, Status> {
+        Err(Status::unimplemented(
+            "image builds are not used by this test",
+        ))
+    }
+
     async fn create_sandbox(
         &self,
         request: tonic::Request<proto::CreateSandboxRequest>,

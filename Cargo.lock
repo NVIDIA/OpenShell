@@ -3820,6 +3820,8 @@ dependencies = [
 name = "openshell-driver-podman"
 version = "0.0.0"
 dependencies = [
+ "bollard",
+ "bytes",
  "clap",
  "futures",
  "http-body-util",

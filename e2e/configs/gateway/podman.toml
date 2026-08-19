@@ -23,6 +23,7 @@ ttl_secs = 0
 [openshell.drivers.podman]
 default_image = "ghcr.io/nvidia/openshell-community/sandboxes/base:latest"
 image_pull_policy = "missing"
+enable_image_builds = true
 network_name = "openshell-e2e"
 grpc_endpoint = "http://host.containers.internal:8080"
 supervisor_image = "localhost/openshell/supervisor:e2e-vm"

@@ -42,6 +42,17 @@ service OpenShell {
     };
   }
 
+  // Build a Dockerfile context in the selected compute runtime's image store.
+  // The first request must contain build metadata; subsequent requests contain
+  // bounded chunks of the tar-formatted build context.
+  rpc BuildSandboxImage(stream BuildSandboxImageRequest) returns (stream BuildSandboxImageEvent) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "sandbox:write"
+      workspace_role: "user"
+    };
+  }
+
   // Create a new sandbox.
   rpc CreateSandbox(CreateSandboxRequest) returns (SandboxResponse) {
     option (openshell.options.v1.authorization) = {
@@ -2696,4 +2707,29 @@ message ExtensionServiceCredential {
   string token = 2 [(openshell.options.v1.secret) = true];
   // Absolute expiry of the token, milliseconds since the epoch.
   int64 expires_at_ms = 3;
+}
+
+// Metadata sent before the Docker build context. Kept at the end of the file
+// so adding it does not renumber existing generated message descriptors.
+message BuildSandboxImageStart {
+  // Path to the Dockerfile relative to the root of the context archive.
+  string dockerfile = 1;
+  // Runtime-local image tag requested by the client.
+  string tag = 2;
+}
+
+// One frame in a streamed sandbox image build request.
+message BuildSandboxImageRequest {
+  oneof payload {
+    BuildSandboxImageStart start = 1;
+    bytes context_chunk = 2;
+  }
+}
+
+// Progress or completion from a sandbox image build.
+message BuildSandboxImageEvent {
+  oneof payload {
+    string progress = 1;
+    string image = 2;
+  }
 }

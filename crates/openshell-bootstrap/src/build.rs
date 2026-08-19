@@ -266,7 +266,7 @@ async fn build_image(
 ///
 /// Walks `context_dir` recursively, respects a `.dockerignore` file if present,
 /// and adds matching files with paths relative to the context root.
-fn create_build_context_tar(context_dir: &Path) -> Result<Vec<u8>> {
+pub fn create_build_context_tar(context_dir: &Path) -> Result<Vec<u8>> {
     let ignore_patterns = load_dockerignore(context_dir);
 
     let mut builder = tar::Builder::new(Vec::new());

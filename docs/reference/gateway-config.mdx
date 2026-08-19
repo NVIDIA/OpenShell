@@ -629,6 +629,9 @@ guest_tls_key           = "/etc/openshell/certs/client-key.pem"
 # bind-backed volumes, expose gateway-host paths inside sandboxes and can
 # negate OpenShell isolation and filesystem controls.
 enable_bind_mounts      = false
+# Allow authenticated users to send Dockerfile build contexts to this Podman
+# image store. Disabled by default.
+enable_image_builds     = false
 # Set to 0 to leave Podman's runtime default unchanged.
 sandbox_pids_limit      = 2048
 # Health check interval in seconds. Lower values detect readiness faster

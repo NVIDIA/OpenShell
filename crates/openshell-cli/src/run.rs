@@ -22,15 +22,14 @@ pub use crate::commands::gateway::{
     gateway_logout, gateway_remove, gateway_select, gateway_status, gateway_use,
 };
 
+use crate::image_build::build_from_dockerfile;
 use crate::policy_update::build_policy_update_plan;
 use crate::tls::{TlsOptions, grpc_client, grpc_inference_client};
 use dialoguer::Confirm;
 use futures::StreamExt;
 use indicatif::{ProgressBar, ProgressStyle};
 use miette::{IntoDiagnostic, Result, WrapErr, miette};
-use openshell_bootstrap::{
-    GatewayMetadata, clear_last_sandbox_if_matches, get_gateway_metadata, save_last_sandbox,
-};
+use openshell_bootstrap::{clear_last_sandbox_if_matches, save_last_sandbox};
 use openshell_core::net::set_tcp_nodelay_best_effort;
 use openshell_core::proto::ProviderProfileCategory;
 use openshell_core::proto::{
@@ -474,7 +473,9 @@ pub async fn sandbox_create(
                     dockerfile,
                     context,
                 } => {
-                    let tag = build_from_dockerfile(&dockerfile, &context, gateway_name).await?;
+                    let tag =
+                        build_from_dockerfile(&mut client, &dockerfile, &context, gateway_name)
+                            .await?;
                     Some(tag)
                 }
             }
@@ -1145,68 +1146,6 @@ fn value_is_explicit_local_path(value: &str) -> bool {
 
 fn value_looks_like_bare_dockerfile_name(value: &str) -> bool {
     !value.contains('/') && !value.contains(':') && filename_looks_like_dockerfile(Path::new(value))
-}
-
-fn dockerfile_sources_supported_for_gateway(metadata: Option<&GatewayMetadata>) -> bool {
-    !metadata.is_some_and(|metadata| metadata.is_remote)
-}
-
-/// Build a Dockerfile and return the local Docker tag.
-///
-/// Package-managed local gateways use the same Docker daemon that the CLI
-/// builds into, so the tag is passed through directly and the active compute
-/// driver resolves it.
-async fn build_from_dockerfile(
-    dockerfile: &Path,
-    context: &Path,
-    gateway_name: &str,
-) -> Result<String> {
-    let metadata = get_gateway_metadata(gateway_name);
-    if !dockerfile_sources_supported_for_gateway(metadata.as_ref()) {
-        return Err(miette!(
-            "local Dockerfile sources are only supported for local gateways; gateway '{}' is remote",
-            gateway_name
-        ));
-    }
-
-    let timestamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    let tag = format!("openshell/sandbox-from:{timestamp}");
-
-    eprintln!(
-        "Building image {} from {}",
-        tag.cyan(),
-        dockerfile.display()
-    );
-    eprintln!("  {} {}", "Context:".dimmed(), context.display());
-    eprintln!("  {} {}", "Gateway:".dimmed(), gateway_name);
-    eprintln!();
-
-    let mut on_log = |msg: String| {
-        eprintln!("  {msg}");
-    };
-
-    openshell_bootstrap::build::build_local_image(
-        dockerfile,
-        &tag,
-        context,
-        &HashMap::new(),
-        &mut on_log,
-    )
-    .await?;
-
-    eprintln!();
-    eprintln!(
-        "{} Image {} is available in the local Docker daemon for gateway '{}'.",
-        "✓".green().bold(),
-        tag.cyan(),
-        gateway_name,
-    );
-    eprintln!();
-
-    Ok(tag)
 }
 
 /// Load sandbox policy YAML.
@@ -7128,8 +7067,7 @@ fn format_endpoint(endpoint: &openshell_core::proto::NetworkEndpoint) -> String 
 #[cfg(test)]
 mod tests {
     use super::{
-        PolicyGetView, ProvisioningStep, build_sandbox_resource_limits,
-        dockerfile_sources_supported_for_gateway, format_endpoint,
+        PolicyGetView, ProvisioningStep, build_sandbox_resource_limits, format_endpoint,
         format_provider_attachment_table, git_sync_files, inferred_provider_type,
         parse_cli_setting_value, parse_credential_expiry_cli_value, parse_credential_expiry_pairs,
         parse_credential_pairs, parse_driver_config_json, parse_secret_material_env_pairs,
@@ -7147,7 +7085,6 @@ mod tests {
     use std::process::Command;
     use tonic::Status;
 
-    use openshell_bootstrap::GatewayMetadata;
     use openshell_core::progress::{
         PROGRESS_STEP_PULLING_IMAGE, PROGRESS_STEP_REQUESTING_SANDBOX,
         PROGRESS_STEP_STARTING_SANDBOX,
@@ -7731,45 +7668,6 @@ mod tests {
                 panic!("expected image ref, got Dockerfile source");
             }
         }
-    }
-
-    #[test]
-    fn dockerfile_sources_are_rejected_for_remote_gateways() {
-        let metadata = GatewayMetadata {
-            name: "remote".to_string(),
-            gateway_endpoint: "https://gateway.example.com".to_string(),
-            is_remote: true,
-            gateway_port: 443,
-            remote_host: Some("user@gateway.example.com".to_string()),
-            resolved_host: Some("gateway.example.com".to_string()),
-            auth_mode: None,
-            edge_team_domain: None,
-            edge_auth_url: None,
-            vm_driver_state_dir: None,
-            ..Default::default()
-        };
-
-        assert!(!dockerfile_sources_supported_for_gateway(Some(&metadata)));
-    }
-
-    #[test]
-    fn dockerfile_sources_are_allowed_for_local_gateways() {
-        let metadata = GatewayMetadata {
-            name: "local".to_string(),
-            gateway_endpoint: "http://127.0.0.1:8080".to_string(),
-            is_remote: false,
-            gateway_port: 8080,
-            remote_host: None,
-            resolved_host: None,
-            auth_mode: None,
-            edge_team_domain: None,
-            edge_auth_url: None,
-            vm_driver_state_dir: None,
-            ..Default::default()
-        };
-
-        assert!(dockerfile_sources_supported_for_gateway(Some(&metadata)));
-        assert!(dockerfile_sources_supported_for_gateway(None));
     }
 
     #[test]

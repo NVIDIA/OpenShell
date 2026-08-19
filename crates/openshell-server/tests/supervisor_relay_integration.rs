@@ -124,6 +124,18 @@ impl OpenShell for RelayGateway {
     ) -> Result<Response<openshell_core::proto::GetGatewayInfoResponse>, Status> {
         Err(Status::unimplemented("unused"))
     }
+    type BuildSandboxImageStream =
+        tokio_stream::Empty<Result<openshell_core::proto::BuildSandboxImageEvent, Status>>;
+
+    async fn build_sandbox_image(
+        &self,
+        _request: tonic::Request<tonic::Streaming<openshell_core::proto::BuildSandboxImageRequest>>,
+    ) -> Result<Response<Self::BuildSandboxImageStream>, Status> {
+        Err(Status::unimplemented(
+            "image builds are not used by this test",
+        ))
+    }
+
     async fn create_sandbox(
         &self,
         _: tonic::Request<openshell_core::proto::CreateSandboxRequest>,

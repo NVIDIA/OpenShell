@@ -6,6 +6,7 @@ pub mod config;
 pub(crate) mod container;
 pub mod driver;
 pub mod grpc;
+mod image_build;
 #[cfg(test)]
 pub(crate) mod test_utils;
 pub(crate) mod watcher;

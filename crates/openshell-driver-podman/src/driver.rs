@@ -50,7 +50,7 @@ impl From<PodmanApiError> for ComputeDriverError {
 #[derive(Clone)]
 pub struct PodmanComputeDriver {
     client: PodmanClient,
-    config: PodmanComputeConfig,
+    pub(crate) config: PodmanComputeConfig,
     /// The host's IP on the bridge network, when that bridge exists in the
     /// gateway's network namespace (notably rootful Podman).
     network_gateway_ip: Option<String>,

@@ -13,12 +13,12 @@ use openshell_cli::run;
 use openshell_cli::tls::TlsOptions;
 use openshell_core::proto::open_shell_server::{OpenShell, OpenShellServer};
 use openshell_core::proto::{
-    AttachSandboxProviderRequest, AttachSandboxProviderResponse, CreateProviderRequest,
-    CreateSandboxRequest, CreateSshSessionRequest, CreateSshSessionResponse, DeleteProviderRequest,
-    DeleteProviderResponse, DeleteSandboxRequest, DeleteSandboxResponse,
-    DetachSandboxProviderRequest, DetachSandboxProviderResponse, ExecSandboxEvent,
-    ExecSandboxInput, ExecSandboxRequest, GatewayMessage, GetGatewayConfigRequest,
-    GetGatewayConfigResponse, GetProviderRequest, GetSandboxConfigRequest,
+    AttachSandboxProviderRequest, AttachSandboxProviderResponse, BuildSandboxImageEvent,
+    BuildSandboxImageRequest, CreateProviderRequest, CreateSandboxRequest, CreateSshSessionRequest,
+    CreateSshSessionResponse, DeleteProviderRequest, DeleteProviderResponse, DeleteSandboxRequest,
+    DeleteSandboxResponse, DetachSandboxProviderRequest, DetachSandboxProviderResponse,
+    ExecSandboxEvent, ExecSandboxInput, ExecSandboxRequest, GatewayMessage,
+    GetGatewayConfigRequest, GetGatewayConfigResponse, GetProviderRequest, GetSandboxConfigRequest,
     GetSandboxConfigResponse, GetSandboxProviderEnvironmentRequest,
     GetSandboxProviderEnvironmentResponse, GetSandboxRequest, GpuResourceRequirements,
     HealthRequest, HealthResponse, ListProvidersRequest, ListProvidersResponse,
@@ -26,8 +26,8 @@ use openshell_core::proto::{
     ListSandboxesResponse, PlatformEvent, ProviderResponse, RevokeSshSessionRequest,
     RevokeSshSessionResponse, Sandbox, SandboxCondition, SandboxLogLine, SandboxPhase,
     SandboxResponse, SandboxStatus, SandboxStreamEvent, ServiceStatus, SettingValue,
-    SupervisorMessage, UpdateProviderRequest, WatchSandboxRequest, sandbox_stream_event,
-    setting_value,
+    SupervisorMessage, UpdateProviderRequest, WatchSandboxRequest, build_sandbox_image_event,
+    build_sandbox_image_request, sandbox_stream_event, setting_value,
 };
 use std::collections::HashMap;
 use std::fs;
@@ -42,10 +42,13 @@ use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::{Certificate as TlsCertificate, Identity, Server, ServerTlsConfig};
 use tonic::{Response, Status};
 
+type CapturedImageBuild = (String, String, Vec<u8>);
+
 #[derive(Clone, Default)]
 struct SandboxState {
     deleted_names: Arc<Mutex<Vec<Vec<String>>>>,
     create_requests: Arc<Mutex<Vec<CreateSandboxRequest>>>,
+    image_builds: Arc<Mutex<Vec<CapturedImageBuild>>>,
     vm_error_after_started: Arc<AtomicBool>,
     vm_slow_progress_before_ready: Arc<AtomicBool>,
     vm_log_churn_before_ready: Arc<AtomicBool>,
@@ -82,6 +85,43 @@ impl OpenShell for TestOpenShell {
         _request: tonic::Request<openshell_core::proto::GetGatewayInfoRequest>,
     ) -> Result<Response<openshell_core::proto::GetGatewayInfoResponse>, Status> {
         Err(Status::unimplemented("unused"))
+    }
+
+    type BuildSandboxImageStream =
+        tokio_stream::wrappers::ReceiverStream<Result<BuildSandboxImageEvent, Status>>;
+
+    async fn build_sandbox_image(
+        &self,
+        request: tonic::Request<tonic::Streaming<BuildSandboxImageRequest>>,
+    ) -> Result<Response<Self::BuildSandboxImageStream>, Status> {
+        let mut stream = request.into_inner();
+        let first = stream
+            .message()
+            .await?
+            .ok_or_else(|| Status::invalid_argument("missing build metadata"))?;
+        let Some(build_sandbox_image_request::Payload::Start(start)) = first.payload else {
+            return Err(Status::invalid_argument("missing build metadata"));
+        };
+        let mut context = Vec::new();
+        while let Some(frame) = stream.message().await? {
+            if let Some(build_sandbox_image_request::Payload::ContextChunk(chunk)) = frame.payload {
+                context.extend_from_slice(&chunk);
+            }
+        }
+        self.state
+            .image_builds
+            .lock()
+            .await
+            .push((start.dockerfile, start.tag.clone(), context));
+        let (tx, rx) = mpsc::channel(1);
+        tx.send(Ok(BuildSandboxImageEvent {
+            payload: Some(build_sandbox_image_event::Payload::Image(start.tag)),
+        }))
+        .await
+        .expect("build response receiver must remain open");
+        Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
+            rx,
+        )))
     }
 
     async fn create_sandbox(
@@ -1128,6 +1168,10 @@ async fn create_requests(server: &TestServer) -> Vec<CreateSandboxRequest> {
     server.openshell.state.create_requests.lock().await.clone()
 }
 
+async fn image_builds(server: &TestServer) -> Vec<CapturedImageBuild> {
+    server.openshell.state.image_builds.lock().await.clone()
+}
+
 async fn enable_providers_v2(server: &TestServer) {
     server.openshell.state.global_settings.lock().await.insert(
         openshell_core::settings::PROVIDERS_V2_ENABLED_KEY.to_string(),
@@ -1186,6 +1230,49 @@ async fn sandbox_create_keeps_command_sessions_by_default() {
         load_last_sandbox("openshell", "default").as_deref(),
         Some("default-command"),
         "default sandboxes should be persisted as last-used"
+    );
+}
+
+#[tokio::test]
+async fn sandbox_create_streams_dockerfile_context_before_create() {
+    let server = run_server().await;
+    let fake_ssh_dir = tempfile::tempdir().unwrap();
+    let xdg_dir = tempfile::tempdir().unwrap();
+    let _env = test_env(&fake_ssh_dir, &xdg_dir);
+    let tls = test_tls(&server);
+    install_fake_ssh(&fake_ssh_dir);
+    let context = tempfile::tempdir().unwrap();
+    fs::write(context.path().join("Dockerfile"), "FROM scratch\n").unwrap();
+    fs::write(context.path().join("payload.txt"), "hello\n").unwrap();
+    let from = context.path().to_str().unwrap();
+
+    run::sandbox_create(
+        &server.endpoint,
+        "openshell",
+        run::SandboxCreateConfig {
+            name: Some("dockerfile-build"),
+            from: Some(from),
+            command: &["echo".into(), "OK".into()],
+            ..test_config()
+        },
+        "default",
+        &tls,
+    )
+    .await
+    .expect("Dockerfile sandbox create should succeed");
+
+    let builds = image_builds(&server).await;
+    assert_eq!(builds.len(), 1);
+    assert_eq!(builds[0].0, "Dockerfile");
+    assert!(!builds[0].2.is_empty());
+    let creates = create_requests(&server).await;
+    assert_eq!(
+        creates[0]
+            .spec
+            .as_ref()
+            .and_then(|spec| spec.template.as_ref())
+            .map(|template| template.image.as_str()),
+        Some(builds[0].1.as_str())
     );
 }
 

@@ -16,6 +16,16 @@ Each runtime receives a sandbox spec from the gateway and is responsible for:
 - Reporting lifecycle and platform events back to the gateway.
 - Cleaning up runtime-owned resources.
 
+A runtime may also implement the gateway-local image-builder interface. The
+public build stream carries Dockerfile metadata and bounded context chunks to
+the gateway; the gateway delegates the completed context to the builder owned
+by its selected runtime and streams progress back to the caller. Podman is the
+initial implementation and builds through the same resolved socket used for
+sandbox provisioning when the operator enables `enable_image_builds`. The
+option defaults to false because builds execute Dockerfile steps in the runtime.
+Runtimes without the interface return an actionable
+error that directs callers to a registry image reference.
+
 Drivers report **backend state only**. A driver snapshot with `Ready=True` means
 the underlying compute resource (container, pod, VM) is healthy and running —
 nothing more. Drivers must not gate on supervisor session state or hold

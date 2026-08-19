@@ -8,6 +8,12 @@ use std::path::Path;
 
 use miette::Result;
 
+pub fn create_build_context_tar(_context_dir: &Path) -> Result<Vec<u8>> {
+    Err(miette::miette!(
+        "local Dockerfile sandbox sources are unsupported on Windows"
+    ))
+}
+
 // Keep this stub's signature aligned with the supported-platform implementation.
 #[allow(clippy::implicit_hasher)]
 pub async fn build_local_image(

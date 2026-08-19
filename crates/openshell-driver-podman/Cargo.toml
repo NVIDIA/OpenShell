@@ -24,6 +24,8 @@ tokio-stream = { workspace = true }
 hyper = { workspace = true }
 hyper-util = { workspace = true }
 http-body-util = { workspace = true }
+bollard = { version = "0.20" }
+bytes = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 prost-types = { workspace = true }

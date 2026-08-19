@@ -26,6 +26,7 @@ const (
 	OpenShell_Health_FullMethodName                        = "/openshell.v1.OpenShell/Health"
 	OpenShell_GetCurrentUser_FullMethodName                = "/openshell.v1.OpenShell/GetCurrentUser"
 	OpenShell_GetGatewayInfo_FullMethodName                = "/openshell.v1.OpenShell/GetGatewayInfo"
+	OpenShell_BuildSandboxImage_FullMethodName             = "/openshell.v1.OpenShell/BuildSandboxImage"
 	OpenShell_CreateSandbox_FullMethodName                 = "/openshell.v1.OpenShell/CreateSandbox"
 	OpenShell_GetSandbox_FullMethodName                    = "/openshell.v1.OpenShell/GetSandbox"
 	OpenShell_ListSandboxes_FullMethodName                 = "/openshell.v1.OpenShell/ListSandboxes"
@@ -110,6 +111,10 @@ type OpenShellClient interface {
 	GetCurrentUser(ctx context.Context, in *GetCurrentUserRequest, opts ...grpc.CallOption) (*GetCurrentUserResponse, error)
 	// Fetch elevated live gateway runtime metadata.
 	GetGatewayInfo(ctx context.Context, in *GetGatewayInfoRequest, opts ...grpc.CallOption) (*GetGatewayInfoResponse, error)
+	// Build a Dockerfile context in the selected compute runtime's image store.
+	// The first request must contain build metadata; subsequent requests contain
+	// bounded chunks of the tar-formatted build context.
+	BuildSandboxImage(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[BuildSandboxImageRequest, BuildSandboxImageEvent], error)
 	// Create a new sandbox.
 	CreateSandbox(ctx context.Context, in *CreateSandboxRequest, opts ...grpc.CallOption) (*SandboxResponse, error)
 	// Fetch a sandbox by name.
@@ -315,6 +320,19 @@ func (c *openShellClient) GetGatewayInfo(ctx context.Context, in *GetGatewayInfo
 	return out, nil
 }
 
+func (c *openShellClient) BuildSandboxImage(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[BuildSandboxImageRequest, BuildSandboxImageEvent], error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	stream, err := c.cc.NewStream(ctx, &OpenShell_ServiceDesc.Streams[0], OpenShell_BuildSandboxImage_FullMethodName, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &grpc.GenericClientStream[BuildSandboxImageRequest, BuildSandboxImageEvent]{ClientStream: stream}
+	return x, nil
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type OpenShell_BuildSandboxImageClient = grpc.BidiStreamingClient[BuildSandboxImageRequest, BuildSandboxImageEvent]
+
 func (c *openShellClient) CreateSandbox(ctx context.Context, in *CreateSandboxRequest, opts ...grpc.CallOption) (*SandboxResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(SandboxResponse)
@@ -467,7 +485,7 @@ func (c *openShellClient) RevokeSshSession(ctx context.Context, in *RevokeSshSes
 
 func (c *openShellClient) ExecSandbox(ctx context.Context, in *ExecSandboxRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[ExecSandboxEvent], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &OpenShell_ServiceDesc.Streams[0], OpenShell_ExecSandbox_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &OpenShell_ServiceDesc.Streams[1], OpenShell_ExecSandbox_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -486,7 +504,7 @@ type OpenShell_ExecSandboxClient = grpc.ServerStreamingClient[ExecSandboxEvent]
 
 func (c *openShellClient) ForwardTcp(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[TcpForwardFrame, TcpForwardFrame], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &OpenShell_ServiceDesc.Streams[1], OpenShell_ForwardTcp_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &OpenShell_ServiceDesc.Streams[2], OpenShell_ForwardTcp_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -499,7 +517,7 @@ type OpenShell_ForwardTcpClient = grpc.BidiStreamingClient[TcpForwardFrame, TcpF
 
 func (c *openShellClient) ExecSandboxInteractive(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[ExecSandboxInput, ExecSandboxEvent], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &OpenShell_ServiceDesc.Streams[2], OpenShell_ExecSandboxInteractive_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &OpenShell_ServiceDesc.Streams[3], OpenShell_ExecSandboxInteractive_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -742,7 +760,7 @@ func (c *openShellClient) GetSandboxLogs(ctx context.Context, in *GetSandboxLogs
 
 func (c *openShellClient) PushSandboxLogs(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[PushSandboxLogsRequest, PushSandboxLogsResponse], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &OpenShell_ServiceDesc.Streams[3], OpenShell_PushSandboxLogs_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &OpenShell_ServiceDesc.Streams[4], OpenShell_PushSandboxLogs_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -755,7 +773,7 @@ type OpenShell_PushSandboxLogsClient = grpc.ClientStreamingClient[PushSandboxLog
 
 func (c *openShellClient) ConnectSupervisor(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[SupervisorMessage, GatewayMessage], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &OpenShell_ServiceDesc.Streams[4], OpenShell_ConnectSupervisor_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &OpenShell_ServiceDesc.Streams[5], OpenShell_ConnectSupervisor_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -768,7 +786,7 @@ type OpenShell_ConnectSupervisorClient = grpc.BidiStreamingClient[SupervisorMess
 
 func (c *openShellClient) RelayStream(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[RelayFrame, RelayFrame], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &OpenShell_ServiceDesc.Streams[5], OpenShell_RelayStream_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &OpenShell_ServiceDesc.Streams[6], OpenShell_RelayStream_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -781,7 +799,7 @@ type OpenShell_RelayStreamClient = grpc.BidiStreamingClient[RelayFrame, RelayFra
 
 func (c *openShellClient) WatchSandbox(ctx context.Context, in *WatchSandboxRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[SandboxStreamEvent], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &OpenShell_ServiceDesc.Streams[6], OpenShell_WatchSandbox_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &OpenShell_ServiceDesc.Streams[7], OpenShell_WatchSandbox_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -997,6 +1015,10 @@ type OpenShellServer interface {
 	GetCurrentUser(context.Context, *GetCurrentUserRequest) (*GetCurrentUserResponse, error)
 	// Fetch elevated live gateway runtime metadata.
 	GetGatewayInfo(context.Context, *GetGatewayInfoRequest) (*GetGatewayInfoResponse, error)
+	// Build a Dockerfile context in the selected compute runtime's image store.
+	// The first request must contain build metadata; subsequent requests contain
+	// bounded chunks of the tar-formatted build context.
+	BuildSandboxImage(grpc.BidiStreamingServer[BuildSandboxImageRequest, BuildSandboxImageEvent]) error
 	// Create a new sandbox.
 	CreateSandbox(context.Context, *CreateSandboxRequest) (*SandboxResponse, error)
 	// Fetch a sandbox by name.
@@ -1180,6 +1202,9 @@ func (UnimplementedOpenShellServer) GetCurrentUser(context.Context, *GetCurrentU
 }
 func (UnimplementedOpenShellServer) GetGatewayInfo(context.Context, *GetGatewayInfoRequest) (*GetGatewayInfoResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetGatewayInfo not implemented")
+}
+func (UnimplementedOpenShellServer) BuildSandboxImage(grpc.BidiStreamingServer[BuildSandboxImageRequest, BuildSandboxImageEvent]) error {
+	return status.Error(codes.Unimplemented, "method BuildSandboxImage not implemented")
 }
 func (UnimplementedOpenShellServer) CreateSandbox(context.Context, *CreateSandboxRequest) (*SandboxResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method CreateSandbox not implemented")
@@ -1444,6 +1469,13 @@ func _OpenShell_GetGatewayInfo_Handler(srv interface{}, ctx context.Context, dec
 	}
 	return interceptor(ctx, in, info, handler)
 }
+
+func _OpenShell_BuildSandboxImage_Handler(srv interface{}, stream grpc.ServerStream) error {
+	return srv.(OpenShellServer).BuildSandboxImage(&grpc.GenericServerStream[BuildSandboxImageRequest, BuildSandboxImageEvent]{ServerStream: stream})
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type OpenShell_BuildSandboxImageServer = grpc.BidiStreamingServer[BuildSandboxImageRequest, BuildSandboxImageEvent]
 
 func _OpenShell_CreateSandbox_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(CreateSandboxRequest)
@@ -2755,6 +2787,12 @@ var OpenShell_ServiceDesc = grpc.ServiceDesc{
 		},
 	},
 	Streams: []grpc.StreamDesc{
+		{
+			StreamName:    "BuildSandboxImage",
+			Handler:       _OpenShell_BuildSandboxImage_Handler,
+			ServerStreams: true,
+			ClientStreams: true,
+		},
 		{
 			StreamName:    "ExecSandbox",
 			Handler:       _OpenShell_ExecSandbox_Handler,

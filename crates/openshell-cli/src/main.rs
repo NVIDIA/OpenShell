@@ -1339,8 +1339,10 @@ enum SandboxCommands {
         /// `ghcr.io/nvidia/openshell-community/sandboxes/<name>:latest`
         /// (override the prefix with `OPENSHELL_COMMUNITY_REGISTRY`).
         ///
-        /// When given a Dockerfile or directory, the image is built into the
-        /// local Docker daemon before creating the sandbox.
+        /// When given a Dockerfile or directory, the context is sent to the
+        /// gateway and built by its selected compute driver. Podman supports
+        /// gateway-owned builds when the operator enables them; other drivers
+        /// require a registry image.
         #[arg(long, value_hint = ValueHint::AnyPath)]
         from: Option<String>,
 

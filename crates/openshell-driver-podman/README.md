@@ -371,6 +371,11 @@ Podman resources after out-of-band container removal or label drift.
 | `OPENSHELL_SANDBOX_PROXY_CONNECT_BY_HOSTNAME` | `--sandbox-proxy-connect-by-hostname` | unset | Send the destination hostname in CONNECT requests instead of a validated IP. Last resort for proxies whose ACLs filter on hostnames: the proxy then resolves the name itself, so sandbox SSRF/`allowed_ips` validation no longer binds the connection. |
 | `OPENSHELL_PODMAN_USERNS` | `--userns` | unset | User namespace mode for sandbox containers (e.g. `auto`). When unset, containers use the default user namespace. |
 
+Gateway-owned Dockerfile builds use the `enable_image_builds` key under
+`[openshell.drivers.podman]`. It defaults to `false`; enable it only when
+sandbox users should be allowed to execute Dockerfile build steps through the
+gateway's selected Podman service.
+
 Through the gateway, the same settings are the `https_proxy`, `no_proxy`,
 `proxy_auth_file`, `proxy_auth_allow_insecure`, and
 `proxy_connect_by_hostname` keys under `[openshell.drivers.podman]`; see

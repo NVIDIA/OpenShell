@@ -126,6 +126,10 @@ pub struct PodmanComputeConfig {
     /// `template.driver_config`.
     #[serde(default)]
     pub enable_bind_mounts: bool,
+    /// Allow authenticated sandbox users to build Dockerfile contexts in the
+    /// driver's Podman image store through the gateway.
+    #[serde(default)]
+    pub enable_image_builds: bool,
     /// Health check interval in seconds for sandbox containers.
     ///
     /// Podman runs the health check command at this interval to determine
@@ -503,6 +507,7 @@ impl Default for PodmanComputeConfig {
             guest_tls_key: None,
             sandbox_pids_limit: DEFAULT_SANDBOX_PIDS_LIMIT,
             enable_bind_mounts: false,
+            enable_image_builds: false,
             health_check_interval_secs: DEFAULT_HEALTH_CHECK_INTERVAL_SECS,
             https_proxy: None,
             no_proxy: None,
@@ -534,6 +539,7 @@ impl std::fmt::Debug for PodmanComputeConfig {
             .field("guest_tls_key", &self.guest_tls_key)
             .field("sandbox_pids_limit", &self.sandbox_pids_limit)
             .field("enable_bind_mounts", &self.enable_bind_mounts)
+            .field("enable_image_builds", &self.enable_image_builds)
             .field(
                 "health_check_interval_secs",
                 &self.health_check_interval_secs,
@@ -575,6 +581,7 @@ mod tests {
         let cfg = PodmanComputeConfig::default();
         assert_eq!(cfg.sandbox_pids_limit, DEFAULT_SANDBOX_PIDS_LIMIT);
         assert!(!cfg.enable_bind_mounts);
+        assert!(!cfg.enable_image_builds);
         assert!(cfg.validate_runtime_limits().is_ok());
     }
 
