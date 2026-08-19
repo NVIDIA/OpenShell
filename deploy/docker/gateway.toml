@@ -41,8 +41,8 @@ default_image     = "ghcr.io/nvidia/openshell-community/sandboxes/base:latest"
 supervisor_image  = "ghcr.io/nvidia/openshell/supervisor:latest"
 # Only pull images that are not already cached locally.
 image_pull_policy = "IfNotPresent"
-# Prefix applied to sandbox container names.
-sandbox_namespace = "openshell"
+# Value assigned to the openshell.sandbox_namespace label on sandbox containers.
+sandbox_label     = "openshell"
 # Address sandbox containers use to call back to the gateway.
 # The Docker driver replaces the host with host.openshell.internal and the
 # port with the gateway's own bind port (8080).  Only the scheme survives.

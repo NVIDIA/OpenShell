@@ -168,7 +168,7 @@ async fn main() -> Result<()> {
         host_gateway_ip: args
             .host_gateway_ip
             .unwrap_or_else(PodmanComputeConfig::default_host_gateway_ip),
-        sandbox_ssh_socket_path: args.sandbox_ssh_socket_path,
+        ssh_socket_path: args.sandbox_ssh_socket_path,
         network_name: args.network_name,
         stop_timeout_secs: args.stop_timeout,
         supervisor_image: args

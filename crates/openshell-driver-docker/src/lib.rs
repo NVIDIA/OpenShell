@@ -98,8 +98,9 @@ pub struct DockerComputeConfig {
     /// Image pull policy for sandbox images.
     pub image_pull_policy: String,
 
-    /// Namespace label applied to Docker sandboxes.
-    pub sandbox_namespace: String,
+    /// Value of the `openshell.sandbox_namespace` label applied to Docker sandboxes.
+    #[serde(alias = "sandbox_namespace")]
+    pub sandbox_label: String,
 
     /// Gateway gRPC endpoint the sandbox connects back to.
     pub grpc_endpoint: String,
@@ -147,7 +148,7 @@ impl Default for DockerComputeConfig {
             socket_path: None,
             default_image: openshell_core::image::default_sandbox_image(),
             image_pull_policy: String::new(),
-            sandbox_namespace: "default".to_string(),
+            sandbox_label: "default".to_string(),
             grpc_endpoint: String::new(),
             supervisor_bin: None,
             supervisor_image: None,
@@ -174,7 +175,7 @@ pub(crate) struct DockerGuestTlsPaths {
 struct DockerDriverRuntimeConfig {
     default_image: String,
     image_pull_policy: String,
-    sandbox_namespace: String,
+    sandbox_label: String,
     grpc_endpoint: String,
     network_name: String,
     gateway_route: DockerGatewayRoute,
@@ -456,7 +457,7 @@ impl DockerComputeDriver {
             config: DockerDriverRuntimeConfig {
                 default_image: docker_config.default_image.clone(),
                 image_pull_policy: docker_config.image_pull_policy.clone(),
-                sandbox_namespace: docker_config.sandbox_namespace.clone(),
+                sandbox_label: docker_config.sandbox_label.clone(),
                 grpc_endpoint,
                 network_name,
                 gateway_route,
@@ -732,7 +733,7 @@ impl DockerComputeDriver {
         );
         self.publish_sandbox_snapshot(pending_sandbox_snapshot(
             sandbox,
-            &self.config.sandbox_namespace,
+            &self.config.sandbox_label,
             provisioning_condition(),
             false,
         ));
@@ -1132,7 +1133,7 @@ impl DockerComputeDriver {
             PendingSandboxRecord {
                 sandbox: pending_sandbox_snapshot(
                     sandbox,
-                    &self.config.sandbox_namespace,
+                    &self.config.sandbox_label,
                     provisioning_condition(),
                     false,
                 ),
@@ -1187,7 +1188,7 @@ impl DockerComputeDriver {
         cleanup_sandbox_token_file(sandbox, &self.config);
         let snapshot = pending_sandbox_snapshot(
             sandbox,
-            &self.config.sandbox_namespace,
+            &self.config.sandbox_label,
             error_condition(failure.reason, &failure.message),
             false,
         );
@@ -1393,7 +1394,7 @@ impl DockerComputeDriver {
     }
 
     async fn list_managed_container_summaries(&self) -> Result<Vec<ContainerSummary>, Status> {
-        let filters = managed_container_label_filters(&self.config.sandbox_namespace, []);
+        let filters = managed_container_label_filters(&self.config.sandbox_label, []);
         self.docker
             .list_containers(Some(
                 ListContainersOptionsBuilder::default()
@@ -1418,7 +1419,7 @@ impl DockerComputeDriver {
         }
 
         let filters =
-            managed_container_label_filters(&self.config.sandbox_namespace, label_filter_values);
+            managed_container_label_filters(&self.config.sandbox_label, label_filter_values);
         let containers = self
             .docker
             .list_containers(Some(
@@ -1436,7 +1437,7 @@ impl DockerComputeDriver {
             };
             let namespace_matches = labels
                 .get(LABEL_SANDBOX_NAMESPACE)
-                .is_some_and(|value| value == &self.config.sandbox_namespace);
+                .is_some_and(|value| value == &self.config.sandbox_label);
             let id_matches = sandbox_id.is_empty()
                 || labels
                     .get(LABEL_SANDBOX_ID)
@@ -2314,7 +2315,7 @@ fn sandbox_token_host_path_by_id(
 ) -> Result<PathBuf, Status> {
     openshell_core::driver_utils::sandbox_token_path(
         "docker-sandbox-tokens",
-        Some(&config.sandbox_namespace),
+        Some(&config.sandbox_label),
         sandbox_id,
     )
     .map_err(|err| {
@@ -2664,13 +2665,13 @@ fn build_container_create_body_for_image(
         LABEL_SANDBOX_WORKSPACE.to_string(),
         sandbox.workspace.clone(),
     );
-    // The list/get/find paths filter by `config.sandbox_namespace`, so use
+    // The list/get/find paths filter by `config.sandbox_label`, so use
     // the same value here. `DriverSandbox.namespace` is unset on the request
     // path (the gateway elides it), and using it would produce containers
     // that the driver itself cannot find afterwards.
     labels.insert(
         LABEL_SANDBOX_NAMESPACE.to_string(),
-        config.sandbox_namespace.clone(),
+        config.sandbox_label.clone(),
     );
 
     Ok(ContainerCreateBody {
@@ -3256,12 +3257,12 @@ fn label_filters(values: impl IntoIterator<Item = String>) -> HashMap<String, Ve
 }
 
 fn managed_container_label_filters(
-    sandbox_namespace: &str,
+    sandbox_label: &str,
     extra_values: impl IntoIterator<Item = String>,
 ) -> HashMap<String, Vec<String>> {
     let mut values = vec![
         format!("{LABEL_MANAGED_BY}={LABEL_MANAGED_BY_VALUE}"),
-        format!("{LABEL_SANDBOX_NAMESPACE}={sandbox_namespace}"),
+        format!("{LABEL_SANDBOX_NAMESPACE}={sandbox_label}"),
     ];
     values.extend(extra_values);
     label_filters(values)

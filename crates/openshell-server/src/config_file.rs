@@ -434,7 +434,7 @@ pub fn driver_table(
     };
 
     for key in inheritable_keys(driver_name) {
-        if merged.contains_key(*key) {
+        if driver_field_is_present(&merged, driver_name, key) {
             continue;
         }
         if let Some(value) = gateway_inherited_value(gateway, key) {
@@ -461,7 +461,7 @@ fn inheritable_keys(driver_name: &str) -> &'static [&'static str] {
             "sa_token_ttl_secs",
         ],
         Some(ComputeDriverKind::Docker) => &[
-            "sandbox_namespace",
+            "sandbox_label",
             "default_image",
             "supervisor_image",
             "host_gateway_ip",
@@ -487,9 +487,21 @@ fn inheritable_keys(driver_name: &str) -> &'static [&'static str] {
     }
 }
 
+fn driver_field_is_present(table: &toml::Table, driver_name: &str, key: &str) -> bool {
+    if table.contains_key(key) {
+        return true;
+    }
+
+    matches!(
+        driver_name.parse::<ComputeDriverKind>().ok(),
+        Some(ComputeDriverKind::Docker)
+    ) && key == "sandbox_label"
+        && table.contains_key("sandbox_namespace")
+}
+
 fn gateway_inherited_value(g: &GatewayFileSection, key: &str) -> Option<toml::Value> {
     match key {
-        "namespace" | "sandbox_namespace" => g.sandbox_namespace.as_deref().map(string_value),
+        "namespace" | "sandbox_label" => g.sandbox_namespace.as_deref().map(string_value),
         "default_image" => g.default_image.as_deref().map(string_value),
         "supervisor_image" => g.supervisor_image.as_deref().map(string_value),
         "client_tls_secret_name" => g.client_tls_secret_name.as_deref().map(string_value),
@@ -1009,7 +1021,7 @@ version = 2
         let merged = driver_table(ComputeDriverKind::Docker.as_str(), &gateway, None);
         let table = merged.as_table().expect("table");
         assert_eq!(
-            table.get("sandbox_namespace").and_then(|v| v.as_str()),
+            table.get("sandbox_label").and_then(|v| v.as_str()),
             Some("agents")
         );
         assert_eq!(
@@ -1020,6 +1032,52 @@ version = 2
             table.get("host_gateway_ip").and_then(|v| v.as_str()),
             Some("10.0.0.1")
         );
+    }
+
+    #[test]
+    fn docker_driver_canonical_sandbox_label_overrides_gateway_default() {
+        let gateway = GatewayFileSection {
+            sandbox_namespace: Some("gateway-default".to_string()),
+            ..Default::default()
+        };
+        let raw = toml::toml! {
+            sandbox_label = "driver-specific"
+        };
+        let merged = driver_table(
+            ComputeDriverKind::Docker.as_str(),
+            &gateway,
+            Some(&toml::Value::Table(raw)),
+        );
+        let table = merged.as_table().expect("table");
+        assert_eq!(
+            table.get("sandbox_label").and_then(|value| value.as_str()),
+            Some("driver-specific")
+        );
+        assert!(!table.contains_key("sandbox_namespace"));
+    }
+
+    #[test]
+    fn docker_driver_legacy_sandbox_namespace_overrides_gateway_default() {
+        let gateway = GatewayFileSection {
+            sandbox_namespace: Some("gateway-default".to_string()),
+            ..Default::default()
+        };
+        let raw = toml::toml! {
+            sandbox_namespace = "driver-specific"
+        };
+        let merged = driver_table(
+            ComputeDriverKind::Docker.as_str(),
+            &gateway,
+            Some(&toml::Value::Table(raw)),
+        );
+        let table = merged.as_table().expect("table");
+        assert_eq!(
+            table
+                .get("sandbox_namespace")
+                .and_then(|value| value.as_str()),
+            Some("driver-specific")
+        );
+        assert!(!table.contains_key("sandbox_label"));
     }
 
     #[test]

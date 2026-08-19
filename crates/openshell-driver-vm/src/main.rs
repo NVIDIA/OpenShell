@@ -91,8 +91,12 @@ struct Args {
     #[arg(long, env = "OPENSHELL_OTLP_ENDPOINT")]
     otlp_endpoint: Option<String>,
 
-    #[arg(long, env = "OPENSHELL_GRPC_ENDPOINT")]
-    openshell_endpoint: Option<String>,
+    #[arg(
+        long = "grpc-endpoint",
+        alias = "openshell-endpoint",
+        env = "OPENSHELL_GRPC_ENDPOINT"
+    )]
+    grpc_endpoint: Option<String>,
 
     #[arg(long, env = "OPENSHELL_SANDBOX_IMAGE", default_value = "")]
     default_image: String,
@@ -218,8 +222,8 @@ async fn main() -> Result<()> {
     }
 
     let driver = VmDriver::new(VmDriverConfig {
-        openshell_endpoint: args
-            .openshell_endpoint
+        grpc_endpoint: args
+            .grpc_endpoint
             .ok_or_else(|| miette::miette!("OPENSHELL_GRPC_ENDPOINT is required"))?,
         state_dir: args.state_dir.clone(),
         launcher_bin: None,
@@ -688,6 +692,28 @@ mod tests {
         let args = Args::parse_from(["openshell-driver-vm"]);
         let err = compute_driver_listen_mode(&args).expect_err("default TCP should be disabled");
         assert!(err.contains("--bind-socket is required"));
+    }
+
+    #[test]
+    fn accepts_canonical_grpc_endpoint_flag() {
+        let args = Args::try_parse_from([
+            "openshell-driver-vm",
+            "--grpc-endpoint",
+            "http://127.0.0.1:8080",
+        ])
+        .unwrap();
+        assert_eq!(args.grpc_endpoint.as_deref(), Some("http://127.0.0.1:8080"));
+    }
+
+    #[test]
+    fn accepts_legacy_openshell_endpoint_flag_alias() {
+        let args = Args::try_parse_from([
+            "openshell-driver-vm",
+            "--openshell-endpoint",
+            "http://127.0.0.1:8080",
+        ])
+        .unwrap();
+        assert_eq!(args.grpc_endpoint.as_deref(), Some("http://127.0.0.1:8080"));
     }
 
     #[test]

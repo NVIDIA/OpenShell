@@ -495,7 +495,7 @@ GATEWAY_CONFIG="${STATE_DIR}/gateway.toml"
     fi
   fi
   printf '[openshell.drivers.docker]\n'
-  printf 'sandbox_namespace = %s\n'    "$(toml_string "${E2E_NAMESPACE}")"
+  printf 'sandbox_label = %s\n'        "$(toml_string "${E2E_NAMESPACE}")"
   printf 'network_name = %s\n'         "$(toml_string "${DOCKER_NETWORK_NAME}")"
   printf 'grpc_endpoint = %s\n'        "$(toml_string "${GATEWAY_ENDPOINT}")"
   printf 'default_image = %s\n'        "$(toml_string "${SANDBOX_IMAGE}")"
