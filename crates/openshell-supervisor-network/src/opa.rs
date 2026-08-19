@@ -18,7 +18,7 @@ use openshell_supervisor_middleware::{ChainEntry, ChainRunner, MiddlewareRegistr
 use std::path::{Path, PathBuf};
 use std::sync::{
     Arc, Mutex, RwLock,
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use tokio::sync::watch;
 use tracing::info;
@@ -123,6 +123,7 @@ pub struct SandboxConfig {
 pub struct OpaEngine {
     engine: Mutex<regorus::Engine>,
     generation: Arc<AtomicU64>,
+    require_binary_identity: AtomicBool,
     middleware_runner: RwLock<ChainRunner>,
     websocket_assembly_budget: crate::l7::websocket::WebSocketAssemblyBudget,
     generation_tx: watch::Sender<u64>,
@@ -250,12 +251,13 @@ impl OpaEngine {
         self.websocket_assembly_budget.clone()
     }
 
-    fn with_engine(engine: regorus::Engine) -> Self {
+    fn with_engine(engine: regorus::Engine, require_binary_identity: bool) -> Self {
         let generation = Arc::new(AtomicU64::new(0));
         let (generation_tx, _) = watch::channel(0);
         Self {
             engine: Mutex::new(engine),
             generation,
+            require_binary_identity: AtomicBool::new(require_binary_identity),
             middleware_runner: RwLock::new(ChainRunner::default()),
             websocket_assembly_budget: crate::l7::websocket::WebSocketAssemblyBudget::default(),
             generation_tx,
@@ -309,7 +311,7 @@ impl OpaEngine {
         engine
             .add_data_json(&data_json)
             .map_err(|e| miette::miette!("{e}"))?;
-        Ok(Self::with_engine(engine))
+        Ok(Self::with_engine(engine, require_binary_identity))
     }
 
     /// Load policy rules and data from strings (data is YAML).
@@ -360,7 +362,7 @@ impl OpaEngine {
         engine
             .add_data_json(&data_json)
             .map_err(|e| miette::miette!("{e}"))?;
-        Ok(Self::with_engine(engine))
+        Ok(Self::with_engine(engine, require_binary_identity))
     }
 
     /// Create OPA engine from a typed proto policy.
@@ -447,7 +449,7 @@ impl OpaEngine {
         engine
             .add_data_json(&data_json)
             .map_err(|e| miette::miette!("{e}"))?;
-        Ok(Self::with_engine(engine))
+        Ok(Self::with_engine(engine, require_binary_identity))
     }
 
     /// Evaluate a network access request against the loaded policy.
@@ -572,6 +574,7 @@ impl OpaEngine {
     /// expansion) to maintain consistency with `from_strings()`.
     pub fn reload(&self, policy: &str, data_yaml: &str) -> Result<()> {
         let new = Self::from_strings(policy, data_yaml)?;
+        let require_binary_identity = new.binary_identity_required();
         let new_engine = new
             .engine
             .into_inner()
@@ -585,6 +588,8 @@ impl OpaEngine {
             .fail_closed_reason
             .write()
             .map_err(|_| miette::miette!("OPA fail-closed state lock poisoned"))? = None;
+        self.require_binary_identity
+            .store(require_binary_identity, Ordering::Release);
         self.advance_generation();
         Ok(())
     }
@@ -611,6 +616,7 @@ impl OpaEngine {
     ) -> Result<()> {
         // Build a complete new engine through the same validated pipeline.
         let new = Self::from_proto_with_pid(proto, entrypoint_pid)?;
+        let require_binary_identity = new.binary_identity_required();
         let new_engine = new
             .engine
             .into_inner()
@@ -624,6 +630,8 @@ impl OpaEngine {
             .fail_closed_reason
             .write()
             .map_err(|_| miette::miette!("OPA fail-closed state lock poisoned"))? = None;
+        self.require_binary_identity
+            .store(require_binary_identity, Ordering::Release);
         self.advance_generation();
         Ok(())
     }
@@ -641,6 +649,7 @@ impl OpaEngine {
         registry: MiddlewareRegistry,
     ) -> Result<()> {
         let new = Self::from_proto_with_pid(proto, entrypoint_pid)?;
+        let require_binary_identity = new.binary_identity_required();
         let new_engine = new
             .engine
             .into_inner()
@@ -662,6 +671,8 @@ impl OpaEngine {
             .fail_closed_reason
             .write()
             .map_err(|_| miette::miette!("OPA fail-closed state lock poisoned"))? = None;
+        self.require_binary_identity
+            .store(require_binary_identity, Ordering::Release);
         self.advance_generation();
         Ok(())
     }
@@ -716,6 +727,10 @@ impl OpaEngine {
     /// Current policy generation. Successful reloads increment this value.
     pub fn current_generation(&self) -> u64 {
         self.generation.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn binary_identity_required(&self) -> bool {
+        self.require_binary_identity.load(Ordering::Acquire)
     }
 
     /// Replace the complete middleware service registry and invalidate
@@ -3256,7 +3271,7 @@ network_policies:
             .expect("policy should load");
         rego.add_data_json(&data_json.to_string())
             .expect("data should load");
-        let engine = OpaEngine::with_engine(rego);
+        let engine = OpaEngine::with_engine(rego, true);
         let input = l7_websocket_graphql_input(
             "realtime.graphql.com",
             serde_json::json!([{

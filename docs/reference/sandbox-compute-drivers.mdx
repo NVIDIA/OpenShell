@@ -69,24 +69,31 @@ Docker and Podman apply them as runtime limits. Kubernetes applies them as both
 container requests and limits. The VM driver accepts the fields but currently
 ignores them.
 
-Sandbox create also accepts experimental driver-owned config through
-`--driver-config-json`. The value is a JSON object keyed by driver name. The
-gateway forwards only the block for the active driver, so a Kubernetes gateway
-receives the `kubernetes` object from a value such as:
+Sandbox templates accept experimental driver-owned config through
+`SandboxTemplate.spec.driver_config`. Attach it through
+`openshell sandbox template create --driver-config-json`, then create sandboxes
+from that template:
+
+```shell
+openshell sandbox template create batch-kata \
+  --driver-config-json '{"kubernetes":{"pod":{"runtime_class_name":"kata-containers","priority_class_name":"batch-low"}}}'
+
+openshell sandbox create --template batch-kata
+```
+
+When `--from` is omitted, sandboxes created from the template use the gateway's
+default sandbox image. The driver config value is a JSON object keyed by driver
+name. The gateway forwards only the block for the active driver, so a Kubernetes
+gateway receives the `kubernetes` object from the value above.
 
 Nested keys inside each driver block use snake_case. The top-level envelope keys
 are driver names, such as `kubernetes`, and are not part of the nested schema.
 
-```shell
-openshell sandbox create \
-  --driver-config-json '{"kubernetes":{"pod":{"runtime_class_name":"kata-containers","priority_class_name":"batch-low"}}}' \
-  -- claude
-```
-
-Driver config is for fields without a stable public flag. Prefer `--cpu`,
-`--memory`, and `--gpu` for supported resource intent. When `--gpu` is present
-without a count, OpenShell treats it as a request for one GPU. Pass
-`--gpu COUNT` when requesting more than one GPU.
+Driver config is for operator-controlled templates and fields without a stable
+public flag. Direct sandbox create remains portable; prefer `--cpu`, `--memory`,
+and `--gpu` for supported resource intent. When `--gpu` is present without a
+count, OpenShell treats it as a request for one GPU. Pass `--gpu COUNT` when
+requesting more than one GPU.
 
 Kubernetes maps the GPU count to the `nvidia.com/gpu` pod resource limit.
 Docker and Podman satisfy count-only GPU requests by selecting the requested
@@ -97,9 +104,10 @@ creates. On WSL2 all-only runtimes, Docker or Podman can use
 `nvidia.com/gpu=all` as a compatibility fallback, where it counts as one
 selectable device.
 
-Exact GPU device selection remains driver-owned and requires `--gpu`. Docker
-and Podman accept `cdi_devices` as opaque CDI device names; replace the
-top-level `docker` key with `podman` when using the Podman driver, for example
+Exact GPU device selection remains driver-owned and belongs in template driver
+config alongside `--gpu` resource intent. Docker and Podman accept
+`cdi_devices` as opaque CDI device names; replace the top-level `docker` key
+with `podman` when using the Podman driver, for example
 `{"docker":{"cdi_devices":["nvidia.com/gpu=0"]}}`. Explicit CDI device lists
 must not contain duplicates, and their length must match the effective GPU
 count. A single exact CDI device is compatible with the default `--gpu`
@@ -109,9 +117,8 @@ accepts at most one entry and allows either `--gpu` or `--gpu 1` when
 `gpu_device_ids` is set.
 
 For Kubernetes, `pod.runtime_class_name` maps to PodSpec `runtimeClassName`.
-It overrides the gateway's configured default runtime class for that sandbox,
-while a typed `SandboxTemplate.runtime_class_name` value from the API still
-takes precedence.
+Template driver config overrides the gateway's configured default runtime class
+for sandboxes created from that template.
 
 Docker and Podman report the address through which their sandboxes can reach
 the gateway. If the primary listener covers that address, the gateway reuses
@@ -154,14 +161,24 @@ Docker local-driver named volumes created with bind options also expose
 gateway-host paths, so OpenShell treats them like bind mounts and requires
 `enable_bind_mounts = true`.
 
-Use a `volume` mount for existing Docker named volumes:
+Use a `volume` mount for existing Docker named volumes. Create the volume
+before referencing it from template driver config:
 
 ```shell
 docker volume create openshell-work
+```
 
-openshell sandbox create \
-  --driver-config-json '{"docker":{"mounts":[{"type":"volume","source":"openshell-work","target":"/sandbox/work","read_only":false}]}}' \
-  -- claude
+```json
+{
+  "docker": {
+    "mounts": [{
+      "type": "volume",
+      "source": "openshell-work",
+      "target": "/sandbox/work",
+      "read_only": false
+    }]
+  }
+}
 ```
 
 <Warning>
@@ -178,10 +195,17 @@ Use a `bind` mount only after enabling it in the Docker driver table:
 enable_bind_mounts = true
 ```
 
-```shell
-openshell sandbox create \
-  --driver-config-json '{"docker":{"mounts":[{"type":"bind","source":"/srv/openshell/work","target":"/sandbox/work","read_only":false}]}}' \
-  -- claude
+```json
+{
+  "docker": {
+    "mounts": [{
+      "type": "bind",
+      "source": "/srv/openshell/work",
+      "target": "/sandbox/work",
+      "read_only": false
+    }]
+  }
+}
 ```
 
 Docker mount schema:
@@ -229,14 +253,24 @@ OpenShell treats them like bind mounts and requires `enable_bind_mounts = true`.
 Host bind mounts expose gateway host paths to sandbox requests, so they are
 disabled by default.
 
-Use a `volume` mount for existing Podman named volumes:
+Use a `volume` mount for existing Podman named volumes. Create the volume
+before referencing it from template driver config:
 
 ```shell
 podman volume create openshell-work
+```
 
-openshell sandbox create \
-  --driver-config-json '{"podman":{"mounts":[{"type":"volume","source":"openshell-work","target":"/sandbox/work","read_only":false}]}}' \
-  -- claude
+```json
+{
+  "podman": {
+    "mounts": [{
+      "type": "volume",
+      "source": "openshell-work",
+      "target": "/sandbox/work",
+      "read_only": false
+    }]
+  }
+}
 ```
 
 <Warning>
@@ -253,10 +287,17 @@ Use a `bind` mount only after enabling it in the Podman driver table:
 enable_bind_mounts = true
 ```
 
-```shell
-openshell sandbox create \
-  --driver-config-json '{"podman":{"mounts":[{"type":"bind","source":"/srv/openshell/work","target":"/sandbox/work","read_only":false}]}}' \
-  -- claude
+```json
+{
+  "podman": {
+    "mounts": [{
+      "type": "bind",
+      "source": "/srv/openshell/work",
+      "target": "/sandbox/work",
+      "read_only": false
+    }]
+  }
+}
 ```
 
 Podman mount schema:
@@ -423,38 +464,36 @@ agent container. Use this when storage is provisioned outside OpenShell and a
 sandbox should mount selected PVC subpaths instead of using the default
 OpenShell-created `/sandbox` workspace PVC.
 
-```shell
-openshell sandbox create \
-  --driver-config-json '{
-    "kubernetes": {
-      "volumes": [{
-        "name": "user-data",
-        "persistent_volume_claim": {
-          "claim_name": "pvc-user-data-123",
-          "read_only": false
-        }
-      }],
-      "containers": {
-        "agent": {
-          "volume_mounts": [
-            {
-              "name": "user-data",
-              "mount_path": "/sandbox/.openshell/workspace",
-              "sub_path": "workspace",
-              "read_only": false
-            },
-            {
-              "name": "user-data",
-              "mount_path": "/sandbox/.openshell/memory",
-              "sub_path": "memory",
-              "read_only": false
-            }
-          ]
-        }
+```json
+{
+  "kubernetes": {
+    "volumes": [{
+      "name": "user-data",
+      "persistent_volume_claim": {
+        "claim_name": "pvc-user-data-123",
+        "read_only": false
+      }
+    }],
+    "containers": {
+      "agent": {
+        "volume_mounts": [
+          {
+            "name": "user-data",
+            "mount_path": "/sandbox/.openshell/workspace",
+            "sub_path": "workspace",
+            "read_only": false
+          },
+          {
+            "name": "user-data",
+            "mount_path": "/sandbox/.openshell/memory",
+            "sub_path": "memory",
+            "read_only": false
+          }
+        ]
       }
     }
-  }' \
-  -- claude
+  }
+}
 ```
 
 Kubernetes PVC mount schema:

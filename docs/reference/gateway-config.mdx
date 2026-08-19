@@ -746,7 +746,9 @@ Extension drivers run outside the gateway and expose the
 `compute_driver.proto` gRPC service on a Unix socket. Use a non-reserved driver
 name; built-in names such as `vm`, `docker`, `podman`, and `kubernetes` cannot
 be selected through unmanaged socket endpoints. The selected driver name is the
-key used for driver-owned sandbox config such as `template.driver_config.<name>`.
+key used for driver-owned sandbox template config such as
+`SandboxTemplate.spec.driver_config.<name>`. Attach driver-owned config through
+`openshell sandbox template create --driver-config-json`.
 
 ```toml
 [openshell]

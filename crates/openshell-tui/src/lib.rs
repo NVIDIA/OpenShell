@@ -1376,14 +1376,10 @@ fn spawn_create_sandbox(app: &mut App, tx: mpsc::UnboundedSender<Event>) {
 
     tokio::spawn(async move {
         let has_custom_image = !image.is_empty();
-        let template = if has_custom_image {
-            let resolved = openshell_core::image::resolve_community_image(&image);
-            Some(openshell_core::proto::SandboxTemplate {
-                image: resolved,
-                ..Default::default()
-            })
+        let workload_image = if has_custom_image {
+            openshell_core::image::resolve_community_image(&image)
         } else {
-            None
+            String::new()
         };
 
         // For custom images, provide a restrictive default policy so the
@@ -1398,12 +1394,16 @@ fn spawn_create_sandbox(app: &mut App, tx: mpsc::UnboundedSender<Event>) {
 
         let req = openshell_core::proto::CreateSandboxRequest {
             name,
-            spec: Some(openshell_core::proto::SandboxSpec {
-                providers: selected_providers,
-                template,
-                policy,
-                ..Default::default()
-            }),
+            workload_source: Some(
+                openshell_core::proto::create_sandbox_request::WorkloadSource::Workload(
+                    openshell_core::proto::SandboxWorkloadConfig {
+                        image: workload_image,
+                        ..Default::default()
+                    },
+                ),
+            ),
+            policy,
+            providers: selected_providers,
             labels: HashMap::new(),
             annotations: HashMap::new(),
             workspace: workspace.clone(),
@@ -2517,8 +2517,8 @@ async fn refresh_sandboxes(app: &mut App) {
                 .map(|s| {
                     s.spec
                         .as_ref()
-                        .and_then(|spec| spec.template.as_ref())
-                        .map(|t| t.image.as_str())
+                        .and_then(|spec| spec.workload.as_ref())
+                        .map(|workload| workload.image.as_str())
                         .filter(|img| !img.is_empty())
                         .unwrap_or("-")
                         .to_string()

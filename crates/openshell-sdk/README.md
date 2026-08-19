@@ -9,7 +9,8 @@ gateway-name resolution.
 ## Two layers
 
 - `OpenShellClient` — the curated, sandbox-focused surface: health, sandbox
-  CRUD, readiness/deletion waits, and non-streaming exec.
+  CRUD, template-based creation, sandbox template CRUD, readiness/deletion
+  waits, and non-streaming exec.
 - `raw` — direct access to the generated tonic clients for RPCs the curated
   surface doesn't yet cover (inference, providers, policy, logs, settings, SSH,
   forwarding).
@@ -43,11 +44,14 @@ mTLS (client certificates) is not supported.
 ## Public surface
 
 `OpenShellClient::connect(ClientConfig)` returns a connected client exposing
-`health`, `create_sandbox`, `get_sandbox`, `list_sandboxes`, `delete_sandbox`,
-`wait_ready`, `wait_deleted`, and `exec`. Curated types (`SandboxSpec`,
-`SandboxRef`, `Health`, `ListOptions`, `ExecOptions`, `SandboxPhase`) use
-SDK-shaped enums rather than raw proto integers. Failures map to a typed
-`SdkError` with a discriminable kind.
+`health`, `create_sandbox`, `create_sandbox_from_template`, sandbox template
+CRUD, `get_sandbox`, `list_sandboxes`, `delete_sandbox`, `wait_ready`,
+`wait_deleted`, and `exec`. Curated types (`SandboxSpec`,
+`SandboxTemplateCreateSpec`, `SandboxRef`, `Health`, `ListOptions`,
+`ExecOptions`, `SandboxPhase`) use SDK-shaped enums rather than raw proto
+integers. Template resources use the generated proto shape because templates
+are an administrative resource with driver-specific configuration. Failures map
+to a typed `SdkError` with a discriminable kind.
 
 ## Modules
 

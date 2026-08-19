@@ -127,8 +127,7 @@ def providers_v2_enabled(
     config = stub.GetGatewayConfig(sandbox_pb2.GetGatewayConfigRequest())
     prior_value = sandbox_pb2.SettingValue()
     had_prior = (
-        key in config.settings
-        and config.settings[key].WhichOneof("value") is not None
+        key in config.settings and config.settings[key].WhichOneof("value") is not None
     )
     if had_prior:
         prior_value.CopyFrom(config.settings[key])
@@ -326,9 +325,7 @@ def test_nvidia_provider_injects_nvidia_api_key_env_var(
         with sandbox(spec=spec, delete_on_exit=True) as sb:
             result = sb.exec_python(read_nvidia_key)
             assert result.exit_code == 0, result.stderr
-            assert _is_placeholder_for_env_key(
-                result.stdout.strip(), "NVIDIA_API_KEY"
-            )
+            assert _is_placeholder_for_env_key(result.stdout.strip(), "NVIDIA_API_KEY")
 
 
 def test_attach_detach_updates_credentials_for_later_exec_launches(
@@ -420,7 +417,11 @@ def test_create_sandbox_rejects_unknown_provider(
         providers=["nonexistent-provider-xyz"],
     )
     with pytest.raises(grpc.RpcError) as exc_info:
-        sandbox_client.create(workspace="default", spec=spec)
+        sandbox_client.create(
+            workspace="default",
+            policy=spec.policy,
+            providers=list(spec.providers),
+        )
 
     assert exc_info.value.code() == grpc.StatusCode.FAILED_PRECONDITION
     assert "nonexistent-provider-xyz" in (exc_info.value.details() or "")
@@ -446,7 +447,7 @@ def test_credentials_not_in_persisted_spec_environment(
             fetched = sandbox_client._stub.GetSandbox(
                 openshell_pb2.GetSandboxRequest(name=sb.sandbox.name)
             )
-            persisted_env = dict(fetched.sandbox.spec.environment)
+            persisted_env = dict(fetched.sandbox.spec.workload.environment)
             assert "ANTHROPIC_API_KEY" not in persisted_env, (
                 "credentials should not be persisted in sandbox spec environment"
             )

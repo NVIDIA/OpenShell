@@ -2110,7 +2110,7 @@ fn authorize_egress_intent(
         }
     };
 
-    if !crate::opa::network_binary_identity_required() {
+    if !engine.binary_identity_required() {
         let result = evaluate_endpoint_only_opa(engine, intent);
         debug!(
             "authorize_egress_intent endpoint-only: host={} port={} transport={:?} action={:?}",
@@ -2262,7 +2262,7 @@ fn authorize_egress_intent(
     _entrypoint_pid: &AtomicU32,
     intent: EgressIntent,
 ) -> EgressDecision {
-    if !crate::opa::network_binary_identity_required() {
+    if !engine.binary_identity_required() {
         return evaluate_endpoint_only_opa(engine, intent);
     }
 
@@ -6099,8 +6099,12 @@ network_policies:
             executable = executable.display(),
         );
         let engine = Arc::new(
-            OpaEngine::from_strings(include_str!("../data/sandbox-policy.rego"), &data)
-                .expect("load policy"),
+            OpaEngine::from_strings_with_binary_identity_required(
+                include_str!("../data/sandbox-policy.rego"),
+                &data,
+                false,
+            )
+            .expect("load policy"),
         );
         let registry = openshell_supervisor_middleware::MiddlewareRegistry::connect_services(
             vec![openshell_supervisor_middleware::in_process_endpoint(
@@ -6213,8 +6217,12 @@ network_policies:
             executable = executable.display(),
         );
         let engine = Arc::new(
-            OpaEngine::from_strings(include_str!("../data/sandbox-policy.rego"), &data)
-                .expect("load policy"),
+            OpaEngine::from_strings_with_binary_identity_required(
+                include_str!("../data/sandbox-policy.rego"),
+                &data,
+                false,
+            )
+            .expect("load policy"),
         );
         let registry = openshell_supervisor_middleware::MiddlewareRegistry::connect_services(
             openshell_supervisor_middleware_builtins::services(),
@@ -6624,6 +6632,47 @@ network_policies:
             matches!(denied.action, NetworkAction::Deny { .. }),
             "endpoint-only mode must still deny undeclared endpoints"
         );
+    }
+
+    #[test]
+    fn authorize_egress_intent_honors_engine_endpoint_only_mode() {
+        let policy = include_str!("../data/sandbox-policy.rego");
+        let data = r#"
+network_policies:
+  test_endpoint:
+    name: test_endpoint
+    endpoints:
+      - host: api.example.test
+        port: 443
+    binaries:
+      - path: /does/not/matter
+"#;
+        let engine = OpaEngine::from_strings_with_binary_identity_required(policy, data, false)
+            .expect("endpoint-only engine");
+        let connection = crate::procfs::WorkloadProxyTcpConnection::new(
+            "127.0.0.1:50000".parse().unwrap(),
+            "127.0.0.1:3128".parse().unwrap(),
+        );
+
+        let decision = authorize_egress_intent(
+            connection,
+            &engine,
+            &BinaryIdentityCache::new(),
+            &AtomicU32::new(0),
+            EgressIntent::connect("api.example.test".to_string(), 443),
+        );
+
+        assert_eq!(
+            decision.action,
+            NetworkAction::Allow {
+                matched_policy: Some("test_endpoint".to_string()),
+            }
+        );
+        assert_eq!(
+            decision.identity,
+            ProcessIdentityEvidence::Unavailable(IdentityUnavailableReason::EndpointOnlyMode)
+        );
+        assert!(decision.binary.is_none());
     }
 
     fn websocket_l7_config(

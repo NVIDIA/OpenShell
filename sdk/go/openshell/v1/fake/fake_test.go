@@ -38,7 +38,18 @@ func TestFakeClient_Sandboxes_AfterClose(t *testing.T) {
 
 	_ = fc.Close()
 
-	_, err := fc.Sandboxes().Create(ctx, "default", "test", &types.SandboxSpec{}, nil)
+	_, err := fc.Sandboxes().Create(ctx, "default", "test", nil, nil, nil, nil)
+	require.Error(t, err)
+	assert.True(t, types.IsUnavailable(err))
+}
+
+func TestFakeClient_SandboxTemplates_AfterClose(t *testing.T) {
+	fc := NewClient()
+	ctx := context.Background()
+
+	_ = fc.Close()
+
+	_, err := fc.SandboxTemplates().Create(ctx, "default", &types.SandboxTemplate{Name: "gpu-kata"})
 	require.Error(t, err)
 	assert.True(t, types.IsUnavailable(err))
 }
@@ -116,6 +127,7 @@ func TestFakeClient_SubClients(t *testing.T) {
 	fc := NewClient()
 
 	assert.NotNil(t, fc.Sandboxes())
+	assert.NotNil(t, fc.SandboxTemplates())
 	assert.NotNil(t, fc.Providers())
 	assert.NotNil(t, fc.Exec())
 	assert.NotNil(t, fc.Files())
@@ -130,7 +142,9 @@ func TestFakeClient_AddSandbox(t *testing.T) {
 
 	sb := &types.Sandbox{
 		Name: "pre-seeded",
-		Spec: types.SandboxSpec{LogLevel: "debug"},
+		Spec: types.SandboxSpec{
+			Workload: &types.SandboxWorkloadConfig{Image: "preseed:v1"},
+		},
 		Status: types.SandboxStatus{
 			Phase: types.SandboxReady,
 		},
@@ -141,7 +155,8 @@ func TestFakeClient_AddSandbox(t *testing.T) {
 	got, err := fc.Sandboxes().Get(ctx, "default", "pre-seeded")
 	require.NoError(t, err)
 	assert.Equal(t, "pre-seeded", got.Name)
-	assert.Equal(t, "debug", got.Spec.LogLevel)
+	require.NotNil(t, got.Spec.Workload)
+	assert.Equal(t, "preseed:v1", got.Spec.Workload.Image)
 	assert.Equal(t, types.SandboxReady, got.Status.Phase)
 }
 

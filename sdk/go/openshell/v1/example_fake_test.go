@@ -104,7 +104,7 @@ func ExampleNewClient_watchEvents() {
 	defer watcher.Stop()
 
 	// Create triggers an ADDED event
-	_, err = client.Sandboxes().Create(ctx, "default", "my-sandbox", &v1.SandboxSpec{}, nil)
+	_, err = client.Sandboxes().Create(ctx, "default", "my-sandbox", nil, nil, nil, nil)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -135,7 +135,7 @@ func ExampleNewClient_stopOnTerminal() {
 	}
 
 	// Create and transition to Ready
-	_, err = client.Sandboxes().Create(ctx, "default", "my-sandbox", &v1.SandboxSpec{}, nil)
+	_, err = client.Sandboxes().Create(ctx, "default", "my-sandbox", nil, nil, nil, nil)
 	if err != nil {
 		log.Fatal(err)
 	}

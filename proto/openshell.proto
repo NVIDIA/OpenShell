@@ -6,6 +6,7 @@ syntax = "proto3";
 package openshell.v1;
 
 import "datamodel.proto";
+import "google/protobuf/duration.proto";
 import "google/protobuf/struct.proto";
 import "options.proto";
 import "sandbox.proto";
@@ -66,6 +67,46 @@ service OpenShell {
       auth_mode: "bearer"
       scope: "sandbox:read"
       workspace_role: "user"
+    };
+  }
+
+  // Create a reusable sandbox workload template.
+  rpc CreateSandboxTemplate(CreateSandboxTemplateRequest)
+      returns (SandboxTemplateResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "sandbox:write"
+      workspace_role: "admin"
+    };
+  }
+
+  // Fetch a sandbox workload template by name.
+  rpc GetSandboxTemplate(GetSandboxTemplateRequest)
+      returns (SandboxTemplateResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "sandbox:read"
+      workspace_role: "user"
+    };
+  }
+
+  // List sandbox workload templates.
+  rpc ListSandboxTemplates(ListSandboxTemplatesRequest)
+      returns (ListSandboxTemplatesResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "sandbox:read"
+      workspace_role: "user"
+    };
+  }
+
+  // Delete a sandbox workload template by name.
+  rpc DeleteSandboxTemplate(DeleteSandboxTemplateRequest)
+      returns (DeleteSandboxTemplateResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "sandbox:write"
+      workspace_role: "admin"
     };
   }
 
@@ -789,77 +830,80 @@ message Sandbox {
   SandboxSpec spec = 2;
   // Latest user-facing observed status derived by the gateway.
   SandboxStatus status = 3;
+  // Read-only provenance for sandboxes created from a named template.
+  SandboxTemplateProvenance created_from_template = 4;
 
-  reserved 4, 5;
+  reserved 5;
   reserved "phase", "current_policy_version";
 }
 
-// Desired sandbox configuration provided through the public API.
+// Resolved desired sandbox configuration stored by the gateway.
 message SandboxSpec {
-  // Log level exposed to processes running inside the sandbox.
-  string log_level = 1;
-  // Environment variables injected into the sandbox runtime.
-  map<string, string> environment = 5;
-  // Container or VM template used to provision the sandbox.
-  SandboxTemplate template = 6;
+  // Portable workload shape used to provision the sandbox.
+  SandboxWorkloadConfig workload = 12;
+  // Driver-keyed opaque config envelope resolved at create time.
+  google.protobuf.Struct driver_config = 13;
   // Required sandbox policy configuration.
-  openshell.sandbox.v1.SandboxPolicy policy = 7;
+  openshell.sandbox.v1.SandboxPolicy policy = 14;
   // Provider names to attach to this sandbox.
-  repeated string providers = 8;
+  repeated string providers = 15;
+  reserved 1, 5, 6, 7, 8, 9, 10, 11;
+  reserved "environment", "gpu_device", "log_level", "proposal_approval_mode",
+      "resource_requirements", "template";
+}
+
+message SandboxWorkloadConfig {
+  // Fully-qualified OCI image reference used to boot the sandbox.
+  string image = 1;
+  // Environment variables injected into the sandbox runtime.
+  map<string, string> environment = 2;
   // Portable resource requirements used by the gateway for driver selection
   // and by drivers for provisioning.
-  ResourceRequirements resource_requirements = 9;
+  SandboxResources resources = 3;
   reserved 10;
   reserved "gpu_device";
-  // Field 11 was `proposal_approval_mode`. The approval mode is now a
-  // runtime setting (gateway or sandbox scope) read via UpdateConfig /
-  // GetSandboxConfig, so it can be flipped on a running sandbox and
-  // managed fleet-wide.
   reserved 11;
   reserved "proposal_approval_mode";
 }
 
-message ResourceRequirements {
-  // GPU requirements for the sandbox. Presence indicates a GPU request.
-  GpuResourceRequirements gpu = 1;
+message SandboxResources {
+  // Portable CPU quantity, for example "500m" or "2".
+  string cpu = 1;
+  // Portable memory quantity, for example "512Mi" or "2Gi".
+  string memory = 2;
+  // Optional number of GPUs requested.
+  optional uint32 gpu_count = 3;
 }
 
-// Public GPU resource requirements.
-message GpuResourceRequirements {
-  // Optional number of GPUs requested. When omitted, the request is for one
-  // GPU using the selected driver's default assignment behavior.
-  optional uint32 count = 1;
-}
-
-// Public sandbox template mapped onto compute-driver template inputs.
+// Reusable sandbox template resource scoped to a workspace.
 message SandboxTemplate {
-  // Fully-qualified OCI image reference used to boot the sandbox.
-  string image = 1;
-  // Optional runtime class name requested from the compute platform.
-  string runtime_class_name = 2;
-  // Optional agent socket path exposed to the workload.
-  string agent_socket = 3;
-  // Labels applied to compute-platform resources for this sandbox.
-  map<string, string> labels = 4;
-  // Annotations applied to compute-platform resources for this sandbox.
-  map<string, string> annotations = 5;
-  // Additional environment variables injected by the template.
-  map<string, string> environment = 6;
-  // Platform-specific compute resource requirements and limits.
-  google.protobuf.Struct resources = 7;
-  reserved 9;
-  reserved "volume_claim_templates";
-  // Enable Kubernetes user namespace isolation (hostUsers: false).
-  // When true, container UID 0 maps to a non-root host UID and capabilities
-  // become namespaced. Requires Kubernetes 1.33+ with user namespace support
-  // available (beta through 1.35, GA in 1.36+) and a supporting runtime.
-  // When unset, the cluster-wide default is used.
-  optional bool user_namespaces = 10;
-  // Driver-keyed opaque config envelope supplied by the caller.
-  // The gateway selects the block matching the active compute driver and
-  // forwards only that inner Struct to DriverSandboxTemplate.driver_config.
-  // The selected driver owns nested schema validation.
-  google.protobuf.Struct driver_config = 11;
+  // Kubernetes-style metadata (id, name, labels, timestamps, resource version).
+  openshell.datamodel.v1.ObjectMeta metadata = 1;
+  // Desired reusable workload shape.
+  SandboxTemplateSpec spec = 2;
+}
+
+message SandboxTemplateSpec {
+  // Portable workload shape.
+  SandboxWorkloadConfig workload = 1;
+  // Driver-keyed opaque config envelope supplied by the template owner.
+  google.protobuf.Struct driver_config = 2;
+  // Desired service level associated with this template.
+  SandboxServiceLevel desired_service_level = 3;
+}
+
+message SandboxServiceLevel {
+  SandboxStartup startup = 1;
+}
+
+message SandboxStartup {
+  google.protobuf.Duration ready_within = 1;
+  uint32 max_burst = 2;
+}
+
+message SandboxTemplateProvenance {
+  string name = 1;
+  string resource_version = 2;
 }
 
 // User-facing sandbox status derived by the gateway from compute-driver observations.
@@ -930,15 +974,65 @@ message PlatformEvent {
 
 // Create sandbox request.
 message CreateSandboxRequest {
-  SandboxSpec spec = 1;
+  oneof workload_source {
+    // Inline portable workload config for this sandbox.
+    SandboxWorkloadConfig workload = 6;
+    // Workspace-scoped template name to resolve at creation time.
+    string workload_template_name = 7;
+  }
+  // Required sandbox policy configuration.
+  openshell.sandbox.v1.SandboxPolicy policy = 8;
+  // Provider names to attach to this sandbox.
+  repeated string providers = 9;
   // Optional user-supplied sandbox name. When empty the server generates one.
-  string name = 2;
+  string name = 10;
   // Optional labels for the sandbox (key-value metadata).
-  map<string, string> labels = 3;
+  map<string, string> labels = 11;
   // Optional annotations for the sandbox (non-selector metadata).
-  map<string, string> annotations = 4;
+  map<string, string> annotations = 12;
   // Workspace for the sandbox. Empty defaults to "default".
-  string workspace = 5;
+  string workspace = 13;
+  reserved 1, 2, 3, 4, 5;
+  reserved "spec";
+}
+
+message CreateSandboxTemplateRequest {
+  SandboxTemplate template = 1;
+  // Workspace for the template. Empty defaults to "default".
+  string workspace = 2;
+}
+
+message GetSandboxTemplateRequest {
+  string name = 1;
+  // Workspace scope. Empty defaults to "default".
+  string workspace = 2;
+}
+
+message ListSandboxTemplatesRequest {
+  uint32 limit = 1;
+  uint32 offset = 2;
+  // Workspace scope. Empty defaults to "default".
+  string workspace = 3;
+  // List across all workspaces. Mutually exclusive with workspace.
+  bool all_workspaces = 4;
+}
+
+message DeleteSandboxTemplateRequest {
+  string name = 1;
+  // Workspace scope. Empty defaults to "default".
+  string workspace = 2;
+}
+
+message SandboxTemplateResponse {
+  SandboxTemplate template = 1;
+}
+
+message ListSandboxTemplatesResponse {
+  repeated SandboxTemplate templates = 1;
+}
+
+message DeleteSandboxTemplateResponse {
+  bool deleted = 1;
 }
 
 // Get sandbox request.

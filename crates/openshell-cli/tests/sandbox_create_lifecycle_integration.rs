@@ -14,19 +14,22 @@ use openshell_cli::tls::TlsOptions;
 use openshell_core::proto::open_shell_server::{OpenShell, OpenShellServer};
 use openshell_core::proto::{
     AttachSandboxProviderRequest, AttachSandboxProviderResponse, CreateProviderRequest,
-    CreateSandboxRequest, CreateSshSessionRequest, CreateSshSessionResponse, DeleteProviderRequest,
-    DeleteProviderResponse, DeleteSandboxRequest, DeleteSandboxResponse,
+    CreateSandboxRequest, CreateSandboxTemplateRequest, CreateSshSessionRequest,
+    CreateSshSessionResponse, DeleteProviderRequest, DeleteProviderResponse, DeleteSandboxRequest,
+    DeleteSandboxResponse, DeleteSandboxTemplateRequest, DeleteSandboxTemplateResponse,
     DetachSandboxProviderRequest, DetachSandboxProviderResponse, ExecSandboxEvent,
     ExecSandboxInput, ExecSandboxRequest, GatewayMessage, GetGatewayConfigRequest,
     GetGatewayConfigResponse, GetProviderRequest, GetSandboxConfigRequest,
     GetSandboxConfigResponse, GetSandboxProviderEnvironmentRequest,
-    GetSandboxProviderEnvironmentResponse, GetSandboxRequest, GpuResourceRequirements,
+    GetSandboxProviderEnvironmentResponse, GetSandboxRequest, GetSandboxTemplateRequest,
     HealthRequest, HealthResponse, ListProvidersRequest, ListProvidersResponse,
-    ListSandboxProvidersRequest, ListSandboxProvidersResponse, ListSandboxesRequest,
-    ListSandboxesResponse, PlatformEvent, ProviderResponse, RevokeSshSessionRequest,
-    RevokeSshSessionResponse, Sandbox, SandboxCondition, SandboxLogLine, SandboxPhase,
-    SandboxResponse, SandboxStatus, SandboxStreamEvent, ServiceStatus, SettingValue,
-    SupervisorMessage, UpdateProviderRequest, WatchSandboxRequest, sandbox_stream_event,
+    ListSandboxProvidersRequest, ListSandboxProvidersResponse, ListSandboxTemplatesRequest,
+    ListSandboxTemplatesResponse, ListSandboxesRequest, ListSandboxesResponse, ObjectMeta,
+    PlatformEvent, Provider, ProviderResponse, RevokeSshSessionRequest, RevokeSshSessionResponse,
+    Sandbox, SandboxCondition, SandboxLogLine, SandboxPhase, SandboxResponse, SandboxServiceLevel,
+    SandboxStartup, SandboxStatus, SandboxStreamEvent, SandboxTemplate, SandboxTemplateResponse,
+    SandboxTemplateSpec, SandboxWorkloadConfig, ServiceStatus, SettingValue, SupervisorMessage,
+    UpdateProviderRequest, WatchSandboxRequest, create_sandbox_request, sandbox_stream_event,
     setting_value,
 };
 use std::collections::HashMap;
@@ -46,6 +49,10 @@ use tonic::{Response, Status};
 struct SandboxState {
     deleted_names: Arc<Mutex<Vec<Vec<String>>>>,
     create_requests: Arc<Mutex<Vec<CreateSandboxRequest>>>,
+    create_template_requests: Arc<Mutex<Vec<CreateSandboxTemplateRequest>>>,
+    get_template_requests: Arc<Mutex<Vec<GetSandboxTemplateRequest>>>,
+    list_template_requests: Arc<Mutex<Vec<ListSandboxTemplatesRequest>>>,
+    delete_template_requests: Arc<Mutex<Vec<DeleteSandboxTemplateRequest>>>,
     vm_error_after_started: Arc<AtomicBool>,
     vm_slow_progress_before_ready: Arc<AtomicBool>,
     vm_log_churn_before_ready: Arc<AtomicBool>,
@@ -56,6 +63,38 @@ struct SandboxState {
 #[derive(Clone, Default)]
 struct TestOpenShell {
     state: SandboxState,
+}
+
+fn test_template(name: &str, workspace: &str) -> SandboxTemplate {
+    SandboxTemplate {
+        metadata: Some(ObjectMeta {
+            id: format!("template-{name}"),
+            name: name.to_string(),
+            created_at_ms: 0,
+            labels: HashMap::new(),
+            resource_version: 1,
+            annotations: HashMap::new(),
+            workspace: workspace.to_string(),
+            deletion_timestamp_ms: 0,
+        }),
+        spec: Some(SandboxTemplateSpec {
+            workload: Some(SandboxWorkloadConfig {
+                image: "python:3.12".to_string(),
+                environment: HashMap::new(),
+                resources: None,
+            }),
+            driver_config: None,
+            desired_service_level: Some(SandboxServiceLevel {
+                startup: Some(SandboxStartup {
+                    ready_within: Some(prost_types::Duration {
+                        seconds: 30,
+                        nanos: 0,
+                    }),
+                    max_burst: 5,
+                }),
+            }),
+        }),
+    }
 }
 
 #[tonic::async_trait]
@@ -98,7 +137,7 @@ impl OpenShell for TestOpenShell {
         };
 
         let mut sandbox = Sandbox {
-            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+            metadata: Some(ObjectMeta {
                 id: format!("id-{sandbox_name}"),
                 name: sandbox_name,
                 created_at_ms: 0,
@@ -136,7 +175,7 @@ impl OpenShell for TestOpenShell {
     ) -> Result<Response<SandboxResponse>, Status> {
         let name = request.into_inner().name;
         let mut sandbox = Sandbox {
-            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+            metadata: Some(ObjectMeta {
                 id: format!("id-{name}"),
                 name,
                 created_at_ms: 0,
@@ -159,6 +198,81 @@ impl OpenShell for TestOpenShell {
         _request: tonic::Request<ListSandboxesRequest>,
     ) -> Result<Response<ListSandboxesResponse>, Status> {
         Ok(Response::new(ListSandboxesResponse::default()))
+    }
+
+    async fn create_sandbox_template(
+        &self,
+        request: tonic::Request<CreateSandboxTemplateRequest>,
+    ) -> Result<Response<SandboxTemplateResponse>, Status> {
+        let request = request.into_inner();
+        let mut template = request.template.clone().unwrap_or_default();
+        if template.metadata.is_none() {
+            template.metadata = Some(ObjectMeta::default());
+        }
+        if let Some(metadata) = template.metadata.as_mut() {
+            if metadata.id.is_empty() {
+                metadata.id = format!("template-{}", metadata.name);
+            }
+            if metadata.workspace.is_empty() {
+                metadata.workspace.clone_from(&request.workspace);
+            }
+            metadata.resource_version = metadata.resource_version.max(1);
+        }
+        self.state
+            .create_template_requests
+            .lock()
+            .await
+            .push(request);
+        Ok(Response::new(SandboxTemplateResponse {
+            template: Some(template),
+        }))
+    }
+
+    async fn get_sandbox_template(
+        &self,
+        request: tonic::Request<GetSandboxTemplateRequest>,
+    ) -> Result<Response<SandboxTemplateResponse>, Status> {
+        let request = request.into_inner();
+        self.state
+            .get_template_requests
+            .lock()
+            .await
+            .push(request.clone());
+        Ok(Response::new(SandboxTemplateResponse {
+            template: Some(test_template(&request.name, &request.workspace)),
+        }))
+    }
+
+    async fn list_sandbox_templates(
+        &self,
+        request: tonic::Request<ListSandboxTemplatesRequest>,
+    ) -> Result<Response<ListSandboxTemplatesResponse>, Status> {
+        let request = request.into_inner();
+        self.state
+            .list_template_requests
+            .lock()
+            .await
+            .push(request.clone());
+        Ok(Response::new(ListSandboxTemplatesResponse {
+            templates: vec![
+                test_template("python", &request.workspace),
+                test_template("gpu-kata", &request.workspace),
+            ],
+        }))
+    }
+
+    async fn delete_sandbox_template(
+        &self,
+        request: tonic::Request<DeleteSandboxTemplateRequest>,
+    ) -> Result<Response<DeleteSandboxTemplateResponse>, Status> {
+        self.state
+            .delete_template_requests
+            .lock()
+            .await
+            .push(request.into_inner());
+        Ok(Response::new(DeleteSandboxTemplateResponse {
+            deleted: true,
+        }))
     }
 
     async fn list_sandbox_providers(
@@ -294,7 +408,21 @@ impl OpenShell for TestOpenShell {
         &self,
         _request: tonic::Request<ListProvidersRequest>,
     ) -> Result<Response<ListProvidersResponse>, Status> {
-        Ok(Response::new(ListProvidersResponse::default()))
+        Ok(Response::new(ListProvidersResponse {
+            providers: vec![Provider {
+                metadata: Some(ObjectMeta {
+                    id: "id-github".to_string(),
+                    name: "github".to_string(),
+                    ..ObjectMeta::default()
+                }),
+                r#type: "github".to_string(),
+                credentials: HashMap::new(),
+                config: HashMap::new(),
+                credential_expires_at_ms: HashMap::new(),
+                profile_workspace: "default".to_string(),
+                credential_handles: HashMap::new(),
+            }],
+        }))
     }
 
     async fn list_provider_profiles(
@@ -402,7 +530,7 @@ impl OpenShell for TestOpenShell {
 
         tokio::spawn(async move {
             let mut provisioning = Sandbox {
-                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                metadata: Some(ObjectMeta {
                     id: sandbox_id.clone(),
                     name: sandbox_id.trim_start_matches("id-").to_string(),
                     created_at_ms: 0,
@@ -1128,6 +1256,46 @@ async fn create_requests(server: &TestServer) -> Vec<CreateSandboxRequest> {
     server.openshell.state.create_requests.lock().await.clone()
 }
 
+async fn create_template_requests(server: &TestServer) -> Vec<CreateSandboxTemplateRequest> {
+    server
+        .openshell
+        .state
+        .create_template_requests
+        .lock()
+        .await
+        .clone()
+}
+
+async fn get_template_requests(server: &TestServer) -> Vec<GetSandboxTemplateRequest> {
+    server
+        .openshell
+        .state
+        .get_template_requests
+        .lock()
+        .await
+        .clone()
+}
+
+async fn list_template_requests(server: &TestServer) -> Vec<ListSandboxTemplatesRequest> {
+    server
+        .openshell
+        .state
+        .list_template_requests
+        .lock()
+        .await
+        .clone()
+}
+
+async fn delete_template_requests(server: &TestServer) -> Vec<DeleteSandboxTemplateRequest> {
+    server
+        .openshell
+        .state
+        .delete_template_requests
+        .lock()
+        .await
+        .clone()
+}
+
 async fn enable_providers_v2(server: &TestServer) {
     server.openshell.state.global_settings.lock().await.insert(
         openshell_core::settings::PROVIDERS_V2_ENABLED_KEY.to_string(),
@@ -1141,8 +1309,15 @@ fn test_tls(server: &TestServer) -> TlsOptions {
     server.tls.with_gateway_name("openshell")
 }
 
-fn gpu_requirements(count: Option<u32>) -> GpuResourceRequirements {
-    GpuResourceRequirements { count }
+fn gpu_requirements(count: Option<u32>) -> u32 {
+    count.unwrap_or(1)
+}
+
+fn inline_workload(request: &CreateSandboxRequest) -> &SandboxWorkloadConfig {
+    match request.workload_source.as_ref() {
+        Some(create_sandbox_request::WorkloadSource::Workload(workload)) => workload,
+        other => panic!("expected inline workload, got {other:?}"),
+    }
 }
 
 /// Shared defaults for integration tests. Note: `keep` is `true` here (most
@@ -1249,49 +1424,16 @@ async fn sandbox_create_sends_cpu_and_memory_limits_only() {
     .expect("sandbox create should succeed");
 
     let requests = create_requests(&server).await;
-    let resources = requests[0]
-        .spec
+    let resources = inline_workload(&requests[0])
+        .resources
         .as_ref()
-        .and_then(|spec| spec.template.as_ref())
-        .and_then(|template| template.resources.as_ref())
         .expect("resource limits should be sent");
-    let limits = resources
-        .fields
-        .get("limits")
-        .and_then(|value| value.kind.as_ref())
-        .and_then(|kind| match kind {
-            prost_types::value::Kind::StructValue(inner) => Some(inner),
-            _ => None,
-        })
-        .expect("limits should be a struct");
-
-    assert_eq!(
-        limits
-            .fields
-            .get("cpu")
-            .and_then(|value| value.kind.as_ref())
-            .and_then(|kind| match kind {
-                prost_types::value::Kind::StringValue(value) => Some(value.as_str()),
-                _ => None,
-            }),
-        Some("500m")
-    );
-    assert_eq!(
-        limits
-            .fields
-            .get("memory")
-            .and_then(|value| value.kind.as_ref())
-            .and_then(|kind| match kind {
-                prost_types::value::Kind::StringValue(value) => Some(value.as_str()),
-                _ => None,
-            }),
-        Some("2Gi")
-    );
-    assert!(!resources.fields.contains_key("requests"));
+    assert_eq!(resources.cpu, "500m");
+    assert_eq!(resources.memory, "2Gi");
 }
 
 #[tokio::test]
-async fn sandbox_create_sends_driver_config_json() {
+async fn sandbox_create_rejects_direct_driver_config_json() {
     let server = run_server().await;
     let fake_ssh_dir = tempfile::tempdir().unwrap();
     let xdg_dir = tempfile::tempdir().unwrap();
@@ -1299,7 +1441,7 @@ async fn sandbox_create_sends_driver_config_json() {
     let tls = test_tls(&server);
     install_fake_ssh(&fake_ssh_dir);
 
-    run::sandbox_create(
+    let err = run::sandbox_create(
         &server.endpoint,
         "openshell",
         run::SandboxCreateConfig {
@@ -1314,44 +1456,239 @@ async fn sandbox_create_sends_driver_config_json() {
         &tls,
     )
     .await
-    .expect("sandbox create should succeed");
+    .expect_err("inline driver config should be rejected");
+    assert!(
+        err.to_string()
+            .contains("--driver-config-json is only supported through named sandbox templates"),
+        "unexpected error: {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn sandbox_create_with_template_sends_workload_template_provider_and_policy() {
+    let server = run_server().await;
+    let fake_ssh_dir = tempfile::tempdir().unwrap();
+    let xdg_dir = tempfile::tempdir().unwrap();
+    let _env = test_env(&fake_ssh_dir, &xdg_dir);
+    let tls = test_tls(&server);
+    install_fake_ssh(&fake_ssh_dir);
+    let providers = vec!["github".to_string()];
+    let policy_path = xdg_dir.path().join("policy.yaml");
+    fs::write(
+        &policy_path,
+        openshell_policy::serialize_sandbox_policy(&openshell_policy::restrictive_default_policy())
+            .expect("default policy should serialize"),
+    )
+    .unwrap();
+    let policy_path = policy_path.to_string_lossy().to_string();
+
+    run::sandbox_create(
+        &server.endpoint,
+        "openshell",
+        run::SandboxCreateConfig {
+            name: Some("templated"),
+            template: Some("gpu-kata"),
+            providers: &providers,
+            policy: Some(&policy_path),
+            command: &["echo".into(), "OK".into()],
+            ..test_config()
+        },
+        "team-a",
+        &tls,
+    )
+    .await
+    .expect("sandbox create from template should succeed");
 
     let requests = create_requests(&server).await;
-    let driver_config = requests[0]
+    assert_eq!(requests.len(), 1);
+    assert!(matches!(
+        requests[0].workload_source.as_ref(),
+        Some(create_sandbox_request::WorkloadSource::WorkloadTemplateName(name)) if name == "gpu-kata"
+    ));
+    assert!(
+        requests[0].policy.is_some(),
+        "template-based sandbox creates should still send policy"
+    );
+    assert_eq!(requests[0].providers, vec!["github".to_string()]);
+    assert_eq!(requests[0].workspace, "team-a");
+}
+
+#[tokio::test]
+async fn sandbox_template_create_sends_template_spec() {
+    let server = run_server().await;
+    let tls = test_tls(&server);
+    let mut environment = HashMap::new();
+    environment.insert("MODE".to_string(), "on".to_string());
+    let mut labels = HashMap::new();
+    labels.insert("tier".to_string(), "gold".to_string());
+    let mut annotations = HashMap::new();
+    annotations.insert("owner".to_string(), "platform".to_string());
+
+    run::sandbox_template_create(
+        &server.endpoint,
+        run::SandboxTemplateCreateConfig {
+            name: "gpu-kata".to_string(),
+            from: Some("cuda:latest".to_string()),
+            environment,
+            cpu: Some("2".to_string()),
+            memory: Some("8Gi".to_string()),
+            gpu_count: Some(2),
+            driver_config_json: Some(
+                r#"{"kubernetes":{"pod":{"runtime_class_name":"kata-containers"}}}"#.to_string(),
+            ),
+            ready_within: Some("30s".to_string()),
+            max_burst: Some(5),
+            labels,
+            annotations,
+            output: "json".to_string(),
+        },
+        "team-a",
+        &tls,
+    )
+    .await
+    .expect("sandbox template create should succeed");
+
+    let requests = create_template_requests(&server).await;
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].workspace, "team-a");
+    let template = requests[0]
+        .template
+        .as_ref()
+        .expect("template should be sent");
+    let metadata = template
+        .metadata
+        .as_ref()
+        .expect("template metadata should be sent");
+    assert_eq!(metadata.name, "gpu-kata");
+    assert_eq!(metadata.workspace, "team-a");
+    assert_eq!(
+        metadata.labels.get("tier").map(String::as_str),
+        Some("gold")
+    );
+    assert_eq!(
+        metadata.annotations.get("owner").map(String::as_str),
+        Some("platform")
+    );
+
+    let spec = template
         .spec
         .as_ref()
-        .and_then(|spec| spec.template.as_ref())
-        .and_then(|template| template.driver_config.as_ref())
-        .expect("driver config should be sent");
-    let kubernetes = driver_config
-        .fields
-        .get("kubernetes")
-        .and_then(|value| value.kind.as_ref())
-        .and_then(|kind| match kind {
-            prost_types::value::Kind::StructValue(inner) => Some(inner),
-            _ => None,
-        })
-        .expect("kubernetes block should be a struct");
-    let pod = kubernetes
-        .fields
-        .get("pod")
-        .and_then(|value| value.kind.as_ref())
-        .and_then(|kind| match kind {
-            prost_types::value::Kind::StructValue(inner) => Some(inner),
-            _ => None,
-        })
-        .expect("pod block should be a struct");
-
+        .expect("template spec should be sent");
+    let workload = spec.workload.as_ref().expect("workload should be sent");
+    assert_eq!(workload.image, "cuda:latest");
     assert_eq!(
-        pod.fields
-            .get("priority_class_name")
-            .and_then(|value| value.kind.as_ref())
-            .and_then(|kind| match kind {
-                prost_types::value::Kind::StringValue(value) => Some(value.as_str()),
-                _ => None,
-            }),
-        Some("batch-low")
+        workload.environment.get("MODE").map(String::as_str),
+        Some("on")
     );
+    let resources = workload
+        .resources
+        .as_ref()
+        .expect("resources should be sent");
+    assert_eq!(resources.cpu, "2");
+    assert_eq!(resources.memory, "8Gi");
+    assert_eq!(resources.gpu_count, Some(2));
+    assert!(
+        spec.driver_config
+            .as_ref()
+            .is_some_and(|config| config.fields.contains_key("kubernetes")),
+        "driver config should keep the kubernetes block"
+    );
+    let startup = spec
+        .desired_service_level
+        .as_ref()
+        .and_then(|level| level.startup.as_ref())
+        .expect("startup service level should be sent");
+    assert_eq!(startup.ready_within.as_ref().map(|d| d.seconds), Some(30));
+    assert_eq!(startup.max_burst, 5);
+}
+
+#[tokio::test]
+async fn sandbox_template_create_omits_service_level_without_startup_flags() {
+    let server = run_server().await;
+    let tls = test_tls(&server);
+
+    run::sandbox_template_create(
+        &server.endpoint,
+        run::SandboxTemplateCreateConfig {
+            name: "python".to_string(),
+            from: None,
+            environment: HashMap::new(),
+            cpu: None,
+            memory: None,
+            gpu_count: None,
+            driver_config_json: None,
+            ready_within: None,
+            max_burst: None,
+            labels: HashMap::new(),
+            annotations: HashMap::new(),
+            output: "json".to_string(),
+        },
+        "team-a",
+        &tls,
+    )
+    .await
+    .expect("sandbox template create should succeed");
+
+    let requests = create_template_requests(&server).await;
+    let spec = requests[0]
+        .template
+        .as_ref()
+        .and_then(|template| template.spec.as_ref())
+        .expect("template spec should be sent");
+    assert_eq!(
+        spec.workload
+            .as_ref()
+            .map(|workload| workload.image.as_str()),
+        Some(""),
+        "omitted --from should leave the image empty for the gateway default"
+    );
+    assert!(
+        spec.desired_service_level.is_none(),
+        "service level should be omitted when startup flags are absent"
+    );
+}
+
+#[tokio::test]
+async fn sandbox_template_get_list_and_delete_send_workspace() {
+    let server = run_server().await;
+    let tls = test_tls(&server);
+
+    run::sandbox_template_get(&server.endpoint, "gpu-kata", "json", "team-a", &tls)
+        .await
+        .expect("sandbox template get should succeed");
+    run::sandbox_template_list(&server.endpoint, 50, 10, "json", "team-a", false, &tls)
+        .await
+        .expect("sandbox template list should succeed");
+    run::sandbox_template_list(&server.endpoint, 100, 0, "json", "default", true, &tls)
+        .await
+        .expect("sandbox template list --all-workspaces should succeed");
+    run::sandbox_template_delete(
+        &server.endpoint,
+        &["gpu-kata".to_string(), "python".to_string()],
+        "team-a",
+        &tls,
+    )
+    .await
+    .expect("sandbox template delete should succeed");
+
+    let get_requests = get_template_requests(&server).await;
+    assert_eq!(get_requests[0].name, "gpu-kata");
+    assert_eq!(get_requests[0].workspace, "team-a");
+    let list_requests = list_template_requests(&server).await;
+    assert_eq!(list_requests[0].limit, 50);
+    assert_eq!(list_requests[0].offset, 10);
+    assert_eq!(list_requests[0].workspace, "team-a");
+    assert!(!list_requests[0].all_workspaces);
+    assert_eq!(list_requests[1].limit, 100);
+    assert_eq!(list_requests[1].offset, 0);
+    assert_eq!(list_requests[1].workspace, "");
+    assert!(list_requests[1].all_workspaces);
+    let delete_requests = delete_template_requests(&server).await;
+    assert_eq!(delete_requests.len(), 2);
+    assert_eq!(delete_requests[0].name, "gpu-kata");
+    assert_eq!(delete_requests[0].workspace, "team-a");
+    assert_eq!(delete_requests[1].name, "python");
+    assert_eq!(delete_requests[1].workspace, "team-a");
 }
 
 #[tokio::test]
@@ -1379,14 +1716,13 @@ async fn sandbox_create_sends_gpu_default_request() {
     .expect("sandbox create should succeed");
 
     let requests = create_requests(&server).await;
-    let gpu = requests[0]
-        .spec
+    let gpu_count = inline_workload(&requests[0])
+        .resources
         .as_ref()
-        .and_then(|spec| spec.resource_requirements.as_ref())
-        .and_then(|requirements| requirements.gpu.as_ref())
+        .and_then(|resources| resources.gpu_count)
         .expect("GPU requirement should be sent");
 
-    assert_eq!(gpu.count, None);
+    assert_eq!(gpu_count, 1);
 }
 
 #[tokio::test]
@@ -1414,14 +1750,13 @@ async fn sandbox_create_sends_gpu_count_request() {
     .expect("sandbox create should succeed");
 
     let requests = create_requests(&server).await;
-    let gpu = requests[0]
-        .spec
+    let gpu_count = inline_workload(&requests[0])
+        .resources
         .as_ref()
-        .and_then(|spec| spec.resource_requirements.as_ref())
-        .and_then(|requirements| requirements.gpu.as_ref())
+        .and_then(|resources| resources.gpu_count)
         .expect("GPU requirement should be sent");
 
-    assert_eq!(gpu.count, Some(2));
+    assert_eq!(gpu_count, 2);
 }
 
 #[tokio::test]
@@ -1450,12 +1785,7 @@ async fn sandbox_create_does_not_infer_command_providers_when_v2_enabled() {
     .expect("sandbox create should succeed without inferred provider");
 
     let requests = create_requests(&server).await;
-    let providers = requests[0]
-        .spec
-        .as_ref()
-        .expect("sandbox spec should be sent")
-        .providers
-        .clone();
+    let providers = requests[0].providers.clone();
     assert!(
         providers.is_empty(),
         "providers v2 should not infer command providers, got {providers:?}"
@@ -1871,11 +2201,7 @@ async fn sandbox_create_sends_environment_variables() {
     .expect("sandbox create should succeed");
 
     let requests = create_requests(&server).await;
-    let environment = &requests[0]
-        .spec
-        .as_ref()
-        .expect("spec should be present")
-        .environment;
+    let environment = &inline_workload(&requests[0]).environment;
     assert_eq!(environment.get("FOO").map(String::as_str), Some("bar"));
     assert_eq!(
         environment.get("BAZ").map(String::as_str),

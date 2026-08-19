@@ -91,9 +91,9 @@ impl From<i32> for SandboxPhase {
 
 /// Caller intent for a new sandbox.
 ///
-/// Only the most commonly used fields are exposed. Callers that need the
-/// full proto surface (volume claim templates, runtime classes, struct
-/// resources, etc.) should drop down to [`crate::raw`].
+/// Only the most commonly used portable fields are exposed. Callers that need
+/// operator-controlled driver config should create a named sandbox template and
+/// launch it with [`SandboxTemplateCreateSpec`].
 #[derive(Clone, Debug, Default)]
 pub struct SandboxSpec {
     /// Optional user-supplied sandbox name. When empty the server generates one.
@@ -106,10 +106,29 @@ pub struct SandboxSpec {
     pub environment: HashMap<String, String>,
     /// Provider names to attach.
     pub providers: Vec<String>,
-    /// Request a GPU. Driver-specific device selection is configured via
-    /// driver config on the raw proto surface (see [`crate::raw`]).
+    /// Request a GPU. Driver-specific device selection is configured through
+    /// named sandbox templates.
     pub gpu: bool,
 }
+
+/// Caller intent for creating a sandbox from a named sandbox template.
+#[derive(Clone, Debug, Default)]
+pub struct SandboxTemplateCreateSpec {
+    /// Optional user-supplied sandbox name. When empty the server generates one.
+    pub name: Option<String>,
+    /// Workspace-scoped template name to resolve at creation time.
+    pub template_name: String,
+    /// Labels attached to the sandbox.
+    pub labels: HashMap<String, String>,
+    /// Provider names to attach.
+    pub providers: Vec<String>,
+}
+
+/// Reusable workspace-scoped sandbox template resource.
+pub type SandboxTemplate = proto::SandboxTemplate;
+
+/// Desired reusable workload shape for a sandbox template.
+pub type SandboxTemplateSpec = proto::SandboxTemplateSpec;
 
 /// Reference to a sandbox owned by the gateway.
 #[derive(Clone, Debug)]
@@ -175,6 +194,17 @@ pub struct ListOptions {
     pub offset: u32,
     /// Optional Kubernetes-style label selector (e.g. `env=prod,team=core`).
     pub label_selector: Option<String>,
+}
+
+/// Options for listing sandbox templates.
+#[derive(Clone, Debug, Default)]
+pub struct SandboxTemplateListOptions {
+    /// Maximum templates to return. `0` defers to the server default.
+    pub limit: u32,
+    /// Offset into the result list.
+    pub offset: u32,
+    /// List across all workspaces. Requires platform-admin permissions.
+    pub all_workspaces: bool,
 }
 
 /// Options for [`crate::client::OpenShellClient::exec`].

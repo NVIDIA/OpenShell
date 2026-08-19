@@ -5,6 +5,11 @@
 
 from __future__ import annotations
 
+from ._proto.openshell_pb2 import (
+    SandboxTemplate,
+    SandboxTemplateSpec,
+    SandboxWorkloadConfig,
+)
 from .sandbox import (
     ExecChunk,
     ExecResult,
@@ -16,6 +21,7 @@ from .sandbox import (
     SandboxRef,
     SandboxSession,
     SandboxStatusRef,
+    SandboxTemplateClient,
     TlsConfig,
     WorkspaceClient,
     WorkspaceRef,
@@ -39,6 +45,10 @@ __all__ = [
     "SandboxRef",
     "SandboxSession",
     "SandboxStatusRef",
+    "SandboxTemplate",
+    "SandboxTemplateClient",
+    "SandboxTemplateSpec",
+    "SandboxWorkloadConfig",
     "TlsConfig",
     "WorkspaceClient",
     "WorkspaceRef",

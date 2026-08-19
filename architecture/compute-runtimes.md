@@ -165,9 +165,11 @@ through the driver configuration. The Helm chart defaults sandbox agents to
 `Unconfined` so runtime/default AppArmor profiles do not block supervisor
 network namespace setup on AppArmor-enabled nodes.
 
-Resource requirements enter the driver layer through `SandboxSpec.resource_requirements`. This includes a set of GPU requirements, where a user
-can request a specific number of GPUs or the driver-specific default behaviour.
-For all in-tree drivers, this is equivalent to selecting a single GPU.
+Resource requirements enter the driver layer through
+`SandboxSpec.workload.resources`. CPU and memory use portable quantity strings,
+and GPU requests use an optional `gpu_count`. For all in-tree drivers, omitting
+the GPU count while requesting GPU access is equivalent to selecting a single
+GPU.
 
 VM runtime state paths are derived only from driver-validated sandbox IDs
 matching `[A-Za-z0-9._-]{1,128}`. The gateway-owned VM driver socket uses a

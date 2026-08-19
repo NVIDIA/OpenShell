@@ -23,31 +23,78 @@ import (
 
 func TestConverterCoversAllProtoFields_SandboxSpec(t *testing.T) {
 	handled := fieldSet{
-		"log_level":             true,
-		"environment":           true,
-		"template":              true,
-		"policy":                true,
-		"providers":             true,
-		"resource_requirements": true,
+		"workload":      true,
+		"driver_config": true,
+		"policy":        true,
+		"providers":     true,
 	}
 
 	assertAllFieldsCovered(t, (&pb.SandboxSpec{}).ProtoReflect().Descriptor(), handled, nil)
 }
 
+func TestConverterCoversAllProtoFields_SandboxWorkloadConfig(t *testing.T) {
+	handled := fieldSet{
+		"image":       true,
+		"environment": true,
+		"resources":   true,
+	}
+
+	assertAllFieldsCovered(t, (&pb.SandboxWorkloadConfig{}).ProtoReflect().Descriptor(), handled, nil)
+}
+
+func TestConverterCoversAllProtoFields_SandboxResources(t *testing.T) {
+	handled := fieldSet{
+		"cpu":       true,
+		"memory":    true,
+		"gpu_count": true,
+	}
+
+	assertAllFieldsCovered(t, (&pb.SandboxResources{}).ProtoReflect().Descriptor(), handled, nil)
+}
+
 func TestConverterCoversAllProtoFields_SandboxTemplate(t *testing.T) {
 	handled := fieldSet{
-		"image":              true,
-		"runtime_class_name": true,
-		"agent_socket":       true,
-		"labels":             true,
-		"annotations":        true,
-		"environment":        true,
-		"resources":          true,
-		"user_namespaces":    true,
-		"driver_config":      true,
+		"metadata": true,
+		"spec":     true,
 	}
 
 	assertAllFieldsCovered(t, (&pb.SandboxTemplate{}).ProtoReflect().Descriptor(), handled, nil)
+}
+
+func TestConverterCoversAllProtoFields_SandboxTemplateSpec(t *testing.T) {
+	handled := fieldSet{
+		"workload":              true,
+		"driver_config":         true,
+		"desired_service_level": true,
+	}
+
+	assertAllFieldsCovered(t, (&pb.SandboxTemplateSpec{}).ProtoReflect().Descriptor(), handled, nil)
+}
+
+func TestConverterCoversAllProtoFields_SandboxServiceLevel(t *testing.T) {
+	handled := fieldSet{
+		"startup": true,
+	}
+
+	assertAllFieldsCovered(t, (&pb.SandboxServiceLevel{}).ProtoReflect().Descriptor(), handled, nil)
+}
+
+func TestConverterCoversAllProtoFields_SandboxStartup(t *testing.T) {
+	handled := fieldSet{
+		"ready_within": true,
+		"max_burst":    true,
+	}
+
+	assertAllFieldsCovered(t, (&pb.SandboxStartup{}).ProtoReflect().Descriptor(), handled, nil)
+}
+
+func TestConverterCoversAllProtoFields_SandboxTemplateProvenance(t *testing.T) {
+	handled := fieldSet{
+		"name":             true,
+		"resource_version": true,
+	}
+
+	assertAllFieldsCovered(t, (&pb.SandboxTemplateProvenance{}).ProtoReflect().Descriptor(), handled, nil)
 }
 
 func TestConverterCoversAllProtoFields_SandboxStatus(t *testing.T) {

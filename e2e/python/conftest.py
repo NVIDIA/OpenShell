@@ -41,9 +41,7 @@ def _gateway_config_guard(
     (``getbasetemp().parent``), which is common to all xdist workers.
     """
     lock_path = tmp_path_factory.getbasetemp().parent / "gateway-config.lock"
-    exclusive = (
-        request.node.get_closest_marker("exclusive_gateway_config") is not None
-    )
+    exclusive = request.node.get_closest_marker("exclusive_gateway_config") is not None
     with lock_path.open("w") as lock_file:
         fcntl.flock(lock_file, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
         yield
@@ -88,17 +86,45 @@ def ensure_sandbox_persistence_ready(sandbox_client: SandboxClient) -> None:
 @pytest.fixture
 def sandbox(cluster_name: str | None) -> Callable[..., Sandbox]:
     def _create(*, spec: object | None = None, delete_on_exit: bool = True) -> Sandbox:
+        create_kwargs = _sandbox_create_kwargs_from_spec(spec)
         return Sandbox(
             workspace="default",
             cluster=cluster_name,
-            spec=spec,
             delete_on_exit=delete_on_exit,
+            **create_kwargs,
             # The sandbox image is large (Python, Node.js, coding agents) so the
             # first pod in the cluster may need extra time for the image pull.
             ready_timeout_seconds=300.0,
         )
 
     return _create
+
+
+def _sandbox_create_kwargs_from_spec(spec: object | None) -> dict[str, object]:
+    if spec is None:
+        return {}
+    if _has_proto_field(spec, "driver_config"):
+        raise ValueError(
+            "sandbox fixture spec.driver_config is no longer a direct create input; "
+            "create a named sandbox template and use template_name instead"
+        )
+
+    kwargs: dict[str, object] = {}
+    if _has_proto_field(spec, "workload"):
+        kwargs["workload"] = spec.workload
+    if _has_proto_field(spec, "policy"):
+        kwargs["policy"] = spec.policy
+    providers = list(getattr(spec, "providers", ()))
+    if providers:
+        kwargs["providers"] = providers
+    return kwargs
+
+
+def _has_proto_field(message: object, field: str) -> bool:
+    try:
+        return bool(message.HasField(field))  # type: ignore[attr-defined]
+    except ValueError:
+        return False
 
 
 @pytest.fixture(scope="session")

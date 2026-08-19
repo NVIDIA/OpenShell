@@ -9,7 +9,7 @@ use std::sync::RwLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::config::CDI_GPU_DEVICE_ALL;
-use crate::proto::ResourceRequirements as SandboxResourceRequirements;
+use crate::proto::SandboxResources;
 use crate::proto::compute::v1::{
     GpuResourceRequirements as DriverGpuResourceRequirements,
     ResourceRequirements as DriverResourceRequirements,
@@ -17,18 +17,16 @@ use crate::proto::compute::v1::{
 
 /// Return whether sandbox resource requirements request a GPU.
 #[must_use]
-pub fn sandbox_gpu_requested(resources: Option<&SandboxResourceRequirements>) -> bool {
+pub fn sandbox_gpu_requested(resources: Option<&SandboxResources>) -> bool {
     resources
-        .and_then(|resources| resources.gpu.as_ref())
+        .and_then(|resources| resources.gpu_count)
         .is_some()
 }
 
 /// Return the requested sandbox GPU count, if one was specified.
 #[must_use]
-pub fn sandbox_gpu_count(resources: Option<&SandboxResourceRequirements>) -> Option<u32> {
-    resources
-        .and_then(|resources| resources.gpu.as_ref())
-        .and_then(|gpu| gpu.count)
+pub fn sandbox_gpu_count(resources: Option<&SandboxResources>) -> Option<u32> {
+    resources.and_then(|resources| resources.gpu_count)
 }
 
 /// Return the effective compute-driver GPU count.

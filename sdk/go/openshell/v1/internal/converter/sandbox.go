@@ -5,10 +5,12 @@ package converter
 
 import (
 	"fmt"
+	"time"
 
 	"github.com/NVIDIA/OpenShell/sdk/go/openshell/v1/types"
 	dm "github.com/NVIDIA/OpenShell/sdk/go/proto/datamodelv1"
 	pb "github.com/NVIDIA/OpenShell/sdk/go/proto/openshellv1"
+	"google.golang.org/protobuf/types/known/durationpb"
 	"google.golang.org/protobuf/types/known/structpb"
 )
 
@@ -30,6 +32,12 @@ func SandboxFromProto(s *pb.Sandbox) *types.Sandbox {
 		result.Workspace = m.GetWorkspace()
 		result.DeletionTimestamp = TimeFromMillisPtr(m.GetDeletionTimestampMs())
 	}
+	if provenance := s.GetCreatedFromTemplate(); provenance != nil {
+		result.CreatedFromTemplate = &types.SandboxTemplateProvenance{
+			Name:            provenance.GetName(),
+			ResourceVersion: provenance.GetResourceVersion(),
+		}
+	}
 
 	if spec := s.GetSpec(); spec != nil {
 		result.Spec = sandboxSpecFromProto(spec)
@@ -46,38 +54,35 @@ func SandboxFromProto(s *pb.Sandbox) *types.Sandbox {
 
 func sandboxSpecFromProto(spec *pb.SandboxSpec) types.SandboxSpec {
 	result := types.SandboxSpec{
-		LogLevel:    spec.GetLogLevel(),
-		Environment: CopyStringMap(spec.GetEnvironment()),
-		Providers:   CopyStringSlice(spec.GetProviders()),
-		Policy:      SandboxPolicyFromProto(spec.GetPolicy()),
-	}
-
-	if tmpl := spec.GetTemplate(); tmpl != nil {
-		t := &types.SandboxTemplate{
-			Image:            tmpl.GetImage(),
-			RuntimeClassName: tmpl.GetRuntimeClassName(),
-			AgentSocket:      tmpl.GetAgentSocket(),
-			Labels:           CopyStringMap(tmpl.GetLabels()),
-			Annotations:      CopyStringMap(tmpl.GetAnnotations()),
-			Environment:      CopyStringMap(tmpl.GetEnvironment()),
-			UserNamespaces:   CopyBoolPtr(tmpl.UserNamespaces),
-		}
-		if res := tmpl.GetResources(); res != nil {
-			t.Resources = res.AsMap()
-		}
-		if dc := tmpl.GetDriverConfig(); dc != nil {
-			t.DriverConfig = dc.AsMap()
-		}
-		result.Template = t
-	}
-
-	if rr := spec.GetResourceRequirements(); rr != nil {
-		if gpu := rr.GetGpu(); gpu != nil && gpu.Count != nil {
-			result.GPUCount = gpu.Count
-		}
+		Workload:     sandboxWorkloadFromProto(spec.GetWorkload()),
+		DriverConfig: structToMap(spec.GetDriverConfig()),
+		Providers:    CopyStringSlice(spec.GetProviders()),
+		Policy:       SandboxPolicyFromProto(spec.GetPolicy()),
 	}
 
 	return result
+}
+
+func sandboxWorkloadFromProto(workload *pb.SandboxWorkloadConfig) *types.SandboxWorkloadConfig {
+	if workload == nil {
+		return nil
+	}
+	return &types.SandboxWorkloadConfig{
+		Image:       workload.GetImage(),
+		Environment: CopyStringMap(workload.GetEnvironment()),
+		Resources:   sandboxResourcesFromProto(workload.GetResources()),
+	}
+}
+
+func sandboxResourcesFromProto(resources *pb.SandboxResources) *types.SandboxResources {
+	if resources == nil {
+		return nil
+	}
+	return &types.SandboxResources{
+		CPU:      resources.GetCpu(),
+		Memory:   resources.GetMemory(),
+		GPUCount: resources.GpuCount,
+	}
 }
 
 func sandboxStatusFromProto(status *pb.SandboxStatus) types.SandboxStatus {
@@ -152,9 +157,13 @@ func SandboxPhaseToProto(phase types.SandboxPhase) pb.SandboxPhase {
 }
 
 // SandboxToProto converts an SDK Sandbox to a proto Sandbox.
-func SandboxToProto(s *types.Sandbox) *pb.Sandbox {
+func SandboxToProto(s *types.Sandbox) (*pb.Sandbox, error) {
 	if s == nil {
-		return nil
+		return nil, nil
+	}
+	spec, err := SandboxSpecToProto(&s.Spec)
+	if err != nil {
+		return nil, err
 	}
 
 	return &pb.Sandbox{
@@ -168,89 +177,210 @@ func SandboxToProto(s *types.Sandbox) *pb.Sandbox {
 			Workspace:           s.Workspace,
 			DeletionTimestampMs: MillisFromTimePtr(s.DeletionTimestamp),
 		},
-		Spec: SandboxSpecToProto(&s.Spec),
-	}
+		CreatedFromTemplate: sandboxTemplateProvenanceToProto(s.CreatedFromTemplate),
+		Spec:                spec,
+	}, nil
 }
 
 // SandboxSpecToProto converts an SDK SandboxSpec to a proto SandboxSpec.
-func SandboxSpecToProto(spec *types.SandboxSpec) *pb.SandboxSpec {
+func SandboxSpecToProto(spec *types.SandboxSpec) (*pb.SandboxSpec, error) {
 	if spec == nil {
-		return nil
+		return nil, nil
 	}
 
-	result := &pb.SandboxSpec{
-		LogLevel:    spec.LogLevel,
-		Environment: CopyStringMap(spec.Environment),
-		Providers:   CopyStringSlice(spec.Providers),
-		Policy:      SandboxPolicyToProto(spec.Policy),
-	}
-
-	if spec.Template != nil {
-		tmpl := &pb.SandboxTemplate{
-			Image:            spec.Template.Image,
-			RuntimeClassName: spec.Template.RuntimeClassName,
-			AgentSocket:      spec.Template.AgentSocket,
-			Labels:           CopyStringMap(spec.Template.Labels),
-			Annotations:      CopyStringMap(spec.Template.Annotations),
-			Environment:      CopyStringMap(spec.Template.Environment),
-			UserNamespaces:   CopyBoolPtr(spec.Template.UserNamespaces),
-		}
-		if spec.Template.Resources != nil {
-			// Non-JSON-compatible values (e.g., chan, func) are silently dropped.
-			// Round-trip data from structpb.AsMap is always re-serializable.
-			s, err := structpb.NewStruct(spec.Template.Resources)
-			if err == nil {
-				tmpl.Resources = s
-			}
-		}
-		if spec.Template.DriverConfig != nil {
-			s, err := structpb.NewStruct(spec.Template.DriverConfig)
-			if err == nil {
-				tmpl.DriverConfig = s
-			}
-		}
-		result.Template = tmpl
-	}
-
-	if spec.GPUCount != nil {
-		result.ResourceRequirements = &pb.ResourceRequirements{
-			Gpu: &pb.GpuResourceRequirements{
-				Count: spec.GPUCount,
-			},
-		}
-	}
-
-	return result
-}
-
-// SandboxSpecToProtoChecked converts an SDK SandboxSpec and reports values
-// that protobuf Struct cannot represent instead of silently dropping them.
-func SandboxSpecToProtoChecked(spec *types.SandboxSpec) (*pb.SandboxSpec, error) {
-	result := SandboxSpecToProto(spec)
-	if spec == nil {
-		return result, nil
+	driverConfig, err := mapToStruct(spec.DriverConfig)
+	if err != nil {
+		return nil, fmt.Errorf("convert driver config: %w", err)
 	}
 	policy, err := SandboxPolicyToProtoChecked(spec.Policy)
 	if err != nil {
 		return nil, fmt.Errorf("policy: %w", err)
 	}
-	result.Policy = policy
-	if spec.Template == nil {
-		return result, nil
+	result := &pb.SandboxSpec{
+		Workload:     sandboxWorkloadToProto(spec.Workload),
+		DriverConfig: driverConfig,
+		Providers:    CopyStringSlice(spec.Providers),
+		Policy:       policy,
 	}
-	if spec.Template.Resources != nil {
-		resources, err := structpb.NewStruct(spec.Template.Resources)
-		if err != nil {
-			return nil, fmt.Errorf("template resources: %w", err)
-		}
-		result.Template.Resources = resources
-	}
-	if spec.Template.DriverConfig != nil {
-		driverConfig, err := structpb.NewStruct(spec.Template.DriverConfig)
-		if err != nil {
-			return nil, fmt.Errorf("template driver config: %w", err)
-		}
-		result.Template.DriverConfig = driverConfig
-	}
+
 	return result, nil
+}
+
+// SandboxSpecToProtoChecked converts an SDK SandboxSpec and reports values
+// that protobuf Struct cannot represent instead of silently dropping them.
+func SandboxSpecToProtoChecked(spec *types.SandboxSpec) (*pb.SandboxSpec, error) {
+	return SandboxSpecToProto(spec)
+}
+
+// SandboxWorkloadToProto converts an SDK SandboxWorkloadConfig to proto.
+func SandboxWorkloadToProto(workload *types.SandboxWorkloadConfig) *pb.SandboxWorkloadConfig {
+	return sandboxWorkloadToProto(workload)
+}
+
+func sandboxWorkloadToProto(workload *types.SandboxWorkloadConfig) *pb.SandboxWorkloadConfig {
+	if workload == nil {
+		return nil
+	}
+	return &pb.SandboxWorkloadConfig{
+		Image:       workload.Image,
+		Environment: CopyStringMap(workload.Environment),
+		Resources:   sandboxResourcesToProto(workload.Resources),
+	}
+}
+
+func sandboxResourcesToProto(resources *types.SandboxResources) *pb.SandboxResources {
+	if resources == nil {
+		return nil
+	}
+	return &pb.SandboxResources{
+		Cpu:      resources.CPU,
+		Memory:   resources.Memory,
+		GpuCount: resources.GPUCount,
+	}
+}
+
+func sandboxTemplateProvenanceToProto(provenance *types.SandboxTemplateProvenance) *pb.SandboxTemplateProvenance {
+	if provenance == nil {
+		return nil
+	}
+	return &pb.SandboxTemplateProvenance{
+		Name:            provenance.Name,
+		ResourceVersion: provenance.ResourceVersion,
+	}
+}
+
+// SandboxTemplateFromProto converts a proto SandboxTemplate to an SDK SandboxTemplate.
+func SandboxTemplateFromProto(template *pb.SandboxTemplate) *types.SandboxTemplate {
+	if template == nil {
+		return nil
+	}
+	result := &types.SandboxTemplate{}
+	if m := template.GetMetadata(); m != nil {
+		result.ID = m.GetId()
+		result.Name = m.GetName()
+		result.CreatedAt = TimeFromMillis(m.GetCreatedAtMs())
+		result.Labels = CopyStringMap(m.GetLabels())
+		result.Annotations = CopyStringMap(m.GetAnnotations())
+		result.ResourceVersion = m.GetResourceVersion()
+		result.Workspace = m.GetWorkspace()
+		result.DeletionTimestamp = TimeFromMillisPtr(m.GetDeletionTimestampMs())
+	}
+	result.Spec = sandboxTemplateSpecFromProto(template.GetSpec())
+	return result
+}
+
+func sandboxTemplateSpecFromProto(spec *pb.SandboxTemplateSpec) types.SandboxTemplateSpec {
+	if spec == nil {
+		return types.SandboxTemplateSpec{}
+	}
+	return types.SandboxTemplateSpec{
+		Workload:            sandboxWorkloadFromProto(spec.GetWorkload()),
+		DriverConfig:        structToMap(spec.GetDriverConfig()),
+		DesiredServiceLevel: sandboxServiceLevelFromProto(spec.GetDesiredServiceLevel()),
+	}
+}
+
+func sandboxServiceLevelFromProto(serviceLevel *pb.SandboxServiceLevel) *types.SandboxServiceLevel {
+	if serviceLevel == nil {
+		return nil
+	}
+	return &types.SandboxServiceLevel{
+		Startup: sandboxStartupFromProto(serviceLevel.GetStartup()),
+	}
+}
+
+func sandboxStartupFromProto(startup *pb.SandboxStartup) *types.SandboxStartup {
+	if startup == nil {
+		return nil
+	}
+	return &types.SandboxStartup{
+		ReadyWithin: durationFromProto(startup.GetReadyWithin()),
+		MaxBurst:    startup.GetMaxBurst(),
+	}
+}
+
+// SandboxTemplateToProto converts an SDK SandboxTemplate to a proto SandboxTemplate.
+func SandboxTemplateToProto(template *types.SandboxTemplate) (*pb.SandboxTemplate, error) {
+	if template == nil {
+		return nil, nil
+	}
+	spec, err := sandboxTemplateSpecToProto(&template.Spec)
+	if err != nil {
+		return nil, err
+	}
+	return &pb.SandboxTemplate{
+		Metadata: &dm.ObjectMeta{
+			Id:                  template.ID,
+			Name:                template.Name,
+			CreatedAtMs:         MillisFromTime(template.CreatedAt),
+			Labels:              CopyStringMap(template.Labels),
+			Annotations:         CopyStringMap(template.Annotations),
+			ResourceVersion:     template.ResourceVersion,
+			Workspace:           template.Workspace,
+			DeletionTimestampMs: MillisFromTimePtr(template.DeletionTimestamp),
+		},
+		Spec: spec,
+	}, nil
+}
+
+func sandboxTemplateSpecToProto(spec *types.SandboxTemplateSpec) (*pb.SandboxTemplateSpec, error) {
+	if spec == nil {
+		return nil, nil
+	}
+	driverConfig, err := mapToStruct(spec.DriverConfig)
+	if err != nil {
+		return nil, fmt.Errorf("convert template driver config: %w", err)
+	}
+	return &pb.SandboxTemplateSpec{
+		Workload:            sandboxWorkloadToProto(spec.Workload),
+		DriverConfig:        driverConfig,
+		DesiredServiceLevel: sandboxServiceLevelToProto(spec.DesiredServiceLevel),
+	}, nil
+}
+
+func sandboxServiceLevelToProto(serviceLevel *types.SandboxServiceLevel) *pb.SandboxServiceLevel {
+	if serviceLevel == nil {
+		return nil
+	}
+	return &pb.SandboxServiceLevel{
+		Startup: sandboxStartupToProto(serviceLevel.Startup),
+	}
+}
+
+func sandboxStartupToProto(startup *types.SandboxStartup) *pb.SandboxStartup {
+	if startup == nil {
+		return nil
+	}
+	return &pb.SandboxStartup{
+		ReadyWithin: durationToProto(startup.ReadyWithin),
+		MaxBurst:    startup.MaxBurst,
+	}
+}
+
+func durationFromProto(duration *durationpb.Duration) time.Duration {
+	if duration == nil {
+		return 0
+	}
+	return duration.AsDuration()
+}
+
+func durationToProto(duration time.Duration) *durationpb.Duration {
+	if duration == 0 {
+		return nil
+	}
+	return durationpb.New(duration)
+}
+
+func structToMap(s *structpb.Struct) map[string]any {
+	if s == nil {
+		return nil
+	}
+	return s.AsMap()
+}
+
+func mapToStruct(m map[string]any) (*structpb.Struct, error) {
+	if m == nil {
+		return nil, nil
+	}
+	return structpb.NewStruct(m)
 }

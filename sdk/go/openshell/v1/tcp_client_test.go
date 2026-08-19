@@ -993,7 +993,10 @@ func (r *flippableResolver) Get(_ context.Context, _, name string) (*Sandbox, er
 	return &Sandbox{ID: "sb-" + name, Name: name}, nil
 }
 
-func (r *flippableResolver) Create(context.Context, string, string, *SandboxSpec, map[string]string, ...CreateOptions) (*Sandbox, error) {
+func (r *flippableResolver) Create(context.Context, string, string, *SandboxWorkloadConfig, *SandboxPolicy, []string, map[string]string, ...CreateOptions) (*Sandbox, error) {
+	panic("not implemented")
+}
+func (r *flippableResolver) CreateFromTemplate(context.Context, string, string, string, *SandboxPolicy, []string, map[string]string, ...CreateOptions) (*Sandbox, error) {
 	panic("not implemented")
 }
 func (r *flippableResolver) List(context.Context, string, ...ListOptions) ([]*Sandbox, error) {
