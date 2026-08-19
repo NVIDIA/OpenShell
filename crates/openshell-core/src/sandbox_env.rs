@@ -53,11 +53,14 @@ impl MainProcessConfig {
 
     #[must_use]
     pub fn from_driver_spec(spec: Option<&crate::proto::compute::v1::DriverSandboxSpec>) -> Self {
-        spec.map_or_else(Self::scratch, |spec| Self {
-            version: Self::VERSION,
-            command: spec.command.clone(),
-            tty: spec.tty,
-        })
+        match spec {
+            Some(spec) if !spec.command.is_empty() => Self {
+                version: Self::VERSION,
+                command: spec.command.clone(),
+                tty: spec.tty,
+            },
+            None | Some(_) => Self::scratch(),
+        }
     }
 
     /// Decode the versioned transport without shell interpretation.
@@ -220,5 +223,15 @@ mod tests {
             MainProcessConfig::decode(r#"{"version":2,"command":["/bin/true"],"tty":false}"#)
                 .unwrap_err();
         assert!(error.contains("unsupported"));
+    }
+
+    #[test]
+    fn legacy_driver_spec_without_command_uses_scratch_main() {
+        let legacy = crate::proto::compute::v1::DriverSandboxSpec::default();
+        let config = MainProcessConfig::from_driver_spec(Some(&legacy));
+
+        assert_eq!(config, MainProcessConfig::scratch());
+        let encoded = serde_json::to_string(&config).unwrap();
+        assert_eq!(MainProcessConfig::decode(&encoded).unwrap(), config);
     }
 }

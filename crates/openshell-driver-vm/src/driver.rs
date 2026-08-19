@@ -7063,6 +7063,40 @@ mod tests {
     }
 
     #[test]
+    fn persisted_legacy_sandbox_without_command_uses_scratch_main() {
+        let config = VmDriverConfig {
+            openshell_endpoint: "http://127.0.0.1:8080".to_string(),
+            ..Default::default()
+        };
+        // Requests persisted before the canonical-main contract have a
+        // present DriverSandboxSpec but no command or tty fields.
+        let sandbox = Sandbox {
+            id: "legacy-sandbox".to_string(),
+            name: "legacy-sandbox".to_string(),
+            spec: Some(SandboxSpec::default()),
+            ..Default::default()
+        };
+
+        let env = build_guest_environment(&sandbox, &config, None);
+        let encoded = env
+            .iter()
+            .find_map(|entry| {
+                entry.strip_prefix(&format!(
+                    "{}=",
+                    openshell_core::sandbox_env::MAIN_PROCESS_SPEC
+                ))
+            })
+            .expect("main process environment");
+        let main = openshell_core::sandbox_env::MainProcessConfig::decode(encoded)
+            .expect("legacy persisted request should produce a valid main config");
+
+        assert_eq!(
+            main,
+            openshell_core::sandbox_env::MainProcessConfig::scratch()
+        );
+    }
+
+    #[test]
     fn build_guest_environment_uses_token_file_without_raw_token_env() {
         let config = VmDriverConfig {
             openshell_endpoint: "http://127.0.0.1:8080".to_string(),

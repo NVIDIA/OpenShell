@@ -147,6 +147,46 @@ impl SandboxGuard {
         Self::create_keep_with_args(&[], command, ready_marker).await
     }
 
+    /// Create a sandbox with a detached canonical main command.
+    ///
+    /// Unlike [`SandboxGuard::create_keep`], this does not open an attachment,
+    /// which lets tests control competing and reconnecting clients directly.
+    pub async fn create_detached_main(command: &[&str]) -> Result<Self, String> {
+        let mut cmd = openshell_cmd();
+        cmd.arg("sandbox")
+            .arg("create")
+            .arg("--detach")
+            .arg("--")
+            .args(command)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        let output = timeout(SANDBOX_READY_TIMEOUT, cmd.output())
+            .await
+            .map_err(|_| format!("sandbox create timed out after {SANDBOX_READY_TIMEOUT:?}"))?
+            .map_err(|e| format!("failed to spawn openshell: {e}"))?;
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        let combined = format!("{stdout}{stderr}");
+
+        if !output.status.success() {
+            return Err(format!(
+                "sandbox create failed (exit {:?}):\n{combined}",
+                output.status.code()
+            ));
+        }
+
+        let name = extract_sandbox_name(&combined).ok_or_else(|| {
+            format!("could not parse sandbox name from create output:\n{combined}")
+        })?;
+        Ok(Self {
+            name,
+            create_output: combined,
+            child: None,
+            cleaned_up: false,
+        })
+    }
+
     /// Like [`SandboxGuard::create_keep`], but forwards extra flags to
     /// `sandbox create` (e.g. `--policy <file>`, `--name <n>`) before the
     /// `-- <command>` separator.

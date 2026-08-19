@@ -9,6 +9,7 @@ use std::time::Duration;
 use openshell_e2e::harness::binary::{openshell_cmd, openshell_tty_cmd};
 use openshell_e2e::harness::output::{extract_field, strip_ansi};
 use openshell_e2e::harness::sandbox::SandboxGuard;
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::time::{Instant, sleep};
 
 const SANDBOX_PRESENCE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -264,6 +265,124 @@ async fn canonical_main_exit_transitions_persistent_sandbox_to_error() {
     );
 
     delete_sandbox(&sandbox_name).await;
+}
+
+#[tokio::test]
+async fn canonical_main_disconnect_reconnect_replays_history_for_same_process() {
+    const FIRST_MARKER: &str = "sequence=0001";
+    let script = r#"n=1; while true; do printf 'main_pid=%s sequence=%04d\n' "$$" "$n"; n=$((n + 1)); sleep 0.2; done"#;
+    let mut sandbox = SandboxGuard::create_detached_main(&["sh", "-lc", script])
+        .await
+        .expect("create retained canonical main process");
+
+    let mut owner_cmd = openshell_cmd();
+    owner_cmd
+        .args(["sandbox", "connect", &sandbox.name])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut owner = owner_cmd.spawn().expect("spawn input-owning attachment");
+    let owner_stdout = owner.stdout.take().expect("owner stdout");
+    let mut owner_lines = BufReader::new(owner_stdout).lines();
+    let owner_line = tokio::time::timeout(Duration::from_secs(30), owner_lines.next_line())
+        .await
+        .expect("owner output timeout")
+        .expect("read owner output")
+        .expect("owner output should remain open");
+    assert!(
+        owner_line.contains("main_pid="),
+        "unexpected owner output: {owner_line}"
+    );
+
+    let mut observer_cmd = openshell_cmd();
+    observer_cmd
+        .args(["sandbox", "connect", &sandbox.name])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut observer = observer_cmd.spawn().expect("spawn competing attachment");
+    let observer_stderr = observer.stderr.take().expect("observer stderr");
+    let mut observer_errors = BufReader::new(observer_stderr).lines();
+    let warning = tokio::time::timeout(Duration::from_secs(30), observer_errors.next_line())
+        .await
+        .expect("observer warning timeout")
+        .expect("read observer warning")
+        .expect("observer warning should remain open");
+    assert!(
+        warning.contains("already has an input owner") && warning.contains("read-only"),
+        "competing attachment should become read-only: {warning}"
+    );
+    let observer_stdout = observer.stdout.take().expect("observer stdout");
+    let mut observer_lines = BufReader::new(observer_stdout).lines();
+    let observed = tokio::time::timeout(Duration::from_secs(30), observer_lines.next_line())
+        .await
+        .expect("observer output timeout")
+        .expect("read observer output")
+        .expect("observer output should remain open");
+    assert!(
+        observed.contains("main_pid="),
+        "read-only attachment should observe output: {observed}"
+    );
+
+    owner.kill().await.expect("disconnect input owner");
+    owner.wait().await.expect("wait for input owner disconnect");
+    observer.kill().await.expect("disconnect observer");
+    observer.wait().await.expect("wait for observer disconnect");
+    sleep(Duration::from_millis(600)).await;
+
+    let mut reconnect_cmd = openshell_cmd();
+    reconnect_cmd
+        .args(["sandbox", "connect", &sandbox.name])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut reconnect = reconnect_cmd.spawn().expect("spawn reconnect attachment");
+    let reconnect_stdout = reconnect.stdout.take().expect("reconnect stdout");
+    let mut reconnect_lines = BufReader::new(reconnect_stdout).lines();
+    let mut replay = Vec::new();
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while replay.len() < 5 {
+            let line = reconnect_lines
+                .next_line()
+                .await
+                .expect("read reconnect output")
+                .expect("reconnect output should remain open");
+            if line.contains("main_pid=") {
+                replay.push(line);
+            }
+        }
+    })
+    .await
+    .expect("reconnect history timeout");
+
+    let first_pid = owner_line
+        .split_whitespace()
+        .find_map(|field| field.strip_prefix("main_pid="))
+        .expect("owner output pid");
+    assert!(
+        replay.iter().any(|line| line.contains(FIRST_MARKER)),
+        "reconnect should replay the beginning of retained history: {replay:?}"
+    );
+    assert!(
+        replay
+            .iter()
+            .all(|line| line.contains(&format!("main_pid={first_pid}"))),
+        "reconnect should target the same canonical process: {replay:?}"
+    );
+    assert!(
+        replay.iter().any(|line| !line.contains(FIRST_MARKER)),
+        "reconnect should observe output beyond the first record: {replay:?}"
+    );
+
+    reconnect
+        .kill()
+        .await
+        .expect("disconnect reconnect attachment");
+    reconnect
+        .wait()
+        .await
+        .expect("wait for reconnect disconnect");
+    sandbox.cleanup().await;
 }
 
 #[tokio::test]
