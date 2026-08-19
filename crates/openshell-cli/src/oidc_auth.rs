@@ -135,6 +135,41 @@ fn interactive_authorization_params(
     params
 }
 
+fn device_authorization_form(
+    client_id: &str,
+    scopes: &str,
+    audience: Option<&str>,
+    code_challenge: &str,
+    code_challenge_method: &str,
+) -> Vec<(&'static str, String)> {
+    let mut params = vec![
+        ("client_id", client_id.to_string()),
+        ("scope", scopes.to_string()),
+        ("code_challenge", code_challenge.to_string()),
+        ("code_challenge_method", code_challenge_method.to_string()),
+    ];
+    if let Some(audience) = audience {
+        params.push(("audience", audience.to_string()));
+    }
+    params
+}
+
+fn device_token_form(
+    client_id: &str,
+    device_code: &str,
+    code_verifier: &str,
+) -> Vec<(&'static str, String)> {
+    vec![
+        (
+            "grant_type",
+            "urn:ietf:params:oauth:grant-type:device_code".to_string(),
+        ),
+        ("device_code", device_code.to_string()),
+        ("client_id", client_id.to_string()),
+        ("code_verifier", code_verifier.to_string()),
+    ]
+}
+
 /// Run the OIDC Authorization Code + PKCE browser flow.
 ///
 /// Opens the user's browser to the Keycloak login page and waits for
@@ -299,14 +334,16 @@ pub async fn oidc_device_code_flow(
         .collect::<Vec<_>>()
         .join(" ");
 
-    let mut form_params = vec![("client_id", client_id), ("scope", &scopes_param)];
-
-    // Add audience if present
-    let audience_str;
-    if let Some(aud) = audience {
-        audience_str = aud.to_string();
-        form_params.push(("audience", &audience_str));
-    }
+    // Use PKCE for the device flow as well as the browser flow. Keycloak
+    // requires these parameters when the public client enforces S256 PKCE.
+    let (pkce_challenge, pkce_verifier) = PkceCodeChallenge::new_random_sha256();
+    let form_params = device_authorization_form(
+        client_id,
+        &scopes_param,
+        audience,
+        pkce_challenge.as_str(),
+        pkce_challenge.method().as_str(),
+    );
 
     let device_auth_resp = http
         .post(device_auth_endpoint)
@@ -355,11 +392,8 @@ pub async fn oidc_device_code_flow(
 
         tokio::time::sleep(poll_interval).await;
 
-        let token_params = vec![
-            ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
-            ("device_code", &device_auth.device_code),
-            ("client_id", client_id),
-        ];
+        let token_params =
+            device_token_form(client_id, &device_auth.device_code, pkce_verifier.secret());
 
         let poll_resp = http
             .post(&discovery.token_endpoint)
@@ -770,6 +804,62 @@ mod tests {
             vec![("audience", "api://openshell".to_string())]
         );
         assert!(interactive_authorization_params(None, false).is_empty());
+    }
+
+    #[test]
+    fn device_authorization_form_includes_pkce_and_audience() {
+        let params = device_authorization_form(
+            "openshell-cli",
+            "openid profile",
+            Some("openshell-api"),
+            "test-challenge",
+            "S256",
+        );
+        let params: std::collections::HashMap<_, _> = params.into_iter().collect();
+
+        assert_eq!(
+            params.get("client_id").map(String::as_str),
+            Some("openshell-cli")
+        );
+        assert_eq!(
+            params.get("scope").map(String::as_str),
+            Some("openid profile")
+        );
+        assert_eq!(
+            params.get("audience").map(String::as_str),
+            Some("openshell-api")
+        );
+        assert_eq!(
+            params.get("code_challenge").map(String::as_str),
+            Some("test-challenge")
+        );
+        assert_eq!(
+            params.get("code_challenge_method").map(String::as_str),
+            Some("S256")
+        );
+    }
+
+    #[test]
+    fn device_token_form_includes_pkce_verifier() {
+        let params = device_token_form("openshell-cli", "device-code", "test-verifier");
+        let params: std::collections::HashMap<_, _> = params.into_iter().collect();
+
+        assert_eq!(
+            params.get("grant_type").map(String::as_str),
+            Some("urn:ietf:params:oauth:grant-type:device_code")
+        );
+        assert_eq!(
+            params.get("device_code").map(String::as_str),
+            Some("device-code")
+        );
+        assert_eq!(
+            params.get("client_id").map(String::as_str),
+            Some("openshell-cli")
+        );
+        assert_eq!(
+            params.get("code_verifier").map(String::as_str),
+            Some("test-verifier")
+        );
     }
 
     #[test]
