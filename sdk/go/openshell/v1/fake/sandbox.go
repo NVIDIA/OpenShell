@@ -32,6 +32,10 @@ func copySandbox(sb *types.Sandbox) *types.Sandbox {
 		t := *sb.DeletionTimestamp
 		cp.DeletionTimestamp = &t
 	}
+	if sb.CreatedFromWorkloadTemplate != nil {
+		provenance := *sb.CreatedFromWorkloadTemplate
+		cp.CreatedFromWorkloadTemplate = &provenance
+	}
 	cp.Spec = copySandboxSpec(sb.Spec)
 	cp.Status = copySandboxStatus(sb.Status)
 	return &cp
@@ -255,9 +259,10 @@ func copyStringSlice(s []string) []string {
 // fakeSandboxClient implements v1.SandboxInterface backed by an in-memory
 // objectStore and watchBroadcaster.
 type fakeSandboxClient struct {
-	store       *objectStore[*types.Sandbox]
-	broadcaster *watchBroadcaster[*types.Sandbox]
-	closedFunc  func() bool
+	store         *objectStore[*types.Sandbox]
+	templateStore *objectStore[*types.SandboxWorkloadTemplate]
+	broadcaster   *watchBroadcaster[*types.Sandbox]
+	closedFunc    func() bool
 }
 
 var _ v1.SandboxInterface = (*fakeSandboxClient)(nil)
@@ -266,13 +271,15 @@ var _ v1.SandboxTemplateCreateInterface = (*fakeSandboxClient)(nil)
 // newFakeSandboxClient creates a new fakeSandboxClient.
 func newFakeSandboxClient(
 	store *objectStore[*types.Sandbox],
+	templateStore *objectStore[*types.SandboxWorkloadTemplate],
 	broadcaster *watchBroadcaster[*types.Sandbox],
 	closedFunc func() bool,
 ) *fakeSandboxClient {
 	return &fakeSandboxClient{
-		store:       store,
-		broadcaster: broadcaster,
-		closedFunc:  closedFunc,
+		store:         store,
+		templateStore: templateStore,
+		broadcaster:   broadcaster,
+		closedFunc:    closedFunc,
 	}
 }
 
@@ -326,6 +333,13 @@ func (c *fakeSandboxClient) CreateFromTemplate(_ context.Context, workspace, nam
 	if templateName == "" {
 		return nil, &types.StatusError{Code: types.ErrorInvalidArgument, Message: "template name is required"}
 	}
+	if err := validateTemplateCreateSpec(spec); err != nil {
+		return nil, err
+	}
+	template, err := c.templateStore.Get(workspace, templateName)
+	if err != nil {
+		return nil, err
+	}
 	if spec == nil {
 		spec = &types.SandboxSpec{}
 	}
@@ -335,15 +349,21 @@ func (c *fakeSandboxClient) CreateFromTemplate(_ context.Context, workspace, nam
 		annotations = copyStringMap(opts[0].Annotations)
 	}
 
+	resolvedSpec := sandboxSpecFromWorkloadTemplate(template)
+	resolvedSpec.Providers = copyStringSlice(spec.Providers)
+	resolvedSpec.Policy = copySandboxPolicy(spec.Policy)
+
 	sb := &types.Sandbox{
-		Name:        name,
-		Workspace:   workspace,
-		CreatedAt:   time.Now(),
-		Labels:      copyStringMap(labels),
-		Annotations: annotations,
-		Spec: types.SandboxSpec{
-			Providers: copyStringSlice(spec.Providers),
-			Policy:    copySandboxPolicy(spec.Policy),
+		Name:            name,
+		Workspace:       workspace,
+		CreatedAt:       time.Now(),
+		Labels:          copyStringMap(labels),
+		Annotations:     annotations,
+		ResourceVersion: 1,
+		Spec:            resolvedSpec,
+		CreatedFromWorkloadTemplate: &types.SandboxWorkloadTemplateProvenance{
+			Name:            template.Name,
+			ResourceVersion: fmt.Sprint(template.ResourceVersion),
 		},
 		Status: types.SandboxStatus{
 			SandboxName: name,
@@ -362,6 +382,53 @@ func (c *fakeSandboxClient) CreateFromTemplate(_ context.Context, workspace, nam
 	}, name)
 
 	return result, nil
+}
+
+func validateTemplateCreateSpec(spec *types.SandboxSpec) error {
+	if spec == nil {
+		return nil
+	}
+	if spec.LogLevel != "" || len(spec.Environment) > 0 || spec.Template != nil || spec.GPUCount != nil {
+		return &types.StatusError{Code: types.ErrorInvalidArgument, Message: "template creates only allow policy and providers in spec"}
+	}
+	return nil
+}
+
+func sandboxSpecFromWorkloadTemplate(template *types.SandboxWorkloadTemplate) types.SandboxSpec {
+	var spec types.SandboxSpec
+	if template == nil || template.Spec.Workload == nil {
+		return spec
+	}
+
+	workload := template.Spec.Workload
+	spec.Environment = copyStringMap(workload.Environment)
+	spec.Template = &types.SandboxTemplate{
+		Image:        workload.Image,
+		Resources:    sandboxTemplateResources(workload.Resources),
+		DriverConfig: copyAnyMap(template.Spec.DriverConfig),
+	}
+	if workload.Resources != nil && workload.Resources.GPUCount != nil {
+		count := *workload.Resources.GPUCount
+		spec.GPUCount = &count
+	}
+	return spec
+}
+
+func sandboxTemplateResources(resources *types.SandboxResources) map[string]any {
+	if resources == nil {
+		return nil
+	}
+	limits := make(map[string]any)
+	if resources.CPU != "" {
+		limits["cpu"] = resources.CPU
+	}
+	if resources.Memory != "" {
+		limits["memory"] = resources.Memory
+	}
+	if len(limits) == 0 {
+		return nil
+	}
+	return map[string]any{"limits": limits}
 }
 
 // Get retrieves a sandbox by name.
