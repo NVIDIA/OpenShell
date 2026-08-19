@@ -625,14 +625,12 @@ The gateway sends a complete host, port, and path binding for every emitted stat
 
 Refresh configuration is stored separately from the current injectable credential value. Non-secret refresh configuration remains in the refresh-state record. Secret material is resolved from the active credential driver only while the gateway mints a new short-lived token. The gateway writes the token back through credential storage and updates credential expiry metadata. If an OAuth issuer rotates its refresh token, the gateway stages the replacement through credential storage before committing the refresh generation and removes the previous handle afterward.
 
-On upgrade, the refresh worker migrates legacy inline secret material before it
-mints again. For a multi-replica gateway, stop every older replica before the
-new version begins migration. A normal mixed-version rolling update is unsafe
-because older protobuf runtimes can discard internal handle fields when they
-rewrite refresh state. Migration removes plaintext values from current records,
-but database backups, SQLite WAL/free pages, and Postgres dead tuples may retain
-historical bytes. Rotate the upstream grant and apply the database's retention
-or compaction procedure when historical erasure is required.
+Before OpenShell 0.1.0, refresh-state and credential-driver migrations are not
+supported. Upgrading from a build that stored refresh material inline requires
+reconfiguring the refresh grant. To change credential drivers, delete or
+reconfigure affected providers while the original driver is still available,
+then select the new driver and create the credentials again. Do not run mixed
+gateway versions against the same refresh records.
 
 Each explicit `refresh configure` call also starts a new gateway-owned
 authorization epoch. Automatic refresh and `refresh rotate` preserve that epoch,

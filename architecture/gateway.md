@@ -335,6 +335,11 @@ Multi-replica deployments can use that default with a shared database and
 shared key-encryption key, or opt into an external backend such as Vault or
 Kubernetes Secrets.
 
+Credential handles remain bound to the driver that created them. Before the
+0.1.0 compatibility boundary, gateways do not migrate inline refresh material
+or move handles between credential drivers; operators reconfigure affected
+grants when upgrading or changing backends.
+
 ### Optimistic Concurrency (CAS)
 
 Every object row carries a `resource_version` that the database increments

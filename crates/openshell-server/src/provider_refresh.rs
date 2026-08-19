@@ -568,85 +568,6 @@ fn validate_secret_material_references(
     )))
 }
 
-async fn migrate_inline_secret_material(
-    store: &Store,
-    credentials: Option<&crate::credentials::CredentialRuntime>,
-    state: &StoredProviderCredentialRefreshState,
-) -> Result<StoredProviderCredentialRefreshState, Status> {
-    let strategy = ProviderCredentialRefreshStrategy::try_from(state.strategy)
-        .unwrap_or(ProviderCredentialRefreshStrategy::Unspecified);
-    let mut secret_keys: std::collections::HashSet<String> =
-        state.secret_material_keys.iter().cloned().collect();
-    secret_keys.extend(
-        strategy_secret_material_keys(strategy)
-            .iter()
-            .map(|key| (*key).to_string()),
-    );
-    let inline_secrets: HashMap<String, String> = secret_keys
-        .into_iter()
-        .filter_map(|key| state.material.get(&key).cloned().map(|value| (key, value)))
-        .collect();
-    if inline_secrets.is_empty() {
-        return Ok(state.clone());
-    }
-    let Some(credentials) = credentials else {
-        // Production refresh entry points always supply the server credential
-        // runtime. Keeping the no-runtime path readable preserves focused unit
-        // tests and test-only helpers that exercise minting in isolation.
-        return Ok(state.clone());
-    };
-    let values_to_stage: HashMap<_, _> = inline_secrets
-        .iter()
-        .filter(|(key, _)| !state.secret_material_handles.contains_key(*key))
-        .map(|(key, value)| (key.clone(), value.clone()))
-        .collect();
-    let staging_id = format!(
-        "{}-refresh-migration-{}",
-        state.object_id(),
-        uuid::Uuid::new_v4()
-    );
-    let staged = credentials
-        .store_refresh_material_with_object_id(
-            refresh_material_scope(state),
-            &staging_id,
-            &values_to_stage,
-            &HashMap::new(),
-        )
-        .await?;
-    let mut migrated = state.clone();
-    migrated.secret_material_handles.extend(staged.clone());
-    for key in inline_secrets.keys() {
-        migrated.material.remove(key);
-        if !migrated.secret_material_keys.contains(key) {
-            migrated.secret_material_keys.push(key.clone());
-        }
-    }
-    migrated.secret_material_keys.sort();
-    migrated.secret_material_keys.dedup();
-    let expected_version = state
-        .metadata
-        .as_ref()
-        .map_or(0, |metadata| metadata.resource_version);
-    match persist_refresh_state_if_current(store, &migrated, expected_version).await {
-        Ok(Some(new_version)) => {
-            if let Some(metadata) = migrated.metadata.as_mut() {
-                metadata.resource_version = new_version;
-            }
-            Ok(migrated)
-        }
-        Ok(None) => {
-            cleanup_staged_refresh_material_handles(credentials, state, &staged).await;
-            Err(Status::aborted(
-                "provider refresh was deleted or superseded during material migration",
-            ))
-        }
-        Err(err) => {
-            cleanup_staged_refresh_material_handles(credentials, state, &staged).await;
-            Err(err)
-        }
-    }
-}
-
 pub async fn refresh_provider_credential(
     store: &Store,
     workspace: &str,
@@ -674,7 +595,7 @@ pub async fn refresh_provider_credential(
             "provider refresh is being deleted",
         ));
     }
-    let mut state = migrate_inline_secret_material(store, Some(credentials), &state).await?;
+    let mut state = state;
     validate_secret_material_references(&state)?;
     // Generation of the refresh at the start of the rotation. Terminal persists
     // match on it so a concurrent delete or rotation is detected rather than
@@ -1634,18 +1555,7 @@ async fn run_refresh_worker_tick(
             }
             continue;
         }
-        let mut state = match migrate_inline_secret_material(store, credentials, &state).await {
-            Ok(state) => state,
-            Err(err) => {
-                warn!(
-                    provider = %state.provider_name,
-                    credential_key = %state.credential_key,
-                    error = %err,
-                    "provider refresh material migration failed"
-                );
-                continue;
-            }
-        };
+        let mut state = state;
         let expected_version = state
             .metadata
             .as_ref()
@@ -1735,9 +1645,9 @@ mod tests {
     use super::{
         NewRefreshStateConfig, delete_refresh_state_with_credentials,
         effective_authorization_epoch, enqueue_pending_secret_deletion, get_refresh_state,
-        list_all_refresh_states, list_refresh_states_for_provider, migrate_inline_secret_material,
-        new_refresh_state, put_refresh_state, refresh_material_scope, refresh_provider_credential,
-        refresh_state_name, refresh_strategy_name, run_refresh_worker_tick, seconds_until_ms,
+        list_all_refresh_states, list_refresh_states_for_provider, new_refresh_state,
+        put_refresh_state, refresh_material_scope, refresh_provider_credential, refresh_state_name,
+        refresh_strategy_name, run_refresh_worker_tick, seconds_until_ms,
         validate_secret_material_references,
     };
     use crate::credentials::CredentialRuntime;
@@ -1799,76 +1709,6 @@ mod tests {
         let all = list_all_refresh_states(&store).await.unwrap();
         assert_eq!(scoped[0].metadata.as_ref().unwrap().resource_version, 1);
         assert_eq!(all[0].metadata.as_ref().unwrap().resource_version, 1);
-    }
-
-    #[tokio::test]
-    async fn superseded_inline_material_migration_cleans_staged_handle() {
-        let store = test_store().await;
-        let provider = provider("migration-race", "outlook");
-        let state = new_refresh_state(
-            &provider,
-            "default",
-            "MS_GRAPH_ACCESS_TOKEN",
-            NewRefreshStateConfig {
-                strategy: ProviderCredentialRefreshStrategy::Oauth2ClientCredentials,
-                material: HashMap::from([
-                    ("client_id".to_string(), "client-id".to_string()),
-                    ("client_secret".to_string(), "client-secret".to_string()),
-                ]),
-                secret_material_keys: vec!["client_secret".to_string()],
-                expires_at_ms: 0,
-                token_url: "https://issuer.example/token".to_string(),
-                scopes: Vec::new(),
-                refresh_before_seconds: 30,
-                max_lifetime_seconds: 60,
-                additional_output_keys: HashMap::new(),
-            },
-        )
-        .unwrap();
-        put_refresh_state(&store, &state).await.unwrap();
-        let state = get_refresh_state(
-            &store,
-            "default",
-            provider.object_id(),
-            "MS_GRAPH_ACCESS_TOKEN",
-        )
-        .await
-        .unwrap()
-        .unwrap();
-        let credentials = test_credentials();
-        let (store_hit, release_store) = credentials.gate_next_store();
-
-        let migration = migrate_inline_secret_material(&store, Some(&credentials), &state);
-        let supersede = async {
-            store_hit.await.unwrap();
-            let mut winner = get_refresh_state(
-                &store,
-                "default",
-                provider.object_id(),
-                "MS_GRAPH_ACCESS_TOKEN",
-            )
-            .await
-            .unwrap()
-            .unwrap();
-            winner.last_error = "won-by-concurrent-writer".to_string();
-            put_refresh_state(&store, &winner).await.unwrap();
-            release_store.send(()).unwrap();
-        };
-        let (result, ()) = tokio::join!(migration, supersede);
-
-        assert_eq!(result.unwrap_err().code(), tonic::Code::Aborted);
-        assert_eq!(credentials.stored_credential_count(), Some(0));
-        let winner = get_refresh_state(
-            &store,
-            "default",
-            provider.object_id(),
-            "MS_GRAPH_ACCESS_TOKEN",
-        )
-        .await
-        .unwrap()
-        .unwrap();
-        assert_eq!(winner.last_error, "won-by-concurrent-writer");
-        assert!(winner.secret_material_handles.is_empty());
     }
 
     #[test]
@@ -2086,7 +1926,7 @@ mod tests {
         let store = test_store().await;
         let provider = provider("my-stored-graph", "outlook");
         store.put_message(&provider).await.unwrap();
-        let state = new_refresh_state(
+        let mut state = new_refresh_state(
             &provider,
             "default",
             "MS_GRAPH_ACCESS_TOKEN",
@@ -2106,10 +1946,20 @@ mod tests {
             },
         )
         .unwrap();
-        put_refresh_state(&store, &state).await.unwrap();
-        let authorization_epoch = state.authorization_epoch.clone();
         let config = Config::new(None).with_credential_drivers(["test-static"]);
         let credentials = CredentialRuntime::from_config(&config).unwrap();
+        state.secret_material_handles = credentials
+            .store_refresh_material_with_object_id(
+                refresh_material_scope(&state),
+                "configured-client-secret",
+                &HashMap::from([("client_secret".to_string(), "client-secret".to_string())]),
+                &HashMap::new(),
+            )
+            .await
+            .unwrap();
+        state.material.remove("client_secret");
+        put_refresh_state(&store, &state).await.unwrap();
+        let authorization_epoch = state.authorization_epoch.clone();
 
         let refreshed = refresh_provider_credential(
             &store,
@@ -2426,6 +2276,16 @@ mod tests {
             },
         )
         .unwrap();
+        state.secret_material_handles = credentials
+            .store_refresh_material_with_object_id(
+                refresh_material_scope(&state),
+                "current-refresh-object",
+                &HashMap::from([("client_secret".to_string(), "client-secret".to_string())]),
+                &HashMap::new(),
+            )
+            .await
+            .unwrap();
+        state.material.remove("client_secret");
         let old = credentials
             .store_refresh_material_with_object_id(
                 refresh_material_scope(&state),
@@ -2689,63 +2549,6 @@ mod tests {
             !stored_provider
                 .credentials
                 .contains_key("MS_GRAPH_ACCESS_TOKEN")
-        );
-    }
-
-    #[tokio::test]
-    async fn refresh_worker_migrates_legacy_secrets_before_skipping_non_mintable_state() {
-        let store = test_store().await;
-        let provider = provider("legacy-external", "outlook");
-        store.put_message(&provider).await.unwrap();
-        let state = new_refresh_state(
-            &provider,
-            "default",
-            "MS_GRAPH_ACCESS_TOKEN",
-            NewRefreshStateConfig {
-                strategy: ProviderCredentialRefreshStrategy::External,
-                material: HashMap::from([(
-                    "legacy_secret".to_string(),
-                    "move-me-out-of-the-database".to_string(),
-                )]),
-                secret_material_keys: vec!["legacy_secret".to_string()],
-                expires_at_ms: 0,
-                token_url: String::new(),
-                scopes: Vec::new(),
-                refresh_before_seconds: 0,
-                max_lifetime_seconds: 0,
-                additional_output_keys: HashMap::new(),
-            },
-        )
-        .unwrap();
-        put_refresh_state(&store, &state).await.unwrap();
-        let credentials = test_credentials();
-
-        run_refresh_worker_tick(&store, Some(&credentials), None)
-            .await
-            .unwrap();
-
-        let stored = get_refresh_state(
-            &store,
-            "default",
-            provider.object_id(),
-            "MS_GRAPH_ACCESS_TOKEN",
-        )
-        .await
-        .unwrap()
-        .unwrap();
-        assert!(!stored.material.contains_key("legacy_secret"));
-        assert!(stored.secret_material_handles.contains_key("legacy_secret"));
-        assert_eq!(stored.status, "configured");
-        assert_eq!(
-            credentials
-                .resolve_refresh_material(
-                    refresh_material_scope(&stored),
-                    &stored.secret_material_handles,
-                )
-                .await
-                .unwrap()
-                .get("legacy_secret"),
-            Some(&"move-me-out-of-the-database".to_string())
         );
     }
 
