@@ -535,9 +535,8 @@ mod tests {
         // Zero configured paths under hard_requirement must fail startup rather
         // than silently running without filesystem restrictions.
         let policy = hard_requirement_policy(vec![], vec![]);
-        let err = match prepare(&policy, None) {
-            Err(err) => err,
-            Ok(_) => panic!("should abort with no paths"),
+        let Err(err) = prepare(&policy, None) else {
+            panic!("should abort with no paths");
         };
         let msg = err.to_string();
         assert!(
