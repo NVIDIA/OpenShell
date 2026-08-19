@@ -20,6 +20,28 @@ sb, err := client.Sandboxes().Create(ctx, "default", "my-sandbox", &v1.SandboxSp
 })
 ```
 
+## Create From Template
+
+Creates a new sandbox from a reusable sandbox workload template. The template
+provides workload fields such as image, environment, resources, and driver
+config. The create request supplies governance fields such as providers and
+policy.
+
+```go
+sb, err := client.CreateSandboxFromTemplate(ctx,
+    "default",
+    "my-sandbox",
+    "gpu-kata",
+    &v1.SandboxSpec{
+        Providers: []string{"openai"},
+        Policy:    policy,
+    },
+    map[string]string{"team": "platform"},
+)
+```
+
+See [Sandbox Templates](sandbox-templates.md) for template CRUD.
+
 ## Get
 
 Retrieves a sandbox by name.
