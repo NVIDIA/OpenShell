@@ -96,7 +96,7 @@ fn runtime_config() -> DockerDriverRuntimeConfig {
     DockerDriverRuntimeConfig {
         default_image: "image:latest".to_string(),
         image_pull_policy: String::new(),
-        sandbox_namespace: "default".to_string(),
+        sandbox_label: "default".to_string(),
         grpc_endpoint: "https://localhost:8443".to_string(),
         network_name: DEFAULT_DOCKER_NETWORK_NAME.to_string(),
         gateway_route: DockerGatewayRoute::Bridge {
@@ -125,6 +125,34 @@ fn runtime_config() -> DockerDriverRuntimeConfig {
         sandbox_pids_limit: DEFAULT_SANDBOX_PIDS_LIMIT,
         enable_bind_mounts: false,
     }
+}
+
+#[test]
+fn docker_config_uses_canonical_sandbox_label_name() {
+    let config: DockerComputeConfig =
+        serde_json::from_value(serde_json::json!({ "sandbox_label": "tenant-a" })).unwrap();
+    assert_eq!(config.sandbox_label, "tenant-a");
+
+    let serialized = serde_json::to_value(config).unwrap();
+    assert_eq!(serialized["sandbox_label"], "tenant-a");
+    assert!(serialized.get("sandbox_namespace").is_none());
+}
+
+#[test]
+fn docker_config_accepts_legacy_sandbox_namespace_alias() {
+    let config: DockerComputeConfig =
+        serde_json::from_value(serde_json::json!({ "sandbox_namespace": "tenant-a" })).unwrap();
+    assert_eq!(config.sandbox_label, "tenant-a");
+}
+
+#[test]
+fn docker_config_rejects_canonical_and_legacy_sandbox_label_names_together() {
+    let error = serde_json::from_value::<DockerComputeConfig>(serde_json::json!({
+        "sandbox_label": "tenant-a",
+        "sandbox_namespace": "tenant-b"
+    }))
+    .expect_err("canonical and legacy names must not both be accepted");
+    assert!(error.to_string().contains("duplicate field"));
 }
 
 fn json_struct(value: serde_json::Value) -> prost_types::Struct {
@@ -2669,10 +2697,10 @@ fn build_container_create_body_uses_runtime_namespace_label() {
     // runtime config, not from `DriverSandbox.namespace`. The gateway
     // does not populate `DriverSandbox.namespace`, so a container created
     // with that empty value would not match subsequent list/get/find
-    // queries (which filter on `config.sandbox_namespace`), leaking
+    // queries (which filter on `config.sandbox_label`), leaking
     // sandboxes that the driver itself cannot observe.
     let mut config = runtime_config();
-    config.sandbox_namespace = "tenant-a".to_string();
+    config.sandbox_label = "tenant-a".to_string();
     let mut sandbox = test_sandbox();
     sandbox.namespace = "ignored-by-driver".to_string();
 

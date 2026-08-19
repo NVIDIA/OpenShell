@@ -237,7 +237,8 @@ enum GuestImagePayloadSource {
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct VmDriverConfig {
-    pub openshell_endpoint: String,
+    #[serde(alias = "openshell_endpoint")]
+    pub grpc_endpoint: String,
     pub state_dir: PathBuf,
     pub launcher_bin: Option<PathBuf>,
     pub default_image: String,
@@ -333,7 +334,7 @@ pub struct VmDriverConfig {
 impl std::fmt::Debug for VmDriverConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("VmDriverConfig")
-            .field("openshell_endpoint", &self.openshell_endpoint)
+            .field("grpc_endpoint", &self.grpc_endpoint)
             .field("state_dir", &self.state_dir)
             .field("launcher_bin", &self.launcher_bin)
             .field("default_image", &self.default_image)
@@ -367,7 +368,7 @@ pub const DEFAULT_SANDBOX_UID: u32 = 10001;
 impl Default for VmDriverConfig {
     fn default() -> Self {
         Self {
-            openshell_endpoint: String::new(),
+            grpc_endpoint: String::new(),
             state_dir: PathBuf::from("target/openshell-vm-driver"),
             launcher_bin: None,
             default_image: String::new(),
@@ -453,7 +454,7 @@ impl VmDriverConfig {
     }
 
     fn requires_tls_materials(&self) -> bool {
-        self.openshell_endpoint.starts_with("https://")
+        self.grpc_endpoint.starts_with("https://")
     }
 
     fn tls_paths(&self) -> Result<Option<VmDriverTlsPaths>, String> {
@@ -593,10 +594,10 @@ impl VmDriver {
             .map_err(|err| err.message().to_string())?;
         config.validate_sandbox_identity()?;
         config.validate_proxy_config()?;
-        if config.openshell_endpoint.trim().is_empty() {
+        if config.grpc_endpoint.trim().is_empty() {
             return Err("openshell endpoint is required".to_string());
         }
-        validate_openshell_endpoint(&config.openshell_endpoint)?;
+        validate_openshell_endpoint(&config.grpc_endpoint)?;
         let _ = config.tls_paths()?;
 
         #[cfg(target_os = "linux")]
@@ -1066,7 +1067,7 @@ impl VmDriver {
 
         let endpoint_override = if plan.backend == VmBackend::Qemu {
             plan.host_ip.as_deref().map(|host_ip| {
-                guest_visible_openshell_endpoint_for_tap(&self.config.openshell_endpoint, host_ip)
+                guest_visible_openshell_endpoint_for_tap(&self.config.grpc_endpoint, host_ip)
             })
         } else {
             None
@@ -1866,7 +1867,7 @@ impl VmDriver {
                 "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
                 mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
             ));
-            plan.gateway_port = gateway_port_from_endpoint(&self.config.openshell_endpoint);
+            plan.gateway_port = gateway_port_from_endpoint(&self.config.grpc_endpoint);
         }
 
         // The corporate-proxy host-loopback recipe is a libkrun/gvproxy
@@ -2019,7 +2020,7 @@ impl VmDriver {
             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
         );
         let tap = tap_device_name(sandbox_id);
-        let gateway_port = gateway_port_from_endpoint(&self.config.openshell_endpoint);
+        let gateway_port = gateway_port_from_endpoint(&self.config.grpc_endpoint);
 
         let (vcpus, mem_mib) = if is_gpu {
             (self.config.gpu_vcpus, self.config.gpu_mem_mib)
@@ -4721,7 +4722,7 @@ fn merged_environment(sandbox: &Sandbox) -> HashMap<String, String> {
 /// Rewrites loopback host references in a gateway URL to a hostname the guest
 /// can reach via gvproxy.
 ///
-/// The driver receives the gateway endpoint from `--openshell-endpoint`, which
+/// The driver receives the gateway endpoint from `--grpc-endpoint`, which
 /// in local/dev/e2e setups is typically `http://127.0.0.1:<port>`. That URL is
 /// useless inside the guest because the guest's loopback interface is its own,
 /// not the host's. Inside the guest we need a name that gvproxy will translate
@@ -4832,7 +4833,7 @@ fn build_guest_environment(
     endpoint_override: Option<&str>,
 ) -> Vec<String> {
     let openshell_endpoint = endpoint_override.map_or_else(
-        || guest_visible_openshell_endpoint(&config.openshell_endpoint),
+        || guest_visible_openshell_endpoint(&config.grpc_endpoint),
         String::from,
     );
     // 1. User-supplied environment (lowest priority).
@@ -6194,6 +6195,52 @@ mod tests {
 
         assert_eq!(result.unwrap(), "success");
         assert_eq!(attempts.load(Ordering::Relaxed), 3);
+    }
+
+    #[test]
+    fn vm_config_uses_canonical_grpc_endpoint_name() {
+        let config = VmDriverConfig {
+            grpc_endpoint: "http://127.0.0.1:8080".to_string(),
+            ..Default::default()
+        };
+        let serialized = serde_json::to_value(&config).unwrap();
+        assert_eq!(serialized["grpc_endpoint"], "http://127.0.0.1:8080");
+        assert!(serialized.get("openshell_endpoint").is_none());
+
+        let parsed: VmDriverConfig = serde_json::from_value(serialized).unwrap();
+        assert_eq!(parsed.grpc_endpoint, "http://127.0.0.1:8080");
+    }
+
+    #[test]
+    fn vm_config_accepts_legacy_openshell_endpoint_alias() {
+        let config = VmDriverConfig::default();
+        let mut serialized = serde_json::to_value(config).unwrap();
+        let fields = serialized.as_object_mut().unwrap();
+        fields.remove("grpc_endpoint");
+        fields.insert(
+            "openshell_endpoint".to_string(),
+            serde_json::json!("http://127.0.0.1:8080"),
+        );
+
+        let parsed: VmDriverConfig = serde_json::from_value(serialized).unwrap();
+        assert_eq!(parsed.grpc_endpoint, "http://127.0.0.1:8080");
+    }
+
+    #[test]
+    fn vm_config_rejects_canonical_and_legacy_endpoint_names_together() {
+        let config = VmDriverConfig {
+            grpc_endpoint: "http://127.0.0.1:8080".to_string(),
+            ..Default::default()
+        };
+        let mut serialized = serde_json::to_value(config).unwrap();
+        serialized.as_object_mut().unwrap().insert(
+            "openshell_endpoint".to_string(),
+            serde_json::json!("http://127.0.0.1:9090"),
+        );
+
+        let error = serde_json::from_value::<VmDriverConfig>(serialized)
+            .expect_err("canonical and legacy names must not both be accepted");
+        assert!(error.to_string().contains("duplicate field"));
     }
 
     struct TestTracing {
@@ -7640,7 +7687,7 @@ mod tests {
     #[test]
     fn build_guest_environment_sets_supervisor_defaults() {
         let config = VmDriverConfig {
-            openshell_endpoint: "http://127.0.0.1:8080".to_string(),
+            grpc_endpoint: "http://127.0.0.1:8080".to_string(),
             ..Default::default()
         };
         let sandbox = Sandbox {
@@ -7675,7 +7722,7 @@ mod tests {
     #[test]
     fn persisted_legacy_sandbox_without_command_uses_scratch_main() {
         let config = VmDriverConfig {
-            openshell_endpoint: "http://127.0.0.1:8080".to_string(),
+            grpc_endpoint: "http://127.0.0.1:8080".to_string(),
             ..Default::default()
         };
         // Requests persisted before the canonical-main contract have a
@@ -7709,7 +7756,7 @@ mod tests {
     #[test]
     fn build_guest_environment_preserves_main_command_spaces() {
         let config = VmDriverConfig {
-            openshell_endpoint: "https://127.0.0.1:8080".to_string(),
+            grpc_endpoint: "https://127.0.0.1:8080".to_string(),
             ..Default::default()
         };
         let command = vec![
@@ -7746,7 +7793,7 @@ mod tests {
     #[test]
     fn build_guest_environment_uses_token_file_without_raw_token_env() {
         let config = VmDriverConfig {
-            openshell_endpoint: "http://127.0.0.1:8080".to_string(),
+            grpc_endpoint: "http://127.0.0.1:8080".to_string(),
             ..Default::default()
         };
         let sandbox = Sandbox {
@@ -7778,7 +7825,7 @@ mod tests {
     #[test]
     fn build_guest_environment_strips_gateway_tls_server_name() {
         let config = VmDriverConfig {
-            openshell_endpoint: "http://127.0.0.1:8080".to_string(),
+            grpc_endpoint: "http://127.0.0.1:8080".to_string(),
             ..Default::default()
         };
         let sandbox = Sandbox {
@@ -7815,7 +7862,7 @@ mod tests {
             )],
             || {
                 let config = VmDriverConfig {
-                    openshell_endpoint: "http://127.0.0.1:8080".to_string(),
+                    grpc_endpoint: "http://127.0.0.1:8080".to_string(),
                     ..Default::default()
                 };
                 let sandbox = Sandbox {
@@ -7854,7 +7901,7 @@ mod tests {
     #[test]
     fn build_guest_environment_clears_unsupported_network_capabilities() {
         let config = VmDriverConfig {
-            openshell_endpoint: "http://127.0.0.1:8080".to_string(),
+            grpc_endpoint: "http://127.0.0.1:8080".to_string(),
             ..Default::default()
         };
         let sandbox = Sandbox {
@@ -7884,7 +7931,7 @@ mod tests {
     #[test]
     fn build_guest_environment_uses_endpoint_override_for_tap() {
         let config = VmDriverConfig {
-            openshell_endpoint: "http://127.0.0.1:8080".to_string(),
+            grpc_endpoint: "http://127.0.0.1:8080".to_string(),
             ..Default::default()
         };
         let sandbox = Sandbox {
@@ -8086,7 +8133,7 @@ mod tests {
     #[test]
     fn build_guest_environment_includes_tls_paths_for_https_endpoint() {
         let config = VmDriverConfig {
-            openshell_endpoint: "https://127.0.0.1:8443".to_string(),
+            grpc_endpoint: "https://127.0.0.1:8443".to_string(),
             guest_tls_ca: Some(PathBuf::from("/host/ca.crt")),
             guest_tls_cert: Some(PathBuf::from("/host/tls.crt")),
             guest_tls_key: Some(PathBuf::from("/host/tls.key")),
@@ -8108,7 +8155,7 @@ mod tests {
     #[test]
     fn vm_driver_config_requires_tls_materials_for_https_endpoint() {
         let config = VmDriverConfig {
-            openshell_endpoint: "https://127.0.0.1:8443".to_string(),
+            grpc_endpoint: "https://127.0.0.1:8443".to_string(),
             ..Default::default()
         };
         let err = config
@@ -8643,7 +8690,7 @@ mod tests {
         let (events, _) = broadcast::channel(WATCH_BUFFER);
         VmDriver {
             config: VmDriverConfig {
-                openshell_endpoint: "http://127.0.0.1:8080".to_string(),
+                grpc_endpoint: "http://127.0.0.1:8080".to_string(),
                 vcpus: 2,
                 mem_mib: 2048,
                 gpu_vcpus: 8,
@@ -9006,7 +9053,7 @@ mod tests {
         ca_bundle: Option<&str>,
     ) -> VmDriverConfig {
         VmDriverConfig {
-            openshell_endpoint: "http://127.0.0.1:8080".to_string(),
+            grpc_endpoint: "http://127.0.0.1:8080".to_string(),
             https_proxy: https_proxy.map(ToString::to_string),
             proxy_auth_file: auth_file.map(ToString::to_string),
             proxy_auth_allow_insecure: auth_file.map(|_| true),

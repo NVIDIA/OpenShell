@@ -231,7 +231,7 @@ ttl_secs = 3600
 [openshell.drivers.docker]
 default_image = "${SANDBOX_IMAGE}"
 image_pull_policy = "${SANDBOX_IMAGE_PULL_POLICY}"
-sandbox_namespace = "${SANDBOX_NAMESPACE}"
+sandbox_label = "${SANDBOX_NAMESPACE}"
 grpc_endpoint = "${GRPC_ENDPOINT}"
 supervisor_bin = "${SUPERVISOR_BIN}"
 EOF

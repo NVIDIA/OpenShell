@@ -514,7 +514,7 @@ GATEWAY_CONFIG="${STATE_DIR}/gateway.toml"
   if [ "${OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" = "1" ]; then
     printf 'socket_path = %s\n' "$(toml_string "${DRIVER_SOCKET}")"
   else
-    printf 'sandbox_namespace = %s\n'    "$(toml_string "${E2E_NAMESPACE}")"
+    printf 'sandbox_label = %s\n'        "$(toml_string "${E2E_NAMESPACE}")"
     printf 'network_name = %s\n'         "$(toml_string "${DOCKER_NETWORK_NAME}")"
     printf 'grpc_endpoint = %s\n'        "$(toml_string "${GATEWAY_ENDPOINT}")"
     printf 'default_image = %s\n'        "$(toml_string "${SANDBOX_IMAGE}")"
@@ -532,7 +532,7 @@ GATEWAY_CONFIG="${STATE_DIR}/gateway.toml"
 
 if [ "${OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" = "1" ]; then
   {
-    printf 'sandbox_namespace = %s\n'    "$(toml_string "${E2E_NAMESPACE}")"
+    printf 'sandbox_label = %s\n'        "$(toml_string "${E2E_NAMESPACE}")"
     printf 'network_name = %s\n'         "$(toml_string "${DOCKER_NETWORK_NAME}")"
     printf 'grpc_endpoint = %s\n'        "$(toml_string "${GATEWAY_ENDPOINT}")"
     printf 'default_image = %s\n'        "$(toml_string "${SANDBOX_IMAGE}")"

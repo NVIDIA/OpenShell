@@ -755,13 +755,14 @@ use the workspace to select the target Kubernetes namespace instead of encoding
 it in the resource name. The label-based lookup and annotation patterns
 established here carry over unchanged.
 
-**Docker and Podman drivers.** The Docker driver's `sandbox_namespace` label
-provides a foundation for workspace mapping, but the driver currently uses a
-single configured namespace rather than per-sandbox values. The driver contract
-must be updated so that workspace flows through `DriverSandbox` and the driver
-applies it as the container label filter. The same applies to Podman and other
-local drivers — workspace isolation is enforced at the gateway level and does
-not require Kubernetes.
+**Docker and Podman drivers.** The Docker driver's `sandbox_label`
+configuration value is stored in the `openshell.sandbox_namespace` container
+label and provides a foundation for workspace mapping, but the driver currently
+uses a single configured value rather than per-sandbox values. The driver
+contract must be updated so that workspace flows through `DriverSandbox` and
+the driver applies it as the container label filter. The same applies to Podman
+and other local drivers — workspace isolation is enforced at the gateway level
+and does not require Kubernetes.
 
 ### Compute Driver Trust Model
 

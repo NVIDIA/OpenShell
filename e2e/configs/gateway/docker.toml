@@ -23,5 +23,5 @@ ttl_secs = 0
 [openshell.drivers.docker]
 default_image = "ghcr.io/nvidia/openshell-community/sandboxes/base:latest"
 image_pull_policy = "IfNotPresent"
-sandbox_namespace = "openshell-e2e"
+sandbox_label = "openshell-e2e"
 supervisor_image = "localhost/openshell/supervisor:e2e-vm"
