@@ -49,11 +49,30 @@ changes and every blocking qualification suite passes.
 OpenShell publishes a development release for every commit to `main`. Each
 development release identifies its source commit and artifact manifest, and the
 floating `dev` alias points to the newest one. Development releases enable all
-development compilation flags and features.
+development compilation flags and features. They give feature authors, early
+adopters, and integration owners a way to consume upcoming OpenShell changes
+between stable releases. This also allows development of a large feature to
+span multiple weeks behind a compile-time feature flag without including the
+unfinished feature in the stable release track. Development releases have
+passed normal CI, but have not passed release qualification and are not
+intended for production use.
 
 OpenShell builds a release candidate nightly for the next expected stable
 release when `main` has changed and normal CI passes. After `0.1.1`, candidates
 are numbered `0.1.2-rc.1`, `0.1.2-rc.2`, and so on. A release candidate is promoted to a stable release tag as part of the weekly release pipeline once the candidate has passed qualification.
+
+Release candidates give the automated release qualification and QA systems an
+immutable artifact set to evaluate. They are also available to maintainers and
+integration owners who need to validate the prospective stable release. An RC
+uses the same release feature set as stable and may still fail qualification;
+it is not intended for production use. A new RC is built nightly when eligible
+changes are available so failures can be fixed and reevaluated before Tuesday.
+
+| Release | Intended users | Contents and expectations |
+| --- | --- | --- |
+| Development | Feature authors, early adopters, and integration owners testing upcoming functionality | Published for every commit to `main`; enables development features; passes normal CI but not release qualification |
+| Release candidate | Automated qualification, maintainers, and integration owners validating the next stable release | Built nightly from eligible `main`; uses the stable feature set; immutable but not yet qualified for production |
+| Stable | Production users and downstream integrations that require the published compatibility and support contract | Published Tuesday by promoting an RC that passed every blocking qualification suite |
 
 ### Project version and compatibility contract
 
@@ -65,6 +84,10 @@ the `0.x` series:
 - Minor releases may represent notable new features even when they remain
   backward-compatible. They may also contain documented breaking changes to
   stable interfaces, for example `0.1.x` to `0.2.0`.
+
+The [release version selection supplement](release-version-selection.md)
+defines how Conventional Commits select the next patch or minor release
+candidate.
 
 ### API and feature maturity
 
@@ -125,12 +148,12 @@ publication:
 ```mermaid
 flowchart LR
     A["Commit to main"] --> B["Dev release<br/>dev features enabled"]
-    A --> C["Qualified main commit"]
+    A --> C["Normal CI passes"]
     C --> D["Nightly RC build<br/>release feature set"]
     D --> E["RC qualification"]
     E -->|"pass"| F["Eligible Tuesday candidate"]
     E -->|"fail"| G["No stable release"]
-    F --> H["Build or promote stable artifacts"]
+    F --> H["Promote exact RC artifacts"]
     H --> I["Final artifact checks"]
     I -->|"pass"| J["Create tag and publish"]
     I -->|"fail"| G
@@ -140,6 +163,11 @@ Every release candidate produces a manifest containing its version,
 full source commit, build inputs, artifact names and digests, SBOM and provenance
 references, and qualification results. Qualification installs and exercises the
 candidate artifacts wherever practical rather than substituting a source build.
+The candidate manifest carries the RC identifier so promotable binaries and
+content-addressable artifacts can be built with the prospective stable version.
+Once qualification begins, an RC is immutable: any source, dependency, build
+input, or artifact change creates a new RC. Stable publication adds the stable
+release references to the qualified artifacts without recompiling them.
 
 Release qualification consists of four suites defined in the
 [release qualification supplement](release-qualification.md):
