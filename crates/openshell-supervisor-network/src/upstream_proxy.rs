@@ -620,7 +620,9 @@ pub(crate) fn read_proxy_ca_bundle(path: &str, var_name: &str) -> Result<String,
     // silently rejected by `RootCertStore::add_parsable_certificates`;
     // counting only PEM blocks would let such a bundle satisfy the check
     // while contributing zero usable anchors at runtime.
-    let certs: Vec<_> = rustls_pemfile::certs(&mut pem.as_bytes()).flatten().collect();
+    let certs: Vec<_> = rustls_pemfile::certs(&mut pem.as_bytes())
+        .flatten()
+        .collect();
     if certs.is_empty() {
         return Err(format!(
             "{var_name} '{path}' contains no PEM certificate blocks"
