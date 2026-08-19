@@ -32,6 +32,12 @@ use std::sync::OnceLock;
 use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
 use tracing::{debug, info};
 
+// `TIOCSCTTY` is `c_ulong` on Linux but `c_uint` on macOS, while `ioctl`
+// accepts `c_ulong` on both platforms.
+#[cfg(unix)]
+#[allow(trivial_numeric_casts)]
+const TIOCSCTTY_REQUEST: libc::c_ulong = libc::TIOCSCTTY as libc::c_ulong;
+
 /// Process/filesystem enforcement performed by the process supervisor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProcessEnforcementMode {
@@ -763,7 +769,7 @@ impl ProcessHandle {
                         if libc::setsid() < 0 {
                             return Err(std::io::Error::last_os_error());
                         }
-                        if libc::ioctl(slave_fd, libc::TIOCSCTTY, 0) < 0 {
+                        if libc::ioctl(slave_fd, TIOCSCTTY_REQUEST, 0) < 0 {
                             return Err(std::io::Error::last_os_error());
                         }
                     } else {
@@ -927,7 +933,7 @@ impl ProcessHandle {
                         if libc::setsid() < 0 {
                             return Err(std::io::Error::last_os_error());
                         }
-                        if libc::ioctl(slave_fd, libc::TIOCSCTTY, 0) < 0 {
+                        if libc::ioctl(slave_fd, TIOCSCTTY_REQUEST, 0) < 0 {
                             return Err(std::io::Error::last_os_error());
                         }
                     } else {
