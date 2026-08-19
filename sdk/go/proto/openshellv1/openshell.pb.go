@@ -5839,8 +5839,9 @@ type StoredProviderCredentialRefreshState struct {
 	CredentialKey string                            `protobuf:"bytes,4,opt,name=credential_key,json=credentialKey,proto3" json:"credential_key,omitempty"`
 	Strategy      ProviderCredentialRefreshStrategy `protobuf:"varint,5,opt,name=strategy,proto3,enum=openshell.v1.ProviderCredentialRefreshStrategy" json:"strategy,omitempty"`
 	Material      map[string]string                 `protobuf:"bytes,6,rep,name=material,proto3" json:"material,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
-	// Material names classified as secret. Their values live in the active
-	// credential driver and are absent from material after migration.
+	// Material names classified as secret. Newly configured values live in the
+	// active credential driver and are absent from material. Legacy inline values
+	// are not automatically migrated before OpenShell 0.1.0.
 	SecretMaterialKeys   []string `protobuf:"bytes,7,rep,name=secret_material_keys,json=secretMaterialKeys,proto3" json:"secret_material_keys,omitempty"`
 	ExpiresAtMs          int64    `protobuf:"varint,8,opt,name=expires_at_ms,json=expiresAtMs,proto3" json:"expires_at_ms,omitempty"`
 	NextRefreshAtMs      int64    `protobuf:"varint,9,opt,name=next_refresh_at_ms,json=nextRefreshAtMs,proto3" json:"next_refresh_at_ms,omitempty"`

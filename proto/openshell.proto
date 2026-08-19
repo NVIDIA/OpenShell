@@ -1579,8 +1579,9 @@ message StoredProviderCredentialRefreshState {
   string credential_key = 4;
   ProviderCredentialRefreshStrategy strategy = 5;
   map<string, string> material = 6 [(openshell.options.v1.secret) = true];
-  // Material names classified as secret. Their values live in the active
-  // credential driver and are absent from material after migration.
+  // Material names classified as secret. Newly configured values live in the
+  // active credential driver and are absent from material. Legacy inline values
+  // are not automatically migrated before OpenShell 0.1.0.
   repeated string secret_material_keys = 7;
   int64 expires_at_ms = 8;
   int64 next_refresh_at_ms = 9;

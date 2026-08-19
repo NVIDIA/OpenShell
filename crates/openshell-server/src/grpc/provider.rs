@@ -3831,7 +3831,7 @@ pub(super) async fn handle_configure_provider_refresh(
             Err(err) => Err(err),
         }
     } else {
-        crate::provider_refresh::put_refresh_state(state.store.as_ref(), &state_record).await
+        crate::provider_refresh::create_refresh_state(state.store.as_ref(), &state_record).await
     };
     if let Err(err) = persist_result {
         if let Err(cleanup_err) = state
@@ -6038,6 +6038,127 @@ mod tests {
                 .unwrap()
                 .get("client_secret"),
             Some(&"original-secret".to_string())
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_first_refresh_configure_keeps_only_winner_material() {
+        let first_state = test_server_state().await;
+        import_test_graph_refresh_profile(&first_state).await;
+        create_provider_record(
+            first_state.store.as_ref(),
+            "default",
+            Provider {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    name: "configure-create-race".to_string(),
+                    workspace: "default".to_string(),
+                    ..Default::default()
+                }),
+                r#type: TEST_GRAPH_PROVIDER_TYPE.to_string(),
+                profile_workspace: "default".to_string(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        // Model a second gateway replica: it shares the durable database and
+        // credential backend, but owns an independent sandbox synchronization
+        // guard, so process-local serialization cannot hide this race.
+        let second_state = Arc::new(ServerState::new_with_credentials(
+            first_state.config.clone(),
+            Arc::clone(&first_state.store),
+            crate::compute::new_test_runtime(Arc::clone(&first_state.store)).await,
+            crate::sandbox_index::SandboxIndex::new(),
+            crate::sandbox_watch::SandboxWatchBus::new(),
+            crate::tracing_bus::TracingLogBus::new(),
+            Arc::new(crate::supervisor_session::SupervisorSessionRegistry::new()),
+            None,
+            first_state.credentials.clone(),
+        ));
+        let request = |client_secret: &str| ConfigureProviderRefreshRequest {
+            provider: "configure-create-race".to_string(),
+            credential_key: "MS_GRAPH_ACCESS_TOKEN".to_string(),
+            strategy: ProviderCredentialRefreshStrategy::Oauth2ClientCredentials as i32,
+            material: HashMap::from([
+                ("tenant_id".to_string(), "tenant".to_string()),
+                ("client_id".to_string(), "client-id".to_string()),
+                ("client_secret".to_string(), client_secret.to_string()),
+            ]),
+            secret_material_keys: vec!["client_secret".to_string()],
+            expires_at_ms: None,
+            workspace: "default".to_string(),
+        };
+        let (first_store_hit, release_first_store) = first_state.credentials.gate_next_store();
+
+        let first = handle_configure_provider_refresh(
+            &first_state,
+            authed_request(request("loser-secret")),
+        );
+        let second = async {
+            first_store_hit.await.unwrap();
+            let result = handle_configure_provider_refresh(
+                &second_state,
+                authed_request(request("winner-secret")),
+            )
+            .await;
+            release_first_store.send(()).unwrap();
+            result
+        };
+        let (first_result, second_result) = tokio::join!(first, second);
+
+        assert_eq!(first_result.unwrap_err().code(), Code::Aborted);
+        second_result.unwrap();
+        assert_eq!(first_state.credentials.stored_credential_count(), Some(1));
+
+        let provider = first_state
+            .store
+            .get_message_by_name::<Provider>("default", "configure-create-race")
+            .await
+            .unwrap()
+            .unwrap();
+        let stored = crate::provider_refresh::get_refresh_state(
+            first_state.store.as_ref(),
+            "default",
+            provider.object_id(),
+            "MS_GRAPH_ACCESS_TOKEN",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            first_state
+                .credentials
+                .resolve_refresh_material(
+                    crate::provider_refresh::refresh_material_scope(&stored),
+                    &stored.secret_material_handles,
+                )
+                .await
+                .unwrap()
+                .get("client_secret"),
+            Some(&"winner-secret".to_string())
+        );
+
+        let physical = first_state
+            .store
+            .get_by_name(
+                StoredProviderCredentialRefreshState::object_type(),
+                "default",
+                stored.object_name(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(physical.id, stored.object_id());
+        assert_eq!(
+            crate::provider_refresh::list_refresh_states_for_provider(
+                first_state.store.as_ref(),
+                provider.object_id(),
+            )
+            .await
+            .unwrap()
+            .len(),
+            1
         );
     }
 

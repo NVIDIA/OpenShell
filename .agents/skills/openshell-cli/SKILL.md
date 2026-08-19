@@ -184,9 +184,12 @@ The gateway stores secret refresh material through its active credential driver.
 With Vault selected, refresh tokens, client secrets, and private keys live in
 Vault alongside injectable provider credentials; refresh state contains only
 opaque handles. A credential-backend read or write failure makes refresh fail
-closed rather than falling back to inline storage. During an upgrade that
-migrates legacy inline refresh material, stop all older gateway replicas before
-starting the new version; do not use a mixed-version rolling update.
+closed rather than falling back to inline storage. Before OpenShell 0.1.0, the
+gateway does not migrate legacy inline refresh material or move secrets between
+credential backends. Reconfigure affected grants after upgrading, and remove or
+reconfigure credentials while the original backend remains available before
+changing backends. Do not run mixed gateway versions against the same refresh
+records.
 
 Gateway-managed refresh credentials use an identity-stable workload handle.
 Routine automatic refresh and `provider refresh rotate` update the access token

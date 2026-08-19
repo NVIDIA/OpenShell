@@ -73,6 +73,7 @@ pub fn effective_authorization_epoch(
         })
 }
 
+#[cfg(test)]
 pub async fn put_refresh_state(
     store: &Store,
     state: &StoredProviderCredentialRefreshState,
@@ -81,6 +82,37 @@ pub async fn put_refresh_state(
         .put_scoped_message(state, &state.provider_id)
         .await
         .map_err(|e| Status::internal(format!("persist provider refresh state failed: {e}")))
+}
+
+/// Atomically claim a new provider-and-credential refresh identity.
+///
+/// The refresh name is unique within a workspace. A concurrent creator must
+/// lose instead of overwriting the winner so its caller can delete any secret
+/// material staged before this write.
+pub async fn create_refresh_state(
+    store: &Store,
+    state: &StoredProviderCredentialRefreshState,
+) -> Result<(), Status> {
+    match store
+        .create_scoped(
+            StoredProviderCredentialRefreshState::object_type(),
+            state.object_id(),
+            state.object_name(),
+            state.object_workspace(),
+            &state.provider_id,
+            &state.encode_to_vec(),
+            None,
+        )
+        .await
+    {
+        Ok(_) => Ok(()),
+        Err(PersistenceError::UniqueViolation { .. }) => Err(Status::aborted(
+            "provider refresh was concurrently configured",
+        )),
+        Err(err) => Err(Status::internal(format!(
+            "create provider refresh state failed: {err}"
+        ))),
+    }
 }
 
 /// Persist an updated refresh state only if the row still exists with the
