@@ -4425,6 +4425,7 @@ endpoints:
     port: 5432
     protocol: tcp
     tls: skip
+    allow_uninspected_credentials: true
     allowed_ips: [10.0.0.0/8]
 binaries:
   - /usr/bin/psql
