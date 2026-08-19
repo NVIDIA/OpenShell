@@ -772,11 +772,8 @@ impl ProcessHandle {
                         if libc::ioctl(slave_fd, TIOCSCTTY_REQUEST, 0) < 0 {
                             return Err(std::io::Error::last_os_error());
                         }
-                    } else {
-                        // Create a distinct process group for signal forwarding.
-                        if libc::setpgid(0, 0) < 0 {
-                            return Err(std::io::Error::last_os_error());
-                        }
+                    } else if libc::setpgid(0, 0) < 0 {
+                        return Err(std::io::Error::last_os_error());
                     }
 
                     // Enter network namespace before applying other restrictions
@@ -936,10 +933,8 @@ impl ProcessHandle {
                         if libc::ioctl(slave_fd, TIOCSCTTY_REQUEST, 0) < 0 {
                             return Err(std::io::Error::last_os_error());
                         }
-                    } else {
-                        if libc::setpgid(0, 0) < 0 {
-                            return Err(std::io::Error::last_os_error());
-                        }
+                    } else if libc::setpgid(0, 0) < 0 {
+                        return Err(std::io::Error::last_os_error());
                     }
 
                     // Drop privileges before applying sandbox restrictions.
