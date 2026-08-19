@@ -445,12 +445,13 @@ VM driver currently reject it as unsupported.
 OpenShell creates a `policy/v1` PodDisruptionBudget with `minAvailable: 1` and
 persists an absolute UTC deadline on the Sandbox CR. The gateway reconciles the
 PDB from that deadline after restarts and schedules deletion at expiration
-while its Kubernetes watch is healthy. If every gateway is unavailable when
-the deadline passes, protection remains active until a gateway resumes
-reconciliation or an operator deletes the PDB. Treat the requested duration as
-a fail-closed expiration target, not a Kubernetes-enforced TTL. If the persisted
-deadline becomes malformed, OpenShell retains the PDB until an operator repairs
-or removes the annotation.
+while its Kubernetes watch is healthy. Gateway-scoped PDB management labels
+prevent one OpenShell installation from reconciling another installation's
+PDBs. If every gateway is unavailable when the deadline passes, protection
+remains active until a gateway resumes reconciliation or an operator deletes
+the PDB. Treat the requested duration as a fail-closed expiration target, not a
+Kubernetes-enforced TTL. If the persisted deadline becomes malformed,
+OpenShell retains the PDB until an operator repairs or removes the annotation.
 
 This protects only against voluntary evictions that honor PDBs. It does not
 prevent node failure, preemption, direct pod or Sandbox deletion, or platform

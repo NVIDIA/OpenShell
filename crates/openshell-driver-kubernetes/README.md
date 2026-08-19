@@ -69,7 +69,9 @@ sandbox pod, and sets `unhealthyPodEvictionPolicy: AlwaysAllow`. The driver
 creates the PDB before the Sandbox, adds the Sandbox owner reference after the
 CR exists, repairs missing or changed managed PDBs during gateway
 reconciliation, and schedules cleanup from Sandbox watch events at the
-deadline. The periodic gateway reconciliation sweep is the repair fallback.
+deadline. PDB management metadata includes the gateway ID so cluster-wide
+reconciliation cannot adopt or remove another OpenShell installation's PDBs.
+The periodic gateway reconciliation sweep is the repair fallback.
 Expiration is fail-closed: if all gateways are unavailable at the deadline, the
 PDB remains active until a gateway resumes or an operator deletes it. A
 malformed persisted deadline also retains protection until an operator repairs

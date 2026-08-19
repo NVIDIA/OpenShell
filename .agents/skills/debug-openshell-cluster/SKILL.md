@@ -449,7 +449,9 @@ Both opt-ins are required: Helm
 `--disruption-protection <duration>` (or the corresponding Sandbox API field).
 A request over `maxDuration` is rejected. The PDB should use `minAvailable: 1`,
 `unhealthyPodEvictionPolicy: AlwaysAllow`, and an owner reference to the
-Sandbox CR. OpenShell stores an absolute UTC deadline in
+Sandbox CR. Its `openshell.ai/gateway-id` management label must match the
+Sandbox CR so cluster-wide reconciliation remains scoped to this gateway.
+OpenShell stores an absolute UTC deadline in
 `openshell.io/disruption-protected-until`; an expired PDB can remain while all
 gateways are down but should be removed after gateway reconciliation resumes.
 Turning the operator gate off rejects new requests but retains existing PDBs

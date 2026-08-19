@@ -1158,25 +1158,17 @@ impl KubernetesComputeDriver {
     }
 
     fn verify_managed_disruption_protection_pdb(
+        &self,
         pdb: &PodDisruptionBudget,
         sandbox_id: &str,
     ) -> Result<(), KubernetesDriverError> {
-        let labels = pdb.metadata.labels.as_ref();
-        let managed = labels
-            .and_then(|labels| labels.get(LABEL_MANAGED_BY))
-            .is_some_and(|value| value == LABEL_MANAGED_BY_VALUE)
-            && labels
-                .and_then(|labels| labels.get(DISRUPTION_PROTECTION_LABEL))
-                .is_some_and(|value| value == DISRUPTION_PROTECTION_LABEL_VALUE)
-            && labels
-                .and_then(|labels| labels.get(LABEL_SANDBOX_ID))
-                .is_some_and(|value| value == sandbox_id);
-        if managed {
+        if disruption_protection_pdb_is_managed_by(pdb, sandbox_id, &self.config.gateway_id) {
             Ok(())
         } else {
             Err(KubernetesDriverError::Precondition(format!(
-                "PodDisruptionBudget '{}' already exists and is not managed by OpenShell for sandbox '{sandbox_id}'",
-                pdb.metadata.name.as_deref().unwrap_or("<unknown>")
+                "PodDisruptionBudget '{}' already exists and is not managed by OpenShell gateway '{}' for sandbox '{sandbox_id}'",
+                pdb.metadata.name.as_deref().unwrap_or("<unknown>"),
+                self.config.gateway_id
             )))
         }
     }
@@ -1209,7 +1201,7 @@ impl KubernetesComputeDriver {
                         ))
                     })?
                     .map_err(KubernetesDriverError::from_kube)?;
-                Self::verify_managed_disruption_protection_pdb(&existing, sandbox_id)?;
+                self.verify_managed_disruption_protection_pdb(&existing, sandbox_id)?;
                 // Do not rewrite an existing PDB before the Sandbox create
                 // succeeds. A duplicate CreateSandbox request calculates a new
                 // absolute deadline; applying it here would let a failed 409
@@ -1272,7 +1264,7 @@ impl KubernetesComputeDriver {
         sandbox_id: &str,
         mut desired: PodDisruptionBudget,
     ) -> Result<(), KubernetesDriverError> {
-        Self::verify_managed_disruption_protection_pdb(&existing, sandbox_id)?;
+        self.verify_managed_disruption_protection_pdb(&existing, sandbox_id)?;
         if Self::disruption_protection_pdb_matches(&existing, &desired) {
             return Ok(());
         }
@@ -1321,8 +1313,14 @@ impl KubernetesComputeDriver {
         })?;
         let owner = disruption_protection_owner_reference(sandbox, resource)
             .map_err(KubernetesDriverError::Message)?;
-        let desired =
-            disruption_protection_pdb(name, namespace, sandbox_id, protected_until, Some(owner));
+        let desired = disruption_protection_pdb(
+            name,
+            namespace,
+            sandbox_id,
+            &self.config.gateway_id,
+            protected_until,
+            Some(owner),
+        );
         let api = self.disruption_protection_api(namespace);
         if let Some(existing) = existing {
             return self
@@ -1449,7 +1447,7 @@ impl KubernetesComputeDriver {
         let Some(existing) = existing else {
             return Ok(());
         };
-        Self::verify_managed_disruption_protection_pdb(&existing, sandbox_id)
+        self.verify_managed_disruption_protection_pdb(&existing, sandbox_id)
             .map_err(|err| err.to_string())?;
         if let Some(expected_deadline) = expected_deadline {
             let observed_deadline = existing
@@ -1528,7 +1526,7 @@ impl KubernetesComputeDriver {
         pdb: &PodDisruptionBudget,
         sandbox_id: &str,
     ) -> Result<(), String> {
-        Self::verify_managed_disruption_protection_pdb(pdb, sandbox_id)
+        self.verify_managed_disruption_protection_pdb(pdb, sandbox_id)
             .map_err(|err| err.to_string())?;
         self.delete_disruption_protection_pdb(pdb).await
     }
@@ -1666,7 +1664,7 @@ impl KubernetesComputeDriver {
                 // deadline or removes protection explicitly.
                 if !self.config.disruption_protection.enabled {
                     if let Some(pdb) = existing.as_ref() {
-                        Self::verify_managed_disruption_protection_pdb(pdb, &sandbox_id)
+                        self.verify_managed_disruption_protection_pdb(pdb, &sandbox_id)
                             .map_err(|verify_err| verify_err.to_string())?;
                         return Err(format!(
                             "{err}; existing disruption protection was retained without repair because new requests are disabled"
@@ -1708,7 +1706,7 @@ impl KubernetesComputeDriver {
                             .to_string(),
                     );
                 };
-                Self::verify_managed_disruption_protection_pdb(pdb, &sandbox_id)
+                self.verify_managed_disruption_protection_pdb(pdb, &sandbox_id)
                     .map_err(|err| err.to_string())?;
                 debug!(
                     namespace,
@@ -1741,9 +1739,7 @@ impl KubernetesComputeDriver {
         } else {
             self.disruption_protection_api(&self.config.namespace)
         };
-        let selector = format!(
-            "{LABEL_MANAGED_BY}={LABEL_MANAGED_BY_VALUE},{DISRUPTION_PROTECTION_LABEL}={DISRUPTION_PROTECTION_LABEL_VALUE}"
-        );
+        let selector = disruption_protection_pdb_selector(&self.config.gateway_id);
         let existing = tokio::time::timeout(
             KUBE_API_TIMEOUT,
             api.list(&ListParams::default().labels(&selector)),
@@ -2265,6 +2261,7 @@ impl KubernetesComputeDriver {
                 &kube_name,
                 &target_namespace,
                 &sandbox.id,
+                &self.config.gateway_id,
                 protected_until,
                 None,
             )
@@ -3232,6 +3229,32 @@ fn openshell_sandbox_selector_for(gateway_id: &str) -> String {
     selector
 }
 
+fn disruption_protection_pdb_selector(gateway_id: &str) -> String {
+    format!(
+        "{LABEL_MANAGED_BY}={LABEL_MANAGED_BY_VALUE},{DISRUPTION_PROTECTION_LABEL}={DISRUPTION_PROTECTION_LABEL_VALUE},{LABEL_GATEWAY_ID}={gateway_id}"
+    )
+}
+
+fn disruption_protection_pdb_is_managed_by(
+    pdb: &PodDisruptionBudget,
+    sandbox_id: &str,
+    gateway_id: &str,
+) -> bool {
+    let labels = pdb.metadata.labels.as_ref();
+    labels
+        .and_then(|labels| labels.get(LABEL_MANAGED_BY))
+        .is_some_and(|value| value == LABEL_MANAGED_BY_VALUE)
+        && labels
+            .and_then(|labels| labels.get(DISRUPTION_PROTECTION_LABEL))
+            .is_some_and(|value| value == DISRUPTION_PROTECTION_LABEL_VALUE)
+        && labels
+            .and_then(|labels| labels.get(LABEL_SANDBOX_ID))
+            .is_some_and(|value| value == sandbox_id)
+        && labels
+            .and_then(|labels| labels.get(LABEL_GATEWAY_ID))
+            .is_some_and(|value| value == gateway_id)
+}
+
 fn sandbox_labels(sandbox: &Sandbox, gateway_id: Option<&str>) -> BTreeMap<String, String> {
     let mut labels = BTreeMap::new();
     labels.insert(LABEL_SANDBOX_ID.to_string(), sandbox.id.clone());
@@ -3460,6 +3483,7 @@ fn disruption_protection_pdb(
     name: &str,
     namespace: &str,
     sandbox_id: &str,
+    gateway_id: &str,
     protected_until: &str,
     owner_reference: Option<OwnerReference>,
 ) -> PodDisruptionBudget {
@@ -3474,11 +3498,13 @@ fn disruption_protection_pdb(
             DISRUPTION_PROTECTION_LABEL_VALUE.to_string(),
         ),
     ]);
+    let mut management_labels = selector_labels.clone();
+    management_labels.insert(LABEL_GATEWAY_ID.to_string(), gateway_id.to_string());
     PodDisruptionBudget {
         metadata: ObjectMeta {
             name: Some(name.to_string()),
             namespace: Some(namespace.to_string()),
-            labels: Some(selector_labels.clone()),
+            labels: Some(management_labels),
             annotations: Some(BTreeMap::from([(
                 DISRUPTION_PROTECTED_UNTIL_ANNOTATION.to_string(),
                 protected_until.to_string(),
@@ -6396,11 +6422,20 @@ mod tests {
             "workspace--tool",
             "openshell",
             "sandbox-id",
+            "gateway-a",
             "2026-08-10T16:00:00Z",
             Some(owner.clone()),
         );
 
         assert_eq!(pdb.metadata.owner_references, Some(vec![owner]));
+        assert_eq!(
+            pdb.metadata
+                .labels
+                .as_ref()
+                .and_then(|labels| labels.get(LABEL_GATEWAY_ID))
+                .map(String::as_str),
+            Some("gateway-a")
+        );
         assert_eq!(
             pdb.metadata
                 .annotations
@@ -6430,6 +6465,36 @@ mod tests {
             selector.get(LABEL_MANAGED_BY).map(String::as_str),
             Some(LABEL_MANAGED_BY_VALUE)
         );
+        assert!(!selector.contains_key(LABEL_GATEWAY_ID));
+    }
+
+    #[test]
+    fn disruption_protection_pdb_management_is_scoped_to_its_gateway() {
+        let pdb = disruption_protection_pdb(
+            "workspace--tool",
+            "openshell",
+            "sandbox-id",
+            "gateway-a",
+            "2026-08-10T16:00:00Z",
+            None,
+        );
+
+        assert!(disruption_protection_pdb_is_managed_by(
+            &pdb,
+            "sandbox-id",
+            "gateway-a"
+        ));
+        assert!(!disruption_protection_pdb_is_managed_by(
+            &pdb,
+            "sandbox-id",
+            "gateway-b"
+        ));
+        assert_eq!(
+            disruption_protection_pdb_selector("gateway-a"),
+            format!(
+                "{LABEL_MANAGED_BY}={LABEL_MANAGED_BY_VALUE},{DISRUPTION_PROTECTION_LABEL}={DISRUPTION_PROTECTION_LABEL_VALUE},{LABEL_GATEWAY_ID}=gateway-a"
+            )
+        );
     }
 
     #[test]
@@ -6446,6 +6511,7 @@ mod tests {
             "workspace--tool",
             "openshell",
             "sandbox-id",
+            "gateway-a",
             "2026-08-10T16:00:00Z",
             Some(owner),
         );
@@ -6471,6 +6537,7 @@ mod tests {
             "workspace--tool",
             "openshell",
             "sandbox-id",
+            "gateway-a",
             "2026-08-10T16:00:00Z",
             None,
         );
@@ -6478,6 +6545,7 @@ mod tests {
             "workspace--tool",
             "openshell",
             "sandbox-id",
+            "gateway-a",
             "2026-08-10T20:00:00Z",
             None,
         );
@@ -6496,6 +6564,7 @@ mod tests {
             "workspace--tool",
             "openshell",
             "sandbox-id",
+            "gateway-a",
             "2026-08-10T16:00:00Z",
             None,
         );
@@ -6516,6 +6585,7 @@ mod tests {
             "workspace--tool",
             "openshell",
             "sandbox-id",
+            "gateway-a",
             "2026-08-10T16:00:00Z",
             None,
         );
