@@ -1,0 +1,19 @@
+flowchart TD
+    P1["Phase 1: Foundation\nOIDC + Providers + Watch\nSDK-only, no gateway changes"]
+    P2["Phase 2: File Transfer\nNew UploadFile / DownloadFile RPCs\nGateway + Supervisor + SDK\nRequires RFC acceptance"]
+    P3["Phase 3: TypeScript SDK\nNew package from protos\nFeature parity with Python\nPublish to npm"]
+    P4["Phase 4: Integration Examples\nAnthropic worker · OpenAI provider\nOpenClaw plugin rewrite"]
+    P5["Phase 5: Policy + Services\nPer-tenant policies · Service exposure\nLog retrieval"]
+
+    P1 -- "OIDC + provider patterns" --> P3
+    P2 -- "file transfer wrappers" --> P3
+    P1 -- "Python SDK surface" --> P4
+    P2 -- "upload/download for full UCs" --> P4
+    P3 -- "TS SDK for OpenClaw rewrite" --> P4
+    P1 -- "Python SDK base" --> P5
+
+    style P1 fill:#37A3A3,stroke:#004D4D,color:#fff
+    style P2 fill:#EE0000,stroke:#A60000,color:#fff
+    style P3 fill:#F5921B,stroke:#C27516,color:#fff
+    style P4 fill:#5E40BE,stroke:#21134D,color:#fff
+    style P5 fill:#999999,stroke:#666666,color:#fff
