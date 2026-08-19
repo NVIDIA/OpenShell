@@ -95,7 +95,7 @@ run = [
 ["e2e:supervisor-middleware"]
 description = "Run the authenticated supervisor middleware happy-path E2E test against a Docker-backed gateway"
 run = [
-  "OPENSHELL_E2E_MIDDLEWARE_FIXTURE=1 e2e/with-docker-gateway.sh cargo test --manifest-path e2e/rust/Cargo.toml --features e2e-docker --test supervisor_middleware -- --nocapture",
+  "OPENSHELL_E2E_MIDDLEWARE_FIXTURE=1 e2e/with-docker-gateway.sh cargo test --manifest-path e2e/rust/Cargo.toml --features e2e-supervisor-middleware --test supervisor_middleware -- --nocapture",
 ]
 
 ["e2e:mcp"]
