@@ -172,11 +172,13 @@ For GPU-backed Docker sandboxes, configure Docker CDI before starting the gatewa
 For Docker GPU/CDI sandboxes, OpenShell uses Docker's selected CDI device IDs
 and daemon-reported CDI spec directories to build a supervisor-only CDI
 context. The driver mounts the spec directories read-only into the sandbox
-container, uploads `cdi-context.json` before starting the container, and removes
-the created container if that upload fails. The supervisor resolves the context
-inside the sandbox and derives the inner filesystem and supplemental group
-requirements from CDI specs. Non-GPU Docker sandboxes do not receive the CDI
-context, spec mounts, or CDI-derived policy changes.
+container. Before creation, it writes a gateway-owned `cdi-context.json` and
+bind-mounts it read-only into the supervisor. If context or token creation
+fails, the driver removes the created state files; if container creation or
+start fails, it also removes the container and state files. The supervisor
+resolves the context inside the sandbox and derives the inner filesystem and
+supplemental group requirements from CDI specs. Non-GPU Docker sandboxes do not
+receive the CDI context, spec mounts, or CDI-derived policy changes.
 
 ### Docker Driver Config Mounts
 
