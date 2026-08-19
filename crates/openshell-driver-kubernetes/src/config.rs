@@ -7,6 +7,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::str::FromStr;
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
 /// Default gateway identity used in managed-mode namespace naming.
 pub const DEFAULT_GATEWAY_ID: &str = "openshell";
@@ -22,6 +23,62 @@ pub const DEFAULT_WORKSPACE_STORAGE_SIZE: &str = "2Gi";
 
 /// Default non-root UID for relaxed Kubernetes network supervisor sidecars.
 pub const DEFAULT_PROXY_UID: u32 = 1337;
+
+/// Maximum disruption-protection duration accepted when the operator enables
+/// per-sandbox `PodDisruptionBudgets`.
+pub const DEFAULT_DISRUPTION_PROTECTION_MAX_DURATION: &str = "24h";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct KubernetesDisruptionProtectionConfig {
+    /// Allow callers to request a time-bounded `PodDisruptionBudget` for an
+    /// individual Kubernetes sandbox. Enabling this capability alone does not
+    /// protect any sandbox; the caller must also provide a duration in the
+    /// first-class sandbox API request.
+    pub enabled: bool,
+    /// Upper bound for a caller-provided protection duration.
+    pub max_duration: String,
+}
+
+impl Default for KubernetesDisruptionProtectionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_duration: DEFAULT_DISRUPTION_PROTECTION_MAX_DURATION.to_string(),
+        }
+    }
+}
+
+pub(crate) fn parse_disruption_protection_duration(value: &str) -> Result<Duration, String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err("duration must not be empty".to_string());
+    }
+
+    let unit_len = value.chars().last().map_or(0, char::len_utf8);
+    let (amount, unit) = value.split_at(value.len() - unit_len);
+    let amount = amount.parse::<u64>().map_err(|_| {
+        format!("invalid duration '{value}'; expected values such as 30m, 4h, or 24h")
+    })?;
+    if amount == 0 {
+        return Err("duration must be greater than zero".to_string());
+    }
+
+    let seconds_per_unit = match unit {
+        "s" => 1,
+        "m" => 60,
+        "h" => 60 * 60,
+        _ => {
+            return Err(format!(
+                "invalid duration unit '{unit}'; use seconds (s), minutes (m), or hours (h)"
+            ));
+        }
+    };
+    amount
+        .checked_mul(seconds_per_unit)
+        .map(Duration::from_secs)
+        .ok_or_else(|| format!("duration '{value}' is too large"))
+}
 
 /// How the supervisor binary is delivered into sandbox pods.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -340,6 +397,8 @@ pub struct KubernetesComputeConfig {
     /// Send hostnames rather than validated IPs in CONNECT requests. This is a
     /// last-resort compatibility mode for hostname-filtering proxy ACLs.
     pub proxy_connect_by_hostname: Option<bool>,
+    /// Operator policy for caller-requested, per-sandbox `PodDisruptionBudgets`.
+    pub disruption_protection: KubernetesDisruptionProtectionConfig,
     pub grpc_endpoint: String,
     pub ssh_socket_path: String,
     pub client_tls_secret_name: String,
@@ -452,6 +511,7 @@ impl Default for KubernetesComputeConfig {
             proxy_auth_secret_key: None,
             proxy_auth_allow_insecure: None,
             proxy_connect_by_hostname: None,
+            disruption_protection: KubernetesDisruptionProtectionConfig::default(),
             grpc_endpoint: String::new(),
             ssh_socket_path: openshell_core::container_paths::SSH_SOCKET_PATH.to_string(),
             client_tls_secret_name: String::new(),
@@ -470,6 +530,12 @@ impl Default for KubernetesComputeConfig {
 }
 
 impl KubernetesComputeConfig {
+    pub fn validate_disruption_protection_config(&self) -> Result<(), String> {
+        parse_disruption_protection_duration(&self.disruption_protection.max_duration)
+            .map(|_| ())
+            .map_err(|err| format!("disruption_protection.max_duration: {err}"))
+    }
+
     /// Clamp `sa_token_ttl_secs` into the `[MIN_SA_TOKEN_TTL_SECS,
     /// MAX_SA_TOKEN_TTL_SECS]` range used by the projected-volume spec.
     /// Invalid (≤0) values fall back to the default 3600.
@@ -971,6 +1037,63 @@ fn validate_provider_spiffe_workload_api_socket_path_value(
 mod tests {
     use super::*;
     use std::collections::BTreeMap as HashMap;
+
+    #[test]
+    fn disruption_protection_is_disabled_by_default() {
+        let cfg = KubernetesComputeConfig::default();
+        assert!(!cfg.disruption_protection.enabled);
+        assert_eq!(
+            cfg.disruption_protection.max_duration,
+            DEFAULT_DISRUPTION_PROTECTION_MAX_DURATION
+        );
+    }
+
+    #[test]
+    fn parses_disruption_protection_duration_units() {
+        assert_eq!(
+            parse_disruption_protection_duration("30s").unwrap(),
+            Duration::from_secs(30)
+        );
+        assert_eq!(
+            parse_disruption_protection_duration("5m").unwrap(),
+            Duration::from_secs(300)
+        );
+        assert_eq!(
+            parse_disruption_protection_duration("4h").unwrap(),
+            Duration::from_secs(14_400)
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_disruption_protection_durations() {
+        for value in ["", "0h", "4", "1d", "-1h", "1.5h"] {
+            assert!(
+                parse_disruption_protection_duration(value).is_err(),
+                "duration {value:?} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn validates_disruption_protection_operator_maximum() {
+        let valid: KubernetesComputeConfig = serde_json::from_value(serde_json::json!({
+            "disruption_protection": {
+                "enabled": true,
+                "max_duration": "4h"
+            }
+        }))
+        .unwrap();
+        assert!(valid.validate_disruption_protection_config().is_ok());
+
+        let invalid: KubernetesComputeConfig = serde_json::from_value(serde_json::json!({
+            "disruption_protection": {
+                "enabled": true,
+                "max_duration": "forever"
+            }
+        }))
+        .unwrap();
+        assert!(invalid.validate_disruption_protection_config().is_err());
+    }
 
     #[test]
     fn default_workspace_storage_size_is_2gi() {

@@ -13,6 +13,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/durationpb"
 	"google.golang.org/protobuf/types/known/structpb"
 )
 
@@ -56,6 +57,9 @@ func TestSandboxFromProto(t *testing.T) {
 					Count: &gpuCount,
 				},
 			},
+			DisruptionProtection: &pb.DisruptionProtectionRequest{
+				Duration: durationpb.New(4 * time.Hour),
+			},
 		},
 		Status: &pb.SandboxStatus{
 			SandboxName:          "sb-compute-1",
@@ -95,6 +99,8 @@ func TestSandboxFromProto(t *testing.T) {
 	assert.Equal(t, []string{"claude", "github"}, s.Spec.Providers)
 	require.NotNil(t, s.Spec.GPUCount)
 	assert.Equal(t, uint32(2), *s.Spec.GPUCount)
+	require.NotNil(t, s.Spec.DisruptionProtectionDuration)
+	assert.Equal(t, 4*time.Hour, *s.Spec.DisruptionProtectionDuration)
 
 	// Template
 	require.NotNil(t, s.Spec.Template)
@@ -220,6 +226,7 @@ func TestSandboxToProto(t *testing.T) {
 	userNS := true
 	gpuCount := uint32(4)
 	delTime := time.UnixMilli(1700000060000).UTC()
+	disruptionProtection := 2 * time.Hour
 	s := &v1.Sandbox{
 		ID:                "sb-1",
 		Name:              "my-sandbox",
@@ -243,6 +250,7 @@ func TestSandboxToProto(t *testing.T) {
 			},
 			Providers: []string{"prov-a"},
 			GPUCount:  &gpuCount,
+			DisruptionProtectionDuration: &disruptionProtection,
 		},
 	}
 
@@ -267,6 +275,8 @@ func TestSandboxToProto(t *testing.T) {
 	require.NotNil(t, p.Spec.ResourceRequirements)
 	require.NotNil(t, p.Spec.ResourceRequirements.Gpu)
 	assert.Equal(t, uint32(4), p.Spec.ResourceRequirements.Gpu.GetCount())
+	require.NotNil(t, p.Spec.DisruptionProtection)
+	assert.Equal(t, 2*time.Hour, p.Spec.DisruptionProtection.Duration.AsDuration())
 
 	require.NotNil(t, p.Spec.Template)
 	assert.Equal(t, "img:v1", p.Spec.Template.Image)

@@ -3774,6 +3774,7 @@ dependencies = [
 name = "openshell-driver-kubernetes"
 version = "0.0.0"
 dependencies = [
+ "chrono",
  "clap",
  "futures",
  "k8s-openapi",
@@ -4070,6 +4071,7 @@ dependencies = [
  "miette",
  "oauth2",
  "openshell-core",
+ "prost-types",
  "reqwest 0.12.28",
  "rustls 0.23.38",
  "serde",

@@ -305,6 +305,16 @@ workload is a StatefulSet for SQLite-backed single-replica installs. External
 database-backed installs can render a Deployment with `workload.kind=deployment`;
 HA deployments must point `server.externalDbSecret` at an operator-managed
 PostgreSQL database.
+The Kubernetes driver can also own an opt-in PodDisruptionBudget with a
+fail-closed expiration target for a sandbox. The gateway persists the absolute
+deadline on the Agent Sandbox CR, schedules deadline cleanup while its watch is
+healthy, and reconciles the PDB after interruptions. An owner reference
+provides deletion cleanup, while gateway-scoped management metadata isolates
+cluster-wide reconciliation between OpenShell installations. This is
+voluntary-eviction protection, not sandbox state persistence or recovery. The
+portable Sandbox API carries the requested duration and the compute-driver
+capability contract reports support, operator enablement, and the maximum.
+Docker, Podman, and VM currently report the capability as unsupported.
 Standalone local deployments start the gateway with a selected runtime such as
 Docker, Podman, or VM. The CLI can register multiple gateways and switch between
 them without changing the sandbox architecture.

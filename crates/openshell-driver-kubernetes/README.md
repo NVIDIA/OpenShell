@@ -49,6 +49,41 @@ by the gateway.
 Kubernetes API calls use explicit timeouts so gRPC handlers do not block
 indefinitely when the API server is slow or unavailable.
 
+## Disruption Protection
+
+The driver can create a `policy/v1` `PodDisruptionBudget` with a fail-closed
+expiration target for an individual sandbox. This capability uses two explicit
+opt-ins: the operator sets `disruption_protection.enabled = true`, and the
+sandbox sets the first-class `disruption_protection` duration through the API
+or `openshell sandbox create --disruption-protection`.
+The operator's `max_duration` limits each request. Durations are positive
+integer seconds, minutes, or hours, such as `30m` or `4h`.
+Disabling the operator gate rejects new requests without shortening previously
+accepted intervals. Existing PDBs remain until their deadlines, but the driver
+does not recreate or patch them while the gate and mutation RBAC are disabled.
+
+OpenShell calculates an absolute UTC deadline and stores it in the
+`openshell.io/disruption-protected-until` annotation on both the Sandbox and
+PDB. The PDB uses `minAvailable: 1`, selects only the corresponding OpenShell
+sandbox pod, and sets `unhealthyPodEvictionPolicy: AlwaysAllow`. The driver
+creates the PDB before the Sandbox, adds the Sandbox owner reference after the
+CR exists, repairs missing or changed managed PDBs during gateway
+reconciliation, and schedules cleanup from Sandbox watch events at the
+deadline. PDB management metadata includes the gateway ID so cluster-wide
+reconciliation cannot adopt or remove another OpenShell installation's PDBs.
+The periodic gateway reconciliation sweep is the repair fallback.
+Expiration is fail-closed: if all gateways are unavailable at the deadline, the
+PDB remains active until a gateway resumes or an operator deletes it. A
+malformed persisted deadline also retains protection until an operator repairs
+or removes the annotation; it never serves as evidence that protection expired.
+
+PDBs constrain voluntary eviction through the Kubernetes Eviction API. They do
+not prevent node failure, preemption, direct pod or Sandbox deletion, or other
+involuntary disruption, and they do not provide sandbox backup or restore.
+The standalone driver accepts the same operator settings through
+`OPENSHELL_K8S_DISRUPTION_PROTECTION_ENABLED` and
+`OPENSHELL_K8S_DISRUPTION_PROTECTION_MAX_DURATION`.
+
 ## Workspace Persistence
 
 Sandbox pods use a PVC-backed `/sandbox` workspace. An init container seeds the
@@ -177,6 +212,14 @@ forwards only the `kubernetes` object to this driver:
 ```shell
 openshell sandbox create \
   --driver-config-json '{"kubernetes":{"pod":{"runtime_class_name":"kata-containers","node_selector":{"pool":"gpu"}}}}' \
+  -- claude
+```
+
+When the operator enables disruption protection, request it for one sandbox:
+
+```shell
+openshell sandbox create \
+  --disruption-protection 4h \
   -- claude
 ```
 

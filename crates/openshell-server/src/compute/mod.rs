@@ -33,16 +33,19 @@ use hyper_util::rt::TokioIo;
 use openshell_core::ComputeDriverKind;
 use openshell_core::proto::compute::v1::{
     CreateSandboxRequest, DeleteSandboxRequest, DeleteWorkspaceRequest, DeleteWorkspaceResponse,
-    DriverCondition, DriverPlatformEvent, DriverResourceRequirements, DriverSandbox,
-    DriverSandboxSpec, DriverSandboxStatus, DriverSandboxTemplate, EnsureWorkspaceRequest,
-    EnsureWorkspaceResponse, GatewayListenerRequirement as ProtoGatewayListenerRequirement,
-    GetCapabilitiesRequest, GetGatewayListenerRequirementsRequest,
-    GetGatewayListenerRequirementsResponse, GetSandboxRequest,
-    GpuResourceRequirements as DriverGpuResourceRequirements, ListSandboxesRequest,
-    ResourceRequirements as DriverSandboxResourceRequirements, StartSandboxRequest,
-    StopSandboxRequest, ValidateSandboxCreateRequest, WatchSandboxesEvent, WatchSandboxesRequest,
-    compute_driver_client::ComputeDriverClient, compute_driver_server::ComputeDriver,
-    gateway_listener_requirement::Selector, watch_sandboxes_event,
+    DisruptionProtectionCapability as DriverDisruptionProtectionCapability,
+    DisruptionProtectionRequest as DriverDisruptionProtectionRequest,
+    DisruptionProtectionSupport as DriverDisruptionProtectionSupport, DriverCondition,
+    DriverPlatformEvent, DriverResourceRequirements, DriverSandbox, DriverSandboxSpec,
+    DriverSandboxStatus, DriverSandboxTemplate, EnsureWorkspaceRequest, EnsureWorkspaceResponse,
+    GatewayListenerRequirement as ProtoGatewayListenerRequirement, GetCapabilitiesRequest,
+    GetGatewayListenerRequirementsRequest, GetGatewayListenerRequirementsResponse,
+    GetSandboxRequest, GpuResourceRequirements as DriverGpuResourceRequirements,
+    ListSandboxesRequest, ResourceRequirements as DriverSandboxResourceRequirements,
+    StartSandboxRequest, StopSandboxRequest, ValidateSandboxCreateRequest, WatchSandboxesEvent,
+    WatchSandboxesRequest, compute_driver_client::ComputeDriverClient,
+    compute_driver_server::ComputeDriver, gateway_listener_requirement::Selector,
+    watch_sandboxes_event,
 };
 use openshell_core::proto::{
     PlatformEvent, Sandbox, SandboxCondition, SandboxPhase, SandboxSpec, SandboxStatus,
@@ -274,6 +277,8 @@ pub struct ComputeDriverInfoSnapshot {
     pub driver_name: String,
     /// Driver-reported implementation version from the startup capability snapshot.
     pub driver_version: String,
+    /// Driver and operator support for bounded voluntary-disruption protection.
+    pub disruption_protection: Option<DriverDisruptionProtectionCapability>,
 }
 
 #[tonic::async_trait]
@@ -653,6 +658,7 @@ impl ComputeRuntime {
             name: driver_name.clone(),
             driver_name: capabilities.driver_name,
             driver_version: capabilities.driver_version,
+            disruption_protection: capabilities.disruption_protection,
         };
         let default_image = capabilities.default_image;
         let gateway_listener_requirements = match driver
@@ -923,6 +929,7 @@ impl ComputeRuntime {
     }
 
     pub async fn validate_sandbox_create(&self, sandbox: &Sandbox) -> Result<(), Status> {
+        self.validate_disruption_protection_capability(sandbox)?;
         let driver_sandbox = driver_sandbox_from_public(sandbox, &self.driver_info.name)
             .map_err(|status| *status)?;
         self.driver
@@ -946,6 +953,7 @@ impl ComputeRuntime {
         sandbox: Sandbox,
         sandbox_token: Option<String>,
     ) -> Result<Sandbox, Status> {
+        self.validate_disruption_protection_capability(&sandbox)?;
         let sandbox_id = sandbox.object_id().to_string();
         let mut driver_sandbox = driver_sandbox_from_public(&sandbox, &self.driver_info.name)
             .map_err(|status| *status)?;
@@ -2661,6 +2669,72 @@ impl ComputeRuntime {
             .await
     }
 
+    fn validate_disruption_protection_capability(&self, sandbox: &Sandbox) -> Result<(), Status> {
+        let Some(request) = sandbox
+            .spec
+            .as_ref()
+            .and_then(|spec| spec.disruption_protection.as_ref())
+        else {
+            return Ok(());
+        };
+
+        let capability = self
+            .driver_info
+            .disruption_protection
+            .as_ref()
+            .ok_or_else(|| {
+                Status::failed_precondition(format!(
+                    "compute driver '{}' does not support disruption protection",
+                    self.driver_info.name
+                ))
+            })?;
+        let support = DriverDisruptionProtectionSupport::try_from(capability.support)
+            .unwrap_or(DriverDisruptionProtectionSupport::Unspecified);
+        if matches!(
+            support,
+            DriverDisruptionProtectionSupport::Unspecified
+                | DriverDisruptionProtectionSupport::Unsupported
+        ) {
+            return Err(Status::failed_precondition(format!(
+                "compute driver '{}' does not support disruption protection",
+                self.driver_info.name
+            )));
+        }
+        if !capability.enabled {
+            return Err(Status::failed_precondition(format!(
+                "disruption protection is disabled by the platform administrator for compute driver '{}'",
+                self.driver_info.name
+            )));
+        }
+
+        let maximum = capability.max_duration.as_ref().ok_or_else(|| {
+            Status::failed_precondition(format!(
+                "compute driver '{}' enabled disruption protection without an administrator maximum",
+                self.driver_info.name
+            ))
+        })?;
+        if maximum.seconds < 0
+            || !(0..1_000_000_000).contains(&maximum.nanos)
+            || (maximum.seconds == 0 && maximum.nanos == 0)
+        {
+            return Err(Status::failed_precondition(format!(
+                "compute driver '{}' reported an invalid disruption protection maximum",
+                self.driver_info.name
+            )));
+        }
+
+        if let Some(requested) = request.duration.as_ref()
+            && (requested.seconds, requested.nanos) > (maximum.seconds, maximum.nanos)
+        {
+            return Err(Status::invalid_argument(format!(
+                "requested disruption protection duration exceeds the administrator maximum of {}s",
+                maximum.seconds
+            )));
+        }
+
+        Ok(())
+    }
+
     // Subsequent driver snapshot for an existing sandbox: apply a single-attempt CAS update.
     // On conflict the next watch event will naturally retry.
     async fn update_sandbox_record(
@@ -3210,6 +3284,11 @@ fn driver_sandbox_spec_from_public(
             }
         }),
         sandbox_token: String::new(),
+        disruption_protection: spec.disruption_protection.as_ref().map(|request| {
+            DriverDisruptionProtectionRequest {
+                duration: request.duration,
+            }
+        }),
     })
 }
 
@@ -3853,6 +3932,7 @@ impl ComputeDriver for NoopTestDriver {
                 driver_name: "noop-test-driver".to_string(),
                 driver_version: "test".to_string(),
                 default_image: "openshell/sandbox:test".to_string(),
+                disruption_protection: None,
             },
         ))
     }
@@ -3993,6 +4073,7 @@ pub async fn new_test_runtime_with_driver(
             name: driver_name.to_string(),
             driver_name: driver_name.to_string(),
             driver_version: "test".to_string(),
+            disruption_protection: None,
         },
         shutdown_cleanup: None,
         startup_starter: None,
@@ -4157,6 +4238,7 @@ mod tests {
                 driver_name: "test-driver".to_string(),
                 driver_version: "test".to_string(),
                 default_image: "openshell/sandbox:test".to_string(),
+                disruption_protection: None,
             }))
         }
 
@@ -4455,6 +4537,7 @@ mod tests {
                 driver_name: "controlled-test-driver".to_string(),
                 driver_version: "test".to_string(),
                 default_image: "openshell/sandbox:test".to_string(),
+                disruption_protection: None,
             }))
         }
 
@@ -4645,6 +4728,7 @@ mod tests {
                 name: "test-driver".to_string(),
                 driver_name: "test-driver".to_string(),
                 driver_version: "test".to_string(),
+                disruption_protection: None,
             },
             shutdown_cleanup: None,
             startup_starter,
@@ -4660,6 +4744,81 @@ mod tests {
             gateway_listener_requirements: Vec::new(),
             replica_id: "test-replica".to_string(),
         }
+    }
+
+    fn disruption_protected_sandbox(seconds: i64) -> Sandbox {
+        Sandbox {
+            spec: Some(SandboxSpec {
+                disruption_protection: Some(openshell_core::proto::DisruptionProtectionRequest {
+                    duration: Some(prost_types::Duration { seconds, nanos: 0 }),
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn disruption_protection_capability_enforces_support_gate_and_maximum() {
+        let driver = ControlledDriver::new();
+        let mut runtime = test_runtime(driver).await;
+        let sandbox = disruption_protected_sandbox(3_600);
+
+        let err = runtime
+            .validate_disruption_protection_capability(&sandbox)
+            .unwrap_err();
+        assert_eq!(err.code(), Code::FailedPrecondition);
+
+        runtime.driver_info.disruption_protection = Some(DriverDisruptionProtectionCapability {
+            support: DriverDisruptionProtectionSupport::Supported as i32,
+            enabled: false,
+            max_duration: Some(prost_types::Duration {
+                seconds: 7_200,
+                nanos: 0,
+            }),
+        });
+        let err = runtime
+            .validate_disruption_protection_capability(&sandbox)
+            .unwrap_err();
+        assert_eq!(err.code(), Code::FailedPrecondition);
+
+        runtime
+            .driver_info
+            .disruption_protection
+            .as_mut()
+            .unwrap()
+            .enabled = true;
+
+        runtime
+            .driver_info
+            .disruption_protection
+            .as_mut()
+            .unwrap()
+            .max_duration = None;
+        let err = runtime
+            .validate_disruption_protection_capability(&sandbox)
+            .unwrap_err();
+        assert_eq!(err.code(), Code::FailedPrecondition);
+
+        runtime
+            .driver_info
+            .disruption_protection
+            .as_mut()
+            .unwrap()
+            .max_duration = Some(prost_types::Duration {
+            seconds: 7_200,
+            nanos: 0,
+        });
+        assert!(
+            runtime
+                .validate_disruption_protection_capability(&sandbox)
+                .is_ok()
+        );
+
+        let err = runtime
+            .validate_disruption_protection_capability(&disruption_protected_sandbox(10_800))
+            .unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
     }
 
     fn register_test_supervisor_session(runtime: &ComputeRuntime, sandbox_id: &str) {

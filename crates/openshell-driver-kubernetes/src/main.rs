@@ -11,8 +11,9 @@ use tracing_subscriber::EnvFilter;
 use openshell_core::VERSION;
 use openshell_core::proto::compute::v1::compute_driver_server::ComputeDriverServer;
 use openshell_driver_kubernetes::{
-    AppArmorProfile, ComputeDriverService, DEFAULT_GATEWAY_ID, DEFAULT_PROXY_UID,
-    DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME, KubernetesComputeConfig, KubernetesComputeDriver,
+    AppArmorProfile, ComputeDriverService, DEFAULT_DISRUPTION_PROTECTION_MAX_DURATION,
+    DEFAULT_GATEWAY_ID, DEFAULT_PROXY_UID, DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME,
+    KubernetesComputeConfig, KubernetesComputeDriver, KubernetesDisruptionProtectionConfig,
     KubernetesSidecarConfig, ManagedSshIngressConfig, SupervisorSideloadMethod, SupervisorTopology,
     WorkspaceMode,
 };
@@ -177,6 +178,21 @@ struct Args {
 
     #[arg(long, env = "OPENSHELL_K8S_SANDBOX_GID")]
     sandbox_gid: Option<u32>,
+
+    #[arg(
+        long,
+        env = "OPENSHELL_K8S_DISRUPTION_PROTECTION_ENABLED",
+        default_value_t = false,
+        action = ArgAction::Set
+    )]
+    disruption_protection_enabled: bool,
+
+    #[arg(
+        long,
+        env = "OPENSHELL_K8S_DISRUPTION_PROTECTION_MAX_DURATION",
+        default_value = DEFAULT_DISRUPTION_PROTECTION_MAX_DURATION
+    )]
+    disruption_protection_max_duration: String,
 }
 
 async fn shutdown_signal() {
@@ -258,6 +274,10 @@ async fn main() -> Result<()> {
             proxy_auth_secret_key: args.proxy_auth_secret_key,
             proxy_auth_allow_insecure: args.proxy_auth_allow_insecure.then_some(true),
             proxy_connect_by_hostname: args.proxy_connect_by_hostname.then_some(true),
+            disruption_protection: KubernetesDisruptionProtectionConfig {
+                enabled: args.disruption_protection_enabled,
+                max_duration: args.disruption_protection_max_duration,
+            },
             grpc_endpoint: args.grpc_endpoint.unwrap_or_default(),
             ssh_socket_path: args.sandbox_ssh_socket_path,
             client_tls_secret_name: args.client_tls_secret_name.unwrap_or_default(),

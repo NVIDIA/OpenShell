@@ -109,6 +109,11 @@ pub struct SandboxSpec {
     /// Request a GPU. Driver-specific device selection is configured via
     /// driver config on the raw proto surface (see [`crate::raw`]).
     pub gpu: bool,
+    /// Requested protection from voluntary platform disruption.
+    ///
+    /// The gateway rejects this when the selected driver does not support the
+    /// capability or the duration exceeds the administrator-configured limit.
+    pub disruption_protection: Option<Duration>,
 }
 
 /// Reference to a sandbox owned by the gateway.

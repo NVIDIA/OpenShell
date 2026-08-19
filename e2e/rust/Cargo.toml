@@ -107,6 +107,11 @@ path = "tests/kubernetes_corporate_proxy.rs"
 required-features = ["e2e-kubernetes"]
 
 [[test]]
+name = "kubernetes_disruption_protection"
+path = "tests/kubernetes_disruption_protection.rs"
+required-features = ["e2e-kubernetes"]
+
+[[test]]
 name = "credential_drivers"
 path = "tests/credential_drivers.rs"
 required-features = ["e2e-kubernetes-credential-drivers"]
@@ -175,6 +180,7 @@ required-features = ["e2e-gpu"]
 base64 = "0.22"
 bollard = "0.20"
 bytes = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 futures-util = "0.3"
 http-body-util = "0.1"
 hyper = { version = "1", features = ["client", "http1"] }

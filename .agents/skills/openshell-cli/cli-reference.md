@@ -215,6 +215,7 @@ Create a sandbox through the selected gateway, wait for readiness, then connect,
 | `--gpu [COUNT]` | Request the driver's default GPU selection or a specific count |
 | `--cpu <QUANTITY>` | CPU limit (for example: `500m`, `1`, `2.5`) |
 | `--memory <QUANTITY>` | Memory limit (for example: `512Mi`, `4Gi`, `8G`) |
+| `--disruption-protection <DURATION>` | Request protection from voluntary platform disruption (for example: `30m`, `4h`); subject to driver support and the administrator maximum |
 | `--driver-config-json <JSON>` | Experimental driver-keyed configuration object |
 | `--provider <NAME>` | Provider to attach (repeatable) |
 | `--policy <PATH>` | Custom policy YAML; overrides the built-in default and `OPENSHELL_SANDBOX_POLICY` |

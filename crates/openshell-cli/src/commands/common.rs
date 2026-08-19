@@ -742,7 +742,8 @@ pub fn parse_duration_to_ms(s: &str) -> Result<i64> {
             ));
         }
     };
-    Ok(num * multiplier)
+    num.checked_mul(multiplier)
+        .ok_or_else(|| miette::miette!("duration is too large: {s}"))
 }
 
 // ---------------------------------------------------------------------------

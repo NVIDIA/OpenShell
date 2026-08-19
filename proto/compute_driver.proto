@@ -5,6 +5,7 @@ syntax = "proto3";
 
 package openshell.compute.v1;
 
+import "google/protobuf/duration.proto";
 import "google/protobuf/struct.proto";
 import "options.proto";
 
@@ -72,6 +73,25 @@ message GetCapabilitiesResponse {
   string driver_version = 2;
   // Default sandbox image recommended by the driver.
   string default_image = 3;
+  // Driver and operator support for voluntary-disruption protection.
+  DisruptionProtectionCapability disruption_protection = 6;
+}
+
+// How closely a compute driver can enforce the portable disruption-protection
+// contract. Unspecified is treated as unsupported for older drivers.
+enum DisruptionProtectionSupport {
+  DISRUPTION_PROTECTION_SUPPORT_UNSPECIFIED = 0;
+  DISRUPTION_PROTECTION_SUPPORT_UNSUPPORTED = 1;
+  DISRUPTION_PROTECTION_SUPPORT_APPROXIMATED = 2;
+  DISRUPTION_PROTECTION_SUPPORT_SUPPORTED = 3;
+}
+
+message DisruptionProtectionCapability {
+  DisruptionProtectionSupport support = 1;
+  // Whether the operator currently allows new requests.
+  bool enabled = 2;
+  // Maximum request accepted by this driver instance when enabled.
+  google.protobuf.Duration max_duration = 3;
 }
 
 message GetGatewayListenerRequirementsRequest {}
@@ -142,6 +162,13 @@ message DriverSandboxSpec {
   // ServiceAccount token bootstrap instead). Never echoed to the public
   // Sandbox proto.
   string sandbox_token = 11 [(openshell.options.v1.secret) = true];
+  // Portable request to prevent platform-initiated voluntary disruption for a
+  // bounded interval beginning at sandbox creation.
+  DisruptionProtectionRequest disruption_protection = 12;
+}
+
+message DisruptionProtectionRequest {
+  google.protobuf.Duration duration = 1;
 }
 
 message ResourceRequirements {

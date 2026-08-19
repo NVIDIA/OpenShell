@@ -369,6 +369,8 @@ For maintainer-level implementation details, refer to the [Kubernetes driver REA
 | `app_armor_profile` | `server.appArmorProfile` | Set the sandbox agent container's AppArmor profile. Helm defaults this to `Unconfined` so AppArmor-enabled nodes do not block supervisor network namespace setup. Set the Helm value to an empty string to omit the field, or use `RuntimeDefault` or `Localhost/<profile-name>` for operator-managed profiles. |
 | `workspace_default_storage_size` | `server.workspaceDefaultStorageSize` | Set the default workspace PVC size for new sandboxes. |
 | `workspace_storage_class` | `server.workspaceStorageClass` | Set the `StorageClass` for the workspace PVC. Empty (default) omits `storageClassName` and uses the cluster's default `StorageClass`. Set this on clusters with no default `StorageClass`, otherwise the workspace PVC stays `Pending` and the sandbox never starts. |
+| `disruption_protection.enabled` | `server.disruptionProtection.enabled` | Allow individual sandboxes to request a PodDisruptionBudget with a fail-closed expiration target. Disabled by default. Disabling it rejects new requests; existing PDBs remain until their deadlines but are not repaired while mutation RBAC is disabled. |
+| `disruption_protection.max_duration` | `server.disruptionProtection.maxDuration` | Set the maximum accepted per-sandbox protection duration. The default is `24h`; values support positive integer seconds, minutes, or hours. |
 | `sa_token_ttl_secs` | `server.sandboxJwt.k8sSaTokenTtlSecs` | Set the projected ServiceAccount token TTL used for the bootstrap token exchange. |
 
 Managed-mode Secret copying requires the gateway ServiceAccount to create
@@ -411,6 +413,59 @@ the driver sets `spec.operatingMode` to `Suspended` or `Running`. For
 workspace PVC keep their identity across both operations.
 
 If Agent Sandbox is upgraded in place, restart the OpenShell gateway after the controller and CRD rollout completes so the gateway can detect the served API versions again.
+
+### Kubernetes Disruption Protection
+
+Operators can allow sandboxes to request fail-closed protection from voluntary
+Kubernetes evictions with an expiration target:
+
+```yaml
+server:
+  disruptionProtection:
+    enabled: true
+    maxDuration: "24h"
+```
+
+The sandbox must also opt in through the portable sandbox API:
+
+```shell
+openshell sandbox create \
+  --disruption-protection 4h \
+  -- claude
+```
+
+OpenShell rejects sandbox creation if the operator gate is disabled, the
+duration is invalid, or the request exceeds `maxDuration`.
+
+The request is part of `SandboxSpec`, not the immutable sandbox template or
+driver JSON. Compute drivers advertise whether they support, approximate, or
+reject the intent. Kubernetes supports it with a PDB; Docker, Podman, and the
+VM driver currently reject it as unsupported.
+
+OpenShell creates a `policy/v1` PodDisruptionBudget with `minAvailable: 1` and
+persists an absolute UTC deadline on the Sandbox CR. The gateway reconciles the
+PDB from that deadline after restarts and schedules deletion at expiration
+while its Kubernetes watch is healthy. Gateway-scoped PDB management labels
+prevent one OpenShell installation from reconciling another installation's
+PDBs. If every gateway is unavailable when the deadline passes, protection
+remains active until a gateway resumes reconciliation or an operator deletes
+the PDB. Treat the requested duration as a fail-closed expiration target, not a
+Kubernetes-enforced TTL. If the persisted deadline becomes malformed,
+OpenShell retains the PDB until an operator repairs or removes the annotation.
+
+This protects only against voluntary evictions that honor PDBs. It does not
+prevent node failure, preemption, direct pod or Sandbox deletion, or platform
+outages, and it is not a backup or restore mechanism. Unhealthy sandbox pods
+remain evictable through `unhealthyPodEvictionPolicy: AlwaysAllow` so a broken
+pod does not indefinitely block node maintenance.
+
+Non-Helm deployments must grant the gateway service account `create`, `delete`,
+`get`, `list`, and `patch` on `policy/v1` PodDisruptionBudgets in the sandbox
+namespace. The OpenShell Helm chart grants mutation permissions when
+`server.disruptionProtection.enabled` is true and retains cleanup permissions
+when it is false. Turning the gate off rejects new requests without shortening
+previously accepted intervals. Existing PDBs expire normally, but OpenShell does
+not recreate or patch them while mutation permissions are disabled.
 
 <Note>
 `Sandbox.spec.volumeClaimTemplates` is immutable after creation. To change storage configuration, delete the sandbox and create a new one with the updated spec.
