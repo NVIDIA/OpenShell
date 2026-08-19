@@ -26,9 +26,11 @@ pub use openshell_core::proto::{
     DeleteSandboxRequest, DeleteSandboxTemplateRequest, DeleteWorkspaceRequest, ExecSandboxRequest,
     GetSandboxRequest, GetSandboxTemplateRequest, GetWorkspaceRequest, HealthRequest,
     ListProvidersRequest, ListSandboxTemplatesRequest, ListSandboxesRequest, ListWorkspacesRequest,
-    Sandbox, SandboxPhase as ProtoSandboxPhase, SandboxSpec as ProtoSandboxSpec, SandboxTemplate,
-    SandboxTemplateResponse, SandboxWorkloadTemplate, SandboxWorkloadTemplateSpec,
-    ServiceStatus as ProtoServiceStatus, StartSandboxRequest, StopSandboxRequest, Workspace,
+    Sandbox, SandboxPhase as ProtoSandboxPhase, SandboxResources, SandboxServiceLevel,
+    SandboxSpec as ProtoSandboxSpec, SandboxStartup, SandboxTemplate, SandboxTemplateResponse,
+    SandboxWorkloadConfig, SandboxWorkloadTemplate, SandboxWorkloadTemplateProvenance,
+    SandboxWorkloadTemplateSpec, ServiceStatus as ProtoServiceStatus, StartSandboxRequest,
+    StopSandboxRequest, Workspace,
 };
 
 /// Type alias for the gRPC client wrapped in the SDK's auth interceptor.
