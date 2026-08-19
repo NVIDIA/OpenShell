@@ -615,13 +615,24 @@ fn parse_proxy_url(raw: &str, var_name: &str) -> Result<(ProxyEndpoint, bool), S
 pub(crate) fn read_proxy_ca_bundle(path: &str, var_name: &str) -> Result<String, String> {
     let pem = std::fs::read_to_string(path)
         .map_err(|err| format!("{var_name} '{path}' could not be read: {err}"))?;
-    // Reject a file that parses to zero certificates up front instead of
-    // silently trusting only the built-in roots (or failing every proxy
-    // handshake later with an opaque TLS error).
-    let count = rustls_pemfile::certs(&mut pem.as_bytes()).flatten().count();
-    if count == 0 {
+    // Validate that the bundle contributes at least one trust anchor that
+    // rustls actually accepts, not just that PEM framing base64-decodes.
+    // A PEM block with invalid DER passes `rustls_pemfile::certs` but is
+    // silently rejected by `RootCertStore::add_parsable_certificates`;
+    // counting only PEM blocks would let such a bundle satisfy the check
+    // while contributing zero usable anchors at runtime.
+    let certs: Vec<_> = rustls_pemfile::certs(&mut pem.as_bytes()).flatten().collect();
+    if certs.is_empty() {
         return Err(format!(
-            "{var_name} '{path}' contains no usable PEM certificates"
+            "{var_name} '{path}' contains no PEM certificate blocks"
+        ));
+    }
+    let mut store = rustls::RootCertStore::empty();
+    let (added, _ignored) = store.add_parsable_certificates(certs);
+    if added == 0 {
+        return Err(format!(
+            "{var_name} '{path}' contains no usable trust anchors \
+             (PEM blocks were found but none contain valid X.509 DER)"
         ));
     }
     Ok(pem)
@@ -1354,7 +1365,25 @@ mod tests {
             (PROXY_CA_BUNDLE, path.as_str()),
         ])
         .unwrap_err();
-        assert!(err.contains("no usable PEM certificates"), "{err}");
+        assert!(err.contains("no PEM certificate blocks"), "{err}");
+    }
+
+    #[test]
+    fn ca_bundle_with_invalid_der_certificates_is_fatal() {
+        install_crypto_provider();
+        let bundle = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            bundle.path(),
+            "-----BEGIN CERTIFICATE-----\nAQID\n-----END CERTIFICATE-----\n",
+        )
+        .unwrap();
+        let path = bundle.path().to_string_lossy().into_owned();
+        let err = config_from(&[
+            (HTTPS_PROXY, "https://proxy.corp.com:3130"),
+            (PROXY_CA_BUNDLE, path.as_str()),
+        ])
+        .unwrap_err();
+        assert!(err.contains("no usable trust anchors"), "{err}");
     }
 
     #[test]
