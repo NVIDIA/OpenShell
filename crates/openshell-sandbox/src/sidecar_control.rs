@@ -121,6 +121,7 @@ impl Publisher {
         });
     }
 
+    #[cfg(any(target_os = "linux", test))]
     pub fn publish_main_process_exit_ack(&self, instance_id: String) {
         let _ = self
             .updates
