@@ -20,7 +20,7 @@ use tokio::time::sleep;
 const READY_MARKER: &str = "podman-gateway-start-ready";
 const STOPPED_READY_MARKER: &str = "podman-gateway-start-stopped-ready";
 const START_FILE: &str = "/sandbox/podman-gateway-start-state";
-const MANAGED_BY_LABEL_FILTER: &str = "label=openshell.ai/managed-by=openshell";
+const MANAGED_BY_LABEL_FILTER: &str = "label=openshell.managed=true";
 const SANDBOX_NAME_LABEL: &str = "openshell.ai/sandbox-name";
 
 fn sandbox_container_running(sandbox_name: &str) -> Result<bool, String> {
