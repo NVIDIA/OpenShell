@@ -1240,7 +1240,8 @@ mod tests {
             command: vec!["/opt/agent binary".into(), "--serve exactly".into()],
             tty: false,
             ..SandboxSpec::default()
-        });
+        })
+        .expect("canonical main process should produce a valid request");
 
         let spec = request.spec.expect("sandbox spec should be present");
         assert_eq!(spec.command, ["/opt/agent binary", "--serve exactly"]);
