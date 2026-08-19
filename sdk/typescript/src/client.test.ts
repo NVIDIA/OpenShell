@@ -17,6 +17,7 @@ import {
   POLICY_SOURCE_NAMES,
   Pushable,
   SandboxClient,
+  SandboxTemplateClient,
   SCOPE_NAMES,
   STATUS_NAMES,
 } from './client.js';
@@ -28,6 +29,13 @@ function client(impl: Partial<ServiceImpl<typeof OpenShell>>): SandboxClient {
     router.service(OpenShell, impl);
   });
   return new SandboxClient(transport);
+}
+
+function templateClient(impl: Partial<ServiceImpl<typeof OpenShell>>): SandboxTemplateClient {
+  const transport: Transport = createRouterTransport((router) => {
+    router.service(OpenShell, impl);
+  });
+  return new SandboxTemplateClient(transport);
 }
 
 function readySandbox(
@@ -265,6 +273,7 @@ describe('create', () => {
     let created: {
       workloadTemplateName?: string;
       name?: string;
+      workspace?: string;
       labels?: Record<string, string>;
       spec?: {
         policy?: { version?: number };
@@ -280,6 +289,7 @@ describe('create', () => {
     });
     await sandbox.createFromTemplate({
       name: 'job-1',
+      workspace: 'staging',
       templateName: 'gpu-kata',
       labels: { team: 'runtime' },
       providers: ['github'],
@@ -288,6 +298,7 @@ describe('create', () => {
 
     expect(created.workloadTemplateName).toBe('gpu-kata');
     expect(created.name).toBe('job-1');
+    expect(created.workspace).toBe('staging');
     expect(created.labels).toEqual({ team: 'runtime' });
     expect(created.spec?.providers).toEqual(['github']);
     expect(created.spec?.policy?.version).toBe(1);
@@ -327,6 +338,135 @@ describe('create', () => {
       mainProcessInstanceId: 'main-1',
       exitCode: 9,
     });
+  });
+});
+
+describe('sandbox templates', () => {
+  it('create sends the template resource and workspace', async () => {
+    let observed: {
+      workspace?: string;
+      template?: {
+        metadata?: { name?: string; labels?: Record<string, string> };
+        spec?: {
+          workload?: {
+            image?: string;
+            environment?: Record<string, string>;
+            resources?: { cpu?: string; memory?: string; gpuCount?: number };
+          };
+          driverConfig?: Record<string, unknown>;
+        };
+      };
+    } = {};
+    const templates = templateClient({
+      createSandboxTemplate: (req) => {
+        observed = req;
+        return {
+          template: {
+            metadata: {
+              id: 'template-python',
+              name: req.template?.metadata?.name ?? '',
+              labels: req.template?.metadata?.labels ?? {},
+              workspace: req.workspace,
+              resourceVersion: 1n,
+            },
+            spec: req.template?.spec,
+          },
+        };
+      },
+    });
+
+    const created = await templates.create(
+      {
+        metadata: { name: 'python', labels: { team: 'runtime' } },
+        spec: {
+          workload: {
+            image: 'ghcr.io/nvidia/openshell-community/sandboxes/python:latest',
+            environment: { FEATURE_FLAG: 'on' },
+            resources: { cpu: '1', memory: '512Mi', gpuCount: 1 },
+          },
+          driverConfig: { kubernetes: { runtime_class_name: 'kata-containers' } },
+        },
+      },
+      { workspace: 'default' },
+    );
+
+    expect(observed.workspace).toBe('default');
+    expect(observed.template?.metadata?.name).toBe('python');
+    expect(observed.template?.metadata?.labels).toEqual({ team: 'runtime' });
+    expect(observed.template?.spec?.workload?.environment).toEqual({ FEATURE_FLAG: 'on' });
+    expect(observed.template?.spec?.workload?.resources?.gpuCount).toBe(1);
+    expect(created.metadata?.workspace).toBe('default');
+    expect(created.metadata?.resourceVersion).toBe(1n);
+  });
+
+  it('get list and delete forward workspace and pagination', async () => {
+    const observed: {
+      get?: { name?: string; workspace?: string };
+      list?: { limit?: number; offset?: number; workspace?: string; allWorkspaces?: boolean };
+      delete?: { name?: string; workspace?: string };
+    } = {};
+    const templates = templateClient({
+      getSandboxTemplate: (req) => {
+        observed.get = req;
+        return {
+          template: {
+            metadata: { id: 'template-gpu-kata', name: req.name, workspace: req.workspace },
+            spec: { workload: { image: 'img:v1' } },
+          },
+        };
+      },
+      listSandboxTemplates: (req) => {
+        observed.list = req;
+        return {
+          templates: [
+            {
+              metadata: { id: 'template-python', name: 'python', workspace: req.workspace || 'default' },
+              spec: { workload: { image: 'img:v1' } },
+            },
+          ],
+        };
+      },
+      deleteSandboxTemplate: (req) => {
+        observed.delete = req;
+        return { deleted: true };
+      },
+    });
+
+    const got = await templates.get('gpu-kata', { workspace: 'staging' });
+    const listed = await templates.list({ workspace: 'staging', limit: 10, offset: 2 });
+    const deleted = await templates.delete('gpu-kata', { workspace: 'staging' });
+
+    expect(got.metadata?.name).toBe('gpu-kata');
+    expect(listed).toHaveLength(1);
+    expect(deleted).toBe(true);
+    expect(observed.get).toMatchObject({ name: 'gpu-kata', workspace: 'staging' });
+    expect(observed.list).toMatchObject({ limit: 10, offset: 2, workspace: 'staging', allWorkspaces: false });
+    expect(observed.delete).toMatchObject({ name: 'gpu-kata', workspace: 'staging' });
+  });
+
+  it('list clears workspace when allWorkspaces is set', async () => {
+    let observed: { workspace?: string; allWorkspaces?: boolean } = {};
+    const templates = templateClient({
+      listSandboxTemplates: (req) => {
+        observed = req;
+        return { templates: [] };
+      },
+    });
+
+    await templates.list({ workspace: 'staging', allWorkspaces: true });
+
+    expect(observed.workspace).toBe('');
+    expect(observed.allWorkspaces).toBe(true);
+  });
+
+  it('rejects empty names and missing template responses locally', async () => {
+    const templates = templateClient({
+      getSandboxTemplate: () => ({}),
+    });
+
+    await expect(templates.get(' ')).rejects.toMatchObject({ code: 'invalid_config' });
+    await expect(templates.delete(' ')).rejects.toMatchObject({ code: 'invalid_config' });
+    await expect(templates.get('missing-response')).rejects.toMatchObject({ code: 'invalid_config' });
   });
 });
 
