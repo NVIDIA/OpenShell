@@ -16,7 +16,7 @@ use crate::refresh::{RefreshedToken, TokenSource};
 use crate::transport;
 use crate::types::{
     ExecOptions, ExecResult, Health, ListOptions, SandboxPhase, SandboxRef, SandboxSpec,
-    WorkspaceRef,
+    SandboxTemplateCreateSpec, WorkspaceRef,
 };
 use futures::StreamExt;
 use openshell_core::proto;
@@ -154,6 +154,21 @@ impl OpenShellClient {
     /// Create a new sandbox from a curated [`SandboxSpec`].
     pub async fn create_sandbox(&self, spec: SandboxSpec) -> Result<SandboxRef> {
         let request = create_sandbox_request(spec);
+        let response = self
+            .unary(|mut grpc| {
+                let request = request.clone();
+                async move { grpc.create_sandbox(request).await }
+            })
+            .await?;
+        sandbox_from_response(response.sandbox)
+    }
+
+    /// Create a new sandbox from a workspace-scoped workload template name.
+    pub async fn create_sandbox_from_template(
+        &self,
+        spec: SandboxTemplateCreateSpec,
+    ) -> Result<SandboxRef> {
+        let request = create_sandbox_from_template_request(spec);
         let response = self
             .unary(|mut grpc| {
                 let request = request.clone();
@@ -562,6 +577,23 @@ impl WorkspaceScopedClient {
         sandbox_from_response(response.sandbox)
     }
 
+    /// Create a new sandbox from a template in this workspace.
+    pub async fn create_sandbox_from_template(
+        &self,
+        spec: SandboxTemplateCreateSpec,
+    ) -> Result<SandboxRef> {
+        let mut request = create_sandbox_from_template_request(spec);
+        request.workspace = self.workspace.clone();
+        let response = self
+            .client
+            .unary(|mut grpc| {
+                let request = request.clone();
+                async move { grpc.create_sandbox(request).await }
+            })
+            .await?;
+        sandbox_from_response(response.sandbox)
+    }
+
     /// Fetch a sandbox by name in this workspace.
     pub async fn get_sandbox(&self, name: &str) -> Result<SandboxRef> {
         let response = self
@@ -823,6 +855,29 @@ fn create_sandbox_request(spec: SandboxSpec) -> proto::CreateSandboxRequest {
         labels,
         annotations: HashMap::new(),
         workspace: String::new(),
+        workload_template_name: String::new(),
+    }
+}
+
+fn create_sandbox_from_template_request(
+    spec: SandboxTemplateCreateSpec,
+) -> proto::CreateSandboxRequest {
+    let SandboxTemplateCreateSpec {
+        name,
+        template_name,
+        labels,
+        providers,
+    } = spec;
+    proto::CreateSandboxRequest {
+        spec: Some(proto::SandboxSpec {
+            providers,
+            ..proto::SandboxSpec::default()
+        }),
+        name: name.unwrap_or_default(),
+        labels,
+        annotations: HashMap::new(),
+        workspace: String::new(),
+        workload_template_name: template_name,
     }
 }
 

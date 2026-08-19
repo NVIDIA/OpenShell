@@ -22,10 +22,12 @@ pub use openshell_core::proto;
 pub use openshell_core::proto::inference_client::InferenceClient;
 pub use openshell_core::proto::open_shell_client::OpenShellClient as GrpcClient;
 pub use openshell_core::proto::{
-    CreateSandboxRequest, CreateWorkspaceRequest, DeleteSandboxRequest, DeleteWorkspaceRequest,
-    ExecSandboxRequest, GetSandboxRequest, GetWorkspaceRequest, HealthRequest,
-    ListProvidersRequest, ListSandboxesRequest, ListWorkspacesRequest, Sandbox,
-    SandboxPhase as ProtoSandboxPhase, SandboxSpec as ProtoSandboxSpec, SandboxTemplate,
+    CreateSandboxRequest, CreateSandboxTemplateRequest, CreateWorkspaceRequest,
+    DeleteSandboxRequest, DeleteSandboxTemplateRequest, DeleteWorkspaceRequest, ExecSandboxRequest,
+    GetSandboxRequest, GetSandboxTemplateRequest, GetWorkspaceRequest, HealthRequest,
+    ListProvidersRequest, ListSandboxTemplatesRequest, ListSandboxesRequest, ListWorkspacesRequest,
+    Sandbox, SandboxPhase as ProtoSandboxPhase, SandboxSpec as ProtoSandboxSpec, SandboxTemplate,
+    SandboxTemplateResponse, SandboxWorkloadTemplate, SandboxWorkloadTemplateSpec,
     ServiceStatus as ProtoServiceStatus, StartSandboxRequest, StopSandboxRequest, Workspace,
 };
 
