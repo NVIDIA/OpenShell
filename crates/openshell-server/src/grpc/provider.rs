@@ -5,6 +5,7 @@
 
 #![allow(clippy::result_large_err)] // gRPC handlers return Result<Response<_>, Status>
 
+use crate::credentials::RefreshMaterialScope;
 use crate::persistence::{
     ObjectId, ObjectLabels, ObjectName, ObjectType, Store, WriteCondition, generate_name,
 };
@@ -583,6 +584,13 @@ pub(super) async fn delete_provider_record_with_credentials(
         )));
     }
 
+    crate::provider_refresh::delete_refresh_states_for_provider_with_credentials(
+        store,
+        credentials,
+        provider.object_id(),
+    )
+    .await?;
+
     credentials
         .delete_provider_credential_handles(
             provider.object_name(),
@@ -590,9 +598,6 @@ pub(super) async fn delete_provider_record_with_credentials(
             provider.object_id(),
             &provider.credential_handles,
         )
-        .await?;
-
-    crate::provider_refresh::delete_refresh_states_for_provider(store, provider.object_id())
         .await?;
 
     store
@@ -1300,6 +1305,13 @@ fn refresh_authorization_epochs_by_key(
 ) -> Result<HashMap<String, String>, Status> {
     let mut epochs = HashMap::new();
     for state in &record.refresh_states {
+        if state
+            .metadata
+            .as_ref()
+            .is_some_and(|metadata| metadata.deletion_timestamp_ms != 0)
+        {
+            continue;
+        }
         if !crate::provider_refresh::is_gateway_mintable_strategy(
             ProviderCredentialRefreshStrategy::try_from(state.strategy).unwrap_or_default(),
         ) {
@@ -3677,6 +3689,32 @@ pub(super) async fn handle_configure_provider_refresh(
         &additional_output_keys,
     )?;
     validate_refresh_material(&request.material, refresh_defaults.as_ref())?;
+    let mut secret_material_keys: HashSet<String> =
+        request.secret_material_keys.iter().cloned().collect();
+    for key in &request.secret_material_keys {
+        if !request.material.contains_key(key) {
+            return Err(Status::invalid_argument(format!(
+                "secret_material_keys entry '{key}' is not present in material"
+            )));
+        }
+    }
+    if let Some(refresh) = refresh_defaults.as_ref() {
+        secret_material_keys.extend(
+            refresh
+                .material
+                .iter()
+                .filter(|item| item.secret && request.material.contains_key(&item.name))
+                .map(|item| item.name.clone()),
+        );
+    }
+    secret_material_keys.extend(
+        crate::provider_refresh::strategy_secret_material_keys(strategy)
+            .iter()
+            .filter(|key| request.material.contains_key(**key))
+            .map(|key| (*key).to_string()),
+    );
+    let mut secret_material_keys: Vec<_> = secret_material_keys.into_iter().collect();
+    secret_material_keys.sort();
     let material_scopes = crate::provider_refresh::material_scopes(&request.material);
     let token_url = refresh_defaults
         .as_ref()
@@ -3716,27 +3754,88 @@ pub(super) async fn handle_configure_provider_refresh(
             "max_lifetime_seconds material must be greater than or equal to 0",
         ));
     }
-    let existing_refresh_state = crate::provider_refresh::get_refresh_state(
+    let mut existing_refresh_state = crate::provider_refresh::get_refresh_state(
         state.store.as_ref(),
         &workspace,
         provider.object_id(),
         credential_key,
     )
     .await?;
+    if existing_refresh_state.as_ref().is_some_and(|state| {
+        state
+            .metadata
+            .as_ref()
+            .is_some_and(|metadata| metadata.deletion_timestamp_ms != 0)
+    }) {
+        return Err(Status::failed_precondition(
+            "provider refresh is being deleted; retry deletion before configuring it again",
+        ));
+    }
+    let existing_refresh_version = existing_refresh_state.as_ref().and_then(|state| {
+        state
+            .metadata
+            .as_ref()
+            .map(|metadata| metadata.resource_version)
+    });
+    if let Some(existing) = existing_refresh_state.as_mut()
+        && !existing.pending_secret_deletions.is_empty()
+    {
+        state
+            .credentials
+            .delete_refresh_material_handles(
+                RefreshMaterialScope {
+                    provider_name: &existing.provider_name,
+                    workspace: existing.object_workspace(),
+                    provider_id: &existing.provider_id,
+                    credential_key: &existing.credential_key,
+                },
+                &existing.pending_secret_deletions,
+            )
+            .await?;
+        existing.pending_secret_deletions.clear();
+    }
     let expires_at_ms = request.expires_at_ms.unwrap_or_else(|| {
         existing_refresh_state
             .as_ref()
             .map(|state| state.expires_at_ms)
             .unwrap_or_default()
     });
+    let mut persisted_material = request.material;
+    let secret_material: HashMap<_, _> = secret_material_keys
+        .iter()
+        .filter_map(|key| {
+            persisted_material
+                .remove(key)
+                .map(|value| (key.clone(), value))
+        })
+        .collect();
+    let material_staging_id = format!(
+        "{}-refresh-config-{}",
+        provider.object_id(),
+        uuid::Uuid::new_v4()
+    );
+    let staged_material_handles = state
+        .credentials
+        .store_refresh_material_with_object_id(
+            RefreshMaterialScope {
+                provider_name: provider.object_name(),
+                workspace: &workspace,
+                provider_id: provider.object_id(),
+                credential_key,
+            },
+            &material_staging_id,
+            &secret_material,
+            &HashMap::new(),
+        )
+        .await?;
     let mut state_record = crate::provider_refresh::new_refresh_state(
         &provider,
         &workspace,
         credential_key,
         crate::provider_refresh::NewRefreshStateConfig {
             strategy,
-            material: request.material,
-            secret_material_keys: request.secret_material_keys,
+            material: persisted_material,
+            secret_material_keys,
             expires_at_ms,
             token_url,
             scopes,
@@ -3745,11 +3844,57 @@ pub(super) async fn handle_configure_provider_refresh(
             additional_output_keys,
         },
     )?;
+    state_record.secret_material_handles = staged_material_handles.clone();
     if let Some(existing) = existing_refresh_state {
         state_record.metadata = existing.metadata;
         state_record.last_refresh_at_ms = existing.last_refresh_at_ms;
+        state_record
+            .pending_secret_deletions
+            .extend(existing.pending_secret_deletions);
+        state_record
+            .pending_secret_deletions
+            .extend(existing.secret_material_handles);
     }
-    crate::provider_refresh::put_refresh_state(state.store.as_ref(), &state_record).await?;
+    let persist_result = if let Some(expected_version) = existing_refresh_version {
+        match crate::provider_refresh::replace_refresh_state_if_current(
+            state.store.as_ref(),
+            &state_record,
+            expected_version,
+        )
+        .await
+        {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(Status::aborted(
+                "provider refresh was concurrently modified during configuration",
+            )),
+            Err(err) => Err(err),
+        }
+    } else {
+        crate::provider_refresh::put_refresh_state(state.store.as_ref(), &state_record).await
+    };
+    if let Err(err) = persist_result {
+        if let Err(cleanup_err) = state
+            .credentials
+            .delete_refresh_material_handles(
+                RefreshMaterialScope {
+                    provider_name: provider.object_name(),
+                    workspace: &workspace,
+                    provider_id: provider.object_id(),
+                    credential_key,
+                },
+                &staged_material_handles,
+            )
+            .await
+        {
+            warn!(
+                provider_name = %provider.object_name(),
+                credential_key,
+                error = %cleanup_err,
+                "failed to clean up staged refresh material after configuration failure"
+            );
+        }
+        return Err(err);
+    }
 
     if let Some(expires_at_ms) = request.expires_at_ms {
         let updated = Provider {
@@ -3889,8 +4034,9 @@ pub(super) async fn handle_delete_provider_refresh(
         credential_key,
     )
     .await?;
-    let deleted_refresh_state = crate::provider_refresh::delete_refresh_state(
+    let deleted_refresh_state = crate::provider_refresh::delete_refresh_state_with_credentials(
         state.store.as_ref(),
+        &state.credentials,
         &workspace,
         provider.object_id(),
         credential_key,
@@ -5320,6 +5466,7 @@ mod tests {
         .unwrap()
         .into_inner();
         assert!(deleted.deleted);
+        assert_eq!(state.credentials.stored_credential_count(), Some(0));
     }
 
     #[tokio::test]
@@ -5686,7 +5833,10 @@ mod tests {
                     ("client_id".to_string(), "client-id".to_string()),
                     ("client_secret".to_string(), "client-secret".to_string()),
                 ]),
-                secret_material_keys: vec!["client_secret".to_string()],
+                // The server derives sensitivity from the authoritative
+                // profile; direct callers cannot opt a client secret out of
+                // credential storage by omitting this advisory list.
+                secret_material_keys: Vec::new(),
                 expires_at_ms: Some(expires_at_ms),
                 workspace: "default".to_string(),
             }),
@@ -5734,6 +5884,29 @@ mod tests {
         .await
         .unwrap()
         .expect("first refresh state");
+        assert!(!first_refresh.material.contains_key("client_secret"));
+        assert!(
+            first_refresh
+                .secret_material_handles
+                .contains_key("client_secret")
+        );
+        assert_eq!(
+            state
+                .credentials
+                .resolve_refresh_material(
+                    RefreshMaterialScope {
+                        provider_name: &first_refresh.provider_name,
+                        workspace: first_refresh.object_workspace(),
+                        provider_id: &first_refresh.provider_id,
+                        credential_key: &first_refresh.credential_key,
+                    },
+                    &first_refresh.secret_material_handles,
+                )
+                .await
+                .unwrap()
+                .get("client_secret"),
+            Some(&"client-secret".to_string())
+        );
         handle_configure_provider_refresh(
             &state,
             authed_request(ConfigureProviderRefreshRequest {
@@ -5779,6 +5952,7 @@ mod tests {
         .unwrap()
         .into_inner();
         assert!(deleted.deleted);
+        assert_eq!(state.credentials.stored_credential_count(), Some(0));
 
         let status_after_delete = handle_get_provider_refresh_status(
             &state,

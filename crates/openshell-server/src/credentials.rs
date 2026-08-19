@@ -38,6 +38,7 @@ use openshell_driver_db_credstore::{
 };
 use openshell_driver_kubernetes_secrets::KubernetesSecretsCredentialDriver;
 use openshell_driver_vault::VaultCredentialDriver;
+use sha2::{Digest, Sha256};
 #[cfg(unix)]
 use tokio::net::UnixStream;
 #[cfg(unix)]
@@ -53,6 +54,8 @@ use crate::persistence::{PersistenceError, Store, WriteCondition};
 
 const DEFAULT_CREDENTIAL_DRIVER_STARTUP_TIMEOUT_SECS: u64 = 10;
 const DEFAULT_CREDENTIAL_DRIVER_RPC_TIMEOUT_SECS: u64 = 30;
+const REFRESH_MATERIAL_CREDENTIAL_KEY_DOMAIN: &[u8] =
+    b"openshell-refresh-material-credential-key-v1";
 const COMMON_CREDENTIAL_DRIVER_FIELDS: &[&str] = &[
     "transport",
     "socket_path",
@@ -87,6 +90,14 @@ pub trait CredentialDriver: std::fmt::Debug + Send + Sync {
 pub struct ResolvedProviderCredentials {
     pub values: HashMap<String, String>,
     pub expires_at_ms: HashMap<String, i64>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct RefreshMaterialScope<'a> {
+    pub provider_name: &'a str,
+    pub workspace: &'a str,
+    pub provider_id: &'a str,
+    pub credential_key: &'a str,
 }
 
 #[derive(Debug, Clone)]
@@ -328,6 +339,123 @@ impl CredentialRuntime {
         Ok(successes)
     }
 
+    /// Store gateway-only refresh material through the active credential
+    /// driver. Material names never become backend keys directly; a
+    /// deterministic driver-safe key binds each slot to its injectable
+    /// credential without exposing caller-controlled names in backend paths.
+    pub async fn store_refresh_material_with_object_id(
+        &self,
+        scope: RefreshMaterialScope<'_>,
+        object_id: &str,
+        material: &HashMap<String, String>,
+        existing_handles: &HashMap<String, CredentialHandle>,
+    ) -> Result<HashMap<String, CredentialHandle>, Status> {
+        let mut values_by_storage_key = HashMap::with_capacity(material.len());
+        let mut handles_by_storage_key = HashMap::with_capacity(existing_handles.len());
+        let mut material_by_storage_key = HashMap::with_capacity(material.len());
+
+        for (material_key, value) in material {
+            let storage_key = refresh_material_storage_key(scope.credential_key, material_key);
+            material_by_storage_key.insert(storage_key.clone(), material_key.clone());
+            values_by_storage_key.insert(storage_key, value.clone());
+        }
+        for (material_key, handle) in existing_handles {
+            handles_by_storage_key.insert(
+                refresh_material_storage_key(scope.credential_key, material_key),
+                handle.clone(),
+            );
+        }
+
+        let stored = self
+            .store_provider_credentials_with_object_id(
+                scope.provider_name,
+                scope.workspace,
+                scope.provider_id,
+                object_id,
+                &values_by_storage_key,
+                &handles_by_storage_key,
+            )
+            .await?;
+        stored
+            .into_iter()
+            .map(|(storage_key, handle)| {
+                material_by_storage_key
+                    .remove(&storage_key)
+                    .map(|material_key| (material_key, handle))
+                    .ok_or_else(|| {
+                        Status::internal(
+                            "credential driver returned an unknown refresh material key",
+                        )
+                    })
+            })
+            .collect()
+    }
+
+    pub async fn resolve_refresh_material(
+        &self,
+        scope: RefreshMaterialScope<'_>,
+        handles: &HashMap<String, CredentialHandle>,
+    ) -> Result<HashMap<String, String>, Status> {
+        if handles.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let mut material_by_storage_key = HashMap::with_capacity(handles.len());
+        let mut storage_handles = HashMap::with_capacity(handles.len());
+        for (material_key, handle) in handles {
+            let storage_key = refresh_material_storage_key(scope.credential_key, material_key);
+            material_by_storage_key.insert(storage_key.clone(), material_key.clone());
+            storage_handles.insert(storage_key, handle.clone());
+        }
+        let provider = Provider {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: scope.provider_id.to_string(),
+                name: scope.provider_name.to_string(),
+                workspace: scope.workspace.to_string(),
+                ..Default::default()
+            }),
+            credential_handles: storage_handles,
+            ..Default::default()
+        };
+        let resolved = self.resolve_provider_handles(&provider, 0).await?;
+        resolved
+            .values
+            .into_iter()
+            .map(|(storage_key, value)| {
+                material_by_storage_key
+                    .remove(&storage_key)
+                    .map(|material_key| (material_key, value))
+                    .ok_or_else(|| {
+                        Status::internal(
+                            "credential driver resolved an unknown refresh material key",
+                        )
+                    })
+            })
+            .collect()
+    }
+
+    pub async fn delete_refresh_material_handles(
+        &self,
+        scope: RefreshMaterialScope<'_>,
+        handles: &HashMap<String, CredentialHandle>,
+    ) -> Result<(), Status> {
+        let storage_handles = handles
+            .iter()
+            .map(|(material_key, handle)| {
+                (
+                    refresh_material_storage_key(scope.credential_key, material_key),
+                    handle.clone(),
+                )
+            })
+            .collect();
+        self.delete_provider_credential_handles(
+            scope.provider_name,
+            scope.workspace,
+            scope.provider_id,
+            &storage_handles,
+        )
+        .await
+    }
+
     pub async fn delete_provider_credential_handles(
         &self,
         provider_name: &str,
@@ -517,6 +645,16 @@ impl CredentialRuntime {
             ))
         })
     }
+}
+
+fn refresh_material_storage_key(credential_key: &str, material_key: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(REFRESH_MATERIAL_CREDENTIAL_KEY_DOMAIN);
+    hasher.update([0]);
+    hasher.update(credential_key.as_bytes());
+    hasher.update([0]);
+    hasher.update(material_key.as_bytes());
+    format!("openshell.refresh.{:x}", hasher.finalize())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

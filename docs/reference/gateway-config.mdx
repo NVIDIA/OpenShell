@@ -331,7 +331,7 @@ The gateway validates snapshot structure and provider-profile semantics. It trea
 
 ## Credential Drivers
 
-Set `credential_drivers` only when the gateway should store provider credentials in an external credential backend. OpenShell supports at most one enabled credential driver at a time. When `credential_drivers` is omitted, the gateway uses its default encrypted database credential storage. `credential_drivers = []` is invalid in the TOML file; omit the field for the default encrypted store, or select a backend such as `kubernetes-secrets` or `vault`.
+Set `credential_drivers` only when the gateway should store provider secrets in an external credential backend. Provider secrets include injectable credentials and gateway-only refresh material such as OAuth refresh tokens, client secrets, and service-account private keys. OpenShell supports at most one enabled credential driver at a time. When `credential_drivers` is omitted, the gateway uses its default encrypted database credential storage. `credential_drivers = []` is invalid in the TOML file; omit the field for the default encrypted store, or select a backend such as `kubernetes-secrets` or `vault`.
 
 Credential driver tables are backend-owned and live under `[openshell.credential_drivers.<name>]`. Built-in drivers default to in-tree transport, so they do not need a `transport` field. Use `transport = "uds"` with an absolute `socket_path` only for a remote gRPC driver over a Unix domain socket.
 
@@ -379,7 +379,7 @@ For `kubernetes-secrets`, `namespace` sets where OpenShell-managed provider Secr
 
 For `vault`, `address` points at the Vault service, `mount` and `kv_version` describe the KV engine where OpenShell-managed provider secrets are stored, and `auth_method = "kubernetes"` logs in with the gateway Pod's ServiceAccount token. For local or development validation, use `auth_method = "token_file"` with `token_path = "/path/to/token"`. Do not put literal Vault tokens in TOML.
 
-Provider records that already contain inline database credentials remain readable for upgrade compatibility. New provider create/update requests still submit credential values through the normal API, but the gateway stores those values through the active credential storage path and persists only handles.
+Provider records that already contain inline database credentials remain readable for upgrade compatibility. New provider create/update requests still submit credential values through the normal API, but the gateway stores those values through the active credential storage path and persists only handles. The refresh worker migrates legacy inline secret refresh material to the same storage path before minting. Stop all older gateway replicas before starting the version that performs this migration; older protobuf runtimes do not preserve the new internal handle fields when they rewrite refresh state.
 
 For remote credential drivers, set `transport = "uds"` with `socket_path`. Omit `command`, `args`, and `startup_timeout_secs` when another service manager prestarts the driver socket. Keep backend tokens out of TOML; point the driver at mounted token files or native identity mechanisms instead.
 
