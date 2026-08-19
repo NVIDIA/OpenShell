@@ -83,6 +83,16 @@ impl OpenShellClient {
         self.channel.clone()
     }
 
+    /// Clone of the auth interceptor backing [`OpenShellClient::raw_grpc`].
+    ///
+    /// tonic allows a single interceptor per channel, so callers that need
+    /// to stack another concern (e.g. trace-context forwarding) on top of
+    /// authentication can compose around this clone — it shares the same
+    /// live bearer slot, so OIDC refresh still reaches the composed stack.
+    pub fn auth_interceptor(&self) -> EdgeAuthInterceptor {
+        self.interceptor.clone()
+    }
+
     /// Authenticated gRPC client for the main `OpenShell` service.
     ///
     /// Use this when the curated surface below doesn't expose the RPC or

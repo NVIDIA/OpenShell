@@ -21,9 +21,10 @@ pub use grpc::{
 };
 pub use ocsf::{OcsfOtlp, OcsfOtlpLayer};
 pub use propagation::{
-    HeaderMapExtractor, MetadataMapInjector, TRACEPARENT_ENV, TRACESTATE_ENV,
-    TraceContextInterceptor, current_trace_context_carrier, current_trace_context_environment,
-    set_parent_from_environment, set_parent_from_trace_context, trace_context_environment,
+    EnvTraceContextInterceptor, HeaderMapExtractor, MetadataMapInjector, TRACEPARENT_ENV,
+    TRACESTATE_ENV, TraceContextInterceptor, current_trace_context_carrier,
+    current_trace_context_environment, set_parent_from_environment, set_parent_from_trace_context,
+    trace_context_environment,
 };
 
 use opentelemetry::KeyValue;

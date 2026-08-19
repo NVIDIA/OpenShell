@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use miette::{IntoDiagnostic, Result, WrapErr};
+use openshell_otel::EnvTraceContextInterceptor;
 use openshell_sdk::{AuthConfig, ClientConfig, ClientIdentity, OpenShellClient};
 use rustls::{
     RootCertStore,
@@ -14,7 +15,31 @@ use tonic::metadata::AsciiMetadataValue;
 use tonic::transport::Channel;
 
 /// Concrete gRPC client type used by all commands.
-pub type GrpcClient = openshell_sdk::raw::AuthedGrpcClient;
+pub type GrpcClient = openshell_sdk::raw::GrpcClient<
+    tonic::service::interceptor::InterceptedService<Channel, GatewayInterceptor>,
+>;
+
+/// Interceptor stack applied to every gateway gRPC request.
+///
+/// Runs authentication header injection first, then passive W3C trace-context
+/// forwarding so a CI pipeline's `TRACEPARENT` extends into the gateway's
+/// spans. tonic allows a single interceptor per channel, so the two concerns
+/// are composed here.
+#[derive(Clone)]
+pub struct GatewayInterceptor {
+    auth: openshell_sdk::EdgeAuthInterceptor,
+    trace: EnvTraceContextInterceptor,
+}
+
+impl tonic::service::Interceptor for GatewayInterceptor {
+    fn call(
+        &mut self,
+        request: tonic::Request<()>,
+    ) -> std::result::Result<tonic::Request<()>, tonic::Status> {
+        let request = self.auth.call(request)?;
+        self.trace.call(request)
+    }
+}
 
 #[derive(Clone, Debug, Default)]
 pub struct TlsOptions {
@@ -305,9 +330,10 @@ pub async fn build_channel(server: &str, tls: &TlsOptions) -> Result<Channel> {
 
 /// Build the SDK client and return its raw gRPC escape hatch.
 ///
-/// When `tls.edge_token` is set, the returned client is wrapped with an
-/// interceptor that injects authentication headers on every request.
-/// Otherwise, standard mTLS is used (interceptor is a no-op).
+/// The returned client carries a [`GatewayInterceptor`] that injects
+/// authentication headers (when a token is set) and passively forwards the
+/// `TRACEPARENT`/`TRACESTATE` trace context from the environment on every
+/// request. With no token and no trace context, the interceptor is a no-op.
 pub async fn grpc_client(server: &str, tls: &TlsOptions) -> Result<GrpcClient> {
     let config = sdk_client_config(server, tls)?;
     // Keep the SDK's transport state machine out of every command future.
@@ -315,7 +341,17 @@ pub async fn grpc_client(server: &str, tls: &TlsOptions) -> Result<GrpcClient> {
     let client = Box::pin(OpenShellClient::connect(config))
         .await
         .into_diagnostic()?;
-    Ok(client.raw_grpc())
+    // tonic allows a single interceptor per channel: compose the SDK's auth
+    // interceptor (sharing its live bearer slot) with the CLI's passive
+    // trace-context forwarding.
+    let interceptor = GatewayInterceptor {
+        auth: client.auth_interceptor(),
+        trace: EnvTraceContextInterceptor::from_env(),
+    };
+    Ok(openshell_sdk::raw::GrpcClient::with_interceptor(
+        client.channel(),
+        interceptor,
+    ))
 }
 
 /// Gateway replica that owns the sandbox named in `response`, when it says.
