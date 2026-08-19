@@ -90,7 +90,8 @@ pub struct PodmanComputeConfig {
     /// default.  Defaults to [`openshell_core::config::DEFAULT_SERVER_PORT`].
     pub gateway_port: u16,
     /// Unix socket path the in-container supervisor bridges relay traffic to.
-    pub sandbox_ssh_socket_path: String,
+    #[serde(alias = "sandbox_ssh_socket_path")]
+    pub ssh_socket_path: String,
     /// Name of the Podman bridge network.
     /// Created automatically if it does not exist.
     pub network_name: String,
@@ -536,7 +537,7 @@ impl Default for PodmanComputeConfig {
             image_pull_policy: ImagePullPolicy::default(),
             grpc_endpoint: String::new(),
             gateway_port: openshell_core::config::DEFAULT_SERVER_PORT,
-            sandbox_ssh_socket_path: openshell_core::container_paths::SSH_SOCKET_PATH.to_string(),
+            ssh_socket_path: openshell_core::container_paths::SSH_SOCKET_PATH.to_string(),
             network_name: DEFAULT_NETWORK_NAME.to_string(),
             host_gateway_ip: Self::default_host_gateway_ip(),
             stop_timeout_secs: DEFAULT_PODMAN_STOP_TIMEOUT_SECS,
@@ -569,7 +570,7 @@ impl std::fmt::Debug for PodmanComputeConfig {
             .field("image_pull_policy", &self.image_pull_policy.as_str())
             .field("grpc_endpoint", &self.grpc_endpoint)
             .field("gateway_port", &self.gateway_port)
-            .field("sandbox_ssh_socket_path", &self.sandbox_ssh_socket_path)
+            .field("ssh_socket_path", &self.ssh_socket_path)
             .field("network_name", &self.network_name)
             .field("host_gateway_ip", &self.host_gateway_ip)
             .field("stop_timeout_secs", &self.stop_timeout_secs)
@@ -604,6 +605,37 @@ impl std::fmt::Debug for PodmanComputeConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn config_uses_canonical_ssh_socket_path_name() {
+        let config: PodmanComputeConfig =
+            serde_json::from_value(serde_json::json!({ "ssh_socket_path": "/run/test.sock" }))
+                .unwrap();
+        assert_eq!(config.ssh_socket_path, "/run/test.sock");
+
+        let serialized = serde_json::to_value(config).unwrap();
+        assert_eq!(serialized["ssh_socket_path"], "/run/test.sock");
+        assert!(serialized.get("sandbox_ssh_socket_path").is_none());
+    }
+
+    #[test]
+    fn config_accepts_legacy_sandbox_ssh_socket_path_alias() {
+        let config: PodmanComputeConfig = serde_json::from_value(serde_json::json!({
+            "sandbox_ssh_socket_path": "/run/test.sock"
+        }))
+        .unwrap();
+        assert_eq!(config.ssh_socket_path, "/run/test.sock");
+    }
+
+    #[test]
+    fn config_rejects_canonical_and_legacy_ssh_socket_path_names_together() {
+        let error = serde_json::from_value::<PodmanComputeConfig>(serde_json::json!({
+            "ssh_socket_path": "/run/canonical.sock",
+            "sandbox_ssh_socket_path": "/run/legacy.sock"
+        }))
+        .expect_err("canonical and legacy names must not both be accepted");
+        assert!(error.to_string().contains("duplicate field"));
+    }
 
     #[test]
     fn default_config_sets_health_check_interval() {

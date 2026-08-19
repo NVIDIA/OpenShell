@@ -536,7 +536,7 @@ pub async fn spawn(
     command.arg("--log-level").arg(gateway_log_level);
     append_otlp_args(&mut command, otlp_config, gateway_name);
     command
-        .arg("--openshell-endpoint")
+        .arg("--grpc-endpoint")
         .arg(&vm_config.grpc_endpoint);
     command.arg("--state-dir").arg(&vm_config.state_dir);
     if !vm_config.default_image.trim().is_empty() {

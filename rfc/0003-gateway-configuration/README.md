@@ -130,7 +130,7 @@ ssh_socket_path              = "/run/openshell/ssh.sock"
 [openshell.drivers.docker]
 default_image     = "ghcr.io/nvidia/openshell-community/sandboxes/base:latest"
 image_pull_policy = "IfNotPresent"
-sandbox_namespace = "docker-dev"
+sandbox_label     = "docker-dev"
 grpc_endpoint     = "https://host.openshell.internal:8080"
 network_name      = "openshell"
 supervisor_bin    = "/usr/local/libexec/openshell/openshell-sandbox"  # optional override

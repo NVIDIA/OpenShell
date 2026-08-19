@@ -275,9 +275,9 @@ Podman follows the same end-to-end contract as the Kubernetes and VM drivers
 for the in-container SSH relay: gateway config to `PodmanComputeConfig` to
 sandbox environment to supervisor session registration on that path.
 
-1. `openshell-core` `Config::sandbox_ssh_socket_path` is copied into
-   `PodmanComputeConfig::sandbox_ssh_socket_path` when the gateway builds the
-   in-process driver.
+1. `[openshell.drivers.podman].ssh_socket_path` is deserialized into
+   `PodmanComputeConfig::ssh_socket_path` when the gateway builds the in-process
+   driver. The field defaults to `/run/openshell/ssh.sock` when omitted.
 2. `build_env()` in `container.rs` sets `OPENSHELL_SSH_SOCKET_PATH` to that
    value, alongside required vars such as `OPENSHELL_ENDPOINT` and
    `OPENSHELL_SANDBOX_ID`. These driver-controlled entries overwrite template
