@@ -124,6 +124,8 @@ When you register or log in to an OIDC gateway, the CLI uses the Authorization C
 
 The connection flow:
 
+For a headless environment, set `OPENSHELL_NO_BROWSER=1` before registering or logging in to the gateway. When this variable is set and `OPENSHELL_OIDC_CLIENT_SECRET` is not configured, the CLI uses the Device Authorization Grant (RFC 8628) with S256 PKCE. This flow prompts the user to visit a verification URL on any device with a browser and enter a displayed code. The CLI polls the token endpoint until the user completes authorization. This requires the OIDC client to have the device authorization grant enabled on the identity provider.
+
 1. The CLI loads the stored OIDC token bundle.
 2. If the access token is expired and a refresh token is available, the CLI refreshes it with the OIDC scopes saved in the gateway metadata.
 3. The CLI connects to the gateway and attaches `authorization: Bearer <token>` metadata to each gRPC request.
