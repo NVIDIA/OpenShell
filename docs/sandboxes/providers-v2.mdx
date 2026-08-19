@@ -585,6 +585,10 @@ and injects it into every gateway pod when no external credential driver is enab
 a shared database with the default encrypted store, or choose a shared backend
 such as `kubernetes-secrets` or `vault`.
 
+Every `secret_material_keys` entry must name a key supplied in `material` in the
+same configure request. Clients submit secret values, not internal credential
+handles.
+
 Provider records that already contain inline database credentials remain
 readable for upgrade compatibility. New provider create/update requests store
 credential values through the active credential driver and persist only handles.

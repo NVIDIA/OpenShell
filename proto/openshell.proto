@@ -1606,9 +1606,18 @@ message StoredProviderCredentialRefreshState {
   // values exist in gateway memory for the duration of one mint operation.
   map<string, openshell.datamodel.v1.CredentialHandle> secret_material_handles = 19;
   // Handles replaced by reconfiguration or issuer-driven refresh-token
-  // rotation. Cleanup is retried by the refresh worker so a gateway crash or
-  // temporary credential-backend outage does not lose the deletion reference.
-  map<string, openshell.datamodel.v1.CredentialHandle> pending_secret_deletions = 20;
+  // rotation. This is a repeated entry rather than a material-keyed map so
+  // multiple superseded generations of the same material remain recoverable.
+  // Cleanup is retried by the refresh worker so a gateway crash or temporary
+  // credential-backend outage does not lose the deletion reference.
+  repeated StoredRefreshMaterialDeletion pending_secret_deletions = 20;
+}
+
+message StoredRefreshMaterialDeletion {
+  // Original material name used to derive the credential driver's storage key.
+  string material_key = 1;
+  // Opaque handle for the superseded secret object.
+  openshell.datamodel.v1.CredentialHandle handle = 2;
 }
 
 message GetProviderRefreshStatusRequest {

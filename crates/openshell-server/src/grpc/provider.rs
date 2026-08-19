@@ -5,6 +5,7 @@
 
 #![allow(clippy::result_large_err)] // gRPC handlers return Result<Response<_>, Status>
 
+#[cfg(test)]
 use crate::credentials::RefreshMaterialScope;
 use crate::persistence::{
     ObjectId, ObjectLabels, ObjectName, ObjectType, Store, WriteCondition, generate_name,
@@ -529,33 +530,11 @@ pub(super) async fn delete_provider_record(
     workspace: &str,
     name: &str,
 ) -> Result<bool, Status> {
-    if name.is_empty() {
-        return Err(Status::invalid_argument("name is required"));
-    }
-
-    let Some(provider) = store
-        .get_message_by_name::<Provider>(workspace, name)
-        .await
-        .map_err(|e| Status::internal(format!("fetch provider failed: {e}")))?
-    else {
-        return Ok(false);
-    };
-
-    let blocking_sandboxes = sandboxes_using_provider(store, workspace, name).await?;
-    if !blocking_sandboxes.is_empty() {
-        return Err(Status::failed_precondition(format!(
-            "provider '{name}' is attached to sandbox(es): {}",
-            blocking_sandboxes.join(", ")
-        )));
-    }
-
-    crate::provider_refresh::delete_refresh_states_for_provider(store, provider.object_id())
-        .await?;
-
-    store
-        .delete_by_name(Provider::object_type(), workspace, name)
-        .await
-        .map_err(|e| Status::internal(format!("delete provider failed: {e}")))
+    let credentials = crate::credentials::CredentialRuntime::from_config(
+        &openshell_core::Config::new(None).with_credential_drivers(["test-static"]),
+    )
+    .map_err(|err| Status::internal(format!("create test credential runtime failed: {err}")))?;
+    delete_provider_record_with_credentials(store, workspace, &credentials, name).await
 }
 
 pub(super) async fn delete_provider_record_with_credentials(
@@ -3754,7 +3733,7 @@ pub(super) async fn handle_configure_provider_refresh(
             "max_lifetime_seconds material must be greater than or equal to 0",
         ));
     }
-    let mut existing_refresh_state = crate::provider_refresh::get_refresh_state(
+    let existing_refresh_state = crate::provider_refresh::get_refresh_state(
         state.store.as_ref(),
         &workspace,
         provider.object_id(),
@@ -3777,23 +3756,6 @@ pub(super) async fn handle_configure_provider_refresh(
             .as_ref()
             .map(|metadata| metadata.resource_version)
     });
-    if let Some(existing) = existing_refresh_state.as_mut()
-        && !existing.pending_secret_deletions.is_empty()
-    {
-        state
-            .credentials
-            .delete_refresh_material_handles(
-                RefreshMaterialScope {
-                    provider_name: &existing.provider_name,
-                    workspace: existing.object_workspace(),
-                    provider_id: &existing.provider_id,
-                    credential_key: &existing.credential_key,
-                },
-                &existing.pending_secret_deletions,
-            )
-            .await?;
-        existing.pending_secret_deletions.clear();
-    }
     let expires_at_ms = request.expires_at_ms.unwrap_or_else(|| {
         existing_refresh_state
             .as_ref()
@@ -3809,25 +3771,6 @@ pub(super) async fn handle_configure_provider_refresh(
                 .map(|value| (key.clone(), value))
         })
         .collect();
-    let material_staging_id = format!(
-        "{}-refresh-config-{}",
-        provider.object_id(),
-        uuid::Uuid::new_v4()
-    );
-    let staged_material_handles = state
-        .credentials
-        .store_refresh_material_with_object_id(
-            RefreshMaterialScope {
-                provider_name: provider.object_name(),
-                workspace: &workspace,
-                provider_id: provider.object_id(),
-                credential_key,
-            },
-            &material_staging_id,
-            &secret_material,
-            &HashMap::new(),
-        )
-        .await?;
     let mut state_record = crate::provider_refresh::new_refresh_state(
         &provider,
         &workspace,
@@ -3844,17 +3787,35 @@ pub(super) async fn handle_configure_provider_refresh(
             additional_output_keys,
         },
     )?;
-    state_record.secret_material_handles = staged_material_handles.clone();
-    if let Some(existing) = existing_refresh_state {
-        state_record.metadata = existing.metadata;
+    if let Some(existing) = existing_refresh_state.as_ref() {
+        state_record.metadata.clone_from(&existing.metadata);
         state_record.last_refresh_at_ms = existing.last_refresh_at_ms;
         state_record
             .pending_secret_deletions
-            .extend(existing.pending_secret_deletions);
-        state_record
-            .pending_secret_deletions
-            .extend(existing.secret_material_handles);
+            .extend(existing.pending_secret_deletions.clone());
+        for (material_key, handle) in &existing.secret_material_handles {
+            crate::provider_refresh::enqueue_pending_secret_deletion(
+                &mut state_record,
+                material_key,
+                handle.clone(),
+            );
+        }
     }
+    let material_staging_id = format!(
+        "{}-refresh-config-{}",
+        provider.object_id(),
+        uuid::Uuid::new_v4()
+    );
+    let staged_material_handles = state
+        .credentials
+        .store_refresh_material_with_object_id(
+            crate::provider_refresh::refresh_material_scope(&state_record),
+            &material_staging_id,
+            &secret_material,
+            &HashMap::new(),
+        )
+        .await?;
+    state_record.secret_material_handles = staged_material_handles.clone();
     let persist_result = if let Some(expected_version) = existing_refresh_version {
         match crate::provider_refresh::replace_refresh_state_if_current(
             state.store.as_ref(),
@@ -3876,12 +3837,7 @@ pub(super) async fn handle_configure_provider_refresh(
         if let Err(cleanup_err) = state
             .credentials
             .delete_refresh_material_handles(
-                RefreshMaterialScope {
-                    provider_name: provider.object_name(),
-                    workspace: &workspace,
-                    provider_id: provider.object_id(),
-                    credential_key,
-                },
+                crate::provider_refresh::refresh_material_scope(&state_record),
                 &staged_material_handles,
             )
             .await
@@ -3954,7 +3910,7 @@ pub(super) async fn handle_rotate_provider_credential(
     let refresh_state = crate::provider_refresh::refresh_provider_credential(
         state.store.as_ref(),
         &workspace,
-        Some(&state.credentials),
+        &state.credentials,
         Some(&state.compute),
         provider_name,
         credential_key,
@@ -5977,6 +5933,111 @@ mod tests {
             !provider_after_delete
                 .credential_expires_at_ms
                 .contains_key("MS_GRAPH_ACCESS_TOKEN")
+        );
+    }
+
+    #[tokio::test]
+    async fn configure_provider_refresh_conflict_cleans_only_staged_material() {
+        let state = test_server_state().await;
+        import_test_graph_refresh_profile(&state).await;
+        create_provider_record(
+            state.store.as_ref(),
+            "default",
+            Provider {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    name: "configure-conflict".to_string(),
+                    workspace: "default".to_string(),
+                    ..Default::default()
+                }),
+                r#type: TEST_GRAPH_PROVIDER_TYPE.to_string(),
+                profile_workspace: "default".to_string(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let request = |client_secret: &str| ConfigureProviderRefreshRequest {
+            provider: "configure-conflict".to_string(),
+            credential_key: "MS_GRAPH_ACCESS_TOKEN".to_string(),
+            strategy: ProviderCredentialRefreshStrategy::Oauth2ClientCredentials as i32,
+            material: HashMap::from([
+                ("tenant_id".to_string(), "tenant".to_string()),
+                ("client_id".to_string(), "client-id".to_string()),
+                ("client_secret".to_string(), client_secret.to_string()),
+            ]),
+            secret_material_keys: vec!["client_secret".to_string()],
+            expires_at_ms: None,
+            workspace: "default".to_string(),
+        };
+        handle_configure_provider_refresh(&state, authed_request(request("original-secret")))
+            .await
+            .unwrap();
+        let provider = state
+            .store
+            .get_message_by_name::<Provider>("default", "configure-conflict")
+            .await
+            .unwrap()
+            .unwrap();
+        let original = crate::provider_refresh::get_refresh_state(
+            state.store.as_ref(),
+            "default",
+            provider.object_id(),
+            "MS_GRAPH_ACCESS_TOKEN",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(state.credentials.stored_credential_count(), Some(1));
+        let (store_hit, release_store) = state.credentials.gate_next_store();
+
+        let configure = handle_configure_provider_refresh(
+            &state,
+            authed_request(request("replacement-secret")),
+        );
+        let supersede = async {
+            store_hit.await.unwrap();
+            let mut winner = crate::provider_refresh::get_refresh_state(
+                state.store.as_ref(),
+                "default",
+                provider.object_id(),
+                "MS_GRAPH_ACCESS_TOKEN",
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            winner.last_error = "won-by-concurrent-writer".to_string();
+            crate::provider_refresh::put_refresh_state(state.store.as_ref(), &winner)
+                .await
+                .unwrap();
+            release_store.send(()).unwrap();
+        };
+        let (result, ()) = tokio::join!(configure, supersede);
+
+        assert_eq!(result.unwrap_err().code(), Code::Aborted);
+        assert_eq!(state.credentials.stored_credential_count(), Some(1));
+        let stored = crate::provider_refresh::get_refresh_state(
+            state.store.as_ref(),
+            "default",
+            provider.object_id(),
+            "MS_GRAPH_ACCESS_TOKEN",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(stored.authorization_epoch, original.authorization_epoch);
+        assert_eq!(stored.last_error, "won-by-concurrent-writer");
+        assert!(stored.pending_secret_deletions.is_empty());
+        assert_eq!(
+            state
+                .credentials
+                .resolve_refresh_material(
+                    crate::provider_refresh::refresh_material_scope(&stored),
+                    &stored.secret_material_handles,
+                )
+                .await
+                .unwrap()
+                .get("client_secret"),
+            Some(&"original-secret".to_string())
         );
     }
 
