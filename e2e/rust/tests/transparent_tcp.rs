@@ -17,6 +17,7 @@ use tempfile::NamedTempFile;
 const FIXTURE_ALIAS: &str = "transparent-tcp-fixture.openshell.test";
 const MUSL_FIXTURE_ALIAS: &str = "transparent-tcp-musl.openshell.test";
 const FIXTURE_PORT: u16 = 5432;
+const TCP_DNS_PORT: u16 = 53;
 const TRANSPARENT_LISTENER_PORT: u16 = 15001;
 
 struct MuslDnsProbe {
@@ -78,11 +79,17 @@ impl MuslDnsProbe {
 }
 
 fn write_policy() -> Result<NamedTempFile, String> {
-    write_policy_for(FIXTURE_ALIAS)
+    write_policy_for_identity(
+        FIXTURE_ALIAS,
+        "sandbox",
+        "sandbox",
+        &[],
+        &[FIXTURE_PORT, TCP_DNS_PORT],
+    )
 }
 
 fn write_policy_for(host: &str) -> Result<NamedTempFile, String> {
-    write_policy_for_identity(host, "sandbox", "sandbox", &[])
+    write_policy_for_identity(host, "sandbox", "sandbox", &[], &[FIXTURE_PORT])
 }
 
 fn write_policy_for_identity(
@@ -90,12 +97,18 @@ fn write_policy_for_identity(
     run_as_user: &str,
     run_as_group: &str,
     extra_read_only: &[&str],
+    ports: &[u16],
 ) -> Result<NamedTempFile, String> {
     let mut file = NamedTempFile::new().map_err(|error| format!("create policy: {error}"))?;
     let extra_read_only = extra_read_only
         .iter()
         .map(|path| format!(", {path}"))
         .collect::<String>();
+    let ports = ports
+        .iter()
+        .map(u16::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
     let policy = format!(
         r#"version: 1
 filesystem_policy:
@@ -109,7 +122,7 @@ network_policies:
     name: native_database
     endpoints:
       - host: {host}
-        port: {FIXTURE_PORT}
+        ports: [{ports}]
         protocol: tcp
         allowed_ips: ["10.0.0.0/8", "172.0.0.0/8", "192.168.0.0/16"]
     binaries:
@@ -256,6 +269,7 @@ def serve(port):
     c.close()
 
 threading.Thread(target=serve, args=({TRANSPARENT_LISTENER_PORT},), daemon=True).start()
+threading.Thread(target=serve, args=({TCP_DNS_PORT},), daemon=True).start()
 serve({FIXTURE_PORT})
 "#
         ),
@@ -289,6 +303,9 @@ assert any(ip.startswith('198.18.') or ip.startswith('198.19.') for ip in synthe
 with socket.create_connection(({host:?}, {port}), timeout=10) as conn:
     conn.sendall(b'probe')
     assert conn.recv(1024) == b'native-tcp-ok:probe'
+with socket.create_connection(({host:?}, {tcp_dns_port}), timeout=10) as conn:
+    conn.sendall(b'tcp-53-probe')
+    assert conn.recv(1024) == b'native-tcp-ok:tcp-53-probe'
 
 def denied(host, port):
     try:
@@ -305,6 +322,7 @@ print('transparent-tcp-e2e-ok')
 "#,
         host = FIXTURE_ALIAS,
         port = FIXTURE_PORT,
+        tcp_dns_port = TCP_DNS_PORT,
         wrong_port = FIXTURE_PORT + 1,
         real_ip = real_ip,
         transparent_port = TRANSPARENT_LISTENER_PORT,

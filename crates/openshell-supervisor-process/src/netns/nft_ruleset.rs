@@ -260,25 +260,6 @@ pub fn generate_transparent_tcp_commands(
                 "inet",
                 "openshell_transparent",
                 "output",
-                "meta",
-                "nfproto",
-                "ipv4",
-                "tcp",
-                "dport",
-                DNS_DESTINATION_PORT,
-                "redirect",
-                "to",
-                &format!(":{dns_port}"),
-            ],
-        ),
-        nft_cmd(
-            true,
-            &[
-                "add",
-                "rule",
-                "inet",
-                "openshell_transparent",
-                "output",
                 "ip",
                 "daddr",
                 synthetic_ipv4_cidr,
@@ -288,6 +269,28 @@ pub fn generate_transparent_tcp_commands(
                 "redirect",
                 "to",
                 &format!(":{transparent_port}"),
+            ],
+        ),
+        // Synthetic destinations must take precedence over the generic TCP
+        // DNS capture. A policy endpoint may legitimately use TCP port 53;
+        // that connection belongs to transparent TCP, not the DNS listener.
+        nft_cmd(
+            true,
+            &[
+                "add",
+                "rule",
+                "inet",
+                "openshell_transparent",
+                "output",
+                "meta",
+                "nfproto",
+                "ipv4",
+                "tcp",
+                "dport",
+                DNS_DESTINATION_PORT,
+                "redirect",
+                "to",
+                &format!(":{dns_port}"),
             ],
         ),
         nft_cmd(
@@ -678,6 +681,14 @@ mod tests {
                     .unwrap()
         );
         assert!(!text.contains("meta nfproto ipv6 udp dport 53 redirect"));
+        assert!(
+            text.find("ip daddr 198.18.0.0/24 tcp dport 1-65535 redirect to :15001")
+                .unwrap()
+                < text
+                    .find("meta nfproto ipv4 tcp dport 53 redirect to :15053")
+                    .unwrap(),
+            "synthetic TCP:53 must reach transparent TCP before generic DNS capture"
+        );
     }
 
     #[test]
