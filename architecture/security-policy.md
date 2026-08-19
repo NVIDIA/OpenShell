@@ -97,6 +97,70 @@ raw relay by default. A `protocol: rest` endpoint can opt in to
 after an allowed `101` upgrade; server-to-client traffic and all other upgraded
 protocols remain raw passthrough.
 
+## Credentialed Endpoints
+
+OpenShell keeps provider credentials on paths it can inspect or rewrite by
+default. The gateway derives credential provenance from the attached providers
+and stamps it onto the effective policy at composition time. This provenance is
+internal, contains no credential identifiers or values, and is never trusted
+from user-authored policy.
+
+Every evaluation clears provenance across the whole policy and re-derives it
+from two sources:
+
+- the endpoints of attached provider profiles that carry credentials, and
+- the valid `credential_binding` entries of the sandbox policy that name an
+  attached provider whose profile is endpointless.
+
+A binding reduces to a host and port scope only. Dropping the path is
+deliberate: a path is not observable on an L4 or `tls: skip` endpoint, so a
+path-scoped derivation would omit the marker on exactly the surfaces the
+uninspected-credential gate exists to catch. A malformed binding — empty
+provider, missing host, or a port outside `1..=65535` — fails the evaluation
+instead of contributing a scope. Bindings naming an endpointful profile or an
+unattached provider contribute nothing; the gateway rejects those uses
+separately.
+
+Both sources merge into one deduplicated scope set, and each endpoint is
+stamped once per evaluation from that set, so binding-derived scopes reach the
+same gates as profile-derived ones. The stamp is an assignment, not an
+accumulation, so an endpoint that stops matching a credentialed scope — or
+whose binding was removed — loses its marker in the same pass. This must remain
+a full recomputation: a delta-based derivation would let a series of
+individually valid edits reach a state no single edit would have admitted.
+
+Credentialed L4-only and `tls: skip` endpoints fail policy validation unless the
+public `allow_uninspected_credentials` escape hatch is explicitly enabled. The
+flag defaults to `false` and is security-flagged in policy approval flows.
+Incremental merges only ever add the flag to a matching endpoint; clearing it
+requires removing the endpoint or replacing the policy.
+
+The network supervisor independently enforces the same boundary. Credentialed
+WebSocket upgrades use the parsed relay, binary frames fail closed, and text
+placeholders require rewrite. REST bodies can continue streaming when body
+rewrite is disabled, but the relay withholds enough trailing bytes to detect a
+placeholder split across reads before forwarding its marker. Explicitly opted-in
+endpoints retain raw passthrough behavior.
+
+Denials emit both the relevant network activity and a detection finding. Events
+identify only the destination, policy, and traffic surface; they never include
+credential names, placeholders, body content, or secret values.
+
+Credential provenance is gateway-derived and deliberately absent from the policy
+YAML schema, so it does not survive a policy that never transits the gateway.
+Gateway-delivered policy is the authoritative source for this control, and a
+policy without provenance applies neither the raw-tunnel refusal nor the
+WebSocket binary-frame refusal. The request-body backstop still applies, because
+it keys off the presence of a secret resolver rather than endpoint provenance.
+
+Two paths load a policy without provenance. A supervisor booting from a
+container-image policy is a bounded window: that policy is resynchronized to the
+gateway, which then serves a stamped effective policy. An explicit local Rego and
+data override is permanent, because gateway revisions are observed for settings
+and providers but never replace the local policy. When that override is combined
+with injected provider credentials, the supervisor emits a high-severity
+detection finding at startup naming the inactive controls.
+
 ## Live Updates
 
 The gateway stores sandbox-authored policy revisions separately from derived

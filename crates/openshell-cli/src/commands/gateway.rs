@@ -912,6 +912,7 @@ pub async fn gateway_add(
                 oidc_audience,
                 oidc_scopes,
                 gateway_insecure,
+                false,
             )
             .await
             {
@@ -1116,6 +1117,8 @@ pub async fn gateway_login(name: &str, gateway_insecure: bool) -> Result<()> {
                 .unwrap_or("openshell-cli");
             let audience = metadata.oidc_audience.as_deref();
             let scopes = metadata.oidc_scopes.as_deref();
+            let force_fresh_login =
+                openshell_bootstrap::oidc_token::oidc_login_prompt_required(name);
 
             let bundle = if std::env::var("OPENSHELL_OIDC_CLIENT_SECRET").is_ok() {
                 crate::oidc_auth::oidc_client_credentials_flow(
@@ -1133,12 +1136,14 @@ pub async fn gateway_login(name: &str, gateway_insecure: bool) -> Result<()> {
                     audience,
                     scopes,
                     gateway_insecure,
+                    force_fresh_login,
                 )
                 .await?
             };
 
             let username = jwt_preferred_username(&bundle.access_token);
             openshell_bootstrap::oidc_token::store_oidc_token(name, &bundle)?;
+            openshell_bootstrap::oidc_token::clear_oidc_login_prompt(name)?;
 
             if let Some(user) = username {
                 eprintln!(
@@ -1184,6 +1189,7 @@ pub fn gateway_logout(name: &str) -> Result<()> {
     match metadata.auth_mode.as_deref() {
         Some("oidc") => {
             openshell_bootstrap::oidc_token::remove_oidc_token(name)?;
+            openshell_bootstrap::oidc_token::request_oidc_login_prompt(name)?;
         }
         Some("cloudflare_jwt") => {
             openshell_bootstrap::edge_token::remove_edge_token(name)?;
@@ -1429,6 +1435,9 @@ fn remove_gateway_registration(name: &str) {
     }
     if let Err(err) = openshell_bootstrap::oidc_token::remove_oidc_token(name) {
         tracing::debug!("failed to remove oidc token: {err}");
+    }
+    if let Err(err) = openshell_bootstrap::oidc_token::clear_oidc_login_prompt(name) {
+        tracing::debug!("failed to clear oidc login prompt marker: {err}");
     }
     if let Err(err) = remove_gateway_metadata(name) {
         tracing::debug!("failed to remove gateway metadata: {err}");

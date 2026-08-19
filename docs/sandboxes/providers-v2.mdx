@@ -388,6 +388,7 @@ endpoints:
     allow_encoded_slash: false
     websocket_credential_rewrite: false
     request_body_credential_rewrite: false
+    allow_uninspected_credentials: false
     persisted_queries: deny
     graphql_max_body_bytes: 65536
     rules:
@@ -435,7 +436,7 @@ credential declared under `credentials`. OpenShell scans the referenced
 credential's `env_vars` in order and stores the first non-empty local
 environment value under the actual environment variable key.
 
-`endpoints` contains the same endpoint object shape as sandbox network policy. A profile can use access presets, protocol-specific allow rules, deny rules, WebSocket credential rewriting, request body credential rewriting, GraphQL fields, and SSRF IP allowlists.
+`endpoints` contains the same endpoint object shape as sandbox network policy. A profile can use access presets, protocol-specific allow rules, deny rules, WebSocket credential rewriting, request body credential rewriting, GraphQL fields, and SSRF IP allowlists. Because profile credentials are not mapped to individual endpoints, OpenShell conservatively treats every endpoint in a profile that declares credentials as credentialed. Such endpoints require L7 inspection and cannot use `tls: skip` unless the profile explicitly sets `allow_uninspected_credentials: true`.
 
 `binaries` contains the executable paths allowed to reach the profile endpoints when the profile contributes policy to a sandbox.
 

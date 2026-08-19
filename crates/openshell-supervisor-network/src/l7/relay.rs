@@ -328,6 +328,7 @@ pub(crate) struct UpgradeRelayOptions<'a> {
 #[derive(Default)]
 pub(crate) struct WebSocketUpgradeBehavior {
     pub(crate) credential_rewrite: bool,
+    pub(crate) deny_uninspected_credentials: bool,
     pub(crate) message_policy: WebSocketMessagePolicy,
     pub(crate) permessage_deflate: bool,
 }
@@ -834,6 +835,8 @@ where
                     ),
                     request_body_credential_rewrite: config.protocol == L7Protocol::Rest
                         && config.request_body_credential_rewrite,
+                    deny_uninspected_credentials: config
+                        .deny_uninspected_body_credentials(ctx.secret_resolver.is_some()),
                     credential_signing: config.credential_signing,
                     signing_service: &config.signing_service,
                     signing_region: &config.signing_region,
@@ -1067,7 +1070,8 @@ where
         && (options.websocket.message_policy.inspects_messages()
             || options.websocket.permessage_deflate
             || options.websocket.credential_rewrite
-            || options.middleware_session.is_some());
+            || options.middleware_session.is_some()
+            || options.websocket.deny_uninspected_credentials);
     let relay_mode = if use_websocket_relay {
         "websocket parsed relay"
     } else {
@@ -1135,6 +1139,7 @@ where
                 compression,
                 middleware_session: options.middleware_session.take(),
                 middleware_context: options.ctx,
+                deny_uninspected_credentials: options.websocket.deny_uninspected_credentials,
             },
         )
         .await;
@@ -1199,6 +1204,8 @@ pub(crate) fn upgrade_options<'a>(
     let websocket_credential_rewrite =
         matches!(config.protocol, L7Protocol::Rest | L7Protocol::Websocket)
             && config.websocket_credential_rewrite;
+    let deny_uninspected_credentials =
+        config.provider_credentialed && !config.allow_uninspected_credentials;
     let websocket_message_policy = if config.protocol == L7Protocol::Websocket {
         if config.websocket_graphql_policy {
             WebSocketMessagePolicy::Graphql
@@ -1212,6 +1219,7 @@ pub(crate) fn upgrade_options<'a>(
         websocket_request,
         websocket: WebSocketUpgradeBehavior {
             credential_rewrite: websocket_credential_rewrite,
+            deny_uninspected_credentials,
             message_policy: websocket_message_policy,
             permessage_deflate: false,
         },
@@ -1240,6 +1248,7 @@ pub(crate) fn websocket_extension_mode(
     if inspecting_middleware_session
         || config.protocol == L7Protocol::Websocket
         || (config.protocol == L7Protocol::Rest && config.websocket_credential_rewrite)
+        || (config.provider_credentialed && !config.allow_uninspected_credentials)
     {
         WebSocketExtensionMode::PermessageDeflate
     } else {
@@ -1524,6 +1533,8 @@ where
                     ),
                     request_body_credential_rewrite: config.protocol == L7Protocol::Rest
                         && config.request_body_credential_rewrite,
+                    deny_uninspected_credentials: config
+                        .deny_uninspected_body_credentials(ctx.secret_resolver.is_some()),
                     credential_signing: config.credential_signing,
                     signing_service: &config.signing_service,
                     signing_region: &config.signing_region,
@@ -6962,6 +6973,8 @@ network_policies:
             allow_encoded_slash,
             websocket_credential_rewrite: false,
             request_body_credential_rewrite: false,
+            allow_uninspected_credentials: false,
+            provider_credentialed: false,
             websocket_graphql_policy: false,
             credential_signing: crate::l7::CredentialSigning::None,
             signing_service: String::new(),
@@ -7315,6 +7328,8 @@ network_policies:
             allow_encoded_slash: false,
             websocket_credential_rewrite: true,
             request_body_credential_rewrite: false,
+            allow_uninspected_credentials: false,
+            provider_credentialed: false,
             websocket_graphql_policy: false,
             credential_signing: crate::l7::CredentialSigning::None,
             signing_service: String::new(),
@@ -7515,6 +7530,8 @@ network_policies:
             allow_encoded_slash: false,
             websocket_credential_rewrite: true,
             request_body_credential_rewrite: false,
+            allow_uninspected_credentials: false,
+            provider_credentialed: false,
             websocket_graphql_policy: false,
             credential_signing: crate::l7::CredentialSigning::None,
             signing_service: String::new(),
@@ -7639,6 +7656,8 @@ network_policies:
             allow_encoded_slash: false,
             websocket_credential_rewrite: true,
             request_body_credential_rewrite: false,
+            allow_uninspected_credentials: false,
+            provider_credentialed: false,
             websocket_graphql_policy: true,
             credential_signing: crate::l7::CredentialSigning::None,
             signing_service: String::new(),

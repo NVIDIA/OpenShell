@@ -96,6 +96,20 @@ fn build_ci_scopes(scopes: Option<&str>) -> Vec<Scope> {
         .collect()
 }
 
+fn interactive_authorization_params(
+    audience: Option<&str>,
+    force_fresh_login: bool,
+) -> Vec<(&'static str, String)> {
+    let mut params = Vec::new();
+    if force_fresh_login {
+        params.push(("prompt", "login".to_string()));
+    }
+    if let Some(aud) = audience {
+        params.push(("audience", aud.to_string()));
+    }
+    params
+}
+
 /// Run the OIDC Authorization Code + PKCE browser flow.
 ///
 /// Opens the user's browser to the Keycloak login page and waits for
@@ -106,6 +120,7 @@ pub async fn oidc_browser_auth_flow(
     audience: Option<&str>,
     scopes: Option<&str>,
     insecure: bool,
+    force_fresh_login: bool,
 ) -> Result<OidcTokenBundle> {
     let discovery = discover(issuer, insecure).await?;
 
@@ -130,10 +145,14 @@ pub async fn oidc_browser_auth_flow(
 
     let (mut auth_url, csrf_token) = auth_request.url();
 
-    // Append audience parameter for providers like Entra ID where the API
-    // audience differs from the client ID.
-    if let Some(aud) = audience {
-        auth_url.query_pairs_mut().append_pair("audience", aud);
+    // After `gateway logout`, ask the IdP for a fresh login prompt so the user
+    // can switch browser identity. Ordinary repeated logins may reuse SSO.
+    let params = interactive_authorization_params(audience, force_fresh_login);
+    {
+        let mut query = auth_url.query_pairs_mut();
+        for (key, value) in &params {
+            query.append_pair(key, value);
+        }
     }
 
     let (tx, rx) = oneshot::channel::<String>();
@@ -535,6 +554,26 @@ mod tests {
     fn build_ci_scopes_empty_on_none() {
         let scopes = build_ci_scopes(None);
         assert!(scopes.is_empty());
+    }
+
+    #[test]
+    fn interactive_authorization_params_force_fresh_login() {
+        assert_eq!(
+            interactive_authorization_params(Some("api://openshell"), true),
+            vec![
+                ("prompt", "login".to_string()),
+                ("audience", "api://openshell".to_string()),
+            ]
+        );
+        assert_eq!(
+            interactive_authorization_params(None, true),
+            vec![("prompt", "login".to_string())]
+        );
+        assert_eq!(
+            interactive_authorization_params(Some("api://openshell"), false),
+            vec![("audience", "api://openshell".to_string())]
+        );
+        assert!(interactive_authorization_params(None, false).is_empty());
     }
 
     #[test]

@@ -103,6 +103,10 @@ struct NetworkPolicyRuleDef {
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "Endpoint DTO mirrors independent policy schema toggles."
+)]
 struct NetworkEndpointDef {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     host: String,
@@ -144,6 +148,10 @@ struct NetworkEndpointDef {
     /// placeholders before forwarding upstream. Defaults to false.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     request_body_credential_rewrite: bool,
+    /// Explicitly permits credentials on traffic paths that `OpenShell` cannot
+    /// inspect or rewrite. Defaults to false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    allow_uninspected_credentials: bool,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     persisted_queries: String,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -745,6 +753,10 @@ fn to_proto(raw: PolicyFile) -> Result<SandboxPolicy> {
                             allow_encoded_slash: e.allow_encoded_slash,
                             websocket_credential_rewrite: e.websocket_credential_rewrite,
                             request_body_credential_rewrite: e.request_body_credential_rewrite,
+                            allow_uninspected_credentials: e.allow_uninspected_credentials,
+                            // Provider credential provenance is derived by the
+                            // gateway and cannot be authored in policy YAML.
+                            provider_credentialed: false,
                             // Advisor provenance is internal runtime state, not
                             // a user-authored policy schema field.
                             advisor_proposed: false,
@@ -901,6 +913,7 @@ fn from_proto(policy: &SandboxPolicy) -> PolicyFile {
                             allow_encoded_slash: e.allow_encoded_slash,
                             websocket_credential_rewrite: e.websocket_credential_rewrite,
                             request_body_credential_rewrite: e.request_body_credential_rewrite,
+                            allow_uninspected_credentials: e.allow_uninspected_credentials,
                             persisted_queries: e.persisted_queries.clone(),
                             graphql_persisted_queries: e
                                 .graphql_persisted_queries
@@ -3487,6 +3500,32 @@ network_policies:
     }
 
     #[test]
+    fn round_trip_preserves_allow_uninspected_credentials() {
+        let yaml = r"
+version: 1
+network_policies:
+  vendor_api:
+    endpoints:
+      - host: api.vendor.example
+        port: 443
+        tls: skip
+        allow_uninspected_credentials: true
+";
+        let proto1 = parse_sandbox_policy(yaml).expect("parse failed");
+        let yaml_out = serialize_sandbox_policy(&proto1).expect("serialize failed");
+        let proto2 = parse_sandbox_policy(&yaml_out).expect("re-parse failed");
+
+        let ep = &proto2.network_policies["vendor_api"].endpoints[0];
+        assert!(ep.allow_uninspected_credentials);
+        assert!(
+            !ep.provider_credentialed,
+            "provider provenance must not be authorable from policy YAML"
+        );
+        assert!(yaml_out.contains("allow_uninspected_credentials: true"));
+        assert!(!yaml_out.contains("provider_credentialed"));
+    }
+
+    #[test]
     fn websocket_credential_rewrite_defaults_false() {
         let yaml = r"
 version: 1
@@ -3504,6 +3543,8 @@ network_policies:
         let ep = &proto.network_policies["gateway"].endpoints[0];
         assert!(!ep.websocket_credential_rewrite);
         assert!(!ep.request_body_credential_rewrite);
+        assert!(!ep.allow_uninspected_credentials);
+        assert!(!ep.provider_credentialed);
     }
 
     #[test]

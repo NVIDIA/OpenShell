@@ -1172,7 +1172,8 @@ enum GatewayCommands {
     /// Authenticate with an edge-authenticated or OIDC gateway.
     ///
     /// Opens a browser for the edge proxy's login flow and stores the
-    /// token locally. Use this to re-authenticate when a token expires.
+    /// token locally. After `gateway logout`, OIDC browser login requests a
+    /// fresh identity-provider prompt so you can switch users.
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Login {
         /// Gateway name (defaults to the active gateway).
@@ -1183,7 +1184,9 @@ enum GatewayCommands {
     /// Clear stored authentication credentials for a gateway.
     ///
     /// Removes the locally stored OIDC token or edge token so subsequent
-    /// commands require re-authentication via `gateway login`.
+    /// commands require re-authentication via `gateway login`. For OIDC
+    /// gateways, the next browser login asks the identity provider for a fresh
+    /// login instead of silently reusing an existing browser session.
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Logout {
         /// Gateway name (defaults to the active gateway).
@@ -1791,6 +1794,8 @@ enum PolicyCommands {
         name: Option<String>,
 
         /// Add or merge an endpoint: host:port[:access[:protocol[:enforcement[:options]]]].
+        /// Options include allowed-ip=..., credential rewrite flags, and
+        /// allow-uninspected-credentials.
         #[arg(long = "add-endpoint")]
         add_endpoints: Vec<String>,
 

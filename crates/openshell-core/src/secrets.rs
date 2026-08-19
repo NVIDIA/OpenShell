@@ -13,6 +13,24 @@ const PROVIDER_ALIAS_MARKER: &str = "OPENSHELL-RESOLVE-ENV-";
 /// Public access to the placeholder prefix for fail-closed scanning in other modules.
 pub const PLACEHOLDER_PREFIX_PUBLIC: &str = PLACEHOLDER_PREFIX;
 pub const PROVIDER_ALIAS_MARKER_PUBLIC: &str = PROVIDER_ALIAS_MARKER;
+/// Longest wire form of a reserved marker: percent-encoding expands every
+/// marker byte to three bytes (`%XX`), and detection decodes in a single pass.
+const LONGEST_RESERVED_MARKER_WIRE_BYTES: usize =
+    3 * if PLACEHOLDER_PREFIX.len() > PROVIDER_ALIAS_MARKER.len() {
+        PLACEHOLDER_PREFIX.len()
+    } else {
+        PROVIDER_ALIAS_MARKER.len()
+    };
+
+/// Retain this many trailing bytes when scanning a streamed request body so a
+/// reserved marker split across reads cannot be forwarded before detection.
+///
+/// A marker is only detected while all of its wire bytes sit in the scan buffer
+/// at once, so the retained window must hold every byte of the longest form but
+/// the last. A window shorter than that lets a caller split a fully
+/// percent-encoded marker so its leading bytes are forwarded before the rest
+/// arrives, and the reassembled remainder no longer decodes to the marker.
+pub const CREDENTIAL_MARKER_SCAN_TAIL_BYTES: usize = LONGEST_RESERVED_MARKER_WIRE_BYTES;
 
 /// Characters that are valid in an env var key name (used to extract
 /// placeholder boundaries within concatenated strings like path segments).
@@ -34,6 +52,15 @@ pub fn contains_reserved_credential_marker(value: &str) -> bool {
     }
     let decoded = percent_decode(value);
     contains_raw_reserved_marker(&decoded)
+}
+
+pub fn contains_reserved_credential_marker_bytes(value: &[u8]) -> bool {
+    if value.is_empty() {
+        return false;
+    }
+    String::from_utf8_lossy(value)
+        .split('\0')
+        .any(contains_reserved_credential_marker)
 }
 
 // ---------------------------------------------------------------------------
@@ -1372,6 +1399,45 @@ mod tests {
     use super::*;
 
     // === Existing tests (preserved) ===
+
+    #[test]
+    fn byte_marker_detection_handles_raw_encoded_and_binary_input() {
+        assert!(contains_reserved_credential_marker_bytes(
+            b"openshell:resolve:env:API_TOKEN"
+        ));
+        assert!(contains_reserved_credential_marker_bytes(
+            b"openshell%3Aresolve%3Aenv%3AAPI_TOKEN"
+        ));
+        assert!(!contains_reserved_credential_marker_bytes(&[
+            0xff, 0x00, 0x01, 0x02
+        ]));
+    }
+
+    fn fully_percent_encoded(marker: &str) -> String {
+        const HEX: &[u8; 16] = b"0123456789ABCDEF";
+        let mut encoded = String::with_capacity(marker.len() * 3);
+        for byte in marker.bytes() {
+            encoded.push('%');
+            encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+            encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+        }
+        encoded
+    }
+
+    #[test]
+    fn scan_tail_window_covers_longest_encoded_marker_form() {
+        for marker in [PLACEHOLDER_PREFIX, PROVIDER_ALIAS_MARKER] {
+            let encoded = fully_percent_encoded(marker);
+            assert!(
+                contains_reserved_credential_marker(&encoded),
+                "fully encoded {marker} must be detected"
+            );
+            assert!(
+                CREDENTIAL_MARKER_SCAN_TAIL_BYTES >= encoded.len() - 1,
+                "scan window must retain every byte of {encoded} but the last"
+            );
+        }
+    }
 
     #[test]
     fn provider_env_is_replaced_with_placeholders() {

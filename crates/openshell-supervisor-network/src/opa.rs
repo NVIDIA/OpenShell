@@ -846,6 +846,38 @@ impl OpaEngine {
         }
     }
 
+    /// Query every matching endpoint for credential-provenance gating.
+    ///
+    /// Unlike [`Self::query_endpoint_configs_with_generation`], this includes
+    /// L4-only endpoints, which carry no extended L7 config. It is answered by
+    /// a dedicated Rego rule so credential gating cannot alter which endpoint
+    /// the TLS mode and SSRF allowlist are read from.
+    pub fn query_endpoint_credential_guards(
+        &self,
+        input: &NetworkInput,
+    ) -> Result<Vec<regorus::Value>> {
+        let input_json = network_input_json(input);
+
+        let mut engine = self
+            .engine
+            .lock()
+            .map_err(|_| miette::miette!("OPA engine lock poisoned"))?;
+
+        engine
+            .set_input_json(&input_json.to_string())
+            .map_err(|e| miette::miette!("{e}"))?;
+
+        let val = engine
+            .eval_rule("data.openshell.sandbox.endpoint_credential_guards".into())
+            .map_err(|e| miette::miette!("{e}"))?;
+
+        match val {
+            regorus::Value::Undefined => Ok(Vec::new()),
+            regorus::Value::Array(values) => Ok(values.to_vec()),
+            other => Ok(vec![other]),
+        }
+    }
+
     /// Query the ordered middleware chain for an admitted destination.
     pub fn query_middleware_chain_with_generation(
         &self,
@@ -1779,6 +1811,12 @@ fn proto_to_opa_data_json(proto: &ProtoSandboxPolicy, entrypoint_pid: u32) -> St
                     }
                     if e.request_body_credential_rewrite {
                         ep["request_body_credential_rewrite"] = true.into();
+                    }
+                    if e.allow_uninspected_credentials {
+                        ep["allow_uninspected_credentials"] = true.into();
+                    }
+                    if e.provider_credentialed {
+                        ep["provider_credentialed"] = true.into();
                     }
                     if !e.credential_signing.is_empty() {
                         ep["credential_signing"] = e.credential_signing.clone().into();
@@ -5661,6 +5699,87 @@ process:
     fn allowed_ips_engine() -> OpaEngine {
         OpaEngine::from_strings(TEST_POLICY, ALLOWED_IPS_TEST_DATA)
             .expect("Failed to load allowed_ips test data")
+    }
+
+    /// An L4-only credentialed endpoint must not join the shared endpoint-config
+    /// list: `query_endpoint_config` returns only its first element, so joining
+    /// it would let the L4 endpoint shadow the inspected endpoint's TLS mode and
+    /// SSRF allowlist on the same host:port.
+    #[test]
+    fn credential_guard_does_not_shadow_inspected_endpoint_config() {
+        const OVERLAPPING_DATA: &str = r#"
+network_policies:
+  telemetry_l4:
+    name: telemetry_l4
+    endpoints:
+      - host: api.example.com
+        port: 443
+        provider_credentialed: true
+        allow_uninspected_credentials: true
+    binaries:
+      - { path: /usr/bin/curl }
+  inspected_api:
+    name: inspected_api
+    endpoints:
+      - host: api.example.com
+        port: 443
+        protocol: rest
+        access: full
+        tls: skip
+        allowed_ips: ["10.0.5.0/24"]
+    binaries:
+      - { path: /usr/bin/curl }
+filesystem_policy:
+  include_workdir: true
+  read_only: []
+  read_write: []
+landlock:
+  compatibility: best_effort
+process:
+  run_as_user: sandbox
+  run_as_group: sandbox
+"#;
+        let engine = OpaEngine::from_strings(TEST_POLICY, OVERLAPPING_DATA)
+            .expect("overlapping endpoint policy should load");
+        let input = NetworkInput {
+            host: "api.example.com".into(),
+            port: 443,
+            binary_path: PathBuf::from("/usr/bin/curl"),
+            binary_sha256: "unused".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+
+        let configs = engine
+            .query_endpoint_configs_with_generation(&input)
+            .unwrap()
+            .0;
+        assert_eq!(
+            configs.len(),
+            1,
+            "only the inspected endpoint carries extended config"
+        );
+        let config = crate::l7::parse_l7_config(&configs[0]).expect("inspected endpoint config");
+        assert_eq!(config.protocol, crate::l7::L7Protocol::Rest);
+        assert_eq!(config.tls, crate::l7::TlsMode::Skip);
+        assert_eq!(
+            engine.query_allowed_ips(&input).unwrap(),
+            vec!["10.0.5.0/24"],
+            "SSRF allowlist must still come from the inspected endpoint"
+        );
+
+        let guards = engine.query_endpoint_credential_guards(&input).unwrap();
+        assert_eq!(
+            guards.len(),
+            2,
+            "credential gating must still see the L4-only endpoint"
+        );
+        assert!(
+            guards
+                .iter()
+                .map(crate::l7::parse_endpoint_credential_guard)
+                .any(|guard| guard.provider_credentialed)
+        );
     }
 
     #[test]

@@ -26,9 +26,9 @@ use tracing::{debug, info, warn};
 use openshell_core::PolicyValidationFailureMode;
 
 use openshell_ocsf::{
-    ActionId, ActivityId, AppLifecycleBuilder, ConfigStateChangeBuilder, DetectionFindingBuilder,
-    DispositionId, FindingInfo, OcsfEvent, SandboxContext, SeverityId, StateId, StatusId,
-    ocsf_emit,
+    ActionId, ActivityId, AppLifecycleBuilder, ConfidenceId, ConfigStateChangeBuilder,
+    DetectionFindingBuilder, DispositionId, FindingInfo, OcsfEvent, SandboxContext, SeverityId,
+    StateId, StatusId, ocsf_emit,
 };
 
 // ---------------------------------------------------------------------------
@@ -331,6 +331,14 @@ pub async fn run_sandbox(
         let provider_env = provider_credentials.child_env_with_gcp_resolved();
         (provider_credentials, provider_env)
     };
+
+    if credential_gating_unavailable(
+        &loaded_policy_origin,
+        provider_credentials.resolver().is_some(),
+        network_enabled,
+    ) {
+        report_credential_gating_unavailable();
+    }
 
     // Shared agent-proposals feature flag. Seed from the same initial settings
     // snapshot that produced the policy so networking and process setup agree
@@ -2604,6 +2612,63 @@ fn unchanged_policy_revision_ready_to_ack(
     policy_runtime_reconciled: bool,
 ) -> Option<u32> {
     candidate.filter(|_| !policy_runtime_changed || policy_runtime_reconciled)
+}
+
+/// Whether the credential-provenance gates cannot apply to the loaded policy.
+///
+/// The gateway derives `provider_credentialed` and deliberately keeps it out of
+/// the policy YAML schema, so a local-file policy never carries it and never
+/// will: gateway revisions are observed for settings and providers but must not
+/// replace the local OPA policy. Provider credentials still arrive from the
+/// gateway on that path, so the raw-tunnel and WebSocket binary-frame refusals
+/// have nothing to match on. The request-body backstop is unaffected because it
+/// keys off the secret resolver rather than endpoint provenance.
+fn credential_gating_unavailable(
+    origin: &LoadedPolicyOrigin,
+    has_resolver: bool,
+    network_enabled: bool,
+) -> bool {
+    network_enabled && has_resolver && matches!(origin, LoadedPolicyOrigin::LocalOverride)
+}
+
+/// Report that credential provenance is unavailable for the loaded policy.
+///
+/// Carries no credential name, host, or value: the finding states which
+/// controls are inactive, nothing about what they would have protected.
+fn report_credential_gating_unavailable() {
+    ocsf_emit!(
+        DetectionFindingBuilder::new(ocsf_ctx())
+            .activity(ActivityId::Open)
+            .severity(SeverityId::High)
+            .confidence(ConfidenceId::High)
+            .is_alert(true)
+            .finding_info(
+                FindingInfo::new(
+                    "credential-gating-unavailable",
+                    "Credential Provenance Unavailable",
+                )
+                .with_desc(
+                    "Provider credentials are injected, but the loaded policy comes from local \
+                     files and carries no gateway-derived credential provenance. Uninspected \
+                     credentialed tunnels and WebSocket binary frames are not refused. Load \
+                     policy from the gateway to enable these controls."
+                ),
+            )
+            .evidence_pairs(&[
+                ("policy_source", "local-override"),
+                ("uninspected_connect_gate", "inactive"),
+                ("websocket_binary_gate", "inactive"),
+                ("request_body_backstop", "active"),
+            ])
+            .remediation(
+                "Remove the local policy override so the gateway-delivered effective policy \
+                 applies, or detach provider credentials from this sandbox."
+            )
+            .message(
+                "Credential provenance unavailable for local-file policy; uninspected credential gates inactive"
+            )
+            .build()
+    );
 }
 
 /// Deliver policy status updates independently from policy reconciliation.
@@ -5233,6 +5298,40 @@ filesystem_policy:
             None,
             "runtime success cannot manufacture a revision candidate"
         );
+    }
+
+    #[test]
+    fn credential_gating_unavailable_for_local_override_with_credentials() {
+        assert!(credential_gating_unavailable(
+            &LoadedPolicyOrigin::LocalOverride,
+            true,
+            true
+        ));
+    }
+
+    #[test]
+    fn credential_gating_available_without_local_override_or_credentials() {
+        // A gateway policy is stamped with provenance, so the gates apply.
+        assert!(!credential_gating_unavailable(
+            &LoadedPolicyOrigin::Gateway {
+                revision: None,
+                has_last_valid_policy: true,
+            },
+            true,
+            true
+        ));
+        // No provider credentials means there is nothing to leak.
+        assert!(!credential_gating_unavailable(
+            &LoadedPolicyOrigin::LocalOverride,
+            false,
+            true
+        ));
+        // Without networking the proxy never evaluates endpoint provenance.
+        assert!(!credential_gating_unavailable(
+            &LoadedPolicyOrigin::LocalOverride,
+            true,
+            false
+        ));
     }
 
     #[test]

@@ -410,6 +410,8 @@ mod tests {
                     allow_encoded_slash: false,
                     websocket_credential_rewrite: false,
                     request_body_credential_rewrite: false,
+                    allow_uninspected_credentials: false,
+                    provider_credentialed: false,
                     websocket_graphql_policy: false,
                     credential_signing: crate::l7::CredentialSigning::None,
                     signing_service: String::new(),
