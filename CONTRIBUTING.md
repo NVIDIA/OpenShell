@@ -34,7 +34,7 @@ We use a vouch system. This exists because AI makes it trivial to generate plaus
 
 Issues labeled [`good first issue`](https://github.com/NVIDIA/OpenShell/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22) are scoped, well-documented, and friendly to new contributors. Start there. If you need guidance, comment on the issue.
 
-An open issue is not necessarily accepted or ready to be worked on. Human contributors should look for `state:accepted`, roadmap placement, `good first issue`, or `help wanted`, or ask a maintainer before starting. Unattended agents additionally require the appropriate human-applied `agent:*` request label; an agent directly asked to work on a specific issue does not.
+An open issue is not necessarily accepted or ready to be worked on. Human contributors should look for `state:accepted`, roadmap placement, `good first issue`, or `help wanted`, or ask a maintainer before starting. An issue authored by a user who currently has repository `maintain` or `admin` permission is also accepted without a separate state label. Unattended agents additionally require the appropriate human-applied `agent:*` request label; an agent directly asked to work on a specific issue does not.
 
 ## Before You Open an Issue
 
@@ -118,11 +118,11 @@ Each issue can require four independent decisions:
 | Decision | Question | Recorded by |
 |---|---|---|
 | Assessment | Is the report technically valid, and is there enough evidence to act on it? | `state:*` |
-| Disposition | Should OpenShell pursue the work? | `state:accepted`, roadmap placement, or closure as not planned |
+| Disposition | Should OpenShell pursue the work? | `state:accepted`, roadmap placement, maintainer authorship, or closure as not planned |
 | Sequencing | Where does accepted work sit relative to everything else? | Placement on the [OpenShell Roadmap](https://github.com/orgs/NVIDIA/projects/233) |
 | Ownership | Will a human implement the issue, will a user directly instruct an agent, or will a maintainer queue it for an unattended agent? | Direct instruction or optional `agent:*` workflow |
 
-`state:validated` confirms that the factual assessment is complete, but it does not mean the project has accepted the work. A maintainer signals acceptance with `state:accepted` or roadmap placement. Roadmap placement also communicates sequencing, but it does not assign an owner or queue an unattended agent.
+`state:validated` confirms that the factual assessment is complete, but it does not mean the project has accepted the work. A maintainer signals acceptance with `state:accepted`, roadmap placement, or by authoring the issue while holding repository `maintain` or `admin` permission. Roadmap placement also communicates sequencing, but neither a state label nor maintainer authorship assigns an owner or queues an unattended agent.
 
 #### Who Controls Each Decision
 
@@ -133,7 +133,7 @@ Agents investigate issues, collect evidence, and report technical findings. Huma
 | Assess technical validity and impact | Triage agent or human triager |
 | Request missing evidence | Triage agent or human triager |
 | Mark the assessment complete with `state:validated` | Triage agent or human triager |
-| Accept or decline the work with `state:accepted`, roadmap placement, or closure | Maintainer |
+| Accept or decline the work with `state:accepted`, roadmap placement, maintainer authorship, or closure | Maintainer |
 | Place the issue on the roadmap or move it | Maintainer |
 | Directly request an agent plan | User |
 | Queue an agent plan with `agent:plan-requested` | Maintainer |
@@ -141,11 +141,11 @@ Agents investigate issues, collect evidence, and report technical findings. Huma
 | Directly request agent implementation | User |
 | Queue approved implementation with `agent:implementation-requested` | Maintainer |
 
-Agents do not apply `state:accepted`, place issues on the roadmap, or apply `agent:plan-requested` or `agent:implementation-requested`.
+Agents do not apply `state:accepted`, place issues on the roadmap, or apply `agent:plan-requested` or `agent:implementation-requested`. When relying on maintainer authorship as acceptance, an agent checks the issue author's current repository permission through GitHub. Only `maintain` and `admin` qualify; if the permission lookup fails, the agent requires another acceptance signal.
 
 #### Issue State
 
-The `state:*` namespace records the issue's disposition for all contributors, regardless of who might implement it.
+The `state:*` namespace normally records the issue's disposition for all contributors, regardless of who might implement it. Verified maintainer authorship can record acceptance without a state label.
 
 | State | Meaning | Normal next action |
 |---|---|---|
@@ -154,7 +154,7 @@ The `state:*` namespace records the issue's disposition for all contributors, re
 | `state:validated` | The factual assessment is complete. | A maintainer accepts the issue, declines it, or asks for more evidence. |
 | `state:accepted` | A maintainer decided that OpenShell should pursue the issue. | A human may implement it, or a maintainer may delegate work to an agent. |
 
-Keep one of these states on an open issue. When new evidence resolves a `state:needs-info` request, reassess the issue and move it to `state:validated` if the evidence is sufficient.
+Keep one of these states on an open issue unless verified maintainer authorship records acceptance without a label. When new evidence resolves a `state:needs-info` request, reassess the issue and move it to `state:validated` if the evidence is sufficient.
 
 `state:stale` is an inactivity marker, not a lifecycle decision. Accepted issues and issues awaiting human disposition are exempt from stale handling. An issue in `state:needs-info` can become stale if no new evidence arrives.
 
@@ -179,11 +179,11 @@ Triage establishes facts and impact. It does not decide whether the project shou
 
 When an issue reaches `state:validated`, a maintainer chooses one of three paths:
 
-- **Accept:** apply `state:accepted`, place the issue on the roadmap, or do both. Either action signals that OpenShell should pursue the work; roadmap placement additionally records sequencing.
+- **Accept:** apply `state:accepted`, place the issue on the roadmap, or do both. A maintainer may also record acceptance by authoring the issue directly. These signals mean that OpenShell should pursue the work; roadmap placement additionally records sequencing.
 - **Decline:** close it as not planned and record the rationale.
 - **Await more evidence:** replace `state:validated` with `state:needs-info` and leave it off the roadmap.
 
-Do not use `state:accepted` as shorthand for technical validity, roadmap sequencing, or agent authorization. It records the human decision that OpenShell should pursue the work. Roadmap placement records the same acceptance decision plus sequencing.
+Do not use `state:accepted` as shorthand for technical validity, roadmap sequencing, or agent authorization. It records the human decision that OpenShell should pursue the work. Maintainer authorship records the same acceptance decision without adding a label. Roadmap placement records acceptance plus sequencing.
 
 #### Roadmap
 
@@ -212,7 +212,7 @@ Maintainers use the `agent:*` workflow to queue work for always-on or unattended
 The normal delegated workflow is:
 
 ```text
-(state:accepted OR roadmap placement)
+(state:accepted OR roadmap placement OR maintainer authorship)
   |
   +-- agent:plan-requested
         |
@@ -256,11 +256,11 @@ A user may instead directly request review or remediation from the specialized s
 | You are | Ready when |
 |---|---|
 | A human contributor | The issue has `state:accepted`, roadmap placement, an invitation to contribute, or maintainer confirmation, and has no conflicting owner or implementation. |
-| An unattended agent scanning for planning work | The issue has `state:accepted` or roadmap placement, plus the human-applied `agent:plan-requested` label. |
-| An unattended agent scanning for implementation work | The issue has `state:accepted` or roadmap placement, plus an approved plan and the human-applied `agent:implementation-requested` label. |
-| An agent directly instructed by a user | The issue has `state:accepted` or roadmap placement, no conflicting owner or implementation, and the instruction explicitly requests the phase the agent will perform. |
+| An unattended agent scanning for planning work | The issue has `state:accepted`, roadmap placement, or verified maintainer authorship, plus the human-applied `agent:plan-requested` label. |
+| An unattended agent scanning for implementation work | The issue has `state:accepted`, roadmap placement, or verified maintainer authorship, plus an approved plan and the human-applied `agent:implementation-requested` label. |
+| An agent directly instructed by a user | The issue has `state:accepted`, roadmap placement, or verified maintainer authorship; has no conflicting owner or implementation; and the instruction explicitly requests the phase the agent will perform. |
 
-Issues with `state:triage-needed`, `state:needs-info`, or `state:validated` are not ready for implementation unless a maintainer has separately placed them on the roadmap. Either `state:accepted` or roadmap placement records the required human acceptance decision.
+`state:needs-info` always blocks implementation until the requested evidence arrives. For issues not authored by a maintainer, `state:triage-needed` and `state:validated` also block implementation unless a maintainer has separately placed the issue on the roadmap or applied `state:accepted`. Verified maintainer authorship records the required human acceptance decision without a state label.
 
 #### Stale Issues
 

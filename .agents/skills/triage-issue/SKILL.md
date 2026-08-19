@@ -25,7 +25,7 @@ Triage establishes technical validity; it does not decide whether valid work bel
 
 OpenShell has no `priority:*` labels. Sequencing comes from association with an item on the OpenShell Roadmap, and that association is a maintainer decision.
 
-`state:validated` means the factual assessment is complete and awaits human disposition. A human declines by closing the issue as not planned with a rationale, or accepts by applying `state:accepted`, placing the issue on the roadmap, or doing both as documented in `CONTRIBUTING.md`. Accepted work may remain human-owned. A maintainer can queue deeper agent investigation or planning with `agent:plan-requested`, or directly ask an agent to work on a specific issue.
+`state:validated` means the factual assessment is complete and awaits human disposition. A human declines by closing the issue as not planned with a rationale, or accepts by applying `state:accepted`, placing the issue on the roadmap, or doing both as documented in `CONTRIBUTING.md`. An issue authored by a user who currently has repository `maintain` or `admin` permission already records that maintainer's acceptance without a separate state label. Accepted work may remain human-owned. A maintainer can queue deeper agent investigation or planning with `agent:plan-requested`, or directly ask an agent to work on a specific issue.
 
 The optional `agent:*` workflow controls unattended queue pickup: `agent:plan-requested` queues planning, and `agent:implementation-requested` queues implementation after plan review. A direct user instruction separately authorizes the phase it requests and does not require either label.
 
@@ -98,7 +98,7 @@ Search the issue comments for the triage agent marker (`> **📋 triage-agent**`
 
 - **If the marker is found** and no subsequent human comments exist with new information or questions, report that the issue has already been triaged and stop.
 - **If the marker is found** but there are newer human comments with additional information, proceed to Step 3 to re-evaluate with the new context.
-- **If a human already declined the issue, applied `state:accepted`, or placed it on the roadmap**, do not undo or reinterpret that decision.
+- **If a human already declined the issue, applied `state:accepted`, placed it on the roadmap, or authored it with current repository `maintain` or `admin` permission**, do not undo or reinterpret that decision.
 - **If the marker is not found**, proceed to Step 3.
 
 ## Step 3: Check Report Completeness
@@ -211,6 +211,8 @@ Post a structured comment with the triage marker:
 > `agent:plan-requested`. You can instead directly ask an agent to use
 > `create-spike` or `build-from-issue` on this issue. If no, close it as not
 > planned and record the rationale.
+
+For an issue with verified maintainer authorship, replace `Human Decision Required` with `Acceptance Recorded`, state that maintainer authorship already records acceptance, and retain only the ownership, sequencing, and agent-authorization choices.
 ```
 
 For other outcomes, replace the impact and decision sections with the exact information request, objective resolution, or safe routing guidance.
@@ -228,7 +230,7 @@ Community issue filed
         |
   state:validated
         |
-  human decline OR state:accepted / roadmap placement
+  human decline OR state:accepted / roadmap placement / maintainer authorship
         |
   create-spike          (if deeper investigation is approved)
         |

@@ -59,11 +59,13 @@ Fetch issue + comments
   ├─ topic:security present?
   │   → Route to review-security-issue or fix-security-issue; STOP
   │
-  ├─ Triage incomplete, awaiting information, or awaiting human disposition?
+  ├─ state:needs-info present?
   │   → Report the blocking state and STOP
   │
   ├─ state:accepted and roadmap association both absent?
-  │   → Human has not accepted the issue; STOP
+  │   → Check whether the author currently has repository maintain/admin permission
+  │   → If verified, treat maintainer authorship as acceptance and continue
+  │   → Otherwise, human has not accepted the issue; STOP
   │
   ├─ No plan comment and no direct planning request and agent:plan-requested absent?
   │   → No request for agent planning; STOP
@@ -109,13 +111,17 @@ If the issue is closed, report that and stop.
 
 If `topic:security` is present, stop. General build agents must not plan or implement security issues. Route planning/review to `review-security-issue` and authorized remediation to `fix-security-issue`.
 
-Stop before planning in any of these states:
+Always stop before planning when `state:needs-info` is present because triage is waiting for evidence from the reporter.
 
-- `state:triage-needed`: the issue has not been assessed; use `triage-issue`.
-- `state:needs-info`: triage is waiting for evidence from the reporter.
-- `state:validated` without roadmap placement: triage is complete, but a human has not yet decided whether OpenShell should invest in the work.
+Next, require a human acceptance signal: `state:accepted`, placement on the roadmap, or verified maintainer authorship. When the first two signals are absent, get the issue author's login from the fetched issue and query their current repository permission:
 
-Next, require a human acceptance signal: either `state:accepted` or placement on the roadmap. The label records acceptance without requiring scheduling; roadmap placement records acceptance and sequencing. If no plan exists, require either a direct user request for planning or the human-applied `agent:plan-requested` label before generating one. Never add or remove `state:accepted`, either human request label, or the `roadmap` label.
+```bash
+gh api repos/{owner}/{repo}/collaborators/<author>/permission --jq '.permission'
+```
+
+Treat only `maintain` or `admin` as verified maintainer authorship. This records acceptance without requiring a state label, but it does not record roadmap sequencing or authorize an unattended phase. Fail closed if the permission lookup fails or returns any other value. For issues without verified maintainer authorship, stop on `state:triage-needed`, or on `state:validated` without roadmap placement, as work still awaits assessment or human disposition.
+
+If no plan exists, require either a direct user request for planning or the human-applied `agent:plan-requested` label before generating one. Never add or remove `state:accepted`, either human request label, or the `roadmap` label.
 
 ## Step 2: Fetch and Classify Comments
 
@@ -140,7 +146,7 @@ Using the state machine above, determine what to do based on:
 1. Whether a plan comment exists
 2. Whether there are human comments newer than the last agent comment (plan or conversation)
 3. Whether this is direct mode and which phase the user requested
-4. Which disposition, roadmap, and agent-workflow labels are present (`state:accepted`, `agent:plan-requested`, `agent:plan-ready`, `agent:implementation-requested`, `agent:in-progress`, `agent:pr-opened`, and the `roadmap` label)
+4. Which acceptance signals are present (`state:accepted`, roadmap placement, or verified maintainer authorship) and which agent-workflow labels are present (`agent:plan-requested`, `agent:plan-ready`, `agent:implementation-requested`, `agent:in-progress`, and `agent:pr-opened`)
 
 Follow the appropriate branch below.
 
@@ -726,6 +732,15 @@ User says: "Build issue #42"
 11. Post summary comment on issue with PR link
 12. No agent-workflow label transition is needed
 13. Report PR URL and workflow run status to user
+
+### Run on a maintainer-authored issue without an acceptance label
+
+User says: "Build issue #42"
+
+1. Fetch issue #42 — neither `state:accepted` nor roadmap placement is present
+2. Query the author's current repository permission and receive `maintain` or `admin`
+3. Treat maintainer authorship as the human acceptance signal
+4. Continue through planning and implementation using the direct request as phase authorization; do not add an acceptance or agent-workflow label
 
 ### Run on issue with existing PR
 
