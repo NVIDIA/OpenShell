@@ -42,11 +42,13 @@ function readySandbox(
   name: string,
   id: string,
   resourceVersion = 7n,
+  createdFromWorkloadTemplate?: { name: string; resourceVersion: string },
 ): MessageInitShape<typeof OpenShell.method.getSandbox.output> {
   return {
     sandbox: {
       metadata: { id, name, labels: { team: 'aire' }, resourceVersion },
       status: { phase: SandboxPhase.READY },
+      createdFromWorkloadTemplate,
     },
   };
 }
@@ -337,6 +339,23 @@ describe('create', () => {
       phase: 'error',
       mainProcessInstanceId: 'main-1',
       exitCode: 9,
+    });
+  });
+
+  it('maps workload template provenance onto SandboxRef', async () => {
+    const sandbox = client({
+      getSandbox: () =>
+        readySandbox('from-template', 'sb-id', 7n, {
+          name: 'gpu-kata',
+          resourceVersion: '42',
+        }),
+    });
+
+    const ref = await sandbox.get('from-template');
+
+    expect(ref.createdFromWorkloadTemplate).toEqual({
+      name: 'gpu-kata',
+      resourceVersion: '42',
     });
   });
 });

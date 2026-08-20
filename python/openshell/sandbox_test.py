@@ -2279,6 +2279,18 @@ def test_sandbox_ref_includes_workspace_from_proto() -> None:
     assert ref.workspace == "production"
 
 
+def test_sandbox_ref_includes_workload_template_provenance() -> None:
+    proto = _make_sandbox_proto("sandbox-1", "job-1")
+    proto.created_from_workload_template.name = "gpu-kata"
+    proto.created_from_workload_template.resource_version = "7"
+
+    ref = _sandbox_ref(proto)
+
+    assert ref.created_from_workload_template is not None
+    assert ref.created_from_workload_template.name == "gpu-kata"
+    assert ref.created_from_workload_template.resource_version == "7"
+
+
 def test_sandbox_session_delete_passes_workspace() -> None:
     from openshell.sandbox import SandboxSession
 

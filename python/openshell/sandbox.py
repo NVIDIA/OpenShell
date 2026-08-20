@@ -159,6 +159,12 @@ class _ImmutableLabels(dict[str, str]):
 
 
 @dataclass(frozen=True)
+class SandboxWorkloadTemplateProvenanceRef:
+    name: str
+    resource_version: str
+
+
+@dataclass(frozen=True)
 class SandboxRef:
     id: str
     name: str
@@ -167,6 +173,7 @@ class SandboxRef:
     # Excluded from equality/hash to preserve the original identity while the
     # immutable mapping remains safe for deepcopy, pickle, and asdict.
     labels: Mapping[str, str] = field(default_factory=_ImmutableLabels, compare=False)
+    created_from_workload_template: SandboxWorkloadTemplateProvenanceRef | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "labels", _ImmutableLabels(self.labels))
@@ -1273,6 +1280,14 @@ def _serialize_python_callable(
 
 def _sandbox_ref(sandbox: openshell_pb2.Sandbox) -> SandboxRef:
     status = sandbox.status if sandbox.HasField("status") else None
+    provenance = (
+        SandboxWorkloadTemplateProvenanceRef(
+            name=sandbox.created_from_workload_template.name,
+            resource_version=sandbox.created_from_workload_template.resource_version,
+        )
+        if sandbox.HasField("created_from_workload_template")
+        else None
+    )
     return SandboxRef(
         id=sandbox.metadata.id if sandbox.metadata else "",
         name=sandbox.metadata.name if sandbox.metadata else "",
@@ -1285,6 +1300,7 @@ def _sandbox_ref(sandbox: openshell_pb2.Sandbox) -> SandboxRef:
             else None,
         ),
         labels=sandbox.metadata.labels if sandbox.metadata else {},
+        created_from_workload_template=provenance,
     )
 
 

@@ -1392,6 +1392,15 @@ pub async fn sandbox_get(
         }
     }
 
+    if let Some(provenance) = &sandbox.created_from_workload_template {
+        println!(
+            "  {} {}@{}",
+            "Workload template:".dimmed(),
+            provenance.name,
+            provenance.resource_version
+        );
+    }
+
     let policy_from_global = config.policy_source == PolicySource::Global as i32;
     println!(
         "  {} {}",
@@ -2131,6 +2140,16 @@ fn sandbox_to_json(sandbox: &Sandbox) -> serde_json::Value {
         || serde_json::json!({}),
         |m| serde_json::json!(m.annotations),
     );
+    let created_from_workload_template =
+        sandbox
+            .created_from_workload_template
+            .as_ref()
+            .map(|provenance| {
+                serde_json::json!({
+                    "name": provenance.name,
+                    "resource_version": provenance.resource_version,
+                })
+            });
     serde_json::json!({
         "id": sandbox.object_id(),
         "name": sandbox.object_name(),
@@ -2141,6 +2160,7 @@ fn sandbox_to_json(sandbox: &Sandbox) -> serde_json::Value {
         "created_at": format_epoch_ms(meta.map_or(0, |m| m.created_at_ms)),
         "phase": phase_name(sandbox.phase()),
         "current_policy_version": sandbox.current_policy_version(),
+        "created_from_workload_template": created_from_workload_template,
     })
 }
 
@@ -7758,7 +7778,8 @@ mod tests {
         ProviderCredentialRefresh, ProviderCredentialRefreshStatus,
         ProviderCredentialRefreshStrategy, ProviderCredentialTokenGrant, ProviderProfile,
         ProviderProfileCredential, ResourceRequirements, Sandbox, SandboxCondition, SandboxPhase,
-        SandboxPolicyRevision, SandboxStatus, datamodel::v1::ObjectMeta,
+        SandboxPolicyRevision, SandboxStatus, SandboxWorkloadTemplateProvenance,
+        datamodel::v1::ObjectMeta,
     };
 
     #[test]
@@ -9099,6 +9120,10 @@ mod tests {
                 created_at_ms: 1_609_459_200_000,
                 ..Default::default()
             }),
+            created_from_workload_template: Some(SandboxWorkloadTemplateProvenance {
+                name: "gpu-kata".to_string(),
+                resource_version: "7".to_string(),
+            }),
             ..Default::default()
         };
         sandbox.set_phase(SandboxPhase::Ready as i32);
@@ -9118,6 +9143,11 @@ mod tests {
         assert_eq!(json["policy_source"], "global");
         assert_eq!(json["revision"], 3);
         assert!(json["policy"].is_null());
+        assert_eq!(json["created_from_workload_template"]["name"], "gpu-kata");
+        assert_eq!(
+            json["created_from_workload_template"]["resource_version"],
+            "7"
+        );
     }
 
     #[test]

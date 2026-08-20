@@ -50,5 +50,5 @@ pub use types::{
     ExecOptions, ExecResult, Health, ListOptions, SandboxPhase, SandboxRef, SandboxResources,
     SandboxServiceLevel, SandboxSpec, SandboxStartup, SandboxTemplateCreateSpec,
     SandboxTemplateListOptions, SandboxWorkloadConfig, SandboxWorkloadTemplate,
-    SandboxWorkloadTemplateSpec, ServiceStatus, WorkspaceRef,
+    SandboxWorkloadTemplateProvenance, SandboxWorkloadTemplateSpec, ServiceStatus, WorkspaceRef,
 };

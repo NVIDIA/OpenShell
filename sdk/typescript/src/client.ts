@@ -133,6 +133,12 @@ export interface SandboxRef {
   resourceVersion: string;
   mainProcessInstanceId?: string;
   exitCode?: number;
+  createdFromWorkloadTemplate?: SandboxWorkloadTemplateProvenance;
+}
+
+export interface SandboxWorkloadTemplateProvenance {
+  name: string;
+  resourceVersion: string;
 }
 
 export interface ListOptions {
@@ -372,6 +378,12 @@ function sandboxRef(sandbox: Sandbox | undefined): SandboxRef {
     resourceVersion: (meta?.resourceVersion ?? 0n).toString(),
     mainProcessInstanceId: sandbox.status?.mainProcessInstanceId || undefined,
     exitCode: sandbox.status?.exitCode,
+    createdFromWorkloadTemplate: sandbox.createdFromWorkloadTemplate
+      ? {
+          name: sandbox.createdFromWorkloadTemplate.name,
+          resourceVersion: sandbox.createdFromWorkloadTemplate.resourceVersion,
+        }
+      : undefined,
   };
 }
 
