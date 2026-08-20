@@ -58,6 +58,14 @@ TLS.
     stores SQLite state under *~/.local/state/openshell/gateway/*.
     Environment: **OPENSHELL_DB_URL**.
 
+**--db-max-connections** *N*
+:   Connection ceiling for the database pool, shared by every
+    database-backed request. Must be at least 1. When unset, the gateway
+    uses the backend default: **10** for Postgres, **5** for on-disk
+    SQLite. An in-memory SQLite database is always one connection.
+    TOML key: `database_max_connections`.
+    Environment: **OPENSHELL_DB_MAX_CONNECTIONS**.
+
 **--drivers** *DRIVER*\[,*DRIVER*\]
 :   Compute driver. Accepts a comma-delimited list. The gateway
     currently requires exactly one driver. Options: **podman**,

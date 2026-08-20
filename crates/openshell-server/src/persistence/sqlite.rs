@@ -23,6 +23,14 @@ static SQLITE_MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations/s
 
 use super::{DRAFT_CHUNK_OBJECT_TYPE, POLICY_OBJECT_TYPE};
 
+/// Pool ceiling for an on-disk database when the operator has not configured
+/// one.
+///
+/// `SQLite` serializes writers, so raising this mainly buys read concurrency;
+/// a gateway that needs more write throughput wants Postgres, not a larger
+/// `SQLite` pool.
+pub const DEFAULT_MAX_CONNECTIONS: u32 = 5;
+
 #[derive(Debug, Clone)]
 pub struct SqliteStore {
     pool: SqlitePool,
@@ -35,9 +43,35 @@ impl SqliteStore {
         self.pool.close().await;
     }
 
-    pub async fn connect(url: &str) -> PersistenceResult<Self> {
+    /// Test support only: the pool's effective connection ceiling.
+    #[cfg(test)]
+    pub(crate) fn max_connections_for_test(&self) -> u32 {
+        self.pool.options().get_max_connections()
+    }
+
+    /// Connect and size the pool, falling back to [`DEFAULT_MAX_CONNECTIONS`]
+    /// for an on-disk database.
+    ///
+    /// An in-memory database is always held by exactly one connection — the
+    /// database lives in that connection, so a second one would see a
+    /// different (empty) database. A configured ceiling is ignored there.
+    pub async fn connect(url: &str, max_connections: Option<u32>) -> PersistenceResult<Self> {
         let is_in_memory = url.contains(":memory:") || url.contains("mode=memory");
-        let max_connections = if is_in_memory { 1 } else { 5 };
+        let max_connections = if is_in_memory {
+            if max_connections.is_some_and(|configured| configured != 1) {
+                tracing::warn!(
+                    "ignoring the configured database pool ceiling: an in-memory SQLite database is held by a single connection"
+                );
+            }
+            1
+        } else {
+            max_connections.unwrap_or(DEFAULT_MAX_CONNECTIONS)
+        };
+        // Keep the pool eagerly warm up to the built-in size, but let a raised
+        // ceiling grow on demand rather than pinning that many file handles
+        // open for the life of the process.
+        let min_connections = max_connections.min(DEFAULT_MAX_CONNECTIONS);
+        tracing::info!(max_connections, "sizing SQLite connection pool");
 
         let options = SqliteConnectOptions::from_str(url)
             .map_err(|e| map_db_error(&e))?
@@ -45,7 +79,7 @@ impl SqliteStore {
 
         let mut pool_options = SqlitePoolOptions::new()
             .max_connections(max_connections)
-            .min_connections(max_connections);
+            .min_connections(min_connections);
 
         if is_in_memory {
             pool_options = pool_options.idle_timeout(None).max_lifetime(None);
