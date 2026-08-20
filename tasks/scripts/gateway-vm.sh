@@ -340,7 +340,7 @@ version = 1
 
 [openshell.gateway]
 name = "${GATEWAY_NAME}"
-compute_drivers = ["vm"]
+compute_driver = "vm"
 disable_tls = ${DISABLE_TLS}
 
 [openshell.gateway.auth]

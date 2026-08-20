@@ -690,9 +690,11 @@ Gateway CLI flag  >  gateway OPENSHELL_* env var  >  TOML file  >  built-in defa
 ```
 
 The TOML file is opt-in via `--config <PATH>` / `OPENSHELL_GATEWAY_CONFIG`.
-Driver implementation settings live in the TOML driver tables. See
-`docs/reference/gateway-config.mdx` for worked per-driver examples and RFC
-0003 for the full schema.
+Driver implementation settings live in the TOML driver tables. The canonical
+selector is the singular `[openshell.gateway] compute_driver`; the legacy
+`compute_drivers` list remains accepted and normalizes into the existing
+exactly-one-driver runtime validation. See `docs/reference/gateway-config.mdx`
+for worked per-driver examples and RFC 0003 for the full schema.
 
 Each installation has an operator-assigned gateway name. Configure it with
 `[openshell.gateway].name`, `--name`, or `OPENSHELL_GATEWAY_NAME`.
@@ -708,13 +710,16 @@ aliases, network names, and the sandbox JWT issuer.
 
 ### Driver inheritance
 
-`[openshell.gateway]` carries a small set of values (`sandbox_namespace`,
-`default_image`,
-`supervisor_image`, `guest_tls_ca/cert/key`, `client_tls_secret_name`,
-`host_gateway_ip`, `enable_user_namespaces`) that are inherited into each
-driver's `[openshell.drivers.<name>]` table when the driver-specific table
-does not override them. The allowlist is per-driver so a gateway-wide
-default cannot land in a driver that does not understand it (e.g.
+`[openshell.gateway]` carries shared defaults such as `default_image`,
+`supervisor_image`, `guest_tls_ca/cert/key`, `client_tls_secret_name`, and
+`host_gateway_ip`. It also continues to accept the historical
+`sandbox_namespace`, `service_account_name`, and `enable_user_namespaces`
+locations as compatibility inputs. Canonical Kubernetes configuration places
+those values in `[openshell.drivers.kubernetes]` as `namespace`,
+`service_account_name`, and `enable_user_namespaces`; canonical Docker
+configuration uses `sandbox_label`. Driver-table values take precedence over
+compatibility inputs. The allowlist is per-driver so a gateway-wide default
+cannot land in a driver that does not understand it (for example,
 `client_tls_secret_name` is K8s-only).
 
 `image_pull_policy` is intentionally **not** inheritable: Kubernetes uses

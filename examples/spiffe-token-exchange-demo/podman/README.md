@@ -62,7 +62,7 @@ to the same Podman network.
 
 `START_GATEWAY=1` automates that same-network gateway setup. It mounts the host
 Podman socket into the gateway container, writes a temporary gateway config with
-`compute_drivers = ["podman"]`, and mounts the SPIRE Workload API socket at the
+`compute_driver = "podman"`, and mounts the SPIRE Workload API socket at the
 same absolute host path so the gateway can pass that path to sibling sandbox
 containers.
 

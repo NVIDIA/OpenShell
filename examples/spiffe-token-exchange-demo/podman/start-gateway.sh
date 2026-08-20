@@ -138,7 +138,7 @@ version = 1
 bind_address = "0.0.0.0:8080"
 health_bind_address = "0.0.0.0:8081"
 log_level = "info"
-compute_drivers = ["podman"]
+compute_driver = "podman"
 disable_tls = true
 
 [openshell.gateway.auth]

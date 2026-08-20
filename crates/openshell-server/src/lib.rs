@@ -496,7 +496,7 @@ pub(crate) async fn run_server(
                 &signing_pem,
                 kid.clone(),
                 &jwt.gateway_id,
-                Duration::from_secs(jwt.ttl_secs),
+                jwt.sandbox_token_ttl().unwrap_or_default(),
             )
             .map_err(Error::config)?,
         );
@@ -1380,11 +1380,11 @@ async fn build_compute_runtime(
     if config
         .gateway_jwt
         .as_ref()
-        .is_some_and(|jwt| jwt.ttl_secs == 0)
+        .is_some_and(|jwt| jwt.sandbox_token_ttl().is_none())
         && !driver.is_local_singleplayer(registry)
     {
         warn!(
-            "Gateway configured with non-expiring sandbox JWTs; set gateway_jwt.ttl_secs > 0 for shared deployments"
+            "Gateway configured with non-expiring sandbox JWTs (gateway_jwt.ttl_secs is omitted or zero); set gateway_jwt.ttl_secs > 0 for shared deployments"
         );
     }
 

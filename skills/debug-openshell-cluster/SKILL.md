@@ -84,7 +84,7 @@ Before debugging the compute platform, inspect gateway logs for failures in depe
 For out-of-tree compute drivers, confirm the selected driver name and socket agree across CLI flags or `gateway.toml`, and that the operator-owned driver is running before the gateway starts:
 
 ```bash
-rg -n 'compute_drivers|socket_path' /etc/openshell/gateway.toml
+rg -n 'compute_driver|compute_drivers|socket_path' /etc/openshell/gateway.toml
 stat /run/openshell/<driver>.sock
 journalctl -u <driver-service> --no-pager --lines=200
 journalctl -u openshell-gateway --no-pager --lines=200

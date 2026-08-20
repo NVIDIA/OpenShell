@@ -160,7 +160,7 @@ fn install_in_tree_compute_drivers(registry: &mut ComputeDriverRegistry) {
                 .with_local_singleplayer()
                 .with_in_process_tracing(openshell_driver_docker::otel_tracing::TRACING)
                 .with_inherited_config_keys(&[
-                    "sandbox_namespace",
+                    "sandbox_label",
                     "default_image",
                     "supervisor_image",
                     "host_gateway_ip",

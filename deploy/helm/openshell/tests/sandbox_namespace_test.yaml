@@ -13,21 +13,27 @@ release:
   namespace: my-namespace
 
 tests:
-  - it: defaults sandbox_namespace to release namespace in the TOML config
+  - it: defaults the Kubernetes driver namespace to release namespace
     template: templates/gateway-config.yaml
     asserts:
       - matchRegex:
           path: data["gateway.toml"]
-          pattern: 'sandbox_namespace\s*=\s*"my-namespace"'
+          pattern: '(?ms)\[openshell\.drivers\.kubernetes\].*?namespace\s*=\s*"my-namespace"'
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: 'sandbox_namespace\s*='
 
-  - it: uses explicit sandboxNamespace when set
+  - it: uses explicit sandboxNamespace for the Kubernetes driver
     template: templates/gateway-config.yaml
     set:
       server.sandboxNamespace: other-ns
     asserts:
       - matchRegex:
           path: data["gateway.toml"]
-          pattern: 'sandbox_namespace\s*=\s*"other-ns"'
+          pattern: '(?ms)\[openshell\.drivers\.kubernetes\].*?namespace\s*=\s*"other-ns"'
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: 'sandbox_namespace\s*='
 
   - it: defaults NetworkPolicy namespace to release namespace
     template: templates/networkpolicy.yaml

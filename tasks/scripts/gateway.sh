@@ -248,7 +248,7 @@ version = 1
 
 [openshell.gateway]
 name = "${GATEWAY_NAME}"
-compute_drivers = ["${DRIVER}"]
+compute_driver = "${DRIVER}"
 default_image = "${SANDBOX_IMAGE}"
 disable_tls = true
 

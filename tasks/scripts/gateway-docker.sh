@@ -215,7 +215,7 @@ version = 1
 
 [openshell.gateway]
 name = "${GATEWAY_NAME}"
-compute_drivers = ["docker"]
+compute_driver = "docker"
 disable_tls = true
 
 [openshell.gateway.auth]
