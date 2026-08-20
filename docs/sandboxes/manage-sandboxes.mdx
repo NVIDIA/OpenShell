@@ -167,10 +167,9 @@ attaches to the same process instance and replays up to 1 MiB of recent
 output. One attachment owns stdin at a time. Use `sandbox exec --tty --
 /bin/bash -l` when you want a new independent shell instead.
 
-For a TTY main process, `Ctrl-C` interrupts a foreground job such as `tail -f`.
-When the canonical main process itself owns the terminal foreground, `Ctrl-C`
-disconnects the attachment without terminating the main process. Non-TTY
-connections retain normal signal behavior.
+Press `Ctrl-P`, then `Ctrl-Q` to disconnect without terminating the main
+process. `Ctrl-C` retains its normal terminal behavior and interrupts the
+foreground process.
 
 Launch VS Code or Cursor directly into the sandbox workspace:
 

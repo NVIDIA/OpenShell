@@ -245,7 +245,39 @@ struct ChannelState {
     main_input_owner: Option<u64>,
     main_attached: bool,
     main_read_only: bool,
+    main_detach_prefix_pending: bool,
     main_output_task: Option<tokio::task::AbortHandle>,
+}
+
+const MAIN_DETACH_PREFIX: u8 = 0x10; // Ctrl-P
+const MAIN_DETACH_KEY: u8 = 0x11; // Ctrl-Q
+
+/// Remove the `OpenShell` detach sequence from canonical-main input.
+///
+/// A trailing Ctrl-P remains pending across SSH data frames. If the following
+/// byte is not Ctrl-Q, both bytes are forwarded unchanged. Bytes after a
+/// completed detach sequence are discarded because the attachment is closing.
+fn filter_main_detach_sequence(prefix_pending: &mut bool, data: &[u8]) -> (Vec<u8>, bool) {
+    let mut forward = Vec::with_capacity(data.len() + usize::from(*prefix_pending));
+
+    for &byte in data {
+        if *prefix_pending {
+            if byte == MAIN_DETACH_KEY {
+                *prefix_pending = false;
+                return (forward, true);
+            }
+            forward.push(MAIN_DETACH_PREFIX);
+            *prefix_pending = false;
+        }
+
+        if byte == MAIN_DETACH_PREFIX {
+            *prefix_pending = true;
+        } else {
+            forward.push(byte);
+        }
+    }
+
+    (forward, false)
 }
 
 enum InputSender {
@@ -575,6 +607,7 @@ impl russh::server::Handler for SshHandler {
                 }
             };
             state.main_attached = true;
+            state.main_detach_prefix_pending = false;
             state.input_sender = input;
             let mut output = self.main_session.subscribe();
             let handle = session.handle();
@@ -684,60 +717,42 @@ impl russh::server::Handler for SshHandler {
         data: &[u8],
         session: &mut Session,
     ) -> Result<(), Self::Error> {
-        let Some(state) = self.channels.get(&channel) else {
+        let Some(state) = self.channels.get_mut(&channel) else {
             warn!("data on unknown channel {channel:?}");
             return Ok(());
         };
 
-        // OpenSSH sends Ctrl-C as the terminal interrupt byte for a PTY
-        // session. Preserve normal job-control behavior while a foreground
-        // child owns the PTY, but treat Ctrl-C as detach once the canonical
-        // main process group has reclaimed the foreground. This lets a user
-        // interrupt `tail -f`, then press Ctrl-C again at the main shell to
-        // disconnect without terminating the sandbox.
-        let detach_at = state
-            .main_attached
-            .then(|| data.iter().position(|byte| *byte == 0x03))
-            .flatten()
-            .filter(
-                |_| match self.main_session.main_owns_terminal_foreground() {
-                    Ok(owns_foreground) => owns_foreground,
-                    Err(error) => {
-                        tracing::debug!(%error, "failed to read canonical PTY foreground group");
-                        false
-                    }
-                },
-            );
+        let main_attached = state.main_attached;
+        let (forward, detach) = if main_attached {
+            filter_main_detach_sequence(&mut state.main_detach_prefix_pending, data)
+        } else {
+            (data.to_vec(), false)
+        };
+        let send_error = (!forward.is_empty())
+            .then(|| state.input_sender.as_ref()?.send(forward).err())
+            .flatten();
 
-        if let Some(detach_at) = detach_at {
-            // Preserve bytes preceding Ctrl-C in the same SSH data frame, but
-            // suppress the interrupt byte and anything after it because the
-            // attachment is closing.
-            if detach_at > 0
-                && let Some(sender) = state.input_sender.as_ref()
-                && let Err(error) = sender.send(data[..detach_at].to_vec())
-            {
-                self.close_main_attachment(channel, session.handle(), Some(error))
+        if let Some(error) = send_error {
+            let handle = session.handle();
+            if main_attached {
+                self.close_main_attachment(channel, handle, Some(error))
                     .await;
-                return Ok(());
+            } else {
+                let _ = handle
+                    .extended_data(
+                        channel,
+                        1,
+                        format!("openshell: {error}; closing attachment\n").into_bytes(),
+                    )
+                    .await;
+                let _ = handle.close(channel).await;
             }
+            return Ok(());
+        }
+        if detach {
             self.close_main_attachment(channel, session.handle(), None)
                 .await;
             return Ok(());
-        }
-
-        if let Some(sender) = state.input_sender.as_ref()
-            && let Err(error) = sender.send(data.to_vec())
-        {
-            let handle = session.handle();
-            let _ = handle
-                .extended_data(
-                    channel,
-                    1,
-                    format!("openshell: {error}; closing attachment\n").into_bytes(),
-                )
-                .await;
-            let _ = handle.close(channel).await;
         }
         Ok(())
     }
@@ -758,6 +773,7 @@ impl russh::server::Handler for SshHandler {
                 self.main_session.release_input(owner);
             }
             state.input_sender.take();
+            state.main_detach_prefix_pending = false;
         } else {
             warn!("channel_eof on unknown channel {channel:?}");
         }
@@ -824,6 +840,7 @@ impl SshHandler {
                 self.main_session.release_input(owner);
             }
             state.input_sender.take();
+            state.main_detach_prefix_pending = false;
             if let Some(task) = state.main_output_task.take() {
                 task.abort();
             }
@@ -1935,6 +1952,56 @@ mod tests {
             .send(b"still-alive".to_vec())
             .unwrap();
         assert_eq!(rx_b.recv().unwrap(), b"still-alive");
+    }
+
+    #[test]
+    fn main_detach_filter_forwards_ctrl_c_unchanged() {
+        let mut prefix_pending = false;
+        let (forward, detach) =
+            filter_main_detach_sequence(&mut prefix_pending, b"before\x03after");
+
+        assert_eq!(forward, b"before\x03after");
+        assert!(!detach);
+        assert!(!prefix_pending);
+    }
+
+    #[test]
+    fn main_detach_filter_removes_sequence_and_trailing_input() {
+        let mut prefix_pending = false;
+        let (forward, detach) =
+            filter_main_detach_sequence(&mut prefix_pending, b"before\x10\x11after");
+
+        assert_eq!(forward, b"before");
+        assert!(detach);
+        assert!(!prefix_pending);
+    }
+
+    #[test]
+    fn main_detach_filter_recognizes_sequence_across_frames() {
+        let mut prefix_pending = false;
+        let (forward, detach) = filter_main_detach_sequence(&mut prefix_pending, b"before\x10");
+        assert_eq!(forward, b"before");
+        assert!(!detach);
+        assert!(prefix_pending);
+
+        let (forward, detach) = filter_main_detach_sequence(&mut prefix_pending, b"\x11");
+        assert!(forward.is_empty());
+        assert!(detach);
+        assert!(!prefix_pending);
+    }
+
+    #[test]
+    fn main_detach_filter_forwards_unmatched_prefix() {
+        let mut prefix_pending = false;
+        let (forward, detach) = filter_main_detach_sequence(&mut prefix_pending, b"\x10");
+        assert!(forward.is_empty());
+        assert!(!detach);
+        assert!(prefix_pending);
+
+        let (forward, detach) = filter_main_detach_sequence(&mut prefix_pending, b"x");
+        assert_eq!(forward, b"\x10x");
+        assert!(!detach);
+        assert!(!prefix_pending);
     }
 
     // -----------------------------------------------------------------------
