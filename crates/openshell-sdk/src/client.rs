@@ -221,6 +221,7 @@ impl OpenShellClient {
                     offset: opts.offset,
                     workspace: String::new(),
                     all_workspaces: opts.all_workspaces,
+                    label_selector: opts.label_selector.clone(),
                 };
                 async move { grpc.list_sandbox_templates(request).await }
             })
@@ -708,6 +709,7 @@ impl WorkspaceScopedClient {
                         self.workspace.clone()
                     },
                     all_workspaces: opts.all_workspaces,
+                    label_selector: opts.label_selector.clone(),
                 };
                 async move { grpc.list_sandbox_templates(request).await }
             })

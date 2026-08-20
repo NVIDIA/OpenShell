@@ -223,6 +223,7 @@ func TestSandboxTemplateGetListDelete(t *testing.T) {
 	list, err := client.List(context.Background(), "default", ListOptions{
 		Limit:         10,
 		Offset:        2,
+		LabelSelector: "team=runtime",
 		AllWorkspaces: true,
 	})
 	require.NoError(t, err)
@@ -242,6 +243,7 @@ func TestSandboxTemplateGetListDelete(t *testing.T) {
 	assert.Empty(t, mock.listRequest.Workspace)
 	assert.Equal(t, uint32(10), mock.listRequest.Limit)
 	assert.Equal(t, uint32(2), mock.listRequest.Offset)
+	assert.Equal(t, "team=runtime", mock.listRequest.LabelSelector)
 	assert.True(t, mock.listRequest.AllWorkspaces)
 	require.NotNil(t, mock.deleteRequest)
 	assert.Equal(t, "default", mock.deleteRequest.Workspace)

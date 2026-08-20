@@ -781,11 +781,24 @@ pub(super) async fn handle_list_sandbox_templates(
     let limit = clamp_limit(request.limit, 100, MAX_PAGE_SIZE);
     let templates = if request.all_workspaces {
         require_platform_admin(&state.admin_role, &principal)?;
-        state
-            .store
-            .list_all_messages::<SandboxWorkloadTemplate>(limit, request.offset)
-            .await
-            .map_err(|e| Status::internal(format!("list sandbox templates failed: {e}")))?
+        if request.label_selector.is_empty() {
+            state
+                .store
+                .list_all_messages::<SandboxWorkloadTemplate>(limit, request.offset)
+                .await
+                .map_err(|e| Status::internal(format!("list sandbox templates failed: {e}")))?
+        } else {
+            crate::grpc::validation::validate_label_selector(&request.label_selector)?;
+            state
+                .store
+                .list_all_messages_with_selector::<SandboxWorkloadTemplate>(
+                    &request.label_selector,
+                    limit,
+                    request.offset,
+                )
+                .await
+                .map_err(|e| Status::internal(format!("list sandbox templates failed: {e}")))?
+        }
     } else {
         let authz = authorize_workspace(
             &state.store,
@@ -798,11 +811,27 @@ pub(super) async fn handle_list_sandbox_templates(
         let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &authz.workspace)
             .await?
             .name;
-        state
-            .store
-            .list_messages::<SandboxWorkloadTemplate>(&workspace, limit, request.offset)
-            .await
-            .map_err(|e| Status::internal(format!("list sandbox templates failed: {e}")))?
+        if request.label_selector.is_empty() {
+            state
+                .store
+                .list_messages::<SandboxWorkloadTemplate>(&workspace, limit, request.offset)
+                .await
+                .map_err(|e| Status::internal(format!("list sandbox templates failed: {e}")))?
+        } else {
+            crate::grpc::validation::validate_label_selector(&request.label_selector)?;
+            state
+                .store
+                .list_messages_with_selector::<SandboxWorkloadTemplate>(
+                    &workspace,
+                    &request.label_selector,
+                    limit,
+                    request.offset,
+                )
+                .await
+                .map_err(|e| {
+                    Status::internal(format!("list sandbox templates with selector failed: {e}"))
+                })?
+        }
     };
     Ok(Response::new(ListSandboxTemplatesResponse { templates }))
 }
@@ -4222,6 +4251,7 @@ mod tests {
                 offset: 0,
                 workspace: "default".to_string(),
                 all_workspaces: false,
+                label_selector: String::new(),
             }),
         )
         .await
@@ -4256,6 +4286,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sandbox_template_list_filters_by_label_selector() {
+        let state = test_server_state().await;
+
+        let mut gpu = test_workload_template("gpu-kata");
+        gpu.metadata
+            .as_mut()
+            .expect("metadata")
+            .labels
+            .insert("team".to_string(), "runtime".to_string());
+        handle_create_sandbox_template(
+            &state,
+            authed_request(CreateSandboxTemplateRequest {
+                template: Some(gpu),
+                workspace: "default".to_string(),
+            }),
+        )
+        .await
+        .expect("gpu template create should succeed");
+
+        let mut cpu = test_workload_template("cpu-base");
+        cpu.metadata
+            .as_mut()
+            .expect("metadata")
+            .labels
+            .insert("team".to_string(), "batch".to_string());
+        handle_create_sandbox_template(
+            &state,
+            authed_request(CreateSandboxTemplateRequest {
+                template: Some(cpu),
+                workspace: "default".to_string(),
+            }),
+        )
+        .await
+        .expect("cpu template create should succeed");
+
+        let listed = handle_list_sandbox_templates(
+            &state,
+            authed_request(ListSandboxTemplatesRequest {
+                limit: 100,
+                offset: 0,
+                workspace: "default".to_string(),
+                all_workspaces: false,
+                label_selector: "team=runtime".to_string(),
+            }),
+        )
+        .await
+        .expect("template list with label selector should succeed")
+        .into_inner()
+        .templates;
+
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].object_name(), "gpu-kata");
+    }
+
+    #[tokio::test]
     async fn sandbox_template_create_rejects_whitespace_name() {
         let state = test_server_state().await;
 
@@ -4279,6 +4364,7 @@ mod tests {
                 offset: 0,
                 workspace: "default".to_string(),
                 all_workspaces: false,
+                label_selector: String::new(),
             }),
         )
         .await
@@ -4326,6 +4412,7 @@ mod tests {
                 offset: 0,
                 workspace: "beta".to_string(),
                 all_workspaces: false,
+                label_selector: String::new(),
             }),
         )
         .await

@@ -5,6 +5,7 @@ package fake
 
 import (
 	"context"
+	"strings"
 	"time"
 
 	v1 "github.com/NVIDIA/OpenShell/sdk/go/openshell/v1"
@@ -107,10 +108,17 @@ func (c *fakeSandboxTemplateClient) List(_ context.Context, workspace string, op
 	if c.closedFunc() {
 		return nil, &types.StatusError{Code: types.ErrorUnavailable, Message: "client is closed"}
 	}
-	if len(opts) > 0 && opts[0].AllWorkspaces {
-		return c.store.ListAll(), nil
+	var options v1.ListOptions
+	if len(opts) > 0 {
+		options = opts[0]
 	}
-	return c.store.List(workspace), nil
+	var templates []*types.SandboxWorkloadTemplate
+	if len(opts) > 0 && opts[0].AllWorkspaces {
+		templates = c.store.ListAll()
+	} else {
+		templates = c.store.List(workspace)
+	}
+	return filterSandboxWorkloadTemplatesByLabelSelector(templates, options.LabelSelector)
 }
 
 func (c *fakeSandboxTemplateClient) Delete(_ context.Context, workspace, name string) (bool, error) {
@@ -150,6 +158,52 @@ func validateSandboxWorkloadEnvironment(environment map[string]string) error {
 		}
 	}
 	return nil
+}
+
+func filterSandboxWorkloadTemplatesByLabelSelector(
+	templates []*types.SandboxWorkloadTemplate,
+	selector string,
+) ([]*types.SandboxWorkloadTemplate, error) {
+	selector = strings.TrimSpace(selector)
+	if selector == "" {
+		return templates, nil
+	}
+	labels, err := parseSimpleLabelSelector(selector)
+	if err != nil {
+		return nil, err
+	}
+	filtered := make([]*types.SandboxWorkloadTemplate, 0, len(templates))
+	for _, template := range templates {
+		if labelsMatchSelector(template.Labels, labels) {
+			filtered = append(filtered, template)
+		}
+	}
+	return filtered, nil
+}
+
+func parseSimpleLabelSelector(selector string) (map[string]string, error) {
+	labels := make(map[string]string)
+	for _, part := range strings.Split(selector, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		key, value, ok := strings.Cut(part, "=")
+		if !ok || strings.TrimSpace(key) == "" {
+			return nil, &types.StatusError{Code: types.ErrorInvalidArgument, Message: "label selector must use key=value pairs"}
+		}
+		labels[strings.TrimSpace(key)] = strings.TrimSpace(value)
+	}
+	return labels, nil
+}
+
+func labelsMatchSelector(labels map[string]string, selector map[string]string) bool {
+	for key, value := range selector {
+		if labels[key] != value {
+			return false
+		}
+	}
+	return true
 }
 
 func isDNS1123Label(name string) bool {

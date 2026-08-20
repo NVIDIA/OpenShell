@@ -2552,6 +2552,7 @@ pub async fn sandbox_template_list(
     server: &str,
     limit: u32,
     offset: u32,
+    label_selector: Option<&str>,
     names_only: bool,
     output: &str,
     workspace: &str,
@@ -2569,6 +2570,7 @@ pub async fn sandbox_template_list(
                 workspace.to_string()
             },
             all_workspaces,
+            label_selector: label_selector.unwrap_or_default().to_string(),
         })
         .await
         .into_diagnostic()?;

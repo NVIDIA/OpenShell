@@ -285,6 +285,7 @@ List sandbox workload templates.
 |------|---------|-------------|
 | `--limit <N>` | 100 | Maximum templates |
 | `--offset <N>` | 0 | Pagination offset |
+| `--label-selector <KEY=VALUE,...>` | empty | Filter templates by labels |
 | `--names` | false | Print only template names |
 | `--all-workspaces` | false | List templates across all workspaces; requires platform-admin permissions |
 | `--output table|yaml|json` | `table` | Output format |
