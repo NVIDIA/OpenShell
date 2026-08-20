@@ -261,7 +261,7 @@ Disable telemetry at runtime by setting `OPENSHELL_TELEMETRY_ENABLED=false` on t
 You can also compile telemetry out entirely. Telemetry support is a default-on `telemetry` Cargo feature, and each crate that carries it also defines a `defaults-without-telemetry` alias covering every other default feature. Build telemetry-free artifacts with `--no-default-features --features defaults-without-telemetry`:
 
 ```shell
-cargo build --release -p openshell-server --no-default-features --features defaults-without-telemetry
+cargo build --release -p openshell-gateway --no-default-features --features defaults-without-telemetry
 cargo build --release -p openshell-sandbox --no-default-features --features defaults-without-telemetry
 cargo build --release -p openshell-driver-vm --no-default-features --features defaults-without-telemetry
 ```

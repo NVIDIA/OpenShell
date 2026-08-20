@@ -311,11 +311,42 @@ fn podman_gpu_selection_error(err: CdiGpuSelectionError) -> ComputeDriverError {
     ComputeDriverError::Precondition(err.to_string())
 }
 
+/// Return the first responsive local Podman API socket.
+#[must_use]
+pub fn detect_socket() -> Option<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Ok(path) = std::env::var("OPENSHELL_PODMAN_SOCKET")
+        && !path.trim().is_empty()
+    {
+        candidates.push(PathBuf::from(path));
+    }
+    if let Some(runtime_dir) = std::env::var_os("XDG_RUNTIME_DIR") {
+        candidates.push(PathBuf::from(runtime_dir).join("podman/podman.sock"));
+    }
+    #[cfg(target_os = "linux")]
+    candidates.push(PathBuf::from(format!(
+        "/run/user/{}/podman/podman.sock",
+        rustix::process::geteuid().as_raw()
+    )));
+    if let Some(home) = std::env::var_os("HOME") {
+        candidates
+            .push(PathBuf::from(home).join(".local/share/containers/podman/machine/podman.sock"));
+    }
+    openshell_core::local_api_socket::first_responsive_socket(&candidates, |response| {
+        openshell_core::local_api_socket::http_response_is_success(response)
+            && openshell_core::local_api_socket::contains_ascii(response, b"Libpod-Api-Version:")
+    })
+}
+
+#[must_use]
+pub fn is_available() -> bool {
+    detect_socket().is_some()
+}
+
 /// Resolve the socket to connect to: explicit configuration wins, otherwise
 /// fall back to `detect`. Returns an error if neither resolves.
 ///
-/// Takes `detect` as a parameter (rather than calling
-/// [`openshell_core::config::detect_podman_socket`] directly) so tests can
+/// Takes `detect` as a parameter so tests can
 /// exercise the precedence deterministically, without touching real
 /// environment variables or the filesystem.
 fn resolve_socket_path(
@@ -337,10 +368,7 @@ impl PodmanComputeDriver {
         const MAX_PING_RETRIES: u32 = 5;
         const PING_RETRY_DELAY: Duration = Duration::from_secs(2);
 
-        let socket_path = resolve_socket_path(
-            config.socket_path.clone(),
-            openshell_core::config::detect_podman_socket,
-        )?;
+        let socket_path = resolve_socket_path(config.socket_path.clone(), detect_socket)?;
         config.socket_path = Some(socket_path.clone());
 
         if !socket_path.exists() {

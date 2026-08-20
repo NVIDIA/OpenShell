@@ -161,7 +161,7 @@ fi
 
 echo "Building openshell-gateway..."
 cargo build ${CARGO_BUILD_JOBS_ARG[@]+"${CARGO_BUILD_JOBS_ARG[@]}"} \
-  -p openshell-server --bin openshell-gateway
+  -p openshell-gateway --bin openshell-gateway
 
 TLS_DIR="${STATE_DIR}/tls"
 echo "Generating local gateway credentials..."

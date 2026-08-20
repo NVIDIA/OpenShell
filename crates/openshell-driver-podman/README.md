@@ -457,11 +457,11 @@ matter compared to cluster or rootful runtimes:
 
 ## Implementation References
 
-- Gateway integration: `crates/openshell-server/src/compute/mod.rs`
-  (`new_podman` and `PodmanComputeDriver` wiring).
-- Server configuration: `crates/openshell-server/src/lib.rs`
-  (`ComputeDriverKind::Podman` builds `PodmanComputeConfig` including
-  `sandbox_ssh_socket_path` from gateway `Config`).
+- Gateway integration: `crates/openshell-gateway/src/lib.rs` registers the
+  driver factory and constructs `PodmanComputeConfig` from the generic server
+  build context.
+- Server configuration: `crates/openshell-server/src/lib.rs` exposes the
+  backend-agnostic registry and factory context.
 - Gateway relay path: `openshell-core` `Config::sandbox_ssh_socket_path` in
   `crates/openshell-core/src/config.rs`.
 - SSRF mitigation: `crates/openshell-core/src/net.rs`,

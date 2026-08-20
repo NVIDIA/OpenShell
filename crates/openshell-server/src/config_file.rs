@@ -26,7 +26,6 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 use base64::Engine as _;
-use openshell_core::config::ComputeDriverKind;
 use openshell_core::proto::SupervisorMiddlewareService;
 use openshell_core::{
     GatewayAuthConfig, GatewayInterceptorConfig, GatewayJwtConfig,
@@ -433,12 +432,21 @@ pub fn driver_table(
     gateway: &GatewayFileSection,
     raw: Option<&toml::Value>,
 ) -> toml::Value {
+    driver_table_with_inherited_keys(driver_name, gateway, raw, &[])
+}
+
+pub(crate) fn driver_table_with_inherited_keys(
+    _driver_name: &str,
+    gateway: &GatewayFileSection,
+    raw: Option<&toml::Value>,
+    inheritable_keys: &[&str],
+) -> toml::Value {
     let mut merged = match raw {
         Some(toml::Value::Table(table)) => table.clone(),
         _ => toml::Table::new(),
     };
 
-    for key in inheritable_keys(driver_name) {
+    for key in inheritable_keys {
         if merged.contains_key(*key) {
             continue;
         }
@@ -448,50 +456,6 @@ pub fn driver_table(
     }
 
     toml::Value::Table(merged)
-}
-
-/// Inheritance allowlist (the Q4 "high-overlap set"). Each driver opts in
-/// to a specific subset so a gateway-wide default does not accidentally land
-/// in a driver table that does not understand the field.
-fn inheritable_keys(driver_name: &str) -> &'static [&'static str] {
-    match driver_name.parse::<ComputeDriverKind>().ok() {
-        Some(ComputeDriverKind::Kubernetes) => &[
-            "namespace",
-            "default_image",
-            "supervisor_image",
-            "client_tls_secret_name",
-            "service_account_name",
-            "host_gateway_ip",
-            "enable_user_namespaces",
-            "sa_token_ttl_secs",
-        ],
-        Some(ComputeDriverKind::Docker) => &[
-            "sandbox_namespace",
-            "default_image",
-            "supervisor_image",
-            "host_gateway_ip",
-            "guest_tls_ca",
-            "guest_tls_cert",
-            "guest_tls_key",
-        ],
-        Some(ComputeDriverKind::Podman) => &[
-            "default_image",
-            "supervisor_image",
-            "host_gateway_ip",
-            "guest_tls_ca",
-            "guest_tls_cert",
-            "guest_tls_key",
-        ],
-        Some(ComputeDriverKind::Vm) => &[
-            "default_image",
-            "guest_tls_ca",
-            "guest_tls_cert",
-            "guest_tls_key",
-        ],
-        // MXC reads its own settings from the driver config table and has no
-        // gateway-inherited required fields.
-        Some(ComputeDriverKind::Mxc) | None => &[],
-    }
 }
 
 fn gateway_inherited_value(g: &GatewayFileSection, key: &str) -> Option<toml::Value> {
@@ -986,10 +950,11 @@ version = 2
         let raw = toml::toml! {
             namespace = "agents"
         };
-        let merged = driver_table(
-            ComputeDriverKind::Kubernetes.as_str(),
+        let merged = driver_table_with_inherited_keys(
+            "alpha",
             &gateway,
             Some(&toml::Value::Table(raw)),
+            &["default_image", "supervisor_image"],
         );
         let table = merged.as_table().expect("table");
         assert_eq!(
@@ -1007,14 +972,19 @@ version = 2
     }
 
     #[test]
-    fn docker_driver_table_inherits_gateway_defaults() {
+    fn registered_driver_table_inherits_selected_gateway_defaults() {
         let gateway = GatewayFileSection {
             sandbox_namespace: Some("agents".to_string()),
             default_image: Some("ghcr.io/nvidia/openshell/sandbox:0.9".to_string()),
             host_gateway_ip: Some("10.0.0.1".to_string()),
             ..Default::default()
         };
-        let merged = driver_table(ComputeDriverKind::Docker.as_str(), &gateway, None);
+        let merged = driver_table_with_inherited_keys(
+            "alpha",
+            &gateway,
+            None,
+            &["sandbox_namespace", "default_image", "host_gateway_ip"],
+        );
         let table = merged.as_table().expect("table");
         assert_eq!(
             table.get("sandbox_namespace").and_then(|v| v.as_str()),
@@ -1031,13 +1001,18 @@ version = 2
     }
 
     #[test]
-    fn podman_driver_table_inherits_gateway_host_gateway_ip() {
+    fn registered_driver_table_can_select_network_defaults() {
         let gateway = GatewayFileSection {
             default_image: Some("ghcr.io/nvidia/openshell/sandbox:0.9".to_string()),
             host_gateway_ip: Some("192.168.127.254".to_string()),
             ..Default::default()
         };
-        let merged = driver_table(ComputeDriverKind::Podman.as_str(), &gateway, None);
+        let merged = driver_table_with_inherited_keys(
+            "beta",
+            &gateway,
+            None,
+            &["default_image", "host_gateway_ip"],
+        );
         let table = merged.as_table().expect("table");
         assert_eq!(
             table.get("default_image").and_then(|v| v.as_str()),
@@ -1058,10 +1033,11 @@ version = 2
         let raw = toml::toml! {
             default_image = "driver-specific"
         };
-        let merged = driver_table(
-            ComputeDriverKind::Podman.as_str(),
+        let merged = driver_table_with_inherited_keys(
+            "alpha",
             &gateway,
             Some(&toml::Value::Table(raw)),
+            &["default_image"],
         );
         assert_eq!(
             merged
@@ -1075,13 +1051,12 @@ version = 2
 
     #[test]
     fn driver_table_does_not_leak_keys_outside_allowlist() {
-        // `client_tls_secret_name` is K8s-only; Docker must not receive it
-        // even when set at gateway scope.
+        // Fields not selected by the registration must remain gateway-only.
         let gateway = GatewayFileSection {
             client_tls_secret_name: Some("openshell-sandbox-tls".to_string()),
             ..Default::default()
         };
-        let merged = driver_table(ComputeDriverKind::Docker.as_str(), &gateway, None);
+        let merged = driver_table_with_inherited_keys("alpha", &gateway, None, &["default_image"]);
         assert!(
             !merged
                 .as_table()

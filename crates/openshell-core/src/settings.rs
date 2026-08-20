@@ -65,7 +65,7 @@ impl RegisteredSetting {
 ///
 /// 1. Add a [`RegisteredSetting`] entry to this array with the key name and
 ///    [`SettingValueKind`].
-/// 2. Recompile `openshell-server` (gateway) and `openshell-sandbox`
+/// 2. Recompile `openshell-gateway` and `openshell-sandbox`
 ///    (supervisor). No database migration is needed -- new keys are stored in
 ///    the existing settings JSON blob.
 /// 3. Add sandbox-side consumption in `openshell-sandbox` to read and act on

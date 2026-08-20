@@ -51,12 +51,12 @@ description = "Verify telemetry emission code is compiled out with --no-default-
 run = [
   # Positive control: the default (telemetry-on) gateway must contain the
   # markers, so the absent checks below can never become silently vacuous.
-  "cargo build -p openshell-server --bin openshell-gateway",
+  "cargo build -p openshell-gateway --bin openshell-gateway",
   "tasks/scripts/verify-telemetry-compiled-out.sh present target/debug/openshell-gateway",
   # Guard: telemetry-free builds must contain no telemetry markers. Built
   # through the `defaults-without-telemetry` alias, which is how the docs tell
   # operators to produce these artifacts.
-  "cargo build -p openshell-server --bin openshell-gateway --no-default-features --features defaults-without-telemetry",
+  "cargo build -p openshell-gateway --bin openshell-gateway --no-default-features --features defaults-without-telemetry",
   "tasks/scripts/verify-telemetry-compiled-out.sh absent target/debug/openshell-gateway",
   "cargo build -p openshell-sandbox --bin openshell-sandbox --no-default-features --features defaults-without-telemetry",
   "tasks/scripts/verify-telemetry-compiled-out.sh absent target/debug/openshell-sandbox",

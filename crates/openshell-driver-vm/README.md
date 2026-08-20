@@ -9,7 +9,7 @@ Standalone libkrun-backed [`ComputeDriver`](../../proto/compute_driver.proto) fo
 ```mermaid
 flowchart LR
     subgraph host["Host process"]
-        gateway["openshell-server<br/>(compute::vm::spawn)"]
+        gateway["openshell-gateway<br/>(vm::spawn)"]
         driver["openshell-driver-vm<br/>├── libkrun (VM)<br/>├── gvproxy (net)<br/>└── openshell-sandbox.zst"]
         gateway <-->|"gRPC over UDS<br/>compute-driver.sock"| driver
     end
@@ -102,7 +102,7 @@ mise run vm:supervisor          # if openshell-sandbox.zst is not already presen
 
 # 2. Build both binaries with the staged artifacts embedded
 OPENSHELL_VM_RUNTIME_COMPRESSED_DIR=$PWD/target/vm-runtime-compressed \
-  cargo build -p openshell-server -p openshell-driver-vm
+  cargo build -p openshell-gateway -p openshell-driver-vm
 
 # 3. macOS only: codesign the driver for Hypervisor.framework
 codesign \
@@ -291,5 +291,5 @@ the user explicitly overrides it.
 
 ## TODOs
 
-- The gateway still configures the driver via CLI args; this will move to a gRPC bootstrap call so the driver interface is uniform across backends. See the `TODO(driver-abstraction)` notes in `crates/openshell-server/src/lib.rs` and `crates/openshell-server/src/compute/vm.rs`.
+- The gateway still configures the driver via CLI args; this will move to a gRPC bootstrap call so the driver interface is uniform across backends. See the `TODO(driver-abstraction)` note in `crates/openshell-gateway/src/vm.rs`.
 - macOS local builds are codesigned by `tasks/scripts/gateway-vm.sh`; the generated Homebrew formula signs the release tarball driver for local installs.

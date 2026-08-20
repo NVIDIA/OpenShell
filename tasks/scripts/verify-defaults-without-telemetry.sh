@@ -22,7 +22,7 @@ set -euo pipefail
 # Crates that define the alias. Each must forward `telemetry` and define
 # `defaults-without-telemetry`.
 CRATES=(
-  openshell-server
+  openshell-gateway
   openshell-sandbox
   openshell-driver-vm
 )

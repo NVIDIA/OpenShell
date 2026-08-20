@@ -7,9 +7,6 @@
 //! driver-specific environment overrides, and applying gateway startup defaults.
 //! It does not acquire, connect to, or start compute drivers.
 
-#[cfg(all(not(target_os = "windows"), feature = "in-tree-compute-drivers"))]
-pub mod builtin;
-
 use crate::config_file;
 use crate::defaults::LocalTlsPaths;
 #[cfg(target_os = "windows")]
@@ -91,16 +88,18 @@ pub struct RemoteDriverConfig {
 pub fn driver_config_from_context<T>(
     context: DriverStartupContext<'_>,
     driver_name: &str,
+    inherited_config_keys: &[&str],
 ) -> Result<T>
 where
     T: Default + serde::de::DeserializeOwned,
 {
-    driver_config_from_file(context.file, driver_name)
+    driver_config_from_file(context.file, driver_name, inherited_config_keys)
 }
 
 fn driver_config_from_file<T>(
     file: Option<&config_file::ConfigFile>,
     driver_name: &str,
+    inherited_config_keys: &[&str],
 ) -> Result<T>
 where
     T: Default + serde::de::DeserializeOwned,
@@ -108,10 +107,11 @@ where
     let Some(file) = file else {
         return Ok(T::default());
     };
-    let merged = config_file::driver_table(
+    let merged = config_file::driver_table_with_inherited_keys(
         driver_name,
         &file.openshell.gateway,
         file.openshell.drivers.get(driver_name),
+        inherited_config_keys,
     );
     merged.try_into().map_err(|e| {
         Error::config(format!(

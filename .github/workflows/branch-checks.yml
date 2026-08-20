@@ -169,9 +169,9 @@ jobs:
 
       - name: Verify telemetry can be compiled out
         run: |
-          cargo build -p openshell-server --bin openshell-gateway
+          cargo build -p openshell-gateway --bin openshell-gateway
           tasks/scripts/verify-telemetry-compiled-out.sh present target/debug/openshell-gateway
-          cargo build -p openshell-server --bin openshell-gateway --no-default-features --features defaults-without-telemetry
+          cargo build -p openshell-gateway --bin openshell-gateway --no-default-features --features defaults-without-telemetry
           tasks/scripts/verify-telemetry-compiled-out.sh absent target/debug/openshell-gateway
           cargo build -p openshell-sandbox --bin openshell-sandbox --no-default-features --features defaults-without-telemetry
           tasks/scripts/verify-telemetry-compiled-out.sh absent target/debug/openshell-sandbox

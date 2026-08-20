@@ -4,16 +4,13 @@
 use std::collections::BTreeSet;
 use std::sync::{Arc, RwLock};
 
-/// Thread-safe dynamic allowlist of Kubernetes operator-mode namespaces.
-///
-/// This type lives in the public core API because both the Kubernetes driver
-/// and gateway authentication boundary consume it.
+/// Thread-safe dynamic allowlist of strings shared across component boundaries.
 #[derive(Debug, Clone)]
-pub struct OperatorNamespaceAllowlist {
+pub struct DynamicStringAllowlist {
     inner: Arc<RwLock<BTreeSet<String>>>,
 }
 
-impl OperatorNamespaceAllowlist {
+impl DynamicStringAllowlist {
     fn read_guard(&self) -> std::sync::RwLockReadGuard<'_, BTreeSet<String>> {
         self.inner
             .read()
@@ -71,7 +68,7 @@ impl OperatorNamespaceAllowlist {
     }
 }
 
-impl Default for OperatorNamespaceAllowlist {
+impl Default for DynamicStringAllowlist {
     fn default() -> Self {
         Self::new()
     }

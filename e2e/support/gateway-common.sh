@@ -219,11 +219,11 @@ e2e_build_gateway_binaries() {
     echo "Building openshell-gateway..."
     if [ "${OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" = "1" ]; then
       cargo build "${jobs[@]}" \
-        -p openshell-server --bin openshell-gateway \
-        --no-default-features
+        -p openshell-gateway --bin openshell-gateway \
+        --no-default-features --features telemetry
     else
       cargo build "${jobs[@]}" \
-        -p openshell-server --bin openshell-gateway
+        -p openshell-gateway --bin openshell-gateway
     fi
   else
     echo "Using prebuilt openshell gateway at ${OPENSHELL_GATEWAY_BIN}"

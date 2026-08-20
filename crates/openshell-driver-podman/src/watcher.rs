@@ -122,15 +122,12 @@ fn deleted_event(sandbox_id: String) -> WatchSandboxesEvent {
 /// drops (daemon restart, socket error, or clean shutdown), the stream
 /// terminates with a final error item and stops producing events.
 ///
-/// Callers are responsible for reconnecting by calling [`start_watch`] again.
-/// The server's `ComputeRuntime::watch_loop` in `openshell-server` provides
-/// this behaviour with a 2-second backoff: when the stream terminates with an
-/// error, `watch_loop` sleeps and then calls `watch_sandboxes()` again, which
-/// ultimately calls `start_watch()` again and re-syncs state.
+/// Callers are responsible for reconnecting by calling [`start_watch`] again
+/// and re-synchronizing state.
 ///
 /// **Do not add reconnection logic inside this function.**  A local reconnect
-/// would race with `watch_loop`'s retry and produce duplicate initial-sync
-/// events that corrupt the server's sandbox index.
+/// would race with the consumer's retry and produce duplicate initial-sync
+/// events.
 pub async fn start_watch(
     client: PodmanClient,
     lifecycle_event_fences: LifecycleEventFences,

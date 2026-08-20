@@ -28,7 +28,7 @@ Sandbox community images are built outside this repository.
 Anonymous telemetry emission is gated behind a default-on `telemetry` Cargo
 feature. It is defined in `openshell-core` (where the emission code, HTTP
 client, and endpoint live) and forwarded by the binary crates that emit or
-collect telemetry: `openshell-server` (gateway), `openshell-sandbox`
+collect telemetry: `openshell-gateway`, `openshell-sandbox`
 (supervisor), and `openshell-driver-vm`. Every crate depends on
 `openshell-core` with `default-features = false`, so the binary crate's feature
 is the single switch that enables `openshell-core/telemetry` for its build

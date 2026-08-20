@@ -311,7 +311,7 @@ fi
 
 echo "==> Building openshell-gateway and openshell-driver-vm"
 cargo build ${CARGO_BUILD_JOBS_ARG[@]+"${CARGO_BUILD_JOBS_ARG[@]}"} \
-  -p openshell-server -p openshell-driver-vm
+  -p openshell-gateway -p openshell-driver-vm
 
 if [ "$(uname -s)" = "Darwin" ]; then
   echo "==> Codesigning openshell-driver-vm (Hypervisor entitlement)"
