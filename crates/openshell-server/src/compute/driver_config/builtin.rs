@@ -192,6 +192,62 @@ service_account_name = "sandbox-sa"
         let cfg = kubernetes_config_for_k8s_sa_bootstrap(Some(&file)).unwrap();
         assert_eq!(cfg.namespace, "sandboxes");
         assert_eq!(cfg.service_account_name, "sandbox-sa");
+        assert!(cfg.additional_bootstrap_service_account_names.is_empty());
+    }
+
+    /// The TOML key the Helm chart renders must reach the field the bootstrap
+    /// authenticator reads. `KubernetesComputeConfig` denies unknown fields, so
+    /// a key/field mismatch would refuse to start every gateway in a fleet.
+    #[test]
+    fn k8s_sa_bootstrap_reads_additional_service_accounts_from_driver_table() {
+        let file: config_file::ConfigFile = toml::from_str(
+            r#"
+[openshell.gateway]
+
+[openshell.drivers.kubernetes]
+namespace = "sandboxes"
+service_account_name = "sandbox-sa"
+additional_bootstrap_service_account_names = ["sandbox-alt", "sandbox-legacy"]
+selectable_service_account_names = ["sandbox-selectable"]
+"#,
+        )
+        .expect("valid config");
+
+        let cfg = kubernetes_config_for_k8s_sa_bootstrap(Some(&file)).unwrap();
+        assert_eq!(
+            cfg.additional_bootstrap_service_account_names,
+            vec!["sandbox-alt".to_string(), "sandbox-legacy".to_string()]
+        );
+
+        assert_eq!(
+            cfg.selectable_service_account_names,
+            vec!["sandbox-selectable".to_string()]
+        );
+
+        let validator = crate::auth::k8s_sa::ServiceAccountValidator::from_kubernetes_config(&cfg);
+        assert!(
+            validator.accepts("sandbox-sa"),
+            "pod default stays accepted"
+        );
+        assert!(validator.accepts("sandbox-alt"));
+        assert!(validator.accepts("sandbox-legacy"));
+        assert!(
+            validator.accepts("sandbox-selectable"),
+            "an account a caller may select has to authenticate"
+        );
+        assert!(!validator.accepts("sandbox-other"));
+
+        // The selectable key governs what a caller may ask for; the
+        // bootstrap-only key must not.
+        assert_eq!(
+            cfg.resolve_pod_service_account(Some("sandbox-selectable"))
+                .unwrap(),
+            "sandbox-selectable"
+        );
+        assert!(
+            cfg.resolve_pod_service_account(Some("sandbox-alt"))
+                .is_err()
+        );
     }
 
     #[test]

@@ -210,7 +210,7 @@ Sandbox secrets are gateway-signed JWTs bound to a single sandbox ID. Docker,
 Podman, and VM drivers deliver the initial token through supervisor-only
 runtime material; Kubernetes supervisors exchange a projected ServiceAccount
 token through `IssueSandboxToken`. The gateway validates that projected token
-with Kubernetes `TokenReview`, requires the configured sandbox service account,
+with Kubernetes `TokenReview`, requires an accepted sandbox service account,
 checks the returned pod binding against the live pod UID, and verifies the pod's
 controlling `Sandbox` ownerReference against the live Sandbox CR UID and
 sandbox-id label before minting the gateway JWT. The bootstrap path accepts

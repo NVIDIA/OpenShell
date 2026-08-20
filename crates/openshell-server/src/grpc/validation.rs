@@ -222,6 +222,7 @@ fn validate_sandbox_template(tmpl: &SandboxTemplate) -> Result<(), Status> {
         ("template.image", &tmpl.image),
         ("template.runtime_class_name", &tmpl.runtime_class_name),
         ("template.agent_socket", &tmpl.agent_socket),
+        ("template.service_account_name", &tmpl.service_account_name),
     ] {
         if value.len() > MAX_TEMPLATE_STRING_LEN {
             return Err(Status::invalid_argument(format!(
@@ -229,6 +230,18 @@ fn validate_sandbox_template(tmpl: &SandboxTemplate) -> Result<(), Status> {
                 value.len()
             )));
         }
+    }
+
+    // A requested ServiceAccount is echoed back in the driver's rejection and
+    // reaches the apiserver as `spec.serviceAccountName`, so reject anything
+    // Kubernetes could not have issued before it travels any further.
+    if !tmpl.service_account_name.is_empty()
+        && !openshell_driver_kubernetes::is_service_account_name(tmpl.service_account_name.trim())
+    {
+        return Err(Status::invalid_argument(
+            "template.service_account_name must be a valid Kubernetes ServiceAccount name \
+             (DNS-1123 subdomain, at most 253 characters)",
+        ));
     }
 
     // Map fields.
@@ -938,6 +951,42 @@ pub(super) fn level_matches(log_level: &str, min_level: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+
+    /// The requested name is echoed in the driver's rejection and reaches the
+    /// apiserver, so an over-long or malformed value must stop at the gateway.
+    #[test]
+    fn validate_sandbox_template_bounds_the_service_account_name() {
+        let long = SandboxTemplate {
+            service_account_name: "a".repeat(MAX_TEMPLATE_STRING_LEN + 1),
+            ..SandboxTemplate::default()
+        };
+        let err = validate_sandbox_template(&long).unwrap_err();
+        assert!(
+            err.message().contains("template.service_account_name"),
+            "{}",
+            err.message()
+        );
+
+        for bad in ["Openshell-Sandbox", "has space", "under_score", "   "] {
+            let tmpl = SandboxTemplate {
+                service_account_name: bad.to_string(),
+                ..SandboxTemplate::default()
+            };
+            let err = validate_sandbox_template(&tmpl).unwrap_err();
+            assert!(
+                err.message()
+                    .contains("valid Kubernetes ServiceAccount name"),
+                "{}",
+                err.message()
+            );
+        }
+
+        let ok = SandboxTemplate {
+            service_account_name: "openshell-sandbox-3".to_string(),
+            ..SandboxTemplate::default()
+        };
+        assert!(validate_sandbox_template(&ok).is_ok());
+    }
     use super::*;
     use openshell_core::proto::SandboxSpec;
     use std::collections::HashMap;

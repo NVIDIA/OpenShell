@@ -486,6 +486,9 @@ impl KubernetesComputeDriver {
         config
             .validate_upstream_proxy_config()
             .map_err(KubernetesDriverError::Precondition)?;
+        config
+            .validate_service_account_names()
+            .map_err(KubernetesDriverError::Precondition)?;
         let base_config = match kube::Config::incluster() {
             Ok(c) => c,
             Err(_) => kube::Config::infer()
@@ -1194,6 +1197,26 @@ impl KubernetesComputeDriver {
         }))
     }
 
+    /// Resolve the `ServiceAccount` for a sandbox's pod, logging a rejection.
+    ///
+    /// The log carries the selectable set and the rejection does not: an
+    /// operator needs to see which name was asked for and what the gateway
+    /// offers, while a caller only needs to know its own request was refused.
+    fn resolve_requested_service_account(&self, sandbox: &Sandbox) -> Result<String, String> {
+        let requested = requested_pod_service_account(sandbox);
+        self.config
+            .resolve_pod_service_account(requested.as_deref())
+            .inspect_err(|err| {
+                warn!(
+                    sandbox_id = %sandbox.id,
+                    requested_service_account = ?requested,
+                    selectable_service_accounts = ?self.config.selectable_pod_service_account_names(),
+                    error = %err,
+                    "rejected a sandbox ServiceAccount request that is not selectable"
+                );
+            })
+    }
+
     pub async fn validate_sandbox_create(&self, sandbox: &Sandbox) -> Result<(), tonic::Status> {
         let _ = self
             .validate_driver_config_for_sandbox(sandbox)
@@ -1207,6 +1230,11 @@ impl KubernetesComputeDriver {
                     .map_err(tonic::Status::invalid_argument)?;
             }
         }
+        // Reject an unselectable ServiceAccount here, before the gateway
+        // persists the sandbox record or mints its JWT, so nothing has to be
+        // rolled back. `create_sandbox` resolves the name again for the value.
+        self.resolve_requested_service_account(sandbox)
+            .map_err(tonic::Status::invalid_argument)?;
         let gpu_requirements = sandbox
             .spec
             .as_ref()
@@ -1352,6 +1380,14 @@ impl KubernetesComputeDriver {
         validate_kubernetes_dns1123_label(&sandbox.name, "sandbox name")
             .map_err(KubernetesDriverError::InvalidArgument)?;
 
+        // Resolved before any namespace or secret is created, so a request
+        // rejected here leaves nothing behind. The resolved name is always a
+        // member of the bootstrap authenticator's accepted set, because the
+        // selectable set is a subset of it.
+        let service_account_name = self
+            .resolve_requested_service_account(sandbox)
+            .map_err(KubernetesDriverError::InvalidArgument)?;
+
         let name = sandbox.name.as_str();
         let workspace = sandbox.workspace.as_str();
         self.validate_workspace_namespace(workspace)?;
@@ -1417,7 +1453,7 @@ impl KubernetesComputeDriver {
             proxy_auth_secret_key: self.config.proxy_auth_secret_key.as_deref(),
             proxy_auth_allow_insecure: self.config.proxy_auth_allow_insecure == Some(true),
             proxy_connect_by_hostname: self.config.proxy_connect_by_hostname == Some(true),
-            service_account_name: &self.config.service_account_name,
+            service_account_name: &service_account_name,
             sandbox_id: &sandbox.id,
             sandbox_name: &sandbox.name,
             grpc_endpoint: &self.config.grpc_endpoint,
@@ -3265,6 +3301,19 @@ impl Default for SandboxPodParams<'_> {
             sandbox_gid: DEFAULT_SANDBOX_UID,
         }
     }
+}
+
+/// The `ServiceAccount` a sandbox's template asked for, if it asked for one.
+///
+/// Split out from `create_sandbox` so the read is testable without a cluster:
+/// it is the only thing standing between a caller's request and the identity
+/// its pod runs as.
+fn requested_pod_service_account(sandbox: &Sandbox) -> Option<String> {
+    sandbox
+        .spec
+        .as_ref()
+        .and_then(|spec| spec.template.as_ref())
+        .and_then(|template| platform_config_string(template, "service_account_name"))
 }
 
 fn validate_sidecar_proxy_identity(
@@ -7068,6 +7117,90 @@ mod tests {
         assert_eq!(
             pod_template["metadata"]["labels"][LABEL_MANAGED_BY],
             serde_json::json!(LABEL_MANAGED_BY_VALUE)
+        );
+    }
+
+    fn sandbox_requesting_service_account(value: Option<Value>) -> Sandbox {
+        Sandbox {
+            id: "sandbox-123".to_string(),
+            spec: Some(SandboxSpec {
+                template: Some(SandboxTemplate {
+                    platform_config: value.map(|v| Struct {
+                        fields: std::iter::once(("service_account_name".to_string(), v)).collect(),
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// This read is the only thing between a caller's request and the identity
+    /// its pod runs as, so it is worth pinning on its own.
+    #[test]
+    fn requested_pod_service_account_reads_the_platform_config_key() {
+        let sandbox = sandbox_requesting_service_account(Some(Value {
+            kind: Some(Kind::StringValue("openshell-sandbox-3".to_string())),
+        }));
+
+        assert_eq!(
+            requested_pod_service_account(&sandbox).as_deref(),
+            Some("openshell-sandbox-3")
+        );
+    }
+
+    #[test]
+    fn requested_pod_service_account_is_none_when_unset() {
+        assert_eq!(requested_pod_service_account(&Sandbox::default()), None);
+        assert_eq!(
+            requested_pod_service_account(&sandbox_requesting_service_account(None)),
+            None
+        );
+    }
+
+    /// A non-string value must not read as a request, or a malformed one would
+    /// silently take the driver default.
+    #[test]
+    fn requested_pod_service_account_ignores_a_non_string_value() {
+        let sandbox = sandbox_requesting_service_account(Some(Value {
+            kind: Some(Kind::NumberValue(42.0)),
+        }));
+
+        assert_eq!(requested_pod_service_account(&sandbox), None);
+    }
+
+    /// The join between the read and the config: a selectable request lands on
+    /// the pod, a bootstrap-only one is refused.
+    #[test]
+    fn requested_service_account_resolves_against_the_selectable_set() {
+        let config = KubernetesComputeConfig {
+            service_account_name: "openshell-sandbox".to_string(),
+            additional_bootstrap_service_account_names: vec![
+                "openshell-sandbox-external".to_string(),
+            ],
+            selectable_service_account_names: vec!["openshell-sandbox-3".to_string()],
+            ..Default::default()
+        };
+        let requested = |name: &str| {
+            let sandbox = sandbox_requesting_service_account(Some(Value {
+                kind: Some(Kind::StringValue(name.to_string())),
+            }));
+            config.resolve_pod_service_account(requested_pod_service_account(&sandbox).as_deref())
+        };
+
+        assert_eq!(
+            requested("openshell-sandbox-3").unwrap(),
+            "openshell-sandbox-3"
+        );
+        assert!(requested("openshell-sandbox-external").is_err());
+        assert_eq!(
+            config
+                .resolve_pod_service_account(
+                    requested_pod_service_account(&Sandbox::default()).as_deref()
+                )
+                .unwrap(),
+            "openshell-sandbox"
         );
     }
 
