@@ -18,18 +18,31 @@
 use super::authenticator::Authenticator;
 use super::principal::{Principal, SandboxIdentitySource, SandboxPrincipal};
 use async_trait::async_trait;
+#[cfg(not(target_os = "windows"))]
+use k8s_openapi::api::authentication::v1::{TokenReview, TokenReviewSpec};
+#[cfg(any(not(target_os = "windows"), test))]
 use k8s_openapi::api::{
-    authentication::v1::{TokenReview, TokenReviewSpec, TokenReviewStatus, UserInfo},
+    authentication::v1::{TokenReviewStatus, UserInfo},
     core::v1::Pod,
 };
+#[cfg(any(not(target_os = "windows"), test))]
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
+#[cfg(any(not(target_os = "windows"), test))]
 use kube::Error as KubeError;
-use kube::api::{Api, ApiResource, PostParams};
-use kube::core::{DynamicObject, gvk::GroupVersionKind};
+#[cfg(any(not(target_os = "windows"), test))]
+use kube::api::ApiResource;
+#[cfg(not(target_os = "windows"))]
+use kube::api::{Api, PostParams};
+#[cfg(any(not(target_os = "windows"), test))]
+use kube::core::DynamicObject;
+#[cfg(any(not(target_os = "windows"), test))]
+use kube::core::gvk::GroupVersionKind;
 use openshell_driver_kubernetes::OperatorNamespaceAllowlist;
 use std::sync::Arc;
 use tonic::Status;
-use tracing::{debug, info, warn};
+#[cfg(not(target_os = "windows"))]
+use tracing::info;
+use tracing::{debug, warn};
 
 /// gRPC method path that this authenticator accepts. All other paths fall
 /// through (return `Ok(None)`) so a gateway-minted JWT is required there.
@@ -40,15 +53,25 @@ pub const ISSUE_SANDBOX_TOKEN_PATH: &str = "/openshell.v1.OpenShell/IssueSandbox
 /// annotation only after validating the pod's `TokenReview` binding, live UID,
 /// and owning Sandbox CR. The K8s `Role` granted to the gateway must not
 /// include `patch pods` (see plan §11.8).
+#[cfg(any(not(target_os = "windows"), test))]
 pub const SANDBOX_ID_ANNOTATION: &str = "openshell.io/sandbox-id";
+#[cfg(any(not(target_os = "windows"), test))]
 const SANDBOX_API_GROUP: &str = "agents.x-k8s.io";
+#[cfg(any(not(target_os = "windows"), test))]
 const SANDBOX_API_VERSION_V1BETA1: &str = "v1beta1";
+#[cfg(not(target_os = "windows"))]
 const SANDBOX_API_VERSION_V1ALPHA1: &str = "v1alpha1";
+#[cfg(any(not(target_os = "windows"), test))]
 const SANDBOX_API_VERSION_FULL_V1BETA1: &str = "agents.x-k8s.io/v1beta1";
+#[cfg(any(not(target_os = "windows"), test))]
 const SANDBOX_API_VERSION_FULL_V1ALPHA1: &str = "agents.x-k8s.io/v1alpha1";
+#[cfg(any(not(target_os = "windows"), test))]
 const SANDBOX_KIND: &str = "Sandbox";
+#[cfg(any(not(target_os = "windows"), test))]
 const SANDBOX_ID_LABEL: &str = "openshell.ai/sandbox-id";
+#[cfg(any(not(target_os = "windows"), test))]
 const POD_NAME_EXTRA: &str = "authentication.kubernetes.io/pod-name";
+#[cfg(any(not(target_os = "windows"), test))]
 const POD_UID_EXTRA: &str = "authentication.kubernetes.io/pod-uid";
 
 /// Resolved identity extracted from a validated SA token + pod lookup.
@@ -160,6 +183,7 @@ impl NamespaceValidator {
 }
 
 #[derive(Debug)]
+#[cfg(any(not(target_os = "windows"), test))]
 struct TokenReviewIdentity {
     namespace: String,
     pod_name: String,
@@ -167,6 +191,7 @@ struct TokenReviewIdentity {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg(any(not(target_os = "windows"), test))]
 struct SandboxOwnerReference {
     api_version: String,
     name: String,
@@ -175,6 +200,7 @@ struct SandboxOwnerReference {
 
 /// Resolver backed by the apiserver's `TokenReview` API and `kube::Client`
 /// for the per-pod annotation lookup.
+#[cfg(not(target_os = "windows"))]
 pub struct LiveK8sResolver {
     client: kube::Client,
     token_reviews_api: Api<TokenReview>,
@@ -183,6 +209,7 @@ pub struct LiveK8sResolver {
     expected_service_account: String,
 }
 
+#[cfg(not(target_os = "windows"))]
 impl LiveK8sResolver {
     pub fn new(
         client: kube::Client,
@@ -236,6 +263,7 @@ impl LiveK8sResolver {
 }
 
 #[async_trait]
+#[cfg(not(target_os = "windows"))]
 impl K8sIdentityResolver for LiveK8sResolver {
     async fn resolve(&self, token: &str) -> Result<Option<ResolvedK8sIdentity>, Status> {
         let review = TokenReview {
@@ -342,6 +370,7 @@ impl K8sIdentityResolver for LiveK8sResolver {
 }
 
 #[allow(clippy::result_large_err)]
+#[cfg(any(not(target_os = "windows"), test))]
 fn token_review_identity(
     status: &TokenReviewStatus,
     expected_audience: &str,
@@ -425,6 +454,7 @@ fn parse_sa_username(username: &str) -> Option<(String, String)> {
 }
 
 #[allow(clippy::result_large_err)]
+#[cfg(any(not(target_os = "windows"), test))]
 fn user_extra_one(user: &UserInfo, key: &str) -> Result<String, Status> {
     let Some(values) = user.extra.as_ref().and_then(|extra| extra.get(key)) else {
         return Err(Status::permission_denied("SA token is not pod-bound"));
@@ -438,6 +468,7 @@ fn user_extra_one(user: &UserInfo, key: &str) -> Result<String, Status> {
 }
 
 #[allow(clippy::result_large_err)]
+#[cfg(any(not(target_os = "windows"), test))]
 fn pod_sandbox_id(pod: &Pod) -> Result<String, Status> {
     let sandbox_id = pod
         .metadata
@@ -455,6 +486,7 @@ fn pod_sandbox_id(pod: &Pod) -> Result<String, Status> {
 }
 
 #[allow(clippy::result_large_err)]
+#[cfg(any(not(target_os = "windows"), test))]
 fn sandbox_owner_reference(pod: &Pod) -> Result<SandboxOwnerReference, Status> {
     let owner_refs = pod.metadata.owner_references.as_deref().unwrap_or_default();
     let mut sandbox_refs = owner_refs
@@ -502,6 +534,7 @@ fn sandbox_owner_reference(pod: &Pod) -> Result<SandboxOwnerReference, Status> {
     })
 }
 
+#[cfg(any(not(target_os = "windows"), test))]
 fn is_supported_sandbox_owner_reference(
     owner: &k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference,
 ) -> bool {
@@ -512,6 +545,7 @@ fn is_supported_sandbox_owner_reference(
         )
 }
 
+#[cfg(any(not(target_os = "windows"), test))]
 fn should_try_next_sandbox_api_version(err: &KubeError) -> bool {
     // Kubernetes returns a structured 404 for some missing API resources and a
     // raw "404 page not found" body for others. Both mean the probed
@@ -521,6 +555,7 @@ fn should_try_next_sandbox_api_version(err: &KubeError) -> bool {
 }
 
 #[allow(clippy::result_large_err)]
+#[cfg(any(not(target_os = "windows"), test))]
 fn validate_sandbox_owner_reference(
     owner: &SandboxOwnerReference,
     sandbox_id: &str,

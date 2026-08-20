@@ -48,11 +48,18 @@ creating misleading Windows driver artifacts.
 
 ## Mise Lane
 
-The GitHub Actions workflow is manually dispatched. Each architecture restores
-and saves a dedicated Rust cache containing the Cargo registry and dependency
-build artifacts, including artifacts from failed runs. Keep the workflow manual
-until cache-hit runtimes demonstrate that it is suitable for pull requests and
-merges to `main`.
+The GitHub Actions workflow runs Clippy for the Windows gateway, core, and CLI
+crates plus Rust tests for pull-request mirror branches and merge queues. On
+pushes to `main`, a cache-seed job runs the same lint and test commands before a
+dependent job builds the release binaries. Manual dispatches exercise the same
+seed-then-build path. The binaries remain CI validation artifacts and are not
+uploaded or published.
+
+Each job restores and saves a dedicated Rust cache containing the Cargo
+registry and dependency build artifacts, including artifacts from failed runs.
+The seed job and pull-request job use the same Cargo target and sccache
+namespaces. The release build waits for the seed job, then restores its newly
+warmed cache rather than compiling concurrently from a cold cache.
 
 Windows validation is exposed through `tasks/windows.toml`:
 
@@ -71,8 +78,10 @@ Windows validation is exposed through `tasks/windows.toml`:
 The Windows tasks call `tasks/scripts/windows-msvc.ps1`. The wrapper discovers
 Visual Studio's `VsDevCmd.bat` with `vswhere` or by enumerating installed
 release directories, validates the requested compiler and ARM64 Spectre
-libraries, adds rustup MSVC targets, clears inherited `RUSTC_WRAPPER`, and
-keeps build artifacts under the normal Cargo target tree.
+libraries, adds rustup MSVC targets, preserves an inherited `RUSTC_WRAPPER`
+when the command is available, and keeps build artifacts under the normal
+Cargo target tree. If the wrapper command is unavailable, it warns and clears
+the setting so local builds continue without compiler caching.
 On Windows, the generic `rust:check`, `rust:lint`, and `test:rust` tasks call
 the same wrapper with the host-native MSVC target. The wrapper preserves the
 Unix Cargo commands on Linux and macOS, excludes unsupported Windows runtime
@@ -84,20 +93,23 @@ packaging-asset tests; its
 cross-platform Python, Markdown, license, and documentation checks still run.
 Test tasks require the Rust target architecture to match the Windows host, so
 an ARM64 test result is native coverage rather than x64 emulation coverage.
-By default it enables bundled Z3 for reproducible Windows builds. When
+By default it enables the `z3-sys` prebuilt-release feature and pins Z3 4.16.0.
+On a clean target directory, `z3-sys` downloads the official static library for
+the selected Windows architecture instead of compiling Z3 through
+CMake/MSBuild. GitHub Actions supplies its read-only workflow token for the
+release lookup, and the Cargo target cache preserves the extracted library for
+subsequent runs. When
 `Z3_LIBRARY_PATH_OVERRIDE` points at a directory containing `libz3.lib`, the
 wrapper uses that system Z3 instead and requires `Z3_SYS_Z3_HEADER` to point at
-the full path to `z3.h`. For bundled builds, the wrapper fetches the Z3 source
-revision pinned by `z3-sys` through Git and sets
-`Z3_SYS_BUNDLED_DIR_OVERRIDE`. When `CARGO_TARGET_DIR` is explicit, the wrapper
-uses it for the source cache. Otherwise, it caches under the current user's
-local application data directory, outside the checkout. Publishing uses an
-atomic directory rename so concurrent x64 and ARM64 commands can share the
-cache safely. This keeps downloaded sources outside the checkout by default and
-avoids the unauthenticated GitHub API lookup in the `z3-sys` build script, which
-can fail with HTTP 403 when a shared runner or developer network exhausts its
-API rate limit. An explicitly set `Z3_SYS_BUNDLED_DIR_OVERRIDE` remains
-supported and must contain `src/api/z3.h`.
+the full path to `z3.h`. Local clean builds use the unauthenticated GitHub API
+unless `READ_ONLY_GITHUB_TOKEN` is set.
+
+GitHub Actions layers the Cargo target cache with sccache's GitHub Actions
+backend. The target cache lets Cargo skip intact dependency builds; sccache
+recovers cacheable Rust compiler outputs when source changes invalidate part of
+that target tree. CI enables client-side mode and normalizes the checkout root
+for stable compiler cache keys. The target-cache action runs its metadata step
+with `RUSTC_WRAPPER` cleared so cache maintenance does not depend on sccache.
 
 The lane uses `mise run --skip-tools windows:*` because Windows Rust comes from
 rustup and linking comes from Visual Studio Build Tools. Mise orchestrates the
@@ -108,45 +120,50 @@ Spectre-mitigated libraries, host-native Clang tools, CMake tools, and an
 ARM64-capable Windows SDK. Clang provides `libclang.dll` for `bindgen` and
 `clang-cl.exe` for ARM64 crypto dependencies. During x64-to-ARM64 check/build,
 the wrapper discovers and adds the Visual Studio-bundled Ninja to `PATH` for
-native dependencies. It lets `cmake-rs` select the Visual Studio ARM64
-generator with native MSVC `cl.exe` for bundled Z3 so the Z3 build does not
-inherit the crypto crates' compiler requirement. Z3 stays on the Visual Studio
-generator because `z3-sys` emits an MSBuild-only `-m` argument that Ninja
-rejects. Artifact hashing uses .NET SHA256 directly because module autoloading
-in the mise-launched Windows PowerShell process is not guaranteed.
+native dependencies. Z3 uses the official prebuilt ARM64 static library, so it
+does not inherit compiler settings from those native dependencies. Artifact
+hashing uses .NET SHA256 directly because module autoloading in the
+mise-launched Windows PowerShell process is not guaranteed.
 
 The wrapper defaults Cargo compilation to four jobs. Set
 `OPENSHELL_WINDOWS_BUILD_JOBS` to a positive integer to override that limit.
 A host-local mutex serializes wrapper-owned Cargo commands so concurrent
-pre-commit tasks do not multiply the process count while bundled Z3 compiles.
+pre-commit tasks do not multiply the compiler process count.
 The wrapper does not set `CL` or `_CL_`: those variables are also consumed by
 `clang-cl`, where MSVC's `/MP` option can be interpreted as an input file and
 break ARM64 crypto dependency builds.
 
 ## CI Shape
 
-The x64 GitHub Actions job runs on `windows-2025` and executes:
+The x64 GitHub Actions jobs run on `windows-2025`. Pull-request mirrors and
+merge queues execute:
 
 ```powershell
-mise run --skip-tools windows:check:x64
-mise run --skip-tools windows:build:x64
-mise run --skip-tools windows:test:x64
-mise run --skip-tools windows:test:unsupported:x64
+cargo clippy -p openshell-server -p openshell-core -p openshell-cli --all-targets --no-deps --features openshell-prover/prebuilt-z3 -- -D warnings
+mise run --skip-tools test:rust
 ```
 
-The cache is partitioned by architecture so incompatible x64 and ARM64 target
-artifacts cannot collide. It does not cache Cargo-installed binaries, which
-also keeps the disabled self-hosted ARM64 scaffold from modifying persistent
-runner tooling.
+Pushes to `main` and manual dispatches first seed the shared caches with those
+same lint and test commands. After the seed succeeds, a separate job executes:
+
+```powershell
+mise run --skip-tools windows:build:x64
+```
+
+The server test-support suite includes the unsupported-driver contract test, so
+CI does not run the focused test task a second time. The focused task remains
+available for local diagnosis.
+
+The hosted workflow uses an x64-specific cache namespace and does not cache
+Cargo-installed binaries.
 
 The local aggregate `windows:ci` task cross-builds ARM64 on an x64 host. The
-GitHub x64 job currently runs only the x64 tasks, and native ARM64 tests remain
-exclusive to an ARM64 runner.
+GitHub x64 job runs only the x64 tasks, and native ARM64 tests remain exclusive
+to an ARM64 runner.
 
-The ARM64 job is scaffolded but disabled until a Windows ARM64 runner is
-available. Once enabled, it should run check, release build, native workspace
-tests, and the focused unsupported-driver contracts for
-`aarch64-pc-windows-msvc`.
+GitHub Actions currently runs only x64. ARM64 remains available through the
+local `windows:*:arm64` tasks and requires a separate native workflow when the
+project is ready to enable hosted ARM64 validation.
 
 ## Validation Contract
 

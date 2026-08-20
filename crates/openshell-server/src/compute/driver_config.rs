@@ -11,6 +11,7 @@
 pub mod builtin;
 
 use crate::config_file;
+#[cfg(not(target_os = "windows"))]
 use crate::defaults::LocalTlsPaths;
 use openshell_core::{Error, Result};
 use serde::Deserialize;
@@ -18,12 +19,14 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg(not(target_os = "windows"))]
 pub struct GuestTlsPaths {
     ca: PathBuf,
     cert: PathBuf,
     key: PathBuf,
 }
 
+#[cfg(not(target_os = "windows"))]
 impl From<&LocalTlsPaths> for GuestTlsPaths {
     fn from(paths: &LocalTlsPaths) -> Self {
         Self {
@@ -37,8 +40,11 @@ impl From<&LocalTlsPaths> for GuestTlsPaths {
 #[derive(Clone, Copy)]
 pub struct DriverStartupContext<'a> {
     pub file: Option<&'a config_file::ConfigFile>,
+    #[cfg(not(target_os = "windows"))]
     pub guest_tls: Option<&'a GuestTlsPaths>,
+    #[cfg(not(target_os = "windows"))]
     pub gateway_port: u16,
+    #[cfg(not(target_os = "windows"))]
     pub gateway_tls_enabled: bool,
     pub endpoint_overrides: &'a BTreeMap<String, PathBuf>,
 }
@@ -125,8 +131,11 @@ mod tests {
     ) -> DriverStartupContext<'a> {
         DriverStartupContext {
             file,
+            #[cfg(not(target_os = "windows"))]
             guest_tls: None,
+            #[cfg(not(target_os = "windows"))]
             gateway_port: openshell_core::config::DEFAULT_SERVER_PORT,
+            #[cfg(not(target_os = "windows"))]
             gateway_tls_enabled: false,
             endpoint_overrides,
         }

@@ -28,7 +28,7 @@ The Windows build lane is implemented by these tracked files:
 | `tasks/windows.toml` | Mise task entry points for `windows:*` commands. |
 | `tasks/rust.toml`, `tasks/test.toml`, and `tasks/markdown.toml` | Windows routing for compiler-bearing checks, explicit Unix-only test skips, and Markdown dependency setup. |
 | `tasks/scripts/windows-msvc.ps1` | PowerShell wrapper that enters the Visual Studio developer environment and invokes Cargo. |
-| `.github/workflows/windows-msvc.yml` | Manually dispatched GitHub Actions jobs with architecture-specific Rust caches for x64 and future ARM64 Windows validation. |
+| `.github/workflows/windows-msvc.yml` | PR/merge-queue x64 lint and test, main cache seeding, and dependent x64 binary-build jobs. ARM64 remains a local task until it gets a native workflow. |
 | `architecture/windows-msvc-build.md` | Design notes and validation contract. |
 | `.agents/skills/build-openshell-mxc-windows/` | This skill and companion reference material. |
 
@@ -113,7 +113,7 @@ The lane targets a Windows host with Visual Studio Build Tools and rustup.
 | Visual C++ ARM64 tools | `vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.ARM64 -property installationPath` | Required for native ARM64 check, build, and tests and for x64-to-ARM64 check/build. Tests always require a native runner. |
 | Visual C++ ARM64 Spectre-mitigated libraries | `vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Runtimes.ARM64.Spectre -property installationPath` | Required by `regorus` through `msvc_spectre_libs`; the build fails when the selected MSVC toolset lacks `lib\spectre\arm64`. |
 | Visual C++ Clang tools | `vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Llvm.Clang -property installationPath` | Provides host-native `libclang.dll` for `bindgen` and `clang-cl.exe` for ARM64 crypto dependencies such as `ring` and `aws-lc-sys`. On ARM64, the wrapper uses `VC\Tools\Llvm\Arm64\bin`. |
-| Visual C++ CMake tools | `vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.CMake.Project -property installationPath` | Provides CMake and Ninja. The x64-to-ARM64 path adds Ninja to `PATH` for native dependencies but keeps bundled Z3 on CMake's Visual Studio ARM64 generator with native MSVC `cl.exe`. |
+| Visual C++ CMake tools | `vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.CMake.Project -property installationPath` | Provides CMake and Ninja for native dependencies. The x64-to-ARM64 path adds Ninja to `PATH`; Z3 uses an architecture-specific prebuilt release. |
 | Windows SDK | `where.exe rc.exe` from a Developer PowerShell | Install an SDK containing target libraries and ARM64 tools. |
 | Rust via rustup | `rustc --version` | Add each target being validated: `x86_64-pc-windows-msvc` and/or `aarch64-pc-windows-msvc`. The wrapper also adds the selected target. |
 | mise | `mise --version` | Used as a task runner only. |
@@ -133,8 +133,9 @@ from this skill.
 | `CARGO_TARGET_DIR` | `target` under repo root | Override Cargo output location. Use a short absolute path when x64-to-ARM64 builds approach Windows path-length limits. |
 | `Z3_LIBRARY_PATH_OVERRIDE` | unset | Directory containing an x64 system `libz3.lib`; not valid for ARM64. |
 | `Z3_SYS_Z3_HEADER` | unset | Full `z3.h` path required with a system Z3 library. |
-| `Z3_SYS_BUNDLED_DIR_OVERRIDE` | pinned source cached under `CARGO_TARGET_DIR` when explicit, otherwise `%LOCALAPPDATA%\OpenShell\cache\z3` | Use an existing Z3 source tree containing `src/api/z3.h`; otherwise the wrapper fetches the pinned revision through Git and sets this automatically. |
-| `RUSTC_WRAPPER` | cleared by wrapper | The wrapper clears inherited values because `--skip-tools` does not provision `sccache`. |
+| `Z3_SYS_Z3_VERSION` | `4.16.0` | Pinned official prebuilt Z3 release selected by the wrapper. |
+| `READ_ONLY_GITHUB_TOKEN` | unset | Optional token for the Z3 release lookup; GitHub Actions supplies `github.token`. |
+| `RUSTC_WRAPPER` | inherited | The wrapper resolves an available command to an absolute path. If it is unavailable, the wrapper warns and continues without compiler caching. |
 
 Legacy fork variables such as `OPENSHELL_UPSTREAM`,
 `OPENSHELL_MXC_FORK_DIR`, and `OPENSHELL_MXC_FORK_BRANCH` are no longer part
@@ -187,17 +188,19 @@ order:
 6. Focused unsupported-driver contract tests.
 7. Artifact reporting.
 
-The GitHub Actions jobs use architecture-specific `Swatinem/rust-cache`
-entries for the Cargo registry and dependency target artifacts. Failed runs
-also save their usable dependency artifacts. The workflow remains manually
-dispatched until cache-hit runtimes justify restoring automatic triggers.
+The GitHub Actions jobs layer architecture-specific `Swatinem/rust-cache`
+entries for Cargo registry and dependency target artifacts with sccache's GHA
+backend for cacheable Rust compiler outputs. Failed runs also save their usable
+dependency artifacts. Pull-request mirrors and merge queues run Clippy for the
+Windows gateway, core, and CLI crates plus Rust tests. Pushes to `main` and
+manual dispatches run the same lint and test commands in a cache-seed job,
+followed by a dependent release-binary build job. The seed and PR jobs use the
+same cache namespaces. The binaries are not uploaded or published.
 
 The ARM64 check/build steps in this x64-host contract are cross-builds. The
 wrapper discovers and adds host-native LLVM and Ninja to `PATH`, requires the
 ARM64 compiler and Spectre-mitigated libraries, lets ARM64 crypto crates select
-`clang-cl`, and keeps bundled Z3 on native MSVC `cl.exe` with CMake's Visual
-Studio ARM64 generator. Z3 does not use Ninja because `z3-sys 0.10.9` passes
-the MSBuild-only `-m` argument.
+`clang-cl`, and downloads the official prebuilt ARM64 Z3 static library.
 
 On ARM64 hosts, validate the native ARM64 check, build, and test path. The
 wrapper rejects test targets that do not match the host architecture, so x64
@@ -207,7 +210,8 @@ commands above on an ARM64 host.
 
 The repository-wide `mise run pre-commit` task is also supported on Windows.
 Its Rust check, Clippy, and test dependencies enter the same MSVC environment
-for the native host target and clear inherited `RUSTC_WRAPPER`. Linux glibc
+for the native host target and use an inherited compiler wrapper when it is
+available. Linux glibc
 installer tests and Linux service/RPM packaging-asset tests skip explicitly;
 the Linux build-environment shell-helper test also skips; cross-platform checks
 continue to run. The blocking Windows Clippy pass excludes unsupported
@@ -259,9 +263,9 @@ The focused contract tasks for either native architecture run:
 windows_builtin_compute_drivers_report_unsupported
 ```
 
-These tests are also included in the full x64 workspace test run; the focused
-task intentionally re-runs them so unsupported Windows behavior is visible in
-the CI report.
+These tests are also included in the full x64 workspace test run. The focused
+task is available for local diagnosis; GitHub Actions does not re-run it after
+the full suite.
 
 ## Test Accounting Guidance
 
@@ -291,19 +295,13 @@ Useful log files:
 | `test-x86_64-pc-windows-msvc-unsupported-*.log` | Focused unsupported-driver contract output. |
 | `test-aarch64-pc-windows-msvc-unsupported-*.log` | Focused native ARM64 contract output. |
 
-The first bundled-Z3 check or test can spend several minutes in CMake/MSBuild
-without much console output because Cargo output is redirected to the log. Look
-for native `MSBuild.exe` workers before treating the process as stalled. The
-wrapper fetches the pinned Z3 source through Git before Cargo starts. It caches
-under an explicitly configured `CARGO_TARGET_DIR`, or under the current user's
-local application data directory when Cargo uses its default target tree.
-Concurrent commands publish the validated source through an atomic directory
-rename, so x64 and ARM64 validation can share the cache safely. The wrapper does
-not rely on the rate-limited GitHub Contents API used by `z3-sys`. A failed
-fetch reports the partial checkout path for diagnosis. The artifact report
-computes SHA256 through .NET directly and does not rely on the
-`Get-FileHash` module being available inside the mise-launched Windows
-PowerShell process.
+The first check downloads the pinned official Z3 archive for the target
+architecture through `z3-sys`. GitHub Actions authenticates the lookup with its
+read-only workflow token; local users can set `READ_ONLY_GITHUB_TOKEN` if an
+unauthenticated lookup is rate-limited. Cargo stores the extracted library in
+its target tree, so the Windows target cache reuses it. The artifact report
+computes SHA256 through .NET directly and does not rely on the `Get-FileHash`
+module being available inside the mise-launched Windows PowerShell process.
 
 ## Common Fix Patterns
 
