@@ -79,6 +79,14 @@ fn unique_name(prefix: &str) -> String {
     format!("{prefix}-{suffix:06}")
 }
 
+fn output_contains(output: &str, needle: &str) -> bool {
+    output.to_lowercase().contains(&needle.to_lowercase())
+}
+
+fn output_mentions_template_not_found(output: &str) -> bool {
+    output_contains(output, "sandbox template") && output_contains(output, "not found")
+}
+
 #[tokio::test]
 async fn sandbox_create_from_template_uses_reusable_workload() {
     let template_name = unique_name("tmpl");
@@ -170,4 +178,98 @@ async fn sandbox_create_from_template_uses_reusable_workload() {
 
     sandbox.cleanup().await;
     template.cleanup().await;
+}
+
+#[tokio::test]
+async fn sandbox_template_get_after_delete_returns_not_found() {
+    let template_name = unique_name("tmpl-del");
+    let template = TemplateGuard::new(template_name.clone());
+
+    let create_template = run_cli(&["sandbox", "template", "create", &template_name]).await;
+    assert!(
+        create_template.success,
+        "sandbox template create failed:\n{}",
+        create_template.output
+    );
+
+    let delete_template = run_cli(&["sandbox", "template", "delete", &template_name]).await;
+    assert!(
+        delete_template.success,
+        "sandbox template delete failed:\n{}",
+        delete_template.output
+    );
+
+    let get_deleted = run_cli(&["sandbox", "template", "get", &template_name]).await;
+    assert!(
+        !get_deleted.success,
+        "deleted template should not be fetchable:\n{}",
+        get_deleted.output
+    );
+    assert!(
+        output_mentions_template_not_found(&get_deleted.output),
+        "deleted template should return not-found:\n{}",
+        get_deleted.output
+    );
+
+    template.cleanup().await;
+}
+
+#[tokio::test]
+async fn sandbox_template_create_rejects_duplicate_name() {
+    let template_name = unique_name("tmpl-dupe");
+    let template = TemplateGuard::new(template_name.clone());
+
+    let create_template = run_cli(&["sandbox", "template", "create", &template_name]).await;
+    assert!(
+        create_template.success,
+        "sandbox template create failed:\n{}",
+        create_template.output
+    );
+
+    let duplicate = run_cli(&["sandbox", "template", "create", &template_name]).await;
+    assert!(
+        !duplicate.success,
+        "duplicate sandbox template create should fail:\n{}",
+        duplicate.output
+    );
+    assert!(
+        output_contains(&duplicate.output, "already exists"),
+        "duplicate sandbox template create should report already-exists:\n{}",
+        duplicate.output
+    );
+
+    template.cleanup().await;
+}
+
+#[tokio::test]
+async fn sandbox_create_from_missing_template_returns_not_found() {
+    let template_name = unique_name("tmpl-missing");
+    let sandbox_name = unique_name("sb-missing");
+
+    let create_sandbox = run_cli(&[
+        "sandbox",
+        "create",
+        "--name",
+        &sandbox_name,
+        "--template",
+        &template_name,
+        "--",
+        "true",
+    ])
+    .await;
+
+    if create_sandbox.success {
+        let _ = run_cli(&["sandbox", "delete", &sandbox_name]).await;
+    }
+
+    assert!(
+        !create_sandbox.success,
+        "sandbox create from missing template should fail:\n{}",
+        create_sandbox.output
+    );
+    assert!(
+        output_mentions_template_not_found(&create_sandbox.output),
+        "sandbox create from missing template should report not-found:\n{}",
+        create_sandbox.output
+    );
 }
