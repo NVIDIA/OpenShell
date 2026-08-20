@@ -317,19 +317,28 @@ default WAL journal mode), which mirror the same sensitive contents.
 
 Persisted state includes sandboxes, providers, provider credential refresh
 state, SSH sessions, policy revisions, settings, inference configuration, and
-deployment records. Provider refresh material is stored as a separate object
-scoped to the provider instance through `objects.scope`; the provider record
-keeps only the current injectable credential values and optional per-credential
-expiry timestamps. A refresh normally mints one credential, but a strategy may
+deployment records. Provider refresh state is stored as a separate object
+scoped to the provider instance through `objects.scope`. Its non-secret
+configuration remains inline, while refresh tokens, client secrets, private
+keys, and other secret source material are stored through the active credential
+driver and represented by opaque handles. The provider record keeps only the
+current injectable credential handles and optional per-credential expiry
+timestamps. A refresh normally mints one credential, but a strategy may
 co-mint several (AWS STS mints the access key, secret key, and session token in
 one call); the refresh state pins the resolved set of env keys it owns so
 collision checks reserve all of them before the first mint. Provider records
 keep inline credential values only for legacy records created before credential
-driver storage. New provider writes keep driver-owned credential handles. When
-no external credential driver is configured, gateways use server-owned encrypted
-database credential storage for defense in depth. Multi-replica deployments can
-use that default with a shared database and shared key-encryption key, or opt
-into an external backend such as Vault or Kubernetes Secrets.
+driver storage. New provider and refresh-material writes keep driver-owned
+credential handles. When no external credential driver is configured, gateways
+use server-owned encrypted database credential storage for defense in depth.
+Multi-replica deployments can use that default with a shared database and
+shared key-encryption key, or opt into an external backend such as Vault or
+Kubernetes Secrets.
+
+Credential handles remain bound to the driver that created them. Before the
+0.1.0 compatibility boundary, gateways do not migrate inline refresh material
+or move handles between credential drivers; operators reconfigure affected
+grants when upgrading or changing backends.
 
 ### Optimistic Concurrency (CAS)
 

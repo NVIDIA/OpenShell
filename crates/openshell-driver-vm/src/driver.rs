@@ -6951,6 +6951,16 @@ mod tests {
     }
 
     #[test]
+    fn validate_sandbox_identity_accepts_non_root_system_ids() {
+        let config = VmDriverConfig {
+            sandbox_uid: Some(500),
+            sandbox_gid: Some(30),
+            ..Default::default()
+        };
+        assert!(config.validate_sandbox_identity().is_ok());
+    }
+
+    #[test]
     fn build_guest_environment_uses_token_file_without_raw_token_env() {
         let config = VmDriverConfig {
             openshell_endpoint: "http://127.0.0.1:8080".to_string(),

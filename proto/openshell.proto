@@ -1579,6 +1579,9 @@ message StoredProviderCredentialRefreshState {
   string credential_key = 4;
   ProviderCredentialRefreshStrategy strategy = 5;
   map<string, string> material = 6 [(openshell.options.v1.secret) = true];
+  // Material names classified as secret. Newly configured values live in the
+  // active credential driver and are absent from material. Legacy inline values
+  // are not automatically migrated before OpenShell 0.1.0.
   repeated string secret_material_keys = 7;
   int64 expires_at_ms = 8;
   int64 next_refresh_at_ms = 9;
@@ -1599,6 +1602,23 @@ message StoredProviderCredentialRefreshState {
   // manual token rotation preserve it. It is never derived from or exposed
   // with refresh material.
   string authorization_epoch = 18;
+  // Secret refresh material is stored through the gateway's active credential
+  // driver. The persisted refresh state keeps only opaque handles; resolved
+  // values exist in gateway memory for the duration of one mint operation.
+  map<string, openshell.datamodel.v1.CredentialHandle> secret_material_handles = 19;
+  // Handles replaced by reconfiguration or issuer-driven refresh-token
+  // rotation. This is a repeated entry rather than a material-keyed map so
+  // multiple superseded generations of the same material remain recoverable.
+  // Cleanup is retried by the refresh worker so a gateway crash or temporary
+  // credential-backend outage does not lose the deletion reference.
+  repeated StoredRefreshMaterialDeletion pending_secret_deletions = 20;
+}
+
+message StoredRefreshMaterialDeletion {
+  // Original material name used to derive the credential driver's storage key.
+  string material_key = 1;
+  // Opaque handle for the superseded secret object.
+  openshell.datamodel.v1.CredentialHandle handle = 2;
 }
 
 message GetProviderRefreshStatusRequest {
@@ -1617,6 +1637,9 @@ message ConfigureProviderRefreshRequest {
   string credential_key = 2;
   ProviderCredentialRefreshStrategy strategy = 3;
   map<string, string> material = 4 [(openshell.options.v1.secret) = true];
+  // Additional material names the caller requests be stored as secrets. Every
+  // name must be present in material. The server also classifies secrets from
+  // the authoritative provider profile and refresh strategy.
   repeated string secret_material_keys = 5;
   optional int64 expires_at_ms = 6;
   // Workspace scope. Empty defaults to "default".

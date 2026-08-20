@@ -766,16 +766,10 @@ pub async fn sandbox_create(
                 // the deadline when applicable.
                 let handled = match &mut display {
                     ProgressOutput::Interactive(d) => {
-                        let mut opt = Some(std::mem::replace(d, ProvisioningDisplay::new()));
-                        let h = handle_platform_progress_event(&ev, &mut opt, provision_start);
-                        if let Some(inner) = opt {
-                            *d = inner;
-                        }
-                        h
+                        handle_platform_progress_event(&ev, Some(d), provision_start)
                     }
                     ProgressOutput::Plain => {
-                        let mut opt: Option<ProvisioningDisplay> = None;
-                        handle_platform_progress_event(&ev, &mut opt, provision_start)
+                        handle_platform_progress_event(&ev, None, provision_start)
                     }
                     ProgressOutput::Silent => false,
                 };

@@ -214,6 +214,13 @@ driver then supplies one authoritative identity input to the supervisor:
   SCC-derived values.
 - VM keeps its existing guest identity behavior.
 
+Explicit numeric workload identities may use any Linux UID/GID from `1`
+through `u32::MAX - 1`. UID/GID `0` remains prohibited as root, and
+`u32::MAX` remains prohibited because Linux APIs and POSIX ACLs use it as an
+invalid identity sentinel. Infrastructure identities use separate validation:
+the Kubernetes network proxy UID remains at least `1000` and must not match the
+workload UID because its traffic bypasses the pod egress fence.
+
 For Docker and Podman, policy values take precedence independently. An omitted
 `run_as_user` or `run_as_group` falls back to the corresponding identity from
 the image. The supervisor resolves names from the image's `/etc/passwd` and

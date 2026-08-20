@@ -172,7 +172,7 @@ Common findings:
 - Docker daemon unavailable: start Docker Desktop or Docker Engine.
 - Gateway process stopped: inspect exit status and logs.
 - Sandbox image missing or pull denied: verify image reference and registry credentials.
-- Sandbox fails before readiness with an identity-resolution error: inspect the image's OCI `USER` and matching `/etc/passwd` and `/etc/group` entries, or explicitly set both process identity fields in policy. Root and missing identities are rejected.
+- Sandbox fails before readiness with an identity-resolution error: inspect the image's OCI `USER` and matching `/etc/passwd` and `/etc/group` entries, or explicitly set both process identity fields in policy. Numeric workload identities `1` through `4294967294` are accepted; root, the invalid identity sentinel, and missing identities are rejected.
 - Sandbox fails before readiness with an OCI workspace validation error: inspect the image's `WorkingDir` using the immutable image ID reported by the gateway. Empty, `/`, and explicit `/sandbox` use the managed `/sandbox` compatibility workspace. Any other workdir must be an absolute normalized directory with no symlink components; the final policy UID, primary GID, and supplementary groups must pass the kernel's effective traverse/write checks, including POSIX ACL and LSM decisions. OpenShell does not create, chown, or chmod a non-default image workdir.
 - Docker also rejects an image `VOLUME` that covers the workdir or one of its parents because the runtime would mask the immutable path before validation. Move the `VOLUME` below the workspace or remove the declaration.
 - A workdir rejected as a special filesystem or OpenShell control-path collision cannot be made valid with permissions. Move the image workdir away from kernel-backed mounts and the concrete supervisor, TLS, token, runtime, and socket paths named in the error.
@@ -208,7 +208,7 @@ Common findings:
 - Podman socket unavailable: start or expose the user socket.
 - Rootless networking unavailable: inspect Podman network configuration.
 - Sandbox image missing or pull denied: verify image reference and registry credentials.
-- Sandbox fails before readiness with an identity-resolution error: inspect the image's OCI `USER` and matching `/etc/passwd` and `/etc/group` entries, or explicitly set both process identity fields in policy. Root and missing identities are rejected.
+- Sandbox fails before readiness with an identity-resolution error: inspect the image's OCI `USER` and matching `/etc/passwd` and `/etc/group` entries, or explicitly set both process identity fields in policy. Numeric workload identities `1` through `4294967294` are accepted; root, the invalid identity sentinel, and missing identities are rejected.
 - Supervisor cannot call back: check callback endpoint and gateway logs.
 - Gateway exits before becoming healthy with a callback-listener discovery
   error: inspect `podman info --debug`, the configured Podman network, and the
@@ -452,8 +452,10 @@ should be the only sidecar topology container with `NET_ADMIN`. It also needs
 default binary-aware network sidecar runs as UID 0 with primary GID
 `sandbox_gid` and adds `SYS_PTRACE` plus `DAC_READ_SEARCH`. When
 `process_binary_aware_network_policy = false`, it runs as the configured
-non-root `proxy_uid` without those inspection capabilities. The pod `fsGroup`
-is set to `sandbox_gid` in both modes.
+non-root `proxy_uid` without those inspection capabilities. That dedicated
+proxy UID must remain at least `1000` and must not match the workload UID
+because the pod egress fence exempts its traffic. The pod `fsGroup` is set to
+`sandbox_gid` in both modes.
 
 In sidecar topology only the network sidecar should mount the gateway bootstrap
 credentials (`openshell-sa-token` and `openshell-client-tls`). The process

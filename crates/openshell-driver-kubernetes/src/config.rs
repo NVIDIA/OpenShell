@@ -162,10 +162,13 @@ impl Default for KubernetesSidecarConfig {
 
 impl KubernetesSidecarConfig {
     pub fn validate_proxy_uid(&self) -> Result<(), String> {
-        if self.proxy_uid < openshell_policy::MIN_SANDBOX_UID {
+        if !(openshell_policy::MIN_SANDBOX_PROXY_UID..=openshell_policy::MAX_SANDBOX_UID)
+            .contains(&self.proxy_uid)
+        {
             return Err(format!(
-                "sidecar.proxy_uid must be at least {}",
-                openshell_policy::MIN_SANDBOX_UID
+                "sidecar.proxy_uid must be in range [{}, {}]",
+                openshell_policy::MIN_SANDBOX_PROXY_UID,
+                openshell_policy::MAX_SANDBOX_UID,
             ));
         }
         Ok(())
@@ -1296,17 +1299,28 @@ mod tests {
     }
 
     #[test]
-    fn parse_openshift_uid_range_rejects_below_min() {
-        // 999 is below MIN_SANDBOX_UID (1000) — should be rejected.
+    fn parse_openshift_uid_range_accepts_non_root_system_uid() {
         assert_eq!(
             KubernetesComputeConfig::from_open_shift_uid_range("999/50000"),
+            Some(999)
+        );
+        assert_eq!(
+            KubernetesComputeConfig::from_open_shift_uid_range("1/50000"),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn parse_openshift_uid_range_rejects_root() {
+        assert_eq!(
+            KubernetesComputeConfig::from_open_shift_uid_range("0/50000"),
             None
         );
     }
 
     #[test]
     fn parse_openshift_uid_range_rejects_above_max() {
-        // u32::MAX is well above MAX_SANDBOX_UID — should be rejected.
+        // u32::MAX is the invalid identity sentinel.
         assert_eq!(
             KubernetesComputeConfig::from_open_shift_uid_range("4294967295/10000"),
             None
@@ -1316,8 +1330,8 @@ mod tests {
     #[test]
     fn validate_sandbox_identity_config_accepts_valid_range() {
         let cfg = KubernetesComputeConfig {
-            sandbox_uid: Some(1000),
-            sandbox_gid: Some(1000),
+            sandbox_uid: Some(500),
+            sandbox_gid: Some(30),
             ..KubernetesComputeConfig::default()
         };
         assert!(cfg.validate_sandbox_identity_config().is_ok());
@@ -1354,6 +1368,10 @@ mod tests {
         assert_eq!(
             KubernetesComputeConfig::from_open_shift_supplemental_groups("1000/50000"),
             Some(1000)
+        );
+        assert_eq!(
+            KubernetesComputeConfig::from_open_shift_supplemental_groups("30/50000"),
+            Some(30)
         );
     }
 

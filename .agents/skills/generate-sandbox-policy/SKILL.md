@@ -504,6 +504,12 @@ environment. Gateway inference is configured separately through `openshell
 inference set/get`. The generated `network_policies` block is the primary
 output.
 
+When the user explicitly requests `process.run_as_user` or
+`process.run_as_group`, accept `sandbox` or a numeric UID/GID from `1` through
+`4294967294`. Reject root (`0`) and the invalid identity sentinel
+(`4294967295`). Warn that a low numeric identity inherits permissions granted
+to the same ID on image files, mounted volumes, or devices.
+
 If the user provides a file path, write to it. Otherwise, ask where to place it. A common convention is a project-local policy file (e.g., `sandbox-policy.yaml`) passed to `openshell sandbox create --policy <path>` or set via the `OPENSHELL_SANDBOX_POLICY` env var.
 
 ### Mode C: Present Only (no file write)
