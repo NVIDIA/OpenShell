@@ -1202,7 +1202,7 @@ fn apply_child_env(
     provider_env: &HashMap<String, String>,
     user_environment: &HashMap<String, String>,
 ) {
-    let path = std::env::var("PATH").unwrap_or_else(|_| "/usr/local/bin:/usr/bin:/bin".into());
+    let path = child_env::child_path_from_env();
 
     cmd.env_clear()
         .env(openshell_core::sandbox_env::SANDBOX, "1")
@@ -1214,7 +1214,11 @@ fn apply_child_env(
 
     for (key, value) in user_environment {
         if !key.starts_with("OPENSHELL_") {
-            cmd.env(key, value);
+            if key == "PATH" {
+                cmd.env(key, child_env::path_with_standard_sbin_paths(value));
+            } else {
+                cmd.env(key, value);
+            }
         }
     }
 
@@ -1234,7 +1238,11 @@ fn apply_child_env(
         if is_supervisor_only_env_var(key) {
             continue;
         }
-        cmd.env(key, value);
+        if key == "PATH" {
+            cmd.env(key, child_env::path_with_standard_sbin_paths(value));
+        } else {
+            cmd.env(key, value);
+        }
     }
 }
 
@@ -1263,6 +1271,11 @@ fn build_ssh_shell_command(
             }
         }
         Some(command) => {
+            let command = if no_login_shell {
+                command
+            } else {
+                child_env::shell_command_with_standard_sbin_paths(&command)
+            };
             cmd.arg(login_shell_flag(no_login_shell)).arg(command);
         }
     }
@@ -1307,7 +1320,6 @@ fn spawn_pty_shell(
     // pass `-i` when no command is given. Runs in the supervisor, so it
     // inspects the sandbox filesystem.
     let shell = openshell_core::shell::detect_login_shell();
-    let mut cmd = build_ssh_shell_command(&shell, command, no_login_shell, Some("-i"));
 
     let term = if pty.term.is_empty() {
         "xterm-256color"
@@ -1463,7 +1475,6 @@ fn spawn_pipe_exec(
     // out and fall back to "windows". A plain shell with piped stdin already
     // reads commands line-by-line (script mode), which is what VS Code expects.
     let shell = openshell_core::shell::detect_login_shell();
-    let mut cmd = build_ssh_shell_command(&shell, command, no_login_shell, None);
 
     let (session_user, session_home) = session_user_and_home(policy, workspace.home());
     apply_child_env(
@@ -2001,6 +2012,34 @@ mod tests {
             !run("-c").contains("LOGIN_MARKER"),
             "non-login shell must not source it"
         );
+    #[test]
+    fn apply_child_env_appends_standard_sbin_to_user_path() {
+        let mut cmd = Command::new("/usr/bin/env");
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+
+        let user_environment = HashMap::from([(
+            "PATH".to_string(),
+            "/sandbox/.venv/bin:/usr/local/bin:/usr/bin:/bin".to_string(),
+        )]);
+        apply_child_env(
+            &mut cmd,
+            "/sandbox",
+            "sandbox",
+            "dumb",
+            None,
+            None,
+            &HashMap::new(),
+            &user_environment,
+        );
+
+        let output = cmd.output().expect("spawn env");
+        assert!(output.status.success());
+        let stdout = String::from_utf8(output.stdout).expect("utf8");
+        assert!(stdout.lines().any(|line| {
+            line == "PATH=/sandbox/.venv/bin:/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin"
+        }));
     }
 
     /// Verify that the stdin writer delivers all buffered data before exiting
