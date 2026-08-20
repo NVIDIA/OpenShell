@@ -158,7 +158,7 @@ The listener TLS Secret should contain the certificate for the external hostname
 
 #### Install with e2e TLS
 
-Install the chart with the GRPCRoute and BackendTLSPolicy enabled. The certgen hook automatically creates the backend CA ConfigMap from the generated PKI bundle. The server certificate SAN list must include the external hostname so the gateway can serve TLS to both the cluster-internal service FQDN and external clients:
+Install the chart with the GRPCRoute and BackendTLSPolicy enabled. The certgen hook automatically creates the backend CA ConfigMap from the generated PKI bundle:
 
 ```shell
 helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart \
@@ -171,8 +171,7 @@ helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart \
   --set grpcRoute.gateway.name=openshell-gateway \
   --set grpcRoute.gateway.namespace=openshift-ingress \
   --set 'grpcRoute.hostnames[0]=<external-hostname>' \
-  --set grpcRoute.backendTLSPolicy.enabled=true \
-  --set 'pkiInitJob.serverDnsNames[0]=<external-hostname>'
+  --set grpcRoute.backendTLSPolicy.enabled=true
 ```
 
 | Override | Reason |
@@ -181,12 +180,12 @@ helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart \
 | `server.tls.enableMtls=false` | Disable mTLS client certificate authentication. BackendTLSPolicy only validates the server certificate; the ingress proxy cannot present a client certificate to the backend. Use OIDC for authentication instead. |
 | `grpcRoute.enabled=true` | Create a GRPCRoute pointing at the external Gateway. |
 | `grpcRoute.gateway.name` / `namespace` | Reference the Gateway created above in `openshift-ingress`. |
-| `grpcRoute.backendTLSPolicy.enabled=true` | Create a BackendTLSPolicy for TLS re-encryption to the gateway pod. The certgen hook auto-creates the backend CA ConfigMap. |
-| `pkiInitJob.serverDnsNames` | Add the external hostname to the server certificate SANs. |
+| `grpcRoute.backendTLSPolicy.enabled=true` | Create a BackendTLSPolicy for TLS re-encryption to the gateway pod. The certgen hook auto-creates the backend CA ConfigMap. The Gateway proxy validates the backend certificate against the service FQDN, which is already in the default server certificate SANs. |
+| `grpcRoute.hostnames` | External hostname for the GRPCRoute. This goes on the Gateway listener certificate, not the backend certificate. |
 
 Note that `server.disableTls` is **not** set — the gateway pod serves TLS over HTTPS without requiring client certificates. Use OIDC for authentication (see [Access Control](/kubernetes/access-control)).
 
-**Using cert-manager instead of pkiInitJob:** Add `--set certManager.enabled=true` and configure `certManager.serverDnsNames` with the external hostname. With cert-manager, the backend CA ConfigMap requires a two-step install because cert-manager creates the server certificate *after* the chart is installed:
+**Using cert-manager instead of pkiInitJob:** Add `--set certManager.enabled=true` to the install command. The default `certManager.serverDnsNames` already includes the service FQDN needed for BackendTLSPolicy validation. With cert-manager, the backend CA ConfigMap requires a two-step install because cert-manager creates the server certificate *after* the chart is installed:
 
 1. `helm install` — cert-manager issues the server certificate, but the certgen hook can't create the backend CA ConfigMap yet (logs a warning)
 2. `helm upgrade` — certgen hook now reads the CA from the cert-manager-issued server certificate and creates the backend CA ConfigMap
