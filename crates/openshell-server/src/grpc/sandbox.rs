@@ -66,6 +66,7 @@ use super::{MAX_PAGE_SIZE, MAX_PROVIDERS, MAX_ROUTABLE_NAME_LEN, clamp_limit};
 use crate::persistence::current_time_ms;
 
 const TCP_FORWARD_CHUNK_SIZE: usize = 64 * 1024;
+const MAX_TEMPLATES_PER_WORKSPACE: u32 = 1000;
 
 #[derive(Debug)]
 pub struct WatchSandboxStream {
@@ -691,18 +692,23 @@ pub(super) async fn handle_create_sandbox_template(
     };
     let write = state
         .store
-        .put_if(
+        .create_if_workspace_count_below(
             SandboxWorkloadTemplate::object_type(),
             resolved.object_id(),
             resolved.object_name(),
             &workspace,
             &resolved.encode_to_vec(),
             labels_json.as_deref(),
-            WriteCondition::MustCreate,
+            u64::from(MAX_TEMPLATES_PER_WORKSPACE),
         )
         .await;
     let write = match write {
-        Ok(write) => write,
+        Ok(Some(write)) => write,
+        Ok(None) => {
+            return Err(Status::resource_exhausted(format!(
+                "workspace has reached the maximum of {MAX_TEMPLATES_PER_WORKSPACE} sandbox templates"
+            )));
+        }
         Err(crate::persistence::PersistenceError::UniqueViolation { .. }) => {
             return Err(Status::already_exists("sandbox template already exists"));
         }
@@ -4360,6 +4366,84 @@ mod tests {
                 "{err:?}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn sandbox_template_create_rejects_workspace_quota() {
+        let state = test_server_state().await;
+        for index in 0..MAX_TEMPLATES_PER_WORKSPACE {
+            let mut template = test_workload_template(&format!("tmpl-{index}"));
+            let metadata = template.metadata.as_mut().expect("metadata");
+            metadata.id = format!("template-{index}");
+            metadata.workspace = "default".to_string();
+            state.store.put_message(&template).await.unwrap();
+        }
+
+        let err = handle_create_sandbox_template(
+            &state,
+            authed_request(CreateSandboxTemplateRequest {
+                template: Some(test_workload_template("overflow")),
+                workspace: "default".to_string(),
+            }),
+        )
+        .await
+        .expect_err("template create must reject a full workspace");
+
+        assert_eq!(err.code(), tonic::Code::ResourceExhausted);
+        assert!(err.message().contains("1000 sandbox templates"));
+    }
+
+    #[tokio::test]
+    async fn sandbox_template_create_enforces_workspace_quota_concurrently() {
+        let state = test_server_state().await;
+        for index in 0..(MAX_TEMPLATES_PER_WORKSPACE - 1) {
+            let mut template = test_workload_template(&format!("tmpl-{index}"));
+            let metadata = template.metadata.as_mut().expect("metadata");
+            metadata.id = format!("template-{index}");
+            metadata.workspace = "default".to_string();
+            state.store.put_message(&template).await.unwrap();
+        }
+
+        let mut handles = vec![];
+        for index in 0..8 {
+            let state = Arc::clone(&state);
+            let handle = tokio::spawn(async move {
+                handle_create_sandbox_template(
+                    &state,
+                    authed_request(CreateSandboxTemplateRequest {
+                        template: Some(test_workload_template(&format!("overflow-{index}"))),
+                        workspace: "default".to_string(),
+                    }),
+                )
+                .await
+            });
+            handles.push(handle);
+        }
+
+        let results: Vec<_> = future::join_all(handles)
+            .await
+            .into_iter()
+            .map(|r| r.unwrap())
+            .collect();
+
+        let successes = results.iter().filter(|r| r.is_ok()).count();
+        let exhausted = results
+            .iter()
+            .filter(|r| {
+                r.as_ref()
+                    .err()
+                    .is_some_and(|e| e.code() == tonic::Code::ResourceExhausted)
+            })
+            .count();
+
+        assert_eq!(successes, 1);
+        assert_eq!(exhausted, 7);
+        let count = state
+            .store
+            .count_in_workspace(SandboxWorkloadTemplate::object_type(), "default")
+            .await
+            .unwrap();
+        assert_eq!(count, u64::from(MAX_TEMPLATES_PER_WORKSPACE));
     }
 
     #[tokio::test]
