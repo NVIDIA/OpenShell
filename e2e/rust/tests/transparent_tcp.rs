@@ -253,7 +253,7 @@ async fn local_container_native_tcp_uses_policy_dns_and_fails_closed() {
         return;
     }
 
-    let fixture = SupportContainer::start_python(
+    let fixture = SupportContainer::start_python_with_capabilities(
         FIXTURE_ALIAS,
         &format!(
             r#"import socket, threading
@@ -280,6 +280,7 @@ serve(fixture_listener)
 "#
         ),
         FIXTURE_PORT,
+        &["NET_BIND_SERVICE"],
     )
     .await
     .expect("start TCP fixture");
