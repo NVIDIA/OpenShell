@@ -351,7 +351,7 @@ describe('sandbox templates', () => {
           workload?: {
             image?: string;
             environment?: Record<string, string>;
-            resources?: { cpu?: string; memory?: string; gpuCount?: number };
+            resources?: { cpu?: string; memory?: string; gpu?: { count?: number } };
           };
           driverConfig?: Record<string, unknown>;
         };
@@ -382,7 +382,7 @@ describe('sandbox templates', () => {
           workload: {
             image: 'ghcr.io/nvidia/openshell-community/sandboxes/python:latest',
             environment: { FEATURE_FLAG: 'on' },
-            resources: { cpu: '1', memory: '512Mi', gpuCount: 1 },
+            resources: { cpu: '1', memory: '512Mi', gpu: { count: 1 } },
           },
           driverConfig: { kubernetes: { runtime_class_name: 'kata-containers' } },
         },
@@ -394,7 +394,7 @@ describe('sandbox templates', () => {
     expect(observed.template?.metadata?.name).toBe('python');
     expect(observed.template?.metadata?.labels).toEqual({ team: 'runtime' });
     expect(observed.template?.spec?.workload?.environment).toEqual({ FEATURE_FLAG: 'on' });
-    expect(observed.template?.spec?.workload?.resources?.gpuCount).toBe(1);
+    expect(observed.template?.spec?.workload?.resources?.gpu?.count).toBe(1);
     expect(created.metadata?.workspace).toBe('default');
     expect(created.metadata?.resourceVersion).toBe(1n);
   });

@@ -1619,10 +1619,10 @@ def _sandbox_workload_template(
         template.spec.workload.resources.cpu = cpu
     if memory is not None:
         template.spec.workload.resources.memory = memory
+    if gpu or gpu_count is not None:
+        template.spec.workload.resources.gpu.SetInParent()
     if gpu_count is not None:
-        template.spec.workload.resources.gpu_count = gpu_count
-    elif gpu:
-        template.spec.workload.resources.gpu_count = 1
+        template.spec.workload.resources.gpu.count = gpu_count
     if driver_config:
         template.spec.driver_config.update(dict(driver_config))
 

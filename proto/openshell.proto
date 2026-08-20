@@ -976,8 +976,10 @@ message SandboxResources {
   string cpu = 1;
   // Portable memory quantity, for example "512Mi" or "2Gi".
   string memory = 2;
-  // Optional number of GPUs requested.
-  optional uint32 gpu_count = 3;
+  // GPU requirements for the sandbox workload. Presence indicates a GPU
+  // request. When count is omitted, the request uses the selected driver's
+  // default GPU assignment behavior.
+  GpuResourceRequirements gpu = 3;
 }
 
 message SandboxServiceLevel {

@@ -388,7 +388,7 @@ func validateTemplateCreateSpec(spec *types.SandboxSpec) error {
 	if spec == nil {
 		return nil
 	}
-	if spec.LogLevel != "" || len(spec.Environment) > 0 || spec.Template != nil || spec.GPUCount != nil {
+	if spec.LogLevel != "" || len(spec.Environment) > 0 || spec.Template != nil || spec.GPU || spec.GPUCount != nil {
 		return &types.StatusError{Code: types.ErrorInvalidArgument, Message: "template creates only allow policy and providers in spec"}
 	}
 	return nil
@@ -407,9 +407,12 @@ func sandboxSpecFromWorkloadTemplate(template *types.SandboxWorkloadTemplate) ty
 		Resources:    sandboxTemplateResources(workload.Resources),
 		DriverConfig: copyAnyMap(template.Spec.DriverConfig),
 	}
-	if workload.Resources != nil && workload.Resources.GPUCount != nil {
-		count := *workload.Resources.GPUCount
-		spec.GPUCount = &count
+	if workload.Resources != nil && workload.Resources.GPU != nil {
+		spec.GPU = true
+		if workload.Resources.GPU.Count != nil {
+			count := *workload.Resources.GPU.Count
+			spec.GPUCount = &count
+		}
 	}
 	return spec
 }

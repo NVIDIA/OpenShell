@@ -106,6 +106,7 @@ func TestSandboxFromProto(t *testing.T) {
 	assert.Equal(t, "debug", s.Spec.LogLevel)
 	assert.Equal(t, map[string]string{"FOO": "bar"}, s.Spec.Environment)
 	assert.Equal(t, []string{"claude", "github"}, s.Spec.Providers)
+	assert.True(t, s.Spec.GPU)
 	require.NotNil(t, s.Spec.GPUCount)
 	assert.Equal(t, uint32(2), *s.Spec.GPUCount)
 	assert.Equal(t, []string{"/opt/agent", "--serve"}, s.Spec.Command)
@@ -181,8 +182,25 @@ func TestSandboxFromProto_NilFields(t *testing.T) {
 	assert.Empty(t, s.Name)
 	assert.True(t, s.CreatedAt.IsZero())
 	assert.Nil(t, s.Spec.Template)
+	assert.False(t, s.Spec.GPU)
 	assert.Nil(t, s.Spec.GPUCount)
 	assert.Equal(t, v1.SandboxUnknown, s.Status.Phase)
+}
+
+func TestSandboxFromProto_DefaultGPURequest(t *testing.T) {
+	proto := &pb.Sandbox{
+		Spec: &pb.SandboxSpec{
+			ResourceRequirements: &pb.ResourceRequirements{
+				Gpu: &pb.GpuResourceRequirements{},
+			},
+		},
+	}
+
+	s := SandboxFromProto(proto)
+
+	require.NotNil(t, s)
+	assert.True(t, s.Spec.GPU)
+	assert.Nil(t, s.Spec.GPUCount)
 }
 
 func TestSandboxFromProto_Nil(t *testing.T) {
@@ -322,6 +340,22 @@ func TestSandboxToProto_NilTemplate(t *testing.T) {
 	assert.Nil(t, p.Spec.ResourceRequirements)
 }
 
+func TestSandboxToProto_DefaultGPURequest(t *testing.T) {
+	s := &v1.Sandbox{
+		Spec: v1.SandboxSpec{
+			GPU: true,
+		},
+	}
+
+	p := SandboxToProto(s)
+
+	require.NotNil(t, p)
+	require.NotNil(t, p.Spec)
+	require.NotNil(t, p.Spec.ResourceRequirements)
+	require.NotNil(t, p.Spec.ResourceRequirements.Gpu)
+	assert.Nil(t, p.Spec.ResourceRequirements.Gpu.Count)
+}
+
 func TestSandboxWorkloadTemplateRoundTrip(t *testing.T) {
 	gpuCount := uint32(2)
 	delTime := time.UnixMilli(1700000060000).UTC()
@@ -339,9 +373,9 @@ func TestSandboxWorkloadTemplateRoundTrip(t *testing.T) {
 				Image:       "nvcr.io/nvidia/openshell:latest",
 				Environment: map[string]string{"CUDA_VISIBLE_DEVICES": "all"},
 				Resources: &v1.SandboxResources{
-					CPU:      "2",
-					Memory:   "8Gi",
-					GPUCount: &gpuCount,
+					CPU:    "2",
+					Memory: "8Gi",
+					GPU:    &v1.SandboxGPURequirements{Count: &gpuCount},
 				},
 			},
 			DriverConfig: map[string]any{
@@ -368,8 +402,9 @@ func TestSandboxWorkloadTemplateRoundTrip(t *testing.T) {
 	require.NotNil(t, protoTemplate.Spec.Workload.Resources)
 	assert.Equal(t, "2", protoTemplate.Spec.Workload.Resources.Cpu)
 	assert.Equal(t, "8Gi", protoTemplate.Spec.Workload.Resources.Memory)
-	require.NotNil(t, protoTemplate.Spec.Workload.Resources.GpuCount)
-	assert.Equal(t, uint32(2), *protoTemplate.Spec.Workload.Resources.GpuCount)
+	require.NotNil(t, protoTemplate.Spec.Workload.Resources.Gpu)
+	require.NotNil(t, protoTemplate.Spec.Workload.Resources.Gpu.Count)
+	assert.Equal(t, uint32(2), *protoTemplate.Spec.Workload.Resources.Gpu.Count)
 	require.NotNil(t, protoTemplate.Spec.DriverConfig)
 	require.NotNil(t, protoTemplate.Spec.DesiredServiceLevel)
 	require.NotNil(t, protoTemplate.Spec.DesiredServiceLevel.Startup)
@@ -393,13 +428,36 @@ func TestSandboxWorkloadTemplateRoundTrip(t *testing.T) {
 	require.NotNil(t, back.Spec.Workload.Resources)
 	assert.Equal(t, original.Spec.Workload.Resources.CPU, back.Spec.Workload.Resources.CPU)
 	assert.Equal(t, original.Spec.Workload.Resources.Memory, back.Spec.Workload.Resources.Memory)
-	require.NotNil(t, back.Spec.Workload.Resources.GPUCount)
-	assert.Equal(t, *original.Spec.Workload.Resources.GPUCount, *back.Spec.Workload.Resources.GPUCount)
+	require.NotNil(t, back.Spec.Workload.Resources.GPU)
+	require.NotNil(t, back.Spec.Workload.Resources.GPU.Count)
+	assert.Equal(t, *original.Spec.Workload.Resources.GPU.Count, *back.Spec.Workload.Resources.GPU.Count)
 	assert.Equal(t, "kata", back.Spec.DriverConfig["kubernetes"].(map[string]any)["runtimeClassName"])
 	require.NotNil(t, back.Spec.DesiredServiceLevel)
 	require.NotNil(t, back.Spec.DesiredServiceLevel.Startup)
 	assert.Equal(t, 30*time.Second, back.Spec.DesiredServiceLevel.Startup.ReadyWithin)
 	assert.Equal(t, uint32(3), back.Spec.DesiredServiceLevel.Startup.MaxBurst)
+}
+
+func TestSandboxWorkloadTemplateRoundTrip_DefaultGpuRequest(t *testing.T) {
+	original := &v1.SandboxWorkloadTemplate{
+		Name: "default-gpu",
+		Spec: v1.SandboxWorkloadTemplateSpec{
+			Workload: &v1.SandboxWorkloadConfig{
+				Resources: &v1.SandboxResources{
+					GPU: &v1.SandboxGPURequirements{},
+				},
+			},
+		},
+	}
+
+	protoTemplate, err := SandboxWorkloadTemplateToProtoChecked(original)
+	require.NoError(t, err)
+	require.NotNil(t, protoTemplate.GetSpec().GetWorkload().GetResources().GetGpu())
+	assert.Nil(t, protoTemplate.GetSpec().GetWorkload().GetResources().GetGpu().Count)
+
+	back := SandboxWorkloadTemplateFromProto(protoTemplate)
+	require.NotNil(t, back.Spec.Workload.Resources.GPU)
+	assert.Nil(t, back.Spec.Workload.Resources.GPU.Count)
 }
 
 func TestSandboxWorkloadTemplateToProtoChecked_RejectsUnrepresentableDriverConfig(t *testing.T) {
@@ -483,6 +541,7 @@ func TestSandboxRoundTrip(t *testing.T) {
 	assert.Equal(t, original.Spec.LogLevel, back.Spec.LogLevel)
 	assert.Equal(t, original.Spec.Environment, back.Spec.Environment)
 	assert.Equal(t, original.Spec.Providers, back.Spec.Providers)
+	assert.True(t, back.Spec.GPU)
 	require.NotNil(t, back.Spec.GPUCount)
 	assert.Equal(t, *original.Spec.GPUCount, *back.Spec.GPUCount)
 	require.NotNil(t, back.Spec.Template)
