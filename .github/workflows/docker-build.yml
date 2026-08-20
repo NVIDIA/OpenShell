@@ -294,6 +294,10 @@ jobs:
       volumes:
         - /var/run/docker.sock:/var/run/docker.sock
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs['checkout-ref'] || github.sha }}
+
       - name: Log in to GHCR
         run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
 
@@ -309,3 +313,14 @@ jobs:
             --prefer-index=false \
             -t "${image}:${{ needs.resolve.outputs.image_tag_base }}" \
             "${refs[@]}"
+
+      - name: Verify merged manifest SBOM attestation
+        env:
+          IMAGE_REF: ghcr.io/nvidia/openshell/${{ inputs.component }}:${{ needs.resolve.outputs.image_tag_base }}
+          REQUIRE_CARGO: ${{ inputs.auditable }}
+        run: |
+          args=("${IMAGE_REF}")
+          if [[ "${REQUIRE_CARGO}" == "true" ]]; then
+            args+=(--require-cargo)
+          fi
+          tasks/scripts/verify-image-sbom.sh "${args[@]}"

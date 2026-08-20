@@ -40,6 +40,8 @@ on:
         required: false
         type: string
         default: ""
+      # Branch E2E and release gateway/supervisor image builds opt in.
+      # CLI images and standalone glibc-static supervisor validation keep false.
       auditable:
         description: "Embed cargo-auditable dependency metadata in the binary"
         required: false
