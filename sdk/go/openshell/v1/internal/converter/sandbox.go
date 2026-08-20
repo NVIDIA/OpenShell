@@ -81,8 +81,11 @@ func sandboxSpecFromProto(spec *pb.SandboxSpec) types.SandboxSpec {
 	}
 
 	if rr := spec.GetResourceRequirements(); rr != nil {
-		if gpu := rr.GetGpu(); gpu != nil && gpu.Count != nil {
-			result.GPUCount = gpu.Count
+		if gpu := rr.GetGpu(); gpu != nil {
+			result.GPU = true
+			if gpu.Count != nil {
+				result.GPUCount = gpu.Count
+			}
 		}
 	}
 	result.Command = CopyStringSlice(spec.GetCommand())
@@ -224,7 +227,7 @@ func SandboxSpecToProto(spec *types.SandboxSpec) *pb.SandboxSpec {
 		result.Template = tmpl
 	}
 
-	if spec.GPUCount != nil {
+	if spec.GPU || spec.GPUCount != nil {
 		result.ResourceRequirements = &pb.ResourceRequirements{
 			Gpu: &pb.GpuResourceRequirements{
 				Count: spec.GPUCount,
@@ -325,9 +328,9 @@ func SandboxResourcesFromProto(resources *pb.SandboxResources) *types.SandboxRes
 		return nil
 	}
 	return &types.SandboxResources{
-		CPU:      resources.GetCpu(),
-		Memory:   resources.GetMemory(),
-		GPUCount: CopyUint32Ptr(resources.GpuCount),
+		CPU:    resources.GetCpu(),
+		Memory: resources.GetMemory(),
+		GPU:    sandboxResourceGpuFromProto(resources),
 	}
 }
 
@@ -407,10 +410,24 @@ func SandboxResourcesToProto(resources *types.SandboxResources) *pb.SandboxResou
 		return nil
 	}
 	return &pb.SandboxResources{
-		Cpu:      resources.CPU,
-		Memory:   resources.Memory,
-		GpuCount: CopyUint32Ptr(resources.GPUCount),
+		Cpu:    resources.CPU,
+		Memory: resources.Memory,
+		Gpu:    sandboxResourceGpuToProto(resources),
 	}
+}
+
+func sandboxResourceGpuToProto(resources *types.SandboxResources) *pb.GpuResourceRequirements {
+	if resources == nil || resources.GPU == nil {
+		return nil
+	}
+	return &pb.GpuResourceRequirements{Count: CopyUint32Ptr(resources.GPU.Count)}
+}
+
+func sandboxResourceGpuFromProto(resources *pb.SandboxResources) *types.SandboxGPURequirements {
+	if resources == nil || resources.GetGpu() == nil {
+		return nil
+	}
+	return &types.SandboxGPURequirements{Count: CopyUint32Ptr(resources.GetGpu().Count)}
 }
 
 // SandboxServiceLevelToProto converts template service-level hints.

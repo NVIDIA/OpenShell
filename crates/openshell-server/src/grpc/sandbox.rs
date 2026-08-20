@@ -23,14 +23,14 @@ use openshell_core::proto::{
     DeleteSandboxRequest, DeleteSandboxResponse, DeleteSandboxTemplateRequest,
     DeleteSandboxTemplateResponse, DetachSandboxProviderRequest, DetachSandboxProviderResponse,
     ExecSandboxEvent, ExecSandboxExit, ExecSandboxInput, ExecSandboxRequest, ExecSandboxStderr,
-    ExecSandboxStdout, GetSandboxRequest, GetSandboxTemplateRequest, GpuResourceRequirements,
-    ListSandboxProvidersRequest, ListSandboxProvidersResponse, ListSandboxTemplatesRequest,
-    ListSandboxTemplatesResponse, ListSandboxesRequest, ListSandboxesResponse, Provider,
-    ResourceRequirements, RevokeSshSessionRequest, RevokeSshSessionResponse, SandboxResources,
-    SandboxResponse, SandboxSpec, SandboxStreamEvent, SandboxTemplateResponse,
-    SandboxWorkloadTemplate, SandboxWorkloadTemplateProvenance, SshRelayTarget,
-    StartSandboxRequest, StopSandboxRequest, TcpForwardFrame, TcpForwardInit, TcpRelayTarget,
-    WatchSandboxRequest, relay_open, tcp_forward_init,
+    ExecSandboxStdout, GetSandboxRequest, GetSandboxTemplateRequest, ListSandboxProvidersRequest,
+    ListSandboxProvidersResponse, ListSandboxTemplatesRequest, ListSandboxTemplatesResponse,
+    ListSandboxesRequest, ListSandboxesResponse, Provider, ResourceRequirements,
+    RevokeSshSessionRequest, RevokeSshSessionResponse, SandboxResources, SandboxResponse,
+    SandboxSpec, SandboxStreamEvent, SandboxTemplateResponse, SandboxWorkloadTemplate,
+    SandboxWorkloadTemplateProvenance, SshRelayTarget, StartSandboxRequest, StopSandboxRequest,
+    TcpForwardFrame, TcpForwardInit, TcpRelayTarget, WatchSandboxRequest, relay_open,
+    tcp_forward_init,
 };
 use openshell_core::proto::{Sandbox, SandboxPhase, SandboxTemplate, SshSession};
 use openshell_core::telemetry::{
@@ -492,17 +492,14 @@ fn sandbox_spec_from_workload_template(
             driver_config: spec.driver_config.clone(),
             ..SandboxTemplate::default()
         }),
-        resource_requirements: resources.and_then(|resources| {
-            resources
-                .gpu_count
-                .is_some()
-                .then_some(ResourceRequirements {
-                    gpu: Some(GpuResourceRequirements {
-                        count: resources.gpu_count,
-                    }),
-                })
-        }),
+        resource_requirements: resources.and_then(template_gpu_requirements),
         ..SandboxSpec::default()
+    })
+}
+
+fn template_gpu_requirements(resources: &SandboxResources) -> Option<ResourceRequirements> {
+    Some(ResourceRequirements {
+        gpu: Some(resources.gpu?),
     })
 }
 
@@ -2831,6 +2828,7 @@ mod tests {
     use crate::grpc::test_support::{
         authed_request, test_server_state, test_server_state_with_driver,
     };
+    use openshell_core::proto::GpuResourceRequirements;
     use openshell_core::proto::datamodel::v1::ObjectMeta;
 
     // ---- shell_escape ----
@@ -3260,7 +3258,7 @@ mod tests {
                     resources: Some(SandboxResources {
                         cpu: "2".to_string(),
                         memory: "4Gi".to_string(),
-                        gpu_count: Some(1),
+                        gpu: Some(GpuResourceRequirements { count: Some(1) }),
                     }),
                 }),
                 driver_config: None,
@@ -4500,16 +4498,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_sandbox_from_workload_template_preserves_gpu_count() {
+    async fn create_sandbox_from_workload_template_preserves_default_gpu_request() {
         let state = test_server_state().await;
-        let mut template = test_workload_template("gpu-count");
+        let mut template = test_workload_template("default-gpu");
         template
             .spec
             .as_mut()
             .and_then(|spec| spec.workload.as_mut())
             .and_then(|workload| workload.resources.as_mut())
             .expect("test template resources")
-            .gpu_count = Some(2);
+            .gpu = Some(GpuResourceRequirements { count: None });
         handle_create_sandbox_template(
             &state,
             authed_request(CreateSandboxTemplateRequest {
@@ -4528,7 +4526,7 @@ mod tests {
                 labels: HashMap::new(),
                 annotations: HashMap::new(),
                 workspace: "default".to_string(),
-                workload_template_name: "gpu-count".to_string(),
+                workload_template_name: "default-gpu".to_string(),
             }),
         )
         .await
@@ -4542,8 +4540,8 @@ mod tests {
             .as_ref()
             .and_then(|spec| spec.resource_requirements.as_ref())
             .and_then(|requirements| requirements.gpu.as_ref())
-            .expect("GPU request should be preserved");
-        assert_eq!(gpu.count, Some(2));
+            .expect("default GPU request should be preserved");
+        assert_eq!(gpu.count, None);
     }
 
     #[tokio::test]

@@ -30,9 +30,9 @@ template, err := client.SandboxTemplates().Create(ctx, "default", &v1.SandboxWor
                 "NVIDIA_VISIBLE_DEVICES": "all",
             },
             Resources: &v1.SandboxResources{
-                CPU:      "2",
-                Memory:   "8Gi",
-                GPUCount: &gpuCount,
+                CPU:    "2",
+                Memory: "8Gi",
+                GPU:    &v1.SandboxGPURequirements{Count: &gpuCount},
             },
         },
         DriverConfig: map[string]any{
@@ -51,6 +51,9 @@ template, err := client.SandboxTemplates().Create(ctx, "default", &v1.SandboxWor
     },
 })
 ```
+
+Set `GPU: &v1.SandboxGPURequirements{}` to request the active driver's default
+GPU assignment without specifying a count.
 
 ## Create a Sandbox From a Template
 

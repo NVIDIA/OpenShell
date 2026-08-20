@@ -34,6 +34,7 @@ type mockSandboxServer struct {
 	attachErr          error
 	detachErr          error
 	listProvErr        error
+	createRequest      *pb.CreateSandboxRequest
 	watchEvents        []*pb.SandboxStreamEvent
 	watchErr           error
 	watchPostEventsErr error
@@ -56,6 +57,7 @@ func newMockSandboxServer() *mockSandboxServer {
 func (s *mockSandboxServer) CreateSandbox(_ context.Context, req *pb.CreateSandboxRequest) (*pb.SandboxResponse, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.createRequest = proto.Clone(req).(*pb.CreateSandboxRequest)
 	if s.createErr != nil {
 		return nil, s.createErr
 	}
@@ -265,6 +267,29 @@ func TestSandboxCreate(t *testing.T) {
 	assert.Equal(t, SandboxProvisioning, result.Status.Phase)
 }
 
+func TestSandboxCreate_DefaultGPURequest(t *testing.T) {
+	mock := newMockSandboxServer()
+	client, cleanup := setupSandboxTest(t, mock)
+	defer cleanup()
+
+	result, err := client.Create(context.Background(), "default", "gpu-sandbox", &SandboxSpec{
+		GPU: true,
+	}, nil)
+
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	assert.True(t, result.Spec.GPU)
+	assert.Nil(t, result.Spec.GPUCount)
+
+	mock.mu.Lock()
+	defer mock.mu.Unlock()
+	require.NotNil(t, mock.createRequest)
+	require.NotNil(t, mock.createRequest.Spec)
+	require.NotNil(t, mock.createRequest.Spec.ResourceRequirements)
+	require.NotNil(t, mock.createRequest.Spec.ResourceRequirements.Gpu)
+	assert.Nil(t, mock.createRequest.Spec.ResourceRequirements.Gpu.Count)
+}
+
 func TestSandboxCreate_RejectsUnrepresentableResourcesBeforeRPC(t *testing.T) {
 	mock := newMockSandboxServer()
 	client, cleanup := setupSandboxTest(t, mock)
@@ -278,6 +303,22 @@ func TestSandboxCreate_RejectsUnrepresentableResourcesBeforeRPC(t *testing.T) {
 	mock.mu.Lock()
 	defer mock.mu.Unlock()
 	assert.Empty(t, mock.sandboxes)
+}
+
+func TestSandboxCreateFromTemplateRejectsGPUOverrideBeforeRPC(t *testing.T) {
+	mock := newMockSandboxServer()
+	client, cleanup := setupSandboxTest(t, mock)
+	defer cleanup()
+
+	_, err := client.CreateFromTemplate(context.Background(), "default", "bad", "gpu-kata", &SandboxSpec{
+		GPU: true,
+	}, nil)
+
+	require.Error(t, err)
+	assert.True(t, IsInvalidArgument(err))
+	mock.mu.Lock()
+	defer mock.mu.Unlock()
+	assert.Nil(t, mock.createRequest)
 }
 
 func TestSandboxCreate_AlreadyExists(t *testing.T) {

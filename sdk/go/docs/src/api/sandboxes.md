@@ -20,6 +20,10 @@ sb, err := client.Sandboxes().Create(ctx, "default", "my-sandbox", &v1.SandboxSp
 })
 ```
 
+Set `GPU: true` to request the active driver's default GPU assignment. Set
+`GPUCount` when the sandbox needs a specific GPU count; a non-nil `GPUCount`
+also implies `GPU`.
+
 ## Create From Template
 
 Creates a new sandbox from a reusable sandbox workload template. The template

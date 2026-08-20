@@ -36,9 +36,13 @@ func copySandboxWorkloadTemplateSpec(spec types.SandboxWorkloadTemplateSpec) typ
 		workload.Environment = copyStringMap(spec.Workload.Environment)
 		if spec.Workload.Resources != nil {
 			resources := *spec.Workload.Resources
-			if spec.Workload.Resources.GPUCount != nil {
-				count := *spec.Workload.Resources.GPUCount
-				resources.GPUCount = &count
+			if spec.Workload.Resources.GPU != nil {
+				gpu := *spec.Workload.Resources.GPU
+				if spec.Workload.Resources.GPU.Count != nil {
+					count := *spec.Workload.Resources.GPU.Count
+					gpu.Count = &count
+				}
+				resources.GPU = &gpu
 			}
 			workload.Resources = &resources
 		}
@@ -130,7 +134,7 @@ func validateSandboxWorkloadTemplate(template *types.SandboxWorkloadTemplate) er
 	if err := validateSandboxWorkloadEnvironment(template.Spec.Workload.Environment); err != nil {
 		return err
 	}
-	if resources := template.Spec.Workload.Resources; resources != nil && resources.GPUCount != nil && *resources.GPUCount == 0 {
+	if resources := template.Spec.Workload.Resources; resources != nil && resources.GPU != nil && resources.GPU.Count != nil && *resources.GPU.Count == 0 {
 		return &types.StatusError{Code: types.ErrorInvalidArgument, Message: "gpu count must be greater than 0"}
 	}
 	return nil

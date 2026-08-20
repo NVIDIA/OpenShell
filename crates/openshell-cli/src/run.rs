@@ -2390,7 +2390,7 @@ pub async fn sandbox_template_create(
     image: Option<&str>,
     cpu: Option<&str>,
     memory: Option<&str>,
-    gpu_count: Option<u32>,
+    gpu_requirements: Option<GpuResourceRequirements>,
     driver_config_json: Option<&str>,
     ready_within: Option<&str>,
     max_burst: Option<u32>,
@@ -2401,7 +2401,7 @@ pub async fn sandbox_template_create(
     workspace: &str,
     tls: &TlsOptions,
 ) -> Result<()> {
-    let resources = if cpu.is_some() || memory.is_some() || gpu_count.is_some() {
+    let resources = if cpu.is_some() || memory.is_some() || gpu_requirements.is_some() {
         Some(SandboxResources {
             cpu: cpu
                 .map(validate_cpu_quantity)
@@ -2411,7 +2411,7 @@ pub async fn sandbox_template_create(
                 .map(validate_memory_quantity)
                 .transpose()?
                 .unwrap_or_default(),
-            gpu_count,
+            gpu: gpu_requirements,
         })
     } else {
         None
@@ -2652,8 +2652,11 @@ fn sandbox_template_to_json(template: &SandboxWorkloadTemplate) -> serde_json::V
                     resources_json
                         .insert("memory".to_string(), serde_json::json!(resources.memory));
                 }
-                if let Some(gpu_count) = resources.gpu_count {
-                    resources_json.insert("gpu_count".to_string(), serde_json::json!(gpu_count));
+                if let Some(gpu) = &resources.gpu {
+                    let value = gpu
+                        .count
+                        .map_or_else(|| serde_json::json!(true), serde_json::Value::from);
+                    resources_json.insert("gpu".to_string(), value);
                 }
                 if !resources_json.is_empty() {
                     obj.insert(
@@ -2753,10 +2756,8 @@ fn print_sandbox_template_detail(template: &SandboxWorkloadTemplate) {
             );
             println!(
                 "  {} {}",
-                "GPU count:".dimmed(),
-                resources
-                    .gpu_count
-                    .map_or_else(|| "<none>".to_string(), |count| count.to_string())
+                "GPU:".dimmed(),
+                template_resources_gpu_display(resources).unwrap_or_else(|| "<none>".to_string())
             );
         }
     }
@@ -2843,8 +2844,8 @@ fn print_sandbox_template_table(templates: &[SandboxWorkloadTemplate], show_work
             .filter(|memory| !memory.is_empty())
             .unwrap_or("-");
         let gpu = resources
-            .and_then(|resources| resources.gpu_count)
-            .map_or_else(|| "-".to_string(), |count| count.to_string());
+            .and_then(template_resources_gpu_display)
+            .unwrap_or_else(|| "-".to_string());
         let image = truncate_status_field(&template_image(template), image_width);
         let startup = template_startup(template);
         let ready = startup
@@ -2905,6 +2906,16 @@ fn template_resources(template: &SandboxWorkloadTemplate) -> Option<&SandboxReso
         .as_ref()
         .and_then(|spec| spec.workload.as_ref())
         .and_then(|workload| workload.resources.as_ref())
+}
+
+fn template_resources_gpu_display(resources: &SandboxResources) -> Option<String> {
+    if let Some(gpu) = &resources.gpu {
+        return Some(
+            gpu.count
+                .map_or_else(|| "default".to_string(), |count| count.to_string()),
+        );
+    }
+    None
 }
 
 fn template_startup(template: &SandboxWorkloadTemplate) -> Option<&SandboxStartup> {
