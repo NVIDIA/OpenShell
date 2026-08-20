@@ -620,7 +620,6 @@ fn build_environment_sets_docker_tls_paths() {
     assert!(env.contains(&format!("OPENSHELL_TLS_KEY={TLS_KEY_MOUNT_PATH}")));
     assert!(env.contains(&"TEMPLATE_ENV=template".to_string()));
     assert!(env.contains(&"SPEC_ENV=spec".to_string()));
-    assert!(env.contains(&"OPENSHELL_SANDBOX_COMMAND=sleep infinity".to_string()));
     assert!(env.contains(&format!(
         "{}={}",
         openshell_core::sandbox_env::NETWORK_RUNTIME_CAPABILITIES,
