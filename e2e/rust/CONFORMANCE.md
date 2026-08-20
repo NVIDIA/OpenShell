@@ -30,8 +30,9 @@ scenario.
 The test profiles separate the surface being validated:
 
 - `e2e-api-conformance` invokes the scenario engine directly against every
-  gateway driver. This includes command execution through the streaming
-  `ExecSandbox` API and process-hardening checks.
+  gateway driver. This includes stop/start lifecycle behavior, command
+  execution through the streaming `ExecSandbox` API, and process-hardening
+  checks.
 - `e2e-cli-conformance` validates portable CLI behavior against the canonical
   Docker-backed gateway, including the gateway smoke test, port forwarding,
   and file upload/download workflows.
@@ -43,14 +44,12 @@ flowchart LR
     subgraph Provisioning["Gateway instantiation"]
         P["Provisioner<br/>Docker · Podman · Kubernetes · VM"]
         C["Connection context<br/>endpoint · mTLS · gateway registration"]
-        L["Lifecycle control<br/>managed gateway metadata"]
     end
 
     subgraph Tests["Test execution"]
         API["API conformance<br/>direct gRPC scenarios"]
         CLI["CLI conformance<br/>portable user workflows"]
         DS["Driver-specific tests<br/>runtime and infrastructure assertions"]
-        RR["Shared restart/resume scenario<br/>driver-specific hooks"]
     end
 
     OCLI["openshell CLI"]
@@ -61,18 +60,14 @@ flowchart LR
     P -.->|"instantiates"| GW
     P -.->|"configures"| DR
     P --> C
-    P --> L
 
     C -.-> API
     C -.-> CLI
     C -.-> DS
-    C -.-> RR
-    L -.-> RR
 
     API -->|"tonic / gRPC"| GW
     CLI --> OCLI
     DS --> OCLI
-    RR -->|"application assertions"| OCLI
 
     OCLI -->|"gateway API"| GW
     GW --> DR
@@ -80,7 +75,6 @@ flowchart LR
 
     DS -.->|"driver or runtime observations"| DR
     DS -.->|"sandbox-specific assertions"| SB
-    RR -.->|"stop / start"| GW
 ```
 
 Solid arrows show normal request paths. Dashed arrows show provisioning,
