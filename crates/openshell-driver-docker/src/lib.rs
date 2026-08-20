@@ -1279,8 +1279,12 @@ impl DockerComputeDriver {
         sandbox_id: &str,
         sandbox_name: &str,
     ) -> Result<Option<DriverSandbox>, Status> {
-        if let Some(pending) = self.pending_snapshot(sandbox_id, sandbox_name).await? {
-            return Ok(Some(pending));
+        let pending = self.pending_snapshot(sandbox_id, sandbox_name).await?;
+        if pending
+            .as_ref()
+            .is_some_and(pending_sandbox_has_provisioning_failure)
+        {
+            return Ok(pending);
         }
         let container = self
             .find_managed_container_summary(sandbox_id, sandbox_name)
@@ -1292,7 +1296,7 @@ impl DockerComputeDriver {
             return Ok(Some(sandbox));
         }
 
-        Ok(None)
+        Ok(pending)
     }
 
     async fn current_snapshots(&self) -> Result<Vec<DriverSandbox>, Status> {
@@ -1341,10 +1345,7 @@ impl DockerComputeDriver {
             .into_iter()
             .map(|sandbox| (sandbox.id.clone(), sandbox))
             .collect::<HashMap<_, _>>();
-        // Provisioning state is authoritative until the supervisor has
-        // attached to both the sandbox and gateway. A running workload
-        // container alone is not a usable sandbox.
-        by_id.extend(self.pending_snapshot_map().await);
+        merge_pending_sandbox_snapshots(&mut by_id, self.pending_snapshot_map().await);
         let mut sandboxes = by_id.into_values().collect::<Vec<_>>();
         sandboxes.sort_by(|left, right| left.id.cmp(&right.id));
         Ok(sandboxes)
@@ -3395,6 +3396,33 @@ fn pending_sandbox_record_id(
         )));
     }
     Ok(first)
+}
+
+/// A pending sandbox holds either the ordinary in-progress snapshot or the
+/// explicit error published by its provisioning task. The latter is more
+/// informative than a transient Docker state observed while that task cleans
+/// up a failed start, so it must win during snapshot reconciliation.
+fn pending_sandbox_has_provisioning_failure(sandbox: &DriverSandbox) -> bool {
+    sandbox.status.as_ref().is_some_and(|status| {
+        status.conditions.iter().any(|condition| {
+            condition.r#type == "Ready"
+                && condition.status.eq_ignore_ascii_case("false")
+                && condition.reason != "Starting"
+        })
+    })
+}
+
+fn merge_pending_sandbox_snapshots(
+    snapshots: &mut HashMap<String, DriverSandbox>,
+    pending: HashMap<String, DriverSandbox>,
+) {
+    for (sandbox_id, sandbox) in pending {
+        if pending_sandbox_has_provisioning_failure(&sandbox) {
+            snapshots.insert(sandbox_id, sandbox);
+        } else {
+            snapshots.entry(sandbox_id).or_insert(sandbox);
+        }
+    }
 }
 
 fn provisioning_condition() -> DriverCondition {

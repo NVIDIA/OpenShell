@@ -3161,6 +3161,61 @@ fn pending_lookup_is_id_authoritative_and_rejects_ambiguous_names() {
 }
 
 #[test]
+fn pending_provisioning_failure_overrides_transient_container_state() {
+    let sandbox = test_sandbox();
+    let dead_container = pending_sandbox_snapshot(
+        &sandbox,
+        "default",
+        error_condition("ContainerDead", "Container is dead"),
+        false,
+    );
+    let start_failure = pending_sandbox_snapshot(
+        &sandbox,
+        "default",
+        error_condition(
+            "ContainerStartFailed",
+            "Docker responded with status code 500: CDI device injection failed",
+        ),
+        false,
+    );
+
+    let mut snapshots = HashMap::from([(sandbox.id.clone(), dead_container)]);
+    merge_pending_sandbox_snapshots(
+        &mut snapshots,
+        HashMap::from([(sandbox.id.clone(), start_failure)]),
+    );
+
+    let status = snapshots[&sandbox.id].status.as_ref().expect("status");
+    assert_eq!(status.conditions[0].reason, "ContainerStartFailed");
+    assert!(
+        status.conditions[0]
+            .message
+            .contains("CDI device injection failed")
+    );
+}
+
+#[test]
+fn pending_starting_snapshot_does_not_override_container_state() {
+    let sandbox = test_sandbox();
+    let dead_container = pending_sandbox_snapshot(
+        &sandbox,
+        "default",
+        error_condition("ContainerDead", "Container is dead"),
+        false,
+    );
+    let starting = pending_sandbox_snapshot(&sandbox, "default", provisioning_condition(), false);
+
+    let mut snapshots = HashMap::from([(sandbox.id.clone(), dead_container)]);
+    merge_pending_sandbox_snapshots(
+        &mut snapshots,
+        HashMap::from([(sandbox.id.clone(), starting)]),
+    );
+
+    let status = snapshots[&sandbox.id].status.as_ref().expect("status");
+    assert_eq!(status.conditions[0].reason, "ContainerDead");
+}
+
+#[test]
 fn workload_mounts_only_the_shared_channel_volume() {
     let config = runtime_config();
     let sandbox = test_sandbox();
