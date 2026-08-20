@@ -182,6 +182,18 @@ Resource requirements enter the driver layer through `SandboxSpec.resource_requi
 can request a specific number of GPUs or the driver-specific default behaviour.
 For all in-tree drivers, this is equivalent to selecting a single GPU.
 
+For Docker GPU sandboxes, the driver treats CDI specs as runtime metadata for
+both outer injection and inner sandbox policy. It selects opaque CDI device IDs,
+passes them to Docker, mounts daemon-reported CDI spec directories into
+supervisor-only paths, and bind-mounts a gateway-owned versioned CDI context
+read-only before creating the container. The supervisor resolves that context
+inside the sandbox and derives Landlock paths and supplemental groups from CDI
+`containerEdits`. Host-side CDI spec paths are diagnostic only and are never
+treated as sandbox policy paths.
+Kubernetes must not infer CDI device IDs from the `nvidia.com/gpu` resource
+request; it needs a node-local selected-device handoff before using the same
+supervisor resolver.
+
 VM runtime state paths are derived only from driver-validated sandbox IDs
 matching `[A-Za-z0-9._-]{1,128}`. The gateway-owned VM driver socket uses a
 private `run/` directory plus Unix peer UID/PID checks. Standalone

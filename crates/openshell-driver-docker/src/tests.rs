@@ -88,7 +88,10 @@ fn gpu_resources(count: Option<u32>) -> ResourceRequirements {
     }
 }
 
-fn runtime_config() -> DockerDriverRuntimeConfig {
+const TEST_CDI_SPEC_DIR: &str = "/opt/openshell-test/cdi";
+const TEST_CDI_SPEC_DIR_ALT: &str = "/srv/openshell-test/cdi";
+
+fn runtime_config(supports_gpu: bool) -> DockerDriverRuntimeConfig {
     DockerDriverRuntimeConfig {
         default_image: "image:latest".to_string(),
         image_pull_policy: String::new(),
@@ -116,10 +119,29 @@ fn runtime_config() -> DockerDriverRuntimeConfig {
             key: PathBuf::from("/tmp/tls.key"),
         }),
         daemon_version: "28.0.0".to_string(),
-        supports_gpu: false,
-        allow_all_default_gpu: false,
+        gpu: gpu_runtime_config(supports_gpu),
         sandbox_pids_limit: DEFAULT_SANDBOX_PIDS_LIMIT,
         enable_bind_mounts: false,
+    }
+}
+
+fn runtime_config_with_cdi_spec_dirs(cdi_spec_dirs: &[&str]) -> DockerDriverRuntimeConfig {
+    let mut config = runtime_config(false);
+    config.gpu.cdi_spec_dirs = cdi_spec_dirs
+        .iter()
+        .map(|path| (*path).to_string())
+        .collect();
+    config
+}
+
+fn gpu_runtime_config(supports_gpu: bool) -> DockerGpuRuntimeConfig {
+    if supports_gpu {
+        DockerGpuRuntimeConfig {
+            cdi_spec_dirs: vec![TEST_CDI_SPEC_DIR.to_string()],
+            ..Default::default()
+        }
+    } else {
+        DockerGpuRuntimeConfig::default()
     }
 }
 
@@ -147,7 +169,7 @@ fn inspected_volume(driver: &str, options: HashMap<String, String>) -> bollard::
 }
 
 fn test_driver_with_config(config: DockerDriverRuntimeConfig) -> DockerComputeDriver {
-    let allow_all_default_gpu = config.allow_all_default_gpu;
+    let allow_all_default_gpu = config.gpu.allow_all_default;
     DockerComputeDriver {
         docker: Arc::new(
             Docker::connect_with_http("http://127.0.0.1:2375", 1, bollard::API_DEFAULT_VERSION)
@@ -166,7 +188,7 @@ fn test_driver_with_config(config: DockerDriverRuntimeConfig) -> DockerComputeDr
 
 #[tokio::test]
 async fn gateway_listener_requirements_report_managed_bridge_address() {
-    let config = runtime_config();
+    let config = runtime_config(false);
     let expected_address = match config.gateway_route {
         DockerGatewayRoute::Bridge { bind_address, .. } => bind_address,
         DockerGatewayRoute::HostGateway => panic!("test config must use a managed bridge"),
@@ -188,7 +210,7 @@ async fn gateway_listener_requirements_report_managed_bridge_address() {
 
 #[tokio::test]
 async fn gateway_listener_requirements_are_empty_for_host_gateway_route() {
-    let mut config = runtime_config();
+    let mut config = runtime_config(false);
     config.gateway_route = DockerGatewayRoute::HostGateway;
     config.gateway_callback_bind_address = None;
     let driver = test_driver_with_config(config);
@@ -204,7 +226,7 @@ async fn gateway_listener_requirements_are_empty_for_host_gateway_route() {
 
 #[tokio::test]
 async fn host_gateway_route_reports_ipv4_loopback_callback_listener() {
-    let mut config = runtime_config();
+    let mut config = runtime_config(false);
     config.gateway_route = DockerGatewayRoute::HostGateway;
     config.gateway_callback_bind_address = Some("127.0.0.1:17670".parse().unwrap());
     let driver = test_driver_with_config(config);
@@ -605,14 +627,14 @@ fn docker_compute_config_disables_bind_mounts_by_default() {
 
 #[test]
 fn container_create_body_sets_driver_owned_pids_limit() {
-    let body = build_container_create_body(&test_sandbox(), &runtime_config()).unwrap();
+    let body = build_container_create_body(&test_sandbox(), &runtime_config(false)).unwrap();
     let host_config = body.host_config.expect("host config");
     assert_eq!(host_config.pids_limit, Some(DEFAULT_SANDBOX_PIDS_LIMIT));
 }
 
 #[test]
 fn build_environment_sets_docker_tls_paths() {
-    let env = build_environment(&test_sandbox(), &runtime_config());
+    let env = build_environment(&test_sandbox(), &runtime_config(false), false);
     assert!(env.contains(&format!("OPENSHELL_TLS_CA={TLS_CA_MOUNT_PATH}")));
     assert!(env.contains(&format!("OPENSHELL_TLS_CERT={TLS_CERT_MOUNT_PATH}")));
     assert!(env.contains(&format!("OPENSHELL_TLS_KEY={TLS_KEY_MOUNT_PATH}")));
@@ -633,7 +655,7 @@ fn build_environment_protects_oci_identity_metadata() {
         spec.environment.insert(key.to_string(), value.to_string());
     }
 
-    let env = build_environment_for_oci_user(&sandbox, &runtime_config(), "app:staff");
+    let env = build_environment_for_oci_user(&sandbox, &runtime_config(false), "app:staff", false);
 
     assert!(env.contains(&format!(
         "{}=app:staff",
@@ -654,7 +676,7 @@ fn build_environment_strips_gateway_tls_server_name() {
         "evil.attacker.example.com".to_string(),
     );
 
-    let env = build_environment(&sandbox, &runtime_config());
+    let env = build_environment(&sandbox, &runtime_config(false), false);
 
     assert!(
         !env.iter().any(|entry| entry.starts_with(&format!(
@@ -676,7 +698,7 @@ fn container_creation_uses_inspected_immutable_image() {
     };
     let body = build_container_create_body_for_image(
         &sandbox,
-        &runtime_config(),
+        &runtime_config(false),
         &DockerSandboxDriverConfig::default(),
         None,
         &metadata,
@@ -706,7 +728,7 @@ fn container_creation_rejects_invalid_oci_working_dir() {
     };
     let err = build_container_create_body_for_image(
         &test_sandbox(),
-        &runtime_config(),
+        &runtime_config(false),
         &DockerSandboxDriverConfig::default(),
         None,
         &metadata,
@@ -727,7 +749,7 @@ fn container_creation_rejects_openshell_control_path_working_dir() {
     };
     let err = build_container_create_body_for_image(
         &test_sandbox(),
-        &runtime_config(),
+        &runtime_config(false),
         &DockerSandboxDriverConfig::default(),
         None,
         &metadata,
@@ -750,7 +772,7 @@ fn container_creation_rejects_image_volume_that_masks_working_dir() {
 
     let error = build_container_create_body_for_image(
         &sandbox,
-        &runtime_config(),
+        &runtime_config(false),
         &DockerSandboxDriverConfig::default(),
         None,
         &metadata,
@@ -772,7 +794,7 @@ fn container_creation_rejects_image_volume_over_configured_ssh_socket() {
         working_dir: "/workspace".to_string(),
         volumes: vec!["/custom-runtime".to_string()],
     };
-    let mut config = runtime_config();
+    let mut config = runtime_config(false);
     config.ssh_socket_path = "/custom-runtime/ssh.sock".to_string();
 
     let error = build_container_create_body_for_image(
@@ -801,7 +823,7 @@ fn container_creation_reserves_resolved_workspace_root_but_allows_nested_mounts(
     .unwrap();
     let err = build_container_create_body_for_image(
         &test_sandbox(),
-        &runtime_config(),
+        &runtime_config(false),
         &root_mount,
         None,
         &metadata,
@@ -823,7 +845,7 @@ fn container_creation_reserves_resolved_workspace_root_but_allows_nested_mounts(
     };
     let err = build_container_create_body_for_image(
         &test_sandbox(),
-        &runtime_config(),
+        &runtime_config(false),
         &ancestor_mount,
         None,
         &nested_metadata,
@@ -840,7 +862,7 @@ fn container_creation_reserves_resolved_workspace_root_but_allows_nested_mounts(
     .unwrap();
     build_container_create_body_for_image(
         &test_sandbox(),
-        &runtime_config(),
+        &runtime_config(false),
         &nested_mount,
         None,
         &metadata,
@@ -854,7 +876,7 @@ fn container_creation_reserves_resolved_workspace_root_but_allows_nested_mounts(
         .unwrap();
     build_container_create_body_for_image(
         &test_sandbox(),
-        &runtime_config(),
+        &runtime_config(false),
         &compatibility_path_mount,
         None,
         &metadata,
@@ -874,7 +896,7 @@ fn build_environment_keeps_path_driver_controlled() {
         .environment
         .insert("PATH".to_string(), "/malicious/template/bin".to_string());
 
-    let env = build_environment(&sandbox, &runtime_config());
+    let env = build_environment(&sandbox, &runtime_config(false), false);
     let path_entries = env
         .iter()
         .filter(|entry| entry.starts_with("PATH="))
@@ -900,7 +922,7 @@ fn build_environment_keeps_telemetry_toggle_driver_controlled() {
                 "true".to_string(),
             );
 
-            let env = build_environment(&sandbox, &runtime_config());
+            let env = build_environment(&sandbox, &runtime_config(false), false);
             let telemetry_entries = env
                 .iter()
                 .filter(|entry| {
@@ -922,7 +944,7 @@ fn build_environment_keeps_telemetry_toggle_driver_controlled() {
 
 #[test]
 fn build_binds_uses_docker_tls_directory() {
-    let binds = build_binds(&test_sandbox(), &runtime_config()).unwrap();
+    let binds = build_binds(&test_sandbox(), &runtime_config(false), None).unwrap();
     let targets = binds
         .iter()
         .filter_map(|bind| bind.split(':').nth(1).map(String::from))
@@ -961,7 +983,7 @@ fn build_container_create_body_includes_driver_config_mounts() {
         ]
     })));
 
-    let body = build_container_create_body(&sandbox, &runtime_config()).unwrap();
+    let body = build_container_create_body(&sandbox, &runtime_config(false)).unwrap();
     let mounts = body
         .host_config
         .unwrap()
@@ -1009,7 +1031,7 @@ fn driver_config_defaults_volume_mounts_to_read_only() {
         }]
     })));
 
-    let body = build_container_create_body(&sandbox, &runtime_config()).unwrap();
+    let body = build_container_create_body(&sandbox, &runtime_config(false)).unwrap();
     let mounts = body
         .host_config
         .unwrap()
@@ -1038,7 +1060,7 @@ fn driver_config_allows_explicit_writable_volume_mounts() {
         }]
     })));
 
-    let body = build_container_create_body(&sandbox, &runtime_config()).unwrap();
+    let body = build_container_create_body(&sandbox, &runtime_config(false)).unwrap();
     let mounts = body
         .host_config
         .unwrap()
@@ -1072,7 +1094,7 @@ fn driver_config_rejects_duplicate_mount_targets() {
         ]
     })));
 
-    let err = build_container_create_body(&sandbox, &runtime_config()).unwrap_err();
+    let err = build_container_create_body(&sandbox, &runtime_config(false)).unwrap_err();
 
     assert_eq!(err.code(), tonic::Code::FailedPrecondition);
     assert!(
@@ -1099,7 +1121,7 @@ fn driver_config_rejects_bind_mounts_unless_enabled() {
         }]
     })));
 
-    let err = build_container_create_body(&sandbox, &runtime_config()).unwrap_err();
+    let err = build_container_create_body(&sandbox, &runtime_config(false)).unwrap_err();
 
     assert_eq!(err.code(), tonic::Code::FailedPrecondition);
     assert!(err.message().contains("enable_bind_mounts = true"));
@@ -1125,7 +1147,7 @@ fn build_container_create_body_includes_bind_mounts_when_enabled() {
             "read_only": true
         }]
     })));
-    let mut config = runtime_config();
+    let mut config = runtime_config(false);
     config.enable_bind_mounts = true;
 
     let body = build_container_create_body(&sandbox, &config).unwrap();
@@ -1170,7 +1192,7 @@ fn driver_config_defaults_enabled_bind_mounts_to_read_only() {
             "target": "/sandbox/host"
         }]
     })));
-    let mut config = runtime_config();
+    let mut config = runtime_config(false);
     config.enable_bind_mounts = true;
 
     let body = build_container_create_body(&sandbox, &config).unwrap();
@@ -1208,7 +1230,7 @@ fn bind_mount_selinux_shared_label() {
             "selinux_label": "shared"
         }]
     })));
-    let mut config = runtime_config();
+    let mut config = runtime_config(false);
     config.enable_bind_mounts = true;
 
     let body = build_container_create_body(&sandbox, &config).unwrap();
@@ -1246,7 +1268,7 @@ fn bind_mount_selinux_private_label() {
             "selinux_label": "private"
         }]
     })));
-    let mut config = runtime_config();
+    let mut config = runtime_config(false);
     config.enable_bind_mounts = true;
 
     let body = build_container_create_body(&sandbox, &config).unwrap();
@@ -1283,7 +1305,7 @@ fn bind_mount_without_selinux_label() {
             "read_only": false
         }]
     })));
-    let mut config = runtime_config();
+    let mut config = runtime_config(false);
     config.enable_bind_mounts = true;
 
     let body = build_container_create_body(&sandbox, &config).unwrap();
@@ -1317,7 +1339,7 @@ fn driver_config_rejects_missing_bind_source() {
             "target": "/sandbox/data"
         }]
     })));
-    let mut config = runtime_config();
+    let mut config = runtime_config(false);
     config.enable_bind_mounts = true;
 
     let err = build_container_create_body(&sandbox, &config).unwrap_err();
@@ -1347,7 +1369,7 @@ fn driver_config_rejects_relative_bind_sources_when_enabled() {
             "target": "/sandbox/host"
         }]
     })));
-    let mut config = runtime_config();
+    let mut config = runtime_config(false);
     config.enable_bind_mounts = true;
 
     let err = build_container_create_body(&sandbox, &config).unwrap_err();
@@ -1377,7 +1399,7 @@ fn driver_config_rejects_image_mounts() {
         }]
     })));
 
-    let err = build_container_create_body(&sandbox, &runtime_config()).unwrap_err();
+    let err = build_container_create_body(&sandbox, &runtime_config(false)).unwrap_err();
 
     assert_eq!(err.code(), tonic::Code::FailedPrecondition);
     assert!(err.message().contains("invalid docker driver_config"));
@@ -1401,7 +1423,7 @@ fn driver_config_rejects_reserved_mount_targets() {
         }]
     })));
 
-    let err = build_container_create_body(&sandbox, &runtime_config()).unwrap_err();
+    let err = build_container_create_body(&sandbox, &runtime_config(false)).unwrap_err();
 
     assert_eq!(err.code(), tonic::Code::FailedPrecondition);
     assert!(err.message().contains("reserved OpenShell path"));
@@ -1422,7 +1444,7 @@ fn driver_config_rejects_mount_over_configured_ssh_socket() {
         working_dir: "/workspace".to_string(),
         volumes: Vec::new(),
     };
-    let mut config = runtime_config();
+    let mut config = runtime_config(false);
     config.ssh_socket_path = "/custom-runtime/ssh.sock".to_string();
 
     let error = build_container_create_body_for_image(
@@ -1499,7 +1521,7 @@ fn build_environment_uses_token_file_without_raw_token_env() {
         "user-provided-token".to_string(),
     );
 
-    let env = build_environment(&sandbox, &runtime_config());
+    let env = build_environment(&sandbox, &runtime_config(false), false);
 
     assert!(!env.iter().any(|entry| {
         entry.starts_with(&format!("{}=", openshell_core::sandbox_env::SANDBOX_TOKEN))
@@ -1523,7 +1545,7 @@ fn managed_container_label_filters_include_gateway_namespace() {
 
 #[test]
 fn build_container_create_body_replaces_inherited_cmd_with_workspace_arg() {
-    let create_body = build_container_create_body(&test_sandbox(), &runtime_config()).unwrap();
+    let create_body = build_container_create_body(&test_sandbox(), &runtime_config(false)).unwrap();
 
     assert_eq!(
         create_body.entrypoint,
@@ -1572,7 +1594,7 @@ fn build_container_create_body_replaces_inherited_cmd_with_workspace_arg() {
 
 #[test]
 fn validate_sandbox_rejects_gpu_when_cdi_unavailable() {
-    let config = runtime_config();
+    let config = runtime_config(false);
     let mut sandbox = test_sandbox();
     sandbox.spec.as_mut().unwrap().resource_requirements = Some(gpu_resources(None));
 
@@ -1584,7 +1606,7 @@ fn validate_sandbox_rejects_gpu_when_cdi_unavailable() {
 
 #[test]
 fn validate_sandbox_rejects_missing_gpu_support_before_request_shape() {
-    let config = runtime_config();
+    let config = runtime_config(false);
     let mut sandbox = test_sandbox();
     let spec = sandbox.spec.as_mut().unwrap();
     spec.resource_requirements = Some(gpu_resources(Some(2)));
@@ -1598,7 +1620,7 @@ fn validate_sandbox_rejects_missing_gpu_support_before_request_shape() {
 
 #[test]
 fn validate_sandbox_rejects_invalid_cdi_devices_before_gpu_capability() {
-    let config = runtime_config();
+    let config = runtime_config(false);
     let mut sandbox = test_sandbox();
     let spec = sandbox.spec.as_mut().unwrap();
     spec.resource_requirements = Some(gpu_resources(None));
@@ -1613,7 +1635,7 @@ fn validate_sandbox_rejects_invalid_cdi_devices_before_gpu_capability() {
 
 #[test]
 fn validate_sandbox_rejects_unknown_driver_config_fields() {
-    let config = runtime_config();
+    let config = runtime_config(false);
     let mut sandbox = test_sandbox();
     let spec = sandbox.spec.as_mut().unwrap();
     spec.resource_requirements = Some(gpu_resources(None));
@@ -1628,8 +1650,7 @@ fn validate_sandbox_rejects_unknown_driver_config_fields() {
 
 #[test]
 fn validate_sandbox_accepts_gpu_count_request_shape() {
-    let mut config = runtime_config();
-    config.supports_gpu = true;
+    let config = runtime_config(true);
     let mut sandbox = test_sandbox();
     sandbox.spec.as_mut().unwrap().resource_requirements = Some(gpu_resources(Some(2)));
 
@@ -1639,8 +1660,7 @@ fn validate_sandbox_accepts_gpu_count_request_shape() {
 
 #[test]
 fn validate_sandbox_accepts_gpu_count_matching_cdi_devices() {
-    let mut config = runtime_config();
-    config.supports_gpu = true;
+    let config = runtime_config(true);
     let mut sandbox = test_sandbox();
     let spec = sandbox.spec.as_mut().unwrap();
     spec.resource_requirements = Some(gpu_resources(Some(2)));
@@ -1655,8 +1675,7 @@ fn validate_sandbox_accepts_gpu_count_matching_cdi_devices() {
 
 #[test]
 fn validate_sandbox_accepts_single_cdi_device_without_gpu_count() {
-    let mut config = runtime_config();
-    config.supports_gpu = true;
+    let config = runtime_config(true);
     let mut sandbox = test_sandbox();
     let spec = sandbox.spec.as_mut().unwrap();
     spec.resource_requirements = Some(gpu_resources(None));
@@ -1668,8 +1687,7 @@ fn validate_sandbox_accepts_single_cdi_device_without_gpu_count() {
 
 #[test]
 fn validate_sandbox_rejects_multiple_cdi_devices_without_gpu_count() {
-    let mut config = runtime_config();
-    config.supports_gpu = true;
+    let config = runtime_config(true);
     let mut sandbox = test_sandbox();
     let spec = sandbox.spec.as_mut().unwrap();
     spec.resource_requirements = Some(gpu_resources(None));
@@ -1689,8 +1707,7 @@ fn validate_sandbox_rejects_multiple_cdi_devices_without_gpu_count() {
 
 #[test]
 fn validate_sandbox_rejects_cdi_devices_without_gpu_request() {
-    let mut config = runtime_config();
-    config.supports_gpu = true;
+    let config = runtime_config(true);
     let mut sandbox = test_sandbox();
     sandbox
         .spec
@@ -1709,8 +1726,7 @@ fn validate_sandbox_rejects_cdi_devices_without_gpu_request() {
 
 #[test]
 fn validate_sandbox_rejects_gpu_count_mismatched_cdi_devices() {
-    let mut config = runtime_config();
-    config.supports_gpu = true;
+    let config = runtime_config(true);
     let mut sandbox = test_sandbox();
     let spec = sandbox.spec.as_mut().unwrap();
     spec.resource_requirements = Some(gpu_resources(Some(2)));
@@ -1727,7 +1743,7 @@ fn validate_sandbox_rejects_gpu_count_mismatched_cdi_devices() {
 
 #[test]
 fn validate_sandbox_rejects_template_errors_before_device_config() {
-    let config = runtime_config();
+    let config = runtime_config(false);
     let mut sandbox = test_sandbox();
     let spec = sandbox.spec.as_mut().unwrap();
     spec.resource_requirements = Some(gpu_resources(None));
@@ -1765,8 +1781,7 @@ fn validate_sandbox_auth_accepts_gateway_token() {
 
 #[test]
 fn build_container_create_body_maps_default_gpu_to_selected_cdi_device() {
-    let mut config = runtime_config();
-    config.supports_gpu = true;
+    let config = runtime_config(true);
     let mut sandbox = test_sandbox();
     sandbox.spec.as_mut().unwrap().resource_requirements = Some(gpu_resources(None));
 
@@ -1794,9 +1809,105 @@ fn build_container_create_body_maps_default_gpu_to_selected_cdi_device() {
 }
 
 #[test]
+fn build_container_create_body_adds_cdi_context_env_and_spec_mounts_for_gpu() {
+    let config = runtime_config_with_cdi_spec_dirs(&[TEST_CDI_SPEC_DIR, TEST_CDI_SPEC_DIR_ALT]);
+    let mut sandbox = test_sandbox();
+    sandbox.spec.as_mut().unwrap().resource_requirements = Some(gpu_resources(None));
+
+    let driver_config = DockerSandboxDriverConfig::default();
+    let gpu_devices = vec!["nvidia.com/gpu=1".to_string()];
+    let create_body = build_container_create_body_with_gpu_devices(
+        &sandbox,
+        &config,
+        &driver_config,
+        Some(&gpu_devices),
+    )
+    .unwrap();
+
+    let env = create_body.env.expect("env should be set");
+    assert!(env.iter().any(|entry| {
+        entry
+            == &format!(
+                "{}={}",
+                openshell_core::sandbox_env::CDI_CONTEXT,
+                openshell_core::cdi::CDI_CONTEXT_PATH
+            )
+    }));
+
+    let binds = create_body
+        .host_config
+        .expect("host config")
+        .binds
+        .expect("binds should be set");
+    assert!(
+        binds.iter().any(|bind| {
+            bind == &format!("{TEST_CDI_SPEC_DIR}:{}:ro,z", cdi_spec_mount_path(0))
+        })
+    );
+    assert!(binds.iter().any(|bind| {
+        bind == &format!("{TEST_CDI_SPEC_DIR_ALT}:{}:ro,z", cdi_spec_mount_path(1))
+    }));
+    assert!(binds.iter().any(|bind| {
+        bind == &format!(
+            "{}:{}:ro,z",
+            cdi_context_host_path(&sandbox, &config).unwrap().display(),
+            openshell_core::cdi::CDI_CONTEXT_PATH
+        )
+    }));
+}
+
+#[test]
+fn build_container_create_body_clears_cdi_context_for_non_gpu() {
+    let mut config = runtime_config(false);
+    config.gpu.cdi_spec_dirs = vec![TEST_CDI_SPEC_DIR.to_string()];
+    let create_body = build_container_create_body(&test_sandbox(), &config).unwrap();
+
+    let env = create_body.env.expect("env should be set");
+    assert!(
+        env.iter()
+            .any(|entry| { entry == &format!("{}=", openshell_core::sandbox_env::CDI_CONTEXT) })
+    );
+
+    let binds = create_body
+        .host_config
+        .expect("host config")
+        .binds
+        .expect("binds should be set");
+    assert!(
+        !binds
+            .iter()
+            .any(|bind| bind.contains(openshell_core::cdi::CDI_SPEC_DIR_BASE))
+    );
+}
+
+#[test]
+fn write_cdi_context_file_materializes_owned_host_context() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    let state_dir = tempfile::tempdir().unwrap();
+    let sandbox = test_sandbox();
+    let config = runtime_config(true);
+    let context = CdiContext::new(
+        vec!["nvidia.com/gpu=0".to_string()],
+        vec![CdiSpecDirectory::new(
+            cdi_spec_mount_path(0),
+            TEST_CDI_SPEC_DIR,
+        )],
+    );
+
+    temp_env::with_var("XDG_STATE_HOME", Some(state_dir.path()), || {
+        write_cdi_context_file(&sandbox, &config, &context).expect("write CDI context");
+        let path = cdi_context_host_path(&sandbox, &config).expect("context path");
+        let contents = fs::read(&path).expect("read CDI context");
+        let parsed: CdiContext = serde_json::from_slice(&contents).expect("parse CDI context");
+        assert_eq!(parsed, context);
+        cleanup_cdi_context_file(&sandbox, &config);
+        assert!(!path.exists());
+    });
+}
+
+#[test]
 fn build_container_create_body_omits_devices_without_resolved_default_cdi_devices() {
-    let mut config = runtime_config();
-    config.supports_gpu = true;
+    let config = runtime_config(true);
     let mut sandbox = test_sandbox();
     sandbox.spec.as_mut().unwrap().resource_requirements = Some(gpu_resources(None));
 
@@ -1813,8 +1924,7 @@ fn build_container_create_body_omits_devices_without_resolved_default_cdi_device
 
 #[test]
 fn build_container_create_body_passes_explicit_cdi_device_id_through() {
-    let mut config = runtime_config();
-    config.supports_gpu = true;
+    let config = runtime_config(true);
     let mut sandbox = test_sandbox();
     let spec = sandbox.spec.as_mut().unwrap();
     spec.resource_requirements = Some(gpu_resources(None));
@@ -1837,8 +1947,7 @@ fn build_container_create_body_passes_explicit_cdi_device_id_through() {
 
 #[test]
 fn build_container_create_body_rejects_gpu_count_mismatched_cdi_devices() {
-    let mut config = runtime_config();
-    config.supports_gpu = true;
+    let config = runtime_config(true);
     let mut sandbox = test_sandbox();
     let spec = sandbox.spec.as_mut().unwrap();
     spec.resource_requirements = Some(gpu_resources(Some(2)));
@@ -1865,7 +1974,7 @@ fn build_container_create_body_rejects_cdi_devices_without_gpu_request() {
         .unwrap()
         .driver_config = Some(cdi_devices_config(&["nvidia.com/gpu=0"]));
 
-    let err = build_container_create_body(&sandbox, &runtime_config()).unwrap_err();
+    let err = build_container_create_body(&sandbox, &runtime_config(false)).unwrap_err();
     assert_eq!(err.code(), tonic::Code::InvalidArgument);
     assert!(err.message().contains("requires a gpu request"));
 }
@@ -1877,15 +1986,14 @@ fn build_container_create_body_rejects_empty_cdi_devices() {
     spec.resource_requirements = Some(gpu_resources(None));
     spec.template.as_mut().unwrap().driver_config = Some(cdi_devices_config(&[]));
 
-    let err = build_container_create_body(&sandbox, &runtime_config()).unwrap_err();
+    let err = build_container_create_body(&sandbox, &runtime_config(false)).unwrap_err();
     assert_eq!(err.code(), tonic::Code::InvalidArgument);
     assert!(err.message().contains("non-empty list"));
 }
 
 #[test]
 fn driver_default_gpu_selection_consumes_distinct_devices_for_creates() {
-    let mut config = runtime_config();
-    config.supports_gpu = true;
+    let config = runtime_config(true);
     let driver = test_driver_with_config(config);
     driver.gpu_selector.refresh(
         CdiGpuInventory::new(["nvidia.com/gpu=0", "nvidia.com/gpu=1"]),
@@ -2017,7 +2125,7 @@ fn require_sandbox_identifier_rejects_when_id_and_name_are_empty() {
 
 #[test]
 fn build_container_create_body_uses_bridge_network() {
-    let create_body = build_container_create_body(&test_sandbox(), &runtime_config()).unwrap();
+    let create_body = build_container_create_body(&test_sandbox(), &runtime_config(false)).unwrap();
     let host_config = create_body.host_config.expect("host_config is populated");
 
     assert_eq!(
@@ -2043,7 +2151,7 @@ fn build_container_create_body_uses_runtime_namespace_label() {
     // with that empty value would not match subsequent list/get/find
     // queries (which filter on `config.sandbox_namespace`), leaking
     // sandboxes that the driver itself cannot observe.
-    let mut config = runtime_config();
+    let mut config = runtime_config(false);
     config.sandbox_namespace = "tenant-a".to_string();
     let mut sandbox = test_sandbox();
     sandbox.namespace = "ignored-by-driver".to_string();
