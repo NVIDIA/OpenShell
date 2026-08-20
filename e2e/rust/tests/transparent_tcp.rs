@@ -257,20 +257,26 @@ async fn local_container_native_tcp_uses_policy_dns_and_fails_closed() {
         FIXTURE_ALIAS,
         &format!(
             r#"import socket, threading
-def serve(port):
+def listen(port):
   s = socket.socket()
   s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
   s.bind(('0.0.0.0', port))
   s.listen()
+  return s
+
+def serve(s):
   while True:
     c, _ = s.accept()
     data = c.recv(1024)
     c.sendall(b'native-tcp-ok:' + data)
     c.close()
 
-threading.Thread(target=serve, args=({TRANSPARENT_LISTENER_PORT},), daemon=True).start()
-threading.Thread(target=serve, args=({TCP_DNS_PORT},), daemon=True).start()
-serve({FIXTURE_PORT})
+transparent_listener = listen({TRANSPARENT_LISTENER_PORT})
+tcp_dns_listener = listen({TCP_DNS_PORT})
+fixture_listener = listen({FIXTURE_PORT})
+threading.Thread(target=serve, args=(transparent_listener,), daemon=True).start()
+threading.Thread(target=serve, args=(tcp_dns_listener,), daemon=True).start()
+serve(fixture_listener)
 "#
         ),
         FIXTURE_PORT,
