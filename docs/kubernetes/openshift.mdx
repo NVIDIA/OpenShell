@@ -201,7 +201,7 @@ openshell status
 
 ### Route with TLS Passthrough (All OpenShift Versions)
 
-For OpenShift versions prior to 4.22, or when you prefer Route-based ingress, cert-manager can issue the gateway's server certificate from a real Issuer or ClusterIssuer (for example, an ACME issuer), and an OpenShift Route with TLS passthrough exposes it externally while the gateway keeps terminating its own TLS and mTLS.
+For OpenShift versions prior to 4.22, or when you prefer Route-based ingress, cert-manager can issue the gateway's server certificate from a real Issuer or ClusterIssuer (for example, a LetsEncrypt/ACME issuer), and an OpenShift Route with TLS passthrough exposes it externally while the gateway keeps terminating its own TLS and mTLS.
 
 Install cert-manager and configure a working `ClusterIssuer` first — see
 [Managing Certificates](/kubernetes/managing-certificates) for the
