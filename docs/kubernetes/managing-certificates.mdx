@@ -66,7 +66,7 @@ By default, cert-manager issues both the server and client certificates from
 a self-signed CA the chart creates — this rotates automatically, but the
 server certificate is still not publicly trusted. `certManager.serverIssuerRef`
 overrides the `issuerRef` on the server `Certificate` resource to point at a
-real `Issuer` or `ClusterIssuer` instead, for example an ACME issuer:
+real `Issuer` or `ClusterIssuer` instead, for example a LetsEncrypt/ACME issuer:
 
 ```shell
 helm upgrade --install openshell \

@@ -475,7 +475,7 @@ certManager:
   # -- Secret created for the intermediate CA (Certificate with isCA: true).
   caSecretName: openshell-ca-tls
   # -- Override the issuerRef for the external server Certificate (e.g. a real
-  # ACME ClusterIssuer for a publicly-trusted cert on an external hostname).
+  # LetsEncrypt/ACME ClusterIssuer for a publicly-trusted cert on an external hostname).
   # When set, the chart creates a second server certificate from this issuer
   # with only the hostnames in serverDnsNames; the internal server certificate
   # is always signed by the chart's own CA. Leave name empty to use the chart
