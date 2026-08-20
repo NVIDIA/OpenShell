@@ -12,7 +12,8 @@ use miette::{IntoDiagnostic, Result, WrapErr};
 use openshell_core::proto::{
     CreateSandboxRequest, DeleteSandboxRequest, ExecSandboxRequest, GetSandboxRequest,
     GpuResourceRequirements, ListSandboxesRequest, ResourceRequirements, SandboxPhase, SandboxSpec,
-    WatchSandboxRequest, exec_sandbox_event, open_shell_client::OpenShellClient,
+    StartSandboxRequest, StopSandboxRequest, WatchSandboxRequest, exec_sandbox_event,
+    open_shell_client::OpenShellClient,
 };
 use openshell_core::{ObjectId, ObjectName};
 use tonic::Code;
@@ -108,17 +109,17 @@ fn all_scenarios() -> &'static [Scenario] {
     &[
         Scenario {
             name: "lifecycle",
-            description: "Create → running → stop → delete completes without error",
+            description: "Create → ready → stop → stopped → start → ready → delete",
             sandbox_name_stems: &["life"],
         },
         Scenario {
             name: "not-found",
-            description: "Get/stop/delete for an unknown sandbox ID returns an appropriate error",
+            description: "Get/start/stop/delete for an unknown sandbox name returns NOT_FOUND",
             sandbox_name_stems: &[],
         },
         Scenario {
-            name: "idempotent-delete",
-            description: "Deleting an already-deleted sandbox returns NOT_FOUND",
+            name: "repeat-delete",
+            description: "Repeating delete after gateway record removal returns NOT_FOUND",
             sandbox_name_stems: &["del"],
         },
         Scenario {
@@ -324,7 +325,7 @@ async fn run_scenario(name: &str, client: &mut GrpcClient, run_id: &str) -> Resu
     match name {
         "lifecycle" => scenario_lifecycle(client, run_id).await,
         "not-found" => scenario_not_found(client, run_id).await,
-        "idempotent-delete" => scenario_idempotent_delete(client, run_id).await,
+        "repeat-delete" => scenario_repeat_delete(client, run_id).await,
         "validate" => scenario_validate(client).await,
         "concurrent" => scenario_concurrent(client, run_id).await,
         "labels" => scenario_labels(client, run_id).await,
@@ -334,13 +335,13 @@ async fn run_scenario(name: &str, client: &mut GrpcClient, run_id: &str) -> Resu
     }
 }
 
-/// Poll `WatchSandbox` until the sandbox reaches Ready, returning an error on
-/// Error phase or a closed stream. Does not perform cleanup — callers are
-/// responsible for deleting the sandbox if this returns an error.
-async fn wait_for_ready(
+/// Poll `WatchSandbox` until the sandbox reaches the target phase, returning
+/// an error on Error phase or a closed stream. Does not perform cleanup.
+async fn wait_for_phase(
     client: &mut GrpcClient,
     sandbox_id: &str,
     sandbox_name: &str,
+    target_phase: SandboxPhase,
 ) -> Result<()> {
     let mut stream = client
         .watch_sandbox(WatchSandboxRequest {
@@ -366,21 +367,48 @@ async fn wait_for_ready(
             .wrap_err("watch_sandbox stream error")?;
         if let Some(openshell_core::proto::sandbox_stream_event::Payload::Sandbox(s)) = evt.payload
         {
-            match SandboxPhase::try_from(s.phase()).unwrap_or(SandboxPhase::Unknown) {
-                SandboxPhase::Ready => return Ok(()),
+            let phase = SandboxPhase::try_from(s.phase()).unwrap_or(SandboxPhase::Unknown);
+            match phase {
                 SandboxPhase::Error => {
                     return Err(miette::miette!(
-                        "sandbox '{sandbox_name}' entered Error phase before becoming Ready"
+                        "sandbox '{sandbox_name}' entered Error phase before becoming {}",
+                        target_phase.as_str_name()
                     ));
                 }
+                _ if phase == target_phase => return Ok(()),
                 _ => {}
             }
         }
     }
 
     Err(miette::miette!(
-        "watch stream ended before sandbox '{sandbox_name}' reached Ready"
+        "watch stream ended before sandbox '{sandbox_name}' reached {}",
+        target_phase.as_str_name()
     ))
+}
+
+async fn wait_for_ready(
+    client: &mut GrpcClient,
+    sandbox_id: &str,
+    sandbox_name: &str,
+) -> Result<()> {
+    wait_for_phase(client, sandbox_id, sandbox_name, SandboxPhase::Ready).await
+}
+
+fn expect_not_found<T>(
+    result: std::result::Result<tonic::Response<T>, tonic::Status>,
+    operation: &str,
+) -> Result<()> {
+    match result {
+        Err(status) if status.code() == Code::NotFound => Ok(()),
+        Err(status) => Err(miette::miette!(
+            "{operation} returned {} instead of NOT_FOUND",
+            status.code()
+        )),
+        Ok(_) => Err(miette::miette!(
+            "{operation} succeeded instead of returning NOT_FOUND"
+        )),
+    }
 }
 
 /// Poll until the gateway no longer has a record for the sandbox.
@@ -405,11 +433,10 @@ async fn wait_for_not_found(client: &mut GrpcClient, sandbox_name: &str) -> Resu
     }
 }
 
-/// Scenario: create → ready → delete.
+/// Scenario: create → ready → stop → stopped → start → ready → delete.
 ///
-/// Creates a minimal sandbox, waits for it to reach the Ready phase, then
-/// deletes it. Verifies that the sandbox appears in the list between create
-/// and delete, and that delete reports it as deleted.
+/// Creates a minimal sandbox and verifies the portable stop/start phase
+/// transitions before deleting it.
 async fn scenario_lifecycle(client: &mut GrpcClient, run_id: &str) -> Result<()> {
     let sandbox_name = sandbox_name("life", run_id);
 
@@ -432,99 +459,127 @@ async fn scenario_lifecycle(client: &mut GrpcClient, run_id: &str) -> Result<()>
         .ok_or_else(|| miette::miette!("create_sandbox response missing sandbox"))?;
     let sandbox_id = sandbox.object_id().to_string();
 
-    // ── 2. Wait for Ready ────────────────────────────────────────────────
-    if let Err(e) = wait_for_ready(client, &sandbox_id, &sandbox_name).await {
-        let _ = client
+    let scenario_result = async {
+        // ── 2. Wait for Ready ────────────────────────────────────────────
+        wait_for_ready(client, &sandbox_id, &sandbox_name).await?;
+
+        // ── 3. Stop and wait for Stopped ─────────────────────────────────
+        client
+            .stop_sandbox(StopSandboxRequest {
+                name: sandbox_name.clone(),
+                workspace: String::new(),
+            })
+            .await
+            .into_diagnostic()
+            .wrap_err("stop_sandbox failed")?;
+        wait_for_phase(client, &sandbox_id, &sandbox_name, SandboxPhase::Stopped).await?;
+
+        // ── 4. Start and wait for Ready again ────────────────────────────
+        client
+            .start_sandbox(StartSandboxRequest {
+                name: sandbox_name.clone(),
+                workspace: String::new(),
+            })
+            .await
+            .into_diagnostic()
+            .wrap_err("start_sandbox failed")?;
+        wait_for_ready(client, &sandbox_id, &sandbox_name).await?;
+
+        // ── 5. Verify it still appears in the list ───────────────────────
+        let found = client
+            .list_sandboxes(ListSandboxesRequest::default())
+            .await
+            .into_diagnostic()
+            .wrap_err("list_sandboxes failed")?
+            .into_inner()
+            .sandboxes
+            .iter()
+            .any(|sandbox| sandbox.object_name() == sandbox_name);
+
+        if !found {
+            return Err(miette::miette!(
+                "sandbox '{sandbox_name}' not found after stop and start"
+            ));
+        }
+
+        // ── 6. Delete ────────────────────────────────────────────────────
+        let deleted = client
             .delete_sandbox(DeleteSandboxRequest {
                 name: sandbox_name.clone(),
                 workspace: String::new(),
             })
-            .await;
-        return Err(e);
+            .await
+            .into_diagnostic()
+            .wrap_err("delete_sandbox failed")?
+            .into_inner()
+            .deleted;
+        if !deleted {
+            return Err(miette::miette!(
+                "delete_sandbox reported sandbox '{sandbox_name}' was not deleted"
+            ));
+        }
+
+        Ok(())
+    }
+    .await;
+
+    if scenario_result.is_err() {
+        let _ = cleanup_sandboxes(client, std::slice::from_ref(&sandbox_name)).await;
     }
 
-    // ── 3. Verify it appears in the list ────────────────────────────────
-    let list_response = client
-        .list_sandboxes(ListSandboxesRequest::default())
-        .await
-        .into_diagnostic()
-        .wrap_err("list_sandboxes failed")?;
-
-    let found = list_response
-        .into_inner()
-        .sandboxes
-        .iter()
-        .any(|s| s.object_name() == sandbox_name);
-
-    if !found {
-        let _ = client
-            .delete_sandbox(DeleteSandboxRequest {
-                name: sandbox_name.clone(),
-                workspace: String::new(),
-            })
-            .await;
-        return Err(miette::miette!(
-            "sandbox '{sandbox_name}' not found in list_sandboxes response after creation"
-        ));
-    }
-
-    // ── 4. Delete ────────────────────────────────────────────────────────
-    let del_response = client
-        .delete_sandbox(DeleteSandboxRequest {
-            name: sandbox_name.clone(),
-            workspace: String::new(),
-        })
-        .await
-        .into_diagnostic()
-        .wrap_err("delete_sandbox failed")?;
-
-    if !del_response.into_inner().deleted {
-        return Err(miette::miette!(
-            "delete_sandbox reported sandbox '{sandbox_name}' was not deleted"
-        ));
-    }
-
-    Ok(())
+    scenario_result
 }
 
-/// Scenario: get and delete a sandbox that does not exist.
+/// Scenario: get, start, stop, and delete a sandbox that does not exist.
 ///
-/// Verifies that `GetSandbox` and `DeleteSandbox` return `NOT_FOUND` for a
-/// name that was never created.
+/// Verifies that every name-based lifecycle operation returns `NOT_FOUND` for
+/// a name that was never created.
 async fn scenario_not_found(client: &mut GrpcClient, run_id: &str) -> Result<()> {
     let phantom_name = sandbox_name("miss", run_id);
 
     // ── 1. GetSandbox → NOT_FOUND ────────────────────────────────────────
-    let err = client
-        .get_sandbox(GetSandboxRequest {
-            name: phantom_name.clone(),
-            workspace: String::new(),
-        })
-        .await
-        .expect_err("get_sandbox on a non-existent sandbox should have returned NOT_FOUND");
+    expect_not_found(
+        client
+            .get_sandbox(GetSandboxRequest {
+                name: phantom_name.clone(),
+                workspace: String::new(),
+            })
+            .await,
+        "get_sandbox",
+    )?;
 
-    if err.code() != Code::NotFound {
-        return Err(miette::miette!(
-            "get_sandbox returned {} instead of NOT_FOUND",
-            err.code()
-        ));
-    }
+    // ── 2. StartSandbox → NOT_FOUND ──────────────────────────────────────
+    expect_not_found(
+        client
+            .start_sandbox(StartSandboxRequest {
+                name: phantom_name.clone(),
+                workspace: String::new(),
+            })
+            .await,
+        "start_sandbox",
+    )?;
 
-    // ── 2. DeleteSandbox → NOT_FOUND ────────────────────────────────────
-    let err = client
-        .delete_sandbox(DeleteSandboxRequest {
-            name: phantom_name.clone(),
-            workspace: String::new(),
-        })
-        .await
-        .expect_err("delete_sandbox on a non-existent sandbox should have returned NOT_FOUND");
+    // ── 3. StopSandbox → NOT_FOUND ───────────────────────────────────────
+    expect_not_found(
+        client
+            .stop_sandbox(StopSandboxRequest {
+                name: phantom_name.clone(),
+                workspace: String::new(),
+            })
+            .await,
+        "stop_sandbox",
+    )?;
 
-    if err.code() != Code::NotFound {
-        return Err(miette::miette!(
-            "delete_sandbox returned {} instead of NOT_FOUND",
-            err.code()
-        ));
-    }
+    // ── 4. DeleteSandbox → NOT_FOUND ────────────────────────────────────
+    expect_not_found(
+        client
+            .delete_sandbox(DeleteSandboxRequest {
+                name: phantom_name,
+                workspace: String::new(),
+            })
+            .await,
+        "delete_sandbox",
+    )?;
 
     Ok(())
 }
@@ -534,7 +589,7 @@ async fn scenario_not_found(client: &mut GrpcClient, run_id: &str) -> Result<()>
 /// Creates a sandbox, waits for it to be Ready, deletes it (expecting
 /// `deleted: true`), then deletes it again and asserts the second call returns
 /// `NOT_FOUND` because the gateway record has already been removed.
-async fn scenario_idempotent_delete(client: &mut GrpcClient, run_id: &str) -> Result<()> {
+async fn scenario_repeat_delete(client: &mut GrpcClient, run_id: &str) -> Result<()> {
     let sandbox_name = sandbox_name("del", run_id);
 
     // ── 1. Create ────────────────────────────────────────────────────────
@@ -1086,7 +1141,7 @@ mod tests {
             [
                 "lifecycle",
                 "not-found",
-                "idempotent-delete",
+                "repeat-delete",
                 "validate",
                 "concurrent",
                 "labels",
