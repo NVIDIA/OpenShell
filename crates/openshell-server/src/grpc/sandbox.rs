@@ -171,7 +171,7 @@ fn emit_sandbox_create_telemetry(
     request: &CreateSandboxRequest,
     outcome: TelemetryOutcome,
 ) {
-    let compute_driver = telemetry_compute_driver(state.compute.driver_kind());
+    let compute_driver = telemetry_compute_driver(state.compute.configured_driver_name());
     let Some(spec) = request.spec.as_ref() else {
         openshell_core::telemetry::emit_sandbox_create(
             outcome,
@@ -204,10 +204,8 @@ fn emit_sandbox_create_telemetry(
     );
 }
 
-fn telemetry_compute_driver(
-    driver_kind: Option<openshell_core::ComputeDriverKind>,
-) -> TelemetryComputeDriver {
-    TelemetryComputeDriver::from_driver_kind(driver_kind)
+fn telemetry_compute_driver(driver_name: &str) -> TelemetryComputeDriver {
+    TelemetryComputeDriver::from_raw(driver_name)
 }
 
 async fn handle_create_sandbox_inner(
@@ -336,11 +334,8 @@ async fn handle_create_sandbox_inner(
             status
         })?;
 
-    // Mint the gateway JWT for singleplayer drivers. K8s sandboxes skip
-    // this mint and bootstrap via `IssueSandboxToken` at supervisor
-    // startup; identifying "is this K8s?" lives in the compute layer, so
-    // we mint unconditionally here when the issuer is configured and let
-    // the K8s driver simply ignore the field.
+    // Mint a gateway JWT whenever the issuer is configured. Compute runtimes
+    // that bootstrap through another authentication mechanism may ignore it.
     let sandbox_token = state.sandbox_jwt_issuer.as_ref().map(|issuer| {
         issuer.mint(&id).map(|minted| {
             tracing::info!(
@@ -2422,24 +2417,24 @@ mod tests {
     #[test]
     fn telemetry_compute_driver_uses_resolved_driver_kind() {
         assert_eq!(
-            telemetry_compute_driver(Some(openshell_core::ComputeDriverKind::Docker)),
-            TelemetryComputeDriver::Docker
+            telemetry_compute_driver("docker"),
+            TelemetryComputeDriver::from_raw("docker")
         );
         assert_eq!(
-            telemetry_compute_driver(Some(openshell_core::ComputeDriverKind::Kubernetes)),
-            TelemetryComputeDriver::Kubernetes
+            telemetry_compute_driver("kubernetes"),
+            TelemetryComputeDriver::from_raw("kubernetes")
         );
         assert_eq!(
-            telemetry_compute_driver(Some(openshell_core::ComputeDriverKind::Podman)),
-            TelemetryComputeDriver::Podman
+            telemetry_compute_driver("podman"),
+            TelemetryComputeDriver::from_raw("podman")
         );
         assert_eq!(
-            telemetry_compute_driver(Some(openshell_core::ComputeDriverKind::Vm)),
-            TelemetryComputeDriver::Vm
+            telemetry_compute_driver("vm"),
+            TelemetryComputeDriver::from_raw("vm")
         );
         assert_eq!(
-            telemetry_compute_driver(None),
-            TelemetryComputeDriver::Unknown
+            telemetry_compute_driver(""),
+            TelemetryComputeDriver::from_raw("")
         );
     }
 
@@ -3383,8 +3378,7 @@ mod tests {
 
     #[tokio::test]
     async fn create_and_get_preserve_partial_process_identity() {
-        let state =
-            test_server_state_with_driver(openshell_core::ComputeDriverKind::Docker.as_str()).await;
+        let state = test_server_state_with_driver("docker").await;
         let policy = openshell_core::proto::SandboxPolicy {
             version: 1,
             process: Some(openshell_core::proto::ProcessPolicy {
@@ -3447,9 +3441,7 @@ mod tests {
 
     #[tokio::test]
     async fn create_and_get_preserve_partial_process_identity_for_kubernetes() {
-        let state =
-            test_server_state_with_driver(openshell_core::ComputeDriverKind::Kubernetes.as_str())
-                .await;
+        let state = test_server_state_with_driver("kubernetes").await;
         let policy = openshell_core::proto::SandboxPolicy {
             version: 1,
             process: Some(openshell_core::proto::ProcessPolicy {

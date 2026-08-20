@@ -103,9 +103,8 @@ of re-querying drivers on each request.
 The gateway binary explicitly installs the compute drivers compiled into that
 binary before entering server startup. The server selects a configured driver
 by normalized registry name. When no driver is configured, it evaluates only
-the installed drivers' probes in registered priority order, records every
-available registration, and selects the first. Drivers without a probe,
-including VM, remain opt-in.
+the installed drivers' probes and chooses the lowest registered priority.
+Drivers without a probe, including VM, remain opt-in.
 
 Startup computes this selection once after merging configuration. The same
 selection drives authentication defaults and runtime construction, so a probe
@@ -117,17 +116,18 @@ registry. Adding or removing a compiled driver therefore changes registration
 rather than the server's selection flow. Alternate gateway binaries can install
 their own `ComputeDriverFactory` registrations and hand the completed registry
 to `run_cli_with_compute_drivers`; factories receive merged driver config and
-finish through the same in-process runtime adapter. A configured UDS endpoint
-still takes precedence over a compiled registration with the same name.
+return either an in-process driver or a gateway-managed remote endpoint. The
+server constructs the common runtime adapter and snapshots `GetCapabilities`
+for either result. A configured UDS endpoint still takes precedence over a
+compiled registration with the same name.
 
-The standard server crate groups first-party registrations behind the
-`in-tree-compute-drivers` feature. Protocol-only gateway builds disable that
-feature and link no compute-driver crates. E2E lanes compose that gateway with
-Docker, Podman, Kubernetes, and VM driver executables over the public UDS gRPC
-contract so an in-tree driver cannot silently depend on a server-only API.
-External Kubernetes drivers support shared and managed workspace modes.
-Operator mode requires an in-process dynamic namespace allowlist and is
-rejected when Kubernetes is configured through an external endpoint.
+The `openshell-gateway` composition crate groups first-party registrations
+behind the `in-tree-compute-drivers` feature. `openshell-server` has no compute
+driver dependencies or backend-name dispatch. Protocol-only gateway builds
+disable the composition feature and link no compute-driver crates. E2E lanes
+compose that gateway with Docker, Podman, Kubernetes, and VM driver executables
+over the public UDS gRPC contract so an in-tree driver cannot silently depend
+on a server-only API.
 
 ## Stop and Start Lifecycle
 
@@ -436,13 +436,13 @@ image-pull Secrets in every operator-managed namespace.
 
 **Operator** uses pre-provisioned namespaces discovered through two optional
 sources: a K8s label selector (`operator_namespace_label`) and a drop-in
-allowlist file (`operator_namespace_file`). At least one must be configured.
-The `OperatorNamespaceAllowlist` (`Arc<RwLock<BTreeSet<String>>>`) is populated
-at runtime by background watchers and read by the namespace resolver. Sandbox
-creation fails closed if the workspace is not in the current allowlist. Platform
-teams manage namespace lifecycle externally. RBAC uses the same ClusterRole as
-managed mode but without namespace `create`/`delete` or ServiceAccount
-permissions.
+allowlist file (`operator_namespace_file`). Exactly one must be configured.
+The compute driver and the gateway's ServiceAccount authenticator independently
+watch that public config source; no in-process driver state crosses into the
+server. Sandbox creation and token bootstrap fail closed if the workspace is
+not in the current allowlist. Platform teams manage namespace lifecycle
+externally. RBAC uses the same ClusterRole as managed mode but without namespace
+`create`/`delete` or ServiceAccount permissions.
 
 ### Watching and Querying
 

@@ -442,7 +442,7 @@ jobs:
         run: |
           set -euo pipefail
           mise x -- rustup target add ${{ matrix.target }}
-          mise x -- cargo zigbuild --release --target ${{ matrix.zig_target }} -p openshell-server --bin openshell-gateway --features bundled-z3
+          mise x -- cargo zigbuild --release --target ${{ matrix.zig_target }} -p openshell-gateway --bin openshell-gateway --features bundled-z3
           mkdir -p artifacts/bin
           install -m 0755 target/${{ matrix.target }}/release/openshell-gateway artifacts/bin/openshell-gateway
 

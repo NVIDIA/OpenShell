@@ -48,8 +48,6 @@ mod tracing_setup;
 mod ws_tunnel;
 
 use metrics_exporter_prometheus::PrometheusBuilder;
-#[cfg(target_os = "windows")]
-use openshell_core::ComputeDriverKind;
 use openshell_core::net::set_tcp_nodelay_best_effort;
 use openshell_core::{Config, Error, ObjectLabels, Result};
 use openshell_extension_core::{
@@ -59,7 +57,7 @@ use openshell_supervisor_middleware::MiddlewareRegistry;
 use std::collections::{BTreeMap, HashMap};
 use std::io::ErrorKind;
 use std::net::SocketAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::sync::LazyLock;
 use std::sync::{Arc, Mutex};
@@ -286,8 +284,8 @@ pub struct ServerState {
 
     /// Registry of active supervisor sessions and pending relay channels.
     ///
-    /// Stored as `Arc` so compute drivers (e.g. the Docker driver)
-    /// can be constructed before `ServerState` and still
+    /// Stored as `Arc` so compiled compute drivers can be constructed before
+    /// `ServerState` and still
     /// query session state to surface supervisor readiness.
     pub supervisor_sessions: Arc<supervisor_session::SupervisorSessionRegistry>,
 
@@ -431,14 +429,14 @@ impl ServerState {
 /// Returns an error if the server fails to start or encounters a fatal error.
 pub(crate) async fn run_server(
     startup: ServerStartupConfig,
-    compute_driver: ConfiguredComputeDriver,
     tracing_log_bus: TracingLogBus,
+    compute_drivers: ComputeDriverRegistry,
 ) -> Result<()> {
     let ServerStartupConfig {
         config,
         config_file,
         guest_tls,
-        compute_driver: _,
+        compute_driver,
     } = startup;
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
@@ -586,10 +584,11 @@ pub(crate) async fn run_server(
         gateway_tls_enabled: config.tls.is_some(),
         endpoint_overrides: &config.compute_driver_endpoints,
     };
-    let (compute, operator_allowlist) = build_compute_runtime(
+    let compute = build_compute_runtime(
+        &compute_drivers,
+        &compute_driver,
         &config,
         driver_startup,
-        compute_driver,
         store.clone(),
         sandbox_index.clone(),
         sandbox_watch_bus.clone(),
@@ -669,10 +668,29 @@ pub(crate) async fn run_server(
             compute::driver_config::kubernetes_sa_bootstrap_config(config_file.as_ref())?;
         let sandbox_namespace = kubernetes_config.namespace.clone();
         let sandbox_service_account = kubernetes_config.service_account_name.clone();
-        let namespace_validator =
-            kubernetes_namespace_validator(&kubernetes_config, &operator_allowlist)?;
         match kube::Client::try_default().await {
             Ok(client) => {
+                let namespace_validator = match kubernetes_config.workspace_mode.as_str() {
+                    "shared" => {
+                        auth::k8s_sa::NamespaceValidator::Exact(kubernetes_config.namespace)
+                    }
+                    "managed" => auth::k8s_sa::NamespaceValidator::Prefix(format!(
+                        "openshell-{}-",
+                        kubernetes_config.gateway_id
+                    )),
+                    "operator" => auth::k8s_sa::NamespaceValidator::Allowlist(
+                        auth::k8s_sa::operator_namespace_allowlist(
+                            &kubernetes_config,
+                            client.clone(),
+                            shutdown_rx.clone(),
+                        )?,
+                    ),
+                    mode => {
+                        return Err(Error::config(format!(
+                            "invalid Kubernetes workspace_mode '{mode}' for ServiceAccount bootstrap"
+                        )));
+                    }
+                };
                 let resolver = Arc::new(auth::k8s_sa::LiveK8sResolver::new(
                     client,
                     namespace_validator,
@@ -1052,75 +1070,59 @@ async fn terminate_signal() {
     let _ = signal.recv().await;
 }
 
-#[cfg(all(target_os = "windows", feature = "in-tree-compute-drivers"))]
-fn unsupported_builtin_compute_driver(driver: ComputeDriverKind) -> compute::ComputeError {
-    compute::ComputeError::Message(format!(
-        "{} compute driver is unsupported on Windows",
-        driver.as_str()
-    ))
+pub use compute::{
+    AcquiredRemoteDriverEndpoint, DriverWatchStream, ManagedDriverProcess, SharedComputeDriver,
+};
+
+/// Driver instance returned by a compiled compute-driver factory.
+pub enum ComputeDriverInstance {
+    /// A driver hosted in the gateway process.
+    InProcess(SharedComputeDriver),
+    /// A driver process launched and owned by the gateway.
+    ManagedRemote(AcquiredRemoteDriverEndpoint),
 }
 
-type OperatorAllowlistArc = Option<openshell_core::OperatorNamespaceAllowlist>;
-pub use compute::{DriverWatchStream, SharedComputeDriver};
+/// Type-erased tracing layer contributed by a compiled compute driver.
+pub type ComputeDriverTracingLayer =
+    Box<dyn tracing_subscriber::Layer<tracing_subscriber::Registry> + Send + Sync>;
 
-fn kubernetes_namespace_validator(
-    config: &compute::driver_config::KubernetesSaBootstrapConfig,
-    operator_allowlist: &OperatorAllowlistArc,
-) -> Result<auth::k8s_sa::NamespaceValidator> {
-    match config.workspace_mode.as_str() {
-        "shared" => Ok(auth::k8s_sa::NamespaceValidator::Exact(
-            config.namespace.clone(),
-        )),
-        "managed" => Ok(auth::k8s_sa::NamespaceValidator::Prefix(format!(
-            "openshell-{}-",
-            config.gateway_id
-        ))),
-        "operator" => operator_allowlist
-            .clone()
-            .map(auth::k8s_sa::NamespaceValidator::Allowlist)
-            .ok_or_else(|| {
-                Error::config("Kubernetes operator namespace allowlist was not initialized")
-            }),
-        mode => Err(Error::config(format!(
-            "invalid Kubernetes workspace_mode '{mode}' for ServiceAccount bootstrap"
-        ))),
+/// Shutdown callback for resources owned by a compute-driver tracing layer.
+pub type ComputeDriverTracingShutdown =
+    Box<dyn Fn() -> std::result::Result<(), String> + Send + Sync>;
+
+/// Optional process-wide tracing integration supplied by a compiled driver.
+#[derive(Default)]
+pub struct ComputeDriverTracingSetup {
+    layer: Option<ComputeDriverTracingLayer>,
+    shutdown: Option<ComputeDriverTracingShutdown>,
+    error: Option<String>,
+    target_prefix: Option<&'static str>,
+}
+
+impl ComputeDriverTracingSetup {
+    #[must_use]
+    pub fn new(
+        layer: Option<ComputeDriverTracingLayer>,
+        shutdown: Option<ComputeDriverTracingShutdown>,
+        error: Option<String>,
+        target_prefix: Option<&'static str>,
+    ) -> Self {
+        Self {
+            layer,
+            shutdown,
+            error,
+            target_prefix,
+        }
     }
 }
 
-fn validate_remote_compute_driver_config(
-    name: &str,
-    file: Option<&config_file::ConfigFile>,
-) -> Result<()> {
-    if name != "kubernetes"
-        || !file.is_some_and(|file| file.openshell.drivers.contains_key("kubernetes"))
-    {
-        return Ok(());
-    }
-
-    let config = compute::driver_config::kubernetes_sa_bootstrap_config(file)?;
-    if config.workspace_mode == "operator" {
-        return Err(Error::config(
-            "Kubernetes workspace_mode 'operator' requires an in-process Kubernetes driver; \
-             external Kubernetes compute drivers do not support operator mode",
-        ));
-    }
-
-    Ok(())
-}
-
-/// Opaque result returned by a compiled compute-driver factory.
-pub struct ComputeDriverBuildOutput {
-    runtime: ComputeRuntime,
-    operator_allowlist: OperatorAllowlistArc,
-}
+/// Factory for a compiled driver's optional tracing integration.
+pub type ComputeDriverTracingFactory = fn(Option<&str>) -> ComputeDriverTracingSetup;
 
 /// Factory for a compute driver linked into a gateway binary.
 #[async_trait::async_trait]
 pub trait ComputeDriverFactory: Send + Sync {
-    async fn build(
-        &self,
-        context: ComputeDriverBuildContext<'_>,
-    ) -> Result<ComputeDriverBuildOutput>;
+    async fn build(&self, context: ComputeDriverBuildContext<'_>) -> Result<ComputeDriverInstance>;
 }
 
 /// One named compiled-driver registration.
@@ -1130,6 +1132,10 @@ pub struct ComputeDriverRegistration {
     detection_priority: u16,
     detect: Option<fn() -> bool>,
     factory: Arc<dyn ComputeDriverFactory>,
+    inherited_config_keys: &'static [&'static str],
+    local_singleplayer: bool,
+    supports_mtls_user_auth: bool,
+    tracing_setup: Option<ComputeDriverTracingFactory>,
 }
 
 impl std::fmt::Debug for ComputeDriverRegistration {
@@ -1158,7 +1164,49 @@ impl ComputeDriverRegistration {
             detection_priority,
             detect,
             factory: Arc::new(factory),
+            inherited_config_keys: &[],
+            local_singleplayer: false,
+            supports_mtls_user_auth: true,
+            tracing_setup: None,
         })
+    }
+
+    /// Select gateway-wide defaults understood by this driver's config type.
+    #[must_use]
+    pub fn with_inherited_config_keys(mut self, keys: &'static [&'static str]) -> Self {
+        self.inherited_config_keys = keys;
+        self
+    }
+
+    /// Mark a backend whose local deployment should use single-player defaults.
+    #[must_use]
+    pub fn with_local_singleplayer(mut self) -> Self {
+        self.local_singleplayer = true;
+        self
+    }
+
+    /// Mark a backend that requires user authentication other than mTLS.
+    #[must_use]
+    pub fn without_mtls_user_auth(mut self) -> Self {
+        self.supports_mtls_user_auth = false;
+        self
+    }
+
+    /// Attach optional process-wide tracing for this compiled driver.
+    #[must_use]
+    pub fn with_tracing_setup(mut self, setup: ComputeDriverTracingFactory) -> Self {
+        self.tracing_setup = Some(setup);
+        self
+    }
+
+    #[must_use]
+    pub(crate) fn is_local_singleplayer(&self) -> bool {
+        self.local_singleplayer
+    }
+
+    #[must_use]
+    pub(crate) fn supports_mtls_user_auth(&self) -> bool {
+        self.supports_mtls_user_auth
     }
 }
 
@@ -1224,8 +1272,25 @@ impl ComputeDriverRegistry {
         self.drivers.keys().map(String::as_str)
     }
 
-    fn get(&self, name: &str) -> Option<&ComputeDriverRegistration> {
+    pub(crate) fn get(&self, name: &str) -> Option<&ComputeDriverRegistration> {
         self.drivers.get(name)
+    }
+
+    fn tracing_setup(
+        &self,
+        selection: &ComputeDriverSelection,
+        endpoint_overrides: &BTreeMap<String, PathBuf>,
+        otlp_endpoint: Option<&str>,
+    ) -> ComputeDriverTracingSetup {
+        let name = selection.name();
+        if endpoint_overrides.contains_key(name) {
+            return ComputeDriverTracingSetup::default();
+        }
+        self.get(name)
+            .and_then(|registration| registration.tracing_setup)
+            .map_or_else(ComputeDriverTracingSetup::default, |setup| {
+                setup(otlp_endpoint)
+            })
     }
 
     fn detect(&self) -> ComputeDriverDetection {
@@ -1254,7 +1319,7 @@ impl ComputeDriverRegistry {
                 if detection.selected().is_none() {
                     return Err(Error::config(
                         "no compute driver configured and auto-detection found no suitable installed \
-                        driver; set --drivers <name> or OPENSHELL_DRIVERS=<name>",
+                         driver; set --drivers <name> or OPENSHELL_DRIVERS=<name>",
                     ));
                 }
                 Ok(ComputeDriverSelection::AutoDetected(detection))
@@ -1272,80 +1337,13 @@ impl ComputeDriverRegistry {
     }
 }
 
-/// Install every first-party compute driver linked into the standard gateway.
-#[must_use]
-pub fn install_default_compute_drivers() -> ComputeDriverRegistry {
-    #[allow(unused_mut)]
-    let mut registry = ComputeDriverRegistry::new();
-    #[cfg(all(not(target_os = "windows"), feature = "in-tree-compute-drivers"))]
-    {
-        registry
-            .install(
-                ComputeDriverRegistration::new(
-                    "kubernetes",
-                    100,
-                    Some(|| std::env::var_os("KUBERNETES_SERVICE_HOST").is_some()),
-                    KubernetesComputeDriverFactory,
-                )
-                .expect("valid kubernetes registration"),
-            )
-            .expect("unique kubernetes registration");
-        registry
-            .install(
-                ComputeDriverRegistration::new(
-                    "podman",
-                    200,
-                    Some(openshell_core::config::is_podman_available),
-                    PodmanComputeDriverFactory,
-                )
-                .expect("valid podman registration"),
-            )
-            .expect("unique podman registration");
-        registry
-            .install(
-                ComputeDriverRegistration::new(
-                    "docker",
-                    300,
-                    Some(openshell_core::config::is_docker_available),
-                    DockerComputeDriverFactory,
-                )
-                .expect("valid docker registration"),
-            )
-            .expect("unique docker registration");
-        registry
-            .install(
-                ComputeDriverRegistration::new("vm", u16::MAX, None, VmComputeDriverFactory)
-                    .expect("valid vm registration"),
-            )
-            .expect("unique vm registration");
-    }
-    #[cfg(all(target_os = "windows", feature = "in-tree-compute-drivers"))]
-    for name in ["kubernetes", "podman", "docker", "vm"] {
-        registry
-            .install(
-                ComputeDriverRegistration::new(
-                    name,
-                    u16::MAX,
-                    None,
-                    UnsupportedComputeDriverFactory,
-                )
-                .expect("valid unsupported registration"),
-            )
-            .expect("unique unsupported registration");
-    }
-    registry
-}
-
 pub struct ComputeDriverBuildContext<'a> {
     driver_name: String,
-    config: &'a Config,
+    gateway_bind_address: SocketAddr,
+    gateway_log_level: &'a str,
     driver_startup: compute::driver_config::DriverStartupContext<'a>,
-    store: Arc<Store>,
-    sandbox_index: SandboxIndex,
-    sandbox_watch_bus: SandboxWatchBus,
-    tracing_log_bus: TracingLogBus,
-    supervisor_sessions: Arc<supervisor_session::SupervisorSessionRegistry>,
     shutdown_rx: watch::Receiver<bool>,
+    inherited_config_keys: &'static [&'static str],
 }
 
 impl ComputeDriverBuildContext<'_> {
@@ -1355,8 +1353,13 @@ impl ComputeDriverBuildContext<'_> {
     }
 
     #[must_use]
-    pub fn gateway_config(&self) -> &Config {
-        self.config
+    pub fn gateway_bind_address(&self) -> SocketAddr {
+        self.gateway_bind_address
+    }
+
+    #[must_use]
+    pub fn gateway_log_level(&self) -> &str {
+        self.gateway_log_level
     }
 
     #[must_use]
@@ -1382,7 +1385,11 @@ impl ComputeDriverBuildContext<'_> {
     where
         T: Default + serde::de::DeserializeOwned,
     {
-        compute::driver_config::driver_config_from_context(self.driver_startup, &self.driver_name)
+        compute::driver_config::driver_config_from_context(
+            self.driver_startup,
+            &self.driver_name,
+            self.inherited_config_keys,
+        )
     }
 
     #[must_use]
@@ -1390,216 +1397,86 @@ impl ComputeDriverBuildContext<'_> {
         self.shutdown_rx.clone()
     }
 
-    /// Finish construction of an in-process driver through the common runtime path.
-    pub async fn finish_in_process(
-        self,
-        driver: SharedComputeDriver,
-    ) -> Result<ComputeDriverBuildOutput> {
-        let runtime = ComputeRuntime::from_driver(
-            self.driver_name,
-            driver,
-            None,
-            self.store,
-            self.sandbox_index,
-            self.sandbox_watch_bus,
-            self.tracing_log_bus,
-            self.supervisor_sessions,
-        )
-        .await
-        .map_err(|error| Error::execution(format!("failed to create compute runtime: {error}")))?;
-        Ok(ComputeDriverBuildOutput {
-            runtime,
-            operator_allowlist: None,
-        })
-    }
-}
-
-#[cfg(all(target_os = "windows", feature = "in-tree-compute-drivers"))]
-#[derive(Clone, Copy)]
-struct UnsupportedComputeDriverFactory;
-
-#[cfg(all(target_os = "windows", feature = "in-tree-compute-drivers"))]
-#[async_trait::async_trait]
-impl ComputeDriverFactory for UnsupportedComputeDriverFactory {
-    async fn build(
-        &self,
-        context: ComputeDriverBuildContext<'_>,
-    ) -> Result<ComputeDriverBuildOutput> {
-        Err(Error::execution(
-            unsupported_builtin_compute_driver(
-                context
-                    .driver_name
-                    .parse()
-                    .expect("default driver names are valid"),
-            )
-            .to_string(),
-        ))
-    }
-}
-
-#[cfg(all(not(target_os = "windows"), feature = "in-tree-compute-drivers"))]
-#[derive(Clone, Copy)]
-struct KubernetesComputeDriverFactory;
-
-#[cfg(all(not(target_os = "windows"), feature = "in-tree-compute-drivers"))]
-#[async_trait::async_trait]
-impl ComputeDriverFactory for KubernetesComputeDriverFactory {
-    async fn build(
-        &self,
-        context: ComputeDriverBuildContext<'_>,
-    ) -> Result<ComputeDriverBuildOutput> {
-        warn_if_kubernetes_sandbox_jwt_expiry_disabled(context.config);
-        let config = compute::driver_config::builtin::kubernetes_config_from_context(
-            context.driver_startup,
-        )?;
-        let (runtime, operator_allowlist) = ComputeRuntime::new_kubernetes(
-            config,
-            context.store,
-            context.sandbox_index,
-            context.sandbox_watch_bus,
-            context.tracing_log_bus,
-            context.supervisor_sessions,
-            context.shutdown_rx,
-        )
-        .await
-        .map_err(|error| Error::execution(format!("failed to create compute runtime: {error}")))?;
-        Ok(ComputeDriverBuildOutput {
-            runtime,
-            operator_allowlist,
-        })
-    }
-}
-
-#[cfg(all(not(target_os = "windows"), feature = "in-tree-compute-drivers"))]
-#[derive(Clone, Copy)]
-struct DockerComputeDriverFactory;
-
-#[cfg(all(not(target_os = "windows"), feature = "in-tree-compute-drivers"))]
-#[async_trait::async_trait]
-impl ComputeDriverFactory for DockerComputeDriverFactory {
-    async fn build(
-        &self,
-        context: ComputeDriverBuildContext<'_>,
-    ) -> Result<ComputeDriverBuildOutput> {
-        let driver_config =
-            compute::driver_config::builtin::docker_config_from_context(context.driver_startup)?;
-        let runtime = ComputeRuntime::new_docker(
-            context.config.clone(),
-            driver_config,
-            context.store,
-            context.sandbox_index,
-            context.sandbox_watch_bus,
-            context.tracing_log_bus,
-            context.supervisor_sessions,
-        )
-        .await
-        .map_err(|error| Error::execution(format!("failed to create compute runtime: {error}")))?;
-        Ok(ComputeDriverBuildOutput {
-            runtime,
-            operator_allowlist: None,
-        })
-    }
-}
-
-#[cfg(all(not(target_os = "windows"), feature = "in-tree-compute-drivers"))]
-#[derive(Clone, Copy)]
-struct PodmanComputeDriverFactory;
-
-#[cfg(all(not(target_os = "windows"), feature = "in-tree-compute-drivers"))]
-#[async_trait::async_trait]
-impl ComputeDriverFactory for PodmanComputeDriverFactory {
-    async fn build(
-        &self,
-        context: ComputeDriverBuildContext<'_>,
-    ) -> Result<ComputeDriverBuildOutput> {
-        let driver_config =
-            compute::driver_config::builtin::podman_config_from_context(context.driver_startup)?;
-        let runtime = ComputeRuntime::new_podman(
-            driver_config,
-            context.store,
-            context.sandbox_index,
-            context.sandbox_watch_bus,
-            context.tracing_log_bus,
-            context.supervisor_sessions,
-        )
-        .await
-        .map_err(|error| Error::execution(format!("failed to create compute runtime: {error}")))?;
-        Ok(ComputeDriverBuildOutput {
-            runtime,
-            operator_allowlist: None,
-        })
-    }
-}
-
-#[cfg(all(not(target_os = "windows"), feature = "in-tree-compute-drivers"))]
-#[derive(Clone, Copy)]
-struct VmComputeDriverFactory;
-
-#[cfg(all(not(target_os = "windows"), feature = "in-tree-compute-drivers"))]
-#[async_trait::async_trait]
-impl ComputeDriverFactory for VmComputeDriverFactory {
-    async fn build(
-        &self,
-        context: ComputeDriverBuildContext<'_>,
-    ) -> Result<ComputeDriverBuildOutput> {
-        let driver_config =
-            compute::driver_config::builtin::vm_config_from_context(context.driver_startup)?;
-        let otlp_config = context
-            .driver_startup
+    #[must_use]
+    pub fn otlp_config(&self) -> Option<&config_file::OtlpConfig> {
+        self.driver_startup
             .file
-            .and_then(|file| file.openshell.gateway.otlp.as_ref());
-        let endpoint = compute::vm::spawn(context.config, &driver_config, otlp_config).await?;
-        let runtime = ComputeRuntime::new_remote_driver(
-            endpoint,
-            context.store,
-            context.sandbox_index,
-            context.sandbox_watch_bus,
-            context.tracing_log_bus,
-            context.supervisor_sessions,
-        )
-        .await
-        .map_err(|error| Error::execution(format!("failed to create compute runtime: {error}")))?;
-        Ok(ComputeDriverBuildOutput {
-            runtime,
-            operator_allowlist: None,
-        })
+            .and_then(|file| file.openshell.gateway.otlp.as_ref())
     }
 }
 
 #[allow(clippy::too_many_arguments)]
 async fn build_compute_runtime(
+    registry: &ComputeDriverRegistry,
+    selection: &ComputeDriverSelection,
     config: &Config,
     driver_startup: compute::driver_config::DriverStartupContext<'_>,
-    driver: ConfiguredComputeDriver,
     store: Arc<Store>,
     sandbox_index: SandboxIndex,
     sandbox_watch_bus: SandboxWatchBus,
     tracing_log_bus: TracingLogBus,
     supervisor_sessions: Arc<supervisor_session::SupervisorSessionRegistry>,
     shutdown_rx: watch::Receiver<bool>,
-) -> Result<(ComputeRuntime, OperatorAllowlistArc)> {
+) -> Result<ComputeRuntime> {
+    let driver = resolve_configured_compute_driver(registry, selection.name(), driver_startup)?;
     info!(driver = %driver.name(), "Using compute driver");
+    if config
+        .gateway_jwt
+        .as_ref()
+        .is_some_and(|jwt| jwt.ttl_secs == 0)
+        && !driver.is_local_singleplayer(registry)
+    {
+        warn!(
+            "Gateway configured with non-expiring sandbox JWTs; set gateway_jwt.ttl_secs > 0 for shared deployments"
+        );
+    }
 
-    let (runtime, operator_allowlist) = match driver {
+    let runtime = match driver {
         ConfiguredComputeDriver::Registered(registration) => {
-            let output = registration
+            let instance = registration
                 .factory
                 .build(ComputeDriverBuildContext {
-                    driver_name: registration.name,
-                    config,
+                    driver_name: registration.name.clone(),
+                    gateway_bind_address: config.bind_address,
+                    gateway_log_level: &config.log_level,
                     driver_startup,
+                    shutdown_rx,
+                    inherited_config_keys: registration.inherited_config_keys,
+                })
+                .await?;
+            match instance {
+                ComputeDriverInstance::InProcess(driver) => ComputeRuntime::from_driver(
+                    registration.name,
+                    driver,
+                    None,
                     store,
                     sandbox_index,
                     sandbox_watch_bus,
                     tracing_log_bus,
                     supervisor_sessions,
-                    shutdown_rx,
-                })
-                .await?;
-            (output.runtime, output.operator_allowlist)
+                )
+                .await
+                .map_err(|error| {
+                    Error::execution(format!("failed to create compute runtime: {error}"))
+                })?,
+                ComputeDriverInstance::ManagedRemote(mut endpoint) => {
+                    endpoint.name = registration.name;
+                    ComputeRuntime::new_remote_driver(
+                        endpoint,
+                        store,
+                        sandbox_index,
+                        sandbox_watch_bus,
+                        tracing_log_bus,
+                        supervisor_sessions,
+                    )
+                    .await
+                    .map_err(|error| {
+                        Error::execution(format!("failed to create compute runtime: {error}"))
+                    })?
+                }
+            }
         }
         ConfiguredComputeDriver::Remote { name } => {
-            validate_remote_compute_driver_config(&name, driver_startup.file)?;
             let remote_config =
                 compute::driver_config::remote_driver_config_from_context(driver_startup, &name)?;
             info!(
@@ -1610,7 +1487,7 @@ async fn build_compute_runtime(
             let endpoint = compute::connect_remote_compute_driver(name, &remote_config.socket_path)
                 .await
                 .map_err(|e| Error::execution(format!("failed to create compute runtime: {e}")))?;
-            let rt = ComputeRuntime::new_remote_driver(
+            ComputeRuntime::new_remote_driver(
                 endpoint,
                 store,
                 sandbox_index,
@@ -1619,16 +1496,15 @@ async fn build_compute_runtime(
                 supervisor_sessions,
             )
             .await
-            .map_err(|e| Error::execution(format!("failed to create compute runtime: {e}")))?;
-            (rt, None)
+            .map_err(|e| Error::execution(format!("failed to create compute runtime: {e}")))?
         }
     };
 
-    Ok((runtime, operator_allowlist))
+    Ok(runtime)
 }
 
 #[derive(Debug, Clone)]
-pub(crate) enum ConfiguredComputeDriver {
+enum ConfiguredComputeDriver {
     Registered(ComputeDriverRegistration),
     Remote { name: String },
 }
@@ -1640,23 +1516,25 @@ impl ConfiguredComputeDriver {
             Self::Remote { name } => name,
         }
     }
+
+    fn is_local_singleplayer(&self, registry: &ComputeDriverRegistry) -> bool {
+        match self {
+            Self::Registered(registration) => registration.is_local_singleplayer(),
+            Self::Remote { name } => registry
+                .get(name)
+                .is_some_and(ComputeDriverRegistration::is_local_singleplayer),
+        }
+    }
 }
 
-pub(crate) fn configured_compute_driver_for_startup(
+#[cfg(test)]
+fn configured_compute_driver(
     registry: &ComputeDriverRegistry,
-    startup: &ServerStartupConfig,
+    config: &Config,
+    driver_startup: compute::driver_config::DriverStartupContext<'_>,
 ) -> Result<ConfiguredComputeDriver> {
-    resolve_configured_compute_driver(
-        registry,
-        startup.compute_driver.name(),
-        compute::driver_config::DriverStartupContext {
-            file: startup.config_file.as_ref(),
-            guest_tls: startup.guest_tls.as_ref(),
-            gateway_port: startup.config.bind_address.port(),
-            gateway_tls_enabled: startup.config.tls.is_some(),
-            endpoint_overrides: &startup.config.compute_driver_endpoints,
-        },
-    )
+    let selection = registry.select(&config.compute_drivers)?;
+    resolve_configured_compute_driver(registry, selection.name(), driver_startup)
 }
 
 fn resolve_configured_compute_driver(
@@ -1678,23 +1556,6 @@ fn resolve_configured_compute_driver(
     }
 
     Ok(ConfiguredComputeDriver::Remote { name })
-}
-
-#[cfg(any(test, feature = "in-tree-compute-drivers"))]
-fn kubernetes_sandbox_jwt_expiry_disabled(config: &Config) -> bool {
-    config
-        .gateway_jwt
-        .as_ref()
-        .is_some_and(|jwt| jwt.ttl_secs == 0)
-}
-
-#[cfg(feature = "in-tree-compute-drivers")]
-fn warn_if_kubernetes_sandbox_jwt_expiry_disabled(config: &Config) {
-    if kubernetes_sandbox_jwt_expiry_disabled(config) {
-        warn!(
-            "Kubernetes gateway configured with non-expiring sandbox JWTs (gateway_jwt.ttl_secs = 0); set ttl_secs > 0 for shared Kubernetes deployments"
-        );
-    }
 }
 
 pub(crate) async fn ensure_default_workspace(store: &Store) -> Result<()> {
@@ -1762,12 +1623,11 @@ mod tests {
         BoundGatewayListener, ConfiguredComputeDriver, ConnectionProtocol, ExtensionKind,
         GatewayListenerScope, MultiplexService, ServerState, TlsAcceptor,
         allow_plaintext_service_http, bind_gateway_listeners, classify_initial_bytes,
-        is_benign_tls_handshake_failure, kubernetes_sandbox_jwt_expiry_disabled,
+        configured_compute_driver, is_benign_tls_handshake_failure,
         mint_gateway_extension_credential, serve_gateway_listener,
-        validate_remote_compute_driver_config,
     };
     use openshell_core::{
-        ComputeDriverKind, Config,
+        Config,
         proto::{HealthRequest, open_shell_client::OpenShellClient},
     };
     use std::io::{Error, ErrorKind};
@@ -1788,6 +1648,26 @@ mod tests {
         tls_test_utils::{generate_test_certs_with_ca, install_rustls_provider},
     };
 
+    static DETECTION_PROBE_ORDER: LazyLock<Mutex<Vec<&'static str>>> =
+        LazyLock::new(|| Mutex::new(Vec::new()));
+
+    fn record_detection_probe(name: &'static str, available: bool) -> bool {
+        DETECTION_PROBE_ORDER.lock().unwrap().push(name);
+        available
+    }
+
+    fn unavailable_first_probe() -> bool {
+        record_detection_probe("first", false)
+    }
+
+    fn available_second_probe() -> bool {
+        record_detection_probe("second", true)
+    }
+
+    fn available_third_probe() -> bool {
+        record_detection_probe("third", true)
+    }
+
     fn extension_test_issuer() -> Arc<crate::auth::sandbox_jwt::SandboxJwtIssuer> {
         let material = openshell_bootstrap::jwt::generate_jwt_key().expect("jwt key");
         Arc::new(
@@ -1799,28 +1679,6 @@ mod tests {
             )
             .expect("issuer"),
         )
-    }
-
-    #[test]
-    fn external_kubernetes_operator_workspace_mode_is_rejected() {
-        let file: crate::config_file::ConfigFile = toml::from_str(
-            r#"
-[openshell.drivers.kubernetes]
-socket_path = "/run/openshell/kubernetes.sock"
-workspace_mode = "operator"
-operator_namespace_label = "openshell.ai/workspace=true"
-"#,
-        )
-        .expect("valid config");
-
-        let error = validate_remote_compute_driver_config("kubernetes", Some(&file))
-            .expect_err("external operator mode must fail closed");
-
-        assert!(
-            error
-                .to_string()
-                .contains("external Kubernetes compute drivers do not support operator mode")
-        );
     }
 
     #[test]
@@ -1912,47 +1770,32 @@ operator_namespace_label = "openshell.ai/workspace=true"
     }
 
     fn test_compute_drivers() -> super::ComputeDriverRegistry {
-        super::install_default_compute_drivers()
-    }
-
-    fn select_compute_driver(
-        registry: &super::ComputeDriverRegistry,
-        config: &Config,
-        driver_startup: crate::compute::driver_config::DriverStartupContext<'_>,
-    ) -> openshell_core::Result<ConfiguredComputeDriver> {
-        let selection = registry.select(&config.compute_drivers)?;
-        super::resolve_configured_compute_driver(registry, selection.name(), driver_startup)
+        let mut registry = super::ComputeDriverRegistry::new();
+        for (name, priority) in [("alpha", 100), ("beta", 200), ("gamma", 300)] {
+            registry
+                .install(
+                    super::ComputeDriverRegistration::new(
+                        name,
+                        priority,
+                        None,
+                        TestComputeDriverFactory,
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+        }
+        registry
     }
 
     #[derive(Clone, Copy)]
     struct TestComputeDriverFactory;
-
-    static DETECTION_PROBE_ORDER: LazyLock<Mutex<Vec<&'static str>>> =
-        LazyLock::new(|| Mutex::new(Vec::new()));
-
-    fn record_detection_probe(name: &'static str, available: bool) -> bool {
-        DETECTION_PROBE_ORDER.lock().unwrap().push(name);
-        available
-    }
-
-    fn unavailable_first_probe() -> bool {
-        record_detection_probe("first", false)
-    }
-
-    fn available_second_probe() -> bool {
-        record_detection_probe("second", true)
-    }
-
-    fn available_third_probe() -> bool {
-        record_detection_probe("third", true)
-    }
 
     #[async_trait::async_trait]
     impl super::ComputeDriverFactory for TestComputeDriverFactory {
         async fn build(
             &self,
             _context: super::ComputeDriverBuildContext<'_>,
-        ) -> openshell_core::Result<super::ComputeDriverBuildOutput> {
+        ) -> openshell_core::Result<super::ComputeDriverInstance> {
             unreachable!("selection tests do not construct the driver")
         }
     }
@@ -2266,38 +2109,31 @@ operator_namespace_label = "openshell.ai/workspace=true"
 
     #[test]
     fn configured_compute_driver_triggers_auto_detection_when_empty() {
-        let config = Config::new(None).with_compute_drivers(std::iter::empty::<String>());
-        // Empty drivers triggers auto-detection, which may return Some or None
-        // depending on the environment. This test verifies the auto-detection path
-        // is taken rather than immediately returning an error.
-        let result = select_compute_driver(
-            &test_compute_drivers(),
-            &config,
-            test_driver_startup(&config, None),
-        );
-        // Either we get a detected driver or an error about none being detected.
-        match result {
-            Ok(ConfiguredComputeDriver::Registered(registration)) => {
-                assert!(
-                    matches!(
-                        registration.name.as_str(),
-                        "kubernetes" | "docker" | "podman"
-                    ),
-                    "auto-detected unexpected driver: {}",
-                    registration.name
-                );
-            }
-            Ok(ConfiguredComputeDriver::Remote { name }) => {
-                panic!("auto-detection returned remote driver: {name}");
-            }
-            Err(e) => {
-                assert!(
-                    e.to_string()
-                        .contains("auto-detection found no suitable installed driver"),
-                    "unexpected error: {e}"
-                );
-            }
+        fn available() -> bool {
+            true
         }
+
+        let mut registry = super::ComputeDriverRegistry::new();
+        registry
+            .install(
+                super::ComputeDriverRegistration::new(
+                    "detected",
+                    100,
+                    Some(available),
+                    TestComputeDriverFactory,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let config = Config::new(None).with_compute_drivers(std::iter::empty::<String>());
+        let result =
+            configured_compute_driver(&registry, &config, test_driver_startup(&config, None))
+                .unwrap();
+
+        let ConfiguredComputeDriver::Registered(registration) = result else {
+            panic!("auto-detection must select a registered driver");
+        };
+        assert_eq!(registration.name, "detected");
     }
 
     #[test]
@@ -2360,9 +2196,8 @@ operator_namespace_label = "openshell.ai/workspace=true"
 
     #[test]
     fn configured_compute_driver_rejects_multiple_entries() {
-        let config = Config::new(None)
-            .with_compute_drivers([ComputeDriverKind::Kubernetes, ComputeDriverKind::Podman]);
-        let err = select_compute_driver(
+        let config = Config::new(None).with_compute_drivers(["alpha", "beta"]);
+        let err = configured_compute_driver(
             &test_compute_drivers(),
             &config,
             test_driver_startup(&config, None),
@@ -2372,13 +2207,13 @@ operator_namespace_label = "openshell.ai/workspace=true"
             err.to_string()
                 .contains("multiple compute drivers are not supported yet")
         );
-        assert!(err.to_string().contains("kubernetes,podman"));
+        assert!(err.to_string().contains("alpha,beta"));
     }
 
     #[test]
-    fn configured_compute_driver_accepts_podman() {
-        let config = Config::new(None).with_compute_drivers([ComputeDriverKind::Podman]);
-        let driver = select_compute_driver(
+    fn configured_compute_driver_accepts_registered_name() {
+        let config = Config::new(None).with_compute_drivers(["beta"]);
+        let driver = configured_compute_driver(
             &test_compute_drivers(),
             &config,
             test_driver_startup(&config, None),
@@ -2386,37 +2221,7 @@ operator_namespace_label = "openshell.ai/workspace=true"
         .unwrap();
         assert!(matches!(
             driver,
-            ConfiguredComputeDriver::Registered(registration) if registration.name == "podman"
-        ));
-    }
-
-    #[test]
-    fn configured_compute_driver_accepts_vm() {
-        let config = Config::new(None).with_compute_drivers([ComputeDriverKind::Vm]);
-        let driver = select_compute_driver(
-            &test_compute_drivers(),
-            &config,
-            test_driver_startup(&config, None),
-        )
-        .unwrap();
-        assert!(matches!(
-            driver,
-            ConfiguredComputeDriver::Registered(registration) if registration.name == "vm"
-        ));
-    }
-
-    #[test]
-    fn configured_compute_driver_accepts_docker() {
-        let config = Config::new(None).with_compute_drivers([ComputeDriverKind::Docker]);
-        let driver = select_compute_driver(
-            &test_compute_drivers(),
-            &config,
-            test_driver_startup(&config, None),
-        )
-        .unwrap();
-        assert!(matches!(
-            driver,
-            ConfiguredComputeDriver::Registered(registration) if registration.name == "docker"
+            ConfiguredComputeDriver::Registered(registration) if registration.name == "beta"
         ));
     }
 
@@ -2424,7 +2229,7 @@ operator_namespace_label = "openshell.ai/workspace=true"
     fn configured_compute_driver_resolves_named_remote() {
         let config = Config::new(None).with_compute_drivers(["kyma"]);
 
-        let driver = select_compute_driver(
+        let driver = configured_compute_driver(
             &test_compute_drivers(),
             &config,
             test_driver_startup(&config, None),
@@ -2445,12 +2250,12 @@ operator_namespace_label = "openshell.ai/workspace=true"
     }
 
     #[test]
-    fn configured_compute_driver_uses_vm_endpoint_override() {
+    fn configured_compute_driver_uses_endpoint_override() {
         let config = Config::new(None)
-            .with_compute_drivers([ComputeDriverKind::Vm])
-            .with_compute_driver_endpoint("vm", "/run/openshell/vm.sock");
+            .with_compute_drivers(["alpha"])
+            .with_compute_driver_endpoint("alpha", "/run/openshell/alpha.sock");
 
-        let driver = select_compute_driver(
+        let driver = configured_compute_driver(
             &test_compute_drivers(),
             &config,
             test_driver_startup(&config, None),
@@ -2458,17 +2263,17 @@ operator_namespace_label = "openshell.ai/workspace=true"
         .unwrap();
         assert!(matches!(
             driver,
-            ConfiguredComputeDriver::Remote { name } if name == "vm"
+            ConfiguredComputeDriver::Remote { name } if name == "alpha"
         ));
     }
 
     #[test]
     fn configured_compute_driver_uses_builtin_endpoint_override() {
         let config = Config::new(None)
-            .with_compute_drivers([ComputeDriverKind::Docker])
-            .with_compute_driver_endpoint("docker", "/run/openshell/docker.sock");
+            .with_compute_drivers(["beta"])
+            .with_compute_driver_endpoint("beta", "/run/openshell/beta.sock");
 
-        let driver = select_compute_driver(
+        let driver = configured_compute_driver(
             &test_compute_drivers(),
             &config,
             test_driver_startup(&config, None),
@@ -2476,48 +2281,8 @@ operator_namespace_label = "openshell.ai/workspace=true"
         .unwrap();
         assert!(matches!(
             driver,
-            ConfiguredComputeDriver::Remote { name } if name == "docker"
+            ConfiguredComputeDriver::Remote { name } if name == "beta"
         ));
-    }
-
-    #[test]
-    fn kubernetes_sandbox_jwt_expiry_disabled_warns_for_zero_ttl() {
-        fn config_with_jwt_ttl(ttl_secs: u64) -> Config {
-            let mut config = Config::new(None);
-            config.gateway_jwt = Some(openshell_core::GatewayJwtConfig {
-                signing_key_path: "/tmp/signing.pem".into(),
-                public_key_path: "/tmp/public.pem".into(),
-                kid_path: "/tmp/kid".into(),
-                gateway_id: "openshell".to_string(),
-                ttl_secs,
-            });
-            config
-        }
-
-        assert!(kubernetes_sandbox_jwt_expiry_disabled(
-            &config_with_jwt_ttl(0)
-        ));
-        assert!(!kubernetes_sandbox_jwt_expiry_disabled(
-            &config_with_jwt_ttl(3600)
-        ));
-        assert!(!kubernetes_sandbox_jwt_expiry_disabled(&Config::new(None)));
-    }
-
-    #[cfg(target_os = "windows")]
-    #[test]
-    fn windows_builtin_compute_drivers_report_unsupported() {
-        for driver in [
-            ComputeDriverKind::Docker,
-            ComputeDriverKind::Kubernetes,
-            ComputeDriverKind::Podman,
-            ComputeDriverKind::Vm,
-        ] {
-            let message = super::unsupported_builtin_compute_driver(driver).to_string();
-            assert!(
-                message.contains("unsupported on Windows"),
-                "{driver} rejection should be explicit, got: {message}"
-            );
-        }
     }
 
     #[tokio::test]

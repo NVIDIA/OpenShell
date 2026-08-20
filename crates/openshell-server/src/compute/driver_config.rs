@@ -7,9 +7,6 @@
 //! driver-specific environment overrides, and applying gateway startup defaults.
 //! It does not acquire, connect to, or start compute drivers.
 
-#[cfg(all(not(target_os = "windows"), feature = "in-tree-compute-drivers"))]
-pub mod builtin;
-
 use crate::config_file;
 use crate::defaults::LocalTlsPaths;
 use openshell_core::{Error, Result};
@@ -82,6 +79,8 @@ pub struct KubernetesSaBootstrapConfig {
     pub service_account_name: String,
     pub workspace_mode: String,
     pub gateway_id: String,
+    pub operator_namespace_label: Option<String>,
+    pub operator_namespace_file: Option<String>,
 }
 
 impl Default for KubernetesSaBootstrapConfig {
@@ -91,6 +90,8 @@ impl Default for KubernetesSaBootstrapConfig {
             service_account_name: "default".to_string(),
             workspace_mode: "shared".to_string(),
             gateway_id: "openshell".to_string(),
+            operator_namespace_label: None,
+            operator_namespace_file: None,
         }
     }
 }
@@ -108,10 +109,19 @@ pub fn kubernetes_sa_bootstrap_config(
             "K8s ServiceAccount bootstrap requires [openshell.drivers.kubernetes] when sandbox JWT issuing is enabled in-cluster",
         ));
     }
-    let merged = config_file::driver_table(
+    let merged = config_file::driver_table_with_inherited_keys(
         "kubernetes",
         &file.openshell.gateway,
         file.openshell.drivers.get("kubernetes"),
+        &[
+            "namespace",
+            "service_account_name",
+            "host_gateway_ip",
+            "enable_user_namespaces",
+            "sa_token_ttl_secs",
+            "operator_namespace_label",
+            "operator_namespace_file",
+        ],
     );
     merged.try_into().map_err(|error| {
         Error::config(format!(
@@ -123,16 +133,18 @@ pub fn kubernetes_sa_bootstrap_config(
 pub fn driver_config_from_context<T>(
     context: DriverStartupContext<'_>,
     driver_name: &str,
+    inherited_config_keys: &[&str],
 ) -> Result<T>
 where
     T: Default + serde::de::DeserializeOwned,
 {
-    driver_config_from_file(context.file, driver_name)
+    driver_config_from_file(context.file, driver_name, inherited_config_keys)
 }
 
 fn driver_config_from_file<T>(
     file: Option<&config_file::ConfigFile>,
     driver_name: &str,
+    inherited_config_keys: &[&str],
 ) -> Result<T>
 where
     T: Default + serde::de::DeserializeOwned,
@@ -140,10 +152,11 @@ where
     let Some(file) = file else {
         return Ok(T::default());
     };
-    let merged = config_file::driver_table(
+    let merged = config_file::driver_table_with_inherited_keys(
         driver_name,
         &file.openshell.gateway,
         file.openshell.drivers.get(driver_name),
+        inherited_config_keys,
     );
     merged.try_into().map_err(|e| {
         Error::config(format!(
@@ -246,6 +259,8 @@ socket_path = "/run/openshell/kubernetes.sock"
 workspace_mode = "managed"
 gateway_id = "gateway-a"
 service_account_name = "sandbox-sa"
+operator_namespace_label = "openshell.ai/workspace=true"
+operator_namespace_file = "/etc/openshell/namespaces.json"
 "#,
         )
         .expect("valid config");
@@ -255,6 +270,14 @@ service_account_name = "sandbox-sa"
         assert_eq!(cfg.workspace_mode, "managed");
         assert_eq!(cfg.gateway_id, "gateway-a");
         assert_eq!(cfg.service_account_name, "sandbox-sa");
+        assert_eq!(
+            cfg.operator_namespace_label.as_deref(),
+            Some("openshell.ai/workspace=true")
+        );
+        assert_eq!(
+            cfg.operator_namespace_file.as_deref(),
+            Some("/etc/openshell/namespaces.json")
+        );
     }
 
     #[test]

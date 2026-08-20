@@ -56,7 +56,7 @@ remove_existing_gateway_registration() {
 echo "==> Building release binaries"
 cargo build --release \
 	-p openshell-cli \
-	-p openshell-server \
+	-p openshell-gateway \
 	-p openshell-driver-vm
 
 echo "==> Building Debian package"

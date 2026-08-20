@@ -159,47 +159,20 @@ impl SandboxTemplateSource {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TelemetryComputeDriver {
-    Docker,
-    Kubernetes,
-    Podman,
-    Vm,
-    Unknown,
-}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TelemetryComputeDriver(String);
 
 impl TelemetryComputeDriver {
     #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Docker => "docker",
-            Self::Kubernetes => "kubernetes",
-            Self::Podman => "podman",
-            Self::Vm => "vm",
-            Self::Unknown => "unknown",
-        }
+    pub fn as_str(&self) -> &str {
+        &self.0
     }
 
     #[must_use]
     pub fn from_raw(raw: &str) -> Self {
-        match raw.trim().to_ascii_lowercase().as_str() {
-            "docker" => Self::Docker,
-            "k8s" | "kubernetes" => Self::Kubernetes,
-            "podman" => Self::Podman,
-            "vm" => Self::Vm,
-            _ => Self::Unknown,
-        }
-    }
-
-    #[must_use]
-    pub const fn from_driver_kind(driver_kind: Option<crate::ComputeDriverKind>) -> Self {
-        match driver_kind {
-            Some(crate::ComputeDriverKind::Docker) => Self::Docker,
-            Some(crate::ComputeDriverKind::Kubernetes) => Self::Kubernetes,
-            Some(crate::ComputeDriverKind::Podman) => Self::Podman,
-            Some(crate::ComputeDriverKind::Vm) => Self::Vm,
-            None => Self::Unknown,
-        }
+        let name = crate::config::normalize_compute_driver_name(raw)
+            .unwrap_or_else(|_| "unknown".to_string());
+        Self(name)
     }
 }
 
@@ -684,27 +657,21 @@ mod tests {
     }
 
     #[test]
-    fn compute_driver_values_are_sanitized() {
+    fn compute_driver_values_are_normalized_without_enumerating_backends() {
+        assert_eq!(TelemetryComputeDriver::from_raw("alpha").as_str(), "alpha");
         assert_eq!(
-            TelemetryComputeDriver::from_raw("docker").as_str(),
-            "docker"
+            TelemetryComputeDriver::from_raw(" Alpha ").as_str(),
+            "alpha"
         );
         assert_eq!(
-            TelemetryComputeDriver::from_raw("k8s").as_str(),
-            "kubernetes"
+            TelemetryComputeDriver::from_raw("CUSTOM_BACKEND").as_str(),
+            "custom_backend"
         );
-        assert_eq!(
-            TelemetryComputeDriver::from_raw("KUBERNETES").as_str(),
-            "kubernetes"
-        );
-        assert_eq!(TelemetryComputeDriver::from_raw("vm").as_str(), "vm");
-        assert_eq!(
-            TelemetryComputeDriver::from_raw("podman").as_str(),
-            "podman"
-        );
+        assert_eq!(TelemetryComputeDriver::from_raw("beta").as_str(), "beta");
+        assert_eq!(TelemetryComputeDriver::from_raw("gamma").as_str(), "gamma");
         assert_eq!(
             TelemetryComputeDriver::from_raw("private-driver").as_str(),
-            "unknown"
+            "private-driver"
         );
     }
 
@@ -793,7 +760,7 @@ mod disabled_tests {
             1,
             false,
             SandboxTemplateSource::Default,
-            TelemetryComputeDriver::Docker,
+            TelemetryComputeDriver::from_raw("test-driver"),
         );
         emit_policy_decision(
             PolicyDecisionOperation::Approve,
