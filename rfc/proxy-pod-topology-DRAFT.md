@@ -36,13 +36,20 @@ exchange, the sandbox pod's security context reduces to `runAsNonRoot` with all
 Linux capabilities dropped, which is the least-privileged sandbox pod any
 OpenShell topology produces.
 
-The RFC also proposes the changes needed to run this topology on OpenShift. Two
-are required and are not satisfied by the current implementation: the DNS egress
-peers in the generated `NetworkPolicy` are hardcoded to upstream Kubernetes
-conventions that do not exist on OpenShift, and the fixed non-root UIDs the
-driver assigns are rejected by the `restricted-v2` SCC. The first needs a
-configuration surface; the second is satisfied by the built-in `nonroot-v2` SCC
-and needs documentation and a gated Helm grant, not a custom SCC.
+The RFC also proposes the changes needed to run this topology on OpenShift, all
+validated against a live OpenShift 4.22 / OVN-Kubernetes cluster. Two were
+required and unmet by the original implementation: the DNS egress peers in the
+generated `NetworkPolicy` are hardcoded to upstream Kubernetes conventions —
+both the namespace/pod selectors and the port — that do not hold on OpenShift,
+and the driver's explicit non-root proxy UID is rejected by the `restricted-v2`
+SCC. The first needs a configuration surface; the second is satisfied by the
+built-in `nonroot-v2` SCC and needs a gated Helm grant, not a custom SCC.
+
+Validation confirmed the security model works as designed on OpenShift —
+unproxied egress denied, proxied egress policy-evaluated, resources
+garbage-collected — and surfaced two usability gaps that block adoption: the
+user-supplied workload command is silently discarded, and sandboxes never leave
+the `Provisioning` phase.
 
 ## Motivation
 
@@ -257,7 +264,18 @@ nothing, so the agent pod's DNS egress falls through to the policy's implicit
 deny and **no name resolution works** — including resolving the paired
 supervisor's own Service name. The sandbox is inert.
 
-This RFC proposes a configurable DNS peer list:
+There is a second, subtler mismatch. A `NetworkPolicy` egress rule whose peer
+is a `podSelector` is evaluated against the destination **pod** after `Service`
+address translation, so its port list must name the DNS pods' *container* port.
+Upstream `CoreDNS` listens on 53, so the Service port and container port
+coincide and nobody notices. OpenShift's `dns-default` listens on **5353** and
+maps 53 onto it, so a rule allowing port 53 matches nothing even with correct
+selectors. This was confirmed empirically: with the right selectors but port
+53, DNS failed both through the Service ClusterIP and directly against the DNS
+pod IP; with 5353 it resolves.
+
+This RFC therefore proposes a configurable DNS peer list carrying both
+selectors and a port:
 
 ```toml
 [openshell.drivers.kubernetes.proxy_pod]
@@ -265,11 +283,15 @@ proxy_uid = 1337
 affinity = "disabled"          # disabled | preferred | required
 
 # Cluster DNS peers for the agent egress NetworkPolicy. Defaults to the
-# upstream kube-system/kube-dns and kube-system/coredns conventions.
+# upstream kube-system/kube-dns and kube-system/coredns conventions on port 53.
 [[openshell.drivers.kubernetes.proxy_pod.dns_peers]]
 namespace_labels = { "kubernetes.io/metadata.name" = "openshift-dns" }
 pod_labels = { "dns.operator.openshift.io/daemonset-dns" = "default" }
+port = 5353
 ```
+
+Each peer renders as its own egress rule, because a rule's port list applies to
+every `to` entry in that rule and peers may listen on different ports.
 
 with the Helm equivalent under `supervisor.proxyPod.dnsPeers`. When unset, the
 existing upstream defaults apply, so no behavior changes for current users. Each
@@ -306,6 +328,17 @@ SCC:
 oc adm policy add-scc-to-user nonroot-v2 -z openshell-sandbox -n openshell
 ```
 
+Measured on the validation cluster, the two pods land on *different* SCCs, and
+only one needs the grant:
+
+| Pod | Admitted under | UID | Why |
+|---|---|---|---|
+| Agent | `restricted-v2` | `1000810000` (SCC-assigned) | `sandbox_uid` is optional and was unset, so no explicit UID to reject |
+| Supervisor | `nonroot-v2` | `1337` (explicit) | `proxy_pod.proxy_uid` always has a value, which `restricted-v2` rejects |
+
+Both ran with `capabilities.drop: ["ALL"]`, `allowPrivilegeEscalation: false`,
+and `seccompProfile: RuntimeDefault`.
+
 This RFC proposes rendering that grant from the chart behind a gated value
 (`sandboxServiceAccount.openshift.nonrootSCC`, default off, so non-OpenShift
 installs never reference OpenShift-only APIs), mirroring how `cni-sidecar`
@@ -329,7 +362,8 @@ nftables fence from exempting the workload, and `proxy-pod` has no nftables
 fence and no shared namespace, so the constraint is not security-relevant here.
 This RFC does not propose it yet, because it interacts with workspace PVC
 ownership and needs its own validation, but it is the natural follow-up and
-would make `proxy-pod` zero-grant on OpenShift.
+would make `proxy-pod` zero-grant on OpenShift. The measurement above is direct
+evidence that it would work: the agent pod already takes exactly this path.
 
 ### Same-node placement
 
@@ -340,6 +374,43 @@ every workload byte crosses the pod network to another node. `preferred` is the
 better operational default for latency-sensitive agents; `required` risks
 unschedulable pairs under node pressure. The default is left at `disabled` in
 this RFC but is a reasonable thing for reviewers to push back on.
+
+### Two gaps that block usability
+
+Cluster validation surfaced two problems that are not OpenShift-specific and
+that this RFC treats as required work, not follow-ups.
+
+**The workload command has nowhere to go.** In `combined` and `sidecar` the
+agent container's command is the supervisor binary, and the user's command
+reaches the workload through the gateway session. `proxy-pod` has no supervisor
+and no session, and `DriverSandboxTemplate` carries no `command`/`args` field at
+all, so `openshell sandbox create -- <cmd>` is accepted and then silently
+discarded. Worse, OpenShell's own sandbox images have `/bin/bash` as their
+entrypoint, which under kubelet with no TTY reads EOF and exits 0 immediately —
+so the default image produces a `CrashLoopBackOff` with empty logs. Verified: a
+`proxy-pod` sandbox on the stock base image crashlooped, and only an image with
+a genuinely long-running entrypoint stayed up.
+
+Options are to add `command`/`args` to `DriverSandboxTemplate` (a proto change
+affecting every driver), to accept them through the Kubernetes driver's
+`platform_config` passthrough (driver-local, no proto change), or to reject the
+combination at the API boundary. At minimum the gateway must not silently
+discard a command the user supplied.
+
+**Sandboxes never reach `Ready`.** The gateway drives the `Ready` transition
+from the supervisor session, which the process supervisor in the agent
+container opens. `proxy-pod` has no process supervisor, so nothing opens that
+session and the sandbox sits in `Provisioning` forever — even though the
+Kubernetes `Sandbox` CR reports `Ready`/`DependenciesReady`, both pods are
+running, and policy-enforced egress works end to end. Every `Ready`-gated RPC
+is then unreachable: `sandbox stop` fails with *"sandbox must be Ready to stop
+(current phase: Provisioning)"*, which in turn makes the supervisor scale-down
+proposed above unreachable in practice.
+
+This needs a readiness path that does not assume an in-pod process supervisor —
+most naturally the network supervisor reporting readiness for its paired
+sandbox once its proxy is serving, since it already holds the gateway
+credentials and polls for policy.
 
 ### Feature availability
 
@@ -373,12 +444,27 @@ defaults. Supervisor `Deployment` lifecycle on `stop_sandbox`, which currently
 leaves the supervisor running and billable while the sandbox is stopped. Chart
 plumbing and unit coverage for both.
 
-**Phase 3 — OpenShift enablement.** Gated `nonroot-v2` grant in the chart.
-Deploy to an OpenShift 4.x / OVN-Kubernetes cluster and validate empirically:
-DNS resolves from the agent pod; unproxied egress is denied; proxied egress is
-allowed and policy-evaluated; the generated CA is trusted; both pods admit under
-`nonroot-v2`; all five resources are reclaimed on delete. Document the results
-in `docs/kubernetes/openshift.mdx`.
+**Phase 3 — OpenShift enablement (validated).** Gated `nonroot-v2` grant in the
+chart, then deployed to OpenShift 4.22.6 / OVN-Kubernetes. Measured results:
+
+| Check | Result |
+|---|---|
+| All five per-sandbox resources created | pass |
+| Supervisor pod admitted and running | pass, under `nonroot-v2`, UID 1337 |
+| Agent pod admitted and running | pass, under stock `restricted-v2`, SCC-assigned UID |
+| DNS resolves from the agent pod | pass, only after the 5353 port fix |
+| Agent resolves its paired supervisor `Service` | pass |
+| Direct egress to the internet denied | pass |
+| Direct egress to the gateway denied | pass |
+| Egress to supervisor `:3128` / `:18080` allowed | pass |
+| Policy-denied host through the proxy | pass, 403 at CONNECT |
+| Policy-allowed host through the proxy | pass, HTTP 200 with the generated CA trusted |
+| All resources reclaimed on delete | pass |
+| Sandbox reaches `Ready` | **fail** — stuck in `Provisioning` |
+| `sandbox stop` / `start` | **blocked** by the `Ready` gate |
+
+The remaining work is documenting the OpenShift path in
+`docs/kubernetes/openshift.mdx` and closing the two gaps above.
 
 **Phase 4 — test strategy.** The branch adds `mise run e2e:kubernetes:proxy-pod`,
 but its `PROXY_POD_E2E` flag currently only prints warnings — it gates nothing.
@@ -408,6 +494,10 @@ whose failure mode is invisible.
 properties may not anticipate that `openshell sandbox exec` and `connect` simply
 stop working. The gateway should reject those RPCs for `proxy-pod` sandboxes
 with an actionable error naming the topology, rather than failing obscurely.
+The observed behavior today is worse than obscure: a working sandbox reports
+`Provisioning` indefinitely and a supplied command is discarded without a
+warning, so the failure looks like a broken deployment rather than an
+intentional topology limit.
 
 **Resource multiplication.** Every sandbox becomes two pods plus three
 supporting objects. At scale this doubles pod count, doubles scheduling
@@ -491,10 +581,14 @@ non-default DNS deployments. Configuration handles every case with no new RBAC.
 - Should a startup fence-verification probe be a **requirement** for graduating
   `proxy-pod` out of experimental, given that the failure mode of a
   non-enforcing CNI is silent?
-- On OVN-Kubernetes, does an egress rule whose peer is a `podSelector` match
-  correctly once the DNS `Service` ClusterIP is DVR-translated to a backend pod
-  IP, or is a CIDR-based peer needed for the DNS rule specifically? This needs
-  empirical confirmation on the OpenShift cluster.
+- Should the network supervisor own the `Ready` transition for its paired
+  sandbox, or should the gateway derive `Ready` from the `Sandbox` CR conditions
+  when the topology has no process supervisor?
+- Should the workload command reach the container through a new
+  `DriverSandboxTemplate` field or through the Kubernetes driver's
+  `platform_config` passthrough?
+- Should OpenShell publish a `proxy-pod`-suitable sandbox image with a
+  long-running entrypoint, given that the current images crashloop here?
 - Should `affinity` default to `preferred` rather than `disabled`, given that
   the default sends all workload egress across nodes?
 - Should the gateway reject `exec`/`connect`/`upload`/`sync` for `proxy-pod`
