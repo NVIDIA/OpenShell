@@ -1,7 +1,10 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
-# probe-mxc-host.ps1 - Emit a JSON capability report for this MXC host.
+# probe-mxc-host.ps1 - Operator/CI preflight for a prospective MXC host.
+# This diagnostic is not invoked by the driver and does not mutate host state.
+# It reports OS, wxc-exec, and backend availability so real tests can skip
+# unsupported scenarios with an explicit reason.
 #
 # PowerShell 5.1-compatible (no && / || / ternary operators).
 #

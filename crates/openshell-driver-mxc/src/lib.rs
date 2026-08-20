@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! OpenShell MXC compute driver.
+//! `OpenShell` MXC compute driver.
 //!
 //! Implements the gateway's `ComputeDriver` gRPC contract backed by Microsoft
 //! MXC (`wxc-exec`) on Windows. The driver is **in-process**, runs the agent

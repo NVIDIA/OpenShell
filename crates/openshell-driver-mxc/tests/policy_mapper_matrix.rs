@@ -4,7 +4,7 @@
 //! Tier-0 coverage matrix + schema drift guard for the OpenShell→MXC policy mapper.
 //!
 //! Three quadrants:
-//!   A — mappable fields (OpenShell ∩ MXC): assert exact MXC output.
+//!   A — mappable fields (`OpenShell` ∩ MXC): assert exact MXC output.
 //!   B — OpenShell-only features MXC cannot express: assert one loss item per
 //!       field with the documented severity.
 //!   C — MXC restrictive defaults ("default deny posture"): empty policy maps
@@ -14,6 +14,12 @@
 //! `openshell-policy` gains a serialized field the mapper does not account for.
 
 #![cfg(target_os = "windows")]
+#![allow(
+    clippy::doc_link_with_quotes,
+    clippy::doc_markdown,
+    clippy::needless_collect,
+    clippy::uninlined_format_args
+)]
 
 use openshell_core::proto::{
     FilesystemPolicy, GraphqlOperation, L7Allow, L7DenyRule, L7Rule, LandlockPolicy,
@@ -927,7 +933,6 @@ fn b_seam_returns_unsupported_on_error_field() {
     );
     let ctx = MapCtx {
         sandbox_id: "sb-test".into(),
-        share_dir: None,
         egress: None, // coarse path → isolation_session → network policy errors
     };
     let err = mapper.map(Some(&policy), &ctx).unwrap_err();

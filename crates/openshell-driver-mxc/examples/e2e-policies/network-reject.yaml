@@ -3,10 +3,9 @@
 #
 # network-reject.yaml — Network policy rejection scenario.
 #
-# A filesystem grant plus a network_policies rule. On isolation_session the
-# driver rejects sandbox create at map time with invalid_argument naming the
-# network rule (M1 not yet landed). On processcontainer with egress_proxy
-# disabled, network policy is also rejected.
+# A filesystem grant plus a network_policies rule. The driver rejects sandbox
+# create at map time with invalid_argument naming the network rule on every
+# backend until MXC has a bound, enforcing egress path.
 #
 # This scenario requires NO live backend — it passes even on this box and in
 # mock mode because the rejection happens in the policy mapper before wxc-exec

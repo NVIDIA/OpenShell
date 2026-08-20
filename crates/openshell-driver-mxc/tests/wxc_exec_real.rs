@@ -15,14 +15,14 @@
 //! Two families:
 //!
 //! **(a) Dry-run contract tests** — exercise `--dry-run` only; pass/fail on
-//!   schema acceptance. These pass on this box even though no enforcement
-//!   backend is live (dry-run validates the JSON schema without spinning up the
-//!   AppContainer or isolation session).
+//!   schema acceptance. Some `wxc-exec` builds select the DACL fallback during
+//!   dry-run and validate filesystem grants, so these tests use owned temporary
+//!   directories with concrete Windows paths.
 //!
 //! **(b) Enforcement tests** — probe-gated; print a human-readable SKIP reason
 //!   and return early when the backend is not live. The probe distinguishes
-//!   "binary absent", "backend_error / velocity keys not enabled", and
-//!   "backend_unavailable".
+//!   "binary absent", "`backend_error` / velocity keys not enabled", and
+//!   "`backend_unavailable`".
 //!
 //! IMPORTANT: `OPENSHELL_MXC_MOCK_WXC` must NOT be set when running this file.
 //! The probe-gated enforcement tests assert that it is absent so a stale env
@@ -94,17 +94,19 @@ fn dryrun_accepts_minimal_processcontainer_config() {
         return;
     };
 
+    let tmpdir = tempfile::tempdir().expect("tempdir");
+    let tmpdir_str = tmpdir.path().to_string_lossy().into_owned();
     let config = serde_json::json!({
         "version": "0.6.0-alpha",
         "containerId": "test-minimal",
         "containment": "processcontainer",
         "process": {
             "commandLine": "cmd /c exit 0",
-            "cwd": "%TEMP%",
+            "cwd": tmpdir_str,
             "timeout": 0,
         },
         "filesystem": {
-            "readwritePaths": ["%TEMP%"],
+            "readwritePaths": [tmpdir_str],
         },
     });
 
@@ -124,17 +126,19 @@ fn dryrun_accepts_network_block_without_proxy() {
         return;
     };
 
+    let tmpdir = tempfile::tempdir().expect("tempdir");
+    let tmpdir_str = tmpdir.path().to_string_lossy().into_owned();
     let config = serde_json::json!({
         "version": "0.6.0-alpha",
         "containerId": "test-net-block",
         "containment": "processcontainer",
         "process": {
             "commandLine": "cmd /c exit 0",
-            "cwd": "%TEMP%",
+            "cwd": tmpdir_str,
             "timeout": 0,
         },
         "filesystem": {
-            "readwritePaths": ["%TEMP%"],
+            "readwritePaths": [tmpdir_str],
         },
         "network": {
             "defaultPolicy": "block",
@@ -161,17 +165,19 @@ fn dryrun_accepts_localhost_proxy_shape() {
         return;
     };
 
+    let tmpdir = tempfile::tempdir().expect("tempdir");
+    let tmpdir_str = tmpdir.path().to_string_lossy().into_owned();
     let config = serde_json::json!({
         "version": "0.6.0-alpha",
         "containerId": "test-proxy-localhost",
         "containment": "processcontainer",
         "process": {
             "commandLine": "cmd /c exit 0",
-            "cwd": "%TEMP%",
+            "cwd": tmpdir_str,
             "timeout": 0,
         },
         "filesystem": {
-            "readwritePaths": ["%TEMP%"],
+            "readwritePaths": [tmpdir_str],
         },
         "network": {
             "defaultPolicy": "block",
@@ -256,7 +262,7 @@ fn dryrun_rejects_unknown_containment() {
 }
 
 /// The most important dry-run test: parse the quickstart example policy with
-/// `openshell_policy`, run `split_policy` (proxy_redirect 127.0.0.1:18080,
+/// `openshell_policy`, run `split_policy` (`proxy_redirect` 127.0.0.1:18080,
 /// containment "processcontainer"), take the resulting `mxc_config`, inject a
 /// real process block with a valid cwd, and verify that `--dry-run` exits 0.
 ///
@@ -313,10 +319,22 @@ fn dryrun_accepts_split_policy_output() {
     // Take the mapper's MXC config and inject the required process block.
     // The split config does not include a process block (that comes from the
     // gateway TOML at runtime); wxc-exec --dry-run requires one.
+    //
+    // The quickstart policy uses sandbox-internal Unix paths. Replace only the
+    // environment-dependent filesystem paths with an owned Windows directory:
+    // this test verifies the mapper's MXC JSON shape, while mapper unit tests
+    // cover the exact filesystem translation.
+    let tmpdir = tempfile::tempdir().expect("tempdir");
+    let tmpdir_str = tmpdir.path().to_string_lossy().into_owned();
     let mut mxc_config = result.mxc_config.clone();
+    mxc_config["filesystem"] = serde_json::json!({
+        "readwritePaths": [tmpdir_str],
+        "readonlyPaths": [],
+        "deniedPaths": [],
+    });
     mxc_config["process"] = serde_json::json!({
         "commandLine": "cmd /c exit 0",
-        "cwd": "%TEMP%",
+        "cwd": tmpdir_str,
         "timeout": 0,
     });
     // containerId is also required for processcontainer.
@@ -340,33 +358,32 @@ fn dryrun_accepts_split_policy_output() {
 
 /// Probe the processcontainer backend.
 ///
-/// Runs a trivial one-shot (`cmd /c exit 0`, `%TEMP%` grant). Returns
-/// `Ok(())` when the backend is live, or `Err(reason)` when it is not (the
+/// Runs a trivial one-shot (`cmd /c exit 0`, owned temporary-directory grant).
+/// Returns `Ok(())` when the backend is live, or `Err(reason)` when it is not (the
 /// caller prints SKIP + reason and returns from the test).
 fn probe_processcontainer(wxc: &PathBuf) -> Result<(), String> {
     // Abort early if the mock env var is set — a stale OPENSHELL_MXC_MOCK_WXC
     // would silently turn this "real" run back into a mock run.
-    if std::env::var("OPENSHELL_MXC_MOCK_WXC")
-        .map(|v| v == "1")
-        .unwrap_or(false)
-    {
+    if std::env::var("OPENSHELL_MXC_MOCK_WXC").is_ok_and(|value| value == "1") {
         return Err(
             "OPENSHELL_MXC_MOCK_WXC=1 is set — unset it before running real enforcement tests"
                 .to_string(),
         );
     }
 
+    let tmpdir = tempfile::tempdir().map_err(|error| format!("tempdir failed: {error}"))?;
+    let tmpdir_str = tmpdir.path().to_string_lossy().into_owned();
     let config = serde_json::json!({
         "version": "0.6.0-alpha",
         "containerId": "probe-pc",
         "containment": "processcontainer",
         "process": {
             "commandLine": "cmd /c exit 0",
-            "cwd": "%TEMP%",
+            "cwd": tmpdir_str,
             "timeout": 10,
         },
         "filesystem": {
-            "readwritePaths": ["%TEMP%"],
+            "readwritePaths": [tmpdir_str],
         },
     });
 
@@ -389,16 +406,17 @@ fn probe_processcontainer(wxc: &PathBuf) -> Result<(), String> {
         || combined.contains("not enabled")
     {
         // Extract the message if possible for a more useful skip reason.
-        let reason = if let Ok(v) =
+        let reason =
             serde_json::from_str::<serde_json::Value>(&String::from_utf8_lossy(&out.stdout))
-        {
-            v["error"]["message"]
-                .as_str()
-                .unwrap_or("backend_error (E_NOTIMPL)")
-                .to_string()
-        } else {
-            "backend_error (velocity keys not enabled)".to_string()
-        };
+                .map_or_else(
+                    |_| "backend_error (velocity keys not enabled)".to_string(),
+                    |value| {
+                        value["error"]["message"]
+                            .as_str()
+                            .unwrap_or("backend_error (E_NOTIMPL)")
+                            .to_string()
+                    },
+                );
         return Err(reason);
     }
 
@@ -414,15 +432,12 @@ fn probe_processcontainer(wxc: &PathBuf) -> Result<(), String> {
     Ok(())
 }
 
-/// Probe the isolation_session backend.
+/// Probe the `isolation_session` backend.
 ///
 /// Attempts a `provision` phase. Returns `Ok(sandbox_id)` when live, or
 /// `Err(reason)` when the backend is unavailable (caller prints SKIP).
 fn probe_isolation_session(wxc: &PathBuf) -> Result<String, String> {
-    if std::env::var("OPENSHELL_MXC_MOCK_WXC")
-        .map(|v| v == "1")
-        .unwrap_or(false)
-    {
+    if std::env::var("OPENSHELL_MXC_MOCK_WXC").is_ok_and(|value| value == "1") {
         return Err(
             "OPENSHELL_MXC_MOCK_WXC=1 is set — unset it before running real enforcement tests"
                 .to_string(),
@@ -605,7 +620,7 @@ fn pc_oneshot_in_policy_write_succeeds() {
 }
 
 /// Write to a path OUTSIDE the granted dir; assert exit non-zero and file absent.
-/// This is the genuine OS default-deny proof — the AppContainer blocks the write
+/// This is the genuine OS default-deny proof — the `AppContainer` blocks the write
 /// without requiring any host ACL lockdown. The mock can only fake this.
 #[test]
 #[ignore = "requires real wxc-exec"]
@@ -670,7 +685,7 @@ fn pc_oneshot_out_of_policy_write_denied() {
 
 // ── Isolation session enforcement tests ──────────────────────────────────────
 
-/// Full isolation_session round trip: provision → start → exec → stop →
+/// Full `isolation_session` round trip: provision → start → exec → stop →
 /// deprovision. `deprovision` runs in a drop-guard even on panic so the
 /// single-session backend is never left orphaned.
 #[test]

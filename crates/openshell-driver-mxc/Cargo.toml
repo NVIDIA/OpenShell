@@ -30,11 +30,9 @@ uuid = { workspace = true }
 tokio = { workspace = true }
 # tempfile is not a workspace dependency; 3.27 is already resolved in Cargo.lock.
 tempfile = "3"
-# Used only by the Windows-only example + integration test (parse policy YAML
-# into the typed proto, and drive the CLI). Inert on non-Windows.
+# Used by Windows-only integration tests to parse policy YAML into the typed
+# proto. Inert on non-Windows.
 openshell-policy = { path = "../openshell-policy" }
-clap = { workspace = true }
-anyhow = { workspace = true }
 # Needed by the real-wxc integration test (wxc_exec_real.rs) which builds
 # --config-base64 payloads without going through the async WxcExecInvoker.
 # base64 and serde_json are already [dependencies] but dev-dependency resolution

@@ -12,9 +12,9 @@ pub mod builtin;
 
 use crate::config_file;
 use crate::defaults::LocalTlsPaths;
-use openshell_core::{Error, Result};
 #[cfg(target_os = "windows")]
 use openshell_core::ComputeDriverKind;
+use openshell_core::{Error, Result};
 #[cfg(target_os = "windows")]
 use openshell_driver_mxc::MxcComputeConfig;
 use serde::Deserialize;

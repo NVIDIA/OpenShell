@@ -31,6 +31,8 @@ use futures::{Stream, StreamExt};
 #[cfg(unix)]
 use hyper_util::rt::TokioIo;
 use openshell_core::ComputeDriverKind;
+#[cfg(target_os = "windows")]
+use openshell_core::proto::SandboxPolicy;
 use openshell_core::proto::compute::v1::{
     CreateSandboxRequest, DeleteSandboxRequest, DeleteWorkspaceRequest, DeleteWorkspaceResponse,
     DriverCondition, DriverPlatformEvent, DriverResourceRequirements, DriverSandbox,
@@ -56,12 +58,10 @@ use openshell_driver_kubernetes::{
     ComputeDriverService as KubernetesDriverService, KubernetesComputeDriver,
     OperatorNamespaceAllowlist,
 };
-#[cfg(all(not(target_os = "windows"), feature = "in-tree-compute-drivers"))]
-use openshell_driver_podman::{ComputeDriverService as PodmanDriverService, PodmanComputeDriver};
 #[cfg(target_os = "windows")]
 use openshell_driver_mxc::{ComputeDriverService as MxcDriverService, MxcComputeConfig};
-#[cfg(target_os = "windows")]
-use openshell_core::proto::SandboxPolicy;
+#[cfg(all(not(target_os = "windows"), feature = "in-tree-compute-drivers"))]
+use openshell_driver_podman::{ComputeDriverService as PodmanDriverService, PodmanComputeDriver};
 use prost::Message;
 use std::collections::HashMap;
 use std::fmt;
@@ -852,8 +852,6 @@ impl ComputeRuntime {
         let mut runtime = Self::from_driver(
             ComputeDriverKind::Mxc.as_str().to_string(),
             service,
-            None,
-            None,
             None,
             store,
             sandbox_index,

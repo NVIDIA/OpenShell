@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+﻿# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # run-mxc-e2e.ps1 - MXC e2e scenario runner.
@@ -19,18 +19,18 @@
 #   powershell -NoProfile -ExecutionPolicy Bypass -File .\run-mxc-e2e.ps1 -Mock
 #
 #   # Choose backend / filter scenarios:
-#   .\run-mxc-e2e.ps1 -Backend process_container -Scenario fs-rw-positive-negative
+#   .\run-mxc-e2e.ps1 -Backend process_container -Scenario fs-rw
 #
 # Scenarios & expected verdicts:
-#   fs-rw-positive-negative  - rw grant on DemoDir; in-policy write succeeds.
+#   fs-rw  - rw grant on DemoDir; in-policy write succeeds.
 #                              Both backends; skipped when backend not live (non-mock).
 #   fs-readonly              - ro grant on a source dir + rw on DemoDir;
 #                              write to ro dir should be denied.
 #                              Both backends; skipped when backend not live.
-#   fs-default-deny-empty    - empty filesystem policy; every write denied.
+#   fs-default-deny    - empty filesystem policy; every write denied.
 #                              processcontainer only (isolation_session has no deny
 #                              primitive); skipped on isolation_session.
-#   network-policy-rejected  - rw grant + network_policies rule;
+#   network-reject  - rw grant + network_policies rule;
 #                              sandbox create must FAIL (invalid_argument).
 #                              Runs on ANY backend including mock — never skips.
 
@@ -181,7 +181,8 @@ function Probe-Backend([string] $backendName, [string] $wxc) {
 
 # ── Mode setup ────────────────────────────────────────────────────────────────
 
-Step "Pre-flight (mode=$(if ($Mock) {'MOCK'} else {'REAL'}), backend=$Backend)"
+$mode = if ($Mock) { "MOCK" } else { "REAL" }
+Step "Pre-flight (mode=$mode, backend=$Backend)"
 
 if ($Mock) {
     $env:OPENSHELL_MXC_MOCK_WXC = "1"
@@ -292,14 +293,16 @@ try {
     #   PolicyFile  - path to the policy YAML fixture
     #   Backends    - list: "both" / "process_container" / "isolation_session"
     #   ExpectFail  - $true means `sandbox create` itself must fail (invalid_argument)
+    #   ExpectArtifact - whether the workload should create its target file
     #   Description - human-readable label
 
     $allScenarios = @(
         @{
-            Name        = "fs-rw-positive-negative"
+            Name        = "fs-rw"
             PolicyFile  = Join-Path $policyDir "fs-rw.yaml"
             Backends    = "both"
             ExpectFail  = $false
+            ExpectArtifact = $true
             Description = "rw grant on DemoDir; in-policy write should succeed"
         },
         @{
@@ -307,17 +310,19 @@ try {
             PolicyFile  = Join-Path $policyDir "fs-readonly.yaml"
             Backends    = "both"
             ExpectFail  = $false
+            ExpectArtifact = $true
             Description = "ro grant + rw share; write to ro dir should be denied"
         },
         @{
-            Name        = "fs-default-deny-empty"
+            Name        = "fs-default-deny"
             PolicyFile  = Join-Path $policyDir "fs-empty.yaml"
             Backends    = "process_container"
             ExpectFail  = $false
+            ExpectArtifact = $false
             Description = "empty filesystem policy; all writes denied (process_container only)"
         },
         @{
-            Name        = "network-policy-rejected"
+            Name        = "network-reject"
             PolicyFile  = Join-Path $policyDir "network-reject.yaml"
             Backends    = "both"
             ExpectFail  = $true
@@ -364,33 +369,30 @@ try {
             continue
         }
 
-        # Patch the TOML agent_command to a simple one-liner appropriate for
-        # the scenario. For ExpectFail scenarios the command never runs; for
-        # others write to DemoDir.
+        # Build per-sandbox MXC workload config. Commands and working directories
+        # are create-time inputs, not gateway-wide settings.
         $target = Join-Path $DemoDir "$($sc.Name)-result.txt"
         Remove-Item $target -Force -ErrorAction SilentlyContinue
         $targetFwd = $target.Replace('\', '/')
         $demoDirFwd = $DemoDir.Replace('\', '/')
-        $agentCmd = "cmd /c echo ok > `"$targetFwd`""
-        $agentCmdJson = "[`"cmd`", `"/c`", `"echo ok > $targetFwd`"]"
-
-        $tomlRuntime = Get-Content $toml -Raw
-        if ($tomlRuntime -match '(?m)^\s*agent_command\s*=') {
-            $tomlRuntime = [regex]::Replace($tomlRuntime, '(?ms)^\s*agent_command\s*=.*?(?=\n\s*[^\s\[#]|\n\s*\[|\Z)', "agent_command = $agentCmdJson")
+        $driverConfig = @{
+            mxc = @{
+                command = @("cmd", "/c", "echo.ok>$targetFwd")
+                cwd = $demoDirFwd
+            }
+        } | ConvertTo-Json -Compress -Depth 4
+        # Windows PowerShell 5.1 removes embedded quotes when it builds the
+        # native command line. Escape them so the CLI receives valid JSON.
+        $driverConfigArg = if ($PSVersionTable.PSVersion.Major -lt 7) {
+            $driverConfig.Replace('"', '\"')
+        } else {
+            $driverConfig
         }
-        if ($tomlRuntime -match '(?m)^\s*share_dir\s*=') {
-            $tomlRuntime = [regex]::Replace($tomlRuntime, '(?m)^\s*share_dir\s*=.*$', "share_dir = `"$demoDirFwd`"")
-        }
-        if ($tomlRuntime -match '(?m)^\s*agent_cwd\s*=') {
-            $tomlRuntime = [regex]::Replace($tomlRuntime, '(?m)^\s*agent_cwd\s*=.*$', "agent_cwd = `"$demoDirFwd`"")
-        }
-        Set-Content $toml -Value $tomlRuntime -Encoding UTF8
-
         # Run sandbox create.
         $createOut = $null
         $createExitCode = 0
         try {
-            $createOut = & $cli sandbox create --name $sc.Name --policy $sc.PolicyFile --no-tty -- exit 2>&1
+            $createOut = & $cli sandbox create --name $sc.Name --policy $sc.PolicyFile --driver-config-json $driverConfigArg --no-tty 2>&1
             $createExitCode = $LASTEXITCODE
         } catch {
             $createOut = $_.Exception.Message
@@ -404,7 +406,7 @@ try {
 
         # Evaluate.
         if ($sc.ExpectFail) {
-            # network-policy-rejected: create must fail.
+            # network-reject: create must fail.
             if ($createExitCode -ne 0) {
                 Ok "$($sc.Name): create correctly failed (exit $createExitCode)"
                 Info "output: $createOutStr"
@@ -415,18 +417,24 @@ try {
                 $results += [pscustomobject]@{ Scenario = $sc.Name; Result = "FAIL"; Reason = "create succeeded unexpectedly" }
             }
         } else {
-            # Wiring check in mock mode: artifact present = pass.
+            # Wiring check in mock mode: the artifact must match the policy's
+            # expected outcome. In particular, default-deny passes only when
+            # the workload cannot create its target file.
             if ($Mock) {
-                $deadline = (Get-Date).AddSeconds(10)
-                while ((Get-Date) -lt $deadline -and -not (Test-Path $target)) {
-                    Start-Sleep -Milliseconds 300
+                if ($sc.ExpectArtifact) {
+                    $deadline = (Get-Date).AddSeconds(10)
+                    while ((Get-Date) -lt $deadline -and -not (Test-Path $target)) {
+                        Start-Sleep -Milliseconds 300
+                    }
                 }
-                if (Test-Path $target) {
-                    Ok "$($sc.Name): in-policy artifact present (mock wiring OK)"
-                    $results += [pscustomobject]@{ Scenario = $sc.Name; Result = "PASS"; Reason = "mock wiring: artifact present" }
+                $artifactExists = Test-Path $target
+                if ($artifactExists -eq $sc.ExpectArtifact) {
+                    $outcome = if ($artifactExists) { "present" } else { "absent" }
+                    Ok "$($sc.Name): artifact $outcome as expected (mock wiring OK)"
+                    $results += [pscustomobject]@{ Scenario = $sc.Name; Result = "PASS"; Reason = "mock wiring: artifact $outcome as expected" }
                 } else {
-                    Bad "$($sc.Name): artifact missing in DemoDir (mock wiring FAIL)"
-                    $results += [pscustomobject]@{ Scenario = $sc.Name; Result = "FAIL"; Reason = "artifact missing (mock)" }
+                    Bad "$($sc.Name): artifact outcome did not match policy (present=$artifactExists, expected=$($sc.ExpectArtifact))"
+                    $results += [pscustomobject]@{ Scenario = $sc.Name; Result = "FAIL"; Reason = "mock wiring: artifact present=$artifactExists, expected=$($sc.ExpectArtifact)" }
                 }
             } else {
                 # Real mode: artifact presence == enforcement worked.
