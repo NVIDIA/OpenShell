@@ -128,6 +128,20 @@ struct RunArgs {
     #[arg(long, env = "OPENSHELL_DB_URL")]
     db_url: Option<String>,
 
+    /// Connection ceiling for the database pool, shared by every
+    /// database-backed request.
+    ///
+    /// When unset, the gateway uses its backend default: 10 with Postgres,
+    /// 5 with an on-disk `SQLite` database. An in-memory `SQLite` database is
+    /// always a single connection. Each replica opens its own pool, so keep
+    /// the total below what the database server itself admits.
+    #[arg(
+        long,
+        env = "OPENSHELL_DB_MAX_CONNECTIONS",
+        value_parser = clap::value_parser!(u32).range(1..)
+    )]
+    db_max_connections: Option<u32>,
+
     /// Compute driver configured for this gateway.
     ///
     /// Accepts one registered driver name. When unset, the gateway runs
@@ -516,7 +530,9 @@ fn prepare_server_config_with_drivers(
         config = config.with_metrics_bind_address(addr);
     }
 
-    config = config.with_database_url(db_url);
+    config = config
+        .with_database_url(db_url)
+        .with_database_max_connections(args.db_max_connections);
     if let Some(driver) = &args.compute_driver {
         config = config.with_compute_driver(driver);
     }
@@ -1266,6 +1282,12 @@ fn merge_file_into_args(args: &mut RunArgs, file: &GatewayFileSection, matches: 
         && arg_defaulted(matches, "grpc_rate_limit_window_seconds")
     {
         args.grpc_rate_limit_window_seconds = Some(window);
+    }
+    if let Some(max_connections) = file.database_max_connections
+        && args.db_max_connections.is_none()
+        && arg_defaulted(matches, "db_max_connections")
+    {
+        args.db_max_connections = Some(max_connections);
     }
 }
 
@@ -3131,6 +3153,72 @@ grpc_rate_limit_window_seconds = 30
 
         assert_eq!(args.grpc_rate_limit_requests, Some(20));
         assert_eq!(args.grpc_rate_limit_window_seconds, Some(30));
+    }
+
+    #[test]
+    fn file_db_max_connections_populates_args_when_cli_omits() {
+        Environment::new()
+            .remove("OPENSHELL_DB_MAX_CONNECTIONS")
+            .run(|| {
+                let (mut args, matches) =
+                    parse_with_args(&["openshell-gateway", "--db-url", "sqlite::memory:"]);
+                assert_eq!(
+                    args.db_max_connections, None,
+                    "default leaves the pool alone"
+                );
+                let file = config_file_from_toml(
+                    r"
+[openshell.gateway]
+database_max_connections = 64
+",
+                );
+                merge_file_into_args(&mut args, &file.openshell.gateway, &matches);
+
+                assert_eq!(args.db_max_connections, Some(64));
+            });
+    }
+
+    #[test]
+    fn env_db_max_connections_overrides_file_value() {
+        Environment::new()
+            .set("OPENSHELL_DB_MAX_CONNECTIONS", "128")
+            .run(|| {
+                let (mut args, matches) =
+                    parse_with_args(&["openshell-gateway", "--db-url", "sqlite::memory:"]);
+                let file = config_file_from_toml(
+                    r"
+[openshell.gateway]
+database_max_connections = 64
+",
+                );
+                merge_file_into_args(&mut args, &file.openshell.gateway, &matches);
+
+                assert_eq!(args.db_max_connections, Some(128));
+            });
+    }
+
+    #[test]
+    fn db_max_connections_rejects_a_zero_or_unparseable_ceiling() {
+        Environment::new()
+            .remove("OPENSHELL_DB_MAX_CONNECTIONS")
+            .run(|| {
+                // Zero would deadlock every `acquire`, and a silent fallback to the
+                // default would reproduce the ceiling the operator is trying to lift.
+                for bad in ["0", "-5", "many"] {
+                    assert!(
+                        command()
+                            .try_get_matches_from([
+                                "openshell-gateway",
+                                "--db-url",
+                                "sqlite::memory:",
+                                "--db-max-connections",
+                                bad,
+                            ])
+                            .is_err(),
+                        "input {bad:?} must be rejected"
+                    );
+                }
+            });
     }
 
     #[test]

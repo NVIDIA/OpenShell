@@ -243,6 +243,16 @@ pub struct Config {
     /// Database URL for persistence.
     pub database_url: String,
 
+    /// Connection ceiling for the persistence pool.
+    ///
+    /// `None` leaves the backend's built-in default in place. The right
+    /// ceiling depends on the deployment — how many gateway replicas share
+    /// the database, and what `max_connections` a Postgres server itself
+    /// allows — so it cannot be one number baked into the binary. An
+    /// in-memory `SQLite` database ignores it: the database lives in its single
+    /// connection.
+    pub database_max_connections: Option<u32>,
+
     /// Explicit compute driver configured for the gateway.
     /// `None` enables runtime auto-detection.
     pub compute_driver: Option<String>,
@@ -892,6 +902,7 @@ impl Config {
             mtls_auth: MtlsAuthConfig::default(),
             gateway_jwt: None,
             database_url: String::new(),
+            database_max_connections: None,
             compute_driver: None,
             compute_driver_endpoints: BTreeMap::new(),
             credential_drivers: Vec::new(),
@@ -941,6 +952,15 @@ impl Config {
     #[must_use]
     pub fn with_database_url(mut self, url: impl Into<String>) -> Self {
         self.database_url = url.into();
+        self
+    }
+
+    /// Create a new configuration with a database pool connection ceiling.
+    ///
+    /// `None` keeps the persistence backend's default.
+    #[must_use]
+    pub const fn with_database_max_connections(mut self, max_connections: Option<u32>) -> Self {
+        self.database_max_connections = max_connections;
         self
     }
 

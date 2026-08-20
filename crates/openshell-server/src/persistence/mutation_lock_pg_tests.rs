@@ -290,7 +290,7 @@ impl LockFixture {
     /// locks.
     async fn store(&self, lock_pool_size: u32) -> Store {
         let store = Store::Postgres(
-            PostgresStore::connect_with_lock_pool_size(self.schema.url(), lock_pool_size)
+            PostgresStore::connect_with_lock_pool_size(self.schema.url(), None, lock_pool_size)
                 .await
                 .expect("connect a lock store"),
         );
@@ -575,7 +575,7 @@ async fn postgres_mutation_lock_stalled_release_closes_session_and_recovers_pool
     let fixture = LockFixture::new().await;
     let proxy = StallingProxy::start(fixture.schema.url()).await;
     let store = Store::Postgres(
-        PostgresStore::connect_with_lock_pool_size(&proxy.url, 1)
+        PostgresStore::connect_with_lock_pool_size(&proxy.url, None, 1)
             .await
             .unwrap(),
     );
@@ -922,7 +922,7 @@ async fn postgres_mutation_lock_released_connection_is_reused_without_residual_l
 #[ignore = "requires a disposable PostgreSQL database in OPENSHELL_TEST_POSTGRES_URL; run mise run test:rust:postgres"]
 async fn postgres_mutation_lock_pool_never_exceeds_configured_size() {
     let fixture = LockFixture::new().await;
-    let postgres = PostgresStore::connect(fixture.schema.url())
+    let postgres = PostgresStore::connect(fixture.schema.url(), None)
         .await
         .expect("connect a store with the production lock pool");
     let store = Store::Postgres(postgres.clone());
@@ -1000,7 +1000,7 @@ async fn postgres_mutation_lock_connection_failure_is_not_a_lock_timeout() {
     // but PostgreSQL never answers one: a database failure, not contention.
     let proxy = StallingProxy::start(fixture.schema.url()).await;
     let unanswered = Store::Postgres(
-        PostgresStore::connect_with_lock_pool_size(&proxy.url, 1)
+        PostgresStore::connect_with_lock_pool_size(&proxy.url, None, 1)
             .await
             .expect("connect a store through the proxy"),
     );

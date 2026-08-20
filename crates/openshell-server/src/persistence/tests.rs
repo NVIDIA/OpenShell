@@ -233,7 +233,7 @@ fn embedded_migrators_include_pagination_indexes() {
 #[tokio::test]
 async fn sqlite_in_memory_store_survives_pool_connection_replacement() {
     for url in ["sqlite::memory:", "sqlite://?mode=memory"] {
-        let store = super::sqlite::SqliteStore::connect(url)
+        let store = super::sqlite::SqliteStore::connect(url, None)
             .await
             .expect("connect to in-memory SQLite");
         store.migrate().await.expect("migrate in-memory SQLite");
@@ -280,6 +280,37 @@ async fn sqlite_in_memory_store_survives_pool_connection_replacement() {
             "database URL: {url}"
         );
     }
+}
+
+#[tokio::test]
+async fn sqlite_pool_ceiling_defaults_and_honours_an_override() {
+    use super::sqlite::{DEFAULT_MAX_CONNECTIONS, SqliteStore};
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let db_path = tmp.path().join("openshell.db");
+    let url = format!("sqlite:{}?mode=rwc", db_path.display());
+
+    let unset = SqliteStore::connect(&url, None)
+        .await
+        .expect("connect to sqlite");
+    assert_eq!(unset.max_connections_for_test(), DEFAULT_MAX_CONNECTIONS);
+
+    let raised = SqliteStore::connect(&url, Some(32))
+        .await
+        .expect("connect to sqlite");
+    assert_eq!(raised.max_connections_for_test(), 32);
+}
+
+/// An in-memory database lives inside its single connection: a second one
+/// would open a different, empty database, so the ceiling cannot be raised.
+#[tokio::test]
+async fn in_memory_sqlite_pins_the_pool_to_one_connection() {
+    use super::sqlite::SqliteStore;
+
+    let store = SqliteStore::connect("sqlite::memory:", Some(32))
+        .await
+        .expect("connect to in-memory sqlite");
+    assert_eq!(store.max_connections_for_test(), 1);
 }
 
 #[cfg(unix)]
