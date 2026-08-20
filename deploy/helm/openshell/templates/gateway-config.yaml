@@ -209,6 +209,18 @@ data:
     [openshell.drivers.kubernetes.proxy_pod]
     proxy_uid                    = {{ .Values.supervisor.proxyPod.proxyUid | default 1337 }}
     affinity                     = {{ .Values.supervisor.proxyPod.affinity | default "disabled" | quote }}
+    {{- range .Values.supervisor.proxyPod.dnsPeers }}
+
+    [[openshell.drivers.kubernetes.proxy_pod.dns_peers]]
+    {{- with .namespaceLabels }}
+    {{- $pairs := list }}{{ range $k, $v := . }}{{ $pairs = append $pairs (printf "%q = %q" $k $v) }}{{ end }}
+    namespace_labels = { {{ join ", " $pairs }} }
+    {{- end }}
+    {{- with .podLabels }}
+    {{- $pairs := list }}{{ range $k, $v := . }}{{ $pairs = append $pairs (printf "%q = %q" $k $v) }}{{ end }}
+    pod_labels = { {{ join ", " $pairs }} }
+    {{- end }}
+    {{- end }}
 
     {{- if not $credentialDrivers }}
 

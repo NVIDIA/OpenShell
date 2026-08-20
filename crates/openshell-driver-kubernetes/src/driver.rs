@@ -7,7 +7,7 @@ use super::AppArmorProfile;
 use crate::config::{
     DEFAULT_PROXY_UID, DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME, DEFAULT_SANDBOX_UID,
     DEFAULT_WORKSPACE_STORAGE_SIZE, KubernetesComputeConfig, OperatorNamespaceAllowlist,
-    ProxyPodAffinity, SupervisorSideloadMethod, SupervisorTopology, WorkspaceMode,
+    ProxyPodAffinity, ProxyPodDnsPeer, SupervisorSideloadMethod, SupervisorTopology, WorkspaceMode,
     is_dns_1123_label, managed_namespace, validate_managed_namespace_name,
 };
 use futures::{Stream, StreamExt, TryStreamExt};
@@ -486,6 +486,12 @@ impl KubernetesComputeDriver {
         config
             .validate_proxy_uid()
             .map_err(KubernetesDriverError::Precondition)?;
+        if config.topology == SupervisorTopology::ProxyPod {
+            config
+                .proxy_pod
+                .validate_dns_peers()
+                .map_err(KubernetesDriverError::Precondition)?;
+        }
         config
             .validate_upstream_proxy_config()
             .map_err(KubernetesDriverError::Precondition)?;
@@ -1426,6 +1432,7 @@ impl KubernetesComputeDriver {
             proxy_auth_allow_insecure: self.config.proxy_auth_allow_insecure == Some(true),
             proxy_connect_by_hostname: self.config.proxy_connect_by_hostname == Some(true),
             proxy_pod_affinity: self.config.proxy_pod.affinity,
+            proxy_pod_dns_peers: &self.config.proxy_pod.dns_peers,
             namespace: &self.config.namespace,
             service_account_name: &self.config.service_account_name,
             sandbox_id: &sandbox.id,
@@ -3806,6 +3813,7 @@ struct SandboxPodParams<'a> {
     proxy_auth_allow_insecure: bool,
     proxy_connect_by_hostname: bool,
     proxy_pod_affinity: ProxyPodAffinity,
+    proxy_pod_dns_peers: &'a [ProxyPodDnsPeer],
     namespace: &'a str,
     service_account_name: &'a str,
     sandbox_id: &'a str,
@@ -3849,6 +3857,7 @@ impl Default for SandboxPodParams<'_> {
             proxy_auth_allow_insecure: false,
             proxy_connect_by_hostname: false,
             proxy_pod_affinity: ProxyPodAffinity::Disabled,
+            proxy_pod_dns_peers: &[],
             namespace: "default",
             service_account_name: DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME,
             sandbox_id: "",
@@ -4885,11 +4894,67 @@ fn proxy_pod_supervisor_deployment(
     }))
 }
 
+/// Build the DNS egress rule for the agent pod, if any peers are configured.
+///
+/// Every configured peer becomes one `to` entry in the same rule, so the
+/// UDP/TCP 53 port list is stated once regardless of peer count.
+///
+/// Returns `None` for an empty peer list. This is deliberately fail-closed: a
+/// `NetworkPolicy` egress rule with an empty `to` array matches *every*
+/// destination, so emitting one here would silently open DNS-port egress to
+/// the whole cluster. Omitting the rule denies DNS instead, and
+/// `validate_dns_peers` rejects an empty list at startup so a correctly
+/// configured driver never reaches this branch.
+fn proxy_pod_dns_egress_rule(peers: &[ProxyPodDnsPeer]) -> Option<serde_json::Value> {
+    if peers.is_empty() {
+        return None;
+    }
+    let to = peers
+        .iter()
+        .map(|peer| {
+            let mut entry = serde_json::Map::new();
+            if !peer.namespace_labels.is_empty() {
+                entry.insert(
+                    "namespaceSelector".to_string(),
+                    serde_json::json!({"matchLabels": peer.namespace_labels}),
+                );
+            }
+            if !peer.pod_labels.is_empty() {
+                entry.insert(
+                    "podSelector".to_string(),
+                    serde_json::json!({"matchLabels": peer.pod_labels}),
+                );
+            }
+            serde_json::Value::Object(entry)
+        })
+        .collect::<Vec<_>>();
+    Some(serde_json::json!({
+        "to": to,
+        "ports": [
+            {"protocol": "UDP", "port": 53},
+            {"protocol": "TCP", "port": 53}
+        ]
+    }))
+}
+
 fn proxy_pod_agent_egress_network_policy(
     names: &ProxyPodResourceNames,
     params: &SandboxPodParams<'_>,
     owner_ref: serde_json::Value,
 ) -> NetworkPolicy {
+    let mut egress = vec![serde_json::json!({
+        "to": [{
+            "podSelector": {
+                "matchLabels": proxy_pod_match_labels(params.sandbox_id, SANDBOX_ROLE_SUPERVISOR)
+            }
+        }],
+        "ports": [
+            {"protocol": "TCP", "port": PROXY_POD_PROXY_PORT},
+            {"protocol": "TCP", "port": PROXY_POD_GATEWAY_FORWARD_PORT}
+        ]
+    })];
+    egress.extend(proxy_pod_dns_egress_rule(params.proxy_pod_dns_peers));
+
     k8s_object(serde_json::json!({
         "apiVersion": "networking.k8s.io/v1",
         "kind": "NetworkPolicy",
@@ -4904,39 +4969,7 @@ fn proxy_pod_agent_egress_network_policy(
                 "matchLabels": proxy_pod_match_labels(params.sandbox_id, SANDBOX_ROLE_AGENT)
             },
             "policyTypes": ["Egress"],
-            "egress": [
-                {
-                    "to": [{
-                        "podSelector": {
-                            "matchLabels": proxy_pod_match_labels(params.sandbox_id, SANDBOX_ROLE_SUPERVISOR)
-                        }
-                    }],
-                    "ports": [
-                        {"protocol": "TCP", "port": PROXY_POD_PROXY_PORT},
-                        {"protocol": "TCP", "port": PROXY_POD_GATEWAY_FORWARD_PORT}
-                    ]
-                },
-                {
-                    "to": [{
-                        "namespaceSelector": {"matchLabels": {"kubernetes.io/metadata.name": "kube-system"}},
-                        "podSelector": {"matchLabels": {"k8s-app": "kube-dns"}}
-                    }],
-                    "ports": [
-                        {"protocol": "UDP", "port": 53},
-                        {"protocol": "TCP", "port": 53}
-                    ]
-                },
-                {
-                    "to": [{
-                        "namespaceSelector": {"matchLabels": {"kubernetes.io/metadata.name": "kube-system"}},
-                        "podSelector": {"matchLabels": {"k8s-app": "coredns"}}
-                    }],
-                    "ports": [
-                        {"protocol": "UDP", "port": 53},
-                        {"protocol": "TCP", "port": 53}
-                    ]
-                }
-            ]
+            "egress": egress
         }
     }))
 }
@@ -7544,6 +7577,125 @@ mod tests {
         let err = validate_proxy_identity(&params).unwrap_err();
         assert!(matches!(err, KubernetesDriverError::Precondition(_)));
         assert!(err.to_string().contains("proxy-pod"));
+    }
+
+    fn dns_egress_rule(policy: &NetworkPolicy) -> Option<serde_json::Value> {
+        let policy = serde_json::to_value(policy).unwrap();
+        policy["spec"]["egress"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|rule| {
+                rule["ports"]
+                    .as_array()
+                    .is_some_and(|ports| ports.iter().any(|port| port["port"] == 53))
+            })
+            .cloned()
+    }
+
+    fn proxy_pod_egress_policy_with_dns_peers(peers: &[ProxyPodDnsPeer]) -> NetworkPolicy {
+        let params = SandboxPodParams {
+            topology: SupervisorTopology::ProxyPod,
+            namespace: "agents",
+            sandbox_id: "sandbox-123",
+            sandbox_name: "example-sandbox",
+            proxy_pod_dns_peers: peers,
+            ..SandboxPodParams::default()
+        };
+        proxy_pod_agent_egress_network_policy(
+            &proxy_pod_resource_names("example-sandbox"),
+            &params,
+            serde_json::json!({}),
+        )
+    }
+
+    #[test]
+    fn proxy_pod_dns_peers_default_to_upstream_kube_system_conventions() {
+        let peers = crate::config::KubernetesProxyPodConfig::default().dns_peers;
+        let rule = dns_egress_rule(&proxy_pod_egress_policy_with_dns_peers(&peers)).unwrap();
+        let to = rule["to"].as_array().unwrap();
+
+        assert_eq!(to.len(), 2);
+        for entry in to {
+            assert_eq!(
+                entry["namespaceSelector"]["matchLabels"]["kubernetes.io/metadata.name"],
+                "kube-system"
+            );
+        }
+        let apps: Vec<_> = to
+            .iter()
+            .map(|entry| entry["podSelector"]["matchLabels"]["k8s-app"].clone())
+            .collect();
+        assert!(apps.contains(&serde_json::json!("kube-dns")));
+        assert!(apps.contains(&serde_json::json!("coredns")));
+    }
+
+    /// `OpenShift` hosts cluster DNS in `openshift-dns`, not `kube-system`, and
+    /// labels the pods with `dns.operator.openshift.io/daemonset-dns=default`.
+    /// The upstream default matches nothing there, leaving the agent pod unable
+    /// to resolve even its own paired supervisor Service.
+    #[test]
+    fn proxy_pod_dns_peers_render_openshift_selectors() {
+        let peers = vec![ProxyPodDnsPeer {
+            namespace_labels: std::iter::once((
+                "kubernetes.io/metadata.name".to_string(),
+                "openshift-dns".to_string(),
+            ))
+            .collect(),
+            pod_labels: std::iter::once((
+                "dns.operator.openshift.io/daemonset-dns".to_string(),
+                "default".to_string(),
+            ))
+            .collect(),
+        }];
+        let rule = dns_egress_rule(&proxy_pod_egress_policy_with_dns_peers(&peers)).unwrap();
+        let to = rule["to"].as_array().unwrap();
+
+        assert_eq!(to.len(), 1);
+        assert_eq!(
+            to[0]["namespaceSelector"]["matchLabels"]["kubernetes.io/metadata.name"],
+            "openshift-dns"
+        );
+        assert_eq!(
+            to[0]["podSelector"]["matchLabels"]["dns.operator.openshift.io/daemonset-dns"],
+            "default"
+        );
+    }
+
+    /// A `NetworkPolicy` egress rule with an empty `to` array matches every
+    /// destination. Emitting one for an empty peer list would open DNS-port
+    /// egress cluster-wide, so the rule is omitted entirely instead.
+    #[test]
+    fn proxy_pod_empty_dns_peers_omit_the_rule_rather_than_allowing_all() {
+        let policy = proxy_pod_egress_policy_with_dns_peers(&[]);
+        assert!(dns_egress_rule(&policy).is_none());
+
+        let policy = serde_json::to_value(&policy).unwrap();
+        let egress = policy["spec"]["egress"].as_array().unwrap();
+        assert_eq!(egress.len(), 1);
+        assert!(
+            !egress
+                .iter()
+                .any(|rule| rule["to"].as_array().is_some_and(Vec::is_empty))
+        );
+    }
+
+    #[test]
+    fn proxy_pod_dns_peers_allow_a_namespace_only_peer() {
+        let peers = vec![ProxyPodDnsPeer {
+            namespace_labels: std::iter::once((
+                "kubernetes.io/metadata.name".to_string(),
+                "openshift-dns".to_string(),
+            ))
+            .collect(),
+            pod_labels: BTreeMap::new(),
+        }];
+        let rule = dns_egress_rule(&proxy_pod_egress_policy_with_dns_peers(&peers)).unwrap();
+        let to = rule["to"].as_array().unwrap();
+
+        assert_eq!(to.len(), 1);
+        assert!(to[0].get("namespaceSelector").is_some());
+        assert!(to[0].get("podSelector").is_none());
     }
 
     /// Regression test: TLS mount path must match env var paths.
