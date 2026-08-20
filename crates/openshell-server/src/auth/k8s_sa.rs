@@ -26,7 +26,7 @@ use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use kube::Error as KubeError;
 use kube::api::{Api, ApiResource, PostParams};
 use kube::core::{DynamicObject, gvk::GroupVersionKind};
-use openshell_driver_kubernetes::OperatorNamespaceAllowlist;
+use openshell_core::OperatorNamespaceAllowlist;
 use std::sync::Arc;
 use tonic::Status;
 use tracing::{debug, info, warn};

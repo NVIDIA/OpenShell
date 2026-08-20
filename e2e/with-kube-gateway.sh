@@ -380,6 +380,7 @@ run_scenario() {
     --set "image.tag=${IMAGE_TAG_VALUE}" \
     --set "supervisor.image.repository=${REGISTRY_VALUE}/supervisor" \
     --set "supervisor.image.tag=${IMAGE_TAG_VALUE}" \
+    "${helm_post_renderer_args[@]}" \
     "$@" \
     --wait --timeout 5m
   HELM_INSTALLED=1
@@ -554,6 +555,7 @@ if [ -z "${OPENSHELL_E2E_KUBE_BUILD_IMAGES+x}" ]; then
   fi
 fi
 
+reuse_supervisor_image=0
 if [ "${OPENSHELL_E2E_KUBE_BUILD_IMAGES}" = "1" ]; then
   REGISTRY_VALUE="${OPENSHELL_REGISTRY:-openshell}"
   IMAGE_TAG_VALUE="${IMAGE_TAG:-e2e-${CLUSTER_NAME:-local}}"
@@ -655,10 +657,43 @@ fi
 if [ "${OPENSHELL_E2E_KUBE_BUILD_IMAGES}" = "1" ]; then
   require_cmd docker
   echo "Building local Kubernetes e2e images (${REGISTRY_VALUE}/{gateway,supervisor}:${IMAGE_TAG_VALUE})..."
-  CONTAINER_ENGINE=docker IMAGE_REGISTRY="${REGISTRY_VALUE}" IMAGE_TAG="${IMAGE_TAG_VALUE}" \
-    bash "${ROOT}/tasks/scripts/docker-build-image.sh" gateway
-  CONTAINER_ENGINE=docker IMAGE_REGISTRY="${REGISTRY_VALUE}" IMAGE_TAG="${IMAGE_TAG_VALUE}" \
-    bash "${ROOT}/tasks/scripts/docker-build-image.sh" supervisor
+  if [ "${OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" = "1" ]; then
+    if [ "$(uname -s)" != "Linux" ]; then
+      echo "ERROR: external Kubernetes driver image composition currently requires a Linux build host." >&2
+      exit 2
+    fi
+    cargo build -p openshell-server --bin openshell-gateway \
+      --no-default-features --features telemetry,bundled-z3
+    cargo build -p openshell-driver-kubernetes --bin openshell-driver-kubernetes
+    case "$(uname -m)" in
+      x86_64) external_arch=amd64 ;;
+      aarch64|arm64) external_arch=arm64 ;;
+      *) echo "ERROR: unsupported external Kubernetes driver architecture: $(uname -m)" >&2; exit 2 ;;
+    esac
+    external_stage="${ROOT}/deploy/docker/.build/prebuilt-binaries/${external_arch}"
+    mkdir -p "${external_stage}"
+    cp "${ROOT}/target/debug/openshell-gateway" "${external_stage}/openshell-gateway"
+    cp "${ROOT}/target/debug/openshell-driver-kubernetes" \
+      "${external_stage}/openshell-driver-kubernetes"
+    docker build \
+      --build-arg "TARGETARCH=${external_arch}" \
+      --build-arg "SUPERVISOR_IMAGE=${REGISTRY_VALUE}/supervisor:${IMAGE_TAG_VALUE}" \
+      --tag "${REGISTRY_VALUE}/gateway:${IMAGE_TAG_VALUE}" \
+      --file "${ROOT}/e2e/docker/Dockerfile.external-kubernetes-gateway" \
+      "${ROOT}"
+  else
+    CONTAINER_ENGINE=docker IMAGE_REGISTRY="${REGISTRY_VALUE}" IMAGE_TAG="${IMAGE_TAG_VALUE}" \
+      bash "${ROOT}/tasks/scripts/docker-build-image.sh" gateway
+  fi
+  supervisor_image="${REGISTRY_VALUE}/supervisor:${IMAGE_TAG_VALUE}"
+  if [ "${OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" != "1" ] \
+     || ! docker image inspect "${supervisor_image}" >/dev/null 2>&1; then
+    CONTAINER_ENGINE=docker IMAGE_REGISTRY="${REGISTRY_VALUE}" IMAGE_TAG="${IMAGE_TAG_VALUE}" \
+      bash "${ROOT}/tasks/scripts/docker-build-image.sh" supervisor
+  else
+    reuse_supervisor_image=1
+    echo "Reusing existing supervisor image ${supervisor_image}"
+  fi
 fi
 
 if [ -n "${import_cluster_name}" ]; then
@@ -670,6 +705,20 @@ if [ -n "${import_cluster_name}" ]; then
       k3d image import "${image}" --cluster "${import_cluster_name}" \
         --mode direct >/dev/null
     fi
+  done
+elif [ "${OPENSHELL_E2E_KUBE_BUILD_IMAGES}" = "1" ] \
+   && [[ "${KUBE_CONTEXT}" == kind-* ]] \
+   && command -v kind >/dev/null 2>&1; then
+  kind_cluster_name="${KUBE_CONTEXT#kind-}"
+  kind_images=("${REGISTRY_VALUE}/gateway:${IMAGE_TAG_VALUE}")
+  # The CI workflow loads its published supervisor archive before invoking this
+  # wrapper. Only load a supervisor image here when this script rebuilt it.
+  if [ "${reuse_supervisor_image}" != "1" ]; then
+    kind_images+=("${REGISTRY_VALUE}/supervisor:${IMAGE_TAG_VALUE}")
+  fi
+  for image in "${kind_images[@]}"; do
+    echo "Loading ${image} into kind cluster ${kind_cluster_name}..."
+    kind load docker-image "${image}" --name "${kind_cluster_name}"
   done
 fi
 
@@ -689,7 +738,18 @@ if [ "${OPENSHELL_E2E_CREDENTIAL_DRIVERS:-0}" = "1" ] \
 fi
 
 helm_extra_args=()
+helm_post_renderer_args=()
 helm_extra_args+=(--set "server.telemetryEnabled=${OPENSHELL_TELEMETRY_ENABLED}")
+if [ "${OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" = "1" ]; then
+  if [ "${OPENSHELL_E2E_KUBE_BUILD_IMAGES}" != "1" ]; then
+    echo "ERROR: external Kubernetes driver e2e requires OPENSHELL_E2E_KUBE_BUILD_IMAGES=1." >&2
+    exit 2
+  fi
+  export HELM_PLUGINS="${ROOT}/e2e/helm-plugins"
+  helm_post_renderer_args+=(
+    --post-renderer openshell-external-compute-driver
+  )
+fi
 if [ -n "${HOST_GATEWAY_IP}" ]; then
   helm_extra_args+=(--set "server.hostGatewayIP=${HOST_GATEWAY_IP}")
 fi
@@ -811,6 +871,7 @@ else
     --set "supervisor.image.repository=${REGISTRY_VALUE}/supervisor" \
     --set "supervisor.image.tag=${IMAGE_TAG_VALUE}" \
     "${helm_extra_args[@]}" \
+    "${helm_post_renderer_args[@]}" \
     --wait --timeout 5m
   HELM_INSTALLED=1
 

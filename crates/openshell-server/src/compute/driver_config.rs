@@ -7,7 +7,7 @@
 //! driver-specific environment overrides, and applying gateway startup defaults.
 //! It does not acquire, connect to, or start compute drivers.
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(all(not(target_os = "windows"), feature = "in-tree-compute-drivers"))]
 pub mod builtin;
 
 use crate::config_file;
@@ -53,17 +53,71 @@ pub fn remote_driver_config_from_context(
     context: DriverStartupContext<'_>,
     name: &str,
 ) -> Result<RemoteDriverConfig> {
-    let mut cfg = driver_config_from_context(context, name)?;
+    let mut cfg = RemoteDriverConfig::default();
+    if let Some(file) = context.file {
+        let merged = config_file::driver_table(
+            name,
+            &file.openshell.gateway,
+            file.openshell.drivers.get(name),
+        );
+        if let Some(socket_path) = merged.get("socket_path").and_then(toml::Value::as_str) {
+            cfg.socket_path = PathBuf::from(socket_path);
+        }
+    }
     apply_remote_driver_overrides(&mut cfg, context, name);
     validate_remote_driver_config(&cfg, name)?;
     Ok(cfg)
 }
 
 #[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
 pub struct RemoteDriverConfig {
     #[serde(default)]
     pub socket_path: PathBuf,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct KubernetesSaBootstrapConfig {
+    pub namespace: String,
+    pub service_account_name: String,
+    pub workspace_mode: String,
+    pub gateway_id: String,
+}
+
+impl Default for KubernetesSaBootstrapConfig {
+    fn default() -> Self {
+        Self {
+            namespace: "openshell".to_string(),
+            service_account_name: "default".to_string(),
+            workspace_mode: "shared".to_string(),
+            gateway_id: "openshell".to_string(),
+        }
+    }
+}
+
+pub fn kubernetes_sa_bootstrap_config(
+    file: Option<&config_file::ConfigFile>,
+) -> Result<KubernetesSaBootstrapConfig> {
+    let Some(file) = file else {
+        return Err(Error::config(
+            "K8s ServiceAccount bootstrap requires [openshell.drivers.kubernetes] when sandbox JWT issuing is enabled in-cluster",
+        ));
+    };
+    if !file.openshell.drivers.contains_key("kubernetes") {
+        return Err(Error::config(
+            "K8s ServiceAccount bootstrap requires [openshell.drivers.kubernetes] when sandbox JWT issuing is enabled in-cluster",
+        ));
+    }
+    let merged = config_file::driver_table(
+        "kubernetes",
+        &file.openshell.gateway,
+        file.openshell.drivers.get("kubernetes"),
+    );
+    merged.try_into().map_err(|error| {
+        Error::config(format!(
+            "invalid Kubernetes ServiceAccount bootstrap config: {error}"
+        ))
+    })
 }
 
 pub fn driver_config_from_context<T>(
@@ -155,6 +209,52 @@ socket_path = "/run/openshell/kyma.sock"
             .expect("remote config");
 
         assert_eq!(cfg.socket_path, PathBuf::from("/run/openshell/kyma.sock"));
+    }
+
+    #[test]
+    fn remote_driver_config_ignores_in_process_driver_fields() {
+        let file: config_file::ConfigFile = toml::from_str(
+            r#"
+[openshell.gateway]
+sandbox_namespace = "sandboxes"
+
+[openshell.drivers.kubernetes]
+socket_path = "/run/openshell/kubernetes.sock"
+workspace_mode = "shared"
+service_account_name = "sandbox-sa"
+"#,
+        )
+        .expect("valid config");
+
+        let cfg = remote_driver_config_from_context(test_context(Some(&file)), "kubernetes")
+            .expect("remote config");
+        assert_eq!(
+            cfg.socket_path,
+            PathBuf::from("/run/openshell/kubernetes.sock")
+        );
+    }
+
+    #[test]
+    fn kubernetes_sa_bootstrap_uses_public_gateway_config() {
+        let file: config_file::ConfigFile = toml::from_str(
+            r#"
+[openshell.gateway]
+sandbox_namespace = "sandboxes"
+
+[openshell.drivers.kubernetes]
+socket_path = "/run/openshell/kubernetes.sock"
+workspace_mode = "managed"
+gateway_id = "gateway-a"
+service_account_name = "sandbox-sa"
+"#,
+        )
+        .expect("valid config");
+
+        let cfg = kubernetes_sa_bootstrap_config(Some(&file)).expect("bootstrap config");
+        assert_eq!(cfg.namespace, "sandboxes");
+        assert_eq!(cfg.workspace_mode, "managed");
+        assert_eq!(cfg.gateway_id, "gateway-a");
+        assert_eq!(cfg.service_account_name, "sandbox-sa");
     }
 
     #[test]

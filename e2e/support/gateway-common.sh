@@ -217,8 +217,14 @@ e2e_build_gateway_binaries() {
 
   if [ -z "${OPENSHELL_GATEWAY_BIN:-}" ]; then
     echo "Building openshell-gateway..."
-    cargo build "${jobs[@]}" \
-      -p openshell-server --bin openshell-gateway
+    if [ "${OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" = "1" ]; then
+      cargo build "${jobs[@]}" \
+        -p openshell-server --bin openshell-gateway \
+        --no-default-features --features telemetry
+    else
+      cargo build "${jobs[@]}" \
+        -p openshell-server --bin openshell-gateway
+    fi
   else
     echo "Using prebuilt openshell gateway at ${OPENSHELL_GATEWAY_BIN}"
   fi
@@ -238,6 +244,59 @@ e2e_build_gateway_binaries() {
   if [ ! -x "${!cli_var}" ]; then
     echo "ERROR: expected openshell CLI binary at ${!cli_var}" >&2
     exit 1
+  fi
+}
+
+e2e_build_external_driver() {
+  local root=$1
+  local package=$2
+  local binary=$3
+  local output_var=$4
+  local target_dir
+  local jobs=()
+
+  if [ -n "${CARGO_BUILD_JOBS:-}" ]; then
+    jobs=(-j "${CARGO_BUILD_JOBS}")
+  fi
+  target_dir="$(e2e_cargo_target_dir "${root}")"
+  printf -v "${output_var}" '%s' "${target_dir}/debug/${binary}"
+  echo "Building external ${binary}..."
+  cargo build "${jobs[@]}" -p "${package}" --bin "${binary}"
+  if [ ! -x "${!output_var}" ]; then
+    echo "ERROR: expected external driver binary at ${!output_var}" >&2
+    exit 1
+  fi
+}
+
+e2e_wait_for_socket() {
+  local socket_path=$1
+  local process_pid=$2
+  local process_label=$3
+  local timeout="${4:-30}"
+  local elapsed=0
+
+  while [ "${elapsed}" -lt "${timeout}" ]; do
+    if [ -S "${socket_path}" ]; then
+      return 0
+    fi
+    if ! kill -0 "${process_pid}" 2>/dev/null; then
+      echo "ERROR: ${process_label} exited before creating ${socket_path}" >&2
+      return 1
+    fi
+    sleep 1
+    elapsed=$((elapsed + 1))
+  done
+  echo "ERROR: ${process_label} did not create ${socket_path} within ${timeout}s" >&2
+  return 1
+}
+
+e2e_stop_process() {
+  local process_pid=$1
+  local process_label=$2
+  if [ -n "${process_pid}" ] && kill -0 "${process_pid}" 2>/dev/null; then
+    echo "Stopping ${process_label} (pid ${process_pid})..."
+    kill "${process_pid}" 2>/dev/null || true
+    wait "${process_pid}" 2>/dev/null || true
   fi
 }
 

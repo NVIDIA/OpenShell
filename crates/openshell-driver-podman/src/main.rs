@@ -23,6 +23,10 @@ use openshell_driver_podman::{ComputeDriverService, PodmanComputeConfig, PodmanC
 #[command(name = "openshell-driver-podman")]
 #[command(version = VERSION)]
 struct Args {
+    /// Public compute-driver Unix socket used by an external gateway.
+    #[arg(long, env = "OPENSHELL_COMPUTE_DRIVER_SOCKET")]
+    bind_socket: Option<PathBuf>,
+
     #[arg(
         long,
         env = "OPENSHELL_COMPUTE_DRIVER_BIND",
@@ -154,6 +158,10 @@ struct Args {
     /// Each entry is `"container_id:host_id:size"`.
     #[arg(long = "gidmap")]
     gidmap: Vec<String>,
+
+    /// Allow sandbox requests to attach host bind mounts.
+    #[arg(long, env = "OPENSHELL_ENABLE_BIND_MOUNTS", default_value_t = false)]
+    enable_bind_mounts: bool,
 }
 
 #[tokio::main]
@@ -203,21 +211,37 @@ async fn main() -> Result<()> {
         userns: args.userns,
         uidmap: args.uidmap,
         gidmap: args.gidmap,
+        enable_bind_mounts: args.enable_bind_mounts,
         ..PodmanComputeConfig::default()
     })
     .await
     .into_diagnostic()?;
 
-    info!(address = %args.bind_address, "Starting Podman compute driver");
-    let result = tonic::transport::Server::builder()
-        .layer(compute_driver_rpc_layer())
-        .add_service(ComputeDriverServer::new(ComputeDriverService::new(driver)))
-        .serve_with_shutdown(args.bind_address, async {
-            shutdown_signal().await;
-            info!("Received shutdown signal, draining in-flight requests");
-        })
-        .await
-        .into_diagnostic();
+    let service = ComputeDriverServer::new(ComputeDriverService::new(driver));
+    let result = if let Some(socket_path) = args.bind_socket {
+        let listener = openshell_core::external_driver_socket::bind_private(&socket_path)
+            .map_err(|err| miette::miette!("{err}"))?;
+        let _cleanup =
+            openshell_core::external_driver_socket::SocketCleanup::new(socket_path.clone());
+        info!(socket = %socket_path.display(), "Starting Podman compute driver");
+        tonic::transport::Server::builder()
+            .layer(compute_driver_rpc_layer())
+            .add_service(service)
+            .serve_with_incoming_shutdown(
+                openshell_core::external_driver_socket::SameUidUnixIncoming::new(listener),
+                shutdown_signal(),
+            )
+            .await
+            .into_diagnostic()
+    } else {
+        info!(address = %args.bind_address, "Starting Podman compute driver");
+        tonic::transport::Server::builder()
+            .layer(compute_driver_rpc_layer())
+            .add_service(service)
+            .serve_with_shutdown(args.bind_address, shutdown_signal())
+            .await
+            .into_diagnostic()
+    };
     if let Some(provider) = &tracer_provider
         && let Err(error) = provider.shutdown()
     {
@@ -260,6 +284,8 @@ async fn shutdown_signal() {
 
     #[cfg(not(unix))]
     ctrl_c_signal().await;
+
+    info!("Received shutdown signal, draining in-flight requests");
 }
 
 #[cfg(test)]

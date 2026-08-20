@@ -3776,6 +3776,7 @@ dependencies = [
  "prost-types",
  "protoc-bin-vendored",
  "reqwest 0.12.28",
+ "rustix 1.1.4",
  "serde",
  "serde_json",
  "tar",
@@ -3814,7 +3815,9 @@ version = "0.0.0"
 dependencies = [
  "bollard",
  "bytes",
+ "clap",
  "futures",
+ "miette",
  "openshell-core",
  "prost-types",
  "serde",
@@ -3824,8 +3827,10 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-stream",
+ "toml",
  "tonic",
  "tracing",
+ "tracing-subscriber",
  "url",
 ]
 
