@@ -32,6 +32,12 @@ The stop call waits until Podman reports the container as stopped or exited.
 This keeps an immediate start from racing a rootless Podman stop that is still
 finishing after its API request returns.
 
+Graceful gateway shutdown sends `StopSandbox` for each sandbox whose persisted
+phase requires running compute without changing that persisted intent. On
+startup, the gateway sends an idempotent `StartSandbox` request for the same
+sandboxes, restarting their retained containers. Explicitly stopped sandboxes
+remain excluded.
+
 ## Architecture
 
 The Podman driver communicates with the Podman daemon over a Unix socket and

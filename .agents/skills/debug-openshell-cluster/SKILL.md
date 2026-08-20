@@ -194,6 +194,13 @@ For source checkout development, restart the local gateway with:
 mise run gateway:docker
 ```
 
+During a graceful gateway restart, Docker, Podman, and VM sandboxes with
+running intent should stop before the gateway exits and restart after it
+returns. Check for `Stopped sandbox during gateway shutdown` and `Started
+sandbox during gateway startup` in gateway logs. A sandbox explicitly stopped
+through the CLI remains stopped. Kubernetes sandboxes are cluster-owned and do
+not follow this local gateway lifecycle.
+
 ### Step 5: Check Podman-Backed Gateways
 
 ```bash

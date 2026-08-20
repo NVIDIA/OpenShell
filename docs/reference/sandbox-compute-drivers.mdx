@@ -18,6 +18,13 @@ Delete remains independent and removes compute plus driver-owned persistent
 state. While a sandbox is stopped, gateway access paths and exposed services
 remain unavailable.
 
+Restarting the gateway preserves this intent. The gateway does not stop Docker
+or Podman containers during shutdown. At startup it sends idempotent start
+requests for Docker, Podman, and MicroVM sandboxes that were intended to run;
+already-running resources are unchanged, retained stopped compute is restarted,
+and explicitly stopped sandboxes remain stopped. Kubernetes workloads continue
+running independently of the gateway process.
+
 ## Configure a Compute Driver
 
 Configure the compute driver on the gateway. Current releases accept one driver per gateway. Set `compute_drivers` in the gateway TOML file:
@@ -141,7 +148,10 @@ Select Docker with `compute_drivers = ["docker"]` in `[openshell.gateway]`. Conf
 Stop stops the existing Docker container without removing its writable
 layer or attached volumes. Start starts that same container. A durably
 stopped container stays stopped across gateway restart, and delete remains
-responsible for removing it.
+responsible for removing it. Graceful gateway shutdown stops running-intent
+Docker containers through the driver RPC without recording an explicit
+sandbox stop. On startup, the gateway reconciles that retained intent with an
+idempotent start request. Explicitly stopped sandboxes remain stopped.
 
 For GPU-backed Docker sandboxes, configure Docker CDI before starting the gateway so OpenShell can detect the daemon capability.
 
@@ -213,7 +223,11 @@ Podman sandboxes default to a 45-second graceful stop window before Podman escal
 
 Stop stops the existing Podman container while retaining its named workspace
 volume and driver-owned secrets. Start starts the same container. Delete is
-the operation that removes the container and named volume.
+the operation that removes the container and named volume. Graceful gateway
+shutdown stops running-intent Podman containers through the driver RPC without
+recording an explicit sandbox stop. On startup, the gateway reconciles that
+retained intent with an idempotent start request while leaving explicitly
+stopped sandboxes alone.
 
 For proxy-required networks, the Podman driver also accepts the corporate egress proxy keys `https_proxy`, `no_proxy`, `proxy_auth_file`, `proxy_auth_allow_insecure`, and `proxy_connect_by_hostname`. The supervisor chains policy-approved TLS tunnels through the proxy with HTTP CONNECT instead of dialing destinations directly. See the [Gateway Configuration File](./gateway-config) reference for the full contract, including the cleartext-credential acknowledgement and the validated-IP CONNECT behavior.
 
@@ -285,7 +299,7 @@ The VM driver boots a cached immutable bootstrap ext4 root disk. When the reques
 
 VM sandbox creation follows the same progress model as Kubernetes-backed sandboxes. The gateway accepts the sandbox, then the VM driver publishes watch events while it resolves the image, prepares or reuses the bootstrap and prepared image caches, creates the writable overlay, and starts the VM launcher.
 
-On gateway restart, the gateway starts a fresh VM driver process. The driver scans its state directory for accepted sandbox launch records, restarts those VMs, and reuses each sandbox's existing `overlay.ext4` so files written inside the sandbox remain available after the supervisor reconnects.
+On graceful gateway shutdown, the gateway stops running-intent VMs through the driver RPC while retaining their launch records and writable overlays. On restart, the gateway starts a fresh VM driver process and reconciles the retained intent through the same idempotent start request used by the local container drivers. Running-intent VMs restart with their existing `overlay.ext4`, while explicitly stopped VMs remain stopped.
 
 Stopped VM state directories contain a marker that prevents startup from
 launching the VM. The driver retains `sandbox.pb`, `overlay.ext4`, and extension

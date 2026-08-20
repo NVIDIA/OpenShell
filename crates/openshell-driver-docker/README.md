@@ -26,6 +26,11 @@ policy. Start starts that same container, so files in the resolved OCI
 workspace remain available. A durably stopped sandbox is excluded from
 gateway startup recovery and stays stopped across gateway restarts. Delete
 continues to force-remove the container and clean up driver-owned material.
+Graceful gateway shutdown sends `StopSandbox` for each sandbox whose persisted
+phase requires running compute without changing that persisted intent. On
+startup, the gateway sends an idempotent `StartSandbox` request for the same
+sandboxes, restarting their retained containers. Explicitly stopped sandboxes
+remain excluded.
 
 Before creating the container, the driver inspects the final sandbox image and
 captures its immutable image ID, raw OCI `Config.User`, and OCI

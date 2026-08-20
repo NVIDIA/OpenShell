@@ -1055,69 +1055,6 @@ impl DockerComputeDriver {
         }
     }
 
-    pub async fn stop_managed_containers_on_shutdown(&self) -> Result<usize, Status> {
-        let containers = self.list_managed_container_summaries().await?;
-        let targets = containers
-            .into_iter()
-            .filter_map(|container| {
-                let state = container.state.unwrap_or(ContainerSummaryStateEnum::EMPTY);
-                if container_state_needs_shutdown_stop(state) {
-                    summary_container_target(&container)
-                } else {
-                    None
-                }
-            })
-            .collect::<Vec<_>>();
-        let target_count = targets.len();
-        let mut stopped = 0usize;
-        let mut failures = Vec::new();
-        let stop_timeout_secs = self.config.stop_timeout_secs;
-
-        let mut stop_results = futures::stream::iter(targets.into_iter().map(|target| {
-            let docker = self.docker.clone();
-            async move {
-                let result = docker
-                    .stop_container(
-                        &target,
-                        Some(
-                            StopContainerOptionsBuilder::default()
-                                .t(docker_stop_timeout_secs(stop_timeout_secs))
-                                .build(),
-                        ),
-                    )
-                    .await;
-                (target, result)
-            }
-        }))
-        .buffer_unordered(16);
-
-        while let Some((target, result)) = stop_results.next().await {
-            match result {
-                Ok(()) => {
-                    stopped += 1;
-                }
-                Err(err) if is_not_found_error(&err) || is_not_modified_error(&err) => {}
-                Err(err) => {
-                    warn!(
-                        container = %target,
-                        error = %err,
-                        "Failed to stop Docker sandbox container during shutdown"
-                    );
-                    failures.push(target);
-                }
-            }
-        }
-
-        if !failures.is_empty() {
-            return Err(Status::internal(format!(
-                "failed to stop {} of {target_count} Docker sandbox containers during shutdown",
-                failures.len()
-            )));
-        }
-
-        Ok(stopped)
-    }
-
     async fn reserve_pending_sandbox(&self, sandbox: &DriverSandbox) -> Result<(), Status> {
         let mut pending = self.pending.lock().await;
         if pending
@@ -3198,15 +3135,6 @@ fn summary_container_target(summary: &ContainerSummary) -> Option<String> {
         .filter(|id| !id.is_empty())
         .map(str::to_string)
         .or_else(|| summary_container_name(summary))
-}
-
-fn container_state_needs_shutdown_stop(state: ContainerSummaryStateEnum) -> bool {
-    matches!(
-        state,
-        ContainerSummaryStateEnum::RUNNING
-            | ContainerSummaryStateEnum::RESTARTING
-            | ContainerSummaryStateEnum::PAUSED
-    )
 }
 
 /// States from which a managed container can be brought back to running by

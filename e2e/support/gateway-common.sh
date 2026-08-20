@@ -273,6 +273,29 @@ e2e_stop_gateway() {
   if [ -n "${gateway_pid}" ] && kill -0 "${gateway_pid}" 2>/dev/null; then
     echo "Stopping openshell-gateway (pid ${gateway_pid})..."
     kill "${gateway_pid}" 2>/dev/null || true
+
+    # A Rust E2E test may have restarted the gateway and updated the PID file.
+    # That replacement process is not a child of this shell, so `wait` returns
+    # immediately even though gateway shutdown (including its sandbox stop
+    # sweep) is still in progress. Poll until either the process exits or a
+    # child process becomes a zombie that the final `wait` can reap.
+    local attempts=0
+    local process_state=""
+    while kill -0 "${gateway_pid}" 2>/dev/null && [ "${attempts}" -lt 120 ]; do
+      process_state="$(ps -p "${gateway_pid}" -o stat= 2>/dev/null || true)"
+      case "${process_state}" in
+        *Z*) break ;;
+      esac
+      sleep 0.5
+      attempts=$((attempts + 1))
+    done
+    if kill -0 "${gateway_pid}" 2>/dev/null; then
+      process_state="$(ps -p "${gateway_pid}" -o stat= 2>/dev/null || true)"
+      case "${process_state}" in
+        *Z*) ;;
+        *) kill -KILL "${gateway_pid}" 2>/dev/null || true ;;
+      esac
+    fi
     wait "${gateway_pid}" 2>/dev/null || true
   fi
 }
