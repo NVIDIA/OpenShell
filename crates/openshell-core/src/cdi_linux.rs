@@ -235,9 +235,6 @@ fn resolve_container_edits(
     selected_devices: &[String],
 ) -> Result<CdiContainerEdits, CdiError> {
     let (mut cache, refresh_error) = build_cache(&context.spec_dirs);
-    if let Some(device) = conflicting_selected_device(refresh_error.as_deref(), selected_devices) {
-        return Err(CdiError::DuplicateDevice(device));
-    }
     let mut merged = UpstreamContainerEdits::new();
     let mut applied_specs = BTreeSet::new();
 
@@ -269,21 +266,6 @@ fn resolve_container_edits(
     let value = serde_json::to_value(&merged.container_edits)
         .map_err(|source| CdiError::EditEncode { source })?;
     serde_json::from_value(value).map_err(|source| CdiError::EditDecode { source })
-}
-
-// Temporary compatibility check for the Rust CDI cache revision pinned by
-// OpenShell. That revision records same-priority device conflicts but leaves
-// the conflicted device resolvable. Remove this once OpenShell uses the
-// upstream fix that excludes conflicts from the cache's device map.
-fn conflicting_selected_device(
-    refresh_error: Option<&str>,
-    selected_devices: &[String],
-) -> Option<String> {
-    let refresh_error = refresh_error?;
-    selected_devices
-        .iter()
-        .find(|device| refresh_error.contains(&format!("conflicting device {device} (specs ")))
-        .cloned()
 }
 
 fn missing_device_error(device: &str, refresh_error: Option<&str>) -> CdiError {
@@ -730,7 +712,11 @@ devices:
         )
         .unwrap_err();
 
-        assert!(matches!(err, CdiError::DuplicateDevice(device) if device == "nvidia.com/gpu=0"));
+        assert!(
+            matches!(err, CdiError::MissingDeviceAfterRefresh { device, refresh_error }
+                if device == "nvidia.com/gpu=0"
+                    && refresh_error.contains("conflicting device nvidia.com/gpu=0"))
+        );
     }
 
     #[test]
