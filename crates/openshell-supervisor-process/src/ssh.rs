@@ -743,6 +743,16 @@ fn session_user_and_home(policy: &SandboxPolicy, workdir_home: Option<&str>) -> 
     (user, home)
 }
 
+fn bash_login_command(command: String) -> Command {
+    let mut cmd = Command::new("/bin/bash");
+    // Login profiles can rewrite PATH after the supervisor-provided child
+    // environment is applied. Re-append standard sbin directories so
+    // CDI-injected tools such as /usr/sbin/nvidia-smi remain discoverable.
+    cmd.arg("-lc")
+        .arg(child_env::shell_command_with_standard_sbin_paths(&command));
+    cmd
+}
+
 #[allow(clippy::too_many_arguments)]
 fn apply_child_env(
     cmd: &mut Command,
@@ -754,7 +764,7 @@ fn apply_child_env(
     provider_env: &HashMap<String, String>,
     user_environment: &HashMap<String, String>,
 ) {
-    let path = std::env::var("PATH").unwrap_or_else(|_| "/usr/local/bin:/usr/bin:/bin".into());
+    let path = child_env::child_path_from_env();
 
     cmd.env_clear()
         .env(openshell_core::sandbox_env::SANDBOX, "1")
@@ -766,7 +776,11 @@ fn apply_child_env(
 
     for (key, value) in user_environment {
         if !key.starts_with("OPENSHELL_") {
-            cmd.env(key, value);
+            if key == "PATH" {
+                cmd.env(key, child_env::path_with_standard_sbin_paths(value));
+            } else {
+                cmd.env(key, value);
+            }
         }
     }
 
@@ -786,7 +800,11 @@ fn apply_child_env(
         if is_supervisor_only_env_var(key) {
             continue;
         }
-        cmd.env(key, value);
+        if key == "PATH" {
+            cmd.env(key, child_env::path_with_standard_sbin_paths(value));
+        } else {
+            cmd.env(key, value);
+        }
     }
 }
 
@@ -829,11 +847,7 @@ fn spawn_pty_shell(
             c.arg("-i");
             c
         },
-        |command| {
-            let mut c = Command::new("/bin/bash");
-            c.arg("-lc").arg(command);
-            c
-        },
+        bash_login_command,
     );
 
     let term = if pty.term.is_empty() {
@@ -989,12 +1003,10 @@ fn spawn_pipe_exec(
             Command::new("/bin/bash")
         },
         |command| {
-            let mut c = Command::new("/bin/bash");
             // Use login shell (-l) so that .profile/.bashrc are sourced and
             // tool-specific env vars (VIRTUAL_ENV, UV_PYTHON_INSTALL_DIR, etc.)
             // are available without hardcoding them here.
-            c.arg("-lc").arg(command);
-            c
+            bash_login_command(command)
         },
     );
 
@@ -1497,6 +1509,36 @@ mod tests {
             output.status
         );
         assert_eq!(output.stdout, b"hello");
+    }
+
+    #[test]
+    fn apply_child_env_appends_standard_sbin_to_user_path() {
+        let mut cmd = Command::new("/usr/bin/env");
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+
+        let user_environment = HashMap::from([(
+            "PATH".to_string(),
+            "/sandbox/.venv/bin:/usr/local/bin:/usr/bin:/bin".to_string(),
+        )]);
+        apply_child_env(
+            &mut cmd,
+            "/sandbox",
+            "sandbox",
+            "dumb",
+            None,
+            None,
+            &HashMap::new(),
+            &user_environment,
+        );
+
+        let output = cmd.output().expect("spawn env");
+        assert!(output.status.success());
+        let stdout = String::from_utf8(output.stdout).expect("utf8");
+        assert!(stdout.lines().any(|line| {
+            line == "PATH=/sandbox/.venv/bin:/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin"
+        }));
     }
 
     /// Verify that the stdin writer delivers all buffered data before exiting
