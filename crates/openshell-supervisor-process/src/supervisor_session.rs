@@ -302,6 +302,9 @@ async fn run_session_loop(
 ) {
     let mut backoff = INITIAL_BACKOFF;
     let mut attempt: u64 = 0;
+    // `instance_id` identifies this supervisor process, not an individual
+    // connection attempt, so reconnects must reuse it.
+    let instance_id = uuid::Uuid::new_v4().to_string();
 
     loop {
         attempt += 1;
@@ -313,6 +316,7 @@ async fn run_session_loop(
             netns_fd,
             expected_ssh_peer_pid,
             Arc::clone(&terminating),
+            &instance_id,
         )
         .await
         {
@@ -344,6 +348,7 @@ async fn run_single_session(
     netns_fd: Option<i32>,
     expected_ssh_peer_pid: Option<u32>,
     terminating: Arc<AtomicBool>,
+    instance_id: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Connect to the gateway. The same `Channel` is used for both the
     // long-lived control stream and all data-plane `RelayStream` calls, so
@@ -359,12 +364,11 @@ async fn run_single_session(
     let outbound = tokio_stream::wrappers::ReceiverStream::new(rx);
 
     // Send hello as the first message.
-    let instance_id = uuid::Uuid::new_v4().to_string();
     tx.send(SupervisorMessage {
-        payload: Some(supervisor_message::Payload::Hello(SupervisorHello {
-            sandbox_id: sandbox_id.to_string(),
-            instance_id: instance_id.clone(),
-        })),
+        payload: Some(supervisor_message::Payload::Hello(build_supervisor_hello(
+            sandbox_id,
+            instance_id,
+        ))),
     })
     .await
     .map_err(|_| "failed to queue hello")?;
@@ -440,6 +444,13 @@ async fn run_single_session(
                 }
             }
         }
+    }
+}
+
+fn build_supervisor_hello(sandbox_id: &str, instance_id: &str) -> SupervisorHello {
+    SupervisorHello {
+        sandbox_id: sandbox_id.to_string(),
+        instance_id: instance_id.to_string(),
     }
 }
 
@@ -798,6 +809,16 @@ fn normalize_tcp_target_host(target: &TcpRelayTarget) -> Result<String, String> 
 #[cfg(test)]
 mod target_tests {
     use super::*;
+
+    #[test]
+    fn supervisor_hello_reuses_caller_owned_instance_id() {
+        let instance_id = uuid::Uuid::new_v4().to_string();
+        let first = build_supervisor_hello("sandbox-1", &instance_id);
+        let second = build_supervisor_hello("sandbox-1", &instance_id);
+
+        assert_eq!(first.instance_id, instance_id);
+        assert_eq!(second.instance_id, first.instance_id);
+    }
 
     fn tcp(host: &str, port: u32) -> TcpRelayTarget {
         TcpRelayTarget {
