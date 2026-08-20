@@ -7596,6 +7596,8 @@ network_policies:
                 session_id,
                 request_id: "request".into(),
                 sandbox_id: "sandbox".into(),
+                sandbox_name: "sandbox-name".into(),
+                workspace: "workspace".into(),
                 scheme: "wss".into(),
                 host: "api.openai.com".into(),
                 port: 443,

@@ -133,6 +133,10 @@ impl PolicyLocalContext {
         *self.current_policy.write().await = Some(policy);
     }
 
+    pub fn workspace(&self) -> String {
+        self.workspace_rx.borrow().clone()
+    }
+
     #[must_use]
     pub fn agent_proposals(&self) -> AgentProposals {
         self.agent_proposals.clone()

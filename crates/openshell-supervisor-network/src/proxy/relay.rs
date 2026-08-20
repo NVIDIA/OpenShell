@@ -45,6 +45,7 @@ pub(super) fn http_context(
     activity_tx: Option<ActivitySender>,
     dynamic_credentials: Option<DynamicCredentials>,
     agent_proposals: openshell_core::proposals::AgentProposals,
+    workspace: String,
 ) -> L7EvalContext {
     // Provider-backed credentials must be acquired from the live state for
     // each request after middleware/token-grant awaits. Keep only the legacy
@@ -87,6 +88,7 @@ pub(super) fn http_context(
             .as_ref()
             .map(|_| crate::l7::token_grant_injection::default_resolver()),
         agent_proposals,
+        workspace,
     }
 }
 
@@ -355,6 +357,7 @@ mod tests {
             dynamic_credentials: None,
             token_grant_resolver: None,
             agent_proposals: openshell_core::proposals::AgentProposals::default(),
+            workspace: String::new(),
         }
     }
 

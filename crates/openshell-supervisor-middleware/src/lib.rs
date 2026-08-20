@@ -438,6 +438,7 @@ pub struct HttpRequestInput {
     pub request_id: String,
     pub sandbox_id: String,
     pub sandbox_name: String,
+    pub workspace: String,
     pub scheme: String,
     pub host: String,
     pub port: u16,
@@ -1583,6 +1584,7 @@ impl ChainRunner {
             request_id,
             sandbox_id,
             sandbox_name,
+            workspace,
             scheme,
             host,
             port,
@@ -1600,6 +1602,7 @@ impl ChainRunner {
             request_id,
             sandbox_id,
             sandbox_name,
+            workspace,
             originating_process: None,
         };
         let target = HttpRequestTarget {
@@ -2052,6 +2055,7 @@ mod tests {
             request_id: "req".into(),
             sandbox_id: "sbx-id".into(),
             sandbox_name: "sbx-name".into(),
+            workspace: "wrks-default".into(),
             scheme: "https".into(),
             host: "api.example.com".into(),
             port: 443,
@@ -3221,6 +3225,7 @@ mod tests {
         assert_eq!(context.request_id, "req");
         assert_eq!(context.sandbox_id, "sbx-id");
         assert_eq!(context.sandbox_name, "sbx-name");
+        assert_eq!(context.workspace, "wrks-default");
         assert!(context.originating_process.is_none());
         let target = received[0].target.as_ref().expect("request target");
         assert_eq!(target.scheme, "https");
@@ -4683,6 +4688,8 @@ mod tests {
             session_id: session_id.into(),
             request_id: "request".into(),
             sandbox_id: "sandbox".into(),
+            sandbox_name: "sandbox-name".into(),
+            workspace: "wrks-default".into(),
             scheme: "wss".into(),
             host: "api.openai.com".into(),
             port: 443,
@@ -5116,6 +5123,8 @@ mod tests {
                     session_id: "builtin-regex-session".into(),
                     request_id: "request".into(),
                     sandbox_id: "sandbox".into(),
+                    sandbox_name: "sandbox-name".into(),
+                    workspace: "wrks-default".into(),
                     scheme: "wss".into(),
                     host: "api.openai.com".into(),
                     port: 443,
@@ -5182,6 +5191,8 @@ mod tests {
                     session_id: "builtin-regex-gap-session".into(),
                     request_id: "request".into(),
                     sandbox_id: "sandbox".into(),
+                    sandbox_name: "sandbox-name".into(),
+                    workspace: "wrks-default".into(),
                     scheme: "wss".into(),
                     host: "api.openai.com".into(),
                     port: 443,
@@ -5244,6 +5255,8 @@ mod tests {
                     session_id: "in-process-session".into(),
                     request_id: "request".into(),
                     sandbox_id: "sandbox".into(),
+                    sandbox_name: "sandbox-name".into(),
+                    workspace: "wrks-default".into(),
                     scheme: "wss".into(),
                     host: "api.openai.com".into(),
                     port: 443,
@@ -5315,6 +5328,8 @@ mod tests {
                     session_id: "ws-session".into(),
                     request_id: "request".into(),
                     sandbox_id: "sandbox".into(),
+                    sandbox_name: "sandbox-name".into(),
+                    workspace: "wrks-default".into(),
                     scheme: "wss".into(),
                     host: "api.openai.com".into(),
                     port: 443,
@@ -5399,6 +5414,8 @@ mod tests {
                     session_id: "ws-session".into(),
                     request_id: "request".into(),
                     sandbox_id: "sandbox".into(),
+                    sandbox_name: "sandbox-name".into(),
+                    workspace: "wrks-default".into(),
                     scheme: "ws".into(),
                     host: "api.openai.com".into(),
                     port: 80,
@@ -5694,6 +5711,8 @@ mod tests {
                     session_id: "session".into(),
                     request_id: "request".into(),
                     sandbox_id: "sandbox".into(),
+                    sandbox_name: "sandbox-name".into(),
+                    workspace: "wrks-default".into(),
                     scheme: "wss".into(),
                     host: "api.openai.com".into(),
                     port: 443,

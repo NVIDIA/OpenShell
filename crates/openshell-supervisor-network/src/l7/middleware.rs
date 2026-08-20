@@ -624,6 +624,7 @@ pub(super) fn middleware_request_input(
         request_id: uuid::Uuid::new_v4().to_string(),
         sandbox_id: sandbox.sandbox_id.clone(),
         sandbox_name: sandbox.sandbox_name.clone(),
+        workspace: ctx.workspace.clone(),
         scheme: scheme.into(),
         host: ctx.host.clone(),
         port: ctx.port,
@@ -1099,6 +1100,7 @@ mod tests {
         let eval = L7EvalContext {
             host: "api.example.test".into(),
             port: 443,
+            workspace: "wrks-default".into(),
             policy_name: "api-policy".into(),
             binary_path: "/usr/bin/curl".into(),
             ancestors: Vec::new(),
@@ -1127,6 +1129,7 @@ mod tests {
 
         assert_eq!(input.sandbox_name, "nightly-build");
         assert_eq!(input.sandbox_id, "sbx-123");
+        assert_eq!(input.workspace, "wrks-default");
     }
 
     #[tokio::test]
