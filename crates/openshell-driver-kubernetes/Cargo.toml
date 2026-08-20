@@ -38,6 +38,7 @@ notify = "8"
 
 [dev-dependencies]
 temp-env = "0.3"
+tokio = { workspace = true, features = ["test-util"] }
 toml = { workspace = true }
 
 [lints]
