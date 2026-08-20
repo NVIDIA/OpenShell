@@ -964,32 +964,31 @@ impl ComputeRuntime {
                 }
                 Ok(sandbox)
             }
-            Err(status) if status.code() == Code::AlreadyExists => {
-                let _ = self
+            Err(status) => {
+                if let Err(error) = self
                     .store
                     .delete(Sandbox::object_type(), sandbox.object_id())
-                    .await;
+                    .await
+                {
+                    error!(
+                        sandbox_id = %sandbox.object_id(),
+                        %error,
+                        "failed to roll back the sandbox record after the compute driver \
+                         rejected the create; the record is orphaned"
+                    );
+                }
                 self.sandbox_index.remove_sandbox(sandbox.object_id());
-                Err(Status::already_exists("sandbox already exists"))
-            }
-            Err(status) if status.code() == Code::FailedPrecondition => {
-                let _ = self
-                    .store
-                    .delete(Sandbox::object_type(), sandbox.object_id())
-                    .await;
-                self.sandbox_index.remove_sandbox(sandbox.object_id());
-                Err(Status::failed_precondition(status.message().to_string()))
-            }
-            Err(err) => {
-                let _ = self
-                    .store
-                    .delete(Sandbox::object_type(), sandbox.object_id())
-                    .await;
-                self.sandbox_index.remove_sandbox(sandbox.object_id());
-                Err(Status::internal(format!(
-                    "create sandbox failed: {}",
-                    err.message()
-                )))
+                Err(match status.code() {
+                    Code::AlreadyExists => Status::already_exists("sandbox already exists"),
+                    Code::FailedPrecondition => {
+                        Status::failed_precondition(status.message().to_string())
+                    }
+                    // A driver rejecting the request is the caller's problem,
+                    // not a server fault: preserve the code so clients do not
+                    // retry a request that cannot succeed.
+                    Code::InvalidArgument => Status::invalid_argument(status.message().to_string()),
+                    _ => Status::internal(format!("create sandbox failed: {}", status.message())),
+                })
             }
         }
     }
@@ -5458,6 +5457,143 @@ mod tests {
         );
     }
 
+    /// A driver that behaves normally except that creates fail with the
+    /// status it was built with.
+    #[derive(Debug)]
+    struct FailingDriver(TestDriver, Status);
+
+    impl FailingDriver {
+        fn new(status: Status) -> Self {
+            Self(TestDriver::default(), status)
+        }
+    }
+
+    #[tonic::async_trait]
+    impl ComputeDriver for FailingDriver {
+        type WatchSandboxesStream = DriverWatchStream;
+
+        async fn create_sandbox(
+            &self,
+            _request: Request<CreateSandboxRequest>,
+        ) -> Result<tonic::Response<CreateSandboxResponse>, Status> {
+            Err(self.1.clone())
+        }
+
+        async fn get_capabilities(
+            &self,
+            request: Request<GetCapabilitiesRequest>,
+        ) -> Result<tonic::Response<GetCapabilitiesResponse>, Status> {
+            self.0.get_capabilities(request).await
+        }
+
+        async fn get_gateway_listener_requirements(
+            &self,
+            request: Request<GetGatewayListenerRequirementsRequest>,
+        ) -> Result<tonic::Response<GetGatewayListenerRequirementsResponse>, Status> {
+            self.0.get_gateway_listener_requirements(request).await
+        }
+
+        async fn validate_sandbox_create(
+            &self,
+            request: Request<ValidateSandboxCreateRequest>,
+        ) -> Result<tonic::Response<ValidateSandboxCreateResponse>, Status> {
+            self.0.validate_sandbox_create(request).await
+        }
+
+        async fn get_sandbox(
+            &self,
+            request: Request<GetSandboxRequest>,
+        ) -> Result<tonic::Response<GetSandboxResponse>, Status> {
+            self.0.get_sandbox(request).await
+        }
+
+        async fn list_sandboxes(
+            &self,
+            request: Request<ListSandboxesRequest>,
+        ) -> Result<
+            tonic::Response<openshell_core::proto::compute::v1::ListSandboxesResponse>,
+            Status,
+        > {
+            self.0.list_sandboxes(request).await
+        }
+
+        async fn stop_sandbox(
+            &self,
+            request: Request<StopSandboxRequest>,
+        ) -> Result<tonic::Response<StopSandboxResponse>, Status> {
+            self.0.stop_sandbox(request).await
+        }
+
+        async fn start_sandbox(
+            &self,
+            request: Request<StartSandboxRequest>,
+        ) -> Result<tonic::Response<StartSandboxResponse>, Status> {
+            self.0.start_sandbox(request).await
+        }
+
+        async fn delete_sandbox(
+            &self,
+            request: Request<DeleteSandboxRequest>,
+        ) -> Result<tonic::Response<DeleteSandboxResponse>, Status> {
+            self.0.delete_sandbox(request).await
+        }
+
+        async fn watch_sandboxes(
+            &self,
+            request: Request<WatchSandboxesRequest>,
+        ) -> Result<tonic::Response<Self::WatchSandboxesStream>, Status> {
+            self.0.watch_sandboxes(request).await
+        }
+
+        async fn ensure_workspace(
+            &self,
+            request: Request<EnsureWorkspaceRequest>,
+        ) -> Result<tonic::Response<EnsureWorkspaceResponse>, Status> {
+            self.0.ensure_workspace(request).await
+        }
+
+        async fn delete_workspace(
+            &self,
+            request: Request<DeleteWorkspaceRequest>,
+        ) -> Result<tonic::Response<DeleteWorkspaceResponse>, Status> {
+            self.0.delete_workspace(request).await
+        }
+    }
+
+    /// A driver rejecting the request must reach the caller as
+    /// `InvalidArgument` carrying the driver's own message, not as `Internal`
+    /// with a wrapper: clients retry `Internal`, and no retry fixes a bad
+    /// request. The rejected create must also leave no record behind.
+    #[tokio::test]
+    async fn create_sandbox_preserves_invalid_argument_from_the_driver() {
+        let runtime = test_runtime(Arc::new(FailingDriver::new(Status::invalid_argument(
+            "service_account_name 'nope' is not selectable on this gateway",
+        ))))
+        .await;
+        let sandbox = sandbox_record("sb-reject", "sandbox-reject", SandboxPhase::Provisioning);
+
+        let err = runtime
+            .create_sandbox(sandbox, None)
+            .await
+            .expect_err("driver rejects the request");
+
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert_eq!(
+            err.message(),
+            "service_account_name 'nope' is not selectable on this gateway",
+            "the driver's message must reach the caller unwrapped"
+        );
+        assert!(
+            runtime
+                .store
+                .get_message::<Sandbox>("sb-reject")
+                .await
+                .unwrap()
+                .is_none(),
+            "a rejected create must not leave a sandbox record behind"
+        );
+    }
+
     /// A failing driver call must be visible as a failure in the trace, not
     /// just as a span that happens to be followed by nothing.
     #[tokio::test]
@@ -5466,105 +5602,10 @@ mod tests {
 
         use crate::otel_tracing::test_exporter;
 
-        /// A driver that behaves normally except that creates fail, so the
-        /// test exercises only the failure attribute.
-        #[derive(Debug, Default)]
-        struct FailingDriver(TestDriver);
-
-        #[tonic::async_trait]
-        impl ComputeDriver for FailingDriver {
-            type WatchSandboxesStream = DriverWatchStream;
-
-            async fn create_sandbox(
-                &self,
-                _request: Request<CreateSandboxRequest>,
-            ) -> Result<tonic::Response<CreateSandboxResponse>, Status> {
-                Err(Status::unavailable("driver is down"))
-            }
-
-            async fn get_capabilities(
-                &self,
-                request: Request<GetCapabilitiesRequest>,
-            ) -> Result<tonic::Response<GetCapabilitiesResponse>, Status> {
-                self.0.get_capabilities(request).await
-            }
-
-            async fn get_gateway_listener_requirements(
-                &self,
-                request: Request<GetGatewayListenerRequirementsRequest>,
-            ) -> Result<tonic::Response<GetGatewayListenerRequirementsResponse>, Status>
-            {
-                self.0.get_gateway_listener_requirements(request).await
-            }
-
-            async fn validate_sandbox_create(
-                &self,
-                request: Request<ValidateSandboxCreateRequest>,
-            ) -> Result<tonic::Response<ValidateSandboxCreateResponse>, Status> {
-                self.0.validate_sandbox_create(request).await
-            }
-
-            async fn get_sandbox(
-                &self,
-                request: Request<GetSandboxRequest>,
-            ) -> Result<tonic::Response<GetSandboxResponse>, Status> {
-                self.0.get_sandbox(request).await
-            }
-
-            async fn list_sandboxes(
-                &self,
-                request: Request<ListSandboxesRequest>,
-            ) -> Result<
-                tonic::Response<openshell_core::proto::compute::v1::ListSandboxesResponse>,
-                Status,
-            > {
-                self.0.list_sandboxes(request).await
-            }
-
-            async fn stop_sandbox(
-                &self,
-                request: Request<StopSandboxRequest>,
-            ) -> Result<tonic::Response<StopSandboxResponse>, Status> {
-                self.0.stop_sandbox(request).await
-            }
-
-            async fn start_sandbox(
-                &self,
-                request: Request<StartSandboxRequest>,
-            ) -> Result<tonic::Response<StartSandboxResponse>, Status> {
-                self.0.start_sandbox(request).await
-            }
-
-            async fn delete_sandbox(
-                &self,
-                request: Request<DeleteSandboxRequest>,
-            ) -> Result<tonic::Response<DeleteSandboxResponse>, Status> {
-                self.0.delete_sandbox(request).await
-            }
-
-            async fn watch_sandboxes(
-                &self,
-                request: Request<WatchSandboxesRequest>,
-            ) -> Result<tonic::Response<Self::WatchSandboxesStream>, Status> {
-                self.0.watch_sandboxes(request).await
-            }
-
-            async fn ensure_workspace(
-                &self,
-                request: Request<EnsureWorkspaceRequest>,
-            ) -> Result<tonic::Response<EnsureWorkspaceResponse>, Status> {
-                self.0.ensure_workspace(request).await
-            }
-
-            async fn delete_workspace(
-                &self,
-                request: Request<DeleteWorkspaceRequest>,
-            ) -> Result<tonic::Response<DeleteWorkspaceResponse>, Status> {
-                self.0.delete_workspace(request).await
-            }
-        }
-
-        let runtime = test_runtime(Arc::new(FailingDriver::default())).await;
+        let runtime = test_runtime(Arc::new(FailingDriver::new(Status::unavailable(
+            "driver is down",
+        ))))
+        .await;
         let sandbox = sandbox_record("sb-fail", "sandbox-fail", SandboxPhase::Provisioning);
 
         let traced = test_exporter::install_traced();
