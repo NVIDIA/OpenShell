@@ -46,6 +46,18 @@ pub fn openshell_sandbox_label_selector() -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Sandbox condition reason strings set by compute drivers.
+// ---------------------------------------------------------------------------
+
+/// Ready-condition reason when a container exits on its own (e.g. SIGTERM
+/// from a machine restart, OOM kill, application crash).
+pub const CONDITION_EXITED: &str = "ContainerExited";
+
+/// Ready-condition reason when a container is explicitly stopped via the
+/// runtime API (e.g. `podman stop`, gateway-initiated shutdown).
+pub const CONDITION_STOPPED: &str = "ContainerStopped";
+
+// ---------------------------------------------------------------------------
 
 /// Path to the sandbox supervisor binary inside the container image.
 ///
