@@ -186,7 +186,12 @@ helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart \
 
 Note that `server.disableTls` is **not** set — the gateway pod serves TLS over HTTPS without requiring client certificates. Use OIDC for authentication (see [Access Control](/kubernetes/access-control)).
 
-To use cert-manager instead of the built-in PKI, add `--set certManager.enabled=true` and configure `certManager.serverDnsNames` with the external hostname. On first install with cert-manager, the backend CA ConfigMap is created on the first `helm upgrade` after cert-manager issues the server certificate.
+**Using cert-manager instead of pkiInitJob:** Add `--set certManager.enabled=true` and configure `certManager.serverDnsNames` with the external hostname. With cert-manager, the backend CA ConfigMap requires a two-step install because cert-manager creates the server certificate *after* the chart is installed:
+
+1. `helm install` — cert-manager issues the server certificate, but the certgen hook can't create the backend CA ConfigMap yet (logs a warning)
+2. `helm upgrade` — certgen hook now reads the CA from the cert-manager-issued server certificate and creates the backend CA ConfigMap
+
+The gateway won't accept backend connections until step 2 completes. Wait for the cert-manager Certificate to be Ready before running upgrade.
 
 #### Register over HTTPS
 
