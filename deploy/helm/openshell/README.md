@@ -213,6 +213,7 @@ add `ci/values-spire.yaml` to the OpenShell release values files.
 | sandboxServiceAccount.annotations | object | `{}` | Annotations to add to the generated sandbox service account. |
 | sandboxServiceAccount.create | bool | `true` | Create a service account for sandbox pods. |
 | sandboxServiceAccount.name | string | `""` | Existing service account name for sandbox pods when sandboxServiceAccount.create is false. |
+| sandboxServiceAccount.openshift.nonrootSCC | bool | `false` | Grant the built-in OpenShift `nonroot-v2` SCC to the sandbox ServiceAccount. Required on OpenShift for "proxy-pod" topology: the driver assigns explicit non-root UIDs, which `restricted-v2` rejects because it only admits UIDs inside the namespace's openshift.io/sa.scc.uid-range annotation. No custom SCC is created — `nonroot-v2` ships with OpenShift and already permits exactly what this topology needs, keeping drop-ALL capabilities, no privilege escalation, and no host namespaces. Creates a ClusterRole + ClusterRoleBinding. |
 | securityContext.allowPrivilegeEscalation | bool | `false` | Whether the gateway container can gain additional privileges. |
 | securityContext.capabilities.drop | list | `["ALL"]` | Linux capabilities dropped from the gateway container. |
 | securityContext.runAsNonRoot | bool | `true` | Require the gateway container to run as a non-root user. |

@@ -122,6 +122,16 @@ sandboxServiceAccount:
   annotations: {}
   # -- Existing service account name for sandbox pods when sandboxServiceAccount.create is false.
   name: ""
+  openshift:
+    # -- Grant the built-in OpenShift `nonroot-v2` SCC to the sandbox
+    # ServiceAccount. Required on OpenShift for "proxy-pod" topology: the
+    # driver assigns explicit non-root UIDs, which `restricted-v2` rejects
+    # because it only admits UIDs inside the namespace's
+    # openshift.io/sa.scc.uid-range annotation. No custom SCC is created —
+    # `nonroot-v2` ships with OpenShift and already permits exactly what this
+    # topology needs, keeping drop-ALL capabilities, no privilege escalation,
+    # and no host namespaces. Creates a ClusterRole + ClusterRoleBinding.
+    nonrootSCC: false
 
 # -- Extra annotations to add to the gateway pod.
 podAnnotations: {}
