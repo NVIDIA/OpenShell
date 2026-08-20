@@ -26,7 +26,7 @@ We use a vouch system. This exists because AI makes it trivial to generate plaus
 2. Describe what you want to change and why.
 3. Write in your own words. AI-generated vouch requests will be denied.
 4. A maintainer will comment `/vouch` if approved.
-5. **Wait for approval before opening a PR.** Once vouched, you can submit pull requests.
+5. **Get vouched before opening a PR.** Once vouched, you can submit pull requests.
 
 **If you are not vouched, any pull request you open will be automatically closed.** Closing loses the discussion thread and the PR must be manually reopened — it cannot be converted to a draft or held. Org members and collaborators with push access bypass this check.
 
@@ -509,18 +509,10 @@ chore(deps): bump tokio to 1.40
 All human contributions must include a `Signed-off-by` line in each commit message. This certifies you have the right to submit the work under the project license. See the [Developer Certificate of Origin](https://developercertificate.org/). Dependabot-authored dependency update PRs are allowlisted because the bot cannot sign commits.
 
 ```bash
-git commit --signoff -m "feat(sandbox): add new capability"
+git commit --signoff --message "feat(sandbox): add new capability"
 ```
 
 DCO sign-off (`--signoff`) and cryptographic commit signing are separate requirements with separate failure modes. The `--signoff` flag adds the `Signed-off-by` trailer checked by the DCO Assistant bot — a missing or mismatched trailer will fail the DCO check regardless of whether the commit is GPG-signed. Cryptographic signing is required for org members only, so that copy-pr-bot can mirror your PR to run CI; see [CI.md](CI.md#commit-signing) for setup.
-
-### Cargo feature conventions
-
-When adding or changing Cargo features that affect packaging or distribution:
-
-- **Feature vs. build mode:** A feature opt-in adds a capability. Removing a feature to disable something (e.g., bundled CA roots) is a build mode — document it as such rather than creating a mirror feature just to name the absence. A convenience alias that re-includes all other defaults is appropriate when distro recipes would otherwise need to manually track every unrelated default feature.
-- **Transitive dependency auditing:** When a feature is meant to exclude a dependency, verify it is physically absent — not just disabled at the call site. Run `cargo tree -e features -p <crate>` to confirm the excluded crate does not appear through a transitive path. A common source of leaks: crates that enable `rustls-tls` or similar features by default in their own `[features]` table.
-- **CI verification:** Add a `mise` task or CI step that builds without the feature and confirms the excluded dependency is absent from `cargo tree` output. A compile-time guard alone may not catch a transitive re-introduction.
 
 ### PR testing checklist
 
