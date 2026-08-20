@@ -257,9 +257,9 @@ Podman follows the same end-to-end contract as the Kubernetes and VM drivers
 for the in-container SSH relay: gateway config to `PodmanComputeConfig` to
 sandbox environment to supervisor session registration on that path.
 
-1. `openshell-core` `Config::sandbox_ssh_socket_path` is copied into
-   `PodmanComputeConfig::sandbox_ssh_socket_path` when the gateway builds the
-   in-process driver.
+1. `[openshell.drivers.podman].ssh_socket_path` is deserialized into
+   `PodmanComputeConfig::ssh_socket_path` when the gateway builds the in-process
+   driver. The field defaults to `/run/openshell/ssh.sock` when omitted.
 2. `build_env()` in `container.rs` sets `OPENSHELL_SSH_SOCKET_PATH` to that
    value, alongside required vars such as `OPENSHELL_ENDPOINT` and
    `OPENSHELL_SANDBOX_ID`. These driver-controlled entries overwrite template
@@ -440,11 +440,9 @@ matter compared to cluster or rootful runtimes:
 
 - Gateway integration: `crates/openshell-server/src/compute/mod.rs`
   (`new_podman` and `PodmanComputeDriver` wiring).
-- Server configuration: `crates/openshell-server/src/lib.rs`
-  (`ComputeDriverKind::Podman` builds `PodmanComputeConfig` including
-  `sandbox_ssh_socket_path` from gateway `Config`).
-- Gateway relay path: `openshell-core` `Config::sandbox_ssh_socket_path` in
-  `crates/openshell-core/src/config.rs`.
+- Server configuration:
+  `crates/openshell-server/src/compute/driver_config/builtin.rs` builds
+  `PodmanComputeConfig` from `[openshell.drivers.podman]`.
 - SSRF mitigation: `crates/openshell-core/src/net.rs`,
   `crates/openshell-sandbox/src/proxy.rs`, and
   `crates/openshell-server/src/grpc/policy.rs`.

@@ -513,7 +513,7 @@ fn build_env(
     );
     env.insert(
         openshell_core::sandbox_env::SSH_SOCKET_PATH.into(),
-        config.sandbox_ssh_socket_path.clone(),
+        config.ssh_socket_path.clone(),
     );
     env.insert("OPENSHELL_CONTAINER_IMAGE".into(), image.to_string());
     env.insert(
@@ -1152,7 +1152,7 @@ pub fn build_container_spec_for_image(
                 "CMD-SHELL".into(),
                 format!(
                     "test -e /var/run/openshell-ssh-ready || test -S {} || ss -tlnp | grep -q :{}",
-                    config.sandbox_ssh_socket_path,
+                    config.ssh_socket_path,
                     openshell_core::config::DEFAULT_SSH_PORT
                 ),
             ],
@@ -2231,7 +2231,7 @@ mod tests {
             default_image: "test-image:latest".to_string(),
             grpc_endpoint: "http://localhost:50051".to_string(),
             host_gateway_ip: String::new(),
-            sandbox_ssh_socket_path: "/run/openshell/test-ssh.sock".to_string(),
+            ssh_socket_path: "/run/openshell/test-ssh.sock".to_string(),
             ..PodmanComputeConfig::default()
         }
     }

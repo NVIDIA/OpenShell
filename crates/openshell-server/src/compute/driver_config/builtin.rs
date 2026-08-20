@@ -210,6 +210,62 @@ enable_bind_mounts = true
     }
 
     #[test]
+    fn docker_config_reads_canonical_sandbox_label_override() {
+        let file: config_file::ConfigFile = toml::from_str(
+            r#"
+[openshell.gateway]
+sandbox_namespace = "gateway-default"
+
+[openshell.drivers.docker]
+sandbox_label = "driver-specific"
+"#,
+        )
+        .expect("valid config");
+
+        let cfg = docker_config_from_context(test_context(Some(&file))).expect("docker config");
+
+        assert_eq!(cfg.sandbox_label, "driver-specific");
+    }
+
+    #[test]
+    fn docker_config_reads_legacy_sandbox_namespace_override() {
+        let file: config_file::ConfigFile = toml::from_str(
+            r#"
+[openshell.gateway]
+sandbox_namespace = "gateway-default"
+
+[openshell.drivers.docker]
+sandbox_namespace = "driver-specific"
+"#,
+        )
+        .expect("valid config");
+
+        let cfg = docker_config_from_context(test_context(Some(&file))).expect("docker config");
+
+        assert_eq!(cfg.sandbox_label, "driver-specific");
+    }
+
+    #[test]
+    fn docker_config_rejects_canonical_and_legacy_sandbox_label_names_together() {
+        let file: config_file::ConfigFile = toml::from_str(
+            r#"
+[openshell.gateway]
+sandbox_namespace = "gateway-default"
+
+[openshell.drivers.docker]
+sandbox_label = "canonical"
+sandbox_namespace = "legacy"
+"#,
+        )
+        .expect("valid config file structure");
+
+        let error = docker_config_from_context(test_context(Some(&file)))
+            .expect_err("canonical and legacy names must not both be accepted");
+
+        assert!(error.to_string().contains("duplicate field"));
+    }
+
+    #[test]
     fn docker_config_reads_bind_mount_opt_in_from_driver_table() {
         let file: config_file::ConfigFile = toml::from_str(
             r"

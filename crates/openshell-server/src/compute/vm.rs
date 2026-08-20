@@ -479,9 +479,7 @@ pub async fn spawn(
         .arg(std::process::id().to_string());
     command.arg("--log-level").arg(&config.log_level);
     append_otlp_args(&mut command, otlp_config);
-    command
-        .arg("--openshell-endpoint")
-        .arg(&vm_config.grpc_endpoint);
+    command.arg("--grpc-endpoint").arg(&vm_config.grpc_endpoint);
     command.arg("--state-dir").arg(&vm_config.state_dir);
     if !vm_config.default_image.trim().is_empty() {
         command.arg("--default-image").arg(&vm_config.default_image);
