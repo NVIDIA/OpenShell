@@ -570,9 +570,9 @@ fn compute_proposal_review_token(
     credentials: &CredentialSet,
 ) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(b"openshell-proposal-evaluator-v1\0");
+    hasher.update(b"openshell-proposal-evaluator-v2\0");
     hasher.update(rule_name.as_bytes());
-    hasher.update(rule.encode_to_vec());
+    hasher.update(canonical_rule_bytes(rule));
     hasher.update(deterministic_policy_hash(current_effective_policy).as_bytes());
     hasher.update(deterministic_policy_hash(candidate_effective_policy).as_bytes());
 
@@ -608,9 +608,9 @@ fn compute_failed_proposal_evaluation_hash(
     application_error: &str,
 ) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(b"openshell-proposal-evaluator-v1-failed\0");
+    hasher.update(b"openshell-proposal-evaluator-v2-failed\0");
     hasher.update(rule_name.as_bytes());
-    hasher.update(rule.encode_to_vec());
+    hasher.update(canonical_rule_bytes(rule));
     hasher.update(deterministic_policy_hash(current_effective_policy).as_bytes());
     hasher.update(application_error.as_bytes());
     hex::encode(hasher.finalize())
@@ -5418,41 +5418,201 @@ pub(super) async fn handle_get_draft_history(
 // Policy helper functions
 // ---------------------------------------------------------------------------
 
-/// Compute a deterministic SHA-256 hash of a `SandboxPolicy`.
-fn deterministic_policy_hash(policy: &ProtoSandboxPolicy) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(policy.version.to_le_bytes());
-    if let Some(fs) = &policy.filesystem {
-        hasher.update(fs.encode_to_vec());
-    }
-    if let Some(ll) = &policy.landlock {
-        hasher.update(ll.encode_to_vec());
-    }
-    if let Some(p) = &policy.process {
-        hasher.update(p.encode_to_vec());
-    }
-    let mut entries: Vec<_> = policy.network_policies.iter().collect();
-    entries.sort_by_key(|(k, _)| k.as_str());
+fn append_canonical_bytes(out: &mut Vec<u8>, value: &[u8]) {
+    out.extend_from_slice(
+        &u64::try_from(value.len())
+            .expect("canonical value length fits in u64")
+            .to_le_bytes(),
+    );
+    out.extend_from_slice(value);
+}
+
+fn append_canonical_message<M: Message>(out: &mut Vec<u8>, value: &M) {
+    append_canonical_bytes(out, &value.encode_to_vec());
+}
+
+fn append_sorted_message_map<M: Message>(
+    out: &mut Vec<u8>,
+    label: &[u8],
+    values: &HashMap<String, M>,
+) {
+    append_canonical_bytes(out, label);
+    let mut entries = values.iter().collect::<Vec<_>>();
+    entries.sort_by_key(|(key, _)| key.as_str());
+    out.extend_from_slice(
+        &u64::try_from(entries.len())
+            .expect("canonical map length fits in u64")
+            .to_le_bytes(),
+    );
     for (key, value) in entries {
-        hasher.update(key.as_bytes());
-        hasher.update(value.encode_to_vec());
+        append_canonical_bytes(out, key.as_bytes());
+        append_canonical_message(out, value);
     }
-    if !policy.network_middlewares.is_empty() {
-        hasher.update(b"network_middlewares");
-        let mut entries: Vec<_> = policy.network_middlewares.iter().collect();
-        entries.sort_by_key(|(name, _)| name.as_str());
-        for (name, middleware) in entries {
-            hasher.update(name.as_bytes());
-            let encoded = middleware.encode_to_vec();
-            hasher.update(
-                u64::try_from(encoded.len())
-                    .expect("protobuf payload length fits in u64")
-                    .to_le_bytes(),
-            );
-            hasher.update(encoded);
+}
+
+/// Encode a policy rule without depending on randomized protobuf map order.
+fn canonical_rule_bytes(rule: &NetworkPolicyRule) -> Vec<u8> {
+    let mut map_free = rule.clone();
+    for endpoint in &mut map_free.endpoints {
+        endpoint.graphql_persisted_queries.clear();
+        for rule in &mut endpoint.rules {
+            if let Some(allow) = &mut rule.allow {
+                allow.query.clear();
+                allow.params.clear();
+            }
+        }
+        for deny in &mut endpoint.deny_rules {
+            deny.query.clear();
+            deny.params.clear();
         }
     }
-    hex::encode(hasher.finalize())
+
+    let mut out = Vec::new();
+    append_canonical_message(&mut out, &map_free);
+    for (endpoint_index, endpoint) in rule.endpoints.iter().enumerate() {
+        out.extend_from_slice(
+            &u64::try_from(endpoint_index)
+                .expect("endpoint index fits in u64")
+                .to_le_bytes(),
+        );
+        append_sorted_message_map(
+            &mut out,
+            b"graphql_persisted_queries",
+            &endpoint.graphql_persisted_queries,
+        );
+        for (rule_index, rule) in endpoint.rules.iter().enumerate() {
+            out.extend_from_slice(
+                &u64::try_from(rule_index)
+                    .expect("rule index fits in u64")
+                    .to_le_bytes(),
+            );
+            if let Some(allow) = &rule.allow {
+                append_sorted_message_map(&mut out, b"allow_query", &allow.query);
+                append_sorted_message_map(&mut out, b"allow_params", &allow.params);
+            }
+        }
+        for (rule_index, deny) in endpoint.deny_rules.iter().enumerate() {
+            out.extend_from_slice(
+                &u64::try_from(rule_index)
+                    .expect("deny-rule index fits in u64")
+                    .to_le_bytes(),
+            );
+            append_sorted_message_map(&mut out, b"deny_query", &deny.query);
+            append_sorted_message_map(&mut out, b"deny_params", &deny.params);
+        }
+    }
+    out
+}
+
+fn canonical_struct_bytes(value: &prost_types::Struct) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut fields = value.fields.iter().collect::<Vec<_>>();
+    fields.sort_by_key(|(key, _)| key.as_str());
+    out.extend_from_slice(
+        &u64::try_from(fields.len())
+            .expect("struct field count fits in u64")
+            .to_le_bytes(),
+    );
+    for (key, value) in fields {
+        append_canonical_bytes(&mut out, key.as_bytes());
+        append_canonical_bytes(&mut out, &canonical_value_bytes(value));
+    }
+    out
+}
+
+fn canonical_value_bytes(value: &prost_types::Value) -> Vec<u8> {
+    use prost_types::value::Kind;
+
+    let mut out = Vec::new();
+    match &value.kind {
+        None => out.push(0),
+        Some(Kind::NullValue(value)) => {
+            out.push(1);
+            out.extend_from_slice(&value.to_le_bytes());
+        }
+        Some(Kind::NumberValue(value)) => {
+            out.push(2);
+            out.extend_from_slice(&value.to_bits().to_le_bytes());
+        }
+        Some(Kind::StringValue(value)) => {
+            out.push(3);
+            append_canonical_bytes(&mut out, value.as_bytes());
+        }
+        Some(Kind::BoolValue(value)) => {
+            out.push(4);
+            out.push(u8::from(*value));
+        }
+        Some(Kind::StructValue(value)) => {
+            out.push(5);
+            append_canonical_bytes(&mut out, &canonical_struct_bytes(value));
+        }
+        Some(Kind::ListValue(value)) => {
+            out.push(6);
+            out.extend_from_slice(
+                &u64::try_from(value.values.len())
+                    .expect("list length fits in u64")
+                    .to_le_bytes(),
+            );
+            for item in &value.values {
+                append_canonical_bytes(&mut out, &canonical_value_bytes(item));
+            }
+        }
+    }
+    out
+}
+
+fn canonical_middleware_bytes(
+    middleware: &openshell_core::proto::NetworkMiddlewareConfig,
+) -> Vec<u8> {
+    let mut map_free = middleware.clone();
+    map_free.config = None;
+    let mut out = Vec::new();
+    append_canonical_message(&mut out, &map_free);
+    if let Some(config) = &middleware.config {
+        append_canonical_bytes(&mut out, &canonical_struct_bytes(config));
+    }
+    out
+}
+
+fn canonical_policy_bytes(policy: &ProtoSandboxPolicy) -> Vec<u8> {
+    let mut map_free = policy.clone();
+    map_free.network_policies.clear();
+    map_free.network_middlewares.clear();
+    let mut out = Vec::new();
+    append_canonical_message(&mut out, &map_free);
+
+    let mut policy_entries = policy.network_policies.iter().collect::<Vec<_>>();
+    policy_entries.sort_by_key(|(key, _)| key.as_str());
+    append_canonical_bytes(&mut out, b"network_policies");
+    out.extend_from_slice(
+        &u64::try_from(policy_entries.len())
+            .expect("policy count fits in u64")
+            .to_le_bytes(),
+    );
+    for (key, rule) in policy_entries {
+        append_canonical_bytes(&mut out, key.as_bytes());
+        append_canonical_bytes(&mut out, &canonical_rule_bytes(rule));
+    }
+
+    let mut middleware_entries = policy.network_middlewares.iter().collect::<Vec<_>>();
+    middleware_entries.sort_by_key(|(key, _)| key.as_str());
+    append_canonical_bytes(&mut out, b"network_middlewares");
+    out.extend_from_slice(
+        &u64::try_from(middleware_entries.len())
+            .expect("middleware count fits in u64")
+            .to_le_bytes(),
+    );
+    for (key, middleware) in middleware_entries {
+        append_canonical_bytes(&mut out, key.as_bytes());
+        append_canonical_bytes(&mut out, &canonical_middleware_bytes(middleware));
+    }
+    out
+}
+
+/// Compute a deterministic SHA-256 hash of a `SandboxPolicy`, recursively
+/// sorting every protobuf map while preserving repeated-field order.
+fn deterministic_policy_hash(policy: &ProtoSandboxPolicy) -> String {
+    hex::encode(Sha256::digest(canonical_policy_bytes(policy)))
 }
 
 /// Compute a fingerprint for the effective sandbox configuration.
@@ -12020,7 +12180,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mechanistic_existing_rest_endpoint_auto_approves_binary_expansion() {
+    async fn mechanistic_existing_multi_port_rest_endpoint_auto_approves_narrow_overlay() {
         use openshell_core::proto::{
             NetworkBinary, NetworkEndpoint, NetworkPolicyRule, SandboxPhase, SandboxPolicy,
             SandboxSpec,
@@ -12035,7 +12195,8 @@ mod tests {
                 name: "cargo-registry".to_string(),
                 endpoints: vec![NetworkEndpoint {
                     host: "index.crates.io".to_string(),
-                    port: 443,
+                    port: 80,
+                    ports: vec![80, 443],
                     protocol: "rest".to_string(),
                     enforcement: "enforce".to_string(),
                     access: "read-only".to_string(),
@@ -12119,7 +12280,7 @@ mod tests {
             "application error: {}; prover: {}",
             chunk.application_error, chunk.validation_result
         );
-        assert_eq!(chunk.rule_name, "cargo_registry");
+        assert_eq!(chunk.rule_name, "allow_index_crates_io_443");
         assert_eq!(chunk.validation_result, "prover: no new findings");
         assert!(chunk.application_error.is_empty());
         assert!(!chunk.review_token.is_empty());
@@ -12137,14 +12298,18 @@ mod tests {
         let applied = ProtoSandboxPolicy::decode(revision.policy_payload.as_slice()).unwrap();
         let cargo_rule = &applied.network_policies["cargo_registry"];
         assert_eq!(cargo_rule.endpoints.len(), 1);
+        assert_eq!(cargo_rule.endpoints[0].ports, vec![80, 443]);
         assert_eq!(cargo_rule.endpoints[0].protocol, "rest");
         assert_eq!(cargo_rule.endpoints[0].access, "read-only");
-        assert!(
-            cargo_rule
-                .binaries
-                .iter()
-                .any(|binary| binary.path == "/usr/bin/curl")
-        );
+        assert_eq!(cargo_rule.binaries.len(), 1);
+        assert_eq!(cargo_rule.binaries[0].path, "/usr/bin/cargo");
+        let curl_rule = &applied.network_policies["allow_index_crates_io_443"];
+        assert_eq!(curl_rule.endpoints.len(), 1);
+        assert_eq!(curl_rule.endpoints[0].ports, vec![443]);
+        assert_eq!(curl_rule.endpoints[0].protocol, "rest");
+        assert_eq!(curl_rule.endpoints[0].access, "read-only");
+        assert_eq!(curl_rule.binaries.len(), 1);
+        assert_eq!(curl_rule.binaries[0].path, "/usr/bin/curl");
     }
 
     #[tokio::test]
@@ -15948,6 +16113,138 @@ mod tests {
             deterministic_policy_hash(&policy(false)),
             deterministic_policy_hash(&policy(true)),
             "equivalent middleware configs must hash identically regardless of field insertion order"
+        );
+    }
+
+    #[test]
+    fn review_token_and_policy_hash_are_stable_across_nested_proto_map_order() {
+        use openshell_core::proto::{GraphqlOperation, L7Allow, L7QueryMatcher};
+
+        fn matcher(value: &str) -> L7QueryMatcher {
+            L7QueryMatcher {
+                glob: value.to_string(),
+                any: Vec::new(),
+            }
+        }
+
+        fn rule(reverse: bool) -> NetworkPolicyRule {
+            let mut query = HashMap::new();
+            let mut params = HashMap::new();
+            let mut persisted = HashMap::new();
+            let entries = if reverse {
+                [("zeta", "two"), ("alpha", "one")]
+            } else {
+                [("alpha", "one"), ("zeta", "two")]
+            };
+            for (key, value) in entries {
+                query.insert(key.to_string(), matcher(value));
+                params.insert(key.to_string(), matcher(value));
+                persisted.insert(
+                    key.to_string(),
+                    GraphqlOperation {
+                        operation_type: "query".to_string(),
+                        operation_name: value.to_string(),
+                        fields: vec![value.to_string()],
+                    },
+                );
+            }
+            NetworkPolicyRule {
+                name: "mapped".to_string(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "api.example.com".to_string(),
+                    port: 443,
+                    ports: vec![443],
+                    protocol: "graphql".to_string(),
+                    rules: vec![L7Rule {
+                        allow: Some(L7Allow {
+                            method: "POST".to_string(),
+                            path: "/graphql".to_string(),
+                            query,
+                            params,
+                            operation_type: "query".to_string(),
+                            ..Default::default()
+                        }),
+                    }],
+                    graphql_persisted_queries: persisted,
+                    ..Default::default()
+                }],
+                binaries: vec![NetworkBinary {
+                    path: "/usr/bin/curl".to_string(),
+                    ..Default::default()
+                }],
+            }
+        }
+
+        let left_rule = rule(false);
+        let right_rule = rule(true);
+        assert_eq!(left_rule, right_rule);
+        let left_policy = ProtoSandboxPolicy {
+            network_policies: HashMap::from([("mapped".to_string(), left_rule.clone())]),
+            ..Default::default()
+        };
+        let right_policy = ProtoSandboxPolicy {
+            network_policies: HashMap::from([("mapped".to_string(), right_rule.clone())]),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            deterministic_policy_hash(&left_policy),
+            deterministic_policy_hash(&right_policy)
+        );
+        assert_eq!(
+            compute_proposal_review_token(
+                "mapped",
+                &left_rule,
+                &left_policy,
+                &left_policy,
+                &CredentialSet::default(),
+            ),
+            compute_proposal_review_token(
+                "mapped",
+                &right_rule,
+                &right_policy,
+                &right_policy,
+                &CredentialSet::default(),
+            )
+        );
+        assert_eq!(
+            compute_failed_proposal_evaluation_hash("mapped", &left_rule, &left_policy, "failed",),
+            compute_failed_proposal_evaluation_hash("mapped", &right_rule, &right_policy, "failed",)
+        );
+
+        let mut changed_rule = right_rule;
+        changed_rule.endpoints[0].rules[0]
+            .allow
+            .as_mut()
+            .unwrap()
+            .query
+            .get_mut("alpha")
+            .unwrap()
+            .glob = "changed".to_string();
+        let changed_policy = ProtoSandboxPolicy {
+            network_policies: HashMap::from([("mapped".to_string(), changed_rule.clone())]),
+            ..Default::default()
+        };
+        assert_ne!(
+            deterministic_policy_hash(&left_policy),
+            deterministic_policy_hash(&changed_policy),
+            "map values remain decision-relevant after canonical ordering"
+        );
+        assert_ne!(
+            compute_proposal_review_token(
+                "mapped",
+                &left_rule,
+                &left_policy,
+                &left_policy,
+                &CredentialSet::default(),
+            ),
+            compute_proposal_review_token(
+                "mapped",
+                &changed_rule,
+                &changed_policy,
+                &changed_policy,
+                &CredentialSet::default(),
+            )
         );
     }
 

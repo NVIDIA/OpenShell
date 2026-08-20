@@ -48,6 +48,11 @@ pub fn canonicalize_advisor_add_rule(
             // This marker is derived from provider/credential context by the
             // gateway and must never be persisted from an advisor proposal.
             endpoint.provider_credentialed = false;
+            // A denial observes one binary-to-port authorization. Preserve the
+            // existing inspection contract, but never copy sibling ports from
+            // a multi-port endpoint into the proposal.
+            endpoint.port = port;
+            endpoint.ports = vec![port];
             normalize_endpoint(&mut endpoint);
             endpoint
         })
@@ -2214,6 +2219,70 @@ mod tests {
         assert_eq!(
             effective.network_policies["_provider_example"].endpoints[0],
             provider_endpoint
+        );
+    }
+
+    #[test]
+    fn canonicalize_advisor_narrows_multi_port_contract_and_keeps_overlay() {
+        let mut existing_endpoint = endpoint("index.crates.io", 443);
+        existing_endpoint.port = 80;
+        existing_endpoint.ports = vec![80, 443];
+        existing_endpoint.protocol = "rest".to_string();
+        existing_endpoint.enforcement = "enforce".to_string();
+        existing_endpoint.access = "read-only".to_string();
+        let existing = NetworkPolicyRule {
+            name: "cargo-registry".to_string(),
+            endpoints: vec![existing_endpoint],
+            binaries: vec![binary("/usr/bin/cargo")],
+        };
+        let mut base = SandboxPolicy::default();
+        base.network_policies
+            .insert("cargo_registry".to_string(), existing);
+        let effective = base.clone();
+        let incoming = NetworkPolicyRule {
+            name: "allow_index_crates_io_443".to_string(),
+            endpoints: vec![NetworkEndpoint {
+                host: "index.crates.io".to_string(),
+                port: 443,
+                advisor_proposed: true,
+                ..Default::default()
+            }],
+            binaries: vec![advisor_binary("/usr/bin/curl")],
+        };
+
+        let (rule_name, canonical) = canonicalize_advisor_add_rule(
+            &base,
+            &effective,
+            "allow_index_crates_io_443",
+            &incoming,
+        )
+        .unwrap();
+
+        assert_eq!(rule_name, "allow_index_crates_io_443");
+        assert_eq!(canonical.endpoints[0].ports, vec![443]);
+        assert_eq!(canonical.endpoints[0].protocol, "rest");
+        assert_eq!(canonical.endpoints[0].access, "read-only");
+
+        let merged = merge_policy(
+            base,
+            &[PolicyMergeOp::AddRule {
+                rule_name,
+                rule: canonical,
+            }],
+        )
+        .unwrap()
+        .policy;
+        assert_eq!(
+            merged.network_policies["cargo_registry"].endpoints[0].ports,
+            vec![80, 443]
+        );
+        assert_eq!(
+            merged.network_policies["allow_index_crates_io_443"].endpoints[0].ports,
+            vec![443]
+        );
+        assert_eq!(
+            merged.network_policies["allow_index_crates_io_443"].binaries[0].path,
+            "/usr/bin/curl"
         );
     }
 
