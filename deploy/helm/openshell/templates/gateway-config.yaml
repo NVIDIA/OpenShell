@@ -220,6 +220,7 @@ data:
     {{- $pairs := list }}{{ range $k, $v := . }}{{ $pairs = append $pairs (printf "%q = %q" $k $v) }}{{ end }}
     pod_labels = { {{ join ", " $pairs }} }
     {{- end }}
+    port = {{ .port | default 53 }}
     {{- end }}
 
     {{- if not $credentialDrivers }}

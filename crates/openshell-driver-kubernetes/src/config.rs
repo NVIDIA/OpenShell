@@ -225,14 +225,36 @@ impl FromStr for ProxyPodAffinity {
 ///
 /// Each peer renders as a single `to` entry combining a `namespaceSelector`
 /// and a `podSelector`, so both selectors must match the same pod.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ProxyPodDnsPeer {
     /// Labels matched against the namespace hosting the DNS pods.
     pub namespace_labels: BTreeMap<String, String>,
     /// Labels matched against the DNS pods themselves.
     pub pod_labels: BTreeMap<String, String>,
+    /// Port the DNS pods actually listen on.
+    ///
+    /// This is the **container** port, not the `Service` port. A
+    /// `NetworkPolicy` egress rule with a `podSelector` peer is evaluated
+    /// against the destination pod after `Service` address translation, so a
+    /// `Service` that maps 53 to a different container port needs that
+    /// container port here. Upstream `CoreDNS` listens on 53; `OpenShift`'s
+    /// `dns-default` listens on 5353 and maps 53 to it.
+    pub port: u16,
 }
+
+impl Default for ProxyPodDnsPeer {
+    fn default() -> Self {
+        Self {
+            namespace_labels: BTreeMap::new(),
+            pod_labels: BTreeMap::new(),
+            port: DEFAULT_DNS_PORT,
+        }
+    }
+}
+
+/// Default DNS container port, matching upstream `CoreDNS`/kube-dns.
+pub const DEFAULT_DNS_PORT: u16 = 53;
 
 impl ProxyPodDnsPeer {
     fn new(namespace_label: (&str, &str), pod_label: (&str, &str)) -> Self {
@@ -244,10 +266,14 @@ impl ProxyPodDnsPeer {
             .collect(),
             pod_labels: std::iter::once((pod_label.0.to_string(), pod_label.1.to_string()))
                 .collect(),
+            port: DEFAULT_DNS_PORT,
         }
     }
 
     fn validate(&self, index: usize) -> Result<(), String> {
+        if self.port == 0 {
+            return Err(format!("proxy_pod.dns_peers[{index}].port must not be 0"));
+        }
         if self.namespace_labels.is_empty() && self.pod_labels.is_empty() {
             return Err(format!(
                 "proxy_pod.dns_peers[{index}] must set namespace_labels, pod_labels, or both; an \

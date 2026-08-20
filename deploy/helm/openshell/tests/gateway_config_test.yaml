@@ -615,7 +615,11 @@ tests:
             kubernetes.io/metadata.name: openshift-dns
           podLabels:
             dns.operator.openshift.io/daemonset-dns: default
+          port: 5353
     asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: 'port = 5353'
       - matchRegex:
           path: data["gateway.toml"]
           pattern: '\[\[openshell\.drivers\.kubernetes\.proxy_pod\.dns_peers\]\]'
@@ -638,6 +642,10 @@ tests:
           podLabels:
             k8s-app: node-local-dns
     asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: 'port = 53'
+
       - matchRegex:
           path: data["gateway.toml"]
           pattern: '(?s)dns_peers\]\].*dns_peers\]\]'

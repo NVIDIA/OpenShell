@@ -4973,22 +4973,26 @@ fn proxy_pod_supervisor_deployment(
     }))
 }
 
-/// Build the DNS egress rule for the agent pod, if any peers are configured.
+/// Build the DNS egress rules for the agent pod.
 ///
-/// Every configured peer becomes one `to` entry in the same rule, so the
-/// UDP/TCP 53 port list is stated once regardless of peer count.
+/// Emits one rule per configured peer, because peers may listen on different
+/// ports and a `NetworkPolicy` rule applies its port list to every `to` entry
+/// in that rule.
 ///
-/// Returns `None` for an empty peer list. This is deliberately fail-closed: a
-/// `NetworkPolicy` egress rule with an empty `to` array matches *every*
-/// destination, so emitting one here would silently open DNS-port egress to
-/// the whole cluster. Omitting the rule denies DNS instead, and
+/// `peer.port` is the destination **pod** port. Egress rules with a
+/// `podSelector` peer are evaluated after `Service` address translation, so a
+/// cluster whose DNS `Service` maps 53 onto a different container port needs
+/// that container port configured. Upstream `CoreDNS` listens on 53;
+/// `OpenShift`'s `dns-default` listens on 5353 and maps 53 to it.
+///
+/// Returns an empty vector for an empty peer list. This is deliberately
+/// fail-closed: a `NetworkPolicy` egress rule with an empty `to` array matches
+/// *every* destination, so emitting one here would silently open DNS-port
+/// egress to the whole cluster. Emitting no rule denies DNS instead, and
 /// `validate_dns_peers` rejects an empty list at startup so a correctly
-/// configured driver never reaches this branch.
-fn proxy_pod_dns_egress_rule(peers: &[ProxyPodDnsPeer]) -> Option<serde_json::Value> {
-    if peers.is_empty() {
-        return None;
-    }
-    let to = peers
+/// configured driver never reaches that state.
+fn proxy_pod_dns_egress_rules(peers: &[ProxyPodDnsPeer]) -> Vec<serde_json::Value> {
+    peers
         .iter()
         .map(|peer| {
             let mut entry = serde_json::Map::new();
@@ -5004,16 +5008,15 @@ fn proxy_pod_dns_egress_rule(peers: &[ProxyPodDnsPeer]) -> Option<serde_json::Va
                     serde_json::json!({"matchLabels": peer.pod_labels}),
                 );
             }
-            serde_json::Value::Object(entry)
+            serde_json::json!({
+                "to": [serde_json::Value::Object(entry)],
+                "ports": [
+                    {"protocol": "UDP", "port": peer.port},
+                    {"protocol": "TCP", "port": peer.port}
+                ]
+            })
         })
-        .collect::<Vec<_>>();
-    Some(serde_json::json!({
-        "to": to,
-        "ports": [
-            {"protocol": "UDP", "port": 53},
-            {"protocol": "TCP", "port": 53}
-        ]
-    }))
+        .collect()
 }
 
 fn proxy_pod_agent_egress_network_policy(
@@ -5032,7 +5035,7 @@ fn proxy_pod_agent_egress_network_policy(
             {"protocol": "TCP", "port": PROXY_POD_GATEWAY_FORWARD_PORT}
         ]
     })];
-    egress.extend(proxy_pod_dns_egress_rule(params.proxy_pod_dns_peers));
+    egress.extend(proxy_pod_dns_egress_rules(params.proxy_pod_dns_peers));
 
     k8s_object(serde_json::json!({
         "apiVersion": "networking.k8s.io/v1",
@@ -7658,18 +7661,23 @@ mod tests {
         assert!(err.to_string().contains("proxy-pod"));
     }
 
-    fn dns_egress_rule(policy: &NetworkPolicy) -> Option<serde_json::Value> {
+    /// Every egress rule except the supervisor rule, which is the one carrying
+    /// the proxy port.
+    fn dns_egress_rules(policy: &NetworkPolicy) -> Vec<serde_json::Value> {
         let policy = serde_json::to_value(policy).unwrap();
         policy["spec"]["egress"]
             .as_array()
             .unwrap()
             .iter()
-            .find(|rule| {
-                rule["ports"]
-                    .as_array()
-                    .is_some_and(|ports| ports.iter().any(|port| port["port"] == 53))
+            .filter(|rule| {
+                !rule["ports"].as_array().is_some_and(|ports| {
+                    ports
+                        .iter()
+                        .any(|port| port["port"] == i64::from(PROXY_POD_PROXY_PORT))
+                })
             })
             .cloned()
+            .collect()
     }
 
     fn proxy_pod_egress_policy_with_dns_peers(peers: &[ProxyPodDnsPeer]) -> NetworkPolicy {
@@ -7691,20 +7699,22 @@ mod tests {
     #[test]
     fn proxy_pod_dns_peers_default_to_upstream_kube_system_conventions() {
         let peers = crate::config::KubernetesProxyPodConfig::default().dns_peers;
-        let rule = dns_egress_rule(&proxy_pod_egress_policy_with_dns_peers(&peers)).unwrap();
-        let to = rule["to"].as_array().unwrap();
+        let rules = dns_egress_rules(&proxy_pod_egress_policy_with_dns_peers(&peers));
 
-        assert_eq!(to.len(), 2);
-        for entry in to {
+        assert_eq!(rules.len(), 2);
+        let mut apps = Vec::new();
+        for rule in &rules {
+            let to = rule["to"].as_array().unwrap();
+            assert_eq!(to.len(), 1);
             assert_eq!(
-                entry["namespaceSelector"]["matchLabels"]["kubernetes.io/metadata.name"],
+                to[0]["namespaceSelector"]["matchLabels"]["kubernetes.io/metadata.name"],
                 "kube-system"
             );
+            for port in rule["ports"].as_array().unwrap() {
+                assert_eq!(port["port"], 53);
+            }
+            apps.push(to[0]["podSelector"]["matchLabels"]["k8s-app"].clone());
         }
-        let apps: Vec<_> = to
-            .iter()
-            .map(|entry| entry["podSelector"]["matchLabels"]["k8s-app"].clone())
-            .collect();
         assert!(apps.contains(&serde_json::json!("kube-dns")));
         assert!(apps.contains(&serde_json::json!("coredns")));
     }
@@ -7726,8 +7736,11 @@ mod tests {
                 "default".to_string(),
             ))
             .collect(),
+            port: 5353,
         }];
-        let rule = dns_egress_rule(&proxy_pod_egress_policy_with_dns_peers(&peers)).unwrap();
+        let rule = dns_egress_rules(&proxy_pod_egress_policy_with_dns_peers(&peers))
+            .pop()
+            .unwrap();
         let to = rule["to"].as_array().unwrap();
 
         assert_eq!(to.len(), 1);
@@ -7739,6 +7752,12 @@ mod tests {
             to[0]["podSelector"]["matchLabels"]["dns.operator.openshift.io/daemonset-dns"],
             "default"
         );
+        // OpenShift's dns-default Service maps 53 onto container port 5353.
+        // Egress rules match the destination pod port, so the rule must carry
+        // 5353 rather than the Service port.
+        for port in rule["ports"].as_array().unwrap() {
+            assert_eq!(port["port"], 5353);
+        }
     }
 
     /// A `NetworkPolicy` egress rule with an empty `to` array matches every
@@ -7747,7 +7766,7 @@ mod tests {
     #[test]
     fn proxy_pod_empty_dns_peers_omit_the_rule_rather_than_allowing_all() {
         let policy = proxy_pod_egress_policy_with_dns_peers(&[]);
-        assert!(dns_egress_rule(&policy).is_none());
+        assert!(dns_egress_rules(&policy).is_empty());
 
         let policy = serde_json::to_value(&policy).unwrap();
         let egress = policy["spec"]["egress"].as_array().unwrap();
@@ -7768,8 +7787,11 @@ mod tests {
             ))
             .collect(),
             pod_labels: BTreeMap::new(),
+            port: 5353,
         }];
-        let rule = dns_egress_rule(&proxy_pod_egress_policy_with_dns_peers(&peers)).unwrap();
+        let rule = dns_egress_rules(&proxy_pod_egress_policy_with_dns_peers(&peers))
+            .pop()
+            .unwrap();
         let to = rule["to"].as_array().unwrap();
 
         assert_eq!(to.len(), 1);

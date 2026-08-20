@@ -75,12 +75,18 @@ supervisor:
     # Empty uses the upstream kube-system/kube-dns and kube-system/coredns
     # conventions, which do NOT match OpenShift (cluster DNS runs in
     # `openshift-dns`) or NodeLocal DNSCache. An agent pod with no matching DNS
-    # peer cannot resolve its own paired supervisor Service. For OpenShift:
+    # peer cannot resolve its own paired supervisor Service.
+    #
+    # `port` is the DNS *pod* port, not the Service port: egress rules with a
+    # podSelector match after Service address translation. Upstream CoreDNS
+    # listens on 53; OpenShift's dns-default listens on 5353 and maps 53 to it.
+    # For OpenShift:
     #   dnsPeers:
     #     - namespaceLabels:
     #         kubernetes.io/metadata.name: openshift-dns
     #       podLabels:
     #         dns.operator.openshift.io/daemonset-dns: default
+    #       port: 5353
     dnsPeers: []
 
 # -- Operator-owned corporate forward proxy for policy-approved TLS egress
