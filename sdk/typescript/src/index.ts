@@ -40,6 +40,7 @@ export type {
   SandboxTemplateWorkspaceOptions,
   SandboxWorkloadConfig,
   SandboxWorkloadTemplate,
+  SandboxWorkloadTemplateProvenance,
   SandboxWorkloadTemplateSpec,
   SetPolicyOptions,
   SettingScopeName,

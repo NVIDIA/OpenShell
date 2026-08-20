@@ -174,12 +174,28 @@ pub struct SandboxRef {
     pub labels: HashMap<String, String>,
     pub resource_version: u64,
     pub exit_code: Option<i32>,
+    pub created_from_workload_template: Option<SandboxWorkloadTemplateProvenance>,
+}
+
+/// Reusable workload template revision used to create a sandbox.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub struct SandboxWorkloadTemplateProvenance {
+    pub name: String,
+    pub resource_version: String,
 }
 
 impl SandboxRef {
     pub(crate) fn from_proto(sandbox: proto::Sandbox) -> Self {
         let phase = sandbox.phase().into();
         let exit_code = sandbox.status.as_ref().and_then(|status| status.exit_code);
+        let created_from_workload_template =
+            sandbox
+                .created_from_workload_template
+                .map(|p| SandboxWorkloadTemplateProvenance {
+                    name: p.name,
+                    resource_version: p.resource_version,
+                });
         let meta = sandbox.metadata.unwrap_or_default();
         Self {
             id: meta.id,
@@ -189,6 +205,7 @@ impl SandboxRef {
             labels: meta.labels,
             resource_version: meta.resource_version,
             exit_code,
+            created_from_workload_template,
         }
     }
 }
