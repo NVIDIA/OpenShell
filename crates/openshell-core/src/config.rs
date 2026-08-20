@@ -212,7 +212,9 @@ pub fn detect_driver() -> Option<ComputeDriverKind> {
     None
 }
 
-fn is_podman_available() -> bool {
+/// Return whether a responsive local Podman API socket is available.
+#[must_use]
+pub fn is_podman_available() -> bool {
     detect_podman_socket().is_some()
 }
 
@@ -270,7 +272,9 @@ fn podman_socket_candidates_from_env(
     candidates
 }
 
-fn is_docker_available() -> bool {
+/// Return whether a responsive local Docker API socket is available.
+#[must_use]
+pub fn is_docker_available() -> bool {
     detect_docker_socket().is_some()
 }
 
