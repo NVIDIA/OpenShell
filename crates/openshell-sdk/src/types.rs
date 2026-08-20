@@ -188,6 +188,9 @@ pub struct ExecOptions {
     pub timeout: Option<Duration>,
     /// Optional stdin payload.
     pub stdin: Option<Vec<u8>>,
+    /// Skip sourcing shell login/profile startup files before the command.
+    /// Default (`false`) preserves login-shell behavior.
+    pub no_login_shell: bool,
 }
 
 /// Result of a non-streaming exec call.

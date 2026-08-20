@@ -183,14 +183,27 @@ openshell sandbox exec -n my-sandbox --tty -- /bin/bash
 
 OpenShell allocates a TTY automatically when both stdin and stdout are terminals. Force the behavior with `--tty` or disable it with `--no-tty`.
 
-| Flag           | Purpose                                                  |
-| -------------- | -------------------------------------------------------- |
-| `-n`, `--name` | Sandbox to target.                                       |
-| `--workdir`    | Working directory for the command inside the sandbox.    |
-| `--timeout`    | Command timeout in seconds. `0` disables the timeout.    |
-| `--tty`        | Force TTY allocation.                                    |
-| `--no-tty`     | Disable TTY allocation even when attached to a terminal. |
-| `--env`        | Set an environment variable for the command (`KEY=VALUE`, repeatable). |
+| Flag              | Purpose                                                  |
+| ----------------- | -------------------------------------------------------- |
+| `-n`, `--name`    | Sandbox to target.                                       |
+| `--workdir`       | Working directory for the command inside the sandbox.    |
+| `--timeout`       | Command timeout in seconds. `0` disables the timeout.    |
+| `--tty`           | Force TTY allocation.                                    |
+| `--no-tty`        | Disable TTY allocation even when attached to a terminal. |
+| `--no-login-shell`| Run the command without sourcing shell login startup files. |
+| `--env`           | Set an environment variable for the command (`KEY=VALUE`, repeatable). |
+
+### Skip shell startup files
+
+By default `sandbox exec` runs the command through a login shell (`bash -lc`), so the sandbox user's first available `.bash_profile`, `.bash_login`, or `.profile` is sourced first (and `.bashrc` only if that login file sources it). This makes tool-specific environment configuration available automatically, which suits interactive and tool-discovery use.
+
+For automation and managed checks that need predictable output and side effects, pass `--no-login-shell` so those startup files are not sourced before the command runs:
+
+```shell
+openshell sandbox exec -n my-sandbox --no-login-shell -- /usr/local/bin/managed-probe
+```
+
+In this mode a sandbox user's login startup files cannot write to the command's output, create files, or otherwise affect the requested command before it starts. The command still runs under `bash -c`, which reads `BASH_ENV` if it is set in the command's environment. The default (login-shell) behavior is unchanged when the flag is omitted.
 
 ## Set Environment Variables
 

@@ -1405,6 +1405,7 @@ pub async fn sandbox_exec_grpc(
     timeout_seconds: u32,
     tty_override: Option<bool>,
     environment: &HashMap<String, String>,
+    no_login_shell: bool,
     tls: &TlsOptions,
     workspace: &str,
 ) -> Result<i32> {
@@ -1468,6 +1469,7 @@ pub async fn sandbox_exec_grpc(
             workdir,
             timeout_seconds,
             environment,
+            no_login_shell,
         )
         .await;
     }
@@ -1482,6 +1484,7 @@ pub async fn sandbox_exec_grpc(
             timeout_seconds,
             stdin: stdin_payload,
             tty,
+            no_login_shell,
             ..Default::default()
         })
         .await
@@ -1831,6 +1834,7 @@ async fn sandbox_exec_interactive_grpc(
     workdir: Option<&str>,
     timeout_seconds: u32,
     environment: &HashMap<String, String>,
+    no_login_shell: bool,
 ) -> Result<i32> {
     #[cfg(unix)]
     use openshell_core::proto::ExecSandboxWindowResize;
@@ -1849,6 +1853,7 @@ async fn sandbox_exec_interactive_grpc(
                 command: command.to_vec(),
                 workdir: workdir.unwrap_or_default().to_string(),
                 environment: environment.clone(),
+                no_login_shell,
                 timeout_seconds,
                 stdin: Vec::new(),
                 tty: true,

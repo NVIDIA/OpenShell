@@ -33,6 +33,8 @@ use std::time::Duration;
 use tokio::net::UnixListener;
 use tracing::warn;
 
+const NO_LOGIN_SHELL_ENV: (&str, &str) = ("OPENSHELL_NO_LOGIN_SHELL", "1");
+
 /// Perform SSH server initialization: generate a host key, build the config,
 /// and bind the Unix socket listener. Extracted so that startup errors can be
 /// forwarded through the readiness channel rather than being silently logged.
@@ -236,6 +238,7 @@ struct ChannelState {
     input_sender: Option<mpsc::Sender<Vec<u8>>>,
     pty_master: Option<std::fs::File>,
     pty_request: Option<PtyRequest>,
+    no_login_shell: bool,
 }
 
 struct SshHandler {
@@ -503,6 +506,7 @@ impl russh::server::Handler for SshHandler {
                 &self.policy,
                 &self.workspace,
                 Some("/usr/lib/openssh/sftp-server".to_string()),
+                false,
                 session.handle(),
                 channel,
                 self.netns_fd,
@@ -539,10 +543,14 @@ impl russh::server::Handler for SshHandler {
         variable_value: &str,
         session: &mut Session,
     ) -> Result<(), Self::Error> {
-        // Accept the env request so the client knows we handled it, but we
-        // don't actually propagate the variables — the sandbox environment is
-        // controlled via policy.  We must reply so VSCode doesn't stall.
-        let _ = (variable_name, variable_value);
+        // Sandbox env is policy-controlled, so we don't propagate arbitrary vars.
+        // One exception: the gateway signals login-shell opt-out over this channel
+        // because SSH has no native carrier for it (unlike PTY requests).
+        if variable_name == NO_LOGIN_SHELL_ENV.0
+            && let Some(state) = self.channels.get_mut(&channel)
+        {
+            state.no_login_shell = variable_value == NO_LOGIN_SHELL_ENV.1;
+        }
         session.channel_success(channel)?;
         Ok(())
     }
@@ -593,6 +601,7 @@ impl SshHandler {
             .channels
             .get_mut(&channel)
             .ok_or_else(|| anyhow::anyhow!("start_shell on unknown channel {channel:?}"))?;
+        let no_login_shell = state.no_login_shell;
         if let Some(pty) = state.pty_request.take() {
             // PTY was requested — allocate a real PTY (interactive shell or
             // exec that explicitly asked for a terminal).
@@ -600,6 +609,7 @@ impl SshHandler {
                 &self.policy,
                 &self.workspace,
                 command,
+                no_login_shell,
                 &pty,
                 handle,
                 channel,
@@ -621,6 +631,7 @@ impl SshHandler {
                 &self.policy,
                 &self.workspace,
                 command,
+                no_login_shell,
                 handle,
                 channel,
                 self.netns_fd,
@@ -795,6 +806,7 @@ fn spawn_pty_shell(
     policy: &SandboxPolicy,
     workspace: &ResolvedWorkspace,
     command: Option<String>,
+    no_login_shell: bool,
     pty: &PtyRequest,
     handle: Handle,
     channel: ChannelId,
@@ -831,7 +843,8 @@ fn spawn_pty_shell(
         },
         |command| {
             let mut c = Command::new("/bin/bash");
-            c.arg("-lc").arg(command);
+            c.arg(if no_login_shell { "-c" } else { "-lc" })
+                .arg(command);
             c
         },
     );
@@ -968,6 +981,7 @@ fn spawn_pipe_exec(
     policy: &SandboxPolicy,
     workspace: &ResolvedWorkspace,
     command: Option<String>,
+    no_login_shell: bool,
     handle: Handle,
     channel: ChannelId,
     netns_fd: Option<RawFd>,
@@ -990,10 +1004,11 @@ fn spawn_pipe_exec(
         },
         |command| {
             let mut c = Command::new("/bin/bash");
-            // Use login shell (-l) so that .profile/.bashrc are sourced and
-            // tool-specific env vars (VIRTUAL_ENV, UV_PYTHON_INSTALL_DIR, etc.)
-            // are available without hardcoding them here.
-            c.arg("-lc").arg(command);
+            // Login shell (-l) sources .profile/.bashrc so tool env vars
+            // (VIRTUAL_ENV, etc.) are available. Callers that need a predictable
+            // environment opt out via OPENSHELL_NO_LOGIN_SHELL → plain -c.
+            c.arg(if no_login_shell { "-c" } else { "-lc" })
+                .arg(command);
             c
         },
     );

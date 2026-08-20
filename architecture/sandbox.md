@@ -327,7 +327,13 @@ gateway reaches it through the outbound supervisor relay, not by dialing the
 sandbox workload directly. The relay supports:
 
 - Interactive shell sessions.
-- Command execution.
+- Command execution. Commands run through a login shell (`bash -lc`) by default,
+  so the first of the user's `.bash_profile`, `.bash_login`, or `.profile` is
+  sourced (and `.bashrc` only if that file sources it). Callers set
+  `ExecSandboxRequest.no_login_shell` to skip those files; the gateway signals
+  this to the supervisor over the SSH `OPENSHELL_NO_LOGIN_SHELL` env request,
+  which selects `bash -c` instead of `bash -lc`. Note `bash -c` still reads
+  `BASH_ENV` when the child environment sets it.
 - Tar-based file sync.
 - Port forwarding where supported by the CLI/TUI surface.
 

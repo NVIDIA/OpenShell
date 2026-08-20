@@ -3352,7 +3352,9 @@ type ExecSandboxRequest struct {
 	// Initial terminal columns (used when tty=true, 0 = use default).
 	Cols uint32 `protobuf:"varint,8,opt,name=cols,proto3" json:"cols,omitempty"`
 	// Initial terminal rows (used when tty=true, 0 = use default).
-	Rows          uint32 `protobuf:"varint,9,opt,name=rows,proto3" json:"rows,omitempty"`
+	Rows uint32 `protobuf:"varint,9,opt,name=rows,proto3" json:"rows,omitempty"`
+	// Ability to opt-out shell login. (TODO: rephrase the explanation.)
+	LoginShell    bool `protobuf:"varint,10,opt,name=login_shell,json=loginShell,proto3" json:"login_shell,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -3448,6 +3450,13 @@ func (x *ExecSandboxRequest) GetRows() uint32 {
 		return x.Rows
 	}
 	return 0
+}
+
+func (x *ExecSandboxRequest) GetLoginShell() bool {
+	if x != nil {
+		return x.LoginShell
+	}
+	return false
 }
 
 // One stdout chunk from a sandbox exec.
@@ -13395,7 +13404,7 @@ const file_openshell_proto_rawDesc = "" +
 	"\x17RevokeSshSessionRequest\x12\x1a\n" +
 	"\x05token\x18\x01 \x01(\tB\x04\x88\xb5\x18\x01R\x05token\"4\n" +
 	"\x18RevokeSshSessionResponse\x12\x18\n" +
-	"\arevoked\x18\x01 \x01(\bR\arevoked\"\xf5\x02\n" +
+	"\arevoked\x18\x01 \x01(\bR\arevoked\"\x96\x03\n" +
 	"\x12ExecSandboxRequest\x12\x1d\n" +
 	"\n" +
 	"sandbox_id\x18\x01 \x01(\tR\tsandboxId\x12\x18\n" +
@@ -13406,7 +13415,10 @@ const file_openshell_proto_rawDesc = "" +
 	"\x05stdin\x18\x06 \x01(\fR\x05stdin\x12\x10\n" +
 	"\x03tty\x18\a \x01(\bR\x03tty\x12\x12\n" +
 	"\x04cols\x18\b \x01(\rR\x04cols\x12\x12\n" +
-	"\x04rows\x18\t \x01(\rR\x04rows\x1a>\n" +
+	"\x04rows\x18\t \x01(\rR\x04rows\x12\x1f\n" +
+	"\vlogin_shell\x18\n" +
+	" \x01(\bR\n" +
+	"loginShell\x1a>\n" +
 	"\x10EnvironmentEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"'\n" +

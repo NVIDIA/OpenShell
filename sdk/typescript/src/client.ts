@@ -118,6 +118,12 @@ export interface ExecOptions {
   environment?: Record<string, string>;
   timeoutSecs?: number;
   stdin?: Buffer;
+  /**
+   * Skip sourcing shell login/profile startup files before the command.
+   * Defaults to `false`, which preserves login-shell behavior. Set `true` for
+   * automation and managed checks that need predictable startup behavior.
+   */
+  noLoginShell?: boolean;
   /** Abort the exec (and the in-flight stream RPC) early. */
   signal?: AbortSignal;
 }
@@ -155,6 +161,11 @@ export interface ExecInteractiveOptions {
   cols?: number;
   /** Initial terminal rows (0 = server default). */
   rows?: number;
+  /**
+   * Skip sourcing shell login/profile startup files before the command.
+   * Defaults to `false`, which preserves login-shell behavior.
+   */
+  noLoginShell?: boolean;
   /** Abort the interactive exec (and the in-flight stream RPC) early. */
   signal?: AbortSignal;
 }
@@ -673,6 +684,7 @@ export class SandboxClient {
           timeoutSeconds: options?.timeoutSecs ?? 0,
           stdin: options?.stdin ? new Uint8Array(options.stdin) : new Uint8Array(),
           tty: false,
+          noLoginShell: options?.noLoginShell ?? false,
         },
         { signal: options?.signal },
       );
@@ -755,6 +767,7 @@ export class SandboxClient {
           tty: options?.tty ?? true,
           cols: options?.cols ?? 0,
           rows: options?.rows ?? 0,
+          noLoginShell: options?.noLoginShell ?? false,
         },
       },
     });

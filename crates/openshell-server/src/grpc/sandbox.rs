@@ -61,6 +61,7 @@ use super::{MAX_PAGE_SIZE, MAX_PROVIDERS, MAX_ROUTABLE_NAME_LEN, clamp_limit};
 use crate::persistence::current_time_ms;
 
 const TCP_FORWARD_CHUNK_SIZE: usize = 64 * 1024;
+const NO_LOGIN_SHELL_ENV: (&str, &str) = ("OPENSHELL_NO_LOGIN_SHELL", "1");
 
 #[derive(Debug)]
 pub struct WatchSandboxStream {
@@ -1210,6 +1211,8 @@ pub(super) async fn handle_exec_sandbox(
 
     let sandbox_id = sandbox.object_id().to_string();
 
+    let no_login_shell = req.no_login_shell;
+
     let (tx, rx) = mpsc::channel::<Result<ExecSandboxEvent, Status>>(256);
     tokio::spawn(async move {
         // Wait for the supervisor's reverse CONNECT to deliver the relay stream.
@@ -1228,6 +1231,7 @@ pub(super) async fn handle_exec_sandbox(
             stdin_payload,
             timeout_seconds,
             request_tty,
+            no_login_shell,
         )
         .await
         {
@@ -1634,6 +1638,7 @@ pub(super) async fn handle_exec_sandbox_interactive(
     let command_str = build_remote_exec_command(&req)
         .map_err(|e| Status::invalid_argument(format!("command construction failed: {e}")))?;
     let request_tty = req.tty;
+    let no_login_shell = req.no_login_shell;
     let timeout_seconds = req.timeout_seconds;
     let cols = if req.cols == 0 { 80 } else { req.cols };
     let rows = if req.rows == 0 { 24 } else { req.rows };
@@ -1662,6 +1667,7 @@ pub(super) async fn handle_exec_sandbox_interactive(
             &command_str,
             input_stream,
             request_tty,
+            no_login_shell,
             timeout_seconds,
             cols,
             rows,
@@ -1939,6 +1945,7 @@ async fn stream_exec_over_relay(
     stdin_payload: Vec<u8>,
     timeout_seconds: u32,
     request_tty: bool,
+    no_login_shell: bool,
 ) -> Result<(), Status> {
     let command_preview: String = command
         .chars()
@@ -1963,6 +1970,7 @@ async fn stream_exec_over_relay(
         command,
         stdin_payload,
         request_tty,
+        no_login_shell,
         tx.clone(),
     );
 
@@ -2017,6 +2025,7 @@ async fn stream_interactive_exec_over_relay(
     command: &str,
     input_stream: tonic::Streaming<ExecSandboxInput>,
     request_tty: bool,
+    no_login_shell: bool,
     timeout_seconds: u32,
     cols: u32,
     rows: u32,
@@ -2043,6 +2052,7 @@ async fn stream_interactive_exec_over_relay(
         command,
         input_stream,
         request_tty,
+        no_login_shell,
         cols,
         rows,
         tx.clone(),
@@ -2090,11 +2100,13 @@ async fn stream_interactive_exec_over_relay(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_interactive_exec_with_russh(
     local_proxy_port: u16,
     command: &str,
     mut input_stream: tonic::Streaming<ExecSandboxInput>,
     request_tty: bool,
+    no_login_shell: bool,
     cols: u32,
     rows: u32,
     tx: mpsc::Sender<Result<ExecSandboxEvent, Status>>,
@@ -2148,6 +2160,13 @@ async fn run_interactive_exec_with_russh(
             .request_pty(false, "xterm-256color", cols, rows, 0, 0, &[])
             .await
             .map_err(|e| Status::internal(format!("failed to allocate PTY: {e}")))?;
+    }
+
+    if no_login_shell {
+        channel
+            .set_env(false, NO_LOGIN_SHELL_ENV.0, NO_LOGIN_SHELL_ENV.1)
+            .await
+            .map_err(|e| Status::internal(format!("failed to set login-shell env: {e}")))?;
     }
 
     channel
@@ -2280,6 +2299,7 @@ async fn run_exec_with_russh(
     command: &str,
     stdin_payload: Vec<u8>,
     request_tty: bool,
+    no_shell_login: bool,
     tx: mpsc::Sender<Result<ExecSandboxEvent, Status>>,
 ) -> Result<i32, Status> {
     // Defense-in-depth: validate command at the transport boundary.
@@ -2329,6 +2349,13 @@ async fn run_exec_with_russh(
             .request_pty(false, "xterm-256color", 0, 0, 0, 0, &[])
             .await
             .map_err(|e| Status::internal(format!("failed to allocate PTY: {e}")))?;
+    }
+
+    if no_shell_login {
+        channel
+            .set_env(false, NO_LOGIN_SHELL_ENV.0, NO_LOGIN_SHELL_ENV.1)
+            .await
+            .map_err(|e| Status::internal(format!("failed to set login-shell env: {e}")))?;
     }
 
     channel

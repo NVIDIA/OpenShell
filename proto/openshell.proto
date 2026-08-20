@@ -1218,6 +1218,13 @@ message ExecSandboxRequest {
 
   // Initial terminal rows (used when tty=true, 0 = use default).
   uint32 rows = 9;
+
+  // Skip sourcing shell login/profile startup files before running the command.
+  // When false (the default), the command runs through a login shell
+  // (`bash -lc`) so user startup files (.bash_profile/.profile, and .bashrc if
+  // sourced by them) are applied. When true, the command runs without those
+  // files (`bash -c`), for automation that needs predictable startup behavior.
+  bool no_login_shell = 10;
 }
 
 // One stdout chunk from a sandbox exec.
