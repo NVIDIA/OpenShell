@@ -28,6 +28,10 @@ volume. Stopped managed containers remain visible through list and watch
 reconciliation. Delete remains responsible for removing the container,
 driver-owned secrets, and workspace volume.
 
+The stop call waits until Podman reports the container as stopped or exited.
+This keeps an immediate start from racing a rootless Podman stop that is still
+finishing after its API request returns.
+
 ## Architecture
 
 The Podman driver communicates with the Podman daemon over a Unix socket and

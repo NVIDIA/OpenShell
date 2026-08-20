@@ -99,6 +99,10 @@ same resource. The gateway requires a fresh supervisor session before a
 starting sandbox returns to `Ready`; stale driver snapshots and supervisor
 sessions cannot promote a `Stopped` row.
 
+A driver stop operation does not complete while its backend still reports an
+in-progress stop. This prevents an immediate start from racing the previous
+run's delayed exit event and regressing the new run to `Error`.
+
 Persisted `Stopping` and `Starting` rows are retried at startup. Stable
 `Stopped` rows remain stopped. Docker and Podman retain the stopped container
 and attached storage, Kubernetes retains the Sandbox CR and PVC while scaling
