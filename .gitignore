@@ -239,6 +239,3 @@ scripts/lint-mermaid/node_modules/
 # Nix
 /result
 /result-*
-
-# Bazel
-bazel-*
