@@ -490,7 +490,7 @@ pub(crate) async fn run_server(
                 &signing_pem,
                 kid.clone(),
                 &jwt.gateway_id,
-                Duration::from_secs(jwt.ttl_secs),
+                jwt.sandbox_token_ttl().unwrap_or_default(),
             )
             .map_err(Error::config)?,
         );
@@ -1271,13 +1271,13 @@ fn kubernetes_sandbox_jwt_expiry_disabled(config: &Config) -> bool {
     config
         .gateway_jwt
         .as_ref()
-        .is_some_and(|jwt| jwt.ttl_secs == 0)
+        .is_some_and(|jwt| jwt.sandbox_token_ttl().is_none())
 }
 
 fn warn_if_kubernetes_sandbox_jwt_expiry_disabled(config: &Config) {
     if kubernetes_sandbox_jwt_expiry_disabled(config) {
         warn!(
-            "Kubernetes gateway configured with non-expiring sandbox JWTs (gateway_jwt.ttl_secs = 0); set ttl_secs > 0 for shared Kubernetes deployments"
+            "Kubernetes gateway configured with non-expiring sandbox JWTs (gateway_jwt.ttl_secs is omitted or zero); set ttl_secs > 0 for shared Kubernetes deployments"
         );
     }
 }

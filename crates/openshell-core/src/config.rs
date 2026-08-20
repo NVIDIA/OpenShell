@@ -790,9 +790,29 @@ pub struct GatewayJwtConfig {
     #[serde(default = "default_gateway_id")]
     pub gateway_id: String,
     /// Token lifetime in seconds. A value of 0 disables expiration and is
-    /// intended only for local single-player deployments.
-    #[serde(default = "default_sandbox_token_ttl_secs")]
+    /// intended only for local single-player deployments. Canonical serialized
+    /// configuration omits the field for that non-expiring behavior; explicit
+    /// legacy zero remains accepted.
+    #[serde(
+        default = "default_sandbox_token_ttl_secs",
+        skip_serializing_if = "is_default"
+    )]
     pub ttl_secs: u64,
+}
+
+impl GatewayJwtConfig {
+    /// Effective token lifetime. `None` preserves the established non-expiring
+    /// behavior represented by an omitted or explicit zero `ttl_secs` value.
+    pub fn sandbox_token_ttl(&self) -> Option<Duration> {
+        (self.ttl_secs != 0).then(|| Duration::from_secs(self.ttl_secs))
+    }
+}
+
+fn is_default<T>(value: &T) -> bool
+where
+    T: Default + PartialEq,
+{
+    value == &T::default()
 }
 
 fn default_gateway_id() -> String {
@@ -1217,6 +1237,25 @@ mod tests {
         .expect("gateway JWT config should deserialize with default ttl");
 
         assert_eq!(cfg.ttl_secs, 0);
+        assert_eq!(cfg.sandbox_token_ttl(), None);
+
+        let serialized = serde_json::to_value(&cfg).expect("gateway JWT config serializes");
+        assert!(serialized.get("ttl_secs").is_none());
+    }
+
+    #[test]
+    fn gateway_jwt_positive_ttl_serializes_and_has_effective_duration() {
+        let cfg: GatewayJwtConfig = serde_json::from_value(serde_json::json!({
+            "signing_key_path": "/tmp/signing.pem",
+            "public_key_path": "/tmp/public.pem",
+            "kid_path": "/tmp/kid",
+            "ttl_secs": 3600
+        }))
+        .expect("gateway JWT config should deserialize with positive ttl");
+
+        assert_eq!(cfg.sandbox_token_ttl(), Some(Duration::from_secs(3600)));
+        let serialized = serde_json::to_value(&cfg).expect("gateway JWT config serializes");
+        assert_eq!(serialized["ttl_secs"], 3600);
     }
 
     #[test]

@@ -57,6 +57,8 @@ version = 1
 # ... credential-driver-specific settings ...
 ```
 
+The canonical gateway selector is `compute_driver = "<driver>"`. The legacy `compute_drivers = ["<driver>"]` list remains accepted for compatibility. An omitted selector or an empty legacy list retains auto-detection; a legacy list with multiple entries retains the existing startup error because only one compute driver can be active.
+
 ## Full Example
 
 A complete gateway configuration covering every section. Trim to the fields you need.
@@ -75,15 +77,14 @@ metrics_bind_address  = "0.0.0.0:9090"
 
 log_level             = "info"
 
-# When empty, the gateway auto-detects Kubernetes, then Podman, then Docker.
+# When omitted, the gateway auto-detects Kubernetes, then Podman, then Docker.
 # VM is never auto-detected and requires an explicit entry here.
-compute_drivers       = ["kubernetes"]
+compute_driver        = "kubernetes"
 
 # Optional external provider credential storage backend. Omit this key to use
 # the gateway's default encrypted database credential storage.
 credential_drivers        = ["kubernetes-secrets"]
 
-sandbox_namespace     = "openshell"
 ssh_session_ttl_secs  = 3600
 
 # Reject invalid policy generations securely by default. Set
@@ -106,9 +107,7 @@ default_image           = "ghcr.io/nvidia/openshell/sandbox:latest"
 # Defaults to the gateway version; override to pin a specific build.
 # supervisor_image      = "ghcr.io/nvidia/openshell/supervisor:<version>"
 client_tls_secret_name  = "openshell-client-tls"
-service_account_name    = "openshell-sandbox"
 host_gateway_ip         = "10.0.0.1"
-enable_user_namespaces  = false
 sa_token_ttl_secs       = 3600
 guest_tls_ca            = "/etc/openshell/certs/ca.pem"
 guest_tls_cert          = "/etc/openshell/certs/client.pem"
@@ -194,6 +193,11 @@ failure_policy = "fail_closed"
 [[openshell.gateway.interceptors.bindings]]
 rpc    = "openshell.v1.OpenShell/UpdateConfig"
 phases = ["validate"]
+
+[openshell.drivers.kubernetes]
+namespace              = "openshell"
+service_account_name   = "openshell-sandbox"
+enable_user_namespaces = false
 
 [openshell.credential_drivers.kubernetes-secrets]
 namespace = "openshell"
@@ -418,6 +422,8 @@ args = [
 
 Each example is a complete TOML file for one compute driver. The examples repeat `[openshell]` and `[openshell.gateway]` so they stay copyable, and the driver tables list the accepted driver-specific keys. Driver-specific values override inherited gateway defaults. The gateway rejects unknown driver fields after inheritance is merged.
 
+Canonical Kubernetes configurations set `namespace`, `service_account_name`, and `enable_user_namespaces` in `[openshell.drivers.kubernetes]`. Their historical gateway-level locations remain accepted as compatibility inputs and retain the same lower precedence. Gateway-level `sandbox_namespace` also remains a compatibility default for Docker `sandbox_label`.
+
 ### Kubernetes
 
 The gateway runs as a Pod and creates sandbox Pods in another namespace. mTLS material for sandboxes is delivered through a Kubernetes Secret rather than host-side file paths.
@@ -431,7 +437,7 @@ bind_address          = "0.0.0.0:8080"
 health_bind_address   = "0.0.0.0:8081"
 metrics_bind_address  = "0.0.0.0:9090"
 log_level             = "info"
-compute_drivers       = ["kubernetes"]
+compute_driver        = "kubernetes"
 
 [openshell.gateway.tls]
 cert_path      = "/etc/openshell-tls/server/tls.crt"
@@ -562,7 +568,7 @@ version = 1
 [openshell.gateway]
 bind_address    = "127.0.0.1:17670"
 log_level       = "info"
-compute_drivers = ["docker"]
+compute_driver = "docker"
 
 [openshell.drivers.docker]
 socket_path        = "/var/run/docker.sock"
@@ -607,7 +613,7 @@ version = 1
 [openshell.gateway]
 bind_address    = "127.0.0.1:17670"
 log_level       = "info"
-compute_drivers = ["podman"]
+compute_driver = "podman"
 
 [openshell.drivers.podman]
 # Rootless socket path. For root Podman use /run/podman/podman.sock.
@@ -727,7 +733,7 @@ version = 1
 bind_address    = "127.0.0.1:17670"
 log_level       = "info"
 # VM is never auto-detected; an explicit entry here is required.
-compute_drivers = ["vm"]
+compute_driver = "vm"
 
 [openshell.drivers.vm]
 state_dir        = "/var/lib/openshell/vm"
@@ -764,7 +770,7 @@ version = 1
 [openshell.gateway]
 bind_address    = "127.0.0.1:17670"
 log_level       = "info"
-compute_drivers = ["kyma"]
+compute_driver = "kyma"
 
 [openshell.drivers.kyma]
 socket_path = "/run/openshell/kyma-compute-driver.sock"

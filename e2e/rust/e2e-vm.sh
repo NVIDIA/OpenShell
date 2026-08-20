@@ -241,7 +241,7 @@ version = 1
 
 [openshell.gateway]
 bind_address = "127.0.0.1:${HOST_PORT}"
-compute_drivers = ["vm"]
+compute_driver = "vm"
 
 [openshell.gateway.tls]
 cert_path = "${PKI_DIR}/server/tls.crt"

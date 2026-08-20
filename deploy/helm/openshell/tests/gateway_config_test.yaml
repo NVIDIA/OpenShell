@@ -103,6 +103,18 @@ tests:
           path: data["gateway.toml"]
           pattern: '(?ms)\[openshell\.drivers\.kubernetes\].*?service_account_name\s*=\s*"openshell-sandbox"'
 
+  - it: renders user namespace enablement under [openshell.drivers.kubernetes]
+    template: templates/gateway-config.yaml
+    set:
+      server.enableUserNamespaces: true
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.drivers\.kubernetes\].*?enable_user_namespaces\s*=\s*true'
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.gateway\][^\[]*?enable_user_namespaces'
+
   - it: renders combined supervisor topology by default under [openshell.drivers.kubernetes]
     template: templates/gateway-config.yaml
     asserts:

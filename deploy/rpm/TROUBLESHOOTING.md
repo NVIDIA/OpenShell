@@ -255,7 +255,7 @@ and map the relevant variables:
 | Environment variable | TOML equivalent |
 |---|---|
 | `OPENSHELL_BIND_ADDRESS=A` + `OPENSHELL_SERVER_PORT=P` | `bind_address = "A:P"` under `[openshell.gateway]` |
-| `OPENSHELL_DRIVERS=podman` | `compute_drivers = ["podman"]` under `[openshell.gateway]` |
+| `OPENSHELL_DRIVERS=podman` | `compute_driver = "podman"` under `[openshell.gateway]` |
 | `OPENSHELL_DISABLE_TLS=true` | `disable_tls = true` under `[openshell.gateway]` |
 | `OPENSHELL_TLS_CERT=PATH` | `cert_path = "PATH"` under `[openshell.gateway.tls]` |
 | `OPENSHELL_TLS_KEY=PATH` | `key_path = "PATH"` under `[openshell.gateway.tls]` |

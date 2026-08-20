@@ -324,7 +324,7 @@ cat >"${CONFIG_PATH}" <<EOF
 version = 1
 
 [openshell.gateway]
-compute_drivers = ["vm"]
+compute_driver = "vm"
 disable_tls = ${DISABLE_TLS}
 
 [openshell.gateway.auth]

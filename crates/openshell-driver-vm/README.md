@@ -112,7 +112,7 @@ cat > .cache/gateway-vm/gateway.toml <<EOF
 version = 1
 
 [openshell.gateway]
-compute_drivers = ["vm"]
+compute_driver = "vm"
 disable_tls = true
 
 [openshell.drivers.vm]
@@ -134,7 +134,7 @@ The gateway resolves `openshell-driver-vm` in this order: `[openshell.drivers.vm
 
 ## Gateway And Driver Configuration
 
-Select the VM driver with `--drivers vm`, `OPENSHELL_DRIVERS=vm`, or `compute_drivers = ["vm"]` in `[openshell.gateway]`. Configure VM-specific settings in `[openshell.drivers.vm]`.
+Select the VM driver with `--drivers vm`, `OPENSHELL_DRIVERS=vm`, or `compute_driver = "vm"` in `[openshell.gateway]`. Configure VM-specific settings in `[openshell.drivers.vm]`.
 
 | Configuration key | Default | Purpose |
 |---|---|---|

@@ -172,7 +172,7 @@ cat >"${CONFIG_PATH}" <<EOF
 version = 1
 
 [openshell.gateway]
-compute_drivers = ["docker"]
+compute_driver = "docker"
 disable_tls = true
 
 [openshell.gateway.auth]

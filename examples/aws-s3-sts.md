@@ -90,7 +90,7 @@ if your gateway cache directory differs):
 version = 1
 
 [openshell.gateway]
-compute_drivers = ["podman"]
+compute_driver = "podman"
 default_image = "ghcr.io/nvidia/openshell-community/sandboxes/base:latest"
 disable_tls = true
 supervisor_image = "localhost/openshell/supervisor:dev"

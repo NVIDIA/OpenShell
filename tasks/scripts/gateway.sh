@@ -359,7 +359,7 @@ cat >"${CONFIG_PATH}" <<EOF
 version = 1
 
 [openshell.gateway]
-compute_drivers = ["${DRIVER}"]
+compute_driver = "${DRIVER}"
 default_image = "${SANDBOX_IMAGE}"
 disable_tls = true
 

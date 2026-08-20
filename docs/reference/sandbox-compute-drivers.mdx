@@ -20,24 +20,26 @@ remain unavailable.
 
 ## Configure a Compute Driver
 
-Configure the compute driver on the gateway. Current releases accept one driver per gateway. Set `compute_drivers` in the gateway TOML file:
+Configure the compute driver on the gateway. Current releases accept one driver per gateway. Set the singular `compute_driver` key in the gateway TOML file:
 
 ```toml
 [openshell.gateway]
-compute_drivers = ["docker"]
+compute_driver = "docker"
 ```
 
 Reserved built-in values are `docker`, `podman`, `kubernetes`, and `vm`.
 Non-reserved names select an extension driver and require a
 `socket_path` in `[openshell.drivers.<name>]`.
 
-When `compute_drivers` is unset, the gateway auto-detects Kubernetes, then Podman, then Docker. Local container runtimes must respond to an API probe before the gateway selects them. The VM driver is never auto-detected; configure it explicitly with `compute_drivers = ["vm"]` or set `OPENSHELL_DRIVERS=vm` in the launch environment.
+When `compute_driver` is unset, the gateway auto-detects Kubernetes, then Podman, then Docker. Local container runtimes must respond to an API probe before the gateway selects them. The VM driver is never auto-detected; configure it explicitly with `compute_driver = "vm"` or set `OPENSHELL_DRIVERS=vm` in the launch environment.
+
+The legacy `compute_drivers = ["<driver>"]` list remains accepted for compatibility. Empty legacy lists retain auto-detection, and lists with more than one entry retain the existing startup error because a gateway supports exactly one active compute driver.
 
 Common gateway options:
 
 | Gateway TOML option | Description |
 |---|---|
-| `compute_drivers = ["<driver>"]` | Select the compute driver. Built-in values are `docker`, `podman`, `kubernetes`, and `vm`; custom names require `[openshell.drivers.<name>].socket_path`. |
+| `compute_driver = "<driver>"` | Select the compute driver. Built-in values are `docker`, `podman`, `kubernetes`, and `vm`; custom names require `[openshell.drivers.<name>].socket_path`. |
 
 Set driver-specific values such as sandbox images, callback endpoints, network names, TLS material, and VM sizing in the gateway TOML file. See the [Gateway Configuration File](./gateway-config) reference for the full `[openshell.drivers.<name>]` schema.
 
@@ -47,7 +49,7 @@ the gateway at the Unix socket the operator has already provisioned:
 
 ```toml
 [openshell.gateway]
-compute_drivers = ["kyma"]
+compute_driver = "kyma"
 
 [openshell.drivers.kyma]
 socket_path = "/run/openshell/kyma.sock"
@@ -136,7 +138,7 @@ that already covers loopback. Otherwise, the Docker driver requests a separate
 
 For maintainer-level implementation details, refer to the [Docker driver README](https://github.com/NVIDIA/OpenShell/blob/main/crates/openshell-driver-docker/README.md).
 
-Select Docker with `compute_drivers = ["docker"]` in `[openshell.gateway]`. Configure Docker driver values such as `socket_path`, `grpc_endpoint`, `network_name`, `sandbox_label`, `supervisor_bin`, `supervisor_image`, `image_pull_policy`, `ssh_socket_path`, `sandbox_pids_limit`, and `guest_tls_*` in `[openshell.drivers.docker]`. When `socket_path` is unset, the driver uses the same responsive local socket selected by auto-detection. An explicitly selected Docker driver falls back to `/var/run/docker.sock` when no candidate responds.
+Select Docker with `compute_driver = "docker"` in `[openshell.gateway]`. Configure Docker driver values such as `socket_path`, `grpc_endpoint`, `network_name`, `sandbox_label`, `supervisor_bin`, `supervisor_image`, `image_pull_policy`, `ssh_socket_path`, `sandbox_pids_limit`, and `guest_tls_*` in `[openshell.drivers.docker]`. When `socket_path` is unset, the driver uses the same responsive local socket selected by auto-detection. An explicitly selected Docker driver falls back to `/var/run/docker.sock` when no candidate responds.
 
 Stop stops the existing Docker container without removing its writable
 layer or attached volumes. Start starts that same container. A durably
@@ -207,7 +209,7 @@ The gateway talks to the Podman API socket. The Podman driver requires Podman 5.
 
 For maintainer-level implementation details, refer to the [Podman driver README](https://github.com/NVIDIA/OpenShell/blob/main/crates/openshell-driver-podman/README.md) and [Podman networking notes](https://github.com/NVIDIA/OpenShell/blob/main/crates/openshell-driver-podman/NETWORKING.md).
 
-Select Podman with `compute_drivers = ["podman"]` in `[openshell.gateway]`. Configure Podman driver values such as `socket_path`, `network_name`, `supervisor_image`, `stop_timeout_secs`, `image_pull_policy`, `grpc_endpoint`, `host_gateway_ip`, `ssh_socket_path`, `sandbox_pids_limit`, and `guest_tls_*` in `[openshell.drivers.podman]`.
+Select Podman with `compute_driver = "podman"` in `[openshell.gateway]`. Configure Podman driver values such as `socket_path`, `network_name`, `supervisor_image`, `stop_timeout_secs`, `image_pull_policy`, `grpc_endpoint`, `host_gateway_ip`, `ssh_socket_path`, `sandbox_pids_limit`, and `guest_tls_*` in `[openshell.drivers.podman]`.
 
 Podman sandboxes default to a 45-second graceful stop window before Podman escalates from `SIGTERM` to `SIGKILL`. Set `stop_timeout_secs` in gateway config, or `OPENSHELL_STOP_TIMEOUT` for the standalone driver, when a local runtime needs a different teardown window.
 
@@ -297,11 +299,11 @@ For maintainer-level implementation details, refer to the [VM driver README](htt
 
 The VM driver is opt-in. Release packages can install `openshell-driver-vm`, but the gateway does not select it unless you configure the driver explicitly.
 
-Enable VM by setting `compute_drivers = ["vm"]` in the gateway TOML file:
+Enable VM by setting `compute_driver = "vm"` in the gateway TOML file:
 
 ```toml
 [openshell.gateway]
-compute_drivers = ["vm"]
+compute_driver = "vm"
 ```
 
 For a launch-time override, set `OPENSHELL_DRIVERS=vm` in the gateway environment and restart the service.
@@ -339,15 +341,16 @@ owner references or use the sandbox ServiceAccount. The operator namespace
 allowlist is a trust grant, not a tenant isolation mechanism.
 </Warning>
 
-Helm deployments set Kubernetes driver values through the chart.
+Helm deployments set Kubernetes driver values through the chart. Canonical TOML places `namespace`, `service_account_name`, and `enable_user_namespaces` in `[openshell.drivers.kubernetes]`. Their historical `[openshell.gateway]` locations remain accepted as lower-precedence compatibility inputs.
 
 For maintainer-level implementation details, refer to the [Kubernetes driver README](https://github.com/NVIDIA/OpenShell/blob/main/crates/openshell-driver-kubernetes/README.md).
 
 | Gateway configuration | Helm value | Description |
 |---|---|---|
-| `compute_drivers = ["kubernetes"]` | Not applicable | Select the Kubernetes compute driver. |
+| `compute_driver = "kubernetes"` | Not applicable | Select the Kubernetes compute driver. |
 | `[openshell.drivers.kubernetes].namespace` | `server.sandboxNamespace` | Set the namespace for sandbox resources. The Helm chart defaults to the release namespace when left empty. |
-| `service_account_name` | `sandboxServiceAccount.name` | Set the Kubernetes service account assigned to sandbox pods and accepted by the gateway TokenReview bootstrap path. The Helm chart creates a dedicated sandbox service account by default. |
+| `[openshell.drivers.kubernetes].service_account_name` | `sandboxServiceAccount.name` | Set the Kubernetes service account assigned to sandbox pods and accepted by the gateway TokenReview bootstrap path. The Helm chart creates a dedicated sandbox service account by default. |
+| `[openshell.drivers.kubernetes].enable_user_namespaces` | `server.enableUserNamespaces` | Enable Kubernetes user namespaces for sandbox pods. |
 | `default_image` | `server.sandboxImage` | Set the default sandbox image. |
 | `image_pull_policy` | `server.sandboxImagePullPolicy` | Set the Kubernetes image pull policy for sandbox pods. |
 | `image_pull_secrets` | `server.sandboxImagePullSecrets` | Attach Kubernetes image-pull Secrets to sandbox pods. Managed mode copies these explicitly named Secrets from the configured source namespace into each workspace namespace. In shared and operator modes, the Secrets must already exist in the sandbox namespace. |

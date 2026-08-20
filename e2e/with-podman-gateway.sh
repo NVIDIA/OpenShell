@@ -427,7 +427,7 @@ GATEWAY_CONFIG="${STATE_DIR}/gateway.toml"
 
 # Start from the RPM default template so this e2e test exercises the same TOML
 # config path that RPM users get on first start. The template leaves
-# bind_address unset and sets compute_drivers = ["podman"]. On Podman Machine,
+# bind_address unset and sets compute_driver = "podman". On Podman Machine,
 # the driver reserves IPv4 loopback for its callback-only listener, so the
 # primary listener uses IPv6 loopback. Native Linux keeps the IPv4 default.
 #
@@ -468,7 +468,7 @@ cp "${ROOT}/deploy/rpm/gateway.toml.default" "${GATEWAY_CONFIG}"
 
 GATEWAY_ARGS=(
   --config "${GATEWAY_CONFIG}"
-  # compute_drivers comes from the RPM template. Override the loopback address
+  # compute_driver comes from the RPM template. Override the loopback address
   # and port so Podman Machine can keep its IPv4 callback listener distinct.
   --bind-address "${PRIMARY_BIND_IP}"
   --port "${HOST_PORT}"

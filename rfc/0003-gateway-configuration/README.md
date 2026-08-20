@@ -72,10 +72,9 @@ metrics_bind_address  = "0.0.0.0:9090"     # optional; omit to disable
 # Logging
 log_level             = "info"
 
-# Compute drivers — list of driver names whose [openshell.drivers.<name>]
-# tables should be activated. When empty, the gateway auto-detects a driver
-# (kubernetes → podman → docker). VM is never auto-detected.
-compute_drivers       = ["kubernetes"]
+# Compute driver — exactly one driver may be active. When omitted, the gateway
+# auto-detects a driver (kubernetes → podman → docker). VM is never auto-detected.
+compute_driver        = "kubernetes"
 
 # Note: database_url is a secret and must be supplied via OPENSHELL_DB_URL
 # (or --db-url) — it is NOT permitted in the file.
@@ -113,7 +112,7 @@ scopes_claim  = ""                     # empty disables scope enforcement
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Compute drivers — each table is owned and parsed by its driver crate.
-# Only tables for drivers listed in compute_drivers are activated.
+# Only the selected or auto-detected driver's table is activated.
 # ──────────────────────────────────────────────────────────────────────────────
 
 [openshell.drivers.kubernetes]
@@ -172,7 +171,7 @@ Each `[openshell.drivers.<name>]` table is extracted from the parsed file and ha
 
 Driver authors define and own their config schema. Adding a new driver does not require changes to the gateway's core `Config` struct or to this RFC.
 
-`[openshell.drivers.<name>]` tables for drivers not listed in `compute_drivers` (and not the auto-detected driver) are parsed for syntax but not activated.
+`[openshell.drivers.<name>]` tables for drivers other than the selected or auto-detected driver are parsed for syntax but not activated.
 
 ### Merge semantics
 
@@ -209,11 +208,11 @@ The following cross-field validations are applied after merging file + env + CLI
 - `bind_address`, `health_bind_address`, and `metrics_bind_address` must all use distinct ports when set.
 - When `[openshell.gateway.tls]` is present, all three of `cert_path`, `key_path`, and `client_ca_path` must be present (either from the file or from CLI/env). Partial TLS configuration is an error.
 - `database_url` must be non-empty after merging env + CLI — every supported driver requires it. The field is not accepted from the file (see Secrets above).
-- `compute_drivers` may be empty; in that case the gateway falls back to auto-detection. If the list contains a driver name with no matching `[openshell.drivers.<name>]` table, the driver runs with its built-in defaults.
+- `compute_driver` selects exactly one driver. When omitted, the gateway falls back to auto-detection. A custom driver name with no matching `[openshell.drivers.<name>]` table runs with its built-in defaults. The legacy `compute_drivers` list remains accepted: an empty list auto-detects, a singleton selects that driver, and multiple entries retain the existing startup error.
 
 ### Backwards compatibility
 
-The existing CLI interface is fully preserved. All flags continue to work exactly as before. The `--config` flag is new and additive. `OPENSHELL_DB_URL` remains a required process input (it is not accepted from the file).
+The existing CLI interface is fully preserved. All flags continue to work exactly as before. The `--config` flag is new and additive. `OPENSHELL_DB_URL` remains a required process input (it is not accepted from the file). Legacy `compute_drivers = ["<driver>"]` TOML remains accepted, while canonical configurations use the singular `compute_driver = "<driver>"`.
 
 ### Example: minimal Kubernetes deployment
 
@@ -222,8 +221,8 @@ The existing CLI interface is fully preserved. All flags continue to work exactl
 version = 1
 
 [openshell.gateway]
-bind_address    = "0.0.0.0:8080"
-compute_drivers = ["kubernetes"]
+bind_address  = "0.0.0.0:8080"
+compute_driver = "kubernetes"
 # database_url comes from env (e.g. valueFrom.secretKeyRef).
 # No [openshell.gateway.tls] → plaintext listener (gateway runs behind Envoy / ingress).
 
@@ -250,7 +249,7 @@ gateway:
     bind_address: "0.0.0.0:8080"
     health_bind_address: "0.0.0.0:8081"
     metrics_bind_address: "0.0.0.0:9090"
-    compute_drivers: ["kubernetes"]
+    compute_driver: "kubernetes"
     drivers:
       kubernetes:
         namespace: agents
@@ -298,5 +297,5 @@ No part of this RFC has shipped yet. The work breaks down as:
 1. **Schema versioning** — the `version` field is reserved but not acted on. Should the parser reject files with `version > 1`, or just warn? Define this before the first stable release.
 2. **Directory-based config (`conf.d` pattern)** — a `--config-dir` flag that globs all `*.toml` files in a directory, sorts them alphabetically, and deep-merges them in order (later files win per key). CLI/env overrides still sit above everything. This maps cleanly to Kubernetes: a base `ConfigMap` as `10-base.toml`, driver config as `20-kubernetes.toml`, and credentials from a projected `Secret` as `90-credentials.toml` — all mounted into the same directory without a monolithic file. This is the approach taken by cri-o and kubelet, inspired by systemd's `conf.d` convention.
 
-   Deferred to a follow-on: the single `--config` file is sufficient for v1, and the directory loader can be added without any schema changes. Before implementing, three design decisions must be settled: (a) whether `--config` and `--config-dir` are mutually exclusive or composable (and if so which takes lower precedence); (b) whether a later file's array value (e.g. `compute_drivers`) replaces or appends — replace is simpler and less surprising; (c) `deny_unknown_fields` validation must apply to the final merged result rather than each individual file, since partial drop-in files won't contain all sections.
+   Deferred to a follow-on: the single `--config` file is sufficient for v1, and the directory loader can be added without any schema changes. Before implementing, three design decisions must be settled: (a) whether `--config` and `--config-dir` are mutually exclusive or composable (and if so which takes lower precedence); (b) whether a later file's array value (for example `credential_drivers`) replaces or appends — replace is simpler and less surprising; (c) `deny_unknown_fields` validation must apply to the final merged result rather than each individual file, since partial drop-in files won't contain all sections.
 3. **OIDC secret hygiene (revisit)** — `database_url` is excluded from the file schema (resolved). OIDC settings are allowed for v1 since the listed fields are identifiers, not credentials. If we add OIDC fields that *are* credentials in the future (e.g. a client secret for confidential-client flows), they should join the env-only list at that point. Re-evaluate once the OIDC surface stabilises.

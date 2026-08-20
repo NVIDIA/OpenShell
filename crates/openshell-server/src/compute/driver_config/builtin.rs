@@ -195,6 +195,45 @@ service_account_name = "sandbox-sa"
     }
 
     #[test]
+    fn kubernetes_canonical_and_legacy_field_locations_are_equivalent() {
+        let legacy: config_file::ConfigFile = toml::from_str(
+            r#"
+[openshell.gateway]
+sandbox_namespace = "sandboxes"
+service_account_name = "sandbox-sa"
+enable_user_namespaces = true
+
+[openshell.drivers.kubernetes]
+"#,
+        )
+        .expect("legacy config");
+        let canonical: config_file::ConfigFile = toml::from_str(
+            r#"
+[openshell.drivers.kubernetes]
+namespace = "sandboxes"
+service_account_name = "sandbox-sa"
+enable_user_namespaces = true
+"#,
+        )
+        .expect("canonical config");
+
+        let legacy_cfg =
+            kubernetes_config_from_context(test_context(Some(&legacy))).expect("legacy config");
+        let canonical_cfg = kubernetes_config_from_context(test_context(Some(&canonical)))
+            .expect("canonical config");
+
+        assert_eq!(legacy_cfg.namespace, canonical_cfg.namespace);
+        assert_eq!(
+            legacy_cfg.service_account_name,
+            canonical_cfg.service_account_name
+        );
+        assert_eq!(
+            legacy_cfg.enable_user_namespaces,
+            canonical_cfg.enable_user_namespaces
+        );
+    }
+
+    #[test]
     fn podman_config_reads_bind_mount_opt_in_from_driver_table() {
         let file: config_file::ConfigFile = toml::from_str(
             r"

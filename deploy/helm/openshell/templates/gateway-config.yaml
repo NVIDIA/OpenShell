@@ -45,7 +45,6 @@ data:
     {{- if $credentialDrivers }}
     credential_drivers    = [{{- range $i, $driver := $credentialDrivers }}{{ if $i }}, {{ end }}{{ $driver | quote }}{{- end }}]
     {{- end }}
-    sandbox_namespace     = {{ include "openshell.sandboxNamespace" . | quote }}
     {{- $policyValidationFailureMode := .Values.server.policyValidationFailureMode }}
     {{- if not (has $policyValidationFailureMode (list "fail_closed" "retain_last_valid")) }}
     {{- fail "server.policyValidationFailureMode must be fail_closed or retain_last_valid" }}
@@ -57,9 +56,6 @@ data:
     {{- end }}
     {{- if .Values.server.hostGatewayIP }}
     host_gateway_ip       = {{ .Values.server.hostGatewayIP | quote }}
-    {{- end }}
-    {{- if .Values.server.enableUserNamespaces }}
-    enable_user_namespaces = true
     {{- end }}
     {{- if .Values.server.disableTls }}
     disable_tls            = true
@@ -135,10 +131,14 @@ data:
     {{- end }}
 
     [openshell.drivers.kubernetes]
+    namespace                    = {{ include "openshell.sandboxNamespace" . | quote }}
     workspace_mode               = {{ .Values.server.drivers.kubernetes.workspaceMode | default "shared" | quote }}
     gateway_id                   = {{ .Values.server.sandboxJwt.gatewayId | default (include "openshell.fullname" .) | quote }}
     grpc_endpoint                = {{ include "openshell.grpcEndpoint" . | quote }}
     service_account_name         = {{ include "openshell.sandboxServiceAccountName" . | quote }}
+    {{- if .Values.server.enableUserNamespaces }}
+    enable_user_namespaces       = true
+    {{- end }}
     {{- if .Values.server.drivers.kubernetes.operatorNamespaceLabel }}
     operator_namespace_label     = {{ .Values.server.drivers.kubernetes.operatorNamespaceLabel | quote }}
     {{- end }}

@@ -1786,6 +1786,22 @@ enable_loopback_service_http = false
     }
 
     #[test]
+    fn canonical_and_legacy_file_driver_selectors_merge_equivalently() {
+        for input in [
+            "[openshell.gateway]\ncompute_driver = \"podman\"\n",
+            "[openshell.gateway]\ncompute_drivers = [\"podman\"]\n",
+        ] {
+            let (mut args, matches) =
+                parse_with_args(&["openshell-gateway", "--db-url", "sqlite::memory:"]);
+            let file = config_file_from_toml(input);
+
+            merge_file_into_args(&mut args, &file.openshell.gateway, &matches);
+
+            assert_eq!(args.drivers, vec!["podman".to_string()]);
+        }
+    }
+
+    #[test]
     fn server_config_preparation_ignores_unselected_driver_tables() {
         let _lock = ENV_LOCK
             .lock()
