@@ -66,6 +66,11 @@ fn sandbox_with_phase_ws(
     phase: proto::SandboxPhase,
     workspace: &str,
 ) -> proto::Sandbox {
+    let created_from_workload_template =
+        (name == "from-template").then(|| proto::SandboxWorkloadTemplateProvenance {
+            name: "python".to_string(),
+            resource_version: "7".to_string(),
+        });
     proto::Sandbox {
         metadata: Some(proto::datamodel::v1::ObjectMeta {
             id: format!("id-{name}"),
@@ -82,7 +87,7 @@ fn sandbox_with_phase_ws(
             phase: phase.into(),
             ..Default::default()
         }),
-        ..proto::Sandbox::default()
+        created_from_workload_template,
     }
 }
 
@@ -1004,6 +1009,21 @@ async fn get_sandbox_sends_name_and_maps_phase() {
 
     let observed = state.last_get_name.lock().await.clone();
     assert_eq!(observed.as_deref(), Some("my-box"));
+}
+
+#[tokio::test]
+async fn get_sandbox_preserves_workload_template_provenance() {
+    let state = Arc::new(MockState::default());
+    let endpoint = start_mock(state.clone()).await;
+    let client = connect(&endpoint).await;
+
+    let sandbox = client.get_sandbox("from-template").await.unwrap();
+
+    let provenance = sandbox
+        .created_from_workload_template
+        .expect("template provenance");
+    assert_eq!(provenance.name, "python");
+    assert_eq!(provenance.resource_version, "7");
 }
 
 #[tokio::test]
