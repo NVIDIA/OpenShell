@@ -86,6 +86,7 @@ tests:
               - create
               - delete
               - get
+              - patch
 
   - it: grants ReplicaSet get for proxy-pod supervisor token bootstrap
     template: templates/role.yaml

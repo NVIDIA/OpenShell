@@ -50,9 +50,10 @@ rules:
   # Service, and one CA Secret per sandbox. All are owner-referenced to the
   # Sandbox CR for garbage collection. The gateway also reads the generated
   # ReplicaSet during K8s ServiceAccount bootstrap to verify the supervisor
-  # pod's Pod -> ReplicaSet -> Deployment -> Sandbox owner chain. These
-  # permissions are only rendered when the Kubernetes driver is configured for
-  # proxy-pod topology.
+  # pod's Pod -> ReplicaSet -> Deployment -> Sandbox owner chain. `patch` on
+  # deployments scales the paired supervisor to zero when the sandbox stops and
+  # back to one when it starts. These permissions are only rendered when the
+  # Kubernetes driver is configured for proxy-pod topology.
   - apiGroups:
       - apps
     resources:
@@ -61,6 +62,7 @@ rules:
       - create
       - delete
       - get
+      - patch
   - apiGroups:
       - apps
     resources:

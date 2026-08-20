@@ -1663,6 +1663,57 @@ impl KubernetesComputeDriver {
         Ok(())
     }
 
+    /// Scale a sandbox's paired supervisor `Deployment`.
+    ///
+    /// The supervisor runs in its own `Deployment`, so it does not stop when
+    /// the agent pod does. Without this, a stopped sandbox keeps consuming a
+    /// pod slot, CPU, and memory indefinitely.
+    ///
+    /// Failures are logged and swallowed. A supervisor that fails to scale down
+    /// wastes resources but does not break the stop; a supervisor that fails to
+    /// scale up is retried by the agent pod's connection attempts and surfaces
+    /// as a normal readiness failure. Neither should fail the caller's
+    /// start/stop RPC.
+    async fn scale_proxy_pod_supervisor(&self, sandbox_name: &str, namespace: &str, replicas: u32) {
+        if self.config.topology != SupervisorTopology::ProxyPod {
+            return;
+        }
+        let names = proxy_pod_resource_names(sandbox_name);
+        let deployments: Api<Deployment> = Api::namespaced(self.client.clone(), namespace);
+        let patch = serde_json::json!({"spec": {"replicas": replicas}});
+        let result = tokio::time::timeout(
+            KUBE_API_TIMEOUT,
+            deployments.patch(
+                &names.supervisor_deployment,
+                &PatchParams::apply("openshell-driver-kubernetes").force(),
+                &Patch::Merge(&patch),
+            ),
+        )
+        .await;
+        match result {
+            Ok(Ok(_)) => info!(
+                sandbox_name = %sandbox_name,
+                deployment = %names.supervisor_deployment,
+                replicas,
+                "Scaled proxy-pod supervisor Deployment"
+            ),
+            Ok(Err(err)) => warn!(
+                sandbox_name = %sandbox_name,
+                deployment = %names.supervisor_deployment,
+                replicas,
+                error = %err,
+                "Failed to scale proxy-pod supervisor Deployment"
+            ),
+            Err(_elapsed) => warn!(
+                sandbox_name = %sandbox_name,
+                deployment = %names.supervisor_deployment,
+                replicas,
+                timeout_secs = KUBE_API_TIMEOUT.as_secs(),
+                "Timed out scaling proxy-pod supervisor Deployment"
+            ),
+        }
+    }
+
     async fn cleanup_proxy_pod_resources(&self, sandbox_name: &str, namespace: &str) {
         let names = proxy_pod_resource_names(sandbox_name);
         let secrets: Api<Secret> = Api::namespaced(self.client.clone(), namespace);
@@ -1704,8 +1755,34 @@ impl KubernetesComputeDriver {
         let (agent_sandbox_api, kube_name, pod_name, namespace, stop_timeout) = self
             .patch_sandbox_operating_state(sandbox_id, false)
             .await?;
+        let stopped = self
+            .wait_for_sandbox_stopped(
+                &agent_sandbox_api,
+                &kube_name,
+                &pod_name,
+                &namespace,
+                stop_timeout,
+            )
+            .await;
+        // Scale the paired supervisor down only once the workload has actually
+        // stopped, so a graceful shutdown that needs egress still has it.
+        if stopped.is_ok() {
+            self.scale_proxy_pod_supervisor(&kube_name, &namespace, 0)
+                .await;
+        }
+        stopped
+    }
+
+    async fn wait_for_sandbox_stopped(
+        &self,
+        agent_sandbox_api: &AgentSandboxApi,
+        kube_name: &str,
+        pod_name: &str,
+        namespace: &str,
+        stop_timeout: Duration,
+    ) -> Result<(), KubernetesDriverError> {
         let legacy_pod_api = (agent_sandbox_api.resource.version == SANDBOX_VERSION_V1ALPHA1)
-            .then(|| Api::<Pod>::namespaced(self.client.clone(), &namespace));
+            .then(|| Api::<Pod>::namespaced(self.client.clone(), namespace));
 
         let deadline = tokio::time::Instant::now() + stop_timeout;
         let mut poll_interval = STOP_INITIAL_POLL_INTERVAL;
@@ -1720,7 +1797,7 @@ impl KubernetesComputeDriver {
             let request_timeout = KUBE_API_TIMEOUT.min(deadline.saturating_duration_since(now));
             let object = tokio::time::timeout(
                 request_timeout,
-                agent_sandbox_api.api.get(&kube_name),
+                agent_sandbox_api.api.get(kube_name),
             )
             .await
             .map_err(|_| {
@@ -1737,7 +1814,7 @@ impl KubernetesComputeDriver {
                 return Err(KubernetesDriverError::Message(error));
             }
             if let Some(pod_api) = legacy_pod_api.as_ref()
-                && kubernetes_sandbox_pod_is_gone(pod_api, &pod_name, deadline)
+                && kubernetes_sandbox_pod_is_gone(pod_api, pod_name, deadline)
                     .await
                     .map_err(KubernetesDriverError::Message)?
             {
@@ -1756,9 +1833,11 @@ impl KubernetesComputeDriver {
     }
 
     pub async fn start_sandbox(&self, sandbox_id: &str) -> Result<(), KubernetesDriverError> {
-        self.patch_sandbox_operating_state(sandbox_id, true)
-            .await
-            .map(|_| ())
+        let (_api, kube_name, _pod_name, namespace, _timeout) =
+            self.patch_sandbox_operating_state(sandbox_id, true).await?;
+        self.scale_proxy_pod_supervisor(&kube_name, &namespace, 1)
+            .await;
+        Ok(())
     }
 
     async fn patch_sandbox_operating_state(
