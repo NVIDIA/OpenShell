@@ -20,6 +20,8 @@ use std::time::Duration;
 use openshell_e2e::harness::binary::{openshell_bin, openshell_cmd};
 use openshell_e2e::harness::output::strip_ansi;
 
+const DURABLE_MAIN_SCRIPT: &str = r#"echo "$1"; exec sleep infinity"#;
+
 fn kube_context() -> String {
     std::env::var("OPENSHELL_E2E_KUBE_CONTEXT_ACTIVE")
         .expect("OPENSHELL_E2E_KUBE_CONTEXT_ACTIVE must be set")
@@ -147,7 +149,10 @@ async fn managed_creates_namespace_with_labels() {
         "--name",
         "mgd-sb",
         "--",
-        "echo",
+        "sh",
+        "-c",
+        DURABLE_MAIN_SCRIPT,
+        "_",
         "managed-ok",
     ])
     .await;
@@ -279,7 +284,10 @@ async fn managed_namespace_survives_with_remaining_sandboxes() {
         "--name",
         "sb-a",
         "--",
-        "echo",
+        "sh",
+        "-c",
+        DURABLE_MAIN_SCRIPT,
+        "_",
         "a",
     ])
     .await;
@@ -293,7 +301,10 @@ async fn managed_namespace_survives_with_remaining_sandboxes() {
         "--name",
         "sb-b",
         "--",
-        "echo",
+        "sh",
+        "-c",
+        DURABLE_MAIN_SCRIPT,
+        "_",
         "b",
     ])
     .await;
@@ -355,7 +366,10 @@ async fn managed_isolates_workspaces_into_separate_namespaces() {
         "--name",
         "sb-iso-a",
         "--",
-        "echo",
+        "sh",
+        "-c",
+        DURABLE_MAIN_SCRIPT,
+        "_",
         "a",
     ])
     .await;
@@ -369,7 +383,10 @@ async fn managed_isolates_workspaces_into_separate_namespaces() {
         "--name",
         "sb-iso-b",
         "--",
-        "echo",
+        "sh",
+        "-c",
+        DURABLE_MAIN_SCRIPT,
+        "_",
         "b",
     ])
     .await;
@@ -444,7 +461,10 @@ async fn managed_workspace_delete_removes_namespace() {
         "--name",
         "del-sb",
         "--",
-        "echo",
+        "sh",
+        "-c",
+        DURABLE_MAIN_SCRIPT,
+        "_",
         "del-ok",
     ])
     .await;
@@ -516,7 +536,10 @@ async fn managed_tls_secret_copied_to_namespace() {
         "--name",
         "tls-sb",
         "--",
-        "echo",
+        "sh",
+        "-c",
+        DURABLE_MAIN_SCRIPT,
+        "_",
         "tls-ok",
     ])
     .await;
@@ -582,7 +605,10 @@ async fn managed_rejects_namespace_owned_by_different_gateway() {
         "--name",
         "conflict-sb",
         "--",
-        "echo",
+        "sh",
+        "-c",
+        DURABLE_MAIN_SCRIPT,
+        "_",
         "nope",
     ])
     .await;
@@ -612,7 +638,10 @@ async fn managed_full_lifecycle_with_multiple_sandboxes() {
         "--name",
         "lc-a",
         "--",
-        "echo",
+        "sh",
+        "-c",
+        DURABLE_MAIN_SCRIPT,
+        "_",
         "a",
     ])
     .await;
@@ -626,7 +655,10 @@ async fn managed_full_lifecycle_with_multiple_sandboxes() {
         "--name",
         "lc-b",
         "--",
-        "echo",
+        "sh",
+        "-c",
+        DURABLE_MAIN_SCRIPT,
+        "_",
         "b",
     ])
     .await;
@@ -705,7 +737,10 @@ async fn managed_stop_waits_for_workspace_pod_to_disappear() {
         "--name",
         sandbox,
         "--",
-        "echo",
+        "sh",
+        "-c",
+        DURABLE_MAIN_SCRIPT,
+        "_",
         "ready",
     ])
     .await;
@@ -754,7 +789,10 @@ async fn managed_rejects_invalid_dns1123_sandbox_name() {
         "--name",
         "my_bad_name",
         "--",
-        "echo",
+        "sh",
+        "-c",
+        DURABLE_MAIN_SCRIPT,
+        "_",
         "nope",
     ])
     .await;
@@ -775,7 +813,10 @@ async fn managed_rejects_invalid_dns1123_sandbox_name() {
         "--name",
         "MyBadName",
         "--",
-        "echo",
+        "sh",
+        "-c",
+        DURABLE_MAIN_SCRIPT,
+        "_",
         "nope",
     ])
     .await;
@@ -793,7 +834,10 @@ async fn managed_rejects_invalid_dns1123_sandbox_name() {
         "--name",
         "trailing-",
         "--",
-        "echo",
+        "sh",
+        "-c",
+        DURABLE_MAIN_SCRIPT,
+        "_",
         "nope",
     ])
     .await;

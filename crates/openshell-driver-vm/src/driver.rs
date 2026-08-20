@@ -4489,9 +4489,14 @@ fn build_guest_environment(
         openshell_core::sandbox_env::SSH_SOCKET_PATH.to_string(),
         GUEST_SSH_SOCKET_PATH.to_string(),
     );
+    // The libkrun guest environment path does not preserve spaces in values
+    // before guest startup. Use a whitespace-free base64url envelope so
+    // command arguments remain lossless.
     let main_process =
-        openshell_core::sandbox_env::MainProcessConfig::encode_driver_spec(sandbox.spec.as_ref())
-            .expect("main process config serialization cannot fail");
+        openshell_core::sandbox_env::MainProcessConfig::encode_driver_spec_base64url(
+            sandbox.spec.as_ref(),
+        )
+        .expect("main process config serialization cannot fail");
     environment.insert(
         openshell_core::sandbox_env::MAIN_PROCESS_SPEC.to_string(),
         main_process,
@@ -7094,6 +7099,43 @@ mod tests {
             main,
             openshell_core::sandbox_env::MainProcessConfig::scratch()
         );
+    }
+
+    #[test]
+    fn build_guest_environment_preserves_main_command_spaces() {
+        let config = VmDriverConfig {
+            openshell_endpoint: "https://127.0.0.1:8080".to_string(),
+            ..Default::default()
+        };
+        let command = vec![
+            "sh".to_string(),
+            "-lc".to_string(),
+            "echo ready; while true; do sleep 1; done".to_string(),
+        ];
+        let sandbox = Sandbox {
+            id: "space-command".to_string(),
+            name: "space-command".to_string(),
+            spec: Some(SandboxSpec {
+                command: command.clone(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let env = build_guest_environment(&sandbox, &config, None);
+        let encoded = env
+            .iter()
+            .find_map(|entry| {
+                entry.strip_prefix(&format!(
+                    "{}=",
+                    openshell_core::sandbox_env::MAIN_PROCESS_SPEC
+                ))
+            })
+            .expect("main process environment");
+
+        assert!(!encoded.contains(char::is_whitespace));
+        let main = openshell_core::sandbox_env::MainProcessConfig::decode(encoded).unwrap();
+        assert_eq!(main.command, command);
     }
 
     #[test]

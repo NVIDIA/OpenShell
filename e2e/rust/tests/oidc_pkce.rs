@@ -28,6 +28,8 @@ use url::Url;
 
 static SANDBOX_LIFECYCLE_LOCK: Mutex<()> = Mutex::const_new(());
 
+const DURABLE_MAIN_SCRIPT: &str = r#"echo "$1"; exec sleep infinity"#;
+
 #[derive(Clone, Copy)]
 struct IdentityScenario {
     gateway_name: &'static str,
@@ -913,7 +915,10 @@ async fn workspace_user_cannot_create_sandbox_in_another_workspace() {
             "oidc-xcreate-denied",
             "--no-tty",
             "--",
-            "echo",
+            "sh",
+            "-c",
+            DURABLE_MAIN_SCRIPT,
+            "_",
             "denied",
         ],
     )
@@ -1384,7 +1389,10 @@ async fn assert_can_create_sandbox(session: &LoginSession, workspace: &str, sand
             sandbox_name,
             "--no-tty",
             "--",
-            "echo",
+            "sh",
+            "-c",
+            DURABLE_MAIN_SCRIPT,
+            "_",
             &marker,
         ],
     )
@@ -1431,7 +1439,10 @@ async fn assert_can_delete_sandbox(session: &LoginSession, workspace: &str, sand
             sandbox_name,
             "--no-tty",
             "--",
-            "echo",
+            "sh",
+            "-c",
+            DURABLE_MAIN_SCRIPT,
+            "_",
             &marker,
         ],
     )
