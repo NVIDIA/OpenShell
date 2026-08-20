@@ -84,7 +84,8 @@ The driver injects gateway callback configuration, sandbox identity, TLS client
 material, and the supervisor SSH socket path into the workload. Driver-owned
 values must override image-provided environment variables.
 
-Sandbox pods run as `service_account_name` and keep
+Sandbox pods run as `service_account_name`, or as an account the caller
+selected from `selectable_service_account_names` and keep
 `automountServiceAccountToken: false`. The only Kubernetes token exposed to the
 supervisor is an explicit, audience-bound projected token mounted at
 `/var/run/secrets/openshell/token` for the one-shot `IssueSandboxToken`

@@ -264,9 +264,25 @@ server:
       # mutating admission policy or an external controller that owns the
       # sandbox pods. Names are matched exactly and ignore the namespace, so
       # under managed and operator workspace modes an entry is accepted in
-      # every namespace the gateway accepts. Empty (default) accepts only the
-      # driver's own sandbox ServiceAccount.
+      # every namespace the gateway accepts. Empty (default) adds nothing to the
+      # accepted set.
       additionalBootstrapServiceAccountNames: []
+      # -- ServiceAccount names a caller may request for an individual sandbox
+      # through SandboxTemplate.service_account_name. These are also accepted
+      # for bootstrap, since a sandbox running as one has to authenticate.
+      # Kept separate from additionalBootstrapServiceAccountNames on purpose:
+      # accepting an identity that something else assigns is not the same
+      # decision as letting any caller ask to run as it. The driver's own
+      # sandbox ServiceAccount is selectable whenever it is set. Empty
+      # (default) leaves the driver default as the only account a caller can
+      # request.
+      #
+      # Every member is available to every caller who can create a sandbox;
+      # selection is not scoped per caller or per workspace. The accounts must
+      # already exist in each namespace the gateway uses, so this suits
+      # workspace_mode shared or operator rather than managed, where namespaces
+      # are created on demand.
+      selectableServiceAccountNames: []
   # -- Disable TLS entirely - the server listens on plaintext HTTP.
   # Set to true when a reverse proxy / tunnel terminates TLS at the edge.
   disableTls: false

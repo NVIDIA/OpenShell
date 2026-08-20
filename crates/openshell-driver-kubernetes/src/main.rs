@@ -236,6 +236,12 @@ async fn main() -> Result<()> {
             // Bootstrap TokenReview runs in the gateway, which reads its own
             // `[openshell.drivers.kubernetes]` table for the accepted set.
             additional_bootstrap_service_account_names: Vec::new(),
+            // This binary has no config file and no flag for the selectable
+            // set, and resolution runs in the driver, so per-sandbox selection
+            // is unavailable out-of-process: any account other than
+            // --sandbox-service-account is rejected. Selection needs the
+            // gateway's built-in driver, which reads the TOML table.
+            selectable_service_account_names: Vec::new(),
             default_image: args.sandbox_image.unwrap_or_default(),
             image_pull_policy: args.sandbox_image_pull_policy.unwrap_or_default(),
             image_pull_secrets: args.sandbox_image_pull_secrets,

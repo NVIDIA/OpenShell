@@ -75,7 +75,7 @@ use tonic::transport::Endpoint;
 use tonic::{Code, Request, Status};
 #[cfg(unix)]
 use tower::service_fn;
-use tracing::{Instrument as _, debug, info, warn};
+use tracing::{Instrument as _, debug, error, info, warn};
 
 type DriverWatchStream = Pin<Box<dyn Stream<Item = Result<WatchSandboxesEvent, Status>> + Send>>;
 type SharedComputeDriver =
@@ -3307,6 +3307,18 @@ fn driver_sandbox_template_from_public(
     template: &SandboxTemplate,
     driver_name: &str,
 ) -> Result<DriverSandboxTemplate, Box<Status>> {
+    // Only the Kubernetes driver has ServiceAccounts. Rejecting here names the
+    // field the caller actually set: the Docker and VM drivers refuse any
+    // populated `platform_config` with a message that does not, and the Podman
+    // driver ignores it entirely, which would acknowledge a request to confine
+    // a sandbox to an identity and then quietly not do it.
+    if !template.service_account_name.is_empty() && driver_name != "kubernetes" {
+        return Err(Box::new(Status::invalid_argument(format!(
+            "template.service_account_name is only supported by the kubernetes compute driver; \
+             this gateway runs the '{driver_name}' driver"
+        ))));
+    }
+
     Ok(DriverSandboxTemplate {
         image: template.image.clone(),
         agent_socket_path: template.agent_socket.clone(),
@@ -3393,6 +3405,17 @@ fn build_platform_config(template: &SandboxTemplate) -> Option<prost_types::Stru
             "runtime_class_name".to_string(),
             Value {
                 kind: Some(Kind::StringValue(template.runtime_class_name.clone())),
+            },
+        );
+    }
+
+    // Forwarded verbatim; the Kubernetes driver decides whether the requested
+    // account is selectable and rejects the create if it is not.
+    if !template.service_account_name.is_empty() {
+        fields.insert(
+            "service_account_name".to_string(),
+            Value {
+                kind: Some(Kind::StringValue(template.service_account_name.clone())),
             },
         );
     }
@@ -8578,6 +8601,61 @@ mod tests {
                 "{driver_name} should not receive stable-running startup reconciliation"
             );
         }
+    }
+
+    /// The requested account has to reach the driver, which is the only layer
+    /// that knows which accounts an operator made selectable.
+    #[test]
+    fn build_platform_config_forwards_requested_service_account() {
+        use prost_types::value::Kind;
+
+        let template = SandboxTemplate {
+            service_account_name: "openshell-sandbox-3".to_string(),
+            ..SandboxTemplate::default()
+        };
+        let config = build_platform_config(&template).expect("config should be Some");
+        assert_eq!(
+            config
+                .fields
+                .get("service_account_name")
+                .and_then(|v| v.kind.clone()),
+            Some(Kind::StringValue("openshell-sandbox-3".to_string()))
+        );
+    }
+
+    /// Only the Kubernetes driver has `ServiceAccount`s. The other drivers must
+    /// not silently ignore the request (Podman) or fail with a message naming
+    /// `platform_config`, which the caller never set (Docker, VM).
+    #[test]
+    fn driver_template_rejects_a_service_account_request_for_other_drivers() {
+        let template = SandboxTemplate {
+            service_account_name: "openshell-sandbox-3".to_string(),
+            ..SandboxTemplate::default()
+        };
+
+        for driver in ["podman", "docker", "vm"] {
+            let err = driver_sandbox_template_from_public(&template, driver)
+                .expect_err("only the kubernetes driver supports the field");
+            assert_eq!(err.code(), Code::InvalidArgument);
+            assert!(
+                err.message().contains("service_account_name"),
+                "{}",
+                err.message()
+            );
+            assert!(err.message().contains(driver), "{}", err.message());
+        }
+
+        assert!(driver_sandbox_template_from_public(&template, "kubernetes").is_ok());
+    }
+
+    #[test]
+    fn build_platform_config_omits_an_unset_service_account() {
+        let template = SandboxTemplate {
+            runtime_class_name: "gvisor".to_string(),
+            ..SandboxTemplate::default()
+        };
+        let config = build_platform_config(&template).expect("config should be Some");
+        assert!(!config.fields.contains_key("service_account_name"));
     }
 
     #[test]

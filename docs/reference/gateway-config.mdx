@@ -457,6 +457,9 @@ service_account_name           = "openshell-sandbox"
 # service_account_name. Only needed when something other than the driver
 # assigns the pod's ServiceAccount. Matched exactly, namespace-independent.
 # additional_bootstrap_service_account_names = ["openshell-sandbox-2"]
+# ServiceAccounts a caller may request per sandbox via
+# SandboxTemplate.service_account_name. Also accepted at bootstrap.
+# selectable_service_account_names = ["openshell-sandbox-restricted"]
 default_image                  = "ghcr.io/nvidia/openshell/sandbox:latest"
 image_pull_policy              = "IfNotPresent"
 image_pull_secrets             = ["regcred"]

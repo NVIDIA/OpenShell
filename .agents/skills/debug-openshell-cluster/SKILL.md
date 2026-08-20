@@ -443,7 +443,12 @@ Check the accepted sandbox service accounts when TokenReview bootstrap or
 sandbox registration fails. Helm creates a dedicated sandbox service account by
 default and writes it to `[openshell.drivers.kubernetes].service_account_name`;
 the gateway rejects projected tokens from any service account outside that name
-plus `additional_bootstrap_service_account_names`.
+plus `additional_bootstrap_service_account_names` and
+`selectable_service_account_names`. A create that fails with
+`service_account_name '<name>' is not selectable` is asking for an account
+missing from `selectable_service_account_names`; the gateway log records the
+requested name and the selectable set. The `gateway.toml` dump below shows both
+settings.
 
 ```bash
 helm -n openshell get values openshell | grep -A3 sandboxServiceAccount

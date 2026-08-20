@@ -208,6 +208,7 @@ service_account_name = "sandbox-sa"
 namespace = "sandboxes"
 service_account_name = "sandbox-sa"
 additional_bootstrap_service_account_names = ["sandbox-alt", "sandbox-legacy"]
+selectable_service_account_names = ["sandbox-selectable"]
 "#,
         )
         .expect("valid config");
@@ -218,6 +219,11 @@ additional_bootstrap_service_account_names = ["sandbox-alt", "sandbox-legacy"]
             vec!["sandbox-alt".to_string(), "sandbox-legacy".to_string()]
         );
 
+        assert_eq!(
+            cfg.selectable_service_account_names,
+            vec!["sandbox-selectable".to_string()]
+        );
+
         let validator = crate::auth::k8s_sa::ServiceAccountValidator::from_kubernetes_config(&cfg);
         assert!(
             validator.accepts("sandbox-sa"),
@@ -225,7 +231,23 @@ additional_bootstrap_service_account_names = ["sandbox-alt", "sandbox-legacy"]
         );
         assert!(validator.accepts("sandbox-alt"));
         assert!(validator.accepts("sandbox-legacy"));
+        assert!(
+            validator.accepts("sandbox-selectable"),
+            "an account a caller may select has to authenticate"
+        );
         assert!(!validator.accepts("sandbox-other"));
+
+        // The selectable key governs what a caller may ask for; the
+        // bootstrap-only key must not.
+        assert_eq!(
+            cfg.resolve_pod_service_account(Some("sandbox-selectable"))
+                .unwrap(),
+            "sandbox-selectable"
+        );
+        assert!(
+            cfg.resolve_pod_service_account(Some("sandbox-alt"))
+                .is_err()
+        );
     }
 
     #[test]

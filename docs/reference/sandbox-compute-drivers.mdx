@@ -365,6 +365,7 @@ For maintainer-level implementation details, refer to the [Kubernetes driver REA
 | `[openshell.drivers.kubernetes].namespace` | `server.sandboxNamespace` | Set the namespace for sandbox resources. The Helm chart defaults to the release namespace when left empty. |
 | `service_account_name` | `sandboxServiceAccount.name` | Set the Kubernetes service account assigned to sandbox pods and accepted by the gateway TokenReview bootstrap path. The Helm chart creates a dedicated sandbox service account by default. |
 | `additional_bootstrap_service_account_names` | `server.drivers.kubernetes.additionalBootstrapServiceAccountNames` | Accept additional service accounts when a sandbox bootstraps, on top of `service_account_name`. A pod spec has a single `serviceAccountName` field, so this is a separate setting rather than a list form of that one. Set it where something other than the driver assigns the pod's service account, such as a mutating admission policy or an external controller that owns the sandbox pods. Empty by default. Refer to [ServiceAccount Bootstrap Identities](#serviceaccount-bootstrap-identities). |
+| `selectable_service_account_names` | `server.drivers.kubernetes.selectableServiceAccountNames` | Service accounts a caller may request for a single sandbox through `SandboxTemplate.service_account_name`, and which are therefore also accepted at bootstrap. Separate from `additional_bootstrap_service_account_names`, because accepting an identity that something else assigns is a different decision from letting any caller ask to run as it. The driver's own `service_account_name` is always selectable. Empty by default, which means no caller can choose. Refer to [ServiceAccount Bootstrap Identities](#serviceaccount-bootstrap-identities). |
 | `default_image` | `server.sandboxImage` | Set the default sandbox image. |
 | `image_pull_policy` | `server.sandboxImagePullPolicy` | Set the Kubernetes image pull policy for sandbox pods. |
 | `image_pull_secrets` | `server.sandboxImagePullSecrets` | Attach Kubernetes image-pull Secrets to sandbox pods. Managed mode copies these explicitly named Secrets from the configured source namespace into each workspace namespace. In shared and operator modes, the Secrets must already exist in the sandbox namespace. |
@@ -440,17 +441,22 @@ A sandbox bootstraps by presenting its projected ServiceAccount token to
 `TokenReview` API, requires it to be pod-bound, and requires the authenticated
 principal to be a ServiceAccount the operator accepts.
 
-Two distinct settings control which accounts those are.
+Three settings control which accounts those are.
 
 | Setting | Purpose |
 |---|---|
 | `service_account_name` | The ServiceAccount the driver assigns to sandbox pods. Accepted for bootstrap whenever it is set. |
 | `additional_bootstrap_service_account_names` | Further ServiceAccounts accepted for bootstrap. Never assigned to pods. |
+| `selectable_service_account_names` | ServiceAccounts a caller may request per sandbox. Also accepted for bootstrap. |
 
-They are separate settings because a pod spec has a single `serviceAccountName`
-field, so a list has no valid rendering into it. Leave the additional list
-empty, which is the default, and the gateway accepts only the ServiceAccount it
-assigns. That is the behavior of releases before this setting existed.
+`additional_bootstrap_service_account_names` is a separate setting rather than
+a list form of `service_account_name` because a pod spec has a single
+`serviceAccountName` field, so a list has no valid rendering into it.
+`selectable_service_account_names` is separate for a different reason, covered
+under [Selecting an Account Per Sandbox](#selecting-an-account-per-sandbox).
+Leave both lists empty, which is the default, and the gateway accepts only the
+ServiceAccount the driver assigns. That is the behavior of releases before
+these settings existed.
 
 Add names when something other than the driver decides the pod's
 ServiceAccount, such as a mutating admission policy, an external controller
@@ -473,12 +479,15 @@ K8s ServiceAccount bootstrap authenticator enabled accepted_service_accounts={"o
 [openshell.drivers.kubernetes]
 service_account_name = "openshell-sandbox"
 additional_bootstrap_service_account_names = ["openshell-sandbox-2"]
+selectable_service_account_names = ["openshell-sandbox-restricted"]
 ```
 
 Names are matched exactly. Prefixes and wildcards are not supported, and
-entries are neither validated as DNS-1123 names nor checked against existing
-ServiceAccounts, so a typo surfaces only as a rejected bootstrap. Surrounding
-whitespace is trimmed. Matching also ignores the namespace, which is validated
+surrounding whitespace is trimmed. Entries are validated as Kubernetes
+ServiceAccount names at gateway startup, so a malformed name fails the gateway
+rather than surfacing later, but nothing checks that the account exists: a
+well-formed name that was never created surfaces as a rejected bootstrap, or as
+a pod the apiserver refuses to admit if a caller selects it. Matching also ignores the namespace, which is validated
 separately against the active `workspace_mode`, so under managed and operator
 modes a name is accepted in every namespace the gateway accepts. Adding a name
 does not widen which namespaces may bootstrap.
@@ -494,7 +503,65 @@ to bootstrap a sandbox on this gateway.
 
 The bootstrap authenticator is constructed only when the gateway runs in-cluster
 with sandbox JWT issuing enabled. If the startup record above is absent, the
-bootstrap path is disabled and these settings have no effect.
+bootstrap path is disabled and the two acceptance lists have no effect.
+`selectable_service_account_names` still applies, because the driver enforces
+it when it renders the pod.
+
+#### Selecting an Account Per Sandbox
+
+`selectable_service_account_names` lets a caller choose which account a single
+sandbox runs as:
+
+```json
+{
+  "spec": {
+    "template": {
+      "image": "ghcr.io/nvidia/openshell/sandbox:latest",
+      "serviceAccountName": "openshell-sandbox-restricted"
+    }
+  }
+}
+```
+
+There is no CLI flag for this field, so gRPC or an SDK is the only way to set
+it.
+
+The driver resolves the pod's account when it validates the create, before the
+gateway persists anything. Omitting the field uses `service_account_name`. A
+value naming a selectable account uses that account. Anything else fails with
+`InvalidArgument`, including a value that is present but blank, rather than
+falling back to the default: a sandbox silently running as a different identity
+than the caller asked for surfaces much later as a confusing cloud IAM denial.
+
+The two lists are opted into separately.
+
+| Configured in | Assigned by | A caller may request it |
+|---|---|---|
+| `service_account_name` | the driver, on any pod that does not select another | yes |
+| `additional_bootstrap_service_account_names` | something outside the driver | no |
+| `selectable_service_account_names` | the driver, when requested | yes |
+
+So accepting an account so an externally-owned pod can bootstrap does not also
+make it requestable. Since a ServiceAccount is the identity cloud
+workload-identity systems attach permissions to, treat
+`selectable_service_account_names` as the set of cloud identities any caller who
+can create a sandbox may assume, and scope its members accordingly. Selection
+is not restricted per caller or per workspace, so on a multi-tenant gateway any
+tenant may request any account in that set.
+
+Three further constraints:
+
+- The accounts must already exist in every namespace the gateway creates
+  sandboxes in. The driver creates only `service_account_name`, so a selected
+  account that is missing yields a pod the apiserver refuses to admit. Under
+  `workspace_mode = "managed"` namespaces are created on demand, so an operator
+  cannot pre-create accounts in them; selection suits `shared` and `operator`
+  mode.
+- Selection requires the gateway's built-in Kubernetes driver. A separately
+  deployed driver process reads its own flags, which do not include these
+  lists, so it rejects every request that names a non-default account.
+- Only the Kubernetes driver supports the field. The gateway rejects a request
+  that sets it when another compute driver is active.
 
 ### Kubernetes Driver Config PVC Mounts
 
