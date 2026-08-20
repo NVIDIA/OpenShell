@@ -258,6 +258,16 @@ template resource limits. Docker and Podman apply them as runtime limits.
 Kubernetes mirrors each limit into the matching request. VM accepts the fields
 but currently ignores them.
 
+Reusable sandbox workload templates are resolved before the compute-driver
+boundary. Drivers do not receive a separate template resource; the gateway
+lowers the selected `SandboxWorkloadTemplate` into the existing sandbox spec
+and validates that spec before calling `ValidateSandboxCreate` or
+`CreateSandbox`. Template CPU and memory become the same typed resource limits
+described above. Template GPU settings become `ResourceRequirements`, preserving
+the driver's default GPU assignment when the count is omitted. Template
+`driver_config` remains a driver-keyed envelope until the compute layer selects
+the active driver block and forwards only that block to the driver.
+
 Docker and Podman also accept per-sandbox driver-config mounts for existing
 runtime-managed named volumes and tmpfs mounts. Podman additionally accepts
 image mounts through its image-volume API. User-supplied bind and volume mounts

@@ -259,6 +259,12 @@ own DNS view, e.g. DoH tunneled via CONNECT, is a possible future
 enhancement and out of scope.) The workload child's proxy variables are
 unaffected — they are always rewritten to point at the local policy proxy.
 
+Template environment is treated like user-provided sandbox environment. It can
+shape the workload child, but it cannot override driver-controlled identity,
+gateway callback, TLS, relay socket, proxy, provider, or supervisor coordination
+variables. Drivers and the supervisor rewrite those reserved values after image
+and template environment are considered.
+
 The configuration is fail-closed: a setting that is present but invalid — an
 empty value, an unsupported or malformed proxy URL, an unreadable auth file or
 CA bundle, a malformed credential, or an auth file, `NO_PROXY` list, or CA
