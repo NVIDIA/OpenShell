@@ -1171,11 +1171,10 @@ dependencies = [
 
 [[package]]
 name = "container-device-interface"
-version = "1.1.1"
-source = "git+https://github.com/cncf-tags/container-device-interface-rs?rev=06644c1b167c8dcc247816590901e0a819636b01#06644c1b167c8dcc247816590901e0a819636b01"
+version = "1.2.0"
+source = "git+https://github.com/cncf-tags/container-device-interface-rs?rev=b8a056e92dbd159423c129cd306c93e410651b18#b8a056e92dbd159423c129cd306c93e410651b18"
 dependencies = [
  "anyhow",
- "clap",
  "const_format",
  "jsonschema",
  "lazy_static",
@@ -2680,7 +2679,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.6.3",
+ "socket2 0.5.10",
  "tokio",
  "tower-service",
  "tracing",
@@ -3148,8 +3147,6 @@ dependencies = [
  "percent-encoding",
  "referencing",
  "regex",
- "reqwest 0.13.2",
- "rustls 0.23.38",
  "serde",
  "serde_json",
  "unicode-general-category",
@@ -3891,7 +3888,7 @@ version = "5.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "51e219e79014df21a225b1860a479e2dcd7cbd9130f4defd4bd0e191ea31d67d"
 dependencies = [
- "base64 0.22.1",
+ "base64 0.21.7",
  "chrono",
  "getrandom 0.2.17",
  "http 1.4.0",
@@ -5560,7 +5557,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash 2.1.2",
  "rustls 0.23.38",
- "socket2 0.6.3",
+ "socket2 0.5.10",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -5599,9 +5596,9 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.6.3",
+ "socket2 0.5.10",
  "tracing",
- "windows-sys 0.60.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -5918,10 +5915,8 @@ checksum = "ab3f43e3283ab1488b624b44b0e988d0acea0b3214e694730a055cb6b2efa801"
 dependencies = [
  "base64 0.22.1",
  "bytes",
- "futures-channel",
  "futures-core",
  "futures-util",
- "h2 0.4.13",
  "http 1.4.0",
  "http-body 1.0.1",
  "http-body-util",

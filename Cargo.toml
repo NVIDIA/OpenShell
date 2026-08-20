@@ -78,7 +78,7 @@ rustix = { version = "1.1", features = ["process"] }
 socket2 = "0.6"
 
 # Serialization
-container-device-interface = { git = "https://github.com/cncf-tags/container-device-interface-rs", rev = "06644c1b167c8dcc247816590901e0a819636b01" }
+container-device-interface = { git = "https://github.com/cncf-tags/container-device-interface-rs", rev = "b8a056e92dbd159423c129cd306c93e410651b18" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yml = "0.0.12"
