@@ -219,8 +219,7 @@ version = 1
 
 [openshell.gateway]
 name = "${GATEWAY_NAME}"
-compute_drivers = ["podman"]
-default_image = "${SANDBOX_IMAGE}"
+compute_driver = "podman"
 disable_tls = true
 
 [openshell.gateway.auth]
@@ -234,6 +233,7 @@ gateway_id = "${GATEWAY_NAME}"
 ttl_secs = 3600
 
 [openshell.drivers.podman]
+default_image = "${SANDBOX_IMAGE}"
 supervisor_image = "${SUPERVISOR_IMAGE}"
 image_pull_policy = "$(podman_pull_policy "${SANDBOX_IMAGE_PULL_POLICY}")"
 EOF

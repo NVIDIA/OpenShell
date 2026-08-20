@@ -25,4 +25,4 @@ version = 1
 # Pin to the Podman compute driver. Without this, the gateway auto-detects
 # in order: Kubernetes, Podman, Docker. Pinning prevents unexpected driver
 # selection if Docker is also installed on the host.
-compute_drivers = ["podman"]
+compute_driver = "podman"

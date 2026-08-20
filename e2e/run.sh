@@ -142,7 +142,14 @@ if ! gateway_config="$(resolve_file "${gateway_config_source}")"; then
 fi
 gateway_driver="$(python3 -c '
 import sys, tomllib
-print(tomllib.load(open(sys.argv[1], "rb"))["openshell"]["gateway"]["compute_drivers"][0])
+gateway = tomllib.load(open(sys.argv[1], "rb"))["openshell"]["gateway"]
+driver = gateway.get("compute_driver")
+if driver is None:
+    drivers = gateway.get("compute_drivers", [])
+    driver = drivers[0] if drivers else None
+if not driver:
+    raise SystemExit("gateway config must explicitly select a compute driver")
+print(driver)
 ' "${gateway_config}")"
 if [[ ! ${suite_name} =~ ^[a-z0-9][a-z0-9-]*$ ]]; then
 	die "suite name must contain only lowercase letters, digits, and hyphens: ${suite_name}"

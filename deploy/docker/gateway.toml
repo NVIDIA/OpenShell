@@ -30,7 +30,7 @@ version = 1
 bind_address        = "127.0.0.1:8080"
 health_bind_address = "127.0.0.1:8081"
 log_level           = "info"
-compute_drivers     = ["docker"]
+compute_driver      = "docker"
 disable_tls         = true
 
 [openshell.drivers.docker]

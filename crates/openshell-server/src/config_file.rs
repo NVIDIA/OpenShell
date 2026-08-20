@@ -31,7 +31,8 @@ use openshell_core::{
     GatewayAuthConfig, GatewayInterceptorConfig, GatewayJwtConfig,
     GatewayProviderProfileSourceConfig, MtlsAuthConfig, OidcConfig, TlsConfig,
 };
-use serde::{Deserialize, Serialize};
+use serde::de::{SeqAccess, Visitor};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 /// Latest schema version this build understands.
 pub const SCHEMA_VERSION: u32 = 1;
@@ -104,7 +105,18 @@ pub struct GatewayFileSection {
     pub log_level: Option<String>,
 
     // ── Drivers ──────────────────────────────────────────────────────────
-    #[serde(default)]
+    /// Canonical TOML uses the singular `compute_driver = "..."`. The legacy
+    /// `compute_drivers = ["..."]` form remains accepted and is normalized to
+    /// this existing vector representation so Rust callers and runtime
+    /// validation retain their current behavior.
+    #[serde(
+        default,
+        rename = "compute_driver",
+        alias = "compute_drivers",
+        deserialize_with = "deserialize_compute_drivers",
+        serialize_with = "serialize_compute_drivers",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub compute_drivers: Option<Vec<String>>,
     #[serde(default)]
     pub credential_drivers: Option<Vec<String>>,
@@ -114,6 +126,9 @@ pub struct GatewayFileSection {
     pub credential_storage: Option<toml::Table>,
 
     // ── Sandbox / SSH ────────────────────────────────────────────────────
+    /// Compatibility input for Kubernetes `namespace` and Docker
+    /// `sandbox_label`. Canonical configurations set those driver-owned
+    /// fields in their respective `[openshell.drivers.<name>]` tables.
     #[serde(default)]
     pub sandbox_namespace: Option<String>,
     #[serde(default)]
@@ -142,10 +157,12 @@ pub struct GatewayFileSection {
     pub supervisor_image: Option<String>,
     #[serde(default)]
     pub client_tls_secret_name: Option<String>,
+    /// Compatibility input for Kubernetes `service_account_name`.
     #[serde(default)]
     pub service_account_name: Option<String>,
     #[serde(default)]
     pub host_gateway_ip: Option<String>,
+    /// Compatibility input for Kubernetes `enable_user_namespaces`.
     #[serde(default)]
     pub enable_user_namespaces: Option<bool>,
     /// Lifetime (seconds) of the projected `ServiceAccount` token kubelet
@@ -191,6 +208,62 @@ pub struct GatewayFileSection {
     // rejected in [`load`].
     #[serde(default)]
     pub database_url: Option<String>,
+}
+
+fn deserialize_compute_drivers<'de, D>(deserializer: D) -> Result<Option<Vec<String>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct ComputeDriversVisitor;
+
+    impl<'de> Visitor<'de> for ComputeDriversVisitor {
+        type Value = Option<Vec<String>>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("a compute driver name or an array of compute driver names")
+        }
+
+        fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(Some(vec![value.to_string()]))
+        }
+
+        fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(Some(vec![value]))
+        }
+
+        fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+        where
+            A: SeqAccess<'de>,
+        {
+            let mut drivers = Vec::new();
+            while let Some(driver) = sequence.next_element::<String>()? {
+                drivers.push(driver);
+            }
+            Ok(Some(drivers))
+        }
+    }
+
+    deserializer.deserialize_any(ComputeDriversVisitor)
+}
+
+fn serialize_compute_drivers<S>(
+    drivers: &Option<Vec<String>>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    match drivers {
+        Some(drivers) if drivers.len() == 1 => serializer.serialize_str(&drivers[0]),
+        Some(drivers) => drivers.serialize(serializer),
+        None => serializer.serialize_none(),
+    }
 }
 
 /// `[openshell.gateway.otlp]` section.
@@ -447,7 +520,7 @@ pub(crate) fn driver_table_with_inherited_keys(
     };
 
     for key in inheritable_keys {
-        if merged.contains_key(*key) {
+        if driver_field_is_present(&merged, key) {
             continue;
         }
         if let Some(value) = gateway_inherited_value(gateway, key) {
@@ -458,9 +531,16 @@ pub(crate) fn driver_table_with_inherited_keys(
     toml::Value::Table(merged)
 }
 
+fn driver_field_is_present(table: &toml::Table, key: &str) -> bool {
+    table.contains_key(key)
+        || (key == "sandbox_label" && table.contains_key("sandbox_namespace"))
+}
+
 fn gateway_inherited_value(g: &GatewayFileSection, key: &str) -> Option<toml::Value> {
     match key {
-        "namespace" | "sandbox_namespace" => g.sandbox_namespace.as_deref().map(string_value),
+        "namespace" | "sandbox_namespace" | "sandbox_label" => {
+            g.sandbox_namespace.as_deref().map(string_value)
+        }
         "default_image" => g.default_image.as_deref().map(string_value),
         "supervisor_image" => g.supervisor_image.as_deref().map(string_value),
         "client_tls_secret_name" => g.client_tls_secret_name.as_deref().map(string_value),
@@ -507,6 +587,86 @@ mod tests {
     }
 
     #[test]
+    fn canonical_compute_driver_scalar_normalizes_to_existing_vector() {
+        let file: ConfigFile = toml::from_str(
+            r#"
+[openshell.gateway]
+compute_driver = "docker"
+"#,
+        )
+        .expect("canonical compute driver parses");
+
+        assert_eq!(
+            file.openshell.gateway.compute_drivers,
+            Some(vec!["docker".to_string()])
+        );
+    }
+
+    #[test]
+    fn legacy_compute_drivers_list_remains_accepted() {
+        for (input, expected) in [
+            ("compute_drivers = []", Vec::<String>::new()),
+            ("compute_drivers = [\"docker\"]", vec!["docker".to_string()]),
+            (
+                "compute_drivers = [\"docker\", \"podman\"]",
+                vec!["docker".to_string(), "podman".to_string()],
+            ),
+        ] {
+            let file: ConfigFile = toml::from_str(&format!("[openshell.gateway]\n{input}\n"))
+                .expect("legacy compute drivers parse");
+            assert_eq!(file.openshell.gateway.compute_drivers, Some(expected));
+        }
+    }
+
+    #[test]
+    fn compute_driver_rejects_non_string_values_with_a_clear_error() {
+        let error = toml::from_str::<ConfigFile>(
+            r"
+[openshell.gateway]
+compute_driver = 42
+",
+        )
+        .expect_err("compute driver must be a string or string array");
+
+        assert!(
+            error
+                .to_string()
+                .contains("a compute driver name or an array of compute driver names")
+        );
+    }
+
+    #[test]
+    fn canonical_and_legacy_compute_driver_names_are_rejected_together() {
+        let error = toml::from_str::<ConfigFile>(
+            r#"
+[openshell.gateway]
+compute_driver = "docker"
+compute_drivers = ["docker"]
+"#,
+        )
+        .expect_err("canonical and legacy names must not both be accepted");
+
+        assert!(error.to_string().contains("duplicate field"));
+    }
+
+    #[test]
+    fn compute_driver_serialization_uses_canonical_scalar_name() {
+        let file = ConfigFile {
+            openshell: OpenShellRoot {
+                gateway: GatewayFileSection {
+                    compute_drivers: Some(vec!["docker".to_string()]),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        };
+
+        let serialized = toml::to_string(&file).expect("config serializes");
+        assert!(serialized.contains("compute_driver = \"docker\""));
+        assert!(!serialized.contains("compute_drivers"));
+    }
+
+    #[test]
     fn parses_full_example() {
         let toml = r#"
 [openshell]
@@ -516,7 +676,7 @@ version = 1
 bind_address = "0.0.0.0:8080"
 health_bind_address = "0.0.0.0:8081"
 log_level = "info"
-compute_drivers = ["kubernetes"]
+compute_driver = "kubernetes"
 credential_drivers = ["kubernetes-secrets"]
 sandbox_namespace = "agents"
 grpc_rate_limit_requests = 120
@@ -987,11 +1147,11 @@ version = 2
             "alpha",
             &gateway,
             None,
-            &["sandbox_namespace", "default_image", "host_gateway_ip"],
+            &["sandbox_label", "default_image", "host_gateway_ip"],
         );
         let table = merged.as_table().expect("table");
         assert_eq!(
-            table.get("sandbox_namespace").and_then(|v| v.as_str()),
+            table.get("sandbox_label").and_then(|v| v.as_str()),
             Some("agents")
         );
         assert_eq!(
@@ -1002,6 +1162,54 @@ version = 2
             table.get("host_gateway_ip").and_then(|v| v.as_str()),
             Some("10.0.0.1")
         );
+    }
+
+    #[test]
+    fn canonical_driver_label_overrides_legacy_gateway_default() {
+        let gateway = GatewayFileSection {
+            sandbox_namespace: Some("gateway-default".to_string()),
+            ..Default::default()
+        };
+        let raw = toml::toml! {
+            sandbox_label = "driver-specific"
+        };
+        let merged = driver_table_with_inherited_keys(
+            "docker",
+            &gateway,
+            Some(&toml::Value::Table(raw)),
+            &["sandbox_label"],
+        );
+        let table = merged.as_table().expect("table");
+        assert_eq!(
+            table.get("sandbox_label").and_then(toml::Value::as_str),
+            Some("driver-specific")
+        );
+        assert!(!table.contains_key("sandbox_namespace"));
+    }
+
+    #[test]
+    fn legacy_driver_label_suppresses_canonical_gateway_inheritance() {
+        let gateway = GatewayFileSection {
+            sandbox_namespace: Some("gateway-default".to_string()),
+            ..Default::default()
+        };
+        let raw = toml::toml! {
+            sandbox_namespace = "driver-specific"
+        };
+        let merged = driver_table_with_inherited_keys(
+            "docker",
+            &gateway,
+            Some(&toml::Value::Table(raw)),
+            &["sandbox_label"],
+        );
+        let table = merged.as_table().expect("table");
+        assert_eq!(
+            table
+                .get("sandbox_namespace")
+                .and_then(toml::Value::as_str),
+            Some("driver-specific")
+        );
+        assert!(!table.contains_key("sandbox_label"));
     }
 
     #[test]
@@ -1108,7 +1316,7 @@ version = 2
     ///   - template corruption or unknown fields (`deny_unknown_fields`)
     ///   - schema drift (version bump or field renames)
     ///   - accidental addition of a wildcard bind-address override
-    ///   - accidental changes to the compute driver list
+    ///   - accidental changes to the configured compute driver
     #[test]
     fn rpm_default_config_parses_and_has_podman_defaults() {
         let path =
@@ -1127,11 +1335,11 @@ version = 2
         let drivers = gw
             .compute_drivers
             .as_ref()
-            .expect("compute_drivers must be explicitly set in the RPM default config");
+            .expect("compute_driver must be explicitly set in the RPM default config");
         assert_eq!(
             drivers,
             &["podman".to_string()],
-            "RPM default must pin compute_drivers to [podman] to prevent unexpected \
+            "RPM default must pin compute_driver to podman to prevent unexpected \
              driver selection when Docker is also installed"
         );
     }

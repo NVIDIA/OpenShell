@@ -57,7 +57,7 @@ start_gateway() {
 version = 1
 
 [openshell.gateway]
-compute_drivers = ["vm"]
+compute_driver = "vm"
 disable_tls = true
 
 [openshell.drivers.vm]

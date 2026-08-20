@@ -20,7 +20,7 @@ The defaults are tuned for rootless Podman use:
 version = 1
 
 [openshell.gateway]
-compute_drivers = ["podman"]
+compute_driver = "podman"
 ```
 
 The RPM does not override `bind_address`. The primary listener uses the
@@ -28,7 +28,7 @@ built-in `127.0.0.1:17670` default. The Podman driver reports the callback
 interface it needs, and the gateway adds a separate listener scoped to that
 interface. This keeps the general API off unrelated host interfaces.
 
-`compute_drivers = ["podman"]` pins the compute driver to Podman. Without
+`compute_driver = "podman"` pins the compute driver to Podman. Without
 this, the gateway auto-detects in order: Kubernetes, Podman, Docker. Pinning
 prevents unexpected driver selection if Docker is also installed on the host.
 
@@ -215,7 +215,7 @@ overrides that persist across package upgrades.
 | TOML option | Default | Description |
 |-------------|---------|-------------|
 | `bind_address` | `127.0.0.1:17670` (gateway default) | Address for the primary gRPC/HTTP API listener. |
-| `compute_drivers` | `["podman"]` (RPM default) | When unset, the gateway auto-detects Kubernetes, then Podman, then Docker. The RPM default pins to Podman. |
+| `compute_driver` | `"podman"` (RPM default) | When unset, the gateway auto-detects Kubernetes, then Podman, then Docker. The RPM default pins to Podman. The legacy `compute_drivers` list remains accepted. |
 | `default_image` | `ghcr.io/nvidia/openshell-community/sandboxes/base:latest` | Default sandbox image. |
 | `supervisor_image` | `ghcr.io/nvidia/openshell/supervisor:latest` | Supervisor image mounted into Podman sandboxes. |
 | `guest_tls_ca`, `guest_tls_cert`, `guest_tls_key` | auto-generated paths | Client TLS material bind-mounted into sandbox containers. |
@@ -235,7 +235,7 @@ settings:
 version = 1
 
 [openshell.gateway]
-compute_drivers = ["podman"]
+compute_driver = "podman"
 default_image = "ghcr.io/nvidia/openshell-community/sandboxes/base:latest"
 
 [openshell.drivers.podman]
