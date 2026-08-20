@@ -24,6 +24,7 @@ use tracing::{debug, info, warn};
 pub struct BootstrapData {
     pub policy_proto: openshell_core::proto::SandboxPolicy,
     pub provider_env_revision: u64,
+    pub provider_env_generation: u64,
     pub provider_child_env: HashMap<String, String>,
     pub agent_proposals_enabled: bool,
     pub proxy_ca_cert_path: Option<PathBuf>,
@@ -49,6 +50,7 @@ pub struct ExpectedPeer {
 pub enum ControlUpdate {
     ProviderEnv {
         revision: u64,
+        generation: u64,
         provider_child_env: HashMap<String, String>,
     },
     Policy {
@@ -73,17 +75,22 @@ pub struct Publisher {
 
 impl Publisher {
     pub fn publish_provider_env(&self, revision: u64, provider_child_env: HashMap<String, String>) {
-        {
-            let mut state = self.state.write().expect("sidecar control state poisoned");
-            if revision <= state.provider_env_revision {
-                return;
-            }
-            state.provider_env_revision = revision;
-            state.provider_child_env.clone_from(&provider_child_env);
+        let mut state = self.state.write().expect("sidecar control state poisoned");
+        if revision == state.provider_env_revision {
+            return;
         }
+        state.provider_env_revision = revision;
+        state.provider_env_generation = state
+            .provider_env_generation
+            .checked_add(1)
+            .expect("sidecar provider environment generation overflow");
+        state.provider_child_env.clone_from(&provider_child_env);
 
+        // Keep generation assignment, bootstrap state, and publication under
+        // one lock so cloned publishers cannot emit generations out of order.
         let _ = self.updates.send(WireServerMessage::ProviderEnvUpdated {
             revision,
+            generation: state.provider_env_generation,
             provider_child_env,
         });
     }
@@ -177,6 +184,7 @@ enum WireServerMessage {
     BootstrapResponse {
         policy_proto: Vec<u8>,
         provider_env_revision: u64,
+        provider_env_generation: u64,
         provider_child_env: HashMap<String, String>,
         agent_proposals_enabled: bool,
         proxy_ca_cert_path: Option<String>,
@@ -184,6 +192,7 @@ enum WireServerMessage {
     },
     ProviderEnvUpdated {
         revision: u64,
+        generation: u64,
         provider_child_env: HashMap<String, String>,
     },
     PolicyUpdated {
@@ -206,6 +215,7 @@ impl BootstrapData {
         WireServerMessage::BootstrapResponse {
             policy_proto: self.policy_proto.encode_to_vec(),
             provider_env_revision: self.provider_env_revision,
+            provider_env_generation: self.provider_env_generation,
             provider_child_env: self.provider_child_env.clone(),
             agent_proposals_enabled: self.agent_proposals_enabled,
             proxy_ca_cert_path: self
@@ -227,6 +237,7 @@ impl TryFrom<WireServerMessage> for BootstrapData {
         let WireServerMessage::BootstrapResponse {
             policy_proto,
             provider_env_revision,
+            provider_env_generation,
             provider_child_env,
             agent_proposals_enabled,
             proxy_ca_cert_path,
@@ -245,6 +256,7 @@ impl TryFrom<WireServerMessage> for BootstrapData {
         Ok(Self {
             policy_proto,
             provider_env_revision,
+            provider_env_generation,
             provider_child_env,
             agent_proposals_enabled,
             proxy_ca_cert_path: proxy_ca_cert_path.map(PathBuf::from),
@@ -260,9 +272,11 @@ impl TryFrom<WireServerMessage> for ControlUpdate {
         match message {
             WireServerMessage::ProviderEnvUpdated {
                 revision,
+                generation,
                 provider_child_env,
             } => Ok(Self::ProviderEnv {
                 revision,
+                generation,
                 provider_child_env,
             }),
             WireServerMessage::PolicyUpdated {
@@ -675,6 +689,7 @@ mod tests {
                 ..SandboxPolicy::default()
             },
             provider_env_revision: 3,
+            provider_env_generation: 0,
             provider_child_env: env.clone(),
             agent_proposals_enabled: true,
             proxy_ca_cert_path: Some(PathBuf::from("/tmp/ca.pem")),
@@ -688,6 +703,7 @@ mod tests {
 
         assert_eq!(received.policy_proto.version, 7);
         assert_eq!(received.provider_env_revision, 3);
+        assert_eq!(received.provider_env_generation, 0);
         assert_eq!(received.provider_child_env, env);
         assert!(received.agent_proposals_enabled);
         assert_eq!(
@@ -701,6 +717,90 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn provider_env_updates_use_generation_not_fingerprint_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("control.sock");
+        let server = spawn_server(
+            &socket,
+            BootstrapData {
+                policy_proto: SandboxPolicy::default(),
+                provider_env_revision: u64::MAX,
+                provider_env_generation: 7,
+                provider_child_env: HashMap::from([("TOKEN".to_string(), "first".to_string())]),
+                agent_proposals_enabled: false,
+                proxy_ca_cert_path: None,
+                proxy_ca_bundle_path: None,
+            },
+            current_peer(),
+        )
+        .unwrap();
+        let publisher = server.publisher();
+        let (_bootstrap, mut connection) = connect_process_client(&socket, Duration::from_secs(1))
+            .await
+            .unwrap();
+
+        publisher.publish_provider_env(
+            1,
+            HashMap::from([("TOKEN".to_string(), "second".to_string())]),
+        );
+
+        let update = tokio::time::timeout(Duration::from_secs(1), connection.updates.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        match update {
+            ControlUpdate::ProviderEnv {
+                revision,
+                generation,
+                provider_child_env,
+            } => {
+                assert_eq!(revision, 1);
+                assert_eq!(generation, 8);
+                assert_eq!(
+                    provider_child_env.get("TOKEN").map(String::as_str),
+                    Some("second")
+                );
+            }
+            other => panic!("unexpected sidecar update: {other:?}"),
+        }
+
+        publisher.publish_provider_env(
+            1,
+            HashMap::from([("TOKEN".to_string(), "duplicate".to_string())]),
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), connection.updates.recv())
+                .await
+                .is_err(),
+            "an identical fingerprint must remain a no-op"
+        );
+
+        publisher.publish_provider_env(
+            u64::MAX,
+            HashMap::from([("TOKEN".to_string(), "third".to_string())]),
+        );
+        let update = tokio::time::timeout(Duration::from_secs(1), connection.updates.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        match update {
+            ControlUpdate::ProviderEnv {
+                revision,
+                generation,
+                provider_child_env,
+            } => {
+                assert_eq!(revision, u64::MAX);
+                assert_eq!(generation, 9);
+                assert_eq!(
+                    provider_child_env.get("TOKEN").map(String::as_str),
+                    Some("third")
+                );
+            }
+            other => panic!("unexpected sidecar update: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn agent_proposals_update_is_delivered_to_process_client() {
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("control.sock");
@@ -709,6 +809,7 @@ mod tests {
             BootstrapData {
                 policy_proto: SandboxPolicy::default(),
                 provider_env_revision: 0,
+                provider_env_generation: 0,
                 provider_child_env: HashMap::new(),
                 agent_proposals_enabled: false,
                 proxy_ca_cert_path: None,
@@ -749,6 +850,7 @@ mod tests {
             BootstrapData {
                 policy_proto: SandboxPolicy::default(),
                 provider_env_revision: 0,
+                provider_env_generation: 0,
                 provider_child_env: HashMap::new(),
                 agent_proposals_enabled: false,
                 proxy_ca_cert_path: None,
@@ -818,6 +920,7 @@ mod tests {
             BootstrapData {
                 policy_proto: SandboxPolicy::default(),
                 provider_env_revision: 0,
+                provider_env_generation: 0,
                 provider_child_env: HashMap::new(),
                 agent_proposals_enabled: false,
                 proxy_ca_cert_path: None,
@@ -852,6 +955,7 @@ mod tests {
             BootstrapData {
                 policy_proto: SandboxPolicy::default(),
                 provider_env_revision: 0,
+                provider_env_generation: 0,
                 provider_child_env: HashMap::new(),
                 agent_proposals_enabled: false,
                 proxy_ca_cert_path: None,
@@ -881,6 +985,7 @@ mod tests {
             BootstrapData {
                 policy_proto: SandboxPolicy::default(),
                 provider_env_revision: 0,
+                provider_env_generation: 0,
                 provider_child_env: HashMap::new(),
                 agent_proposals_enabled: false,
                 proxy_ca_cert_path: None,
@@ -911,6 +1016,7 @@ mod tests {
             BootstrapData {
                 policy_proto: SandboxPolicy::default(),
                 provider_env_revision: 0,
+                provider_env_generation: 0,
                 provider_child_env: HashMap::new(),
                 agent_proposals_enabled: false,
                 proxy_ca_cert_path: None,

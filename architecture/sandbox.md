@@ -121,6 +121,13 @@ partially active or last-known-good static set. Invalid metadata preserves the
 supplied dynamic snapshot, while a fetch failure preserves the currently active
 dynamic snapshot.
 
+In the Kubernetes sidecar topology, the provider environment revision remains
+an opaque content fingerprint and has no numeric ordering semantics. The
+network supervisor assigns a separate, connection-local monotonic generation
+to each distinct environment it publishes. The process supervisor applies only
+newer generations, which accepts descending fingerprint values while rejecting
+duplicate or delayed sidecar messages.
+
 Gateway-managed refresh credentials use an opaque workload handle derived from
 the sandbox, provider identity, credential key, refresh authorization epoch,
 and canonical endpoint boundary. The handle remains stable while the gateway

@@ -363,6 +363,9 @@ pub async fn run_sandbox(
         .as_ref()
         .map(|connection| connection.writer.clone());
     let process_exit_ack = Arc::new(tokio::sync::Mutex::new(None));
+    let initial_provider_env_generation = sidecar_bootstrap
+        .as_ref()
+        .map_or(0, |bootstrap| bootstrap.provider_env_generation);
     let mut process_control_closed = None;
     if let Some(connection) = process_control_connection {
         process_control_closed = Some(connection.closed);
@@ -371,6 +374,7 @@ pub async fn run_sandbox(
             provider_credentials.clone(),
             agent_proposals.clone(),
             Arc::clone(&process_exit_ack),
+            initial_provider_env_generation,
         );
     }
 
@@ -569,6 +573,7 @@ pub async fn run_sandbox(
             sidecar_control::BootstrapData {
                 policy_proto: proto.clone(),
                 provider_env_revision: provider_credentials.snapshot().revision,
+                provider_env_generation: 0,
                 provider_child_env: provider_env.clone(),
                 agent_proposals_enabled: agent_proposals.enabled(),
                 proxy_ca_cert_path: ca_paths.as_ref().map(|paths| paths.0.clone()),
@@ -1072,25 +1077,29 @@ fn spawn_sidecar_control_update_watcher(
     provider_credentials: ProviderCredentialState,
     agent_proposals: AgentProposals,
     exit_ack: MainProcessExitAckWaiter,
+    mut provider_env_generation: u64,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         while let Some(update) = updates.recv().await {
             match update {
                 sidecar_control::ControlUpdate::ProviderEnv {
                     revision,
+                    generation,
                     provider_child_env,
                 } => {
-                    if revision <= provider_credentials.snapshot().revision {
+                    if generation <= provider_env_generation {
                         continue;
                     }
                     let env_count = provider_credentials
                         .install_child_env_snapshot(revision, provider_child_env);
+                    provider_env_generation = generation;
                     ocsf_emit!(
                         ConfigStateChangeBuilder::new(ocsf_ctx())
                             .severity(SeverityId::Informational)
                             .status(StatusId::Success)
                             .state(StateId::Enabled, "loaded")
                             .unmapped("provider_env_revision", serde_json::json!(revision))
+                            .unmapped("provider_env_generation", serde_json::json!(generation))
                             .message(format!(
                                 "Sidecar provider environment refreshed [revision:{revision} env_count:{env_count}]"
                             ))
@@ -4350,21 +4359,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sidecar_control_provider_env_update_installs_newer_revision() {
+    async fn sidecar_control_provider_env_update_orders_by_generation() {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let provider_credentials = ProviderCredentialState::from_child_env_snapshot(
-            1,
+            u64::MAX,
             std::collections::HashMap::from([("TOKEN".to_string(), "old".to_string())]),
         );
+        let agent_proposals = AgentProposals::new(true);
         let handle = spawn_sidecar_control_update_watcher(
             rx,
             provider_credentials.clone(),
-            AgentProposals::default(),
+            agent_proposals.clone(),
             Arc::new(tokio::sync::Mutex::new(None)),
+            10,
         );
 
         tx.send(sidecar_control::ControlUpdate::ProviderEnv {
-            revision: 2,
+            revision: 1,
+            generation: 11,
             provider_child_env: std::collections::HashMap::from([(
                 "TOKEN".to_string(),
                 "new".to_string(),
@@ -4372,6 +4384,62 @@ mod tests {
         })
         .unwrap();
 
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if provider_credentials.snapshot().revision == 1 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let snapshot = provider_credentials.snapshot();
+        assert_eq!(snapshot.revision, 1);
+        assert_eq!(
+            snapshot.child_env.get("TOKEN").map(String::as_str),
+            Some("new")
+        );
+
+        tx.send(sidecar_control::ControlUpdate::ProviderEnv {
+            revision: 2,
+            generation: 11,
+            provider_child_env: std::collections::HashMap::from([(
+                "TOKEN".to_string(),
+                "duplicate-generation".to_string(),
+            )]),
+        })
+        .unwrap();
+        tx.send(sidecar_control::ControlUpdate::AgentProposals {
+            enabled: false,
+            config_revision: 1,
+        })
+        .unwrap();
+        timeout(Duration::from_secs(1), async {
+            while agent_proposals.enabled() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            provider_credentials
+                .snapshot()
+                .child_env
+                .get("TOKEN")
+                .map(String::as_str),
+            Some("new")
+        );
+
+        tx.send(sidecar_control::ControlUpdate::ProviderEnv {
+            revision: 2,
+            generation: 12,
+            provider_child_env: std::collections::HashMap::from([(
+                "TOKEN".to_string(),
+                "newest".to_string(),
+            )]),
+        })
+        .unwrap();
         timeout(Duration::from_secs(1), async {
             loop {
                 if provider_credentials.snapshot().revision == 2 {
@@ -4382,29 +4450,33 @@ mod tests {
         })
         .await
         .unwrap();
-        let snapshot = provider_credentials.snapshot();
-        assert_eq!(snapshot.revision, 2);
-        assert_eq!(
-            snapshot.child_env.get("TOKEN").map(String::as_str),
-            Some("new")
-        );
 
         tx.send(sidecar_control::ControlUpdate::ProviderEnv {
-            revision: 1,
+            revision: u64::MAX,
+            generation: 11,
             provider_child_env: std::collections::HashMap::from([(
                 "TOKEN".to_string(),
                 "stale".to_string(),
             )]),
         })
         .unwrap();
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        tx.send(sidecar_control::ControlUpdate::AgentProposals {
+            enabled: true,
+            config_revision: 2,
+        })
+        .unwrap();
+        timeout(Duration::from_secs(1), async {
+            while !agent_proposals.enabled() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let snapshot = provider_credentials.snapshot();
+        assert_eq!(snapshot.revision, 2);
         assert_eq!(
-            provider_credentials
-                .snapshot()
-                .child_env
-                .get("TOKEN")
-                .map(String::as_str),
-            Some("new")
+            snapshot.child_env.get("TOKEN").map(String::as_str),
+            Some("newest")
         );
         handle.abort();
     }
@@ -4420,6 +4492,7 @@ mod tests {
             provider_credentials,
             agent_proposals.clone(),
             Arc::new(tokio::sync::Mutex::new(None)),
+            0,
         );
 
         tx.send(sidecar_control::ControlUpdate::AgentProposals {

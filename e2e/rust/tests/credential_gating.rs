@@ -26,6 +26,14 @@ const TEST_HOST: &str = "host.openshell.internal";
 const TOKEN_ENV: &str = "E2E_GATING_TOKEN";
 const TEST_SECRET: &str = "e2e-gating-secret-value";
 const PLACEHOLDER_PREFIX: &str = "openshell:resolve:env:";
+const KEY_PRESENCE_SCRIPT: &str = r#"if [ "${E2E_GATING_TOKEN+x}" != x ]; then
+  echo TOKEN_ABSENT
+else
+  case "$E2E_GATING_TOKEN" in
+    openshell:resolve:env:*) echo TOKEN_PLACEHOLDER ;;
+    *) echo TOKEN_UNSAFE ;;
+  esac
+fi"#;
 const WEBSOCKET_GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
 async fn run_cli(args: &[&str]) -> (bool, String) {
@@ -709,6 +717,102 @@ async fn assert_gateway_admission(
     Ok(())
 }
 
+async fn wait_for_provider_key_presence(
+    sandbox: &SandboxGuard,
+    expected_present: bool,
+) -> Result<(), String> {
+    let expected = if expected_present {
+        "TOKEN_PLACEHOLDER"
+    } else {
+        "TOKEN_ABSENT"
+    };
+    let mut last_output = String::new();
+    for _ in 0..60 {
+        last_output = sandbox.exec(&["sh", "-lc", KEY_PRESENCE_SCRIPT]).await?;
+        if last_output.contains(expected) {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    Err(format!(
+        "provider environment did not converge to {expected}; last key-presence output:\n{last_output}"
+    ))
+}
+
+async fn assert_endpointless_provider_env_live_update(port: u16) -> Result<(), String> {
+    let unbound = write_policy(
+        port,
+        EndpointMode::RestBody { rewrite: false },
+        CredentialSource::ProviderProfile,
+    )?;
+    let bound = write_policy(
+        port,
+        EndpointMode::RestBody { rewrite: false },
+        CredentialSource::PolicyBinding,
+    )?;
+    let unbound_path = unbound
+        .path()
+        .to_str()
+        .ok_or_else(|| "unbound policy path is not UTF-8".to_string())?;
+    let bound_path = bound
+        .path()
+        .to_str()
+        .ok_or_else(|| "bound policy path is not UTF-8".to_string())?;
+
+    let mut sandbox = SandboxGuard::create_keep_with_args(
+        &[
+            "--policy",
+            unbound_path,
+            "--provider",
+            PROVIDER_NAME,
+            "--no-tty",
+        ],
+        &["sh", "-c", "echo PROVIDER_UPDATE_READY && sleep infinity"],
+        "PROVIDER_UPDATE_READY",
+    )
+    .await?;
+
+    let result = async {
+        wait_for_provider_key_presence(&sandbox, false).await?;
+
+        let (success, output) = run_cli(&[
+            "policy",
+            "set",
+            &sandbox.name,
+            "--policy",
+            bound_path,
+            "--wait",
+            "--timeout",
+            "120",
+        ])
+        .await;
+        if !success {
+            return Err(format!("binding policy update failed:\n{output}"));
+        }
+        wait_for_provider_key_presence(&sandbox, true).await?;
+
+        let (success, output) = run_cli(&[
+            "policy",
+            "set",
+            &sandbox.name,
+            "--policy",
+            unbound_path,
+            "--wait",
+            "--timeout",
+            "120",
+        ])
+        .await;
+        if !success {
+            return Err(format!("unbinding policy update failed:\n{output}"));
+        }
+        wait_for_provider_key_presence(&sandbox, false).await
+    }
+    .await;
+
+    sandbox.cleanup().await;
+    result
+}
+
 async fn run_body_sandbox(
     port: u16,
     mode: EndpointMode,
@@ -835,6 +939,7 @@ async fn credentialed_endpoint_gates_work_end_to_end() {
         assert_eq!(observations.len(), 3, "observations: {observations:?}");
         assert!(!observations[2].saw_placeholder);
         assert!(!observations[2].saw_secret);
+        assert_endpointless_provider_env_live_update(server.port).await?;
         Ok::<(), String>(())
     }
     .await;
