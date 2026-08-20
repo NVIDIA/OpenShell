@@ -9,7 +9,7 @@ use crate::main_session::{MainOutput, MainSession};
 use crate::managed_children;
 use crate::process::{
     ProcessEnforcementMode, ResolvedProcessIdentity, ResolvedWorkspace,
-    drop_privileges_with_identity, is_supervisor_only_env_var,
+    drop_privileges_with_identity, is_supervisor_only_env_var, session_user_and_home,
 };
 use crate::sandbox;
 use miette::{IntoDiagnostic, Result};
@@ -910,38 +910,6 @@ impl Default for PtyRequest {
             pixel_height: 0,
         }
     }
-}
-
-/// Derive the session USER and HOME from the policy's `run_as_user`.
-///
-/// For name-based identities, looks up the home directory via `/etc/passwd`
-/// (or defaults to `/home/{user}`).
-///
-/// For numeric UIDs, there is no passwd entry, so the default remains
-/// `("{uid}", "/sandbox")`. Docker replaces that default with its resolved
-/// image workspace.
-fn session_user_and_home(policy: &SandboxPolicy, workdir_home: Option<&str>) -> (String, String) {
-    let (user, default_home) = match policy.process.run_as_user.as_deref() {
-        Some(user) if !user.is_empty() => {
-            // Numeric UID — no passwd entry expected; use default HOME.
-            if user.parse::<u32>().is_ok() {
-                (user.to_string(), "/sandbox".to_string())
-            } else {
-                // Name-based identity — look up home from /etc/passwd.
-                let home = nix::unistd::User::from_name(user)
-                    .ok()
-                    .flatten()
-                    .map_or_else(
-                        || format!("/home/{user}"),
-                        |u| u.dir.to_string_lossy().into_owned(),
-                    );
-                (user.to_string(), home)
-            }
-        }
-        _ => ("sandbox".to_string(), "/sandbox".to_string()),
-    };
-    let home = workdir_home.map_or(default_home, str::to_string);
-    (user, home)
 }
 
 #[allow(clippy::too_many_arguments)]

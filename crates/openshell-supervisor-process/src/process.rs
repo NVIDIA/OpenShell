@@ -187,6 +187,67 @@ fn inject_provider_env(cmd: &mut Command, provider_env: &HashMap<String, String>
     }
 }
 
+/// Derive the child USER and HOME from the policy's sandbox identity.
+///
+/// Name-based identities use their passwd entry. Numeric identities have no
+/// reliable passwd entry, so their workspace remains the portable fallback.
+pub(crate) fn session_user_and_home(
+    policy: &SandboxPolicy,
+    workdir_home: Option<&str>,
+) -> (String, String) {
+    let (user, default_home) = match policy.process.run_as_user.as_deref() {
+        Some(user) if !user.is_empty() => {
+            if user.parse::<u32>().is_ok() {
+                (user.to_string(), "/sandbox".to_string())
+            } else {
+                let home = User::from_name(user).ok().flatten().map_or_else(
+                    || format!("/home/{user}"),
+                    |entry| entry.dir.to_string_lossy().into_owned(),
+                );
+                (user.to_string(), home)
+            }
+        }
+        _ => ("sandbox".to_string(), "/sandbox".to_string()),
+    };
+    let home = workdir_home.map_or(default_home, str::to_string);
+    (user, home)
+}
+
+fn apply_canonical_process_environment(
+    cmd: &mut Command,
+    policy: &SandboxPolicy,
+    workspace: &ResolvedWorkspace,
+    interactive: bool,
+    user_environment: &HashMap<String, String>,
+) {
+    let (session_user, session_home) = session_user_and_home(policy, workspace.home());
+
+    for (key, value) in [
+        ("HOME", session_home.as_str()),
+        ("USER", session_user.as_str()),
+        ("SHELL", "/bin/bash"),
+        (
+            "TERM",
+            if interactive {
+                "xterm-256color"
+            } else {
+                "dumb"
+            },
+        ),
+    ] {
+        if !user_environment.contains_key(key) {
+            cmd.env(key, value);
+        }
+    }
+}
+
+fn configured_user_environment() -> HashMap<String, String> {
+    std::env::var(openshell_core::sandbox_env::USER_ENVIRONMENT)
+        .ok()
+        .and_then(|json| serde_json::from_str(&json).ok())
+        .unwrap_or_default()
+}
+
 #[cfg(unix)]
 pub fn harden_child_process() -> Result<()> {
     use rustix::process::{Resource, Rlimit, setrlimit};
@@ -688,12 +749,16 @@ impl ProcessHandle {
         strip_supervisor_only_env(&mut cmd);
 
         inject_provider_env(&mut cmd, provider_env);
+        apply_canonical_process_environment(
+            &mut cmd,
+            policy,
+            workspace,
+            interactive,
+            &configured_user_environment(),
+        );
 
         if let Some(dir) = workspace.root() {
             cmd.current_dir(dir);
-        }
-        if let Some(home) = workspace.home() {
-            cmd.env("HOME", home);
         }
 
         if matches!(policy.network.mode, NetworkMode::Proxy) {
@@ -883,12 +948,16 @@ impl ProcessHandle {
         strip_supervisor_only_env(&mut cmd);
 
         inject_provider_env(&mut cmd, provider_env);
+        apply_canonical_process_environment(
+            &mut cmd,
+            policy,
+            workspace,
+            interactive,
+            &configured_user_environment(),
+        );
 
         if let Some(dir) = workspace.root() {
             cmd.current_dir(dir);
-        }
-        if let Some(home) = workspace.home() {
-            cmd.env("HOME", home);
         }
 
         if matches!(policy.network.mode, NetworkMode::Proxy) {
@@ -2341,6 +2410,42 @@ mod tests {
             landlock: LandlockPolicy::default(),
             process,
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn canonical_tty_environment_replaces_supervisor_identity_defaults() {
+        let current_user = User::from_uid(nix::unistd::geteuid())
+            .expect("look up current user")
+            .expect("current user entry");
+        let policy = policy_with_process(ProcessPolicy {
+            run_as_user: Some(current_user.name.clone()),
+            run_as_group: None,
+        });
+        let workspace = ResolvedWorkspace::default();
+        let mut cmd = Command::new("/usr/bin/env");
+        cmd.env_clear()
+            .env("HOME", "/root")
+            .env("TERM", "dumb")
+            .stdout(StdStdio::piped());
+
+        apply_canonical_process_environment(&mut cmd, &policy, &workspace, true, &HashMap::new());
+
+        let output = cmd.output().await.expect("run environment probe");
+        assert!(output.status.success());
+        let environment = String::from_utf8(output.stdout).expect("environment is UTF-8");
+        let variables: HashMap<_, _> = environment
+            .lines()
+            .filter_map(|line| line.split_once('='))
+            .collect();
+
+        assert_eq!(
+            variables.get("HOME"),
+            Some(&current_user.dir.to_string_lossy().as_ref())
+        );
+        assert_eq!(variables.get("USER"), Some(&current_user.name.as_str()));
+        assert_eq!(variables.get("SHELL"), Some(&"/bin/bash"));
+        assert_eq!(variables.get("TERM"), Some(&"xterm-256color"));
     }
 
     /// Unknown names may yield `Ok(None)` (`… not found …`) or `Err` when NSS fails first

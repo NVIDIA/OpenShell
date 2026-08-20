@@ -268,6 +268,42 @@ async fn canonical_main_exit_transitions_persistent_sandbox_to_error() {
 }
 
 #[tokio::test]
+async fn canonical_tty_main_uses_sandbox_environment() {
+    let script = r#"printf 'canonical_env home=%s user=%s term=%s\n' "$HOME" "$USER" "$TERM"; while true; do sleep 1; done"#;
+    let mut sandbox =
+        SandboxGuard::create_keep_with_args(&["--tty"], &["sh", "-lc", script], "canonical_env")
+            .await
+            .expect("create canonical TTY process");
+
+    let output = normalize_output(&sandbox.create_output);
+    let environment = output
+        .lines()
+        .find(|line| line.contains("canonical_env"))
+        .expect("canonical environment output");
+    let field = |name: &str| {
+        environment
+            .split_whitespace()
+            .find_map(|value| value.strip_prefix(&format!("{name}=")))
+            .unwrap_or_default()
+    };
+
+    assert!(
+        !field("home").is_empty() && field("home") != "/root",
+        "canonical process must not inherit the supervisor HOME: {environment}"
+    );
+    assert!(
+        !field("user").is_empty(),
+        "canonical process USER must identify the sandbox user: {environment}"
+    );
+    assert!(
+        !field("term").is_empty() && field("term") != "dumb",
+        "canonical TTY process must receive a usable TERM: {environment}"
+    );
+
+    sandbox.cleanup().await;
+}
+
+#[tokio::test]
 async fn canonical_main_disconnect_reconnect_replays_history_for_same_process() {
     const FIRST_MARKER: &str = "sequence=0001";
     let script = r#"n=1; while true; do printf 'main_pid=%s sequence=%04d\n' "$$" "$n"; n=$((n + 1)); sleep 0.2; done"#;
