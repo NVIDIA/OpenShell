@@ -123,3 +123,110 @@ impl Stream for SameUidUnixIncoming {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    use tokio_stream::StreamExt;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn bind_private_creates_private_socket_and_cleanup_removes_it() {
+        let temp_dir = tempfile::tempdir().expect("create temporary directory");
+        let socket_dir = temp_dir.path().join("driver");
+        let socket_path = socket_dir.join("compute.sock");
+
+        let listener = bind_private(&socket_path).expect("bind private socket");
+
+        let directory_mode = std::fs::metadata(&socket_dir)
+            .expect("stat socket directory")
+            .permissions()
+            .mode()
+            & 0o777;
+        let socket_mode = std::fs::metadata(&socket_path)
+            .expect("stat socket")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(directory_mode, 0o700);
+        assert_eq!(socket_mode, 0o600);
+
+        drop(listener);
+        let cleanup = SocketCleanup::new(socket_path.clone());
+        drop(cleanup);
+        assert!(!socket_path.exists());
+    }
+
+    #[test]
+    fn bind_private_rejects_symlinked_parent() {
+        let temp_dir = tempfile::tempdir().expect("create temporary directory");
+        let actual_dir = temp_dir.path().join("actual");
+        let linked_dir = temp_dir.path().join("linked");
+        std::fs::create_dir(&actual_dir).expect("create socket directory");
+        symlink(&actual_dir, &linked_dir).expect("create directory symlink");
+
+        let err = bind_private(&linked_dir.join("compute.sock"))
+            .expect_err("symlinked socket parent must be rejected");
+
+        assert!(err.contains("must be a directory, not a symlink"));
+    }
+
+    #[test]
+    fn bind_private_rejects_existing_non_socket() {
+        let temp_dir = tempfile::tempdir().expect("create temporary directory");
+        let socket_path = temp_dir.path().join("compute.sock");
+        std::fs::write(&socket_path, b"not a socket").expect("create conflicting file");
+
+        let err = bind_private(&socket_path).expect_err("non-socket path must be rejected");
+
+        assert!(err.contains("is not an owned Unix socket"));
+        assert_eq!(
+            std::fs::read(&socket_path).expect("read conflicting file"),
+            b"not a socket"
+        );
+    }
+
+    #[tokio::test]
+    async fn bind_private_replaces_existing_owned_socket() {
+        let temp_dir = tempfile::tempdir().expect("create temporary directory");
+        let socket_path = temp_dir.path().join("compute.sock");
+        let stale_listener =
+            std::os::unix::net::UnixListener::bind(&socket_path).expect("bind stale Unix socket");
+        drop(stale_listener);
+
+        let listener = bind_private(&socket_path).expect("replace owned Unix socket");
+
+        assert!(
+            std::fs::symlink_metadata(&socket_path)
+                .expect("stat replacement socket")
+                .file_type()
+                .is_socket()
+        );
+        drop(listener);
+    }
+
+    #[tokio::test]
+    async fn same_uid_incoming_accepts_current_user() {
+        let temp_dir = tempfile::tempdir().expect("create temporary directory");
+        let socket_path = temp_dir.path().join("compute.sock");
+        let listener = bind_private(&socket_path).expect("bind private socket");
+        let mut incoming = SameUidUnixIncoming::new(listener);
+
+        let client = UnixStream::connect(&socket_path)
+            .await
+            .expect("connect to private socket");
+        let accepted = incoming
+            .next()
+            .await
+            .expect("incoming stream ended")
+            .expect("accept same-UID client");
+
+        assert_eq!(
+            accepted.peer_cred().expect("read client credentials").uid(),
+            rustix::process::geteuid().as_raw()
+        );
+        drop(client);
+    }
+}
