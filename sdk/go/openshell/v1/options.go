@@ -10,17 +10,8 @@ import (
 // CreateOptions configures resource creation.
 type CreateOptions = types.CreateOptions
 
-// GetOptions configures resource retrieval.
-type GetOptions = types.GetOptions
-
 // ListOptions configures resource listing with pagination and filtering.
 type ListOptions = types.ListOptions
-
-// DeleteOptions configures resource deletion.
-type DeleteOptions = types.DeleteOptions
-
-// UpdateOptions configures resource updates.
-type UpdateOptions = types.UpdateOptions
 
 // WatchOptions configures watch behavior.
 type WatchOptions = types.WatchOptions

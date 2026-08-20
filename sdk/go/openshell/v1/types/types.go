@@ -15,6 +15,9 @@ const (
 	SandboxError        SandboxPhase = "Error"
 	SandboxDeleting     SandboxPhase = "Deleting"
 	SandboxUnknown      SandboxPhase = "Unknown"
+	SandboxStopping     SandboxPhase = "Stopping"
+	SandboxStopped      SandboxPhase = "Stopped"
+	SandboxStarting     SandboxPhase = "Starting"
 )
 
 // EventType classifies watch events.
@@ -42,7 +45,6 @@ type TLSConfig struct {
 	CertFile string
 	KeyFile  string
 	CAFile   string
-	// Insecure skips TLS certificate verification. Use http:// for plaintext.
 	Insecure bool
 }
 

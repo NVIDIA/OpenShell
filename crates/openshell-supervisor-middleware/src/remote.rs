@@ -1,46 +1,59 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::sync::Arc;
-use std::time::Duration;
-
 use miette::{IntoDiagnostic, Result, WrapErr};
-use openshell_core::middleware::HttpRequestView;
+use openshell_core::middleware::{
+    HttpRequestView, SupervisorMiddlewareEndpoint, WebSocketResponseStream,
+};
 use openshell_core::proto::middleware::v1::supervisor_middleware_client::SupervisorMiddlewareClient;
-use openshell_core::proto::middleware::v1::supervisor_middleware_server::SupervisorMiddleware;
 use openshell_core::proto::{
     HttpRequestEvaluation, HttpRequestResult, MiddlewareManifest, ValidateConfigRequest,
-    ValidateConfigResponse,
+    ValidateConfigResponse, WebSocketSessionEvent,
 };
-use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
+use openshell_extension_core::{
+    BearerTokenInterceptor, BearerTokenSlot, ExtensionChannelConfig, ExtensionServerTrust,
+    connect_channel,
+};
+use std::sync::Arc;
+use tonic::service::interceptor::InterceptedService;
+use tonic::transport::Channel;
 use tonic::{Request, Response, Status};
 
 use crate::MIDDLEWARE_GRPC_MESSAGE_BYTES;
 
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
-const HTTP2_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(10);
-const HTTP2_KEEP_ALIVE_TIMEOUT: Duration = Duration::from_secs(20);
+type ExtensionChannel = InterceptedService<Channel, BearerTokenInterceptor>;
 
 /// Adapts the borrowed runtime request contract to the owned protobuf service
 /// contract only when dispatch crosses a gRPC-shaped boundary.
 #[derive(Clone)]
 pub struct GrpcMiddlewareService {
-    service: Arc<dyn SupervisorMiddleware>,
+    service: Arc<dyn SupervisorMiddlewareEndpoint>,
 }
 
 impl GrpcMiddlewareService {
     /// Connect an operator registration and wrap its generated gRPC client.
-    pub async fn connect(registration_name: &str, grpc_endpoint: &str) -> Result<Self> {
+    pub async fn connect(
+        registration_name: &str,
+        grpc_endpoint: &str,
+        tls_ca_cert_pem: &[u8],
+        bearer: Option<BearerTokenSlot>,
+    ) -> Result<Self> {
         Ok(Self {
             service: Arc::new(
-                RemoteMiddlewareService::connect(registration_name, grpc_endpoint).await?,
+                RemoteMiddlewareService::connect(
+                    registration_name,
+                    grpc_endpoint,
+                    tls_ca_cert_pem,
+                    bearer,
+                )
+                .await?,
             ),
         })
     }
 
     /// Wrap a protobuf-shaped service used by transport-boundary tests.
     #[cfg(test)]
-    pub fn from_service(service: Arc<dyn SupervisorMiddleware>) -> Self {
+    pub fn from_service(service: Arc<dyn SupervisorMiddlewareEndpoint>) -> Self {
         Self { service }
     }
 
@@ -80,39 +93,34 @@ impl GrpcMiddlewareService {
             }))
             .await
     }
+
+    /// Open a remote WebSocket middleware stream through the gRPC adapter.
+    pub async fn open_websocket_session(
+        &self,
+        receiver: tokio::sync::mpsc::Receiver<WebSocketSessionEvent>,
+    ) -> std::result::Result<WebSocketResponseStream, Status> {
+        self.service.open_websocket_session(receiver).await
+    }
 }
 
 #[derive(Clone)]
 pub struct RemoteMiddlewareService {
-    client: SupervisorMiddlewareClient<Channel>,
+    client: SupervisorMiddlewareClient<ExtensionChannel>,
 }
 
 impl RemoteMiddlewareService {
-    pub async fn connect(registration_name: &str, grpc_endpoint: &str) -> Result<Self> {
-        let mut endpoint = Endpoint::from_shared(grpc_endpoint.to_string())
-            .into_diagnostic()
-            .wrap_err_with(|| {
-                format!(
-                    "middleware registration '{registration_name}' has an invalid grpc_endpoint"
-                )
-            })?
-            .http2_keep_alive_interval(HTTP2_KEEP_ALIVE_INTERVAL)
-            .keep_alive_while_idle(true)
-            .keep_alive_timeout(HTTP2_KEEP_ALIVE_TIMEOUT)
-            .http2_adaptive_window(true);
-
-        if grpc_endpoint.starts_with("https://") {
-            endpoint = endpoint
-                .tls_config(ClientTlsConfig::new().with_enabled_roots())
-                .into_diagnostic()
-                .wrap_err_with(|| {
-                    format!("middleware registration '{registration_name}' could not configure TLS")
-                })?;
+    pub async fn connect(
+        registration_name: &str,
+        grpc_endpoint: &str,
+        tls_ca_cert_pem: &[u8],
+        bearer: Option<BearerTokenSlot>,
+    ) -> Result<Self> {
+        let mut config = ExtensionChannelConfig::new(grpc_endpoint);
+        if !tls_ca_cert_pem.is_empty() {
+            config = config
+                .with_server_trust(ExtensionServerTrust::CustomCaPem(tls_ca_cert_pem.to_vec()));
         }
-
-        let channel = endpoint
-            .connect_timeout(CONNECT_TIMEOUT)
-            .connect()
+        let channel = connect_channel(&config)
             .await
             .into_diagnostic()
             .wrap_err_with(|| {
@@ -120,6 +128,9 @@ impl RemoteMiddlewareService {
                     "middleware registration '{registration_name}' could not connect to {grpc_endpoint}"
                 )
             })?;
+        let interceptor =
+            bearer.map_or_else(BearerTokenInterceptor::disabled, |slot| slot.interceptor());
+        let channel = InterceptedService::new(channel, interceptor);
 
         Ok(Self {
             client: SupervisorMiddlewareClient::new(channel)
@@ -130,7 +141,7 @@ impl RemoteMiddlewareService {
 }
 
 #[tonic::async_trait]
-impl SupervisorMiddleware for RemoteMiddlewareService {
+impl SupervisorMiddlewareEndpoint for RemoteMiddlewareService {
     async fn describe(
         &self,
         request: Request<()>,
@@ -153,5 +164,19 @@ impl SupervisorMiddleware for RemoteMiddlewareService {
     ) -> std::result::Result<Response<HttpRequestResult>, Status> {
         let mut client = self.client.clone();
         client.evaluate_http_request(request).await
+    }
+
+    async fn open_websocket_session(
+        &self,
+        receiver: tokio::sync::mpsc::Receiver<WebSocketSessionEvent>,
+    ) -> std::result::Result<WebSocketResponseStream, Status> {
+        let mut client = self.client.clone();
+        let responses = client
+            .evaluate_web_socket_session(Request::new(tokio_stream::wrappers::ReceiverStream::new(
+                receiver,
+            )))
+            .await?
+            .into_inner();
+        Ok(Box::pin(responses))
     }
 }

@@ -22,8 +22,6 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
-const bufSize = 1024 * 1024
-
 type mockSandboxServer struct {
 	pb.UnimplementedOpenShellServer
 	mu                 sync.Mutex
@@ -123,6 +121,28 @@ func (s *mockSandboxServer) DeleteSandbox(_ context.Context, req *pb.DeleteSandb
 	}
 	delete(s.sandboxes, req.GetName())
 	return &pb.DeleteSandboxResponse{Deleted: true}, nil
+}
+
+func (s *mockSandboxServer) StopSandbox(_ context.Context, req *pb.StopSandboxRequest) (*pb.SandboxResponse, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	sb, ok := s.sandboxes[req.GetName()]
+	if !ok {
+		return nil, status.Errorf(codes.NotFound, "sandbox %q not found", req.GetName())
+	}
+	sb.Status.Phase = pb.SandboxPhase_SANDBOX_PHASE_STOPPED
+	return &pb.SandboxResponse{Sandbox: proto.Clone(sb).(*pb.Sandbox)}, nil
+}
+
+func (s *mockSandboxServer) StartSandbox(_ context.Context, req *pb.StartSandboxRequest) (*pb.SandboxResponse, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	sb, ok := s.sandboxes[req.GetName()]
+	if !ok {
+		return nil, status.Errorf(codes.NotFound, "sandbox %q not found", req.GetName())
+	}
+	sb.Status.Phase = pb.SandboxPhase_SANDBOX_PHASE_STARTING
+	return &pb.SandboxResponse{Sandbox: proto.Clone(sb).(*pb.Sandbox)}, nil
 }
 
 func (s *mockSandboxServer) AttachSandboxProvider(_ context.Context, req *pb.AttachSandboxProviderRequest) (*pb.AttachSandboxProviderResponse, error) {
@@ -245,6 +265,21 @@ func TestSandboxCreate(t *testing.T) {
 	assert.Equal(t, SandboxProvisioning, result.Status.Phase)
 }
 
+func TestSandboxCreate_RejectsUnrepresentableResourcesBeforeRPC(t *testing.T) {
+	mock := newMockSandboxServer()
+	client, cleanup := setupSandboxTest(t, mock)
+	defer cleanup()
+
+	_, err := client.Create(context.Background(), "default", "bad", &SandboxSpec{
+		Template: &SandboxTemplate{Resources: map[string]any{"invalid": make(chan int)}},
+	}, nil)
+	require.Error(t, err)
+	assert.True(t, IsInvalidArgument(err))
+	mock.mu.Lock()
+	defer mock.mu.Unlock()
+	assert.Empty(t, mock.sandboxes)
+}
+
 func TestSandboxCreate_AlreadyExists(t *testing.T) {
 	mock := newMockSandboxServer()
 	mock.createErr = status.Error(codes.AlreadyExists, "sandbox already exists")
@@ -356,6 +391,24 @@ func TestSandboxDelete_NotFound(t *testing.T) {
 
 	require.Error(t, err)
 	assert.True(t, IsNotFound(err))
+}
+
+func TestSandboxStopAndStart(t *testing.T) {
+	mock := newMockSandboxServer()
+	mock.sandboxes["lifecycle"] = &pb.Sandbox{
+		Metadata: &dm.ObjectMeta{Name: "lifecycle", Workspace: "team-a"},
+		Status:   &pb.SandboxStatus{Phase: pb.SandboxPhase_SANDBOX_PHASE_READY},
+	}
+	client, cleanup := setupSandboxTest(t, mock)
+	defer cleanup()
+
+	stopped, err := client.Stop(context.Background(), "team-a", "lifecycle")
+	require.NoError(t, err)
+	assert.Equal(t, SandboxStopped, stopped.Status.Phase)
+
+	starting, err := client.Start(context.Background(), "team-a", "lifecycle")
+	require.NoError(t, err)
+	assert.Equal(t, SandboxStarting, starting.Status.Phase)
 }
 
 // --- T030: AttachProvider, DetachProvider, ListProviders tests ---
@@ -472,6 +525,20 @@ func TestSandboxListProviders_Error(t *testing.T) {
 
 // --- T031: WaitReady tests ---
 
+func TestSandboxWaitStopped_AlreadyStopped(t *testing.T) {
+	mock := newMockSandboxServer()
+	mock.sandboxes["sleeping"] = &pb.Sandbox{
+		Metadata: &dm.ObjectMeta{Name: "sleeping"},
+		Status:   &pb.SandboxStatus{Phase: pb.SandboxPhase_SANDBOX_PHASE_STOPPED},
+	}
+	client, cleanup := setupSandboxTest(t, mock)
+	defer cleanup()
+
+	result, err := client.WaitStopped(context.Background(), "default", "sleeping")
+	require.NoError(t, err)
+	assert.Equal(t, SandboxStopped, result.Status.Phase)
+}
+
 func TestSandboxWaitReady_AlreadyReady(t *testing.T) {
 	mock := newMockSandboxServer()
 	mock.sandboxes["ready-sb"] = &pb.Sandbox{
@@ -564,6 +631,44 @@ func TestSandboxWaitReady_SandboxFailed(t *testing.T) {
 	_, err := client.WaitReady(context.Background(), "default", "fail-sb")
 
 	require.Error(t, err)
+}
+
+func TestSandboxWaitReady_SandboxDeleting(t *testing.T) {
+	mock := newMockSandboxServer()
+	mock.sandboxes["deleting-sb"] = &pb.Sandbox{
+		Metadata: &dm.ObjectMeta{Name: "deleting-sb"},
+		Status:   &pb.SandboxStatus{Phase: pb.SandboxPhase_SANDBOX_PHASE_DELETING},
+	}
+	client, cleanup := setupSandboxTest(t, mock)
+	defer cleanup()
+
+	_, err := client.WaitReady(context.Background(), "default", "deleting-sb")
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "being deleted")
+}
+
+func TestSandboxWaitReady_BecomesDeleting(t *testing.T) {
+	mock := newMockSandboxServer()
+	mock.sandboxes["del-sb"] = &pb.Sandbox{
+		Metadata: &dm.ObjectMeta{Name: "del-sb"},
+		Status:   &pb.SandboxStatus{Phase: pb.SandboxPhase_SANDBOX_PHASE_PROVISIONING},
+	}
+	client, cleanup := setupSandboxTest(t, mock)
+	defer cleanup()
+
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		mock.setPhase("del-sb", pb.SandboxPhase_SANDBOX_PHASE_DELETING)
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	_, err := client.WaitReady(ctx, "default", "del-sb", WaitOptions{PollInterval: 20 * time.Millisecond})
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "being deleted")
 }
 
 func TestSandboxWaitReady_NotFound(t *testing.T) {

@@ -319,6 +319,44 @@ ON CONFLICT ("object_type", "workspace", "name") WHERE "name" IS NOT NULL DO UPD
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_scoped(
+        &self,
+        object_type: &str,
+        id: &str,
+        name: &str,
+        workspace: &str,
+        scope: &str,
+        payload: &[u8],
+        labels: Option<&str>,
+    ) -> PersistenceResult<WriteResult> {
+        let now_ms = current_time_ms();
+
+        sqlx::query(
+            r#"
+INSERT INTO "objects" ("object_type", "id", "name", "workspace", "scope", "payload", "created_at_ms", "updated_at_ms", "labels", "resource_version")
+VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?8, 1)
+"#,
+        )
+        .bind(object_type)
+        .bind(id)
+        .bind(name)
+        .bind(workspace)
+        .bind(scope)
+        .bind(payload)
+        .bind(now_ms)
+        .bind(labels.unwrap_or("{}"))
+        .execute(&self.pool)
+        .await
+        .map_err(|e| map_db_error(&e))?;
+
+        Ok(WriteResult {
+            resource_version: 1,
+            created_at_ms: now_ms,
+            updated_at_ms: now_ms,
+        })
+    }
+
     pub async fn get(
         &self,
         object_type: &str,

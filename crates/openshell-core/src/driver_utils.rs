@@ -3,9 +3,9 @@
 
 //! Utility helpers shared across compute-driver crates.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-use crate::proto::compute::v1::{DriverSandbox, GetCapabilitiesResponse};
+use crate::proto::compute::v1::DriverSandbox;
 
 pub use crate::container_paths::{
     SANDBOX_TOKEN_MOUNT_PATH, SUPERVISOR_CONTAINER_BINARY, SUPERVISOR_CONTAINER_DIR,
@@ -34,6 +34,9 @@ pub const LABEL_SANDBOX_NAMESPACE: &str = "openshell.ai/sandbox-namespace";
 
 /// Container/pod label carrying the sandbox workspace.
 pub const LABEL_SANDBOX_WORKSPACE: &str = "openshell.ai/sandbox-workspace";
+
+/// Label carrying the gateway identity on managed namespaces.
+pub const LABEL_GATEWAY_ID: &str = "openshell.ai/gateway-id";
 
 /// Label selector that matches all OpenShell-managed resources which carry a
 /// sandbox ID label.  Used by list and watch operations to exclude foreign
@@ -369,22 +372,6 @@ pub fn sandbox_token_path(
     Ok(path.join(sandbox_id).join("sandbox.jwt"))
 }
 
-/// Build a [`GetCapabilitiesResponse`] from the common driver capability fields.
-///
-/// Every compute driver constructs this response with the same fields. Shared
-/// here to avoid repeating the struct literal in each driver crate.
-pub fn build_capabilities_response(
-    driver_name: &str,
-    driver_version: impl Into<String>,
-    default_image: impl Into<String>,
-) -> GetCapabilitiesResponse {
-    GetCapabilitiesResponse {
-        driver_name: driver_name.to_string(),
-        driver_version: driver_version.into(),
-        default_image: default_image.into(),
-    }
-}
-
 /// Return the effective log level for a sandbox.
 ///
 /// Uses the level from the sandbox spec when non-empty, falling back to
@@ -432,6 +419,145 @@ pub fn supervisor_image_tag(image: &str) -> Option<&str> {
 /// all other versioned tags are treated as immutable and pulled at most once.
 pub fn supervisor_image_should_refresh(image: &str) -> bool {
     matches!(supervisor_image_tag(image), Some("dev" | "latest"))
+}
+
+// ---------------------------------------------------------------------------
+// Supervisor binary extraction helpers (shared by Docker and Podman drivers)
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "driver-extraction")]
+/// Extract the payload of the first regular-file entry in a tar archive.
+///
+/// Container archive endpoints return a single-file tar when `path` points to
+/// a file, so only the first entry is consumed. Returns an error when the
+/// archive is empty, the first entry is not a regular file, or the payload is
+/// empty.
+pub fn extract_first_tar_entry(tar_bytes: &[u8]) -> Result<Vec<u8>, String> {
+    let mut archive = tar::Archive::new(std::io::Cursor::new(tar_bytes));
+    let mut entries = archive
+        .entries()
+        .map_err(|err| format!("open tar archive: {err}"))?;
+    let mut entry = entries
+        .next()
+        .ok_or_else(|| "tar archive was empty".to_string())?
+        .map_err(|err| format!("read tar entry: {err}"))?;
+    let kind = entry.header().entry_type();
+    if !kind.is_file() {
+        return Err(format!(
+            "expected a regular file in tar archive, got type {kind:?}"
+        ));
+    }
+    let mut bytes = Vec::new();
+    std::io::Read::read_to_end(&mut entry, &mut bytes)
+        .map_err(|err| format!("read tar entry payload: {err}"))?;
+    if bytes.is_empty() {
+        return Err("tar entry payload was empty".to_string());
+    }
+    Ok(bytes)
+}
+
+#[cfg(feature = "driver-extraction")]
+/// Atomically write `bytes` to `final_path` via a sibling temp file.
+///
+/// Creates parent directories as needed. The temp file is synced, `chmod 755`
+/// (on Unix), and renamed into place so concurrent readers never observe a
+/// partial write. Returns a human-readable error string on failure.
+pub fn write_cache_binary_atomic(final_path: &Path, bytes: &[u8]) -> Result<(), String> {
+    let dir = final_path
+        .parent()
+        .ok_or_else(|| format!("cache path '{}' has no parent", final_path.display()))?;
+    std::fs::create_dir_all(dir)
+        .map_err(|err| format!("failed to create cache dir '{}': {err}", dir.display()))?;
+
+    let mut temp = tempfile::Builder::new()
+        .prefix(".openshell-sandbox-")
+        .tempfile_in(dir)
+        .map_err(|err| format!("failed to create temp file in '{}': {err}", dir.display()))?;
+    std::io::Write::write_all(&mut temp, bytes)
+        .map_err(|err| format!("failed to write supervisor binary: {err}"))?;
+    temp.as_file()
+        .sync_all()
+        .map_err(|err| format!("failed to sync supervisor binary: {err}"))?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o755))
+            .map_err(|err| format!("failed to chmod supervisor binary: {err}"))?;
+    }
+
+    temp.persist(final_path).map_err(|err| {
+        format!(
+            "failed to persist supervisor binary to '{}': {}",
+            final_path.display(),
+            err.error,
+        )
+    })?;
+    Ok(())
+}
+
+/// Return the host-side cache path for an extracted supervisor binary.
+///
+/// The path is `$XDG_DATA_HOME/openshell/<driver_subdir>/<sanitized-digest>/openshell-sandbox`.
+/// `driver_subdir` distinguishes caches across drivers (e.g. `"docker-supervisor"`,
+/// `"podman-supervisor"`).
+pub fn supervisor_cache_path(driver_subdir: &str, digest: &str) -> Result<PathBuf, String> {
+    let base = crate::paths::xdg_data_dir()
+        .map_err(|err| format!("failed to resolve XDG data dir: {err}"))?;
+    Ok(supervisor_cache_path_with_base(
+        &base,
+        driver_subdir,
+        digest,
+    ))
+}
+
+/// [`supervisor_cache_path`] with an explicit base directory (for testing).
+pub fn supervisor_cache_path_with_base(base: &Path, driver_subdir: &str, digest: &str) -> PathBuf {
+    let sanitized = digest.replace(':', "-");
+    base.join("openshell")
+        .join(driver_subdir)
+        .join(sanitized)
+        .join("openshell-sandbox")
+}
+
+/// Generate a unique container name for supervisor binary extraction.
+///
+/// Uses the process ID and an atomic counter to avoid collisions across
+/// concurrent gateway starts.
+pub fn temp_extract_container_name() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let pid = std::process::id();
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    format!("openshell-supervisor-extract-{pid}-{seq}")
+}
+
+/// Validate that the file at `path` starts with the ELF magic bytes (`\x7fELF`).
+///
+/// Returns a human-readable error when the file cannot be read or is not a
+/// Linux ELF binary.
+pub fn validate_linux_elf_binary(path: &Path) -> Result<(), String> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path).map_err(|err| {
+        format!(
+            "failed to open supervisor binary '{}': {err}",
+            path.display()
+        )
+    })?;
+    let mut magic = [0u8; 4];
+    file.read_exact(&mut magic).map_err(|err| {
+        format!(
+            "failed to read supervisor binary '{}': {err}",
+            path.display()
+        )
+    })?;
+    if magic != [0x7f, b'E', b'L', b'F'] {
+        return Err(format!(
+            "supervisor binary '{}' is not a Linux ELF executable",
+            path.display(),
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -625,7 +751,7 @@ mod tests {
         let err = read_upstream_proxy_credential_file(dir.path().to_str().unwrap()).unwrap_err();
         assert!(err.contains("regular file"), "{err}");
 
-        if std::path::Path::new("/dev/zero").exists() {
+        if Path::new("/dev/zero").exists() {
             let err = read_upstream_proxy_credential_file("/dev/zero").unwrap_err();
             assert!(err.contains("regular file"), "{err}");
         }

@@ -293,6 +293,7 @@ try {
     #   PolicyFile  - path to the policy YAML fixture
     #   Backends    - list: "both" / "process_container" / "isolation_session"
     #   ExpectFail  - $true means `sandbox create` itself must fail (invalid_argument)
+    #   ExpectArtifact - whether the workload should create its target file
     #   Description - human-readable label
 
     $allScenarios = @(
@@ -301,6 +302,7 @@ try {
             PolicyFile  = Join-Path $policyDir "fs-rw.yaml"
             Backends    = "both"
             ExpectFail  = $false
+            ExpectArtifact = $true
             Description = "rw grant on DemoDir; in-policy write should succeed"
         },
         @{
@@ -308,6 +310,7 @@ try {
             PolicyFile  = Join-Path $policyDir "fs-readonly.yaml"
             Backends    = "both"
             ExpectFail  = $false
+            ExpectArtifact = $true
             Description = "ro grant + rw share; write to ro dir should be denied"
         },
         @{
@@ -315,6 +318,7 @@ try {
             PolicyFile  = Join-Path $policyDir "fs-empty.yaml"
             Backends    = "process_container"
             ExpectFail  = $false
+            ExpectArtifact = $false
             Description = "empty filesystem policy; all writes denied (process_container only)"
         },
         @{
@@ -413,18 +417,24 @@ try {
                 $results += [pscustomobject]@{ Scenario = $sc.Name; Result = "FAIL"; Reason = "create succeeded unexpectedly" }
             }
         } else {
-            # Wiring check in mock mode: artifact present = pass.
+            # Wiring check in mock mode: the artifact must match the policy's
+            # expected outcome. In particular, default-deny passes only when
+            # the workload cannot create its target file.
             if ($Mock) {
-                $deadline = (Get-Date).AddSeconds(10)
-                while ((Get-Date) -lt $deadline -and -not (Test-Path $target)) {
-                    Start-Sleep -Milliseconds 300
+                if ($sc.ExpectArtifact) {
+                    $deadline = (Get-Date).AddSeconds(10)
+                    while ((Get-Date) -lt $deadline -and -not (Test-Path $target)) {
+                        Start-Sleep -Milliseconds 300
+                    }
                 }
-                if (Test-Path $target) {
-                    Ok "$($sc.Name): in-policy artifact present (mock wiring OK)"
-                    $results += [pscustomobject]@{ Scenario = $sc.Name; Result = "PASS"; Reason = "mock wiring: artifact present" }
+                $artifactExists = Test-Path $target
+                if ($artifactExists -eq $sc.ExpectArtifact) {
+                    $outcome = if ($artifactExists) { "present" } else { "absent" }
+                    Ok "$($sc.Name): artifact $outcome as expected (mock wiring OK)"
+                    $results += [pscustomobject]@{ Scenario = $sc.Name; Result = "PASS"; Reason = "mock wiring: artifact $outcome as expected" }
                 } else {
-                    Bad "$($sc.Name): artifact missing in DemoDir (mock wiring FAIL)"
-                    $results += [pscustomobject]@{ Scenario = $sc.Name; Result = "FAIL"; Reason = "artifact missing (mock)" }
+                    Bad "$($sc.Name): artifact outcome did not match policy (present=$artifactExists, expected=$($sc.ExpectArtifact))"
+                    $results += [pscustomobject]@{ Scenario = $sc.Name; Result = "FAIL"; Reason = "mock wiring: artifact present=$artifactExists, expected=$($sc.ExpectArtifact)" }
                 }
             } else {
                 # Real mode: artifact presence == enforcement worked.

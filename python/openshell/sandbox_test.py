@@ -1543,6 +1543,8 @@ class _FakeSandboxStub:
         self.list_request: openshell_pb2.ListSandboxesRequest | None = None
         self.get_request: openshell_pb2.GetSandboxRequest | None = None
         self.delete_request: openshell_pb2.DeleteSandboxRequest | None = None
+        self.stop_request: openshell_pb2.StopSandboxRequest | None = None
+        self.start_request: openshell_pb2.StartSandboxRequest | None = None
         self._listed = listed or []
 
     def GetSandbox(
@@ -1566,6 +1568,38 @@ class _FakeSandboxStub:
         self.delete_request = request
         _ = timeout
         return SimpleNamespace(deleted=True)
+
+    def StopSandbox(
+        self,
+        request: openshell_pb2.StopSandboxRequest,
+        timeout: float | None = None,
+    ) -> Any:
+        self.stop_request = request
+        _ = timeout
+        return SimpleNamespace(
+            sandbox=_make_sandbox_proto(
+                "sandbox-1",
+                request.name,
+                phase=openshell_pb2.SANDBOX_PHASE_STOPPED,
+                workspace=request.workspace,
+            )
+        )
+
+    def StartSandbox(
+        self,
+        request: openshell_pb2.StartSandboxRequest,
+        timeout: float | None = None,
+    ) -> Any:
+        self.start_request = request
+        _ = timeout
+        return SimpleNamespace(
+            sandbox=_make_sandbox_proto(
+                "sandbox-1",
+                request.name,
+                phase=openshell_pb2.SANDBOX_PHASE_STARTING,
+                workspace=request.workspace,
+            )
+        )
 
     def CreateSandbox(
         self,
@@ -1639,6 +1673,23 @@ def test_create_forwards_name_and_labels() -> None:
     assert stub.create_request.name == "job-1"
     assert dict(stub.create_request.labels) == {"aiq": "deep-research"}
     assert dict(ref.labels) == {"aiq": "deep-research"}
+
+
+def test_stop_and_start_forward_workspace_and_return_phase() -> None:
+    stub = _FakeSandboxStub()
+    client = _client_with_fake_stub(stub)
+
+    stopped = client.stop("job-1", workspace="team-a")
+    assert stub.stop_request is not None
+    assert stub.stop_request.name == "job-1"
+    assert stub.stop_request.workspace == "team-a"
+    assert stopped.phase == openshell_pb2.SANDBOX_PHASE_STOPPED
+
+    starting = client.start("job-1", workspace="team-a")
+    assert stub.start_request is not None
+    assert stub.start_request.name == "job-1"
+    assert stub.start_request.workspace == "team-a"
+    assert starting.phase == openshell_pb2.SANDBOX_PHASE_STARTING
 
 
 def test_create_without_args_sends_empty_metadata() -> None:

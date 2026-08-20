@@ -472,16 +472,23 @@ fn run_network_init(
 
 #[cfg(target_os = "linux")]
 fn validate_network_init_ids(proxy_user_id: u32, proxy_primary_group_id: u32) -> Result<()> {
-    if proxy_user_id != 0 && proxy_user_id < openshell_policy::MIN_SANDBOX_UID {
+    if proxy_user_id != 0
+        && !(openshell_policy::MIN_SANDBOX_PROXY_UID..=openshell_policy::MAX_SANDBOX_UID)
+            .contains(&proxy_user_id)
+    {
         return Err(miette::miette!(
-            "--proxy-uid must be 0 or at least {}",
-            openshell_policy::MIN_SANDBOX_UID
+            "--proxy-uid must be 0 or in range [{}, {}]",
+            openshell_policy::MIN_SANDBOX_PROXY_UID,
+            openshell_policy::MAX_SANDBOX_UID,
         ));
     }
-    if proxy_primary_group_id < openshell_policy::MIN_SANDBOX_UID {
+    if !(openshell_policy::MIN_SANDBOX_UID..=openshell_policy::MAX_SANDBOX_UID)
+        .contains(&proxy_primary_group_id)
+    {
         return Err(miette::miette!(
-            "--proxy-gid must be at least {}",
-            openshell_policy::MIN_SANDBOX_UID
+            "--proxy-gid must be in range [{}, {}]",
+            openshell_policy::MIN_SANDBOX_UID,
+            openshell_policy::MAX_SANDBOX_UID,
         ));
     }
     Ok(())
@@ -806,17 +813,23 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn network_init_accepts_root_proxy_uid_for_binary_aware_sidecar() {
-        validate_network_init_ids(0, openshell_policy::MIN_SANDBOX_UID).unwrap();
+        validate_network_init_ids(0, 30).unwrap();
     }
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn network_init_still_rejects_low_non_root_proxy_ids() {
+    fn network_init_still_rejects_low_non_root_proxy_uid_and_root_gid() {
         let uid_err =
             validate_network_init_ids(999, openshell_policy::MIN_SANDBOX_UID).unwrap_err();
         assert!(uid_err.to_string().contains("--proxy-uid"));
 
-        let gid_err = validate_network_init_ids(0, 999).unwrap_err();
+        let gid_err = validate_network_init_ids(0, 0).unwrap_err();
         assert!(gid_err.to_string().contains("--proxy-gid"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn network_init_accepts_non_root_system_proxy_group() {
+        validate_network_init_ids(openshell_policy::MIN_SANDBOX_PROXY_UID, 30).unwrap();
     }
 }

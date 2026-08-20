@@ -1,0 +1,30 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Render-coverage overlay for cert-manager issuing the server certificate from
+# an external Issuer/ClusterIssuer (e.g. a real ACME issuer), plus an
+# OpenShift Route with TLS passthrough. Merge after values.yaml:
+#   helm lint deploy/helm/openshell -f ci/values-openshift-route-cert-manager.yaml
+#
+# The ClusterIssuer name below is a placeholder for render coverage; a real
+# deployment must reference an Issuer/ClusterIssuer that's actually installed
+# and Ready in the target cluster. See docs/kubernetes/managing-certificates.mdx.
+#
+# clientCaFromServerTlsSecret defaults to true and is correct here: the
+# internal server certificate is always signed by the chart CA, so its
+# ca.crt is exactly the CA that signed the client (mTLS) certificate.
+
+server:
+  disableTls: false
+
+certManager:
+  enabled: true
+  serverIssuerRef:
+    name: letsencrypt-prod
+    kind: ClusterIssuer
+  serverDnsNames:
+    - openshell.example.com
+
+openshiftRoute:
+  enabled: true
+  host: openshell.example.com

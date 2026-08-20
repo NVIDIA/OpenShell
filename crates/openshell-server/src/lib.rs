@@ -60,14 +60,17 @@ mod ws_tunnel;
 use metrics_exporter_prometheus::PrometheusBuilder;
 use openshell_core::net::set_tcp_nodelay_best_effort;
 use openshell_core::{ComputeDriverKind, Config, Error, ObjectLabels, Result};
+use openshell_extension_core::{
+    BearerTokenSlot, ExtensionAudience, ExtensionCallerKind, ExtensionKind, MAX_EXTENSION_TOKEN_TTL,
+};
 use openshell_supervisor_middleware::MiddlewareRegistry;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::ErrorKind;
 use std::net::SocketAddr;
 #[cfg(test)]
 use std::sync::LazyLock;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
 use tracing::{debug, error, info, warn};
@@ -83,6 +86,158 @@ use compute::ComputeRuntime;
 use gateway_listener::{BoundGatewayListener, GatewayListenerScope, bind_gateway_listeners};
 pub use grpc::OpenShellService;
 pub use http::{health_router, http_router, metrics_router, service_http_router};
+
+/// Deriving `Debug` is safe here: `BearerTokenSlot` renders only its expiry,
+/// and an extension audience is configuration rather than secret material.
+#[derive(Debug)]
+struct GatewayExtensionCredential {
+    name: String,
+    audience: ExtensionAudience,
+    slot: BearerTokenSlot,
+    ttl: Duration,
+}
+
+fn extension_token_ttl(issuer: &auth::sandbox_jwt::SandboxJwtIssuer) -> Duration {
+    if issuer.ttl().is_zero() {
+        Duration::from_secs(15 * 60)
+    } else {
+        issuer.ttl().min(MAX_EXTENSION_TOKEN_TTL)
+    }
+}
+
+/// Mint the gateway-caller credential for one extension registration.
+///
+/// Returns `Ok(None)` when the operator has explicitly opted the registration
+/// out of extension authentication. The opt-out is deliberately loud: it
+/// downgrades a security boundary, so it is reported once per registration at
+/// startup rather than being silently tolerated.
+fn mint_gateway_extension_credential(
+    issuer: &Arc<auth::sandbox_jwt::SandboxJwtIssuer>,
+    kind: ExtensionKind,
+    name: &str,
+    audience: &str,
+    endpoint: &str,
+    allow_insecure_transport: bool,
+) -> Result<Option<GatewayExtensionCredential>> {
+    // A middleware endpoint must be reachable from sandbox supervisors, so a
+    // gateway-local Unix socket is only an option for interceptors.
+    let (accepted, supports_unix) = match kind {
+        ExtensionKind::Middleware => ("https://", false),
+        ExtensionKind::Interceptor => ("https:// or unix://", true),
+        _ => {
+            return Err(Error::config(format!(
+                "extension kind '{kind}' is not supported by gateway authentication"
+            )));
+        }
+    };
+    if allow_insecure_transport {
+        warn!(
+            extension = %name,
+            endpoint = %endpoint,
+            "extension authentication is DISABLED for this registration by \
+             allow_insecure_transport; OpenShell attaches no caller credential \
+             and the service cannot distinguish OpenShell from any other \
+             network client. Use {accepted} with the opt-out removed outside \
+             trusted-network development deployments."
+        );
+        return Ok(None);
+    }
+    let transport_supported =
+        endpoint.starts_with("https://") || (supports_unix && endpoint.starts_with("unix://"));
+    if !transport_supported {
+        return Err(Error::config(format!(
+            "authenticated {kind} '{name}' must use {accepted}; set \
+             allow_insecure_transport = true to opt this registration out of \
+             extension authentication instead"
+        )));
+    }
+    let audience = ExtensionAudience::new(audience.to_string()).map_err(|error| {
+        Error::config(format!(
+            "extension '{name}' has an invalid audience: {error}"
+        ))
+    })?;
+    let ttl = extension_token_ttl(issuer);
+    let minted = issuer
+        .mint_extension_token(&audience, ExtensionCallerKind::Gateway, None, ttl)
+        .map_err(|status| {
+            Error::config(format!(
+                "failed to mint credential for extension '{name}': {}",
+                status.message()
+            ))
+        })?;
+    let slot = BearerTokenSlot::new(&minted.token, minted.expires_at_ms).map_err(|error| {
+        Error::config(format!(
+            "failed to install credential for extension '{name}': {error}"
+        ))
+    })?;
+    Ok(Some(GatewayExtensionCredential {
+        name: name.to_string(),
+        audience,
+        slot,
+        ttl,
+    }))
+}
+
+fn spawn_gateway_extension_token_refresh(
+    issuer: Arc<auth::sandbox_jwt::SandboxJwtIssuer>,
+    credentials: Vec<GatewayExtensionCredential>,
+) {
+    if credentials.is_empty() {
+        return;
+    }
+    tokio::spawn(async move {
+        loop {
+            let now_ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |duration| {
+                    i64::try_from(duration.as_millis()).unwrap_or(i64::MAX)
+                });
+            let remaining_ms = credentials
+                .iter()
+                .filter_map(|credential| credential.slot.expires_at_ms())
+                .min()
+                .map_or(60_000, |expiry_ms| expiry_ms.saturating_sub(now_ms));
+            let refresh_delay = if remaining_ms <= 0 {
+                Duration::from_millis(100)
+            } else {
+                Duration::from_millis(
+                    u64::try_from(remaining_ms)
+                        .unwrap_or(u64::MAX)
+                        .saturating_mul(4)
+                        .checked_div(5)
+                        .unwrap_or(100)
+                        .max(100),
+                )
+            };
+            tokio::time::sleep(refresh_delay).await;
+            for credential in &credentials {
+                match issuer.mint_extension_token(
+                    &credential.audience,
+                    ExtensionCallerKind::Gateway,
+                    None,
+                    credential.ttl,
+                ) {
+                    Ok(minted) => {
+                        if let Err(error) =
+                            credential.slot.update(&minted.token, minted.expires_at_ms)
+                        {
+                            warn!(
+                                extension = %credential.name,
+                                error = %error,
+                                "failed to rotate gateway extension credential"
+                            );
+                        }
+                    }
+                    Err(status) => warn!(
+                        extension = %credential.name,
+                        error = %status,
+                        "failed to mint gateway extension credential"
+                    ),
+                }
+            }
+        }
+    });
+}
 pub use multiplex::{MultiplexService, MultiplexedService};
 pub use persistence::Store;
 use sandbox_index::SandboxIndex;
@@ -166,6 +321,10 @@ pub struct ServerState {
 
     /// Gateway-wide gRPC request rate limiter shared by every multiplex path.
     pub(crate) grpc_rate_limiter: Option<multiplex::GrpcRateLimiter>,
+
+    /// Per-sandbox bound on extension credential minting, which resolves the
+    /// caller's effective policy on every request.
+    pub(crate) extension_mint_limiter: auth::extension_mint_limit::ExtensionMintLimiter,
 
     /// Immutable gateway interceptor execution plan. `None` when disabled.
     pub(crate) gateway_interceptors:
@@ -254,6 +413,7 @@ impl ServerState {
             ssh_connections_by_sandbox: Mutex::new(HashMap::new()),
             settings_mutex: tokio::sync::Mutex::new(()),
             supervisor_sessions,
+            extension_mint_limiter: auth::extension_mint_limit::ExtensionMintLimiter::default(),
             middleware_registry: Arc::new(MiddlewareRegistry::default()),
             oidc_cache,
             sandbox_jwt_issuer: None,
@@ -277,6 +437,7 @@ impl ServerState {
 /// Returns an error if the server fails to start or encounters a fatal error.
 pub(crate) async fn run_server(
     startup: ServerStartupConfig,
+    compute_driver: ConfiguredComputeDriver,
     tracing_log_bus: TracingLogBus,
 ) -> Result<()> {
     let ServerStartupConfig {
@@ -284,6 +445,7 @@ pub(crate) async fn run_server(
         config_file,
         guest_tls,
     } = startup;
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
     auth::descriptor_authz::init()
         .map_err(|error| Error::config(format!("invalid gRPC authorization metadata: {error}")))?;
@@ -293,6 +455,62 @@ pub(crate) async fn run_server(
         return Err(Error::config("database_url is required"));
     }
 
+    // Load signing material before connecting remote extensions so their
+    // startup Describe calls can authenticate with gateway-caller tokens.
+    let (sandbox_jwt_issuer, sandbox_jwt_authenticator) = if let Some(ref jwt) = config.gateway_jwt
+    {
+        let signing_pem = std::fs::read(&jwt.signing_key_path).map_err(|e| {
+            Error::config(format!(
+                "failed to read sandbox JWT signing key from {}: {e}",
+                jwt.signing_key_path.display()
+            ))
+        })?;
+        let public_pem = std::fs::read(&jwt.public_key_path).map_err(|e| {
+            Error::config(format!(
+                "failed to read sandbox JWT public key from {}: {e}",
+                jwt.public_key_path.display()
+            ))
+        })?;
+        let kid = std::fs::read_to_string(&jwt.kid_path)
+            .map_err(|e| {
+                Error::config(format!(
+                    "failed to read sandbox JWT kid from {}: {e}",
+                    jwt.kid_path.display()
+                ))
+            })?
+            .trim()
+            .to_string();
+        if kid.is_empty() {
+            return Err(Error::config(format!(
+                "sandbox JWT kid file {} is empty",
+                jwt.kid_path.display()
+            )));
+        }
+        let issuer = Arc::new(
+            auth::sandbox_jwt::SandboxJwtIssuer::from_pem(
+                &signing_pem,
+                kid.clone(),
+                &jwt.gateway_id,
+                Duration::from_secs(jwt.ttl_secs),
+            )
+            .map_err(Error::config)?,
+        );
+        let authenticator = Arc::new(
+            auth::sandbox_jwt::SandboxJwtAuthenticator::from_pem(&public_pem, kid, &jwt.gateway_id)
+                .map_err(Error::config)?,
+        );
+        info!(
+            gateway_id = %jwt.gateway_id,
+            ttl_secs = jwt.ttl_secs,
+            "gateway-minted sandbox JWT enabled"
+        );
+        (Some(issuer), Some(authenticator))
+    } else {
+        (None, None)
+    };
+
+    // Preserve the structured TOML source in ConfigFileError for actionable startup diagnostics.
+    #[allow(clippy::result_large_err)]
     let middleware_registrations = config_file
         .as_ref()
         .map(|file| {
@@ -300,16 +518,42 @@ pub(crate) async fn run_server(
                 .supervisor
                 .middleware
                 .iter()
-                .map(Into::into)
-                .collect()
+                .map(openshell_core::proto::SupervisorMiddlewareService::try_from)
+                .collect::<std::result::Result<Vec<_>, _>>()
         })
+        .transpose()
+        .map_err(|error| Error::config(format!("middleware registration failed: {error}")))?
         .unwrap_or_default();
+    let mut gateway_extension_credentials = Vec::new();
     let middleware_registry = Arc::new(
-        MiddlewareRegistry::connect_services(
-            openshell_supervisor_middleware_builtins::services(),
-            middleware_registrations,
-        )
-        .await
+        if let Some(issuer) = sandbox_jwt_issuer.as_ref() {
+            let mut slots = HashMap::new();
+            for registration in &middleware_registrations {
+                if let Some(credential) = mint_gateway_extension_credential(
+                    issuer,
+                    ExtensionKind::Middleware,
+                    &registration.name,
+                    &registration.audience,
+                    &registration.grpc_endpoint,
+                    registration.allow_insecure_transport,
+                )? {
+                    slots.insert(registration.name.clone(), credential.slot.clone());
+                    gateway_extension_credentials.push(credential);
+                }
+            }
+            MiddlewareRegistry::connect_services_authenticated(
+                openshell_supervisor_middleware_builtins::services(),
+                middleware_registrations,
+                &slots,
+            )
+            .await
+        } else {
+            MiddlewareRegistry::connect_services(
+                openshell_supervisor_middleware_builtins::services(),
+                middleware_registrations,
+            )
+            .await
+        }
         .map_err(|error| Error::config(format!("middleware registration failed: {error}")))?,
     );
 
@@ -349,22 +593,45 @@ pub(crate) async fn run_server(
         gateway_tls_enabled: config.tls.is_some(),
         endpoint_overrides: &config.compute_driver_endpoints,
     };
-    let compute = build_compute_runtime(
+    let (compute, operator_allowlist) = build_compute_runtime(
         &config,
         driver_startup,
+        compute_driver,
         store.clone(),
         sandbox_index.clone(),
         sandbox_watch_bus.clone(),
         tracing_log_bus.clone(),
         supervisor_sessions.clone(),
+        shutdown_rx.clone(),
     )
     .await?;
-    let gateway_interceptors =
-        openshell_gateway_interceptors::initialize(config.gateway_interceptors.clone())
-            .await
-            .map_err(|e| {
-                Error::config(format!("gateway interceptor initialization failed: {e}"))
-            })?;
+    #[cfg(target_os = "windows")]
+    let _ = &operator_allowlist;
+    let gateway_interceptors = if let Some(issuer) = sandbox_jwt_issuer.as_ref() {
+        let mut slots = BTreeMap::new();
+        for interceptor in &config.gateway_interceptors {
+            let audience = interceptor.resolved_audience();
+            if let Some(credential) = mint_gateway_extension_credential(
+                issuer,
+                ExtensionKind::Interceptor,
+                &interceptor.name,
+                audience.as_ref(),
+                &interceptor.grpc_endpoint,
+                interceptor.allow_insecure_transport,
+            )? {
+                slots.insert(interceptor.name.clone(), credential.slot.clone());
+                gateway_extension_credentials.push(credential);
+            }
+        }
+        openshell_gateway_interceptors::initialize_authenticated(
+            config.gateway_interceptors.clone(),
+            slots,
+        )
+        .await
+    } else {
+        openshell_gateway_interceptors::initialize(config.gateway_interceptors.clone()).await
+    }
+    .map_err(|e| Error::config(format!("gateway interceptor initialization failed: {e}")))?;
     let provider_profile_sources = provider_profile_sources::ProviderProfileSources::from_config(
         &config.provider_profile_sources,
         gateway_interceptors.as_ref(),
@@ -392,56 +659,10 @@ pub(crate) async fn run_server(
     state.middleware_registry = middleware_registry;
     state.gateway_interceptors = gateway_interceptors;
     state.provider_profile_sources = provider_profile_sources;
-
-    // Load the gateway-minted sandbox JWT signing key when configured.
-    // Optional so single-driver dev deployments without certgen continue
-    // to start. The helm-deployed gateway and the RPM init script populate
-    // `gateway_jwt` once `certgen` has produced the on-disk material.
-    if let Some(ref jwt) = config.gateway_jwt {
-        let signing_pem = std::fs::read(&jwt.signing_key_path).map_err(|e| {
-            Error::config(format!(
-                "failed to read sandbox JWT signing key from {}: {e}",
-                jwt.signing_key_path.display()
-            ))
-        })?;
-        let public_pem = std::fs::read(&jwt.public_key_path).map_err(|e| {
-            Error::config(format!(
-                "failed to read sandbox JWT public key from {}: {e}",
-                jwt.public_key_path.display()
-            ))
-        })?;
-        let kid = std::fs::read_to_string(&jwt.kid_path)
-            .map_err(|e| {
-                Error::config(format!(
-                    "failed to read sandbox JWT kid from {}: {e}",
-                    jwt.kid_path.display()
-                ))
-            })?
-            .trim()
-            .to_string();
-        if kid.is_empty() {
-            return Err(Error::config(format!(
-                "sandbox JWT kid file {} is empty",
-                jwt.kid_path.display()
-            )));
-        }
-        let issuer = auth::sandbox_jwt::SandboxJwtIssuer::from_pem(
-            &signing_pem,
-            kid.clone(),
-            &jwt.gateway_id,
-            Duration::from_secs(jwt.ttl_secs),
-        )
-        .map_err(Error::config)?;
-        let authenticator =
-            auth::sandbox_jwt::SandboxJwtAuthenticator::from_pem(&public_pem, kid, &jwt.gateway_id)
-                .map_err(Error::config)?;
-        info!(
-            gateway_id = %jwt.gateway_id,
-            ttl_secs = jwt.ttl_secs,
-            "gateway-minted sandbox JWT enabled"
-        );
-        state.sandbox_jwt_issuer = Some(Arc::new(issuer));
-        state.sandbox_jwt_authenticator = Some(Arc::new(authenticator));
+    state.sandbox_jwt_issuer = sandbox_jwt_issuer.clone();
+    state.sandbox_jwt_authenticator = sandbox_jwt_authenticator;
+    if let Some(issuer) = sandbox_jwt_issuer {
+        spawn_gateway_extension_token_refresh(issuer, gateway_extension_credentials);
     }
 
     // K8s ServiceAccount bootstrap authenticator. Only constructed when
@@ -457,13 +678,29 @@ pub(crate) async fn run_server(
             compute::driver_config::builtin::kubernetes_config_for_k8s_sa_bootstrap(
                 config_file.as_ref(),
             )?;
-        let sandbox_namespace = kubernetes_config.namespace;
-        let sandbox_service_account = kubernetes_config.service_account_name;
+        let sandbox_namespace = kubernetes_config.namespace.clone();
+        let sandbox_service_account = kubernetes_config.service_account_name.clone();
+        let namespace_validator = match kubernetes_config.workspace_mode {
+            openshell_driver_kubernetes::WorkspaceMode::Shared => {
+                auth::k8s_sa::NamespaceValidator::Exact(kubernetes_config.namespace)
+            }
+            openshell_driver_kubernetes::WorkspaceMode::Managed => {
+                auth::k8s_sa::NamespaceValidator::Prefix(
+                    openshell_driver_kubernetes::managed_namespace_prefix(
+                        &kubernetes_config.gateway_id,
+                    ),
+                )
+            }
+            openshell_driver_kubernetes::WorkspaceMode::Operator => {
+                let allowlist = operator_allowlist.clone().unwrap_or_default();
+                auth::k8s_sa::NamespaceValidator::Allowlist(allowlist)
+            }
+        };
         match kube::Client::try_default().await {
             Ok(client) => {
                 let resolver = Arc::new(auth::k8s_sa::LiveK8sResolver::new(
                     client,
-                    &sandbox_namespace,
+                    namespace_validator,
                     "openshell-gateway".to_string(),
                     sandbox_service_account.clone(),
                 ));
@@ -485,12 +722,9 @@ pub(crate) async fn run_server(
 
     let state = Arc::new(state);
 
-    let (shutdown_tx, shutdown_rx) = watch::channel(false);
-
-    // Resume sandboxes that were stopped during the previous gateway
-    // shutdown so the running compute state matches the persisted store.
-    // Runs before watchers spawn so the watch loop sees the post-resume
-    // snapshot on its first poll.
+    // Reconcile local-driver running intent before watchers spawn so their
+    // first snapshots observe the post-start backend state. Explicitly stopped
+    // sandboxes remain stopped.
     ensure_default_workspace(&store).await?;
 
     let gateway_listeners = bind_gateway_listeners(
@@ -499,8 +733,8 @@ pub(crate) async fn run_server(
     )
     .await?;
 
-    if let Err(err) = state.compute.resume_persisted_sandboxes().await {
-        warn!(error = %err, "Failed to resume persisted sandboxes during startup");
+    if let Err(err) = state.compute.start_persisted_sandboxes().await {
+        warn!(error = %err, "Failed to start persisted sandboxes during startup");
     }
 
     state.compute.spawn_watchers(shutdown_rx.clone());
@@ -564,6 +798,9 @@ pub(crate) async fn run_server(
             &tls.key_path,
             tls.client_ca_path.as_deref(),
             tls.require_client_auth,
+            tls.external_cert_path.as_deref(),
+            tls.external_key_path.as_deref(),
+            tls.external_server_names.clone(),
         )?;
 
         // Spawn file-watcher-based TLS certificate reload worker.
@@ -851,39 +1088,52 @@ fn unsupported_builtin_compute_driver(driver: ComputeDriverKind) -> compute::Com
 // Internal wiring helper: each argument is a distinct piece of runtime state
 // that must be passed through, so the count is justified.
 #[allow(clippy::too_many_arguments)]
+#[cfg(not(target_os = "windows"))]
+type OperatorAllowlistArc = Option<openshell_driver_kubernetes::OperatorNamespaceAllowlist>;
+#[cfg(target_os = "windows")]
+type OperatorAllowlistArc = Option<()>;
+
+#[allow(clippy::too_many_arguments)]
 async fn build_compute_runtime(
     config: &Config,
     driver_startup: compute::driver_config::DriverStartupContext<'_>,
+    driver: ConfiguredComputeDriver,
     store: Arc<Store>,
     sandbox_index: SandboxIndex,
     sandbox_watch_bus: SandboxWatchBus,
     tracing_log_bus: TracingLogBus,
     supervisor_sessions: Arc<supervisor_session::SupervisorSessionRegistry>,
-) -> Result<ComputeRuntime> {
-    let driver = configured_compute_driver(config, driver_startup)?;
+    shutdown_rx: watch::Receiver<bool>,
+) -> Result<(ComputeRuntime, OperatorAllowlistArc)> {
     info!(driver = %driver.name(), "Using compute driver");
 
-    let runtime = match driver {
+    #[cfg(target_os = "windows")]
+    let _ = (config, &shutdown_rx);
+
+    let (runtime, operator_allowlist) = match driver {
         #[cfg(not(target_os = "windows"))]
         ConfiguredComputeDriver::Builtin(ComputeDriverKind::Kubernetes) => {
             warn_if_kubernetes_sandbox_jwt_expiry_disabled(config);
             let k8s_config =
                 compute::driver_config::builtin::kubernetes_config_from_context(driver_startup)?;
-            ComputeRuntime::new_kubernetes(
+            let (rt, allowlist) = ComputeRuntime::new_kubernetes(
                 k8s_config,
                 store,
                 sandbox_index,
                 sandbox_watch_bus,
                 tracing_log_bus,
                 supervisor_sessions.clone(),
+                shutdown_rx,
             )
             .await
+            .map_err(|e| Error::execution(format!("failed to create compute runtime: {e}")))?;
+            (rt, allowlist)
         }
         #[cfg(not(target_os = "windows"))]
         ConfiguredComputeDriver::Builtin(ComputeDriverKind::Docker) => {
             let docker_config =
                 compute::driver_config::builtin::docker_config_from_context(driver_startup)?;
-            ComputeRuntime::new_docker(
+            let rt = ComputeRuntime::new_docker(
                 config.clone(),
                 docker_config,
                 store,
@@ -893,12 +1143,14 @@ async fn build_compute_runtime(
                 supervisor_sessions,
             )
             .await
+            .map_err(|e| Error::execution(format!("failed to create compute runtime: {e}")))?;
+            (rt, None)
         }
         #[cfg(not(target_os = "windows"))]
         ConfiguredComputeDriver::Builtin(ComputeDriverKind::Podman) => {
             let podman_config =
                 compute::driver_config::builtin::podman_config_from_context(driver_startup)?;
-            ComputeRuntime::new_podman(
+            let rt = ComputeRuntime::new_podman(
                 podman_config,
                 store,
                 sandbox_index,
@@ -907,6 +1159,8 @@ async fn build_compute_runtime(
                 supervisor_sessions,
             )
             .await
+            .map_err(|e| Error::execution(format!("failed to create compute runtime: {e}")))?;
+            (rt, None)
         }
         #[cfg(not(target_os = "windows"))]
         ConfiguredComputeDriver::Builtin(ComputeDriverKind::Vm) => {
@@ -916,7 +1170,7 @@ async fn build_compute_runtime(
                 .file
                 .and_then(|file| file.openshell.gateway.otlp.as_ref());
             let endpoint = compute::vm::spawn(config, &vm_config, otlp_config).await?;
-            ComputeRuntime::new_remote_driver(
+            let rt = ComputeRuntime::new_remote_driver(
                 endpoint,
                 store,
                 sandbox_index,
@@ -925,12 +1179,14 @@ async fn build_compute_runtime(
                 supervisor_sessions,
             )
             .await
+            .map_err(|e| Error::execution(format!("failed to create compute runtime: {e}")))?;
+            (rt, None)
         }
         ConfiguredComputeDriver::Builtin(ComputeDriverKind::Mxc) => {
             #[cfg(target_os = "windows")]
             {
                 let mxc_config = compute::driver_config::mxc_config_from_context(driver_startup)?;
-                ComputeRuntime::new_mxc(
+                let rt = ComputeRuntime::new_mxc(
                     mxc_config,
                     store,
                     sandbox_index,
@@ -939,12 +1195,14 @@ async fn build_compute_runtime(
                     supervisor_sessions,
                 )
                 .await
+                .map_err(|e| Error::execution(format!("failed to create compute runtime: {e}")))?;
+                (rt, None)
             }
             #[cfg(not(target_os = "windows"))]
             {
-                Err(compute::ComputeError::Message(
+                return Err(Error::execution(
                     "the mxc compute driver is only supported on Windows".to_string(),
-                ))
+                ));
             }
         }
         // Any remaining built-in driver is a Linux-only container backend whose
@@ -952,7 +1210,11 @@ async fn build_compute_runtime(
         // after the MXC arm so MXC (the one Windows-supported built-in) matches
         // first instead of being swallowed by this catch-all.
         #[cfg(target_os = "windows")]
-        ConfiguredComputeDriver::Builtin(driver) => Err(unsupported_builtin_compute_driver(driver)),
+        ConfiguredComputeDriver::Builtin(driver) => {
+            return Err(Error::execution(
+                unsupported_builtin_compute_driver(driver).to_string(),
+            ));
+        }
         ConfiguredComputeDriver::Remote { name } => {
             let remote_config =
                 compute::driver_config::remote_driver_config_from_context(driver_startup, &name)?;
@@ -964,7 +1226,7 @@ async fn build_compute_runtime(
             let endpoint = compute::connect_remote_compute_driver(name, &remote_config.socket_path)
                 .await
                 .map_err(|e| Error::execution(format!("failed to create compute runtime: {e}")))?;
-            ComputeRuntime::new_remote_driver(
+            let rt = ComputeRuntime::new_remote_driver(
                 endpoint,
                 store,
                 sandbox_index,
@@ -973,14 +1235,16 @@ async fn build_compute_runtime(
                 supervisor_sessions,
             )
             .await
+            .map_err(|e| Error::execution(format!("failed to create compute runtime: {e}")))?;
+            (rt, None)
         }
     };
 
-    runtime.map_err(|e| Error::execution(format!("failed to create compute runtime: {e}")))
+    Ok((runtime, operator_allowlist))
 }
 
 #[derive(Debug, Clone)]
-enum ConfiguredComputeDriver {
+pub(crate) enum ConfiguredComputeDriver {
     Builtin(ComputeDriverKind),
     Remote { name: String },
 }
@@ -1017,19 +1281,35 @@ fn configured_compute_driver(
     }
 }
 
+pub(crate) fn configured_compute_driver_for_startup(
+    startup: &ServerStartupConfig,
+) -> Result<ConfiguredComputeDriver> {
+    configured_compute_driver(
+        &startup.config,
+        compute::driver_config::DriverStartupContext {
+            file: startup.config_file.as_ref(),
+            guest_tls: startup.guest_tls.as_ref(),
+            gateway_port: startup.config.bind_address.port(),
+            gateway_tls_enabled: startup.config.tls.is_some(),
+            endpoint_overrides: &startup.config.compute_driver_endpoints,
+        },
+    )
+}
+
 fn resolve_configured_compute_driver(
     driver_name: &str,
     driver_startup: compute::driver_config::DriverStartupContext<'_>,
 ) -> Result<ConfiguredComputeDriver> {
     let name = openshell_core::config::normalize_compute_driver_name(driver_name)
         .map_err(Error::config)?;
-    let driver_kind = builtin_compute_driver(&name);
-    if driver_kind.is_some() && driver_startup.endpoint_overrides.contains_key(&name) {
-        return Err(Error::config(format!(
-            "compute driver '{name}' is a reserved built-in driver and cannot be selected with a socket endpoint"
-        )));
+    // An operator-provided endpoint replaces normal construction for the
+    // selected name. The gateway connects to it; it does not provision a
+    // remote implementation for canonical built-in names.
+    if driver_startup.endpoint_overrides.contains_key(&name) {
+        return Ok(ConfiguredComputeDriver::Remote { name });
     }
 
+    let driver_kind = builtin_compute_driver(&name);
     if let Some(kind) = driver_kind {
         return Ok(ConfiguredComputeDriver::Builtin(kind));
     }
@@ -1118,10 +1398,11 @@ pub(crate) async fn ensure_default_workspace(store: &Store) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        BoundGatewayListener, ConfiguredComputeDriver, ConnectionProtocol, GatewayListenerScope,
-        MultiplexService, ServerState, TlsAcceptor, allow_plaintext_service_http,
-        bind_gateway_listeners, classify_initial_bytes, configured_compute_driver,
-        is_benign_tls_handshake_failure, kubernetes_sandbox_jwt_expiry_disabled,
+        BoundGatewayListener, ConfiguredComputeDriver, ConnectionProtocol, ExtensionKind,
+        GatewayListenerScope, MultiplexService, ServerState, TlsAcceptor,
+        allow_plaintext_service_http, bind_gateway_listeners, classify_initial_bytes,
+        configured_compute_driver, is_benign_tls_handshake_failure,
+        kubernetes_sandbox_jwt_expiry_disabled, mint_gateway_extension_credential,
         serve_gateway_listener,
     };
     use openshell_core::{
@@ -1145,6 +1426,94 @@ mod tests {
         gateway_listener::GatewayListenerSpec,
         tls_test_utils::{generate_test_certs_with_ca, install_rustls_provider},
     };
+
+    fn extension_test_issuer() -> Arc<crate::auth::sandbox_jwt::SandboxJwtIssuer> {
+        let material = openshell_bootstrap::jwt::generate_jwt_key().expect("jwt key");
+        Arc::new(
+            crate::auth::sandbox_jwt::SandboxJwtIssuer::from_pem(
+                material.signing_key_pem.as_bytes(),
+                material.kid,
+                "gateway-a",
+                Duration::from_secs(900),
+            )
+            .expect("issuer"),
+        )
+    }
+
+    #[test]
+    fn plaintext_extension_endpoint_is_rejected_unless_explicitly_opted_out() {
+        let issuer = extension_test_issuer();
+
+        // Default posture: a plaintext endpoint cannot carry a bearer
+        // credential, so startup fails and names the opt-out.
+        let error = mint_gateway_extension_credential(
+            &issuer,
+            ExtensionKind::Middleware,
+            "content-guard",
+            "urn:openshell:extension:middleware:content-guard",
+            "http://host.openshell.internal:50051",
+            false,
+        )
+        .expect_err("plaintext endpoint must not silently downgrade");
+        assert!(error.to_string().contains("allow_insecure_transport"));
+
+        // Explicit opt-out starts the gateway with no credential attached.
+        assert!(
+            mint_gateway_extension_credential(
+                &issuer,
+                ExtensionKind::Middleware,
+                "content-guard",
+                "urn:openshell:extension:middleware:content-guard",
+                "http://host.openshell.internal:50051",
+                true,
+            )
+            .expect("opt-out must be permitted")
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn authenticated_extension_endpoints_mint_a_credential() {
+        let issuer = extension_test_issuer();
+        let credential = mint_gateway_extension_credential(
+            &issuer,
+            ExtensionKind::Middleware,
+            "content-guard",
+            "urn:openshell:extension:middleware:content-guard",
+            "https://content-guard.example:50051",
+            false,
+        )
+        .expect("credential")
+        .expect("authenticated endpoint mints a credential");
+        assert_eq!(credential.name, "content-guard");
+        assert!(credential.slot.expires_at_ms().is_some_and(|ms| ms > 0));
+
+        // Unix sockets are gateway-local, so only interceptors can use them.
+        // A middleware endpoint must also be reachable from every supervisor.
+        let error = mint_gateway_extension_credential(
+            &issuer,
+            ExtensionKind::Middleware,
+            "content-guard",
+            "urn:openshell:extension:middleware:content-guard",
+            "unix:///run/openshell/content-guard.sock",
+            false,
+        )
+        .expect_err("middleware cannot be reached over a gateway-local socket");
+        assert!(error.to_string().contains("must use https://"));
+
+        assert!(
+            mint_gateway_extension_credential(
+                &issuer,
+                ExtensionKind::Interceptor,
+                "quota",
+                "urn:openshell:extension:interceptor:quota",
+                "unix:///run/openshell/interceptors/quota.sock",
+                false,
+            )
+            .expect("credential")
+            .is_some()
+        );
+    }
 
     fn test_driver_startup<'a>(
         config: &'a Config,
@@ -1170,6 +1539,9 @@ mod tests {
             &dir.path().join("server-key.pem"),
             Some(&dir.path().join("ca.pem")),
             false,
+            None,
+            None,
+            Vec::new(),
         )
         .expect("failed to build tls acceptor");
 
@@ -1560,35 +1932,31 @@ mod tests {
     }
 
     #[test]
-    fn configured_compute_driver_rejects_vm_endpoint_from_config() {
+    fn configured_compute_driver_uses_vm_endpoint_override() {
         let config = Config::new(None)
             .with_compute_drivers([ComputeDriverKind::Vm])
             .with_compute_driver_endpoint("vm", "/run/openshell/vm.sock");
 
-        let err =
-            configured_compute_driver(&config, test_driver_startup(&config, None)).unwrap_err();
-
-        assert!(
-            err.to_string()
-                .contains("reserved built-in driver and cannot be selected with a socket endpoint"),
-            "unexpected error: {err}"
-        );
+        let driver =
+            configured_compute_driver(&config, test_driver_startup(&config, None)).unwrap();
+        assert!(matches!(
+            driver,
+            ConfiguredComputeDriver::Remote { name } if name == "vm"
+        ));
     }
 
     #[test]
-    fn configured_compute_driver_rejects_builtin_endpoint() {
+    fn configured_compute_driver_uses_builtin_endpoint_override() {
         let config = Config::new(None)
             .with_compute_drivers([ComputeDriverKind::Docker])
             .with_compute_driver_endpoint("docker", "/run/openshell/docker.sock");
 
-        let err =
-            configured_compute_driver(&config, test_driver_startup(&config, None)).unwrap_err();
-
-        assert!(
-            err.to_string()
-                .contains("cannot be selected with a socket endpoint"),
-            "unexpected error: {err}"
-        );
+        let driver =
+            configured_compute_driver(&config, test_driver_startup(&config, None)).unwrap();
+        assert!(matches!(
+            driver,
+            ConfiguredComputeDriver::Remote { name } if name == "docker"
+        ));
     }
 
     #[test]
@@ -1632,10 +2000,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_gateway_listener_bind_does_not_attempt_persisted_sandbox_resume() {
+    async fn failed_gateway_listener_bind_does_not_attempt_persisted_sandbox_start() {
         let occupied_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let occupied_address = occupied_listener.local_addr().unwrap();
-        let resume_attempted = AtomicBool::new(false);
+        let start_attempted = AtomicBool::new(false);
         let primary_address: SocketAddr = "127.0.0.1:0".parse().unwrap();
 
         let result: openshell_core::Result<()> = async {
@@ -1644,7 +2012,7 @@ mod tests {
                 &[docker_listener_requirement(occupied_address)],
             )
             .await?;
-            resume_attempted.store(true, Ordering::SeqCst);
+            start_attempted.store(true, Ordering::SeqCst);
             Ok(())
         }
         .await;
@@ -1654,8 +2022,8 @@ mod tests {
             "binding the occupied extra gateway address should fail"
         );
         assert!(
-            !resume_attempted.load(Ordering::SeqCst),
-            "persisted sandbox resume must not run before every gateway listener is bound"
+            !start_attempted.load(Ordering::SeqCst),
+            "persisted sandbox start must not run before every gateway listener is bound"
         );
     }
 

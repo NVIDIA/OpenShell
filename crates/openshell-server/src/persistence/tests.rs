@@ -1302,6 +1302,65 @@ fn parse_label_selector_handles_whitespace() {
     assert_eq!(result.get("tier"), Some(&"frontend".to_string()));
 }
 
+#[tokio::test]
+async fn create_scoped_is_insert_only_and_preserves_scope() {
+    use super::PersistenceError;
+
+    let store = test_store().await;
+    let created = store
+        .create_scoped(
+            "refresh",
+            "winner-id",
+            "provider-token",
+            "default",
+            "winner-provider",
+            b"winner",
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(created.resource_version, 1);
+
+    let duplicate = store
+        .create_scoped(
+            "refresh",
+            "loser-id",
+            "provider-token",
+            "default",
+            "loser-provider",
+            b"loser",
+            None,
+        )
+        .await;
+    assert!(matches!(
+        duplicate,
+        Err(PersistenceError::UniqueViolation { .. })
+    ));
+
+    let winner = store
+        .get_by_name("refresh", "default", "provider-token")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(winner.id, "winner-id");
+    assert_eq!(winner.payload, b"winner");
+    assert_eq!(
+        store
+            .list_by_scope("refresh", "winner-provider", 10, 0)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(
+        store
+            .list_by_scope("refresh", "loser-provider", 10, 0)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
 // ---------------------------------------------------------------------------
 // CAS (compare-and-swap) tests
 // ---------------------------------------------------------------------------

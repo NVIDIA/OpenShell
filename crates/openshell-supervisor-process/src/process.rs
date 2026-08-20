@@ -151,6 +151,7 @@ const SUPERVISOR_ONLY_ENV_VARS: &[&str] = &[
     openshell_core::sandbox_env::TLS_CERT,
     openshell_core::sandbox_env::TLS_KEY,
     openshell_core::sandbox_env::PROVIDER_SPIFFE_WORKLOAD_API_SOCKET,
+    openshell_core::sandbox_env::NETWORK_RUNTIME_CAPABILITIES,
 ];
 
 pub fn is_supervisor_only_env_var(key: &str) -> bool {
@@ -2230,14 +2231,14 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
-    fn explicit_identity_rejects_non_root_system_ids() {
+    fn explicit_identity_accepts_non_root_system_ids() {
         let policy = policy_with_process(ProcessPolicy {
             run_as_user: Some("101".into()),
             run_as_group: Some("102".into()),
         });
 
-        assert!(validate_sandbox_user(&policy).is_err());
-        assert!(validate_sandbox_group(&policy).is_err());
+        assert!(validate_sandbox_user(&policy).is_ok());
+        assert!(validate_sandbox_group(&policy).is_ok());
     }
 
     #[test]

@@ -108,6 +108,24 @@ service OpenShell {
     };
   }
 
+  // Stop a sandbox while retaining its persistent state.
+  rpc StopSandbox(StopSandboxRequest) returns (SandboxResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "sandbox:write"
+      workspace_role: "user"
+    };
+  }
+
+  // Start a previously stopped sandbox.
+  rpc StartSandbox(StartSandboxRequest) returns (SandboxResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "sandbox:write"
+      workspace_role: "user"
+    };
+  }
+
   // Create a short-lived SSH session for a sandbox.
   rpc CreateSshSession(CreateSshSessionRequest) returns (CreateSshSessionResponse) {
     option (openshell.options.v1.authorization) = {
@@ -664,10 +682,16 @@ message IssueSandboxTokenResponse {
   int64 expires_at_ms = 2;
 }
 
-// RefreshSandboxToken request. Empty body; the calling principal must
-// already be a sandbox principal (i.e. the request carries a still-valid
-// gateway-minted JWT in its Authorization header).
-message RefreshSandboxTokenRequest {}
+// RefreshSandboxToken request. The calling principal must already be a
+// sandbox principal (i.e. the request carries a still-valid gateway-minted
+// JWT in its Authorization header). Extension service names are resolved
+// against server-owned registrations and the sandbox's effective policy;
+// callers never choose token audiences directly.
+message RefreshSandboxTokenRequest {
+  // Operator registration names for extension services selected by the
+  // sandbox's effective policy.
+  repeated string extension_service_names = 1;
+}
 
 // RefreshSandboxToken response. The new token replaces the supervisor's
 // in-memory bearer credential.
@@ -677,7 +701,11 @@ message RefreshSandboxTokenResponse {
   // Absolute expiry of the new token, milliseconds since the epoch. 0 means
   // the token is non-expiring.
   int64 expires_at_ms = 2;
+  // Fresh credentials for the requested, policy-authorized extension
+  // services. These remain in supervisor memory and are never persisted.
+  repeated ExtensionServiceCredential extension_credentials = 3;
 }
+
 
 // Health check request.
 message HealthRequest {}
@@ -879,6 +907,9 @@ enum SandboxPhase {
   SANDBOX_PHASE_ERROR = 3;
   SANDBOX_PHASE_DELETING = 4;
   SANDBOX_PHASE_UNKNOWN = 5;
+  SANDBOX_PHASE_STOPPING = 6;
+  SANDBOX_PHASE_STOPPED = 7;
+  SANDBOX_PHASE_STARTING = 8;
 }
 
 // Public platform event exposed on the sandbox watch stream.
@@ -970,6 +1001,22 @@ message DetachSandboxProviderRequest {
 
 // Delete sandbox request.
 message DeleteSandboxRequest {
+  // Sandbox name (canonical lookup key).
+  string name = 1;
+  // Workspace scope. Empty defaults to "default".
+  string workspace = 2;
+}
+
+// Stop sandbox request.
+message StopSandboxRequest {
+  // Sandbox name (canonical lookup key).
+  string name = 1;
+  // Workspace scope. Empty defaults to "default".
+  string workspace = 2;
+}
+
+// Start sandbox request.
+message StartSandboxRequest {
   // Sandbox name (canonical lookup key).
   string name = 1;
   // Workspace scope. Empty defaults to "default".
@@ -1532,6 +1579,9 @@ message StoredProviderCredentialRefreshState {
   string credential_key = 4;
   ProviderCredentialRefreshStrategy strategy = 5;
   map<string, string> material = 6 [(openshell.options.v1.secret) = true];
+  // Material names classified as secret. Newly configured values live in the
+  // active credential driver and are absent from material. Legacy inline values
+  // are not automatically migrated before OpenShell 0.1.0.
   repeated string secret_material_keys = 7;
   int64 expires_at_ms = 8;
   int64 next_refresh_at_ms = 9;
@@ -1547,6 +1597,28 @@ message StoredProviderCredentialRefreshState {
   // collision reservation, and env-key surfacing so later profile edits cannot
   // silently redirect writes.
   map<string, string> additional_output_keys = 17;
+  // Opaque gateway-owned authorization epoch for the configured refresh
+  // grant. Explicit refresh configuration creates a new epoch; automatic and
+  // manual token rotation preserve it. It is never derived from or exposed
+  // with refresh material.
+  string authorization_epoch = 18;
+  // Secret refresh material is stored through the gateway's active credential
+  // driver. The persisted refresh state keeps only opaque handles; resolved
+  // values exist in gateway memory for the duration of one mint operation.
+  map<string, openshell.datamodel.v1.CredentialHandle> secret_material_handles = 19;
+  // Handles replaced by reconfiguration or issuer-driven refresh-token
+  // rotation. This is a repeated entry rather than a material-keyed map so
+  // multiple superseded generations of the same material remain recoverable.
+  // Cleanup is retried by the refresh worker so a gateway crash or temporary
+  // credential-backend outage does not lose the deletion reference.
+  repeated StoredRefreshMaterialDeletion pending_secret_deletions = 20;
+}
+
+message StoredRefreshMaterialDeletion {
+  // Original material name used to derive the credential driver's storage key.
+  string material_key = 1;
+  // Opaque handle for the superseded secret object.
+  openshell.datamodel.v1.CredentialHandle handle = 2;
 }
 
 message GetProviderRefreshStatusRequest {
@@ -1565,6 +1637,9 @@ message ConfigureProviderRefreshRequest {
   string credential_key = 2;
   ProviderCredentialRefreshStrategy strategy = 3;
   map<string, string> material = 4 [(openshell.options.v1.secret) = true];
+  // Additional material names the caller requests be stored as secrets. Every
+  // name must be present in material. The server also classifies secrets from
+  // the authoritative provider profile and refresh strategy.
   repeated string secret_material_keys = 5;
   optional int64 expires_at_ms = 6;
   // Workspace scope. Empty defaults to "default".
@@ -1743,6 +1818,12 @@ message StaticCredentialBinding {
   // Supervisors use it to retain old revision placeholders only across
   // rotations of the same provider credential.
   string credential_identity = 2;
+  // Opaque gateway-issued handle for a refresh-managed credential identity
+  // epoch. When non-empty, supervisors keep the workload placeholder stable
+  // across access-token rotations and replace only the resolver value. The
+  // handle changes when the sandbox, provider, credential key, refresh
+  // authorization epoch, or endpoint authorization boundary changes.
+  string workload_credential_handle = 3;
 }
 
 // Get sandbox provider environment response.
@@ -2625,4 +2706,17 @@ message ListWorkspaceMembersRequest {
 // List workspace members response.
 message ListWorkspaceMembersResponse {
   repeated WorkspaceMember members = 1;
+}
+
+// Short-lived credential for one policy-authorized extension service.
+// Kept at the end of the file so adding it does not renumber existing
+// generated message descriptors.
+message ExtensionServiceCredential {
+  // Operator registration name used to correlate the credential with the
+  // stable service registration delivered by GetSandboxConfig.
+  string service_name = 1;
+  // Gateway-minted JWT with an audience derived from the registration.
+  string token = 2 [(openshell.options.v1.secret) = true];
+  // Absolute expiry of the token, milliseconds since the epoch.
+  int64 expires_at_ms = 3;
 }

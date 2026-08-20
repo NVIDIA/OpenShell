@@ -29,6 +29,8 @@ e2e-gpu = ["e2e"]
 e2e-docker-gpu = ["e2e-docker", "e2e-gpu"]
 e2e-kubernetes = ["e2e"]
 e2e-kubernetes-credential-drivers = ["e2e-kubernetes"]
+e2e-kubernetes-workspace-managed = ["e2e-kubernetes"]
+e2e-kubernetes-workspace-operator = ["e2e-kubernetes"]
 e2e-podman = ["e2e", "e2e-host-gateway", "e2e-local-container-driver"]
 e2e-podman-gpu = ["e2e-podman", "e2e-gpu"]
 e2e-oidc-pkce = []
@@ -55,8 +57,8 @@ path = "tests/driver_config_volume.rs"
 required-features = ["e2e-local-container-driver"]
 
 [[test]]
-name = "gateway_resume"
-path = "tests/gateway_resume.rs"
+name = "gateway_start"
+path = "tests/gateway_start.rs"
 required-features = ["e2e-docker"]
 
 [[test]]
@@ -65,8 +67,8 @@ path = "tests/local_driver_token_restart.rs"
 required-features = ["e2e"]
 
 [[test]]
-name = "podman_gateway_resume"
-path = "tests/podman_gateway_resume.rs"
+name = "podman_gateway_start"
+path = "tests/podman_gateway_start.rs"
 required-features = ["e2e-podman"]
 
 [[test]]
@@ -80,13 +82,28 @@ path = "tests/podman_oci_identity.rs"
 required-features = ["e2e-podman"]
 
 [[test]]
-name = "vm_gateway_resume"
-path = "tests/vm_gateway_resume.rs"
+name = "podman_userns"
+path = "tests/podman_userns.rs"
+required-features = ["e2e-podman"]
+
+[[test]]
+name = "provider_refresh_handles"
+path = "tests/provider_refresh_handles.rs"
+required-features = ["e2e-podman"]
+
+[[test]]
+name = "vm_gateway_start"
+path = "tests/vm_gateway_start.rs"
 required-features = ["e2e-vm"]
 
 [[test]]
 name = "readyz_health"
 path = "tests/readyz_health.rs"
+required-features = ["e2e-kubernetes"]
+
+[[test]]
+name = "kubernetes_corporate_proxy"
+path = "tests/kubernetes_corporate_proxy.rs"
 required-features = ["e2e-kubernetes"]
 
 [[test]]
@@ -97,6 +114,11 @@ required-features = ["e2e-kubernetes-credential-drivers"]
 [[test]]
 name = "websocket_conformance"
 path = "tests/websocket_conformance.rs"
+required-features = ["e2e-host-gateway"]
+
+[[test]]
+name = "credential_gating"
+path = "tests/credential_gating.rs"
 required-features = ["e2e-host-gateway"]
 
 [[test]]
@@ -135,6 +157,16 @@ path = "tests/proxy_egress_pipeline.rs"
 required-features = ["e2e-host-gateway"]
 
 [[test]]
+name = "workspace_namespace_managed"
+path = "tests/workspace_namespace_managed.rs"
+required-features = ["e2e-kubernetes-workspace-managed"]
+
+[[test]]
+name = "workspace_namespace_operator"
+path = "tests/workspace_namespace_operator.rs"
+required-features = ["e2e-kubernetes-workspace-operator"]
+
+[[test]]
 name = "gpu"
 path = "tests/gpu.rs"
 required-features = ["e2e-gpu"]
@@ -158,6 +190,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yml = "0.0.12"
 url = "2"
+nix = { version = "0.29", features = ["user"] }
 
 [dev-dependencies]
 serial_test = "3"

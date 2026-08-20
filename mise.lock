@@ -55,6 +55,33 @@ checksum = "sha256:d5c38fb914bbad57c6a7d58c4847315bc3fe11efbe4fb51b3c515f997a56c
 url = "https://github.com/EmbarkStudios/cargo-about/releases/download/0.8.4/cargo-about-0.8.4-x86_64-pc-windows-msvc.tar.gz"
 url_api = "https://api.github.com/repos/EmbarkStudios/cargo-about/releases/assets/324269449"
 
+[[tools."github:EmbarkStudios/cargo-deny"]]
+version = "0.20.2"
+backend = "github:EmbarkStudios/cargo-deny"
+
+[tools."github:EmbarkStudios/cargo-deny".options]
+version_prefix = ""
+
+[tools."github:EmbarkStudios/cargo-deny"."platforms.linux-arm64"]
+checksum = "sha256:995c82be0defc7a025cae49a2aa2644ce8245c9a3318fc4103907c6a285e8c7d"
+url = "https://github.com/EmbarkStudios/cargo-deny/releases/download/0.20.2/cargo-deny-0.20.2-aarch64-unknown-linux-musl.tar.gz"
+url_api = "https://api.github.com/repos/EmbarkStudios/cargo-deny/releases/assets/471598345"
+
+[tools."github:EmbarkStudios/cargo-deny"."platforms.linux-x64"]
+checksum = "sha256:9f12ed4c49936e09b48bf862b595cde2fe64fcbd9d74dfacac6131ca824c8d5f"
+url = "https://github.com/EmbarkStudios/cargo-deny/releases/download/0.20.2/cargo-deny-0.20.2-x86_64-unknown-linux-musl.tar.gz"
+url_api = "https://api.github.com/repos/EmbarkStudios/cargo-deny/releases/assets/471598214"
+
+[tools."github:EmbarkStudios/cargo-deny"."platforms.macos-arm64"]
+checksum = "sha256:fe67d82a10d8597a3549364cb733a3f9cc1bfff9031b7ae46384a9f2a72090c3"
+url = "https://github.com/EmbarkStudios/cargo-deny/releases/download/0.20.2/cargo-deny-0.20.2-aarch64-apple-darwin.tar.gz"
+url_api = "https://api.github.com/repos/EmbarkStudios/cargo-deny/releases/assets/471597689"
+
+[tools."github:EmbarkStudios/cargo-deny"."platforms.windows-x64"]
+checksum = "sha256:975a22143262fd27476d19ee00c7af67978426e40e1dee94eed6bbade1cf87dc"
+url = "https://github.com/EmbarkStudios/cargo-deny/releases/download/0.20.2/cargo-deny-0.20.2-x86_64-pc-windows-msvc.tar.gz"
+url_api = "https://api.github.com/repos/EmbarkStudios/cargo-deny/releases/assets/471599057"
+
 [[tools."github:anchore/syft"]]
 version = "1.44.0"
 backend = "github:anchore/syft"
@@ -82,28 +109,6 @@ checksum = "sha256:195e786eb84ec145854f20528992e86637c77d1968731dfe6ce850c90e28f
 url = "https://github.com/anchore/syft/releases/download/v1.44.0/syft_1.44.0_windows_amd64.zip"
 url_api = "https://api.github.com/repos/anchore/syft/releases/assets/410001172"
 provenance = "github-attestations"
-
-[[tools."github:mozilla/sccache"]]
-version = "0.16.0"
-backend = "github:mozilla/sccache"
-
-[tools."github:mozilla/sccache".options]
-asset_pattern = "sccache-v*x86_64*linux*.tar.gz"
-
-[tools."github:mozilla/sccache"."platforms.linux-arm64"]
-checksum = "sha256:f73a5c39f96bb6ebb89cc7915cf182260d4cbf30765322c5e793d0fe8bd80784"
-url = "https://github.com/mozilla/sccache/releases/download/v0.16.0/sccache-v0.16.0-aarch64-unknown-linux-musl.tar.gz"
-url_api = "https://api.github.com/repos/mozilla/sccache/releases/assets/452060468"
-
-[tools."github:mozilla/sccache"."platforms.linux-x64"]
-checksum = "sha256:aec995a83ad3dff3d14b6314e08858b7b73d35ca85a5bcf3d3a9ec07dee35588"
-url = "https://github.com/mozilla/sccache/releases/download/v0.16.0/sccache-v0.16.0-x86_64-unknown-linux-musl.tar.gz"
-url_api = "https://api.github.com/repos/mozilla/sccache/releases/assets/452060682"
-
-[tools."github:mozilla/sccache"."platforms.macos-arm64"]
-checksum = "sha256:ded590cae2c72042c61178632906bef62d635fa20d45f8b22110a2241f430960"
-url = "https://github.com/mozilla/sccache/releases/download/v0.16.0/sccache-v0.16.0-aarch64-apple-darwin.tar.gz"
-url_api = "https://api.github.com/repos/mozilla/sccache/releases/assets/452060416"
 
 [[tools."github:mozilla/sccache"]]
 version = "0.16.0"
@@ -193,6 +198,9 @@ backend = "go:google.golang.org/protobuf/cmd/protoc-gen-go"
 version = "4.2.0"
 backend = "aqua:helm/helm"
 
+[tools.helm.options]
+"vars.version_prefix" = "v"
+
 [tools.helm."platforms.linux-arm64"]
 checksum = "sha256:1f8de130dfbd04de64978e7b852a7a547be1404956a366608276d2520b678670"
 url = "https://get.helm.sh/helm-v4.2.0-linux-arm64.tar.gz"
@@ -260,6 +268,9 @@ url_api = "https://api.github.com/repos/k3d-io/k3d/releases/assets/229450011"
 [[tools.kubectl]]
 version = "1.36.1"
 backend = "aqua:kubernetes/kubernetes/kubectl"
+
+[tools.kubectl.options]
+"vars.version_prefix" = "v"
 
 [tools.kubectl."platforms.linux-arm64"]
 checksum = "sha256:59f7ee8e477fae658447607dc3c8790ac17a1b016c01c622c12070e969e2d4e7"
@@ -360,18 +371,19 @@ backend = "core:rust"
 version = "2.20.0"
 backend = "aqua:GoogleContainerTools/skaffold"
 
+[tools.skaffold.options]
+"vars.version_prefix" = "v"
+
 [tools.skaffold."platforms.linux-arm64"]
 url = "https://storage.googleapis.com/skaffold/releases/v2.20.0/skaffold-linux-arm64"
 
 [tools.skaffold."platforms.linux-x64"]
-checksum = "blake3:4de6b14984ff1c7e5f107dd12d15890feb4b6600032d61158162c243a81d9156"
 url = "https://storage.googleapis.com/skaffold/releases/v2.20.0/skaffold-linux-amd64"
 
 [tools.skaffold."platforms.macos-arm64"]
 url = "https://storage.googleapis.com/skaffold/releases/v2.20.0/skaffold-darwin-arm64"
 
 [tools.skaffold."platforms.windows-x64"]
-checksum = "blake3:f6db036671e29118d0fdc4457dc563e99d7bff8a39f0f2f72e3e5d857d9013a3"
 url = "https://storage.googleapis.com/skaffold/releases/v2.20.0/skaffold-windows-amd64.exe"
 
 [[tools.uv]]

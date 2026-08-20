@@ -25,7 +25,7 @@ Triage establishes technical validity; it does not decide whether valid work bel
 
 OpenShell has no `priority:*` labels. Sequencing comes from association with an item on the OpenShell Roadmap, and that association is a maintainer decision.
 
-`state:validated` means the factual assessment is complete and awaits human disposition. A human declines by closing the issue as not planned with a rationale, or accepts by replacing `state:validated` with `state:accepted` and placing the issue on the roadmap as documented in `CONTRIBUTING.md`. Accepted work may remain human-owned. A maintainer can queue deeper agent investigation or planning with `agent:plan-requested`, or directly ask an agent to work on a specific issue.
+`state:validated` means the factual assessment is complete and awaits human disposition. A human declines by closing the issue as not planned with a rationale, or accepts by applying `state:accepted`, placing the issue on the roadmap, or doing both as documented in `CONTRIBUTING.md`. Accepted work may remain human-owned. A maintainer can queue deeper agent investigation or planning with `agent:plan-requested`, or directly ask an agent to work on a specific issue.
 
 The optional `agent:*` workflow controls unattended queue pickup: `agent:plan-requested` queues planning, and `agent:implementation-requested` queues implementation after plan review. A direct user instruction separately authorizes the phase it requests and does not require either label.
 
@@ -98,18 +98,14 @@ Search the issue comments for the triage agent marker (`> **📋 triage-agent**`
 
 - **If the marker is found** and no subsequent human comments exist with new information or questions, report that the issue has already been triaged and stop.
 - **If the marker is found** but there are newer human comments with additional information, proceed to Step 3 to re-evaluate with the new context.
-- **If a human already declined the issue or applied `state:accepted`**, do not undo or reinterpret that decision.
+- **If a human already declined the issue, applied `state:accepted`, or placed it on the roadmap**, do not undo or reinterpret that decision.
 - **If the marker is not found**, proceed to Step 3.
 
-## Step 3: Validate the Agent-First Gate
+## Step 3: Check Report Completeness
 
-Check whether the issue body contains a substantive agent diagnostic section. Treat this as evidence quality, not as a reason to skip obvious safety or routing actions. Look for:
+Check for a substantive User Story, Problem Statement, Impact / Why This Matters, and Acceptance Criteria. The impact should explain the consequences of the current behavior and any insufficient workaround. For bug reports, also identify the reproduction steps and relevant environment. For feature requests, review the Proposed Design and Alternatives Considered. Reporter-supplied diagnostics and agent output are optional and must not be used as an intake gate.
 
-- An "Agent Diagnostic" heading or section (from the bug report template)
-- Evidence that the reporter used agent skills (skill names mentioned, diagnostic output pasted)
-- Concrete investigation output (not just placeholder text or "N/A")
-
-If the diagnostic is missing, continue when the report already contains enough concrete evidence to assess safely. Otherwise classify it as `needs-information`, request the exact missing evidence, remove `state:triage-needed`, and add `state:needs-info`.
+If the report contains enough context to understand and assess the need, continue. If a required section lacks material information, classify it as `needs-information`, request only the exact missing information, remove `state:triage-needed`, and add `state:needs-info`.
 
 - If a public issue may disclose a security vulnerability, do not repeat or expand sensitive details. Classify it as `security-report` and direct the operator to `SECURITY.md`.
 - Route usage questions and support requests to the documented support venue.
@@ -121,7 +117,7 @@ Proceed to Step 4 for reports requiring technical validation.
 
 Before deeper diagnosis, determine whether the report may already be fixed in a newer release.
 
-1. Extract the reported OpenShell version from the issue body, Agent Diagnostic, environment section, logs, and comments. If no version is provided, record that as missing context and continue.
+1. Extract the reported OpenShell version from the issue body, environment section, logs, and comments. If no version is provided, record that as missing context and continue.
 2. Check current release information and known fixes when available:
    - `gh release list --limit 10`
    - `gh release view <tag>`
@@ -140,15 +136,17 @@ Assess the report by investigating the codebase. Use the `principal-engineer-rev
 ```
 Prompt the sub-agent with:
 - The full issue title and body
-- The reporter's agent diagnostic output
 - Instructions to evaluate with a skeptical lens:
-  1. Is this report describing a real problem or user error?
-  2. Can the described behavior be reproduced from the information given?
-  3. Does the reporter's agent diagnostic match what you see in the codebase?
-  4. If this is a bug, what component is affected?
-  5. If this is a feature request, is it technically coherent and feasible? Do not decide whether the project should accept it.
-  6. Are there any open or closed issues that duplicate this?
-  7. What uncertainty remains, and what exact evidence would resolve it?
+  1. What persona and desired capability does the user story establish?
+  2. Does the problem statement match current product behavior?
+  3. Does the impact explain the consequences, current workaround, and why that workaround is insufficient?
+  4. Are the acceptance criteria specific, observable, and consistent with the user story?
+  5. Can the described workflow be reproduced or otherwise validated from the information given?
+  6. Does the current product support the requested outcome, and what component owns the behavior?
+  7. Is the report best classified as a bug, feature request, support request, or another category?
+  8. If this is a feature request, is the proposed design technically coherent and feasible? Do not decide whether the project should accept it.
+  9. Are there any open or closed issues that duplicate this?
+  10. What uncertainty remains, and what exact evidence would resolve it?
 ```
 
 Based on the sub-agent's analysis, also attempt to validate the report directly:
@@ -205,14 +203,14 @@ Post a structured comment with the triage marker:
 > - **Evidence quality:** <high/medium/low with reason>
 >
 > ### Human Decision Required
-> Decide whether OpenShell should address this issue. If yes, replace
-> `state:validated` with `state:accepted`, associate it with a roadmap
-> item, and decide whether the work remains human-owned.
+> Decide whether OpenShell should address this issue. If yes, apply
+> `state:accepted`, associate it with a roadmap item, or do both, and decide
+> whether the work remains human-owned. Either action records acceptance;
+> roadmap placement additionally records sequencing.
 > To queue investigation or planning for an unattended agent, also apply
 > `agent:plan-requested`. You can instead directly ask an agent to use
 > `create-spike` or `build-from-issue` on this issue. If no, close it as not
 > planned and record the rationale.
-> Roadmap association is independent sequencing metadata.
 ```
 
 For other outcomes, replace the impact and decision sections with the exact information request, objective resolution, or safe routing guidance.
@@ -230,7 +228,7 @@ Community issue filed
         |
   state:validated
         |
-  human decline OR state:accepted + roadmap placement
+  human decline OR state:accepted / roadmap placement
         |
   create-spike          (if deeper investigation is approved)
         |

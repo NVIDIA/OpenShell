@@ -1136,6 +1136,7 @@ fn handled_fields_inventory() {
                     name: "rule".to_owned(),
                     endpoints: vec![NetworkEndpoint {
                         host: "api.example.com".into(),
+                        port: 443,
                         ..Default::default()
                     }],
                     binaries: Vec::new(),

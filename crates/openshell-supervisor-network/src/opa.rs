@@ -50,6 +50,34 @@ pub enum NetworkAction {
     Deny { reason: String },
 }
 
+/// Endpoint identity and metadata captured with one policy generation.
+#[derive(Debug, Clone)]
+pub struct MatchedEndpoint {
+    pub policy_name: String,
+    pub endpoint_index: usize,
+    pub endpoint: regorus::Value,
+}
+
+/// Policy-DNS eligible endpoint metadata captured from one policy generation.
+///
+/// This is policy data only. It deliberately contains no process identity or
+/// network authorization decision.
+#[derive(Debug, Clone)]
+pub struct PolicyDnsEligibilitySnapshot {
+    pub endpoints: Vec<MatchedEndpoint>,
+    pub generation: u64,
+}
+
+/// Atomic policy result used to authorize and materialize one egress request.
+#[derive(Debug, Clone)]
+pub struct EgressAuthorization {
+    pub action: NetworkAction,
+    pub endpoint_configs: Vec<regorus::Value>,
+    pub matched_endpoints: Vec<MatchedEndpoint>,
+    pub exact_declared_endpoint_host: bool,
+    pub generation: u64,
+}
+
 /// Input for a network access policy evaluation.
 pub struct NetworkInput {
     pub host: String,
@@ -124,6 +152,7 @@ pub struct OpaEngine {
     engine: Mutex<regorus::Engine>,
     generation: Arc<AtomicU64>,
     middleware_runner: RwLock<ChainRunner>,
+    websocket_assembly_budget: crate::l7::websocket::WebSocketAssemblyBudget,
     generation_tx: watch::Sender<u64>,
     fail_closed_reason: RwLock<Option<String>>,
 }
@@ -198,6 +227,7 @@ pub struct TunnelPolicyEngine {
     engine: Mutex<regorus::Engine>,
     generation_guard: PolicyGenerationGuard,
     middleware_runner: ChainRunner,
+    websocket_assembly_budget: crate::l7::websocket::WebSocketAssemblyBudget,
 }
 
 impl TunnelPolicyEngine {
@@ -225,6 +255,12 @@ impl TunnelPolicyEngine {
         &self.middleware_runner
     }
 
+    pub(crate) fn websocket_assembly_budget(
+        &self,
+    ) -> crate::l7::websocket::WebSocketAssemblyBudget {
+        self.websocket_assembly_budget.clone()
+    }
+
     /// Query the ordered middleware chain for a destination within this tunnel.
     pub fn query_middleware_chain(&self, input: &NetworkInput) -> Result<Vec<ChainEntry>> {
         let mut engine = self
@@ -236,6 +272,12 @@ impl TunnelPolicyEngine {
 }
 
 impl OpaEngine {
+    pub(crate) fn websocket_assembly_budget(
+        &self,
+    ) -> crate::l7::websocket::WebSocketAssemblyBudget {
+        self.websocket_assembly_budget.clone()
+    }
+
     fn with_engine(engine: regorus::Engine) -> Self {
         let generation = Arc::new(AtomicU64::new(0));
         let (generation_tx, _) = watch::channel(0);
@@ -243,6 +285,7 @@ impl OpaEngine {
             engine: Mutex::new(engine),
             generation,
             middleware_runner: RwLock::new(ChainRunner::default()),
+            websocket_assembly_budget: crate::l7::websocket::WebSocketAssemblyBudget::default(),
             generation_tx,
             fail_closed_reason: RwLock::new(None),
         }
@@ -252,15 +295,6 @@ impl OpaEngine {
         let generation = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
         self.generation_tx.send_replace(generation);
         generation
-    }
-
-    #[cfg(test)]
-    pub(crate) fn poison_lock_for_test(&self) {
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _guard = self.engine.lock().expect("test engine lock");
-            panic!("poison OPA engine lock for compatibility fallback test");
-        }));
-        assert!(self.engine.is_poisoned());
     }
 
     /// Load policy from a `.rego` rules file and data from a YAML file.
@@ -461,9 +495,7 @@ impl OpaEngine {
             });
         }
 
-        engine
-            .set_input_json(&input_json.to_string())
-            .map_err(|e| miette::miette!("{e}"))?;
+        set_regorus_input(&mut engine, input_json)?;
 
         let allowed = engine
             .eval_rule("data.openshell.sandbox.allow_network".into())
@@ -504,6 +536,13 @@ impl OpaEngine {
         &self,
         input: &NetworkInput,
     ) -> Result<(NetworkAction, u64)> {
+        let authorization = self.authorize_egress(input)?;
+        Ok((authorization.action, authorization.generation))
+    }
+
+    /// Authorize egress and return all connection metadata from one Rego result
+    /// evaluated against one policy generation.
+    pub fn authorize_egress(&self, input: &NetworkInput) -> Result<EgressAuthorization> {
         #[cfg(test)]
         record_test_opa_query();
 
@@ -521,36 +560,94 @@ impl OpaEngine {
             .map_err(|_| miette::miette!("OPA fail-closed state lock poisoned"))?
             .clone();
         if let Some(reason) = fail_closed_reason {
-            return Ok((NetworkAction::Deny { reason }, generation));
+            return Ok(EgressAuthorization {
+                action: NetworkAction::Deny { reason },
+                endpoint_configs: Vec::new(),
+                matched_endpoints: Vec::new(),
+                exact_declared_endpoint_host: false,
+                generation,
+            });
         }
 
-        engine
-            .set_input_json(&input_json.to_string())
-            .map_err(|e| miette::miette!("{e}"))?;
+        set_regorus_input(&mut engine, input_json)?;
 
-        let action_val = engine
-            .eval_rule("data.openshell.sandbox.network_action".into())
+        let result = engine
+            .eval_rule("data.openshell.sandbox.egress_authorization".into())
             .map_err(|e| miette::miette!("{e}"))?;
-        let action_str = value_to_string(&action_val);
+        let action_str = get_str(&result, "action").unwrap_or_default();
+        let matched_policy = get_str(&result, "matched_policy").filter(|name| !name.is_empty());
+        let endpoint_configs = match get_field(&result, "endpoint_configs") {
+            Some(regorus::Value::Array(values)) => values.to_vec(),
+            _ => Vec::new(),
+        };
+        let matched_endpoints = match get_field(&result, "matched_endpoints") {
+            Some(regorus::Value::Array(values)) => {
+                values.iter().filter_map(parse_matched_endpoint).collect()
+            }
+            _ => Vec::new(),
+        };
+        let exact_declared_endpoint_host =
+            get_bool(&result, "exact_declared_endpoint_host").unwrap_or(false);
 
-        let matched = engine
-            .eval_rule("data.openshell.sandbox.matched_network_policy".into())
-            .map_err(|e| miette::miette!("{e}"))?;
-        let matched_policy = if matched == regorus::Value::Undefined {
-            None
+        let action = if action_str == "allow" {
+            NetworkAction::Allow { matched_policy }
         } else {
-            Some(value_to_string(&matched))
+            NetworkAction::Deny {
+                reason: get_str(&result, "deny_reason")
+                    .filter(|reason| !reason.is_empty())
+                    .unwrap_or_else(|| "network connections not allowed by policy".to_string()),
+            }
         };
 
-        if action_str == "allow" {
-            Ok((NetworkAction::Allow { matched_policy }, generation))
-        } else {
-            let reason_val = engine
-                .eval_rule("data.openshell.sandbox.deny_reason".into())
-                .map_err(|e| miette::miette!("{e}"))?;
-            let reason = value_to_string(&reason_val);
-            Ok((NetworkAction::Deny { reason }, generation))
+        Ok(EgressAuthorization {
+            action,
+            endpoint_configs,
+            matched_endpoints,
+            exact_declared_endpoint_host,
+            generation,
+        })
+    }
+
+    /// Return all explicit TCP endpoints eligible for policy DNS.
+    ///
+    /// The owned endpoint records and generation are captured while holding
+    /// the engine lock, so reloads cannot mix data from one generation with
+    /// the generation number of another. Fail-closed quarantine produces an
+    /// empty snapshot for its quarantine generation.
+    pub fn policy_dns_eligibility_snapshot(&self) -> Result<PolicyDnsEligibilitySnapshot> {
+        let mut engine = self
+            .engine
+            .lock()
+            .map_err(|_| miette::miette!("OPA engine lock poisoned"))?;
+        let generation = self.current_generation();
+
+        if self
+            .fail_closed_reason
+            .read()
+            .map_err(|_| miette::miette!("OPA fail-closed state lock poisoned"))?
+            .is_some()
+        {
+            return Ok(PolicyDnsEligibilitySnapshot {
+                endpoints: Vec::new(),
+                generation,
+            });
         }
+
+        let value = engine
+            .eval_rule("data.openshell.sandbox.policy_dns_eligible_endpoint_records".into())
+            .map_err(|error| miette::miette!("{error}"))?;
+        let endpoints = match value {
+            regorus::Value::Array(values) => {
+                values.iter().filter_map(parse_matched_endpoint).collect()
+            }
+            regorus::Value::Undefined => Vec::new(),
+            other => parse_matched_endpoint(&other).into_iter().collect(),
+        };
+
+        Ok(PolicyDnsEligibilitySnapshot {
+            endpoints,
+            generation,
+        })
     }
 
     /// Reload policy and data from strings (data is YAML).
@@ -634,8 +731,6 @@ impl OpaEngine {
             .engine
             .into_inner()
             .map_err(|_| miette::miette!("lock poisoned on new engine"))?;
-        let new_runner = ChainRunner::from_registry(registry);
-
         // Match clone_engine_for_tunnel's lock order (engine, then runner) so
         // readers can observe only the old pair or the new pair.
         let mut engine = self
@@ -646,6 +741,7 @@ impl OpaEngine {
             .middleware_runner
             .write()
             .map_err(|_| miette::miette!("middleware runner lock poisoned"))?;
+        let new_runner = runner.with_replacement_registry(registry);
         *engine = new_engine;
         *runner = new_runner;
         *self
@@ -708,14 +804,42 @@ impl OpaEngine {
         self.generation.load(Ordering::Acquire)
     }
 
+    /// Run a short operation only while `expected_generation` is current.
+    ///
+    /// The engine mutex is also the policy reload mutex. Holding it across the
+    /// generation comparison and callback linearizes state derived from an OPA
+    /// snapshot with every policy reload and fail-closed transition. Callers
+    /// must not perform I/O or other long-running work in `operation`.
+    pub(crate) fn with_current_generation<T>(
+        &self,
+        expected_generation: u64,
+        operation: impl FnOnce(u64) -> T,
+    ) -> Result<Option<T>> {
+        let _engine = self
+            .engine
+            .lock()
+            .map_err(|_| miette::miette!("OPA engine lock poisoned"))?;
+        let current_generation = self.current_generation();
+        if current_generation != expected_generation {
+            return Ok(None);
+        }
+        Ok(Some(operation(current_generation)))
+    }
+
     /// Replace the complete middleware service registry and invalidate
     /// existing tunnels so subsequent requests use the new service set.
     pub fn replace_middleware_registry(&self, registry: MiddlewareRegistry) -> Result<()> {
+        // Generation changes serialize through the engine lock so guarded
+        // publication cannot overlap any runtime generation transition.
+        let _engine = self
+            .engine
+            .lock()
+            .map_err(|_| miette::miette!("OPA engine lock poisoned"))?;
         let mut runner = self
             .middleware_runner
             .write()
             .map_err(|_| miette::miette!("middleware runner lock poisoned"))?;
-        *runner = ChainRunner::from_registry(registry);
+        *runner = runner.with_replacement_registry(registry);
         self.advance_generation();
         Ok(())
     }
@@ -823,9 +947,7 @@ impl OpaEngine {
             .map_err(|_| miette::miette!("OPA engine lock poisoned"))?;
         let generation = self.current_generation();
 
-        engine
-            .set_input_json(&input_json.to_string())
-            .map_err(|e| miette::miette!("{e}"))?;
+        set_regorus_input(&mut engine, input_json)?;
 
         let val = engine
             .eval_rule("data.openshell.sandbox._matching_endpoint_configs".into())
@@ -835,6 +957,38 @@ impl OpaEngine {
             regorus::Value::Undefined => Ok((Vec::new(), generation)),
             regorus::Value::Array(values) => Ok((values.to_vec(), generation)),
             other => Ok((vec![other], generation)),
+        }
+    }
+
+    /// Query every matching endpoint for credential-provenance gating.
+    ///
+    /// Unlike [`Self::query_endpoint_configs_with_generation`], this includes
+    /// L4-only endpoints, which carry no extended L7 config. It is answered by
+    /// a dedicated Rego rule so credential gating cannot alter which endpoint
+    /// the TLS mode and SSRF allowlist are read from.
+    pub fn query_endpoint_credential_guards(
+        &self,
+        input: &NetworkInput,
+    ) -> Result<Vec<regorus::Value>> {
+        let input_json = network_input_json(input);
+
+        let mut engine = self
+            .engine
+            .lock()
+            .map_err(|_| miette::miette!("OPA engine lock poisoned"))?;
+
+        engine
+            .set_input_json(&input_json.to_string())
+            .map_err(|e| miette::miette!("{e}"))?;
+
+        let val = engine
+            .eval_rule("data.openshell.sandbox.endpoint_credential_guards".into())
+            .map_err(|e| miette::miette!("{e}"))?;
+
+        match val {
+            regorus::Value::Undefined => Ok(Vec::new()),
+            regorus::Value::Array(values) => Ok(values.to_vec()),
+            other => Ok(vec![other]),
         }
     }
 
@@ -883,9 +1037,7 @@ impl OpaEngine {
             .lock()
             .map_err(|_| miette::miette!("OPA engine lock poisoned"))?;
 
-        engine
-            .set_input_json(&input_json.to_string())
-            .map_err(|e| miette::miette!("{e}"))?;
+        set_regorus_input(&mut engine, input_json)?;
 
         let val = engine
             .eval_rule("data.openshell.sandbox.exact_declared_endpoint_host".into())
@@ -918,6 +1070,7 @@ impl OpaEngine {
                 generation_rx: self.generation_tx.subscribe(),
             },
             middleware_runner: self.middleware_runner()?,
+            websocket_assembly_budget: self.websocket_assembly_budget(),
         })
     }
 }
@@ -998,6 +1151,20 @@ fn network_input_json(input: &NetworkInput) -> serde_json::Value {
             "port": input.port,
         }
     })
+}
+
+/// Sets an already-built JSON value as Regorus input without encoding and reparsing JSON text.
+///
+/// The explicit fallible conversion preserves evaluator errors because Regorus's infallible
+/// `From<serde_json::Value>` conversion maps failures to [`regorus::Value::Undefined`].
+pub(crate) fn set_regorus_input(
+    engine: &mut regorus::Engine,
+    input: serde_json::Value,
+) -> Result<()> {
+    let input =
+        serde_json::from_value::<regorus::Value>(input).map_err(|e| miette::miette!("{e}"))?;
+    engine.set_input(input);
+    Ok(())
 }
 
 fn query_middleware_chain_locked(
@@ -1100,6 +1267,21 @@ fn get_field<'a>(val: &'a regorus::Value, key: &str) -> Option<&'a regorus::Valu
         regorus::Value::Object(map) => map.get(&key_val),
         _ => None,
     }
+}
+
+fn parse_matched_endpoint(value: &regorus::Value) -> Option<MatchedEndpoint> {
+    let policy_name = get_str(value, "policy_name")?;
+    let endpoint_index = match get_field(value, "endpoint_index")? {
+        regorus::Value::Number(number) => usize::try_from(number.as_i64()?).ok()?,
+        _ => return None,
+    };
+    let endpoint = get_field(value, "endpoint")?.clone();
+
+    Some(MatchedEndpoint {
+        policy_name,
+        endpoint_index,
+        endpoint,
+    })
 }
 
 fn regorus_value_to_struct(value: &regorus::Value) -> prost_types::Struct {
@@ -1759,6 +1941,12 @@ fn proto_to_opa_data_json(proto: &ProtoSandboxPolicy, entrypoint_pid: u32) -> St
                     if e.request_body_credential_rewrite {
                         ep["request_body_credential_rewrite"] = true.into();
                     }
+                    if e.allow_uninspected_credentials {
+                        ep["allow_uninspected_credentials"] = true.into();
+                    }
+                    if e.provider_credentialed {
+                        ep["provider_credentialed"] = true.into();
+                    }
                     if !e.credential_signing.is_empty() {
                         ep["credential_signing"] = e.credential_signing.clone().into();
                     }
@@ -1767,6 +1955,11 @@ fn proto_to_opa_data_json(proto: &ProtoSandboxPolicy, entrypoint_pid: u32) -> St
                     }
                     if !e.signing_region.is_empty() {
                         ep["signing_region"] = e.signing_region.clone().into();
+                    }
+                    if let Some(binding) = &e.credential_binding {
+                        ep["credential_binding"] = serde_json::json!({
+                            "provider": binding.provider.clone(),
+                        });
                     }
                     if !e.persisted_queries.is_empty() {
                         ep["persisted_queries"] = e.persisted_queries.clone().into();
@@ -1959,6 +2152,78 @@ mod tests {
             network_policies,
             network_middlewares: std::collections::HashMap::default(),
         }
+    }
+
+    const POLICY_DNS_SNAPSHOT_DATA: &str = r#"
+network_policies:
+  dns_transport:
+    name: dns_transport
+    endpoints:
+      - { host: resolver.example, ports: [53, 853], protocol: tcp }
+      - { host: web.example, port: 443, protocol: rest, access: full }
+      - { host: implicit.example, port: 443 }
+      - { host: "", port: 53, protocol: tcp, allowed_ips: [8.8.8.8] }
+      - { host: secondary.example, port: 5353, protocol: tcp }
+    binaries:
+      - { path: /usr/bin/one-process }
+filesystem_policy:
+  include_workdir: true
+  read_only: []
+  read_write: []
+landlock:
+  compatibility: best_effort
+process:
+  run_as_user: sandbox
+  run_as_group: sandbox
+"#;
+
+    #[test]
+    fn policy_dns_snapshot_is_tcp_only_stable_and_generation_consistent() {
+        let engine = OpaEngine::from_strings(TEST_POLICY, POLICY_DNS_SNAPSHOT_DATA).unwrap();
+
+        let snapshot = engine.policy_dns_eligibility_snapshot().unwrap();
+
+        assert_eq!(snapshot.generation, engine.current_generation());
+        assert_eq!(snapshot.endpoints.len(), 2);
+        assert_eq!(snapshot.endpoints[0].policy_name, "dns_transport");
+        assert_eq!(snapshot.endpoints[0].endpoint_index, 0);
+        assert_eq!(
+            get_str(&snapshot.endpoints[0].endpoint, "host").as_deref(),
+            Some("resolver.example")
+        );
+        let Some(regorus::Value::Array(ports)) =
+            get_field(&snapshot.endpoints[0].endpoint, "ports")
+        else {
+            panic!("eligible endpoint must retain concrete ports");
+        };
+        assert_eq!(ports.as_ref(), &[53.into(), 853.into()]);
+        assert_eq!(snapshot.endpoints[1].endpoint_index, 4);
+
+        engine
+            .reload(TEST_POLICY, POLICY_DNS_SNAPSHOT_DATA)
+            .unwrap();
+        let reloaded = engine.policy_dns_eligibility_snapshot().unwrap();
+        assert_eq!(reloaded.generation, snapshot.generation + 1);
+        assert_eq!(reloaded.endpoints.len(), 2);
+        assert_eq!(reloaded.endpoints[1].endpoint_index, 4);
+    }
+
+    #[test]
+    fn policy_dns_snapshot_is_empty_during_fail_closed_quarantine() {
+        let engine = OpaEngine::from_strings(TEST_POLICY, POLICY_DNS_SNAPSHOT_DATA).unwrap();
+        let generation = engine.enter_fail_closed("invalid candidate").unwrap();
+
+        let snapshot = engine.policy_dns_eligibility_snapshot().unwrap();
+
+        assert_eq!(snapshot.generation, generation);
+        assert!(snapshot.endpoints.is_empty());
+    }
+
+    #[test]
+    fn policy_dns_snapshot_accepts_the_default_multi_policy_shape() {
+        let engine = OpaEngine::from_strings(TEST_POLICY, TEST_DATA_YAML).unwrap();
+        let snapshot = engine.policy_dns_eligibility_snapshot().unwrap();
+        assert!(snapshot.endpoints.is_empty());
     }
 
     #[test]
@@ -2633,6 +2898,7 @@ network_policies:
     name: l4_only
     endpoints:
       - { host: l4only.example.com, port: 443 }
+      - { host: explicit-tcp.example.com, port: 443, protocol: tcp }
     binaries:
       - { path: /usr/bin/curl }
 filesystem_policy:
@@ -2788,7 +3054,7 @@ process:
 
     fn eval_l7(engine: &OpaEngine, input: &serde_json::Value) -> bool {
         let mut eng = engine.engine.lock().unwrap();
-        eng.set_input_json(&input.to_string()).unwrap();
+        set_regorus_input(&mut eng, input.clone()).unwrap();
         let val = eng
             .eval_rule("data.openshell.sandbox.allow_request".into())
             .unwrap();
@@ -2803,7 +3069,7 @@ process:
         engine
             .add_data_json(&data.to_string())
             .expect("add raw data json");
-        engine.set_input_json(&input.to_string()).unwrap();
+        set_regorus_input(&mut engine, input).unwrap();
         let val = engine
             .eval_rule("data.openshell.sandbox.allow_request".into())
             .unwrap();
@@ -3080,7 +3346,7 @@ process:
             }]),
         );
         let mut eng = engine.engine.lock().unwrap();
-        eng.set_input_json(&input.to_string()).unwrap();
+        set_regorus_input(&mut eng, input).unwrap();
         let val = eng
             .eval_rule("data.openshell.sandbox.request_deny_reason".into())
             .unwrap();
@@ -4383,7 +4649,7 @@ network_policies:
         let engine = l7_engine();
         let input = l7_input("api.example.com", 8080, "DELETE", "/repos/myorg/foo");
         let mut eng = engine.engine.lock().unwrap();
-        eng.set_input_json(&input.to_string()).unwrap();
+        set_regorus_input(&mut eng, input).unwrap();
         let val = eng
             .eval_rule("data.openshell.sandbox.request_deny_reason".into())
             .unwrap();
@@ -4414,6 +4680,26 @@ network_policies:
         let l7 = crate::l7::parse_l7_config(&config).unwrap();
         assert_eq!(l7.protocol, crate::l7::L7Protocol::Rest);
         assert_eq!(l7.enforcement, crate::l7::EnforcementMode::Enforce);
+    }
+
+    #[test]
+    fn explicit_tcp_authorizes_as_l4_without_endpoint_config() {
+        let engine = l7_engine();
+        let input = NetworkInput {
+            host: "explicit-tcp.example.com".into(),
+            port: 443,
+            binary_path: PathBuf::from("/usr/bin/curl"),
+            binary_sha256: "unused".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+
+        assert!(matches!(
+            engine.evaluate_network_action(&input).unwrap(),
+            NetworkAction::Allow { .. }
+        ));
+        assert!(engine.query_endpoint_config(&input).unwrap().is_none());
+        assert!(engine.query_exact_declared_endpoint_host(&input).unwrap());
     }
 
     #[test]
@@ -4777,7 +5063,7 @@ network_policies:
         // Verify the cloned engine can evaluate
         let input_json = l7_input("api.example.com", 8080, "GET", "/repos/myorg/foo");
         let mut eng = cloned.engine().lock().unwrap();
-        eng.set_input_json(&input_json.to_string()).unwrap();
+        set_regorus_input(&mut eng, input_json).unwrap();
         let val = eng
             .eval_rule("data.openshell.sandbox.allow_request".into())
             .unwrap();
@@ -4819,7 +5105,7 @@ network_policies:
             .clone_engine_for_tunnel(engine.current_generation())
             .unwrap();
         let mut eng = cloned.engine().lock().unwrap();
-        eng.set_input_json(&input_json.to_string()).unwrap();
+        set_regorus_input(&mut eng, input_json).unwrap();
         let val = eng
             .eval_rule("data.openshell.sandbox.allow_request".into())
             .unwrap();
@@ -5019,7 +5305,7 @@ process:
             "/repos/myorg/pulls/123/reviews",
         );
         let mut eng = engine.engine.lock().unwrap();
-        eng.set_input_json(&input.to_string()).unwrap();
+        set_regorus_input(&mut eng, input).unwrap();
         let val = eng
             .eval_rule("data.openshell.sandbox.allow_request".into())
             .unwrap();
@@ -5036,7 +5322,7 @@ process:
         // GET repos/issues is allowed and not denied
         let input = l7_input("api.github.com", 443, "GET", "/repos/myorg/issues");
         let mut eng = engine.engine.lock().unwrap();
-        eng.set_input_json(&input.to_string()).unwrap();
+        set_regorus_input(&mut eng, input).unwrap();
         let val = eng
             .eval_rule("data.openshell.sandbox.allow_request".into())
             .unwrap();
@@ -5053,7 +5339,7 @@ process:
         // POST to issues is allowed (deny only targets reviews)
         let input = l7_input("api.github.com", 443, "POST", "/repos/myorg/issues");
         let mut eng = engine.engine.lock().unwrap();
-        eng.set_input_json(&input.to_string()).unwrap();
+        set_regorus_input(&mut eng, input).unwrap();
         let val = eng
             .eval_rule("data.openshell.sandbox.allow_request".into())
             .unwrap();
@@ -5070,7 +5356,7 @@ process:
         // GET /repos/myorg/rulesets should be denied (method: "*")
         let input = l7_input("api.github.com", 443, "GET", "/repos/myorg/rulesets");
         let mut eng = engine.engine.lock().unwrap();
-        eng.set_input_json(&input.to_string()).unwrap();
+        set_regorus_input(&mut eng, input).unwrap();
         let val = eng
             .eval_rule("data.openshell.sandbox.allow_request".into())
             .unwrap();
@@ -5091,7 +5377,7 @@ process:
             "/repos/myorg/branches/main/protection",
         );
         let mut eng = engine.engine.lock().unwrap();
-        eng.set_input_json(&input.to_string()).unwrap();
+        set_regorus_input(&mut eng, input).unwrap();
         let val = eng
             .eval_rule("data.openshell.sandbox.allow_request".into())
             .unwrap();
@@ -5112,7 +5398,7 @@ process:
             "/repos/myorg/pulls/123/reviews",
         );
         let mut eng = engine.engine.lock().unwrap();
-        eng.set_input_json(&input.to_string()).unwrap();
+        set_regorus_input(&mut eng, input).unwrap();
         let val = eng
             .eval_rule("data.openshell.sandbox.request_deny_reason".into())
             .unwrap();
@@ -5138,7 +5424,7 @@ process:
             serde_json::json!({"force": ["true"]}),
         );
         let mut eng = engine.engine.lock().unwrap();
-        eng.set_input_json(&input.to_string()).unwrap();
+        set_regorus_input(&mut eng, input).unwrap();
         let val = eng
             .eval_rule("data.openshell.sandbox.allow_request".into())
             .unwrap();
@@ -5161,7 +5447,7 @@ process:
             serde_json::json!({"force": ["false"]}),
         );
         let mut eng = engine.engine.lock().unwrap();
-        eng.set_input_json(&input.to_string()).unwrap();
+        set_regorus_input(&mut eng, input).unwrap();
         let val = eng
             .eval_rule("data.openshell.sandbox.allow_request".into())
             .unwrap();
@@ -5186,7 +5472,7 @@ process:
             serde_json::json!({"force": ["true", "false"]}),
         );
         let mut eng = engine.engine.lock().unwrap();
-        eng.set_input_json(&input.to_string()).unwrap();
+        set_regorus_input(&mut eng, input).unwrap();
         let val = eng
             .eval_rule("data.openshell.sandbox.allow_request".into())
             .unwrap();
@@ -5204,7 +5490,7 @@ process:
         // so no match (key not present) and request should be allowed
         let input = l7_input("api.restricted.com", 443, "POST", "/admin/settings");
         let mut eng = engine.engine.lock().unwrap();
-        eng.set_input_json(&input.to_string()).unwrap();
+        set_regorus_input(&mut eng, input).unwrap();
         let val = eng
             .eval_rule("data.openshell.sandbox.allow_request".into())
             .unwrap();
@@ -5299,6 +5585,18 @@ process:
             NetworkAction::Allow {
                 matched_policy: Some("allow_192_168_1_100_8567".to_string())
             }
+        );
+
+        let authorization = engine.authorize_egress(&input).unwrap();
+        let mut endpoint_identities = authorization
+            .matched_endpoints
+            .iter()
+            .map(|matched| (matched.policy_name.as_str(), matched.endpoint_index))
+            .collect::<Vec<_>>();
+        endpoint_identities.sort_unstable();
+        assert_eq!(
+            endpoint_identities,
+            [("allow_192_168_1_100_8567", 0), ("test_server", 0),]
         );
 
         let (configs, generation) = engine
@@ -5642,6 +5940,87 @@ process:
             .expect("Failed to load allowed_ips test data")
     }
 
+    /// An L4-only credentialed endpoint must not join the shared endpoint-config
+    /// list: `query_endpoint_config` returns only its first element, so joining
+    /// it would let the L4 endpoint shadow the inspected endpoint's TLS mode and
+    /// SSRF allowlist on the same host:port.
+    #[test]
+    fn credential_guard_does_not_shadow_inspected_endpoint_config() {
+        const OVERLAPPING_DATA: &str = r#"
+network_policies:
+  telemetry_l4:
+    name: telemetry_l4
+    endpoints:
+      - host: api.example.com
+        port: 443
+        provider_credentialed: true
+        allow_uninspected_credentials: true
+    binaries:
+      - { path: /usr/bin/curl }
+  inspected_api:
+    name: inspected_api
+    endpoints:
+      - host: api.example.com
+        port: 443
+        protocol: rest
+        access: full
+        tls: skip
+        allowed_ips: ["10.0.5.0/24"]
+    binaries:
+      - { path: /usr/bin/curl }
+filesystem_policy:
+  include_workdir: true
+  read_only: []
+  read_write: []
+landlock:
+  compatibility: best_effort
+process:
+  run_as_user: sandbox
+  run_as_group: sandbox
+"#;
+        let engine = OpaEngine::from_strings(TEST_POLICY, OVERLAPPING_DATA)
+            .expect("overlapping endpoint policy should load");
+        let input = NetworkInput {
+            host: "api.example.com".into(),
+            port: 443,
+            binary_path: PathBuf::from("/usr/bin/curl"),
+            binary_sha256: "unused".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+
+        let configs = engine
+            .query_endpoint_configs_with_generation(&input)
+            .unwrap()
+            .0;
+        assert_eq!(
+            configs.len(),
+            1,
+            "only the inspected endpoint carries extended config"
+        );
+        let config = crate::l7::parse_l7_config(&configs[0]).expect("inspected endpoint config");
+        assert_eq!(config.protocol, crate::l7::L7Protocol::Rest);
+        assert_eq!(config.tls, crate::l7::TlsMode::Skip);
+        assert_eq!(
+            engine.query_allowed_ips(&input).unwrap(),
+            vec!["10.0.5.0/24"],
+            "SSRF allowlist must still come from the inspected endpoint"
+        );
+
+        let guards = engine.query_endpoint_credential_guards(&input).unwrap();
+        assert_eq!(
+            guards.len(),
+            2,
+            "credential gating must still see the L4-only endpoint"
+        );
+        assert!(
+            guards
+                .iter()
+                .map(crate::l7::parse_endpoint_credential_guard)
+                .any(|guard| guard.provider_credentialed)
+        );
+    }
+
     #[test]
     fn allowed_ips_mode2_host_plus_ips_allows() {
         let engine = allowed_ips_engine();
@@ -5660,6 +6039,121 @@ process:
             decision.reason
         );
         assert_eq!(decision.matched_policy.as_deref(), Some("internal_api"));
+    }
+
+    #[test]
+    fn egress_authorization_returns_one_generation_consistent_snapshot() {
+        let engine = allowed_ips_engine();
+        let input = NetworkInput {
+            host: "my-service.corp.net".into(),
+            port: 8080,
+            binary_path: PathBuf::from("/usr/bin/curl"),
+            binary_sha256: "unused".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+
+        let authorization = engine.authorize_egress(&input).unwrap();
+
+        assert_eq!(authorization.generation, engine.current_generation());
+        assert_eq!(
+            authorization.action,
+            NetworkAction::Allow {
+                matched_policy: Some("internal_api".to_string())
+            }
+        );
+        assert!(authorization.exact_declared_endpoint_host);
+        assert_eq!(authorization.endpoint_configs.len(), 1);
+        assert_eq!(
+            get_str_array(&authorization.endpoint_configs[0], "allowed_ips"),
+            vec!["10.0.5.0/24"]
+        );
+        assert_eq!(authorization.matched_endpoints.len(), 1);
+        assert_eq!(
+            authorization.matched_endpoints[0].policy_name,
+            "internal_api"
+        );
+        assert_eq!(authorization.matched_endpoints[0].endpoint_index, 0);
+        assert_eq!(
+            get_str(&authorization.matched_endpoints[0].endpoint, "host").as_deref(),
+            Some("my-service.corp.net")
+        );
+    }
+
+    #[test]
+    fn egress_authorization_preserves_explicit_tcp_endpoint_identity() {
+        let engine = OpaEngine::from_strings(
+            TEST_POLICY,
+            r#"
+network_policies:
+  native_tcp:
+    name: native_tcp
+    endpoints:
+      - host: database.example.com
+        port: 5432
+        protocol: tcp
+    binaries:
+      - path: /usr/bin/client
+filesystem_policy:
+  include_workdir: true
+  read_only: []
+  read_write: []
+landlock:
+  compatibility: best_effort
+process:
+  run_as_user: sandbox
+  run_as_group: sandbox
+"#,
+        )
+        .expect("explicit TCP policy should load");
+        let input = NetworkInput {
+            host: "database.example.com".into(),
+            port: 5432,
+            binary_path: PathBuf::from("/usr/bin/client"),
+            binary_sha256: "unused".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+
+        let authorization = engine.authorize_egress(&input).unwrap();
+
+        assert!(authorization.endpoint_configs.is_empty());
+        assert_eq!(authorization.matched_endpoints.len(), 1);
+        let matched = &authorization.matched_endpoints[0];
+        assert_eq!(matched.policy_name, "native_tcp");
+        assert_eq!(matched.endpoint_index, 0);
+        assert_eq!(
+            get_str(&matched.endpoint, "protocol").as_deref(),
+            Some("tcp")
+        );
+    }
+
+    #[test]
+    fn proto_activation_rejects_explicit_tcp_credential_binding() {
+        let proto = openshell_policy::parse_sandbox_policy(
+            r#"
+version: 1
+network_policies:
+  native_tcp:
+    name: native_tcp
+    endpoints:
+      - host: database.example.com
+        port: 5432
+        protocol: tcp
+        credential_binding:
+          provider: database
+    binaries:
+      - path: /usr/bin/client
+"#,
+        )
+        .expect("policy should parse before semantic validation");
+
+        let error = OpaEngine::from_proto(&proto)
+            .err()
+            .expect("explicit TCP must reject credential binding during activation");
+
+        assert!(error.to_string().contains("credential_binding"));
+        assert!(error.to_string().contains("protocol tcp"));
     }
 
     #[test]
@@ -7069,6 +7563,142 @@ network_policies:
     }
 
     #[tokio::test]
+    async fn middleware_session_budget_survives_atomic_registry_reload() {
+        let proto = test_proto();
+        let engine = OpaEngine::from_proto(&proto).expect("initial load should succeed");
+        let registry = MiddlewareRegistry::connect_services(
+            openshell_supervisor_middleware_builtins::services(),
+            Vec::new(),
+        )
+        .await
+        .expect("built-in registry");
+        engine
+            .replace_middleware_registry(registry)
+            .expect("install registry");
+        let old_runner = engine.middleware_runner().expect("old runner");
+        let entry = ChainEntry {
+            name: "regex".into(),
+            implementation: openshell_supervisor_middleware_builtins::BUILTIN_REGEX.into(),
+            order: 0,
+            config: prost_types::Struct {
+                fields: std::iter::once((
+                    "mode".into(),
+                    prost_types::Value {
+                        kind: Some(prost_types::value::Kind::StringValue("redact".into())),
+                    },
+                ))
+                .collect(),
+            },
+            on_error: openshell_supervisor_middleware::OnError::FailClosed,
+        };
+        let preflight_input =
+            |session_id: String| openshell_supervisor_middleware::WebSocketPreflightInput {
+                session_id,
+                request_id: "request".into(),
+                sandbox_id: "sandbox".into(),
+                scheme: "wss".into(),
+                host: "api.openai.com".into(),
+                port: 443,
+                path: "/v1/responses".into(),
+                requested_subprotocols: Vec::new(),
+            };
+        let mut old_sessions = Vec::new();
+        for index in 0..openshell_supervisor_middleware::MAX_CONCURRENT_MIDDLEWARE_SESSIONS {
+            let preflight = old_runner
+                .preflight_websocket(
+                    std::slice::from_ref(&entry),
+                    preflight_input(format!("old-generation-{index}")),
+                )
+                .await
+                .expect("admit old-generation session");
+            old_sessions.push(preflight.session.expect("built-in inspects session"));
+        }
+
+        let replacement = MiddlewareRegistry::connect_services(
+            openshell_supervisor_middleware_builtins::services(),
+            Vec::new(),
+        )
+        .await
+        .expect("replacement registry");
+        engine
+            .reload_policy_and_middleware_from_proto_with_pid(&proto, 0, replacement)
+            .expect("atomic policy and registry reload");
+        let current_runner = engine.middleware_runner().expect("current runner");
+        let overflow = current_runner
+            .preflight_websocket(
+                std::slice::from_ref(&entry),
+                preflight_input("new-generation-overflow".into()),
+            )
+            .await
+            .expect("capacity exhaustion is a typed preflight outcome");
+        assert!(!overflow.allowed);
+        assert!(overflow.session_capacity_exhausted);
+
+        old_sessions
+            .pop()
+            .expect("old-generation session")
+            .end(openshell_core::proto::WebSocketSessionEndReason::PolicyReload)
+            .await;
+        let admitted = current_runner
+            .preflight_websocket(
+                std::slice::from_ref(&entry),
+                preflight_input("new-generation-admitted".into()),
+            )
+            .await
+            .expect("released capacity is reusable after reload");
+        assert!(admitted.allowed);
+        assert!(admitted.session.is_some());
+    }
+
+    #[tokio::test]
+    async fn websocket_assembly_budget_survives_policy_reload() {
+        use crate::l7::websocket::{
+            MAX_CONCURRENT_WEBSOCKET_ASSEMBLIES, WebSocketAssemblyAdmissionOutcome,
+        };
+
+        let proto = test_proto();
+        let engine = OpaEngine::from_proto(&proto).expect("initial policy");
+        let old_tunnel = engine
+            .clone_engine_for_tunnel(engine.current_generation())
+            .expect("old tunnel");
+        let old_budget = old_tunnel.websocket_assembly_budget();
+        let mut old_admissions = Vec::new();
+        for _ in 0..MAX_CONCURRENT_WEBSOCKET_ASSEMBLIES {
+            match old_budget.reserve().await.expect("reserve old assembly") {
+                WebSocketAssemblyAdmissionOutcome::Admitted(admission) => {
+                    old_admissions.push(admission);
+                }
+                WebSocketAssemblyAdmissionOutcome::QueueExhausted => {
+                    panic!("active assembly capacity exhausted too early")
+                }
+            }
+        }
+
+        engine
+            .reload_from_proto_with_pid(&proto, 0)
+            .expect("policy reload");
+        let new_tunnel = engine
+            .clone_engine_for_tunnel(engine.current_generation())
+            .expect("new tunnel");
+        let new_budget = new_tunnel.websocket_assembly_budget();
+        let waiting = tokio::spawn(async move { new_budget.reserve().await });
+        tokio::task::yield_now().await;
+        assert!(
+            !waiting.is_finished(),
+            "new generation must share old generation assembly capacity"
+        );
+
+        drop(old_admissions.pop());
+        assert!(matches!(
+            waiting
+                .await
+                .expect("join waiting assembly")
+                .expect("waiting assembly result"),
+            WebSocketAssemblyAdmissionOutcome::Admitted(_)
+        ));
+    }
+
+    #[tokio::test]
     async fn policy_only_reload_keeps_connected_middleware_registry() {
         let proto = test_proto();
         let engine = OpaEngine::from_proto(&proto).expect("initial load should succeed");
@@ -7721,11 +8351,11 @@ host_match if {
         ];
         for (pattern, host) in cases {
             let rust = openshell_core::host_pattern::host_matches(pattern, host).unwrap();
-            engine
-                .set_input_json(
-                    &serde_json::json!({ "pattern": pattern, "host": host }).to_string(),
-                )
-                .unwrap();
+            set_regorus_input(
+                &mut engine,
+                serde_json::json!({ "pattern": pattern, "host": host }),
+            )
+            .unwrap();
             let rego = engine.eval_rule("data.test.host_match".into()).unwrap()
                 == regorus::Value::from(true);
             assert_eq!(

@@ -66,6 +66,20 @@ impl OpenShell for TestOpenShell {
         ))
     }
 
+    async fn stop_sandbox(
+        &self,
+        _request: tonic::Request<openshell_core::proto::StopSandboxRequest>,
+    ) -> Result<Response<openshell_core::proto::SandboxResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn start_sandbox(
+        &self,
+        _request: tonic::Request<openshell_core::proto::StartSandboxRequest>,
+    ) -> Result<Response<openshell_core::proto::SandboxResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
     async fn get_sandbox(
         &self,
         _request: tonic::Request<openshell_core::proto::GetSandboxRequest>,

@@ -46,8 +46,9 @@ use openshell_core::proto::{
     RemoveWorkspaceMemberResponse, ReportPolicyStatusRequest, ReportPolicyStatusResponse,
     RevokeSshSessionRequest, RevokeSshSessionResponse, RotateProviderCredentialRequest,
     RotateProviderCredentialResponse, SandboxResponse, ServiceEndpointResponse, ServiceStatus,
-    SubmitPolicyAnalysisRequest, SubmitPolicyAnalysisResponse, SupervisorMessage, TcpForwardFrame,
-    UndoDraftChunkRequest, UndoDraftChunkResponse, UpdateConfigRequest, UpdateConfigResponse,
+    StartSandboxRequest, StopSandboxRequest, SubmitPolicyAnalysisRequest,
+    SubmitPolicyAnalysisResponse, SupervisorMessage, TcpForwardFrame, UndoDraftChunkRequest,
+    UndoDraftChunkResponse, UpdateConfigRequest, UpdateConfigResponse,
     UpdateProviderProfilesRequest, UpdateProviderProfilesResponse, UpdateProviderRequest,
     WatchSandboxRequest, open_shell_server::OpenShell,
 };
@@ -321,6 +322,20 @@ impl OpenShell for OpenShellService {
         request: Request<DeleteSandboxRequest>,
     ) -> Result<Response<DeleteSandboxResponse>, Status> {
         sandbox::handle_delete_sandbox(&self.state, request).await
+    }
+
+    async fn stop_sandbox(
+        &self,
+        request: Request<StopSandboxRequest>,
+    ) -> Result<Response<SandboxResponse>, Status> {
+        sandbox::handle_stop_sandbox(&self.state, request).await
+    }
+
+    async fn start_sandbox(
+        &self,
+        request: Request<StartSandboxRequest>,
+    ) -> Result<Response<SandboxResponse>, Status> {
+        sandbox::handle_start_sandbox(&self.state, request).await
     }
 
     // --- Exec ---
@@ -738,7 +753,9 @@ pub mod test_support {
     use crate::ServerState;
     use crate::auth::identity::{Identity, IdentityProvider};
     use crate::auth::principal::{Principal, UserPrincipal};
-    use crate::compute::{new_test_runtime, new_test_runtime_for_driver};
+    use crate::compute::{
+        NoopTestDriver, new_test_runtime, new_test_runtime_for_driver, new_test_runtime_with_driver,
+    };
     use crate::persistence::Store;
     use crate::sandbox_index::SandboxIndex;
     use crate::sandbox_watch::SandboxWatchBus;
@@ -785,6 +802,33 @@ pub mod test_support {
         } else {
             new_test_runtime_for_driver(store.clone(), driver_name).await
         };
+        Arc::new(ServerState::new(
+            Config::new(None)
+                .with_database_url("sqlite::memory:?cache=shared")
+                .with_credential_drivers(["test-static"]),
+            store,
+            compute,
+            SandboxIndex::new(),
+            SandboxWatchBus::new(),
+            TracingLogBus::new(),
+            Arc::new(SupervisorSessionRegistry::new()),
+            None,
+        ))
+    }
+
+    /// Build a test state whose compute driver fails the requested number of
+    /// workspace cleanup calls before succeeding.
+    pub async fn test_server_state_with_workspace_cleanup_failures(
+        failures: usize,
+    ) -> Arc<ServerState> {
+        let store = Arc::new(
+            Store::connect("sqlite::memory:?cache=shared")
+                .await
+                .unwrap(),
+        );
+        crate::ensure_default_workspace(&store).await.unwrap();
+        let driver = Arc::new(NoopTestDriver::failing_workspace_deletes(failures));
+        let compute = new_test_runtime_with_driver(store.clone(), "test", driver).await;
         Arc::new(ServerState::new(
             Config::new(None)
                 .with_database_url("sqlite::memory:?cache=shared")

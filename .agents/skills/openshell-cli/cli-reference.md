@@ -48,6 +48,8 @@ openshell
 │   ├── create [opts] [-- CMD...]
 │   ├── get [name]
 │   ├── list [opts]
+│   ├── stop [name]
+│   ├── start [name]
 │   ├── delete [name]... [--all]
 │   ├── exec [--name <name>] [opts] -- CMD...
 │   ├── connect [name] [--editor <editor>]
@@ -250,6 +252,17 @@ Show sandbox details and the active policy. Metadata identifies sandbox or globa
 
 Delete one or more named sandboxes, or use `--all`. Deletion stops background port forwards.
 
+### `openshell sandbox stop [name]`
+
+Stop sandbox compute while retaining the sandbox and persistent workspace. The
+name defaults to the last-used sandbox. The command stops background forwards
+and waits for the `Stopped` phase.
+
+### `openshell sandbox start [name]`
+
+Start a stopped sandbox and wait for `Ready`. The name defaults to the
+last-used sandbox.
+
 ### `openshell sandbox exec [OPTIONS] -- COMMAND...`
 
 Execute a command through the gRPC exec endpoint, stream its output, and exit with the remote command's exit code.
@@ -371,6 +384,12 @@ Incrementally merge live network policy changes into the current sandbox policy 
 Notes:
 
 - The sandbox name defaults to the last-used sandbox.
+- `--add-endpoint` options are comma-separated: `allowed-ip=<CIDR-or-IP>`, `websocket-credential-rewrite`, `request-body-credential-rewrite`, and `allow-uninspected-credentials`. The last option is a security-sensitive exception for provider-credentialed L4-only, `tls: skip`, or otherwise uninspectable traffic.
+- `protocol` accepts `tcp` for explicit L4-only host/port policy. It has the
+  same payload-handling behavior as omitting the protocol, but it requires a
+  valid DNS hostname and rejects hostless `allowed_ips` or literal-IP
+  selectors. It cannot be combined with `access`, `rules`, or L7 enforcement
+  options.
 - `--add-allow` and `--add-deny` operate on REST and WebSocket endpoints. Use full YAML for JSON-RPC, MCP, SQL, or other policy structure.
 - `--wait` cannot be combined with `--dry-run`.
 - Use `policy set` when replacing the full policy or changing static sections.

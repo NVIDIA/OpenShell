@@ -10,9 +10,11 @@ use crate::driver::MxcComputeBackend;
 use futures::{Stream, StreamExt};
 use openshell_core::proto::compute::v1::{
     CreateSandboxRequest, CreateSandboxResponse, DeleteSandboxRequest, DeleteSandboxResponse,
-    GetCapabilitiesRequest, GetCapabilitiesResponse, GetGatewayListenerRequirementsRequest,
-    GetGatewayListenerRequirementsResponse, GetSandboxRequest, GetSandboxResponse,
-    ListSandboxesRequest, ListSandboxesResponse, StopSandboxRequest, StopSandboxResponse,
+    DeleteWorkspaceRequest, DeleteWorkspaceResponse, EnsureWorkspaceRequest,
+    EnsureWorkspaceResponse, GetCapabilitiesRequest, GetCapabilitiesResponse,
+    GetGatewayListenerRequirementsRequest, GetGatewayListenerRequirementsResponse,
+    GetSandboxRequest, GetSandboxResponse, ListSandboxesRequest, ListSandboxesResponse,
+    StartSandboxRequest, StartSandboxResponse, StopSandboxRequest, StopSandboxResponse,
     ValidateSandboxCreateRequest, ValidateSandboxCreateResponse, WatchSandboxesEvent,
     WatchSandboxesRequest, compute_driver_server::ComputeDriver,
 };
@@ -117,6 +119,15 @@ impl ComputeDriver for ComputeDriverService {
         Ok(Response::new(StopSandboxResponse {}))
     }
 
+    async fn start_sandbox(
+        &self,
+        _request: Request<StartSandboxRequest>,
+    ) -> Result<Response<StartSandboxResponse>, Status> {
+        Err(Status::unimplemented(
+            "mxc driver does not support restarting stopped sandboxes",
+        ))
+    }
+
     async fn delete_sandbox(
         &self,
         request: Request<DeleteSandboxRequest>,
@@ -145,5 +156,54 @@ impl ComputeDriver for ComputeDriverService {
         let stream = self.backend.watch_sandboxes().await;
         let mapped = stream.map(|item| item.map_err(|e| Status::internal(e.to_string())));
         Ok(Response::new(Box::pin(mapped)))
+    }
+
+    async fn ensure_workspace(
+        &self,
+        _request: Request<EnsureWorkspaceRequest>,
+    ) -> Result<Response<EnsureWorkspaceResponse>, Status> {
+        Ok(Response::new(EnsureWorkspaceResponse {}))
+    }
+
+    async fn delete_workspace(
+        &self,
+        _request: Request<DeleteWorkspaceRequest>,
+    ) -> Result<Response<DeleteWorkspaceResponse>, Status> {
+        Ok(Response::new(DeleteWorkspaceResponse {}))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::driver::MxcComputeConfig;
+
+    #[tokio::test]
+    async fn start_sandbox_reports_one_shot_lifecycle() {
+        let service =
+            ComputeDriverService::new(MxcComputeBackend::new(MxcComputeConfig::default()));
+
+        let error = service
+            .start_sandbox(Request::new(StartSandboxRequest::default()))
+            .await
+            .expect_err("MXC must not restart a stopped one-shot workload");
+
+        assert_eq!(error.code(), tonic::Code::Unimplemented);
+        assert!(error.message().contains("does not support restarting"));
+    }
+
+    #[tokio::test]
+    async fn workspace_lifecycle_is_an_idempotent_no_op() {
+        let service =
+            ComputeDriverService::new(MxcComputeBackend::new(MxcComputeConfig::default()));
+
+        service
+            .ensure_workspace(Request::new(EnsureWorkspaceRequest::default()))
+            .await
+            .expect("MXC has no driver-owned workspace resource to provision");
+        service
+            .delete_workspace(Request::new(DeleteWorkspaceRequest::default()))
+            .await
+            .expect("MXC workspace deletion must remain idempotent");
     }
 }

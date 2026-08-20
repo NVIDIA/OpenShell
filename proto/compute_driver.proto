@@ -8,14 +8,17 @@ package openshell.compute.v1;
 import "google/protobuf/struct.proto";
 import "options.proto";
 
-// Internal compute-driver contract used by the gateway.
+// Gateway/compute-driver extension contract.
 //
 // Conventions:
 // - This file owns driver-native request, response, and observation types.
 // - Compute drivers must not import or return the public `openshell.v1.Sandbox`
 //   resource model.
-// - The gateway translates between these internal driver-native messages and
+// - The gateway translates between these driver-native messages and
 //   the public OpenShell API resource model.
+// - Capability fields are additive. Drivers and gateways must ignore unknown
+//   fields so independently versioned external drivers remain
+//   forward-compatible.
 service ComputeDriver {
   // Report driver capabilities and defaults.
   rpc GetCapabilities(GetCapabilitiesRequest) returns (GetCapabilitiesResponse);
@@ -40,14 +43,24 @@ service ComputeDriver {
   // Provision platform resources for a sandbox.
   rpc CreateSandbox(CreateSandboxRequest) returns (CreateSandboxResponse);
 
-  // Stop platform resources for a sandbox without deleting its record.
+  // Idempotently stop platform resources without deleting persistent state.
   rpc StopSandbox(StopSandboxRequest) returns (StopSandboxResponse);
+
+  // Idempotently start platform resources for a stopped sandbox.
+  rpc StartSandbox(StartSandboxRequest) returns (StartSandboxResponse);
 
   // Tear down platform resources for a sandbox.
   rpc DeleteSandbox(DeleteSandboxRequest) returns (DeleteSandboxResponse);
 
   // Stream sandbox observations from the platform.
   rpc WatchSandboxes(WatchSandboxesRequest) returns (stream WatchSandboxesEvent);
+
+  // Ensure platform resources for a workspace exist (e.g. namespace).
+  // Idempotent: succeeds if resources already exist.
+  rpc EnsureWorkspace(EnsureWorkspaceRequest) returns (EnsureWorkspaceResponse);
+
+  // Tear down platform resources for a workspace.
+  rpc DeleteWorkspace(DeleteWorkspaceRequest) returns (DeleteWorkspaceResponse);
 }
 
 message GetCapabilitiesRequest {}
@@ -62,6 +75,9 @@ message GetCapabilitiesResponse {
   string driver_version = 2;
   // Default sandbox image recommended by the driver.
   string default_image = 3;
+  // Whether the gateway should stop running sandbox compute during graceful
+  // shutdown and restart the retained running intent on startup.
+  bool gateway_manages_lifecycle = 6;
 }
 
 message GetGatewayListenerRequirementsRequest {}
@@ -286,6 +302,15 @@ message StopSandboxRequest {
 
 message StopSandboxResponse {}
 
+message StartSandboxRequest {
+  // Stable sandbox ID stored by the gateway.
+  string sandbox_id = 1;
+  // Compute-runtime name used by the driver.
+  string sandbox_name = 2;
+}
+
+message StartSandboxResponse {}
+
 message DeleteSandboxRequest {
   // Stable sandbox ID stored by the gateway.
   string sandbox_id = 1;
@@ -327,3 +352,17 @@ message WatchSandboxesEvent {
     WatchSandboxesPlatformEvent platform_event = 3;
   }
 }
+
+message EnsureWorkspaceRequest {
+  // Workspace identifier used by the gateway.
+  string workspace = 1;
+}
+
+message EnsureWorkspaceResponse {}
+
+message DeleteWorkspaceRequest {
+  // Workspace identifier used by the gateway.
+  string workspace = 1;
+}
+
+message DeleteWorkspaceResponse {}

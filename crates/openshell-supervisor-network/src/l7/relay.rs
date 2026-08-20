@@ -312,18 +312,23 @@ where
 pub(crate) struct UpgradeRelayOptions<'a> {
     pub(crate) websocket_request: bool,
     pub(crate) websocket: WebSocketUpgradeBehavior,
+    pub(crate) assembly_budget: Option<crate::l7::websocket::WebSocketAssemblyBudget>,
     pub(crate) secret_resolver: Option<Arc<SecretResolver>>,
+    pub(crate) generation_guard: Option<&'a PolicyGenerationGuard>,
     pub(crate) engine: Option<&'a TunnelPolicyEngine>,
     pub(crate) ctx: Option<&'a L7EvalContext>,
     pub(crate) enforcement: EnforcementMode,
     pub(crate) target: String,
     pub(crate) query_params: std::collections::HashMap<String, Vec<String>>,
     pub(crate) policy_name: String,
+    pub(crate) middleware_session: Option<openshell_supervisor_middleware::WebSocketSession>,
+    pub(crate) selected_subprotocol: Option<String>,
 }
 
 #[derive(Default)]
 pub(crate) struct WebSocketUpgradeBehavior {
     pub(crate) credential_rewrite: bool,
+    pub(crate) deny_uninspected_credentials: bool,
     pub(crate) message_policy: WebSocketMessagePolicy,
     pub(crate) permessage_deflate: bool,
 }
@@ -564,6 +569,32 @@ where
                 .await?;
             return Ok(());
         };
+        // The request was canonicalized before the matching config was known,
+        // so `allow_encoded_slash` was taken permissively across every config
+        // on this host:port. Re-check it against the config that actually
+        // matched: the opt-in is per-endpoint, and one endpoint enabling it
+        // must not loosen parsing for the others.
+        // Check `req.target`, not `route_target`: redaction percent-decodes any
+        // segment holding a credential placeholder and re-inserts the redacted
+        // form without re-encoding, so a `%2F` sharing that segment becomes a
+        // literal `/` and would escape this check.
+        if !config.allow_encoded_slash
+            && crate::l7::path::canonical_path_has_encoded_slash(&req.target)
+        {
+            let detail = "request-target contains an encoded '/' (%2F) which is not allowed on this endpoint";
+            emit_parse_rejection(ctx, detail, engine_type_for_protocol(config.protocol));
+            crate::l7::rest::RestProvider::default()
+                .deny_with_redacted_target(
+                    &req,
+                    &ctx.policy_name,
+                    detail,
+                    client,
+                    None,
+                    Some(crate::l7::rest::DenyResponseContext::from_l7_context(ctx)),
+                )
+                .await?;
+            return Ok(());
+        }
         if deny_h2c_upgrade_if_requested(&req, config, ctx, client).await? {
             return Ok(());
         }
@@ -701,12 +732,13 @@ where
 
         if allowed || (config.enforcement == EnforcementMode::Audit && !force_deny) {
             let chain = engine.query_middleware_chain(&middleware_network_input(ctx))?;
+            let websocket_chain = websocket_request.then(|| chain.clone());
             // Route selection resolved `config` per request, so re-check the
             // body against that protocol's policy after every transforming
             // stage (a no-op for REST and websocket, whose policy inputs the
             // chain cannot mutate).
             let validate = transformed_body_validator(config, &engine, ctx, &request_info);
-            let req = match apply_middleware_chain(
+            let middleware_result = apply_middleware_chain(
                 req,
                 client,
                 ctx,
@@ -715,8 +747,8 @@ where
                 engine.generation_guard(),
                 openshell_supervisor_middleware::TransformedBodyPolicy::Reevaluate(&validate),
             )
-            .await?
-            {
+            .await;
+            let req = match middleware_result? {
                 MiddlewareApplyResult::Allowed(request) => request,
                 MiddlewareApplyResult::Denied { denial, .. } => {
                     let denied_request = crate::l7::provider::L7Request {
@@ -736,10 +768,60 @@ where
                     .await?;
                     return Ok(());
                 }
+                MiddlewareApplyResult::AdmissionExhausted => {
+                    let unavailable_request = crate::l7::provider::L7Request {
+                        action: request_info.action.clone(),
+                        target: redacted_target.clone(),
+                        query_params: request_info.query_params.clone(),
+                        raw_header: Vec::new(),
+                        body_length: crate::l7::provider::BodyLength::None,
+                    };
+                    crate::l7::middleware::send_middleware_admission_exhausted_response(
+                        &unavailable_request,
+                        client,
+                        ctx,
+                        &redacted_target,
+                    )
+                    .await?;
+                    return Ok(());
+                }
             };
             let scoped_ctx = scoped_context_for_request(ctx, &req);
             let ctx = scoped_ctx.as_ref().unwrap_or(ctx);
-            let Some(outcome) = relay_http_request_with_credential_rejection(
+            let mut middleware_session = if let Some(chain) = websocket_chain.as_deref() {
+                let preflight = websocket_middleware_preflight(
+                    &req,
+                    chain,
+                    engine.middleware_runner(),
+                    ctx,
+                    "wss",
+                )
+                .await;
+                let preflight = match preflight {
+                    Ok(preflight) => preflight,
+                    Err(error) => {
+                        warn!(error = %error, "WebSocket middleware preflight failed");
+                        write_bad_gateway_response(client).await?;
+                        return Ok(());
+                    }
+                };
+                crate::l7::middleware::emit_websocket_preflight_events(ctx, &preflight);
+                if preflight.terminal_reason.is_some() {
+                    crate::l7::middleware::send_middleware_rejection_response(
+                        &req,
+                        client,
+                        ctx,
+                        preflight.denial.as_ref(),
+                        &redacted_target,
+                    )
+                    .await?;
+                    return Ok(());
+                }
+                preflight.session
+            } else {
+                None
+            };
+            let outcome_result = relay_http_request_with_credential_rejection(
                 &req,
                 client,
                 upstream,
@@ -747,9 +829,14 @@ where
                     resolver: ctx.secret_resolver.as_deref(),
                     credential_generation: credential_generation_guard(ctx),
                     generation_guard: Some(engine.generation_guard()),
-                    websocket_extensions: websocket_extension_mode(config),
+                    websocket_extensions: websocket_extension_mode(
+                        config,
+                        middleware_session.is_some(),
+                    ),
                     request_body_credential_rewrite: config.protocol == L7Protocol::Rest
                         && config.request_body_credential_rewrite,
+                    deny_uninspected_credentials: config
+                        .deny_uninspected_body_credentials(ctx.secret_resolver.is_some()),
                     credential_signing: config.credential_signing,
                     signing_service: &config.signing_service,
                     signing_region: &config.signing_region,
@@ -758,16 +845,48 @@ where
                 },
                 ctx,
             )
-            .await?
-            else {
-                return Ok(());
+            .await;
+            let outcome_result = match outcome_result {
+                Ok(Some(outcome)) => Ok(outcome),
+                Ok(None) => {
+                    if let Some(session) = middleware_session.take() {
+                        session
+                            .end(openshell_core::proto::WebSocketSessionEndReason::Cancellation)
+                            .await;
+                    }
+                    return Ok(());
+                }
+                Err(error) => Err(error),
             };
+            let outcome = finalize_websocket_pre_upgrade(
+                &mut middleware_session,
+                engine.generation_guard(),
+                &ctx.host,
+                ctx.port,
+                &ctx.policy_name,
+                outcome_result,
+            )
+            .await?;
             match outcome {
-                RelayOutcome::Reusable => {}
-                RelayOutcome::Consumed => return Ok(()),
+                RelayOutcome::Reusable => {
+                    if let Some(session) = middleware_session.take() {
+                        session
+                            .end(openshell_core::proto::WebSocketSessionEndReason::UpstreamRejected)
+                            .await;
+                    }
+                }
+                RelayOutcome::Consumed => {
+                    if let Some(session) = middleware_session.take() {
+                        session
+                            .end(openshell_core::proto::WebSocketSessionEndReason::UpstreamRejected)
+                            .await;
+                    }
+                    return Ok(());
+                }
                 RelayOutcome::Upgraded {
                     overflow,
                     websocket_permessage_deflate,
+                    websocket_subprotocol,
                 } => {
                     let mut options = upgrade_options(
                         config,
@@ -778,6 +897,8 @@ where
                         Some(&engine),
                     );
                     options.websocket.permessage_deflate = websocket_permessage_deflate;
+                    options.middleware_session = middleware_session.take();
+                    options.selected_subprotocol = websocket_subprotocol;
                     return handle_upgrade(
                         client, upstream, overflow, &ctx.host, ctx.port, options,
                     )
@@ -877,6 +998,37 @@ fn emit_activity(ctx: &L7EvalContext, denied: bool, deny_group: &'static str) {
     }
 }
 
+pub(crate) async fn websocket_middleware_preflight(
+    req: &crate::l7::provider::L7Request,
+    chain: &[openshell_supervisor_middleware::ChainEntry],
+    runner: &openshell_supervisor_middleware::ChainRunner,
+    ctx: &L7EvalContext,
+    scheme: &str,
+) -> Result<openshell_supervisor_middleware::WebSocketPreflightResult> {
+    let header_end = req
+        .raw_header
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .map_or(req.raw_header.len(), |position| position + 4);
+    let requested_subprotocols =
+        crate::l7::rest::websocket_requested_subprotocols(&req.raw_header[..header_end])?;
+    runner
+        .preflight_websocket(
+            chain,
+            openshell_supervisor_middleware::WebSocketPreflightInput {
+                session_id: uuid::Uuid::new_v4().to_string(),
+                request_id: uuid::Uuid::new_v4().to_string(),
+                sandbox_id: openshell_ocsf::ctx::ctx().sandbox_id.clone(),
+                scheme: scheme.to_string(),
+                host: ctx.host.clone(),
+                port: ctx.port,
+                path: req.target.clone(),
+                requested_subprotocols,
+            },
+        )
+        .await
+}
+
 /// Handle an upgraded connection (101 Switching Protocols).
 ///
 /// Forwards any overflow bytes from the upgrade response to the client, then
@@ -888,16 +1040,38 @@ pub(crate) async fn handle_upgrade<C, U>(
     overflow: Vec<u8>,
     host: &str,
     port: u16,
-    options: UpgradeRelayOptions<'_>,
+    mut options: UpgradeRelayOptions<'_>,
 ) -> Result<()>
 where
     C: AsyncRead + AsyncWrite + Unpin + Send,
     U: AsyncRead + AsyncWrite + Unpin + Send,
 {
+    ensure_upgrade_generation_current(client, upstream, host, port, &mut options).await?;
+    let start_terminal_reason = if let Some(session) = options.middleware_session.as_mut() {
+        let start = session
+            .start(options.selected_subprotocol.as_deref().unwrap_or_default())
+            .await;
+        if let Some(ctx) = options.ctx {
+            crate::l7::middleware::emit_websocket_session_start_events(ctx, &start);
+        }
+        start.terminal_reason
+    } else {
+        None
+    };
+    ensure_upgrade_generation_current(client, upstream, host, port, &mut options).await?;
+    if let Some(reason) = start_terminal_reason {
+        if let Some(session) = options.middleware_session.take() {
+            session.end(reason).await;
+        }
+        send_websocket_close(client, upstream, 1008).await;
+        return Ok(());
+    }
     let use_websocket_relay = options.websocket_request
         && (options.websocket.message_policy.inspects_messages()
             || options.websocket.permessage_deflate
-            || options.websocket.credential_rewrite);
+            || options.websocket.credential_rewrite
+            || options.middleware_session.is_some()
+            || options.websocket.deny_uninspected_credentials);
     let relay_mode = if use_websocket_relay {
         "websocket parsed relay"
     } else {
@@ -916,6 +1090,7 @@ where
             .build()
     );
     if use_websocket_relay {
+        let assembly_budget = options.assembly_budget.take().unwrap_or_default();
         let resolver = if options.websocket.credential_rewrite {
             options.secret_resolver.as_deref()
         } else {
@@ -953,13 +1128,18 @@ where
             port,
             crate::l7::websocket::RelayOptions {
                 policy_name: &options.policy_name,
+                assembly_budget,
                 resolver,
+                generation_guard: options.generation_guard,
                 provider_credentials: options
                     .ctx
                     .and_then(|ctx| ctx.provider_credentials.as_ref()),
                 target: &options.target,
                 inspector,
                 compression,
+                middleware_session: options.middleware_session.take(),
+                middleware_context: options.ctx,
+                deny_uninspected_credentials: options.websocket.deny_uninspected_credentials,
             },
         )
         .await;
@@ -974,6 +1154,45 @@ where
     Ok(())
 }
 
+async fn ensure_upgrade_generation_current<C, U>(
+    client: &mut C,
+    upstream: &mut U,
+    host: &str,
+    port: u16,
+    options: &mut UpgradeRelayOptions<'_>,
+) -> Result<()>
+where
+    C: AsyncWrite + Unpin,
+    U: AsyncWrite + Unpin,
+{
+    let Some(guard) = options.generation_guard else {
+        return Ok(());
+    };
+    if let Err(error) = guard.ensure_current() {
+        emit_policy_reload(guard, host, port, &options.policy_name);
+        if let Some(session) = options.middleware_session.take() {
+            session
+                .end(openshell_core::proto::WebSocketSessionEndReason::PolicyReload)
+                .await;
+        }
+        send_websocket_close(client, upstream, 1012).await;
+        return Err(error);
+    }
+    Ok(())
+}
+
+async fn send_websocket_close<C, U>(client: &mut C, upstream: &mut U, code: u16)
+where
+    C: AsyncWrite + Unpin,
+    U: AsyncWrite + Unpin,
+{
+    let payload = code.to_be_bytes();
+    let _ = crate::l7::websocket::write_unmasked_close(client, &payload).await;
+    let _ = crate::l7::websocket::write_masked_close(upstream, &payload).await;
+    let _ = client.shutdown().await;
+    let _ = upstream.shutdown().await;
+}
+
 pub(crate) fn upgrade_options<'a>(
     config: &L7EndpointConfig,
     ctx: &'a L7EvalContext,
@@ -985,6 +1204,8 @@ pub(crate) fn upgrade_options<'a>(
     let websocket_credential_rewrite =
         matches!(config.protocol, L7Protocol::Rest | L7Protocol::Websocket)
             && config.websocket_credential_rewrite;
+    let deny_uninspected_credentials =
+        config.provider_credentialed && !config.allow_uninspected_credentials;
     let websocket_message_policy = if config.protocol == L7Protocol::Websocket {
         if config.websocket_graphql_policy {
             WebSocketMessagePolicy::Graphql
@@ -998,26 +1219,36 @@ pub(crate) fn upgrade_options<'a>(
         websocket_request,
         websocket: WebSocketUpgradeBehavior {
             credential_rewrite: websocket_credential_rewrite,
+            deny_uninspected_credentials,
             message_policy: websocket_message_policy,
             permessage_deflate: false,
         },
+        assembly_budget: engine.map(TunnelPolicyEngine::websocket_assembly_budget),
         secret_resolver: if websocket_credential_rewrite {
             ctx.secret_resolver.clone()
         } else {
             None
         },
+        generation_guard: engine.map(TunnelPolicyEngine::generation_guard),
         engine,
         ctx: (engine.is_some() || websocket_credential_rewrite).then_some(ctx),
         enforcement: config.enforcement,
         target: target.to_string(),
         query_params: query_params.clone(),
         policy_name: ctx.policy_name.clone(),
+        middleware_session: None,
+        selected_subprotocol: None,
     }
 }
 
-pub(crate) fn websocket_extension_mode(config: &L7EndpointConfig) -> WebSocketExtensionMode {
-    if config.protocol == L7Protocol::Websocket
+pub(crate) fn websocket_extension_mode(
+    config: &L7EndpointConfig,
+    inspecting_middleware_session: bool,
+) -> WebSocketExtensionMode {
+    if inspecting_middleware_session
+        || config.protocol == L7Protocol::Websocket
         || (config.protocol == L7Protocol::Rest && config.websocket_credential_rewrite)
+        || (config.provider_credentialed && !config.allow_uninspected_credentials)
     {
         WebSocketExtensionMode::PermessageDeflate
     } else {
@@ -1185,10 +1416,11 @@ where
 
         if allowed || config.enforcement == EnforcementMode::Audit {
             let chain = engine.query_middleware_chain(&middleware_network_input(ctx))?;
+            let websocket_chain = websocket_request.then(|| chain.clone());
             // REST and websocket-upgrade policy evaluates only the method,
             // path, and query, which a middleware result cannot mutate, so no
             // per-stage body re-check is needed.
-            let req = match apply_middleware_chain(
+            let middleware_result = apply_middleware_chain(
                 req,
                 client,
                 ctx,
@@ -1197,8 +1429,8 @@ where
                 engine.generation_guard(),
                 openshell_supervisor_middleware::TransformedBodyPolicy::NotPolicyRelevant,
             )
-            .await?
-            {
+            .await;
+            let req = match middleware_result? {
                 MiddlewareApplyResult::Allowed(request) => request,
                 MiddlewareApplyResult::Denied { denial, .. } => {
                     let denied_request = crate::l7::provider::L7Request {
@@ -1218,6 +1450,56 @@ where
                     .await?;
                     return Ok(());
                 }
+                MiddlewareApplyResult::AdmissionExhausted => {
+                    let unavailable_request = crate::l7::provider::L7Request {
+                        action: request_info.action.clone(),
+                        target: redacted_target.clone(),
+                        query_params: request_info.query_params.clone(),
+                        raw_header: Vec::new(),
+                        body_length: crate::l7::provider::BodyLength::None,
+                    };
+                    crate::l7::middleware::send_middleware_admission_exhausted_response(
+                        &unavailable_request,
+                        client,
+                        ctx,
+                        &redacted_target,
+                    )
+                    .await?;
+                    return Ok(());
+                }
+            };
+            let mut middleware_session = if let Some(chain) = websocket_chain.as_deref() {
+                let preflight = websocket_middleware_preflight(
+                    &req,
+                    chain,
+                    engine.middleware_runner(),
+                    ctx,
+                    "wss",
+                )
+                .await;
+                let preflight = match preflight {
+                    Ok(preflight) => preflight,
+                    Err(error) => {
+                        warn!(error = %error, "WebSocket middleware preflight failed");
+                        write_bad_gateway_response(client).await?;
+                        return Ok(());
+                    }
+                };
+                crate::l7::middleware::emit_websocket_preflight_events(ctx, &preflight);
+                if preflight.terminal_reason.is_some() {
+                    crate::l7::middleware::send_middleware_rejection_response(
+                        &req,
+                        client,
+                        ctx,
+                        preflight.denial.as_ref(),
+                        &redacted_target,
+                    )
+                    .await?;
+                    return Ok(());
+                }
+                preflight.session
+            } else {
+                None
             };
             let req_with_auth =
                 match crate::l7::token_grant_injection::inject_if_needed(req, ctx).await {
@@ -1237,7 +1519,7 @@ where
             let ctx = scoped_ctx.as_ref().unwrap_or(ctx);
 
             // Forward request to upstream and relay response
-            let Some(outcome) = relay_http_request_with_credential_rejection(
+            let outcome_result = relay_http_request_with_credential_rejection(
                 &req_with_auth,
                 client,
                 upstream,
@@ -1245,9 +1527,14 @@ where
                     resolver: ctx.secret_resolver.as_deref(),
                     credential_generation: credential_generation_guard(ctx),
                     generation_guard: Some(engine.generation_guard()),
-                    websocket_extensions: websocket_extension_mode(config),
+                    websocket_extensions: websocket_extension_mode(
+                        config,
+                        middleware_session.is_some(),
+                    ),
                     request_body_credential_rewrite: config.protocol == L7Protocol::Rest
                         && config.request_body_credential_rewrite,
+                    deny_uninspected_credentials: config
+                        .deny_uninspected_body_credentials(ctx.secret_resolver.is_some()),
                     credential_signing: config.credential_signing,
                     signing_service: &config.signing_service,
                     signing_region: &config.signing_region,
@@ -1256,13 +1543,42 @@ where
                 },
                 ctx,
             )
-            .await?
-            else {
-                return Ok(());
+            .await;
+            let outcome_result = match outcome_result {
+                Ok(Some(outcome)) => Ok(outcome),
+                Ok(None) => {
+                    if let Some(session) = middleware_session.take() {
+                        session
+                            .end(openshell_core::proto::WebSocketSessionEndReason::Cancellation)
+                            .await;
+                    }
+                    return Ok(());
+                }
+                Err(error) => Err(error),
             };
+            let outcome = finalize_websocket_pre_upgrade(
+                &mut middleware_session,
+                engine.generation_guard(),
+                &ctx.host,
+                ctx.port,
+                &ctx.policy_name,
+                outcome_result,
+            )
+            .await?;
             match outcome {
-                RelayOutcome::Reusable => {} // continue loop
+                RelayOutcome::Reusable => {
+                    if let Some(session) = middleware_session.take() {
+                        session
+                            .end(openshell_core::proto::WebSocketSessionEndReason::UpstreamRejected)
+                            .await;
+                    }
+                }
                 RelayOutcome::Consumed => {
+                    if let Some(session) = middleware_session.take() {
+                        session
+                            .end(openshell_core::proto::WebSocketSessionEndReason::UpstreamRejected)
+                            .await;
+                    }
                     debug!(
                         host = %ctx.host,
                         port = ctx.port,
@@ -1273,6 +1589,7 @@ where
                 RelayOutcome::Upgraded {
                     overflow,
                     websocket_permessage_deflate,
+                    websocket_subprotocol,
                 } => {
                     let mut options = upgrade_options(
                         config,
@@ -1283,6 +1600,8 @@ where
                         Some(engine),
                     );
                     options.websocket.permessage_deflate = websocket_permessage_deflate;
+                    options.middleware_session = middleware_session.take();
+                    options.selected_subprotocol = websocket_subprotocol;
                     return handle_upgrade(
                         client, upstream, overflow, &ctx.host, ctx.port, options,
                     )
@@ -1311,6 +1630,16 @@ fn close_if_stale(guard: &PolicyGenerationGuard, ctx: &L7EvalContext) -> bool {
         return false;
     }
 
+    emit_policy_reload(guard, &ctx.host, ctx.port, &ctx.policy_name);
+    true
+}
+
+pub(crate) fn emit_policy_reload(
+    guard: &PolicyGenerationGuard,
+    host: &str,
+    port: u16,
+    policy_name: &str,
+) {
     ocsf_emit!(
         NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
             .activity(ActivityId::Open)
@@ -1318,18 +1647,55 @@ fn close_if_stale(guard: &PolicyGenerationGuard, ctx: &L7EvalContext) -> bool {
             .disposition(DispositionId::Blocked)
             .severity(SeverityId::Medium)
             .status(StatusId::Failure)
-            .dst_endpoint(Endpoint::from_domain(&ctx.host, ctx.port))
-            .firewall_rule(&ctx.policy_name, "l7")
+            .dst_endpoint(Endpoint::from_domain(host, port))
+            .firewall_rule(policy_name, "l7")
             .message(format!(
                 "L7 tunnel closed after policy reload [host:{} port:{} captured_generation:{} current_generation:{}]",
-                ctx.host,
-                ctx.port,
+                host,
+                port,
                 guard.captured_generation(),
                 guard.current_generation(),
             ))
             .build()
     );
-    true
+}
+
+pub(crate) async fn finalize_websocket_pre_upgrade(
+    session: &mut Option<openshell_supervisor_middleware::WebSocketSession>,
+    guard: &PolicyGenerationGuard,
+    host: &str,
+    port: u16,
+    policy_name: &str,
+    result: Result<RelayOutcome>,
+) -> Result<RelayOutcome> {
+    match result {
+        Ok(value @ RelayOutcome::Upgraded { .. }) => Ok(value),
+        Ok(value) => {
+            if let Err(error) = guard.ensure_current() {
+                emit_policy_reload(guard, host, port, policy_name);
+                if let Some(session) = session.take() {
+                    session
+                        .end(openshell_core::proto::WebSocketSessionEndReason::PolicyReload)
+                        .await;
+                }
+                Err(error)
+            } else {
+                Ok(value)
+            }
+        }
+        Err(error) => {
+            let reason = if guard.is_stale() {
+                emit_policy_reload(guard, host, port, policy_name);
+                openshell_core::proto::WebSocketSessionEndReason::PolicyReload
+            } else {
+                openshell_core::proto::WebSocketSessionEndReason::UpstreamRejected
+            };
+            if let Some(session) = session.take() {
+                session.end(reason).await;
+            }
+            Err(error)
+        }
+    }
 }
 
 async fn relay_jsonrpc<C, U>(
@@ -1494,6 +1860,23 @@ where
                         client,
                         ctx,
                         denial.as_ref(),
+                        &redacted_target,
+                    )
+                    .await?;
+                    return Ok(());
+                }
+                MiddlewareApplyResult::AdmissionExhausted => {
+                    let unavailable_request = crate::l7::provider::L7Request {
+                        action: request_info.action.clone(),
+                        target: redacted_target.clone(),
+                        query_params: request_info.query_params.clone(),
+                        raw_header: Vec::new(),
+                        body_length: crate::l7::provider::BodyLength::None,
+                    };
+                    crate::l7::middleware::send_middleware_admission_exhausted_response(
+                        &unavailable_request,
+                        client,
+                        ctx,
                         &redacted_target,
                     )
                     .await?;
@@ -1722,6 +2105,23 @@ where
                     .await?;
                     return Ok(());
                 }
+                MiddlewareApplyResult::AdmissionExhausted => {
+                    let unavailable_request = crate::l7::provider::L7Request {
+                        action: request_info.action.clone(),
+                        target: redacted_target.clone(),
+                        query_params: request_info.query_params.clone(),
+                        raw_header: Vec::new(),
+                        body_length: crate::l7::provider::BodyLength::None,
+                    };
+                    crate::l7::middleware::send_middleware_admission_exhausted_response(
+                        &unavailable_request,
+                        client,
+                        ctx,
+                        &redacted_target,
+                    )
+                    .await?;
+                    return Ok(());
+                }
             };
             let scoped_ctx = scoped_context_for_request(ctx, &req);
             let ctx = scoped_ctx.as_ref().unwrap_or(ctx);
@@ -1754,8 +2154,12 @@ where
                 RelayOutcome::Upgraded {
                     overflow,
                     websocket_permessage_deflate,
+                    ..
                 } => {
                     let options = UpgradeRelayOptions {
+                        assembly_budget: Some(
+                            crate::l7::websocket::WebSocketAssemblyBudget::default(),
+                        ),
                         websocket: WebSocketUpgradeBehavior {
                             permessage_deflate: websocket_permessage_deflate,
                             ..Default::default()
@@ -2155,7 +2559,7 @@ fn evaluate_l7_request_once(
         ));
     }
 
-    let input_json = serde_json::json!({
+    let input = serde_json::json!({
         "network": {
             "host": ctx.host,
             "port": ctx.port,
@@ -2179,9 +2583,7 @@ fn evaluate_l7_request_once(
         .lock()
         .map_err(|_| miette!("OPA engine lock poisoned"))?;
 
-    engine
-        .set_input_json(&input_json.to_string())
-        .map_err(|e| miette!("{e}"))?;
+    crate::opa::set_regorus_input(&mut engine, input)?;
 
     let allowed = engine
         .eval_rule("data.openshell.sandbox.allow_request".into())
@@ -2325,6 +2727,23 @@ where
                     .await?;
                     return Ok(());
                 }
+                MiddlewareApplyResult::AdmissionExhausted => {
+                    let unavailable_request = crate::l7::provider::L7Request {
+                        action: "HTTP".into(),
+                        target: redacted_target.clone(),
+                        query_params: std::collections::HashMap::new(),
+                        raw_header: Vec::new(),
+                        body_length: crate::l7::provider::BodyLength::None,
+                    };
+                    crate::l7::middleware::send_middleware_admission_exhausted_response(
+                        &unavailable_request,
+                        client,
+                        ctx,
+                        &redacted_target,
+                    )
+                    .await?;
+                    return Ok(());
+                }
             }
         } else {
             req
@@ -2425,6 +2844,7 @@ mod tests {
                 path: "/allowed/**".to_string(),
             }],
             credential_identity: identity.to_string(),
+            workload_credential_handle: String::new(),
         }
     }
 
@@ -2757,6 +3177,35 @@ mod tests {
         assert!(body.get("agent_guidance").is_none());
     }
 
+    fn assert_middleware_unavailable_response(response: &str, policy_name: &str) {
+        assert!(
+            response.starts_with("HTTP/1.1 503 Service Unavailable\r\n"),
+            "{response}"
+        );
+        assert!(!response.contains("100 Continue"), "{response}");
+        assert!(!response.to_ascii_lowercase().contains("retry-after"));
+        let (headers, body) = response.split_once("\r\n\r\n").expect("HTTP response");
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix("Content-Length: ")
+                    .and_then(|value| value.parse::<usize>().ok())
+            })
+            .expect("Content-Length");
+        assert_eq!(content_length, body.len());
+        let body: serde_json::Value = serde_json::from_str(body).expect("JSON response");
+        assert_eq!(body["error"], "middleware_failed");
+        assert_eq!(
+            body["detail"],
+            "Request could not be processed by configured middleware"
+        );
+        assert_eq!(body["policy"], policy_name);
+        assert!(body.get("middleware").is_none());
+        assert!(body.get("reason_code").is_none());
+        assert!(body.get("rule_missing").is_none());
+        assert!(body.get("next_steps").is_none());
+    }
+
     fn rest_token_grant_relay_context(
         resolver_response: std::result::Result<&str, &str>,
     ) -> (
@@ -2935,6 +3384,304 @@ network_policies:
         };
 
         (generation_guard, ctx, fixture)
+    }
+
+    #[derive(Clone)]
+    struct ControllableWebSocketPreflight {
+        seen: tokio::sync::mpsc::UnboundedSender<()>,
+        release: Arc<tokio::sync::Notify>,
+        action: openshell_core::proto::WebSocketPreflightAction,
+    }
+
+    #[tonic::async_trait]
+    impl openshell_core::proto::middleware::v1::supervisor_middleware_server::SupervisorMiddleware
+        for ControllableWebSocketPreflight
+    {
+        type EvaluateWebSocketSessionStream =
+            openshell_supervisor_middleware::WebSocketResponseStream;
+
+        async fn describe(
+            &self,
+            _request: tonic::Request<()>,
+        ) -> std::result::Result<
+            tonic::Response<openshell_core::proto::MiddlewareManifest>,
+            tonic::Status,
+        > {
+            Ok(tonic::Response::new(
+                openshell_core::proto::MiddlewareManifest {
+                    name: "test/controllable-websocket-preflight".into(),
+                    service_version: "test".into(),
+                    bindings: vec![openshell_core::proto::MiddlewareBinding {
+                        operation:
+                            openshell_core::proto::SupervisorMiddlewareOperation::WebsocketMessage
+                                as i32,
+                        phase: openshell_core::proto::SupervisorMiddlewarePhase::PreCredentials
+                            as i32,
+                        max_payload_bytes:
+                            openshell_supervisor_middleware::MAX_MIDDLEWARE_PAYLOAD_BYTES as u64,
+                        timeout: "2s".into(),
+                    }],
+                    expected_audience: String::new(),
+                },
+            ))
+        }
+
+        async fn validate_config(
+            &self,
+            _request: tonic::Request<openshell_core::proto::ValidateConfigRequest>,
+        ) -> std::result::Result<
+            tonic::Response<openshell_core::proto::ValidateConfigResponse>,
+            tonic::Status,
+        > {
+            Ok(tonic::Response::new(
+                openshell_core::proto::ValidateConfigResponse {
+                    valid: true,
+                    reason: String::new(),
+                },
+            ))
+        }
+
+        async fn evaluate_http_request(
+            &self,
+            _request: tonic::Request<openshell_core::proto::HttpRequestEvaluation>,
+        ) -> std::result::Result<
+            tonic::Response<openshell_core::proto::HttpRequestResult>,
+            tonic::Status,
+        > {
+            Err(tonic::Status::unimplemented("WebSocket-only middleware"))
+        }
+
+        async fn evaluate_web_socket_session(
+            &self,
+            request: tonic::Request<tonic::Streaming<openshell_core::proto::WebSocketSessionEvent>>,
+        ) -> std::result::Result<tonic::Response<Self::EvaluateWebSocketSessionStream>, tonic::Status>
+        {
+            use openshell_core::proto::{
+                WebSocketPreflightDecision, WebSocketSessionEventResult, web_socket_session_event,
+                web_socket_session_event_result,
+            };
+            use tokio_stream::wrappers::ReceiverStream;
+
+            let mut requests = request.into_inner();
+            let seen = self.seen.clone();
+            let release = Arc::clone(&self.release);
+            let action = self.action;
+            let (responses_tx, responses_rx) = tokio::sync::mpsc::channel(4);
+            tokio::spawn(async move {
+                while let Ok(Some(request)) = requests.message().await {
+                    if matches!(
+                        request.event,
+                        Some(web_socket_session_event::Event::Preflight(_))
+                    ) {
+                        let _ = seen.send(());
+                        release.notified().await;
+                        let _ = responses_tx
+                            .send(Ok(WebSocketSessionEventResult {
+                                result: Some(
+                                    web_socket_session_event_result::Result::PreflightDecision(
+                                        WebSocketPreflightDecision {
+                                            action: action as i32,
+                                            ..Default::default()
+                                        },
+                                    ),
+                                ),
+                            }))
+                            .await;
+                    }
+                }
+            });
+            Ok(tonic::Response::new(Box::pin(ReceiverStream::new(
+                responses_rx,
+            ))))
+        }
+    }
+
+    async fn assert_websocket_preflight_precedes_token_grant(
+        action: openshell_core::proto::WebSocketPreflightAction,
+        admitted: bool,
+    ) {
+        use openshell_core::proto::SupervisorMiddlewareService;
+        use openshell_core::proto::middleware::v1::supervisor_middleware_server::SupervisorMiddlewareServer;
+        use openshell_supervisor_middleware::{ChainRunner, MiddlewareRegistry};
+        use tokio_stream::wrappers::TcpListenerStream;
+
+        let (seen_tx, mut seen_rx) = tokio::sync::mpsc::unbounded_channel();
+        let release = Arc::new(tokio::sync::Notify::new());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind middleware");
+        let address = listener.local_addr().expect("middleware address");
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let server = tonic::transport::Server::builder()
+            .add_service(SupervisorMiddlewareServer::new(
+                ControllableWebSocketPreflight {
+                    seen: seen_tx,
+                    release: Arc::clone(&release),
+                    action,
+                },
+            ))
+            .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async {
+                let _ = shutdown_rx.await;
+            });
+        let server_task = tokio::spawn(server);
+        let registry = MiddlewareRegistry::connect_services(
+            Vec::new(),
+            vec![SupervisorMiddlewareService {
+                name: "preflight-service".into(),
+                grpc_endpoint: format!("http://{address}"),
+                max_payload_bytes: openshell_supervisor_middleware::MAX_MIDDLEWARE_PAYLOAD_BYTES
+                    as u64,
+                timeout: "2s".into(),
+                tls_ca_cert_pem: Vec::new(),
+                audience: String::new(),
+                allow_insecure_transport: false,
+            }],
+        )
+        .await
+        .expect("connect middleware");
+
+        let data = r#"
+network_middlewares:
+  websocket-preflight:
+    middleware: preflight-service
+    on_error: fail_closed
+    endpoints:
+      include: ["api.example.test"]
+network_policies:
+  rest_api:
+    name: rest_api
+    endpoints:
+      - host: api.example.test
+        port: 8080
+        protocol: rest
+        enforcement: enforce
+        rules:
+          - allow:
+              method: GET
+              path: "/v1/**"
+    binaries:
+      - { path: /usr/bin/curl }
+"#;
+        let engine = OpaEngine::from_strings(TEST_POLICY, data).expect("test policy");
+        engine.set_middleware_runner_for_tests(ChainRunner::from_registry(registry));
+        let input = NetworkInput {
+            host: "api.example.test".into(),
+            port: 8080,
+            binary_path: PathBuf::from("/usr/bin/curl"),
+            binary_sha256: "unused".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+        let (endpoint_config, generation) = engine
+            .query_endpoint_config_with_generation(&input)
+            .expect("endpoint config");
+        let config = crate::l7::parse_l7_config(&endpoint_config.expect("configured endpoint"))
+            .expect("REST config");
+        let tunnel_engine = engine
+            .clone_engine_for_tunnel(generation)
+            .expect("tunnel engine");
+        let provider_key = "api.example.test\t8080\t/v1/**\tprovider:access_token";
+        let fixture =
+            crate::l7::token_grant_injection::test_support::TokenGrantTestFixture::success(
+                provider_key,
+                "grant-token",
+            );
+        let ctx = L7EvalContext {
+            host: "api.example.test".into(),
+            port: 8080,
+            request_default_port: Some(8080),
+            policy_name: "rest_api".into(),
+            binary_path: "/usr/bin/curl".into(),
+            dynamic_credentials: Some(fixture.dynamic_credentials()),
+            token_grant_resolver: Some(fixture.resolver()),
+            ..Default::default()
+        };
+        let (mut app, mut relay_client) = tokio::io::duplex(8192);
+        let (mut relay_upstream, mut upstream) = tokio::io::duplex(8192);
+        let relay = tokio::spawn(async move {
+            relay_rest(
+                &config,
+                &tunnel_engine,
+                &mut relay_client,
+                &mut relay_upstream,
+                &ctx,
+            )
+            .await
+        });
+
+        app.write_all(
+            b"GET /v1/ws HTTP/1.1\r\nHost: api.example.test\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n",
+        )
+        .await
+        .expect("send upgrade request");
+        seen_rx.recv().await.expect("preflight reached middleware");
+        fixture.assert_no_requests();
+        release.notify_one();
+
+        if admitted {
+            let mut forwarded = Vec::new();
+            let mut buffer = [0u8; 512];
+            while !forwarded.windows(4).any(|window| window == b"\r\n\r\n") {
+                let count = upstream.read(&mut buffer).await.expect("read upstream");
+                assert!(count > 0, "upstream closed before request headers");
+                forwarded.extend_from_slice(&buffer[..count]);
+            }
+            let forwarded = String::from_utf8_lossy(&forwarded);
+            assert!(forwarded.contains("Authorization: Bearer grant-token\r\n"));
+            upstream
+                .write_all(
+                    b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .expect("reject upgrade");
+            let mut response = [0u8; 512];
+            let count = app.read(&mut response).await.expect("read client response");
+            assert!(
+                String::from_utf8_lossy(&response[..count]).contains("400 Bad Request"),
+                "unexpected client response"
+            );
+            fixture.assert_one_request(provider_key);
+        } else {
+            let mut response = [0u8; 1024];
+            let count = app.read(&mut response).await.expect("read client response");
+            let response = String::from_utf8_lossy(&response[..count]);
+            assert!(response.contains("403 Forbidden"), "{response}");
+            assert!(response.contains(r#""error":"middleware_denied""#));
+            assert!(response.contains(r#""middleware":"websocket-preflight""#));
+            let mut byte = [0u8; 1];
+            let count = upstream.read(&mut byte).await.expect("upstream close");
+            assert_eq!(count, 0, "denied preflight must not reach upstream");
+            fixture.assert_no_requests();
+        }
+
+        drop(app);
+        relay
+            .await
+            .expect("join REST relay")
+            .expect("REST relay result");
+        let _ = shutdown_tx.send(());
+        server_task
+            .await
+            .expect("join middleware server")
+            .expect("middleware server");
+    }
+
+    #[tokio::test]
+    async fn denied_websocket_preflight_has_no_token_grant_side_effects() {
+        assert_websocket_preflight_precedes_token_grant(
+            openshell_core::proto::WebSocketPreflightAction::Deny,
+            false,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn admitted_websocket_preflight_precedes_token_grant() {
+        assert_websocket_preflight_precedes_token_grant(
+            openshell_core::proto::WebSocketPreflightAction::Inspect,
+            true,
+        )
+        .await;
     }
 
     fn jsonrpc_test_relay_context() -> (L7EndpointConfig, TunnelPolicyEngine, L7EvalContext) {
@@ -3436,6 +4183,94 @@ network_policies:
     }
 
     #[tokio::test]
+    async fn l7_rest_exhausted_middleware_admission_returns_503_before_body_or_upstream() {
+        let (config, tunnel_engine, ctx) = middleware_relay_context("openshell/regex", "fail_open");
+        let runner = tunnel_engine.middleware_runner().clone();
+
+        let mut active = Vec::new();
+        for _ in 0..openshell_supervisor_middleware::MAX_CONCURRENT_MIDDLEWARE_WORK {
+            active.push(
+                runner
+                    .reserve_middleware_work_admission()
+                    .await
+                    .expect("fill active middleware work"),
+            );
+        }
+        let mut waiters = Vec::new();
+        for _ in 0..openshell_supervisor_middleware::MAX_QUEUED_MIDDLEWARE_WORK {
+            let runner = runner.clone();
+            waiters.push(Box::pin(
+                async move { runner.reserve_middleware_work().await },
+            ));
+        }
+        for waiter in &mut waiters {
+            assert!(
+                futures::poll!(waiter.as_mut()).is_pending(),
+                "every bounded waiter slot must be occupied"
+            );
+        }
+
+        let (mut app, mut relay_client) = tokio::io::duplex(8192);
+        let (mut relay_upstream, mut upstream) = tokio::io::duplex(8192);
+        let relay = tokio::spawn(async move {
+            relay_with_inspection(
+                &config,
+                tunnel_engine,
+                &mut relay_client,
+                &mut relay_upstream,
+                &ctx,
+            )
+            .await
+        });
+
+        // The declared body is within the built-in regex HTTP capability, but
+        // the client intentionally withholds it behind Expect: 100-continue.
+        // Queue exhaustion must be answered before buffering begins.
+        app.write_all(
+            b"POST /v1/messages HTTP/1.1\r\nHost: api.example.test\r\nContent-Length: 32\r\nExpect: 100-continue\r\nConnection: close\r\n\r\n",
+        )
+        .await
+        .expect("send headers without body");
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), relay)
+            .await
+            .expect("relay should shed immediately")
+            .expect("join relay")
+            .expect("relay returns a complete HTTP response");
+
+        let mut response = Vec::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            app.read_to_end(&mut response),
+        )
+        .await
+        .expect("client should receive 503 without sending its body")
+        .expect("read client response");
+        let response = String::from_utf8(response).expect("UTF-8 response");
+        assert_middleware_unavailable_response(&response, "rest_api");
+
+        let mut upstream_bytes = Vec::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            upstream.read_to_end(&mut upstream_bytes),
+        )
+        .await
+        .expect("upstream side should close")
+        .expect("read upstream");
+        assert!(
+            upstream_bytes.is_empty(),
+            "admission-exhausted request must not reach upstream"
+        );
+
+        drop(waiters);
+        drop(active);
+        runner
+            .reserve_middleware_work_admission()
+            .await
+            .expect("work capacity recovers after saturation fixture");
+    }
+
+    #[tokio::test]
     async fn l7_rest_middleware_fail_closed_does_not_reach_upstream() {
         let (config, tunnel_engine, ctx) =
             middleware_relay_context("example/unavailable", "fail_closed");
@@ -3577,6 +4412,7 @@ network_policies:
                         path: "/v1/**".to_string(),
                     }],
                     credential_identity: "provider-a:API_TOKEN".to_string(),
+                    workload_credential_handle: String::new(),
                 },
             )]),
             Vec::new(),
@@ -3680,6 +4516,7 @@ network_policies:
                         path: "/v1/**".to_string(),
                     }],
                     credential_identity: "provider-a:API_TOKEN".to_string(),
+                    workload_credential_handle: String::new(),
                 },
             )]),
             Vec::new(),
@@ -4239,9 +5076,10 @@ network_policies:
                     operation: openshell_core::proto::SupervisorMiddlewareOperation::HttpRequest
                         as i32,
                     phase: openshell_core::proto::SupervisorMiddlewarePhase::PreCredentials as i32,
-                    max_body_bytes: 8192,
+                    max_payload_bytes: 8192,
                     timeout: String::new(),
                 }],
+                expected_audience: String::new(),
             }
         }
 
@@ -4327,6 +5165,7 @@ network_policies:
                         path: "/allowed".to_string(),
                     }],
                     credential_identity: "provider-a:API_TOKEN".to_string(),
+                    workload_credential_handle: String::new(),
                 },
             )]),
             Vec::new(),
@@ -4384,9 +5223,10 @@ network_policies:
                     operation: openshell_core::proto::SupervisorMiddlewareOperation::HttpRequest
                         as i32,
                     phase: openshell_core::proto::SupervisorMiddlewarePhase::PreCredentials as i32,
-                    max_body_bytes: 8192,
+                    max_payload_bytes: 8192,
                     timeout: String::new(),
                 }],
+                expected_audience: String::new(),
             }
         }
 
@@ -4854,9 +5694,10 @@ network_policies:
                 bindings: vec![MiddlewareBinding {
                     operation: SupervisorMiddlewareOperation::HttpRequest as i32,
                     phase: SupervisorMiddlewarePhase::PreCredentials as i32,
-                    max_body_bytes: self.max_body_bytes,
+                    max_payload_bytes: self.max_body_bytes,
                     timeout: String::new(),
                 }],
+                expected_audience: String::new(),
             }
         }
 
@@ -4970,6 +5811,9 @@ network_policies:
             }
             MiddlewareApplyResult::Denied { .. } => {
                 panic!("body within the largest stage limit must not fail the chain")
+            }
+            MiddlewareApplyResult::AdmissionExhausted => {
+                panic!("test middleware work admission must be available")
             }
         }
     }
@@ -6086,6 +6930,371 @@ network_policies:
             .unwrap();
     }
 
+    /// Policy allowing GET on both `/repos/**` and `/admin/**` for the same
+    /// host:port, so an encoded-slash denial can only come from the
+    /// per-endpoint `allow_encoded_slash` scoping.
+    const ENCODED_SLASH_SCOPING_POLICY: &str = r#"
+network_policies:
+  route_api:
+    name: route_api
+    endpoints:
+      - host: gateway.example.test
+        port: 443
+        path: /repos/**
+        protocol: rest
+        enforcement: enforce
+        allow_encoded_slash: true
+        rules:
+          - allow:
+              method: GET
+              path: "/repos/**"
+      - host: gateway.example.test
+        port: 443
+        path: /admin/**
+        protocol: rest
+        enforcement: enforce
+        rules:
+          - allow:
+              method: GET
+              path: "/admin/**"
+    binaries:
+      - { path: /usr/bin/node }
+"#;
+
+    fn encoded_slash_scoping_configs() -> Vec<L7EndpointConfig> {
+        let rest = |path: &str, allow_encoded_slash: bool| L7EndpointConfig {
+            protocol: L7Protocol::Rest,
+            path: path.into(),
+            tls: crate::l7::TlsMode::Auto,
+            enforcement: EnforcementMode::Enforce,
+            graphql_max_body_bytes: 0,
+            json_rpc_max_body_bytes: crate::l7::jsonrpc::DEFAULT_MAX_BODY_BYTES,
+            mcp_strict_tool_names: true,
+            allow_encoded_slash,
+            websocket_credential_rewrite: false,
+            request_body_credential_rewrite: false,
+            allow_uninspected_credentials: false,
+            provider_credentialed: false,
+            websocket_graphql_policy: false,
+            credential_signing: crate::l7::CredentialSigning::None,
+            signing_service: String::new(),
+            signing_region: String::new(),
+        };
+        // One endpoint opts in, the other does not.
+        vec![rest("/repos/**", true), rest("/admin/**", false)]
+    }
+
+    fn encoded_slash_scoping_ctx() -> L7EvalContext {
+        L7EvalContext {
+            host: "gateway.example.test".into(),
+            port: 443,
+            request_default_port: Some(443),
+            policy_name: "route_api".into(),
+            binary_path: "/usr/bin/node".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+            secret_resolver: None,
+            ..Default::default()
+        }
+    }
+
+    /// Canonicalization runs before the matching config is known, so
+    /// `allow_encoded_slash` is taken permissively across the whole
+    /// host:port. The endpoint that did *not* opt in must still reject a
+    /// `%2F`, otherwise one endpoint's opt-in silently loosens every other
+    /// endpoint sharing that host:port.
+    #[tokio::test]
+    async fn route_selected_encoded_slash_optin_does_not_leak_to_other_endpoints() {
+        let engine = OpaEngine::from_strings(TEST_POLICY, ENCODED_SLASH_SCOPING_POLICY).unwrap();
+        let tunnel_engine = engine
+            .clone_engine_for_tunnel(engine.current_generation())
+            .unwrap();
+        let configs = encoded_slash_scoping_configs();
+        let (activity_tx, mut activity_rx) = tokio::sync::mpsc::channel(1);
+        let ctx = L7EvalContext {
+            activity_tx: Some(activity_tx),
+            ..encoded_slash_scoping_ctx()
+        };
+
+        let (mut app, mut relay_client) = tokio::io::duplex(8192);
+        let (mut relay_upstream, mut upstream) = tokio::io::duplex(8192);
+        let relay = tokio::spawn(async move {
+            relay_with_route_selection(
+                &configs,
+                tunnel_engine,
+                &mut relay_client,
+                &mut relay_upstream,
+                &ctx,
+            )
+            .await
+        });
+
+        app.write_all(
+            b"GET /admin/x%2Fy HTTP/1.1\r\nHost: gateway.example.test\r\nConnection: close\r\n\r\n",
+        )
+        .await
+        .unwrap();
+
+        let mut response = [0u8; 1024];
+        let n = tokio::time::timeout(std::time::Duration::from_secs(1), app.read(&mut response))
+            .await
+            .expect("denial should reach client")
+            .unwrap();
+        let response = String::from_utf8_lossy(&response[..n]);
+        assert!(response.contains("403 Forbidden"), "{response}");
+        assert!(
+            response.contains("not allowed on this endpoint"),
+            "denial must name the encoded-slash reason: {response}"
+        );
+
+        let mut upstream_bytes = [0u8; 16];
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            upstream.read(&mut upstream_bytes),
+        )
+        .await;
+        assert!(
+            matches!(result, Err(_) | Ok(Ok(0))),
+            "request must not reach upstream"
+        );
+        let activity = tokio::time::timeout(std::time::Duration::from_secs(1), activity_rx.recv())
+            .await
+            .expect("parse rejection activity should be emitted")
+            .expect("activity channel should remain open");
+        assert!(activity.denied);
+        assert_eq!(activity.deny_group, "l7_parse_rejection");
+
+        drop(app);
+        tokio::time::timeout(std::time::Duration::from_secs(1), relay)
+            .await
+            .expect("relay should finish")
+            .unwrap()
+            .unwrap();
+    }
+
+    /// Credential redaction percent-decodes any segment holding a placeholder
+    /// and re-inserts the redacted form without re-encoding it. A `%2F` sharing
+    /// that segment therefore becomes a literal `/` in the redacted target, so
+    /// the scoping check must read the canonical target rather than the
+    /// redacted one — otherwise a placeholder is enough to smuggle an encoded
+    /// slash past an endpoint that never opted in.
+    #[tokio::test]
+    async fn route_selected_encoded_slash_check_survives_credential_redaction() {
+        let engine = OpaEngine::from_strings(TEST_POLICY, ENCODED_SLASH_SCOPING_POLICY).unwrap();
+        let tunnel_engine = engine
+            .clone_engine_for_tunnel(engine.current_generation())
+            .unwrap();
+        let configs = encoded_slash_scoping_configs();
+        let (child_env, resolver) = SecretResolver::from_provider_env(
+            std::iter::once(("TOKEN".to_string(), "real-token".to_string())).collect(),
+        );
+        let placeholder = child_env.get("TOKEN").expect("placeholder env").clone();
+        let ctx = L7EvalContext {
+            secret_resolver: resolver.map(Arc::new),
+            ..encoded_slash_scoping_ctx()
+        };
+
+        let (mut app, mut relay_client) = tokio::io::duplex(8192);
+        let (mut relay_upstream, mut upstream) = tokio::io::duplex(8192);
+        let relay = tokio::spawn(async move {
+            relay_with_route_selection(
+                &configs,
+                tunnel_engine,
+                &mut relay_client,
+                &mut relay_upstream,
+                &ctx,
+            )
+            .await
+        });
+
+        // Placeholder and encoded slash in the same segment, on the endpoint
+        // that did NOT opt into encoded slashes.
+        let request = format!(
+            "GET /admin/{placeholder}%2Fx HTTP/1.1\r\nHost: gateway.example.test\r\nConnection: close\r\n\r\n"
+        );
+        app.write_all(request.as_bytes()).await.unwrap();
+
+        let mut response = [0u8; 1024];
+        let n = tokio::time::timeout(std::time::Duration::from_secs(1), app.read(&mut response))
+            .await
+            .expect("denial should reach client")
+            .unwrap();
+        let response = String::from_utf8_lossy(&response[..n]);
+        assert!(response.contains("403 Forbidden"), "{response}");
+        assert!(
+            response.contains("not allowed on this endpoint"),
+            "redaction must not hide the encoded slash: {response}"
+        );
+
+        let mut upstream_bytes = [0u8; 16];
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            upstream.read(&mut upstream_bytes),
+        )
+        .await;
+        assert!(
+            matches!(result, Err(_) | Ok(Ok(0))),
+            "request must not reach upstream"
+        );
+
+        drop(app);
+        tokio::time::timeout(std::time::Duration::from_secs(1), relay)
+            .await
+            .expect("relay should finish")
+            .unwrap()
+            .unwrap();
+    }
+
+    /// The converse: tightening the scope must not break the endpoint that
+    /// legitimately opted in. A GitLab-style encoded slug still reaches the
+    /// upstream verbatim.
+    #[tokio::test]
+    async fn route_selected_encoded_slash_still_allowed_on_opted_in_endpoint() {
+        let engine = OpaEngine::from_strings(TEST_POLICY, ENCODED_SLASH_SCOPING_POLICY).unwrap();
+        let tunnel_engine = engine
+            .clone_engine_for_tunnel(engine.current_generation())
+            .unwrap();
+        let configs = encoded_slash_scoping_configs();
+        let ctx = encoded_slash_scoping_ctx();
+
+        let (mut app, mut relay_client) = tokio::io::duplex(8192);
+        let (mut relay_upstream, mut upstream) = tokio::io::duplex(8192);
+        let relay = tokio::spawn(async move {
+            relay_with_route_selection(
+                &configs,
+                tunnel_engine,
+                &mut relay_client,
+                &mut relay_upstream,
+                &ctx,
+            )
+            .await
+        });
+
+        app.write_all(
+            b"GET /repos/group%2Fproject HTTP/1.1\r\nHost: gateway.example.test\r\nConnection: close\r\n\r\n",
+        )
+        .await
+        .unwrap();
+
+        let mut upstream_bytes = [0u8; 512];
+        let n = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            upstream.read(&mut upstream_bytes),
+        )
+        .await
+        .expect("opted-in request should reach upstream")
+        .unwrap();
+        let forwarded = String::from_utf8_lossy(&upstream_bytes[..n]);
+        assert!(
+            forwarded.contains("GET /repos/group%2Fproject "),
+            "encoded slug must be forwarded verbatim: {forwarded}"
+        );
+
+        drop(app);
+        drop(upstream);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), relay).await;
+    }
+
+    #[tokio::test]
+    async fn rest_websocket_middleware_inspects_compressed_wss_messages() {
+        let data = r#"
+network_middlewares:
+  redact:
+    middleware: openshell/regex
+    on_error: fail_closed
+    endpoints:
+      include: ["api.example.test"]
+network_policies:
+  rest_api:
+    name: rest_api
+    endpoints:
+      - host: api.example.test
+        port: 8080
+        protocol: rest
+        enforcement: enforce
+        rules:
+          - allow:
+              method: GET
+              path: "/ws"
+    binaries:
+      - { path: /usr/bin/node }
+"#;
+        let engine = OpaEngine::from_strings(TEST_POLICY, data).unwrap();
+        install_builtin_middleware(&engine);
+        let input = NetworkInput {
+            host: "api.example.test".into(),
+            port: 8080,
+            binary_path: PathBuf::from("/usr/bin/node"),
+            binary_sha256: "unused".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+        let (endpoint_config, generation) = engine
+            .query_endpoint_config_with_generation(&input)
+            .unwrap();
+        let config = crate::l7::parse_l7_config(&endpoint_config.unwrap()).unwrap();
+        let tunnel_engine = engine.clone_engine_for_tunnel(generation).unwrap();
+        let ctx = L7EvalContext {
+            host: "api.example.test".into(),
+            port: 8080,
+            request_default_port: Some(8080),
+            policy_name: "rest_api".into(),
+            binary_path: "/usr/bin/node".into(),
+            ..Default::default()
+        };
+        let (mut app, mut relay_client) = tokio::io::duplex(8192);
+        let (mut relay_upstream, mut upstream) = tokio::io::duplex(8192);
+        let relay = tokio::spawn(async move {
+            relay_rest(
+                &config,
+                &tunnel_engine,
+                &mut relay_client,
+                &mut relay_upstream,
+                &ctx,
+            )
+            .await
+        });
+
+        let scenario = tokio::time::timeout(std::time::Duration::from_secs(60), async {
+            app.write_all(
+                b"GET /ws HTTP/1.1\r\nHost: api.example.test\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Extensions: permessage-deflate; client_no_context_takeover\r\n\r\n",
+            )
+            .await
+            .unwrap();
+
+            let upstream_headers = read_http_headers(&mut upstream).await;
+            let upstream_headers = String::from_utf8_lossy(&upstream_headers);
+            assert!(upstream_headers.contains(
+                "Sec-WebSocket-Extensions: permessage-deflate; client_no_context_takeover\r\n"
+            ));
+            upstream
+                .write_all(
+                    b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\nSec-WebSocket-Extensions: permessage-deflate; client_no_context_takeover\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            let response = read_http_headers(&mut app).await;
+            assert!(String::from_utf8_lossy(&response).contains("101 Switching Protocols"));
+
+            app.write_all(
+                &crate::l7::websocket::compressed_masked_text_frame_for_test(
+                    br#"{"token":"sk-1234567890abcdef"}"#,
+                ),
+            )
+            .await
+            .unwrap();
+            let frame = crate::l7::websocket::read_frame_for_test(&mut upstream).await;
+            assert_eq!(
+                crate::l7::websocket::decode_compressed_masked_text_frame_for_test(&frame),
+                r#"{"token":"[REDACTED]"}"#
+            );
+        })
+        .await;
+        relay.abort();
+        let _ = relay.await;
+        scenario.expect("compressed WSS scenario should complete");
+    }
+
     #[tokio::test]
     async fn route_selected_websocket_upgrade_rejects_invalid_accept_without_forwarding_101() {
         let data = r#"
@@ -6119,6 +7328,8 @@ network_policies:
             allow_encoded_slash: false,
             websocket_credential_rewrite: true,
             request_body_credential_rewrite: false,
+            allow_uninspected_credentials: false,
+            provider_credentialed: false,
             websocket_graphql_policy: false,
             credential_signing: crate::l7::CredentialSigning::None,
             signing_service: String::new(),
@@ -6205,6 +7416,7 @@ network_policies:
                         path: "/allowed/**".to_string(),
                     }],
                     credential_identity: "provider-a:API_TOKEN".to_string(),
+                    workload_credential_handle: String::new(),
                 },
             )]),
             Vec::new(),
@@ -6318,6 +7530,8 @@ network_policies:
             allow_encoded_slash: false,
             websocket_credential_rewrite: true,
             request_body_credential_rewrite: false,
+            allow_uninspected_credentials: false,
+            provider_credentialed: false,
             websocket_graphql_policy: false,
             credential_signing: crate::l7::CredentialSigning::None,
             signing_service: String::new(),
@@ -6442,6 +7656,8 @@ network_policies:
             allow_encoded_slash: false,
             websocket_credential_rewrite: true,
             request_body_credential_rewrite: false,
+            allow_uninspected_credentials: false,
+            provider_credentialed: false,
             websocket_graphql_policy: true,
             credential_signing: crate::l7::CredentialSigning::None,
             signing_service: String::new(),
@@ -6550,6 +7766,18 @@ network_policies:
                 .map(|(idx, byte)| byte ^ mask[idx % 4]),
         );
         frame
+    }
+
+    async fn read_http_headers<R: AsyncRead + Unpin>(reader: &mut R) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        let mut byte = [0u8; 1];
+        loop {
+            reader.read_exact(&mut byte).await.unwrap();
+            bytes.push(byte[0]);
+            if bytes.ends_with(b"\r\n\r\n") {
+                return bytes;
+            }
+        }
     }
 
     async fn read_text_frame<R: AsyncRead + Unpin>(

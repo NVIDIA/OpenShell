@@ -17,27 +17,27 @@ This project uses YAML form issue templates. When creating issues, match the tem
 
 ### Bug Reports
 
-Do not add a type label automatically. The body must include an **Agent Diagnostic** section — this is required by the template and enforced by project convention. The diagnostic must identify the OpenShell version tested, whether the latest release or known fixes were checked, and whether possible duplicate issues were searched. If the agent cannot verify the latest release or search existing issues, say so explicitly instead of guessing. Apply area or topic labels only when they are clearly known.
+Do not add a type label automatically. The body must include a **User Story**, **Problem Statement**, **Impact / Why This Matters**, and **Acceptance Criteria**, followed by bug-specific reproduction steps and environment details. Logs are optional and must be concise and redacted. Apply area or topic labels only when they are clearly known.
 
 ```bash
 gh issue create \
   --title "bug: <concise description>" \
   --body "$(cat <<'EOF'
-## Agent Diagnostic
+## User Story
 
-- Skills loaded: <skills used during investigation>
-- OpenShell version tested: <version from openshell --version or other source>
-- Latest release checked: <version checked, or unable to verify>
-- Known fixes reviewed: <release notes / merged PRs checked, or unable to verify>
-- Possible duplicates reviewed: <existing issues searched, or unable to verify>
-- Findings: <what the agent found and tried>
-- Remaining reason for filing: <why this still appears to be a bug>
+As a <persona>, I want <capability or outcome>, so that <benefit or impact>.
 
-## Description
+## Problem Statement
 
-**Actual behavior:** <what happened>
+<Summarize what is broken or missing in OpenShell's current behavior and when the issue occurs>
 
-**Expected behavior:** <what should happen>
+## Impact / Why This Matters
+
+<Explain the consequences for users, the current workaround, and why that workaround is insufficient>
+
+## Acceptance Criteria
+
+- [ ] <observable outcome that demonstrates the bug is fixed>
 
 ## Reproduction Steps
 
@@ -46,16 +46,14 @@ gh issue create \
 
 ## Environment
 
-- OS: <os>
-- Docker: <version>
 - OpenShell: <version>
-- Latest release checked: <yes/no and reason>
-- Possible duplicates checked: <yes/no and reason>
+- OS: <os>
+- Runtime, deployment, or integration: <relevant details>
 
 ## Logs
 
 ```
-<relevant output>
+<optional minimal, redacted output>
 ```
 EOF
 )"
@@ -63,28 +61,39 @@ EOF
 
 ### Feature Requests
 
-Do not add a type label automatically. The body must include a **Proposed Design** — not a "please build this" request. Apply area or topic labels only when they are clearly known.
+Do not add a type label automatically. The body must include a **User Story**, **Problem Statement**, **Impact / Why This Matters**, **Proposed Design**, **Acceptance Criteria**, and **Alternatives Considered**. The proposed design should define the user-facing workflow and externally observable behavior without prescribing internal implementation. Agent investigation is optional. Apply area or topic labels only when they are clearly known.
 
 ```bash
 gh issue create \
   --title "feat: <concise description>" \
   --body "$(cat <<'EOF'
+## User Story
+
+As a <persona>, I want <capability or outcome>, so that <benefit or impact>.
+
 ## Problem Statement
 
-<What problem does this solve? Why does it matter?>
+<Summarize the capability or behavior missing from OpenShell today>
+
+## Impact / Why This Matters
+
+<Explain what users must do today, why it is insufficient, and the operational cost, risk, blocked workflow, or adoption barrier>
 
 ## Proposed Design
 
-<How should this work? Describe the system behavior, components involved,
-and user-facing interface.>
+<The desired user-facing workflow and externally observable behavior, without prescribing internal implementation>
+
+## Acceptance Criteria
+
+- [ ] <specific, observable outcome>
 
 ## Alternatives Considered
 
-<What other approaches were evaluated? Why is this design better?>
+<Other user-facing workflows or behaviors considered and why this approach best satisfies the user story>
 
 ## Agent Investigation
 
-<If the agent explored the codebase to assess feasibility, paste findings here.>
+<Optional findings from codebase exploration>
 EOF
 )"
 ```
@@ -114,7 +123,7 @@ EOF
 
 GitHub built-in issue types (`Bug`, `Feature`, `Task`) should come from the matching issue template when possible, or be set manually afterward. Do not try to emulate them through labels.
 
-Creating an issue does not accept it for roadmap work or queue agent work. Agents never apply the `roadmap` label, add issues to the roadmap project, or apply `agent:plan-requested` or `agent:implementation-requested`. Community issues proceed through `triage-issue`; a human decides whether technically validated work should be accepted and places it on the roadmap. The request labels queue work for unattended agents; a user may instead direct an agent to a specific issue.
+Creating an issue does not accept it or queue agent work. Agents never apply `state:accepted`, the `roadmap` label, add issues to the roadmap project, or apply `agent:plan-requested` or `agent:implementation-requested`. Community issues proceed through `triage-issue`; a human accepts technically validated work with `state:accepted` or roadmap placement. The request labels queue work for unattended agents; a user may instead direct an agent to a specific issue.
 
 ## Useful Options
 

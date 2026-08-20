@@ -38,11 +38,13 @@ use openshell_core::progress::{
 };
 use openshell_core::proto::compute::v1::{
     CreateSandboxRequest, CreateSandboxResponse, DeleteSandboxRequest, DeleteSandboxResponse,
-    DriverCondition as SandboxCondition, DriverPlatformEvent as PlatformEvent,
-    DriverSandbox as Sandbox, DriverSandboxStatus as SandboxStatus,
-    DriverSandboxTemplate as SandboxTemplate, GetCapabilitiesRequest, GetCapabilitiesResponse,
-    GetGatewayListenerRequirementsRequest, GetGatewayListenerRequirementsResponse,
-    GetSandboxRequest, GetSandboxResponse, ListSandboxesRequest, ListSandboxesResponse,
+    DeleteWorkspaceRequest, DeleteWorkspaceResponse, DriverCondition as SandboxCondition,
+    DriverPlatformEvent as PlatformEvent, DriverSandbox as Sandbox,
+    DriverSandboxStatus as SandboxStatus, DriverSandboxTemplate as SandboxTemplate,
+    EnsureWorkspaceRequest, EnsureWorkspaceResponse, GetCapabilitiesRequest,
+    GetCapabilitiesResponse, GetGatewayListenerRequirementsRequest,
+    GetGatewayListenerRequirementsResponse, GetSandboxRequest, GetSandboxResponse,
+    ListSandboxesRequest, ListSandboxesResponse, StartSandboxRequest, StartSandboxResponse,
     StopSandboxRequest, StopSandboxResponse, ValidateSandboxCreateRequest,
     ValidateSandboxCreateResponse, WatchSandboxesDeletedEvent, WatchSandboxesEvent,
     WatchSandboxesPlatformEvent, WatchSandboxesRequest, WatchSandboxesSandboxEvent,
@@ -166,6 +168,7 @@ const OVERLAY_TEMPLATE_CACHE_DIR: &str = "overlay-templates";
 const OVERLAY_TEMPLATE_CACHE_LAYOUT_VERSION: &str = "sandbox-overlay-ext4-v1";
 const SANDBOX_OVERLAY_IMAGE: &str = "overlay.ext4";
 const SANDBOX_REQUEST_FILE: &str = "sandbox.pb";
+const SANDBOX_STOPPED_FILE: &str = "stopped";
 const GUEST_IMAGE_CONFIG_DIR: &str = "openshell-image";
 const GUEST_IMAGE_OCI_LAYOUT_DIR: &str = "oci";
 const GUEST_IMAGE_OCI_REF: &str = "openshell";
@@ -517,6 +520,7 @@ impl VmDriver {
             driver_name: DRIVER_NAME.to_string(),
             driver_version: openshell_core::VERSION.to_string(),
             default_image: self.config.default_image.clone(),
+            gateway_manages_lifecycle: true,
         }
     }
 
@@ -604,7 +608,7 @@ impl VmDriver {
             registry.remove(&sandbox.id);
             let _ = tokio::fs::remove_dir_all(&state_dir).await;
             return Err(Status::internal(format!(
-                "write sandbox resume metadata failed: {err}"
+                "write sandbox start metadata failed: {err}"
             )));
         }
 
@@ -1058,6 +1062,129 @@ impl VmDriver {
         Ok(())
     }
 
+    pub async fn stop_sandbox(&self, sandbox_id: &str, sandbox_name: &str) -> Result<(), Status> {
+        if !sandbox_id.is_empty() {
+            validate_sandbox_id(sandbox_id)?;
+        }
+        let record_id = {
+            let registry = self.registry.lock().await;
+            if registry.contains_key(sandbox_id) {
+                Some(sandbox_id.to_string())
+            } else {
+                registry
+                    .iter()
+                    .find(|(_, record)| record.snapshot.name == sandbox_name)
+                    .map(|(id, _)| id.clone())
+            }
+        }
+        .ok_or_else(|| Status::not_found("sandbox not found"))?;
+
+        let state_dir = {
+            let registry = self.registry.lock().await;
+            registry
+                .get(&record_id)
+                .ok_or_else(|| Status::not_found("sandbox not found"))?
+                .state_dir
+                .clone()
+        };
+
+        // Persist intent before detaching process handles or releasing host
+        // allocations. If this write fails, the live record remains intact.
+        tokio::fs::write(state_dir.join(SANDBOX_STOPPED_FILE), b"stopped\n")
+            .await
+            .map_err(|err| Status::internal(format!("persist stop marker failed: {err}")))?;
+
+        let (process, provisioning_task, has_gpu, has_qemu_network, snapshot) = {
+            let mut registry = self.registry.lock().await;
+            let record = registry
+                .get_mut(&record_id)
+                .ok_or_else(|| Status::not_found("sandbox not found"))?;
+            (
+                record.process.take(),
+                record.provisioning_task.take(),
+                record.gpu_bdf.take().is_some(),
+                std::mem::take(&mut record.qemu_network_allocated),
+                record.snapshot.clone(),
+            )
+        };
+
+        if let Some(task) = provisioning_task {
+            task.abort();
+        }
+        if let Some(process) = process {
+            let mut process = process.lock().await;
+            process.deleting = true;
+            terminate_vm_process(&mut process.child)
+                .await
+                .map_err(|err| Status::internal(format!("failed to stop vm: {err}")))?;
+        }
+        self.lifecycle_extensions
+            .after_launch_failed(&snapshot, &state_dir, LaunchAbortReason::Stopped)
+            .await;
+        self.release_allocations(&record_id, has_gpu, has_qemu_network);
+
+        if let Some(snapshot) = self
+            .set_snapshot_condition(&record_id, stopped_condition(), false)
+            .await
+        {
+            self.publish_snapshot(snapshot);
+        }
+        self.publish_platform_event(
+            record_id,
+            platform_event("vm", "Normal", "Stopped", "VM sandbox stopped".to_string()),
+        );
+        Ok(())
+    }
+
+    pub async fn start_sandbox(&self, sandbox_id: &str, sandbox_name: &str) -> Result<(), Status> {
+        if !sandbox_id.is_empty() {
+            validate_sandbox_id(sandbox_id)?;
+        }
+        let (record_id, state_dir, already_running) = {
+            let registry = self.registry.lock().await;
+            let (id, record) = if let Some(entry) = registry.get_key_value(sandbox_id) {
+                entry
+            } else {
+                registry
+                    .iter()
+                    .find(|(_, record)| record.snapshot.name == sandbox_name)
+                    .ok_or_else(|| Status::not_found("sandbox not found"))?
+            };
+            (
+                id.clone(),
+                record.state_dir.clone(),
+                record.process.is_some() || record.provisioning_task.is_some(),
+            )
+        };
+        if already_running {
+            return Ok(());
+        }
+
+        let sandbox = read_sandbox_request(&state_dir.join(SANDBOX_REQUEST_FILE))
+            .await
+            .map_err(|err| {
+                Status::internal(format!("read sandbox start metadata failed: {err}"))
+            })?;
+        let stopped_record = self
+            .registry
+            .lock()
+            .await
+            .remove(&record_id)
+            .ok_or_else(|| Status::not_found("sandbox not found"))?;
+        let restored = self
+            .restore_persisted_sandbox(sandbox, state_dir, true, &tracing::Span::current())
+            .await;
+        if !restored {
+            self.registry
+                .lock()
+                .await
+                .entry(record_id)
+                .or_insert(stopped_record);
+            return Err(Status::internal("failed to start persisted VM sandbox"));
+        }
+        Ok(())
+    }
+
     #[tracing::instrument(
         name = "vm.delete",
         skip(self),
@@ -1264,24 +1391,50 @@ impl VmDriver {
                 continue;
             }
 
-            self.restore_persisted_sandbox(sandbox, state_dir, &tracing::Span::current())
+            if tokio::fs::metadata(state_dir.join(SANDBOX_STOPPED_FILE))
+                .await
+                .is_ok()
+            {
+                let snapshot = sandbox_snapshot(&sandbox, stopped_condition(), false);
+                let mut registry = self.registry.lock().await;
+                registry.entry(sandbox.id.clone()).or_insert(SandboxRecord {
+                    snapshot: snapshot.clone(),
+                    state_dir: state_dir.clone(),
+                    process: None,
+                    provisioning_task: None,
+                    gpu_bdf: None,
+                    qemu_network_allocated: false,
+                    deleting: false,
+                });
+                drop(registry);
+                self.publish_snapshot(snapshot);
+                info!(sandbox_id = %sandbox.id, "vm driver: restored stopped sandbox without launching compute");
+                continue;
+            }
+
+            self.restore_persisted_sandbox(sandbox, state_dir, false, &tracing::Span::current())
                 .await;
         }
     }
 
+    /// Restore a persisted sandbox and report whether the driver accepted it.
+    /// For explicit start, the stop marker is cleared only after all
+    /// restore preflight checks pass and the replacement registry record is
+    /// installed. A failed restore therefore remains durably stopped.
     async fn restore_persisted_sandbox(
         &self,
         sandbox: Sandbox,
         state_dir: PathBuf,
+        clear_stop_marker: bool,
         reconciliation_span: &tracing::Span,
-    ) {
+    ) -> bool {
         let Some(image_ref) = self.resolved_sandbox_image(&sandbox) else {
             warn!(
                 sandbox_id = %sandbox.id,
                 sandbox_name = %sandbox.name,
                 "vm driver: cannot restore persisted sandbox without image"
             );
-            return;
+            return false;
         };
         let tls_paths = match self.config.tls_paths() {
             Ok(paths) => paths,
@@ -1292,7 +1445,7 @@ impl VmDriver {
                     error = %err,
                     "vm driver: cannot restore persisted sandbox TLS configuration"
                 );
-                return;
+                return false;
             }
         };
 
@@ -1304,7 +1457,7 @@ impl VmDriver {
                 error = %err.message(),
                 "vm driver: cannot restore persisted sandbox extension state"
             );
-            return;
+            return false;
         }
 
         let persisted = RestoreContext {
@@ -1319,14 +1472,14 @@ impl VmDriver {
                 error = %err,
                 "vm driver: lifecycle extension rejected persisted sandbox restore"
             );
-            return;
+            return false;
         }
 
         let snapshot = sandbox_snapshot(&sandbox, provisioning_condition(), false);
         {
             let mut registry = self.registry.lock().await;
             if registry.contains_key(&sandbox.id) {
-                return;
+                return false;
             }
             registry.insert(
                 sandbox.id.clone(),
@@ -1340,6 +1493,23 @@ impl VmDriver {
                     deleting: false,
                 },
             );
+        }
+
+        if clear_stop_marker {
+            match tokio::fs::remove_file(state_dir.join(SANDBOX_STOPPED_FILE)).await {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => {
+                    self.registry.lock().await.remove(&sandbox.id);
+                    warn!(
+                        sandbox_id = %sandbox.id,
+                        state_dir = %state_dir.display(),
+                        error = %err,
+                        "vm driver: cannot clear stop marker for persisted sandbox restore"
+                    );
+                    return false;
+                }
+            }
         }
 
         self.publish_platform_event(
@@ -1392,6 +1562,7 @@ impl VmDriver {
         } else {
             task.abort();
         }
+        true
     }
 
     fn release_gpu(&self, sandbox_id: &str) {
@@ -3179,11 +3350,22 @@ impl ComputeDriver for VmDriver {
 
     async fn stop_sandbox(
         &self,
-        _request: Request<StopSandboxRequest>,
+        request: Request<StopSandboxRequest>,
     ) -> Result<Response<StopSandboxResponse>, Status> {
-        Err(Status::unimplemented(
-            "stop sandbox is not implemented by the vm compute driver",
-        ))
+        let request = request.into_inner();
+        self.stop_sandbox(&request.sandbox_id, &request.sandbox_name)
+            .await?;
+        Ok(Response::new(StopSandboxResponse {}))
+    }
+
+    async fn start_sandbox(
+        &self,
+        request: Request<StartSandboxRequest>,
+    ) -> Result<Response<StartSandboxResponse>, Status> {
+        let request = request.into_inner();
+        self.start_sandbox(&request.sandbox_id, &request.sandbox_name)
+            .await?;
+        Ok(Response::new(StartSandboxResponse {}))
     }
 
     async fn delete_sandbox(
@@ -3252,6 +3434,20 @@ impl ComputeDriver for VmDriver {
 
         let stream: Self::WatchSandboxesStream = Box::pin(ReceiverStream::new(out_rx));
         Ok(Response::new(stream))
+    }
+
+    async fn ensure_workspace(
+        &self,
+        _request: Request<EnsureWorkspaceRequest>,
+    ) -> Result<Response<EnsureWorkspaceResponse>, Status> {
+        Ok(Response::new(EnsureWorkspaceResponse {}))
+    }
+
+    async fn delete_workspace(
+        &self,
+        _request: Request<DeleteWorkspaceRequest>,
+    ) -> Result<Response<DeleteWorkspaceResponse>, Status> {
+        Ok(Response::new(DeleteWorkspaceResponse {}))
     }
 }
 
@@ -4266,8 +4462,19 @@ fn build_guest_environment(
         openshell_core::sandbox_env::TELEMETRY_ENABLED.to_string(),
         openshell_core::telemetry::enabled_env_value().to_string(),
     );
+    // Runtime capabilities are driver-owned. The VM driver does not yet
+    // provide policy DNS and transparent TCP interception.
+    environment.insert(
+        openshell_core::sandbox_env::NETWORK_RUNTIME_CAPABILITIES.to_string(),
+        String::new(),
+    );
     environment.remove(openshell_core::sandbox_env::SANDBOX_TOKEN);
     environment.remove(openshell_core::sandbox_env::SANDBOX_TOKEN_FILE);
+    // Prevent user-supplied environment from overriding the TLS server name
+    // the supervisor verifies — a sandbox user who can redirect the gateway
+    // hostname could otherwise present a certificate for a name they control
+    // and intercept the sandbox JWT.
+    environment.remove(openshell_core::sandbox_env::GATEWAY_TLS_SERVER_NAME);
     if sandbox
         .spec
         .as_ref()
@@ -5180,6 +5387,16 @@ fn deleting_condition() -> SandboxCondition {
         status: "False".to_string(),
         reason: "Deleting".to_string(),
         message: "Sandbox is being deleted".to_string(),
+        last_transition_time: String::new(),
+    }
+}
+
+fn stopped_condition() -> SandboxCondition {
+    SandboxCondition {
+        r#type: "Stopped".to_string(),
+        status: "True".to_string(),
+        reason: "ComputeStopped".to_string(),
+        message: "VM compute is stopped and persistent state is retained".to_string(),
         last_transition_time: String::new(),
     }
 }
@@ -6349,13 +6566,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sandbox_request_metadata_round_trips_for_resume() {
+    async fn sandbox_request_metadata_round_trips_for_start() {
         let base = unique_temp_dir();
         let state_dir = base.join("sandboxes").join("sandbox-123");
         std::fs::create_dir_all(&state_dir).unwrap();
         let sandbox = Sandbox {
             id: "sandbox-123".to_string(),
-            name: "resume-sandbox".to_string(),
+            name: "start-sandbox".to_string(),
             namespace: "vm-dev".to_string(),
             spec: Some(SandboxSpec {
                 environment: HashMap::from([("KEY".to_string(), "value".to_string())]),
@@ -6395,8 +6612,64 @@ mod tests {
         let _ = std::fs::remove_dir_all(base);
     }
 
+    #[tokio::test]
+    async fn failed_start_preserves_stopped_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut driver = test_driver_with_extensions(LifecycleExtensionRegistry::new());
+        driver.config.state_dir = temp.path().to_path_buf();
+        let sandbox = Sandbox {
+            id: "sandbox-stopped".to_string(),
+            name: "stopped".to_string(),
+            ..Default::default()
+        };
+        let state_dir = temp.path().join("sandboxes").join(&sandbox.id);
+        create_private_dir_all(&state_dir).await.unwrap();
+        write_sandbox_request(&state_dir, &sandbox).await.unwrap();
+        tokio::fs::write(state_dir.join(SANDBOX_STOPPED_FILE), b"stopped\n")
+            .await
+            .unwrap();
+        let snapshot = sandbox_snapshot(&sandbox, stopped_condition(), false);
+        driver.registry.lock().await.insert(
+            sandbox.id.clone(),
+            SandboxRecord {
+                snapshot,
+                state_dir: state_dir.clone(),
+                process: None,
+                provisioning_task: None,
+                gpu_bdf: None,
+                qemu_network_allocated: false,
+                deleting: false,
+            },
+        );
+
+        let err = driver
+            .start_sandbox(&sandbox.id, &sandbox.name)
+            .await
+            .expect_err("start without an image should fail");
+
+        assert_eq!(err.code(), Code::Internal);
+        assert!(
+            tokio::fs::metadata(state_dir.join(SANDBOX_STOPPED_FILE))
+                .await
+                .is_ok(),
+            "failed start must retain its durable stop marker"
+        );
+        let restored = driver
+            .get_sandbox(&sandbox.id, &sandbox.name)
+            .await
+            .unwrap()
+            .expect("failed start must retain its stopped registry record");
+        let condition = restored
+            .status
+            .as_ref()
+            .and_then(|status| status.conditions.first())
+            .expect("stopped condition");
+        assert_eq!(condition.r#type, "Stopped");
+        assert_eq!(condition.status, "True");
+    }
+
     #[test]
-    fn prepare_sandbox_overlay_preserves_existing_overlay_on_resume() {
+    fn prepare_sandbox_overlay_preserves_existing_overlay_on_start() {
         let base = unique_temp_dir();
         std::fs::create_dir_all(&base).unwrap();
         let template = base.join("template.ext4");
@@ -6420,7 +6693,7 @@ mod tests {
     }
 
     #[test]
-    fn prepare_sandbox_overlay_creates_missing_overlay_on_resume() {
+    fn prepare_sandbox_overlay_creates_missing_overlay_on_start() {
         let base = unique_temp_dir();
         std::fs::create_dir_all(&base).unwrap();
         let template = base.join("template.ext4");
@@ -6685,6 +6958,16 @@ mod tests {
     }
 
     #[test]
+    fn validate_sandbox_identity_accepts_non_root_system_ids() {
+        let config = VmDriverConfig {
+            sandbox_uid: Some(500),
+            sandbox_gid: Some(30),
+            ..Default::default()
+        };
+        assert!(config.validate_sandbox_identity().is_ok());
+    }
+
+    #[test]
     fn build_guest_environment_uses_token_file_without_raw_token_env() {
         let config = VmDriverConfig {
             openshell_endpoint: "http://127.0.0.1:8080".to_string(),
@@ -6714,6 +6997,36 @@ mod tests {
             "{}={GUEST_SANDBOX_TOKEN_PATH}",
             openshell_core::sandbox_env::SANDBOX_TOKEN_FILE
         )));
+    }
+
+    #[test]
+    fn build_guest_environment_strips_gateway_tls_server_name() {
+        let config = VmDriverConfig {
+            openshell_endpoint: "http://127.0.0.1:8080".to_string(),
+            ..Default::default()
+        };
+        let sandbox = Sandbox {
+            id: "sandbox-123".to_string(),
+            name: "sandbox-123".to_string(),
+            spec: Some(SandboxSpec {
+                environment: HashMap::from([(
+                    openshell_core::sandbox_env::GATEWAY_TLS_SERVER_NAME.to_string(),
+                    "evil.attacker.example.com".to_string(),
+                )]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let env = build_guest_environment(&sandbox, &config, None);
+
+        assert!(
+            !env.iter().any(|v| v.starts_with(&format!(
+                "{}=",
+                openshell_core::sandbox_env::GATEWAY_TLS_SERVER_NAME
+            ))),
+            "GATEWAY_TLS_SERVER_NAME must be stripped from the guest environment"
+        );
     }
 
     #[test]
@@ -6760,6 +7073,36 @@ mod tests {
                 );
             },
         );
+    }
+
+    #[test]
+    fn build_guest_environment_clears_unsupported_network_capabilities() {
+        let config = VmDriverConfig {
+            openshell_endpoint: "http://127.0.0.1:8080".to_string(),
+            ..Default::default()
+        };
+        let sandbox = Sandbox {
+            id: "sandbox-123".to_string(),
+            name: "sandbox-123".to_string(),
+            spec: Some(SandboxSpec {
+                environment: HashMap::from([(
+                    openshell_core::sandbox_env::NETWORK_RUNTIME_CAPABILITIES.to_string(),
+                    openshell_core::sandbox_env::POLICY_DNS_TRANSPARENT_TCP_CAPABILITY.to_string(),
+                )]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let env = build_guest_environment(&sandbox, &config, None);
+        assert!(env.contains(&format!(
+            "{}=",
+            openshell_core::sandbox_env::NETWORK_RUNTIME_CAPABILITIES
+        )));
+        assert!(!env.contains(&format!(
+            "{}={}",
+            openshell_core::sandbox_env::NETWORK_RUNTIME_CAPABILITIES,
+            openshell_core::sandbox_env::POLICY_DNS_TRANSPARENT_TCP_CAPABILITY
+        )));
     }
 
     #[test]

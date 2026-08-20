@@ -6,9 +6,11 @@
 use futures::{Stream, StreamExt};
 use openshell_core::proto::compute::v1::{
     CreateSandboxRequest, CreateSandboxResponse, DeleteSandboxRequest, DeleteSandboxResponse,
-    GetCapabilitiesRequest, GetCapabilitiesResponse, GetGatewayListenerRequirementsRequest,
-    GetGatewayListenerRequirementsResponse, GetSandboxRequest, GetSandboxResponse,
-    ListSandboxesRequest, ListSandboxesResponse, StopSandboxRequest, StopSandboxResponse,
+    DeleteWorkspaceRequest, DeleteWorkspaceResponse, EnsureWorkspaceRequest,
+    EnsureWorkspaceResponse, GetCapabilitiesRequest, GetCapabilitiesResponse,
+    GetGatewayListenerRequirementsRequest, GetGatewayListenerRequirementsResponse,
+    GetSandboxRequest, GetSandboxResponse, ListSandboxesRequest, ListSandboxesResponse,
+    StartSandboxRequest, StartSandboxResponse, StopSandboxRequest, StopSandboxResponse,
     ValidateSandboxCreateRequest, ValidateSandboxCreateResponse, WatchSandboxesEvent,
     WatchSandboxesRequest, compute_driver_server::ComputeDriver,
 };
@@ -16,6 +18,7 @@ use std::pin::Pin;
 use tonic::{Request, Response, Status};
 
 use crate::KubernetesComputeDriver;
+use crate::WorkspaceMode;
 
 #[derive(Debug, Clone)]
 pub struct ComputeDriverService {
@@ -112,11 +115,32 @@ impl ComputeDriver for ComputeDriverService {
 
     async fn stop_sandbox(
         &self,
-        _request: Request<StopSandboxRequest>,
+        request: Request<StopSandboxRequest>,
     ) -> Result<Response<StopSandboxResponse>, Status> {
-        Err(Status::unimplemented(
-            "stop sandbox is not implemented by the kubernetes compute driver",
-        ))
+        let request = request.into_inner();
+        if request.sandbox_id.is_empty() {
+            return Err(Status::invalid_argument("sandbox_id is required"));
+        }
+        self.driver
+            .stop_sandbox(&request.sandbox_id)
+            .await
+            .map_err(|error| Status::from(openshell_core::ComputeDriverError::from(error)))?;
+        Ok(Response::new(StopSandboxResponse {}))
+    }
+
+    async fn start_sandbox(
+        &self,
+        request: Request<StartSandboxRequest>,
+    ) -> Result<Response<StartSandboxResponse>, Status> {
+        let request = request.into_inner();
+        if request.sandbox_id.is_empty() {
+            return Err(Status::invalid_argument("sandbox_id is required"));
+        }
+        self.driver
+            .start_sandbox(&request.sandbox_id)
+            .await
+            .map_err(|error| Status::from(openshell_core::ComputeDriverError::from(error)))?;
+        Ok(Response::new(StartSandboxResponse {}))
     }
 
     async fn delete_sandbox(
@@ -150,10 +174,67 @@ impl ComputeDriver for ComputeDriverService {
         let stream = stream.map(|item| item.map_err(|err| Status::internal(err.to_string())));
         Ok(Response::new(Box::pin(stream)))
     }
+
+    async fn ensure_workspace(
+        &self,
+        request: Request<EnsureWorkspaceRequest>,
+    ) -> Result<Response<EnsureWorkspaceResponse>, Status> {
+        let workspace = request.into_inner().workspace;
+        if workspace.is_empty() {
+            return Err(Status::invalid_argument("workspace is required"));
+        }
+        self.driver
+            .validate_workspace_namespace(&workspace)
+            .map_err(|error| Status::from(openshell_core::ComputeDriverError::from(error)))?;
+        match self.driver.workspace_mode() {
+            WorkspaceMode::Managed => {
+                self.driver
+                    .ensure_namespace(&workspace)
+                    .await
+                    .map_err(|e| Status::internal(e.to_string()))?;
+            }
+            WorkspaceMode::Operator => {
+                if let Some(allowlist) = self.driver.operator_allowlist()
+                    && !allowlist.contains(&workspace)
+                {
+                    return Err(Status::permission_denied(format!(
+                        "workspace '{workspace}' is not in the operator namespace allowlist"
+                    )));
+                }
+            }
+            WorkspaceMode::Shared => {}
+        }
+        Ok(Response::new(EnsureWorkspaceResponse {}))
+    }
+
+    async fn delete_workspace(
+        &self,
+        request: Request<DeleteWorkspaceRequest>,
+    ) -> Result<Response<DeleteWorkspaceResponse>, Status> {
+        let workspace = request.into_inner().workspace;
+        if workspace.is_empty() {
+            return Err(Status::invalid_argument("workspace is required"));
+        }
+        if workspace_delete_requires_namespace_access(self.driver.workspace_mode()) {
+            self.driver
+                .validate_workspace_namespace(&workspace)
+                .map_err(|error| Status::from(openshell_core::ComputeDriverError::from(error)))?;
+            self.driver
+                .delete_namespace(&workspace)
+                .await
+                .map_err(|e| Status::internal(e.to_string()))?;
+        }
+        Ok(Response::new(DeleteWorkspaceResponse {}))
+    }
+}
+
+fn workspace_delete_requires_namespace_access(mode: WorkspaceMode) -> bool {
+    matches!(mode, WorkspaceMode::Managed)
 }
 
 #[cfg(test)]
 mod tests {
+    use super::{WorkspaceMode, workspace_delete_requires_namespace_access};
     use crate::KubernetesDriverError;
     use openshell_core::ComputeDriverError;
     use tonic::Status;
@@ -170,10 +251,42 @@ mod tests {
     }
 
     #[test]
+    fn invalid_workspace_driver_errors_map_to_invalid_argument_status() {
+        let status: Status = ComputeDriverError::from(KubernetesDriverError::InvalidArgument(
+            "managed namespace is invalid".to_string(),
+        ))
+        .into();
+
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        assert_eq!(status.message(), "managed namespace is invalid");
+    }
+
+    #[test]
     fn already_exists_driver_errors_map_to_already_exists_status() {
         let status: Status = ComputeDriverError::from(KubernetesDriverError::AlreadyExists).into();
 
         assert_eq!(status.code(), tonic::Code::AlreadyExists);
         assert_eq!(status.message(), "sandbox already exists");
+    }
+
+    #[test]
+    fn not_found_driver_errors_map_to_not_found_status() {
+        let status: Status = ComputeDriverError::from(KubernetesDriverError::NotFound).into();
+
+        assert_eq!(status.code(), tonic::Code::NotFound);
+        assert_eq!(status.message(), "sandbox not found");
+    }
+
+    #[test]
+    fn only_managed_workspace_delete_accesses_the_namespace() {
+        assert!(workspace_delete_requires_namespace_access(
+            WorkspaceMode::Managed
+        ));
+        assert!(!workspace_delete_requires_namespace_access(
+            WorkspaceMode::Operator
+        ));
+        assert!(!workspace_delete_requires_namespace_access(
+            WorkspaceMode::Shared
+        ));
     }
 }

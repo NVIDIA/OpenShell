@@ -177,10 +177,17 @@ HTTP 101 upgrade has completed. OpenShell closes that WebSocket with policy
 violation code 1008 instead of returning an HTTP response.
 
 Binding updates apply to both current and retained placeholder generations.
-Credential rotation keeps the current endpoint set. Updating a provider profile
-changes the binding on the next sandbox provider-environment sync, and detaching
-the provider revokes resolution for placeholders already held by running
-processes.
+For gateway-managed refresh credentials, automatic and manual token rotation
+keep one opaque workload placeholder and replace only its current resolver
+value. This lets a long-running process use each newly minted access token
+without restarting. OpenShell does not retain older values behind this stable
+placeholder.
+
+Explicitly configuring refresh again starts a new authorization epoch, even
+when the provider and credential key are unchanged. Reconfiguration, provider
+replacement or detachment, refresh deletion, and endpoint-boundary changes
+revoke the old placeholder. Updating a provider profile changes the binding on
+the next sandbox provider-environment sync.
 
 <Warning>
 Static credentials require at least one usable binding. OpenShell withholds only
@@ -195,6 +202,10 @@ restart or recreate older running sandboxes. A new gateway withholds static
 credential material from supervisors that do not advertise binding support.
 Rotate attached static credentials after upgrading when an older sandbox may
 have received their real values.
+
+When upgrading from revision-scoped refresh placeholders to stable refresh
+handles, restart each existing workload once so it receives the new placeholder.
+Later access-token rotations do not require workload restarts.
 
 ## Roadmap
 
@@ -377,6 +388,7 @@ endpoints:
     allow_encoded_slash: false
     websocket_credential_rewrite: false
     request_body_credential_rewrite: false
+    allow_uninspected_credentials: false
     persisted_queries: deny
     graphql_max_body_bytes: 65536
     rules:
@@ -424,7 +436,7 @@ credential declared under `credentials`. OpenShell scans the referenced
 credential's `env_vars` in order and stores the first non-empty local
 environment value under the actual environment variable key.
 
-`endpoints` contains the same endpoint object shape as sandbox network policy. A profile can use access presets, protocol-specific allow rules, deny rules, WebSocket credential rewriting, request body credential rewriting, GraphQL fields, and SSRF IP allowlists.
+`endpoints` contains the same endpoint object shape as sandbox network policy. A profile can use access presets, protocol-specific allow rules, deny rules, WebSocket credential rewriting, request body credential rewriting, GraphQL fields, and SSRF IP allowlists. Because profile credentials are not mapped to individual endpoints, OpenShell conservatively treats every endpoint in a profile that declares credentials as credentialed. Such endpoints require L7 inspection and cannot use `tls: skip` unless the profile explicitly sets `allow_uninspected_credentials: true`.
 
 `binaries` contains the executable paths allowed to reach the profile endpoints when the profile contributes policy to a sandbox.
 
@@ -562,15 +574,21 @@ openshell provider create \
   --credential OPENAI_API_KEY
 ```
 
-The create/update API stores submitted provider credentials through the
-gateway's active credential storage path and persists only internal credential
-handles. By default, the gateway stores AES-256-GCM encrypted credential
-envelopes in the gateway database outside the provider record. The Helm chart
+The create/update API stores submitted provider credentials and secret refresh
+material through the gateway's active credential storage path and persists only
+internal credential handles. Secret refresh material includes OAuth refresh
+tokens, client secrets, service-account private keys, and temporary AWS source
+secrets. By default, the gateway stores AES-256-GCM encrypted credential
+envelopes in the gateway database outside provider and refresh-state records. The Helm chart
 creates a retained Kubernetes Secret for the default storage key-encryption key
 and injects it into every gateway pod when no external credential driver is enabled.
 `credential_drivers = []` is invalid. Multi-replica Kubernetes gateways can use
 a shared database with the default encrypted store, or choose a shared backend
 such as `kubernetes-secrets` or `vault`.
+
+Every `secret_material_keys` entry must name a key supplied in `material` in the
+same configure request. Clients submit secret values, not internal credential
+handles.
 
 Provider records that already contain inline database credentials remain
 readable for upgrade compatibility. New provider create/update requests store
@@ -606,7 +624,28 @@ The gateway sends a complete host, port, and path binding for every emitted stat
 
 ## Configure Credential Refresh
 
-Refresh configuration is stored separately from the current injectable credential value. The gateway refresh worker reads refresh state, mints a new short-lived token for supported strategies, writes the token back to the provider record, and updates credential expiry metadata.
+Refresh configuration is stored separately from the current injectable credential value. Non-secret refresh configuration remains in the refresh-state record. Secret material is resolved from the active credential driver only while the gateway mints a new short-lived token. The gateway writes the token back through credential storage and updates credential expiry metadata. If an OAuth issuer rotates its refresh token, the gateway stages the replacement through credential storage before committing the refresh generation and removes the previous handle afterward.
+
+Before OpenShell 0.1.0, refresh-state and credential-driver migrations are not
+supported. Upgrading from a build that stored refresh material inline requires
+reconfiguring the refresh grant. To change credential drivers, delete or
+reconfigure affected providers while the original driver is still available,
+then select the new driver and create the credentials again. Do not run mixed
+gateway versions against the same refresh records.
+
+Each explicit `refresh configure` call also starts a new gateway-owned
+authorization epoch. Automatic refresh and `refresh rotate` preserve that epoch,
+so running workloads keep the same opaque credential handle while the short-lived
+token changes. Configuring refresh again is a revocation boundary and causes
+running workloads that still hold the previous handle to fail closed.
+
+While gateway-managed refresh is configured, `provider update --credential`
+cannot replace or delete its primary credential or any co-minted output. Use
+`provider refresh rotate` to mint a new short-lived value. Re-run
+`provider refresh configure` to start a new authorization, or use
+`provider refresh delete` before returning those credential keys to manual
+management. You can still update unrelated credentials, configuration, and
+credential expiry metadata.
 
 For a complete Microsoft Graph OAuth2 refresh-token walkthrough, see [Refresh Microsoft Graph Credentials with Providers v2](/get-started/tutorials/microsoft-graph-provider-refresh).
 
@@ -676,7 +715,7 @@ openshell provider refresh configure drive-work \
 This example assumes you imported a custom profile with `id: google-drive`.
 
 <Note>
-`--secret-material-key` takes the name of a `--material` key, not the secret value. For example, use `--material client_secret="$MS_CLIENT_SECRET"` with `--secret-material-key client_secret`. The key should match a material entry so OpenShell can record that material field as sensitive when it stores refresh state. The gateway uses the material values to mint future access tokens, but only the `--credential-key` value, such as `MS_GRAPH_ACCESS_TOKEN`, becomes the injectable provider credential. If a refresh response rotates an OAuth refresh token, OpenShell stores the new `refresh_token` material and marks `refresh_token` as secret automatically.
+`--secret-material-key` takes the name of a `--material` key, not the secret value. For example, use `--material client_secret="$MS_CLIENT_SECRET"` with `--secret-material-key client_secret`. Prefer `--secret-material-env` so the value does not appear in shell history. The gateway combines caller markings with authoritative profile metadata and strategy-defined secret fields, then stores those values through the active credential driver. Only the `--credential-key` value, such as `MS_GRAPH_ACCESS_TOKEN`, becomes injectable. If an OAuth response rotates a refresh token, OpenShell stores the replacement through the credential driver automatically.
 </Note>
 
 Use `--credential-expires-at` when the current provider credential already has a known expiry timestamp. For refresh-managed keys, the value can be Unix epoch milliseconds or an ISO/RFC3339 timestamp such as `2026-01-01T00:00:00Z` or `2026-01-01T01:00:00+01:00`. OpenShell stores that value as epoch milliseconds in both refresh state and provider credential metadata. Later gateway-managed refreshes replace it with the minted token expiry.

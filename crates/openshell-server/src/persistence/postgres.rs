@@ -293,6 +293,50 @@ ON CONFLICT (object_type, workspace, name) WHERE name IS NOT NULL DO UPDATE SET
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_scoped(
+        &self,
+        object_type: &str,
+        id: &str,
+        name: &str,
+        workspace: &str,
+        scope: &str,
+        payload: &[u8],
+        labels: Option<&str>,
+    ) -> PersistenceResult<WriteResult> {
+        let now_ms = current_time_ms();
+        let labels_jsonb: Option<serde_json::Value> = labels
+            .map(serde_json::from_str)
+            .transpose()
+            .map_err(|e| PersistenceError::Encode(format!("invalid labels JSON: {e}")))?;
+
+        let row = sqlx::query(
+            r"
+INSERT INTO objects (object_type, id, name, workspace, scope, payload, created_at_ms, updated_at_ms, labels, resource_version)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $7, COALESCE($8, '{}'::jsonb), 1)
+RETURNING resource_version, created_at_ms, updated_at_ms
+",
+        )
+        .bind(object_type)
+        .bind(id)
+        .bind(name)
+        .bind(workspace)
+        .bind(scope)
+        .bind(payload)
+        .bind(now_ms)
+        .bind(labels_jsonb)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| map_db_error(&e))?;
+
+        let resource_version_i64: i64 = row.try_get("resource_version").unwrap_or(1);
+        Ok(WriteResult {
+            resource_version: resource_version_i64.max(1).cast_unsigned(),
+            created_at_ms: row.get("created_at_ms"),
+            updated_at_ms: row.get("updated_at_ms"),
+        })
+    }
+
     pub async fn get(
         &self,
         object_type: &str,

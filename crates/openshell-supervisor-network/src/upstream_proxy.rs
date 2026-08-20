@@ -581,6 +581,9 @@ pub struct PrefixedStream {
     prefix: Vec<u8>,
     /// Read offset into `prefix`.
     pos: usize,
+    /// CONNECT target selected for a corporate-proxy tunnel. Direct streams
+    /// leave this unset; their socket peer is the destination itself.
+    connect_target: Option<ConnectTarget>,
 }
 
 impl PrefixedStream {
@@ -591,6 +594,7 @@ impl PrefixedStream {
             inner,
             prefix,
             pos: 0,
+            connect_target: None,
         }
     }
 
@@ -598,6 +602,25 @@ impl PrefixedStream {
     #[must_use]
     pub fn without_prefix(inner: TcpStream) -> Self {
         Self::new(inner, Vec::new())
+    }
+
+    fn with_connect_target(mut self, target: ConnectTarget) -> Self {
+        self.connect_target = Some(target);
+        self
+    }
+
+    /// Return the connected socket peer. For a proxied tunnel this is the
+    /// corporate proxy, not the ultimate destination.
+    pub fn peer_addr(&self) -> std::io::Result<SocketAddr> {
+        self.inner.peer_addr()
+    }
+
+    /// Return the HTTP CONNECT target for a proxied tunnel. An IP target is
+    /// the exact validated destination selected by the fallback loop; a
+    /// hostname target means the corporate proxy performs resolution.
+    #[must_use]
+    pub fn connect_target(&self) -> Option<ConnectTarget> {
+        self.connect_target
     }
 }
 
@@ -801,7 +824,8 @@ async fn connect_via_inner(
     let mut stream = TcpStream::connect((endpoint.host.as_str(), endpoint.port)).await?;
     set_tcp_nodelay_best_effort(&stream);
 
-    let target = match target {
+    let connect_target = target;
+    let target = match connect_target {
         ConnectTarget::Ip(IpAddr::V6(ip)) => format!("[{ip}]:{port}"),
         ConnectTarget::Ip(ip) => format!("{ip}:{port}"),
         ConnectTarget::Hostname if host.contains(':') => format!("[{host}]:{port}"),
@@ -859,7 +883,7 @@ async fn connect_via_inner(
             );
             buf.truncate(used);
             let overflow = buf.split_off(header_end);
-            Ok(PrefixedStream::new(stream, overflow))
+            Ok(PrefixedStream::new(stream, overflow).with_connect_target(connect_target))
         }
         Some(code) => Err(IoError::other(format!(
             "upstream proxy {} refused CONNECT to {target}: HTTP {code}",
@@ -1553,6 +1577,11 @@ mod tests {
         let stream = connect_via_validated(&endpoint, "api.example.com", 443, &addrs)
             .await
             .unwrap();
+        assert!(matches!(
+            stream.connect_target(),
+            Some(ConnectTarget::Ip(ip)) if ip == addrs[1].ip()
+        ));
+        assert_eq!(stream.peer_addr().unwrap(), addr);
         let (first, second, _accepted) = handle.await.unwrap();
         drop(stream);
         assert!(

@@ -1282,6 +1282,7 @@ fn merge_endpoint(
     existing.allow_encoded_slash |= incoming.allow_encoded_slash;
     existing.websocket_credential_rewrite |= incoming.websocket_credential_rewrite;
     existing.request_body_credential_rewrite |= incoming.request_body_credential_rewrite;
+    existing.allow_uninspected_credentials |= incoming.allow_uninspected_credentials;
     existing.advisor_proposed |= incoming.advisor_proposed;
     normalize_endpoint(existing);
     Ok(())
@@ -3098,6 +3099,48 @@ mod tests {
 
         let endpoint = &result.policy.network_policies["existing"].endpoints[0];
         assert!(endpoint.request_body_credential_rewrite);
+    }
+
+    #[test]
+    fn add_rule_merges_allow_uninspected_credentials_flag() {
+        let mut policy = restrictive_default_policy();
+        policy.network_policies.insert(
+            "existing".to_string(),
+            NetworkPolicyRule {
+                name: "existing".to_string(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "api.vendor.example".to_string(),
+                    port: 443,
+                    ports: vec![443],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+
+        let incoming = NetworkPolicyRule {
+            name: "incoming".to_string(),
+            endpoints: vec![NetworkEndpoint {
+                host: "api.vendor.example".to_string(),
+                port: 443,
+                ports: vec![443],
+                allow_uninspected_credentials: true,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let result = merge_policy(
+            policy,
+            &[PolicyMergeOp::AddRule {
+                rule_name: "allow_api_vendor_example_443".to_string(),
+                rule: incoming,
+            }],
+        )
+        .expect("merge should succeed");
+
+        let endpoint = &result.policy.network_policies["existing"].endpoints[0];
+        assert!(endpoint.allow_uninspected_credentials);
     }
 
     #[test]

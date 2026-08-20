@@ -8,9 +8,11 @@ use futures::{Stream, stream};
 use openshell_core::proto::compute::v1::compute_driver_server::ComputeDriverServer;
 use openshell_core::proto::compute::v1::{
     CreateSandboxRequest, CreateSandboxResponse, DeleteSandboxRequest, DeleteSandboxResponse,
-    DriverSandbox, GatewayListenerRequirement, GetCapabilitiesRequest, GetCapabilitiesResponse,
-    GetGatewayListenerRequirementsRequest, GetGatewayListenerRequirementsResponse,
-    GetSandboxRequest, GetSandboxResponse, ListSandboxesRequest, ListSandboxesResponse,
+    DeleteWorkspaceRequest, DeleteWorkspaceResponse, DriverSandbox, EnsureWorkspaceRequest,
+    EnsureWorkspaceResponse, GatewayListenerRequirement, GetCapabilitiesRequest,
+    GetCapabilitiesResponse, GetGatewayListenerRequirementsRequest,
+    GetGatewayListenerRequirementsResponse, GetSandboxRequest, GetSandboxResponse,
+    ListSandboxesRequest, ListSandboxesResponse, StartSandboxRequest, StartSandboxResponse,
     StopSandboxRequest, StopSandboxResponse, ValidateSandboxCreateRequest,
     ValidateSandboxCreateResponse, WatchSandboxesEvent, WatchSandboxesRequest,
     compute_driver_server::ComputeDriver, gateway_listener_requirement::Selector,
@@ -51,6 +53,10 @@ pub enum FakeComputeDriverCall {
         sandbox_id: String,
         sandbox_name: String,
     },
+    StartSandbox {
+        sandbox_id: String,
+        sandbox_name: String,
+    },
     DeleteSandbox {
         sandbox_id: String,
         sandbox_name: String,
@@ -65,9 +71,7 @@ pub struct FakeComputeDriver {
 
 #[derive(Debug)]
 struct FakeComputeDriverState {
-    driver_name: String,
-    driver_version: String,
-    default_image: String,
+    capabilities: GetCapabilitiesResponse,
     gateway_listener_requirements: Vec<GatewayListenerRequirement>,
     gateway_listener_requirements_supported: bool,
     sandboxes: HashMap<String, DriverSandbox>,
@@ -86,9 +90,12 @@ impl FakeComputeDriver {
     pub fn new() -> Self {
         Self {
             state: Arc::new(Mutex::new(FakeComputeDriverState {
-                driver_name: "fake-compute-driver".to_string(),
-                driver_version: "test".to_string(),
-                default_image: "openshell/sandbox:test".to_string(),
+                capabilities: GetCapabilitiesResponse {
+                    driver_name: "fake-compute-driver".to_string(),
+                    driver_version: "test".to_string(),
+                    default_image: "openshell/sandbox:test".to_string(),
+                    gateway_manages_lifecycle: false,
+                },
                 gateway_listener_requirements: Vec::new(),
                 gateway_listener_requirements_supported: true,
                 sandboxes: HashMap::new(),
@@ -100,19 +107,25 @@ impl FakeComputeDriver {
 
     #[must_use]
     pub fn with_driver_name(self, driver_name: impl Into<String>) -> Self {
-        self.with_state(|state| state.driver_name = driver_name.into());
+        self.with_state(|state| state.capabilities.driver_name = driver_name.into());
         self
     }
 
     #[must_use]
     pub fn with_driver_version(self, driver_version: impl Into<String>) -> Self {
-        self.with_state(|state| state.driver_version = driver_version.into());
+        self.with_state(|state| state.capabilities.driver_version = driver_version.into());
         self
     }
 
     #[must_use]
     pub fn with_default_image(self, default_image: impl Into<String>) -> Self {
-        self.with_state(|state| state.default_image = default_image.into());
+        self.with_state(|state| state.capabilities.default_image = default_image.into());
+        self
+    }
+
+    #[must_use]
+    pub fn with_gateway_manages_lifecycle(self) -> Self {
+        self.with_state(|state| state.capabilities.gateway_manages_lifecycle = true);
         self
     }
 
@@ -231,11 +244,7 @@ impl ComputeDriver for FakeComputeDriver {
         self.record_traceparent(request.metadata());
         let response = self.with_state(|state| {
             state.calls.push(FakeComputeDriverCall::GetCapabilities);
-            GetCapabilitiesResponse {
-                driver_name: state.driver_name.clone(),
-                driver_version: state.driver_version.clone(),
-                default_image: state.default_image.clone(),
-            }
+            state.capabilities.clone()
         });
         Ok(Response::new(response))
     }
@@ -344,6 +353,21 @@ impl ComputeDriver for FakeComputeDriver {
         Ok(Response::new(StopSandboxResponse {}))
     }
 
+    async fn start_sandbox(
+        &self,
+        request: Request<StartSandboxRequest>,
+    ) -> Result<Response<StartSandboxResponse>, Status> {
+        self.record_traceparent(request.metadata());
+        let request = request.into_inner();
+        self.with_state(|state| {
+            state.calls.push(FakeComputeDriverCall::StartSandbox {
+                sandbox_id: request.sandbox_id,
+                sandbox_name: request.sandbox_name,
+            });
+        });
+        Ok(Response::new(StartSandboxResponse {}))
+    }
+
     async fn delete_sandbox(
         &self,
         request: Request<DeleteSandboxRequest>,
@@ -379,5 +403,19 @@ impl ComputeDriver for FakeComputeDriver {
         self.record_traceparent(request.metadata());
         self.with_state(|state| state.calls.push(FakeComputeDriverCall::WatchSandboxes));
         Ok(Response::new(Box::pin(stream::empty())))
+    }
+
+    async fn ensure_workspace(
+        &self,
+        _request: Request<EnsureWorkspaceRequest>,
+    ) -> Result<Response<EnsureWorkspaceResponse>, Status> {
+        Ok(Response::new(EnsureWorkspaceResponse {}))
+    }
+
+    async fn delete_workspace(
+        &self,
+        _request: Request<DeleteWorkspaceRequest>,
+    ) -> Result<Response<DeleteWorkspaceResponse>, Status> {
+        Ok(Response::new(DeleteWorkspaceResponse {}))
     }
 }

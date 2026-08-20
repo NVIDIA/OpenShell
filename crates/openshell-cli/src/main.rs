@@ -1172,7 +1172,8 @@ enum GatewayCommands {
     /// Authenticate with an edge-authenticated or OIDC gateway.
     ///
     /// Opens a browser for the edge proxy's login flow and stores the
-    /// token locally. Use this to re-authenticate when a token expires.
+    /// token locally. After `gateway logout`, OIDC browser login requests a
+    /// fresh identity-provider prompt so you can switch users.
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Login {
         /// Gateway name (defaults to the active gateway).
@@ -1183,7 +1184,9 @@ enum GatewayCommands {
     /// Clear stored authentication credentials for a gateway.
     ///
     /// Removes the locally stored OIDC token or edge token so subsequent
-    /// commands require re-authentication via `gateway login`.
+    /// commands require re-authentication via `gateway login`. For OIDC
+    /// gateways, the next browser login asks the identity provider for a fresh
+    /// login instead of silently reusing an existing browser session.
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Logout {
         /// Gateway name (defaults to the active gateway).
@@ -1524,6 +1527,22 @@ enum SandboxCommands {
         all: bool,
     },
 
+    /// Stop a sandbox while preserving its workspace.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Stop {
+        /// Sandbox name (defaults to last-used sandbox).
+        #[arg(add = ArgValueCompleter::new(completers::complete_sandbox_names))]
+        name: Option<String>,
+    },
+
+    /// Start a stopped sandbox.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Start {
+        /// Sandbox name (defaults to last-used sandbox).
+        #[arg(add = ArgValueCompleter::new(completers::complete_sandbox_names))]
+        name: Option<String>,
+    },
+
     /// Execute a command in a running sandbox.
     ///
     /// Runs a command inside an existing sandbox using the gRPC exec endpoint.
@@ -1775,6 +1794,8 @@ enum PolicyCommands {
         name: Option<String>,
 
         /// Add or merge an endpoint: host:port[:access[:protocol[:enforcement[:options]]]].
+        /// Options include allowed-ip=..., credential rewrite flags, and
+        /// allow-uninspected-credentials.
         #[arg(long = "add-endpoint")]
         add_endpoints: Vec<String>,
 
@@ -3163,6 +3184,14 @@ async fn run_async() -> Result<()> {
                             )
                             .await?;
                         }
+                        SandboxCommands::Stop { name } => {
+                            let name = resolve_sandbox_name(name, &ctx.name, &cli.workspace)?;
+                            run::sandbox_stop(endpoint, &name, &cli.workspace, &tls).await?;
+                        }
+                        SandboxCommands::Start { name } => {
+                            let name = resolve_sandbox_name(name, &ctx.name, &cli.workspace)?;
+                            run::sandbox_start(endpoint, &name, &cli.workspace, &tls).await?;
+                        }
                         SandboxCommands::Connect { name, editor } => {
                             let name = resolve_sandbox_name(name, &ctx.name, &cli.workspace)?;
                             if let Some(editor) = editor.map(Into::into) {
@@ -4459,6 +4488,27 @@ mod tests {
                     output: OutputFormat::Table,
                     ..
                 })
+            })
+        ));
+    }
+
+    #[test]
+    fn sandbox_stop_and_start_accept_optional_names() {
+        let stop = Cli::try_parse_from(["openshell", "sandbox", "stop", "demo"])
+            .expect("stop command should parse");
+        assert!(matches!(
+            stop.command,
+            Some(Commands::Sandbox {
+                command: Some(SandboxCommands::Stop { name: Some(ref name) }),
+            }) if name == "demo"
+        ));
+
+        let start = Cli::try_parse_from(["openshell", "sandbox", "start"])
+            .expect("start command should parse");
+        assert!(matches!(
+            start.command,
+            Some(Commands::Sandbox {
+                command: Some(SandboxCommands::Start { name: None }),
             })
         ));
     }

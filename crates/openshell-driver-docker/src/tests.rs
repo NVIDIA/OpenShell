@@ -5,7 +5,7 @@ use super::*;
 use openshell_core::config::DEFAULT_SERVER_PORT;
 use openshell_core::driver_utils::{
     LABEL_MANAGED_BY, LABEL_MANAGED_BY_VALUE, LABEL_SANDBOX_ID, LABEL_SANDBOX_NAME,
-    LABEL_SANDBOX_NAMESPACE,
+    LABEL_SANDBOX_NAMESPACE, supervisor_cache_path_with_base,
 };
 use openshell_core::progress::{
     PROGRESS_ACTIVE_DETAIL_KEY, PROGRESS_ACTIVE_STEP_KEY, PROGRESS_COMPLETE_LABEL_KEY,
@@ -102,6 +102,10 @@ fn runtime_config() -> DockerDriverRuntimeConfig {
             ),
             host_alias_ip: IpAddr::V4(Ipv4Addr::new(172, 18, 0, 1)),
         },
+        gateway_callback_bind_address: Some(SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::new(172, 18, 0, 1)),
+            DEFAULT_SERVER_PORT,
+        )),
         ssh_socket_path: "/run/openshell/ssh.sock".to_string(),
         stop_timeout_secs: DEFAULT_STOP_TIMEOUT_SECS,
         log_level: "info".to_string(),
@@ -156,6 +160,7 @@ fn test_driver_with_config(config: DockerDriverRuntimeConfig) -> DockerComputeDr
             CdiGpuInventory::default(),
             allow_all_default_gpu,
         )),
+        lifecycle_event_fences: DockerLifecycleEventFences::default(),
     }
 }
 
@@ -185,6 +190,7 @@ async fn gateway_listener_requirements_report_managed_bridge_address() {
 async fn gateway_listener_requirements_are_empty_for_host_gateway_route() {
     let mut config = runtime_config();
     config.gateway_route = DockerGatewayRoute::HostGateway;
+    config.gateway_callback_bind_address = None;
     let driver = test_driver_with_config(config);
 
     let response = driver
@@ -194,6 +200,26 @@ async fn gateway_listener_requirements_are_empty_for_host_gateway_route() {
         .into_inner();
 
     assert!(response.requirements.is_empty());
+}
+
+#[tokio::test]
+async fn host_gateway_route_reports_ipv4_loopback_callback_listener() {
+    let mut config = runtime_config();
+    config.gateway_route = DockerGatewayRoute::HostGateway;
+    config.gateway_callback_bind_address = Some("127.0.0.1:17670".parse().unwrap());
+    let driver = test_driver_with_config(config);
+
+    let response = driver
+        .get_gateway_listener_requirements(Request::new(GetGatewayListenerRequirementsRequest {}))
+        .await
+        .unwrap()
+        .into_inner();
+
+    assert_eq!(response.requirements.len(), 1);
+    assert_eq!(
+        response.requirements[0].selector,
+        Some(Selector::ExactBindAddress("127.0.0.1:17670".to_string()))
+    );
 }
 
 #[test]
@@ -295,6 +321,31 @@ fn docker_gateway_route_uses_host_gateway_for_docker_desktop() {
             "host.openshell.internal:host-gateway".to_string()
         ]
     );
+}
+
+#[test]
+fn host_gateway_route_requests_ipv4_loopback_for_ipv6_primary() {
+    assert_eq!(
+        docker_gateway_callback_bind_address(
+            &DockerGatewayRoute::HostGateway,
+            "[::1]:17670".parse().unwrap(),
+        ),
+        Some("127.0.0.1:17670".parse().unwrap())
+    );
+}
+
+#[test]
+fn host_gateway_route_reuses_ipv4_primary_when_it_covers_loopback() {
+    for primary in ["127.0.0.1:17670", "0.0.0.0:17670"] {
+        assert_eq!(
+            docker_gateway_callback_bind_address(
+                &DockerGatewayRoute::HostGateway,
+                primary.parse().unwrap(),
+            ),
+            None,
+            "{primary} already covers the IPv4 loopback callback"
+        );
+    }
 }
 
 #[test]
@@ -568,6 +619,27 @@ fn build_environment_sets_docker_tls_paths() {
     assert!(env.contains(&"TEMPLATE_ENV=template".to_string()));
     assert!(env.contains(&"SPEC_ENV=spec".to_string()));
     assert!(env.contains(&"OPENSHELL_SANDBOX_COMMAND=sleep infinity".to_string()));
+    assert!(env.contains(&format!(
+        "{}={}",
+        openshell_core::sandbox_env::NETWORK_RUNTIME_CAPABILITIES,
+        openshell_core::sandbox_env::POLICY_DNS_TRANSPARENT_TCP_CAPABILITY
+    )));
+}
+
+#[test]
+fn build_environment_keeps_network_capabilities_driver_controlled() {
+    let mut sandbox = test_sandbox();
+    sandbox.spec.as_mut().unwrap().environment.insert(
+        openshell_core::sandbox_env::NETWORK_RUNTIME_CAPABILITIES.to_string(),
+        "spoofed".to_string(),
+    );
+    let env = build_environment(&sandbox, &runtime_config());
+    assert!(env.contains(&format!(
+        "{}={}",
+        openshell_core::sandbox_env::NETWORK_RUNTIME_CAPABILITIES,
+        openshell_core::sandbox_env::POLICY_DNS_TRANSPARENT_TCP_CAPABILITY
+    )));
+    assert!(!env.iter().any(|entry| entry.ends_with("=spoofed")));
 }
 
 #[test]
@@ -592,6 +664,26 @@ fn build_environment_protects_oci_identity_metadata() {
     assert!(env.contains(&format!("{}=", openshell_core::sandbox_env::SANDBOX_GID)));
     assert!(!env.iter().any(|entry| entry.ends_with("=spoofed")));
     assert!(!env.iter().any(|entry| entry.ends_with("=9999")));
+}
+
+#[test]
+fn build_environment_strips_gateway_tls_server_name() {
+    let mut sandbox = test_sandbox();
+    let spec = sandbox.spec.as_mut().unwrap();
+    spec.environment.insert(
+        openshell_core::sandbox_env::GATEWAY_TLS_SERVER_NAME.to_string(),
+        "evil.attacker.example.com".to_string(),
+    );
+
+    let env = build_environment(&sandbox, &runtime_config());
+
+    assert!(
+        !env.iter().any(|entry| entry.starts_with(&format!(
+            "{}=",
+            openshell_core::sandbox_env::GATEWAY_TLS_SERVER_NAME
+        ))),
+        "GATEWAY_TLS_SERVER_NAME must be stripped from the supervisor environment"
+    );
 }
 
 #[test]
@@ -2174,7 +2266,7 @@ fn validate_linux_elf_binary_rejects_non_elf_files() {
     fs::write(&path, b"not-elf").unwrap();
 
     let err = validate_linux_elf_binary(&path).unwrap_err();
-    assert!(err.to_string().contains("Linux ELF executable"));
+    assert!(err.contains("Linux ELF executable"));
 }
 
 #[test]
@@ -2380,8 +2472,11 @@ fn docker_supervisor_image_refreshes_mutable_tags_only() {
 #[test]
 fn supervisor_cache_path_namespaces_by_digest_under_openshell_data_dir() {
     let base = PathBuf::from("/var/cache/share");
-    let path =
-        supervisor_cache_path_with_base(&base, "sha256:abc123deadbeef0123456789cafe0123456789fe");
+    let path = supervisor_cache_path_with_base(
+        &base,
+        "docker-supervisor",
+        "sha256:abc123deadbeef0123456789cafe0123456789fe",
+    );
 
     assert_eq!(
         path,
@@ -2394,8 +2489,8 @@ fn supervisor_cache_path_namespaces_by_digest_under_openshell_data_dir() {
 #[test]
 fn supervisor_cache_path_isolates_different_digests() {
     let base = PathBuf::from("/data");
-    let left = supervisor_cache_path_with_base(&base, "sha256:aaaaaaaa");
-    let right = supervisor_cache_path_with_base(&base, "sha256:bbbbbbbb");
+    let left = supervisor_cache_path_with_base(&base, "docker-supervisor", "sha256:aaaaaaaa");
+    let right = supervisor_cache_path_with_base(&base, "docker-supervisor", "sha256:bbbbbbbb");
     assert_ne!(
         left.parent().unwrap(),
         right.parent().unwrap(),
@@ -2469,14 +2564,14 @@ fn extract_first_tar_entry_rejects_empty_archive() {
 }
 
 #[test]
-fn container_state_needs_resume_matches_startable_states() {
+fn container_state_needs_start_matches_startable_states() {
     for state in [
         ContainerSummaryStateEnum::EXITED,
         ContainerSummaryStateEnum::CREATED,
     ] {
         assert!(
-            container_state_needs_resume(state),
-            "{state:?} should be resumed with Docker start",
+            container_state_needs_start(state),
+            "{state:?} should be started with Docker start",
         );
     }
 
@@ -2489,8 +2584,54 @@ fn container_state_needs_resume_matches_startable_states() {
         ContainerSummaryStateEnum::EMPTY,
     ] {
         assert!(
-            !container_state_needs_resume(state),
-            "{state:?} should not be resumed with Docker start",
+            !container_state_needs_start(state),
+            "{state:?} should not be started with Docker start",
         );
     }
+}
+
+#[test]
+fn lifecycle_fence_rejects_polled_exit_from_before_restart() {
+    let fences = DockerLifecycleEventFences::default();
+    fences.begin_start("sandbox-1");
+    assert!(fences.start_in_progress("sandbox-1"));
+    fences.finish_start("sandbox-1");
+    assert!(!fences.start_in_progress("sandbox-1"));
+
+    fences.record_previous_exit("sandbox-1", Some("2026-08-12T16:39:13Z"));
+    assert_eq!(
+        fences.previous_exit("sandbox-1").as_deref(),
+        Some("2026-08-12T16:39:13Z")
+    );
+
+    let previous_exit = ContainerState {
+        status: Some(ContainerStateStatusEnum::EXITED),
+        finished_at: Some("2026-08-12T16:39:13Z".to_string()),
+        ..Default::default()
+    };
+    assert!(docker_polled_exit_is_stale(
+        "2026-08-12T16:39:13Z",
+        Some(&previous_exit),
+    ));
+
+    let running = ContainerState {
+        status: Some(ContainerStateStatusEnum::RUNNING),
+        ..previous_exit.clone()
+    };
+    assert!(docker_polled_exit_is_stale(
+        "2026-08-12T16:39:13Z",
+        Some(&running),
+    ));
+
+    let new_exit = ContainerState {
+        finished_at: Some("2026-08-12T16:40:00Z".to_string()),
+        ..previous_exit
+    };
+    assert!(!docker_polled_exit_is_stale(
+        "2026-08-12T16:39:13Z",
+        Some(&new_exit),
+    ));
+
+    fences.remove("sandbox-1");
+    assert!(fences.previous_exit("sandbox-1").is_none());
 }

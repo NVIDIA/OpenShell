@@ -180,6 +180,31 @@ openshell provider refresh rotate my-outlook --credential-key MS_GRAPH_ACCESS_TO
 
 Prefer `--secret-material-env KEY[=ENVVAR]` for secret refresh material. `--material KEY=VALUE` is for non-secret material; `--secret-material-key` marks supplied material keys as secret.
 
+The gateway stores secret refresh material through its active credential driver.
+With Vault selected, refresh tokens, client secrets, and private keys live in
+Vault alongside injectable provider credentials; refresh state contains only
+opaque handles. A credential-backend read or write failure makes refresh fail
+closed rather than falling back to inline storage. Before OpenShell 0.1.0, the
+gateway does not migrate legacy inline refresh material or move secrets between
+credential backends. Reconfigure affected grants after upgrading, and remove or
+reconfigure credentials while the original backend remains available before
+changing backends. Do not run mixed gateway versions against the same refresh
+records.
+
+Gateway-managed refresh credentials use an identity-stable workload handle.
+Routine automatic refresh and `provider refresh rotate` update the access token
+behind that handle, so long-running processes do not need to restart. Running
+processes must be restarted once when upgrading from revision-scoped
+placeholders. A later `provider refresh configure` call is an explicit
+reauthorization boundary: it revokes the previous handle, and processes holding
+that handle fail closed until restarted.
+
+While gateway-managed refresh is configured, `provider update --credential`
+cannot replace or delete the refresh-owned primary credential or any co-minted
+output. Use `provider refresh rotate`, reconfigure refresh, or delete refresh
+before returning those keys to manual management. Unrelated provider fields
+remain updateable.
+
 ---
 
 ## Workflow 3: Sandbox Lifecycle
@@ -298,6 +323,21 @@ openshell sandbox delete sandbox-1 sandbox-2 sandbox-3   # Multiple at once
 openshell sandbox delete --all
 ```
 
+### Stop and start sandboxes
+
+Use stop to halt compute while retaining the sandbox and its persistent
+workspace:
+
+```bash
+openshell sandbox stop [name]
+openshell sandbox start [name]
+```
+
+Both commands default to the last-used sandbox. Stop stops background
+forwards and waits for `Stopped`; start waits for `Ready`. Connect, exec,
+file transfer, forwarding, and exposed services are unavailable while
+stopped. Delete remains the operation that removes retained state.
+
 ---
 
 ## Workflow 4: Policy Iteration Loop
@@ -305,6 +345,11 @@ openshell sandbox delete --all
 This is the most important multi-step workflow. It enables a tight feedback cycle where sandbox policy is refined based on observed activity.
 
 **Key concept**: Policies have static fields (immutable after creation: `filesystem_policy`, `landlock`, `process`) and two dynamic fields: `network_policies` and `network_middlewares`. Both dynamic fields can be updated without recreating the sandbox when the selected compute driver supports live policy updates. MXC rejects live policy replacement and merge updates; delete and recreate an MXC sandbox instead.
+
+An endpoint with omitted `protocol` retains explicit-proxy behavior. Explicit
+`protocol: tcp` requests policy DNS and transparent TCP and currently requires
+the Docker or Podman runtime; unsupported runtimes reject the policy before starting the
+workload rather than activating only part of the network contract.
 
 ```
 Create sandbox with initial policy
@@ -367,9 +412,11 @@ Edit `current-policy.yaml` to allow the blocked actions. **For policy content au
 - TLS termination configuration
 - Enforcement modes (`audit` vs `enforce`)
 - Binary matching patterns
-- Ordered `network_middlewares`, host selection, and `fail_open` or `fail_closed` behavior
+- Ordered `network_middlewares`, host selection, HTTP and WebSocket bindings, and `fail_open` or `fail_closed` behavior
 
 `network_policies` and `network_middlewares` can be modified at runtime when the selected compute driver supports live policy updates. MXC rejects live policy replacement and merge updates; delete and recreate an MXC sandbox instead. If `filesystem_policy`, `landlock`, or `process` need changes, the sandbox must be recreated. Built-in middleware such as `openshell/regex` needs no gateway registration. An operator-run middleware must already be registered under `[[openshell.supervisor.middleware]]`; changing that static registration requires a gateway restart.
+
+Middleware can inspect parsed HTTP request bodies and complete client-to-upstream WebSocket text messages over both `ws://` and `wss://` when the implementation advertises the matching binding. The built-in `openshell/regex` advertises both bindings and applies its fixed patterns to UTF-8 text. A host-matched HTTP-only attachment can inspect the upgrade GET but does not join the WebSocket chain; look for `binding_not_selected` coverage. Binary messages pass under both `on_error` modes and active stages emit `unsupported_message_type` coverage; upstream-to-client messages remain uninspected. A broken fail-open WebSocket stage is disabled for the rest of that connection; inspect sandbox OCSF logs for `openshell.middleware.websocket_stage_disabled`.
 
 ### Step 5: Push the updated policy
 
@@ -462,7 +509,10 @@ For Docker and Podman gateways, custom images should declare a non-root OCI
 `USER`. Each explicit `process.run_as_user` or `process.run_as_group` policy
 field wins independently; omitted fields fall back to the image declaration.
 An image with no `USER` fails before readiness unless policy supplies both
-fields.
+fields. Explicit numeric fields may use any UID/GID from `1` through
+`4294967294`; `0` is root and `4294967295` is the invalid identity sentinel.
+Warn users that low IDs can inherit permissions from matching accounts, image
+files, mounted volumes, or devices.
 
 ### Forward ports
 
@@ -669,7 +719,7 @@ The CLI help is always authoritative. If the help output contradicts this skill,
 
 ```bash
 $ openshell sandbox --help
-# Shows: create, get, list, delete, exec, connect, upload, download, ssh-config, provider
+# Shows: create, get, list, stop, start, delete, exec, connect, upload, download, ssh-config, provider
 
 $ openshell sandbox upload --help
 # Shows: positional arguments (name, path, dest), usage examples
@@ -691,6 +741,8 @@ $ openshell sandbox upload --help
 | Create sandbox with GPUs | `openshell sandbox create --gpu 1` |
 | Create with custom policy | `openshell sandbox create --policy ./p.yaml` |
 | Connect to sandbox | `openshell sandbox connect <name>` |
+| Stop sandbox compute | `openshell sandbox stop [name]` |
+| Start sandbox compute | `openshell sandbox start [name]` |
 | Execute in sandbox | `openshell sandbox exec --name <name> -- <command>` |
 | Stream live logs | `openshell logs <name> --tail` |
 | Incremental policy update | `openshell policy update <name> --add-endpoint host:443:read-only:rest:enforce --binary /usr/bin/curl --wait` |

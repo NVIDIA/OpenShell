@@ -105,7 +105,9 @@ async fn run_get_sandbox_config(args: &[String]) -> Result<i32> {
 async fn run_refresh() -> Result<i32> {
     let mut client = open_client().await?;
     let resp = client
-        .refresh_sandbox_token(RefreshSandboxTokenRequest {})
+        .refresh_sandbox_token(RefreshSandboxTokenRequest {
+            extension_service_names: Vec::new(),
+        })
         .await;
     match resp {
         Ok(r) => {

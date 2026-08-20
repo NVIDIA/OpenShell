@@ -663,6 +663,10 @@ mod tests {
             }
         );
         assert_eq!(
+            DriverIdentity::from_values(None, Some("500".into()), Some("30".into())).unwrap(),
+            DriverIdentity::Resolved { uid: 500, gid: 30 }
+        );
+        assert_eq!(
             DriverIdentity::from_values(
                 Some(String::new()),
                 Some("1234".into()),

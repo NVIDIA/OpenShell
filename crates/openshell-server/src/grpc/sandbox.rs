@@ -23,8 +23,9 @@ use openshell_core::proto::{
     ExecSandboxInput, ExecSandboxRequest, ExecSandboxStderr, ExecSandboxStdout, GetSandboxRequest,
     ListSandboxProvidersRequest, ListSandboxProvidersResponse, ListSandboxesRequest,
     ListSandboxesResponse, Provider, RevokeSshSessionRequest, RevokeSshSessionResponse,
-    SandboxResponse, SandboxStreamEvent, SshRelayTarget, TcpForwardFrame, TcpForwardInit,
-    TcpRelayTarget, WatchSandboxRequest, relay_open, tcp_forward_init,
+    SandboxResponse, SandboxStreamEvent, SshRelayTarget, StartSandboxRequest, StopSandboxRequest,
+    TcpForwardFrame, TcpForwardInit, TcpRelayTarget, WatchSandboxRequest, relay_open,
+    tcp_forward_init,
 };
 use openshell_core::proto::{Sandbox, SandboxPhase, SandboxTemplate, SshSession};
 use openshell_core::telemetry::{
@@ -52,9 +53,8 @@ use super::provider::{
     get_provider_record, is_valid_env_key, validate_provider_environment_keys_unique,
 };
 use super::validation::{
-    level_matches, normalize_process_identity_for_driver, source_matches,
-    validate_exec_request_fields, validate_no_reserved_provider_policy_keys,
-    validate_policy_safety, validate_sandbox_spec,
+    level_matches, source_matches, validate_exec_request_fields,
+    validate_no_reserved_provider_policy_keys, validate_policy_safety, validate_sandbox_spec,
 };
 use super::{MAX_PAGE_SIZE, MAX_PROVIDERS, MAX_ROUTABLE_NAME_LEN, clamp_limit};
 use crate::persistence::current_time_ms;
@@ -267,14 +267,19 @@ async fn handle_create_sandbox_inner(
         template.image = state.compute.default_image().to_string();
     }
 
-    // Docker and Podman preserve omitted identity fields for OCI USER
-    // fallback. Other drivers retain the legacy persisted sandbox defaults.
     if let Some(ref mut policy) = spec.policy {
-        normalize_process_identity_for_driver(policy, state.compute.driver_kind());
+        super::policy::clear_provider_credentialed_markers(policy);
         validate_no_reserved_provider_policy_keys(policy)?;
         validate_policy_safety(policy)?;
         crate::middleware::validate_policy(state.middleware_registry.as_ref(), policy).await?;
     }
+    super::policy::validate_candidate_sandbox_credential_policy(
+        state,
+        &workspace,
+        &spec.providers,
+        spec.policy.as_ref(),
+    )
+    .await?;
 
     let id = uuid::Uuid::new_v4().to_string();
     let name = if request.name.is_empty() {
@@ -572,6 +577,13 @@ pub(super) async fn handle_attach_sandbox_provider(
         &candidate_spec.providers,
     )
     .await?;
+    super::policy::validate_candidate_sandbox_credential_policy(
+        state,
+        &workspace,
+        &candidate_spec.providers,
+        candidate_spec.policy.as_ref(),
+    )
+    .await?;
 
     let provider_name = request.provider_name.clone();
     let attached = Arc::new(AtomicBool::new(false));
@@ -760,6 +772,94 @@ async fn handle_delete_sandbox_inner(
     info!(sandbox_name = %name, "DeleteSandbox request completed successfully");
     Ok(Response::new(DeleteSandboxResponse {
         deleted: result.deleted,
+    }))
+}
+
+pub(super) async fn handle_stop_sandbox(
+    state: &Arc<ServerState>,
+    request: Request<StopSandboxRequest>,
+) -> Result<Response<SandboxResponse>, Status> {
+    let result = handle_stop_sandbox_inner(state, request).await;
+    openshell_core::telemetry::emit_lifecycle(
+        LifecycleResource::Sandbox,
+        LifecycleOperation::Stop,
+        if result.is_ok() {
+            TelemetryOutcome::Success
+        } else {
+            TelemetryOutcome::Failure
+        },
+    );
+    result
+}
+
+async fn handle_stop_sandbox_inner(
+    state: &Arc<ServerState>,
+    request: Request<StopSandboxRequest>,
+) -> Result<Response<SandboxResponse>, Status> {
+    let principal = super::extract_principal(&request)?;
+    let req = request.into_inner();
+    if req.name.is_empty() {
+        return Err(Status::invalid_argument("name is required"));
+    }
+    let authz = authorize_workspace(
+        &state.store,
+        &state.admin_role,
+        &principal,
+        &req.workspace,
+        MinWorkspaceRole::User,
+    )
+    .await?;
+    let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &authz.workspace)
+        .await?
+        .name;
+    let sandbox = state.compute.stop_sandbox(&workspace, &req.name).await?;
+    info!(sandbox_name = %req.name, "StopSandbox request completed successfully");
+    Ok(Response::new(SandboxResponse {
+        sandbox: Some(sandbox),
+    }))
+}
+
+pub(super) async fn handle_start_sandbox(
+    state: &Arc<ServerState>,
+    request: Request<StartSandboxRequest>,
+) -> Result<Response<SandboxResponse>, Status> {
+    let result = handle_start_sandbox_inner(state, request).await;
+    openshell_core::telemetry::emit_lifecycle(
+        LifecycleResource::Sandbox,
+        LifecycleOperation::Start,
+        if result.is_ok() {
+            TelemetryOutcome::Success
+        } else {
+            TelemetryOutcome::Failure
+        },
+    );
+    result
+}
+
+async fn handle_start_sandbox_inner(
+    state: &Arc<ServerState>,
+    request: Request<StartSandboxRequest>,
+) -> Result<Response<SandboxResponse>, Status> {
+    let principal = super::extract_principal(&request)?;
+    let req = request.into_inner();
+    if req.name.is_empty() {
+        return Err(Status::invalid_argument("name is required"));
+    }
+    let authz = authorize_workspace(
+        &state.store,
+        &state.admin_role,
+        &principal,
+        &req.workspace,
+        MinWorkspaceRole::User,
+    )
+    .await?;
+    let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &authz.workspace)
+        .await?
+        .name;
+    let sandbox = state.compute.start_sandbox(&workspace, &req.name).await?;
+    info!(sandbox_name = %req.name, "StartSandbox request completed successfully");
+    Ok(Response::new(SandboxResponse {
+        sandbox: Some(sandbox),
     }))
 }
 
@@ -2725,7 +2825,7 @@ mod tests {
             .await
         });
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            while state.compute.delete_gate_entry_count() == 0 {
+            while state.compute.lifecycle_gate_entry_count() == 0 {
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
         })
@@ -3339,7 +3439,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_and_get_restore_legacy_identity_defaults_for_non_local_driver() {
+    async fn create_and_get_preserve_partial_process_identity_for_kubernetes() {
         let state =
             test_server_state_with_driver(openshell_core::ComputeDriverKind::Kubernetes.as_str())
                 .await;
@@ -3366,7 +3466,7 @@ mod tests {
             }),
         )
         .await
-        .expect("Kubernetes identity defaults should be accepted")
+        .expect("partial Kubernetes process identity should be accepted")
         .into_inner();
 
         let process = response
@@ -3378,7 +3478,7 @@ mod tests {
             .unwrap()
             .process
             .unwrap();
-        assert_eq!(process.run_as_user, "sandbox");
+        assert!(process.run_as_user.is_empty());
         assert_eq!(process.run_as_group, "1234");
     }
 
@@ -4426,6 +4526,31 @@ mod tests {
             Code::PermissionDenied,
             "handle_delete_sandbox should reject non-members with PermissionDenied"
         );
+
+        for result in [
+            handle_stop_sandbox(
+                &state,
+                non_member_request(StopSandboxRequest {
+                    workspace: "no-such-ws".into(),
+                    name: "any".into(),
+                }),
+            )
+            .await,
+            handle_start_sandbox(
+                &state,
+                non_member_request(StartSandboxRequest {
+                    workspace: "no-such-ws".into(),
+                    name: "any".into(),
+                }),
+            )
+            .await,
+        ] {
+            assert_eq!(
+                result.unwrap_err().code(),
+                Code::PermissionDenied,
+                "lifecycle handlers should reject non-members"
+            );
+        }
     }
 
     /// ID-based data-plane handlers must return `NOT_FOUND` — never

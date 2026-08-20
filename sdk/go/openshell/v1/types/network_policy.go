@@ -34,18 +34,23 @@ type PolicyNetworkEndpoint struct {
 	Path                         string
 	WebsocketCredentialRewrite   bool
 	RequestBodyCredentialRewrite bool
-	AdvisorProposed              bool
-	CredentialSigning            string
-	SigningService               string
-	SigningRegion                string
-	JsonRpcMaxBodyBytes          uint32
-	Mcp                          *McpOptions
-	CredentialBinding            *NetworkCredentialBinding
+	// AllowUninspectedCredentials explicitly permits credential-bearing traffic
+	// on paths OpenShell cannot inspect or rewrite.
+	AllowUninspectedCredentials bool
+	// ProviderCredentialed is gateway-derived provenance indicating that the
+	// endpoint belongs to an attached credentialed provider.
+	ProviderCredentialed bool
+	AdvisorProposed      bool
+	CredentialSigning    string
+	SigningService       string
+	SigningRegion        string
+	JSONRPCMaxBodyBytes  uint32
+	Mcp                  *McpOptions
+	CredentialBinding    *NetworkCredentialBinding
 }
 
 // NetworkCredentialBinding binds an endpoint to static credentials from an attached provider.
 type NetworkCredentialBinding struct {
-	// Provider is the attached provider whose static credentials may be resolved for the endpoint.
 	Provider string
 }
 
@@ -62,7 +67,7 @@ type L7Rule struct {
 	Allow *L7Allow
 }
 
-// L7Allow specifies layer-7 allow criteria for HTTP/GraphQL/MCP traffic.
+// L7Allow specifies layer-7 allow criteria for HTTP/GraphQL traffic.
 type L7Allow struct {
 	Method        string
 	Path          string
@@ -74,7 +79,7 @@ type L7Allow struct {
 	Params        map[string]L7QueryMatcher
 }
 
-// L7DenyRule specifies layer-7 deny criteria for HTTP/GraphQL/MCP traffic.
+// L7DenyRule specifies layer-7 deny criteria for HTTP/GraphQL traffic.
 type L7DenyRule struct {
 	Method        string
 	Path          string
@@ -86,16 +91,16 @@ type L7DenyRule struct {
 	Params        map[string]L7QueryMatcher
 }
 
-// McpOptions holds MCP-specific policy and inspection options.
-type McpOptions struct {
-	StrictToolNames         *bool
-	AllowAllKnownMcpMethods *bool
-}
-
 // L7QueryMatcher matches query parameters by glob pattern or exact values.
 type L7QueryMatcher struct {
 	Glob string
 	Any  []string
+}
+
+// McpOptions configures MCP-specific policy controls on a network endpoint.
+type McpOptions struct {
+	StrictToolNames         *bool
+	AllowAllKnownMcpMethods *bool
 }
 
 // GraphqlOperation describes a GraphQL operation for persisted-query validation.

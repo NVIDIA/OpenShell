@@ -12,7 +12,29 @@ import (
 // HealthResult holds the result of a health check.
 type HealthResult = types.HealthResult
 
-// HealthInterface defines health check operations.
+// GatewayInfo holds operational metadata about the gateway.
+type GatewayInfo = types.GatewayInfo
+
+// ComputeDriverInfo describes a compute backend available on the gateway.
+type ComputeDriverInfo = types.ComputeDriverInfo
+
+// ServiceStatus describes the health state of the gateway.
+type ServiceStatus = types.ServiceStatus
+
+// ServiceStatus constants.
+const (
+	ServiceStatusHealthy   = types.ServiceStatusHealthy
+	ServiceStatusDegraded  = types.ServiceStatusDegraded
+	ServiceStatusUnhealthy = types.ServiceStatusUnhealthy
+	ServiceStatusUnknown   = types.ServiceStatusUnknown
+)
+
+// CurrentUser holds the authenticated caller's identity.
+type CurrentUser = types.CurrentUser
+
+// HealthInterface defines health check and gateway info operations.
 type HealthInterface interface {
 	Check(ctx context.Context) (*HealthResult, error)
+	GetGatewayInfo(ctx context.Context) (*GatewayInfo, error)
+	GetCurrentUser(ctx context.Context) (*CurrentUser, error)
 }
