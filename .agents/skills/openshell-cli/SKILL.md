@@ -274,6 +274,7 @@ openshell sandbox template create gpu-kata \
   --label team=runtime \
   --env FEATURE_FLAG=on
 openshell sandbox template list
+openshell sandbox template list --label-selector team=runtime
 openshell sandbox template list --all-workspaces --output json
 openshell sandbox template get gpu-kata
 openshell sandbox template delete gpu-kata

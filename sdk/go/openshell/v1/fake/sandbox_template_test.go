@@ -97,6 +97,32 @@ func TestSandboxTemplate_ListAllWorkspaces(t *testing.T) {
 	assert.Len(t, listed, 2)
 }
 
+func TestSandboxTemplate_ListFiltersByLabelSelector(t *testing.T) {
+	tc := newTestSandboxTemplateClient()
+	ctx := context.Background()
+
+	_, _ = tc.Create(ctx, "default", &types.SandboxWorkloadTemplate{
+		Name:   "runtime-template",
+		Labels: map[string]string{"team": "runtime"},
+		Spec: types.SandboxWorkloadTemplateSpec{
+			Workload: &types.SandboxWorkloadConfig{Image: "python:3.12"},
+		},
+	})
+	_, _ = tc.Create(ctx, "default", &types.SandboxWorkloadTemplate{
+		Name:   "batch-template",
+		Labels: map[string]string{"team": "batch"},
+		Spec: types.SandboxWorkloadTemplateSpec{
+			Workload: &types.SandboxWorkloadConfig{Image: "python:3.12"},
+		},
+	})
+
+	listed, err := tc.List(ctx, "default", types.ListOptions{LabelSelector: "team=runtime"})
+
+	require.NoError(t, err)
+	require.Len(t, listed, 1)
+	assert.Equal(t, "runtime-template", listed[0].Name)
+}
+
 func TestSandboxTemplate_CreateSandboxFromTemplateRequiresExistingTemplate(t *testing.T) {
 	client := NewClient()
 	ctx := context.Background()

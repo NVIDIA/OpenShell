@@ -155,6 +155,8 @@ export interface SandboxTemplateWorkspaceOptions {
 export interface SandboxTemplateListOptions extends SandboxTemplateWorkspaceOptions {
   limit?: number;
   offset?: number;
+  /** Optional label selector in key=value comma-separated form. */
+  labelSelector?: string;
   /** List templates across all workspaces. Requires platform admin permission. */
   allWorkspaces?: boolean;
 }
@@ -631,6 +633,7 @@ export class SandboxTemplateClient {
         offset: options?.offset ?? 0,
         workspace: allWorkspaces ? '' : (options?.workspace ?? ''),
         allWorkspaces,
+        labelSelector: options?.labelSelector ?? '',
       });
       return resp.templates;
     } catch (e) {

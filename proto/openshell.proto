@@ -1086,6 +1086,8 @@ message ListSandboxTemplatesRequest {
   string workspace = 3;
   // List across all workspaces. Mutually exclusive with workspace.
   bool all_workspaces = 4;
+  // Optional label selector in key=value comma-separated form.
+  string label_selector = 5;
 }
 
 message DeleteSandboxTemplateRequest {

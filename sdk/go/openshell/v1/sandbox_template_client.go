@@ -63,6 +63,7 @@ func (s *sandboxTemplateClient) List(ctx context.Context, workspace string, opts
 		}
 		req.Limit = uint32(opts[0].Limit)
 		req.Offset = uint32(opts[0].Offset)
+		req.LabelSelector = opts[0].LabelSelector
 		req.AllWorkspaces = opts[0].AllWorkspaces
 		if req.AllWorkspaces {
 			req.Workspace = ""

@@ -2339,6 +2339,8 @@ type ListSandboxTemplatesRequest struct {
 	Workspace string `protobuf:"bytes,3,opt,name=workspace,proto3" json:"workspace,omitempty"`
 	// List across all workspaces. Mutually exclusive with workspace.
 	AllWorkspaces bool `protobuf:"varint,4,opt,name=all_workspaces,json=allWorkspaces,proto3" json:"all_workspaces,omitempty"`
+	// Optional label selector in key=value comma-separated form.
+	LabelSelector string `protobuf:"bytes,5,opt,name=label_selector,json=labelSelector,proto3" json:"label_selector,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -2399,6 +2401,13 @@ func (x *ListSandboxTemplatesRequest) GetAllWorkspaces() bool {
 		return x.AllWorkspaces
 	}
 	return false
+}
+
+func (x *ListSandboxTemplatesRequest) GetLabelSelector() string {
+	if x != nil {
+		return x.LabelSelector
+	}
+	return ""
 }
 
 type DeleteSandboxTemplateRequest struct {
@@ -14260,12 +14269,13 @@ const file_openshell_proto_rawDesc = "" +
 	"\tworkspace\x18\x02 \x01(\tR\tworkspace\"M\n" +
 	"\x19GetSandboxTemplateRequest\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x1c\n" +
-	"\tworkspace\x18\x02 \x01(\tR\tworkspace\"\x90\x01\n" +
+	"\tworkspace\x18\x02 \x01(\tR\tworkspace\"\xb7\x01\n" +
 	"\x1bListSandboxTemplatesRequest\x12\x14\n" +
 	"\x05limit\x18\x01 \x01(\rR\x05limit\x12\x16\n" +
 	"\x06offset\x18\x02 \x01(\rR\x06offset\x12\x1c\n" +
 	"\tworkspace\x18\x03 \x01(\tR\tworkspace\x12%\n" +
-	"\x0eall_workspaces\x18\x04 \x01(\bR\rallWorkspaces\"P\n" +
+	"\x0eall_workspaces\x18\x04 \x01(\bR\rallWorkspaces\x12%\n" +
+	"\x0elabel_selector\x18\x05 \x01(\tR\rlabelSelector\"P\n" +
 	"\x1cDeleteSandboxTemplateRequest\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x1c\n" +
 	"\tworkspace\x18\x02 \x01(\tR\tworkspace\"\\\n" +
