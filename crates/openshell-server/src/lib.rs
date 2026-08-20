@@ -668,14 +668,16 @@ pub(crate) async fn run_server(
     // and without the issuer there's nothing to exchange the SA token for.
     #[cfg(not(target_os = "windows"))]
     if state.sandbox_jwt_issuer.is_some() && std::env::var_os("KUBERNETES_SERVICE_HOST").is_some() {
-        // Pod lookups and TokenReview identity checks must match the sandbox
-        // namespace and service account used by the Kubernetes driver.
+        // Pod lookups use the Kubernetes driver's sandbox namespace; the
+        // TokenReview identity check accepts the driver's sandbox service
+        // account plus any additional names configured for bootstrap.
         let kubernetes_config =
             compute::driver_config::builtin::kubernetes_config_for_k8s_sa_bootstrap(
                 config_file.as_ref(),
             )?;
         let sandbox_namespace = kubernetes_config.namespace.clone();
-        let sandbox_service_account = kubernetes_config.service_account_name.clone();
+        let service_account_validator =
+            auth::k8s_sa::ServiceAccountValidator::from_kubernetes_config(&kubernetes_config);
         let namespace_validator = match kubernetes_config.workspace_mode {
             openshell_driver_kubernetes::WorkspaceMode::Shared => {
                 auth::k8s_sa::NamespaceValidator::Exact(kubernetes_config.namespace)
@@ -694,19 +696,19 @@ pub(crate) async fn run_server(
         };
         match kube::Client::try_default().await {
             Ok(client) => {
+                info!(
+                    namespace = %sandbox_namespace,
+                    accepted_service_accounts = ?service_account_validator.accepted(),
+                    "K8s ServiceAccount bootstrap authenticator enabled"
+                );
                 let resolver = Arc::new(auth::k8s_sa::LiveK8sResolver::new(
                     client,
                     namespace_validator,
                     "openshell-gateway".to_string(),
-                    sandbox_service_account.clone(),
+                    service_account_validator,
                 ));
                 let authenticator = auth::k8s_sa::K8sServiceAccountAuthenticator::new(resolver);
                 state.k8s_sa_authenticator = Some(Arc::new(authenticator));
-                info!(
-                    namespace = %sandbox_namespace,
-                    service_account = %sandbox_service_account,
-                    "K8s ServiceAccount bootstrap authenticator enabled"
-                );
             }
             Err(e) => warn!(
                 error = %e,

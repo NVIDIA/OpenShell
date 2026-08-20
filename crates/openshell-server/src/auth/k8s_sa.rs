@@ -26,7 +26,8 @@ use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use kube::Error as KubeError;
 use kube::api::{Api, ApiResource, PostParams};
 use kube::core::{DynamicObject, gvk::GroupVersionKind};
-use openshell_driver_kubernetes::OperatorNamespaceAllowlist;
+use openshell_driver_kubernetes::{KubernetesComputeConfig, OperatorNamespaceAllowlist};
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use tonic::Status;
 use tracing::{debug, info, warn};
@@ -159,9 +160,72 @@ impl NamespaceValidator {
     }
 }
 
+/// Validates the `ServiceAccount` name extracted from an SA token username
+/// against the set an operator accepts for sandbox bootstrap.
+///
+/// The Kubernetes driver writes a single `serviceAccountName` onto sandbox pods
+/// (`service_account_name`), and that name is a member whenever it is
+/// non-empty. Deployments where something other than the driver assigns the
+/// pod's `ServiceAccount`, such as a mutating admission policy or an external
+/// controller that owns the sandbox pods, add those identities through
+/// `additional_bootstrap_service_account_names`. The set stays
+/// operator-configured and closed; this widens which identities may bootstrap,
+/// not how they are verified.
+///
+/// Matching is an exact comparison of the bare name and is independent of the
+/// namespace, which [`NamespaceValidator`] checks separately. Under managed and
+/// operator workspace modes a name is therefore accepted in every namespace
+/// that validator accepts.
+#[derive(Debug)]
+pub struct ServiceAccountValidator {
+    accepted: BTreeSet<String>,
+}
+
+impl ServiceAccountValidator {
+    /// `pod_default` is the driver's `service_account_name`; `additional` are
+    /// the names accepted for bootstrap only.
+    ///
+    /// Names are trimmed, because a `ServiceAccount` name never carries
+    /// surrounding whitespace and a padded config entry would otherwise sit in
+    /// the set as a member nothing can ever match. Entries that are empty
+    /// after trimming are dropped, so a blank config line cannot widen the
+    /// set. An empty `pod_default` is dropped on the same rule: the driver
+    /// omits `serviceAccountName` from the pod in that case, and the resulting
+    /// set accepts only what `additional` supplies.
+    pub fn new(pod_default: &str, additional: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        let accepted = std::iter::once(pod_default.to_string())
+            .chain(additional.into_iter().map(Into::into))
+            .filter_map(|name| {
+                let trimmed = name.trim();
+                (!trimmed.is_empty()).then(|| trimmed.to_string())
+            })
+            .collect();
+        Self { accepted }
+    }
+
+    /// Build the accepted set from the Kubernetes driver configuration the
+    /// gateway reads for bootstrap.
+    pub fn from_kubernetes_config(config: &KubernetesComputeConfig) -> Self {
+        Self::new(
+            &config.service_account_name,
+            &config.additional_bootstrap_service_account_names,
+        )
+    }
+
+    pub fn accepts(&self, service_account: &str) -> bool {
+        self.accepted.contains(service_account)
+    }
+
+    /// The accepted names, for startup and rejection diagnostics.
+    pub fn accepted(&self) -> &BTreeSet<String> {
+        &self.accepted
+    }
+}
+
 #[derive(Debug)]
 struct TokenReviewIdentity {
     namespace: String,
+    service_account: String,
     pod_name: String,
     pod_uid: String,
 }
@@ -180,7 +244,7 @@ pub struct LiveK8sResolver {
     token_reviews_api: Api<TokenReview>,
     expected_audience: String,
     namespace_validator: NamespaceValidator,
-    expected_service_account: String,
+    service_account_validator: ServiceAccountValidator,
 }
 
 impl LiveK8sResolver {
@@ -188,7 +252,7 @@ impl LiveK8sResolver {
         client: kube::Client,
         namespace_validator: NamespaceValidator,
         expected_audience: String,
-        expected_service_account: String,
+        service_account_validator: ServiceAccountValidator,
     ) -> Self {
         let token_reviews_api: Api<TokenReview> = Api::all(client.clone());
         Self {
@@ -196,7 +260,7 @@ impl LiveK8sResolver {
             token_reviews_api,
             expected_audience,
             namespace_validator,
-            expected_service_account,
+            service_account_validator,
         }
     }
 
@@ -262,7 +326,7 @@ impl K8sIdentityResolver for LiveK8sResolver {
             &status,
             &self.expected_audience,
             &self.namespace_validator,
-            &self.expected_service_account,
+            &self.service_account_validator,
         )?
         else {
             return Ok(None);
@@ -272,7 +336,7 @@ impl K8sIdentityResolver for LiveK8sResolver {
             pod_name = %identity.pod_name,
             pod_uid = %identity.pod_uid,
             namespace = %identity.namespace,
-            service_account = %self.expected_service_account,
+            service_account = %identity.service_account,
             "validated K8s SA token via TokenReview"
         );
 
@@ -346,7 +410,7 @@ fn token_review_identity(
     status: &TokenReviewStatus,
     expected_audience: &str,
     namespace_validator: &NamespaceValidator,
-    expected_service_account: &str,
+    service_account_validator: &ServiceAccountValidator,
 ) -> Result<Option<TokenReviewIdentity>, Status> {
     if status.authenticated != Some(true) {
         debug!(
@@ -383,15 +447,15 @@ fn token_review_identity(
         Status::permission_denied("SA token username format not recognized")
     })?;
 
-    if sa_name != expected_service_account {
+    if !service_account_validator.accepts(&sa_name) {
         warn!(
             username = %username,
             service_account = %sa_name,
-            expected = %expected_service_account,
-            "K8s TokenReview principal is not the configured sandbox service account"
+            accepted_service_accounts = ?service_account_validator.accepted(),
+            "K8s TokenReview principal is not an accepted sandbox service account"
         );
         return Err(Status::permission_denied(
-            "SA token is not from the configured sandbox service account",
+            "SA token is not from an accepted sandbox service account",
         ));
     }
 
@@ -410,6 +474,7 @@ fn token_review_identity(
     let pod_uid = user_extra_one(user, POD_UID_EXTRA)?;
     Ok(Some(TokenReviewIdentity {
         namespace,
+        service_account: sa_name,
         pod_name,
         pod_uid,
     }))
@@ -717,6 +782,10 @@ mod tests {
         NamespaceValidator::Exact(ns.to_string())
     }
 
+    fn sa_validator(pod_default: &str) -> ServiceAccountValidator {
+        ServiceAccountValidator::new(pod_default, std::iter::empty::<&str>())
+    }
+
     #[test]
     fn token_review_identity_extracts_pod_binding() {
         let status = token_review_status(
@@ -730,9 +799,14 @@ mod tests {
         );
 
         let validator = exact_validator("openshell");
-        let identity = token_review_identity(&status, "openshell-gateway", &validator, "default")
-            .unwrap()
-            .expect("authenticated token should resolve");
+        let identity = token_review_identity(
+            &status,
+            "openshell-gateway",
+            &validator,
+            &sa_validator("default"),
+        )
+        .unwrap()
+        .expect("authenticated token should resolve");
 
         assert_eq!(identity.namespace, "openshell");
         assert_eq!(identity.pod_name, "openshell-sandbox-a");
@@ -749,9 +823,14 @@ mod tests {
         let validator = exact_validator("openshell");
 
         assert!(
-            token_review_identity(&status, "openshell-gateway", &validator, "default")
-                .unwrap()
-                .is_none()
+            token_review_identity(
+                &status,
+                "openshell-gateway",
+                &validator,
+                &sa_validator("default")
+            )
+            .unwrap()
+            .is_none()
         );
     }
 
@@ -768,8 +847,13 @@ mod tests {
         );
         let validator = exact_validator("openshell");
 
-        let err = token_review_identity(&status, "openshell-gateway", &validator, "default")
-            .expect_err("wrong audience must fail closed");
+        let err = token_review_identity(
+            &status,
+            "openshell-gateway",
+            &validator,
+            &sa_validator("default"),
+        )
+        .expect_err("wrong audience must fail closed");
         assert_eq!(err.code(), tonic::Code::Unauthenticated);
     }
 
@@ -786,8 +870,13 @@ mod tests {
         );
         let validator = exact_validator("openshell");
 
-        let err = token_review_identity(&status, "openshell-gateway", &validator, "default")
-            .expect_err("other namespace must be rejected");
+        let err = token_review_identity(
+            &status,
+            "openshell-gateway",
+            &validator,
+            &sa_validator("default"),
+        )
+        .expect_err("other namespace must be rejected");
         assert_eq!(err.code(), tonic::Code::PermissionDenied);
     }
 
@@ -804,8 +893,13 @@ mod tests {
         );
         let validator = exact_validator("openshell");
 
-        let err = token_review_identity(&status, "openshell-gateway", &validator, "default")
-            .expect_err("other service account must be rejected");
+        let err = token_review_identity(
+            &status,
+            "openshell-gateway",
+            &validator,
+            &sa_validator("default"),
+        )
+        .expect_err("other service account must be rejected");
         assert_eq!(err.code(), tonic::Code::PermissionDenied);
     }
 
@@ -819,9 +913,140 @@ mod tests {
         );
         let validator = exact_validator("openshell");
 
-        let err = token_review_identity(&status, "openshell-gateway", &validator, "default")
-            .expect_err("non pod-bound tokens must be rejected");
+        let err = token_review_identity(
+            &status,
+            "openshell-gateway",
+            &validator,
+            &sa_validator("default"),
+        )
+        .expect_err("non pod-bound tokens must be rejected");
         assert_eq!(err.code(), tonic::Code::PermissionDenied);
+    }
+
+    /// A non-empty pod default is a member, so a gateway with no additional
+    /// names behaves exactly as it did before the accepted set existed.
+    #[test]
+    fn service_account_validator_accepts_only_pod_default_by_default() {
+        let v = sa_validator("openshell-sandbox");
+
+        assert!(v.accepts("openshell-sandbox"));
+        assert!(!v.accepts("openshell-sandbox-2"));
+        assert_eq!(v.accepted().len(), 1);
+    }
+
+    #[test]
+    fn service_account_validator_accepts_every_configured_name() {
+        let v = ServiceAccountValidator::new(
+            "openshell-sandbox",
+            ["openshell-sandbox-2", "openshell-sandbox-3"],
+        );
+
+        assert!(v.accepts("openshell-sandbox"));
+        assert!(v.accepts("openshell-sandbox-2"));
+        assert!(v.accepts("openshell-sandbox-3"));
+        assert!(!v.accepts("openshell-sandbox-other"));
+        assert!(!v.accepts(""));
+        assert_eq!(v.accepted().len(), 3);
+    }
+
+    /// A blank or padded config entry must not enter the accepted set as a
+    /// member nothing can match. `parse_sa_username` already rejects an empty
+    /// name, so this is hygiene for the startup and rejection logs and it
+    /// keeps an empty pod default from looking like a configured identity.
+    #[test]
+    fn service_account_validator_drops_blank_and_trims_padded_names() {
+        let v = ServiceAccountValidator::new("", ["", "  ", " openshell-sandbox-2 "]);
+
+        assert!(!v.accepts(""));
+        assert!(
+            v.accepts("openshell-sandbox-2"),
+            "padded entry should be trimmed"
+        );
+        assert_eq!(v.accepted().len(), 1);
+    }
+
+    /// The pod default and an identical additional entry collapse, so neither
+    /// operator-facing log record prints a duplicate.
+    #[test]
+    fn service_account_validator_collapses_duplicates() {
+        let v = ServiceAccountValidator::new(
+            "openshell-sandbox",
+            ["openshell-sandbox", "openshell-sandbox-2"],
+        );
+
+        assert_eq!(v.accepted().len(), 2);
+    }
+
+    #[test]
+    fn token_review_identity_accepts_additional_service_account() {
+        let status = token_review_status(
+            true,
+            vec!["openshell-gateway"],
+            "system:serviceaccount:openshell:openshell-sandbox-2",
+            vec![
+                (POD_NAME_EXTRA, "openshell-sandbox-a"),
+                (POD_UID_EXTRA, "uid-a"),
+            ],
+        );
+        let validator = exact_validator("openshell");
+        let service_accounts =
+            ServiceAccountValidator::new("openshell-sandbox", ["openshell-sandbox-2"]);
+
+        let identity =
+            token_review_identity(&status, "openshell-gateway", &validator, &service_accounts)
+                .unwrap()
+                .expect("an enrolled service account should authenticate");
+
+        assert_eq!(identity.service_account, "openshell-sandbox-2");
+        assert_eq!(identity.pod_name, "openshell-sandbox-a");
+    }
+
+    #[test]
+    fn token_review_identity_rejects_service_account_outside_accepted_set() {
+        let status = token_review_status(
+            true,
+            vec!["openshell-gateway"],
+            "system:serviceaccount:openshell:openshell-sandbox-other",
+            vec![
+                (POD_NAME_EXTRA, "openshell-sandbox-a"),
+                (POD_UID_EXTRA, "uid-a"),
+            ],
+        );
+        let validator = exact_validator("openshell");
+        let service_accounts =
+            ServiceAccountValidator::new("openshell-sandbox", ["openshell-sandbox-2"]);
+
+        let err =
+            token_review_identity(&status, "openshell-gateway", &validator, &service_accounts)
+                .expect_err("a non-member service account must be rejected");
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+    }
+
+    /// The presented account is carried out of validation, so the success log
+    /// names the identity that actually bootstrapped rather than the pod
+    /// default. The two differ here, which is what makes the assertion mean
+    /// something.
+    #[test]
+    fn token_review_identity_reports_presented_service_account() {
+        let status = token_review_status(
+            true,
+            vec!["openshell-gateway"],
+            "system:serviceaccount:openshell:openshell-sandbox-2",
+            vec![
+                (POD_NAME_EXTRA, "openshell-sandbox-a"),
+                (POD_UID_EXTRA, "uid-a"),
+            ],
+        );
+        let validator = exact_validator("openshell");
+        let service_accounts =
+            ServiceAccountValidator::new("openshell-sandbox", ["openshell-sandbox-2"]);
+
+        let identity =
+            token_review_identity(&status, "openshell-gateway", &validator, &service_accounts)
+                .unwrap()
+                .expect("authenticated token should resolve");
+
+        assert_eq!(identity.service_account, "openshell-sandbox-2");
     }
 
     #[test]
@@ -842,7 +1067,7 @@ mod tests {
 
     #[test]
     fn namespace_validator_allowlist_accepts_known_namespaces() {
-        let al = OperatorNamespaceAllowlist::from_set(std::collections::BTreeSet::from([
+        let al = OperatorNamespaceAllowlist::from_set(BTreeSet::from([
             "ns-a".to_string(),
             "ns-b".to_string(),
         ]));
@@ -865,9 +1090,14 @@ mod tests {
         );
         let validator = NamespaceValidator::Prefix("openshell-gw1-".to_string());
 
-        let identity = token_review_identity(&status, "openshell-gateway", &validator, "default")
-            .unwrap()
-            .expect("managed namespace token should resolve");
+        let identity = token_review_identity(
+            &status,
+            "openshell-gateway",
+            &validator,
+            &sa_validator("default"),
+        )
+        .unwrap()
+        .expect("managed namespace token should resolve");
         assert_eq!(identity.namespace, "openshell-gw1-workspace-a");
     }
 

@@ -439,10 +439,11 @@ helm -n openshell get values openshell | grep sandboxNamespace
 
 Then inspect sandbox resources in that namespace.
 
-Check the configured sandbox service account when TokenReview bootstrap or
+Check the accepted sandbox service accounts when TokenReview bootstrap or
 sandbox registration fails. Helm creates a dedicated sandbox service account by
 default and writes it to `[openshell.drivers.kubernetes].service_account_name`;
-the gateway rejects projected tokens from other service accounts.
+the gateway rejects projected tokens from any service account outside that name
+plus `additional_bootstrap_service_account_names`.
 
 ```bash
 helm -n openshell get values openshell | grep -A3 sandboxServiceAccount

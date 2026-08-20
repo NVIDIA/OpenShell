@@ -453,6 +453,10 @@ workspace_mode                 = "shared"
 # gateway_id                   = "openshell"
 namespace                      = "agents"
 service_account_name           = "openshell-sandbox"
+# Extra ServiceAccounts accepted when a sandbox bootstraps, on top of
+# service_account_name. Only needed when something other than the driver
+# assigns the pod's ServiceAccount. Matched exactly, namespace-independent.
+# additional_bootstrap_service_account_names = ["openshell-sandbox-2"]
 default_image                  = "ghcr.io/nvidia/openshell/sandbox:latest"
 image_pull_policy              = "IfNotPresent"
 image_pull_secrets             = ["regcred"]

@@ -257,6 +257,16 @@ server:
       # -- Path to a JSON file containing an array of namespace names
       # allowed in operator mode. Hot-reloaded on change.
       operatorNamespaceFile: ""
+      # -- Extra ServiceAccount names the gateway accepts when a sandbox
+      # bootstraps, on top of the sandbox ServiceAccount the driver assigns.
+      # A pod spec has a single serviceAccountName field, so this is a separate
+      # setting. Use it where something else assigns that field, such as a
+      # mutating admission policy or an external controller that owns the
+      # sandbox pods. Names are matched exactly and ignore the namespace, so
+      # under managed and operator workspace modes an entry is accepted in
+      # every namespace the gateway accepts. Empty (default) accepts only the
+      # driver's own sandbox ServiceAccount.
+      additionalBootstrapServiceAccountNames: []
   # -- Disable TLS entirely - the server listens on plaintext HTTP.
   # Set to true when a reverse proxy / tunnel terminates TLS at the edge.
   disableTls: false

@@ -103,6 +103,43 @@ tests:
           path: data["gateway.toml"]
           pattern: '(?ms)\[openshell\.drivers\.kubernetes\].*?service_account_name\s*=\s*"openshell-sandbox"'
 
+  - it: omits additional bootstrap service accounts by default
+    template: templates/gateway-config.yaml
+    asserts:
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: 'additional_bootstrap_service_account_names\s*='
+
+  - it: renders additional bootstrap service accounts under [openshell.drivers.kubernetes]
+    template: templates/gateway-config.yaml
+    set:
+      server.drivers.kubernetes.additionalBootstrapServiceAccountNames:
+        - openshell-sandbox-2
+        - openshell-sandbox-3
+    asserts:
+      # `[^\[]*?` keeps the match inside the kubernetes table: the key must not
+      # drift into a nested table such as [openshell.drivers.kubernetes.sidecar],
+      # which denies unknown fields and would fail the gateway at startup.
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.drivers\.kubernetes\][^\[]*?additional_bootstrap_service_account_names\s*=\s*\["openshell-sandbox-2", "openshell-sandbox-3"\]'
+      # The pod default is a separate setting and must be untouched.
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.drivers\.kubernetes\][^\[]*?service_account_name\s*=\s*"openshell-sandbox"'
+
+  # A null YAML list item renders away silently through `quote`, leaving an
+  # operator with an empty or short array they believe is populated.
+  - it: fails to render when an additional bootstrap service account is blank
+    template: templates/statefulset.yaml
+    set:
+      server.drivers.kubernetes.additionalBootstrapServiceAccountNames:
+        - openshell-sandbox-2
+        - ""
+    asserts:
+      - failedTemplate:
+          errorMessage: "server.drivers.kubernetes.additionalBootstrapServiceAccountNames entries must be non-empty strings"
+
   - it: renders combined supervisor topology by default under [openshell.drivers.kubernetes]
     template: templates/gateway-config.yaml
     asserts:

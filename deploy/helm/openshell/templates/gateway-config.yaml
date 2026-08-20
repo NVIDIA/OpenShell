@@ -139,6 +139,14 @@ data:
     gateway_id                   = {{ .Values.server.sandboxJwt.gatewayId | default (include "openshell.fullname" .) | quote }}
     grpc_endpoint                = {{ include "openshell.grpcEndpoint" . | quote }}
     service_account_name         = {{ include "openshell.sandboxServiceAccountName" . | quote }}
+    {{- with .Values.server.drivers.kubernetes.additionalBootstrapServiceAccountNames }}
+    {{- range $name := . }}
+    {{- if not (and (kindIs "string" $name) (trim $name)) }}
+    {{- fail "server.drivers.kubernetes.additionalBootstrapServiceAccountNames entries must be non-empty strings" }}
+    {{- end }}
+    {{- end }}
+    additional_bootstrap_service_account_names = [{{- range $i, $name := . }}{{ if $i }}, {{ end }}{{ $name | quote }}{{- end }}]
+    {{- end }}
     {{- if .Values.server.drivers.kubernetes.operatorNamespaceLabel }}
     operator_namespace_label     = {{ .Values.server.drivers.kubernetes.operatorNamespaceLabel | quote }}
     {{- end }}

@@ -233,6 +233,9 @@ async fn main() -> Result<()> {
             operator_namespace_label: args.operator_namespace_label,
             operator_namespace_file: args.operator_namespace_file,
             service_account_name: args.sandbox_service_account,
+            // Bootstrap TokenReview runs in the gateway, which reads its own
+            // `[openshell.drivers.kubernetes]` table for the accepted set.
+            additional_bootstrap_service_account_names: Vec::new(),
             default_image: args.sandbox_image.unwrap_or_default(),
             image_pull_policy: args.sandbox_image_pull_policy.unwrap_or_default(),
             image_pull_secrets: args.sandbox_image_pull_secrets,

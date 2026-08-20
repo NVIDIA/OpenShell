@@ -364,6 +364,7 @@ For maintainer-level implementation details, refer to the [Kubernetes driver REA
 | `compute_drivers = ["kubernetes"]` | Not applicable | Select the Kubernetes compute driver. |
 | `[openshell.drivers.kubernetes].namespace` | `server.sandboxNamespace` | Set the namespace for sandbox resources. The Helm chart defaults to the release namespace when left empty. |
 | `service_account_name` | `sandboxServiceAccount.name` | Set the Kubernetes service account assigned to sandbox pods and accepted by the gateway TokenReview bootstrap path. The Helm chart creates a dedicated sandbox service account by default. |
+| `additional_bootstrap_service_account_names` | `server.drivers.kubernetes.additionalBootstrapServiceAccountNames` | Accept additional service accounts when a sandbox bootstraps, on top of `service_account_name`. A pod spec has a single `serviceAccountName` field, so this is a separate setting rather than a list form of that one. Set it where something other than the driver assigns the pod's service account, such as a mutating admission policy or an external controller that owns the sandbox pods. Empty by default. Refer to [ServiceAccount Bootstrap Identities](#serviceaccount-bootstrap-identities). |
 | `default_image` | `server.sandboxImage` | Set the default sandbox image. |
 | `image_pull_policy` | `server.sandboxImagePullPolicy` | Set the Kubernetes image pull policy for sandbox pods. |
 | `image_pull_secrets` | `server.sandboxImagePullSecrets` | Attach Kubernetes image-pull Secrets to sandbox pods. Managed mode copies these explicitly named Secrets from the configured source namespace into each workspace namespace. In shared and operator modes, the Secrets must already exist in the sandbox namespace. |
@@ -431,6 +432,69 @@ If Agent Sandbox is upgraded in place, restart the OpenShell gateway after the c
 <Note>
 `Sandbox.spec.volumeClaimTemplates` is immutable after creation. To change storage configuration, delete the sandbox and create a new one with the updated spec.
 </Note>
+
+### ServiceAccount Bootstrap Identities
+
+A sandbox bootstraps by presenting its projected ServiceAccount token to
+`IssueSandboxToken`. The gateway verifies the token through the apiserver's
+`TokenReview` API, requires it to be pod-bound, and requires the authenticated
+principal to be a ServiceAccount the operator accepts.
+
+Two distinct settings control which accounts those are.
+
+| Setting | Purpose |
+|---|---|
+| `service_account_name` | The ServiceAccount the driver assigns to sandbox pods. Accepted for bootstrap whenever it is set. |
+| `additional_bootstrap_service_account_names` | Further ServiceAccounts accepted for bootstrap. Never assigned to pods. |
+
+They are separate settings because a pod spec has a single `serviceAccountName`
+field, so a list has no valid rendering into it. Leave the additional list
+empty, which is the default, and the gateway accepts only the ServiceAccount it
+assigns. That is the behavior of releases before this setting existed.
+
+Add names when something other than the driver decides the pod's
+ServiceAccount, such as a mutating admission policy, an external controller
+that owns the sandbox pods, or a separately deployed Kubernetes driver
+configured independently of the gateway. Without this, bootstrap fails and the
+gateway logs:
+
+```text
+K8s TokenReview principal is not an accepted sandbox service account
+```
+
+That record names the presented principal alongside the accepted set. The
+gateway also logs the accepted set once at startup:
+
+```text
+K8s ServiceAccount bootstrap authenticator enabled accepted_service_accounts={"openshell-sandbox", "openshell-sandbox-2"}
+```
+
+```toml
+[openshell.drivers.kubernetes]
+service_account_name = "openshell-sandbox"
+additional_bootstrap_service_account_names = ["openshell-sandbox-2"]
+```
+
+Names are matched exactly. Prefixes and wildcards are not supported, and
+entries are neither validated as DNS-1123 names nor checked against existing
+ServiceAccounts, so a typo surfaces only as a rejected bootstrap. Surrounding
+whitespace is trimmed. Matching also ignores the namespace, which is validated
+separately against the active `workspace_mode`, so under managed and operator
+modes a name is accepted in every namespace the gateway accepts. Adding a name
+does not widen which namespaces may bootstrap.
+
+Accepting a name does not change how a token is verified. It is still checked
+through `TokenReview`, still required to carry the pod-name and pod-UID extras,
+the live pod UID must still match the token, and the pod must still be owned by
+a `Sandbox` CR whose `openshell.ai/sandbox-id` label matches the pod's
+`openshell.io/sandbox-id` annotation. A ServiceAccount is also the identity that
+cloud workload-identity systems attach permissions to, so a name you accept here
+may carry authority outside the cluster. Add only identities that should be able
+to bootstrap a sandbox on this gateway.
+
+The bootstrap authenticator is constructed only when the gateway runs in-cluster
+with sandbox JWT issuing enabled. If the startup record above is absent, the
+bootstrap path is disabled and these settings have no effect.
 
 ### Kubernetes Driver Config PVC Mounts
 

@@ -303,6 +303,22 @@ pub struct KubernetesComputeConfig {
     /// Kubernetes `ServiceAccount` assigned to sandbox pods and accepted by
     /// the gateway's `TokenReview` bootstrap authenticator.
     pub service_account_name: String,
+    /// Extra `ServiceAccount` names the gateway's `TokenReview` bootstrap
+    /// authenticator accepts, on top of [`Self::service_account_name`].
+    ///
+    /// This is deliberately a separate setting rather than a widening of
+    /// `service_account_name`, because a pod spec has a single
+    /// `serviceAccountName` field and a list has no valid rendering into it.
+    /// Use this where something other than the driver assigns the pod's
+    /// `ServiceAccount`, such as a mutating admission policy or an external
+    /// controller that owns the sandbox pods.
+    ///
+    /// Names are matched exactly and without regard to namespace, so under
+    /// managed and operator workspace modes an entry is accepted in every
+    /// namespace the gateway accepts. Empty by default, which keeps the
+    /// single-account behavior unchanged.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub additional_bootstrap_service_account_names: Vec<String>,
     pub default_image: String,
     pub image_pull_policy: String,
     /// Kubernetes `imagePullSecrets` names attached to sandbox pods.
@@ -436,6 +452,7 @@ impl Default for KubernetesComputeConfig {
             operator_namespace_label: None,
             operator_namespace_file: None,
             service_account_name: DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME.to_string(),
+            additional_bootstrap_service_account_names: Vec::new(),
             default_image: openshell_core::image::default_sandbox_image(),
             // Default empty so the gateway omits `imagePullPolicy` from pod
             // specs and Kubernetes applies its own default (Always for `latest`,
@@ -1150,6 +1167,32 @@ mod tests {
         });
         let cfg: KubernetesComputeConfig = serde_json::from_value(json).unwrap();
         assert_eq!(cfg.service_account_name, "openshell-sandbox");
+    }
+
+    #[test]
+    fn additional_bootstrap_service_account_names_default_to_empty() {
+        let cfg: KubernetesComputeConfig = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert!(cfg.additional_bootstrap_service_account_names.is_empty());
+    }
+
+    #[test]
+    fn serde_override_additional_bootstrap_service_account_names() {
+        let json = serde_json::json!({
+            "service_account_name": "openshell-sandbox",
+            "additional_bootstrap_service_account_names": [
+                "openshell-sandbox-2",
+                "openshell-sandbox-3"
+            ]
+        });
+        let cfg: KubernetesComputeConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(cfg.service_account_name, "openshell-sandbox");
+        assert_eq!(
+            cfg.additional_bootstrap_service_account_names,
+            vec![
+                "openshell-sandbox-2".to_string(),
+                "openshell-sandbox-3".to_string()
+            ]
+        );
     }
 
     #[test]
