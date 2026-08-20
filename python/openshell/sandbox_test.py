@@ -2378,12 +2378,15 @@ def test_sandbox_template_client_crud_forwards_requests() -> None:
     assert stub.get_template_request.name == "gpu-kata"
     assert stub.get_template_request.workspace == "default"
 
-    listed = client.list(workspace="default", limit=50, offset=10)
+    listed = client.list(
+        workspace="default", limit=50, offset=10, label_selector="team=runtime"
+    )
     assert len(listed) == 1
     assert stub.list_template_request is not None
     assert stub.list_template_request.workspace == "default"
     assert stub.list_template_request.limit == 50
     assert stub.list_template_request.offset == 10
+    assert stub.list_template_request.label_selector == "team=runtime"
     assert not stub.list_template_request.all_workspaces
 
     assert client.delete("gpu-kata", workspace="default") is True
@@ -2396,13 +2399,14 @@ def test_sandbox_template_list_for_all_workspaces_clears_workspace() -> None:
     stub = _FakeSandboxStub()
     client = _template_client_with_fake_stub(stub)
 
-    client.list_for_all_workspaces(limit=100, offset=5)
+    client.list_for_all_workspaces(limit=100, offset=5, label_selector="team=runtime")
 
     assert stub.list_template_request is not None
     assert stub.list_template_request.all_workspaces
     assert stub.list_template_request.workspace == ""
     assert stub.list_template_request.limit == 100
     assert stub.list_template_request.offset == 5
+    assert stub.list_template_request.label_selector == "team=runtime"
 
 
 def test_stop_and_start_forward_workspace_and_return_phase() -> None:

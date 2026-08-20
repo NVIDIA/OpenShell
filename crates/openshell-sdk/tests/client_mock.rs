@@ -975,6 +975,7 @@ async fn sandbox_template_crud_uses_default_workspace() {
         .list_sandbox_templates(SandboxTemplateListOptions {
             limit: 10,
             offset: 2,
+            label_selector: String::new(),
             all_workspaces: true,
         })
         .await

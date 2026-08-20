@@ -1174,12 +1174,14 @@ class SandboxTemplateClient:
         workspace: str,
         limit: int = 100,
         offset: int = 0,
+        label_selector: str = "",
     ) -> builtins.list[openshell_pb2.SandboxWorkloadTemplate]:
         response = self._stub.ListSandboxTemplates(
             openshell_pb2.ListSandboxTemplatesRequest(
                 workspace=workspace,
                 limit=limit,
                 offset=offset,
+                label_selector=label_selector,
             ),
             timeout=self._timeout,
         )
@@ -1190,12 +1192,14 @@ class SandboxTemplateClient:
         *,
         limit: int = 100,
         offset: int = 0,
+        label_selector: str = "",
     ) -> builtins.list[openshell_pb2.SandboxWorkloadTemplate]:
         response = self._stub.ListSandboxTemplates(
             openshell_pb2.ListSandboxTemplatesRequest(
                 all_workspaces=True,
                 limit=limit,
                 offset=offset,
+                label_selector=label_selector,
             ),
             timeout=self._timeout,
         )

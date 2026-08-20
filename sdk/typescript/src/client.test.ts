@@ -452,14 +452,20 @@ describe('sandbox templates', () => {
     });
 
     const got = await templates.get('gpu-kata', { workspace: 'staging' });
-    const listed = await templates.list({ workspace: 'staging', limit: 10, offset: 2 });
+    const listed = await templates.list({ workspace: 'staging', limit: 10, offset: 2, labelSelector: 'team=runtime' });
     const deleted = await templates.delete('gpu-kata', { workspace: 'staging' });
 
     expect(got.metadata?.name).toBe('gpu-kata');
     expect(listed).toHaveLength(1);
     expect(deleted).toBe(true);
     expect(observed.get).toMatchObject({ name: 'gpu-kata', workspace: 'staging' });
-    expect(observed.list).toMatchObject({ limit: 10, offset: 2, workspace: 'staging', allWorkspaces: false });
+    expect(observed.list).toMatchObject({
+      limit: 10,
+      offset: 2,
+      workspace: 'staging',
+      allWorkspaces: false,
+      labelSelector: 'team=runtime',
+    });
     expect(observed.delete).toMatchObject({ name: 'gpu-kata', workspace: 'staging' });
   });
 

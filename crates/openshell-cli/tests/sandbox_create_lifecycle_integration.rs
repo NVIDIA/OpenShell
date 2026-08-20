@@ -1766,6 +1766,7 @@ async fn sandbox_template_list_and_delete_send_workspace_requests() {
         &server.endpoint,
         25,
         5,
+        Some("team=runtime"),
         false,
         "table",
         "default",
@@ -1784,6 +1785,7 @@ async fn sandbox_template_list_and_delete_send_workspace_requests() {
         .expect("template list request should be recorded");
     assert_eq!(list_request.limit, 25);
     assert_eq!(list_request.offset, 5);
+    assert_eq!(list_request.label_selector, "team=runtime");
     assert_eq!(list_request.workspace, "default");
     assert!(!list_request.all_workspaces);
 
