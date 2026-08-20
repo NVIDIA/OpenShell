@@ -117,19 +117,75 @@ tests:
         - openshell-sandbox-2
         - openshell-sandbox-3
     asserts:
-      # `[^\[]*?` keeps the match inside the kubernetes table: the key must not
-      # drift into a nested table such as [openshell.drivers.kubernetes.sidecar],
-      # which denies unknown fields and would fail the gateway at startup.
+      # Line-anchored: a containment match cannot be used once a rendered array
+      # literal sits between the table header and the key, and both of these
+      # settings render arrays.
       - matchRegex:
           path: data["gateway.toml"]
-          pattern: '(?ms)\[openshell\.drivers\.kubernetes\][^\[]*?additional_bootstrap_service_account_names\s*=\s*\["openshell-sandbox-2", "openshell-sandbox-3"\]'
+          pattern: '(?m)^\s*additional_bootstrap_service_account_names = \["openshell-sandbox-2", "openshell-sandbox-3"\]$'
       # The pod default is a separate setting and must be untouched.
       - matchRegex:
           path: data["gateway.toml"]
-          pattern: '(?ms)\[openshell\.drivers\.kubernetes\][^\[]*?service_account_name\s*=\s*"openshell-sandbox"'
+          pattern: '(?m)^\s*service_account_name\s+= "openshell-sandbox"$'
 
-  # A null YAML list item renders away silently through `quote`, leaving an
-  # operator with an empty or short array they believe is populated.
+  - it: renders selectable service accounts under [openshell.drivers.kubernetes]
+    template: templates/gateway-config.yaml
+    set:
+      server.drivers.kubernetes.selectableServiceAccountNames:
+        - openshell-sandbox-3
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^\s*selectable_service_account_names = \["openshell-sandbox-3"\]$'
+
+  - it: omits selectable service accounts by default
+    template: templates/gateway-config.yaml
+    asserts:
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: 'selectable_service_account_names\s*='
+
+  # Both keys render into the same table; a containment regex would silently
+  # stop matching here, which is why the assertions above are line-anchored.
+  - it: renders both service account lists together
+    template: templates/gateway-config.yaml
+    set:
+      server.drivers.kubernetes.additionalBootstrapServiceAccountNames:
+        - openshell-sandbox-external
+      server.drivers.kubernetes.selectableServiceAccountNames:
+        - openshell-sandbox-3
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^\s*additional_bootstrap_service_account_names = \["openshell-sandbox-external"\]$'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^\s*selectable_service_account_names = \["openshell-sandbox-3"\]$'
+
+  - it: fails to render when a selectable service account is blank
+    template: templates/statefulset.yaml
+    set:
+      server.drivers.kubernetes.selectableServiceAccountNames:
+        - openshell-sandbox-3
+        - ""
+    asserts:
+      - failedTemplate:
+          errorMessage: "server.drivers.kubernetes.selectableServiceAccountNames entries must be non-empty strings"
+
+  # `kindIs "string"` exists for this case: a null item is not a blank string.
+  - it: fails to render when a selectable service account is not a string
+    template: templates/statefulset.yaml
+    set:
+      server.drivers.kubernetes.selectableServiceAccountNames:
+        - 5
+    asserts:
+      - failedTemplate:
+          errorMessage: "server.drivers.kubernetes.selectableServiceAccountNames entries must be non-empty strings"
+
+  # A blank or null list item renders away silently through `quote`, leaving an
+  # operator with a shorter array than they configured and no error anywhere.
+  # Asserted against statefulset.yaml because it pulls gateway-config.yaml into
+  # its checksum annotation, so rendering it evaluates the guard.
   - it: fails to render when an additional bootstrap service account is blank
     template: templates/statefulset.yaml
     set:

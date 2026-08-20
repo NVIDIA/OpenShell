@@ -163,14 +163,17 @@ impl NamespaceValidator {
 /// Validates the `ServiceAccount` name extracted from an SA token username
 /// against the set an operator accepts for sandbox bootstrap.
 ///
-/// The Kubernetes driver writes a single `serviceAccountName` onto sandbox pods
-/// (`service_account_name`), and that name is a member whenever it is
+/// The Kubernetes driver writes one resolved `serviceAccountName` onto each
+/// sandbox pod, `service_account_name` unless the request selected another
+/// account, and every name it can resolve to is a member whenever it is
 /// non-empty. Deployments where something other than the driver assigns the
 /// pod's `ServiceAccount`, such as a mutating admission policy or an external
 /// controller that owns the sandbox pods, add those identities through
-/// `additional_bootstrap_service_account_names`. The set stays
-/// operator-configured and closed; this widens which identities may bootstrap,
-/// not how they are verified.
+/// `additional_bootstrap_service_account_names`. Accounts a caller may request
+/// per sandbox (`selectable_service_account_names`) are members too, since a
+/// pod running as one has to authenticate. The set stays operator-configured
+/// and closed; this widens which identities may bootstrap, not how they are
+/// verified.
 ///
 /// Matching is an exact comparison of the bare name and is independent of the
 /// namespace, which [`NamespaceValidator`] checks separately. Under managed and
@@ -192,24 +195,25 @@ impl ServiceAccountValidator {
     /// set. An empty `pod_default` is dropped on the same rule: the driver
     /// omits `serviceAccountName` from the pod in that case, and the resulting
     /// set accepts only what `additional` supplies.
+    #[cfg(test)]
     pub fn new(pod_default: &str, additional: impl IntoIterator<Item = impl Into<String>>) -> Self {
-        let accepted = std::iter::once(pod_default.to_string())
+        let owned: Vec<String> = std::iter::once(pod_default.to_string())
             .chain(additional.into_iter().map(Into::into))
-            .filter_map(|name| {
-                let trimmed = name.trim();
-                (!trimmed.is_empty()).then(|| trimmed.to_string())
-            })
             .collect();
-        Self { accepted }
+        Self {
+            accepted: openshell_driver_kubernetes::service_account_name_set(
+                owned.iter().map(String::as_str),
+            ),
+        }
     }
 
     /// Build the accepted set from the Kubernetes driver configuration the
-    /// gateway reads for bootstrap.
+    /// gateway reads for bootstrap. Selectable accounts are included, since an
+    /// account a caller may run a sandbox as has to be able to authenticate.
     pub fn from_kubernetes_config(config: &KubernetesComputeConfig) -> Self {
-        Self::new(
-            &config.service_account_name,
-            &config.additional_bootstrap_service_account_names,
-        )
+        Self {
+            accepted: config.accepted_bootstrap_service_account_names(),
+        }
     }
 
     pub fn accepts(&self, service_account: &str) -> bool {
@@ -975,6 +979,29 @@ mod tests {
         );
 
         assert_eq!(v.accepted().len(), 2);
+    }
+
+    /// A caller-selectable account has to authenticate when its pod bootstraps,
+    /// so the validator accepts both lists even though only one of them is
+    /// selectable.
+    #[test]
+    fn service_account_validator_accepts_bootstrap_and_selectable_names() {
+        let config = KubernetesComputeConfig {
+            service_account_name: "openshell-sandbox".to_string(),
+            additional_bootstrap_service_account_names: vec![
+                "openshell-sandbox-external".to_string(),
+            ],
+            selectable_service_account_names: vec!["openshell-sandbox-3".to_string()],
+            ..Default::default()
+        };
+
+        let v = ServiceAccountValidator::from_kubernetes_config(&config);
+
+        assert!(v.accepts("openshell-sandbox"));
+        assert!(v.accepts("openshell-sandbox-external"));
+        assert!(v.accepts("openshell-sandbox-3"));
+        assert!(!v.accepts("openshell-sandbox-other"));
+        assert_eq!(v.accepted().len(), 3);
     }
 
     #[test]

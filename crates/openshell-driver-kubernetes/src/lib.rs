@@ -9,7 +9,8 @@ pub use config::{
     AppArmorProfile, DEFAULT_GATEWAY_ID, DEFAULT_PROXY_UID, DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME,
     DEFAULT_WORKSPACE_STORAGE_SIZE, KubernetesComputeConfig, KubernetesSidecarConfig,
     ManagedSshIngressConfig, OperatorNamespaceAllowlist, SupervisorSideloadMethod,
-    SupervisorTopology, WorkspaceMode, managed_namespace_prefix,
+    SupervisorTopology, WorkspaceMode, is_service_account_name, managed_namespace_prefix,
+    service_account_name_set,
 };
 pub use driver::{KubernetesComputeDriver, KubernetesDriverError};
 pub use grpc::ComputeDriverService;

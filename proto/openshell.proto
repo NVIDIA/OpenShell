@@ -860,6 +860,18 @@ message SandboxTemplate {
   // forwards only that inner Struct to DriverSandboxTemplate.driver_config.
   // The selected driver owns nested schema validation.
   google.protobuf.Struct driver_config = 11;
+  // Optional Kubernetes ServiceAccount for this sandbox's pod.
+  //
+  // Must name an account the operator made selectable
+  // (`[openshell.drivers.kubernetes] selectable_service_account_names`, plus
+  // the driver's own `service_account_name`); anything else is rejected rather
+  // than silently replaced by the default, including a value that is present
+  // but blank. Leave it unset to get the driver's configured account, which is
+  // the behavior of every deployment that does not set this.
+  //
+  // Kubernetes only: the gateway rejects a request that sets this field when
+  // the active compute driver is not the Kubernetes driver.
+  string service_account_name = 12;
 }
 
 // User-facing sandbox status derived by the gateway from compute-driver observations.

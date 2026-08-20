@@ -1308,9 +1308,18 @@ type SandboxTemplate struct {
 	// The gateway selects the block matching the active compute driver and
 	// forwards only that inner Struct to DriverSandboxTemplate.driver_config.
 	// The selected driver owns nested schema validation.
-	DriverConfig  *structpb.Struct `protobuf:"bytes,11,opt,name=driver_config,json=driverConfig,proto3" json:"driver_config,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	DriverConfig *structpb.Struct `protobuf:"bytes,11,opt,name=driver_config,json=driverConfig,proto3" json:"driver_config,omitempty"`
+	// Optional Kubernetes ServiceAccount for this sandbox's pod.
+	//
+	// Must name an account the operator made selectable
+	// (`[openshell.drivers.kubernetes] selectable_service_account_names`, plus
+	// the driver's own `service_account_name`); anything else is rejected rather
+	// than silently replaced by the default. When unset the driver's configured
+	// account is used, which is the behavior of every deployment that does not
+	// set this. Ignored by non-Kubernetes compute drivers.
+	ServiceAccountName string `protobuf:"bytes,12,opt,name=service_account_name,json=serviceAccountName,proto3" json:"service_account_name,omitempty"`
+	unknownFields      protoimpl.UnknownFields
+	sizeCache          protoimpl.SizeCache
 }
 
 func (x *SandboxTemplate) Reset() {
@@ -1404,6 +1413,13 @@ func (x *SandboxTemplate) GetDriverConfig() *structpb.Struct {
 		return x.DriverConfig
 	}
 	return nil
+}
+
+func (x *SandboxTemplate) GetServiceAccountName() string {
+	if x != nil {
+		return x.ServiceAccountName
+	}
+	return ""
 }
 
 // User-facing sandbox status derived by the gateway from compute-driver observations.
@@ -13236,7 +13252,7 @@ const file_openshell_proto_rawDesc = "" +
 	"\x03gpu\x18\x01 \x01(\v2%.openshell.v1.GpuResourceRequirementsR\x03gpu\">\n" +
 	"\x17GpuResourceRequirements\x12\x19\n" +
 	"\x05count\x18\x01 \x01(\rH\x00R\x05count\x88\x01\x01B\b\n" +
-	"\x06_count\"\xef\x05\n" +
+	"\x06_count\"\xa1\x06\n" +
 	"\x0fSandboxTemplate\x12\x14\n" +
 	"\x05image\x18\x01 \x01(\tR\x05image\x12,\n" +
 	"\x12runtime_class_name\x18\x02 \x01(\tR\x10runtimeClassName\x12!\n" +
@@ -13247,7 +13263,8 @@ const file_openshell_proto_rawDesc = "" +
 	"\tresources\x18\a \x01(\v2\x17.google.protobuf.StructR\tresources\x12,\n" +
 	"\x0fuser_namespaces\x18\n" +
 	" \x01(\bH\x00R\x0euserNamespaces\x88\x01\x01\x12<\n" +
-	"\rdriver_config\x18\v \x01(\v2\x17.google.protobuf.StructR\fdriverConfig\x1a9\n" +
+	"\rdriver_config\x18\v \x01(\v2\x17.google.protobuf.StructR\fdriverConfig\x120\n" +
+	"\x14service_account_name\x18\f \x01(\tR\x12serviceAccountName\x1a9\n" +
 	"\vLabelsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\x1a>\n" +

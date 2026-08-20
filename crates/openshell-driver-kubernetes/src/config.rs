@@ -300,8 +300,9 @@ pub struct KubernetesComputeConfig {
     /// operator mode. Hot-reloaded on change. Delivered via `ConfigMap` volume mount.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub operator_namespace_file: Option<String>,
-    /// Kubernetes `ServiceAccount` assigned to sandbox pods and accepted by
-    /// the gateway's `TokenReview` bootstrap authenticator.
+    /// Default Kubernetes `ServiceAccount` for sandbox pods, used unless a
+    /// request selects another selectable account, and accepted by the
+    /// gateway's `TokenReview` bootstrap authenticator.
     pub service_account_name: String,
     /// Extra `ServiceAccount` names the gateway's `TokenReview` bootstrap
     /// authenticator accepts, on top of [`Self::service_account_name`].
@@ -315,10 +316,34 @@ pub struct KubernetesComputeConfig {
     ///
     /// Names are matched exactly and without regard to namespace, so under
     /// managed and operator workspace modes an entry is accepted in every
-    /// namespace the gateway accepts. Empty by default, which keeps the
-    /// single-account behavior unchanged.
+    /// namespace the gateway accepts. Empty by default; on its own it does not
+    /// widen the accepted set.
+    ///
+    /// Accepting a name here does not let a caller ask for it. Use
+    /// [`Self::selectable_service_account_names`] for that.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub additional_bootstrap_service_account_names: Vec<String>,
+    /// `ServiceAccount` names a caller may request for an individual sandbox
+    /// through `SandboxTemplate.service_account_name`, and which the gateway's
+    /// bootstrap authenticator therefore also accepts.
+    ///
+    /// This is separate from [`Self::additional_bootstrap_service_account_names`]
+    /// on purpose. That setting says "accept this identity if something outside
+    /// the driver assigned it to the pod"; this one says "any caller who can
+    /// create a sandbox may run as this identity". Enrolling a privileged
+    /// account for bootstrap should not silently put it on the menu, so the two
+    /// are opted into independently.
+    ///
+    /// A request naming an account outside this set is rejected; the driver's
+    /// own [`Self::service_account_name`] is selectable whenever it is set.
+    /// Empty by default, which leaves the driver default as the only account a
+    /// caller can request.
+    ///
+    /// Members are available to every caller who can create a sandbox, and the
+    /// driver only ever provisions [`Self::service_account_name`], so the rest
+    /// have to exist already in each namespace the gateway uses.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub selectable_service_account_names: Vec<String>,
     pub default_image: String,
     pub image_pull_policy: String,
     /// Kubernetes `imagePullSecrets` names attached to sandbox pods.
@@ -453,6 +478,7 @@ impl Default for KubernetesComputeConfig {
             operator_namespace_file: None,
             service_account_name: DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME.to_string(),
             additional_bootstrap_service_account_names: Vec::new(),
+            selectable_service_account_names: Vec::new(),
             default_image: openshell_core::image::default_sandbox_image(),
             // Default empty so the gateway omits `imagePullPolicy` from pod
             // specs and Kubernetes applies its own default (Always for `latest`,
@@ -669,6 +695,107 @@ impl KubernetesComputeConfig {
         })
     }
 
+    /// `ServiceAccount` names the gateway's bootstrap authenticator accepts:
+    /// the pod default, the names enrolled for bootstrap only, and every name a
+    /// caller may select. A selectable account has to authenticate, so it is
+    /// necessarily accepted.
+    pub fn accepted_bootstrap_service_account_names(&self) -> BTreeSet<String> {
+        service_account_name_set(
+            std::iter::once(self.service_account_name.as_str())
+                .chain(
+                    self.additional_bootstrap_service_account_names
+                        .iter()
+                        .map(String::as_str),
+                )
+                .chain(
+                    self.selectable_service_account_names
+                        .iter()
+                        .map(String::as_str),
+                ),
+        )
+    }
+
+    /// `ServiceAccount` names a caller may request for a single sandbox. The
+    /// driver's own default is always selectable; anything else has to be
+    /// opted in through `selectable_service_account_names`.
+    pub fn selectable_pod_service_account_names(&self) -> BTreeSet<String> {
+        service_account_name_set(
+            std::iter::once(self.service_account_name.as_str()).chain(
+                self.selectable_service_account_names
+                    .iter()
+                    .map(String::as_str),
+            ),
+        )
+    }
+
+    /// Resolve the `ServiceAccount` for one sandbox's pod.
+    ///
+    /// `requested` is the caller's `SandboxTemplate.service_account_name` when
+    /// the field was set. An absent field takes [`Self::service_account_name`].
+    /// A field that was set has to name a selectable account: anything else,
+    /// including a blank or whitespace-only value, is an error rather than a
+    /// silent fall back to the default, because running a sandbox under a
+    /// different identity than the caller asked for is the kind of surprise
+    /// that is discovered by an unexpected IAM denial much later.
+    ///
+    /// The error names the requested account but not the selectable set, which
+    /// goes to the gateway log instead: the caller already knows what it asked
+    /// for, and the set of identities a gateway can assume is not something to
+    /// hand out on request.
+    pub fn resolve_pod_service_account(&self, requested: Option<&str>) -> Result<String, String> {
+        let Some(requested) = requested else {
+            return Ok(self.service_account_name.trim().to_string());
+        };
+        let requested = requested.trim();
+        if requested.is_empty() {
+            return Err(
+                "service_account_name was set but is blank; omit the field to use \
+                        the gateway's default sandbox ServiceAccount"
+                    .to_string(),
+            );
+        }
+        if !self
+            .selectable_pod_service_account_names()
+            .contains(requested)
+        {
+            return Err(format!(
+                "service_account_name '{requested}' is not selectable on this gateway"
+            ));
+        }
+        Ok(requested.to_string())
+    }
+
+    /// Reject configured `ServiceAccount` names that Kubernetes could never
+    /// issue, so a typo fails at gateway startup instead of surfacing later as
+    /// a rejected sandbox create or a pod the apiserver refuses to admit.
+    pub fn validate_service_account_names(&self) -> Result<(), String> {
+        let lists = [
+            (
+                "service_account_name",
+                std::slice::from_ref(&self.service_account_name),
+            ),
+            (
+                "additional_bootstrap_service_account_names",
+                self.additional_bootstrap_service_account_names.as_slice(),
+            ),
+            (
+                "selectable_service_account_names",
+                self.selectable_service_account_names.as_slice(),
+            ),
+        ];
+        for (setting, names) in lists {
+            for name in service_account_name_set(names.iter().map(String::as_str)) {
+                if !is_service_account_name(&name) {
+                    return Err(format!(
+                        "{setting} entry '{name}' is not a valid Kubernetes ServiceAccount name \
+                         (DNS-1123 subdomain, at most 253 characters)"
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Validate that configured `sandbox_uid` and `sandbox_gid` fall within
     /// the policy-enforced UID/GID range. Called during driver initialization
     /// before any pod parameters are rendered.
@@ -824,6 +951,30 @@ pub fn managed_namespace(gateway_id: &str, workspace: &str) -> String {
 #[must_use]
 pub fn managed_namespace_prefix(gateway_id: &str) -> String {
     format!("openshell-{gateway_id}-")
+}
+
+/// Check whether a string is a name Kubernetes could issue a `ServiceAccount`
+/// for: a DNS-1123 subdomain of at most 253 characters.
+#[must_use]
+pub fn is_service_account_name(name: &str) -> bool {
+    !name.is_empty() && name.len() <= 253 && name.split('.').all(is_dns_1123_label)
+}
+
+/// Normalize a list of configured `ServiceAccount` names into a set.
+///
+/// Names are trimmed, because a `ServiceAccount` name never carries
+/// surrounding whitespace and a padded config entry would otherwise sit in the
+/// set as a member nothing can ever match. Entries that are empty after
+/// trimming are dropped, so a blank config line cannot widen the set.
+#[must_use]
+pub fn service_account_name_set<'a>(names: impl IntoIterator<Item = &'a str>) -> BTreeSet<String> {
+    names
+        .into_iter()
+        .filter_map(|name| {
+            let trimmed = name.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_string())
+        })
+        .collect()
 }
 
 /// Check whether a string is a valid DNS-1123 label (lowercase alphanumeric
@@ -1192,6 +1343,203 @@ mod tests {
                 "openshell-sandbox-2".to_string(),
                 "openshell-sandbox-3".to_string()
             ]
+        );
+    }
+
+    fn config_with_service_accounts(
+        pod_default: &str,
+        additional: &[&str],
+        selectable: &[&str],
+    ) -> KubernetesComputeConfig {
+        KubernetesComputeConfig {
+            service_account_name: pod_default.to_string(),
+            additional_bootstrap_service_account_names: additional
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
+            selectable_service_account_names: selectable.iter().map(ToString::to_string).collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn selectable_service_account_names_default_to_empty() {
+        let cfg: KubernetesComputeConfig = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert!(cfg.selectable_service_account_names.is_empty());
+    }
+
+    /// Everything that can appear on a sandbox pod has to be able to
+    /// authenticate, so the bootstrap set is the union of both lists.
+    #[test]
+    fn accepted_bootstrap_names_union_both_lists_and_the_pod_default() {
+        let cfg = config_with_service_accounts(
+            "openshell-sandbox",
+            [" openshell-sandbox-2 ", ""].as_slice(),
+            ["openshell-sandbox-3", "openshell-sandbox"].as_slice(),
+        );
+
+        let accepted = cfg.accepted_bootstrap_service_account_names();
+        assert!(accepted.contains("openshell-sandbox"));
+        assert!(accepted.contains("openshell-sandbox-2"), "trimmed and kept");
+        assert!(accepted.contains("openshell-sandbox-3"));
+        assert_eq!(accepted.len(), 3, "blank dropped, duplicate collapsed");
+    }
+
+    /// The security property that keeps the two lists separate: enrolling an
+    /// account for bootstrap must not put it on the menu for callers.
+    #[test]
+    fn bootstrap_only_names_are_not_selectable() {
+        let cfg = config_with_service_accounts(
+            "openshell-sandbox",
+            ["openshell-sandbox-privileged"].as_slice(),
+            ["openshell-sandbox-3"].as_slice(),
+        );
+
+        let selectable = cfg.selectable_pod_service_account_names();
+        assert!(selectable.contains("openshell-sandbox"), "pod default");
+        assert!(selectable.contains("openshell-sandbox-3"));
+        assert!(
+            !selectable.contains("openshell-sandbox-privileged"),
+            "a bootstrap-only account must not be selectable by a caller"
+        );
+        assert!(
+            cfg.accepted_bootstrap_service_account_names()
+                .contains("openshell-sandbox-privileged"),
+            "but it still authenticates"
+        );
+    }
+
+    #[test]
+    fn resolve_pod_service_account_falls_back_to_the_driver_default() {
+        let cfg = config_with_service_accounts("openshell-sandbox", &[], &["openshell-sandbox-3"]);
+
+        assert_eq!(
+            cfg.resolve_pod_service_account(None).unwrap(),
+            "openshell-sandbox"
+        );
+    }
+
+    /// The default is trimmed on the way out, so a padded config value cannot
+    /// reach the pod as a name the apiserver rejects while the accepted set
+    /// holds the trimmed spelling.
+    #[test]
+    fn resolve_pod_service_account_trims_the_driver_default() {
+        let cfg = config_with_service_accounts(" openshell-sandbox ", &[], &[]);
+
+        assert_eq!(
+            cfg.resolve_pod_service_account(None).unwrap(),
+            "openshell-sandbox"
+        );
+    }
+
+    /// A field that was set but is blank is a mistake, not a request for the
+    /// default: defaulting it would run the sandbox under an identity the
+    /// caller did not ask for.
+    #[test]
+    fn resolve_pod_service_account_rejects_a_blank_request() {
+        let cfg = config_with_service_accounts("openshell-sandbox", &[], &["openshell-sandbox-3"]);
+
+        for blank in ["", "   ", "\t"] {
+            let err = cfg.resolve_pod_service_account(Some(blank)).unwrap_err();
+            assert!(err.contains("blank"), "{err}");
+        }
+    }
+
+    /// The set of identities a gateway can assume is not something to hand out
+    /// to whoever asks; it goes to the log instead.
+    #[test]
+    fn resolve_pod_service_account_error_does_not_disclose_the_selectable_set() {
+        let cfg = config_with_service_accounts(
+            "openshell-sandbox",
+            &[],
+            ["openshell-sandbox-privileged"].as_slice(),
+        );
+
+        let err = cfg
+            .resolve_pod_service_account(Some("openshell-sandbox-typo"))
+            .unwrap_err();
+        assert!(err.contains("openshell-sandbox-typo"), "{err}");
+        assert!(
+            !err.contains("openshell-sandbox-privileged"),
+            "the selectable set must not leak to the caller: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_service_account_names_accepts_valid_names() {
+        let cfg = config_with_service_accounts(
+            "openshell-sandbox",
+            ["openshell-sandbox-2", " openshell-sandbox-3 "].as_slice(),
+            ["sa.with.dots", "a"].as_slice(),
+        );
+
+        assert!(cfg.validate_service_account_names().is_ok());
+    }
+
+    #[test]
+    fn validate_service_account_names_rejects_names_kubernetes_cannot_issue() {
+        for bad in [
+            "Openshell-Sandbox",
+            "has space",
+            "-leading-hyphen",
+            "under_score",
+        ] {
+            let cfg = config_with_service_accounts("openshell-sandbox", &[], [bad].as_slice());
+            let err = cfg.validate_service_account_names().unwrap_err();
+            assert!(err.contains("selectable_service_account_names"), "{err}");
+            assert!(err.contains(bad), "{err}");
+        }
+
+        let too_long = "a".repeat(254);
+        let cfg =
+            config_with_service_accounts("openshell-sandbox", [too_long.as_str()].as_slice(), &[]);
+        let err = cfg.validate_service_account_names().unwrap_err();
+        assert!(
+            err.contains("additional_bootstrap_service_account_names"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn resolve_pod_service_account_accepts_a_selectable_request() {
+        let cfg = config_with_service_accounts("openshell-sandbox", &[], &["openshell-sandbox-3"]);
+
+        assert_eq!(
+            cfg.resolve_pod_service_account(Some("openshell-sandbox-3"))
+                .unwrap(),
+            "openshell-sandbox-3"
+        );
+        assert_eq!(
+            cfg.resolve_pod_service_account(Some(" openshell-sandbox-3 "))
+                .unwrap(),
+            "openshell-sandbox-3"
+        );
+        assert_eq!(
+            cfg.resolve_pod_service_account(Some("openshell-sandbox"))
+                .unwrap(),
+            "openshell-sandbox",
+            "asking for the default explicitly is fine"
+        );
+    }
+
+    #[test]
+    fn resolve_pod_service_account_rejects_a_non_selectable_request() {
+        let cfg = config_with_service_accounts(
+            "openshell-sandbox",
+            ["openshell-sandbox-privileged"].as_slice(),
+            ["openshell-sandbox-3"].as_slice(),
+        );
+
+        let err = cfg
+            .resolve_pod_service_account(Some("openshell-sandbox-privileged"))
+            .unwrap_err();
+        assert!(err.contains("openshell-sandbox-privileged"), "{err}");
+        assert!(err.contains("not selectable"), "{err}");
+
+        assert!(
+            cfg.resolve_pod_service_account(Some("openshell-sandbox-typo"))
+                .is_err(),
+            "an unknown account is rejected, not silently defaulted"
         );
     }
 
