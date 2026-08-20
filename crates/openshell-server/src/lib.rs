@@ -13,6 +13,16 @@
 //! startup. Runtime selection only consults that registry or a configured
 //! external endpoint; it does not switch on driver names.
 
+// `defaults-without-telemetry` is an alias for the default feature set minus
+// `telemetry`, not a switch that turns telemetry off. Cargo cannot subtract a
+// default feature, so adding it on top of the defaults would otherwise produce
+// a telemetry-on build that reads as telemetry-free. Fail the build instead.
+#[cfg(all(feature = "telemetry", feature = "defaults-without-telemetry"))]
+compile_error!(
+    "features `telemetry` and `defaults-without-telemetry` are mutually exclusive; \
+     build a telemetry-free gateway with `--no-default-features --features defaults-without-telemetry`"
+);
+
 mod auth;
 pub mod certgen;
 pub mod cli;

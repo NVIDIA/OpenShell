@@ -35,12 +35,27 @@ is the single switch that enables `openshell-core/telemetry` for its build
 graph. In-process drivers (`docker`, `kubernetes`, `podman`) inherit the
 gateway's setting through feature unification and carry no passthrough.
 
-Building a binary with `--no-default-features` compiles out telemetry entirely:
-no endpoint, no telemetry HTTP client, and no emission code. With telemetry
-compiled out, `telemetry::enabled()` is always `false` and the `emit_*` helpers
-are no-ops, so the data-model types stay available and dependent crates compile
-unchanged. The runtime `OPENSHELL_TELEMETRY_ENABLED` switch remains the way to
-disable telemetry in a default (telemetry-enabled) build.
+Building a binary without the `telemetry` feature compiles out telemetry
+entirely: no endpoint, no telemetry HTTP client, and no emission code. With
+telemetry compiled out, `telemetry::enabled()` is always `false` and the
+`emit_*` helpers are no-ops, so the data-model types stay available and
+dependent crates compile unchanged. The runtime `OPENSHELL_TELEMETRY_ENABLED`
+switch remains the way to disable telemetry in a default (telemetry-enabled)
+build.
+
+Cargo cannot subtract a single default feature, so each of the three binary
+crates also defines a `defaults-without-telemetry` alias listing every default
+except `telemetry`. Telemetry-free builds use
+`--no-default-features --features defaults-without-telemetry` and stay correct
+as the default set grows, instead of dropping unrelated defaults the way a bare
+`--no-default-features` does on `openshell-sandbox`. The alias is a keep-list,
+not a switch: enabling it on top of the defaults would otherwise yield a
+telemetry-on binary that reads as telemetry-free, so each crate root carries a
+`compile_error!` for the `telemetry` + `defaults-without-telemetry` combination.
+`rust:verify:defaults-without-telemetry` guards both properties — that each
+alias still equals its crate's defaults minus `telemetry`, and that the
+mutual-exclusion error is wired up — and `rust:verify:telemetry-off` builds
+through the alias and inspects the resulting binaries for telemetry markers.
 
 Supervisor upstream TLS root-store selection is controlled by the
 `bundled-ca-roots` Cargo feature (on by default). Default builds use Mozilla

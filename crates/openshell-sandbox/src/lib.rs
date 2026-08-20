@@ -5,6 +5,16 @@
 //!
 //! This crate provides process sandboxing and monitoring capabilities.
 
+// `defaults-without-telemetry` is an alias for the default feature set minus
+// `telemetry`, not a switch that turns telemetry off. Cargo cannot subtract a
+// default feature, so adding it on top of the defaults would otherwise produce
+// a telemetry-on build that reads as telemetry-free. Fail the build instead.
+#[cfg(all(feature = "telemetry", feature = "defaults-without-telemetry"))]
+compile_error!(
+    "features `telemetry` and `defaults-without-telemetry` are mutually exclusive; \
+     build a telemetry-free supervisor with `--no-default-features --features defaults-without-telemetry`"
+);
+
 mod activity_aggregator;
 mod denial_aggregator;
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
