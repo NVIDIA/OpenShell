@@ -3,19 +3,19 @@
 
 //! CLI command implementations.
 
+use crate::commands::common::{
+    PlainProvisioningProgress, ProvisioningDisplay, ProvisioningStep,
+    confirm_global_setting_delete, confirm_global_setting_takeover, format_epoch_ms,
+    format_optional_epoch_ms, format_setting_value, format_timestamp, format_timestamp_ms,
+    handle_platform_progress_event, is_provisioning_progress_event, non_empty_or,
+    parse_cli_setting_value, parse_credential_expiry_pairs, parse_credential_pairs,
+    parse_duration_to_ms, phase_name, print_policy_merge_warnings, print_sandbox_header,
+    print_sandbox_policy, provisioning_timeout_message, ready_false_condition_message,
+    scrub_git_env, short_hash, truncate_display, truncate_status_field,
+};
 pub use crate::commands::common::{
     PolicyGetView, parse_credential_expiry_cli_value, parse_env_pairs, parse_key_value_pairs,
     parse_secret_material_env_pairs, warn_credential_env_vars,
-};
-use crate::commands::common::{
-    ProvisioningDisplay, ProvisioningStep, confirm_global_setting_delete,
-    confirm_global_setting_takeover, format_epoch_ms, format_optional_epoch_ms,
-    format_setting_value, format_timestamp, format_timestamp_ms, handle_platform_progress_event,
-    is_provisioning_progress_event, non_empty_or, parse_cli_setting_value,
-    parse_credential_expiry_pairs, parse_credential_pairs, parse_duration_to_ms, phase_name,
-    print_policy_merge_warnings, print_sandbox_header, print_sandbox_policy,
-    provisioning_timeout_message, ready_false_condition_message, scrub_git_env, short_hash,
-    truncate_display, truncate_status_field,
 };
 pub use crate::commands::gateway::{
     gateway_add, gateway_info, gateway_info_not_configured, gateway_list, gateway_login,
@@ -628,6 +628,7 @@ pub async fn sandbox_create(
 
     // Non-interactive mode: track start time for timestamps.
     let provision_start = Instant::now();
+    let mut plain_progress = PlainProvisioningProgress::default();
 
     // Don't use stop_on_terminal on the server — the Kubernetes CRD may
     // briefly report a stale Ready status before the controller reconciles
@@ -765,12 +766,18 @@ pub async fn sandbox_create(
                 // Silent mode suppresses all progress output; only update
                 // the deadline when applicable.
                 let handled = match &mut display {
-                    ProgressOutput::Interactive(d) => {
-                        handle_platform_progress_event(&ev, Some(d), provision_start)
-                    }
-                    ProgressOutput::Plain => {
-                        handle_platform_progress_event(&ev, None, provision_start)
-                    }
+                    ProgressOutput::Interactive(d) => handle_platform_progress_event(
+                        &ev,
+                        Some(d),
+                        &mut plain_progress,
+                        provision_start,
+                    ),
+                    ProgressOutput::Plain => handle_platform_progress_event(
+                        &ev,
+                        None,
+                        &mut plain_progress,
+                        provision_start,
+                    ),
                     ProgressOutput::Silent => false,
                 };
                 if handled {

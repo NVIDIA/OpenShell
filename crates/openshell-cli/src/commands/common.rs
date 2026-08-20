@@ -444,9 +444,26 @@ pub fn noninteractive_active_label(step: ProvisioningStep) -> String {
     step.active_label().trim_end_matches('.').to_string()
 }
 
+#[derive(Default)]
+pub struct PlainProvisioningProgress {
+    last_completion: Option<(ProvisioningStep, String)>,
+}
+
+impl PlainProvisioningProgress {
+    fn should_print_completion(&mut self, step: ProvisioningStep, label: &str) -> bool {
+        let completion = (step, label.to_string());
+        if self.last_completion.as_ref() == Some(&completion) {
+            return false;
+        }
+        self.last_completion = Some(completion);
+        true
+    }
+}
+
 pub fn handle_platform_progress_event(
     event: &PlatformEvent,
     mut display: Option<&mut ProvisioningDisplay>,
+    plain_progress: &mut PlainProvisioningProgress,
     provision_start: Instant,
 ) -> bool {
     let completed_step = event
@@ -474,7 +491,7 @@ pub fn handle_platform_progress_event(
             .map_or_else(|| step.completed_label(), String::as_str);
         if let Some(d) = display.as_deref_mut() {
             d.complete_step_with_label(step, label);
-        } else {
+        } else if plain_progress.should_print_completion(step, label) {
             let ts = format_timestamp(provision_start.elapsed());
             println!("{} {}", ts.dimmed(), label);
         }
@@ -1057,6 +1074,17 @@ mod tests {
     use super::*;
 
     #[test]
+    fn plain_progress_suppresses_only_consecutive_identical_completions() {
+        let mut state = PlainProvisioningProgress::default();
+
+        assert!(state.should_print_completion(ProvisioningStep::RequestingSandbox, "allocated"));
+        assert!(!state.should_print_completion(ProvisioningStep::RequestingSandbox, "allocated"));
+        assert!(state.should_print_completion(ProvisioningStep::RequestingSandbox, "ready"));
+        assert!(state.should_print_completion(ProvisioningStep::PullingSandboxImage, "pulled"));
+        assert!(state.should_print_completion(ProvisioningStep::RequestingSandbox, "allocated"));
+    }
+
+    #[test]
     fn parse_duration_to_ms_parses_supported_units() {
         assert_eq!(parse_duration_to_ms("30s").expect("parse"), 30_000);
         assert_eq!(parse_duration_to_ms("5m").expect("parse"), 300_000);
@@ -1089,14 +1117,17 @@ mod tests {
         };
         let mut display = ProvisioningDisplay::new();
 
+        let mut plain_progress = PlainProvisioningProgress::default();
         assert!(handle_platform_progress_event(
             &event,
             Some(&mut display),
+            &mut plain_progress,
             Instant::now(),
         ));
         assert!(handle_platform_progress_event(
             &event,
             Some(&mut display),
+            &mut plain_progress,
             Instant::now(),
         ));
 
