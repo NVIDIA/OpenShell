@@ -969,11 +969,11 @@ impl PodmanComputeDriver {
             .await
             .map_err(ComputeDriverError::from)?;
 
-        // Libpod can acknowledge the stop request while the container still
-        // reports `stopping`, especially after escalating from SIGTERM to
-        // SIGKILL in rootless mode. Do not let a following start race that
-        // transition: its delayed die event would otherwise regress the new
-        // run from Starting to Error.
+        // Podman can return from the stop request before inspect reports the
+        // container as exited. If start runs during that interval, the exit
+        // event from the previous run can arrive after the gateway has moved
+        // the same sandbox to Starting, causing it to regress to Error. Wait
+        // for the terminal container state before allowing a restart.
         self.wait_for_container_stopped(sandbox_id, &container_id)
             .await
     }
