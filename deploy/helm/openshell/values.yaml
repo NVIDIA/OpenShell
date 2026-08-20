@@ -565,10 +565,11 @@ grpcRoute:
     enabled: false
     # -- Name of the ConfigMap containing the CA certificate (key: ca.crt) used
     # to validate the gateway pod's TLS certificate. Defaults to
-    # <fullname>-backend-ca when empty. When pkiInitJob is enabled (default),
-    # the certgen hook creates this ConfigMap automatically. With
-    # cert-manager, the ConfigMap is created on the first helm upgrade after
-    # cert-manager has issued the server certificate.
+    # <fullname>-backend-ca when empty. The certgen hook auto-creates this:
+    # with pkiInitJob (default), immediately on install/upgrade; with
+    # cert-manager, the hook waits for cert-manager to issue the server
+    # certificate first, so on first install the ConfigMap is created during
+    # the subsequent `helm upgrade` (run upgrade after cert-manager reconciles).
     caCertificateConfigMapName: ""
     # -- Hostname the Gateway proxy validates against the backend's TLS
     # certificate SAN. Defaults to the service FQDN
