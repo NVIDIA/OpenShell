@@ -18,6 +18,39 @@ Gateway CLI flag  >  gateway OPENSHELL_* env var  >  TOML file  >  built-in defa
 
 `database_url` is env-only. The loader rejects it when it appears in the file. When `OPENSHELL_DB_URL` is unset, the gateway stores its SQLite database under `$XDG_STATE_HOME/openshell/gateway/openshell.db`.
 
+## Update Configuration from the Command Line
+
+Use `openshell-gateway config set` with one or more TOML dotted `KEY=VALUE`
+assignments:
+
+```shell
+openshell-gateway config set \
+  'openshell.gateway.compute_drivers=["podman"]' \
+  'openshell.gateway.bind_address="0.0.0.0:17670"'
+```
+
+The command updates `$XDG_CONFIG_HOME/openshell/gateway.toml`, creating the
+file and parent directory when needed. Pass `--config <PATH>` or set
+`OPENSHELL_GATEWAY_CONFIG` to update another file. It preserves comments,
+validates the resulting gateway schema, and replaces the file atomically.
+Assignments use TOML syntax, including quotes around string values. They accept
+TOML strings, integers, booleans, arrays, and inline tables. Quoted TOML keys
+can address names that contain dots. Later assignments to the same key win.
+Array elements cannot be addressed individually; assign the complete array
+value instead.
+
+For the local Docker development gateway, pass assignments through the Mise
+task. The task applies them after generating its normal configuration:
+
+```shell
+mise run gateway:docker -- \
+  --set 'openshell.drivers.docker.network_name="openshell-dev"' \
+  --set 'openshell.drivers.docker.image_pull_policy="Never"'
+```
+
+Gateway CLI flags and `OPENSHELL_*` environment variables still take
+precedence over values written to the file.
+
 ## Package-Managed Locations
 
 Package-managed gateways do not require a TOML file. Create one at the package's optional config location when you need to override built-in defaults. Set `OPENSHELL_GATEWAY_CONFIG` in the launch environment to use a different file.

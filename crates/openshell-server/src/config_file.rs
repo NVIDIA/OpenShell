@@ -378,10 +378,14 @@ pub fn load(path: &Path) -> Result<ConfigFile, ConfigFileError> {
         path: path.to_path_buf(),
         source,
     })?;
+    parse(&contents, path)
+}
+
+pub(crate) fn parse(contents: &str, path: &Path) -> Result<ConfigFile, ConfigFileError> {
     if contents.trim().is_empty() {
         return Ok(ConfigFile::default());
     }
-    let file: ConfigFile = toml::from_str(&contents).map_err(|source| ConfigFileError::Parse {
+    let file: ConfigFile = toml::from_str(contents).map_err(|source| ConfigFileError::Parse {
         path: path.to_path_buf(),
         source,
     })?;
