@@ -1862,8 +1862,8 @@ fn spawn_draft_approve(app: &App, tx: mpsc::UnboundedSender<Event>) {
         None => return,
     };
     let abs = app.draft_scroll + app.draft_selected;
-    let chunk_id = match app.draft_chunks.get(abs) {
-        Some(c) => c.id.clone(),
+    let (chunk_id, review_token) = match app.draft_chunks.get(abs) {
+        Some(c) => (c.id.clone(), c.review_token.clone()),
         None => return,
     };
     let rule_name = app
@@ -1877,6 +1877,7 @@ fn spawn_draft_approve(app: &App, tx: mpsc::UnboundedSender<Event>) {
             name,
             chunk_id,
             workspace,
+            review_token,
         };
         match tokio::time::timeout(Duration::from_secs(5), client.approve_draft_chunk(req)).await {
             Ok(Ok(resp)) => {
@@ -1949,7 +1950,7 @@ fn spawn_draft_reject(app: &App, tx: mpsc::UnboundedSender<Event>) {
 /// modal count display but is not iterated for per-chunk approval.
 fn spawn_draft_approve_all(
     app: &App,
-    _snapshot: Vec<openshell_core::proto::PolicyChunk>,
+    snapshot: Vec<openshell_core::proto::PolicyChunk>,
     tx: mpsc::UnboundedSender<Event>,
 ) {
     let mut client = app.client.clone();
@@ -1960,10 +1961,18 @@ fn spawn_draft_approve_all(
     let workspace = app.selected_sandbox_workspace();
 
     tokio::spawn(async move {
+        let approvals = snapshot
+            .into_iter()
+            .map(|chunk| openshell_core::proto::DraftChunkApproval {
+                chunk_id: chunk.id,
+                review_token: chunk.review_token,
+            })
+            .collect();
         let req = openshell_core::proto::ApproveAllDraftChunksRequest {
             name,
             include_security_flagged: false,
             workspace,
+            approvals,
         };
         match tokio::time::timeout(
             Duration::from_secs(30),

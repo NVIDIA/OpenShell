@@ -471,7 +471,7 @@ Review agent-authored network rule proposals. This command group is intentionall
 - `openshell rule clear [name]`
 - `openshell rule history [name]`
 
-Sandbox names default to the last-used sandbox. Bulk approval of security-flagged proposals requires explicit `--include-security-flagged`.
+Sandbox names default to the last-used sandbox. The CLI fetches and submits each proposal's current review token; a changed live candidate remains pending until it is reviewed again. Bulk approval of security-flagged proposals requires explicit `--include-security-flagged`.
 
 ---
 

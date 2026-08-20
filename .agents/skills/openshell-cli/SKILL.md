@@ -493,7 +493,7 @@ Avoid `--yes` during interactive work. A global policy locks policy control for 
 
 ### Review agent-authored rule proposals
 
-Sandboxes created with `--approval-mode manual` place every proposal in the review inbox. `auto` approves only proposals with an empty prover delta; findings still require review.
+Sandboxes created with `--approval-mode manual` place every proposal in the review inbox. `auto` approves only valid effective-policy candidates with an empty prover delta; findings still require review. The CLI binds approval to the candidate's current review token. If live policy, provider, or credential inputs change, approval leaves the chunk pending with a refreshed candidate and requires a fresh review.
 
 ```bash
 openshell rule get dev --status pending
@@ -502,7 +502,7 @@ openshell rule reject dev --chunk-id <chunk-id> --reason "too broad"
 openshell rule history dev
 ```
 
-Review the proposed scope and prover findings before approval. Treat `rule approve-all --include-security-flagged` as a high-risk bulk action.
+Review the proposed scope, candidate hash, prover findings, and application errors before approval. Treat `rule approve-all --include-security-flagged` as a high-risk bulk action.
 
 ---
 

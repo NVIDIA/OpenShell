@@ -41,8 +41,8 @@ pub use l7_validate::{
     validate_l7_endpoint_semantics,
 };
 pub use merge::{
-    PolicyMergeError, PolicyMergeOp, PolicyMergeResult, PolicyMergeWarning, generated_rule_name,
-    merge_policy, policy_covers_rule,
+    PolicyMergeError, PolicyMergeOp, PolicyMergeResult, PolicyMergeWarning,
+    canonicalize_advisor_add_rule, generated_rule_name, merge_policy, policy_covers_rule,
 };
 pub use middleware::middleware_host_matches;
 pub use middleware::validate_json as validate_network_middleware_json;
@@ -1206,6 +1206,12 @@ pub enum PolicyViolation {
     },
     /// `credential_signing` and `request_body_credential_rewrite` are both set.
     CredentialSigningWithBodyRewrite { policy_name: String, host: String },
+    /// An endpoint contains a deterministic L7 semantic error.
+    InvalidL7Endpoint {
+        policy_name: String,
+        endpoint_index: usize,
+        reason: String,
+    },
     /// A middleware configuration is structurally invalid.
     InvalidMiddlewareConfig { name: String, reason: String },
     /// Too many middleware configurations are attached to one policy.
@@ -1340,6 +1346,14 @@ impl fmt::Display for PolicyViolation {
                      and request_body_credential_rewrite set; these options are mutually exclusive"
                 )
             }
+            Self::InvalidL7Endpoint {
+                policy_name,
+                endpoint_index,
+                reason,
+            } => write!(
+                f,
+                "network policy '{policy_name}': endpoint {endpoint_index} has invalid L7 configuration: {reason}"
+            ),
             Self::InvalidMiddlewareConfig { name, reason } => {
                 write!(f, "middleware config '{name}' is invalid: {reason}")
             }
@@ -1475,7 +1489,7 @@ pub fn validate_sandbox_policy(
         } else {
             rule.name.clone()
         };
-        for ep in &rule.endpoints {
+        for (endpoint_index, ep) in rule.endpoints.iter().enumerate() {
             let explicit_tcp = l7_validate::is_explicit_tcp_protocol(&ep.protocol);
             if ep.host.trim().is_empty() && explicit_tcp {
                 violations.push(PolicyViolation::MissingTcpEndpointHost {
@@ -1558,6 +1572,127 @@ pub fn validate_sandbox_policy(
                     host: ep.host.clone(),
                 });
             }
+
+            let rules_would_deny_all = !ep.rules.is_empty()
+                && ep.rules.iter().all(|rule| {
+                    rule.allow.as_ref().is_none_or(|allow| {
+                        allow.method.is_empty()
+                            && allow.path.is_empty()
+                            && allow.command.is_empty()
+                            && allow.operation_type.is_empty()
+                            && allow.operation_name.is_empty()
+                            && allow.fields.is_empty()
+                            && allow.params.is_empty()
+                    })
+                });
+            let fields = L7EndpointFields {
+                protocol: &ep.protocol,
+                access: &ep.access,
+                has_rules: !ep.rules.is_empty(),
+                has_deny_rules: !ep.deny_rules.is_empty(),
+                rules_would_deny_all,
+                allow_all_known_mcp_methods: ep
+                    .mcp
+                    .as_ref()
+                    .and_then(|mcp| mcp.allow_all_known_mcp_methods)
+                    .unwrap_or(false),
+            };
+            let mut l7_errors = validate_l7_endpoint_semantics(&fields);
+            let mut explicit_tcp_fields = Vec::new();
+            if !ep.enforcement.is_empty() {
+                explicit_tcp_fields.push("enforcement");
+            }
+            if !ep.path.is_empty() {
+                explicit_tcp_fields.push("path");
+            }
+            if ep.allow_encoded_slash {
+                explicit_tcp_fields.push("allow_encoded_slash");
+            }
+            if ep.websocket_credential_rewrite {
+                explicit_tcp_fields.push("websocket_credential_rewrite");
+            }
+            if ep.request_body_credential_rewrite {
+                explicit_tcp_fields.push("request_body_credential_rewrite");
+            }
+            if !ep.persisted_queries.is_empty() {
+                explicit_tcp_fields.push("persisted_queries");
+            }
+            if !ep.graphql_persisted_queries.is_empty() {
+                explicit_tcp_fields.push("graphql_persisted_queries");
+            }
+            if ep.graphql_max_body_bytes > 0 {
+                explicit_tcp_fields.push("graphql_max_body_bytes");
+            }
+            if ep.json_rpc_max_body_bytes > 0 {
+                explicit_tcp_fields.push("json_rpc_max_body_bytes");
+            }
+            if ep.mcp.is_some() {
+                explicit_tcp_fields.push("mcp");
+            }
+            l7_errors.extend(validate_explicit_tcp_additional_fields(
+                &ep.protocol,
+                &explicit_tcp_fields,
+            ));
+            if !ep.path.is_empty() && !ep.path.starts_with('/') && ep.path != "**" {
+                l7_errors.push("path must start with '/' or be '**'".to_string());
+            }
+            if !ep.persisted_queries.is_empty()
+                && !matches!(ep.persisted_queries.as_str(), "deny" | "allow_registered")
+            {
+                l7_errors.push(format!(
+                    "persisted_queries must be 'deny' or 'allow_registered', got '{}'",
+                    ep.persisted_queries
+                ));
+            }
+            if ep.protocol == "sql" && ep.enforcement == "enforce" {
+                l7_errors.push(
+                    "SQL enforcement requires full SQL parsing; use enforcement: audit".to_string(),
+                );
+            }
+            if ep.mcp.is_some() && ep.protocol != "mcp" {
+                l7_errors.push("mcp options are only valid for protocol mcp".to_string());
+            }
+            if ep.protocol == "graphql" {
+                for (rule_index, rule) in ep.rules.iter().enumerate() {
+                    let operation_type = rule
+                        .allow
+                        .as_ref()
+                        .map(|allow| allow.operation_type.as_str())
+                        .unwrap_or_default();
+                    if !matches!(operation_type, "query" | "mutation" | "subscription") {
+                        l7_errors.push(format!(
+                            "rules[{rule_index}].allow.operation_type must be query, mutation, or subscription"
+                        ));
+                    }
+                }
+                for (rule_index, rule) in ep.deny_rules.iter().enumerate() {
+                    if !matches!(
+                        rule.operation_type.as_str(),
+                        "query" | "mutation" | "subscription"
+                    ) {
+                        l7_errors.push(format!(
+                            "deny_rules[{rule_index}].operation_type must be query, mutation, or subscription"
+                        ));
+                    }
+                }
+                for (key, operation) in &ep.graphql_persisted_queries {
+                    if !matches!(
+                        operation.operation_type.as_str(),
+                        "query" | "mutation" | "subscription"
+                    ) {
+                        l7_errors.push(format!(
+                            "graphql_persisted_queries[{key}].operation_type must be query, mutation, or subscription"
+                        ));
+                    }
+                }
+            }
+            violations.extend(l7_errors.into_iter().map(|reason| {
+                PolicyViolation::InvalidL7Endpoint {
+                    policy_name: name.clone(),
+                    endpoint_index,
+                    reason,
+                }
+            }));
         }
     }
 

@@ -6878,8 +6878,23 @@ pub async fn sandbox_draft_get(
         if !chunk.validation_result.is_empty() {
             println!(
                 "  {} {}",
-                "Validation:".dimmed(),
+                "Prover:".dimmed(),
                 chunk.validation_result.cyan()
+            );
+        }
+        if !chunk.application_error.is_empty() {
+            println!(
+                "  {} {}",
+                "Application:".dimmed(),
+                chunk.application_error.red()
+            );
+        }
+        if !chunk.candidate_effective_policy_hash.is_empty() {
+            println!(
+                "  {} {}",
+                "Candidate:".dimmed(),
+                &chunk.candidate_effective_policy_hash
+                    [..12.min(chunk.candidate_effective_policy_hash.len())]
             );
         }
 
@@ -6915,12 +6930,27 @@ pub async fn sandbox_draft_approve(
     tls: &TlsOptions,
 ) -> Result<()> {
     let mut client = grpc_client(server, tls).await?;
+    let review_token = client
+        .get_draft_policy(GetDraftPolicyRequest {
+            name: name.to_string(),
+            status_filter: String::new(),
+            workspace: workspace.to_string(),
+        })
+        .await
+        .into_diagnostic()?
+        .into_inner()
+        .chunks
+        .into_iter()
+        .find(|chunk| chunk.id == chunk_id)
+        .ok_or_else(|| miette::miette!("draft chunk '{chunk_id}' not found"))?
+        .review_token;
 
     let response = client
         .approve_draft_chunk(ApproveDraftChunkRequest {
             name: name.to_string(),
             chunk_id: chunk_id.to_string(),
             workspace: workspace.to_string(),
+            review_token,
         })
         .await
         .into_diagnostic()?;
@@ -6971,12 +7001,29 @@ pub async fn sandbox_draft_approve_all(
     tls: &TlsOptions,
 ) -> Result<()> {
     let mut client = grpc_client(server, tls).await?;
+    let approvals = client
+        .get_draft_policy(GetDraftPolicyRequest {
+            name: name.to_string(),
+            status_filter: "pending".to_string(),
+            workspace: workspace.to_string(),
+        })
+        .await
+        .into_diagnostic()?
+        .into_inner()
+        .chunks
+        .into_iter()
+        .map(|chunk| openshell_core::proto::DraftChunkApproval {
+            chunk_id: chunk.id,
+            review_token: chunk.review_token,
+        })
+        .collect();
 
     let response = client
         .approve_all_draft_chunks(ApproveAllDraftChunksRequest {
             name: name.to_string(),
             include_security_flagged,
             workspace: workspace.to_string(),
+            approvals,
         })
         .await
         .into_diagnostic()?;
