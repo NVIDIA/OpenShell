@@ -87,11 +87,11 @@ openshell gateway add http://127.0.0.1:8080 --local --name openshift
 openshell status
 ```
 
-## Production Deployments
+## Options for end-to-end TLS
 
-The steps above run the gateway over plaintext HTTP for quick evaluation. For production deployments, choose one of the approaches below based on your OpenShift version.
+The steps above run the gateway over plaintext HTTP for quick evaluation. For production deployments, choose one of the approaches below based on your OpenShift version and preferences.
 
-### End-to-end TLS (OpenShift 4.22+)
+### End-to-end TLS using Gateway API and BackendTLSPolicy (OpenShift 4.22+)
 
 OpenShift 4.22 and later support `BackendTLSPolicy` in the Gateway API, enabling end-to-end TLS between the OpenShift router and the OpenShell gateway pod. The traffic flow is:
 
@@ -124,7 +124,7 @@ EOF
 
 #### Create the Gateway
 
-Create a Gateway resource in the `openshift-ingress` namespace. Replace `<external-hostname>` with your cluster's route hostname:
+Create a Gateway resource in the `openshift-ingress` namespace. Replace `<external-hostname>` with your cluster's route hostname (typically a wildcard like `*.openshell-ingress-gw.example.com`):
 
 ```shell
 oc apply -f - <<'EOF'
@@ -154,7 +154,7 @@ spec:
 EOF
 ```
 
-The listener TLS Secret should contain the certificate for the external hostname. On ROSA and managed OpenShift clusters, you can copy the cluster's wildcard certificate from the `openshift-ingress` namespace.
+The listener TLS Secret should contain the certificate for the external hostname.
 
 #### Install with e2e TLS
 
@@ -199,7 +199,7 @@ openshell gateway add https://<external-hostname> --name openshift
 openshell status
 ```
 
-### Route with TLS Passthrough (All OpenShift Versions)
+### End-to-end TLS using pass-through Route (all OpenShift versions)
 
 For OpenShift versions prior to 4.22, or when you prefer Route-based ingress, cert-manager can issue the gateway's server certificate from a real Issuer or ClusterIssuer (for example, a LetsEncrypt/ACME issuer), and an OpenShift Route with TLS passthrough exposes it externally while the gateway keeps terminating its own TLS and mTLS.
 
