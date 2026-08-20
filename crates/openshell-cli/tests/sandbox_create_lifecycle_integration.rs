@@ -1606,7 +1606,7 @@ async fn sandbox_template_create_sends_workload_template_resource() {
         Some("registry.example.com/agent:latest"),
         Some("2"),
         Some("4Gi"),
-        Some(1),
+        Some(GpuResourceRequirements { count: Some(1) }),
         Some(r#"{"kubernetes":{"pod":{"node_selector":{"pool":"gpu"}}}}"#),
         Some("5m"),
         Some(3),
@@ -1647,7 +1647,7 @@ async fn sandbox_template_create_sends_workload_template_resource() {
         .expect("resources should be sent");
     assert_eq!(resources.cpu, "2");
     assert_eq!(resources.memory, "4Gi");
-    assert_eq!(resources.gpu_count, Some(1));
+    assert_eq!(resources.gpu.as_ref().and_then(|gpu| gpu.count), Some(1));
     assert!(spec.driver_config.is_some());
     let startup = spec
         .desired_service_level

@@ -1828,7 +1828,7 @@ def test_sandbox_template_create_builds_template_from_public_fields() -> None:
     assert dict(template.spec.workload.environment) == {"FEATURE_FLAG": "on"}
     assert template.spec.workload.resources.cpu == "1"
     assert template.spec.workload.resources.memory == "512Mi"
-    assert template.spec.workload.resources.gpu_count == 2
+    assert template.spec.workload.resources.gpu.count == 2
     assert template.spec.driver_config["kubernetes"]["runtime_class_name"] == "kata"
 
 

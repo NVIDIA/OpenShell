@@ -26,7 +26,10 @@ type SandboxSpec struct {
 	Environment map[string]string
 	Template    *SandboxTemplate
 	Providers   []string
-	GPUCount    *uint32
+	// GPU requests GPU resources using the active driver's default GPU assignment
+	// when GPUCount is nil. GPUCount implies GPU for backward compatibility.
+	GPU      bool
+	GPUCount *uint32
 	// Policy is the security policy for the sandbox. Nil means no policy specified.
 	Policy  *SandboxPolicy
 	Command []string
@@ -75,9 +78,16 @@ type SandboxWorkloadConfig struct {
 
 // SandboxResources defines portable sandbox resource requirements.
 type SandboxResources struct {
-	CPU      string
-	Memory   string
-	GPUCount *uint32
+	CPU    string
+	Memory string
+	// GPU requests GPU resources for template-backed sandboxes. A non-nil GPU
+	// with nil Count requests the active driver's default GPU assignment.
+	GPU *SandboxGPURequirements
+}
+
+// SandboxGPURequirements defines template GPU requirements.
+type SandboxGPURequirements struct {
+	Count *uint32
 }
 
 // SandboxServiceLevel describes desired operational characteristics.

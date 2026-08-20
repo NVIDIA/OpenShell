@@ -125,9 +125,9 @@ func TestSandboxTemplate_CreateSandboxFromTemplateResolvesWorkloadAndGovernance(
 				Image:       "registry.example.com/agent:latest",
 				Environment: map[string]string{"FEATURE_FLAG": "on"},
 				Resources: &types.SandboxResources{
-					CPU:      "2",
-					Memory:   "4Gi",
-					GPUCount: &gpuCount,
+					CPU:    "2",
+					Memory: "4Gi",
+					GPU:    &types.SandboxGPURequirements{Count: &gpuCount},
 				},
 			},
 			DriverConfig: map[string]any{
@@ -156,6 +156,7 @@ func TestSandboxTemplate_CreateSandboxFromTemplateResolvesWorkloadAndGovernance(
 	assert.Equal(t, "registry.example.com/agent:latest", created.Spec.Template.Image)
 	assert.Equal(t, map[string]any{"limits": map[string]any{"cpu": "2", "memory": "4Gi"}}, created.Spec.Template.Resources)
 	assert.Equal(t, "kata-containers", created.Spec.Template.DriverConfig["kubernetes"].(map[string]any)["runtime_class_name"])
+	assert.True(t, created.Spec.GPU)
 	require.NotNil(t, created.Spec.GPUCount)
 	assert.Equal(t, uint32(1), *created.Spec.GPUCount)
 	assert.Equal(t, []string{"github"}, created.Spec.Providers)
@@ -190,6 +191,9 @@ func TestSandboxTemplate_CreateSandboxFromTemplateRejectsWorkloadOverrides(t *te
 		"gpu_count": {
 			GPUCount: &gpuCount,
 		},
+		"gpu": {
+			GPU: true,
+		},
 	}
 
 	for name, spec := range tests {
@@ -204,6 +208,62 @@ func TestSandboxTemplate_CreateSandboxFromTemplateRejectsWorkloadOverrides(t *te
 	listed, err := client.Sandboxes().List(ctx, "default")
 	require.NoError(t, err)
 	assert.Empty(t, listed)
+}
+
+func TestSandboxTemplate_DefaultGpuRequestRoundTripsTemplate(t *testing.T) {
+	tc := newTestSandboxTemplateClient()
+	ctx := context.Background()
+
+	created, err := tc.Create(ctx, "default", &types.SandboxWorkloadTemplate{
+		Name: "default-gpu",
+		Spec: types.SandboxWorkloadTemplateSpec{
+			Workload: &types.SandboxWorkloadConfig{
+				Resources: &types.SandboxResources{
+					GPU: &types.SandboxGPURequirements{},
+				},
+			},
+		},
+	})
+
+	require.NoError(t, err)
+	require.NotNil(t, created.Spec.Workload.Resources.GPU)
+	assert.Nil(t, created.Spec.Workload.Resources.GPU.Count)
+
+	got, err := tc.Get(ctx, "default", "default-gpu")
+	require.NoError(t, err)
+	require.NotNil(t, got.Spec.Workload.Resources.GPU)
+	assert.Nil(t, got.Spec.Workload.Resources.GPU.Count)
+}
+
+func TestSandboxTemplate_CreateSandboxFromTemplatePreservesDefaultGPURequest(t *testing.T) {
+	client := NewClient()
+	ctx := context.Background()
+
+	client.AddSandboxTemplate("default", &types.SandboxWorkloadTemplate{
+		Name:            "default-gpu",
+		ResourceVersion: 3,
+		Spec: types.SandboxWorkloadTemplateSpec{
+			Workload: &types.SandboxWorkloadConfig{
+				Image: "registry.example.com/agent:latest",
+				Resources: &types.SandboxResources{
+					GPU: &types.SandboxGPURequirements{},
+				},
+			},
+		},
+	})
+
+	created, err := client.CreateSandboxFromTemplate(
+		ctx,
+		"default",
+		"job-default-gpu",
+		"default-gpu",
+		nil,
+		nil,
+	)
+
+	require.NoError(t, err)
+	assert.True(t, created.Spec.GPU)
+	assert.Nil(t, created.Spec.GPUCount)
 }
 
 func TestSandboxTemplate_DeepCopy(t *testing.T) {
@@ -289,7 +349,7 @@ func TestSandboxTemplate_CreateRejectsInvalidTemplate(t *testing.T) {
 				Workload: &types.SandboxWorkloadConfig{
 					Image: "registry.example.com/agent:latest",
 					Resources: &types.SandboxResources{
-						GPUCount: &zeroGPUCount,
+						GPU: &types.SandboxGPURequirements{Count: &zeroGPUCount},
 					},
 				},
 			},

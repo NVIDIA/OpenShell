@@ -1734,9 +1734,12 @@ enum SandboxTemplateCommands {
         #[arg(long)]
         memory: Option<String>,
 
-        /// Number of GPUs requested by this template.
-        #[arg(long, value_name = "COUNT", value_parser = clap::value_parser!(u32).range(1..))]
-        gpu: Option<u32>,
+        /// Request GPU resources for sandboxes created from this template.
+        ///
+        /// Omit COUNT for the driver's default GPU selection, or pass COUNT
+        /// to request a specific number of GPUs.
+        #[arg(long, num_args = 0..=1, value_name = "COUNT", default_missing_value = "", value_parser = parse_gpu_request)]
+        gpu: Option<GpuCliRequest>,
 
         /// Experimental driver-keyed JSON object for driver-specific sandbox settings.
         #[arg(long, value_name = "JSON")]
@@ -3419,13 +3422,15 @@ async fn run_async() -> Result<()> {
                                 let annotations =
                                     run::parse_key_value_pairs(&annotations, "--annotation")?;
                                 let environment = run::parse_env_pairs(&envs)?;
+                                let gpu_requirements: Option<GpuResourceRequirements> =
+                                    gpu.map(Into::into);
                                 run::sandbox_template_create(
                                     endpoint,
                                     &name,
                                     image.as_deref(),
                                     cpu.as_deref(),
                                     memory.as_deref(),
-                                    gpu,
+                                    gpu_requirements,
                                     driver_config_json.as_deref(),
                                     ready_within.as_deref(),
                                     max_burst,
@@ -5619,7 +5624,7 @@ mod tests {
                 assert_eq!(image.as_deref(), Some("registry.example.com/agent:latest"));
                 assert_eq!(cpu.as_deref(), Some("2"));
                 assert_eq!(memory.as_deref(), Some("4Gi"));
-                assert_eq!(gpu, Some(1));
+                assert_eq!(gpu, Some(GpuCliRequest::Count(1)));
                 assert_eq!(driver_config_json.as_deref(), Some(json));
                 assert_eq!(ready_within.as_deref(), Some("5m"));
                 assert_eq!(max_burst, Some(3));
@@ -5695,6 +5700,30 @@ mod tests {
                 ..
             }) => {
                 assert_eq!(image, None);
+            }
+            other => panic!("expected SandboxTemplateCommands::Create, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sandbox_template_create_gpu_parses_driver_default() {
+        let cli = Cli::try_parse_from([
+            "openshell",
+            "sandbox",
+            "template",
+            "create",
+            "gpu-kata",
+            "--gpu",
+        ])
+        .expect("sandbox template create --gpu should parse");
+
+        match cli.command {
+            Some(Commands::Sandbox {
+                command:
+                    Some(SandboxCommands::Template(SandboxTemplateCommands::Create { gpu, .. })),
+                ..
+            }) => {
+                assert_eq!(gpu, Some(GpuCliRequest::DriverDefault));
             }
             other => panic!("expected SandboxTemplateCommands::Create, got: {other:?}"),
         }

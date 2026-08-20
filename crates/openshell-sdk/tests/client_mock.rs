@@ -123,7 +123,7 @@ fn workload_template_proto(name: &str, workspace: &str) -> proto::SandboxWorkloa
                 resources: Some(proto::SandboxResources {
                     cpu: "1".to_string(),
                     memory: "512Mi".to_string(),
-                    gpu_count: None,
+                    ..proto::SandboxResources::default()
                 }),
             }),
             driver_config: None,
