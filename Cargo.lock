@@ -1193,11 +1193,10 @@ dependencies = [
 
 [[package]]
 name = "container-device-interface"
-version = "1.1.1"
-source = "git+https://github.com/cncf-tags/container-device-interface-rs?rev=06644c1b167c8dcc247816590901e0a819636b01#06644c1b167c8dcc247816590901e0a819636b01"
+version = "1.2.0"
+source = "git+https://github.com/cncf-tags/container-device-interface-rs?rev=b8a056e92dbd159423c129cd306c93e410651b18#b8a056e92dbd159423c129cd306c93e410651b18"
 dependencies = [
  "anyhow",
- "clap",
  "const_format",
  "jsonschema",
  "lazy_static",
@@ -2260,9 +2259,11 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "899def5c37c4fd7b2664648c28120ecec138e4d395b459e5ca34f9cce2dd77fd"
 dependencies = [
  "cfg-if",
+ "js-sys",
  "libc",
  "r-efi 5.3.0",
  "wasip2",
+ "wasm-bindgen",
 ]
 
 [[package]]
@@ -3215,8 +3216,6 @@ dependencies = [
  "percent-encoding",
  "referencing",
  "regex",
- "reqwest 0.13.2",
- "rustls 0.23.38",
  "serde",
  "serde_json",
  "unicode-general-category",
@@ -5708,7 +5707,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.60.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -6024,10 +6023,8 @@ checksum = "ab3f43e3283ab1488b624b44b0e988d0acea0b3214e694730a055cb6b2efa801"
 dependencies = [
  "base64",
  "bytes",
- "futures-channel",
  "futures-core",
  "futures-util",
- "h2 0.4.13",
  "http 1.4.0",
  "http-body 1.0.1",
  "http-body-util",

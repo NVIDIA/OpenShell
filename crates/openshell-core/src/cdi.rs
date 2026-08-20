@@ -82,8 +82,6 @@ pub enum CdiError {
         device: String,
         refresh_error: String,
     },
-    #[error("selected CDI device '{0}' is defined by multiple mounted CDI specs")]
-    DuplicateDevice(String),
     #[error("failed to merge CDI edits for '{device}': {error}")]
     EditMerge { device: String, error: String },
     #[error("failed to encode resolved CDI edits: {source}")]
