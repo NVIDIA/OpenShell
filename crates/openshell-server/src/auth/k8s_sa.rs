@@ -26,6 +26,7 @@ use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use kube::Error as KubeError;
 use kube::api::{Api, ApiResource, PostParams};
 use kube::core::{DynamicObject, gvk::GroupVersionKind};
+#[cfg(not(target_os = "windows"))]
 use openshell_driver_kubernetes::OperatorNamespaceAllowlist;
 use std::sync::Arc;
 use tonic::Status;
@@ -146,6 +147,7 @@ pub enum NamespaceValidator {
     /// (`openshell-{gateway_id}-`).
     Prefix(String),
     /// Operator mode: accept namespaces in the dynamic allowlist.
+    #[cfg(not(target_os = "windows"))]
     Allowlist(OperatorNamespaceAllowlist),
 }
 
@@ -154,6 +156,7 @@ impl NamespaceValidator {
         match self {
             Self::Exact(expected) => namespace == expected,
             Self::Prefix(prefix) => namespace.starts_with(prefix.as_str()),
+            #[cfg(not(target_os = "windows"))]
             Self::Allowlist(al) => al.contains(namespace),
         }
     }
@@ -840,6 +843,7 @@ mod tests {
         assert!(!v.accepts("other"));
     }
 
+    #[cfg(not(target_os = "windows"))]
     #[test]
     fn namespace_validator_allowlist_accepts_known_namespaces() {
         let al = OperatorNamespaceAllowlist::from_set(std::collections::BTreeSet::from([

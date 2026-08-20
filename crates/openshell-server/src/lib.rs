@@ -504,6 +504,9 @@ pub(crate) async fn run_server(
         (None, None)
     };
 
+    // Preserve the structured config-file error until this boundary so the
+    // diagnostic retains its path and TOML source details.
+    #[allow(clippy::result_large_err)]
     let middleware_registrations = config_file
         .as_ref()
         .map(|file| {
@@ -598,6 +601,8 @@ pub(crate) async fn run_server(
         shutdown_rx.clone(),
     )
     .await?;
+    #[cfg(target_os = "windows")]
+    let _ = &operator_allowlist;
     let gateway_interceptors = if let Some(issuer) = sandbox_jwt_issuer.as_ref() {
         let mut slots = BTreeMap::new();
         for interceptor in &config.gateway_interceptors {
@@ -1076,7 +1081,10 @@ fn unsupported_builtin_compute_driver(driver: ComputeDriverKind) -> compute::Com
     ))
 }
 
+#[cfg(not(target_os = "windows"))]
 type OperatorAllowlistArc = Option<openshell_driver_kubernetes::OperatorNamespaceAllowlist>;
+#[cfg(target_os = "windows")]
+type OperatorAllowlistArc = Option<()>;
 pub use compute::{DriverWatchStream, SharedComputeDriver};
 
 /// Opaque result returned by a compiled compute-driver factory.
@@ -1290,18 +1298,26 @@ pub fn install_default_compute_drivers() -> ComputeDriverRegistry {
             .expect("unique vm registration");
     }
     #[cfg(target_os = "windows")]
-    for name in ["kubernetes", "podman", "docker", "vm"] {
+    {
         registry
             .install(
-                ComputeDriverRegistration::new(
-                    name,
-                    u16::MAX,
-                    None,
-                    UnsupportedComputeDriverFactory,
-                )
-                .expect("valid unsupported registration"),
+                ComputeDriverRegistration::new("mxc", u16::MAX, None, MxcComputeDriverFactory)
+                    .expect("valid mxc registration"),
             )
-            .expect("unique unsupported registration");
+            .expect("unique mxc registration");
+        for name in ["kubernetes", "podman", "docker", "vm"] {
+            registry
+                .install(
+                    ComputeDriverRegistration::new(
+                        name,
+                        u16::MAX,
+                        None,
+                        UnsupportedComputeDriverFactory,
+                    )
+                    .expect("valid unsupported registration"),
+                )
+                .expect("unique unsupported registration");
+        }
     }
     registry
 }
@@ -1374,6 +1390,35 @@ impl ComputeDriverBuildContext<'_> {
             self.sandbox_watch_bus,
             self.tracing_log_bus,
             self.supervisor_sessions,
+        )
+        .await
+        .map_err(|error| Error::execution(format!("failed to create compute runtime: {error}")))?;
+        Ok(ComputeDriverBuildOutput {
+            runtime,
+            operator_allowlist: None,
+        })
+    }
+}
+
+#[cfg(target_os = "windows")]
+#[derive(Clone, Copy)]
+struct MxcComputeDriverFactory;
+
+#[cfg(target_os = "windows")]
+#[async_trait::async_trait]
+impl ComputeDriverFactory for MxcComputeDriverFactory {
+    async fn build(
+        &self,
+        context: ComputeDriverBuildContext<'_>,
+    ) -> Result<ComputeDriverBuildOutput> {
+        let mxc_config = compute::driver_config::mxc_config_from_context(context.driver_startup)?;
+        let runtime = ComputeRuntime::new_mxc(
+            mxc_config,
+            context.store,
+            context.sandbox_index,
+            context.sandbox_watch_bus,
+            context.tracing_log_bus,
+            context.supervisor_sessions,
         )
         .await
         .map_err(|error| Error::execution(format!("failed to create compute runtime: {error}")))?;
@@ -1649,6 +1694,7 @@ fn resolve_configured_compute_driver(
     Ok(ConfiguredComputeDriver::Remote { name })
 }
 
+#[cfg(not(target_os = "windows"))]
 fn kubernetes_sandbox_jwt_expiry_disabled(config: &Config) -> bool {
     config
         .gateway_jwt
@@ -1656,6 +1702,7 @@ fn kubernetes_sandbox_jwt_expiry_disabled(config: &Config) -> bool {
         .is_some_and(|jwt| jwt.ttl_secs == 0)
 }
 
+#[cfg(not(target_os = "windows"))]
 fn warn_if_kubernetes_sandbox_jwt_expiry_disabled(config: &Config) {
     if kubernetes_sandbox_jwt_expiry_disabled(config) {
         warn!(
@@ -1729,8 +1776,7 @@ mod tests {
         BoundGatewayListener, ConfiguredComputeDriver, ConnectionProtocol, ExtensionKind,
         GatewayListenerScope, MultiplexService, ServerState, TlsAcceptor,
         allow_plaintext_service_http, bind_gateway_listeners, classify_initial_bytes,
-        is_benign_tls_handshake_failure, kubernetes_sandbox_jwt_expiry_disabled,
-        mint_gateway_extension_credential, serve_gateway_listener,
+        is_benign_tls_handshake_failure, mint_gateway_extension_credential, serve_gateway_listener,
     };
     use openshell_core::{
         ComputeDriverKind, Config,
@@ -2364,6 +2410,22 @@ mod tests {
         ));
     }
 
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn configured_compute_driver_accepts_mxc() {
+        let config = Config::new(None).with_compute_drivers([ComputeDriverKind::Mxc]);
+        let driver = select_compute_driver(
+            &test_compute_drivers(),
+            &config,
+            test_driver_startup(&config, None),
+        )
+        .unwrap();
+        assert!(matches!(
+            driver,
+            ConfiguredComputeDriver::Registered(registration) if registration.name == "mxc"
+        ));
+    }
+
     #[test]
     fn configured_compute_driver_resolves_named_remote() {
         let config = Config::new(None).with_compute_drivers(["kyma"]);
@@ -2424,6 +2486,7 @@ mod tests {
         ));
     }
 
+    #[cfg(not(target_os = "windows"))]
     #[test]
     fn kubernetes_sandbox_jwt_expiry_disabled_warns_for_zero_ttl() {
         fn config_with_jwt_ttl(ttl_secs: u64) -> Config {

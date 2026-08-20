@@ -12,7 +12,11 @@ pub mod builtin;
 
 use crate::config_file;
 use crate::defaults::LocalTlsPaths;
+#[cfg(target_os = "windows")]
+use openshell_core::ComputeDriverKind;
 use openshell_core::{Error, Result};
+#[cfg(target_os = "windows")]
+use openshell_driver_mxc::MxcComputeConfig;
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -47,6 +51,15 @@ pub struct DriverStartupContext<'a> {
     pub gateway_port: u16,
     pub gateway_tls_enabled: bool,
     pub endpoint_overrides: &'a BTreeMap<String, PathBuf>,
+}
+
+/// Build the selected MXC config from TOML. MXC is Windows-only and has no
+/// runtime-default overlay; the driver reads its own settings from the config.
+/// The Linux built-in driver configs now live in the `builtin` submodule
+/// (compiled only off Windows).
+#[cfg(target_os = "windows")]
+pub fn mxc_config_from_context(context: DriverStartupContext<'_>) -> Result<MxcComputeConfig> {
+    driver_config_from_context(context, ComputeDriverKind::Mxc.as_str())
 }
 
 pub fn remote_driver_config_from_context(

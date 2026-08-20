@@ -51,13 +51,22 @@ pub fn install(
     enable_podman_export: bool,
 ) -> (TracingHandle, Option<SetupError>) {
     let (tracer_provider, setup_error) = crate::otel_tracing::provider_for(otlp_config);
-    let podman_endpoint = enable_podman_export
-        .then_some(otlp_config)
-        .flatten()
-        .map(|config| config.endpoint.as_str());
-    let (podman_tracer_provider, podman_setup_error) =
-        openshell_driver_podman::otel_tracing::provider_for(podman_endpoint);
 
+    #[cfg(not(target_os = "windows"))]
+    let (podman_tracer_provider, podman_setup_error) = {
+        let podman_endpoint = enable_podman_export
+            .then_some(otlp_config)
+            .flatten()
+            .map(|config| config.endpoint.as_str());
+        openshell_driver_podman::otel_tracing::provider_for(podman_endpoint)
+    };
+    #[cfg(target_os = "windows")]
+    let (podman_tracer_provider, podman_setup_error) = {
+        let _ = enable_podman_export;
+        (None::<SdkTracerProvider>, None::<SetupError>)
+    };
+
+    #[cfg(not(target_os = "windows"))]
     tracing_subscriber::registry()
         .with(env_filter)
         .with(tracing_subscriber::fmt::layer())
@@ -68,6 +77,14 @@ pub fn install(
                 .as_ref()
                 .map(openshell_driver_podman::otel_tracing::in_process_layer),
         )
+        .init();
+
+    #[cfg(target_os = "windows")]
+    tracing_subscriber::registry()
+        .with(env_filter)
+        .with(tracing_subscriber::fmt::layer())
+        .with(tracing_log_bus.layer())
+        .with(tracer_provider.as_ref().map(crate::otel_tracing::layer))
         .init();
 
     (

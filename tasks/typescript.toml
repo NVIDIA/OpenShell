@@ -24,7 +24,7 @@ run = "npm run gen"
 ["proto:lint"]
 description = "Lint proto/ with buf (repo-level buf.yaml)"
 depends = ["sdk:ts:install"]
-run = "./sdk/typescript/node_modules/.bin/buf lint"
+run = "npm --prefix sdk/typescript exec -- buf lint"
 
 ["sdk:ts:typecheck"]
 description = "Type-check the TypeScript SDK"

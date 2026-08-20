@@ -281,6 +281,8 @@ impl TryFrom<&MiddlewareServiceFileConfig> for SupervisorMiddlewareService {
     }
 }
 
+// Keep ConfigFileError structured so callers retain the offending path and TOML source.
+#[allow(clippy::result_large_err)]
 fn sanitize_ca_cert_pem(name: &str, path: &Path, pem: &[u8]) -> Result<Vec<u8>, ConfigFileError> {
     let mut sanitized = Vec::new();
     let mut certificate_count = 0;
@@ -483,7 +485,9 @@ fn inheritable_keys(driver_name: &str) -> &'static [&'static str] {
             "guest_tls_cert",
             "guest_tls_key",
         ],
-        None => &[],
+        // MXC reads its own settings from the driver config table and has no
+        // gateway-inherited required fields.
+        Some(ComputeDriverKind::Mxc) | None => &[],
     }
 }
 
@@ -708,16 +712,17 @@ allow_unauthenticated_users = true
             .expect("CA tempfile");
         ca.write_all(certificate.cert.pem().as_bytes())
             .expect("write CA");
+        let ca_path = toml::Value::String(ca.path().display().to_string()).to_string();
         let toml = r#"
 [[openshell.supervisor.middleware]]
 name = "local-guard"
 grpc_endpoint = "https://127.0.0.1:50051"
-tls_ca_cert_path = "CA_PATH"
+tls_ca_cert_path = CA_PATH
 audience = "urn:openshell:middleware:local-guard"
 max_payload_bytes = 262144
 timeout = "2s"
 "#
-        .replace("CA_PATH", &ca.path().display().to_string());
+        .replace("CA_PATH", &ca_path);
         let tmp = write_tmp(&toml);
         let file = load(tmp.path()).expect("valid middleware registration parses");
         assert_eq!(
@@ -736,10 +741,8 @@ timeout = "2s"
             SupervisorMiddlewareService::try_from(&file.openshell.supervisor.middleware[0])
                 .expect("valid CA resolves");
         assert_eq!(registration.timeout, "2s");
-        assert_eq!(
-            registration.tls_ca_cert_pem,
-            certificate.cert.pem().as_bytes()
-        );
+        let expected_pem = certificate.cert.pem().replace("\r\n", "\n");
+        assert_eq!(registration.tls_ca_cert_pem, expected_pem.as_bytes());
         assert_eq!(
             registration.audience,
             "urn:openshell:middleware:local-guard"
