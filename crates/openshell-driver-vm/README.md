@@ -207,6 +207,10 @@ marked sandboxes without launching compute. Start removes the marker and uses
 the normal persisted restore path with the existing overlay. Delete removes the
 entire sandbox state directory, including a stop marker and overlay.
 
+The driver records a terminal tombstone when the canonical main process exits.
+Driver startup reports that sandbox as terminal instead of relaunching the VM,
+even when the process exited successfully.
+
 ## Logs and debugging
 
 Raise log verbosity for both processes:

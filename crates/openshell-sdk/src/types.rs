@@ -109,6 +109,10 @@ pub struct SandboxSpec {
     /// Request a GPU. Driver-specific device selection is configured via
     /// driver config on the raw proto surface (see [`crate::raw`]).
     pub gpu: bool,
+    /// Exact canonical command. Empty selects the gateway's scratch login shell.
+    pub command: Vec<String>,
+    /// Allocate a retained pseudo-terminal for the canonical command.
+    pub tty: bool,
 }
 
 /// Reference to a sandbox owned by the gateway.
@@ -121,11 +125,13 @@ pub struct SandboxRef {
     pub phase: SandboxPhase,
     pub labels: HashMap<String, String>,
     pub resource_version: u64,
+    pub exit_code: Option<i32>,
 }
 
 impl SandboxRef {
     pub(crate) fn from_proto(sandbox: proto::Sandbox) -> Self {
         let phase = sandbox.phase().into();
+        let exit_code = sandbox.status.as_ref().and_then(|status| status.exit_code);
         let meta = sandbox.metadata.unwrap_or_default();
         Self {
             id: meta.id,
@@ -134,6 +140,7 @@ impl SandboxRef {
             phase,
             labels: meta.labels,
             resource_version: meta.resource_version,
+            exit_code,
         }
     }
 }

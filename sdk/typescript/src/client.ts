@@ -82,6 +82,10 @@ export interface SandboxSpec {
   environment?: Record<string, string>;
   providers?: string[];
   gpu?: boolean;
+  /** Exact canonical command. Empty selects the gateway scratch shell. */
+  command?: string[];
+  /** Allocate a retained pseudo-terminal for the canonical command. */
+  tty?: boolean;
   /**
    * Create-time sandbox policy (the safety boundary). Sandbox-scoped
    * `setPolicy` cannot introduce static fields later, so express filesystem,
@@ -105,6 +109,8 @@ export interface SandboxRef {
   labels: Record<string, string>;
   /** u64 rendered as a string — JS numbers can't hold it safely. */
   resourceVersion: string;
+  mainProcessInstanceId?: string;
+  exitCode?: number;
 }
 
 export interface ListOptions {
@@ -330,6 +336,8 @@ function sandboxRef(sandbox: Sandbox | undefined): SandboxRef {
     phase: phaseName(sandbox.status?.phase ?? SandboxPhase.UNSPECIFIED),
     labels: meta?.labels ?? {},
     resourceVersion: (meta?.resourceVersion ?? 0n).toString(),
+    mainProcessInstanceId: sandbox.status?.mainProcessInstanceId || undefined,
+    exitCode: sandbox.status?.exitCode,
   };
 }
 
@@ -561,6 +569,8 @@ export class SandboxClient {
         template: spec.image ? { image: spec.image } : undefined,
         resourceRequirements: spec.gpu ? { gpu: {} } : undefined,
         policy: spec.policy,
+        command: spec.command ?? [],
+        tty: spec.tty ?? false,
       };
       if (spec.rawSpec) Object.assign(specInit, spec.rawSpec);
 

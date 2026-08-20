@@ -4,11 +4,12 @@
 //! Embedded SSH server for sandbox access.
 
 use crate::child_env;
+use crate::main_session::{MainOutput, MainSession};
 #[cfg(target_os = "linux")]
 use crate::managed_children;
 use crate::process::{
     ProcessEnforcementMode, ResolvedProcessIdentity, ResolvedWorkspace,
-    drop_privileges_with_identity, is_supervisor_only_env_var,
+    drop_privileges_with_identity, is_supervisor_only_env_var, session_user_and_home,
 };
 use crate::sandbox;
 use miette::{IntoDiagnostic, Result};
@@ -22,7 +23,7 @@ use openshell_ocsf::{
 };
 use russh::keys::{Algorithm, PrivateKey};
 use russh::server::{Auth, ChannelOpenHandle, Handle, Session};
-use russh::{ChannelId, ChannelOpenFailure};
+use russh::{ChannelId, ChannelOpenFailure, Sig};
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, RawFd};
@@ -120,6 +121,7 @@ pub async fn run_ssh_server(
     resolved_identity: ResolvedProcessIdentity,
     enforcement_mode: ProcessEnforcementMode,
     shared_socket: bool,
+    main_session: Arc<MainSession>,
 ) -> Result<()> {
     let (listener, config, ca_paths) = match ssh_server_init(
         &listen_path,
@@ -150,6 +152,7 @@ pub async fn run_ssh_server(
         let ca_paths = ca_paths.clone();
         let provider_credentials = provider_credentials.clone();
         let user_environment = user_environment.clone();
+        let main_session = Arc::clone(&main_session);
 
         tokio::spawn(async move {
             if let Err(err) = handle_connection(
@@ -164,6 +167,7 @@ pub async fn run_ssh_server(
                 user_environment,
                 resolved_identity,
                 enforcement_mode,
+                main_session,
             )
             .await
             {
@@ -193,6 +197,7 @@ async fn handle_connection(
     user_environment: HashMap<String, String>,
     resolved_identity: ResolvedProcessIdentity,
     enforcement_mode: ProcessEnforcementMode,
+    main_session: Arc<MainSession>,
 ) -> Result<()> {
     // Access is gated by the Unix-socket filesystem permissions (root-only),
     // not by an application-level preface. The supervisor bridges the
@@ -218,6 +223,7 @@ async fn handle_connection(
         user_environment,
         resolved_identity,
         enforcement_mode,
+        main_session,
     );
     russh::server::run_stream(config, stream, handler)
         .await
@@ -233,9 +239,64 @@ async fn handle_connection(
 /// sftp, etc.).
 #[derive(Default)]
 struct ChannelState {
-    input_sender: Option<mpsc::Sender<Vec<u8>>>,
+    input_sender: Option<InputSender>,
     pty_master: Option<std::fs::File>,
     pty_request: Option<PtyRequest>,
+    main_input_owner: Option<u64>,
+    main_attached: bool,
+    main_read_only: bool,
+    main_detach_prefix_pending: bool,
+    main_output_task: Option<tokio::task::AbortHandle>,
+}
+
+const MAIN_DETACH_PREFIX: u8 = 0x10; // Ctrl-P
+const MAIN_DETACH_KEY: u8 = 0x11; // Ctrl-Q
+
+/// Remove the `OpenShell` detach sequence from canonical-main input.
+///
+/// A trailing Ctrl-P remains pending across SSH data frames. If the following
+/// byte is not Ctrl-Q, both bytes are forwarded unchanged. Bytes after a
+/// completed detach sequence are discarded because the attachment is closing.
+fn filter_main_detach_sequence(prefix_pending: &mut bool, data: &[u8]) -> (Vec<u8>, bool) {
+    let mut forward = Vec::with_capacity(data.len() + usize::from(*prefix_pending));
+
+    for &byte in data {
+        if *prefix_pending {
+            if byte == MAIN_DETACH_KEY {
+                *prefix_pending = false;
+                return (forward, true);
+            }
+            forward.push(MAIN_DETACH_PREFIX);
+            *prefix_pending = false;
+        }
+
+        if byte == MAIN_DETACH_PREFIX {
+            *prefix_pending = true;
+        } else {
+            forward.push(byte);
+        }
+    }
+
+    (forward, false)
+}
+
+enum InputSender {
+    Process(mpsc::Sender<Vec<u8>>),
+    Main(tokio::sync::mpsc::Sender<Vec<u8>>),
+}
+
+impl InputSender {
+    fn send(&self, data: Vec<u8>) -> Result<(), &'static str> {
+        match self {
+            Self::Process(sender) => sender.send(data).map_err(|_| "process stdin closed"),
+            Self::Main(sender) => sender.try_send(data).map_err(|error| match error {
+                tokio::sync::mpsc::error::TrySendError::Full(_) => "canonical stdin buffer is full",
+                tokio::sync::mpsc::error::TrySendError::Closed(_) => {
+                    "canonical process stdin closed"
+                }
+            }),
+        }
+    }
 }
 
 struct SshHandler {
@@ -248,7 +309,21 @@ struct SshHandler {
     user_environment: HashMap<String, String>,
     resolved_identity: ResolvedProcessIdentity,
     enforcement_mode: ProcessEnforcementMode,
+    main_session: Arc<MainSession>,
     channels: HashMap<ChannelId, ChannelState>,
+}
+
+impl Drop for SshHandler {
+    fn drop(&mut self) {
+        for state in self.channels.values_mut() {
+            if let Some(owner) = state.main_input_owner.take() {
+                self.main_session.release_input(owner);
+            }
+            if let Some(task) = state.main_output_task.take() {
+                task.abort();
+            }
+        }
+    }
 }
 
 impl SshHandler {
@@ -263,6 +338,7 @@ impl SshHandler {
         user_environment: HashMap<String, String>,
         resolved_identity: ResolvedProcessIdentity,
         enforcement_mode: ProcessEnforcementMode,
+        main_session: Arc<MainSession>,
     ) -> Self {
         Self {
             policy,
@@ -274,6 +350,7 @@ impl SshHandler {
             user_environment,
             resolved_identity,
             enforcement_mode,
+            main_session,
             channels: HashMap::new(),
         }
     }
@@ -315,7 +392,14 @@ impl russh::server::Handler for SshHandler {
         channel: ChannelId,
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
-        self.channels.remove(&channel);
+        if let Some(state) = self.channels.remove(&channel) {
+            if let Some(owner) = state.main_input_owner {
+                self.main_session.release_input(owner);
+            }
+            if let Some(task) = state.main_output_task {
+                task.abort();
+            }
+        }
         Ok(())
     }
 
@@ -442,7 +526,10 @@ impl russh::server::Handler for SshHandler {
             warn!("window_change_request on unknown channel {channel:?}");
             return Ok(());
         };
-        if let Some(master) = state.pty_master.as_ref() {
+        if state.main_attached {
+            self.main_session
+                .resize(col_width, row_height, pixel_width, pixel_height);
+        } else if let Some(master) = state.pty_master.as_ref() {
             let winsize = Winsize {
                 ws_row: to_u16(row_height.max(1)),
                 ws_col: to_u16(col_width.max(1)),
@@ -493,7 +580,79 @@ impl russh::server::Handler for SshHandler {
         name: &str,
         session: &mut Session,
     ) -> Result<(), Self::Error> {
-        if name == "sftp" {
+        if name == "openshell-main" {
+            let state = self.channels.get_mut(&channel).ok_or_else(|| {
+                anyhow::anyhow!("subsystem_request on unknown channel {channel:?}")
+            })?;
+            if let Some(pty) = state.pty_request.take() {
+                self.main_session.resize(
+                    pty.col_width,
+                    pty.row_height,
+                    pty.pixel_width,
+                    pty.pixel_height,
+                );
+            }
+            let (input, input_warning) = if state.main_read_only {
+                (None, None)
+            } else {
+                match self.main_session.acquire_input() {
+                    Ok((owner, input)) => {
+                        state.main_input_owner = Some(owner);
+                        (Some(InputSender::Main(input)), None)
+                    }
+                    Err(error) => {
+                        warn!(%error, "main process input lease unavailable; attaching read-only");
+                        (None, Some(error))
+                    }
+                }
+            };
+            state.main_attached = true;
+            state.main_detach_prefix_pending = false;
+            state.input_sender = input;
+            let mut output = self.main_session.subscribe();
+            let handle = session.handle();
+            session.channel_success(channel)?;
+            if let Some(error) = input_warning {
+                let _ = handle
+                    .extended_data(
+                        channel,
+                        1,
+                        format!("openshell: {error}; attached read-only\n").into_bytes(),
+                    )
+                    .await;
+            }
+            let output_task = tokio::spawn(async move {
+                loop {
+                    match output.recv().await {
+                        Ok(event) => {
+                            let exited = matches!(event, MainOutput::Exit(_));
+                            send_main_output(&handle, channel, event).await;
+                            if exited {
+                                break;
+                            }
+                        }
+                        Err(error) => {
+                            let _ = handle
+                                .extended_data(
+                                    channel,
+                                    1,
+                                    format!(
+                                        "openshell: attachment fell behind by {} output chunks; reconnect for buffered output\n",
+                                        error.skipped
+                                    )
+                                    .into_bytes(),
+                                )
+                                .await;
+                            let _ = handle.close(channel).await;
+                            break;
+                        }
+                    }
+                }
+            });
+            if let Some(state) = self.channels.get_mut(&channel) {
+                state.main_output_task = Some(output_task.abort_handle());
+            }
+        } else if name == "sftp" {
             session.channel_success(channel)?;
             // sftp-server speaks the SFTP binary protocol over stdin/stdout,
             // which is exactly what spawn_pipe_exec wires up.  This enables
@@ -516,7 +675,7 @@ impl russh::server::Handler for SshHandler {
             let state = self.channels.get_mut(&channel).ok_or_else(|| {
                 anyhow::anyhow!("subsystem_request on unknown channel {channel:?}")
             })?;
-            state.input_sender = Some(input_sender);
+            state.input_sender = Some(InputSender::Process(input_sender));
         } else {
             ocsf_emit!(
                 SshActivityBuilder::new(openshell_ocsf::ctx::ctx())
@@ -542,7 +701,12 @@ impl russh::server::Handler for SshHandler {
         // Accept the env request so the client knows we handled it, but we
         // don't actually propagate the variables — the sandbox environment is
         // controlled via policy.  We must reply so VSCode doesn't stall.
-        let _ = (variable_name, variable_value);
+        if variable_name == "OPENSHELL_MAIN_READ_ONLY"
+            && variable_value == "1"
+            && let Some(state) = self.channels.get_mut(&channel)
+        {
+            state.main_read_only = true;
+        }
         session.channel_success(channel)?;
         Ok(())
     }
@@ -551,14 +715,44 @@ impl russh::server::Handler for SshHandler {
         &mut self,
         channel: ChannelId,
         data: &[u8],
-        _session: &mut Session,
+        session: &mut Session,
     ) -> Result<(), Self::Error> {
-        let Some(state) = self.channels.get(&channel) else {
+        let Some(state) = self.channels.get_mut(&channel) else {
             warn!("data on unknown channel {channel:?}");
             return Ok(());
         };
-        if let Some(sender) = state.input_sender.as_ref() {
-            let _ = sender.send(data.to_vec());
+
+        let main_attached = state.main_attached;
+        let (forward, detach) = if main_attached {
+            filter_main_detach_sequence(&mut state.main_detach_prefix_pending, data)
+        } else {
+            (data.to_vec(), false)
+        };
+        let send_error = (!forward.is_empty())
+            .then(|| state.input_sender.as_ref()?.send(forward).err())
+            .flatten();
+
+        if let Some(error) = send_error {
+            let handle = session.handle();
+            if main_attached {
+                self.close_main_attachment(channel, handle, Some(error))
+                    .await;
+            } else {
+                let _ = handle
+                    .extended_data(
+                        channel,
+                        1,
+                        format!("openshell: {error}; closing attachment\n").into_bytes(),
+                    )
+                    .await;
+                let _ = handle.close(channel).await;
+            }
+            return Ok(());
+        }
+        if detach {
+            self.close_main_attachment(channel, session.handle(), None)
+                .await;
+            return Ok(());
         }
         Ok(())
     }
@@ -573,15 +767,99 @@ impl russh::server::Handler for SshHandler {
         // is essential for commands like `cat | tar xf -` which need
         // stdin EOF to know the input stream is complete.
         if let Some(state) = self.channels.get_mut(&channel) {
+            if state.main_attached
+                && let Some(owner) = state.main_input_owner.take()
+            {
+                self.main_session.release_input(owner);
+            }
             state.input_sender.take();
+            state.main_detach_prefix_pending = false;
         } else {
             warn!("channel_eof on unknown channel {channel:?}");
         }
         Ok(())
     }
+
+    async fn signal(
+        &mut self,
+        channel: ChannelId,
+        signal: Sig,
+        _session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        if !self
+            .channels
+            .get(&channel)
+            .is_some_and(|state| state.main_attached)
+        {
+            return Ok(());
+        }
+        let signal = match signal {
+            Sig::HUP => Some(nix::sys::signal::Signal::SIGHUP),
+            Sig::INT => Some(nix::sys::signal::Signal::SIGINT),
+            Sig::KILL => Some(nix::sys::signal::Signal::SIGKILL),
+            Sig::QUIT => Some(nix::sys::signal::Signal::SIGQUIT),
+            Sig::TERM => Some(nix::sys::signal::Signal::SIGTERM),
+            _ => None,
+        };
+        if let Some(signal) = signal
+            && let Err(error) = self.main_session.signal_group(signal)
+        {
+            warn!(%error, ?signal, "failed to signal canonical main process group");
+        }
+        Ok(())
+    }
+}
+
+async fn send_main_output(handle: &Handle, channel: ChannelId, event: MainOutput) {
+    match event {
+        MainOutput::Stdout(data) => {
+            let _ = handle.data(channel, data).await;
+        }
+        MainOutput::Stderr(data) => {
+            let _ = handle.extended_data(channel, 1, data).await;
+        }
+        MainOutput::Exit(code) => {
+            let _ = handle.eof(channel).await;
+            let _ = handle
+                .exit_status_request(channel, code.max(0).unsigned_abs())
+                .await;
+            let _ = handle.close(channel).await;
+        }
+    }
 }
 
 impl SshHandler {
+    async fn close_main_attachment(
+        &mut self,
+        channel: ChannelId,
+        handle: Handle,
+        error: Option<&str>,
+    ) {
+        if let Some(state) = self.channels.get_mut(&channel) {
+            if let Some(owner) = state.main_input_owner.take() {
+                self.main_session.release_input(owner);
+            }
+            state.input_sender.take();
+            state.main_detach_prefix_pending = false;
+            if let Some(task) = state.main_output_task.take() {
+                task.abort();
+            }
+            state.main_attached = false;
+        }
+        if let Some(error) = error {
+            let _ = handle
+                .extended_data(
+                    channel,
+                    1,
+                    format!("openshell: {error}; closing attachment\n").into_bytes(),
+                )
+                .await;
+        }
+        let _ = handle.eof(channel).await;
+        let _ = handle.exit_status_request(channel, 0).await;
+        let _ = handle.close(channel).await;
+    }
+
     fn start_shell(
         &mut self,
         channel: ChannelId,
@@ -612,7 +890,7 @@ impl SshHandler {
                 self.enforcement_mode,
             )?;
             state.pty_master = Some(pty_master);
-            state.input_sender = Some(input_sender);
+            state.input_sender = Some(InputSender::Process(input_sender));
         } else {
             // No PTY requested — use plain pipes so stdout/stderr are
             // separate and output has clean LF line endings.  This is the
@@ -631,7 +909,7 @@ impl SshHandler {
                 self.resolved_identity,
                 self.enforcement_mode,
             )?;
-            state.input_sender = Some(input_sender);
+            state.input_sender = Some(InputSender::Process(input_sender));
         }
         Ok(())
     }
@@ -709,38 +987,6 @@ impl Default for PtyRequest {
             pixel_height: 0,
         }
     }
-}
-
-/// Derive the session USER and HOME from the policy's `run_as_user`.
-///
-/// For name-based identities, looks up the home directory via `/etc/passwd`
-/// (or defaults to `/home/{user}`).
-///
-/// For numeric UIDs, there is no passwd entry, so the default remains
-/// `("{uid}", "/sandbox")`. Docker replaces that default with its resolved
-/// image workspace.
-fn session_user_and_home(policy: &SandboxPolicy, workdir_home: Option<&str>) -> (String, String) {
-    let (user, default_home) = match policy.process.run_as_user.as_deref() {
-        Some(user) if !user.is_empty() => {
-            // Numeric UID — no passwd entry expected; use default HOME.
-            if user.parse::<u32>().is_ok() {
-                (user.to_string(), "/sandbox".to_string())
-            } else {
-                // Name-based identity — look up home from /etc/passwd.
-                let home = nix::unistd::User::from_name(user)
-                    .ok()
-                    .flatten()
-                    .map_or_else(
-                        || format!("/home/{user}"),
-                        |u| u.dir.to_string_lossy().into_owned(),
-                    );
-                (user.to_string(), home)
-            }
-        }
-        _ => ("sandbox".to_string(), "/sandbox".to_string()),
-    };
-    let home = workdir_home.map_or(default_home, str::to_string);
-    (user, home)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1665,11 +1911,11 @@ mod tests {
         let (tx_b, rx_b) = mpsc::channel::<Vec<u8>>();
 
         let mut state_a = ChannelState {
-            input_sender: Some(tx_a),
+            input_sender: Some(InputSender::Process(tx_a)),
             ..Default::default()
         };
         let state_b = ChannelState {
-            input_sender: Some(tx_b),
+            input_sender: Some(InputSender::Process(tx_b)),
             ..Default::default()
         };
 
@@ -1706,6 +1952,56 @@ mod tests {
             .send(b"still-alive".to_vec())
             .unwrap();
         assert_eq!(rx_b.recv().unwrap(), b"still-alive");
+    }
+
+    #[test]
+    fn main_detach_filter_forwards_ctrl_c_unchanged() {
+        let mut prefix_pending = false;
+        let (forward, detach) =
+            filter_main_detach_sequence(&mut prefix_pending, b"before\x03after");
+
+        assert_eq!(forward, b"before\x03after");
+        assert!(!detach);
+        assert!(!prefix_pending);
+    }
+
+    #[test]
+    fn main_detach_filter_removes_sequence_and_trailing_input() {
+        let mut prefix_pending = false;
+        let (forward, detach) =
+            filter_main_detach_sequence(&mut prefix_pending, b"before\x10\x11after");
+
+        assert_eq!(forward, b"before");
+        assert!(detach);
+        assert!(!prefix_pending);
+    }
+
+    #[test]
+    fn main_detach_filter_recognizes_sequence_across_frames() {
+        let mut prefix_pending = false;
+        let (forward, detach) = filter_main_detach_sequence(&mut prefix_pending, b"before\x10");
+        assert_eq!(forward, b"before");
+        assert!(!detach);
+        assert!(prefix_pending);
+
+        let (forward, detach) = filter_main_detach_sequence(&mut prefix_pending, b"\x11");
+        assert!(forward.is_empty());
+        assert!(detach);
+        assert!(!prefix_pending);
+    }
+
+    #[test]
+    fn main_detach_filter_forwards_unmatched_prefix() {
+        let mut prefix_pending = false;
+        let (forward, detach) = filter_main_detach_sequence(&mut prefix_pending, b"\x10");
+        assert!(forward.is_empty());
+        assert!(!detach);
+        assert!(prefix_pending);
+
+        let (forward, detach) = filter_main_detach_sequence(&mut prefix_pending, b"x");
+        assert_eq!(forward, b"\x10x");
+        assert!(!detach);
+        assert!(!prefix_pending);
     }
 
     // -----------------------------------------------------------------------
@@ -2012,7 +2308,9 @@ mod tests {
     /// The handler gets `netns_fd: None` so `connect_in_netns` performs a plain
     /// TCP connect, making the forwarding path reachable without a network
     /// namespace.
-    async fn authenticated_test_client() -> russh::client::Handle<AcceptAnyServerKey> {
+    async fn authenticated_test_client_with_main(
+        main_session: Arc<MainSession>,
+    ) -> russh::client::Handle<AcceptAnyServerKey> {
         // Scoped so the `!Send` ThreadRng is dropped before the first await.
         let host_key = {
             let mut rng = rand::rng();
@@ -2034,6 +2332,7 @@ mod tests {
             HashMap::new(),
             ResolvedProcessIdentity::default(),
             ProcessEnforcementMode::NetworkOnly,
+            main_session,
         );
 
         let (server_stream, client_stream) = tokio::io::duplex(64 * 1024);
@@ -2063,6 +2362,71 @@ mod tests {
         );
 
         client
+    }
+
+    async fn authenticated_test_client() -> russh::client::Handle<AcceptAnyServerKey> {
+        authenticated_test_client_with_main(MainSession::inert()).await
+    }
+
+    #[tokio::test]
+    async fn abrupt_transport_drop_releases_main_input_lease() {
+        let main_session = MainSession::inert();
+        let client = authenticated_test_client_with_main(Arc::clone(&main_session)).await;
+        let channel = client.channel_open_session().await.expect("open session");
+        channel
+            .request_subsystem(true, "openshell-main")
+            .await
+            .expect("attach main subsystem");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                match main_session.acquire_input() {
+                    Err(_) => break,
+                    Ok((owner, _)) => main_session.release_input(owner),
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("main subsystem should acquire canonical input lease");
+
+        drop(channel);
+        drop(client);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if main_session.acquire_input().is_ok() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("handler drop should release canonical input lease");
+    }
+
+    #[tokio::test]
+    async fn main_subsystem_applies_initial_pty_dimensions() {
+        let (main_session, _slave) = MainSession::terminal_for_test();
+        let client = authenticated_test_client_with_main(Arc::clone(&main_session)).await;
+        let channel = client.channel_open_session().await.expect("open session");
+        channel
+            .request_pty(true, "xterm-256color", 200, 60, 1600, 900, &[])
+            .await
+            .expect("request PTY");
+        channel
+            .request_subsystem(true, "openshell-main")
+            .await
+            .expect("attach main subsystem");
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if main_session.terminal_size_for_test() == (200, 60) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("main subsystem should apply the initial PTY dimensions");
     }
 
     #[tokio::test]

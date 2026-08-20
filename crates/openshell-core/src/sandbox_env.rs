@@ -8,6 +8,8 @@
 //! supervisor process (which reads them on startup).  Using constants here
 //! prevents typos from producing silently broken sandboxes.
 
+use serde::{Deserialize, Serialize};
+
 /// Name of the sandbox (used for policy sync and identification).
 pub const SANDBOX: &str = "OPENSHELL_SANDBOX";
 
@@ -23,8 +25,64 @@ pub const SSH_SOCKET_PATH: &str = "OPENSHELL_SSH_SOCKET_PATH";
 /// Log level for the sandbox supervisor (e.g. `"debug"`, `"info"`, `"warn"`).
 pub const LOG_LEVEL: &str = "OPENSHELL_LOG_LEVEL";
 
-/// Shell command to run inside the sandbox.
-pub const SANDBOX_COMMAND: &str = "OPENSHELL_SANDBOX_COMMAND";
+/// Versioned JSON specification for the exact canonical main process.
+pub const MAIN_PROCESS_SPEC: &str = "OPENSHELL_MAIN_PROCESS_SPEC";
+
+/// Lossless driver-to-supervisor representation of the canonical process.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct MainProcessConfig {
+    pub version: u32,
+    pub command: Vec<String>,
+    pub tty: bool,
+}
+
+impl MainProcessConfig {
+    pub const VERSION: u32 = 1;
+
+    #[must_use]
+    pub fn scratch() -> Self {
+        Self {
+            version: Self::VERSION,
+            command: vec!["/bin/bash".to_string(), "-l".to_string()],
+            tty: true,
+        }
+    }
+
+    #[must_use]
+    pub fn from_driver_spec(spec: Option<&crate::proto::compute::v1::DriverSandboxSpec>) -> Self {
+        match spec {
+            Some(spec) if !spec.command.is_empty() => Self {
+                version: Self::VERSION,
+                command: spec.command.clone(),
+                tty: spec.tty,
+            },
+            None | Some(_) => Self::scratch(),
+        }
+    }
+
+    /// Decode the versioned transport without shell interpretation.
+    pub fn decode(json: &str) -> Result<Self, String> {
+        let config: Self = serde_json::from_str(json)
+            .map_err(|error| format!("invalid {MAIN_PROCESS_SPEC}: {error}"))?;
+        if config.version != Self::VERSION {
+            return Err(format!(
+                "unsupported {MAIN_PROCESS_SPEC} version {}",
+                config.version
+            ));
+        }
+        if config.command.is_empty() || config.command[0].is_empty() {
+            return Err(format!("{MAIN_PROCESS_SPEC} command must not be empty"));
+        }
+        Ok(config)
+    }
+
+    /// Encode the versioned driver-to-supervisor transport.
+    pub fn encode_driver_spec(
+        spec: Option<&crate::proto::compute::v1::DriverSandboxSpec>,
+    ) -> Result<String, serde_json::Error> {
+        serde_json::to_string(&Self::from_driver_spec(spec))
+    }
+}
 
 /// Deployment-controlled telemetry toggle propagated to the sandbox supervisor.
 pub const TELEMETRY_ENABLED: &str = "OPENSHELL_TELEMETRY_ENABLED";
@@ -138,3 +196,39 @@ pub const OCI_IMAGE_USER: &str = "OPENSHELL_OCI_IMAGE_USER";
 // environment variables: it travels on the supervisor's argv
 // (`--upstream-proxy` and friends), which a sandbox image cannot forge the
 // way it could bake `ENV` values.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn main_process_transport_preserves_argument_boundaries() {
+        let spec = crate::proto::compute::v1::DriverSandboxSpec {
+            command: vec!["/bin/sh".into(), "-c".into(), "printf '%s' 'a b'".into()],
+            tty: false,
+            ..Default::default()
+        };
+        let encoded = MainProcessConfig::encode_driver_spec(Some(&spec)).unwrap();
+        let decoded = MainProcessConfig::decode(&encoded).unwrap();
+        assert_eq!(decoded.command, spec.command);
+        assert!(!decoded.tty);
+    }
+
+    #[test]
+    fn main_process_transport_rejects_unknown_version() {
+        let error =
+            MainProcessConfig::decode(r#"{"version":2,"command":["/bin/true"],"tty":false}"#)
+                .unwrap_err();
+        assert!(error.contains("unsupported"));
+    }
+
+    #[test]
+    fn legacy_driver_spec_without_command_uses_scratch_main() {
+        let legacy = crate::proto::compute::v1::DriverSandboxSpec::default();
+        let config = MainProcessConfig::from_driver_spec(Some(&legacy));
+
+        assert_eq!(config, MainProcessConfig::scratch());
+        let encoded = serde_json::to_string(&config).unwrap();
+        assert_eq!(MainProcessConfig::decode(&encoded).unwrap(), config);
+    }
+}

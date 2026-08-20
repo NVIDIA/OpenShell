@@ -39,6 +39,12 @@ use crate::process::{
     ResolvedWorkspace,
 };
 
+pub type SidecarExitReport = (
+    String,
+    i32,
+    tokio::sync::oneshot::Sender<Result<(), String>>,
+);
+
 fn ocsf_ctx() -> &'static openshell_ocsf::SandboxContext {
     openshell_ocsf::ctx::ctx()
 }
@@ -65,7 +71,8 @@ pub async fn run_process(
     resolved_process_identity: ResolvedProcessIdentity,
     enforcement_mode: ProcessEnforcementMode,
     entrypoint_pid: Arc<AtomicU32>,
-    entrypoint_started_tx: Option<tokio::sync::oneshot::Sender<u32>>,
+    entrypoint_started_tx: Option<tokio::sync::oneshot::Sender<(u32, String)>>,
+    sidecar_exit_tx: Option<tokio::sync::mpsc::Sender<SidecarExitReport>>,
     provider_credentials: ProviderCredentialState,
     provider_env: std::collections::HashMap<String, String>,
     ca_file_paths: Option<(std::path::PathBuf, std::path::PathBuf)>,
@@ -219,6 +226,37 @@ pub async fn run_process(
     #[cfg(not(target_os = "linux"))]
     let ssh_netns_fd: Option<i32> = None;
 
+    #[cfg(target_os = "linux")]
+    let mut handle = ProcessHandle::spawn(
+        program,
+        args,
+        &workspace,
+        interactive,
+        policy,
+        resolved_process_identity,
+        enforcement_mode,
+        netns,
+        ca_file_paths.as_ref(),
+        &provider_env,
+    )?;
+
+    #[cfg(not(target_os = "linux"))]
+    let mut handle = ProcessHandle::spawn(
+        program,
+        args,
+        &workspace,
+        interactive,
+        policy,
+        resolved_process_identity,
+        enforcement_mode,
+        ca_file_paths.as_ref(),
+        &provider_env,
+    )?;
+
+    let main_pid = handle.pid();
+    let main_session = crate::main_session::MainSession::new(handle.take_io(), main_pid);
+    let main_instance_id = uuid::Uuid::new_v4().to_string();
+
     // SSH-spawned shells get http_proxy=http://<host_ip>:<port> exported into
     // their env so cooperative tools (curl, npm, Node) route through the
     // CONNECT proxy. Linux uses the netns host_ip; on other targets fall back
@@ -236,6 +274,7 @@ pub async fn run_process(
         let netns_fd = ssh_netns_fd;
         let ca_paths = ca_file_paths.clone();
         let provider_credentials_clone = provider_credentials.clone();
+        let main_session_clone = Arc::clone(&main_session);
         let user_env_clone: std::collections::HashMap<String, String> =
             std::env::var(openshell_core::sandbox_env::USER_ENVIRONMENT)
                 .ok()
@@ -258,6 +297,7 @@ pub async fn run_process(
                 resolved_process_identity,
                 enforcement_mode,
                 shared_ssh_socket,
+                main_session_clone,
             )
             .await
             {
@@ -303,55 +343,39 @@ pub async fn run_process(
     }
 
     let supervisor_terminating = Arc::new(AtomicBool::new(false));
+    // A canonical process may have completed while the SSH socket was being
+    // prepared. Never open a readiness-bearing supervisor session for a child
+    // that is already terminal.
+    let early_exit = handle.try_wait().into_diagnostic()?;
 
     // Spawn the persistent supervisor session if we have a gateway endpoint
     // and sandbox identity. The session provides relay channels for SSH
     // connect and ExecSandbox through the gateway.
-    if let (Some(endpoint), Some(id), Some(socket)) =
-        (openshell_endpoint, sandbox_id, ssh_socket_path.as_ref())
+    let supervisor_session_task = if early_exit.is_none()
+        && let (Some(endpoint), Some(id), Some(socket)) =
+            (openshell_endpoint, sandbox_id, ssh_socket_path.as_ref())
     {
-        crate::supervisor_session::spawn(
+        let task = crate::supervisor_session::spawn(
             endpoint.to_string(),
             id.to_string(),
             socket.clone(),
             ssh_netns_fd,
             None,
             Arc::clone(&supervisor_terminating),
+            main_instance_id.clone(),
         );
         info!("supervisor session task spawned");
-    }
-
-    #[cfg(target_os = "linux")]
-    let mut handle = ProcessHandle::spawn(
-        program,
-        args,
-        &workspace,
-        interactive,
-        policy,
-        resolved_process_identity,
-        enforcement_mode,
-        netns,
-        ca_file_paths.as_ref(),
-        &provider_env,
-    )?;
-
-    #[cfg(not(target_os = "linux"))]
-    let mut handle = ProcessHandle::spawn(
-        program,
-        args,
-        &workspace,
-        interactive,
-        policy,
-        resolved_process_identity,
-        enforcement_mode,
-        ca_file_paths.as_ref(),
-        &provider_env,
-    )?;
+        Some(task)
+    } else {
+        None
+    };
 
     // Store the entrypoint PID so the proxy can resolve TCP peer identity
     entrypoint_pid.store(handle.pid(), Ordering::Release);
-    if let Some(tx) = entrypoint_started_tx {
-        let _ = tx.send(handle.pid());
+    if early_exit.is_none()
+        && let Some(tx) = entrypoint_started_tx
+    {
+        let _ = tx.send((handle.pid(), main_instance_id.clone()));
     }
     ocsf_emit!(
         ProcessActivityBuilder::new(ocsf_ctx())
@@ -366,12 +390,15 @@ pub async fn run_process(
             .build()
     );
 
-    let outcome =
+    let outcome = if let Some(status) = early_exit {
+        ProcessWaitOutcome::Exited(status)
+    } else {
         wait_for_process_exit_or_shutdown(&mut handle, timeout_secs, &supervisor_terminating)
-            .await?;
+            .await?
+    };
 
-    let status = match outcome {
-        ProcessWaitOutcome::Exited(status) => status,
+    let rendered_code = match outcome {
+        ProcessWaitOutcome::Exited(status) => status.code(),
         ProcessWaitOutcome::TimedOut => {
             ocsf_emit!(
                 ProcessActivityBuilder::new(ocsf_ctx())
@@ -383,7 +410,7 @@ pub async fn run_process(
                     .message("Process timed out, killing")
                     .build()
             );
-            return Ok(124); // Standard timeout exit code
+            124
         }
         ProcessWaitOutcome::ShutdownSignal { signal, status } => {
             info!(
@@ -391,10 +418,11 @@ pub async fn run_process(
                 exit_code = status.code(),
                 "Entrypoint exited after supervisor shutdown signal"
             );
-            status
+            status.code()
         }
     };
     supervisor_terminating.store(true, Ordering::Release);
+    main_session.finish(rendered_code).await;
 
     ocsf_emit!(
         ProcessActivityBuilder::new(ocsf_ctx())
@@ -403,12 +431,55 @@ pub async fn run_process(
             .disposition(DispositionId::Allowed)
             .severity(SeverityId::Informational)
             .status(StatusId::Success)
-            .exit_code(status.code())
-            .message(format!("Process exited with code {}", status.code()))
+            .exit_code(rendered_code)
+            .message(format!("Process exited with code {rendered_code}"))
             .build()
     );
 
-    Ok(status.code())
+    if let Some(task) = supervisor_session_task {
+        task.abort();
+    }
+    if let Some(tx) = sidecar_exit_tx {
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+        tx.send((main_instance_id.clone(), rendered_code, ack_tx))
+            .await
+            .map_err(|_| miette::miette!("sidecar exit reporter closed"))?;
+        ack_rx
+            .await
+            .map_err(|_| miette::miette!("sidecar exit reporter dropped acknowledgement"))?
+            .map_err(|error| miette::miette!(error))?;
+    } else if let (Some(endpoint), Some(id)) = (openshell_endpoint, sandbox_id) {
+        report_main_process_exit_until_ack(endpoint, id, &main_instance_id, rendered_code).await;
+        info!(instance_id = %main_instance_id, "main-process exit acknowledged");
+    }
+
+    Ok(rendered_code)
+}
+
+async fn report_main_process_exit_until_ack(
+    endpoint: &str,
+    sandbox_id: &str,
+    instance_id: &str,
+    exit_code: i32,
+) {
+    let mut retry_delay = Duration::from_millis(250);
+    loop {
+        match crate::supervisor_session::report_main_process_exit(
+            endpoint,
+            sandbox_id,
+            instance_id,
+            exit_code,
+        )
+        .await
+        {
+            Ok(()) => return,
+            Err(error) => {
+                tracing::warn!(%error, "main-process exit report failed; retrying");
+                tokio::time::sleep(retry_delay).await;
+                retry_delay = (retry_delay * 2).min(Duration::from_secs(2));
+            }
+        }
+    }
 }
 
 enum ProcessWaitOutcome {
@@ -486,13 +557,13 @@ fn signal_entrypoint_for_shutdown(_pid: u32, _signal: &'static str) {}
 #[cfg(unix)]
 fn signal_pid(pid: u32, signal: nix::sys::signal::Signal, reason: &'static str) {
     let raw_pid = i32::try_from(pid).unwrap_or(i32::MAX);
-    if let Err(error) = nix::sys::signal::kill(nix::unistd::Pid::from_raw(raw_pid), signal) {
+    if let Err(error) = nix::sys::signal::kill(nix::unistd::Pid::from_raw(-raw_pid), signal) {
         tracing::warn!(
             pid,
             signal = ?signal,
             reason,
             error = %error,
-            "failed to signal entrypoint process"
+            "failed to signal entrypoint process group"
         );
     }
 }

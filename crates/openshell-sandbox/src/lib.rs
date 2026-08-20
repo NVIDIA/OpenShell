@@ -92,6 +92,7 @@ const SIDECAR_READY_TIMEOUT_SECS: u64 = 120;
 /// Returns an error if the command fails to start or encounters a fatal error.
 #[allow(
     clippy::too_many_arguments,
+    clippy::implicit_hasher,
     clippy::similar_names,
     clippy::fn_params_excessive_bools
 )]
@@ -349,6 +350,10 @@ pub async fn run_sandbox(
         report_credential_gating_unavailable();
     }
 
+    // Canonical-process overrides are deliberately applied only to the main
+    // child. Keep the provider snapshot pristine because Kubernetes forwards
+    // it to the process sidecar for later exec/editor/SFTP children.
+
     // Shared agent-proposals feature flag. Seed from the same initial settings
     // snapshot that produced the policy so networking and process setup agree
     // before the poll loop starts reconciling later changes.
@@ -357,6 +362,7 @@ pub async fn run_sandbox(
     let process_control_writer = process_control_connection
         .as_ref()
         .map(|connection| connection.writer.clone());
+    let process_exit_ack = Arc::new(tokio::sync::Mutex::new(None));
     let mut process_control_closed = None;
     if let Some(connection) = process_control_connection {
         process_control_closed = Some(connection.closed);
@@ -364,6 +370,7 @@ pub async fn run_sandbox(
             connection.updates,
             provider_credentials.clone(),
             agent_proposals.clone(),
+            Arc::clone(&process_exit_ack),
         );
     }
 
@@ -597,12 +604,15 @@ pub async fn run_sandbox(
         sidecar_control_task = Some(connection_task);
         spawn_sidecar_entrypoint_handler(
             entrypoint_rx,
-            entrypoint_pid.clone(),
-            opa_engine.clone(),
-            retained_proto.clone(),
-            openshell_endpoint.clone(),
-            sandbox_id.clone(),
-            std::path::PathBuf::from(trusted_ssh_socket_path),
+            SidecarEntrypointHandler {
+                entrypoint_pid: entrypoint_pid.clone(),
+                opa_engine: opa_engine.clone(),
+                retained_proto: retained_proto.clone(),
+                openshell_endpoint: openshell_endpoint.clone(),
+                sandbox_id: sandbox_id.clone(),
+                trusted_ssh_socket_path: std::path::PathBuf::from(trusted_ssh_socket_path),
+                control_publisher: sidecar_control_publisher.clone(),
+            },
         );
     }
 
@@ -800,6 +810,7 @@ pub async fn run_sandbox(
     }
 
     let process_policy = process_policy_for_topology(&policy, sidecar_network_enforcement)?;
+    let main_env = provider_env.clone();
     let sidecar_bootstrap_ca_file_paths = sidecar_bootstrap.as_ref().and_then(|bootstrap| {
         bootstrap
             .proxy_ca_cert_path
@@ -826,9 +837,10 @@ pub async fn run_sandbox(
                 let (tx, rx) = tokio::sync::oneshot::channel();
                 tokio::spawn(async move {
                     match rx.await {
-                        Ok(pid) => {
+                        Ok((pid, instance_id)) => {
                             if let Err(err) =
-                                sidecar_control::send_entrypoint_started(&writer, pid).await
+                                sidecar_control::send_entrypoint_started(&writer, pid, instance_id)
+                                    .await
                             {
                                 warn!(error = %err, "Failed to send sidecar entrypoint event");
                             }
@@ -836,6 +848,35 @@ pub async fn run_sandbox(
                         Err(_closed) => {
                             debug!("Entrypoint exited before sidecar entrypoint event was sent");
                         }
+                    }
+                });
+                Some(tx)
+            } else {
+                None
+            };
+        let sidecar_exit_tx =
+            if process_uses_sidecar_control && let Some(writer) = process_control_writer.clone() {
+                let exit_ack = Arc::clone(&process_exit_ack);
+                let (tx, mut rx) = tokio::sync::mpsc::channel::<
+                    openshell_supervisor_process::run::SidecarExitReport,
+                >(1);
+                tokio::spawn(async move {
+                    while let Some((instance_id, exit_code, ack)) = rx.recv().await {
+                        let (durable_tx, durable_rx) = tokio::sync::oneshot::channel();
+                        *exit_ack.lock().await = Some((instance_id.clone(), durable_tx));
+                        let result = match sidecar_control::send_main_process_exited(
+                            &writer,
+                            instance_id,
+                            exit_code,
+                        )
+                        .await
+                        {
+                            Ok(()) => durable_rx.await.map_err(|_| {
+                                "sidecar durable exit acknowledgement closed".to_string()
+                            }),
+                            Err(error) => Err(error.to_string()),
+                        };
+                        let _ = ack.send(result);
                     }
                 });
                 Some(tx)
@@ -858,8 +899,9 @@ pub async fn run_sandbox(
             process_enforcement_mode,
             entrypoint_pid,
             entrypoint_started_tx,
+            sidecar_exit_tx,
             provider_credentials,
-            provider_env,
+            main_env,
             ca_file_paths,
             agent_proposals.clone(),
             #[cfg(target_os = "linux")]
@@ -1004,6 +1046,9 @@ type LoadedPolicyBundle = (
     LoadedPolicyOrigin,
 );
 
+type MainProcessExitAckWaiter =
+    Arc<tokio::sync::Mutex<Option<(String, tokio::sync::oneshot::Sender<()>)>>>;
+
 fn load_policy_from_sidecar_bootstrap(
     bootstrap: &sidecar_control::BootstrapData,
 ) -> Result<LoadedPolicyBundle> {
@@ -1026,6 +1071,7 @@ fn spawn_sidecar_control_update_watcher(
     mut updates: tokio::sync::mpsc::UnboundedReceiver<sidecar_control::ControlUpdate>,
     provider_credentials: ProviderCredentialState,
     agent_proposals: AgentProposals,
+    exit_ack: MainProcessExitAckWaiter,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         while let Some(update) = updates.recv().await {
@@ -1076,26 +1122,80 @@ fn spawn_sidecar_control_update_watcher(
                         skills::install_static_skills,
                     );
                 }
+                sidecar_control::ControlUpdate::MainProcessExitAck { instance_id } => {
+                    let mut waiter = exit_ack.lock().await;
+                    if waiter
+                        .as_ref()
+                        .is_some_and(|(expected, _)| expected == &instance_id)
+                        && let Some((_, ack)) = waiter.take()
+                    {
+                        let _ = ack.send(());
+                    }
+                }
             }
         }
     })
 }
 
 #[cfg(target_os = "linux")]
-fn spawn_sidecar_entrypoint_handler(
-    mut entrypoint_rx: tokio::sync::mpsc::Receiver<sidecar_control::EntrypointStarted>,
+struct SidecarEntrypointHandler {
     entrypoint_pid: Arc<AtomicU32>,
     opa_engine: Option<Arc<OpaEngine>>,
     retained_proto: Option<openshell_core::proto::SandboxPolicy>,
     openshell_endpoint: Option<String>,
     sandbox_id: Option<String>,
     trusted_ssh_socket_path: std::path::PathBuf,
+    control_publisher: Option<sidecar_control::Publisher>,
+}
+
+#[cfg(target_os = "linux")]
+fn spawn_sidecar_entrypoint_handler(
+    mut entrypoint_rx: tokio::sync::mpsc::Receiver<sidecar_control::EntrypointStarted>,
+    handler: SidecarEntrypointHandler,
 ) {
     tokio::spawn(async move {
+        let SidecarEntrypointHandler {
+            entrypoint_pid,
+            opa_engine,
+            retained_proto,
+            openshell_endpoint,
+            sandbox_id,
+            trusted_ssh_socket_path,
+            control_publisher,
+        } = handler;
         let mut session_started = false;
         let mut trusted_supervisor_pid = None;
         let terminating = Arc::new(AtomicBool::new(false));
         while let Some(started) = entrypoint_rx.recv().await {
+            if let Some(exit_code) = started.exit_code {
+                terminating.store(true, Ordering::Release);
+                if let (Some(endpoint), Some(id)) =
+                    (openshell_endpoint.as_ref(), sandbox_id.as_ref())
+                {
+                    let mut delay = Duration::from_millis(250);
+                    loop {
+                        match openshell_supervisor_process::supervisor_session::report_main_process_exit(
+                            endpoint,
+                            id,
+                            &started.instance_id,
+                            exit_code,
+                        )
+                        .await
+                        {
+                            Ok(()) => break,
+                            Err(error) => {
+                                warn!(%error, "sidecar main-process exit report failed; retrying");
+                                tokio::time::sleep(delay).await;
+                                delay = (delay * 2).min(Duration::from_secs(2));
+                            }
+                        }
+                    }
+                    if let Some(publisher) = control_publisher.as_ref() {
+                        publisher.publish_main_process_exit_ack(started.instance_id.clone());
+                    }
+                }
+                break;
+            }
             entrypoint_pid.store(started.pid, Ordering::Release);
             if started.start_session {
                 info!(
@@ -1144,6 +1244,7 @@ fn spawn_sidecar_entrypoint_handler(
                     None,
                     Some(supervisor_pid),
                     Arc::clone(&terminating),
+                    started.instance_id.clone(),
                 );
                 session_started = true;
                 info!("sidecar supervisor session task spawned");
@@ -4259,6 +4360,7 @@ mod tests {
             rx,
             provider_credentials.clone(),
             AgentProposals::default(),
+            Arc::new(tokio::sync::Mutex::new(None)),
         );
 
         tx.send(sidecar_control::ControlUpdate::ProviderEnv {
@@ -4313,8 +4415,12 @@ mod tests {
         let provider_credentials =
             ProviderCredentialState::from_child_env_snapshot(0, std::collections::HashMap::new());
         let agent_proposals = AgentProposals::new(true);
-        let handle =
-            spawn_sidecar_control_update_watcher(rx, provider_credentials, agent_proposals.clone());
+        let handle = spawn_sidecar_control_update_watcher(
+            rx,
+            provider_credentials,
+            agent_proposals.clone(),
+            Arc::new(tokio::sync::Mutex::new(None)),
+        );
 
         tx.send(sidecar_control::ControlUpdate::AgentProposals {
             enabled: false,

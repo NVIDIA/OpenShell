@@ -216,9 +216,17 @@ async fn handle_create_sandbox_inner(
 ) -> Result<Response<SandboxResponse>, Status> {
     let principal = super::extract_principal(&request)?;
     let request = request.into_inner();
-    let spec = request
+    let mut spec = request
         .spec
         .ok_or_else(|| Status::invalid_argument("spec is required"))?;
+
+    // Every newly persisted sandbox has one explicit canonical process. This
+    // portable default also preserves compatibility with callers compiled
+    // before the main-process field was introduced.
+    if spec.command.is_empty() {
+        spec.command = vec!["/bin/bash".to_string(), "-l".to_string()];
+        spec.tty = true;
+    }
 
     // Validate field sizes before any I/O (fail fast on oversized payloads).
     validate_sandbox_spec(&request.name, &spec)?;
@@ -261,7 +269,6 @@ async fn handle_create_sandbox_inner(
         .await?;
 
     // Ensure the template always carries the resolved image.
-    let mut spec = spec;
     let template = spec.template.get_or_insert_with(SandboxTemplate::default);
     if template.image.is_empty() {
         template.image = state.compute.default_image().to_string();

@@ -17,6 +17,7 @@ openshell-policy = { path = "../openshell-policy" }
 
 anyhow = { workspace = true }
 base64 = { workspace = true }
+bytes = { workspace = true }
 hex = "0.4"
 ipnet = "2"
 miette = { workspace = true }

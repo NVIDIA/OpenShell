@@ -29,10 +29,11 @@ only when the set is already empty; any other outcome fails the spawn.
    gateway, depending on mode.
 3. It prepares filesystem access, process restrictions, network namespace
    routing, trust stores, provider credential resolution, and inference routes.
-4. It starts the policy proxy and local SSH server.
-5. It opens a supervisor session back to the gateway for connect, exec, file
+4. It launches the persisted canonical main-process argv and retains its PTY
+   or pipes in the main-session multiplexer.
+5. It starts the policy proxy and local SSH server.
+6. It opens a supervisor session back to the gateway for connect, exec, file
    sync, config polling, and log push.
-6. It launches the agent command as the resolved restricted identity.
 
 ## Isolation Layers
 
@@ -359,8 +360,10 @@ The supervisor runs an SSH server on a Unix socket inside the sandbox. The
 gateway reaches it through the outbound supervisor relay, not by dialing the
 sandbox workload directly. The relay supports:
 
-- Interactive shell sessions.
-- Command execution.
+- Attachment to the canonical main process through the `openshell-main` SSH
+  subsystem. The supervisor owns its retained PTY or pipes, a 1 MiB replay
+  buffer, and a single stdin lease across client disconnects.
+- Independent shell and command execution sessions.
 - Tar-based file sync.
 - Port forwarding where supported by the CLI/TUI surface.
 
@@ -436,3 +439,7 @@ engine with a gateway policy revision.
   re-evaluate.
 - If the supervisor relay drops, the sandbox can keep running, but connect and
   exec operations fail until the supervisor registers again.
+- If the canonical main process exits, including with code 0, the supervisor
+  reports its normalized exit code before shutdown. The gateway persists the
+  code on sandbox status, records `MainProcessExited`, and makes the sandbox
+  terminal `Error`; runtime restart policies must not replace the process.

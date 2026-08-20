@@ -13,6 +13,9 @@ Each runtime receives a sandbox spec from the gateway and is responsible for:
 - Injecting sandbox identity and gateway callback configuration.
 - Supplying TLS or secret material for supervisor callbacks.
 - Providing the supervisor binary or image in the workload.
+- Forwarding the exact canonical main-process argv and TTY mode without shell
+  reconstruction. The sandbox-level environment and policy workspace apply to
+  the main process.
 - Reporting lifecycle and platform events back to the gateway.
 - Cleaning up runtime-owned resources.
 
@@ -29,6 +32,10 @@ default image, and gateway-lifecycle preference from `GetCapabilities`.
 Process-identity omissions are preserved across this boundary so every driver
 can apply its native image or runtime defaults. Driver-requested listeners are
 structurally validated and remain restricted to sandbox callback RPCs.
+
+Canonical main-process support is part of the `ComputeDriver` contract. Every
+in-tree and extension driver must forward the exact specification; it is not an
+optional capability that drivers can omit or negotiate.
 
 Drivers own runtime-specific platform event interpretation. When an event should
 drive client provisioning UI, the driver attaches the shared

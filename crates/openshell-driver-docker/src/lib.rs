@@ -11,7 +11,7 @@ use bollard::models::{
     ContainerCreateBody, ContainerState, ContainerStateStatusEnum, ContainerSummary,
     ContainerSummaryStateEnum, CreateImageInfo, DeviceRequest, EndpointSettings, HostConfig, Mount,
     MountTmpfsOptions, MountTypeEnum, MountVolumeOptions, NetworkCreateRequest, NetworkingConfig,
-    ProgressDetail, RestartPolicy, RestartPolicyNameEnum, SystemInfo,
+    ProgressDetail, SystemInfo,
 };
 use bollard::query_parameters::{
     CreateContainerOptionsBuilder, CreateImageOptions, DownloadFromContainerOptionsBuilder,
@@ -77,7 +77,6 @@ const TLS_CA_MOUNT_PATH: &str = openshell_core::driver_utils::TLS_CA_MOUNT_PATH;
 const TLS_CERT_MOUNT_PATH: &str = openshell_core::driver_utils::TLS_CERT_MOUNT_PATH;
 const TLS_KEY_MOUNT_PATH: &str = openshell_core::driver_utils::TLS_KEY_MOUNT_PATH;
 const SANDBOX_TOKEN_MOUNT_PATH: &str = openshell_core::driver_utils::SANDBOX_TOKEN_MOUNT_PATH;
-const SANDBOX_COMMAND: &str = "sleep infinity";
 const SUPERVISOR_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 const HOST_OPENSHELL_INTERNAL: &str = "host.openshell.internal";
 const HOST_DOCKER_INTERNAL: &str = "host.docker.internal";
@@ -2386,9 +2385,12 @@ fn build_environment_for_oci_user(
         openshell_core::sandbox_env::SSH_SOCKET_PATH.to_string(),
         config.ssh_socket_path.clone(),
     );
+    let main_process =
+        openshell_core::sandbox_env::MainProcessConfig::encode_driver_spec(sandbox.spec.as_ref())
+            .expect("main process config serialization cannot fail");
     environment.insert(
-        openshell_core::sandbox_env::SANDBOX_COMMAND.to_string(),
-        SANDBOX_COMMAND.to_string(),
+        openshell_core::sandbox_env::MAIN_PROCESS_SPEC.to_string(),
+        main_process,
     );
     environment.insert(
         openshell_core::sandbox_env::TELEMETRY_ENABLED.to_string(),
@@ -2638,10 +2640,9 @@ fn build_container_create_body_for_image(
                 Some(binds)
             },
             mounts: Some(user_mounts),
-            restart_policy: Some(RestartPolicy {
-                name: Some(RestartPolicyNameEnum::UNLESS_STOPPED),
-                maximum_retry_count: None,
-            }),
+            // Canonical main-process exit is terminal. Runtime restart would
+            // silently create a new process generation behind the gateway.
+            restart_policy: None,
             cap_add: Some(vec![
                 "SYS_ADMIN".to_string(),
                 "NET_ADMIN".to_string(),

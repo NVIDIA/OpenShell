@@ -35,6 +35,8 @@ pub struct BootstrapData {
 pub struct EntrypointStarted {
     pub pid: u32,
     pub start_session: bool,
+    pub instance_id: String,
+    pub exit_code: Option<i32>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -57,6 +59,9 @@ pub enum ControlUpdate {
     AgentProposals {
         enabled: bool,
         config_revision: u64,
+    },
+    MainProcessExitAck {
+        instance_id: String,
     },
 }
 
@@ -115,6 +120,13 @@ impl Publisher {
             config_revision,
         });
     }
+
+    #[cfg(any(target_os = "linux", test))]
+    pub fn publish_main_process_exit_ack(&self, instance_id: String) {
+        let _ = self
+            .updates
+            .send(WireServerMessage::MainProcessExitAck { instance_id });
+    }
 }
 
 pub struct ServerHandle {
@@ -155,7 +167,8 @@ pub struct ProcessConnection {
 #[serde(tag = "type", rename_all = "snake_case")]
 enum WireClientMessage {
     BootstrapRequest { supervisor_pid: u32 },
-    EntrypointStarted { pid: u32 },
+    EntrypointStarted { pid: u32, instance_id: String },
+    MainProcessExited { instance_id: String, exit_code: i32 },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -181,6 +194,9 @@ enum WireServerMessage {
     AgentProposalsUpdated {
         enabled: bool,
         config_revision: u64,
+    },
+    MainProcessExitAck {
+        instance_id: String,
     },
 }
 
@@ -271,6 +287,9 @@ impl TryFrom<WireServerMessage> for ControlUpdate {
                 enabled,
                 config_revision,
             }),
+            WireServerMessage::MainProcessExitAck { instance_id } => {
+                Ok(Self::MainProcessExitAck { instance_id })
+            }
             WireServerMessage::BootstrapResponse { .. } => Err(miette::miette!(
                 "unexpected sidecar bootstrap response after initial handshake"
             )),
@@ -431,11 +450,14 @@ async fn handle_connection(
                 .send(EntrypointStarted {
                     pid: supervisor_pid,
                     start_session: false,
+                    instance_id: String::new(),
+                    exit_code: None,
                 })
                 .await
                 .map_err(|_| miette::miette!("sidecar entrypoint receiver closed"))?;
         }
-        WireClientMessage::EntrypointStarted { .. } => {
+        WireClientMessage::EntrypointStarted { .. }
+        | WireClientMessage::MainProcessExited { .. } => {
             return Err(miette::miette!(
                 "sidecar control client sent entrypoint event before bootstrap"
             ));
@@ -462,7 +484,7 @@ async fn handle_connection(
                     WireClientMessage::BootstrapRequest { .. } => {
                         debug!("Ignoring duplicate sidecar bootstrap request");
                     }
-                    WireClientMessage::EntrypointStarted { pid } => {
+                    WireClientMessage::EntrypointStarted { pid, instance_id } => {
                         if pid == 0 {
                             warn!("Ignoring sidecar entrypoint event with pid=0");
                             continue;
@@ -471,6 +493,22 @@ async fn handle_connection(
                             .send(EntrypointStarted {
                                 pid,
                                 start_session: true,
+                                instance_id,
+                                exit_code: None,
+                            })
+                            .await
+                            .map_err(|_| miette::miette!("sidecar entrypoint receiver closed"))?;
+                    }
+                    WireClientMessage::MainProcessExited {
+                        instance_id,
+                        exit_code,
+                    } => {
+                        entrypoint_tx
+                            .send(EntrypointStarted {
+                                pid: 0,
+                                start_session: false,
+                                instance_id,
+                                exit_code: Some(exit_code),
                             })
                             .await
                             .map_err(|_| miette::miette!("sidecar entrypoint receiver closed"))?;
@@ -565,8 +603,25 @@ async fn connect_with_retry(path: &Path, timeout: Duration) -> Result<tokio::net
     }
 }
 
-pub async fn send_entrypoint_started(writer: &Arc<Mutex<OwnedWriteHalf>>, pid: u32) -> Result<()> {
-    let message = WireClientMessage::EntrypointStarted { pid };
+pub async fn send_entrypoint_started(
+    writer: &Arc<Mutex<OwnedWriteHalf>>,
+    pid: u32,
+    instance_id: String,
+) -> Result<()> {
+    let message = WireClientMessage::EntrypointStarted { pid, instance_id };
+    let mut writer = writer.lock().await;
+    write_json_line(&mut *writer, &message).await
+}
+
+pub async fn send_main_process_exited(
+    writer: &Arc<Mutex<OwnedWriteHalf>>,
+    instance_id: String,
+    exit_code: i32,
+) -> Result<()> {
+    let message = WireClientMessage::MainProcessExited {
+        instance_id,
+        exit_code,
+    };
     let mut writer = writer.lock().await;
     write_json_line(&mut *writer, &message).await
 }
@@ -702,8 +757,9 @@ mod tests {
             current_peer(),
         )
         .unwrap();
+        let publisher = server.publisher();
         let mut entrypoint_rx = server.into_entrypoint_receiver();
-        let (_bootstrap, connection) = connect_process_client(&socket, Duration::from_secs(1))
+        let (_bootstrap, mut connection) = connect_process_client(&socket, Duration::from_secs(1))
             .await
             .unwrap();
 
@@ -714,7 +770,7 @@ mod tests {
         assert_eq!(anchor.pid, std::process::id());
         assert!(!anchor.start_session);
 
-        send_entrypoint_started(&connection.writer, 4242)
+        send_entrypoint_started(&connection.writer, 4242, "instance-1".to_string())
             .await
             .unwrap();
 
@@ -724,6 +780,33 @@ mod tests {
             .unwrap();
         assert_eq!(started.pid, 4242);
         assert!(started.start_session);
+        assert_eq!(started.instance_id, "instance-1");
+        assert!(started.exit_code.is_none());
+
+        send_main_process_exited(&connection.writer, "instance-1".to_string(), 0)
+            .await
+            .unwrap();
+        let terminal = tokio::time::timeout(Duration::from_secs(1), entrypoint_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(terminal.exit_code, Some(0));
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), connection.updates.recv())
+                .await
+                .is_err(),
+            "process side must not observe a durable ACK before gateway persistence"
+        );
+        publisher.publish_main_process_exit_ack("instance-1".to_string());
+        let ack = tokio::time::timeout(Duration::from_secs(1), connection.updates.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            ack,
+            ControlUpdate::MainProcessExitAck { instance_id } if instance_id == "instance-1"
+        ));
     }
 
     #[tokio::test]

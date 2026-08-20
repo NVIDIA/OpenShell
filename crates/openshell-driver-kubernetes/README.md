@@ -93,6 +93,11 @@ bootstrap exchange.
 The gateway uses the supervisor relay for connect, exec, and file sync. Sandbox
 pods do not need direct external ingress for SSH.
 
+The driver forwards the canonical main-process specification to the process
+supervisor and sets pod `restartPolicy: Never`. Main-process environment
+overrides stay local to that child; the sidecar bootstrap retains the unmodified
+provider environment used by later exec, editor, and SFTP sessions.
+
 ## Container Security Context
 
 The default `combined` supervisor topology grants the sandbox agent container

@@ -148,6 +148,10 @@ message DriverSandboxSpec {
   // ServiceAccount token bootstrap instead). Never echoed to the public
   // Sandbox proto.
   string sandbox_token = 11 [(openshell.options.v1.secret) = true];
+  // Exact canonical command forwarded to the supervisor without shell parsing.
+  repeated string command = 12;
+  // Allocate a retained pseudo-terminal for the canonical process.
+  bool tty = 13;
 }
 
 message ResourceRequirements {
