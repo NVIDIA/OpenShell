@@ -2285,12 +2285,7 @@ pub fn drop_privileges_with_identity(
         },
     };
 
-    #[cfg(not(any(
-        target_os = "macos",
-        target_os = "ios",
-        target_os = "haiku",
-        target_os = "redox"
-    )))]
+    #[cfg(target_os = "linux")]
     if target_uid != nix::unistd::geteuid() {
         let user_name_is_numeric = user_name.is_some_and(|n| n.parse::<u32>().is_ok());
         let initgroups_name =
