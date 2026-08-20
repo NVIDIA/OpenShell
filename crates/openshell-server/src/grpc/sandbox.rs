@@ -29,8 +29,7 @@ use openshell_core::proto::{
 };
 use openshell_core::proto::{Sandbox, SandboxPhase, SandboxTemplate, SshSession};
 use openshell_core::telemetry::{
-    LifecycleOperation, LifecycleResource, SandboxTemplateSource, TelemetryComputeDriver,
-    TelemetryOutcome,
+    LifecycleOperation, LifecycleResource, SandboxTemplateSource, TelemetryOutcome,
 };
 use openshell_core::{ObjectId, ObjectName, ObjectWorkspace};
 use prost::Message;
@@ -172,7 +171,7 @@ fn emit_sandbox_create_telemetry(
     request: &CreateSandboxRequest,
     outcome: TelemetryOutcome,
 ) {
-    let compute_driver = telemetry_compute_driver(state.compute.configured_driver_name());
+    let compute_driver = state.compute.telemetry_compute_driver();
     let Some(spec) = request.spec.as_ref() else {
         openshell_core::telemetry::emit_sandbox_create(
             outcome,
@@ -203,10 +202,6 @@ fn emit_sandbox_create_telemetry(
         template_source,
         compute_driver,
     );
-}
-
-fn telemetry_compute_driver(driver_name: &str) -> TelemetryComputeDriver {
-    TelemetryComputeDriver::from_raw(driver_name)
 }
 
 async fn handle_create_sandbox_inner(
@@ -2593,30 +2588,6 @@ mod tests {
                 "{phase:?} should keep the watch open"
             );
         }
-    }
-
-    #[test]
-    fn telemetry_compute_driver_uses_resolved_driver_kind() {
-        assert_eq!(
-            telemetry_compute_driver("docker"),
-            TelemetryComputeDriver::from_raw("docker")
-        );
-        assert_eq!(
-            telemetry_compute_driver("kubernetes"),
-            TelemetryComputeDriver::from_raw("kubernetes")
-        );
-        assert_eq!(
-            telemetry_compute_driver("podman"),
-            TelemetryComputeDriver::from_raw("podman")
-        );
-        assert_eq!(
-            telemetry_compute_driver("vm"),
-            TelemetryComputeDriver::from_raw("vm")
-        );
-        assert_eq!(
-            telemetry_compute_driver(""),
-            TelemetryComputeDriver::from_raw("")
-        );
     }
 
     #[test]

@@ -159,20 +159,35 @@ impl SandboxTemplateSource {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TelemetryComputeDriver(String);
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TelemetryComputeDriver(&'static str);
 
 impl TelemetryComputeDriver {
     #[must_use]
-    pub fn as_str(&self) -> &str {
-        &self.0
+    pub const fn as_str(self) -> &'static str {
+        self.0
     }
 
+    /// Classify an unregistered compute driver without exposing its configured
+    /// name.
     #[must_use]
-    pub fn from_raw(raw: &str) -> Self {
-        let name = crate::config::normalize_compute_driver_name(raw)
-            .unwrap_or_else(|_| "unknown".to_string());
-        Self(name)
+    pub const fn custom() -> Self {
+        Self("custom")
+    }
+
+    /// Define a bounded, anonymous category at a binary composition boundary.
+    ///
+    /// The category must be a static operational label. Never construct it
+    /// from user input, configuration, resource names, or other runtime data.
+    #[must_use]
+    pub const fn anonymous_category(category: &'static str) -> Self {
+        Self(category)
+    }
+}
+
+impl Default for TelemetryComputeDriver {
+    fn default() -> Self {
+        Self::custom()
     }
 }
 
@@ -657,21 +672,11 @@ mod tests {
     }
 
     #[test]
-    fn compute_driver_values_are_normalized_without_enumerating_backends() {
-        assert_eq!(TelemetryComputeDriver::from_raw("alpha").as_str(), "alpha");
+    fn compute_driver_values_are_bounded_by_the_composition_boundary() {
+        assert_eq!(TelemetryComputeDriver::custom().as_str(), "custom");
         assert_eq!(
-            TelemetryComputeDriver::from_raw(" Alpha ").as_str(),
-            "alpha"
-        );
-        assert_eq!(
-            TelemetryComputeDriver::from_raw("CUSTOM_BACKEND").as_str(),
-            "custom_backend"
-        );
-        assert_eq!(TelemetryComputeDriver::from_raw("beta").as_str(), "beta");
-        assert_eq!(TelemetryComputeDriver::from_raw("gamma").as_str(), "gamma");
-        assert_eq!(
-            TelemetryComputeDriver::from_raw("private-driver").as_str(),
-            "private-driver"
+            TelemetryComputeDriver::anonymous_category("first_party").as_str(),
+            "first_party"
         );
     }
 
@@ -760,7 +765,7 @@ mod disabled_tests {
             1,
             false,
             SandboxTemplateSource::Default,
-            TelemetryComputeDriver::from_raw("test-driver"),
+            TelemetryComputeDriver::custom(),
         );
         emit_policy_decision(
             PolicyDecisionOperation::Approve,

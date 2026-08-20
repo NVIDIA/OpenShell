@@ -10,7 +10,7 @@ OpenShell builds these main artifacts:
 
 | Artifact | Source |
 |---|---|
-| Gateway binary | `crates/openshell-server` |
+| Gateway binary | `crates/openshell-gateway` |
 | CLI binaries and system packages | `crates/openshell-cli` plus release packaging |
 | E2E conformance CLI | `crates/openshell-conformance-cli` |
 | Python SDK wheel | `python/openshell` |

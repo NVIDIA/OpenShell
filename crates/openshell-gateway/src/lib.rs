@@ -20,6 +20,8 @@ compile_error!(
 mod vm;
 
 #[cfg(all(not(target_os = "windows"), feature = "in-tree-compute-drivers"))]
+use openshell_core::telemetry::TelemetryComputeDriver;
+#[cfg(all(not(target_os = "windows"), feature = "in-tree-compute-drivers"))]
 use openshell_server::ComputeDriverRegistration;
 use openshell_server::ComputeDriverRegistry;
 
@@ -44,6 +46,7 @@ fn install_in_tree_compute_drivers(registry: &mut ComputeDriverRegistry) {
         )
         .map(|registration| {
             registration
+                .with_telemetry_category(TelemetryComputeDriver::anonymous_category("kubernetes"))
                 .without_mtls_user_auth()
                 .with_inherited_config_keys(&[
                     "namespace",
@@ -64,6 +67,7 @@ fn install_in_tree_compute_drivers(registry: &mut ComputeDriverRegistry) {
         )
         .map(|registration| {
             registration
+                .with_telemetry_category(TelemetryComputeDriver::anonymous_category("podman"))
                 .with_local_singleplayer()
                 .with_tracing_setup(podman_tracing_setup)
                 .with_inherited_config_keys(&[
@@ -83,6 +87,7 @@ fn install_in_tree_compute_drivers(registry: &mut ComputeDriverRegistry) {
         )
         .map(|registration| {
             registration
+                .with_telemetry_category(TelemetryComputeDriver::anonymous_category("docker"))
                 .with_local_singleplayer()
                 .with_inherited_config_keys(&[
                     "sandbox_namespace",
@@ -96,6 +101,7 @@ fn install_in_tree_compute_drivers(registry: &mut ComputeDriverRegistry) {
         }),
         ComputeDriverRegistration::new("vm", u16::MAX, None, VmFactory).map(|registration| {
             registration
+                .with_telemetry_category(TelemetryComputeDriver::anonymous_category("vm"))
                 .with_local_singleplayer()
                 .with_inherited_config_keys(&[
                     "default_image",
@@ -118,18 +124,13 @@ fn podman_tracing_setup(
     let (provider, error) = openshell_driver_podman::otel_tracing::provider_for(otlp_endpoint);
     let layer = provider.as_ref().map(|provider| {
         let layer: openshell_server::ComputeDriverTracingLayer = Box::new(
-            openshell_driver_podman::otel_tracing::in_process_layer(
-                provider,
-            ),
+            openshell_driver_podman::otel_tracing::in_process_layer(provider),
         );
         layer
     });
     let shutdown = provider.map(|provider| {
-        let shutdown: openshell_server::ComputeDriverTracingShutdown = Box::new(move || {
-            provider
-                .shutdown()
-                .map_err(|error| error.to_string())
-        });
+        let shutdown: openshell_server::ComputeDriverTracingShutdown =
+            Box::new(move || provider.shutdown().map_err(|error| error.to_string()));
         shutdown
     });
     openshell_server::ComputeDriverTracingSetup::new(
