@@ -71,7 +71,7 @@ Use gateway metadata, deployment values, or the user's setup notes to identify t
 
 Before debugging the compute platform, inspect gateway logs for failures in dependencies initialized before the listener becomes ready.
 
-For out-of-tree compute drivers, confirm the custom driver name and socket agree across CLI flags or `gateway.toml`, and that the operator-owned driver is running before the gateway starts:
+For out-of-tree compute drivers, confirm the selected driver name and socket agree across CLI flags or `gateway.toml`, and that the operator-owned driver is running before the gateway starts:
 
 ```bash
 rg -n 'compute_drivers|socket_path' /etc/openshell/gateway.toml
@@ -80,7 +80,7 @@ journalctl -u <driver-service> --no-pager --lines=200
 journalctl -u openshell-gateway --no-pager --lines=200
 ```
 
-The custom driver name must not be a reserved built-in name (`docker`, `podman`, `kubernetes`, or `vm`). The socket must be accessible only to the intended gateway identity. Check gateway logs for connection errors, `GetCapabilities` failures, or an unexpected advertised driver name. The gateway does not create or supervise out-of-tree driver processes or sockets.
+Custom names use `[openshell.drivers.<name>].socket_path`. A launch-time `--compute-driver-socket` override may also use `docker`, `podman`, `kubernetes`, or `vm`; the endpoint then takes precedence over built-in construction. The socket must be accessible only to the intended gateway identity. Check gateway logs for connection errors, `GetCapabilities` failures, or an unexpected advertised driver name. The advertised name is diagnostic metadata; negotiated features control optional behavior. The gateway does not create or supervise operator-supplied driver processes or sockets.
 
 For configured gateway interceptors, inspect `[[openshell.gateway.interceptors]]`, their Unix or network endpoints, and gateway startup logs:
 
@@ -186,6 +186,7 @@ Common findings:
   callbacks. On an older release, set `bind_address = "127.0.0.1:17670"` or
   upgrade.
 - Supervisor image exits before printing `openshell-sandbox --version`: the image should be the scratch supervisor image from `deploy/docker/Dockerfile.supervisor` and must contain a static executable at `/openshell-sandbox`.
+- A sandbox with explicit `protocol: tcp` endpoints fails before workload readiness: confirm the Docker or Podman driver supplied the `policy-dns-transparent-tcp` runtime capability and inspect supervisor logs for missing `nft`, synthetic-route overlap, or namespace-local DNS/TCP listener bind failures. Kubernetes, VM, sidecar, and out-of-tree drivers must reject this policy until they provide the complete substrate; use omitted protocol with an explicit proxy on those runtimes.
 - `mise run e2e:docker:gpu` fails with `docker info --format json did not report any discovered NVIDIA CDI GPU devices`: Docker may report `CDISpecDirs` while still having no generated NVIDIA CDI specs. Verify `.DiscoveredDevices` contains entries such as `nvidia.com/gpu=all`, verify `/etc/cdi` or `/var/run/cdi` contains a generated NVIDIA spec, and check that `nvidia-cdi-refresh.service` and `nvidia-cdi-refresh.path` from NVIDIA Container Toolkit are enabled and healthy. The service is a one-shot unit, so `inactive (dead)` can be normal after a successful run; use `systemctl status` and `journalctl` to distinguish success from a skipped or failed refresh. NVIDIA recommends enabling the path and service units, and restarting `nvidia-cdi-refresh.service` to regenerate missing or stale CDI specs. If specs are generated but Docker still reports no discovered devices, restart Docker or reload the daemon and re-check `docker info`.
 
 For source checkout development, restart the local gateway with:
@@ -199,7 +200,9 @@ running intent should stop before the gateway exits and restart after it
 returns. Check for `Stopped sandbox during gateway shutdown` and `Started
 sandbox during gateway startup` in gateway logs. A sandbox explicitly stopped
 through the CLI remains stopped. Kubernetes sandboxes are cluster-owned and do
-not follow this local gateway lifecycle.
+not follow this local gateway lifecycle. Internal and external drivers follow
+the same rule: `GetCapabilities.gateway_manages_lifecycle` must be true for the
+gateway to run shutdown and startup sweeps.
 
 ### Step 5: Check Podman-Backed Gateways
 
@@ -217,6 +220,10 @@ Common findings:
 - Sandbox image missing or pull denied: verify image reference and registry credentials.
 - Sandbox fails before readiness with an identity-resolution error: inspect the image's OCI `USER` and matching `/etc/passwd` and `/etc/group` entries, or explicitly set both process identity fields in policy. Numeric workload identities `1` through `4294967294` are accepted; root, the invalid identity sentinel, and missing identities are rejected.
 - Supervisor cannot call back: check callback endpoint and gateway logs.
+- A sandbox with explicit `protocol: tcp` endpoints fails before readiness:
+  inspect supervisor logs for policy DNS port-53 binding, synthetic-route, or
+  nftables redirect failures. Rootless Podman must provide these primitives
+  inside the supervisor-owned nested network namespace; setup fails closed.
 - Gateway exits before becoming healthy with a callback-listener discovery
   error: inspect `podman info --debug`, the configured Podman network, and the
   host's IPv4 default route. Rootless pasta uses the private source address
@@ -595,7 +602,7 @@ openshell logs <sandbox-name>
 | Binary WebSocket message passes without a middleware RPC | Binary is unsupported by the V1 text-message binding under both `on_error` modes | `WEBSOCKET_MIDDLEWARE_COVERAGE state=unsupported_message_type`; the next text RPC may have a valid sequence gap |
 | WebSocket messages stop reaching middleware after one failure | A fail-open stage stream was disabled for the rest of the connection | `openshell.middleware.websocket_stage_disabled`; middleware timeout/stream/protocol logs. A per-message capacity bypass alone leaves the stage active. Reconnect to create a fresh stream after a genuine stream failure |
 | Supervisor repeatedly fails to install middleware after enabling gateway JWT signing | Extension credential minting, distribution, or authenticated service connection failed; last-known-good registry remains active | Gateway `RefreshSandboxToken` logs, sandbox configuration events, service token-verification logs, registration TLS/audience settings |
-| Custom compute driver is unavailable | Driver process/socket missing, inaccessible, or configured with a reserved/mismatched name | Socket ownership/mode, driver service logs, gateway `GetCapabilities` logs |
+| Custom compute driver is unavailable | Driver process/socket missing, inaccessible, or selected name does not match its endpoint/config key | Socket ownership/mode, driver service logs, gateway `GetCapabilities` logs |
 | Sandbox remains `Stopping` or `Starting` | Driver stop/start failed, retained resource is missing, or a fresh supervisor has not connected | Gateway and driver logs; `docker inspect`, `podman inspect`, Agent Sandbox status/PVC, or VM state marker and launcher process |
 | Image pull failure | Gateway or sandbox image cannot be pulled | Runtime events and image pull credentials |
 | `K8s namespace not ready` with `envoy-gateway-openshell.yaml: the server could not find the requested resource` | Optional Gateway API manifest was applied without Envoy Gateway CRDs, or k3s Helm controller startup exceeded the namespace wait | Apply `deploy/kube/manifests/envoy-gateway-openshell.yaml` manually only after Envoy Gateway is installed and `grpcRoute` is enabled |

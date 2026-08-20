@@ -81,9 +81,8 @@ use tonic::{Request, Response, Status};
 use tracing::{debug, info, warn};
 
 use super::validation::{
-    level_matches, normalize_process_identity_for_driver, source_matches, validate_annotations,
-    validate_no_reserved_provider_policy_keys, validate_policy_safety,
-    validate_static_fields_unchanged,
+    level_matches, source_matches, validate_annotations, validate_no_reserved_provider_policy_keys,
+    validate_policy_safety, validate_static_fields_unchanged,
 };
 use super::{MAX_PAGE_SIZE, StoredSettingValue, StoredSettings, clamp_limit};
 use crate::persistence::current_time_ms;
@@ -2705,7 +2704,6 @@ async fn handle_update_config_inner(
                 Status::invalid_argument("policy is required for global policy update")
             })?;
             clear_provider_credentialed_markers(&mut new_policy);
-            normalize_process_identity_for_driver(&mut new_policy, state.compute.driver_kind());
             validate_no_reserved_provider_policy_keys(&new_policy)?;
             validate_policy_safety(&new_policy)?;
             crate::middleware::validate_policy(state.middleware_registry.as_ref(), &new_policy)
@@ -2999,10 +2997,7 @@ async fn handle_update_config_inner(
             provenance: &req.annotations,
             annotations: &req.annotations,
         };
-        let mut baseline_policy = spec.policy.clone();
-        if let Some(policy) = baseline_policy.as_mut() {
-            normalize_process_identity_for_driver(policy, state.compute.driver_kind());
-        }
+        let baseline_policy = spec.policy.clone();
         let (version, hash, updated_sandbox) = apply_merge_operations_with_retry(
             state.store.as_ref(),
             &sandbox_id,
@@ -3078,8 +3073,6 @@ async fn handle_update_config_inner(
         .policy
         .ok_or_else(|| Status::invalid_argument("policy is required"))?;
     clear_provider_credentialed_markers(&mut new_policy);
-    normalize_process_identity_for_driver(&mut new_policy, state.compute.driver_kind());
-
     let global_settings = load_global_settings(state.store.as_ref()).await?;
     if global_settings.settings.contains_key(POLICY_SETTING_KEY) {
         return Err(Status::failed_precondition(
@@ -3104,11 +3097,7 @@ async fn handle_update_config_inner(
     }
 
     let backfill_policy = if let Some(baseline_policy) = spec.policy.as_ref() {
-        let mut comparable_baseline = baseline_policy.clone();
-        normalize_process_identity_for_driver(
-            &mut comparable_baseline,
-            state.compute.driver_kind(),
-        );
+        let comparable_baseline = baseline_policy.clone();
         validate_static_fields_unchanged(&comparable_baseline, &new_policy)?;
         None
     } else {
@@ -15422,6 +15411,7 @@ mod tests {
         assert_eq!(response.version, 1);
 
         // Verify the resource_version incremented and policy was backfilled
+        // without replacing an omitted process identity component.
         let updated_sandbox = state
             .store
             .get_message_by_name::<Sandbox>("default", "test-sandbox")
@@ -15433,9 +15423,9 @@ mod tests {
             .as_ref()
             .and_then(|spec| spec.policy.as_ref())
             .and_then(|policy| policy.process.as_ref())
-            .expect("legacy process identity should be persisted");
+            .expect("partial process identity should be persisted");
         assert_eq!(process.run_as_user, "1234");
-        assert_eq!(process.run_as_group, "sandbox");
+        assert!(process.run_as_group.is_empty());
         assert_eq!(
             updated_sandbox.metadata.as_ref().unwrap().resource_version,
             current_version + 1,

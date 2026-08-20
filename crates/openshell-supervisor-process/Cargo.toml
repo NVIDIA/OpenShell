@@ -18,6 +18,7 @@ openshell-policy = { path = "../openshell-policy" }
 anyhow = { workspace = true }
 base64 = { workspace = true }
 hex = "0.4"
+ipnet = "2"
 miette = { workspace = true }
 nix = { workspace = true }
 rand = "0.10"
@@ -39,6 +40,7 @@ rustix = { workspace = true }
 capctl = "0.2.4"
 landlock = "0.4"
 seccompiler = "0.5"
+socket2 = { workspace = true }
 tempfile = "3"
 
 [dev-dependencies]

@@ -240,12 +240,20 @@ impl OcsfEvent {
                     (false, true) => format!(" {action}"),
                     (false, false) => format!(" {action}{arrow}"),
                 };
-                let message_ctx =
-                    if detail.is_empty() && rule_ctx.is_empty() && reason_ctx.is_empty() {
-                        message_tag(&e.base)
-                    } else {
-                        String::new()
-                    };
+                // Most network messages duplicate the structured action and
+                // destination shown above. Transparent TCP correlation is the
+                // exception: its message intentionally carries the logical,
+                // synthetic, and actual dial targets needed to follow the
+                // policy-DNS mapping in the human-readable audit log.
+                let show_correlation_message =
+                    e.base.status_detail.as_deref() == Some("transparent_tcp_allowed");
+                let message_ctx = if show_correlation_message
+                    || (detail.is_empty() && rule_ctx.is_empty() && reason_ctx.is_empty())
+                {
+                    message_tag(&e.base)
+                } else {
+                    String::new()
+                };
                 format!("NET:{activity} {sev}{detail}{rule_ctx}{reason_ctx}{message_ctx}")
             }
 

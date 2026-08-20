@@ -90,11 +90,15 @@ pub fn provider_for(cfg: Option<&OtlpConfig>) -> (Option<SdkTracerProvider>, Opt
 ///
 /// Events stay on the gateway's logging layers. Spans emitted by the
 /// OpenTelemetry crates are excluded to prevent recursive export traffic.
-pub fn layer<S>(provider: &SdkTracerProvider) -> openshell_otel::OtlpLayer<S>
+pub fn layer<S>(provider: &SdkTracerProvider) -> openshell_otel::TargetOtlpLayer<S>
 where
     S: Subscriber + for<'span> LookupSpan<'span>,
 {
-    openshell_otel::layer(provider, INSTRUMENTATION_SCOPE)
+    openshell_otel::layer_excluding_target_prefix(
+        provider,
+        INSTRUMENTATION_SCOPE,
+        openshell_driver_podman::otel_tracing::IN_PROCESS_TARGET_PREFIX,
+    )
 }
 
 /// Isolated in-memory span exporters for tracing tests.

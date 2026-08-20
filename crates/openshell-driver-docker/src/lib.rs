@@ -490,11 +490,12 @@ impl DockerComputeDriver {
     }
 
     fn capabilities(&self) -> GetCapabilitiesResponse {
-        openshell_core::driver_utils::build_capabilities_response(
-            "docker",
-            &self.config.daemon_version,
-            &self.config.default_image,
-        )
+        GetCapabilitiesResponse {
+            driver_name: "docker".to_string(),
+            driver_version: self.config.daemon_version.clone(),
+            default_image: self.config.default_image.clone(),
+            gateway_manages_lifecycle: true,
+        }
     }
 
     #[cfg(test)]
@@ -2392,6 +2393,10 @@ fn build_environment_for_oci_user(
     environment.insert(
         openshell_core::sandbox_env::TELEMETRY_ENABLED.to_string(),
         openshell_core::telemetry::enabled_env_value().to_string(),
+    );
+    environment.insert(
+        openshell_core::sandbox_env::NETWORK_RUNTIME_CAPABILITIES.to_string(),
+        openshell_core::sandbox_env::POLICY_DNS_TRANSPARENT_TCP_CAPABILITY.to_string(),
     );
     // The root supervisor executes namespace helpers during bootstrap; keep
     // their search path driver-owned even when the template/spec set PATH.

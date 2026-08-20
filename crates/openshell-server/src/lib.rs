@@ -437,6 +437,7 @@ impl ServerState {
 /// Returns an error if the server fails to start or encounters a fatal error.
 pub(crate) async fn run_server(
     startup: ServerStartupConfig,
+    compute_driver: ConfiguredComputeDriver,
     tracing_log_bus: TracingLogBus,
 ) -> Result<()> {
     let ServerStartupConfig {
@@ -593,6 +594,7 @@ pub(crate) async fn run_server(
     let (compute, operator_allowlist) = build_compute_runtime(
         &config,
         driver_startup,
+        compute_driver,
         store.clone(),
         sandbox_index.clone(),
         sandbox_watch_bus.clone(),
@@ -1088,6 +1090,7 @@ type OperatorAllowlistArc = Option<openshell_driver_kubernetes::OperatorNamespac
 async fn build_compute_runtime(
     config: &Config,
     driver_startup: compute::driver_config::DriverStartupContext<'_>,
+    driver: ConfiguredComputeDriver,
     store: Arc<Store>,
     sandbox_index: SandboxIndex,
     sandbox_watch_bus: SandboxWatchBus,
@@ -1095,7 +1098,6 @@ async fn build_compute_runtime(
     supervisor_sessions: Arc<supervisor_session::SupervisorSessionRegistry>,
     shutdown_rx: watch::Receiver<bool>,
 ) -> Result<(ComputeRuntime, OperatorAllowlistArc)> {
-    let driver = configured_compute_driver(config, driver_startup)?;
     info!(driver = %driver.name(), "Using compute driver");
 
     let (runtime, operator_allowlist) = match driver {
@@ -1205,7 +1207,7 @@ async fn build_compute_runtime(
 }
 
 #[derive(Debug, Clone)]
-enum ConfiguredComputeDriver {
+pub(crate) enum ConfiguredComputeDriver {
     Builtin(ComputeDriverKind),
     Remote { name: String },
 }
@@ -1242,19 +1244,35 @@ fn configured_compute_driver(
     }
 }
 
+pub(crate) fn configured_compute_driver_for_startup(
+    startup: &ServerStartupConfig,
+) -> Result<ConfiguredComputeDriver> {
+    configured_compute_driver(
+        &startup.config,
+        compute::driver_config::DriverStartupContext {
+            file: startup.config_file.as_ref(),
+            guest_tls: startup.guest_tls.as_ref(),
+            gateway_port: startup.config.bind_address.port(),
+            gateway_tls_enabled: startup.config.tls.is_some(),
+            endpoint_overrides: &startup.config.compute_driver_endpoints,
+        },
+    )
+}
+
 fn resolve_configured_compute_driver(
     driver_name: &str,
     driver_startup: compute::driver_config::DriverStartupContext<'_>,
 ) -> Result<ConfiguredComputeDriver> {
     let name = openshell_core::config::normalize_compute_driver_name(driver_name)
         .map_err(Error::config)?;
-    let driver_kind = builtin_compute_driver(&name);
-    if driver_kind.is_some() && driver_startup.endpoint_overrides.contains_key(&name) {
-        return Err(Error::config(format!(
-            "compute driver '{name}' is a reserved built-in driver and cannot be selected with a socket endpoint"
-        )));
+    // An operator-provided endpoint replaces normal construction for the
+    // selected name. The gateway connects to it; it does not provision a
+    // remote implementation for canonical built-in names.
+    if driver_startup.endpoint_overrides.contains_key(&name) {
+        return Ok(ConfiguredComputeDriver::Remote { name });
     }
 
+    let driver_kind = builtin_compute_driver(&name);
     if let Some(kind) = driver_kind {
         return Ok(ConfiguredComputeDriver::Builtin(kind));
     }
@@ -1877,35 +1895,31 @@ mod tests {
     }
 
     #[test]
-    fn configured_compute_driver_rejects_vm_endpoint_from_config() {
+    fn configured_compute_driver_uses_vm_endpoint_override() {
         let config = Config::new(None)
             .with_compute_drivers([ComputeDriverKind::Vm])
             .with_compute_driver_endpoint("vm", "/run/openshell/vm.sock");
 
-        let err =
-            configured_compute_driver(&config, test_driver_startup(&config, None)).unwrap_err();
-
-        assert!(
-            err.to_string()
-                .contains("reserved built-in driver and cannot be selected with a socket endpoint"),
-            "unexpected error: {err}"
-        );
+        let driver =
+            configured_compute_driver(&config, test_driver_startup(&config, None)).unwrap();
+        assert!(matches!(
+            driver,
+            ConfiguredComputeDriver::Remote { name } if name == "vm"
+        ));
     }
 
     #[test]
-    fn configured_compute_driver_rejects_builtin_endpoint() {
+    fn configured_compute_driver_uses_builtin_endpoint_override() {
         let config = Config::new(None)
             .with_compute_drivers([ComputeDriverKind::Docker])
             .with_compute_driver_endpoint("docker", "/run/openshell/docker.sock");
 
-        let err =
-            configured_compute_driver(&config, test_driver_startup(&config, None)).unwrap_err();
-
-        assert!(
-            err.to_string()
-                .contains("cannot be selected with a socket endpoint"),
-            "unexpected error: {err}"
-        );
+        let driver =
+            configured_compute_driver(&config, test_driver_startup(&config, None)).unwrap();
+        assert!(matches!(
+            driver,
+            ConfiguredComputeDriver::Remote { name } if name == "docker"
+        ));
     }
 
     #[test]

@@ -63,10 +63,10 @@ socket inode.
 
 CONNECT and absolute-form forward HTTP are explicit-proxy adapters over the same
 egress pipeline. Each adapter normalizes its request into an egress intent, and
-the shared authorization result carries the process evidence used by destination
-validation and relay selection. During the compatibility migration, endpoint
-state is hydrated at the adapters' existing policy query points; it is not yet
-one atomic, generation-consistent authorization result. Destination validation
+the shared authorization result carries the process evidence and endpoint
+metadata used by destination validation and relay selection. Network action,
+matched policy, endpoint configuration, and exact-host authorization are
+evaluated as one atomic snapshot from one policy generation. Destination validation
 returns an unopened connector so adapters retain their existing response and
 upstream-dial timing. CONNECT prepares a generation-pinned relay context before
 entering shared TLS-terminated or plaintext HTTP relays; non-HTTP traffic uses
@@ -74,6 +74,39 @@ the shared raw byte relay after the existing adapter gates. Forward HTTP retains
 its guarded single-request relay while sharing authorization, request context,
 policy-pinning, and destination boundaries.
 Adapter-specific response and OCSF event shapes remain at the protocol boundary.
+An explicit `protocol: tcp` endpoint with a valid DNS hostname opts into native
+DNS and transparent TCP when the selected runtime advertises that substrate.
+Hostless `allowed_ips` and literal-IP selectors remain available only to the
+legacy explicit-proxy path when `protocol` is omitted. The shared supervisor
+answers only eligible DNS names, returns an epoch-scoped synthetic address, and
+publishes the expiring name, endpoint, ports, policy generation, and validated
+real addresses as one correlation. A connection to that synthetic address is
+captured before the bypass fence, mapped back to its workload process, authorized
+through the same egress pipeline, and dialed only through the pinned addresses.
+Omitted protocol endpoints retain explicit-proxy behavior.
+
+The DNS store is in-memory and sandbox-local. A combined-supervisor restart also
+restarts its workload; before execution, the supervisor advances a persisted
+boot epoch and installs only that epoch's synthetic capture ranges. An address
+cached from the preceding epoch therefore falls through to the bypass fence
+instead of inheriting a new mapping. Policy reload, expiry, wrong ports, direct real-IP access, missing
+mappings, or pool exhaustion fail closed. Resolver injection, DNS listeners,
+capture rules, and the transparent listener are all ready before workload
+execution. A runtime that cannot provide the complete contract rejects a policy
+containing explicit TCP endpoints rather than partially activating it. Because
+that substrate is startup infrastructure, a sandbox created without explicit
+TCP endpoints rejects a hot reload that introduces one and keeps its complete
+previous policy active; recreating the sandbox installs the substrate before
+the workload starts. A sandbox that started with the substrate may continue to
+remove and re-add TCP endpoints through ordinary atomic policy reloads.
+Workload DNS targets port 53, while nftables redirects eligible IPv4 DNS traffic
+to an unprivileged supervisor listener. The filter admits DNS and transparent
+TCP only when the kernel records the traffic as DNATed to the corresponding
+supervisor listener, so direct dials to either unprivileged listener port remain
+fenced. `SO_ORIGINAL_DST`, synthetic mapping lookup, endpoint correlation, and
+generation-pinned authorization form the transparent TCP security boundary.
+Docker and Podman do not currently advertise usable IPv6 egress for this
+substrate, so AAAA queries return NOERROR/NODATA and IPv6 DNS remains fenced.
 
 Provider credential placeholders are resolved through the live provider state
 for each HTTP request, after destination and L7 policy admission. A static

@@ -346,6 +346,11 @@ This is the most important multi-step workflow. It enables a tight feedback cycl
 
 **Key concept**: Policies have static fields (immutable after creation: `filesystem_policy`, `landlock`, `process`) and two dynamic fields: `network_policies` and `network_middlewares`. Both dynamic fields can be updated without recreating the sandbox.
 
+An endpoint with omitted `protocol` retains explicit-proxy behavior. Explicit
+`protocol: tcp` requests policy DNS and transparent TCP and currently requires
+the Docker or Podman runtime; unsupported runtimes reject the policy before starting the
+workload rather than activating only part of the network contract.
+
 ```
 Create sandbox with initial policy
         │

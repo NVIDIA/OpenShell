@@ -53,9 +53,8 @@ use super::provider::{
     get_provider_record, is_valid_env_key, validate_provider_environment_keys_unique,
 };
 use super::validation::{
-    level_matches, normalize_process_identity_for_driver, source_matches,
-    validate_exec_request_fields, validate_no_reserved_provider_policy_keys,
-    validate_policy_safety, validate_sandbox_spec,
+    level_matches, source_matches, validate_exec_request_fields,
+    validate_no_reserved_provider_policy_keys, validate_policy_safety, validate_sandbox_spec,
 };
 use super::{MAX_PAGE_SIZE, MAX_PROVIDERS, MAX_ROUTABLE_NAME_LEN, clamp_limit};
 use crate::persistence::current_time_ms;
@@ -268,11 +267,8 @@ async fn handle_create_sandbox_inner(
         template.image = state.compute.default_image().to_string();
     }
 
-    // Docker and Podman preserve omitted identity fields for OCI USER
-    // fallback. Other drivers retain the legacy persisted sandbox defaults.
     if let Some(ref mut policy) = spec.policy {
         super::policy::clear_provider_credentialed_markers(policy);
-        normalize_process_identity_for_driver(policy, state.compute.driver_kind());
         validate_no_reserved_provider_policy_keys(policy)?;
         validate_policy_safety(policy)?;
         crate::middleware::validate_policy(state.middleware_registry.as_ref(), policy).await?;
@@ -3443,7 +3439,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_and_get_restore_legacy_identity_defaults_for_non_local_driver() {
+    async fn create_and_get_preserve_partial_process_identity_for_kubernetes() {
         let state =
             test_server_state_with_driver(openshell_core::ComputeDriverKind::Kubernetes.as_str())
                 .await;
@@ -3470,7 +3466,7 @@ mod tests {
             }),
         )
         .await
-        .expect("Kubernetes identity defaults should be accepted")
+        .expect("partial Kubernetes process identity should be accepted")
         .into_inner();
 
         let process = response
@@ -3482,7 +3478,7 @@ mod tests {
             .unwrap()
             .process
             .unwrap();
-        assert_eq!(process.run_as_user, "sandbox");
+        assert!(process.run_as_user.is_empty());
         assert_eq!(process.run_as_group, "1234");
     }
 

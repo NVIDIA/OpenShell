@@ -23,6 +23,13 @@ references to gateway-internal types. The gateway owns the public
 `SandboxPhase::Ready` decision. This applies equally to extension drivers
 implementing `ComputeDriver` out of tree.
 
+`compute_driver.proto` is the supported gateway/driver extension boundary.
+At initialization the gateway snapshots the driver's identity, version,
+default image, and gateway-lifecycle preference from `GetCapabilities`.
+Process-identity omissions are preserved across this boundary so every driver
+can apply its native image or runtime defaults. Driver-requested listeners are
+structurally validated and remain restricted to sandbox callback RPCs.
+
 Drivers own runtime-specific platform event interpretation. When an event should
 drive client provisioning UI, the driver attaches the shared
 `openshell.progress.*` metadata defined in `openshell-core` instead of requiring
@@ -119,6 +126,11 @@ shared idempotent `StartSandbox` RPC before watch processing begins. Explicitly
 cluster-owned and continue running without gateway shutdown or startup
 lifecycle calls.
 
+The driver reports this behavior through
+`GetCapabilities.gateway_manages_lifecycle`. The same declaration works for
+in-process and external drivers. Older drivers omit the field and retain the
+conservative operator-managed behavior.
+
 ## Deletion Lifecycle
 
 Lifecycle requests use per-sandbox gates to serialize stop, start, and
@@ -152,11 +164,11 @@ delete, reconciliation removes the row; otherwise it can remain `Deleting`.
 
 | Runtime | Best fit | Sandbox boundary | Notes |
 |---|---|---|---|
-| Docker | Local development with Docker available. | Container plus nested sandbox namespace. | Uses host networking so loopback gateway endpoints work from the supervisor. |
-| Podman | Rootless or single-machine deployments. | Container plus nested sandbox namespace. | Uses the Podman REST API and CDI GPU devices when available. Delivers the supervisor via OCI image volume by default; falls back to extracting the binary to a host-side cache and bind-mounting it when `userns` is configured (overlay does not support idmapped mounts). |
+| Docker | Local development with Docker available. | Container plus nested sandbox namespace. | Uses host networking so loopback gateway endpoints work from the supervisor. Advertises the combined-supervisor policy-DNS and transparent-TCP substrate. |
+| Podman | Rootless or single-machine deployments. | Container plus nested sandbox namespace. | Uses the Podman REST API and CDI GPU devices when available. Delivers the supervisor via OCI image volume by default; falls back to extracting the binary to a host-side cache and bind-mounting it when `userns` is configured (overlay does not support idmapped mounts). Advertises the combined-supervisor policy-DNS and transparent-TCP substrate. |
 | Kubernetes | Cluster deployment through Helm. | Pod plus nested sandbox namespace. | Uses Kubernetes API objects, service accounts, secrets, PVC-backed workspace storage, and GPU resources. |
 | VM | Experimental microVM isolation. | Per-sandbox libkrun VM. | Managed endpoint-backed driver. The gateway spawns `openshell-driver-vm`, waits for its Unix socket, and then consumes it through the same remote `compute_driver.proto` path used by unmanaged endpoint drivers. The VM driver boots a cached bootstrap `rootfs.ext4`, prepares requested OCI images inside a bootstrap VM with `umoci`, attaches the prepared image disk read-only, and gives each sandbox a writable `overlay.ext4` for merged-root changes and runtime material. The driver persists each accepted launch request beside the overlay and restarts those VMs on driver startup without recreating the overlay. |
-| Extension | Out-of-tree drivers operated alongside the gateway. | Whatever boundary the driver implements. | Selected by a non-reserved custom `compute_drivers = ["<name>"]` entry with `[openshell.drivers.<name>].socket_path`, or at launch time by pairing `--drivers <name>` with `--compute-driver-socket=<path>`. Reserved built-in names such as `vm`, `docker`, `podman`, and `kubernetes` cannot be used as unmanaged socket endpoints. The gateway connects to a UDS the operator already provisioned, runs `GetCapabilities`, logs the advertised `driver_name`, and dispatches all sandbox lifecycle calls through `compute_driver.proto`. The driver process and socket lifecycle are operator-owned; the gateway does not spawn, supervise, or remove unmanaged extension drivers. The trust boundary is the socket's filesystem permissions: the operator must ensure only the gateway uid can read/write it. |
+| Extension | Out-of-tree drivers operated alongside the gateway. | Whatever boundary the driver implements. | Selected by a custom `compute_drivers = ["<name>"]` entry with `[openshell.drivers.<name>].socket_path`, or at launch time by pairing `--drivers <name>` with `--compute-driver-socket=<path>`. A launch-time endpoint may use a canonical built-in name to preserve its driver-config key while replacing in-process construction. The gateway connects to an operator-provisioned UDS, snapshots `GetCapabilities`, and dispatches all sandbox lifecycle calls through `compute_driver.proto`. The driver process and socket lifecycle are operator-owned; the gateway does not spawn, supervise, or remove unmanaged extension drivers. The trust boundary is the socket's filesystem permissions: the operator must ensure only the gateway uid can read/write it. |
 
 Per-sandbox CPU and memory values currently enter the driver layer through
 template resource limits. Docker and Podman apply them as runtime limits.
@@ -172,6 +184,16 @@ active local driver table of `gateway.toml`. Host bind mounts are an unsafe
 operator override because they place gateway-host filesystem state inside the
 sandbox and can negate OpenShell workspace isolation and filesystem-policy
 controls. Driver-owned supervisor, token, and TLS bind mounts stay reserved.
+
+Network features follow the existing driver/substrate split. Compute drivers
+advertise only the runtime mechanics they can guarantee: namespace and
+capability ownership, DNS/TCP capture installation, and coupled
+restart ordering. The shared supervisor remains the sole owner of DNS
+eligibility, synthetic mappings, process authorization, destination filtering,
+pinned dialing, relay behavior, and OCSF decisions. Docker and Podman advertise
+`policy-dns-transparent-tcp`; other runtimes reject explicit TCP policy until
+they implement and validate the same complete contract. The capability marker
+is driver-owned supervisor input and is removed from workload environments.
 
 Kubernetes deployments may set an AppArmor profile on sandbox agent containers
 through the driver configuration. The Helm chart defaults sandbox agents to

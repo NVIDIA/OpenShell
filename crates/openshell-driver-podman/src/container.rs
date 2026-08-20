@@ -228,6 +228,10 @@ struct ContainerSpec {
     /// via Podman's `host-gateway` magic so sandbox containers can reach
     /// the gateway server running on the host in rootless mode.
     hostadd: Vec<String>,
+    /// Search domains written to `/etc/resolv.conf` by Podman.
+    dns_search: Vec<String>,
+    /// Resolver options written to `/etc/resolv.conf` by Podman.
+    dns_option: Vec<String>,
     netns: NetNS,
     // Matches libpod's network spec format, which is `{name: {opts}}` where
     // empty opts is a unit struct rather than `()`. Keep as a map so JSON
@@ -523,6 +527,12 @@ fn build_env(
     env.insert(
         openshell_core::sandbox_env::TELEMETRY_ENABLED.into(),
         openshell_core::telemetry::enabled_env_value().into(),
+    );
+    // Runtime capabilities are driver-owned. Override image/user input with
+    // only the substrate that this driver configures for the supervisor.
+    env.insert(
+        openshell_core::sandbox_env::NETWORK_RUNTIME_CAPABILITIES.into(),
+        openshell_core::sandbox_env::POLICY_DNS_TRANSPARENT_TCP_CAPABILITY.into(),
     );
 
     // 3. TLS client cert paths (when mTLS is enabled). These point to
@@ -1217,6 +1227,11 @@ pub fn build_container_spec_for_image(
         // reach services on the host. `host.openshell.internal` is the driver-
         // neutral alias used by policies and e2e tests.
         hostadd: hostadd_entries(config),
+        // Preserve Podman's resolver defaults for both policy-DNS and ordinary
+        // sandboxes. Namespace-local capture supports UDP and TCP, so it must
+        // not depend on a libc-specific option or alter short-name searches.
+        dns_search: Vec::new(),
+        dns_option: Vec::new(),
         netns: NetNS {
             nsmode: "bridge".to_string(),
         },
@@ -1538,6 +1553,8 @@ mod tests {
         );
         assert_eq!(container["user"].as_str(), Some("0:0"));
         assert_eq!(container["image_pull_policy"].as_str(), Some("never"));
+        assert_eq!(container["dns_search"], serde_json::json!([]));
+        assert_eq!(container["dns_option"], serde_json::json!([]));
         assert_eq!(
             container["env"][openshell_core::sandbox_env::OCI_IMAGE_USER].as_str(),
             Some("app:staff")
@@ -1810,6 +1827,10 @@ mod tests {
         assert!(!dropped.contains(&"SETUID"), "SETUID must not be dropped");
         assert!(!dropped.contains(&"SETGID"), "SETGID must not be dropped");
         assert!(
+            dropped.contains(&"NET_BIND_SERVICE"),
+            "NET_BIND_SERVICE must stay dropped; policy DNS binds an unprivileged port"
+        );
+        assert!(
             !dropped.contains(&"CHOWN"),
             "CHOWN must not be dropped (needed for prepare_filesystem chown)"
         );
@@ -1966,6 +1987,26 @@ mod tests {
                     "telemetry toggle must come from the deployment environment"
                 );
             },
+        );
+    }
+
+    #[test]
+    fn container_spec_keeps_network_capabilities_driver_controlled() {
+        use openshell_core::proto::compute::v1::{DriverSandboxSpec, DriverSandboxTemplate};
+
+        let mut sandbox = test_sandbox("test-id", "legit-name");
+        sandbox.spec = Some(DriverSandboxSpec {
+            environment: std::collections::HashMap::from([(
+                openshell_core::sandbox_env::NETWORK_RUNTIME_CAPABILITIES.to_string(),
+                "spoofed".to_string(),
+            )]),
+            template: Some(DriverSandboxTemplate::default()),
+            ..Default::default()
+        });
+        let spec = build_container_spec(&sandbox, &test_config());
+        assert_eq!(
+            spec["env"][openshell_core::sandbox_env::NETWORK_RUNTIME_CAPABILITIES],
+            serde_json::json!(openshell_core::sandbox_env::POLICY_DNS_TRANSPARENT_TCP_CAPABILITY)
         );
     }
 

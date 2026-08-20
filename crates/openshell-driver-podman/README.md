@@ -7,6 +7,12 @@ driver runs in-process within the gateway server and delegates all sandbox
 isolation enforcement to the `openshell-sandbox` supervisor binary, which is
 sideloaded into each container via an OCI image volume mount.
 
+When the gateway configures `[openshell.gateway.otlp]`, Podman compute-driver
+spans export to the same OTLP/gRPC collector with the service name
+`openshell-driver-podman`. The driver preserves the gateway trace context and
+uses the same compute-driver RPC span names in its in-process and standalone
+forms.
+
 Before creating the container, the driver inspects the final sandbox image and
 captures its immutable image ID and raw OCI `Config.User`. Container creation
 uses that image ID with pulling disabled, preventing a mutable tag from changing
@@ -71,7 +77,7 @@ The container spec in `container.rs` sets these security-critical fields:
 |---|---|---|
 | `user` | `0:0` | The supervisor needs root inside the container for namespace creation, proxy setup, Landlock, seccomp, and filesystem preparation. |
 | `cap_drop` | Selected unneeded defaults | Podman's default capability set is already restricted. The driver drops capabilities the supervisor does not need. |
-| `cap_add` | `SYS_ADMIN`, `NET_ADMIN`, `SYS_PTRACE`, `SYSLOG`, `DAC_READ_SEARCH`, `SETPCAP` | Grants supervisor-only capabilities required for namespace setup, process identity, bypass diagnostics, and child bounding-set cleanup. |
+| `cap_add` | `SYS_ADMIN`, `NET_ADMIN`, `SYS_PTRACE`, `SYSLOG`, `DAC_READ_SEARCH`, `SETPCAP` | Grants supervisor-only capabilities required for namespace setup, process identity, bypass diagnostics, and child bounding-set cleanup. Policy DNS binds an unprivileged supervisor port and does not require `NET_BIND_SERVICE`. |
 | `no_new_privileges` | `true` | Prevents privilege escalation after exec. |
 | `seccomp_profile_path` | `unconfined` | The supervisor installs its own policy-aware BPF filter. A container-level profile can block Landlock/seccomp syscalls during setup. |
 | `mounts` | Private tmpfs at `/run/netns` | Lets the supervisor create named network namespaces in rootless Podman. |
@@ -136,7 +142,7 @@ and `FOWNER` capabilities because the supervisor needs them to drop privileges
 and prepare writable sandbox directories. It also keeps `SETPCAP` until child
 setup so `drop_privileges()` can clear the child capability bounding set before
 exec. It drops unneeded defaults such as
-`DAC_OVERRIDE`, `FSETID`, `KILL`, `NET_BIND_SERVICE`, `NET_RAW`, `SETFCAP`,
+`DAC_OVERRIDE`, `FSETID`, `KILL`, `NET_RAW`, `SETFCAP`,
 and `SYS_CHROOT`.
 
 ## Supervisor Sideloading
@@ -237,6 +243,14 @@ Key points:
 - Nested netns: the supervisor creates a private `NetworkNamespace` with a veth
   pair. Sandbox processes enter this netns via `setns(fd, CLONE_NEWNET)` in the
   `pre_exec` hook, forcing ordinary traffic through the CONNECT proxy.
+- Policy DNS and transparent TCP: the driver advertises the complete
+  `policy-dns-transparent-tcp` substrate. For explicit `protocol: tcp`
+  endpoints, the supervisor installs namespace-local DNS listeners, synthetic
+  routes, and TCP redirect rules before starting the workload. The container
+  disables Podman's implicit DNS search suffix so policy DNS evaluates the
+  exact endpoint name requested by the workload, and asks libc to use the
+  policy DNS TCP listener to avoid rootless Podman's nested UDP NAT return
+  path.
 - Port publishing: the container spec still requests `host_port: 0` for the
   configured SSH port. The gateway SSH tunnel uses the supervisor relay rather
   than connecting directly to the published port.

@@ -214,6 +214,39 @@ network_action := "allow" if {
 	network_policy_for_request
 }
 
+# --- Authoritative egress authorization snapshot ---
+#
+# Rust evaluates this rule once per admitted connection. Keeping the action,
+# matched policy, endpoint metadata, and exact-host signal in one result makes
+# them an atomic view of one policy generation.
+
+default _egress_matched_policy := ""
+
+_egress_matched_policy := matched_network_policy if {
+	matched_network_policy
+}
+
+default _egress_deny_reason := ""
+
+_egress_deny_reason := deny_reason if {
+	network_action == "deny"
+}
+
+default _egress_exact_declared_endpoint_host := false
+
+_egress_exact_declared_endpoint_host := true if {
+	exact_declared_endpoint_host
+}
+
+egress_authorization := {
+	"action": network_action,
+	"deny_reason": _egress_deny_reason,
+	"matched_policy": _egress_matched_policy,
+	"endpoint_configs": _matching_endpoint_configs,
+	"matched_endpoints": _matching_endpoint_records,
+	"exact_declared_endpoint_host": _egress_exact_declared_endpoint_host,
+}
+
 # ===========================================================================
 # L7 request evaluation (queried per-request within a tunnel)
 # ===========================================================================
@@ -864,6 +897,52 @@ _matching_endpoint_configs := [cfg |
 	endpoint_has_extended_config(cfg)
 ]
 
+# Full matched endpoint records are kept separate from the legacy
+# endpoint-config list, which intentionally contains only connection/L7
+# metadata. The policy name and array index identify the endpoint within this
+# policy generation while the complete endpoint preserves explicit protocol
+# markers needed by later policy-DNS correlation.
+
+_policy_endpoint_records(policy_name, policy) := [record |
+	some endpoint_index, ep in policy.endpoints
+	endpoint_matches_request(ep, input.network)
+	record := {
+		"policy_name": policy_name,
+		"endpoint_index": endpoint_index,
+		"endpoint": ep,
+	}
+]
+
+_matching_endpoint_records := [record |
+	some pname
+	_matching_policy_names[pname]
+	records := _policy_endpoint_records(pname, data.network_policies[pname])
+	record := records[_]
+]
+
+# Endpoints eligible for policy DNS are a policy-data snapshot, not an
+# authorization decision. In particular, they do not depend on input.exec or
+# grant access to any process. Only endpoints that explicitly opt into raw TCP
+# and provide a resolvable host plus concrete ports are materialized.
+policy_dns_eligible_endpoint_records := [record |
+	some policy_name, policy in data.network_policies
+	some endpoint_index, ep in policy.endpoints
+	lower(object.get(ep, "protocol", "")) == "tcp"
+	object.get(ep, "host", "") != ""
+	ports := object.get(ep, "ports", [])
+	count(ports) > 0
+	every port in ports {
+		is_number(port)
+		port >= 1
+		port <= 65535
+	}
+	record := {
+		"policy_name": policy_name,
+		"endpoint_index": endpoint_index,
+		"endpoint": ep,
+	}
+]
+
 matched_endpoint_config := _matching_endpoint_configs[0] if {
 	count(_matching_endpoint_configs) > 0
 }
@@ -943,10 +1022,13 @@ endpoint_path_matches_request(ep, request) if {
 	path_matches(request.path, path)
 }
 
-# An endpoint has extended config if it specifies L7 protocol, allowed_ips,
-# or an explicit tls mode (e.g. tls: skip).
+# An endpoint has extended config if it specifies an L7 protocol, allowed_ips,
+# or an explicit tls mode (e.g. tls: skip). Explicit protocol "tcp" is the
+# authored spelling of plain L4 behavior and does not select an L7 config.
 endpoint_has_extended_config(ep) if {
-	ep.protocol
+	protocol := object.get(ep, "protocol", "")
+	protocol != ""
+	lower(protocol) != "tcp"
 }
 
 endpoint_has_extended_config(ep) if {

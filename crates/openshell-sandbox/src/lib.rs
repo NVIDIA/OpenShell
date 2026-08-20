@@ -73,6 +73,15 @@ const SIDECAR_NETWORK_ENFORCEMENT_MODE: &str = "sidecar-nftables";
 const SIDECAR_TLS_DIR: &str = openshell_core::container_paths::SIDECAR_TLS_DIR;
 const SIDECAR_CA_CERT: &str = "openshell-ca.pem";
 const SIDECAR_CA_BUNDLE: &str = "ca-bundle.pem";
+
+#[cfg(any(test, target_os = "linux"))]
+fn has_network_runtime_capability(capabilities: Option<&str>, required: &str) -> bool {
+    capabilities.is_some_and(|capabilities| {
+        capabilities
+            .split(',')
+            .any(|capability| capability.trim() == required)
+    })
+}
 const SIDECAR_PROCESS_PROXY_ADDR: &str = "127.0.0.1:3128";
 const SIDECAR_READY_TIMEOUT_SECS: u64 = 120;
 
@@ -374,6 +383,87 @@ pub async fn run_sandbox(
         None
     };
 
+    #[cfg(target_os = "linux")]
+    let transparent_tcp_requested = opa_engine
+        .as_ref()
+        .map(|engine| engine.policy_dns_eligibility_snapshot())
+        .transpose()?
+        .is_some_and(|snapshot| !snapshot.endpoints.is_empty());
+    #[cfg(target_os = "linux")]
+    let runtime_capabilities =
+        std::env::var(openshell_core::sandbox_env::NETWORK_RUNTIME_CAPABILITIES).ok();
+    #[cfg(target_os = "linux")]
+    let transparent_tcp_capable = has_network_runtime_capability(
+        runtime_capabilities.as_deref(),
+        openshell_core::sandbox_env::POLICY_DNS_TRANSPARENT_TCP_CAPABILITY,
+    );
+    #[cfg(not(target_os = "linux"))]
+    let transparent_tcp_capable = false;
+    #[cfg(target_os = "linux")]
+    let transparent_runtime = if transparent_tcp_requested {
+        if !transparent_tcp_capable {
+            ocsf_emit!(
+                ConfigStateChangeBuilder::new(ocsf_ctx())
+                    .severity(SeverityId::Medium)
+                    .status(StatusId::Failure)
+                    .state(StateId::Disabled, "unsupported_runtime")
+                    .message(
+                        "Policy DNS and transparent TCP unavailable: runtime capability is missing"
+                    )
+                    .build()
+            );
+            return Err(miette::miette!(
+                "policy contains protocol: tcp endpoints, but the selected runtime does not advertise policy DNS and transparent TCP support"
+            ));
+        }
+        if sidecar_network_enforcement {
+            ocsf_emit!(
+                ConfigStateChangeBuilder::new(ocsf_ctx())
+                    .severity(SeverityId::Medium)
+                    .status(StatusId::Failure)
+                    .state(StateId::Disabled, "unsupported_topology")
+                    .message("Policy DNS and transparent TCP unavailable: sidecar topology is unsupported")
+                    .build()
+            );
+            return Err(miette::miette!(
+                "policy DNS and transparent TCP are not yet supported by the sidecar topology"
+            ));
+        }
+        let namespace = netns.as_ref().ok_or_else(|| {
+            miette::miette!("policy DNS and transparent TCP require a workload network namespace")
+        })?;
+        let listeners = namespace
+            .bind_transparent_tcp_listeners()
+            .await
+            .into_diagnostic()
+            .wrap_err("failed to bind transparent TCP listeners")?;
+        let (dns_udp, dns_tcp) = namespace
+            .bind_policy_dns_sockets()
+            .await
+            .into_diagnostic()
+            .wrap_err("failed to bind policy DNS listeners")?;
+        let proxy_port = policy
+            .network
+            .proxy
+            .as_ref()
+            .and_then(|proxy| proxy.http_addr)
+            .map_or(3128, |address| address.port());
+        let runtime = openshell_supervisor_network::run::TransparentRuntimeSetup::new(
+            listeners,
+            dns_udp,
+            dns_tcp,
+            sandbox_id.as_deref(),
+        )?;
+        let (ipv4_cidr, ipv6_cidr) = runtime.synthetic_cidrs();
+        namespace.install_transparent_tcp_rules(proxy_port, &ipv4_cidr, &ipv6_cidr)?;
+        Some(runtime)
+    } else {
+        None
+    };
+    #[cfg(target_os = "linux")]
+    let transparent_tcp_substrate_ready = transparent_runtime.is_some();
+    #[cfg(not(target_os = "linux"))]
+    let transparent_tcp_substrate_ready = false;
     // The denial channel is owned by the orchestrator: the proxy (in the
     // networking leaf) and the bypass monitor (in the process leaf) both
     // produce DenialEvents that the denial aggregator (orchestrator-side)
@@ -439,6 +529,8 @@ pub async fn run_sandbox(
                 agent_proposals.clone(),
                 workspace_rx.clone(),
                 &upstream_proxy_args,
+                #[cfg(target_os = "linux")]
+                transparent_runtime,
             )
             .await?,
         )
@@ -648,6 +740,10 @@ pub async fn run_sandbox(
             extension_credentials: extension_credentials.clone(),
             extension_authentication_enabled: initial_extension_authentication_enabled,
             middleware_connector: default_middleware_connector(),
+            transparent_tcp: TransparentTcpReloadState {
+                capable: transparent_tcp_capable,
+                substrate_ready: transparent_tcp_substrate_ready,
+            },
         };
 
         tokio::spawn(async move {
@@ -1537,6 +1633,7 @@ fn enrich_sandbox_baseline_paths(policy: &mut SandboxPolicy) {
 mod baseline_tests {
     use super::*;
     use openshell_core::policy::{FilesystemPolicy, LandlockPolicy, ProcessPolicy};
+    use std::path::PathBuf;
 
     #[test]
     fn proc_not_in_both_read_only_and_read_write_when_gpu_present() {
@@ -1768,7 +1865,7 @@ mod baseline_tests {
         let mut policy = SandboxPolicy {
             version: 1,
             filesystem: FilesystemPolicy {
-                read_only: vec![std::path::PathBuf::from("/tmp")],
+                read_only: vec![PathBuf::from("/tmp")],
                 read_write: vec![],
                 include_workdir: false,
             },
@@ -1783,17 +1880,14 @@ mod baseline_tests {
         enrich_sandbox_baseline_paths(&mut policy);
 
         assert!(
-            policy
-                .filesystem
-                .read_only
-                .contains(&std::path::PathBuf::from("/tmp")),
+            policy.filesystem.read_only.contains(&PathBuf::from("/tmp")),
             "explicit read_only baseline path should be preserved"
         );
         assert!(
             !policy
                 .filesystem
                 .read_write
-                .contains(&std::path::PathBuf::from("/tmp")),
+                .contains(&PathBuf::from("/tmp")),
             "baseline enrichment must not promote explicit read_only /tmp to read_write"
         );
     }
@@ -2319,12 +2413,14 @@ enum MiddlewareRegistryStatus {
 #[derive(Debug)]
 enum GatewayRuntimeReloadError {
     PolicyValidation(miette::Report),
+    TransparentTcpPrerequisite(miette::Report),
     MiddlewareRegistry(miette::Report),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum GatewayRuntimeFailureClass {
     PolicyValidation,
+    TransparentTcpPrerequisite,
     MiddlewareRegistry,
 }
 
@@ -2332,6 +2428,9 @@ impl GatewayRuntimeReloadError {
     fn class(&self) -> GatewayRuntimeFailureClass {
         match self {
             Self::PolicyValidation(_) => GatewayRuntimeFailureClass::PolicyValidation,
+            Self::TransparentTcpPrerequisite(_) => {
+                GatewayRuntimeFailureClass::TransparentTcpPrerequisite
+            }
             Self::MiddlewareRegistry(_) => GatewayRuntimeFailureClass::MiddlewareRegistry,
         }
     }
@@ -2354,21 +2453,46 @@ impl FailedRuntimeRevision {
     }
 }
 
+struct MiddlewareReloadContext<'a> {
+    desired_services: &'a [openshell_core::proto::SupervisorMiddlewareService],
+    authentication: &'a MiddlewareAuthentication,
+    registry_changed: bool,
+    connector: &'a MiddlewareConnector,
+}
+
 async fn reload_gateway_policy_runtime(
     engine: &OpaEngine,
     policy: Option<&openshell_core::proto::SandboxPolicy>,
     entrypoint_pid: u32,
-    desired_services: &[openshell_core::proto::SupervisorMiddlewareService],
-    middleware_authentication: &MiddlewareAuthentication,
-    middleware_registry_changed: bool,
-    middleware_connector: &MiddlewareConnector,
+    middleware: MiddlewareReloadContext<'_>,
+    transparent_tcp: TransparentTcpReloadState,
 ) -> std::result::Result<(), GatewayRuntimeReloadError> {
+    if let Some(policy) = policy
+        && policy_contains_explicit_tcp(policy)
+    {
+        if !transparent_tcp.capable {
+            return Err(GatewayRuntimeReloadError::TransparentTcpPrerequisite(
+                miette::miette!(
+                    "candidate policy introduces protocol: tcp, but the runtime does not advertise transparent TCP support; previous policy remains active"
+                ),
+            ));
+        }
+        if !transparent_tcp.substrate_ready {
+            return Err(GatewayRuntimeReloadError::TransparentTcpPrerequisite(
+                miette::miette!(
+                    "candidate policy introduces protocol: tcp, but this sandbox started without the transparent TCP substrate; recreate the sandbox to enable TCP; previous policy remains active"
+                ),
+            ));
+        }
+    }
     match policy {
-        Some(policy) if middleware_registry_changed => {
-            let registry =
-                middleware_connector(desired_services.to_vec(), middleware_authentication.clone())
-                    .await
-                    .map_err(GatewayRuntimeReloadError::MiddlewareRegistry)?;
+        Some(policy) if middleware.registry_changed => {
+            let registry = (middleware.connector)(
+                middleware.desired_services.to_vec(),
+                middleware.authentication.clone(),
+            )
+            .await
+            .map_err(GatewayRuntimeReloadError::MiddlewareRegistry)?;
             engine
                 .reload_policy_and_middleware_from_proto_with_pid(policy, entrypoint_pid, registry)
                 .map_err(GatewayRuntimeReloadError::PolicyValidation)
@@ -2383,6 +2507,20 @@ async fn reload_gateway_policy_runtime(
             miette::miette!("runtime reload requires a policy payload but none was returned"),
         )),
     }
+}
+
+fn policy_contains_explicit_tcp(policy: &openshell_core::proto::SandboxPolicy) -> bool {
+    policy.network_policies.values().any(|rule| {
+        rule.endpoints
+            .iter()
+            .any(|endpoint| endpoint.protocol.eq_ignore_ascii_case("tcp"))
+    })
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct TransparentTcpReloadState {
+    capable: bool,
+    substrate_ready: bool,
 }
 
 /// True when the installed middleware registry no longer matches the desired
@@ -2901,6 +3039,8 @@ struct PolicyPollLoopContext {
     extension_credentials: openshell_extension_core::ExtensionCredentialStore,
     extension_authentication_enabled: bool,
     middleware_connector: MiddlewareConnector,
+    /// Immutable driver capability and startup substrate state.
+    transparent_tcp: TransparentTcpReloadState,
 }
 
 type MiddlewareConnector = Arc<
@@ -3087,6 +3227,10 @@ enum GatewayRuntimeFailureDisposition {
     MiddlewareUnavailable {
         error: String,
     },
+    TransparentTcpExpansionRejected {
+        error: String,
+        active_generation: u64,
+    },
 }
 
 fn apply_gateway_runtime_reload_failure(
@@ -3108,12 +3252,42 @@ fn apply_gateway_runtime_reload_failure(
             )?;
             Ok(GatewayRuntimeFailureDisposition::PolicyRejected { error, disposition })
         }
+        GatewayRuntimeReloadError::TransparentTcpPrerequisite(error) => Ok(
+            GatewayRuntimeFailureDisposition::TransparentTcpExpansionRejected {
+                error: error.to_string(),
+                active_generation: engine.current_generation(),
+            },
+        ),
         GatewayRuntimeReloadError::MiddlewareRegistry(error) => {
             Ok(GatewayRuntimeFailureDisposition::MiddlewareUnavailable {
                 error: error.to_string(),
             })
         }
     }
+}
+
+fn emit_transparent_tcp_expansion_rejection(
+    version: u32,
+    policy_hash: &str,
+    active_generation: u64,
+    error: &str,
+) {
+    let message = format!(
+        "Transparent TCP policy expansion rejected; previous policy IS active [version:{version} active_generation:{active_generation} error:{error}]"
+    );
+    ocsf_emit!(
+        ConfigStateChangeBuilder::new(ocsf_ctx())
+            .severity(SeverityId::High)
+            .status(StatusId::Failure)
+            .state(StateId::Enabled, "retained_previous_policy")
+            .unmapped("candidate_version", serde_json::json!(version))
+            .unmapped("candidate_policy_hash", serde_json::json!(policy_hash))
+            .unmapped("previous_policy_active", serde_json::json!(true))
+            .unmapped("active_generation", serde_json::json!(active_generation))
+            .unmapped("validation_error", serde_json::json!(error))
+            .message(message)
+            .build()
+    );
 }
 
 fn apply_policy_validation_failure(
@@ -3595,13 +3769,16 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
                 &ctx.opa_engine,
                 result.policy.as_ref(),
                 pid,
-                &result.supervisor_middleware_services,
-                &MiddlewareAuthentication {
-                    credentials: middleware_credentials.clone(),
-                    enabled: result.extension_authentication_enabled,
+                MiddlewareReloadContext {
+                    desired_services: &result.supervisor_middleware_services,
+                    authentication: &MiddlewareAuthentication {
+                        credentials: middleware_credentials.clone(),
+                        enabled: result.extension_authentication_enabled,
+                    },
+                    registry_changed: middleware_registry_changed,
+                    connector: &ctx.middleware_connector,
                 },
-                middleware_registry_changed,
-                &ctx.middleware_connector,
+                ctx.transparent_tcp,
             )
             .await;
 
@@ -3764,6 +3941,26 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
                                         result.version
                                     ))
                                     .build());
+                            }
+                            GatewayRuntimeFailureDisposition::TransparentTcpExpansionRejected {
+                                error,
+                                active_generation,
+                            } => {
+                                emit_transparent_tcp_expansion_rejection(
+                                    result.version,
+                                    &result.policy_hash,
+                                    active_generation,
+                                    &error,
+                                );
+                                if policy_changed
+                                    && result.version > 0
+                                    && result.policy_source == PolicySource::Sandbox
+                                {
+                                    enqueue_policy_status(
+                                        &status_sender,
+                                        PolicyStatusUpdate::failed(result.version, error),
+                                    );
+                                }
                             }
                         }
                     }
@@ -3968,6 +4165,21 @@ fn format_setting_value(es: &openshell_core::proto::EffectiveSetting) -> String 
 )]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transparent_tcp_capability_requires_exact_driver_marker() {
+        let required = openshell_core::sandbox_env::POLICY_DNS_TRANSPARENT_TCP_CAPABILITY;
+        assert!(!has_network_runtime_capability(None, required));
+        assert!(!has_network_runtime_capability(Some(""), required));
+        assert!(!has_network_runtime_capability(
+            Some("policy-dns-transparent-tcp-extra"),
+            required
+        ));
+        assert!(has_network_runtime_capability(
+            Some("other, policy-dns-transparent-tcp"),
+            required
+        ));
+    }
     use openshell_core::policy::{
         FilesystemPolicy, LandlockPolicy, NetworkMode, NetworkPolicy, ProcessPolicy, ProxyPolicy,
     };
@@ -4299,6 +4511,24 @@ filesystem_policy:
         openshell_policy::restrictive_default_policy()
     }
 
+    fn proto_tcp_policy_fixture() -> openshell_core::proto::SandboxPolicy {
+        openshell_policy::parse_sandbox_policy(
+            r#"
+version: 1
+network_policies:
+  redis:
+    name: redis
+    endpoints:
+      - host: redis.example.com
+        port: 6379
+        protocol: tcp
+    binaries:
+      - path: /usr/bin/redis-cli
+"#,
+        )
+        .expect("parse TCP policy")
+    }
+
     fn settings_poll_result(
         policy: Option<openshell_core::proto::SandboxPolicy>,
         version: u32,
@@ -4449,6 +4679,7 @@ filesystem_policy:
             extension_credentials: openshell_extension_core::ExtensionCredentialStore::new(),
             extension_authentication_enabled: false,
             middleware_connector,
+            transparent_tcp: TransparentTcpReloadState::default(),
         }
     }
 
@@ -4513,6 +4744,54 @@ filesystem_policy:
             0,
             "same-hash acknowledgement must not reload OPA"
         );
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn poll_rejects_first_tcp_expansion_and_reports_previous_policy_active() {
+        let v1 = settings_poll_result(
+            Some(proto_policy_fixture()),
+            1,
+            openshell_core::proto::PolicySource::Sandbox,
+        );
+        let v2 = settings_poll_result(
+            Some(proto_tcp_policy_fixture()),
+            2,
+            openshell_core::proto::PolicySource::Sandbox,
+        );
+        let engine =
+            Arc::new(OpaEngine::from_proto(&proto_policy_fixture()).expect("build OPA engine"));
+        let active_generation = engine.current_generation();
+        let loaded_revision = LoadedPolicyRevision::from_snapshot(&v1);
+        let mut ctx = policy_poll_test_context(
+            engine.clone(),
+            LoadedPolicyOrigin::Gateway {
+                revision: Some(loaded_revision),
+                has_last_valid_policy: true,
+            },
+            default_middleware_connector(),
+        );
+        ctx.transparent_tcp = TransparentTcpReloadState {
+            capable: true,
+            substrate_ready: false,
+        };
+        let (client, polls, mut reports) = scripted_policy_gateway();
+        polls.send(v1).unwrap();
+
+        let handle = tokio::spawn(run_policy_poll_loop_with_client(ctx, client));
+        expect_policy_report(&mut reports, 1).await;
+        polls.send(v2).unwrap();
+        let report = timeout(Duration::from_secs(1), reports.recv())
+            .await
+            .expect("TCP rejection report timed out")
+            .expect("policy reporter stopped");
+
+        assert_eq!(report.0, 2);
+        assert!(!report.1);
+        assert!(report.2.contains("recreate the sandbox"), "{}", report.2);
+        assert!(report.2.contains("previous policy remains active"));
+        assert_eq!(engine.current_generation(), active_generation);
+        assert!(engine.fail_closed_reason().is_none());
         handle.abort();
     }
 
@@ -4903,10 +5182,13 @@ filesystem_policy:
             &engine,
             Some(&proto_policy_fixture()),
             0,
-            &[unavailable_service],
-            &MiddlewareAuthentication::default(),
-            true,
-            &default_middleware_connector(),
+            MiddlewareReloadContext {
+                desired_services: &[unavailable_service],
+                authentication: &MiddlewareAuthentication::default(),
+                registry_changed: true,
+                connector: &default_middleware_connector(),
+            },
+            TransparentTcpReloadState::default(),
         )
         .await
         .expect_err("unavailable middleware must fail candidate preparation");
@@ -4925,6 +5207,74 @@ filesystem_policy:
         ));
         assert_eq!(engine.current_generation(), active_generation);
         assert!(engine.fail_closed_reason().is_none());
+    }
+
+    #[tokio::test]
+    async fn tcp_policy_reload_without_startup_substrate_is_rejected_and_keeps_previous_policy() {
+        let engine = OpaEngine::from_proto(&proto_policy_fixture()).expect("build OPA engine");
+        let active_generation = engine.current_generation();
+
+        let failure = reload_gateway_policy_runtime(
+            &engine,
+            Some(&proto_tcp_policy_fixture()),
+            0,
+            MiddlewareReloadContext {
+                desired_services: &[],
+                authentication: &MiddlewareAuthentication::default(),
+                registry_changed: false,
+                connector: &default_middleware_connector(),
+            },
+            TransparentTcpReloadState {
+                capable: true,
+                substrate_ready: false,
+            },
+        )
+        .await
+        .expect_err("TCP expansion must require startup substrate");
+        let disposition = apply_gateway_runtime_reload_failure(
+            &engine,
+            failure,
+            PolicyValidationFailureMode::FailClosed,
+            true,
+            2,
+        )
+        .expect("runtime prerequisite failure handling must succeed");
+
+        assert!(matches!(
+            disposition,
+            GatewayRuntimeFailureDisposition::TransparentTcpExpansionRejected {
+                active_generation: generation,
+                ..
+            } if generation == active_generation
+        ));
+        assert_eq!(engine.current_generation(), active_generation);
+        assert!(engine.fail_closed_reason().is_none());
+    }
+
+    #[tokio::test]
+    async fn tcp_policy_reload_on_unsupported_runtime_is_rejected() {
+        let engine = OpaEngine::from_proto(&proto_policy_fixture()).expect("build OPA engine");
+
+        let failure = reload_gateway_policy_runtime(
+            &engine,
+            Some(&proto_tcp_policy_fixture()),
+            0,
+            MiddlewareReloadContext {
+                desired_services: &[],
+                authentication: &MiddlewareAuthentication::default(),
+                registry_changed: false,
+                connector: &default_middleware_connector(),
+            },
+            TransparentTcpReloadState::default(),
+        )
+        .await
+        .expect_err("unsupported runtime must reject TCP expansion");
+
+        assert!(matches!(
+            failure,
+            GatewayRuntimeReloadError::TransparentTcpPrerequisite(_)
+        ));
+        assert_eq!(engine.current_generation(), 0);
     }
 
     #[test]
@@ -5495,11 +5845,21 @@ filesystem_policy:
             "fail_closed"
         );
         assert_eq!(config["unmapped"]["previous_policy_active"], false);
+        assert_eq!(
+            config["unmapped"]["validation_error"],
+            "conflicting tls metadata"
+        );
         assert!(
             config["message"]
                 .as_str()
                 .unwrap()
                 .contains("previous policy IS NOT active")
+        );
+        assert!(
+            config["message"]
+                .as_str()
+                .unwrap()
+                .contains("error:conflicting tls metadata")
         );
 
         let finding = finding.to_json().unwrap();

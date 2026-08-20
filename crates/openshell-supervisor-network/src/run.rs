@@ -38,6 +38,108 @@ use crate::opa::OpaEngine;
 use crate::policy_local::PolicyLocalContext;
 use crate::proxy::ProxyHandle;
 
+#[cfg(target_os = "linux")]
+pub struct TransparentRuntimeSetup {
+    pub listeners: Vec<tokio::net::TcpListener>,
+    pub dns_udp: tokio::net::UdpSocket,
+    pub dns_tcp: tokio::net::TcpListener,
+    config: crate::policy_dns::PolicyDnsRuntimeConfig,
+}
+
+#[cfg(target_os = "linux")]
+impl TransparentRuntimeSetup {
+    /// Build one boot-scoped synthetic allocation epoch. The epoch advances
+    /// before workload execution, so addresses cached across a supervisor
+    /// restart fall outside the newly installed capture ranges.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the epoch cannot be read or atomically persisted,
+    /// or when the derived synthetic pools are invalid.
+    pub fn new(
+        listeners: Vec<tokio::net::TcpListener>,
+        dns_udp: tokio::net::UdpSocket,
+        dns_tcp: tokio::net::TcpListener,
+        sandbox_id: Option<&str>,
+    ) -> Result<Self> {
+        let epoch = advance_allocation_epoch(
+            std::path::Path::new("/run/openshell/policy-dns-epoch"),
+            sandbox_id,
+        )?;
+        Ok(Self {
+            listeners,
+            dns_udp,
+            dns_tcp,
+            config: crate::policy_dns::PolicyDnsRuntimeConfig::for_epoch(epoch)?,
+        })
+    }
+
+    #[must_use]
+    pub fn synthetic_cidrs(&self) -> (String, String) {
+        (
+            self.config.ipv4_cidr.to_string(),
+            self.config.ipv6_cidr.to_string(),
+        )
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn advance_allocation_epoch(path: &std::path::Path, sandbox_id: Option<&str>) -> Result<u64> {
+    use miette::{IntoDiagnostic, WrapErr};
+    use std::io::Write as _;
+
+    let seed = sandbox_id.map_or(0, |value| {
+        value
+            .as_bytes()
+            .iter()
+            .fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
+                (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
+            })
+    });
+    let previous = match std::fs::read_to_string(path) {
+        Ok(value) => value
+            .trim()
+            .parse::<u64>()
+            .into_diagnostic()
+            .wrap_err("policy DNS allocation epoch is invalid")?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => seed,
+        Err(error) => {
+            return Err(error)
+                .into_diagnostic()
+                .wrap_err("failed to read policy DNS allocation epoch");
+        }
+    };
+    let epoch = previous.wrapping_add(1);
+    let parent = path
+        .parent()
+        .ok_or_else(|| miette::miette!("policy DNS allocation epoch has no parent directory"))?;
+    std::fs::create_dir_all(parent)
+        .into_diagnostic()
+        .wrap_err("failed to create policy DNS runtime directory")?;
+    let temporary = parent.join(format!(
+        ".policy-dns-epoch-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ));
+    let result = (|| -> std::io::Result<()> {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)?;
+        writeln!(file, "{epoch}")?;
+        file.sync_all()?;
+        std::fs::rename(&temporary, path)?;
+        std::fs::File::open(parent)?.sync_all()
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    result
+        .into_diagnostic()
+        .wrap_err("failed to atomically persist policy DNS allocation epoch")?;
+    Ok(epoch)
+}
+
 /// Handles and values produced by [`run_networking`] that the rest of
 /// `run_sandbox` consumes.
 ///
@@ -53,6 +155,10 @@ pub struct Networking {
     /// loop so it can publish updated `SandboxPolicy` snapshots that the
     /// `policy.local` route handler returns to the workload.
     pub policy_local_ctx: Arc<PolicyLocalContext>,
+    #[cfg(target_os = "linux")]
+    _policy_dns: Option<crate::policy_dns::PolicyDnsRuntime>,
+    #[cfg(target_os = "linux")]
+    _transparent_tcp: Option<crate::proxy::TransparentTcpHandle>,
 }
 
 /// Set up the networking stack: ephemeral CA + TLS state, proxy server,
@@ -90,6 +196,7 @@ pub async fn run_networking(
     agent_proposals: AgentProposals,
     workspace_rx: tokio::sync::watch::Receiver<String>,
     upstream_proxy_args: &crate::upstream_proxy::UpstreamProxyArgs,
+    #[cfg(target_os = "linux")] transparent_runtime: Option<TransparentRuntimeSetup>,
 ) -> Result<Networking> {
     // Build the policy-local route context. The orchestrator's policy poll
     // loop also holds an `Arc` clone (via `Networking::policy_local_ctx`) so
@@ -100,7 +207,7 @@ pub async fn run_networking(
         sandbox_name
             .map(str::to_string)
             .or_else(|| sandbox_id.map(str::to_string)),
-        agent_proposals,
+        agent_proposals.clone(),
         workspace_rx,
     ));
 
@@ -110,6 +217,10 @@ pub async fn run_networking(
     // the race where an in-flight request observes a generation transition
     // during the OPA engine reload.
     let (engine_ready_tx, engine_ready_rx) = tokio::sync::watch::channel(false);
+    #[cfg(target_os = "linux")]
+    let transparent_engine_ready_rx = engine_ready_rx.clone();
+    #[cfg(target_os = "linux")]
+    let policy_dns_engine_ready_rx = engine_ready_rx.clone();
 
     // Spawn a task to resolve policy binary symlinks once the workload's mount
     // namespace becomes accessible via /proc/<pid>/root/. The task starts
@@ -312,8 +423,8 @@ pub async fn run_networking(
             inference_ctx,
             Some(provider_credentials.clone()),
             Some(policy_local_ctx.clone()),
-            denial_tx,
-            activity_tx,
+            denial_tx.clone(),
+            activity_tx.clone(),
             engine_ready_rx,
             upstream_proxy_args,
         )
@@ -323,9 +434,70 @@ pub async fn run_networking(
         None
     };
 
+    #[cfg(target_os = "linux")]
+    let (policy_dns, transparent_tcp) = if let Some(runtime) = transparent_runtime {
+        let engine = opa_engine
+            .cloned()
+            .ok_or_else(|| miette::miette!("transparent TCP requires an OPA policy engine"))?;
+        let cache = identity_cache
+            .clone()
+            .ok_or_else(|| miette::miette!("transparent TCP requires a process identity cache"))?;
+        let trusted_gateway = crate::proxy::detect_trusted_host_gateway();
+        let dns = crate::policy_dns::PolicyDnsRuntime::start(
+            engine.clone(),
+            runtime.dns_udp,
+            runtime.dns_tcp,
+            trusted_gateway,
+            runtime.config,
+            policy_dns_engine_ready_rx,
+        )?;
+        let transparent = crate::proxy::TransparentTcpHandle::start(
+            runtime.listeners,
+            dns.store.clone(),
+            engine,
+            cache,
+            entrypoint_pid,
+            agent_proposals,
+            denial_tx,
+            activity_tx,
+            upstream_proxy_args,
+            transparent_engine_ready_rx,
+        )?;
+        (Some(dns), Some(transparent))
+    } else {
+        (None, None)
+    };
+
     Ok(Networking {
         proxy: proxy_handle,
         ca_file_paths,
         policy_local_ctx,
+        #[cfg(target_os = "linux")]
+        _policy_dns: policy_dns,
+        #[cfg(target_os = "linux")]
+        _transparent_tcp: transparent_tcp,
     })
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod transparent_runtime_tests {
+    use super::*;
+
+    #[test]
+    fn allocation_epoch_advances_across_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("epoch");
+        let first = advance_allocation_epoch(&path, Some("sandbox-a")).unwrap();
+        let second = advance_allocation_epoch(&path, Some("sandbox-a")).unwrap();
+        assert_eq!(second, first + 1);
+    }
+
+    #[test]
+    fn invalid_allocation_epoch_fails_closed() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("epoch");
+        std::fs::write(&path, "corrupt\n").unwrap();
+        let error = advance_allocation_epoch(&path, Some("sandbox-a")).unwrap_err();
+        assert!(error.to_string().contains("allocation epoch is invalid"));
+    }
 }
