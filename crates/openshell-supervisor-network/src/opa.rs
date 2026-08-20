@@ -1227,6 +1227,7 @@ fn parse_process_policy(val: &regorus::Value) -> ProcessPolicy {
     ProcessPolicy {
         run_as_user: get_str(val, "run_as_user"),
         run_as_group: get_str(val, "run_as_group"),
+        supplemental_groups: Vec::new(),
     }
 }
 
