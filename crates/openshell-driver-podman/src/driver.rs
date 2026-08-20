@@ -36,6 +36,9 @@ use std::time::Duration;
 use tracing::{debug, info, warn};
 use url::Url;
 
+const STOP_COMPLETION_POLL_INTERVAL: Duration = Duration::from_millis(50);
+const STOP_COMPLETION_TIMEOUT_HEADROOM: Duration = Duration::from_secs(5);
+
 impl From<PodmanApiError> for ComputeDriverError {
     fn from(value: PodmanApiError) -> Self {
         match value {
@@ -914,22 +917,65 @@ impl PodmanComputeDriver {
         Ok(entries.into_iter().next())
     }
 
+    async fn wait_for_container_stopped(
+        &self,
+        sandbox_id: &str,
+        container_id: &str,
+    ) -> Result<(), ComputeDriverError> {
+        let timeout = Duration::from_secs(u64::from(self.config.stop_timeout_secs))
+            + STOP_COMPLETION_TIMEOUT_HEADROOM;
+        let deadline = tokio::time::Instant::now() + timeout;
+
+        loop {
+            let inspect = self
+                .client
+                .inspect_container(container_id)
+                .await
+                .map_err(ComputeDriverError::from)?;
+            if matches!(inspect.state.status.as_str(), "exited" | "stopped") {
+                return Ok(());
+            }
+
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                return Err(ComputeDriverError::Message(format!(
+                    "container {container_id} for sandbox {sandbox_id} did not finish stopping within {timeout:?} (last state: {})",
+                    inspect.state.status,
+                )));
+            }
+            tokio::time::sleep(STOP_COMPLETION_POLL_INTERVAL.min(deadline - now)).await;
+        }
+    }
+
     /// Stop a sandbox container without deleting it.
     pub async fn stop_sandbox(&self, sandbox_id: &str) -> Result<(), ComputeDriverError> {
         let container = self
             .find_container(sandbox_id)
             .await?
             .ok_or(ComputeDriverError::NotFound)?;
+        let container_id = container.id;
+        if container.state == "stopping" {
+            return self
+                .wait_for_container_stopped(sandbox_id, &container_id)
+                .await;
+        }
         if container.state != "running" {
             return Ok(());
         }
-        let container_id = container.id;
         info!(sandbox_id = %sandbox_id, container = %container_id, "Stopping sandbox container");
 
         self.client
             .stop_container(&container_id, self.config.stop_timeout_secs)
             .await
-            .map_err(ComputeDriverError::from)
+            .map_err(ComputeDriverError::from)?;
+
+        // Podman can return from the stop request before inspect reports the
+        // container as exited. If start runs during that interval, the exit
+        // event from the previous run can arrive after the gateway has moved
+        // the same sandbox to Starting, causing it to regress to Error. Wait
+        // for the terminal container state before allowing a restart.
+        self.wait_for_container_stopped(sandbox_id, &container_id)
+            .await
     }
 
     /// Start a previously stopped sandbox container.
@@ -1437,6 +1483,10 @@ mod tests {
             vec![
                 StubResponse::new(StatusCode::OK, r#"[{"Id":"ctr-1","State":"running"}]"#),
                 StubResponse::new(StatusCode::NO_CONTENT, ""),
+                StubResponse::new(
+                    StatusCode::OK,
+                    r#"{"Id":"ctr-1","Name":"sandbox","State":{"Status":"exited","Running":false,"FinishedAt":"2026-08-12T16:39:13Z"},"Config":{}}"#,
+                ),
             ],
         );
         test_driver(stop_socket.clone())
@@ -1452,6 +1502,12 @@ mod tests {
                 "POST {}",
                 api_path("/libpod/containers/ctr-1/stop?timeout=10")
             )
+        );
+        assert_eq!(
+            stop_requests
+                .lock()
+                .expect("request log lock should not be poisoned")[2],
+            format!("GET {}", api_path("/libpod/containers/ctr-1/json"))
         );
 
         let (start_socket, start_requests, start_handle) = spawn_podman_stub(
@@ -1485,6 +1541,74 @@ mod tests {
 
         let _ = fs::remove_file(stop_socket);
         let _ = fs::remove_file(start_socket);
+    }
+
+    #[tokio::test]
+    async fn stop_waits_for_the_container_to_leave_stopping_state() {
+        let (socket, requests, handle) = spawn_podman_stub(
+            "lifecycle-stop-wait",
+            vec![
+                StubResponse::new(StatusCode::OK, r#"[{"Id":"ctr-1","State":"running"}]"#),
+                StubResponse::new(StatusCode::NO_CONTENT, ""),
+                StubResponse::new(
+                    StatusCode::OK,
+                    r#"{"Id":"ctr-1","Name":"sandbox","State":{"Status":"stopping","Running":true},"Config":{}}"#,
+                ),
+                StubResponse::new(
+                    StatusCode::OK,
+                    r#"{"Id":"ctr-1","Name":"sandbox","State":{"Status":"exited","Running":false,"FinishedAt":"2026-08-12T16:39:13Z"},"Config":{}}"#,
+                ),
+            ],
+        );
+
+        test_driver(socket.clone())
+            .stop_sandbox("sandbox-1")
+            .await
+            .expect("stop should wait for the terminal container state");
+        handle.await.expect("stop stub should finish");
+
+        let requests = requests
+            .lock()
+            .expect("request log lock should not be poisoned");
+        assert_eq!(requests.len(), 4);
+        assert_eq!(
+            requests[2],
+            format!("GET {}", api_path("/libpod/containers/ctr-1/json"))
+        );
+        assert_eq!(requests[3], requests[2]);
+
+        let _ = fs::remove_file(socket);
+    }
+
+    #[tokio::test]
+    async fn stop_retry_waits_for_an_existing_stopping_container() {
+        let (socket, requests, handle) = spawn_podman_stub(
+            "lifecycle-stop-retry",
+            vec![
+                StubResponse::new(StatusCode::OK, r#"[{"Id":"ctr-1","State":"stopping"}]"#),
+                StubResponse::new(
+                    StatusCode::OK,
+                    r#"{"Id":"ctr-1","Name":"sandbox","State":{"Status":"exited","Running":false,"FinishedAt":"2026-08-12T16:39:13Z"},"Config":{}}"#,
+                ),
+            ],
+        );
+
+        test_driver(socket.clone())
+            .stop_sandbox("sandbox-1")
+            .await
+            .expect("stop retry should wait for the terminal container state");
+        handle.await.expect("stop retry stub should finish");
+
+        let requests = requests
+            .lock()
+            .expect("request log lock should not be poisoned");
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            requests[1],
+            format!("GET {}", api_path("/libpod/containers/ctr-1/json"))
+        );
+
+        let _ = fs::remove_file(socket);
     }
 
     #[test]
