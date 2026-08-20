@@ -2652,6 +2652,12 @@ fn sandbox_template_to_json(template: &SandboxWorkloadTemplate) -> serde_json::V
         if !metadata.labels.is_empty() {
             obj.insert("labels".to_string(), serde_json::json!(metadata.labels));
         }
+        if !metadata.annotations.is_empty() {
+            obj.insert(
+                "annotations".to_string(),
+                serde_json::json!(metadata.annotations),
+            );
+        }
     }
 
     if let Some(spec) = &template.spec {
@@ -9020,6 +9026,32 @@ mod tests {
         assert_eq!(json["resource_version"], 42);
         assert_eq!(json["created_at"], "2009-02-13 23:31:30");
         assert_eq!(json["labels"]["env"], "prod");
+    }
+
+    #[test]
+    fn sandbox_template_to_json_includes_metadata_labels_and_annotations() {
+        let template = openshell_core::proto::SandboxWorkloadTemplate {
+            metadata: Some(ObjectMeta {
+                id: "template-123".to_string(),
+                name: "gpu-kata".to_string(),
+                labels: std::collections::HashMap::from([(
+                    "team".to_string(),
+                    "runtime".to_string(),
+                )]),
+                annotations: std::collections::HashMap::from([(
+                    "owner".to_string(),
+                    "platform".to_string(),
+                )]),
+                workspace: "default".to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let json = super::sandbox_template_to_json(&template);
+
+        assert_eq!(json["labels"]["team"], "runtime");
+        assert_eq!(json["annotations"]["owner"], "platform");
     }
 
     #[test]
