@@ -3,9 +3,9 @@
 
 # demo.yaml — June 15 MXC filesystem-policy proof.
 #
-# Minimal filesystem policy granting the shared host folder read-write;
-# everything else is implicitly denied (default-deny). The granted path MUST
-# match `share_dir` / OPENSHELL_MXC_SHARE_DIR and the agent_command target.
+# Minimal filesystem policy granting the workload folder read-write. The granted
+# path must cover the per-sandbox command executable, working directory, and any
+# files that command reads or writes. ProcessContainer denies all ungranted paths.
 #
 # NOTE: the canonical OpenShell policy YAML key is `filesystem_policy`
 # (parsed by the `openshell-policy` crate into SandboxPolicy.filesystem), NOT
@@ -19,7 +19,6 @@ filesystem_policy:
   read_write:
     - "C:/work/openshell-mxc-demo"   # = OPENSHELL_MXC_SHARE_DIR (host-visible share)
 
-# No landlock / process / network_policies for the demo. (Network policy on
-# isolation_session is REJECTED by the driver — see the crate README. Adding a
-# network_policies block here would make `sandbox create` fail with a precise
-# invalid_argument naming the rule, never a silent drop.)
+# No landlock, process, or network policy is present. MXC rejects every network
+# policy at create time until an enforcing egress path is available; it never
+# silently drops network rules.

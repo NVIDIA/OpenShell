@@ -25,15 +25,13 @@ pub const DEFAULT_CONFIGURATION_ID: &str = "composable";
 
 /// Environment flag selecting the in-process mock `wxc-exec` shim. When set to
 /// `"1"`, the invoker does NOT spawn the real `wxc-exec.exe`; instead it emits
-/// canned provision/start/stop/deprovision results and simulates AppContainer
+/// canned provision/start/stop/deprovision results and simulates `AppContainer`
 /// filesystem-policy enforcement for the exec phase. This is what makes the
 /// full create → Ready → policy-proof round trip runnable off the demo box.
 pub const MOCK_ENV_VAR: &str = "OPENSHELL_MXC_MOCK_WXC";
 
 fn mock_enabled() -> bool {
-    std::env::var(MOCK_ENV_VAR)
-        .map(|v| v == "1")
-        .unwrap_or(false)
+    std::env::var(MOCK_ENV_VAR).is_ok_and(|value| value == "1")
 }
 
 /// Normalize a path/command fragment to lowercase backslash form for the mock's
@@ -56,9 +54,10 @@ fn mock_grants() -> &'static Mutex<HashMap<String, Vec<String>>> {
 ///
 /// `isolation_session` honors `readwrite`/`readonly` (grant-only — it has no
 /// deny primitive). `processContainer` additionally honors `denied_paths`
-/// because the AppContainer backend can stamp deny ACEs; it is also genuinely
+/// because the `AppContainer` backend can stamp deny ACEs; it is also genuinely
 /// default-deny, so anything not granted is already inaccessible.
 #[derive(Debug, Default)]
+#[allow(clippy::struct_field_names)]
 pub struct MxcFilesystem {
     pub readwrite_paths: Vec<String>,
     pub readonly_paths: Vec<String>,
@@ -72,12 +71,12 @@ pub struct MxcNetwork {
     pub proxy: Option<SocketAddr>,
 }
 
-/// `processContainer`-specific knobs (one-shot AppContainer backend).
+/// `processContainer`-specific knobs (one-shot `AppContainer` backend).
 #[derive(Debug, Default, Clone)]
 pub struct MxcProcessContainer {
-    /// Request a Less-Privileged AppContainer (stricter default-deny).
+    /// Request a Less-Privileged `AppContainer` (stricter default-deny).
     pub least_privilege: bool,
-    /// AppContainer capabilities to grant (e.g. `internetClient`).
+    /// `AppContainer` capabilities to grant (e.g. `internetClient`).
     pub capabilities: Vec<String>,
 }
 
@@ -193,7 +192,7 @@ fn mock_configs() -> &'static Mutex<HashMap<String, serde_json::Value>> {
 }
 
 #[cfg(test)]
-pub(crate) fn mock_recorded_config(id: &str) -> Option<serde_json::Value> {
+pub fn mock_recorded_config(id: &str) -> Option<serde_json::Value> {
     mock_configs().lock().unwrap().get(id).cloned()
 }
 
@@ -339,13 +338,11 @@ impl WxcExecInvoker {
         let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
 
         if !output.status.success() {
-            if let Ok(env) = serde_json::from_str::<MxcEnvelope>(&stdout) {
-                if let MxcEnvelope::Err { error } = env {
-                    return Err(InvokerError::Mxc {
-                        code: error.code,
-                        message: error.message,
-                    });
-                }
+            if let Ok(MxcEnvelope::Err { error }) = serde_json::from_str::<MxcEnvelope>(&stdout) {
+                return Err(InvokerError::Mxc {
+                    code: error.code,
+                    message: error.message,
+                });
             }
             let code = output.status.code().unwrap_or(-1);
             return Err(InvokerError::NoEnvelope {
@@ -413,13 +410,14 @@ impl WxcExecInvoker {
 
         if !output.status.success() {
             let code = output.status.code().unwrap_or(-1);
-            if let Ok(env) = serde_json::from_str::<ProvisionEnvelope>(&stdout) {
-                if let Some(err) = env.error {
-                    return Err(InvokerError::Mxc {
-                        code: err.code,
-                        message: err.message,
-                    });
-                }
+            if let Ok(ProvisionEnvelope {
+                error: Some(error), ..
+            }) = serde_json::from_str::<ProvisionEnvelope>(&stdout)
+            {
+                return Err(InvokerError::Mxc {
+                    code: error.code,
+                    message: error.message,
+                });
             }
             return Err(InvokerError::NoEnvelope {
                 exit_code: code,
@@ -471,7 +469,7 @@ impl WxcExecInvoker {
         process: MxcProcess,
     ) -> Result<tokio::process::Child, InvokerError> {
         if self.mock {
-            return self.mock_spawn_exec(iso_sandbox_id, &process);
+            return Self::mock_spawn_exec(iso_sandbox_id, &process);
         }
         let config = serde_json::json!({
             "version": MXC_SCHEMA_VERSION,
@@ -493,8 +491,9 @@ impl WxcExecInvoker {
             .arg(&b64)
             .arg("--experimental")
             .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
+            .stdout(std::process::Stdio::inherit())
+            .stderr(std::process::Stdio::inherit())
+            .kill_on_drop(true);
         if self.debug {
             cmd.arg("--debug");
         }
@@ -504,12 +503,11 @@ impl WxcExecInvoker {
         Ok(child)
     }
 
-    /// Mock exec: simulate AppContainer filesystem-policy enforcement.
+    /// Mock exec: simulate `AppContainer` filesystem-policy enforcement.
     ///
     /// The agent's write target is considered **in-policy** iff the command line
     /// references one of the granted read-write paths recorded at mock provision.
     fn mock_spawn_exec(
-        &self,
         iso_sandbox_id: &str,
         process: &MxcProcess,
     ) -> Result<tokio::process::Child, InvokerError> {
@@ -538,11 +536,15 @@ impl WxcExecInvoker {
 
         let mut cmd = Command::new("cmd");
         cmd.stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
+            .stdout(std::process::Stdio::inherit())
+            .stderr(std::process::Stdio::inherit())
+            .kill_on_drop(true);
         if in_policy {
             debug!(command = %process.command_line, "mock exec: in-policy, running agent");
-            cmd.arg("/c").arg(&process.command_line);
+            // `command_line` is already encoded with Windows quoting rules.
+            // Pass it raw so this mock matches wxc-exec/CreateProcess instead
+            // of asking Rust to quote the entire command as one cmd.exe argv.
+            cmd.raw_arg(format!("/d /s /c \"{}\"", process.command_line));
         } else {
             debug!(command = %process.command_line, "mock exec: OUT-OF-POLICY, denying");
             cmd.arg("/c").arg(
@@ -557,8 +559,8 @@ impl WxcExecInvoker {
     ///
     /// Unlike the `isolation_session` lifecycle (provision → start → exec →
     /// stop → deprovision), `processContainer` is a single ephemeral
-    /// AppContainer: one `wxc-exec` invocation creates the container, runs the
-    /// one process, and tears down when it exits. The AppContainer is genuinely
+    /// `AppContainer`: one `wxc-exec` invocation creates the container, runs the
+    /// one process, and tears down when it exits. The `AppContainer` is genuinely
     /// default-deny, so a write to any ungranted path is denied by the OS.
     ///
     /// **Stdout is raw agent output; the exit code is the agent's own exit code.**
@@ -593,8 +595,9 @@ impl WxcExecInvoker {
         cmd.arg("--config-base64")
             .arg(&b64)
             .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
+            .stdout(std::process::Stdio::inherit())
+            .stderr(std::process::Stdio::inherit())
+            .kill_on_drop(true);
         if self.debug {
             cmd.arg("--debug");
         }

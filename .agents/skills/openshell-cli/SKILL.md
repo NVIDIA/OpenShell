@@ -304,7 +304,7 @@ openshell sandbox delete --all
 
 This is the most important multi-step workflow. It enables a tight feedback cycle where sandbox policy is refined based on observed activity.
 
-**Key concept**: Policies have static fields (immutable after creation: `filesystem_policy`, `landlock`, `process`) and two dynamic fields: `network_policies` and `network_middlewares`. Both dynamic fields can be updated without recreating the sandbox.
+**Key concept**: Policies have static fields (immutable after creation: `filesystem_policy`, `landlock`, `process`) and two dynamic fields: `network_policies` and `network_middlewares`. Both dynamic fields can be updated without recreating the sandbox when the selected compute driver supports live policy updates. MXC rejects live policy replacement and merge updates; delete and recreate an MXC sandbox instead.
 
 ```
 Create sandbox with initial policy
@@ -369,7 +369,7 @@ Edit `current-policy.yaml` to allow the blocked actions. **For policy content au
 - Binary matching patterns
 - Ordered `network_middlewares`, host selection, and `fail_open` or `fail_closed` behavior
 
-`network_policies` and `network_middlewares` can be modified at runtime. If `filesystem_policy`, `landlock`, or `process` need changes, the sandbox must be recreated. Built-in middleware such as `openshell/regex` needs no gateway registration. An operator-run middleware must already be registered under `[[openshell.supervisor.middleware]]`; changing that static registration requires a gateway restart.
+`network_policies` and `network_middlewares` can be modified at runtime when the selected compute driver supports live policy updates. MXC rejects live policy replacement and merge updates; delete and recreate an MXC sandbox instead. If `filesystem_policy`, `landlock`, or `process` need changes, the sandbox must be recreated. Built-in middleware such as `openshell/regex` needs no gateway registration. An operator-run middleware must already be registered under `[[openshell.supervisor.middleware]]`; changing that static registration requires a gateway restart.
 
 ### Step 5: Push the updated policy
 

@@ -177,7 +177,6 @@ fn build_split_mxc_config(
     // MXC 0.6.0-alpha schema accepts ONLY {"proxy": {"localhost": <port>}}.
     // {"host": ..., "port": ...} and every other shape is rejected — verified
     // empirically against the real wxc-exec 0.6.0-alpha binary via --dry-run.
-    // See also docs/reference/mxc-compute-driver-design.mdx §network.proxy.
     if proxy_supported && proxy_addr.ip() != std::net::IpAddr::from([127, 0, 0, 1]) {
         add_loss(
             items,
@@ -185,9 +184,8 @@ fn build_split_mxc_config(
             "error",
             &format!(
                 "MXC schema 0.6.0-alpha can only express a localhost port \
-                 ({{\"localhost\": N}}); non-127.0.0.1 redirect address {} \
-                 is not representable.",
-                proxy_addr
+                 ({{\"localhost\": N}}); non-127.0.0.1 redirect address \
+                 {proxy_addr} is not representable."
             ),
             "per-sandbox egress attribution",
             "The redirect cannot be emitted; use a 127.0.0.1:PORT address.",

@@ -782,7 +782,12 @@ fn effective_single_driver(args: &RunArgs) -> Option<ComputeDriverKind> {
 fn is_singleplayer_driver(args: &RunArgs) -> bool {
     matches!(
         effective_single_driver(args),
-        Some(ComputeDriverKind::Docker | ComputeDriverKind::Podman | ComputeDriverKind::Vm)
+        Some(
+            ComputeDriverKind::Docker
+                | ComputeDriverKind::Podman
+                | ComputeDriverKind::Vm
+                | ComputeDriverKind::Mxc
+        )
     )
 }
 
@@ -1565,7 +1570,7 @@ ssh_session_ttl_secs = 1234
 
     #[test]
     fn singleplayer_driver_matches_only_one_local_driver() {
-        for driver in ["docker", "podman", "vm"] {
+        for driver in ["docker", "podman", "vm", "mxc"] {
             let (args, _) = parse_with_args(&[
                 "openshell-gateway",
                 "--db-url",

@@ -3815,9 +3815,7 @@ dependencies = [
 name = "openshell-driver-mxc"
 version = "0.0.0"
 dependencies = [
- "anyhow",
  "base64 0.22.1",
- "clap",
  "futures",
  "openshell-core",
  "openshell-policy",

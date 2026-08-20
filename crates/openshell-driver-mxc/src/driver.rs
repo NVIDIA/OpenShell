@@ -4,8 +4,8 @@
 //! MXC compute backend: lifecycle logic, in-memory registry, exec-in-driver,
 //! and self-reported readiness.
 
-use crate::mxc::{MxcFilesystem, MxcNetwork, MxcProcess, MxcProcessContainer, WxcExecInvoker};
-use crate::policy::{EmbeddedPolicyMapper, MapCtx, PolicyMapper};
+use crate::mxc::{MxcFilesystem, MxcProcess, MxcProcessContainer, WxcExecInvoker};
+use crate::policy::{EmbeddedPolicyMapper, MapCtx, MappedConfig, PolicyMapper};
 use futures::Stream;
 use openshell_core::gpu::{driver_gpu_requirements, effective_driver_gpu_count};
 use openshell_core::proto::SandboxPolicy;
@@ -14,13 +14,13 @@ use openshell_core::proto::compute::v1::{
     GetCapabilitiesResponse, WatchSandboxesDeletedEvent, WatchSandboxesEvent,
     WatchSandboxesPlatformEvent, WatchSandboxesSandboxEvent, watch_sandboxes_event,
 };
+use openshell_core::proto_struct::struct_to_json_value;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
-use tokio::process::Child;
-use tokio::sync::{Mutex, broadcast, mpsc};
+use tokio::sync::{Mutex, broadcast, mpsc, watch};
+use tokio::task::JoinHandle;
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{info, warn};
 
@@ -28,22 +28,22 @@ const DRIVER_NAME: &str = "mxc";
 const DRIVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Sentinel image name — MXC has no OCI image; this string must be non-empty
 /// so the gateway's `default_image` cache is satisfied, but it is not pullable.
-const DEFAULT_IMAGE_SENTINEL: &str = "mxc:isolation-session";
+const DEFAULT_IMAGE_SENTINEL: &str = "mxc:process-container";
 
 // ── Config ────────────────────────────────────────────────────────────────────
 
 /// Which MXC backend the driver targets.
 ///
-/// - `IsolationSession` (default): persistent, attachable session
+/// - `IsolationSession`: persistent, attachable session
 ///   (provision → start → exec → stop → deprovision). Grant-only filesystem
 ///   policy — it has no deny primitive and is NOT default-deny.
-/// - `ProcessContainer`: one-shot AppContainer. Genuinely default-deny: a
+/// - `ProcessContainer` (default): one-shot `AppContainer`. Genuinely default-deny: a
 ///   write to any ungranted path is denied by the OS. No persistent session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum MxcBackend {
-    #[default]
     IsolationSession,
+    #[default]
     ProcessContainer,
 }
 
@@ -52,45 +52,20 @@ pub enum MxcBackend {
 /// Loaded from `[openshell.drivers.mxc]` in the gateway TOML file, or from
 /// environment variables / CLI flags via the standard gateway precedence chain.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct MxcComputeConfig {
     /// Path to `wxc-exec.exe`. Required for live runs.
     pub wxc_exec_path: String,
-    /// Backend to target. Default: `isolation_session`.
+    /// Backend to target. Default: `process_container`.
     pub backend: MxcBackend,
-    /// `processContainer` only: request a Less-Privileged AppContainer.
+    /// `processContainer` only: request a Less-Privileged `AppContainer`.
     pub pc_least_privilege: bool,
-    /// `processContainer` only: AppContainer capabilities to grant.
+    /// `processContainer` only: `AppContainer` capabilities to grant.
     pub pc_capabilities: Vec<String>,
     /// MXC `configurationId` for isolation session. Default: `"composable"`.
     /// Never use `"small"` (known OS bug).
     pub default_configuration_id: String,
-    /// Agent command executed inside the sandbox (exec-in-driver).
-    /// For the June 15 demo this writes `hello.txt`; a follow-up skill
-    /// swaps in a richer agent. Must be non-empty for `CreateSandbox` to
-    /// succeed.
-    pub agent_command: Vec<String>,
-    /// Working directory for the agent command inside the sandbox.
-    pub agent_cwd: String,
-    /// Environment variables injected into the agent process inside the sandbox
-    /// (becomes MXC `process.env`). Each entry is either:
-    ///   - `KEY=VALUE` — passed through verbatim, or
-    ///   - `KEY` — resolved from the gateway host's environment at launch.
-    /// The bare-`KEY` form keeps secrets (e.g. inference API keys) out of the
-    /// config file: set the value on the gateway host and reference it by name.
-    /// Host vars that are not set are skipped with a warning.
-    pub agent_env: Vec<String>,
-    /// Host directory mapped into the sandbox as a read-write grant.
-    /// Appears in the shared host folder for the positive-proof artifact.
-    pub share_dir: String,
-    /// Enable Pattern-C governed egress. When true, MXC receives filesystem
-    /// grants plus a `network.proxy` redirect and the host CONNECT proxy
-    /// receives a trimmed network-only policy.
-    pub egress_proxy: bool,
-    /// Loopback `IP:PORT` used for MXC `network.proxy` while governed egress is
-    /// enabled. Per-sandbox allocation is a follow-up; this is one configured
-    /// address for the initial integration.
-    pub egress_proxy_addr: String,
+
     /// Enable `--debug` flag on `wxc-exec` invocations.
     pub debug: bool,
 }
@@ -103,15 +78,20 @@ impl Default for MxcComputeConfig {
             pc_least_privilege: false,
             pc_capabilities: Vec::new(),
             default_configuration_id: crate::mxc::DEFAULT_CONFIGURATION_ID.into(),
-            agent_command: Vec::new(),
-            agent_cwd: String::new(),
-            agent_env: Vec::new(),
-            share_dir: String::new(),
-            egress_proxy: false,
-            egress_proxy_addr: String::new(),
+
             debug: false,
         }
     }
+}
+
+/// Per-sandbox MXC workload settings supplied through
+/// `template.driver_config.mxc` / `--driver-config-json`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MxcSandboxConfig {
+    command: Vec<String>,
+    #[serde(default)]
+    cwd: String,
 }
 
 // ── Registry entry ────────────────────────────────────────────────────────────
@@ -127,10 +107,12 @@ pub enum PhaseState {
 struct SandboxEntry {
     sandbox: DriverSandbox,
     iso_sandbox_id: Option<String>,
+    isolation_stopped: bool,
     phase_state: PhaseState,
-    exec_child: Option<Child>,
-    trimmed_policy: Option<SandboxPolicy>,
-    proxy_addr: Option<SocketAddr>,
+    /// Serializes stop/delete with provisioning and process launch.
+    lifecycle_gate: Arc<Mutex<()>>,
+    monitor_cancel: Option<watch::Sender<bool>>,
+    monitor_task: Option<JoinHandle<()>>,
 }
 
 impl std::fmt::Debug for SandboxEntry {
@@ -138,8 +120,8 @@ impl std::fmt::Debug for SandboxEntry {
         f.debug_struct("SandboxEntry")
             .field("sandbox_id", &self.sandbox.id)
             .field("iso_sandbox_id", &self.iso_sandbox_id)
+            .field("isolation_stopped", &self.isolation_stopped)
             .field("phase_state", &self.phase_state)
-            .field("proxy_addr", &self.proxy_addr)
             .finish_non_exhaustive()
     }
 }
@@ -212,63 +194,79 @@ impl std::fmt::Debug for MxcComputeBackend {
     }
 }
 
-fn configured_egress_addr(config: &MxcComputeConfig) -> Result<Option<SocketAddr>, tonic::Status> {
-    if !config.egress_proxy {
-        return Ok(None);
-    }
-    if config.backend == MxcBackend::IsolationSession {
+fn sandbox_config(sandbox: &DriverSandbox) -> Result<MxcSandboxConfig, tonic::Status> {
+    let config = sandbox
+        .spec
+        .as_ref()
+        .and_then(|spec| spec.template.as_ref())
+        .and_then(|template| template.driver_config.as_ref())
+        .ok_or_else(|| {
+            tonic::Status::invalid_argument(
+                "mxc requires template.driver_config.mxc with a non-empty command array",
+            )
+        })?;
+    let config: MxcSandboxConfig =
+        serde_json::from_value(struct_to_json_value(config)).map_err(|error| {
+            tonic::Status::invalid_argument(format!("invalid mxc driver_config: {error}"))
+        })?;
+    if config.command.is_empty() || config.command[0].is_empty() {
         return Err(tonic::Status::invalid_argument(
-            "mxc governed egress requires process_container; network.proxy is not supported on isolation_session until MXC M1 lands",
+            "mxc driver_config.command must contain a non-empty executable",
         ));
     }
-    let raw = config.egress_proxy_addr.trim();
-    if raw.is_empty() {
-        return Err(tonic::Status::invalid_argument(
-            "mxc egress_proxy_addr is required when egress_proxy is enabled",
-        ));
-    }
-    let addr = raw.parse::<SocketAddr>().map_err(|e| {
-        tonic::Status::invalid_argument(format!(
-            "mxc egress_proxy_addr must be an IP:PORT socket address: {e}"
-        ))
-    })?;
-    // MXC 0.6.0-alpha expresses the redirect as {"proxy": {"localhost": N}}
-    // — it has no way to encode a non-loopback host. Reject early so the
-    // operator gets a clear message rather than a silent policy gap.
-    // Use 127.0.0.1:PORT. Future schema versions may lift this restriction.
-    if addr.ip() != std::net::IpAddr::from([127, 0, 0, 1]) {
-        return Err(tonic::Status::invalid_argument(format!(
-            "mxc egress_proxy_addr must be 127.0.0.1:PORT — MXC 0.6.0-alpha \
-             expresses the redirect as {{\"localhost\": N}} and cannot encode \
-             non-loopback addresses (got {})",
-            addr.ip()
-        )));
-    }
-    Ok(Some(addr))
+    Ok(config)
 }
 
-/// Resolve configured `agent_env` entries into concrete `KEY=VALUE` strings for
-/// MXC `process.env`. `KEY=VALUE` entries pass through verbatim; bare `KEY`
-/// entries are looked up in the gateway host environment so secrets never have
-/// to live in the config file. Unset host vars are skipped with a warning.
-fn resolve_agent_env(entries: &[String]) -> Vec<String> {
-    let mut resolved = Vec::with_capacity(entries.len());
-    for entry in entries {
-        if entry.contains('=') {
-            resolved.push(entry.clone());
-            continue;
-        }
-        match std::env::var(entry) {
-            Ok(value) => resolved.push(format!("{entry}={value}")),
-            Err(_) => warn!(
-                var = %entry,
-                "agent_env passthrough variable not set in gateway host environment; skipping"
-            ),
-        }
-    }
-    resolved
+fn sandbox_environment(sandbox: &DriverSandbox) -> Vec<String> {
+    let Some(spec) = sandbox.spec.as_ref() else {
+        return Vec::new();
+    };
+    let mut environment = spec
+        .template
+        .as_ref()
+        .map_or_else(HashMap::new, |template| template.environment.clone());
+    environment.extend(spec.environment.clone());
+    let mut environment = environment
+        .into_iter()
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect::<Vec<_>>();
+    environment.sort_unstable();
+    environment
 }
 
+fn encode_windows_command_line(args: &[String]) -> String {
+    args.iter()
+        .map(|arg| quote_windows_argument(arg))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn quote_windows_argument(arg: &str) -> String {
+    if !arg.is_empty() && !arg.chars().any(|ch| ch.is_whitespace() || ch == '"') {
+        return arg.to_string();
+    }
+
+    let mut quoted = String::from("\"");
+    let mut backslashes = 0;
+    for ch in arg.chars() {
+        match ch {
+            '\\' => backslashes += 1,
+            '"' => {
+                quoted.push_str(&"\\".repeat(backslashes * 2 + 1));
+                quoted.push('"');
+                backslashes = 0;
+            }
+            _ => {
+                quoted.push_str(&"\\".repeat(backslashes));
+                backslashes = 0;
+                quoted.push(ch);
+            }
+        }
+    }
+    quoted.push_str(&"\\".repeat(backslashes * 2));
+    quoted.push('"');
+    quoted
+}
 impl MxcComputeBackend {
     pub fn new(config: MxcComputeConfig) -> Self {
         let invoker = WxcExecInvoker::new(&config.wxc_exec_path, config.debug);
@@ -278,8 +276,8 @@ impl MxcComputeBackend {
             config,
             registry: Arc::new(Mutex::new(HashMap::new())),
             watch_tx: Arc::new(watch_tx),
-            // Primary impl: the embedded mapper (Giedrius's logic vendored into
-            // `policy_map`). Swap for `StubPolicyMapper` only for scaffolding.
+            // Production policy translation is always handled by the embedded
+            // mapper before any MXC lifecycle side effects begin.
             policy_mapper: Arc::new(EmbeddedPolicyMapper),
             pending_policies: Arc::new(Mutex::new(HashMap::new())),
         }
@@ -320,23 +318,17 @@ impl MxcComputeBackend {
                     "mxc driver does not support GPU sandboxes",
                 ));
             }
-            if let Some(tmpl) = &spec.template {
-                if !tmpl.agent_socket_path.is_empty() {
-                    return Err(tonic::Status::invalid_argument(
-                        "mxc driver does not support agent_socket_path (no in-sandbox supervisor)",
-                    ));
-                }
+            if let Some(tmpl) = &spec.template
+                && !tmpl.agent_socket_path.is_empty()
+            {
+                return Err(tonic::Status::invalid_argument(
+                    "mxc driver does not support agent_socket_path (no in-sandbox supervisor)",
+                ));
             }
         }
-        if self.config.agent_command.is_empty() {
-            return Err(tonic::Status::invalid_argument(
-                "mxc driver: agent_command is required in [openshell.drivers.mxc]",
-            ));
-        }
-        configured_egress_addr(&self.config)?;
+        sandbox_config(sandbox)?;
         Ok(())
     }
-
     pub async fn get_sandbox(&self, sandbox_name: &str) -> Option<DriverSandbox> {
         let registry = self.registry.lock().await;
         registry
@@ -354,20 +346,29 @@ impl MxcComputeBackend {
         let sandbox_id = sandbox.id.clone();
 
         // Consume the out-of-band policy staged by `ComputeRuntime::create_sandbox`
-        // (A1). Always remove — even on the early-return paths below — so nothing
-        // leaks if validation or the duplicate check rejects the create.
+        // (A1). Always remove so rejected creates cannot leak policy state.
         let policy = self.pending_policies.lock().await.remove(&sandbox_id);
-
         self.validate_sandbox_create(sandbox)?;
+        let sandbox_config = sandbox_config(sandbox)?;
 
-        // `sandbox_token` is minted by the gateway only when the sandbox-JWT
-        // issuer is configured. On MXC there is no in-sandbox supervisor that
-        // would ever consume it (the supervisor-removal design — D1/D4), so an
-        // absent token must not block create. Log it and move on.
+        // Policy translation is deterministic and side-effect free. Do it before
+        // inserting the registry entry or launching MXC so invalid requests fail
+        // synchronously at the CreateSandbox boundary.
+        let mapped = self
+            .policy_mapper
+            .map(
+                policy.as_ref(),
+                &MapCtx {
+                    sandbox_id: sandbox_id.clone(),
+                    egress: None,
+                },
+            )
+            .map_err(|error| tonic::Status::invalid_argument(error.to_string()))?;
+
         if sandbox
             .spec
             .as_ref()
-            .map_or(true, |s| s.sandbox_token.is_empty())
+            .is_none_or(|spec| spec.sandbox_token.is_empty())
         {
             tracing::debug!(
                 sandbox = %sandbox.name,
@@ -376,7 +377,11 @@ impl MxcComputeBackend {
         }
 
         let sandbox_name = sandbox.name.clone();
-
+        let lifecycle_gate = Arc::new(Mutex::new(()));
+        // Take the gate before publishing the entry. stop/delete can discover the
+        // sandbox immediately, but cannot pass this guard until startup has either
+        // installed a cancellable child monitor or failed.
+        let startup_guard = lifecycle_gate.clone().lock_owned().await;
         {
             let mut registry = self.registry.lock().await;
             if registry.contains_key(&sandbox_id) {
@@ -401,10 +406,11 @@ impl MxcComputeBackend {
                 SandboxEntry {
                     sandbox: initial,
                     iso_sandbox_id: None,
+                    isolation_stopped: false,
                     phase_state: PhaseState::Starting,
-                    exec_child: None,
-                    trimmed_policy: None,
-                    proxy_addr: None,
+                    lifecycle_gate,
+                    monitor_cancel: None,
+                    monitor_task: None,
                 },
             );
         }
@@ -413,46 +419,68 @@ impl MxcComputeBackend {
         let config = self.config.clone();
         let registry = self.registry.clone();
         let watch_tx = self.watch_tx.clone();
-        let policy_mapper = self.policy_mapper.clone();
         let sandbox = sandbox.clone();
-
         tokio::spawn(async move {
             run_lifecycle(
                 invoker,
                 config,
-                policy_mapper,
                 registry,
                 watch_tx,
                 sandbox,
-                policy,
+                sandbox_config,
+                mapped,
+                startup_guard,
             )
             .await;
         });
 
         Ok(())
     }
-
     pub async fn stop_sandbox(&self, sandbox_name: &str) -> Result<(), tonic::Status> {
-        let (iso_id, sandbox_id) = {
+        let (sandbox_id, lifecycle_gate) = {
             let registry = self.registry.lock().await;
             let entry = registry
                 .values()
-                .find(|e| e.sandbox.name == sandbox_name)
+                .find(|entry| entry.sandbox.name == sandbox_name)
                 .ok_or_else(|| {
                     tonic::Status::not_found(format!("sandbox {sandbox_name} not found"))
                 })?;
-            (entry.iso_sandbox_id.clone(), entry.sandbox.id.clone())
+            (entry.sandbox.id.clone(), entry.lifecycle_gate.clone())
         };
 
-        if let Some(ref iso_id) = iso_id {
-            if let Err(e) = self.invoker.stop(iso_id).await {
-                warn!(sandbox = %sandbox_name, error = %e, "wxc-exec stop failed");
-            }
+        let _lifecycle_guard = lifecycle_gate.lock().await;
+        let (iso_id, mut isolation_stopped, cancel, monitor_task) = {
+            let mut registry = self.registry.lock().await;
+            let entry = registry.get_mut(&sandbox_id).ok_or_else(|| {
+                tonic::Status::not_found(format!("sandbox {sandbox_name} not found"))
+            })?;
+            (
+                entry.iso_sandbox_id.clone(),
+                entry.isolation_stopped,
+                entry.monitor_cancel.take(),
+                entry.monitor_task.take(),
+            )
+        };
+        if let Some(cancel) = cancel {
+            let _ = cancel.send(true);
+        }
+        if let Some(task) = monitor_task {
+            task.await.map_err(|error| {
+                tonic::Status::internal(format!("mxc process monitor failed: {error}"))
+            })?;
+        }
+        if let Some(ref iso_id) = iso_id
+            && !isolation_stopped
+        {
+            self.invoker.stop(iso_id).await.map_err(|error| {
+                tonic::Status::internal(format!("wxc-exec stop failed: {error}"))
+            })?;
+            isolation_stopped = true;
         }
 
-        let watch_tx = self.watch_tx.clone();
         let mut registry = self.registry.lock().await;
         if let Some(entry) = registry.get_mut(&sandbox_id) {
+            entry.isolation_stopped = isolation_stopped;
             entry.phase_state = PhaseState::Stopped;
             entry.sandbox = make_sandbox_with_condition(
                 &entry.sandbox,
@@ -467,28 +495,64 @@ impl MxcComputeBackend {
             );
             let snapshot = entry.sandbox.clone();
             drop(registry);
-            let _ = watch_tx.send(sandbox_event(snapshot));
+            let _ = self.watch_tx.send(sandbox_event(snapshot));
         }
         Ok(())
     }
-
     pub async fn delete_sandbox(
         &self,
         sandbox_id: &str,
         sandbox_name: &str,
     ) -> Result<bool, tonic::Status> {
-        let iso_id = {
+        let lifecycle_gate = {
             let registry = self.registry.lock().await;
-            registry
-                .get(sandbox_id)
-                .and_then(|e| e.iso_sandbox_id.clone())
+            let Some(entry) = registry.get(sandbox_id) else {
+                return Ok(false);
+            };
+            if entry.sandbox.name != sandbox_name {
+                return Err(tonic::Status::failed_precondition(
+                    "sandbox_id did not match sandbox_name",
+                ));
+            }
+            entry.lifecycle_gate.clone()
         };
 
-        if let Some(iso_id) = iso_id {
-            let _ = self.invoker.stop(&iso_id).await;
-            if let Err(e) = self.invoker.deprovision(&iso_id).await {
-                warn!(sandbox = %sandbox_name, error = %e, "wxc-exec deprovision failed");
+        let _lifecycle_guard = lifecycle_gate.lock().await;
+        let (iso_id, isolation_stopped, cancel, monitor_task) = {
+            let mut registry = self.registry.lock().await;
+            let Some(entry) = registry.get_mut(sandbox_id) else {
+                return Ok(false);
+            };
+            (
+                entry.iso_sandbox_id.clone(),
+                entry.isolation_stopped,
+                entry.monitor_cancel.take(),
+                entry.monitor_task.take(),
+            )
+        };
+        if let Some(cancel) = cancel {
+            let _ = cancel.send(true);
+        }
+        if let Some(task) = monitor_task {
+            task.await.map_err(|error| {
+                tonic::Status::internal(format!("mxc process monitor failed: {error}"))
+            })?;
+        }
+        if let Some(ref iso_id) = iso_id {
+            if !isolation_stopped {
+                self.invoker.stop(iso_id).await.map_err(|error| {
+                    tonic::Status::internal(format!("wxc-exec stop failed: {error}"))
+                })?;
+                // Persist phase progress before deprovision. If deprovision
+                // fails, a retry resumes here instead of stopping twice.
+                let mut registry = self.registry.lock().await;
+                if let Some(entry) = registry.get_mut(sandbox_id) {
+                    entry.isolation_stopped = true;
+                }
             }
+            self.invoker.deprovision(iso_id).await.map_err(|error| {
+                tonic::Status::internal(format!("wxc-exec deprovision failed: {error}"))
+            })?;
         }
 
         let mut registry = self.registry.lock().await;
@@ -498,7 +562,6 @@ impl MxcComputeBackend {
         }
         Ok(false)
     }
-
     /// Returns a stream of watch events.
     ///
     /// First emits a snapshot of all current sandboxes, then forwards live
@@ -507,12 +570,17 @@ impl MxcComputeBackend {
         let (tx, rx) =
             mpsc::channel::<Result<WatchSandboxesEvent, openshell_core::ComputeDriverError>>(256);
 
-        // Send initial snapshots before subscribing so we don't miss live events.
-        let snapshots: Vec<DriverSandbox> = {
+        // Subscribe while holding the registry lock. Every transition is then
+        // represented by either this snapshot or the live receiver.
+        let (snapshots, mut broadcast_rx): (Vec<DriverSandbox>, _) = {
             let registry = self.registry.lock().await;
-            registry.values().map(|e| e.sandbox.clone()).collect()
+            let broadcast_rx = self.watch_tx.subscribe();
+            let snapshots = registry
+                .values()
+                .map(|entry| entry.sandbox.clone())
+                .collect();
+            (snapshots, broadcast_rx)
         };
-        let mut broadcast_rx = self.watch_tx.subscribe();
 
         let tx_clone = tx.clone();
         tokio::spawn(async move {
@@ -532,7 +600,6 @@ impl MxcComputeBackend {
                     }
                     Err(broadcast::error::RecvError::Lagged(_)) => {
                         // Drop lagged events — the gateway re-syncs via Get/List.
-                        continue;
                     }
                     Err(broadcast::error::RecvError::Closed) => break,
                 }
@@ -549,130 +616,104 @@ impl MxcComputeBackend {
 async fn run_lifecycle(
     invoker: WxcExecInvoker,
     config: MxcComputeConfig,
-    policy_mapper: Arc<dyn PolicyMapper>,
     registry: Arc<Mutex<HashMap<String, SandboxEntry>>>,
     watch_tx: Arc<broadcast::Sender<WatchSandboxesEvent>>,
     sandbox: DriverSandbox,
-    policy: Option<SandboxPolicy>,
+    sandbox_config: MxcSandboxConfig,
+    mapped: MappedConfig,
+    _startup_guard: tokio::sync::OwnedMutexGuard<()>,
 ) {
     let sandbox_id = sandbox.id.clone();
     let sandbox_name = sandbox.name.clone();
-    let egress_addr = match configured_egress_addr(&config) {
-        Ok(addr) => addr,
-        Err(e) => {
-            set_failed(&registry, &watch_tx, &sandbox, &sandbox_id, &e.to_string()).await;
-            return;
-        }
-    };
-
-    // 1. Map policy → MXC filesystem config (A1: policy is now threaded in).
-    let map_ctx = MapCtx {
-        sandbox_id: sandbox_id.clone(),
-        share_dir: if config.share_dir.is_empty() {
-            None
-        } else {
-            Some(config.share_dir.clone())
-        },
-        egress: egress_addr,
-    };
-    let mapped = match policy_mapper.map(policy.as_ref(), &map_ctx) {
-        Ok(m) => m,
-        Err(e) => {
-            set_failed(&registry, &watch_tx, &sandbox, &sandbox_id, &e.to_string()).await;
-            return;
-        }
-    };
-    let trimmed_policy = mapped.trimmed_policy.clone();
-    let proxy_addr = mapped.proxy_addr;
-    if let Some(addr) = proxy_addr {
-        {
-            let mut reg = registry.lock().await;
-            if let Some(entry) = reg.get_mut(&sandbox_id) {
-                entry.trimmed_policy = trimmed_policy;
-                entry.proxy_addr = Some(addr);
-            }
-        }
-        let _ = watch_tx.send(platform_event(
-            sandbox_id.clone(),
-            "EgressRedirect",
-            format!("MXC egress redirected to OpenShell host CONNECT proxy at {addr}"),
-        ));
-    }
-
-    // 2. Build filesystem grants + the agent process (shared across backends).
     let filesystem = MxcFilesystem {
         readwrite_paths: mapped.readwrite_paths,
         readonly_paths: mapped.readonly_paths,
         // OpenShell's policy model has no explicit deny field; default-deny is
-        // implicit. processContainer enforces that at the OS level regardless.
+        // implicit and enforced by processContainer at the OS boundary.
         denied_paths: Vec::new(),
     };
-    let command_line = config.agent_command.join(" ");
-    let cwd = if config.agent_cwd.is_empty() {
-        config.share_dir.clone()
-    } else {
-        config.agent_cwd.clone()
-    };
+    let command_line = encode_windows_command_line(&sandbox_config.command);
     let process = MxcProcess {
         command_line: command_line.clone(),
-        cwd,
-        env: resolve_agent_env(&config.agent_env),
+        cwd: sandbox_config.cwd,
+        env: sandbox_environment(&sandbox),
         timeout: 0,
     };
-    let network = proxy_addr.map(|addr| MxcNetwork {
-        default_policy: "block".into(),
-        proxy: Some(addr),
-    });
 
-    // 3. Launch the agent. The backends differ fundamentally:
-    //    - isolation_session: persistent (provision -> start -> exec).
-    //    - processContainer: one-shot (a single ephemeral AppContainer).
     let child = match config.backend {
         MxcBackend::IsolationSession => {
             let iso_sandbox_id = match invoker
-                .provision(&config.default_configuration_id, filesystem, network)
+                .provision(&config.default_configuration_id, filesystem, None)
                 .await
             {
                 Ok(id) => id,
-                Err(e) => {
-                    set_failed(&registry, &watch_tx, &sandbox, &sandbox_id, &e.to_string()).await;
+                Err(error) => {
+                    set_failed(
+                        &registry,
+                        &watch_tx,
+                        &sandbox,
+                        &sandbox_id,
+                        &error.to_string(),
+                    )
+                    .await;
                     return;
                 }
             };
             info!(sandbox = %sandbox_name, iso_id = %iso_sandbox_id, "MXC provisioned");
             {
-                let mut reg = registry.lock().await;
-                if let Some(entry) = reg.get_mut(&sandbox_id) {
+                let mut registry = registry.lock().await;
+                if let Some(entry) = registry.get_mut(&sandbox_id) {
+                    // Publish cleanup identity before any later lifecycle await.
                     entry.iso_sandbox_id = Some(iso_sandbox_id.clone());
+                    entry.isolation_stopped = false;
                 }
             }
-            if let Err(e) = invoker.start(&iso_sandbox_id).await {
-                set_failed(&registry, &watch_tx, &sandbox, &sandbox_id, &e.to_string()).await;
+            if let Err(error) = invoker.start(&iso_sandbox_id).await {
+                set_failed(
+                    &registry,
+                    &watch_tx,
+                    &sandbox,
+                    &sandbox_id,
+                    &error.to_string(),
+                )
+                .await;
                 return;
             }
             info!(sandbox = %sandbox_name, "MXC started");
             match invoker.spawn_exec(&iso_sandbox_id, process).await {
-                Ok(c) => c,
-                Err(e) => {
-                    set_failed(&registry, &watch_tx, &sandbox, &sandbox_id, &e.to_string()).await;
+                Ok(child) => child,
+                Err(error) => {
+                    set_failed(
+                        &registry,
+                        &watch_tx,
+                        &sandbox,
+                        &sandbox_id,
+                        &error.to_string(),
+                    )
+                    .await;
                     return;
                 }
             }
         }
         MxcBackend::ProcessContainer => {
-            // One-shot: no provision/start, no persistent iso id. The
-            // AppContainer is created, runs the agent, and is torn down on exit.
-            let pc = MxcProcessContainer {
+            let process_container = MxcProcessContainer {
                 least_privilege: config.pc_least_privilege,
                 capabilities: config.pc_capabilities.clone(),
             };
             match invoker
-                .run_oneshot(&sandbox_id, filesystem, pc, process, network)
+                .run_oneshot(&sandbox_id, filesystem, process_container, process, None)
                 .await
             {
-                Ok(c) => c,
-                Err(e) => {
-                    set_failed(&registry, &watch_tx, &sandbox, &sandbox_id, &e.to_string()).await;
+                Ok(child) => child,
+                Err(error) => {
+                    set_failed(
+                        &registry,
+                        &watch_tx,
+                        &sandbox,
+                        &sandbox_id,
+                        &error.to_string(),
+                    )
+                    .await;
                     return;
                 }
             }
@@ -680,7 +721,6 @@ async fn run_lifecycle(
     };
     info!(sandbox = %sandbox_name, command = %command_line, backend = ?config.backend, "MXC agent launched");
 
-    // 5. Self-report Ready=True.
     let ready_sandbox = make_sandbox_with_condition(
         &sandbox,
         &DriverCondition {
@@ -692,24 +732,27 @@ async fn run_lifecycle(
         },
         false,
     );
+    let (cancel_tx, cancel_rx) = watch::channel(false);
     {
-        let mut reg = registry.lock().await;
-        if let Some(entry) = reg.get_mut(&sandbox_id) {
+        // Publish cancellation state before the monitor can observe a fast
+        // process exit. Holding the registry lock while spawning prevents a
+        // completed child from being overwritten with AgentRunning.
+        let mut registry_guard = registry.lock().await;
+        if let Some(entry) = registry_guard.get_mut(&sandbox_id) {
             entry.sandbox = ready_sandbox.clone();
             entry.phase_state = PhaseState::Running;
-            entry.exec_child = Some(child);
+            entry.monitor_cancel = Some(cancel_tx);
+            entry.monitor_task = Some(tokio::spawn(monitor_exec(
+                registry.clone(),
+                watch_tx.clone(),
+                sandbox.clone(),
+                sandbox_id.clone(),
+                cancel_rx,
+                child,
+            )));
         }
     }
     let _ = watch_tx.send(sandbox_event(ready_sandbox));
-
-    // 6. Monitor exec completion in background.
-    let registry2 = registry.clone();
-    let watch_tx2 = watch_tx.clone();
-    let sandbox2 = sandbox.clone();
-    let sandbox_id2 = sandbox_id.clone();
-    tokio::spawn(async move {
-        monitor_exec(registry2, watch_tx2, sandbox2, sandbox_id2).await;
-    });
 }
 
 async fn monitor_exec(
@@ -717,22 +760,28 @@ async fn monitor_exec(
     watch_tx: Arc<broadcast::Sender<WatchSandboxesEvent>>,
     sandbox: DriverSandbox,
     sandbox_id: String,
+    mut cancel_rx: watch::Receiver<bool>,
+    mut child: tokio::process::Child,
 ) {
-    let child = {
-        let mut reg = registry.lock().await;
-        reg.get_mut(&sandbox_id).and_then(|e| e.exec_child.take())
-    };
-    let Some(mut child) = child else {
-        return;
+    let status = tokio::select! {
+        status = child.wait() => status,
+        changed = cancel_rx.changed() => {
+            let should_kill = changed.is_ok() && *cancel_rx.borrow_and_update();
+            if should_kill {
+                if let Err(error) = child.kill().await {
+                    warn!(sandbox = %sandbox.name, error = %error, "failed to terminate MXC agent process");
+                }
+                // `kill` waits on current Tokio releases, but an explicit wait is
+                // harmless and guarantees the OS process handle is reaped.
+                let _ = child.wait().await;
+            }
+            return;
+        }
     };
 
-    match child.wait().await {
+    match status {
         Ok(status) if status.success() => {
             info!(sandbox = %sandbox.name, "MXC agent exec completed successfully");
-            // A successful one-shot agent (exit 0) must NOT demote the sandbox to
-            // Error. The isolation session is still alive until stop/deprovision,
-            // and the demo's positive proof is "Ready + in-policy file written".
-            // Keep Ready=True so derive_phase leaves the public phase at Ready.
             let done = make_sandbox_with_condition(
                 &sandbox,
                 &DriverCondition {
@@ -744,12 +793,12 @@ async fn monitor_exec(
                 },
                 false,
             );
-            let mut reg = registry.lock().await;
-            if let Some(entry) = reg.get_mut(&sandbox_id) {
+            let mut registry = registry.lock().await;
+            if let Some(entry) = registry.get_mut(&sandbox_id) {
                 entry.sandbox = done.clone();
                 entry.phase_state = PhaseState::Running;
             }
-            drop(reg);
+            drop(registry);
             let _ = watch_tx.send(sandbox_event(done));
         }
         Ok(status) => {
@@ -771,20 +820,19 @@ async fn monitor_exec(
                 },
                 false,
             );
-            let mut reg = registry.lock().await;
-            if let Some(entry) = reg.get_mut(&sandbox_id) {
+            let mut registry = registry.lock().await;
+            if let Some(entry) = registry.get_mut(&sandbox_id) {
                 entry.sandbox = failed.clone();
                 entry.phase_state = PhaseState::Failed(format!("exit code {code}"));
             }
-            drop(reg);
+            drop(registry);
             let _ = watch_tx.send(sandbox_event(failed));
         }
-        Err(e) => {
-            warn!(sandbox = %sandbox.name, error = %e, "MXC agent exec wait error");
+        Err(error) => {
+            warn!(sandbox = %sandbox.name, error = %error, "MXC agent exec wait error");
         }
     }
 }
-
 async fn set_failed(
     registry: &Arc<Mutex<HashMap<String, SandboxEntry>>>,
     watch_tx: &Arc<broadcast::Sender<WatchSandboxesEvent>>,
@@ -848,11 +896,21 @@ fn make_sandbox_with_condition(
 mod lifecycle_tests {
     use super::*;
     use futures::StreamExt;
-    use openshell_core::proto::compute::v1::DriverSandboxSpec;
+    use openshell_core::proto::compute::v1::{DriverSandboxSpec, DriverSandboxTemplate};
     use openshell_core::proto::{FilesystemPolicy, SandboxPolicy};
     use std::time::Duration;
 
     fn driver_sandbox(id: &str) -> DriverSandbox {
+        driver_sandbox_with_command(id, "", vec!["cmd".into(), "/c".into(), "exit 0".into()])
+    }
+
+    fn driver_sandbox_with_command(id: &str, cwd: &str, command: Vec<String>) -> DriverSandbox {
+        let serde_json::Value::Object(driver_config) = serde_json::json!({
+            "command": command,
+            "cwd": cwd,
+        }) else {
+            unreachable!();
+        };
         DriverSandbox {
             id: id.to_string(),
             name: id.to_string(),
@@ -860,18 +918,23 @@ mod lifecycle_tests {
             workspace: String::new(),
             spec: Some(DriverSandboxSpec {
                 sandbox_token: "test-token".into(),
+                template: Some(DriverSandboxTemplate {
+                    driver_config: Some(
+                        openshell_core::proto_struct::json_object_to_struct(driver_config).unwrap(),
+                    ),
+                    ..Default::default()
+                }),
                 ..Default::default()
             }),
             status: None,
         }
     }
-
     fn fs_policy(read_write: &[&str]) -> SandboxPolicy {
         SandboxPolicy {
             filesystem: Some(FilesystemPolicy {
                 include_workdir: false,
                 read_only: Vec::new(),
-                read_write: read_write.iter().map(|s| s.to_string()).collect(),
+                read_write: read_write.iter().map(ToString::to_string).collect(),
             }),
             ..Default::default()
         }
@@ -896,92 +959,60 @@ mod lifecycle_tests {
         F: FnMut(&DriverSandbox) -> bool,
     {
         for _ in 0..100 {
-            if let Some(sb) = backend.get_sandbox(name).await {
-                if pred(&sb) {
-                    return Some(sb);
-                }
+            if let Some(sandbox) = backend.get_sandbox(name).await
+                && pred(&sandbox)
+            {
+                return Some(sandbox);
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
         None
     }
 
-    fn demo_config(share_dir: &str, agent_command: Vec<String>) -> MxcComputeConfig {
-        MxcComputeConfig {
-            agent_command,
-            agent_cwd: share_dir.into(),
-            share_dir: share_dir.into(),
-            ..Default::default()
-        }
-    }
-
     #[test]
-    fn mxc_config_defaults_leave_egress_disabled() {
-        let config = MxcComputeConfig::default();
-        assert!(!config.egress_proxy);
-        assert!(config.egress_proxy_addr.is_empty());
-    }
-
-    #[test]
-    fn resolve_agent_env_passthrough_and_host_lookup() {
-        // Literal KEY=VALUE passes through verbatim.
+    fn mxc_config_defaults_to_default_deny_process_container() {
         assert_eq!(
-            resolve_agent_env(&["FOO=bar".into()]),
-            vec!["FOO=bar".to_string()]
-        );
-
-        // Bare KEY for an unset host var is skipped (not emitted empty).
-        assert!(resolve_agent_env(&["OPENSHELL_TEST_DEFINITELY_UNSET_VAR".into()]).is_empty());
-
-        // Bare KEY for a set host var resolves to KEY=value from the host env.
-        // Use PATH (guaranteed present) read-only, so the test never mutates the
-        // process environment (set_var/remove_var are unsafe + racy under
-        // parallel test execution in edition 2024).
-        let var = "PATH";
-        let expected = std::env::var(var).expect("PATH must be set in test environment");
-        let resolved = resolve_agent_env(&[var.to_string()]);
-        assert_eq!(resolved, vec![format!("{var}={expected}")]);
-    }
-
-    #[test]
-    fn egress_non_loopback_addr_is_rejected() {
-        // MXC 0.6.0-alpha can only express {"proxy": {"localhost": N}}, so
-        // non-127.0.0.1 redirect addresses must be rejected at validate time.
-        let mut config = demo_config(
-            "C:/work/demo",
-            vec!["cmd".into(), "/c".into(), "exit 0".into()],
-        );
-        config.backend = MxcBackend::ProcessContainer;
-        config.egress_proxy = true;
-        config.egress_proxy_addr = "10.0.0.1:18080".into();
-        let backend = MxcComputeBackend::new_mocked(config);
-        let err = backend
-            .validate_sandbox_create(&driver_sandbox("sb-nonlocal"))
-            .unwrap_err();
-        assert_eq!(err.code(), tonic::Code::InvalidArgument);
-        assert!(
-            err.message().contains("127.0.0.1"),
-            "error should mention 127.0.0.1, got: {}",
-            err.message()
+            MxcComputeConfig::default().backend,
+            MxcBackend::ProcessContainer
         );
     }
 
     #[test]
-    fn egress_on_isolation_session_is_rejected() {
-        let mut config = demo_config(
-            "C:/work/demo",
-            vec!["cmd".into(), "/c".into(), "exit 0".into()],
+    fn sandbox_environment_uses_sandbox_scope_with_spec_precedence() {
+        let mut sandbox = driver_sandbox("sb-env");
+        let spec = sandbox.spec.as_mut().unwrap();
+        spec.template
+            .as_mut()
+            .unwrap()
+            .environment
+            .insert("SHARED".into(), "template".into());
+        spec.environment.insert("SHARED".into(), "spec".into());
+        spec.environment.insert("TOKEN".into(), "value".into());
+        assert_eq!(
+            sandbox_environment(&sandbox),
+            vec!["SHARED=spec".to_string(), "TOKEN=value".to_string()]
         );
-        config.egress_proxy = true;
-        config.egress_proxy_addr = "127.0.0.1:18080".into();
-        let backend = MxcComputeBackend::new_mocked(config);
-        let err = backend
-            .validate_sandbox_create(&driver_sandbox("sb-egress-iso"))
-            .unwrap_err();
-        assert_eq!(err.code(), tonic::Code::InvalidArgument);
-        assert!(err.message().contains("MXC M1"));
     }
 
+    #[test]
+    fn windows_command_line_preserves_argument_boundaries() {
+        assert_eq!(
+            encode_windows_command_line(&[
+                r"C:\Program Files\Agent\agent.exe".into(),
+                "hello world".into(),
+                String::new(),
+            ]),
+            r#""C:\Program Files\Agent\agent.exe" "hello world" """#
+        );
+        assert_eq!(
+            quote_windows_argument(r#"say "hello""#),
+            r#""say \"hello\"""#
+        );
+        assert_eq!(
+            quote_windows_argument("trailing slash\\ "),
+            r#""trailing slash\ ""#
+        );
+    }
     #[tokio::test]
     async fn positive_in_policy_write_reaches_ready_and_materializes_file() {
         let tmp = tempfile::tempdir().unwrap();
@@ -993,7 +1024,7 @@ mod lifecycle_tests {
             "-Command".into(),
             format!("Set-Content -LiteralPath {hello} -Value hi"),
         ];
-        let backend = MxcComputeBackend::new_mocked(demo_config(&share, cmd));
+        let backend = MxcComputeBackend::new_mocked(MxcComputeConfig::default());
 
         // Stage the policy via the A1 side channel (as ComputeRuntime would).
         let sink = backend.policy_sink();
@@ -1001,7 +1032,7 @@ mod lifecycle_tests {
             .await
             .insert("sb-pos".into(), fs_policy(&[&share]));
 
-        let sb = driver_sandbox("sb-pos");
+        let sb = driver_sandbox_with_command("sb-pos", &share, cmd);
         backend.create_sandbox(&sb).await.expect("create accepted");
 
         // Self-reported Ready=True (no supervisor) once the agent exec launches.
@@ -1051,16 +1082,14 @@ mod lifecycle_tests {
             "-Command".into(),
             format!("Set-Content -LiteralPath {hello} -Value hi"),
         ];
-        let mut config = demo_config(&share, cmd);
-        config.backend = MxcBackend::ProcessContainer;
-        let backend = MxcComputeBackend::new_mocked(config);
+        let backend = MxcComputeBackend::new_mocked(MxcComputeConfig::default());
 
         let sink = backend.policy_sink();
         sink.lock()
             .await
             .insert("sb-pc".into(), fs_policy(&[&share]));
 
-        let sb = driver_sandbox("sb-pc");
+        let sb = driver_sandbox_with_command("sb-pc", &share, cmd);
         backend.create_sandbox(&sb).await.expect("create accepted");
 
         let ready = wait_for(&backend, "sb-pc", |s| {
@@ -1093,113 +1122,6 @@ mod lifecycle_tests {
     }
 
     #[tokio::test]
-    async fn split_path_provisions_with_proxy_redirect() {
-        use openshell_core::proto::{NetworkBinary, NetworkEndpoint, NetworkPolicyRule};
-
-        let tmp = tempfile::tempdir().unwrap();
-        let share = tmp.path().to_string_lossy().replace('\\', "/");
-        let hello = format!("{share}/hello.txt");
-        let cmd = vec![
-            "powershell".into(),
-            "-NoProfile".into(),
-            "-Command".into(),
-            format!("Set-Content -LiteralPath {hello} -Value hi"),
-        ];
-        let mut config = demo_config(&share, cmd);
-        config.backend = MxcBackend::ProcessContainer;
-        config.egress_proxy = true;
-        config.egress_proxy_addr = "127.0.0.1:18080".into();
-        let backend = MxcComputeBackend::new_mocked(config);
-        let mut stream = backend.watch_sandboxes().await;
-
-        let mut policy = fs_policy(&[&share]);
-        policy.network_policies.insert(
-            "api".into(),
-            NetworkPolicyRule {
-                name: "api".into(),
-                endpoints: vec![NetworkEndpoint {
-                    host: "example.com".into(),
-                    ports: vec![443],
-                    protocol: "rest".into(),
-                    ..Default::default()
-                }],
-                binaries: vec![NetworkBinary {
-                    path: "/usr/bin/curl".into(),
-                    ..Default::default()
-                }],
-            },
-        );
-        backend
-            .policy_sink()
-            .lock()
-            .await
-            .insert("sb-egress".into(), policy.clone());
-
-        backend
-            .create_sandbox(&driver_sandbox("sb-egress"))
-            .await
-            .expect("create accepted");
-
-        let ready = wait_for(&backend, "sb-egress", |s| {
-            ready_condition(s).is_some_and(|c| c.status == "True" && c.reason == "AgentRunning")
-        })
-        .await;
-        assert!(
-            ready.is_some(),
-            "egress split sandbox should reach Ready=True"
-        );
-
-        let recorded = crate::mxc::mock_recorded_config("sb-egress").expect("mock recorded config");
-        assert_eq!(recorded["network"]["defaultPolicy"], "block");
-        assert!(
-            recorded["network"]["allowedHosts"]
-                .as_array()
-                .unwrap()
-                .is_empty()
-        );
-        // MXC 0.6.0-alpha accepts only {"proxy": {"localhost": N}}.
-        assert_eq!(recorded["network"]["proxy"]["localhost"], 18080);
-        assert!(
-            recorded["network"]["proxy"].get("host").is_none(),
-            "proxy must not contain 'host' key"
-        );
-        assert!(
-            recorded["network"]["proxy"].get("port").is_none(),
-            "proxy must not contain 'port' key"
-        );
-
-        let reg = backend.registry.lock().await;
-        let entry = reg.get("sb-egress").expect("registry entry");
-        assert_eq!(entry.proxy_addr, Some("127.0.0.1:18080".parse().unwrap()));
-        assert_eq!(
-            entry.trimmed_policy.as_ref().unwrap().network_policies,
-            policy.network_policies
-        );
-        drop(reg);
-
-        let mut saw_redirect = false;
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
-        while tokio::time::Instant::now() < deadline {
-            match tokio::time::timeout(Duration::from_millis(500), stream.next()).await {
-                Ok(Some(Ok(ev))) => {
-                    if let Some(watch_sandboxes_event::Payload::PlatformEvent(pe)) = ev.payload
-                        && pe
-                            .event
-                            .as_ref()
-                            .is_some_and(|e| e.reason == "EgressRedirect")
-                    {
-                        saw_redirect = true;
-                        break;
-                    }
-                }
-                Ok(_) => break,
-                Err(_) => continue,
-            }
-        }
-        assert!(saw_redirect, "expected EgressRedirect platform event");
-    }
-
-    #[tokio::test]
     async fn negative_out_of_policy_write_is_denied_with_event() {
         let share_tmp = tempfile::tempdir().unwrap();
         let out_tmp = tempfile::tempdir().unwrap();
@@ -1214,7 +1136,7 @@ mod lifecycle_tests {
             "-Command".into(),
             format!("Set-Content -LiteralPath {out_path} -Value hi"),
         ];
-        let backend = MxcComputeBackend::new_mocked(demo_config(&share, cmd));
+        let backend = MxcComputeBackend::new_mocked(MxcComputeConfig::default());
 
         // Subscribe to the watch stream BEFORE create so we catch the denial event.
         let mut stream = backend.watch_sandboxes().await;
@@ -1224,7 +1146,7 @@ mod lifecycle_tests {
             .await
             .insert("sb-neg".into(), fs_policy(&[&share]));
         backend
-            .create_sandbox(&driver_sandbox("sb-neg"))
+            .create_sandbox(&driver_sandbox_with_command("sb-neg", &share, cmd))
             .await
             .expect("create accepted");
 
@@ -1234,19 +1156,18 @@ mod lifecycle_tests {
         while tokio::time::Instant::now() < deadline {
             match tokio::time::timeout(Duration::from_millis(500), stream.next()).await {
                 Ok(Some(Ok(ev))) => {
-                    if let Some(watch_sandboxes_event::Payload::PlatformEvent(pe)) = ev.payload {
-                        if pe
+                    if let Some(watch_sandboxes_event::Payload::PlatformEvent(event)) = ev.payload
+                        && event
                             .event
                             .as_ref()
-                            .is_some_and(|e| e.reason == "AgentExecFailed")
-                        {
-                            saw_denial = true;
-                            break;
-                        }
+                            .is_some_and(|event| event.reason == "AgentExecFailed")
+                    {
+                        saw_denial = true;
+                        break;
                     }
                 }
                 Ok(_) => break,
-                Err(_) => continue,
+                Err(_) => {}
             }
         }
         assert!(
@@ -1267,12 +1188,58 @@ mod lifecycle_tests {
     }
 
     #[tokio::test]
+    async fn stop_terminates_and_reaps_a_running_process_container() {
+        let tmp = tempfile::tempdir().unwrap();
+        let share = tmp.path().to_string_lossy().replace('\\', "/");
+        let marker = format!("{share}/started.txt");
+        let command = vec![
+            "powershell".into(),
+            "-NoProfile".into(),
+            "-Command".into(),
+            format!("Set-Content -LiteralPath '{marker}' -Value started; Start-Sleep -Seconds 60"),
+        ];
+        let backend = MxcComputeBackend::new_mocked(MxcComputeConfig::default());
+        backend
+            .policy_sink()
+            .lock()
+            .await
+            .insert("sb-stop".into(), fs_policy(&[&share]));
+        backend
+            .create_sandbox(&driver_sandbox_with_command("sb-stop", "", command))
+            .await
+            .expect("create accepted");
+        wait_for(&backend, "sb-stop", |sandbox| {
+            ready_condition(sandbox).is_some_and(|condition| condition.reason == "AgentRunning")
+        })
+        .await
+        .expect("long-running child should start");
+        let marker_path = std::path::Path::new(tmp.path()).join("started.txt");
+        for _ in 0..100 {
+            if marker_path.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(
+            marker_path.exists(),
+            "the long-running child must execute before stop tests cancellation"
+        );
+
+        tokio::time::timeout(Duration::from_secs(5), backend.stop_sandbox("sb-stop"))
+            .await
+            .expect("stop should not wait for the child sleep")
+            .expect("stop should terminate and reap the child");
+        let stopped = backend.get_sandbox("sb-stop").await.unwrap();
+        assert_eq!(ready_condition(&stopped).unwrap().reason, "Stopped");
+    }
+
+    #[tokio::test]
     async fn unmappable_network_policy_fails_create_lifecycle() {
         use openshell_core::proto::{NetworkEndpoint, NetworkPolicyRule};
         let tmp = tempfile::tempdir().unwrap();
         let share = tmp.path().to_string_lossy().replace('\\', "/");
-        let cmd = vec!["cmd".into(), "/c".into(), "exit 0".into()];
-        let backend = MxcComputeBackend::new_mocked(demo_config(&share, cmd));
+
+        let backend = MxcComputeBackend::new_mocked(MxcComputeConfig::default());
 
         let mut policy = fs_policy(&[&share]);
         policy.network_policies.insert(
@@ -1291,21 +1258,11 @@ mod lifecycle_tests {
             .lock()
             .await
             .insert("sb-net".into(), policy);
-        backend
+        let error = backend
             .create_sandbox(&driver_sandbox("sb-net"))
             .await
-            .expect("create accepted (rejection happens in lifecycle)");
-
-        // Unmappable policy surfaces as a terminal create-time failure, never a
-        // silent drop. (ValidateSandboxCreate has no policy side channel, so the
-        // mapper rejection happens at map-time in run_lifecycle.)
-        let failed = wait_for(&backend, "sb-net", |s| {
-            ready_condition(s).is_some_and(|c| c.status == "False" && c.reason == "ProvisionFailed")
-        })
-        .await;
-        assert!(
-            failed.is_some(),
-            "network policy on isolation_session must fail the create"
-        );
+            .expect_err("unmappable policy must fail CreateSandbox synchronously");
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        assert!(backend.get_sandbox("sb-net").await.is_none());
     }
 }

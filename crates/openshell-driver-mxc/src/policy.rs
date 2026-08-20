@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! PolicyMapper seam: `SandboxPolicy` → MXC `ContainerConfig` fragment.
+//! `PolicyMapper` seam: `SandboxPolicy` → MXC `ContainerConfig` fragment.
 //!
 //! This file does **not** write the actual policy mapping rules — that logic is
 //! **embedded** as the [`crate::policy_map`] module (the source of truth; it was
@@ -13,11 +13,9 @@
 //!   proto (no YAML bridge), extracts the MXC filesystem shares, normalizes
 //!   their paths to Windows form, and rejects the create on any `error`-severity
 //!   loss.
-//! - [`StubPolicyMapper`] — a compile-only fallback that grants only the demo
-//!   `share_dir`. Kept so the crate builds/tests without exercising the embed.
 //!
 //! **Rule: never silently drop policy.** Unmappable rules surface as
-//! `MapError::Unsupported` and are rejected in `ValidateSandboxCreate`.
+//! `MapError::Unsupported` and are rejected by `CreateSandbox` before lifecycle side effects.
 
 use std::net::SocketAddr;
 
@@ -48,9 +46,6 @@ pub struct MapCtx {
     /// Sandbox ID (gateway-assigned). Used as the MXC `containerId` and to
     /// correlate diagnostics.
     pub sandbox_id: String,
-    /// Host share directory for the demo positive proof. Always granted
-    /// read-write so `hello.txt` is visible on the host.
-    pub share_dir: Option<String>,
     /// Pattern-C governed-egress redirect address. When set, the embedded
     /// mapper uses `split_policy`; otherwise it uses the coarse MXC map.
     pub egress: Option<SocketAddr>,
@@ -80,7 +75,7 @@ fn format_loss(items: &[LossItem]) -> String {
         .join("; ")
 }
 
-/// Translates an OpenShell `SandboxPolicy` into an MXC `ContainerConfig`
+/// Translates an `OpenShell` `SandboxPolicy` into an MXC `ContainerConfig`
 /// fragment, returning a loss report of anything unrepresentable.
 pub trait PolicyMapper: Send + Sync {
     /// `policy` is `None` only when the gateway failed to stage one (the MXC
@@ -171,9 +166,9 @@ impl PolicyMapper for EmbeddedPolicyMapper {
             return Err(MapError::Unsupported(errors));
         }
 
-        // The embedded mapper copies paths verbatim; normalize them (and the
-        // demo share dir) to Windows backslash form here, in one place.
-        let mut readwrite: Vec<String> = extract_paths(&config, "readwritePaths")
+        // The embedded mapper copies paths verbatim; normalize them to Windows
+        // backslash form here, in one place.
+        let readwrite: Vec<String> = extract_paths(&config, "readwritePaths")
             .iter()
             .map(|p| normalize_path(p))
             .collect();
@@ -181,16 +176,6 @@ impl PolicyMapper for EmbeddedPolicyMapper {
             .iter()
             .map(|p| normalize_path(p))
             .collect();
-
-        // Always grant the demo host-visible share read-write so the positive
-        // proof artifact (`hello.txt`) appears on the host. For the demo this
-        // equals the policy's read_write path, so it does not broaden access.
-        if let Some(dir) = &ctx.share_dir {
-            let norm = normalize_path(dir);
-            if !readwrite.contains(&norm) {
-                readwrite.push(norm);
-            }
-        }
 
         Ok(MappedConfig {
             readwrite_paths: readwrite,
@@ -201,38 +186,14 @@ impl PolicyMapper for EmbeddedPolicyMapper {
     }
 }
 
-// ── Stub implementation (compile-only fallback) ─────────────────────────────
-
-/// Compile-only stub that applies only the demo's filesystem grant.
-///
-/// Ignores the policy and maps `ctx.share_dir` as a read-write path. Kept so the
-/// crate compiles/tests without exercising the embedded mapper. **Not sufficient
-/// for a meaningful policy demo** — use [`EmbeddedPolicyMapper`].
-///
-/// Retained as a documented scaffolding fallback (see SKILL Step 7); the default
-/// backend uses [`EmbeddedPolicyMapper`], so this is unused outside tests.
-#[allow(dead_code)]
-pub struct StubPolicyMapper;
-
-impl PolicyMapper for StubPolicyMapper {
-    fn map(&self, _policy: Option<&SandboxPolicy>, ctx: &MapCtx) -> Result<MappedConfig, MapError> {
-        let mut config = MappedConfig::default();
-        if let Some(ref dir) = ctx.share_dir {
-            config.readwrite_paths.push(normalize_path(dir));
-        }
-        Ok(config)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use openshell_core::proto::FilesystemPolicy;
 
-    fn demo_ctx(share_dir: Option<&str>) -> MapCtx {
+    fn demo_ctx() -> MapCtx {
         MapCtx {
             sandbox_id: "sb-test".into(),
-            share_dir: share_dir.map(str::to_string),
             egress: None,
         }
     }
@@ -241,27 +202,18 @@ mod tests {
         SandboxPolicy {
             filesystem: Some(FilesystemPolicy {
                 include_workdir: false,
-                read_only: ro.iter().map(|s| s.to_string()).collect(),
-                read_write: rw.iter().map(|s| s.to_string()).collect(),
+                read_only: ro.iter().map(ToString::to_string).collect(),
+                read_write: rw.iter().map(ToString::to_string).collect(),
             }),
             ..Default::default()
         }
     }
 
     #[test]
-    fn stub_maps_share_dir_as_readwrite() {
-        let mapper = StubPolicyMapper;
-        let ctx = demo_ctx(Some("C:\\work\\demo"));
-        let config = mapper.map(None, &ctx).unwrap();
-        assert_eq!(config.readwrite_paths, vec!["C:\\work\\demo"]);
-        assert!(config.readonly_paths.is_empty());
-    }
-
-    #[test]
     fn embedded_maps_policy_read_write_to_share() {
         let mapper = EmbeddedPolicyMapper;
         let policy = fs_policy(&["C:/work/openshell-mxc-demo"], &["C:/tools"]);
-        let ctx = demo_ctx(Some("C:/work/openshell-mxc-demo"));
+        let ctx = demo_ctx();
         let config = mapper.map(Some(&policy), &ctx).unwrap();
         // Forward slashes normalized to Windows backslashes by the bridge.
         assert!(
@@ -275,7 +227,7 @@ mod tests {
     #[test]
     fn embedded_rejects_missing_policy() {
         let mapper = EmbeddedPolicyMapper;
-        let ctx = demo_ctx(Some("C:/work/demo"));
+        let ctx = demo_ctx();
         let err = mapper.map(None, &ctx).unwrap_err();
         assert!(matches!(err, MapError::Internal(_)));
     }
@@ -296,7 +248,7 @@ mod tests {
                 binaries: Vec::new(),
             },
         );
-        let ctx = demo_ctx(Some("C:/work/demo"));
+        let ctx = demo_ctx();
         let err = mapper.map(Some(&policy), &ctx).unwrap_err();
         assert!(matches!(err, MapError::Unsupported(_)));
     }
@@ -326,7 +278,7 @@ mod tests {
         let proxy_addr = "127.0.0.1:18080".parse().unwrap();
         let ctx = MapCtx {
             sandbox_id: "sb-egress".into(),
-            share_dir: Some("C:/work/demo".into()),
+
             egress: Some(proxy_addr),
         };
 

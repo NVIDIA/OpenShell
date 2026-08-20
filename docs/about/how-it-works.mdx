@@ -68,6 +68,10 @@ flowchart TB
     ROUTER -->|"managed inference"| MODEL["Inference backends"]
 ```
 
+<Note>
+The Windows MXC compute driver is an exec-in-driver exception to this supervisor data path. It launches and monitors a one-shot workload without a supervisor session, interactive connect, live policy delivery, or governed egress.
+</Note>
+
 ## Deployment Models
 
 OpenShell can run on a single local machine or in a remote Kubernetes cluster.
@@ -98,7 +102,7 @@ device plugins without changing the gateway and sandbox contract.
 
 The gateway and sandbox split control-plane authority from runtime enforcement. The gateway owns durable platform state: sandboxes, policy revisions, runtime settings, provider records, inference configuration, session records, and authorization decisions. A sandbox owns the local execution boundary: process identity, filesystem access, network egress, credential injection, local logs, and the agent child process.
 
-The relationship is supervisor initiated. Each sandbox supervisor connects outbound to a known gateway endpoint, authenticates as a sandbox workload, and keeps a live session open for control traffic and relays. This avoids requiring every compute driver to solve gateway-to-sandbox reachability through pod IPs, bridge networks, port mappings, NAT traversal, or custom tunnels.
+For supervisor-backed drivers, the relationship is supervisor initiated. Each sandbox supervisor connects outbound to a known gateway endpoint, authenticates as a sandbox workload, and keeps a live session open for control traffic and relays. This avoids requiring those compute drivers to solve gateway-to-sandbox reachability through pod IPs, bridge networks, port mappings, NAT traversal, or custom tunnels. The Windows MXC driver has no supervisor session and supports only its documented create-time workload lifecycle.
 
 The gateway delivers desired state. The supervisor applies it locally, keeps last-known-good config when refresh fails, and leaves static isolation controls in place until the sandbox is recreated. Live operations such as config refresh, policy updates, credential delivery, log push, connect, exec, file sync, and relay setup use the same authenticated gateway-supervisor relationship.
 

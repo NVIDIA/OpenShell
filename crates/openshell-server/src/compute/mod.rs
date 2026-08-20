@@ -31,6 +31,8 @@ use futures::{Stream, StreamExt};
 #[cfg(unix)]
 use hyper_util::rt::TokioIo;
 use openshell_core::ComputeDriverKind;
+#[cfg(target_os = "windows")]
+use openshell_core::proto::SandboxPolicy;
 use openshell_core::proto::compute::v1::{
     CreateSandboxRequest, DeleteSandboxRequest, DriverCondition, DriverPlatformEvent,
     DriverResourceRequirements, DriverSandbox, DriverSandboxSpec, DriverSandboxStatus,
@@ -54,12 +56,10 @@ use openshell_driver_docker::DockerComputeDriver;
 use openshell_driver_kubernetes::{
     ComputeDriverService as KubernetesDriverService, KubernetesComputeDriver,
 };
-#[cfg(not(target_os = "windows"))]
-use openshell_driver_podman::{ComputeDriverService as PodmanDriverService, PodmanComputeDriver};
 #[cfg(target_os = "windows")]
 use openshell_driver_mxc::{ComputeDriverService as MxcDriverService, MxcComputeConfig};
-#[cfg(target_os = "windows")]
-use openshell_core::proto::SandboxPolicy;
+#[cfg(not(target_os = "windows"))]
+use openshell_driver_podman::{ComputeDriverService as PodmanDriverService, PodmanComputeDriver};
 use prost::Message;
 use std::collections::HashMap;
 use std::fmt;
