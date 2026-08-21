@@ -281,6 +281,17 @@ the supervisor's RPCs. Otherwise, it creates an additional listener that
 exposes only the gateway's sandbox-callable gRPC methods. Operator, health,
 reflection, and HTTP requests must use the primary listener.
 
+When both the gateway and rootful Podman run inside another Linux container,
+netavark may not assign the managed bridge gateway until the first sandbox
+joins the network. If that exact private callback address fails to bind with
+`EADDRNOTAVAIL`, the gateway uses one scoped IPv4 wildcard listener for that
+process. Connections addressed to loopback retain primary scope; connections
+addressed to the Podman bridge or any other IPv4 interface are callback-only.
+This exposes the sandbox-callable gRPC surface on every IPv4 interface in the
+outer container namespace, so deployments should still restrict that namespace
+at the container-network boundary. It does not expose operator, health,
+reflection, or HTTP routes on those interfaces.
+
 ### Layer 3 Inner Sandbox Network Namespace
 
 Inside the container, the supervisor creates another network namespace for the

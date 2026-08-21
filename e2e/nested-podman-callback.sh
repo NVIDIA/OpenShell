@@ -15,6 +15,9 @@ SUPERVISOR_IMAGE="${OPENSHELL_SUPERVISOR_IMAGE:-}"
 SANDBOX_IMAGE="${OPENSHELL_SANDBOX_IMAGE:-ghcr.io/nvidia/openshell-community/sandboxes/base:latest}"
 FEDORA_IMAGE="${OPENSHELL_E2E_NESTED_FEDORA_IMAGE:-fedora:latest}"
 CONTAINER_NAME="${OPENSHELL_E2E_NESTED_CONTAINER_NAME:-openshell-e2e-nested-podman-$$}"
+SANDBOX_NAME="${OPENSHELL_E2E_NESTED_SANDBOX_NAME:-nested-podman-cb}"
+GATEWAY_SERVICE_FILE="${OPENSHELL_E2E_GATEWAY_SERVICE_FILE:-${ROOT}/deploy/deb/openshell-gateway.service}"
+GATEWAY_DEFAULT_CONFIG="${OPENSHELL_E2E_GATEWAY_DEFAULT_CONFIG:-${ROOT}/deploy/rpm/gateway.toml.default}"
 
 die() {
   echo "ERROR: $*" >&2
@@ -25,6 +28,8 @@ command -v docker >/dev/null 2>&1 || die "docker is required"
 [ -x "${CLI_BIN}" ] || die "OPENSHELL_BIN must point to an executable Linux CLI artifact"
 [ -x "${GATEWAY_BIN}" ] || die "OPENSHELL_GATEWAY_BIN must point to an executable Linux gateway artifact"
 [ -n "${SUPERVISOR_IMAGE}" ] || die "OPENSHELL_SUPERVISOR_IMAGE is required"
+[ -f "${GATEWAY_SERVICE_FILE}" ] || die "gateway service file not found: ${GATEWAY_SERVICE_FILE}"
+[ -f "${GATEWAY_DEFAULT_CONFIG}" ] || die "gateway default config not found: ${GATEWAY_DEFAULT_CONFIG}"
 
 WORKDIR="$(mktemp -d "${TMPDIR:-/tmp}/openshell-e2e-nested-podman.XXXXXX")"
 IMAGE_ARCHIVE="${WORKDIR}/images.tar"
@@ -98,19 +103,21 @@ docker exec "${CONTAINER_NAME}" systemctl list-units --no-pager >/dev/null 2>&1 
   || die "Fedora systemd container did not become reachable within 120 seconds"
 
 echo "==> Installing PR artifacts in nested Fedora"
+docker exec "${CONTAINER_NAME}" install -d /usr/lib/systemd/user /usr/share/openshell
 docker cp "${CLI_BIN}" "${CONTAINER_NAME}:/usr/bin/openshell"
 docker cp "${GATEWAY_BIN}" "${CONTAINER_NAME}:/usr/bin/openshell-gateway"
-docker cp "${ROOT}/deploy/deb/openshell-gateway.service" \
+docker cp "${GATEWAY_SERVICE_FILE}" \
   "${CONTAINER_NAME}:/usr/lib/systemd/user/openshell-gateway.service"
-docker cp "${ROOT}/deploy/rpm/gateway.toml.default" \
+docker cp "${GATEWAY_DEFAULT_CONFIG}" \
   "${CONTAINER_NAME}:/usr/share/openshell/gateway.toml.default"
-docker cp "${IMAGE_ARCHIVE}" "${CONTAINER_NAME}:/tmp/openshell-e2e-images.tar"
+docker cp "${IMAGE_ARCHIVE}" "${CONTAINER_NAME}:/var/lib/openshell-e2e-images.tar"
 
-root_exec bash -s -- "${SUPERVISOR_IMAGE}" "${SANDBOX_IMAGE}" <<'EOF'
+root_exec bash -s -- "${SUPERVISOR_IMAGE}" "${SANDBOX_IMAGE}" "${SANDBOX_NAME}" <<'EOF'
 set -euo pipefail
 
 supervisor_image=$1
 sandbox_image=$2
+sandbox_name=$3
 
 test -f /.dockerenv || {
   echo "ERROR: nested Podman E2E must run inside a Docker container" >&2
@@ -140,7 +147,7 @@ for _ in $(seq 1 30); do
 done
 podman info >/dev/null
 test "$(podman info --format '{{.Host.Security.Rootless}}')" = false
-podman load --input /tmp/openshell-e2e-images.tar >/dev/null
+podman load --input /var/lib/openshell-e2e-images.tar >/dev/null
 
 install -d -m 0700 "${HOME}/.config/openshell"
 install -m 0600 /usr/share/openshell/gateway.toml.default \
@@ -189,15 +196,18 @@ for _ in $(seq 1 90); do
   sleep 1
 done
 openshell status
+journalctl --user -u openshell-gateway.service --no-pager \
+  | grep -F 'listener_purpose="nested-podman-callback-fallback"'
+ss -ltn | grep -F '0.0.0.0:17670'
 
 echo "==> Creating sandbox through the nested rootful Podman driver"
 openshell sandbox create \
-  --name nested-podman-callback \
+  --name "${sandbox_name}" \
   --detach \
   --no-auto-providers \
   --from "${sandbox_image}"
 
-callback_output="$(openshell sandbox exec -n nested-podman-callback -- printf nested-callback-ok)"
+callback_output="$(openshell sandbox exec -n "${sandbox_name}" -- printf nested-callback-ok)"
 test "${callback_output}" = nested-callback-ok
 ip -4 address show | grep -F "${gateway_ip}"
 echo "==> Nested rootful Podman callback succeeded"

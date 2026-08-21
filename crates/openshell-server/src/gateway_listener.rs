@@ -4,9 +4,12 @@
 use crate::compute::GatewayListenerRequirement;
 use openshell_core::{Error, Result};
 use socket2::{Domain, Protocol, Socket, Type};
+use std::io::ErrorKind;
 use std::net::{IpAddr, SocketAddr};
+#[cfg(target_os = "linux")]
+use std::path::Path;
 use tokio::net::TcpListener;
-use tracing::info;
+use tracing::{info, warn};
 
 /// Authorization scope associated with a gateway listener.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -272,9 +275,49 @@ pub async fn bind_gateway_listeners(
         ) && specs.iter().any(|candidate| {
             candidate.address.port() == spec.address.port() && candidate.address.is_ipv4()
         });
-        let listener = bind_gateway_listener(spec.address, ipv6_only)
-            .await
-            .map_err(|e| Error::transport(format!("failed to bind to {}: {e}", spec.address)))?;
+        let listener = bind_gateway_listener(spec.address, ipv6_only).await;
+        let listener = match listener {
+            Ok(listener) => listener,
+            Err(err) => {
+                let Some(fallback_spec) = nested_podman_wildcard_fallback_spec(
+                    &specs,
+                    spec,
+                    err.kind(),
+                    running_in_linux_container(),
+                ) else {
+                    return Err(Error::transport(format!(
+                        "failed to bind to {}: {err}",
+                        spec.address
+                    )));
+                };
+
+                // The wildcard cannot coexist with the already-bound loopback
+                // socket on the same port. Dropping the partial listener set is
+                // safe because none of it has been returned to the server yet.
+                drop(listeners);
+                let listener = bind_gateway_listener(fallback_spec.address, false)
+                    .await
+                    .map_err(|fallback_err| {
+                        Error::transport(format!(
+                            "failed to bind Podman callback address {} ({err}); scoped wildcard fallback {} also failed: {fallback_err}",
+                            spec.address, fallback_spec.address
+                        ))
+                    })?;
+                let local_addr = listener.local_addr().unwrap_or(fallback_spec.address);
+                let fallback_spec = fallback_spec.bind_to(local_addr);
+                warn!(
+                    address = %local_addr,
+                    unavailable_callback_address = %spec.address,
+                    listener_purpose = "nested-podman-callback-fallback",
+                    authorization_scope = "primary-on-loopback; sandbox-callable-grpc-only-on-other-ipv4-interfaces",
+                    "Podman bridge address is not available yet; gateway callback listener is exposed on all container IPv4 interfaces for this gateway process"
+                );
+                return Ok(vec![BoundGatewayListener {
+                    listener,
+                    spec: fallback_spec,
+                }]);
+            }
+        };
         let local_addr = listener.local_addr().unwrap_or(spec.address);
         match spec.scope {
             GatewayListenerScope::Primary => {
@@ -306,6 +349,60 @@ pub async fn bind_gateway_listeners(
         });
     }
     Ok(listeners)
+}
+
+fn nested_podman_wildcard_fallback_spec(
+    specs: &[GatewayListenerSpec],
+    failed_spec: &GatewayListenerSpec,
+    error_kind: ErrorKind,
+    running_in_container: bool,
+) -> Option<GatewayListenerSpec> {
+    if !running_in_container || error_kind != ErrorKind::AddrNotAvailable || specs.len() != 2 {
+        return None;
+    }
+
+    let primary = specs
+        .iter()
+        .find(|spec| spec.scope == GatewayListenerScope::Primary)?;
+    let callback = specs.iter().find(|spec| {
+        spec.scope == GatewayListenerScope::ComputeDriverCallback && *spec == failed_spec
+    })?;
+    let callback_provenance = callback.provenance.as_ref()?;
+    let (IpAddr::V4(primary_ip), IpAddr::V4(callback_ip)) =
+        (primary.address.ip(), callback.address.ip())
+    else {
+        return None;
+    };
+    if !primary_ip.is_loopback()
+        || !callback_ip.is_private()
+        || primary.address.port() == 0
+        || primary.address.port() != callback.address.port()
+        || callback_provenance.driver_name != "podman"
+    {
+        return None;
+    }
+
+    Some(GatewayListenerSpec {
+        address: SocketAddr::from((std::net::Ipv4Addr::UNSPECIFIED, primary.address.port())),
+        // The broader socket is callback-only by default. Only connections
+        // addressed to the original loopback endpoint retain primary scope.
+        scope: GatewayListenerScope::ComputeDriverCallback,
+        covered_addresses: vec![CoveredGatewayAddress {
+            address: primary.address,
+            scope: GatewayListenerScope::Primary,
+        }],
+        provenance: Some(callback_provenance.clone()),
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn running_in_linux_container() -> bool {
+    Path::new("/.dockerenv").exists() || Path::new("/run/.containerenv").exists()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn running_in_linux_container() -> bool {
+    false
 }
 
 fn resolve_bound_covered_addresses(
@@ -376,9 +473,10 @@ mod tests {
     use super::{
         GatewayListenerProvenance, GatewayListenerScope, GatewayListenerSpec,
         bind_gateway_listeners, gateway_listener_specs,
-        gateway_listener_specs_with_default_route_ip,
+        gateway_listener_specs_with_default_route_ip, nested_podman_wildcard_fallback_spec,
     };
     use crate::compute::GatewayListenerRequirement;
+    use std::io::ErrorKind;
     use std::net::SocketAddr;
     use std::sync::atomic::{AtomicBool, Ordering};
     use tokio::net::TcpListener;
@@ -622,6 +720,93 @@ mod tests {
         assert_eq!(specs[0].address, primary);
         assert_eq!(specs[1].address, "127.0.0.1:8080".parse().unwrap());
         assert_eq!(specs[1].scope, GatewayListenerScope::ComputeDriverCallback);
+    }
+
+    #[test]
+    fn nested_podman_fallback_is_callback_only_off_loopback() {
+        let primary: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        let podman_gateway: SocketAddr = "10.89.0.1:8080".parse().unwrap();
+        let specs = gateway_listener_specs(primary, &[podman_listener_requirement(podman_gateway)])
+            .unwrap();
+
+        let fallback = nested_podman_wildcard_fallback_spec(
+            &specs,
+            &specs[1],
+            ErrorKind::AddrNotAvailable,
+            true,
+        )
+        .expect("eligible nested Podman bind failure should use the scoped fallback");
+
+        assert_eq!(fallback.address, "0.0.0.0:8080".parse().unwrap());
+        assert_eq!(
+            fallback.scope_for_local_addr(primary),
+            GatewayListenerScope::Primary
+        );
+        assert_eq!(
+            fallback.scope_for_local_addr(podman_gateway),
+            GatewayListenerScope::ComputeDriverCallback
+        );
+        assert_eq!(
+            fallback.scope_for_local_addr("172.17.0.2:8080".parse().unwrap()),
+            GatewayListenerScope::ComputeDriverCallback
+        );
+    }
+
+    #[test]
+    fn nested_podman_fallback_rejects_unrelated_bind_failures() {
+        let primary: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        let podman_gateway: SocketAddr = "10.89.0.1:8080".parse().unwrap();
+        let specs = gateway_listener_specs(primary, &[podman_listener_requirement(podman_gateway)])
+            .unwrap();
+
+        assert!(
+            nested_podman_wildcard_fallback_spec(
+                &specs,
+                &specs[1],
+                ErrorKind::AddrNotAvailable,
+                false,
+            )
+            .is_none(),
+            "the gateway must be running in a Linux container"
+        );
+        assert!(
+            nested_podman_wildcard_fallback_spec(&specs, &specs[1], ErrorKind::AddrInUse, true,)
+                .is_none(),
+            "only a not-yet-present interface is eligible"
+        );
+
+        let docker_specs =
+            gateway_listener_specs(primary, &[docker_listener_requirement(podman_gateway)])
+                .unwrap();
+        assert!(
+            nested_podman_wildcard_fallback_spec(
+                &docker_specs,
+                &docker_specs[1],
+                ErrorKind::AddrNotAvailable,
+                true,
+            )
+            .is_none(),
+            "the fallback must remain specific to Podman"
+        );
+    }
+
+    #[test]
+    fn nested_podman_fallback_rejects_non_private_callback_address() {
+        let primary: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        let public_callback: SocketAddr = "203.0.113.1:8080".parse().unwrap();
+        let specs =
+            gateway_listener_specs(primary, &[podman_listener_requirement(public_callback)])
+                .unwrap();
+
+        assert!(
+            nested_podman_wildcard_fallback_spec(
+                &specs,
+                &specs[1],
+                ErrorKind::AddrNotAvailable,
+                true,
+            )
+            .is_none()
+        );
     }
 
     #[tokio::test]

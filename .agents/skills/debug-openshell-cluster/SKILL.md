@@ -238,6 +238,12 @@ Common findings:
 - Current gateways reuse the primary listener when it covers Podman's callback
   address. If the primary does not cover that address, inspect the gateway
   startup logs for the additional callback-only listener and its provenance.
+- In a nested Linux container with rootful Podman, a missing bridge address can
+  trigger `listener_purpose="nested-podman-callback-fallback"`. Confirm the
+  failed exact address is private, the bind error is `EADDRNOTAVAIL`, and the
+  wildcard socket is callback-only off loopback. The callback RPC surface is
+  reachable on every IPv4 interface in the outer container namespace for that
+  gateway process, so also inspect the surrounding container-network boundary.
 - Rootless slirp4netns, another named helper, or missing helper metadata
   requires an explicitly remote `grpc_endpoint`. An explicit `host_gateway_ip`
   cannot bypass slirp4netns host-loopback isolation. Do not work around
@@ -589,6 +595,7 @@ openshell logs <sandbox-name>
 | `openshell status` fails | Gateway endpoint unreachable or auth mismatch | `openshell gateway info`, gateway logs |
 | Gateway starts but sandbox create fails | Compute driver cannot reach runtime | Docker/Podman/Kubernetes/VM driver logs |
 | Gateway exits while resolving compute-driver listener requirements | Callback alias topology is unsupported, the Podman network cannot be inspected, or the selected address is not private/authorized | Gateway startup error, `podman info --debug`, Podman network inspection, host IPv4 default route |
+| Nested rootful Podman gateway logs `nested-podman-callback-fallback` | Podman reported a private bridge gateway before netavark assigned it | Confirm the exact bind failed with `EADDRNOTAVAIL`; verify non-loopback destinations receive callback-only scope and restrict the outer container network |
 | Admin, health, reflection, or HTTP request is denied on an additional Docker/Podman callback-only listener | Additional callback listeners intentionally expose only sandbox-callable gRPC methods | Retry through the gateway's primary endpoint; inspect the listener-purpose startup log if the address was unexpected |
 | Docker or Podman sandbox never registers | Wrong callback endpoint or supervisor startup failure | Gateway logs and sandbox container logs |
 | Docker GPU e2e fails before GPU sandbox comparison | NVIDIA CDI specs are missing or Docker has not discovered them | `docker info --format '{{json .DiscoveredDevices}}'`, `/etc/cdi`, `/var/run/cdi`, `nvidia-cdi-refresh.service` |
