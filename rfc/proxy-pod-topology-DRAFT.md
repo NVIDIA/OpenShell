@@ -224,6 +224,17 @@ container performing network supervision. Mounting it into the workload pod
 would defeat the purpose. This RFC proposes rejecting that combination at
 configuration validation rather than silently mounting it in the wrong place.
 
+Separate pods also raise the isolation ceiling under a VM-based `RuntimeClass`.
+Kata Containers gives each *pod* its own lightweight VM and kernel; containers
+within a pod share that VM. In every in-pod topology the workload and the
+supervisor live in one pod, so a Kata VM escape — a kernel compromise inside
+that shared VM — reaches the supervisor and its gateway credentials. Under
+`proxy-pod` the workload and supervisor are separate pods and therefore separate
+Kata VMs with separate kernels, so a kernel compromise in the workload VM does
+not by itself reach the supervisor. This is unique to `proxy-pod`: it is the
+only topology where the workload-to-supervisor boundary can be a hypervisor
+boundary rather than a namespace boundary.
+
 ### The NetworkPolicy contract
 
 Two policies define the fence:
@@ -546,7 +557,7 @@ All relay-backed, and all requiring the workload's namespaces:
 | `NET:*` allow/deny with reason | yes | yes | yes | yes |
 | `CONFIG:*` policy and route changes | yes | yes | yes | yes |
 | Denial analysis for the policy advisor | yes | yes | yes | yes |
-| Workload stdout/stderr in `openshell logs` | yes | yes | yes | **no** — container log only |
+| Workload stdout/stderr in `openshell logs` | yes | yes | yes | **no** — only in the `agent` container log via `kubectl logs <agent-pod>` |
 | Actor process on network events | yes | yes | yes | **no** — renders as `-(0)` |
 | `PROCESS:*` lifecycle events | yes | yes | yes | **no** |
 | `SSH:*` events | yes | yes | yes | **no** |
@@ -561,6 +572,7 @@ All relay-backed, and all requiring the workload's namespaces:
 | Node-level privileged DaemonSet | no | no | **yes** | no |
 | Requires `NetworkPolicy` enforcement | no | no | no | **yes** |
 | Pods per sandbox | 1 | 1 | 1 | **2** |
+| Workload/supervisor kernel isolation under Kata | no — one pod, one VM/kernel | no — one pod, one VM/kernel | no — one pod, one VM/kernel | **yes — separate pods, separate Kata VMs/kernels** |
 | OpenShift SCC required | `privileged` | custom | custom + `privileged` CNI | **built-in `nonroot-v2`** |
 
 The dividing line is consistent: everything observable or enforceable at the
