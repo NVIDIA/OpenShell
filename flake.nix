@@ -46,6 +46,7 @@
         };
         testGuestPkgs = import nixpkgs-test-guest { inherit system; };
         commonDevShellPackages = with pkgs; [
+          cargo-nextest
           # Assemble Debian artifacts on macOS and Linux.
           dpkg
           # Required to find packages.
