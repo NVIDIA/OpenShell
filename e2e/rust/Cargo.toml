@@ -17,6 +17,10 @@ publish = false
 
 [features]
 e2e = []
+# Selects the portable CLI conformance profile. The profile initially reuses
+# existing E2E test targets; membership is defined by the e2e:cli-conformance
+# task so adding the feature does not remove tests from existing E2E suites.
+e2e-cli-conformance = ["e2e"]
 # Selects tests that rely on `host.openshell.internal` (the sandbox's stable
 # alias to the host running test fixtures). docker, podman, and vm wire the
 # alias unconditionally; the kube driver only does so when the chart's
