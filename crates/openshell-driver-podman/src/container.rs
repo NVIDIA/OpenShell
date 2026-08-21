@@ -520,9 +520,11 @@ fn build_env(
         config.sandbox_ssh_socket_path.clone(),
     );
     env.insert("OPENSHELL_CONTAINER_IMAGE".into(), image.to_string());
+    let main_process = openshell_core::sandbox_env::MainProcessConfig::encode_driver_spec(spec)
+        .expect("main process config serialization cannot fail");
     env.insert(
-        openshell_core::sandbox_env::SANDBOX_COMMAND.into(),
-        "sleep infinity".into(),
+        openshell_core::sandbox_env::MAIN_PROCESS_SPEC.into(),
+        main_process,
     );
     env.insert(
         openshell_core::sandbox_env::TELEMETRY_ENABLED.into(),

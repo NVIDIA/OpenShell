@@ -799,6 +799,8 @@ fn create_sandbox_request(spec: SandboxSpec) -> proto::CreateSandboxRequest {
         environment,
         providers,
         gpu,
+        command,
+        tty,
     } = spec;
     let template = image.map(|image| proto::SandboxTemplate {
         image,
@@ -813,6 +815,8 @@ fn create_sandbox_request(spec: SandboxSpec) -> proto::CreateSandboxRequest {
             template,
             providers,
             resource_requirements,
+            command,
+            tty,
             ..proto::SandboxSpec::default()
         }),
         name: name.unwrap_or_default(),
@@ -991,5 +995,18 @@ mod tests {
         assert!(store_bearer(&slot, "bad\nvalue").is_err());
         let current = slot.read().unwrap().clone().unwrap();
         assert_eq!(current.to_str().unwrap(), "Bearer good-token");
+    }
+
+    #[test]
+    fn create_request_preserves_canonical_main_process() {
+        let request = create_sandbox_request(SandboxSpec {
+            command: vec!["/opt/agent binary".into(), "--serve exactly".into()],
+            tty: false,
+            ..SandboxSpec::default()
+        });
+
+        let spec = request.spec.expect("sandbox spec should be present");
+        assert_eq!(spec.command, ["/opt/agent binary", "--serve exactly"]);
+        assert!(!spec.tty);
     }
 }

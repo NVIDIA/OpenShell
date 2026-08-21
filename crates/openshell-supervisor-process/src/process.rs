@@ -15,8 +15,10 @@ use nix::unistd::{Gid, Group, Pid, Uid, User};
 use openshell_core::policy::{NetworkMode, SandboxPolicy};
 use std::collections::HashMap;
 use std::ffi::CString;
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
 #[cfg(target_os = "linux")]
-use std::os::fd::{AsRawFd, OwnedFd, RawFd};
+use std::os::fd::{OwnedFd, RawFd};
 #[cfg(target_os = "linux")]
 use std::os::unix::ffi::OsStrExt;
 #[cfg(unix)]
@@ -27,8 +29,20 @@ use std::path::PathBuf;
 use std::process::Stdio;
 #[cfg(target_os = "linux")]
 use std::sync::OnceLock;
-use tokio::process::{Child, Command};
+use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
 use tracing::{debug, info};
+
+// `libc::TIOCSCTTY` and the request parameter accepted by `ioctl` vary across
+// glibc, musl, and BSD targets. The conversion is a no-op on some targets but
+// is required on others.
+#[cfg(unix)]
+#[allow(unsafe_code, clippy::useless_conversion)]
+fn set_controlling_tty(fd: libc::c_int) -> std::io::Result<()> {
+    if unsafe { libc::ioctl(fd, libc::TIOCSCTTY.into(), 0) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
 
 /// Process/filesystem enforcement performed by the process supervisor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -171,6 +185,67 @@ fn inject_provider_env(cmd: &mut Command, provider_env: &HashMap<String, String>
         }
         cmd.env(key, value);
     }
+}
+
+/// Derive the child USER and HOME from the policy's sandbox identity.
+///
+/// Name-based identities use their passwd entry. Numeric identities have no
+/// reliable passwd entry, so their workspace remains the portable fallback.
+pub(crate) fn session_user_and_home(
+    policy: &SandboxPolicy,
+    workdir_home: Option<&str>,
+) -> (String, String) {
+    let (user, default_home) = match policy.process.run_as_user.as_deref() {
+        Some(user) if !user.is_empty() => {
+            if user.parse::<u32>().is_ok() {
+                (user.to_string(), "/sandbox".to_string())
+            } else {
+                let home = User::from_name(user).ok().flatten().map_or_else(
+                    || format!("/home/{user}"),
+                    |entry| entry.dir.to_string_lossy().into_owned(),
+                );
+                (user.to_string(), home)
+            }
+        }
+        _ => ("sandbox".to_string(), "/sandbox".to_string()),
+    };
+    let home = workdir_home.map_or(default_home, str::to_string);
+    (user, home)
+}
+
+fn apply_canonical_process_environment(
+    cmd: &mut Command,
+    policy: &SandboxPolicy,
+    workspace: &ResolvedWorkspace,
+    interactive: bool,
+    user_environment: &HashMap<String, String>,
+) {
+    let (session_user, session_home) = session_user_and_home(policy, workspace.home());
+
+    for (key, value) in [
+        ("HOME", session_home.as_str()),
+        ("USER", session_user.as_str()),
+        ("SHELL", "/bin/bash"),
+        (
+            "TERM",
+            if interactive {
+                "xterm-256color"
+            } else {
+                "dumb"
+            },
+        ),
+    ] {
+        if !user_environment.contains_key(key) {
+            cmd.env(key, value);
+        }
+    }
+}
+
+fn configured_user_environment() -> HashMap<String, String> {
+    std::env::var(openshell_core::sandbox_env::USER_ENVIRONMENT)
+        .ok()
+        .and_then(|json| serde_json::from_str(&json).ok())
+        .unwrap_or_default()
 }
 
 #[cfg(unix)]
@@ -546,6 +621,18 @@ fn mount_empty_tmpfs(target: &CString) -> std::io::Result<()> {
 pub struct ProcessHandle {
     child: Child,
     pid: u32,
+    io: Option<ProcessIo>,
+}
+
+/// Supervisor-owned canonical-process I/O. These handles outlive individual
+/// SSH attachments and are consumed by the main-session multiplexer.
+pub enum ProcessIo {
+    Pty(std::fs::File),
+    Pipes {
+        stdin: ChildStdin,
+        stdout: ChildStdout,
+        stderr: ChildStderr,
+    },
 }
 
 impl ProcessHandle {
@@ -629,11 +716,31 @@ impl ProcessHandle {
     ) -> Result<Self> {
         let mut cmd = Command::new(program);
         cmd.args(args)
-            .stdin(Stdio::inherit())
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit())
             .kill_on_drop(true)
             .env(openshell_core::sandbox_env::SANDBOX, "1");
+
+        let mut pty_master = None;
+        let mut terminal_slave_fd = None;
+        if interactive {
+            let winsize = nix::pty::Winsize {
+                ws_row: 24,
+                ws_col: 80,
+                ws_xpixel: 0,
+                ws_ypixel: 0,
+            };
+            let pty = nix::pty::openpty(Some(&winsize), None).into_diagnostic()?;
+            let master = std::fs::File::from(pty.master);
+            let slave = std::fs::File::from(pty.slave);
+            terminal_slave_fd = Some(slave.as_raw_fd());
+            cmd.stdin(slave.try_clone().into_diagnostic()?)
+                .stdout(slave.try_clone().into_diagnostic()?)
+                .stderr(slave);
+            pty_master = Some(master);
+        } else {
+            cmd.stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+        }
 
         // Strip supervisor-only identity material from the entrypoint's
         // inherited environment. The entrypoint drops to the sandbox user
@@ -642,12 +749,16 @@ impl ProcessHandle {
         strip_supervisor_only_env(&mut cmd);
 
         inject_provider_env(&mut cmd, provider_env);
+        apply_canonical_process_environment(
+            &mut cmd,
+            policy,
+            workspace,
+            interactive,
+            &configured_user_environment(),
+        );
 
         if let Some(dir) = workspace.root() {
             cmd.current_dir(dir);
-        }
-        if let Some(home) = workspace.home() {
-            cmd.env("HOME", home);
         }
 
         if matches!(policy.network.mode, NetworkMode::Proxy) {
@@ -720,9 +831,13 @@ impl ProcessHandle {
             #[allow(unsafe_code)]
             unsafe {
                 cmd.pre_exec(move || {
-                    if !interactive {
-                        // Create new process group
-                        libc::setpgid(0, 0);
+                    if let Some(slave_fd) = terminal_slave_fd {
+                        if libc::setsid() < 0 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                        set_controlling_tty(slave_fd)?;
+                    } else if libc::setpgid(0, 0) < 0 {
+                        return Err(std::io::Error::last_os_error());
                     }
 
                     // Enter network namespace before applying other restrictions
@@ -762,13 +877,27 @@ impl ProcessHandle {
             }
         }
 
-        let child = cmd.spawn().into_diagnostic()?;
+        let mut child = cmd.spawn().into_diagnostic()?;
         let pid = child.id().unwrap_or(0);
         managed_children::register(pid);
 
+        let io = if let Some(master) = pty_master {
+            ProcessIo::Pty(master)
+        } else {
+            ProcessIo::Pipes {
+                stdin: child.stdin.take().expect("canonical stdin must be piped"),
+                stdout: child.stdout.take().expect("canonical stdout must be piped"),
+                stderr: child.stderr.take().expect("canonical stderr must be piped"),
+            }
+        };
+
         debug!(pid, program, "Process spawned");
 
-        Ok(Self { child, pid })
+        Ok(Self {
+            child,
+            pid,
+            io: Some(io),
+        })
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -786,23 +915,49 @@ impl ProcessHandle {
     ) -> Result<Self> {
         let mut cmd = Command::new(program);
         cmd.args(args)
-            .stdin(Stdio::inherit())
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit())
             .kill_on_drop(true)
             .env(openshell_core::sandbox_env::SANDBOX, "1");
+
+        let mut pty_master = None;
+        let mut terminal_slave_fd = None;
+        #[cfg(unix)]
+        if interactive {
+            let winsize = nix::pty::Winsize {
+                ws_row: 24,
+                ws_col: 80,
+                ws_xpixel: 0,
+                ws_ypixel: 0,
+            };
+            let pty = nix::pty::openpty(Some(&winsize), None).into_diagnostic()?;
+            let master = std::fs::File::from(pty.master);
+            let slave = std::fs::File::from(pty.slave);
+            terminal_slave_fd = Some(slave.as_raw_fd());
+            cmd.stdin(slave.try_clone().into_diagnostic()?)
+                .stdout(slave.try_clone().into_diagnostic()?)
+                .stderr(slave);
+            pty_master = Some(master);
+        }
+        if !interactive {
+            cmd.stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+        }
 
         // Strip supervisor-only identity material from the entrypoint's
         // inherited environment.
         strip_supervisor_only_env(&mut cmd);
 
         inject_provider_env(&mut cmd, provider_env);
+        apply_canonical_process_environment(
+            &mut cmd,
+            policy,
+            workspace,
+            interactive,
+            &configured_user_environment(),
+        );
 
         if let Some(dir) = workspace.root() {
             cmd.current_dir(dir);
-        }
-        if let Some(home) = workspace.home() {
-            cmd.env("HOME", home);
         }
 
         if matches!(policy.network.mode, NetworkMode::Proxy) {
@@ -826,9 +981,9 @@ impl ProcessHandle {
             }
         }
 
-        // Set up process group for signal handling (non-interactive mode only).
-        // In interactive mode, we inherit the parent's process group to maintain
-        // proper terminal control for shells and interactive programs.
+        // Create a dedicated session for PTY children and a dedicated process
+        // group for pipe children so attachment signals target only the
+        // canonical workload tree.
         // SAFETY: pre_exec runs after fork but before exec in the child process.
         // setpgid is async-signal-safe and safe to call in this context.
         #[cfg(unix)]
@@ -838,9 +993,13 @@ impl ProcessHandle {
             #[allow(unsafe_code)]
             unsafe {
                 cmd.pre_exec(move || {
-                    if !interactive {
-                        // Create new process group
-                        libc::setpgid(0, 0);
+                    if let Some(slave_fd) = terminal_slave_fd {
+                        if libc::setsid() < 0 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                        set_controlling_tty(slave_fd)?;
+                    } else if libc::setpgid(0, 0) < 0 {
+                        return Err(std::io::Error::last_os_error());
                     }
 
                     // Drop privileges before applying sandbox restrictions.
@@ -863,20 +1022,39 @@ impl ProcessHandle {
             }
         }
 
-        let child = cmd.spawn().into_diagnostic()?;
+        let mut child = cmd.spawn().into_diagnostic()?;
         let pid = child.id().unwrap_or(0);
         #[cfg(target_os = "linux")]
         managed_children::register(pid);
 
         debug!(pid, program, "Process spawned");
 
-        Ok(Self { child, pid })
+        let io = if let Some(master) = pty_master {
+            ProcessIo::Pty(master)
+        } else {
+            ProcessIo::Pipes {
+                stdin: child.stdin.take().expect("canonical stdin must be piped"),
+                stdout: child.stdout.take().expect("canonical stdout must be piped"),
+                stderr: child.stderr.take().expect("canonical stderr must be piped"),
+            }
+        };
+
+        Ok(Self {
+            child,
+            pid,
+            io: Some(io),
+        })
     }
 
     /// Get the process ID.
     #[must_use]
     pub const fn pid(&self) -> u32 {
         self.pid
+    }
+
+    /// Transfer retained stdio to the main-session multiplexer.
+    pub fn take_io(&mut self) -> ProcessIo {
+        self.io.take().expect("canonical process I/O already taken")
     }
 
     /// Wait for the process to exit.
@@ -890,6 +1068,16 @@ impl ProcessHandle {
         managed_children::unregister(self.pid);
         let status = status?;
         Ok(ProcessStatus::from(status))
+    }
+
+    /// Observe an already-terminated child without blocking.
+    pub fn try_wait(&mut self) -> std::io::Result<Option<ProcessStatus>> {
+        let status = self.child.try_wait()?;
+        if status.is_some() {
+            #[cfg(target_os = "linux")]
+            managed_children::unregister(self.pid);
+        }
+        Ok(status.map(ProcessStatus::from))
     }
 
     /// Send a signal to the process.
@@ -2151,6 +2339,12 @@ pub struct ProcessStatus {
 }
 
 impl ProcessStatus {
+    /// Get the conventional exit code when the process exited normally.
+    #[must_use]
+    pub const fn exit_code(&self) -> Option<i32> {
+        self.code
+    }
+
     /// Get the exit code, or 128 + signal number if killed by signal.
     #[must_use]
     pub fn code(&self) -> i32 {
@@ -2216,6 +2410,42 @@ mod tests {
             landlock: LandlockPolicy::default(),
             process,
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn canonical_tty_environment_replaces_supervisor_identity_defaults() {
+        let current_user = User::from_uid(nix::unistd::geteuid())
+            .expect("look up current user")
+            .expect("current user entry");
+        let policy = policy_with_process(ProcessPolicy {
+            run_as_user: Some(current_user.name.clone()),
+            run_as_group: None,
+        });
+        let workspace = ResolvedWorkspace::default();
+        let mut cmd = Command::new("/usr/bin/env");
+        cmd.env_clear()
+            .env("HOME", "/root")
+            .env("TERM", "dumb")
+            .stdout(StdStdio::piped());
+
+        apply_canonical_process_environment(&mut cmd, &policy, &workspace, true, &HashMap::new());
+
+        let output = cmd.output().await.expect("run environment probe");
+        assert!(output.status.success());
+        let environment = String::from_utf8(output.stdout).expect("environment is UTF-8");
+        let variables: HashMap<_, _> = environment
+            .lines()
+            .filter_map(|line| line.split_once('='))
+            .collect();
+
+        assert_eq!(
+            variables.get("HOME"),
+            Some(&current_user.dir.to_string_lossy().as_ref())
+        );
+        assert_eq!(variables.get("USER"), Some(&current_user.name.as_str()));
+        assert_eq!(variables.get("SHELL"), Some(&"/bin/bash"));
+        assert_eq!(variables.get("TERM"), Some(&"xterm-256color"));
     }
 
     /// Unknown names may yield `Ok(None)` (`… not found …`) or `Err` when NSS fails first

@@ -3337,6 +3337,7 @@ fn sandbox_to_k8s_spec(
                     template,
                     driver_gpu_requirements(spec.resource_requirements.as_ref()),
                     &pod_env,
+                    Some(spec),
                     &driver_config,
                     inject_workspace,
                     params,
@@ -3370,6 +3371,7 @@ fn sandbox_to_k8s_spec(
                 &SandboxTemplate::default(),
                 driver_gpu_requirements(spec.and_then(|s| s.resource_requirements.as_ref())),
                 &pod_env,
+                spec,
                 &driver_config,
                 inject_workspace,
                 params,
@@ -3397,6 +3399,7 @@ fn sandbox_template_to_k8s(
         template,
         gpu_requirements.as_ref(),
         spec_environment,
+        None,
         &driver_config,
         inject_workspace,
         params,
@@ -3417,6 +3420,7 @@ fn sandbox_template_to_k8s_with_gpu_requirements(
         template,
         gpu_requirements,
         spec_environment,
+        None,
         &driver_config,
         inject_workspace,
         params,
@@ -3427,6 +3431,7 @@ fn sandbox_template_to_k8s_with_validated_config(
     template: &SandboxTemplate,
     gpu_requirements: Option<&GpuResourceRequirements>,
     spec_environment: &std::collections::HashMap<String, String>,
+    sandbox_spec: Option<&openshell_core::proto::compute::v1::DriverSandboxSpec>,
     driver_config: &KubernetesSandboxDriverConfig,
     inject_workspace: bool,
     params: &SandboxPodParams<'_>,
@@ -3536,6 +3541,9 @@ fn sandbox_template_to_k8s_with_validated_config(
         "automountServiceAccountToken".to_string(),
         serde_json::json!(false),
     );
+    // Do not let kubelet replace the canonical main-process generation after
+    // the supervisor exits. The gateway records that exit as terminal Error.
+    spec.insert("restartPolicy".to_string(), serde_json::json!("Never"));
 
     let mut container = serde_json::Map::new();
     container.insert("name".to_string(), serde_json::json!("agent"));
@@ -3560,6 +3568,7 @@ fn sandbox_template_to_k8s_with_validated_config(
         None,
         &template.environment,
         spec_environment,
+        sandbox_spec,
         params.sandbox_id,
         params.sandbox_name,
         params.grpc_endpoint,
@@ -3929,6 +3938,7 @@ fn build_env_list(
     existing_env: Option<&Vec<serde_json::Value>>,
     template_environment: &std::collections::HashMap<String, String>,
     spec_environment: &std::collections::HashMap<String, String>,
+    sandbox_spec: Option<&openshell_core::proto::compute::v1::DriverSandboxSpec>,
     sandbox_id: &str,
     sandbox_name: &str,
     grpc_endpoint: &str,
@@ -3950,6 +3960,14 @@ fn build_env_list(
             &json,
         );
     }
+    let main_process =
+        openshell_core::sandbox_env::MainProcessConfig::encode_driver_spec(sandbox_spec)
+            .expect("main process config serialization cannot fail");
+    upsert_env(
+        &mut env,
+        openshell_core::sandbox_env::MAIN_PROCESS_SPEC,
+        &main_process,
+    );
     apply_required_env(
         &mut env,
         sandbox_id,
@@ -3985,11 +4003,6 @@ fn apply_required_env(
     upsert_env(env, openshell_core::sandbox_env::SANDBOX_ID, sandbox_id);
     upsert_env(env, openshell_core::sandbox_env::SANDBOX, sandbox_name);
     upsert_env(env, openshell_core::sandbox_env::ENDPOINT, grpc_endpoint);
-    upsert_env(
-        env,
-        openshell_core::sandbox_env::SANDBOX_COMMAND,
-        "sleep infinity",
-    );
     upsert_env(
         env,
         openshell_core::sandbox_env::TELEMETRY_ENABLED,

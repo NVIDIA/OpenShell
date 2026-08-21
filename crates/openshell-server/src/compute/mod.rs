@@ -77,8 +77,9 @@ use tonic::{Code, Request, Status};
 use tower::service_fn;
 use tracing::{Instrument as _, debug, info, warn};
 
-type DriverWatchStream = Pin<Box<dyn Stream<Item = Result<WatchSandboxesEvent, Status>> + Send>>;
-type SharedComputeDriver =
+pub type DriverWatchStream =
+    Pin<Box<dyn Stream<Item = Result<WatchSandboxesEvent, Status>> + Send>>;
+pub type SharedComputeDriver =
     Arc<dyn ComputeDriver<WatchSandboxesStream = DriverWatchStream> + Send + Sync>;
 
 use traced_driver::TracedDriver;
@@ -585,7 +586,7 @@ impl ComputeRuntime {
             driver.name = %driver_name,
         )
     )]
-    async fn from_driver(
+    pub(crate) async fn from_driver(
         driver_name: String,
         driver: SharedComputeDriver,
         driver_process: Option<Arc<ManagedDriverProcess>>,
@@ -1390,6 +1391,11 @@ impl ComputeRuntime {
                 move |sandbox| {
                     sandbox.set_phase(phase as i32);
                     let name = sandbox.object_name().to_string();
+                    if matches!(phase, SandboxPhase::Stopping | SandboxPhase::Starting) {
+                        let status = sandbox.status.get_or_insert_with(Default::default);
+                        status.main_process_instance_id.clear();
+                        status.exit_code = None;
+                    }
                     upsert_ready_condition(
                         &mut sandbox.status,
                         &name,
@@ -2789,18 +2795,25 @@ impl ComputeRuntime {
         Ok(())
     }
 
-    pub async fn supervisor_session_connected(&self, sandbox_id: &str) -> Result<(), String> {
-        self.set_supervisor_session_state(sandbox_id, true).await
+    pub async fn supervisor_session_connected(
+        &self,
+        sandbox_id: &str,
+        instance_id: &str,
+    ) -> Result<(), String> {
+        self.set_supervisor_session_state(sandbox_id, true, Some(instance_id))
+            .await
     }
 
     pub async fn supervisor_session_disconnected(&self, sandbox_id: &str) -> Result<(), String> {
-        self.set_supervisor_session_state(sandbox_id, false).await
+        self.set_supervisor_session_state(sandbox_id, false, None)
+            .await
     }
 
     async fn set_supervisor_session_state(
         &self,
         sandbox_id: &str,
         connected: bool,
+        instance_id: Option<&str>,
     ) -> Result<(), String> {
         let _guard = self.sync_lock.lock().await;
 
@@ -2835,6 +2848,9 @@ impl ComputeRuntime {
                 let sandbox_name = sandbox.object_name().to_string();
                 if connected {
                     ensure_supervisor_ready_status(&mut sandbox.status, &sandbox_name);
+                    let status = sandbox.status.get_or_insert_with(Default::default);
+                    status.main_process_instance_id = instance_id.unwrap_or_default().to_string();
+                    status.exit_code = None;
                     sandbox.set_phase(SandboxPhase::Ready as i32);
                 } else {
                     ensure_supervisor_not_ready_status(&mut sandbox.status, &sandbox_name);
@@ -2863,6 +2879,68 @@ impl ComputeRuntime {
             Err(e) => return Err(e.to_string()),
         };
 
+        self.sandbox_index.update_from_sandbox(&sandbox);
+        self.sandbox_watch_bus.notify(sandbox_id);
+        Ok(())
+    }
+
+    /// Persist a terminal canonical-process result. Exit code zero is still a
+    /// sandbox error because the canonical process defines sandbox health.
+    pub async fn main_process_exited(
+        &self,
+        sandbox_id: &str,
+        instance_id: &str,
+        exit_code: i32,
+    ) -> Result<(), String> {
+        let _guard = self.sync_lock.lock().await;
+        let Some(existing) = self
+            .store
+            .get_message::<Sandbox>(sandbox_id)
+            .await
+            .map_err(|error| error.to_string())?
+        else {
+            return Ok(());
+        };
+        let phase = SandboxPhase::try_from(existing.phase()).unwrap_or(SandboxPhase::Unknown);
+        if matches!(
+            phase,
+            SandboxPhase::Deleting | SandboxPhase::Stopping | SandboxPhase::Stopped
+        ) {
+            return Ok(());
+        }
+        if let Some(status) = existing.status.as_ref() {
+            if !status.main_process_instance_id.is_empty()
+                && status.main_process_instance_id != instance_id
+            {
+                tracing::warn!(
+                    sandbox_id,
+                    instance_id,
+                    active_instance_id = %status.main_process_instance_id,
+                    "ignoring stale main-process exit report"
+                );
+                return Ok(());
+            }
+            if let Some(current_exit_code) = status.exit_code {
+                if current_exit_code != exit_code {
+                    tracing::warn!(
+                        sandbox_id,
+                        instance_id,
+                        current_exit_code,
+                        reported_exit_code = exit_code,
+                        "ignoring conflicting duplicate main-process exit report"
+                    );
+                }
+                return Ok(());
+            }
+        }
+        let expected_resource_version = sandbox_resource_version(&existing);
+        let sandbox = self
+            .store
+            .update_message_cas::<Sandbox, _>(sandbox_id, expected_resource_version, |sandbox| {
+                apply_main_process_exit(sandbox, instance_id, exit_code);
+            })
+            .await
+            .map_err(|error| error.to_string())?;
         self.sandbox_index.update_from_sandbox(&sandbox);
         self.sandbox_watch_bus.notify(sandbox_id);
         Ok(())
@@ -3222,6 +3300,28 @@ impl ComputeRuntime {
     }
 }
 
+fn apply_main_process_exit(sandbox: &mut Sandbox, instance_id: &str, exit_code: i32) {
+    let sandbox_name = sandbox.object_name().to_string();
+    let status = sandbox.status.get_or_insert_with(|| SandboxStatus {
+        sandbox_name: sandbox_name.clone(),
+        ..Default::default()
+    });
+    status.main_process_instance_id = instance_id.to_string();
+    status.exit_code = Some(exit_code);
+    upsert_ready_condition(
+        &mut sandbox.status,
+        &sandbox_name,
+        SandboxCondition {
+            r#type: "Ready".to_string(),
+            status: "False".to_string(),
+            reason: "MainProcessExited".to_string(),
+            message: "Canonical main process exited".to_string(),
+            last_transition_time: String::new(),
+        },
+    );
+    sandbox.set_phase(SandboxPhase::Error as i32);
+}
+
 /// Connect to an unmanaged remote compute driver that is already listening on
 /// `socket_path` and return the acquired endpoint.
 ///
@@ -3300,6 +3400,8 @@ fn driver_sandbox_spec_from_public(
             }
         }),
         sandbox_token: String::new(),
+        command: spec.command.clone(),
+        tty: spec.tty,
     })
 }
 
@@ -3571,12 +3673,24 @@ fn public_status_from_driver(
             .collect(),
         phase: phase as i32,
         current_policy_version,
+        main_process_instance_id: String::new(),
+        exit_code: None,
     }
 }
 
 fn apply_driver_snapshot(sandbox: &mut Sandbox, incoming: &DriverSandbox, session_connected: bool) {
     let old_phase = SandboxPhase::try_from(sandbox.phase()).unwrap_or(SandboxPhase::Unknown);
     let sandbox_name = &incoming.name;
+
+    // Error is terminal until an explicit future lifecycle operation changes
+    // desired state. In particular, a still-running backend snapshot must not
+    // revive a sandbox whose canonical process has exited.
+    if old_phase == SandboxPhase::Error {
+        if let Some(metadata) = sandbox.metadata.as_mut() {
+            metadata.name.clone_from(sandbox_name);
+        }
+        return;
+    }
 
     let cpv = sandbox.current_policy_version();
     let (mut phase, mut status) = incoming.status.as_ref().map_or_else(
@@ -3633,7 +3747,12 @@ fn apply_driver_snapshot(sandbox: &mut Sandbox, incoming: &DriverSandbox, sessio
     {
         status.sandbox_name.clone_from(sandbox_name);
     }
-
+    if let (Some(status), Some(current_status)) = (status.as_mut(), sandbox.status.as_ref()) {
+        status
+            .main_process_instance_id
+            .clone_from(&current_status.main_process_instance_id);
+        status.exit_code = current_status.exit_code;
+    }
     if old_phase != phase {
         info!(
             sandbox_id = %incoming.id,
@@ -4820,6 +4939,173 @@ mod tests {
         };
         sandbox.set_phase(phase as i32);
         sandbox
+    }
+
+    #[test]
+    fn main_process_exit_zero_is_terminal_error() {
+        let mut sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Ready);
+        apply_main_process_exit(&mut sandbox, "instance-1", 0);
+
+        assert_eq!(
+            SandboxPhase::try_from(sandbox.phase()),
+            Ok(SandboxPhase::Error)
+        );
+        let status = sandbox.status.as_ref().unwrap();
+        assert_eq!(status.exit_code, Some(0));
+        assert_eq!(status.main_process_instance_id, "instance-1");
+        assert!(status.conditions.iter().any(|condition| {
+            condition.r#type == "Ready"
+                && condition.status == "False"
+                && condition.reason == "MainProcessExited"
+        }));
+    }
+
+    #[tokio::test]
+    async fn stale_main_process_exit_is_acknowledged_without_replacing_active_instance() {
+        let runtime = test_runtime(Arc::new(TestDriver::default())).await;
+        let sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Provisioning);
+        runtime.store.put_message(&sandbox).await.unwrap();
+        runtime
+            .supervisor_session_connected("sb-1", "instance-2")
+            .await
+            .unwrap();
+
+        runtime
+            .main_process_exited("sb-1", "instance-1", 0)
+            .await
+            .unwrap();
+        let stored = runtime
+            .store
+            .get_message::<Sandbox>("sb-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.phase(), SandboxPhase::Ready as i32);
+        assert_eq!(
+            stored.status.unwrap().main_process_instance_id,
+            "instance-2"
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_sandbox_main_process_exit_is_acknowledged() {
+        let runtime = test_runtime(Arc::new(TestDriver::default())).await;
+
+        runtime
+            .main_process_exited("missing", "instance-1", 0)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn duplicate_main_process_exit_is_idempotent() {
+        let runtime = test_runtime(Arc::new(TestDriver::default())).await;
+        let sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Provisioning);
+        runtime.store.put_message(&sandbox).await.unwrap();
+        runtime
+            .supervisor_session_connected("sb-1", "instance-1")
+            .await
+            .unwrap();
+        runtime
+            .main_process_exited("sb-1", "instance-1", 9)
+            .await
+            .unwrap();
+        runtime
+            .main_process_exited("sb-1", "instance-1", 9)
+            .await
+            .unwrap();
+        let stored = runtime
+            .store
+            .get_message::<Sandbox>("sb-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.phase(), SandboxPhase::Error as i32);
+        assert_eq!(stored.status.unwrap().exit_code, Some(9));
+    }
+
+    #[tokio::test]
+    async fn conflicting_duplicate_main_process_exit_is_acknowledged() {
+        let runtime = test_runtime(Arc::new(TestDriver::default())).await;
+        let sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Provisioning);
+        runtime.store.put_message(&sandbox).await.unwrap();
+        runtime
+            .supervisor_session_connected("sb-1", "instance-1")
+            .await
+            .unwrap();
+        runtime
+            .main_process_exited("sb-1", "instance-1", 9)
+            .await
+            .unwrap();
+        runtime
+            .main_process_exited("sb-1", "instance-1", 7)
+            .await
+            .unwrap();
+
+        let stored = runtime
+            .store
+            .get_message::<Sandbox>("sb-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.status.unwrap().exit_code, Some(9));
+    }
+
+    #[tokio::test]
+    async fn precise_exit_enriches_driver_terminal_fallback() {
+        let runtime = test_runtime(Arc::new(TestDriver::default())).await;
+        let mut sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Error);
+        sandbox.status = Some(SandboxStatus {
+            phase: SandboxPhase::Error as i32,
+            main_process_instance_id: "instance-1".into(),
+            ..Default::default()
+        });
+        runtime.store.put_message(&sandbox).await.unwrap();
+
+        runtime
+            .main_process_exited("sb-1", "instance-1", 7)
+            .await
+            .unwrap();
+
+        let stored = runtime
+            .store
+            .get_message::<Sandbox>("sb-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.phase(), SandboxPhase::Error as i32);
+        assert_eq!(stored.status.unwrap().exit_code, Some(7));
+    }
+
+    #[tokio::test]
+    async fn intentional_stop_ignores_main_process_exit_report() {
+        let runtime = test_runtime(Arc::new(TestDriver::default())).await;
+        for (id, phase) in [
+            ("sb-stopping", SandboxPhase::Stopping),
+            ("sb-stopped", SandboxPhase::Stopped),
+        ] {
+            let mut sandbox = sandbox_record(id, id, phase);
+            sandbox.status = Some(SandboxStatus {
+                phase: phase as i32,
+                main_process_instance_id: "instance-1".into(),
+                ..Default::default()
+            });
+            runtime.store.put_message(&sandbox).await.unwrap();
+
+            runtime
+                .main_process_exited(id, "instance-1", 143)
+                .await
+                .unwrap();
+
+            let stored = runtime
+                .store
+                .get_message::<Sandbox>(id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(stored.phase(), phase as i32);
+            assert_eq!(stored.status.unwrap().exit_code, None);
+        }
     }
 
     fn ssh_session_record(id: &str, sandbox_id: &str) -> SshSession {
@@ -7300,7 +7586,12 @@ mod tests {
     #[tokio::test]
     async fn non_deleting_container_exit_still_transitions_to_error() {
         let runtime = test_runtime(Arc::new(TestDriver::default())).await;
-        let sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Ready);
+        let mut sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Ready);
+        sandbox.status = Some(SandboxStatus {
+            sandbox_name: "sandbox-a".to_string(),
+            main_process_instance_id: "instance-1".to_string(),
+            ..Default::default()
+        });
         runtime.store.put_message(&sandbox).await.unwrap();
         let mut exited = ready_driver_sandbox("sb-1", "sandbox-a");
         exited.status = Some(make_driver_status(make_driver_condition(
@@ -7320,6 +7611,9 @@ mod tests {
             SandboxPhase::try_from(stored.phase()).unwrap(),
             SandboxPhase::Error
         );
+        let status = stored.status.unwrap();
+        assert_eq!(status.main_process_instance_id, "instance-1");
+        assert_eq!(status.exit_code, None);
     }
 
     #[tokio::test]
@@ -7433,7 +7727,10 @@ mod tests {
         let sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Provisioning);
         runtime.store.put_message(&sandbox).await.unwrap();
 
-        runtime.supervisor_session_connected("sb-1").await.unwrap();
+        runtime
+            .supervisor_session_connected("sb-1", "test-generation")
+            .await
+            .unwrap();
 
         let stored = runtime
             .store
@@ -7676,6 +7973,10 @@ mod tests {
             SandboxPhase::try_from(stored.phase()).unwrap(),
             SandboxPhase::Error
         );
+        assert!(
+            stored.status.unwrap().main_process_instance_id.is_empty(),
+            "a provisioning failure must not fabricate a main-process exit"
+        );
     }
 
     #[tokio::test]
@@ -7688,7 +7989,10 @@ mod tests {
 
         // Promote to Ready via supervisor session connect.
         register_test_supervisor_session(&runtime, "sb-1");
-        runtime.supervisor_session_connected("sb-1").await.unwrap();
+        runtime
+            .supervisor_session_connected("sb-1", "test-generation")
+            .await
+            .unwrap();
         let stored = runtime
             .store
             .get_message::<Sandbox>("sb-1")

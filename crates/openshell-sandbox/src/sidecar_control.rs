@@ -24,6 +24,7 @@ use tracing::{debug, info, warn};
 pub struct BootstrapData {
     pub policy_proto: openshell_core::proto::SandboxPolicy,
     pub provider_env_revision: u64,
+    pub provider_env_generation: u64,
     pub provider_child_env: HashMap<String, String>,
     pub agent_proposals_enabled: bool,
     pub proxy_ca_cert_path: Option<PathBuf>,
@@ -35,6 +36,8 @@ pub struct BootstrapData {
 pub struct EntrypointStarted {
     pub pid: u32,
     pub start_session: bool,
+    pub instance_id: String,
+    pub exit_code: Option<i32>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -47,6 +50,7 @@ pub struct ExpectedPeer {
 pub enum ControlUpdate {
     ProviderEnv {
         revision: u64,
+        generation: u64,
         provider_child_env: HashMap<String, String>,
     },
     Policy {
@@ -58,6 +62,9 @@ pub enum ControlUpdate {
         enabled: bool,
         config_revision: u64,
     },
+    MainProcessExitAck {
+        instance_id: String,
+    },
 }
 
 #[derive(Clone)]
@@ -68,17 +75,22 @@ pub struct Publisher {
 
 impl Publisher {
     pub fn publish_provider_env(&self, revision: u64, provider_child_env: HashMap<String, String>) {
-        {
-            let mut state = self.state.write().expect("sidecar control state poisoned");
-            if revision <= state.provider_env_revision {
-                return;
-            }
-            state.provider_env_revision = revision;
-            state.provider_child_env.clone_from(&provider_child_env);
+        let mut state = self.state.write().expect("sidecar control state poisoned");
+        if revision == state.provider_env_revision {
+            return;
         }
+        state.provider_env_revision = revision;
+        state.provider_env_generation = state
+            .provider_env_generation
+            .checked_add(1)
+            .expect("sidecar provider environment generation overflow");
+        state.provider_child_env.clone_from(&provider_child_env);
 
+        // Keep generation assignment, bootstrap state, and publication under
+        // one lock so cloned publishers cannot emit generations out of order.
         let _ = self.updates.send(WireServerMessage::ProviderEnvUpdated {
             revision,
+            generation: state.provider_env_generation,
             provider_child_env,
         });
     }
@@ -114,6 +126,13 @@ impl Publisher {
             enabled,
             config_revision,
         });
+    }
+
+    #[cfg(any(target_os = "linux", test))]
+    pub fn publish_main_process_exit_ack(&self, instance_id: String) {
+        let _ = self
+            .updates
+            .send(WireServerMessage::MainProcessExitAck { instance_id });
     }
 }
 
@@ -155,7 +174,8 @@ pub struct ProcessConnection {
 #[serde(tag = "type", rename_all = "snake_case")]
 enum WireClientMessage {
     BootstrapRequest { supervisor_pid: u32 },
-    EntrypointStarted { pid: u32 },
+    EntrypointStarted { pid: u32, instance_id: String },
+    MainProcessExited { instance_id: String, exit_code: i32 },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -164,6 +184,7 @@ enum WireServerMessage {
     BootstrapResponse {
         policy_proto: Vec<u8>,
         provider_env_revision: u64,
+        provider_env_generation: u64,
         provider_child_env: HashMap<String, String>,
         agent_proposals_enabled: bool,
         proxy_ca_cert_path: Option<String>,
@@ -171,6 +192,7 @@ enum WireServerMessage {
     },
     ProviderEnvUpdated {
         revision: u64,
+        generation: u64,
         provider_child_env: HashMap<String, String>,
     },
     PolicyUpdated {
@@ -182,6 +204,9 @@ enum WireServerMessage {
         enabled: bool,
         config_revision: u64,
     },
+    MainProcessExitAck {
+        instance_id: String,
+    },
 }
 
 impl BootstrapData {
@@ -190,6 +215,7 @@ impl BootstrapData {
         WireServerMessage::BootstrapResponse {
             policy_proto: self.policy_proto.encode_to_vec(),
             provider_env_revision: self.provider_env_revision,
+            provider_env_generation: self.provider_env_generation,
             provider_child_env: self.provider_child_env.clone(),
             agent_proposals_enabled: self.agent_proposals_enabled,
             proxy_ca_cert_path: self
@@ -211,6 +237,7 @@ impl TryFrom<WireServerMessage> for BootstrapData {
         let WireServerMessage::BootstrapResponse {
             policy_proto,
             provider_env_revision,
+            provider_env_generation,
             provider_child_env,
             agent_proposals_enabled,
             proxy_ca_cert_path,
@@ -229,6 +256,7 @@ impl TryFrom<WireServerMessage> for BootstrapData {
         Ok(Self {
             policy_proto,
             provider_env_revision,
+            provider_env_generation,
             provider_child_env,
             agent_proposals_enabled,
             proxy_ca_cert_path: proxy_ca_cert_path.map(PathBuf::from),
@@ -244,9 +272,11 @@ impl TryFrom<WireServerMessage> for ControlUpdate {
         match message {
             WireServerMessage::ProviderEnvUpdated {
                 revision,
+                generation,
                 provider_child_env,
             } => Ok(Self::ProviderEnv {
                 revision,
+                generation,
                 provider_child_env,
             }),
             WireServerMessage::PolicyUpdated {
@@ -271,6 +301,9 @@ impl TryFrom<WireServerMessage> for ControlUpdate {
                 enabled,
                 config_revision,
             }),
+            WireServerMessage::MainProcessExitAck { instance_id } => {
+                Ok(Self::MainProcessExitAck { instance_id })
+            }
             WireServerMessage::BootstrapResponse { .. } => Err(miette::miette!(
                 "unexpected sidecar bootstrap response after initial handshake"
             )),
@@ -431,11 +464,14 @@ async fn handle_connection(
                 .send(EntrypointStarted {
                     pid: supervisor_pid,
                     start_session: false,
+                    instance_id: String::new(),
+                    exit_code: None,
                 })
                 .await
                 .map_err(|_| miette::miette!("sidecar entrypoint receiver closed"))?;
         }
-        WireClientMessage::EntrypointStarted { .. } => {
+        WireClientMessage::EntrypointStarted { .. }
+        | WireClientMessage::MainProcessExited { .. } => {
             return Err(miette::miette!(
                 "sidecar control client sent entrypoint event before bootstrap"
             ));
@@ -462,7 +498,7 @@ async fn handle_connection(
                     WireClientMessage::BootstrapRequest { .. } => {
                         debug!("Ignoring duplicate sidecar bootstrap request");
                     }
-                    WireClientMessage::EntrypointStarted { pid } => {
+                    WireClientMessage::EntrypointStarted { pid, instance_id } => {
                         if pid == 0 {
                             warn!("Ignoring sidecar entrypoint event with pid=0");
                             continue;
@@ -471,6 +507,22 @@ async fn handle_connection(
                             .send(EntrypointStarted {
                                 pid,
                                 start_session: true,
+                                instance_id,
+                                exit_code: None,
+                            })
+                            .await
+                            .map_err(|_| miette::miette!("sidecar entrypoint receiver closed"))?;
+                    }
+                    WireClientMessage::MainProcessExited {
+                        instance_id,
+                        exit_code,
+                    } => {
+                        entrypoint_tx
+                            .send(EntrypointStarted {
+                                pid: 0,
+                                start_session: false,
+                                instance_id,
+                                exit_code: Some(exit_code),
                             })
                             .await
                             .map_err(|_| miette::miette!("sidecar entrypoint receiver closed"))?;
@@ -565,8 +617,25 @@ async fn connect_with_retry(path: &Path, timeout: Duration) -> Result<tokio::net
     }
 }
 
-pub async fn send_entrypoint_started(writer: &Arc<Mutex<OwnedWriteHalf>>, pid: u32) -> Result<()> {
-    let message = WireClientMessage::EntrypointStarted { pid };
+pub async fn send_entrypoint_started(
+    writer: &Arc<Mutex<OwnedWriteHalf>>,
+    pid: u32,
+    instance_id: String,
+) -> Result<()> {
+    let message = WireClientMessage::EntrypointStarted { pid, instance_id };
+    let mut writer = writer.lock().await;
+    write_json_line(&mut *writer, &message).await
+}
+
+pub async fn send_main_process_exited(
+    writer: &Arc<Mutex<OwnedWriteHalf>>,
+    instance_id: String,
+    exit_code: i32,
+) -> Result<()> {
+    let message = WireClientMessage::MainProcessExited {
+        instance_id,
+        exit_code,
+    };
     let mut writer = writer.lock().await;
     write_json_line(&mut *writer, &message).await
 }
@@ -620,6 +689,7 @@ mod tests {
                 ..SandboxPolicy::default()
             },
             provider_env_revision: 3,
+            provider_env_generation: 0,
             provider_child_env: env.clone(),
             agent_proposals_enabled: true,
             proxy_ca_cert_path: Some(PathBuf::from("/tmp/ca.pem")),
@@ -633,6 +703,7 @@ mod tests {
 
         assert_eq!(received.policy_proto.version, 7);
         assert_eq!(received.provider_env_revision, 3);
+        assert_eq!(received.provider_env_generation, 0);
         assert_eq!(received.provider_child_env, env);
         assert!(received.agent_proposals_enabled);
         assert_eq!(
@@ -646,6 +717,90 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn provider_env_updates_use_generation_not_fingerprint_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("control.sock");
+        let server = spawn_server(
+            &socket,
+            BootstrapData {
+                policy_proto: SandboxPolicy::default(),
+                provider_env_revision: u64::MAX,
+                provider_env_generation: 7,
+                provider_child_env: HashMap::from([("TOKEN".to_string(), "first".to_string())]),
+                agent_proposals_enabled: false,
+                proxy_ca_cert_path: None,
+                proxy_ca_bundle_path: None,
+            },
+            current_peer(),
+        )
+        .unwrap();
+        let publisher = server.publisher();
+        let (_bootstrap, mut connection) = connect_process_client(&socket, Duration::from_secs(1))
+            .await
+            .unwrap();
+
+        publisher.publish_provider_env(
+            1,
+            HashMap::from([("TOKEN".to_string(), "second".to_string())]),
+        );
+
+        let update = tokio::time::timeout(Duration::from_secs(1), connection.updates.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        match update {
+            ControlUpdate::ProviderEnv {
+                revision,
+                generation,
+                provider_child_env,
+            } => {
+                assert_eq!(revision, 1);
+                assert_eq!(generation, 8);
+                assert_eq!(
+                    provider_child_env.get("TOKEN").map(String::as_str),
+                    Some("second")
+                );
+            }
+            other => panic!("unexpected sidecar update: {other:?}"),
+        }
+
+        publisher.publish_provider_env(
+            1,
+            HashMap::from([("TOKEN".to_string(), "duplicate".to_string())]),
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), connection.updates.recv())
+                .await
+                .is_err(),
+            "an identical fingerprint must remain a no-op"
+        );
+
+        publisher.publish_provider_env(
+            u64::MAX,
+            HashMap::from([("TOKEN".to_string(), "third".to_string())]),
+        );
+        let update = tokio::time::timeout(Duration::from_secs(1), connection.updates.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        match update {
+            ControlUpdate::ProviderEnv {
+                revision,
+                generation,
+                provider_child_env,
+            } => {
+                assert_eq!(revision, u64::MAX);
+                assert_eq!(generation, 9);
+                assert_eq!(
+                    provider_child_env.get("TOKEN").map(String::as_str),
+                    Some("third")
+                );
+            }
+            other => panic!("unexpected sidecar update: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn agent_proposals_update_is_delivered_to_process_client() {
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("control.sock");
@@ -654,6 +809,7 @@ mod tests {
             BootstrapData {
                 policy_proto: SandboxPolicy::default(),
                 provider_env_revision: 0,
+                provider_env_generation: 0,
                 provider_child_env: HashMap::new(),
                 agent_proposals_enabled: false,
                 proxy_ca_cert_path: None,
@@ -694,6 +850,7 @@ mod tests {
             BootstrapData {
                 policy_proto: SandboxPolicy::default(),
                 provider_env_revision: 0,
+                provider_env_generation: 0,
                 provider_child_env: HashMap::new(),
                 agent_proposals_enabled: false,
                 proxy_ca_cert_path: None,
@@ -702,8 +859,9 @@ mod tests {
             current_peer(),
         )
         .unwrap();
+        let publisher = server.publisher();
         let mut entrypoint_rx = server.into_entrypoint_receiver();
-        let (_bootstrap, connection) = connect_process_client(&socket, Duration::from_secs(1))
+        let (_bootstrap, mut connection) = connect_process_client(&socket, Duration::from_secs(1))
             .await
             .unwrap();
 
@@ -714,7 +872,7 @@ mod tests {
         assert_eq!(anchor.pid, std::process::id());
         assert!(!anchor.start_session);
 
-        send_entrypoint_started(&connection.writer, 4242)
+        send_entrypoint_started(&connection.writer, 4242, "instance-1".to_string())
             .await
             .unwrap();
 
@@ -724,6 +882,33 @@ mod tests {
             .unwrap();
         assert_eq!(started.pid, 4242);
         assert!(started.start_session);
+        assert_eq!(started.instance_id, "instance-1");
+        assert!(started.exit_code.is_none());
+
+        send_main_process_exited(&connection.writer, "instance-1".to_string(), 0)
+            .await
+            .unwrap();
+        let terminal = tokio::time::timeout(Duration::from_secs(1), entrypoint_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(terminal.exit_code, Some(0));
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), connection.updates.recv())
+                .await
+                .is_err(),
+            "process side must not observe a durable ACK before gateway persistence"
+        );
+        publisher.publish_main_process_exit_ack("instance-1".to_string());
+        let ack = tokio::time::timeout(Duration::from_secs(1), connection.updates.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            ack,
+            ControlUpdate::MainProcessExitAck { instance_id } if instance_id == "instance-1"
+        ));
     }
 
     #[tokio::test]
@@ -735,6 +920,7 @@ mod tests {
             BootstrapData {
                 policy_proto: SandboxPolicy::default(),
                 provider_env_revision: 0,
+                provider_env_generation: 0,
                 provider_child_env: HashMap::new(),
                 agent_proposals_enabled: false,
                 proxy_ca_cert_path: None,
@@ -769,6 +955,7 @@ mod tests {
             BootstrapData {
                 policy_proto: SandboxPolicy::default(),
                 provider_env_revision: 0,
+                provider_env_generation: 0,
                 provider_child_env: HashMap::new(),
                 agent_proposals_enabled: false,
                 proxy_ca_cert_path: None,
@@ -798,6 +985,7 @@ mod tests {
             BootstrapData {
                 policy_proto: SandboxPolicy::default(),
                 provider_env_revision: 0,
+                provider_env_generation: 0,
                 provider_child_env: HashMap::new(),
                 agent_proposals_enabled: false,
                 proxy_ca_cert_path: None,
@@ -828,6 +1016,7 @@ mod tests {
             BootstrapData {
                 policy_proto: SandboxPolicy::default(),
                 provider_env_revision: 0,
+                provider_env_generation: 0,
                 provider_child_env: HashMap::new(),
                 agent_proposals_enabled: false,
                 proxy_ca_cert_path: None,

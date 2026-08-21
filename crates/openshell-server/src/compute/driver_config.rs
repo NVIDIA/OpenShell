@@ -24,6 +24,12 @@ pub struct GuestTlsPaths {
     key: PathBuf,
 }
 
+impl GuestTlsPaths {
+    pub(crate) fn as_paths(&self) -> (&std::path::Path, &std::path::Path, &std::path::Path) {
+        (&self.ca, &self.cert, &self.key)
+    }
+}
+
 impl From<&LocalTlsPaths> for GuestTlsPaths {
     fn from(paths: &LocalTlsPaths) -> Self {
         Self {
@@ -60,7 +66,10 @@ pub struct RemoteDriverConfig {
     pub socket_path: PathBuf,
 }
 
-fn driver_config_from_context<T>(context: DriverStartupContext<'_>, driver_name: &str) -> Result<T>
+pub fn driver_config_from_context<T>(
+    context: DriverStartupContext<'_>,
+    driver_name: &str,
+) -> Result<T>
 where
     T: Default + serde::de::DeserializeOwned,
 {

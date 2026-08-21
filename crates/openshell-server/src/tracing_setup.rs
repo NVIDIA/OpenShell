@@ -40,7 +40,7 @@ impl TracingHandle {
 pub fn podman_export_enabled(driver: &ConfiguredComputeDriver) -> bool {
     matches!(
         driver,
-        ConfiguredComputeDriver::Builtin(openshell_core::ComputeDriverKind::Podman)
+        ConfiguredComputeDriver::Registered(registration) if registration.name == "podman"
     )
 }
 
@@ -83,20 +83,22 @@ pub fn install(
 mod tests {
     use super::*;
 
+    #[cfg(not(target_os = "windows"))]
     #[test]
     fn podman_export_is_enabled_only_when_podman_is_selected() {
-        use crate::ConfiguredComputeDriver;
-        use openshell_core::ComputeDriverKind;
+        let registry = crate::install_default_compute_drivers();
+        let registered = |name| {
+            ConfiguredComputeDriver::Registered(
+                registry
+                    .get(name)
+                    .unwrap_or_else(|| panic!("{name} driver is registered"))
+                    .clone(),
+            )
+        };
 
-        assert!(podman_export_enabled(&ConfiguredComputeDriver::Builtin(
-            ComputeDriverKind::Podman
-        )));
-        assert!(!podman_export_enabled(&ConfiguredComputeDriver::Builtin(
-            ComputeDriverKind::Docker
-        )));
-        assert!(!podman_export_enabled(&ConfiguredComputeDriver::Builtin(
-            ComputeDriverKind::Kubernetes
-        )));
+        assert!(podman_export_enabled(&registered("podman")));
+        assert!(!podman_export_enabled(&registered("docker")));
+        assert!(!podman_export_enabled(&registered("kubernetes")));
         assert!(!podman_export_enabled(&ConfiguredComputeDriver::Remote {
             name: "custom".to_string(),
         }));

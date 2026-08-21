@@ -169,6 +169,9 @@ const OVERLAY_TEMPLATE_CACHE_LAYOUT_VERSION: &str = "sandbox-overlay-ext4-v1";
 const SANDBOX_OVERLAY_IMAGE: &str = "overlay.ext4";
 const SANDBOX_REQUEST_FILE: &str = "sandbox.pb";
 const SANDBOX_STOPPED_FILE: &str = "stopped";
+/// Durable tombstone preventing driver restart from relaunching a sandbox
+/// whose canonical main process already terminated.
+const MAIN_PROCESS_EXITED_FILE: &str = "main-process-exited";
 const GUEST_IMAGE_CONFIG_DIR: &str = "openshell-image";
 const GUEST_IMAGE_OCI_LAYOUT_DIR: &str = "oci";
 const GUEST_IMAGE_OCI_REF: &str = "openshell";
@@ -1409,6 +1412,37 @@ impl VmDriver {
                 drop(registry);
                 self.publish_snapshot(snapshot);
                 info!(sandbox_id = %sandbox.id, "vm driver: restored stopped sandbox without launching compute");
+                continue;
+            }
+
+            if tokio::fs::try_exists(state_dir.join(MAIN_PROCESS_EXITED_FILE))
+                .await
+                .unwrap_or(false)
+            {
+                let snapshot = sandbox_snapshot(
+                    &sandbox,
+                    error_condition(
+                        "ProcessExited",
+                        "Canonical main process exited before VM driver restart",
+                    ),
+                    false,
+                );
+                let mut registry = self.registry.lock().await;
+                registry.entry(sandbox.id.clone()).or_insert(SandboxRecord {
+                    snapshot: snapshot.clone(),
+                    state_dir: state_dir.clone(),
+                    process: None,
+                    provisioning_task: None,
+                    gpu_bdf: None,
+                    qemu_network_allocated: false,
+                    deleting: false,
+                });
+                drop(registry);
+                self.publish_snapshot(snapshot);
+                info!(
+                    sandbox_id = %sandbox.id,
+                    "vm driver: preserved terminal sandbox without restarting canonical process"
+                );
                 continue;
             }
 
@@ -3165,6 +3199,25 @@ impl VmDriver {
             };
 
             if let Some(status) = exit_status {
+                let state_dir = {
+                    let registry = self.registry.lock().await;
+                    registry
+                        .get(&sandbox_id)
+                        .map(|record| record.state_dir.clone())
+                };
+                if let Some(state_dir) = state_dir
+                    && let Err(error) = write_private_file(
+                        &state_dir.join(MAIN_PROCESS_EXITED_FILE),
+                        b"terminal\n".to_vec(),
+                    )
+                    .await
+                {
+                    warn!(
+                        sandbox_id = %sandbox_id,
+                        %error,
+                        "vm driver: failed to persist canonical-process exit tombstone"
+                    );
+                }
                 let message = status.code().map_or_else(
                     || "VM process exited".to_string(),
                     |code| format!("VM process exited with status {code}"),
@@ -4436,9 +4489,17 @@ fn build_guest_environment(
         openshell_core::sandbox_env::SSH_SOCKET_PATH.to_string(),
         GUEST_SSH_SOCKET_PATH.to_string(),
     );
+    // The libkrun guest environment path does not preserve spaces in values
+    // before guest startup. Use a whitespace-free base64url envelope so
+    // command arguments remain lossless.
+    let main_process =
+        openshell_core::sandbox_env::MainProcessConfig::encode_driver_spec_base64url(
+            sandbox.spec.as_ref(),
+        )
+        .expect("main process config serialization cannot fail");
     environment.insert(
-        openshell_core::sandbox_env::SANDBOX_COMMAND.to_string(),
-        "tail -f /dev/null".to_string(),
+        openshell_core::sandbox_env::MAIN_PROCESS_SPEC.to_string(),
+        main_process,
     );
     environment.insert(
         openshell_core::sandbox_env::LOG_LEVEL.to_string(),
@@ -5917,6 +5978,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn startup_does_not_restore_terminal_canonical_process() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut driver = test_driver_with_extensions(LifecycleExtensionRegistry::new());
+        driver.config.state_dir = temp.path().to_path_buf();
+        let sandbox = Sandbox {
+            id: "sb-terminal-main".to_string(),
+            name: "terminal-main".to_string(),
+            spec: Some(SandboxSpec {
+                template: Some(SandboxTemplate {
+                    image: "unused-image".to_string(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let state_dir = temp.path().join("sandboxes").join(&sandbox.id);
+        tokio::fs::create_dir_all(&state_dir).await.unwrap();
+        write_sandbox_request(&state_dir, &sandbox).await.unwrap();
+        write_private_file(
+            &state_dir.join(MAIN_PROCESS_EXITED_FILE),
+            b"terminal\n".to_vec(),
+        )
+        .await
+        .unwrap();
+
+        driver.restore_persisted_sandboxes().await;
+
+        let registry = driver.registry.lock().await;
+        let record = registry.get(&sandbox.id).expect("terminal record");
+        assert!(record.process.is_none());
+        assert!(record.provisioning_task.is_none());
+        let status = record.snapshot.status.as_ref().expect("terminal status");
+        assert!(status.conditions.iter().any(|condition| {
+            condition.reason == "ProcessExited" && condition.status == "False"
+        }));
+    }
+
+    #[tokio::test]
     async fn background_provisioning_does_not_extend_the_rpc_span_lifetime() {
         let traced = TestTracing::new();
         let _dispatch = tracing::dispatcher::set_default(&traced.dispatch);
@@ -6965,6 +7065,77 @@ mod tests {
             ..Default::default()
         };
         assert!(config.validate_sandbox_identity().is_ok());
+    }
+
+    #[test]
+    fn persisted_legacy_sandbox_without_command_uses_scratch_main() {
+        let config = VmDriverConfig {
+            openshell_endpoint: "http://127.0.0.1:8080".to_string(),
+            ..Default::default()
+        };
+        // Requests persisted before the canonical-main contract have a
+        // present DriverSandboxSpec but no command or tty fields.
+        let sandbox = Sandbox {
+            id: "legacy-sandbox".to_string(),
+            name: "legacy-sandbox".to_string(),
+            spec: Some(SandboxSpec::default()),
+            ..Default::default()
+        };
+
+        let env = build_guest_environment(&sandbox, &config, None);
+        let encoded = env
+            .iter()
+            .find_map(|entry| {
+                entry.strip_prefix(&format!(
+                    "{}=",
+                    openshell_core::sandbox_env::MAIN_PROCESS_SPEC
+                ))
+            })
+            .expect("main process environment");
+        let main = openshell_core::sandbox_env::MainProcessConfig::decode(encoded)
+            .expect("legacy persisted request should produce a valid main config");
+
+        assert_eq!(
+            main,
+            openshell_core::sandbox_env::MainProcessConfig::scratch()
+        );
+    }
+
+    #[test]
+    fn build_guest_environment_preserves_main_command_spaces() {
+        let config = VmDriverConfig {
+            openshell_endpoint: "https://127.0.0.1:8080".to_string(),
+            ..Default::default()
+        };
+        let command = vec![
+            "sh".to_string(),
+            "-lc".to_string(),
+            "echo ready; while true; do sleep 1; done".to_string(),
+        ];
+        let sandbox = Sandbox {
+            id: "space-command".to_string(),
+            name: "space-command".to_string(),
+            spec: Some(SandboxSpec {
+                command: command.clone(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let env = build_guest_environment(&sandbox, &config, None);
+        let encoded = env
+            .iter()
+            .find_map(|entry| {
+                entry.strip_prefix(&format!(
+                    "{}=",
+                    openshell_core::sandbox_env::MAIN_PROCESS_SPEC
+                ))
+            })
+            .expect("main process environment");
+
+        assert!(!encoded.contains(char::is_whitespace));
+        let main = openshell_core::sandbox_env::MainProcessConfig::decode(encoded).unwrap();
+        assert_eq!(main.command, command);
     }
 
     #[test]

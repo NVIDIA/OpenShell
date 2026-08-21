@@ -455,6 +455,13 @@ service OpenShell {
     };
   }
 
+  // Persist the canonical main process result before the supervisor exits.
+  rpc ReportMainProcessExit(ReportMainProcessExitRequest) returns (ReportMainProcessExitResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "sandbox"
+    };
+  }
+
   // Raw byte relay between supervisor and gateway.
   //
   // The supervisor initiates this call after receiving a RelayOpen message
@@ -772,6 +779,7 @@ message ComputeDriverCapabilities {
 
   // Driver-reported implementation version from the startup capability snapshot.
   string driver_version = 2;
+
 }
 
 // Public sandbox resource exposed by the OpenShell API.
@@ -817,6 +825,12 @@ message SandboxSpec {
   // managed fleet-wide.
   reserved 11;
   reserved "proposal_approval_mode";
+  // Canonical command launched once by the sandbox supervisor. No shell
+  // parsing is performed. The gateway normalizes an omitted command to the
+  // portable scratch login shell before persistence.
+  repeated string command = 12;
+  // Allocate a retained pseudo-terminal for the main process.
+  bool tty = 13;
 }
 
 message ResourceRequirements {
@@ -880,6 +894,12 @@ message SandboxStatus {
   SandboxPhase phase = 6;
   // Currently active policy version (updated when sandbox reports loaded).
   uint32 current_policy_version = 7;
+  // Supervisor instance currently associated with the canonical main process.
+  // The gateway uses this to reject stale exit reports after a restart.
+  string main_process_instance_id = 8;
+  // Normalized main process result. Signal exits use 128 + signal number.
+  // Presence indicates that the main process exited and the sandbox is in Error.
+  optional int32 exit_code = 9;
 }
 
 // User-facing sandbox condition derived from driver-native conditions.
@@ -2127,6 +2147,17 @@ message SupervisorHeartbeat {}
 
 // Gateway heartbeat.
 message GatewayHeartbeat {}
+
+// Terminal result reported before the supervisor shuts down. A successful RPC
+// response confirms that the result was durably handled by the gateway.
+message ReportMainProcessExitRequest {
+  string sandbox_id = 1;
+  string instance_id = 2;
+  // Normalized process result. Signal exits use 128 + signal number.
+  int32 exit_code = 3;
+}
+
+message ReportMainProcessExitResponse {}
 
 // Gateway requests the supervisor to open a relay channel.
 //

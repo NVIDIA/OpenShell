@@ -60,6 +60,13 @@ struct TestOpenShell {
 
 #[tonic::async_trait]
 impl OpenShell for TestOpenShell {
+    async fn report_main_process_exit(
+        &self,
+        _request: tonic::Request<openshell_core::proto::ReportMainProcessExitRequest>,
+    ) -> Result<Response<openshell_core::proto::ReportMainProcessExitResponse>, Status> {
+        Err(Status::unimplemented("not used by this test server"))
+    }
+
     async fn get_current_user(
         &self,
         _request: tonic::Request<openshell_core::proto::GetCurrentUserRequest>,
@@ -1288,6 +1295,44 @@ async fn sandbox_create_sends_cpu_and_memory_limits_only() {
         Some("2Gi")
     );
     assert!(!resources.fields.contains_key("requests"));
+}
+
+#[tokio::test]
+async fn sandbox_create_persists_exact_trailing_argv_as_main_process() {
+    let server = run_server().await;
+    let fake_ssh_dir = tempfile::tempdir().unwrap();
+    let xdg_dir = tempfile::tempdir().unwrap();
+    let _env = test_env(&fake_ssh_dir, &xdg_dir);
+    let tls = test_tls(&server);
+    install_fake_ssh(&fake_ssh_dir);
+    let command = vec![
+        "/opt/agent binary".to_string(),
+        "--prompt=keep spaces".to_string(),
+        "literal * $HOME".to_string(),
+    ];
+
+    run::sandbox_create(
+        &server.endpoint,
+        "openshell",
+        run::SandboxCreateConfig {
+            name: Some("canonical-main"),
+            command: &command,
+            tty_override: Some(false),
+            ..test_config()
+        },
+        "default",
+        &tls,
+    )
+    .await
+    .expect("sandbox create should succeed");
+
+    let requests = create_requests(&server).await;
+    let spec = requests[0]
+        .spec
+        .as_ref()
+        .expect("sandbox spec should be persisted at create time");
+    assert_eq!(spec.command, command);
+    assert!(!spec.tty);
 }
 
 #[tokio::test]
