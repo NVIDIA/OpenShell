@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -72,6 +72,10 @@ pub struct SupervisorSessionRegistry {
     sessions: Mutex<HashMap<String, LiveSession>>,
     /// `channel_id` -> oneshot sender for the reverse CONNECT stream.
     pending_relays: Mutex<HashMap<String, PendingRelay>>,
+    /// Sandboxes whose topology has no in-sandbox process supervisor, and so
+    /// will never register a session. Waiting for one is pointless, and the
+    /// caller deserves to know why rather than watching a timeout elapse.
+    sessionless: Mutex<HashSet<String>>,
 }
 
 struct PendingRelay {
@@ -182,6 +186,17 @@ impl SupervisorSessionRegistry {
         sandbox_id: &str,
         timeout: Duration,
     ) -> Result<mpsc::Sender<GatewayMessage>, Status> {
+        // Topologies without an in-sandbox process supervisor never register a
+        // session. Fail immediately with an actionable message instead of
+        // burning the caller's timeout on a wait that cannot succeed.
+        if self.is_sessionless(sandbox_id) {
+            return Err(Status::failed_precondition(
+                "this sandbox runs a topology with no in-sandbox supervisor, so SSH, exec, \
+                 port forwarding, and file transfer are unavailable; use the `combined` or \
+                 `sidecar` topology when those are required",
+            ));
+        }
+
         let deadline = Instant::now() + timeout;
         let mut backoff = SESSION_WAIT_INITIAL_BACKOFF;
 
@@ -207,6 +222,28 @@ impl SupervisorSessionRegistry {
 
     pub fn has_session(&self, sandbox_id: &str) -> bool {
         self.sessions.lock().unwrap().contains_key(sandbox_id)
+    }
+
+    /// Record whether a sandbox's topology can ever open a supervisor session.
+    ///
+    /// Driven by the compute driver's reported `SupervisorSessionModel`, so it
+    /// re-establishes itself from the next driver snapshot after a gateway
+    /// restart.
+    pub fn set_sessionless(&self, sandbox_id: &str, sessionless: bool) {
+        let mut set = self.sessionless.lock().unwrap();
+        if sessionless {
+            set.insert(sandbox_id.to_string());
+        } else {
+            set.remove(sandbox_id);
+        }
+    }
+
+    pub fn is_sessionless(&self, sandbox_id: &str) -> bool {
+        self.sessionless.lock().unwrap().contains(sandbox_id)
+    }
+
+    pub fn forget_sessionless(&self, sandbox_id: &str) {
+        self.sessionless.lock().unwrap().remove(sandbox_id);
     }
 
     pub fn is_current_session(&self, sandbox_id: &str, session_id: &str) -> bool {

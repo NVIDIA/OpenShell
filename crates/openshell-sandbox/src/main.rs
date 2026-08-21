@@ -6,6 +6,7 @@
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::time::Duration;
 
 use clap::Parser;
 use miette::{IntoDiagnostic, Result};
@@ -33,6 +34,14 @@ const COPY_SELF_SUBCOMMAND: &str = "copy-self";
 /// to confirm the cross-sandbox IDOR guard fires.
 const DEBUG_RPC_SUBCOMMAND: &str = "debug-rpc";
 const VALIDATE_WORKSPACE_SUBCOMMAND: &str = "validate-workspace";
+
+/// Subcommand that blocks until a TCP endpoint accepts a connection.
+///
+/// Used by the `proxy-pod` agent pod's init container to hold the workload
+/// until its paired network supervisor is serving. Without it the workload
+/// can start before the proxy exists, its early egress fails, and the
+/// Kubernetes `Sandbox` reports Ready while no egress path is available.
+const WAIT_FOR_TCP_SUBCOMMAND: &str = "wait-for-tcp";
 
 /// Default `--mode` value: run both supervisor leaves in a single binary.
 const DEFAULT_MODE: &str = "network,process";
@@ -506,6 +515,58 @@ fn run_network_init(
     ))
 }
 
+/// Block until `addr` accepts a TCP connection, or the timeout elapses.
+///
+/// Deliberately dependency-free: this runs in an init container built from
+/// the supervisor image, which has no shell networking tools.
+fn wait_for_tcp(args: &[String]) -> Result<()> {
+    let addr = args.first().ok_or_else(|| {
+        miette::miette!(
+            "usage: openshell-sandbox {WAIT_FOR_TCP_SUBCOMMAND} <HOST:PORT> [TIMEOUT_SECS]"
+        )
+    })?;
+    let timeout_secs: u64 = match args.get(1) {
+        Some(raw) => raw
+            .parse()
+            .map_err(|_| miette::miette!("timeout must be a positive integer: {raw}"))?,
+        None => 180,
+    };
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(timeout_secs);
+    let mut last_error = String::new();
+    loop {
+        // Re-resolve every attempt: the paired supervisor Service may not have
+        // endpoints yet when the init container first runs.
+        match std::net::ToSocketAddrs::to_socket_addrs(&addr.as_str()) {
+            Ok(mut resolved) => {
+                let mut connected = false;
+                for socket_addr in &mut resolved {
+                    match std::net::TcpStream::connect_timeout(&socket_addr, Duration::from_secs(5))
+                    {
+                        Ok(_) => {
+                            connected = true;
+                            break;
+                        }
+                        Err(err) => last_error = err.to_string(),
+                    }
+                }
+                if connected {
+                    println!("network supervisor endpoint {addr} is accepting connections");
+                    return Ok(());
+                }
+            }
+            Err(err) => last_error = err.to_string(),
+        }
+
+        if std::time::Instant::now() >= deadline {
+            return Err(miette::miette!(
+                "timed out after {timeout_secs}s waiting for network supervisor at {addr}: {last_error}"
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+}
+
 fn main() -> Result<()> {
     // Handle `copy-self <DEST>` before clap so it works without any of the
     // sandbox flags. Kubernetes init containers invoke this path to seed an
@@ -533,6 +594,12 @@ fn main() -> Result<()> {
     }
     if raw_args.get(1).map(String::as_str) == Some(VALIDATE_WORKSPACE_SUBCOMMAND) {
         return validate_workspace(&raw_args[2..]);
+    }
+
+    // Handle `wait-for-tcp <ADDR> [TIMEOUT_SECS]` before clap. Runs in the
+    // agent pod's init container, which has none of the supervisor's config.
+    if raw_args.get(1).map(String::as_str) == Some(WAIT_FOR_TCP_SUBCOMMAND) {
+        return wait_for_tcp(&raw_args[2..]);
     }
 
     let args = Args::parse();

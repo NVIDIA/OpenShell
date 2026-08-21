@@ -13,8 +13,9 @@ use crate::container::{
 use futures::Stream;
 use openshell_core::ComputeDriverError;
 use openshell_core::proto::compute::v1::{
-    DriverCondition, DriverSandbox, DriverSandboxStatus, WatchSandboxesDeletedEvent,
-    WatchSandboxesEvent, WatchSandboxesSandboxEvent, watch_sandboxes_event,
+    DriverCondition, DriverSandbox, DriverSandboxStatus, SupervisorSessionModel,
+    WatchSandboxesDeletedEvent, WatchSandboxesEvent, WatchSandboxesSandboxEvent,
+    watch_sandboxes_event,
 };
 use std::collections::HashMap;
 use std::pin::Pin;
@@ -348,6 +349,7 @@ fn build_driver_sandbox(
         namespace: String::new(),
         spec: None,
         status: Some(DriverSandboxStatus {
+            supervisor_session_model: SupervisorSessionModel::Unspecified as i32,
             sandbox_name: instance_name,
             instance_id,
             agent_fd: String::new(),
@@ -650,6 +652,7 @@ mod tests {
             namespace: String::new(),
             spec: None,
             status: Some(DriverSandboxStatus {
+                supervisor_session_model: SupervisorSessionModel::Unspecified as i32,
                 sandbox_name: String::new(),
                 instance_id: short_id("container-id-full"),
                 agent_fd: String::new(),

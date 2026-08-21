@@ -44,9 +44,9 @@ use openshell_core::proto::compute::v1::{
     DriverCondition as SandboxCondition, DriverPlatformEvent as PlatformEvent,
     DriverSandbox as Sandbox, DriverSandboxSpec as SandboxSpec,
     DriverSandboxStatus as SandboxStatus, DriverSandboxTemplate as SandboxTemplate,
-    GetCapabilitiesResponse, GpuResourceRequirements, WatchSandboxesDeletedEvent,
-    WatchSandboxesEvent, WatchSandboxesPlatformEvent, WatchSandboxesSandboxEvent,
-    watch_sandboxes_event,
+    GetCapabilitiesResponse, GpuResourceRequirements, SupervisorSessionModel,
+    WatchSandboxesDeletedEvent, WatchSandboxesEvent, WatchSandboxesPlatformEvent,
+    WatchSandboxesSandboxEvent, watch_sandboxes_event,
 };
 use openshell_core::proto_struct::{struct_to_json_object, value_to_json};
 use rcgen::{CertificateParams, DnType, IsCa, KeyPair, KeyUsagePurpose};
@@ -1257,7 +1257,9 @@ impl KubernetesComputeDriver {
                         .namespace
                         .clone()
                         .unwrap_or_else(|| self.config.namespace.clone());
-                    Ok(sandbox_from_object(&ns, obj).ok().map(|(_, s)| s))
+                    Ok(sandbox_from_object(&ns, obj, self.config.topology)
+                        .ok()
+                        .map(|(_, s)| s))
                 },
             ),
             Ok(Err(err)) => {
@@ -1311,7 +1313,7 @@ impl KubernetesComputeDriver {
                             .namespace
                             .clone()
                             .unwrap_or_else(|| self.config.namespace.clone());
-                        match sandbox_from_object(&ns, obj) {
+                        match sandbox_from_object(&ns, obj, self.config.topology) {
                             Ok((_, s)) => Some(s),
                             Err(err) => {
                                 warn!(object_name = %name, error = %err, "skipping unrecognized Sandbox in list");
@@ -2063,6 +2065,7 @@ impl KubernetesComputeDriver {
 
     async fn watch_sandboxes_single_namespace(&self) -> Result<WatchStream, String> {
         let namespace = self.config.namespace.clone();
+        let topology = self.config.topology;
         let agent_sandbox_api = self
             .supported_agent_sandbox_api(self.watch_client.clone(), &self.config.namespace)
             .await?;
@@ -2080,7 +2083,7 @@ impl KubernetesComputeDriver {
                 tokio::select! {
                     result = sandbox_stream.try_next() => match result {
                         Ok(Some(Event::Applied(obj))) => {
-                            if let Ok((kube_name, sandbox)) = sandbox_from_object(&namespace, obj) {
+                            if let Ok((kube_name, sandbox)) = sandbox_from_object(&namespace, obj, topology) {
                                 update_indexes(&mut sandbox_name_to_id, &mut agent_pod_to_id, &kube_name, &sandbox);
                                 let event = WatchSandboxesEvent {
                                     payload: Some(watch_sandboxes_event::Payload::Sandbox(
@@ -2109,7 +2112,7 @@ impl KubernetesComputeDriver {
                         }
                         Ok(Some(Event::Restarted(objs))) => {
                             for obj in objs {
-                                if let Ok((kube_name, sandbox)) = sandbox_from_object(&namespace, obj) {
+                                if let Ok((kube_name, sandbox)) = sandbox_from_object(&namespace, obj, topology) {
                                     update_indexes(&mut sandbox_name_to_id, &mut agent_pod_to_id, &kube_name, &sandbox);
                                     let event = WatchSandboxesEvent {
                                         payload: Some(watch_sandboxes_event::Payload::Sandbox(
@@ -2174,6 +2177,7 @@ impl KubernetesComputeDriver {
     }
 
     async fn watch_sandboxes_cluster_wide(&self) -> Result<WatchStream, String> {
+        let topology = self.config.topology;
         let sandbox_api_version = self
             .supported_sandbox_api_version(self.watch_client.clone())
             .await?;
@@ -2192,7 +2196,7 @@ impl KubernetesComputeDriver {
                         Ok(Some(Event::Applied(obj))) => {
                             let ns = obj.metadata.namespace.clone()
                                 .unwrap_or_else(|| default_namespace.clone());
-                            if let Ok((_kube_name, sandbox)) = sandbox_from_object(&ns, obj) {
+                            if let Ok((_kube_name, sandbox)) = sandbox_from_object(&ns, obj, topology) {
                                 let event = WatchSandboxesEvent {
                                     payload: Some(watch_sandboxes_event::Payload::Sandbox(
                                         WatchSandboxesSandboxEvent { sandbox: Some(sandbox) }
@@ -2221,7 +2225,7 @@ impl KubernetesComputeDriver {
                             for obj in objs {
                                 let ns = obj.metadata.namespace.clone()
                                     .unwrap_or_else(|| default_namespace.clone());
-                                if let Ok((_kube_name, sandbox)) = sandbox_from_object(&ns, obj) {
+                                if let Ok((_kube_name, sandbox)) = sandbox_from_object(&ns, obj, topology) {
                                     let event = WatchSandboxesEvent {
                                         payload: Some(watch_sandboxes_event::Payload::Sandbox(
                                             WatchSandboxesSandboxEvent { sandbox: Some(sandbox) }
@@ -2448,7 +2452,11 @@ fn is_openshell_managed(obj: &DynamicObject) -> bool {
 /// Returns `Err` in two cases (callers should skip, not fail):
 /// - The object is not managed by `OpenShell` (missing/wrong `managed-by` label).
 /// - The object is managed by `OpenShell` but missing required fields (orphan).
-fn sandbox_from_object(namespace: &str, obj: DynamicObject) -> Result<(String, Sandbox), String> {
+fn sandbox_from_object(
+    namespace: &str,
+    obj: DynamicObject,
+    topology: SupervisorTopology,
+) -> Result<(String, Sandbox), String> {
     let kube_name = obj.metadata.name.clone().unwrap_or_default();
 
     if !is_openshell_managed(&obj) {
@@ -2474,7 +2482,7 @@ fn sandbox_from_object(namespace: &str, obj: DynamicObject) -> Result<(String, S
         .namespace
         .clone()
         .unwrap_or_else(|| namespace.to_string());
-    let status = status_from_object(&obj);
+    let status = status_from_object(&obj, topology);
 
     Ok((
         kube_name,
@@ -2659,6 +2667,11 @@ const SANDBOX_ROLE_SUPERVISOR: &str = "supervisor";
 const PROXY_POD_PROXY_PORT: u16 = 3128;
 const PROXY_POD_GATEWAY_FORWARD_PORT: u16 = 18080;
 const PROXY_POD_GATEWAY_FORWARD_ADDR: &str = "0.0.0.0:18080";
+const PROXY_POD_WAIT_INIT_CONTAINER_NAME: &str = "openshell-wait-for-proxy";
+/// Upper bound on how long the agent pod waits for its paired supervisor.
+/// Exceeding it fails the init container, which surfaces as a pod-level error
+/// rather than a workload that silently has no egress.
+const PROXY_POD_WAIT_TIMEOUT_SECS: u64 = 180;
 const PROXY_POD_NETWORK_ENFORCEMENT_MODE: &str = "proxy-pod";
 const PROXY_POD_CA_SECRET_MOUNT_PATH: &str = "/var/run/openshell-proxy-ca";
 const PROXY_POD_CA_CERT_FILE: &str = "openshell-ca.pem";
@@ -3469,6 +3482,39 @@ fn proxy_pod_ca_init_container(
     init_spec
 }
 
+fn proxy_pod_wait_for_proxy_init_container(
+    image: &str,
+    image_pull_policy: &str,
+    run_as_user: u32,
+    run_as_group: u32,
+    service_dns: &str,
+) -> serde_json::Value {
+    let mut init_spec = serde_json::json!({
+        "name": PROXY_POD_WAIT_INIT_CONTAINER_NAME,
+        "image": image,
+        "command": [
+            SUPERVISOR_IMAGE_BINARY_PATH,
+            "wait-for-tcp",
+            format!("{service_dns}:{PROXY_POD_PROXY_PORT}"),
+            PROXY_POD_WAIT_TIMEOUT_SECS.to_string(),
+        ],
+        "securityContext": {
+            "runAsUser": run_as_user,
+            "runAsGroup": run_as_group,
+            "runAsNonRoot": true,
+            "allowPrivilegeEscalation": false,
+            "readOnlyRootFilesystem": true,
+            "capabilities": {
+                "drop": ["ALL"]
+            }
+        }
+    });
+    if !image_pull_policy.is_empty() {
+        init_spec["imagePullPolicy"] = serde_json::json!(image_pull_policy);
+    }
+    init_spec
+}
+
 fn apply_proxy_pod_affinity(
     spec: &mut serde_json::Map<String, serde_json::Value>,
     sandbox_id: &str,
@@ -3585,6 +3631,18 @@ fn apply_supervisor_proxy_pod_topology(
             params.supervisor_image_pull_policy,
             params.sandbox_uid,
             params.sandbox_gid,
+        ));
+        // Hold the workload until the paired supervisor is accepting proxy
+        // connections. Without this the workload starts first, its early
+        // egress fails, and — because the gateway derives readiness for this
+        // topology from the pod's Ready condition — the sandbox would report
+        // Ready while it has no egress path at all.
+        init_containers.push(proxy_pod_wait_for_proxy_init_container(
+            params.supervisor_image,
+            params.supervisor_image_pull_policy,
+            params.sandbox_uid,
+            params.sandbox_gid,
+            &service_dns,
         ));
     }
 
@@ -5375,7 +5433,15 @@ fn platform_config_struct(template: &SandboxTemplate, key: &str) -> Option<serde
     }
 }
 
-fn status_from_object(obj: &DynamicObject) -> Option<SandboxStatus> {
+/// Convert a `Sandbox` CR's status into the driver contract's status.
+///
+/// `topology` decides the supervisor-session model reported to the gateway.
+/// `proxy-pod` has no in-sandbox process supervisor, so no `ConnectSupervisor`
+/// session will ever open; the gateway must derive readiness from the
+/// conditions below instead of waiting forever. The agent pod's
+/// `wait-for-proxy` init container is what makes that safe: the pod does not
+/// become Ready until its paired supervisor is accepting connections.
+fn status_from_object(obj: &DynamicObject, topology: SupervisorTopology) -> Option<SandboxStatus> {
     let status = obj.data.get("status")?;
     let status_obj = status.as_object()?;
 
@@ -5413,6 +5479,12 @@ fn status_from_object(obj: &DynamicObject) -> Option<SandboxStatus> {
             .to_string(),
         conditions,
         deleting: obj.metadata.deletion_timestamp.is_some(),
+        supervisor_session_model: match topology {
+            SupervisorTopology::ProxyPod => SupervisorSessionModel::None as i32,
+            SupervisorTopology::Combined | SupervisorTopology::Sidecar => {
+                SupervisorSessionModel::Required as i32
+            }
+        },
     })
 }
 
@@ -7477,7 +7549,8 @@ mod tests {
 
         let containers = pod_template["spec"]["containers"].as_array().unwrap();
         let init_containers = pod_template["spec"]["initContainers"].as_array().unwrap();
-        assert_eq!(init_containers.len(), 2);
+        // CA install, wait-for-proxy, and workspace seed.
+        assert_eq!(init_containers.len(), 3);
         for container in containers.iter().chain(init_containers) {
             let security_context = &container["securityContext"];
             assert_ne!(
@@ -7694,6 +7767,120 @@ mod tests {
             &params,
             serde_json::json!({}),
         )
+    }
+
+    fn sandbox_object_with_conditions(conditions: &[(&str, &str)]) -> DynamicObject {
+        let resource = ApiResource::from_gvk(&GroupVersionKind::gvk(
+            SANDBOX_GROUP,
+            SANDBOX_VERSION_V1BETA1,
+            SANDBOX_KIND,
+        ));
+        let mut obj = DynamicObject::new("sandbox", &resource);
+        let conditions: Vec<_> = conditions
+            .iter()
+            .map(|(kind, status)| serde_json::json!({"type": kind, "status": status}))
+            .collect();
+        obj.data = serde_json::json!({"status": {"conditions": conditions}});
+        obj
+    }
+
+    #[test]
+    fn proxy_pod_reports_no_supervisor_session_model() {
+        let obj = sandbox_object_with_conditions(&[("Ready", "True")]);
+        let status = status_from_object(&obj, SupervisorTopology::ProxyPod).unwrap();
+        assert_eq!(
+            status.supervisor_session_model,
+            SupervisorSessionModel::None as i32
+        );
+    }
+
+    #[test]
+    fn supervisor_topologies_require_a_supervisor_session() {
+        let obj = sandbox_object_with_conditions(&[("Ready", "True")]);
+        for topology in [SupervisorTopology::Combined, SupervisorTopology::Sidecar] {
+            let status = status_from_object(&obj, topology).unwrap();
+            assert_eq!(
+                status.supervisor_session_model,
+                SupervisorSessionModel::Required as i32,
+                "{topology}"
+            );
+        }
+    }
+
+    /// The agent pod must not report Ready before its paired supervisor is
+    /// serving: the gateway derives readiness from the pod for this topology,
+    /// so a pod that is up without a proxy would advertise egress it does not
+    /// have.
+    #[test]
+    fn proxy_pod_agent_waits_for_its_paired_supervisor() {
+        let params = SandboxPodParams {
+            topology: SupervisorTopology::ProxyPod,
+            supervisor_image: "supervisor-image:latest",
+            namespace: "agents",
+            sandbox_id: "sandbox-123",
+            sandbox_name: "example-sandbox",
+            proxy_uid: 2200,
+            sandbox_uid: 1500,
+            sandbox_gid: 1500,
+            ..SandboxPodParams::default()
+        };
+        let pod_template = sandbox_template_to_k8s(
+            &SandboxTemplate {
+                image: "agent-image:latest".to_string(),
+                ..SandboxTemplate::default()
+            },
+            false,
+            &std::collections::HashMap::new(),
+            false,
+            &params,
+        );
+        let init_containers = pod_template["spec"]["initContainers"].as_array().unwrap();
+        let wait = init_containers
+            .iter()
+            .find(|c| c["name"] == PROXY_POD_WAIT_INIT_CONTAINER_NAME)
+            .expect("proxy-pod agent pod waits for its supervisor");
+
+        let command = wait["command"].as_array().unwrap();
+        assert_eq!(command[1], "wait-for-tcp");
+        let names = proxy_pod_resource_names("example-sandbox");
+        let service_dns = proxy_pod_service_dns(&names.service, "agents");
+        assert_eq!(command[2], format!("{service_dns}:3128"));
+        assert_eq!(wait["securityContext"]["runAsNonRoot"], true);
+        assert_eq!(
+            wait["securityContext"]["capabilities"]["drop"],
+            serde_json::json!(["ALL"])
+        );
+    }
+
+    #[test]
+    fn other_topologies_have_no_wait_for_proxy_init_container() {
+        let params = SandboxPodParams {
+            topology: SupervisorTopology::Sidecar,
+            supervisor_image: "supervisor-image:latest",
+            namespace: "agents",
+            sandbox_id: "sandbox-123",
+            sandbox_name: "example-sandbox",
+            ..SandboxPodParams::default()
+        };
+        let pod_template = sandbox_template_to_k8s(
+            &SandboxTemplate {
+                image: "agent-image:latest".to_string(),
+                ..SandboxTemplate::default()
+            },
+            false,
+            &std::collections::HashMap::new(),
+            false,
+            &params,
+        );
+        let init_containers = pod_template["spec"]["initContainers"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            !init_containers
+                .iter()
+                .any(|c| c["name"] == PROXY_POD_WAIT_INIT_CONTAINER_NAME)
+        );
     }
 
     #[test]
@@ -9170,7 +9357,8 @@ mod tests {
             data: serde_json::json!({}),
         };
 
-        let (kube_name, sandbox) = sandbox_from_object("default", obj).unwrap();
+        let (kube_name, sandbox) =
+            sandbox_from_object("default", obj, SupervisorTopology::Combined).unwrap();
         assert_eq!(kube_name, "alpha--work");
         assert_eq!(sandbox.name, "work");
         assert_eq!(sandbox.workspace, "alpha");
@@ -9199,7 +9387,8 @@ mod tests {
             data: serde_json::json!({}),
         };
 
-        let (_, sandbox) = sandbox_from_object("default", obj).unwrap();
+        let (_, sandbox) =
+            sandbox_from_object("default", obj, SupervisorTopology::Combined).unwrap();
         assert_eq!(sandbox.name, "work");
         assert_eq!(sandbox.workspace, "alpha");
         assert_eq!(sandbox.id, "uuid-456");
@@ -9221,7 +9410,7 @@ mod tests {
             data: serde_json::json!({}),
         };
 
-        let result = sandbox_from_object("default", obj);
+        let result = sandbox_from_object("default", obj, SupervisorTopology::Combined);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("not managed by openshell"));
     }
@@ -9252,7 +9441,8 @@ mod tests {
             data: serde_json::json!({}),
         };
 
-        let (_, sandbox) = sandbox_from_object("openshell", obj).unwrap();
+        let (_, sandbox) =
+            sandbox_from_object("openshell", obj, SupervisorTopology::Combined).unwrap();
         assert_eq!(sandbox.namespace, "openshell-gw1-team-a");
         assert_eq!(sandbox.workspace, "team-a");
     }
@@ -9277,7 +9467,7 @@ mod tests {
             data: serde_json::json!({}),
         };
 
-        let result = sandbox_from_object("default", obj);
+        let result = sandbox_from_object("default", obj, SupervisorTopology::Combined);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("missing sandbox workspace"));
     }

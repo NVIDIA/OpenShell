@@ -45,11 +45,11 @@ use openshell_core::proto::compute::v1::{
     GetCapabilitiesResponse, GetGatewayListenerRequirementsRequest,
     GetGatewayListenerRequirementsResponse, GetSandboxRequest, GetSandboxResponse,
     GpuResourceRequirements, ListSandboxesRequest, ListSandboxesResponse, StartSandboxRequest,
-    StartSandboxResponse, StopSandboxRequest, StopSandboxResponse, ValidateSandboxCreateRequest,
-    ValidateSandboxCreateResponse, WatchSandboxesDeletedEvent, WatchSandboxesEvent,
-    WatchSandboxesPlatformEvent, WatchSandboxesRequest, WatchSandboxesSandboxEvent,
-    compute_driver_server::ComputeDriver, gateway_listener_requirement::Selector,
-    watch_sandboxes_event,
+    StartSandboxResponse, StopSandboxRequest, StopSandboxResponse, SupervisorSessionModel,
+    ValidateSandboxCreateRequest, ValidateSandboxCreateResponse, WatchSandboxesDeletedEvent,
+    WatchSandboxesEvent, WatchSandboxesPlatformEvent, WatchSandboxesRequest,
+    WatchSandboxesSandboxEvent, compute_driver_server::ComputeDriver,
+    gateway_listener_requirement::Selector, watch_sandboxes_event,
 };
 use openshell_core::proto_struct::{
     deserialize_optional_non_empty_string_list, struct_to_json_value,
@@ -1749,6 +1749,7 @@ fn pending_sandbox_snapshot(
         namespace: namespace.to_string(),
         spec: None,
         status: Some(DriverSandboxStatus {
+            supervisor_session_model: SupervisorSessionModel::Unspecified as i32,
             sandbox_name: sandbox.name.clone(),
             instance_id: String::new(),
             agent_fd: String::new(),
@@ -3077,6 +3078,7 @@ fn driver_status_from_summary(
     let (ready, reason, message, deleting) = container_ready_condition(state);
 
     DriverSandboxStatus {
+        supervisor_session_model: SupervisorSessionModel::Unspecified as i32,
         sandbox_name: summary_container_name(summary).unwrap_or_else(|| sandbox_name.to_string()),
         instance_id: summary.id.clone().unwrap_or_default(),
         agent_fd: String::new(),
