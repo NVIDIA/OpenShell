@@ -584,7 +584,7 @@ grpcRoute:
     # to validate the gateway pod's TLS certificate. Defaults to
     # <fullname>-backend-ca when empty. The certgen hook auto-creates this:
     # with pkiInitJob (default), immediately on install/upgrade; with
-    # cert-manager, the hook polls for (pkiInitJob.timeoutSeconds - 30) seconds
+    # cert-manager, the hook polls for pkiInitJob.timeoutSeconds seconds
     # waiting for cert-manager to issue the server certificate, then creates the
     # ConfigMap. A single install usually succeeds; if cert-manager takes longer,
     # increase pkiInitJob.timeoutSeconds. By default (pkiInitJob.failOnTimeout=true),
