@@ -1,0 +1,36 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Apply the upstream pasta AppArmor signal rule after podman-rootless-pasta has
+# installed the packaged profile. This is deliberately an opt-in overlay so a
+# guest using only podman-rootless-pasta remains an unmodified-package control.
+
+- name: Apply the pasta AppArmor signal fix
+  hosts: test_vm
+  become: true
+  gather_facts: false
+
+  tasks:
+    - name: Require the packaged pasta AppArmor profile
+      ansible.builtin.stat:
+        path: /etc/apparmor.d/usr.bin.pasta
+      register: pasta_profile
+
+    - name: Reject guests without the pasta profile
+      ansible.builtin.assert:
+        that:
+          - pasta_profile.stat.exists
+        fail_msg: Apply podman-rootless-pasta before pasta-apparmor-fix.
+
+    - name: Allow pasta to receive signals from Podman
+      ansible.builtin.lineinfile:
+        path: /etc/apparmor.d/usr.bin.pasta
+        insertafter: '^  include <abstractions/pasta>$'
+        line: '  signal (receive) peer=podman,'
+        regexp: '^  signal \(receive\) peer=podman,$'
+
+    - name: Reload the fixed pasta AppArmor profile
+      ansible.builtin.command:
+        cmd: apparmor_parser --replace /etc/apparmor.d/usr.bin.pasta
+      changed_when: true
