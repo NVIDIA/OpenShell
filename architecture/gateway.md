@@ -707,7 +707,9 @@ inbound request to provide a parent. gRPC status is recorded when response
 trailers arrive.
 
 The gateway forwards OTLP configuration and W3C trace context to managed
-external drivers. Each driver exports under its own service name.
+external drivers. Built-in drivers use dedicated in-process providers that
+preserve the same RPC trace boundary. Each driver exports to the configured
+collector under its own service name.
 
 Two invariants shape the failure behavior. Telemetry is diagnostic, so no OTLP
 failure stops the gateway from serving: a malformed endpoint is logged at

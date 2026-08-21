@@ -50,7 +50,7 @@ use openshell_core::proto::{
 };
 use openshell_core::{ObjectLabels, ObjectWorkspace};
 #[cfg(all(not(target_os = "windows"), feature = "in-tree-compute-drivers"))]
-use openshell_driver_docker::DockerComputeDriver;
+use openshell_driver_docker::{ComputeDriverService as DockerDriverService, DockerComputeDriver};
 #[cfg(all(not(target_os = "windows"), feature = "in-tree-compute-drivers"))]
 use openshell_driver_kubernetes::{
     ComputeDriverService as KubernetesDriverService, KubernetesComputeDriver,
@@ -724,11 +724,10 @@ impl ComputeRuntime {
         tracing_log_bus: TracingLogBus,
         supervisor_sessions: Arc<SupervisorSessionRegistry>,
     ) -> Result<Self, ComputeError> {
-        let driver: SharedComputeDriver = Arc::new(
-            DockerComputeDriver::new(&config, &docker_config)
-                .await
-                .map_err(|err| ComputeError::Message(err.to_string()))?,
-        );
+        let driver = DockerComputeDriver::new(&config, &docker_config)
+            .await
+            .map_err(|err| ComputeError::Message(err.to_string()))?;
+        let driver: SharedComputeDriver = Arc::new(DockerDriverService::new_in_process(driver));
         Self::from_driver(
             ComputeDriverKind::Docker.as_str().to_string(),
             driver,

@@ -2,6 +2,12 @@
 
 Docker-backed compute driver for local OpenShell gateways.
 
+When the gateway configures `[openshell.gateway.otlp]`, Docker compute-driver
+spans export to the same OTLP/gRPC collector with the service name
+`openshell-driver-docker`. The in-process driver preserves the gateway trace
+context and emits the compute-driver RPC boundary that a standalone driver
+would expose.
+
 The driver manages sandbox containers through the local Docker daemon with the
 `bollard` client. It is intended for developer environments where Docker is
 already available and running Kubernetes would be unnecessary.

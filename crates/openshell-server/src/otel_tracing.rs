@@ -29,12 +29,6 @@ use opentelemetry_sdk::trace::SdkTracerProvider;
 use tracing::Subscriber;
 use tracing_subscriber::registry::LookupSpan;
 
-#[cfg(feature = "in-tree-compute-drivers")]
-const COMPUTE_DRIVER_TARGET_PREFIX: &str =
-    openshell_driver_podman::otel_tracing::IN_PROCESS_TARGET_PREFIX;
-#[cfg(not(feature = "in-tree-compute-drivers"))]
-const COMPUTE_DRIVER_TARGET_PREFIX: &str = "\0";
-
 use crate::config_file::OtlpConfig;
 
 /// `service.name` reported when the config file does not override it.
@@ -92,18 +86,19 @@ pub fn provider_for(cfg: Option<&OtlpConfig>) -> (Option<SdkTracerProvider>, Opt
     openshell_otel::provider_for(cfg.map(trace_config))
 }
 
-/// Build the `tracing` layer that forwards spans to `provider`.
-///
-/// Events stay on the gateway's logging layers. Spans emitted by the
-/// OpenTelemetry crates are excluded to prevent recursive export traffic.
-pub fn layer<S>(provider: &SdkTracerProvider) -> openshell_otel::TargetOtlpLayer<S>
+/// Build the gateway layer while routing one selected in-process driver to
+/// its own tracer provider.
+pub fn layer_excluding_driver<S>(
+    provider: &SdkTracerProvider,
+    driver_target_prefix: Option<&'static str>,
+) -> openshell_otel::TargetOtlpLayer<S>
 where
     S: Subscriber + for<'span> LookupSpan<'span>,
 {
     openshell_otel::layer_excluding_target_prefix(
         provider,
         INSTRUMENTATION_SCOPE,
-        COMPUTE_DRIVER_TARGET_PREFIX,
+        driver_target_prefix,
     )
 }
 
@@ -137,7 +132,8 @@ pub mod test_exporter {
         let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
             .with_simple_exporter(exporter.clone())
             .build();
-        let subscriber = tracing_subscriber::registry().with(super::layer(&provider));
+        let subscriber =
+            tracing_subscriber::registry().with(super::layer_excluding_driver(&provider, None));
         let dispatch = tracing::Dispatch::new(subscriber);
         TracingTestGuard {
             _default: tracing::dispatcher::set_default(&dispatch),
