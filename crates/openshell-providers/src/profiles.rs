@@ -1688,6 +1688,10 @@ pub fn validate_profile_set(
             }
         }
 
+        diagnostics.extend(validate_broker_only_subject_credentials(
+            source, profile_id, profile,
+        ));
+
         let mut env_vars = HashSet::new();
         for credential in &profile.credentials {
             for env_var in &credential.env_vars {
@@ -2518,6 +2522,64 @@ fn validate_token_grant_subject_token(
     }
 
     diagnostics
+}
+
+fn validate_broker_only_subject_credentials(
+    source: &str,
+    profile_id: &str,
+    profile: &ProviderTypeProfile,
+) -> Vec<ProfileValidationDiagnostic> {
+    let subject_credentials = token_exchange_subject_credential_names(profile);
+    if subject_credentials.is_empty() {
+        return Vec::new();
+    }
+
+    let mut diagnostics = Vec::new();
+    for credential in &profile.credentials {
+        let credential_name = credential.name.trim();
+        if !subject_credentials.contains(credential_name) {
+            continue;
+        }
+        if credential_has_workload_injection_metadata(credential) {
+            diagnostics.push(ProfileValidationDiagnostic::error(
+                source,
+                profile_id,
+                "credentials.token_grant.subject_token.credential",
+                format!(
+                    "subject token credential '{credential_name}' is broker-only and cannot declare workload injection metadata"
+                ),
+            ));
+        }
+    }
+    diagnostics
+}
+
+fn token_exchange_subject_credential_names(profile: &ProviderTypeProfile) -> HashSet<&str> {
+    profile
+        .credentials
+        .iter()
+        .filter_map(|credential| credential.token_grant.as_ref())
+        .filter(|token_grant| {
+            effective_token_grant_type(token_grant.grant_type)
+                == ProviderCredentialTokenGrantType::TokenExchange
+        })
+        .filter_map(|token_grant| token_grant.subject_token.as_ref())
+        .filter(|subject_token| subject_token.source.trim() == "provider_credential")
+        .filter_map(|subject_token| {
+            let credential = subject_token.credential.trim();
+            (!credential.is_empty()).then_some(credential)
+        })
+        .collect()
+}
+
+fn credential_has_workload_injection_metadata(credential: &CredentialProfile) -> bool {
+    !credential.env_vars.is_empty()
+        || !credential.auth_style.trim().is_empty()
+        || !credential.header_name.trim().is_empty()
+        || !credential.query_param.trim().is_empty()
+        || !credential.path_template.trim().is_empty()
+        || credential.refresh.is_some()
+        || credential.token_grant.is_some()
 }
 
 fn validate_token_grant_audience_overrides(
@@ -3559,6 +3621,44 @@ credentials:
             diagnostic
                 .message
                 .contains("unknown subject token credential: USER_OIDC_TOKEN")
+        );
+    }
+
+    #[test]
+    fn validate_profile_set_rejects_injectable_token_exchange_subject_credential() {
+        let profile = parse_profile_yaml(
+            r"
+id: injectable-subject-token
+display_name: Injectable Subject Token
+credentials:
+  - name: USER_OIDC_TOKEN
+    auth_style: header
+    header_name: X-Subject-Token
+  - name: access_token
+    auth_style: bearer
+    header_name: Authorization
+    token_grant:
+      grant_type: token_exchange
+      token_endpoint: https://keycloak.example.com/realms/openshell/protocol/openid-connect/token
+      subject_token:
+        source: provider_credential
+        credential: USER_OIDC_TOKEN
+",
+        )
+        .expect("profile should parse");
+
+        let diagnostics = validate_profile_set(&[("injectable.yaml".to_string(), profile)]);
+        let diagnostic = diagnostics
+            .iter()
+            .find(|diagnostic| {
+                diagnostic.field == "credentials.token_grant.subject_token.credential"
+                    && diagnostic.message.contains("broker-only")
+            })
+            .expect("expected broker-only subject token diagnostic");
+        assert!(
+            diagnostic
+                .message
+                .contains("cannot declare workload injection metadata")
         );
     }
 

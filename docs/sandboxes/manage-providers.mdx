@@ -63,7 +63,9 @@ This looks up the current value of `$NVIDIA_API_KEY` in your shell and stores it
 ### From the Current OIDC Login
 
 Profile-backed token-exchange providers can store the current gateway OIDC
-access token as their subject credential:
+access token as their subject credential. The subject credential stays
+gateway-only and is not emitted into sandbox environment material or static
+credential bindings:
 
 ```shell
 openshell provider create \

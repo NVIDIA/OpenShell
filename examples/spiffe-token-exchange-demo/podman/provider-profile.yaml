@@ -12,7 +12,7 @@ description: Dynamic token exchange for local Podman alpha/beta demo services us
 category: other
 credentials:
   - name: subject_token
-    description: Demo user subject token stored on the provider for token exchange
+    description: Demo user subject token stored for gateway-side token exchange only
     required: true
   - name: access_token
     description: Access token obtained via RFC 8693 token exchange

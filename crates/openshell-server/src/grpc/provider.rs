@@ -17,9 +17,9 @@ use crate::provider_profile_sources::{
 use openshell_core::metadata::ObjectWorkspace;
 use openshell_core::proto::{
     CredentialHandle, Provider, ProviderCredentialRefreshStrategy,
-    ProviderCredentialTokenGrantAudienceOverride, ProviderProfile, ProviderProfileCredential,
-    Sandbox, StaticCredentialBinding, StaticCredentialEndpointBinding,
-    StoredProviderCredentialRefreshState,
+    ProviderCredentialTokenGrantAudienceOverride, ProviderCredentialTokenGrantType,
+    ProviderProfile, ProviderProfileCredential, Sandbox, StaticCredentialBinding,
+    StaticCredentialEndpointBinding, StoredProviderCredentialRefreshState,
 };
 use openshell_core::telemetry::{
     LifecycleOperation, ProviderProfile as TelemetryProviderProfile, TelemetryOutcome,
@@ -1098,11 +1098,15 @@ pub(super) async fn resolve_provider_environment_from_records_with_policy_bindin
             normalize_provider_type(&provider.r#type).unwrap_or(provider.r#type.as_str());
         let profile =
             get_provider_type_profile_for_scope(catalog, profile_id, &provider.profile_workspace);
-        let profile_endpoints = profile.as_ref().map(|profile| {
+        let profile_proto = profile.as_ref().map(ProviderTypeProfile::to_proto);
+        let broker_only_credential_keys = profile_proto
+            .as_ref()
+            .map(broker_only_provider_credential_keys)
+            .unwrap_or_default();
+        let profile_endpoints = profile_proto.as_ref().map(|profile| {
             profile
-                .to_proto()
                 .endpoints
-                .into_iter()
+                .iter()
                 .flat_map(|endpoint| {
                     endpoint_ports(endpoint.port, &endpoint.ports)
                         .into_iter()
@@ -1139,7 +1143,9 @@ pub(super) async fn resolve_provider_environment_from_records_with_policy_bindin
         let refresh_epochs = refresh_authorization_epochs_by_key(record)?;
 
         for (key, value) in &provider.credentials {
-            if is_non_injectable_provider_credential(provider, key) {
+            if is_non_injectable_provider_credential(provider, key)
+                || broker_only_credential_keys.contains(key)
+            {
                 warn!(
                     provider_name = %name,
                     key = %key,
@@ -1209,7 +1215,9 @@ pub(super) async fn resolve_provider_environment_from_records_with_policy_bindin
             .resolve_provider_handles(provider, now_ms)
             .await?;
         for (key, value) in resolved_refs.values {
-            if is_non_injectable_provider_credential(provider, &key) {
+            if is_non_injectable_provider_credential(provider, &key)
+                || broker_only_credential_keys.contains(&key)
+            {
                 warn!(
                     provider_name = %name,
                     key = %key,
@@ -1798,7 +1806,7 @@ async fn validate_provider_environment_keys_unique_at(
             &mut seen_credentials,
             &mut seen_plugin_config,
             &provider_name,
-            active_provider_environment_keys(store, &provider, now_ms).await?,
+            active_provider_environment_keys(store, catalog, &provider, now_ms).await?,
             provider_plugin_environment_keys(&provider),
         )?;
         dynamic_bindings.extend(dynamic_token_grant_bindings_for_provider_with_catalog(
@@ -1826,6 +1834,7 @@ async fn validate_provider_environment_records_unique_at(
             &record.name,
             active_provider_environment_keys_for_identity(
                 store,
+                catalog,
                 provider,
                 &record.object_id,
                 now_ms,
@@ -2057,20 +2066,30 @@ fn validate_dynamic_token_grant_bindings_unambiguous(
 
 async fn active_provider_environment_keys(
     store: &Store,
+    catalog: &EffectiveProviderProfileCatalog,
     provider: &Provider,
     now_ms: i64,
 ) -> Result<Vec<String>, Status> {
-    active_provider_environment_keys_for_identity(store, provider, provider.object_id(), now_ms)
-        .await
+    active_provider_environment_keys_for_identity(
+        store,
+        catalog,
+        provider,
+        provider.object_id(),
+        now_ms,
+    )
+    .await
 }
 
 async fn active_provider_environment_keys_for_identity(
     store: &Store,
+    catalog: &EffectiveProviderProfileCatalog,
     provider: &Provider,
     provider_identity: &str,
     now_ms: i64,
 ) -> Result<Vec<String>, Status> {
-    let mut keys = active_provider_credential_keys(provider, now_ms);
+    let broker_only_credential_keys =
+        broker_only_provider_credential_keys_for_provider(catalog, provider);
+    let mut keys = active_provider_credential_keys(provider, now_ms, &broker_only_credential_keys);
     if !provider_identity.is_empty() {
         for state in
             crate::provider_refresh::list_refresh_states_for_provider(store, provider_identity)
@@ -2081,6 +2100,7 @@ async fn active_provider_environment_keys_for_identity(
             keys.extend(
                 std::iter::once(state.credential_key)
                     .chain(state.additional_output_keys.into_values())
+                    .filter(|key| !broker_only_credential_keys.contains(key))
                     .filter(|key| is_valid_env_key(key)),
             );
         }
@@ -2090,11 +2110,16 @@ async fn active_provider_environment_keys_for_identity(
     Ok(keys)
 }
 
-fn active_provider_credential_keys(provider: &Provider, now_ms: i64) -> Vec<String> {
+fn active_provider_credential_keys(
+    provider: &Provider,
+    now_ms: i64,
+    broker_only_credential_keys: &HashSet<String>,
+) -> Vec<String> {
     let mut keys: Vec<String> = provider
         .credentials
         .keys()
         .filter(|key| !is_non_injectable_provider_credential(provider, key))
+        .filter(|key| !broker_only_credential_keys.contains(*key))
         .filter(|key| is_valid_env_key(key))
         .filter(|key| provider_credential_not_expired(provider, key, now_ms))
         .cloned()
@@ -2104,11 +2129,43 @@ fn active_provider_credential_keys(provider: &Provider, now_ms: i64) -> Vec<Stri
             .credential_handles
             .keys()
             .filter(|key| !is_non_injectable_provider_credential(provider, key))
+            .filter(|key| !broker_only_credential_keys.contains(*key))
             .filter(|key| is_valid_env_key(key))
             .filter(|key| provider_credential_not_expired(provider, key, now_ms))
             .cloned(),
     );
     keys
+}
+
+fn broker_only_provider_credential_keys_for_provider(
+    catalog: &EffectiveProviderProfileCatalog,
+    provider: &Provider,
+) -> HashSet<String> {
+    let profile_id = normalize_provider_type(&provider.r#type).unwrap_or(provider.r#type.as_str());
+    get_provider_type_profile_for_scope(catalog, profile_id, &provider.profile_workspace)
+        .as_ref()
+        .map(ProviderTypeProfile::to_proto)
+        .map(|profile| broker_only_provider_credential_keys(&profile))
+        .unwrap_or_default()
+}
+
+fn broker_only_provider_credential_keys(profile: &ProviderProfile) -> HashSet<String> {
+    profile
+        .credentials
+        .iter()
+        .filter_map(|credential| credential.token_grant.as_ref())
+        .filter(|token_grant| {
+            ProviderCredentialTokenGrantType::try_from(token_grant.grant_type).is_ok_and(
+                |grant_type| grant_type == ProviderCredentialTokenGrantType::TokenExchange,
+            )
+        })
+        .filter_map(|token_grant| token_grant.subject_token.as_ref())
+        .filter(|subject_token| subject_token.source.trim() == "provider_credential")
+        .filter_map(|subject_token| {
+            let key = subject_token.credential.trim();
+            (!key.is_empty()).then(|| key.to_string())
+        })
+        .collect()
 }
 
 fn provider_credential_not_expired(provider: &Provider, key: &str, now_ms: i64) -> bool {
@@ -2159,10 +2216,10 @@ use openshell_core::proto::{
     GetProviderRequest, ImportProviderProfilesRequest, ImportProviderProfilesResponse,
     LintProviderProfilesRequest, LintProviderProfilesResponse, ListProviderProfilesRequest,
     ListProviderProfilesResponse, ListProvidersRequest, ListProvidersResponse,
-    ProviderCredentialTokenGrantType, ProviderProfileDiagnostic, ProviderProfileImportItem,
-    ProviderProfileResponse, ProviderResponse, RotateProviderCredentialRequest,
-    RotateProviderCredentialResponse, StoredProviderProfile, UpdateProviderProfilesRequest,
-    UpdateProviderProfilesResponse, UpdateProviderRequest,
+    ProviderProfileDiagnostic, ProviderProfileImportItem, ProviderProfileResponse,
+    ProviderResponse, RotateProviderCredentialRequest, RotateProviderCredentialResponse,
+    StoredProviderProfile, UpdateProviderProfilesRequest, UpdateProviderProfilesResponse,
+    UpdateProviderRequest,
 };
 use openshell_core::spiffe::{
     JwtSvidParseError, SpiffeJwtClaims, parse_unverified_jwt_svid_claims,
@@ -11997,7 +12054,11 @@ mod tests {
             .await
             .unwrap();
 
-        let keys = active_provider_environment_keys(state.store.as_ref(), &provider, 0)
+        let catalog = ProviderProfileSources::with_default_sources()
+            .snapshot_catalog(state.store.as_ref(), "default")
+            .await
+            .unwrap();
+        let keys = active_provider_environment_keys(state.store.as_ref(), &catalog, &provider, 0)
             .await
             .unwrap();
         assert!(keys.contains(&"AWS_ACCESS_KEY_ID".to_string()));

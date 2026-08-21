@@ -14,7 +14,8 @@ The demo deploys three in-cluster workloads:
 
 The OpenShell provider profile in `provider-profile.yaml` declares a stored
 `subject_token` credential and a runtime `access_token` credential with
-`token_grant.grant_type: token_exchange`.
+`token_grant.grant_type: token_exchange`. The subject token is stored for
+gateway-side exchange only and is not injected into the sandbox environment.
 
 The profile declares exact Kubernetes service hostnames for `alpha-exchange`
 and `beta-exchange`. It intentionally does not set `allowed_ips`, because
