@@ -1699,7 +1699,7 @@ impl KubernetesComputeDriver {
             KUBE_API_TIMEOUT,
             deployments.patch(
                 &names.supervisor_deployment,
-                &PatchParams::apply("openshell-driver-kubernetes").force(),
+                &PatchParams::default(),
                 &Patch::Merge(&patch),
             ),
         )

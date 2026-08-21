@@ -47,9 +47,10 @@ built-in `nonroot-v2` SCC and needs a gated Helm grant, not a custom SCC.
 
 Validation confirmed the security model works as designed on OpenShift —
 unproxied egress denied, proxied egress policy-evaluated, resources
-garbage-collected — and surfaced two usability gaps that block adoption: the
-user-supplied workload command is silently discarded, and sandboxes never leave
-the `Provisioning` phase.
+garbage-collected — and surfaced two adoption blockers, both since fixed and
+re-verified: sandboxes never left the `Provisioning` phase because readiness
+was gated on a supervisor session this topology cannot have, and the workload
+container had no way to be given a long-running command.
 
 ## Motivation
 
@@ -375,42 +376,68 @@ better operational default for latency-sensitive agents; `required` risks
 unschedulable pairs under node pressure. The default is left at `disabled` in
 this RFC but is a reasonable thing for reviewers to push back on.
 
-### Two gaps that block usability
+### Readiness without a supervisor session
 
-Cluster validation surfaced two problems that are not OpenShift-specific and
-that this RFC treats as required work, not follow-ups.
+`SandboxPhase::Ready` was reachable only through a live `ConnectSupervisor`
+session. That session is opened solely by `openshell-supervisor-process`, and
+its `GatewayMessage` payload is relays — `RelayOpen`/`RelayClose` — plus session
+control and heartbeats. So `Ready` has meant "the gateway can open relays into
+this sandbox," which for `proxy-pod` will never be true and should not be.
 
-**The workload command has nowhere to go.** In `combined` and `sidecar` the
-agent container's command is the supervisor binary, and the user's command
-reaches the workload through the gateway session. `proxy-pod` has no supervisor
-and no session, and `DriverSandboxTemplate` carries no `command`/`args` field at
-all, so `openshell sandbox create -- <cmd>` is accepted and then silently
-discarded. Worse, OpenShell's own sandbox images have `/bin/bash` as their
-entrypoint, which under kubelet with no TTY reads EOF and exits 0 immediately —
-so the default image produces a `CrashLoopBackOff` with empty logs. Verified: a
-`proxy-pod` sandbox on the stock base image crashlooped, and only an image with
-a genuinely long-running entrypoint stayed up.
+Left alone, this made the topology unusable: on OpenShift both pods ran and
+policy-enforced egress worked end to end while the sandbox reported
+`Provisioning` indefinitely, and every `Ready`-gated RPC — including `stop` and
+`start` — was unreachable.
 
-Options are to add `command`/`args` to `DriverSandboxTemplate` (a proto change
-affecting every driver), to accept them through the Kubernetes driver's
-`platform_config` passthrough (driver-local, no proto change), or to reject the
-combination at the API boundary. At minimum the gateway must not silently
-discard a command the user supplied.
+This RFC proposes making the readiness contract explicit rather than implied. A
+`SupervisorSessionModel` on `DriverSandboxStatus` lets a driver declare that a
+sandbox has no in-sandbox process supervisor. `UNSPECIFIED` preserves the
+existing behavior, so drivers that never set it are unaffected; the Kubernetes
+driver reports `NONE` for `proxy-pod` and `REQUIRED` otherwise. The gateway then
+derives readiness for such sandboxes from the backend conditions alone.
 
-**Sandboxes never reach `Ready`.** The gateway drives the `Ready` transition
-from the supervisor session, which the process supervisor in the agent
-container opens. `proxy-pod` has no process supervisor, so nothing opens that
-session and the sandbox sits in `Provisioning` forever — even though the
-Kubernetes `Sandbox` CR reports `Ready`/`DependenciesReady`, both pods are
-running, and policy-enforced egress works end to end. Every `Ready`-gated RPC
-is then unreachable: `sandbox stop` fails with *"sandbox must be Ready to stop
-(current phase: Provisioning)"*, which in turn makes the supervisor scale-down
-proposed above unreachable in practice.
+Two consequences fall out of that and are part of the proposal:
 
-This needs a readiness path that does not assume an in-pod process supervisor —
-most naturally the network supervisor reporting readiness for its paired
-sandbox once its proxy is serving, since it already holds the gateway
-credentials and polls for policy.
+**Readiness must not become a lie.** With the session gate removed, `Ready`
+follows the agent pod, which says nothing about whether the paired supervisor is
+serving. A pod could be Ready with no egress path at all. The agent pod
+therefore gains a `wait-for-proxy` init container that blocks until the paired
+supervisor accepts connections on its proxy port, so pod readiness transitively
+means egress works. This also closes a pre-existing ordering gap where the
+workload could start before the proxy existed and its early requests simply
+failed.
+
+**Relay-backed RPCs must fail honestly.** Once such sandboxes reach `Ready`,
+`exec`, `connect`, port forwarding, and file transfer would pass their readiness
+checks and then wait out a session timeout that cannot succeed. The same
+declaration lets the gateway reject them immediately with an error naming the
+topology.
+
+### Running a workload with no supervisor to launch it
+
+`proxy-pod` runs the sandbox image directly. Nothing supplies a command: the
+initial command from `openshell sandbox create -- <cmd>` is delivered over the
+supervisor session as an exec/SSH session after `Ready`, which this topology
+does not have, and `DriverSandboxTemplate` has no `command`/`args` field.
+
+That is tolerable for images built to run a workload, but OpenShell's own
+sandbox images use an interactive shell entrypoint. Under kubelet with no TTY it
+reads EOF and exits 0, so the stock image produces a `CrashLoopBackOff` with
+empty logs — verified on OpenShift, where only an image with a genuinely
+long-running entrypoint stayed up.
+
+This RFC proposes accepting `containers.agent.command` and
+`containers.agent.args` through the Kubernetes driver's existing `driver_config`
+passthrough, alongside `resources` and `volume_mounts`. That needs no public API
+change and reuses the documented escape hatch for driver-specific settings. The
+fields are rejected in `combined` and `sidecar`, where the driver replaces the
+container command with the supervisor binary and an override would be accepted
+and then silently dropped.
+
+Adding `command`/`args` to the public `SandboxTemplate` remains the more
+discoverable long-term answer, but it forces a semantic decision — the field is
+genuinely inapplicable to topologies where the supervisor is the entrypoint — and
+is deferred rather than resolved here.
 
 ### Feature availability
 
@@ -460,11 +487,22 @@ chart, then deployed to OpenShift 4.22.6 / OVN-Kubernetes. Measured results:
 | Policy-denied host through the proxy | pass, 403 at CONNECT |
 | Policy-allowed host through the proxy | pass, HTTP 200 with the generated CA trusted |
 | All resources reclaimed on delete | pass |
-| Sandbox reaches `Ready` | **fail** — stuck in `Provisioning` |
-| `sandbox stop` / `start` | **blocked** by the `Ready` gate |
+| Sandbox reaches `Ready` | pass, after the `SupervisorSessionModel` change |
+| `wait-for-proxy` init container gates pod readiness | pass |
+| Relay RPCs rejected with a topology error | pass, 43ms rather than a timeout |
+| `sandbox stop` scales the supervisor to zero | pass |
+| `sandbox start` scales it back and returns to service | pass |
+| Stock sandbox image runs via `containers.agent.command` | pass, previously `CrashLoopBackOff` |
+
+Cluster testing also caught a bug the unit tests could not: the stop, start,
+and delete paths derived per-sandbox resource names from the `Sandbox` CR name
+rather than the sandbox name, which differ (`default--rdy` versus `rdy`). The
+scale-down silently patched a Deployment that does not exist, and delete was
+affected too but owner-reference garbage collection reclaimed the resources and
+hid it.
 
 The remaining work is documenting the OpenShift path in
-`docs/kubernetes/openshift.mdx` and closing the two gaps above.
+`docs/kubernetes/openshift.mdx`.
 
 **Phase 4 — test strategy.** The branch adds `mise run e2e:kubernetes:proxy-pod`,
 but its `PROXY_POD_E2E` flag currently only prints warnings — it gates nothing.
@@ -494,10 +532,8 @@ whose failure mode is invisible.
 properties may not anticipate that `openshell sandbox exec` and `connect` simply
 stop working. The gateway should reject those RPCs for `proxy-pod` sandboxes
 with an actionable error naming the topology, rather than failing obscurely.
-The observed behavior today is worse than obscure: a working sandbox reports
-`Provisioning` indefinitely and a supplied command is discarded without a
-warning, so the failure looks like a broken deployment rather than an
-intentional topology limit.
+This is now the behavior: relay-backed RPCs are rejected immediately with an
+error naming the topology and pointing at `combined` or `sidecar`.
 
 **Resource multiplication.** Every sandbox becomes two pods plus three
 supporting objects. At scale this doubles pod count, doubles scheduling
@@ -581,14 +617,16 @@ non-default DNS deployments. Configuration handles every case with no new RBAC.
 - Should a startup fence-verification probe be a **requirement** for graduating
   `proxy-pod` out of experimental, given that the failure mode of a
   non-enforcing CNI is silent?
-- Should the network supervisor own the `Ready` transition for its paired
-  sandbox, or should the gateway derive `Ready` from the `Sandbox` CR conditions
-  when the topology has no process supervisor?
-- Should the workload command reach the container through a new
-  `DriverSandboxTemplate` field or through the Kubernetes driver's
-  `platform_config` passthrough?
+- Should `command`/`args` graduate from the Kubernetes `driver_config`
+  passthrough to the public `SandboxTemplate`, and if so what do they mean in
+  topologies where the supervisor is the container entrypoint?
+- Should `openshell sandbox create -- <cmd>` be reinterpreted as the container
+  command in topologies with no session, rather than failing to deliver it?
 - Should OpenShell publish a `proxy-pod`-suitable sandbox image with a
-  long-running entrypoint, given that the current images crashloop here?
+  long-running entrypoint, so the default path works without `driver_config`?
+- Should a future `SupervisorSessionModel` variant carry a capability list, so
+  the gateway can gate individual RPCs rather than treating relays as
+  all-or-nothing?
 - Should `affinity` default to `preferred` rather than `disabled`, given that
   the default sends all workload egress across nodes?
 - Should the gateway reject `exec`/`connect`/`upload`/`sync` for `proxy-pod`
