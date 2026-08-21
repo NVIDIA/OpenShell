@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # Render-coverage overlay for cert-manager issuing the server certificate from
-# an external Issuer/ClusterIssuer (e.g. a real ACME issuer), plus an
+# an external Issuer/ClusterIssuer (e.g. a real LetsEncrypt/ACME issuer), plus an
 # OpenShift Route with TLS passthrough. Merge after values.yaml:
 #   helm lint deploy/helm/openshell -f ci/values-openshift-route-cert-manager.yaml
 #

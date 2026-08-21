@@ -347,8 +347,14 @@ server:
   tls:
     # -- K8s secret (type kubernetes.io/tls) with tls.crt and tls.key for the server.
     certSecretName: openshell-server-tls
+    # -- Enable mTLS client certificate authentication. When false, the gateway
+    # runs HTTPS-only without requiring client certificates (use OIDC for auth
+    # instead). Must be false when using BackendTLSPolicy because ingress
+    # proxies cannot present client certificates to the backend.
+    enableMtls: true
     # -- K8s secret with ca.crt for client certificate verification (mTLS).
-    # Set to "" to disable mTLS and run HTTPS-only (use OIDC for auth instead).
+    # Only used when enableMtls is true. Set to "" to use the default client CA
+    # (from pkiInitJob or cert-manager).
     clientCaSecretName: openshell-server-client-ca
     # -- K8s secret mounted into sandbox pods for mTLS to the server.
     clientTlsSecretName: openshell-client-tls
@@ -440,6 +446,23 @@ pkiInitJob:
   serverDnsNames: []
   # -- Extra IP SANs to append to the server certificate.
   serverIpAddresses: []
+  # -- Maximum time in seconds for the certgen hook to poll for cert-manager
+  # certificates. When using cert-manager with BackendTLSPolicy, the hook
+  # polls for this many seconds waiting for the certificate to be issued,
+  # then creates the backend CA ConfigMap. The Job deadline is set to
+  # (timeoutSeconds + 30) to allow time for ConfigMap creation and cleanup.
+  # Increase this if cert-manager takes longer than 120 seconds to issue
+  # certificates.
+  timeoutSeconds: 120
+  # -- Fail the helm install/upgrade if cert-manager does not issue the
+  # certificate within the polling timeout. When true (default), the install
+  # fails immediately if the timeout is reached, providing clear feedback that
+  # BackendTLSPolicy is non-functional. When false, the hook succeeds with a
+  # warning and you can run `helm upgrade` after cert-manager issues the
+  # certificate to create the backend CA ConfigMap. If you set this to false and
+  # see "TLS error: Secret is not supplied by SDS" when connecting to the gateway,
+  # check if the TLS secret exists and run `helm upgrade` to create the ConfigMap.
+  failOnTimeout: true
 
 # cert-manager Certificate/Issuer resources (requires cert-manager CRDs in-cluster).
 # Does not install cert-manager itself.
@@ -451,7 +474,7 @@ certManager:
   # -- Secret created for the intermediate CA (Certificate with isCA: true).
   caSecretName: openshell-ca-tls
   # -- Override the issuerRef for the external server Certificate (e.g. a real
-  # ACME ClusterIssuer for a publicly-trusted cert on an external hostname).
+  # LetsEncrypt/ACME ClusterIssuer for a publicly-trusted cert on an external hostname).
   # When set, the chart creates a second server certificate from this issuer
   # with only the hostnames in serverDnsNames; the internal server certificate
   # is always signed by the chart's own CA. Leave name empty to use the chart
@@ -525,6 +548,36 @@ grpcRoute:
         # or the existing openshell-server-tls Secret (its SANs must include the
         # external hostname).
         certificateRefs: []
+  # BackendTLSPolicy for end-to-end TLS between the Gateway proxy and the
+  # OpenShell gateway pod. When enabled, the Gateway proxy terminates
+  # client-facing TLS at the listener and re-encrypts when connecting to the
+  # backend service, validating the backend's certificate against the
+  # specified CA. Requires the gateway pod to serve TLS (server.disableTls
+  # must be false). Supported on OpenShift 4.22+ and other platforms with
+  # BackendTLSPolicy support in the Gateway API implementation.
+  backendTLSPolicy:
+    # -- Create a BackendTLSPolicy resource for end-to-end TLS between the
+    # Gateway proxy and the OpenShell gateway pod. The traffic flow is:
+    # client → HTTPS → Gateway (terminate) → TLS (re-encrypt) → gateway pod.
+    # Requires server.disableTls=false and server.tls.enableMtls=false. The
+    # certgen hook auto-creates the backend CA ConfigMap.
+    enabled: false
+    # -- Name of the ConfigMap containing the CA certificate (key: ca.crt) used
+    # to validate the gateway pod's TLS certificate. Defaults to
+    # <fullname>-backend-ca when empty. The certgen hook auto-creates this:
+    # with pkiInitJob (default), immediately on install/upgrade; with
+    # cert-manager, the hook polls for pkiInitJob.timeoutSeconds seconds
+    # waiting for cert-manager to issue the server certificate, then creates the
+    # ConfigMap. A single install usually succeeds; if cert-manager takes longer,
+    # increase pkiInitJob.timeoutSeconds. By default (pkiInitJob.failOnTimeout=true),
+    # the install fails if the timeout is reached; set failOnTimeout=false to allow
+    # the install to succeed and run `helm upgrade` after the certificate is issued.
+    caCertificateConfigMapName: ""
+    # -- Hostname the Gateway proxy validates against the backend's TLS
+    # certificate SAN. Defaults to the service FQDN
+    # (<fullname>.<namespace>.svc.cluster.local) when empty, which matches
+    # the SAN included by both cert-manager and the pkiInitJob.
+    hostname: ""
 
 # OpenShift Route with TLS passthrough. The gateway terminates its own
 # TLS/mTLS; the router only forwards based on SNI, so it never sees plaintext

@@ -120,8 +120,9 @@ helm upgrade --install openshell \
   --set grpcRoute.gateway.listener.port=443 \
   --set 'grpcRoute.gateway.listener.tls.certificateRefs[0].name=openshell-ingress-tls' \
   --set server.disableTls=true \
-  --set server.oidc.issuer=https://<issuer> \
-  --set 'grpcRoute.hostnames[0]=<external-hostname>'
+  --set server.oidc.issuer=https://keycloak.example.com/realms/openshell \
+  --set server.oidc.audience=openshell-cli \
+  --set 'grpcRoute.hostnames[0]=gateway.example.com'
 ```
 
 Keep the certificate Secret in the release namespace. Referencing a Secret in another namespace requires a `ReferenceGrant`.
@@ -129,11 +130,78 @@ Keep the certificate Secret in the release namespace. Referencing a Secret in an
 ### Register over HTTPS
 
 ```shell
-openshell gateway add https://<external-hostname> --name production --oidc-issuer https://<issuer>
+openshell gateway add https://gateway.example.com \
+  --name production \
+  --oidc-issuer https://keycloak.example.com/realms/openshell \
+  --oidc-client-id openshell-cli
 openshell status
 ```
 
 See [Authentication](/kubernetes/setup) for OIDC issuer, audience, and roles configuration.
+
+## End-to-end TLS (BackendTLSPolicy)
+
+As an alternative to the plaintext backend path above, the chart can create a `BackendTLSPolicy` that tells the Gateway proxy to re-encrypt traffic when connecting to the OpenShell gateway pod:
+
+```text
+client → HTTPS → Gateway (terminate TLS) → TLS (re-encrypt) → openshell gateway pod
+```
+
+This keeps TLS on the gateway pod rather than disabling it with `server.disableTls=true`. The Gateway proxy validates the backend's certificate against a CA ConfigMap that the certgen hook auto-creates.
+
+BackendTLSPolicy is a standard Gateway API resource. It is supported on OpenShift 4.22+ (via the OpenShift gateway controller) and on other platforms where the Gateway API implementation supports it (check your controller's documentation).
+
+### Install with e2e TLS
+
+The certgen hook automatically creates the backend CA ConfigMap when `backendTLSPolicy` is enabled:
+
+```shell
+helm upgrade --install openshell \
+  oci://ghcr.io/nvidia/openshell/helm-chart \
+  --version <version> \
+  --namespace openshell \
+  --set server.tls.enableMtls=false \
+  --set grpcRoute.enabled=true \
+  --set grpcRoute.gateway.create=true \
+  --set grpcRoute.gateway.className=eg \
+  --set grpcRoute.gateway.listener.protocol=HTTPS \
+  --set grpcRoute.gateway.listener.port=443 \
+  --set 'grpcRoute.gateway.listener.tls.certificateRefs[0].name=openshell-ingress-tls' \
+  --set grpcRoute.backendTLSPolicy.enabled=true \
+  --set server.oidc.issuer=https://keycloak.example.com/realms/openshell \
+  --set server.oidc.audience=openshell-cli \
+  --set 'grpcRoute.hostnames[0]=gateway.example.com'
+```
+
+Note that `server.disableTls` is **not** set — the gateway pod continues to serve TLS — but `server.tls.enableMtls=false` disables mTLS client certificate authentication because the Gateway proxy cannot present a client certificate to the backend. The chart will fail the install if you try to enable both `grpcRoute.backendTLSPolicy.enabled=true` and `server.tls.enableMtls=true` simultaneously. The BackendTLSPolicy hostname defaults to the service FQDN, which matches the SAN on the server certificate. Use OIDC for authentication (configured via `server.oidc.issuer`).
+
+The example above uses the default `pkiInitJob` for TLS, which creates the backend CA ConfigMap immediately. If using cert-manager instead (`--set certManager.enabled=true`), the Certificate resources are created first (as pre-install hooks with weight -30), then the certgen hook runs (weight -20) and polls for up to 120 seconds waiting for cert-manager to issue the server certificate, then creates the backend CA ConfigMap from it. This means a single `helm install` is sufficient in most cases. 
+
+If cert-manager takes longer than 120 seconds to issue certificates, increase the polling timeout with `--set pkiInitJob.timeoutSeconds=<seconds>`. The hook polls for exactly this many seconds. For example, `timeoutSeconds=180` polls for 180 seconds. By default (`pkiInitJob.failOnTimeout=true`), the install fails if the timeout is reached, providing clear feedback that the BackendTLSPolicy is non-functional.
+
+### Troubleshooting
+
+If you see the error `remote connection failure, transport failure reason: TLS error: Secret is not supplied by SDS` when connecting through the Gateway:
+
+1. Check if the backend CA ConfigMap exists:
+   ```shell
+   kubectl get configmap <release-name>-backend-ca -n <namespace>
+   ```
+
+2. If the ConfigMap is missing, verify the TLS secret exists:
+   ```shell
+   kubectl get secret <release-name>-server-tls -n <namespace>
+   ```
+
+3. If the secret exists but the ConfigMap doesn't, run `helm upgrade` to create it:
+   ```shell
+   helm upgrade <release-name> oci://ghcr.io/nvidia/openshell/helm-chart \
+     --reuse-values --namespace <namespace>
+   ```
+
+This situation can occur if you set `pkiInitJob.failOnTimeout=false` and cert-manager issued the certificate after the hook timed out.
+
+For OpenShift 4.22+, see [OpenShift](/kubernetes/openshift#end-to-end-tls-openshift-422) for platform-specific instructions including Gateway and GatewayClass setup.
 
 ## SSH Relay
 

@@ -48,6 +48,9 @@ helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart --version <vers
   --set securityContext.runAsUser=null
 ```
 
+On OpenShift 4.22+, end-to-end TLS is supported via `BackendTLSPolicy`. See the
+[OpenShift install guide](https://docs.nvidia.com/openshell/latest/kubernetes/openshift#end-to-end-tls-openshift-422) for details.
+
 ## Available versions
 
 | Tag | Source | Notes |
@@ -168,8 +171,11 @@ add `ci/values-spire.yaml` to the OpenShell release values files.
 | certManager.enabled | bool | `false` | Create cert-manager Issuer and Certificate resources. When enabled, cert-manager owns TLS and the chart runs a JWT-only certgen hook to create the sandbox JWT signing Secret that cert-manager does not manage. |
 | certManager.serverDnsNames | list | `["openshell","openshell.openshell.svc","openshell.openshell.svc.cluster.local","localhost","openshell.localhost","*.openshell.localhost","host.docker.internal"]` | DNS SANs on the cert-manager-issued server certificate. |
 | certManager.serverIpAddresses | list | `["127.0.0.1"]` | IP SANs on the cert-manager-issued server certificate. |
-| certManager.serverIssuerRef | object | `{"group":"","kind":"","name":""}` | Override the issuerRef for the external server Certificate (e.g. a real ACME ClusterIssuer for a publicly-trusted cert on an external hostname). When set, the chart creates a second server certificate from this issuer with only the hostnames in serverDnsNames; the internal server certificate is always signed by the chart's own CA. Leave name empty to use the chart CA for all server certificates (default). Requires certManager.enabled=true. |
+| certManager.serverIssuerRef | object | `{"group":"","kind":"","name":""}` | Override the issuerRef for the external server Certificate (e.g. a real LetsEncrypt/ACME ClusterIssuer for a publicly-trusted cert on an external hostname). When set, the chart creates a second server certificate from this issuer with only the hostnames in serverDnsNames; the internal server certificate is always signed by the chart's own CA. Leave name empty to use the chart CA for all server certificates (default). Requires certManager.enabled=true. |
 | fullnameOverride | string | `""` | Override the full generated resource name. |
+| grpcRoute.backendTLSPolicy.caCertificateConfigMapName | string | `""` | Name of the ConfigMap containing the CA certificate (key: ca.crt) used to validate the gateway pod's TLS certificate. Defaults to <fullname>-backend-ca when empty. The certgen hook auto-creates this: with pkiInitJob (default), immediately on install/upgrade; with cert-manager, the hook polls for pkiInitJob.timeoutSeconds seconds waiting for cert-manager to issue the server certificate, then creates the ConfigMap. A single install usually succeeds; if cert-manager takes longer, increase pkiInitJob.timeoutSeconds. By default (pkiInitJob.failOnTimeout=true), the install fails if the timeout is reached; set failOnTimeout=false to allow the install to succeed and run `helm upgrade` after the certificate is issued. |
+| grpcRoute.backendTLSPolicy.enabled | bool | `false` | Create a BackendTLSPolicy resource for end-to-end TLS between the Gateway proxy and the OpenShell gateway pod. The traffic flow is: client → HTTPS → Gateway (terminate) → TLS (re-encrypt) → gateway pod. Requires server.disableTls=false and server.tls.enableMtls=false. The certgen hook auto-creates the backend CA ConfigMap. |
+| grpcRoute.backendTLSPolicy.hostname | string | `""` | Hostname the Gateway proxy validates against the backend's TLS certificate SAN. Defaults to the service FQDN (<fullname>.<namespace>.svc.cluster.local) when empty, which matches the SAN included by both cert-manager and the pkiInitJob. |
 | grpcRoute.enabled | bool | `false` | Create a Gateway API GRPCRoute for the gateway service. |
 | grpcRoute.gateway.className | string | `"eg"` | GatewayClass to reference. Envoy Gateway installs one named "eg". |
 | grpcRoute.gateway.create | bool | `false` | When true, a Gateway resource is created in the release namespace. Set to false and provide name/namespace to attach to a pre-existing Gateway. |
@@ -191,8 +197,10 @@ add `ci/values-spire.yaml` to the OpenShell release values files.
 | openshiftRoute.enabled | bool | `false` | Create an OpenShift Route with TLS passthrough. |
 | openshiftRoute.host | string | `""` | Hostname for the Route. Must match a SAN on the gateway's server cert. |
 | pkiInitJob.enabled | bool | `true` | Run a pre-install/pre-upgrade Job that creates gateway and client mTLS Secrets. When certManager.enabled=true, cert-manager owns TLS and this same hook runs in JWT-only mode even if pkiInitJob.enabled remains true. |
+| pkiInitJob.failOnTimeout | bool | `true` | Fail the helm install/upgrade if cert-manager does not issue the certificate within the polling timeout. When true (default), the install fails immediately if the timeout is reached, providing clear feedback that BackendTLSPolicy is non-functional. When false, the hook succeeds with a warning and you can run `helm upgrade` after cert-manager issues the certificate to create the backend CA ConfigMap. If you set this to false and see "TLS error: Secret is not supplied by SDS" when connecting to the gateway, check if the TLS secret exists and run `helm upgrade` to create the ConfigMap. |
 | pkiInitJob.serverDnsNames | list | `[]` | Extra DNS SANs to append to the server certificate. |
 | pkiInitJob.serverIpAddresses | list | `[]` | Extra IP SANs to append to the server certificate. |
+| pkiInitJob.timeoutSeconds | int | `120` | Maximum time in seconds for the certgen hook to poll for cert-manager certificates. When using cert-manager with BackendTLSPolicy, the hook polls for this many seconds waiting for the certificate to be issued, then creates the backend CA ConfigMap. The Job deadline is set to (timeoutSeconds + 30) to allow time for ConfigMap creation and cleanup. Increase this if cert-manager takes longer than 120 seconds to issue certificates. |
 | podAnnotations | object | `{}` | Extra annotations to add to the gateway pod. |
 | podLabels | object | `{}` | Extra labels to add to the gateway pod. |
 | podLifecycle.terminationGracePeriodSeconds | int | `5` | Grace period, in seconds, before Kubernetes terminates the gateway pod. |
@@ -270,8 +278,9 @@ add `ci/values-spire.yaml` to the OpenShell release values files.
 | server.sandboxNamespace | string | `""` | Namespace where sandbox pods are created. Defaults to the Helm release namespace (.Release.Namespace) when left empty. |
 | server.telemetryEnabled | bool | `true` | Enable anonymous OpenShell telemetry from the gateway and the sandbox supervisors it launches. |
 | server.tls.certSecretName | string | `"openshell-server-tls"` | K8s secret (type kubernetes.io/tls) with tls.crt and tls.key for the server. |
-| server.tls.clientCaSecretName | string | `"openshell-server-client-ca"` | K8s secret with ca.crt for client certificate verification (mTLS). Set to "" to disable mTLS and run HTTPS-only (use OIDC for auth instead). |
+| server.tls.clientCaSecretName | string | `"openshell-server-client-ca"` | K8s secret with ca.crt for client certificate verification (mTLS). Only used when enableMtls is true. Set to "" to use the default client CA (from pkiInitJob or cert-manager). |
 | server.tls.clientTlsSecretName | string | `"openshell-client-tls"` | K8s secret mounted into sandbox pods for mTLS to the server. |
+| server.tls.enableMtls | bool | `true` | Enable mTLS client certificate authentication. When false, the gateway runs HTTPS-only without requiring client certificates (use OIDC for auth instead). Must be false when using BackendTLSPolicy because ingress proxies cannot present client certificates to the backend. |
 | server.workspaceDefaultStorageSize | string | `""` | Default storage size for the workspace PVC in sandbox pods. Uses Kubernetes quantity syntax (e.g. "2Gi", "10Gi", "500Mi"). Empty = built-in default (2Gi). |
 | server.workspaceStorageClass | string | `""` | Kubernetes StorageClass for the workspace PVC in sandbox pods. Empty (default) = omit storageClassName, using the cluster's default StorageClass. Set this on clusters with no default StorageClass, otherwise the workspace PVC stays Pending and the sandbox never starts. |
 | service.healthPort | int | `8081` | Gateway health service port. |
