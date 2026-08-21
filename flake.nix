@@ -68,6 +68,9 @@
           glibc-2-28 = import ./nix/devShells/glibc-2-28.nix {
             inherit pkgs rust-overlay commonDevShellPackages;
           };
+          musl = import ./nix/devShells/musl.nix {
+            inherit pkgs rust-overlay commonDevShellPackages;
+          };
         };
 
         formatter = treefmtEval.config.build.wrapper;
