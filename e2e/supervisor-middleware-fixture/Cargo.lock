@@ -1105,6 +1105,7 @@ dependencies = [
  "prost-types",
  "protoc-bin-vendored",
  "reqwest",
+ "rustix",
  "serde",
  "serde_json",
  "thiserror 2.0.19",
