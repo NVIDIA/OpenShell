@@ -74,7 +74,6 @@ COPY proto/ proto/
 RUN mkdir -p crates/openshell-cli/src crates/openshell-core/src crates/openshell-ocsf/src crates/openshell-policy/src crates/openshell-providers/src crates/openshell-prover/src crates/openshell-router/src crates/openshell-sandbox/src crates/openshell-server/src crates/openshell-bootstrap/src crates/openshell-tui/src && \
     echo "fn main() {}" > crates/openshell-cli/src/main.rs && \
     echo "fn main() {}" > crates/openshell-sandbox/src/main.rs && \
-    echo "fn main() {}" > crates/openshell-server/src/main.rs && \
     touch crates/openshell-core/src/lib.rs && \
     touch crates/openshell-ocsf/src/lib.rs && \
     touch crates/openshell-providers/src/lib.rs && \
@@ -106,7 +105,7 @@ RUN touch crates/openshell-cli/src/main.rs \
     crates/openshell-providers/src/lib.rs \
     crates/openshell-router/src/lib.rs \
     crates/openshell-sandbox/src/main.rs \
-    crates/openshell-server/src/main.rs \
+    crates/openshell-server/src/lib.rs \
     crates/openshell-core/build.rs \
     proto/*.proto
 

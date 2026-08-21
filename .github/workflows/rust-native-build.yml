@@ -123,7 +123,7 @@ jobs:
 
           case "$COMPONENT" in
             gateway)
-              crate=openshell-server
+              crate=openshell-gateway
               binary=openshell-gateway
               zig_target=
               ;;

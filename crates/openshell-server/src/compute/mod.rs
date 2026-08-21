@@ -5,17 +5,6 @@
 
 pub mod driver_config;
 pub mod lease;
-#[cfg(all(not(target_os = "windows"), feature = "in-tree-compute-drivers"))]
-pub mod vm;
-
-#[cfg(all(not(target_os = "windows"), feature = "in-tree-compute-drivers"))]
-pub use openshell_driver_docker::DockerComputeConfig;
-#[cfg(all(not(target_os = "windows"), feature = "in-tree-compute-drivers"))]
-pub use openshell_driver_kubernetes::KubernetesComputeConfig;
-#[cfg(all(not(target_os = "windows"), feature = "in-tree-compute-drivers"))]
-pub use openshell_driver_podman::PodmanComputeConfig;
-#[cfg(all(not(target_os = "windows"), feature = "in-tree-compute-drivers"))]
-pub use vm::VmComputeConfig;
 
 use crate::grpc::policy::SANDBOX_SETTINGS_OBJECT_TYPE;
 use crate::otel_tracing::TraceContextInterceptor;
@@ -30,7 +19,6 @@ use crate::tracing_bus::TracingLogBus;
 use futures::{Stream, StreamExt};
 #[cfg(unix)]
 use hyper_util::rt::TokioIo;
-use openshell_core::ComputeDriverKind;
 use openshell_core::proto::compute::v1::{
     CreateSandboxRequest, DeleteSandboxRequest, DeleteWorkspaceRequest, DeleteWorkspaceResponse,
     DriverCondition, DriverPlatformEvent, DriverResourceRequirements, DriverSandbox,
@@ -48,16 +36,8 @@ use openshell_core::proto::{
     PlatformEvent, Sandbox, SandboxCondition, SandboxPhase, SandboxSpec, SandboxStatus,
     SandboxTemplate, ServiceEndpoint, SshSession,
 };
+use openshell_core::telemetry::TelemetryComputeDriver;
 use openshell_core::{ObjectLabels, ObjectWorkspace};
-#[cfg(all(not(target_os = "windows"), feature = "in-tree-compute-drivers"))]
-use openshell_driver_docker::DockerComputeDriver;
-#[cfg(all(not(target_os = "windows"), feature = "in-tree-compute-drivers"))]
-use openshell_driver_kubernetes::{
-    ComputeDriverService as KubernetesDriverService, KubernetesComputeDriver,
-    OperatorNamespaceAllowlist,
-};
-#[cfg(all(not(target_os = "windows"), feature = "in-tree-compute-drivers"))]
-use openshell_driver_podman::{ComputeDriverService as PodmanDriverService, PodmanComputeDriver};
 use prost::Message;
 use std::collections::HashMap;
 use std::fmt;
@@ -299,8 +279,8 @@ pub struct ManagedDriverProcess {
 }
 
 impl ManagedDriverProcess {
-    #[cfg(all(unix, any(test, feature = "in-tree-compute-drivers")))]
-    pub(crate) fn new(child: tokio::process::Child, socket_path: PathBuf) -> Self {
+    #[cfg(unix)]
+    pub fn new(child: tokio::process::Child, socket_path: PathBuf) -> Self {
         Self {
             child: std::sync::Mutex::new(Some(child)),
             socket_path,
@@ -397,14 +377,13 @@ pub struct AcquiredRemoteDriverEndpoint {
 }
 
 impl AcquiredRemoteDriverEndpoint {
-    #[cfg(any(test, feature = "in-tree-compute-drivers"))]
-    pub(crate) fn managed_builtin(
-        driver_kind: ComputeDriverKind,
+    pub fn managed(
+        name: impl Into<String>,
         channel: Channel,
         driver_process: Arc<ManagedDriverProcess>,
     ) -> Self {
         Self {
-            name: driver_kind.as_str().to_string(),
+            name: name.into(),
             channel,
             driver_process: Some(driver_process),
         }
@@ -557,6 +536,7 @@ impl ComputeDriver for RemoteComputeDriver {
 pub struct ComputeRuntime {
     driver: TracedDriver,
     driver_info: ComputeDriverInfoSnapshot,
+    telemetry_compute_driver: TelemetryComputeDriver,
     driver_process: Option<Arc<ManagedDriverProcess>>,
     default_image: String,
     store: Arc<Store>,
@@ -605,11 +585,9 @@ impl ComputeRuntime {
                 compute_error_from_status(status)
             })?
             .into_inner();
-        let driver_kind = driver_name.parse::<ComputeDriverKind>().ok();
         info!(
             configured_driver = %driver_name,
             advertised_driver = %capabilities.driver_name,
-            in_tree = driver_kind.is_some(),
             "Compute driver connected"
         );
         let driver_info = ComputeDriverInfoSnapshot {
@@ -675,6 +653,7 @@ impl ComputeRuntime {
         Ok(Self {
             driver: TracedDriver::new(driver, driver_name),
             driver_info,
+            telemetry_compute_driver: TelemetryComputeDriver::custom(),
             driver_process,
             default_image,
             store,
@@ -714,63 +693,6 @@ impl ComputeRuntime {
         self.lifecycle_gates.entry_count()
     }
 
-    #[cfg(all(not(target_os = "windows"), feature = "in-tree-compute-drivers"))]
-    pub async fn new_docker(
-        config: openshell_core::Config,
-        docker_config: DockerComputeConfig,
-        store: Arc<Store>,
-        sandbox_index: SandboxIndex,
-        sandbox_watch_bus: SandboxWatchBus,
-        tracing_log_bus: TracingLogBus,
-        supervisor_sessions: Arc<SupervisorSessionRegistry>,
-    ) -> Result<Self, ComputeError> {
-        let driver: SharedComputeDriver = Arc::new(
-            DockerComputeDriver::new(&config, &docker_config)
-                .await
-                .map_err(|err| ComputeError::Message(err.to_string()))?,
-        );
-        Self::from_driver(
-            ComputeDriverKind::Docker.as_str().to_string(),
-            driver,
-            None,
-            store,
-            sandbox_index,
-            sandbox_watch_bus,
-            tracing_log_bus,
-            supervisor_sessions,
-        )
-        .await
-    }
-
-    #[cfg(all(not(target_os = "windows"), feature = "in-tree-compute-drivers"))]
-    pub async fn new_kubernetes(
-        config: KubernetesComputeConfig,
-        store: Arc<Store>,
-        sandbox_index: SandboxIndex,
-        sandbox_watch_bus: SandboxWatchBus,
-        tracing_log_bus: TracingLogBus,
-        supervisor_sessions: Arc<SupervisorSessionRegistry>,
-        shutdown_rx: watch::Receiver<bool>,
-    ) -> Result<(Self, Option<OperatorNamespaceAllowlist>), ComputeError> {
-        let driver = KubernetesComputeDriver::new(config, shutdown_rx)
-            .await
-            .map_err(|err| ComputeError::Message(err.to_string()))?;
-        let operator_allowlist_arc = driver.operator_allowlist().cloned();
-        let driver: SharedComputeDriver = Arc::new(KubernetesDriverService::new(driver));
-        let runtime = Self::from_driver(
-            ComputeDriverKind::Kubernetes.as_str().to_string(),
-            driver,
-            None,
-            store,
-            sandbox_index,
-            sandbox_watch_bus,
-            tracing_log_bus,
-            supervisor_sessions,
-        )
-        .await?;
-        Ok((runtime, operator_allowlist_arc))
-    }
-
     pub(crate) async fn new_remote_driver(
         endpoint: AcquiredRemoteDriverEndpoint,
         store: Arc<Store>,
@@ -793,32 +715,6 @@ impl ComputeRuntime {
         .await
     }
 
-    #[cfg(all(not(target_os = "windows"), feature = "in-tree-compute-drivers"))]
-    pub async fn new_podman(
-        config: PodmanComputeConfig,
-        store: Arc<Store>,
-        sandbox_index: SandboxIndex,
-        sandbox_watch_bus: SandboxWatchBus,
-        tracing_log_bus: TracingLogBus,
-        supervisor_sessions: Arc<SupervisorSessionRegistry>,
-    ) -> Result<Self, ComputeError> {
-        let driver = PodmanComputeDriver::new(config)
-            .await
-            .map_err(|err| ComputeError::Message(err.to_string()))?;
-        let driver: SharedComputeDriver = Arc::new(PodmanDriverService::new_in_process(driver));
-        Self::from_driver(
-            ComputeDriverKind::Podman.as_str().to_string(),
-            driver,
-            None,
-            store,
-            sandbox_index,
-            sandbox_watch_bus,
-            tracing_log_bus,
-            supervisor_sessions,
-        )
-        .await
-    }
-
     #[must_use]
     pub fn default_image(&self) -> &str {
         &self.default_image
@@ -830,8 +726,22 @@ impl ComputeRuntime {
     }
 
     #[must_use]
-    pub fn driver_kind(&self) -> Option<ComputeDriverKind> {
-        self.driver_info.name.parse().ok()
+    pub fn configured_driver_name(&self) -> &str {
+        &self.driver_info.name
+    }
+
+    #[must_use]
+    pub(crate) fn telemetry_compute_driver(&self) -> TelemetryComputeDriver {
+        self.telemetry_compute_driver
+    }
+
+    #[must_use]
+    pub(crate) fn with_telemetry_compute_driver(
+        mut self,
+        telemetry_compute_driver: TelemetryComputeDriver,
+    ) -> Self {
+        self.telemetry_compute_driver = telemetry_compute_driver;
+        self
     }
 
     #[must_use]
@@ -1306,10 +1216,10 @@ impl ComputeRuntime {
                 let suspension_progressing =
                     expected_stopped && driver_snapshot_confirms_stopping(&snapshot);
                 if suspension_progressing {
-                    // The Kubernetes controller has accepted the stop and
-                    // is waiting for its pod to terminate. Preserve the
-                    // durable transition so a later watch event can complete
-                    // it instead of claiming the sandbox is running again.
+                    // The backend has accepted the stop but has not finished
+                    // terminating the sandbox. Preserve the durable transition
+                    // so a later watch event can complete it instead of claiming
+                    // the sandbox is running again.
                     debug!(sandbox_id, "Sandbox stop is still progressing");
                 } else if backend_phase == SandboxPhase::Error
                     || observed_stopped == expected_stopped
@@ -3446,6 +3356,7 @@ fn driver_sandbox_template_from_public(
         resources: extract_typed_resources(&template.resources),
         platform_config: build_platform_config(template),
         driver_config: select_driver_config(&template.driver_config, driver_name)?,
+        user_namespaces: template.user_namespaces,
     })
 }
 
@@ -3547,19 +3458,6 @@ fn build_platform_config(template: &SandboxTemplate) -> Option<prost_types::Stru
                 kind: Some(Kind::StructValue(Struct {
                     fields: annotation_fields,
                 })),
-            },
-        );
-    }
-
-    // Invert: the public API uses `user_namespaces: true` (positive sense)
-    // while the K8s driver expects `host_users: false` (K8s convention).
-    // The driver inverts this back via `!host_users` to resolve the final
-    // pod-level `hostUsers` field.
-    if let Some(user_ns) = template.user_namespaces {
-        fields.insert(
-            "host_users".to_string(),
-            Value {
-                kind: Some(Kind::BoolValue(!user_ns)),
             },
         );
     }
@@ -4234,6 +4132,7 @@ pub async fn new_test_runtime_with_driver(
             driver_version: "test".to_string(),
             gateway_manages_lifecycle: false,
         },
+        telemetry_compute_driver: TelemetryComputeDriver::custom(),
         driver_process: None,
         default_image: "openshell/sandbox:test".to_string(),
         store,
@@ -4918,6 +4817,7 @@ mod tests {
                 driver_version: "test".to_string(),
                 gateway_manages_lifecycle: false,
             },
+            telemetry_compute_driver: TelemetryComputeDriver::custom(),
             driver_process: None,
             default_image: "openshell/sandbox:test".to_string(),
             store,
@@ -5765,8 +5665,7 @@ mod tests {
         ));
     }
 
-    /// Driver calls are a remote boundary even in-process: they reach the
-    /// Docker daemon, the Kubernetes API, or a Podman socket.
+    /// Driver calls are a remote boundary even when the driver is in-process.
     #[tokio::test]
     async fn driver_calls_export_spans_with_parents() {
         use tracing::Instrument as _;
@@ -7999,7 +7898,7 @@ mod tests {
 
     #[tokio::test]
     async fn backend_not_ready_with_supervisor_becomes_ready() {
-        // VM path: supervisor connects before backend reports Ready.
+        // The supervisor may connect before the backend reports Ready.
         let runtime = test_runtime(Arc::new(TestDriver::default())).await;
         let sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Provisioning);
         runtime.store.put_message(&sandbox).await.unwrap();
@@ -8976,45 +8875,16 @@ mod tests {
     }
 
     #[test]
-    fn build_platform_config_inverts_user_namespaces_to_host_users() {
-        use prost_types::value::Kind;
-
-        // user_namespaces: true  → host_users: false
-        let mut template = SandboxTemplate {
+    fn driver_template_preserves_user_namespace_intent() {
+        let template = SandboxTemplate {
             user_namespaces: Some(true),
             ..SandboxTemplate::default()
         };
-        let config = build_platform_config(&template).expect("config should be Some");
-        let host_users = config
-            .fields
-            .get("host_users")
-            .expect("host_users must exist");
-        assert_eq!(
-            host_users.kind,
-            Some(Kind::BoolValue(false)),
-            "user_namespaces: true must produce host_users: false"
-        );
+        let driver_template = driver_sandbox_template_from_public(&template, "test")
+            .expect("template conversion should succeed");
 
-        // user_namespaces: false → host_users: true
-        template.user_namespaces = Some(false);
-        let config = build_platform_config(&template).expect("config should be Some");
-        let host_users = config
-            .fields
-            .get("host_users")
-            .expect("host_users must exist");
-        assert_eq!(
-            host_users.kind,
-            Some(Kind::BoolValue(true)),
-            "user_namespaces: false must produce host_users: true"
-        );
-
-        // user_namespaces: None → host_users absent
-        template.user_namespaces = None;
-        let config = build_platform_config(&template);
-        assert!(
-            config.is_none() || !config.as_ref().unwrap().fields.contains_key("host_users"),
-            "unset user_namespaces must not produce host_users"
-        );
+        assert_eq!(driver_template.user_namespaces, Some(true));
+        assert!(driver_template.platform_config.is_none());
     }
 
     #[tokio::test]

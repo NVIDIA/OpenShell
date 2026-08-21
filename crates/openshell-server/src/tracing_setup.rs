@@ -11,14 +11,13 @@ use opentelemetry_sdk::trace::SdkTracerProvider;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::prelude::*;
 
-use crate::ConfiguredComputeDriver;
 use crate::config_file::OtlpConfig;
-use crate::otel_tracing::SetupError;
 use crate::tracing_bus::TracingLogBus;
+use crate::{ComputeDriverTracingSetup, ComputeDriverTracingShutdown};
 
 pub struct TracingHandle {
     tracer_provider: Option<SdkTracerProvider>,
-    podman_tracer_provider: Option<SdkTracerProvider>,
+    compute_driver_shutdown: Option<ComputeDriverTracingShutdown>,
 }
 
 impl TracingHandle {
@@ -28,107 +27,45 @@ impl TracingHandle {
         {
             tracing::warn!(error = %err, "OTLP tracer provider shutdown failed");
         }
-        if let Some(provider) = &self.podman_tracer_provider
-            && let Err(err) = provider.shutdown()
+        if let Some(shutdown) = &self.compute_driver_shutdown
+            && let Err(err) = shutdown()
         {
-            tracing::warn!(error = %err, "Podman OTLP tracer provider shutdown failed");
+            tracing::warn!(error = %err, "Compute driver tracing shutdown failed");
         }
     }
-}
-
-#[must_use]
-pub fn podman_export_enabled(driver: &ConfiguredComputeDriver) -> bool {
-    matches!(
-        driver,
-        ConfiguredComputeDriver::Registered(registration) if registration.name == "podman"
-    )
 }
 
 pub fn install(
     env_filter: EnvFilter,
     tracing_log_bus: &TracingLogBus,
     otlp_config: Option<&OtlpConfig>,
-    enable_podman_export: bool,
-) -> (TracingHandle, Option<SetupError>) {
+    compute_driver_tracing: ComputeDriverTracingSetup,
+) -> (TracingHandle, Option<String>) {
     let (tracer_provider, setup_error) = crate::otel_tracing::provider_for(otlp_config);
-    #[cfg(feature = "in-tree-compute-drivers")]
-    let podman_endpoint = enable_podman_export
-        .then_some(otlp_config)
-        .flatten()
-        .map(|config| config.endpoint.as_str());
-    #[cfg(feature = "in-tree-compute-drivers")]
-    let (podman_tracer_provider, podman_setup_error) =
-        openshell_driver_podman::otel_tracing::provider_for(podman_endpoint);
-    #[cfg(not(feature = "in-tree-compute-drivers"))]
-    let (podman_tracer_provider, podman_setup_error): (
-        Option<SdkTracerProvider>,
-        Option<SetupError>,
-    ) = {
-        let _ = enable_podman_export;
-        (None, None)
-    };
+    let ComputeDriverTracingSetup {
+        layer,
+        shutdown,
+        error,
+        target_prefix,
+    } = compute_driver_tracing;
 
     tracing_subscriber::registry()
+        .with(layer)
         .with(env_filter)
         .with(tracing_subscriber::fmt::layer())
         .with(tracing_log_bus.layer())
-        .with(tracer_provider.as_ref().map(crate::otel_tracing::layer))
-        .with(podman_in_process_layer(&podman_tracer_provider))
+        .with(
+            tracer_provider
+                .as_ref()
+                .map(|provider| crate::otel_tracing::layer(provider, target_prefix)),
+        )
         .init();
 
     (
         TracingHandle {
             tracer_provider,
-            podman_tracer_provider,
+            compute_driver_shutdown: shutdown,
         },
-        setup_error.or(podman_setup_error),
+        setup_error.map(|error| error.to_string()).or(error),
     )
-}
-
-#[cfg(feature = "in-tree-compute-drivers")]
-fn podman_in_process_layer<S>(
-    provider: &Option<SdkTracerProvider>,
-) -> Option<openshell_otel::TargetOtlpLayer<S>>
-where
-    S: tracing::Subscriber + for<'span> tracing_subscriber::registry::LookupSpan<'span>,
-{
-    provider
-        .as_ref()
-        .map(openshell_driver_podman::otel_tracing::in_process_layer)
-}
-
-#[cfg(not(feature = "in-tree-compute-drivers"))]
-fn podman_in_process_layer<S>(
-    _provider: &Option<SdkTracerProvider>,
-) -> Option<openshell_otel::TargetOtlpLayer<S>>
-where
-    S: tracing::Subscriber + for<'span> tracing_subscriber::registry::LookupSpan<'span>,
-{
-    None
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[cfg(not(target_os = "windows"))]
-    #[test]
-    fn podman_export_is_enabled_only_when_podman_is_selected() {
-        let registry = crate::install_default_compute_drivers();
-        let registered = |name| {
-            ConfiguredComputeDriver::Registered(
-                registry
-                    .get(name)
-                    .unwrap_or_else(|| panic!("{name} driver is registered"))
-                    .clone(),
-            )
-        };
-
-        assert!(podman_export_enabled(&registered("podman")));
-        assert!(!podman_export_enabled(&registered("docker")));
-        assert!(!podman_export_enabled(&registered("kubernetes")));
-        assert!(!podman_export_enabled(&ConfiguredComputeDriver::Remote {
-            name: "custom".to_string(),
-        }));
-    }
 }

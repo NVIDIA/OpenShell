@@ -155,6 +155,13 @@ gateway_id       = "openshell"
 # Omit or set to 0 only for local single-player Docker, Podman, or VM gateways.
 ttl_secs         = 3600
 
+# Optional pre-JWT authentication exchange. This is gateway-owned and does not
+# depend on which compute driver is selected.
+[openshell.gateway.sandbox_token_bootstrap]
+type                 = "kubernetes_service_account"
+service_account_name = "openshell-sandbox"
+namespace            = "openshell"
+
 [openshell.gateway.auth]
 allow_unauthenticated_users = false
 
@@ -207,6 +214,8 @@ Local Docker, Podman, and VM gateways can also set `[openshell.gateway.mtls_auth
 `[openshell.gateway] policy_validation_failure_mode` controls what sandbox supervisors do when a complete candidate policy fails runtime validation. The default, `fail_closed`, deactivates the previous network policy, closes relays pinned to it, and denies new egress until a valid generation loads. `retain_last_valid` leaves the previous valid generation active. Both modes reject the candidate atomically; startup always fails closed when no previous valid generation exists. Gateway mutation paths that can preflight a known effective scope reject invalid candidates before persistence and leave the active policy unchanged regardless of this setting. Changing the value requires restarting the gateway so it can reload `gateway.toml` and distribute the new posture to sandbox supervisors.
 
 `[openshell.gateway.gateway_jwt] ttl_secs` controls gateway-minted sandbox JWT lifetime. When omitted, it defaults to `0`: the token `exp` claim and `expires_at_ms` response field become `0`, and the sandbox JWT does not expire. Use that default only for local single-player Docker, Podman, or VM gateways. Kubernetes and other shared deployments should set a positive TTL; Helm renders `3600` seconds by default, and the gateway logs a warning when a Kubernetes gateway uses `0`.
+
+`[openshell.gateway.sandbox_token_bootstrap]` configures the one-shot exchange used before a sandbox has a gateway-minted JWT. It is independent of compute-driver selection, so an external driver does not require a Kubernetes driver table merely because the gateway process runs inside a cluster. `type = "kubernetes_service_account"` validates projected tokens with Kubernetes TokenReview. Set `service_account_name` and exactly one namespace policy: `namespace` for one exact namespace, `namespace_prefix` for managed namespaces, or `namespace_label`/`namespace_file` for a dynamic allowlist. Omit the table when sandboxes receive gateway JWTs through another mechanism.
 
 `[openshell.gateway.auth] allow_unauthenticated_users = true` is an unsafe local-development and trusted-proxy escape hatch. It accepts user-facing CLI/API calls without OIDC or mTLS credentials while sandbox supervisors still authenticate with gateway-minted sandbox JWTs. Leave it false for shared and production gateways.
 
@@ -441,6 +450,14 @@ client_ca_path = "/etc/openshell-tls/client-ca/ca.crt"
 # external_cert_path    = "/etc/openshell-tls/server-external/tls.crt"
 # external_key_path     = "/etc/openshell-tls/server-external/tls.key"
 # external_server_names = ["gateway.example.com"]
+
+[openshell.gateway.sandbox_token_bootstrap]
+type                 = "kubernetes_service_account"
+service_account_name = "openshell-sandbox"
+# Shared mode accepts one namespace. Managed mode instead uses
+# namespace_prefix = "openshell-<gateway-id>-". Operator mode uses exactly one
+# of namespace_label or namespace_file.
+namespace            = "agents"
 
 [openshell.drivers.kubernetes]
 # Workspace isolation mode. "shared" renders all sandboxes into a single

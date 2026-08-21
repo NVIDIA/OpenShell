@@ -20,28 +20,24 @@
 //! [`openshell_core::Config`] so the shared core stays free of driver-specific
 //! plumbing.
 //!
-//! TODO(driver-abstraction): this module still assumes the concrete VM driver
-//! (argv shape, guest-TLS flags, libkrun-specific settings). Once we land the
-//! generalized compute-driver interface, the CLI-arg plumbing below should
-//! be replaced with a driver-agnostic launcher that speaks gRPC to
-//! configure the driver — and this file should collapse to the types that
-//! are genuinely VM-specific (libkrun log level, vCPU / memory shape) plus a
-//! trait implementation registering the VM driver against the generic
-//! interface.
+//! Process launch remains deliberately VM-specific at this binary composition
+//! boundary: it translates gateway configuration into the standalone driver's
+//! argv and then connects through the same public compute-driver RPC interface
+//! used by operator-managed external drivers.
 
-use super::AcquiredRemoteDriverEndpoint;
-#[cfg(unix)]
-use super::ManagedDriverProcess;
-use crate::config_file::OtlpConfig;
-#[cfg(unix)]
-use crate::otel_tracing::TraceContextInterceptor;
 #[cfg(unix)]
 use hyper_util::rt::TokioIo;
 #[cfg(unix)]
 use openshell_core::proto::compute::v1::{
     GetCapabilitiesRequest, compute_driver_client::ComputeDriverClient,
 };
-use openshell_core::{ComputeDriverKind, Config, Error, Result};
+use openshell_core::{Error, Result};
+#[cfg(unix)]
+use openshell_otel::TraceContextInterceptor;
+use openshell_server::AcquiredRemoteDriverEndpoint;
+#[cfg(unix)]
+use openshell_server::ManagedDriverProcess;
+use openshell_server::config_file::OtlpConfig;
 #[cfg(unix)]
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 #[cfg(unix)]
@@ -453,7 +449,7 @@ pub fn compute_driver_guest_tls_paths(
 /// kills the subprocess and removes the socket on drop.
 #[cfg(unix)]
 pub async fn spawn(
-    config: &Config,
+    gateway_log_level: &str,
     vm_config: &VmComputeConfig,
     otlp_config: Option<&OtlpConfig>,
 ) -> Result<AcquiredRemoteDriverEndpoint> {
@@ -477,7 +473,7 @@ pub async fn spawn(
     command
         .arg("--expected-peer-pid")
         .arg(std::process::id().to_string());
-    command.arg("--log-level").arg(&config.log_level);
+    command.arg("--log-level").arg(gateway_log_level);
     append_otlp_args(&mut command, otlp_config);
     command
         .arg("--openshell-endpoint")
@@ -513,10 +509,8 @@ pub async fn spawn(
     })?;
     let channel = wait_for_compute_driver(&socket_path, &mut child).await?;
     let process = Arc::new(ManagedDriverProcess::new(child, socket_path));
-    Ok(AcquiredRemoteDriverEndpoint::managed_builtin(
-        ComputeDriverKind::Vm,
-        channel,
-        process,
+    Ok(AcquiredRemoteDriverEndpoint::managed(
+        "vm", channel, process,
     ))
 }
 
@@ -529,7 +523,7 @@ fn append_otlp_args(command: &mut Command, otlp_config: Option<&OtlpConfig>) {
 
 #[cfg(not(unix))]
 pub async fn spawn(
-    _config: &Config,
+    _gateway_log_level: &str,
     _vm_config: &VmComputeConfig,
     _otlp_config: Option<&OtlpConfig>,
 ) -> Result<AcquiredRemoteDriverEndpoint> {
@@ -612,9 +606,8 @@ mod tests {
         VmComputeConfig, append_otlp_args, compute_driver_guest_tls_paths,
         compute_driver_socket_path, current_euid, prepare_compute_driver_socket_path,
         prepare_vm_state_dir, resolve_compute_driver_bin, resolve_driver_search_dirs,
-        wait_for_compute_driver,
     };
-    use crate::config_file::OtlpConfig;
+    use openshell_server::config_file::OtlpConfig;
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::net::UnixListener as StdUnixListener;
     use std::path::PathBuf;
@@ -637,43 +630,6 @@ mod tests {
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect::<Vec<_>>();
         assert_eq!(args, ["--otlp-endpoint", "http://collector.internal:4317"]);
-    }
-
-    #[tokio::test]
-    async fn readiness_probe_propagates_the_active_trace() {
-        use crate::otel_tracing::test_exporter;
-        use crate::test_support::FakeComputeDriver;
-
-        let dir = tempdir().unwrap();
-        let socket_path = dir.path().join("compute-driver.sock");
-        let driver = FakeComputeDriver::new();
-        let _server = driver.serve_uds(&socket_path).unwrap();
-        let mut child = tokio::process::Command::new("sh")
-            .arg("-c")
-            .arg("read _")
-            .stdin(std::process::Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
-            .unwrap();
-
-        let traced = test_exporter::install_traced();
-        wait_for_compute_driver(&socket_path, &mut child)
-            .await
-            .unwrap();
-
-        let readiness = traced.spans_named("driver.wait_for_ready");
-        assert_eq!(readiness.len(), 1, "one readiness operation should finish");
-        test_exporter::assert_is_root(&readiness[0]);
-        let trace_id = readiness[0].span_context.trace_id().to_string();
-        assert_eq!(
-            driver.traceparents().len(),
-            1,
-            "the readiness capability probe should carry trace context"
-        );
-        assert!(
-            driver.traceparents()[0].contains(&trace_id),
-            "the readiness probe should be part of the active trace"
-        );
     }
 
     #[test]

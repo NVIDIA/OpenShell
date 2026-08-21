@@ -18,16 +18,21 @@
 use super::authenticator::Authenticator;
 use super::principal::{Principal, SandboxIdentitySource, SandboxPrincipal};
 use async_trait::async_trait;
+use futures::{StreamExt, TryStreamExt};
 use k8s_openapi::api::{
     authentication::v1::{TokenReview, TokenReviewSpec, TokenReviewStatus, UserInfo},
-    core::v1::Pod,
+    core::v1::{Namespace, Pod},
 };
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use kube::Error as KubeError;
 use kube::api::{Api, ApiResource, PostParams};
 use kube::core::{DynamicObject, gvk::GroupVersionKind};
-use openshell_core::OperatorNamespaceAllowlist;
+use kube::runtime::watcher::{self, Event};
+use openshell_core::DynamicStringAllowlist as OperatorNamespaceAllowlist;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, SystemTime};
+use tokio::sync::{mpsc, watch};
 use tonic::Status;
 use tracing::{debug, info, warn};
 
@@ -157,6 +162,231 @@ impl NamespaceValidator {
             Self::Allowlist(al) => al.contains(namespace),
         }
     }
+}
+
+pub fn namespace_validator(
+    namespace: Option<String>,
+    namespace_prefix: Option<String>,
+    namespace_label: Option<String>,
+    namespace_file: Option<PathBuf>,
+    client: kube::Client,
+    shutdown_rx: watch::Receiver<bool>,
+) -> openshell_core::Result<NamespaceValidator> {
+    let exact = namespace.filter(|value| !value.trim().is_empty());
+    let prefix = namespace_prefix.filter(|value| !value.trim().is_empty());
+    let label = namespace_label.filter(|value| !value.trim().is_empty());
+    let file = namespace_file.filter(|value| !value.as_os_str().is_empty());
+
+    match (exact, prefix, label, file) {
+        (Some(namespace), None, None, None) => Ok(NamespaceValidator::Exact(namespace)),
+        (None, Some(prefix), None, None) => Ok(NamespaceValidator::Prefix(prefix)),
+        (None, None, label, file) if label.is_some() || file.is_some() => {
+            Ok(NamespaceValidator::Allowlist(dynamic_namespace_allowlist(
+                label,
+                file,
+                client,
+                shutdown_rx,
+            )?))
+        }
+        _ => Err(openshell_core::Error::config(
+            "sandbox_token_bootstrap requires exactly one namespace policy: namespace, namespace_prefix, namespace_label, or namespace_file",
+        )),
+    }
+}
+
+fn dynamic_namespace_allowlist(
+    namespace_label: Option<String>,
+    namespace_file: Option<PathBuf>,
+    client: kube::Client,
+    shutdown_rx: watch::Receiver<bool>,
+) -> openshell_core::Result<OperatorNamespaceAllowlist> {
+    let allowlist = OperatorNamespaceAllowlist::new();
+    match (namespace_label, namespace_file) {
+        (Some(label), None) => {
+            spawn_namespace_label_watcher(client, label, allowlist.clone(), shutdown_rx);
+        }
+        (None, Some(path)) => {
+            spawn_namespace_file_watcher(path, allowlist.clone(), shutdown_rx);
+        }
+        _ => {
+            return Err(openshell_core::Error::config(
+                "sandbox_token_bootstrap accepts only one dynamic namespace source",
+            ));
+        }
+    }
+    Ok(allowlist)
+}
+
+fn spawn_namespace_label_watcher(
+    client: kube::Client,
+    label_selector: String,
+    allowlist: OperatorNamespaceAllowlist,
+    mut shutdown_rx: watch::Receiver<bool>,
+) {
+    let namespace_api: Api<Namespace> = Api::all(client);
+    let watcher_config = watcher::Config::default().labels(&label_selector);
+    let jitter_seed = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |duration| {
+            duration.as_secs() ^ u64::from(duration.subsec_nanos())
+        });
+
+    tokio::spawn(async move {
+        let mut retry_attempt = 0;
+        loop {
+            let mut stream =
+                watcher::watcher(namespace_api.clone(), watcher_config.clone()).boxed();
+            loop {
+                let event = tokio::select! {
+                    result = stream.try_next() => result,
+                    changed = shutdown_rx.changed() => {
+                        if changed.is_err() || *shutdown_rx.borrow() {
+                            return;
+                        }
+                        continue;
+                    }
+                };
+                match event {
+                    Ok(Some(Event::Applied(namespace))) => {
+                        retry_attempt = 0;
+                        if let Some(name) = namespace.metadata.name
+                            && allowlist.insert(name.clone())
+                        {
+                            info!(namespace = name, "operator namespace added to allowlist");
+                        }
+                    }
+                    Ok(Some(Event::Deleted(namespace))) => {
+                        retry_attempt = 0;
+                        if let Some(name) = namespace.metadata.name.as_deref()
+                            && allowlist.remove(name)
+                        {
+                            info!(
+                                namespace = name,
+                                "operator namespace removed from allowlist"
+                            );
+                        }
+                    }
+                    Ok(Some(Event::Restarted(namespaces))) => {
+                        retry_attempt = 0;
+                        allowlist.replace(
+                            namespaces
+                                .into_iter()
+                                .filter_map(|namespace| namespace.metadata.name)
+                                .collect(),
+                        );
+                    }
+                    Ok(None) => {
+                        warn!("operator namespace watcher stream ended unexpectedly");
+                        break;
+                    }
+                    Err(error) => {
+                        warn!(%error, "operator namespace watcher stream error");
+                        break;
+                    }
+                }
+            }
+
+            let retry_delay = namespace_watcher_retry_delay(retry_attempt, jitter_seed);
+            warn!(?retry_delay, "operator namespace watcher reconnecting");
+            tokio::select! {
+                () = tokio::time::sleep(retry_delay) => {}
+                changed = shutdown_rx.changed() => {
+                    if changed.is_err() || *shutdown_rx.borrow() {
+                        return;
+                    }
+                }
+            }
+            retry_attempt = retry_attempt.saturating_add(1);
+        }
+    });
+
+    info!(%label_selector, "operator namespace label watcher spawned");
+}
+
+fn namespace_watcher_retry_delay(attempt: u32, jitter_seed: u64) -> Duration {
+    let base_secs = 2_u64.saturating_mul(1_u64 << attempt.min(4)).min(24);
+    let max_jitter_secs = base_secs / 4;
+    let mixed_seed =
+        jitter_seed.wrapping_add(u64::from(attempt).wrapping_mul(0x9e37_79b9_7f4a_7c15));
+    Duration::from_secs(base_secs + mixed_seed % (max_jitter_secs + 1))
+}
+
+fn load_namespace_file(path: &Path) -> Result<std::collections::BTreeSet<String>, String> {
+    let contents = std::fs::read_to_string(path)
+        .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
+    let names: Vec<String> = serde_json::from_str(&contents)
+        .map_err(|error| format!("failed to parse {}: {error}", path.display()))?;
+    Ok(names.into_iter().collect())
+}
+
+fn spawn_namespace_file_watcher(
+    path: PathBuf,
+    allowlist: OperatorNamespaceAllowlist,
+    mut shutdown_rx: watch::Receiver<bool>,
+) {
+    match load_namespace_file(&path) {
+        Ok(names) => allowlist.replace(names),
+        Err(error) => {
+            warn!(%error, "failed to load initial operator namespace file, allowlist empty");
+        }
+    }
+
+    let watch_dir = path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .to_path_buf();
+    tokio::spawn(async move {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut file_watcher = match notify::recommended_watcher(
+            move |result: Result<notify::Event, notify::Error>| {
+                if let Ok(event) = result
+                    && matches!(
+                        event.kind,
+                        notify::EventKind::Modify(_) | notify::EventKind::Create(_)
+                    )
+                {
+                    let _ = tx.send(());
+                }
+            },
+        ) {
+            Ok(watcher) => watcher,
+            Err(error) => {
+                warn!(%error, "failed to start operator namespace file watcher");
+                return;
+            }
+        };
+        if let Err(error) = notify::Watcher::watch(
+            &mut file_watcher,
+            &watch_dir,
+            notify::RecursiveMode::NonRecursive,
+        ) {
+            warn!(%error, dir = %watch_dir.display(), "failed to watch operator namespace file directory");
+            return;
+        }
+
+        loop {
+            let got_event = tokio::select! {
+                event = rx.recv() => event.is_some(),
+                changed = shutdown_rx.changed() => {
+                    if changed.is_err() || *shutdown_rx.borrow() {
+                        return;
+                    }
+                    continue;
+                }
+            };
+            if !got_event {
+                return;
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            while rx.try_recv().is_ok() {}
+            match load_namespace_file(&path) {
+                Ok(names) => allowlist.replace(names),
+                Err(error) => {
+                    warn!(%error, "failed to reload operator namespace file, keeping existing allowlist");
+                }
+            }
+        }
+    });
 }
 
 #[derive(Debug)]

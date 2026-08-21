@@ -53,6 +53,7 @@ ENV BINDGEN_EXTRA_CLANG_ARGS_aarch64_apple_darwin=--target=arm64-apple-macosx\ -
 
 COPY Cargo.toml Cargo.lock ./
 COPY crates/openshell-core/Cargo.toml crates/openshell-core/Cargo.toml
+COPY crates/openshell-gateway/Cargo.toml crates/openshell-gateway/Cargo.toml
 COPY crates/openshell-driver-kubernetes/Cargo.toml crates/openshell-driver-kubernetes/Cargo.toml
 COPY crates/openshell-policy/Cargo.toml crates/openshell-policy/Cargo.toml
 COPY crates/openshell-prover/Cargo.toml crates/openshell-prover/Cargo.toml
@@ -61,39 +62,42 @@ COPY crates/openshell-server/Cargo.toml crates/openshell-server/Cargo.toml
 COPY crates/openshell-core/build.rs crates/openshell-core/build.rs
 COPY proto/ proto/
 
-RUN sed -i 's|members = \["crates/\*"\]|members = ["crates/openshell-server", "crates/openshell-core", "crates/openshell-driver-kubernetes", "crates/openshell-policy", "crates/openshell-prover", "crates/openshell-router"]|' Cargo.toml
+RUN sed -i 's|members = \["crates/\*"\]|members = ["crates/openshell-gateway", "crates/openshell-server", "crates/openshell-core", "crates/openshell-driver-kubernetes", "crates/openshell-policy", "crates/openshell-prover", "crates/openshell-router"]|' Cargo.toml
 
 RUN mkdir -p crates/openshell-core/src \
+             crates/openshell-gateway/src \
              crates/openshell-driver-kubernetes/src \
              crates/openshell-policy/src \
              crates/openshell-prover/src \
              crates/openshell-router/src \
              crates/openshell-server/src && \
     touch crates/openshell-core/src/lib.rs && \
+    touch crates/openshell-gateway/src/lib.rs && \
+    printf 'fn main() {}\n' > crates/openshell-gateway/src/main.rs && \
     touch crates/openshell-driver-kubernetes/src/lib.rs && \
     printf 'fn main() {}\n' > crates/openshell-driver-kubernetes/src/main.rs && \
     touch crates/openshell-policy/src/lib.rs && \
     touch crates/openshell-prover/src/lib.rs && \
     touch crates/openshell-router/src/lib.rs && \
-    touch crates/openshell-server/src/lib.rs && \
-    printf 'fn main() {}\n' > crates/openshell-server/src/main.rs
+    touch crates/openshell-server/src/lib.rs
 
 RUN --mount=type=cache,id=cargo-registry-gateway-macos,sharing=locked,target=/root/.cargo/registry \
     --mount=type=cache,id=cargo-git-gateway-macos,sharing=locked,target=/root/.cargo/git \
     --mount=type=cache,id=cargo-target-gateway-macos-${CARGO_TARGET_CACHE_SCOPE},sharing=locked,target=/build/target \
-    cargo build --release --target aarch64-apple-darwin -p openshell-server --features bundled-z3 2>/dev/null || true
+    cargo build --release --target aarch64-apple-darwin -p openshell-gateway --features bundled-z3 2>/dev/null || true
 
 COPY crates/ crates/
 COPY providers/ providers/
 
 RUN touch crates/openshell-core/src/lib.rs \
+    crates/openshell-gateway/src/lib.rs \
+    crates/openshell-gateway/src/main.rs \
     crates/openshell-driver-kubernetes/src/lib.rs \
     crates/openshell-driver-kubernetes/src/main.rs \
     crates/openshell-policy/src/lib.rs \
     crates/openshell-prover/src/lib.rs \
     crates/openshell-router/src/lib.rs \
     crates/openshell-server/src/lib.rs \
-    crates/openshell-server/src/main.rs \
     crates/openshell-core/build.rs \
     proto/*.proto
 
@@ -105,7 +109,7 @@ RUN --mount=type=cache,id=cargo-registry-gateway-macos,sharing=locked,target=/ro
     if [ -n "${OPENSHELL_CARGO_VERSION:-}" ]; then \
       sed -i -E '/^\[workspace\.package\]/,/^\[/{s/^version[[:space:]]*=[[:space:]]*".*"/version = "'"${OPENSHELL_CARGO_VERSION}"'"/}' Cargo.toml; \
     fi && \
-    cargo build --release --target aarch64-apple-darwin -p openshell-server --features bundled-z3 && \
+    cargo build --release --target aarch64-apple-darwin -p openshell-gateway --features bundled-z3 && \
     cp target/aarch64-apple-darwin/release/openshell-gateway /openshell-gateway
 
 FROM scratch AS binary

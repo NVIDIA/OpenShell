@@ -26,7 +26,6 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 use base64::Engine as _;
-use openshell_core::config::ComputeDriverKind;
 use openshell_core::proto::SupervisorMiddlewareService;
 use openshell_core::{
     GatewayAuthConfig, GatewayInterceptorConfig, GatewayJwtConfig,
@@ -177,6 +176,10 @@ pub struct GatewayFileSection {
     pub mtls_auth: Option<MtlsAuthConfig>,
     #[serde(default)]
     pub gateway_jwt: Option<GatewayJwtConfig>,
+    /// Optional gateway authentication bootstrap independent of compute-driver
+    /// selection. When omitted, only gateway-minted sandbox JWTs are accepted.
+    #[serde(default)]
+    pub sandbox_token_bootstrap: Option<SandboxTokenBootstrapConfig>,
     #[serde(default)]
     pub otlp: Option<OtlpConfig>,
 
@@ -204,6 +207,31 @@ pub struct OtlpConfig {
     /// `service.name` resource attribute. Defaults to `openshell-gateway`.
     #[serde(default)]
     pub service_name: Option<String>,
+}
+
+/// Gateway-side exchange that authenticates a sandbox before it has a
+/// gateway-minted JWT. This configuration belongs to the authentication
+/// boundary rather than any compute-driver table.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum SandboxTokenBootstrapConfig {
+    /// Validate a projected Kubernetes `ServiceAccount` token with `TokenReview`.
+    KubernetesServiceAccount {
+        /// Exact service account accepted for sandbox bootstrap calls.
+        service_account_name: String,
+        /// Accept exactly one namespace.
+        #[serde(default)]
+        namespace: Option<String>,
+        /// Accept namespaces beginning with this prefix.
+        #[serde(default)]
+        namespace_prefix: Option<String>,
+        /// Dynamically allow namespaces matching this Kubernetes label selector.
+        #[serde(default)]
+        namespace_label: Option<String>,
+        /// Dynamically allow namespaces listed in this JSON/YAML file.
+        #[serde(default)]
+        namespace_file: Option<PathBuf>,
+    },
 }
 
 /// `[openshell.supervisor]` section.
@@ -428,12 +456,21 @@ pub fn driver_table(
     gateway: &GatewayFileSection,
     raw: Option<&toml::Value>,
 ) -> toml::Value {
+    driver_table_with_inherited_keys(driver_name, gateway, raw, &[])
+}
+
+pub(crate) fn driver_table_with_inherited_keys(
+    _driver_name: &str,
+    gateway: &GatewayFileSection,
+    raw: Option<&toml::Value>,
+    inheritable_keys: &[&str],
+) -> toml::Value {
     let mut merged = match raw {
         Some(toml::Value::Table(table)) => table.clone(),
         _ => toml::Table::new(),
     };
 
-    for key in inheritable_keys(driver_name) {
+    for key in inheritable_keys {
         if merged.contains_key(*key) {
             continue;
         }
@@ -443,48 +480,6 @@ pub fn driver_table(
     }
 
     toml::Value::Table(merged)
-}
-
-/// Inheritance allowlist (the Q4 "high-overlap set"). Each driver opts in
-/// to a specific subset so a gateway-wide default does not accidentally land
-/// in a driver table that does not understand the field.
-fn inheritable_keys(driver_name: &str) -> &'static [&'static str] {
-    match driver_name.parse::<ComputeDriverKind>().ok() {
-        Some(ComputeDriverKind::Kubernetes) => &[
-            "namespace",
-            "default_image",
-            "supervisor_image",
-            "client_tls_secret_name",
-            "service_account_name",
-            "host_gateway_ip",
-            "enable_user_namespaces",
-            "sa_token_ttl_secs",
-        ],
-        Some(ComputeDriverKind::Docker) => &[
-            "sandbox_namespace",
-            "default_image",
-            "supervisor_image",
-            "host_gateway_ip",
-            "guest_tls_ca",
-            "guest_tls_cert",
-            "guest_tls_key",
-        ],
-        Some(ComputeDriverKind::Podman) => &[
-            "default_image",
-            "supervisor_image",
-            "host_gateway_ip",
-            "guest_tls_ca",
-            "guest_tls_cert",
-            "guest_tls_key",
-        ],
-        Some(ComputeDriverKind::Vm) => &[
-            "default_image",
-            "guest_tls_ca",
-            "guest_tls_cert",
-            "guest_tls_key",
-        ],
-        None => &[],
-    }
 }
 
 fn gateway_inherited_value(g: &GatewayFileSection, key: &str) -> Option<toml::Value> {
@@ -631,6 +626,35 @@ service_name = "openshell-gateway-dev"
             "http://otel-collector.observability.svc:4317"
         );
         assert_eq!(otlp.service_name.as_deref(), Some("openshell-gateway-dev"));
+    }
+
+    #[test]
+    fn parses_gateway_owned_sandbox_token_bootstrap() {
+        let tmp = write_tmp(
+            r#"
+[openshell.gateway.sandbox_token_bootstrap]
+type = "kubernetes_service_account"
+service_account_name = "openshell-sandbox"
+namespace_prefix = "openshell-local-"
+
+[openshell.drivers.custom]
+socket_path = "/run/custom-driver.sock"
+"#,
+        );
+
+        let file = load(tmp.path()).expect("gateway bootstrap config parses");
+        assert_eq!(
+            file.openshell.gateway.sandbox_token_bootstrap,
+            Some(SandboxTokenBootstrapConfig::KubernetesServiceAccount {
+                service_account_name: "openshell-sandbox".to_string(),
+                namespace: None,
+                namespace_prefix: Some("openshell-local-".to_string()),
+                namespace_label: None,
+                namespace_file: None,
+            })
+        );
+        assert!(file.openshell.drivers.contains_key("custom"));
+        assert!(!file.openshell.drivers.contains_key("kubernetes"));
     }
 
     #[test]
@@ -978,10 +1002,11 @@ version = 2
         let raw = toml::toml! {
             namespace = "agents"
         };
-        let merged = driver_table(
-            ComputeDriverKind::Kubernetes.as_str(),
+        let merged = driver_table_with_inherited_keys(
+            "alpha",
             &gateway,
             Some(&toml::Value::Table(raw)),
+            &["default_image", "supervisor_image"],
         );
         let table = merged.as_table().expect("table");
         assert_eq!(
@@ -999,14 +1024,19 @@ version = 2
     }
 
     #[test]
-    fn docker_driver_table_inherits_gateway_defaults() {
+    fn registered_driver_table_inherits_selected_gateway_defaults() {
         let gateway = GatewayFileSection {
             sandbox_namespace: Some("agents".to_string()),
             default_image: Some("ghcr.io/nvidia/openshell/sandbox:0.9".to_string()),
             host_gateway_ip: Some("10.0.0.1".to_string()),
             ..Default::default()
         };
-        let merged = driver_table(ComputeDriverKind::Docker.as_str(), &gateway, None);
+        let merged = driver_table_with_inherited_keys(
+            "alpha",
+            &gateway,
+            None,
+            &["sandbox_namespace", "default_image", "host_gateway_ip"],
+        );
         let table = merged.as_table().expect("table");
         assert_eq!(
             table.get("sandbox_namespace").and_then(|v| v.as_str()),
@@ -1023,13 +1053,18 @@ version = 2
     }
 
     #[test]
-    fn podman_driver_table_inherits_gateway_host_gateway_ip() {
+    fn registered_driver_table_can_select_network_defaults() {
         let gateway = GatewayFileSection {
             default_image: Some("ghcr.io/nvidia/openshell/sandbox:0.9".to_string()),
             host_gateway_ip: Some("192.168.127.254".to_string()),
             ..Default::default()
         };
-        let merged = driver_table(ComputeDriverKind::Podman.as_str(), &gateway, None);
+        let merged = driver_table_with_inherited_keys(
+            "beta",
+            &gateway,
+            None,
+            &["default_image", "host_gateway_ip"],
+        );
         let table = merged.as_table().expect("table");
         assert_eq!(
             table.get("default_image").and_then(|v| v.as_str()),
@@ -1050,10 +1085,11 @@ version = 2
         let raw = toml::toml! {
             default_image = "driver-specific"
         };
-        let merged = driver_table(
-            ComputeDriverKind::Podman.as_str(),
+        let merged = driver_table_with_inherited_keys(
+            "alpha",
             &gateway,
             Some(&toml::Value::Table(raw)),
+            &["default_image"],
         );
         assert_eq!(
             merged
@@ -1067,13 +1103,12 @@ version = 2
 
     #[test]
     fn driver_table_does_not_leak_keys_outside_allowlist() {
-        // `client_tls_secret_name` is K8s-only; Docker must not receive it
-        // even when set at gateway scope.
+        // Fields not selected by the registration must remain gateway-only.
         let gateway = GatewayFileSection {
             client_tls_secret_name: Some("openshell-sandbox-tls".to_string()),
             ..Default::default()
         };
-        let merged = driver_table(ComputeDriverKind::Docker.as_str(), &gateway, None);
+        let merged = driver_table_with_inherited_keys("alpha", &gateway, None, &["default_image"]);
         assert!(
             !merged
                 .as_table()
