@@ -27,6 +27,7 @@ jobs:
       run_gpu_e2e: ${{ steps.labels.outputs.run_gpu_e2e }}
       run_kubernetes_ha_e2e: ${{ steps.labels.outputs.run_kubernetes_ha_e2e }}
       run_kubernetes_credential_drivers_e2e: ${{ steps.labels.outputs.run_kubernetes_credential_drivers_e2e }}
+      run_snap_smoke: ${{ steps.labels.outputs.run_snap_smoke }}
       run_any_e2e: ${{ steps.labels.outputs.run_any_e2e }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -46,6 +47,7 @@ jobs:
               run_gpu_e2e="$(jq -r 'index("test:e2e-gpu") != null' <<< "$LABELS_JSON")"
               run_kubernetes_ha_e2e="$(jq -r 'index("test:e2e-kubernetes") != null' <<< "$LABELS_JSON")"
               run_kubernetes_credential_drivers_e2e="$(jq -r 'index("test:e2e-kubernetes") != null' <<< "$LABELS_JSON")"
+              run_snap_smoke="$(jq -r 'index("test:snap") != null' <<< "$LABELS_JSON")"
               ;;
             merge_group)
               # Merge groups have no PR labels. When GPU E2E is required as documented
@@ -55,15 +57,17 @@ jobs:
               run_gpu_e2e=true
               run_kubernetes_ha_e2e=false
               run_kubernetes_credential_drivers_e2e=false
+              run_snap_smoke=true
               ;;
             *)
               run_core_e2e=true
               run_gpu_e2e=true
               run_kubernetes_ha_e2e=true
               run_kubernetes_credential_drivers_e2e=true
+              run_snap_smoke=true
               ;;
           esac
-          if [ "$run_core_e2e" = "true" ] || [ "$run_gpu_e2e" = "true" ] || [ "$run_kubernetes_ha_e2e" = "true" ] || [ "$run_kubernetes_credential_drivers_e2e" = "true" ]; then
+          if [ "$run_core_e2e" = "true" ] || [ "$run_gpu_e2e" = "true" ] || [ "$run_kubernetes_ha_e2e" = "true" ] || [ "$run_kubernetes_credential_drivers_e2e" = "true" ] || [ "$run_snap_smoke" = "true" ]; then
             run_any_e2e=true
           else
             run_any_e2e=false
@@ -73,6 +77,7 @@ jobs:
             echo "run_gpu_e2e=$run_gpu_e2e"
             echo "run_kubernetes_ha_e2e=$run_kubernetes_ha_e2e"
             echo "run_kubernetes_credential_drivers_e2e=$run_kubernetes_credential_drivers_e2e"
+            echo "run_snap_smoke=$run_snap_smoke"
             echo "run_any_e2e=$run_any_e2e"
           } >> "$GITHUB_OUTPUT"
 
@@ -86,6 +91,7 @@ jobs:
     with:
       component: gateway
       image-tag: ${{ github.sha }}
+      platform: ${{ (needs.pr_metadata.outputs.run_core_e2e == 'true' || needs.pr_metadata.outputs.run_gpu_e2e == 'true' || needs.pr_metadata.outputs.run_kubernetes_ha_e2e == 'true' || needs.pr_metadata.outputs.run_kubernetes_credential_drivers_e2e == 'true') && 'linux/amd64,linux/arm64' || 'linux/amd64' }}
 
   build-supervisor:
     needs: [pr_metadata]
@@ -97,6 +103,7 @@ jobs:
     with:
       component: supervisor
       image-tag: ${{ github.sha }}
+      platform: ${{ (needs.pr_metadata.outputs.run_core_e2e == 'true' || needs.pr_metadata.outputs.run_gpu_e2e == 'true' || needs.pr_metadata.outputs.run_kubernetes_ha_e2e == 'true' || needs.pr_metadata.outputs.run_kubernetes_credential_drivers_e2e == 'true') && 'linux/amd64,linux/arm64' || 'linux/amd64' }}
 
   build-cli:
     needs: [pr_metadata]
@@ -107,7 +114,45 @@ jobs:
     uses: ./.github/workflows/docker-build.yml
     with:
       component: cli
-      platform: linux/amd64,linux/arm64
+      platform: ${{ (needs.pr_metadata.outputs.run_core_e2e == 'true' || needs.pr_metadata.outputs.run_gpu_e2e == 'true' || needs.pr_metadata.outputs.run_kubernetes_ha_e2e == 'true' || needs.pr_metadata.outputs.run_kubernetes_credential_drivers_e2e == 'true') && 'linux/amd64,linux/arm64' || 'linux/amd64' }}
+
+  build-snap:
+    name: Build Snap
+    needs: [pr_metadata, build-gateway, build-supervisor, build-cli]
+    if: needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_snap_smoke == 'true'
+    permissions:
+      actions: read
+      contents: read
+      packages: read
+    uses: ./.github/workflows/snap-build.yml
+    with:
+      checkout-ref: ${{ github.sha }}
+      artifact-layout: raw
+      build-matrix: '{"include":[{"arch":"amd64","runner":"linux-amd64-cpu8"}]}'
+      cli-artifact-prefix: rust-binary-cli
+      gateway-artifact-prefix: rust-binary-gateway
+      supervisor-artifact-prefix: rust-binary-supervisor
+
+  snap-smoke:
+    name: Snap Smoke
+    needs: [pr_metadata, build-snap]
+    if: needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_snap_smoke == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Download locally built Snap
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: snap-linux-amd64
+          path: release/
+      - name: Install and verify local Snap
+        uses: ./.github/actions/snap-gateway-smoke
+        with:
+          snap-path: ./release/*.snap
 
   build-driver-vm-linux:
     needs: [pr_metadata]

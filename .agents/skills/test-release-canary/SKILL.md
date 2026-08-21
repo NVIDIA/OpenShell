@@ -29,6 +29,10 @@ validation lives in the `TypeScript SDK` branch check, including a publish
 dry-run. The tagged release workflow publishes the package to GitHub Packages;
 verify that job directly when diagnosing SDK publication failures.
 
+The PR-only `test:snap` label runs the same gateway lifecycle smoke test in
+`Branch E2E Checks`, but packages a Snap from that workflow's amd64 prebuilt
+binary artifacts. It does not require or publish a Release Dev artifact.
+
 ## Trigger paths
 
 The workflow has two triggers:

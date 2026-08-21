@@ -1,0 +1,73 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: Snap gateway smoke test
+description: Install a local OpenShell Snap with Docker and verify gateway readiness.
+
+inputs:
+  snap-path:
+    description: Path to the locally built Snap artifact.
+    required: true
+  telemetry-enabled:
+    description: Value supplied to the gateway service environment.
+    required: false
+    default: "false"
+
+runs:
+  using: composite
+  steps:
+    - name: Install snapd
+      shell: bash
+      run: |
+        set -euo pipefail
+        sudo apt-get update
+        sudo apt-get install -y snapd
+        sudo systemctl enable --now snapd.socket
+        sudo systemctl start snapd
+        sudo snap wait system seed.loaded
+
+    - name: Install Docker snap
+      shell: bash
+      run: sudo snap install docker
+
+    - name: Install, connect, and verify gateway
+      shell: bash
+      env:
+        SNAP_PATH: ${{ inputs.snap-path }}
+        TELEMETRY_ENABLED: ${{ inputs.telemetry-enabled }}
+      run: |
+        set -Eeuo pipefail
+
+        collect_diagnostics() {
+          set +e
+          sudo snap services openshell
+          sudo snap connections openshell
+          sudo snap changes
+          sudo systemctl status snap.openshell.gateway.service --no-pager
+          sudo journalctl -b -u snap.openshell.gateway.service --no-pager -n 300
+          sudo journalctl -b -u snapd.service --no-pager -n 300
+          sudo snap logs openshell.gateway -n=300
+          sudo ss -ltnp '( sport = :17670 )'
+        }
+        trap collect_diagnostics ERR
+
+        snap_path=$(compgen -G "$SNAP_PATH" | head -n 1 || true)
+        test -n "$snap_path"
+        sudo systemctl set-environment "OPENSHELL_TELEMETRY_ENABLED=${TELEMETRY_ENABLED}"
+        sudo snap install "$snap_path" --dangerous
+        sudo snap connect openshell:docker docker:docker-daemon
+        sudo snap connect openshell:log-observe
+        sudo snap connect openshell:system-observe
+
+        openshell --version
+        sudo snap services openshell
+        openshell gateway add http://127.0.0.1:17670 --local --name snap-docker
+        openshell gateway select snap-docker
+        for _ in $(seq 1 30); do
+          if openshell status; then
+            exit 0
+          fi
+          sleep 1
+        done
+        echo "Gateway did not become ready within 30 seconds" >&2
+        exit 1
