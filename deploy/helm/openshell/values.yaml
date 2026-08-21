@@ -133,6 +133,16 @@ service:
   # -- Gateway metrics service port.
   metricsPort: 9090
 
+# Agent Sandbox is a cluster-scoped prerequisite for the Kubernetes compute
+# driver. OpenShell deliberately does not install its CRDs or controller.
+# Enable this check for live Helm installs to fail before creating gateway
+# resources when neither supported Sandbox API is served. Disable it for
+# offline `helm template` and lint workflows, which cannot discover APIs.
+agentSandbox:
+  preflight:
+    # -- Check the live cluster for a supported Agent Sandbox API before rendering gateway resources. Disable only for offline rendering and linting.
+    enabled: true
+
 # Pod restart behavior and health probe tuning.
 podLifecycle:
   # -- Grace period, in seconds, before Kubernetes terminates the gateway pod.

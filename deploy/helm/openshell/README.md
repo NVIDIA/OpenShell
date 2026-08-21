@@ -17,6 +17,13 @@ The Kubernetes Agent Sandbox CRDs and controller must be installed on the cluste
 kubectl apply -f https://github.com/kubernetes-sigs/agent-sandbox/releases/latest/download/manifest.yaml
 ```
 
+The chart does not install this cluster-scoped dependency. By default, it
+fails before creating gateway resources when the cluster serves neither
+supported Sandbox API (`agents.x-k8s.io/v1beta1` or
+`agents.x-k8s.io/v1alpha1`). Disable the check with
+`agentSandbox.preflight.enabled=false` for offline `helm template` rendering,
+where Helm cannot discover cluster APIs.
+
 ## Install on Kubernetes
 
 ```shell
@@ -153,6 +160,7 @@ add `ci/values-spire.yaml` to the OpenShell release values files.
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | affinity | object | `{}` | Affinity rules for the gateway pod. |
+| agentSandbox.preflight.enabled | bool | `true` | Check the live cluster for a supported Agent Sandbox API before rendering gateway resources. Disable only for offline rendering and linting. |
 | certManager.caSecretName | string | `"openshell-ca-tls"` | Secret created for the intermediate CA (Certificate with isCA: true). |
 | certManager.certificateDuration | string | `"8760h"` | Duration for cert-manager-issued certificates. |
 | certManager.certificateRenewBefore | string | `"720h"` | Renewal window for cert-manager-issued certificates. |
