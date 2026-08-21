@@ -82,6 +82,16 @@ Note `install.sh` is pulled from `raw.githubusercontent.com/NVIDIA/OpenShell/${h
 
 To smoke-test the chart for a specific dev build, dispatch `Release Dev` on the branch first, then run the kind canary steps locally pointed at the SHA-pinned chart (see "Local kind reproduction" below). The release-canary workflow itself does not currently expose `chart_version` / `image_tag` inputs.
 
+## PR-built Fedora callback reproduction
+
+For a PR-built reproduction of the Fedora callback topology, run the
+`e2e:podman:nested-container` task with `OPENSHELL_BIN`,
+`OPENSHELL_GATEWAY_BIN`, and `OPENSHELL_SUPERVISOR_IMAGE` set to Linux
+artifacts from the same revision. The `test:e2e` PR label enables this lane in
+`Branch E2E Checks`. It injects those artifacts into the same
+Docker-to-Fedora-to-rootful-Podman topology as the canary and verifies both
+gateway startup and a supervisor callback before published RPMs exist.
+
 ## Local kind reproduction
 
 The `kubernetes` job can be reproduced on any machine with Docker and `mise install`-provided `kubectl` + `helm`:

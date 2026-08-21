@@ -137,6 +137,7 @@ jobs:
       cli-artifact-prefix: rust-binary-cli
       gateway-artifact-prefix: rust-binary-gateway
       vm-driver-artifact-name: driver-vm-linux-amd64
+      nested-podman-callback: true
 
   gpu-e2e:
     needs: [pr_metadata, build-gateway, build-supervisor, build-cli]

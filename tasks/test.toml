@@ -110,6 +110,10 @@ run = "e2e/with-docker-gateway.sh uv run pytest -o python_files='test_*.py *_tes
 description = "Run Rust CLI e2e tests against a Podman-backed gateway"
 run = "e2e/rust/e2e-podman.sh"
 
+["e2e:podman:nested-container"]
+description = "Run the Release Canary Fedora/rootful-Podman callback topology with prebuilt PR artifacts"
+run = "e2e/nested-podman-callback.sh"
+
 ["e2e:oidc-pkce"]
 description = "Run Linux browser PKCE and RBAC e2e tests against Keycloak and a Podman gateway"
 run = [
