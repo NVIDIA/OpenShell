@@ -4339,7 +4339,7 @@ pub async fn provider_refresh_status(
 
 fn refresh_status_header() -> String {
     format!(
-        "{:<24}  {:<28}  {:<28}  {:<24}  {:<18}  {:<20}  {:<20}  {:<20}  {:<34}  {}",
+        "{:<24}  {:<28}  {:<28}  {:<24}  {:<18}  {:<20}  {:<20}  {:<20}  {:<44}  {}",
         "PROVIDER".bold(),
         "CREDENTIAL_KEY".bold(),
         "STRATEGY".bold(),
@@ -4503,7 +4503,7 @@ fn refresh_status_row(status: &ProviderCredentialRefreshStatus) -> String {
     let recovery_action = ProviderCredentialRefreshRecoveryAction::try_from(status.recovery_action)
         .unwrap_or(ProviderCredentialRefreshRecoveryAction::Unspecified);
     format!(
-        "{:<24}  {:<28}  {:<28}  {:<24}  {:<18}  {:<20}  {:<20}  {:<20}  {:<34}  {}",
+        "{:<24}  {:<28}  {:<28}  {:<24}  {:<18}  {:<20}  {:<20}  {:<20}  {:<44}  {}",
         status.provider_name,
         status.credential_key,
         provider_refresh_strategy_name(strategy),
@@ -7689,7 +7689,7 @@ mod tests {
             last_error: "token endpoint returned a very long error message that should be truncated for table readability"
                 .to_string(),
             recovery_action: ProviderCredentialRefreshRecoveryAction::Reauthorize as i32,
-            failure_code: "oauth_invalid_grant".to_string(),
+            failure_code: "oauth_rotated_refresh_token_handle_missing".to_string(),
             provider_error_subtype: "invalid_rapt".to_string(),
             last_error_at_ms: 1_767_225_000_000,
         });
@@ -7699,7 +7699,7 @@ mod tests {
         assert!(row.contains("oauth2_client_credentials"));
         assert!(row.contains("error"));
         assert!(row.contains("reauthorize"));
-        assert!(row.contains("oauth_invalid_grant"));
+        assert!(row.contains("oauth_rotated_refresh_token_handle_missing"));
         assert!(row.contains("2026-01-01 00:00:00"));
         assert!(!row.contains("292278994"));
         assert!(row.contains("..."));

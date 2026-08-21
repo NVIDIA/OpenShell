@@ -790,13 +790,17 @@ structured recovery action rather than parsing `LAST_ERROR`. For example,
 `oauth_invalid_grant` with recovery action `reauthorize` means the user must
 complete OAuth authorization again; `oauth_invalid_client` with
 `fix_configuration` means changing the user login alone will not repair the
-grant.
+grant. OpenShell parks `reauthorize` failures until an explicit rotation or
+reconfiguration. It retries `fix_configuration` failures hourly so externally
+repaired clocks, policies, or credential-store values can recover without
+creating rapid token-endpoint traffic. Transient and unrecognized failures use
+the existing bounded 60-second retry interval.
 
 The status table reports operational state without printing token values or refresh material:
 
 ```text
-PROVIDER                CREDENTIAL_KEY                STRATEGY                     STATUS              EXPIRES_AT            NEXT_REFRESH          LAST_REFRESH          LAST_ERROR
-my-graph                MS_GRAPH_ACCESS_TOKEN         oauth2_refresh_token         refreshed           2026-06-01 00:00:00   2026-05-31 23:50:00   2026-05-31 23:00:00   -
+PROVIDER                  CREDENTIAL_KEY                STRATEGY                      STATUS                    RECOVERY            EXPIRES_AT            NEXT_REFRESH          LAST_REFRESH          FAILURE_CODE                                  LAST_ERROR
+my-graph                  MS_GRAPH_ACCESS_TOKEN         oauth2_refresh_token          reauthorization_required  reauthorize         2026-06-01 00:00:00   -                     2026-05-31 23:00:00   oauth_invalid_grant                           OAuth refresh grant is no longer usable
 ```
 
 When no refresh configuration exists, the CLI distinguishes whole-provider checks from credential-specific checks:

@@ -213,9 +213,11 @@ When OAuth refresh fails, inspect the `RECOVERY` and `FAILURE_CODE` columns from
 user must obtain a new OAuth grant and run `provider refresh configure`,
 `fix_configuration` means an operator must repair the OAuth client, scopes, or
 administrator policy, and `investigate` means the issuer returned an
-unrecognized response. The gateway parks `reauthorize` and
-`fix_configuration` records until a manual rotate or reconfiguration. The
-existing access credential remains usable only until its recorded expiry.
+unrecognized response. The gateway parks `reauthorize` records until a manual
+rotate or reconfiguration. It retries
+`fix_configuration` records hourly so externally repaired configuration can
+recover without rapid token-endpoint traffic. The existing access credential
+remains usable only until its recorded expiry.
 
 ---
 
