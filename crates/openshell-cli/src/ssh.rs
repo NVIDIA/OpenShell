@@ -3,8 +3,8 @@
 
 //! SSH connection and proxy utilities.
 
-use crate::tls::{TlsOptions, grpc_client};
-use miette::{IntoDiagnostic, Result, WrapErr};
+use crate::tls::{GrpcConnectError, TlsOptions, grpc_client};
+use miette::{IntoDiagnostic, Report, Result, WrapErr};
 #[cfg(unix)]
 use nix::sys::signal::{SaFlags, SigAction, SigHandler, SigSet, Signal, sigaction};
 use openshell_core::forward::{
@@ -39,6 +39,56 @@ const FORWARD_LISTENER_PROBE_INTERVAL: Duration = Duration::from_millis(50);
 /// Per-attempt connect timeout, so one hung probe cannot consume the whole
 /// grace period.
 const FORWARD_LISTENER_CONNECT_TIMEOUT: Duration = Duration::from_millis(200);
+
+const SYNC_RETRY_ATTEMPTS: usize = 4;
+const SYNC_RETRY_DELAY: Duration = Duration::from_secs(2);
+
+#[derive(Debug, thiserror::Error, miette::Diagnostic)]
+#[error("ssh {operation} exited with status {status}")]
+struct SshCommandExitError {
+    operation: &'static str,
+    status: String,
+    code: Option<i32>,
+}
+
+#[derive(Debug, thiserror::Error, miette::Diagnostic)]
+#[error(transparent)]
+struct SyncGrpcStatusError(#[from] tonic::Status);
+
+#[derive(Debug, thiserror::Error, miette::Diagnostic)]
+#[error("{context}: {source}")]
+struct SyncIoError {
+    context: String,
+    #[source]
+    source: std::io::Error,
+}
+
+fn sync_io_error(context: impl Into<String>, source: std::io::Error) -> Report {
+    Report::new(SyncIoError {
+        context: context.into(),
+        source,
+    })
+}
+
+trait SyncIoResultExt<T> {
+    fn with_sync_context(self, context: impl Into<String>) -> Result<T>;
+}
+
+impl<T> SyncIoResultExt<T> for std::io::Result<T> {
+    fn with_sync_context(self, context: impl Into<String>) -> Result<T> {
+        self.map_err(|source| sync_io_error(context, source))
+    }
+}
+
+impl SshCommandExitError {
+    fn from_status(operation: &'static str, status: std::process::ExitStatus) -> Self {
+        Self {
+            operation,
+            status: status.to_string(),
+            code: status.code(),
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug)]
 pub enum Editor {
@@ -89,7 +139,7 @@ async fn ssh_session_config(
             workspace: workspace.to_string(),
         })
         .await
-        .into_diagnostic()?
+        .map_err(|error| Report::new(SyncGrpcStatusError(error)))?
         .into_inner()
         .sandbox
         .ok_or_else(|| miette::miette!("sandbox not found"))?;
@@ -99,7 +149,7 @@ async fn ssh_session_config(
             sandbox_id: sandbox.object_id().to_string(),
         })
         .await
-        .into_diagnostic()?;
+        .map_err(|error| Report::new(SyncGrpcStatusError(error)))?;
     let session = response.into_inner();
     validate_ssh_session_response(&session)
         .map_err(|err| miette::miette!("gateway returned invalid SSH session response: {err}"))?;
@@ -603,6 +653,7 @@ pub async fn sandbox_exec(
 }
 
 /// What to pack into the tar archive streamed to the sandbox.
+#[derive(Clone)]
 enum UploadSource {
     /// A single local file or directory.  `tar_name` controls the entry name
     /// inside the archive (e.g. the target basename for file-to-file uploads).
@@ -641,7 +692,9 @@ fn write_upload_archive<W: Write>(writer: W, source: UploadSource) -> Result<()>
             }
         }
     }
-    archive.finish().into_diagnostic()?;
+    archive
+        .finish()
+        .with_sync_context("failed to finish upload tar archive")?;
     Ok(())
 }
 
@@ -655,9 +708,7 @@ fn append_upload_path<W: Write>(
         Ok(metadata) => metadata,
         Err(err) if skip_missing && err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(err) => {
-            return Err(err)
-                .into_diagnostic()
-                .wrap_err_with(|| format!("failed to stat {}", local_path.display()));
+            return Err(err).with_sync_context(format!("failed to stat {}", local_path.display()));
         }
     };
     let file_type = metadata.file_type();
@@ -665,8 +716,10 @@ fn append_upload_path<W: Write>(
     if file_type.is_file() {
         archive
             .append_path_with_name(local_path, archive_path)
-            .into_diagnostic()
-            .wrap_err_with(|| format!("failed to add {} to tar archive", archive_path.display()))?;
+            .with_sync_context(format!(
+                "failed to add {} to tar archive",
+                archive_path.display()
+            ))?;
         return Ok(());
     }
 
@@ -674,13 +727,10 @@ fn append_upload_path<W: Write>(
         let dir_archive_path = upload_archive_dir_entry_path(archive_path);
         archive
             .append_dir(&dir_archive_path, local_path)
-            .into_diagnostic()
-            .wrap_err_with(|| {
-                format!(
-                    "failed to add directory {} to tar archive",
-                    archive_path.display()
-                )
-            })?;
+            .with_sync_context(format!(
+                "failed to add directory {} to tar archive",
+                archive_path.display()
+            ))?;
         append_upload_dir_contents(archive, local_path, archive_path)?;
         return Ok(());
     }
@@ -708,11 +758,9 @@ fn append_upload_dir_contents<W: Write>(
     archive_path: &Path,
 ) -> Result<()> {
     let mut entries = fs::read_dir(local_path)
-        .into_diagnostic()
-        .wrap_err_with(|| format!("failed to read directory {}", local_path.display()))?
+        .with_sync_context(format!("failed to read directory {}", local_path.display()))?
         .collect::<std::io::Result<Vec<_>>>()
-        .into_diagnostic()
-        .wrap_err_with(|| format!("failed to read directory {}", local_path.display()))?;
+        .with_sync_context(format!("failed to read directory {}", local_path.display()))?;
     entries.sort_by_key(fs::DirEntry::file_name);
 
     for entry in entries {
@@ -731,8 +779,7 @@ fn append_upload_symlink<W: Write>(
     metadata: &fs::Metadata,
 ) -> Result<()> {
     let target = fs::read_link(local_path)
-        .into_diagnostic()
-        .wrap_err_with(|| format!("failed to read symlink {}", local_path.display()))?;
+        .with_sync_context(format!("failed to read symlink {}", local_path.display()))?;
     let mut header = tar::Header::new_gnu();
     header.set_metadata(metadata);
     header.set_entry_type(tar::EntryType::Symlink);
@@ -740,13 +787,10 @@ fn append_upload_symlink<W: Write>(
     header.set_cksum();
     archive
         .append_link(&mut header, archive_path, target)
-        .into_diagnostic()
-        .wrap_err_with(|| {
-            format!(
-                "failed to add symlink {} to tar archive",
-                archive_path.display()
-            )
-        })?;
+        .with_sync_context(format!(
+            "failed to add symlink {} to tar archive",
+            archive_path.display()
+        ))?;
     Ok(())
 }
 
@@ -805,9 +849,10 @@ async fn ssh_tar_upload(
         .into_diagnostic()?;
 
     if !status.success() {
-        return Err(miette::miette!(
-            "ssh tar extract exited with status {status}"
-        ));
+        return Err(Report::new(SshCommandExitError::from_status(
+            "tar extract",
+            status,
+        )));
     }
 
     Ok(())
@@ -980,18 +1025,15 @@ pub async fn sandbox_sync_up_files(
     if files.is_empty() {
         return Ok(());
     }
-    ssh_tar_upload(
-        server,
-        name,
-        dest,
-        UploadSource::FileList {
-            base_dir: base_dir.to_path_buf(),
-            files: files.to_vec(),
-            archive_prefix: file_list_archive_prefix(local_path),
-        },
-        tls,
-        workspace,
-    )
+    let source = UploadSource::FileList {
+        base_dir: base_dir.to_path_buf(),
+        files: files.to_vec(),
+        archive_prefix: file_list_archive_prefix(local_path),
+    };
+    retry_sandbox_sync("upload", || {
+        let source = source.clone();
+        async move { ssh_tar_upload(server, name, dest, source, tls, workspace).await }
+    })
     .await
 }
 
@@ -1026,17 +1068,14 @@ pub async fn sandbox_sync_up(
     {
         let (parent, target_name) = split_sandbox_path(path);
         if parent != "/" {
-            return ssh_tar_upload(
-                server,
-                name,
-                Some(parent),
-                UploadSource::SinglePath {
-                    local_path: local_path.to_path_buf(),
-                    tar_name: target_name.into(),
-                },
-                tls,
-                workspace,
-            )
+            let source = UploadSource::SinglePath {
+                local_path: local_path.to_path_buf(),
+                tar_name: target_name.into(),
+            };
+            return retry_sandbox_sync("upload", || {
+                let source = source.clone();
+                async move { ssh_tar_upload(server, name, Some(parent), source, tls, workspace).await }
+            })
             .await;
         }
     }
@@ -1054,17 +1093,14 @@ pub async fn sandbox_sync_up(
         directory_upload_prefix(local_path)
     };
 
-    ssh_tar_upload(
-        server,
-        name,
-        sandbox_path,
-        UploadSource::SinglePath {
-            local_path: local_path.to_path_buf(),
-            tar_name,
-        },
-        tls,
-        workspace,
-    )
+    let source = UploadSource::SinglePath {
+        local_path: local_path.to_path_buf(),
+        tar_name,
+    };
+    retry_sandbox_sync("upload", || {
+        let source = source.clone();
+        async move { ssh_tar_upload(server, name, sandbox_path, source, tls, workspace).await }
+    })
     .await
 }
 
@@ -1113,10 +1149,10 @@ async fn ssh_run_capture_stdout(session: &SshSessionConfig, command: &str) -> Re
         .into_diagnostic()?
         .into_diagnostic()?;
     if !output.status.success() {
-        return Err(miette::miette!(
-            "ssh probe exited with status {}",
-            output.status
-        ));
+        return Err(Report::new(SshCommandExitError::from_status(
+            "probe",
+            output.status,
+        )));
     }
     decode_ssh_probe_stdout(output.stdout)
 }
@@ -1204,6 +1240,21 @@ pub async fn sandbox_sync_down(
     tls: &TlsOptions,
     workspace: &str,
 ) -> Result<()> {
+    retry_sandbox_sync("download", || async {
+        sandbox_sync_down_once(server, name, sandbox_path, dest, tls, workspace).await
+    })
+    .await
+}
+
+async fn sandbox_sync_down_once(
+    server: &str,
+    name: &str,
+    sandbox_path: &str,
+    dest: &str,
+    tls: &TlsOptions,
+    workspace: &str,
+) -> Result<()> {
+    let sandbox_path = validate_sandbox_source_path(sandbox_path)?;
     let session = ssh_session_config(server, name, tls, workspace).await?;
     let sandbox_path = resolve_sandbox_source_path(&session, sandbox_path).await?;
     let kind = probe_sandbox_source_kind(&session, &sandbox_path).await?;
@@ -1214,6 +1265,70 @@ pub async fn sandbox_sync_down(
             sandbox_sync_down_directory(&session, &sandbox_path, dest).await
         }
     }
+}
+
+async fn retry_sandbox_sync<F, Fut>(operation: &str, run: F) -> Result<()>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<()>>,
+{
+    retry_sandbox_sync_with_delay(operation, SYNC_RETRY_ATTEMPTS, SYNC_RETRY_DELAY, run).await
+}
+
+async fn retry_sandbox_sync_with_delay<F, Fut>(
+    operation: &str,
+    max_attempts: usize,
+    delay: Duration,
+    mut run: F,
+) -> Result<()>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<()>>,
+{
+    debug_assert!(max_attempts > 0);
+    let mut attempt = 1;
+    loop {
+        match run().await {
+            Ok(()) => return Ok(()),
+            Err(err) if attempt < max_attempts && sync_error_is_retryable(&err) => {
+                tracing::warn!(
+                    operation,
+                    attempt,
+                    max_attempts,
+                    error = %err,
+                    "sandbox sync operation failed; retrying"
+                );
+                tokio::time::sleep(delay).await;
+                attempt += 1;
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+fn sync_error_is_retryable(err: &Report) -> bool {
+    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(err.as_ref());
+    while let Some(error) = source {
+        if let Some(exit) = error.downcast_ref::<SshCommandExitError>() {
+            return exit.code == Some(255);
+        }
+        if let Some(status) = error.downcast_ref::<SyncGrpcStatusError>() {
+            return status.0.code() == tonic::Code::Unavailable;
+        }
+        if error.downcast_ref::<GrpcConnectError>().is_some() {
+            return true;
+        }
+        if let Some(io_error) = error.downcast_ref::<SyncIoError>() {
+            return matches!(
+                io_error.source.kind(),
+                std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::UnexpectedEof
+            );
+        }
+        source = error.source();
+    }
+    false
 }
 
 /// Stream a tar archive from the sandbox and extract it into a fresh
@@ -1245,8 +1360,7 @@ async fn stream_sandbox_tar(
         let mut archive = tar::Archive::new(stdout);
         archive
             .unpack(&extract_into)
-            .into_diagnostic()
-            .wrap_err("failed to extract tar archive from sandbox")?;
+            .with_sync_context("failed to extract tar archive from sandbox")?;
         Ok(())
     })
     .await
@@ -1258,9 +1372,10 @@ async fn stream_sandbox_tar(
         .into_diagnostic()?;
 
     if !status.success() {
-        return Err(miette::miette!(
-            "ssh tar create exited with status {status}"
-        ));
+        return Err(Report::new(SshCommandExitError::from_status(
+            "tar create",
+            status,
+        )));
     }
     Ok(())
 }
@@ -1707,6 +1822,97 @@ pub fn print_ssh_config(gateway: &str, name: &str, workspace: &str) {
 mod tests {
     use super::*;
     use crate::TEST_ENV_LOCK;
+    use std::sync::{Arc, atomic::AtomicUsize, atomic::Ordering};
+
+    fn io_sync_error(kind: std::io::ErrorKind) -> Report {
+        sync_io_error("test I/O failure", std::io::Error::from(kind))
+    }
+
+    fn ssh_exit_error(code: i32) -> Report {
+        Report::new(SshCommandExitError {
+            operation: "test",
+            status: format!("exit status: {code}"),
+            code: Some(code),
+        })
+    }
+
+    #[tokio::test]
+    async fn sandbox_sync_retry_succeeds_after_transient_disconnects() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let observed_attempts = Arc::clone(&attempts);
+        retry_sandbox_sync_with_delay("test", 4, Duration::ZERO, move || {
+            let attempts = Arc::clone(&attempts);
+            async move {
+                if attempts.fetch_add(1, Ordering::SeqCst) < 2 {
+                    Err(io_sync_error(std::io::ErrorKind::BrokenPipe))
+                } else {
+                    Ok(())
+                }
+            }
+        })
+        .await
+        .expect("third attempt should succeed");
+
+        assert_eq!(observed_attempts.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn sandbox_sync_retry_stops_after_exhausting_attempts() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let observed_attempts = Arc::clone(&attempts);
+        let err = retry_sandbox_sync_with_delay("test", 4, Duration::ZERO, move || {
+            let attempts = Arc::clone(&attempts);
+            async move {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                Err(io_sync_error(std::io::ErrorKind::ConnectionReset))
+            }
+        })
+        .await
+        .expect_err("all attempts should fail");
+
+        assert!(sync_error_is_retryable(&err));
+        assert_eq!(observed_attempts.load(Ordering::SeqCst), 4);
+    }
+
+    #[tokio::test]
+    async fn sandbox_sync_retry_returns_permanent_failure_immediately() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let observed_attempts = Arc::clone(&attempts);
+        let err = retry_sandbox_sync_with_delay("test", 4, Duration::ZERO, move || {
+            let attempts = Arc::clone(&attempts);
+            async move {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                Err(ssh_exit_error(1))
+            }
+        })
+        .await
+        .expect_err("exit 1 should not be retried");
+
+        assert!(!sync_error_is_retryable(&err));
+        assert_eq!(observed_attempts.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn sandbox_sync_retry_classifies_typed_failures() {
+        let unavailable = Report::new(SyncGrpcStatusError(tonic::Status::unavailable(
+            "gateway restarting",
+        )));
+        let invalid = Report::new(SyncGrpcStatusError(tonic::Status::invalid_argument(
+            "invalid path",
+        )));
+
+        assert!(sync_error_is_retryable(&unavailable));
+        assert!(sync_error_is_retryable(&ssh_exit_error(255)));
+        assert!(sync_error_is_retryable(&io_sync_error(
+            std::io::ErrorKind::UnexpectedEof
+        )));
+        assert!(!sync_error_is_retryable(&invalid));
+        assert!(!sync_error_is_retryable(&ssh_exit_error(1)));
+        assert!(!sync_error_is_retryable(&ssh_exit_error(2)));
+        assert!(!sync_error_is_retryable(&io_sync_error(
+            std::io::ErrorKind::PermissionDenied
+        )));
+    }
 
     #[test]
     fn upsert_host_block_appends_when_missing() {
@@ -1727,6 +1933,28 @@ mod tests {
         assert!(output.contains("LogLevel ERROR"));
         assert!(output.contains("Host other"));
         assert_eq!(output.matches("Host openshell-demo").count(), 1);
+    }
+
+    #[test]
+    fn sync_error_retry_filter_accepts_transport_failures() {
+        let err = miette::miette!("transport error: connection reset by peer");
+        assert!(sync_error_is_retryable(&err));
+    }
+
+    #[test]
+    fn sync_error_retry_filter_accepts_transient_ssh_probe_failures() {
+        let err = Err::<(), _>(miette::miette!(
+            "ssh probe exited with status exit status: 255"
+        ))
+        .wrap_err("failed to resolve sandbox source path '/sandbox/ha-sync/ha-sync-upload'")
+        .unwrap_err();
+        assert!(sync_error_is_retryable(&err));
+    }
+
+    #[test]
+    fn sync_error_retry_filter_rejects_validation_failures() {
+        let err = miette::miette!("sandbox source path '/etc/passwd' resolves outside /sandbox");
+        assert!(!sync_error_is_retryable(&err));
     }
 
     #[test]
