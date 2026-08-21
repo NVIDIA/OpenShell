@@ -130,7 +130,7 @@ if [ -z "${distro}" ]; then
 	usage >&2
 	exit 2
 fi
-if [[ ! ${distro} =~ ^[a-z0-9][a-z0-9-]*$ ]] ||
+if [[ ! ${distro} =~ ^[a-z0-9][a-z0-9.-]*$ ]] ||
 	[ ! -r "${OPENSHELL_TEST_GUEST_DISTROS}/${distro}" ]; then
 	echo "unknown distro: ${distro}" >&2
 	exit 2

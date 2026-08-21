@@ -1,0 +1,35 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Produce a deterministic pre-fix control from the Ubuntu-packaged profile.
+# Ubuntu's package may advance independently of this repository, so relying on
+# its version to retain the missing rule would make the regression probe flaky.
+
+- name: Remove the pasta AppArmor signal fix
+  hosts: test_vm
+  become: true
+  gather_facts: false
+
+  tasks:
+    - name: Require the packaged pasta AppArmor profile
+      ansible.builtin.stat:
+        path: /etc/apparmor.d/usr.bin.pasta
+      register: pasta_profile
+
+    - name: Reject guests without the pasta profile
+      ansible.builtin.assert:
+        that:
+          - pasta_profile.stat.exists
+        fail_msg: Apply podman-rootless-pasta before pasta-apparmor-control.
+
+    - name: Remove the Podman signal allowance
+      ansible.builtin.lineinfile:
+        path: /etc/apparmor.d/usr.bin.pasta
+        regexp: '^  signal \(receive\) peer=podman,$'
+        state: absent
+
+    - name: Reload the control pasta AppArmor profile
+      ansible.builtin.command:
+        cmd: apparmor_parser --replace /etc/apparmor.d/usr.bin.pasta
+      changed_when: true

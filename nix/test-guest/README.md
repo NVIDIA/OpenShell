@@ -28,12 +28,16 @@ nix/test-guest/
 ├── cache-seal.sh
 ├── distros/
 │   ├── ubuntu.nix
+│   ├── ubuntu-26.04.nix
 │   ├── centos.nix
 │   ├── fedora.nix
 │   └── rocky.nix
 └── configuration/
     ├── docker.yml
     ├── podman.yml
+    ├── podman-rootless-pasta.yml
+    ├── pasta-apparmor-control.yml
+    ├── pasta-apparmor-fix.yml
     └── selinux.yml
 ```
 
@@ -53,6 +57,7 @@ The root [`flake.nix`](../../flake.nix) exposes this directory as the `test-gues
 | Distro | Docker | Podman | SELinux | Package format |
 | --- | --- | --- | --- | --- |
 | Ubuntu 24.04 | Yes | Yes | No | `.deb` |
+| Ubuntu 26.04 | No | Rootless pasta + AppArmor | Yes | `.deb` |
 | CentOS Stream 10 | No | Yes | Yes | `.rpm` |
 | Fedora 44 | No | Yes | Yes | `.rpm` |
 | Rocky Linux 9 | Yes | Yes | Yes | `.rpm` |
@@ -61,6 +66,45 @@ The Ubuntu 24.04 Podman configuration is available for runtime and packaging
 checks, but its Podman 4 release does not provide the `pasta` rootless network
 helper required by OpenShell sandbox callbacks. OpenShell Podman E2E runs use
 the Fedora guest, which provides Podman 5 and `pasta`.
+
+## Rootless pasta AppArmor probe
+
+The `ubuntu-26.04` guest and `podman-rootless-pasta` configuration reproduce
+the host-side AppArmor path that rootless Podman uses to stop `pasta`. The
+configuration installs `passt`, Podman, and its rootless prerequisites; enables
+AppArmor and `kernel.apparmor_restrict_unprivileged_userns=1`; then verifies
+that Podman reports `true:pasta`. Because Ubuntu's package can advance outside
+this repository, `pasta-apparmor-control` removes the upstream Podman signal
+allowance from that packaged profile to create a deterministic pre-fix control.
+
+Copy the probe into an unmodified-package guest to test for the known denial:
+
+```shell
+nix run .#test-guest -- \
+  --distro ubuntu-26.04 \
+  --with podman-rootless-pasta \
+  --with pasta-apparmor-control \
+  --copy "$PWD/nix/test-guest/pasta-signal-probe.sh:/usr/local/bin/pasta-signal-probe" \
+  -- pasta-signal-probe --expect-denial
+```
+
+Apply `pasta-apparmor-fix` after the control configuration to add the upstream
+rule `signal (receive) peer=podman,`, reload the profile, and verify the clean
+path:
+
+```shell
+nix run .#test-guest -- \
+  --distro ubuntu-26.04 \
+  --with podman-rootless-pasta \
+  --with pasta-apparmor-control \
+  --with pasta-apparmor-fix \
+  --copy "$PWD/nix/test-guest/pasta-signal-probe.sh:/usr/local/bin/pasta-signal-probe" \
+  -- pasta-signal-probe --expect-clean
+```
+
+Use `--keep` when either run fails to retain the serial log and writable guest
+overlay for inspection. The probe tests one exact AppArmor signal denial; it
+does not replace the rootless Podman OpenShell E2E suite.
 
 List the available distros and configurations:
 
