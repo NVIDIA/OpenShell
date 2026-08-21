@@ -9,12 +9,13 @@
 
 let
   muslPkgs = pkgs.pkgsMusl;
+  stdenv = pkgs.stdenvAdapters.useMoldLinker muslPkgs.stdenv;
   rust-bin = rust-overlay.lib.mkRustBin { } muslPkgs;
   rustToolchain = (rust-bin.fromRustupToolchainFile ../../rust-toolchain.toml).override {
     enableLibsecret = false;
   };
 in
-muslPkgs.mkShell {
+(muslPkgs.mkShell.override { inherit stdenv; }) {
   packages = [
     rustToolchain
     (muslPkgs.callPackage ../pkgs/z3-static.nix { })
