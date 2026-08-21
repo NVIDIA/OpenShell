@@ -469,6 +469,13 @@ pkiInitJob:
   # for (timeoutSeconds - 30) to leave margin for ConfigMap creation. Increase
   # this if cert-manager takes longer than 90 seconds to issue certificates.
   timeoutSeconds: 120
+  # -- Fail the helm install/upgrade if cert-manager does not issue the
+  # certificate within the polling timeout. When false (default), the hook
+  # succeeds with a warning and you can run `helm upgrade` after cert-manager
+  # issues the certificate to create the backend CA ConfigMap. When true, the
+  # install fails immediately if the timeout is reached, providing clear feedback
+  # that BackendTLSPolicy is non-functional.
+  failOnTimeout: false
 
 # cert-manager Certificate/Issuer resources (requires cert-manager CRDs in-cluster).
 # Does not install cert-manager itself.
