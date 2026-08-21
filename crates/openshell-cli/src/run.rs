@@ -333,6 +333,22 @@ fn validate_memory_quantity(value: &str) -> Result<String> {
     Ok(value.to_string())
 }
 
+/// True when the gateway reports that this sandbox's topology never opens a
+/// supervisor session, so relay-backed operations cannot work.
+///
+/// Checked before attempting a session rather than after: the failure would
+/// otherwise surface through the `ssh` subprocess as `exit status 255`, which
+/// tells the reader nothing.
+fn sandbox_has_no_supervisor_session(sandbox: &Sandbox) -> bool {
+    sandbox.status.as_ref().is_some_and(|status| {
+        status.conditions.iter().any(|condition| {
+            condition.r#type == "SupervisorSession"
+                && condition.status.eq_ignore_ascii_case("false")
+                && condition.reason == "NotApplicable"
+        })
+    })
+}
+
 /// True when an error is the gateway rejecting a relay-backed operation because
 /// the sandbox's topology has no in-sandbox supervisor.
 fn is_no_supervisor_session_error(err: &miette::Report) -> bool {
@@ -1035,6 +1051,32 @@ pub async fn sandbox_create(
                     && (!std::io::stdin().is_terminal() || !std::io::stdout().is_terminal()))
             {
                 return Ok(());
+            }
+
+            // Skip the session entirely when the topology cannot serve one.
+            // Attempting it would spawn ssh, fail inside the subprocess, and
+            // surface as an opaque exit status.
+            if sandbox_has_no_supervisor_session(&last_sandbox) {
+                let had_command = !command.is_empty();
+                if !persist {
+                    let names = [sandbox_name.clone()];
+                    if let Err(err) = sandbox_delete(
+                        &effective_server,
+                        &names,
+                        false,
+                        workspace,
+                        &effective_tls,
+                        gateway_name,
+                    )
+                    .await
+                    {
+                        eprintln!("Failed to delete sandbox {sandbox_name}: {err}");
+                    }
+                }
+                report_no_supervisor_session(&sandbox_name, had_command, persist);
+                return Err(miette::miette!(
+                    "sandbox '{sandbox_name}' cannot open interactive sessions"
+                ));
             }
 
             let connect_result = if persist {
@@ -7776,7 +7818,46 @@ mod tests {
         assert!(sandbox_should_persist(true, None));
     }
 
-    use crate::run::is_no_supervisor_session_error;
+    use crate::run::{is_no_supervisor_session_error, sandbox_has_no_supervisor_session};
+
+    #[test]
+    fn detects_the_sessionless_condition_on_a_sandbox() {
+        use openshell_core::proto::{Sandbox, SandboxCondition, SandboxStatus};
+
+        let sessionless = Sandbox {
+            status: Some(SandboxStatus {
+                conditions: vec![SandboxCondition {
+                    r#type: "SupervisorSession".to_string(),
+                    status: "False".to_string(),
+                    reason: "NotApplicable".to_string(),
+                    message: openshell_core::error::no_supervisor_session_message(),
+                    last_transition_time: String::new(),
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(sandbox_has_no_supervisor_session(&sessionless));
+
+        // A supervisor that is merely not connected yet must not be mistaken
+        // for a topology that will never have one.
+        let still_settling = Sandbox {
+            status: Some(SandboxStatus {
+                conditions: vec![SandboxCondition {
+                    r#type: "Ready".to_string(),
+                    status: "False".to_string(),
+                    reason: "SupervisorNotConnected".to_string(),
+                    message: "Backend ready; waiting for supervisor session".to_string(),
+                    last_transition_time: String::new(),
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(!sandbox_has_no_supervisor_session(&still_settling));
+
+        assert!(!sandbox_has_no_supervisor_session(&Sandbox::default()));
+    }
 
     #[test]
     fn detects_the_no_supervisor_session_rejection() {

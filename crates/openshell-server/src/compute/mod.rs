@@ -3898,6 +3898,7 @@ struct ComposedPhase {
     phase: SandboxPhase,
     session_connected: bool,
     backend_ready_without_session: bool,
+    sessionless: bool,
 }
 
 impl ComposedPhase {
@@ -3923,6 +3924,7 @@ impl ComposedPhase {
             backend_ready_without_session: backend_phase == SandboxPhase::Ready
                 && !session_connected
                 && !sessionless,
+            sessionless,
         }
     }
 
@@ -3933,6 +3935,9 @@ impl ComposedPhase {
         spec: Option<&SandboxSpec>,
     ) {
         rewrite_user_facing_conditions(status, spec);
+        if self.sessionless {
+            ensure_no_supervisor_session_status(status, sandbox_name);
+        }
         if self.backend_ready_without_session {
             ensure_supervisor_not_connected_status(status, sandbox_name);
         } else if self.session_connected && self.phase == SandboxPhase::Ready {
@@ -3964,6 +3969,52 @@ fn ensure_supervisor_not_ready_status(status: &mut Option<SandboxStatus>, sandbo
             status: "False".to_string(),
             reason: "DependenciesNotReady".to_string(),
             message: "Supervisor session disconnected".to_string(),
+            last_transition_time: String::new(),
+        },
+    );
+}
+
+/// Condition type advertising whether a sandbox can serve relay-backed
+/// operations.
+///
+/// Carried in the public status so clients can tell that SSH, `exec`, port
+/// forwarding, and file transfer are unavailable *before* attempting one,
+/// rather than discovering it from a failed connection. Using a condition
+/// avoids adding a field to the public `Sandbox` message.
+pub const SUPERVISOR_SESSION_CONDITION: &str = "SupervisorSession";
+
+fn upsert_condition(
+    status: &mut Option<SandboxStatus>,
+    sandbox_name: &str,
+    condition: SandboxCondition,
+) {
+    let status = status.get_or_insert_with(|| SandboxStatus {
+        sandbox_name: sandbox_name.to_string(),
+        ..Default::default()
+    });
+
+    let condition_type = condition.r#type.clone();
+    if let Some(existing) = status
+        .conditions
+        .iter_mut()
+        .find(|existing| existing.r#type == condition_type)
+    {
+        *existing = condition;
+    } else {
+        status.conditions.push(condition);
+    }
+}
+
+/// Record that this sandbox's topology never opens a supervisor session.
+fn ensure_no_supervisor_session_status(status: &mut Option<SandboxStatus>, sandbox_name: &str) {
+    upsert_condition(
+        status,
+        sandbox_name,
+        SandboxCondition {
+            r#type: SUPERVISOR_SESSION_CONDITION.to_string(),
+            status: "False".to_string(),
+            reason: "NotApplicable".to_string(),
+            message: openshell_core::error::no_supervisor_session_message(),
             last_transition_time: String::new(),
         },
     );
