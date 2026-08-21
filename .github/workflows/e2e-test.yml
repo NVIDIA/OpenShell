@@ -157,6 +157,12 @@ jobs:
             podman_package_version: "5.7.0+ds2-3build1"
             conmon_package_version: "2.1.13+ds1-2"
             cmd: "env -u OPENSHELL_GATEWAY_BIN mise run --no-deps --skip-deps e2e:podman:external-driver"
+          - suite: provider-refresh-keycloak
+            runner: ubuntu-26.04
+            podman_major: "5"
+            podman_package_version: "5.7.0+ds2-3build1"
+            conmon_package_version: "2.1.13+ds1-2"
+            cmd: "mise run --no-deps --skip-deps e2e:provider-refresh-keycloak"
     env:
       IMAGE_TAG: ${{ inputs.image-tag }}
       MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
