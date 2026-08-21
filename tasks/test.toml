@@ -83,13 +83,13 @@ hide = true
 ["e2e:rust"]
 description = "Run Rust CLI e2e tests against a Docker-backed gateway"
 run = [
-  "e2e/with-docker-gateway.sh cargo test --manifest-path e2e/rust/Cargo.toml --features e2e-docker",
+  "e2e/with-docker-gateway.sh cargo test --manifest-path e2e/rust/Cargo.toml --features e2e-docker,e2e-cli-conformance",
 ]
 
 ["e2e:cli-conformance"]
 description = "Run the portable CLI conformance baseline against a Docker-backed gateway"
 run = [
-  "e2e/with-docker-gateway.sh cargo test --manifest-path e2e/rust/Cargo.toml --features e2e-docker,e2e-cli-conformance --test smoke",
+  "e2e/with-docker-gateway.sh cargo test --manifest-path e2e/rust/Cargo.toml --features e2e-docker,e2e-cli-conformance --test smoke --test sandbox_lifecycle --test sandbox_labels",
 ]
 
 ["e2e:websocket-conformance"]

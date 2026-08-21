@@ -46,6 +46,21 @@ path = "tests/oidc_pkce.rs"
 required-features = ["e2e-oidc-pkce"]
 
 [[test]]
+name = "smoke"
+path = "tests/smoke.rs"
+required-features = ["e2e-cli-conformance"]
+
+[[test]]
+name = "sandbox_lifecycle"
+path = "tests/sandbox_lifecycle.rs"
+required-features = ["e2e-cli-conformance"]
+
+[[test]]
+name = "sandbox_labels"
+path = "tests/sandbox_labels.rs"
+required-features = ["e2e-cli-conformance"]
+
+[[test]]
 name = "custom_image"
 path = "tests/custom_image.rs"
 required-features = ["e2e-docker"]

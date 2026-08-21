@@ -52,7 +52,7 @@ GATEWAY_BIN="${OPENSHELL_GATEWAY_BIN:-${ROOT}/target/debug/openshell-gateway}"
 DRIVER_BIN="${OPENSHELL_VM_DRIVER_BIN:-${ROOT}/target/debug/openshell-driver-vm}"
 CLI_BIN="${OPENSHELL_BIN:-${ROOT}/target/debug/openshell}"
 E2E_TEST_OVERRIDE="${OPENSHELL_E2E_VM_TEST:-}"
-E2E_FEATURES="${OPENSHELL_E2E_VM_FEATURES:-e2e-vm}"
+E2E_FEATURES="${OPENSHELL_E2E_VM_FEATURES:-e2e-vm,e2e-cli-conformance}"
 SANDBOX_IMAGE="${OPENSHELL_SANDBOX_IMAGE:-${COMMUNITY_SANDBOX_IMAGE:-ghcr.io/nvidia/openshell-community/sandboxes/base:latest}}"
 
 # The VM driver places `compute-driver.sock` under `[openshell.drivers.vm].state_dir`.

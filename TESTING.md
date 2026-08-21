@@ -149,8 +149,8 @@ Suites:
 
 - Common suite (`--features e2e`) - driver-neutral CLI behavior, sandbox lifecycle, sync, port forwarding, policy, and provider tests.
 - CLI conformance (`--features e2e-cli-conformance`) - a curated portable CLI
-  baseline selected from existing E2E test targets. The initial profile contains
-  the gateway smoke workflow and remains additive to the regular E2E suites.
+  baseline selected from existing E2E test targets. The profile contains gateway
+  smoke, sandbox lifecycle, and sandbox label workflows.
 - Docker suite (`--features e2e-docker`) - common suite plus Docker-only coverage such as Dockerfile image builds, Docker preflight checks, and managed Docker gateway start.
 - Docker GPU suite (`--features e2e-docker-gpu`) - Docker suite plus GPU sandbox smoke coverage.
 - VM suite (`--features e2e-vm`) - runs e2e tests on a VM.
@@ -179,8 +179,9 @@ gateway:
 mise run e2e:cli-conformance
 ```
 
-The conformance task selects existing test targets explicitly. Adding a test
-to the profile does not remove it from the regular E2E suites.
+The conformance task selects existing test targets explicitly. Driver suites
+enable the same profile when they run overlapping portable targets; the test
+implementations are shared instead of duplicated as driver-specific coverage.
 
 Run the Podman-backed Rust CLI e2e suite:
 
