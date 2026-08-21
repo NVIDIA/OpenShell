@@ -141,6 +141,7 @@ jobs:
           # Preserve compiled artifacts from failed lint/test runs so the next
           # push to the same PR branch does not start from a cold cache.
           cache-on-failure: "true"
+          cache-workspace-crates: "true"
           cache-bin: "false"
           cmd-format: nix develop .#devShells.${{ matrix.system }}.default -c {0}
 
