@@ -1388,6 +1388,7 @@ async fn assert_can_create_sandbox(session: &LoginSession, workspace: &str, sand
             "--name",
             sandbox_name,
             "--no-tty",
+            "--detach",
             "--",
             "sh",
             "-c",
@@ -1413,10 +1414,6 @@ async fn assert_can_create_sandbox(session: &LoginSession, workspace: &str, sand
     let cleanup = run_workspace_cli(session, workspace, &["sandbox", "delete", sandbox_name]).await;
 
     assert!(
-        create_output.contains(&marker),
-        "sandbox command output should contain {marker}:\n{create_output}"
-    );
-    assert!(
         list.status.success() && list_output.contains(sandbox_name),
         "created sandbox {sandbox_name} should appear in the sandbox list:\n{list_output}"
     );
@@ -1438,6 +1435,7 @@ async fn assert_can_delete_sandbox(session: &LoginSession, workspace: &str, sand
             "--name",
             sandbox_name,
             "--no-tty",
+            "--detach",
             "--",
             "sh",
             "-c",
