@@ -1055,6 +1055,10 @@ fn apply_child_env(
     }
 }
 
+const fn login_shell_flag(no_login_shell: bool) -> &'static str {
+    if no_login_shell { "-c" } else { "-lc" }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn spawn_pty_shell(
     policy: &SandboxPolicy,
@@ -1097,8 +1101,7 @@ fn spawn_pty_shell(
         },
         |command| {
             let mut c = Command::new("/bin/bash");
-            c.arg(if no_login_shell { "-c" } else { "-lc" })
-                .arg(command);
+            c.arg(login_shell_flag(no_login_shell)).arg(command);
             c
         },
     );
@@ -1261,8 +1264,7 @@ fn spawn_pipe_exec(
             // Login shell (-l) sources .profile/.bashrc so tool env vars
             // (VIRTUAL_ENV, etc.) are available. Callers that need a predictable
             // environment opt out via OPENSHELL_NO_LOGIN_SHELL → plain -c.
-            c.arg(if no_login_shell { "-c" } else { "-lc" })
-                .arg(command);
+            c.arg(login_shell_flag(no_login_shell)).arg(command);
             c
         },
     );
@@ -1766,6 +1768,38 @@ mod tests {
             output.status
         );
         assert_eq!(output.stdout, b"hello");
+    }
+
+    /// Command execution selects a login shell by default and a non-login shell
+    /// under `--no-login-shell`, so user startup files are sourced only in the
+    /// default case.
+    #[cfg(unix)]
+    #[test]
+    fn login_shell_flag_controls_profile_sourcing() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(home.path().join(".bash_profile"), "echo LOGIN_MARKER\n").unwrap();
+
+        let run = |flag: &str| -> String {
+            let out = Command::new("bash")
+                .arg(flag)
+                .arg("true")
+                .env("HOME", home.path())
+                .env_remove("BASH_ENV") // isolate: -c still reads BASH_ENV if set
+                .output()
+                .expect("spawn bash");
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        };
+
+        assert_eq!(login_shell_flag(true), "-c");
+        assert_eq!(login_shell_flag(false), "-lc");
+        assert!(
+            run("-lc").contains("LOGIN_MARKER"),
+            "login shell must source .bash_profile"
+        );
+        assert!(
+            !run("-c").contains("LOGIN_MARKER"),
+            "non-login shell must not source it"
+        );
     }
 
     /// Verify that the stdin writer delivers all buffered data before exiting
