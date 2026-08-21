@@ -65,11 +65,13 @@ pub fn prove(
         findings = apply_accepted_risks(findings, &accepted);
     }
 
-    let exit_code = if compact {
-        render_compact(&findings, policy_path, credentials_path)
+    if compact {
+        render_compact(&findings);
     } else {
-        render_report(&findings, policy_path, credentials_path)
-    };
+        render_report(&findings, policy_path, credentials_path);
+    }
+
+    let exit_code = i32::from(findings.iter().any(|f| !f.accepted));
 
     Ok(exit_code)
 }
@@ -310,5 +312,66 @@ network_policies:
             findings.is_empty(),
             "deny-all policy should produce no findings, got: {findings:?}"
         );
+    }
+
+    fn outcome(findings: &[finding::Finding]) -> i32 {
+        i32::from(findings.iter().any(|f| !f.accepted))
+    }
+
+    #[test]
+    fn test_outcome_empty_findings() {
+        assert_eq!(outcome(&[]), 0);
+    }
+
+    #[test]
+    fn test_outcome_accepted_only() {
+        let f = finding::Finding {
+            query: finding::category::LINK_LOCAL_REACH.to_owned(),
+            title: String::new(),
+            description: String::new(),
+            paths: vec![],
+            remediation: vec![],
+            accepted: true,
+            accepted_reason: "accepted for test".to_owned(),
+        };
+        assert_eq!(outcome(&[f]), 0);
+    }
+
+    #[test]
+    fn test_outcome_unaccepted_finding() {
+        let f = finding::Finding {
+            query: finding::category::LINK_LOCAL_REACH.to_owned(),
+            title: String::new(),
+            description: String::new(),
+            paths: vec![finding::FindingPath::Exfil(finding::ExfilPath {
+                binary: "/usr/bin/curl".to_owned(),
+                endpoint_host: "169.254.169.254".to_owned(),
+                endpoint_port: 80,
+                mechanism: String::new(),
+                policy_name: "test".to_owned(),
+                category: finding::category::LINK_LOCAL_REACH.to_owned(),
+                method: String::new(),
+            })],
+            remediation: vec![],
+            accepted: false,
+            accepted_reason: String::new(),
+        };
+        assert_eq!(outcome(&[f]), 1);
+    }
+
+    // prove() returns Ok(1) for an unaccepted pathless finding;
+    // renderers show REVIEW, not PASS, when unaccepted findings exist regardless of path count.
+    #[test]
+    fn test_outcome_pathless_unaccepted() {
+        let f = finding::Finding {
+            query: finding::category::LINK_LOCAL_REACH.to_owned(),
+            title: String::new(),
+            description: String::new(),
+            paths: vec![],
+            remediation: vec![],
+            accepted: false,
+            accepted_reason: String::new(),
+        };
+        assert_eq!(outcome(&[f]), 1);
     }
 }
