@@ -229,7 +229,7 @@ fn reset_transient_tty_signals(command: &mut Command) {
     }
 }
 
-fn exec_or_wait(mut command: Command, replace_process: bool) -> Result<()> {
+fn exec_or_wait(mut command: Command, replace_process: bool) -> Result<i32> {
     if replace_process && std::io::stdin().is_terminal() {
         #[cfg(unix)]
         {
@@ -248,11 +248,7 @@ fn exec_or_wait(mut command: Command, replace_process: bool) -> Result<()> {
 
     let status = command.status().into_diagnostic()?;
 
-    if !status.success() {
-        return Err(miette::miette!("ssh exited with status {status}"));
-    }
-
-    Ok(())
+    Ok(status.code().unwrap_or(1))
 }
 
 async fn sandbox_connect_with_mode(
@@ -261,7 +257,7 @@ async fn sandbox_connect_with_mode(
     tls: &TlsOptions,
     replace_process: bool,
     workspace: &str,
-) -> Result<()> {
+) -> Result<i32> {
     let session = ssh_session_config(server, name, tls, workspace).await?;
 
     let mut command = ssh_base_command(&session.proxy_command);
@@ -280,11 +276,11 @@ async fn sandbox_connect_with_mode(
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
 
-    tokio::task::spawn_blocking(move || exec_or_wait(command, replace_process))
+    let exit_code = tokio::task::spawn_blocking(move || exec_or_wait(command, replace_process))
         .await
         .into_diagnostic()??;
 
-    Ok(())
+    Ok(exit_code)
 }
 
 /// Connect to a sandbox via SSH.
@@ -293,7 +289,7 @@ pub async fn sandbox_connect(
     name: &str,
     tls: &TlsOptions,
     workspace: &str,
-) -> Result<()> {
+) -> Result<i32> {
     sandbox_connect_with_mode(server, name, tls, true, workspace).await
 }
 
@@ -302,7 +298,7 @@ pub(crate) async fn sandbox_connect_without_exec(
     name: &str,
     tls: &TlsOptions,
     workspace: &str,
-) -> Result<()> {
+) -> Result<i32> {
     sandbox_connect_with_mode(server, name, tls, false, workspace).await
 }
 

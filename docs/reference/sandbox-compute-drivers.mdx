@@ -29,7 +29,9 @@ The gateway forwards one exact, persisted main-process specification to every
 driver. Drivers serialize that specification in
 `OPENSHELL_MAIN_PROCESS_SPEC`; they do not install an idle `sleep` workload or
 reconstruct argv with shell parsing. Runtime restart policies are disabled so
-an exited canonical process remains a terminal sandbox error.
+an exited canonical process remains a terminal sandbox result. Exit code zero
+produces `Completed`; a nonzero or signal-normalized exit produces `Error`
+with the exact exit code. Driver and supervisor failures remain `Error`.
 
 ## Configure a Compute Driver
 

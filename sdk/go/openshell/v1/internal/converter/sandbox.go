@@ -125,6 +125,8 @@ func SandboxPhaseFromProto(phase pb.SandboxPhase) types.SandboxPhase {
 		return types.SandboxStopped
 	case pb.SandboxPhase_SANDBOX_PHASE_STARTING:
 		return types.SandboxStarting
+	case pb.SandboxPhase_SANDBOX_PHASE_COMPLETED:
+		return types.SandboxCompleted
 	default:
 		return types.SandboxUnknown
 	}
@@ -149,6 +151,8 @@ func SandboxPhaseToProto(phase types.SandboxPhase) pb.SandboxPhase {
 		return pb.SandboxPhase_SANDBOX_PHASE_STOPPED
 	case types.SandboxStarting:
 		return pb.SandboxPhase_SANDBOX_PHASE_STARTING
+	case types.SandboxCompleted:
+		return pb.SandboxPhase_SANDBOX_PHASE_COMPLETED
 	default:
 		return pb.SandboxPhase_SANDBOX_PHASE_UNKNOWN
 	}

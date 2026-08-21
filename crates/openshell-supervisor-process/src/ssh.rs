@@ -413,6 +413,12 @@ impl russh::server::Handler for SshHandler {
         reply: ChannelOpenHandle,
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
+        if self.main_session.finished() {
+            reply
+                .reject(ChannelOpenFailure::AdministrativelyProhibited)
+                .await;
+            return Ok(());
+        }
         // Validate port range before truncating u32 -> u16.  The SSH protocol
         // uses u32 for ports, but valid TCP ports are 0-65535.  Without this
         // check, port 65537 truncates to port 1 (privileged).
@@ -548,6 +554,10 @@ impl russh::server::Handler for SshHandler {
         channel: ChannelId,
         session: &mut Session,
     ) -> Result<(), Self::Error> {
+        if self.main_session.finished() {
+            session.channel_failure(channel)?;
+            return Ok(());
+        }
         session.channel_success(channel)?;
         // Only allocate a PTY when the client explicitly requested one via
         // pty_request.  VS Code Remote-SSH sends shell_request *without* a
@@ -565,6 +575,10 @@ impl russh::server::Handler for SshHandler {
         data: &[u8],
         session: &mut Session,
     ) -> Result<(), Self::Error> {
+        if self.main_session.finished() {
+            session.channel_failure(channel)?;
+            return Ok(());
+        }
         session.channel_success(channel)?;
         let command = String::from_utf8_lossy(data).trim().to_string();
         if command.is_empty() {
@@ -610,6 +624,7 @@ impl russh::server::Handler for SshHandler {
             state.main_detach_prefix_pending = false;
             state.input_sender = input;
             let mut output = self.main_session.subscribe();
+            let terminal_delivery = Arc::clone(&self.main_session);
             let handle = session.handle();
             session.channel_success(channel)?;
             if let Some(error) = input_warning {
@@ -625,11 +640,14 @@ impl russh::server::Handler for SshHandler {
                 loop {
                     match output.recv().await {
                         Ok(event) => {
-                            let exited = matches!(event, MainOutput::Exit(_));
-                            send_main_output(&handle, channel, event).await;
-                            if exited {
+                            if let MainOutput::Exit(code) = event {
+                                terminal_delivery.mark_terminal_delivered();
+                                terminal_delivery.wait_for_terminal_reported().await;
+                                let _ = send_main_output(&handle, channel, MainOutput::Exit(code))
+                                    .await;
                                 break;
                             }
+                            let _ = send_main_output(&handle, channel, event).await;
                         }
                         Err(error) => {
                             let _ = handle
@@ -652,7 +670,7 @@ impl russh::server::Handler for SshHandler {
             if let Some(state) = self.channels.get_mut(&channel) {
                 state.main_output_task = Some(output_task.abort_handle());
             }
-        } else if name == "sftp" {
+        } else if name == "sftp" && !self.main_session.finished() {
             session.channel_success(channel)?;
             // sftp-server speaks the SFTP binary protocol over stdin/stdout,
             // which is exactly what spawn_pipe_exec wires up.  This enables
@@ -810,20 +828,18 @@ impl russh::server::Handler for SshHandler {
     }
 }
 
-async fn send_main_output(handle: &Handle, channel: ChannelId, event: MainOutput) {
+async fn send_main_output(handle: &Handle, channel: ChannelId, event: MainOutput) -> bool {
     match event {
-        MainOutput::Stdout(data) => {
-            let _ = handle.data(channel, data).await;
-        }
-        MainOutput::Stderr(data) => {
-            let _ = handle.extended_data(channel, 1, data).await;
-        }
+        MainOutput::Stdout(data) => handle.data(channel, data).await.is_ok(),
+        MainOutput::Stderr(data) => handle.extended_data(channel, 1, data).await.is_ok(),
         MainOutput::Exit(code) => {
-            let _ = handle.eof(channel).await;
-            let _ = handle
+            let eof_sent = handle.eof(channel).await.is_ok();
+            let status_sent = handle
                 .exit_status_request(channel, code.max(0).unsigned_abs())
-                .await;
-            let _ = handle.close(channel).await;
+                .await
+                .is_ok();
+            let close_sent = handle.close(channel).await.is_ok();
+            eof_sent && status_sent && close_sent
         }
     }
 }

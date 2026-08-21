@@ -137,6 +137,12 @@ The gateway persists lifecycle intent before mutating compute:
 Ready -> Stopping -> Stopped -> Starting -> Ready
 ```
 
+A canonical main process that exits successfully follows `Ready -> Completed`.
+A nonzero or signal-normalized result follows `Ready -> Error` with a
+`MainProcessFailed` condition. Both retained results may be started explicitly,
+which creates a fresh main-process instance. Drivers must not automatically
+restart a completed or failed canonical process.
+
 `StopSandbox` and `StartSandbox` are idempotent driver operations. Stop
 retains the driver resource and its persistent workspace boundary while making
 exec, SSH, forwarding, and exposed services unavailable. Start reactivates the

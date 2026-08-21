@@ -246,15 +246,19 @@ impl OpenShellClient {
     }
 
     /// Poll [`OpenShellClient::get_sandbox`] until the sandbox reaches
-    /// [`SandboxPhase::Ready`] or the `timeout` elapses.
+    /// [`SandboxPhase::Ready`] or successful [`SandboxPhase::Completed`], or
+    /// until the `timeout` elapses.
     ///
     /// Returns the terminal sandbox snapshot on success. Returns an
     /// [`SdkError::Connect`] when the timeout expires, or whatever error
     /// the gateway returns if the sandbox transitions into
-    /// [`SandboxPhase::Error`].
+    /// [`SandboxPhase::Stopped`] or [`SandboxPhase::Error`].
     pub async fn wait_ready(&self, name: &str, timeout: Duration) -> Result<SandboxRef> {
         self.wait_for(name, timeout, |phase| match phase {
-            SandboxPhase::Ready => Some(Ok(())),
+            SandboxPhase::Ready | SandboxPhase::Completed => Some(Ok(())),
+            SandboxPhase::Stopped => Some(Err(SdkError::connect(format!(
+                "sandbox '{name}' main process failed"
+            )))),
             SandboxPhase::Error => Some(Err(SdkError::connect(format!(
                 "sandbox '{name}' entered error phase"
             )))),
@@ -644,15 +648,22 @@ impl WorkspaceScopedClient {
         sandbox_from_response(response.sandbox)
     }
 
-    /// Poll until the sandbox reaches [`SandboxPhase::Ready`] or the timeout
-    /// elapses.
+    /// Poll until the sandbox reaches [`SandboxPhase::Ready`] or successful
+    /// [`SandboxPhase::Completed`], or the timeout elapses.
     pub async fn wait_ready(&self, name: &str, timeout: Duration) -> Result<SandboxRef> {
         let deadline = Instant::now() + timeout;
         let mut delay = Duration::from_millis(250);
         loop {
             let snapshot = self.get_sandbox(name).await?;
             match snapshot.phase {
-                SandboxPhase::Ready => return Ok(snapshot),
+                SandboxPhase::Ready | SandboxPhase::Completed => return Ok(snapshot),
+                SandboxPhase::Stopped => {
+                    let detail = snapshot.exit_code.map_or_else(
+                        || "stopped before becoming ready".to_string(),
+                        |code| format!("main process failed with status {code}"),
+                    );
+                    return Err(SdkError::connect(format!("sandbox '{name}' {detail}")));
+                }
                 SandboxPhase::Error => {
                     return Err(SdkError::connect(format!(
                         "sandbox '{name}' entered error phase"

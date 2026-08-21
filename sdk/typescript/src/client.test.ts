@@ -291,6 +291,30 @@ describe('create', () => {
 });
 
 describe('waits', () => {
+  it('waitReady accepts successful main-process completion', async () => {
+    const sandbox = client({
+      getSandbox: () => ({
+        sandbox: {
+          metadata: { id: 'sb-id', name: 'sb' },
+          status: { phase: SandboxPhase.COMPLETED, exitCode: 0 },
+        },
+      }),
+    });
+    await expect(sandbox.waitReady('sb', 1)).resolves.toMatchObject({ phase: 'completed', exitCode: 0 });
+  });
+
+  it('waitReady rejects stopped main-process results without waiting for timeout', async () => {
+    const sandbox = client({
+      getSandbox: () => ({
+        sandbox: {
+          metadata: { id: 'sb-id', name: 'sb' },
+          status: { phase: SandboxPhase.STOPPED, exitCode: 7 },
+        },
+      }),
+    });
+    await expect(sandbox.waitReady('sb', 30)).rejects.toMatchObject({ code: 'connect' });
+  });
+
   it('waitReady rejects rather than hanging when get() never resolves', async () => {
     const sandbox = client({
       // Only settles when the per-poll deadline signal aborts the call.

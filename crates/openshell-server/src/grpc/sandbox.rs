@@ -1032,7 +1032,7 @@ pub(super) async fn handle_watch_sandbox(
                     if stop_on_terminal {
                         let phase = SandboxPhase::try_from(sandbox.phase())
                             .unwrap_or(SandboxPhase::Unknown);
-                        if phase == SandboxPhase::Ready {
+                        if is_watch_terminal(phase) {
                             return;
                         }
                     }
@@ -1106,7 +1106,7 @@ pub(super) async fn handle_watch_sandbox(
                                         }
                                         if stop_on_terminal {
                                             let phase = SandboxPhase::try_from(sandbox.phase()).unwrap_or(SandboxPhase::Unknown);
-                                            if phase == SandboxPhase::Ready {
+                                            if is_watch_terminal(phase) {
                                                 return;
                                             }
                                         }
@@ -1177,6 +1177,13 @@ pub(super) async fn handle_watch_sandbox(
     ));
 
     Ok(Response::new(WatchSandboxStream::new(rx, producer)))
+}
+
+fn is_watch_terminal(phase: SandboxPhase) -> bool {
+    matches!(
+        phase,
+        SandboxPhase::Ready | SandboxPhase::Completed | SandboxPhase::Stopped | SandboxPhase::Error
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -2457,6 +2464,30 @@ mod tests {
     }
 
     // ---- shell_escape ----
+
+    #[test]
+    fn watch_terminal_phases_include_command_results_and_errors() {
+        for phase in [
+            SandboxPhase::Ready,
+            SandboxPhase::Completed,
+            SandboxPhase::Stopped,
+            SandboxPhase::Error,
+        ] {
+            assert!(is_watch_terminal(phase), "{phase:?} should stop the watch");
+        }
+        for phase in [
+            SandboxPhase::Provisioning,
+            SandboxPhase::Starting,
+            SandboxPhase::Stopping,
+            SandboxPhase::Deleting,
+            SandboxPhase::Unknown,
+        ] {
+            assert!(
+                !is_watch_terminal(phase),
+                "{phase:?} should keep the watch open"
+            );
+        }
+    }
 
     #[test]
     fn telemetry_compute_driver_uses_resolved_driver_kind() {

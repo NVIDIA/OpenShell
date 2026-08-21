@@ -1651,10 +1651,49 @@ async fn sandbox_create_deletes_command_sessions_with_no_keep() {
         deleted_names(&server).await,
         vec![vec!["ephemeral-command".to_string()]]
     );
+    let requests = create_requests(&server).await;
+    assert_eq!(
+        requests[0]
+            .annotations
+            .get("openshell.nvidia.com/retention")
+            .map(String::as_str),
+        Some("ephemeral")
+    );
     assert_eq!(
         load_last_sandbox("openshell", "default"),
         None,
         "no-keep sandboxes should not be persisted as last-used"
+    );
+}
+
+#[tokio::test]
+async fn sandbox_create_returns_exact_main_status_after_no_keep_cleanup() {
+    let server = run_server().await;
+    let fake_ssh_dir = tempfile::tempdir().unwrap();
+    let xdg_dir = tempfile::tempdir().unwrap();
+    let _env = test_env(&fake_ssh_dir, &xdg_dir);
+    let tls = test_tls(&server);
+    install_executable_script(&fake_ssh_dir, "ssh", "#!/bin/sh\nexit 7\n");
+
+    let exit_code = run::sandbox_create(
+        &server.endpoint,
+        "openshell",
+        run::SandboxCreateConfig {
+            name: Some("ephemeral-failure"),
+            keep: false,
+            command: &["sh".into(), "-c".into(), "exit 7".into()],
+            ..test_config()
+        },
+        "default",
+        &tls,
+    )
+    .await
+    .expect("a main-process failure is a command result, not a cleanup error");
+
+    assert_eq!(exit_code, 7);
+    assert_eq!(
+        deleted_names(&server).await,
+        vec![vec!["ephemeral-failure".to_string()]]
     );
 }
 

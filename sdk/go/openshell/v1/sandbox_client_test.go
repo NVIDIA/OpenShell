@@ -633,6 +633,36 @@ func TestSandboxWaitReady_SandboxFailed(t *testing.T) {
 	require.Error(t, err)
 }
 
+func TestSandboxWaitReady_SandboxCompleted(t *testing.T) {
+	mock := newMockSandboxServer()
+	mock.sandboxes["complete-sb"] = &pb.Sandbox{
+		Metadata: &dm.ObjectMeta{Name: "complete-sb"},
+		Status:   &pb.SandboxStatus{Phase: pb.SandboxPhase_SANDBOX_PHASE_COMPLETED},
+	}
+	client, cleanup := setupSandboxTest(t, mock)
+	defer cleanup()
+
+	result, err := client.WaitReady(context.Background(), "default", "complete-sb")
+
+	require.NoError(t, err)
+	assert.Equal(t, SandboxCompleted, result.Status.Phase)
+}
+
+func TestSandboxWaitReady_SandboxStopped(t *testing.T) {
+	mock := newMockSandboxServer()
+	mock.sandboxes["stopped-sb"] = &pb.Sandbox{
+		Metadata: &dm.ObjectMeta{Name: "stopped-sb"},
+		Status:   &pb.SandboxStatus{Phase: pb.SandboxPhase_SANDBOX_PHASE_STOPPED},
+	}
+	client, cleanup := setupSandboxTest(t, mock)
+	defer cleanup()
+
+	_, err := client.WaitReady(context.Background(), "default", "stopped-sb")
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "stopped")
+}
+
 func TestSandboxWaitReady_SandboxDeleting(t *testing.T) {
 	mock := newMockSandboxServer()
 	mock.sandboxes["deleting-sb"] = &pb.Sandbox{
