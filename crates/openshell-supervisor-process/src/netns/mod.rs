@@ -21,6 +21,11 @@ use uuid::Uuid;
 const SUBNET_PREFIX: &str = "10.200.0";
 const HOST_IP_SUFFIX: u8 = 1;
 const SANDBOX_IP_SUFFIX: u8 = 2;
+/// Unprivileged port owned by the supervisor's policy DNS service. Workload
+/// queries still target the standard DNS port and nftables redirects them to
+/// this listener before the bypass fence runs.
+pub const POLICY_DNS_PORT: u16 = 15_053;
+pub const TRANSPARENT_TCP_PORT: u16 = 15_001;
 const IP_SEARCH_PATHS: &[&str] = &["/usr/sbin/ip", "/sbin/ip", "/usr/bin/ip", "/bin/ip"];
 const NSENTER_SEARCH_PATHS: &[&str] = &[
     "/usr/bin/nsenter",
@@ -316,6 +321,193 @@ impl NetworkNamespace {
         );
 
         Ok(())
+    }
+
+    /// Replace the ordinary bypass fence with the policy-DNS and transparent
+    /// TCP ruleset. This is fail-closed: callers must not release workload
+    /// execution unless every required rule was installed.
+    pub fn install_transparent_tcp_rules(
+        &self,
+        proxy_port: u16,
+        synthetic_ipv4_cidr: &str,
+        synthetic_ipv6_cidr: &str,
+    ) -> Result<()> {
+        self.validate_synthetic_pool_routes(synthetic_ipv4_cidr, synthetic_ipv6_cidr)?;
+        // The inner namespace has an IPv4 default route, but not an IPv6
+        // default route. Install only the active synthetic IPv6 epoch so the
+        // kernel reaches the nft OUTPUT hook; REDIRECT then reroutes it to
+        // the local transparent listener.
+        run_ip_netns(
+            &self.name,
+            &["-6", "route", "replace", synthetic_ipv6_cidr, "dev", "lo"],
+        )?;
+        let nft_path = find_nft().ok_or_else(|| {
+            miette::miette!(
+                "trusted nft helper not found; policy DNS and transparent TCP require nftables"
+            )
+        })?;
+        let host_ip = self.host_ip.to_string();
+        let log_prefix = format!("openshell:bypass:{}:", self.name);
+        let commands = nft_ruleset::generate_transparent_tcp_commands(
+            &host_ip,
+            proxy_port,
+            POLICY_DNS_PORT,
+            TRANSPARENT_TCP_PORT,
+            synthetic_ipv4_cidr,
+            synthetic_ipv6_cidr,
+            Some(&log_prefix),
+        );
+        run_nft_commands_netns(&self.name, &nft_path, &commands)?;
+        openshell_ocsf::ocsf_emit!(
+            openshell_ocsf::ConfigStateChangeBuilder::new(openshell_ocsf::ctx::ctx())
+                .severity(openshell_ocsf::SeverityId::Informational)
+                .status(openshell_ocsf::StatusId::Success)
+                .state(openshell_ocsf::StateId::Enabled, "installed")
+                .message(format!(
+                    "Policy DNS and transparent TCP capture installed [ns:{}]",
+                    self.name
+                ))
+                .build()
+        );
+        Ok(())
+    }
+
+    fn validate_synthetic_pool_routes(
+        &self,
+        synthetic_ipv4_cidr: &str,
+        synthetic_ipv6_cidr: &str,
+    ) -> Result<()> {
+        let reserved = [
+            synthetic_ipv4_cidr
+                .parse::<ipnet::IpNet>()
+                .into_diagnostic()?,
+            synthetic_ipv6_cidr
+                .parse::<ipnet::IpNet>()
+                .into_diagnostic()?,
+        ];
+        for family in ["-4", "-6"] {
+            let routes =
+                run_ip_netns_output(&self.name, &[family, "route", "show", "table", "all"])?;
+            if let Some((route, pool)) = first_route_overlap(&routes, &reserved) {
+                return Err(miette::miette!(
+                    "synthetic address pool {pool} overlaps workload route {route}; refusing to enable policy DNS"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Bind IPv4 and IPv6 transparent listeners inside the workload network
+    /// namespace without moving an async runtime worker into that namespace.
+    pub async fn bind_transparent_tcp_listeners(
+        &self,
+    ) -> std::io::Result<Vec<tokio::net::TcpListener>> {
+        let ns_fd = self
+            .ns_fd
+            .ok_or_else(|| std::io::Error::other("no namespace fd available for bind"))?;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        std::thread::spawn(move || {
+            let result = (|| -> std::io::Result<Vec<std::net::TcpListener>> {
+                #[allow(unsafe_code)]
+                if unsafe { libc::setns(ns_fd, libc::CLONE_NEWNET) } != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                let mut listeners = Vec::with_capacity(2);
+                for (domain, address) in [
+                    (
+                        socket2::Domain::IPV4,
+                        format!("0.0.0.0:{TRANSPARENT_TCP_PORT}"),
+                    ),
+                    (
+                        socket2::Domain::IPV6,
+                        format!("[::]:{TRANSPARENT_TCP_PORT}"),
+                    ),
+                ] {
+                    let socket = socket2::Socket::new(
+                        domain,
+                        socket2::Type::STREAM,
+                        Some(socket2::Protocol::TCP),
+                    )?;
+                    socket.set_reuse_address(true)?;
+                    if domain == socket2::Domain::IPV6 {
+                        socket.set_only_v6(true)?;
+                    }
+                    let address: std::net::SocketAddr = address.parse().map_err(|error| {
+                        std::io::Error::other(format!("invalid listener address: {error}"))
+                    })?;
+                    socket.bind(&address.into())?;
+                    socket.listen(128)?;
+                    let listener: std::net::TcpListener = socket.into();
+                    listener.set_nonblocking(true)?;
+                    listeners.push(listener);
+                }
+                Ok(listeners)
+            })();
+            let _ = tx.send(result);
+        });
+        rx.await
+            .map_err(|_| std::io::Error::other("netns bind thread panicked"))??
+            .into_iter()
+            .map(tokio::net::TcpListener::from_std)
+            .collect()
+    }
+
+    /// Bind UDP and TCP DNS listeners inside the workload network namespace.
+    /// The workload keeps its image-provided resolver configuration; nftables
+    /// redirects port 53 to these sockets before the bypass fence runs.
+    pub async fn bind_policy_dns_sockets(
+        &self,
+    ) -> std::io::Result<(tokio::net::UdpSocket, tokio::net::TcpListener)> {
+        let ns_fd = self
+            .ns_fd
+            .ok_or_else(|| std::io::Error::other("no namespace fd available for bind"))?;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        std::thread::spawn(move || {
+            let result = (|| -> std::io::Result<(std::net::UdpSocket, std::net::TcpListener)> {
+                #[allow(unsafe_code)]
+                if unsafe { libc::setns(ns_fd, libc::CLONE_NEWNET) } != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                // Bind the exact REDIRECT destination instead of INADDR_ANY.
+                // For UDP this keeps replies sourced from loopback so
+                // conntrack can reverse the port/address translation before
+                // delivering them to libc in nested rootless namespaces.
+                let address: std::net::SocketAddr = format!("127.0.0.1:{POLICY_DNS_PORT}")
+                    .parse()
+                    .map_err(|error| {
+                        std::io::Error::other(format!("invalid DNS listener address: {error}"))
+                    })?;
+
+                let udp = socket2::Socket::new(
+                    socket2::Domain::IPV4,
+                    socket2::Type::DGRAM,
+                    Some(socket2::Protocol::UDP),
+                )?;
+                udp.set_reuse_address(true)?;
+                udp.bind(&address.into())?;
+                udp.set_nonblocking(true)?;
+
+                let tcp = socket2::Socket::new(
+                    socket2::Domain::IPV4,
+                    socket2::Type::STREAM,
+                    Some(socket2::Protocol::TCP),
+                )?;
+                tcp.set_reuse_address(true)?;
+                tcp.bind(&address.into())?;
+                tcp.listen(128)?;
+                tcp.set_nonblocking(true)?;
+
+                Ok((udp.into(), tcp.into()))
+            })();
+            let _ = tx.send(result);
+        });
+        let (udp, tcp) = rx
+            .await
+            .map_err(|_| std::io::Error::other("netns DNS bind thread panicked"))??;
+        Ok((
+            tokio::net::UdpSocket::from_std(udp)?,
+            tokio::net::TcpListener::from_std(tcp)?,
+        ))
     }
 
     /// Bind a TCP listener inside this network namespace on a dedicated thread.
@@ -729,6 +921,10 @@ fn run_nft_commands_current_namespace(
 /// The supervisor's operations (addr add, link set, route add) are all
 /// netlink-based and do not need sysfs access.
 fn run_ip_netns(netns: &str, args: &[&str]) -> Result<()> {
+    run_ip_netns_output(netns, args).map(|_| ())
+}
+
+fn run_ip_netns_output(netns: &str, args: &[&str]) -> Result<String> {
     let ip_path = find_trusted_binary("ip", IP_SEARCH_PATHS)?;
     let nsenter_path = find_trusted_binary("nsenter", NSENTER_SEARCH_PATHS)?;
     let ns_path = openshell_core::container_paths::netns_path(netns);
@@ -757,7 +953,31 @@ fn run_ip_netns(netns: &str, args: &[&str]) -> Result<()> {
         ));
     }
 
-    Ok(())
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+fn first_route_overlap(
+    routes: &str,
+    reserved: &[ipnet::IpNet],
+) -> Option<(ipnet::IpNet, ipnet::IpNet)> {
+    routes.lines().find_map(|line| {
+        line.split_whitespace().find_map(|token| {
+            let route = token
+                .parse::<ipnet::IpNet>()
+                .ok()
+                .or_else(|| token.parse::<IpAddr>().ok().map(ipnet::IpNet::from))?;
+            reserved
+                .iter()
+                .copied()
+                .find(|pool| {
+                    let same_family = route.addr().is_ipv4() == pool.addr().is_ipv4();
+                    let overlaps =
+                        route.contains(&pool.network()) || pool.contains(&route.network());
+                    same_family && overlaps
+                })
+                .map(|pool| (route, pool))
+        })
+    })
 }
 
 /// Run a sequence of nft commands inside a network namespace via `nsenter --net=`.
@@ -963,6 +1183,28 @@ fe800000000000000000000000000001 02 40 20 80 eth0
 ";
 
         assert!(has_non_loopback_ipv6_interface(content));
+    }
+
+    #[test]
+    fn route_overlap_detects_reserved_pool_collision() {
+        let reserved = [
+            "198.18.1.0/25".parse().unwrap(),
+            "fd23:6f70:656e:1::/120".parse().unwrap(),
+        ];
+        let routes = "default via 10.200.0.1 dev veth\n198.18.0.0/15 dev eth1\n";
+        let (route, pool) = first_route_overlap(routes, &reserved).expect("collision");
+        assert_eq!(route.to_string(), "198.18.0.0/15");
+        assert_eq!(pool.to_string(), "198.18.1.0/25");
+    }
+
+    #[test]
+    fn route_overlap_ignores_default_and_unrelated_routes() {
+        let reserved = [
+            "198.18.1.0/25".parse().unwrap(),
+            "fd23:6f70:656e:1::/120".parse().unwrap(),
+        ];
+        let routes = "default via 10.200.0.1 dev veth\n10.200.0.0/24 dev veth\n";
+        assert_eq!(first_route_overlap(routes, &reserved), None);
     }
 
     #[test]

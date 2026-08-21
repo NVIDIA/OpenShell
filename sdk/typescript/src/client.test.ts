@@ -215,6 +215,25 @@ describe('create', () => {
     expect(created.spec?.policy?.version).toBe(1);
   });
 
+  it('sends canonical main process fields', async () => {
+    let created: { spec?: { command?: string[]; tty?: boolean } } = {};
+    const sandbox = client({
+      createSandbox: (req) => {
+        created = req;
+        return readySandbox('sb', 'sb-id');
+      },
+    });
+
+    await sandbox.create({
+      image: 'img',
+      command: ['/opt/worker', '--serve'],
+      tty: true,
+    });
+
+    expect(created.spec?.command).toEqual(['/opt/worker', '--serve']);
+    expect(created.spec?.tty).toBe(true);
+  });
+
   it('rawSpec reaches an ungated field and overrides a curated one', async () => {
     let created: {
       spec?: {
@@ -247,6 +266,27 @@ describe('create', () => {
       getSandbox: () => ({ sandbox: { status: { phase: SandboxPhase.READY } } }),
     });
     await expect(sandbox.get('sb')).rejects.toMatchObject({ code: 'invalid_config' });
+  });
+
+  it('maps canonical main process status', async () => {
+    const sandbox = client({
+      getSandbox: () => ({
+        sandbox: {
+          metadata: { id: 'sb-id', name: 'sb', resourceVersion: 8n },
+          status: {
+            phase: SandboxPhase.ERROR,
+            mainProcessInstanceId: 'main-1',
+            exitCode: 9,
+          },
+        },
+      }),
+    });
+
+    await expect(sandbox.get('sb')).resolves.toMatchObject({
+      phase: 'error',
+      mainProcessInstanceId: 'main-1',
+      exitCode: 9,
+    });
   });
 });
 

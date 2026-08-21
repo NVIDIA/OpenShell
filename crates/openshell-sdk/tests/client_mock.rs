@@ -100,6 +100,13 @@ fn workspace_proto(name: &str, phase: proto::datamodel::v1::WorkspacePhase) -> p
 
 #[tonic::async_trait]
 impl OpenShell for TestOpenShell {
+    async fn report_main_process_exit(
+        &self,
+        _request: tonic::Request<proto::ReportMainProcessExitRequest>,
+    ) -> Result<Response<proto::ReportMainProcessExitResponse>, Status> {
+        Err(Status::unimplemented("not used by this test server"))
+    }
+
     async fn get_current_user(
         &self,
         _request: tonic::Request<proto::GetCurrentUserRequest>,

@@ -13,7 +13,9 @@ use openshell_core::proto::{
     ProviderProfileCredential, ProviderProfileDiscovery,
 };
 use openshell_core::secrets::uses_reserved_revision_namespace;
-use openshell_policy::{L7EndpointFields, validate_l7_endpoint_semantics};
+use openshell_policy::{
+    L7EndpointFields, validate_explicit_tcp_additional_fields, validate_l7_endpoint_semantics,
+};
 use serde::ser::SerializeStruct;
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use std::collections::{HashMap, HashSet};
@@ -1923,6 +1925,17 @@ pub fn validate_profile_set(
                     msg,
                 ));
             }
+            for msg in validate_explicit_tcp_additional_fields(
+                &endpoint.protocol,
+                &additional_l7_profile_fields(endpoint),
+            ) {
+                diagnostics.push(ProfileValidationDiagnostic::error(
+                    source,
+                    profile_id,
+                    format!("endpoints[{index}]"),
+                    msg,
+                ));
+            }
 
             if endpoint.protocol == "mcp" {
                 let strict_tool_names = endpoint
@@ -2261,6 +2274,49 @@ fn endpoint_is_valid(endpoint: &EndpointProfile) -> bool {
             .all(|port| (1..=65_535).contains(port));
     }
     (1..=65_535).contains(&endpoint.port)
+}
+
+fn additional_l7_profile_fields(endpoint: &EndpointProfile) -> Vec<&'static str> {
+    let mut fields = Vec::new();
+    for (name, present) in [
+        ("enforcement", !endpoint.enforcement.is_empty()),
+        ("path", !endpoint.path.is_empty()),
+        ("allow_encoded_slash", endpoint.allow_encoded_slash),
+        (
+            "websocket_credential_rewrite",
+            endpoint.websocket_credential_rewrite,
+        ),
+        (
+            "request_body_credential_rewrite",
+            endpoint.request_body_credential_rewrite,
+        ),
+        ("persisted_queries", !endpoint.persisted_queries.is_empty()),
+        (
+            "graphql_persisted_queries",
+            !endpoint.graphql_persisted_queries.is_empty(),
+        ),
+        (
+            "graphql_max_body_bytes",
+            endpoint.graphql_max_body_bytes > 0,
+        ),
+        (
+            "json_rpc_max_body_bytes",
+            endpoint.json_rpc_max_body_bytes > 0,
+        ),
+        ("mcp", endpoint.mcp.is_some()),
+        (
+            "credential_signing",
+            !endpoint.credential_signing.is_empty(),
+        ),
+        ("signing_service", !endpoint.signing_service.is_empty()),
+        ("signing_region", !endpoint.signing_region.is_empty()),
+    ] {
+        if present {
+            fields.push(name);
+        }
+    }
+
+    fields
 }
 
 #[derive(Debug, Clone)]
@@ -4349,6 +4405,112 @@ binaries:
             .filter(|d| d.severity == "error")
             .collect();
         assert!(errors.is_empty(), "unexpected errors: {errors:?}");
+    }
+
+    #[test]
+    fn validate_accepts_explicit_tcp_without_l7_fields() {
+        let profile = parse_profile_yaml(
+            r"
+id: valid-tcp
+display_name: Valid TCP
+credentials:
+  - name: api_key
+    env_vars: [API_KEY]
+    auth_style: bearer
+    header_name: authorization
+discovery:
+  credentials: [api_key]
+endpoints:
+  - host: database.example.com
+    port: 5432
+    protocol: tcp
+    tls: skip
+    allow_uninspected_credentials: true
+    allowed_ips: [10.0.0.0/8]
+binaries:
+  - /usr/bin/psql
+",
+        )
+        .expect("profile should parse");
+
+        let diagnostics = validate_profile_set(&[("profile.yaml".to_string(), profile)]);
+        let errors: Vec<_> = diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.severity == "error")
+            .collect();
+        assert!(errors.is_empty(), "unexpected errors: {errors:?}");
+    }
+
+    #[test]
+    fn validate_rejects_additional_l7_field_families_with_explicit_tcp() {
+        let profile = parse_profile_yaml(
+            r"
+id: invalid-tcp-l7
+display_name: Invalid TCP L7
+credentials:
+  - name: api_key
+    env_vars: [API_KEY]
+    auth_style: bearer
+    header_name: authorization
+discovery:
+  credentials: [api_key]
+endpoints:
+  - host: database.example.com
+    port: 5432
+    protocol: tcp
+    enforcement: enforce
+    path: /query
+    allow_encoded_slash: true
+    websocket_credential_rewrite: true
+    request_body_credential_rewrite: true
+    persisted_queries: allow_registered
+    graphql_persisted_queries:
+      hash:
+        operation_type: query
+    graphql_max_body_bytes: 1024
+    json_rpc_max_body_bytes: 1024
+    mcp:
+      strict_tool_names: false
+    credential_signing: sigv4
+    signing_service: rds
+    signing_region: us-west-2
+binaries:
+  - /usr/bin/psql
+",
+        )
+        .expect("profile should parse");
+
+        let diagnostics = validate_profile_set(&[("profile.yaml".to_string(), profile)]);
+        let tcp_error = diagnostics
+            .iter()
+            .find(|diagnostic| {
+                diagnostic
+                    .message
+                    .contains("protocol tcp does not support L7-only fields")
+            })
+            .expect("explicit TCP should reject additional L7 fields");
+
+        for field in [
+            "enforcement",
+            "path",
+            "allow_encoded_slash",
+            "websocket_credential_rewrite",
+            "request_body_credential_rewrite",
+            "persisted_queries",
+            "graphql_persisted_queries",
+            "graphql_max_body_bytes",
+            "json_rpc_max_body_bytes",
+            "mcp",
+            "credential_signing",
+            "signing_service",
+            "signing_region",
+        ] {
+            assert!(
+                tcp_error.message.contains(field),
+                "missing {field}: {}",
+                tcp_error.message
+            );
+        }
     }
 
     #[test]

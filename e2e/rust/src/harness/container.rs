@@ -311,27 +311,46 @@ impl SupportContainer {
     /// network and wait until `ready_port` accepts TCP connections inside the
     /// container.
     pub async fn start_python(alias: &str, script: &str, ready_port: u16) -> Result<Self, String> {
+        Self::start_python_with_capabilities(alias, script, ready_port, &[]).await
+    }
+
+    /// Start a Python support container with the requested Linux capabilities.
+    pub async fn start_python_with_capabilities(
+        alias: &str,
+        script: &str,
+        ready_port: u16,
+        capabilities: &[&str],
+    ) -> Result<Self, String> {
         let engine = ContainerEngine::from_env()?;
         let network = e2e_network_name().ok_or_else(|| {
             "SupportContainer requires OPENSHELL_E2E_NETWORK_NAME (managed gateway network mode)"
                 .to_string()
         })?;
 
+        let mut args = vec![
+            "run".to_string(),
+            "--detach".to_string(),
+            "--entrypoint".to_string(),
+            "python3".to_string(),
+            "--network".to_string(),
+            network.clone(),
+            "--network-alias".to_string(),
+            alias.to_string(),
+        ];
+        args.extend(
+            capabilities
+                .iter()
+                .map(|capability| format!("--cap-add={capability}")),
+        );
+        args.extend([
+            DEFAULT_TEST_SERVER_IMAGE.to_string(),
+            "-c".to_string(),
+            script.to_string(),
+        ]);
+
         let output = engine
             .command()
-            .args([
-                "run",
-                "--detach",
-                "--entrypoint",
-                "python3",
-                "--network",
-                &network,
-                "--network-alias",
-                alias,
-                DEFAULT_TEST_SERVER_IMAGE,
-                "-c",
-                script,
-            ])
+            .args(&args)
             .output()
             .map_err(|e| format!("start {} support container: {e}", engine.name()))?;
 

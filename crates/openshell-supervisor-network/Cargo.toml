@@ -27,6 +27,7 @@ bytes = { workspace = true }
 flate2 = "1"
 glob = { workspace = true }
 hex = "0.4"
+hickory-proto = "0.26.1"
 ipnet = "2"
 miette = { workspace = true }
 prost-types = { workspace = true }

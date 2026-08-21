@@ -13,6 +13,9 @@ Each runtime receives a sandbox spec from the gateway and is responsible for:
 - Injecting sandbox identity and gateway callback configuration.
 - Supplying TLS or secret material for supervisor callbacks.
 - Providing the supervisor binary or image in the workload.
+- Forwarding the exact canonical main-process argv and TTY mode without shell
+  reconstruction. The sandbox-level environment and policy workspace apply to
+  the main process.
 - Reporting lifecycle and platform events back to the gateway.
 - Cleaning up runtime-owned resources.
 
@@ -22,6 +25,17 @@ nothing more. Drivers must not gate on supervisor session state or hold
 references to gateway-internal types. The gateway owns the public
 `SandboxPhase::Ready` decision. This applies equally to extension drivers
 implementing `ComputeDriver` out of tree.
+
+`compute_driver.proto` is the supported gateway/driver extension boundary.
+At initialization the gateway snapshots the driver's identity, version,
+default image, and gateway-lifecycle preference from `GetCapabilities`.
+Process-identity omissions are preserved across this boundary so every driver
+can apply its native image or runtime defaults. Driver-requested listeners are
+structurally validated and remain restricted to sandbox callback RPCs.
+
+Canonical main-process support is part of the `ComputeDriver` contract. Every
+in-tree and extension driver must forward the exact specification; it is not an
+optional capability that drivers can omit or negotiate.
 
 Drivers own runtime-specific platform event interpretation. When an event should
 drive client provisioning UI, the driver attaches the shared
@@ -84,6 +98,37 @@ The gateway records driver identity and version from the startup capability
 response. Elevated gateway info reports that initialized driver snapshot instead
 of re-querying drivers on each request.
 
+## Compiled Driver Selection
+
+The gateway binary explicitly installs the compute drivers compiled into that
+binary before entering server startup. The server selects a configured driver
+by normalized registry name. When no driver is configured, it evaluates only
+the installed drivers' probes in registered priority order, records every
+available registration, and selects the first. Drivers without a probe,
+including VM, remain opt-in.
+
+Startup computes this selection once after merging configuration. The same
+selection drives authentication defaults and runtime construction, so a probe
+result cannot change which driver is constructed later in startup.
+
+This follows the same composition model as SQLx's `Any` drivers: the binary
+defines the available implementation set, while the runtime consumes a generic
+registry. Adding or removing a compiled driver therefore changes registration
+rather than the server's selection flow. Alternate gateway binaries can install
+their own `ComputeDriverFactory` registrations and hand the completed registry
+to `run_cli_with_compute_drivers`; factories receive merged driver config and
+finish through the same in-process runtime adapter. A configured UDS endpoint
+still takes precedence over a compiled registration with the same name.
+
+The standard server crate groups first-party registrations behind the
+`in-tree-compute-drivers` feature. Protocol-only gateway builds disable that
+feature and link no compute-driver crates. E2E lanes compose that gateway with
+Docker, Podman, Kubernetes, and VM driver executables over the public UDS gRPC
+contract so an in-tree driver cannot silently depend on a server-only API.
+External Kubernetes drivers support shared and managed workspace modes.
+Operator mode requires an in-process dynamic namespace allowlist and is
+rejected when Kubernetes is configured through an external endpoint.
+
 ## Stop and Start Lifecycle
 
 The gateway persists lifecycle intent before mutating compute:
@@ -119,6 +164,11 @@ shared idempotent `StartSandbox` RPC before watch processing begins. Explicitly
 cluster-owned and continue running without gateway shutdown or startup
 lifecycle calls.
 
+The driver reports this behavior through
+`GetCapabilities.gateway_manages_lifecycle`. The same declaration works for
+in-process and external drivers. Older drivers omit the field and retain the
+conservative operator-managed behavior.
+
 ## Deletion Lifecycle
 
 Lifecycle requests use per-sandbox gates to serialize stop, start, and
@@ -152,11 +202,11 @@ delete, reconciliation removes the row; otherwise it can remain `Deleting`.
 
 | Runtime | Best fit | Sandbox boundary | Notes |
 |---|---|---|---|
-| Docker | Local development with Docker available. | Container plus nested sandbox namespace. | Uses host networking so loopback gateway endpoints work from the supervisor. |
-| Podman | Rootless or single-machine deployments. | Container plus nested sandbox namespace. | Uses the Podman REST API and CDI GPU devices when available. Delivers the supervisor via OCI image volume by default; falls back to extracting the binary to a host-side cache and bind-mounting it when `userns` is configured (overlay does not support idmapped mounts). |
+| Docker | Local development with Docker available. | Container plus nested sandbox namespace. | Uses host networking so loopback gateway endpoints work from the supervisor. Advertises the combined-supervisor policy-DNS and transparent-TCP substrate. |
+| Podman | Rootless or single-machine deployments. | Container plus nested sandbox namespace. | Uses the Podman REST API and CDI GPU devices when available. Delivers the supervisor via OCI image volume by default; falls back to extracting the binary to a host-side cache and bind-mounting it when `userns` is configured (overlay does not support idmapped mounts). Advertises the combined-supervisor policy-DNS and transparent-TCP substrate. |
 | Kubernetes | Cluster deployment through Helm. | Pod plus nested sandbox namespace. | Uses Kubernetes API objects, service accounts, secrets, PVC-backed workspace storage, and GPU resources. |
 | VM | Experimental microVM isolation. | Per-sandbox libkrun VM. | Managed endpoint-backed driver. The gateway spawns `openshell-driver-vm`, waits for its Unix socket, and then consumes it through the same remote `compute_driver.proto` path used by unmanaged endpoint drivers. The VM driver boots a cached bootstrap `rootfs.ext4`, prepares requested OCI images inside a bootstrap VM with `umoci`, attaches the prepared image disk read-only, and gives each sandbox a writable `overlay.ext4` for merged-root changes and runtime material. The driver persists each accepted launch request beside the overlay and restarts those VMs on driver startup without recreating the overlay. |
-| Extension | Out-of-tree drivers operated alongside the gateway. | Whatever boundary the driver implements. | Selected by a non-reserved custom `compute_drivers = ["<name>"]` entry with `[openshell.drivers.<name>].socket_path`, or at launch time by pairing `--drivers <name>` with `--compute-driver-socket=<path>`. Reserved built-in names such as `vm`, `docker`, `podman`, and `kubernetes` cannot be used as unmanaged socket endpoints. The gateway connects to a UDS the operator already provisioned, runs `GetCapabilities`, logs the advertised `driver_name`, and dispatches all sandbox lifecycle calls through `compute_driver.proto`. The driver process and socket lifecycle are operator-owned; the gateway does not spawn, supervise, or remove unmanaged extension drivers. The trust boundary is the socket's filesystem permissions: the operator must ensure only the gateway uid can read/write it. |
+| Extension | Out-of-tree drivers operated alongside the gateway. | Whatever boundary the driver implements. | Selected by a custom `compute_drivers = ["<name>"]` entry with `[openshell.drivers.<name>].socket_path`, or at launch time by pairing `--drivers <name>` with `--compute-driver-socket=<path>`. A launch-time endpoint may use a canonical built-in name to preserve its driver-config key while replacing in-process construction. The gateway connects to an operator-provisioned UDS, snapshots `GetCapabilities`, and dispatches all sandbox lifecycle calls through `compute_driver.proto`. The driver process and socket lifecycle are operator-owned; the gateway does not spawn, supervise, or remove unmanaged extension drivers. The trust boundary is the socket's filesystem permissions: the operator must ensure only the gateway uid can read/write it. |
 
 Per-sandbox CPU and memory values currently enter the driver layer through
 template resource limits. Docker and Podman apply them as runtime limits.
@@ -172,6 +222,16 @@ active local driver table of `gateway.toml`. Host bind mounts are an unsafe
 operator override because they place gateway-host filesystem state inside the
 sandbox and can negate OpenShell workspace isolation and filesystem-policy
 controls. Driver-owned supervisor, token, and TLS bind mounts stay reserved.
+
+Network features follow the existing driver/substrate split. Compute drivers
+advertise only the runtime mechanics they can guarantee: namespace and
+capability ownership, DNS/TCP capture installation, and coupled
+restart ordering. The shared supervisor remains the sole owner of DNS
+eligibility, synthetic mappings, process authorization, destination filtering,
+pinned dialing, relay behavior, and OCSF decisions. Docker and Podman advertise
+`policy-dns-transparent-tcp`; other runtimes reject explicit TCP policy until
+they implement and validate the same complete contract. The capability marker
+is driver-owned supervisor input and is removed from workload environments.
 
 Kubernetes deployments may set an AppArmor profile on sandbox agent containers
 through the driver configuration. The Helm chart defaults sandbox agents to

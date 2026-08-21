@@ -1351,7 +1351,12 @@ enum SandboxCommands {
         /// working directory.
         /// `.gitignore` rules are applied by default; use `--no-git-ignore` to
         /// upload everything.
-        #[arg(long, value_hint = ValueHint::AnyPath, help_heading = "UPLOAD FLAGS")]
+        #[arg(
+            long,
+            value_hint = ValueHint::AnyPath,
+            help_heading = "UPLOAD FLAGS",
+            conflicts_with = "command"
+        )]
         upload: Vec<String>,
 
         /// Disable `.gitignore` filtering for `--upload`.
@@ -1420,6 +1425,10 @@ enum SandboxCommands {
         /// Disable pseudo-terminal allocation.
         #[arg(long, overrides_with = "tty")]
         no_tty: bool,
+
+        /// Start the canonical main process without attaching to it.
+        #[arg(long, conflicts_with_all = ["editor", "no_keep"])]
+        detach: bool,
 
         /// Auto-create missing providers from local credentials.
         ///
@@ -1603,6 +1612,7 @@ enum SandboxCommands {
     /// Connect to a sandbox.
     ///
     /// When no name is given, reconnects to the last-used sandbox.
+    /// Press Ctrl-P Ctrl-Q to disconnect without terminating the main process.
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Connect {
         /// Sandbox name (defaults to last-used sandbox).
@@ -2989,6 +2999,7 @@ async fn run_async() -> Result<()> {
                     forward,
                     tty,
                     no_tty,
+                    detach,
                     auto_providers,
                     no_auto_providers,
                     labels,
@@ -3084,6 +3095,7 @@ async fn run_async() -> Result<()> {
                             environment: env_map,
                             approval_mode: &approval_mode,
                             output: output.as_str(),
+                            detach,
                         },
                         &cli.workspace,
                         &tls,
@@ -5137,6 +5149,55 @@ mod tests {
                 panic!("expected SandboxCommands::Create");
             }
         }
+    }
+
+    #[test]
+    fn sandbox_create_detach_parses_with_main_command() {
+        let cli = Cli::try_parse_from([
+            "openshell",
+            "sandbox",
+            "create",
+            "--detach",
+            "--",
+            "worker",
+            "--serve",
+        ])
+        .expect("sandbox create --detach should parse");
+
+        match cli.command {
+            Some(Commands::Sandbox {
+                command:
+                    Some(SandboxCommands::Create {
+                        detach, command, ..
+                    }),
+                ..
+            }) => {
+                assert!(detach);
+                assert_eq!(command, ["worker", "--serve"]);
+            }
+            other => panic!("expected SandboxCommands::Create, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sandbox_create_detach_rejects_ephemeral_sandbox() {
+        let result =
+            Cli::try_parse_from(["openshell", "sandbox", "create", "--detach", "--no-keep"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn sandbox_create_rejects_upload_with_main_command() {
+        let result = Cli::try_parse_from([
+            "openshell",
+            "sandbox",
+            "create",
+            "--upload",
+            ".",
+            "--",
+            "./run-uploaded-app",
+        ]);
+        assert!(result.is_err());
     }
 
     /// `sandbox create` defaults `--approval-mode` to `"manual"`. The CLI

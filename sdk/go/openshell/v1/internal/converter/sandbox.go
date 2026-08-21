@@ -76,6 +76,8 @@ func sandboxSpecFromProto(spec *pb.SandboxSpec) types.SandboxSpec {
 			result.GPUCount = gpu.Count
 		}
 	}
+	result.Command = CopyStringSlice(spec.GetCommand())
+	result.TTY = spec.GetTty()
 
 	return result
 }
@@ -99,6 +101,7 @@ func sandboxStatusFromProto(status *pb.SandboxStatus) types.SandboxStatus {
 			LastTransitionTime: c.GetLastTransitionTime(),
 		})
 	}
+	result.ExitCode = CopyInt32Ptr(status.ExitCode)
 
 	return result
 }
@@ -219,6 +222,9 @@ func SandboxSpecToProto(spec *types.SandboxSpec) *pb.SandboxSpec {
 			},
 		}
 	}
+
+	result.Command = CopyStringSlice(spec.Command)
+	result.Tty = spec.TTY
 
 	return result
 }

@@ -29,10 +29,11 @@ only when the set is already empty; any other outcome fails the spawn.
    gateway, depending on mode.
 3. It prepares filesystem access, process restrictions, network namespace
    routing, trust stores, provider credential resolution, and inference routes.
-4. It starts the policy proxy and local SSH server.
-5. It opens a supervisor session back to the gateway for connect, exec, file
+4. It launches the persisted canonical main-process argv and retains its PTY
+   or pipes in the main-session multiplexer.
+5. It starts the policy proxy and local SSH server.
+6. It opens a supervisor session back to the gateway for connect, exec, file
    sync, config polling, and log push.
-6. It launches the agent command as the resolved restricted identity.
 
 ## Isolation Layers
 
@@ -63,10 +64,10 @@ socket inode.
 
 CONNECT and absolute-form forward HTTP are explicit-proxy adapters over the same
 egress pipeline. Each adapter normalizes its request into an egress intent, and
-the shared authorization result carries the process evidence used by destination
-validation and relay selection. During the compatibility migration, endpoint
-state is hydrated at the adapters' existing policy query points; it is not yet
-one atomic, generation-consistent authorization result. Destination validation
+the shared authorization result carries the process evidence and endpoint
+metadata used by destination validation and relay selection. Network action,
+matched policy, endpoint configuration, and exact-host authorization are
+evaluated as one atomic snapshot from one policy generation. Destination validation
 returns an unopened connector so adapters retain their existing response and
 upstream-dial timing. CONNECT prepares a generation-pinned relay context before
 entering shared TLS-terminated or plaintext HTTP relays; non-HTTP traffic uses
@@ -74,6 +75,39 @@ the shared raw byte relay after the existing adapter gates. Forward HTTP retains
 its guarded single-request relay while sharing authorization, request context,
 policy-pinning, and destination boundaries.
 Adapter-specific response and OCSF event shapes remain at the protocol boundary.
+An explicit `protocol: tcp` endpoint with a valid DNS hostname opts into native
+DNS and transparent TCP when the selected runtime advertises that substrate.
+Hostless `allowed_ips` and literal-IP selectors remain available only to the
+legacy explicit-proxy path when `protocol` is omitted. The shared supervisor
+answers only eligible DNS names, returns an epoch-scoped synthetic address, and
+publishes the expiring name, endpoint, ports, policy generation, and validated
+real addresses as one correlation. A connection to that synthetic address is
+captured before the bypass fence, mapped back to its workload process, authorized
+through the same egress pipeline, and dialed only through the pinned addresses.
+Omitted protocol endpoints retain explicit-proxy behavior.
+
+The DNS store is in-memory and sandbox-local. A combined-supervisor restart also
+restarts its workload; before execution, the supervisor advances a persisted
+boot epoch and installs only that epoch's synthetic capture ranges. An address
+cached from the preceding epoch therefore falls through to the bypass fence
+instead of inheriting a new mapping. Policy reload, expiry, wrong ports, direct real-IP access, missing
+mappings, or pool exhaustion fail closed. Resolver injection, DNS listeners,
+capture rules, and the transparent listener are all ready before workload
+execution. A runtime that cannot provide the complete contract rejects a policy
+containing explicit TCP endpoints rather than partially activating it. Because
+that substrate is startup infrastructure, a sandbox created without explicit
+TCP endpoints rejects a hot reload that introduces one and keeps its complete
+previous policy active; recreating the sandbox installs the substrate before
+the workload starts. A sandbox that started with the substrate may continue to
+remove and re-add TCP endpoints through ordinary atomic policy reloads.
+Workload DNS targets port 53, while nftables redirects eligible IPv4 DNS traffic
+to an unprivileged supervisor listener. The filter admits DNS and transparent
+TCP only when the kernel records the traffic as DNATed to the corresponding
+supervisor listener, so direct dials to either unprivileged listener port remain
+fenced. `SO_ORIGINAL_DST`, synthetic mapping lookup, endpoint correlation, and
+generation-pinned authorization form the transparent TCP security boundary.
+Docker and Podman do not currently advertise usable IPv6 egress for this
+substrate, so AAAA queries return NOERROR/NODATA and IPv6 DNS remains fenced.
 
 Provider credential placeholders are resolved through the live provider state
 for each HTTP request, after destination and L7 policy admission. A static
@@ -86,6 +120,13 @@ refresh revokes the previous static credential state instead of leaving a
 partially active or last-known-good static set. Invalid metadata preserves the
 supplied dynamic snapshot, while a fetch failure preserves the currently active
 dynamic snapshot.
+
+In the Kubernetes sidecar topology, the provider environment revision remains
+an opaque content fingerprint and has no numeric ordering semantics. The
+network supervisor assigns a separate, connection-local monotonic generation
+to each distinct environment it publishes. The process supervisor applies only
+newer generations, which accepts descending fingerprint values while rejecting
+duplicate or delayed sidecar messages.
 
 Gateway-managed refresh credentials use an opaque workload handle derived from
 the sandbox, provider identity, credential key, refresh authorization epoch,
@@ -326,7 +367,10 @@ The supervisor runs an SSH server on a Unix socket inside the sandbox. The
 gateway reaches it through the outbound supervisor relay, not by dialing the
 sandbox workload directly. The relay supports:
 
-- Interactive shell sessions.
+- Attachment to the canonical main process through the `openshell-main` SSH
+  subsystem. The supervisor owns its retained PTY or pipes, a 1 MiB replay
+  buffer, and a single stdin lease across client disconnects.
+- Independent interactive shell sessions.
 - Command execution. Commands run through a login shell (`bash -lc`) by default,
   so the first of the user's `.bash_profile`, `.bash_login`, or `.profile` is
   sourced (and `.bashrc` only if that file sources it). Callers set
@@ -409,3 +453,7 @@ engine with a gateway policy revision.
   re-evaluate.
 - If the supervisor relay drops, the sandbox can keep running, but connect and
   exec operations fail until the supervisor registers again.
+- If the canonical main process exits, including with code 0, the supervisor
+  reports its normalized exit code before shutdown. The gateway persists the
+  code on sandbox status, records `MainProcessExited`, and makes the sandbox
+  terminal `Error`; runtime restart policies must not replace the process.

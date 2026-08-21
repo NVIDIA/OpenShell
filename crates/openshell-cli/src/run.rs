@@ -383,6 +383,7 @@ pub struct SandboxCreateConfig<'a> {
     pub environment: HashMap<String, String>,
     pub approval_mode: &'a str,
     pub output: &'a str,
+    pub detach: bool,
 }
 
 impl Default for SandboxCreateConfig<'_> {
@@ -407,6 +408,7 @@ impl Default for SandboxCreateConfig<'_> {
             environment: HashMap::new(),
             approval_mode: "manual",
             output: "table",
+            detach: false,
         }
     }
 }
@@ -439,11 +441,17 @@ pub async fn sandbox_create(
         environment,
         approval_mode,
         output,
+        detach,
     } = config;
 
     if editor.is_some() && !command.is_empty() {
         return Err(miette::miette!(
             "--editor cannot be used with a trailing command; use `openshell sandbox connect <name> --editor ...` after the sandbox is ready"
+        ));
+    }
+    if !uploads.is_empty() && !command.is_empty() {
+        return Err(miette::miette!(
+            "--upload cannot be combined with a trailing main command yet because uploads complete after the canonical process starts"
         ));
     }
 
@@ -521,6 +529,13 @@ pub async fn sandbox_create(
 
     let resource_requirements = gpu_requirements.map(|gpu| ResourceRequirements { gpu: Some(gpu) });
 
+    let main_terminal = tty_override
+        .unwrap_or_else(|| std::io::stdin().is_terminal() && std::io::stdout().is_terminal());
+    let main_command = if command.is_empty() {
+        vec!["/bin/bash".to_string(), "-l".to_string()]
+    } else {
+        command.to_vec()
+    };
     let request = CreateSandboxRequest {
         spec: Some(SandboxSpec {
             resource_requirements,
@@ -528,6 +543,8 @@ pub async fn sandbox_create(
             policy,
             providers: configured_providers,
             template,
+            command: main_command,
+            tty: main_terminal,
             ..SandboxSpec::default()
         }),
         name: name.unwrap_or_default().to_string(),
@@ -939,53 +956,23 @@ pub async fn sandbox_create(
                 return Ok(());
             }
 
-            if command.is_empty() {
-                let connect_result = if persist {
-                    sandbox_connect(&effective_server, &sandbox_name, &effective_tls, workspace)
-                        .await
-                } else {
-                    crate::ssh::sandbox_connect_without_exec(
-                        &effective_server,
-                        &sandbox_name,
-                        &effective_tls,
-                        workspace,
-                    )
-                    .await
-                };
-
-                return finalize_sandbox_create_session(
-                    &effective_server,
-                    &sandbox_name,
-                    persist,
-                    connect_result,
-                    workspace,
-                    &effective_tls,
-                    gateway_name,
-                )
-                .await;
+            // Persistent non-interactive creates detach implicitly. An
+            // explicitly ephemeral (`--no-keep`) create must still attach so
+            // it can observe the canonical process and delete the sandbox when
+            // that session ends.
+            if detach
+                || (persist
+                    && (!std::io::stdin().is_terminal() || !std::io::stdout().is_terminal()))
+            {
+                return Ok(());
             }
 
-            // Resolve TTY mode: explicit --tty / --no-tty wins, otherwise
-            // auto-detect from the local terminal.
-            let tty = tty_override.unwrap_or_else(|| {
-                std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
-            });
-            let exec_result = if persist {
-                sandbox_exec(
-                    &effective_server,
-                    &sandbox_name,
-                    command,
-                    tty,
-                    &effective_tls,
-                    workspace,
-                )
-                .await
+            let connect_result = if persist {
+                sandbox_connect(&effective_server, &sandbox_name, &effective_tls, workspace).await
             } else {
-                crate::ssh::sandbox_exec_without_exec(
+                crate::ssh::sandbox_connect_without_exec(
                     &effective_server,
                     &sandbox_name,
-                    command,
-                    tty,
                     &effective_tls,
                     workspace,
                 )
@@ -996,7 +983,7 @@ pub async fn sandbox_create(
                 &effective_server,
                 &sandbox_name,
                 persist,
-                exec_result,
+                connect_result,
                 workspace,
                 &effective_tls,
                 gateway_name,
@@ -1004,7 +991,9 @@ pub async fn sandbox_create(
             .await
         }
         SandboxPhase::Error => {
-            if last_error_reason.is_empty() {
+            drop(stream);
+            drop(client);
+            let create_result = if last_error_reason.is_empty() {
                 Err(miette::miette!(
                     "sandbox entered error phase while provisioning"
                 ))
@@ -1013,7 +1002,17 @@ pub async fn sandbox_create(
                     "sandbox entered error phase while provisioning: {}",
                     last_error_reason
                 ))
-            }
+            };
+            finalize_sandbox_create_session(
+                &effective_server,
+                &sandbox_name,
+                persist,
+                create_result,
+                workspace,
+                &effective_tls,
+                gateway_name,
+            )
+            .await
         }
         _ => Err(miette::miette!(
             "sandbox provisioning stream ended before reaching terminal phase"

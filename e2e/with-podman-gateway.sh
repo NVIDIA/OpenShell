@@ -92,6 +92,10 @@ GATEWAY_PID=""
 GATEWAY_LOG="${WORKDIR}/gateway.log"
 GATEWAY_PID_FILE="${WORKDIR}/gateway.pid"
 GATEWAY_ARGS_FILE="${WORKDIR}/gateway.args"
+DRIVER_BIN=""
+DRIVER_PID=""
+DRIVER_LOG="${WORKDIR}/podman-driver.log"
+DRIVER_SOCKET="${WORKDIR}/compute-driver.sock"
 E2E_NAMESPACE=""
 PODMAN_NETWORK_NAME=""
 PODMAN_NETWORK_MANAGED=0
@@ -114,6 +118,7 @@ cleanup() {
   local exit_code=$?
 
   e2e_stop_gateway "${GATEWAY_PID}" "${GATEWAY_PID_FILE}"
+  e2e_stop_process "${DRIVER_PID}" "external Podman compute driver"
 
   local sandbox_ids=""
   if command -v podman >/dev/null 2>&1; then
@@ -159,6 +164,11 @@ cleanup() {
   fi
 
   e2e_print_gateway_log_on_failure "${exit_code}" "${GATEWAY_LOG}"
+  if [ "${exit_code}" -ne 0 ] && [ -f "${DRIVER_LOG}" ]; then
+    echo "=== external Podman compute driver log ==="
+    cat "${DRIVER_LOG}" || true
+    echo "=== end external Podman compute driver log ==="
+  fi
   if [ "${exit_code}" -ne 0 ] && [ -f "${PODMAN_SERVICE_LOG}" ]; then
     echo "=== podman service log (preserved for debugging) ==="
     cat "${PODMAN_SERVICE_LOG}" || true
@@ -363,6 +373,10 @@ fi
 ensure_podman_api_socket
 
 e2e_build_gateway_binaries "${ROOT}" TARGET_DIR GATEWAY_BIN CLI_BIN
+if [ "${OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" = "1" ]; then
+  e2e_build_external_driver \
+    "${ROOT}" openshell-driver-podman openshell-driver-podman DRIVER_BIN
+fi
 
 SUPERVISOR_IMAGE="$(resolve_podman_supervisor_image)"
 ensure_podman_supervisor_image "${SUPERVISOR_IMAGE}"
@@ -443,6 +457,9 @@ cp "${ROOT}/deploy/rpm/gateway.toml.default" "${GATEWAY_CONFIG}"
     fi
   fi
   printf '\n[openshell.drivers.podman]\n'
+  if [ "${OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" = "1" ]; then
+    printf 'socket_path = %s\n' "$(toml_string "${DRIVER_SOCKET}")"
+  else
   # The Podman driver scopes isolation by network rather than namespace.
   printf 'network_name = %s\n'   "$(toml_string "${PODMAN_NETWORK_NAME}")"
   printf 'gateway_port = %s\n'   "${HOST_PORT}"
@@ -464,7 +481,27 @@ cp "${ROOT}/deploy/rpm/gateway.toml.default" "${GATEWAY_CONFIG}"
   if [ -n "${OPENSHELL_PODMAN_SOCKET:-}" ]; then
     printf 'socket_path = %s\n' "$(toml_string "${OPENSHELL_PODMAN_SOCKET}")"
   fi
+  fi
 } >> "${GATEWAY_CONFIG}"
+
+if [ "${OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" = "1" ]; then
+  OPENSHELL_COMPUTE_DRIVER_SOCKET="${DRIVER_SOCKET}" \
+  OPENSHELL_PODMAN_SOCKET="${OPENSHELL_PODMAN_SOCKET:-}" \
+  OPENSHELL_SANDBOX_IMAGE="${SANDBOX_IMAGE}" \
+  OPENSHELL_SANDBOX_IMAGE_PULL_POLICY="missing" \
+  OPENSHELL_GATEWAY_PORT="${HOST_PORT}" \
+  OPENSHELL_NETWORK_NAME="${PODMAN_NETWORK_NAME}" \
+  OPENSHELL_STOP_TIMEOUT="${PODMAN_STOP_TIMEOUT_SECS}" \
+  OPENSHELL_SUPERVISOR_IMAGE="${SUPERVISOR_IMAGE}" \
+  OPENSHELL_PODMAN_TLS_CA="${PKI_DIR}/ca.crt" \
+  OPENSHELL_PODMAN_TLS_CERT="${PKI_DIR}/client/tls.crt" \
+  OPENSHELL_PODMAN_TLS_KEY="${PKI_DIR}/client/tls.key" \
+  OPENSHELL_ENABLE_BIND_MOUNTS=true \
+    "${DRIVER_BIN}" >"${DRIVER_LOG}" 2>&1 &
+  DRIVER_PID=$!
+  e2e_wait_for_socket \
+    "${DRIVER_SOCKET}" "${DRIVER_PID}" "external Podman compute driver"
+fi
 
 GATEWAY_ARGS=(
   --config "${GATEWAY_CONFIG}"

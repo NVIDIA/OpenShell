@@ -25,6 +25,12 @@ already-running resources are unchanged, retained stopped compute is restarted,
 and explicitly stopped sandboxes remain stopped. Kubernetes workloads continue
 running independently of the gateway process.
 
+The gateway forwards one exact, persisted main-process specification to every
+driver. Drivers serialize that specification in
+`OPENSHELL_MAIN_PROCESS_SPEC`; they do not install an idle `sleep` workload or
+reconstruct argv with shell parsing. Runtime restart policies are disabled so
+an exited canonical process remains a terminal sandbox error.
+
 ## Configure a Compute Driver
 
 Configure the compute driver on the gateway. Current releases accept one driver per gateway. Set `compute_drivers` in the gateway TOML file:
@@ -60,16 +66,18 @@ compute_drivers = ["kyma"]
 socket_path = "/run/openshell/kyma.sock"
 ```
 
-For a launch-time socket override, pass the same non-reserved driver name with
-the socket path:
+For a launch-time socket override, pass the selected driver name with the
+socket path. The endpoint replaces normal driver construction for that name,
+including canonical built-in names:
 
 ```shell
 openshell-gateway --drivers kyma --compute-driver-socket /run/openshell/kyma.sock
+openshell-gateway --drivers docker --compute-driver-socket /run/openshell/docker.sock
 ```
 
-The gateway does not spawn, supervise, or delete extension drivers. The
-operator must protect the socket so only the gateway uid can access it.
-Reserved built-in names cannot be selected through unmanaged socket endpoints.
+The gateway connects to the operator-provided endpoint; it does not provision
+or supervise the remote driver. The operator must protect the socket so only
+the gateway uid can access it.
 
 Sandbox create supports `--cpu` and `--memory` for per-sandbox compute sizing.
 Docker and Podman apply them as runtime limits. Kubernetes applies them as both

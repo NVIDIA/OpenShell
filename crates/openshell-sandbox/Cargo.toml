@@ -50,6 +50,7 @@ prost = { workspace = true }
 
 # Logging
 tracing = { workspace = true }
+uuid = { workspace = true }
 tracing-subscriber = { workspace = true }
 tracing-appender = { workspace = true }
 

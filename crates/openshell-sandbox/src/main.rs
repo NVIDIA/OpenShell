@@ -111,8 +111,7 @@ impl std::str::FromStr for Mode {
 #[command(about = "Process sandbox and monitor", long_about = None)]
 struct Args {
     /// Command to execute in the sandbox.
-    /// Can also be provided via `OPENSHELL_SANDBOX_COMMAND` environment variable.
-    /// Defaults to `/bin/bash` if neither is provided.
+    /// Defaults to `/bin/bash -l` if neither this nor the driver specification is provided.
     #[arg(trailing_var_arg = true)]
     command: Vec<String>,
 
@@ -650,14 +649,19 @@ fn main() -> Result<()> {
             (None, None)
         };
 
-        // Get command - either from CLI args, environment variable, or default to /bin/bash
-        let command = if !args.command.is_empty() {
-            args.command
-        } else if let Ok(c) = std::env::var(openshell_core::sandbox_env::SANDBOX_COMMAND) {
-            // Simple shell-like splitting on whitespace
-            c.split_whitespace().map(String::from).collect()
+        // Resolve an exact canonical process. Explicit offline/test argv wins;
+        // drivers otherwise provide a versioned JSON transport so argument
+        // boundaries are never reconstructed with shell parsing.
+        let workdir = args.workdir.clone();
+        let (command, interactive) = if !args.command.is_empty() {
+            (args.command, args.interactive)
+        } else if let Ok(json) = std::env::var(openshell_core::sandbox_env::MAIN_PROCESS_SPEC) {
+            let config = openshell_core::sandbox_env::MainProcessConfig::decode(&json)
+                .map_err(|error| miette::miette!("{error}"))?;
+            (config.command, config.tty)
         } else {
-            vec!["/bin/bash".to_string()]
+            let config = openshell_core::sandbox_env::MainProcessConfig::scratch();
+            (config.command, config.tty)
         };
 
         info!(command = ?command, "Starting sandbox");
@@ -675,9 +679,9 @@ fn main() -> Result<()> {
 
         run_sandbox(
             command,
-            args.workdir,
+            workdir,
             args.timeout,
-            args.interactive,
+            interactive,
             args.sandbox_id,
             args.sandbox,
             args.openshell_endpoint,

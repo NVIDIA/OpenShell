@@ -5,7 +5,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::proto::compute::v1::{DriverSandbox, GetCapabilitiesResponse};
+use crate::proto::compute::v1::DriverSandbox;
 
 pub use crate::container_paths::{
     SANDBOX_TOKEN_MOUNT_PATH, SUPERVISOR_CONTAINER_BINARY, SUPERVISOR_CONTAINER_DIR,
@@ -370,22 +370,6 @@ pub fn sandbox_token_path(
         path = path.join(ns.replace(['/', '\\'], "-"));
     }
     Ok(path.join(sandbox_id).join("sandbox.jwt"))
-}
-
-/// Build a [`GetCapabilitiesResponse`] from the common driver capability fields.
-///
-/// Every compute driver constructs this response with the same fields. Shared
-/// here to avoid repeating the struct literal in each driver crate.
-pub fn build_capabilities_response(
-    driver_name: &str,
-    driver_version: impl Into<String>,
-    default_image: impl Into<String>,
-) -> GetCapabilitiesResponse {
-    GetCapabilitiesResponse {
-        driver_name: driver_name.to_string(),
-        driver_version: driver_version.into(),
-        default_image: default_image.into(),
-    }
 }
 
 /// Return the effective log level for a sandbox.
