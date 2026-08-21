@@ -504,6 +504,10 @@ impl RefreshFailure {
     fn into_status(self) -> Status {
         self.status
     }
+
+    fn from_status(status: &Status) -> Self {
+        Self::from(Status::new(status.code(), status.message().to_string()))
+    }
 }
 
 impl From<Status> for RefreshFailure {
@@ -676,7 +680,7 @@ async fn cleanup_pending_secret_deletions(
     Ok(new_version)
 }
 
-async fn persist_refresh_error_state(
+async fn persist_retryable_refresh_error_state(
     store: &Store,
     state: &mut StoredProviderCredentialRefreshState,
     expected_version: u64,
@@ -826,7 +830,8 @@ pub async fn refresh_provider_credential(
     // Otherwise disabling providers_v2_enabled leaves already-configured refresh
     // states that the worker and manual rotation keep minting from.
     if let Err(err) = ensure_refresh_providers_v2_gate(store, &state).await {
-        persist_refresh_error_state(store, &mut state, expected_version, &err).await?;
+        let failure = RefreshFailure::from_status(&err);
+        persist_refresh_failure_state(store, &mut state, expected_version, &failure).await?;
         warn!(
             provider = %state.provider_name,
             credential_key = %state.credential_key,
@@ -974,7 +979,13 @@ pub async fn refresh_provider_credential(
                     // upstream-valid grant. If that also fails, leave the
                     // staged object intact for operator recovery rather than
                     // deleting an irreplaceable rotated token.
-                    persist_refresh_error_state(store, &mut state, expected_version, &err).await?;
+                    persist_retryable_refresh_error_state(
+                        store,
+                        &mut state,
+                        expected_version,
+                        &err,
+                    )
+                    .await?;
                     return Err(err);
                 }
             };
@@ -993,7 +1004,8 @@ pub async fn refresh_provider_credential(
             {
                 // Reflect the failure on the state we just wrote; skip silently
                 // if it was deleted concurrently (it is not recreated).
-                persist_refresh_error_state(store, &mut state, new_version, &err).await?;
+                let failure = RefreshFailure::from_status(&err);
+                persist_refresh_failure_state(store, &mut state, new_version, &failure).await?;
                 warn!(
                     provider = %state.provider_name,
                     credential_key = %state.credential_key,
@@ -1720,6 +1732,21 @@ fn classify_oauth_token_error(
                 "admin_policy_enforced",
             )
         }
+        "access_denied" if grant_kind == OAuthGrantKind::UserRefreshToken => {
+            RefreshFailure::reauthorize(
+                Status::failed_precondition(
+                    "OAuth access was denied; user reauthorization is required (access_denied)",
+                ),
+                "oauth_access_denied",
+                None,
+            )
+        }
+        "access_denied" => RefreshFailure::fix_configuration(
+            Status::failed_precondition(
+                "OAuth access was denied for the non-interactive grant (access_denied)",
+            ),
+            "oauth_access_denied",
+        ),
         "invalid_grant" => RefreshFailure::fix_configuration(
             Status::failed_precondition(
                 "OAuth token endpoint rejected the non-interactive grant (invalid_grant)",
@@ -2296,6 +2323,36 @@ mod tests {
     }
 
     #[test]
+    fn oauth_access_denied_recovery_depends_on_grant_kind() {
+        let user_failure = classify_oauth_token_error(
+            reqwest::StatusCode::FORBIDDEN,
+            br#"{"error":"access_denied"}"#,
+            OAuthGrantKind::UserRefreshToken,
+        );
+        assert_eq!(
+            user_failure.recovery_action,
+            ProviderCredentialRefreshRecoveryAction::Reauthorize
+        );
+        assert_eq!(user_failure.failure_code, "oauth_access_denied");
+        assert_eq!(user_failure.retry_schedule, RefreshRetrySchedule::Parked);
+
+        let service_failure = classify_oauth_token_error(
+            reqwest::StatusCode::FORBIDDEN,
+            br#"{"error":"access_denied"}"#,
+            OAuthGrantKind::NonInteractive,
+        );
+        assert_eq!(
+            service_failure.recovery_action,
+            ProviderCredentialRefreshRecoveryAction::FixConfiguration
+        );
+        assert_eq!(service_failure.failure_code, "oauth_access_denied");
+        assert_eq!(
+            service_failure.retry_schedule,
+            RefreshRetrySchedule::Configuration
+        );
+    }
+
+    #[test]
     fn oauth_server_failure_remains_retryable() {
         let failure = classify_oauth_token_error(
             reqwest::StatusCode::SERVICE_UNAVAILABLE,
@@ -2423,6 +2480,62 @@ mod tests {
         .await
         .unwrap()
         .unwrap();
+        assert_eq!(stored.status, "configuration_required");
+        assert_eq!(
+            stored.recovery_action,
+            ProviderCredentialRefreshRecoveryAction::FixConfiguration as i32
+        );
+        assert_eq!(stored.failure_code, "refresh_configuration_invalid");
+        assert_eq!(
+            stored.next_refresh_at_ms - stored.last_error_at_ms,
+            60 * 60 * 1000
+        );
+    }
+
+    #[tokio::test]
+    async fn disabled_provider_gate_requires_configuration_and_retries_hourly() {
+        let store = test_store().await;
+        let provider = provider("disabled-provider-gate", "aws-s3");
+        store.put_message(&provider).await.unwrap();
+        let state = new_refresh_state(
+            &provider,
+            "default",
+            "AWS_ACCESS_KEY_ID",
+            NewRefreshStateConfig {
+                strategy: ProviderCredentialRefreshStrategy::AwsStsAssumeRole,
+                material: HashMap::from([(
+                    "role_arn".to_string(),
+                    "arn:aws:iam::123456789012:role/test".to_string(),
+                )]),
+                secret_material_keys: Vec::new(),
+                expires_at_ms: 0,
+                token_url: String::new(),
+                scopes: Vec::new(),
+                refresh_before_seconds: 30,
+                max_lifetime_seconds: 60,
+                additional_output_keys: HashMap::new(),
+            },
+        )
+        .unwrap();
+        put_refresh_state(&store, &state).await.unwrap();
+
+        let err = refresh_provider_credential(
+            &store,
+            "default",
+            &test_credentials(),
+            None,
+            "disabled-provider-gate",
+            "AWS_ACCESS_KEY_ID",
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        let stored =
+            get_refresh_state(&store, "default", provider.object_id(), "AWS_ACCESS_KEY_ID")
+                .await
+                .unwrap()
+                .unwrap();
         assert_eq!(stored.status, "configuration_required");
         assert_eq!(
             stored.recovery_action,
@@ -2795,7 +2908,16 @@ mod tests {
         .await
         .unwrap()
         .unwrap();
-        assert_eq!(stored_state.status, "error");
+        assert_eq!(stored_state.status, "configuration_required");
+        assert_eq!(
+            stored_state.recovery_action,
+            ProviderCredentialRefreshRecoveryAction::FixConfiguration as i32
+        );
+        assert_eq!(stored_state.failure_code, "refresh_configuration_invalid");
+        assert_eq!(
+            stored_state.next_refresh_at_ms - stored_state.last_error_at_ms,
+            60 * 60 * 1000
+        );
         assert!(stored_state.last_error.contains("MS_GRAPH_ACCESS_TOKEN"));
         let stored_provider = store
             .get_message_by_name::<Provider>("default", "refreshing-graph")

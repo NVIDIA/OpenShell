@@ -4755,10 +4755,11 @@ mod tests {
         ImportProviderProfilesRequest, L7Allow, L7Rule, LintProviderProfilesRequest,
         ListProviderProfilesRequest, ListProvidersRequest, NetworkBinary, NetworkEndpoint,
         NetworkPolicyRule, ProviderCredentialRefresh, ProviderCredentialRefreshMaterial,
-        ProviderCredentialTokenGrant, ProviderCredentialTokenGrantAudienceOverride,
-        ProviderProfile, ProviderProfileCategory, ProviderProfileCredential,
-        ProviderProfileImportItem, RotateProviderCredentialRequest, Sandbox, SandboxPolicy,
-        SandboxSpec, StoredProviderProfile, UpdateProviderProfilesRequest, UpdateProviderRequest,
+        ProviderCredentialRefreshRecoveryAction, ProviderCredentialTokenGrant,
+        ProviderCredentialTokenGrantAudienceOverride, ProviderProfile, ProviderProfileCategory,
+        ProviderProfileCredential, ProviderProfileImportItem, RotateProviderCredentialRequest,
+        Sandbox, SandboxPolicy, SandboxSpec, StoredProviderProfile, UpdateProviderProfilesRequest,
+        UpdateProviderRequest,
     };
     use openshell_core::{ObjectId, ObjectName};
     use tonic::{Code, Request};
@@ -11988,7 +11989,16 @@ mod tests {
         .await
         .unwrap()
         .expect("refresh state should exist");
-        assert_eq!(refresh_state.status, "error");
+        assert_eq!(refresh_state.status, "configuration_required");
+        assert_eq!(
+            refresh_state.recovery_action,
+            ProviderCredentialRefreshRecoveryAction::FixConfiguration as i32
+        );
+        assert_eq!(refresh_state.failure_code, "refresh_configuration_invalid");
+        assert_eq!(
+            refresh_state.next_refresh_at_ms - refresh_state.last_error_at_ms,
+            60 * 60 * 1000
+        );
     }
 
     #[tokio::test]
