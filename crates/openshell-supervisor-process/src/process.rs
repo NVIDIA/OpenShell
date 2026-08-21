@@ -166,13 +166,20 @@ fn strip_supervisor_only_env(cmd: &mut Command) {
     }
 }
 
-fn inject_provider_env(cmd: &mut Command, provider_env: &HashMap<String, String>) {
+fn inject_provider_env(
+    cmd: &mut Command,
+    provider_env: &HashMap<String, String>,
+    repair_standard_sbin: bool,
+) {
     for (key, value) in provider_env {
         if is_supervisor_only_env_var(key) {
             continue;
         }
         if key == "PATH" {
-            cmd.env(key, child_env::path_with_standard_sbin_paths(value));
+            cmd.env(
+                key,
+                child_env::maybe_path_with_standard_sbin_paths(value, repair_standard_sbin),
+            );
         } else {
             cmd.env(key, value);
         }
@@ -563,8 +570,16 @@ fn shell_command_arg_index(args: &[String]) -> Option<usize> {
     None
 }
 
-fn process_args_with_standard_sbin_paths(program: &str, args: &[String]) -> Vec<String> {
+fn process_args_with_standard_sbin_paths(
+    program: &str,
+    args: &[String],
+    repair_standard_sbin: bool,
+) -> Vec<String> {
     let mut args = args.to_vec();
+    if !repair_standard_sbin {
+        return args;
+    }
+
     let basename = program.rsplit('/').next().unwrap_or(program);
     if matches!(basename, "bash" | "sh")
         && let Some(command_index) = shell_command_arg_index(&args)
@@ -654,7 +669,8 @@ impl ProcessHandle {
         ca_paths: Option<&(PathBuf, PathBuf)>,
         provider_env: &HashMap<String, String>,
     ) -> Result<Self> {
-        let args = process_args_with_standard_sbin_paths(program, args);
+        let repair_standard_sbin = child_env::standard_sbin_path_repair_enabled(policy);
+        let args = process_args_with_standard_sbin_paths(program, args, repair_standard_sbin);
         let mut cmd = Command::new(program);
         cmd.args(&args)
             .stdin(Stdio::inherit())
@@ -662,7 +678,7 @@ impl ProcessHandle {
             .stderr(Stdio::inherit())
             .kill_on_drop(true)
             .env(openshell_core::sandbox_env::SANDBOX, "1")
-            .env("PATH", child_env::child_path_from_env());
+            .env("PATH", child_env::child_path_from_env(repair_standard_sbin));
 
         // Strip supervisor-only identity material from the entrypoint's
         // inherited environment. The entrypoint drops to the sandbox user
@@ -670,7 +686,7 @@ impl ProcessHandle {
         // supervisor credentials from its inherited environment.
         strip_supervisor_only_env(&mut cmd);
 
-        inject_provider_env(&mut cmd, provider_env);
+        inject_provider_env(&mut cmd, provider_env, repair_standard_sbin);
 
         if let Some(dir) = workspace.root() {
             cmd.current_dir(dir);
@@ -813,7 +829,8 @@ impl ProcessHandle {
         ca_paths: Option<&(PathBuf, PathBuf)>,
         provider_env: &HashMap<String, String>,
     ) -> Result<Self> {
-        let args = process_args_with_standard_sbin_paths(program, args);
+        let repair_standard_sbin = child_env::standard_sbin_path_repair_enabled(policy);
+        let args = process_args_with_standard_sbin_paths(program, args, repair_standard_sbin);
         let mut cmd = Command::new(program);
         cmd.args(&args)
             .stdin(Stdio::inherit())
@@ -821,13 +838,13 @@ impl ProcessHandle {
             .stderr(Stdio::inherit())
             .kill_on_drop(true)
             .env(openshell_core::sandbox_env::SANDBOX, "1")
-            .env("PATH", child_env::child_path_from_env());
+            .env("PATH", child_env::child_path_from_env(repair_standard_sbin));
 
         // Strip supervisor-only identity material from the entrypoint's
         // inherited environment.
         strip_supervisor_only_env(&mut cmd);
 
-        inject_provider_env(&mut cmd, provider_env);
+        inject_provider_env(&mut cmd, provider_env, repair_standard_sbin);
 
         if let Some(dir) = workspace.root() {
             cmd.current_dir(dir);
@@ -2252,7 +2269,7 @@ mod tests {
     fn process_args_wrap_shell_c_command_with_standard_sbin_paths() {
         let args = vec!["-lc".to_string(), "nvidia-smi -L".to_string()];
 
-        let wrapped = process_args_with_standard_sbin_paths("sh", &args);
+        let wrapped = process_args_with_standard_sbin_paths("sh", &args, true);
 
         assert_eq!(wrapped[0], "-lc");
         assert!(wrapped[1].contains("/usr/sbin"));
@@ -2263,7 +2280,16 @@ mod tests {
     fn process_args_leave_non_shell_commands_unchanged() {
         let args = vec!["nvidia-smi -L".to_string()];
 
-        let wrapped = process_args_with_standard_sbin_paths("python", &args);
+        let wrapped = process_args_with_standard_sbin_paths("python", &args, true);
+
+        assert_eq!(wrapped, args);
+    }
+
+    #[test]
+    fn process_args_do_not_wrap_when_standard_sbin_repair_disabled() {
+        let args = vec!["-lc".to_string(), "nvidia-smi -L".to_string()];
+
+        let wrapped = process_args_with_standard_sbin_paths("sh", &args, false);
 
         assert_eq!(wrapped, args);
     }
@@ -2786,7 +2812,7 @@ mod tests {
         ))
         .collect();
 
-        inject_provider_env(&mut cmd, &provider_env);
+        inject_provider_env(&mut cmd, &provider_env, false);
 
         let output = cmd.output().await.expect("spawn env");
         let stdout = String::from_utf8(output.stdout).expect("utf8");
@@ -2794,7 +2820,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn inject_provider_env_appends_standard_sbin_to_path() {
+    async fn inject_provider_env_appends_standard_sbin_to_path_when_enabled() {
         let mut cmd = Command::new("/usr/bin/env");
         cmd.env_clear()
             .stdin(StdStdio::null())
@@ -2806,7 +2832,7 @@ mod tests {
             "/sandbox/.venv/bin:/usr/local/bin:/usr/bin:/bin".to_string(),
         )]);
 
-        inject_provider_env(&mut cmd, &provider_env);
+        inject_provider_env(&mut cmd, &provider_env, true);
 
         let output = cmd.output().await.expect("spawn env");
         assert!(output.status.success());
@@ -2814,6 +2840,31 @@ mod tests {
         assert!(stdout.lines().any(|line| {
             line == "PATH=/sandbox/.venv/bin:/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin"
         }));
+    }
+
+    #[tokio::test]
+    async fn inject_provider_env_leaves_path_unchanged_when_standard_sbin_repair_disabled() {
+        let mut cmd = Command::new("/usr/bin/env");
+        cmd.env_clear()
+            .stdin(StdStdio::null())
+            .stdout(StdStdio::piped())
+            .stderr(StdStdio::null());
+
+        let provider_env = HashMap::from([(
+            "PATH".to_string(),
+            "/sandbox/.venv/bin:/usr/local/bin:/usr/bin:/bin".to_string(),
+        )]);
+
+        inject_provider_env(&mut cmd, &provider_env, false);
+
+        let output = cmd.output().await.expect("spawn env");
+        assert!(output.status.success());
+        let stdout = String::from_utf8(output.stdout).expect("utf8");
+        assert!(
+            stdout
+                .lines()
+                .any(|line| { line == "PATH=/sandbox/.venv/bin:/usr/local/bin:/usr/bin:/bin" })
+        );
     }
 
     #[cfg(unix)]
@@ -3693,7 +3744,7 @@ mod tests {
             ),
         ]);
 
-        inject_provider_env(&mut cmd, &provider_env);
+        inject_provider_env(&mut cmd, &provider_env, false);
 
         let output = cmd.output().await.expect("spawn env");
         assert!(output.status.success());
