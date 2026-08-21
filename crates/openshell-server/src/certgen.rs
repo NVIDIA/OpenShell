@@ -79,16 +79,16 @@ pub struct CertgenArgs {
     #[arg(long)]
     dry_run: bool,
 
-    /// Name of a ConfigMap to create containing the CA certificate (key: ca.crt)
-    /// for BackendTLSPolicy backend validation. In full PKI mode, the CA comes
+    /// Name of a `ConfigMap` to create containing the CA certificate (key: ca.crt)
+    /// for `BackendTLSPolicy` backend validation. In full PKI mode, the CA comes
     /// from the generated bundle. In --jwt-only mode, the CA is read from
     /// --backend-ca-source-secret.
     #[arg(long, value_name = "NAME")]
     backend_ca_configmap_name: Option<String>,
 
-    /// Name of an existing Secret containing a ca.crt key to populate the
-    /// backend CA ConfigMap from. Required with --jwt-only when
-    /// --backend-ca-configmap-name is set (typically the server TLS Secret
+    /// Name of an existing `Secret` containing a ca.crt key to populate the
+    /// backend CA `ConfigMap` from. Required with --jwt-only when
+    /// --backend-ca-configmap-name is set (typically the server TLS `Secret`
     /// created by cert-manager).
     #[arg(long, value_name = "NAME", requires = "backend_ca_configmap_name")]
     backend_ca_source_secret: Option<String>,
@@ -348,33 +348,62 @@ async fn create_backend_ca_configmap_if_needed(
         bundle.ca_cert_pem.clone()
     } else if let Some(source_secret) = &args.backend_ca_source_secret {
         let secret_api: Api<Secret> = Api::namespaced(client, namespace);
-        match secret_api
-            .get_opt(source_secret)
-            .await
+
+        // Poll for the cert-manager Secret with timeout to handle cert issuance delay.
+        // The Job has activeDeadlineSeconds: 120, so we poll for up to 90s leaving
+        // margin for ConfigMap creation and hook completion.
+        let poll_timeout = std::time::Duration::from_secs(90);
+        let poll_interval = std::time::Duration::from_secs(2);
+        let start = std::time::Instant::now();
+
+        let secret = loop {
+            match secret_api
+                .get_opt(source_secret)
+                .await
+                .into_diagnostic()
+                .wrap_err_with(|| format!("failed to read secret {source_secret}"))?
+            {
+                Some(secret) => break secret,
+                None if start.elapsed() >= poll_timeout => {
+                    warn!(
+                        secret = %source_secret,
+                        configmap = %configmap_name,
+                        timeout_secs = poll_timeout.as_secs(),
+                        "Backend CA source secret not found after polling; ConfigMap not created. \
+                         This is expected if cert-manager is still issuing the certificate. \
+                         Run helm upgrade after the TLS secret exists or the BackendTLSPolicy \
+                         will remain non-functional until the ConfigMap is created manually."
+                    );
+                    return Ok(());
+                }
+                None => {
+                    if start.elapsed().as_secs().is_multiple_of(10) {
+                        info!(
+                            secret = %source_secret,
+                            elapsed_secs = start.elapsed().as_secs(),
+                            "Waiting for cert-manager to issue TLS certificate..."
+                        );
+                    }
+                    tokio::time::sleep(poll_interval).await;
+                }
+            }
+        };
+
+        info!(
+            secret = %source_secret,
+            elapsed_secs = start.elapsed().as_secs(),
+            "cert-manager TLS certificate found."
+        );
+
+        let data = secret
+            .data
+            .ok_or_else(|| miette::miette!("secret {source_secret} has no data"))?;
+        let ca = data
+            .get("ca.crt")
+            .ok_or_else(|| miette::miette!("secret {source_secret} has no ca.crt key"))?;
+        String::from_utf8(ca.0.clone())
             .into_diagnostic()
-            .wrap_err_with(|| format!("failed to read secret {source_secret}"))?
-        {
-            Some(secret) => {
-                let data = secret.data.ok_or_else(|| {
-                    miette::miette!("secret {source_secret} has no data")
-                })?;
-                let ca = data.get("ca.crt").ok_or_else(|| {
-                    miette::miette!("secret {source_secret} has no ca.crt key")
-                })?;
-                String::from_utf8(ca.0.clone())
-                    .into_diagnostic()
-                    .wrap_err("ca.crt is not valid UTF-8")?
-            }
-            None => {
-                warn!(
-                    secret = %source_secret,
-                    configmap = %configmap_name,
-                    "Backend CA source secret not found; ConfigMap not created. \
-                     Create it manually or run helm upgrade after the TLS secret exists."
-                );
-                return Ok(());
-            }
-        }
+            .wrap_err("ca.crt is not valid UTF-8")?
     } else {
         return Err(miette::miette!(
             "--backend-ca-source-secret is required with --jwt-only \
