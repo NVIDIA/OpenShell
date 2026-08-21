@@ -207,6 +207,16 @@ output. Use `provider refresh rotate`, reconfigure refresh, or delete refresh
 before returning those keys to manual management. Unrelated provider fields
 remain updateable.
 
+When OAuth refresh fails, inspect the `RECOVERY` and `FAILURE_CODE` columns from
+`provider refresh status`; do not infer the remedy from HTTP status or parse
+`LAST_ERROR`. `retry` means the worker will try again, `reauthorize` means the
+user must obtain a new OAuth grant and run `provider refresh configure`,
+`fix_configuration` means an operator must repair the OAuth client, scopes, or
+administrator policy, and `investigate` means the issuer returned an
+unrecognized response. The gateway parks `reauthorize` and
+`fix_configuration` records until a manual rotate or reconfiguration. The
+existing access credential remains usable only until its recorded expiry.
+
 ---
 
 ## Workflow 3: Sandbox Lifecycle
