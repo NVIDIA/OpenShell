@@ -708,7 +708,7 @@ fn profile_snapshot_revision(profiles: &[ProviderProfile]) -> String {
     format!("sha256:{:x}", hasher.finalize())
 }
 
-#[expect(dead_code)]
+#[cfg(test)]
 pub fn stored_provider_profile(profile: ProviderProfile) -> StoredProviderProfile {
     use crate::persistence::current_time_ms;
     let now_ms = current_time_ms();
