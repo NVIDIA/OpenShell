@@ -2483,8 +2483,8 @@ message ApproveAllDraftChunksRequest {
   bool include_security_flagged = 2;
   // Workspace scope. Empty defaults to "default".
   string workspace = 3;
-  // Exact reviewed chunks and tokens. Processed in order; each successful
-  // prefix changes the live candidate for the following item.
+  // Exact reviewed chunks and tokens. The server validates them against one
+  // live snapshot, stages compatible operations in order, and writes once.
   repeated DraftChunkApproval approvals = 4;
 }
 
@@ -2495,7 +2495,8 @@ message ApproveAllDraftChunksResponse {
   string policy_hash = 2;
   // Number of chunks approved.
   uint32 chunks_approved = 3;
-  // Number of chunks skipped (security-flagged).
+  // Number of chunks skipped for any reason, including security flags,
+  // stale or invalid candidates, and conflicts within the staged batch.
   uint32 chunks_skipped = 4;
 }
 

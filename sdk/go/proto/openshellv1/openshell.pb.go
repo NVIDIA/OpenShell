@@ -11436,8 +11436,8 @@ type ApproveAllDraftChunksRequest struct {
 	IncludeSecurityFlagged bool `protobuf:"varint,2,opt,name=include_security_flagged,json=includeSecurityFlagged,proto3" json:"include_security_flagged,omitempty"`
 	// Workspace scope. Empty defaults to "default".
 	Workspace string `protobuf:"bytes,3,opt,name=workspace,proto3" json:"workspace,omitempty"`
-	// Exact reviewed chunks and tokens. Processed in order; each successful
-	// prefix changes the live candidate for the following item.
+	// Exact reviewed chunks and tokens. The server validates them against one
+	// live snapshot, stages compatible operations in order, and writes once.
 	Approvals     []*DraftChunkApproval `protobuf:"bytes,4,rep,name=approvals,proto3" json:"approvals,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -11509,7 +11509,8 @@ type ApproveAllDraftChunksResponse struct {
 	PolicyHash string `protobuf:"bytes,2,opt,name=policy_hash,json=policyHash,proto3" json:"policy_hash,omitempty"`
 	// Number of chunks approved.
 	ChunksApproved uint32 `protobuf:"varint,3,opt,name=chunks_approved,json=chunksApproved,proto3" json:"chunks_approved,omitempty"`
-	// Number of chunks skipped (security-flagged).
+	// Number of chunks skipped for any reason, including security flags,
+	// stale or invalid candidates, and conflicts within the staged batch.
 	ChunksSkipped uint32 `protobuf:"varint,4,opt,name=chunks_skipped,json=chunksSkipped,proto3" json:"chunks_skipped,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
