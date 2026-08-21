@@ -3741,7 +3741,7 @@ fn apply_supervisor_proxy_pod_topology(
                 openshell_core::sandbox_env::SANDBOX_ID,
                 openshell_core::sandbox_env::SANDBOX,
                 openshell_core::sandbox_env::ENDPOINT,
-                openshell_core::sandbox_env::SANDBOX_COMMAND,
+                openshell_core::sandbox_env::MAIN_PROCESS_SPEC,
                 openshell_core::sandbox_env::TELEMETRY_ENABLED,
                 openshell_core::sandbox_env::SSH_SOCKET_PATH,
                 openshell_core::sandbox_env::TLS_CA,
