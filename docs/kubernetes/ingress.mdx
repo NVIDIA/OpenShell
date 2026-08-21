@@ -120,8 +120,9 @@ helm upgrade --install openshell \
   --set grpcRoute.gateway.listener.port=443 \
   --set 'grpcRoute.gateway.listener.tls.certificateRefs[0].name=openshell-ingress-tls' \
   --set server.disableTls=true \
-  --set server.oidc.issuer=https://<issuer> \
-  --set 'grpcRoute.hostnames[0]=<external-hostname>'
+  --set server.oidc.issuer=https://keycloak.example.com/realms/openshell \
+  --set server.oidc.audience=openshell-cli \
+  --set 'grpcRoute.hostnames[0]=gateway.example.com'
 ```
 
 Keep the certificate Secret in the release namespace. Referencing a Secret in another namespace requires a `ReferenceGrant`.
@@ -129,7 +130,9 @@ Keep the certificate Secret in the release namespace. Referencing a Secret in an
 ### Register over HTTPS
 
 ```shell
-openshell gateway add https://<external-hostname> --name production --oidc-issuer https://<issuer>
+openshell gateway add https://gateway.example.com \
+  --name production \
+  --oidc-issuer https://keycloak.example.com/realms/openshell
 openshell status
 ```
 
@@ -164,8 +167,9 @@ helm upgrade --install openshell \
   --set grpcRoute.gateway.listener.port=443 \
   --set 'grpcRoute.gateway.listener.tls.certificateRefs[0].name=openshell-ingress-tls' \
   --set grpcRoute.backendTLSPolicy.enabled=true \
-  --set server.oidc.issuer=https://<issuer> \
-  --set 'grpcRoute.hostnames[0]=<external-hostname>'
+  --set server.oidc.issuer=https://keycloak.example.com/realms/openshell \
+  --set server.oidc.audience=openshell-cli \
+  --set 'grpcRoute.hostnames[0]=gateway.example.com'
 ```
 
 Note that `server.disableTls` is **not** set — the gateway pod continues to serve TLS — but `server.tls.enableMtls=false` disables mTLS client certificate authentication because the Gateway proxy cannot present a client certificate to the backend. The chart will fail the install if you try to enable both `grpcRoute.backendTLSPolicy.enabled=true` and `server.tls.enableMtls=true` simultaneously. The BackendTLSPolicy hostname defaults to the service FQDN, which matches the SAN on the server certificate. Use OIDC for authentication (configured via `server.oidc.issuer`).

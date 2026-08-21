@@ -170,8 +170,10 @@ helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart \
   --set grpcRoute.enabled=true \
   --set grpcRoute.gateway.name=openshell-gateway \
   --set grpcRoute.gateway.namespace=openshift-ingress \
-  --set 'grpcRoute.hostnames[0]=<external-hostname>' \
-  --set grpcRoute.backendTLSPolicy.enabled=true
+  --set 'grpcRoute.hostnames[0]=gateway.example.com' \
+  --set grpcRoute.backendTLSPolicy.enabled=true \
+  --set server.oidc.issuer=https://keycloak.example.com/realms/openshell \
+  --set server.oidc.audience=openshell-cli
 ```
 
 | Override | Reason |
@@ -192,7 +194,9 @@ If cert-manager takes longer than 120 seconds to issue certificates, increase th
 #### Register over HTTPS
 
 ```shell
-openshell gateway add https://<external-hostname> --name openshift
+openshell gateway add https://gateway.example.com \
+  --name openshift \
+  --oidc-issuer https://keycloak.example.com/realms/openshell
 openshell status
 ```
 
@@ -215,13 +219,13 @@ helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart \
   --set securityContext.runAsUser=null \
   --set server.disableTls=false \
   --set certManager.enabled=true \
-  --set certManager.serverIssuerRef.name=<cluster-issuer-name> \
+  --set certManager.serverIssuerRef.name=letsencrypt-prod \
   --set certManager.serverIssuerRef.kind=ClusterIssuer \
-  --set certManager.serverDnsNames[0]=<external-hostname> \
+  --set certManager.serverDnsNames[0]=gateway.example.com \
   --set openshiftRoute.enabled=true \
-  --set openshiftRoute.host=<external-hostname> \
-  --set server.oidc.issuer=<oidc-issuer-url> \
-  --set server.oidc.audience=<oidc-audience>
+  --set openshiftRoute.host=gateway.example.com \
+  --set server.oidc.issuer=https://keycloak.example.com/realms/openshell \
+  --set server.oidc.audience=openshell-cli
 ```
 
 | Override | Reason |
@@ -234,9 +238,9 @@ Register the gateway with the CLI over OIDC. Remote gateways authenticate CLI
 users via OIDC, not mTLS — see [Access Control](/kubernetes/access-control):
 
 ```shell
-openshell gateway add https://<external-hostname> \
+openshell gateway add https://gateway.example.com \
   --name openshift \
-  --oidc-issuer <issuer-url>
+  --oidc-issuer https://keycloak.example.com/realms/openshell
 openshell gateway login openshift
 ```
 
