@@ -98,7 +98,7 @@ impl Inference for InferenceService {
         let req = request.into_inner();
         let authz = authorize_workspace(
             &self.state.store,
-            &self.state.admin_role,
+            &self.state.admin_policy,
             &principal,
             &req.workspace,
             MinWorkspaceRole::Admin,
@@ -148,7 +148,7 @@ impl Inference for InferenceService {
         let req = request.into_inner();
         let authz = authorize_workspace(
             &self.state.store,
-            &self.state.admin_role,
+            &self.state.admin_policy,
             &principal,
             &req.workspace,
             MinWorkspaceRole::User,
@@ -200,7 +200,7 @@ impl Inference for InferenceService {
         let req = request.into_inner();
         let authz = authorize_workspace(
             &self.state.store,
-            &self.state.admin_role,
+            &self.state.admin_policy,
             &principal,
             &req.workspace,
             MinWorkspaceRole::Admin,
@@ -3790,7 +3790,7 @@ mod tests {
         }
 
         let mut state = test_server_state().await;
-        Arc::get_mut(&mut state).unwrap().admin_role = "openshell-admin".to_string();
+        Arc::get_mut(&mut state).unwrap().admin_policy.admin_role = "openshell-admin".to_string();
 
         let svc = InferenceService::new(state.clone());
 

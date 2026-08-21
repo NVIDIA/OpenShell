@@ -549,6 +549,36 @@ tests:
           path: data["gateway.toml"]
           pattern: '\[openshell\.gateway\.spiffe\]'
 
+  - it: omits admin_subjects when not configured
+    template: templates/gateway-config.yaml
+    asserts:
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: 'admin_subjects\s*='
+
+  - it: renders admin_subjects array under [openshell.gateway.oidc]
+    template: templates/gateway-config.yaml
+    set:
+      server.oidc.issuer: https://idp.example.com/realms/openshell
+      server.oidc.adminSubjects:
+        - "sub-1"
+        - "sub-2"
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.gateway\.oidc\].*?admin_subjects\s*=\s*\["sub-1", "sub-2"\]'
+
+  - it: renders a single admin_subjects entry
+    template: templates/gateway-config.yaml
+    set:
+      server.oidc.issuer: https://idp.example.com/realms/openshell
+      server.oidc.adminSubjects:
+        - "only-admin"
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.gateway\.oidc\].*?admin_subjects\s*=\s*\["only-admin"\]'
+
   - it: keeps the gateway sandbox JWT secret mounted when provider SPIFFE grants are enabled
     set:
       server.providerTokenGrants.spiffe.enabled: true

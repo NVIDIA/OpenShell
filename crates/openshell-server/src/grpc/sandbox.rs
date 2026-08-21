@@ -125,7 +125,7 @@ pub(super) async fn fetch_and_authorize_sandbox(
         .ok_or_else(|| Status::not_found("sandbox not found"))?;
     authorize_sandbox_workspace(
         &state.store,
-        &state.admin_role,
+        &state.admin_policy,
         principal,
         sandbox.object_workspace(),
         MinWorkspaceRole::User,
@@ -240,7 +240,7 @@ async fn handle_create_sandbox_inner(
 
     let authz = authorize_workspace(
         &state.store,
-        &state.admin_role,
+        &state.admin_policy,
         &principal,
         &request.workspace,
         MinWorkspaceRole::User,
@@ -379,7 +379,7 @@ pub(super) async fn handle_get_sandbox(
     }
     let authz = authorize_workspace(
         &state.store,
-        &state.admin_role,
+        &state.admin_policy,
         &principal,
         &req.workspace,
         MinWorkspaceRole::User,
@@ -415,7 +415,7 @@ pub(super) async fn handle_list_sandboxes(
     let limit = clamp_limit(request.limit, 100, MAX_PAGE_SIZE);
 
     let sandboxes: Vec<Sandbox> = if request.all_workspaces {
-        require_platform_admin(&state.admin_role, &principal)?;
+        require_platform_admin(&state.admin_policy, &principal)?;
         if request.label_selector.is_empty() {
             state
                 .store
@@ -433,7 +433,7 @@ pub(super) async fn handle_list_sandboxes(
     } else {
         let authz = authorize_workspace(
             &state.store,
-            &state.admin_role,
+            &state.admin_policy,
             &principal,
             &request.workspace,
             MinWorkspaceRole::User,
@@ -476,7 +476,7 @@ pub(super) async fn handle_list_sandbox_providers(
     let req = request.into_inner();
     let authz = authorize_workspace(
         &state.store,
-        &state.admin_role,
+        &state.admin_policy,
         &principal,
         &req.workspace,
         MinWorkspaceRole::User,
@@ -498,7 +498,7 @@ pub(super) async fn handle_attach_sandbox_provider(
     let request = request.into_inner();
     let authz = authorize_workspace(
         &state.store,
-        &state.admin_role,
+        &state.admin_policy,
         &principal,
         &request.workspace,
         MinWorkspaceRole::User,
@@ -642,7 +642,7 @@ pub(super) async fn handle_detach_sandbox_provider(
     let request = request.into_inner();
     let authz = authorize_workspace(
         &state.store,
-        &state.admin_role,
+        &state.admin_policy,
         &principal,
         &request.workspace,
         MinWorkspaceRole::User,
@@ -762,7 +762,7 @@ async fn handle_delete_sandbox_inner(
     }
     let authz = authorize_workspace(
         &state.store,
-        &state.admin_role,
+        &state.admin_policy,
         &principal,
         &req.workspace,
         MinWorkspaceRole::User,
@@ -1789,7 +1789,7 @@ pub(super) async fn handle_revoke_ssh_session(
     };
     authorize_sandbox_workspace(
         &state.store,
-        &state.admin_role,
+        &state.admin_policy,
         &principal,
         session.object_workspace(),
         MinWorkspaceRole::User,
@@ -4415,7 +4415,7 @@ mod tests {
         }
 
         let mut state = test_server_state().await;
-        Arc::get_mut(&mut state).unwrap().admin_role = "openshell-admin".to_string();
+        Arc::get_mut(&mut state).unwrap().admin_policy.admin_role = "openshell-admin".to_string();
 
         // --- handle_create_sandbox ---
         // Provide a spec so the handler passes the "spec is required" check
@@ -4584,7 +4584,7 @@ mod tests {
         }
 
         let mut state = test_server_state().await;
-        Arc::get_mut(&mut state).unwrap().admin_role = "openshell-admin".to_string();
+        Arc::get_mut(&mut state).unwrap().admin_policy.admin_role = "openshell-admin".to_string();
 
         let mut sandbox = test_sandbox("cross-ws", Vec::new());
         sandbox.metadata.as_mut().unwrap().workspace = "other-workspace".to_string();

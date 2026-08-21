@@ -613,6 +613,16 @@ pub struct OidcConfig {
     /// Keycloak: `scope` (space-delimited string). Okta: `scp` (JSON array).
     #[serde(default)]
     pub scopes_claim: String,
+
+    /// OIDC subjects (`sub` claim values) that are granted Platform Admin
+    /// privileges regardless of their JWT role claims. Works alongside
+    /// `admin_role` — either mechanism grants admin access.
+    ///
+    /// When `admin_subjects` is set but `admin_role` and `user_role` are
+    /// empty, only listed subjects receive Platform Admin — overriding the
+    /// default auth-only behavior where every authenticated user is admin.
+    #[serde(default)]
+    pub admin_subjects: Vec<String>,
 }
 
 /// mTLS user authentication for local, single-user gateways.

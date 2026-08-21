@@ -189,6 +189,16 @@ struct RunArgs {
     #[arg(long, env = "OPENSHELL_OIDC_SCOPES_CLAIM", default_value = "")]
     oidc_scopes_claim: String,
 
+    /// OIDC subjects (`sub` claim values) granted Platform Admin privileges
+    /// regardless of their JWT role claims. Comma-separated.
+    #[arg(
+        long,
+        env = "OPENSHELL_OIDC_ADMIN_SUBJECTS",
+        value_delimiter = ',',
+        default_value = ""
+    )]
+    oidc_admin_subjects: Vec<String>,
+
     /// Maximum gRPC requests allowed per rate-limit window. Set to 0 to disable.
     #[arg(long, env = "OPENSHELL_GRPC_RATE_LIMIT_REQUESTS")]
     grpc_rate_limit_requests: Option<u64>,
@@ -458,6 +468,14 @@ fn prepare_server_config(
             admin_role: args.oidc_admin_role.clone(),
             user_role: args.oidc_user_role.clone(),
             scopes_claim: args.oidc_scopes_claim.clone(),
+            // clap's `value_delimiter` + `default_value = ""` produces
+            // `vec![""]` when the user supplies no value — filter it out.
+            admin_subjects: args
+                .oidc_admin_subjects
+                .iter()
+                .filter(|s| !s.is_empty())
+                .cloned()
+                .collect(),
         });
     }
 
@@ -729,6 +747,9 @@ fn merge_file_into_args(args: &mut RunArgs, file: &GatewayFileSection, matches: 
         }
         if arg_defaulted(matches, "oidc_scopes_claim") {
             args.oidc_scopes_claim.clone_from(&oidc.scopes_claim);
+        }
+        if arg_defaulted(matches, "oidc_admin_subjects") && !oidc.admin_subjects.is_empty() {
+            args.oidc_admin_subjects.clone_from(&oidc.admin_subjects);
         }
     }
     if let Some(requests) = file.grpc_rate_limit_requests

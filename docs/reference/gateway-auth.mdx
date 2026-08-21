@@ -82,7 +82,8 @@ openshell-gateway \
   --oidc-audience openshell-cli \
   --oidc-roles-claim realm_access.roles \
   --oidc-admin-role openshell-admin \
-  --oidc-user-role openshell-user
+  --oidc-user-role openshell-user \
+  --oidc-admin-subjects user-id-1,user-id-2
 ```
 
 The same settings are available through environment variables:
@@ -95,6 +96,7 @@ The same settings are available through environment variables:
 | `OPENSHELL_OIDC_ROLES_CLAIM` | Dot-separated claim path containing roles. | `realm_access.roles` |
 | `OPENSHELL_OIDC_ADMIN_ROLE` | Role required for admin operations. | `openshell-admin` |
 | `OPENSHELL_OIDC_USER_ROLE` | Role required for standard user operations. | `openshell-user` |
+| `OPENSHELL_OIDC_ADMIN_SUBJECTS` | Comma-separated OIDC subject (`sub`) values granted Platform Admin regardless of roles. Works alongside `OPENSHELL_OIDC_ADMIN_ROLE`. | Empty |
 | `OPENSHELL_OIDC_SCOPES_CLAIM` | Dot-separated claim path containing scopes. Empty disables scope enforcement. | Empty |
 
 For Helm deployments, set the same values under `server.oidc`:
@@ -107,6 +109,7 @@ server:
     rolesClaim: realm_access.roles
     adminRole: openshell-admin
     userRole: openshell-user
+    adminSubjects: []
     scopesClaim: ""
 ```
 
@@ -131,7 +134,7 @@ For a headless environment, set `OPENSHELL_NO_BROWSER=1` before registering or l
 3. The CLI connects to the gateway and attaches `authorization: Bearer <token>` metadata to each gRPC request.
 4. The gateway validates the JWT signature, issuer, audience, expiration, and key ID against the issuer's JWKS.
 5. The gateway extracts roles and optional scopes from the configured claim paths.
-6. The gateway authorizes the gRPC method. Platform-scoped methods require the configured admin role. Workspace-scoped methods require the configured user role and a sufficient membership in the target workspace. Admin role holders satisfy user-role checks and bypass workspace membership checks.
+6. The gateway authorizes the gRPC method. Platform-scoped methods require the configured admin role or a matching `admin_subjects` entry. Workspace-scoped methods require the configured user role and a sufficient membership in the target workspace. Admin role holders and admin subjects satisfy user-role checks and bypass workspace membership checks.
 
 For the Platform Admin, Workspace Admin, and Workspace User permissions, refer
 to [Manage Workspaces and Access](/sandboxes/manage-workspaces).

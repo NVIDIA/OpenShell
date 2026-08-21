@@ -396,6 +396,9 @@ server:
     userRole: ""
     # -- Dot-separated path to the scopes array in the JWT claims.
     scopesClaim: ""
+    # -- OIDC subjects (sub claim values) granted Platform Admin regardless
+    # of JWT roles. Works alongside adminRole — either grants admin.
+    adminSubjects: []
     # -- Name of a ConfigMap containing a CA certificate bundle (key: ca.crt)
     # for verifying the OIDC issuer's TLS certificate. Required when the
     # issuer uses a non-public CA (e.g. OpenShift ingress, private PKI).

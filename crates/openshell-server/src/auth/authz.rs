@@ -12,6 +12,8 @@
 //! authentication is handled by explicit application-layer authenticators,
 //! authorization is a gateway concern.
 
+use std::collections::HashSet;
+
 use super::identity::Identity;
 use super::{descriptor_authz, method_authz};
 use tonic::Status;
@@ -35,6 +37,8 @@ pub struct AuthzPolicy {
     pub user_role: String,
     /// When true, enforce scope-based permissions on top of roles.
     pub scopes_enabled: bool,
+    /// OIDC subjects granted Platform Admin regardless of roles.
+    pub admin_subjects: HashSet<String>,
 }
 
 impl AuthzPolicy {
@@ -60,8 +64,11 @@ impl AuthzPolicy {
     /// Check whether the identity is authorized to call the given method.
     ///
     /// Returns `Ok(())` if authorized, `Err(PERMISSION_DENIED)` if not.
-    /// When both role names are empty, all authenticated callers are authorized
-    /// (authentication-only mode for providers like GitHub).
+    /// When both role names and `admin_subjects` are empty, all authenticated
+    /// callers are authorized (authentication-only mode for providers like
+    /// GitHub). When `admin_subjects` is set but role names are empty,
+    /// admin methods are restricted to listed subjects while user-level
+    /// methods remain open to all authenticated callers.
     ///
     /// Methods annotated with `global_role` (e.g. `"platform_admin"`) require
     /// the `admin_role` OIDC claim. Methods annotated with `workspace_role`
@@ -70,35 +77,57 @@ impl AuthzPolicy {
     /// annotation requires authentication only.
     #[allow(clippy::result_large_err)]
     pub fn check(&self, identity: &Identity, method: &str) -> Result<(), Status> {
-        let required = match descriptor_authz::lookup(method) {
-            Some(entry) if entry.global_role.is_some() => Some(&self.admin_role),
-            Some(entry) if entry.workspace_role.is_some() => Some(&self.user_role),
-            Some(_) => None,
-            None => Some(&self.user_role),
+        // Track whether this method needs admin-level access so we can
+        // enforce admin_subjects even when admin_role is empty.
+        let (required, needs_admin) = match descriptor_authz::lookup(method) {
+            Some(entry) if entry.global_role.is_some() => (Some(&self.admin_role), true),
+            Some(entry) if entry.workspace_role.is_some() => (Some(&self.user_role), false),
+            Some(_) => (None, false),
+            None => (Some(&self.user_role), false),
         };
 
-        // Empty role name = skip role check for this level (auth-only mode).
-        // Scope enforcement still applies if enabled.
-        if let Some(required) = required
-            && !required.is_empty()
-        {
-            // Admin role implicitly satisfies user role requirements.
-            let has_role = identity.roles.iter().any(|r| r == required)
-                || (!self.admin_role.is_empty()
-                    && required == &self.user_role
-                    && identity.roles.iter().any(|r| r == &self.admin_role));
+        // In auth-only mode (empty role names), skip role enforcement UNLESS
+        // admin_subjects is configured and this is an admin method — in that
+        // case, only listed subjects get admin access.
+        if let Some(required) = required {
+            let enforce = !required.is_empty() || (needs_admin && !self.admin_subjects.is_empty());
 
-            if !has_role {
-                debug!(
-                    sub = %identity.subject,
-                    required_role = required,
-                    user_roles = ?identity.roles,
-                    method = method,
-                    "authorization denied: missing role"
-                );
-                return Err(Status::permission_denied(format!(
-                    "role '{required}' required"
-                )));
+            if enforce {
+                // Admin role implicitly satisfies user role requirements.
+                // Admin subjects also implicitly satisfy any role requirement.
+                // Guard empty-string comparisons: when admin_role/user_role is
+                // "", skip the role-match branch entirely — only
+                // admin_subjects can grant access in that case.
+                let has_role = (!required.is_empty()
+                    && identity.roles.iter().any(|r| r == required))
+                    || (!self.admin_role.is_empty()
+                        && required == &self.user_role
+                        && identity.roles.iter().any(|r| r == &self.admin_role))
+                    || self.admin_subjects.contains(&identity.subject);
+
+                if !has_role {
+                    let role_label = if required.is_empty() {
+                        "(admin_subjects)"
+                    } else {
+                        required.as_str()
+                    };
+                    debug!(
+                        sub = %identity.subject,
+                        required_role = role_label,
+                        user_roles = ?identity.roles,
+                        method = method,
+                        "authorization denied: missing role"
+                    );
+                    return if needs_admin && self.admin_role.is_empty() {
+                        Err(Status::permission_denied(
+                            "platform admin access required",
+                        ))
+                    } else {
+                        Err(Status::permission_denied(format!(
+                            "role '{required}' required"
+                        )))
+                    };
+                }
             }
         }
 
@@ -152,6 +181,7 @@ mod tests {
             admin_role: "openshell-admin".to_string(),
             user_role: "openshell-user".to_string(),
             scopes_enabled: false,
+            admin_subjects: HashSet::new(),
         }
     }
 
@@ -160,6 +190,7 @@ mod tests {
             admin_role: "openshell-admin".to_string(),
             user_role: "openshell-user".to_string(),
             scopes_enabled: true,
+            admin_subjects: HashSet::new(),
         }
     }
 
@@ -271,6 +302,7 @@ mod tests {
             admin_role: String::new(),
             user_role: String::new(),
             scopes_enabled: false,
+            admin_subjects: HashSet::new(),
         };
         assert!(
             policy
@@ -291,6 +323,7 @@ mod tests {
             admin_role: "OpenShell.Admin".to_string(),
             user_role: "OpenShell.User".to_string(),
             scopes_enabled: false,
+            admin_subjects: HashSet::new(),
         };
         assert!(
             policy
@@ -316,6 +349,7 @@ mod tests {
             admin_role: String::new(),
             user_role: String::new(),
             scopes_enabled: false,
+            admin_subjects: HashSet::new(),
         };
         assert!(policy.validate().is_ok());
     }
@@ -326,6 +360,7 @@ mod tests {
             admin_role: "admin".to_string(),
             user_role: String::new(),
             scopes_enabled: false,
+            admin_subjects: HashSet::new(),
         };
         assert!(policy.validate().is_err());
     }
@@ -336,6 +371,7 @@ mod tests {
             admin_role: String::new(),
             user_role: "user".to_string(),
             scopes_enabled: false,
+            admin_subjects: HashSet::new(),
         };
         assert!(policy.validate().is_err());
     }
@@ -590,6 +626,7 @@ mod tests {
             admin_role: String::new(),
             user_role: String::new(),
             scopes_enabled: true,
+            admin_subjects: HashSet::new(),
         };
         let id_with_scope = identity_with_roles_and_scopes(&[], &["sandbox:read"]);
         assert!(
@@ -602,6 +639,132 @@ mod tests {
             policy
                 .check(&id_without_scope, "/openshell.v1.OpenShell/ListSandboxes")
                 .is_err()
+        );
+    }
+
+    // ---- Admin subjects tests ----
+
+    #[test]
+    fn admin_subject_can_access_platform_admin_methods() {
+        let policy = AuthzPolicy {
+            admin_role: "openshell-admin".to_string(),
+            user_role: "openshell-user".to_string(),
+            scopes_enabled: false,
+            admin_subjects: HashSet::from(["special-sub".to_string()]),
+        };
+        let id = Identity {
+            subject: "special-sub".to_string(),
+            display_name: None,
+            roles: vec![],
+            scopes: vec![],
+            provider: IdentityProvider::Oidc,
+        };
+        assert!(
+            policy
+                .check(&id, "/openshell.v1.OpenShell/CreateWorkspace")
+                .is_ok()
+        );
+        assert!(
+            policy
+                .check(&id, "/openshell.v1.OpenShell/GetGatewayInfo")
+                .is_ok()
+        );
+        assert!(
+            policy
+                .check(&id, "/openshell.v1.OpenShell/ListSandboxes")
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn non_admin_subject_still_denied() {
+        let policy = AuthzPolicy {
+            admin_role: "openshell-admin".to_string(),
+            user_role: "openshell-user".to_string(),
+            scopes_enabled: false,
+            admin_subjects: HashSet::from(["special-sub".to_string()]),
+        };
+        let id = Identity {
+            subject: "other-sub".to_string(),
+            display_name: None,
+            roles: vec![],
+            scopes: vec![],
+            provider: IdentityProvider::Oidc,
+        };
+        assert!(
+            policy
+                .check(&id, "/openshell.v1.OpenShell/ListSandboxes")
+                .is_err()
+        );
+    }
+
+    // ---- Subjects-only mode (no roles, admin_subjects set) ----
+
+    #[test]
+    fn subjects_only_admin_method_denied_without_subject() {
+        let policy = AuthzPolicy {
+            admin_role: String::new(),
+            user_role: String::new(),
+            scopes_enabled: false,
+            admin_subjects: HashSet::from(["admin-sub".to_string()]),
+        };
+        let id = Identity {
+            subject: "regular-user".to_string(),
+            display_name: None,
+            roles: vec![],
+            scopes: vec![],
+            provider: IdentityProvider::Oidc,
+        };
+        // Admin method should be denied — not in admin_subjects.
+        let err = policy
+            .check(&id, "/openshell.v1.OpenShell/CreateWorkspace")
+            .unwrap_err();
+        assert_eq!(err.message(), "platform admin access required");
+    }
+
+    #[test]
+    fn subjects_only_admin_method_allowed_with_subject() {
+        let policy = AuthzPolicy {
+            admin_role: String::new(),
+            user_role: String::new(),
+            scopes_enabled: false,
+            admin_subjects: HashSet::from(["admin-sub".to_string()]),
+        };
+        let id = Identity {
+            subject: "admin-sub".to_string(),
+            display_name: None,
+            roles: vec![],
+            scopes: vec![],
+            provider: IdentityProvider::Oidc,
+        };
+        // Admin method should be allowed — subject is in admin_subjects.
+        assert!(
+            policy
+                .check(&id, "/openshell.v1.OpenShell/CreateWorkspace")
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn subjects_only_user_method_still_open() {
+        let policy = AuthzPolicy {
+            admin_role: String::new(),
+            user_role: String::new(),
+            scopes_enabled: false,
+            admin_subjects: HashSet::from(["admin-sub".to_string()]),
+        };
+        let id = Identity {
+            subject: "regular-user".to_string(),
+            display_name: None,
+            roles: vec![],
+            scopes: vec![],
+            provider: IdentityProvider::Oidc,
+        };
+        // User-level method should still be open — no user_role gate.
+        assert!(
+            policy
+                .check(&id, "/openshell.v1.OpenShell/ListSandboxes")
+                .is_ok()
         );
     }
 }
