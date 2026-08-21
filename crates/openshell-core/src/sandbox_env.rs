@@ -105,7 +105,7 @@ impl MainProcessConfig {
     }
 
     /// Encode the versioned transport without whitespace for constrained
-    /// environment-variable transports such as libkrun.
+    /// environment-variable transports used by embedded runtimes.
     pub fn encode_driver_spec_base64url(
         spec: Option<&crate::proto::compute::v1::DriverSandboxSpec>,
     ) -> Result<String, serde_json::Error> {
