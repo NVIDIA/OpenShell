@@ -104,6 +104,10 @@ pub async fn run_process(
         )?;
     }
 
+    if crate::child_env::standard_sbin_path_repair_enabled(policy) {
+        crate::child_env::install_standard_sbin_path_startup_files(workspace.home());
+    }
+
     // Eagerly fetch initial settings and install the agent skill if the
     // proposals flag is on at startup, rather than waiting for the policy
     // poll loop's first tick. In offline/file-mode there is no gateway, so
