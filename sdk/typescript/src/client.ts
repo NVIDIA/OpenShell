@@ -59,7 +59,8 @@ export type SandboxPhaseName =
   | 'unknown'
   | 'stopping'
   | 'stopped'
-  | 'starting';
+  | 'starting'
+  | 'completed';
 
 /** Lowercase mirror of the generated `ServiceStatus` enum. Hand-maintained. */
 export type HealthStatus = 'unspecified' | 'healthy' | 'degraded' | 'unhealthy';
@@ -293,6 +294,7 @@ export const PHASE_NAMES: Record<SandboxPhase, SandboxPhaseName> = {
   [SandboxPhase.STOPPING]: 'stopping',
   [SandboxPhase.STOPPED]: 'stopped',
   [SandboxPhase.STARTING]: 'starting',
+  [SandboxPhase.COMPLETED]: 'completed',
 };
 export const STATUS_NAMES: Record<ServiceStatus, HealthStatus> = {
   [ServiceStatus.UNSPECIFIED]: 'unspecified',
@@ -632,7 +634,8 @@ export class SandboxClient {
       } catch (e) {
         throw mapWaitError(e, name, deadline, signal);
       }
-      if (ref.phase === 'ready') return ref;
+      if (ref.phase === 'ready' || ref.phase === 'completed') return ref;
+      if (ref.phase === 'stopped') throw new SdkError('connect', `sandbox '${name}' stopped before becoming ready`);
       if (ref.phase === 'error') throw new SdkError('connect', `sandbox '${name}' entered error phase`);
       if (Date.now() >= deadline) throw new SdkError('connect', `timed out waiting for sandbox '${name}'`);
       await waitSleep(delay, deadline, signal);

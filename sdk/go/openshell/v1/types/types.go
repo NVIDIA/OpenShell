@@ -18,6 +18,7 @@ const (
 	SandboxStopping     SandboxPhase = "Stopping"
 	SandboxStopped      SandboxPhase = "Stopped"
 	SandboxStarting     SandboxPhase = "Starting"
+	SandboxCompleted    SandboxPhase = "Completed"
 )
 
 // EventType classifies watch events.

@@ -1024,7 +1024,7 @@ impl ComputeRuntime {
         }
 
         let phase = SandboxPhase::try_from(current.phase()).unwrap_or(SandboxPhase::Unknown);
-        if phase == SandboxPhase::Stopped {
+        if matches!(phase, SandboxPhase::Stopped | SandboxPhase::Completed) {
             self.cleanup_stopped_sandbox_sessions(&current)
                 .await
                 .map_err(Status::internal)?;
@@ -1182,9 +1182,12 @@ impl ComputeRuntime {
         if phase == SandboxPhase::Ready {
             return Ok(current);
         }
-        if !matches!(phase, SandboxPhase::Stopped | SandboxPhase::Starting) {
+        if !matches!(
+            phase,
+            SandboxPhase::Stopped | SandboxPhase::Completed | SandboxPhase::Starting
+        ) {
             return Err(Status::failed_precondition(format!(
-                "sandbox must be Stopped to start (current phase: {phase:?})"
+                "sandbox must be Stopped or Completed to start (current phase: {phase:?})"
             )));
         }
 
@@ -2280,7 +2283,7 @@ impl ComputeRuntime {
             };
             let phase = SandboxPhase::try_from(sandbox.phase()).unwrap_or(SandboxPhase::Unknown);
             match phase {
-                SandboxPhase::Stopped => {
+                SandboxPhase::Stopped | SandboxPhase::Completed => {
                     if let Err(err) = self.cleanup_stopped_sandbox_sessions(&sandbox).await {
                         warn!(sandbox_id = %sandbox.object_id(), error = %err, "Failed to complete recovered sandbox session cleanup");
                     }
@@ -2835,6 +2838,7 @@ impl ComputeRuntime {
                 | SandboxPhase::Error
                 | SandboxPhase::Stopping
                 | SandboxPhase::Stopped
+                | SandboxPhase::Completed
         ) {
             return Ok(());
         }
@@ -2886,15 +2890,15 @@ impl ComputeRuntime {
         Ok(())
     }
 
-    /// Persist a terminal canonical-process result. Exit code zero is still a
-    /// sandbox error because the canonical process defines sandbox health.
+    /// Persist a terminal canonical-process result. Successful completion is
+    /// distinct from a nonzero command result and from infrastructure error.
     pub async fn main_process_exited(
         &self,
         sandbox_id: &str,
         instance_id: &str,
         exit_code: i32,
     ) -> Result<(), String> {
-        let _guard = self.sync_lock.lock().await;
+        let guard = self.sync_lock.lock().await;
         let Some(existing) = self
             .store
             .get_message::<Sandbox>(sandbox_id)
@@ -2906,7 +2910,10 @@ impl ComputeRuntime {
         let phase = SandboxPhase::try_from(existing.phase()).unwrap_or(SandboxPhase::Unknown);
         if matches!(
             phase,
-            SandboxPhase::Deleting | SandboxPhase::Stopping | SandboxPhase::Stopped
+            SandboxPhase::Deleting
+                | SandboxPhase::Stopping
+                | SandboxPhase::Stopped
+                | SandboxPhase::Completed
         ) {
             return Ok(());
         }
@@ -2949,6 +2956,14 @@ impl ComputeRuntime {
             }
         }
         let expected_resource_version = sandbox_resource_version(&existing);
+        let ephemeral = existing.metadata.as_ref().is_some_and(|metadata| {
+            metadata
+                .annotations
+                .get("openshell.nvidia.com/retention")
+                .is_some_and(|value| value == "ephemeral")
+        });
+        let workspace = existing.object_workspace().to_string();
+        let name = existing.object_name().to_string();
         let sandbox = self
             .store
             .update_message_cas::<Sandbox, _>(sandbox_id, expected_resource_version, |sandbox| {
@@ -2958,6 +2973,19 @@ impl ComputeRuntime {
             .map_err(|error| error.to_string())?;
         self.sandbox_index.update_from_sandbox(&sandbox);
         self.sandbox_watch_bus.notify(sandbox_id);
+        drop(guard);
+        if ephemeral {
+            let runtime = self.clone();
+            tokio::spawn(async move {
+                if let Err(error) = runtime.delete_sandbox(&workspace, &name).await {
+                    tracing::warn!(
+                        sandbox_name = %name,
+                        error = %error,
+                        "Failed to delete completed ephemeral sandbox"
+                    );
+                }
+            });
+        }
         Ok(())
     }
 
@@ -3228,6 +3256,17 @@ impl ComputeRuntime {
 
         let sandbox = decode_sandbox_record(&current_record)?;
         let phase = SandboxPhase::try_from(sandbox.phase()).unwrap_or(SandboxPhase::Unknown);
+        if phase == SandboxPhase::Completed
+            || (phase == SandboxPhase::Stopped
+                && sandbox
+                    .status
+                    .as_ref()
+                    .is_some_and(|status| status.exit_code.is_some()))
+        {
+            // A terminal canonical process may legitimately have removed its
+            // transient compute object. Keep the durable command result.
+            return Ok(());
+        }
         if matches!(
             phase,
             SandboxPhase::Stopping | SandboxPhase::Stopped | SandboxPhase::Starting
@@ -3317,24 +3356,41 @@ impl ComputeRuntime {
 
 fn apply_main_process_exit(sandbox: &mut Sandbox, instance_id: &str, exit_code: i32) {
     let sandbox_name = sandbox.object_name().to_string();
+    let preserve_infrastructure_error = sandbox.phase() == SandboxPhase::Error as i32;
     let status = sandbox.status.get_or_insert_with(|| SandboxStatus {
         sandbox_name: sandbox_name.clone(),
         ..Default::default()
     });
     status.main_process_instance_id = instance_id.to_string();
     status.exit_code = Some(exit_code);
+    if preserve_infrastructure_error {
+        return;
+    }
+    let (phase, reason, message) = if exit_code == 0 {
+        (
+            SandboxPhase::Completed,
+            "MainProcessCompleted",
+            "Canonical main process completed successfully".to_string(),
+        )
+    } else {
+        (
+            SandboxPhase::Stopped,
+            "MainProcessFailed",
+            format!("Canonical main process exited with status {exit_code}"),
+        )
+    };
     upsert_ready_condition(
         &mut sandbox.status,
         &sandbox_name,
         SandboxCondition {
             r#type: "Ready".to_string(),
             status: "False".to_string(),
-            reason: "MainProcessExited".to_string(),
-            message: "Canonical main process exited".to_string(),
+            reason: reason.to_string(),
+            message,
             last_transition_time: String::new(),
         },
     );
-    sandbox.set_phase(SandboxPhase::Error as i32);
+    sandbox.set_phase(phase as i32);
 }
 
 /// Connect to an unmanaged remote compute driver that is already listening on
@@ -3711,10 +3767,10 @@ fn apply_driver_snapshot(sandbox: &mut Sandbox, incoming: &DriverSandbox, sessio
     let old_phase = SandboxPhase::try_from(sandbox.phase()).unwrap_or(SandboxPhase::Unknown);
     let sandbox_name = &incoming.name;
 
-    // Error is terminal until an explicit future lifecycle operation changes
-    // desired state. In particular, a still-running backend snapshot must not
-    // revive a sandbox whose canonical process has exited.
-    if old_phase == SandboxPhase::Error {
+    // Infrastructure errors and successful main-process completions are
+    // sticky until an explicit lifecycle operation changes desired state. A
+    // late backend snapshot must not revive either result.
+    if matches!(old_phase, SandboxPhase::Error | SandboxPhase::Completed) {
         if let Some(metadata) = sandbox.metadata.as_mut() {
             metadata.name.clone_from(sandbox_name);
         }
@@ -3761,6 +3817,7 @@ fn apply_driver_snapshot(sandbox: &mut Sandbox, incoming: &DriverSandbox, sessio
         }
         SandboxPhase::Stopping if phase != SandboxPhase::Error => SandboxPhase::Stopping,
         SandboxPhase::Stopped => SandboxPhase::Stopped,
+        SandboxPhase::Completed => SandboxPhase::Completed,
         SandboxPhase::Starting if !matches!(phase, SandboxPhase::Ready | SandboxPhase::Error) => {
             SandboxPhase::Starting
         }
@@ -4971,13 +5028,13 @@ mod tests {
     }
 
     #[test]
-    fn main_process_exit_zero_is_terminal_error() {
+    fn main_process_exit_zero_is_completed() {
         let mut sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Ready);
         apply_main_process_exit(&mut sandbox, "instance-1", 0);
 
         assert_eq!(
             SandboxPhase::try_from(sandbox.phase()),
-            Ok(SandboxPhase::Error)
+            Ok(SandboxPhase::Completed)
         );
         let status = sandbox.status.as_ref().unwrap();
         assert_eq!(status.exit_code, Some(0));
@@ -4985,7 +5042,26 @@ mod tests {
         assert!(status.conditions.iter().any(|condition| {
             condition.r#type == "Ready"
                 && condition.status == "False"
-                && condition.reason == "MainProcessExited"
+                && condition.reason == "MainProcessCompleted"
+        }));
+    }
+
+    #[test]
+    fn main_process_nonzero_exit_is_stopped_failure() {
+        let mut sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Ready);
+        apply_main_process_exit(&mut sandbox, "instance-1", 7);
+
+        assert_eq!(
+            SandboxPhase::try_from(sandbox.phase()),
+            Ok(SandboxPhase::Stopped)
+        );
+        let status = sandbox.status.as_ref().unwrap();
+        assert_eq!(status.exit_code, Some(7));
+        assert_eq!(status.main_process_instance_id, "instance-1");
+        assert!(status.conditions.iter().any(|condition| {
+            condition.r#type == "Ready"
+                && condition.status == "False"
+                && condition.reason == "MainProcessFailed"
         }));
     }
 
@@ -5049,7 +5125,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(stored.phase(), SandboxPhase::Error as i32);
+        assert_eq!(stored.phase(), SandboxPhase::Stopped as i32);
         assert_eq!(stored.status.unwrap().exit_code, Some(9));
     }
 
@@ -5193,7 +5269,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(stored.phase(), SandboxPhase::Error as i32);
+        assert_eq!(stored.phase(), SandboxPhase::Stopped as i32);
         let status = stored.status.unwrap();
         assert_eq!(status.main_process_instance_id, "instance-new");
         assert_eq!(status.exit_code, Some(1));
@@ -6014,6 +6090,32 @@ mod tests {
             .unwrap();
         assert_eq!(ready.phase(), SandboxPhase::Ready as i32);
         assert_eq!(driver.start_calls(), 2, "ready start is idempotent");
+    }
+
+    #[tokio::test]
+    async fn completed_sandbox_can_start_a_fresh_main_instance() {
+        let driver = ControlledDriver::new();
+        let runtime = test_runtime(driver.clone()).await;
+        let mut sandbox =
+            sandbox_record("sb-completed", "sandbox-completed", SandboxPhase::Completed);
+        sandbox.status = Some(SandboxStatus {
+            phase: SandboxPhase::Completed as i32,
+            main_process_instance_id: "instance-old".to_string(),
+            exit_code: Some(0),
+            ..Default::default()
+        });
+        runtime.store.put_message(&sandbox).await.unwrap();
+
+        let starting = runtime
+            .start_sandbox("default", sandbox.object_name())
+            .await
+            .unwrap();
+
+        assert_eq!(starting.phase(), SandboxPhase::Starting as i32);
+        let status = starting.status.unwrap();
+        assert_eq!(status.main_process_instance_id, "instance-old");
+        assert_eq!(status.exit_code, None);
+        assert_eq!(driver.start_calls(), 1);
     }
 
     #[tokio::test]
@@ -7705,6 +7807,38 @@ mod tests {
         let status = stored.status.unwrap();
         assert_eq!(status.main_process_instance_id, "instance-1");
         assert_eq!(status.exit_code, None);
+    }
+
+    #[tokio::test]
+    async fn late_driver_exit_preserves_completed_main_result() {
+        let runtime = test_runtime(Arc::new(TestDriver::default())).await;
+        let mut sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Completed);
+        sandbox.status = Some(SandboxStatus {
+            sandbox_name: "sandbox-a".to_string(),
+            phase: SandboxPhase::Completed as i32,
+            main_process_instance_id: "instance-1".to_string(),
+            exit_code: Some(0),
+            ..Default::default()
+        });
+        runtime.store.put_message(&sandbox).await.unwrap();
+        let mut exited = ready_driver_sandbox("sb-1", "sandbox-a");
+        exited.status = Some(make_driver_status(make_driver_condition(
+            "ContainerExited",
+            "container exited after the canonical process completed",
+        )));
+
+        runtime.apply_sandbox_update(exited).await.unwrap();
+
+        let stored = runtime
+            .store
+            .get_message::<Sandbox>("sb-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.phase(), SandboxPhase::Completed as i32);
+        let status = stored.status.unwrap();
+        assert_eq!(status.main_process_instance_id, "instance-1");
+        assert_eq!(status.exit_code, Some(0));
     }
 
     #[tokio::test]

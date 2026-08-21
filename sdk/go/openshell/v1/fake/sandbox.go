@@ -504,8 +504,8 @@ func (c *fakeSandboxClient) WaitReady(ctx context.Context, workspace, name strin
 
 // Watch registers a watcher for sandbox events. If name is non-empty, only
 // events for that sandbox are delivered. When StopOnTerminal is set, the
-// watcher auto-closes after delivering a terminal phase event (SandboxReady
-// or SandboxError).
+// watcher auto-closes after delivering a terminal phase event (SandboxReady,
+// SandboxCompleted, SandboxStopped, or SandboxError).
 func (c *fakeSandboxClient) Watch(ctx context.Context, _, name string, opts ...v1.WatchOptions) (types.WatchInterface[*types.Sandbox], error) {
 	if c.closedFunc() {
 		return nil, &types.StatusError{Code: types.ErrorUnavailable, Message: "client is closed"}
@@ -547,7 +547,7 @@ func (c *fakeSandboxClient) Watch(ctx context.Context, _, name string, opts ...v
 				return
 			}
 			if ev.Object != nil &&
-				(ev.Object.Status.Phase == types.SandboxReady || ev.Object.Status.Phase == types.SandboxError) {
+				(ev.Object.Status.Phase == types.SandboxReady || ev.Object.Status.Phase == types.SandboxCompleted || ev.Object.Status.Phase == types.SandboxStopped || ev.Object.Status.Phase == types.SandboxError) {
 				inner.Stop()
 				return
 			}

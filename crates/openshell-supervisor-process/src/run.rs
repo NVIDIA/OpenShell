@@ -39,6 +39,8 @@ use crate::process::{
     ResolvedWorkspace,
 };
 
+const TERMINAL_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
+
 pub type SidecarExitReport = (
     String,
     i32,
@@ -312,9 +314,9 @@ pub async fn run_process(
             }
         });
 
-        // Wait for the SSH server to bind its socket before spawning the
-        // entrypoint process. This prevents exec requests from racing against
-        // SSH server startup when Kubernetes marks the pod Ready.
+        // Wait for the SSH server to bind before advertising its relay. The
+        // main process is already supervised; MainSession retains any output
+        // produced while this endpoint is being prepared.
         match timeout(Duration::from_secs(10), ssh_ready_rx).await {
             Ok(Ok(Ok(()))) => {
                 ocsf_emit!(
@@ -344,37 +346,35 @@ pub async fn run_process(
 
     let supervisor_terminating = Arc::new(AtomicBool::new(false));
     // A canonical process may have completed while the SSH socket was being
-    // prepared. Never open a readiness-bearing supervisor session for a child
-    // that is already terminal.
+    // prepared. Its relay must still register so a foreground create can
+    // attach and replay retained output before runtime shutdown.
     let early_exit = handle.try_wait().into_diagnostic()?;
 
     // Spawn the persistent supervisor session if we have a gateway endpoint
     // and sandbox identity. The session provides relay channels for SSH
     // connect and ExecSandbox through the gateway.
-    let supervisor_session_task = if early_exit.is_none()
-        && let (Some(endpoint), Some(id), Some(socket)) =
+    let (supervisor_session_task, supervisor_session_ready) =
+        if let (Some(endpoint), Some(id), Some(socket)) =
             (openshell_endpoint, sandbox_id, ssh_socket_path.as_ref())
-    {
-        let task = crate::supervisor_session::spawn(
-            endpoint.to_string(),
-            id.to_string(),
-            socket.clone(),
-            ssh_netns_fd,
-            None,
-            Arc::clone(&supervisor_terminating),
-            main_instance_id.clone(),
-        );
-        info!("supervisor session task spawned");
-        Some(task)
-    } else {
-        None
-    };
+        {
+            let (task, ready) = crate::supervisor_session::spawn_with_ready(
+                endpoint.to_string(),
+                id.to_string(),
+                socket.clone(),
+                ssh_netns_fd,
+                None,
+                Arc::clone(&supervisor_terminating),
+                main_instance_id.clone(),
+            );
+            info!("supervisor session task spawned");
+            (Some(task), Some(ready))
+        } else {
+            (None, None)
+        };
 
     // Store the entrypoint PID so the proxy can resolve TCP peer identity
     entrypoint_pid.store(handle.pid(), Ordering::Release);
-    if early_exit.is_none()
-        && let Some(tx) = entrypoint_started_tx
-    {
+    if let Some(tx) = entrypoint_started_tx {
         let _ = tx.send((handle.pid(), main_instance_id.clone()));
     }
     ocsf_emit!(
@@ -397,8 +397,8 @@ pub async fn run_process(
             .await?
     };
 
-    let rendered_code = match outcome {
-        ProcessWaitOutcome::Exited(status) => status.code(),
+    let (rendered_code, drain_terminal) = match outcome {
+        ProcessWaitOutcome::Exited(status) => (status.code(), true),
         ProcessWaitOutcome::TimedOut => {
             ocsf_emit!(
                 ProcessActivityBuilder::new(ocsf_ctx())
@@ -410,7 +410,7 @@ pub async fn run_process(
                     .message("Process timed out, killing")
                     .build()
             );
-            124
+            (124, false)
         }
         ProcessWaitOutcome::ShutdownSignal { signal, status } => {
             info!(
@@ -418,10 +418,9 @@ pub async fn run_process(
                 exit_code = status.code(),
                 "Entrypoint exited after supervisor shutdown signal"
             );
-            status.code()
+            (status.code(), false)
         }
     };
-    supervisor_terminating.store(true, Ordering::Release);
     main_session.finish(rendered_code).await;
 
     ocsf_emit!(
@@ -436,8 +435,21 @@ pub async fn run_process(
             .build()
     );
 
-    if let Some(task) = supervisor_session_task {
-        task.abort();
+    if drain_terminal && let Some(ready) = supervisor_session_ready {
+        timeout(TERMINAL_DRAIN_TIMEOUT, ready)
+            .await
+            .map_err(|_| miette::miette!("supervisor session registration timed out"))?
+            .map_err(|_| miette::miette!("supervisor session ended before registration"))?;
+    }
+    if drain_terminal && (supervisor_session_task.is_some() || sidecar_exit_tx.is_some()) {
+        // Keep the public phase Ready until a foreground attachment has
+        // drained the result. Explicitly detached commands use the bounded
+        // fallback and then publish their terminal result.
+        let _ = timeout(
+            TERMINAL_DRAIN_TIMEOUT,
+            main_session.wait_for_terminal_delivery(),
+        )
+        .await;
     }
     if let Some(tx) = sidecar_exit_tx {
         let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
@@ -451,6 +463,11 @@ pub async fn run_process(
     } else if let (Some(endpoint), Some(id)) = (openshell_endpoint, sandbox_id) {
         report_main_process_exit_until_ack(endpoint, id, &main_instance_id, rendered_code).await;
         info!(instance_id = %main_instance_id, "main-process exit acknowledged");
+    }
+
+    supervisor_terminating.store(true, Ordering::Release);
+    if let Some(task) = supervisor_session_task {
+        task.abort();
     }
 
     Ok(rendered_code)
@@ -505,7 +522,6 @@ async fn wait_for_process_exit_or_shutdown(
         tokio::pin!(deadline);
         tokio::select! {
             result = &mut wait => {
-                terminating.store(true, Ordering::Release);
                 Ok(ProcessWaitOutcome::Exited(result.into_diagnostic()?))
             }
             () = &mut deadline => {

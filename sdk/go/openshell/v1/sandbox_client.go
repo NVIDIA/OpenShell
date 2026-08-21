@@ -214,6 +214,13 @@ func checkTerminalPhase(sb *Sandbox, name string, target SandboxPhase) (*Sandbox
 		return sb, nil
 	}
 	switch sb.Status.Phase {
+	case SandboxCompleted:
+		if target == SandboxReady {
+			return sb, nil
+		}
+		return nil, &StatusError{Code: ErrorInternal, Message: fmt.Sprintf("sandbox %q completed before reaching %s", name, target)}
+	case SandboxStopped:
+		return nil, &StatusError{Code: ErrorInternal, Message: fmt.Sprintf("sandbox %q stopped before reaching %s", name, target)}
 	case SandboxError:
 		return nil, &StatusError{Code: ErrorInternal, Message: fmt.Sprintf("sandbox %q is in error state", name)}
 	case SandboxDeleting:
@@ -278,7 +285,7 @@ func (s *sandboxClient) Watch(ctx context.Context, workspace, name string, opts 
 				case <-w.done:
 					return
 				}
-				if watchOpts.StopOnTerminal && (sandbox.Status.Phase == SandboxReady || sandbox.Status.Phase == SandboxError) {
+				if watchOpts.StopOnTerminal && (sandbox.Status.Phase == SandboxReady || sandbox.Status.Phase == SandboxCompleted || sandbox.Status.Phase == SandboxStopped || sandbox.Status.Phase == SandboxError) {
 					w.Stop()
 					return
 				}

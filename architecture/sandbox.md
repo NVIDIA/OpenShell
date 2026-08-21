@@ -446,7 +446,9 @@ engine with a gateway policy revision.
   re-evaluate.
 - If the supervisor relay drops, the sandbox can keep running, but connect and
   exec operations fail until the supervisor registers again.
-- If the canonical main process exits, including with code 0, the supervisor
-  reports its normalized exit code before shutdown. The gateway persists the
-  code on sandbox status, records `MainProcessExited`, and makes the sandbox
-  terminal `Error`; runtime restart policies must not replace the process.
+- If the canonical main process exits, the supervisor drains its retained main
+  output and reports the normalized result before shutdown. Exit code 0 records
+  `Completed/MainProcessCompleted`; nonzero and signal-normalized exits record
+  `Stopped/MainProcessFailed`. `Error` remains reserved for failures to create,
+  run, or supervise the sandbox, and runtime restart policies must not replace
+  the canonical process.

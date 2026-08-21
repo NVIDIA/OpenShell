@@ -207,13 +207,16 @@ identity provider. Requires an authenticated gateway connection.
 Create a sandbox through the selected gateway and launch its canonical main
 process. By default, the CLI attaches to that retained process after the
 sandbox becomes ready. A trailing command defines the canonical main process;
-without one, the default is `/bin/bash -l` with a PTY.
+without one, the default is `/bin/bash -l` with a PTY. Explicit commands remain
+foreground in non-interactive automation: stdout and stderr stream to the
+caller and the CLI returns the command's exact status. Exit 0 leaves
+`Completed`; nonzero leaves `Stopped/MainProcessFailed`.
 
 | Flag | Description |
 |------|-------------|
 | `--name <NAME>` | Sandbox name (auto-generated if omitted) |
 | `--from <SOURCE>` | Community name, Dockerfile path, directory, or image reference (BYOC) |
-| `--no-keep` | Delete the sandbox after the initial command or shell exits |
+| `--no-keep` | Delete the sandbox after main output and the result drain |
 | `--detach` | Start the canonical main process without attaching |
 | `--editor vscode|cursor` | Launch a remote editor and keep the sandbox alive |
 | `--gpu [COUNT]` | Request the driver's default GPU selection or a specific count |
@@ -269,8 +272,9 @@ and waits for the `Stopped` phase.
 
 ### `openshell sandbox start [name]`
 
-Start a stopped sandbox and wait for `Ready`. The name defaults to the
-last-used sandbox.
+Start a stopped, failed, or completed sandbox and wait for `Ready`. This
+launches a fresh canonical-main instance. The name defaults to the last-used
+sandbox.
 
 ### `openshell sandbox exec [OPTIONS] -- COMMAND...`
 

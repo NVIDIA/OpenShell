@@ -65,6 +65,7 @@ pub fn phase_name(phase: i32) -> &'static str {
         Ok(SandboxPhase::Stopping) => "Stopping",
         Ok(SandboxPhase::Stopped) => "Stopped",
         Ok(SandboxPhase::Starting) => "Starting",
+        Ok(SandboxPhase::Completed) => "Completed",
         Ok(SandboxPhase::Unknown) | Err(_) => "Unknown",
     }
 }

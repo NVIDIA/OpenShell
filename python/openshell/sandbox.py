@@ -623,6 +623,18 @@ class SandboxClient:
             sandbox = self.get(sandbox_name, workspace=workspace)
             if sandbox.status.phase == target_phase:
                 return sandbox
+            if (
+                target_phase == openshell_pb2.SANDBOX_PHASE_READY
+                and sandbox.status.phase == openshell_pb2.SANDBOX_PHASE_COMPLETED
+            ):
+                return sandbox
+            if (
+                target_phase == openshell_pb2.SANDBOX_PHASE_READY
+                and sandbox.status.phase == openshell_pb2.SANDBOX_PHASE_STOPPED
+            ):
+                raise SandboxError(
+                    f"sandbox {sandbox_name} stopped before becoming ready"
+                )
             if sandbox.status.phase == openshell_pb2.SANDBOX_PHASE_ERROR:
                 raise SandboxError(f"sandbox {sandbox_name} entered error phase")
             time.sleep(1)

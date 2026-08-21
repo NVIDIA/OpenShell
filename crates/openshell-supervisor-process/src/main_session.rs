@@ -54,6 +54,8 @@ struct OutputLogState {
 struct OutputLog {
     state: Mutex<OutputLogState>,
     version: watch::Sender<u64>,
+    terminal_delivered: std::sync::atomic::AtomicBool,
+    terminal_delivered_notify: Notify,
 }
 
 impl OutputLog {
@@ -66,6 +68,8 @@ impl OutputLog {
                 next_sequence: 0,
             }),
             version,
+            terminal_delivered: std::sync::atomic::AtomicBool::new(false),
+            terminal_delivered_notify: Notify::new(),
         })
     }
 
@@ -170,6 +174,7 @@ pub struct MainSession {
     pty_master: Option<Arc<std::fs::File>>,
     readers_remaining: AtomicUsize,
     readers_done: Notify,
+    finished: std::sync::atomic::AtomicBool,
 }
 
 impl MainSession {
@@ -186,6 +191,7 @@ impl MainSession {
             pty_master: None,
             readers_remaining: AtomicUsize::new(0),
             readers_done: Notify::new(),
+            finished: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -230,6 +236,7 @@ impl MainSession {
             pty_master,
             readers_remaining: AtomicUsize::new(if terminal { 1 } else { 2 }),
             readers_done: Notify::new(),
+            finished: std::sync::atomic::AtomicBool::new(false),
         });
         Self::start_io(&session, io, input_rx);
         session
@@ -345,11 +352,31 @@ impl MainSession {
         if self.readers_remaining.load(Ordering::Acquire) != 0 {
             let _ = tokio::time::timeout(std::time::Duration::from_secs(2), notified).await;
         }
+        self.finished.store(true, Ordering::Release);
         self.publish(MainOutput::Exit(exit_code));
     }
 
     pub fn subscribe(&self) -> MainOutputCursor {
         self.output.subscribe()
+    }
+
+    /// Wait until an attached main-session consumer receives the terminal
+    /// exit event. Callers use a bounded timeout for detached commands.
+    pub async fn wait_for_terminal_delivery(&self) {
+        let notified = self.output.terminal_delivered_notify.notified();
+        if self.output.terminal_delivered.load(Ordering::Acquire) {
+            return;
+        }
+        notified.await;
+    }
+
+    /// Record that the SSH main subsystem sent the terminal result to an
+    /// attached client.
+    pub fn mark_terminal_delivered(&self) {
+        self.output
+            .terminal_delivered
+            .store(true, Ordering::Release);
+        self.output.terminal_delivered_notify.notify_waiters();
     }
 
     pub fn acquire_input(&self) -> Result<(u64, tokio::sync::mpsc::Sender<Vec<u8>>), &'static str> {
@@ -394,6 +421,11 @@ impl MainSession {
     pub const fn terminal(&self) -> bool {
         self.terminal
     }
+
+    #[must_use]
+    pub fn finished(&self) -> bool {
+        self.finished.load(Ordering::Acquire)
+    }
 }
 
 fn set_nonblocking(file: &std::fs::File) -> Result<(), nix::errno::Errno> {
@@ -437,6 +469,31 @@ mod tests {
             output.recv().await.expect("live output"),
             MainOutput::Stderr(data) if data == b"after"[..]
         ));
+    }
+
+    #[tokio::test]
+    async fn terminal_delivery_requires_ssh_send_acknowledgement() {
+        let session = MainSession::inert();
+        session.finish(0).await;
+        assert!(session.finished());
+
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(10),
+                session.wait_for_terminal_delivery(),
+            )
+            .await
+            .is_err(),
+            "publishing Exit alone must not count as delivery"
+        );
+
+        session.mark_terminal_delivered();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            session.wait_for_terminal_delivery(),
+        )
+        .await
+        .expect("delivery acknowledgement should wake waiter");
     }
 
     #[tokio::test]

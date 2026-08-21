@@ -65,6 +65,7 @@ pub enum SandboxPhase {
     Stopping,
     Stopped,
     Starting,
+    Completed,
 }
 
 impl From<proto::SandboxPhase> for SandboxPhase {
@@ -79,6 +80,7 @@ impl From<proto::SandboxPhase> for SandboxPhase {
             proto::SandboxPhase::Stopping => Self::Stopping,
             proto::SandboxPhase::Stopped => Self::Stopped,
             proto::SandboxPhase::Starting => Self::Starting,
+            proto::SandboxPhase::Completed => Self::Completed,
         }
     }
 }

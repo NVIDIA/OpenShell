@@ -44,6 +44,8 @@ const (
 	SandboxPhase_SANDBOX_PHASE_STOPPING     SandboxPhase = 6
 	SandboxPhase_SANDBOX_PHASE_STOPPED      SandboxPhase = 7
 	SandboxPhase_SANDBOX_PHASE_STARTING     SandboxPhase = 8
+	// The canonical main process exited successfully and its result is final.
+	SandboxPhase_SANDBOX_PHASE_COMPLETED SandboxPhase = 9
 )
 
 // Enum value maps for SandboxPhase.
@@ -58,6 +60,7 @@ var (
 		6: "SANDBOX_PHASE_STOPPING",
 		7: "SANDBOX_PHASE_STOPPED",
 		8: "SANDBOX_PHASE_STARTING",
+		9: "SANDBOX_PHASE_COMPLETED",
 	}
 	SandboxPhase_value = map[string]int32{
 		"SANDBOX_PHASE_UNSPECIFIED":  0,
@@ -69,6 +72,7 @@ var (
 		"SANDBOX_PHASE_STOPPING":     6,
 		"SANDBOX_PHASE_STOPPED":      7,
 		"SANDBOX_PHASE_STARTING":     8,
+		"SANDBOX_PHASE_COMPLETED":    9,
 	}
 )
 
@@ -1449,7 +1453,8 @@ type SandboxStatus struct {
 	// The gateway uses this to reject stale exit reports after a restart.
 	MainProcessInstanceId string `protobuf:"bytes,8,opt,name=main_process_instance_id,json=mainProcessInstanceId,proto3" json:"main_process_instance_id,omitempty"`
 	// Normalized main process result. Signal exits use 128 + signal number.
-	// Presence indicates that the main process exited and the sandbox is in Error.
+	// Presence indicates that the canonical main process exited. Exit code 0
+	// produces Completed; nonzero and signal-normalized exits produce Stopped.
 	ExitCode      *int32 `protobuf:"varint,9,opt,name=exit_code,json=exitCode,proto3,oneof" json:"exit_code,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -4173,7 +4178,8 @@ type WatchSandboxRequest struct {
 	LogTailLines uint32 `protobuf:"varint,5,opt,name=log_tail_lines,json=logTailLines,proto3" json:"log_tail_lines,omitempty"`
 	// Replay the last N platform events (best-effort) before following.
 	EventTail uint32 `protobuf:"varint,6,opt,name=event_tail,json=eventTail,proto3" json:"event_tail,omitempty"`
-	// Stop streaming once the sandbox reaches a terminal phase (READY or ERROR).
+	// Stop streaming once the sandbox reaches READY or a terminal result phase
+	// (COMPLETED, STOPPED, or ERROR).
 	StopOnTerminal bool `protobuf:"varint,7,opt,name=stop_on_terminal,json=stopOnTerminal,proto3" json:"stop_on_terminal,omitempty"`
 	// Only include log lines with timestamp >= this value (milliseconds since epoch).
 	// 0 means no time filter. Applies to both tail replay and live streaming.
@@ -14337,7 +14343,7 @@ const file_openshell_proto_rawDesc = "" +
 	"\x1aExtensionServiceCredential\x12!\n" +
 	"\fservice_name\x18\x01 \x01(\tR\vserviceName\x12\x1a\n" +
 	"\x05token\x18\x02 \x01(\tB\x04\x88\xb5\x18\x01R\x05token\x12\"\n" +
-	"\rexpires_at_ms\x18\x03 \x01(\x03R\vexpiresAtMs*\x89\x02\n" +
+	"\rexpires_at_ms\x18\x03 \x01(\x03R\vexpiresAtMs*\xa6\x02\n" +
 	"\fSandboxPhase\x12\x1d\n" +
 	"\x19SANDBOX_PHASE_UNSPECIFIED\x10\x00\x12\x1e\n" +
 	"\x1aSANDBOX_PHASE_PROVISIONING\x10\x01\x12\x17\n" +
@@ -14347,7 +14353,8 @@ const file_openshell_proto_rawDesc = "" +
 	"\x15SANDBOX_PHASE_UNKNOWN\x10\x05\x12\x1a\n" +
 	"\x16SANDBOX_PHASE_STOPPING\x10\x06\x12\x19\n" +
 	"\x15SANDBOX_PHASE_STOPPED\x10\a\x12\x1a\n" +
-	"\x16SANDBOX_PHASE_STARTING\x10\b*\xc3\x03\n" +
+	"\x16SANDBOX_PHASE_STARTING\x10\b\x12\x1b\n" +
+	"\x17SANDBOX_PHASE_COMPLETED\x10\t*\xc3\x03\n" +
 	"!ProviderCredentialRefreshStrategy\x124\n" +
 	"0PROVIDER_CREDENTIAL_REFRESH_STRATEGY_UNSPECIFIED\x10\x00\x12/\n" +
 	"+PROVIDER_CREDENTIAL_REFRESH_STRATEGY_STATIC\x10\x01\x121\n" +

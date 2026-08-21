@@ -16,8 +16,9 @@ workloads.
 - Coordinate supervisor relay sessions for connect, exec, file sync, and
   service forwarding.
 - Persist the canonical main-process instance ID and normalized exit code on
-  sandbox status. Any main process exit transitions the sandbox to `Error`,
-  including exit code zero.
+  sandbox status. Exit code zero transitions the sandbox to `Completed`;
+  nonzero results transition it to `Stopped/MainProcessFailed`. `Error` is
+  reserved for infrastructure failures.
 
 The gateway does not enforce agent network policy at request time. That happens
 inside each sandbox, where the supervisor and proxy can observe local process
@@ -26,7 +27,9 @@ identity.
 The live supervisor session is the readiness authority for its main-process
 instance. The supervisor reports its normalized result through the
 sandbox-authenticated `ReportMainProcessExit` RPC, and the gateway rejects
-results from stale instance IDs.
+results from stale instance IDs. The process supervisor keeps the main SSH
+session alive until an attached foreground client receives the terminal result
+or a bounded detached timeout expires, then reports the result and closes.
 
 ## Protocol and Auth
 

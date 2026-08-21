@@ -898,7 +898,8 @@ message SandboxStatus {
   // The gateway uses this to reject stale exit reports after a restart.
   string main_process_instance_id = 8;
   // Normalized main process result. Signal exits use 128 + signal number.
-  // Presence indicates that the main process exited and the sandbox is in Error.
+  // Presence indicates that the canonical main process exited. Exit code 0
+  // produces Completed; nonzero and signal-normalized exits produce Stopped.
   optional int32 exit_code = 9;
 }
 
@@ -930,6 +931,8 @@ enum SandboxPhase {
   SANDBOX_PHASE_STOPPING = 6;
   SANDBOX_PHASE_STOPPED = 7;
   SANDBOX_PHASE_STARTING = 8;
+  // The canonical main process exited successfully and its result is final.
+  SANDBOX_PHASE_COMPLETED = 9;
 }
 
 // Public platform event exposed on the sandbox watch stream.
@@ -1346,7 +1349,8 @@ message WatchSandboxRequest {
   // Replay the last N platform events (best-effort) before following.
   uint32 event_tail = 6;
 
-  // Stop streaming once the sandbox reaches a terminal phase (READY or ERROR).
+  // Stop streaming once the sandbox reaches READY or a terminal result phase
+  // (COMPLETED, STOPPED, or ERROR).
   bool stop_on_terminal = 7;
 
   // Only include log lines with timestamp >= this value (milliseconds since epoch).
