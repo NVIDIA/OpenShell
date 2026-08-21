@@ -41,6 +41,7 @@
           overlays = [ (import rust-overlay) ];
         };
         commonDevShellPackages = with pkgs; [
+          cargo-nextest
           # Assemble Debian artifacts on macOS and Linux.
           dpkg
           # Required to find packages.

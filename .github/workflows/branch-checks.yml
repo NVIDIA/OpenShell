@@ -110,7 +110,7 @@ jobs:
             system: x86_64-linux
           - runner: linux-arm64-cpu8
             system: aarch64-linux
-          - runner: macos-latest
+          - runner: macos-15-xlarge
             system: aarch64-darwin
     runs-on: ${{ matrix.runner }}
     defaults:
@@ -160,8 +160,10 @@ jobs:
         env:
           OPENSHELL_TELEMETRY_ENABLED: "false"
         run: |
-          cargo test --workspace --exclude openshell-server
-          cargo test -p openshell-server --features test-support
+          cargo nextest run --profile ci --workspace --exclude openshell-server
+          cargo test --doc --workspace --exclude openshell-server
+          cargo nextest run --profile ci -p openshell-server --features test-support
+          cargo test --doc -p openshell-server --features test-support
 
   python:
     name: Python (${{ matrix.runner }})
