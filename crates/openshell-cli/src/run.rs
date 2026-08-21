@@ -1394,7 +1394,8 @@ const MAX_STDIN_PAYLOAD: usize = 4 * 1024 * 1024;
 
 /// Execute a command in a running sandbox via gRPC, streaming output to the terminal.
 ///
-/// Returns the remote command's exit code.
+/// Returns the remote command's exit code, or an error if the event stream
+/// closes before the command reports an exit status.
 #[allow(clippy::too_many_arguments, clippy::implicit_hasher)]
 pub async fn sandbox_exec_grpc(
     server: &str,
@@ -1489,6 +1490,7 @@ pub async fn sandbox_exec_grpc(
 
     // Stream output to terminal in real-time.
     let mut exit_code = 0i32;
+    let mut exit_seen = false;
     let stdout = std::io::stdout();
     let stderr = std::io::stderr();
 
@@ -1507,9 +1509,19 @@ pub async fn sandbox_exec_grpc(
             }
             Some(exec_sandbox_event::Payload::Exit(exit)) => {
                 exit_code = exit.exit_code;
+                exit_seen = true;
             }
             None => {}
         }
+    }
+
+    // A stream that closes without an Exit event means we never observed the
+    // command's outcome. The server treats the same condition as a relay
+    // failure; mirror that here so exit 0 stays meaningful.
+    if !exit_seen {
+        return Err(miette::miette!(
+            "sandbox exec relay closed before the command reported an exit status"
+        ));
     }
 
     Ok(exit_code)
@@ -1922,6 +1934,7 @@ async fn sandbox_exec_interactive_grpc(
     let _resize_guard = TaskGuard(resize_task);
 
     let mut exit_code = 0i32;
+    let mut exit_seen = false;
     let stdout = std::io::stdout();
     let stderr = std::io::stderr();
 
@@ -1940,6 +1953,7 @@ async fn sandbox_exec_interactive_grpc(
             }
             Some(exec_sandbox_event::Payload::Exit(exit)) => {
                 exit_code = exit.exit_code;
+                exit_seen = true;
                 break;
             }
             None => {}
@@ -1950,6 +1964,15 @@ async fn sandbox_exec_interactive_grpc(
 
     // Drop the raw mode guard to restore the terminal before returning.
     drop(raw_guard);
+
+    // A stream that closes without an Exit event means we never observed the
+    // command's outcome. Treat it as a relay failure rather than reporting a
+    // successful (0) exit.
+    if !exit_seen {
+        return Err(miette::miette!(
+            "sandbox exec relay closed before the command reported an exit status"
+        ));
+    }
 
     Ok(exit_code)
 }
