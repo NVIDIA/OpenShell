@@ -1393,7 +1393,8 @@ impl ComputeRuntime {
                     let name = sandbox.object_name().to_string();
                     if matches!(phase, SandboxPhase::Stopping | SandboxPhase::Starting) {
                         let status = sandbox.status.get_or_insert_with(Default::default);
-                        status.main_process_instance_id.clear();
+                        // Retain the previous instance id as a tombstone until
+                        // the restarted supervisor registers its new id.
                         status.exit_code = None;
                     }
                     upsert_ready_condition(
@@ -2909,16 +2910,29 @@ impl ComputeRuntime {
             return Ok(());
         }
         if let Some(status) = existing.status.as_ref() {
-            if !status.main_process_instance_id.is_empty()
-                && status.main_process_instance_id != instance_id
-            {
-                tracing::warn!(
-                    sandbox_id,
-                    instance_id,
-                    active_instance_id = %status.main_process_instance_id,
-                    "ignoring stale main-process exit report"
-                );
-                return Ok(());
+            if !status.main_process_instance_id.is_empty() {
+                // While Starting, the stored id belongs to the stopped
+                // instance. A different id is the new process and its early
+                // exit must still be recorded.
+                if phase == SandboxPhase::Starting && status.main_process_instance_id == instance_id
+                {
+                    tracing::warn!(
+                        sandbox_id,
+                        instance_id,
+                        "ignoring main-process exit report from stopped instance while sandbox is starting"
+                    );
+                    return Ok(());
+                }
+                if phase != SandboxPhase::Starting && status.main_process_instance_id != instance_id
+                {
+                    tracing::warn!(
+                        sandbox_id,
+                        instance_id,
+                        active_instance_id = %status.main_process_instance_id,
+                        "ignoring stale main-process exit report"
+                    );
+                    return Ok(());
+                }
             }
             if let Some(current_exit_code) = status.exit_code {
                 if current_exit_code != exit_code {
@@ -5106,6 +5120,68 @@ mod tests {
             assert_eq!(stored.phase(), phase as i32);
             assert_eq!(stored.status.unwrap().exit_code, None);
         }
+    }
+
+    #[tokio::test]
+    async fn starting_uses_previous_main_process_instance_as_exit_tombstone() {
+        let runtime = test_runtime(Arc::new(TestDriver::default())).await;
+        let mut sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Stopped);
+        sandbox.status = Some(SandboxStatus {
+            phase: SandboxPhase::Stopped as i32,
+            main_process_instance_id: "instance-old".into(),
+            exit_code: Some(143),
+            ..Default::default()
+        });
+        runtime.store.put_message(&sandbox).await.unwrap();
+        let stored = runtime
+            .store
+            .get_message::<Sandbox>("sb-1")
+            .await
+            .unwrap()
+            .unwrap();
+
+        let starting = runtime
+            .write_lifecycle_phase(
+                &stored,
+                SandboxPhase::Starting,
+                "Starting",
+                "Sandbox start requested",
+            )
+            .await
+            .unwrap();
+        let status = starting.status.as_ref().unwrap();
+        assert_eq!(status.main_process_instance_id, "instance-old");
+        assert_eq!(status.exit_code, None);
+
+        runtime
+            .main_process_exited("sb-1", "instance-old", 143)
+            .await
+            .unwrap();
+        let stored = runtime
+            .store
+            .get_message::<Sandbox>("sb-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.phase(), SandboxPhase::Starting as i32);
+        let status = stored.status.as_ref().unwrap();
+        assert_eq!(status.main_process_instance_id, "instance-old");
+        assert_eq!(status.exit_code, None);
+
+        runtime
+            .main_process_exited("sb-1", "instance-new", 1)
+            .await
+            .unwrap();
+        let stored = runtime
+            .store
+            .get_message::<Sandbox>("sb-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.phase(), SandboxPhase::Error as i32);
+        let status = stored.status.unwrap();
+        assert_eq!(status.main_process_instance_id, "instance-new");
+        assert_eq!(status.exit_code, Some(1));
     }
 
     fn ssh_session_record(id: &str, sandbox_id: &str) -> SshSession {
