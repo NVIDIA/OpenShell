@@ -128,6 +128,20 @@ It overrides the gateway's configured default runtime class for that sandbox,
 while a typed `SandboxTemplate.runtime_class_name` value from the API still
 takes precedence.
 
+In `proxy-pod` topology the sandbox image runs directly, with no supervisor to
+launch a workload, so the container needs an entrypoint that stays running.
+Set `containers.agent.command` and `containers.agent.args` when the image's own
+entrypoint exits immediately:
+
+```shell
+openshell sandbox create --name batch \
+  --driver-config-json '{"kubernetes":{"containers":{"agent":{"command":["python","/app/agent.py"]}}}}'
+```
+
+These fields apply only to `proxy-pod`. The `combined` and `sidecar` topologies
+run the OpenShell supervisor as the container entrypoint, so setting them there
+is rejected rather than silently ignored.
+
 Docker and Podman report the address through which their sandboxes can reach
 the gateway. If the primary listener covers that address, the gateway reuses
 it and sandbox JWT authentication restricts the supervisor to its callback RPC

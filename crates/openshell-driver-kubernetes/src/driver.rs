@@ -196,6 +196,16 @@ struct KubernetesDriverContainersConfig {
 struct KubernetesContainerDriverConfig {
     resources: KubernetesContainerResourceConfig,
     volume_mounts: Vec<KubernetesDriverVolumeMountConfig>,
+    /// Entrypoint override for the workload container.
+    ///
+    /// Only meaningful in `proxy-pod` topology, where the sandbox image runs
+    /// directly. `combined` and `sidecar` replace the container command with
+    /// the supervisor binary, so an override there would be silently ignored
+    /// and is rejected instead.
+    command: Vec<String>,
+    /// Arguments for `command`, or for the image entrypoint when `command` is
+    /// not set.
+    args: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -1012,14 +1022,16 @@ impl KubernetesComputeDriver {
         &self,
         sandbox: &Sandbox,
     ) -> Result<KubernetesSandboxDriverConfig, String> {
-        kubernetes_driver_config_for_spec(
+        let config = kubernetes_driver_config_for_spec(
             sandbox.spec.as_ref(),
             self.config.provider_spiffe_enabled().then_some(
                 self.config
                     .provider_spiffe_workload_api_socket_path
                     .as_str(),
             ),
-        )
+        )?;
+        validate_agent_command_for_topology(&config, self.config.topology)?;
+        Ok(config)
     }
 
     fn agent_sandbox_api(
@@ -4043,6 +4055,30 @@ fn spec_pod_env(spec: Option<&SandboxSpec>) -> std::collections::HashMap<String,
     env
 }
 
+/// Reject workload entrypoint overrides in topologies that ignore them.
+///
+/// `combined` and `sidecar` replace the agent container's command with the
+/// supervisor binary, so an override there would be accepted and then silently
+/// dropped. Failing at validation is better than a sandbox that quietly does
+/// something other than what was asked.
+fn validate_agent_command_for_topology(
+    config: &KubernetesSandboxDriverConfig,
+    topology: SupervisorTopology,
+) -> Result<(), String> {
+    let agent = &config.containers.agent;
+    if agent.command.is_empty() && agent.args.is_empty() {
+        return Ok(());
+    }
+    if topology == SupervisorTopology::ProxyPod {
+        return Ok(());
+    }
+    Err(format!(
+        "containers.agent.command and containers.agent.args are only supported in \"proxy-pod\" \
+         topology; {topology} topology runs the OpenShell supervisor as the container entrypoint \
+         and would ignore them"
+    ))
+}
+
 fn kubernetes_driver_config_for_spec(
     spec: Option<&SandboxSpec>,
     provider_spiffe_workload_api_socket_path: Option<&str>,
@@ -4397,6 +4433,18 @@ fn sandbox_template_to_k8s_with_validated_config(
         container.insert("resources".to_string(), resources);
     }
     apply_agent_driver_resources(&mut container, &driver_config.containers.agent.resources);
+    if params.topology == SupervisorTopology::ProxyPod {
+        let agent_config = &driver_config.containers.agent;
+        if !agent_config.command.is_empty() {
+            container.insert(
+                "command".to_string(),
+                serde_json::json!(agent_config.command),
+            );
+        }
+        if !agent_config.args.is_empty() {
+            container.insert("args".to_string(), serde_json::json!(agent_config.args));
+        }
+    }
     spec.insert(
         "containers".to_string(),
         serde_json::Value::Array(vec![serde_json::Value::Object(container)]),
@@ -7782,6 +7830,24 @@ mod tests {
             .collect();
         obj.data = serde_json::json!({"status": {"conditions": conditions}});
         obj
+    }
+
+    #[test]
+    fn agent_command_override_is_rejected_outside_proxy_pod() {
+        let config = KubernetesSandboxDriverConfig {
+            containers: KubernetesDriverContainersConfig {
+                agent: KubernetesContainerDriverConfig {
+                    command: vec!["sleep".to_string(), "infinity".to_string()],
+                    ..KubernetesContainerDriverConfig::default()
+                },
+            },
+            ..KubernetesSandboxDriverConfig::default()
+        };
+
+        validate_agent_command_for_topology(&config, SupervisorTopology::ProxyPod).unwrap();
+        let err =
+            validate_agent_command_for_topology(&config, SupervisorTopology::Combined).unwrap_err();
+        assert!(err.contains("proxy-pod"), "{err}");
     }
 
     #[test]
