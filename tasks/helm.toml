@@ -69,14 +69,14 @@ dir = "deploy/helm/openshell"
 run = "skaffold dev -p sidecar-mtls"
 
 ["helm:skaffold:run"]
-description = "Run skaffold run for deploy/helm/openshell (one-shot deploy)"
+description = "Run a one-shot Skaffold deploy and register its local plaintext gateway"
 dir = "deploy/helm/openshell"
-run = "skaffold run"
+run = "skaffold run && ../../../tasks/scripts/helm-k3s-local.sh register"
 
 ["helm:skaffold:run:sidecar"]
-description = "Run skaffold run with the Kubernetes supervisor sidecar topology"
+description = "Run a sidecar Skaffold deploy and register its local plaintext gateway"
 dir = "deploy/helm/openshell"
-run = "skaffold run -p sidecar"
+run = "skaffold run -p sidecar && ../../../tasks/scripts/helm-k3s-local.sh register"
 
 ["helm:skaffold:run:sidecar-mtls"]
 description = "Run skaffold run with the Kubernetes supervisor sidecar topology and TLS/mTLS enabled"
@@ -129,6 +129,10 @@ hide = true
 description = "List local k3d clusters"
 run = "tasks/scripts/helm-k3s-local.sh status"
 hide = true
+
+["helm:k3s:forward"]
+description = "Forward the local Kubernetes gateway to port 8090"
+run = "tasks/scripts/helm-k3s-local.sh forward"
 
 # Install Envoy Gateway's GatewayClass into the cluster
 
