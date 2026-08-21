@@ -176,6 +176,10 @@ pub struct GatewayFileSection {
     pub mtls_auth: Option<MtlsAuthConfig>,
     #[serde(default)]
     pub gateway_jwt: Option<GatewayJwtConfig>,
+    /// Optional gateway authentication bootstrap independent of compute-driver
+    /// selection. When omitted, only gateway-minted sandbox JWTs are accepted.
+    #[serde(default)]
+    pub sandbox_token_bootstrap: Option<SandboxTokenBootstrapConfig>,
     #[serde(default)]
     pub otlp: Option<OtlpConfig>,
 
@@ -203,6 +207,31 @@ pub struct OtlpConfig {
     /// `service.name` resource attribute. Defaults to `openshell-gateway`.
     #[serde(default)]
     pub service_name: Option<String>,
+}
+
+/// Gateway-side exchange that authenticates a sandbox before it has a
+/// gateway-minted JWT. This configuration belongs to the authentication
+/// boundary rather than any compute-driver table.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum SandboxTokenBootstrapConfig {
+    /// Validate a projected Kubernetes `ServiceAccount` token with `TokenReview`.
+    KubernetesServiceAccount {
+        /// Exact service account accepted for sandbox bootstrap calls.
+        service_account_name: String,
+        /// Accept exactly one namespace.
+        #[serde(default)]
+        namespace: Option<String>,
+        /// Accept namespaces beginning with this prefix.
+        #[serde(default)]
+        namespace_prefix: Option<String>,
+        /// Dynamically allow namespaces matching this Kubernetes label selector.
+        #[serde(default)]
+        namespace_label: Option<String>,
+        /// Dynamically allow namespaces listed in this JSON/YAML file.
+        #[serde(default)]
+        namespace_file: Option<PathBuf>,
+    },
 }
 
 /// `[openshell.supervisor]` section.
@@ -597,6 +626,35 @@ service_name = "openshell-gateway-dev"
             "http://otel-collector.observability.svc:4317"
         );
         assert_eq!(otlp.service_name.as_deref(), Some("openshell-gateway-dev"));
+    }
+
+    #[test]
+    fn parses_gateway_owned_sandbox_token_bootstrap() {
+        let tmp = write_tmp(
+            r#"
+[openshell.gateway.sandbox_token_bootstrap]
+type = "kubernetes_service_account"
+service_account_name = "openshell-sandbox"
+namespace_prefix = "openshell-local-"
+
+[openshell.drivers.custom]
+socket_path = "/run/custom-driver.sock"
+"#,
+        );
+
+        let file = load(tmp.path()).expect("gateway bootstrap config parses");
+        assert_eq!(
+            file.openshell.gateway.sandbox_token_bootstrap,
+            Some(SandboxTokenBootstrapConfig::KubernetesServiceAccount {
+                service_account_name: "openshell-sandbox".to_string(),
+                namespace: None,
+                namespace_prefix: Some("openshell-local-".to_string()),
+                namespace_label: None,
+                namespace_file: None,
+            })
+        );
+        assert!(file.openshell.drivers.contains_key("custom"));
+        assert!(!file.openshell.drivers.contains_key("kubernetes"));
     }
 
     #[test]

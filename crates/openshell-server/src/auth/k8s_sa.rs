@@ -164,40 +164,53 @@ impl NamespaceValidator {
     }
 }
 
-pub fn operator_namespace_allowlist(
-    config: &crate::compute::driver_config::KubernetesSaBootstrapConfig,
+pub fn namespace_validator(
+    namespace: Option<String>,
+    namespace_prefix: Option<String>,
+    namespace_label: Option<String>,
+    namespace_file: Option<PathBuf>,
+    client: kube::Client,
+    shutdown_rx: watch::Receiver<bool>,
+) -> openshell_core::Result<NamespaceValidator> {
+    let exact = namespace.filter(|value| !value.trim().is_empty());
+    let prefix = namespace_prefix.filter(|value| !value.trim().is_empty());
+    let label = namespace_label.filter(|value| !value.trim().is_empty());
+    let file = namespace_file.filter(|value| !value.as_os_str().is_empty());
+
+    match (exact, prefix, label, file) {
+        (Some(namespace), None, None, None) => Ok(NamespaceValidator::Exact(namespace)),
+        (None, Some(prefix), None, None) => Ok(NamespaceValidator::Prefix(prefix)),
+        (None, None, label, file) if label.is_some() || file.is_some() => {
+            Ok(NamespaceValidator::Allowlist(dynamic_namespace_allowlist(
+                label,
+                file,
+                client,
+                shutdown_rx,
+            )?))
+        }
+        _ => Err(openshell_core::Error::config(
+            "sandbox_token_bootstrap requires exactly one namespace policy: namespace, namespace_prefix, namespace_label, or namespace_file",
+        )),
+    }
+}
+
+fn dynamic_namespace_allowlist(
+    namespace_label: Option<String>,
+    namespace_file: Option<PathBuf>,
     client: kube::Client,
     shutdown_rx: watch::Receiver<bool>,
 ) -> openshell_core::Result<OperatorNamespaceAllowlist> {
     let allowlist = OperatorNamespaceAllowlist::new();
-    match (
-        config.operator_namespace_label.as_deref(),
-        config.operator_namespace_file.as_deref(),
-    ) {
-        (Some(label), None) if !label.trim().is_empty() => {
-            spawn_namespace_label_watcher(
-                client,
-                label.to_string(),
-                allowlist.clone(),
-                shutdown_rx,
-            );
+    match (namespace_label, namespace_file) {
+        (Some(label), None) => {
+            spawn_namespace_label_watcher(client, label, allowlist.clone(), shutdown_rx);
         }
-        (None, Some(path)) if !path.trim().is_empty() => {
-            spawn_namespace_file_watcher(path.into(), allowlist.clone(), shutdown_rx);
-        }
-        (None, None) => {
-            return Err(openshell_core::Error::config(
-                "operator workspace mode requires operator_namespace_label or operator_namespace_file",
-            ));
-        }
-        (Some(_), Some(_)) => {
-            return Err(openshell_core::Error::config(
-                "operator workspace mode accepts only one of operator_namespace_label or operator_namespace_file",
-            ));
+        (None, Some(path)) => {
+            spawn_namespace_file_watcher(path, allowlist.clone(), shutdown_rx);
         }
         _ => {
             return Err(openshell_core::Error::config(
-                "operator namespace source must not be empty",
+                "sandbox_token_bootstrap accepts only one dynamic namespace source",
             ));
         }
     }

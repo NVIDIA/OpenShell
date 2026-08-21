@@ -455,14 +455,21 @@ watcher emits only sandbox CR changes, not platform events.
 
 ### SA Token Authentication
 
-The gateway's `K8sServiceAccountAuthenticator` adapts its `NamespaceValidator`
-per mode (`crates/openshell-server/src/auth/k8s_sa.rs`):
+The gateway owns ServiceAccount bootstrap under
+`[openshell.gateway.sandbox_token_bootstrap]`, independently of compute-driver
+selection. The Helm chart maps its workspace mode into the corresponding
+`NamespaceValidator` (`crates/openshell-server/src/auth/k8s_sa.rs`):
 
 - **Shared:** `Exact` — accepts only the single configured namespace.
 - **Managed:** `Prefix` — accepts any namespace starting with `openshell-{gateway_id}-`.
 - **Operator:** `Allowlist` — accepts namespaces present in the dynamic
   `BTreeSet` populated by the label/file watchers. Starts empty (fail-closed)
   until the first watcher update.
+
+The compiled Kubernetes registration derives the same policy from legacy
+driver configuration for compatibility. Operator-managed external drivers use
+the gateway-owned table directly; unrelated external drivers do not acquire a
+Kubernetes bootstrap requirement merely because the gateway runs in-cluster.
 
 These checks rely on an ownership invariant. In shared and managed modes, the
 gateway and its trusted Agent Sandbox controller exclusively administer the

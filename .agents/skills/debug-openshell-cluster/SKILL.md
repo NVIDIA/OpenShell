@@ -454,8 +454,13 @@ Then inspect sandbox resources in that namespace.
 
 Check the configured sandbox service account when TokenReview bootstrap or
 sandbox registration fails. Helm creates a dedicated sandbox service account by
-default and writes it to `[openshell.drivers.kubernetes].service_account_name`;
-the gateway rejects projected tokens from other service accounts.
+default. The driver receives it in
+`[openshell.drivers.kubernetes].service_account_name`, while the independent
+gateway authenticator receives it in
+`[openshell.gateway.sandbox_token_bootstrap].service_account_name`; the gateway
+rejects projected tokens from other service accounts. Confirm the bootstrap
+table also contains exactly one of `namespace`, `namespace_prefix`,
+`namespace_label`, or `namespace_file`.
 
 ```bash
 helm -n openshell get values openshell | grep -A3 sandboxServiceAccount

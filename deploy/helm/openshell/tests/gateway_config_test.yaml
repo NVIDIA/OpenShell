@@ -103,6 +103,36 @@ tests:
           path: data["gateway.toml"]
           pattern: '(?ms)\[openshell\.drivers\.kubernetes\].*?service_account_name\s*=\s*"openshell-sandbox"'
 
+  - it: renders shared workspace bootstrap under the gateway auth table
+    template: templates/gateway-config.yaml
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.gateway\.sandbox_token_bootstrap\].*?type\s*=\s*"kubernetes_service_account".*?service_account_name\s*=\s*"openshell-sandbox".*?namespace\s*=\s*"my-namespace"'
+
+  - it: renders managed workspace bootstrap as a namespace prefix
+    template: templates/gateway-config.yaml
+    set:
+      server.drivers.kubernetes.workspaceMode: managed
+      server.sandboxJwt.gatewayId: gateway-a
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.gateway\.sandbox_token_bootstrap\].*?namespace_prefix\s*=\s*"openshell-gateway-a-"'
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.gateway\.sandbox_token_bootstrap\][^\[]*?\nnamespace\s*='
+
+  - it: renders operator workspace bootstrap from the namespace label
+    template: templates/gateway-config.yaml
+    set:
+      server.drivers.kubernetes.workspaceMode: operator
+      server.drivers.kubernetes.operatorNamespaceLabel: openshell.ai/workspace=true
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.gateway\.sandbox_token_bootstrap\].*?namespace_label\s*=\s*"openshell\.ai/workspace=true"'
+
   - it: renders combined supervisor topology by default under [openshell.drivers.kubernetes]
     template: templates/gateway-config.yaml
     asserts:

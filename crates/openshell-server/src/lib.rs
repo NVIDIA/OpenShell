@@ -585,7 +585,10 @@ pub(crate) async fn run_server(
         gateway_tls_enabled: config.tls.is_some(),
         endpoint_overrides: &config.compute_driver_endpoints,
     };
-    let compute = build_compute_runtime(
+    let BuiltComputeRuntime {
+        runtime: compute,
+        driver_token_bootstrap,
+    } = build_compute_runtime(
         &compute_drivers,
         &compute_driver,
         &config,
@@ -656,53 +659,58 @@ pub(crate) async fn run_server(
         spawn_gateway_extension_token_refresh(issuer, gateway_extension_credentials);
     }
 
-    // K8s ServiceAccount bootstrap authenticator. Only constructed when
-    // the gateway is running in-cluster (kubelet provides the API host
-    // env var) and has a sandbox JWT issuer to mint replacements against;
-    // outside the cluster we can't call the apiserver's TokenReview API,
-    // and without the issuer there's nothing to exchange the SA token for.
+    // The explicit gateway-owned bootstrap configuration wins. Compiled
+    // drivers may contribute a compatibility default for configurations that
+    // predate the backend-neutral table; external drivers never trigger it.
     #[cfg(not(target_os = "windows"))]
-    if state.sandbox_jwt_issuer.is_some() && std::env::var_os("KUBERNETES_SERVICE_HOST").is_some() {
-        // Pod lookups and TokenReview identity checks must match the sandbox
-        // namespace and service account used by the Kubernetes driver.
-        let kubernetes_config =
-            compute::driver_config::kubernetes_sa_bootstrap_config(config_file.as_ref())?;
-        let sandbox_namespace = kubernetes_config.namespace.clone();
-        let sandbox_service_account = kubernetes_config.service_account_name.clone();
+    let sandbox_token_bootstrap = select_sandbox_token_bootstrap(
+        config_file
+            .as_ref()
+            .and_then(|file| file.openshell.gateway.sandbox_token_bootstrap.clone()),
+        driver_token_bootstrap,
+    );
+    #[cfg(target_os = "windows")]
+    let _ = driver_token_bootstrap;
+
+    // A bootstrap authenticator is useful only when the gateway can mint the
+    // replacement sandbox JWT. Its configuration is independent of the
+    // selected compute driver.
+    #[cfg(not(target_os = "windows"))]
+    if state.sandbox_jwt_issuer.is_some()
+        && let Some(bootstrap) = sandbox_token_bootstrap
+    {
+        let config_file::SandboxTokenBootstrapConfig::KubernetesServiceAccount {
+            service_account_name,
+            namespace,
+            namespace_prefix,
+            namespace_label,
+            namespace_file,
+        } = bootstrap;
+        if service_account_name.trim().is_empty() {
+            return Err(Error::config(
+                "sandbox_token_bootstrap.service_account_name must not be empty",
+            ));
+        }
         match kube::Client::try_default().await {
             Ok(client) => {
-                let namespace_validator = match kubernetes_config.workspace_mode.as_str() {
-                    "shared" => {
-                        auth::k8s_sa::NamespaceValidator::Exact(kubernetes_config.namespace)
-                    }
-                    "managed" => auth::k8s_sa::NamespaceValidator::Prefix(format!(
-                        "openshell-{}-",
-                        kubernetes_config.gateway_id
-                    )),
-                    "operator" => auth::k8s_sa::NamespaceValidator::Allowlist(
-                        auth::k8s_sa::operator_namespace_allowlist(
-                            &kubernetes_config,
-                            client.clone(),
-                            shutdown_rx.clone(),
-                        )?,
-                    ),
-                    mode => {
-                        return Err(Error::config(format!(
-                            "invalid Kubernetes workspace_mode '{mode}' for ServiceAccount bootstrap"
-                        )));
-                    }
-                };
+                let namespace_validator = auth::k8s_sa::namespace_validator(
+                    namespace,
+                    namespace_prefix,
+                    namespace_label,
+                    namespace_file,
+                    client.clone(),
+                    shutdown_rx.clone(),
+                )?;
                 let resolver = Arc::new(auth::k8s_sa::LiveK8sResolver::new(
                     client,
                     namespace_validator,
                     "openshell-gateway".to_string(),
-                    sandbox_service_account.clone(),
+                    service_account_name.clone(),
                 ));
                 let authenticator = auth::k8s_sa::K8sServiceAccountAuthenticator::new(resolver);
                 state.k8s_sa_authenticator = Some(Arc::new(authenticator));
                 info!(
-                    namespace = %sandbox_namespace,
-                    service_account = %sandbox_service_account,
+                    service_account = %service_account_name,
                     "K8s ServiceAccount bootstrap authenticator enabled"
                 );
             }
@@ -1120,6 +1128,15 @@ impl ComputeDriverTracingSetup {
 /// Factory for a compiled driver's optional tracing integration.
 pub type ComputeDriverTracingFactory = fn(Option<&str>) -> ComputeDriverTracingSetup;
 
+/// Compatibility bootstrap configuration supplied by a compiled driver.
+///
+/// Explicit `[openshell.gateway.sandbox_token_bootstrap]` configuration takes
+/// precedence, and external drivers do not invoke this hook.
+pub type ComputeDriverTokenBootstrapFactory =
+    for<'a> fn(
+        &ComputeDriverBuildContext<'a>,
+    ) -> Result<Option<config_file::SandboxTokenBootstrapConfig>>;
+
 /// Factory for a compute driver linked into a gateway binary.
 #[async_trait::async_trait]
 pub trait ComputeDriverFactory: Send + Sync {
@@ -1138,6 +1155,7 @@ pub struct ComputeDriverRegistration {
     local_singleplayer: bool,
     supports_mtls_user_auth: bool,
     tracing_setup: Option<ComputeDriverTracingFactory>,
+    token_bootstrap: Option<ComputeDriverTokenBootstrapFactory>,
 }
 
 impl std::fmt::Debug for ComputeDriverRegistration {
@@ -1171,6 +1189,7 @@ impl ComputeDriverRegistration {
             local_singleplayer: false,
             supports_mtls_user_auth: true,
             tracing_setup: None,
+            token_bootstrap: None,
         })
     }
 
@@ -1186,6 +1205,17 @@ impl ComputeDriverRegistration {
     #[must_use]
     pub fn with_telemetry_category(mut self, category: TelemetryComputeDriver) -> Self {
         self.telemetry_category = category;
+        self
+    }
+
+    /// Supply a compatibility default for sandbox-token bootstrap. New
+    /// deployments should configure the gateway-owned bootstrap table.
+    #[must_use]
+    pub fn with_token_bootstrap(
+        mut self,
+        token_bootstrap: ComputeDriverTokenBootstrapFactory,
+    ) -> Self {
+        self.token_bootstrap = Some(token_bootstrap);
         self
     }
 
@@ -1416,6 +1446,18 @@ impl ComputeDriverBuildContext<'_> {
     }
 }
 
+struct BuiltComputeRuntime {
+    runtime: ComputeRuntime,
+    driver_token_bootstrap: Option<config_file::SandboxTokenBootstrapConfig>,
+}
+
+fn select_sandbox_token_bootstrap(
+    explicit: Option<config_file::SandboxTokenBootstrapConfig>,
+    compiled_driver_default: Option<config_file::SandboxTokenBootstrapConfig>,
+) -> Option<config_file::SandboxTokenBootstrapConfig> {
+    explicit.or(compiled_driver_default)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn build_compute_runtime(
     registry: &ComputeDriverRegistry,
@@ -1428,7 +1470,7 @@ async fn build_compute_runtime(
     tracing_log_bus: TracingLogBus,
     supervisor_sessions: Arc<supervisor_session::SupervisorSessionRegistry>,
     shutdown_rx: watch::Receiver<bool>,
-) -> Result<ComputeRuntime> {
+) -> Result<BuiltComputeRuntime> {
     let driver = resolve_configured_compute_driver(registry, selection.name(), driver_startup)?;
     let telemetry_compute_driver = driver.telemetry_compute_driver(registry);
     info!(driver = %driver.name(), "Using compute driver");
@@ -1443,20 +1485,23 @@ async fn build_compute_runtime(
         );
     }
 
-    let runtime = match driver {
+    let (runtime, driver_token_bootstrap) = match driver {
         ConfiguredComputeDriver::Registered(registration) => {
-            let instance = registration
-                .factory
-                .build(ComputeDriverBuildContext {
-                    driver_name: registration.name.clone(),
-                    gateway_bind_address: config.bind_address,
-                    gateway_log_level: &config.log_level,
-                    driver_startup,
-                    shutdown_rx,
-                    inherited_config_keys: registration.inherited_config_keys,
-                })
-                .await?;
-            match instance {
+            let build_context = ComputeDriverBuildContext {
+                driver_name: registration.name.clone(),
+                gateway_bind_address: config.bind_address,
+                gateway_log_level: &config.log_level,
+                driver_startup,
+                shutdown_rx,
+                inherited_config_keys: registration.inherited_config_keys,
+            };
+            let driver_token_bootstrap = registration
+                .token_bootstrap
+                .map(|factory| factory(&build_context))
+                .transpose()?
+                .flatten();
+            let instance = registration.factory.build(build_context).await?;
+            let runtime = match instance {
                 ComputeDriverInstance::InProcess(driver) => ComputeRuntime::from_driver(
                     registration.name,
                     driver,
@@ -1486,7 +1531,8 @@ async fn build_compute_runtime(
                         Error::execution(format!("failed to create compute runtime: {error}"))
                     })?
                 }
-            }
+            };
+            (runtime, driver_token_bootstrap)
         }
         ConfiguredComputeDriver::Remote { name } => {
             let remote_config =
@@ -1499,7 +1545,7 @@ async fn build_compute_runtime(
             let endpoint = compute::connect_remote_compute_driver(name, &remote_config.socket_path)
                 .await
                 .map_err(|e| Error::execution(format!("failed to create compute runtime: {e}")))?;
-            ComputeRuntime::new_remote_driver(
+            let runtime = ComputeRuntime::new_remote_driver(
                 endpoint,
                 store,
                 sandbox_index,
@@ -1508,11 +1554,15 @@ async fn build_compute_runtime(
                 supervisor_sessions,
             )
             .await
-            .map_err(|e| Error::execution(format!("failed to create compute runtime: {e}")))?
+            .map_err(|e| Error::execution(format!("failed to create compute runtime: {e}")))?;
+            (runtime, None)
         }
     };
 
-    Ok(runtime.with_telemetry_compute_driver(telemetry_compute_driver))
+    Ok(BuiltComputeRuntime {
+        runtime: runtime.with_telemetry_compute_driver(telemetry_compute_driver),
+        driver_token_bootstrap,
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -1647,7 +1697,7 @@ mod tests {
         GatewayListenerScope, MultiplexService, ServerState, TlsAcceptor,
         allow_plaintext_service_http, bind_gateway_listeners, classify_initial_bytes,
         configured_compute_driver, is_benign_tls_handshake_failure,
-        mint_gateway_extension_credential, serve_gateway_listener,
+        mint_gateway_extension_credential, select_sandbox_token_bootstrap, serve_gateway_listener,
     };
     use openshell_core::{
         Config,
@@ -2317,6 +2367,32 @@ mod tests {
             driver,
             ConfiguredComputeDriver::Remote { name } if name == "beta"
         ));
+    }
+
+    #[test]
+    fn explicit_sandbox_token_bootstrap_overrides_compiled_driver_default() {
+        use crate::config_file::SandboxTokenBootstrapConfig::KubernetesServiceAccount;
+
+        let explicit = KubernetesServiceAccount {
+            service_account_name: "external-sa".to_string(),
+            namespace: Some("external-namespace".to_string()),
+            namespace_prefix: None,
+            namespace_label: None,
+            namespace_file: None,
+        };
+        let compiled_driver_default = KubernetesServiceAccount {
+            service_account_name: "compiled-sa".to_string(),
+            namespace: Some("compiled-namespace".to_string()),
+            namespace_prefix: None,
+            namespace_label: None,
+            namespace_file: None,
+        };
+
+        assert_eq!(
+            select_sandbox_token_bootstrap(Some(explicit.clone()), Some(compiled_driver_default)),
+            Some(explicit)
+        );
+        assert_eq!(select_sandbox_token_bootstrap(None, None), None);
     }
 
     #[tokio::test]

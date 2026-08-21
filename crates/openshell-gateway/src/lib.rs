@@ -38,6 +38,7 @@ fn install_in_tree_compute_drivers(registry: &mut ComputeDriverRegistry) {
             registration
                 .with_telemetry_category(TelemetryComputeDriver::anonymous_category("kubernetes"))
                 .without_mtls_user_auth()
+                .with_token_bootstrap(kubernetes_token_bootstrap)
                 .with_inherited_config_keys(&[
                     "namespace",
                     "default_image",
@@ -104,6 +105,48 @@ fn install_in_tree_compute_drivers(registry: &mut ComputeDriverRegistry) {
         registry
             .install(registration.expect("first-party driver name is valid"))
             .expect("first-party driver names are unique");
+    }
+}
+
+#[cfg(all(not(target_os = "windows"), feature = "in-tree-compute-drivers"))]
+fn kubernetes_token_bootstrap(
+    context: &openshell_server::ComputeDriverBuildContext<'_>,
+) -> openshell_core::Result<Option<openshell_server::config_file::SandboxTokenBootstrapConfig>> {
+    let config: openshell_driver_kubernetes::KubernetesComputeConfig = context.driver_config()?;
+    Ok(Some(kubernetes_token_bootstrap_from_config(config)))
+}
+
+#[cfg(all(not(target_os = "windows"), feature = "in-tree-compute-drivers"))]
+fn kubernetes_token_bootstrap_from_config(
+    config: openshell_driver_kubernetes::KubernetesComputeConfig,
+) -> openshell_server::config_file::SandboxTokenBootstrapConfig {
+    use openshell_driver_kubernetes::WorkspaceMode;
+
+    let (namespace, namespace_prefix, namespace_label, namespace_file) = match config.workspace_mode
+    {
+        WorkspaceMode::Shared => (Some(config.namespace), None, None, None),
+        WorkspaceMode::Managed => (
+            None,
+            Some(openshell_driver_kubernetes::managed_namespace_prefix(
+                &config.gateway_id,
+            )),
+            None,
+            None,
+        ),
+        WorkspaceMode::Operator => (
+            None,
+            None,
+            config.operator_namespace_label,
+            config.operator_namespace_file.map(std::path::PathBuf::from),
+        ),
+    };
+
+    openshell_server::config_file::SandboxTokenBootstrapConfig::KubernetesServiceAccount {
+        service_account_name: config.service_account_name,
+        namespace,
+        namespace_prefix,
+        namespace_label,
+        namespace_file,
     }
 }
 
@@ -286,5 +329,33 @@ fn apply_guest_tls(
         *ca = Some(default_ca.to_owned());
         *cert = Some(default_cert.to_owned());
         *key = Some(default_key.to_owned());
+    }
+}
+
+#[cfg(all(test, not(target_os = "windows"), feature = "in-tree-compute-drivers"))]
+mod tests {
+    use super::*;
+    use openshell_driver_kubernetes::{KubernetesComputeConfig, WorkspaceMode};
+    use openshell_server::config_file::SandboxTokenBootstrapConfig;
+
+    #[test]
+    fn kubernetes_bootstrap_compatibility_uses_managed_namespace_prefix() {
+        let config = KubernetesComputeConfig {
+            workspace_mode: WorkspaceMode::Managed,
+            gateway_id: "test-gateway".to_string(),
+            service_account_name: "sandbox-sa".to_string(),
+            ..KubernetesComputeConfig::default()
+        };
+
+        assert_eq!(
+            kubernetes_token_bootstrap_from_config(config),
+            SandboxTokenBootstrapConfig::KubernetesServiceAccount {
+                service_account_name: "sandbox-sa".to_string(),
+                namespace: None,
+                namespace_prefix: Some("openshell-test-gateway-".to_string()),
+                namespace_label: None,
+                namespace_file: None,
+            }
+        );
     }
 }

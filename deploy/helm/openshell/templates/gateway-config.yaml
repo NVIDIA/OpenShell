@@ -114,6 +114,23 @@ data:
     gateway_id       = {{ .Values.server.sandboxJwt.gatewayId | default (include "openshell.fullname" .) | quote }}
     ttl_secs         = {{ .Values.server.sandboxJwt.ttlSecs | default 3600 }}
 
+    [openshell.gateway.sandbox_token_bootstrap]
+    type                 = "kubernetes_service_account"
+    service_account_name = {{ include "openshell.sandboxServiceAccountName" . | quote }}
+    {{- $workspaceMode := .Values.server.drivers.kubernetes.workspaceMode | default "shared" }}
+    {{- if eq $workspaceMode "shared" }}
+    namespace             = {{ include "openshell.sandboxNamespace" . | quote }}
+    {{- else if eq $workspaceMode "managed" }}
+    namespace_prefix      = {{ printf "openshell-%s-" (.Values.server.sandboxJwt.gatewayId | default (include "openshell.fullname" .)) | quote }}
+    {{- else if eq $workspaceMode "operator" }}
+    {{- if .Values.server.drivers.kubernetes.operatorNamespaceLabel }}
+    namespace_label       = {{ .Values.server.drivers.kubernetes.operatorNamespaceLabel | quote }}
+    {{- end }}
+    {{- if .Values.server.drivers.kubernetes.operatorNamespaceFile }}
+    namespace_file        = {{ .Values.server.drivers.kubernetes.operatorNamespaceFile | quote }}
+    {{- end }}
+    {{- end }}
+
     {{- if .Values.server.oidc.issuer }}
 
     [openshell.gateway.oidc]

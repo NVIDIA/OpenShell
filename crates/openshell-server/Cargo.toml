@@ -27,7 +27,8 @@ openshell-router = { path = "../openshell-router" }
 openshell-supervisor-middleware = { path = "../openshell-supervisor-middleware" }
 openshell-supervisor-middleware-builtins = { path = "../openshell-supervisor-middleware-builtins" }
 
-# Kubernetes client (used by the `generate-certs` subcommand)
+# Kubernetes client used by ServiceAccount bootstrap authentication and the
+# `generate-certs` subcommand.
 kube = { workspace = true }
 k8s-openapi = { workspace = true }
 
