@@ -132,7 +132,8 @@ Keep the certificate Secret in the release namespace. Referencing a Secret in an
 ```shell
 openshell gateway add https://gateway.example.com \
   --name production \
-  --oidc-issuer https://keycloak.example.com/realms/openshell
+  --oidc-issuer https://keycloak.example.com/realms/openshell \
+  --oidc-client-id openshell-cli
 openshell status
 ```
 

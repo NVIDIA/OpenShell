@@ -196,7 +196,8 @@ If cert-manager takes longer than 120 seconds to issue certificates, increase th
 ```shell
 openshell gateway add https://gateway.example.com \
   --name openshift \
-  --oidc-issuer https://keycloak.example.com/realms/openshell
+  --oidc-issuer https://keycloak.example.com/realms/openshell \
+  --oidc-client-id openshell-cli
 openshell status
 ```
 
@@ -240,7 +241,8 @@ users via OIDC, not mTLS — see [Access Control](/kubernetes/access-control):
 ```shell
 openshell gateway add https://gateway.example.com \
   --name openshift \
-  --oidc-issuer https://keycloak.example.com/realms/openshell
+  --oidc-issuer https://keycloak.example.com/realms/openshell \
+  --oidc-client-id openshell-cli
 openshell gateway login openshift
 ```
 
