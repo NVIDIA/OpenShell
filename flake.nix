@@ -33,34 +33,40 @@
           inherit system;
           overlays = [ (import rust-overlay) ];
         };
+        commonDevShellPackages = with pkgs; [
+          # Assemble Debian artifacts on macOS and Linux.
+          dpkg
+          # Required to find packages.
+          pkg-config
+          # Coverage.
+          lcov
+        ];
         treefmtEval = treefmt-nix.lib.evalModule pkgs {
           projectRootFile = "flake.nix";
           programs.nixfmt.enable = true;
         };
         rustToolchain = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
+        z3-static = pkgs.callPackage ./nix/pkgs/z3-static.nix { };
+        aws-lc-static = pkgs.callPackage ./nix/pkgs/aws-lc-static.nix { };
         testGuest = import ./nix/test-guest { inherit pkgs; };
       in
       {
         apps.test-guest = testGuest.app;
         apps.test-guest-cache = testGuest.cacheApp;
 
-        devShells.default = pkgs.mkShell {
-          packages = with pkgs; [
-            rustToolchain
-            # Assemble Debian artifacts on macOS and Linux.
-            dpkg
-            # Required to find packages
-            pkg-config
-            # Required for bindgen generation.
-            llvmPackages.libclang
-            # system dependency for openshell-prover
-            z3
-            # Coverage
-            lcov
-          ];
-
-          env = {
-            LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
+        devShells = {
+          default = pkgs.mkShell {
+            packages = [
+              rustToolchain
+              z3-static
+              aws-lc-static
+            ]
+            ++ commonDevShellPackages;
+          };
+        }
+        // pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
+          glibc-2-28 = import ./nix/devShells/glibc-2-28.nix {
+            inherit pkgs rust-overlay commonDevShellPackages;
           };
         };
 
