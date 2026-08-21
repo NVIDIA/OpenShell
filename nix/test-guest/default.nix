@@ -24,6 +24,7 @@ let
     docker = ./configuration/docker.yml;
     podman = ./configuration/podman.yml;
     selinux = ./configuration/selinux.yml;
+    snapd = ./configuration/snapd.yml;
   };
 
   mkDistroProfile =

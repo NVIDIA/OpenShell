@@ -13,9 +13,11 @@ Usage:
 
 Options:
   --distro NAME       Base distro: ubuntu, centos, fedora, or rocky
-  --with NAME         Apply a configuration; repeatable (docker, podman, selinux)
+  --with NAME         Apply a configuration; repeatable (docker, podman, selinux, snapd)
   --install PATH      Install a .deb or .rpm package; repeatable
   --copy SRC:DEST     Copy an executable to an absolute guest path; repeatable
+  --copy-file SRC:DEST
+                      Copy a regular file to an absolute guest path; repeatable
   --ssh-port PORT     Use a specific loopback SSH forwarding port
   --forward-port HOST_PORT:GUEST_PORT
                       Forward a loopback host port to a guest port; repeatable
@@ -50,6 +52,7 @@ list=0
 configurations=()
 packages=()
 copies=()
+files=()
 forward_ports=()
 guest_command=()
 
@@ -73,6 +76,11 @@ while [ "$#" -gt 0 ]; do
 	--copy)
 		require_value "$@"
 		copies+=("$2")
+		shift 2
+		;;
+	--copy-file)
+		require_value "$@"
+		files+=("$2")
 		shift 2
 		;;
 	--ssh-port)
@@ -250,6 +258,36 @@ for copy_spec in "${copies[@]}"; do
 	resolved_copies+=("${source_path}:${destination}")
 done
 copies=("${resolved_copies[@]}")
+
+resolved_files=()
+for file_spec in "${files[@]}"; do
+	source_path=${file_spec%%:*}
+	destination=${file_spec#*:}
+	if [ "${source_path}" = "${file_spec}" ] ||
+		! source_path=$(realpath -- "${source_path}") ||
+		[ ! -f "${source_path}" ]; then
+		echo "invalid --copy-file source: ${file_spec}" >&2
+		exit 2
+	fi
+	case "${destination}" in
+	/*)
+		if [[ ${destination} == *"/../"* ]] || [[ ${destination} == */.. ]]; then
+			echo "--copy-file destination must not contain '..': ${destination}" >&2
+			exit 2
+		fi
+		if [[ ! ${destination} =~ ^/[A-Za-z0-9._+~/-]+$ ]]; then
+			echo "--copy-file destination contains unsupported characters: ${destination}" >&2
+			exit 2
+		fi
+		;;
+	*)
+		echo "--copy-file destination must be absolute: ${destination}" >&2
+		exit 2
+		;;
+	esac
+	resolved_files+=("${source_path}:${destination}")
+done
+files=("${resolved_files[@]}")
 
 test_vm_cpu=host
 ssh_wait_seconds=180
@@ -583,7 +621,7 @@ else
 	echo "==> Reusing cached configuration: ${configurations[*]:-base image}"
 fi
 
-if [ "${#packages[@]}" -gt 0 ] || [ "${#copies[@]}" -gt 0 ]; then
+if [ "${#packages[@]}" -gt 0 ] || [ "${#copies[@]}" -gt 0 ] || [ "${#files[@]}" -gt 0 ]; then
 	phase_started_at=${SECONDS}
 	artifact_staging_dir=/tmp/openshell-test-guest-artifacts-$$
 	ssh "${ssh_args[@]}" openshell@127.0.0.1 \
@@ -624,6 +662,21 @@ if [ "${#packages[@]}" -gt 0 ] || [ "${#copies[@]}" -gt 0 ]; then
 			"${source_path}" "openshell@127.0.0.1:${remote_path}"
 		printf -v install_command \
 			'sudo install -D -m 0755 -- %q %q' \
+			"${remote_path}" "${destination}"
+		ssh "${ssh_args[@]}" openshell@127.0.0.1 "${install_command}"
+		artifact_index=$((artifact_index + 1))
+	done
+
+	artifact_index=0
+	for file_spec in "${files[@]}"; do
+		source_path=${file_spec%%:*}
+		destination=${file_spec#*:}
+		remote_path=${artifact_staging_dir}/file-${artifact_index}
+		echo "==> Copying file: ${destination}"
+		scp -q "${scp_args[@]}" \
+			"${source_path}" "openshell@127.0.0.1:${remote_path}"
+		printf -v install_command \
+			'sudo install -D -m 0644 -- %q %q' \
 			"${remote_path}" "${destination}"
 		ssh "${ssh_args[@]}" openshell@127.0.0.1 "${install_command}"
 		artifact_index=$((artifact_index + 1))

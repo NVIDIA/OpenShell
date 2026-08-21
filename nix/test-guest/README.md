@@ -57,6 +57,11 @@ The root [`flake.nix`](../../flake.nix) exposes this directory as the `test-gues
 | Fedora 44 | No | Yes | Yes | `.rpm` |
 | Rocky Linux 9 | Yes | Yes | Yes | `.rpm` |
 
+The `snapd` configuration is available for Ubuntu and prepares snapd for
+local Snap lifecycle experiments. It does not install Docker, because the Snap
+gateway reproduction uses the Docker **Snap** and its `docker:docker-daemon`
+interface rather than the host-package Docker configuration.
+
 The Ubuntu 24.04 Podman configuration is available for runtime and packaging
 checks, but its Podman 4 release does not provide the `pasta` rootless network
 helper required by OpenShell sandbox callbacks. OpenShell Podman E2E runs use
@@ -117,7 +122,9 @@ Configurations are Ansible playbooks stored under `nix/test-guest/configuration/
 
 Configurations run in the order provided on the command line. OpenShell packages and copied binaries are installed after all configurations succeed.
 
-`--install` packages and `--copy` executables are applied by a dedicated per-run Ansible playbook. They are not stored in prepared VM cache entries.
+`--install` packages, `--copy` executables, and `--copy-file` regular files are
+applied by a dedicated per-run Ansible playbook. They are not stored in prepared
+VM cache entries.
 
 ## Prepared VM cache
 
@@ -217,6 +224,29 @@ nix run .#test-guest -- \
   -- openshell --version
 ```
 
+## Reproduce Snap gateway startup
+
+The gateway Snap must be native to the guest architecture. Copy an existing
+Snap artifact and the reproduction script into a prepared Ubuntu guest, then
+run the script as root. It follows the Release Canary ordering exactly: install
+the Snap, connect Docker/log/system interfaces, and immediately query the
+gateway. On each failure it prints snapd and gateway journals.
+
+```shell
+nix run .#test-guest -- \
+  --distro ubuntu \
+  --with snapd \
+  --keep \
+  --copy-file ./openshell_*.snap:/tmp/openshell.snap \
+  --copy ./nix/test-guest/scripts/snap-gateway-repro.sh:/usr/local/bin/snap-gateway-repro \
+  -- sudo /usr/local/bin/snap-gateway-repro /tmp/openshell.snap 10 30
+```
+
+`--keep` retains the overlay and serial log when diagnosing a failure. The
+runner prints their location after shutdown. The final `30` accepts automatic
+recovery for up to 30 seconds; omit it to require the canary's immediate check.
+
+
 The destination must be an absolute guest path. Copied files are installed with mode `0755`.
 
 ## Runner options
@@ -226,6 +256,8 @@ The destination must be an absolute guest path. Copied files are installed with 
 --with NAME         Apply docker, podman, or selinux; repeatable
 --install PATH      Install a .deb or .rpm package; repeatable
 --copy SRC:DEST     Copy an executable into the guest; repeatable
+--copy-file SRC:DEST
+                    Copy a regular file into the guest; repeatable
 --ssh-port PORT     Use a specific loopback SSH forwarding port
 --forward-port HOST_PORT:GUEST_PORT
                     Forward a loopback host port to a guest port; repeatable
