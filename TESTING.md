@@ -182,6 +182,8 @@ mise run e2e:cli-conformance
 The conformance task selects existing test targets explicitly. Driver suites
 enable the same profile when they run overlapping portable targets; the test
 implementations are shared instead of duplicated as driver-specific coverage.
+VM overlay and TLS-key permission assertions remain in the VM suite instead of
+the portable smoke workflow.
 
 Run the Podman-backed Rust CLI e2e suite:
 

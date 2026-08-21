@@ -61,6 +61,11 @@ path = "tests/sandbox_labels.rs"
 required-features = ["e2e-cli-conformance"]
 
 [[test]]
+name = "vm_overlay"
+path = "tests/vm_overlay.rs"
+required-features = ["e2e-vm"]
+
+[[test]]
 name = "custom_image"
 path = "tests/custom_image.rs"
 required-features = ["e2e-docker"]
