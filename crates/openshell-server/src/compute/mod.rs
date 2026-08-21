@@ -2742,7 +2742,7 @@ impl ComputeRuntime {
         match event.payload {
             Some(watch_sandboxes_event::Payload::Sandbox(sandbox)) => {
                 if let Some(sandbox) = sandbox.sandbox {
-                    self.apply_sandbox_update(sandbox).await?;
+                    Box::pin(self.apply_sandbox_update(sandbox)).await?;
                 }
             }
             Some(watch_sandboxes_event::Payload::Deleted(deleted)) => {
@@ -2767,13 +2767,67 @@ impl ComputeRuntime {
         Ok(())
     }
 
-    async fn apply_sandbox_update(&self, incoming: DriverSandbox) -> Result<(), String> {
-        let _guard = self.sync_lock.lock().await;
-        let existing = self
+    async fn apply_sandbox_update(&self, mut incoming: DriverSandbox) -> Result<(), String> {
+        let guard = self.sync_lock.lock().await;
+        let mut existing = self
             .store
             .get(Sandbox::object_type(), &incoming.id)
             .await
             .map_err(|e| e.to_string())?;
+        let existing_sandbox = existing.as_ref().map(decode_sandbox_record).transpose()?;
+        let existing_phase = existing_sandbox
+            .as_ref()
+            .map_or(SandboxPhase::Unknown, |sandbox| {
+                SandboxPhase::try_from(sandbox.phase()).unwrap_or(SandboxPhase::Unknown)
+            });
+
+        if !driver_snapshot_reports_terminal_container_exit(&incoming)
+            || existing_phase != SandboxPhase::Starting
+        {
+            return self.apply_sandbox_update_locked(incoming, existing).await;
+        }
+
+        // A terminal snapshot can already be queued when StartSandbox moves
+        // the durable phase to Starting. Release the global watch lock, wait
+        // for that lifecycle operation, and then reread both the driver and
+        // store before applying the terminal observation. Taking the
+        // per-sandbox gate only for this ambiguous phase avoids delaying
+        // unrelated watch events behind slow lifecycle operations.
+        let existing_name = existing_sandbox.as_ref().map_or_else(
+            || incoming.name.clone(),
+            |sandbox| sandbox.object_name().to_string(),
+        );
+        drop(guard);
+        let _lifecycle_guard = self.lifecycle_gates.lock_for(&incoming.id).await;
+        let observed = self.get_driver_sandbox(&incoming.id, &existing_name).await;
+        let _guard = self.sync_lock.lock().await;
+        existing = self
+            .store
+            .get(Sandbox::object_type(), &incoming.id)
+            .await
+            .map_err(|e| e.to_string())?;
+        let current_phase = existing
+            .as_ref()
+            .map(decode_sandbox_record)
+            .transpose()?
+            .map_or(SandboxPhase::Unknown, |sandbox| {
+                SandboxPhase::try_from(sandbox.phase()).unwrap_or(SandboxPhase::Unknown)
+            });
+
+        match observed {
+            Ok(Some(live)) if live.id == incoming.id && live.status.is_some() => incoming = live,
+            Ok(Some(_) | None) | Err(_)
+                if matches!(current_phase, SandboxPhase::Starting | SandboxPhase::Ready) =>
+            {
+                warn!(
+                    sandbox_id = %incoming.id,
+                    "Could not validate terminal driver snapshot; retaining current sandbox state"
+                );
+                return Ok(());
+            }
+            Ok(Some(_) | None) | Err(_) => {}
+        }
+
         self.apply_sandbox_update_locked(incoming, existing).await
     }
 
@@ -4160,6 +4214,18 @@ fn driver_snapshot_confirms_stopped(incoming: &DriverSandbox) -> bool {
                 && matches!(
                     condition.reason.to_ascii_lowercase().as_str(),
                     "containerexited" | "containerstopped"
+                )
+        })
+    })
+}
+
+fn driver_snapshot_reports_terminal_container_exit(incoming: &DriverSandbox) -> bool {
+    incoming.status.as_ref().is_some_and(|status| {
+        status.conditions.iter().any(|condition| {
+            condition.status.eq_ignore_ascii_case("false")
+                && matches!(
+                    condition.reason.to_ascii_lowercase().as_str(),
+                    "containerexited" | "containerstopped" | "containerruntimerestart"
                 )
         })
     })
@@ -7151,6 +7217,105 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(stored.phase(), SandboxPhase::Starting as i32);
+    }
+
+    #[tokio::test]
+    async fn stale_container_exit_queued_before_start_cannot_regress_restart() {
+        for reason in [
+            "ContainerExited",
+            "ContainerStopped",
+            "ContainerRuntimeRestart",
+        ] {
+            let driver = ControlledDriver::new();
+            driver.block_start();
+            let sandbox =
+                sandbox_record("sb-start-race", "sandbox-start-race", SandboxPhase::Stopped);
+            driver.set_get_outcome(ControlledGetOutcome::Sandbox(Box::new(
+                ready_driver_sandbox(sandbox.object_id(), sandbox.object_name()),
+            )));
+            let runtime = test_runtime(driver.clone()).await;
+            runtime.store.put_message(&sandbox).await.unwrap();
+
+            let start_runtime = runtime.clone();
+            let sandbox_name = sandbox.object_name().to_string();
+            let start =
+                tokio::spawn(
+                    async move { start_runtime.start_sandbox("default", &sandbox_name).await },
+                );
+            tokio::time::timeout(Duration::from_secs(1), driver.start_started.notified())
+                .await
+                .expect("start did not reach the driver");
+
+            let mut stale_exit = ready_driver_sandbox(sandbox.object_id(), sandbox.object_name());
+            stale_exit.status = Some(make_driver_status(make_driver_condition(
+                reason,
+                "container stopped before restart",
+            )));
+            let update_runtime = runtime.clone();
+            let mut update =
+                tokio::spawn(async move { update_runtime.apply_sandbox_update(stale_exit).await });
+
+            assert!(
+                tokio::time::timeout(Duration::from_millis(50), &mut update)
+                    .await
+                    .is_err(),
+                "{reason} watch update must wait for the active start operation"
+            );
+
+            driver.release_start();
+            start.await.unwrap().unwrap();
+            update.await.unwrap().unwrap();
+
+            let stored = runtime
+                .store
+                .get_message::<Sandbox>(sandbox.object_id())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                stored.phase(),
+                SandboxPhase::Starting as i32,
+                "{reason} must not regress the restarted sandbox"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn live_container_exit_during_start_still_transitions_to_error() {
+        for reason in [
+            "ContainerExited",
+            "ContainerStopped",
+            "ContainerRuntimeRestart",
+        ] {
+            let driver = ControlledDriver::new();
+            let sandbox = sandbox_record(
+                "sb-start-exited",
+                "sandbox-start-exited",
+                SandboxPhase::Starting,
+            );
+            let mut exited = ready_driver_sandbox(sandbox.object_id(), sandbox.object_name());
+            exited.status = Some(make_driver_status(make_driver_condition(
+                reason,
+                "restarted container exited",
+            )));
+            driver.set_get_outcome(ControlledGetOutcome::Sandbox(Box::new(exited.clone())));
+            let runtime = test_runtime(driver).await;
+            runtime.store.put_message(&sandbox).await.unwrap();
+
+            runtime.apply_sandbox_update(exited).await.unwrap();
+
+            let stored = runtime
+                .store
+                .get_message::<Sandbox>(sandbox.object_id())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                stored.phase(),
+                SandboxPhase::Error as i32,
+                "current {reason} snapshot must remain terminal"
+            );
+        }
     }
 
     #[tokio::test]
