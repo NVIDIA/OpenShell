@@ -130,6 +130,27 @@ step via the `rust-native-build.yml` workflow (per-architecture, per-component)
 and uploads the result as an artifact that the image build job downloads back
 into the staging directory before running Buildx.
 
+Gateway and supervisor binaries staged into Release Dev and Release Tag images
+are compiled through `cargo auditable` (pinned in `mise.toml`), which embeds a
+`.dep-v0` section describing the Rust dependencies actually compiled into the
+binary. That section holds data rather than symbols, so it survives the
+workspace's `strip = true` release profile, and Syft can catalog the crates
+present in image binaries instead of inferring them from the source tree. This
+is a different artifact from the source SBOM produced by `syft dir:.` in
+`tasks/sbom.toml`, which describes the checkout, and from an OCI SBOM
+attestation, which remains out of scope.
+
+Only release image builds are auditable. `docker-build.yml` and
+`rust-native-build.yml` take an `auditable` input that defaults to false, so PR
+and E2E image builds and standalone release artifacts remain non-auditable. The
+CI image gains the pinned `cargo-auditable` tool through `mise install --locked`
+but ships no auditable OpenShell binary of its own. Local staging opts in with
+`OPENSHELL_AUDITABLE=1`. sccache's `RUSTC_WRAPPER` is unset only around auditable
+builds, because it would otherwise wrap `cargo-auditable`'s workspace wrapper and
+be misidentified as `rustc`. Auditable builds are verified by scanning the built
+binary with Syft and requiring at least one decoded Cargo package; the check runs
+only for those builds.
+
 Runtime layout:
 
 - **Gateway**: `gcr.io/distroless/cc-debian13:nonroot` base, GNU-linked binary at

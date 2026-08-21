@@ -81,6 +81,7 @@ jobs:
       cargo-version: ${{ needs.compute-versions.outputs.cargo_version }}
       image-tag: ${{ needs.compute-versions.outputs.source_sha }}
       checkout-ref: ${{ inputs.tag || github.ref }}
+      auditable: true
 
   build-supervisor:
     needs: [compute-versions]
@@ -90,6 +91,7 @@ jobs:
       cargo-version: ${{ needs.compute-versions.outputs.cargo_version }}
       image-tag: ${{ needs.compute-versions.outputs.source_sha }}
       checkout-ref: ${{ inputs.tag || github.ref }}
+      auditable: true
 
   e2e:
     needs: [compute-versions, build-gateway, build-supervisor]
