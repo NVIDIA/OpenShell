@@ -49,7 +49,8 @@ EOF
     --approval-mode auto \
     --no-auto-providers \
     --no-tty \
-    -- sh -c "echo sandbox ready" >/dev/null
+    --detach \
+    -- sh -c "exec sleep infinity" >/dev/null
 
 set +e
 DENY_OUTPUT="$($OPENSHELL_BIN sandbox exec --name "$SANDBOX" -- \
