@@ -214,6 +214,10 @@ message DriverSandboxTemplate {
   // This is the inner block selected from public SandboxTemplate.driver_config.
   // The selected driver owns nested schema validation.
   google.protobuf.Struct driver_config = 12;
+  // Enable Linux user namespace isolation for the sandbox workload. Drivers
+  // map this portable intent to their compute platform; when unset, the
+  // driver's configured default applies.
+  optional bool user_namespaces = 13;
 }
 
 // Typed compute-resource requirements.

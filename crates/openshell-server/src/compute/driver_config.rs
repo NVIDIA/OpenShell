@@ -3,9 +3,9 @@
 
 //! Selected compute-driver config construction.
 //!
-//! This module owns loading the selected driver config from TOML, applying
-//! driver-specific environment overrides, and applying gateway startup defaults.
-//! It does not acquire, connect to, or start compute drivers.
+//! This module owns loading the selected driver config from TOML and applying
+//! gateway startup defaults and endpoint overrides. It does not acquire,
+//! connect to, or start compute drivers.
 
 use crate::config_file;
 use crate::defaults::LocalTlsPaths;

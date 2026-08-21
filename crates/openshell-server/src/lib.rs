@@ -1417,18 +1417,16 @@ async fn build_compute_runtime(
 
     let runtime = match driver {
         ConfiguredComputeDriver::Registered(registration) => {
-            let instance = registration
-                .factory
-                .build(ComputeDriverBuildContext {
-                    driver_name: registration.name.clone(),
-                    gateway_bind_address: config.bind_address,
-                    gateway_log_level: &config.log_level,
-                    driver_startup,
-                    shutdown_rx,
-                    inherited_config_keys: registration.inherited_config_keys,
-                })
-                .await?;
-            match instance {
+            let build_context = ComputeDriverBuildContext {
+                driver_name: registration.name.clone(),
+                gateway_bind_address: config.bind_address,
+                gateway_log_level: &config.log_level,
+                driver_startup,
+                shutdown_rx,
+                inherited_config_keys: registration.inherited_config_keys,
+            };
+            let instance = registration.factory.build(build_context).await?;
+            let runtime = match instance {
                 ComputeDriverInstance::InProcess(driver) => ComputeRuntime::from_driver(
                     registration.name,
                     driver,
@@ -1458,7 +1456,8 @@ async fn build_compute_runtime(
                         Error::execution(format!("failed to create compute runtime: {error}"))
                     })?
                 }
-            }
+            };
+            runtime
         }
         ConfiguredComputeDriver::Remote { name } => {
             let remote_config =
@@ -1471,7 +1470,7 @@ async fn build_compute_runtime(
             let endpoint = compute::connect_remote_compute_driver(name, &remote_config.socket_path)
                 .await
                 .map_err(|e| Error::execution(format!("failed to create compute runtime: {e}")))?;
-            ComputeRuntime::new_remote_driver(
+            let runtime = ComputeRuntime::new_remote_driver(
                 endpoint,
                 store,
                 sandbox_index,
@@ -1480,7 +1479,8 @@ async fn build_compute_runtime(
                 supervisor_sessions,
             )
             .await
-            .map_err(|e| Error::execution(format!("failed to create compute runtime: {e}")))?
+            .map_err(|e| Error::execution(format!("failed to create compute runtime: {e}")))?;
+            runtime
         }
     };
 

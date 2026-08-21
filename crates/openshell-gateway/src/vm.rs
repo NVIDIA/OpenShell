@@ -20,14 +20,10 @@
 //! [`openshell_core::Config`] so the shared core stays free of driver-specific
 //! plumbing.
 //!
-//! TODO(driver-abstraction): this module still assumes the concrete VM driver
-//! (argv shape, guest-TLS flags, libkrun-specific settings). Once we land the
-//! generalized compute-driver interface, the CLI-arg plumbing below should
-//! be replaced with a driver-agnostic launcher that speaks gRPC to
-//! configure the driver — and this file should collapse to the types that
-//! are genuinely VM-specific (libkrun log level, vCPU / memory shape) plus a
-//! trait implementation registering the VM driver against the generic
-//! interface.
+//! Process launch remains deliberately VM-specific at this binary composition
+//! boundary: it translates gateway configuration into the standalone driver's
+//! argv and then connects through the same public compute-driver RPC interface
+//! used by operator-managed external drivers.
 
 #[cfg(unix)]
 use hyper_util::rt::TokioIo;
