@@ -92,6 +92,12 @@ pub struct CertgenArgs {
     /// created by cert-manager).
     #[arg(long, value_name = "NAME", requires = "backend_ca_configmap_name")]
     backend_ca_source_secret: Option<String>,
+
+    /// Maximum time in seconds to poll for the backend CA source `Secret` when
+    /// using cert-manager. Defaults to 90 seconds. The Helm chart sets this to
+    /// (Job activeDeadlineSeconds - 30) to leave margin for `ConfigMap` creation.
+    #[arg(long, value_name = "SECONDS", default_value = "90")]
+    backend_ca_poll_timeout_seconds: u64,
 }
 
 pub async fn run(args: CertgenArgs) -> Result<()> {
@@ -350,9 +356,9 @@ async fn create_backend_ca_configmap_if_needed(
         let secret_api: Api<Secret> = Api::namespaced(client, namespace);
 
         // Poll for the cert-manager Secret with timeout to handle cert issuance delay.
-        // The Job has activeDeadlineSeconds: 120, so we poll for up to 90s leaving
+        // The Helm chart sets this to (Job activeDeadlineSeconds - 30) leaving
         // margin for ConfigMap creation and hook completion.
-        let poll_timeout = std::time::Duration::from_secs(90);
+        let poll_timeout = std::time::Duration::from_secs(args.backend_ca_poll_timeout_seconds);
         let poll_interval = std::time::Duration::from_secs(2);
         let start = std::time::Instant::now();
 

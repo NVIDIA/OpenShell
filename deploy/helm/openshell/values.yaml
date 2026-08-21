@@ -464,6 +464,11 @@ pkiInitJob:
   serverDnsNames: []
   # -- Extra IP SANs to append to the server certificate.
   serverIpAddresses: []
+  # -- Maximum time in seconds for the certgen hook Job to run. When using
+  # cert-manager with BackendTLSPolicy, the hook polls for the certificate
+  # for (timeoutSeconds - 30) to leave margin for ConfigMap creation. Increase
+  # this if cert-manager takes longer than 90 seconds to issue certificates.
+  timeoutSeconds: 120
 
 # cert-manager Certificate/Issuer resources (requires cert-manager CRDs in-cluster).
 # Does not install cert-manager itself.
