@@ -761,8 +761,23 @@ pub async fn sandbox_create(
                     saw_non_ready = true;
                 }
 
-                // Capture error reason from conditions only when phase is Error
-                // to avoid showing stale transient error reasons
+                let has_main_process_result = s
+                    .status
+                    .as_ref()
+                    .is_some_and(|status| status.exit_code.is_some());
+                if matches!(
+                    phase,
+                    SandboxPhase::Completed | SandboxPhase::Error | SandboxPhase::Stopped
+                ) && has_main_process_result
+                {
+                    if let Some(d) = display.as_interactive_mut() {
+                        d.clear();
+                    }
+                    break;
+                }
+
+                // Capture infrastructure error reasons only after excluding a
+                // canonical-command result, which must attach and drain output.
                 if phase == SandboxPhase::Error
                     && let Some(status) = &s.status
                 {
@@ -773,17 +788,6 @@ pub async fn sandbox_create(
                             last_error_reason =
                                 format!("{}: {}", condition.reason, condition.message);
                         }
-                    }
-                    break;
-                }
-
-                if matches!(phase, SandboxPhase::Completed | SandboxPhase::Stopped)
-                    && s.status
-                        .as_ref()
-                        .is_some_and(|status| status.exit_code.is_some())
-                {
-                    if let Some(d) = display.as_interactive_mut() {
-                        d.clear();
                     }
                     break;
                 }
@@ -852,10 +856,15 @@ pub async fn sandbox_create(
 
     // If we exited the loop without hitting the Ready break, finish the display.
     let final_phase = SandboxPhase::try_from(last_phase).unwrap_or(SandboxPhase::Unknown);
-    if !matches!(
+    let final_has_main_process_result = last_sandbox
+        .status
+        .as_ref()
+        .is_some_and(|status| status.exit_code.is_some());
+    if !(matches!(
         final_phase,
         SandboxPhase::Ready | SandboxPhase::Completed | SandboxPhase::Stopped
-    ) && let Some(d) = display.as_interactive_mut()
+    ) || final_phase == SandboxPhase::Error && final_has_main_process_result)
+        && let Some(d) = display.as_interactive_mut()
     {
         if final_phase == SandboxPhase::Error {
             let msg = if last_error_reason.is_empty() {
@@ -1018,35 +1027,8 @@ pub async fn sandbox_create(
             )
             .await
         }
-        SandboxPhase::Error => {
-            drop(stream);
-            drop(client);
-            let create_result = if last_error_reason.is_empty() {
-                Err(miette::miette!(
-                    "sandbox entered error phase while provisioning"
-                ))
-            } else {
-                Err(miette::miette!(
-                    "sandbox entered error phase while provisioning: {}",
-                    last_error_reason
-                ))
-            };
-            finalize_sandbox_create_session(
-                &effective_server,
-                &sandbox_name,
-                persist,
-                create_result,
-                workspace,
-                &effective_tls,
-                gateway_name,
-            )
-            .await
-        }
-        SandboxPhase::Completed | SandboxPhase::Stopped
-            if last_sandbox
-                .status
-                .as_ref()
-                .is_some_and(|status| status.exit_code.is_some()) =>
+        SandboxPhase::Completed | SandboxPhase::Stopped | SandboxPhase::Error
+            if final_has_main_process_result =>
         {
             drop(stream);
             drop(client);
@@ -1065,6 +1047,30 @@ pub async fn sandbox_create(
                 &sandbox_name,
                 persist,
                 connect_result,
+                workspace,
+                &effective_tls,
+                gateway_name,
+            )
+            .await
+        }
+        SandboxPhase::Error => {
+            drop(stream);
+            drop(client);
+            let create_result = if last_error_reason.is_empty() {
+                Err(miette::miette!(
+                    "sandbox entered error phase while provisioning"
+                ))
+            } else {
+                Err(miette::miette!(
+                    "sandbox entered error phase while provisioning: {}",
+                    last_error_reason
+                ))
+            };
+            finalize_sandbox_create_session(
+                &effective_server,
+                &sandbox_name,
+                persist,
+                create_result,
                 workspace,
                 &effective_tls,
                 gateway_name,
@@ -2553,9 +2559,9 @@ async fn wait_for_lifecycle_phase(
         return Ok(sandbox);
     }
     if current == SandboxPhase::Error {
-        return Err(miette!(
-            "sandbox entered Error while waiting for {target:?}"
-        ));
+        let detail = ready_false_condition_message(sandbox.status.as_ref())
+            .unwrap_or_else(|| "sandbox entered Error".to_string());
+        return Err(miette!("{detail} while waiting for {target:?}"));
     }
 
     let timeout = Duration::from_secs(

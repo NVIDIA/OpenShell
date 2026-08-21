@@ -77,7 +77,7 @@ the sandbox becomes ready without attaching.
 An explicit trailing command is foreground even when stdin or stdout is not a
 terminal. The CLI streams its stdout and stderr and returns its exact exit
 status. Exit code 0 leaves a retained sandbox in `Completed`; nonzero leaves it
-in `Stopped` with `MainProcessFailed`. Use `--no-keep` to delete either result
+in `Error` with `MainProcessFailed`. Use `--no-keep` to delete either result
 after output drains, or `--detach` for a long-running service.
 
 When supplying `--name`, use a portable DNS-1123 label: at most 63 lowercase alphanumeric or `-` characters, beginning and ending with an alphanumeric character. The Kubernetes driver rejects uppercase letters, underscores, dots, and other names that cannot become Kubernetes resource labels.
@@ -358,7 +358,7 @@ Both commands default to the last-used sandbox. Stop stops background
 forwards and waits for `Stopped`; start waits for `Ready`. Connect, exec,
 file transfer, forwarding, and exposed services are unavailable while
 stopped or completed. Starting a retained `Completed` or
-`Stopped/MainProcessFailed` sandbox launches a fresh canonical-main instance.
+`Error/MainProcessFailed` sandbox launches a fresh canonical-main instance.
 Delete remains the operation that removes retained state.
 
 ---

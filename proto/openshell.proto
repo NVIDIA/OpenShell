@@ -899,7 +899,7 @@ message SandboxStatus {
   string main_process_instance_id = 8;
   // Normalized main process result. Signal exits use 128 + signal number.
   // Presence indicates that the canonical main process exited. Exit code 0
-  // produces Completed; nonzero and signal-normalized exits produce Stopped.
+  // produces Completed; nonzero and signal-normalized exits produce Error.
   optional int32 exit_code = 9;
 }
 

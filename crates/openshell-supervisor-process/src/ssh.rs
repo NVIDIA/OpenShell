@@ -640,14 +640,14 @@ impl russh::server::Handler for SshHandler {
                 loop {
                     match output.recv().await {
                         Ok(event) => {
-                            let exited = matches!(event, MainOutput::Exit(_));
-                            let delivered = send_main_output(&handle, channel, event).await;
-                            if exited {
-                                if delivered {
-                                    terminal_delivery.mark_terminal_delivered();
-                                }
+                            if let MainOutput::Exit(code) = event {
+                                terminal_delivery.mark_terminal_delivered();
+                                terminal_delivery.wait_for_terminal_reported().await;
+                                let _ = send_main_output(&handle, channel, MainOutput::Exit(code))
+                                    .await;
                                 break;
                             }
+                            let _ = send_main_output(&handle, channel, event).await;
                         }
                         Err(error) => {
                             let _ = handle

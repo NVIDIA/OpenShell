@@ -56,6 +56,8 @@ struct OutputLog {
     version: watch::Sender<u64>,
     terminal_delivered: std::sync::atomic::AtomicBool,
     terminal_delivered_notify: Notify,
+    terminal_reported: std::sync::atomic::AtomicBool,
+    terminal_reported_notify: Notify,
 }
 
 impl OutputLog {
@@ -70,6 +72,8 @@ impl OutputLog {
             version,
             terminal_delivered: std::sync::atomic::AtomicBool::new(false),
             terminal_delivered_notify: Notify::new(),
+            terminal_reported: std::sync::atomic::AtomicBool::new(false),
+            terminal_reported_notify: Notify::new(),
         })
     }
 
@@ -370,13 +374,29 @@ impl MainSession {
         notified.await;
     }
 
-    /// Record that the SSH main subsystem sent the terminal result to an
-    /// attached client.
+    /// Record that an SSH main attachment drained output through the terminal
+    /// event and is ready for the durable lifecycle report.
     pub fn mark_terminal_delivered(&self) {
         self.output
             .terminal_delivered
             .store(true, Ordering::Release);
         self.output.terminal_delivered_notify.notify_waiters();
+    }
+
+    /// Wait until the gateway durably acknowledges the main-process result.
+    pub async fn wait_for_terminal_reported(&self) {
+        let notified = self.output.terminal_reported_notify.notified();
+        if self.output.terminal_reported.load(Ordering::Acquire) {
+            return;
+        }
+        notified.await;
+    }
+
+    /// Release attached clients to receive their SSH exit status after the
+    /// durable sandbox phase and exit code have been recorded.
+    pub fn mark_terminal_reported(&self) {
+        self.output.terminal_reported.store(true, Ordering::Release);
+        self.output.terminal_reported_notify.notify_waiters();
     }
 
     pub fn acquire_input(&self) -> Result<(u64, tokio::sync::mpsc::Sender<Vec<u8>>), &'static str> {
@@ -472,7 +492,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn terminal_delivery_requires_ssh_send_acknowledgement() {
+    async fn terminal_delivery_requires_attachment_acknowledgement() {
         let session = MainSession::inert();
         session.finish(0).await;
         assert!(session.finished());
@@ -494,6 +514,30 @@ mod tests {
         )
         .await
         .expect("delivery acknowledgement should wake waiter");
+    }
+
+    #[tokio::test]
+    async fn terminal_report_acknowledgement_is_independent_from_delivery() {
+        let session = MainSession::inert();
+        session.mark_terminal_delivered();
+
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(10),
+                session.wait_for_terminal_reported(),
+            )
+            .await
+            .is_err(),
+            "draining output must not imply durable gateway persistence"
+        );
+
+        session.mark_terminal_reported();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            session.wait_for_terminal_reported(),
+        )
+        .await
+        .expect("durable report acknowledgement should wake waiter");
     }
 
     #[tokio::test]

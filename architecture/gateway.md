@@ -17,8 +17,9 @@ workloads.
   service forwarding.
 - Persist the canonical main-process instance ID and normalized exit code on
   sandbox status. Exit code zero transitions the sandbox to `Completed`;
-  nonzero results transition it to `Stopped/MainProcessFailed`. `Error` is
-  reserved for infrastructure failures.
+  nonzero results transition it to `Error/MainProcessFailed`. Infrastructure
+  failures also use `Error`, with a distinct reason and no fabricated command
+  result.
 
 The gateway does not enforce agent network policy at request time. That happens
 inside each sandbox, where the supervisor and proxy can observe local process

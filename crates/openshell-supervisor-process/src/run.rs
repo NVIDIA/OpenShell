@@ -464,6 +464,7 @@ pub async fn run_process(
         report_main_process_exit_until_ack(endpoint, id, &main_instance_id, rendered_code).await;
         info!(instance_id = %main_instance_id, "main-process exit acknowledged");
     }
+    main_session.mark_terminal_reported();
 
     supervisor_terminating.store(true, Ordering::Release);
     if let Some(task) = supervisor_session_task {
@@ -539,7 +540,6 @@ async fn wait_for_process_exit_or_shutdown(
     } else {
         tokio::select! {
             result = &mut wait => {
-                terminating.store(true, Ordering::Release);
                 Ok(ProcessWaitOutcome::Exited(result.into_diagnostic()?))
             }
             signal = wait_for_supervisor_shutdown_signal() => {

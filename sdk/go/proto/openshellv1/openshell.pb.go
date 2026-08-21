@@ -1454,7 +1454,7 @@ type SandboxStatus struct {
 	MainProcessInstanceId string `protobuf:"bytes,8,opt,name=main_process_instance_id,json=mainProcessInstanceId,proto3" json:"main_process_instance_id,omitempty"`
 	// Normalized main process result. Signal exits use 128 + signal number.
 	// Presence indicates that the canonical main process exited. Exit code 0
-	// produces Completed; nonzero and signal-normalized exits produce Stopped.
+	// produces Completed; nonzero and signal-normalized exits produce Error.
 	ExitCode      *int32 `protobuf:"varint,9,opt,name=exit_code,json=exitCode,proto3,oneof" json:"exit_code,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache

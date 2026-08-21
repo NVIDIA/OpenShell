@@ -310,7 +310,7 @@ async fn canonical_main_nonzero_exit_preserves_status() {
         String::from_utf8_lossy(&get_output.stderr),
     ));
     assert!(
-        details.contains("Phase: Stopped"),
+        details.contains("Phase: Error"),
         "unexpected phase:\n{details}"
     );
     assert!(

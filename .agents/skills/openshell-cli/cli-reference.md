@@ -210,7 +210,7 @@ sandbox becomes ready. A trailing command defines the canonical main process;
 without one, the default is `/bin/bash -l` with a PTY. Explicit commands remain
 foreground in non-interactive automation: stdout and stderr stream to the
 caller and the CLI returns the command's exact status. Exit 0 leaves
-`Completed`; nonzero leaves `Stopped/MainProcessFailed`.
+`Completed`; nonzero leaves `Error/MainProcessFailed`.
 
 | Flag | Description |
 |------|-------------|

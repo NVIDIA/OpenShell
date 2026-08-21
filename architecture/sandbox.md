@@ -449,6 +449,6 @@ engine with a gateway policy revision.
 - If the canonical main process exits, the supervisor drains its retained main
   output and reports the normalized result before shutdown. Exit code 0 records
   `Completed/MainProcessCompleted`; nonzero and signal-normalized exits record
-  `Stopped/MainProcessFailed`. `Error` remains reserved for failures to create,
-  run, or supervise the sandbox, and runtime restart policies must not replace
-  the canonical process.
+  `Error/MainProcessFailed`. Infrastructure failures also use `Error`, with a
+  distinct condition reason and no fabricated canonical-process result. Runtime
+  restart policies must not replace the canonical process.

@@ -1024,7 +1024,9 @@ impl ComputeRuntime {
         }
 
         let phase = SandboxPhase::try_from(current.phase()).unwrap_or(SandboxPhase::Unknown);
-        if matches!(phase, SandboxPhase::Stopped | SandboxPhase::Completed) {
+        if matches!(phase, SandboxPhase::Stopped | SandboxPhase::Completed)
+            || is_failed_main_process_result(&current)
+        {
             self.cleanup_stopped_sandbox_sessions(&current)
                 .await
                 .map_err(Status::internal)?;
@@ -1185,9 +1187,10 @@ impl ComputeRuntime {
         if !matches!(
             phase,
             SandboxPhase::Stopped | SandboxPhase::Completed | SandboxPhase::Starting
-        ) {
+        ) && !is_failed_main_process_result(&current)
+        {
             return Err(Status::failed_precondition(format!(
-                "sandbox must be Stopped or Completed to start (current phase: {phase:?})"
+                "sandbox must be Stopped, Completed, or a failed main-process Error to start (current phase: {phase:?})"
             )));
         }
 
@@ -2288,6 +2291,11 @@ impl ComputeRuntime {
                         warn!(sandbox_id = %sandbox.object_id(), error = %err, "Failed to complete recovered sandbox session cleanup");
                     }
                 }
+                SandboxPhase::Error if is_failed_main_process_result(&sandbox) => {
+                    if let Err(err) = self.cleanup_stopped_sandbox_sessions(&sandbox).await {
+                        warn!(sandbox_id = %sandbox.object_id(), error = %err, "Failed to complete recovered failed-main session cleanup");
+                    }
+                }
                 SandboxPhase::Stopping => {
                     let sandbox_id = sandbox.object_id().to_string();
                     let sandbox_name = sandbox.object_name().to_string();
@@ -3256,13 +3264,7 @@ impl ComputeRuntime {
 
         let sandbox = decode_sandbox_record(&current_record)?;
         let phase = SandboxPhase::try_from(sandbox.phase()).unwrap_or(SandboxPhase::Unknown);
-        if phase == SandboxPhase::Completed
-            || (phase == SandboxPhase::Stopped
-                && sandbox
-                    .status
-                    .as_ref()
-                    .is_some_and(|status| status.exit_code.is_some()))
-        {
+        if phase == SandboxPhase::Completed || is_failed_main_process_result(&sandbox) {
             // A terminal canonical process may legitimately have removed its
             // transient compute object. Keep the durable command result.
             return Ok(());
@@ -3374,7 +3376,7 @@ fn apply_main_process_exit(sandbox: &mut Sandbox, instance_id: &str, exit_code: 
         )
     } else {
         (
-            SandboxPhase::Stopped,
+            SandboxPhase::Error,
             "MainProcessFailed",
             format!("Canonical main process exited with status {exit_code}"),
         )
@@ -3391,6 +3393,18 @@ fn apply_main_process_exit(sandbox: &mut Sandbox, instance_id: &str, exit_code: 
         },
     );
     sandbox.set_phase(phase as i32);
+}
+
+fn is_failed_main_process_result(sandbox: &Sandbox) -> bool {
+    sandbox.phase() == SandboxPhase::Error as i32
+        && sandbox.status.as_ref().is_some_and(|status| {
+            status.exit_code.is_some()
+                && status.conditions.iter().any(|condition| {
+                    condition.r#type == "Ready"
+                        && condition.status.eq_ignore_ascii_case("false")
+                        && condition.reason == "MainProcessFailed"
+                })
+        })
 }
 
 /// Connect to an unmanaged remote compute driver that is already listening on
@@ -5047,13 +5061,13 @@ mod tests {
     }
 
     #[test]
-    fn main_process_nonzero_exit_is_stopped_failure() {
+    fn main_process_nonzero_exit_is_error() {
         let mut sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Ready);
         apply_main_process_exit(&mut sandbox, "instance-1", 7);
 
         assert_eq!(
             SandboxPhase::try_from(sandbox.phase()),
-            Ok(SandboxPhase::Stopped)
+            Ok(SandboxPhase::Error)
         );
         let status = sandbox.status.as_ref().unwrap();
         assert_eq!(status.exit_code, Some(7));
@@ -5125,7 +5139,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(stored.phase(), SandboxPhase::Stopped as i32);
+        assert_eq!(stored.phase(), SandboxPhase::Error as i32);
         assert_eq!(stored.status.unwrap().exit_code, Some(9));
     }
 
@@ -5269,7 +5283,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(stored.phase(), SandboxPhase::Stopped as i32);
+        assert_eq!(stored.phase(), SandboxPhase::Error as i32);
         let status = stored.status.unwrap();
         assert_eq!(status.main_process_instance_id, "instance-new");
         assert_eq!(status.exit_code, Some(1));
@@ -6116,6 +6130,42 @@ mod tests {
         assert_eq!(status.main_process_instance_id, "instance-old");
         assert_eq!(status.exit_code, None);
         assert_eq!(driver.start_calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn failed_main_process_error_can_start_a_fresh_instance() {
+        let driver = ControlledDriver::new();
+        let runtime = test_runtime(driver.clone()).await;
+        let mut sandbox = sandbox_record("sb-failed", "sandbox-failed", SandboxPhase::Ready);
+        apply_main_process_exit(&mut sandbox, "instance-old", 130);
+        runtime.store.put_message(&sandbox).await.unwrap();
+
+        let starting = runtime
+            .start_sandbox("default", sandbox.object_name())
+            .await
+            .unwrap();
+
+        assert_eq!(starting.phase(), SandboxPhase::Starting as i32);
+        let status = starting.status.unwrap();
+        assert_eq!(status.main_process_instance_id, "instance-old");
+        assert_eq!(status.exit_code, None);
+        assert_eq!(driver.start_calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn infrastructure_error_cannot_be_started_as_a_command_result() {
+        let driver = ControlledDriver::new();
+        let runtime = test_runtime(driver.clone()).await;
+        let sandbox = sandbox_record("sb-error", "sandbox-error", SandboxPhase::Error);
+        runtime.store.put_message(&sandbox).await.unwrap();
+
+        let error = runtime
+            .start_sandbox("default", sandbox.object_name())
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.code(), Code::FailedPrecondition);
+        assert_eq!(driver.start_calls(), 0);
     }
 
     #[tokio::test]

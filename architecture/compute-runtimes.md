@@ -138,7 +138,7 @@ Ready -> Stopping -> Stopped -> Starting -> Ready
 ```
 
 A canonical main process that exits successfully follows `Ready -> Completed`.
-A nonzero or signal-normalized result follows `Ready -> Stopped` with a
+A nonzero or signal-normalized result follows `Ready -> Error` with a
 `MainProcessFailed` condition. Both retained results may be started explicitly,
 which creates a fresh main-process instance. Drivers must not automatically
 restart a completed or failed canonical process.
