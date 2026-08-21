@@ -439,24 +439,138 @@ discoverable long-term answer, but it forces a semantic decision — the field i
 genuinely inapplicable to topologies where the supervisor is the entrypoint — and
 is deferred rather than resolved here.
 
+### Why relays cannot cross the pod boundary
+
+The relay protocol states the constraint directly: `RelayOpen`'s target is
+"the target the supervisor should dial **inside the sandbox**." Every
+relay-backed capability — SSH, `exec`, port forwarding, file transfer — is a
+request to reach into the sandbox and connect to something. Three properties
+make that impossible from a separate pod:
+
+- **The SSH server exists only in the process supervisor.** `russh` is a
+  dependency of `openshell-supervisor-process` and the gateway.
+  `openshell-supervisor-network`, the only supervisor `proxy-pod` runs, has no
+  SSH server at all.
+- **Sessions must land in the workload's namespaces.** `ssh.rs` spawns PTY
+  shells and pipe-execs that need the workload's PID, mount, and user
+  namespaces, and for networking it calls `setns(fd, CLONE_NEWNET)` on a
+  dedicated thread to enter the sandbox network namespace — otherwise
+  connections reach the host loopback rather than the sandbox loopback where
+  services listen. A supervisor in another pod holds none of those namespaces.
+- **The `sidecar` bridge does not generalize.** In `sidecar` the network
+  sidecar owns the gateway session but does not serve SSH itself; it bridges
+  relays to a Linux abstract socket owned by the process supervisor in the
+  agent container, verified by peer PID. That works only because both run in
+  one pod.
+
+SSHing into the supervisor pod would land a shell in the wrong container.
+
+One nuance is worth recording, because it narrows the gap. `RelayOpen` also
+carries a `TcpRelayTarget`, used for port forwarding and service exposure, and
+that is *not* structurally impossible here: the supervisor pod can dial the
+agent pod's IP, since this design restricts agent **egress** and supervisor
+**ingress** but leaves agent ingress open. The obstacle is practical rather
+than architectural — `connect_in_netns` exists precisely because workloads
+usually bind `127.0.0.1`, which is unreachable across pods, so it would work
+for services bound to `0.0.0.0` and fail otherwise. The current implementation
+rejects all relays uniformly, which is correct and safe; restoring TCP relays
+alone is possible later and is the strongest argument for giving
+`SupervisorSessionModel` a capability list rather than treating relays as
+all-or-nothing.
+
+### Observability
+
+Network-layer observability survives intact; anything requiring visibility
+inside the workload's namespaces does not. Log push to the gateway is gated on
+the sandbox ID and gateway endpoint rather than on topology, and the proxy pod
+has both, so `openshell logs <sandbox>` carries `[sandbox]` lines as usual.
+Confirmed on OpenShift:
+
+```text
+[sandbox] [OCSF] NET:OPEN  [MED] DENIED -(0) -> github.com:443 [engine:opa] [reason:network connections not allowed by policy]
+[sandbox] [OCSF] CONFIG:LOADED [INFO] Acknowledged initial policy revision as loaded [version:1]
+[sandbox] Flushed denial analysis to gateway proposals=2 summaries=2
+```
+
+| Signal | `proxy-pod` |
+|---|---|
+| `NET:*` allow/deny with policy engine and reason | full |
+| `CONFIG:*` policy and inference-route changes | full |
+| Activity summaries and denial analysis for the policy advisor | full |
+| Gateway-side logs | full |
+| Workload stdout/stderr | **container log only** (`kubectl logs`), never `openshell logs` |
+| Process and binary attribution on network events | **none** |
+| `PROCESS:*`, `SSH:*`, Landlock/filesystem events | **none** |
+
+Two losses deserve emphasis. The workload's own output is no longer captured
+by OpenShell at all: the workload is the container's PID 1 and no OpenShell
+process shares that pod, so its output reaches only the container log. Anyone
+driving OpenShell through the API rather than with cluster access cannot see it.
+
+And network events carry no actor: the denial above reads `-(0)`, an empty
+process name and PID 0. Binary-aware attribution requires reading
+`/proc/<pid>` across the workload's PID namespace, which a separate pod cannot
+do. Operators can therefore answer what was denied but not which process
+attempted it, which removes `policy.binaries` as both an enforcement and a
+forensic tool.
+
 ### Feature availability
+
+#### Enforcement
 
 | Capability | `combined` | `sidecar` | `cni-sidecar` | `proxy-pod` |
 |---|---|---|---|---|
 | Network endpoint + L7 policy | yes | yes | yes | yes |
+| Enforcement mechanism | in-pod nftables | in-pod nftables | node CNI rules | **`NetworkPolicy`** |
 | Filesystem policy | yes | partial (Landlock) | partial (Landlock) | **no** |
 | Process / binary identity | yes | yes | yes | **no** |
-| SSH / `connect` | yes | yes | yes | **no** |
-| `exec` | yes | yes | yes | **no** |
-| Upload / download / sync | yes | yes | yes | **no** |
+| `policy.binaries` matching | yes | yes | yes | **no** — no actor attribution |
 | Dynamic provider env injection | yes | yes | yes | **no** |
+
+#### Session and file access
+
+All relay-backed, and all requiring the workload's namespaces:
+
+| Capability | `combined` | `sidecar` | `cni-sidecar` | `proxy-pod` |
+|---|---|---|---|---|
+| SSH / `connect` | yes | yes | yes | **no** — structurally impossible |
+| `exec` | yes | yes | yes | **no** — structurally impossible |
+| Upload / download / sync | yes | yes | yes | **no** — structurally impossible |
+| Port forwarding / service exposure | yes | yes | yes | **no today** — recoverable for `0.0.0.0` binds |
+| Initial command from `sandbox create -- <cmd>` | yes | yes | yes | **no** — use `containers.agent.command` |
+
+#### Observability
+
+| Signal | `combined` | `sidecar` | `cni-sidecar` | `proxy-pod` |
+|---|---|---|---|---|
+| `NET:*` allow/deny with reason | yes | yes | yes | yes |
+| `CONFIG:*` policy and route changes | yes | yes | yes | yes |
+| Denial analysis for the policy advisor | yes | yes | yes | yes |
+| Workload stdout/stderr in `openshell logs` | yes | yes | yes | **no** — container log only |
+| Actor process on network events | yes | yes | yes | **no** — renders as `-(0)` |
+| `PROCESS:*` lifecycle events | yes | yes | yes | **no** |
+| `SSH:*` events | yes | yes | yes | **no** |
+| Landlock / filesystem events | yes | partial | partial | **no** |
+
+#### Operational posture
+
+| Property | `combined` | `sidecar` | `cni-sidecar` | `proxy-pod` |
+|---|---|---|---|---|
 | Privileged init container | no | **yes** | no | no |
 | Added capabilities in sandbox pod | **yes** | no | no | no |
-| Requires NetworkPolicy enforcement | no | no | no | **yes** |
+| Node-level privileged DaemonSet | no | no | **yes** | no |
+| Requires `NetworkPolicy` enforcement | no | no | no | **yes** |
+| Pods per sandbox | 1 | 1 | 1 | **2** |
+| OpenShift SCC required | `privileged` | custom | custom + `privileged` CNI | **built-in `nonroot-v2`** |
 
-The sandbox image's own entrypoint and command determine what runs. This
-topology suits batch and autonomous agent workloads that need policy-enforced
-egress and never need an interactive session.
+The dividing line is consistent: everything observable or enforceable at the
+network boundary survives, and everything needing visibility inside the
+workload's namespaces does not. `proxy-pod` suits batch and autonomous agent
+workloads that need policy-enforced egress, ship their own long-running
+entrypoint, and never need a human on the other end. Operators who want the
+interactive workflow *and* low pod privilege should use `cni-sidecar`, which
+keeps the full supervisor contract at the cost of a custom SCC and a
+node-level DaemonSet. The two are complementary, not competing.
 
 ## Implementation plan
 
