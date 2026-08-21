@@ -55,8 +55,14 @@ async fn run_cli_success(args: &[&str], env: &[(&str, &str)]) -> Result<String, 
     Ok(combined)
 }
 
-async fn acquire_keycloak_grant(issuer: &str) -> Result<(String, String), String> {
+async fn acquire_keycloak_grant(
+    issuer: &str,
+    username: &str,
+    password: &str,
+) -> Result<(String, String), String> {
     let token_endpoint = format!("{issuer}/protocol/openid-connect/token");
+    let username_form = format!("username={username}");
+    let password_form = format!("password={password}");
     let output = Command::new("curl")
         .args([
             "--fail",
@@ -70,9 +76,9 @@ async fn acquire_keycloak_grant(issuer: &str) -> Result<(String, String), String
             "--data-urlencode",
             "client_id=openshell-cli",
             "--data-urlencode",
-            "username=admin@test",
+            &username_form,
             "--data-urlencode",
-            "password=admin",
+            &password_form,
             "--data-urlencode",
             "scope=openid",
         ])
@@ -194,11 +200,70 @@ async fn delete_provider_resources() {
     let _ = run_cli(&["provider", "profile", "delete", PROFILE_ID], &[]).await;
 }
 
+async fn read_providers_v2_setting() -> Result<Option<String>, String> {
+    let output = run_cli(&["settings", "get", "--global", "--json"], &[]).await?;
+    if !output.status.success() {
+        return Err(format!(
+            "read global settings failed (exit {:?}):\n{}",
+            output.status.code(),
+            combined_output(&output)
+        ));
+    }
+    let response: Value = serde_json::from_slice(&output.stdout)
+        .map_err(|error| format!("decode global settings: {error}"))?;
+    let value = response
+        .get("settings")
+        .and_then(|settings| settings.get("providers_v2_enabled"))
+        .and_then(Value::as_str)
+        .filter(|value| *value != "<unset>")
+        .map(ToString::to_string);
+    Ok(value)
+}
+
+async fn restore_providers_v2_setting(previous: Option<&str>) -> Result<(), String> {
+    if let Some(value) = previous {
+        run_cli_success(
+            &[
+                "settings",
+                "set",
+                "--global",
+                "--key",
+                "providers_v2_enabled",
+                "--value",
+                value,
+                "--yes",
+            ],
+            &[],
+        )
+        .await?;
+    } else {
+        run_cli_success(
+            &[
+                "settings",
+                "delete",
+                "--global",
+                "--key",
+                "providers_v2_enabled",
+                "--yes",
+            ],
+            &[],
+        )
+        .await?;
+    }
+    Ok(())
+}
+
 #[tokio::test]
 async fn revoked_refresh_grant_requires_user_reauthorization() -> Result<(), String> {
     let issuer = std::env::var("OPENSHELL_E2E_OIDC_ISSUER")
         .map_err(|_| "OPENSHELL_E2E_OIDC_ISSUER is required".to_string())?;
-    let (access_token, refresh_token) = acquire_keycloak_grant(&issuer).await?;
+    let username = std::env::var("OPENSHELL_E2E_OIDC_USERNAME")
+        .map_err(|_| "OPENSHELL_E2E_OIDC_USERNAME is required".to_string())?;
+    let password = std::env::var("OPENSHELL_E2E_OIDC_PASSWORD")
+        .map_err(|_| "OPENSHELL_E2E_OIDC_PASSWORD is required".to_string())?;
+    let previous_providers_v2_setting = read_providers_v2_setting().await?;
+    let (access_token, refresh_token) =
+        acquire_keycloak_grant(&issuer, &username, &password).await?;
     let profile = write_profile(&issuer)?;
     let profile_path = profile.path().to_string_lossy().into_owned();
 
@@ -339,5 +404,14 @@ async fn revoked_refresh_grant_requires_user_reauthorization() -> Result<(), Str
     .await;
 
     delete_provider_resources().await;
-    result
+    let cleanup_result =
+        restore_providers_v2_setting(previous_providers_v2_setting.as_deref()).await;
+    match (result, cleanup_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(test_error), Ok(())) => Err(test_error),
+        (Ok(()), Err(cleanup_error)) => Err(cleanup_error),
+        (Err(test_error), Err(cleanup_error)) => Err(format!(
+            "{test_error}\ncleanup also failed: {cleanup_error}"
+        )),
+    }
 }

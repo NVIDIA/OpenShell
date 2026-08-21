@@ -18,12 +18,13 @@ use prost::Message;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::Duration;
-use tonic::Status;
+use tonic::{Code, Status};
 use tracing::{info, warn};
 
 const DEFAULT_REFRESH_BEFORE_SECONDS: i64 = 300;
 const DEFAULT_MAX_LIFETIME_SECONDS: i64 = 3600;
 const REFRESH_ERROR_RETRY_SECONDS: i64 = 60;
+const REFRESH_CONFIGURATION_RETRY_SECONDS: i64 = 60 * 60;
 const REFRESH_WORKER_PAGE_SIZE: u32 = 1000;
 const MAX_OAUTH_ERROR_RESPONSE_BYTES: usize = 8 * 1024;
 
@@ -431,7 +432,14 @@ struct RefreshFailure {
     recovery_action: ProviderCredentialRefreshRecoveryAction,
     failure_code: &'static str,
     provider_error_subtype: Option<&'static str>,
-    retry_automatically: bool,
+    retry_schedule: RefreshRetrySchedule,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RefreshRetrySchedule {
+    Short,
+    Configuration,
+    Parked,
 }
 
 impl RefreshFailure {
@@ -441,7 +449,7 @@ impl RefreshFailure {
             recovery_action: ProviderCredentialRefreshRecoveryAction::Retry,
             failure_code,
             provider_error_subtype: None,
-            retry_automatically: true,
+            retry_schedule: RefreshRetrySchedule::Short,
         }
     }
 
@@ -451,7 +459,7 @@ impl RefreshFailure {
             recovery_action: ProviderCredentialRefreshRecoveryAction::Investigate,
             failure_code,
             provider_error_subtype: None,
-            retry_automatically: true,
+            retry_schedule: RefreshRetrySchedule::Short,
         }
     }
 
@@ -465,7 +473,7 @@ impl RefreshFailure {
             recovery_action: ProviderCredentialRefreshRecoveryAction::Reauthorize,
             failure_code,
             provider_error_subtype,
-            retry_automatically: false,
+            retry_schedule: RefreshRetrySchedule::Parked,
         }
     }
 
@@ -475,7 +483,21 @@ impl RefreshFailure {
             recovery_action: ProviderCredentialRefreshRecoveryAction::FixConfiguration,
             failure_code,
             provider_error_subtype: None,
-            retry_automatically: false,
+            retry_schedule: RefreshRetrySchedule::Configuration,
+        }
+    }
+
+    fn fix_configuration_with_subtype(
+        status: Status,
+        failure_code: &'static str,
+        provider_error_subtype: &'static str,
+    ) -> Self {
+        Self {
+            status,
+            recovery_action: ProviderCredentialRefreshRecoveryAction::FixConfiguration,
+            failure_code,
+            provider_error_subtype: Some(provider_error_subtype),
+            retry_schedule: RefreshRetrySchedule::Configuration,
         }
     }
 
@@ -486,7 +508,20 @@ impl RefreshFailure {
 
 impl From<Status> for RefreshFailure {
     fn from(status: Status) -> Self {
-        Self::retryable(status, "refresh_failed")
+        match status.code() {
+            Code::InvalidArgument
+            | Code::FailedPrecondition
+            | Code::PermissionDenied
+            | Code::Unauthenticated => {
+                Self::fix_configuration(status, "refresh_configuration_invalid")
+            }
+            Code::Unavailable
+            | Code::DeadlineExceeded
+            | Code::ResourceExhausted
+            | Code::Aborted
+            | Code::Internal => Self::retryable(status, "refresh_failed"),
+            _ => Self::investigate(status, "refresh_failed"),
+        }
     }
 }
 
@@ -677,10 +712,14 @@ async fn persist_refresh_failure_state(
         .unwrap_or_default()
         .to_string();
     state.last_error_at_ms = now_ms;
-    state.next_refresh_at_ms = if failure.retry_automatically {
-        now_ms.saturating_add(REFRESH_ERROR_RETRY_SECONDS.saturating_mul(1000))
-    } else {
-        i64::MAX
+    state.next_refresh_at_ms = match failure.retry_schedule {
+        RefreshRetrySchedule::Short => {
+            now_ms.saturating_add(REFRESH_ERROR_RETRY_SECONDS.saturating_mul(1000))
+        }
+        RefreshRetrySchedule::Configuration => {
+            now_ms.saturating_add(REFRESH_CONFIGURATION_RETRY_SECONDS.saturating_mul(1000))
+        }
+        RefreshRetrySchedule::Parked => i64::MAX,
     };
     let new_version = persist_refresh_state_if_current(store, state, expected_version)
         .await?
@@ -1522,12 +1561,31 @@ async fn request_token(
         .timeout(Duration::from_secs(30))
         .build()
         .map_err(|e| Status::internal(format!("build refresh HTTP client failed: {e}")))?;
-    let response = client.post(parsed).form(form).send().await.map_err(|_| {
-        RefreshFailure::retryable(
-            Status::unavailable("token endpoint request failed"),
-            "oauth_token_endpoint_unavailable",
-        )
-    })?;
+    let response = client
+        .post(parsed)
+        .form(form)
+        .send()
+        .await
+        .map_err(|error| {
+            let error_kind = if error.is_timeout() {
+                "timeout"
+            } else if error.is_connect() {
+                "connect"
+            } else if error.is_request() {
+                "request"
+            } else {
+                "other"
+            };
+            warn!(
+                error = %error.without_url(),
+                error_kind,
+                "OAuth token endpoint request failed"
+            );
+            RefreshFailure::retryable(
+                Status::unavailable("token endpoint request failed"),
+                "oauth_token_endpoint_unavailable",
+            )
+        })?;
     let status = response.status();
     if !status.is_success() {
         let body = read_bounded_oauth_error_body(response).await;
@@ -1650,6 +1708,17 @@ fn classify_oauth_token_error(
             ),
             "oauth_admin_policy_enforced",
         ),
+        "access_denied"
+            if error_response.error_subtype.as_deref() == Some("admin_policy_enforced") =>
+        {
+            RefreshFailure::fix_configuration_with_subtype(
+                Status::failed_precondition(
+                    "OAuth access is blocked by an administrator policy (access_denied/admin_policy_enforced)",
+                ),
+                "oauth_admin_policy_enforced",
+                "admin_policy_enforced",
+            )
+        }
         "invalid_grant" => RefreshFailure::fix_configuration(
             Status::failed_precondition(
                 "OAuth token endpoint rejected the non-interactive grant (invalid_grant)",
@@ -1941,12 +2010,13 @@ async fn run_refresh_worker_tick(
 #[cfg(test)]
 mod tests {
     use super::{
-        NewRefreshStateConfig, OAuthGrantKind, classify_oauth_token_error,
+        MAX_OAUTH_ERROR_RESPONSE_BYTES, NewRefreshStateConfig, OAuthGrantKind, RefreshFailure,
+        RefreshRetrySchedule, Status, classify_oauth_token_error,
         delete_refresh_state_with_credentials, effective_authorization_epoch,
         enqueue_pending_secret_deletion, get_refresh_state, list_all_refresh_states,
         list_refresh_states_for_provider, new_refresh_state, put_refresh_state,
-        refresh_material_scope, refresh_provider_credential, refresh_state_name,
-        refresh_strategy_name, run_refresh_worker_tick, seconds_until_ms,
+        read_bounded_oauth_error_body, refresh_material_scope, refresh_provider_credential,
+        refresh_state_name, refresh_strategy_name, run_refresh_worker_tick, seconds_until_ms,
         validate_secret_material_references,
     };
     use crate::credentials::CredentialRuntime;
@@ -2073,6 +2143,37 @@ mod tests {
     }
 
     #[test]
+    fn local_refresh_statuses_default_to_safe_recovery_actions() {
+        for status in [
+            Status::invalid_argument("missing material"),
+            Status::failed_precondition("strategy cannot be minted"),
+            Status::permission_denied("client is not allowed"),
+        ] {
+            let failure = RefreshFailure::from(status);
+            assert_eq!(
+                failure.recovery_action,
+                ProviderCredentialRefreshRecoveryAction::FixConfiguration
+            );
+            assert_eq!(failure.failure_code, "refresh_configuration_invalid");
+            assert_eq!(failure.retry_schedule, RefreshRetrySchedule::Configuration);
+        }
+
+        let retry = RefreshFailure::from(Status::unavailable("temporary backend outage"));
+        assert_eq!(
+            retry.recovery_action,
+            ProviderCredentialRefreshRecoveryAction::Retry
+        );
+        assert_eq!(retry.retry_schedule, RefreshRetrySchedule::Short);
+
+        let investigate = RefreshFailure::from(Status::unknown("unclassified failure"));
+        assert_eq!(
+            investigate.recovery_action,
+            ProviderCredentialRefreshRecoveryAction::Investigate
+        );
+        assert_eq!(investigate.retry_schedule, RefreshRetrySchedule::Short);
+    }
+
+    #[test]
     fn pending_secret_deletions_preserve_multiple_generations_for_one_key() {
         let mut state = StoredProviderCredentialRefreshState::default();
         for handle in ["first", "second"] {
@@ -2142,7 +2243,7 @@ mod tests {
         );
         assert_eq!(failure.failure_code, "oauth_invalid_grant");
         assert_eq!(failure.provider_error_subtype, Some("invalid_rapt"));
-        assert!(!failure.retry_automatically);
+        assert_eq!(failure.retry_schedule, RefreshRetrySchedule::Parked);
         assert!(
             failure
                 .status
@@ -2170,7 +2271,27 @@ mod tests {
             ProviderCredentialRefreshRecoveryAction::FixConfiguration
         );
         assert_eq!(failure.failure_code, "oauth_invalid_grant");
-        assert!(!failure.retry_automatically);
+        assert_eq!(failure.retry_schedule, RefreshRetrySchedule::Configuration);
+    }
+
+    #[test]
+    fn oauth_admin_policy_subtype_requires_configuration_fix() {
+        let failure = classify_oauth_token_error(
+            reqwest::StatusCode::BAD_REQUEST,
+            br#"{"error":"access_denied","error_subtype":"admin_policy_enforced"}"#,
+            OAuthGrantKind::UserRefreshToken,
+        );
+
+        assert_eq!(
+            failure.recovery_action,
+            ProviderCredentialRefreshRecoveryAction::FixConfiguration
+        );
+        assert_eq!(failure.failure_code, "oauth_admin_policy_enforced");
+        assert_eq!(
+            failure.provider_error_subtype,
+            Some("admin_policy_enforced")
+        );
+        assert_eq!(failure.retry_schedule, RefreshRetrySchedule::Configuration);
     }
 
     #[test]
@@ -2186,7 +2307,7 @@ mod tests {
             ProviderCredentialRefreshRecoveryAction::Retry
         );
         assert_eq!(failure.failure_code, "oauth_token_endpoint_retryable");
-        assert!(failure.retry_automatically);
+        assert_eq!(failure.retry_schedule, RefreshRetrySchedule::Short);
     }
 
     #[test]
@@ -2202,9 +2323,115 @@ mod tests {
             ProviderCredentialRefreshRecoveryAction::Investigate
         );
         assert_eq!(failure.failure_code, "oauth_unrecognized_error");
-        assert!(failure.retry_automatically);
+        assert_eq!(failure.retry_schedule, RefreshRetrySchedule::Short);
         assert!(!failure.status.message().contains("vendor_secret_error"));
         assert!(!failure.status.message().contains("do not expose me"));
+    }
+
+    #[test]
+    fn html_and_malformed_oauth_errors_are_investigated_without_echoing_body() {
+        for body in [b"<html>issuer failure</html>".as_slice(), b"{".as_slice()] {
+            let failure = classify_oauth_token_error(
+                reqwest::StatusCode::BAD_REQUEST,
+                body,
+                OAuthGrantKind::UserRefreshToken,
+            );
+
+            assert_eq!(
+                failure.recovery_action,
+                ProviderCredentialRefreshRecoveryAction::Investigate
+            );
+            assert_eq!(failure.failure_code, "oauth_unrecognized_error_response");
+            assert!(!failure.status.message().contains("issuer failure"));
+        }
+    }
+
+    #[tokio::test]
+    async fn oversized_oauth_error_body_is_bounded_and_investigated() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/oversized"))
+            .respond_with(ResponseTemplate::new(400).set_body_bytes(vec![
+                b'x';
+                MAX_OAUTH_ERROR_RESPONSE_BYTES
+                    + 512
+            ]))
+            .mount(&mock_server)
+            .await;
+
+        let response = reqwest::get(format!("{}/oversized", mock_server.uri()))
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = read_bounded_oauth_error_body(response).await;
+        assert_eq!(body.len(), MAX_OAUTH_ERROR_RESPONSE_BYTES);
+
+        let failure = classify_oauth_token_error(status, &body, OAuthGrantKind::UserRefreshToken);
+        assert_eq!(
+            failure.recovery_action,
+            ProviderCredentialRefreshRecoveryAction::Investigate
+        );
+        assert_eq!(failure.failure_code, "oauth_unrecognized_error_response");
+    }
+
+    #[tokio::test]
+    async fn invalid_local_oauth_configuration_retries_hourly() {
+        let store = test_store().await;
+        let provider = provider("invalid-local-config", "outlook");
+        store.put_message(&provider).await.unwrap();
+        let state = new_refresh_state(
+            &provider,
+            "default",
+            "MS_GRAPH_ACCESS_TOKEN",
+            NewRefreshStateConfig {
+                strategy: ProviderCredentialRefreshStrategy::Oauth2RefreshToken,
+                material: HashMap::from([
+                    ("client_id".to_string(), "client-id".to_string()),
+                    ("refresh_token".to_string(), "refresh-token".to_string()),
+                ]),
+                secret_material_keys: vec!["refresh_token".to_string()],
+                expires_at_ms: 0,
+                token_url: "not-an-absolute-url".to_string(),
+                scopes: Vec::new(),
+                refresh_before_seconds: 30,
+                max_lifetime_seconds: 60,
+                additional_output_keys: HashMap::new(),
+            },
+        )
+        .unwrap();
+        put_refresh_state(&store, &state).await.unwrap();
+
+        let err = refresh_provider_credential(
+            &store,
+            "default",
+            &test_credentials(),
+            None,
+            "invalid-local-config",
+            "MS_GRAPH_ACCESS_TOKEN",
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        let stored = get_refresh_state(
+            &store,
+            "default",
+            provider.object_id(),
+            "MS_GRAPH_ACCESS_TOKEN",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(stored.status, "configuration_required");
+        assert_eq!(
+            stored.recovery_action,
+            ProviderCredentialRefreshRecoveryAction::FixConfiguration as i32
+        );
+        assert_eq!(stored.failure_code, "refresh_configuration_invalid");
+        assert_eq!(
+            stored.next_refresh_at_ms - stored.last_error_at_ms,
+            60 * 60 * 1000
+        );
     }
 
     #[tokio::test]
@@ -2303,7 +2530,7 @@ mod tests {
         let provider = provider("my-graph", "outlook");
         store.put_message(&provider).await.unwrap();
         let before_refresh_ms = current_time_ms();
-        let state = new_refresh_state(
+        let mut state = new_refresh_state(
             &provider,
             "default",
             "MS_GRAPH_ACCESS_TOKEN",
@@ -2323,6 +2550,12 @@ mod tests {
             },
         )
         .unwrap();
+        state.status = "investigation_required".to_string();
+        state.last_error = "safe prior error".to_string();
+        state.recovery_action = ProviderCredentialRefreshRecoveryAction::Investigate as i32;
+        state.failure_code = "oauth_unrecognized_error".to_string();
+        state.provider_error_subtype = "prior_subtype".to_string();
+        state.last_error_at_ms = current_time_ms();
         put_refresh_state(&store, &state).await.unwrap();
         let authorization_epoch = state.authorization_epoch.clone();
         let credentials = test_credentials();
@@ -2343,6 +2576,13 @@ mod tests {
         assert!(refreshed.next_refresh_at_ms > 0);
         assert!(refreshed.expires_at_ms <= before_refresh_ms + 120_000);
         assert!(refreshed.last_error.is_empty());
+        assert_eq!(
+            refreshed.recovery_action,
+            ProviderCredentialRefreshRecoveryAction::Unspecified as i32
+        );
+        assert!(refreshed.failure_code.is_empty());
+        assert!(refreshed.provider_error_subtype.is_empty());
+        assert_eq!(refreshed.last_error_at_ms, 0);
 
         let stored = store
             .get_message_by_name::<Provider>("default", "my-graph")
@@ -2834,7 +3074,6 @@ mod tests {
         state.material.remove("refresh_token");
         put_refresh_state(&store, &state).await.unwrap();
         credentials.fail_next_store();
-        let before = current_time_ms();
 
         let err = refresh_provider_credential(
             &store,
@@ -2861,7 +3100,6 @@ mod tests {
         assert_eq!(stored.status, "reauthorization_required");
         assert!(stored.last_error.contains("must be re-authorized"));
         assert_eq!(stored.next_refresh_at_ms, i64::MAX);
-        assert!(stored.next_refresh_at_ms > before);
         assert_eq!(
             stored.recovery_action,
             ProviderCredentialRefreshRecoveryAction::Reauthorize as i32
@@ -3011,6 +3249,58 @@ mod tests {
             !stored_provider
                 .credentials
                 .contains_key("MS_GRAPH_ACCESS_TOKEN")
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_worker_skips_parked_reauthorization_state() {
+        let store = test_store().await;
+        let provider = provider("parked-refresh", "outlook");
+        store.put_message(&provider).await.unwrap();
+        let mut state = new_refresh_state(
+            &provider,
+            "default",
+            "MS_GRAPH_ACCESS_TOKEN",
+            NewRefreshStateConfig {
+                strategy: ProviderCredentialRefreshStrategy::Oauth2RefreshToken,
+                material: HashMap::new(),
+                secret_material_keys: Vec::new(),
+                expires_at_ms: 0,
+                token_url: "https://issuer.example/token".to_string(),
+                scopes: Vec::new(),
+                refresh_before_seconds: 30,
+                max_lifetime_seconds: 60,
+                additional_output_keys: HashMap::new(),
+            },
+        )
+        .unwrap();
+        state.status = "reauthorization_required".to_string();
+        state.last_error = "OAuth refresh grant is no longer usable".to_string();
+        state.recovery_action = ProviderCredentialRefreshRecoveryAction::Reauthorize as i32;
+        state.failure_code = "oauth_invalid_grant".to_string();
+        state.last_error_at_ms = current_time_ms();
+        state.next_refresh_at_ms = i64::MAX;
+        put_refresh_state(&store, &state).await.unwrap();
+
+        run_refresh_worker_tick(&store, Some(&test_credentials()), None)
+            .await
+            .unwrap();
+
+        let stored = get_refresh_state(
+            &store,
+            "default",
+            provider.object_id(),
+            "MS_GRAPH_ACCESS_TOKEN",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(stored.status, "reauthorization_required");
+        assert_eq!(stored.next_refresh_at_ms, i64::MAX);
+        assert_eq!(stored.failure_code, "oauth_invalid_grant");
+        assert_eq!(
+            stored.recovery_action,
+            ProviderCredentialRefreshRecoveryAction::Reauthorize as i32
         );
     }
 
