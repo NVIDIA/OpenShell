@@ -181,6 +181,12 @@ Envoy Gateway is already installed by Skaffold (the `envoy-gateway` Helm release
 service for the proxy; klipper-lb binds it to hostPort 80, reachable via the
 `8080:80` load balancer port mapping.
 
+To exercise the same path in the standard single-replica Kubernetes E2E suite,
+run `mise run e2e:kubernetes:envoy`. The wrapper creates isolated Gateway API
+resources, reuses an existing Envoy controller when present, and forwards the
+test client through the generated Envoy proxy Service. It does not enable HA or
+provision PostgreSQL.
+
 ### Keycloak OIDC
 
 One-time setup — only needed once per cluster lifetime:
