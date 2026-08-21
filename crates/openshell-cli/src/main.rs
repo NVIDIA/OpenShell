@@ -156,8 +156,11 @@ fn resolve_gateway_name(gateway_flag: &Option<String>) -> Option<String> {
 /// Handles Cloudflare Access and OIDC auth modes by loading the stored token
 /// and setting it on `TlsOptions`. For OIDC, automatically refreshes the token
 /// if it's near expiry.
-fn apply_auth(tls: &mut TlsOptions, gateway_name: &str) {
-    let _ = apply_auth_with_status(tls, gateway_name);
+fn apply_auth(tls: &mut TlsOptions, gateway_name: &str) -> Result<()> {
+    if let Some(error) = apply_auth_with_status(tls, gateway_name) {
+        return Err(miette::miette!(error));
+    }
+    Ok(())
 }
 
 /// Apply stored authentication and return a user-facing preparation failure,
@@ -206,11 +209,8 @@ fn apply_auth_with_status(tls: &mut TlsOptions, gateway_name: &str) -> Option<St
                     }
                     Err(e) => {
                         tracing::warn!("OIDC token refresh failed: {e}");
-                        // Use the expired token anyway — server will reject it
-                        // with a clear error prompting re-login.
-                        tls.oidc_token = Some(bundle.access_token);
                         Some(format!(
-                            "OIDC token refresh failed; run `openshell gateway login {gateway_name}`"
+                            "OIDC token refresh failed: {e}\nrun `openshell gateway login {gateway_name}`"
                         ))
                     }
                 }
@@ -2325,7 +2325,7 @@ async fn run_async() -> Result<()> {
             GatewayCommands::Info { output } => {
                 if let Ok(ctx) = resolve_gateway(&cli.gateway, &cli.gateway_endpoint) {
                     let mut tls = tls.with_gateway_name(&ctx.name);
-                    apply_auth(&mut tls, &ctx.name);
+                    apply_auth(&mut tls, &ctx.name)?;
                     run::gateway_info(&ctx.name, &ctx.endpoint, &tls, output.as_str()).await?;
                 } else {
                     run::gateway_info_not_configured()?;
@@ -2393,7 +2393,7 @@ async fn run_async() -> Result<()> {
         Some(Commands::Whoami { output }) => {
             let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
             let mut tls = tls.with_gateway_name(&ctx.name);
-            apply_auth(&mut tls, &ctx.name);
+            apply_auth(&mut tls, &ctx.name)?;
             run::whoami(&ctx.endpoint, &tls, output.as_str()).await?;
         }
 
@@ -2481,7 +2481,7 @@ async fn run_async() -> Result<()> {
             } => {
                 let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
                 let mut tls = tls.with_gateway_name(&ctx.name);
-                apply_auth(&mut tls, &ctx.name);
+                apply_auth(&mut tls, &ctx.name)?;
                 let name = resolve_sandbox_name(name, &ctx.name, &cli.workspace)?;
                 let local = local.unwrap_or_else(|| target_port.to_string());
                 run::service_forward_tcp(
@@ -2503,7 +2503,7 @@ async fn run_async() -> Result<()> {
                 let spec = openshell_core::forward::ForwardSpec::parse(&port)?;
                 let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
                 let mut tls = tls.with_gateway_name(&ctx.name);
-                apply_auth(&mut tls, &ctx.name);
+                apply_auth(&mut tls, &ctx.name)?;
                 let name = resolve_sandbox_name(name, &ctx.name, &cli.workspace)?;
                 run::sandbox_forward(
                     &ctx.endpoint,
@@ -2534,7 +2534,7 @@ async fn run_async() -> Result<()> {
         }) => {
             let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
             let mut tls = tls.with_gateway_name(&ctx.name);
-            apply_auth(&mut tls, &ctx.name);
+            apply_auth(&mut tls, &ctx.name)?;
             match command {
                 ServiceCommands::Expose {
                     sandbox,
@@ -2594,7 +2594,7 @@ async fn run_async() -> Result<()> {
         }) => {
             let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
             let mut tls = tls.with_gateway_name(&ctx.name);
-            apply_auth(&mut tls, &ctx.name);
+            apply_auth(&mut tls, &ctx.name)?;
             let name = resolve_sandbox_name(name, &ctx.name, &cli.workspace)?;
             run::sandbox_logs(
                 &ctx.endpoint,
@@ -2618,7 +2618,7 @@ async fn run_async() -> Result<()> {
         }) => {
             let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
             let mut tls = tls.with_gateway_name(&ctx.name);
-            apply_auth(&mut tls, &ctx.name);
+            apply_auth(&mut tls, &ctx.name)?;
             match policy_cmd {
                 PolicyCommands::Set {
                     name,
@@ -2758,7 +2758,7 @@ async fn run_async() -> Result<()> {
         }) => {
             let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
             let mut tls = tls.with_gateway_name(&ctx.name);
-            apply_auth(&mut tls, &ctx.name);
+            apply_auth(&mut tls, &ctx.name)?;
 
             match settings_cmd {
                 SettingsCommands::Get { name, global, json } => {
@@ -2837,7 +2837,7 @@ async fn run_async() -> Result<()> {
         }) => {
             let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
             let mut tls = tls.with_gateway_name(&ctx.name);
-            apply_auth(&mut tls, &ctx.name);
+            apply_auth(&mut tls, &ctx.name)?;
             match draft_cmd {
                 DraftCommands::Get { name, status } => {
                     let name = resolve_sandbox_name(name, &ctx.name, &cli.workspace)?;
@@ -2912,7 +2912,7 @@ async fn run_async() -> Result<()> {
             let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
             let endpoint = &ctx.endpoint;
             let mut tls = tls.with_gateway_name(&ctx.name);
-            apply_auth(&mut tls, &ctx.name);
+            apply_auth(&mut tls, &ctx.name)?;
             match command {
                 InferenceCommands::Set {
                     provider,
@@ -3062,7 +3062,7 @@ async fn run_async() -> Result<()> {
                     let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
                     let endpoint = &ctx.endpoint;
                     let mut tls = tls.with_gateway_name(&ctx.name);
-                    apply_auth(&mut tls, &ctx.name);
+                    apply_auth(&mut tls, &ctx.name)?;
                     Box::pin(run::sandbox_create(
                         endpoint,
                         &ctx.name,
@@ -3101,7 +3101,7 @@ async fn run_async() -> Result<()> {
                 } => {
                     let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
                     let mut tls = tls.with_gateway_name(&ctx.name);
-                    apply_auth(&mut tls, &ctx.name);
+                    apply_auth(&mut tls, &ctx.name)?;
                     let local = std::path::Path::new(&local_path);
                     run::sandbox_upload(
                         &ctx.endpoint,
@@ -3121,7 +3121,7 @@ async fn run_async() -> Result<()> {
                 } => {
                     let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
                     let mut tls = tls.with_gateway_name(&ctx.name);
-                    apply_auth(&mut tls, &ctx.name);
+                    apply_auth(&mut tls, &ctx.name)?;
                     let local_dest = dest.as_deref().unwrap_or(".");
                     eprintln!("Downloading sandbox:{sandbox_path} -> {local_dest}");
                     run::sandbox_sync_down(
@@ -3139,7 +3139,7 @@ async fn run_async() -> Result<()> {
                     let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
                     let endpoint = &ctx.endpoint;
                     let mut tls = tls.with_gateway_name(&ctx.name);
-                    apply_auth(&mut tls, &ctx.name);
+                    apply_auth(&mut tls, &ctx.name)?;
                     match other {
                         SandboxCommands::Create { .. }
                         | SandboxCommands::Upload { .. }
@@ -3302,7 +3302,7 @@ async fn run_async() -> Result<()> {
             let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
             let endpoint = &ctx.endpoint;
             let mut tls = tls.with_gateway_name(&ctx.name);
-            apply_auth(&mut tls, &ctx.name);
+            apply_auth(&mut tls, &ctx.name)?;
 
             match command {
                 WorkspaceCommands::Create { name, labels } => {
@@ -3360,7 +3360,7 @@ async fn run_async() -> Result<()> {
             let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
             let endpoint = &ctx.endpoint;
             let mut tls = tls.with_gateway_name(&ctx.name);
-            apply_auth(&mut tls, &ctx.name);
+            apply_auth(&mut tls, &ctx.name)?;
 
             match command {
                 ProviderCommands::Create {
@@ -3563,7 +3563,7 @@ async fn run_async() -> Result<()> {
         Some(Commands::Term { theme }) => {
             let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
             let mut tls = tls.with_gateway_name(&ctx.name);
-            apply_auth(&mut tls, &ctx.name);
+            apply_auth(&mut tls, &ctx.name)?;
             let channel = openshell_cli::tls::build_channel(&ctx.endpoint, &tls).await?;
             let interceptor = openshell_core::auth::EdgeAuthInterceptor::new(
                 tls.oidc_token.as_deref(),
@@ -3607,7 +3607,7 @@ async fn run_async() -> Result<()> {
                         None => tls,
                     };
                     if let Some(ref g) = gateway_name_opt {
-                        apply_auth(&mut effective_tls, g);
+                        apply_auth(&mut effective_tls, g)?;
                     }
                     run::sandbox_ssh_proxy(&gw, &sid, &tok, &effective_tls).await?;
                 }
@@ -3626,7 +3626,7 @@ async fn run_async() -> Result<()> {
                         meta.gateway_endpoint
                     };
                     let mut tls = tls.with_gateway_name(&g);
-                    apply_auth(&mut tls, &g);
+                    apply_auth(&mut tls, &g)?;
                     run::sandbox_ssh_proxy_by_name(&endpoint, &n, &tls, &cli.workspace).await?;
                 }
                 // Legacy name mode with --server only (no --gateway-name).
@@ -4312,7 +4312,7 @@ mod tests {
             store_edge_token("edge-gateway", "token-123").unwrap();
 
             let mut tls = TlsOptions::default();
-            apply_auth(&mut tls, "edge-gateway");
+            apply_auth(&mut tls, "edge-gateway").unwrap();
 
             assert_eq!(tls.edge_token.as_deref(), Some("token-123"));
         });
