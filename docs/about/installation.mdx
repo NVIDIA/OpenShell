@@ -125,9 +125,6 @@ sudo snap connect openshell:log-observe
 sudo snap connect openshell:system-observe
 ```
 
-Connecting Docker automatically restarts the gateway so it discovers the newly
-available Docker socket. This restart interrupts active sandbox sessions.
-
 The `log-observe` and `system-observe` plugs are needed for the gateway service
 to read logs and inspect system processes. The `docker` plug requires the
 `docker:docker-daemon` slot from the Docker snap and does not work with
