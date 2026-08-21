@@ -190,6 +190,8 @@ add `ci/values-spire.yaml` to the OpenShell release values files.
 | openshiftRoute.annotations | object | `{}` | Extra annotations on the Route (e.g. haproxy.router.openshift.io/*). |
 | openshiftRoute.enabled | bool | `false` | Create an OpenShift Route with TLS passthrough. |
 | openshiftRoute.host | string | `""` | Hostname for the Route. Must match a SAN on the gateway's server cert. |
+| persistence.size | string | `"1Gi"` | Size of the gateway data volume. Note that volumeClaimTemplates is immutable: changing this only affects claims created from now on, and does not resize the volume of an existing StatefulSet. |
+| persistence.storageClassName | string | `""` | StorageClass for the gateway data volume. Empty = omit the field, using the cluster's default StorageClass. Set this on clusters that have no default StorageClass, otherwise the claim stays Pending. |
 | pkiInitJob.enabled | bool | `true` | Run a pre-install/pre-upgrade Job that creates gateway and client mTLS Secrets. When certManager.enabled=true, cert-manager owns TLS and this same hook runs in JWT-only mode even if pkiInitJob.enabled remains true. |
 | pkiInitJob.serverDnsNames | list | `[]` | Extra DNS SANs to append to the server certificate. |
 | pkiInitJob.serverIpAddresses | list | `[]` | Extra IP SANs to append to the server certificate. |
@@ -197,6 +199,7 @@ add `ci/values-spire.yaml` to the OpenShell release values files.
 | podLabels | object | `{}` | Extra labels to add to the gateway pod. |
 | podLifecycle.terminationGracePeriodSeconds | int | `5` | Grace period, in seconds, before Kubernetes terminates the gateway pod. |
 | podSecurityContext.fsGroup | int | `1000` | fsGroup assigned to the gateway pod. |
+| priorityClassName | string | `""` | PriorityClass for the gateway pod. The gateway is a control-plane component; when it shares nodes with the workloads it serves, the default priority gives it no advantage under node pressure. Empty = omit the field. |
 | probes.liveness.failureThreshold | int | `3` | Liveness probe failure threshold before the container is restarted. |
 | probes.liveness.initialDelaySeconds | int | `2` | Liveness probe initial delay, in seconds. |
 | probes.liveness.periodSeconds | int | `5` | Liveness probe period, in seconds. |
@@ -289,6 +292,7 @@ add `ci/values-spire.yaml` to the OpenShell release values files.
 | supervisor.sideloadMethod | string | `""` | How the supervisor binary is delivered into sandbox pods. Empty (default) = auto-detect from cluster version:   K8s >= v1.35 -> "image-volume" (ImageVolume enabled by default; GA in v1.36)   K8s < v1.35 -> "init-container" (copies via init container + emptyDir) On K8s v1.33-v1.34 with the ImageVolume feature gate manually enabled, set this to "image-volume" explicitly. |
 | supervisor.topology | string | `"combined"` | Supervisor pod topology for Kubernetes sandboxes. "combined" runs the current single supervisor container in the agent pod. "sidecar" runs network enforcement in a dedicated sidecar and the process supervisor as a low-capability wrapper in the agent container. |
 | tolerations | list | `[]` | Tolerations for the gateway pod. |
+| topologySpreadConstraints | list | `[]` | Topology spread constraints for the gateway pod, used to spread replicas across zones or nodes. Empty = omit the field. |
 | upstreamProxy | object | `{"authAllowInsecure":false,"authSecret":{"key":"","name":""},"connectByHostname":false,"noProxy":"","url":""}` | Operator-owned corporate forward proxy for policy-approved TLS egress from Kubernetes sandboxes. The workload cannot select or override it. |
 | upstreamProxy.authAllowInsecure | bool | `false` | Required when authSecret is configured because Basic auth to an HTTP proxy is cleartext. |
 | upstreamProxy.authSecret.key | string | `""` | Secret key containing the proxy credential. |

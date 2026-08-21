@@ -187,6 +187,27 @@ tolerations: []
 # -- Affinity rules for the gateway pod.
 affinity: {}
 
+# -- PriorityClass for the gateway pod. The gateway is a control-plane
+# component; when it shares nodes with the workloads it serves, the default
+# priority gives it no advantage under node pressure. Empty = omit the field.
+priorityClassName: ""
+
+# -- Topology spread constraints for the gateway pod, used to spread replicas
+# across zones or nodes. Empty = omit the field.
+topologySpreadConstraints: []
+
+# Gateway data volume (workload.kind=statefulset only). The StatefulSet's
+# openshell-data claim holds the default SQLite database.
+persistence:
+  # -- Size of the gateway data volume. Note that volumeClaimTemplates is
+  # immutable: changing this only affects claims created from now on, and does
+  # not resize the volume of an existing StatefulSet.
+  size: 1Gi
+  # -- StorageClass for the gateway data volume. Empty = omit the field, using
+  # the cluster's default StorageClass. Set this on clusters that have no
+  # default StorageClass, otherwise the claim stays Pending.
+  storageClassName: ""
+
 # Server configuration
 server:
   # -- Gateway log level.
