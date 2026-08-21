@@ -897,9 +897,28 @@ impl ComputeRuntime {
         sandbox: Sandbox,
         sandbox_token: Option<String>,
     ) -> Result<Sandbox, Status> {
+        let _guard = self.sync_lock.lock().await;
+        self.create_sandbox_locked(sandbox, sandbox_token).await
+    }
+
+    pub(crate) async fn create_sandbox_with_sync_guard(
+        &self,
+        sandbox: Sandbox,
+        sandbox_token: Option<String>,
+    ) -> Result<Sandbox, Status> {
+        self.create_sandbox_locked(sandbox, sandbox_token).await
+    }
+
+    async fn create_sandbox_locked(
+        &self,
+        sandbox: Sandbox,
+        sandbox_token: Option<String>,
+    ) -> Result<Sandbox, Status> {
         let sandbox_id = sandbox.object_id().to_string();
         let mut driver_sandbox = driver_sandbox_from_public(&sandbox, &self.driver_info.name)
             .map_err(|status| *status)?;
+
+        self.remove_failed_sandbox_for_create(&sandbox).await?;
 
         // Create with MustCreate condition to prevent duplicate creation race
         self.sandbox_index.update_from_sandbox(&sandbox);
@@ -1435,6 +1454,38 @@ impl ComputeRuntime {
                 debug!(sandbox_id, error = %err, "Skipped lifecycle rollback after concurrent change");
             }
         }
+    }
+
+    async fn remove_failed_sandbox_for_create(&self, sandbox: &Sandbox) -> Result<(), Status> {
+        let Some(record) = self
+            .store
+            .get_by_name(
+                Sandbox::object_type(),
+                sandbox.object_workspace(),
+                sandbox.object_name(),
+            )
+            .await
+            .map_err(|e| Status::internal(format!("fetch existing sandbox failed: {e}")))?
+        else {
+            return Ok(());
+        };
+        let existing = decode_sandbox_record(&record)
+            .map_err(|e| Status::internal(format!("decode existing sandbox failed: {e}")))?;
+        if SandboxPhase::try_from(existing.phase()).unwrap_or(SandboxPhase::Unknown)
+            != SandboxPhase::Error
+        {
+            return Ok(());
+        }
+
+        self.cleanup_sandbox_owned_records(&existing)
+            .await
+            .map_err(|e| Status::internal(format!("cleanup failed sandbox: {e}")))?;
+        self.store
+            .delete(Sandbox::object_type(), existing.object_id())
+            .await
+            .map_err(|e| Status::internal(format!("delete failed sandbox: {e}")))?;
+        self.cleanup_removed_sandbox_state(existing.object_id());
+        Ok(())
     }
 
     pub(crate) async fn delete_sandbox(
@@ -9375,6 +9426,34 @@ mod tests {
             stored.metadata.as_ref().unwrap().resource_version,
             1,
             "database should have resource_version: 1 after create"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_sandbox_replaces_failed_same_name_without_waiting_for_deleted_event() {
+        let runtime = test_runtime(Arc::new(TestDriver::default())).await;
+        let failed = sandbox_record("sb-failed", "retryable-sandbox", SandboxPhase::Error);
+        runtime.store.put_message(&failed).await.unwrap();
+
+        let retry = sandbox_record("sb-retry", "retryable-sandbox", SandboxPhase::Provisioning);
+        let created = runtime.create_sandbox(retry, None).await.unwrap();
+
+        assert_eq!(created.object_id(), "sb-retry");
+        assert!(
+            runtime
+                .store
+                .get_message::<Sandbox>("sb-failed")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            runtime
+                .store
+                .get_message::<Sandbox>("sb-retry")
+                .await
+                .unwrap()
+                .is_some()
         );
     }
 
