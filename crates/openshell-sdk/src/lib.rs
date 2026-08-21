@@ -34,6 +34,8 @@ pub mod client;
 pub mod config;
 pub mod edge_tunnel;
 pub mod error;
+#[cfg(feature = "extension")]
+pub mod extension;
 pub mod oidc;
 pub mod raw;
 pub mod refresh;

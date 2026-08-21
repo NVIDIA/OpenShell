@@ -33,6 +33,7 @@ e2e-kubernetes-workspace-managed = ["e2e-kubernetes"]
 e2e-kubernetes-workspace-operator = ["e2e-kubernetes"]
 e2e-podman = ["e2e", "e2e-host-gateway", "e2e-local-container-driver"]
 e2e-podman-gpu = ["e2e-podman", "e2e-gpu"]
+e2e-supervisor-middleware = ["e2e-docker"]
 e2e-oidc-pkce = []
 e2e-vm = ["e2e", "e2e-host-gateway"]
 
@@ -155,6 +156,11 @@ required-features = ["e2e"]
 name = "proxy_egress_pipeline"
 path = "tests/proxy_egress_pipeline.rs"
 required-features = ["e2e-host-gateway"]
+
+[[test]]
+name = "supervisor_middleware"
+path = "tests/supervisor_middleware.rs"
+required-features = ["e2e-supervisor-middleware"]
 
 [[test]]
 name = "workspace_namespace_managed"

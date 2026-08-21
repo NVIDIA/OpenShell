@@ -62,6 +62,9 @@ jobs:
           - suite: rust-docker-external-driver
             cmd: "env -u OPENSHELL_GATEWAY_BIN mise run --no-deps --skip-deps e2e:docker:external-driver"
             apt_packages: "openssh-client"
+          - suite: supervisor-middleware
+            cmd: "mise run --no-deps --skip-deps e2e:supervisor-middleware"
+            apt_packages: "openssh-client"
           - suite: mcp
             cmd: "mise run --no-deps --skip-deps e2e:mcp"
             apt_packages: ""
