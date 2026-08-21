@@ -151,50 +151,7 @@ install -Dpm 0644 deploy/rpm/gateway.toml.default %{buildroot}%{_datadir}/%{name
 # Installed to the systemd user unit directory so any user can run:
 #   systemctl --user enable --now openshell-gateway.service
 install -d %{buildroot}%{_userunitdir}
-cat > %{buildroot}%{_userunitdir}/%{name}-gateway.service << 'EOF'
-[Unit]
-Description=OpenShell Gateway (user)
-Documentation=https://github.com/NVIDIA/OpenShell
-After=podman.socket
-Wants=podman.socket
-
-[Service]
-Type=exec
-# On first start the unit seeds a default TOML config and generates PKI.
-# Client certs are placed in ~/.config/openshell/gateways/openshell/mtls/ so
-# the CLI discovers them automatically.
-# See /usr/share/doc/openshell-gateway/ for details.
-
-# Seed a default TOML config on first start if the user has not created one.
-# The template ships at /usr/share/openshell-gateway/gateway.toml.default.
-# Edit ~/.config/openshell/gateway.toml to customize.
-# %%E expands to $XDG_CONFIG_HOME (~/.config) in user units.
-ExecStartPre=/bin/sh -c 'test -f %%E/openshell/gateway.toml || install -Dm644 /usr/share/openshell-gateway/gateway.toml.default %%E/openshell/gateway.toml'
-
-# Auto-generate PKI on first start if not present.
-# The default local TLS dir uses %%h because %%S resolves differently across
-# systemd user-manager versions. gateway.env may override this path.
-Environment=OPENSHELL_LOCAL_TLS_DIR=%%h/.local/state/openshell/tls
-ExecStartPre=/usr/bin/openshell-gateway generate-certs --output-dir ${OPENSHELL_LOCAL_TLS_DIR} --server-san host.openshell.internal
-
-# gateway.env is honored for backward compatibility with pre-1415 installs.
-# New installs use runtime defaults; create gateway.toml to override.
-# See TROUBLESHOOTING.md for the env-to-TOML migration guide.
-EnvironmentFile=-%%E/openshell/gateway.env
-ExecStart=/usr/bin/openshell-gateway
-StateDirectory=openshell
-Restart=on-failure
-RestartSec=5
-
-# Security hardening
-NoNewPrivileges=yes
-ProtectSystem=strict
-PrivateTmp=yes
-RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
-
-[Install]
-WantedBy=default.target
-EOF
+install -Dpm 0644 deploy/rpm/%{name}-gateway.service %{buildroot}%{_userunitdir}/%{name}-gateway.service
 
 # --- Gateway documentation ---
 install -d %{buildroot}%{_docdir}/%{name}-gateway
