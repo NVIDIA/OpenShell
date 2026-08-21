@@ -157,6 +157,7 @@ pub enum GatewayListenerRequirement {
         address: SocketAddr,
         driver_name: String,
         reason: String,
+        allow_nested_container_wildcard_fallback: bool,
     },
     DefaultRouteInterface {
         driver_name: String,
@@ -166,6 +167,12 @@ pub enum GatewayListenerRequirement {
         driver_name: String,
         reason: String,
     },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GatewayListenerFallbackPolicy {
+    Deny,
+    TrustedBuiltinPodman,
 }
 
 impl GatewayListenerRequirement {
@@ -591,6 +598,7 @@ impl ComputeRuntime {
         driver_name: String,
         driver: SharedComputeDriver,
         driver_process: Option<Arc<ManagedDriverProcess>>,
+        listener_fallback_policy: GatewayListenerFallbackPolicy,
         store: Arc<Store>,
         sandbox_index: SandboxIndex,
         sandbox_watch_bus: SandboxWatchBus,
@@ -646,6 +654,9 @@ impl ComputeRuntime {
                                 address,
                                 driver_name: driver_name.clone(),
                                 reason: requirement.reason,
+                                allow_nested_container_wildcard_fallback: listener_fallback_policy
+                                    == GatewayListenerFallbackPolicy::TrustedBuiltinPodman
+                                    && requirement.allow_nested_container_wildcard_fallback,
                             })
                         }
                         Selector::DefaultRouteInterface(_) => {
@@ -733,6 +744,7 @@ impl ComputeRuntime {
             ComputeDriverKind::Docker.as_str().to_string(),
             driver,
             None,
+            GatewayListenerFallbackPolicy::Deny,
             store,
             sandbox_index,
             sandbox_watch_bus,
@@ -761,6 +773,7 @@ impl ComputeRuntime {
             ComputeDriverKind::Kubernetes.as_str().to_string(),
             driver,
             None,
+            GatewayListenerFallbackPolicy::Deny,
             store,
             sandbox_index,
             sandbox_watch_bus,
@@ -784,6 +797,7 @@ impl ComputeRuntime {
             endpoint.name,
             driver,
             endpoint.driver_process,
+            GatewayListenerFallbackPolicy::Deny,
             store,
             sandbox_index,
             sandbox_watch_bus,
@@ -810,6 +824,7 @@ impl ComputeRuntime {
             ComputeDriverKind::Podman.as_str().to_string(),
             driver,
             None,
+            GatewayListenerFallbackPolicy::TrustedBuiltinPodman,
             store,
             sandbox_index,
             sandbox_watch_bus,
@@ -9027,6 +9042,7 @@ mod tests {
             "test-driver".to_string(),
             Arc::new(TestDriver::default()),
             None,
+            GatewayListenerFallbackPolicy::Deny,
             store,
             SandboxIndex::new(),
             SandboxWatchBus::new(),
@@ -9038,6 +9054,41 @@ mod tests {
 
         let initialization = traced.span_with("driver.initialize", "driver.name", "test-driver");
         test_exporter::assert_is_root(&initialization);
+    }
+
+    #[tokio::test]
+    async fn trusted_builtin_podman_preserves_wildcard_fallback_marker() {
+        use crate::test_support::FakeComputeDriver;
+
+        let store = Arc::new(Store::connect("sqlite::memory:").await.unwrap());
+        let driver = FakeComputeDriver::new()
+            .with_nested_container_wildcard_fallback_listener_requirement(
+                "10.89.0.1:17670",
+                "Podman managed bridge",
+            );
+        let runtime = ComputeRuntime::from_driver(
+            "podman".to_string(),
+            Arc::new(driver),
+            None,
+            GatewayListenerFallbackPolicy::TrustedBuiltinPodman,
+            store,
+            SandboxIndex::new(),
+            SandboxWatchBus::new(),
+            TracingLogBus::new(),
+            Arc::new(SupervisorSessionRegistry::new()),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            runtime.gateway_listener_requirements(),
+            &[GatewayListenerRequirement::Exact {
+                address: "10.89.0.1:17670".parse().unwrap(),
+                driver_name: "podman".to_string(),
+                reason: "Podman managed bridge".to_string(),
+                allow_nested_container_wildcard_fallback: true,
+            }]
+        );
     }
 
     #[tokio::test]
@@ -9179,6 +9230,44 @@ mod tests {
 
     #[tokio::test]
     #[cfg(unix)]
+    async fn external_driver_named_podman_cannot_authorize_wildcard_fallback() {
+        use crate::test_support::FakeComputeDriver;
+
+        let dir = tempfile::tempdir().unwrap();
+        let socket_path = dir.path().join("compute-driver.sock");
+        let driver = FakeComputeDriver::new()
+            .with_nested_container_wildcard_fallback_listener_requirement(
+                "10.89.0.1:17670",
+                "external Podman bridge",
+            );
+        let _server = driver.serve_uds(&socket_path).unwrap();
+        let endpoint = connect_remote_compute_driver("podman", &socket_path)
+            .await
+            .unwrap();
+        let runtime = ComputeRuntime::new_remote_driver(
+            endpoint,
+            Arc::new(Store::connect("sqlite::memory:").await.unwrap()),
+            SandboxIndex::new(),
+            SandboxWatchBus::new(),
+            TracingLogBus::new(),
+            Arc::new(SupervisorSessionRegistry::new()),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            runtime.gateway_listener_requirements(),
+            &[GatewayListenerRequirement::Exact {
+                address: "10.89.0.1:17670".parse().unwrap(),
+                driver_name: "podman".to_string(),
+                reason: "external Podman bridge".to_string(),
+                allow_nested_container_wildcard_fallback: false,
+            }]
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
     async fn remote_compute_driver_forwards_lifecycle_calls_over_uds() {
         use crate::test_support::{FakeComputeDriver, FakeComputeDriverCall};
 
@@ -9188,7 +9277,7 @@ mod tests {
             .with_driver_name("fake-remote-driver")
             .with_default_image("openshell/sandbox:remote")
             .with_gateway_manages_lifecycle()
-            .with_gateway_listener_requirement(
+            .with_nested_container_wildcard_fallback_listener_requirement(
                 "172.19.0.1:17670",
                 "external driver managed bridge",
             );
@@ -9214,6 +9303,7 @@ mod tests {
                 address: "172.19.0.1:17670".parse().unwrap(),
                 driver_name: "docker".to_string(),
                 reason: "external driver managed bridge".to_string(),
+                allow_nested_container_wildcard_fallback: false,
             }]
         );
 

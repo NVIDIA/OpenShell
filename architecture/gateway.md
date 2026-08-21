@@ -67,7 +67,8 @@ container's non-loopback interfaces, but it does make the sandbox-callable gRPC
 surface reachable on every IPv4 interface in that container namespace for the
 lifetime of the gateway process. Sandbox mTLS/JWT authentication and the RPC
 allowlist remain mandatory defenses. This exception does not apply on a host,
-to Docker or external drivers, to public callback addresses, or to bind errors
+to rootless Podman, an explicit `host_gateway_ip`, Docker or external drivers,
+to public callback addresses, or to bind errors
 other than `EADDRNOTAVAIL`.
 
 The `rpc_auth` classification is also the source of truth for negotiated

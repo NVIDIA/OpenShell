@@ -285,7 +285,10 @@ When both the gateway and rootful Podman run inside another Linux container,
 netavark may not assign the managed bridge gateway until the first sandbox
 joins the network. If that exact private callback address fails to bind with
 `EADDRNOTAVAIL`, the gateway uses one scoped IPv4 wildcard listener for that
-process. Connections addressed to loopback retain primary scope; connections
+process. Only the in-process built-in Podman driver can mark its discovered
+rootful managed-bridge address as eligible; rootless Podman, explicit
+`host_gateway_ip` values, and external drivers cannot activate the fallback.
+Connections addressed to loopback retain primary scope; connections
 addressed to the Podman bridge or any other IPv4 interface are callback-only.
 This exposes the sandbox-callable gRPC surface on every IPv4 interface in the
 outer container namespace, so deployments should still restrict that namespace

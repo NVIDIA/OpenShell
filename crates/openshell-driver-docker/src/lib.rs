@@ -1529,6 +1529,7 @@ impl ComputeDriver for DockerComputeDriver {
                             DockerGatewayRoute::HostGateway => "docker host-gateway IPv4 loopback",
                         }
                         .to_string(),
+                        allow_nested_container_wildcard_fallback: false,
                         selector: Some(Selector::ExactBindAddress(bind_address.to_string())),
                     }]
                 });

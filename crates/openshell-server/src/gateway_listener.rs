@@ -30,6 +30,7 @@ pub struct GatewayListenerSpec {
     pub scope: GatewayListenerScope,
     covered_addresses: Vec<CoveredGatewayAddress>,
     provenance: Option<GatewayListenerProvenance>,
+    allows_nested_container_wildcard_fallback: bool,
 }
 
 /// Diagnostic source of a driver-requested listener.
@@ -52,6 +53,7 @@ impl GatewayListenerSpec {
             scope,
             covered_addresses: Vec::new(),
             provenance: None,
+            allows_nested_container_wildcard_fallback: false,
         }
     }
 
@@ -180,6 +182,13 @@ fn callback_listener_spec(
     address: SocketAddr,
     requirement: &GatewayListenerRequirement,
 ) -> GatewayListenerSpec {
+    let allows_nested_container_wildcard_fallback = matches!(
+        requirement,
+        GatewayListenerRequirement::Exact {
+            allow_nested_container_wildcard_fallback: true,
+            ..
+        }
+    );
     GatewayListenerSpec {
         address,
         scope: GatewayListenerScope::ComputeDriverCallback,
@@ -188,6 +197,7 @@ fn callback_listener_spec(
             driver_name: requirement.driver_name().to_string(),
             reason: requirement.reason().to_string(),
         }),
+        allows_nested_container_wildcard_fallback,
     }
 }
 
@@ -377,6 +387,7 @@ fn nested_podman_wildcard_fallback_spec(
         || !callback_ip.is_private()
         || primary.address.port() == 0
         || primary.address.port() != callback.address.port()
+        || !callback.allows_nested_container_wildcard_fallback
         || callback_provenance.driver_name != "podman"
     {
         return None;
@@ -392,6 +403,7 @@ fn nested_podman_wildcard_fallback_spec(
             scope: GatewayListenerScope::Primary,
         }],
         provenance: Some(callback_provenance.clone()),
+        allows_nested_container_wildcard_fallback: true,
     })
 }
 
@@ -533,6 +545,7 @@ mod tests {
                     scope: GatewayListenerScope::Primary,
                     covered_addresses: Vec::new(),
                     provenance: None,
+                    allows_nested_container_wildcard_fallback: false,
                 },
                 GatewayListenerSpec {
                     address: docker,
@@ -542,6 +555,7 @@ mod tests {
                         driver_name: "docker".to_string(),
                         reason: "managed bridge".to_string(),
                     }),
+                    allows_nested_container_wildcard_fallback: false,
                 },
             ]
         );
@@ -554,6 +568,7 @@ mod tests {
             address: "172.18.0.1:8080".parse().unwrap(),
             driver_name: "external-test".to_string(),
             reason: "external bridge".to_string(),
+            allow_nested_container_wildcard_fallback: false,
         };
 
         let specs = gateway_listener_specs(primary, &[requirement]).unwrap();
@@ -788,6 +803,25 @@ mod tests {
             .is_none(),
             "the fallback must remain specific to Podman"
         );
+
+        let untrusted_podman_requirement = GatewayListenerRequirement::Exact {
+            address: podman_gateway,
+            driver_name: "podman".to_string(),
+            reason: "external or rootless Podman address".to_string(),
+            allow_nested_container_wildcard_fallback: false,
+        };
+        let untrusted_podman_specs =
+            gateway_listener_specs(primary, &[untrusted_podman_requirement]).unwrap();
+        assert!(
+            nested_podman_wildcard_fallback_spec(
+                &untrusted_podman_specs,
+                &untrusted_podman_specs[1],
+                ErrorKind::AddrNotAvailable,
+                true,
+            )
+            .is_none(),
+            "the trusted rootful managed-bridge marker is required"
+        );
     }
 
     #[test]
@@ -865,6 +899,7 @@ mod tests {
             address,
             driver_name: "docker".to_string(),
             reason: "managed bridge".to_string(),
+            allow_nested_container_wildcard_fallback: false,
         }
     }
 
@@ -873,6 +908,7 @@ mod tests {
             address,
             driver_name: "podman".to_string(),
             reason: "Podman managed bridge".to_string(),
+            allow_nested_container_wildcard_fallback: true,
         }
     }
 
@@ -896,6 +932,7 @@ mod tests {
             scope: GatewayListenerScope::Primary,
             covered_addresses: Vec::new(),
             provenance: None,
+            allows_nested_container_wildcard_fallback: false,
         }
     }
 
@@ -912,6 +949,7 @@ mod tests {
                 driver_name: driver_name.to_string(),
                 reason: reason.to_string(),
             }),
+            allows_nested_container_wildcard_fallback: reason == "Podman managed bridge",
         }
     }
 }

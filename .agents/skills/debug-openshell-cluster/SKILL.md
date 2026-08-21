@@ -240,8 +240,10 @@ Common findings:
   startup logs for the additional callback-only listener and its provenance.
 - In a nested Linux container with rootful Podman, a missing bridge address can
   trigger `listener_purpose="nested-podman-callback-fallback"`. Confirm the
-  failed exact address is private, the bind error is `EADDRNOTAVAIL`, and the
-  wildcard socket is callback-only off loopback. The callback RPC surface is
+  failed exact address is the built-in driver's discovered managed bridge (not
+  rootless Podman, an explicit `host_gateway_ip`, or an external driver), the
+  bind error is `EADDRNOTAVAIL`, and the wildcard socket is callback-only off
+  loopback. The callback RPC surface is
   reachable on every IPv4 interface in the outer container namespace for that
   gateway process, so also inspect the surrounding container-network boundary.
 - Rootless slirp4netns, another named helper, or missing helper metadata

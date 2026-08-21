@@ -1399,6 +1399,7 @@ impl ComputeDriverBuildContext<'_> {
             self.driver_name,
             driver,
             None,
+            compute::GatewayListenerFallbackPolicy::Deny,
             self.store,
             self.sandbox_index,
             self.sandbox_watch_bus,
@@ -2553,6 +2554,7 @@ operator_namespace_label = "openshell.ai/workspace=true"
             address,
             driver_name: "docker".to_string(),
             reason: "managed bridge".to_string(),
+            allow_nested_container_wildcard_fallback: false,
         }
     }
 }
