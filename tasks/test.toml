@@ -116,6 +116,12 @@ run = [
   "CONTAINER_RUNTIME=podman e2e/with-keycloak.sh env OPENSHELL_E2E_OIDC_GATEWAY=1 e2e/with-podman-gateway.sh cargo test --manifest-path e2e/rust/Cargo.toml --features e2e-oidc-pkce --test oidc_pkce",
 ]
 
+["e2e:provider-refresh-keycloak"]
+description = "Run provider refresh recovery e2e against Keycloak and a Podman gateway"
+run = [
+  "CONTAINER_RUNTIME=podman e2e/with-keycloak.sh e2e/with-podman-gateway.sh cargo test --manifest-path e2e/rust/Cargo.toml --features e2e-provider-refresh-keycloak --test provider_refresh_keycloak -- --nocapture",
+]
+
 ["e2e:oidc-pkce:docker"]
 description = "Run Linux browser PKCE and RBAC e2e tests against Keycloak and a Docker gateway"
 run = [
