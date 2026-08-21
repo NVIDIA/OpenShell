@@ -59,6 +59,11 @@ path = "tests/custom_image.rs"
 required-features = ["e2e-docker"]
 
 [[test]]
+name = "rootfs_tar"
+path = "tests/rootfs_tar.rs"
+required-features = ["e2e-vm"]
+
+[[test]]
 name = "docker_preflight"
 path = "tests/docker_preflight.rs"
 required-features = ["e2e-docker"]
