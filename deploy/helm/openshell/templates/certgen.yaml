@@ -124,6 +124,9 @@ spec:
             {{- if .Values.certManager.enabled }}
             - --backend-ca-source-secret={{ .Values.server.tls.certSecretName }}
             - --backend-ca-poll-timeout-seconds={{ sub .Values.pkiInitJob.timeoutSeconds 30 }}
+            {{- if .Values.pkiInitJob.failOnTimeout }}
+            - --backend-ca-fail-on-timeout
+            {{- end }}
             {{- end }}
             {{- end }}
 {{- end }}

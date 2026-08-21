@@ -98,6 +98,13 @@ pub struct CertgenArgs {
     /// (Job activeDeadlineSeconds - 30) to leave margin for `ConfigMap` creation.
     #[arg(long, value_name = "SECONDS", default_value = "90")]
     backend_ca_poll_timeout_seconds: u64,
+
+    /// Fail with an error if the backend CA source `Secret` is not found within
+    /// the polling timeout. When false (default), the hook succeeds with a warning
+    /// and the `ConfigMap` is not created. The Helm chart sets this based on
+    /// pkiInitJob.failOnTimeout.
+    #[arg(long)]
+    backend_ca_fail_on_timeout: bool,
 }
 
 pub async fn run(args: CertgenArgs) -> Result<()> {
@@ -371,13 +378,22 @@ async fn create_backend_ca_configmap_if_needed(
             {
                 Some(secret) => break secret,
                 None if start.elapsed() >= poll_timeout => {
+                    let msg = format!(
+                        "Backend CA source secret {source_secret} not found after {timeout_secs}s; \
+                         ConfigMap {configmap_name} not created. This is expected if cert-manager \
+                         is still issuing the certificate.",
+                        timeout_secs = poll_timeout.as_secs()
+                    );
+                    if args.backend_ca_fail_on_timeout {
+                        return Err(miette::miette!(
+                            "{msg} Install failed due to --backend-ca-fail-on-timeout."
+                        ));
+                    }
                     warn!(
                         secret = %source_secret,
                         configmap = %configmap_name,
                         timeout_secs = poll_timeout.as_secs(),
-                        "Backend CA source secret not found after polling; ConfigMap not created. \
-                         This is expected if cert-manager is still issuing the certificate. \
-                         Run helm upgrade after the TLS secret exists or the BackendTLSPolicy \
+                        "{msg} Run helm upgrade after the TLS secret exists or the BackendTLSPolicy \
                          will remain non-functional until the ConfigMap is created manually."
                     );
                     return Ok(());
