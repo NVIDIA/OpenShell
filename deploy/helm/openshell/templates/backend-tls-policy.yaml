@@ -5,6 +5,9 @@
 {{- if .Values.server.disableTls }}
 {{- fail "grpcRoute.backendTLSPolicy requires the gateway pod to serve TLS; set server.disableTls=false" }}
 {{- end }}
+{{- if .Values.server.tls.enableMtls }}
+{{- fail "grpcRoute.backendTLSPolicy requires mTLS to be disabled because the Gateway proxy cannot present client certificates to the backend; set server.tls.enableMtls=false" }}
+{{- end }}
 apiVersion: gateway.networking.k8s.io/v1
 kind: BackendTLSPolicy
 metadata:
