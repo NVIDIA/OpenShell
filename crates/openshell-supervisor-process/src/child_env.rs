@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::Path;
 
 const LOCAL_NO_PROXY: &str = "127.0.0.1,localhost,::1";
@@ -10,6 +10,12 @@ const STANDARD_SBIN_PATHS: &[&str] = &["/usr/local/sbin", "/usr/sbin", "/sbin"];
 const ENSURE_STANDARD_SBIN_PATHS_SCRIPT: &str = "for dir in /usr/local/sbin /usr/sbin /sbin; do case \":${PATH:-}:\" in *:\"$dir\":*) ;; *) PATH=\"${PATH:+$PATH:}$dir\" ;; esac; done; export PATH";
 const STARTUP_SNIPPET_MARKER: &str = "# OpenShell standard sbin PATH";
 const PROFILE_D_SNIPPET_PATH: &str = "/etc/profile.d/openshell-standard-sbin-path.sh";
+
+enum StartupFile {
+    Missing,
+    Regular(String),
+    Unsafe,
+}
 
 pub fn child_path_from_env() -> String {
     std::env::var("PATH")
@@ -71,32 +77,156 @@ fn startup_snippet() -> String {
 }
 
 fn write_profile_snippet(path: &Path) -> std::io::Result<()> {
-    let snippet = startup_snippet();
-    if std::fs::read_to_string(path).is_ok_and(|content| content == snippet) {
-        return Ok(());
-    }
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+        ensure_directory_without_symlink(parent)?;
     }
-    std::fs::write(path, snippet)
+
+    let snippet = startup_snippet();
+    match read_startup_file(path)? {
+        StartupFile::Regular(content) if content == snippet => return Ok(()),
+        StartupFile::Regular(_) | StartupFile::Missing => {}
+        StartupFile::Unsafe => return Ok(()),
+    }
+    write_startup_file(path, &snippet)
 }
 
 fn append_startup_snippet(path: &Path) -> std::io::Result<()> {
-    let existing = match std::fs::read_to_string(path) {
-        Ok(content) => content,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error),
+    if let Some(parent) = path.parent()
+        && !existing_directory_without_symlink(parent)?
+    {
+        return Ok(());
+    }
+
+    let existing = match read_startup_file(path)? {
+        StartupFile::Regular(content) => content,
+        StartupFile::Missing | StartupFile::Unsafe => return Ok(()),
     };
     if existing.contains(STARTUP_SNIPPET_MARKER) {
         return Ok(());
     }
 
     let snippet = startup_snippet();
-    let mut file = std::fs::OpenOptions::new().append(true).open(path)?;
+    let mut file = open_startup_file_for_append(path)?;
     if !existing.is_empty() && !existing.ends_with('\n') {
         file.write_all(b"\n")?;
     }
     file.write_all(snippet.as_bytes())
+}
+
+fn read_startup_file(path: &Path) -> std::io::Result<StartupFile> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(StartupFile::Missing);
+        }
+        Err(error) => return Err(error),
+    };
+    let file_type = metadata.file_type();
+    if file_type.is_symlink() || !file_type.is_file() {
+        tracing::debug!(
+            path = %path.display(),
+            "skipping OpenShell PATH startup repair for non-regular file"
+        );
+        return Ok(StartupFile::Unsafe);
+    }
+
+    let mut content = String::new();
+    open_startup_file_for_read(path)?.read_to_string(&mut content)?;
+    Ok(StartupFile::Regular(content))
+}
+
+fn ensure_directory_without_symlink(path: &Path) -> std::io::Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(std::io::Error::other(format!(
+            "directory '{}' is a symlink",
+            path.display()
+        ))),
+        Ok(metadata) if metadata.is_dir() => Ok(()),
+        Ok(_) => Err(std::io::Error::other(format!(
+            "'{}' is not a directory",
+            path.display()
+        ))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            if let Some(parent) = path.parent() {
+                ensure_directory_without_symlink(parent)?;
+            }
+            std::fs::create_dir(path)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn existing_directory_without_symlink(path: &Path) -> std::io::Result<bool> {
+    if let Some(parent) = path.parent()
+        && parent != path
+        && !parent.as_os_str().is_empty()
+        && !existing_directory_without_symlink(parent)?
+    {
+        return Ok(false);
+    }
+
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            tracing::debug!(
+                path = %path.display(),
+                "skipping OpenShell PATH startup repair through symlink directory"
+            );
+            Ok(false)
+        }
+        Ok(metadata) if metadata.is_dir() => Ok(true),
+        Ok(_) => {
+            tracing::debug!(
+                path = %path.display(),
+                "skipping OpenShell PATH startup repair through non-directory path"
+            );
+            Ok(false)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+fn write_startup_file(path: &Path, content: &str) -> std::io::Result<()> {
+    let mut file = no_follow_options()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(path)?;
+    ensure_opened_file_is_regular(&file, path)?;
+    file.write_all(content.as_bytes())
+}
+
+fn open_startup_file_for_read(path: &Path) -> std::io::Result<std::fs::File> {
+    let file = no_follow_options().read(true).open(path)?;
+    ensure_opened_file_is_regular(&file, path)?;
+    Ok(file)
+}
+
+fn open_startup_file_for_append(path: &Path) -> std::io::Result<std::fs::File> {
+    let file = no_follow_options().append(true).open(path)?;
+    ensure_opened_file_is_regular(&file, path)?;
+    Ok(file)
+}
+
+fn ensure_opened_file_is_regular(file: &std::fs::File, path: &Path) -> std::io::Result<()> {
+    let metadata = file.metadata()?;
+    if metadata.is_file() {
+        return Ok(());
+    }
+    Err(std::io::Error::other(format!(
+        "'{}' is not a regular file",
+        path.display()
+    )))
+}
+
+fn no_follow_options() -> std::fs::OpenOptions {
+    let mut options = std::fs::OpenOptions::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    options
 }
 
 pub fn proxy_env_vars(proxy_url: &str) -> [(&'static str, String); 9] {
@@ -209,6 +339,96 @@ mod tests {
         assert_eq!(profile.matches(STARTUP_SNIPPET_MARKER).count(), 1);
         assert_eq!(bashrc.matches(STARTUP_SNIPPET_MARKER).count(), 1);
         assert!(bashrc.contains("export PATH=\"/sandbox/.venv/bin:/usr/local/bin:/usr/bin:/bin\""));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn profile_snippet_skips_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let target = dir.path().join("target");
+        std::fs::write(&target, "keep me").expect("write target");
+        let profile_path = dir.path().join("openshell-path.sh");
+        symlink(&target, &profile_path).expect("symlink profile");
+
+        write_profile_snippet(&profile_path).expect("skip symlink profile");
+
+        assert_eq!(
+            std::fs::read_to_string(&target).expect("read target"),
+            "keep me"
+        );
+        assert!(
+            std::fs::symlink_metadata(&profile_path)
+                .expect("profile metadata")
+                .file_type()
+                .is_symlink()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn profile_snippet_rejects_symlink_parent() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let target_dir = dir.path().join("target-dir");
+        std::fs::create_dir(&target_dir).expect("target dir");
+        let parent = dir.path().join("profile.d");
+        symlink(&target_dir, &parent).expect("symlink parent");
+        let profile_path = parent.join("openshell-path.sh");
+
+        let error = write_profile_snippet(&profile_path).expect_err("reject symlink parent");
+
+        assert!(error.to_string().contains("symlink"));
+        assert!(!target_dir.join("openshell-path.sh").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bashrc_snippet_skips_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let target = dir.path().join("target");
+        std::fs::write(&target, "keep me").expect("write target");
+        let bashrc_path = dir.path().join(".bashrc");
+        symlink(&target, &bashrc_path).expect("symlink bashrc");
+
+        append_startup_snippet(&bashrc_path).expect("skip symlink bashrc");
+
+        assert_eq!(
+            std::fs::read_to_string(&target).expect("read target"),
+            "keep me"
+        );
+        assert!(
+            std::fs::symlink_metadata(&bashrc_path)
+                .expect("bashrc metadata")
+                .file_type()
+                .is_symlink()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bashrc_snippet_skips_symlink_parent() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let target_dir = dir.path().join("target-dir");
+        std::fs::create_dir(&target_dir).expect("target dir");
+        std::fs::write(
+            target_dir.join(".bashrc"),
+            "export PATH=\"/sandbox/.venv/bin:/usr/local/bin:/usr/bin:/bin\"\n",
+        )
+        .expect("target bashrc");
+        let home = dir.path().join("home");
+        symlink(&target_dir, &home).expect("symlink home");
+
+        append_startup_snippet(&home.join(".bashrc")).expect("skip symlink home");
+
+        let bashrc = std::fs::read_to_string(target_dir.join(".bashrc")).expect("read target");
+        assert!(!bashrc.contains(STARTUP_SNIPPET_MARKER));
     }
 
     #[test]
