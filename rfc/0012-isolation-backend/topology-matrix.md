@@ -6,22 +6,20 @@ kernel; it does not select a deployment or establish conformance.
 
 ## Representative placements
 
-| Pattern | Supervisor placement | Backend and network-mediation placement | Workload-kernel relationship | Implementation |
+| Pattern | Logical supervisor and network-mediation placement | Backend placement | Workload-kernel relationship | Topology status |
 |---|---|---|---|---|
-| **Co-located/in-pod** | With the workload | Backend runs in the supervisor process; network mediation is co-located | Trusted components share the workload's host, guest, or application kernel, depending on the runtime | Implemented (original topology) |
-| **Same-pod composite** | With the workload | Backend runs with the supervisor; network mediation may run in a sidecar | Components share the workload's kernel | Implemented (#2076) |
-| **Delegated backend components** | With the workload | A node or remote helper establishes some controls; network mediation may be co-located or delegated | Depends on which trusted components remain with the workload | Proposed |
-| **Driver-hosted/shared service** | With the compute driver or another trusted service | Backend and network mediation may be co-located with the supervisor; one host may operate many isolated boundaries | Depends on the workload runtime | Proposed |
+| **Co-located/in-pod** | With the workload | In the supervisor process | Trusted components share the workload's host, guest, or application kernel, depending on the runtime | Placement implemented (original topology) |
+| **Same-pod composite** | Spans the workload-local supervisor process and, when used, a network-mediation sidecar | In the workload-local supervisor process | Components share the workload's kernel | Placement implemented (#2076) |
+| **Delegated backend components** | With the workload and any delegated mediation component | A node or remote helper establishes some controls behind a workload-local backend | Depends on which trusted components remain with the workload | Placement proposed (#2606) |
+| **Driver-hosted/shared service** | With the compute driver or another trusted service; no in-sandbox supervisor process is required | May be co-located with the logical supervisor; one host may operate many isolated boundaries | Depends on the workload runtime | Placement proposed |
 
 ## Durable rules
 
 - Every active boundary has one verified descriptor, one trusted
-  `SandboxContext`, and one logical supervisor.
+  `SandboxContext`, and at most one logical supervisor, which may span multiple
+  coupled processes.
 - Physical processes and listeners may be shared, but lifecycle state, policy,
   binary identity, enforcement, and cleanup remain isolated per boundary.
-- `Ready` means network mediation is initialized, standing enforcement is
-  confirmed, and launch-time controls will be in force before untrusted
-  execution.
 - Moving a privileged component does not itself provide kernel separation.
 
 ## Kernel relationships
