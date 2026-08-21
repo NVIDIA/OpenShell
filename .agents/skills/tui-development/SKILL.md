@@ -258,7 +258,7 @@ The `Theme` struct has 16 `Style` fields, accessed at runtime via `app.theme`:
 | `border` | EVERGLADE fg | Light sage fg | Unfocused panel borders |
 | `border_focused` | NVIDIA_GREEN fg | NVIDIA_GREEN_DARK fg | Focused panel borders |
 | `status_ok` | NVIDIA_GREEN fg | NVIDIA_GREEN_DARK fg | Healthy, INFO, Ready |
-| `status_warn` | Yellow fg | Dark yellow fg | Degraded, WARN, Provisioning |
+| `status_warn` | Yellow fg | Dark yellow fg | Degraded, WARN, Provisioning, Restarting |
 | `status_err` | Red fg | Dark red fg | Unhealthy, ERROR |
 | `key_hint` | NVIDIA_GREEN fg | NVIDIA_GREEN_DARK fg | Keyboard shortcut labels |
 | `log_cursor` | EVERGLADE bg | Light green bg | Selected log line highlight |
@@ -293,7 +293,7 @@ fn draw_detail_popup(frame: &mut Frame<'_>, data: &MyData, area: Rect, theme: &T
 
 - **Selected row**: Green `▌` left-border marker on the selected row. Active gateway also gets a green `●` dot.
 - **Focused panel**: Border changes from `border` to `border_focused` style.
-- **Status indicators**: Green for healthy/ready/info, yellow for degraded/provisioning/warn, red for unhealthy/error.
+- **Status indicators**: Green for healthy/ready/info, yellow for degraded/provisioning/restarting/warn, red for unhealthy/error.
 - **Separators**: Muted `│` characters between title bar segments and nav bar sections.
 - **Log source labels**: `"sandbox"` source renders in `accent` (green), `"gateway"` in `muted`.
 

@@ -1775,10 +1775,16 @@ def test_sandbox_ref_retains_gateway_labels() -> None:
 def test_sandbox_ref_includes_main_process_result() -> None:
     proto = _make_sandbox_proto("sandbox-1", "job-1")
     proto.status.exit_code = 0
+    proto.status.restart_count = 2
+    proto.status.next_restart_at_ms = 1_700_000_000_000
+    proto.status.main_process_started_at_ms = 1_699_999_000_000
 
     status = _sandbox_ref(proto).status
 
     assert status.exit_code == 0
+    assert status.restart_count == 2
+    assert status.next_restart_at_ms == 1_700_000_000_000
+    assert status.main_process_started_at_ms == 1_699_999_000_000
 
 
 def test_returned_labels_are_immutable() -> None:

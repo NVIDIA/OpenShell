@@ -831,6 +831,9 @@ message SandboxSpec {
   repeated string command = 12;
   // Allocate a retained pseudo-terminal for the main process.
   bool tty = 13;
+  // Gateway-owned policy for replacing the sandbox runtime after the canonical
+  // main process exits. Unspecified is normalized to Never before persistence.
+  SandboxRestartPolicy restart_policy = 14;
 }
 
 message ResourceRequirements {
@@ -897,9 +900,17 @@ message SandboxStatus {
   // Supervisor instance currently associated with the canonical main process.
   // The gateway uses this to reject stale exit reports after a restart.
   string main_process_instance_id = 8;
-  // Normalized main process result. Signal exits use 128 + signal number.
-  // Presence indicates that the main process exited and the sandbox is in Error.
+  // Most recent normalized main process result. Signal exits use 128 + signal
+  // number. Cleared when a replacement main process becomes ready.
   optional int32 exit_code = 9;
+  // Consecutive policy-driven restart number in the current crash loop.
+  uint32 restart_count = 10;
+  // Unix epoch deadline in milliseconds for the next restart-controller
+  // attempt or recovery check. Zero when no automatic restart is pending.
+  int64 next_restart_at_ms = 11;
+  // Unix epoch time in milliseconds when the current main process became
+  // ready. Used to reset restart backoff after a stable run.
+  int64 main_process_started_at_ms = 12;
 }
 
 // User-facing sandbox condition derived from driver-native conditions.
@@ -930,6 +941,7 @@ enum SandboxPhase {
   SANDBOX_PHASE_STOPPING = 6;
   SANDBOX_PHASE_STOPPED = 7;
   SANDBOX_PHASE_STARTING = 8;
+  SANDBOX_PHASE_RESTARTING = 9;
 }
 
 // Public platform event exposed on the sandbox watch stream.
@@ -2687,6 +2699,16 @@ enum WorkspaceRole {
   WORKSPACE_ROLE_UNSPECIFIED = 0;
   WORKSPACE_ROLE_USER = 1;
   WORKSPACE_ROLE_ADMIN = 2;
+}
+
+// Policy applied when the canonical main process exits outside an intentional
+// stop or delete operation. Kept after existing enums so generated enum
+// descriptors remain stable.
+enum SandboxRestartPolicy {
+  SANDBOX_RESTART_POLICY_UNSPECIFIED = 0;
+  SANDBOX_RESTART_POLICY_NEVER = 1;
+  SANDBOX_RESTART_POLICY_ON_FAILURE = 2;
+  SANDBOX_RESTART_POLICY_ALWAYS = 3;
 }
 
 // Workspace membership record.
