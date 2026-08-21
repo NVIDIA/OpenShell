@@ -170,7 +170,7 @@ helm upgrade --install openshell \
 
 Note that `server.disableTls` is **not** set — the gateway pod continues to serve TLS — but `server.tls.enableMtls=false` disables mTLS client certificate authentication because the Gateway proxy cannot present a client certificate to the backend. The BackendTLSPolicy hostname defaults to the service FQDN, which matches the SAN on the server certificate. Use OIDC for authentication (configured via `server.oidc.issuer`).
 
-The example above uses the default `pkiInitJob` for TLS, which creates the backend CA ConfigMap immediately. If using cert-manager instead (`--set certManager.enabled=true`), you'll need to run `helm upgrade` a second time after cert-manager issues the server certificate so the certgen hook can create the backend CA ConfigMap from it.
+The example above uses the default `pkiInitJob` for TLS, which creates the backend CA ConfigMap immediately. If using cert-manager instead (`--set certManager.enabled=true`), the certgen hook polls for up to 90 seconds waiting for cert-manager to issue the server certificate, then creates the backend CA ConfigMap from it. This means a single `helm install` is sufficient in most cases. If cert-manager takes longer than 90 seconds, the hook times out gracefully and you'll need to run `helm upgrade` after the certificate is issued to create the backend CA ConfigMap.
 
 For OpenShift 4.22+, see [OpenShift](/kubernetes/openshift#end-to-end-tls-openshift-422) for platform-specific instructions including Gateway and GatewayClass setup.
 
