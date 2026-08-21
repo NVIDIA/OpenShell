@@ -466,8 +466,10 @@ pkiInitJob:
   serverIpAddresses: []
   # -- Maximum time in seconds for the certgen hook Job to run. When using
   # cert-manager with BackendTLSPolicy, the hook polls for the certificate
-  # for (timeoutSeconds - 30) to leave margin for ConfigMap creation. Increase
-  # this if cert-manager takes longer than 90 seconds to issue certificates.
+  # for (timeoutSeconds - 30) seconds, reserving 30 seconds for ConfigMap
+  # creation and cleanup. For example, timeoutSeconds=180 allows 150 seconds
+  # of polling. Increase this if cert-manager takes longer than 90 seconds to
+  # issue certificates.
   timeoutSeconds: 120
   # -- Fail the helm install/upgrade if cert-manager does not issue the
   # certificate within the polling timeout. When true (default), the install
