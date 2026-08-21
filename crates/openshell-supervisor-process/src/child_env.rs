@@ -4,8 +4,10 @@
 use std::io::{Read, Write};
 use std::path::Path;
 
+use openshell_core::policy::SandboxPolicy;
+
 const LOCAL_NO_PROXY: &str = "127.0.0.1,localhost,::1";
-pub const DEFAULT_CHILD_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+pub const DEFAULT_CHILD_PATH: &str = "/usr/local/bin:/usr/bin:/bin";
 const STANDARD_SBIN_PATHS: &[&str] = &["/usr/local/sbin", "/usr/sbin", "/sbin"];
 const ENSURE_STANDARD_SBIN_PATHS_SCRIPT: &str = "for dir in /usr/local/sbin /usr/sbin /sbin; do case \":${PATH:-}:\" in *:\"$dir\":*) ;; *) PATH=\"${PATH:+$PATH:}$dir\" ;; esac; done; export PATH";
 const STARTUP_SNIPPET_MARKER: &str = "# OpenShell standard sbin PATH";
@@ -17,14 +19,45 @@ enum StartupFile {
     Unsafe,
 }
 
-pub fn child_path_from_env() -> String {
-    std::env::var("PATH")
+pub fn standard_sbin_path_repair_enabled(policy: &SandboxPolicy) -> bool {
+    let cdi_context = std::env::var(openshell_core::sandbox_env::CDI_CONTEXT);
+    standard_sbin_path_repair_enabled_for_context(policy, cdi_context.as_deref().ok())
+}
+
+fn standard_sbin_path_repair_enabled_for_context(
+    policy: &SandboxPolicy,
+    cdi_context: Option<&str>,
+) -> bool {
+    cdi_context
+        .map(str::trim)
+        .is_some_and(|path| path == openshell_core::cdi::CDI_CONTEXT_PATH)
+        && policy_has_standard_sbin_path(policy)
+}
+
+fn policy_has_standard_sbin_path(policy: &SandboxPolicy) -> bool {
+    policy
+        .filesystem
+        .read_only
+        .iter()
+        .chain(policy.filesystem.read_write.iter())
+        .any(|path| STANDARD_SBIN_PATHS.iter().any(|dir| path.starts_with(dir)))
+}
+
+pub fn child_path_from_env(repair_standard_sbin: bool) -> String {
+    let path = std::env::var("PATH")
         .ok()
         .filter(|path| !path.trim().is_empty())
-        .map_or_else(
-            || DEFAULT_CHILD_PATH.to_string(),
-            |path| path_with_standard_sbin_paths(&path),
-        )
+        .unwrap_or_else(|| DEFAULT_CHILD_PATH.to_string());
+
+    maybe_path_with_standard_sbin_paths(&path, repair_standard_sbin)
+}
+
+pub fn maybe_path_with_standard_sbin_paths(path: &str, repair_standard_sbin: bool) -> String {
+    if repair_standard_sbin {
+        path_with_standard_sbin_paths(path)
+    } else {
+        path.to_string()
+    }
 }
 
 pub fn path_with_standard_sbin_paths(path: &str) -> String {
@@ -48,6 +81,17 @@ pub fn path_with_standard_sbin_paths(path: &str) -> String {
 
 pub fn shell_command_with_standard_sbin_paths(command: &str) -> String {
     format!("{ENSURE_STANDARD_SBIN_PATHS_SCRIPT}\n{command}")
+}
+
+pub fn maybe_shell_command_with_standard_sbin_paths(
+    command: &str,
+    repair_standard_sbin: bool,
+) -> String {
+    if repair_standard_sbin {
+        shell_command_with_standard_sbin_paths(command)
+    } else {
+        command.to_string()
+    }
 }
 
 pub fn install_standard_sbin_path_startup_files(home: Option<&str>) {
@@ -271,7 +315,10 @@ mod tests {
 
     #[test]
     fn path_with_standard_sbin_paths_uses_default_for_empty_path() {
-        assert_eq!(path_with_standard_sbin_paths(""), DEFAULT_CHILD_PATH);
+        assert_eq!(
+            path_with_standard_sbin_paths(""),
+            "/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin"
+        );
     }
 
     #[test]
@@ -284,10 +331,88 @@ mod tests {
 
     #[test]
     fn path_with_standard_sbin_paths_is_idempotent() {
+        let path = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+        assert_eq!(path_with_standard_sbin_paths(path), path);
+    }
+
+    #[test]
+    fn maybe_path_with_standard_sbin_paths_respects_gate() {
+        let path = "/sandbox/.venv/bin:/usr/local/bin:/usr/bin:/bin";
+
+        assert_eq!(maybe_path_with_standard_sbin_paths(path, false), path);
         assert_eq!(
-            path_with_standard_sbin_paths(DEFAULT_CHILD_PATH),
-            DEFAULT_CHILD_PATH
+            maybe_path_with_standard_sbin_paths(path, true),
+            "/sandbox/.venv/bin:/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin"
         );
+    }
+
+    #[test]
+    fn maybe_shell_command_with_standard_sbin_paths_respects_gate() {
+        assert_eq!(
+            maybe_shell_command_with_standard_sbin_paths("nvidia-smi -L", false),
+            "nvidia-smi -L"
+        );
+        assert!(
+            maybe_shell_command_with_standard_sbin_paths("nvidia-smi -L", true)
+                .contains("/usr/sbin")
+        );
+    }
+
+    #[test]
+    fn standard_sbin_repair_requires_expected_cdi_context_and_policy_path() {
+        let policy = policy_with_read_only(["/usr/sbin/nvidia-smi"]);
+
+        assert!(standard_sbin_path_repair_enabled_for_context(
+            &policy,
+            Some(openshell_core::cdi::CDI_CONTEXT_PATH)
+        ));
+        assert!(!standard_sbin_path_repair_enabled_for_context(
+            &policy,
+            Some("/tmp/cdi-context.json")
+        ));
+        assert!(!standard_sbin_path_repair_enabled_for_context(
+            &policy, None
+        ));
+    }
+
+    #[test]
+    fn standard_sbin_repair_requires_standard_sbin_policy_path() {
+        let policy = policy_with_read_only(["/usr/local/bin/nvidia-smi"]);
+
+        assert!(!standard_sbin_path_repair_enabled_for_context(
+            &policy,
+            Some(openshell_core::cdi::CDI_CONTEXT_PATH)
+        ));
+    }
+
+    #[test]
+    fn standard_sbin_repair_accepts_read_write_standard_sbin_policy_path() {
+        let mut policy = policy_with_read_only(std::iter::empty::<&str>());
+        policy
+            .filesystem
+            .read_write
+            .push("/sbin/vendor-tool".into());
+
+        assert!(standard_sbin_path_repair_enabled_for_context(
+            &policy,
+            Some(openshell_core::cdi::CDI_CONTEXT_PATH)
+        ));
+    }
+
+    fn policy_with_read_only(
+        paths: impl IntoIterator<Item = impl Into<std::path::PathBuf>>,
+    ) -> SandboxPolicy {
+        SandboxPolicy {
+            version: 1,
+            filesystem: openshell_core::policy::FilesystemPolicy {
+                read_only: paths.into_iter().map(Into::into).collect(),
+                read_write: Vec::new(),
+                include_workdir: false,
+            },
+            network: openshell_core::policy::NetworkPolicy::default(),
+            landlock: openshell_core::policy::LandlockPolicy::default(),
+            process: openshell_core::policy::ProcessPolicy::default(),
+        }
     }
 
     #[test]
