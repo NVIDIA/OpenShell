@@ -1766,7 +1766,7 @@ impl KubernetesComputeDriver {
     }
 
     pub async fn stop_sandbox(&self, sandbox_id: &str) -> Result<(), KubernetesDriverError> {
-        let (agent_sandbox_api, kube_name, pod_name, namespace, stop_timeout) = self
+        let (agent_sandbox_api, kube_name, sandbox_name, pod_name, namespace, stop_timeout) = self
             .patch_sandbox_operating_state(sandbox_id, false)
             .await?;
         let stopped = self
@@ -1780,8 +1780,10 @@ impl KubernetesComputeDriver {
             .await;
         // Scale the paired supervisor down only once the workload has actually
         // stopped, so a graceful shutdown that needs egress still has it.
-        if stopped.is_ok() {
-            self.scale_proxy_pod_supervisor(&kube_name, &namespace, 0)
+        if stopped.is_ok()
+            && let Some(sandbox_name) = sandbox_name.as_deref()
+        {
+            self.scale_proxy_pod_supervisor(sandbox_name, &namespace, 0)
                 .await;
         }
         stopped
@@ -1847,10 +1849,12 @@ impl KubernetesComputeDriver {
     }
 
     pub async fn start_sandbox(&self, sandbox_id: &str) -> Result<(), KubernetesDriverError> {
-        let (_api, kube_name, _pod_name, namespace, _timeout) =
+        let (_api, _kube_name, sandbox_name, _pod_name, namespace, _timeout) =
             self.patch_sandbox_operating_state(sandbox_id, true).await?;
-        self.scale_proxy_pod_supervisor(&kube_name, &namespace, 1)
-            .await;
+        if let Some(sandbox_name) = sandbox_name.as_deref() {
+            self.scale_proxy_pod_supervisor(sandbox_name, &namespace, 1)
+                .await;
+        }
         Ok(())
     }
 
@@ -1858,7 +1862,17 @@ impl KubernetesComputeDriver {
         &self,
         sandbox_id: &str,
         running: bool,
-    ) -> Result<(AgentSandboxApi, String, String, String, Duration), KubernetesDriverError> {
+    ) -> Result<
+        (
+            AgentSandboxApi,
+            String,
+            Option<String>,
+            String,
+            String,
+            Duration,
+        ),
+        KubernetesDriverError,
+    > {
         let lookup_api = self
             .supported_sandbox_api_for_lookup(self.client.clone())
             .await
@@ -1883,6 +1897,9 @@ impl KubernetesComputeDriver {
             .into_iter()
             .next()
             .ok_or(KubernetesDriverError::NotFound)?;
+        // Proxy-pod companion resources are named from the sandbox name, which
+        // is not the CR name.
+        let sandbox_name = annotation_or_label(&object, LABEL_SANDBOX_NAME);
         let namespace = object
             .metadata
             .namespace
@@ -1936,6 +1953,7 @@ impl KubernetesComputeDriver {
         Ok((
             agent_sandbox_api,
             kube_name,
+            sandbox_name,
             pod_name,
             namespace,
             stop_timeout,
@@ -1954,64 +1972,72 @@ impl KubernetesComputeDriver {
             .await?;
         let selector = self.sandbox_lookup_selector(sandbox_id);
         let lp = ListParams::default().labels(&selector);
-        let (kube_name, obj_namespace, _workspace, preconditions) = match tokio::time::timeout(
-            KUBE_API_TIMEOUT,
-            lookup_api.api.list(&lp),
-        )
-        .await
-        {
-            Ok(Ok(list)) => {
-                if let Some(obj) = list.items.into_iter().next() {
-                    match obj.metadata.name {
-                        Some(name) => {
-                            let ns = obj
-                                .metadata
-                                .namespace
-                                .clone()
-                                .unwrap_or_else(|| self.config.namespace.clone());
-                            let ws = obj
-                                .metadata
-                                .labels
-                                .as_ref()
-                                .and_then(|l| l.get(LABEL_SANDBOX_WORKSPACE).cloned())
-                                .unwrap_or_default();
-                            let pc = Preconditions {
-                                uid: obj.metadata.uid,
-                                resource_version: obj.metadata.resource_version,
-                            };
-                            (name, ns, ws, pc)
+        let (kube_name, sandbox_name, obj_namespace, _workspace, preconditions) =
+            match tokio::time::timeout(KUBE_API_TIMEOUT, lookup_api.api.list(&lp)).await {
+                Ok(Ok(list)) => {
+                    if let Some(obj) = list.items.into_iter().next() {
+                        // Per-sandbox proxy-pod resources are named from the
+                        // sandbox name, not the CR name. They differ: a CR is
+                        // `<workspace>--<sandbox>`.
+                        let sandbox_name = annotation_or_label(&obj, LABEL_SANDBOX_NAME);
+                        match obj.metadata.name {
+                            Some(name) => {
+                                let ns = obj
+                                    .metadata
+                                    .namespace
+                                    .clone()
+                                    .unwrap_or_else(|| self.config.namespace.clone());
+                                let ws = obj
+                                    .metadata
+                                    .labels
+                                    .as_ref()
+                                    .and_then(|l| l.get(LABEL_SANDBOX_WORKSPACE).cloned())
+                                    .unwrap_or_default();
+                                let pc = Preconditions {
+                                    uid: obj.metadata.uid,
+                                    resource_version: obj.metadata.resource_version,
+                                };
+                                (name, sandbox_name, ns, ws, pc)
+                            }
+                            None => return Ok(false),
                         }
-                        None => return Ok(false),
+                    } else {
+                        debug!(sandbox_id = %sandbox_id, "Sandbox not found in Kubernetes (already deleted)");
+                        return Ok(false);
                     }
-                } else {
-                    debug!(sandbox_id = %sandbox_id, "Sandbox not found in Kubernetes (already deleted)");
-                    return Ok(false);
                 }
-            }
-            Ok(Err(err)) => {
-                warn!(
-                    sandbox_id = %sandbox_id,
-                    error = %err,
-                    "Failed to list sandbox for deletion from Kubernetes"
-                );
-                return Err(err.to_string());
-            }
-            Err(_elapsed) => {
-                warn!(
-                    sandbox_id = %sandbox_id,
-                    timeout_secs = KUBE_API_TIMEOUT.as_secs(),
-                    "Timed out listing sandbox for deletion from Kubernetes"
-                );
-                return Err(format!(
-                    "timed out after {}s waiting for Kubernetes API",
-                    KUBE_API_TIMEOUT.as_secs()
-                ));
-            }
-        };
+                Ok(Err(err)) => {
+                    warn!(
+                        sandbox_id = %sandbox_id,
+                        error = %err,
+                        "Failed to list sandbox for deletion from Kubernetes"
+                    );
+                    return Err(err.to_string());
+                }
+                Err(_elapsed) => {
+                    warn!(
+                        sandbox_id = %sandbox_id,
+                        timeout_secs = KUBE_API_TIMEOUT.as_secs(),
+                        "Timed out listing sandbox for deletion from Kubernetes"
+                    );
+                    return Err(format!(
+                        "timed out after {}s waiting for Kubernetes API",
+                        KUBE_API_TIMEOUT.as_secs()
+                    ));
+                }
+            };
 
         if self.config.topology == SupervisorTopology::ProxyPod {
-            self.cleanup_proxy_pod_resources(&kube_name, &obj_namespace)
-                .await;
+            if let Some(sandbox_name) = sandbox_name.as_deref() {
+                self.cleanup_proxy_pod_resources(sandbox_name, &obj_namespace)
+                    .await;
+            } else {
+                warn!(
+                    sandbox_id = %sandbox_id,
+                    kube_name = %kube_name,
+                    "Sandbox CR has no sandbox-name label; leaving proxy-pod resources to owner-reference GC"
+                );
+            }
         }
 
         let delete_api = self
@@ -7848,6 +7874,28 @@ mod tests {
         let err =
             validate_agent_command_for_topology(&config, SupervisorTopology::Combined).unwrap_err();
         assert!(err.contains("proxy-pod"), "{err}");
+    }
+
+    /// Per-sandbox proxy-pod resources are named from the sandbox name, not
+    /// the Sandbox CR name -- the CR is `<workspace>--<sandbox>`. Deriving them
+    /// from the CR name silently targets objects that do not exist, which
+    /// owner-reference GC then masks on delete but not on stop/start.
+    #[test]
+    fn proxy_pod_resource_names_come_from_the_sandbox_name_not_the_cr_name() {
+        let from_sandbox_name = proxy_pod_resource_names("rdy");
+        let from_cr_name = proxy_pod_resource_names("default--rdy");
+
+        assert_ne!(
+            from_sandbox_name.supervisor_deployment,
+            from_cr_name.supervisor_deployment
+        );
+        assert!(
+            from_sandbox_name
+                .supervisor_deployment
+                .starts_with("os-sup-rdy-"),
+            "{}",
+            from_sandbox_name.supervisor_deployment
+        );
     }
 
     #[test]
