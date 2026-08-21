@@ -171,7 +171,11 @@ fn inject_provider_env(cmd: &mut Command, provider_env: &HashMap<String, String>
         if is_supervisor_only_env_var(key) {
             continue;
         }
-        cmd.env(key, value);
+        if key == "PATH" {
+            cmd.env(key, child_env::path_with_standard_sbin_paths(value));
+        } else {
+            cmd.env(key, value);
+        }
     }
 }
 
@@ -2787,6 +2791,29 @@ mod tests {
         let output = cmd.output().await.expect("spawn env");
         let stdout = String::from_utf8(output.stdout).expect("utf8");
         assert!(stdout.contains("ANTHROPIC_API_KEY=openshell:resolve:env:ANTHROPIC_API_KEY"));
+    }
+
+    #[tokio::test]
+    async fn inject_provider_env_appends_standard_sbin_to_path() {
+        let mut cmd = Command::new("/usr/bin/env");
+        cmd.env_clear()
+            .stdin(StdStdio::null())
+            .stdout(StdStdio::piped())
+            .stderr(StdStdio::null());
+
+        let provider_env = HashMap::from([(
+            "PATH".to_string(),
+            "/sandbox/.venv/bin:/usr/local/bin:/usr/bin:/bin".to_string(),
+        )]);
+
+        inject_provider_env(&mut cmd, &provider_env);
+
+        let output = cmd.output().await.expect("spawn env");
+        assert!(output.status.success());
+        let stdout = String::from_utf8(output.stdout).expect("utf8");
+        assert!(stdout.lines().any(|line| {
+            line == "PATH=/sandbox/.venv/bin:/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin"
+        }));
     }
 
     #[cfg(unix)]
