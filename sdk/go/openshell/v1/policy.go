@@ -24,6 +24,9 @@ type ProcessPolicy = types.ProcessPolicy
 // PolicyChunk represents a single proposed policy change in the draft inbox.
 type PolicyChunk = types.PolicyChunk
 
+// DraftChunkApproval binds a bulk approval to an evaluated proposal.
+type DraftChunkApproval = types.DraftChunkApproval
+
 // DraftPolicy contains the full draft policy state returned by GetDraft.
 type DraftPolicy = types.DraftPolicy
 
@@ -72,6 +75,9 @@ type ApproveAllOption = types.ApproveAllOption
 // WithIncludeSecurityFlagged includes security-flagged chunks in bulk approval.
 var WithIncludeSecurityFlagged = types.WithIncludeSecurityFlagged
 
+// WithDraftApprovals supplies token-bound chunks for bulk approval.
+var WithDraftApprovals = types.WithDraftApprovals
+
 // GetStatusOption configures a GetStatus call.
 type GetStatusOption = types.GetStatusOption
 
@@ -99,7 +105,7 @@ var WithStatusGlobal = types.WithStatusGlobal
 // approvals, and revision history.
 type PolicyInterface interface {
 	GetDraft(ctx context.Context, workspace, sandboxName string, opts ...GetDraftOption) (*DraftPolicy, error)
-	ApproveDraftChunk(ctx context.Context, workspace, sandboxName, chunkID string) (*ApproveResult, error)
+	ApproveDraftChunk(ctx context.Context, workspace, sandboxName, chunkID, reviewToken string) (*ApproveResult, error)
 	RejectDraftChunk(ctx context.Context, workspace, sandboxName, chunkID, reason string) error
 	ApproveAllDraftChunks(ctx context.Context, workspace, sandboxName string, opts ...ApproveAllOption) (*ApproveAllResult, error)
 	ClearDraftChunks(ctx context.Context, workspace, sandboxName string) (*ClearResult, error)

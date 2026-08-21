@@ -3495,6 +3495,10 @@ network_policies:
         close_on_first_message: bool,
         message_received: Option<Arc<tokio::sync::Notify>>,
         release_message: Option<Arc<tokio::sync::Notify>>,
+        // Opt-in capture of the preflight request context's workspace. Kept
+        // separate from `observed` so it does not perturb the session-event
+        // ordering the other tests assert on.
+        preflight_observed: Option<tokio::sync::mpsc::UnboundedSender<String>>,
     }
 
     #[tonic::async_trait]
@@ -3561,11 +3565,20 @@ network_policies:
             let close_on_first_message = self.close_on_first_message;
             let message_received = self.message_received.clone();
             let release_message = self.release_message.clone();
+            let preflight_observed = self.preflight_observed.clone();
             let (responses_tx, responses_rx) = tokio::sync::mpsc::channel(4);
             tokio::spawn(async move {
                 while let Ok(Some(request)) = requests.message().await {
                     let response = match request.event {
-                        Some(web_socket_session_event::Event::Preflight(_)) => {
+                        Some(web_socket_session_event::Event::Preflight(preflight)) => {
+                            if let Some(preflight_observed) = &preflight_observed {
+                                let workspace = preflight
+                                    .context
+                                    .as_ref()
+                                    .map(|context| context.workspace.clone())
+                                    .unwrap_or_default();
+                                let _ = preflight_observed.send(workspace);
+                            }
                             Some(WebSocketSessionEventResult {
                                 result: Some(
                                     web_socket_session_event_result::Result::PreflightDecision(
@@ -3726,6 +3739,8 @@ network_policies:
                     session_id: "session".into(),
                     request_id: "request".into(),
                     sandbox_id: "sandbox".into(),
+                    sandbox_name: "sandbox-name".into(),
+                    workspace: "workspace".into(),
                     scheme: scheme.into(),
                     host: "api.openai.com".into(),
                     port: if scheme == "wss" { 443 } else { 80 },
@@ -3742,6 +3757,80 @@ network_policies:
             shutdown_tx,
             server_task,
         )
+    }
+
+    // Companion to the HTTP-path assertion in openshell-supervisor-middleware:
+    // proves the WebSocket preflight forwards the request context's workspace to
+    // the middleware service.
+    #[tokio::test]
+    async fn websocket_preflight_forwards_workspace_to_middleware() {
+        use openshell_core::proto::SupervisorMiddlewareService;
+        use openshell_supervisor_middleware::{ChainEntry, MiddlewareRegistry, OnError};
+
+        let (preflight_tx, mut preflight_rx) = tokio::sync::mpsc::unbounded_channel();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind WebSocket middleware");
+        let address = listener.local_addr().expect("middleware address");
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let server = tonic::transport::Server::builder()
+            .add_service(SupervisorMiddlewareServer::new(OpenAiWebSocketRedactor {
+                preflight_observed: Some(preflight_tx),
+                ..Default::default()
+            }))
+            .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async {
+                let _ = shutdown_rx.await;
+            });
+        let server_task = tokio::spawn(server);
+        let registry = MiddlewareRegistry::connect_services(
+            Vec::new(),
+            vec![SupervisorMiddlewareService {
+                name: "openai-redactor".into(),
+                grpc_endpoint: format!("http://{address}"),
+                max_payload_bytes: openshell_supervisor_middleware::MAX_MIDDLEWARE_PAYLOAD_BYTES
+                    as u64,
+                timeout: "2s".into(),
+                tls_ca_cert_pem: Vec::new(),
+                audience: String::new(),
+                allow_insecure_transport: false,
+            }],
+        )
+        .await
+        .expect("connect middleware");
+        let runner = openshell_supervisor_middleware::ChainRunner::from_registry(registry);
+        runner
+            .preflight_websocket(
+                &[ChainEntry {
+                    name: "redact-openai".into(),
+                    implementation: "openai-redactor".into(),
+                    order: 0,
+                    config: prost_types::Struct::default(),
+                    on_error: OnError::FailClosed,
+                }],
+                openshell_supervisor_middleware::WebSocketPreflightInput {
+                    session_id: "session".into(),
+                    request_id: "request".into(),
+                    sandbox_id: "sandbox".into(),
+                    sandbox_name: "sandbox-name".into(),
+                    workspace: "team-a".into(),
+                    scheme: "wss".into(),
+                    host: "api.openai.com".into(),
+                    port: 443,
+                    path: "/v1/responses".into(),
+                    requested_subprotocols: Vec::new(),
+                },
+            )
+            .await
+            .expect("preflight");
+
+        assert_eq!(
+            preflight_rx.recv().await,
+            Some("team-a".to_string()),
+            "WebSocket preflight must forward the workspace to the middleware"
+        );
+
+        let _ = shutdown_tx.send(());
+        let _ = server_task.await;
     }
 
     async fn assert_invalid_close_termination(payload: Vec<u8>, expected_close_code: u16) {
@@ -4613,6 +4702,8 @@ network_policies:
                     session_id: "session".into(),
                     request_id: "request".into(),
                     sandbox_id: "sandbox".into(),
+                    sandbox_name: "sandbox-name".into(),
+                    workspace: "workspace".into(),
                     scheme: "wss".into(),
                     host: "api.openai.com".into(),
                     port: 443,
@@ -4761,6 +4852,8 @@ network_policies:
                     session_id: "disabled-session".into(),
                     request_id: "request".into(),
                     sandbox_id: "sandbox".into(),
+                    sandbox_name: "sandbox-name".into(),
+                    workspace: "workspace".into(),
                     scheme: "wss".into(),
                     host: "api.openai.com".into(),
                     port: 443,
@@ -4881,6 +4974,8 @@ network_policies:
                     session_id: "builtin-regex-session".into(),
                     request_id: "request".into(),
                     sandbox_id: "sandbox".into(),
+                    sandbox_name: "sandbox-name".into(),
+                    workspace: "workspace".into(),
                     scheme: "wss".into(),
                     host: "api.openai.com".into(),
                     port: 443,

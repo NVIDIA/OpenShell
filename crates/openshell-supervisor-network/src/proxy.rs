@@ -667,6 +667,10 @@ async fn handle_transparent_tcp_connection(
         activity_tx.clone(),
         None,
         agent_proposals,
+        // The transparent TCP path carries no PolicyLocalContext, so no
+        // workspace is available here; matches the CONNECT path default when
+        // policy-local context is absent.
+        String::new(),
     );
     let middleware_gate = middleware_uninspectable_gate(&opa_engine, &ctx)?;
     if middleware_gate == crate::l7::middleware::UninspectableTrafficGate::Deny {
@@ -2133,6 +2137,10 @@ async fn handle_tcp_connection(
     // gate needs it) and drives the raw-tunnel branch below.
 
     // Build request-processing context shared by CONNECT and forward HTTP.
+    let workspace = policy_local_ctx
+        .as_ref()
+        .map(|ctx| ctx.workspace())
+        .unwrap_or_default();
     let mut ctx = relay::http_context(
         &decision,
         provider_credentials,
@@ -2140,6 +2148,7 @@ async fn handle_tcp_connection(
         activity_tx.clone(),
         dynamic_credentials.clone(),
         agent_proposals,
+        workspace,
     );
 
     if effective_tls_skip {
@@ -5091,6 +5100,10 @@ async fn handle_forward_proxy(
         .map_or_else(std::collections::HashMap::new, |query| {
             crate::l7::rest::parse_query_params(query).unwrap_or_default()
         });
+    let workspace = policy_local_ctx
+        .as_ref()
+        .map(|ctx| ctx.workspace())
+        .unwrap_or_default();
     let mut l7_ctx = relay::http_context(
         &decision,
         provider_credentials,
@@ -5098,6 +5111,7 @@ async fn handle_forward_proxy(
         activity_tx.cloned(),
         dynamic_credentials.clone(),
         agent_proposals,
+        workspace,
     );
     l7_ctx.request_default_port = match scheme.as_str() {
         "http" => Some(80),

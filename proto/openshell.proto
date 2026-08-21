@@ -2352,6 +2352,20 @@ message PolicyChunk {
   // back to the in-sandbox agent so it can revise the proposal.
   // Empty for non-rejected chunks.
   string rejection_reason = 18;
+  // Gateway-side merge/application preflight failure. Kept separate from
+  // prover output and operator rejection so clients can explain why a
+  // prover-clean proposal is not currently applicable.
+  string application_error = 19;
+  // Opaque digest binding review to the exact live inputs and complete
+  // effective candidate evaluated by the gateway.
+  string review_token = 20;
+  // Deterministic hashes for compact candidate display and diagnostics.
+  string current_effective_policy_hash = 21;
+  string candidate_effective_policy_hash = 22;
+  // Complete effective policies used for review. These contain policy
+  // configuration only; credential secret values are never materialized.
+  openshell.sandbox.v1.SandboxPolicy current_effective_policy = 23;
+  openshell.sandbox.v1.SandboxPolicy candidate_effective_policy = 24;
 }
 
 // Notification that the draft policy was updated.
@@ -2430,6 +2444,9 @@ message ApproveDraftChunkRequest {
   string chunk_id = 2;
   // Workspace scope. Empty defaults to "default".
   string workspace = 3;
+  // Token returned with the reviewed PolicyChunk. Approval fails with
+  // FAILED_PRECONDITION if live decision inputs no longer match it.
+  string review_token = 4;
 }
 
 message ApproveDraftChunkResponse {
@@ -2454,6 +2471,11 @@ message RejectDraftChunkRequest {
 message RejectDraftChunkResponse {}
 
 // Approve all pending chunks.
+message DraftChunkApproval {
+  string chunk_id = 1;
+  string review_token = 2;
+}
+
 message ApproveAllDraftChunksRequest {
   // Sandbox name.
   string name = 1;
@@ -2461,6 +2483,9 @@ message ApproveAllDraftChunksRequest {
   bool include_security_flagged = 2;
   // Workspace scope. Empty defaults to "default".
   string workspace = 3;
+  // Exact reviewed chunks and tokens. The server validates them against one
+  // live snapshot, stages compatible operations in order, and writes once.
+  repeated DraftChunkApproval approvals = 4;
 }
 
 message ApproveAllDraftChunksResponse {
@@ -2470,7 +2495,8 @@ message ApproveAllDraftChunksResponse {
   string policy_hash = 2;
   // Number of chunks approved.
   uint32 chunks_approved = 3;
-  // Number of chunks skipped (security-flagged).
+  // Number of chunks skipped for any reason, including security flags,
+  // stale or invalid candidates, and conflicts within the staged batch.
   uint32 chunks_skipped = 4;
 }
 
@@ -2585,6 +2611,12 @@ message DraftChunkPayload {
   // Operator-supplied free-form rejection text; empty for non-rejected
   // chunks. Mirrors PolicyChunk.rejection_reason.
   string rejection_reason = 12;
+  string application_error = 13;
+  string review_token = 14;
+  string current_effective_policy_hash = 15;
+  string candidate_effective_policy_hash = 16;
+  openshell.sandbox.v1.SandboxPolicy current_effective_policy = 17;
+  openshell.sandbox.v1.SandboxPolicy candidate_effective_policy = 18;
 }
 
 // Internal stored policy revision row materialized from the generic objects table.
@@ -2624,6 +2656,12 @@ message StoredDraftChunk {
   string validation_result = 18;
   // Operator-supplied free-form rejection text. See PolicyChunk.
   string rejection_reason = 19;
+  string application_error = 20;
+  string review_token = 21;
+  string current_effective_policy_hash = 22;
+  string candidate_effective_policy_hash = 23;
+  openshell.sandbox.v1.SandboxPolicy current_effective_policy = 24;
+  openshell.sandbox.v1.SandboxPolicy candidate_effective_policy = 25;
 }
 
 // ---------------------------------------------------------------------------

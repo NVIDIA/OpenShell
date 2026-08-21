@@ -1670,6 +1670,7 @@ fn endpoint_path_matches(pattern: &str, path: &str) -> bool {
     openshell_core::endpoint_path::matches(pattern, path)
 }
 
+#[cfg(test)]
 pub async fn validate_provider_environment_keys_unique(
     store: &Store,
     workspace: &str,
