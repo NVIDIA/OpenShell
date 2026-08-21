@@ -31,9 +31,14 @@
         name:
           - apparmor
           - apparmor-utils
+          - conmon=2.1.13+ds1-2
           - fuse-overlayfs
           - passt
-          - podman
+          # Match the Ubuntu 26.04 GitHub-hosted rootless E2E job. The
+          # surrounding Ubuntu package set is intentionally left to the
+          # selected cloud image; these are the two versions the workflow
+          # explicitly supports and verifies.
+          - podman=5.7.0+ds2-3build1
           - uidmap
         state: present
 
@@ -92,17 +97,11 @@
         cmd: apparmor_parser --replace /etc/apparmor.d/usr.bin.pasta
       changed_when: true
 
-    - name: Enable the rootless Podman API socket
-      ansible.builtin.systemd_service:
-        name: podman.socket
-        scope: user
-        enabled: true
-        state: started
-      become: false
-
     - name: Verify the rootless pasta environment
       ansible.builtin.command:
-        cmd: podman info --format '{{ "{{" }}.Host.Security.Rootless{{ "}}" }}:{{ "{{" }}.Host.RootlessNetworkCmd{{ "}}" }}'
+        cmd: >-
+          podman info --format
+          '{{ "{{" }}.Host.Security.Rootless{{ "}}" }}:{{ "{{" }}.Host.RootlessNetworkCmd{{ "}}" }}:{{ "{{" }}.Host.Conmon.Path{{ "}}" }}'
       become: false
       register: podman_environment
       changed_when: false
@@ -110,6 +109,7 @@
     - name: Require rootless Podman with pasta
       ansible.builtin.assert:
         that:
-          - podman_environment.stdout == "true:pasta"
+          - podman_environment.stdout == "true:pasta:/usr/bin/conmon"
         fail_msg: >-
-          Expected rootless Podman with pasta, got {{ podman_environment.stdout | quote }}.
+          Expected rootless Podman with pasta and /usr/bin/conmon, got
+          {{ podman_environment.stdout | quote }}.

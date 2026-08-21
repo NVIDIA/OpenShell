@@ -71,10 +71,14 @@ the Fedora guest, which provides Podman 5 and `pasta`.
 
 The `ubuntu-26.04` guest and `podman-rootless-pasta` configuration reproduce
 the host-side AppArmor path that rootless Podman uses to stop `pasta`. The
-configuration installs `passt`, Podman, and its rootless prerequisites; enables
-AppArmor and `kernel.apparmor_restrict_unprivileged_userns=1`; then verifies
-that Podman reports `true:pasta`. Because Ubuntu's package can advance outside
-this repository, `pasta-apparmor-control` removes the upstream Podman signal
+configuration pins the same Podman 5.7.0 and conmon packages as the
+`ubuntu-26.04` GitHub-hosted rootless E2E job, installs `passt` and the
+rootless prerequisites, enables AppArmor and
+`kernel.apparmor_restrict_unprivileged_userns=1`, then verifies
+`true:pasta:/usr/bin/conmon`. The probe starts a private `podman system service`
+with the same `/usr/bin/conmon` config override OpenShell E2E uses, rather than
+using a systemd user socket. Because Ubuntu's package can advance outside this
+repository, `pasta-apparmor-control` removes the upstream Podman signal
 allowance from that packaged profile to create a deterministic pre-fix control.
 
 Copy the probe into an unmodified-package guest to test for the known denial:
@@ -105,6 +109,10 @@ nix run .#test-guest -- \
 Use `--keep` when either run fails to retain the serial log and writable guest
 overlay for inspection. The probe tests one exact AppArmor signal denial; it
 does not replace the rootless Podman OpenShell E2E suite.
+
+For a non-asserting collection run, use `pasta-signal-probe --report`. It emits
+the versions, live Podman/pasta processes, AppArmor labels, and user/network
+namespace identities while the pasta helper is running.
 
 List the available distros and configurations:
 
