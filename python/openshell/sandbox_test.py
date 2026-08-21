@@ -1700,7 +1700,7 @@ def test_stop_and_start_forward_workspace_and_return_phase() -> None:
     ],
 )
 def test_wait_ready_handles_terminal_main_process_results(
-    phase: int, should_succeed: bool
+    phase: openshell_pb2.SandboxPhase, should_succeed: bool
 ) -> None:
     class TerminalStub(_FakeSandboxStub):
         def GetSandbox(
