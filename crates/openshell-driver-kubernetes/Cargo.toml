@@ -39,6 +39,8 @@ notify = "8"
 [dev-dependencies]
 temp-env = "0.3"
 toml = { workspace = true }
+http = { workspace = true }
+tower = { workspace = true }
 
 [lints]
 workspace = true

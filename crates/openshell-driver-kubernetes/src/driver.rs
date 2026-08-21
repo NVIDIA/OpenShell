@@ -1503,8 +1503,7 @@ impl KubernetesComputeDriver {
         let (agent_sandbox_api, kube_name, pod_name, namespace, stop_timeout) = self
             .patch_sandbox_operating_state(sandbox_id, false)
             .await?;
-        let legacy_pod_api = (agent_sandbox_api.resource.version == SANDBOX_VERSION_V1ALPHA1)
-            .then(|| Api::<Pod>::namespaced(self.client.clone(), &namespace));
+        let pod_api = Api::<Pod>::namespaced(self.client.clone(), &namespace);
 
         let deadline = tokio::time::Instant::now() + stop_timeout;
         let mut poll_interval = STOP_INITIAL_POLL_INTERVAL;
@@ -1529,16 +1528,9 @@ impl KubernetesComputeDriver {
                 ))
             })?
             .map_err(KubernetesDriverError::from_kube)?;
-            if kubernetes_sandbox_has_stopped_condition(&object) {
-                return Ok(());
-            }
-            if let Some(error) = kubernetes_sandbox_stop_failure(&object) {
-                return Err(KubernetesDriverError::Message(error));
-            }
-            if let Some(pod_api) = legacy_pod_api.as_ref()
-                && kubernetes_sandbox_pod_is_gone(pod_api, &pod_name, deadline)
-                    .await
-                    .map_err(KubernetesDriverError::Message)?
+            if kubernetes_sandbox_stop_completed(&object, &pod_api, &pod_name, deadline)
+                .await
+                .map_err(KubernetesDriverError::Message)?
             {
                 return Ok(());
             }
@@ -4185,23 +4177,6 @@ fn status_from_object(obj: &DynamicObject) -> Option<SandboxStatus> {
     })
 }
 
-fn kubernetes_sandbox_has_stopped_condition(obj: &DynamicObject) -> bool {
-    obj.data
-        .get("status")
-        .and_then(|status| status.get("conditions"))
-        .and_then(serde_json::Value::as_array)
-        .is_some_and(|conditions| {
-            conditions.iter().any(|condition| {
-                condition.get("type").and_then(serde_json::Value::as_str)
-                    == Some(SANDBOX_SUSPENDED_CONDITION)
-                    && condition
-                        .get("status")
-                        .and_then(serde_json::Value::as_str)
-                        .is_some_and(|status| status.eq_ignore_ascii_case("true"))
-            })
-        })
-}
-
 fn kubernetes_sandbox_stop_failure(obj: &DynamicObject) -> Option<String> {
     obj.data
         .get("status")?
@@ -4228,6 +4203,18 @@ fn kubernetes_sandbox_stop_failure(obj: &DynamicObject) -> Option<String> {
                 .unwrap_or("backing pod is not owned by this sandbox");
             Some(format!("Kubernetes sandbox stop rejected: {message}"))
         })
+}
+
+async fn kubernetes_sandbox_stop_completed(
+    obj: &DynamicObject,
+    pod_api: &Api<Pod>,
+    pod_name: &str,
+    deadline: tokio::time::Instant,
+) -> Result<bool, String> {
+    if let Some(error) = kubernetes_sandbox_stop_failure(obj) {
+        return Err(error);
+    }
+    kubernetes_sandbox_pod_is_gone(pod_api, pod_name, deadline).await
 }
 
 async fn kubernetes_sandbox_pod_is_gone(
@@ -4263,8 +4250,8 @@ fn kubernetes_sandbox_stop_timeout(obj: &DynamicObject) -> Duration {
         .map_or(DEFAULT_POD_TERMINATION_GRACE_PERIOD, Duration::from_secs);
 
     // The controller must observe the desired state, wait for the pod grace
-    // period and kubelet teardown, then reconcile the deleted pod into the
-    // Sandbox status. Keep one API timeout of headroom around that grace.
+    // period, and complete kubelet teardown. Keep one API timeout of headroom
+    // around that grace.
     termination_grace_period.saturating_add(KUBE_API_TIMEOUT)
 }
 
@@ -4551,6 +4538,8 @@ fn spawn_namespace_file_watcher(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use http::{Request, Response, StatusCode};
+    use kube::client::Body;
     use openshell_core::progress::{
         PROGRESS_ACTIVE_DETAIL_KEY, PROGRESS_ACTIVE_STEP_KEY, PROGRESS_COMPLETE_LABEL_KEY,
         PROGRESS_COMPLETE_STEP_KEY,
@@ -4612,7 +4601,7 @@ mod tests {
     }
 
     #[test]
-    fn stop_timeout_includes_pod_grace_period_and_reconcile_headroom() {
+    fn stop_timeout_includes_pod_grace_period_and_api_headroom() {
         let resource = ApiResource::from_gvk(&GroupVersionKind::gvk(
             SANDBOX_GROUP,
             SANDBOX_VERSION_V1BETA1,
@@ -4655,27 +4644,81 @@ mod tests {
         }
     }
 
-    #[test]
-    fn stopped_status_requires_published_condition() {
+    fn pod_api_with_response(status: StatusCode, body: serde_json::Value) -> Api<Pod> {
+        let body = serde_json::to_vec(&body).unwrap();
+        let service = tower::service_fn(move |request: Request<Body>| {
+            assert_eq!(request.method(), http::Method::GET);
+            assert_eq!(
+                request.uri().path(),
+                "/api/v1/namespaces/openshell/pods/sandbox-pod"
+            );
+            let body = body.clone();
+            async move {
+                Ok::<_, std::convert::Infallible>(
+                    Response::builder()
+                        .status(status)
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+            }
+        });
+        Api::namespaced(Client::new(service, "openshell"), "openshell")
+    }
+
+    #[tokio::test]
+    async fn suspended_condition_waits_for_pod_termination() {
         let resource = ApiResource::from_gvk(&GroupVersionKind::gvk(
             SANDBOX_GROUP,
-            SANDBOX_VERSION_V1ALPHA1,
+            SANDBOX_VERSION_V1BETA1,
             SANDBOX_KIND,
         ));
         let mut sandbox = DynamicObject::new("sandbox", &resource);
-        sandbox.data = serde_json::json!({"status": {"replicas": 0}});
-
-        assert!(
-            !kubernetes_sandbox_has_stopped_condition(&sandbox),
-            "v1alpha1 omits a zero status replica count on the wire; it is not a usable completion signal"
-        );
-
         sandbox.data = serde_json::json!({
             "status": {
                 "conditions": [{"type": "Suspended", "status": "True"}]
             }
         });
-        assert!(kubernetes_sandbox_has_stopped_condition(&sandbox));
+
+        let existing_pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "sandbox-pod", "namespace": "openshell"},
+            "spec": {"containers": [{"name": "sandbox", "image": "sandbox"}]}
+        });
+        let pod_api = pod_api_with_response(StatusCode::OK, existing_pod);
+        assert!(
+            !kubernetes_sandbox_stop_completed(
+                &sandbox,
+                &pod_api,
+                "sandbox-pod",
+                tokio::time::Instant::now() + Duration::from_secs(1),
+            )
+            .await
+            .unwrap(),
+            "Suspended=True is not complete while the backing pod still exists"
+        );
+
+        let missing_pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Status",
+            "status": "Failure",
+            "message": "pods sandbox-pod not found",
+            "reason": "NotFound",
+            "details": {"name": "sandbox-pod", "kind": "pods"},
+            "code": 404
+        });
+        let pod_api = pod_api_with_response(StatusCode::NOT_FOUND, missing_pod);
+        assert!(
+            kubernetes_sandbox_stop_completed(
+                &sandbox,
+                &pod_api,
+                "sandbox-pod",
+                tokio::time::Instant::now() + Duration::from_secs(1),
+            )
+            .await
+            .unwrap(),
+            "pod disappearance completes the accepted stop"
+        );
     }
 
     #[test]
