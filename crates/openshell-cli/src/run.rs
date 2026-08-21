@@ -333,6 +333,55 @@ fn validate_memory_quantity(value: &str) -> Result<String> {
     Ok(value.to_string())
 }
 
+/// True when an error is the gateway rejecting a relay-backed operation because
+/// the sandbox's topology has no in-sandbox supervisor.
+fn is_no_supervisor_session_error(err: &miette::Report) -> bool {
+    let marker = openshell_core::error::NO_SUPERVISOR_SESSION_MARKER;
+    // Check the whole chain: the marker may sit in a wrapped transport error
+    // rather than the outermost message.
+    format!("{err}").contains(marker)
+        || err
+            .chain()
+            .any(|source| source.to_string().contains(marker))
+}
+
+/// Explain a topology that cannot open sessions, instead of letting a raw gRPC
+/// error imply the sandbox failed to start.
+///
+/// The sandbox is running and its network policy is enforced; only the
+/// interactive path is unavailable. The command still exits non-zero, because
+/// a command passed to `sandbox create` did not run and callers must not read
+/// success from the exit code.
+fn report_no_supervisor_session(sandbox_name: &str, had_command: bool, persisted: bool) {
+    eprintln!();
+    eprintln!(
+        "{} Sandbox '{}' is running, but this topology cannot open sessions.",
+        "!".yellow().bold(),
+        sandbox_name.bold()
+    );
+    eprintln!("  SSH, exec, port forwarding, and file transfer need a supervisor inside");
+    eprintln!("  the sandbox, which this topology does not run.");
+    eprintln!();
+    if had_command {
+        eprintln!("  {} your command did not run.", "Note:".bold());
+        eprintln!("  Set the workload entrypoint instead, so it starts with the container:");
+        eprintln!(
+            "    --driver-config-json '{{\"kubernetes\":{{\"containers\":{{\"agent\":{{\"command\":[...]}}}}}}}}'"
+        );
+    } else {
+        eprintln!("  Policy-enforced network egress is unaffected.");
+    }
+    eprintln!();
+    if persisted {
+        eprintln!("  Inspect it with:");
+        eprintln!("    openshell logs {sandbox_name}");
+        eprintln!("    openshell sandbox list");
+    }
+    eprintln!("  Use the `combined`, `sidecar`, or `cni-sidecar` topology when you need");
+    eprintln!("  interactive sessions.");
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn finalize_sandbox_create_session(
     server: &str,
     sandbox_name: &str,
@@ -341,8 +390,20 @@ async fn finalize_sandbox_create_session(
     workspace: &str,
     tls: &TlsOptions,
     gateway: &str,
+    had_command: bool,
 ) -> Result<()> {
+    let sessionless = session_result
+        .as_ref()
+        .err()
+        .is_some_and(is_no_supervisor_session_error);
+
     if persist {
+        if sessionless {
+            report_no_supervisor_session(sandbox_name, had_command, true);
+            return Err(miette::miette!(
+                "sandbox '{sandbox_name}' is running but cannot open interactive sessions"
+            ));
+        }
         return session_result;
     }
 
@@ -352,6 +413,15 @@ async fn finalize_sandbox_create_session(
             return Err(err);
         }
         eprintln!("Failed to delete sandbox {sandbox_name}: {err}");
+    }
+
+    if sessionless {
+        // The sandbox has already been deleted per --no-keep, so do not point
+        // the reader at commands that would now fail.
+        report_no_supervisor_session(sandbox_name, had_command, false);
+        return Err(miette::miette!(
+            "sandbox '{sandbox_name}' could not open an interactive session"
+        ));
     }
 
     session_result
@@ -987,6 +1057,7 @@ pub async fn sandbox_create(
                 workspace,
                 &effective_tls,
                 gateway_name,
+                !command.is_empty(),
             )
             .await
         }
@@ -1011,6 +1082,7 @@ pub async fn sandbox_create(
                 workspace,
                 &effective_tls,
                 gateway_name,
+                !command.is_empty(),
             )
             .await
         }
@@ -7702,6 +7774,39 @@ mod tests {
     #[test]
     fn sandbox_should_persist_defaults_to_persistent() {
         assert!(sandbox_should_persist(true, None));
+    }
+
+    use crate::run::is_no_supervisor_session_error;
+
+    #[test]
+    fn detects_the_no_supervisor_session_rejection() {
+        let err = miette::miette!("{}", openshell_core::error::no_supervisor_session_message());
+        assert!(is_no_supervisor_session_error(&err));
+    }
+
+    #[test]
+    fn other_errors_are_not_mistaken_for_a_sessionless_topology() {
+        for message in [
+            "supervisor session not connected",
+            "sandbox not found",
+            "timed out waiting for the sandbox to become ready",
+        ] {
+            let err = miette::miette!("{message}");
+            assert!(
+                !is_no_supervisor_session_error(&err),
+                "{message} must not be treated as a sessionless topology"
+            );
+        }
+    }
+
+    /// The marker travels through gRPC as part of the status message, so
+    /// detection has to survive the wrapping the transport and CLI add.
+    #[test]
+    fn detection_survives_error_wrapping() {
+        let inner =
+            Status::failed_precondition(openshell_core::error::no_supervisor_session_message());
+        let err = miette::miette!("failed to open session: {inner}");
+        assert!(is_no_supervisor_session_error(&err));
     }
 
     #[test]

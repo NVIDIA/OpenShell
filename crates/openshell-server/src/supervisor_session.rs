@@ -191,9 +191,7 @@ impl SupervisorSessionRegistry {
         // burning the caller's timeout on a wait that cannot succeed.
         if self.is_sessionless(sandbox_id) {
             return Err(Status::failed_precondition(
-                "this sandbox runs a topology with no in-sandbox supervisor, so SSH, exec, \
-                 port forwarding, and file transfer are unavailable; use the `combined` or \
-                 `sidecar` topology when those are required",
+                openshell_core::error::no_supervisor_session_message(),
             ));
         }
 
