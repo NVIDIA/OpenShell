@@ -18,6 +18,8 @@ pub mod driver_mounts;
 pub mod driver_utils;
 pub mod endpoint_path;
 pub mod error;
+#[cfg(unix)]
+pub mod external_driver_socket;
 pub mod forward;
 pub mod google_cloud;
 pub mod gpu;
@@ -29,6 +31,7 @@ pub mod jwt;
 pub mod metadata;
 pub mod middleware;
 pub mod net;
+pub mod operator_namespace_allowlist;
 pub mod paths;
 pub mod policy;
 pub mod progress;
@@ -53,6 +56,7 @@ pub use error::{ComputeDriverError, Error, Result};
 pub use metadata::{
     GetResourceVersion, ObjectId, ObjectLabels, ObjectName, ObjectWorkspace, SetResourceVersion,
 };
+pub use operator_namespace_allowlist::OperatorNamespaceAllowlist;
 
 /// Build version string derived from git metadata.
 ///

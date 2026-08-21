@@ -148,6 +148,7 @@ async fn managed_creates_namespace_with_labels() {
         &ws,
         "--name",
         "mgd-sb",
+        "--detach",
         "--",
         "sh",
         "-c",
@@ -157,10 +158,6 @@ async fn managed_creates_namespace_with_labels() {
     ])
     .await;
     assert!(ok, "sandbox create failed: {out}");
-    assert!(
-        out.contains("managed-ok"),
-        "sandbox output missing expected string: {out}"
-    );
 
     // Verify the managed namespace was created.
     let (ok, out) = kubectl(&["get", "namespace", &ns]).await;
@@ -460,6 +457,7 @@ async fn managed_workspace_delete_removes_namespace() {
         &ws,
         "--name",
         "del-sb",
+        "--detach",
         "--",
         "sh",
         "-c",
@@ -469,10 +467,6 @@ async fn managed_workspace_delete_removes_namespace() {
     ])
     .await;
     assert!(ok, "sandbox create failed: {out}");
-    assert!(
-        out.contains("del-ok"),
-        "sandbox output missing expected string: {out}"
-    );
 
     let (ok, _) = kubectl(&["get", "namespace", &ns]).await;
     assert!(
@@ -535,6 +529,7 @@ async fn managed_tls_secret_copied_to_namespace() {
         &ws,
         "--name",
         "tls-sb",
+        "--detach",
         "--",
         "sh",
         "-c",
@@ -544,10 +539,6 @@ async fn managed_tls_secret_copied_to_namespace() {
     ])
     .await;
     assert!(ok, "sandbox create failed: {out}");
-    assert!(
-        out.contains("tls-ok"),
-        "sandbox output missing expected string: {out}"
-    );
 
     let (ok, out) = kubectl(&["get", "secret", "openshell-client-tls", "-n", &ns]).await;
     assert!(

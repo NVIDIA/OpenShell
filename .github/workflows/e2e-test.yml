@@ -59,6 +59,9 @@ jobs:
           - suite: rust-docker
             cmd: "mise run --no-deps --skip-deps e2e:rust"
             apt_packages: "openssh-client"
+          - suite: rust-docker-external-driver
+            cmd: "env -u OPENSHELL_GATEWAY_BIN mise run --no-deps --skip-deps e2e:docker:external-driver"
+            apt_packages: "openssh-client"
           - suite: mcp
             cmd: "mise run --no-deps --skip-deps e2e:mcp"
             apt_packages: ""
@@ -127,7 +130,7 @@ jobs:
         run: ${{ matrix.cmd }}
 
   e2e-podman-rootless:
-    name: E2E (rust-podman-rootless, ${{ matrix.runner }})
+    name: E2E (rust-podman-${{ matrix.suite }}, ${{ matrix.runner }})
     # Run directly on the Ubuntu host so the test observes the host's AppArmor
     # and unprivileged-user-namespace policy. A privileged job container masks
     # the restrictions that production rootless Podman installations enforce.
@@ -142,10 +145,18 @@ jobs:
         include:
           # Keep package versions explicit so hosted-runner tool overrides
           # cannot silently change the supported test environment.
-          - runner: ubuntu-26.04
+          - suite: rootless
+            runner: ubuntu-26.04
             podman_major: "5"
             podman_package_version: "5.7.0+ds2-3build1"
             conmon_package_version: "2.1.13+ds1-2"
+            cmd: "mise run --no-deps --skip-deps e2e:podman:rootless"
+          - suite: external-driver
+            runner: ubuntu-26.04
+            podman_major: "5"
+            podman_package_version: "5.7.0+ds2-3build1"
+            conmon_package_version: "2.1.13+ds1-2"
+            cmd: "env -u OPENSHELL_GATEWAY_BIN mise run --no-deps --skip-deps e2e:podman:external-driver"
     env:
       IMAGE_TAG: ${{ inputs.image-tag }}
       MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -261,20 +272,28 @@ jobs:
       - name: Log in to GHCR with Podman
         run: echo "${{ secrets.GITHUB_TOKEN }}" | podman login ghcr.io -u "${{ github.actor }}" --password-stdin
 
-      - name: Run rootless Podman E2E
-        run: mise run --no-deps --skip-deps e2e:podman:rootless
+      - name: Run Podman E2E
+        run: ${{ matrix.cmd }}
 
       - name: Print AppArmor denials
         if: always()
         run: sudo dmesg | grep -E 'apparmor=.*DENIED|profile="unprivileged_userns"' | tail -100 || true
 
   e2e-vm:
-    name: E2E (rust-vm)
+    name: E2E (rust-vm-${{ matrix.suite }})
     # libkrun needs KVM, so this job must run directly on a GitHub-hosted
     # Linux VM. GitHub-hosted macOS runners do not support nested
     # virtualization, and a job container would hide the host KVM device.
     runs-on: ubuntu-24.04
     timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - suite: managed
+            cmd: "mise run --no-deps --skip-deps e2e:vm"
+          - suite: external-driver
+            cmd: "env -u OPENSHELL_GATEWAY_BIN mise run --no-deps --skip-deps e2e:vm:external-driver"
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -362,4 +381,4 @@ jobs:
           cache-on-failure: "true"
 
       - name: Run VM E2E
-        run: mise run --no-deps --skip-deps e2e:vm
+        run: ${{ matrix.cmd }}

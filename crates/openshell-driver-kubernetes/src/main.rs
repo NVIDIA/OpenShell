@@ -5,6 +5,7 @@ use clap::{ArgAction, Parser};
 use miette::{IntoDiagnostic, Result};
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
@@ -22,6 +23,10 @@ use openshell_driver_kubernetes::{
 #[command(version = VERSION)]
 #[allow(clippy::struct_excessive_bools)]
 struct Args {
+    /// Public compute-driver Unix socket used by an external gateway.
+    #[arg(long, env = "OPENSHELL_COMPUTE_DRIVER_SOCKET")]
+    bind_socket: Option<PathBuf>,
+
     #[arg(
         long,
         env = "OPENSHELL_COMPUTE_DRIVER_BIND",
@@ -286,13 +291,31 @@ async fn main() -> Result<()> {
     .await
     .into_diagnostic()?;
 
-    info!(address = %args.bind_address, "Starting Kubernetes compute driver");
-    tonic::transport::Server::builder()
-        .add_service(ComputeDriverServer::new(ComputeDriverService::new(driver)))
-        .serve_with_shutdown(args.bind_address, async move {
-            shutdown_signal().await;
-            let _ = shutdown_tx.send(true);
-        })
-        .await
-        .into_diagnostic()
+    let service = ComputeDriverServer::new(ComputeDriverService::new(driver));
+    let shutdown = async move {
+        shutdown_signal().await;
+        let _ = shutdown_tx.send(true);
+    };
+    if let Some(socket_path) = args.bind_socket {
+        let listener = openshell_core::external_driver_socket::bind_private(&socket_path)
+            .map_err(|err| miette::miette!("{err}"))?;
+        let _cleanup =
+            openshell_core::external_driver_socket::SocketCleanup::new(socket_path.clone());
+        info!(socket = %socket_path.display(), "Starting Kubernetes compute driver");
+        tonic::transport::Server::builder()
+            .add_service(service)
+            .serve_with_incoming_shutdown(
+                openshell_core::external_driver_socket::SameUidUnixIncoming::new(listener),
+                shutdown,
+            )
+            .await
+            .into_diagnostic()
+    } else {
+        info!(address = %args.bind_address, "Starting Kubernetes compute driver");
+        tonic::transport::Server::builder()
+            .add_service(service)
+            .serve_with_shutdown(args.bind_address, shutdown)
+            .await
+            .into_diagnostic()
+    }
 }

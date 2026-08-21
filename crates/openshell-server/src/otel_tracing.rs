@@ -29,6 +29,12 @@ use opentelemetry_sdk::trace::SdkTracerProvider;
 use tracing::Subscriber;
 use tracing_subscriber::registry::LookupSpan;
 
+#[cfg(feature = "in-tree-compute-drivers")]
+const COMPUTE_DRIVER_TARGET_PREFIX: &str =
+    openshell_driver_podman::otel_tracing::IN_PROCESS_TARGET_PREFIX;
+#[cfg(not(feature = "in-tree-compute-drivers"))]
+const COMPUTE_DRIVER_TARGET_PREFIX: &str = "\0";
+
 use crate::config_file::OtlpConfig;
 
 /// `service.name` reported when the config file does not override it.
@@ -97,7 +103,7 @@ where
     openshell_otel::layer_excluding_target_prefix(
         provider,
         INSTRUMENTATION_SCOPE,
-        openshell_driver_podman::otel_tracing::IN_PROCESS_TARGET_PREFIX,
+        COMPUTE_DRIVER_TARGET_PREFIX,
     )
 }
 

@@ -115,12 +115,19 @@ arc-swap = "1"
 notify = "8"
 
 [target.'cfg(not(target_os = "windows"))'.dependencies]
-openshell-driver-docker = { path = "../openshell-driver-docker" }
-openshell-driver-kubernetes = { path = "../openshell-driver-kubernetes" }
-openshell-driver-podman = { path = "../openshell-driver-podman" }
+openshell-driver-docker = { path = "../openshell-driver-docker", optional = true }
+openshell-driver-kubernetes = { path = "../openshell-driver-kubernetes", optional = true }
+openshell-driver-podman = { path = "../openshell-driver-podman", optional = true }
 
 [features]
-default = ["telemetry"]
+default = ["telemetry", "in-tree-compute-drivers"]
+## Link the first-party compute drivers into the standard gateway binary.
+## Disable this feature for a protocol-only gateway that uses external drivers.
+in-tree-compute-drivers = [
+    "dep:openshell-driver-docker",
+    "dep:openshell-driver-kubernetes",
+    "dep:openshell-driver-podman",
+]
 ## Compile in anonymous telemetry emission (forwards to openshell-core/telemetry).
 ## On by default; build with `--no-default-features` for a telemetry-free gateway
 ## that contains no telemetry endpoint, HTTP client, or emission code.

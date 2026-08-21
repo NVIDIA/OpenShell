@@ -1,12 +1,14 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+pub use openshell_core::OperatorNamespaceAllowlist;
 use openshell_core::config;
 use serde::{Deserialize, Deserializer, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
+#[cfg(test)]
+use std::collections::BTreeSet;
 use std::path::Path;
 use std::str::FromStr;
-use std::sync::{Arc, RwLock};
 
 /// Default gateway identity used in managed-mode namespace naming.
 pub const DEFAULT_GATEWAY_ID: &str = "openshell";
@@ -839,89 +841,6 @@ pub fn validate_managed_namespace_name(gateway_id: &str, workspace: &str) -> Res
         ));
     }
     Ok(())
-}
-
-/// Thread-safe dynamic allowlist of valid operator-mode namespaces.
-///
-/// Backed by an `Arc<RwLock<BTreeSet<String>>>` that is updated by background
-/// tasks (label selector watcher, drop-in file watcher) and read by the SA
-/// authenticator and namespace resolver.
-#[derive(Debug, Clone)]
-pub struct OperatorNamespaceAllowlist {
-    inner: Arc<RwLock<BTreeSet<String>>>,
-}
-
-impl OperatorNamespaceAllowlist {
-    fn read_guard(&self) -> std::sync::RwLockReadGuard<'_, BTreeSet<String>> {
-        self.inner
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
-
-    fn write_guard(&self) -> std::sync::RwLockWriteGuard<'_, BTreeSet<String>> {
-        self.inner
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
-
-    #[must_use]
-    pub fn new() -> Self {
-        Self {
-            inner: Arc::new(RwLock::new(BTreeSet::new())),
-        }
-    }
-
-    #[must_use]
-    pub fn from_set(set: BTreeSet<String>) -> Self {
-        Self {
-            inner: Arc::new(RwLock::new(set)),
-        }
-    }
-
-    /// Replace the entire allowlist (used by background watchers on refresh).
-    pub fn replace(&self, new_set: BTreeSet<String>) {
-        let mut guard = self.write_guard();
-        *guard = new_set;
-    }
-
-    /// Merge additional namespaces into the allowlist.
-    pub fn merge(&self, additional: &BTreeSet<String>) {
-        let mut guard = self.write_guard();
-        guard.extend(additional.iter().cloned());
-    }
-
-    /// Read the current allowlist snapshot.
-    pub fn read(&self) -> std::sync::RwLockReadGuard<'_, BTreeSet<String>> {
-        self.read_guard()
-    }
-
-    /// Check whether a namespace is in the allowlist.
-    #[must_use]
-    pub fn contains(&self, namespace: &str) -> bool {
-        self.read_guard().contains(namespace)
-    }
-
-    /// Insert a namespace into the allowlist. Returns `true` if it was new.
-    pub fn insert(&self, name: String) -> bool {
-        self.write_guard().insert(name)
-    }
-
-    /// Remove a namespace from the allowlist. Returns `true` if it was present.
-    pub fn remove(&self, name: &str) -> bool {
-        self.write_guard().remove(name)
-    }
-
-    /// Return a clone of the inner `Arc` for sharing with background tasks.
-    #[must_use]
-    pub fn shared(&self) -> Arc<RwLock<BTreeSet<String>>> {
-        Arc::clone(&self.inner)
-    }
-}
-
-impl Default for OperatorNamespaceAllowlist {
-    fn default() -> Self {
-        Self::new()
-    }
 }
 
 fn is_dns1123_subdomain(value: &str) -> bool {

@@ -35,6 +35,7 @@ tempfile = { version = "3", optional = true }
 
 [target.'cfg(unix)'.dependencies]
 nix = { workspace = true }
+rustix = { workspace = true }
 
 [features]
 default = ["telemetry"]

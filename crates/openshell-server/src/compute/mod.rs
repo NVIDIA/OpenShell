@@ -5,16 +5,16 @@
 
 pub mod driver_config;
 pub mod lease;
-#[cfg(not(target_os = "windows"))]
+#[cfg(all(not(target_os = "windows"), feature = "in-tree-compute-drivers"))]
 pub mod vm;
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(all(not(target_os = "windows"), feature = "in-tree-compute-drivers"))]
 pub use openshell_driver_docker::DockerComputeConfig;
-#[cfg(not(target_os = "windows"))]
+#[cfg(all(not(target_os = "windows"), feature = "in-tree-compute-drivers"))]
 pub use openshell_driver_kubernetes::KubernetesComputeConfig;
-#[cfg(not(target_os = "windows"))]
+#[cfg(all(not(target_os = "windows"), feature = "in-tree-compute-drivers"))]
 pub use openshell_driver_podman::PodmanComputeConfig;
-#[cfg(not(target_os = "windows"))]
+#[cfg(all(not(target_os = "windows"), feature = "in-tree-compute-drivers"))]
 pub use vm::VmComputeConfig;
 
 use crate::grpc::policy::SANDBOX_SETTINGS_OBJECT_TYPE;
@@ -49,14 +49,14 @@ use openshell_core::proto::{
     SandboxTemplate, ServiceEndpoint, SshSession,
 };
 use openshell_core::{ObjectLabels, ObjectWorkspace};
-#[cfg(not(target_os = "windows"))]
+#[cfg(all(not(target_os = "windows"), feature = "in-tree-compute-drivers"))]
 use openshell_driver_docker::DockerComputeDriver;
-#[cfg(not(target_os = "windows"))]
+#[cfg(all(not(target_os = "windows"), feature = "in-tree-compute-drivers"))]
 use openshell_driver_kubernetes::{
     ComputeDriverService as KubernetesDriverService, KubernetesComputeDriver,
     OperatorNamespaceAllowlist,
 };
-#[cfg(not(target_os = "windows"))]
+#[cfg(all(not(target_os = "windows"), feature = "in-tree-compute-drivers"))]
 use openshell_driver_podman::{ComputeDriverService as PodmanDriverService, PodmanComputeDriver};
 use prost::Message;
 use std::collections::HashMap;
@@ -299,7 +299,7 @@ pub struct ManagedDriverProcess {
 }
 
 impl ManagedDriverProcess {
-    #[cfg(unix)]
+    #[cfg(all(unix, any(test, feature = "in-tree-compute-drivers")))]
     pub(crate) fn new(child: tokio::process::Child, socket_path: PathBuf) -> Self {
         Self {
             child: std::sync::Mutex::new(Some(child)),
@@ -397,6 +397,7 @@ pub struct AcquiredRemoteDriverEndpoint {
 }
 
 impl AcquiredRemoteDriverEndpoint {
+    #[cfg(any(test, feature = "in-tree-compute-drivers"))]
     pub(crate) fn managed_builtin(
         driver_kind: ComputeDriverKind,
         channel: Channel,
@@ -713,7 +714,7 @@ impl ComputeRuntime {
         self.lifecycle_gates.entry_count()
     }
 
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(all(not(target_os = "windows"), feature = "in-tree-compute-drivers"))]
     pub async fn new_docker(
         config: openshell_core::Config,
         docker_config: DockerComputeConfig,
@@ -741,7 +742,7 @@ impl ComputeRuntime {
         .await
     }
 
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(all(not(target_os = "windows"), feature = "in-tree-compute-drivers"))]
     pub async fn new_kubernetes(
         config: KubernetesComputeConfig,
         store: Arc<Store>,
@@ -792,7 +793,7 @@ impl ComputeRuntime {
         .await
     }
 
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(all(not(target_os = "windows"), feature = "in-tree-compute-drivers"))]
     pub async fn new_podman(
         config: PodmanComputeConfig,
         store: Arc<Store>,
@@ -1393,7 +1394,8 @@ impl ComputeRuntime {
                     let name = sandbox.object_name().to_string();
                     if matches!(phase, SandboxPhase::Stopping | SandboxPhase::Starting) {
                         let status = sandbox.status.get_or_insert_with(Default::default);
-                        status.main_process_instance_id.clear();
+                        // Retain the previous instance id as a tombstone until
+                        // the restarted supervisor registers its new id.
                         status.exit_code = None;
                     }
                     upsert_ready_condition(
@@ -2909,16 +2911,29 @@ impl ComputeRuntime {
             return Ok(());
         }
         if let Some(status) = existing.status.as_ref() {
-            if !status.main_process_instance_id.is_empty()
-                && status.main_process_instance_id != instance_id
-            {
-                tracing::warn!(
-                    sandbox_id,
-                    instance_id,
-                    active_instance_id = %status.main_process_instance_id,
-                    "ignoring stale main-process exit report"
-                );
-                return Ok(());
+            if !status.main_process_instance_id.is_empty() {
+                // While Starting, the stored id belongs to the stopped
+                // instance. A different id is the new process and its early
+                // exit must still be recorded.
+                if phase == SandboxPhase::Starting && status.main_process_instance_id == instance_id
+                {
+                    tracing::warn!(
+                        sandbox_id,
+                        instance_id,
+                        "ignoring main-process exit report from stopped instance while sandbox is starting"
+                    );
+                    return Ok(());
+                }
+                if phase != SandboxPhase::Starting && status.main_process_instance_id != instance_id
+                {
+                    tracing::warn!(
+                        sandbox_id,
+                        instance_id,
+                        active_instance_id = %status.main_process_instance_id,
+                        "ignoring stale main-process exit report"
+                    );
+                    return Ok(());
+                }
             }
             if let Some(current_exit_code) = status.exit_code {
                 if current_exit_code != exit_code {
@@ -3334,20 +3349,34 @@ pub async fn connect_remote_compute_driver(
     name: impl Into<String>,
     socket_path: &Path,
 ) -> Result<AcquiredRemoteDriverEndpoint, ComputeError> {
-    let socket_path: PathBuf = socket_path.to_path_buf();
-    let display_path = socket_path.clone();
-    let channel = Endpoint::from_static("http://[::]:50051")
-        .connect_with_connector(service_fn(move |_: tonic::transport::Uri| {
-            let socket_path = socket_path.clone();
-            async move { UnixStream::connect(socket_path).await.map(TokioIo::new) }
-        }))
-        .await
-        .map_err(|e| {
-            ComputeError::Message(format!(
-                "failed to connect to remote compute driver socket '{}': {e}",
-                display_path.display()
-            ))
-        })?;
+    let socket_path = socket_path.to_path_buf();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let channel = loop {
+        let connector_path = socket_path.clone();
+        match Endpoint::from_static("http://[::]:50051")
+            .connect_with_connector(service_fn(move |_: tonic::transport::Uri| {
+                let connector_path = connector_path.clone();
+                async move { UnixStream::connect(connector_path).await.map(TokioIo::new) }
+            }))
+            .await
+        {
+            Ok(channel) => break channel,
+            Err(error) if tokio::time::Instant::now() < deadline => {
+                tracing::debug!(
+                    socket = %socket_path.display(),
+                    %error,
+                    "waiting for remote compute driver socket"
+                );
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+            Err(error) => {
+                return Err(ComputeError::Message(format!(
+                    "failed to connect to remote compute driver socket '{}' within 30s: {error}",
+                    socket_path.display()
+                )));
+            }
+        }
+    };
     Ok(AcquiredRemoteDriverEndpoint::unmanaged(name, channel))
 }
 
@@ -5106,6 +5135,68 @@ mod tests {
             assert_eq!(stored.phase(), phase as i32);
             assert_eq!(stored.status.unwrap().exit_code, None);
         }
+    }
+
+    #[tokio::test]
+    async fn starting_uses_previous_main_process_instance_as_exit_tombstone() {
+        let runtime = test_runtime(Arc::new(TestDriver::default())).await;
+        let mut sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Stopped);
+        sandbox.status = Some(SandboxStatus {
+            phase: SandboxPhase::Stopped as i32,
+            main_process_instance_id: "instance-old".into(),
+            exit_code: Some(143),
+            ..Default::default()
+        });
+        runtime.store.put_message(&sandbox).await.unwrap();
+        let stored = runtime
+            .store
+            .get_message::<Sandbox>("sb-1")
+            .await
+            .unwrap()
+            .unwrap();
+
+        let starting = runtime
+            .write_lifecycle_phase(
+                &stored,
+                SandboxPhase::Starting,
+                "Starting",
+                "Sandbox start requested",
+            )
+            .await
+            .unwrap();
+        let status = starting.status.as_ref().unwrap();
+        assert_eq!(status.main_process_instance_id, "instance-old");
+        assert_eq!(status.exit_code, None);
+
+        runtime
+            .main_process_exited("sb-1", "instance-old", 143)
+            .await
+            .unwrap();
+        let stored = runtime
+            .store
+            .get_message::<Sandbox>("sb-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.phase(), SandboxPhase::Starting as i32);
+        let status = stored.status.as_ref().unwrap();
+        assert_eq!(status.main_process_instance_id, "instance-old");
+        assert_eq!(status.exit_code, None);
+
+        runtime
+            .main_process_exited("sb-1", "instance-new", 1)
+            .await
+            .unwrap();
+        let stored = runtime
+            .store
+            .get_message::<Sandbox>("sb-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.phase(), SandboxPhase::Error as i32);
+        let status = stored.status.unwrap();
+        assert_eq!(status.main_process_instance_id, "instance-new");
+        assert_eq!(status.exit_code, Some(1));
     }
 
     fn ssh_session_record(id: &str, sandbox_id: &str) -> SshSession {
