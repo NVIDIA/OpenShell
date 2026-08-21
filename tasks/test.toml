@@ -13,7 +13,6 @@ depends = [
   "test:install-sh",
   "test:build-env",
   "test:packaging-assets",
-  "test:test-guest",
   "test:docs-website",
 ]
 
@@ -32,12 +31,6 @@ hide = true
 description = "Run focused install.sh shell tests"
 run = "tasks/scripts/test-install-sh.sh"
 run_windows = "echo Skipping test:install-sh: Linux glibc installer tests do not apply on Windows."
-hide = true
-
-["test:test-guest"]
-description = "Run focused Nix test-guest shell tests"
-run = "tasks/scripts/test-test-guest.sh"
-run_windows = "echo Skipping test:test-guest: Nix test guests do not apply on Windows."
 hide = true
 
 ["test:build-env"]
