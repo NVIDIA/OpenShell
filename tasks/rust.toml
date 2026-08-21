@@ -53,12 +53,18 @@ run = [
   # markers, so the absent checks below can never become silently vacuous.
   "cargo build -p openshell-server --bin openshell-gateway",
   "tasks/scripts/verify-telemetry-compiled-out.sh present target/debug/openshell-gateway",
-  # Guard: telemetry-free builds must contain no telemetry markers.
-  "cargo build -p openshell-server --bin openshell-gateway --no-default-features",
+  # Guard: telemetry-free builds must contain no telemetry markers. Built
+  # through the `defaults-without-telemetry` alias, which is how the docs tell
+  # operators to produce these artifacts.
+  "cargo build -p openshell-server --bin openshell-gateway --no-default-features --features defaults-without-telemetry",
   "tasks/scripts/verify-telemetry-compiled-out.sh absent target/debug/openshell-gateway",
-  "cargo build -p openshell-sandbox --bin openshell-sandbox --no-default-features --features bundled-ca-roots",
+  "cargo build -p openshell-sandbox --bin openshell-sandbox --no-default-features --features defaults-without-telemetry",
   "tasks/scripts/verify-telemetry-compiled-out.sh absent target/debug/openshell-sandbox",
 ]
+
+["rust:verify:defaults-without-telemetry"]
+description = "Verify the defaults-without-telemetry feature alias matches default minus telemetry and cannot be used additively"
+run = "tasks/scripts/verify-defaults-without-telemetry.sh"
 
 ["rust:verify:system-ca-roots"]
 description = "Verify system CA roots build mode compiles and excludes bundled Mozilla root crates"

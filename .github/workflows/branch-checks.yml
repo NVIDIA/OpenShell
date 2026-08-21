@@ -146,6 +146,9 @@ jobs:
       - name: Verify telemetry can be compiled out
         run: mise run rust:verify:telemetry-off
 
+      - name: Verify the defaults-without-telemetry feature alias tracks the default feature set
+        run: mise run rust:verify:defaults-without-telemetry
+
       - name: Verify system CA roots build mode compiles and excludes bundled Mozilla roots
         run: mise run rust:verify:system-ca-roots
 
