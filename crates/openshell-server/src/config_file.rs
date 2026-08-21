@@ -87,6 +87,11 @@ pub struct OpenShellRoot {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GatewayFileSection {
+    // ── Identity ─────────────────────────────────────────────────────────
+    /// Operator-assigned name for this gateway installation.
+    #[serde(default)]
+    pub name: Option<String>,
+
     // ── Listeners ────────────────────────────────────────────────────────
     #[serde(default)]
     pub bind_address: Option<SocketAddr>,

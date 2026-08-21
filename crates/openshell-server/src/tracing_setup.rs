@@ -13,7 +13,7 @@ use tracing_subscriber::prelude::*;
 
 use crate::ConfiguredComputeDriver;
 use crate::config_file::OtlpConfig;
-use crate::otel_tracing::SetupError;
+use crate::otel_tracing::{GatewayResourceAttributes, SetupError};
 use crate::tracing_bus::TracingLogBus;
 
 pub struct TracingHandle {
@@ -49,14 +49,15 @@ pub fn install(
     tracing_log_bus: &TracingLogBus,
     otlp_config: Option<&OtlpConfig>,
     enable_podman_export: bool,
+    gateway: GatewayResourceAttributes<'_>,
 ) -> (TracingHandle, Option<SetupError>) {
-    let (tracer_provider, setup_error) = crate::otel_tracing::provider_for(otlp_config);
+    let (tracer_provider, setup_error) = crate::otel_tracing::provider_for(otlp_config, gateway);
     let podman_endpoint = enable_podman_export
         .then_some(otlp_config)
         .flatten()
         .map(|config| config.endpoint.as_str());
     let (podman_tracer_provider, podman_setup_error) =
-        openshell_driver_podman::otel_tracing::provider_for(podman_endpoint);
+        openshell_driver_podman::otel_tracing::provider_for(podman_endpoint, gateway.name());
 
     tracing_subscriber::registry()
         .with(env_filter)

@@ -579,13 +579,8 @@ pub(crate) async fn run_server(
     let sandbox_index = SandboxIndex::new();
     let sandbox_watch_bus = SandboxWatchBus::new();
     let supervisor_sessions = Arc::new(supervisor_session::SupervisorSessionRegistry::new());
-    let driver_startup = compute::driver_config::DriverStartupContext {
-        file: config_file.as_ref(),
-        guest_tls: guest_tls.as_ref(),
-        gateway_port: config.bind_address.port(),
-        gateway_tls_enabled: config.tls.is_some(),
-        endpoint_overrides: &config.compute_driver_endpoints,
-    };
+    let driver_startup =
+        compute_driver_startup_context(&config, config_file.as_ref(), guest_tls.as_ref());
     let (compute, operator_allowlist) = build_compute_runtime(
         &config,
         driver_startup,
@@ -1596,6 +1591,20 @@ async fn build_compute_runtime(
     Ok((runtime, operator_allowlist))
 }
 
+fn compute_driver_startup_context<'a>(
+    config: &'a Config,
+    config_file: Option<&'a config_file::ConfigFile>,
+    guest_tls: Option<&'a compute::driver_config::GuestTlsPaths>,
+) -> compute::driver_config::DriverStartupContext<'a> {
+    compute::driver_config::DriverStartupContext {
+        file: config_file,
+        guest_tls,
+        gateway_port: config.bind_address.port(),
+        gateway_tls_enabled: config.tls.is_some(),
+        endpoint_overrides: &config.compute_driver_endpoints,
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) enum ConfiguredComputeDriver {
     Registered(ComputeDriverRegistration),
@@ -1603,7 +1612,7 @@ pub(crate) enum ConfiguredComputeDriver {
 }
 
 impl ConfiguredComputeDriver {
-    fn name(&self) -> &str {
+    pub(crate) fn name(&self) -> &str {
         match self {
             Self::Registered(registration) => &registration.name,
             Self::Remote { name } => name,
