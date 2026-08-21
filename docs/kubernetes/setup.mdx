@@ -38,6 +38,19 @@ kubectl apply -f https://github.com/kubernetes-sigs/agent-sandbox/releases/lates
 
 This creates the `agent-sandbox-system` namespace, installs the `sandboxes.agents.x-k8s.io` CRD, and starts the controller.
 
+The Helm chart checks for a supported Agent Sandbox API before it creates
+gateway resources. This preflight is enabled by default. Disable it only for
+offline `helm template` rendering, where Helm cannot discover cluster APIs:
+
+```shell
+helm template openshell oci://ghcr.io/nvidia/openshell/helm-chart \
+  --version <version> \
+  --set agentSandbox.preflight.enabled=false
+```
+
+The chart does not install or upgrade the cluster-scoped Agent Sandbox CRDs or
+controller.
+
 <Note>
 **Air-gapped clusters:** mirror the manifest above and the `registry.k8s.io/agent-sandbox/agent-sandbox-controller` image referenced inside it to your internal registry, then point the manifest's image reference at your mirror before applying. You will also need to mirror the OpenShell gateway and sandbox images — see the chart's `image.repository` value for the gateway and `server.sandboxImage` / `server.supervisorImage` for the sandbox runtime.
 </Note>

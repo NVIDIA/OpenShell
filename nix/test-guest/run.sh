@@ -609,7 +609,7 @@ if [ "${#packages[@]}" -gt 0 ] || [ "${#copies[@]}" -gt 0 ]; then
 			;;
 		rpm)
 			ssh "${ssh_args[@]}" openshell@127.0.0.1 \
-				"sudo dnf install -y --nogpgcheck --${quoted_packages}"
+				"sudo dnf install -y --nogpgcheck ${quoted_packages}"
 			;;
 		esac
 	fi
