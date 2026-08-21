@@ -343,6 +343,15 @@ Multi-replica deployments can use that default with a shared database and
 shared key-encryption key, or opt into an external backend such as Vault or
 Kubernetes Secrets.
 
+OAuth refresh failures retain a gateway-owned recovery classification alongside
+the refresh state. The gateway reads only a bounded error response and maps
+recognized OAuth codes to retry, reauthorization, configuration repair, or
+investigation without persisting issuer-controlled descriptions. Terminal
+reauthorization failures remain parked until a manual retry or explicit refresh
+reconfiguration. Configuration failures retry hourly so an externally repaired
+clock, policy, or stored credential can recover without rapid endpoint traffic;
+short-lived credentials still fail closed at their recorded expiry.
+
 Credential handles remain bound to the driver that created them. Before the
 0.1.0 compatibility boundary, gateways do not migrate inline refresh material
 or move handles between credential drivers; operators reconfigure affected

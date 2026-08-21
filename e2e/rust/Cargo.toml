@@ -34,12 +34,18 @@ e2e-kubernetes-workspace-operator = ["e2e-kubernetes"]
 e2e-podman = ["e2e", "e2e-host-gateway", "e2e-local-container-driver"]
 e2e-podman-gpu = ["e2e-podman", "e2e-gpu"]
 e2e-oidc-pkce = []
+e2e-provider-refresh-keycloak = []
 e2e-vm = ["e2e", "e2e-host-gateway"]
 
 [[test]]
 name = "oidc_pkce"
 path = "tests/oidc_pkce.rs"
 required-features = ["e2e-oidc-pkce"]
+
+[[test]]
+name = "provider_refresh_keycloak"
+path = "tests/provider_refresh_keycloak.rs"
+required-features = ["e2e-provider-refresh-keycloak"]
 
 [[test]]
 name = "custom_image"
