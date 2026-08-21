@@ -397,6 +397,29 @@ fn report_no_supervisor_session(sandbox_name: &str, had_command: bool, persisted
     eprintln!("  interactive sessions.");
 }
 
+/// Delete an ephemeral sandbox, explain the sessionless topology, and return
+/// the error to surface. Shared by the pre-detach (command-bearing) and
+/// post-detach (interactive) paths so both behave identically.
+#[allow(clippy::too_many_arguments)]
+async fn abort_sessionless_create(
+    server: &str,
+    sandbox_name: &str,
+    persist: bool,
+    workspace: &str,
+    tls: &TlsOptions,
+    gateway: &str,
+    had_command: bool,
+) -> miette::Report {
+    if !persist {
+        let names = [sandbox_name.to_string()];
+        if let Err(err) = sandbox_delete(server, &names, false, workspace, tls, gateway).await {
+            eprintln!("Failed to delete sandbox {sandbox_name}: {err}");
+        }
+    }
+    report_no_supervisor_session(sandbox_name, had_command, persist);
+    miette::miette!("sandbox '{sandbox_name}' cannot open interactive sessions")
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn finalize_sandbox_create_session(
     server: &str,
@@ -1042,6 +1065,25 @@ pub async fn sandbox_create(
                 return Ok(());
             }
 
+            let sessionless = sandbox_has_no_supervisor_session(&last_sandbox);
+
+            // A command given to a sessionless topology never runs: there is no
+            // supervisor to launch it and no session to exec it. Surface that
+            // even in the implicit-detach path a non-interactive persistent
+            // create would otherwise take silently.
+            if sessionless && !command.is_empty() {
+                return Err(abort_sessionless_create(
+                    &effective_server,
+                    &sandbox_name,
+                    persist,
+                    workspace,
+                    &effective_tls,
+                    gateway_name,
+                    true,
+                )
+                .await);
+            }
+
             // Persistent non-interactive creates detach implicitly. An
             // explicitly ephemeral (`--no-keep`) create must still attach so
             // it can observe the canonical process and delete the sandbox when
@@ -1053,30 +1095,20 @@ pub async fn sandbox_create(
                 return Ok(());
             }
 
-            // Skip the session entirely when the topology cannot serve one.
-            // Attempting it would spawn ssh, fail inside the subprocess, and
-            // surface as an opaque exit status.
-            if sandbox_has_no_supervisor_session(&last_sandbox) {
-                let had_command = !command.is_empty();
-                if !persist {
-                    let names = [sandbox_name.clone()];
-                    if let Err(err) = sandbox_delete(
-                        &effective_server,
-                        &names,
-                        false,
-                        workspace,
-                        &effective_tls,
-                        gateway_name,
-                    )
-                    .await
-                    {
-                        eprintln!("Failed to delete sandbox {sandbox_name}: {err}");
-                    }
-                }
-                report_no_supervisor_session(&sandbox_name, had_command, persist);
-                return Err(miette::miette!(
-                    "sandbox '{sandbox_name}' cannot open interactive sessions"
-                ));
+            // An interactive create against a sessionless topology cannot
+            // attach. Skip the session — which would spawn ssh, fail inside the
+            // subprocess, and surface as an opaque exit status — and explain.
+            if sessionless {
+                return Err(abort_sessionless_create(
+                    &effective_server,
+                    &sandbox_name,
+                    persist,
+                    workspace,
+                    &effective_tls,
+                    gateway_name,
+                    false,
+                )
+                .await);
             }
 
             let connect_result = if persist {
