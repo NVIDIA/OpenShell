@@ -264,6 +264,24 @@ jobs:
       - name: Run rootless Podman E2E
         run: mise run --no-deps --skip-deps e2e:podman:rootless
 
+      - name: Diagnose rootless Podman AppArmor labels
+        if: always()
+        run: |
+          set -x
+          dpkg-query -W -f='${Package} ${Version}\n' \
+            apparmor apparmor-utils passt podman conmon
+          dpkg-query -L passt
+          sudo sed -n '1,240p' /etc/apparmor.d/usr.bin.pasta || true
+          sudo aa-status --profiled || true
+          sudo cat /sys/kernel/security/apparmor/profiles || true
+          ps -eo pid,ppid,user,comm,args | grep -E '[p]odman|[p]asta' || true
+          for pid in $(pgrep -x pasta || true) $(pgrep -x podman || true); do
+            echo "=== pid=${pid} ==="
+            sudo cat "/proc/${pid}/attr/current" || true
+            sudo tr '\0' ' ' < "/proc/${pid}/cmdline" || true
+            echo
+          done
+
       - name: Print AppArmor denials
         if: always()
         run: sudo dmesg | grep -E 'apparmor=.*DENIED|profile="unprivileged_userns"' | tail -100 || true

@@ -15,6 +15,7 @@ let
 
   distros = {
     ubuntu = import ./distros/ubuntu.nix { inherit pkgs architecture; };
+    "ubuntu-26.04" = import ./distros/ubuntu-26.04.nix { inherit pkgs architecture; };
     centos = import ./distros/centos.nix { inherit pkgs architecture; };
     fedora = import ./distros/fedora.nix { inherit pkgs architecture; };
     rocky = import ./distros/rocky.nix { inherit pkgs architecture; };
@@ -23,6 +24,9 @@ let
   configurations = {
     docker = ./configuration/docker.yml;
     podman = ./configuration/podman.yml;
+    podman-rootless-pasta = ./configuration/podman-rootless-pasta.yml;
+    pasta-apparmor-control = ./configuration/pasta-apparmor-control.yml;
+    pasta-apparmor-fix = ./configuration/pasta-apparmor-fix.yml;
     selinux = ./configuration/selinux.yml;
   };
 

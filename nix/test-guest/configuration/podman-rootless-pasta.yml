@@ -1,0 +1,115 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Configure the Ubuntu 26.04 rootless Podman/pasta environment used by the
+# AppArmor regression probe. Keep this distinct from podman.yml: Ubuntu 24.04
+# intentionally remains a supported generic Podman guest even though it lacks
+# the pasta helper required for OpenShell's rootless callback topology.
+
+- name: Configure rootless Podman with pasta and AppArmor
+  hosts: test_vm
+  become: true
+  gather_facts: true
+
+  tasks:
+    - name: Validate Ubuntu 26.04 support
+      ansible.builtin.assert:
+        that:
+          - ansible_facts.distribution == "Ubuntu"
+          - ansible_facts.distribution_version == "26.04"
+        fail_msg: >-
+          podman-rootless-pasta requires the Ubuntu 26.04 guest, not
+          {{ ansible_facts.distribution }} {{ ansible_facts.distribution_version }}.
+
+    - name: Refresh Ubuntu package metadata
+      ansible.builtin.apt:
+        update_cache: true
+
+    - name: Install rootless Podman and AppArmor dependencies
+      ansible.builtin.apt:
+        name:
+          - apparmor
+          - apparmor-utils
+          - fuse-overlayfs
+          - passt
+          - podman
+          - uidmap
+        state: present
+
+    - name: Configure subordinate user and group ranges
+      ansible.builtin.lineinfile:
+        path: "{{ item.path }}"
+        line: "{{ ansible_facts.user_id }}:100000:65536"
+        regexp: "^{{ ansible_facts.user_id | regex_escape }}:"
+        create: true
+        owner: root
+        group: root
+        mode: "0644"
+      loop:
+        - path: /etc/subuid
+        - path: /etc/subgid
+
+    - name: Enable AppArmor user namespace restrictions
+      ansible.builtin.copy:
+        dest: /etc/sysctl.d/60-openshell-pasta-apparmor.conf
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          kernel.apparmor_restrict_unprivileged_userns = 1
+
+    - name: Apply AppArmor user namespace restrictions
+      ansible.builtin.command:
+        cmd: sysctl --system
+      changed_when: true
+
+    - name: Start AppArmor
+      ansible.builtin.systemd_service:
+        name: apparmor.service
+        enabled: true
+        state: started
+
+    - name: Verify AppArmor is enabled
+      ansible.builtin.command:
+        cmd: aa-status --enabled
+      changed_when: false
+
+    - name: Verify pasta AppArmor profile is installed
+      ansible.builtin.command:
+        cmd: dpkg-query -L passt
+      register: passt_files
+      changed_when: false
+
+    - name: Require the pasta AppArmor profile
+      ansible.builtin.assert:
+        that:
+          - "'/etc/apparmor.d/usr.bin.pasta' in passt_files.stdout_lines"
+        fail_msg: Ubuntu passt package did not install /etc/apparmor.d/usr.bin.pasta.
+
+    - name: Reload the packaged pasta AppArmor profile
+      ansible.builtin.command:
+        cmd: apparmor_parser --replace /etc/apparmor.d/usr.bin.pasta
+      changed_when: true
+
+    - name: Enable the rootless Podman API socket
+      ansible.builtin.systemd_service:
+        name: podman.socket
+        scope: user
+        enabled: true
+        state: started
+      become: false
+
+    - name: Verify the rootless pasta environment
+      ansible.builtin.command:
+        cmd: podman info --format '{{ "{{" }}.Host.Security.Rootless{{ "}}" }}:{{ "{{" }}.Host.RootlessNetworkCmd{{ "}}" }}'
+      become: false
+      register: podman_environment
+      changed_when: false
+
+    - name: Require rootless Podman with pasta
+      ansible.builtin.assert:
+        that:
+          - podman_environment.stdout == "true:pasta"
+        fail_msg: >-
+          Expected rootless Podman with pasta, got {{ podman_environment.stdout | quote }}.
