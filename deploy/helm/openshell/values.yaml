@@ -567,9 +567,10 @@ grpcRoute:
     # to validate the gateway pod's TLS certificate. Defaults to
     # <fullname>-backend-ca when empty. The certgen hook auto-creates this:
     # with pkiInitJob (default), immediately on install/upgrade; with
-    # cert-manager, the hook waits for cert-manager to issue the server
-    # certificate first, so on first install the ConfigMap is created during
-    # the subsequent `helm upgrade` (run upgrade after cert-manager reconciles).
+    # cert-manager, the hook polls for up to 90 seconds waiting for cert-manager
+    # to issue the server certificate, then creates the ConfigMap. A single
+    # install usually succeeds; if cert-manager takes longer than 90 seconds,
+    # run `helm upgrade` after the certificate is issued.
     caCertificateConfigMapName: ""
     # -- Hostname the Gateway proxy validates against the backend's TLS
     # certificate SAN. Defaults to the service FQDN
