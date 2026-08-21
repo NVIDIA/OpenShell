@@ -100,6 +100,7 @@ struct VmSandboxDriverConfig {
         deserialize_with = "deserialize_optional_non_empty_string_list"
     )]
     gpu_device_ids: Option<Vec<String>>,
+    rootfs_tar_path: Option<String>,
 }
 
 impl VmSandboxDriverConfig {
@@ -680,9 +681,11 @@ impl VmDriver {
     #[allow(clippy::result_large_err)]
     pub fn validate_sandbox(&self, sandbox: &Sandbox) -> Result<(), Status> {
         validate_vm_sandbox(sandbox, self.config.gpu_enabled)?;
-        if self.resolved_sandbox_image(sandbox).is_none() {
+        let has_rootfs_tar =
+            VmSandboxDriverConfig::from_sandbox(sandbox).is_ok_and(|c| c.rootfs_tar_path.is_some());
+        if self.resolved_sandbox_image(sandbox).is_none() && !has_rootfs_tar {
             return Err(Status::failed_precondition(
-                "vm sandboxes require template.image or a configured default sandbox image",
+                "vm sandboxes require template.image, rootfs_tar_path in driver_config, or a configured default sandbox image",
             ));
         }
         Ok(())
@@ -700,11 +703,20 @@ impl VmDriver {
         validate_vm_sandbox(sandbox, self.config.gpu_enabled)?;
 
         let state_dir = sandbox_state_dir(&self.config.state_dir, &sandbox.id)?;
-        let image_ref = self.resolved_sandbox_image(sandbox).ok_or_else(|| {
-            Status::failed_precondition(
-                "vm sandboxes require template.image or a configured default sandbox image",
-            )
-        })?;
+        let has_rootfs_tar =
+            VmSandboxDriverConfig::from_sandbox(sandbox).is_ok_and(|c| c.rootfs_tar_path.is_some());
+        let image_ref = self
+            .resolved_sandbox_image(sandbox)
+            .or_else(|| {
+                has_rootfs_tar
+                    .then(|| self.bootstrap_image_ref_default())
+                    .flatten()
+            })
+            .ok_or_else(|| {
+                Status::failed_precondition(
+                    "vm sandboxes require template.image, rootfs_tar_path in driver_config, or a configured default sandbox image",
+                )
+            })?;
         info!(
             sandbox_id = %sandbox.id,
             image_ref = %image_ref,
@@ -869,6 +881,10 @@ impl VmDriver {
             .and_then(|spec| spec.resource_requirements.as_ref())
             .and_then(|requirements| driver_gpu_requirements(Some(requirements)))
             .is_some();
+        let driver_config =
+            VmSandboxDriverConfig::from_sandbox(&sandbox).map_err(Status::invalid_argument)?;
+        let rootfs_tar_path = driver_config.rootfs_tar_path.map(PathBuf::from);
+
         self.publish_platform_event(
             sandbox.id.clone(),
             platform_event(
@@ -879,7 +895,9 @@ impl VmDriver {
             ),
         );
 
-        let image_plan = self.prepare_runtime_images(&sandbox.id, &image_ref).await?;
+        let image_plan = self
+            .prepare_runtime_images(&sandbox.id, &image_ref, rootfs_tar_path.as_deref())
+            .await?;
         let image_identity = image_plan.image_identity.clone();
         self.ensure_provisioning_active(&sandbox.id).await?;
         info!(
@@ -1620,7 +1638,14 @@ impl VmDriver {
         clear_stop_marker: bool,
         reconciliation_span: &tracing::Span,
     ) -> bool {
-        let Some(image_ref) = self.resolved_sandbox_image(&sandbox) else {
+        let has_rootfs_tar = VmSandboxDriverConfig::from_sandbox(&sandbox)
+            .is_ok_and(|c| c.rootfs_tar_path.is_some());
+
+        let Some(image_ref) = self.resolved_sandbox_image(&sandbox).or_else(|| {
+            has_rootfs_tar
+                .then(|| self.bootstrap_image_ref_default())
+                .flatten()
+        }) else {
             warn!(
                 sandbox_id = %sandbox.id,
                 sandbox_name = %sandbox.name,
@@ -2164,6 +2189,7 @@ impl VmDriver {
         &self,
         sandbox_id: &str,
         image_ref: &str,
+        rootfs_tar_path: Option<&Path>,
     ) -> Result<RuntimeImagePlan, Status> {
         let span_status = openshell_otel::ErrorStatusGuard::current();
         let bootstrap_image_ref = self.bootstrap_image_ref(image_ref);
@@ -2171,6 +2197,18 @@ impl VmDriver {
             .ensure_cached_bootstrap_rootfs_image(sandbox_id, &bootstrap_image_ref)
             .await?;
         let root_disk = image_cache_rootfs_image(&self.config.state_dir, &bootstrap_image_identity);
+
+        if let Some(tar_path) = rootfs_tar_path {
+            let prepared = self
+                .ensure_prepared_rootfs_tar_disk(sandbox_id, tar_path, &root_disk)
+                .await?;
+            return Ok(RuntimeImagePlan {
+                root_disk,
+                image_disk: Some(prepared.disk_path),
+                image_identity: prepared.image_identity,
+                bootstrap_image_identity,
+            });
+        }
 
         if image_ref.trim() == bootstrap_image_ref.trim() {
             return span_status.finish(Ok(RuntimeImagePlan {
@@ -2193,15 +2231,20 @@ impl VmDriver {
     }
 
     fn bootstrap_image_ref(&self, sandbox_image_ref: &str) -> String {
+        self.bootstrap_image_ref_default()
+            .unwrap_or_else(|| sandbox_image_ref.to_string())
+    }
+
+    fn bootstrap_image_ref_default(&self) -> Option<String> {
         let configured = self.config.bootstrap_image.trim();
         if !configured.is_empty() {
-            return configured.to_string();
+            return Some(configured.to_string());
         }
         let default = self.config.default_image.trim();
         if !default.is_empty() {
-            return default.to_string();
+            return Some(default.to_string());
         }
-        sandbox_image_ref.to_string()
+        None
     }
 
     #[tracing::instrument(
@@ -2690,6 +2733,100 @@ impl VmDriver {
             sandbox_id,
             image_ref,
             "local_docker",
+            &cache_identity,
+            bootstrap_root_disk,
+            &staging_dir,
+            &payload,
+        )
+        .await?;
+
+        Ok(PreparedImageDisk {
+            image_identity: cache_identity,
+            disk_path: image_path,
+        })
+    }
+
+    async fn ensure_prepared_rootfs_tar_disk(
+        &self,
+        sandbox_id: &str,
+        tar_path: &Path,
+        bootstrap_root_disk: &Path,
+    ) -> Result<PreparedImageDisk, Status> {
+        let metadata = tokio::fs::metadata(tar_path).await.map_err(|err| {
+            Status::failed_precondition(format!(
+                "rootfs tar not accessible at {}: {err}",
+                tar_path.display()
+            ))
+        })?;
+        let mtime = metadata
+            .modified()
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let tar_identity = format!("rootfs-tar:{}:{mtime}", tar_path.display());
+        let cache_identity = prepared_image_cache_identity(&tar_identity);
+        let image_path = image_cache_rootfs_image(&self.config.state_dir, &cache_identity);
+        let tar_display = tar_path.display().to_string();
+
+        if tokio::fs::metadata(&image_path).await.is_ok() {
+            self.publish_prepared_cache_hit(
+                sandbox_id,
+                &tar_display,
+                "rootfs_tar",
+                &cache_identity,
+            );
+            return Ok(PreparedImageDisk {
+                image_identity: cache_identity,
+                disk_path: image_path,
+            });
+        }
+
+        self.publish_prepared_cache_miss(sandbox_id, &tar_display, "rootfs_tar", &cache_identity);
+        let _cache_guard = self.image_cache_lock.lock().await;
+        if tokio::fs::metadata(&image_path).await.is_ok() {
+            self.publish_prepared_cache_hit(
+                sandbox_id,
+                &tar_display,
+                "rootfs_tar",
+                &cache_identity,
+            );
+            return Ok(PreparedImageDisk {
+                image_identity: cache_identity,
+                disk_path: image_path,
+            });
+        }
+
+        let staging_dir = image_cache_staging_dir(&self.config.state_dir, &cache_identity);
+        let rootfs_archive = staging_dir.join(IMAGE_EXPORT_ROOTFS_ARCHIVE);
+        self.reset_image_staging_dir(&staging_dir).await?;
+
+        self.publish_vm_progress(
+            sandbox_id,
+            "CopyingRootfsTar",
+            format!("Copying rootfs tar \"{tar_display}\""),
+            HashMap::from([
+                ("rootfs_tar_path".to_string(), tar_display.clone()),
+                ("image_source".to_string(), "rootfs_tar".to_string()),
+                ("image_identity".to_string(), cache_identity.clone()),
+            ]),
+        );
+        if let Err(err) = tokio::fs::copy(tar_path, &rootfs_archive).await {
+            let _ = tokio::fs::remove_dir_all(&staging_dir).await;
+            return Err(Status::internal(format!(
+                "failed to copy rootfs tar to staging: {err}"
+            )));
+        }
+
+        let payload = GuestImagePayload {
+            image_ref: tar_display.clone(),
+            image_identity: cache_identity.clone(),
+            source: GuestImagePayloadSource::LocalDocker { rootfs_archive },
+        };
+        self.build_prepared_image_disk(
+            sandbox_id,
+            &tar_display,
+            "rootfs_tar",
             &cache_identity,
             bootstrap_root_disk,
             &staging_dir,
