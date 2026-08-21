@@ -62,14 +62,22 @@
         apps.test-guest-cache = testGuest.cacheApp;
 
         devShells = {
-          default = pkgs.mkShell {
-            packages = [
-              rustToolchain
-              z3-static
-              aws-lc-static
-            ]
-            ++ commonDevShellPackages;
-          };
+          default =
+            (pkgs.mkShell.override {
+              stdenv =
+                if pkgs.stdenv.hostPlatform.isLinux then
+                  pkgs.stdenvAdapters.useMoldLinker pkgs.stdenv
+                else
+                  pkgs.stdenv;
+            })
+              {
+                packages = [
+                  rustToolchain
+                  z3-static
+                  aws-lc-static
+                ]
+                ++ commonDevShellPackages;
+              };
         }
         // pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
           glibc-2-28 = import ./nix/devShells/glibc-2-28.nix {
