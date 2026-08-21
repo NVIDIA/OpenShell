@@ -70,7 +70,7 @@ metadata:
     helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
 spec:
   backoffLimit: 3
-  activeDeadlineSeconds: {{ .Values.pkiInitJob.timeoutSeconds }}
+  activeDeadlineSeconds: {{ add .Values.pkiInitJob.timeoutSeconds 30 }}
   ttlSecondsAfterFinished: 300
   template:
     metadata:
@@ -123,7 +123,7 @@ spec:
             - --backend-ca-configmap-name={{ include "openshell.backendCaConfigMapName" . }}
             {{- if .Values.certManager.enabled }}
             - --backend-ca-source-secret={{ .Values.server.tls.certSecretName }}
-            - --backend-ca-poll-timeout-seconds={{ sub .Values.pkiInitJob.timeoutSeconds 30 }}
+            - --backend-ca-poll-timeout-seconds={{ .Values.pkiInitJob.timeoutSeconds }}
             {{- if .Values.pkiInitJob.failOnTimeout }}
             - --backend-ca-fail-on-timeout
             {{- end }}
