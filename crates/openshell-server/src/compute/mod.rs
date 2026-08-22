@@ -3131,6 +3131,10 @@ impl ComputeRuntime {
         self.tracing_log_bus.remove(sandbox_id);
         self.tracing_log_bus.platform_event_bus.remove(sandbox_id);
         self.sandbox_watch_bus.remove(sandbox_id);
+        // Drop the sessionless marker on permanent removal only. It is a
+        // topology property that must survive stop/start, so it is not cleared
+        // in cleanup_stopped_sandbox_sessions.
+        self.supervisor_sessions.forget_sessionless(sandbox_id);
     }
 
     async fn reconcile_snapshot_sandbox(
