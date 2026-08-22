@@ -1421,6 +1421,7 @@ impl KubernetesComputeDriver {
             .resolve_sandbox_identity_in_namespace(&target_namespace)
             .await;
 
+        let cr_name = self.config.kube_resource_name(workspace, name);
         let params = SandboxPodParams {
             default_image: &self.config.default_image,
             image_pull_policy: &self.config.image_pull_policy,
@@ -1451,6 +1452,7 @@ impl KubernetesComputeDriver {
             service_account_name: &self.config.service_account_name,
             sandbox_id: &sandbox.id,
             sandbox_name: &sandbox.name,
+            cr_name: &cr_name,
             grpc_endpoint: &self.config.grpc_endpoint,
             ssh_socket_path: self.ssh_socket_path(),
             client_tls_secret_name: &self.config.client_tls_secret_name,
@@ -1472,7 +1474,7 @@ impl KubernetesComputeDriver {
 
         let data = sandbox_to_k8s_spec(sandbox.spec.as_ref(), &params)
             .map_err(KubernetesDriverError::InvalidArgument)?;
-        let kube_name = self.config.kube_resource_name(workspace, name);
+        let kube_name = cr_name.clone();
         let mut obj = DynamicObject::new(&kube_name, &agent_sandbox_api.resource);
         let mut annotations = sandbox_annotations(sandbox);
         for key in [
@@ -1548,7 +1550,7 @@ impl KubernetesComputeDriver {
                 error = %err,
                 "Failed to create proxy-pod resources; deleting Sandbox CR"
             );
-            self.cleanup_proxy_pod_resources(name, &self.config.namespace)
+            self.cleanup_proxy_pod_resources(params.cr_name, params.namespace)
                 .await;
             let _ = tokio::time::timeout(
                 KUBE_API_TIMEOUT,
@@ -3657,7 +3659,7 @@ fn apply_supervisor_proxy_pod_topology(
 
     apply_proxy_pod_affinity(spec, params.sandbox_id, params.proxy_pod_affinity);
 
-    let names = proxy_pod_resource_names(params.sandbox_name);
+    let names = proxy_pod_resource_names(params.cr_name);
     let service_dns = proxy_pod_service_dns(&names.service, params.namespace);
 
     let volumes = spec
@@ -4016,6 +4018,10 @@ struct SandboxPodParams<'a> {
     service_account_name: &'a str,
     sandbox_id: &'a str,
     sandbox_name: &'a str,
+    /// Sandbox CR resource name (`kube_resource_name`), unique per sandbox in
+    /// every workspace mode. Companion resource names derive from this so they
+    /// match across the workload pod template and the companion objects.
+    cr_name: &'a str,
     grpc_endpoint: &'a str,
     ssh_socket_path: &'a str,
     client_tls_secret_name: &'a str,
@@ -4060,6 +4066,7 @@ impl Default for SandboxPodParams<'_> {
             service_account_name: DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME,
             sandbox_id: "",
             sandbox_name: "",
+            cr_name: "",
             grpc_endpoint: "",
             ssh_socket_path: "",
             client_tls_secret_name: "",
@@ -7502,6 +7509,7 @@ mod tests {
             namespace: "agents",
             sandbox_id: "sandbox-123",
             sandbox_name: "example-sandbox",
+            cr_name: "example-sandbox",
             grpc_endpoint: "https://openshell-gateway.openshell.svc:8080",
             proxy_uid: 2200,
             sandbox_uid: 1500,
@@ -7618,6 +7626,7 @@ mod tests {
             namespace: "agents",
             sandbox_id: "sandbox-123",
             sandbox_name: "example-sandbox",
+            cr_name: "example-sandbox",
             proxy_uid: 2200,
             sandbox_uid: 1500,
             sandbox_gid: 1600,
@@ -7706,6 +7715,7 @@ mod tests {
             service_account_name: "openshell-sandbox",
             sandbox_id: "sandbox-123",
             sandbox_name: "example-sandbox",
+            cr_name: "example-sandbox",
             grpc_endpoint: "http://openshell-gateway.openshell.svc:8080",
             proxy_uid: 2200,
             sandbox_uid: 1500,
@@ -7843,6 +7853,7 @@ mod tests {
             namespace: "agents",
             sandbox_id: "sandbox-123",
             sandbox_name: "example-sandbox",
+            cr_name: "example-sandbox",
             proxy_pod_dns_peers: peers,
             ..SandboxPodParams::default()
         };
@@ -7924,6 +7935,52 @@ mod tests {
     }
 
     #[test]
+    fn proxy_pod_pod_template_references_companions_by_cr_name() {
+        // Shared mode: CR name is `<workspace>--<name>`, distinct from the bare
+        // sandbox name. The workload pod's CA secret mount and proxy URL must
+        // use the CR-name-derived companion names, or the pod mounts a secret
+        // that does not exist (and never becomes Ready).
+        let params = SandboxPodParams {
+            topology: SupervisorTopology::ProxyPod,
+            supervisor_image: "supervisor:latest",
+            namespace: "agents",
+            sandbox_id: "sandbox-1",
+            sandbox_name: "dev",
+            cr_name: "team-a--dev",
+            proxy_uid: 2000,
+            sandbox_uid: 1500,
+            sandbox_gid: 1500,
+            ..SandboxPodParams::default()
+        };
+        let pod_template = sandbox_template_to_k8s(
+            &SandboxTemplate {
+                image: "agent:latest".to_string(),
+                ..SandboxTemplate::default()
+            },
+            false,
+            &std::collections::HashMap::new(),
+            false,
+            &params,
+        );
+        let names = proxy_pod_resource_names("team-a--dev");
+        let service_dns = proxy_pod_service_dns(&names.service, "agents");
+        let agent = &pod_template["spec"]["containers"][0];
+        assert_eq!(
+            rendered_env(agent, "HTTP_PROXY"),
+            Some(format!("http://{service_dns}:3128").as_str())
+        );
+        let volumes = pod_template["spec"]["volumes"].as_array().unwrap();
+        assert!(
+            volumes.iter().any(|v| {
+                v["name"] == "openshell-proxy-pod-ca-source"
+                    && v["secret"]["secretName"] == serde_json::json!(names.proxy_ca_secret)
+            }),
+            "workload CA volume must reference the CR-name-derived secret {}",
+            names.proxy_ca_secret
+        );
+    }
+
+    #[test]
     fn proxy_pod_resource_names_disambiguate_by_cr_name() {
         // In shared mode two workspaces may hold a sandbox named `dev`, giving
         // CR names `workspace-a--dev` and `workspace-b--dev`. Companion names
@@ -7976,6 +8033,7 @@ mod tests {
             namespace: "agents",
             sandbox_id: "sandbox-123",
             sandbox_name: "example-sandbox",
+            cr_name: "example-sandbox",
             proxy_uid: 2200,
             sandbox_uid: 1500,
             sandbox_gid: 1500,
@@ -8017,6 +8075,7 @@ mod tests {
             namespace: "agents",
             sandbox_id: "sandbox-123",
             sandbox_name: "example-sandbox",
+            cr_name: "example-sandbox",
             ..SandboxPodParams::default()
         };
         let pod_template = sandbox_template_to_k8s(
