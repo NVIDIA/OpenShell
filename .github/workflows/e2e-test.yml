@@ -261,6 +261,55 @@ jobs:
       - name: Log in to GHCR with Podman
         run: echo "${{ secrets.GITHUB_TOKEN }}" | podman login ghcr.io -u "${{ github.actor }}" --password-stdin
 
+      - name: Capture live rootless pasta state
+        run: |
+          set -euo pipefail
+          workdir="$(mktemp -d "${RUNNER_TEMP}/openshell-pasta-live.XXXXXX")"
+          socket="${workdir}/podman/podman.sock"
+          service_log="${workdir}/podman-service.log"
+          container_name="openshell-pasta-live-$$"
+          service_pid=""
+          cleanup() {
+            if [ -S "${socket}" ]; then
+              podman --url "unix://${socket}" rm --force "${container_name}" >/dev/null 2>&1 || true
+            fi
+            if [ -n "${service_pid}" ] && kill -0 "${service_pid}" 2>/dev/null; then
+              kill "${service_pid}" 2>/dev/null || true
+              wait "${service_pid}" 2>/dev/null || true
+            fi
+          }
+          trap cleanup EXIT
+
+          mkdir -p "$(dirname "${socket}")"
+          podman system service --time=0 "unix://${socket}" >"${service_log}" 2>&1 &
+          service_pid="$!"
+          for _ in $(seq 1 30); do
+            if [ -S "${socket}" ] && podman --url "unix://${socket}" info >/dev/null 2>&1; then
+              break
+            fi
+            if ! kill -0 "${service_pid}" 2>/dev/null; then
+              cat "${service_log}" >&2 || true
+              exit 1
+            fi
+            sleep 1
+          done
+          podman --url "unix://${socket}" info >/dev/null
+          podman --url "unix://${socket}" run --detach --name "${container_name}" \
+            docker.io/library/alpine:3.22 sleep infinity >/dev/null
+
+          echo "=== live rootless pasta state ==="
+          ps -eo pid,ppid,user,comm,args | grep -E '[p]odman|[p]asta' || true
+          for pid in "${service_pid}" $(pgrep -x pasta || true); do
+            [ -r "/proc/${pid}/attr/current" ] || continue
+            echo "=== pid=${pid} ==="
+            sudo cat "/proc/${pid}/attr/current" || true
+            readlink "/proc/${pid}/ns/user" || true
+            readlink "/proc/${pid}/ns/net" || true
+            sudo cat "/proc/${pid}/cgroup" || true
+            sudo cat "/proc/${pid}/cmdline" | tr '\0' ' ' || true
+            echo
+          done
+
       - name: Run rootless Podman E2E
         run: mise run --no-deps --skip-deps e2e:podman:rootless
 
