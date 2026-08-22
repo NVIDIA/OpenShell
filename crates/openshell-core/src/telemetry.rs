@@ -216,6 +216,7 @@ pub enum ProviderProfile {
     Openai,
     Opencode,
     Outlook,
+    Tars,
     Custom,
 }
 
@@ -234,6 +235,7 @@ impl ProviderProfile {
             Self::Openai => "openai",
             Self::Opencode => "opencode",
             Self::Outlook => "outlook",
+            Self::Tars => "tars",
             Self::Custom => "custom",
         }
     }
@@ -252,6 +254,7 @@ impl ProviderProfile {
             "openai" => Self::Openai,
             "opencode" => Self::Opencode,
             "outlook" => Self::Outlook,
+            "tars" | "agentrouter" | "tetrate-agent-router" => Self::Tars,
             _ => Self::Custom,
         }
     }

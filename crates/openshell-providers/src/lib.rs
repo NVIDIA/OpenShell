@@ -116,6 +116,7 @@ impl ProviderRegistry {
         registry.register(providers::anthropic::SPEC);
         registry.register(providers::nvidia::SPEC);
         registry.register(providers::deepinfra::SPEC);
+        registry.register(providers::tars::SPEC);
         registry.register(providers::github::SPEC);
         registry.register(providers::gitlab::SPEC);
         registry.register(providers::google_cloud::GoogleCloudProvider);
@@ -240,6 +241,12 @@ mod tests {
         assert_eq!(
             normalize_provider_type("vertex-ai"),
             Some("google-vertex-ai")
+        );
+        assert_eq!(normalize_provider_type("tars"), Some("tars"));
+        assert_eq!(normalize_provider_type("agentrouter"), Some("tars"));
+        assert_eq!(
+            normalize_provider_type("tetrate-agent-router"),
+            Some("tars")
         );
         assert_eq!(normalize_provider_type("unknown"), None);
     }
