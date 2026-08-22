@@ -65,8 +65,6 @@ use openshell_supervisor_network::opa::OpaEngine;
 use openshell_supervisor_process::process::ProcessEnforcementMode;
 pub use openshell_supervisor_process::process::{ProcessHandle, ProcessStatus};
 use openshell_supervisor_process::skills;
-use tokio::io::copy_bidirectional;
-use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc::UnboundedSender;
 #[cfg(any(test, target_os = "linux"))]
 use tokio::time::timeout;
@@ -549,20 +547,6 @@ pub async fn run_sandbox(
             )
             .await?,
         )
-    } else {
-        None
-    };
-
-    let _gateway_forward = if network_enabled && proxy_pod_network_enforcement {
-        if !matches!(policy.network.mode, NetworkMode::Proxy) {
-            return Err(miette::miette!(
-                "external network enforcement requires proxy network mode"
-            ));
-        }
-        let endpoint = openshell_endpoint_for_proxy.as_deref().ok_or_else(|| {
-            miette::miette!("proxy-pod network enforcement requires an OpenShell gateway endpoint")
-        })?;
-        Some(start_gateway_forward_from_env(endpoint).await?)
     } else {
         None
     };
@@ -1320,100 +1304,6 @@ fn process_policy_for_topology(
         }
     }
     Ok(process_policy)
-}
-
-struct GatewayForwardHandle {
-    task: tokio::task::JoinHandle<()>,
-}
-
-impl Drop for GatewayForwardHandle {
-    fn drop(&mut self) {
-        self.task.abort();
-    }
-}
-
-async fn start_gateway_forward_from_env(endpoint: &str) -> Result<GatewayForwardHandle> {
-    let listen_addr =
-        std::env::var(openshell_core::sandbox_env::GATEWAY_FORWARD_ADDR).map_err(|_| {
-            miette::miette!(
-                "{} is required for proxy-pod gateway forwarding",
-                openshell_core::sandbox_env::GATEWAY_FORWARD_ADDR
-            )
-        })?;
-    start_gateway_forward(&listen_addr, endpoint).await
-}
-
-async fn start_gateway_forward(listen_addr: &str, endpoint: &str) -> Result<GatewayForwardHandle> {
-    let upstream = gateway_tcp_addr(endpoint)?;
-    let listener = TcpListener::bind(listen_addr).await.into_diagnostic()?;
-    info!(
-        listen_addr,
-        upstream, "Gateway TCP forward started for proxy-pod topology"
-    );
-
-    let task = tokio::spawn(async move {
-        loop {
-            let (mut inbound, peer) = match listener.accept().await {
-                Ok(accepted) => accepted,
-                Err(e) => {
-                    warn!(error = %e, "Gateway forward accept failed");
-                    continue;
-                }
-            };
-            let upstream = upstream.clone();
-            tokio::spawn(async move {
-                let mut outbound = match TcpStream::connect(&upstream).await {
-                    Ok(stream) => stream,
-                    Err(e) => {
-                        warn!(peer = %peer, upstream, error = %e, "Gateway forward connect failed");
-                        return;
-                    }
-                };
-                if let Err(e) = copy_bidirectional(&mut inbound, &mut outbound).await {
-                    debug!(peer = %peer, error = %e, "Gateway forward connection closed with error");
-                }
-            });
-        }
-    });
-
-    Ok(GatewayForwardHandle { task })
-}
-
-fn gateway_tcp_addr(endpoint: &str) -> Result<String> {
-    let (scheme, rest) = endpoint
-        .split_once("://")
-        .ok_or_else(|| miette::miette!("gateway endpoint must include a URL scheme"))?;
-    let default_port = match scheme {
-        "http" => 80,
-        "https" => 443,
-        other => {
-            return Err(miette::miette!(
-                "unsupported gateway endpoint scheme '{other}' for proxy-pod forwarding"
-            ));
-        }
-    };
-    let authority = rest.split('/').next().unwrap_or(rest);
-    if authority.is_empty() {
-        return Err(miette::miette!("gateway endpoint is missing a host"));
-    }
-    if authority.starts_with('[') {
-        let closing = authority
-            .find(']')
-            .ok_or_else(|| miette::miette!("invalid bracketed IPv6 gateway endpoint"))?;
-        let host = &authority[..=closing];
-        let port = authority[closing + 1..]
-            .strip_prefix(':')
-            .and_then(|value| value.parse::<u16>().ok())
-            .unwrap_or(default_port);
-        return Ok(format!("{host}:{port}"));
-    }
-    let (host, port) = match authority.rsplit_once(':') {
-        Some((host, port)) if !host.is_empty() => {
-            (host, port.parse::<u16>().unwrap_or(default_port))
-        }
-        _ => (authority, default_port),
-    };
-    Ok(format!("{host}:{port}"))
 }
 
 /// Flush aggregated denial summaries to the gateway via `SubmitPolicyAnalysis`.
