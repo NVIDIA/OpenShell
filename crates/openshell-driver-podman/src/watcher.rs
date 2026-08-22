@@ -26,8 +26,7 @@ use tracing::{debug, info, warn};
 // Condition reason constants shared across event-building paths.
 const CONDITION_RUNNING: &str = "ContainerRunning";
 const CONDITION_STARTING: &str = "ContainerStarting";
-const CONDITION_EXITED: &str = "ContainerExited";
-const CONDITION_STOPPED: &str = "ContainerStopped";
+use openshell_core::driver_utils::{CONDITION_EXITED, CONDITION_STOPPED};
 
 pub type WatchStream =
     Pin<Box<dyn Stream<Item = Result<WatchSandboxesEvent, ComputeDriverError>> + Send>>;
