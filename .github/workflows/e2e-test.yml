@@ -272,6 +272,62 @@ jobs:
       - name: Log in to GHCR with Podman
         run: echo "${{ secrets.GITHUB_TOKEN }}" | podman login ghcr.io -u "${{ github.actor }}" --password-stdin
 
+      - name: Capture live rootless pasta state
+        run: |
+          set -euo pipefail
+          workdir="$(mktemp -d "${RUNNER_TEMP}/openshell-pasta-live.XXXXXX")"
+          socket="${workdir}/podman/podman.sock"
+          service_log="${workdir}/podman-service.log"
+          container_name="openshell-pasta-live-$$"
+          service_pid=""
+          cleanup() {
+            if [ -S "${socket}" ]; then
+              podman --url "unix://${socket}" rm --force "${container_name}" >/dev/null 2>&1 || true
+            fi
+            if [ -n "${service_pid}" ] && kill -0 "${service_pid}" 2>/dev/null; then
+              kill "${service_pid}" 2>/dev/null || true
+              wait "${service_pid}" 2>/dev/null || true
+            fi
+          }
+          trap cleanup EXIT
+
+          mkdir -p "$(dirname "${socket}")"
+          podman system service --time=0 "unix://${socket}" >"${service_log}" 2>&1 &
+          service_pid="$!"
+          for _ in $(seq 1 30); do
+            if [ -S "${socket}" ] && podman --url "unix://${socket}" info >/dev/null 2>&1; then
+              break
+            fi
+            if ! kill -0 "${service_pid}" 2>/dev/null; then
+              cat "${service_log}" >&2 || true
+              exit 1
+            fi
+            sleep 1
+          done
+          podman --url "unix://${socket}" info >/dev/null
+          podman --url "unix://${socket}" run --detach --name "${container_name}" \
+            docker.io/library/alpine:3.22 sleep infinity >/dev/null
+
+          # Ubuntu selects pasta.avx2 on x86 hosts with AVX2 and pasta on
+          # other architectures. Match the executable path rather than the
+          # short process name so this capture covers both variants.
+          pasta_pids() {
+            pgrep -f '^/usr/bin/pasta(\.avx2)?( |$)' || true
+          }
+          echo "=== live rootless pasta state ==="
+          ps -eo pid,ppid,user,comm,args | grep -E '[p]odman|[p]asta' || true
+          for pid in "${service_pid}" $(pasta_pids); do
+            [ -r "/proc/${pid}/attr/current" ] || continue
+            echo "=== pid=${pid} ==="
+            sudo cat "/proc/${pid}/attr/current" || true
+            readlink "/proc/${pid}/ns/user" || true
+            readlink "/proc/${pid}/ns/net" || true
+            sudo cat "/proc/${pid}/cgroup" || true
+            readlink "/proc/${pid}/exe" || true
+            sudo cat "/proc/${pid}/cmdline" | tr '\0' ' ' || true
+            echo
+          done
+
       - name: Run Podman E2E
         run: ${{ matrix.cmd }}
 
@@ -286,7 +342,10 @@ jobs:
           sudo aa-status --profiled || true
           sudo cat /sys/kernel/security/apparmor/profiles || true
           ps -eo pid,ppid,user,comm,args | grep -E '[p]odman|[p]asta' || true
-          for pid in $(pgrep -x pasta || true) $(pgrep -x podman || true); do
+          pasta_pids() {
+            pgrep -f '^/usr/bin/pasta(\.avx2)?( |$)' || true
+          }
+          for pid in $(pasta_pids) $(pgrep -x podman || true); do
             echo "=== pid=${pid} ==="
             sudo cat "/proc/${pid}/attr/current" || true
             sudo tr '\0' ' ' < "/proc/${pid}/cmdline" || true
