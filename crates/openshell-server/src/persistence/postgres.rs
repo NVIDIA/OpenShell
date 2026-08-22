@@ -25,10 +25,21 @@ pub struct PostgresStore {
     pool: PgPool,
 }
 
+/// Pool ceiling used when the operator has not configured one.
+///
+/// A single shared pool serves every database-backed RPC, so this value is
+/// also the gateway's ceiling on concurrent database work. It is high enough
+/// for a single-replica gateway against a default-sized server; fleets that
+/// outgrow it raise it through `[openshell.gateway] database_max_connections`.
+pub const DEFAULT_MAX_CONNECTIONS: u32 = 10;
+
 impl PostgresStore {
-    pub async fn connect(url: &str) -> PersistenceResult<Self> {
+    /// Connect and size the pool, falling back to [`DEFAULT_MAX_CONNECTIONS`].
+    pub async fn connect(url: &str, max_connections: Option<u32>) -> PersistenceResult<Self> {
+        let max_connections = max_connections.unwrap_or(DEFAULT_MAX_CONNECTIONS);
+        tracing::info!(max_connections, "sizing Postgres connection pool");
         let pool = PgPoolOptions::new()
-            .max_connections(10)
+            .max_connections(max_connections)
             .connect(url)
             .await
             .map_err(|e| map_db_error(&e))?;

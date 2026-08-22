@@ -201,10 +201,24 @@ impl Store {
         matches!(self, Self::Sqlite(_))
     }
 
-    /// Connect to a persistence store based on the database URL.
+    /// Connect to a persistence store based on the database URL, leaving pool
+    /// sizing at the backend default.
     pub async fn connect(url: &str) -> CoreResult<Self> {
+        Self::connect_with_pool_size(url, None).await
+    }
+
+    /// Connect to a persistence store based on the database URL.
+    ///
+    /// `max_connections` overrides the backend's pool ceiling, which stays at
+    /// its built-in default when `None`. The two backends have different
+    /// defaults, and an in-memory `SQLite` database ignores the override
+    /// entirely — it must be held by exactly one connection.
+    pub async fn connect_with_pool_size(
+        url: &str,
+        max_connections: Option<u32>,
+    ) -> CoreResult<Self> {
         if url.starts_with("postgres://") || url.starts_with("postgresql://") {
-            let store = PostgresStore::connect(url)
+            let store = PostgresStore::connect(url, max_connections)
                 .await
                 .map_err(|e| CoreError::execution(e.to_string()))?;
             store
@@ -213,7 +227,7 @@ impl Store {
                 .map_err(|e| CoreError::execution(e.to_string()))?;
             Ok(Self::Postgres(store))
         } else if url.starts_with("sqlite:") {
-            let store = SqliteStore::connect(url)
+            let store = SqliteStore::connect(url, max_connections)
                 .await
                 .map_err(|e| CoreError::execution(e.to_string()))?;
             store
