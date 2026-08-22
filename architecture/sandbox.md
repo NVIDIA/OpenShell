@@ -370,7 +370,14 @@ sandbox workload directly. The relay supports:
 - Attachment to the canonical main process through the `openshell-main` SSH
   subsystem. The supervisor owns its retained PTY or pipes, a 1 MiB replay
   buffer, and a single stdin lease across client disconnects.
-- Independent shell and command execution sessions.
+- Independent interactive shell sessions.
+- Command execution. Commands run through a login shell (`bash -lc`) by default,
+  so the first of the user's `.bash_profile`, `.bash_login`, or `.profile` is
+  sourced (and `.bashrc` only if that file sources it). Callers set
+  `ExecSandboxRequest.no_login_shell` to skip those files; the gateway signals
+  this to the supervisor over the SSH `OPENSHELL_NO_LOGIN_SHELL` env request,
+  which selects `bash -c` instead of `bash -lc`. Note `bash -c` still reads
+  `BASH_ENV` when the child environment sets it.
 - Tar-based file sync.
 - Port forwarding where supported by the CLI/TUI surface.
 

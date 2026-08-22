@@ -1589,6 +1589,15 @@ enum SandboxCommands {
         #[arg(long, overrides_with = "tty")]
         no_tty: bool,
 
+        /// Run the command without sourcing shell login/profile startup files.
+        ///
+        /// Default sources them so tool-specific env (`VIRTUAL_ENV`, etc.) is
+        /// available. Use this for automation and managed checks that need
+        /// predictable startup behavior — sandbox-user startup files cannot run
+        /// before the requested command.
+        #[arg(long)]
+        no_login_shell: bool,
+
         /// Set a non-secret environment variable for the command.
         /// Do not use this option for API keys, tokens, or other secrets; attach
         /// a provider to the sandbox instead. Repeatable.
@@ -3229,6 +3238,7 @@ async fn run_async() -> Result<()> {
                             no_tty,
                             envs,
                             command,
+                            no_login_shell,
                         } => {
                             let name = resolve_sandbox_name(name, &ctx.name, &cli.workspace)?;
                             // Resolve --tty / --no-tty into an Option<bool> override.
@@ -3248,6 +3258,7 @@ async fn run_async() -> Result<()> {
                                 timeout,
                                 tty_override,
                                 &env_map,
+                                no_login_shell,
                                 &tls,
                                 &cli.workspace,
                             )

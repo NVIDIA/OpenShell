@@ -407,6 +407,7 @@ impl OpenShellClient {
             tty: false,
             cols: 0,
             rows: 0,
+            no_login_shell: opts.no_login_shell,
         };
 
         // Open the stream under the same OIDC-aware auth policy as unary RPCs
@@ -705,6 +706,7 @@ impl WorkspaceScopedClient {
             tty: false,
             cols: 0,
             rows: 0,
+            no_login_shell: opts.no_login_shell,
         };
 
         let mut stream = self
