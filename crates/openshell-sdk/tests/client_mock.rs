@@ -499,6 +499,13 @@ impl OpenShell for TestOpenShell {
         Ok(Response::new(proto::GetGatewayConfigResponse::default()))
     }
 
+    async fn exchange_provider_subject_token(
+        &self,
+        _: tonic::Request<proto::ExchangeProviderSubjectTokenRequest>,
+    ) -> Result<Response<proto::ExchangeProviderSubjectTokenResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
     async fn update_config(
         &self,
         _: tonic::Request<proto::UpdateConfigRequest>,

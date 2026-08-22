@@ -265,6 +265,9 @@ func TestConverterCoversAllProtoFields_ProviderCredentialTokenGrant(t *testing.T
 		"cache_ttl_seconds":     true,
 		"audience_overrides":    true,
 		"client_assertion_type": true,
+		"grant_type":            true,
+		"subject_token":         true,
+		"requested_token_type":  true,
 	}
 
 	assertAllFieldsCovered(t, (&pb.ProviderCredentialTokenGrant{}).ProtoReflect().Descriptor(), handled, nil)

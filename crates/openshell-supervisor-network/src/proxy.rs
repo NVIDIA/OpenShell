@@ -22,7 +22,7 @@ use openshell_core::net::{
     set_tcp_nodelay_best_effort,
 };
 use openshell_core::policy::ProxyPolicy;
-use openshell_core::provider_credentials::ProviderCredentialState;
+use openshell_core::provider_credentials::{ProviderCredentialSnapshot, ProviderCredentialState};
 use openshell_core::secrets::{self, SecretResolver, rewrite_header_line_checked};
 use openshell_ocsf::{
     ActionId, ActivityId, AiModel, ApiActivityBuilder, DispositionId, Endpoint,
@@ -102,6 +102,27 @@ const HOST_GATEWAY_ALIASES: &[&str] = &[
     "host.containers.internal",
     "host.docker.internal",
 ];
+
+fn revision_scoped_dynamic_credentials(
+    snapshot: &ProviderCredentialSnapshot,
+) -> std::collections::HashMap<String, openshell_core::proto::ProviderProfileCredential> {
+    snapshot
+        .dynamic_credentials
+        .iter()
+        .map(|(key, credential)| {
+            let scoped_key = key.rsplit_once('\t').map_or_else(
+                || format!("rev:{}\t{key}", snapshot.revision),
+                |(endpoint_selector, provider_credential)| {
+                    format!(
+                        "{endpoint_selector}\trev:{}\t{provider_credential}",
+                        snapshot.revision
+                    )
+                },
+            );
+            (scoped_key, credential.clone())
+        })
+        .collect()
+}
 
 /// Cloud instance metadata IPs that are NEVER exempted from SSRF blocking,
 /// even when they coincidentally match a host-gateway alias resolution.
@@ -363,9 +384,9 @@ impl ProxyHandle {
                             .as_ref()
                             .and_then(ProviderCredentialState::resolver);
                         let dynamic_credentials = provider_credentials.as_ref().map(|state| {
-                            Arc::new(std::sync::RwLock::new(
-                                state.snapshot().dynamic_credentials.clone(),
-                            ))
+                            Arc::new(std::sync::RwLock::new(revision_scoped_dynamic_credentials(
+                                &state.snapshot(),
+                            )))
                         });
                         let dtx = denial_tx.clone();
                         let atx = activity_tx.clone();
@@ -7406,6 +7427,29 @@ network_policies:
     }
 
     #[test]
+    fn revision_scoped_dynamic_credentials_preserves_endpoint_selector_and_adds_revision() {
+        let mut dynamic_credentials = std::collections::HashMap::new();
+        dynamic_credentials.insert(
+            "api.example.test\t443\t/v1/**\tprovider:access_token".to_string(),
+            openshell_core::proto::ProviderProfileCredential {
+                name: "access_token".to_string(),
+                ..Default::default()
+            },
+        );
+        let snapshot = ProviderCredentialSnapshot {
+            revision: 42,
+            child_env: std::collections::HashMap::new(),
+            dynamic_credentials,
+        };
+
+        let scoped = revision_scoped_dynamic_credentials(&snapshot);
+
+        assert!(
+            scoped.contains_key("api.example.test\t443\t/v1/**\trev:42\tprovider:access_token")
+        );
+    }
+
+    #[test]
     fn connect_activity_is_skipped_when_l7_will_count_the_request() {
         let (tx, mut rx) = mpsc::channel(4);
         let activity_tx = Some(tx);
@@ -7906,20 +7950,7 @@ network_policies:
         crate::l7::token_grant_injection::test_support::TokenGrantTestFixture,
     ) {
         let provider_key = "api.example.test\t8080\t/v1/**\tprovider:access_token";
-        let fixture = match resolver_response {
-            Ok(token) => {
-                crate::l7::token_grant_injection::test_support::TokenGrantTestFixture::success(
-                    provider_key,
-                    token,
-                )
-            }
-            Err(error) => {
-                crate::l7::token_grant_injection::test_support::TokenGrantTestFixture::failure(
-                    provider_key,
-                    error,
-                )
-            }
-        };
+        let fixture = forward_token_grant_fixture(provider_key, resolver_response, false);
         let ctx = crate::l7::relay::L7EvalContext {
             host: "api.example.test".into(),
             port: 8080,
@@ -7935,6 +7966,54 @@ network_policies:
         };
 
         (ctx, fixture)
+    }
+
+    fn forward_token_exchange_context(
+        resolver_response: std::result::Result<&str, &str>,
+    ) -> (
+        crate::l7::relay::L7EvalContext,
+        crate::l7::token_grant_injection::test_support::TokenGrantTestFixture,
+    ) {
+        let (mut ctx, _) = forward_token_grant_context(Ok("unused-token"));
+        let provider_key = "api.example.test\t8080\t/v1/**\tprovider:access_token";
+        let fixture = forward_token_grant_fixture(provider_key, resolver_response, true);
+        ctx.dynamic_credentials = Some(fixture.dynamic_credentials());
+        ctx.token_grant_resolver = Some(fixture.resolver());
+
+        (ctx, fixture)
+    }
+
+    fn forward_token_grant_fixture(
+        provider_key: &str,
+        resolver_response: std::result::Result<&str, &str>,
+        token_exchange: bool,
+    ) -> crate::l7::token_grant_injection::test_support::TokenGrantTestFixture {
+        match (resolver_response, token_exchange) {
+            (Ok(token), false) => {
+                crate::l7::token_grant_injection::test_support::TokenGrantTestFixture::success(
+                    provider_key,
+                    token,
+                )
+            }
+            (Ok(token), true) => {
+                crate::l7::token_grant_injection::test_support::TokenGrantTestFixture::success_token_exchange(
+                    provider_key,
+                    token,
+                )
+            }
+            (Err(error), false) => {
+                crate::l7::token_grant_injection::test_support::TokenGrantTestFixture::failure(
+                    provider_key,
+                    error,
+                )
+            }
+            (Err(error), true) => {
+                crate::l7::token_grant_injection::test_support::TokenGrantTestFixture::failure_token_exchange(
+                    provider_key,
+                    error,
+                )
+            }
+        }
     }
 
     fn authorization_header_count(headers: &str) -> usize {
@@ -10775,6 +10854,34 @@ network_policies:
     }
 
     #[tokio::test]
+    async fn forward_proxy_injects_token_exchange_before_rewriting_request() {
+        let (ctx, fixture) = forward_token_exchange_context(Ok("grant-token"));
+        let raw = b"GET http://api.example.test:8080/v1/projects HTTP/1.1\r\nHost: api.example.test:8080\r\nAuthorization: Bearer stale-token\r\nConnection: close\r\n\r\n".to_vec();
+
+        let with_token = inject_token_grant_for_forward_request("GET", "/v1/projects", raw, &ctx)
+            .await
+            .expect("forward token exchange should inject");
+        let rewritten = rewrite_forward_request(
+            &with_token,
+            with_token.len(),
+            "/v1/projects",
+            "api.example.test:8080",
+            None,
+            false,
+        )
+        .expect("forward request should rewrite");
+        let rewritten = String::from_utf8_lossy(&rewritten);
+
+        assert!(rewritten.starts_with("GET /v1/projects HTTP/1.1\r\n"));
+        assert!(rewritten.contains("Authorization: Bearer grant-token\r\n"));
+        assert!(!rewritten.contains("stale-token"));
+        assert_eq!(authorization_header_count(&rewritten), 1);
+        fixture.assert_one_token_exchange_request(
+            "api.example.test\t8080\t/v1/**\tprovider:access_token",
+        );
+    }
+
+    #[tokio::test]
     async fn forward_proxy_token_grant_failure_returns_error_before_rewrite() {
         let (ctx, fixture) = forward_token_grant_context(Err("oauth unavailable"));
         let raw = b"GET http://api.example.test:8080/v1/projects HTTP/1.1\r\nHost: api.example.test:8080\r\nConnection: close\r\n\r\n".to_vec();
@@ -10786,6 +10893,22 @@ network_policies:
         assert!(err.to_string().contains("Token grant failed"));
         assert!(err.to_string().contains("oauth unavailable"));
         fixture.assert_one_request("api.example.test\t8080\t/v1/**\tprovider:access_token");
+    }
+
+    #[tokio::test]
+    async fn forward_proxy_token_exchange_failure_returns_error_before_rewrite() {
+        let (ctx, fixture) = forward_token_exchange_context(Err("oauth unavailable"));
+        let raw = b"GET http://api.example.test:8080/v1/projects HTTP/1.1\r\nHost: api.example.test:8080\r\nConnection: close\r\n\r\n".to_vec();
+
+        let err = inject_token_grant_for_forward_request("GET", "/v1/projects", raw, &ctx)
+            .await
+            .expect_err("forward token exchange failure should stop request rewriting");
+
+        assert!(err.to_string().contains("Token grant failed"));
+        assert!(err.to_string().contains("oauth unavailable"));
+        fixture.assert_one_token_exchange_request(
+            "api.example.test\t8080\t/v1/**\tprovider:access_token",
+        );
     }
 
     #[test]
