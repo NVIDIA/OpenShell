@@ -35,6 +35,11 @@ description: |
          openshell status
          openshell gateway add http://127.0.0.1:17670 --local --name openshell-gateway
 
+    To use the VM compute driver instead of Docker, connect the kvm
+    interface and select the driver in $SNAP_COMMON/gateway.toml:
+
+         sudo snap connect openshell:kvm
+
     After a snap refresh, restart the gateway to pick up the new revision:
 
          sudo snap restart openshell.gateway
@@ -57,6 +62,13 @@ platforms:
   arm64:
     build-on: [arm64]
     build-for: [arm64]
+
+layout:
+  # The gateway resolves openshell-driver-vm through its conventional libexec
+  # search paths. Symlink /usr/libexec/openshell at the snap-internal copy so
+  # that resolution works inside the snap mount namespace.
+  /usr/libexec/openshell:
+    symlink: $SNAP/usr/libexec/openshell
 
 apps:
   openshell:
@@ -98,6 +110,9 @@ apps:
       - docker
       # Docker snap is required because the snap uses the docker:docker-daemon
       # interface slot. It does not work with system-installed Docker.
+      # kvm is required by the VM compute driver for /dev/kvm access. The
+      # interface must be connected manually: sudo snap connect openshell:kvm
+      - kvm
       - log-observe
       - network
       - network-bind
@@ -114,7 +129,7 @@ parts:
       set -euo pipefail
 
       MISSING=()
-      for bin in openshell openshell-gateway openshell-sandbox openshell-gateway-wrapper; do
+      for bin in openshell openshell-gateway openshell-sandbox openshell-driver-vm openshell-gateway-wrapper; do
         if [ ! -f "$CRAFT_PART_SRC/$bin" ]; then
           MISSING+=("$bin")
         fi
@@ -136,6 +151,8 @@ parts:
         "$CRAFT_PART_INSTALL/bin/openshell-gateway"
       install -D -m 0755 "$CRAFT_PART_SRC/openshell-sandbox" \
         "$CRAFT_PART_INSTALL/bin/openshell-sandbox"
+      install -D -m 0755 "$CRAFT_PART_SRC/openshell-driver-vm" \
+        "$CRAFT_PART_INSTALL/usr/libexec/openshell/openshell-driver-vm"
       install -D -m 0755 "$CRAFT_PART_SRC/openshell-gateway-wrapper" \
         "$CRAFT_PART_INSTALL/bin/openshell-gateway-wrapper"
       install -D -m 0644 "$CRAFT_PART_SRC/meta/gui/term.desktop" \
@@ -157,3 +174,15 @@ parts:
       - openssh-client
     prime:
       - usr/bin/ssh
+
+  e2fsprogs:
+    # The VM compute driver shells out to mke2fs/mkfs.ext4 to format sandbox
+    # root disks and to debugfs to inject files into them. core24 ships these
+    # under /usr/sbin, but the snap AppArmor profile does not permit executing
+    # base-snap sbin binaries — they resolve on PATH and then fail execve with
+    # EACCES. Vendor them into $SNAP, which the snap PATH prefers over
+    # /usr/sbin. The shared libraries are staged alongside because the base's
+    # copies are not guaranteed to match the vendored binaries.
+    plugin: nil
+    stage-packages:
+      - e2fsprogs

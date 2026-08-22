@@ -138,6 +138,24 @@ a snap refresh when you need the updated binary:
 sudo systemctl restart snap.openshell.gateway
 ```
 
+### VM compute driver
+
+The snap ships `openshell-driver-vm` at `/usr/libexec/openshell/openshell-driver-vm`, exposed
+through a snapcraft `layout:` symlink. To enable it, set `compute_drivers = ["vm"]` in
+`$SNAP_COMMON/gateway.toml`, then connect the `kvm` interface and restart the service:
+
+```shell
+sudo snap connect openshell:kvm
+sudo snap restart openshell.gateway
+```
+
+The `kvm` interface grants access to `/dev/kvm`, which the VM driver requires. Without it, the
+gateway cannot create VMs even with the driver configured.
+
+VM driver state defaults to a path under the revision-scoped snap user data directory and does not
+persist across snap refreshes. Set `[openshell.drivers.vm].state_dir` in `$SNAP_COMMON/gateway.toml`
+to keep VM state in a stable location across refreshes.
+
 ## Kubernetes
 
 Kubernetes deployments use the OpenShell Helm chart. For step-by-step installation, refer to [Kubernetes Setup](/kubernetes/setup). For chart values and packaging details, refer to the [Helm chart README](https://github.com/NVIDIA/OpenShell/blob/main/deploy/helm/openshell/README.md).
