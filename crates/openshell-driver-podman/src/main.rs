@@ -144,6 +144,13 @@ struct Args {
     #[arg(long, env = "OPENSHELL_SANDBOX_PROXY_CONNECT_BY_HOSTNAME")]
     sandbox_proxy_connect_by_hostname: Option<bool>,
 
+    /// Path (on the gateway host) to a PEM CA bundle trusted for the corporate
+    /// proxy: the TLS handshake with an `https://` proxy and, for
+    /// TLS-intercepting proxies, re-signed upstream certificates. Bind-mounted
+    /// read-only into the sandbox. Only meaningful with `--sandbox-https-proxy`.
+    #[arg(long, env = "OPENSHELL_SANDBOX_PROXY_CA_BUNDLE")]
+    sandbox_proxy_ca_bundle: Option<String>,
+
     /// User namespace mode for sandbox containers (e.g. `auto`).
     /// When unset, containers use the default user namespace.
     #[arg(long, env = "OPENSHELL_PODMAN_USERNS")]
@@ -208,6 +215,7 @@ async fn main() -> Result<()> {
         proxy_auth_file: args.sandbox_proxy_auth_file,
         proxy_auth_allow_insecure: args.sandbox_proxy_auth_allow_insecure,
         proxy_connect_by_hostname: args.sandbox_proxy_connect_by_hostname,
+        proxy_ca_bundle: args.sandbox_proxy_ca_bundle,
         userns: args.userns,
         uidmap: args.uidmap,
         gidmap: args.gidmap,

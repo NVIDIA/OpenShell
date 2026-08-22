@@ -177,6 +177,41 @@ async fn create_sandbox_proxy_auth_secret(
     Ok(Some(secret_name))
 }
 
+/// Fail-closed readability check for the corporate proxy CA bundle.
+///
+/// When `proxy_ca_bundle` is configured the host PEM is bind-mounted read-only
+/// into the sandbox; verifying up front that it exists and is a non-empty
+/// regular file turns a missing path into a clear `proxy_ca_bundle` error at
+/// sandbox-create time instead of an opaque bind-mount failure. The supervisor
+/// independently validates the certificate content (fail-closed) at startup.
+async fn validate_sandbox_proxy_ca_bundle(
+    config: &PodmanComputeConfig,
+) -> Result<(), ComputeDriverError> {
+    let Some(path) = config.proxy_ca_bundle.as_deref() else {
+        return Ok(());
+    };
+    let path_owned = path.to_string();
+    let metadata = tokio::task::spawn_blocking(move || std::fs::metadata(&path_owned))
+        .await
+        .map_err(|e| ComputeDriverError::Message(format!("proxy_ca_bundle stat task failed: {e}")))?
+        .map_err(|err| {
+            ComputeDriverError::InvalidArgument(format!(
+                "proxy_ca_bundle '{path}' could not be read: {err}"
+            ))
+        })?;
+    if !metadata.is_file() {
+        return Err(ComputeDriverError::InvalidArgument(format!(
+            "proxy_ca_bundle '{path}' is not a regular file"
+        )));
+    }
+    if metadata.len() == 0 {
+        return Err(ComputeDriverError::InvalidArgument(format!(
+            "proxy_ca_bundle '{path}' is empty"
+        )));
+    }
+    Ok(())
+}
+
 async fn cleanup_sandbox_proxy_auth_secret(client: &PodmanClient, secret_name: &str) {
     if let Err(err) = client.remove_secret(secret_name).await {
         warn!(
@@ -792,6 +827,13 @@ impl PodmanComputeDriver {
             otel.status_code = tracing::field::Empty,
         ))
         .await?;
+
+        // Fail closed on a missing/unreadable corporate proxy CA bundle before
+        // creating any resources, so the operator gets a clear error
+        // attributable to `proxy_ca_bundle` rather than an opaque bind-mount
+        // failure. The supervisor independently validates the certificate
+        // content at startup.
+        validate_sandbox_proxy_ca_bundle(&self.config).await?;
 
         // Create workspace volume and per-sandbox token secret.
         let (token_secret_name, proxy_auth_secret_name) = async {
