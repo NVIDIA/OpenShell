@@ -17,6 +17,10 @@ publish = false
 
 [features]
 e2e = []
+# Selects the portable CLI conformance profile. The profile initially reuses
+# existing E2E test targets; membership is defined by the e2e:cli-conformance
+# task so adding the feature does not remove tests from existing E2E suites.
+e2e-cli-conformance = ["e2e"]
 # Selects tests that rely on `host.openshell.internal` (the sandbox's stable
 # alias to the host running test fixtures). docker, podman, and vm wire the
 # alias unconditionally; the kube driver only does so when the chart's
@@ -40,6 +44,26 @@ e2e-vm = ["e2e", "e2e-host-gateway"]
 name = "oidc_pkce"
 path = "tests/oidc_pkce.rs"
 required-features = ["e2e-oidc-pkce"]
+
+[[test]]
+name = "smoke"
+path = "tests/smoke.rs"
+required-features = ["e2e-cli-conformance"]
+
+[[test]]
+name = "sandbox_lifecycle"
+path = "tests/sandbox_lifecycle.rs"
+required-features = ["e2e-cli-conformance"]
+
+[[test]]
+name = "sandbox_labels"
+path = "tests/sandbox_labels.rs"
+required-features = ["e2e-cli-conformance"]
+
+[[test]]
+name = "vm_overlay"
+path = "tests/vm_overlay.rs"
+required-features = ["e2e-vm"]
 
 [[test]]
 name = "custom_image"
