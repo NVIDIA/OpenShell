@@ -79,11 +79,19 @@ struct FilesystemDef {
     read_write: Vec<String>,
 }
 
+#[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum LandlockCompatibilityDef {
+    #[default]
+    BestEffort,
+    HardRequirement,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct LandlockDef {
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    compatibility: String,
+    #[serde(default)]
+    compatibility: LandlockCompatibilityDef,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -815,7 +823,10 @@ fn to_proto(raw: PolicyFile) -> Result<SandboxPolicy> {
             read_write: fs.read_write,
         }),
         landlock: raw.landlock.map(|ll| LandlockPolicy {
-            compatibility: ll.compatibility,
+            compatibility: match ll.compatibility {
+                LandlockCompatibilityDef::BestEffort => "best_effort".to_string(),
+                LandlockCompatibilityDef::HardRequirement => "hard_requirement".to_string(),
+            },
         }),
         process: raw.process.map(|p| ProcessPolicy {
             run_as_user: p.run_as_user,
@@ -830,16 +841,28 @@ fn to_proto(raw: PolicyFile) -> Result<SandboxPolicy> {
 // Proto → YAML conversion
 // ---------------------------------------------------------------------------
 
-fn from_proto(policy: &SandboxPolicy) -> PolicyFile {
+fn from_proto(policy: &SandboxPolicy) -> Result<PolicyFile> {
     let filesystem_policy = policy.filesystem.as_ref().map(|fs| FilesystemDef {
         include_workdir: fs.include_workdir,
         read_only: fs.read_only.clone(),
         read_write: fs.read_write.clone(),
     });
 
-    let landlock = policy.landlock.as_ref().map(|ll| LandlockDef {
-        compatibility: ll.compatibility.clone(),
-    });
+    let landlock = match policy.landlock.as_ref() {
+        Some(ll) => {
+            let compatibility = match ll.compatibility.as_str() {
+                "hard_requirement" => LandlockCompatibilityDef::HardRequirement,
+                "best_effort" | "" => LandlockCompatibilityDef::BestEffort,
+                otherwise => miette::bail!(
+                    "invalid landlock.compatibility {:?}; accepted: {}",
+                    otherwise,
+                    openshell_core::policy::LANDLOCK_COMPATIBILITY_VALUES.join(", ")
+                ),
+            };
+            Some(LandlockDef { compatibility })
+        }
+        _ => None,
+    };
 
     let process = policy.process.as_ref().and_then(|p| {
         if p.run_as_user.is_empty() && p.run_as_group.is_empty() {
@@ -963,14 +986,14 @@ fn from_proto(policy: &SandboxPolicy) -> PolicyFile {
 
     let network_middlewares = middleware::from_proto(&policy.network_middlewares);
 
-    PolicyFile {
+    Ok(PolicyFile {
         version: policy.version,
         filesystem_policy,
         landlock,
         process,
         network_policies,
         network_middlewares,
-    }
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1036,7 +1059,7 @@ pub fn parse_sandbox_policy(yaml: &str) -> Result<SandboxPolicy> {
 /// canonical YAML field names (e.g. `filesystem_policy`, not `filesystem`)
 /// and is round-trippable through `parse_sandbox_policy`.
 pub fn serialize_sandbox_policy(policy: &SandboxPolicy) -> Result<String> {
-    let yaml_repr = from_proto(policy);
+    let yaml_repr = from_proto(policy)?;
     serde_yml::to_string(&yaml_repr)
         .into_diagnostic()
         .wrap_err("failed to serialize policy to YAML")
@@ -1047,7 +1070,7 @@ pub fn serialize_sandbox_policy(policy: &SandboxPolicy) -> Result<String> {
 /// The shape mirrors the YAML schema used by [`serialize_sandbox_policy`], so
 /// automation can use the same documented field names in either format.
 pub fn sandbox_policy_to_json_value(policy: &SandboxPolicy) -> Result<serde_json::Value> {
-    let json_repr = from_proto(policy);
+    let json_repr = from_proto(policy)?;
     serde_json::to_value(&json_repr)
         .into_diagnostic()
         .wrap_err("failed to serialize policy to JSON")
@@ -1230,6 +1253,8 @@ pub enum PolicyViolation {
         policy_name: String,
         host: String,
     },
+    /// `landlock.compatibility` has an unrecognized value.
+    InvalidLandlockCompatibility { value: String },
 }
 
 impl fmt::Display for PolicyViolation {
@@ -1392,6 +1417,13 @@ impl fmt::Display for PolicyViolation {
                      '{policy_name}' tls: skip endpoint '{host}'"
                 )
             }
+            Self::InvalidLandlockCompatibility { value } => {
+                write!(
+                    f,
+                    "invalid landlock.compatibility '{value}'; accepted: {}",
+                    openshell_core::policy::LANDLOCK_COMPATIBILITY_VALUES.join(", ")
+                )
+            }
         }
     }
 }
@@ -1434,6 +1466,17 @@ pub fn validate_sandbox_policy(
                 value: process.run_as_group.clone(),
             });
         }
+    }
+
+    // Check landlock compatibility mode is a recognized value. Direct gRPC/SDK
+    // clients bypass YAML serde validation, so reject invalid values here at the
+    // gateway create path rather than deferring rejection to sandbox startup.
+    if let Some(ref landlock) = policy.landlock
+        && !openshell_core::policy::is_valid_landlock_compatibility(&landlock.compatibility)
+    {
+        violations.push(PolicyViolation::InvalidLandlockCompatibility {
+            value: landlock.compatibility.clone(),
+        });
     }
 
     // Check filesystem paths
@@ -2312,6 +2355,80 @@ network_policies:
         });
         let violations = validate_sandbox_policy(&policy).unwrap_err();
         assert_eq!(violations.len(), 2);
+    }
+
+    #[test]
+    fn parse_rejects_invalid_landlock_compatibility() {
+        let err = parse_sandbox_policy("version: 1\nlandlock:\n  compatibility: bogus\n")
+            .expect_err("should reject invalid YAML enum value");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("best_effort") && msg.contains("hard_requirement"),
+            "error should list accepted values, got: {msg}",
+        );
+    }
+
+    #[test]
+    fn parse_accepts_known_landlock_compatibility() {
+        for value in ["best_effort", "hard_requirement"] {
+            let yaml = format!("version: 1\nlandlock:\n  compatibility: {value}\n");
+            let policy = parse_sandbox_policy(&yaml).expect("should parse");
+            assert_eq!(
+                policy.landlock.as_ref().expect("landlock").compatibility,
+                value,
+            );
+        }
+    }
+
+    #[test]
+    fn validate_rejects_invalid_landlock_compatibility_proto() {
+        let mut policy = restrictive_default_policy();
+        policy.landlock = Some(LandlockPolicy {
+            compatibility: "nope".into(),
+        });
+        let violations = validate_sandbox_policy(&policy).unwrap_err();
+        assert!(
+            violations
+                .iter()
+                .any(|v| matches!(v, PolicyViolation::InvalidLandlockCompatibility { .. })),
+            "expected InvalidLandlockCompatibility, got: {violations:?}",
+        );
+    }
+
+    #[test]
+    fn validate_accepts_empty_landlock_compatibility() {
+        // Empty string is the proto default and maps to best_effort.
+        let mut policy = restrictive_default_policy();
+        policy.landlock = Some(LandlockPolicy {
+            compatibility: String::new(),
+        });
+        assert!(validate_sandbox_policy(&policy).is_ok());
+    }
+
+    #[test]
+    fn serialize_rejects_invalid_landlock_compatibility() {
+        // Old policies persisted before gateway validation can hold invalid
+        // values; serialization must error rather than normalize to best_effort.
+        let mut policy = restrictive_default_policy();
+        policy.landlock = Some(LandlockPolicy {
+            compatibility: "hard-requirement".to_string(),
+        });
+        let err = serialize_sandbox_policy(&policy).expect_err("should reject");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("best_effort") && msg.contains("hard_requirement"),
+            "error should list accepted values, got: {msg}",
+        );
+    }
+
+    #[test]
+    fn serialize_accepts_empty_landlock_compatibility() {
+        // Empty string is the proto default; serialize must not error on it.
+        let mut policy = restrictive_default_policy();
+        policy.landlock = Some(LandlockPolicy {
+            compatibility: String::new(),
+        });
+        assert!(serialize_sandbox_policy(&policy).is_ok());
     }
 
     #[test]
