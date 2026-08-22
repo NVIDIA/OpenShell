@@ -34,7 +34,7 @@ We use a vouch system. This exists because AI makes it trivial to generate plaus
 
 Issues labeled [`good first issue`](https://github.com/NVIDIA/OpenShell/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22) are scoped, well-documented, and friendly to new contributors. Start there. If you need guidance, comment on the issue.
 
-An open issue is not necessarily accepted or ready to be worked on. Human contributors should look for `state:accepted`, roadmap placement, `good first issue`, or `help wanted`, or ask a maintainer before starting. Unattended agents additionally require the appropriate human-applied `agent:*` request label; an agent directly asked to work on a specific issue does not.
+An open issue is not necessarily accepted or ready to be worked on. Human contributors should look for `state:accepted`, roadmap placement, `good first issue`, or `help wanted`, or ask a maintainer before starting. Unattended agents require the expected lifecycle state and the appropriate human-applied `agent:*` request label. An agent directly asked to work on a specific issue warns about missing or incomplete expected labels and continues with the requested phase without changing them.
 
 ## Before You Open an Issue
 
@@ -141,7 +141,7 @@ Agents investigate issues, collect evidence, and report technical findings. Huma
 | Directly request agent implementation | User |
 | Queue approved implementation with `agent:implementation-requested` | Maintainer |
 
-Agents do not apply `state:accepted`, place issues on the roadmap, or apply `agent:plan-requested` or `agent:implementation-requested`.
+Agents do not apply `state:accepted`, place issues on the roadmap, or apply `agent:plan-requested` or `agent:implementation-requested`. A direct request may authorize work outside the recorded workflow, but it does not alter the issue's disposition or make the labels accurate.
 
 #### Issue State
 
@@ -199,7 +199,7 @@ Roadmap placement does not assign an owner. A roadmap issue still needs a human 
 
 A human contributor may implement an accepted issue without any `agent:*` label. Before starting, check for an assignee, linked pull request, active branch, or comment that shows someone else is already working on it.
 
-Maintainers use the `agent:*` workflow to queue work for always-on or unattended agents that scan issues. Keep exactly one agent-workflow label on the issue at a time. When a user directly asks an agent to plan or implement a specific issue, that instruction authorizes the requested phase and the corresponding request label is not required.
+Maintainers use the `agent:*` workflow to queue work for always-on or unattended agents that scan issues. Keep exactly one agent-workflow label on the issue at a time. When a user directly asks an agent to plan or implement a specific issue, that instruction authorizes the requested phase even if the issue does not match the normal lifecycle or agent-workflow state. The agent warns about each missing or incomplete expected label and continues without changing the labels.
 
 | Agent workflow | Applied by | Meaning |
 |---|---|---|
@@ -249,7 +249,7 @@ Maintainers use the specialized security review and remediation workflow for an 
 3. A maintainer reviews the plan and applies `agent:implementation-requested`.
 4. The remediation agent implements the approved plan.
 
-A user may instead directly request review or remediation from the specialized skill. The direct request replaces the corresponding queue label, but a request for review still does not authorize remediation. General implementation agents do not process issues labeled `topic:security`.
+A user may instead directly request review or remediation from the specialized skill. If the corresponding queue label is missing, the agent warns and continues without changing it, but a request for review still does not authorize remediation. General implementation agents do not process issues labeled `topic:security`.
 
 #### When an Issue Is Ready for Work
 
@@ -258,9 +258,9 @@ A user may instead directly request review or remediation from the specialized s
 | A human contributor | The issue has `state:accepted`, roadmap placement, an invitation to contribute, or maintainer confirmation, and has no conflicting owner or implementation. |
 | An unattended agent scanning for planning work | The issue has `state:accepted` or roadmap placement, plus the human-applied `agent:plan-requested` label. |
 | An unattended agent scanning for implementation work | The issue has `state:accepted` or roadmap placement, plus an approved plan and the human-applied `agent:implementation-requested` label. |
-| An agent directly instructed by a user | The issue has `state:accepted` or roadmap placement, no conflicting owner or implementation, and the instruction explicitly requests the phase the agent will perform. |
+| An agent directly instructed by a user | The instruction explicitly requests the phase the agent will perform and the issue has no conflicting owner or implementation. Missing or incomplete workflow labels produce a warning, not a stop. |
 
-Issues with `state:triage-needed`, `state:needs-info`, or `state:validated` are not ready for implementation unless a maintainer has separately placed them on the roadmap. Either `state:accepted` or roadmap placement records the required human acceptance decision.
+For unattended agents, `state:needs-info` blocks work until the requested evidence arrives, and `state:triage-needed` or `state:validated` blocks work unless a maintainer has separately placed the issue on the roadmap or applied `state:accepted`. For a directly instructed agent, these labels require a warning but do not themselves block the requested work. If information actually needed to do the work is unavailable, the agent reports that concrete blocker rather than treating the label as the blocker.
 
 #### Stale Issues
 

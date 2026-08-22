@@ -11,7 +11,7 @@ Detect and fix drift across the agent-first infrastructure files. These files re
 |------|---------------|
 | `AGENTS.md` | Project identity, workflow chains, architecture overview, issue/PR conventions, skill maintenance pointer |
 | `CONTRIBUTING.md` | Skills table, workflow chains, "When to Open an Issue" guidance, skill references |
-| `docs/resources/issue-lifecycle.mdx` | Human-facing issue states, roadmap decisions, and direct-versus-queued agent ownership |
+| `CONTRIBUTING.md` issue lifecycle section | Human-facing issue states, roadmap decisions, acceptance signals, and direct-versus-queued agent ownership |
 | `README.md` | "Built With Agents" section, "Explore with your agent" skill references |
 | `.github/ISSUE_TEMPLATE/bug_report.yml` | Skill name references in diagnostic guidance |
 | `.github/ISSUE_TEMPLATE/feature_request.yml` | Skill name references in investigation guidance |
@@ -88,7 +88,7 @@ The canonical workflow chains are defined in `AGENTS.md` under "## Workflow Chai
 
 ### Labels
 
-The canonical label set is used by skills and templates. The key labels are: `state:triage-needed`, `state:needs-info`, `state:validated`, `state:accepted`, `agent:plan-requested`, `agent:plan-ready`, `agent:implementation-requested`, `agent:in-progress`, `agent:pr-opened`, `roadmap`, `topic:security`, `good first issue`, `help wanted`, `spike`, and the relevant `area:*`, `topic:*`, `integration:*`, and `test:*` labels. The `agent:*` request labels control unattended queue pickup; they are not prerequisites when a user directly asks an agent to work on a specific issue.
+The canonical label set is used by skills and templates. The key labels are: `state:triage-needed`, `state:needs-info`, `state:validated`, `state:accepted`, `agent:plan-requested`, `agent:plan-ready`, `agent:implementation-requested`, `agent:in-progress`, `agent:pr-opened`, `roadmap`, `topic:security`, `good first issue`, `help wanted`, `spike`, and the relevant `area:*`, `topic:*`, `integration:*`, and `test:*` labels. Lifecycle and `agent:*` request labels gate unattended queue pickup. They do not prevent a direct user request: the agent warns about each missing or incomplete expected workflow label and continues with the requested phase without changing those labels.
 
 ## Step 2: Check Each File for Drift
 
@@ -109,8 +109,9 @@ For each file in the table above, check for the following inconsistencies:
 
 ### Issue Lifecycle Documentation
 
-1. **`docs/resources/issue-lifecycle.mdx`** — State, roadmap, and agent-workflow meanings must match `AGENTS.md` and `CONTRIBUTING.md`.
-2. **Invocation modes** — The `agent:*` request labels must control unattended queue pickup without being presented as prerequisites for a direct user request to a specific agent.
+1. **`CONTRIBUTING.md` issue lifecycle section** — State, roadmap, acceptance-signal, and agent-workflow meanings must match `AGENTS.md`.
+2. **Invocation modes** — Lifecycle and `agent:*` request labels must gate unattended queue pickup without blocking a direct user request to a specific agent.
+3. **Direct-mode warnings** — Guidance must require the agent to warn about each missing or incomplete expected workflow label, continue with the requested phase, and leave labels unchanged.
 
 ### `README.md`
 
@@ -131,7 +132,7 @@ For each file in the table above, check for the following inconsistencies:
 
 1. **`triage-issue`** — Skills referenced in gate check and diagnosis steps must exist.
 2. **`openshell-cli`** — Companion skills table entries must exist.
-3. **`build-from-issue`** — Label names must match the project's label taxonomy, and request labels must gate unattended queue pickup without blocking direct user requests.
+3. **`build-from-issue`** — Label names must match the project's label taxonomy. Lifecycle and request labels must gate unattended queue pickup, while direct requests warn on workflow discrepancies and continue.
 4. **`create-spike`** — Reference to `build-from-issue` as next step must be accurate.
 5. **`review-security-issue`** / **`fix-security-issue`** — Cross-references between the two must be accurate.
 6. **PR creation and review checks** — The `create-github-pr`, `review-github-pr`, `build-from-issue`, and `principal-engineer-reviewer` references to `sync-agent-infra` must exist and use trigger conditions aligned with this skill.
