@@ -104,6 +104,9 @@ requires manual connection:
 sudo snap connect openshell:docker docker:docker-daemon
 ```
 
+Connecting Docker automatically restarts the gateway so it discovers the newly
+available Docker socket. This restart interrupts active sandbox sessions.
+
 The snap declares `default-provider: docker` on the Docker plug so snapd will
 offer to install the Docker snap, but the connection itself must be made
 manually.
