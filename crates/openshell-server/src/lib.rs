@@ -848,11 +848,11 @@ async fn serve_gateway_listener(
                 continue;
             }
         };
-        let listener_scope = match stream.local_addr() {
-            Ok(local_addr) => spec.scope_for_local_addr(local_addr),
+        let (accepted_local_addr, listener_scope) = match stream.local_addr() {
+            Ok(local_addr) => (local_addr, spec.scope_for_local_addr(local_addr)),
             Err(e) => {
                 debug!(error = %e, client = %addr, listen = %listen_addr, "Failed to inspect accepted local address");
-                spec.scope
+                (listen_addr, spec.scope)
             }
         };
 
@@ -861,7 +861,7 @@ async fn serve_gateway_listener(
         spawn_gateway_connection(
             stream,
             addr,
-            listen_addr,
+            accepted_local_addr,
             listener_scope,
             service.clone(),
             tls_acceptor.clone(),
@@ -1399,6 +1399,7 @@ impl ComputeDriverBuildContext<'_> {
             self.driver_name,
             driver,
             None,
+            compute::GatewayListenerFallbackPolicy::Deny,
             self.store,
             self.sandbox_index,
             self.sandbox_watch_bus,
@@ -2553,6 +2554,7 @@ operator_namespace_label = "openshell.ai/workspace=true"
             address,
             driver_name: "docker".to_string(),
             reason: "managed bridge".to_string(),
+            allow_nested_container_wildcard_fallback: false,
         }
     }
 }

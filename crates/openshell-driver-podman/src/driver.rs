@@ -517,6 +517,7 @@ impl PodmanComputeDriver {
                         reason:
                             "Podman rootless pasta callback uses the host default-route interface"
                                 .to_string(),
+                        allow_nested_container_wildcard_fallback: false,
                         selector: Some(Selector::DefaultRouteInterface(
                             GatewayDefaultRouteInterfaceRequirement {},
                         )),
@@ -542,6 +543,11 @@ impl PodmanComputeDriver {
             })?;
             Ok(vec![GatewayListenerRequirement {
                 reason: format!("Podman network '{}' host gateway", self.config.network_name),
+                // A rootful managed bridge can be created after gateway
+                // startup. An explicit override is operator-owned, and
+                // rootless networking must never broaden the listener.
+                allow_nested_container_wildcard_fallback: !self.rootless
+                    && self.config.host_gateway_ip.trim().is_empty(),
                 selector: Some(Selector::ExactBindAddress(
                     SocketAddr::new(gateway_ip, callback_port).to_string(),
                 )),
@@ -552,6 +558,7 @@ impl PodmanComputeDriver {
             Ok(vec![GatewayListenerRequirement {
                 reason: "Podman machine callback forwarding terminates on gateway loopback"
                     .to_string(),
+                allow_nested_container_wildcard_fallback: false,
                 selector: Some(Selector::LoopbackInterface(
                     GatewayLoopbackInterfaceRequirement {},
                 )),
@@ -2121,6 +2128,7 @@ mod tests {
         let requirements = driver.gateway_listener_requirements().unwrap();
 
         assert_eq!(requirements.len(), 1);
+        assert!(requirements[0].allow_nested_container_wildcard_fallback);
         assert_eq!(
             requirements[0].selector,
             Some(Selector::ExactBindAddress("10.89.1.1:17670".to_string()))
@@ -2145,6 +2153,22 @@ mod tests {
             requirements[0].selector,
             Some(Selector::ExactBindAddress("10.90.1.1:17670".to_string()))
         );
+        assert!(!requirements[0].allow_nested_container_wildcard_fallback);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn rootful_explicit_host_gateway_does_not_allow_wildcard_fallback() {
+        let mut driver = PodmanComputeDriver::for_tests(PodmanComputeConfig {
+            grpc_endpoint: "http://host.containers.internal:17670".to_string(),
+            host_gateway_ip: "10.90.1.1".to_string(),
+            ..PodmanComputeConfig::default()
+        });
+        driver.network_gateway_ip = Some("10.89.1.1".to_string());
+
+        let requirements = driver.gateway_listener_requirements().unwrap();
+
+        assert!(!requirements[0].allow_nested_container_wildcard_fallback);
     }
 
     #[test]
@@ -2163,6 +2187,7 @@ mod tests {
             requirements[0].selector,
             Some(Selector::DefaultRouteInterface(_))
         ));
+        assert!(!requirements[0].allow_nested_container_wildcard_fallback);
     }
 
     #[test]

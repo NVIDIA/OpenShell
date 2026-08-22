@@ -86,6 +86,12 @@ message GatewayListenerRequirement {
   // Untrusted human-readable driver rationale for diagnostics.
   string reason = 1;
 
+  // Indicates that an exact address belongs to a driver-managed bridge that
+  // may not exist until the first sandbox joins it. Gateways must honor this
+  // only for a trusted built-in driver and only while running in a nested
+  // container; external drivers cannot authorize a wildcard listener.
+  bool allow_nested_container_wildcard_fallback = 5;
+
   oneof selector {
     // Concrete IP:port address requested by the driver. The port must match
     // the gateway's configured primary listener port.

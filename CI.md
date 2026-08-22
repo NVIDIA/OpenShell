@@ -15,13 +15,14 @@ Merge queue validation is a second integration gate for `main`. After a PR has p
 Three opt-in labels enable the long-running E2E suites:
 
 - `test:e2e` runs the standard Docker, rootless Podman, Kubernetes, and VM E2E
-  suites in `Branch E2E Checks`
+  suites plus the Fedora-in-Docker/rootful-Podman callback regression lane in
+  `Branch E2E Checks`
 - `test:e2e-gpu` runs GPU E2E in `Branch E2E Checks`
 - `test:e2e-kubernetes` runs Kubernetes E2E with the HA Helm overlay
   (`replicaCount: 2` and bundled PostgreSQL) and the credential-driver suite
   (Kubernetes Secrets plus Vault) in `Branch E2E Checks`
 
-When multiple labels are present, `Branch E2E Checks` builds the shared gateway and supervisor images once, builds one CLI artifact per runner architecture, builds the Linux VM driver artifact once, and fans out all enabled suites in parallel. Docker, Podman, GPU, Rust, Python, MCP, and VM E2E jobs reuse the matching prebuilt gateway and CLI binaries instead of compiling additional debug binaries in each job; Kubernetes E2E consumes the gateway image directly and reuses the prebuilt CLI. VM E2E also reuses the prebuilt VM driver artifact and falls back to local VM-driver/runtime preparation for local runs or workflow invocations that omit the artifact.
+When multiple labels are present, `Branch E2E Checks` builds the shared gateway and supervisor images once, builds one CLI artifact per runner architecture, builds the Linux VM driver artifact once, and fans out all enabled suites in parallel. Docker, Podman, GPU, Rust, Python, MCP, and VM E2E jobs reuse the matching prebuilt gateway and CLI binaries instead of compiling additional debug binaries in each job; Kubernetes E2E consumes the gateway image directly and reuses the prebuilt CLI. The nested Podman lane injects those artifacts into a Fedora systemd container and creates a rootful Podman sandbox, reproducing the Release Canary callback topology without waiting for an RPM publication. VM E2E also reuses the prebuilt VM driver artifact and falls back to local VM-driver/runtime preparation for local runs or workflow invocations that omit the artifact.
 The `OpenShell / E2E` and `OpenShell / GPU E2E` required statuses are evaluated from separate suite result jobs inside that workflow. `test:e2e-kubernetes` is optional while Kubernetes HA and credential-driver behavior are under active iteration: failures are visible in the workflow run but do not publish a required CI gate status.
 
 The GitHub ruleset should require the `OpenShell / ...` statuses published by `Required CI Gates`, not the push-triggered workflow jobs directly.

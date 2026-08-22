@@ -56,6 +56,21 @@ reflection, non-callback inference APIs, and HTTP routes before normal request
 authentication. The operator-configured primary listener retains the full
 multiplexed API surface.
 
+One Linux container startup race requires a narrower exception. Rootful Podman
+can report a private bridge gateway before netavark assigns that address. If an
+exact built-in Podman callback bind fails with `EADDRNOTAVAIL` while the gateway
+itself runs in a container, the gateway replaces the loopback primary and
+missing bridge sockets with one IPv4 wildcard socket. The wildcard defaults to
+callback-only authorization; only traffic addressed to the configured loopback
+endpoint receives primary scope. This keeps user and administrator APIs off the
+container's non-loopback interfaces, but it does make the sandbox-callable gRPC
+surface reachable on every IPv4 interface in that container namespace for the
+lifetime of the gateway process. Sandbox mTLS/JWT authentication and the RPC
+allowlist remain mandatory defenses. This exception does not apply on a host,
+to rootless Podman, an explicit `host_gateway_ip`, Docker or external drivers,
+to public callback addresses, or to bind errors
+other than `EADDRNOTAVAIL`.
+
 The `rpc_auth` classification is also the source of truth for negotiated
 listener exposure: marking an RPC as `sandbox` or `dual` makes it callable on
 these listeners. Review such changes as both authorization and network-surface

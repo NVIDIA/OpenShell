@@ -140,6 +140,25 @@ impl FakeComputeDriver {
                 .gateway_listener_requirements
                 .push(GatewayListenerRequirement {
                     reason: reason.into(),
+                    allow_nested_container_wildcard_fallback: false,
+                    selector: Some(Selector::ExactBindAddress(bind_address.into())),
+                });
+        });
+        self
+    }
+
+    #[must_use]
+    pub fn with_nested_container_wildcard_fallback_listener_requirement(
+        self,
+        bind_address: impl Into<String>,
+        reason: impl Into<String>,
+    ) -> Self {
+        self.with_state(|state| {
+            state
+                .gateway_listener_requirements
+                .push(GatewayListenerRequirement {
+                    reason: reason.into(),
+                    allow_nested_container_wildcard_fallback: true,
                     selector: Some(Selector::ExactBindAddress(bind_address.into())),
                 });
         });
