@@ -958,6 +958,31 @@ pub async fn sandbox_create(
             drop(stream);
             drop(client);
 
+            // Detect a sessionless topology (e.g. proxy-pod) before any
+            // operation that needs a supervisor session. Uploads, port
+            // forwarding, the editor, an exec command, and interactive connect
+            // all require one. Handling this first means a discarded command is
+            // never reported as success (including with --output json) and an
+            // ephemeral (--no-keep) sandbox is cleaned up rather than leaked.
+            let sessionless = sandbox_has_no_supervisor_session(&last_sandbox);
+            if sessionless
+                && (!command.is_empty()
+                    || !uploads.is_empty()
+                    || forward.is_some()
+                    || editor.is_some())
+            {
+                return Err(abort_sessionless_create(
+                    &effective_server,
+                    &sandbox_name,
+                    persist,
+                    workspace,
+                    &effective_tls,
+                    gateway_name,
+                    !command.is_empty(),
+                )
+                .await);
+            }
+
             let upload_count = uploads.len();
             for (idx, (local_path, sandbox_path, git_ignore)) in uploads.iter().enumerate() {
                 let dest = sandbox_path.as_deref();
@@ -1065,25 +1090,6 @@ pub async fn sandbox_create(
                 return Ok(());
             }
 
-            let sessionless = sandbox_has_no_supervisor_session(&last_sandbox);
-
-            // A command given to a sessionless topology never runs: there is no
-            // supervisor to launch it and no session to exec it. Surface that
-            // even in the implicit-detach path a non-interactive persistent
-            // create would otherwise take silently.
-            if sessionless && !command.is_empty() {
-                return Err(abort_sessionless_create(
-                    &effective_server,
-                    &sandbox_name,
-                    persist,
-                    workspace,
-                    &effective_tls,
-                    gateway_name,
-                    true,
-                )
-                .await);
-            }
-
             // Persistent non-interactive creates detach implicitly. An
             // explicitly ephemeral (`--no-keep`) create must still attach so
             // it can observe the canonical process and delete the sandbox when
@@ -1095,9 +1101,11 @@ pub async fn sandbox_create(
                 return Ok(());
             }
 
-            // An interactive create against a sessionless topology cannot
-            // attach. Skip the session — which would spawn ssh, fail inside the
-            // subprocess, and surface as an opaque exit status — and explain.
+            // An interactive bare create against a sessionless topology cannot
+            // attach (session-requiring operations were already rejected at the
+            // top of this arm). Skip the connect — which would spawn ssh, fail
+            // inside the subprocess, and surface as an opaque exit status — and
+            // explain instead.
             if sessionless {
                 return Err(abort_sessionless_create(
                     &effective_server,
