@@ -1332,15 +1332,17 @@ enum SandboxCommands {
         name: Option<String>,
 
         /// Sandbox source: a community sandbox name (e.g., `ollama`), a path
-        /// to a Dockerfile or directory containing one, or a full container
-        /// image reference (e.g., `myregistry.com/img:tag`).
+        /// to a Dockerfile or directory containing one, a rootfs tar archive
+        /// (`.tar`, `.tar.gz`, or `.tgz`), or a full container image reference
+        /// (e.g., `myregistry.com/img:tag`).
         ///
         /// Community names are resolved to
         /// `ghcr.io/nvidia/openshell-community/sandboxes/<name>:latest`
         /// (override the prefix with `OPENSHELL_COMMUNITY_REGISTRY`).
         ///
         /// When given a Dockerfile or directory, the image is built into the
-        /// local Docker daemon before creating the sandbox.
+        /// local Docker daemon before creating the sandbox. When given a
+        /// rootfs tar, it is passed directly to the VM compute driver.
         #[arg(long, value_hint = ValueHint::AnyPath)]
         from: Option<String>,
 

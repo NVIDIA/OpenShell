@@ -40,20 +40,21 @@ use openshell_core::proto::{
     DeleteProviderProfileRequest, DeleteProviderRefreshRequest, DeleteProviderRequest,
     DeleteSandboxRequest, DeleteServiceRequest, DetachSandboxProviderRequest, ExecSandboxRequest,
     ExposeServiceRequest, GetCurrentUserRequest, GetDraftHistoryRequest, GetDraftPolicyRequest,
-    GetGatewayConfigRequest, GetInferenceRouteRequest, GetProviderProfileRequest,
-    GetProviderRefreshStatusRequest, GetProviderRequest, GetSandboxConfigRequest,
-    GetSandboxConfigResponse, GetSandboxLogsRequest, GetSandboxPolicyStatusRequest,
-    GetSandboxRequest, GetServiceRequest, GpuResourceRequirements, ImportProviderProfilesRequest,
-    LintProviderProfilesRequest, ListProviderProfilesRequest, ListProvidersRequest,
-    ListSandboxPoliciesRequest, ListSandboxProvidersRequest, ListSandboxesRequest,
-    ListServicesRequest, PolicySource, PolicyStatus, Provider, ProviderCredentialRefreshStatus,
-    ProviderCredentialRefreshStrategy, ProviderProfile, ProviderProfileDiagnostic,
-    ProviderProfileImportItem, RejectDraftChunkRequest, ResourceRequirements,
-    RevokeSshSessionRequest, RotateProviderCredentialRequest, Sandbox, SandboxPhase, SandboxPolicy,
-    SandboxSpec, SandboxTemplate, ServiceEndpointResponse, SetInferenceRouteRequest, SettingScope,
-    StartSandboxRequest, StopSandboxRequest, TcpForwardFrame, TcpForwardInit, TcpRelayTarget,
-    UpdateConfigRequest, UpdateProviderProfilesRequest, UpdateProviderRequest, WatchSandboxRequest,
-    exec_sandbox_event, setting_value, tcp_forward_init,
+    GetGatewayConfigRequest, GetGatewayInfoRequest, GetInferenceRouteRequest,
+    GetProviderProfileRequest, GetProviderRefreshStatusRequest, GetProviderRequest,
+    GetSandboxConfigRequest, GetSandboxConfigResponse, GetSandboxLogsRequest,
+    GetSandboxPolicyStatusRequest, GetSandboxRequest, GetServiceRequest, GpuResourceRequirements,
+    ImportProviderProfilesRequest, LintProviderProfilesRequest, ListProviderProfilesRequest,
+    ListProvidersRequest, ListSandboxPoliciesRequest, ListSandboxProvidersRequest,
+    ListSandboxesRequest, ListServicesRequest, PolicySource, PolicyStatus, Provider,
+    ProviderCredentialRefreshStatus, ProviderCredentialRefreshStrategy, ProviderProfile,
+    ProviderProfileDiagnostic, ProviderProfileImportItem, RejectDraftChunkRequest,
+    ResourceRequirements, RevokeSshSessionRequest, RotateProviderCredentialRequest, Sandbox,
+    SandboxPhase, SandboxPolicy, SandboxSpec, SandboxTemplate, ServiceEndpointResponse,
+    SetInferenceRouteRequest, SettingScope, StartSandboxRequest, StopSandboxRequest,
+    TcpForwardFrame, TcpForwardInit, TcpRelayTarget, UpdateConfigRequest,
+    UpdateProviderProfilesRequest, UpdateProviderRequest, WatchSandboxRequest, exec_sandbox_event,
+    setting_value, tcp_forward_init,
 };
 use openshell_core::settings;
 use openshell_core::{ObjectId, ObjectName, ObjectWorkspace};
@@ -472,22 +473,26 @@ pub async fn sandbox_create(
     let effective_tls = tls.clone();
 
     // Resolve the --from flag into a container image reference, building from
-    // a Dockerfile first if necessary.
-    let image: Option<String> = match from {
+    // a Dockerfile first if necessary, or a rootfs tar path for the VM driver.
+    let (image, rootfs_tar_path): (Option<String>, Option<PathBuf>) = match from {
         Some(val) => {
             let resolved = resolve_from(val)?;
             match resolved {
-                ResolvedSource::Image(img) => Some(img),
+                ResolvedSource::Image(img) => (Some(img), None),
                 ResolvedSource::Dockerfile {
                     dockerfile,
                     context,
                 } => {
                     let tag = build_from_dockerfile(&dockerfile, &context, gateway_name).await?;
-                    Some(tag)
+                    (Some(tag), None)
+                }
+                ResolvedSource::RootfsTar { path } => {
+                    validate_rootfs_tar_source(gateway_name, &mut client, &path).await?;
+                    (None, Some(path))
                 }
             }
         }
-        None => None,
+        None => (None, None),
     };
     let inferred_provider = inferred_provider_type(command);
     let providers_v2_enabled =
@@ -512,11 +517,20 @@ pub async fn sandbox_create(
 
     let policy = load_sandbox_policy(policy)?;
     let resource_limits = build_sandbox_resource_limits(cpu, memory)?;
-    let driver_config = driver_config_json
+    let mut driver_config = driver_config_json
         .map(parse_driver_config_json)
         .transpose()?;
 
-    let template = if image.is_some() || resource_limits.is_some() || driver_config.is_some() {
+    if let Some(tar_path) = &rootfs_tar_path {
+        let rootfs_config = rootfs_tar_driver_config(tar_path)?;
+        driver_config = Some(merge_driver_config(driver_config, rootfs_config));
+    }
+
+    let template = if image.is_some()
+        || resource_limits.is_some()
+        || driver_config.is_some()
+        || rootfs_tar_path.is_some()
+    {
         Some(SandboxTemplate {
             image: image.unwrap_or_default(),
             resources: resource_limits,
@@ -1030,17 +1044,23 @@ enum ResolvedSource {
         dockerfile: PathBuf,
         context: PathBuf,
     },
+    /// A flat rootfs tar archive (`.tar`, `.tar.gz`, `.tgz`) to pass directly
+    /// to the VM compute driver.
+    RootfsTar { path: PathBuf },
 }
 
-/// Classify the `--from` value into an image reference or a Dockerfile that
-/// needs building.
+/// Classify the `--from` value into an image reference, a Dockerfile that
+/// needs building, or a rootfs tar to pass to the VM driver.
 ///
 /// Resolution order:
-/// 1. Existing file whose name contains "Dockerfile" → build from file.
+/// 1. Existing file whose name contains "dockerfile" → build from Dockerfile.
 /// 2. Existing directory that contains a `Dockerfile` → build from directory.
-/// 3. Missing explicit local paths → local error, not image pull.
-/// 4. Value contains `/`, `:`, or `.` → treat as a full image reference.
-/// 5. Otherwise → community sandbox name, expanded via the registry prefix.
+/// 3. Existing file with `.tar`, `.tar.gz`, or `.tgz` extension → rootfs tar archive.
+/// 4. Other existing local paths → error.
+/// 5. Non-existent path-like values (`./…`, `../…`, `/…`, `~/…`) → local
+///    error, so they don't reach the gateway as broken image-pull requests.
+/// 6. Value contains `/`, `:`, or `.` → treat as a full image reference.
+/// 7. Otherwise → community sandbox name, expanded via the registry prefix.
 fn resolve_from(value: &str) -> Result<ResolvedSource> {
     let path = Path::new(value);
 
@@ -1061,9 +1081,17 @@ fn resolve_from(value: &str) -> Result<ResolvedSource> {
             });
         }
 
+        if filename_looks_like_rootfs_tar(path) {
+            let tar_path = path
+                .canonicalize()
+                .into_diagnostic()
+                .wrap_err_with(|| format!("failed to resolve path: {}", path.display()))?;
+            return Ok(ResolvedSource::RootfsTar { path: tar_path });
+        }
+
         if value_looks_like_local_source(value) {
             return Err(miette::miette!(
-                "local --from file is not a Dockerfile: {}",
+                "local --from file is not a Dockerfile or rootfs tar (.tar/.tar.gz/.tgz): {}",
                 path.display()
             ));
         }
@@ -1102,7 +1130,7 @@ fn resolve_from(value: &str) -> Result<ResolvedSource> {
     if value_looks_like_local_source(value) {
         return Err(miette::miette!(
             "local --from path does not exist: {}\n\
-             Use an existing Dockerfile, a directory containing Dockerfile, or a container image reference.",
+             Use an existing Dockerfile, directory containing Dockerfile, rootfs tar (.tar/.tar.gz/.tgz), or a container image reference.",
             path.display()
         ));
     }
@@ -1120,7 +1148,17 @@ fn filename_looks_like_dockerfile(path: &Path) -> bool {
         .map(|n| n.to_string_lossy())
         .unwrap_or_default();
     let lower = name.to_lowercase();
-    lower.contains("dockerfile") || lower.ends_with(".dockerfile")
+    lower.contains("dockerfile")
+}
+
+#[allow(clippy::case_sensitive_file_extension_comparisons)] // already lowercased
+fn filename_looks_like_rootfs_tar(path: &Path) -> bool {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy())
+        .unwrap_or_default();
+    let lower = name.to_lowercase();
+    lower.ends_with(".tar.gz") || lower.ends_with(".tar") || lower.ends_with(".tgz")
 }
 
 fn value_looks_like_local_source(value: &str) -> bool {
@@ -1200,6 +1238,73 @@ async fn build_from_dockerfile(
     eprintln!();
 
     Ok(tag)
+}
+
+/// Validate that a rootfs tar source is usable with the current gateway.
+async fn validate_rootfs_tar_source(
+    gateway_name: &str,
+    client: &mut crate::tls::GrpcClient,
+    tar_path: &Path,
+) -> Result<()> {
+    let metadata = get_gateway_metadata(gateway_name);
+    if !dockerfile_sources_supported_for_gateway(metadata.as_ref()) {
+        return Err(miette!(
+            "local rootfs tar sources are only supported for local gateways; gateway '{}' is remote",
+            gateway_name
+        ));
+    }
+
+    let info = client
+        .get_gateway_info(GetGatewayInfoRequest {})
+        .await
+        .into_diagnostic()
+        .wrap_err("failed to query gateway compute driver")?
+        .into_inner();
+
+    let driver_name = info.compute_drivers.first().map_or("", |d| d.name.as_str());
+
+    if driver_name != "vm" {
+        return Err(miette!(
+            "rootfs tar sources are only supported by the VM compute driver, \
+             but gateway '{}' uses the '{}' driver",
+            gateway_name,
+            driver_name
+        ));
+    }
+
+    eprintln!(
+        "Using rootfs tar {} for gateway '{}'",
+        tar_path.display().to_string().cyan(),
+        gateway_name,
+    );
+    eprintln!();
+
+    Ok(())
+}
+
+/// Build a `driver_config` struct carrying the rootfs tar path for the VM driver.
+fn rootfs_tar_driver_config(tar_path: &Path) -> Result<prost_types::Struct> {
+    let fields = serde_json::Map::from_iter([(
+        "rootfs_tar_path".to_string(),
+        serde_json::Value::String(tar_path.to_string_lossy().into_owned()),
+    )]);
+    openshell_core::proto_struct::json_object_to_struct(fields)
+        .into_diagnostic()
+        .wrap_err("failed to encode rootfs_tar_path in driver_config")
+}
+
+/// Merge a rootfs tar config into an existing `driver_config`, if any.
+fn merge_driver_config(
+    base: Option<prost_types::Struct>,
+    overlay: prost_types::Struct,
+) -> prost_types::Struct {
+    match base {
+        Some(mut base) => {
+            base.fields.extend(overlay.fields);
+            base
+        }
+        None => overlay,
+    }
 }
 
 /// Load sandbox policy YAML.
@@ -7741,8 +7846,8 @@ mod tests {
                         .expect("failed to canonicalize context")
                 );
             }
-            super::ResolvedSource::Image(image) => {
-                panic!("expected Dockerfile source, got image {image}");
+            other => {
+                panic!("expected Dockerfile source, got {other:?}");
             }
         }
     }
@@ -7767,10 +7872,99 @@ mod tests {
 
         match resolve_from(image_ref).expect("expected image source") {
             super::ResolvedSource::Image(image) => assert_eq!(image, image_ref),
-            super::ResolvedSource::Dockerfile { .. } => {
-                panic!("expected image ref, got Dockerfile source");
+            other => {
+                panic!("expected image ref, got {other:?}");
             }
         }
+    }
+
+    #[test]
+    fn resolve_from_classifies_tar_archive() {
+        let temp = tempfile::tempdir().expect("failed to create tempdir");
+        let archive = temp.path().join("rootfs.tar");
+        fs::write(&archive, b"fake tar content").expect("failed to write archive");
+
+        match resolve_from(archive.to_str().expect("temp path is not UTF-8"))
+            .expect("expected RootfsTar source")
+        {
+            super::ResolvedSource::RootfsTar { path } => {
+                assert_eq!(
+                    path,
+                    archive
+                        .canonicalize()
+                        .expect("failed to canonicalize archive")
+                );
+            }
+            other => panic!("expected RootfsTar source, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_from_classifies_tar_gz_archive() {
+        let temp = tempfile::tempdir().expect("failed to create tempdir");
+        let archive = temp.path().join("rootfs.tar.gz");
+        fs::write(&archive, b"fake tar.gz content").expect("failed to write archive");
+
+        match resolve_from(archive.to_str().expect("temp path is not UTF-8"))
+            .expect("expected RootfsTar source")
+        {
+            super::ResolvedSource::RootfsTar { path } => {
+                assert_eq!(
+                    path,
+                    archive
+                        .canonicalize()
+                        .expect("failed to canonicalize archive")
+                );
+            }
+            other => panic!("expected RootfsTar source, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_from_classifies_tgz_archive() {
+        let temp = tempfile::tempdir().expect("failed to create tempdir");
+        let archive = temp.path().join("rootfs.tgz");
+        fs::write(&archive, b"fake tgz content").expect("failed to write archive");
+
+        match resolve_from(archive.to_str().expect("temp path is not UTF-8"))
+            .expect("expected RootfsTar source")
+        {
+            super::ResolvedSource::RootfsTar { path } => {
+                assert_eq!(
+                    path,
+                    archive
+                        .canonicalize()
+                        .expect("failed to canonicalize archive")
+                );
+            }
+            other => panic!("expected RootfsTar source, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_from_rejects_missing_tar_archive() {
+        let temp = tempfile::tempdir().expect("failed to create tempdir");
+        let missing = temp.path().join("missing.tar");
+
+        let err = resolve_from(missing.to_str().expect("temp path is not UTF-8"))
+            .expect_err("expected missing archive to be rejected");
+
+        assert!(
+            err.to_string().contains("local --from path does not exist"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn filename_looks_like_rootfs_tar_detects_extensions() {
+        use super::filename_looks_like_rootfs_tar;
+        assert!(filename_looks_like_rootfs_tar(Path::new("rootfs.tar")));
+        assert!(filename_looks_like_rootfs_tar(Path::new("rootfs.tar.gz")));
+        assert!(filename_looks_like_rootfs_tar(Path::new("rootfs.tgz")));
+        assert!(filename_looks_like_rootfs_tar(Path::new("IMAGE.TAR")));
+        assert!(filename_looks_like_rootfs_tar(Path::new("my-image.TAR.GZ")));
+        assert!(!filename_looks_like_rootfs_tar(Path::new("Dockerfile")));
+        assert!(!filename_looks_like_rootfs_tar(Path::new("image.zip")));
     }
 
     #[test]
