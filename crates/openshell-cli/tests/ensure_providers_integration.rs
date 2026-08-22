@@ -146,6 +146,8 @@ impl OpenShell for TestOpenShell {
         Ok(Response::new(ListSandboxesResponse::default()))
     }
 
+    unimplemented_sandbox_template_rpcs!();
+
     async fn list_sandbox_providers(
         &self,
         _request: tonic::Request<ListSandboxProvidersRequest>,

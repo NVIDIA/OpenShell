@@ -17,12 +17,13 @@ import type { MessageInitShape } from '@bufbuild/protobuf';
 import { type CallOptions, type Client, createClient, type Transport } from '@connectrpc/connect';
 import { errorCode, fromConnect, SdkError } from './errors.js';
 import type { Provider } from './gen/datamodel_pb.js';
-import type { Sandbox, UpdateConfigResponse } from './gen/openshell_pb.js';
+import type { Sandbox, SandboxWorkloadTemplate, UpdateConfigResponse } from './gen/openshell_pb.js';
 import {
   type ExecSandboxInputSchema,
   OpenShell,
   SandboxPhase,
   type SandboxSpecSchema,
+  type SandboxWorkloadTemplateSchema,
   ServiceStatus,
   type TcpForwardFrameSchema,
 } from './gen/openshell_pb.js';
@@ -31,9 +32,16 @@ import { PolicySource, type SandboxPolicySchema, SettingScope, type SettingValue
 import { validateSshResponse } from './ssh-validate.js';
 import { buildTransport, type ConnectOptions } from './transport.js';
 
-// The policy and setting value shapes are the generated protobuf messages;
-// re-export them rather than re-curating a parallel surface. Callers round-trip
-// `getConfig().policy` back into `setPolicy`, and build `SettingValue`s inline.
+// Generated protobuf message shapes that callers need to populate or round-trip
+// directly. Re-export these rather than re-curating parallel surfaces.
+export type {
+  SandboxResources,
+  SandboxServiceLevel,
+  SandboxStartup,
+  SandboxWorkloadConfig,
+  SandboxWorkloadTemplate,
+  SandboxWorkloadTemplateSpec,
+} from './gen/openshell_pb.js';
 export type { SandboxPolicy, SettingValue } from './gen/sandbox_pb.js';
 export type { ConnectOptions };
 export { errorCode };
@@ -102,6 +110,20 @@ export interface SandboxSpec {
   rawSpec?: MessageInitShape<typeof SandboxSpecSchema>;
 }
 
+export interface SandboxFromTemplateSpec {
+  name?: string;
+  /** Workspace scope. Omit or use an empty string for the gateway default workspace. */
+  workspace?: string;
+  templateName: string;
+  labels?: Record<string, string>;
+  providers?: string[];
+  /**
+   * Create-time sandbox policy (the safety boundary). The named workload
+   * template supplies runtime workload fields.
+   */
+  policy?: MessageInitShape<typeof SandboxPolicySchema>;
+}
+
 export interface SandboxRef {
   id: string;
   name: string;
@@ -111,12 +133,32 @@ export interface SandboxRef {
   resourceVersion: string;
   mainProcessInstanceId?: string;
   exitCode?: number;
+  createdFromWorkloadTemplate?: SandboxWorkloadTemplateProvenance;
+}
+
+export interface SandboxWorkloadTemplateProvenance {
+  name: string;
+  resourceVersion: string;
 }
 
 export interface ListOptions {
   limit?: number;
   offset?: number;
   labelSelector?: string;
+}
+
+export interface SandboxTemplateWorkspaceOptions {
+  /** Workspace scope. Omit or use an empty string for the gateway default workspace. */
+  workspace?: string;
+}
+
+export interface SandboxTemplateListOptions extends SandboxTemplateWorkspaceOptions {
+  limit?: number;
+  offset?: number;
+  /** Optional label selector in key=value comma-separated form. */
+  labelSelector?: string;
+  /** List templates across all workspaces. Requires platform admin permission. */
+  allWorkspaces?: boolean;
 }
 
 export interface ExecOptions {
@@ -338,7 +380,18 @@ function sandboxRef(sandbox: Sandbox | undefined): SandboxRef {
     resourceVersion: (meta?.resourceVersion ?? 0n).toString(),
     mainProcessInstanceId: sandbox.status?.mainProcessInstanceId || undefined,
     exitCode: sandbox.status?.exitCode,
+    createdFromWorkloadTemplate: sandbox.createdFromWorkloadTemplate
+      ? {
+          name: sandbox.createdFromWorkloadTemplate.name,
+          resourceVersion: sandbox.createdFromWorkloadTemplate.resourceVersion,
+        }
+      : undefined,
   };
+}
+
+function sandboxTemplate(template: SandboxWorkloadTemplate | undefined): SandboxWorkloadTemplate {
+  if (!template) throw new SdkError('invalid_config', 'sandbox template missing from gateway response');
+  return template;
 }
 
 function providerRef(provider: Provider): ProviderRef {
@@ -523,6 +576,85 @@ export class Pushable<T> implements AsyncIterable<T> {
   }
 }
 
+// ---- sandbox template client ----------------------------------------------
+
+// Reusable sandbox workload template lifecycle. Templates intentionally return
+// generated proto messages because the resource owns portable workload fields
+// plus driver-specific config that should not be lossy in the curated layer.
+export class SandboxTemplateClient {
+  private readonly grpc: Client<typeof OpenShell>;
+
+  readonly raw: Client<typeof OpenShell>;
+  readonly transport: Transport;
+
+  constructor(transport: Transport, grpc = createClient(OpenShell, transport)) {
+    this.transport = transport;
+    this.grpc = grpc;
+    this.raw = this.grpc;
+  }
+
+  static async connect(options: ConnectOptions): Promise<SandboxTemplateClient> {
+    return new SandboxTemplateClient(buildTransport(options));
+  }
+
+  async create(
+    template: MessageInitShape<typeof SandboxWorkloadTemplateSchema>,
+    options?: SandboxTemplateWorkspaceOptions | null,
+  ): Promise<SandboxWorkloadTemplate> {
+    try {
+      const resp = await this.grpc.createSandboxTemplate({
+        template,
+        workspace: options?.workspace ?? '',
+      });
+      return sandboxTemplate(resp.template);
+    } catch (e) {
+      throw e instanceof SdkError ? e : fromConnect(e);
+    }
+  }
+
+  async get(name: string, options?: SandboxTemplateWorkspaceOptions | null): Promise<SandboxWorkloadTemplate> {
+    if (name.trim() === '') throw new SdkError('invalid_config', 'template name is required');
+    try {
+      const resp = await this.grpc.getSandboxTemplate({
+        name,
+        workspace: options?.workspace ?? '',
+      });
+      return sandboxTemplate(resp.template);
+    } catch (e) {
+      throw e instanceof SdkError ? e : fromConnect(e);
+    }
+  }
+
+  async list(options?: SandboxTemplateListOptions | null): Promise<SandboxWorkloadTemplate[]> {
+    try {
+      const allWorkspaces = options?.allWorkspaces ?? false;
+      const resp = await this.grpc.listSandboxTemplates({
+        limit: options?.limit ?? 0,
+        offset: options?.offset ?? 0,
+        workspace: allWorkspaces ? '' : (options?.workspace ?? ''),
+        allWorkspaces,
+        labelSelector: options?.labelSelector ?? '',
+      });
+      return resp.templates;
+    } catch (e) {
+      throw fromConnect(e);
+    }
+  }
+
+  async delete(name: string, options?: SandboxTemplateWorkspaceOptions | null): Promise<boolean> {
+    if (name.trim() === '') throw new SdkError('invalid_config', 'template name is required');
+    try {
+      const resp = await this.grpc.deleteSandboxTemplate({
+        name,
+        workspace: options?.workspace ?? '',
+      });
+      return resp.deleted;
+    } catch (e) {
+      throw fromConnect(e);
+    }
+  }
+}
+
 // ---- sandbox client --------------------------------------------------------
 
 // Sandbox lifecycle + exec. Usable standalone via `SandboxClient.connect()`,
@@ -578,6 +710,25 @@ export class SandboxClient {
         name: spec.name ?? '',
         labels: spec.labels ?? {},
         spec: specInit,
+      });
+      return sandboxRef(resp.sandbox);
+    } catch (e) {
+      throw fromConnect(e);
+    }
+  }
+
+  async createFromTemplate(spec: SandboxFromTemplateSpec): Promise<SandboxRef> {
+    if (spec.templateName.trim() === '') throw new SdkError('invalid_config', 'templateName is required');
+    try {
+      const resp = await this.grpc.createSandbox({
+        name: spec.name ?? '',
+        labels: spec.labels ?? {},
+        workspace: spec.workspace ?? '',
+        spec: {
+          providers: spec.providers ?? [],
+          policy: spec.policy,
+        },
+        workloadTemplateName: spec.templateName,
       });
       return sandboxRef(resp.sandbox);
     } catch (e) {
@@ -1203,6 +1354,8 @@ export class SandboxClient {
 export class OpenShellClient {
   /** Sandbox lifecycle + exec: create/get/list/delete, waitReady/waitDeleted, exec. */
   readonly sandbox: SandboxClient;
+  /** Reusable sandbox workload template lifecycle. */
+  readonly sandboxTemplates: SandboxTemplateClient;
 
   /**
    * Advanced escape hatch: a generated client for every gateway RPC, including
@@ -1222,6 +1375,7 @@ export class OpenShellClient {
     this.grpc = createClient(OpenShell, transport);
     this.raw = this.grpc;
     this.sandbox = new SandboxClient(transport, this.grpc);
+    this.sandboxTemplates = new SandboxTemplateClient(transport, this.grpc);
   }
 
   /**

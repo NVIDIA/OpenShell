@@ -20,8 +20,9 @@ import (
 // helper to build a minimal fake sandbox client for testing.
 func newTestSandboxClient() *fakeSandboxClient {
 	store := newobjectStore(sandboxName, copySandbox)
+	templateStore := newobjectStore(sandboxWorkloadTemplateName, copySandboxWorkloadTemplate)
 	broadcaster := newWatchBroadcaster[*types.Sandbox]()
-	return newFakeSandboxClient(store, broadcaster, func() bool { return false })
+	return newFakeSandboxClient(store, templateStore, broadcaster, func() bool { return false })
 }
 
 // --- T008: Sandbox CRUD tests ---
@@ -924,8 +925,9 @@ func TestSandbox_GetLogs_ReturnsUnimplemented(t *testing.T) {
 
 func TestSandbox_GetLogs_ClosedReturnsUnavailable(t *testing.T) {
 	store := newobjectStore(sandboxName, copySandbox)
+	templateStore := newobjectStore(sandboxWorkloadTemplateName, copySandboxWorkloadTemplate)
 	broadcaster := newWatchBroadcaster[*types.Sandbox]()
-	sc := newFakeSandboxClient(store, broadcaster, func() bool { return true })
+	sc := newFakeSandboxClient(store, templateStore, broadcaster, func() bool { return true })
 	_, err := sc.GetLogs(context.Background(), "default", "sb-1")
 	require.Error(t, err)
 	assert.True(t, types.IsUnavailable(err))

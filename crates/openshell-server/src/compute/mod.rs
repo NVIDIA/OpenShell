@@ -46,7 +46,7 @@ use openshell_core::proto::compute::v1::{
 };
 use openshell_core::proto::{
     PlatformEvent, Sandbox, SandboxCondition, SandboxPhase, SandboxSpec, SandboxStatus,
-    SandboxTemplate, ServiceEndpoint, SshSession,
+    SandboxTemplate, SandboxWorkloadTemplate, ServiceEndpoint, SshSession,
 };
 use openshell_core::{ObjectLabels, ObjectWorkspace};
 #[cfg(all(not(target_os = "windows"), feature = "in-tree-compute-drivers"))]
@@ -3663,6 +3663,12 @@ fn driver_condition_from_public(condition: &SandboxCondition) -> DriverCondition
 impl ObjectType for Sandbox {
     fn object_type() -> &'static str {
         "sandbox"
+    }
+}
+
+impl ObjectType for SandboxWorkloadTemplate {
+    fn object_type() -> &'static str {
+        "sandbox_workload_template"
     }
 }
 
