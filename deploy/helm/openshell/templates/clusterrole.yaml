@@ -146,4 +146,51 @@ rules:
       - patch
       - update
   {{- end }}
+  {{- if eq (.Values.supervisor.topology | default "combined") "proxy-pod" }}
+  # Proxy-pod topology creates a supervisor Deployment, Service, CA Secret, and
+  # NetworkPolicy pair per sandbox in the sandbox's namespace. In managed and
+  # operator modes that namespace is per-workspace, so these permissions must be
+  # cluster-scoped. `patch` on deployments scales the supervisor on stop/start,
+  # and `get` on replicasets lets the gateway verify the supervisor pod's
+  # Pod -> ReplicaSet -> Deployment -> Sandbox owner chain during ServiceAccount
+  # bootstrap.
+  - apiGroups:
+      - apps
+    resources:
+      - deployments
+    verbs:
+      - create
+      - delete
+      - get
+      - list
+      - patch
+      - watch
+  - apiGroups:
+      - apps
+    resources:
+      - replicasets
+    verbs:
+      - get
+  - apiGroups:
+      - ""
+    resources:
+      - services
+      - secrets
+    verbs:
+      - create
+      - delete
+      - get
+      - list
+      - watch
+  - apiGroups:
+      - networking.k8s.io
+    resources:
+      - networkpolicies
+    verbs:
+      - create
+      - delete
+      - get
+      - list
+      - watch
+  {{- end }}
   {{- end }}

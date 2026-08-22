@@ -3849,6 +3849,7 @@ dependencies = [
  "openshell-policy",
  "prost",
  "prost-types",
+ "rcgen",
  "serde",
  "serde_json",
  "temp-env",
@@ -4367,6 +4368,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "socket2 0.6.3",
+ "temp-env",
  "tempfile",
  "tokio",
  "tokio-stream",
@@ -5341,6 +5343,7 @@ dependencies = [
  "ring",
  "rustls-pki-types",
  "time",
+ "x509-parser",
  "yasna",
 ]
 
@@ -8454,6 +8457,7 @@ dependencies = [
  "lazy_static",
  "nom",
  "oid-registry",
+ "ring",
  "rusticata-macros",
  "thiserror 1.0.69",
  "time",

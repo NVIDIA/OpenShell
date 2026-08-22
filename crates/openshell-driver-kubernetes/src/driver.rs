@@ -7,13 +7,14 @@ use super::AppArmorProfile;
 use crate::config::{
     DEFAULT_PROXY_UID, DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME, DEFAULT_SANDBOX_UID,
     DEFAULT_WORKSPACE_STORAGE_SIZE, KubernetesComputeConfig, OperatorNamespaceAllowlist,
-    SupervisorSideloadMethod, SupervisorTopology, WorkspaceMode, is_dns_1123_label,
-    managed_namespace, validate_managed_namespace_name,
+    ProxyPodAffinity, ProxyPodDnsPeer, SupervisorSideloadMethod, SupervisorTopology, WorkspaceMode,
+    is_dns_1123_label, managed_namespace, validate_managed_namespace_name,
 };
 use futures::{Stream, StreamExt, TryStreamExt};
+use k8s_openapi::api::apps::v1::Deployment;
 use k8s_openapi::api::core::v1::{
     Event as KubeEventObj, Namespace, Node, PersistentVolumeClaimVolumeSource, Pod, Secret,
-    ServiceAccount, Volume, VolumeMount,
+    Service, ServiceAccount, Volume, VolumeMount,
 };
 use k8s_openapi::api::networking::v1::{
     NetworkPolicy, NetworkPolicyIngressRule, NetworkPolicyPeer, NetworkPolicyPort,
@@ -43,12 +44,14 @@ use openshell_core::proto::compute::v1::{
     DriverCondition as SandboxCondition, DriverPlatformEvent as PlatformEvent,
     DriverSandbox as Sandbox, DriverSandboxSpec as SandboxSpec,
     DriverSandboxStatus as SandboxStatus, DriverSandboxTemplate as SandboxTemplate,
-    GetCapabilitiesResponse, GpuResourceRequirements, WatchSandboxesDeletedEvent,
-    WatchSandboxesEvent, WatchSandboxesPlatformEvent, WatchSandboxesSandboxEvent,
-    watch_sandboxes_event,
+    GetCapabilitiesResponse, GpuResourceRequirements, SupervisorSessionModel,
+    WatchSandboxesDeletedEvent, WatchSandboxesEvent, WatchSandboxesPlatformEvent,
+    WatchSandboxesSandboxEvent, watch_sandboxes_event,
 };
 use openshell_core::proto_struct::{struct_to_json_object, value_to_json};
+use rcgen::{CertificateParams, DnType, IsCa, KeyPair, KeyUsagePurpose};
 use serde::Deserialize;
+use serde::de::DeserializeOwned;
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -193,6 +196,16 @@ struct KubernetesDriverContainersConfig {
 struct KubernetesContainerDriverConfig {
     resources: KubernetesContainerResourceConfig,
     volume_mounts: Vec<KubernetesDriverVolumeMountConfig>,
+    /// Entrypoint override for the workload container.
+    ///
+    /// Only meaningful in `proxy-pod` topology, where the sandbox image runs
+    /// directly. `combined` and `sidecar` replace the container command with
+    /// the supervisor binary, so an override there would be silently ignored
+    /// and is rejected instead.
+    command: Vec<String>,
+    /// Arguments for `command`, or for the image entrypoint when `command` is
+    /// not set.
+    args: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -483,6 +496,12 @@ impl KubernetesComputeDriver {
         config
             .validate_proxy_uid()
             .map_err(KubernetesDriverError::Precondition)?;
+        if config.topology == SupervisorTopology::ProxyPod {
+            config
+                .proxy_pod
+                .validate_dns_peers()
+                .map_err(KubernetesDriverError::Precondition)?;
+        }
         config
             .validate_upstream_proxy_config()
             .map_err(KubernetesDriverError::Precondition)?;
@@ -1003,14 +1022,16 @@ impl KubernetesComputeDriver {
         &self,
         sandbox: &Sandbox,
     ) -> Result<KubernetesSandboxDriverConfig, String> {
-        kubernetes_driver_config_for_spec(
+        let config = kubernetes_driver_config_for_spec(
             sandbox.spec.as_ref(),
             self.config.provider_spiffe_enabled().then_some(
                 self.config
                     .provider_spiffe_workload_api_socket_path
                     .as_str(),
             ),
-        )
+        )?;
+        validate_agent_command_for_topology(&config, self.config.topology)?;
+        Ok(config)
     }
 
     fn agent_sandbox_api(
@@ -1248,7 +1269,9 @@ impl KubernetesComputeDriver {
                         .namespace
                         .clone()
                         .unwrap_or_else(|| self.config.namespace.clone());
-                    Ok(sandbox_from_object(&ns, obj).ok().map(|(_, s)| s))
+                    Ok(sandbox_from_object(&ns, obj, self.config.topology)
+                        .ok()
+                        .map(|(_, s)| s))
                 },
             ),
             Ok(Err(err)) => {
@@ -1302,7 +1325,7 @@ impl KubernetesComputeDriver {
                             .namespace
                             .clone()
                             .unwrap_or_else(|| self.config.namespace.clone());
-                        match sandbox_from_object(&ns, obj) {
+                        match sandbox_from_object(&ns, obj, self.config.topology) {
                             Ok((_, s)) => Some(s),
                             Err(err) => {
                                 warn!(object_name = %name, error = %err, "skipping unrecognized Sandbox in list");
@@ -1398,6 +1421,7 @@ impl KubernetesComputeDriver {
             .resolve_sandbox_identity_in_namespace(&target_namespace)
             .await;
 
+        let cr_name = self.config.kube_resource_name(workspace, name);
         let params = SandboxPodParams {
             default_image: &self.config.default_image,
             image_pull_policy: &self.config.image_pull_policy,
@@ -1406,7 +1430,12 @@ impl KubernetesComputeDriver {
             supervisor_image_pull_policy: &self.config.supervisor_image_pull_policy,
             supervisor_sideload_method: self.config.supervisor_sideload_method,
             topology: self.config.topology,
-            proxy_uid: self.config.sidecar.proxy_uid,
+            proxy_uid: match self.config.topology {
+                SupervisorTopology::ProxyPod => self.config.proxy_pod.proxy_uid,
+                SupervisorTopology::Combined | SupervisorTopology::Sidecar => {
+                    self.config.sidecar.proxy_uid
+                }
+            },
             process_binary_aware_network_policy: self
                 .config
                 .sidecar
@@ -1417,9 +1446,13 @@ impl KubernetesComputeDriver {
             proxy_auth_secret_key: self.config.proxy_auth_secret_key.as_deref(),
             proxy_auth_allow_insecure: self.config.proxy_auth_allow_insecure == Some(true),
             proxy_connect_by_hostname: self.config.proxy_connect_by_hostname == Some(true),
+            proxy_pod_affinity: self.config.proxy_pod.affinity,
+            proxy_pod_dns_peers: &self.config.proxy_pod.dns_peers,
+            namespace: &target_namespace,
             service_account_name: &self.config.service_account_name,
             sandbox_id: &sandbox.id,
             sandbox_name: &sandbox.name,
+            cr_name: &cr_name,
             grpc_endpoint: &self.config.grpc_endpoint,
             ssh_socket_path: self.ssh_socket_path(),
             client_tls_secret_name: &self.config.client_tls_secret_name,
@@ -1437,11 +1470,11 @@ impl KubernetesComputeDriver {
             sandbox_uid: resolved_user_id,
             sandbox_gid: resolved_group_id,
         };
-        validate_sidecar_proxy_identity(&params)?;
+        validate_proxy_identity(&params)?;
 
         let data = sandbox_to_k8s_spec(sandbox.spec.as_ref(), &params)
             .map_err(KubernetesDriverError::InvalidArgument)?;
-        let kube_name = self.config.kube_resource_name(workspace, name);
+        let kube_name = cr_name.clone();
         let mut obj = DynamicObject::new(&kube_name, &agent_sandbox_api.resource);
         let mut annotations = sandbox_annotations(sandbox);
         for key in [
@@ -1454,26 +1487,28 @@ impl KubernetesComputeDriver {
         }
         obj.metadata = ObjectMeta {
             name: Some(kube_name),
-            namespace: Some(target_namespace),
+            // Clone: `params` borrows `target_namespace` for later companion
+            // creation.
+            namespace: Some(target_namespace.clone()),
             labels: Some(sandbox_labels(sandbox, Some(&self.config.gateway_id))),
             annotations: Some(annotations),
             ..Default::default()
         };
 
         obj.data = data;
-        match tokio::time::timeout(
+        let created = match tokio::time::timeout(
             KUBE_API_TIMEOUT,
             agent_sandbox_api.api.create(&PostParams::default(), &obj),
         )
         .await
         {
-            Ok(Ok(_result)) => {
+            Ok(Ok(result)) => {
                 info!(
                     sandbox_id = %sandbox.id,
                     sandbox_name = %name,
                     "Sandbox created in Kubernetes successfully"
                 );
-                Ok(())
+                result
             }
             Ok(Err(err)) => {
                 warn!(
@@ -1482,7 +1517,7 @@ impl KubernetesComputeDriver {
                     error = %err,
                     "Failed to create sandbox in Kubernetes"
                 );
-                Err(KubernetesDriverError::from_kube(err))
+                return Err(KubernetesDriverError::from_kube(err));
             }
             Err(_elapsed) => {
                 warn!(
@@ -1491,20 +1526,312 @@ impl KubernetesComputeDriver {
                     timeout_secs = KUBE_API_TIMEOUT.as_secs(),
                     "Timed out creating sandbox in Kubernetes"
                 );
-                Err(KubernetesDriverError::Message(format!(
+                return Err(KubernetesDriverError::Message(format!(
                     "timed out after {}s waiting for Kubernetes API",
                     KUBE_API_TIMEOUT.as_secs()
-                )))
+                )));
             }
+        };
+
+        if self.config.topology == SupervisorTopology::ProxyPod
+            && let Err(err) = self
+                .create_proxy_pod_resources(
+                    sandbox,
+                    sandbox.spec.as_ref(),
+                    &params,
+                    &created,
+                    &agent_sandbox_api.resource.api_version,
+                )
+                .await
+        {
+            warn!(
+                sandbox_id = %sandbox.id,
+                sandbox_name = %name,
+                error = %err,
+                "Failed to create proxy-pod resources; deleting Sandbox CR"
+            );
+            self.cleanup_proxy_pod_resources(params.cr_name, params.namespace)
+                .await;
+            let _ = tokio::time::timeout(
+                KUBE_API_TIMEOUT,
+                agent_sandbox_api.api.delete(name, &DeleteParams::default()),
+            )
+            .await;
+            return Err(err);
         }
+
+        Ok(())
+    }
+
+    async fn create_proxy_pod_resources(
+        &self,
+        sandbox: &Sandbox,
+        spec: Option<&SandboxSpec>,
+        params: &SandboxPodParams<'_>,
+        sandbox_cr: &DynamicObject,
+        sandbox_api_version: &str,
+    ) -> Result<(), KubernetesDriverError> {
+        // Companion names derive from the Sandbox CR name, which is unique per
+        // sandbox in every workspace mode. The bare sandbox name collides in
+        // shared mode, where `workspace-a/dev` and `workspace-b/dev` both have
+        // sandbox name `dev`.
+        let cr_name = sandbox_cr
+            .metadata
+            .name
+            .as_deref()
+            .unwrap_or(sandbox.name.as_str());
+        let names = proxy_pod_resource_names(cr_name);
+        let template_environment = spec
+            .and_then(|spec| spec.template.as_ref())
+            .map(|template| template.environment.clone())
+            .unwrap_or_default();
+        let spec_environment = spec_pod_env(spec);
+        let deployment_owner_ref =
+            proxy_pod_owner_reference(sandbox_cr, sandbox_api_version, true)?;
+        let dependent_owner_ref =
+            proxy_pod_owner_reference(sandbox_cr, sandbox_api_version, false)?;
+        let (ca_cert_pem, ca_key_pem) = generate_proxy_pod_ca()?;
+
+        let secret = proxy_pod_ca_secret(
+            &names,
+            params,
+            dependent_owner_ref.clone(),
+            &ca_cert_pem,
+            &ca_key_pem,
+        );
+        let service = proxy_pod_supervisor_service(&names, params, dependent_owner_ref.clone());
+        let agent_egress =
+            proxy_pod_agent_egress_network_policy(&names, params, dependent_owner_ref.clone());
+        let supervisor_ingress =
+            proxy_pod_supervisor_ingress_network_policy(&names, params, dependent_owner_ref);
+        // Give the supervisor the workload's node placement so same-node
+        // affinity resolves to a node the workload can also use.
+        let pod_driver_config = spec
+            .and_then(|spec| spec.template.as_ref())
+            .and_then(|template| KubernetesSandboxDriverConfig::from_template(template).ok())
+            .map(|config| config.pod)
+            .unwrap_or_default();
+        let supervisor_deployment = proxy_pod_supervisor_deployment(
+            &names,
+            &template_environment,
+            &spec_environment,
+            params,
+            &pod_driver_config,
+            deployment_owner_ref,
+        );
+
+        let secrets: Api<Secret> = Api::namespaced(self.client.clone(), params.namespace);
+        let services: Api<Service> = Api::namespaced(self.client.clone(), params.namespace);
+        let policies: Api<NetworkPolicy> = Api::namespaced(self.client.clone(), params.namespace);
+        let deployments: Api<Deployment> = Api::namespaced(self.client.clone(), params.namespace);
+
+        tokio::time::timeout(
+            KUBE_API_TIMEOUT,
+            secrets.create(&PostParams::default(), &secret),
+        )
+        .await
+        .map_err(|_| {
+            KubernetesDriverError::Message(format!(
+                "timed out after {}s creating proxy-pod CA secret",
+                KUBE_API_TIMEOUT.as_secs()
+            ))
+        })?
+        .map_err(KubernetesDriverError::from_kube)?;
+        tokio::time::timeout(
+            KUBE_API_TIMEOUT,
+            services.create(&PostParams::default(), &service),
+        )
+        .await
+        .map_err(|_| {
+            KubernetesDriverError::Message(format!(
+                "timed out after {}s creating proxy-pod service",
+                KUBE_API_TIMEOUT.as_secs()
+            ))
+        })?
+        .map_err(KubernetesDriverError::from_kube)?;
+        tokio::time::timeout(
+            KUBE_API_TIMEOUT,
+            policies.create(&PostParams::default(), &agent_egress),
+        )
+        .await
+        .map_err(|_| {
+            KubernetesDriverError::Message(format!(
+                "timed out after {}s creating proxy-pod agent egress NetworkPolicy",
+                KUBE_API_TIMEOUT.as_secs()
+            ))
+        })?
+        .map_err(KubernetesDriverError::from_kube)?;
+        tokio::time::timeout(
+            KUBE_API_TIMEOUT,
+            policies.create(&PostParams::default(), &supervisor_ingress),
+        )
+        .await
+        .map_err(|_| {
+            KubernetesDriverError::Message(format!(
+                "timed out after {}s creating proxy-pod supervisor ingress NetworkPolicy",
+                KUBE_API_TIMEOUT.as_secs()
+            ))
+        })?
+        .map_err(KubernetesDriverError::from_kube)?;
+        tokio::time::timeout(
+            KUBE_API_TIMEOUT,
+            deployments.create(&PostParams::default(), &supervisor_deployment),
+        )
+        .await
+        .map_err(|_| {
+            KubernetesDriverError::Message(format!(
+                "timed out after {}s creating proxy-pod supervisor deployment",
+                KUBE_API_TIMEOUT.as_secs()
+            ))
+        })?
+        .map_err(KubernetesDriverError::from_kube)?;
+
+        info!(
+            sandbox_id = %sandbox.id,
+            sandbox_name = %sandbox.name,
+            supervisor_deployment = %names.supervisor_deployment,
+            service = %names.service,
+            "Created proxy-pod supervisor resources"
+        );
+        Ok(())
+    }
+
+    /// Scale a sandbox's paired supervisor `Deployment`.
+    ///
+    /// The supervisor runs in its own `Deployment`, so it does not stop when
+    /// the agent pod does. Without this, a stopped sandbox keeps consuming a
+    /// pod slot, CPU, and memory indefinitely.
+    ///
+    /// Failures are logged and swallowed. A supervisor that fails to scale down
+    /// wastes resources but does not break the stop; a supervisor that fails to
+    /// scale up is retried by the agent pod's connection attempts and surfaces
+    /// as a normal readiness failure. Neither should fail the caller's
+    /// start/stop RPC.
+    /// Scale a proxy-pod sandbox's supervisor Deployment.
+    ///
+    /// `cr_name` is the Sandbox CR resource name, which is unique per sandbox in
+    /// every workspace mode (shared prefixes it with the workspace); the bare
+    /// sandbox name is not. `namespace` is the sandbox's resolved namespace.
+    async fn scale_proxy_pod_supervisor(
+        &self,
+        cr_name: &str,
+        namespace: &str,
+        replicas: u32,
+    ) -> Result<(), KubernetesDriverError> {
+        if self.config.topology != SupervisorTopology::ProxyPod {
+            return Ok(());
+        }
+        let names = proxy_pod_resource_names(cr_name);
+        let deployments: Api<Deployment> = Api::namespaced(self.client.clone(), namespace);
+        let patch = serde_json::json!({"spec": {"replicas": replicas}});
+        match tokio::time::timeout(
+            KUBE_API_TIMEOUT,
+            deployments.patch(
+                &names.supervisor_deployment,
+                &PatchParams::default(),
+                &Patch::Merge(&patch),
+            ),
+        )
+        .await
+        {
+            Ok(Ok(_)) => {
+                info!(
+                    cr_name = %cr_name,
+                    deployment = %names.supervisor_deployment,
+                    replicas,
+                    "Scaled proxy-pod supervisor Deployment"
+                );
+                Ok(())
+            }
+            Ok(Err(err)) => Err(KubernetesDriverError::from_kube(err)),
+            Err(_elapsed) => Err(KubernetesDriverError::Message(format!(
+                "timed out after {}s scaling proxy-pod supervisor Deployment {}",
+                KUBE_API_TIMEOUT.as_secs(),
+                names.supervisor_deployment
+            ))),
+        }
+    }
+
+    async fn cleanup_proxy_pod_resources(&self, sandbox_name: &str, namespace: &str) {
+        let names = proxy_pod_resource_names(sandbox_name);
+        let secrets: Api<Secret> = Api::namespaced(self.client.clone(), namespace);
+        let services: Api<Service> = Api::namespaced(self.client.clone(), namespace);
+        let policies: Api<NetworkPolicy> = Api::namespaced(self.client.clone(), namespace);
+        let deployments: Api<Deployment> = Api::namespaced(self.client.clone(), namespace);
+
+        let _ = tokio::time::timeout(
+            KUBE_API_TIMEOUT,
+            deployments.delete(&names.supervisor_deployment, &DeleteParams::default()),
+        )
+        .await;
+        let _ = tokio::time::timeout(
+            KUBE_API_TIMEOUT,
+            policies.delete(
+                &names.supervisor_ingress_network_policy,
+                &DeleteParams::default(),
+            ),
+        )
+        .await;
+        let _ = tokio::time::timeout(
+            KUBE_API_TIMEOUT,
+            policies.delete(&names.agent_egress_network_policy, &DeleteParams::default()),
+        )
+        .await;
+        let _ = tokio::time::timeout(
+            KUBE_API_TIMEOUT,
+            services.delete(&names.service, &DeleteParams::default()),
+        )
+        .await;
+        let _ = tokio::time::timeout(
+            KUBE_API_TIMEOUT,
+            secrets.delete(&names.proxy_ca_secret, &DeleteParams::default()),
+        )
+        .await;
     }
 
     pub async fn stop_sandbox(&self, sandbox_id: &str) -> Result<(), KubernetesDriverError> {
         let (agent_sandbox_api, kube_name, pod_name, namespace, stop_timeout) = self
             .patch_sandbox_operating_state(sandbox_id, false)
             .await?;
+        let stopped = self
+            .wait_for_sandbox_stopped(
+                &agent_sandbox_api,
+                &kube_name,
+                &pod_name,
+                &namespace,
+                stop_timeout,
+            )
+            .await;
+        // Scale the paired supervisor down only once the workload has actually
+        // stopped, so a graceful shutdown that needs egress still has it. This
+        // is best-effort: the workload is already stopped, so a failed
+        // scale-down only wastes supervisor resources and must not fail the
+        // stop. A later start or delete reconciles the replica count.
+        if stopped.is_ok()
+            && let Err(err) = self
+                .scale_proxy_pod_supervisor(&kube_name, &namespace, 0)
+                .await
+        {
+            warn!(
+                sandbox_id = %sandbox_id,
+                cr_name = %kube_name,
+                error = %err,
+                "Failed to scale proxy-pod supervisor down on stop"
+            );
+        }
+        stopped
+    }
+
+    async fn wait_for_sandbox_stopped(
+        &self,
+        agent_sandbox_api: &AgentSandboxApi,
+        kube_name: &str,
+        pod_name: &str,
+        namespace: &str,
+        stop_timeout: Duration,
+    ) -> Result<(), KubernetesDriverError> {
         let legacy_pod_api = (agent_sandbox_api.resource.version == SANDBOX_VERSION_V1ALPHA1)
-            .then(|| Api::<Pod>::namespaced(self.client.clone(), &namespace));
+            .then(|| Api::<Pod>::namespaced(self.client.clone(), namespace));
 
         let deadline = tokio::time::Instant::now() + stop_timeout;
         let mut poll_interval = STOP_INITIAL_POLL_INTERVAL;
@@ -1519,7 +1846,7 @@ impl KubernetesComputeDriver {
             let request_timeout = KUBE_API_TIMEOUT.min(deadline.saturating_duration_since(now));
             let object = tokio::time::timeout(
                 request_timeout,
-                agent_sandbox_api.api.get(&kube_name),
+                agent_sandbox_api.api.get(kube_name),
             )
             .await
             .map_err(|_| {
@@ -1536,7 +1863,7 @@ impl KubernetesComputeDriver {
                 return Err(KubernetesDriverError::Message(error));
             }
             if let Some(pod_api) = legacy_pod_api.as_ref()
-                && kubernetes_sandbox_pod_is_gone(pod_api, &pod_name, deadline)
+                && kubernetes_sandbox_pod_is_gone(pod_api, pod_name, deadline)
                     .await
                     .map_err(KubernetesDriverError::Message)?
             {
@@ -1555,9 +1882,14 @@ impl KubernetesComputeDriver {
     }
 
     pub async fn start_sandbox(&self, sandbox_id: &str) -> Result<(), KubernetesDriverError> {
-        self.patch_sandbox_operating_state(sandbox_id, true)
-            .await
-            .map(|_| ())
+        let (_api, kube_name, _pod_name, namespace, _timeout) =
+            self.patch_sandbox_operating_state(sandbox_id, true).await?;
+        // Propagate scale-up failure: the agent pod cannot itself retry a
+        // Deployment scale, so a swallowed error would wedge the sandbox in
+        // Starting with a supervisor stuck at zero replicas.
+        self.scale_proxy_pod_supervisor(&kube_name, &namespace, 1)
+            .await?;
+        Ok(())
     }
 
     async fn patch_sandbox_operating_state(
@@ -1719,7 +2051,19 @@ impl KubernetesComputeDriver {
             .supported_agent_sandbox_api(self.client.clone(), &obj_namespace)
             .await?;
         let dp = DeleteParams::default().preconditions(preconditions);
-        match tokio::time::timeout(KUBE_API_TIMEOUT, delete_api.api.delete(&kube_name, &dp)).await {
+        // Delete the Sandbox CR (which tears down the workload pod) BEFORE
+        // removing the proxy-pod companion resources. The agent egress
+        // NetworkPolicy is the egress fence; removing it while the workload is
+        // still running would open unrestricted egress, and if the CR delete
+        // failed the exposure would persist. Companions are owner-referenced to
+        // the CR, so this ordering also matches Kubernetes garbage collection;
+        // the explicit cleanup below only accelerates it.
+        let deleted = match tokio::time::timeout(
+            KUBE_API_TIMEOUT,
+            delete_api.api.delete(&kube_name, &dp),
+        )
+        .await
+        {
             Ok(Ok(_response)) => {
                 info!(sandbox_id = %sandbox_id, namespace = %obj_namespace, "Sandbox deleted from Kubernetes");
                 Ok(true)
@@ -1747,7 +2091,15 @@ impl KubernetesComputeDriver {
                     KUBE_API_TIMEOUT.as_secs()
                 ))
             }
+        };
+
+        // Only remove the egress fence once the CR (and its workload) deletion
+        // has been initiated. On CR-delete failure the fence stays in place.
+        if deleted.is_ok() && self.config.topology == SupervisorTopology::ProxyPod {
+            self.cleanup_proxy_pod_resources(&kube_name, &obj_namespace)
+                .await;
         }
+        deleted
     }
 
     pub async fn sandbox_exists(&self, sandbox_id: &str) -> Result<bool, String> {
@@ -1778,6 +2130,7 @@ impl KubernetesComputeDriver {
 
     async fn watch_sandboxes_single_namespace(&self) -> Result<WatchStream, String> {
         let namespace = self.config.namespace.clone();
+        let topology = self.config.topology;
         let agent_sandbox_api = self
             .supported_agent_sandbox_api(self.watch_client.clone(), &self.config.namespace)
             .await?;
@@ -1795,7 +2148,7 @@ impl KubernetesComputeDriver {
                 tokio::select! {
                     result = sandbox_stream.try_next() => match result {
                         Ok(Some(Event::Applied(obj))) => {
-                            if let Ok((kube_name, sandbox)) = sandbox_from_object(&namespace, obj) {
+                            if let Ok((kube_name, sandbox)) = sandbox_from_object(&namespace, obj, topology) {
                                 update_indexes(&mut sandbox_name_to_id, &mut agent_pod_to_id, &kube_name, &sandbox);
                                 let event = WatchSandboxesEvent {
                                     payload: Some(watch_sandboxes_event::Payload::Sandbox(
@@ -1824,7 +2177,7 @@ impl KubernetesComputeDriver {
                         }
                         Ok(Some(Event::Restarted(objs))) => {
                             for obj in objs {
-                                if let Ok((kube_name, sandbox)) = sandbox_from_object(&namespace, obj) {
+                                if let Ok((kube_name, sandbox)) = sandbox_from_object(&namespace, obj, topology) {
                                     update_indexes(&mut sandbox_name_to_id, &mut agent_pod_to_id, &kube_name, &sandbox);
                                     let event = WatchSandboxesEvent {
                                         payload: Some(watch_sandboxes_event::Payload::Sandbox(
@@ -1889,6 +2242,7 @@ impl KubernetesComputeDriver {
     }
 
     async fn watch_sandboxes_cluster_wide(&self) -> Result<WatchStream, String> {
+        let topology = self.config.topology;
         let sandbox_api_version = self
             .supported_sandbox_api_version(self.watch_client.clone())
             .await?;
@@ -1907,7 +2261,7 @@ impl KubernetesComputeDriver {
                         Ok(Some(Event::Applied(obj))) => {
                             let ns = obj.metadata.namespace.clone()
                                 .unwrap_or_else(|| default_namespace.clone());
-                            if let Ok((_kube_name, sandbox)) = sandbox_from_object(&ns, obj) {
+                            if let Ok((_kube_name, sandbox)) = sandbox_from_object(&ns, obj, topology) {
                                 let event = WatchSandboxesEvent {
                                     payload: Some(watch_sandboxes_event::Payload::Sandbox(
                                         WatchSandboxesSandboxEvent { sandbox: Some(sandbox) }
@@ -1936,7 +2290,7 @@ impl KubernetesComputeDriver {
                             for obj in objs {
                                 let ns = obj.metadata.namespace.clone()
                                     .unwrap_or_else(|| default_namespace.clone());
-                                if let Ok((_kube_name, sandbox)) = sandbox_from_object(&ns, obj) {
+                                if let Ok((_kube_name, sandbox)) = sandbox_from_object(&ns, obj, topology) {
                                     let event = WatchSandboxesEvent {
                                         payload: Some(watch_sandboxes_event::Payload::Sandbox(
                                             WatchSandboxesSandboxEvent { sandbox: Some(sandbox) }
@@ -2163,7 +2517,11 @@ fn is_openshell_managed(obj: &DynamicObject) -> bool {
 /// Returns `Err` in two cases (callers should skip, not fail):
 /// - The object is not managed by `OpenShell` (missing/wrong `managed-by` label).
 /// - The object is managed by `OpenShell` but missing required fields (orphan).
-fn sandbox_from_object(namespace: &str, obj: DynamicObject) -> Result<(String, Sandbox), String> {
+fn sandbox_from_object(
+    namespace: &str,
+    obj: DynamicObject,
+    topology: SupervisorTopology,
+) -> Result<(String, Sandbox), String> {
     let kube_name = obj.metadata.name.clone().unwrap_or_default();
 
     if !is_openshell_managed(&obj) {
@@ -2189,7 +2547,7 @@ fn sandbox_from_object(namespace: &str, obj: DynamicObject) -> Result<(String, S
         .namespace
         .clone()
         .unwrap_or_else(|| namespace.to_string());
-    let status = status_from_object(&obj);
+    let status = status_from_object(&obj, topology);
 
     Ok((
         kube_name,
@@ -2367,6 +2725,20 @@ const SIDECAR_SSH_SOCKET_FILE: &str = "@openshell-sidecar-ssh";
 const SIDECAR_TLS_VOLUME_NAME: &str = "openshell-supervisor-tls";
 const SIDECAR_TLS_MOUNT_PATH: &str = openshell_core::container_paths::SIDECAR_TLS_DIR;
 const SIDECAR_CLIENT_TLS_MOUNT_PATH: &str = openshell_core::container_paths::SIDECAR_CLIENT_TLS_DIR;
+
+const LABEL_SANDBOX_ROLE: &str = "openshell.ai/sandbox-role";
+const SANDBOX_ROLE_AGENT: &str = "agent";
+const SANDBOX_ROLE_SUPERVISOR: &str = "supervisor";
+const PROXY_POD_PROXY_PORT: u16 = 3128;
+const PROXY_POD_WAIT_INIT_CONTAINER_NAME: &str = "openshell-wait-for-proxy";
+/// Upper bound on how long the agent pod waits for its paired supervisor.
+/// Exceeding it fails the init container, which surfaces as a pod-level error
+/// rather than a workload that silently has no egress.
+const PROXY_POD_WAIT_TIMEOUT_SECS: u64 = 180;
+const PROXY_POD_NETWORK_ENFORCEMENT_MODE: &str = "proxy-pod";
+const PROXY_POD_CA_SECRET_MOUNT_PATH: &str = "/var/run/openshell-proxy-ca";
+const PROXY_POD_CA_CERT_FILE: &str = "openshell-ca.pem";
+const PROXY_POD_CA_KEY_FILE: &str = "openshell-ca-key.pem";
 
 /// Build the emptyDir volume that holds the supervisor binary.
 ///
@@ -2656,6 +3028,85 @@ fn sidecar_tls_volume_mount() -> serde_json::Value {
         "name": SIDECAR_TLS_VOLUME_NAME,
         "mountPath": SIDECAR_TLS_MOUNT_PATH,
     })
+}
+
+#[derive(Debug, Clone)]
+struct ProxyPodResourceNames {
+    supervisor_deployment: String,
+    service: String,
+    proxy_ca_secret: String,
+    agent_egress_network_policy: String,
+    supervisor_ingress_network_policy: String,
+}
+
+fn proxy_pod_resource_names(sandbox_name: &str) -> ProxyPodResourceNames {
+    ProxyPodResourceNames {
+        supervisor_deployment: dns_label_name("os-sup", sandbox_name),
+        service: dns_label_name("os-svc", sandbox_name),
+        proxy_ca_secret: dns_label_name("os-ca", sandbox_name),
+        agent_egress_network_policy: dns_label_name("os-eg", sandbox_name),
+        supervisor_ingress_network_policy: dns_label_name("os-ing", sandbox_name),
+    }
+}
+
+fn dns_label_name(prefix: &str, name: &str) -> String {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for byte in name.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    let suffix_hash = hash & 0xffff_ffff;
+    let suffix = format!("{suffix_hash:08x}");
+    let mut sanitized = name
+        .chars()
+        .map(|c| {
+            let c = c.to_ascii_lowercase();
+            if c.is_ascii_alphanumeric() || c == '-' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    sanitized = sanitized
+        .trim_matches('-')
+        .split('-')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("-");
+    if sanitized.is_empty() {
+        sanitized = "sandbox".to_string();
+    }
+    let max_base_len = 63usize.saturating_sub(prefix.len() + suffix.len() + 2);
+    if sanitized.len() > max_base_len {
+        sanitized.truncate(max_base_len);
+        sanitized = sanitized.trim_matches('-').to_string();
+    }
+    format!("{prefix}-{sanitized}-{suffix}")
+}
+
+fn proxy_pod_service_dns(service_name: &str, namespace: &str) -> String {
+    format!("{service_name}.{namespace}.svc.cluster.local")
+}
+
+fn proxy_pod_proxy_url(service_dns: &str) -> String {
+    format!("http://{service_dns}:{PROXY_POD_PROXY_PORT}")
+}
+
+fn apply_host_gateway_aliases(
+    spec: &mut serde_json::Map<String, serde_json::Value>,
+    host_gateway_ip: &str,
+) {
+    if host_gateway_ip.is_empty() {
+        return;
+    }
+    spec.insert(
+        "hostAliases".to_string(),
+        serde_json::json!([{
+            "ip": host_gateway_ip,
+            "hostnames": ["host.docker.internal", "host.openshell.internal"]
+        }]),
+    );
 }
 
 fn copy_log_level_env(
@@ -3034,6 +3485,347 @@ fn apply_supervisor_sidecar_topology(
     ));
 }
 
+fn proxy_pod_ca_source_volume_mount() -> serde_json::Value {
+    serde_json::json!({
+        "name": "openshell-proxy-pod-ca-source",
+        "mountPath": PROXY_POD_CA_SECRET_MOUNT_PATH,
+        "readOnly": true
+    })
+}
+
+fn proxy_pod_ca_tls_volume_mount(read_only: bool) -> serde_json::Value {
+    serde_json::json!({
+        "name": "openshell-proxy-pod-tls",
+        "mountPath": SIDECAR_TLS_MOUNT_PATH,
+        "readOnly": read_only,
+    })
+}
+
+fn proxy_pod_ca_init_container(
+    image: &str,
+    image_pull_policy: &str,
+    run_as_user: u32,
+    run_as_group: u32,
+) -> serde_json::Value {
+    let copy_cmd = format!(
+        "set -eu; \
+         mkdir -p {SIDECAR_TLS_MOUNT_PATH}; \
+         cp {PROXY_POD_CA_SECRET_MOUNT_PATH}/{PROXY_POD_CA_CERT_FILE} {SIDECAR_TLS_MOUNT_PATH}/{PROXY_POD_CA_CERT_FILE}; \
+         bundle={SIDECAR_TLS_MOUNT_PATH}/ca-bundle.pem; \
+         found=0; \
+         for path in /etc/ssl/certs/ca-certificates.crt /etc/pki/tls/certs/ca-bundle.crt /etc/ssl/ca-bundle.pem /etc/ssl/cert.pem; do \
+           if [ -f \"$path\" ]; then cat \"$path\" > \"$bundle\"; found=1; break; fi; \
+         done; \
+         if [ \"$found\" = 0 ]; then : > \"$bundle\"; fi; \
+         printf '\\n' >> \"$bundle\"; \
+         cat {PROXY_POD_CA_SECRET_MOUNT_PATH}/{PROXY_POD_CA_CERT_FILE} >> \"$bundle\""
+    );
+    let mut init_spec = serde_json::json!({
+        "name": "openshell-proxy-ca-install",
+        "image": image,
+        "command": ["sh", "-c", copy_cmd],
+        "securityContext": {
+            "runAsUser": run_as_user,
+            "runAsGroup": run_as_group,
+            "runAsNonRoot": true,
+            "allowPrivilegeEscalation": false,
+            "readOnlyRootFilesystem": true,
+            "capabilities": {
+                "drop": ["ALL"]
+            }
+        },
+        "volumeMounts": [
+            proxy_pod_ca_source_volume_mount(),
+            proxy_pod_ca_tls_volume_mount(false),
+        ]
+    });
+    if !image_pull_policy.is_empty() {
+        init_spec["imagePullPolicy"] = serde_json::json!(image_pull_policy);
+    }
+    init_spec
+}
+
+fn proxy_pod_wait_for_proxy_init_container(
+    image: &str,
+    image_pull_policy: &str,
+    run_as_user: u32,
+    run_as_group: u32,
+    service_dns: &str,
+) -> serde_json::Value {
+    let mut init_spec = serde_json::json!({
+        "name": PROXY_POD_WAIT_INIT_CONTAINER_NAME,
+        "image": image,
+        "command": [
+            SUPERVISOR_IMAGE_BINARY_PATH,
+            "wait-for-tcp",
+            format!("{service_dns}:{PROXY_POD_PROXY_PORT}"),
+            PROXY_POD_WAIT_TIMEOUT_SECS.to_string(),
+        ],
+        "securityContext": {
+            "runAsUser": run_as_user,
+            "runAsGroup": run_as_group,
+            "runAsNonRoot": true,
+            "allowPrivilegeEscalation": false,
+            "readOnlyRootFilesystem": true,
+            "capabilities": {
+                "drop": ["ALL"]
+            }
+        }
+    });
+    if !image_pull_policy.is_empty() {
+        init_spec["imagePullPolicy"] = serde_json::json!(image_pull_policy);
+    }
+    init_spec
+}
+
+fn apply_proxy_pod_affinity(
+    spec: &mut serde_json::Map<String, serde_json::Value>,
+    sandbox_id: &str,
+    mode: ProxyPodAffinity,
+) {
+    if sandbox_id.is_empty() || mode == ProxyPodAffinity::Disabled {
+        return;
+    }
+
+    let term = serde_json::json!({
+        "labelSelector": {
+            "matchLabels": proxy_pod_match_labels(sandbox_id, SANDBOX_ROLE_SUPERVISOR)
+        },
+        "topologyKey": "kubernetes.io/hostname"
+    });
+
+    let affinity = spec
+        .entry("affinity".to_string())
+        .or_insert_with(|| serde_json::json!({}));
+    if !affinity.is_object() {
+        *affinity = serde_json::json!({});
+    }
+    let affinity = affinity
+        .as_object_mut()
+        .expect("affinity was converted to object");
+    let pod_affinity = affinity
+        .entry("podAffinity".to_string())
+        .or_insert_with(|| serde_json::json!({}));
+    if !pod_affinity.is_object() {
+        *pod_affinity = serde_json::json!({});
+    }
+    let pod_affinity = pod_affinity
+        .as_object_mut()
+        .expect("podAffinity was converted to object");
+    match mode {
+        ProxyPodAffinity::Disabled => {}
+        ProxyPodAffinity::Preferred => {
+            let preferred = pod_affinity
+                .entry("preferredDuringSchedulingIgnoredDuringExecution".to_string())
+                .or_insert_with(|| serde_json::json!([]));
+            if !preferred.is_array() {
+                *preferred = serde_json::json!([]);
+            }
+            if let Some(preferred) = preferred.as_array_mut() {
+                preferred.push(serde_json::json!({
+                    "weight": 100,
+                    "podAffinityTerm": term,
+                }));
+            }
+        }
+        ProxyPodAffinity::Required => {
+            let required = pod_affinity
+                .entry("requiredDuringSchedulingIgnoredDuringExecution".to_string())
+                .or_insert_with(|| serde_json::json!([]));
+            if !required.is_array() {
+                *required = serde_json::json!([]);
+            }
+            if let Some(required) = required.as_array_mut() {
+                required.push(term);
+            }
+        }
+    }
+}
+
+fn apply_supervisor_proxy_pod_topology(
+    pod_template: &mut serde_json::Value,
+    params: &SandboxPodParams<'_>,
+) {
+    let Some(spec) = pod_template.get_mut("spec").and_then(|v| v.as_object_mut()) else {
+        return;
+    };
+
+    let pod_security_context = spec
+        .entry("securityContext")
+        .or_insert_with(|| serde_json::json!({}));
+    if let Some(sc) = pod_security_context.as_object_mut() {
+        sc.insert("fsGroup".to_string(), serde_json::json!(params.sandbox_gid));
+    }
+
+    apply_proxy_pod_affinity(spec, params.sandbox_id, params.proxy_pod_affinity);
+
+    let names = proxy_pod_resource_names(params.cr_name);
+    let service_dns = proxy_pod_service_dns(&names.service, params.namespace);
+
+    let volumes = spec
+        .entry("volumes")
+        .or_insert_with(|| serde_json::json!([]))
+        .as_array_mut();
+    if let Some(volumes) = volumes {
+        volumes.push(serde_json::json!({
+            "name": "openshell-proxy-pod-ca-source",
+            "secret": {
+                "secretName": names.proxy_ca_secret,
+                "defaultMode": 0o444,
+                "items": [{
+                    "key": PROXY_POD_CA_CERT_FILE,
+                    "path": PROXY_POD_CA_CERT_FILE,
+                }]
+            }
+        }));
+        volumes.push(serde_json::json!({
+            "name": "openshell-proxy-pod-tls",
+            "emptyDir": {}
+        }));
+    }
+
+    let init_containers = spec
+        .entry("initContainers")
+        .or_insert_with(|| serde_json::json!([]))
+        .as_array_mut();
+    if let Some(init_containers) = init_containers {
+        init_containers.push(proxy_pod_ca_init_container(
+            params.supervisor_image,
+            params.supervisor_image_pull_policy,
+            params.sandbox_uid,
+            params.sandbox_gid,
+        ));
+        // Hold the workload until the paired supervisor is accepting proxy
+        // connections. Without this the workload starts first, its early
+        // egress fails, and — because the gateway derives readiness for this
+        // topology from the pod's Ready condition — the sandbox would report
+        // Ready while it has no egress path at all.
+        init_containers.push(proxy_pod_wait_for_proxy_init_container(
+            params.supervisor_image,
+            params.supervisor_image_pull_policy,
+            params.sandbox_uid,
+            params.sandbox_gid,
+            &service_dns,
+        ));
+    }
+
+    let Some(containers) = spec.get_mut("containers").and_then(|v| v.as_array_mut()) else {
+        return;
+    };
+    let target_index = containers
+        .iter()
+        .position(|c| c.get("name").and_then(|v| v.as_str()) == Some("agent"))
+        .unwrap_or(0);
+    if let Some(container) = containers
+        .get_mut(target_index)
+        .and_then(|v| v.as_object_mut())
+    {
+        let security_context = container
+            .entry("securityContext")
+            .or_insert_with(|| serde_json::json!({}));
+        if !security_context.is_object() {
+            *security_context = serde_json::json!({});
+        }
+        if let Some(sc) = security_context.as_object_mut() {
+            sc.insert(
+                "runAsUser".to_string(),
+                serde_json::json!(params.sandbox_uid),
+            );
+            sc.insert(
+                "runAsGroup".to_string(),
+                serde_json::json!(params.sandbox_gid),
+            );
+            sc.insert("runAsNonRoot".to_string(), serde_json::json!(true));
+            sc.insert(
+                "allowPrivilegeEscalation".to_string(),
+                serde_json::json!(false),
+            );
+            sc.insert(
+                "capabilities".to_string(),
+                serde_json::json!({ "drop": ["ALL"] }),
+            );
+        }
+
+        let volume_mounts = container
+            .entry("volumeMounts")
+            .or_insert_with(|| serde_json::json!([]))
+            .as_array_mut();
+        if let Some(volume_mounts) = volume_mounts {
+            remove_volume_mount(volume_mounts, SERVICE_ACCOUNT_TOKEN_VOLUME_NAME);
+            remove_volume_mount(volume_mounts, CLIENT_TLS_VOLUME_NAME);
+            remove_volume_mount(volume_mounts, SPIFFE_WORKLOAD_API_VOLUME_NAME);
+            volume_mounts.push(proxy_pod_ca_tls_volume_mount(true));
+        }
+
+        let env = container
+            .entry("env")
+            .or_insert_with(|| serde_json::json!([]))
+            .as_array_mut();
+        if let Some(env) = env {
+            for name in [
+                openshell_core::sandbox_env::SANDBOX_ID,
+                openshell_core::sandbox_env::SANDBOX,
+                openshell_core::sandbox_env::ENDPOINT,
+                openshell_core::sandbox_env::MAIN_PROCESS_SPEC,
+                openshell_core::sandbox_env::TELEMETRY_ENABLED,
+                openshell_core::sandbox_env::SSH_SOCKET_PATH,
+                openshell_core::sandbox_env::TLS_CA,
+                openshell_core::sandbox_env::TLS_CERT,
+                openshell_core::sandbox_env::TLS_KEY,
+                openshell_core::sandbox_env::K8S_SA_TOKEN_FILE,
+                openshell_core::sandbox_env::PROVIDER_SPIFFE_WORKLOAD_API_SOCKET,
+            ] {
+                remove_env(env, name);
+            }
+            let proxy_url = proxy_pod_proxy_url(&service_dns);
+            for name in [
+                "ALL_PROXY",
+                "HTTP_PROXY",
+                "HTTPS_PROXY",
+                "http_proxy",
+                "https_proxy",
+                "grpc_proxy",
+            ] {
+                upsert_env(env, name, &proxy_url);
+            }
+            for name in ["NO_PROXY", "no_proxy"] {
+                upsert_env(env, name, "127.0.0.1,localhost,::1");
+            }
+            upsert_env(env, "NODE_USE_ENV_PROXY", "1");
+
+            let ca_cert = format!("{SIDECAR_TLS_MOUNT_PATH}/{PROXY_POD_CA_CERT_FILE}");
+            let ca_bundle = format!("{SIDECAR_TLS_MOUNT_PATH}/ca-bundle.pem");
+            for name in ["NODE_EXTRA_CA_CERTS", "DENO_CERT"] {
+                upsert_env(env, name, &ca_cert);
+            }
+            for name in [
+                "SSL_CERT_FILE",
+                "REQUESTS_CA_BUNDLE",
+                "CURL_CA_BUNDLE",
+                "GIT_SSL_CAINFO",
+            ] {
+                upsert_env(env, name, &ca_bundle);
+            }
+        }
+    }
+
+    if let Some(volumes) = spec
+        .get_mut("volumes")
+        .and_then(|value| value.as_array_mut())
+    {
+        volumes.retain(|volume| {
+            !matches!(
+                volume.get("name").and_then(|value| value.as_str()),
+                Some(
+                    SERVICE_ACCOUNT_TOKEN_VOLUME_NAME
+                        | CLIENT_TLS_VOLUME_NAME
+                        | SPIFFE_WORKLOAD_API_VOLUME_NAME
+                )
+            )
+        });
+    }
+}
+
 /// Apply workspace persistence transforms to an already-built pod template.
 ///
 /// This injects:
@@ -3054,7 +3846,9 @@ fn apply_workspace_persistence(
     pod_template: &mut serde_json::Value,
     image: &str,
     image_pull_policy: &str,
+    sandbox_uid: u32,
     sandbox_gid: u32,
+    topology: SupervisorTopology,
 ) {
     let Some(spec) = pod_template.get_mut("spec").and_then(|v| v.as_object_mut()) else {
         return;
@@ -3131,13 +3925,26 @@ fn apply_workspace_persistence(
              fi"
         );
 
+        let security_context = if topology == SupervisorTopology::ProxyPod {
+            serde_json::json!({
+                "runAsUser": sandbox_uid,
+                "runAsGroup": sandbox_gid,
+                "runAsNonRoot": true,
+                "allowPrivilegeEscalation": false,
+                "capabilities": {
+                    "drop": ["ALL"]
+                }
+            })
+        } else {
+            serde_json::json!({
+                "runAsUser": 0,
+            })
+        };
         let mut init_spec = serde_json::json!({
             "name": WORKSPACE_INIT_CONTAINER_NAME,
             "image": image,
             "command": ["sh", "-c", copy_cmd],
-            "securityContext": {
-                "runAsUser": 0,
-            },
+            "securityContext": security_context,
             "volumeMounts": [{
                 "name": WORKSPACE_VOLUME_NAME,
                 "mountPath": WORKSPACE_INIT_MOUNT_PATH
@@ -3205,9 +4012,16 @@ struct SandboxPodParams<'a> {
     proxy_auth_secret_key: Option<&'a str>,
     proxy_auth_allow_insecure: bool,
     proxy_connect_by_hostname: bool,
+    proxy_pod_affinity: ProxyPodAffinity,
+    proxy_pod_dns_peers: &'a [ProxyPodDnsPeer],
+    namespace: &'a str,
     service_account_name: &'a str,
     sandbox_id: &'a str,
     sandbox_name: &'a str,
+    /// Sandbox CR resource name (`kube_resource_name`), unique per sandbox in
+    /// every workspace mode. Companion resource names derive from this so they
+    /// match across the workload pod template and the companion objects.
+    cr_name: &'a str,
     grpc_endpoint: &'a str,
     ssh_socket_path: &'a str,
     client_tls_secret_name: &'a str,
@@ -3246,9 +4060,13 @@ impl Default for SandboxPodParams<'_> {
             proxy_auth_secret_key: None,
             proxy_auth_allow_insecure: false,
             proxy_connect_by_hostname: false,
+            proxy_pod_affinity: ProxyPodAffinity::Disabled,
+            proxy_pod_dns_peers: &[],
+            namespace: "default",
             service_account_name: DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME,
             sandbox_id: "",
             sandbox_name: "",
+            cr_name: "",
             grpc_endpoint: "",
             ssh_socket_path: "",
             client_tls_secret_name: "",
@@ -3267,12 +4085,15 @@ impl Default for SandboxPodParams<'_> {
     }
 }
 
-fn validate_sidecar_proxy_identity(
-    params: &SandboxPodParams<'_>,
-) -> Result<(), KubernetesDriverError> {
-    if params.topology == SupervisorTopology::Sidecar && params.proxy_uid == params.sandbox_uid {
+fn validate_proxy_identity(params: &SandboxPodParams<'_>) -> Result<(), KubernetesDriverError> {
+    if matches!(
+        params.topology,
+        SupervisorTopology::Sidecar | SupervisorTopology::ProxyPod
+    ) && params.proxy_uid == params.sandbox_uid
+    {
+        let topology = params.topology.to_string();
         return Err(KubernetesDriverError::Precondition(format!(
-            "proxy_uid ({}) must not match sandbox_uid ({}) in sidecar topology",
+            "proxy_uid ({}) must not match sandbox_uid ({}) in {topology} topology",
             params.proxy_uid, params.sandbox_uid
         )));
     }
@@ -3288,6 +4109,30 @@ fn spec_pod_env(spec: Option<&SandboxSpec>) -> std::collections::HashMap<String,
         );
     }
     env
+}
+
+/// Reject workload entrypoint overrides in topologies that ignore them.
+///
+/// `combined` and `sidecar` replace the agent container's command with the
+/// supervisor binary, so an override there would be accepted and then silently
+/// dropped. Failing at validation is better than a sandbox that quietly does
+/// something other than what was asked.
+fn validate_agent_command_for_topology(
+    config: &KubernetesSandboxDriverConfig,
+    topology: SupervisorTopology,
+) -> Result<(), String> {
+    let agent = &config.containers.agent;
+    if agent.command.is_empty() && agent.args.is_empty() {
+        return Ok(());
+    }
+    if topology == SupervisorTopology::ProxyPod {
+        return Ok(());
+    }
+    Err(format!(
+        "containers.agent.command and containers.agent.args are only supported in \"proxy-pod\" \
+         topology; {topology} topology runs the OpenShell supervisor as the container entrypoint \
+         and would ignore them"
+    ))
 }
 
 fn kubernetes_driver_config_for_spec(
@@ -3442,7 +4287,8 @@ fn sandbox_template_to_k8s_with_validated_config(
         .iter()
         .map(|(key, value)| (key.clone(), serde_json::Value::String(value.clone())))
         .collect::<serde_json::Map<String, serde_json::Value>>();
-    if params.provider_spiffe_enabled {
+    let proxy_pod_topology = params.topology == SupervisorTopology::ProxyPod;
+    if params.provider_spiffe_enabled || proxy_pod_topology {
         pod_labels.insert(
             LABEL_MANAGED_BY.to_string(),
             serde_json::Value::String(LABEL_MANAGED_BY_VALUE.to_string()),
@@ -3453,6 +4299,12 @@ fn sandbox_template_to_k8s_with_validated_config(
                 serde_json::Value::String(params.sandbox_id.to_string()),
             );
         }
+    }
+    if proxy_pod_topology {
+        pod_labels.insert(
+            LABEL_SANDBOX_ROLE.to_string(),
+            serde_json::Value::String(SANDBOX_ROLE_AGENT.to_string()),
+        );
     }
     if !pod_labels.is_empty() {
         metadata.insert("labels".to_string(), serde_json::Value::Object(pod_labels));
@@ -3637,6 +4489,18 @@ fn sandbox_template_to_k8s_with_validated_config(
         container.insert("resources".to_string(), resources);
     }
     apply_agent_driver_resources(&mut container, &driver_config.containers.agent.resources);
+    if params.topology == SupervisorTopology::ProxyPod {
+        let agent_config = &driver_config.containers.agent;
+        if !agent_config.command.is_empty() {
+            container.insert(
+                "command".to_string(),
+                serde_json::json!(agent_config.command),
+            );
+        }
+        if !agent_config.args.is_empty() {
+            container.insert("args".to_string(), serde_json::json!(agent_config.args));
+        }
+    }
     spec.insert(
         "containers".to_string(),
         serde_json::Value::Array(vec![serde_json::Value::Object(container)]),
@@ -3650,7 +4514,7 @@ fn sandbox_template_to_k8s_with_validated_config(
     if !params.client_tls_secret_name.is_empty() {
         let client_tls_default_mode = match params.topology {
             SupervisorTopology::Combined => 0o400,
-            SupervisorTopology::Sidecar => 0o440,
+            SupervisorTopology::Sidecar | SupervisorTopology::ProxyPod => 0o440,
         };
         volumes.push(serde_json::json!({
             "name": CLIENT_TLS_VOLUME_NAME,
@@ -3671,7 +4535,9 @@ fn sandbox_template_to_k8s_with_validated_config(
         // network supervision. Sidecar mode uses the pod fsGroup already
         // required for its non-root network supervisor.
         let default_mode = match params.topology {
-            SupervisorTopology::Combined => 0o400,
+            // `combined` and `proxy-pod` are rejected by
+            // `validate_upstream_proxy_config`; use the most restrictive mode.
+            SupervisorTopology::Combined | SupervisorTopology::ProxyPod => 0o400,
             SupervisorTopology::Sidecar => 0o440,
         };
         volumes.push(serde_json::json!({
@@ -3702,7 +4568,7 @@ fn sandbox_template_to_k8s_with_validated_config(
     // supervisor containers run with the sandbox GID and need group-read access.
     let sa_token_default_mode = match params.topology {
         SupervisorTopology::Combined => 0o400,
-        SupervisorTopology::Sidecar => 0o440,
+        SupervisorTopology::Sidecar | SupervisorTopology::ProxyPod => 0o440,
     };
     volumes.push(serde_json::json!({
         "name": SERVICE_ACCOUNT_TOKEN_VOLUME_NAME,
@@ -3726,15 +4592,7 @@ fn sandbox_template_to_k8s_with_validated_config(
     spec.insert("volumes".to_string(), serde_json::Value::Array(volumes));
 
     // Add hostAliases so sandbox pods can reach the Docker host.
-    if !params.host_gateway_ip.is_empty() {
-        spec.insert(
-            "hostAliases".to_string(),
-            serde_json::json!([{
-                "ip": params.host_gateway_ip,
-                "hostnames": ["host.docker.internal", "host.openshell.internal"]
-            }]),
-        );
-    }
+    apply_host_gateway_aliases(&mut spec, params.host_gateway_ip);
 
     let mut template_value = serde_json::Map::new();
     if !metadata.is_empty() {
@@ -3756,6 +4614,9 @@ fn sandbox_template_to_k8s_with_validated_config(
                 params,
             );
         }
+        SupervisorTopology::ProxyPod => {
+            apply_supervisor_proxy_pod_topology(&mut result, params);
+        }
     }
 
     // Inject workspace persistence (init container + PVC volume mount) so
@@ -3766,7 +4627,9 @@ fn sandbox_template_to_k8s_with_validated_config(
             &mut result,
             image,
             params.image_pull_policy,
+            params.sandbox_uid,
             params.sandbox_gid,
+            params.topology,
         );
     }
 
@@ -3857,6 +4720,526 @@ fn image_pull_secret_refs(secrets: &[String]) -> Vec<serde_json::Value> {
         .filter(|secret| !secret.is_empty())
         .map(|secret| serde_json::json!({ "name": secret }))
         .collect()
+}
+
+fn k8s_object<T>(value: serde_json::Value) -> T
+where
+    T: DeserializeOwned,
+{
+    serde_json::from_value(value).expect("driver rendered an invalid Kubernetes object")
+}
+
+fn generate_proxy_pod_ca() -> Result<(String, String), KubernetesDriverError> {
+    let ca_key = KeyPair::generate().map_err(|err| {
+        KubernetesDriverError::Message(format!("failed to generate CA key: {err}"))
+    })?;
+
+    let mut params = CertificateParams::default();
+    params.is_ca = IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    params
+        .distinguished_name
+        .push(DnType::CommonName, "OpenShell Proxy Pod Sandbox CA");
+    params
+        .distinguished_name
+        .push(DnType::OrganizationName, "OpenShell");
+    params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+
+    let ca_cert = params.self_signed(&ca_key).map_err(|err| {
+        KubernetesDriverError::Message(format!("failed to generate CA certificate: {err}"))
+    })?;
+    Ok((ca_cert.pem(), ca_key.serialize_pem()))
+}
+
+fn proxy_pod_owner_reference(
+    sandbox_cr: &DynamicObject,
+    api_version: &str,
+    controller: bool,
+) -> Result<serde_json::Value, KubernetesDriverError> {
+    let name =
+        sandbox_cr.metadata.name.as_deref().ok_or_else(|| {
+            KubernetesDriverError::Message("created Sandbox is missing name".into())
+        })?;
+    let uid =
+        sandbox_cr.metadata.uid.as_deref().ok_or_else(|| {
+            KubernetesDriverError::Message("created Sandbox is missing uid".into())
+        })?;
+    Ok(serde_json::json!({
+        "apiVersion": sandbox_cr
+            .types
+            .as_ref()
+            .map_or(api_version, |types| types.api_version.as_str()),
+        "kind": SANDBOX_KIND,
+        "name": name,
+        "uid": uid,
+        "controller": controller,
+        "blockOwnerDeletion": false,
+    }))
+}
+
+fn proxy_pod_labels(sandbox_id: &str, role: &str) -> serde_json::Value {
+    let mut labels = serde_json::Map::new();
+    labels.insert(
+        LABEL_MANAGED_BY.to_string(),
+        serde_json::json!(LABEL_MANAGED_BY_VALUE),
+    );
+    labels.insert(LABEL_SANDBOX_ID.to_string(), serde_json::json!(sandbox_id));
+    labels.insert(LABEL_SANDBOX_ROLE.to_string(), serde_json::json!(role));
+    serde_json::Value::Object(labels)
+}
+
+fn proxy_pod_match_labels(sandbox_id: &str, role: &str) -> serde_json::Value {
+    let mut labels = serde_json::Map::new();
+    labels.insert(LABEL_SANDBOX_ID.to_string(), serde_json::json!(sandbox_id));
+    labels.insert(LABEL_SANDBOX_ROLE.to_string(), serde_json::json!(role));
+    serde_json::Value::Object(labels)
+}
+
+fn proxy_pod_object_meta(
+    name: &str,
+    namespace: &str,
+    sandbox_id: &str,
+    role: &str,
+    owner_ref: serde_json::Value,
+) -> serde_json::Value {
+    serde_json::json!({
+        "name": name,
+        "namespace": namespace,
+        "labels": proxy_pod_labels(sandbox_id, role),
+        "annotations": {
+            "openshell.io/sandbox-id": sandbox_id
+        },
+        "ownerReferences": [owner_ref]
+    })
+}
+
+fn proxy_pod_supervisor_env(
+    template_environment: &std::collections::HashMap<String, String>,
+    spec_environment: &std::collections::HashMap<String, String>,
+    params: &SandboxPodParams<'_>,
+) -> Vec<serde_json::Value> {
+    let mut env = Vec::new();
+    apply_required_env(
+        &mut env,
+        params.sandbox_id,
+        params.sandbox_name,
+        params.grpc_endpoint,
+        "",
+        false,
+        provider_spiffe_socket_path(params),
+    );
+    if !params.client_tls_secret_name.is_empty() {
+        upsert_env(
+            &mut env,
+            openshell_core::sandbox_env::TLS_CA,
+            &format!("{SIDECAR_CLIENT_TLS_MOUNT_PATH}/ca.crt"),
+        );
+        upsert_env(
+            &mut env,
+            openshell_core::sandbox_env::TLS_CERT,
+            &format!("{SIDECAR_CLIENT_TLS_MOUNT_PATH}/tls.crt"),
+        );
+        upsert_env(
+            &mut env,
+            openshell_core::sandbox_env::TLS_KEY,
+            &format!("{SIDECAR_CLIENT_TLS_MOUNT_PATH}/tls.key"),
+        );
+    }
+    copy_log_level_env(&mut env, template_environment, spec_environment);
+    upsert_env(
+        &mut env,
+        openshell_core::sandbox_env::SUPERVISOR_TOPOLOGY,
+        "proxy-pod",
+    );
+    upsert_env(
+        &mut env,
+        openshell_core::sandbox_env::NETWORK_ENFORCEMENT_MODE,
+        PROXY_POD_NETWORK_ENFORCEMENT_MODE,
+    );
+    upsert_env(
+        &mut env,
+        openshell_core::sandbox_env::NETWORK_BINARY_IDENTITY,
+        "relaxed",
+    );
+    upsert_env(
+        &mut env,
+        openshell_core::sandbox_env::PROXY_BIND_ADDR,
+        &format!("0.0.0.0:{PROXY_POD_PROXY_PORT}"),
+    );
+    upsert_env(
+        &mut env,
+        openshell_core::sandbox_env::PROXY_TLS_DIR,
+        SIDECAR_TLS_MOUNT_PATH,
+    );
+    upsert_env(
+        &mut env,
+        openshell_core::sandbox_env::PROXY_CA_CERT_PATH,
+        &format!("{PROXY_POD_CA_SECRET_MOUNT_PATH}/{PROXY_POD_CA_CERT_FILE}"),
+    );
+    upsert_env(
+        &mut env,
+        openshell_core::sandbox_env::PROXY_CA_KEY_PATH,
+        &format!("{PROXY_POD_CA_SECRET_MOUNT_PATH}/{PROXY_POD_CA_KEY_FILE}"),
+    );
+    upsert_env(
+        &mut env,
+        openshell_core::sandbox_env::SANDBOX_UID,
+        &params.sandbox_uid.to_string(),
+    );
+    upsert_env(
+        &mut env,
+        openshell_core::sandbox_env::SANDBOX_GID,
+        &params.sandbox_gid.to_string(),
+    );
+    env
+}
+
+fn proxy_pod_ca_secret(
+    names: &ProxyPodResourceNames,
+    params: &SandboxPodParams<'_>,
+    owner_ref: serde_json::Value,
+    cert_pem: &str,
+    key_pem: &str,
+) -> Secret {
+    let mut string_data = serde_json::Map::new();
+    string_data.insert(
+        PROXY_POD_CA_CERT_FILE.to_string(),
+        serde_json::json!(cert_pem),
+    );
+    string_data.insert(
+        PROXY_POD_CA_KEY_FILE.to_string(),
+        serde_json::json!(key_pem),
+    );
+    k8s_object(serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "Secret",
+        "metadata": {
+            "name": names.proxy_ca_secret,
+            "namespace": params.namespace,
+            "labels": proxy_pod_labels(params.sandbox_id, SANDBOX_ROLE_SUPERVISOR),
+            "ownerReferences": [owner_ref],
+        },
+        "type": "Opaque",
+        "stringData": serde_json::Value::Object(string_data)
+    }))
+}
+
+fn proxy_pod_supervisor_service(
+    names: &ProxyPodResourceNames,
+    params: &SandboxPodParams<'_>,
+    owner_ref: serde_json::Value,
+) -> Service {
+    k8s_object(serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "Service",
+        "metadata": {
+            "name": names.service,
+            "namespace": params.namespace,
+            "labels": proxy_pod_labels(params.sandbox_id, SANDBOX_ROLE_SUPERVISOR),
+            "ownerReferences": [owner_ref],
+        },
+        "spec": {
+            "clusterIP": "None",
+            "publishNotReadyAddresses": true,
+            "selector": proxy_pod_match_labels(params.sandbox_id, SANDBOX_ROLE_SUPERVISOR),
+            "ports": [
+                {
+                    "name": "http-proxy",
+                    "port": PROXY_POD_PROXY_PORT,
+                    "targetPort": PROXY_POD_PROXY_PORT,
+                    "protocol": "TCP"
+                }
+            ]
+        }
+    }))
+}
+
+fn proxy_pod_supervisor_deployment(
+    names: &ProxyPodResourceNames,
+    template_environment: &std::collections::HashMap<String, String>,
+    spec_environment: &std::collections::HashMap<String, String>,
+    params: &SandboxPodParams<'_>,
+    pod_config: &KubernetesPodDriverConfig,
+    owner_ref: serde_json::Value,
+) -> Deployment {
+    let mut container = serde_json::json!({
+        "name": SUPERVISOR_NETWORK_SIDECAR_NAME,
+        "image": params.supervisor_image,
+        "command": [
+            SUPERVISOR_IMAGE_BINARY_PATH,
+            "--mode=network",
+        ],
+        "env": proxy_pod_supervisor_env(template_environment, spec_environment, params),
+        "ports": [
+            {"name": "http-proxy", "containerPort": PROXY_POD_PROXY_PORT, "protocol": "TCP"}
+        ],
+        "readinessProbe": {
+            "tcpSocket": {"port": PROXY_POD_PROXY_PORT},
+            "periodSeconds": 2,
+            "failureThreshold": 30
+        },
+        "securityContext": {
+            "runAsUser": params.proxy_uid,
+            "runAsGroup": params.sandbox_gid,
+            "runAsNonRoot": true,
+            "allowPrivilegeEscalation": false,
+            "capabilities": {
+                "drop": ["ALL"]
+            }
+        },
+        "volumeMounts": [
+            {
+                "name": "openshell-sa-token",
+                "mountPath": "/var/run/secrets/openshell",
+                "readOnly": true
+            },
+            {
+                "name": "openshell-proxy-pod-ca-source",
+                "mountPath": PROXY_POD_CA_SECRET_MOUNT_PATH,
+                "readOnly": true
+            },
+            proxy_pod_ca_tls_volume_mount(false),
+        ]
+    });
+    if !params.supervisor_image_pull_policy.is_empty() {
+        container["imagePullPolicy"] = serde_json::json!(params.supervisor_image_pull_policy);
+    }
+    if !params.client_tls_secret_name.is_empty() {
+        container["volumeMounts"]
+            .as_array_mut()
+            .expect("volumeMounts is an array")
+            .push(serde_json::json!({
+                "name": "openshell-client-tls",
+                "mountPath": SIDECAR_CLIENT_TLS_MOUNT_PATH,
+                "readOnly": true
+            }));
+    }
+    if params.provider_spiffe_enabled {
+        container["volumeMounts"]
+            .as_array_mut()
+            .expect("volumeMounts is an array")
+            .push(serde_json::json!({
+                "name": SPIFFE_WORKLOAD_API_VOLUME_NAME,
+                "mountPath": spiffe_socket_mount_path(params.provider_spiffe_workload_api_socket_path),
+                "readOnly": true,
+            }));
+    }
+    if let Some(profile) = params.app_armor_profile {
+        container["securityContext"]["appArmorProfile"] = app_armor_profile_to_k8s(profile);
+    }
+
+    let mut spec = serde_json::json!({
+        "serviceAccountName": params.service_account_name,
+        "automountServiceAccountToken": false,
+        "securityContext": {
+            "fsGroup": params.sandbox_gid
+        },
+        "containers": [container],
+        "volumes": [
+            {
+                "name": "openshell-sa-token",
+                "projected": {
+                    "sources": [{
+                        "serviceAccountToken": {
+                            "audience": "openshell-gateway",
+                            "expirationSeconds": params.sa_token_ttl_secs,
+                            "path": "token"
+                        }
+                    }],
+                    "defaultMode": 0o440
+                }
+            },
+            {
+                "name": "openshell-proxy-pod-ca-source",
+                "secret": {
+                    "secretName": names.proxy_ca_secret,
+                    "defaultMode": 0o440
+                }
+            },
+            {
+                "name": "openshell-proxy-pod-tls",
+                "emptyDir": {}
+            }
+        ]
+    });
+    if !params.default_runtime_class_name.is_empty() {
+        spec["runtimeClassName"] = serde_json::json!(params.default_runtime_class_name);
+    }
+    if let Some(spec_obj) = spec.as_object_mut() {
+        apply_host_gateway_aliases(spec_obj, params.host_gateway_ip);
+    }
+    let image_pull_secrets = image_pull_secret_refs(params.image_pull_secrets);
+    if !image_pull_secrets.is_empty() {
+        spec["imagePullSecrets"] = serde_json::Value::Array(image_pull_secrets);
+    }
+    if !params.client_tls_secret_name.is_empty() {
+        spec["volumes"]
+            .as_array_mut()
+            .expect("volumes is an array")
+            .push(serde_json::json!({
+                "name": "openshell-client-tls",
+                "secret": {
+                    "secretName": params.client_tls_secret_name,
+                    "defaultMode": 0o440
+                }
+            }));
+    }
+    if params.provider_spiffe_enabled {
+        spec["volumes"]
+            .as_array_mut()
+            .expect("volumes is an array")
+            .push(serde_json::json!({
+                "name": SPIFFE_WORKLOAD_API_VOLUME_NAME,
+                "csi": {
+                    "driver": "csi.spiffe.io",
+                    "readOnly": true
+                }
+            }));
+    }
+    if let Some(spec_obj) = spec.as_object_mut() {
+        apply_pod_driver_config(spec_obj, pod_config);
+    }
+
+    k8s_object(serde_json::json!({
+        "apiVersion": "apps/v1",
+        "kind": "Deployment",
+        "metadata": proxy_pod_object_meta(
+            &names.supervisor_deployment,
+            params.namespace,
+            params.sandbox_id,
+            SANDBOX_ROLE_SUPERVISOR,
+            owner_ref
+        ),
+        "spec": {
+            "replicas": 1,
+            "selector": {
+                "matchLabels": proxy_pod_match_labels(params.sandbox_id, SANDBOX_ROLE_SUPERVISOR)
+            },
+            "template": {
+                "metadata": {
+                    "labels": proxy_pod_labels(params.sandbox_id, SANDBOX_ROLE_SUPERVISOR),
+                    "annotations": {
+                        "openshell.io/sandbox-id": params.sandbox_id
+                    }
+                },
+                "spec": spec
+            }
+        }
+    }))
+}
+
+/// Build the DNS egress rules for the agent pod.
+///
+/// Emits one rule per configured peer, because peers may listen on different
+/// ports and a `NetworkPolicy` rule applies its port list to every `to` entry
+/// in that rule.
+///
+/// `peer.port` is the destination **pod** port. Egress rules with a
+/// `podSelector` peer are evaluated after `Service` address translation, so a
+/// cluster whose DNS `Service` maps 53 onto a different container port needs
+/// that container port configured. Upstream `CoreDNS` listens on 53;
+/// `OpenShift`'s `dns-default` listens on 5353 and maps 53 to it.
+///
+/// Returns an empty vector for an empty peer list. This is deliberately
+/// fail-closed: a `NetworkPolicy` egress rule with an empty `to` array matches
+/// *every* destination, so emitting one here would silently open DNS-port
+/// egress to the whole cluster. Emitting no rule denies DNS instead, and
+/// `validate_dns_peers` rejects an empty list at startup so a correctly
+/// configured driver never reaches that state.
+fn proxy_pod_dns_egress_rules(peers: &[ProxyPodDnsPeer]) -> Vec<serde_json::Value> {
+    peers
+        .iter()
+        .map(|peer| {
+            let mut entry = serde_json::Map::new();
+            if !peer.namespace_labels.is_empty() {
+                entry.insert(
+                    "namespaceSelector".to_string(),
+                    serde_json::json!({"matchLabels": peer.namespace_labels}),
+                );
+            }
+            if !peer.pod_labels.is_empty() {
+                entry.insert(
+                    "podSelector".to_string(),
+                    serde_json::json!({"matchLabels": peer.pod_labels}),
+                );
+            }
+            serde_json::json!({
+                "to": [serde_json::Value::Object(entry)],
+                "ports": [
+                    {"protocol": "UDP", "port": peer.port},
+                    {"protocol": "TCP", "port": peer.port}
+                ]
+            })
+        })
+        .collect()
+}
+
+fn proxy_pod_agent_egress_network_policy(
+    names: &ProxyPodResourceNames,
+    params: &SandboxPodParams<'_>,
+    owner_ref: serde_json::Value,
+) -> NetworkPolicy {
+    let mut egress = vec![serde_json::json!({
+        "to": [{
+            "podSelector": {
+                "matchLabels": proxy_pod_match_labels(params.sandbox_id, SANDBOX_ROLE_SUPERVISOR)
+            }
+        }],
+        "ports": [
+            {"protocol": "TCP", "port": PROXY_POD_PROXY_PORT}
+        ]
+    })];
+    egress.extend(proxy_pod_dns_egress_rules(params.proxy_pod_dns_peers));
+
+    k8s_object(serde_json::json!({
+        "apiVersion": "networking.k8s.io/v1",
+        "kind": "NetworkPolicy",
+        "metadata": {
+            "name": names.agent_egress_network_policy,
+            "namespace": params.namespace,
+            "labels": proxy_pod_labels(params.sandbox_id, SANDBOX_ROLE_AGENT),
+            "ownerReferences": [owner_ref],
+        },
+        "spec": {
+            "podSelector": {
+                "matchLabels": proxy_pod_match_labels(params.sandbox_id, SANDBOX_ROLE_AGENT)
+            },
+            "policyTypes": ["Egress"],
+            "egress": egress
+        }
+    }))
+}
+
+fn proxy_pod_supervisor_ingress_network_policy(
+    names: &ProxyPodResourceNames,
+    params: &SandboxPodParams<'_>,
+    owner_ref: serde_json::Value,
+) -> NetworkPolicy {
+    k8s_object(serde_json::json!({
+        "apiVersion": "networking.k8s.io/v1",
+        "kind": "NetworkPolicy",
+        "metadata": {
+            "name": names.supervisor_ingress_network_policy,
+            "namespace": params.namespace,
+            "labels": proxy_pod_labels(params.sandbox_id, SANDBOX_ROLE_SUPERVISOR),
+            "ownerReferences": [owner_ref],
+        },
+        "spec": {
+            "podSelector": {
+                "matchLabels": proxy_pod_match_labels(params.sandbox_id, SANDBOX_ROLE_SUPERVISOR)
+            },
+            "policyTypes": ["Ingress"],
+            "ingress": [{
+                "from": [{
+                    "podSelector": {
+                        "matchLabels": proxy_pod_match_labels(params.sandbox_id, SANDBOX_ROLE_AGENT)
+                    }
+                }],
+                "ports": [
+                    {"protocol": "TCP", "port": PROXY_POD_PROXY_PORT}
+                ]
+            }]
+        }
+    }))
 }
 
 fn app_armor_profile_to_k8s(profile: &AppArmorProfile) -> serde_json::Value {
@@ -4144,7 +5527,15 @@ fn platform_config_struct(template: &SandboxTemplate, key: &str) -> Option<serde
     }
 }
 
-fn status_from_object(obj: &DynamicObject) -> Option<SandboxStatus> {
+/// Convert a `Sandbox` CR's status into the driver contract's status.
+///
+/// `topology` decides the supervisor-session model reported to the gateway.
+/// `proxy-pod` has no in-sandbox process supervisor, so no `ConnectSupervisor`
+/// session will ever open; the gateway must derive readiness from the
+/// conditions below instead of waiting forever. The agent pod's
+/// `wait-for-proxy` init container is what makes that safe: the pod does not
+/// become Ready until its paired supervisor is accepting connections.
+fn status_from_object(obj: &DynamicObject, topology: SupervisorTopology) -> Option<SandboxStatus> {
     let status = obj.data.get("status")?;
     let status_obj = status.as_object()?;
 
@@ -4182,6 +5573,12 @@ fn status_from_object(obj: &DynamicObject) -> Option<SandboxStatus> {
             .to_string(),
         conditions,
         deleting: obj.metadata.deletion_timestamp.is_some(),
+        supervisor_session_model: match topology {
+            SupervisorTopology::ProxyPod => SupervisorSessionModel::None as i32,
+            SupervisorTopology::Combined | SupervisorTopology::Sidecar => {
+                SupervisorSessionModel::Required as i32
+            }
+        },
     })
 }
 
@@ -5708,6 +7105,7 @@ mod tests {
             grpc_endpoint: "https://openshell-gateway.openshell.svc:8080",
             client_tls_secret_name: "openshell-client-tls",
             proxy_uid: 2200,
+            namespace: "default",
             sandbox_uid: 1500,
             sandbox_gid: 1500,
             ..SandboxPodParams::default()
@@ -6092,13 +7490,716 @@ mod tests {
         let params = SandboxPodParams {
             topology: SupervisorTopology::Sidecar,
             proxy_uid: 1500,
+            namespace: "default",
             sandbox_uid: 1500,
             ..SandboxPodParams::default()
         };
 
-        let err = validate_sidecar_proxy_identity(&params).unwrap_err();
+        let err = validate_proxy_identity(&params).unwrap_err();
         assert!(matches!(err, KubernetesDriverError::Precondition(_)));
         assert!(err.to_string().contains("proxy_uid"));
+    }
+
+    #[test]
+    fn proxy_pod_topology_runs_workload_directly_through_proxy_service() {
+        let params = SandboxPodParams {
+            topology: SupervisorTopology::ProxyPod,
+            supervisor_sideload_method: SupervisorSideloadMethod::InitContainer,
+            supervisor_image: "supervisor-image:latest",
+            namespace: "agents",
+            sandbox_id: "sandbox-123",
+            sandbox_name: "example-sandbox",
+            cr_name: "example-sandbox",
+            grpc_endpoint: "https://openshell-gateway.openshell.svc:8080",
+            proxy_uid: 2200,
+            sandbox_uid: 1500,
+            sandbox_gid: 1500,
+            host_gateway_ip: "172.17.0.1",
+            ..SandboxPodParams::default()
+        };
+        let pod_template = sandbox_template_to_k8s(
+            &SandboxTemplate {
+                image: "agent-image:latest".to_string(),
+                ..SandboxTemplate::default()
+            },
+            false,
+            &std::collections::HashMap::new(),
+            false,
+            &params,
+        );
+
+        let names = proxy_pod_resource_names("example-sandbox");
+        let service_dns = proxy_pod_service_dns(&names.service, "agents");
+        let agent = &pod_template["spec"]["containers"][0];
+
+        assert_eq!(
+            pod_template["metadata"]["labels"][LABEL_SANDBOX_ROLE],
+            SANDBOX_ROLE_AGENT
+        );
+        assert!(agent.get("command").is_none());
+        assert_eq!(
+            rendered_env(agent, openshell_core::sandbox_env::ENDPOINT),
+            None
+        );
+        assert_eq!(
+            rendered_env(agent, "HTTP_PROXY"),
+            Some(format!("http://{service_dns}:3128").as_str())
+        );
+        assert_eq!(
+            rendered_env(agent, "SSL_CERT_FILE"),
+            Some("/etc/openshell-tls/proxy/ca-bundle.pem")
+        );
+        assert_eq!(
+            rendered_env(agent, openshell_core::sandbox_env::K8S_SA_TOKEN_FILE),
+            None
+        );
+        assert_eq!(
+            rendered_env(agent, openshell_core::sandbox_env::SSH_SOCKET_PATH),
+            None
+        );
+        assert_eq!(
+            agent["securityContext"]["capabilities"]["drop"],
+            serde_json::json!(["ALL"])
+        );
+        let proxy_tls_mount = agent["volumeMounts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|mount| mount["name"] == "openshell-proxy-pod-tls")
+            .unwrap();
+        assert_eq!(proxy_tls_mount["readOnly"], true);
+
+        let containers = pod_template["spec"]["containers"].as_array().unwrap();
+        assert_eq!(containers.len(), 1);
+        let volumes = pod_template["spec"]["volumes"].as_array().unwrap();
+        assert!(volumes.iter().any(|volume| {
+            volume["name"] == "openshell-proxy-pod-ca-source"
+                && volume["secret"]["secretName"] == names.proxy_ca_secret
+        }));
+        assert!(volumes.iter().any(|volume| {
+            volume["name"] == "openshell-proxy-pod-tls" && volume["emptyDir"].is_object()
+        }));
+        assert!(!volumes.iter().any(|volume| {
+            matches!(
+                volume["name"].as_str(),
+                Some(
+                    SUPERVISOR_VOLUME_NAME
+                        | SERVICE_ACCOUNT_TOKEN_VOLUME_NAME
+                        | CLIENT_TLS_VOLUME_NAME
+                        | SPIFFE_WORKLOAD_API_VOLUME_NAME
+                )
+            )
+        }));
+
+        let init_containers = pod_template["spec"]["initContainers"].as_array().unwrap();
+        let ca_init = init_containers
+            .iter()
+            .find(|container| container["name"] == "openshell-proxy-ca-install")
+            .unwrap();
+        assert_eq!(ca_init["image"], "supervisor-image:latest");
+        assert_eq!(ca_init["securityContext"]["runAsUser"], 1500);
+        assert_eq!(ca_init["securityContext"]["runAsGroup"], 1500);
+        assert_eq!(ca_init["securityContext"]["runAsNonRoot"], true);
+        assert_eq!(
+            ca_init["securityContext"]["allowPrivilegeEscalation"],
+            false
+        );
+        assert_eq!(ca_init["securityContext"]["readOnlyRootFilesystem"], true);
+        assert_eq!(
+            ca_init["securityContext"]["capabilities"]["drop"],
+            serde_json::json!(["ALL"])
+        );
+        assert!(
+            !init_containers
+                .iter()
+                .any(|container| container["name"] == SUPERVISOR_INIT_CONTAINER_NAME)
+        );
+
+        assert!(pod_template["spec"].get("affinity").is_none());
+    }
+
+    #[test]
+    fn proxy_pod_agent_pod_has_no_root_containers() {
+        let params = SandboxPodParams {
+            topology: SupervisorTopology::ProxyPod,
+            supervisor_image: "supervisor-image:latest",
+            namespace: "agents",
+            sandbox_id: "sandbox-123",
+            sandbox_name: "example-sandbox",
+            cr_name: "example-sandbox",
+            proxy_uid: 2200,
+            sandbox_uid: 1500,
+            sandbox_gid: 1600,
+            ..SandboxPodParams::default()
+        };
+        let pod_template = sandbox_template_to_k8s(
+            &SandboxTemplate {
+                image: "agent-image:latest".to_string(),
+                ..SandboxTemplate::default()
+            },
+            false,
+            &std::collections::HashMap::new(),
+            true,
+            &params,
+        );
+
+        let containers = pod_template["spec"]["containers"].as_array().unwrap();
+        let init_containers = pod_template["spec"]["initContainers"].as_array().unwrap();
+        // CA install, wait-for-proxy, and workspace seed.
+        assert_eq!(init_containers.len(), 3);
+        for container in containers.iter().chain(init_containers) {
+            let security_context = &container["securityContext"];
+            assert_ne!(
+                security_context["runAsUser"], 0,
+                "{} must not run as root",
+                container["name"]
+            );
+            assert_eq!(security_context["runAsNonRoot"], true);
+            assert_eq!(security_context["allowPrivilegeEscalation"], false);
+            assert_eq!(
+                security_context["capabilities"]["drop"],
+                serde_json::json!(["ALL"])
+            );
+        }
+    }
+
+    #[test]
+    fn proxy_pod_topology_supports_preferred_affinity() {
+        let mut spec = serde_json::Map::new();
+        apply_proxy_pod_affinity(&mut spec, "sandbox-123", ProxyPodAffinity::Preferred);
+
+        let preferred =
+            &spec["affinity"]["podAffinity"]["preferredDuringSchedulingIgnoredDuringExecution"][0];
+        assert_eq!(preferred["weight"], 100);
+        assert_eq!(
+            preferred["podAffinityTerm"]["labelSelector"]["matchLabels"][LABEL_SANDBOX_ROLE],
+            SANDBOX_ROLE_SUPERVISOR
+        );
+        assert_eq!(
+            preferred["podAffinityTerm"]["topologyKey"],
+            "kubernetes.io/hostname"
+        );
+    }
+
+    #[test]
+    fn proxy_pod_topology_supports_required_affinity_without_replacing_existing_terms() {
+        let mut spec = serde_json::json!({
+            "affinity": {
+                "podAffinity": {
+                    "requiredDuringSchedulingIgnoredDuringExecution": [{
+                        "topologyKey": "topology.kubernetes.io/zone"
+                    }]
+                }
+            }
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        apply_proxy_pod_affinity(&mut spec, "sandbox-123", ProxyPodAffinity::Required);
+
+        let required =
+            spec["affinity"]["podAffinity"]["requiredDuringSchedulingIgnoredDuringExecution"]
+                .as_array()
+                .unwrap();
+        assert_eq!(required.len(), 2);
+        assert_eq!(required[0]["topologyKey"], "topology.kubernetes.io/zone");
+        assert_eq!(required[1]["topologyKey"], "kubernetes.io/hostname");
+    }
+
+    #[test]
+    fn proxy_pod_companion_resources_bind_one_agent_to_one_supervisor() {
+        let params = SandboxPodParams {
+            topology: SupervisorTopology::ProxyPod,
+            supervisor_image: "supervisor-image:latest",
+            namespace: "agents",
+            service_account_name: "openshell-sandbox",
+            sandbox_id: "sandbox-123",
+            sandbox_name: "example-sandbox",
+            cr_name: "example-sandbox",
+            grpc_endpoint: "http://openshell-gateway.openshell.svc:8080",
+            proxy_uid: 2200,
+            sandbox_uid: 1500,
+            sandbox_gid: 1500,
+            host_gateway_ip: "172.17.0.1",
+            ..SandboxPodParams::default()
+        };
+        let names = proxy_pod_resource_names(params.sandbox_name);
+        let owner_ref = serde_json::json!({
+            "apiVersion": "agents.x-k8s.io/v1beta1",
+            "kind": "Sandbox",
+            "name": params.sandbox_name,
+            "uid": "sandbox-cr-uid",
+            "controller": true,
+            "blockOwnerDeletion": false
+        });
+
+        let supervisor = serde_json::to_value(proxy_pod_supervisor_deployment(
+            &names,
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            &params,
+            &KubernetesPodDriverConfig::default(),
+            owner_ref.clone(),
+        ))
+        .unwrap();
+        assert_eq!(
+            supervisor["metadata"]["ownerReferences"][0]["controller"],
+            true
+        );
+        assert_eq!(
+            supervisor["metadata"]["annotations"]["openshell.io/sandbox-id"],
+            "sandbox-123"
+        );
+        assert_eq!(
+            supervisor["metadata"]["labels"][LABEL_SANDBOX_ROLE],
+            SANDBOX_ROLE_SUPERVISOR
+        );
+        assert_eq!(supervisor["kind"], "Deployment");
+        assert_eq!(supervisor["spec"]["replicas"], 1);
+        assert_eq!(
+            supervisor["spec"]["selector"]["matchLabels"][LABEL_SANDBOX_ROLE],
+            SANDBOX_ROLE_SUPERVISOR
+        );
+        assert_eq!(
+            supervisor["spec"]["template"]["metadata"]["labels"][LABEL_SANDBOX_ROLE],
+            SANDBOX_ROLE_SUPERVISOR
+        );
+        assert_eq!(
+            supervisor["spec"]["template"]["spec"]["hostAliases"][0]["ip"],
+            params.host_gateway_ip
+        );
+        let hostnames = supervisor["spec"]["template"]["spec"]["hostAliases"][0]["hostnames"]
+            .as_array()
+            .unwrap();
+        assert!(hostnames.contains(&serde_json::json!("host.openshell.internal")));
+        let container = &supervisor["spec"]["template"]["spec"]["containers"][0];
+        assert_eq!(
+            rendered_env(container, openshell_core::sandbox_env::PROXY_BIND_ADDR),
+            Some("0.0.0.0:3128")
+        );
+
+        let agent_egress = serde_json::to_value(proxy_pod_agent_egress_network_policy(
+            &names,
+            &params,
+            owner_ref.clone(),
+        ))
+        .unwrap();
+        assert_eq!(
+            agent_egress["spec"]["policyTypes"],
+            serde_json::json!(["Egress"])
+        );
+        assert_eq!(
+            agent_egress["spec"]["podSelector"]["matchLabels"][LABEL_SANDBOX_ROLE],
+            SANDBOX_ROLE_AGENT
+        );
+        assert_eq!(
+            agent_egress["spec"]["egress"][0]["to"][0]["podSelector"]["matchLabels"]
+                [LABEL_SANDBOX_ROLE],
+            SANDBOX_ROLE_SUPERVISOR
+        );
+
+        let supervisor_ingress = serde_json::to_value(proxy_pod_supervisor_ingress_network_policy(
+            &names, &params, owner_ref,
+        ))
+        .unwrap();
+        assert_eq!(
+            supervisor_ingress["spec"]["policyTypes"],
+            serde_json::json!(["Ingress"])
+        );
+        assert_eq!(
+            supervisor_ingress["spec"]["ingress"][0]["from"][0]["podSelector"]["matchLabels"]
+                [LABEL_SANDBOX_ROLE],
+            SANDBOX_ROLE_AGENT
+        );
+    }
+
+    #[test]
+    fn proxy_pod_topology_rejects_proxy_uid_matching_sandbox_uid() {
+        let params = SandboxPodParams {
+            topology: SupervisorTopology::ProxyPod,
+            proxy_uid: 1500,
+            namespace: "default",
+            sandbox_uid: 1500,
+            ..SandboxPodParams::default()
+        };
+
+        let err = validate_proxy_identity(&params).unwrap_err();
+        assert!(matches!(err, KubernetesDriverError::Precondition(_)));
+        assert!(err.to_string().contains("proxy-pod"));
+    }
+
+    /// Every egress rule except the supervisor rule, which is the one carrying
+    /// the proxy port.
+    fn dns_egress_rules(policy: &NetworkPolicy) -> Vec<serde_json::Value> {
+        let policy = serde_json::to_value(policy).unwrap();
+        policy["spec"]["egress"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|rule| {
+                !rule["ports"].as_array().is_some_and(|ports| {
+                    ports
+                        .iter()
+                        .any(|port| port["port"] == i64::from(PROXY_POD_PROXY_PORT))
+                })
+            })
+            .cloned()
+            .collect()
+    }
+
+    fn proxy_pod_egress_policy_with_dns_peers(peers: &[ProxyPodDnsPeer]) -> NetworkPolicy {
+        let params = SandboxPodParams {
+            topology: SupervisorTopology::ProxyPod,
+            namespace: "agents",
+            sandbox_id: "sandbox-123",
+            sandbox_name: "example-sandbox",
+            cr_name: "example-sandbox",
+            proxy_pod_dns_peers: peers,
+            ..SandboxPodParams::default()
+        };
+        proxy_pod_agent_egress_network_policy(
+            &proxy_pod_resource_names("example-sandbox"),
+            &params,
+            serde_json::json!({}),
+        )
+    }
+
+    fn sandbox_object_with_conditions(conditions: &[(&str, &str)]) -> DynamicObject {
+        let resource = ApiResource::from_gvk(&GroupVersionKind::gvk(
+            SANDBOX_GROUP,
+            SANDBOX_VERSION_V1BETA1,
+            SANDBOX_KIND,
+        ));
+        let mut obj = DynamicObject::new("sandbox", &resource);
+        let conditions: Vec<_> = conditions
+            .iter()
+            .map(|(kind, status)| serde_json::json!({"type": kind, "status": status}))
+            .collect();
+        obj.data = serde_json::json!({"status": {"conditions": conditions}});
+        obj
+    }
+
+    #[test]
+    fn agent_command_override_is_rejected_outside_proxy_pod() {
+        let config = KubernetesSandboxDriverConfig {
+            containers: KubernetesDriverContainersConfig {
+                agent: KubernetesContainerDriverConfig {
+                    command: vec!["sleep".to_string(), "infinity".to_string()],
+                    ..KubernetesContainerDriverConfig::default()
+                },
+            },
+            ..KubernetesSandboxDriverConfig::default()
+        };
+
+        validate_agent_command_for_topology(&config, SupervisorTopology::ProxyPod).unwrap();
+        let err =
+            validate_agent_command_for_topology(&config, SupervisorTopology::Combined).unwrap_err();
+        assert!(err.contains("proxy-pod"), "{err}");
+    }
+
+    /// Per-sandbox proxy-pod resources are named from the sandbox name, not
+    /// the Sandbox CR name -- the CR is `<workspace>--<sandbox>`. Deriving them
+    /// from the CR name silently targets objects that do not exist, which
+    /// owner-reference GC then masks on delete but not on stop/start.
+    #[test]
+    fn proxy_pod_supervisor_inherits_workload_node_placement() {
+        let names = proxy_pod_resource_names("ws--dev");
+        let params = SandboxPodParams {
+            topology: SupervisorTopology::ProxyPod,
+            supervisor_image: "supervisor:latest",
+            namespace: "agents",
+            sandbox_id: "sandbox-1",
+            sandbox_name: "dev",
+            proxy_uid: 2000,
+            sandbox_uid: 1500,
+            sandbox_gid: 1500,
+            ..SandboxPodParams::default()
+        };
+        let pod_config = KubernetesPodDriverConfig {
+            node_selector: std::iter::once(("pool".to_string(), "gpu".to_string())).collect(),
+            tolerations: vec![serde_json::json!({"key": "gpu", "operator": "Exists"})],
+            ..KubernetesPodDriverConfig::default()
+        };
+        let dep = serde_json::to_value(proxy_pod_supervisor_deployment(
+            &names,
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            &params,
+            &pod_config,
+            serde_json::json!({}),
+        ))
+        .unwrap();
+        let pod_spec = &dep["spec"]["template"]["spec"];
+        assert_eq!(pod_spec["nodeSelector"]["pool"], "gpu");
+        assert_eq!(pod_spec["tolerations"][0]["key"], "gpu");
+    }
+
+    #[test]
+    fn proxy_pod_pod_template_references_companions_by_cr_name() {
+        // Shared mode: CR name is `<workspace>--<name>`, distinct from the bare
+        // sandbox name. The workload pod's CA secret mount and proxy URL must
+        // use the CR-name-derived companion names, or the pod mounts a secret
+        // that does not exist (and never becomes Ready).
+        let params = SandboxPodParams {
+            topology: SupervisorTopology::ProxyPod,
+            supervisor_image: "supervisor:latest",
+            namespace: "agents",
+            sandbox_id: "sandbox-1",
+            sandbox_name: "dev",
+            cr_name: "team-a--dev",
+            proxy_uid: 2000,
+            sandbox_uid: 1500,
+            sandbox_gid: 1500,
+            ..SandboxPodParams::default()
+        };
+        let pod_template = sandbox_template_to_k8s(
+            &SandboxTemplate {
+                image: "agent:latest".to_string(),
+                ..SandboxTemplate::default()
+            },
+            false,
+            &std::collections::HashMap::new(),
+            false,
+            &params,
+        );
+        let names = proxy_pod_resource_names("team-a--dev");
+        let service_dns = proxy_pod_service_dns(&names.service, "agents");
+        let agent = &pod_template["spec"]["containers"][0];
+        assert_eq!(
+            rendered_env(agent, "HTTP_PROXY"),
+            Some(format!("http://{service_dns}:3128").as_str())
+        );
+        let volumes = pod_template["spec"]["volumes"].as_array().unwrap();
+        assert!(
+            volumes.iter().any(|v| {
+                v["name"] == "openshell-proxy-pod-ca-source"
+                    && v["secret"]["secretName"] == serde_json::json!(names.proxy_ca_secret)
+            }),
+            "workload CA volume must reference the CR-name-derived secret {}",
+            names.proxy_ca_secret
+        );
+    }
+
+    #[test]
+    fn proxy_pod_resource_names_disambiguate_by_cr_name() {
+        // In shared mode two workspaces may hold a sandbox named `dev`, giving
+        // CR names `workspace-a--dev` and `workspace-b--dev`. Companion names
+        // must derive from the CR name so they do not collide; the bare
+        // sandbox name would.
+        let a = proxy_pod_resource_names("workspace-a--dev");
+        let b = proxy_pod_resource_names("workspace-b--dev");
+        assert_ne!(a.supervisor_deployment, b.supervisor_deployment);
+        assert_ne!(a.service, b.service);
+        assert_ne!(a.proxy_ca_secret, b.proxy_ca_secret);
+        assert_ne!(a.agent_egress_network_policy, b.agent_egress_network_policy);
+        assert_ne!(
+            a.supervisor_ingress_network_policy,
+            b.supervisor_ingress_network_policy
+        );
+    }
+
+    #[test]
+    fn proxy_pod_reports_no_supervisor_session_model() {
+        let obj = sandbox_object_with_conditions(&[("Ready", "True")]);
+        let status = status_from_object(&obj, SupervisorTopology::ProxyPod).unwrap();
+        assert_eq!(
+            status.supervisor_session_model,
+            SupervisorSessionModel::None as i32
+        );
+    }
+
+    #[test]
+    fn supervisor_topologies_require_a_supervisor_session() {
+        let obj = sandbox_object_with_conditions(&[("Ready", "True")]);
+        for topology in [SupervisorTopology::Combined, SupervisorTopology::Sidecar] {
+            let status = status_from_object(&obj, topology).unwrap();
+            assert_eq!(
+                status.supervisor_session_model,
+                SupervisorSessionModel::Required as i32,
+                "{topology}"
+            );
+        }
+    }
+
+    /// The agent pod must not report Ready before its paired supervisor is
+    /// serving: the gateway derives readiness from the pod for this topology,
+    /// so a pod that is up without a proxy would advertise egress it does not
+    /// have.
+    #[test]
+    fn proxy_pod_agent_waits_for_its_paired_supervisor() {
+        let params = SandboxPodParams {
+            topology: SupervisorTopology::ProxyPod,
+            supervisor_image: "supervisor-image:latest",
+            namespace: "agents",
+            sandbox_id: "sandbox-123",
+            sandbox_name: "example-sandbox",
+            cr_name: "example-sandbox",
+            proxy_uid: 2200,
+            sandbox_uid: 1500,
+            sandbox_gid: 1500,
+            ..SandboxPodParams::default()
+        };
+        let pod_template = sandbox_template_to_k8s(
+            &SandboxTemplate {
+                image: "agent-image:latest".to_string(),
+                ..SandboxTemplate::default()
+            },
+            false,
+            &std::collections::HashMap::new(),
+            false,
+            &params,
+        );
+        let init_containers = pod_template["spec"]["initContainers"].as_array().unwrap();
+        let wait = init_containers
+            .iter()
+            .find(|c| c["name"] == PROXY_POD_WAIT_INIT_CONTAINER_NAME)
+            .expect("proxy-pod agent pod waits for its supervisor");
+
+        let command = wait["command"].as_array().unwrap();
+        assert_eq!(command[1], "wait-for-tcp");
+        let names = proxy_pod_resource_names("example-sandbox");
+        let service_dns = proxy_pod_service_dns(&names.service, "agents");
+        assert_eq!(command[2], format!("{service_dns}:3128"));
+        assert_eq!(wait["securityContext"]["runAsNonRoot"], true);
+        assert_eq!(
+            wait["securityContext"]["capabilities"]["drop"],
+            serde_json::json!(["ALL"])
+        );
+    }
+
+    #[test]
+    fn other_topologies_have_no_wait_for_proxy_init_container() {
+        let params = SandboxPodParams {
+            topology: SupervisorTopology::Sidecar,
+            supervisor_image: "supervisor-image:latest",
+            namespace: "agents",
+            sandbox_id: "sandbox-123",
+            sandbox_name: "example-sandbox",
+            cr_name: "example-sandbox",
+            ..SandboxPodParams::default()
+        };
+        let pod_template = sandbox_template_to_k8s(
+            &SandboxTemplate {
+                image: "agent-image:latest".to_string(),
+                ..SandboxTemplate::default()
+            },
+            false,
+            &std::collections::HashMap::new(),
+            false,
+            &params,
+        );
+        let init_containers = pod_template["spec"]["initContainers"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            !init_containers
+                .iter()
+                .any(|c| c["name"] == PROXY_POD_WAIT_INIT_CONTAINER_NAME)
+        );
+    }
+
+    #[test]
+    fn proxy_pod_dns_peers_default_to_upstream_kube_system_conventions() {
+        let peers = crate::config::KubernetesProxyPodConfig::default().dns_peers;
+        let rules = dns_egress_rules(&proxy_pod_egress_policy_with_dns_peers(&peers));
+
+        assert_eq!(rules.len(), 2);
+        let mut apps = Vec::new();
+        for rule in &rules {
+            let to = rule["to"].as_array().unwrap();
+            assert_eq!(to.len(), 1);
+            assert_eq!(
+                to[0]["namespaceSelector"]["matchLabels"]["kubernetes.io/metadata.name"],
+                "kube-system"
+            );
+            for port in rule["ports"].as_array().unwrap() {
+                assert_eq!(port["port"], 53);
+            }
+            apps.push(to[0]["podSelector"]["matchLabels"]["k8s-app"].clone());
+        }
+        assert!(apps.contains(&serde_json::json!("kube-dns")));
+        assert!(apps.contains(&serde_json::json!("coredns")));
+    }
+
+    /// `OpenShift` hosts cluster DNS in `openshift-dns`, not `kube-system`, and
+    /// labels the pods with `dns.operator.openshift.io/daemonset-dns=default`.
+    /// The upstream default matches nothing there, leaving the agent pod unable
+    /// to resolve even its own paired supervisor Service.
+    #[test]
+    fn proxy_pod_dns_peers_render_openshift_selectors() {
+        let peers = vec![ProxyPodDnsPeer {
+            namespace_labels: std::iter::once((
+                "kubernetes.io/metadata.name".to_string(),
+                "openshift-dns".to_string(),
+            ))
+            .collect(),
+            pod_labels: std::iter::once((
+                "dns.operator.openshift.io/daemonset-dns".to_string(),
+                "default".to_string(),
+            ))
+            .collect(),
+            port: 5353,
+        }];
+        let rule = dns_egress_rules(&proxy_pod_egress_policy_with_dns_peers(&peers))
+            .pop()
+            .unwrap();
+        let to = rule["to"].as_array().unwrap();
+
+        assert_eq!(to.len(), 1);
+        assert_eq!(
+            to[0]["namespaceSelector"]["matchLabels"]["kubernetes.io/metadata.name"],
+            "openshift-dns"
+        );
+        assert_eq!(
+            to[0]["podSelector"]["matchLabels"]["dns.operator.openshift.io/daemonset-dns"],
+            "default"
+        );
+        // OpenShift's dns-default Service maps 53 onto container port 5353.
+        // Egress rules match the destination pod port, so the rule must carry
+        // 5353 rather than the Service port.
+        for port in rule["ports"].as_array().unwrap() {
+            assert_eq!(port["port"], 5353);
+        }
+    }
+
+    /// A `NetworkPolicy` egress rule with an empty `to` array matches every
+    /// destination. Emitting one for an empty peer list would open DNS-port
+    /// egress cluster-wide, so the rule is omitted entirely instead.
+    #[test]
+    fn proxy_pod_empty_dns_peers_omit_the_rule_rather_than_allowing_all() {
+        let policy = proxy_pod_egress_policy_with_dns_peers(&[]);
+        assert!(dns_egress_rules(&policy).is_empty());
+
+        let policy = serde_json::to_value(&policy).unwrap();
+        let egress = policy["spec"]["egress"].as_array().unwrap();
+        assert_eq!(egress.len(), 1);
+        assert!(
+            !egress
+                .iter()
+                .any(|rule| rule["to"].as_array().is_some_and(Vec::is_empty))
+        );
+    }
+
+    #[test]
+    fn proxy_pod_dns_peers_allow_a_namespace_only_peer() {
+        let peers = vec![ProxyPodDnsPeer {
+            namespace_labels: std::iter::once((
+                "kubernetes.io/metadata.name".to_string(),
+                "openshift-dns".to_string(),
+            ))
+            .collect(),
+            pod_labels: BTreeMap::new(),
+            port: 5353,
+        }];
+        let rule = dns_egress_rules(&proxy_pod_egress_policy_with_dns_peers(&peers))
+            .pop()
+            .unwrap();
+        let to = rule["to"].as_array().unwrap();
+
+        assert_eq!(to.len(), 1);
+        assert!(to[0].get("namespaceSelector").is_some());
+        assert!(to[0].get("podSelector").is_none());
     }
 
     /// Regression test: TLS mount path must match env var paths.
@@ -6583,7 +8684,9 @@ mod tests {
             &mut pod_template,
             "openshell/sandbox:latest",
             "IfNotPresent",
+            1000, // sandbox_uid
             1000, // sandbox_gid
+            SupervisorTopology::Combined,
         );
 
         // Init container
@@ -6643,6 +8746,8 @@ mod tests {
             "my-custom-image:v2",
             "IfNotPresent",
             1000,
+            1000,
+            SupervisorTopology::Combined,
         );
 
         let init_image = pod_template["spec"]["initContainers"][0]["image"]
@@ -6665,7 +8770,14 @@ mod tests {
             }
         });
 
-        apply_workspace_persistence(&mut pod_template, "img:latest", "Always", 1000);
+        apply_workspace_persistence(
+            &mut pod_template,
+            "img:latest",
+            "Always",
+            1000,
+            1000,
+            SupervisorTopology::Combined,
+        );
 
         let cmd = pod_template["spec"]["initContainers"][0]["command"]
             .as_array()
@@ -6688,6 +8800,37 @@ mod tests {
                 && script.contains("--no-same-permissions")
                 && script.contains("--touch"),
             "init script must avoid restoring metadata onto the PVC root"
+        );
+    }
+
+    #[test]
+    fn workspace_persistence_uses_non_root_init_container_for_proxy_pod() {
+        let mut pod_template = serde_json::json!({
+            "spec": {
+                "containers": [{
+                    "name": "agent",
+                    "image": "img:latest"
+                }]
+            }
+        });
+
+        apply_workspace_persistence(
+            &mut pod_template,
+            "img:latest",
+            "IfNotPresent",
+            1500,
+            1600,
+            SupervisorTopology::ProxyPod,
+        );
+
+        let security_context = &pod_template["spec"]["initContainers"][0]["securityContext"];
+        assert_eq!(security_context["runAsUser"], 1500);
+        assert_eq!(security_context["runAsGroup"], 1600);
+        assert_eq!(security_context["runAsNonRoot"], true);
+        assert_eq!(security_context["allowPrivilegeEscalation"], false);
+        assert_eq!(
+            security_context["capabilities"]["drop"],
+            serde_json::json!(["ALL"])
         );
     }
 
@@ -7430,7 +9573,8 @@ mod tests {
             data: serde_json::json!({}),
         };
 
-        let (kube_name, sandbox) = sandbox_from_object("default", obj).unwrap();
+        let (kube_name, sandbox) =
+            sandbox_from_object("default", obj, SupervisorTopology::Combined).unwrap();
         assert_eq!(kube_name, "alpha--work");
         assert_eq!(sandbox.name, "work");
         assert_eq!(sandbox.workspace, "alpha");
@@ -7459,7 +9603,8 @@ mod tests {
             data: serde_json::json!({}),
         };
 
-        let (_, sandbox) = sandbox_from_object("default", obj).unwrap();
+        let (_, sandbox) =
+            sandbox_from_object("default", obj, SupervisorTopology::Combined).unwrap();
         assert_eq!(sandbox.name, "work");
         assert_eq!(sandbox.workspace, "alpha");
         assert_eq!(sandbox.id, "uuid-456");
@@ -7481,7 +9626,7 @@ mod tests {
             data: serde_json::json!({}),
         };
 
-        let result = sandbox_from_object("default", obj);
+        let result = sandbox_from_object("default", obj, SupervisorTopology::Combined);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("not managed by openshell"));
     }
@@ -7512,7 +9657,8 @@ mod tests {
             data: serde_json::json!({}),
         };
 
-        let (_, sandbox) = sandbox_from_object("openshell", obj).unwrap();
+        let (_, sandbox) =
+            sandbox_from_object("openshell", obj, SupervisorTopology::Combined).unwrap();
         assert_eq!(sandbox.namespace, "openshell-gw1-team-a");
         assert_eq!(sandbox.workspace, "team-a");
     }
@@ -7537,7 +9683,7 @@ mod tests {
             data: serde_json::json!({}),
         };
 
-        let result = sandbox_from_object("default", obj);
+        let result = sandbox_from_object("default", obj, SupervisorTopology::Combined);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("missing sandbox workspace"));
     }

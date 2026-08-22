@@ -232,6 +232,31 @@ message DriverSandboxStatus {
   repeated DriverCondition conditions = 5;
   // True when the compute platform has begun deleting this sandbox.
   bool deleting = 6;
+  // How the gateway should decide that this sandbox is Ready.
+  //
+  // Unset preserves the default contract: the gateway requires a live
+  // supervisor session before reporting Ready. Drivers whose topology has no
+  // in-sandbox process supervisor report SUPERVISOR_SESSION_MODEL_NONE so the
+  // gateway derives Ready from `conditions` alone.
+  SupervisorSessionModel supervisor_session_model = 7;
+}
+
+// Whether a sandbox has an in-sandbox process supervisor that opens a
+// `ConnectSupervisor` session with the gateway.
+//
+// The session is the transport for relays -- SSH, exec, port forwarding, and
+// file transfer -- so this also tells the gateway which RPCs the sandbox can
+// serve. A sandbox reporting NONE is reachable for policy-enforced network
+// egress but cannot accept a relay.
+enum SupervisorSessionModel {
+  // Default contract: a supervisor session is required for Ready and relays
+  // are expected to work.
+  SUPERVISOR_SESSION_MODEL_UNSPECIFIED = 0;
+  // A supervisor session is required before the sandbox is Ready.
+  SUPERVISOR_SESSION_MODEL_REQUIRED = 1;
+  // No supervisor session exists. Readiness comes from `conditions`, and
+  // relay-backed RPCs are unavailable for this sandbox.
+  SUPERVISOR_SESSION_MODEL_NONE = 2;
 }
 
 // Raw compute-platform condition.
