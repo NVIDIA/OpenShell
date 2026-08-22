@@ -1,0 +1,170 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: Build Snap
+
+on:
+  workflow_call:
+    inputs:
+      checkout-ref:
+        required: true
+        type: string
+      artifact-layout:
+        description: "Layout of the prebuilt binary artifacts (tarball or raw)"
+        required: false
+        type: string
+        default: tarball
+      build-matrix:
+        description: "JSON matrix of architectures to package"
+        required: false
+        type: string
+        default: '{"include":[{"arch":"amd64","runner":"linux-amd64-cpu8"},{"arch":"arm64","runner":"linux-arm64-cpu8"}]}'
+      cli-artifact-name:
+        required: false
+        type: string
+        default: ""
+      cli-artifact-prefix:
+        required: false
+        type: string
+        default: ""
+      gateway-artifact-name:
+        required: false
+        type: string
+        default: ""
+      gateway-artifact-prefix:
+        required: false
+        type: string
+        default: ""
+      supervisor-artifact-name:
+        required: false
+        type: string
+        default: ""
+      supervisor-artifact-prefix:
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build-snap:
+    name: Build Snap (Linux ${{ matrix.arch }})
+    strategy:
+      matrix: ${{ fromJSON(inputs.build-matrix) }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.checkout-ref }}
+          fetch-depth: 0
+
+      - name: Install snapd
+        run: |
+          set -euo pipefail
+          if ! command -v snapd >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y snapd
+          fi
+          sudo systemctl enable --now snapd.socket
+          sudo systemctl start snapd
+          sudo snap wait system seed.loaded
+
+      - name: Install LXD
+        run: |
+          set -euo pipefail
+          sudo snap install lxd
+          sudo usermod -aG lxd "$USER"
+          sudo lxd waitready
+          sudo lxd init --auto
+          sudo iptables -P FORWARD ACCEPT
+          sudo chgrp lxd /var/snap/lxd/common/lxd/unix.socket
+          sudo chmod 660 /var/snap/lxd/common/lxd/unix.socket
+
+      - name: Install snapcraft
+        run: sudo snap install snapcraft --classic
+
+      - name: Download prebuilt CLI binary
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ inputs.artifact-layout == 'raw' && format('{0}-linux-{1}', inputs.cli-artifact-prefix, matrix.arch) || inputs.cli-artifact-name || format('cli-linux-{0}', matrix.arch) }}
+          path: prebuilt/cli
+
+      - name: Download prebuilt gateway binary
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ inputs.artifact-layout == 'raw' && format('{0}-linux-{1}', inputs.gateway-artifact-prefix, matrix.arch) || inputs.gateway-artifact-name || format('gateway-binary-linux-{0}', matrix.arch) }}
+          path: prebuilt/gateway
+
+      - name: Download prebuilt sandbox binary
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ inputs.artifact-layout == 'raw' && format('{0}-linux-{1}', inputs.supervisor-artifact-prefix, matrix.arch) || inputs.supervisor-artifact-name || format('supervisor-binary-linux-{0}', matrix.arch) }}
+          path: prebuilt/sandbox
+
+      - name: Prepare snap build directory
+        run: |
+          set -euo pipefail
+          case "${{ inputs.artifact-layout }}" in
+            tarball)
+              for directory in cli gateway sandbox; do
+                for tarball in "prebuilt/$directory"/*.tar.gz; do
+                  test -f "$tarball" || continue
+                  tar -xzf "$tarball" -C "prebuilt/$directory"
+                done
+              done
+              ;;
+            raw) ;;
+            *)
+              echo "unsupported artifact layout: ${{ inputs.artifact-layout }}" >&2
+              exit 1
+              ;;
+          esac
+
+          find_binary() {
+            find "$1" -type f -name "$2" -print -quit
+          }
+          cli="$(find_binary prebuilt/cli openshell)"
+          gateway="$(find_binary prebuilt/gateway openshell-gateway)"
+          sandbox="$(find_binary prebuilt/sandbox openshell-sandbox)"
+          test -n "$cli" && test -n "$gateway" && test -n "$sandbox"
+
+          mkdir -p snap/prebuilt/meta/gui
+          install -m 0755 "$cli" snap/prebuilt/openshell
+          install -m 0755 "$gateway" snap/prebuilt/openshell-gateway
+          install -m 0755 "$sandbox" snap/prebuilt/openshell-sandbox
+          install -m 0755 tasks/scripts/snap-gateway-wrapper.sh snap/prebuilt/openshell-gateway-wrapper
+          cp LICENSE README.md snap/prebuilt/
+          cp snap/local/term.desktop snap/prebuilt/meta/gui/term.desktop
+          cp snap/local/icon.png snap/prebuilt/meta/gui/icon.png
+          python3 tasks/scripts/release.py get-version --snap > snap/prebuilt/version
+
+      - name: Build snap
+        run: |
+          set -euo pipefail
+          runtime_dir="/run/user/$(id -u)"
+          sudo install -d -m 0700 -o "$(id -u)" -g "$(id -g)" "$runtime_dir"
+          export XDG_RUNTIME_DIR="$runtime_dir"
+          sg lxd -c "XDG_RUNTIME_DIR=${runtime_dir} snapcraft pack -v"
+
+      - name: Upload snapcraft logs on failure
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: snapcraft-logs-${{ matrix.arch }}
+          path: "~/.local/state/snapcraft/log/snapcraft-*.log"
+          retention-days: 7
+
+      - name: Upload snap artifact (${{ matrix.arch }})
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: snap-linux-${{ matrix.arch }}
+          path: |
+            *.snap
+            *.comp
+          retention-days: 5

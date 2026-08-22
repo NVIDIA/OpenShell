@@ -163,19 +163,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - name: Install snapd
-        run: |
-          set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y snapd
-          sudo systemctl enable --now snapd.socket
-          sudo systemctl start snapd
-          sudo snap wait system seed.loaded
-
-      - name: Install Docker snap
-        run: |
-          set -euo pipefail
-          sudo snap install docker
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+          fetch-depth: 1
 
       - name: Download snap from release-dev artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
@@ -186,48 +177,11 @@ jobs:
           path: release/
           merge-multiple: true
 
-      - name: Install snap (dangerous — from release, not store)
-        run: |
-          set -euo pipefail
-          sudo systemctl set-environment \
-            "OPENSHELL_TELEMETRY_ENABLED=${OPENSHELL_TELEMETRY_ENABLED}"
-          sudo snap install ./release/*.snap --dangerous
-
-      - name: Connect interfaces
-        run: |
-          set -euo pipefail
-          sudo snap connect openshell:docker docker:docker-daemon
-          sudo snap connect openshell:log-observe
-          sudo snap connect openshell:system-observe
-
-      - name: Register snap gateway and check status
-        run: |
-          set -euo pipefail
-          openshell --version
-          sudo snap services openshell
-          openshell gateway add http://127.0.0.1:17670 --local --name snap-docker
-          openshell gateway select snap-docker
-          for _ in $(seq 1 30); do
-            if openshell status; then
-              exit 0
-            fi
-            sleep 1
-          done
-          echo "Gateway did not become ready within 30 seconds" >&2
-          exit 1
-
-      - name: Collect Snap diagnostics
-        if: failure()
-        run: |
-          set +e
-          sudo snap services openshell
-          sudo snap connections openshell
-          sudo snap changes
-          sudo systemctl status snap.openshell.gateway.service --no-pager
-          sudo journalctl -b -u snap.openshell.gateway.service --no-pager -n 300
-          sudo journalctl -b -u snapd.service --no-pager -n 300
-          sudo snap logs openshell.gateway -n=300
-          sudo ss -ltnp '( sport = :17670 )'
+      - name: Install and verify local Snap
+        uses: ./.github/actions/snap-gateway-smoke
+        with:
+          snap-path: ./release/*.snap
+          telemetry-enabled: ${{ env.OPENSHELL_TELEMETRY_ENABLED }}
 
   kubernetes:
     name: Kubernetes Helm (kind)

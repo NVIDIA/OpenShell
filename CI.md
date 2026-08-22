@@ -12,7 +12,7 @@ PR CI that runs on NVIDIA self-hosted runners uses NVIDIA's copy-pr-bot. The bot
 
 Merge queue validation is a second integration gate for `main`. After a PR has passed the required PR-head statuses, a maintainer adds it to the merge queue. GitHub creates a temporary merge-group branch that combines the latest `main`, the queued PR, and any earlier queued PRs. The same required `OpenShell / ...` status contexts are then published against the merge-group SHA before GitHub merges it.
 
-Three opt-in labels enable the long-running E2E suites:
+Four opt-in labels enable the long-running E2E suites:
 
 - `test:e2e` runs the standard Docker, rootless Podman, Kubernetes, and VM E2E
   suites in `Branch E2E Checks`
@@ -20,6 +20,8 @@ Three opt-in labels enable the long-running E2E suites:
 - `test:e2e-kubernetes` runs Kubernetes E2E with the HA Helm overlay
   (`replicaCount: 2` and bundled PostgreSQL) and the credential-driver suite
   (Kubernetes Secrets plus Vault) in `Branch E2E Checks`
+- `test:snap` builds an amd64 Snap from the branch's prebuilt binaries and
+  installs it on a fresh Ubuntu runner with Docker Snap connected
 
 When multiple labels are present, `Branch E2E Checks` builds the shared gateway and supervisor images once, builds one CLI artifact per runner architecture, builds the Linux VM driver artifact once, and fans out all enabled suites in parallel. Docker, Podman, GPU, Rust, Python, MCP, and VM E2E jobs reuse the matching prebuilt gateway and CLI binaries instead of compiling additional debug binaries in each job; Kubernetes E2E consumes the gateway image directly and reuses the prebuilt CLI. VM E2E also reuses the prebuilt VM driver artifact and falls back to local VM-driver/runtime preparation for local runs or workflow invocations that omit the artifact.
 The `OpenShell / E2E` and `OpenShell / GPU E2E` required statuses are evaluated from separate suite result jobs inside that workflow. `test:e2e-kubernetes` is optional while Kubernetes HA and credential-driver behavior are under active iteration: failures are visible in the workflow run but do not publish a required CI gate status.
@@ -75,7 +77,7 @@ Flow:
 
 1. Open the PR. copy-pr-bot mirrors it to `pull-request/<N>` automatically.
 2. The mirror push runs `Branch Checks` automatically. `Required CI Gates` keeps the PR blocked until the mirror exists, matches the PR head SHA, and the required push-based workflow succeeds. The first `Branch E2E Checks` run only resolves metadata and skips expensive jobs unless an E2E label is already set.
-3. A maintainer applies `test:e2e`, `test:e2e-gpu`, and/or `test:e2e-kubernetes`. `E2E Label Help` posts a comment with a link to the existing gated workflow run.
+3. A maintainer applies `test:e2e`, `test:e2e-gpu`, `test:e2e-kubernetes`, and/or `test:snap`. `E2E Label Help` posts a comment with a link to the existing gated workflow run.
 4. The maintainer opens that link and clicks **Re-run all jobs**. This time `pr_metadata` sees the label and the build/E2E jobs run.
 5. When the run finishes, the matching `OpenShell / ...` gate status flips to green automatically.
 6. New commits push to the mirror automatically and re-trigger `Branch Checks` plus any labeled E2E jobs in `Branch E2E Checks`.
@@ -136,7 +138,7 @@ The bot's full administrator documentation is internal to NVIDIA. The only comma
 | File | Role |
 |---|---|
 | `.github/workflows/branch-checks.yml` | Required non-E2E checks. Triggers on `push: pull-request/[0-9]+` for PR mirrors and `merge_group` for queued merges. |
-| `.github/workflows/branch-e2e.yml` | Standard, GPU, Kubernetes HA, and Kubernetes credential-driver E2E. PR mirror pushes use `test:e2e`, `test:e2e-gpu`, and `test:e2e-kubernetes` labels; merge groups run core and GPU E2E. |
+| `.github/workflows/branch-e2e.yml` | Standard, GPU, Kubernetes HA, Kubernetes credential-driver, and Snap smoke E2E. PR mirror pushes use `test:e2e`, `test:e2e-gpu`, `test:e2e-kubernetes`, and `test:snap` labels; merge groups run core, GPU, and Snap smoke E2E. |
 | `.github/workflows/helm-lint.yml` | Helm chart validation. PR mirror pushes skip lint jobs unless Helm inputs changed; merge groups always validate Helm because they represent the final integration state. |
 | `.github/actions/pr-gate/action.yml` | Composite action that resolves PR metadata and verifies the required label is set for PR mirror pushes. Non-push events are allowed through. |
 | `.github/actions/pr-merge-base/action.yml` | Composite action that resolves and fetches the merge-base commit for `pull-request/<N>` push workflows. |
