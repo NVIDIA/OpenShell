@@ -21,7 +21,7 @@ originating issue before it moves out of draft.
 ## Summary
 
 This RFC proposes `proxy-pod`, a Kubernetes supervisor topology that moves
-network enforcement and gateway forwarding out of the sandbox pod entirely and
+network enforcement out of the sandbox pod entirely and
 into a paired, per-sandbox supervisor `Deployment`. The sandbox pod runs the
 agent image directly — no supervisor binary, no gateway credentials, no
 privileged init container, no shared process namespace. Egress is fenced by two
@@ -130,7 +130,7 @@ flowchart TB
 
     Deployment["Supervisor Deployment<br/>replicas: 1, owned by Sandbox CR"]
     subgraph SupervisorPod["Supervisor pod — role=supervisor"]
-      Proxy["openshell-supervisor --mode=network<br/>:3128 proxy, :18080 gateway-fwd"]
+      Proxy["openshell-supervisor --mode=network<br/>:3128 policy-enforced proxy"]
     end
 
     Service["Headless Service<br/>clusterIP: None"]
@@ -147,7 +147,6 @@ flowchart TB
   Deployment --> SupervisorPod
   AgentPod -->|"HTTP_PROXY / HTTPS_PROXY"| Service
   Service --> Proxy
-  Proxy -->|"gateway forwarding"| Gateway
   Proxy -->|"policy-enforced egress"| External
   CA -. mounted .- AgentPod
   CA -. mounted .- SupervisorPod
@@ -217,6 +216,14 @@ control socket with peer-credential checks and one-shot listener semantics.
 `proxy-pod` has no such socket: the credential simply is not in the pod, and the
 two pods share no namespace, no filesystem, and no IPC.
 
+The workload also has no network path to the gateway. Only the supervisor
+connects to the gateway (for policy, inference, log push, and token bootstrap);
+the agent egress `NetworkPolicy` permits the workload to reach only the
+supervisor's proxy port and cluster DNS. An earlier revision ran a raw TCP
+forward from the supervisor to the gateway that the workload could reach; it was
+removed because nothing on the workload consumed it and, under unauthenticated
+gateway access, it was a policy-bypassing path to the gateway API.
+
 One consequence: because credentials are per-supervisor and the CA is generated
 per sandbox, a `proxy-pod` sandbox cannot participate in the corporate
 upstream-proxy credential feature, which mounts a `user:pass` Secret into the
@@ -242,8 +249,8 @@ Two policies define the fence:
 **Agent egress** (`policyTypes: [Egress]`, selecting `sandbox-role=agent`) permits
 exactly two destinations:
 
-1. Pods labeled `sandbox-role=supervisor` for this sandbox ID, on TCP 3128 and
-   TCP 18080.
+1. Pods labeled `sandbox-role=supervisor` for this sandbox ID, on TCP 3128 (the
+   policy-enforced HTTP CONNECT proxy).
 2. Cluster DNS, on UDP 53 and TCP 53.
 
 Everything else is denied. **This is load-bearing.** `HTTP_PROXY` is only a
@@ -609,7 +616,7 @@ chart, then deployed to OpenShift 4.22.6 / OVN-Kubernetes. Measured results:
 | Agent resolves its paired supervisor `Service` | pass |
 | Direct egress to the internet denied | pass |
 | Direct egress to the gateway denied | pass |
-| Egress to supervisor `:3128` / `:18080` allowed | pass |
+| Egress to supervisor `:3128` allowed | pass |
 | Policy-denied host through the proxy | pass, 403 at CONNECT |
 | Policy-allowed host through the proxy | pass, HTTP 200 with the generated CA trusted |
 | All resources reclaimed on delete | pass |
