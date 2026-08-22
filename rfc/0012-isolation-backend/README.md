@@ -273,17 +273,17 @@ The backend resolves executable identity for every accepted connection and deliv
 ```rust
 struct BinaryIdentity {
     binary_path: PathBuf,                 // absolute executable path
-    binary_digest: Option<Sha256Digest>,  // executable bytes at connection initiation
+    binary_digest: Option<Sha256Digest>,  // bytes of the resolved executable object
     ancestors: Vec<PathBuf>,              // nearest first
     cmdline_paths: Vec<PathBuf>,          // diagnostic context; never authorizes
 }
 ```
 
-Identity describes the process that initiated the connection, as it existed at initiation. Paths are expressed in the workload's filesystem namespace.
+Identity describes the executable identity resolved for the accepted connection before policy evaluation. Paths are expressed in the workload's filesystem namespace.
 
-If binary identity cannot be resolved, the connection is denied. `ResolveError` reports that failure. A missing digest is represented as `None`. How a backend captures identity is implementation-specific; the guarantees above are not.
+If binary identity cannot be resolved, the connection is denied. `ResolveError` reports that failure. A missing digest is represented as `None`. How a backend resolves identity is implementation-specific.
 
-Every identity field used for authorization is derived from the workload's execution environment by a trusted authority outside the workload's control. The result is bound to the exact boundary and connection at initiation. Workload-supplied identity may be retained only as non-authorizing diagnostic context. If the trusted binding or any required identity field cannot be established, the connection is denied.
+Every identity field used for authorization is obtained by a trusted component from boundary or kernel state, rather than accepted as a workload claim. The result is bound to the active boundary and accepted connection; a transport tuple or workload-supplied identifier alone is not authoritative. Workload-supplied identity may be retained only as non-authorizing diagnostic context. If attribution is ambiguous or any required identity field cannot be established, the connection is denied.
 
 Binary identity is mandatory conformance: RFC 0002 makes it part of the outbound-policy baseline. There is no capability flag and no mode that exempts a backend from resolving identity.
 
@@ -335,7 +335,7 @@ This RFC defines the contract; implementation lands in three phases:
 
 1. **Contract.** Add the common types, descriptor handling, registry, and explicit backend selection from deployment configuration.
 2. **Co-located backend.** Implement the co-located backend behind a deployment flag and route agent launch, egress interception, the network-mediation source, SSH, `exec`, and forwarding through it without changing behavior.
-3. **Conformance and enablement.** Require every admitted backend and topology to pass tests for the six contract invariants plus descriptor verification, lifecycle ordering, runtime operations, and failure semantics. Make the co-located backend the default after parity validation. Parity covers the agent, SSH, `exec`, and forwarding paths; enablement also closes the in-pod egress and binary-identity gaps pinned in [codebase-grounding.md](./codebase-grounding.md), which parity alone would preserve.
+3. **Conformance and enablement.** Require every admitted backend and topology to pass tests for the six contract invariants plus descriptor verification, lifecycle ordering, runtime operations, and failure semantics. Make the co-located backend the default after parity validation. Parity covers the agent, binary identity, SSH, `exec`, and forwarding paths; enablement also closes the in-pod egress gaps pinned in [codebase-grounding.md](./codebase-grounding.md), which parity alone would preserve.
 
 Delegated backends remain separate design and implementation work.
 
