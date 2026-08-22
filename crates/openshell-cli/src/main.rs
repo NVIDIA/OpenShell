@@ -312,7 +312,7 @@ const SANDBOX_EXAMPLES: &str = "\x1b[1mALIAS\x1b[0m
 
 \x1b[1mEXAMPLES\x1b[0m
   $ openshell sandbox create
-  $ openshell sandbox create --from python
+  $ openshell sandbox create --from base
   $ openshell sandbox connect my-sandbox
   $ openshell sandbox list
   $ openshell sandbox delete my-sandbox

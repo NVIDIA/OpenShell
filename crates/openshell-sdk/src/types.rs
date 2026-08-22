@@ -98,7 +98,7 @@ impl From<i32> for SandboxPhase {
 pub struct SandboxSpec {
     /// Optional user-supplied sandbox name. When empty the server generates one.
     pub name: Option<String>,
-    /// Container image reference (e.g. `ghcr.io/nvidia/openshell-community/sandboxes/python:latest`).
+    /// Container image reference (e.g. `ghcr.io/nvidia/openshell-community/sandboxes/base:latest`).
     pub image: Option<String>,
     /// Labels attached to the sandbox.
     pub labels: HashMap<String, String>,
