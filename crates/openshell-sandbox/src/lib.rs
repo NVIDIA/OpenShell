@@ -13,7 +13,6 @@ mod inpod;
 mod mechanistic_mapper;
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod metadata_server;
-mod sidecar;
 mod sidecar_control;
 
 use miette::{IntoDiagnostic, Result, WrapErr};
@@ -106,6 +105,7 @@ pub async fn run_sandbox(
     network_enabled: bool,
     process_enabled: bool,
     upstream_proxy_args: openshell_supervisor_network::upstream_proxy::UpstreamProxyArgs,
+    topology_descriptor: Option<openshell_isolation::contract::TopologyDescriptor>,
 ) -> Result<i32> {
     let (program, args) = command
         .split_first()
@@ -135,23 +135,19 @@ pub async fn run_sandbox(
     }
 
     let sidecar_network_enforcement = sidecar_network_enforcement_enabled();
-    let process_enforcement_mode = process_enforcement_mode();
+    validate_admitted_policy_source(
+        topology_descriptor.is_some(),
+        sandbox_id.as_deref(),
+        openshell_endpoint.as_deref(),
+        policy_rules.as_deref(),
+        policy_data.as_deref(),
+    )?;
+    // The descriptor is trusted admission state. An admitted topology always
+    // gets the full launch-time controls, regardless of workload-provided
+    // environment intended for the legacy sidecar path.
+    let process_enforcement_mode = process_enforcement_mode(topology_descriptor.is_some());
     let process_uses_sidecar_control =
         process_enabled && !network_enabled && sidecar_network_enforcement;
-
-    // Sidecar network enforcement requires the network and process roles to run
-    // in *separate* containers: the network container hosts egress mediation and
-    // the agent container runs the workload behind the sidecar backend. A single
-    // supervisor enabling both roles at once (the default `--mode=network,process`
-    // run by hand, plus sidecar enforcement) is not a topology any compute driver
-    // produces. Fail closed rather than silently entering the network-mediation
-    // arm and holding open without ever spawning the workload.
-    if sidecar_network_enforcement && network_enabled && process_enabled {
-        return Err(miette::miette!(
-            "sidecar network enforcement requires split containers: a single supervisor \
-             cannot enable both --mode=network and --mode=process"
-        ));
-    }
     let mut process_control_connection = None;
     let sidecar_bootstrap = if process_uses_sidecar_control {
         let socket = sidecar_control_socket().ok_or_else(|| {
@@ -317,10 +313,11 @@ pub async fn run_sandbox(
     // the entrypoint process's /proc/net/tcp for identity binding.
     let entrypoint_pid = Arc::new(AtomicU32::new(0));
 
-    // Event channels are owned by the orchestrator: the proxy and the bypass
-    // monitor produce DenialEvents / activity records that the orchestrator's
-    // aggregators (spawned below) consume via the matching receiver. Both
-    // leaves are pure producers; the orchestrator owns the consumers.
+    // The denial channel is owned by the orchestrator: the proxy (in the
+    // networking leaf) and the bypass monitor (in the process leaf) both
+    // produce DenialEvents that the denial aggregator (orchestrator-side)
+    // consumes via the matching receiver. Both leaves are pure producers;
+    // the orchestrator owns the consumer task spawned below.
     let (denial_tx, denial_rx, bypass_denial_tx): (
         Option<UnboundedSender<DenialEvent>>,
         _,
@@ -336,7 +333,9 @@ pub async fn run_sandbox(
     drop(bypass_denial_tx);
 
     // Anonymous activity channel: same orchestrator-owned pattern as the
-    // denial channel.
+    // denial channel. The proxy and the bypass monitor both emit per-event
+    // activity records; the orchestrator-side aggregator drains, sanitizes,
+    // and flushes anonymous summaries to the gateway.
     let (activity_tx, activity_rx, bypass_activity_tx) = if sandbox_id.is_some() {
         let (tx, rx) =
             tokio::sync::mpsc::channel(openshell_core::activity::ACTIVITY_EVENT_QUEUE_CAPACITY);
@@ -353,10 +352,351 @@ pub async fn run_sandbox(
     // API read the current value so proposals target the correct workspace.
     let (workspace_tx, workspace_rx) = tokio::sync::watch::channel(String::new());
 
-    // Spawn the denial-aggregator flush task. Shared by both topologies: it
-    // drains denial events from the proxy + bypass monitor, batches them, and
-    // ships summaries to the gateway via SubmitPolicyAnalysis. Gated on a known
-    // workspace so proposals are attributed correctly.
+    if let Some(descriptor) = topology_descriptor {
+        if sidecar_network_enforcement || !network_enabled || !process_enabled {
+            return Err(miette::miette!(
+                "an admitted isolation backend requires the co-located network,process topology"
+            ));
+        }
+
+        let mediation_ready = Arc::new(AtomicBool::new(false));
+        let ca_file_paths = Arc::new(std::sync::Mutex::new(None));
+        let proxy_bind_ip = Arc::new(std::sync::Mutex::new(None));
+        let backend = Arc::new(inpod::InPodBackend::new(inpod::InPodConfig {
+            require_exclusive_pid_namespace: true,
+            network_enabled,
+            process_enabled,
+            entrypoint_pid: entrypoint_pid.clone(),
+            provider_credentials: provider_credentials.clone(),
+            provider_env: std::sync::Mutex::new(provider_env),
+            process_enforcement_mode,
+            resolved_process_identity,
+            agent_proposals: agent_proposals.clone(),
+            openshell_endpoint: openshell_endpoint_for_proxy.clone(),
+            ssh_socket_path,
+            #[cfg(target_os = "linux")]
+            bypass_denial_tx: std::sync::Mutex::new(bypass_denial_tx),
+            #[cfg(target_os = "linux")]
+            bypass_activity_tx: std::sync::Mutex::new(bypass_activity_tx),
+            mediation_ready: mediation_ready.clone(),
+            ca_file_paths: ca_file_paths.clone(),
+            proxy_bind_ip: proxy_bind_ip.clone(),
+        }));
+        let mut registry = openshell_isolation::contract::BackendRegistry::new();
+        registry
+            .register(backend)
+            .map_err(|error| miette::miette!(error.to_string()))?;
+        let (backend, verified) = registry
+            .resolve(descriptor, inpod::IN_POD_BACKEND_NAME)
+            .map_err(|error| miette::miette!(error.to_string()))?;
+        let context = openshell_isolation::contract::SandboxContext {
+            sandbox_id: sandbox_id.clone().unwrap_or_default(),
+            policy: policy.clone(),
+            agent: openshell_isolation::AgentSpec {
+                program: program.clone(),
+                args: args.to_vec(),
+                workdir: workdir.clone(),
+                timeout_secs,
+                interactive,
+            },
+        };
+        let bound = backend
+            .attach(verified, context)
+            .await
+            .map_err(|error| miette::miette!(error.to_string()))?;
+        let network_mediation_source = bound.network_mediation_source();
+        let mediation_bind_ip = *proxy_bind_ip.lock().expect("proxy bind IP lock");
+        let networking = openshell_supervisor_network::run::run_networking(
+            &policy,
+            mediation_bind_ip,
+            opa_engine.as_ref(),
+            retained_proto.as_ref(),
+            entrypoint_pid.clone(),
+            process_enabled,
+            &provider_credentials,
+            sandbox_id.as_deref(),
+            sandbox_name_for_agg.as_deref(),
+            openshell_endpoint_for_proxy.as_deref(),
+            inference_routes.as_deref(),
+            denial_tx,
+            activity_tx,
+            agent_proposals.clone(),
+            workspace_rx.clone(),
+            &upstream_proxy_args,
+            Some(network_mediation_source),
+        )
+        .await?;
+        ca_file_paths
+            .lock()
+            .expect("ca paths lock")
+            .clone_from(&networking.ca_file_paths);
+        mediation_ready.store(true, Ordering::Release);
+        let ready = bound
+            .confirm()
+            .await
+            .map_err(|error| miette::miette!(error.to_string()))?;
+
+        if let (Some(rx), Some(endpoint)) = (denial_rx, openshell_endpoint_for_proxy.as_deref()) {
+            let agg_name = sandbox_name_for_agg
+                .clone()
+                .or_else(|| sandbox_id.clone())
+                .unwrap_or_default();
+            let agg_endpoint = endpoint.to_string();
+            let flush_interval_secs = std::env::var("OPENSHELL_DENIAL_FLUSH_INTERVAL_SECS")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(10);
+            let aggregator = denial_aggregator::DenialAggregator::new(rx, flush_interval_secs);
+            let workspace_gate = workspace_rx.clone();
+            let workspace = workspace_rx.clone();
+            tokio::spawn(async move {
+                aggregator
+                    .run(
+                        |summaries| {
+                            let endpoint = agg_endpoint.clone();
+                            let sandbox_name = agg_name.clone();
+                            let workspace = workspace.borrow().clone();
+                            async move {
+                                if let Err(error) = flush_proposals_to_gateway(
+                                    &endpoint,
+                                    &sandbox_name,
+                                    &workspace,
+                                    summaries,
+                                )
+                                .await
+                                {
+                                    warn!(%error, "Failed to flush denial summaries to gateway");
+                                }
+                            }
+                        },
+                        move || !workspace_gate.borrow().is_empty(),
+                    )
+                    .await;
+            });
+        }
+        if let (Some(rx), Some(endpoint)) = (activity_rx, openshell_endpoint_for_proxy.as_deref()) {
+            let agg_name = sandbox_name_for_agg
+                .clone()
+                .or_else(|| sandbox_id.clone())
+                .unwrap_or_default();
+            let agg_endpoint = endpoint.to_string();
+            let interval = activity_aggregator::activity_flush_interval_secs_from_env(
+                std::env::var("OPENSHELL_ACTIVITY_FLUSH_INTERVAL_SECS")
+                    .ok()
+                    .as_deref(),
+            );
+            let aggregator = activity_aggregator::ActivityAggregator::new(rx, interval);
+            let workspace_gate = workspace_rx.clone();
+            let workspace = workspace_rx.clone();
+            tokio::spawn(async move {
+                aggregator
+                    .run(
+                        move |summary| {
+                            let endpoint = agg_endpoint.clone();
+                            let sandbox_name = agg_name.clone();
+                            let workspace = workspace.borrow().clone();
+                            async move {
+                                if let Err(error) = flush_activity_to_gateway(
+                                    &endpoint,
+                                    &sandbox_name,
+                                    &workspace,
+                                    summary,
+                                )
+                                .await
+                                {
+                                    warn!(%error, "Failed to flush activity summary to gateway");
+                                }
+                            }
+                        },
+                        move || !workspace_gate.borrow().is_empty(),
+                    )
+                    .await;
+            });
+        }
+
+        if let (Some(id), Some(endpoint), Some(engine)) = (
+            sandbox_id.as_deref(),
+            openshell_endpoint.as_deref(),
+            opa_engine.as_ref(),
+        ) {
+            let poll_ctx = PolicyPollLoopContext {
+                endpoint: endpoint.to_string(),
+                sandbox_id: id.to_string(),
+                opa_engine: engine.clone(),
+                loaded_policy_origin,
+                entrypoint_pid: entrypoint_pid.clone(),
+                interval_secs: std::env::var("OPENSHELL_POLICY_POLL_INTERVAL_SECS")
+                    .ok()
+                    .and_then(|value| value.parse().ok())
+                    .unwrap_or(10),
+                ocsf_enabled: ocsf_enabled.clone(),
+                provider_credentials: provider_credentials.clone(),
+                policy_local_ctx: Some(networking.policy_local_ctx.clone()),
+                agent_proposals: agent_proposals.clone(),
+                middleware_registry_status,
+                sidecar_control_publisher: None,
+                workspace_tx,
+            };
+            tokio::spawn(async move {
+                if let Err(error) = run_policy_poll_loop(poll_ctx).await {
+                    warn!(%error, "Policy poll loop exited with error");
+                }
+            });
+        }
+
+        let running = ready
+            .start_agent()
+            .await
+            .map_err(|error| miette::miette!(error.to_string()))?;
+        let agent = running.agent();
+        // Mediation-source failure is already audited by the proxy. The
+        // default-deny ceiling remains standing, so new egress fails static
+        // while the workload continues under its last confirmed enforcement.
+        let result = agent
+            .wait()
+            .await
+            .map(|status| match status {
+                openshell_isolation::contract::BoundaryExitStatus::Exited(code) => code,
+                openshell_isolation::contract::BoundaryExitStatus::Signaled(signal) => {
+                    128_i32.saturating_add(signal)
+                }
+            })
+            .map_err(|error| miette::miette!(error.to_string()));
+        drop(running);
+        drop(networking);
+
+        // This admitted topology exclusively owns its PID namespace and the
+        // supervisor is PID 1. Exiting namespace init is the kernel's
+        // race-free whole-boundary teardown: no workload descendant can
+        // escape it by changing process group or forking during cleanup.
+        #[cfg(target_os = "linux")]
+        std::process::exit(result?);
+
+        #[cfg(not(target_os = "linux"))]
+        return result;
+    }
+
+    // Legacy path for topologies that have not admitted the in-pod backend,
+    // including the current sidecar placement.
+    #[cfg(target_os = "linux")]
+    let netns = if network_enabled && !sidecar_network_enforcement {
+        openshell_supervisor_process::netns::create_netns_for_proxy(&policy)?
+    } else {
+        None
+    };
+
+    let networking = if network_enabled {
+        #[cfg(target_os = "linux")]
+        let proxy_bind_ip = netns
+            .as_ref()
+            .map(openshell_supervisor_process::netns::NetworkNamespace::host_ip);
+        #[cfg(not(target_os = "linux"))]
+        let proxy_bind_ip: Option<std::net::IpAddr> = None;
+
+        Some(
+            openshell_supervisor_network::run::run_networking(
+                &policy,
+                proxy_bind_ip,
+                opa_engine.as_ref(),
+                retained_proto.as_ref(),
+                entrypoint_pid.clone(),
+                process_enabled,
+                &provider_credentials,
+                sandbox_id.as_deref(),
+                sandbox_name_for_agg.as_deref(),
+                openshell_endpoint_for_proxy.as_deref(),
+                inference_routes.as_deref(),
+                denial_tx,
+                activity_tx,
+                agent_proposals.clone(),
+                workspace_rx.clone(),
+                &upstream_proxy_args,
+                None,
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
+
+    #[cfg(target_os = "linux")]
+    let sidecar_control_server = if network_enabled && sidecar_network_enforcement {
+        if !matches!(policy.network.mode, NetworkMode::Proxy) {
+            return Err(miette::miette!(
+                "sidecar network enforcement requires proxy network mode"
+            ));
+        }
+        let socket = sidecar_control_socket().ok_or_else(|| {
+            miette::miette!(
+                "{} is required for sidecar topology",
+                openshell_core::sandbox_env::SIDECAR_CONTROL_SOCKET
+            )
+        })?;
+        let proto = retained_proto.as_ref().ok_or_else(|| {
+            miette::miette!(
+                "sidecar topology requires gateway policy data for the process supervisor"
+            )
+        })?;
+        let ca_paths = networking.as_ref().and_then(|n| n.ca_file_paths.clone());
+        Some(sidecar_control::spawn_server(
+            &socket,
+            sidecar_control::BootstrapData {
+                policy_proto: proto.clone(),
+                provider_env_revision: provider_credentials.snapshot().revision,
+                provider_child_env: provider_env.clone(),
+                agent_proposals_enabled: agent_proposals.enabled(),
+                proxy_ca_cert_path: ca_paths.as_ref().map(|paths| paths.0.clone()),
+                proxy_ca_bundle_path: ca_paths.as_ref().map(|paths| paths.1.clone()),
+            },
+            sidecar_expected_peer()?,
+        )?)
+    } else {
+        None
+    };
+    #[cfg(not(target_os = "linux"))]
+    let sidecar_control_server: Option<sidecar_control::ServerHandle> = None;
+
+    let sidecar_control_publisher = sidecar_control_server
+        .as_ref()
+        .map(sidecar_control::ServerHandle::publisher);
+
+    #[cfg(target_os = "linux")]
+    let mut sidecar_control_task = None;
+
+    #[cfg(target_os = "linux")]
+    if network_enabled
+        && sidecar_network_enforcement
+        && let Some(server) = sidecar_control_server
+    {
+        let trusted_ssh_socket_path = ssh_socket_path.clone().ok_or_else(|| {
+            miette::miette!(
+                "{} is required for sidecar network topology",
+                openshell_core::sandbox_env::SSH_SOCKET_PATH
+            )
+        })?;
+        let (entrypoint_rx, connection_task) = server.into_runtime_parts();
+        sidecar_control_task = Some(connection_task);
+        spawn_sidecar_entrypoint_handler(
+            entrypoint_rx,
+            entrypoint_pid.clone(),
+            opa_engine.clone(),
+            retained_proto.clone(),
+            openshell_endpoint.clone(),
+            sandbox_id.clone(),
+            std::path::PathBuf::from(trusted_ssh_socket_path),
+        );
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    if network_enabled && sidecar_network_enforcement {
+        return Err(miette::miette!(
+            "sidecar network enforcement is only supported on Linux"
+        ));
+    }
+
+    // Spawn the denial-aggregator flush task. The aggregator drains denial
+    // events from the proxy + bypass monitor, batches them, and ships
+    // summaries to the gateway via `SubmitPolicyAnalysis`.
     if let (Some(rx), Some(endpoint)) = (denial_rx, openshell_endpoint_for_proxy.as_deref()) {
         // SubmitPolicyAnalysis resolves by sandbox *name*, not UUID — fall
         // back to the ID when the name isn't set.
@@ -400,7 +740,9 @@ pub async fn run_sandbox(
         });
     }
 
-    // Spawn the activity-aggregator flush task. Shared by both topologies.
+    // Spawn the activity-aggregator flush task. The aggregator drains
+    // anonymous activity events from the proxy, sanitizes deny groups,
+    // and ships periodic summaries to the gateway.
     if let (Some(rx), Some(endpoint)) = (activity_rx, openshell_endpoint_for_proxy.as_deref()) {
         let agg_name = sandbox_name_for_agg
             .clone()
@@ -443,493 +785,223 @@ pub async fn run_sandbox(
         });
     }
 
-    // Topology gate. When the network dimension is enforced by a separate
-    // sidecar container (#2076), run the inline sidecar path: proxy + sidecar
-    // control server in the network container, process supervisor talking to it
-    // over the control socket in the workload container. Otherwise drive the
-    // co-located in-pod isolation backend (RFC 0012), which owns the network
-    // namespace, proxy, and workload behind the boundary lifecycle.
-    let exit_code = if sidecar_network_enforcement && network_enabled {
-        // The network-mediation component: this is the Kubernetes *network*
-        // container. It hosts the proxy (egress mediation) and the sidecar
-        // control server for the agent container's supervisor; it runs no
-        // workload of its own (`process_enabled` is false here). The agent
-        // container's process path is a separate RFC 0012 backend (see the
-        // `else` arm and `sidecar.rs`).
-        //
-        // Legacy in-pod netns is never created under sidecar enforcement; the
-        // expression evaluates to None here but is kept for structural parity
-        // with the non-sidecar supervisor path.
-        #[cfg(target_os = "linux")]
-        let netns = if network_enabled && !sidecar_network_enforcement {
-            openshell_supervisor_process::netns::create_netns_for_proxy(&policy)?
-        } else {
-            None
+    // Spawn background policy poll task (gRPC mode only).
+    if !process_uses_sidecar_control
+        && let (Some(id), Some(endpoint), Some(engine)) = (
+            sandbox_id.as_deref(),
+            openshell_endpoint.as_deref(),
+            opa_engine.as_ref(),
+        )
+    {
+        let poll_id = id.to_string();
+        let poll_endpoint = endpoint.to_string();
+        let poll_engine = engine.clone();
+        let poll_ocsf_enabled = ocsf_enabled.clone();
+        let poll_pid = entrypoint_pid.clone();
+        let poll_provider_credentials = provider_credentials.clone();
+        let poll_policy_local = networking.as_ref().map(|n| n.policy_local_ctx.clone());
+        let poll_interval_secs: u64 = std::env::var("OPENSHELL_POLICY_POLL_INTERVAL_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(10);
+        let poll_ctx = PolicyPollLoopContext {
+            endpoint: poll_endpoint,
+            sandbox_id: poll_id,
+            opa_engine: poll_engine,
+            loaded_policy_origin,
+            entrypoint_pid: poll_pid,
+            interval_secs: poll_interval_secs,
+            ocsf_enabled: poll_ocsf_enabled,
+            provider_credentials: poll_provider_credentials,
+            policy_local_ctx: poll_policy_local,
+            agent_proposals: agent_proposals.clone(),
+            middleware_registry_status,
+            sidecar_control_publisher: sidecar_control_publisher.clone(),
+            workspace_tx,
         };
 
-        let networking = if network_enabled {
-            #[cfg(target_os = "linux")]
-            let proxy_bind_ip = netns
-                .as_ref()
-                .map(openshell_supervisor_process::netns::NetworkNamespace::host_ip);
-            #[cfg(not(target_os = "linux"))]
-            let proxy_bind_ip: Option<std::net::IpAddr> = None;
-
-            Some(
-                openshell_supervisor_network::run::run_networking(
-                    &policy,
-                    proxy_bind_ip,
-                    opa_engine.as_ref(),
-                    retained_proto.as_ref(),
-                    entrypoint_pid.clone(),
-                    process_enabled,
-                    &provider_credentials,
-                    sandbox_id.as_deref(),
-                    sandbox_name_for_agg.as_deref(),
-                    openshell_endpoint_for_proxy.as_deref(),
-                    inference_routes.as_deref(),
-                    denial_tx,
-                    activity_tx,
-                    workspace_rx.clone(),
-                )
-                .await?,
-            )
-        } else {
-            None
-        };
-
-        #[cfg(target_os = "linux")]
-        let sidecar_control_server = if network_enabled && sidecar_network_enforcement {
-            if !matches!(policy.network.mode, NetworkMode::Proxy) {
-                return Err(miette::miette!(
-                    "sidecar network enforcement requires proxy network mode"
-                ));
+        tokio::spawn(async move {
+            if let Err(e) = run_policy_poll_loop(poll_ctx).await {
+                ocsf_emit!(
+                    AppLifecycleBuilder::new(ocsf_ctx())
+                        .activity(ActivityId::Fail)
+                        .severity(SeverityId::Medium)
+                        .status(StatusId::Failure)
+                        .message(format!("Policy poll loop exited with error: {e}"))
+                        .build()
+                );
             }
-            let socket = sidecar_control_socket().ok_or_else(|| {
-                miette::miette!(
-                    "{} is required for sidecar topology",
-                    openshell_core::sandbox_env::SIDECAR_CONTROL_SOCKET
-                )
-            })?;
-            let proto = retained_proto.as_ref().ok_or_else(|| {
-                miette::miette!(
-                    "sidecar topology requires gateway policy data for the process supervisor"
-                )
-            })?;
-            let ca_paths = networking.as_ref().and_then(|n| n.ca_file_paths.clone());
-            Some(sidecar_control::spawn_server(
-                &socket,
-                sidecar_control::BootstrapData {
-                    policy_proto: proto.clone(),
-                    provider_env_revision: provider_credentials.snapshot().revision,
-                    provider_child_env: provider_env.clone(),
-                    proxy_ca_cert_path: ca_paths.as_ref().map(|paths| paths.0.clone()),
-                    proxy_ca_bundle_path: ca_paths.as_ref().map(|paths| paths.1.clone()),
-                },
-                sidecar_expected_peer()?,
-            )?)
-        } else {
-            None
-        };
-        #[cfg(not(target_os = "linux"))]
-        let sidecar_control_server: Option<sidecar_control::ServerHandle> = None;
+        });
+    }
 
-        let sidecar_control_publisher = sidecar_control_server
-            .as_ref()
-            .map(sidecar_control::ServerHandle::publisher);
-
-        #[cfg(target_os = "linux")]
-        let mut sidecar_control_task = None;
-
-        #[cfg(target_os = "linux")]
-        if network_enabled
-            && sidecar_network_enforcement
-            && let Some(server) = sidecar_control_server
+    // Start GCE metadata loopback server inside the network namespace so
+    // Go's cloud.google.com/go/compute/metadata (which bypasses HTTP_PROXY)
+    // can reach it via direct TCP. Must start before the process leaf so SSH
+    // sessions also see corrected env vars on bind failure.
+    #[cfg(target_os = "linux")]
+    if let Some(ns) = netns.as_ref()
+        && provider_credentials
+            .snapshot()
+            .child_env
+            .contains_key("GCE_METADATA_HOST")
+    {
+        let ctx = google_cloud_metadata::MetadataContext::new(provider_credentials.clone());
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        match ns
+            .bind_tcp_in_netns(openshell_core::google_cloud::METADATA_LOOPBACK_ADDR)
+            .await
         {
-            let trusted_ssh_socket_path = ssh_socket_path.clone().ok_or_else(|| {
-                miette::miette!(
-                    "{} is required for sidecar network topology",
-                    openshell_core::sandbox_env::SSH_SOCKET_PATH
-                )
-            })?;
-            let (entrypoint_rx, connection_task) = server.into_runtime_parts();
-            sidecar_control_task = Some(connection_task);
-            spawn_sidecar_entrypoint_handler(
-                entrypoint_rx,
-                entrypoint_pid.clone(),
-                opa_engine.clone(),
-                retained_proto.clone(),
-                openshell_endpoint.clone(),
-                sandbox_id.clone(),
-                std::path::PathBuf::from(trusted_ssh_socket_path),
-            );
-        }
-
-        #[cfg(not(target_os = "linux"))]
-        if network_enabled && sidecar_network_enforcement {
-            return Err(miette::miette!(
-                "sidecar network enforcement is only supported on Linux"
-            ));
-        }
-
-        // Spawn background policy poll task (gRPC mode only). Skipped for the
-        // process-only sidecar container, whose policy arrives over the control
-        // socket rather than a direct gateway poll.
-        if !process_uses_sidecar_control
-            && let (Some(id), Some(endpoint), Some(engine)) = (
-                sandbox_id.as_deref(),
-                openshell_endpoint.as_deref(),
-                opa_engine.as_ref(),
-            )
-        {
-            let poll_id = id.to_string();
-            let poll_endpoint = endpoint.to_string();
-            let poll_engine = engine.clone();
-            let poll_ocsf_enabled = ocsf_enabled.clone();
-            let poll_pid = entrypoint_pid.clone();
-            let poll_provider_credentials = provider_credentials.clone();
-            let poll_policy_local = networking.as_ref().map(|n| n.policy_local_ctx.clone());
-            let poll_interval_secs: u64 = std::env::var("OPENSHELL_POLICY_POLL_INTERVAL_SECS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(10);
-            let poll_ctx = PolicyPollLoopContext {
-                endpoint: poll_endpoint,
-                sandbox_id: poll_id,
-                opa_engine: poll_engine,
-                loaded_policy_origin,
-                entrypoint_pid: poll_pid,
-                interval_secs: poll_interval_secs,
-                ocsf_enabled: poll_ocsf_enabled,
-                provider_credentials: poll_provider_credentials,
-                policy_local_ctx: poll_policy_local,
-                middleware_registry_status,
-                sidecar_control_publisher: sidecar_control_publisher.clone(),
-                workspace_tx,
-            };
-
-            tokio::spawn(async move {
-                if let Err(e) = run_policy_poll_loop(poll_ctx).await {
-                    ocsf_emit!(
-                        AppLifecycleBuilder::new(ocsf_ctx())
-                            .activity(ActivityId::Fail)
-                            .severity(SeverityId::Medium)
-                            .status(StatusId::Failure)
-                            .message(format!("Policy poll loop exited with error: {e}"))
-                            .build()
-                    );
-                }
-            });
-        }
-
-        // Start GCE metadata loopback server inside the network namespace so
-        // Go's cloud.google.com/go/compute/metadata (which bypasses HTTP_PROXY)
-        // can reach it via direct TCP. Must start before the process leaf so SSH
-        // sessions also see corrected env vars on bind failure.
-        #[cfg(target_os = "linux")]
-        if let Some(ns) = netns.as_ref()
-            && provider_credentials
-                .snapshot()
-                .child_env
-                .contains_key("GCE_METADATA_HOST")
-        {
-            let ctx = google_cloud_metadata::MetadataContext::new(provider_credentials.clone());
-            let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
-            match ns
-                .bind_tcp_in_netns(openshell_core::google_cloud::METADATA_LOOPBACK_ADDR)
-                .await
-            {
-                Ok(listener) => {
-                    tokio::spawn(metadata_server::run(listener, ctx, ready_tx));
-                    if let Ok(Ok(addr)) = timeout(Duration::from_secs(5), ready_rx).await {
-                        info!(addr = %addr, "GCE metadata loopback server ready");
-                    } else {
-                        warn!(
-                            "GCE metadata server failed to become ready, removing metadata env vars"
-                        );
-                        provider_env.remove("GCE_METADATA_HOST");
-                        provider_env.remove("GCE_METADATA_IP");
-                        provider_env.remove("METADATA_SERVER_DETECTION");
-                        provider_credentials.remove_env_key("GCE_METADATA_HOST");
-                    }
-                }
-                Err(e) => {
-                    warn!(error = %e, "GCE metadata server bind failed, Go SDK may not discover credentials");
+            Ok(listener) => {
+                tokio::spawn(metadata_server::run(listener, ctx, ready_tx));
+                if let Ok(Ok(addr)) = timeout(Duration::from_secs(5), ready_rx).await {
+                    info!(addr = %addr, "GCE metadata loopback server ready");
+                } else {
+                    warn!("GCE metadata server failed to become ready, removing metadata env vars");
                     provider_env.remove("GCE_METADATA_HOST");
                     provider_env.remove("GCE_METADATA_IP");
                     provider_env.remove("METADATA_SERVER_DETECTION");
                     provider_credentials.remove_env_key("GCE_METADATA_HOST");
                 }
             }
+            Err(e) => {
+                warn!(error = %e, "GCE metadata server bind failed, Go SDK may not discover credentials");
+                provider_env.remove("GCE_METADATA_HOST");
+                provider_env.remove("GCE_METADATA_IP");
+                provider_env.remove("METADATA_SERVER_DETECTION");
+                provider_credentials.remove_env_key("GCE_METADATA_HOST");
+            }
         }
+    }
 
-        // Network-only sidecar mode: this network container keeps the proxy and
-        // its background tasks alive (held via the `networking` value) until
-        // shutdown. The agent container's workload is spawned by the sidecar
-        // isolation backend (see the `else` arm); it never runs here. If the
-        // sole authenticated process-supervisor control connection closes, exit
-        // non-zero so Kubernetes restarts the network sidecar and creates a
-        // fresh one-client bootstrap listener for the restarted agent.
-        let exit_code = {
-            #[cfg(target_os = "linux")]
-            let code = if let Some(control_task) = sidecar_control_task {
-                tokio::select! {
-                    () = wait_for_shutdown_signal() => 0,
-                    result = control_task => {
-                        warn!(?result, "Authoritative sidecar control channel exited; restarting sidecar");
-                        1
-                    }
-                }
-            } else {
-                wait_for_shutdown_signal().await;
-                0
-            };
-            #[cfg(not(target_os = "linux"))]
-            let code = {
-                wait_for_shutdown_signal().await;
-                0
-            };
-            code
-        };
+    let process_policy = process_policy_for_topology(&policy, sidecar_network_enforcement)?;
+    let sidecar_bootstrap_ca_file_paths = sidecar_bootstrap.as_ref().and_then(|bootstrap| {
+        bootstrap
+            .proxy_ca_cert_path
+            .clone()
+            .zip(bootstrap.proxy_ca_bundle_path.clone())
+    });
 
-        // Drop networking explicitly so the proxy + bypass monitor RAII handles
-        // tear down before we return.
-        drop(networking);
-        exit_code
-    } else {
-        // Drive the isolation boundary through a runtime-selected backend (RFC
-        // 0012). The supervisor matches the topology descriptor's backend id to
-        // the admitted backend, resolves its factory from the registry without
-        // fallback, and advances the boxed state chain: attach -> Bound ->
-        // confirm -> Ready -> start_agent -> Running. The transitions consume
-        // each prior state, so "no untrusted instruction before the boundary is
-        // ready" is enforced by construction.
-        let policy_local_slot = Arc::new(std::sync::Mutex::new(None));
-
-        // Build the admitted backend. The Kubernetes sidecar *agent* container
-        // (network mediation is enforced by a separate network container, so
-        // `sidecar_network_enforcement` is set but this container has
-        // `network_enabled == false`) drives the sidecar backend: it wraps the
-        // autonomous agent/process path (workload spawn + control-closed
-        // watchdog) in the RFC 0012 contract. Every other supervisor drives the
-        // co-located in-pod backend, which owns the netns, proxy, and workload.
-        let (factory, admitted_backend_id): (
-            Arc<dyn openshell_isolation::contract::IsolationBackendFactory>,
-            &str,
-        ) = if sidecar_network_enforcement {
-            // Process-role policy and CA material for the agent container. The
-            // proxy runs in the network container, so there is no local
-            // `networking` to source CA paths from; fall back to the sidecar
-            // bootstrap or the well-known mount.
-            let process_policy = process_policy_for_topology(&policy, sidecar_network_enforcement)?;
-            let ca_file_paths = sidecar_bootstrap
-                .as_ref()
-                .and_then(|bootstrap| {
-                    bootstrap
-                        .proxy_ca_cert_path
+    let exit_code = if process_enabled {
+        let ca_file_paths = networking
+            .as_ref()
+            .and_then(|n| n.ca_file_paths.clone())
+            .or_else(|| {
+                if sidecar_network_enforcement {
+                    sidecar_bootstrap_ca_file_paths
                         .clone()
-                        .zip(bootstrap.proxy_ca_bundle_path.clone())
-                })
-                .or_else(sidecar_ca_file_paths);
+                        .or_else(sidecar_ca_file_paths)
+                } else {
+                    None
+                }
+            });
 
-            let config = sidecar::SidecarConfig {
-                process_enforcement_mode,
-                provider_credentials: provider_credentials.clone(),
-                provider_env,
-                process_policy,
-                ca_file_paths,
-                entrypoint_pid: entrypoint_pid.clone(),
-                ssh_socket_path,
-                openshell_endpoint: openshell_endpoint_for_proxy.clone(),
-                sandbox_id: sandbox_id.clone(),
-                process_control_writer,
-                process_control_closed: std::sync::Mutex::new(process_control_closed),
-                #[cfg(target_os = "linux")]
-                bypass_denial_tx: std::sync::Mutex::new(bypass_denial_tx),
-                #[cfg(target_os = "linux")]
-                bypass_activity_tx: std::sync::Mutex::new(bypass_activity_tx),
-            };
-            (
-                Arc::new(sidecar::SidecarBackendFactory::new(config)),
-                sidecar::SIDECAR_BACKEND_ID,
-            )
-        } else {
-            let config = inpod::InPodConfig {
-                network_enabled,
-                process_enabled,
-                opa_engine: opa_engine.clone(),
-                retained_proto,
-                entrypoint_pid: entrypoint_pid.clone(),
-                provider_credentials: provider_credentials.clone(),
-                provider_env: std::sync::Mutex::new(provider_env),
-                process_enforcement_mode,
-                sandbox_name: sandbox_name_for_agg.clone(),
-                openshell_endpoint: openshell_endpoint_for_proxy.clone(),
-                inference_routes,
-                ssh_socket_path,
-                workspace_rx: workspace_rx.clone(),
-                denial_tx: std::sync::Mutex::new(denial_tx),
-                activity_tx: std::sync::Mutex::new(activity_tx),
-                #[cfg(target_os = "linux")]
-                bypass_denial_tx: std::sync::Mutex::new(bypass_denial_tx),
-                #[cfg(target_os = "linux")]
-                bypass_activity_tx: std::sync::Mutex::new(bypass_activity_tx),
-                policy_local_slot: policy_local_slot.clone(),
-            };
-            (
-                Arc::new(inpod::InPodBackendFactory::new(config)),
-                inpod::IN_POD_BACKEND_ID,
-            )
-        };
-
-        let mut registry = openshell_isolation::contract::BackendRegistry::new();
-        registry
-            .register(factory)
-            .map_err(|e| miette::miette!("failed to register isolation backend: {e}"))?;
-
-        // The topology descriptor. A driver-provisioned sandbox receives it
-        // through the driver-controlled environment (`OPENSHELL_TOPOLOGY_DESCRIPTOR`)
-        // and missing or invalid input fails closed with no default backend. A
-        // standalone run (no sandbox id, so no driver and no admission record) is
-        // its own deployment configuration and uses the in-pod descriptor directly.
-        let descriptor = match std::env::var(openshell_core::sandbox_env::TOPOLOGY_DESCRIPTOR) {
-            Ok(value) => openshell_isolation::contract::TopologyDescriptor::from_env_value(&value)
-                .map_err(|e| miette::miette!("invalid topology descriptor: {e}"))?,
-            Err(std::env::VarError::NotUnicode(_)) => {
-                return Err(miette::miette!(
-                    "invalid topology descriptor: value is not valid UTF-8"
-                ));
-            }
-            Err(std::env::VarError::NotPresent) if sandbox_id.is_none() => {
-                openshell_isolation::contract::TopologyDescriptor::in_pod()
-            }
-            Err(std::env::VarError::NotPresent) => {
-                return Err(miette::miette!(
-                    "no topology descriptor: a driver-provisioned sandbox must receive {} \
-                     from its compute driver",
-                    openshell_core::sandbox_env::TOPOLOGY_DESCRIPTOR
-                ));
-            }
-        };
-        // Verify the admitted backend id and exact contract version, then
-        // resolve the factory from the registry without fallback.
-        let (factory, verified) = registry
-            .resolve(descriptor, admitted_backend_id)
-            .map_err(|e| miette::miette!("backend resolution failed: {e}"))?;
-
-        // The trusted sandbox context: it carries the create-time policy
-        // baseline; authorized mediation-evaluated revisions continue through
-        // the policy poll loop below without a backend lifecycle transition.
-        let sandbox_context = openshell_isolation::contract::SandboxContext {
-            sandbox_id: sandbox_id.clone().unwrap_or_default(),
-            policy,
-            agent: openshell_isolation::AgentSpec {
-                program: program.clone(),
-                args: args.to_vec(),
-                workdir,
-                timeout_secs,
-                interactive,
-            },
-        };
-
-        // `attach` validates the payload and atomically binds it to the sandbox
-        // context: it returns `Bound` or fails closed.
-        let bound = factory
-            .attach(verified, sandbox_context)
-            .await
-            .map_err(|e| miette::miette!("boundary attach failed: {e}"))?;
-
-        // Retain the boundary's mediation ingress before consuming `Bound`.
-        let _mediation_ingress = bound.mediation_ingress();
-
-        // Spawn background policy poll task (gRPC mode only). Skipped for the
-        // sidecar agent container, whose policy arrives over the control socket
-        // rather than a direct gateway poll.
-        if !process_uses_sidecar_control
-            && let (Some(id), Some(endpoint), Some(engine)) = (
-                sandbox_id.as_deref(),
-                openshell_endpoint.as_deref(),
-                opa_engine.as_ref(),
-            )
-        {
-            let poll_id = id.to_string();
-            let poll_endpoint = endpoint.to_string();
-            let poll_engine = engine.clone();
-            let poll_ocsf_enabled = ocsf_enabled.clone();
-            let poll_pid = entrypoint_pid.clone();
-            let poll_provider_credentials = provider_credentials.clone();
-            let poll_policy_local = policy_local_slot
-                .lock()
-                .expect("policy_local_slot lock")
-                .clone();
-            let poll_interval_secs: u64 = std::env::var("OPENSHELL_POLICY_POLL_INTERVAL_SECS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(10);
-            let poll_ctx = PolicyPollLoopContext {
-                endpoint: poll_endpoint,
-                sandbox_id: poll_id,
-                opa_engine: poll_engine,
-                loaded_policy_origin,
-                entrypoint_pid: poll_pid,
-                interval_secs: poll_interval_secs,
-                ocsf_enabled: poll_ocsf_enabled,
-                provider_credentials: poll_provider_credentials,
-                policy_local_ctx: poll_policy_local,
-                middleware_registry_status,
-                sidecar_control_publisher: None,
-                workspace_tx,
+        let entrypoint_started_tx =
+            if process_uses_sidecar_control && let Some(writer) = process_control_writer.clone() {
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                tokio::spawn(async move {
+                    match rx.await {
+                        Ok(pid) => {
+                            if let Err(err) =
+                                sidecar_control::send_entrypoint_started(&writer, pid).await
+                            {
+                                warn!(error = %err, "Failed to send sidecar entrypoint event");
+                            }
+                        }
+                        Err(_closed) => {
+                            debug!("Entrypoint exited before sidecar entrypoint event was sent");
+                        }
+                    }
+                });
+                Some(tx)
+            } else {
+                None
             };
 
-            tokio::spawn(async move {
-                if let Err(e) = run_policy_poll_loop(poll_ctx).await {
+        let process = openshell_supervisor_process::run::run_process(
+            program,
+            args,
+            workdir.as_deref(),
+            timeout_secs,
+            interactive,
+            sandbox_id.as_deref(),
+            openshell_endpoint.as_deref(),
+            ssh_socket_path,
+            sidecar_network_enforcement,
+            &process_policy,
+            resolved_process_identity,
+            process_enforcement_mode,
+            entrypoint_pid,
+            entrypoint_started_tx,
+            provider_credentials,
+            provider_env,
+            ca_file_paths,
+            agent_proposals.clone(),
+            #[cfg(target_os = "linux")]
+            netns.as_ref(),
+            #[cfg(target_os = "linux")]
+            bypass_denial_tx,
+            #[cfg(target_os = "linux")]
+            bypass_activity_tx,
+        );
+
+        if let Some(control_closed) = process_control_closed.as_mut() {
+            tokio::select! {
+                result = process => result?,
+                _ = control_closed => {
                     ocsf_emit!(
                         AppLifecycleBuilder::new(ocsf_ctx())
                             .activity(ActivityId::Fail)
-                            .severity(SeverityId::Medium)
+                            .severity(SeverityId::High)
                             .status(StatusId::Failure)
-                            .message(format!("Policy poll loop exited with error: {e}"))
+                            .message(
+                                "Authoritative network-sidecar control channel closed; terminating process container"
+                            )
                             .build()
                     );
+                    return Err(miette::miette!(
+                        "authoritative network-sidecar control channel closed"
+                    ));
                 }
-            });
+            }
+        } else {
+            process.await?
         }
-
-        // Confirm standing enforcement, then make the agent runnable behind the
-        // boundary. In network-only (sidecar) mode the backend holds the
-        // boundary open until a shutdown signal instead of running an agent.
-        let ready = bound
-            .confirm()
-            .await
-            .map_err(|e| miette::miette!("boundary confirm failed: {e}"))?;
-        let running = ready
-            .start_agent()
-            .await
-            .map_err(|e| miette::miette!("agent start failed: {e}"))?;
-
-        // Wait for the agent (or the held-open boundary) through its process handle.
-        let exit_status = running
-            .agent()
-            .wait()
-            .await
-            .map_err(|e| miette::miette!("waiting on agent failed: {e}"))?;
-        let exit_code = match exit_status {
-            openshell_isolation::contract::BoundaryExitStatus::Exited(code) => code,
-            openshell_isolation::contract::BoundaryExitStatus::Signaled(sig) => 128 + sig,
-        };
-
-        // Drop the running boundary so the backend reclaims its private state
-        // (proxy + bypass monitor and the network namespace) before we return.
-        drop(running);
-        exit_code
+    } else {
+        // Network-only sidecar mode: keep the proxy and its background
+        // tasks alive (held via the `networking` value) until shutdown. If the
+        // sole authenticated process-supervisor control connection closes,
+        // exit non-zero so Kubernetes restarts the network sidecar and creates
+        // a fresh one-client bootstrap listener for the restarted agent.
+        #[cfg(target_os = "linux")]
+        if let Some(control_task) = sidecar_control_task {
+            tokio::select! {
+                () = wait_for_shutdown_signal() => 0,
+                result = control_task => {
+                    warn!(?result, "Authoritative sidecar control channel exited; restarting sidecar");
+                    1
+                }
+            }
+        } else {
+            wait_for_shutdown_signal().await;
+            0
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            wait_for_shutdown_signal().await;
+            0
+        }
     };
+
+    // Drop networking explicitly so the proxy + bypass monitor RAII
+    // handles tear down before we return.
+    drop(networking);
 
     Ok(exit_code)
 }
 
 /// Wait for SIGINT or SIGTERM. Used in network-only mode where there is
 /// no entrypoint child whose lifetime drives the supervisor's exit.
-pub(crate) async fn wait_for_shutdown_signal() {
+async fn wait_for_shutdown_signal() {
     #[cfg(unix)]
     {
         use tokio::signal::unix::{SignalKind, signal};
@@ -965,14 +1037,45 @@ fn sidecar_network_enforcement_enabled() -> bool {
         .is_ok_and(|value| value == SIDECAR_NETWORK_ENFORCEMENT_MODE)
 }
 
-fn process_enforcement_mode() -> ProcessEnforcementMode {
-    match std::env::var(openshell_core::sandbox_env::SUPERVISOR_TOPOLOGY)
-        .ok()
-        .as_deref()
-    {
+fn process_enforcement_mode(admitted: bool) -> ProcessEnforcementMode {
+    let configured = std::env::var(openshell_core::sandbox_env::SUPERVISOR_TOPOLOGY).ok();
+    process_enforcement_mode_from(admitted, configured.as_deref())
+}
+
+fn process_enforcement_mode_from(
+    admitted: bool,
+    configured_topology: Option<&str>,
+) -> ProcessEnforcementMode {
+    if admitted {
+        return ProcessEnforcementMode::Full;
+    }
+    match configured_topology {
         Some("sidecar") => ProcessEnforcementMode::NetworkOnly,
         _ => ProcessEnforcementMode::Full,
     }
+}
+
+fn validate_admitted_policy_source(
+    admitted: bool,
+    sandbox_id: Option<&str>,
+    openshell_endpoint: Option<&str>,
+    policy_rules: Option<&str>,
+    policy_data: Option<&str>,
+) -> Result<()> {
+    if !admitted {
+        return Ok(());
+    }
+    if policy_rules.is_some() || policy_data.is_some() {
+        return Err(miette::miette!(
+            "an admitted isolation backend does not accept local policy overrides"
+        ));
+    }
+    if sandbox_id.is_none() || openshell_endpoint.is_none() {
+        return Err(miette::miette!(
+            "an admitted isolation backend requires an authenticated gateway policy source"
+        ));
+    }
+    Ok(())
 }
 
 fn sidecar_control_socket() -> Option<std::path::PathBuf> {
@@ -1143,12 +1246,10 @@ fn spawn_sidecar_entrypoint_handler(
                     endpoint.clone(),
                     id.clone(),
                     trusted_ssh_socket_path.clone(),
-                    // The sidecar process supervisor connects from its own
-                    // network namespace (no boundary netns to enter).
                     Arc::new(
-                        openshell_supervisor_process::boundary_io::NetnsPortForward {
-                            netns_fd: None,
-                        },
+                        openshell_supervisor_process::boundary_io::NetnsPortForward::new(
+                            None, None,
+                        ),
                     ),
                     Some(supervisor_pid),
                     Arc::clone(&terminating),
@@ -3651,6 +3752,46 @@ mod tests {
         FilesystemPolicy, LandlockPolicy, NetworkMode, NetworkPolicy, ProcessPolicy, ProxyPolicy,
     };
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    #[test]
+    fn admitted_topology_cannot_select_reduced_process_enforcement() {
+        assert_eq!(
+            process_enforcement_mode_from(true, Some("sidecar")),
+            ProcessEnforcementMode::Full
+        );
+        assert_eq!(
+            process_enforcement_mode_from(false, Some("sidecar")),
+            ProcessEnforcementMode::NetworkOnly
+        );
+    }
+
+    #[test]
+    fn admitted_topology_requires_gateway_policy() {
+        assert!(
+            validate_admitted_policy_source(true, Some("id"), Some("endpoint"), None, None).is_ok()
+        );
+        assert!(
+            validate_admitted_policy_source(
+                true,
+                Some("id"),
+                Some("endpoint"),
+                Some("rules.rego"),
+                Some("policy.yaml")
+            )
+            .is_err()
+        );
+        assert!(validate_admitted_policy_source(true, None, None, None, None).is_err());
+        assert!(
+            validate_admitted_policy_source(
+                false,
+                None,
+                None,
+                Some("rules.rego"),
+                Some("policy.yaml")
+            )
+            .is_ok()
+        );
+    }
 
     fn proxy_policy(http_addr: Option<std::net::SocketAddr>) -> SandboxPolicy {
         SandboxPolicy {

@@ -30,6 +30,7 @@ const RESERVED_MOUNT_TARGETS: &[&str] = &[
     "/etc/openshell",
     "/etc/openshell-tls",
     "/run/netns",
+    "/proc",
 ];
 
 /// Validate a non-empty driver mount source.
@@ -118,9 +119,11 @@ pub fn validate_container_mount_target(target: &str) -> Result<(), String> {
         return Err("mount target '/sandbox' is reserved for the OpenShell workspace".to_string());
     }
     for reserved in RESERVED_MOUNT_TARGETS {
-        if path_is_or_under(path, Path::new(reserved)) {
+        let reserved = Path::new(reserved);
+        if path_is_or_under(path, reserved) || path_is_or_under(reserved, path) {
             return Err(format!(
-                "mount target '{target}' conflicts with reserved OpenShell path '{reserved}'"
+                "mount target '{target}' conflicts with reserved OpenShell path '{}'",
+                reserved.display()
             ));
         }
     }
@@ -169,6 +172,24 @@ mod tests {
         let err = validate_container_mount_target("/etc/openshell/tls/client").unwrap_err();
 
         assert!(err.contains("/etc/openshell"));
+    }
+
+    #[test]
+    fn container_target_rejects_parents_that_shadow_reserved_trees() {
+        for target in ["/opt", "/etc", "/run"] {
+            let err = validate_container_mount_target(target).unwrap_err();
+            assert!(
+                err.contains("reserved OpenShell path"),
+                "expected {target} to be rejected: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn container_target_rejects_proc_shadowing() {
+        for target in ["/proc", "/proc/self", "/"] {
+            assert!(validate_container_mount_target(target).is_err());
+        }
     }
 
     #[test]

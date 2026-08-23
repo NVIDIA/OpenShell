@@ -10,7 +10,7 @@ Standalone libkrun-backed [`ComputeDriver`](../../proto/compute_driver.proto) fo
 flowchart LR
     subgraph host["Host process"]
         gateway["openshell-server<br/>(compute::vm::spawn)"]
-        driver["openshell-driver-vm<br/>├── libkrun (VM)<br/>├── gvproxy (net)<br/>└── openshell-sandbox.zst"]
+        driver["openshell-driver-vm<br/>├── libkrun (VM)<br/>├── gvproxy (net)<br/>├── openshell-sandbox.zst<br/>└── openshell-runtime.tar.zst"]
         gateway <-->|"gRPC over UDS<br/>compute-driver.sock"| driver
     end
 
@@ -35,7 +35,7 @@ Sandbox guests execute `/opt/openshell/bin/openshell-sandbox` as PID 1 inside th
 mise run gateway:vm
 ```
 
-First run takes a few minutes while `mise run vm:setup` stages libkrun/libkrunfw/gvproxy/umoci and `mise run vm:supervisor` builds the bundled guest supervisor. Subsequent runs are cached.
+First run takes a few minutes while `mise run vm:setup` stages libkrun/libkrunfw/gvproxy/umoci and `mise run vm:supervisor` builds the bundled guest supervisor plus its trusted network-helper runtime. The latter uses Docker Buildx to materialize the same runtime shipped in the supervisor image. Subsequent runs are cached.
 
 By default `mise run gateway:vm`:
 
@@ -94,7 +94,7 @@ If you want to drive the launch yourself instead of using `mise run gateway:vm` 
 ```shell
 # 1. Stage runtime artifacts + supervisor bundle into target/vm-runtime-compressed/
 mise run vm:setup
-mise run vm:supervisor          # if openshell-sandbox.zst is not already present
+mise run vm:supervisor          # builds openshell-sandbox.zst and its trusted helper runtime
 
 # 2. Build both binaries with the staged artifacts embedded
 OPENSHELL_VM_RUNTIME_COMPRESSED_DIR=$PWD/target/vm-runtime-compressed \

@@ -8,15 +8,16 @@
 //! container. It implements the object-safe boxed state chain
 //! (`attach -> Bound -> confirm -> Ready -> start_agent -> Running`) over the
 //! existing supervisor primitives without changing their behavior:
-//! `create_netns_for_proxy` (network), `run_networking` (proxy mediation),
+//! `create_netns_for_proxy` (network), supervisor-owned proxy mediation,
 //! the pre-exec ceiling in `spawn_workload` (filesystem/Landlock +
 //! syscall/seccomp), and procfs (binary identity).
 //!
 //! `attach` validates the (empty) in-pod payload and atomically binds the
 //! trusted [`SandboxContext`] to the boundary it establishes: the workload
-//! network namespace and the mediation service come up inside `attach`, so
+//! network namespace and backend-owned connection source come up inside
+//! `attach`. The supervisor connects that source to mediation before `confirm`, so
 //! `Bound` means what the RFC says it means — descriptor and context bound to
-//! the same resource, mediation ingress available, no untrusted workload code
+//! the same resource, mediation source available, no untrusted workload code
 //! running. Each transition consumes the prior state by value, so the call
 //! order, and thus "no untrusted instruction before the boundary is ready", is
 //! enforced by construction.
@@ -28,6 +29,8 @@
 //! environment by construction.
 
 use std::collections::HashMap;
+#[cfg(target_os = "linux")]
+use std::future::Future;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -37,42 +40,40 @@ use async_trait::async_trait;
 use openshell_core::activity::ActivitySender;
 use openshell_core::denial::DenialEvent;
 use openshell_core::policy::NetworkMode;
+use openshell_core::proposals::AgentProposals;
 use openshell_core::provider_credentials::ProviderCredentialState;
 use openshell_isolation::contract::{
     BackendError, BoundBoundary, BoundaryExec, BoundaryExitStatus, BoundaryPortForward,
-    BoundaryProcess, BoundarySignal, CONTRACT_VERSION, ExecSession, ExecSpec,
-    IsolationBackendFactory, MediatedConnection, MediationIngress, ReadyBoundary, RunningBoundary,
-    SandboxContext, VerifiedTopologyDescriptor,
+    BoundaryProcess, BoundarySignal, INTERFACE_VERSION, IsolationBackend, MediatedConnection,
+    NetworkMediationSource, ReadyBoundary, RunningBoundary, SandboxContext,
+    VerifiedTopologyDescriptor,
 };
 use openshell_supervisor_network::identity_source::ProcfsIdentityResolver;
-use openshell_supervisor_network::opa::OpaEngine;
-use openshell_supervisor_network::run::{Networking, run_networking};
-use openshell_supervisor_process::boundary_io::NetnsPortForward;
 use openshell_supervisor_process::process::ProcessEnforcementMode;
+use openshell_supervisor_process::process::ResolvedProcessIdentity;
 use openshell_supervisor_process::run::{AgentSignaler, SpawnedAgent, spawn_workload};
 use tokio::sync::mpsc::UnboundedSender;
 
 #[cfg(target_os = "linux")]
-use openshell_supervisor_process::netns::{NetworkNamespace, create_netns_for_proxy};
+use openshell_supervisor_process::netns::{NetworkNamespace, create_conformant_netns_for_proxy};
 
-/// The registered id for the in-pod backend (defined in the contract crate so
-/// compute drivers can name it in the descriptors they create).
-pub use openshell_isolation::contract::IN_POD_BACKEND_ID;
+/// Stable name of the co-located backend implementation.
+pub const IN_POD_BACKEND_NAME: &str = "in-pod";
 
 // ============================================================================
-// Config and factory
+// Config and backend
 // ============================================================================
 
 /// Runtime collaborators the in-pod lifecycle calls need, captured once when the
-/// factory is built. Move-once values (the event senders) are held behind a
-/// `Mutex<Option<_>>` so the `&self` factory/state methods can take them exactly
+/// backend is built. Move-once values (the event senders) are held behind a
+/// `Mutex<Option<_>>` so the `&self` backend/state methods can take them exactly
 /// when the matching transition fires. Policy, workload, and sandbox identity
 /// are *not* here; they arrive in the trusted [`SandboxContext`] at `attach`.
 pub struct InPodConfig {
+    /// Require the supervisor to own the execution environment's PID namespace.
+    pub require_exclusive_pid_namespace: bool,
     pub network_enabled: bool,
     pub process_enabled: bool,
-    pub opa_engine: Option<Arc<OpaEngine>>,
-    pub retained_proto: Option<openshell_core::proto::SandboxPolicy>,
     pub entrypoint_pid: Arc<AtomicU32>,
     pub provider_credentials: ProviderCredentialState,
     /// Child environment for the agent, resolved at startup. Mutated in place by
@@ -81,32 +82,25 @@ pub struct InPodConfig {
     /// Process launch-time enforcement level (full privileged setup vs.
     /// network-sidecar reduced mode), resolved by the supervisor at startup.
     pub process_enforcement_mode: ProcessEnforcementMode,
-    pub sandbox_name: Option<String>,
+    pub resolved_process_identity: ResolvedProcessIdentity,
+    pub agent_proposals: AgentProposals,
     pub openshell_endpoint: Option<String>,
-    pub inference_routes: Option<String>,
     pub ssh_socket_path: Option<String>,
-    /// Workspace watch receiver: handed to `run_networking` so the proxy's
-    /// policy-local and activity paths observe the workspace the poll loop
-    /// learns from `GetSandboxConfig`.
-    pub workspace_rx: tokio::sync::watch::Receiver<String>,
-    /// Proxy-side denial / activity senders (consumed by `attach`).
-    pub denial_tx: Mutex<Option<UnboundedSender<DenialEvent>>>,
-    pub activity_tx: Mutex<Option<ActivitySender>>,
     /// Bypass-monitor denial / activity senders (consumed by `start_agent`).
     #[cfg(target_os = "linux")]
     pub bypass_denial_tx: Mutex<Option<UnboundedSender<DenialEvent>>>,
     #[cfg(target_os = "linux")]
     pub bypass_activity_tx: Mutex<Option<ActivitySender>>,
-    /// Output slot: `attach` publishes the proxy's policy-local route context
-    /// here so the orchestrator's policy poll loop can pick it up without
-    /// reaching into in-pod-specific state through the `dyn` boundary.
-    pub policy_local_slot:
-        Arc<Mutex<Option<Arc<openshell_supervisor_network::policy_local::PolicyLocalContext>>>>,
+    /// Co-located coordination set by supervisor-owned mediation after it has
+    /// connected the source and before `confirm`.
+    pub mediation_ready: Arc<AtomicBool>,
+    pub ca_file_paths: Arc<Mutex<Option<(std::path::PathBuf, std::path::PathBuf)>>>,
+    pub proxy_bind_ip: Arc<Mutex<Option<std::net::IpAddr>>>,
 }
 
-/// The factory for the in-pod backend. Holds the per-sandbox [`InPodConfig`] and
+/// The backend for the in-pod backend. Holds the per-sandbox [`InPodConfig`] and
 /// hands it to the boundary on the single `attach`.
-pub struct InPodBackendFactory {
+pub struct InPodBackend {
     config: Mutex<Option<InPodConfig>>,
     /// Whether a prior `attach` consumed the config and then failed during
     /// establishment. The one-shot event senders are consumed with it, so the
@@ -115,8 +109,8 @@ pub struct InPodBackendFactory {
     attach_failed: AtomicBool,
 }
 
-impl InPodBackendFactory {
-    /// Build the factory from its per-sandbox runtime collaborators.
+impl InPodBackend {
+    /// Build the backend from its per-sandbox runtime collaborators.
     #[must_use]
     pub fn new(config: InPodConfig) -> Self {
         Self {
@@ -127,13 +121,13 @@ impl InPodBackendFactory {
 }
 
 #[async_trait]
-impl IsolationBackendFactory for InPodBackendFactory {
-    fn backend_id(&self) -> &'static str {
-        IN_POD_BACKEND_ID
+impl IsolationBackend for InPodBackend {
+    fn backend_name(&self) -> &'static str {
+        IN_POD_BACKEND_NAME
     }
 
-    fn contract_version(&self) -> u32 {
-        CONTRACT_VERSION
+    fn version(&self) -> u32 {
+        INTERFACE_VERSION
     }
 
     async fn attach(
@@ -187,50 +181,70 @@ async fn establish(
     config: InPodConfig,
     sandbox: SandboxContext,
 ) -> Result<InPodBound, BackendError> {
+    #[cfg(not(target_os = "linux"))]
+    return Err(BackendError::Attach(
+        "the in-pod RFC 0012 backend requires Linux enforcement primitives".to_string(),
+    ));
+
+    if matches!(sandbox.policy.network.mode, NetworkMode::Allow) {
+        return Err(BackendError::Denied(
+            "the in-pod RFC 0012 topology does not admit unrestricted network mode; workload egress must be mediated or blocked"
+                .to_string(),
+        ));
+    }
+
     // Establish the network dimension of standing enforcement: create the
     // workload's network namespace and install the bypass-detection rules.
     // Filesystem and syscall are launch-time controls applied per process;
     // binary identity is resolved per accepted connection.
     #[cfg(target_os = "linux")]
     let netns = if config.network_enabled {
-        create_netns_for_proxy(&sandbox.policy).map_err(|e| BackendError::Attach(e.to_string()))?
+        create_conformant_netns_for_proxy(&sandbox.policy)
+            .map_err(|e| BackendError::Attach(e.to_string()))?
     } else {
         None
     };
 
-    // Bring up the mediation service (the in-pod proxy) so the mediation
-    // ingress is available at `Bound`.
-    let networking = if config.network_enabled {
-        #[cfg(target_os = "linux")]
-        let proxy_bind_ip = netns.as_ref().map(NetworkNamespace::host_ip);
-        #[cfg(not(target_os = "linux"))]
-        let proxy_bind_ip: Option<std::net::IpAddr> = None;
+    #[cfg(target_os = "linux")]
+    let proxy_bind_ip = netns.as_ref().map(NetworkNamespace::host_ip);
+    #[cfg(not(target_os = "linux"))]
+    let proxy_bind_ip: Option<std::net::IpAddr> = None;
+    *config.proxy_bind_ip.lock().expect("proxy bind IP lock") = proxy_bind_ip;
 
-        // Take the senders into locals so the Mutex guards drop before the
-        // await (a guard held across an await would make the future !Send).
-        let denial_tx = config.denial_tx.lock().expect("denial_tx lock").take();
-        let activity_tx = config.activity_tx.lock().expect("activity_tx lock").take();
-        let networking = run_networking(
-            &sandbox.policy,
-            proxy_bind_ip,
-            config.opa_engine.as_ref(),
-            config.retained_proto.as_ref(),
-            config.entrypoint_pid.clone(),
-            config.process_enabled,
-            &config.provider_credentials,
-            Some(sandbox.sandbox_id.as_str()),
-            config.sandbox_name.as_deref(),
-            config.openshell_endpoint.as_deref(),
-            config.inference_routes.as_deref(),
-            denial_tx,
-            activity_tx,
-            config.workspace_rx.clone(),
+    if config.require_exclusive_pid_namespace && std::process::id() != 1 {
+        return Err(BackendError::Attach(
+            "the in-pod topology requires the supervisor to be PID 1 in its execution environment"
+                .to_string(),
+        ));
+    }
+    let runtime = if config.require_exclusive_pid_namespace {
+        openshell_supervisor_process::boundary_io::BoundaryRuntimeState::new_exclusive_pid_namespace(
         )
-        .await
-        .map_err(|e| BackendError::Attach(e.to_string()))?;
-        Some(networking)
     } else {
-        None
+        openshell_supervisor_process::boundary_io::BoundaryRuntimeState::new()
+    };
+    let network_mediation_source: Arc<dyn NetworkMediationSource> = if config.network_enabled
+        && matches!(sandbox.policy.network.mode, NetworkMode::Proxy)
+    {
+        let proxy_policy = sandbox.policy.network.proxy.as_ref().ok_or_else(|| {
+            BackendError::Attach("proxy mode requires a proxy configuration".to_string())
+        })?;
+        let default_ip = proxy_bind_ip.unwrap_or_else(|| std::net::IpAddr::from([127, 0, 0, 1]));
+        let port = proxy_policy.http_addr.map_or(3128, |addr| addr.port());
+        let listener = tokio::net::TcpListener::bind((default_ip, port))
+            .await
+            .map_err(|error| BackendError::Attach(error.to_string()))?;
+        Arc::new(InPodNetworkMediationSource {
+            listener,
+            identity: ProcfsIdentityResolver {
+                entrypoint_pid: config.entrypoint_pid.clone(),
+            },
+            runtime: runtime.clone(),
+        })
+    } else {
+        Arc::new(InactiveNetworkMediationSource {
+            runtime: runtime.clone(),
+        })
     };
 
     // Start the GCE metadata loopback server inside the namespace so Go's
@@ -242,32 +256,13 @@ async fn establish(
         ensure_gce_metadata_server(&config, ns).await;
     }
 
-    // Publish the policy-local route context for the orchestrator's poll
-    // loop (the mediation service's policy-update path: authorized
-    // revisions apply there without a backend lifecycle transition).
-    *config
-        .policy_local_slot
-        .lock()
-        .expect("policy_local_slot lock") = networking.as_ref().map(|n| n.policy_local_ctx.clone());
-
-    // The mediation service's backend-neutral connection source, carrying
-    // the per-connection identity resolver. The live in-pod proxy still
-    // accepts directly (see `InPodMediationIngress`); this satisfies the
-    // contract shape, and a delegated backend supplies a transport-backed
-    // version.
-    let mediation_ingress: Arc<dyn MediationIngress> = Arc::new(InPodMediationIngress {
-        _identity: ProcfsIdentityResolver {
-            entrypoint_pid: config.entrypoint_pid.clone(),
-        },
-    });
-
     Ok(InPodBound {
         config,
         sandbox,
         #[cfg(target_os = "linux")]
         netns,
-        networking,
-        mediation_ingress,
+        network_mediation_source,
+        runtime,
     })
 }
 
@@ -276,34 +271,32 @@ async fn establish(
 // ============================================================================
 
 /// Bound: the descriptor and trusted sandbox context are bound to this process's
-/// boundary, and the mediation ingress is available. No untrusted workload code
+/// boundary, and the mediation source is available. No untrusted workload code
 /// is running.
 struct InPodBound {
     config: InPodConfig,
     sandbox: SandboxContext,
     #[cfg(target_os = "linux")]
     netns: Option<NetworkNamespace>,
-    networking: Option<Networking>,
-    mediation_ingress: Arc<dyn MediationIngress>,
+    network_mediation_source: Arc<dyn NetworkMediationSource>,
+    runtime: Arc<openshell_supervisor_process::boundary_io::BoundaryRuntimeState>,
 }
 
 #[async_trait]
 impl BoundBoundary for InPodBound {
-    fn mediation_ingress(&self) -> Arc<dyn MediationIngress> {
-        self.mediation_ingress.clone()
+    fn network_mediation_source(&self) -> Arc<dyn NetworkMediationSource> {
+        self.network_mediation_source.clone()
     }
 
     async fn confirm(self: Box<Self>) -> Result<Box<dyn ReadyBoundary>, BackendError> {
-        // Effective-mediation check (fail closed). In proxy mode the only egress
-        // is through the proxy bound inside the workload netns; if the namespace
-        // or the proxy listener is absent, the boundary does not safely gate
-        // egress, so we must not produce Ready.
-        //
-        // Note: this confirms mediation *structure*. The nftables bypass-
-        // detection ruleset still uses `policy accept` with protocol-specific
-        // rejects (see `netns/nft_ruleset.rs`); hardening it to a true
-        // default-deny is tracked as remaining implementation work and is NOT
-        // certified here.
+        if !self.config.process_enabled {
+            return Err(BackendError::Confirm(
+                "the co-located backend requires the process supervisor leaf".to_string(),
+            ));
+        }
+        // Structural-mediation check (fail closed). The proxy listener must be
+        // connected and the live default-deny ceiling must still be present
+        // before the backend advances its lifecycle.
         if self.config.network_enabled
             && matches!(self.sandbox.policy.network.mode, NetworkMode::Proxy)
         {
@@ -314,14 +307,26 @@ impl BoundBoundary for InPodBound {
                         .to_string(),
                 ));
             }
-            let proxy_up = self
-                .networking
-                .as_ref()
-                .and_then(|n| n.proxy.as_ref())
-                .is_some();
-            if !proxy_up {
+            #[cfg(target_os = "linux")]
+            if let Some(netns) = self.netns.as_ref() {
+                let proxy_port = self
+                    .sandbox
+                    .policy
+                    .network
+                    .proxy
+                    .as_ref()
+                    .and_then(|proxy| proxy.http_addr)
+                    .map_or(3128, |address| address.port());
+                netns
+                    .egress_ceiling_verifier()
+                    .verify_bounded(proxy_port, std::time::Duration::from_secs(2))
+                    .await
+                    .map_err(|error| BackendError::Confirm(error.to_string()))?;
+            }
+            if !self.config.mediation_ready.load(Ordering::Acquire) {
                 return Err(BackendError::Confirm(
-                    "proxy listener is not bound; egress mediation is not in effect".to_string(),
+                    "the supervisor has not connected network mediation to the boundary source"
+                        .to_string(),
                 ));
             }
         }
@@ -331,7 +336,7 @@ impl BoundBoundary for InPodBound {
             sandbox: self.sandbox,
             #[cfg(target_os = "linux")]
             netns: self.netns,
-            networking: self.networking,
+            runtime: self.runtime,
         }))
     }
 }
@@ -343,7 +348,7 @@ struct InPodReady {
     sandbox: SandboxContext,
     #[cfg(target_os = "linux")]
     netns: Option<NetworkNamespace>,
-    networking: Option<Networking>,
+    runtime: Arc<openshell_supervisor_process::boundary_io::BoundaryRuntimeState>,
 }
 
 #[async_trait]
@@ -352,25 +357,45 @@ impl ReadyBoundary for InPodReady {
         let this = *self;
         let config = this.config;
         let sandbox = this.sandbox;
+        let runtime = this.runtime;
         #[cfg(target_os = "linux")]
         let netns = this.netns;
-        let networking = this.networking;
 
         #[cfg(target_os = "linux")]
-        let netns_fd = netns.as_ref().and_then(NetworkNamespace::ns_fd);
-        #[cfg(not(target_os = "linux"))]
-        let netns_fd: Option<std::os::unix::io::RawFd> = None;
-
-        let port_forward: Arc<dyn BoundaryPortForward> = Arc::new(NetnsPortForward { netns_fd });
-        let exec: Arc<dyn BoundaryExec> = Arc::new(InPodExec);
+        let enforcement_monitor = if let Some(netns) = netns.as_ref()
+            && matches!(sandbox.policy.network.mode, NetworkMode::Proxy)
+        {
+            let proxy_port = sandbox
+                .policy
+                .network
+                .proxy
+                .as_ref()
+                .and_then(|proxy| proxy.http_addr)
+                .map_or(3128, |address| address.port());
+            Some(
+                start_egress_ceiling_monitor(
+                    netns.egress_ceiling_verifier(),
+                    proxy_port,
+                    runtime.clone(),
+                    config.require_exclusive_pid_namespace,
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
 
         // The in-pod backend creates the agent process itself; the launch-time
         // controls (Landlock, seccomp, privilege drop) are applied inside
         // `spawn_workload`'s pre-exec ceiling, before the first untrusted
         // instruction.
-        let agent: Arc<dyn BoundaryProcess> = if config.process_enabled {
+        let (agent, exec, port_forward): (
+            Arc<dyn BoundaryProcess>,
+            Arc<dyn BoundaryExec>,
+            Arc<dyn BoundaryPortForward>,
+        ) = {
             let spec = &sandbox.agent;
-            let ca_file_paths = networking.as_ref().and_then(|n| n.ca_file_paths.clone());
+            let ca_file_paths = config.ca_file_paths.lock().expect("ca paths lock").clone();
             let provider_env = config
                 .provider_env
                 .lock()
@@ -403,6 +428,7 @@ impl ReadyBoundary for InPodReady {
                 // shared with a separate network-sidecar container.
                 false,
                 &sandbox.policy,
+                config.resolved_process_identity,
                 config.process_enforcement_mode,
                 config.entrypoint_pid.clone(),
                 // No sidecar control channel awaits the in-pod entrypoint PID.
@@ -410,29 +436,37 @@ impl ReadyBoundary for InPodReady {
                 config.provider_credentials.clone(),
                 provider_env,
                 ca_file_paths,
+                config.agent_proposals.clone(),
                 #[cfg(target_os = "linux")]
                 netns.as_ref(),
                 #[cfg(target_os = "linux")]
                 bypass_denial_tx,
                 #[cfg(target_os = "linux")]
                 bypass_activity_tx,
+                Some(runtime.clone()),
             )
             .await
-            .map_err(|e| BackendError::Process(e.to_string()))?;
+            .map_err(|error| {
+                runtime.deactivate();
+                BackendError::Process(error.to_string())
+            })?;
 
-            Arc::new(InPodAgentProcess::running(spawned))
-        } else {
-            // Network-only (sidecar/legacy) mode: no workload in this pod. The
-            // boundary is held open until a shutdown signal. This is a legacy
-            // split mode, not a gated external workload.
-            Arc::new(InPodAgentProcess::hold_open())
+            let exec = spawned.boundary_exec();
+            let port_forward = spawned.port_forward();
+            (
+                Arc::new(InPodAgentProcess::running(spawned)),
+                exec,
+                port_forward,
+            )
         };
 
         Ok(Box::new(InPodRunning {
             agent,
             exec,
             port_forward,
-            _networking: networking,
+            runtime,
+            #[cfg(target_os = "linux")]
+            _enforcement_monitor: enforcement_monitor,
             #[cfg(target_os = "linux")]
             _netns: netns,
         }))
@@ -440,19 +474,153 @@ impl ReadyBoundary for InPodReady {
 }
 
 /// Running: the agent is runnable behind the boundary. Exec, forwarding, wait,
-/// and signal are available. The mediation ingress was retained by the
+/// and signal are available. The mediation source was retained by the
 /// supervisor from the `Bound` state.
 struct InPodRunning {
     agent: Arc<dyn BoundaryProcess>,
     exec: Arc<dyn BoundaryExec>,
     port_forward: Arc<dyn BoundaryPortForward>,
-    /// Held to keep the proxy task and network namespace alive for the boundary's
-    /// life; dropping the running state tears them down (RAII), which is the
+    runtime: Arc<openshell_supervisor_process::boundary_io::BoundaryRuntimeState>,
+    #[cfg(target_os = "linux")]
+    _enforcement_monitor: Option<EnforcementMonitorGuard>,
+    /// Held to keep the network namespace alive for the boundary's life;
+    /// dropping the running state tears it down (RAII), which is the
     /// backend reclaiming backend-private state — the contract defines no public
     /// cleanup transition.
-    _networking: Option<Networking>,
     #[cfg(target_os = "linux")]
     _netns: Option<NetworkNamespace>,
+}
+
+#[cfg(target_os = "linux")]
+async fn start_egress_ceiling_monitor(
+    verifier: openshell_supervisor_process::netns::EgressCeilingVerifier,
+    proxy_port: u16,
+    runtime: Arc<openshell_supervisor_process::boundary_io::BoundaryRuntimeState>,
+    exit_execution_environment_on_loss: bool,
+) -> Result<EnforcementMonitorGuard, BackendError> {
+    let verify: EnforcementCheck = Arc::new(move || {
+        let verifier = verifier.clone();
+        Box::pin(async move {
+            verifier
+                .verify_bounded(proxy_port, std::time::Duration::from_secs(2))
+                .await
+                .map_err(|error| error.to_string())
+        })
+    });
+    start_enforcement_monitor(
+        runtime,
+        std::time::Duration::from_millis(250),
+        verify,
+        exit_execution_environment_on_loss,
+    )
+    .await
+}
+
+#[cfg(target_os = "linux")]
+type EnforcementCheck = Arc<
+    dyn Fn() -> std::pin::Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'static>>
+        + Send
+        + Sync,
+>;
+
+#[cfg(target_os = "linux")]
+async fn start_enforcement_monitor(
+    runtime: Arc<openshell_supervisor_process::boundary_io::BoundaryRuntimeState>,
+    period: std::time::Duration,
+    verify: EnforcementCheck,
+    exit_execution_environment_on_loss: bool,
+) -> Result<EnforcementMonitorGuard, BackendError> {
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let task = tokio::spawn(async move {
+        if let Err(error) = verify().await {
+            let _ = ready_tx.send(Err(error.clone()));
+            if runtime.deactivate_for_enforcement_loss() {
+                report_enforcement_loss(&error);
+                exit_execution_environment(exit_execution_environment_on_loss);
+            }
+            return;
+        }
+        if ready_tx.send(Ok(())).is_err() {
+            runtime.deactivate();
+            return;
+        }
+        let mut interval = tokio::time::interval(period);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        interval.tick().await;
+        while runtime.is_active() {
+            interval.tick().await;
+            if let Err(error) = verify().await {
+                if runtime.deactivate_for_enforcement_loss() {
+                    report_enforcement_loss(&error);
+                    exit_execution_environment(exit_execution_environment_on_loss);
+                }
+                break;
+            }
+        }
+    });
+    ready_rx
+        .await
+        .map_err(|_| BackendError::Confirm("egress monitor failed to start".to_string()))?
+        .map_err(BackendError::Confirm)?;
+    Ok(EnforcementMonitorGuard { task })
+}
+
+#[cfg(target_os = "linux")]
+fn exit_execution_environment(enabled: bool) {
+    if enabled {
+        // This backend admits only an exclusive workload PID namespace with
+        // the supervisor as PID 1. Exiting its init process makes the kernel
+        // terminate every remaining process in that execution environment,
+        // including descendants that changed process group or session.
+        std::process::exit(125);
+    }
+}
+
+#[cfg(target_os = "linux")]
+struct EnforcementMonitorGuard {
+    task: tokio::task::JoinHandle<()>,
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for EnforcementMonitorGuard {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn report_enforcement_loss(error: &str) {
+    let message = format!(
+        "Isolation boundary lost its default-deny egress ceiling; terminating workloads [error:{error}]"
+    );
+    openshell_ocsf::ocsf_emit!(
+        openshell_ocsf::ConfigStateChangeBuilder::new(crate::ocsf_ctx())
+            .severity(openshell_ocsf::SeverityId::High)
+            .status(openshell_ocsf::StatusId::Failure)
+            .state(openshell_ocsf::StateId::Disabled, "enforcement_lost")
+            .message(message.clone())
+            .build()
+    );
+    openshell_ocsf::ocsf_emit!(
+        openshell_ocsf::DetectionFindingBuilder::new(crate::ocsf_ctx())
+            .activity(openshell_ocsf::ActivityId::Open)
+            .action(openshell_ocsf::ActionId::Denied)
+            .disposition(openshell_ocsf::DispositionId::Blocked)
+            .severity(openshell_ocsf::SeverityId::High)
+            .is_alert(true)
+            .finding_info(openshell_ocsf::FindingInfo::new(
+                "isolation-egress-enforcement-lost",
+                "Isolation egress enforcement lost",
+            ))
+            .message(message)
+            .build()
+    );
+}
+
+impl Drop for InPodRunning {
+    fn drop(&mut self) {
+        self.runtime.deactivate();
+    }
 }
 
 impl RunningBoundary for InPodRunning {
@@ -475,31 +643,59 @@ impl RunningBoundary for InPodRunning {
 /// terminal status across repeated calls; signals go through the lock-free
 /// pid-based [`AgentSignaler`] so they never contend with an in-flight `wait`.
 struct InPodAgentProcess {
-    pid: Option<u32>,
     signaler: Option<AgentSignaler>,
-    waiter: tokio::sync::Mutex<AgentWaitState>,
+    result: Arc<Mutex<Option<Result<BoundaryExitStatus, StableWaitError>>>>,
+    exited: Arc<tokio::sync::Notify>,
+    terminal: Arc<AtomicBool>,
+    runtime: Arc<openshell_supervisor_process::boundary_io::BoundaryRuntimeState>,
 }
 
-enum AgentWaitState {
-    Running(SpawnedAgent),
-    HoldOpen,
-    Done(BoundaryExitStatus),
+#[derive(Clone)]
+enum StableWaitError {
+    Process(String),
+    EnforcementLost,
 }
 
 impl InPodAgentProcess {
     fn running(spawned: SpawnedAgent) -> Self {
+        let signaler = spawned.signaler();
+        let runtime = spawned.boundary_runtime();
+        let result = Arc::new(Mutex::new(None));
+        let exited = Arc::new(tokio::sync::Notify::new());
+        let result_for_wait = result.clone();
+        let exited_for_wait = exited.clone();
+        let terminal = Arc::new(AtomicBool::new(false));
+        let terminal_for_wait = terminal.clone();
+        let runtime_for_wait = runtime.clone();
+        tokio::spawn(async move {
+            let mut spawned = spawned;
+            let waited = spawned
+                .wait()
+                .await
+                .map_err(|error| StableWaitError::Process(error.to_string()))
+                .map(|process_status| {
+                    process_status.signal().map_or_else(
+                        || BoundaryExitStatus::Exited(process_status.code()),
+                        BoundaryExitStatus::Signaled,
+                    )
+                });
+            let waited = if runtime_for_wait.enforcement_was_lost() {
+                Err(StableWaitError::EnforcementLost)
+            } else {
+                waited
+            };
+            terminal_for_wait.store(true, Ordering::Release);
+            if let Ok(mut slot) = result_for_wait.lock() {
+                *slot = Some(waited);
+            }
+            exited_for_wait.notify_waiters();
+        });
         Self {
-            pid: Some(spawned.pid()),
-            signaler: Some(spawned.signaler()),
-            waiter: tokio::sync::Mutex::new(AgentWaitState::Running(spawned)),
-        }
-    }
-
-    fn hold_open() -> Self {
-        Self {
-            pid: None,
-            signaler: None,
-            waiter: tokio::sync::Mutex::new(AgentWaitState::HoldOpen),
+            signaler: Some(signaler),
+            result,
+            exited,
+            terminal,
+            runtime,
         }
     }
 }
@@ -507,31 +703,31 @@ impl InPodAgentProcess {
 #[async_trait]
 impl BoundaryProcess for InPodAgentProcess {
     async fn wait(&self) -> Result<BoundaryExitStatus, BackendError> {
-        // Holding the lock across the wait serializes repeated callers: the first
-        // performs the wait and caches the status; later callers block on the
-        // lock, then observe the cached `Done`. Signals never take this lock.
-        let mut guard = self.waiter.lock().await;
-        match &mut *guard {
-            AgentWaitState::Done(status) => Ok(*status),
-            AgentWaitState::HoldOpen => {
-                crate::wait_for_shutdown_signal().await;
-                let status = BoundaryExitStatus::Exited(0);
-                *guard = AgentWaitState::Done(status);
-                Ok(status)
+        loop {
+            let notified = self.exited.notified();
+            let result = self
+                .result
+                .lock()
+                .map_err(|_| BackendError::Process("agent result lock poisoned".to_string()))?
+                .clone();
+            if let Some(result) = result {
+                self.terminal.store(true, Ordering::Release);
+                return result.map_err(|error| match error {
+                    StableWaitError::Process(message) => BackendError::Process(message),
+                    StableWaitError::EnforcementLost => BackendError::Terminated(
+                        "required isolation enforcement was lost".to_string(),
+                    ),
+                });
             }
-            AgentWaitState::Running(agent) => {
-                let code = agent
-                    .wait()
-                    .await
-                    .map_err(|e| BackendError::Process(e.to_string()))?;
-                let status = BoundaryExitStatus::Exited(code);
-                *guard = AgentWaitState::Done(status);
-                Ok(status)
-            }
+            notified.await;
         }
     }
 
     async fn signal(&self, signal: BoundarySignal) -> Result<(), BackendError> {
+        self.runtime.ensure_active()?;
+        if self.terminal.load(Ordering::Acquire) {
+            return Err(BackendError::Terminated("agent has exited".to_string()));
+        }
         let Some(signaler) = self.signaler.as_ref() else {
             // Network-only hold-open: no workload process to signal.
             return Ok(());
@@ -546,61 +742,70 @@ impl BoundaryProcess for InPodAgentProcess {
     }
 
     async fn terminate(&self) -> Result<(), BackendError> {
+        self.runtime.ensure_active()?;
+        if self.terminal.load(Ordering::Acquire) {
+            return Err(BackendError::Terminated("agent has exited".to_string()));
+        }
         let Some(signaler) = self.signaler.as_ref() else {
             return Ok(());
         };
         signaler
-            .term()
+            .kill()
             .map_err(|e| BackendError::Process(e.to_string()))
     }
-
-    fn diagnostic_pid(&self) -> Option<u32> {
-        self.pid
-    }
 }
 
 // ============================================================================
-// Exec (SSH adoption pending)
-// ============================================================================
-
-/// In-pod exec interface. The live SSH server still spawns workload shells
-/// directly (inside `spawn_workload`); routing those through an owned
-/// [`ExecSession`] (stdio/PTY/wait) is the remaining live-adoption refactor, so
-/// this returns an explicit error rather than a half-wired session.
-struct InPodExec;
-
-#[async_trait]
-impl BoundaryExec for InPodExec {
-    async fn exec(&self, _spec: ExecSpec) -> Result<ExecSession, BackendError> {
-        Err(BackendError::Process(
-            "in-pod BoundaryExec is not yet the live SSH exec path; SSH execs directly. \
-             Wiring ExecSession stdio/PTY through this interface is pending (see POC handoff)."
-                .to_string(),
-        ))
-    }
-}
-
-/// In-pod mediation ingress. The live in-pod proxy still accepts workload
-/// connections on its own listener inside the netns and resolves identity
-/// inline; routing those through `accept` — so every connection carries this
-/// resolver's per-connection [`BinaryIdentity`] result, and a delegated backend
-/// can deliver connections over its private transport instead — is the
-/// remaining live-adoption refactor, so this returns an explicit error rather
-/// than a competing accept loop.
-///
-/// [`BinaryIdentity`]: openshell_isolation::contract::BinaryIdentity
-struct InPodMediationIngress {
-    /// The per-connection resolver the adopted accept path will consult.
-    _identity: ProcfsIdentityResolver,
+/// In-pod mediation source: owns the listener and resolves trusted procfs
+/// identity for each accepted TCP connection before handing it to mediation.
+/// A stronger backend may use another resolution mechanism without changing
+/// the mediation contract.
+struct InPodNetworkMediationSource {
+    listener: tokio::net::TcpListener,
+    identity: ProcfsIdentityResolver,
+    runtime: Arc<openshell_supervisor_process::boundary_io::BoundaryRuntimeState>,
 }
 
 #[async_trait]
-impl MediationIngress for InPodMediationIngress {
+impl NetworkMediationSource for InPodNetworkMediationSource {
     async fn accept(&self) -> Result<MediatedConnection, BackendError> {
-        Err(BackendError::Process(
-            "in-pod MediationIngress is not yet the live proxy connection source; \
-             the proxy accepts directly (see POC handoff)."
-                .to_string(),
+        self.runtime.ensure_active()?;
+        let (stream, workload_addr) = self
+            .listener
+            .accept()
+            .await
+            .map_err(|error| BackendError::Unavailable(error.to_string()))?;
+        self.runtime.ensure_active()?;
+        let proxy_addr = stream
+            .local_addr()
+            .map_err(|error| BackendError::Unavailable(error.to_string()))?;
+        let resolver = self.identity.clone();
+        let binary_identity = tokio::task::spawn_blocking(move || {
+            resolver.resolve_connection(workload_addr, proxy_addr)
+        })
+        .await
+        .map_err(|error| BackendError::Unavailable(error.to_string()))?;
+        self.runtime.ensure_active()?;
+        Ok(MediatedConnection {
+            stream: Box::new(stream),
+            binary_identity,
+        })
+    }
+}
+
+/// A topology with no proxy listener has no mediated connections. Calling
+/// `accept` is an orchestration error, so fail closed rather than fabricating a
+/// connection.
+struct InactiveNetworkMediationSource {
+    runtime: Arc<openshell_supervisor_process::boundary_io::BoundaryRuntimeState>,
+}
+
+#[async_trait]
+impl NetworkMediationSource for InactiveNetworkMediationSource {
+    async fn accept(&self) -> Result<MediatedConnection, BackendError> {
+        self.runtime.ensure_active()?;
+        Err(BackendError::Unavailable(
+            "network mediation is inactive for this admitted network mode".to_string(),
         ))
     }
 }
@@ -673,14 +878,14 @@ mod tests {
     use openshell_isolation::AgentSpec;
     use openshell_isolation::contract::{BackendRegistry, TopologyDescriptor};
 
-    /// A minimal in-pod config with networking and the workload disabled, so the
-    /// lifecycle runs without root, a network namespace, or a gateway.
+    /// A minimal in-pod config with networking disabled. The process leaf is
+    /// declared available so `confirm` can certify launch readiness, but tests
+    /// that use this fixture do not call `start_agent`.
     fn minimal_config() -> InPodConfig {
         InPodConfig {
+            require_exclusive_pid_namespace: false,
             network_enabled: false,
-            process_enabled: false,
-            opa_engine: None,
-            retained_proto: None,
+            process_enabled: true,
             entrypoint_pid: Arc::new(AtomicU32::new(0)),
             provider_credentials: ProviderCredentialState::from_environment(
                 0,
@@ -690,18 +895,20 @@ mod tests {
             ),
             provider_env: Mutex::new(HashMap::new()),
             process_enforcement_mode: ProcessEnforcementMode::Full,
-            sandbox_name: None,
+            resolved_process_identity: ResolvedProcessIdentity::new(
+                Some(nix::unistd::geteuid().as_raw()),
+                Some(nix::unistd::getegid().as_raw()),
+            ),
+            agent_proposals: AgentProposals::new(false),
             openshell_endpoint: None,
-            inference_routes: None,
             ssh_socket_path: None,
-            workspace_rx: tokio::sync::watch::channel(String::new()).1,
-            denial_tx: Mutex::new(None),
-            activity_tx: Mutex::new(None),
             #[cfg(target_os = "linux")]
             bypass_denial_tx: Mutex::new(None),
             #[cfg(target_os = "linux")]
             bypass_activity_tx: Mutex::new(None),
-            policy_local_slot: Arc::new(Mutex::new(None)),
+            mediation_ready: Arc::new(AtomicBool::new(true)),
+            ca_file_paths: Arc::new(Mutex::new(None)),
+            proxy_bind_ip: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -720,8 +927,8 @@ mod tests {
 
     fn descriptor() -> TopologyDescriptor {
         TopologyDescriptor {
-            contract_version: CONTRACT_VERSION,
-            backend_id: IN_POD_BACKEND_ID.to_string(),
+            version: INTERFACE_VERSION,
+            backend_name: IN_POD_BACKEND_NAME.to_string(),
             payload: Vec::new(),
         }
     }
@@ -740,36 +947,36 @@ mod tests {
         }
     }
 
-    // ----- Factory and registry -----
+    // ----- Backend and registry -----
 
     #[test]
-    fn factory_speaks_the_contract_version() {
-        let factory = InPodBackendFactory::new(minimal_config());
-        assert_eq!(factory.backend_id(), IN_POD_BACKEND_ID);
-        assert_eq!(factory.contract_version(), CONTRACT_VERSION);
+    fn backend_speaks_the_version() {
+        let backend = InPodBackend::new(minimal_config());
+        assert_eq!(backend.backend_name(), IN_POD_BACKEND_NAME);
+        assert_eq!(backend.version(), INTERFACE_VERSION);
     }
 
     #[test]
     fn registry_selects_in_pod_backend() {
         let mut registry = BackendRegistry::new();
         registry
-            .register(Arc::new(InPodBackendFactory::new(minimal_config())))
+            .register(Arc::new(InPodBackend::new(minimal_config())))
             .expect("register");
-        let (factory, _verified) = registry
-            .resolve(descriptor(), IN_POD_BACKEND_ID)
+        let (backend, _verified) = registry
+            .resolve(descriptor(), IN_POD_BACKEND_NAME)
             .expect("resolve");
-        assert_eq!(factory.backend_id(), IN_POD_BACKEND_ID);
+        assert_eq!(backend.backend_name(), IN_POD_BACKEND_NAME);
     }
 
     #[test]
     fn registry_rejects_duplicate_in_pod() {
         let mut registry = BackendRegistry::new();
         registry
-            .register(Arc::new(InPodBackendFactory::new(minimal_config())))
+            .register(Arc::new(InPodBackend::new(minimal_config())))
             .expect("first register");
         assert!(
             registry
-                .register(Arc::new(InPodBackendFactory::new(minimal_config())))
+                .register(Arc::new(InPodBackend::new(minimal_config())))
                 .is_err()
         );
     }
@@ -778,7 +985,7 @@ mod tests {
     fn registry_rejects_admission_mismatch() {
         let mut registry = BackendRegistry::new();
         registry
-            .register(Arc::new(InPodBackendFactory::new(minimal_config())))
+            .register(Arc::new(InPodBackend::new(minimal_config())))
             .expect("register");
         // The descriptor names in-pod, but admission expects a different backend.
         assert!(
@@ -792,27 +999,96 @@ mod tests {
     // ----- Lifecycle (no root / no netns) -----
 
     /// Drive the real in-pod chain attach -> Bound -> confirm -> Ready and prove
-    /// the retained mediation ingress survives the consuming transitions.
+    /// the retained mediation source survives the consuming transitions.
     #[tokio::test]
-    async fn lifecycle_reaches_ready_and_retains_ingress() {
+    async fn lifecycle_reaches_ready_and_retains_source() {
         let mut registry = BackendRegistry::new();
         registry
-            .register(Arc::new(InPodBackendFactory::new(minimal_config())))
+            .register(Arc::new(InPodBackend::new(minimal_config())))
             .expect("register");
-        let (factory, verified) = registry
-            .resolve(descriptor(), IN_POD_BACKEND_ID)
+        let (backend, verified) = registry
+            .resolve(descriptor(), IN_POD_BACKEND_NAME)
             .expect("resolve");
 
-        let bound = factory
+        let bound = backend
             .attach(verified, sandbox_context())
             .await
             .expect("attach");
-        let ingress = bound.mediation_ingress();
+        let source = bound.network_mediation_source();
         let _ready = bound.confirm().await.expect("confirm");
-        // The retained ingress remains usable after `Bound` is consumed; the
-        // in-pod accept adoption is pending, so it reports an explicit error
-        // rather than a half-wired connection.
-        assert!(ingress.accept().await.is_err());
+        // Block mode has no connection source, so a retained accept fails
+        // closed after `Bound` is consumed.
+        assert!(source.accept().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn live_source_accepts_stream_and_carries_fail_closed_identity() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let source = Arc::new(InPodNetworkMediationSource {
+            listener,
+            identity: ProcfsIdentityResolver {
+                entrypoint_pid: Arc::new(AtomicU32::new(0)),
+            },
+            runtime: openshell_supervisor_process::boundary_io::BoundaryRuntimeState::new(),
+        });
+        let client = tokio::spawn(async move {
+            let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+            stream.write_all(b"ping").await.unwrap();
+        });
+        let mut connection = source.accept().await.expect("accept");
+        assert!(connection.binary_identity.is_err());
+        let mut bytes = [0_u8; 4];
+        connection.stream.read_exact(&mut bytes).await.unwrap();
+        assert_eq!(&bytes, b"ping");
+        client.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn pending_source_accept_rejects_connection_after_boundary_end() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let runtime = openshell_supervisor_process::boundary_io::BoundaryRuntimeState::new();
+        let source = Arc::new(InPodNetworkMediationSource {
+            listener,
+            identity: ProcfsIdentityResolver {
+                entrypoint_pid: Arc::new(AtomicU32::new(0)),
+            },
+            runtime: runtime.clone(),
+        });
+        let pending = tokio::spawn({
+            let source = source.clone();
+            async move { source.accept().await }
+        });
+        tokio::task::yield_now().await;
+        runtime.deactivate();
+        let _client = tokio::net::TcpStream::connect(address).await.unwrap();
+        assert!(matches!(
+            pending.await.unwrap(),
+            Err(BackendError::Terminated(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn mediation_source_failure_is_fail_static_without_ending_the_boundary() {
+        let runtime = openshell_supervisor_process::boundary_io::BoundaryRuntimeState::new();
+        let source = InactiveNetworkMediationSource {
+            runtime: runtime.clone(),
+        };
+
+        assert!(matches!(
+            source.accept().await,
+            Err(BackendError::Unavailable(_))
+        ));
+        runtime
+            .ensure_active()
+            .expect("network failure must leave Running active");
+        assert!(matches!(
+            source.accept().await,
+            Err(BackendError::Unavailable(_))
+        ));
     }
 
     /// `attach` is atomic and never binds a resource that is already bound to an
@@ -821,21 +1097,21 @@ mod tests {
     async fn second_attach_is_denied() {
         let mut registry = BackendRegistry::new();
         registry
-            .register(Arc::new(InPodBackendFactory::new(minimal_config())))
+            .register(Arc::new(InPodBackend::new(minimal_config())))
             .expect("register");
 
-        let (factory, verified) = registry
-            .resolve(descriptor(), IN_POD_BACKEND_ID)
+        let (backend, verified) = registry
+            .resolve(descriptor(), IN_POD_BACKEND_NAME)
             .expect("resolve");
-        let _bound = factory
+        let _bound = backend
             .attach(verified, sandbox_context())
             .await
             .expect("first attach");
 
-        let (_factory2, verified2) = registry
-            .resolve(descriptor(), IN_POD_BACKEND_ID)
+        let (_backend2, verified2) = registry
+            .resolve(descriptor(), IN_POD_BACKEND_NAME)
             .expect("re-resolve");
-        let err = factory
+        let err = backend
             .attach(verified2, sandbox_context())
             .await
             .map(|_| ())
@@ -849,19 +1125,492 @@ mod tests {
     async fn non_empty_payload_is_rejected() {
         let mut registry = BackendRegistry::new();
         registry
-            .register(Arc::new(InPodBackendFactory::new(minimal_config())))
+            .register(Arc::new(InPodBackend::new(minimal_config())))
             .expect("register");
         let bad = TopologyDescriptor {
-            contract_version: CONTRACT_VERSION,
-            backend_id: IN_POD_BACKEND_ID.to_string(),
+            version: INTERFACE_VERSION,
+            backend_name: IN_POD_BACKEND_NAME.to_string(),
             payload: vec![1, 2, 3],
         };
-        let (factory, verified) = registry.resolve(bad, IN_POD_BACKEND_ID).expect("resolve");
-        let err = factory
+        let (backend, verified) = registry.resolve(bad, IN_POD_BACKEND_NAME).expect("resolve");
+        let err = backend
             .attach(verified, sandbox_context())
             .await
             .map(|_| ())
             .expect_err("payload must be rejected");
         assert!(matches!(err, BackendError::Descriptor(_)));
+    }
+
+    #[tokio::test]
+    async fn unrestricted_network_mode_is_not_admitted() {
+        let backend = Arc::new(InPodBackend::new(minimal_config()));
+        let mut registry = BackendRegistry::new();
+        registry.register(backend.clone()).expect("register");
+        let (_resolved, verified) = registry
+            .resolve(descriptor(), IN_POD_BACKEND_NAME)
+            .expect("resolve");
+        let mut sandbox = sandbox_context();
+        sandbox.policy.network.mode = NetworkMode::Allow;
+        let error = backend
+            .attach(verified, sandbox)
+            .await
+            .map(|_| ())
+            .expect_err("unrestricted egress cannot conform");
+        assert_eq!(
+            error.kind(),
+            openshell_isolation::contract::BackendErrorKind::Denied
+        );
+    }
+
+    #[tokio::test]
+    async fn confirm_rejects_missing_launch_control_leaf() {
+        let mut config = minimal_config();
+        config.process_enabled = false;
+        let backend = Arc::new(InPodBackend::new(config));
+        let mut registry = BackendRegistry::new();
+        registry.register(backend.clone()).expect("register");
+        let (_resolved, verified) = registry
+            .resolve(descriptor(), IN_POD_BACKEND_NAME)
+            .expect("resolve");
+        let bound = backend
+            .attach(verified, sandbox_context())
+            .await
+            .expect("attach");
+        let error = bound
+            .confirm()
+            .await
+            .map(|_| ())
+            .expect_err("Ready requires launch controls");
+        assert!(matches!(error, BackendError::Confirm(_)));
+    }
+
+    #[tokio::test]
+    async fn failed_agent_start_ends_boundary_and_invalidates_retained_source() {
+        let mut registry = BackendRegistry::new();
+        registry
+            .register(Arc::new(InPodBackend::new(minimal_config())))
+            .expect("register");
+        let (backend, verified) = registry
+            .resolve(descriptor(), IN_POD_BACKEND_NAME)
+            .expect("resolve");
+        let mut sandbox = sandbox_context();
+        sandbox.agent.program = "/definitely/missing/openshell-agent".to_string();
+        let bound = backend.attach(verified, sandbox).await.expect("attach");
+        let source = bound.network_mediation_source();
+        let ready = bound.confirm().await.expect("confirm");
+        assert!(matches!(
+            ready.start_agent().await,
+            Err(BackendError::Process(_))
+        ));
+        assert!(matches!(
+            source.accept().await,
+            Err(BackendError::Terminated(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn normal_agent_exit_invalidates_runtime_interfaces() {
+        let mut registry = BackendRegistry::new();
+        registry
+            .register(Arc::new(InPodBackend::new(minimal_config())))
+            .expect("register");
+        let (backend, verified) = registry
+            .resolve(descriptor(), IN_POD_BACKEND_NAME)
+            .expect("resolve");
+        let bound = backend
+            .attach(verified, sandbox_context())
+            .await
+            .expect("attach");
+        let source = bound.network_mediation_source();
+        let ready = bound.confirm().await.expect("confirm");
+        let running = ready.start_agent().await.expect("start agent");
+        let agent = running.agent();
+        let exec = running.exec();
+        let forward = running.port_forward();
+
+        assert_eq!(
+            agent.wait().await.expect("normal exit"),
+            BoundaryExitStatus::Exited(0)
+        );
+        assert!(matches!(
+            exec.exec(openshell_isolation::contract::ExecSpec {
+                program: "/bin/true".to_string(),
+                args: vec![],
+                env: vec![],
+                workdir: None,
+                pty: false,
+            })
+            .await,
+            Err(BackendError::Terminated(_))
+        ));
+        let target = openshell_isolation::contract::LoopbackTarget::new(
+            std::net::Ipv4Addr::LOCALHOST.into(),
+            1,
+        )
+        .expect("loopback target");
+        assert!(matches!(
+            forward.connect(target).await,
+            Err(BackendError::Terminated(_))
+        ));
+        assert!(matches!(
+            source.accept().await,
+            Err(BackendError::Terminated(_))
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn enforcement_monitor_terminates_boundary_after_verification_loss() {
+        let runtime = openshell_supervisor_process::boundary_io::BoundaryRuntimeState::new();
+        let healthy = Arc::new(AtomicBool::new(true));
+        let verify: EnforcementCheck = {
+            let healthy = healthy.clone();
+            Arc::new(move || {
+                let healthy = healthy.clone();
+                Box::pin(async move {
+                    if healthy.load(Ordering::Acquire) {
+                        Ok(())
+                    } else {
+                        Err("test enforcement loss".to_string())
+                    }
+                })
+            })
+        };
+        let _monitor = start_enforcement_monitor(
+            runtime.clone(),
+            std::time::Duration::from_millis(5),
+            verify,
+            false,
+        )
+        .await
+        .expect("initial enforcement verification");
+        tokio::time::sleep(std::time::Duration::from_millis(15)).await;
+        runtime.ensure_active().expect("healthy enforcement");
+
+        healthy.store(false, Ordering::Release);
+        tokio::time::timeout(std::time::Duration::from_millis(100), async {
+            while runtime.is_active() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("monitor must terminate within its bound");
+        assert!(runtime.ensure_active().is_err());
+        assert!(runtime.enforcement_was_lost());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn enforcement_loss_kills_registered_workload_within_bound() {
+        use std::os::unix::process::CommandExt as _;
+
+        let runtime = openshell_supervisor_process::boundary_io::BoundaryRuntimeState::new();
+        let mut command = std::process::Command::new("/bin/sleep");
+        command.arg("30").process_group(0);
+        let mut child = command.spawn().expect("spawn workload process");
+        runtime
+            .register_process_group(
+                child.id(),
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(Mutex::new(())),
+            )
+            .expect("register workload process group");
+
+        let healthy = Arc::new(AtomicBool::new(true));
+        let verify: EnforcementCheck = {
+            let healthy = healthy.clone();
+            Arc::new(move || {
+                let healthy = healthy.clone();
+                Box::pin(async move {
+                    healthy
+                        .load(Ordering::Acquire)
+                        .then_some(())
+                        .ok_or_else(|| "test enforcement loss".to_string())
+                })
+            })
+        };
+        let _monitor = start_enforcement_monitor(
+            runtime.clone(),
+            std::time::Duration::from_millis(5),
+            verify,
+            false,
+        )
+        .await
+        .expect("initial verification");
+        healthy.store(false, Ordering::Release);
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                match child.try_wait() {
+                    Ok(Some(_)) => break,
+                    Ok(None) => {}
+                    Err(error) if error.raw_os_error() == Some(nix::libc::ECHILD) => break,
+                    Err(error) => panic!("wait workload: {error}"),
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("workload must terminate within the topology bound");
+        assert!(runtime.enforcement_was_lost());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires privileged PID namespace creation"]
+    #[allow(unsafe_code)]
+    #[allow(
+        clippy::zombie_processes,
+        reason = "PID 1 exits to make the kernel reap this deliberately unregistered descendant"
+    )]
+    fn pid_namespace_exit_helper() {
+        use std::io::Write as _;
+        use std::os::unix::process::CommandExt as _;
+
+        let Some(ready_path) = std::env::var_os("OPENSHELL_PIDNS_TEST_READY") else {
+            return;
+        };
+        let trigger_path = std::env::var_os("OPENSHELL_PIDNS_TEST_TRIGGER")
+            .expect("PID namespace helper trigger path");
+        let identity_socket = std::env::var_os("OPENSHELL_PIDNS_TEST_SOCKET")
+            .expect("PID namespace helper identity socket");
+        assert_eq!(std::process::id(), 1, "helper must be PID 1");
+        std::os::unix::net::UnixStream::connect(&identity_socket)
+            .expect("connect PID 1 identity socket")
+            .write_all(b"pid1")
+            .expect("publish PID 1 identity");
+        let mut command =
+            std::process::Command::new(std::env::current_exe().expect("current test executable"));
+        command
+            .args([
+                "--ignored",
+                "--exact",
+                "inpod::tests::pid_namespace_descendant_helper",
+                "--nocapture",
+            ])
+            .env("OPENSHELL_PIDNS_TEST_SOCKET", &identity_socket);
+        // SAFETY: `setsid` is async-signal-safe and has no captured state.
+        unsafe {
+            command.pre_exec(|| {
+                if nix::libc::setsid() >= 0 {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::last_os_error())
+                }
+            });
+        }
+        let _unregistered_descendant = command.spawn().expect("spawn setsid descendant");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("build monitor runtime");
+        runtime.block_on(async move {
+            let boundary = openshell_supervisor_process::boundary_io::BoundaryRuntimeState::new();
+            let healthy = Arc::new(AtomicBool::new(true));
+            let verify: EnforcementCheck = {
+                let healthy = healthy.clone();
+                Arc::new(move || {
+                    let healthy = healthy.clone();
+                    Box::pin(async move {
+                        healthy
+                            .load(Ordering::Acquire)
+                            .then_some(())
+                            .ok_or_else(|| "privileged test enforcement loss".to_string())
+                    })
+                })
+            };
+            let _monitor = start_enforcement_monitor(
+                boundary,
+                std::time::Duration::from_millis(5),
+                verify,
+                true,
+            )
+            .await
+            .expect("start enforcement monitor");
+            std::fs::write(&ready_path, b"ready").expect("publish helper readiness");
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while !std::path::Path::new(&trigger_path).exists() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "parent did not trigger enforcement loss"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            healthy.store(false, Ordering::Release);
+            std::future::pending::<()>().await;
+        });
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "helper for privileged PID namespace test"]
+    fn pid_namespace_descendant_helper() {
+        use std::io::Write as _;
+
+        let Some(socket_path) = std::env::var_os("OPENSHELL_PIDNS_TEST_SOCKET") else {
+            return;
+        };
+        std::os::unix::net::UnixStream::connect(socket_path)
+            .expect("connect descendant identity socket")
+            .write_all(b"descendant")
+            .expect("publish descendant identity");
+        loop {
+            std::thread::park();
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires privileged PID namespace creation"]
+    fn pid_one_exit_kills_unregistered_setsid_descendant_within_bound() {
+        fn process_is_running(pid: u32) -> bool {
+            let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+                return false;
+            };
+            let Some((_, fields)) = stat.rsplit_once(") ") else {
+                return false;
+            };
+            !matches!(fields.as_bytes().first(), Some(b'Z' | b'X'))
+        }
+
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let ready = tempdir.path().join("ready");
+        let trigger = tempdir.path().join("trigger");
+        let identity_socket = tempdir.path().join("identity.sock");
+        let listener =
+            std::os::unix::net::UnixListener::bind(&identity_socket).expect("bind identity socket");
+        listener
+            .set_nonblocking(true)
+            .expect("set identity socket nonblocking");
+        let current_exe = std::env::current_exe().expect("current test executable");
+        let mut namespace = std::process::Command::new("unshare")
+            .args(["--mount", "--pid", "--fork", "--kill-child", "--mount-proc"])
+            .arg(current_exe)
+            .args([
+                "--ignored",
+                "--exact",
+                "inpod::tests::pid_namespace_exit_helper",
+                "--nocapture",
+            ])
+            .env("OPENSHELL_PIDNS_TEST_READY", &ready)
+            .env("OPENSHELL_PIDNS_TEST_TRIGGER", &trigger)
+            .env("OPENSHELL_PIDNS_TEST_SOCKET", &identity_socket)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("start isolated PID namespace");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut isolated = Vec::new();
+        while !ready.exists() || isolated.len() < 2 {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
+
+                    let credentials = getsockopt(&stream, PeerCredentials)
+                        .expect("read namespaced process credentials");
+                    isolated.push(u32::try_from(credentials.pid()).expect("positive peer PID"));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(error) => panic!("accept identity connection: {error}"),
+            }
+            if let Some(status) = namespace.try_wait().expect("poll namespace") {
+                let stderr = namespace
+                    .stderr
+                    .take()
+                    .and_then(|mut stderr| {
+                        use std::io::Read as _;
+                        let mut output = String::new();
+                        stderr.read_to_string(&mut output).ok()?;
+                        Some(output)
+                    })
+                    .unwrap_or_default();
+                panic!("PID namespace helper exited early ({status}): {stderr}");
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "helper readiness timeout"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        assert_eq!(
+            isolated.len(),
+            2,
+            "expected PID 1 and its setsid descendant"
+        );
+        std::fs::write(&trigger, b"exit").expect("trigger PID 1 exit");
+        let status = namespace.wait().expect("wait for namespace exit");
+        assert_eq!(status.code(), Some(125));
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while isolated.iter().copied().any(process_is_running) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "namespace descendant survived the documented termination bound"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    #[tokio::test]
+    async fn wait_reports_enforcement_loss_as_terminated() {
+        let process = InPodAgentProcess {
+            signaler: None,
+            result: Arc::new(Mutex::new(Some(Err(StableWaitError::EnforcementLost)))),
+            exited: Arc::new(tokio::sync::Notify::new()),
+            terminal: Arc::new(AtomicBool::new(true)),
+            runtime: openshell_supervisor_process::boundary_io::BoundaryRuntimeState::new(),
+        };
+
+        let error = process
+            .wait()
+            .await
+            .expect_err("enforcement loss is abnormal");
+        assert_eq!(
+            error.kind(),
+            openshell_isolation::contract::BackendErrorKind::Terminated
+        );
+    }
+
+    #[tokio::test]
+    async fn normal_teardown_is_not_reclassified_by_inflight_verification() {
+        let runtime = openshell_supervisor_process::boundary_io::BoundaryRuntimeState::new();
+        let calls = Arc::new(AtomicU32::new(0));
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let verify: EnforcementCheck = {
+            let calls = calls.clone();
+            let entered = entered.clone();
+            let release = release.clone();
+            Arc::new(move || {
+                let calls = calls.clone();
+                let entered = entered.clone();
+                let release = release.clone();
+                Box::pin(async move {
+                    if calls.fetch_add(1, Ordering::AcqRel) == 0 {
+                        return Ok(());
+                    }
+                    entered.notify_one();
+                    release.notified().await;
+                    Err("verification completed after teardown".to_string())
+                })
+            })
+        };
+        let _monitor = start_enforcement_monitor(
+            runtime.clone(),
+            std::time::Duration::from_millis(1),
+            verify,
+            false,
+        )
+        .await
+        .expect("initial verification");
+        entered.notified().await;
+        runtime.deactivate();
+        release.notify_one();
+        tokio::task::yield_now().await;
+
+        assert!(!runtime.enforcement_was_lost());
     }
 }

@@ -257,7 +257,10 @@ const KUBERNETES_DRIVER_RESERVED_VOLUME_NAMES: &[&str] = &[
     WORKSPACE_VOLUME_NAME,
 ];
 
-const KUBERNETES_DRIVER_PROTECTED_MOUNT_PATHS: &[&str] = &[SERVICE_ACCOUNT_TOKEN_MOUNT_PATH];
+const KUBERNETES_DRIVER_PROTECTED_MOUNT_PATHS: &[&str] = &[
+    SERVICE_ACCOUNT_TOKEN_MOUNT_PATH,
+    openshell_core::driver_utils::SUPERVISOR_CONTAINER_DIR,
+];
 
 fn validate_kubernetes_driver_volumes(
     volumes: &[KubernetesDriverVolumeConfig],
@@ -1412,6 +1415,7 @@ fn extract_image_size(message: &str) -> Option<u64> {
 
 /// Path where the supervisor binary is mounted inside the agent container.
 const SUPERVISOR_MOUNT_PATH: &str = openshell_core::driver_utils::SUPERVISOR_CONTAINER_DIR;
+const IN_POD_ISOLATION_BACKEND_NAME: &str = "in-pod";
 
 /// Name of the volume used to side-load the supervisor binary.
 const SUPERVISOR_VOLUME_NAME: &str = "openshell-supervisor-bin";
@@ -1445,7 +1449,7 @@ const SIDECAR_TLS_VOLUME_NAME: &str = "openshell-supervisor-tls";
 const SIDECAR_TLS_MOUNT_PATH: &str = "/etc/openshell-tls/proxy";
 const SIDECAR_CLIENT_TLS_MOUNT_PATH: &str = "/etc/openshell-tls/proxy/client";
 
-/// Build the emptyDir volume that holds the supervisor binary.
+/// Build the emptyDir volume that holds the trusted supervisor runtime.
 ///
 /// The init container writes the binary here; the agent container reads it.
 fn supervisor_volume() -> serde_json::Value {
@@ -1455,7 +1459,7 @@ fn supervisor_volume() -> serde_json::Value {
     })
 }
 
-/// Build the read-only volume mount for the supervisor binary in the agent container.
+/// Build the read-only volume mount for the trusted supervisor runtime.
 fn supervisor_volume_mount() -> serde_json::Value {
     serde_json::json!({
         "name": SUPERVISOR_VOLUME_NAME,
@@ -1467,8 +1471,8 @@ fn supervisor_volume_mount() -> serde_json::Value {
 /// Build an image volume that mounts the supervisor OCI image directly.
 ///
 /// Requires Kubernetes >= v1.33 (`ImageVolume` beta) or >= v1.36 (GA).
-/// The entire image filesystem is mounted read-only, making the binary
-/// available at `{SUPERVISOR_MOUNT_PATH}/openshell-sandbox`.
+/// The entire image filesystem is mounted read-only, making the supervisor and
+/// its network-setup helpers available from one driver-controlled artifact.
 fn supervisor_image_volume(
     supervisor_image: &str,
     supervisor_image_pull_policy: &str,
@@ -1485,26 +1489,23 @@ fn supervisor_image_volume(
     })
 }
 
-/// Build the init container that copies the supervisor binary into the emptyDir.
+/// Build the init container that copies the trusted supervisor runtime into the emptyDir.
 ///
 /// The supervisor image contains the supervisor binary at `/openshell-sandbox`.
-/// We invoke that binary with the `copy-self` subcommand so it copies itself
-/// into the shared emptyDir volume, where the agent container then executes it
-/// from a fixed, writable path. This pattern (binary self-copy) avoids requiring
-/// `sh`/`cp` in the supervisor image and mirrors the approach used by argoexec's
-/// emissary executor.
+/// We invoke the supervisor's built-in installer so the binary, network helper
+/// binaries, and their libraries all come from the supervisor image. The agent
+/// container mounts the resulting volume read-only.
 fn supervisor_init_container(
     supervisor_image: &str,
     supervisor_image_pull_policy: &str,
 ) -> serde_json::Value {
-    let installed_path = format!("{SUPERVISOR_MOUNT_PATH}/openshell-sandbox");
     let mut spec = serde_json::json!({
         "name": SUPERVISOR_INIT_CONTAINER_NAME,
         "image": supervisor_image,
         "command": [
             SUPERVISOR_IMAGE_BINARY_PATH,
-            "copy-self",
-            installed_path,
+            "copy-runtime",
+            SUPERVISOR_MOUNT_PATH,
         ],
         "securityContext": {"runAsUser": 0},
         "volumeMounts": [{
@@ -1636,6 +1637,72 @@ fn apply_supervisor_sideload(
             apply_resolved_identity_env(env, sandbox_uid, sandbox_gid);
         }
     }
+}
+
+fn apply_topology_descriptor(pod_template: &mut serde_json::Value) -> bool {
+    let Some(containers) = pod_template
+        .pointer_mut("/spec/containers")
+        .and_then(serde_json::Value::as_array_mut)
+    else {
+        return false;
+    };
+    let index = containers
+        .iter()
+        .position(|container| container.get("name").and_then(|name| name.as_str()) == Some("agent"))
+        .unwrap_or(0);
+    let Some(container) = containers.get_mut(index) else {
+        return false;
+    };
+    let Some(command) = container
+        .get_mut("command")
+        .and_then(serde_json::Value::as_array_mut)
+    else {
+        return false;
+    };
+    remove_protected_topology_arguments(command);
+    command.extend([
+        serde_json::json!(format!(
+            "--topology-backend-name={IN_POD_ISOLATION_BACKEND_NAME}"
+        )),
+        serde_json::json!(format!(
+            "--topology-version={}",
+            openshell_isolation::contract::INTERFACE_VERSION
+        )),
+        serde_json::json!("--topology-payload-base64="),
+        serde_json::json!("--"),
+    ]);
+    true
+}
+
+fn remove_protected_topology_arguments(arguments: &mut Vec<serde_json::Value>) {
+    const PROTECTED: &[&str] = &[
+        // Strip the removed selector as well so an older or workload-supplied
+        // template cannot make the supervisor reject trusted provisioning.
+        "--isolation-backend",
+        "--topology-backend-name",
+        "--topology-version",
+        "--topology-payload-base64",
+    ];
+    let mut remove_value = false;
+    arguments.retain(|argument| {
+        if remove_value {
+            remove_value = false;
+            return false;
+        }
+        let Some(argument) = argument.as_str() else {
+            return true;
+        };
+        for protected in PROTECTED {
+            if argument == *protected {
+                remove_value = true;
+                return false;
+            }
+            if argument.starts_with(&format!("{protected}=")) {
+                return false;
+            }
+        }
+        true
+    });
 }
 
 fn sidecar_state_volume_mount() -> serde_json::Value {
@@ -1996,16 +2063,6 @@ fn apply_supervisor_sidecar_topology(
                 openshell_core::sandbox_env::SIDECAR_CONTROL_SOCKET,
                 SIDECAR_CONTROL_SOCKET,
             );
-            // RFC 0012: the agent container's supervisor resolves the sidecar
-            // backend, so override the default in-pod descriptor set by
-            // `apply_required_env`. (The network sidecar container keeps the
-            // in-pod default; it runs the mediation component, not a backend, so
-            // its descriptor is never resolved.)
-            upsert_env(
-                env,
-                openshell_core::sandbox_env::TOPOLOGY_DESCRIPTOR,
-                &openshell_isolation::contract::TopologyDescriptor::sidecar().to_env_value(),
-            );
             upsert_env(
                 env,
                 openshell_core::sandbox_env::PROXY_TLS_DIR,
@@ -2315,7 +2372,7 @@ fn sandbox_to_k8s_spec(
                     &driver_config,
                     inject_workspace,
                     params,
-                ),
+                )?,
             );
             if !template.agent_socket_path.is_empty() {
                 root.insert(
@@ -2348,8 +2405,46 @@ fn sandbox_to_k8s_spec(
                 &driver_config,
                 inject_workspace,
                 params,
-            ),
+            )?,
         );
+    }
+
+    if params.topology == SupervisorTopology::Combined {
+        let selected = root
+            .get("podTemplate")
+            .and_then(|template| template.pointer("/spec/containers"))
+            .and_then(serde_json::Value::as_array)
+            .and_then(|containers| {
+                containers.iter().find(|container| {
+                    container.get("name").and_then(|name| name.as_str()) == Some("agent")
+                })
+            })
+            .and_then(|container| container.get("command"))
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|command| {
+                [
+                    "--topology-backend-name=in-pod".to_string(),
+                    format!(
+                        "--topology-version={}",
+                        openshell_isolation::contract::INTERFACE_VERSION
+                    ),
+                    "--topology-payload-base64=".to_string(),
+                ]
+                .iter()
+                .all(|expected| {
+                    command
+                        .iter()
+                        .filter(|argument| argument.as_str() == Some(expected.as_str()))
+                        .count()
+                        == 1
+                })
+            });
+        if !selected {
+            return Err(
+                "failed to apply the admitted in-pod isolation backend to the supervisor command"
+                    .to_string(),
+            );
+        }
     }
 
     Ok(serde_json::Value::Object(
@@ -2376,6 +2471,7 @@ fn sandbox_template_to_k8s(
         inject_workspace,
         params,
     )
+    .expect("test pod template should accept the selected isolation backend")
 }
 
 #[cfg(test)]
@@ -2396,6 +2492,7 @@ fn sandbox_template_to_k8s_with_gpu_requirements(
         inject_workspace,
         params,
     )
+    .expect("test pod template should accept the selected isolation backend")
 }
 
 fn sandbox_template_to_k8s_with_validated_config(
@@ -2405,7 +2502,7 @@ fn sandbox_template_to_k8s_with_validated_config(
     driver_config: &KubernetesSandboxDriverConfig,
     inject_workspace: bool,
     params: &SandboxPodParams<'_>,
-) -> serde_json::Value {
+) -> Result<serde_json::Value, String> {
     let mut metadata = serde_json::Map::new();
     let mut pod_labels = template
         .labels
@@ -2686,6 +2783,10 @@ fn sandbox_template_to_k8s_with_validated_config(
 
     match params.topology {
         SupervisorTopology::Combined => {
+            // An admitted boundary is one-shot: after the supervisor (PID 1)
+            // exits, the driver must provision a new topology rather than
+            // restarting the old binding.
+            result["spec"]["restartPolicy"] = serde_json::json!("Never");
             apply_supervisor_sideload(
                 &mut result,
                 params.supervisor_image,
@@ -2694,6 +2795,12 @@ fn sandbox_template_to_k8s_with_validated_config(
                 params.sandbox_uid,
                 params.sandbox_gid,
             );
+            if !apply_topology_descriptor(&mut result) {
+                return Err(
+                    "failed to apply the admitted in-pod isolation backend to the supervisor command"
+                        .to_string(),
+                );
+            }
         }
         SupervisorTopology::Sidecar => {
             apply_supervisor_sidecar_topology(
@@ -2717,7 +2824,7 @@ fn sandbox_template_to_k8s_with_validated_config(
         );
     }
 
-    result
+    Ok(result)
 }
 
 fn apply_pod_driver_config(
@@ -2950,13 +3057,6 @@ fn apply_required_env(
         env,
         openshell_core::sandbox_env::TELEMETRY_ENABLED,
         openshell_core::telemetry::enabled_env_value(),
-    );
-    // RFC 0012: the driver provisions the topology and delivers its descriptor
-    // to the supervisor through the driver-controlled environment.
-    upsert_env(
-        env,
-        openshell_core::sandbox_env::TOPOLOGY_DESCRIPTOR,
-        &openshell_isolation::contract::TopologyDescriptor::in_pod().to_env_value(),
     );
     if !ssh_socket_path.is_empty() {
         upsert_env(
@@ -3615,6 +3715,42 @@ mod tests {
     }
 
     #[test]
+    fn driver_config_reserves_the_complete_supervisor_runtime_mount() {
+        for mount_path in [
+            "/opt/openshell",
+            SUPERVISOR_MOUNT_PATH,
+            "/opt/openshell/bin/openshell-runtime/lib",
+        ] {
+            let spec = SandboxSpec {
+                template: Some(SandboxTemplate {
+                    driver_config: Some(json_struct(serde_json::json!({
+                        "volumes": [{
+                            "name": "user-data",
+                            "persistent_volume_claim": {"claim_name": "pvc-user-data"}
+                        }],
+                        "containers": {
+                            "agent": {
+                                "volume_mounts": [{
+                                    "name": "user-data",
+                                    "mount_path": mount_path
+                                }]
+                            }
+                        }
+                    }))),
+                    ..SandboxTemplate::default()
+                }),
+                ..SandboxSpec::default()
+            };
+
+            let err = kubernetes_driver_config_for_spec(Some(&spec), None).unwrap_err();
+            assert!(
+                err.contains("reserved OpenShell path"),
+                "expected {mount_path:?} to conflict with the supervisor runtime: {err}"
+            );
+        }
+    }
+
+    #[test]
     fn driver_config_allows_spiffe_workload_path_without_provider_spiffe() {
         let spec = SandboxSpec {
             template: Some(SandboxTemplate {
@@ -3937,6 +4073,72 @@ mod tests {
     }
 
     #[test]
+    fn trusted_driver_selects_in_pod_isolation_backend() {
+        let mut pod_template = serde_json::json!({
+            "spec": { "containers": [{
+                "name": "agent",
+                "command": [
+                    "/openshell/bin/openshell-sandbox",
+                    "--isolation-backend=legacy",
+                    "--topology-version=999"
+                ],
+                "args": [
+                    "/bin/tool",
+                    "--isolation-backend=legacy",
+                    "--topology-backend-name", "attacker",
+                    "--topology-payload-base64=Zm9yZ2Vk"
+                ]
+            }] }
+        });
+
+        assert!(apply_topology_descriptor(&mut pod_template));
+
+        assert_eq!(
+            pod_template["spec"]["containers"][0]["command"],
+            serde_json::json!([
+                "/openshell/bin/openshell-sandbox",
+                "--topology-backend-name=in-pod",
+                format!(
+                    "--topology-version={}",
+                    openshell_isolation::contract::INTERFACE_VERSION
+                ),
+                "--topology-payload-base64=",
+                "--"
+            ])
+        );
+        assert_eq!(
+            pod_template["spec"]["containers"][0]["args"],
+            serde_json::json!([
+                "/bin/tool",
+                "--isolation-backend=legacy",
+                "--topology-backend-name",
+                "attacker",
+                "--topology-payload-base64=Zm9yZ2Vk"
+            ]),
+            "arguments after the trusted delimiter belong to the workload"
+        );
+    }
+
+    #[test]
+    fn admitted_pod_does_not_restart() {
+        let pod_template = sandbox_template_to_k8s(
+            &SandboxTemplate::default(),
+            false,
+            &std::collections::HashMap::new(),
+            true,
+            &SandboxPodParams::default(),
+        );
+
+        assert_eq!(pod_template["spec"]["restartPolicy"], "Never");
+    }
+
+    #[test]
+    fn in_pod_selection_fails_when_no_agent_command_exists() {
+        let mut pod_template = serde_json::json!({ "spec": { "containers": [] } });
+        assert!(!apply_topology_descriptor(&mut pod_template));
+    }
+
+    #[test]
     fn supervisor_sideload_replaces_spoofed_identity_environment() {
         let mut pod_template = serde_json::json!({
             "spec": {
@@ -4057,17 +4259,19 @@ mod tests {
         assert_eq!(init_containers[0]["imagePullPolicy"], "IfNotPresent");
 
         // The init container must invoke the binary directly with
-        // `copy-self <DEST>` rather than depending on shell utilities.
+        // `copy-runtime <DEST>` rather than depending on shell utilities or
+        // helpers from the workload image.
         let init_command = init_containers[0]["command"]
             .as_array()
             .expect("init container command should be set");
-        assert_eq!(init_command.len(), 3, "expected [binary, copy-self, dest]");
-        assert_eq!(init_command[0], SUPERVISOR_IMAGE_BINARY_PATH);
-        assert_eq!(init_command[1], "copy-self");
         assert_eq!(
-            init_command[2].as_str().unwrap(),
-            format!("{SUPERVISOR_MOUNT_PATH}/openshell-sandbox")
+            init_command.len(),
+            3,
+            "expected [binary, copy-runtime, dest]"
         );
+        assert_eq!(init_command[0], SUPERVISOR_IMAGE_BINARY_PATH);
+        assert_eq!(init_command[1], "copy-runtime");
+        assert_eq!(init_command[2].as_str().unwrap(), SUPERVISOR_MOUNT_PATH);
         assert!(
             !init_command.iter().any(|v| v == "sh"),
             "init container must not depend on a shell"
@@ -4265,13 +4469,6 @@ mod tests {
             rendered_env(agent, openshell_core::sandbox_env::SIDECAR_CONTROL_SOCKET),
             Some(SIDECAR_CONTROL_SOCKET)
         );
-        // RFC 0012: the agent container resolves the sidecar backend.
-        let sidecar_descriptor =
-            openshell_isolation::contract::TopologyDescriptor::sidecar().to_env_value();
-        assert_eq!(
-            rendered_env(agent, openshell_core::sandbox_env::TOPOLOGY_DESCRIPTOR),
-            Some(sidecar_descriptor.as_str())
-        );
         assert_eq!(rendered_env(agent, "OPENSHELL_SUPERVISOR_READY_FILE"), None);
         assert_eq!(rendered_env(agent, "OPENSHELL_ENTRYPOINT_PID_FILE"), None);
         assert_eq!(
@@ -4304,16 +4501,6 @@ mod tests {
         assert_eq!(
             sidecar["command"],
             serde_json::json!([SUPERVISOR_IMAGE_BINARY_PATH, "--mode=network"])
-        );
-        // The network sidecar container runs the mediation component, not a
-        // backend, so it keeps the default in-pod descriptor (never resolved).
-        assert_eq!(
-            rendered_env(sidecar, openshell_core::sandbox_env::TOPOLOGY_DESCRIPTOR),
-            Some(
-                openshell_isolation::contract::TopologyDescriptor::in_pod()
-                    .to_env_value()
-                    .as_str()
-            )
         );
         assert_eq!(sidecar["securityContext"]["runAsUser"], 0);
         assert_eq!(sidecar["securityContext"]["runAsGroup"], 1500);

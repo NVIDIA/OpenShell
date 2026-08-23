@@ -96,11 +96,13 @@ Runtime layout:
   as a release artifact. Linux GNU VM driver binaries must not reference
   `GLIBC_*` symbols newer than `GLIBC_2.28`; release workflows verify this
   before publishing artifacts.
-- **Supervisor**: Alpine base with `nftables`, static musl binary at
-  `/openshell-sandbox`. Static linkage keeps the binary usable when the image
-  is mounted/extracted into sandbox environments (Docker extraction, Podman
-  image volumes, Kubernetes init-container copy-self), while `nftables` supports
-  Kubernetes supervisor sidecar egress enforcement.
+- **Supervisor**: Alpine base with a static musl binary at
+  `/openshell-sandbox` and a materialized, driver-controlled network-helper
+  runtime at `/openshell-runtime`. Kubernetes mounts or copies both into
+  workload containers so boundary setup never executes helpers supplied by a
+  workload image. Podman mounts the same image runtime, Docker extracts it to
+  a digest-keyed read-only bind mount, and the VM supervisor build embeds it
+  beside the guest supervisor.
 
 Gateway image builds bake the corresponding supervisor image tag into the
 gateway binary so Docker sandboxes do not depend on `:latest` by default.

@@ -173,7 +173,7 @@ Common findings:
 - Gateway process stopped: inspect exit status and logs.
 - Sandbox image missing or pull denied: verify image reference and registry credentials.
 - Sandbox fails before readiness with an identity-resolution error: inspect the image's OCI `USER` and matching `/etc/passwd` and `/etc/group` entries, or explicitly set both process identity fields in policy. Root and missing identities are rejected.
-- Docker driver cannot initialize because it cannot find `openshell-sandbox`: verify `OPENSHELL_DOCKER_SUPERVISOR_BIN`, the sibling binary next to `openshell-gateway`, or the configured supervisor image contains `/openshell-sandbox`.
+- Docker driver cannot initialize because it cannot find `openshell-sandbox` or its trusted helper runtime: verify `OPENSHELL_DOCKER_SUPERVISOR_BIN`, the sibling binary next to `openshell-gateway`, and that the configured supervisor image contains both `/openshell-sandbox` and `/openshell-runtime`. A local supervisor binary without a valid sibling `openshell-runtime` still requires the image as the runtime source.
 - Sandbox never registers: check gateway logs and supervisor callback endpoint.
 - Supervisor image exits before printing `openshell-sandbox --version`: the image should be the scratch supervisor image from `deploy/docker/Dockerfile.supervisor` and must contain a static executable at `/openshell-sandbox`.
 - `mise run e2e:docker:gpu` fails with `docker info --format json did not report any discovered NVIDIA CDI GPU devices`: Docker may report `CDISpecDirs` while still having no generated NVIDIA CDI specs. Verify `.DiscoveredDevices` contains entries such as `nvidia.com/gpu=all`, verify `/etc/cdi` or `/var/run/cdi` contains a generated NVIDIA spec, and check that `nvidia-cdi-refresh.service` and `nvidia-cdi-refresh.path` from NVIDIA Container Toolkit are enabled and healthy. The service is a one-shot unit, so `inactive (dead)` can be normal after a successful run; use `systemctl status` and `journalctl` to distinguish success from a skipped or failed refresh. NVIDIA recommends enabling the path and service units, and restarting `nvidia-cdi-refresh.service` to regenerate missing or stale CDI specs. If specs are generated but Docker still reports no discovered devices, restart Docker or reload the daemon and re-check `docker info`.
@@ -354,6 +354,20 @@ kubectl -n <sandbox-namespace> get serviceaccount openshell-sandbox
 kubectl -n openshell get configmap openshell-config -o jsonpath='{.data.gateway\.toml}'
 kubectl -n <sandbox-namespace> get sandbox <sandbox-name> -o jsonpath='{.spec.template.spec.serviceAccountName}{"\n"}'
 ```
+
+For the RFC 0012 co-located backend, verify the trusted topology and confirm the
+driver placed the descriptor in the supervisor command rather than
+workload-controlled arguments:
+
+```bash
+helm -n openshell get values openshell | grep topology
+kubectl -n openshell get configmap openshell-config -o jsonpath='{.data.gateway\.toml}' | grep -E '^topology\s*='
+kubectl -n <sandbox-namespace> get pod <sandbox-pod> -o jsonpath='{.spec.containers[?(@.name=="agent")].command}{"\n"}'
+```
+
+Combined topology selects the in-pod backend; sidecar topology remains on its
+separate lifecycle. A combined pod command should include the driver-supplied
+topology descriptor arguments.
 
 If `topology = "sidecar"` is rendered under `[openshell.drivers.kubernetes]`,
 sandbox pods should have an `openshell-network-init` init container running

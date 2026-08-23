@@ -3,10 +3,10 @@
 
 //! Conformance harness for the runtime-selectable contract.
 //!
-//! Two materially different mock factories (`Primary`, `Secondary`) with
+//! Two materially different mock backends (`Primary`, `Secondary`) with
 //! distinct concrete state structs (each generic over a marker, so each kind
 //! monomorphizes to its own types) prove the registry holds heterogeneous
-//! factories behind `dyn` with no enum over concrete state, and that one driver
+//! backends behind `dyn` with no enum over concrete state, and that one driver
 //! runs both unchanged.
 
 use std::marker::PhantomData;
@@ -62,34 +62,38 @@ impl MockProcess {
 impl BoundaryProcess for MockProcess {
     async fn wait(&self) -> Result<BoundaryExitStatus, BackendError> {
         // Stable across repeated calls.
+        self.alive.store(false, Ordering::SeqCst);
         Ok(self.status)
     }
     async fn signal(&self, signal: BoundarySignal) -> Result<(), BackendError> {
+        if !self.alive.load(Ordering::SeqCst) {
+            return Err(BackendError::Terminated("process has exited".to_string()));
+        }
         self.signals.lock().unwrap().push(signal);
         Ok(())
     }
     async fn terminate(&self) -> Result<(), BackendError> {
-        self.alive.store(false, Ordering::SeqCst);
-        Ok(())
-    }
-    fn diagnostic_pid(&self) -> Option<u32> {
-        Some(4242)
+        self.alive
+            .swap(false, Ordering::SeqCst)
+            .then_some(())
+            .ok_or_else(|| BackendError::Terminated("process has exited".to_string()))
     }
 }
 
-/// Mediation ingress: hands the mediation service a connection carrying its
+/// Mediation source: hands the mediation service a connection carrying its
 /// per-connection identity-resolution result.
-struct MockIngress<K>(PhantomData<K>);
+struct MockSource<K>(PhantomData<K>);
 
 #[async_trait]
-impl<K: MockKind> MediationIngress for MockIngress<K> {
+impl<K: MockKind> NetworkMediationSource for MockSource<K> {
     async fn accept(&self) -> Result<MediatedConnection, BackendError> {
         let (near, _far) = tokio::io::duplex(64);
         Ok(MediatedConnection {
             stream: Box::new(near),
             binary_identity: Ok(BinaryIdentity {
                 binary_path: PathBuf::from("/usr/bin/agent"),
-                binary_sha256: K::HAS_DIGEST.then(|| "deadbeef".to_string()),
+                binary_digest: K::HAS_DIGEST
+                    .then(|| "00".repeat(32).parse().expect("valid digest")),
                 ancestors: vec![],
                 cmdline_paths: vec![],
             }),
@@ -97,13 +101,13 @@ impl<K: MockKind> MediationIngress for MockIngress<K> {
     }
 }
 
-/// An ingress whose backend cannot attribute the connection: the connection is
+/// An source whose backend cannot attribute the connection: the connection is
 /// still delivered, carrying `Err`, so the mediation service denies and audits
 /// it. It never authorizes anything.
-struct UnattributedIngress;
+struct UnattributedSource;
 
 #[async_trait]
-impl MediationIngress for UnattributedIngress {
+impl NetworkMediationSource for UnattributedSource {
     async fn accept(&self) -> Result<MediatedConnection, BackendError> {
         let (near, _far) = tokio::io::duplex(64);
         Ok(MediatedConnection {
@@ -115,18 +119,35 @@ impl MediationIngress for UnattributedIngress {
 
 struct MockExec;
 
+struct MockTerminal {
+    size: Mutex<Option<(u16, u16)>>,
+}
+
+#[async_trait]
+impl BoundaryTerminal for MockTerminal {
+    async fn resize(&self, cols: u16, rows: u16) -> Result<(), BackendError> {
+        *self.size.lock().unwrap() = Some((cols, rows));
+        Ok(())
+    }
+}
+
 #[async_trait]
 impl BoundaryExec for MockExec {
-    async fn exec(&self, _spec: ExecSpec) -> Result<ExecSession, BackendError> {
+    async fn exec(&self, spec: ExecSpec) -> Result<ExecSession, BackendError> {
         let (_near, far) = tokio::io::duplex(64);
         let (out_r, _out_w) = tokio::io::duplex(64);
         let (err_r, _err_w) = tokio::io::duplex(64);
+        let stdin: BoundaryInput = Box::new(far);
+        let stderr: BoundaryOutput = Box::new(err_r);
+        let terminal: Arc<dyn BoundaryTerminal> = Arc::new(MockTerminal {
+            size: Mutex::new(None),
+        });
         Ok(ExecSession {
             process: MockProcess::new(),
-            stdin: Some(Box::new(far)),
+            stdin: (!spec.pty).then_some(stdin),
             stdout: Box::new(out_r),
-            stderr: Some(Box::new(err_r)),
-            terminal: None,
+            stderr: (!spec.pty).then_some(stderr),
+            terminal: spec.pty.then_some(terminal),
         })
     }
 }
@@ -135,7 +156,7 @@ struct MockPortForward;
 
 #[async_trait]
 impl BoundaryPortForward for MockPortForward {
-    async fn connect(&self, _target: LoopbackTarget) -> Result<BoundaryConn, BackendError> {
+    async fn connect(&self, _target: LoopbackTarget) -> Result<BoundaryDuplexStream, BackendError> {
         let (near, far) = tokio::io::duplex(64);
         tokio::spawn(async move {
             use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -154,7 +175,7 @@ impl BoundaryPortForward for MockPortForward {
 // ---------------------------------------------------------------------------
 
 struct MockBound<K> {
-    ingress: Arc<MockIngress<K>>,
+    source: Arc<MockSource<K>>,
 }
 struct MockReady<K> {
     _k: PhantomData<K>,
@@ -168,8 +189,8 @@ struct MockRunning<K> {
 
 #[async_trait]
 impl<K: MockKind> BoundBoundary for MockBound<K> {
-    fn mediation_ingress(&self) -> Arc<dyn MediationIngress> {
-        self.ingress.clone()
+    fn network_mediation_source(&self) -> Arc<dyn NetworkMediationSource> {
+        self.source.clone()
     }
     async fn confirm(self: Box<Self>) -> Result<Box<dyn ReadyBoundary>, BackendError> {
         Ok(Box::new(MockReady::<K> { _k: PhantomData }))
@@ -200,15 +221,15 @@ impl<K: MockKind> RunningBoundary for MockRunning<K> {
     }
 }
 
-/// One factory per boundary resource: `attach` is atomic and never binds a
+/// One backend per boundary resource: `attach` is atomic and never binds a
 /// resource that is already bound to an active boundary, so a second attach
 /// against the same mock resource is `Denied`.
-struct MockFactory<K> {
+struct MockBackend<K> {
     attached: AtomicBool,
     _k: PhantomData<K>,
 }
 
-impl<K> MockFactory<K> {
+impl<K> MockBackend<K> {
     fn new() -> Self {
         Self {
             attached: AtomicBool::new(false),
@@ -218,19 +239,19 @@ impl<K> MockFactory<K> {
 }
 
 #[async_trait]
-impl<K: MockKind> IsolationBackendFactory for MockFactory<K> {
-    fn backend_id(&self) -> &'static str {
+impl<K: MockKind> IsolationBackend for MockBackend<K> {
+    fn backend_name(&self) -> &'static str {
         K::BACKEND_ID
     }
-    fn contract_version(&self) -> u32 {
-        CONTRACT_VERSION
+    fn version(&self) -> u32 {
+        INTERFACE_VERSION
     }
     async fn attach(
         &self,
         descriptor: VerifiedTopologyDescriptor,
         sandbox: SandboxContext,
     ) -> Result<Box<dyn BoundBoundary>, BackendError> {
-        assert_eq!(descriptor.backend_id(), K::BACKEND_ID);
+        assert_eq!(descriptor.backend_name(), K::BACKEND_ID);
         assert!(!sandbox.sandbox_id.is_empty());
         if self.attached.swap(true, Ordering::SeqCst) {
             return Err(BackendError::Denied(
@@ -238,21 +259,21 @@ impl<K: MockKind> IsolationBackendFactory for MockFactory<K> {
             ));
         }
         Ok(Box::new(MockBound::<K> {
-            ingress: Arc::new(MockIngress(PhantomData)),
+            source: Arc::new(MockSource(PhantomData)),
         }))
     }
 }
 
-/// A factory that speaks the wrong contract version; registration must reject it.
-struct WrongVersionFactory;
+/// A backend that speaks the wrong contract version; registration must reject it.
+struct WrongVersionBackend;
 
 #[async_trait]
-impl IsolationBackendFactory for WrongVersionFactory {
-    fn backend_id(&self) -> &'static str {
+impl IsolationBackend for WrongVersionBackend {
+    fn backend_name(&self) -> &'static str {
         "mock-wrong-version"
     }
-    fn contract_version(&self) -> u32 {
-        CONTRACT_VERSION + 1
+    fn version(&self) -> u32 {
+        INTERFACE_VERSION + 1
     }
     async fn attach(
         &self,
@@ -269,17 +290,17 @@ impl IsolationBackendFactory for WrongVersionFactory {
 
 fn registry() -> BackendRegistry {
     let mut reg = BackendRegistry::new();
-    reg.register(Arc::new(MockFactory::<Primary>::new()))
+    reg.register(Arc::new(MockBackend::<Primary>::new()))
         .expect("register primary");
-    reg.register(Arc::new(MockFactory::<Secondary>::new()))
+    reg.register(Arc::new(MockBackend::<Secondary>::new()))
         .expect("register secondary");
     reg
 }
 
-fn descriptor(backend_id: &str) -> TopologyDescriptor {
+fn descriptor(backend_name: &str) -> TopologyDescriptor {
     TopologyDescriptor {
-        contract_version: CONTRACT_VERSION,
-        backend_id: backend_id.to_string(),
+        version: INTERFACE_VERSION,
+        backend_name: backend_name.to_string(),
         payload: vec![],
     }
 }
@@ -311,11 +332,11 @@ async fn drive(
     descriptor: TopologyDescriptor,
     admitted: &str,
 ) -> Result<Box<dyn RunningBoundary>, BackendError> {
-    let (factory, verified) = reg.resolve(descriptor, admitted)?;
-    let bound = factory.attach(verified, sandbox_ctx()).await?;
-    // The mediation ingress is retained before consuming `Bound` and stays
+    let (backend, verified) = reg.resolve(descriptor, admitted)?;
+    let bound = backend.attach(verified, sandbox_ctx()).await?;
+    // The mediation source is retained before consuming `Bound` and stays
     // usable across the confirm/start transitions.
-    let _ingress = bound.mediation_ingress();
+    let _ingress = bound.network_mediation_source();
     let ready = bound.confirm().await?;
     ready.start_agent().await
 }
@@ -330,25 +351,25 @@ async fn registry_selects_correct_backend() {
     let (f, _v) = reg
         .resolve(descriptor("mock-secondary"), "mock-secondary")
         .expect("resolve");
-    assert_eq!(f.backend_id(), "mock-secondary");
+    assert_eq!(f.backend_name(), "mock-secondary");
 }
 
 #[test]
 fn registry_rejects_duplicate_registration() {
     let mut reg = BackendRegistry::new();
-    reg.register(Arc::new(MockFactory::<Primary>::new()))
+    reg.register(Arc::new(MockBackend::<Primary>::new()))
         .expect("first");
     let err = reg
-        .register(Arc::new(MockFactory::<Primary>::new()))
+        .register(Arc::new(MockBackend::<Primary>::new()))
         .expect_err("duplicate must fail");
     assert!(matches!(err, BackendError::Descriptor(_)));
 }
 
 #[test]
-fn registry_rejects_wrong_factory_version() {
+fn registry_rejects_wrong_backend_version() {
     let mut reg = BackendRegistry::new();
     let err = reg
-        .register(Arc::new(WrongVersionFactory))
+        .register(Arc::new(WrongVersionBackend))
         .expect_err("wrong version must fail");
     assert_eq!(err.kind(), BackendErrorKind::Invalid);
 }
@@ -379,7 +400,7 @@ fn registry_rejects_descriptor_admission_mismatch_without_fallback() {
 fn registry_rejects_unsupported_version() {
     let reg = registry();
     let mut d = descriptor("mock-primary");
-    d.contract_version = CONTRACT_VERSION + 1;
+    d.version = INTERFACE_VERSION + 1;
     let err = reg
         .resolve(d, "mock-primary")
         .map(|_| ())
@@ -415,6 +436,28 @@ async fn one_driver_runs_both_backends() {
 }
 
 #[tokio::test]
+async fn one_boundary_termination_does_not_change_another_boundary() {
+    let reg = registry();
+    let primary = drive(&reg, descriptor("mock-primary"), "mock-primary")
+        .await
+        .expect("primary lifecycle");
+    let secondary = drive(&reg, descriptor("mock-secondary"), "mock-secondary")
+        .await
+        .expect("secondary lifecycle");
+
+    primary
+        .agent()
+        .terminate()
+        .await
+        .expect("terminate primary");
+    secondary
+        .agent()
+        .signal(BoundarySignal::Term)
+        .await
+        .expect("secondary remains active");
+}
+
+#[tokio::test]
 async fn attach_never_binds_an_already_bound_resource() {
     let reg = registry();
     // First attach binds the mock resource.
@@ -433,21 +476,21 @@ async fn attach_never_binds_an_already_bound_resource() {
 #[tokio::test]
 async fn runtime_interfaces_survive_lifecycle_consumption() {
     let reg = registry();
-    let (factory, verified) = reg
+    let (backend, verified) = reg
         .resolve(descriptor("mock-primary"), "mock-primary")
         .expect("resolve");
-    let bound = factory
+    let bound = backend
         .attach(verified, sandbox_ctx())
         .await
         .expect("attach");
 
-    // Retain the ingress at Bound, then consume the bound state with confirm.
+    // Retain the source at Bound, then consume the bound state with confirm.
     // The retained Arc must remain usable afterward.
-    let ingress = bound.mediation_ingress();
+    let source = bound.network_mediation_source();
     let ready = bound.confirm().await.expect("confirm");
     let _running = ready.start_agent().await.expect("start");
 
-    let conn = ingress.accept().await.expect("accept after consumption");
+    let conn = source.accept().await.expect("accept after consumption");
     let identity = conn.binary_identity.expect("identity resolves");
     assert_eq!(identity.binary_path, PathBuf::from("/usr/bin/agent"));
 }
@@ -472,7 +515,53 @@ async fn agent_process_survives_and_wait_is_stable() {
         agent.wait().await.expect("wait 2"),
         BoundaryExitStatus::Exited(0)
     );
-    agent.signal(BoundarySignal::Term).await.expect("signal");
+    assert!(matches!(
+        agent.signal(BoundarySignal::Term).await,
+        Err(BackendError::Terminated(_))
+    ));
+}
+
+#[tokio::test]
+async fn every_signal_reaches_the_backend_unchanged() {
+    let process = MockProcess::new();
+    for signal in [
+        BoundarySignal::Term,
+        BoundarySignal::Kill,
+        BoundarySignal::Int,
+        BoundarySignal::Hup,
+    ] {
+        process.signal(signal).await.expect("signal");
+    }
+    assert_eq!(
+        *process.signals.lock().unwrap(),
+        vec![
+            BoundarySignal::Term,
+            BoundarySignal::Kill,
+            BoundarySignal::Int,
+            BoundarySignal::Hup,
+        ]
+    );
+}
+
+#[tokio::test]
+async fn normal_and_signaled_exit_are_distinct_and_stable() {
+    let signaled = MockProcess {
+        status: BoundaryExitStatus::Signaled(9),
+        alive: AtomicBool::new(false),
+        signals: Mutex::new(Vec::new()),
+    };
+    assert_eq!(
+        signaled.wait().await.expect("first wait"),
+        BoundaryExitStatus::Signaled(9)
+    );
+    assert_eq!(
+        signaled.wait().await.expect("second wait"),
+        BoundaryExitStatus::Signaled(9)
+    );
+    assert_ne!(
+        signaled.wait().await.expect("third wait"),
+        BoundaryExitStatus::Exited(137)
+    );
 }
 
 #[tokio::test]
@@ -502,11 +591,45 @@ async fn exec_session_owns_its_process_and_streams() {
 }
 
 #[tokio::test]
+async fn pty_exec_merges_output_and_supports_resize() {
+    let session = MockExec
+        .exec(ExecSpec {
+            program: "/bin/sh".to_string(),
+            args: vec![],
+            env: vec![],
+            workdir: None,
+            pty: true,
+        })
+        .await
+        .expect("pty exec");
+    assert!(session.stdin.is_none());
+    assert!(session.stderr.is_none());
+    session
+        .terminal
+        .expect("terminal")
+        .resize(120, 40)
+        .await
+        .expect("resize");
+}
+
+#[tokio::test]
 async fn port_forward_rejects_non_loopback() {
     let target = LoopbackTarget::new("8.8.8.8".parse().unwrap(), 53);
     assert!(target.is_err());
     let loopback = LoopbackTarget::new("127.0.0.1".parse().unwrap(), 8080).expect("loopback ok");
     assert_eq!(loopback.port(), 8080);
+}
+
+#[tokio::test]
+async fn validated_port_forward_stream_remains_usable() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let target = LoopbackTarget::new("127.0.0.1".parse().unwrap(), 8080).unwrap();
+    let mut stream = MockPortForward.connect(target).await.expect("connect");
+    stream.write_all(b"ping").await.expect("write");
+    let mut response = [0_u8; 4];
+    stream.read_exact(&mut response).await.expect("read");
+    assert_eq!(&response, b"ping");
 }
 
 // ---------------------------------------------------------------------------
@@ -516,82 +639,44 @@ async fn port_forward_rejects_non_loopback() {
 #[tokio::test]
 async fn mediated_connection_carries_identity_for_that_connection() {
     let reg = registry();
-    let (factory, verified) = reg
+    let (backend, verified) = reg
         .resolve(descriptor("mock-primary"), "mock-primary")
         .expect("resolve");
-    let bound = factory
+    let bound = backend
         .attach(verified, sandbox_ctx())
         .await
         .expect("attach");
-    let conn = bound.mediation_ingress().accept().await.expect("accept");
+    let conn = bound
+        .network_mediation_source()
+        .accept()
+        .await
+        .expect("accept");
     let identity = conn.binary_identity.expect("identity resolves");
     assert_eq!(identity.binary_path, PathBuf::from("/usr/bin/agent"));
     // A missing digest is `None`, never an empty value.
-    assert_eq!(identity.binary_sha256.as_deref(), Some("deadbeef"));
+    assert_eq!(
+        identity.binary_digest.expect("digest").to_string(),
+        "00".repeat(32)
+    );
 }
 
 #[tokio::test]
 async fn missing_digest_is_none_never_empty() {
     // The secondary backend resolves path-only identity: the digest is `None`,
     // so policy that requires a digest cannot authorize the connection.
-    let ingress = MockIngress::<Secondary>(PhantomData);
-    let conn = ingress.accept().await.expect("accept");
+    let source = MockSource::<Secondary>(PhantomData);
+    let conn = source.accept().await.expect("accept");
     let identity = conn.binary_identity.expect("identity resolves");
-    assert!(identity.binary_sha256.is_none());
+    assert!(identity.binary_digest.is_none());
 }
 
 #[tokio::test]
 async fn unresolved_identity_travels_with_the_connection_and_fails_closed() {
-    // Attribution failure does not tear down the ingress: the connection is
+    // Attribution failure does not tear down the source: the connection is
     // delivered carrying `Err`, and the mediation service denies it.
-    let ingress = UnattributedIngress;
-    let conn = ingress.accept().await.expect("accept");
+    let source = UnattributedSource;
+    let conn = source.accept().await.expect("accept");
     assert!(conn.binary_identity.is_err());
-}
-
-// ---------------------------------------------------------------------------
-// Descriptor environment transport.
-// ---------------------------------------------------------------------------
-
-#[test]
-fn descriptor_env_value_round_trips() {
-    let original = TopologyDescriptor {
-        contract_version: CONTRACT_VERSION,
-        backend_id: "mock-primary".to_string(),
-        payload: vec![0x00, 0x7f, 0xff],
-    };
-    let parsed = TopologyDescriptor::from_env_value(&original.to_env_value()).expect("parse");
-    assert_eq!(parsed.contract_version, original.contract_version);
-    assert_eq!(parsed.backend_id, original.backend_id);
-    assert_eq!(parsed.payload, original.payload);
-}
-
-#[test]
-fn in_pod_descriptor_env_value_round_trips_with_empty_payload() {
-    let parsed = TopologyDescriptor::from_env_value(&TopologyDescriptor::in_pod().to_env_value())
-        .expect("parse");
-    assert_eq!(parsed.backend_id, IN_POD_BACKEND_ID);
-    assert_eq!(parsed.contract_version, CONTRACT_VERSION);
-    assert!(parsed.payload.is_empty());
-}
-
-#[test]
-fn malformed_descriptor_env_values_fail_closed() {
-    for bad in [
-        "",
-        "1",
-        "1:in-pod",
-        "x:in-pod:",
-        "1::",
-        "1:in-pod:zz",
-        "1:in-pod:abc",
-        "1:in-pod:aa:bb",
-    ] {
-        assert!(
-            TopologyDescriptor::from_env_value(bad).is_err(),
-            "{bad:?} must fail closed"
-        );
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -599,7 +684,7 @@ fn malformed_descriptor_env_values_fail_closed() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn error_kinds_map_and_only_unavailable_retries() {
+fn error_kinds_map_to_supervisor_status_classes() {
     assert_eq!(
         BackendError::Descriptor("x".into()).kind(),
         BackendErrorKind::Invalid
@@ -628,6 +713,4 @@ fn error_kinds_map_and_only_unavailable_retries() {
         BackendError::Terminated("x".into()).kind(),
         BackendErrorKind::Terminated
     );
-    assert!(BackendError::Unavailable("x".into()).is_retryable());
-    assert!(!BackendError::Confirm("x".into()).is_retryable());
 }

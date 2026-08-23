@@ -116,6 +116,8 @@ jobs:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
       options: --privileged
+      volumes:
+        - /var/run/docker.sock:/var/run/docker.sock
     env:
       MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       OPENSHELL_IMAGE_TAG: ${{ inputs['image-tag'] }}
@@ -141,8 +143,12 @@ jobs:
           cache-directories: .cache/sccache
           cache-targets: "true"
 
-      - name: Install zstd
-        run: apt-get update && apt-get install -y --no-install-recommends zstd && rm -rf /var/lib/apt/lists/*
+      - name: Install zstd and verify Docker
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends zstd
+          rm -rf /var/lib/apt/lists/*
+          docker info
 
       - name: Download kernel runtime tarball
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
@@ -168,14 +174,14 @@ jobs:
       - name: Verify embedded driver inputs
         run: |
           set -euo pipefail
-          for file in libkrun.so.zst libkrunfw.so.5.zst gvproxy.zst umoci.zst openshell-sandbox.zst; do
+          for file in libkrun.so.zst libkrunfw.so.5.zst gvproxy.zst umoci.zst openshell-sandbox.zst openshell-runtime.tar.zst; do
             test -s "target/vm-runtime-compressed/${file}"
           done
 
       - name: Scope workspace to driver-vm crates
         run: |
           set -euo pipefail
-          sed -i 's|members = \["crates/\*"\]|members = ["crates/openshell-driver-vm", "crates/openshell-core"]|' Cargo.toml
+          sed -i 's|members = \["crates/\*"\]|members = ["crates/openshell-driver-vm", "crates/openshell-core", "crates/openshell-isolation"]|' Cargo.toml
 
       - name: Patch workspace version
         if: ${{ inputs['cargo-version'] != '' }}

@@ -373,7 +373,7 @@ process_binary_aware_network_policy = true
 
 ### Docker
 
-Sandboxes run as containers on a local bridge network. The supervisor binary is bind-mounted from the host (no in-cluster image pull required); guest mTLS material is supplied as host paths.
+Sandboxes run as containers on a local bridge network. The driver supplies RFC 0012's co-located backend descriptor by default. The supervisor binary and its trusted network-helper runtime are bind-mounted read-only from driver-controlled sources; guest mTLS material is supplied as host paths.
 
 ```toml
 [openshell]
@@ -392,10 +392,11 @@ image_pull_policy  = "IfNotPresent"
 sandbox_namespace  = "docker-dev"
 # Empty auto-detects https://host.openshell.internal:<gateway-port> when guest TLS is set.
 grpc_endpoint      = "https://host.openshell.internal:17670"
-# Skip the image-pull-and-extract step by pointing at a locally built binary.
+# Use a locally built supervisor binary. If it has no sibling
+# openshell-runtime directory, the driver still extracts that runtime from supervisor_image.
 supervisor_bin     = "/usr/local/libexec/openshell/openshell-sandbox"
-# When supervisor_bin is omitted, Docker extracts /openshell-sandbox from this image.
-# Defaults to the gateway version; override to pin a specific build.
+# Source for /openshell-sandbox and its trusted helper runtime. Defaults to the
+# gateway version; override to pin a specific build.
 # supervisor_image = "ghcr.io/nvidia/openshell/supervisor:<version>"
 guest_tls_ca       = "/etc/openshell/certs/ca.pem"
 guest_tls_cert     = "/etc/openshell/certs/client.pem"
@@ -413,7 +414,7 @@ sandbox_pids_limit = 2048
 
 ### Podman
 
-Sandboxes run as Podman containers on a user-mode bridge network. The supervisor image is mounted read-only via Podman's `type=image` mount; guest mTLS material is supplied as host paths.
+Sandboxes run as Podman containers on a user-mode bridge network. The driver supplies RFC 0012's co-located backend descriptor by default. The supervisor image, including its trusted network-helper runtime, is mounted read-only via Podman's `type=image` mount; guest mTLS material is supplied as host paths.
 
 ```toml
 [openshell]
@@ -519,7 +520,7 @@ health_check_interval_secs = 10
 
 ### MicroVM
 
-Each sandbox runs inside its own libkrun microVM managed by the standalone `openshell-driver-vm` subprocess. Use this driver when you want stronger isolation than container namespaces alone.
+Each sandbox runs inside its own libkrun microVM managed by the standalone `openshell-driver-vm` subprocess. The driver supplies RFC 0012's co-located backend descriptor by default and embeds its trusted network-helper runtime in the guest bootstrap. Use this driver when you want stronger isolation than container namespaces alone.
 
 ```toml
 [openshell]

@@ -4,10 +4,10 @@
 //! Runtime-selectable Isolation Backend contract (RFC 0012).
 //!
 //! This module is the object-safe, runtime-selectable contract the supervisor
-//! role drives. A backend registers an [`IsolationBackendFactory`] under a
-//! `backend_id`; the supervisor resolves it from a [`BackendRegistry`] against
-//! the admitted backend id and advances the boundary through a fixed chain of
-//! boxed states:
+//! role drives. A backend registers an [`IsolationBackend`] under a
+//! `backend_name`; the supervisor resolves it from a [`BackendRegistry`]
+//! against the admitted backend name and advances the boundary through a fixed
+//! chain of boxed states:
 //!
 //! ```text
 //! attach topology + sandbox context -> Bound -> confirm -> Ready
@@ -17,7 +17,7 @@
 //! Each transition consumes the prior state by value (`self: Box<Self>`), and no
 //! state type has a public constructor, so a stage cannot be skipped or
 //! replayed. The supervisor holds no `match`/downcast on concrete backends: the
-//! registry is the only lookup by `backend_id`, and everything past it is a
+//! registry is the only lookup by `backend_name`, and everything past it is a
 //! `Box<dyn _>` / `Arc<dyn _>`.
 //!
 //! `attach` is atomic from the caller's perspective: it returns `Bound` or fails
@@ -26,14 +26,14 @@
 //! by the backend for that exact connection; an unresolved identity denies the
 //! connection and never authorizes anything.
 //!
-//! The in-pod backend (`openshell-sandbox`) and the supervisor drive this
-//! contract directly; two mock factories and the conformance tests below
-//! exercise it against a second, heterogeneous backend.
+//! The contract is transport-neutral. Concrete topology implementations keep
+//! their placement and coordination details behind these interfaces.
 
 use std::collections::HashMap;
 use std::fmt;
 use std::net::IpAddr;
 use std::path::PathBuf;
+use std::str::FromStr;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -42,25 +42,8 @@ use tokio::io::{AsyncRead, AsyncWrite};
 pub use openshell_core::policy::SandboxPolicy;
 
 /// The Isolation Backend contract version. The descriptor and the resolved
-/// factory must both equal the supervisor-supported version exactly.
-pub const CONTRACT_VERSION: u32 = 1;
-
-/// The well-known backend id of the co-located in-pod backend.
-///
-/// Lives in the contract crate because compute drivers create the
-/// [`TopologyDescriptor`] naming it; the implementation lives in
-/// `openshell-sandbox`.
-pub const IN_POD_BACKEND_ID: &str = "in-pod";
-
-/// The well-known backend id of the Kubernetes sidecar topology.
-///
-/// Selected for the agent container, whose supervisor runs this backend to
-/// operate the workload; network mediation runs in a separate network-sidecar
-/// container that the backend coordinates. A distinct topology from `in-pod`.
-/// Lives in the contract crate because compute drivers create the
-/// [`TopologyDescriptor`] naming it; the implementation lives in
-/// `openshell-sandbox`.
-pub const SIDECAR_BACKEND_ID: &str = "sidecar";
+/// backend must both equal the supervisor-supported version exactly.
+pub const INTERFACE_VERSION: u32 = 1;
 
 // ============================================================================
 // Errors
@@ -68,18 +51,16 @@ pub const SIDECAR_BACKEND_ID: &str = "sidecar";
 
 /// Classified failures at the common contract boundary.
 ///
-/// Only [`BackendError::is_retryable`] cases may be retried by the supervisor,
-/// and a retry must reuse the same backend and boundary; no error downgrades
-/// isolation.
+/// An error never advances the lifecycle or authorizes an operation.
 #[derive(Debug)]
 pub enum BackendError {
     /// Descriptor missing, malformed, unsupported, or mismatched against admission.
     Descriptor(String),
-    /// No factory registered for the resolved `backend_id`.
+    /// No backend registered for the resolved `backend_name`.
     NotRegistered(String),
     /// Authenticated attachment rejection (incompatible or already-bound resource).
     Denied(String),
-    /// Boundary temporarily unavailable. The only retryable class.
+    /// Boundary temporarily unavailable.
     Unavailable(String),
     /// Attachment-phase failure (establishment or mediation bring-up).
     Attach(String),
@@ -101,7 +82,7 @@ pub enum BackendErrorKind {
     Invalid,
     /// Authenticated attachment rejection.
     Denied,
-    /// Transient inability to serve an operation (the only retryable kind).
+    /// Transient inability to serve an operation.
     Unavailable,
     /// Attachment, confirmation, start, or runtime operation failure.
     Failed,
@@ -111,12 +92,6 @@ pub enum BackendErrorKind {
 }
 
 impl BackendError {
-    /// Whether the supervisor may retry, reusing the same backend and boundary.
-    #[must_use]
-    pub fn is_retryable(&self) -> bool {
-        matches!(self, Self::Unavailable(_))
-    }
-
     /// The machine-readable kind for this error.
     #[must_use]
     pub fn kind(&self) -> BackendErrorKind {
@@ -149,7 +124,7 @@ impl std::error::Error for BackendError {}
 
 /// Why an identity resolution failed. Resolution failure fails closed: the
 /// mediation service denies and audits the connection; it never authorizes.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum ResolveError {
     /// No process owns the connection (stale or unknown attribution).
     NotFound,
@@ -181,112 +156,17 @@ impl std::error::Error for ResolveError {}
 #[derive(Debug, Clone)]
 pub struct TopologyDescriptor {
     /// The Isolation Backend contract version this descriptor targets.
-    pub contract_version: u32,
+    pub version: u32,
     /// The backend the supervisor must instantiate.
-    pub backend_id: String,
+    pub backend_name: String,
     /// Backend-specific attachment data.
     pub payload: Vec<u8>,
-}
-
-impl TopologyDescriptor {
-    /// The descriptor for the co-located in-pod backend: the supervisor
-    /// process is the provisioned resource, so the payload is empty.
-    #[must_use]
-    pub fn in_pod() -> Self {
-        Self {
-            contract_version: CONTRACT_VERSION,
-            backend_id: IN_POD_BACKEND_ID.to_string(),
-            payload: Vec::new(),
-        }
-    }
-
-    /// The descriptor for the Kubernetes sidecar topology's agent container: the
-    /// supervisor there resolves the sidecar backend. The payload is empty; the
-    /// backend reads its operational data (control socket, expected peer) from
-    /// the driver-controlled environment for now.
-    #[must_use]
-    pub fn sidecar() -> Self {
-        Self {
-            contract_version: CONTRACT_VERSION,
-            backend_id: SIDECAR_BACKEND_ID.to_string(),
-            payload: Vec::new(),
-        }
-    }
-
-    /// Serialize for the driver-controlled environment transport
-    /// (`OPENSHELL_TOPOLOGY_DESCRIPTOR`): `<version>:<backend_id>:<hex payload>`.
-    /// Other transports deliver the same envelope with equivalent integrity.
-    #[must_use]
-    pub fn to_env_value(&self) -> String {
-        format!(
-            "{}:{}:{}",
-            self.contract_version,
-            self.backend_id,
-            hex_encode(&self.payload)
-        )
-    }
-
-    /// Parse the environment-transport serialization produced by
-    /// [`Self::to_env_value`]. Missing or malformed input fails closed.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`BackendError::Descriptor`] for a malformed value: missing
-    /// fields, a non-numeric version, an empty backend id, or a payload that
-    /// is not valid hex.
-    pub fn from_env_value(value: &str) -> Result<Self, BackendError> {
-        let mut parts = value.splitn(3, ':');
-        let (Some(version), Some(backend_id), Some(payload_hex)) =
-            (parts.next(), parts.next(), parts.next())
-        else {
-            return Err(BackendError::Descriptor(
-                "topology descriptor must be <version>:<backend_id>:<hex payload>".to_string(),
-            ));
-        };
-        let contract_version: u32 = version.parse().map_err(|_| {
-            BackendError::Descriptor(format!(
-                "topology descriptor version {version:?} is not a number"
-            ))
-        })?;
-        if backend_id.is_empty() {
-            return Err(BackendError::Descriptor(
-                "topology descriptor backend id is empty".to_string(),
-            ));
-        }
-        let payload = hex_decode(payload_hex).ok_or_else(|| {
-            BackendError::Descriptor("topology descriptor payload is not valid hex".to_string())
-        })?;
-        Ok(Self {
-            contract_version,
-            backend_id: backend_id.to_string(),
-            payload,
-        })
-    }
-}
-
-fn hex_encode(bytes: &[u8]) -> String {
-    use std::fmt::Write as _;
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        let _ = write!(out, "{byte:02x}");
-    }
-    out
-}
-
-fn hex_decode(hex: &str) -> Option<Vec<u8>> {
-    if !hex.is_ascii() || !hex.len().is_multiple_of(2) {
-        return None;
-    }
-    (0..hex.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).ok())
-        .collect()
 }
 
 /// A descriptor whose common envelope has passed registry verification.
 ///
 /// Minted only by [`BackendRegistry::resolve`]; no public constructor, so an
-/// unverified descriptor cannot reach a factory. The type does not imply that
+/// unverified descriptor cannot reach a backend. The type does not imply that
 /// the opaque payload has been validated: the backend validates the payload and
 /// atomically binds it to the sandbox context during `attach`.
 pub struct VerifiedTopologyDescriptor {
@@ -294,35 +174,33 @@ pub struct VerifiedTopologyDescriptor {
 }
 
 impl VerifiedTopologyDescriptor {
-    /// The verified backend id.
+    /// The verified backend name.
     #[must_use]
-    pub fn backend_id(&self) -> &str {
-        &self.descriptor.backend_id
+    pub fn backend_name(&self) -> &str {
+        &self.descriptor.backend_name
     }
     /// The backend-specific payload (validated by the backend at `attach`).
     #[must_use]
     pub fn payload(&self) -> &[u8] {
         &self.descriptor.payload
     }
-    /// The contract version.
+    /// The interface version.
     #[must_use]
-    pub fn contract_version(&self) -> u32 {
-        self.descriptor.contract_version
+    pub fn version(&self) -> u32 {
+        self.descriptor.version
     }
 }
 
 /// The trusted sandbox context, constructed by trusted common code after the
 /// control plane assigns the resource to the admitted sandbox.
 ///
-/// Carries the create-time policy baseline. Authorized revisions to
-/// mediation-evaluated policy continue through the mediation service's
-/// policy-update path after `Running`, without a backend lifecycle transition;
-/// a revision that requires changing standing enforcement or launch-time
-/// controls is rejected.
+/// Carries the admitted create-time policy. Approved network-policy revisions
+/// are made effective by supervisor-owned network mediation, outside the
+/// backend lifecycle.
 pub struct SandboxContext {
     /// Which sandbox this is.
     pub sandbox_id: String,
-    /// The create-time policy baseline across all four dimensions.
+    /// The admitted create-time policy.
     pub policy: SandboxPolicy,
     /// The admitted agent workload.
     pub agent: AgentSpec,
@@ -331,12 +209,12 @@ pub struct SandboxContext {
 /// The agent workload to run inside the boundary.
 pub use crate::AgentSpec;
 
-/// Maps `backend_id` to its factory. The only lookup-by-id in the system; the
+/// Maps backend name to its implementation. This is the only lookup by name;
 /// supervisor lifecycle never branches on a concrete backend, and resolution
 /// never falls back to another backend.
 #[derive(Default)]
 pub struct BackendRegistry {
-    factories: HashMap<String, Arc<dyn IsolationBackendFactory>>,
+    backends: HashMap<String, Arc<dyn IsolationBackend>>,
 }
 
 impl BackendRegistry {
@@ -344,100 +222,96 @@ impl BackendRegistry {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            factories: HashMap::new(),
+            backends: HashMap::new(),
         }
     }
 
-    /// Register a factory. Rejects a duplicate `backend_id` and a factory that
-    /// does not speak the supervisor-supported contract version exactly.
+    /// Register a backend. Rejects a duplicate name or a backend that does not
+    /// speak the supervisor-supported interface version exactly.
     ///
     /// # Errors
     ///
-    /// Returns [`BackendError::Descriptor`] for a duplicate `backend_id` or a
-    /// contract-version mismatch.
-    pub fn register(
-        &mut self,
-        factory: Arc<dyn IsolationBackendFactory>,
-    ) -> Result<(), BackendError> {
-        let id = factory.backend_id().to_string();
-        if self.factories.contains_key(&id) {
+    /// Returns [`BackendError::Descriptor`] for a duplicate `backend_name` or
+    /// an interface-version mismatch.
+    pub fn register(&mut self, backend: Arc<dyn IsolationBackend>) -> Result<(), BackendError> {
+        let name = backend.backend_name().to_string();
+        if self.backends.contains_key(&name) {
             return Err(BackendError::Descriptor(format!(
-                "duplicate backend id {id:?}"
+                "duplicate backend name {name:?}"
             )));
         }
-        if factory.contract_version() != CONTRACT_VERSION {
+        if backend.version() != INTERFACE_VERSION {
             return Err(BackendError::Descriptor(format!(
-                "backend {id:?} targets contract version {}, supervisor speaks {CONTRACT_VERSION}",
-                factory.contract_version()
+                "backend {name:?} targets interface version {}, supervisor speaks {INTERFACE_VERSION}",
+                backend.version()
             )));
         }
-        self.factories.insert(id, factory);
+        self.backends.insert(name, backend);
         Ok(())
     }
 
-    /// Verify the descriptor's common envelope against the admitted backend id
-    /// and resolve its factory. Fails closed and never falls back:
+    /// Verify the descriptor's common envelope against the admitted backend name
+    /// and resolve its backend. Fails closed and never falls back:
     ///
-    /// - the descriptor's contract version must equal [`CONTRACT_VERSION`];
-    /// - the descriptor's `backend_id` must equal the admitted id;
-    /// - a factory must be registered for that id, agreeing on its id; and
-    /// - the factory's contract version must equal [`CONTRACT_VERSION`] exactly.
+    /// - the descriptor's interface version must equal [`INTERFACE_VERSION`];
+    /// - the descriptor's `backend_name` must equal the admitted name;
+    /// - a backend must be registered under that name; and
+    /// - the backend's version must equal [`INTERFACE_VERSION`] exactly.
     ///
     /// # Errors
     ///
     /// Returns [`BackendError::Descriptor`] for a version or admission
-    /// mismatch, and [`BackendError::NotRegistered`] when no factory is
-    /// registered for the admitted id.
+    /// mismatch, and [`BackendError::NotRegistered`] when no backend is
+    /// registered for the admitted name.
     pub fn resolve(
         &self,
         descriptor: TopologyDescriptor,
-        admitted_backend_id: &str,
-    ) -> Result<(Arc<dyn IsolationBackendFactory>, VerifiedTopologyDescriptor), BackendError> {
-        if descriptor.contract_version != CONTRACT_VERSION {
+        admitted_backend_name: &str,
+    ) -> Result<(Arc<dyn IsolationBackend>, VerifiedTopologyDescriptor), BackendError> {
+        if descriptor.version != INTERFACE_VERSION {
             return Err(BackendError::Descriptor(format!(
-                "descriptor contract version {} unsupported (expected {CONTRACT_VERSION})",
-                descriptor.contract_version
+                "descriptor interface version {} unsupported (expected {INTERFACE_VERSION})",
+                descriptor.version
             )));
         }
-        if descriptor.backend_id != admitted_backend_id {
+        if descriptor.backend_name != admitted_backend_name {
             return Err(BackendError::Descriptor(format!(
-                "descriptor backend {:?} does not match admitted backend {admitted_backend_id:?}",
-                descriptor.backend_id
+                "descriptor backend {:?} does not match admitted backend {admitted_backend_name:?}",
+                descriptor.backend_name
             )));
         }
-        let factory = self
-            .factories
-            .get(&descriptor.backend_id)
-            .ok_or_else(|| BackendError::NotRegistered(descriptor.backend_id.clone()))?
+        let backend = self
+            .backends
+            .get(&descriptor.backend_name)
+            .ok_or_else(|| BackendError::NotRegistered(descriptor.backend_name.clone()))?
             .clone();
-        // Defense in depth: the resolved factory must agree on its id and version.
-        if factory.backend_id() != descriptor.backend_id {
+        if backend.backend_name() != descriptor.backend_name {
             return Err(BackendError::Descriptor(format!(
-                "registry returned backend {:?} for id {:?}",
-                factory.backend_id(),
-                descriptor.backend_id
+                "registry returned backend {:?} for name {:?}",
+                backend.backend_name(),
+                descriptor.backend_name
             )));
         }
-        if factory.contract_version() != CONTRACT_VERSION {
+        if backend.version() != INTERFACE_VERSION {
             return Err(BackendError::Descriptor(format!(
-                "backend {:?} speaks contract version {}, supervisor requires {CONTRACT_VERSION}",
-                descriptor.backend_id,
-                factory.contract_version()
+                "backend {:?} speaks interface version {}, supervisor requires {INTERFACE_VERSION}",
+                descriptor.backend_name,
+                backend.version()
             )));
         }
-        Ok((factory, VerifiedTopologyDescriptor { descriptor }))
+        Ok((backend, VerifiedTopologyDescriptor { descriptor }))
     }
 }
 
-/// Builds and attaches a concrete backend. Registered once per `backend_id`.
+/// Establishes and operates boundaries for one admitted backend implementation.
 #[async_trait]
-pub trait IsolationBackendFactory: Send + Sync {
-    /// The backend this factory builds.
-    fn backend_id(&self) -> &'static str;
+pub trait IsolationBackend: Send + Sync {
+    /// The stable registered backend name.
+    fn backend_name(&self) -> &str;
 
-    /// The Isolation Backend contract version this factory speaks. Matched
-    /// exactly against [`CONTRACT_VERSION`]; there is no capability negotiation.
-    fn contract_version(&self) -> u32;
+    /// The Isolation Backend contract version this backend speaks. Matched
+    /// exactly against [`INTERFACE_VERSION`]; there is no capability negotiation.
+    fn version(&self) -> u32;
 
     /// Validate the opaque payload and atomically bind it to the trusted
     /// sandbox context: returns `Bound` or fails closed. Never binds a resource
@@ -454,24 +328,22 @@ pub trait IsolationBackendFactory: Send + Sync {
 // ============================================================================
 
 /// Bound: the topology descriptor and trusted sandbox context are bound to the
-/// same resource, and the mediation ingress is available. No untrusted workload
+/// same resource, and the mediation source is available. No untrusted workload
 /// code is running.
 #[async_trait]
 pub trait BoundBoundary: Send {
     /// The mediation service's backend-neutral source of workload connections.
     /// Retained by the supervisor before consuming `Bound`.
-    fn mediation_ingress(&self) -> Arc<dyn MediationIngress>;
+    fn network_mediation_source(&self) -> Arc<dyn NetworkMediationSource>;
 
     /// Confirm standing enforcement. How a backend establishes confidence is
     /// private to that backend; confirmation fails closed.
     async fn confirm(self: Box<Self>) -> Result<Box<dyn ReadyBoundary>, BackendError>;
 }
 
-/// Ready: mediation is initialized and standing enforcement is confirmed.
-///
-/// The backend is prepared to ensure the admitted launch-time controls are in
-/// force before untrusted execution. Only agent activation is possible from
-/// here.
+/// Ready: standing enforcement is confirmed, and the backend is prepared to
+/// ensure the admitted launch-time controls are in force
+/// before untrusted execution. Only agent activation is possible from here.
 #[async_trait]
 pub trait ReadyBoundary: Send {
     /// Make the admitted agent runnable behind the boundary and return its
@@ -484,13 +356,13 @@ pub trait ReadyBoundary: Send {
     async fn start_agent(self: Box<Self>) -> Result<Box<dyn RunningBoundary>, BackendError>;
 }
 
-/// Running: the agent is runnable behind the boundary.
+/// Running: the agent is runnable behind the boundary and the returned agent
+/// handle represents the admitted agent process. Exec and forwarding are available.
 ///
-/// The returned agent handle owns the complete workload tree. Exec and
-/// forwarding are available. All interface accessors return owned `Arc`s so a
-/// consumer can retain them past any later state consumption.
+/// All interface accessors return owned `Arc`s so a consumer can retain them
+/// past any later state consumption.
 pub trait RunningBoundary: Send + Sync {
-    /// The agent process handle (owns the complete workload tree).
+    /// The admitted agent process handle.
     fn agent(&self) -> Arc<dyn BoundaryProcess>;
     /// The in-boundary exec interface.
     fn exec(&self) -> Arc<dyn BoundaryExec>;
@@ -524,21 +396,16 @@ pub enum BoundarySignal {
     Hup,
 }
 
-/// A process running inside the boundary, owned by its boundary state. `wait`
-/// returns one stable status however many times it is called; a host PID, if
-/// useful, is diagnostics-only and never the handle.
+/// A process running inside the boundary. `wait` returns one stable status
+/// however many times it is called; a local PID is never the process handle.
 #[async_trait]
 pub trait BoundaryProcess: Send + Sync {
     /// Await terminal status (stable across repeated calls).
     async fn wait(&self) -> Result<BoundaryExitStatus, BackendError>;
     /// Deliver a signal to the process or its group.
     async fn signal(&self, signal: BoundarySignal) -> Result<(), BackendError>;
-    /// Terminate the process and its complete descendant tree.
+    /// Terminate the process and its backend-owned process group.
     async fn terminate(&self) -> Result<(), BackendError>;
-    /// Optional host PID, for diagnostics only.
-    fn diagnostic_pid(&self) -> Option<u32> {
-        None
-    }
 }
 
 /// A boxed async writer into a boundary process's stdin.
@@ -636,13 +503,13 @@ pub trait DuplexStream: AsyncRead + AsyncWrite + Send + Unpin {}
 impl<T: AsyncRead + AsyncWrite + Send + Unpin> DuplexStream for T {}
 
 /// An open connection into a boundary loopback target.
-pub type BoundaryConn = Box<dyn DuplexStream>;
+pub type BoundaryDuplexStream = Box<dyn DuplexStream>;
 
 /// Loopback port-forward, consumed by the SSH server and supervisor session.
 #[async_trait]
 pub trait BoundaryPortForward: Send + Sync {
     /// Connect to `target` inside the boundary.
-    async fn connect(&self, target: LoopbackTarget) -> Result<BoundaryConn, BackendError>;
+    async fn connect(&self, target: LoopbackTarget) -> Result<BoundaryDuplexStream, BackendError>;
 }
 
 // ============================================================================
@@ -659,11 +526,10 @@ pub trait BoundaryPortForward: Send + Sync {
 /// semantics do not change.
 #[derive(Debug, Clone)]
 pub struct BinaryIdentity {
-    /// Absolute path of the connecting binary.
+    /// Absolute path of the executable resolved for the accepted connection.
     pub binary_path: PathBuf,
-    /// SHA-256 of the connecting binary, hex-encoded. `None` when unavailable;
-    /// never an empty string.
-    pub binary_sha256: Option<String>,
+    /// Digest of the resolved executable object. `None` when unavailable.
+    pub binary_digest: Option<Sha256Digest>,
     /// Ancestor process binaries, nearest first.
     pub ancestors: Vec<PathBuf>,
     /// Absolute script/interpreter paths drawn from the process cmdlines.
@@ -671,14 +537,55 @@ pub struct BinaryIdentity {
     pub cmdline_paths: Vec<PathBuf>,
 }
 
+/// A SHA-256 digest, kept typed so the identity field is not coupled to its
+/// textual encoding or forced to repeat the algorithm in its name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Sha256Digest([u8; 32]);
+
+impl Sha256Digest {
+    /// Return the raw digest bytes.
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+impl fmt::Display for Sha256Digest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for byte in self.0 {
+            write!(f, "{byte:02x}")?;
+        }
+        Ok(())
+    }
+}
+
+impl FromStr for Sha256Digest {
+    type Err = ResolveError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        if value.len() != 64 || !value.is_ascii() {
+            return Err(ResolveError::Failed(
+                "SHA-256 digest must contain 64 hexadecimal characters".to_string(),
+            ));
+        }
+        let mut bytes = [0_u8; 32];
+        for (index, byte) in bytes.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(&value[index * 2..index * 2 + 2], 16).map_err(|_| {
+                ResolveError::Failed("SHA-256 digest contains non-hexadecimal data".to_string())
+            })?;
+        }
+        Ok(Self(bytes))
+    }
+}
+
 /// A workload connection delivered to the mediation service, carrying the
-/// identity-resolution result for that exact connection.
+/// identity-resolution result for that connection.
 ///
 /// An `Err` identity denies the connection and is audited; it never authorizes
 /// anything.
 pub struct MediatedConnection {
     /// The workload connection stream.
-    pub stream: BoundaryConn,
+    pub stream: BoundaryDuplexStream,
     /// Executable identity, resolved by the backend for this connection.
     pub binary_identity: Result<BinaryIdentity, ResolveError>,
 }
@@ -688,12 +595,12 @@ pub struct MediatedConnection {
 ///
 /// It may wrap a dedicated listener or a demultiplexed view over shared
 /// transport; how it reaches a co-located proxy, a sidecar, or a shared
-/// mediation service is backend-private. The backend authoritatively attributes
-/// every returned connection to its active boundary without relying solely on a
-/// workload-provided identifier. An `Err` from `accept` means the ingress
-/// itself is unusable and fails the boundary closed.
+/// mediation service is backend-private. A trusted backend component associates
+/// every returned connection with its active boundary without relying solely on
+/// a transport tuple or workload-provided identifier. An `Err` from `accept`
+/// means the source itself is unusable and fails the boundary closed.
 #[async_trait]
-pub trait MediationIngress: Send + Sync {
+pub trait NetworkMediationSource: Send + Sync {
     /// Await the next mediated workload connection.
     async fn accept(&self) -> Result<MediatedConnection, BackendError>;
 }

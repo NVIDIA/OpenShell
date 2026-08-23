@@ -838,4 +838,43 @@ mod tests {
             "socket(AF_NETLINK, SOCK_RAW, NETLINK_SOCK_DIAG) should be blocked with EPERM"
         );
     }
+
+    #[test]
+    fn behavioral_block_mode_denies_inet_and_packet_sockets() {
+        let filter = build_filter(false).unwrap();
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed");
+        if pid == 0 {
+            unsafe {
+                libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
+                apply_filter(&filter).expect("apply block-mode filter");
+                for (domain, socket_type, protocol) in [
+                    (libc::AF_INET, libc::SOCK_STREAM, 0),
+                    (libc::AF_INET6, libc::SOCK_DGRAM, 0),
+                    (libc::AF_PACKET, libc::SOCK_RAW, 0),
+                ] {
+                    let fd = libc::socket(domain, socket_type, protocol);
+                    let errno = *libc::__errno_location();
+                    if fd >= 0 || errno != libc::EPERM {
+                        if fd >= 0 {
+                            libc::close(fd);
+                        }
+                        libc::_exit(1);
+                    }
+                }
+                let unix_fd = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0);
+                if unix_fd < 0 {
+                    libc::_exit(1);
+                }
+                libc::close(unix_fd);
+                libc::_exit(0);
+            }
+        }
+        let mut status: libc::c_int = 0;
+        unsafe { libc::waitpid(pid, &mut status, 0) };
+        assert!(
+            unsafe { libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0 },
+            "block mode must deny IPv4, IPv6, and packet sockets while retaining Unix IPC"
+        );
+    }
 }

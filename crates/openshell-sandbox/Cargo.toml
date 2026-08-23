@@ -25,13 +25,8 @@ openshell-supervisor-middleware-builtins = { path = "../openshell-supervisor-mid
 openshell-supervisor-process = { path = "../openshell-supervisor-process" }
 
 # Async runtime
-tokio = { workspace = true }
-
-# Async trait for the IsolationBackend impl
 async-trait = "0.1"
-
-# Stream adapter for the prototype EventSource seam
-futures = { workspace = true }
+tokio = { workspace = true }
 
 # gRPC (tonic::Status downcast in error mapping)
 tonic = { workspace = true, features = ["channel", "tls-native-roots"] }
@@ -44,12 +39,13 @@ clap = { workspace = true }
 miette = { workspace = true }
 
 # Unix ownership for Kubernetes sidecar init setup
-nix = { workspace = true }
+nix = { workspace = true, features = ["socket"] }
 
 # TLS crypto provider install (main.rs)
 rustls = { workspace = true }
 
 # Serialization (serde_json::json! for OCSF unmapped fields)
+base64 = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 prost = { workspace = true }

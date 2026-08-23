@@ -416,7 +416,7 @@ async fn run_single_session(
                 let context = GatewayMessageContext {
                     sandbox_id,
                     ssh_socket_path,
-                    &port_forward,
+                    port_forward: &port_forward,
                     expected_ssh_peer_pid,
                     channel: &channel,
                     tx: &tx,
@@ -444,7 +444,7 @@ async fn run_single_session(
 struct GatewayMessageContext<'a> {
     sandbox_id: &'a str,
     ssh_socket_path: &'a std::path::Path,
-    port_forward: &Arc<dyn BoundaryPortForward>,
+    port_forward: &'a Arc<dyn BoundaryPortForward>,
     expected_ssh_peer_pid: Option<u32>,
     channel: &'a grpc_client::AuthedChannel,
     tx: &'a mpsc::Sender<SupervisorMessage>,
@@ -1057,7 +1057,7 @@ mod ocsf_event_tests {
         // The SSH relay path does not use the port-forward (that is the TCP
         // target path); connect from the supervisor's own namespace.
         let port_forward: Arc<dyn BoundaryPortForward> =
-            Arc::new(crate::boundary_io::NetnsPortForward { netns_fd: None });
+            Arc::new(crate::boundary_io::NetnsPortForward::new(None, None));
 
         let trusted = open_target(&relay, &socket, &port_forward, Some(std::process::id()))
             .await

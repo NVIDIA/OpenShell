@@ -117,6 +117,10 @@ ensure_target_runtime() {
         cp /opt/openshell/bin/openshell-sandbox "$image_root/opt/openshell/bin/openshell-sandbox"
         chmod 0755 "$image_root/opt/openshell/bin/openshell-sandbox"
     fi
+    if [ -d /opt/openshell/bin/openshell-runtime ]; then
+        rm -rf "$image_root/opt/openshell/bin/openshell-runtime"
+        cp -a /opt/openshell/bin/openshell-runtime "$image_root/opt/openshell/bin/openshell-runtime"
+    fi
 
     touch "$image_root/etc/passwd" "$image_root/etc/group" "$image_root/etc/shadow" "$image_root/etc/gshadow"
     if ! grep -q '^sandbox:' "$image_root/etc/group" 2>/dev/null; then
@@ -214,14 +218,29 @@ exec_supervisor_in_newroot() {
                 "${bootstrap}/lib64/ld-linux-aarch64.so.1"; do
                 if [ -x "/newroot${loader}" ]; then
                     lib_path="${bootstrap}/lib:${bootstrap}/lib64:${bootstrap}/usr/lib:${bootstrap}/usr/lib64:${bootstrap}/lib/aarch64-linux-gnu:${bootstrap}/lib/x86_64-linux-gnu:${bootstrap}/usr/lib/aarch64-linux-gnu:${bootstrap}/usr/lib/x86_64-linux-gnu"
-                    exec "$chroot_bin" /newroot "$loader" --library-path "$lib_path" "$supervisor" --workdir /sandbox
+                    exec "$chroot_bin" /newroot "$loader" --library-path "$lib_path" "$supervisor" \
+                        --workdir /sandbox \
+                        --topology-backend-name=in-pod \
+                        --topology-version=@ISOLATION_INTERFACE_VERSION@ \
+                        --topology-payload-base64= \
+                        --
                 fi
             done
-            exec "$chroot_bin" /newroot "$supervisor" --workdir /sandbox
+            exec "$chroot_bin" /newroot "$supervisor" \
+                --workdir /sandbox \
+                --topology-backend-name=in-pod \
+                --topology-version=@ISOLATION_INTERFACE_VERSION@ \
+                --topology-payload-base64= \
+                --
         fi
 
         if [ -x /newroot/opt/openshell/bin/openshell-sandbox ]; then
-            exec "$chroot_bin" /newroot /opt/openshell/bin/openshell-sandbox --workdir /sandbox
+            exec "$chroot_bin" /newroot /opt/openshell/bin/openshell-sandbox \
+                --workdir /sandbox \
+                --topology-backend-name=in-pod \
+                --topology-version=@ISOLATION_INTERFACE_VERSION@ \
+                --topology-payload-base64= \
+                --
         fi
     done
 
@@ -837,7 +856,12 @@ ts "starting openshell-sandbox supervisor"
 if [ "${ROOT_PREFIX:-}" = "/newroot" ]; then
     exec_supervisor_in_newroot
 fi
-exec /opt/openshell/bin/openshell-sandbox --workdir /sandbox
+exec /opt/openshell/bin/openshell-sandbox \
+    --workdir /sandbox \
+    --topology-backend-name=in-pod \
+    --topology-version=@ISOLATION_INTERFACE_VERSION@ \
+    --topology-payload-base64= \
+    --
 }
 
 if [ "${1:-}" != "--post-overlay" ]; then

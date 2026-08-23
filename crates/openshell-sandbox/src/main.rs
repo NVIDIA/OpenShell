@@ -23,6 +23,7 @@ use openshell_sandbox::run_sandbox;
 /// to copy the binary out. Invoking the binary itself with this argument
 /// performs the copy in pure Rust.
 const COPY_SELF_SUBCOMMAND: &str = "copy-self";
+const COPY_RUNTIME_SUBCOMMAND: &str = "copy-runtime";
 
 /// Subcommand for one-shot debug RPCs from inside a sandbox container.
 ///
@@ -229,6 +230,18 @@ struct Args {
     /// (for proxies whose ACLs filter on hostnames).
     #[arg(long)]
     upstream_proxy_connect_by_hostname: bool,
+
+    /// Backend named by the compute driver's topology descriptor.
+    #[arg(long)]
+    topology_backend_name: Option<String>,
+
+    /// Isolation Backend interface version named by the topology descriptor.
+    #[arg(long)]
+    topology_version: Option<u32>,
+
+    /// Base64-encoded opaque topology-descriptor payload.
+    #[arg(long)]
+    topology_payload_base64: Option<String>,
 }
 
 /// Copy the running executable to `dest`, creating parent directories as
@@ -268,6 +281,100 @@ fn copy_self(dest: &str) -> Result<()> {
         std::fs::set_permissions(&final_path, perms).into_diagnostic()?;
     }
 
+    Ok(())
+}
+
+/// Install the supervisor and its trusted network-helper runtime below `dest`.
+///
+/// Kubernetes uses this when image volumes are unavailable. The source is the
+/// driver-selected supervisor image and the destination is mounted read-only in
+/// the workload container, so helper provenance does not depend on the
+/// workload-selected image.
+#[cfg(unix)]
+fn copy_runtime(dest: &str) -> Result<()> {
+    let dest = Path::new(dest);
+    std::fs::create_dir_all(dest).into_diagnostic()?;
+    copy_self(
+        dest.join("openshell-sandbox")
+            .to_str()
+            .ok_or_else(|| miette::miette!("runtime destination is not valid UTF-8"))?,
+    )?;
+
+    copy_runtime_from(Path::new("/openshell-runtime"), dest)
+}
+
+#[cfg(unix)]
+fn copy_runtime_from(source: &Path, dest: &Path) -> Result<()> {
+    use miette::Context as _;
+
+    if !source.is_dir() {
+        return Err(miette::miette!(
+            "supervisor image is missing its trusted helper runtime"
+        ));
+    }
+    copy_runtime_tree(source, &dest.join("openshell-runtime"))
+        .wrap_err("failed to install trusted supervisor helper runtime")?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn copy_runtime_tree(source: &Path, destination: &Path) -> Result<()> {
+    copy_runtime_tree_inner(source, destination, &mut std::collections::HashSet::new())
+}
+
+#[cfg(unix)]
+fn copy_runtime_tree_inner(
+    source: &Path,
+    destination: &Path,
+    active_sources: &mut std::collections::HashSet<std::path::PathBuf>,
+) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let metadata = std::fs::symlink_metadata(source).into_diagnostic()?;
+    if metadata.file_type().is_symlink() {
+        // The image build already materializes links. Dereference defensively
+        // here too so no absolute link can escape into the workload rootfs.
+        // Track the active canonical chain so a malformed trusted image fails
+        // instead of recursing forever through a symlink cycle.
+        let resolved = source.canonicalize().into_diagnostic()?;
+        if !active_sources.insert(resolved.clone()) {
+            return Err(miette::miette!(
+                "trusted helper runtime contains a symlink cycle at {}",
+                source.display()
+            ));
+        }
+        let result = copy_runtime_tree_inner(&resolved, destination, active_sources);
+        active_sources.remove(&resolved);
+        return result;
+    }
+    if metadata.is_dir() {
+        std::fs::create_dir_all(destination).into_diagnostic()?;
+        std::fs::set_permissions(
+            destination,
+            std::fs::Permissions::from_mode(metadata.permissions().mode()),
+        )
+        .into_diagnostic()?;
+        for entry in std::fs::read_dir(source).into_diagnostic()? {
+            let entry = entry.into_diagnostic()?;
+            copy_runtime_tree_inner(
+                &entry.path(),
+                &destination.join(entry.file_name()),
+                active_sources,
+            )?;
+        }
+        return Ok(());
+    }
+    if metadata.is_file() {
+        if let Some(parent) = destination.parent() {
+            std::fs::create_dir_all(parent).into_diagnostic()?;
+        }
+        std::fs::copy(source, destination).into_diagnostic()?;
+        std::fs::set_permissions(
+            destination,
+            std::fs::Permissions::from_mode(metadata.permissions().mode()),
+        )
+        .into_diagnostic()?;
+    }
     Ok(())
 }
 
@@ -455,15 +562,37 @@ fn run_network_init(
 }
 
 fn main() -> Result<()> {
-    // Handle `copy-self <DEST>` before clap so it works without any of the
-    // sandbox flags. Kubernetes init containers invoke this path to seed an
-    // emptyDir volume that the agent container then executes from.
+    // Handle internal image-extraction commands before clap so they work
+    // without any sandbox flags.
     let raw_args: Vec<String> = std::env::args().collect();
     if raw_args.get(1).map(String::as_str) == Some(COPY_SELF_SUBCOMMAND) {
-        let dest = raw_args.get(2).ok_or_else(|| {
-            miette::miette!("usage: openshell-sandbox {COPY_SELF_SUBCOMMAND} <DEST>")
-        })?;
+        let [_, _, dest] = raw_args.as_slice() else {
+            return Err(miette::miette!(
+                "usage: openshell-sandbox {COPY_SELF_SUBCOMMAND} <DEST>"
+            ));
+        };
+        if dest.is_empty() {
+            return Err(miette::miette!(
+                "usage: openshell-sandbox {COPY_SELF_SUBCOMMAND} <DEST>"
+            ));
+        }
         return copy_self(dest);
+    }
+    if raw_args.get(1).map(String::as_str) == Some(COPY_RUNTIME_SUBCOMMAND) {
+        let [_, _, dest] = raw_args.as_slice() else {
+            return Err(miette::miette!(
+                "usage: openshell-sandbox {COPY_RUNTIME_SUBCOMMAND} <DEST>"
+            ));
+        };
+        if dest.is_empty() {
+            return Err(miette::miette!(
+                "usage: openshell-sandbox {COPY_RUNTIME_SUBCOMMAND} <DEST>"
+            ));
+        }
+        #[cfg(unix)]
+        return copy_runtime(dest);
+        #[cfg(not(unix))]
+        return Err(miette::miette!("{COPY_RUNTIME_SUBCOMMAND} requires Unix"));
     }
 
     // Handle `debug-rpc <subcommand> [args]` before clap. Uses a small
@@ -618,6 +747,29 @@ fn main() -> Result<()> {
             proxy_connect_by_hostname: args.upstream_proxy_connect_by_hostname,
         };
 
+        let topology_descriptor = match (
+            args.topology_backend_name,
+            args.topology_version,
+            args.topology_payload_base64,
+        ) {
+            (None, None, None) => None,
+            (Some(backend_name), Some(version), Some(payload)) => {
+                use base64::Engine as _;
+                Some(openshell_isolation::contract::TopologyDescriptor {
+                    backend_name,
+                    version,
+                    payload: base64::engine::general_purpose::STANDARD
+                        .decode(payload)
+                        .into_diagnostic()?,
+                })
+            }
+            _ => {
+                return Err(miette::miette!(
+                    "topology descriptor requires backend name, version, and payload"
+                ));
+            }
+        };
+
         run_sandbox(
             command,
             args.workdir,
@@ -636,6 +788,7 @@ fn main() -> Result<()> {
             args.mode.network,
             args.mode.process,
             upstream_proxy_args,
+            topology_descriptor,
         )
         .await
     })?;
@@ -647,6 +800,21 @@ fn main() -> Result<()> {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn topology_descriptor_selects_backend() {
+        let args = Args::try_parse_from([
+            "openshell-sandbox",
+            "--topology-backend-name=in-pod",
+            "--topology-version=1",
+            "--topology-payload-base64=",
+            "/bin/true",
+        ])
+        .expect("parse in-pod backend flag");
+        assert_eq!(args.topology_backend_name.as_deref(), Some("in-pod"));
+        assert_eq!(args.topology_version, Some(1));
+        assert_eq!(args.topology_payload_base64.as_deref(), Some(""));
+    }
 
     /// Drives `copy_self`'s file-copy logic against an arbitrary source path
     /// so tests don't depend on `current_exe()`.
@@ -699,6 +867,40 @@ mod tests {
 
         let final_path = dest_dir.join("openshell-sandbox");
         assert!(final_path.exists(), "binary should land inside dest dir");
+    }
+
+    #[test]
+    fn runtime_install_materializes_links_inside_read_only_tree() {
+        use std::os::unix::fs::symlink;
+
+        let tempdir = tempfile::tempdir().unwrap();
+        let source = tempdir.path().join("source-runtime");
+        let destination = tempdir.path().join("installed");
+        std::fs::create_dir_all(source.join("usr/sbin")).unwrap();
+        std::fs::create_dir_all(source.join("bin")).unwrap();
+        let target = source.join("bin/ip");
+        std::fs::write(&target, b"trusted ip helper").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+        symlink("../../bin/ip", source.join("usr/sbin/ip")).unwrap();
+
+        copy_runtime_from(&source, &destination).unwrap();
+
+        let installed = destination.join("openshell-runtime/usr/sbin/ip");
+        assert!(std::fs::symlink_metadata(&installed).unwrap().is_file());
+        assert_eq!(std::fs::read(installed).unwrap(), b"trusted ip helper");
+    }
+
+    #[test]
+    fn runtime_install_rejects_symlink_cycles() {
+        use std::os::unix::fs::symlink;
+
+        let tempdir = tempfile::tempdir().unwrap();
+        let source = tempdir.path().join("source-runtime");
+        let destination = tempdir.path().join("installed");
+        std::fs::create_dir_all(&source).unwrap();
+        symlink(".", source.join("cycle")).unwrap();
+
+        assert!(copy_runtime_from(&source, &destination).is_err());
     }
 
     #[test]

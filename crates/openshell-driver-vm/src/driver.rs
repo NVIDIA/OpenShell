@@ -4081,10 +4081,12 @@ fn build_guest_environment(
         || guest_visible_openshell_endpoint(&config.openshell_endpoint),
         String::from,
     );
-    // 1. User-supplied environment (lowest priority).
+    // User-supplied values travel only through the serialized child-environment
+    // channel. They must not become guest-init or supervisor environment
+    // variables: guest init runs as root and sources only driver-owned keys,
+    // while the supervisor applies this map when it launches workload code.
     let user_env = merged_environment(sandbox);
     let mut environment: HashMap<String, String> = HashMap::new();
-    environment.extend(user_env.clone());
     if !user_env.is_empty()
         && let Ok(json) = serde_json::to_string(&user_env)
     {
@@ -4124,14 +4126,6 @@ fn build_guest_environment(
     environment.insert(
         openshell_core::sandbox_env::LOG_LEVEL.to_string(),
         openshell_core::driver_utils::sandbox_log_level(sandbox, &config.log_level),
-    );
-    // RFC 0012: the driver provisions the topology and delivers its descriptor
-    // to the supervisor through the driver-controlled environment. The VM
-    // supervisor is co-located with the agent inside the guest, so it drives
-    // the in-pod backend.
-    environment.insert(
-        openshell_core::sandbox_env::TOPOLOGY_DESCRIPTOR.to_string(),
-        openshell_isolation::contract::TopologyDescriptor::in_pod().to_env_value(),
     );
     if config.requires_tls_materials() {
         environment.insert(
@@ -5996,6 +5990,49 @@ mod tests {
         assert!(env.contains(&format!(
             "OPENSHELL_SSH_SOCKET_PATH={GUEST_SSH_SOCKET_PATH}"
         )));
+    }
+
+    #[test]
+    fn build_guest_environment_keeps_user_values_in_child_channel() {
+        let config = VmDriverConfig {
+            openshell_endpoint: "http://127.0.0.1:8080".to_string(),
+            ..Default::default()
+        };
+        let sandbox = Sandbox {
+            id: "sandbox-123".to_string(),
+            name: "sandbox-123".to_string(),
+            spec: Some(SandboxSpec {
+                environment: HashMap::from([
+                    ("LD_PRELOAD".to_string(), "/workload/evil.so".to_string()),
+                    ("BAD;touch /root/pwned".to_string(), "value".to_string()),
+                ]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let env = build_guest_environment(&sandbox, &config, None);
+
+        assert!(!env.iter().any(|entry| entry.starts_with("LD_PRELOAD=")));
+        assert!(!env.iter().any(|entry| entry.starts_with("BAD;")));
+        let serialized = env
+            .iter()
+            .find_map(|entry| {
+                entry
+                    .strip_prefix(openshell_core::sandbox_env::USER_ENVIRONMENT)
+                    .and_then(|value| value.strip_prefix('='))
+            })
+            .expect("serialized child environment");
+        let child_env: HashMap<String, String> =
+            serde_json::from_str(serialized).expect("valid child environment JSON");
+        assert_eq!(
+            child_env.get("LD_PRELOAD"),
+            Some(&"/workload/evil.so".to_string())
+        );
+        assert_eq!(
+            child_env.get("BAD;touch /root/pwned"),
+            Some(&"value".to_string())
+        );
     }
 
     #[test]

@@ -113,7 +113,7 @@ A compute driver may provision a resource and `TopologyDescriptor` before the co
 
 ### The topology descriptor
 
-The driver supplies a descriptor for every provisioned topology, including in-pod and resources prepared before assignment. The common envelope names the backend and carries an opaque payload.
+The driver supplies a descriptor for every topology admitted to this contract, including in-pod and resources prepared before assignment. The common envelope names the backend and carries an opaque payload.
 
 ```rust
 struct TopologyDescriptor {
@@ -215,7 +215,7 @@ The states have normative meanings:
 trait BoundaryProcess: Send + Sync {  // the agent, or a process started via exec
     async fn wait(&self) -> Result<BoundaryExitStatus, BackendError>; // one stable result where process-exit observation is retained
     async fn signal(&self, signal: BoundarySignal) -> Result<(), BackendError>;
-    async fn terminate(&self) -> Result<(), BackendError>;            // this process and its descendants
+    async fn terminate(&self) -> Result<(), BackendError>;            // this process and its owned process group
 }
 
 #[async_trait]
@@ -327,7 +327,7 @@ Whenever a boundary ends, the backend terminates remaining workload processes an
 
 ### Topologies
 
-The contract fixes the roles; a topology fixes their placement. Components may be co-located with the workload or hosted in trusted services, and one component may implement multiple roles. Every arrangement preserves the same lifecycle, interfaces, and invariants. Actual containment depends on the workload's kernel relationship to the trusted components. The non-normative [topology matrix](./topology-matrix.md) catalogs representative placements.
+The contract fixes the roles; a topology fixes their placement. Components may be co-located with the workload or hosted in trusted services, and one component may implement multiple roles. Every arrangement admitted to this contract preserves the same lifecycle, interfaces, and invariants. Actual containment depends on the workload's kernel relationship to the trusted components. The non-normative [topology matrix](./topology-matrix.md) catalogs representative placements.
 
 ## Implementation plan
 
@@ -335,9 +335,9 @@ This RFC defines the contract; implementation lands in three phases:
 
 1. **Contract.** Add the common types, descriptor handling, registry, and explicit backend selection from deployment configuration.
 2. **Co-located backend.** Implement the co-located backend behind a deployment flag and route agent launch, egress interception, the network-mediation source, SSH, `exec`, and forwarding through it without changing behavior.
-3. **Conformance and enablement.** Require every admitted backend and topology to pass tests for the six contract invariants plus descriptor verification, lifecycle ordering, runtime operations, and failure semantics. Make the co-located backend the default after parity validation. Parity covers the agent, binary identity, SSH, `exec`, and forwarding paths; enablement also closes the in-pod egress gaps pinned in [codebase-grounding.md](./codebase-grounding.md), which parity alone would preserve.
+3. **Conformance and enablement.** Require every topology admitted to the RFC 0012 lifecycle to pass tests for the six contract invariants plus descriptor verification, lifecycle ordering, runtime operations, and failure semantics. Make the co-located backend the default after parity validation. Parity covers the agent, binary identity, SSH, `exec`, and forwarding paths; enablement also closes the in-pod egress gaps pinned in [codebase-grounding.md](./codebase-grounding.md), which parity alone would preserve.
 
-Delegated backends remain separate design and implementation work.
+Existing placements remain outside this contract until their backend is implemented and admitted; they do not claim conformance. Delegated backends remain separate design and implementation work.
 
 ## Risks
 

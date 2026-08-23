@@ -281,7 +281,8 @@ if [ ! -d "${COMPRESSED_DIR}" ] \
   mise run vm:setup
 fi
 
-if [ ! -f "${COMPRESSED_DIR}/openshell-sandbox.zst" ]; then
+if [ ! -f "${COMPRESSED_DIR}/openshell-sandbox.zst" ] \
+    || [ ! -f "${COMPRESSED_DIR}/openshell-runtime.tar.zst" ]; then
   check_supervisor_cross_toolchain
   echo "==> Building bundled VM supervisor (mise run vm:supervisor)"
   mise run vm:supervisor

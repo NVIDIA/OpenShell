@@ -23,8 +23,10 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::Arc;
 #[cfg(target_os = "linux")]
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::process::{Child, Command};
 use tracing::{debug, info};
 
@@ -120,9 +122,6 @@ const SUPERVISOR_ONLY_ENV_VARS: &[&str] = &[
     openshell_core::sandbox_env::TLS_CERT,
     openshell_core::sandbox_env::TLS_KEY,
     openshell_core::sandbox_env::PROVIDER_SPIFFE_WORKLOAD_API_SOCKET,
-    // Supervisor-only bootstrap state (RFC 0012): never exposed to the agent,
-    // exec sessions, or any other process inside the boundary.
-    openshell_core::sandbox_env::TOPOLOGY_DESCRIPTOR,
 ];
 
 pub fn is_supervisor_only_env_var(key: &str) -> bool {
@@ -517,6 +516,10 @@ fn mount_empty_tmpfs(target: &CString) -> std::io::Result<()> {
 pub struct ProcessHandle {
     child: Child,
     pid: u32,
+    #[cfg(target_os = "linux")]
+    managed_child: Option<managed_children::ManagedChild>,
+    terminal: Arc<AtomicBool>,
+    signal_lock: Arc<std::sync::Mutex<()>>,
 }
 
 impl ProcessHandle {
@@ -532,6 +535,7 @@ impl ProcessHandle {
         args: &[String],
         workdir: Option<&str>,
         interactive: bool,
+        dedicated_process_group: bool,
         policy: &SandboxPolicy,
         resolved_identity: ResolvedProcessIdentity,
         enforcement_mode: ProcessEnforcementMode,
@@ -544,6 +548,7 @@ impl ProcessHandle {
             args,
             workdir,
             interactive,
+            dedicated_process_group,
             policy,
             resolved_identity,
             enforcement_mode,
@@ -565,6 +570,7 @@ impl ProcessHandle {
         args: &[String],
         workdir: Option<&str>,
         interactive: bool,
+        dedicated_process_group: bool,
         policy: &SandboxPolicy,
         resolved_identity: ResolvedProcessIdentity,
         enforcement_mode: ProcessEnforcementMode,
@@ -576,6 +582,7 @@ impl ProcessHandle {
             args,
             workdir,
             interactive,
+            dedicated_process_group,
             policy,
             resolved_identity,
             enforcement_mode,
@@ -591,6 +598,7 @@ impl ProcessHandle {
         args: &[String],
         workdir: Option<&str>,
         interactive: bool,
+        dedicated_process_group: bool,
         policy: &SandboxPolicy,
         resolved_identity: ResolvedProcessIdentity,
         enforcement_mode: ProcessEnforcementMode,
@@ -674,9 +682,9 @@ impl ProcessHandle {
             None
         };
 
-        // Set up process group for signal handling (non-interactive mode only).
-        // In interactive mode, we inherit the parent's process group to maintain
-        // proper terminal control for shells and interactive programs.
+        // Give the workload its own process group so boundary termination can
+        // signal the entrypoint and all of its descendants without touching
+        // the trusted supervisor.
         // SAFETY: pre_exec runs after fork but before exec in the child process.
         // setpgid and setns are async-signal-safe and safe to call in this context.
         {
@@ -688,9 +696,8 @@ impl ProcessHandle {
             #[allow(unsafe_code)]
             unsafe {
                 cmd.pre_exec(move || {
-                    if !interactive {
-                        // Create new process group
-                        libc::setpgid(0, 0);
+                    if (!interactive || dedicated_process_group) && libc::setpgid(0, 0) != 0 {
+                        return Err(std::io::Error::last_os_error());
                     }
 
                     // Enter network namespace before applying other restrictions
@@ -730,13 +737,22 @@ impl ProcessHandle {
             }
         }
 
+        #[cfg(target_os = "linux")]
+        let mut child_registry = managed_children::lock();
         let child = cmd.spawn().into_diagnostic()?;
         let pid = child.id().unwrap_or(0);
-        managed_children::register(pid);
+        let managed_child = child_registry.register(pid);
+        drop(child_registry);
 
         debug!(pid, program, "Process spawned");
 
-        Ok(Self { child, pid })
+        Ok(Self {
+            child,
+            pid,
+            managed_child,
+            terminal: Arc::new(AtomicBool::new(false)),
+            signal_lock: Arc::new(std::sync::Mutex::new(())),
+        })
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -746,6 +762,7 @@ impl ProcessHandle {
         args: &[String],
         workdir: Option<&str>,
         interactive: bool,
+        dedicated_process_group: bool,
         policy: &SandboxPolicy,
         resolved_identity: ResolvedProcessIdentity,
         enforcement_mode: ProcessEnforcementMode,
@@ -791,9 +808,8 @@ impl ProcessHandle {
             }
         }
 
-        // Set up process group for signal handling (non-interactive mode only).
-        // In interactive mode, we inherit the parent's process group to maintain
-        // proper terminal control for shells and interactive programs.
+        // Give the workload its own process group so boundary termination can
+        // signal the entrypoint and all of its descendants.
         // SAFETY: pre_exec runs after fork but before exec in the child process.
         // setpgid is async-signal-safe and safe to call in this context.
         #[cfg(unix)]
@@ -803,9 +819,8 @@ impl ProcessHandle {
             #[allow(unsafe_code)]
             unsafe {
                 cmd.pre_exec(move || {
-                    if !interactive {
-                        // Create new process group
-                        libc::setpgid(0, 0);
+                    if (!interactive || dedicated_process_group) && libc::setpgid(0, 0) != 0 {
+                        return Err(std::io::Error::last_os_error());
                     }
 
                     // Drop privileges before applying sandbox restrictions.
@@ -828,14 +843,25 @@ impl ProcessHandle {
             }
         }
 
+        #[cfg(target_os = "linux")]
+        let mut child_registry = managed_children::lock();
         let child = cmd.spawn().into_diagnostic()?;
         let pid = child.id().unwrap_or(0);
         #[cfg(target_os = "linux")]
-        managed_children::register(pid);
+        let managed_child = child_registry.register(pid);
+        #[cfg(target_os = "linux")]
+        drop(child_registry);
 
         debug!(pid, program, "Process spawned");
 
-        Ok(Self { child, pid })
+        Ok(Self {
+            child,
+            pid,
+            #[cfg(target_os = "linux")]
+            managed_child,
+            terminal: Arc::new(AtomicBool::new(false)),
+            signal_lock: Arc::new(std::sync::Mutex::new(())),
+        })
     }
 
     /// Get the process ID.
@@ -844,16 +870,42 @@ impl ProcessHandle {
         self.pid
     }
 
+    #[must_use]
+    pub fn signaling_state(&self) -> (Arc<AtomicBool>, Arc<std::sync::Mutex<()>>) {
+        (self.terminal.clone(), self.signal_lock.clone())
+    }
+
     /// Wait for the process to exit.
     ///
     /// # Errors
     ///
     /// Returns an error if waiting fails.
     pub async fn wait(&mut self) -> std::io::Result<ProcessStatus> {
-        let status = self.child.wait().await;
         #[cfg(target_os = "linux")]
-        managed_children::unregister(self.pid);
-        let status = status?;
+        let status = {
+            let pid = self.pid;
+            tokio::task::spawn_blocking(move || managed_children::wait_until_terminal(pid))
+                .await
+                .map_err(std::io::Error::other)??;
+            let _signal_guard = self
+                .signal_lock
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            self.terminal.store(true, Ordering::Release);
+            self.child.try_wait()?.ok_or_else(|| {
+                std::io::Error::other("terminal child was not waitable after waitid")
+            })?
+        };
+        #[cfg(not(target_os = "linux"))]
+        let status = {
+            let status = self.child.wait().await?;
+            self.terminal.store(true, Ordering::Release);
+            status
+        };
+        #[cfg(target_os = "linux")]
+        if let Some(managed_child) = self.managed_child.take() {
+            managed_children::unregister(managed_child);
+        }
         Ok(ProcessStatus::from(status))
     }
 
@@ -863,6 +915,13 @@ impl ProcessHandle {
     ///
     /// Returns an error if the signal cannot be sent.
     pub fn signal(&self, sig: Signal) -> Result<()> {
+        let _signal_guard = self
+            .signal_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.terminal.load(Ordering::Acquire) {
+            return Err(miette::miette!("process has exited"));
+        }
         let pid = i32::try_from(self.pid).unwrap_or(i32::MAX);
         signal::kill(Pid::from_raw(pid), sig).into_diagnostic()
     }
@@ -902,7 +961,9 @@ impl ProcessHandle {
 impl Drop for ProcessHandle {
     fn drop(&mut self) {
         #[cfg(target_os = "linux")]
-        managed_children::unregister(self.pid);
+        if let Some(managed_child) = self.managed_child.take() {
+            managed_children::unregister(managed_child);
+        }
     }
 }
 
@@ -1613,6 +1674,14 @@ pub struct ProcessStatus {
 }
 
 impl ProcessStatus {
+    /// Construct a normal exit status.
+    #[must_use]
+    pub const fn exited(code: i32) -> Self {
+        Self {
+            code: Some(code),
+            signal: None,
+        }
+    }
     /// Get the exit code, or 128 + signal number if killed by signal.
     #[must_use]
     pub fn code(&self) -> i32 {

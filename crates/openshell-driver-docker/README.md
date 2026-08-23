@@ -45,7 +45,7 @@ contract:
 | `network_mode = openshell` | Places the supervisor on the managed Docker bridge network. |
 | `cap_add` | Grants supervisor-only capabilities required for namespace setup and process inspection. |
 | `apparmor=unconfined` | Avoids Docker's default profile blocking required mount operations. |
-| `restart_policy = unless-stopped` | Keeps managed sandboxes resumable across daemon or gateway restarts. |
+| `restart_policy = no` | Keeps each admitted isolation-boundary lifecycle one-shot. |
 | `PidsLimit` | Enforces the sandbox PID budget at the Docker cgroup layer. Set `[openshell.drivers.docker].sandbox_pids_limit = 0` to inherit the Docker/runtime default. |
 | CDI GPU request | Uses opaque `driver_config.cdi_devices` values when set; otherwise selects the requested count of NVIDIA CDI GPUs in round-robin order when daemon CDI support is detected. Docker daemon `/info` can permit `nvidia.com/gpu=all` as a WSL2 all-only compatibility fallback, where it counts as one selectable device. Exact CDI device lists must not contain duplicates and must match the effective GPU count. |
 
@@ -136,7 +136,6 @@ overwrites security-critical keys:
 - `OPENSHELL_SANDBOX`
 - `OPENSHELL_SSH_SOCKET_PATH`
 - `OPENSHELL_SANDBOX_COMMAND`
-- `OPENSHELL_TOPOLOGY_DESCRIPTOR` (RFC 0012 topology descriptor for the boundary)
 - TLS path variables when HTTPS is enabled
 
 Do not allow sandbox images or templates to override these values.

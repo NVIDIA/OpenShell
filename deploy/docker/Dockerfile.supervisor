@@ -6,9 +6,8 @@
 # Supervisor image build.
 #
 # The final image carries the static `openshell-sandbox` binary used by Docker
-# extraction, Podman image volumes, and the Kubernetes init container copy-self
-# path. It also includes nftables so the Kubernetes supervisor sidecar can
-# install pod-namespace egress enforcement rules.
+# extraction, Podman image volumes, and Kubernetes side-loading. It also carries
+# a materialized helper runtime used for trusted network setup and enforcement.
 #
 # The Rust binary is built natively before this image build runs and staged at:
 #   deploy/docker/.build/prebuilt-binaries/<arch>/openshell-sandbox
@@ -23,7 +22,23 @@ FROM alpine:3.22 AS supervisor
 
 ARG TARGETARCH
 
-RUN apk add --no-cache nftables iptables iptables-legacy
+RUN apk add --no-cache iproute2 nftables iptables iptables-legacy \
+    && mkdir -p /openshell-runtime/usr /openshell-runtime/etc \
+    && cp -aL /bin /sbin /lib /openshell-runtime/ \
+    && cp -aL /usr/bin /usr/sbin /usr/lib /openshell-runtime/usr/ \
+    && if [ -d /etc/iproute2 ]; then \
+         cp -aL /etc/iproute2 /openshell-runtime/etc/; \
+       fi \
+    && if [ -d /usr/share/nftables ]; then \
+         mkdir -p /openshell-runtime/usr/share; \
+         cp -aL /usr/share/nftables /openshell-runtime/usr/share/; \
+       fi \
+    && loader="$(find /openshell-runtime/lib -maxdepth 1 -type f -name 'ld-musl-*.so.1' | head -n 1)" \
+    && test -n "$loader" \
+    && "$loader" --library-path /openshell-runtime/lib:/openshell-runtime/usr/lib \
+         /openshell-runtime/sbin/ip -Version \
+    && "$loader" --library-path /openshell-runtime/lib:/openshell-runtime/usr/lib \
+         /openshell-runtime/usr/sbin/nft --version
 
 # --chmod=0555 restores execute bits after the actions/upload-artifact +
 # download-artifact roundtrip strips them. Ownership stays root (0:0) for

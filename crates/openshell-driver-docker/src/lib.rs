@@ -71,6 +71,8 @@ const WATCH_POLL_INTERVAL: Duration = Duration::from_secs(2);
 const WATCH_POLL_MAX_BACKOFF: Duration = Duration::from_secs(30);
 
 const SUPERVISOR_MOUNT_PATH: &str = openshell_core::driver_utils::SUPERVISOR_CONTAINER_BINARY;
+const SUPERVISOR_RUNTIME_MOUNT_PATH: &str = "/opt/openshell/bin/openshell-runtime";
+const SUPERVISOR_IMAGE_RUNTIME_PATH: &str = "/openshell-runtime";
 const TLS_CA_MOUNT_PATH: &str = openshell_core::driver_utils::TLS_CA_MOUNT_PATH;
 const TLS_CERT_MOUNT_PATH: &str = openshell_core::driver_utils::TLS_CERT_MOUNT_PATH;
 const TLS_KEY_MOUNT_PATH: &str = openshell_core::driver_utils::TLS_KEY_MOUNT_PATH;
@@ -105,9 +107,9 @@ pub struct DockerComputeConfig {
     /// Optional override for the Linux `openshell-sandbox` binary mounted into containers.
     pub supervisor_bin: Option<PathBuf>,
 
-    /// Optional image used to extract the Linux `openshell-sandbox` binary.
-    /// Ignored when `supervisor_bin` is set. See `resolve_supervisor_bin` for
-    /// the full resolution order.
+    /// Optional image used to extract the Linux `openshell-sandbox` binary and
+    /// its trusted helper runtime. With `supervisor_bin`, the image remains the
+    /// runtime source unless the binary has a valid sibling runtime directory.
     pub supervisor_image: Option<String>,
 
     /// Host-side CA certificate for Docker sandbox mTLS.
@@ -180,6 +182,7 @@ struct DockerDriverRuntimeConfig {
     stop_timeout_secs: u32,
     log_level: String,
     supervisor_bin: PathBuf,
+    supervisor_runtime: PathBuf,
     guest_tls: Option<DockerGuestTlsPaths>,
     daemon_version: String,
     supports_gpu: bool,
@@ -363,6 +366,8 @@ impl DockerComputeDriver {
         );
         let daemon_arch = normalize_docker_arch(version.arch.as_deref().unwrap_or_default());
         let supervisor_bin = resolve_supervisor_bin(&docker, &docker_config, &daemon_arch).await?;
+        let supervisor_runtime =
+            resolve_supervisor_runtime(&docker, &docker_config, &supervisor_bin).await?;
         let guest_tls = docker_guest_tls_paths(&docker_config)?;
 
         let driver = Self {
@@ -378,6 +383,7 @@ impl DockerComputeDriver {
                 stop_timeout_secs: DEFAULT_STOP_TIMEOUT_SECS,
                 log_level: config.log_level.clone(),
                 supervisor_bin,
+                supervisor_runtime,
                 guest_tls,
                 daemon_version: version.version.unwrap_or_else(|| "unknown".to_string()),
                 supports_gpu,
@@ -2040,11 +2046,18 @@ fn build_binds(
     sandbox: &DriverSandbox,
     config: &DockerDriverRuntimeConfig,
 ) -> Result<Vec<String>, Status> {
-    let mut binds = vec![format!(
-        "{}:{}:ro,z",
-        config.supervisor_bin.display(),
-        SUPERVISOR_MOUNT_PATH
-    )];
+    let mut binds = vec![
+        format!(
+            "{}:{}:ro,z",
+            config.supervisor_bin.display(),
+            SUPERVISOR_MOUNT_PATH
+        ),
+        format!(
+            "{}:{}:ro,z",
+            config.supervisor_runtime.display(),
+            SUPERVISOR_RUNTIME_MOUNT_PATH
+        ),
+    ];
     if let Some(tls) = &config.guest_tls {
         binds.push(format!("{}:{}:ro,z", tls.ca.display(), TLS_CA_MOUNT_PATH));
         binds.push(format!(
@@ -2222,12 +2235,6 @@ fn build_environment_for_oci_user(
     environment.insert(
         openshell_core::sandbox_env::TELEMETRY_ENABLED.to_string(),
         openshell_core::telemetry::enabled_env_value().to_string(),
-    );
-    // RFC 0012: the driver provisions the topology and delivers its descriptor
-    // to the supervisor through the driver-controlled environment.
-    environment.insert(
-        openshell_core::sandbox_env::TOPOLOGY_DESCRIPTOR.to_string(),
-        openshell_isolation::contract::TopologyDescriptor::in_pod().to_env_value(),
     );
     // The root supervisor executes namespace helpers during bootstrap; keep
     // their search path driver-owned even when the template/spec set PATH.
@@ -2415,7 +2422,15 @@ fn build_container_create_body_for_image(
         entrypoint: Some(vec![SUPERVISOR_MOUNT_PATH.to_string()]),
         // Clear the image CMD so Docker does not append inherited args to the
         // supervisor entrypoint.
-        cmd: Some(Vec::new()),
+        cmd: Some(vec![
+            "--topology-backend-name=in-pod".to_string(),
+            format!(
+                "--topology-version={}",
+                openshell_isolation::contract::INTERFACE_VERSION
+            ),
+            "--topology-payload-base64=".to_string(),
+            "--".to_string(),
+        ]),
         labels: Some(labels),
         host_config: Some(HostConfig {
             nano_cpus: resource_limits.nano_cpus,
@@ -2429,7 +2444,7 @@ fn build_container_create_body_for_image(
             },
             mounts: Some(user_mounts),
             restart_policy: Some(RestartPolicy {
-                name: Some(RestartPolicyNameEnum::UNLESS_STOPPED),
+                name: Some(RestartPolicyNameEnum::NO),
                 maximum_retry_count: None,
             }),
             cap_add: Some(vec![
@@ -3152,6 +3167,32 @@ pub(crate) async fn resolve_supervisor_bin(
     }
 }
 
+async fn resolve_supervisor_runtime(
+    docker: &Docker,
+    docker_config: &DockerComputeConfig,
+    supervisor_bin: &Path,
+) -> CoreResult<PathBuf> {
+    if let Some(runtime) = supervisor_bin
+        .parent()
+        .map(|parent| parent.join("openshell-runtime"))
+        && validate_supervisor_runtime(&runtime).is_ok()
+    {
+        return Ok(runtime);
+    }
+
+    let image = docker_config
+        .supervisor_image
+        .clone()
+        .unwrap_or_else(openshell_core::config::default_supervisor_image);
+    let extracted_bin = extract_supervisor_bin_from_image(docker, &image).await?;
+    let runtime = extracted_bin
+        .parent()
+        .expect("cache path has a parent")
+        .join("openshell-runtime");
+    validate_supervisor_runtime(&runtime)?;
+    Ok(runtime)
+}
+
 fn linux_supervisor_candidates(daemon_arch: &str) -> Vec<PathBuf> {
     match daemon_arch {
         "arm64" => vec![PathBuf::from(
@@ -3222,6 +3263,8 @@ async fn extract_supervisor_bin_from_image(docker: &Docker, image: &str) -> Core
     let cache_path = supervisor_cache_path(&digest)?;
     if cache_path.is_file() {
         validate_linux_elf_binary(&cache_path)?;
+        ensure_cached_supervisor_runtime(docker, image, cache_path.parent().expect("cache parent"))
+            .await?;
         return Ok(cache_path);
     }
 
@@ -3248,7 +3291,93 @@ async fn extract_supervisor_bin_from_image(docker: &Docker, image: &str) -> Core
     let binary_bytes = extract_supervisor_binary_bytes(docker, image).await?;
     write_cache_binary_atomic(&cache_path, &binary_bytes)?;
     validate_linux_elf_binary(&cache_path)?;
+    ensure_cached_supervisor_runtime(docker, image, cache_dir).await?;
     Ok(cache_path)
+}
+
+fn validate_supervisor_runtime(runtime: &Path) -> CoreResult<()> {
+    if !runtime.is_dir() {
+        return Err(Error::config(format!(
+            "trusted supervisor helper runtime '{}' is missing",
+            runtime.display()
+        )));
+    }
+    let has_ip = ["usr/sbin/ip", "sbin/ip", "usr/bin/ip", "bin/ip"]
+        .iter()
+        .any(|path| runtime.join(path).is_file());
+    let has_nft = ["usr/sbin/nft", "sbin/nft", "usr/bin/nft"]
+        .iter()
+        .any(|path| runtime.join(path).is_file());
+    let has_loader = std::fs::read_dir(runtime.join("lib"))
+        .ok()
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .any(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.starts_with("ld-musl-") && name.ends_with(".so.1"))
+        });
+    if !has_ip || !has_nft || !has_loader {
+        return Err(Error::config(format!(
+            "trusted supervisor helper runtime '{}' is incomplete",
+            runtime.display()
+        )));
+    }
+    Ok(())
+}
+
+async fn ensure_cached_supervisor_runtime(
+    docker: &Docker,
+    image: &str,
+    cache_dir: &Path,
+) -> CoreResult<()> {
+    let runtime = cache_dir.join("openshell-runtime");
+    if validate_supervisor_runtime(&runtime).is_ok() {
+        return Ok(());
+    }
+
+    let archive = extract_supervisor_runtime_archive(docker, image).await?;
+    let staging = tempfile::Builder::new()
+        .prefix(".openshell-runtime-")
+        .tempdir_in(cache_dir)
+        .map_err(|err| Error::config(format!("create runtime staging directory: {err}")))?;
+    let mut tar = tar::Archive::new(std::io::Cursor::new(archive));
+    for entry in tar
+        .entries()
+        .map_err(|err| Error::config(format!("open supervisor runtime archive: {err}")))?
+    {
+        let mut entry = entry
+            .map_err(|err| Error::config(format!("read supervisor runtime archive: {err}")))?;
+        let kind = entry.header().entry_type();
+        if !kind.is_file() && !kind.is_dir() {
+            return Err(Error::config(
+                "supervisor runtime archive contains a non-materialized link or special file",
+            ));
+        }
+        if !entry
+            .unpack_in(staging.path())
+            .map_err(|err| Error::config(format!("extract supervisor runtime archive: {err}")))?
+        {
+            return Err(Error::config(
+                "supervisor runtime archive contains a path outside its root",
+            ));
+        }
+    }
+    let extracted = staging.path().join("openshell-runtime");
+    validate_supervisor_runtime(&extracted)?;
+    match std::fs::rename(&extracted, &runtime) {
+        Ok(()) => {}
+        Err(_) if validate_supervisor_runtime(&runtime).is_ok() => {}
+        Err(err) => {
+            return Err(Error::config(format!(
+                "install trusted supervisor runtime '{}': {err}",
+                runtime.display()
+            )));
+        }
+    }
+    validate_supervisor_runtime(&runtime)
 }
 
 async fn pull_supervisor_image(docker: &Docker, image: &str) -> CoreResult<()> {
@@ -3274,6 +3403,19 @@ async fn pull_supervisor_image(docker: &Docker, image: &str) -> CoreResult<()> {
 /// binary as a tar archive, and return the untarred file bytes. The
 /// container is always removed, even on error paths.
 async fn extract_supervisor_binary_bytes(docker: &Docker, image: &str) -> CoreResult<Vec<u8>> {
+    extract_supervisor_path_archive(docker, image, SUPERVISOR_IMAGE_BINARY_PATH, true).await
+}
+
+async fn extract_supervisor_runtime_archive(docker: &Docker, image: &str) -> CoreResult<Vec<u8>> {
+    extract_supervisor_path_archive(docker, image, SUPERVISOR_IMAGE_RUNTIME_PATH, false).await
+}
+
+async fn extract_supervisor_path_archive(
+    docker: &Docker,
+    image: &str,
+    path: &str,
+    extract_single_file: bool,
+) -> CoreResult<Vec<u8>> {
     let container_name = temp_extract_container_name();
     docker
         .create_container(
@@ -3297,7 +3439,8 @@ async fn extract_supervisor_binary_bytes(docker: &Docker, image: &str) -> CoreRe
         })?;
 
     // Always tear down the extractor container, even if extraction fails.
-    let result = download_binary_from_container(docker, &container_name).await;
+    let result =
+        download_path_from_container(docker, &container_name, path, extract_single_file).await;
     if let Err(remove_err) = docker
         .remove_container(
             &container_name,
@@ -3314,12 +3457,14 @@ async fn extract_supervisor_binary_bytes(docker: &Docker, image: &str) -> CoreRe
     result
 }
 
-async fn download_binary_from_container(
+async fn download_path_from_container(
     docker: &Docker,
     container_name: &str,
+    path: &str,
+    extract_single_file: bool,
 ) -> CoreResult<Vec<u8>> {
     let options = DownloadFromContainerOptionsBuilder::default()
-        .path(SUPERVISOR_IMAGE_BINARY_PATH)
+        .path(path)
         .build();
     let mut stream = docker.download_from_container(container_name, Some(options));
 
@@ -3333,11 +3478,15 @@ async fn download_binary_from_container(
         tar_bytes.extend_from_slice(&chunk);
     }
 
-    extract_first_tar_entry(&tar_bytes).map_err(|err| {
-        Error::config(format!(
-            "failed to extract supervisor binary from tar archive returned by '{container_name}': {err}",
-        ))
-    })
+    if extract_single_file {
+        extract_first_tar_entry(&tar_bytes).map_err(|err| {
+            Error::config(format!(
+                "failed to extract supervisor binary from tar archive returned by '{container_name}': {err}",
+            ))
+        })
+    } else {
+        Ok(tar_bytes)
+    }
 }
 
 /// Extract the payload of the first regular-file entry in a tar archive.

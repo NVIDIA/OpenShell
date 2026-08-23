@@ -51,30 +51,31 @@ paths, such as proxy support files or GPU device paths when a GPU is present.
 
 ## Isolation Backend
 
-The supervisor does not build the boundary inline. It drives an **isolation
-backend** (RFC 0012) through one runtime contract (`attach` → `confirm` →
-`start_agent`, over the `Bound`/`Ready`/`Running` type-state), so the same
-supervisor code runs wherever the boundary sits. The supervisor selects the
-backend from the driver-provided `TopologyDescriptor` and never branches on
-which one it resolved. Two backends exist:
+[RFC 0012](../rfc/0012-isolation-backend/README.md) defines the Isolation
+Backend contract for topology-specific boundary construction and process
+operations. The contract uses consuming
+lifecycle states (`attach` → `Bound` → `confirm` → `Ready` → `start_agent` →
+`Running`) so untrusted workload execution cannot begin before standing
+enforcement is confirmed.
 
-- **in-pod** — builds and operates the boundary in the same process, over the
-  existing primitives (network namespace, proxy, the pre-exec Landlock/seccomp
-  ceiling, procfs identity).
-- **sidecar** (Kubernetes) — the agent container's supervisor runs this backend
-  to operate the workload; network mediation runs in a separate network-sidecar
-  container the backend coordinates (the agent container holds no gateway
-  credentials and receives its policy over a peer-cred-authenticated control
-  socket). The agent stays autonomous — it spawns its own workload — so the
-  backend wraps that path rather than inverting control.
+The logical supervisor remains the trusted bridge between the gateway and the
+workload. It drives the backend and applies approved network policy through
+supervisor-owned mediation; the backend routes workload egress to that
+mediation. The trusted Kubernetes driver selects the co-located backend for
+combined topology and supplies its topology descriptor to the supervisor.
+Sidecar topology remains on its pre-RFC lifecycle; a conforming backend for
+that placement requires separate design and implementation. Docker, Podman,
+and VM drivers provision the same co-located topology and supply its descriptor
+by default. The co-located backend requires the
+supervisor to own the execution environment's PID namespace so boundary
+teardown can terminate every remaining workload process.
 
-`attach` binds the trusted sandbox context and establishes standing enforcement;
-`confirm` verifies it (fail-closed); `start_agent` establishes the per-process
-launch-time controls (Landlock/seccomp) before the first untrusted instruction;
-identity resolves the connecting binary from procfs at runtime. The lifecycle
-handles are unforgeable type-state tokens, so the order (and thus "no workload
-runs before the boundary is ready") holds by construction rather than by
-convention.
+For proxy-mode boundaries, the co-located backend verifies its default-deny
+kernel egress ceiling before exposing any workload execution surface and then
+rechecks it every 250 milliseconds. Each check has a two-second deadline.
+Verification failure or timeout ends the boundary and triggers process cleanup;
+the PID-1 supervisor exits so the kernel terminates the complete workload PID
+namespace. The topology's detection-and-termination bound is five seconds.
 
 ## Network and Inference
 

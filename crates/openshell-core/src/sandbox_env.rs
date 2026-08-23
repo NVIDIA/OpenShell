@@ -17,17 +17,6 @@ pub const ENDPOINT: &str = "OPENSHELL_ENDPOINT";
 /// Unique identifier of the sandbox being supervised.
 pub const SANDBOX_ID: &str = "OPENSHELL_SANDBOX_ID";
 
-/// Serialized RFC 0012 `TopologyDescriptor` for the boundary this sandbox runs
-/// behind.
-///
-/// Set by the compute driver that provisioned the topology; driver-required,
-/// so it overrides any user-supplied value. This is the in-pod delivery
-/// transport for provisioning's descriptor handoff to the supervisor role.
-/// The descriptor is supervisor-only bootstrap state: the supervisor reads it
-/// once at startup and never exposes it to the agent, exec sessions, or any
-/// other process inside the boundary.
-pub const TOPOLOGY_DESCRIPTOR: &str = "OPENSHELL_TOPOLOGY_DESCRIPTOR";
-
 /// Filesystem path to the UNIX socket used for the in-sandbox SSH server.
 pub const SSH_SOCKET_PATH: &str = "OPENSHELL_SSH_SOCKET_PATH";
 
