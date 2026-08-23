@@ -347,7 +347,7 @@ rg -q 'COPY bin/validate-review-findings /usr/local/bin/validate-review-findings
     "$GATOR_DIR/Dockerfile"
 ruby -ryaml -e '
   manifest = YAML.load_file(ARGV.fetch(0))
-  abort unless manifest.fetch("payload_version") == 5
+  abort unless manifest.fetch("payload_version") == 6
   resource = manifest.fetch("resources").find {
     |entry| entry.fetch("id") == "gator-review-findings-schema"
   }

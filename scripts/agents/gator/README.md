@@ -59,4 +59,5 @@ The launcher preserves existing gateway-owned Codex refresh material by default 
 ```shell
 bash scripts/agents/gator/bin/gh_guard_test.sh
 bash scripts/agents/gator/bin/review_feedback_ledger_test.sh
+bash scripts/agents/runtime/harnesses/codex/exec_test.sh
 ```
