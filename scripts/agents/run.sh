@@ -331,18 +331,42 @@ provider_exists() {
 import_provider_profile() {
     local profile_id="$1"
     local profile_file="$2"
-    local import_output
+    local import_output current_profile resource_version update_dir update_file
 
     openshell_cmd provider profile delete "$profile_id" >/dev/null 2>&1 || true
     if import_output="$(openshell_cmd provider profile import --file "$profile_file" 2>&1)"; then
         return 0
     fi
     if [[ "$import_output" == *"already exists"* ]]; then
+        if ! current_profile="$(openshell_cmd provider profile export \
+            --output json "$profile_id")"; then
+            echo "failed to export existing provider profile: $profile_id" >&2
+            return 1
+        fi
+        resource_version="$(printf '%s' "$current_profile" | \
+            jq -r '.resource_version // 0')"
+        [[ "$resource_version" =~ ^[1-9][0-9]*$ ]] || {
+            echo "existing provider profile has no resource version: $profile_id" >&2
+            return 1
+        }
+
+        update_dir="$(mktemp -d "${TMPDIR:-/tmp}/openshell-provider-profile-XXXXXX")"
+        update_file="$update_dir/profile.yaml"
+        ruby -ryaml - "$profile_file" "$resource_version" "$update_file" <<'RUBY'
+profile_file, resource_version, update_file = ARGV
+profile = YAML.load_file(profile_file) || {}
+profile["resource_version"] = Integer(resource_version, 10)
+File.write(update_file, YAML.dump(profile))
+RUBY
         if openshell_cmd provider profile update "$profile_id" \
-            --file "$profile_file" >/dev/null; then
+            --file "$update_file" >/dev/null; then
+            rm -f "$update_file"
+            rmdir "$update_dir"
             echo "Updated provider profile: $profile_file"
             return 0
         fi
+        rm -f "$update_file"
+        rmdir "$update_dir"
         echo "failed to update existing provider profile: $profile_id" >&2
         return 1
     fi
