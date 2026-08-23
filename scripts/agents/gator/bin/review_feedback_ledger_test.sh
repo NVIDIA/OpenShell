@@ -347,7 +347,7 @@ rg -q 'COPY bin/validate-review-findings /usr/local/bin/validate-review-findings
     "$GATOR_DIR/Dockerfile"
 ruby -ryaml -e '
   manifest = YAML.load_file(ARGV.fetch(0))
-  abort unless manifest.fetch("payload_version") == 4
+  abort unless manifest.fetch("payload_version") == 5
   resource = manifest.fetch("resources").find {
     |entry| entry.fetch("id") == "gator-review-findings-schema"
   }
@@ -384,5 +384,11 @@ rg -q '`test_dispatch_required`' \
     "$GATOR_DIR/skills/gator-gate/SKILL.md"
 rg -q 'attacker_or_operator_prerequisite' \
     "$GATOR_DIR/skills/gator-gate/references/review-findings-schema.md"
+rg -Fq 'Write `Summary` as natural prose that can be read aloud' \
+    "$GATOR_DIR/skills/gator-gate/SKILL.md"
+rg -Fq '<summary>Agent context</summary>' \
+    "$GATOR_DIR/skills/gator-gate/SKILL.md"
+rg -Fq 'Those fields validate the finding;' \
+    "$GATOR_DIR/skills/gator-gate/SKILL.md"
 
 printf 'PASS: gator review feedback ledger tests\n'

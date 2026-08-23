@@ -39,6 +39,7 @@ The launcher:
 - Installs the gator-specific `gh` wrapper from `gator/bin/gh` as `/usr/local/bin/gh` to fail closed when same-head-SHA history cannot be checked, prevent duplicate dispositions, and require versioned review payloads.
 - Installs `gator/bin/review-feedback-ledger` as `/usr/local/bin/review-feedback-ledger` so reviews receive tree- and patch-aware scope, prior summaries and findings, resolution state, convergence telemetry, and the three-round Warning budget.
 - Installs `gator/bin/validate-review-findings` to downgrade blockers that lack the required reachability, ownership, base-vs-head, impact, and reproducer evidence.
+- Keeps that normalized evidence as Gator's internal review contract, then renders validated blockers for people as a read-aloud `Summary`, an actionable `Fix`, and a deterministic `Verify`. Exact paths and only the additional provenance an implementation agent needs appear in collapsed `Agent context`; raw evidence headings such as `Base` and `Head` are not posted publicly.
 - Bakes `scripts/agents/gator/skills/gator-gate/SKILL.md` into `/etc/openshell/agent-payload`.
 - Bakes `.claude/agents/principal-engineer-reviewer.md` so the selected harness can run a deterministic independent reviewer execution through `/etc/openshell/agent-payload/runtime/subagent.sh principal-engineer-reviewer < task.md`.
 - For `--harness codex`, optionally bakes a host Codex executable as `/etc/openshell/agent-payload/runtime/harnesses/codex/codex`.

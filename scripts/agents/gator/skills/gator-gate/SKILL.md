@@ -746,10 +746,38 @@ Post findings using these rules:
 - Submit all inline comments for a head SHA together in one `COMMENT` review. The review summary plus its complete inline-comment batch is the single gator disposition for that SHA.
 - Begin the review summary and each inline body with `> **gator-agent**`. Put the current head SHA in the summary using the canonical `Head SHA: <sha>` field.
 - Put the stable finding ID in every blocking summary item and inline comment.
-- In each blocker, state reachability, impact, why the PR owns the problem, and
-  the proportionate requested change. Also state the prerequisite, supported
-  entry point and sink, base-vs-head behavior, and deterministic reproducer
-  from the validated evidence contract.
+- Keep the normalized evidence contract in `review-findings.json`; do not copy
+  its field labels into the public comment. Render each new blocker as the
+  human-first card below.
+- Write `Summary` as natural prose that can be read aloud to someone who has
+  not seen the code. In one compact paragraph, explain who encounters the
+  problem, what they do, what goes wrong, and the concrete consequence. Prefer
+  product concepts over internal identifiers unless an identifier is needed
+  to understand the issue.
+- Write `Fix` as a proportionate imperative derived from `requested_change`.
+  Retain every operative constraint and required regression-test outcome.
+- Write `Verify` as a deterministic setup, action, and current-versus-expected
+  observation derived from `reproducer`. Preserve identity and equality
+  qualifiers and distinguish concurrent calls, staged objects, and durable
+  state when those distinctions matter.
+- Across the visible card and its agent context, preserve the operative facts
+  needed to understand, fix, and verify the blocker: exact trigger conditions,
+  actor or permission scope, supported-path qualifiers, causal direction,
+  observable impact, relevant identifiers, and negations. Never move a read,
+  transform, store, forward, reject, or delete operation to a neighboring
+  component for brevity. Do not infer missing facts.
+- Do not expose `Invariant`, `Prerequisite`, `Entry point`, `Sink`, `Base`,
+  `Head`, or `PR ownership` as headings. Those fields validate the finding;
+  they are not the public explanation.
+- Add collapsed `Agent context` after the visible card. Always include the
+  validated `changed_location` as `path:line`. Include the exact execution
+  path, PR ownership, minimal historical contrast, or concrete sibling sites
+  only when that information is not already clear above and helps an agent act
+  or establishes otherwise-unclear PR causality. Do not add empty rows or
+  duplicate the visible prose. Most findings need no historical comparison.
+- Target roughly 130 total words and about half the legacy evidence-dump
+  length. Operative fidelity is the escape hatch: exceed the target rather
+  than make the defect, fix, or verification ambiguous.
 - Use the review summary for blocking design concerns, missing tests,
   cross-file findings, and blockers that cannot be anchored because the
   relevant line is outside the mode-appropriate diff. For an unanchored
@@ -776,7 +804,7 @@ Build the batch as one REST request. Verify every requested line appears in the 
       "path": "crates/example/src/lib.rs",
       "line": 123,
       "side": "RIGHT",
-      "body": "> **gator-agent**\n\n**Warning — GATOR-12345678-01**\n\nInvariant: <root cause and sibling family>\n\nPrerequisite: <attacker or operator capability>\n\nEntry point → sink: <supported path> → <effectful operation>\n\nBase → head: <old behavior> → <introduced or worsened behavior>\n\nImpact: <material observable impact>\n\nReproducer: <minimal deterministic test>\n\nPR ownership: <why this change owns the defect>\n\nRequested change: <proportionate fix>"
+      "body": "> **gator-agent**\n\n**Warning — GATOR-12345678-01 · Authorization happens after lookup**\n\n**Summary:** A user who can request a workspace can make the server look up another workspace before checking access. That discloses whether the workspace exists.\n\n**Fix:** Restore the authorization check before the workspace lookup and cover cross-workspace requests.\n\n**Verify:** Request another workspace as an unauthorized user; the server must return 404 without performing the lookup.\n\n<details>\n<summary>Agent context</summary>\n\n- **Agent path:** `GET /workspaces/{name}` → workspace record lookup\n- **Ownership:** This PR reordered the authorization check and lookup.\n- **Location:** `server.rs:123`\n\n</details>"
     }
   ]
 }
