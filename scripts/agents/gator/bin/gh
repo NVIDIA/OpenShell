@@ -7,7 +7,7 @@ set -euo pipefail
 
 REAL_GH="${OPENSHELL_REAL_GH:-/usr/bin/gh}"
 GATOR_MARKER='> **gator-agent**'
-GATOR_PAYLOAD_VERSION="${OPENSHELL_AGENT_PAYLOAD_VERSION:-4}"
+GATOR_PAYLOAD_VERSION="${OPENSHELL_AGENT_PAYLOAD_VERSION:-5}"
 
 if [[ $# -lt 1 || "$1" != "api" ]]; then
     exec "$REAL_GH" "$@"

@@ -778,6 +778,18 @@ Post findings using these rules:
 - Target roughly 130 total words and about half the legacy evidence-dump
   length. Operative fidelity is the escape hatch: exceed the target rather
   than make the defect, fix, or verification ambiguous.
+- Put review-process bookkeeping at the end of the review summary in one
+  collapsed `<details><summary>Gator metadata</summary>` block. This includes
+  validation provenance, docs and E2E disposition, check status, head/base/
+  merge-base SHAs, patch ID, payload version, review mode, previous reviewed
+  SHA, review-budget state, maintainer-decision state, next Gator state, and a
+  machine-readable blocked reason. Keep the canonical `Head SHA: <sha>` and
+  `Gator payload: <version>` text intact inside the block so the write guard
+  and feedback ledger can parse them.
+- Do not hide an action a person must take. When blocked, approval-needed, or
+  awaiting clarification, put one plain-language `Action required:` sentence
+  in the visible summary. Keep the redundant state code and operational detail
+  in `Gator metadata`.
 - Use the review summary for blocking design concerns, missing tests,
   cross-file findings, and blockers that cannot be anchored because the
   relevant line is outside the mode-appropriate diff. For an unanchored
@@ -798,7 +810,7 @@ Build the batch as one REST request. Verify every requested line appears in the 
 {
   "commit_id": "<head-sha>",
   "event": "COMMENT",
-  "body": "> **gator-agent**\n\n## PR Review Status\n\nHead SHA: `<head-sha>`\nBase SHA: `<base-sha>`\nMerge base SHA: `<merge-base-sha>`\nPatch ID: `<patch-id>`\nGator payload: `<payload-version>`\n\n<summary and general findings>",
+  "body": "> **gator-agent**\n\n## PR Review Status\n\n<plain-language disposition and general findings>\n\n<details>\n<summary>Gator metadata</summary>\n\n- Head SHA: `<head-sha>`\n- Base SHA: `<base-sha>`\n- Merge base SHA: `<merge-base-sha>`\n- Patch ID: `<patch-id>`\n- Gator payload: `<payload-version>`\n\n</details>",
   "comments": [
     {
       "path": "crates/example/src/lib.rs",
@@ -1014,16 +1026,9 @@ Recommended next step: <create-spike/build-from-issue/human planning/other>.
 
 ## PR Review Status
 
-Validation: <why this PR is project-valid>
-Head SHA: `<sha>`
-Base SHA: `<sha>`
-Merge base SHA: `<sha>`
-Patch ID: `<stable patch id>`
-Gator payload: `<payload version>`
-Review mode: `<initial|follow_up|critical_only>`
-Previous reviewed SHA: `<sha or none>`
-Review budget exhausted: `<yes|no>`
-Maintainer decision required: `<yes|no — concrete reason when yes>`
+<one or two natural sentences describing the review disposition>
+
+Action required: <specific human action; include only when one is required>
 
 Blocking findings:
 - `<finding-id>`: <finding or "No blocking findings remain">
@@ -1034,9 +1039,26 @@ Carried findings:
 Non-blocking suggestions:
 - <initial-review suggestion or "None"; omit on follow-up reviews>
 
-Docs: <Fern docs updated / not needed because ... / missing for direct UX change>
+<details>
+<summary>Gator metadata</summary>
 
-Next state: `<gator:in-review|gator:watch-pipeline|gator:follow-up-needed|gator:blocked>`
+- Validation: <why this PR is project-valid>
+- Docs: <Fern docs updated / not needed because ... / missing for direct UX change>
+- Checks: <current-head required-check disposition>
+- E2E: <current-head E2E disposition or N/A>
+- Head SHA: `<sha>`
+- Base SHA: `<sha>`
+- Merge base SHA: `<sha>`
+- Patch ID: `<stable patch id>`
+- Gator payload: `<payload version>`
+- Review mode: `<initial|follow_up|critical_only>`
+- Previous reviewed SHA: `<sha or none>`
+- Review budget exhausted: `<yes|no>`
+- Maintainer decision required: `<yes|no — concrete reason when yes>`
+- Next state: `<gator:in-review|gator:watch-pipeline|gator:follow-up-needed|gator:blocked>`
+- Blocked reason: `<machine-readable reason; include only when blocked>`
+
+</details>
 ```
 
 ### Maintainer Convergence Decision
@@ -1045,12 +1067,6 @@ Next state: `<gator:in-review|gator:watch-pipeline|gator:follow-up-needed|gator:
 > **gator-agent**
 
 ## Maintainer Convergence Decision
-
-Head SHA: `<sha>`
-Base SHA: `<sha>`
-Merge base SHA: `<sha>`
-Patch ID: `<stable patch id>`
-Gator payload: `<payload version>`
 
 The autonomous Warning budget is exhausted, and a specific maintainer decision
 is required before review can proceed.
@@ -1067,8 +1083,18 @@ Reviewer-quality signals:
 Maintainer action: <state only the applicable choice, affected finding or scope
 boundary, and exact next action>
 
-Next state: `gator:blocked`
-Blocked reason: `review_convergence_decision_required`
+<details>
+<summary>Gator metadata</summary>
+
+- Head SHA: `<sha>`
+- Base SHA: `<sha>`
+- Merge base SHA: `<sha>`
+- Patch ID: `<stable patch id>`
+- Gator payload: `<payload version>`
+- Next state: `gator:blocked`
+- Blocked reason: `review_convergence_decision_required`
+
+</details>
 ```
 
 ### Human Response Disposition
@@ -1082,12 +1108,6 @@ Post this as a new comment after a substantive author, maintainer, or reviewer r
 
 Thanks <person>. I re-evaluated latest head `<sha>` after your <date/time> comment about <short paraphrase>.
 
-Head SHA: `<sha>`
-Base SHA: `<sha>`
-Merge base SHA: `<sha>`
-Patch ID: `<stable patch id>`
-Gator payload: `<payload version>`
-
 What I checked: <specific files, checks, or behavior inspected because of the comment>.
 
 Disposition: <resolved / partially resolved / not resolved / needs clarification>.
@@ -1095,7 +1115,20 @@ Disposition: <resolved / partially resolved / not resolved / needs clarification
 Remaining items:
 - <specific unresolved item, or "No blocking items remain">
 
-Next state: `<gator:in-review|gator:watch-pipeline|gator:follow-up-needed|gator:blocked|gator:approval-needed|gator:merge-ready>`
+Action required: <specific human action; include only when one is required>
+
+<details>
+<summary>Gator metadata</summary>
+
+- Head SHA: `<sha>`
+- Base SHA: `<sha>`
+- Merge base SHA: `<sha>`
+- Patch ID: `<stable patch id>`
+- Gator payload: `<payload version>`
+- Next state: `<gator:in-review|gator:watch-pipeline|gator:follow-up-needed|gator:blocked|gator:approval-needed|gator:merge-ready>`
+- Blocked reason: `<machine-readable reason; include only when blocked>`
+
+</details>
 ```
 
 ### Approval Needed
@@ -1107,13 +1140,20 @@ Next state: `<gator:in-review|gator:watch-pipeline|gator:follow-up-needed|gator:
 
 Gator validation and PR monitoring are complete.
 
-Validation: <summary>
 Review: <summary>
-Docs: <summary>
-Checks: <summary>
-E2E: <summary or N/A>
 
 Human maintainer approval is now required.
+
+<details>
+<summary>Gator metadata</summary>
+
+- Validation: <summary>
+- Docs: <summary>
+- Checks: <summary>
+- E2E: <summary or N/A>
+- Next state: `gator:approval-needed`
+
+</details>
 ```
 
 ### Merge Ready
@@ -1125,14 +1165,21 @@ Human maintainer approval is now required.
 
 Gator validation and PR monitoring are complete, and maintainer approval is present.
 
-Validation: <summary>
 Review: <summary>
 Approval: <summary>
-Docs: <summary>
-Checks: <summary>
-E2E: <summary or N/A>
 
 Human maintainer merge or close decision is now required.
+
+<details>
+<summary>Gator metadata</summary>
+
+- Validation: <summary>
+- Docs: <summary>
+- Checks: <summary>
+- E2E: <summary or N/A>
+- Next state: `gator:merge-ready`
+
+</details>
 ```
 
 ### Monitoring Complete

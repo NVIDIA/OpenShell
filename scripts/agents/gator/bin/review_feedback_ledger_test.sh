@@ -156,7 +156,7 @@ cat > "$tmp/reviews.json" <<'JSON'
       "login": "drew"
     },
     "author_association": "MEMBER",
-    "body": "> **gator-agent**\n\n## PR Review Status\n\nHead SHA: `1111111111111111111111111111111111111111`\nBase SHA: `aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa`\nMerge base SHA: `bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb`\nPatch ID: `cccccccccccccccccccccccccccccccccccccccc`\nGator payload: `2`\n\nGeneral findings:\n- Finding ID: GATOR-11111111-01 — Keep package verification.",
+    "body": "> **gator-agent**\n\n## PR Review Status\n\nGeneral findings:\n- Finding ID: GATOR-11111111-01 — Keep package verification.\n\n<details>\n<summary>Gator metadata</summary>\n\n- Head SHA: `1111111111111111111111111111111111111111`\n- Base SHA: `aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa`\n- Merge base SHA: `bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb`\n- Patch ID: `cccccccccccccccccccccccccccccccccccccccc`\n- Gator payload: `2`\n\n</details>",
     "state": "COMMENTED",
     "submitted_at": "2026-07-28T19:53:23Z",
     "commit_id": "1111111111111111111111111111111111111111"
@@ -387,6 +387,8 @@ rg -q 'attacker_or_operator_prerequisite' \
 rg -Fq 'Write `Summary` as natural prose that can be read aloud' \
     "$GATOR_DIR/skills/gator-gate/SKILL.md"
 rg -Fq '<summary>Agent context</summary>' \
+    "$GATOR_DIR/skills/gator-gate/SKILL.md"
+rg -Fq '<summary>Gator metadata</summary>' \
     "$GATOR_DIR/skills/gator-gate/SKILL.md"
 rg -Fq 'Those fields validate the finding;' \
     "$GATOR_DIR/skills/gator-gate/SKILL.md"
