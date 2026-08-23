@@ -138,6 +138,11 @@ Treat the ledger as required reviewer input, not optional background:
 - Carry every still-open finding forward as an existing obligation. Do not post
   a new thread or semantically equivalent general finding for it.
 - A Gator thread resolved by a verified maintainer is addressed. If the resolver is only the PR author, inspect the trusted reply and latest diff to decide whether the finding was fixed; resolution alone does not grant a non-maintainer author waiver authority.
+- When a later commit demonstrably fixes an open inline Gator finding, resolve
+  that Gator-owned GitHub review thread as part of the same reconciliation
+  cycle. Also resolve it after a verified maintainer explicitly waives the
+  finding. Do not resolve a thread merely because it is outdated, the author
+  says it is fixed, or a new review omits it.
 - Preserve a verified maintainer's reply as the rationale. An explicit rejection such as "invalid", "intentional", "fine as implemented", or "won't fix" is a waiver, not an unanswered request.
 - An unresolved thread with an explicit verified-maintainer waiver is also waived. A non-maintainer author's disagreement remains context for review but does not override a maintainer-required change.
 - Preserve each `GATOR-<origin-sha-prefix>-<ordinal>` finding ID across later
@@ -151,6 +156,33 @@ Treat the ledger as required reviewer input, not optional background:
 - Record the ledger's `review_telemetry` in the internal cycle summary. Treat a
   nonzero duplicate finding-ID count, a waived finding reappearing, or an
   unchanged-code proposal as a reviewer-quality signal, not an author defect.
+
+### Resolve addressed Gator threads
+
+After checking the new diff and trusted replies, partition every open ledger
+finding into still-open, fixed by the current head, or explicitly waived by a
+verified maintainer. Before posting the current-head disposition or advancing
+out of review, resolve each fixed or waived inline Gator thread by stable
+finding ID:
+
+```bash
+resolve-gator-review-threads \
+  /tmp/gator-review-feedback-ledger.json \
+  GATOR-<origin-sha-prefix>-<ordinal> [...]
+```
+
+The resolver accepts only exact threads from the feedback ledger whose first
+comment carries the Gator marker. Never resolve a human-owned review thread, a
+still-open finding, or a thread whose disposition is ambiguous. General
+findings and issue comments have no review thread to resolve; retain their
+durable disposition in the ledger.
+
+Thread resolution is required housekeeping for an addressed inline finding,
+not a new review disposition, and does not consume the one-disposition-per-head
+SHA slot. If GitHub does not confirm every requested resolution, do not advance
+the Gator state or post the follow-up disposition. Return
+`OPENSHELL_AGENT_RESULT {"status":"transient_failure","next_poll_seconds":120,"reason":"review_thread_resolution_failed"}`
+and retry the reconciliation later.
 
 ## Labels
 
@@ -844,12 +876,14 @@ determine which Gator findings or trusted maintainer comments are still
 unanswered. Ignore unacknowledged third-party comments and reviews. If the PR
 author has pushed commits and `review_scope.mode` is `follow_up`, review only
 the unresolved obligations plus `<previous_reviewed_sha>..HEAD`, carrying all
-other dispositions without duplicating them. If the author replied without
-pushing a new commit, do not re-review, repost findings, or post a same-SHA
-disposition; inspect the response internally and wait for a new commit or
-maintainer override. If CI changes state without a new commit, do not post a
-same-SHA CI update. A due TTL author nudge remains allowed when the unresolved
-feedback still requires an author action.
+other dispositions without duplicating them. Resolve the Gator-owned inline
+threads for obligations that the follow-up confirms are fixed or explicitly
+waived before posting the new-head disposition or advancing the label. If the
+author replied without pushing a new commit, do not re-review, repost findings,
+or post a same-SHA disposition; inspect the response internally and wait for a
+new commit or maintainer override. If CI changes state without a new commit, do
+not post a same-SHA CI update. A due TTL author nudge remains allowed when the
+unresolved feedback still requires an author action.
 
 If review feedback is waiting on the PR author for more than 48 business hours, post a single author nudge. Use the latest of these timestamps as the TTL start:
 

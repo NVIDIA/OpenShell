@@ -342,12 +342,14 @@ if "$LEDGER" --input "$tmp/missing-pr.json" >/dev/null 2>&1; then
 fi
 
 rg -q 'COPY bin/review-feedback-ledger /usr/local/bin/review-feedback-ledger' \
-    "$GATOR_DIR/Dockerfile"
+  "$GATOR_DIR/Dockerfile"
+rg -q 'COPY bin/resolve-gator-review-threads /usr/local/bin/resolve-gator-review-threads' \
+  "$GATOR_DIR/Dockerfile"
 rg -q 'COPY bin/validate-review-findings /usr/local/bin/validate-review-findings' \
-    "$GATOR_DIR/Dockerfile"
+  "$GATOR_DIR/Dockerfile"
 ruby -ryaml -e '
   manifest = YAML.load_file(ARGV.fetch(0))
-  abort unless manifest.fetch("payload_version") == 6
+  abort unless manifest.fetch("payload_version") == 7
   resource = manifest.fetch("resources").find {
     |entry| entry.fetch("id") == "gator-review-findings-schema"
   }

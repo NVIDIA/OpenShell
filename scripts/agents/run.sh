@@ -338,8 +338,13 @@ import_provider_profile() {
         return 0
     fi
     if [[ "$import_output" == *"already exists"* ]]; then
-        echo "Provider profile already exists: $profile_file"
-        return 0
+        if openshell_cmd provider profile update "$profile_id" \
+            --file "$profile_file" >/dev/null; then
+            echo "Updated provider profile: $profile_file"
+            return 0
+        fi
+        echo "failed to update existing provider profile: $profile_id" >&2
+        return 1
     fi
 
     printf '%s\n' "$import_output" >&2

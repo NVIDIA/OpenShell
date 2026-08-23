@@ -28,6 +28,7 @@ For gator's PR/issue validation policy, load `gator-gate` inside the launched sa
 | `scripts/agents/gator/policy.yaml` | Sandbox policy for the gator agent. |
 | `scripts/agents/gator/bin/gh` | Gator-specific `gh` wrapper and same-SHA duplicate-post guard. |
 | `scripts/agents/gator/bin/review-feedback-ledger` | Builds tree-aware review scope, durable findings, convergence telemetry, and review-budget state. |
+| `scripts/agents/gator/bin/resolve-gator-review-threads` | Resolves addressed Gator-owned inline review threads by ledger finding ID. |
 | `scripts/agents/gator/bin/validate-review-findings` | Enforces the blocker evidence schema and downgrades unsupported hypotheses. |
 | `scripts/agents/gator/prompts/gator.md` | Rendered top-level prompt template baked into the payload. |
 | `scripts/agents/gator/skills/gator-gate/SKILL.md` | In-sandbox gator state-machine skill. |
@@ -317,10 +318,10 @@ Restart when the payload must change, the sandbox is wedged without a sentinel, 
 
 Increment `payload_version` in `scripts/agents/gator/agent.yaml` whenever a
 merged change alters the Gator prompt, gate skill, reviewer contract, write
-guard, ledger, or bundled validator. Existing immutable watchers cannot replace
-their own payload. New-version watchers detect later published versions and
-stop with `stale_gator_payload`; relaunch every still-active older watcher after
-the version bump is published.
+guard, ledger, thread resolver, or bundled validator. Existing immutable
+watchers cannot replace their own payload. New-version watchers detect later
+published versions and stop with `stale_gator_payload`; relaunch every
+still-active older watcher after the version bump is published.
 
 Before deleting, check that the sandbox is truly stale or that the operator asked for a restart. If a bounded review cycle is actively running and still producing useful output, prefer leaving it alone.
 
