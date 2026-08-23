@@ -1251,7 +1251,7 @@ async fn handle_tcp_connection(
 
     let (raw_host, port) = parse_target(target)?;
     let host = normalize_host(&raw_host);
-    let host_lc = host.to_ascii_lowercase();
+    let (host_lc, raw_host_lc) = (host.to_ascii_lowercase(), raw_host.to_ascii_lowercase());
 
     if host_lc == INFERENCE_LOCAL_HOST && port == INFERENCE_LOCAL_PORT {
         respond(&mut client, b"HTTP/1.1 200 Connection Established\r\n\r\n").await?;
@@ -1525,7 +1525,7 @@ async fn handle_tcp_connection(
     }
 
     let upstream_result = tokio::select! {
-        result = dial_upstream(&upstream_proxy, &host_lc, port, connector.addrs()) => Some(result),
+        result = dial_upstream(&upstream_proxy, &host_lc, &raw_host_lc, port, connector.addrs()) => Some(result),
         () = connect_generation_guard.wait_until_stale() => None,
     };
     let Some(upstream_result) = upstream_result else {
@@ -3262,6 +3262,7 @@ fn validate_declared_endpoint_resolved_addrs(
 async fn dial_upstream(
     upstream_proxy: &Option<UpstreamProxyConfig>,
     host_lc: &str,
+    raw_host_lc: &str,
     port: u16,
     addrs: &[SocketAddr],
 ) -> std::io::Result<upstream_proxy::PrefixedStream> {
@@ -3271,7 +3272,7 @@ async fn dial_upstream(
                 if cfg.connect_by_hostname() {
                     upstream_proxy::connect_via(
                         endpoint,
-                        host_lc,
+                        raw_host_lc,
                         port,
                         upstream_proxy::ConnectTarget::Hostname,
                     )
@@ -5603,6 +5604,8 @@ fn is_benign_relay_error(err: &miette::Report) -> bool {
     reason = "Test code: test fixtures and explicit control-flow markers are idiomatic in tests."
 )]
 mod tests {
+    use crate::upstream_proxy::UpstreamProxyArgs;
+
     use super::*;
     use openshell_core::proposals::AgentProposals;
     use std::collections::HashMap as TestHashMap;
@@ -6106,6 +6109,49 @@ network_policies:
                     .any(|window| window == b"invalid_policy_local_scheme")
             );
         }
+    }
+
+    #[tokio::test]
+    async fn dial_upstream_preserves_trailing_dot_in_hostname_connect() {
+        // Fake upstream proxy: capture the request line, then 200.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0_u8; 1024_usize];
+            let n = sock.read(&mut buf).await.unwrap();
+            sock.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
+                .await
+                .unwrap();
+            String::from_utf8_lossy(&buf[..n]).into_owned()
+        });
+
+        // Operator config: proxy set + connect-by-hostname opt-in.
+        let cfg = UpstreamProxyConfig::from_args(&UpstreamProxyArgs {
+            https_proxy: Some(format!("http://{proxy_addr}")),
+            proxy_connect_by_hostname: true,
+            ..Default::default()
+        })
+        .unwrap();
+
+        // host_lc = normalized (undotted), raw_host_lc = absolute (dotted).
+        let stream = dial_upstream(
+            &cfg,
+            "api.example.com",
+            "api.example.com.",
+            443,
+            &[], // addrs unused in the hostname branch
+        )
+        .await
+        .unwrap();
+
+        drop(stream);
+
+        let request = handle.await.unwrap();
+        assert!(
+            request.starts_with("CONNECT api.example.com.:443 HTTP/1.1\r\n"),
+            "proxy must receive the absolute FQDN: {request}"
+        );
     }
 
     #[test]
