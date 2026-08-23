@@ -1,6 +1,8 @@
 ---
 name: review-security-issue
 description: Given a GitHub issue, review the issue for security implications. You'll make a determination if the claim in the issue is legitimate and should be addressed or will be a "won't fix." Trigger keywords - security issue, review security ticket, review security issue.
+metadata:
+  internal: true
 ---
 
 # Review Security Issue

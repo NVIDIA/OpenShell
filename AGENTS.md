@@ -10,7 +10,12 @@ OpenShell is built agent-first. We design systems and use agents to implement th
 
 ## Skills
 
-Agent skills live in `.agents/skills/`. Your harness can discover and load them natively — do not rely on this file for a full inventory. The detailed skills table is in [CONTRIBUTING.md](CONTRIBUTING.md) (for humans).
+OpenShell has two skill collections:
+
+- `skills/` contains public, installable skills for using and operating OpenShell. These skills must work outside a source checkout and use installed CLI help plus published documentation as their sources of truth.
+- `.agents/skills/` contains internal contributor and maintainer workflows for developing OpenShell. Your repository-aware harness can discover and load them natively.
+
+Do not rely on this file for a full inventory. The detailed public and contributor skill tables are in [CONTRIBUTING.md](CONTRIBUTING.md) (for humans).
 
 ## Workflow Chains
 
@@ -68,6 +73,7 @@ These pipelines connect skills into end-to-end workflows. Individual skill files
 | `deploy/` | Docker, Helm, K8s | Dockerfiles, Helm chart, manifests |
 | `docs/` | Published docs | MDX pages, navigation, and content assets |
 | `fern/` | Docs site config | Fern site config, components, and theme assets |
+| `skills/` | Public agent skills | Installable workflows for using and operating OpenShell |
 | `.agents/skills/` | Agent skills | Workflow automation for development |
 | `.agents/agents/` | Agent personas | Sub-agent definitions (e.g., reviewer, doc writer) |
 | `architecture/` | Architecture docs | Design decisions and component documentation |
@@ -239,7 +245,7 @@ ocsf_emit!(event);
 
 ## Cluster Infrastructure Changes
 
-- If you change gateway deployment infrastructure (e.g., Helm values/templates, gateway image packaging, or deploy logic in `openshell-cli`), update the `debug-openshell-cluster` skill in `.agents/skills/debug-openshell-cluster/SKILL.md` to reflect those changes.
+- If you change gateway deployment infrastructure (e.g., Helm values/templates, gateway image packaging, or deploy logic in `openshell-cli`), update the `debug-openshell-cluster` skill in `skills/debug-openshell-cluster/SKILL.md` to reflect those changes.
 
 ## Skill Maintenance
 
@@ -253,7 +259,7 @@ When behavior, commands, or development workflows change, review the related age
 - `fern/` contains the Fern site config, components, preview workflow inputs, and publish settings.
 - Follow the docs style guide in [docs/CONTRIBUTING.mdx](docs/CONTRIBUTING.mdx): active voice, minimal formatting, no filler introductions, `shell` fences for copyable commands, and no duplicate body H1.
 - Fern PR previews run through `.github/workflows/branch-docs.yml`, and production publish runs through the `publish-fern-docs` job in `.github/workflows/release-tag.yml` for stable release tags.
-- Use the `update-docs` skill to scan recent commits and draft doc updates.
+- Use the `update-docs-from-commits` skill to scan recent commits and draft doc updates.
 
 ### Architecture Docs
 

@@ -157,11 +157,7 @@ You may need to go back and forth a few times. Keep the loop tight:
 
 ## Step 3: Read the Policy Schema
 
-Read the full policy schema reference:
-
-```
-Read docs/reference/policy-schema.mdx
-```
+Read the published [policy schema reference](https://docs.nvidia.com/openshell/latest/reference/policy-schema) before generating or changing a policy. Published documentation is the authority for the current schema; do not infer fields from examples in this skill.
 
 Key sections to reference:
 - **Policy Schema Reference** — top-level structure
@@ -173,17 +169,9 @@ Key sections to reference:
 - **Network Middleware** - top-level middleware configs, ordering, host selection, and failure behavior
 - **Validation Rules** — what combinations are valid/invalid
 
-When middleware is requested, also read the full operational reference:
+When middleware is requested, also read the published [supervisor middleware guide](https://docs.nvidia.com/openshell/latest/extensibility/supervisor-middleware).
 
-```
-Read docs/extensibility/supervisor-middleware.mdx
-```
-
-Also read the architecture overview for enforcement context. The default policy is baked into the community base image (`ghcr.io/nvidia/openshell-community/sandboxes/base:latest`). For reference, consult:
-
-```
-Read architecture/security-policy.md
-```
+For enforcement concepts and the shipped baseline, read [sandbox policies](https://docs.nvidia.com/openshell/latest/sandboxes/policies) and the [default policy reference](https://docs.nvidia.com/openshell/latest/reference/default-policy). The default policy is baked into the community base image (`ghcr.io/nvidia/openshell-community/sandboxes/base:latest`).
 
 ## Step 4: Choose Policy Shape
 
@@ -644,8 +632,9 @@ private_services:
 
 ## Additional Resources
 
-- Full policy schema: [docs/reference/policy-schema.mdx](../../../docs/reference/policy-schema.mdx)
-- Enforcement overview: [architecture/security-policy.md](../../../architecture/security-policy.md)
+- [Policy schema](https://docs.nvidia.com/openshell/latest/reference/policy-schema)
+- [Sandbox policies](https://docs.nvidia.com/openshell/latest/sandboxes/policies)
+- [Default policy](https://docs.nvidia.com/openshell/latest/reference/default-policy)
+- [Supervisor middleware](https://docs.nvidia.com/openshell/latest/extensibility/supervisor-middleware)
 - Default policy: baked into the community base image (`ghcr.io/nvidia/openshell-community/sandboxes/base:latest`)
-- Rego evaluation rules: [sandbox-policy.rego](../../../crates/openshell-sandbox/data/sandbox-policy.rego)
 - For translation examples from real API docs, see [examples.md](examples.md)

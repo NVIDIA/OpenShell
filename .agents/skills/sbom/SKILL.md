@@ -1,6 +1,8 @@
 ---
 name: sbom
 description: Generate and manage Software Bill of Materials (SBOMs) for the OpenShell project. Covers SBOM generation with Syft, license resolution via public registries, and CSV export for compliance review. Trigger keywords - SBOM, sbom, bill of materials, license audit, license resolution, generate sbom, sbom csv, dependency license, supply chain, license scan.
+metadata:
+  internal: true
 ---
 
 # SBOM Generation and License Resolution
