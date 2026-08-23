@@ -157,7 +157,7 @@ sandbox_name="gator-pr-${pr_number}-supervised"
   "Review and monitor PR #${pr_number} through the gator-gate workflow. Scope this invocation only to PR #${pr_number}."
 ```
 
-The launcher builds the gator sandbox image when needed, stages the immutable payload, imports provider profiles, configures provider credentials and refresh, creates the sandbox, and writes a background log under `scripts/agents/gator/logs/`.
+The launcher builds the gator sandbox image when needed, stages the immutable payload, imports provider profiles, configures provider credentials and refresh, creates and uploads the sandbox payload, then starts the agent supervisor with `sandbox exec`. It writes a background log under `scripts/agents/gator/logs/`.
 
 ### Launch An Issue Or Issue/PR Pair
 
@@ -368,7 +368,9 @@ Symptoms: host `gh` auth fails, Codex refresh fails, in-sandbox GitHub calls rep
 Actions:
 
 - Re-run the GitHub and Codex preflight checks.
+- Existing refresh-managed providers are reused without an ordinary credential update; the launcher rotates their gateway-managed credential instead.
 - If host Codex auth changed, relaunch with `--reset-refresh` once.
+- `--reset-refresh` removes the old refresh ownership before rediscovering host credentials, then configures and rotates the replacement refresh state.
 - If Entra or Microsoft auth is involved in a future provider, use the relevant auth skill. Gator's default providers are GitHub and Codex.
 
 ### Unsupported `gh pr view --json` Field

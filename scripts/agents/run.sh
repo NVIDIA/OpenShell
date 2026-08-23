@@ -324,6 +324,10 @@ upsert_provider() {
     fi
 }
 
+provider_exists() {
+    openshell_cmd provider get "$1" >/dev/null 2>&1
+}
+
 import_provider_profile() {
     local profile_id="$1"
     local profile_file="$2"
@@ -670,6 +674,7 @@ for ((provider_index = 0; provider_index < PROVIDER_COUNT; provider_index++)); d
     mode_var="PROVIDER_${provider_index}_CREDENTIAL_MODE"
     credential_count_var="PROVIDER_${provider_index}_CREDENTIAL_COUNT"
     refresh_enabled_var="PROVIDER_${provider_index}_REFRESH_ENABLED"
+    refresh_key_var="PROVIDER_${provider_index}_REFRESH_CREDENTIAL_KEY"
     provider_name="${!name_var}"
     profile_id="${!profile_var}"
     credential_mode="${!mode_var}"
@@ -700,17 +705,31 @@ for ((provider_index = 0; provider_index < PROVIDER_COUNT; provider_index++)); d
         fi
     done
 
+    provider_credential_args=()
     case "$credential_mode" in
         explicit)
-            upsert_provider "$provider_name" "$profile_id" "${credential_args[@]}"
+            provider_credential_args=("${credential_args[@]}")
             ;;
         from_existing)
-            upsert_provider "$provider_name" "$profile_id" --from-existing
+            provider_credential_args=(--from-existing)
             ;;
         *)
             fail "unsupported credential_mode for $provider_name: $credential_mode"
             ;;
     esac
+
+    if [[ "${!refresh_enabled_var}" == "true" ]] && provider_exists "$provider_name"; then
+        if [[ "$RESET_REFRESH" == "1" ]]; then
+            log "Resetting refresh-owned provider credential '$provider_name/${!refresh_key_var}'."
+            openshell_cmd provider refresh delete "$provider_name" \
+                --credential-key "${!refresh_key_var}" >/dev/null
+            upsert_provider "$provider_name" "$profile_id" "${provider_credential_args[@]}"
+        else
+            log "Reusing provider '$provider_name' because its credentials are managed by gateway refresh."
+        fi
+    else
+        upsert_provider "$provider_name" "$profile_id" "${provider_credential_args[@]}"
+    fi
 
     if [[ "${!refresh_enabled_var}" == "true" ]]; then
         log "Refreshing provider credential '$provider_name/${!refresh_key_var}'."
@@ -737,7 +756,7 @@ case "$HARNESS" in
         ;;
 esac
 
-SANDBOX_CMD=(
+SANDBOX_CREATE_CMD=(
     env -u OPENSHELL_SANDBOX_POLICY
     "$OPENSHELL_BIN" --gateway "$GATEWAY" sandbox create
     --name "$SANDBOX_NAME"
@@ -747,11 +766,35 @@ SANDBOX_CMD=(
     --no-git-ignore
     --no-auto-providers
     --no-tty
+    --detach
 )
-if [[ "$KEEP_SANDBOX" != "1" ]]; then
-    SANDBOX_CMD+=(--no-keep)
-fi
-SANDBOX_CMD+=(-- env "${HARNESS_ENV_ARGS[@]}" bash "$PAYLOAD_IMAGE_DIR/runtime/entrypoint.sh")
+
+SANDBOX_EXEC_CMD=(
+    "$OPENSHELL_BIN" --gateway "$GATEWAY" sandbox exec
+    --name "$SANDBOX_NAME"
+    --no-tty
+    --
+    env
+    "${HARNESS_ENV_ARGS[@]}"
+    bash "$PAYLOAD_IMAGE_DIR/runtime/entrypoint.sh"
+)
+
+run_agent_sandbox() {
+    local exec_status=0
+    local cleanup_status=0
+
+    "${SANDBOX_CREATE_CMD[@]}"
+    "${SANDBOX_EXEC_CMD[@]}" || exec_status=$?
+
+    if [[ "$KEEP_SANDBOX" != "1" ]]; then
+        openshell_cmd sandbox delete "$SANDBOX_NAME" >/dev/null || cleanup_status=$?
+    fi
+
+    if [[ "$exec_status" -ne 0 ]]; then
+        return "$exec_status"
+    fi
+    return "$cleanup_status"
+}
 
 log "Launching $AGENT_DISPLAY_NAME sandbox '$SANDBOX_NAME' on gateway '$GATEWAY'."
 if [[ "$BACKGROUND" == "1" ]]; then
@@ -761,9 +804,9 @@ if [[ "$BACKGROUND" == "1" ]]; then
     trap - EXIT
     (
         trap 'cleanup_config; cleanup_payload' EXIT
-        "${SANDBOX_CMD[@]}"
+        run_agent_sandbox
     ) >"$LOG_FILE" 2>&1 &
     echo "Started in background. Log: $LOG_FILE"
 else
-    "${SANDBOX_CMD[@]}"
+    run_agent_sandbox
 fi
