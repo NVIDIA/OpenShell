@@ -3092,7 +3092,28 @@ pub(super) async fn handle_get_sandbox_provider_environment(
         )
         .await?;
 
-    if !supports_static_credential_bindings {
+    if supports_static_credential_bindings {
+        let unbound_static_keys = provider_environment
+            .static_credential_keys
+            .iter()
+            .filter(|key| {
+                !provider_environment
+                    .static_credential_bindings
+                    .contains_key(*key)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        for key in unbound_static_keys {
+            warn!(
+                sandbox_id = %sandbox_id,
+                key = %key,
+                "withholding unbound static provider credential from binding-capable supervisor"
+            );
+            provider_environment.environment.remove(&key);
+            provider_environment.credential_expires_at_ms.remove(&key);
+            provider_environment.static_credential_keys.remove(&key);
+        }
+    } else {
         for key in &provider_environment.static_credential_keys {
             provider_environment.environment.remove(key);
             provider_environment.credential_expires_at_ms.remove(key);
@@ -9739,6 +9760,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn provider_environment_withholds_unbound_static_credentials_independently() {
+        use openshell_core::proto::GetSandboxProviderEnvironmentRequest;
+
+        let state = test_server_state().await;
+        state
+            .store
+            .put_message(&test_provider("work-github", "github"))
+            .await
+            .unwrap();
+        let mut profileless_openai = test_provider("gateway-openai", "openai");
+        profileless_openai.credentials =
+            HashMap::from([("OPENAI_API_KEY".to_string(), "openai-secret".to_string())]);
+        state.store.put_message(&profileless_openai).await.unwrap();
+        state
+            .store
+            .put_message(&test_sandbox(
+                "sb-unbound-provider-env",
+                "unbound-provider-env",
+                test_policy_with_rule("sandbox_only", "sandbox.example.com"),
+                vec!["work-github".to_string(), "gateway-openai".to_string()],
+            ))
+            .await
+            .unwrap();
+
+        let response = handle_get_sandbox_provider_environment(
+            &state,
+            with_user(Request::new(GetSandboxProviderEnvironmentRequest {
+                sandbox_id: "sb-unbound-provider-env".to_string(),
+                supports_static_credential_bindings: true,
+            })),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+
+        assert!(!response.environment.contains_key("OPENAI_API_KEY"));
+        assert!(
+            !response
+                .static_credential_bindings
+                .contains_key("OPENAI_API_KEY")
+        );
+        assert_eq!(
+            response.environment.get("GITHUB_TOKEN"),
+            Some(&"ghp-test".to_string())
+        );
+        assert!(
+            response
+                .static_credential_bindings
+                .get("GITHUB_TOKEN")
+                .is_some_and(|binding| !binding.endpoints.is_empty())
+        );
+    }
+
+    #[tokio::test]
     async fn provider_environment_uses_policy_binding_for_endpointless_profile() {
         use openshell_core::proto::{
             GetSandboxConfigRequest, GetSandboxProviderEnvironmentRequest,
@@ -10031,15 +10106,15 @@ mod tests {
         .expect("mixed snapshot must be returned")
         .into_inner();
 
-        assert_eq!(
-            response.environment.get("INVALID_TOKEN"),
-            Some(&"static-secret".to_string())
+        assert!(
+            !response.environment.contains_key("INVALID_TOKEN"),
+            "an unbound static credential must be withheld before the supervisor snapshot"
         );
         assert!(
             !response
                 .static_credential_bindings
                 .contains_key("INVALID_TOKEN"),
-            "incomplete static metadata must reach the supervisor for fail-closed rejection"
+            "an unbound static credential must not emit incomplete binding metadata"
         );
         assert!(
             !response.dynamic_credentials.is_empty(),
