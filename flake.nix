@@ -57,6 +57,13 @@
             z3
             # Coverage
             lcov
+            # mise dependencies
+            mise
+            cmakeMinimal
+            zlib
+            openssl_3_5
+            xz
+            gh
           ];
 
           env = {
