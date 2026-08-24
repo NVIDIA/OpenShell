@@ -6,10 +6,10 @@
 use crate::app::App;
 use openshell_core::proto::{L7Allow, L7DenyRule, L7QueryMatcher, NetworkEndpoint, PolicyChunk};
 use ratatui::Frame;
-use ratatui::layout::Rect;
-use ratatui::style::Modifier;
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Padding, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, Padding, Paragraph};
 
 use super::centered_rect;
 
@@ -178,12 +178,22 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
 // Detail popup (Enter key)
 // ---------------------------------------------------------------------------
 
+/// What `draw_detail_popup` actually laid out, so the app can clamp its scroll
+/// offset to content that exists.
+pub struct DetailMetrics {
+    /// Total rows of content, after wrapping.
+    pub total_rows: usize,
+    /// Rows visible in the scrollable body, excluding the pinned hint row.
+    pub body_height: usize,
+}
+
 pub fn draw_detail_popup(
     frame: &mut Frame<'_>,
     chunk: &PolicyChunk,
     area: Rect,
     theme: &crate::theme::Theme,
-) {
+    scroll: usize,
+) -> DetailMetrics {
     let t = theme;
     let popup_width = (area.width * 4 / 5).min(area.width.saturating_sub(4));
     let popup_height = 22u16.min(area.height.saturating_sub(4));
@@ -204,6 +214,11 @@ pub fn draw_detail_popup(
         .border_style(t.accent)
         .padding(Padding::new(1, 1, 0, 0));
 
+    // Text columns inside the borders and the one-column padding on each side.
+    // Content is wrapped to this width here rather than by `Wrap`, so the row
+    // count below is exactly what renders and the scroll clamp stays honest.
+    let text_width = usize::from(popup_width).saturating_sub(4).max(1);
+
     let mut lines: Vec<Line<'_>> = vec![
         Line::from(vec![
             Span::styled("Status:     ", t.muted),
@@ -221,26 +236,40 @@ pub fn draw_detail_popup(
             ApprovalAnnotationKind::RequiresReview => t.status_warn.add_modifier(Modifier::BOLD),
             ApprovalAnnotationKind::Reviewed => t.muted,
         };
-        lines.push(Line::from(vec![
-            Span::styled("Review:     ", t.muted),
-            Span::styled(annotation.detail_label, annotation_style),
-        ]));
+        push_wrapped(
+            &mut lines,
+            "Review:     ",
+            t.muted,
+            &annotation.detail_label,
+            annotation_style,
+            text_width,
+        );
     }
 
-    // Reviewer's persisted rejection guidance.
+    // Reviewer's persisted rejection guidance. The reason is free-form and has
+    // no server-side length cap, so it wraps and the popup scrolls instead of
+    // clipping the tail.
     if let Some(reason) = rejection_guidance(chunk) {
-        lines.push(Line::from(vec![
-            Span::styled("Guidance:   ", t.muted),
-            Span::styled(reason, t.status_err),
-        ]));
+        push_wrapped(
+            &mut lines,
+            "Guidance:   ",
+            t.muted,
+            reason,
+            t.status_err,
+            text_width,
+        );
     }
 
     // Binary (denormalized from the denial).
     if !chunk.binary.is_empty() {
-        lines.push(Line::from(vec![
-            Span::styled("Binary:     ", t.muted),
-            Span::styled(&chunk.binary, t.text),
-        ]));
+        push_wrapped(
+            &mut lines,
+            "Binary:     ",
+            t.muted,
+            &chunk.binary,
+            t.text,
+            text_width,
+        );
     }
 
     // Hit count (accumulated real denial count) and first/last seen.
@@ -269,17 +298,17 @@ pub fn draw_detail_popup(
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled("Endpoints:", t.muted)));
         for ep in &rule.endpoints {
-            lines.push(Line::from(vec![
-                Span::raw("  "),
-                Span::styled("-> ", t.muted),
-                Span::styled(format_endpoint_summary(ep), t.accent),
-            ]));
+            push_wrapped(
+                &mut lines,
+                "  -> ",
+                t.muted,
+                &format_endpoint_summary(ep),
+                t.accent,
+                text_width,
+            );
 
             for detail in format_endpoint_details(ep) {
-                lines.push(Line::from(vec![
-                    Span::raw("     "),
-                    Span::styled(detail, t.text),
-                ]));
+                push_wrapped(&mut lines, "     ", t.text, &detail, t.text, text_width);
             }
         }
 
@@ -288,10 +317,7 @@ pub fn draw_detail_popup(
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled("Binaries:", t.muted)));
             for b in &rule.binaries {
-                lines.push(Line::from(vec![
-                    Span::raw("  "),
-                    Span::styled(&b.path, t.text),
-                ]));
+                push_wrapped(&mut lines, "  ", t.text, &b.path, t.text, text_width);
             }
         }
     }
@@ -299,23 +325,61 @@ pub fn draw_detail_popup(
     // Rationale.
     if !chunk.rationale.is_empty() {
         lines.push(Line::from(""));
-        lines.push(Line::from(vec![
-            Span::styled("Rationale:  ", t.muted),
-            Span::styled(&chunk.rationale, t.text),
-        ]));
+        push_wrapped(
+            &mut lines,
+            "Rationale:  ",
+            t.muted,
+            &chunk.rationale,
+            t.text,
+            text_width,
+        );
     }
 
     // Security notes.
     if !chunk.security_notes.is_empty() {
         lines.push(Line::from(""));
-        lines.push(Line::from(vec![Span::styled(
-            format!("! {}", chunk.security_notes),
-            t.status_warn.add_modifier(Modifier::BOLD),
-        )]));
+        let warn = t.status_warn.add_modifier(Modifier::BOLD);
+        push_wrapped(
+            &mut lines,
+            "! ",
+            warn,
+            &chunk.security_notes,
+            warn,
+            text_width,
+        );
     }
 
-    // Action hints — state-aware toggle keys.
-    lines.push(Line::from(""));
+    // Split the inner area into a scrollable body and a pinned hint row, so the
+    // action and close controls stay on screen however long the content is.
+    let inner = block.inner(popup_area);
+    let parts = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(0), Constraint::Length(1)])
+        .split(inner);
+    let body_height = usize::from(parts[0].height);
+    let total_rows = lines.len();
+    let max_scroll = total_rows.saturating_sub(body_height);
+    let scroll = scroll.min(max_scroll);
+
+    let block = if max_scroll > 0 {
+        block.title_bottom(
+            Line::from(Span::styled(
+                format!(" {}/{} ", scroll + 1, total_rows),
+                t.muted,
+            ))
+            .right_aligned(),
+        )
+    } else {
+        block
+    };
+
+    frame.render_widget(block, popup_area);
+    frame.render_widget(
+        Paragraph::new(lines).scroll((u16::try_from(scroll).unwrap_or(u16::MAX), 0)),
+        parts[0],
+    );
+
+    // Action hints — state-aware toggle keys, pinned below the scrolling body.
     let mut hint_spans: Vec<Span<'_>> = Vec::new();
     match chunk.status.as_str() {
         "pending" => {
@@ -340,18 +404,22 @@ pub fn draw_detail_popup(
         }
         _ => {}
     }
+    if max_scroll > 0 {
+        hint_spans.extend([
+            Span::styled("[j/k]", t.key_hint),
+            Span::styled(" Scroll  ", t.text),
+        ]);
+    }
     hint_spans.extend([
         Span::styled("[Esc]", t.muted),
         Span::styled(" Close", t.muted),
     ]);
-    lines.push(Line::from(hint_spans));
+    frame.render_widget(Paragraph::new(Line::from(hint_spans)), parts[1]);
 
-    frame.render_widget(
-        Paragraph::new(lines)
-            .block(block)
-            .wrap(Wrap { trim: false }),
-        popup_area,
-    );
+    DetailMetrics {
+        total_rows,
+        body_height,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -471,6 +539,78 @@ fn truncate_str(s: &str, max_len: usize) -> String {
         let mut out: String = s.chars().take(max_len - 3).collect();
         out.push_str("...");
         out
+    }
+}
+
+/// Word-wrap `text` into rows of at most `width` columns.
+///
+/// A word longer than `width` is hard-broken rather than allowed to overflow.
+/// Always returns at least one row so callers can index the first row safely.
+fn wrap_value(text: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return vec![text.to_string()];
+    }
+    let mut rows: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut cur_len = 0usize;
+    for word in text.split_whitespace() {
+        let word_len = word.chars().count();
+        if word_len > width {
+            if cur_len > 0 {
+                rows.push(std::mem::take(&mut cur));
+                cur_len = 0;
+            }
+            for ch in word.chars() {
+                if cur_len == width {
+                    rows.push(std::mem::take(&mut cur));
+                    cur_len = 0;
+                }
+                cur.push(ch);
+                cur_len += 1;
+            }
+            continue;
+        }
+        let needed = if cur_len == 0 {
+            word_len
+        } else {
+            cur_len + 1 + word_len
+        };
+        if needed > width {
+            rows.push(std::mem::take(&mut cur));
+            cur_len = 0;
+        }
+        if cur_len > 0 {
+            cur.push(' ');
+            cur_len += 1;
+        }
+        cur.push_str(word);
+        cur_len += word_len;
+    }
+    if cur_len > 0 || rows.is_empty() {
+        rows.push(cur);
+    }
+    rows
+}
+
+/// Push `text` wrapped to `width`, with `prefix` on the first row and a matching
+/// indent on continuation rows so the label column stays aligned.
+fn push_wrapped(
+    lines: &mut Vec<Line<'_>>,
+    prefix: &str,
+    prefix_style: Style,
+    text: &str,
+    text_style: Style,
+    width: usize,
+) {
+    let indent = prefix.chars().count();
+    let available = width.saturating_sub(indent).max(1);
+    for (i, row) in wrap_value(text, available).into_iter().enumerate() {
+        let head = if i == 0 {
+            Span::styled(prefix.to_string(), prefix_style)
+        } else {
+            Span::raw(" ".repeat(indent))
+        };
+        lines.push(Line::from(vec![head, Span::styled(row, text_style)]));
     }
 }
 
@@ -732,6 +872,9 @@ fn format_short_time(epoch_ms: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::theme::Theme;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
 
     fn make_chunk(status: &str, rejection_reason: &str) -> PolicyChunk {
         PolicyChunk {
@@ -787,5 +930,170 @@ mod tests {
     #[test]
     fn short_reason_is_not_truncated() {
         assert_eq!(truncate_str("too broad", 32), "too broad");
+    }
+
+    // --- wrapping ---------------------------------------------------------
+
+    #[test]
+    fn wrap_value_breaks_on_word_boundaries() {
+        assert_eq!(
+            wrap_value("alpha beta gamma", 11),
+            vec!["alpha beta", "gamma"]
+        );
+    }
+
+    #[test]
+    fn wrap_value_hard_breaks_a_word_longer_than_the_width() {
+        assert_eq!(wrap_value("abcdefghij", 4), vec!["abcd", "efgh", "ij"]);
+    }
+
+    #[test]
+    fn wrap_value_always_returns_at_least_one_row() {
+        assert_eq!(wrap_value("", 10), vec![String::new()]);
+    }
+
+    #[test]
+    fn wrap_value_never_exceeds_the_width() {
+        let text = "reject this rule because the endpoint list is far too permissive";
+        for row in wrap_value(text, 17) {
+            assert!(row.chars().count() <= 17, "row too wide: {row:?}");
+        }
+    }
+
+    // --- rendering --------------------------------------------------------
+
+    fn render(chunk: &PolicyChunk, width: u16, height: u16, scroll: usize) -> (String, usize) {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        let mut max_scroll = 0usize;
+        terminal
+            .draw(|frame| {
+                let metrics = draw_detail_popup(
+                    frame,
+                    chunk,
+                    Rect::new(0, 0, width, height),
+                    &Theme::dark(),
+                    scroll,
+                );
+                max_scroll = metrics.total_rows.saturating_sub(metrics.body_height);
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let text: String = buffer
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        (text, max_scroll)
+    }
+
+    /// A rejection reason has no server-side length cap, so the popup has to keep
+    /// a paragraph-length one reachable rather than clipping its tail.
+    fn long_reason() -> String {
+        let mut reason = String::from("PREFIX_MARKER ");
+        while reason.len() < 1980 {
+            reason.push_str("this rule is far too broad and must be narrowed; ");
+        }
+        reason.push_str(" SUFFIX_MARKER");
+        reason
+    }
+
+    #[test]
+    fn long_guidance_head_and_tail_are_both_reachable() {
+        let chunk = PolicyChunk {
+            status: "rejected".to_string(),
+            rejection_reason: long_reason(),
+            rule_name: "allow-github".to_string(),
+            ..Default::default()
+        };
+
+        let (top, max_scroll) = render(&chunk, 80, 24, 0);
+        assert!(max_scroll > 0, "content should overflow an 80x24 popup");
+        assert!(
+            top.contains("PREFIX_MARKER"),
+            "head not visible at scroll 0"
+        );
+
+        let (bottom, _) = render(&chunk, 80, 24, max_scroll);
+        assert!(
+            bottom.contains("SUFFIX_MARKER"),
+            "tail not reachable at max scroll"
+        );
+    }
+
+    #[test]
+    fn action_hints_stay_visible_at_every_scroll_position() {
+        let chunk = PolicyChunk {
+            status: "rejected".to_string(),
+            rejection_reason: long_reason(),
+            rule_name: "allow-github".to_string(),
+            ..Default::default()
+        };
+
+        let (top, max_scroll) = render(&chunk, 80, 24, 0);
+        let (bottom, _) = render(&chunk, 80, 24, max_scroll);
+        for (label, screen) in [("top", &top), ("bottom", &bottom)] {
+            assert!(screen.contains("Close"), "close hint missing at {label}");
+            assert!(
+                screen.contains("Approve"),
+                "approve hint missing at {label}"
+            );
+            assert!(screen.contains("Scroll"), "scroll hint missing at {label}");
+        }
+    }
+
+    #[test]
+    fn scrolling_past_the_end_is_clamped_to_the_last_page() {
+        let chunk = PolicyChunk {
+            status: "rejected".to_string(),
+            rejection_reason: long_reason(),
+            rule_name: "allow-github".to_string(),
+            ..Default::default()
+        };
+        let (_, max_scroll) = render(&chunk, 80, 24, 0);
+        let (clamped, _) = render(&chunk, 80, 24, max_scroll + 500);
+        let (last, _) = render(&chunk, 80, 24, max_scroll);
+        assert_eq!(
+            clamped, last,
+            "over-scrolling should clamp to the last page"
+        );
+    }
+
+    /// The same overflow already affected `rationale` before this change, so the
+    /// scrollable body has to fix that case too.
+    #[test]
+    fn long_rationale_tail_is_reachable_on_a_pending_chunk() {
+        let mut rationale = String::from("PREFIX_MARKER ");
+        while rationale.len() < 1980 {
+            rationale.push_str("the agent needs broad network access; ");
+        }
+        rationale.push_str(" SUFFIX_MARKER");
+        let chunk = PolicyChunk {
+            status: "pending".to_string(),
+            rule_name: "allow-github".to_string(),
+            rationale,
+            ..Default::default()
+        };
+
+        let (_, max_scroll) = render(&chunk, 80, 24, 0);
+        let (bottom, _) = render(&chunk, 80, 24, max_scroll);
+        assert!(bottom.contains("SUFFIX_MARKER"));
+        assert!(bottom.contains("Close"));
+    }
+
+    #[test]
+    fn short_content_does_not_scroll() {
+        let chunk = PolicyChunk {
+            status: "rejected".to_string(),
+            rejection_reason: "too broad".to_string(),
+            rule_name: "allow-github".to_string(),
+            ..Default::default()
+        };
+        let (screen, max_scroll) = render(&chunk, 80, 24, 0);
+        assert_eq!(max_scroll, 0, "short content should not be scrollable");
+        assert!(screen.contains("too broad"));
+        assert!(
+            !screen.contains("Scroll"),
+            "scroll hint should be hidden when everything fits"
+        );
     }
 }
