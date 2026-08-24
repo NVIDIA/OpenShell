@@ -25,7 +25,9 @@ A direct request authorizes only what it says. A request to review or plan does 
 
 The two request labels remain human-only queue controls. Under **no circumstances** should this skill or any agent apply them, ask to apply them, or suggest automating their application.
 
-Do not refuse a direct user request merely because its request label is absent. If direct work begins on an issue that was not already in the label-driven workflow, do not introduce `agent:in-progress` or `agent:pr-opened` solely for that invocation. If a matching request label is present, preserve the existing label transitions so unattended agents can track the workflow.
+In direct mode, issue lifecycle and `agent:*` workflow labels are advisory rather than gates. Inspect the labels and warn the user about each expected label that is missing or any lifecycle label that indicates the normal workflow is incomplete, then continue with the requested phase. Do not ask the user to fix the labels first. A direct request does not change the issue's disposition or make the labels accurate; it only authorizes the requested work.
+
+If direct work begins on an issue that was not already in the label-driven workflow, do not introduce `agent:in-progress` or `agent:pr-opened` solely for that invocation. If a matching request label is present, preserve the existing label transitions so unattended agents can track the workflow.
 
 ## Agent Comment Markers
 
@@ -59,11 +61,11 @@ Fetch issue + comments
   ├─ topic:security present?
   │   → Route to review-security-issue or fix-security-issue; STOP
   │
-  ├─ Triage incomplete, awaiting information, or awaiting human disposition?
-  │   → Report the blocking state and STOP
+  ├─ Direct mode + expected lifecycle or agent-workflow labels missing/incomplete?
+  │   → Warn which labels are missing or incomplete; continue with the requested phase
   │
-  ├─ state:accepted and roadmap association both absent?
-  │   → Human has not accepted the issue; STOP
+  ├─ Queue mode + triage incomplete, awaiting information, or awaiting human disposition?
+  │   → Report the blocking state and STOP
   │
   ├─ No plan comment and no direct planning request and agent:plan-requested absent?
   │   → No request for agent planning; STOP
@@ -109,13 +111,15 @@ If the issue is closed, report that and stop.
 
 If `topic:security` is present, stop. General build agents must not plan or implement security issues. Route planning/review to `review-security-issue` and authorized remediation to `fix-security-issue`.
 
-Stop before planning in any of these states:
+In queue mode, stop before planning on `state:triage-needed` or `state:needs-info`, and stop on `state:validated` without roadmap placement. Require `state:accepted` or roadmap placement before queue work proceeds. If no plan exists, require `agent:plan-requested`; require `agent:implementation-requested` before queue-mode implementation.
 
-- `state:triage-needed`: the issue has not been assessed; use `triage-issue`.
-- `state:needs-info`: triage is waiting for evidence from the reporter.
-- `state:validated` without roadmap placement: triage is complete, but a human has not yet decided whether OpenShell should invest in the work.
+In direct mode, inspect the same expected workflow state but do not stop because a lifecycle or agent-workflow label is absent or incomplete. Before continuing, warn the user with the specific discrepancy, for example:
 
-Next, require a human acceptance signal: either `state:accepted` or placement on the roadmap. The label records acceptance without requiring scheduling; roadmap placement records acceptance and sequencing. If no plan exists, require either a direct user request for planning or the human-applied `agent:plan-requested` label before generating one. Never add or remove `state:accepted`, either human request label, or the `roadmap` label.
+> "Issue #42 is missing `state:accepted` or roadmap placement and `agent:implementation-requested`. Those labels are expected in the queued workflow, but your direct request authorizes implementation, so I am continuing without changing them."
+
+If `state:triage-needed`, `state:needs-info`, or `state:validated` is present, name that state in the warning and explain what it normally means. Continue unless the issue lacks information that is actually necessary to perform the requested work; in that case, report the concrete missing information rather than treating the label itself as the blocker.
+
+Never add or remove `state:accepted`, either human request label, or the `roadmap` label.
 
 ## Step 2: Fetch and Classify Comments
 
@@ -140,7 +144,7 @@ Using the state machine above, determine what to do based on:
 1. Whether a plan comment exists
 2. Whether there are human comments newer than the last agent comment (plan or conversation)
 3. Whether this is direct mode and which phase the user requested
-4. Which disposition, roadmap, and agent-workflow labels are present (`state:accepted`, `agent:plan-requested`, `agent:plan-ready`, `agent:implementation-requested`, `agent:in-progress`, `agent:pr-opened`, and the `roadmap` label)
+4. Which lifecycle and agent-workflow labels are present (`state:*`, `agent:plan-requested`, `agent:plan-ready`, `agent:implementation-requested`, `agent:in-progress`, and `agent:pr-opened`) and which discrepancies require a direct-mode warning
 
 Follow the appropriate branch below.
 
@@ -681,7 +685,7 @@ If the `agent:in-progress` label is present, the skill was previously started bu
 User says: "Plan issue #42"
 
 1. Fetch issue #42 — title: "Add pagination to dataset list endpoint"
-2. Confirm `state:accepted` with no blocking triage state; the user's direct request authorizes planning even if `agent:plan-requested` is absent
+2. Notice that `state:accepted` and `agent:plan-requested` are absent; warn that the issue does not match the queued workflow, then continue because the user directly requested planning
 3. Fetch comments — no `🏗️ build-plan` marker found
 4. Pass issue to `principal-engineer-reviewer` for analysis
 5. Reviewer produces a plan: feat type, Medium complexity, 3 implementation steps, unit + integration tests needed
@@ -713,7 +717,7 @@ User says: "Check issue #42"
 
 User says: "Build issue #42"
 
-1. Fetch issue #42 — `state:accepted` is present; the user's direct request authorizes implementation
+1. Fetch issue #42 — `state:accepted` is present but `agent:implementation-requested` is absent; warn about the missing queue label and continue because the user directly requested implementation
 2. Plan exists (Revision 2), complexity: Medium, confidence: High
 3. No conflicting branches or PRs
 4. Create branch `feat/42-add-pagination/jmyers`
@@ -727,6 +731,15 @@ User says: "Build issue #42"
 12. No agent-workflow label transition is needed
 13. Report PR URL and workflow run status to user
 
+### Run directly on an issue outside the workflow state machine
+
+User says: "Build issue #42"
+
+1. Fetch issue #42 — it has `state:triage-needed`; neither `state:accepted` nor `agent:implementation-requested` is present
+2. Warn that triage and acceptance are incomplete and name the missing implementation request label
+3. Continue through planning and implementation because the user directly requested the work
+4. Do not add, remove, or reinterpret lifecycle or agent-workflow labels
+
 ### Run on issue with existing PR
 
 User says: "Build issue #42"
@@ -739,7 +752,7 @@ User says: "Build issue #42"
 
 User says: "Build issue #99"
 
-1. Fetch issue #99 — `state:accepted` is present; the user's direct request authorizes implementation
+1. Fetch issue #99 — warn about any missing expected workflow labels, then continue because the user directly requested implementation
 2. Plan exists: complexity High, confidence Low, has open questions
 3. Warn user: "Issue #99 is rated High complexity / Low confidence. Proceeding but flagging for your awareness."
 4. Continue with build
