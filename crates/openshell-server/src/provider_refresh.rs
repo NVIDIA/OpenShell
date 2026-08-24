@@ -417,7 +417,16 @@ struct TokenResponse {
 #[derive(Debug, Deserialize)]
 struct OAuthErrorResponse {
     error: String,
+    #[serde(default, deserialize_with = "deserialize_optional_oauth_string")]
     error_subtype: Option<String>,
+}
+
+fn deserialize_optional_oauth_string<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(value.as_str().map(str::to_owned))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2284,6 +2293,23 @@ mod tests {
                 .message()
                 .contains("sensitive provider detail")
         );
+    }
+
+    #[test]
+    fn oauth_invalid_grant_ignores_non_string_optional_subtype() {
+        let failure = classify_oauth_token_error(
+            reqwest::StatusCode::BAD_REQUEST,
+            br#"{"error":"invalid_grant","error_subtype":{"vendor":"value"}}"#,
+            OAuthGrantKind::UserRefreshToken,
+        );
+
+        assert_eq!(
+            failure.recovery_action,
+            ProviderCredentialRefreshRecoveryAction::Reauthorize
+        );
+        assert_eq!(failure.failure_code, "oauth_invalid_grant");
+        assert_eq!(failure.provider_error_subtype, None);
+        assert_eq!(failure.retry_schedule, RefreshRetrySchedule::Parked);
     }
 
     #[test]
