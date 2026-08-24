@@ -130,3 +130,4 @@ nickbp
 bjw123
 wtrep
 vyncint
+cwing-nvidia
