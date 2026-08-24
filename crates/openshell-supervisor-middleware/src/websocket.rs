@@ -38,6 +38,8 @@ pub struct WebSocketPreflightInput {
     pub session_id: String,
     pub request_id: String,
     pub sandbox_id: String,
+    pub sandbox_name: String,
+    pub workspace: String,
     pub scheme: String,
     pub host: String,
     pub port: u16,
@@ -920,6 +922,8 @@ async fn open_stage(entry: DescribedChainEntry, input: WebSocketPreflightInput) 
         context: Some(RequestContext {
             request_id: input.request_id,
             sandbox_id: input.sandbox_id,
+            sandbox_name: input.sandbox_name,
+            workspace: input.workspace,
             originating_process: None,
         }),
         target: Some(HttpRequestTarget {

@@ -11,7 +11,7 @@ use bollard::models::{
     ContainerCreateBody, ContainerState, ContainerStateStatusEnum, ContainerSummary,
     ContainerSummaryStateEnum, CreateImageInfo, DeviceRequest, EndpointSettings, HostConfig, Mount,
     MountTmpfsOptions, MountTypeEnum, MountVolumeOptions, NetworkCreateRequest, NetworkingConfig,
-    ProgressDetail, RestartPolicy, RestartPolicyNameEnum, SystemInfo,
+    ProgressDetail, SystemInfo,
 };
 use bollard::query_parameters::{
     CreateContainerOptionsBuilder, CreateImageOptions, DownloadFromContainerOptionsBuilder,
@@ -77,7 +77,6 @@ const TLS_CA_MOUNT_PATH: &str = openshell_core::driver_utils::TLS_CA_MOUNT_PATH;
 const TLS_CERT_MOUNT_PATH: &str = openshell_core::driver_utils::TLS_CERT_MOUNT_PATH;
 const TLS_KEY_MOUNT_PATH: &str = openshell_core::driver_utils::TLS_KEY_MOUNT_PATH;
 const SANDBOX_TOKEN_MOUNT_PATH: &str = openshell_core::driver_utils::SANDBOX_TOKEN_MOUNT_PATH;
-const SANDBOX_COMMAND: &str = "sleep infinity";
 const SUPERVISOR_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 const HOST_OPENSHELL_INTERNAL: &str = "host.openshell.internal";
 const HOST_DOCKER_INTERNAL: &str = "host.docker.internal";
@@ -490,11 +489,12 @@ impl DockerComputeDriver {
     }
 
     fn capabilities(&self) -> GetCapabilitiesResponse {
-        openshell_core::driver_utils::build_capabilities_response(
-            "docker",
-            &self.config.daemon_version,
-            &self.config.default_image,
-        )
+        GetCapabilitiesResponse {
+            driver_name: "docker".to_string(),
+            driver_version: self.config.daemon_version.clone(),
+            default_image: self.config.default_image.clone(),
+            gateway_manages_lifecycle: true,
+        }
     }
 
     #[cfg(test)]
@@ -1053,69 +1053,6 @@ impl DockerComputeDriver {
             Err(err) if is_not_found_error(&err) => Ok(false),
             Err(err) => Err(internal_status("start docker sandbox container", err)),
         }
-    }
-
-    pub async fn stop_managed_containers_on_shutdown(&self) -> Result<usize, Status> {
-        let containers = self.list_managed_container_summaries().await?;
-        let targets = containers
-            .into_iter()
-            .filter_map(|container| {
-                let state = container.state.unwrap_or(ContainerSummaryStateEnum::EMPTY);
-                if container_state_needs_shutdown_stop(state) {
-                    summary_container_target(&container)
-                } else {
-                    None
-                }
-            })
-            .collect::<Vec<_>>();
-        let target_count = targets.len();
-        let mut stopped = 0usize;
-        let mut failures = Vec::new();
-        let stop_timeout_secs = self.config.stop_timeout_secs;
-
-        let mut stop_results = futures::stream::iter(targets.into_iter().map(|target| {
-            let docker = self.docker.clone();
-            async move {
-                let result = docker
-                    .stop_container(
-                        &target,
-                        Some(
-                            StopContainerOptionsBuilder::default()
-                                .t(docker_stop_timeout_secs(stop_timeout_secs))
-                                .build(),
-                        ),
-                    )
-                    .await;
-                (target, result)
-            }
-        }))
-        .buffer_unordered(16);
-
-        while let Some((target, result)) = stop_results.next().await {
-            match result {
-                Ok(()) => {
-                    stopped += 1;
-                }
-                Err(err) if is_not_found_error(&err) || is_not_modified_error(&err) => {}
-                Err(err) => {
-                    warn!(
-                        container = %target,
-                        error = %err,
-                        "Failed to stop Docker sandbox container during shutdown"
-                    );
-                    failures.push(target);
-                }
-            }
-        }
-
-        if !failures.is_empty() {
-            return Err(Status::internal(format!(
-                "failed to stop {} of {target_count} Docker sandbox containers during shutdown",
-                failures.len()
-            )));
-        }
-
-        Ok(stopped)
     }
 
     async fn reserve_pending_sandbox(&self, sandbox: &DriverSandbox) -> Result<(), Status> {
@@ -2448,13 +2385,20 @@ fn build_environment_for_oci_user(
         openshell_core::sandbox_env::SSH_SOCKET_PATH.to_string(),
         config.ssh_socket_path.clone(),
     );
+    let main_process =
+        openshell_core::sandbox_env::MainProcessConfig::encode_driver_spec(sandbox.spec.as_ref())
+            .expect("main process config serialization cannot fail");
     environment.insert(
-        openshell_core::sandbox_env::SANDBOX_COMMAND.to_string(),
-        SANDBOX_COMMAND.to_string(),
+        openshell_core::sandbox_env::MAIN_PROCESS_SPEC.to_string(),
+        main_process,
     );
     environment.insert(
         openshell_core::sandbox_env::TELEMETRY_ENABLED.to_string(),
         openshell_core::telemetry::enabled_env_value().to_string(),
+    );
+    environment.insert(
+        openshell_core::sandbox_env::NETWORK_RUNTIME_CAPABILITIES.to_string(),
+        openshell_core::sandbox_env::POLICY_DNS_TRANSPARENT_TCP_CAPABILITY.to_string(),
     );
     // The root supervisor executes namespace helpers during bootstrap; keep
     // their search path driver-owned even when the template/spec set PATH.
@@ -2696,10 +2640,9 @@ fn build_container_create_body_for_image(
                 Some(binds)
             },
             mounts: Some(user_mounts),
-            restart_policy: Some(RestartPolicy {
-                name: Some(RestartPolicyNameEnum::UNLESS_STOPPED),
-                maximum_retry_count: None,
-            }),
+            // Canonical main-process exit is terminal. Runtime restart would
+            // silently create a new process generation behind the gateway.
+            restart_policy: None,
             cap_add: Some(vec![
                 "SYS_ADMIN".to_string(),
                 "NET_ADMIN".to_string(),
@@ -3198,15 +3141,6 @@ fn summary_container_target(summary: &ContainerSummary) -> Option<String> {
         .filter(|id| !id.is_empty())
         .map(str::to_string)
         .or_else(|| summary_container_name(summary))
-}
-
-fn container_state_needs_shutdown_stop(state: ContainerSummaryStateEnum) -> bool {
-    matches!(
-        state,
-        ContainerSummaryStateEnum::RUNNING
-            | ContainerSummaryStateEnum::RESTARTING
-            | ContainerSummaryStateEnum::PAUSED
-    )
 }
 
 /// States from which a managed container can be brought back to running by

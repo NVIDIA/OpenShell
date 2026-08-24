@@ -26,6 +26,15 @@ func CopyBoolPtr(p *bool) *bool {
 	return &v
 }
 
+// CopyInt32Ptr returns a copy of an *int32 pointer.
+func CopyInt32Ptr(p *int32) *int32 {
+	if p == nil {
+		return nil
+	}
+	v := *p
+	return &v
+}
+
 // CopyStringSlice returns a copy of a string slice.
 // Returns nil for nil input.
 func CopyStringSlice(s []string) []string {

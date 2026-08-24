@@ -1,12 +1,14 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+pub use openshell_core::OperatorNamespaceAllowlist;
 use openshell_core::config;
 use serde::{Deserialize, Deserializer, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
+#[cfg(test)]
+use std::collections::BTreeSet;
 use std::path::Path;
 use std::str::FromStr;
-use std::sync::{Arc, RwLock};
 
 /// Default gateway identity used in managed-mode namespace naming.
 pub const DEFAULT_GATEWAY_ID: &str = "openshell";
@@ -162,10 +164,13 @@ impl Default for KubernetesSidecarConfig {
 
 impl KubernetesSidecarConfig {
     pub fn validate_proxy_uid(&self) -> Result<(), String> {
-        if self.proxy_uid < openshell_policy::MIN_SANDBOX_UID {
+        if !(openshell_policy::MIN_SANDBOX_PROXY_UID..=openshell_policy::MAX_SANDBOX_UID)
+            .contains(&self.proxy_uid)
+        {
             return Err(format!(
-                "sidecar.proxy_uid must be at least {}",
-                openshell_policy::MIN_SANDBOX_UID
+                "sidecar.proxy_uid must be in range [{}, {}]",
+                openshell_policy::MIN_SANDBOX_PROXY_UID,
+                openshell_policy::MAX_SANDBOX_UID,
             ));
         }
         Ok(())
@@ -838,89 +843,6 @@ pub fn validate_managed_namespace_name(gateway_id: &str, workspace: &str) -> Res
     Ok(())
 }
 
-/// Thread-safe dynamic allowlist of valid operator-mode namespaces.
-///
-/// Backed by an `Arc<RwLock<BTreeSet<String>>>` that is updated by background
-/// tasks (label selector watcher, drop-in file watcher) and read by the SA
-/// authenticator and namespace resolver.
-#[derive(Debug, Clone)]
-pub struct OperatorNamespaceAllowlist {
-    inner: Arc<RwLock<BTreeSet<String>>>,
-}
-
-impl OperatorNamespaceAllowlist {
-    fn read_guard(&self) -> std::sync::RwLockReadGuard<'_, BTreeSet<String>> {
-        self.inner
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
-
-    fn write_guard(&self) -> std::sync::RwLockWriteGuard<'_, BTreeSet<String>> {
-        self.inner
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
-
-    #[must_use]
-    pub fn new() -> Self {
-        Self {
-            inner: Arc::new(RwLock::new(BTreeSet::new())),
-        }
-    }
-
-    #[must_use]
-    pub fn from_set(set: BTreeSet<String>) -> Self {
-        Self {
-            inner: Arc::new(RwLock::new(set)),
-        }
-    }
-
-    /// Replace the entire allowlist (used by background watchers on refresh).
-    pub fn replace(&self, new_set: BTreeSet<String>) {
-        let mut guard = self.write_guard();
-        *guard = new_set;
-    }
-
-    /// Merge additional namespaces into the allowlist.
-    pub fn merge(&self, additional: &BTreeSet<String>) {
-        let mut guard = self.write_guard();
-        guard.extend(additional.iter().cloned());
-    }
-
-    /// Read the current allowlist snapshot.
-    pub fn read(&self) -> std::sync::RwLockReadGuard<'_, BTreeSet<String>> {
-        self.read_guard()
-    }
-
-    /// Check whether a namespace is in the allowlist.
-    #[must_use]
-    pub fn contains(&self, namespace: &str) -> bool {
-        self.read_guard().contains(namespace)
-    }
-
-    /// Insert a namespace into the allowlist. Returns `true` if it was new.
-    pub fn insert(&self, name: String) -> bool {
-        self.write_guard().insert(name)
-    }
-
-    /// Remove a namespace from the allowlist. Returns `true` if it was present.
-    pub fn remove(&self, name: &str) -> bool {
-        self.write_guard().remove(name)
-    }
-
-    /// Return a clone of the inner `Arc` for sharing with background tasks.
-    #[must_use]
-    pub fn shared(&self) -> Arc<RwLock<BTreeSet<String>>> {
-        Arc::clone(&self.inner)
-    }
-}
-
-impl Default for OperatorNamespaceAllowlist {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 fn is_dns1123_subdomain(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 253
@@ -1296,17 +1218,28 @@ mod tests {
     }
 
     #[test]
-    fn parse_openshift_uid_range_rejects_below_min() {
-        // 999 is below MIN_SANDBOX_UID (1000) — should be rejected.
+    fn parse_openshift_uid_range_accepts_non_root_system_uid() {
         assert_eq!(
             KubernetesComputeConfig::from_open_shift_uid_range("999/50000"),
+            Some(999)
+        );
+        assert_eq!(
+            KubernetesComputeConfig::from_open_shift_uid_range("1/50000"),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn parse_openshift_uid_range_rejects_root() {
+        assert_eq!(
+            KubernetesComputeConfig::from_open_shift_uid_range("0/50000"),
             None
         );
     }
 
     #[test]
     fn parse_openshift_uid_range_rejects_above_max() {
-        // u32::MAX is well above MAX_SANDBOX_UID — should be rejected.
+        // u32::MAX is the invalid identity sentinel.
         assert_eq!(
             KubernetesComputeConfig::from_open_shift_uid_range("4294967295/10000"),
             None
@@ -1316,8 +1249,8 @@ mod tests {
     #[test]
     fn validate_sandbox_identity_config_accepts_valid_range() {
         let cfg = KubernetesComputeConfig {
-            sandbox_uid: Some(1000),
-            sandbox_gid: Some(1000),
+            sandbox_uid: Some(500),
+            sandbox_gid: Some(30),
             ..KubernetesComputeConfig::default()
         };
         assert!(cfg.validate_sandbox_identity_config().is_ok());
@@ -1354,6 +1287,10 @@ mod tests {
         assert_eq!(
             KubernetesComputeConfig::from_open_shift_supplemental_groups("1000/50000"),
             Some(1000)
+        );
+        assert_eq!(
+            KubernetesComputeConfig::from_open_shift_supplemental_groups("30/50000"),
+            Some(30)
         );
     }
 

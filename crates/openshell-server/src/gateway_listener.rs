@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::compute::GatewayListenerRequirement;
-use openshell_core::{ComputeDriverKind, Error, Result};
+use openshell_core::{Error, Result};
 use socket2::{Domain, Protocol, Socket, Type};
 use std::net::{IpAddr, SocketAddr};
 use tokio::net::TcpListener;
@@ -193,25 +193,11 @@ fn validate_gateway_listener_requirement(
     requirement: &GatewayListenerRequirement,
 ) -> Result<()> {
     match requirement {
-        GatewayListenerRequirement::Exact {
-            address,
-            driver_name,
-            ..
-        } if driver_name == ComputeDriverKind::Docker.as_str()
-            || driver_name == ComputeDriverKind::Podman.as_str() =>
-        {
+        GatewayListenerRequirement::Exact { address, .. } => {
             validate_resolved_gateway_listener(primary_listener, *address)
         }
-        GatewayListenerRequirement::DefaultRouteInterface { driver_name, .. }
-        | GatewayListenerRequirement::LoopbackInterface { driver_name, .. }
-            if driver_name == ComputeDriverKind::Podman.as_str() =>
-        {
-            Ok(())
-        }
-        _ => Err(Error::config(format!(
-            "compute driver '{}' is not authorized to request this gateway listener selector",
-            requirement.driver_name()
-        ))),
+        GatewayListenerRequirement::DefaultRouteInterface { .. }
+        | GatewayListenerRequirement::LoopbackInterface { .. } => Ok(()),
     }
 }
 
@@ -464,7 +450,7 @@ mod tests {
     }
 
     #[test]
-    fn gateway_listener_specs_reject_unauthorized_external_driver() {
+    fn gateway_listener_specs_accept_safe_external_driver_requirement() {
         let primary: SocketAddr = "127.0.0.1:8080".parse().unwrap();
         let requirement = GatewayListenerRequirement::Exact {
             address: "172.18.0.1:8080".parse().unwrap(),
@@ -472,8 +458,10 @@ mod tests {
             reason: "external bridge".to_string(),
         };
 
-        let err = gateway_listener_specs(primary, &[requirement]).unwrap_err();
-        assert!(err.to_string().contains("not authorized"));
+        let specs = gateway_listener_specs(primary, &[requirement]).unwrap();
+        assert_eq!(specs.len(), 2);
+        assert_eq!(specs[1].address, "172.18.0.1:8080".parse().unwrap());
+        assert_eq!(specs[1].scope, GatewayListenerScope::ComputeDriverCallback);
     }
 
     #[test]
@@ -622,15 +610,18 @@ mod tests {
     }
 
     #[test]
-    fn gateway_listener_specs_reject_cross_driver_selector_authority() {
-        let primary: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+    fn gateway_listener_specs_validate_selector_independently_of_driver_name() {
+        let primary: SocketAddr = "192.168.20.20:8080".parse().unwrap();
         let requirement = GatewayListenerRequirement::LoopbackInterface {
             driver_name: "docker".to_string(),
             reason: "wrong selector".to_string(),
         };
 
-        let err = gateway_listener_specs(primary, &[requirement]).unwrap_err();
-        assert!(err.to_string().contains("not authorized"));
+        let specs = gateway_listener_specs(primary, &[requirement]).unwrap();
+        assert_eq!(specs.len(), 2);
+        assert_eq!(specs[0].address, primary);
+        assert_eq!(specs[1].address, "127.0.0.1:8080".parse().unwrap());
+        assert_eq!(specs[1].scope, GatewayListenerScope::ComputeDriverCallback);
     }
 
     #[tokio::test]

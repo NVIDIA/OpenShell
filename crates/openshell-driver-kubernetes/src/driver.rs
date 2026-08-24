@@ -544,11 +544,12 @@ impl KubernetesComputeDriver {
     }
 
     pub fn capabilities(&self) -> Result<GetCapabilitiesResponse, String> {
-        Ok(openshell_core::driver_utils::build_capabilities_response(
-            "kubernetes",
-            openshell_core::VERSION,
-            &self.config.default_image,
-        ))
+        Ok(GetCapabilitiesResponse {
+            driver_name: "kubernetes".to_string(),
+            driver_version: openshell_core::VERSION.to_string(),
+            default_image: self.config.default_image.clone(),
+            gateway_manages_lifecycle: false,
+        })
     }
 
     pub fn operator_allowlist(&self) -> Option<&OperatorNamespaceAllowlist> {
@@ -3336,6 +3337,7 @@ fn sandbox_to_k8s_spec(
                     template,
                     driver_gpu_requirements(spec.resource_requirements.as_ref()),
                     &pod_env,
+                    Some(spec),
                     &driver_config,
                     inject_workspace,
                     params,
@@ -3369,6 +3371,7 @@ fn sandbox_to_k8s_spec(
                 &SandboxTemplate::default(),
                 driver_gpu_requirements(spec.and_then(|s| s.resource_requirements.as_ref())),
                 &pod_env,
+                spec,
                 &driver_config,
                 inject_workspace,
                 params,
@@ -3396,6 +3399,7 @@ fn sandbox_template_to_k8s(
         template,
         gpu_requirements.as_ref(),
         spec_environment,
+        None,
         &driver_config,
         inject_workspace,
         params,
@@ -3416,6 +3420,7 @@ fn sandbox_template_to_k8s_with_gpu_requirements(
         template,
         gpu_requirements,
         spec_environment,
+        None,
         &driver_config,
         inject_workspace,
         params,
@@ -3426,6 +3431,7 @@ fn sandbox_template_to_k8s_with_validated_config(
     template: &SandboxTemplate,
     gpu_requirements: Option<&GpuResourceRequirements>,
     spec_environment: &std::collections::HashMap<String, String>,
+    sandbox_spec: Option<&openshell_core::proto::compute::v1::DriverSandboxSpec>,
     driver_config: &KubernetesSandboxDriverConfig,
     inject_workspace: bool,
     params: &SandboxPodParams<'_>,
@@ -3535,6 +3541,9 @@ fn sandbox_template_to_k8s_with_validated_config(
         "automountServiceAccountToken".to_string(),
         serde_json::json!(false),
     );
+    // Do not let kubelet replace the canonical main-process generation after
+    // the supervisor exits. The gateway records that exit as terminal Error.
+    spec.insert("restartPolicy".to_string(), serde_json::json!("Never"));
 
     let mut container = serde_json::Map::new();
     container.insert("name".to_string(), serde_json::json!("agent"));
@@ -3559,6 +3568,7 @@ fn sandbox_template_to_k8s_with_validated_config(
         None,
         &template.environment,
         spec_environment,
+        sandbox_spec,
         params.sandbox_id,
         params.sandbox_name,
         params.grpc_endpoint,
@@ -3928,6 +3938,7 @@ fn build_env_list(
     existing_env: Option<&Vec<serde_json::Value>>,
     template_environment: &std::collections::HashMap<String, String>,
     spec_environment: &std::collections::HashMap<String, String>,
+    sandbox_spec: Option<&openshell_core::proto::compute::v1::DriverSandboxSpec>,
     sandbox_id: &str,
     sandbox_name: &str,
     grpc_endpoint: &str,
@@ -3949,6 +3960,14 @@ fn build_env_list(
             &json,
         );
     }
+    let main_process =
+        openshell_core::sandbox_env::MainProcessConfig::encode_driver_spec(sandbox_spec)
+            .expect("main process config serialization cannot fail");
+    upsert_env(
+        &mut env,
+        openshell_core::sandbox_env::MAIN_PROCESS_SPEC,
+        &main_process,
+    );
     apply_required_env(
         &mut env,
         sandbox_id,
@@ -3986,13 +4005,15 @@ fn apply_required_env(
     upsert_env(env, openshell_core::sandbox_env::ENDPOINT, grpc_endpoint);
     upsert_env(
         env,
-        openshell_core::sandbox_env::SANDBOX_COMMAND,
-        "sleep infinity",
-    );
-    upsert_env(
-        env,
         openshell_core::sandbox_env::TELEMETRY_ENABLED,
         openshell_core::telemetry::enabled_env_value(),
+    );
+    // Runtime capabilities are driver-owned. Kubernetes topologies do not yet
+    // provide the complete policy DNS and transparent TCP substrate.
+    upsert_env(
+        env,
+        openshell_core::sandbox_env::NETWORK_RUNTIME_CAPABILITIES,
+        "",
     );
     if !ssh_socket_path.is_empty() {
         upsert_env(
@@ -7146,6 +7167,29 @@ mod tests {
                 assert_eq!(telemetry_entries[0]["value"], serde_json::json!("false"));
             },
         );
+    }
+
+    #[test]
+    fn sandbox_pod_clears_unsupported_network_capabilities() {
+        let spec = SandboxSpec {
+            environment: std::collections::HashMap::from([(
+                openshell_core::sandbox_env::NETWORK_RUNTIME_CAPABILITIES.to_string(),
+                openshell_core::sandbox_env::POLICY_DNS_TRANSPARENT_TCP_CAPABILITY.to_string(),
+            )]),
+            ..SandboxSpec::default()
+        };
+        let cr = sandbox_to_k8s_spec_for_test(Some(&spec), &SandboxPodParams::default());
+        let env = cr["spec"]["podTemplate"]["spec"]["containers"][0]["env"]
+            .as_array()
+            .unwrap();
+        let entries = env
+            .iter()
+            .filter(|entry| {
+                entry["name"] == openshell_core::sandbox_env::NETWORK_RUNTIME_CAPABILITIES
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["value"], serde_json::json!(""));
     }
 
     #[test]

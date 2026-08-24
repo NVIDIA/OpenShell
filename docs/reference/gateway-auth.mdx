@@ -120,9 +120,11 @@ openshell gateway add https://gateway.example.com \
   --oidc-audience openshell-cli
 ```
 
-When you register or log in to an OIDC gateway, the CLI uses the Authorization Code flow with PKCE. It opens a browser, receives the authorization code on a localhost callback, exchanges the code for tokens, and stores the token bundle under the gateway credential directory. If `OPENSHELL_OIDC_CLIENT_SECRET` is set, the CLI uses the client credentials flow instead. Use that mode for CI and other non-interactive automation.
+When you register or log in to an OIDC gateway, the CLI uses the Authorization Code flow with PKCE. It opens a browser, receives the authorization code on a localhost callback, exchanges the code for tokens, and stores the token bundle under the gateway credential directory. After `openshell gateway logout`, the next browser login asks the identity provider for a fresh login prompt so you can choose a different browser user instead of silently reusing the previous session. If `OPENSHELL_OIDC_CLIENT_SECRET` is set, the CLI uses the client credentials flow instead. Use that mode for CI and other non-interactive automation.
 
 The connection flow:
+
+For a headless environment, set `OPENSHELL_NO_BROWSER=1` before registering or logging in to the gateway. When this variable is set and `OPENSHELL_OIDC_CLIENT_SECRET` is not configured, the CLI uses the Device Authorization Grant (RFC 8628) with S256 PKCE. This flow prompts the user to visit a verification URL on any device with a browser and enter a displayed code. The CLI polls the token endpoint until the user completes authorization. This requires the OIDC client to have the device authorization grant enabled on the identity provider.
 
 1. The CLI loads the stored OIDC token bundle.
 2. If the access token is expired and a refresh token is available, the CLI refreshes it with the OIDC scopes saved in the gateway metadata.

@@ -17,6 +17,13 @@ The Kubernetes Agent Sandbox CRDs and controller must be installed on the cluste
 kubectl apply -f https://github.com/kubernetes-sigs/agent-sandbox/releases/latest/download/manifest.yaml
 ```
 
+The chart does not install this cluster-scoped dependency. By default, it
+fails before creating gateway resources when the cluster serves neither
+supported Sandbox API (`agents.x-k8s.io/v1beta1` or
+`agents.x-k8s.io/v1alpha1`). Disable the check with
+`agentSandbox.preflight.enabled=false` for offline `helm template` rendering,
+where Helm cannot discover cluster APIs.
+
 ## Install on Kubernetes
 
 ```shell
@@ -139,20 +146,26 @@ JWT signing Secret.
 
 ## SPIFFE/SPIRE provider token grants
 
-Set `server.providerTokenGrants.spiffe.enabled=true` to let sandbox supervisors
-use SPIFFE JWT-SVIDs for dynamic provider token grants. The chart keeps
-supervisor-to-gateway authentication on gateway-minted sandbox JWTs and passes
-the SPIFFE Workload API socket path to the Kubernetes driver so sandbox pods can
-mount the SPIFFE CSI socket.
+Set `server.providerTokenGrants.spiffe.enabled=true` to let the gateway and
+sandbox supervisors use SPIFFE JWT-SVIDs for dynamic provider token grants. The
+chart keeps supervisor-to-gateway authentication on gateway-minted sandbox JWTs,
+mounts the SPIFFE CSI socket into the gateway pod, exports
+`OPENSHELL_GATEWAY_SPIFFE_WORKLOAD_API_SOCKET`, and passes the socket path to
+the Kubernetes driver so sandbox pods can mount the same socket.
 
 For local development, uncomment the SPIRE Helm releases in `skaffold.yaml` and
 add `ci/values-spire.yaml` to the OpenShell release values files.
+
+The gateway verifies supervisor JWT-SVIDs with JWT bundles fetched from the
+SPIFFE Workload API, so this path does not require access to the SPIRE OIDC
+discovery endpoint or its TLS CA.
 
 ## Values
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | affinity | object | `{}` | Affinity rules for the gateway pod. |
+| agentSandbox.preflight.enabled | bool | `true` | Check the live cluster for a supported Agent Sandbox API before rendering gateway resources. Disable only for offline rendering and linting. |
 | certManager.caSecretName | string | `"openshell-ca-tls"` | Secret created for the intermediate CA (Certificate with isCA: true). |
 | certManager.certificateDuration | string | `"8760h"` | Duration for cert-manager-issued certificates. |
 | certManager.certificateRenewBefore | string | `"720h"` | Renewal window for cert-manager-issued certificates. |
@@ -249,8 +262,8 @@ add `ci/values-spire.yaml` to the OpenShell release values files.
 | server.oidc.scopesClaim | string | `""` | Dot-separated path to the scopes array in the JWT claims. |
 | server.oidc.userRole | string | `""` | Role name for standard user access. |
 | server.policyValidationFailureMode | string | `"fail_closed"` | Posture when a candidate sandbox policy fails validation. `fail_closed` deactivates the previous policy; `retain_last_valid` keeps it active. |
-| server.providerTokenGrants.spiffe.enabled | bool | `false` | Mount the SPIFFE Workload API socket into sandbox pods for dynamic provider token grants. |
-| server.providerTokenGrants.spiffe.workloadApiSocketPath | string | `"/spiffe-workload-api/spire-agent.sock"` | Path to the SPIFFE Workload API socket mounted into sandbox pods. |
+| server.providerTokenGrants.spiffe.enabled | bool | `false` | Mount the SPIFFE Workload API socket into gateway and sandbox pods for dynamic provider token grants. |
+| server.providerTokenGrants.spiffe.workloadApiSocketPath | string | `"/spiffe-workload-api/spire-agent.sock"` | Path to the SPIFFE Workload API socket mounted into gateway and sandbox pods. |
 | server.sandboxImage | string | `"ghcr.io/nvidia/openshell-community/sandboxes/base:latest"` | Default sandbox image used when requests do not specify one. |
 | server.sandboxImagePullPolicy | string | `""` | Kubernetes imagePullPolicy for sandbox pods. Empty = Kubernetes default (Always for :latest, IfNotPresent otherwise). Set to "Always" for dev clusters so new images are picked up without manual eviction. |
 | server.sandboxImagePullSecrets | list | `[]` | Image pull secrets attached to sandbox pods. Referenced Secrets must exist in the sandbox namespace. |

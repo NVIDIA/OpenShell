@@ -19,6 +19,13 @@ The target deployment flow is:
 4. The CLI registers a reachable gateway endpoint with `openshell gateway add`.
 5. The gateway creates sandboxes through the selected compute driver.
 
+The standard gateway binary explicitly installs its compiled Docker, Podman,
+Kubernetes, and VM registrations at startup. With no configured driver, the
+gateway probes only installed registrations in priority order (Kubernetes,
+Podman, then Docker); VM has no probe and remains opt-in. A custom gateway
+binary may install a different set, so confirm the binary's registered drivers
+when auto-detection reports that no suitable driver is available.
+
 For local evaluation only, TLS may be disabled and the gateway can be reached through `http://127.0.0.1:<port>`.
 
 ## Prerequisites
@@ -71,7 +78,7 @@ Use gateway metadata, deployment values, or the user's setup notes to identify t
 
 Before debugging the compute platform, inspect gateway logs for failures in dependencies initialized before the listener becomes ready.
 
-For out-of-tree compute drivers, confirm the custom driver name and socket agree across CLI flags or `gateway.toml`, and that the operator-owned driver is running before the gateway starts:
+For out-of-tree compute drivers, confirm the selected driver name and socket agree across CLI flags or `gateway.toml`, and that the operator-owned driver is running before the gateway starts:
 
 ```bash
 rg -n 'compute_drivers|socket_path' /etc/openshell/gateway.toml
@@ -80,7 +87,7 @@ journalctl -u <driver-service> --no-pager --lines=200
 journalctl -u openshell-gateway --no-pager --lines=200
 ```
 
-The custom driver name must not be a reserved built-in name (`docker`, `podman`, `kubernetes`, or `vm`). The socket must be accessible only to the intended gateway identity. Check gateway logs for connection errors, `GetCapabilities` failures, or an unexpected advertised driver name. The gateway does not create or supervise out-of-tree driver processes or sockets.
+Custom names use `[openshell.drivers.<name>].socket_path`. A launch-time `--compute-driver-socket` override may also use `docker`, `podman`, `kubernetes`, or `vm`; the endpoint then takes precedence over built-in construction. First-party standalone drivers require the socket parent directory to be owned by the driver's effective UID, force its mode to `0700`, create the socket with mode `0600`, and accept only peers with that same UID. Check the parent and socket separately with `stat`; a gateway running under a different UID cannot connect even when filesystem permissions or group membership would otherwise allow it. Operator-supplied drivers must provide equivalent access control appropriate to their implementation. Check gateway logs for connection errors, `GetCapabilities` failures, or an unexpected advertised driver name. The advertised name is diagnostic metadata; negotiated features control optional behavior. The gateway does not create or supervise operator-supplied driver processes or sockets.
 
 For configured gateway interceptors, inspect `[[openshell.gateway.interceptors]]`, their Unix or network endpoints, and gateway startup logs:
 
@@ -172,7 +179,7 @@ Common findings:
 - Docker daemon unavailable: start Docker Desktop or Docker Engine.
 - Gateway process stopped: inspect exit status and logs.
 - Sandbox image missing or pull denied: verify image reference and registry credentials.
-- Sandbox fails before readiness with an identity-resolution error: inspect the image's OCI `USER` and matching `/etc/passwd` and `/etc/group` entries, or explicitly set both process identity fields in policy. Root and missing identities are rejected.
+- Sandbox fails before readiness with an identity-resolution error: inspect the image's OCI `USER` and matching `/etc/passwd` and `/etc/group` entries, or explicitly set both process identity fields in policy. Numeric workload identities `1` through `4294967294` are accepted; root, the invalid identity sentinel, and missing identities are rejected.
 - Sandbox fails before readiness with an OCI workspace validation error: inspect the image's `WorkingDir` using the immutable image ID reported by the gateway. Empty, `/`, and explicit `/sandbox` use the managed `/sandbox` compatibility workspace. Any other workdir must be an absolute normalized directory with no symlink components; the final policy UID, primary GID, and supplementary groups must pass the kernel's effective traverse/write checks, including POSIX ACL and LSM decisions. OpenShell does not create, chown, or chmod a non-default image workdir.
 - Docker also rejects an image `VOLUME` that covers the workdir or one of its parents because the runtime would mask the immutable path before validation. Move the `VOLUME` below the workspace or remove the declaration.
 - A workdir rejected as a special filesystem or OpenShell control-path collision cannot be made valid with permissions. Move the image workdir away from kernel-backed mounts and the concrete supervisor, TLS, token, runtime, and socket paths named in the error.
@@ -186,6 +193,7 @@ Common findings:
   callbacks. On an older release, set `bind_address = "127.0.0.1:17670"` or
   upgrade.
 - Supervisor image exits before printing `openshell-sandbox --version`: the image should be the scratch supervisor image from `deploy/docker/Dockerfile.supervisor` and must contain a static executable at `/openshell-sandbox`.
+- A sandbox with explicit `protocol: tcp` endpoints fails before workload readiness: confirm the Docker or Podman driver supplied the `policy-dns-transparent-tcp` runtime capability and inspect supervisor logs for missing `nft`, synthetic-route overlap, or namespace-local DNS/TCP listener bind failures. Kubernetes, VM, sidecar, and out-of-tree drivers must reject this policy until they provide the complete substrate; use omitted protocol with an explicit proxy on those runtimes.
 - `mise run e2e:docker:gpu` fails with `docker info --format json did not report any discovered NVIDIA CDI GPU devices`: Docker may report `CDISpecDirs` while still having no generated NVIDIA CDI specs. Verify `.DiscoveredDevices` contains entries such as `nvidia.com/gpu=all`, verify `/etc/cdi` or `/var/run/cdi` contains a generated NVIDIA spec, and check that `nvidia-cdi-refresh.service` and `nvidia-cdi-refresh.path` from NVIDIA Container Toolkit are enabled and healthy. The service is a one-shot unit, so `inactive (dead)` can be normal after a successful run; use `systemctl status` and `journalctl` to distinguish success from a skipped or failed refresh. NVIDIA recommends enabling the path and service units, and restarting `nvidia-cdi-refresh.service` to regenerate missing or stale CDI specs. If specs are generated but Docker still reports no discovered devices, restart Docker or reload the daemon and re-check `docker info`.
 
 For source checkout development, restart the local gateway with:
@@ -193,6 +201,15 @@ For source checkout development, restart the local gateway with:
 ```bash
 mise run gateway:docker
 ```
+
+During a graceful gateway restart, Docker, Podman, and VM sandboxes with
+running intent should stop before the gateway exits and restart after it
+returns. Check for `Stopped sandbox during gateway shutdown` and `Started
+sandbox during gateway startup` in gateway logs. A sandbox explicitly stopped
+through the CLI remains stopped. Kubernetes sandboxes are cluster-owned and do
+not follow this local gateway lifecycle. Internal and external drivers follow
+the same rule: `GetCapabilities.gateway_manages_lifecycle` must be true for the
+gateway to run shutdown and startup sweeps.
 
 ### Step 5: Check Podman-Backed Gateways
 
@@ -208,8 +225,12 @@ Common findings:
 - Podman socket unavailable: start or expose the user socket.
 - Rootless networking unavailable: inspect Podman network configuration.
 - Sandbox image missing or pull denied: verify image reference and registry credentials.
-- Sandbox fails before readiness with an identity-resolution error: inspect the image's OCI `USER` and matching `/etc/passwd` and `/etc/group` entries, or explicitly set both process identity fields in policy. Root and missing identities are rejected.
+- Sandbox fails before readiness with an identity-resolution error: inspect the image's OCI `USER` and matching `/etc/passwd` and `/etc/group` entries, or explicitly set both process identity fields in policy. Numeric workload identities `1` through `4294967294` are accepted; root, the invalid identity sentinel, and missing identities are rejected.
 - Supervisor cannot call back: check callback endpoint and gateway logs.
+- A sandbox with explicit `protocol: tcp` endpoints fails before readiness:
+  inspect supervisor logs for policy DNS port-53 binding, synthetic-route, or
+  nftables redirect failures. Rootless Podman must provide these primitives
+  inside the supervisor-owned nested network namespace; setup fails closed.
 - Gateway exits before becoming healthy with a callback-listener discovery
   error: inspect `podman info --debug`, the configured Podman network, and the
   host's IPv4 default route. Rootless pasta uses the private source address
@@ -354,14 +375,20 @@ kubectl -n openshell get statefulset openshell -o jsonpath='{.spec.template.spec
 
 If `server.providerTokenGrants.spiffe.enabled=true`, the gateway should still
 render `[openshell.gateway.gateway_jwt]` and mount the `sandbox-jwt` Secret.
-SPIRE is used only by sandbox pods for dynamic provider token grants. Verify
-that SPIRE is installed, the CSI driver is available, and the Kubernetes driver
-config includes `provider_spiffe_workload_api_socket_path`:
+SPIRE is used by both the gateway and sandbox supervisors for dynamic provider
+token grants. The gateway pod must mount the `spiffe-workload-api` CSI volume
+and set `OPENSHELL_GATEWAY_SPIFFE_WORKLOAD_API_SOCKET`; sandbox pods must
+receive the matching Workload API socket from the Kubernetes driver config.
+The gateway verifies supervisor JWT-SVIDs from JWT bundles fetched through this
+Workload API socket, not from the SPIRE OIDC discovery endpoint.
+Verify that SPIRE is installed, the CSI driver is available, and the Kubernetes
+driver config includes `provider_spiffe_workload_api_socket_path`:
 
 ```bash
 helm -n openshell get values openshell | grep -E 'providerTokenGrants|workloadApiSocketPath'
 kubectl get pods -A | grep -E 'spire|spiffe'
 kubectl -n openshell get configmap openshell-config -o yaml | grep provider_spiffe_workload_api_socket_path
+kubectl -n openshell get pod -l app.kubernetes.io/name=helm-chart -o jsonpath="{.items[*].spec.containers[*].env[?(@.name==\"OPENSHELL_GATEWAY_SPIFFE_WORKLOAD_API_SOCKET\")].value}{\"\n\"}"
 ```
 
 Sandbox pods using provider token grants should have an
@@ -452,8 +479,10 @@ should be the only sidecar topology container with `NET_ADMIN`. It also needs
 default binary-aware network sidecar runs as UID 0 with primary GID
 `sandbox_gid` and adds `SYS_PTRACE` plus `DAC_READ_SEARCH`. When
 `process_binary_aware_network_policy = false`, it runs as the configured
-non-root `proxy_uid` without those inspection capabilities. The pod `fsGroup`
-is set to `sandbox_gid` in both modes.
+non-root `proxy_uid` without those inspection capabilities. That dedicated
+proxy UID must remain at least `1000` and must not match the workload UID
+because the pod egress fence exempts its traffic. The pod `fsGroup` is set to
+`sandbox_gid` in both modes.
 
 In sidecar topology only the network sidecar should mount the gateway bootstrap
 credentials (`openshell-sa-token` and `openshell-client-tls`). The process
@@ -586,7 +615,7 @@ openshell logs <sandbox-name>
 | Binary WebSocket message passes without a middleware RPC | Binary is unsupported by the V1 text-message binding under both `on_error` modes | `WEBSOCKET_MIDDLEWARE_COVERAGE state=unsupported_message_type`; the next text RPC may have a valid sequence gap |
 | WebSocket messages stop reaching middleware after one failure | A fail-open stage stream was disabled for the rest of the connection | `openshell.middleware.websocket_stage_disabled`; middleware timeout/stream/protocol logs. A per-message capacity bypass alone leaves the stage active. Reconnect to create a fresh stream after a genuine stream failure |
 | Supervisor repeatedly fails to install middleware after enabling gateway JWT signing | Extension credential minting, distribution, or authenticated service connection failed; last-known-good registry remains active | Gateway `RefreshSandboxToken` logs, sandbox configuration events, service token-verification logs, registration TLS/audience settings |
-| Custom compute driver is unavailable | Driver process/socket missing, inaccessible, or configured with a reserved/mismatched name | Socket ownership/mode, driver service logs, gateway `GetCapabilities` logs |
+| Custom compute driver is unavailable | Driver process/socket missing, inaccessible, or selected name does not match its endpoint/config key | Socket ownership/mode, driver service logs, gateway `GetCapabilities` logs |
 | Sandbox remains `Stopping` or `Starting` | Driver stop/start failed, retained resource is missing, or a fresh supervisor has not connected | Gateway and driver logs; `docker inspect`, `podman inspect`, Agent Sandbox status/PVC, or VM state marker and launcher process |
 | Image pull failure | Gateway or sandbox image cannot be pulled | Runtime events and image pull credentials |
 | `K8s namespace not ready` with `envoy-gateway-openshell.yaml: the server could not find the requested resource` | Optional Gateway API manifest was applied without Envoy Gateway CRDs, or k3s Helm controller startup exceeded the namespace wait | Apply `deploy/kube/manifests/envoy-gateway-openshell.yaml` manually only after Envoy Gateway is installed and `grpcRoute` is enabled |

@@ -204,13 +204,17 @@ identity provider. Requires an authenticated gateway connection.
 
 ### `openshell sandbox create [OPTIONS] [-- COMMAND...]`
 
-Create a sandbox through the selected gateway, wait for readiness, then connect, open an editor, or execute the trailing command.
+Create a sandbox through the selected gateway and launch its canonical main
+process. By default, the CLI attaches to that retained process after the
+sandbox becomes ready. A trailing command defines the canonical main process;
+without one, the default is `/bin/bash -l` with a PTY.
 
 | Flag | Description |
 |------|-------------|
 | `--name <NAME>` | Sandbox name (auto-generated if omitted) |
 | `--from <SOURCE>` | Community name, Dockerfile path, directory, or image reference (BYOC) |
 | `--no-keep` | Delete the sandbox after the initial command or shell exits |
+| `--detach` | Start the canonical main process without attaching |
 | `--editor vscode|cursor` | Launch a remote editor and keep the sandbox alive |
 | `--gpu [COUNT]` | Request the driver's default GPU selection or a specific count |
 | `--cpu <QUANTITY>` | CPU limit (for example: `500m`, `1`, `2.5`) |
@@ -227,7 +231,12 @@ Create a sandbox through the selected gateway, wait for readiness, then connect,
 | `--approval-mode manual|auto` | Handle agent-authored policy proposals; default: `manual` |
 | `--upload <PATH>[:<DEST>]` | Upload local files to the working directory or an explicit destination (repeatable) |
 | `--no-git-ignore` | Disable `.gitignore` filtering for `--upload` |
-| `[-- COMMAND...]` | Initial command (defaults to an interactive shell) |
+| `[-- COMMAND...]` | Canonical main command (defaults to `/bin/bash -l`) |
+
+`--upload` cannot be combined with a trailing main command because uploads
+currently complete after the canonical process starts. Create the default
+scratch sandbox, upload files, then use `sandbox exec`, or build the files into
+the image.
 
 ### `openshell sandbox get [name]`
 
@@ -277,7 +286,13 @@ Execute a command through the gRPC exec endpoint, stream its output, and exit wi
 
 ### `openshell sandbox connect [name]`
 
-Open an interactive SSH shell. The name defaults to the last-used sandbox. `--editor vscode|cursor` launches a supported remote editor instead.
+Attach to the sandbox's retained canonical main process. Disconnecting leaves
+the process running. Reconnecting targets the same process instance and
+replays recent output. Use `sandbox exec --tty -- /bin/bash -l` when you need a
+new shell. The name defaults to the last-used sandbox.
+
+`--editor vscode|cursor` launches a supported remote editor instead of
+attaching to the canonical main process.
 
 ### `openshell sandbox upload <name> <path> [dest]`
 
@@ -384,6 +399,12 @@ Incrementally merge live network policy changes into the current sandbox policy.
 Notes:
 
 - The sandbox name defaults to the last-used sandbox.
+- `--add-endpoint` options are comma-separated: `allowed-ip=<CIDR-or-IP>`, `websocket-credential-rewrite`, `request-body-credential-rewrite`, and `allow-uninspected-credentials`. The last option is a security-sensitive exception for provider-credentialed L4-only, `tls: skip`, or otherwise uninspectable traffic.
+- `protocol` accepts `tcp` for explicit L4-only host/port policy. It has the
+  same payload-handling behavior as omitting the protocol, but it requires a
+  valid DNS hostname and rejects hostless `allowed_ips` or literal-IP
+  selectors. It cannot be combined with `access`, `rules`, or L7 enforcement
+  options.
 - `--add-allow` and `--add-deny` operate on REST and WebSocket endpoints. Use full YAML for JSON-RPC, MCP, SQL, or other policy structure.
 - `--wait` cannot be combined with `--dry-run`.
 - Use `policy set` when replacing the full policy or changing static sections.
@@ -450,7 +471,7 @@ Review agent-authored network rule proposals. This command group is intentionall
 - `openshell rule clear [name]`
 - `openshell rule history [name]`
 
-Sandbox names default to the last-used sandbox. Bulk approval of security-flagged proposals requires explicit `--include-security-flagged`.
+Sandbox names default to the last-used sandbox. The CLI fetches and submits each proposal's current review token; a changed live candidate remains pending until it is reviewed again. Bulk approval of security-flagged proposals requires explicit `--include-security-flagged`.
 
 ---
 

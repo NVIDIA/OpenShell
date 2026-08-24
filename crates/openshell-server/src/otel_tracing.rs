@@ -29,6 +29,12 @@ use opentelemetry_sdk::trace::SdkTracerProvider;
 use tracing::Subscriber;
 use tracing_subscriber::registry::LookupSpan;
 
+#[cfg(feature = "in-tree-compute-drivers")]
+const COMPUTE_DRIVER_TARGET_PREFIX: &str =
+    openshell_driver_podman::otel_tracing::IN_PROCESS_TARGET_PREFIX;
+#[cfg(not(feature = "in-tree-compute-drivers"))]
+const COMPUTE_DRIVER_TARGET_PREFIX: &str = "\0";
+
 use crate::config_file::OtlpConfig;
 
 /// `service.name` reported when the config file does not override it.
@@ -90,11 +96,15 @@ pub fn provider_for(cfg: Option<&OtlpConfig>) -> (Option<SdkTracerProvider>, Opt
 ///
 /// Events stay on the gateway's logging layers. Spans emitted by the
 /// OpenTelemetry crates are excluded to prevent recursive export traffic.
-pub fn layer<S>(provider: &SdkTracerProvider) -> openshell_otel::OtlpLayer<S>
+pub fn layer<S>(provider: &SdkTracerProvider) -> openshell_otel::TargetOtlpLayer<S>
 where
     S: Subscriber + for<'span> LookupSpan<'span>,
 {
-    openshell_otel::layer(provider, INSTRUMENTATION_SCOPE)
+    openshell_otel::layer_excluding_target_prefix(
+        provider,
+        INSTRUMENTATION_SCOPE,
+        COMPUTE_DRIVER_TARGET_PREFIX,
+    )
 }
 
 /// Isolated in-memory span exporters for tracing tests.

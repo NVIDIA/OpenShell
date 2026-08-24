@@ -30,7 +30,7 @@ use openshell_core::proto::credentials::v1::{
     GetCredentialDriverCapabilitiesResponse, ResolveCredentialRequest, ResolveCredentialsRequest,
     ResolvedCredential, StoreCredentialRequest, credential_driver_client::CredentialDriverClient,
 };
-use openshell_core::proto::{CredentialHandle, Provider};
+use openshell_core::proto::{CredentialHandle, Provider, StoredRefreshMaterialDeletion};
 use openshell_core::{Config, Error, Result as CoreResult};
 use openshell_driver_db_credstore::{
     CredentialObjectWrite, DbCredstoreCredentialDriver, DbCredstoreObjectStore,
@@ -38,6 +38,7 @@ use openshell_driver_db_credstore::{
 };
 use openshell_driver_kubernetes_secrets::KubernetesSecretsCredentialDriver;
 use openshell_driver_vault::VaultCredentialDriver;
+use sha2::{Digest, Sha256};
 #[cfg(unix)]
 use tokio::net::UnixStream;
 #[cfg(unix)]
@@ -53,6 +54,8 @@ use crate::persistence::{PersistenceError, Store, WriteCondition};
 
 const DEFAULT_CREDENTIAL_DRIVER_STARTUP_TIMEOUT_SECS: u64 = 10;
 const DEFAULT_CREDENTIAL_DRIVER_RPC_TIMEOUT_SECS: u64 = 30;
+const REFRESH_MATERIAL_CREDENTIAL_KEY_DOMAIN: &[u8] =
+    b"openshell-refresh-material-credential-key-v1";
 const COMMON_CREDENTIAL_DRIVER_FIELDS: &[&str] = &[
     "transport",
     "socket_path",
@@ -81,12 +84,36 @@ pub trait CredentialDriver: std::fmt::Debug + Send + Sync {
     fn stored_credential_count(&self) -> Option<usize> {
         None
     }
+
+    #[cfg(test)]
+    fn fail_next_store(&self) {}
+
+    #[cfg(test)]
+    fn fail_next_delete(&self) {}
+
+    #[cfg(test)]
+    fn gate_next_store(
+        &self,
+    ) -> Option<(
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    )> {
+        None
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ResolvedProviderCredentials {
     pub values: HashMap<String, String>,
     pub expires_at_ms: HashMap<String, i64>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct RefreshMaterialScope<'a> {
+    pub provider_name: &'a str,
+    pub workspace: &'a str,
+    pub provider_id: &'a str,
+    pub credential_key: &'a str,
 }
 
 #[derive(Debug, Clone)]
@@ -213,6 +240,33 @@ impl CredentialRuntime {
             .and_then(|driver| driver.stored_credential_count())
     }
 
+    #[cfg(test)]
+    pub(crate) fn fail_next_store(&self) {
+        if let Some(driver) = self.drivers.get(&self.registry.storage_owner_name()) {
+            driver.fail_next_store();
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_delete(&self) {
+        if let Some(driver) = self.drivers.get(&self.registry.storage_owner_name()) {
+            driver.fail_next_delete();
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn gate_next_store(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        self.drivers
+            .get(&self.registry.storage_owner_name())
+            .and_then(|driver| driver.gate_next_store())
+            .expect("test credential driver supports store gating")
+    }
+
     pub async fn store_provider_credentials(
         &self,
         provider_name: &str,
@@ -326,6 +380,169 @@ impl CredentialRuntime {
         }
 
         Ok(successes)
+    }
+
+    /// Store gateway-only refresh material through the active credential
+    /// driver. Material names never become backend keys directly; a
+    /// deterministic driver-safe key binds each slot to its injectable
+    /// credential without exposing caller-controlled names in backend paths.
+    pub async fn store_refresh_material_with_object_id(
+        &self,
+        scope: RefreshMaterialScope<'_>,
+        object_id: &str,
+        material: &HashMap<String, String>,
+        existing_handles: &HashMap<String, CredentialHandle>,
+    ) -> Result<HashMap<String, CredentialHandle>, Status> {
+        let mut values_by_storage_key = HashMap::with_capacity(material.len());
+        let mut handles_by_storage_key = HashMap::with_capacity(existing_handles.len());
+        let mut material_by_storage_key = HashMap::with_capacity(material.len());
+
+        for (material_key, value) in material {
+            let storage_key = refresh_material_storage_key(scope.credential_key, material_key);
+            material_by_storage_key.insert(storage_key.clone(), material_key.clone());
+            values_by_storage_key.insert(storage_key, value.clone());
+        }
+        for (material_key, handle) in existing_handles {
+            handles_by_storage_key.insert(
+                refresh_material_storage_key(scope.credential_key, material_key),
+                handle.clone(),
+            );
+        }
+
+        let stored = self
+            .store_provider_credentials_with_object_id(
+                scope.provider_name,
+                scope.workspace,
+                scope.provider_id,
+                object_id,
+                &values_by_storage_key,
+                &handles_by_storage_key,
+            )
+            .await?;
+        stored
+            .into_iter()
+            .map(|(storage_key, handle)| {
+                material_by_storage_key
+                    .remove(&storage_key)
+                    .map(|material_key| (material_key, handle))
+                    .ok_or_else(|| {
+                        Status::internal(
+                            "credential driver returned an unknown refresh material key",
+                        )
+                    })
+            })
+            .collect()
+    }
+
+    pub async fn resolve_refresh_material(
+        &self,
+        scope: RefreshMaterialScope<'_>,
+        handles: &HashMap<String, CredentialHandle>,
+    ) -> Result<HashMap<String, String>, Status> {
+        if handles.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let mut material_by_storage_key = HashMap::with_capacity(handles.len());
+        let mut storage_handles = HashMap::with_capacity(handles.len());
+        for (material_key, handle) in handles {
+            let storage_key = refresh_material_storage_key(scope.credential_key, material_key);
+            material_by_storage_key.insert(storage_key.clone(), material_key.clone());
+            storage_handles.insert(storage_key, handle.clone());
+        }
+        // Reuse the normal driver-batched resolver with a synthetic provider.
+        // Refresh inputs are gateway-only and have no provider-level expiry;
+        // passing zero below prevents an expired injectable credential from
+        // suppressing resolution of an otherwise valid refresh-material handle.
+        let provider = Provider {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: scope.provider_id.to_string(),
+                name: scope.provider_name.to_string(),
+                workspace: scope.workspace.to_string(),
+                ..Default::default()
+            }),
+            credential_handles: storage_handles,
+            ..Default::default()
+        };
+        let resolved = self.resolve_provider_handles(&provider, 0).await?;
+        resolved
+            .values
+            .into_iter()
+            .map(|(storage_key, value)| {
+                material_by_storage_key
+                    .remove(&storage_key)
+                    .map(|material_key| (material_key, value))
+                    .ok_or_else(|| {
+                        Status::internal(
+                            "credential driver resolved an unknown refresh material key",
+                        )
+                    })
+            })
+            .collect()
+    }
+
+    pub async fn delete_refresh_material_handles(
+        &self,
+        scope: RefreshMaterialScope<'_>,
+        handles: &HashMap<String, CredentialHandle>,
+    ) -> Result<(), Status> {
+        let storage_handles = handles
+            .iter()
+            .map(|(material_key, handle)| {
+                (
+                    refresh_material_storage_key(scope.credential_key, material_key),
+                    handle.clone(),
+                )
+            })
+            .collect();
+        self.delete_provider_credential_handles(
+            scope.provider_name,
+            scope.workspace,
+            scope.provider_id,
+            &storage_handles,
+        )
+        .await
+    }
+
+    pub async fn delete_refresh_material_deletions(
+        &self,
+        scope: RefreshMaterialScope<'_>,
+        deletions: &[StoredRefreshMaterialDeletion],
+    ) -> Result<(), Status> {
+        let futures = deletions.iter().map(|deletion| async move {
+            if deletion.material_key.is_empty() {
+                return Err(Status::failed_precondition(
+                    "pending refresh-material deletion has no material key",
+                ));
+            }
+            let handle = deletion.handle.clone().ok_or_else(|| {
+                Status::failed_precondition(
+                    "pending refresh-material deletion has no credential handle",
+                )
+            })?;
+            let storage_key =
+                refresh_material_storage_key(scope.credential_key, &deletion.material_key);
+            self.delete_provider_credential_handle(
+                scope.provider_name,
+                scope.workspace,
+                scope.provider_id,
+                &storage_key,
+                handle,
+            )
+            .await
+        });
+        let results = futures::future::join_all(futures).await;
+        let mut first_error = None;
+        for result in results {
+            if let Err(err) = result
+                && first_error.is_none()
+            {
+                first_error = Some(err);
+            }
+        }
+        if let Some(err) = first_error {
+            return Err(err);
+        }
+        Ok(())
     }
 
     pub async fn delete_provider_credential_handles(
@@ -517,6 +734,16 @@ impl CredentialRuntime {
             ))
         })
     }
+}
+
+fn refresh_material_storage_key(credential_key: &str, material_key: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(REFRESH_MATERIAL_CREDENTIAL_KEY_DOMAIN);
+    hasher.update([0]);
+    hasher.update(credential_key.as_bytes());
+    hasher.update([0]);
+    hasher.update(material_key.as_bytes());
+    format!("openshell.refresh.{:x}", hasher.finalize())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1480,6 +1707,15 @@ async fn connect_credential_driver_socket(
 #[derive(Debug)]
 struct TestStaticCredentialDriver {
     values: std::sync::Mutex<HashMap<String, String>>,
+    fail_next_store: std::sync::atomic::AtomicBool,
+    fail_next_delete: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    store_gate: std::sync::Mutex<
+        Option<(
+            tokio::sync::oneshot::Sender<()>,
+            tokio::sync::oneshot::Receiver<()>,
+        )>,
+    >,
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -1489,6 +1725,10 @@ impl TestStaticCredentialDriver {
     fn new() -> Self {
         Self {
             values: std::sync::Mutex::new(HashMap::new()),
+            fail_next_store: std::sync::atomic::AtomicBool::new(false),
+            fail_next_delete: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            store_gate: std::sync::Mutex::new(None),
         }
     }
 
@@ -1511,6 +1751,19 @@ impl CredentialDriver for TestStaticCredentialDriver {
         &self,
         request: StoreCredentialRequest,
     ) -> Result<CredentialHandle, Status> {
+        #[cfg(test)]
+        let gate = self.store_gate.lock().ok().and_then(|mut gate| gate.take());
+        #[cfg(test)]
+        if let Some((hit, release)) = gate {
+            let _ = hit.send(());
+            let _ = release.await;
+        }
+        if self
+            .fail_next_store
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(Status::unavailable("injected credential store failure"));
+        }
         let handle = request
             .existing_handle
             .map(|handle| handle.handle)
@@ -1533,6 +1786,12 @@ impl CredentialDriver for TestStaticCredentialDriver {
     }
 
     async fn delete_credential(&self, request: DeleteCredentialRequest) -> Result<(), Status> {
+        if self
+            .fail_next_delete
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(Status::unavailable("injected credential delete failure"));
+        }
         let handle = Self::handle_from_request("delete", request.handle)?;
         self.values
             .lock()
@@ -1568,6 +1827,31 @@ impl CredentialDriver for TestStaticCredentialDriver {
     #[cfg(test)]
     fn stored_credential_count(&self) -> Option<usize> {
         self.values.lock().ok().map(|values| values.len())
+    }
+
+    #[cfg(test)]
+    fn fail_next_store(&self) {
+        self.fail_next_store
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    fn fail_next_delete(&self) {
+        self.fail_next_delete
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    fn gate_next_store(
+        &self,
+    ) -> Option<(
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    )> {
+        let (hit_tx, hit_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        *self.store_gate.lock().ok()? = Some((hit_tx, release_rx));
+        Some((hit_rx, release_tx))
     }
 }
 

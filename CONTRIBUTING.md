@@ -34,7 +34,7 @@ We use a vouch system. This exists because AI makes it trivial to generate plaus
 
 Issues labeled [`good first issue`](https://github.com/NVIDIA/OpenShell/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22) are scoped, well-documented, and friendly to new contributors. Start there. If you need guidance, comment on the issue.
 
-An open issue is not necessarily accepted or ready to be worked on. Human contributors should look for `state:accepted`, roadmap placement, `good first issue`, or `help wanted`, or ask a maintainer before starting. Unattended agents additionally require the appropriate human-applied `agent:*` request label; an agent directly asked to work on a specific issue does not.
+An open issue is not necessarily accepted or ready to be worked on. Human contributors should look for `state:accepted`, roadmap placement, `good first issue`, or `help wanted`, or ask a maintainer before starting. Unattended agents require the expected lifecycle state and the appropriate human-applied `agent:*` request label. An agent directly asked to work on a specific issue warns about missing or incomplete expected labels and continues with the requested phase without changing them.
 
 ## Before You Open an Issue
 
@@ -141,7 +141,7 @@ Agents investigate issues, collect evidence, and report technical findings. Huma
 | Directly request agent implementation | User |
 | Queue approved implementation with `agent:implementation-requested` | Maintainer |
 
-Agents do not apply `state:accepted`, place issues on the roadmap, or apply `agent:plan-requested` or `agent:implementation-requested`.
+Agents do not apply `state:accepted`, place issues on the roadmap, or apply `agent:plan-requested` or `agent:implementation-requested`. A direct request may authorize work outside the recorded workflow, but it does not alter the issue's disposition or make the labels accurate.
 
 #### Issue State
 
@@ -199,7 +199,7 @@ Roadmap placement does not assign an owner. A roadmap issue still needs a human 
 
 A human contributor may implement an accepted issue without any `agent:*` label. Before starting, check for an assignee, linked pull request, active branch, or comment that shows someone else is already working on it.
 
-Maintainers use the `agent:*` workflow to queue work for always-on or unattended agents that scan issues. Keep exactly one agent-workflow label on the issue at a time. When a user directly asks an agent to plan or implement a specific issue, that instruction authorizes the requested phase and the corresponding request label is not required.
+Maintainers use the `agent:*` workflow to queue work for always-on or unattended agents that scan issues. Keep exactly one agent-workflow label on the issue at a time. When a user directly asks an agent to plan or implement a specific issue, that instruction authorizes the requested phase even if the issue does not match the normal lifecycle or agent-workflow state. The agent warns about each missing or incomplete expected label and continues without changing the labels.
 
 | Agent workflow | Applied by | Meaning |
 |---|---|---|
@@ -249,7 +249,7 @@ Maintainers use the specialized security review and remediation workflow for an 
 3. A maintainer reviews the plan and applies `agent:implementation-requested`.
 4. The remediation agent implements the approved plan.
 
-A user may instead directly request review or remediation from the specialized skill. The direct request replaces the corresponding queue label, but a request for review still does not authorize remediation. General implementation agents do not process issues labeled `topic:security`.
+A user may instead directly request review or remediation from the specialized skill. If the corresponding queue label is missing, the agent warns and continues without changing it, but a request for review still does not authorize remediation. General implementation agents do not process issues labeled `topic:security`.
 
 #### When an Issue Is Ready for Work
 
@@ -258,9 +258,9 @@ A user may instead directly request review or remediation from the specialized s
 | A human contributor | The issue has `state:accepted`, roadmap placement, an invitation to contribute, or maintainer confirmation, and has no conflicting owner or implementation. |
 | An unattended agent scanning for planning work | The issue has `state:accepted` or roadmap placement, plus the human-applied `agent:plan-requested` label. |
 | An unattended agent scanning for implementation work | The issue has `state:accepted` or roadmap placement, plus an approved plan and the human-applied `agent:implementation-requested` label. |
-| An agent directly instructed by a user | The issue has `state:accepted` or roadmap placement, no conflicting owner or implementation, and the instruction explicitly requests the phase the agent will perform. |
+| An agent directly instructed by a user | The instruction explicitly requests the phase the agent will perform and the issue has no conflicting owner or implementation. Missing or incomplete workflow labels produce a warning, not a stop. |
 
-Issues with `state:triage-needed`, `state:needs-info`, or `state:validated` are not ready for implementation unless a maintainer has separately placed them on the roadmap. Either `state:accepted` or roadmap placement records the required human acceptance decision.
+For unattended agents, `state:needs-info` blocks work until the requested evidence arrives, and `state:triage-needed` or `state:validated` blocks work unless a maintainer has separately placed the issue on the roadmap or applied `state:accepted`. For a directly instructed agent, these labels require a warning but do not themselves block the requested work. If information actually needed to do the work is unavailable, the agent reports that concrete blocker rather than treating the label as the blocker.
 
 #### Stale Issues
 
@@ -295,24 +295,6 @@ Project requirements:
 - Rust 1.90+
 - Python 3.11+
 - Docker (running)
-
-### Optional: Bazel (experimental)
-
-Install [Bazelisk](https://github.com/bazelbuild/bazelisk), which auto-downloads the Bazel version pinned in `.bazelversion`:
-
-```bash
-# macOS
-brew install bazelisk
-
-# npm (any platform)
-npm install -g @bazel/bazelisk
-```
-
-Bazel builds Z3 from source, so no system Z3 installation is needed when using Bazel. If you have previously built with Cargo, add Cargo's output directory to `.bazelignore` to prevent conflicts:
-
-```bash
-echo "target" >> .bazelignore
-```
 
 ### Z3 installation
 
@@ -430,26 +412,6 @@ These are the primary `mise` tasks for day-to-day development:
 | `mise run docs`      | Validate Fern docs locally                              |
 | `mise run helm:docs` | Regenerate the Helm chart README                        |
 | `mise run clean`     | Clean build artifacts                                   |
-
-### Bazel targets (experimental)
-
-> [!IMPORTANT]
-> Bazel support is experimental and under evaluation via [RFC 0012](https://github.com/NVIDIA/OpenShell/pull/2543).
-> It may be removed at any time depending on the RFC outcome.
-> Feedback is welcome: [open an issue](https://github.com/NVIDIA/OpenShell/issues/new) or find us on CNCF Slack in [#openshell-dev](https://cloud-native.slack.com/archives/openshell-dev).
-
-The following Bazel commands are available alongside the mise tasks above. Cargo and mise remain the primary build system.
-
-| Task | Bazel command | Notes |
-| ---- | ------------- | ----- |
-| Build everything | `bazel build //...` | All crates and protos |
-| Run all tests | `bazel test //...` | Unit tests only, no E2E |
-| Build the CLI | `bazel build //crates/openshell-cli:openshell` | |
-| Build the gateway | `bazel build //crates/openshell-server:openshell-gateway` | |
-| Build the supervisor | `bazel build //crates/openshell-sandbox:openshell-sandbox-bin` | |
-| Clean | `bazel clean` | |
-
-Bazel does not yet cover `mise run gateway`, `mise run sandbox`, `mise run e2e`, `mise run docs`, or `mise run helm:docs`. Those are runtime and infrastructure tasks that remain with mise. Additional Bazel targets will be added over time as the experiment progresses.
 
 ## Project Structure
 

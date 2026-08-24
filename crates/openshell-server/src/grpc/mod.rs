@@ -23,7 +23,8 @@ use openshell_core::proto::{
     DeleteProviderRequest, DeleteProviderResponse, DeleteSandboxRequest, DeleteSandboxResponse,
     DeleteServiceRequest, DeleteServiceResponse, DeleteWorkspaceRequest, DeleteWorkspaceResponse,
     DetachSandboxProviderRequest, DetachSandboxProviderResponse, EditDraftChunkRequest,
-    EditDraftChunkResponse, ExecSandboxEvent, ExecSandboxInput, ExecSandboxRequest,
+    EditDraftChunkResponse, ExchangeProviderSubjectTokenRequest,
+    ExchangeProviderSubjectTokenResponse, ExecSandboxEvent, ExecSandboxInput, ExecSandboxRequest,
     ExposeServiceRequest, GatewayMessage, GetCurrentUserRequest, GetCurrentUserResponse,
     GetDraftHistoryRequest, GetDraftHistoryResponse, GetDraftPolicyRequest, GetDraftPolicyResponse,
     GetGatewayConfigRequest, GetGatewayConfigResponse, GetGatewayInfoRequest,
@@ -43,14 +44,15 @@ use openshell_core::proto::{
     ProviderProfileResponse, ProviderResponse, PushSandboxLogsRequest, PushSandboxLogsResponse,
     RefreshSandboxTokenRequest, RefreshSandboxTokenResponse, RejectDraftChunkRequest,
     RejectDraftChunkResponse, RelayFrame, RemoveWorkspaceMemberRequest,
-    RemoveWorkspaceMemberResponse, ReportPolicyStatusRequest, ReportPolicyStatusResponse,
-    RevokeSshSessionRequest, RevokeSshSessionResponse, RotateProviderCredentialRequest,
-    RotateProviderCredentialResponse, SandboxResponse, ServiceEndpointResponse, ServiceStatus,
-    StartSandboxRequest, StopSandboxRequest, SubmitPolicyAnalysisRequest,
-    SubmitPolicyAnalysisResponse, SupervisorMessage, TcpForwardFrame, UndoDraftChunkRequest,
-    UndoDraftChunkResponse, UpdateConfigRequest, UpdateConfigResponse,
-    UpdateProviderProfilesRequest, UpdateProviderProfilesResponse, UpdateProviderRequest,
-    WatchSandboxRequest, open_shell_server::OpenShell,
+    RemoveWorkspaceMemberResponse, ReportMainProcessExitRequest, ReportMainProcessExitResponse,
+    ReportPolicyStatusRequest, ReportPolicyStatusResponse, RevokeSshSessionRequest,
+    RevokeSshSessionResponse, RotateProviderCredentialRequest, RotateProviderCredentialResponse,
+    SandboxResponse, ServiceEndpointResponse, ServiceStatus, StartSandboxRequest,
+    StopSandboxRequest, SubmitPolicyAnalysisRequest, SubmitPolicyAnalysisResponse,
+    SupervisorMessage, TcpForwardFrame, UndoDraftChunkRequest, UndoDraftChunkResponse,
+    UpdateConfigRequest, UpdateConfigResponse, UpdateProviderProfilesRequest,
+    UpdateProviderProfilesResponse, UpdateProviderRequest, WatchSandboxRequest,
+    open_shell_server::OpenShell,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -542,6 +544,13 @@ impl OpenShell for OpenShellService {
         policy::handle_get_sandbox_provider_environment(&self.state, request).await
     }
 
+    async fn exchange_provider_subject_token(
+        &self,
+        request: Request<ExchangeProviderSubjectTokenRequest>,
+    ) -> Result<Response<ExchangeProviderSubjectTokenResponse>, Status> {
+        provider::handle_exchange_provider_subject_token(&self.state, request).await
+    }
+
     async fn update_config(
         &self,
         request: Request<UpdateConfigRequest>,
@@ -677,6 +686,13 @@ impl OpenShell for OpenShellService {
         request: Request<tonic::Streaming<SupervisorMessage>>,
     ) -> Result<Response<Self::ConnectSupervisorStream>, Status> {
         crate::supervisor_session::handle_connect_supervisor(&self.state, request).await
+    }
+
+    async fn report_main_process_exit(
+        &self,
+        request: Request<ReportMainProcessExitRequest>,
+    ) -> Result<Response<ReportMainProcessExitResponse>, Status> {
+        crate::supervisor_session::handle_report_main_process_exit(&self.state, request).await
     }
 
     type RelayStreamStream =

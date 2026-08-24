@@ -66,9 +66,11 @@ const (
 	OpenShell_ListSandboxPolicies_FullMethodName           = "/openshell.v1.OpenShell/ListSandboxPolicies"
 	OpenShell_ReportPolicyStatus_FullMethodName            = "/openshell.v1.OpenShell/ReportPolicyStatus"
 	OpenShell_GetSandboxProviderEnvironment_FullMethodName = "/openshell.v1.OpenShell/GetSandboxProviderEnvironment"
+	OpenShell_ExchangeProviderSubjectToken_FullMethodName  = "/openshell.v1.OpenShell/ExchangeProviderSubjectToken"
 	OpenShell_GetSandboxLogs_FullMethodName                = "/openshell.v1.OpenShell/GetSandboxLogs"
 	OpenShell_PushSandboxLogs_FullMethodName               = "/openshell.v1.OpenShell/PushSandboxLogs"
 	OpenShell_ConnectSupervisor_FullMethodName             = "/openshell.v1.OpenShell/ConnectSupervisor"
+	OpenShell_ReportMainProcessExit_FullMethodName         = "/openshell.v1.OpenShell/ReportMainProcessExit"
 	OpenShell_RelayStream_FullMethodName                   = "/openshell.v1.OpenShell/RelayStream"
 	OpenShell_WatchSandbox_FullMethodName                  = "/openshell.v1.OpenShell/WatchSandbox"
 	OpenShell_SubmitPolicyAnalysis_FullMethodName          = "/openshell.v1.OpenShell/SubmitPolicyAnalysis"
@@ -199,6 +201,9 @@ type OpenShellClient interface {
 	ReportPolicyStatus(ctx context.Context, in *ReportPolicyStatusRequest, opts ...grpc.CallOption) (*ReportPolicyStatusResponse, error)
 	// Get provider environment for a sandbox (called by sandbox supervisor at startup).
 	GetSandboxProviderEnvironment(ctx context.Context, in *GetSandboxProviderEnvironmentRequest, opts ...grpc.CallOption) (*GetSandboxProviderEnvironmentResponse, error)
+	// Exchange a stored provider subject token for an intermediate token scoped
+	// to the calling supervisor's SPIFFE identity.
+	ExchangeProviderSubjectToken(ctx context.Context, in *ExchangeProviderSubjectTokenRequest, opts ...grpc.CallOption) (*ExchangeProviderSubjectTokenResponse, error)
 	// Fetch recent sandbox logs (one-shot).
 	GetSandboxLogs(ctx context.Context, in *GetSandboxLogsRequest, opts ...grpc.CallOption) (*GetSandboxLogsResponse, error)
 	// Push sandbox supervisor logs to the server (client-streaming).
@@ -211,6 +216,8 @@ type OpenShellClient interface {
 	// bytes flow over RelayStream calls (separate HTTP/2 streams on the same
 	// connection), not over this stream.
 	ConnectSupervisor(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[SupervisorMessage, GatewayMessage], error)
+	// Persist the canonical main process result before the supervisor exits.
+	ReportMainProcessExit(ctx context.Context, in *ReportMainProcessExitRequest, opts ...grpc.CallOption) (*ReportMainProcessExitResponse, error)
 	// Raw byte relay between supervisor and gateway.
 	//
 	// The supervisor initiates this call after receiving a RelayOpen message
@@ -730,6 +737,16 @@ func (c *openShellClient) GetSandboxProviderEnvironment(ctx context.Context, in 
 	return out, nil
 }
 
+func (c *openShellClient) ExchangeProviderSubjectToken(ctx context.Context, in *ExchangeProviderSubjectTokenRequest, opts ...grpc.CallOption) (*ExchangeProviderSubjectTokenResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ExchangeProviderSubjectTokenResponse)
+	err := c.cc.Invoke(ctx, OpenShell_ExchangeProviderSubjectToken_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *openShellClient) GetSandboxLogs(ctx context.Context, in *GetSandboxLogsRequest, opts ...grpc.CallOption) (*GetSandboxLogsResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(GetSandboxLogsResponse)
@@ -765,6 +782,16 @@ func (c *openShellClient) ConnectSupervisor(ctx context.Context, opts ...grpc.Ca
 
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type OpenShell_ConnectSupervisorClient = grpc.BidiStreamingClient[SupervisorMessage, GatewayMessage]
+
+func (c *openShellClient) ReportMainProcessExit(ctx context.Context, in *ReportMainProcessExitRequest, opts ...grpc.CallOption) (*ReportMainProcessExitResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ReportMainProcessExitResponse)
+	err := c.cc.Invoke(ctx, OpenShell_ReportMainProcessExit_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
 
 func (c *openShellClient) RelayStream(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[RelayFrame, RelayFrame], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
@@ -1086,6 +1113,9 @@ type OpenShellServer interface {
 	ReportPolicyStatus(context.Context, *ReportPolicyStatusRequest) (*ReportPolicyStatusResponse, error)
 	// Get provider environment for a sandbox (called by sandbox supervisor at startup).
 	GetSandboxProviderEnvironment(context.Context, *GetSandboxProviderEnvironmentRequest) (*GetSandboxProviderEnvironmentResponse, error)
+	// Exchange a stored provider subject token for an intermediate token scoped
+	// to the calling supervisor's SPIFFE identity.
+	ExchangeProviderSubjectToken(context.Context, *ExchangeProviderSubjectTokenRequest) (*ExchangeProviderSubjectTokenResponse, error)
 	// Fetch recent sandbox logs (one-shot).
 	GetSandboxLogs(context.Context, *GetSandboxLogsRequest) (*GetSandboxLogsResponse, error)
 	// Push sandbox supervisor logs to the server (client-streaming).
@@ -1098,6 +1128,8 @@ type OpenShellServer interface {
 	// bytes flow over RelayStream calls (separate HTTP/2 streams on the same
 	// connection), not over this stream.
 	ConnectSupervisor(grpc.BidiStreamingServer[SupervisorMessage, GatewayMessage]) error
+	// Persist the canonical main process result before the supervisor exits.
+	ReportMainProcessExit(context.Context, *ReportMainProcessExitRequest) (*ReportMainProcessExitResponse, error)
 	// Raw byte relay between supervisor and gateway.
 	//
 	// The supervisor initiates this call after receiving a RelayOpen message
@@ -1301,6 +1333,9 @@ func (UnimplementedOpenShellServer) ReportPolicyStatus(context.Context, *ReportP
 func (UnimplementedOpenShellServer) GetSandboxProviderEnvironment(context.Context, *GetSandboxProviderEnvironmentRequest) (*GetSandboxProviderEnvironmentResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetSandboxProviderEnvironment not implemented")
 }
+func (UnimplementedOpenShellServer) ExchangeProviderSubjectToken(context.Context, *ExchangeProviderSubjectTokenRequest) (*ExchangeProviderSubjectTokenResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ExchangeProviderSubjectToken not implemented")
+}
 func (UnimplementedOpenShellServer) GetSandboxLogs(context.Context, *GetSandboxLogsRequest) (*GetSandboxLogsResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetSandboxLogs not implemented")
 }
@@ -1309,6 +1344,9 @@ func (UnimplementedOpenShellServer) PushSandboxLogs(grpc.ClientStreamingServer[P
 }
 func (UnimplementedOpenShellServer) ConnectSupervisor(grpc.BidiStreamingServer[SupervisorMessage, GatewayMessage]) error {
 	return status.Error(codes.Unimplemented, "method ConnectSupervisor not implemented")
+}
+func (UnimplementedOpenShellServer) ReportMainProcessExit(context.Context, *ReportMainProcessExitRequest) (*ReportMainProcessExitResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ReportMainProcessExit not implemented")
 }
 func (UnimplementedOpenShellServer) RelayStream(grpc.BidiStreamingServer[RelayFrame, RelayFrame]) error {
 	return status.Error(codes.Unimplemented, "method RelayStream not implemented")
@@ -2136,6 +2174,24 @@ func _OpenShell_GetSandboxProviderEnvironment_Handler(srv interface{}, ctx conte
 	return interceptor(ctx, in, info, handler)
 }
 
+func _OpenShell_ExchangeProviderSubjectToken_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ExchangeProviderSubjectTokenRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(OpenShellServer).ExchangeProviderSubjectToken(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: OpenShell_ExchangeProviderSubjectToken_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(OpenShellServer).ExchangeProviderSubjectToken(ctx, req.(*ExchangeProviderSubjectTokenRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _OpenShell_GetSandboxLogs_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(GetSandboxLogsRequest)
 	if err := dec(in); err != nil {
@@ -2167,6 +2223,24 @@ func _OpenShell_ConnectSupervisor_Handler(srv interface{}, stream grpc.ServerStr
 
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type OpenShell_ConnectSupervisorServer = grpc.BidiStreamingServer[SupervisorMessage, GatewayMessage]
+
+func _OpenShell_ReportMainProcessExit_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ReportMainProcessExitRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(OpenShellServer).ReportMainProcessExit(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: OpenShell_ReportMainProcessExit_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(OpenShellServer).ReportMainProcessExit(ctx, req.(*ReportMainProcessExitRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
 
 func _OpenShell_RelayStream_Handler(srv interface{}, stream grpc.ServerStream) error {
 	return srv.(OpenShellServer).RelayStream(&grpc.GenericServerStream[RelayFrame, RelayFrame]{ServerStream: stream})
@@ -2678,8 +2752,16 @@ var OpenShell_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _OpenShell_GetSandboxProviderEnvironment_Handler,
 		},
 		{
+			MethodName: "ExchangeProviderSubjectToken",
+			Handler:    _OpenShell_ExchangeProviderSubjectToken_Handler,
+		},
+		{
 			MethodName: "GetSandboxLogs",
 			Handler:    _OpenShell_GetSandboxLogs_Handler,
+		},
+		{
+			MethodName: "ReportMainProcessExit",
+			Handler:    _OpenShell_ReportMainProcessExit_Handler,
 		},
 		{
 			MethodName: "SubmitPolicyAnalysis",

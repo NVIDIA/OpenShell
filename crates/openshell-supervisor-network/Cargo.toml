@@ -11,7 +11,7 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-openshell-core = { path = "../openshell-core" }
+openshell-core = { path = "../openshell-core", features = ["oauth"] }
 openshell-ocsf = { path = "../openshell-ocsf" }
 openshell-policy = { path = "../openshell-policy" }
 openshell-router = { path = "../openshell-router" }
@@ -27,6 +27,7 @@ bytes = { workspace = true }
 flate2 = "1"
 glob = { workspace = true }
 hex = "0.4"
+hickory-proto = "0.26.1"
 ipnet = "2"
 miette = { workspace = true }
 prost-types = { workspace = true }

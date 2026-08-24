@@ -96,14 +96,17 @@ jobs:
         run: mise install --locked
 
       # The openshell-policy crate transitively pulls in z3-sys, whose
-      # build script needs the z3 C/C++ headers and clang/bindgen to
-      # compile. The bare runner doesn't ship them; the CI container
+      # build script needs the z3 C/C++ headers, clang/bindgen, and CMake to
+      # compile both system-linked and bundled-Z3 builds. The bare runner
+      # doesn't ship them; the CI container
       # image used by other Rust e2e jobs does, but we can't run this job
       # there (the runner's container handler injects its own --network
       # bridge, which conflicts with the --network host we need so kind's
       # API server is reachable from the test process).
       - name: Install z3 build deps
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libz3-dev clang
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libz3-dev clang cmake
 
       - name: Log in to GHCR
         run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin

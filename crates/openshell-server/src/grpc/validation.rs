@@ -8,7 +8,6 @@
 
 #![allow(clippy::result_large_err)] // Validation returns Result<_, Status>
 
-use openshell_core::ComputeDriverKind;
 use openshell_core::proto::{
     CredentialHandle, ExecSandboxRequest, Provider, SandboxPolicy as ProtoSandboxPolicy,
     SandboxTemplate,
@@ -28,29 +27,16 @@ use super::{
 // Exec request validation
 // ---------------------------------------------------------------------------
 
-/// Preserve process-identity omission only for the local OCI-aware drivers.
-///
-/// Kubernetes, VM, and unknown/remote drivers retain the legacy persisted
-/// `sandbox:sandbox` defaults so existing policy hashes and live-update
-/// workflows do not change.
-pub(super) fn normalize_process_identity_for_driver(
-    policy: &mut ProtoSandboxPolicy,
-    driver_kind: Option<ComputeDriverKind>,
-) {
-    if !matches!(
-        driver_kind,
-        Some(ComputeDriverKind::Docker | ComputeDriverKind::Podman)
-    ) {
-        openshell_policy::ensure_sandbox_process_identity(policy);
-    }
-}
-
 /// Maximum number of arguments in the command array.
 pub(super) const MAX_EXEC_COMMAND_ARGS: usize = 1024;
 /// Maximum length of a single command argument or environment value (bytes).
 pub(super) const MAX_EXEC_ARG_LEN: usize = 32 * 1024; // 32 KiB
 /// Maximum length of the workdir field (bytes).
 pub(super) const MAX_EXEC_WORKDIR_LEN: usize = 4096;
+/// Maximum number of entries in the canonical main-process argv.
+pub(super) const MAX_MAIN_PROCESS_ARGS: usize = 256;
+/// Maximum aggregate byte size of the canonical main-process argv.
+pub(super) const MAX_MAIN_PROCESS_ARGV_SIZE: usize = 256 * 1024;
 
 /// Validate exec request size limits and field-specific character constraints.
 ///
@@ -212,6 +198,10 @@ pub(super) fn validate_sandbox_spec(
     // --- spec.resource_requirements.gpu ---
     validate_gpu_request_fields(spec)?;
 
+    if !spec.command.is_empty() {
+        validate_main_process_command(&spec.command)?;
+    }
+
     // --- spec.policy serialized size ---
     if let Some(ref policy) = spec.policy {
         let size = policy.encoded_len();
@@ -220,6 +210,35 @@ pub(super) fn validate_sandbox_spec(
                 "policy serialized size exceeds maximum ({size} > {MAX_POLICY_SIZE})"
             )));
         }
+    }
+
+    Ok(())
+}
+
+fn validate_main_process_command(command: &[String]) -> Result<(), Status> {
+    if command.len() > MAX_MAIN_PROCESS_ARGS {
+        return Err(Status::invalid_argument(format!(
+            "spec.command exceeds {MAX_MAIN_PROCESS_ARGS} argument limit"
+        )));
+    }
+    if command[0].is_empty() {
+        return Err(Status::invalid_argument(
+            "spec.command[0] must not be empty",
+        ));
+    }
+    let argv_size: usize = command.iter().map(String::len).sum();
+    if argv_size > MAX_MAIN_PROCESS_ARGV_SIZE {
+        return Err(Status::invalid_argument(format!(
+            "spec.command total size exceeds {MAX_MAIN_PROCESS_ARGV_SIZE} byte limit"
+        )));
+    }
+    for (index, argument) in command.iter().enumerate() {
+        if argument.len() > MAX_EXEC_ARG_LEN {
+            return Err(Status::invalid_argument(format!(
+                "spec.command[{index}] exceeds {MAX_EXEC_ARG_LEN} byte limit"
+            )));
+        }
+        reject_null_char(argument, &format!("spec.command[{index}]"))?;
     }
 
     Ok(())
@@ -1018,6 +1037,16 @@ mod tests {
     #[test]
     fn validate_sandbox_spec_accepts_empty_defaults() {
         assert!(validate_sandbox_spec("", &default_spec()).is_ok());
+    }
+
+    #[test]
+    fn validate_sandbox_spec_accepts_exact_main_process_argv() {
+        let spec = SandboxSpec {
+            command: vec!["/bin/sh".into(), "-c".into(), "printf 'a b'".into()],
+            tty: false,
+            ..Default::default()
+        };
+        validate_sandbox_spec("", &spec).unwrap();
     }
 
     #[test]
@@ -1852,44 +1881,6 @@ mod tests {
     }
 
     // ---- Policy safety ----
-
-    #[test]
-    fn process_identity_omission_is_driver_scoped() {
-        use openshell_core::proto::ProcessPolicy;
-
-        for driver in [ComputeDriverKind::Docker, ComputeDriverKind::Podman] {
-            let mut policy = ProtoSandboxPolicy {
-                process: Some(ProcessPolicy {
-                    run_as_user: "1234".into(),
-                    run_as_group: String::new(),
-                }),
-                ..Default::default()
-            };
-            normalize_process_identity_for_driver(&mut policy, Some(driver));
-            assert!(
-                policy.process.unwrap().run_as_group.is_empty(),
-                "{driver:?} must preserve omission"
-            );
-        }
-
-        for driver in [
-            Some(ComputeDriverKind::Kubernetes),
-            Some(ComputeDriverKind::Vm),
-            None,
-        ] {
-            let mut policy = ProtoSandboxPolicy {
-                process: Some(ProcessPolicy {
-                    run_as_user: "1234".into(),
-                    run_as_group: String::new(),
-                }),
-                ..Default::default()
-            };
-            normalize_process_identity_for_driver(&mut policy, driver);
-            let process = policy.process.unwrap();
-            assert_eq!(process.run_as_user, "1234");
-            assert_eq!(process.run_as_group, "sandbox");
-        }
-    }
 
     #[test]
     fn validate_policy_safety_rejects_root_user() {

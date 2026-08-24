@@ -89,12 +89,10 @@ async fn auto_created_provider_credential_available_in_sandbox() {
     let mut cmd = openshell_cmd();
     cmd.arg("sandbox")
         .arg("create")
+        .arg("--detach")
         .arg("--provider")
         .arg("claude-code")
         .arg("--auto-providers")
-        .arg("--")
-        .arg("printenv")
-        .arg("ANTHROPIC_API_KEY")
         .env("ANTHROPIC_API_KEY", TEST_API_KEY)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -110,7 +108,26 @@ async fn auto_created_provider_credential_available_in_sandbox() {
     let clean = strip_ansi(&combined);
 
     // Parse sandbox name for cleanup.
-    let sandbox_name = extract_field(&combined, "Name");
+    let sandbox_name = extract_field(&combined, "Created sandbox");
+    let exec_output = if let Some(ref name) = sandbox_name {
+        let mut exec_cmd = openshell_cmd();
+        exec_cmd
+            .args([
+                "sandbox",
+                "exec",
+                "--name",
+                name,
+                "--no-tty",
+                "--",
+                "printenv",
+                "ANTHROPIC_API_KEY",
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        Some(exec_cmd.output().await.expect("failed to run sandbox exec"))
+    } else {
+        None
+    };
 
     // Always clean up, even if assertions fail.
     if let Some(ref name) = sandbox_name {
@@ -125,18 +142,29 @@ async fn auto_created_provider_credential_available_in_sandbox() {
         output.status.code()
     );
 
+    let exec_output = exec_output.expect("sandbox name should be present");
+    let exec_clean = strip_ansi(&format!(
+        "{}{}",
+        String::from_utf8_lossy(&exec_output.stdout),
+        String::from_utf8_lossy(&exec_output.stderr)
+    ));
+    assert!(
+        exec_output.status.success(),
+        "sandbox exec should succeed:\n{exec_clean}"
+    );
+
     assert!(
         clean.contains("Created provider claude-code"),
         "output should confirm provider auto-creation:\n{clean}"
     );
 
     assert!(
-        contains_placeholder_for_env_key(&clean, "ANTHROPIC_API_KEY"),
-        "sandbox should have placeholder ANTHROPIC_API_KEY in its environment:\n{clean}"
+        contains_placeholder_for_env_key(&exec_clean, "ANTHROPIC_API_KEY"),
+        "sandbox should have placeholder ANTHROPIC_API_KEY in its environment:\n{exec_clean}"
     );
 
     assert!(
-        !clean.contains(TEST_API_KEY),
-        "sandbox should not expose the raw ANTHROPIC_API_KEY secret:\n{clean}"
+        !exec_clean.contains(TEST_API_KEY),
+        "sandbox should not expose the raw ANTHROPIC_API_KEY secret:\n{exec_clean}"
     );
 }

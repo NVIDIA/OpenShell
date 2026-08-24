@@ -16,10 +16,10 @@ pub struct ProcessActivityEvent {
     #[serde(flatten)]
     pub base: BaseEventData,
 
-    /// The process being acted upon (required in v1.7.0).
+    /// The process being acted upon (required in v1.8.0).
     pub process: Process,
 
-    /// Actor (parent/supervisor process, required in v1.7.0).
+    /// Actor (parent/supervisor process, required in v1.8.0).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub actor: Option<Actor>,
 
@@ -86,7 +86,7 @@ mod tests {
                 "Launch",
                 SeverityId::Informational,
                 Metadata {
-                    version: "1.7.0".to_string(),
+                    version: "1.8.0".to_string(),
                     product: Product::openshell_sandbox("0.1.0"),
                     profiles: vec!["container".to_string()],
                     uid: Some("sandbox-abc123".to_string()),

@@ -130,6 +130,7 @@ def _normalize_bearer(
 class SandboxStatusRef:
     phase: int
     current_policy_version: int
+    exit_code: int | None = None
 
 
 class _ImmutableLabels(dict[str, str]):
@@ -1092,6 +1093,9 @@ def _sandbox_ref(sandbox: openshell_pb2.Sandbox) -> SandboxRef:
         status=SandboxStatusRef(
             phase=status.phase if status else 0,
             current_policy_version=status.current_policy_version if status else 0,
+            exit_code=status.exit_code
+            if status is not None and status.HasField("exit_code")
+            else None,
         ),
         labels=sandbox.metadata.labels if sandbox.metadata else {},
     )

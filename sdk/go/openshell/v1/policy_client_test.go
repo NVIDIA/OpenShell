@@ -314,7 +314,7 @@ func TestPolicyApproveDraftChunk(t *testing.T) {
 	client, cleanup := setupPolicyTest(t, mock)
 	defer cleanup()
 
-	result, err := client.ApproveDraftChunk(context.Background(), "default", "my-sandbox", "chunk-1")
+	result, err := client.ApproveDraftChunk(context.Background(), "default", "my-sandbox", "chunk-1", "token-1")
 
 	require.NoError(t, err)
 	require.NotNil(t, result)
@@ -323,6 +323,7 @@ func TestPolicyApproveDraftChunk(t *testing.T) {
 	mock.mu.Lock()
 	assert.Equal(t, "my-sandbox", mock.lastApproveReq.GetName())
 	assert.Equal(t, "chunk-1", mock.lastApproveReq.GetChunkId())
+	assert.Equal(t, "token-1", mock.lastApproveReq.GetReviewToken())
 	mock.mu.Unlock()
 
 	// Verify response mapping.
@@ -337,7 +338,7 @@ func TestPolicyApproveDraftChunk_Error(t *testing.T) {
 	client, cleanup := setupPolicyTest(t, mock)
 	defer cleanup()
 
-	result, err := client.ApproveDraftChunk(context.Background(), "default", "sb1", "bad-chunk")
+	result, err := client.ApproveDraftChunk(context.Background(), "default", "sb1", "bad-chunk", "token-bad")
 
 	assert.Nil(t, result)
 	require.Error(t, err)

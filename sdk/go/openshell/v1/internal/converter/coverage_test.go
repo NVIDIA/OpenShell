@@ -29,6 +29,8 @@ func TestConverterCoversAllProtoFields_SandboxSpec(t *testing.T) {
 		"policy":                true,
 		"providers":             true,
 		"resource_requirements": true,
+		"command":               true,
+		"tty":                   true,
 	}
 
 	assertAllFieldsCovered(t, (&pb.SandboxSpec{}).ProtoReflect().Descriptor(), handled, nil)
@@ -59,9 +61,13 @@ func TestConverterCoversAllProtoFields_SandboxStatus(t *testing.T) {
 		"phase":                  true,
 		"conditions":             true,
 		"current_policy_version": true,
+		"exit_code":              true,
 	}
+	// The instance ID is an internal gateway/supervisor fencing token exposed
+	// only through the raw protobuf API.
+	skipped := fieldSet{"main_process_instance_id": true}
 
-	assertAllFieldsCovered(t, (&pb.SandboxStatus{}).ProtoReflect().Descriptor(), handled, nil)
+	assertAllFieldsCovered(t, (&pb.SandboxStatus{}).ProtoReflect().Descriptor(), handled, skipped)
 }
 
 func TestConverterCoversAllProtoFields_SandboxCondition(t *testing.T) {
@@ -130,6 +136,8 @@ func TestConverterCoversAllProtoFields_NetworkEndpoint(t *testing.T) {
 		"path":                            true,
 		"websocket_credential_rewrite":    true,
 		"request_body_credential_rewrite": true,
+		"allow_uninspected_credentials":   true,
+		"provider_credentialed":           true,
 		"advisor_proposed":                true,
 		"credential_signing":              true,
 		"signing_service":                 true,
@@ -257,6 +265,9 @@ func TestConverterCoversAllProtoFields_ProviderCredentialTokenGrant(t *testing.T
 		"cache_ttl_seconds":     true,
 		"audience_overrides":    true,
 		"client_assertion_type": true,
+		"grant_type":            true,
+		"subject_token":         true,
+		"requested_token_type":  true,
 	}
 
 	assertAllFieldsCovered(t, (&pb.ProviderCredentialTokenGrant{}).ProtoReflect().Descriptor(), handled, nil)

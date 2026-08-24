@@ -54,6 +54,10 @@ pub struct ProxyResponse {
     pub status: u16,
     pub headers: Vec<(String, String)>,
     pub body: bytes::Bytes,
+    /// Model identity of the route that produced this response.
+    pub route_model: Option<String>,
+    /// Endpoint of the route that produced this response.
+    pub route_endpoint: Option<String>,
 }
 
 /// Response from a proxied HTTP request where the body can be streamed
@@ -61,6 +65,10 @@ pub struct ProxyResponse {
 pub struct StreamingProxyResponse {
     pub status: u16,
     pub headers: Vec<(String, String)>,
+    /// Model identity of the route that produced this response.
+    pub route_model: Option<String>,
+    /// Endpoint of the route that produced this response.
+    pub route_endpoint: Option<String>,
     /// Either a live response to stream from, or a pre-buffered body (for mock routes).
     body: StreamingBody,
 }
@@ -98,6 +106,8 @@ impl StreamingProxyResponse {
         Self {
             status: resp.status,
             headers: resp.headers,
+            route_model: resp.route_model,
+            route_endpoint: resp.route_endpoint,
             body: StreamingBody::Buffered(Some(resp.body)),
         }
     }
@@ -685,6 +695,8 @@ pub async fn proxy_to_backend(
         status,
         headers: resp_headers,
         body,
+        route_model: Some(route.model.clone()),
+        route_endpoint: Some(route.endpoint.clone()),
     })
 }
 
@@ -752,6 +764,8 @@ pub async fn proxy_to_backend_streaming(
     Ok(StreamingProxyResponse {
         status,
         headers: resp_headers,
+        route_model: Some(route.model.clone()),
+        route_endpoint: Some(route.endpoint.clone()),
         body: StreamingBody::Live(response),
     })
 }

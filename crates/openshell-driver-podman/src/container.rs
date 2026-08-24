@@ -64,6 +64,8 @@ const TLS_KEY_MOUNT_PATH: &str = openshell_core::driver_utils::TLS_KEY_MOUNT_PAT
 const SANDBOX_TOKEN_MOUNT_PATH: &str = openshell_core::driver_utils::SANDBOX_TOKEN_MOUNT_PATH;
 const UPSTREAM_PROXY_AUTH_MOUNT_PATH: &str =
     openshell_core::driver_utils::UPSTREAM_PROXY_AUTH_MOUNT_PATH;
+const PROVIDER_SPIFFE_WORKLOAD_API_SOCKET_MOUNT_DIR: &str =
+    openshell_core::driver_utils::PROVIDER_SPIFFE_WORKLOAD_API_SOCKET_MOUNT_DIR;
 
 /// Directory inside sandbox containers where the supervisor binary is mounted.
 const SUPERVISOR_MOUNT_DIR: &str = openshell_core::driver_utils::SUPERVISOR_CONTAINER_DIR;
@@ -228,6 +230,10 @@ struct ContainerSpec {
     /// via Podman's `host-gateway` magic so sandbox containers can reach
     /// the gateway server running on the host in rootless mode.
     hostadd: Vec<String>,
+    /// Search domains written to `/etc/resolv.conf` by Podman.
+    dns_search: Vec<String>,
+    /// Resolver options written to `/etc/resolv.conf` by Podman.
+    dns_option: Vec<String>,
     netns: NetNS,
     // Matches libpod's network spec format, which is `{name: {opts}}` where
     // empty opts is a unit struct rather than `()`. Keep as a map so JSON
@@ -516,13 +522,21 @@ fn build_env(
         config.sandbox_ssh_socket_path.clone(),
     );
     env.insert("OPENSHELL_CONTAINER_IMAGE".into(), image.to_string());
+    let main_process = openshell_core::sandbox_env::MainProcessConfig::encode_driver_spec(spec)
+        .expect("main process config serialization cannot fail");
     env.insert(
-        openshell_core::sandbox_env::SANDBOX_COMMAND.into(),
-        "sleep infinity".into(),
+        openshell_core::sandbox_env::MAIN_PROCESS_SPEC.into(),
+        main_process,
     );
     env.insert(
         openshell_core::sandbox_env::TELEMETRY_ENABLED.into(),
         openshell_core::telemetry::enabled_env_value().into(),
+    );
+    // Runtime capabilities are driver-owned. Override image/user input with
+    // only the substrate that this driver configures for the supervisor.
+    env.insert(
+        openshell_core::sandbox_env::NETWORK_RUNTIME_CAPABILITIES.into(),
+        openshell_core::sandbox_env::POLICY_DNS_TRANSPARENT_TCP_CAPABILITY.into(),
     );
 
     // 3. TLS client cert paths (when mTLS is enabled). These point to
@@ -540,6 +554,13 @@ fn build_env(
         env.insert(
             openshell_core::sandbox_env::TLS_KEY.into(),
             TLS_KEY_MOUNT_PATH.into(),
+        );
+    }
+
+    if let Some(socket_path) = provider_spiffe_workload_api_socket_env_value(config) {
+        env.insert(
+            openshell_core::sandbox_env::PROVIDER_SPIFFE_WORKLOAD_API_SOCKET.into(),
+            socket_path,
         );
     }
 
@@ -1217,6 +1238,11 @@ pub fn build_container_spec_for_image(
         // reach services on the host. `host.openshell.internal` is the driver-
         // neutral alias used by policies and e2e tests.
         hostadd: hostadd_entries(config),
+        // Preserve Podman's resolver defaults for both policy-DNS and ordinary
+        // sandboxes. Namespace-local capture supports UDP and TCP, so it must
+        // not depend on a libc-specific option or alter short-name searches.
+        dns_search: Vec::new(),
+        dns_option: Vec::new(),
         netns: NetNS {
             nsmode: "bridge".to_string(),
         },
@@ -1283,6 +1309,17 @@ pub fn build_container_spec_for_image(
                     options: opts,
                 });
             }
+            if let Some(path) = provider_spiffe_workload_api_socket_mount_source(config) {
+                // No SELinux relabel - the SPIRE agent socket is shared host
+                // infrastructure and must keep its existing SELinux context.
+                let ro = vec!["ro".into(), "rbind".into()];
+                m.push(Mount {
+                    kind: "bind".into(),
+                    source: path.display().to_string(),
+                    destination: PROVIDER_SPIFFE_WORKLOAD_API_SOCKET_MOUNT_DIR.into(),
+                    options: ro,
+                });
+            }
             m.extend(user_mounts.mounts);
             m
         },
@@ -1327,6 +1364,33 @@ pub fn build_container_spec_for_image(
     };
 
     Ok(serde_json::to_value(container_spec).expect("ContainerSpec serialization cannot fail"))
+}
+
+fn provider_spiffe_workload_api_socket_env_value(config: &PodmanComputeConfig) -> Option<String> {
+    let host_path = config.provider_spiffe_workload_api_socket.as_ref()?;
+    let raw = host_path.to_str()?;
+    if raw.starts_with("tcp:") {
+        return Some(raw.to_string());
+    }
+    let host_path = raw
+        .strip_prefix("unix:")
+        .map_or(host_path.as_path(), Path::new);
+    let file_name = host_path.file_name()?.to_str()?;
+    Some(format!(
+        "{PROVIDER_SPIFFE_WORKLOAD_API_SOCKET_MOUNT_DIR}/{file_name}"
+    ))
+}
+
+fn provider_spiffe_workload_api_socket_mount_source(config: &PodmanComputeConfig) -> Option<&Path> {
+    let host_path = config.provider_spiffe_workload_api_socket.as_ref()?;
+    let raw = host_path.to_str()?;
+    if raw.starts_with("tcp:") {
+        return None;
+    }
+    let host_path = raw
+        .strip_prefix("unix:")
+        .map_or(host_path.as_path(), Path::new);
+    host_path.parent()
 }
 
 fn hostadd_entries(config: &PodmanComputeConfig) -> Vec<String> {
@@ -1538,6 +1602,8 @@ mod tests {
         );
         assert_eq!(container["user"].as_str(), Some("0:0"));
         assert_eq!(container["image_pull_policy"].as_str(), Some("never"));
+        assert_eq!(container["dns_search"], serde_json::json!([]));
+        assert_eq!(container["dns_option"], serde_json::json!([]));
         assert_eq!(
             container["env"][openshell_core::sandbox_env::OCI_IMAGE_USER].as_str(),
             Some("app:staff")
@@ -1810,6 +1876,10 @@ mod tests {
         assert!(!dropped.contains(&"SETUID"), "SETUID must not be dropped");
         assert!(!dropped.contains(&"SETGID"), "SETGID must not be dropped");
         assert!(
+            dropped.contains(&"NET_BIND_SERVICE"),
+            "NET_BIND_SERVICE must stay dropped; policy DNS binds an unprivileged port"
+        );
+        assert!(
             !dropped.contains(&"CHOWN"),
             "CHOWN must not be dropped (needed for prepare_filesystem chown)"
         );
@@ -1966,6 +2036,26 @@ mod tests {
                     "telemetry toggle must come from the deployment environment"
                 );
             },
+        );
+    }
+
+    #[test]
+    fn container_spec_keeps_network_capabilities_driver_controlled() {
+        use openshell_core::proto::compute::v1::{DriverSandboxSpec, DriverSandboxTemplate};
+
+        let mut sandbox = test_sandbox("test-id", "legit-name");
+        sandbox.spec = Some(DriverSandboxSpec {
+            environment: std::collections::HashMap::from([(
+                openshell_core::sandbox_env::NETWORK_RUNTIME_CAPABILITIES.to_string(),
+                "spoofed".to_string(),
+            )]),
+            template: Some(DriverSandboxTemplate::default()),
+            ..Default::default()
+        });
+        let spec = build_container_spec(&sandbox, &test_config());
+        assert_eq!(
+            spec["env"][openshell_core::sandbox_env::NETWORK_RUNTIME_CAPABILITIES],
+            serde_json::json!(openshell_core::sandbox_env::POLICY_DNS_TRANSPARENT_TCP_CAPABILITY)
         );
     }
 
@@ -2924,6 +3014,33 @@ mod tests {
                 .any(|a| a == "--upstream-proxy-connect-by-hostname"),
             "hostname CONNECT flag present on opt-in: {command:?}"
         );
+    }
+
+    #[test]
+    fn container_spec_includes_provider_spiffe_socket_when_configured() {
+        let sandbox = test_sandbox("spiffe-id", "spiffe-name");
+        let mut config = test_config();
+        config.provider_spiffe_workload_api_socket =
+            Some(std::path::PathBuf::from("/host/spire-agent.sock"));
+
+        let spec = build_container_spec(&sandbox, &config);
+
+        let env_map = spec["env"].as_object().expect("env should be an object");
+        assert_eq!(
+            env_map
+                .get(openshell_core::sandbox_env::PROVIDER_SPIFFE_WORKLOAD_API_SOCKET)
+                .and_then(|v| v.as_str()),
+            Some("/spiffe-workload-api/spire-agent.sock"),
+        );
+
+        let mounts = spec["mounts"]
+            .as_array()
+            .expect("mounts should be an array");
+        assert!(mounts.iter().any(|m| {
+            m["type"].as_str() == Some("bind")
+                && m["source"].as_str() == Some("/host")
+                && m["destination"].as_str() == Some(PROVIDER_SPIFFE_WORKLOAD_API_SOCKET_MOUNT_DIR)
+        }));
     }
 
     #[test]

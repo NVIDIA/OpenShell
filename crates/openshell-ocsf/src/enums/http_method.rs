@@ -5,7 +5,7 @@
 
 use serde::{Deserialize, Serialize};
 
-/// HTTP method as defined in the OCSF v1.7.0 `http_request` object schema.
+/// HTTP method as defined in the OCSF v1.8.0 `http_request` object schema.
 ///
 /// The 9 standard methods are typed variants. Non-standard methods use
 /// `Other(String)`.

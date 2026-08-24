@@ -280,6 +280,14 @@ message RequestContext {
   string sandbox_id = 2;
   // Workload process that originated the request, when available.
   Process originating_process = 3;
+  // Sandbox name that originated the request. For display and logging only.
+  // Names are workspace-scoped and may be reused for different sandbox
+  // instances, so consumers must use sandbox_id for authorization, persistence,
+  // durable correlation, and identity.
+  string sandbox_name = 4;
+  // Workspace the sandbox belongs to. For display and logging only; see the
+  // sandbox_name guidance above.
+  string workspace = 5;
 }
 
 // HttpRequestTarget describes the admitted HTTP destination and request target.

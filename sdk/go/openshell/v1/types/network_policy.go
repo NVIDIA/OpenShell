@@ -34,13 +34,19 @@ type PolicyNetworkEndpoint struct {
 	Path                         string
 	WebsocketCredentialRewrite   bool
 	RequestBodyCredentialRewrite bool
-	AdvisorProposed              bool
-	CredentialSigning            string
-	SigningService               string
-	SigningRegion                string
-	JSONRPCMaxBodyBytes          uint32
-	Mcp                          *McpOptions
-	CredentialBinding            *NetworkCredentialBinding
+	// AllowUninspectedCredentials explicitly permits credential-bearing traffic
+	// on paths OpenShell cannot inspect or rewrite.
+	AllowUninspectedCredentials bool
+	// ProviderCredentialed is gateway-derived provenance indicating that the
+	// endpoint belongs to an attached credentialed provider.
+	ProviderCredentialed bool
+	AdvisorProposed      bool
+	CredentialSigning    string
+	SigningService       string
+	SigningRegion        string
+	JSONRPCMaxBodyBytes  uint32
+	Mcp                  *McpOptions
+	CredentialBinding    *NetworkCredentialBinding
 }
 
 // NetworkCredentialBinding binds an endpoint to static credentials from an attached provider.

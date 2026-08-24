@@ -5,8 +5,8 @@
 
 use http::Request;
 use openshell_otel::{
-    HeaderMapExtractor, OtlpTraceConfig, RecordGrpcFailure, SdkTracerProvider, ServiceName,
-    SetupError,
+    HeaderMapExtractor, OtlpTraceConfig, RecordGrpcFailure, RecordGrpcStatus, SdkTracerProvider,
+    ServiceName, SetupError,
 };
 use opentelemetry::propagation::TextMapPropagator;
 use opentelemetry::trace::TraceContextExt as _;
@@ -21,14 +21,21 @@ const INSTRUMENTATION_SCOPE: &str = "openshell-driver-vm";
 const COMPUTE_DRIVER_SERVICE: &str = "openshell.compute.v1.ComputeDriver";
 
 /// Trace every inbound compute-driver RPC at the tonic service boundary.
-pub fn compute_driver_rpc_layer()
--> TraceLayer<GrpcMakeClassifier, ComputeDriverRpcSpan, (), (), (), (), RecordGrpcFailure> {
+pub fn compute_driver_rpc_layer() -> TraceLayer<
+    GrpcMakeClassifier,
+    ComputeDriverRpcSpan,
+    (),
+    RecordGrpcStatus,
+    (),
+    RecordGrpcStatus,
+    RecordGrpcFailure,
+> {
     TraceLayer::new_for_grpc()
         .make_span_with(ComputeDriverRpcSpan)
         .on_request(())
-        .on_response(())
+        .on_response(RecordGrpcStatus)
         .on_body_chunk(())
-        .on_eos(())
+        .on_eos(RecordGrpcStatus)
         .on_failure(RecordGrpcFailure)
 }
 

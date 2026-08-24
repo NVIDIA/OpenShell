@@ -24,7 +24,7 @@ These events cover startup plumbing, gRPC communication, and internal state tran
 
 ### OCSF structured events
 
-Network, process, filesystem, and configuration events use the [Open Cybersecurity Schema Framework (OCSF)](https://ocsf.io) format. OCSF is an open standard for normalizing security telemetry across tools and platforms. OpenShell maps sandbox events to OCSF v1.7.0 event classes.
+Network, process, filesystem, configuration, and API activity events use the [Open Cybersecurity Schema Framework (OCSF)](https://ocsf.io) format. OCSF is an open standard for normalizing security telemetry across tools and platforms. OpenShell maps sandbox events to OCSF v1.8.0 event classes, including API Activity [6003] with the `ai_operation` profile for inference observability.
 
 In the log file, OCSF events appear in a shorthand format with an `OCSF` level label, designed for quick human and agent scanning:
 
@@ -61,6 +61,7 @@ OpenShell maps sandbox events to these OCSF classes:
 | `FINDING:` | Detection Finding | 2004 | Security findings (nonce replay, proxy bypass, unsafe policy) |
 | `CONFIG:` | Device Config State Change | 5019 | Policy load/reload, Landlock, TLS setup, inference routes |
 | `LIFECYCLE:` | Application Lifecycle | 6002 | Sandbox supervisor start, SSH server ready |
+| `API:INFERENCE` | API Activity | 6003 | AI model inference calls through `inference.local` (model, provider, latency, tokens) |
 
 ## Reading the Shorthand Format
 

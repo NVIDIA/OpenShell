@@ -474,6 +474,14 @@ struct ApprovalAnnotation {
 }
 
 fn approval_annotation(chunk: &PolicyChunk) -> Option<ApprovalAnnotation> {
+    let application_error = chunk.application_error.trim();
+    if !application_error.is_empty() {
+        return Some(ApprovalAnnotation {
+            kind: ApprovalAnnotationKind::RequiresReview,
+            short_label: "application blocked".to_string(),
+            detail_label: format!("candidate cannot be applied: {application_error}"),
+        });
+    }
     let validation = chunk.validation_result.trim();
     if validation.is_empty() {
         return None;

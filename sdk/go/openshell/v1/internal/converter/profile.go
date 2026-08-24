@@ -55,6 +55,30 @@ func ProfileCategoryToProto(c types.ProfileCategory) pb.ProviderProfileCategory 
 	}
 }
 
+// CredentialTokenGrantTypeFromProto converts a proto token grant type to an SDK token grant type.
+func CredentialTokenGrantTypeFromProto(t pb.ProviderCredentialTokenGrantType) types.CredentialTokenGrantType {
+	switch t {
+	case pb.ProviderCredentialTokenGrantType_PROVIDER_CREDENTIAL_TOKEN_GRANT_TYPE_CLIENT_CREDENTIALS:
+		return types.CredentialTokenGrantTypeClientCredentials
+	case pb.ProviderCredentialTokenGrantType_PROVIDER_CREDENTIAL_TOKEN_GRANT_TYPE_TOKEN_EXCHANGE:
+		return types.CredentialTokenGrantTypeTokenExchange
+	default:
+		return types.CredentialTokenGrantType("")
+	}
+}
+
+// CredentialTokenGrantTypeToProto converts an SDK token grant type to a proto token grant type.
+func CredentialTokenGrantTypeToProto(t types.CredentialTokenGrantType) pb.ProviderCredentialTokenGrantType {
+	switch t {
+	case types.CredentialTokenGrantTypeClientCredentials:
+		return pb.ProviderCredentialTokenGrantType_PROVIDER_CREDENTIAL_TOKEN_GRANT_TYPE_CLIENT_CREDENTIALS
+	case types.CredentialTokenGrantTypeTokenExchange:
+		return pb.ProviderCredentialTokenGrantType_PROVIDER_CREDENTIAL_TOKEN_GRANT_TYPE_TOKEN_EXCHANGE
+	default:
+		return pb.ProviderCredentialTokenGrantType_PROVIDER_CREDENTIAL_TOKEN_GRANT_TYPE_UNSPECIFIED
+	}
+}
+
 // --- NetworkEndpoint ---
 
 // NetworkEndpointFromProto converts a proto NetworkEndpoint to an SDK NetworkEndpoint.
@@ -193,6 +217,9 @@ func tokenGrantFromProto(tg *pb.ProviderCredentialTokenGrant) *types.CredentialT
 		Scopes:              CopyStringSlice(tg.GetScopes()),
 		CacheTTLSeconds:     tg.GetCacheTtlSeconds(),
 		ClientAssertionType: tg.GetClientAssertionType(),
+		GrantType:           CredentialTokenGrantTypeFromProto(tg.GetGrantType()),
+		SubjectToken:        subjectTokenFromProto(tg.GetSubjectToken()),
+		RequestedTokenType:  tg.GetRequestedTokenType(),
 	}
 	if overrides := tg.GetAudienceOverrides(); len(overrides) > 0 {
 		result.AudienceOverrides = make([]types.TokenGrantAudienceOverride, len(overrides))
@@ -214,6 +241,9 @@ func tokenGrantToProto(tg *types.CredentialTokenGrant) *pb.ProviderCredentialTok
 		Scopes:              CopyStringSlice(tg.Scopes),
 		CacheTtlSeconds:     tg.CacheTTLSeconds,
 		ClientAssertionType: tg.ClientAssertionType,
+		GrantType:           CredentialTokenGrantTypeToProto(tg.GrantType),
+		SubjectToken:        subjectTokenToProto(tg.SubjectToken),
+		RequestedTokenType:  tg.RequestedTokenType,
 	}
 	if len(tg.AudienceOverrides) > 0 {
 		result.AudienceOverrides = make([]*pb.ProviderCredentialTokenGrantAudienceOverride, len(tg.AudienceOverrides))
@@ -222,6 +252,28 @@ func tokenGrantToProto(tg *types.CredentialTokenGrant) *pb.ProviderCredentialTok
 		}
 	}
 	return result
+}
+
+func subjectTokenFromProto(st *pb.ProviderCredentialTokenGrantSubjectToken) *types.TokenGrantSubjectToken {
+	if st == nil {
+		return nil
+	}
+	return &types.TokenGrantSubjectToken{
+		Source:           st.GetSource(),
+		Credential:       st.GetCredential(),
+		SubjectTokenType: st.GetSubjectTokenType(),
+	}
+}
+
+func subjectTokenToProto(st *types.TokenGrantSubjectToken) *pb.ProviderCredentialTokenGrantSubjectToken {
+	if st == nil {
+		return nil
+	}
+	return &pb.ProviderCredentialTokenGrantSubjectToken{
+		Source:           st.Source,
+		Credential:       st.Credential,
+		SubjectTokenType: st.SubjectTokenType,
+	}
 }
 
 func audienceOverrideFromProto(o *pb.ProviderCredentialTokenGrantAudienceOverride) types.TokenGrantAudienceOverride {

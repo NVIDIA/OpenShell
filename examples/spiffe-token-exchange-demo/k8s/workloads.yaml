@@ -1,0 +1,230 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: token-exchange-issuer
+  namespace: default
+  labels:
+    app: token-exchange-issuer
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: token-exchange-issuer
+  template:
+    metadata:
+      labels:
+        app: token-exchange-issuer
+    spec:
+      containers:
+        - name: token-exchange-issuer
+          image: node:22-alpine
+          imagePullPolicy: IfNotPresent
+          command: ["node", "/demo/token-issuer.js"]
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            - name: ACCESS_TOKEN_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: openshell-spiffe-token-exchange-demo
+                  key: access-token-secret
+            - name: ACCESS_TOKEN_ISSUER
+              value: http://token-exchange-issuer.default.svc.cluster.local
+            - name: SPIRE_JWKS_URI
+              value: https://spire-spiffe-oidc-discovery-provider.spire.svc.cluster.local/keys
+            - name: SPIRE_JWKS_CA_FILE
+              value: /etc/x509/spiffe-bundle/bundle.pem
+            - name: SPIRE_ISSUER
+              value: https://spire-spiffe-oidc-discovery-provider.spire.svc.cluster.local
+            - name: JWT_SVID_AUDIENCE
+              value: http://token-exchange-issuer.default.svc.cluster.local
+            - name: SUPERVISOR_TRUST_DOMAIN_PREFIX
+              value: spiffe://openshell.local/openshell/sandbox/
+            - name: GATEWAY_TRUST_DOMAIN_PREFIX
+              value: spiffe://openshell.local/ns/openshell/sa/
+            - name: DEMO_USER_SUBJECT
+              value: demo-user
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+          volumeMounts:
+            - name: scripts
+              mountPath: /demo
+              readOnly: true
+            - name: spiffe-bundle
+              mountPath: /etc/x509/spiffe-bundle
+              readOnly: true
+        - name: spiffe-helper
+          image: ghcr.io/spiffe/spiffe-helper:0.11.0
+          imagePullPolicy: IfNotPresent
+          args: ["-config", "/etc/spiffe-helper/spiffe-helper.conf"]
+          volumeMounts:
+            - name: spiffe-socket
+              mountPath: /run/spire/sockets
+              readOnly: true
+            - name: spiffe-bundle
+              mountPath: /target
+            - name: helper-config
+              mountPath: /etc/spiffe-helper
+              readOnly: true
+      volumes:
+        - name: scripts
+          configMap:
+            name: openshell-spiffe-token-exchange-demo-scripts
+        - name: helper-config
+          configMap:
+            name: openshell-spiffe-token-exchange-demo-helper
+        - name: spiffe-socket
+          csi:
+            driver: csi.spiffe.io
+            readOnly: true
+        - name: spiffe-bundle
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: token-exchange-issuer
+  namespace: default
+spec:
+  selector:
+    app: token-exchange-issuer
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: alpha-exchange
+  namespace: default
+  labels:
+    app: alpha-exchange
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: alpha-exchange
+  template:
+    metadata:
+      labels:
+        app: alpha-exchange
+    spec:
+      containers:
+        - name: alpha-exchange
+          image: node:22-alpine
+          imagePullPolicy: IfNotPresent
+          command: ["node", "/demo/protected-service.js"]
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            - name: SERVICE_NAME
+              value: alpha
+            - name: EXPECTED_AUDIENCE
+              value: alpha
+            - name: EXPECTED_SCOPE
+              value: alpha
+            - name: ACCESS_TOKEN_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: openshell-spiffe-token-exchange-demo
+                  key: access-token-secret
+            - name: ACCESS_TOKEN_ISSUER
+              value: http://token-exchange-issuer.default.svc.cluster.local
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+          volumeMounts:
+            - name: scripts
+              mountPath: /demo
+              readOnly: true
+      volumes:
+        - name: scripts
+          configMap:
+            name: openshell-spiffe-token-exchange-demo-scripts
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: alpha-exchange
+  namespace: default
+spec:
+  selector:
+    app: alpha-exchange
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: beta-exchange
+  namespace: default
+  labels:
+    app: beta-exchange
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: beta-exchange
+  template:
+    metadata:
+      labels:
+        app: beta-exchange
+    spec:
+      containers:
+        - name: beta-exchange
+          image: node:22-alpine
+          imagePullPolicy: IfNotPresent
+          command: ["node", "/demo/protected-service.js"]
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            - name: SERVICE_NAME
+              value: beta
+            - name: EXPECTED_AUDIENCE
+              value: beta
+            - name: EXPECTED_SCOPE
+              value: beta
+            - name: ACCESS_TOKEN_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: openshell-spiffe-token-exchange-demo
+                  key: access-token-secret
+            - name: ACCESS_TOKEN_ISSUER
+              value: http://token-exchange-issuer.default.svc.cluster.local
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+          volumeMounts:
+            - name: scripts
+              mountPath: /demo
+              readOnly: true
+      volumes:
+        - name: scripts
+          configMap:
+            name: openshell-spiffe-token-exchange-demo-scripts
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: beta-exchange
+  namespace: default
+spec:
+  selector:
+    app: beta-exchange
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
