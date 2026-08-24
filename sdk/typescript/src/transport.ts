@@ -37,16 +37,18 @@ export interface ConnectOptions {
   /** Disable TLS verification (dev/debug only). */
   insecureSkipVerify?: boolean;
   /**
-   * Permit sending an auth token (oidcToken/edgeToken) over plaintext `http://`
-   * to a non-loopback host. Off by default: tokens over cleartext to a remote
-   * host leak credentials on the wire. Loopback hosts are always allowed.
+   * Permit sending an auth token (oidcToken/oidcTokenProvider/edgeToken) over
+   * plaintext `http://` to a non-loopback host. Off by default: tokens over
+   * cleartext to a remote host leak credentials on the wire. Loopback hosts are
+   * always allowed.
    */
   allowInsecureAuth?: boolean;
 }
 
 // OIDC bearer takes precedence; otherwise attach the Cloudflare Access header +
 // cookie. No-op when neither token is set.
-function authInterceptor(opts: ConnectOptions): Interceptor {
+/** @internal Exported for transport contract tests; not part of the package root API. */
+export function authInterceptor(opts: ConnectOptions): Interceptor {
   return (next) => async (req) => {
     if (opts.oidcTokenProvider) {
       req.header.set('authorization', `Bearer ${await opts.oidcTokenProvider.getToken(req.signal)}`);

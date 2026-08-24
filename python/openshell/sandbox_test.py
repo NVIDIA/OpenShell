@@ -111,6 +111,39 @@ def test_client_credentials_auth_exact_form_cache_and_redaction() -> None:
     assert "conformance-secret" not in repr(auth)
 
 
+def test_client_credentials_auth_preserves_explicit_empty_scopes() -> None:
+    import httpx
+
+    form: dict[str, str] = {}
+
+    def handler(request: Any) -> Any:
+        if request.method == "GET":
+            return httpx.Response(
+                200,
+                json={
+                    "issuer": "https://issuer.example.com",
+                    "token_endpoint": "https://issuer.example.com/token",
+                },
+            )
+        form.update(
+            __import__("urllib.parse").parse.parse_qsl(request.content.decode())
+        )
+        return httpx.Response(200, json={"access_token": "token", "expires_in": 120})
+
+    auth = ClientCredentialsAuth(
+        issuer="https://issuer.example.com",
+        client_id="client",
+        client_secret="secret",
+        scopes=(),
+        _transport=httpx.MockTransport(handler),
+    )
+    auth._apply_gateway_metadata({"oidc_scopes": "sandbox:read sandbox:write"})
+
+    assert auth() == "token"
+    assert auth._scopes == ()
+    assert "scope" not in form
+
+
 @pytest.mark.parametrize(
     "expires_in", _client_credentials_fixture()["expiry"]["invalid_expires_in"]
 )
@@ -1518,12 +1551,16 @@ def test_from_active_cluster_fills_client_credentials_from_metadata(
     )
     metadata_path.write_text(json.dumps(metadata))
     auth = ClientCredentialsAuth(client_secret="secret")
-    client = SandboxClient.from_active_cluster(client_credentials=auth)
+    client = SandboxClient.from_active_cluster(
+        client_credentials=auth,
+        insecure=True,
+    )
     try:
         assert auth._issuer == "https://issuer.example.com"
         assert auth._client_id == "service-client"
         assert auth._audience == "gateway"
         assert auth._scopes == ("sandbox:read", "sandbox:write")
+        assert auth._insecure is True
     finally:
         client.close()
 

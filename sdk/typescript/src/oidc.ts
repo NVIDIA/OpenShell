@@ -17,6 +17,7 @@ export interface ClientCredentialsOptions {
   clientSecret: string | (() => string | Promise<string>);
   scopes?: readonly string[];
   audience?: string;
+  /** Timeout for each complete discovery or token response, including its body. */
   timeoutMs?: number;
 }
 
@@ -131,12 +132,26 @@ class ClientCredentialsProvider implements OidcTokenProvider {
     }
   }
 
-  async #request(url: string, init: RequestInit): Promise<Response> {
+  async #requestJson(
+    url: string,
+    init: RequestInit,
+    responseKind: string,
+    operation: string,
+  ): Promise<Record<string, unknown>> {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), this.#options.timeoutMs ?? 30_000);
     try {
-      return await fetch(url, { ...init, redirect: 'manual', signal: controller.signal });
-    } catch {
+      const response = await fetch(url, { ...init, redirect: 'manual', signal: controller.signal });
+      if (response.status !== 200) {
+        await response.body?.cancel();
+        throw new SdkError('auth', `OAuth ${operation} failed with HTTP ${response.status}`);
+      }
+      return await boundedJson(response, responseKind);
+    } catch (error) {
+      if (error instanceof SdkError) throw error;
+      if (controller.signal.aborted) {
+        throw new SdkError('auth', `OAuth ${operation} request timed out`);
+      }
       throw new SdkError('auth', 'OAuth client credentials request failed');
     } finally {
       clearTimeout(timeout);
@@ -145,14 +160,12 @@ class ClientCredentialsProvider implements OidcTokenProvider {
 
   async #exchange(): Promise<string> {
     if (!this.#tokenEndpoint) {
-      const response = await this.#request(`${this.#issuer}/.well-known/openid-configuration`, {
-        headers: { accept: 'application/json' },
-      });
-      if (response.status !== 200) {
-        await response.body?.cancel();
-        throw new SdkError('auth', `OAuth discovery failed with HTTP ${response.status}`);
-      }
-      const discovery = await boundedJson(response, 'discovery');
+      const discovery = await this.#requestJson(
+        `${this.#issuer}/.well-known/openid-configuration`,
+        { headers: { accept: 'application/json' } },
+        'discovery',
+        'discovery',
+      );
       if (typeof discovery.issuer !== 'string' || withoutTrailingSlash(discovery.issuer) !== this.#issuer) {
         throw new SdkError('auth', 'OAuth discovery issuer mismatch');
       }
@@ -169,16 +182,16 @@ class ClientCredentialsProvider implements OidcTokenProvider {
     });
     if (this.#options.scopes?.length) form.set('scope', this.#options.scopes.join(' '));
     if (this.#options.audience) form.set('audience', this.#options.audience);
-    const response = await this.#request(this.#tokenEndpoint, {
-      method: 'POST',
-      headers: { accept: 'application/json', 'content-type': 'application/x-www-form-urlencoded' },
-      body: form,
-    });
-    if (response.status !== 200) {
-      await response.body?.cancel();
-      throw new SdkError('auth', `OAuth client credentials exchange failed with HTTP ${response.status}`);
-    }
-    const token = await boundedJson(response, 'client credentials response');
+    const token = await this.#requestJson(
+      this.#tokenEndpoint,
+      {
+        method: 'POST',
+        headers: { accept: 'application/json', 'content-type': 'application/x-www-form-urlencoded' },
+        body: form,
+      },
+      'client credentials response',
+      'client credentials exchange',
+    );
     if (typeof token.access_token !== 'string' || !token.access_token) {
       throw new SdkError('auth', 'OAuth client credentials response is missing access_token');
     }

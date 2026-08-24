@@ -276,7 +276,7 @@ from openshell import ClientCredentialsAuth, SandboxClient
 
 auth = ClientCredentialsAuth(client_secret=lambda: load_secret())
 with SandboxClient.from_active_cluster(client_credentials=auth) as client:
-    sandboxes = client.list()
+    sandboxes = client.list(workspace="default")
 ```
 
 ## Expose Long Running Services

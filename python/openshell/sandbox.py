@@ -191,7 +191,7 @@ class ClientCredentialsAuth:
         client_secret: str | Callable[[], str],
         issuer: str | None = None,
         client_id: str | None = None,
-        scopes: Sequence[str] = (),
+        scopes: Sequence[str] | None = None,
         audience: str | None = None,
         insecure: bool = False,
         timeout: float = 30.0,
@@ -204,7 +204,7 @@ class ClientCredentialsAuth:
         self._secret = client_secret
         self._issuer = issuer
         self._client_id = client_id
-        self._scopes = tuple(scopes)
+        self._scopes = tuple(scopes) if scopes is not None else None
         self._audience = audience
         self._insecure = insecure
         self._timeout = timeout
@@ -221,8 +221,10 @@ class ClientCredentialsAuth:
             f"scopes={self._scopes!r}, audience={self._audience!r})"
         )
 
-    def _apply_gateway_metadata(self, metadata: Mapping[str, object]) -> None:
-        """Fill omitted public fields from registered gateway metadata."""
+    def _apply_gateway_metadata(
+        self, metadata: Mapping[str, object], *, insecure: bool = False
+    ) -> None:
+        """Fill omitted fields and apply active-gateway transport settings."""
         if self._issuer is None:
             value = metadata.get("oidc_issuer")
             self._issuer = value if isinstance(value, str) and value else None
@@ -232,10 +234,13 @@ class ClientCredentialsAuth:
         if self._audience is None:
             value = metadata.get("oidc_audience")
             self._audience = value if isinstance(value, str) and value else None
-        if not self._scopes:
+        if self._scopes is None:
             value = metadata.get("oidc_scopes")
             if isinstance(value, str):
                 self._scopes = tuple(value.split())
+        # Preserve an explicit provider-level opt-in while also honoring the
+        # active-gateway construction flag used by the existing OIDC refresher.
+        self._insecure = self._insecure or insecure
 
     def __call__(self) -> str:
         if (
@@ -632,7 +637,7 @@ class SandboxClient:
                 raise SandboxError(
                     f"gateway '{cluster_name}' is not configured for OIDC"
                 )
-            client_credentials._apply_gateway_metadata(metadata)
+            client_credentials._apply_gateway_metadata(metadata, insecure=insecure)
             bearer_token = client_credentials
         elif metadata.get("auth_mode") == "oidc":
             bearer_token, bearer_close = _make_cluster_bearer_provider(

@@ -186,6 +186,34 @@ describe('clientCredentials', () => {
     await expect(provider.getToken()).rejects.toThrow(/too large/);
   });
 
+  it('times out while reading a stalled body and retries cleanly', async () => {
+    let issuer = '';
+    let discoveryCalls = 0;
+    const server = createServer((req, res) => {
+      if (req.url === '/.well-known/openid-configuration') {
+        discoveryCalls += 1;
+        if (discoveryCalls === 1) {
+          res.writeHead(200, { 'content-type': 'application/json' });
+          res.write('{"issuer":');
+          return;
+        }
+        res.end(JSON.stringify({ issuer, token_endpoint: `${issuer}/token` }));
+        return;
+      }
+      res.end(JSON.stringify({ access_token: 'recovered', expires_in: 120 }));
+    });
+    servers.push(server);
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const address = server.address();
+    if (!address || typeof address === 'string') throw new Error('missing address');
+    issuer = `http://127.0.0.1:${address.port}`;
+    const provider = clientCredentials({ issuer, clientId: 'client', clientSecret: 'secret', timeoutMs: 100 });
+
+    await expect(provider.getToken()).rejects.toThrow(/discovery request timed out/);
+    await expect(provider.getToken()).resolves.toBe('recovered');
+    expect(discoveryCalls).toBe(2);
+  });
+
   it('lets one waiter cancel without canceling the shared exchange', async () => {
     let issuer = '';
     let releaseToken!: () => void;
