@@ -3948,6 +3948,10 @@ dependencies = [
  "futures",
  "miette",
  "openshell-core",
+ "openshell-otel",
+ "openshell-otel-test-support",
+ "opentelemetry",
+ "opentelemetry_sdk",
  "prost-types",
  "serde",
  "serde_json",
@@ -3959,6 +3963,7 @@ dependencies = [
  "toml",
  "tonic",
  "tracing",
+ "tracing-opentelemetry",
  "tracing-subscriber",
  "url",
 ]
@@ -4023,8 +4028,8 @@ dependencies = [
  "nix 0.29.0",
  "openshell-core",
  "openshell-otel",
+ "openshell-otel-test-support",
  "opentelemetry",
- "opentelemetry-proto",
  "opentelemetry_sdk",
  "prost-types",
  "rustix 1.1.4",
@@ -4079,10 +4084,10 @@ dependencies = [
  "oci-client",
  "openshell-core",
  "openshell-otel",
+ "openshell-otel-test-support",
  "openshell-policy",
  "openshell-vfio",
  "opentelemetry",
- "opentelemetry-proto",
  "opentelemetry_sdk",
  "polling",
  "prost",
@@ -4169,6 +4174,16 @@ dependencies = [
  "tracing",
  "tracing-opentelemetry",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "openshell-otel-test-support"
+version = "0.0.0"
+dependencies = [
+ "opentelemetry-proto",
+ "tokio",
+ "tokio-stream",
+ "tonic",
 ]
 
 [[package]]
