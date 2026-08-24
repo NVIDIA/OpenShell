@@ -256,14 +256,18 @@ fn run_podman_capture(args: &[&str]) -> Option<Vec<u8>> {
 /// Run `program <args>` with a deadline, capturing stdout.
 ///
 /// Unlike `Command::output()`, which blocks until the child exits, the deadline
-/// bounds the whole call so a hung probe cannot stall gateway startup. The
-/// probe runs in its own process group and the deadline covers both waiting for
-/// the child and draining its stdout: a Podman probe can leave a daemonized
-/// descendant (an SSH multiplexer, `gvproxy`, etc.) that inherited the stdout
-/// pipe, so `read_to_end` would otherwise wait for EOF forever even after the
-/// direct child exits. On expiry the entire process group is killed, which
-/// terminates such descendants and releases the pipe. Returns the captured
-/// stdout only on a successful exit within the deadline; otherwise `None`.
+/// is absolute: the call returns within `timeout` no matter what the probe or
+/// its descendants do. A Podman probe can leave a daemonized descendant (an SSH
+/// multiplexer, `gvproxy`, etc.) that inherited the stdout pipe, so
+/// `read_to_end` would otherwise wait for EOF forever even after the direct
+/// child exits — and such a descendant may even have escaped the probe's
+/// process group. To stay bounded, the deadline covers both waiting for the
+/// child and draining its stdout; on expiry the call best-effort kills the
+/// process group (cleaning up in-group descendants) and gives up immediately,
+/// abandoning the reader thread rather than waiting on it again. The abandoned
+/// reader exits on its own once the pipe finally closes. Returns the captured
+/// stdout only on a successful exit whose output was fully drained within the
+/// deadline; otherwise `None`.
 fn run_bounded_command(program: &str, args: &[&str], timeout: Duration) -> Option<Vec<u8>> {
     use std::io::Read as _;
     use std::sync::mpsc;
@@ -274,14 +278,15 @@ fn run_bounded_command(program: &str, args: &[&str], timeout: Duration) -> Optio
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
-    // Run the probe as its own process-group leader so a daemonized descendant
-    // that inherited the stdout pipe can be terminated as a group on timeout.
+    // Run the probe as its own process-group leader so in-group descendants that
+    // inherited the stdout pipe can be terminated as a group on timeout.
     set_new_process_group(&mut command);
     let mut child = command.spawn().ok()?;
 
     // Drain stdout on a separate thread so a child that fills the pipe buffer
-    // cannot deadlock against the polling loop below. The reader signals through
-    // a channel so the drain can itself be bounded by the deadline.
+    // cannot deadlock against the polling loop below. The reader reports through
+    // a channel so the drain can be bounded by the deadline and abandoned if it
+    // outlives it.
     let mut stdout = child.stdout.take()?;
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
@@ -306,29 +311,28 @@ fn run_bounded_command(program: &str, args: &[&str], timeout: Duration) -> Optio
         }
     };
 
-    // If the child is still running at the deadline, kill its whole process
-    // group so any descendants (and the child) are terminated together.
-    if status.is_none() {
+    // The child never exited within the deadline: kill the group, reap the
+    // (now-killed) direct child, and give up. `wait()` is bounded because the
+    // direct child is dead.
+    let Some(status) = status else {
         terminate_process_group(&mut child);
-    }
-
-    // Collect stdout, but never past the deadline. A surviving descendant can
-    // hold the pipe open after the direct child exits, so cap the wait and, on
-    // expiry, kill the group to force EOF before collecting what was written.
-    let remaining = deadline.saturating_duration_since(Instant::now());
-    let stdout = match rx.recv_timeout(remaining) {
-        Ok(buf) => buf,
-        Err(mpsc::RecvTimeoutError::Timeout) => {
-            terminate_process_group(&mut child);
-            rx.recv().unwrap_or_default()
-        }
-        Err(mpsc::RecvTimeoutError::Disconnected) => Vec::new(),
+        let _ = child.wait();
+        return None;
     };
 
-    let _ = child.wait();
-    match status {
-        Some(status) if status.success() => Some(stdout),
-        _ => None,
+    // The direct child exited (already reaped by `try_wait`). Collect its stdout
+    // without ever blocking past the deadline. A surviving descendant — possibly
+    // one that escaped the process group — can hold the pipe open indefinitely,
+    // so on expiry best-effort kill the group for cleanup and return None rather
+    // than waiting on the reader again.
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    match rx.recv_timeout(remaining) {
+        Ok(stdout) if status.success() => Some(stdout),
+        Ok(_) => None,
+        Err(_) => {
+            terminate_process_group(&mut child);
+            None
+        }
     }
 }
 
@@ -2139,11 +2143,11 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn run_bounded_command_bounds_drain_when_descendant_holds_stdout() {
+    fn run_bounded_command_bounds_drain_when_in_group_descendant_holds_stdout() {
         // The shell exits immediately after `echo`, but the backgrounded child
-        // inherits and holds the stdout pipe open. Without bounding the drain
-        // (and killing the process group), `read_to_end` would wait ~30s for
-        // EOF even though the direct child already exited.
+        // (in the same process group) inherits and holds the stdout pipe open.
+        // Without a bounded drain, `read_to_end` would wait ~30s for EOF even
+        // though the direct child already exited.
         let start = Instant::now();
         let result = run_bounded_command(
             "sh",
@@ -2152,12 +2156,34 @@ mod tests {
         );
         let elapsed = start.elapsed();
         assert!(
-            elapsed < Duration::from_secs(5),
+            elapsed < Duration::from_secs(2),
             "drain blocked on a descendant holding stdout: {elapsed:?}"
         );
-        // The direct child exited 0 and its flushed output is still collected
-        // once the group is killed and the pipe reaches EOF.
-        assert_eq!(result, Some(b"done\n".to_vec()));
+        // Draining hit the deadline, so the probe is treated as "not found".
+        assert_eq!(result, None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_bounded_command_bounds_drain_when_descendant_escapes_process_group() {
+        // `set -m` runs the background job in its OWN process group, so it
+        // survives the group kill while still holding the stdout pipe. The
+        // deadline must remain absolute: the call must not fall back to an
+        // untimed receive that waits for the escaped descendant's EOF.
+        let start = Instant::now();
+        let result = run_bounded_command(
+            "bash",
+            &["-c", "set -m; sleep 5 & echo done"],
+            Duration::from_millis(300),
+        );
+        let elapsed = start.elapsed();
+        // A regression (blocking receive after the timeout) would wait ~5s for
+        // the escaped `sleep`; the bounded implementation returns promptly.
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "drain blocked on a descendant that escaped the process group: {elapsed:?}"
+        );
+        assert_eq!(result, None);
     }
 
     #[cfg(unix)]
