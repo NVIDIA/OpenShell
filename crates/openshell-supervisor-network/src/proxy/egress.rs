@@ -27,14 +27,21 @@ pub(super) struct L7RouteSnapshot {
 
 /// Endpoint metadata materialized for an allowed egress decision.
 ///
-/// The migration hydrates these fields at the same points the legacy handlers
-/// queried them so policy-reload and upstream-connect timing remain unchanged.
+/// Adapters materialize these fields from the authoritative policy snapshot at
+/// their existing timing boundaries so upstream-connect behavior stays stable.
 #[derive(Debug, Clone)]
 pub(super) struct EndpointDecision {
     pub(super) tls_mode: crate::l7::TlsMode,
     pub(super) l7_route: Option<L7RouteSnapshot>,
-    /// Destination authorization selected at the legacy hydration point.
+    /// Destination authorization selected from the captured endpoint metadata.
     pub(super) destination: Option<DestinationValidationPlan>,
+    /// Raw endpoint configs returned with the authoritative egress decision.
+    pub(super) policy_configs: Vec<regorus::Value>,
+    /// Full endpoint identities and metadata captured in the same generation.
+    #[allow(dead_code, reason = "consumed when the policy DNS adapter lands")]
+    pub(super) matched_endpoints: Vec<crate::opa::MatchedEndpoint>,
+    /// Whether policy matched the requested hostname exactly (not by glob).
+    pub(super) exact_declared_host: bool,
 }
 
 impl Default for EndpointDecision {
@@ -43,6 +50,20 @@ impl Default for EndpointDecision {
             tls_mode: crate::l7::TlsMode::Auto,
             l7_route: None,
             destination: None,
+            policy_configs: Vec::new(),
+            matched_endpoints: Vec::new(),
+            exact_declared_host: false,
+        }
+    }
+}
+
+impl EndpointDecision {
+    pub(super) fn from_authorization(authorization: &crate::opa::EgressAuthorization) -> Self {
+        Self {
+            policy_configs: authorization.endpoint_configs.clone(),
+            matched_endpoints: authorization.matched_endpoints.clone(),
+            exact_declared_host: authorization.exact_declared_endpoint_host,
+            ..Self::default()
         }
     }
 }
@@ -52,6 +73,9 @@ impl Default for EndpointDecision {
 pub(super) enum EgressTransport {
     Connect,
     ForwardHttp,
+    /// Transparent TCP adapter fed by the policy DNS registry.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    TransparentTcp,
 }
 
 /// Destination requested by an explicit proxy adapter.
@@ -75,6 +99,14 @@ impl EgressIntent {
 
     pub(super) fn forward_http(host: String, port: u16) -> Self {
         Self::new(EgressTransport::ForwardHttp, host, port)
+    }
+
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(super) fn transparent_tcp(host: String, port: u16) -> Self {
+        Self {
+            transport: EgressTransport::TransparentTcp,
+            destination: RequestedDestination { host, port },
+        }
     }
 
     fn new(transport: EgressTransport, host: String, port: u16) -> Self {
@@ -105,15 +137,13 @@ pub(super) enum ProcessIdentityEvidence {
 
 /// Result of authorizing a normalized egress intent.
 ///
-/// The identity fields intentionally mirror the former CONNECT-specific
-/// decision during the compatibility migration. Endpoint configuration is
-/// hydrated at the legacy query points without changing lookup precedence or
-/// failure defaults.
+/// The policy action and endpoint metadata are one atomic snapshot. Adapters
+/// may parse that metadata later, but they never query a second generation.
 pub(super) struct EgressDecision {
     pub(super) intent: EgressIntent,
     pub(super) action: NetworkAction,
-    /// Policy generation used for the L4 network decision.
-    pub(super) l4_policy_generation: u64,
+    /// Policy generation used for the complete authorization snapshot.
+    pub(super) policy_generation: u64,
     /// Whether process identity evidence was available to policy evaluation.
     pub(super) identity: ProcessIdentityEvidence,
     /// Endpoint behavior hydrated for destination validation and relays.
@@ -142,5 +172,10 @@ mod tests {
         assert_eq!(connect.destination.port, 443);
         assert_eq!(forward.transport, EgressTransport::ForwardHttp);
         assert_eq!(forward.destination.port, 80);
+
+        let transparent = EgressIntent::transparent_tcp("db.example.com".to_string(), 5432);
+        assert_eq!(transparent.transport, EgressTransport::TransparentTcp);
+        assert_eq!(transparent.destination.host, "db.example.com");
+        assert_eq!(transparent.destination.port, 5432);
     }
 }

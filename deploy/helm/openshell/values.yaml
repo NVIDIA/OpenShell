@@ -133,6 +133,16 @@ service:
   # -- Gateway metrics service port.
   metricsPort: 9090
 
+# Agent Sandbox is a cluster-scoped prerequisite for the Kubernetes compute
+# driver. OpenShell deliberately does not install its CRDs or controller.
+# Enable this check for live Helm installs to fail before creating gateway
+# resources when neither supported Sandbox API is served. Disable it for
+# offline `helm template` and lint workflows, which cannot discover APIs.
+agentSandbox:
+  preflight:
+    # -- Check the live cluster for a supported Agent Sandbox API before rendering gateway resources. Disable only for offline rendering and linting.
+    enabled: true
+
 # Pod restart behavior and health probe tuning.
 podLifecycle:
   # -- Grace period, in seconds, before Kubernetes terminates the gateway pod.
@@ -366,15 +376,15 @@ server:
     # (owner-read only). Override to 0440 or 0444 if the container UID
     # does not match the volume file owner.
     secretDefaultMode: ""
-  # Dynamic provider token grants. When SPIFFE is enabled here, sandbox
-  # supervisors mount the SPIFFE Workload API socket so provider profiles can
-  # exchange JWT-SVIDs for upstream access tokens. Supervisor-to-gateway
-  # authentication still uses gateway-minted sandbox JWTs.
+  # Dynamic provider token grants. When SPIFFE is enabled here, both the
+  # gateway and sandbox supervisors mount the SPIFFE Workload API socket so
+  # token-exchange profiles can use gateway- and sandbox-scoped JWT-SVIDs.
+  # Supervisor-to-gateway authentication still uses gateway-minted sandbox JWTs.
   providerTokenGrants:
     spiffe:
-      # -- Mount the SPIFFE Workload API socket into sandbox pods for dynamic provider token grants.
+      # -- Mount the SPIFFE Workload API socket into gateway and sandbox pods for dynamic provider token grants.
       enabled: false
-      # -- Path to the SPIFFE Workload API socket mounted into sandbox pods.
+      # -- Path to the SPIFFE Workload API socket mounted into gateway and sandbox pods.
       workloadApiSocketPath: /spiffe-workload-api/spire-agent.sock
   # OIDC (OpenID Connect) configuration for JWT-based authentication.
   # When issuer is set, the server validates Bearer tokens on gRPC requests.

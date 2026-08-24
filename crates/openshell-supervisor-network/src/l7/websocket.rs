@@ -491,6 +491,7 @@ pub(super) struct RelayOptions<'a> {
     pub(super) compression: WebSocketCompression,
     pub(super) middleware_session: Option<openshell_supervisor_middleware::WebSocketSession>,
     pub(super) middleware_context: Option<&'a L7EvalContext>,
+    pub(super) deny_uninspected_credentials: bool,
 }
 
 /// Relay an upgraded WebSocket connection with optional client text inspection,
@@ -811,6 +812,18 @@ where
                 }
             }
             OPCODE_BINARY => {
+                if options.deny_uninspected_credentials {
+                    emit_uninspected_credential_denial(
+                        host,
+                        port,
+                        options.policy_name,
+                        "websocket-binary",
+                    );
+                    return Err(terminate(
+                        WebSocketTerminationCause::PolicyDenial,
+                        miette!("websocket binary frame denied for credentialed endpoint"),
+                    ));
+                }
                 let initial_size = usize::try_from(frame.payload_len).unwrap_or(usize::MAX);
                 let coverage = options
                     .middleware_session
@@ -1172,6 +1185,27 @@ where
             "websocket text message is not valid UTF-8"
         )))
     })?;
+    let live_resolver = options.provider_credentials.map(|credentials| {
+        let (resolver, revision) =
+            credentials.resolver_for_endpoint_with_revision(host, port, options.target);
+        (
+            resolver,
+            crate::l7::rest::CredentialGenerationGuard::new(credentials, revision),
+        )
+    });
+    let resolver = live_resolver
+        .as_ref()
+        .map_or(options.resolver, |(resolver, _)| resolver.as_deref());
+    if options.deny_uninspected_credentials
+        && resolver.is_none()
+        && contains_reserved_credential_marker(&text)
+    {
+        emit_uninspected_credential_denial(host, port, options.policy_name, "websocket-text");
+        return Err(terminate(
+            WebSocketTerminationCause::PolicyDenial,
+            miette!("websocket credential placeholder denied because rewrite is disabled"),
+        ));
+    }
 
     // Built-in transport/GraphQL inspection sees the original unresolved
     // message. External transformations run next, then policy is re-evaluated
@@ -1223,17 +1257,6 @@ where
     }
     ensure_generation_current(host, port, options)?;
 
-    let live_resolver = options.provider_credentials.map(|credentials| {
-        let (resolver, revision) =
-            credentials.resolver_for_endpoint_with_revision(host, port, options.target);
-        (
-            resolver,
-            crate::l7::rest::CredentialGenerationGuard::new(credentials, revision),
-        )
-    });
-    let resolver = live_resolver
-        .as_ref()
-        .map_or(options.resolver, |(resolver, _)| resolver.as_deref());
     let replacements = if let Some(resolver) = resolver {
         resolver
             .rewrite_websocket_text_placeholders(&mut text)
@@ -1321,6 +1344,23 @@ where
         options.generation_guard,
     )
     .await
+}
+
+fn emit_uninspected_credential_denial(host: &str, port: u16, policy_name: &str, surface: &str) {
+    let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
+        .activity(ActivityId::Traffic)
+        .action(ActionId::Denied)
+        .disposition(DispositionId::Blocked)
+        .severity(SeverityId::High)
+        .status(StatusId::Failure)
+        .dst_endpoint(Endpoint::from_domain(host, port))
+        .firewall_rule(policy_name, "l7-websocket")
+        .message(format!(
+            "WebSocket credential traffic denied for {host}:{port}"
+        ))
+        .build();
+    ocsf_emit!(event);
+    crate::l7::emit_uninspected_credential_finding(host, policy_name, surface);
 }
 
 fn inspect_websocket_text_message(
@@ -2362,6 +2402,7 @@ network_policies:
             compression: WebSocketCompression::None,
             middleware_session: None,
             middleware_context: None,
+            deny_uninspected_credentials: false,
         }
     }
 
@@ -2391,6 +2432,7 @@ network_policies:
             compression: WebSocketCompression::None,
             middleware_session: None,
             middleware_context: None,
+            deny_uninspected_credentials: false,
         };
         let result = relay_client_to_server(
             &mut relay_read,
@@ -2639,6 +2681,7 @@ network_policies:
                         path: "/socket".to_string(),
                     }],
                     credential_identity: "provider-a:DISCORD_BOT_TOKEN".to_string(),
+                    workload_credential_handle: String::new(),
                 },
             )]),
             Vec::new(),
@@ -2668,6 +2711,7 @@ network_policies:
             compression: WebSocketCompression::None,
             middleware_session: None,
             middleware_context: None,
+            deny_uninspected_credentials: false,
         };
         let result = relay_client_to_server(
             &mut relay_read,
@@ -2729,6 +2773,48 @@ network_policies:
     }
 
     #[tokio::test]
+    async fn guarded_websocket_uses_path_scoped_live_resolver() {
+        let state = bound_websocket_provider_state();
+        let placeholder = b"openshell:resolve:env:v1_DISCORD_BOT_TOKEN";
+        let input = masked_frame(true, OPCODE_TEXT, placeholder);
+        let (mut client_write, mut relay_read) = tokio::io::duplex(4096);
+        let (mut relay_write, mut upstream_read) = tokio::io::duplex(4096);
+        client_write.write_all(&input).await.unwrap();
+        drop(client_write);
+
+        let mut options = RelayOptions {
+            policy_name: "test-policy",
+            assembly_budget: WebSocketAssemblyBudget::default(),
+            resolver: None,
+            generation_guard: None,
+            provider_credentials: Some(&state),
+            target: "/socket",
+            inspector: None,
+            compression: WebSocketCompression::None,
+            middleware_session: None,
+            middleware_context: None,
+            deny_uninspected_credentials: true,
+        };
+        let result = relay_client_to_server(
+            &mut relay_read,
+            &mut relay_write,
+            "gateway.example.test",
+            443,
+            &mut options,
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "path-scoped live resolver must satisfy the credential guard: {result:?}"
+        );
+
+        drop(relay_write);
+        let mut output = Vec::new();
+        upstream_read.read_to_end(&mut output).await.unwrap();
+        assert_eq!(decode_masked_text_frame(&output), "real-token");
+    }
+
+    #[tokio::test]
     async fn websocket_rewrite_rejects_revocation_before_frame_write() {
         let state = bound_websocket_provider_state();
         let fallback = state.resolver().expect("upgrade-time resolver");
@@ -2754,6 +2840,7 @@ network_policies:
             compression: WebSocketCompression::PermessageDeflate,
             middleware_session: None,
             middleware_context: None,
+            deny_uninspected_credentials: false,
         };
         let reached_write = tokio::sync::Barrier::new(2);
         let release_write = tokio::sync::Barrier::new(2);
@@ -2795,6 +2882,44 @@ network_policies:
             output.is_empty(),
             "credential revoked before the write guard must not reach upstream"
         );
+    }
+
+    async fn run_client_to_server_guarded(input: Vec<u8>) -> (Result<()>, Vec<u8>) {
+        let (mut client_write, mut relay_read) = tokio::io::duplex(MAX_TEXT_MESSAGE_BYTES + 1024);
+        let (mut relay_write, mut upstream_read) = tokio::io::duplex(MAX_TEXT_MESSAGE_BYTES + 1024);
+
+        client_write.write_all(&input).await.unwrap();
+        drop(client_write);
+
+        let mut options = RelayOptions {
+            policy_name: "test-policy",
+            assembly_budget: WebSocketAssemblyBudget::default(),
+            resolver: None,
+            generation_guard: None,
+            provider_credentials: None,
+            target: "/",
+            inspector: None,
+            compression: WebSocketCompression::None,
+            middleware_session: None,
+            middleware_context: None,
+            deny_uninspected_credentials: true,
+        };
+        let result = relay_client_to_server(
+            &mut relay_read,
+            &mut relay_write,
+            "gateway.example.test",
+            443,
+            &mut options,
+        )
+        .await;
+        drop(relay_write);
+
+        let mut output = Vec::new();
+        upstream_read.read_to_end(&mut output).await.unwrap();
+        (
+            result.map(|_| ()).map_err(|termination| termination.error),
+            output,
+        )
     }
 
     async fn run_client_to_server_with_graphql_policy(
@@ -2852,6 +2977,7 @@ network_policies:
             compression: WebSocketCompression::None,
             middleware_session: None,
             middleware_context: None,
+            deny_uninspected_credentials: false,
         };
         let result = relay_client_to_server(
             &mut relay_read,
@@ -2889,6 +3015,7 @@ network_policies:
             compression: WebSocketCompression::PermessageDeflate,
             middleware_session: None,
             middleware_context: None,
+            deny_uninspected_credentials: false,
         };
         let result = relay_client_to_server(
             &mut relay_read,
@@ -3330,6 +3457,7 @@ network_policies:
                     compression: WebSocketCompression::None,
                     middleware_session: None,
                     middleware_context: None,
+                    deny_uninspected_credentials: false,
                 },
             )
             .await
@@ -3367,6 +3495,10 @@ network_policies:
         close_on_first_message: bool,
         message_received: Option<Arc<tokio::sync::Notify>>,
         release_message: Option<Arc<tokio::sync::Notify>>,
+        // Opt-in capture of the preflight request context's workspace. Kept
+        // separate from `observed` so it does not perturb the session-event
+        // ordering the other tests assert on.
+        preflight_observed: Option<tokio::sync::mpsc::UnboundedSender<String>>,
     }
 
     #[tonic::async_trait]
@@ -3433,11 +3565,20 @@ network_policies:
             let close_on_first_message = self.close_on_first_message;
             let message_received = self.message_received.clone();
             let release_message = self.release_message.clone();
+            let preflight_observed = self.preflight_observed.clone();
             let (responses_tx, responses_rx) = tokio::sync::mpsc::channel(4);
             tokio::spawn(async move {
                 while let Ok(Some(request)) = requests.message().await {
                     let response = match request.event {
-                        Some(web_socket_session_event::Event::Preflight(_)) => {
+                        Some(web_socket_session_event::Event::Preflight(preflight)) => {
+                            if let Some(preflight_observed) = &preflight_observed {
+                                let workspace = preflight
+                                    .context
+                                    .as_ref()
+                                    .map(|context| context.workspace.clone())
+                                    .unwrap_or_default();
+                                let _ = preflight_observed.send(workspace);
+                            }
                             Some(WebSocketSessionEventResult {
                                 result: Some(
                                     web_socket_session_event_result::Result::PreflightDecision(
@@ -3598,6 +3739,8 @@ network_policies:
                     session_id: "session".into(),
                     request_id: "request".into(),
                     sandbox_id: "sandbox".into(),
+                    sandbox_name: "sandbox-name".into(),
+                    workspace: "workspace".into(),
                     scheme: scheme.into(),
                     host: "api.openai.com".into(),
                     port: if scheme == "wss" { 443 } else { 80 },
@@ -3614,6 +3757,80 @@ network_policies:
             shutdown_tx,
             server_task,
         )
+    }
+
+    // Companion to the HTTP-path assertion in openshell-supervisor-middleware:
+    // proves the WebSocket preflight forwards the request context's workspace to
+    // the middleware service.
+    #[tokio::test]
+    async fn websocket_preflight_forwards_workspace_to_middleware() {
+        use openshell_core::proto::SupervisorMiddlewareService;
+        use openshell_supervisor_middleware::{ChainEntry, MiddlewareRegistry, OnError};
+
+        let (preflight_tx, mut preflight_rx) = tokio::sync::mpsc::unbounded_channel();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind WebSocket middleware");
+        let address = listener.local_addr().expect("middleware address");
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let server = tonic::transport::Server::builder()
+            .add_service(SupervisorMiddlewareServer::new(OpenAiWebSocketRedactor {
+                preflight_observed: Some(preflight_tx),
+                ..Default::default()
+            }))
+            .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async {
+                let _ = shutdown_rx.await;
+            });
+        let server_task = tokio::spawn(server);
+        let registry = MiddlewareRegistry::connect_services(
+            Vec::new(),
+            vec![SupervisorMiddlewareService {
+                name: "openai-redactor".into(),
+                grpc_endpoint: format!("http://{address}"),
+                max_payload_bytes: openshell_supervisor_middleware::MAX_MIDDLEWARE_PAYLOAD_BYTES
+                    as u64,
+                timeout: "2s".into(),
+                tls_ca_cert_pem: Vec::new(),
+                audience: String::new(),
+                allow_insecure_transport: false,
+            }],
+        )
+        .await
+        .expect("connect middleware");
+        let runner = openshell_supervisor_middleware::ChainRunner::from_registry(registry);
+        runner
+            .preflight_websocket(
+                &[ChainEntry {
+                    name: "redact-openai".into(),
+                    implementation: "openai-redactor".into(),
+                    order: 0,
+                    config: prost_types::Struct::default(),
+                    on_error: OnError::FailClosed,
+                }],
+                openshell_supervisor_middleware::WebSocketPreflightInput {
+                    session_id: "session".into(),
+                    request_id: "request".into(),
+                    sandbox_id: "sandbox".into(),
+                    sandbox_name: "sandbox-name".into(),
+                    workspace: "team-a".into(),
+                    scheme: "wss".into(),
+                    host: "api.openai.com".into(),
+                    port: 443,
+                    path: "/v1/responses".into(),
+                    requested_subprotocols: Vec::new(),
+                },
+            )
+            .await
+            .expect("preflight");
+
+        assert_eq!(
+            preflight_rx.recv().await,
+            Some("team-a".to_string()),
+            "WebSocket preflight must forward the workspace to the middleware"
+        );
+
+        let _ = shutdown_tx.send(());
+        let _ = server_task.await;
     }
 
     async fn assert_invalid_close_termination(payload: Vec<u8>, expected_close_code: u16) {
@@ -3645,6 +3862,7 @@ network_policies:
                     compression: WebSocketCompression::None,
                     middleware_session: Some(session),
                     middleware_context: None,
+                    deny_uninspected_credentials: false,
                 },
             )
             .await
@@ -3772,6 +3990,7 @@ network_policies:
                     compression: WebSocketCompression::None,
                     middleware_session: Some(session),
                     middleware_context: None,
+                    deny_uninspected_credentials: false,
                 },
             )
             .await
@@ -4380,6 +4599,7 @@ network_policies:
                     compression: WebSocketCompression::None,
                     middleware_session: Some(session),
                     middleware_context: Some(&ctx),
+                    deny_uninspected_credentials: false,
                 },
             )
             .await
@@ -4482,6 +4702,8 @@ network_policies:
                     session_id: "session".into(),
                     request_id: "request".into(),
                     sandbox_id: "sandbox".into(),
+                    sandbox_name: "sandbox-name".into(),
+                    workspace: "workspace".into(),
                     scheme: "wss".into(),
                     host: "api.openai.com".into(),
                     port: 443,
@@ -4516,6 +4738,7 @@ network_policies:
                     compression: WebSocketCompression::None,
                     middleware_session: Some(session),
                     middleware_context: None,
+                    deny_uninspected_credentials: false,
                 },
             )
             .await
@@ -4629,6 +4852,8 @@ network_policies:
                     session_id: "disabled-session".into(),
                     request_id: "request".into(),
                     sandbox_id: "sandbox".into(),
+                    sandbox_name: "sandbox-name".into(),
+                    workspace: "workspace".into(),
                     scheme: "wss".into(),
                     host: "api.openai.com".into(),
                     port: 443,
@@ -4687,6 +4912,7 @@ network_policies:
                     compression: WebSocketCompression::None,
                     middleware_session: Some(session),
                     middleware_context: None,
+                    deny_uninspected_credentials: false,
                 },
             )
             .await
@@ -4748,6 +4974,8 @@ network_policies:
                     session_id: "builtin-regex-session".into(),
                     request_id: "request".into(),
                     sandbox_id: "sandbox".into(),
+                    sandbox_name: "sandbox-name".into(),
+                    workspace: "workspace".into(),
                     scheme: "wss".into(),
                     host: "api.openai.com".into(),
                     port: 443,
@@ -4781,6 +5009,7 @@ network_policies:
                     compression: WebSocketCompression::None,
                     middleware_session: Some(session),
                     middleware_context: None,
+                    deny_uninspected_credentials: false,
                 },
             )
             .await
@@ -5046,6 +5275,40 @@ network_policies:
             .expect("binary frame should pass through");
 
         assert_eq!(output, frame);
+    }
+
+    #[tokio::test]
+    async fn credentialed_endpoint_denies_binary_frame_without_opt_in() {
+        let frame = masked_frame(true, OPCODE_BINARY, &[0, 1, 2, 3, 255]);
+
+        let (result, output) = run_client_to_server_guarded(frame).await;
+
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("binary frame denied")
+        );
+        assert!(output.is_empty());
+    }
+
+    #[tokio::test]
+    async fn credentialed_endpoint_denies_text_placeholder_without_rewrite() {
+        let frame = masked_frame(
+            true,
+            OPCODE_TEXT,
+            br#"{"token":"openshell:resolve:env:API_TOKEN"}"#,
+        );
+
+        let (result, output) = run_client_to_server_guarded(frame).await;
+
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("rewrite is disabled")
+        );
+        assert!(output.is_empty());
     }
 
     #[tokio::test]

@@ -20,6 +20,20 @@ Create a sandbox with a single command. For example, to create a sandbox with Cl
 openshell sandbox create -- claude
 ```
 
+The trailing command is the sandbox's canonical main process. OpenShell starts
+it once and attaches your terminal to it. With no trailing command, OpenShell
+starts `/bin/bash -l` in a retained pseudo-terminal. Add `--detach` to create
+the sandbox without attaching:
+
+```shell
+openshell sandbox create --name worker --detach -- ./worker
+```
+
+`--upload` cannot yet be combined with a trailing main command because uploads
+finish after the canonical process starts. Create a scratch sandbox, upload the
+files, then launch the workload with `sandbox exec`, or build the files into the
+sandbox image.
+
 For automation, use `--output json` or `--output yaml` to get machine-readable sandbox metadata after creation:
 
 ```shell
@@ -142,11 +156,20 @@ For default policy coverage by agent, refer to [Default Policy](/reference/defau
 
 ## Connect to a Sandbox
 
-Open an SSH session into a running sandbox:
+Attach to the canonical main process in a running sandbox:
 
 ```shell
 openshell sandbox connect my-sandbox
 ```
+
+Disconnecting does not stop the process or close its stdin. A later `connect`
+attaches to the same process instance and replays up to 1 MiB of recent
+output. One attachment owns stdin at a time. Use `sandbox exec --tty --
+/bin/bash -l` when you want a new independent shell instead.
+
+Press `Ctrl-P`, then `Ctrl-Q` to disconnect without terminating the main
+process. `Ctrl-C` retains its normal terminal behavior and interrupts the
+foreground process.
 
 Launch VS Code or Cursor directly into the sandbox workspace:
 
@@ -477,7 +500,7 @@ Every sandbox moves through a defined set of phases:
 | Stopping     | The gateway accepted a stop request and is stopping compute while retaining persistent state.                                                         |
 | Stopped      | Compute is stopped and access is unavailable. The sandbox record and driver-owned persistent workspace remain.                                       |
 | Starting     | Compute is starting. The sandbox becomes usable only after a fresh supervisor session connects.                                                       |
-| Error        | Something went wrong during provisioning or execution. Check logs with `openshell logs` for details.                                                           |
+| Error        | Provisioning failed or the canonical main process exited unexpectedly. Main-process exit is terminal even with exit code 0. Check logs with `openshell logs`.       |
 | Deleting     | The sandbox is being torn down. The system releases resources and purges credentials.                                                                          |
 
 The compute backend can become ready before the sandbox supervisor connects to
@@ -486,6 +509,11 @@ reports a `Ready=False` condition with the reason `SupervisorNotConnected`.
 After a gateway restart, an existing sandbox can return to `Provisioning`
 temporarily while its supervisor reconnects. Wait for the phase to return to
 `Ready` before you connect to the sandbox or execute commands.
+
+The gateway records a canonical main-process exit as `Ready=False` with reason
+`MainProcessExited`. It also sets `status.exit_code`; signal exits use the
+standard `128 + signal` convention. Compute runtimes do not automatically
+restart that process.
 
 ## Sandbox Compute Drivers
 

@@ -111,8 +111,7 @@ impl std::str::FromStr for Mode {
 #[command(about = "Process sandbox and monitor", long_about = None)]
 struct Args {
     /// Command to execute in the sandbox.
-    /// Can also be provided via `OPENSHELL_SANDBOX_COMMAND` environment variable.
-    /// Defaults to `/bin/bash` if neither is provided.
+    /// Defaults to `/bin/bash -l` if neither this nor the driver specification is provided.
     #[arg(trailing_var_arg = true)]
     command: Vec<String>,
 
@@ -472,16 +471,23 @@ fn run_network_init(
 
 #[cfg(target_os = "linux")]
 fn validate_network_init_ids(proxy_user_id: u32, proxy_primary_group_id: u32) -> Result<()> {
-    if proxy_user_id != 0 && proxy_user_id < openshell_policy::MIN_SANDBOX_UID {
+    if proxy_user_id != 0
+        && !(openshell_policy::MIN_SANDBOX_PROXY_UID..=openshell_policy::MAX_SANDBOX_UID)
+            .contains(&proxy_user_id)
+    {
         return Err(miette::miette!(
-            "--proxy-uid must be 0 or at least {}",
-            openshell_policy::MIN_SANDBOX_UID
+            "--proxy-uid must be 0 or in range [{}, {}]",
+            openshell_policy::MIN_SANDBOX_PROXY_UID,
+            openshell_policy::MAX_SANDBOX_UID,
         ));
     }
-    if proxy_primary_group_id < openshell_policy::MIN_SANDBOX_UID {
+    if !(openshell_policy::MIN_SANDBOX_UID..=openshell_policy::MAX_SANDBOX_UID)
+        .contains(&proxy_primary_group_id)
+    {
         return Err(miette::miette!(
-            "--proxy-gid must be at least {}",
-            openshell_policy::MIN_SANDBOX_UID
+            "--proxy-gid must be in range [{}, {}]",
+            openshell_policy::MIN_SANDBOX_UID,
+            openshell_policy::MAX_SANDBOX_UID,
         ));
     }
     Ok(())
@@ -643,14 +649,19 @@ fn main() -> Result<()> {
             (None, None)
         };
 
-        // Get command - either from CLI args, environment variable, or default to /bin/bash
-        let command = if !args.command.is_empty() {
-            args.command
-        } else if let Ok(c) = std::env::var(openshell_core::sandbox_env::SANDBOX_COMMAND) {
-            // Simple shell-like splitting on whitespace
-            c.split_whitespace().map(String::from).collect()
+        // Resolve an exact canonical process. Explicit offline/test argv wins;
+        // drivers otherwise provide a versioned JSON transport so argument
+        // boundaries are never reconstructed with shell parsing.
+        let workdir = args.workdir.clone();
+        let (command, interactive) = if !args.command.is_empty() {
+            (args.command, args.interactive)
+        } else if let Ok(json) = std::env::var(openshell_core::sandbox_env::MAIN_PROCESS_SPEC) {
+            let config = openshell_core::sandbox_env::MainProcessConfig::decode(&json)
+                .map_err(|error| miette::miette!("{error}"))?;
+            (config.command, config.tty)
         } else {
-            vec!["/bin/bash".to_string()]
+            let config = openshell_core::sandbox_env::MainProcessConfig::scratch();
+            (config.command, config.tty)
         };
 
         info!(command = ?command, "Starting sandbox");
@@ -668,9 +679,9 @@ fn main() -> Result<()> {
 
         run_sandbox(
             command,
-            args.workdir,
+            workdir,
             args.timeout,
-            args.interactive,
+            interactive,
             args.sandbox_id,
             args.sandbox,
             args.openshell_endpoint,
@@ -806,17 +817,23 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn network_init_accepts_root_proxy_uid_for_binary_aware_sidecar() {
-        validate_network_init_ids(0, openshell_policy::MIN_SANDBOX_UID).unwrap();
+        validate_network_init_ids(0, 30).unwrap();
     }
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn network_init_still_rejects_low_non_root_proxy_ids() {
+    fn network_init_still_rejects_low_non_root_proxy_uid_and_root_gid() {
         let uid_err =
             validate_network_init_ids(999, openshell_policy::MIN_SANDBOX_UID).unwrap_err();
         assert!(uid_err.to_string().contains("--proxy-uid"));
 
-        let gid_err = validate_network_init_ids(0, 999).unwrap_err();
+        let gid_err = validate_network_init_ids(0, 0).unwrap_err();
         assert!(gid_err.to_string().contains("--proxy-gid"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn network_init_accepts_non_root_system_proxy_group() {
+        validate_network_init_ids(openshell_policy::MIN_SANDBOX_PROXY_UID, 30).unwrap();
     }
 }

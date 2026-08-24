@@ -3,7 +3,7 @@
 
 #![cfg(feature = "e2e")]
 
-//! E2E coverage for starting Docker sandboxes after a standalone gateway restart.
+//! E2E coverage for reconciling Docker sandboxes after a standalone gateway restart.
 //!
 //! This intentionally targets the Docker-driver gateway started by
 //! `e2e/with-docker-gateway.sh`. Existing-endpoint E2E runs do not own the
@@ -13,7 +13,8 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use openshell_e2e::harness::cli::{
-    sandbox_names, wait_for_healthy, wait_for_sandbox_exec_contains,
+    run_cli, sandbox_names, wait_for_healthy, wait_for_sandbox_exec_contains,
+    wait_for_sandbox_phase,
 };
 use openshell_e2e::harness::gateway::ManagedGateway;
 use openshell_e2e::harness::sandbox::SandboxGuard;
@@ -21,6 +22,7 @@ use tokio::time::sleep;
 
 const MANAGED_BY_LABEL_FILTER: &str = "label=openshell.ai/managed-by=openshell";
 const READY_MARKER: &str = "gateway-start-ready";
+const STOPPED_READY_MARKER: &str = "gateway-start-stopped-ready";
 const START_FILE: &str = "/sandbox/gateway-start-state";
 const SANDBOX_NAMESPACE_LABEL: &str = "openshell.ai/sandbox-namespace";
 const SANDBOX_NAME_LABEL: &str = "openshell.ai/sandbox-name";
@@ -117,7 +119,7 @@ async fn wait_for_container_running(
 }
 
 #[tokio::test]
-async fn docker_gateway_restart_starts_running_sandbox() {
+async fn docker_gateway_restart_preserves_running_and_stopped_intent() {
     let Some(gateway) = ManagedGateway::from_env().expect("load managed e2e gateway metadata")
     else {
         eprintln!("Skipping gateway start test: e2e gateway is not managed by this test run");
@@ -155,10 +157,29 @@ async fn docker_gateway_restart_starts_running_sandbox() {
         .await
         .expect("sandbox container should be running before gateway restart");
 
-    gateway.stop().expect("stop e2e gateway");
-    wait_for_container_running(&namespace, &sandbox.name, false, Duration::from_secs(120))
+    let stopped_script = format!("echo {STOPPED_READY_MARKER}; while true; do sleep 1; done");
+    let mut stopped_sandbox =
+        SandboxGuard::create_keep(&["sh", "-lc", &stopped_script], STOPPED_READY_MARKER)
+            .await
+            .expect("create Docker sandbox that will remain stopped");
+    let (stop_output, stop_code) = run_cli(&["sandbox", "stop", &stopped_sandbox.name]).await;
+    assert_eq!(stop_code, 0, "sandbox stop should succeed:\n{stop_output}");
+    wait_for_sandbox_phase(&stopped_sandbox.name, "Stopped", Duration::from_secs(30))
         .await
-        .expect("gateway shutdown should stop managed Docker sandboxes");
+        .expect("sandbox should be stopped before gateway restart");
+    wait_for_container_running(
+        &namespace,
+        &stopped_sandbox.name,
+        false,
+        Duration::from_secs(30),
+    )
+    .await
+    .expect("stopped Docker sandbox container should not be running");
+
+    gateway.stop().expect("stop e2e gateway");
+    wait_for_container_running(&namespace, &sandbox.name, false, Duration::from_secs(30))
+        .await
+        .expect("gateway shutdown should stop a running-intent Docker sandbox");
 
     gateway.start().expect("restart e2e gateway");
     wait_for_healthy(Duration::from_secs(120))
@@ -166,7 +187,18 @@ async fn docker_gateway_restart_starts_running_sandbox() {
         .expect("gateway should become healthy after restart");
     wait_for_container_running(&namespace, &sandbox.name, true, Duration::from_secs(120))
         .await
-        .expect("gateway startup should start the Docker sandbox container");
+        .expect("gateway startup should restart the running-intent Docker sandbox container");
+    wait_for_sandbox_phase(&stopped_sandbox.name, "Stopped", Duration::from_secs(120))
+        .await
+        .expect("explicitly stopped Docker sandbox should remain stopped after restart");
+    wait_for_container_running(
+        &namespace,
+        &stopped_sandbox.name,
+        false,
+        Duration::from_secs(30),
+    )
+    .await
+    .expect("gateway startup should not start an explicitly stopped Docker sandbox");
 
     let names = sandbox_names().await.expect("list sandboxes after restart");
     assert!(
@@ -185,4 +217,5 @@ async fn docker_gateway_restart_starts_running_sandbox() {
     .expect("sandbox should become ready again with its state preserved");
 
     sandbox.cleanup().await;
+    stopped_sandbox.cleanup().await;
 }

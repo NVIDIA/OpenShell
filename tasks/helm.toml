@@ -30,12 +30,12 @@ run = """
   helm dependency build deploy/helm/openshell
   echo "--- helm lint: defaults ---"
   echo "values files: deploy/helm/openshell/values.yaml"
-  helm lint deploy/helm/openshell
+  helm lint deploy/helm/openshell --set agentSandbox.preflight.enabled=false
   for f in deploy/helm/openshell/ci/values-*.yaml; do
     variant=$(basename "$f" .yaml | sed 's/values-//')
     echo "--- helm lint: $variant ---"
     echo "values files: deploy/helm/openshell/values.yaml, $f"
-    helm lint deploy/helm/openshell -f "$f"
+    helm lint deploy/helm/openshell -f "$f" --set agentSandbox.preflight.enabled=false
   done
   echo "All variants passed."
 """

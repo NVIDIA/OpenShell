@@ -19,6 +19,7 @@ import (
 func TestSandboxFromProto(t *testing.T) {
 	userNS := true
 	gpuCount := uint32(2)
+	exitCode := int32(0)
 	proto := &pb.Sandbox{
 		Metadata: &dm.ObjectMeta{
 			Id:                  "sb-1",
@@ -56,14 +57,18 @@ func TestSandboxFromProto(t *testing.T) {
 					Count: &gpuCount,
 				},
 			},
+			Command: []string{"/opt/agent", "--serve"},
+			Tty:     false,
 		},
 		Status: &pb.SandboxStatus{
-			SandboxName:          "sb-compute-1",
-			AgentPod:             "agent-pod-xyz",
-			AgentFd:              "fd-agent",
-			SandboxFd:            "fd-sandbox",
-			Phase:                pb.SandboxPhase_SANDBOX_PHASE_READY,
-			CurrentPolicyVersion: 7,
+			SandboxName:           "sb-compute-1",
+			AgentPod:              "agent-pod-xyz",
+			AgentFd:               "fd-agent",
+			SandboxFd:             "fd-sandbox",
+			Phase:                 pb.SandboxPhase_SANDBOX_PHASE_READY,
+			CurrentPolicyVersion:  7,
+			MainProcessInstanceId: "instance-1",
+			ExitCode:              &exitCode,
 			Conditions: []*pb.SandboxCondition{
 				{
 					Type:               "Ready",
@@ -95,6 +100,8 @@ func TestSandboxFromProto(t *testing.T) {
 	assert.Equal(t, []string{"claude", "github"}, s.Spec.Providers)
 	require.NotNil(t, s.Spec.GPUCount)
 	assert.Equal(t, uint32(2), *s.Spec.GPUCount)
+	assert.Equal(t, []string{"/opt/agent", "--serve"}, s.Spec.Command)
+	assert.False(t, s.Spec.TTY)
 
 	// Template
 	require.NotNil(t, s.Spec.Template)
@@ -125,6 +132,8 @@ func TestSandboxFromProto(t *testing.T) {
 	assert.Equal(t, "AllGood", s.Status.Conditions[0].Reason)
 	assert.Equal(t, "Sandbox is ready", s.Status.Conditions[0].Message)
 	assert.Equal(t, "2024-01-01T00:00:00Z", s.Status.Conditions[0].LastTransitionTime)
+	require.NotNil(t, s.Status.ExitCode)
+	assert.Equal(t, int32(0), *s.Status.ExitCode)
 }
 
 func TestSandboxFromProto_TemplateResourcesDeepCopy(t *testing.T) {
@@ -243,6 +252,8 @@ func TestSandboxToProto(t *testing.T) {
 			},
 			Providers: []string{"prov-a"},
 			GPUCount:  &gpuCount,
+			Command:   []string{"/opt/agent", "--serve"},
+			TTY:       false,
 		},
 	}
 
@@ -263,6 +274,8 @@ func TestSandboxToProto(t *testing.T) {
 	assert.Equal(t, "info", p.Spec.LogLevel)
 	assert.Equal(t, map[string]string{"KEY": "val"}, p.Spec.Environment)
 	assert.Equal(t, []string{"prov-a"}, p.Spec.Providers)
+	assert.Equal(t, []string{"/opt/agent", "--serve"}, p.Spec.Command)
+	assert.False(t, p.Spec.Tty)
 
 	require.NotNil(t, p.Spec.ResourceRequirements)
 	require.NotNil(t, p.Spec.ResourceRequirements.Gpu)

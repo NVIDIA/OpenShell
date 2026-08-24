@@ -13,7 +13,7 @@ fn allowed_decision(intent: EgressIntent) -> EgressDecision {
         action: NetworkAction::Allow {
             matched_policy: Some("proxy_compatibility".to_string()),
         },
-        l4_policy_generation: 0,
+        policy_generation: 0,
         identity: ProcessIdentityEvidence::Available,
         endpoint: EndpointDecision::default(),
         binary: Some(PathBuf::from("/usr/bin/curl")),
@@ -279,7 +279,35 @@ fn representative_adapter_allows_preserve_ocsf_fields() {
     );
 }
 
-fn poisoned_engine() -> OpaEngine {
+#[test]
+fn missing_authorized_l7_metadata_preserves_l4_only_fallback() {
+    let decision = allowed_decision(EgressIntent::connect("target.example".to_string(), 443));
+    assert!(query_l7_route_snapshot(&decision, "target.example", 443).is_none());
+}
+
+#[test]
+fn missing_authorized_tls_metadata_preserves_auto_fallback() {
+    let decision = allowed_decision(EgressIntent::connect("target.example".to_string(), 443));
+    assert_eq!(
+        query_tls_mode(&decision, "target.example", 443),
+        crate::l7::TlsMode::Auto
+    );
+}
+
+#[test]
+fn missing_authorized_allowed_ips_preserves_empty_fallback() {
+    let decision = allowed_decision(EgressIntent::connect("target.example".to_string(), 443));
+    assert!(query_allowed_ips(&decision).is_empty());
+}
+
+#[test]
+fn missing_authorized_exact_host_preserves_false_fallback() {
+    let decision = allowed_decision(EgressIntent::connect("target.example".to_string(), 443));
+    assert!(!decision.endpoint.exact_declared_host);
+}
+
+#[test]
+fn authoritative_evaluation_error_denies_without_metadata_fallback() {
     let engine = OpaEngine::from_strings(
         include_str!("../../../data/sandbox-policy.rego"),
         r#"
@@ -287,57 +315,29 @@ network_policies:
   proxy_compatibility:
     name: proxy_compatibility
     endpoints:
-      - host: target.example
+      - host: "*.example.com"
         port: 443
-        protocol: rest
-        enforcement: enforce
-        tls: skip
-        allowed_ips: ["10.0.0.0/8"]
-        rules:
-          - allow: { method: GET, path: "/**" }
     binaries:
-      - path: /usr/bin/curl
+      - path: /**
 "#,
     )
     .unwrap();
-    engine.poison_lock_for_test();
-    engine
-}
 
-#[test]
-fn l7_query_failure_preserves_l4_only_fallback() {
-    let engine = poisoned_engine();
-    let decision = allowed_decision(EgressIntent::connect("target.example".to_string(), 443));
-    assert!(query_l7_route_snapshot(&engine, &decision, "target.example", 443).is_none());
-}
-
-#[test]
-fn tls_query_failure_preserves_auto_fallback() {
-    let engine = poisoned_engine();
-    let decision = allowed_decision(EgressIntent::connect("target.example".to_string(), 443));
-    assert_eq!(
-        query_tls_mode(&engine, &decision, "target.example", 443),
-        crate::l7::TlsMode::Auto
-    );
-}
-
-#[test]
-fn allowed_ips_query_failure_preserves_empty_fallback() {
-    let engine = poisoned_engine();
-    let decision = allowed_decision(EgressIntent::connect("target.example".to_string(), 443));
-    assert!(query_allowed_ips(&engine, &decision, "target.example", 443).is_empty());
-}
-
-#[test]
-fn exact_host_query_failure_preserves_false_fallback() {
-    let engine = poisoned_engine();
-    let decision = allowed_decision(EgressIntent::connect("target.example".to_string(), 443));
-    assert!(!query_exact_declared_endpoint_host(
+    // Regorus rejects the NUL byte used internally by its glob matcher. The
+    // combined authorization query must deny rather than preserve the old
+    // multi-query behavior that could fall back to an L4-only allow.
+    let decision = evaluate_endpoint_only_opa(
         &engine,
-        &decision,
-        "target.example",
-        443
-    ));
+        EgressIntent::connect("sub\0.example.com".to_string(), 443),
+    );
+
+    let NetworkAction::Deny { reason } = decision.action else {
+        panic!("evaluation errors must deny the request");
+    };
+    assert!(reason.starts_with("policy evaluation error:"));
+    assert!(decision.endpoint.policy_configs.is_empty());
+    assert!(decision.endpoint.matched_endpoints.is_empty());
+    assert!(decision.endpoint.destination.is_none());
 }
 
 #[test]

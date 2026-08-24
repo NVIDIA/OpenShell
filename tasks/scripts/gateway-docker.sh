@@ -120,6 +120,25 @@ SUPERVISOR_TARGET="$(linux_target_triple "${DAEMON_ARCH}")"
 SUPERVISOR_OUT_DIR="${STATE_DIR}/supervisor/${DAEMON_ARCH}"
 SUPERVISOR_BIN="${SUPERVISOR_OUT_DIR}/openshell-sandbox"
 
+install_supervisor_binary() {
+  local source=$1
+  local staged
+
+  # A running sandbox may execute a bind-mounted copy of SUPERVISOR_BIN.
+  # Replacing its directory entry keeps that old inode alive for the running
+  # container without truncating it, while new containers see this build.
+  mkdir -p "${SUPERVISOR_OUT_DIR}"
+  staged="$(mktemp "${SUPERVISOR_OUT_DIR}/.openshell-sandbox.XXXXXX")"
+  if ! cp "${source}" "${staged}" || ! chmod 0755 "${staged}"; then
+    rm -f -- "${staged}"
+    return 1
+  fi
+  if ! mv -f -- "${staged}" "${SUPERVISOR_BIN}"; then
+    rm -f -- "${staged}"
+    return 1
+  fi
+}
+
 CARGO_BUILD_JOBS_ARG=()
 if [[ -n "${CARGO_BUILD_JOBS:-}" ]]; then
   CARGO_BUILD_JOBS_ARG=(-j "${CARGO_BUILD_JOBS}")
@@ -143,8 +162,8 @@ if [[ "${HOST_OS}" == "Linux" && "${HOST_ARCH}" == "${DAEMON_ARCH}" ]]; then
   rustup target add "${SUPERVISOR_TARGET}" >/dev/null 2>&1 || true
   cargo build ${CARGO_BUILD_JOBS_ARG[@]+"${CARGO_BUILD_JOBS_ARG[@]}"} \
     -p openshell-sandbox --target "${SUPERVISOR_TARGET}"
-  mkdir -p "${SUPERVISOR_OUT_DIR}"
-  cp "${ROOT}/target/${SUPERVISOR_TARGET}/debug/openshell-sandbox" "${SUPERVISOR_BIN}"
+  install_supervisor_binary \
+    "${ROOT}/target/${SUPERVISOR_TARGET}/debug/openshell-sandbox"
 else
   # Cross-compile through the prebuilt-binary staging helper, then use the
   # supervisor stage to extract just the openshell-sandbox binary.
@@ -153,17 +172,25 @@ else
   # container-engine helper to docker — otherwise it auto-detects podman
   # whenever the binary happens to be on PATH.
   mkdir -p "${SUPERVISOR_OUT_DIR}"
-  CONTAINER_ENGINE=docker \
-  DOCKER_PLATFORM="linux/${DAEMON_ARCH}" \
-  DOCKER_OUTPUT="type=local,dest=${SUPERVISOR_OUT_DIR}" \
-    bash "${ROOT}/tasks/scripts/docker-build-image.sh" supervisor-output
+  SUPERVISOR_BUILD_DIR="$(mktemp -d "${SUPERVISOR_OUT_DIR}/.build.XXXXXX")"
+  if ! CONTAINER_ENGINE=docker \
+    DOCKER_PLATFORM="linux/${DAEMON_ARCH}" \
+    DOCKER_OUTPUT="type=local,dest=${SUPERVISOR_BUILD_DIR}" \
+      bash "${ROOT}/tasks/scripts/docker-build-image.sh" supervisor-output; then
+    rm -rf -- "${SUPERVISOR_BUILD_DIR}"
+    exit 1
+  fi
+  if ! install_supervisor_binary "${SUPERVISOR_BUILD_DIR}/openshell-sandbox"; then
+    rm -rf -- "${SUPERVISOR_BUILD_DIR}"
+    exit 1
+  fi
+  rm -rf -- "${SUPERVISOR_BUILD_DIR}"
 fi
 
 if [[ ! -f "${SUPERVISOR_BIN}" ]]; then
   echo "ERROR: expected supervisor binary at ${SUPERVISOR_BIN}" >&2
   exit 1
 fi
-chmod +x "${SUPERVISOR_BIN}"
 
 mkdir -p "${STATE_DIR}"
 CONFIG_PATH="${STATE_DIR}/gateway.toml"

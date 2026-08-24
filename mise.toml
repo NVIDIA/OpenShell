@@ -22,7 +22,7 @@ lockfile_platforms = ["linux-x64", "linux-arm64", "macos-arm64", "windows-x64"]
 python = "3.14.5"
 rust = "1.95.0"
 node = "24.15.0"
-kubectl = "1.36.1"
+kubectl = { version = "1.36.1", version_prefix = "v" }
 uv = "0.10.12"
 protoc = "29.6"
 go = "1.26"
@@ -31,9 +31,9 @@ go = "1.26"
 "go:google.golang.org/grpc/cmd/protoc-gen-go-grpc" = "1.6.2"
 "go:golang.org/x/tools/cmd/goimports" = "0.48.0"
 buf = "1.72.0"
-helm = "4.2.0"
+helm = { version = "4.2.0", version_prefix = "v" }
 helm-docs = "1.14.2"
-skaffold = { version = "2.20.0", os = ["linux", "macos"] }
+skaffold = { version = "2.20.0", os = ["linux", "macos"], version_prefix = "v" }
 # Keep k3d out of Linux CI images until upstream ships a release rebuilt with
 # patched Go/container dependencies. Linux Kubernetes E2E uses kind or an
 # externally provided cluster context.

@@ -1772,6 +1772,15 @@ def test_sandbox_ref_retains_gateway_labels() -> None:
     assert dict(ref.labels) == {"aiq": "deep-research", "env": "dev"}
 
 
+def test_sandbox_ref_includes_main_process_result() -> None:
+    proto = _make_sandbox_proto("sandbox-1", "job-1")
+    proto.status.exit_code = 0
+
+    status = _sandbox_ref(proto).status
+
+    assert status.exit_code == 0
+
+
 def test_returned_labels_are_immutable() -> None:
     proto = _make_sandbox_proto("sandbox-1", "job-1", {"aiq": "deep-research"})
     ref = _sandbox_ref(proto)

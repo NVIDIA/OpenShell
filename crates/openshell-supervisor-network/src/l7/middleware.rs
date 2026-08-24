@@ -480,6 +480,7 @@ pub async fn apply_middleware_chain_for_scheme<C: AsyncRead + AsyncWrite + Unpin
         // unresolved binding is handled before the body is read) and forward
         // the original request unchanged if the chain allows.
         let input = middleware_request_input(
+            openshell_ocsf::ctx::ctx(),
             scheme,
             &req,
             ctx,
@@ -525,6 +526,7 @@ pub async fn apply_middleware_chain_for_scheme<C: AsyncRead + AsyncWrite + Unpin
     let headers = safe_middleware_headers(&buffered.headers)?;
     let query = raw_query_from_request_headers(&buffered.headers)?;
     let input = middleware_request_input(
+        openshell_ocsf::ctx::ctx(),
         scheme,
         &req,
         ctx,
@@ -607,7 +609,9 @@ pub async fn send_middleware_admission_exhausted_response<
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn middleware_request_input(
+    sandbox: &openshell_ocsf::SandboxContext,
     scheme: &str,
     req: &crate::l7::provider::L7Request,
     ctx: &L7EvalContext,
@@ -618,7 +622,9 @@ pub(super) fn middleware_request_input(
 ) -> openshell_supervisor_middleware::HttpRequestInput {
     openshell_supervisor_middleware::HttpRequestInput {
         request_id: uuid::Uuid::new_v4().to_string(),
-        sandbox_id: openshell_ocsf::ctx::ctx().sandbox_id.clone(),
+        sandbox_id: sandbox.sandbox_id.clone(),
+        sandbox_name: sandbox.sandbox_name.clone(),
+        workspace: ctx.workspace.clone(),
         scheme: scheme.into(),
         host: ctx.host.clone(),
         port: ctx.port,
@@ -1077,6 +1083,53 @@ mod tests {
         assert!(body.get("rule_missing").is_none());
         assert!(body.get("next_steps").is_none());
         assert!(!body.to_string().contains("secret-value"));
+    }
+
+    #[test]
+    fn middleware_input_carries_real_sandbox_name() {
+        let sandbox = openshell_ocsf::SandboxContext {
+            sandbox_id: "sbx-123".into(),
+            sandbox_name: "nightly-build".into(),
+            container_image: String::new(),
+            hostname: "h".into(),
+            product_version: "0".into(),
+            proxy_ip: [127, 0, 0, 1].into(),
+            proxy_port: 3128,
+        };
+
+        let eval = L7EvalContext {
+            host: "api.example.test".into(),
+            port: 443,
+            workspace: "wrks-default".into(),
+            policy_name: "api-policy".into(),
+            binary_path: "/usr/bin/curl".into(),
+            ancestors: Vec::new(),
+            cmdline_paths: Vec::new(),
+            secret_resolver: None,
+            ..Default::default()
+        };
+        let req = crate::l7::provider::L7Request {
+            action: "POST".into(),
+            target: "/v1/messages".into(),
+            query_params: std::collections::HashMap::new(),
+            raw_header: Vec::new(),
+            body_length: crate::l7::provider::BodyLength::None,
+        };
+
+        let input = super::middleware_request_input(
+            &sandbox,
+            "https",
+            &req,
+            &eval,
+            Vec::new(),
+            Vec::new(),
+            String::new(),
+            Vec::new(),
+        );
+
+        assert_eq!(input.sandbox_name, "nightly-build");
+        assert_eq!(input.sandbox_id, "sbx-123");
+        assert_eq!(input.workspace, "wrks-default");
     }
 
     #[tokio::test]

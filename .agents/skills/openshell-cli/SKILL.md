@@ -70,7 +70,9 @@ The simplest way to get a sandbox running:
 openshell sandbox create
 ```
 
-This creates a sandbox with defaults and drops you into an interactive shell.
+This creates a sandbox whose canonical main process is `/bin/bash -l` and
+attaches your terminal to that retained process. Add `--detach` to return after
+the sandbox becomes ready without attaching.
 
 When supplying `--name`, use a portable DNS-1123 label: at most 63 lowercase alphanumeric or `-` characters, beginning and ending with an alphanumeric character. The Kubernetes driver rejects uppercase letters, underscores, dots, and other names that cannot become Kubernetes resource labels.
 
@@ -180,6 +182,31 @@ openshell provider refresh rotate my-outlook --credential-key MS_GRAPH_ACCESS_TO
 
 Prefer `--secret-material-env KEY[=ENVVAR]` for secret refresh material. `--material KEY=VALUE` is for non-secret material; `--secret-material-key` marks supplied material keys as secret.
 
+The gateway stores secret refresh material through its active credential driver.
+With Vault selected, refresh tokens, client secrets, and private keys live in
+Vault alongside injectable provider credentials; refresh state contains only
+opaque handles. A credential-backend read or write failure makes refresh fail
+closed rather than falling back to inline storage. Before OpenShell 0.1.0, the
+gateway does not migrate legacy inline refresh material or move secrets between
+credential backends. Reconfigure affected grants after upgrading, and remove or
+reconfigure credentials while the original backend remains available before
+changing backends. Do not run mixed gateway versions against the same refresh
+records.
+
+Gateway-managed refresh credentials use an identity-stable workload handle.
+Routine automatic refresh and `provider refresh rotate` update the access token
+behind that handle, so long-running processes do not need to restart. Running
+processes must be restarted once when upgrading from revision-scoped
+placeholders. A later `provider refresh configure` call is an explicit
+reauthorization boundary: it revokes the previous handle, and processes holding
+that handle fail closed until restarted.
+
+While gateway-managed refresh is configured, `provider update --credential`
+cannot replace or delete the refresh-owned primary credential or any co-minted
+output. Use `provider refresh rotate`, reconfigure refresh, or delete refresh
+before returning those keys to manual management. Unrelated provider fields
+remain updateable.
+
 ---
 
 ## Workflow 3: Sandbox Lifecycle
@@ -205,12 +232,18 @@ Key flags:
 - `--driver-config-json`: Pass experimental driver-specific sandbox configuration
 - `--label KEY=VALUE`: Add labels for later selection (repeatable)
 - `--env KEY=VALUE`: Set non-secret sandbox environment variables (repeatable); use `--provider` for credentials
+- `--tty`: Allocate a retained PTY for the canonical main process
 - `--approval-mode manual|auto`: Control handling of agent-authored policy proposals; `manual` is the default
 - `--upload <PATH>[:<DEST>]`: Upload local files into the container working directory or an explicit destination
 - `--no-git-ignore`: Disable `.gitignore` filtering for uploads
 - `--no-keep`: Delete the sandbox after the initial command or shell exits
+- `--detach`: Start the canonical main process without attaching
 - `--forward [BIND_ADDRESS:]PORT`: Forward a local port and keep the sandbox alive
 - `--editor vscode|cursor`: Open a remote editor after creation and keep the sandbox alive
+
+Do not combine `--upload` with a trailing main command. Uploads currently finish
+after the canonical process starts; create a scratch sandbox and use
+`sandbox exec`, or build the files into the image.
 
 ### List and inspect sandboxes
 
@@ -229,7 +262,12 @@ openshell sandbox connect my-sandbox
 openshell sandbox connect my-sandbox --editor vscode
 ```
 
-Opens an interactive SSH shell. To configure VS Code Remote-SSH:
+Attaches to the sandbox's existing canonical main process. Disconnecting leaves
+that process running; reconnecting targets the same process instance and replays
+recent output. Use `sandbox exec --tty -- /bin/bash -l` for a new shell. Press
+`Ctrl-P`, then `Ctrl-Q` to disconnect without terminating main. `Ctrl-C` retains
+its normal terminal behavior and interrupts the foreground process. Configure
+VS Code Remote-SSH with:
 
 ```bash
 openshell sandbox ssh-config my-sandbox >> ~/.ssh/config
@@ -262,7 +300,9 @@ openshell sandbox exec --name my-sandbox --workdir /workspace -- ls -la
 openshell sandbox exec --name my-sandbox --env MODE=test -- cargo test
 ```
 
-`sandbox exec` streams output and exits with the remote command's exit code. Use `sandbox connect` for an interactive shell.
+`sandbox exec` starts an independent sibling process, streams output, and exits
+with the remote command's exit code. Use `sandbox connect` to attach to the
+canonical main process.
 Use `--env` only for non-secret values. Attach credentials to the sandbox with a
 provider instead of passing API keys, tokens, or other secrets to `sandbox exec`.
 
@@ -320,6 +360,11 @@ stopped. Delete remains the operation that removes retained state.
 This is the most important multi-step workflow. It enables a tight feedback cycle where sandbox policy is refined based on observed activity.
 
 **Key concept**: Policies have static fields (immutable after creation: `filesystem_policy`, `landlock`, `process`) and two dynamic fields: `network_policies` and `network_middlewares`. Both dynamic fields can be updated without recreating the sandbox.
+
+An endpoint with omitted `protocol` retains explicit-proxy behavior. Explicit
+`protocol: tcp` requests policy DNS and transparent TCP and currently requires
+the Docker or Podman runtime; unsupported runtimes reject the policy before starting the
+workload rather than activating only part of the network contract.
 
 ```
 Create sandbox with initial policy
@@ -448,7 +493,7 @@ Avoid `--yes` during interactive work. A global policy locks policy control for 
 
 ### Review agent-authored rule proposals
 
-Sandboxes created with `--approval-mode manual` place every proposal in the review inbox. `auto` approves only proposals with an empty prover delta; findings still require review.
+Sandboxes created with `--approval-mode manual` place every proposal in the review inbox. `auto` approves only valid effective-policy candidates with an empty prover delta; findings still require review. The CLI binds approval to the candidate's current review token. If live policy, provider, or credential inputs change, approval leaves the chunk pending with a refreshed candidate and requires a fresh review.
 
 ```bash
 openshell rule get dev --status pending
@@ -457,7 +502,7 @@ openshell rule reject dev --chunk-id <chunk-id> --reason "too broad"
 openshell rule history dev
 ```
 
-Review the proposed scope and prover findings before approval. Treat `rule approve-all --include-security-flagged` as a high-risk bulk action.
+Review the proposed scope, candidate hash, prover findings, and application errors before approval. Treat `rule approve-all --include-security-flagged` as a high-risk bulk action.
 
 ---
 
@@ -479,7 +524,10 @@ For Docker and Podman gateways, custom images should declare a non-root OCI
 `USER`. Each explicit `process.run_as_user` or `process.run_as_group` policy
 field wins independently; omitted fields fall back to the image declaration.
 An image with no `USER` fails before readiness unless policy supplies both
-fields.
+fields. Explicit numeric fields may use any UID/GID from `1` through
+`4294967294`; `0` is root and `4294967295` is the invalid identity sentinel.
+Warn users that low IDs can inherit permissions from matching accounts, image
+files, mounted volumes, or devices.
 
 ### Forward ports
 

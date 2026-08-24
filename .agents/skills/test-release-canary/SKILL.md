@@ -89,6 +89,8 @@ The `kubernetes` job can be reproduced on any machine with Docker and `mise inst
 ```shell
 kind create cluster --name release-canary-local
 
+bash e2e/support/install-agent-sandbox.sh
+
 helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart \
   --version 0.0.0-dev \
   --namespace openshell --create-namespace \

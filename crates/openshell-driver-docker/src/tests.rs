@@ -5,7 +5,7 @@ use super::*;
 use openshell_core::config::DEFAULT_SERVER_PORT;
 use openshell_core::driver_utils::{
     LABEL_MANAGED_BY, LABEL_MANAGED_BY_VALUE, LABEL_SANDBOX_ID, LABEL_SANDBOX_NAME,
-    LABEL_SANDBOX_NAMESPACE,
+    LABEL_SANDBOX_NAMESPACE, supervisor_cache_path_with_base,
 };
 use openshell_core::progress::{
     PROGRESS_ACTIVE_DETAIL_KEY, PROGRESS_ACTIVE_STEP_KEY, PROGRESS_COMPLETE_LABEL_KEY,
@@ -45,6 +45,8 @@ fn test_sandbox() -> DriverSandbox {
             }),
             resource_requirements: None,
             sandbox_token: String::new(),
+            command: Vec::new(),
+            tty: false,
         }),
         status: None,
         workspace: String::new(),
@@ -618,7 +620,38 @@ fn build_environment_sets_docker_tls_paths() {
     assert!(env.contains(&format!("OPENSHELL_TLS_KEY={TLS_KEY_MOUNT_PATH}")));
     assert!(env.contains(&"TEMPLATE_ENV=template".to_string()));
     assert!(env.contains(&"SPEC_ENV=spec".to_string()));
-    assert!(env.contains(&"OPENSHELL_SANDBOX_COMMAND=sleep infinity".to_string()));
+    assert!(env.contains(&format!(
+        "{}={}",
+        openshell_core::sandbox_env::NETWORK_RUNTIME_CAPABILITIES,
+        openshell_core::sandbox_env::POLICY_DNS_TRANSPARENT_TCP_CAPABILITY
+    )));
+    let encoded = env
+        .iter()
+        .find_map(|entry| {
+            entry
+                .strip_prefix("OPENSHELL_MAIN_PROCESS_SPEC=")
+                .map(str::to_string)
+        })
+        .expect("main-process transport");
+    let main = openshell_core::sandbox_env::MainProcessConfig::decode(&encoded).unwrap();
+    assert_eq!(main.command, vec!["/bin/bash", "-l"]);
+    assert!(main.tty);
+}
+
+#[test]
+fn build_environment_keeps_network_capabilities_driver_controlled() {
+    let mut sandbox = test_sandbox();
+    sandbox.spec.as_mut().unwrap().environment.insert(
+        openshell_core::sandbox_env::NETWORK_RUNTIME_CAPABILITIES.to_string(),
+        "spoofed".to_string(),
+    );
+    let env = build_environment(&sandbox, &runtime_config());
+    assert!(env.contains(&format!(
+        "{}={}",
+        openshell_core::sandbox_env::NETWORK_RUNTIME_CAPABILITIES,
+        openshell_core::sandbox_env::POLICY_DNS_TRANSPARENT_TCP_CAPABILITY
+    )));
+    assert!(!env.iter().any(|entry| entry.ends_with("=spoofed")));
 }
 
 #[test]
@@ -2245,7 +2278,7 @@ fn validate_linux_elf_binary_rejects_non_elf_files() {
     fs::write(&path, b"not-elf").unwrap();
 
     let err = validate_linux_elf_binary(&path).unwrap_err();
-    assert!(err.to_string().contains("Linux ELF executable"));
+    assert!(err.contains("Linux ELF executable"));
 }
 
 #[test]
@@ -2451,8 +2484,11 @@ fn docker_supervisor_image_refreshes_mutable_tags_only() {
 #[test]
 fn supervisor_cache_path_namespaces_by_digest_under_openshell_data_dir() {
     let base = PathBuf::from("/var/cache/share");
-    let path =
-        supervisor_cache_path_with_base(&base, "sha256:abc123deadbeef0123456789cafe0123456789fe");
+    let path = supervisor_cache_path_with_base(
+        &base,
+        "docker-supervisor",
+        "sha256:abc123deadbeef0123456789cafe0123456789fe",
+    );
 
     assert_eq!(
         path,
@@ -2465,8 +2501,8 @@ fn supervisor_cache_path_namespaces_by_digest_under_openshell_data_dir() {
 #[test]
 fn supervisor_cache_path_isolates_different_digests() {
     let base = PathBuf::from("/data");
-    let left = supervisor_cache_path_with_base(&base, "sha256:aaaaaaaa");
-    let right = supervisor_cache_path_with_base(&base, "sha256:bbbbbbbb");
+    let left = supervisor_cache_path_with_base(&base, "docker-supervisor", "sha256:aaaaaaaa");
+    let right = supervisor_cache_path_with_base(&base, "docker-supervisor", "sha256:bbbbbbbb");
     assert_ne!(
         left.parent().unwrap(),
         right.parent().unwrap(),

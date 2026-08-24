@@ -53,6 +53,7 @@ DRIVER_BIN="${OPENSHELL_VM_DRIVER_BIN:-${ROOT}/target/debug/openshell-driver-vm}
 CLI_BIN="${OPENSHELL_BIN:-${ROOT}/target/debug/openshell}"
 E2E_TEST_OVERRIDE="${OPENSHELL_E2E_VM_TEST:-}"
 E2E_FEATURES="${OPENSHELL_E2E_VM_FEATURES:-e2e-vm}"
+SANDBOX_IMAGE="${OPENSHELL_SANDBOX_IMAGE:-${COMMUNITY_SANDBOX_IMAGE:-ghcr.io/nvidia/openshell-community/sandboxes/base:latest}}"
 
 # The VM driver places `compute-driver.sock` under `[openshell.drivers.vm].state_dir`.
 # AF_UNIX SUN_LEN is 104 bytes on macOS (108 on Linux), so paths anchored
@@ -97,7 +98,14 @@ fi
 
 build_packages=()
 if [ -z "${OPENSHELL_GATEWAY_BIN:-}" ]; then
-  build_packages+=(-p openshell-server)
+  if [ "${OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" = "1" ]; then
+    echo "==> Building driver-free openshell-gateway"
+    cargo build \
+      -p openshell-server --bin openshell-gateway \
+      --no-default-features --features telemetry
+  else
+    build_packages+=(-p openshell-server)
+  fi
 else
   echo "==> Using prebuilt openshell-gateway at ${GATEWAY_BIN}"
 fi
@@ -165,6 +173,9 @@ GATEWAY_DB="${RUN_STATE_DIR}/gateway.db"
 JWT_DIR="${RUN_STATE_DIR}/jwt"
 PKI_DIR="${RUN_STATE_DIR}/pki"
 GATEWAY_NAME="openshell-e2e-vm-${HOST_PORT}"
+DRIVER_PID=""
+DRIVER_LOG="${RUN_STATE_DIR}/vm-driver.log"
+DRIVER_SOCKET="${RUN_STATE_DIR}/compute-driver.sock"
 
 # ── Cleanup (trap) ───────────────────────────────────────────────────
 
@@ -188,6 +199,7 @@ cleanup() {
     kill -KILL "${gateway_pid}" 2>/dev/null || true
     wait "${gateway_pid}" 2>/dev/null || true
   fi
+  e2e_stop_process "${DRIVER_PID}" "external VM compute driver"
 
   # On failure, keep the VM console log for debugging. We deliberately
   # print it instead of leaving it on disk because the state dir gets
@@ -196,6 +208,11 @@ cleanup() {
     echo "=== gateway log (preserved for debugging) ==="
     cat "${GATEWAY_LOG}" 2>/dev/null || true
     echo "=== end gateway log ==="
+    if [ -f "${DRIVER_LOG}" ]; then
+      echo "=== external VM compute driver log ==="
+      cat "${DRIVER_LOG}" 2>/dev/null || true
+      echo "=== end external VM compute driver log ==="
+    fi
 
     local console
     while IFS= read -r -d '' console; do
@@ -261,6 +278,11 @@ gateway_id = "${GATEWAY_NAME}"
 ttl_secs = 0
 
 [openshell.drivers.vm]
+EOF
+if [ "${OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" = "1" ]; then
+  printf 'socket_path = "%s"\n' "${DRIVER_SOCKET}" >>"${GATEWAY_CONFIG}"
+else
+  cat >>"${GATEWAY_CONFIG}" <<EOF
 grpc_endpoint = "https://host.openshell.internal:${HOST_PORT}"
 driver_dir = "${DRIVER_DIR}"
 state_dir = "${RUN_STATE_DIR}"
@@ -268,6 +290,23 @@ guest_tls_ca = "${PKI_DIR}/ca.crt"
 guest_tls_cert = "${PKI_DIR}/client/tls.crt"
 guest_tls_key = "${PKI_DIR}/client/tls.key"
 EOF
+fi
+
+if [ "${OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" = "1" ]; then
+  "${DRIVER_BIN}" \
+    --bind-socket "${DRIVER_SOCKET}" \
+    --allow-same-uid-peer \
+    --openshell-endpoint "https://host.openshell.internal:${HOST_PORT}" \
+    --default-image "${SANDBOX_IMAGE}" \
+    --state-dir "${RUN_STATE_DIR}" \
+    --guest-tls-ca "${PKI_DIR}/ca.crt" \
+    --guest-tls-cert "${PKI_DIR}/client/tls.crt" \
+    --guest-tls-key "${PKI_DIR}/client/tls.key" \
+    >"${DRIVER_LOG}" 2>&1 &
+  DRIVER_PID=$!
+  e2e_wait_for_socket \
+    "${DRIVER_SOCKET}" "${DRIVER_PID}" "external VM compute driver" 60
+fi
 
 GATEWAY_ARGS=(
   --config "${GATEWAY_CONFIG}"

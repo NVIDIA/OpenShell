@@ -198,6 +198,9 @@ backend = "go:google.golang.org/protobuf/cmd/protoc-gen-go"
 version = "4.2.0"
 backend = "aqua:helm/helm"
 
+[tools.helm.options]
+"vars.version_prefix" = "v"
+
 [tools.helm."platforms.linux-arm64"]
 checksum = "sha256:1f8de130dfbd04de64978e7b852a7a547be1404956a366608276d2520b678670"
 url = "https://get.helm.sh/helm-v4.2.0-linux-arm64.tar.gz"
@@ -265,6 +268,9 @@ url_api = "https://api.github.com/repos/k3d-io/k3d/releases/assets/229450011"
 [[tools.kubectl]]
 version = "1.36.1"
 backend = "aqua:kubernetes/kubernetes/kubectl"
+
+[tools.kubectl.options]
+"vars.version_prefix" = "v"
 
 [tools.kubectl."platforms.linux-arm64"]
 checksum = "sha256:59f7ee8e477fae658447607dc3c8790ac17a1b016c01c622c12070e969e2d4e7"
@@ -365,18 +371,19 @@ backend = "core:rust"
 version = "2.20.0"
 backend = "aqua:GoogleContainerTools/skaffold"
 
+[tools.skaffold.options]
+"vars.version_prefix" = "v"
+
 [tools.skaffold."platforms.linux-arm64"]
 url = "https://storage.googleapis.com/skaffold/releases/v2.20.0/skaffold-linux-arm64"
 
 [tools.skaffold."platforms.linux-x64"]
-checksum = "blake3:4de6b14984ff1c7e5f107dd12d15890feb4b6600032d61158162c243a81d9156"
 url = "https://storage.googleapis.com/skaffold/releases/v2.20.0/skaffold-linux-amd64"
 
 [tools.skaffold."platforms.macos-arm64"]
 url = "https://storage.googleapis.com/skaffold/releases/v2.20.0/skaffold-darwin-arm64"
 
 [tools.skaffold."platforms.windows-x64"]
-checksum = "blake3:f6db036671e29118d0fdc4457dc563e99d7bff8a39f0f2f72e3e5d857d9013a3"
 url = "https://storage.googleapis.com/skaffold/releases/v2.20.0/skaffold-windows-amd64.exe"
 
 [[tools.uv]]

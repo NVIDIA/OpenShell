@@ -74,7 +74,8 @@ Both commands build the `gateway` and `supervisor` images and deploy the OpenShe
 chart. The sidecar profile renders an `openshell-network-init` init container for
 nftables setup and an `openshell-supervisor-network` runtime sidecar for proxying.
 Binary-aware policy mode runs that sidecar as UID 0 with `SYS_PTRACE` and
-`DAC_READ_SEARCH`; relaxed mode can run it as the configured proxy UID. The
+`DAC_READ_SEARCH`; relaxed mode can run it as the configured proxy UID, which
+must be at least `1000` and distinct from the workload UID. The
 sidecar-mTLS profile reuses `ci/values-sidecar.yaml` and restores
 `server.disableTls=false` inline for Skaffold. The `pkiInitJob` hook (a pre-install
 Job that runs `openshell-gateway generate-certs`) generates mTLS secrets on first

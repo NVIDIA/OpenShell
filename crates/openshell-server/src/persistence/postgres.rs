@@ -321,6 +321,50 @@ ON CONFLICT (object_type, workspace, name) WHERE name IS NOT NULL DO UPDATE SET
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_scoped(
+        &self,
+        object_type: &str,
+        id: &str,
+        name: &str,
+        workspace: &str,
+        scope: &str,
+        payload: &[u8],
+        labels: Option<&str>,
+    ) -> PersistenceResult<WriteResult> {
+        let now_ms = current_time_ms();
+        let labels_jsonb: Option<serde_json::Value> = labels
+            .map(serde_json::from_str)
+            .transpose()
+            .map_err(|e| PersistenceError::Encode(format!("invalid labels JSON: {e}")))?;
+
+        let row = sqlx::query(
+            r"
+INSERT INTO objects (object_type, id, name, workspace, scope, payload, created_at_ms, updated_at_ms, labels, resource_version)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $7, COALESCE($8, '{}'::jsonb), 1)
+RETURNING resource_version, created_at_ms, updated_at_ms
+",
+        )
+        .bind(object_type)
+        .bind(id)
+        .bind(name)
+        .bind(workspace)
+        .bind(scope)
+        .bind(payload)
+        .bind(now_ms)
+        .bind(labels_jsonb)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| map_db_error(&e))?;
+
+        let resource_version_i64: i64 = row.try_get("resource_version").unwrap_or(1);
+        Ok(WriteResult {
+            resource_version: resource_version_i64.max(1).cast_unsigned(),
+            created_at_ms: row.get("created_at_ms"),
+            updated_at_ms: row.get("updated_at_ms"),
+        })
+    }
+
     pub async fn get(
         &self,
         object_type: &str,
@@ -1157,6 +1201,28 @@ WHERE object_type = $1 AND id = $2 AND status = 'pending'
         .bind(id)
         .bind(payload)
         .bind(record.last_seen_ms)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| map_db_error(&e))?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    pub async fn update_draft_chunk_evaluation(
+        &self,
+        chunk: &DraftChunkRecord,
+    ) -> PersistenceResult<bool> {
+        let payload = draft_chunk_payload_from_record(chunk)?;
+        let result = sqlx::query(
+            r#"
+UPDATE "objects"
+SET "payload" = $3, "updated_at_ms" = $4
+WHERE "object_type" = $1 AND "id" = $2 AND "status" IN ('pending', 'rejected')
+"#,
+        )
+        .bind(DRAFT_CHUNK_OBJECT_TYPE)
+        .bind(&chunk.id)
+        .bind(payload)
+        .bind(chunk.last_seen_ms)
         .execute(&self.pool)
         .await
         .map_err(|e| map_db_error(&e))?;

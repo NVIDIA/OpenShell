@@ -100,6 +100,13 @@ fn workspace_proto(name: &str, phase: proto::datamodel::v1::WorkspacePhase) -> p
 
 #[tonic::async_trait]
 impl OpenShell for TestOpenShell {
+    async fn report_main_process_exit(
+        &self,
+        _request: tonic::Request<proto::ReportMainProcessExitRequest>,
+    ) -> Result<Response<proto::ReportMainProcessExitResponse>, Status> {
+        Err(Status::unimplemented("not used by this test server"))
+    }
+
     async fn get_current_user(
         &self,
         _request: tonic::Request<proto::GetCurrentUserRequest>,
@@ -500,6 +507,13 @@ impl OpenShell for TestOpenShell {
         _: tonic::Request<proto::GetGatewayConfigRequest>,
     ) -> Result<Response<proto::GetGatewayConfigResponse>, Status> {
         Ok(Response::new(proto::GetGatewayConfigResponse::default()))
+    }
+
+    async fn exchange_provider_subject_token(
+        &self,
+        _: tonic::Request<proto::ExchangeProviderSubjectTokenRequest>,
+    ) -> Result<Response<proto::ExchangeProviderSubjectTokenResponse>, Status> {
+        Err(Status::unimplemented("unused"))
     }
 
     async fn update_config(

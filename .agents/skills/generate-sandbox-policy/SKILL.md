@@ -42,7 +42,11 @@ For this tier, default to:
 - `access: read-only` when the user says "read", "browse", "view", "query", "fetch"
 - `access: read-write` when the user says "read-write", "create", "update" (but not "delete")
 - `access: full` when the user says "full access", "everything", "unrestricted"
-- L4-only (no `protocol`) when the user says "just allow it", "pass through", "no inspection"
+- L4-only when the user says "just allow it", "pass through", or "no
+  inspection". Omit `protocol` for explicit-proxy clients. Use
+  `protocol: tcp` only when the workload must use native DNS and direct socket
+  calls, the endpoint has a valid DNS hostname, and the selected runtime
+  support (currently Docker and Podman).
 
 ### Moderate Tier (host + partial path knowledge)
 
@@ -188,7 +192,8 @@ Follow this decision tree based on the detail tier and user intent:
 ```
 Is L7 inspection needed?
 ├─ No (user wants pass-through / "just allow it")
-│   └─ Generate L4-only policy (no protocol, no tls, no rules/access)
+│   ├─ Explicit-proxy client → omit protocol
+│   └─ Native DNS/socket client with a DNS hostname on a supported runtime → protocol: tcp
 │
 └─ Yes (user wants method/path control)
     │
@@ -209,7 +214,7 @@ Is L7 inspection needed?
 | API host port | TLS setting |
 |--------------|-------------|
 | Port 443 (HTTPS) and L7 rules/preset needed | `tls: terminate` (required for inspection) |
-| Port 443 (HTTPS) and L4-only | Omit `tls` (passthrough, no L7) |
+| Port 443 (HTTPS) and L4-only | Omit `tls` (passthrough, no L7); choose omitted protocol or explicit TCP based on client/runtime as above |
 | Non-443 (HTTP) | Omit `tls` |
 
 **Critical**: `protocol: rest` on port 443 without `tls: terminate` will not work — the proxy cannot inspect encrypted traffic. Always set `tls: terminate` when combining port 443 with L7 rules.
@@ -376,7 +381,10 @@ Before presenting the policy to the user, verify correctness **and** flag breadt
 ### Hard Errors (would block sandbox startup)
 
 - [ ] `rules` and `access` are NOT both present on the same endpoint
-- [ ] If `protocol` is set, either `rules` or `access` is also present
+- [ ] If an L7 `protocol` is set, either `rules` or `access` is also present;
+      `protocol: tcp` is L4-only and must not contain either field
+- [ ] Every `protocol: tcp` endpoint has a valid DNS hostname; it is not
+      hostless, an IP literal, a trailing-dot name, or a malformed DNS selector
 - [ ] If `tls: terminate` is set, `protocol` is also set
 - [ ] `rules` list is not empty when present
 - [ ] If `protocol: sql`, `enforcement` is not `enforce`
@@ -384,6 +392,7 @@ Before presenting the policy to the user, verify correctness **and** flag breadt
 - [ ] Middleware `order` values are unique and no selected chain exceeds 10 stages
 - [ ] No fail-closed middleware selector can cover a `tls: skip` endpoint
 - [ ] Any required WebSocket control advertises `WEBSOCKET_MESSAGE/PRE_CREDENTIALS`, and the user understands that V1 does not inspect binary messages
+- [ ] Endpoints contributed by a credentialed provider are not L4-only or `tls: skip` unless `allow_uninspected_credentials: true` explicitly records the exception
 
 ### Schema Warnings (log-only, but should be fixed)
 
@@ -407,17 +416,18 @@ Evaluate the generated policy for overly broad access and **include warnings in 
 
 | Condition | Warning to show |
 |-----------|----------------|
-| **L4-only** (no `protocol`) | "This policy allows all HTTP methods and paths without inspection. The proxy will only check host:port and binary identity. Consider adding `protocol: rest` with a preset if you want method-level control." |
+| **L4-only** (no `protocol`, or `protocol: tcp`) | "This policy allows all application methods and paths without inspection. An omitted protocol uses explicit-proxy behavior; `protocol: tcp` enables policy DNS and transparent TCP only on a runtime that advertises the complete substrate (currently Docker and Podman). Consider `protocol: rest` with a preset if you want HTTP method-level control." |
 | **`access: full`** | "This policy allows all HTTP methods (including DELETE) on all paths. If you don't need DELETE, `read-write` is safer. If you only need to read, `read-only` is the most restrictive option." |
 | **`access: full` + `enforcement: audit`** | "Full access in audit mode provides no actual restriction — all traffic flows through. This is effectively a monitoring-only policy." |
 | **`access: read-write`** when user hasn't confirmed write need | "This policy allows POST, PUT, and PATCH on all paths. If you only need to read data, `read-only` is more restrictive." |
 | **Wildcard binary** (`*` or `**` in binary path) | "This policy allows any binary matching the glob pattern. A compromised or unexpected binary in that directory could use this policy. Consider listing specific binary paths." |
 | **`**` path glob** on all explicit rules | "All rules use `**` path patterns, which match any URL path. This is equivalent to a preset — consider using `access: read-only` (or similar) for clarity, or narrowing paths if you know the API structure." |
 | **Multiple broad endpoints** in one policy | "This policy grants the same broad access to N different hosts. If any of these hosts needs tighter restrictions later, you'll need to split the policy." |
-| **Hostless `allowed_ips`** (no `host` field) | "This endpoint has no `host` — any domain resolving to the allowed IP range on this port will be permitted. Consider adding a `host` field to restrict which domains can use this allowlist." |
+| **Hostless `allowed_ips`** (no `host` field and no `protocol: tcp`) | "This endpoint has no `host` — any domain resolving to the allowed IP range on this port will be permitted through the legacy proxy. Consider adding a `host` field to restrict which domains can use this allowlist." |
 | **Broad CIDR** in `allowed_ips` (e.g., `10.0.0.0/8`) | "This `allowed_ips` entry covers a very broad range. Consider narrowing to a specific subnet (e.g., `10.0.5.0/24`) to minimize exposure." |
 | **`on_error: fail_open`** | "This middleware can be bypassed when it is unavailable, rejects configuration, returns an invalid result, or exceeds its body limit. Use `fail_closed` unless availability is more important than this control." |
 | **Broad middleware host selector** | "This middleware attaches independently of the admitting network rule to every matching destination, then runs only for operation bindings its implementation advertises. Narrow `endpoints.include` or add exclusions if the attachment is not required for every matching host." |
+| **`allow_uninspected_credentials: true`** | "This endpoint may carry provider credentials on traffic OpenShell cannot inspect or rewrite. Prefer an inspected protocol and credential rewrite; keep this exception only when raw traffic is required." |
 
 Format breadth warnings clearly in the output, e.g.:
 
@@ -501,6 +511,12 @@ Docker and Podman, each omitted identity field falls back to the image's OCI
 environment. Gateway inference is configured separately through `openshell
 inference set/get`. The generated `network_policies` block is the primary
 output.
+
+When the user explicitly requests `process.run_as_user` or
+`process.run_as_group`, accept `sandbox` or a numeric UID/GID from `1` through
+`4294967294`. Reject root (`0`) and the invalid identity sentinel
+(`4294967295`). Warn that a low numeric identity inherits permissions granted
+to the same ID on image files, mounted volumes, or devices.
 
 If the user provides a file path, write to it. Otherwise, ask where to place it. A common convention is a project-local policy file (e.g., `sandbox-policy.yaml`) passed to `openshell sandbox create --policy <path>` or set via the `OPENSHELL_SANDBOX_POLICY` env var.
 

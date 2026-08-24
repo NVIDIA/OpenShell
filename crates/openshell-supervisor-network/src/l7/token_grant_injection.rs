@@ -26,6 +26,8 @@ pub struct TokenGrantRequest<'a> {
     pub audience: &'a str,
     pub scopes: &'a [String],
     pub cache_ttl_seconds: i64,
+    pub grant_type: i32,
+    pub requested_token_type: &'a str,
 }
 
 pub trait TokenGrantResolver: Send + Sync {
@@ -45,13 +47,17 @@ impl TokenGrantResolver for SpiffeTokenGrantResolver {
     ) -> Pin<Box<dyn Future<Output = Result<String>> + Send + 'a>> {
         Box::pin(async move {
             crate::token_grant::obtain_provider_token(
-                request.provider_key,
-                request.token_endpoint,
-                request.jwt_svid_audience,
-                request.client_assertion_type,
-                request.audience,
-                request.scopes,
-                request.cache_ttl_seconds,
+                crate::token_grant::ObtainProviderTokenRequest {
+                    provider_name: request.provider_key,
+                    token_endpoint: request.token_endpoint,
+                    jwt_svid_audience: request.jwt_svid_audience,
+                    client_assertion_type: request.client_assertion_type,
+                    audience: request.audience,
+                    scopes: request.scopes,
+                    cache_ttl_override: request.cache_ttl_seconds,
+                    grant_type: request.grant_type,
+                    requested_token_type: request.requested_token_type,
+                },
             )
             .await
         })
@@ -127,7 +133,7 @@ pub async fn inject_if_needed(req: L7Request, ctx: &L7EvalContext) -> Result<L7R
                     port = ctx.port,
                     provider = %provider_key,
                     error = %e,
-                    "Token grant failed"
+                    "Token grant failed: {e}"
                 );
                 let provider_key = ocsf_message_field(&provider_key);
                 ocsf_emit!(
@@ -175,6 +181,8 @@ fn token_grant_request<'a>(
         audience: &token_grant.audience,
         scopes: &token_grant.scopes,
         cache_ttl_seconds: token_grant.cache_ttl_seconds,
+        grant_type: token_grant.grant_type,
+        requested_token_type: &token_grant.requested_token_type,
     }
 }
 
@@ -348,7 +356,10 @@ fn inject_header(raw_header: &[u8], header_name: &str, header_value: &str) -> Re
 #[cfg(test)]
 pub mod test_support {
     use super::*;
-    use openshell_core::proto::{ProviderCredentialTokenGrant, ProviderProfileCredential};
+    use openshell_core::proto::{
+        ProviderCredentialTokenGrant, ProviderCredentialTokenGrantSubjectToken,
+        ProviderCredentialTokenGrantType, ProviderProfileCredential,
+    };
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
 
@@ -366,6 +377,8 @@ pub mod test_support {
         audience: String,
         scopes: Vec<String>,
         cache_ttl_seconds: i64,
+        grant_type: i32,
+        requested_token_type: String,
     }
 
     pub struct TokenGrantTestFixture {
@@ -379,11 +392,27 @@ pub mod test_support {
             Self::new(key, Ok(token))
         }
 
+        pub fn success_token_exchange(key: &str, token: &str) -> Self {
+            Self::new_with_grant(key, Ok(token), token_exchange_grant())
+        }
+
         pub fn failure(key: &str, error: &str) -> Self {
             Self::new(key, Err(error))
         }
 
+        pub fn failure_token_exchange(key: &str, error: &str) -> Self {
+            Self::new_with_grant(key, Err(error), token_exchange_grant())
+        }
+
         fn new(key: &str, response: std::result::Result<&str, &str>) -> Self {
+            Self::new_with_grant(key, response, token_grant())
+        }
+
+        fn new_with_grant(
+            key: &str,
+            response: std::result::Result<&str, &str>,
+            token_grant: ProviderCredentialTokenGrant,
+        ) -> Self {
             let requests = Arc::new(Mutex::new(Vec::new()));
             let resolver = Arc::new(FakeTokenGrantResolver {
                 requests: requests.clone(),
@@ -397,7 +426,7 @@ pub mod test_support {
                     name: "access_token".to_string(),
                     auth_style: "bearer".to_string(),
                     header_name: "Authorization".to_string(),
-                    token_grant: Some(token_grant()),
+                    token_grant: Some(token_grant),
                     ..Default::default()
                 },
             );
@@ -445,6 +474,39 @@ pub mod test_support {
             assert_eq!(request.audience, "api://example");
             assert_eq!(request.scopes, ["read"]);
             assert_eq!(request.cache_ttl_seconds, 300);
+            assert_eq!(
+                request.grant_type,
+                ProviderCredentialTokenGrantType::ClientCredentials as i32
+            );
+            assert!(request.requested_token_type.is_empty());
+        }
+
+        pub fn assert_one_token_exchange_request(&self, expected_provider_key: &str) {
+            let requests = self
+                .requests
+                .lock()
+                .expect("fake token grant requests lock poisoned");
+            assert_eq!(requests.len(), 1);
+
+            let request = &requests[0];
+            assert_eq!(request.provider_key, expected_provider_key);
+            assert_eq!(request.token_endpoint, "https://auth.example.com/token");
+            assert_eq!(request.jwt_svid_audience, "https://auth.example.com");
+            assert_eq!(
+                request.client_assertion_type,
+                "urn:ietf:params:oauth:client-assertion-type:jwt-spiffe"
+            );
+            assert_eq!(request.audience, "api://example");
+            assert_eq!(request.scopes, ["read"]);
+            assert_eq!(request.cache_ttl_seconds, 300);
+            assert_eq!(
+                request.grant_type,
+                ProviderCredentialTokenGrantType::TokenExchange as i32
+            );
+            assert_eq!(
+                request.requested_token_type,
+                "urn:ietf:params:oauth:token-type:access_token"
+            );
         }
     }
 
@@ -458,6 +520,24 @@ pub mod test_support {
             scopes: vec!["read".to_string()],
             cache_ttl_seconds: 300,
             audience_overrides: Vec::new(),
+            grant_type: ProviderCredentialTokenGrantType::ClientCredentials as i32,
+            subject_token: None,
+            requested_token_type: String::new(),
+        }
+    }
+
+    fn token_exchange_grant() -> ProviderCredentialTokenGrant {
+        ProviderCredentialTokenGrant {
+            client_assertion_type: "urn:ietf:params:oauth:client-assertion-type:jwt-spiffe"
+                .to_string(),
+            grant_type: ProviderCredentialTokenGrantType::TokenExchange as i32,
+            subject_token: Some(ProviderCredentialTokenGrantSubjectToken {
+                source: "provider_credential".to_string(),
+                credential: "user_oidc_token".to_string(),
+                subject_token_type: "urn:ietf:params:oauth:token-type:id_token".to_string(),
+            }),
+            requested_token_type: "urn:ietf:params:oauth:token-type:access_token".to_string(),
+            ..token_grant()
         }
     }
 
@@ -474,6 +554,8 @@ pub mod test_support {
                 audience: request.audience.to_string(),
                 scopes: request.scopes.to_vec(),
                 cache_ttl_seconds: request.cache_ttl_seconds,
+                grant_type: request.grant_type,
+                requested_token_type: request.requested_token_type.to_string(),
             };
             Box::pin(async move {
                 self.requests
@@ -506,6 +588,12 @@ mod tests {
 
         assert!(dynamic_credential_key_matches(
             key,
+            "api.example.com",
+            443,
+            "/repos/owner/repo"
+        ));
+        assert!(dynamic_credential_key_matches(
+            "api.example.com\t443\t/repos/**\trev:42\tgithub:access_token",
             "api.example.com",
             443,
             "/repos/owner/repo"
@@ -749,6 +837,46 @@ mod tests {
 
         assert!(rewritten.contains("Authorization: Bearer grant-token\r\n"));
         fixture.assert_one_request("api.example.com\t443\t/v1/**\tprovider:access_token");
+    }
+
+    #[tokio::test]
+    async fn inject_if_needed_passes_token_exchange_grant_to_resolver() {
+        let fixture = TokenGrantTestFixture::success_token_exchange(
+            "api.example.com\t443\t/v1/**\tprovider:access_token",
+            "grant-token",
+        );
+
+        let ctx = L7EvalContext {
+            host: "api.example.com".into(),
+            port: 443,
+            policy_name: "api".into(),
+            binary_path: "/usr/bin/curl".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+            secret_resolver: None,
+            activity_tx: None,
+            dynamic_credentials: Some(fixture.dynamic_credentials()),
+            token_grant_resolver: Some(fixture.resolver()),
+            ..Default::default()
+        };
+        let req = L7Request {
+            action: "GET".to_string(),
+            target: "/v1/projects".to_string(),
+            query_params: std::collections::HashMap::new(),
+            raw_header: b"GET /v1/projects HTTP/1.1\r\nHost: api.example.com\r\n\r\n".to_vec(),
+            body_length: BodyLength::None,
+        };
+
+        let rewritten = inject_if_needed(req, &ctx)
+            .await
+            .expect("fake token exchange grant should inject");
+        let rewritten =
+            String::from_utf8(rewritten.raw_header).expect("rewritten request should be UTF-8");
+
+        assert!(rewritten.contains("Authorization: Bearer grant-token\r\n"));
+        fixture.assert_one_token_exchange_request(
+            "api.example.com\t443\t/v1/**\tprovider:access_token",
+        );
     }
 
     #[tokio::test]

@@ -199,6 +199,12 @@ jobs:
             -p openshell-sandbox \
             -p openshell-core \
             -p openshell-cli \
+            -p openshell-driver-db-credstore \
+            -p openshell-driver-docker \
+            -p openshell-driver-kubernetes \
+            -p openshell-driver-kubernetes-secrets \
+            -p openshell-driver-podman \
+            -p openshell-driver-vault \
             --all-targets \
             -- -D warnings
 
