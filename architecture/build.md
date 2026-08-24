@@ -272,6 +272,45 @@ Repository CI keeps telemetry compiled into release-parity artifacts but
 disables emission for Rust tests, E2E runs, and release canaries. This prevents
 synthetic activity from contributing to product usage metrics.
 
+Static security checks are deliberately outside the mirror-branch path. They run
+directly on GitHub-hosted runners with no secrets, so they also cover fork pull
+requests and consume no NVIDIA self-hosted capacity. Scanner jobs request
+`security-events: write` and upload SARIF to Code Scanning directly on every
+event they run on, including fork and Dependabot pull requests, which Code
+Scanning permits for `pull_request` runs despite their read-only `GITHUB_TOKEN`.
+Each scanner also retains its report as a workflow artifact. No privileged
+intermediate workflow relays those uploads.
+Triggers differ by workflow: `.github/workflows/workflow-security.yml` and
+`.github/workflows/codeql.yml` run on `pull_request`, `merge_group`, `main`, and
+a weekly schedule; `.github/workflows/dependency-review.yml` runs on
+`pull_request` and `merge_group` only, because it needs a base and head commit
+to compare.
+
+- **Actionlint and Zizmor** analyze the workflow definitions themselves.
+  Repository configuration lives in `.github/actionlint.yml` (self-hosted runner
+  labels, scoped per-file ignores) and `.github/zizmor.yml` (scoped rule
+  suppressions). Zizmor runs offline and reports only High severity, which is
+  its maximum level. Both publish SARIF to Code Scanning and retain report
+  artifacts. The Nix flake provides both scanners, so local runs use
+  `nix develop --command actionlint -shellcheck= -pyflakes=` and
+  `nix develop --command zizmor --offline --persona=regular --min-severity=high --no-exit-codes .`.
+- **Dependency Review** compares the base and head dependency graphs. It
+  preflights the GitHub Dependency Graph compare API and neutralizes itself with
+  a warning while that repository feature is unavailable, so the check begins
+  reporting on its own once the feature is enabled. Reviews run in warn-only
+  mode.
+- **CodeQL** analyzes product Rust code, examples, and the Go, Python, and
+  TypeScript SDKs, scoped by `.github/codeql/codeql-config.yml`; E2E test code is
+  excluded. Only Go requires a build; the other languages use build mode `none`.
+  Results are uploaded to Code Scanning and always retained as workflow
+  artifacts.
+
+Findings never fail these checks; scanner and build failures do. A scanner that
+cannot run, a CodeQL analyzer that does not complete, and an unexpected
+Dependency Graph API error are all errors, which keeps an informational check
+from silently degrading into a no-op. None of these checks are required
+statuses, so they do not gate merges.
+
 See `CI.md` for the contributor workflow, labels, and maintainer merge-queue workflow.
 
 ## Docs Site

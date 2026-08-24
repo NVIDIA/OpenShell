@@ -1,0 +1,128 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: CodeQL
+
+on:
+  pull_request:
+  merge_group:
+    types: [checks_requested]
+  push:
+    branches: [main]
+  schedule:
+    - cron: "29 5 * * 6"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  security-events: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  analyze:
+    name: CodeQL (${{ matrix.language }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - language: rust
+            build-mode: none
+          - language: go
+            build-mode: manual
+          - language: python
+            build-mode: none
+          - language: javascript-typescript
+            build-mode: none
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        if: matrix.language == 'go'
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: sdk/go/go.mod
+          cache-dependency-path: sdk/go/go.sum
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@ff2f1c621b7f889edc0d3c761ac2e6a3f8cdb0dd # v4.37.7
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: ${{ matrix.build-mode }}
+          config-file: ./.github/codeql/codeql-config.yml
+
+      - name: Build Go SDK
+        if: matrix.language == 'go'
+        working-directory: sdk/go
+        run: go build ./...
+
+      - name: Analyze
+        id: analyze
+        uses: github/codeql-action/analyze@ff2f1c621b7f889edc0d3c761ac2e6a3f8cdb0dd # v4.37.7
+        with:
+          category: /language:${{ matrix.language }}
+          output: codeql-results
+          upload: never
+
+      - name: Summarize findings
+        if: always()
+        env:
+          LANGUAGE: ${{ matrix.language }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s globstar nullglob
+          sarif_files=(codeql-results/**/*.sarif)
+
+          {
+            echo "### CodeQL: $LANGUAGE"
+            echo
+            if [ "${#sarif_files[@]}" -eq 0 ]; then
+              echo "No SARIF report was produced."
+            else
+              finding_count=$(jq -s '[.[].runs[]?.results[]?] | length' "${sarif_files[@]}")
+              echo "Findings: $finding_count"
+              echo
+              echo "Findings are informational and do not fail CI."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload SARIF to Code Scanning
+        if: steps.analyze.outcome == 'success'
+        uses: github/codeql-action/upload-sarif@ff2f1c621b7f889edc0d3c761ac2e6a3f8cdb0dd # v4.37.7
+        with:
+          sarif_file: codeql-results
+          category: /language:${{ matrix.language }}
+
+      - name: Upload SARIF
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: codeql-${{ matrix.language }}-${{ github.run_id }}
+          path: codeql-results
+          if-no-files-found: ignore
+          retention-days: 14
+
+  result:
+    name: OpenShell / CodeQL (informational)
+    if: always()
+    needs: analyze
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Evaluate analyzer execution
+        env:
+          ANALYZE_RESULT: ${{ needs.analyze.result }}
+        shell: bash
+        run: |
+          if [ "$ANALYZE_RESULT" != "success" ]; then
+            echo "::error::One or more CodeQL analyzers did not complete successfully."
+            exit 1
+          fi
+          echo "All CodeQL analyzers completed; findings remain informational."

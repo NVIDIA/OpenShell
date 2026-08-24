@@ -46,6 +46,7 @@
         };
         testGuestPkgs = import nixpkgs-test-guest { inherit system; };
         commonDevShellPackages = with pkgs; [
+          actionlint
           cargo-deny
           cargo-nextest
           # Assemble Debian artifacts on macOS and Linux.
@@ -55,6 +56,7 @@
           # Coverage.
           lcov
           uv
+          zizmor
         ];
         treefmtEval = treefmt-nix.lib.evalModule pkgs {
           projectRootFile = "flake.nix";
