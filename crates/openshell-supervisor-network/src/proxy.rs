@@ -5604,8 +5604,6 @@ fn is_benign_relay_error(err: &miette::Report) -> bool {
     reason = "Test code: test fixtures and explicit control-flow markers are idiomatic in tests."
 )]
 mod tests {
-    use crate::upstream_proxy::UpstreamProxyArgs;
-
     use super::*;
     use openshell_core::proposals::AgentProposals;
     use std::collections::HashMap as TestHashMap;
@@ -6127,7 +6125,7 @@ network_policies:
         });
 
         // Operator config: proxy set + connect-by-hostname opt-in.
-        let cfg = UpstreamProxyConfig::from_args(&UpstreamProxyArgs {
+        let cfg = UpstreamProxyConfig::from_args(&upstream_proxy::UpstreamProxyArgs {
             https_proxy: Some(format!("http://{proxy_addr}")),
             proxy_connect_by_hostname: true,
             ..Default::default()
