@@ -240,6 +240,7 @@ impl JwksCache {
             let Some(ref kid) = key.kid else {
                 continue;
             };
+            crate::install_jsonwebtoken_crypto_provider();
             match DecodingKey::from_rsa_components(&key.n, &key.e) {
                 Ok(dk) => {
                     new_keys.insert(kid.clone(), dk);
@@ -286,6 +287,8 @@ impl JwksCache {
     /// This is the authentication step — it verifies the caller's identity
     /// but does not check authorization (that's `authz::AuthzPolicy::check`).
     pub async fn validate_token(&self, token: &str) -> Result<Identity, Status> {
+        crate::install_jsonwebtoken_crypto_provider();
+
         self.refresh_if_stale().await.map_err(|e| {
             warn!(error = %e, "JWKS refresh failed");
             Status::internal("OIDC key refresh failed")
@@ -568,6 +571,8 @@ mod tests {
 
     /// Sign `claims` with the test key, tagging the header with `kid`.
     fn mint_rs256(claims: &serde_json::Value, kid: &str) -> String {
+        crate::install_jsonwebtoken_crypto_provider();
+
         let mut header = jsonwebtoken::Header::new(Algorithm::RS256);
         header.kid = Some(kid.to_owned());
         let key = jsonwebtoken::EncodingKey::from_rsa_pem(TEST_RSA_KEY.private_pem.as_bytes())
@@ -682,6 +687,7 @@ mod tests {
         let cache = cache_with_mock_issuer(&server).await;
 
         let other = TestRsaKey::generate();
+        crate::install_jsonwebtoken_crypto_provider();
         let mut header = jsonwebtoken::Header::new(Algorithm::RS256);
         header.kid = Some(TEST_KID.to_owned());
         let token = jsonwebtoken::encode(

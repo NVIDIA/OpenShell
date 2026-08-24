@@ -23,12 +23,12 @@ use std::sync::{Arc, OnceLock, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::proto::{
-    DenialSummary, GetDraftPolicyRequest, GetInferenceBundleRequest, GetInferenceBundleResponse,
-    GetSandboxConfigRequest, GetSandboxProviderEnvironmentRequest, IssueSandboxTokenRequest,
-    NetworkActivitySummary, PolicyChunk, PolicySource, PolicyStatus, RefreshSandboxTokenRequest,
-    ReportPolicyStatusRequest, SandboxPolicy as ProtoSandboxPolicy, SubmitPolicyAnalysisRequest,
-    SubmitPolicyAnalysisResponse, UpdateConfigRequest, inference_client::InferenceClient,
-    open_shell_client::OpenShellClient,
+    DenialSummary, ExchangeProviderSubjectTokenRequest, GetDraftPolicyRequest,
+    GetInferenceBundleRequest, GetInferenceBundleResponse, GetSandboxConfigRequest,
+    GetSandboxProviderEnvironmentRequest, IssueSandboxTokenRequest, NetworkActivitySummary,
+    PolicyChunk, PolicySource, PolicyStatus, RefreshSandboxTokenRequest, ReportPolicyStatusRequest,
+    SandboxPolicy as ProtoSandboxPolicy, SubmitPolicyAnalysisRequest, SubmitPolicyAnalysisResponse,
+    UpdateConfigRequest, inference_client::InferenceClient, open_shell_client::OpenShellClient,
 };
 use crate::sandbox_env;
 use miette::{IntoDiagnostic, Result, WrapErr};
@@ -860,6 +860,55 @@ pub async fn fetch_provider_environment(
     })
 }
 
+pub async fn exchange_provider_subject_token(
+    endpoint: &str,
+    sandbox_id: &str,
+    provider: &str,
+    credential_key: &str,
+    supervisor_jwt_svid: &str,
+) -> Result<ProviderSubjectTokenExchangeResult> {
+    debug!(
+        endpoint = %endpoint,
+        sandbox_id = %sandbox_id,
+        provider = %provider,
+        credential_key = %credential_key,
+        "Exchanging provider subject token through gateway"
+    );
+
+    let mut client = connect(endpoint).await?;
+    let response = client
+        .exchange_provider_subject_token(ExchangeProviderSubjectTokenRequest {
+            sandbox_id: sandbox_id.to_string(),
+            provider: provider.to_string(),
+            credential_key: credential_key.to_string(),
+            supervisor_jwt_svid: supervisor_jwt_svid.to_string(),
+        })
+        .await
+        .map_err(provider_subject_token_exchange_status)?;
+    let inner = response.into_inner();
+    Ok(ProviderSubjectTokenExchangeResult {
+        access_token: inner.access_token,
+        expires_in: inner.expires_in,
+        token_type: inner.token_type,
+    })
+}
+
+fn provider_subject_token_exchange_status(status: Status) -> miette::Report {
+    let message = status.message();
+    if message.is_empty() {
+        miette::miette!(
+            "gateway ExchangeProviderSubjectToken failed with status {}",
+            status.code()
+        )
+    } else {
+        miette::miette!(
+            "gateway ExchangeProviderSubjectToken failed with status {}: {}",
+            status.code(),
+            message
+        )
+    }
+}
+
 /// A reusable gRPC client for the `OpenShell` service.
 ///
 /// Wraps a tonic channel connected once and reused for policy polling
@@ -967,6 +1016,12 @@ pub struct ProviderEnvironmentResult {
     pub dynamic_credentials: HashMap<String, crate::proto::ProviderProfileCredential>,
     pub static_credential_bindings: HashMap<String, crate::proto::StaticCredentialBinding>,
     pub non_secret_environment_keys: Vec<String>,
+}
+
+pub struct ProviderSubjectTokenExchangeResult {
+    pub access_token: String,
+    pub expires_in: i64,
+    pub token_type: String,
 }
 
 impl CachedOpenShellClient {

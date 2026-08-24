@@ -10123,6 +10123,128 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn provider_environment_withholds_token_exchange_subject_credential() {
+        use openshell_core::proto::{
+            GetSandboxProviderEnvironmentRequest, ProviderCredentialTokenGrant,
+            ProviderCredentialTokenGrantSubjectToken, ProviderCredentialTokenGrantType,
+            ProviderProfile, ProviderProfileCategory, ProviderProfileCredential,
+            StoredProviderProfile,
+        };
+
+        let state = test_server_state().await;
+        let profile = StoredProviderProfile {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: "profile-token-exchange-subject".to_string(),
+                name: "token-exchange-subject".to_string(),
+                created_at_ms: 1_000_000,
+                labels: HashMap::new(),
+                resource_version: 0,
+                annotations: HashMap::new(),
+                workspace: "default".to_string(),
+                deletion_timestamp_ms: 0,
+            }),
+            profile: Some(ProviderProfile {
+                id: "token-exchange-subject".to_string(),
+                display_name: "Token Exchange Subject".to_string(),
+                category: ProviderProfileCategory::Other as i32,
+                credentials: vec![
+                    ProviderProfileCredential {
+                        name: "subject_token".to_string(),
+                        ..Default::default()
+                    },
+                    ProviderProfileCredential {
+                        name: "access_token".to_string(),
+                        auth_style: "bearer".to_string(),
+                        header_name: "authorization".to_string(),
+                        token_grant: Some(ProviderCredentialTokenGrant {
+                            grant_type: ProviderCredentialTokenGrantType::TokenExchange as i32,
+                            token_endpoint: "https://auth.example.test/token".to_string(),
+                            audience: "api://exchange".to_string(),
+                            subject_token: Some(ProviderCredentialTokenGrantSubjectToken {
+                                source: "provider_credential".to_string(),
+                                credential: "subject_token".to_string(),
+                                subject_token_type: "urn:ietf:params:oauth:token-type:access_token"
+                                    .to_string(),
+                            }),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    },
+                ],
+                endpoints: vec![NetworkEndpoint {
+                    host: "api.exchange.example.test".to_string(),
+                    port: 443,
+                    protocol: "rest".to_string(),
+                    access: "full".to_string(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+        };
+        state.store.put_message(&profile).await.unwrap();
+
+        let mut provider = test_provider("exchange-provider", "token-exchange-subject");
+        provider.credentials = HashMap::from([(
+            "subject_token".to_string(),
+            "raw-gateway-oidc-token".to_string(),
+        )]);
+        provider.credential_expires_at_ms =
+            HashMap::from([("subject_token".to_string(), current_time_ms() + 60_000)]);
+        state.store.put_message(&provider).await.unwrap();
+        state
+            .store
+            .put_message(&test_sandbox(
+                "sb-token-exchange-subject",
+                "token-exchange-subject",
+                test_policy_with_rule("sandbox_only", "sandbox.example.com"),
+                vec!["exchange-provider".to_string()],
+            ))
+            .await
+            .unwrap();
+
+        let response = handle_get_sandbox_provider_environment(
+            &state,
+            with_user(Request::new(GetSandboxProviderEnvironmentRequest {
+                sandbox_id: "sb-token-exchange-subject".to_string(),
+                supports_static_credential_bindings: true,
+            })),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+
+        assert!(
+            !response.environment.contains_key("subject_token"),
+            "token-exchange subject credentials must not enter sandbox environment material"
+        );
+        assert!(
+            !response
+                .static_credential_bindings
+                .contains_key("subject_token"),
+            "token-exchange subject credentials must not own workload placeholders"
+        );
+        assert!(
+            !response
+                .credential_expires_at_ms
+                .contains_key("subject_token"),
+            "withheld subject credentials must not emit sandbox expiry metadata"
+        );
+        let dynamic_access_token = response
+            .dynamic_credentials
+            .values()
+            .find(|credential| credential.name == "access_token")
+            .expect("dynamic access_token credential should remain available");
+        assert_eq!(
+            dynamic_access_token
+                .token_grant
+                .as_ref()
+                .and_then(|grant| grant.subject_token.as_ref())
+                .map(|subject| subject.credential.as_str()),
+            Some("subject_token")
+        );
+    }
+
+    #[tokio::test]
     async fn provider_env_revision_changes_on_consecutive_provider_updates_without_delay() {
         use openshell_core::proto::GetSandboxProviderEnvironmentRequest;
 

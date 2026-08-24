@@ -31,6 +31,8 @@ pub mod jwt;
 pub mod metadata;
 pub mod middleware;
 pub mod net;
+#[cfg(feature = "oauth")]
+pub mod oauth;
 pub mod operator_namespace_allowlist;
 pub mod paths;
 pub mod policy;
@@ -42,6 +44,7 @@ pub mod provider_credentials;
 pub mod sandbox_env;
 pub mod secrets;
 pub mod settings;
+pub mod spiffe;
 pub mod telemetry;
 pub mod time;
 pub mod transport_errors;

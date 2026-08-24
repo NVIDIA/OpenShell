@@ -23,7 +23,8 @@ use openshell_core::proto::{
     DeleteProviderRequest, DeleteProviderResponse, DeleteSandboxRequest, DeleteSandboxResponse,
     DeleteServiceRequest, DeleteServiceResponse, DeleteWorkspaceRequest, DeleteWorkspaceResponse,
     DetachSandboxProviderRequest, DetachSandboxProviderResponse, EditDraftChunkRequest,
-    EditDraftChunkResponse, ExecSandboxEvent, ExecSandboxInput, ExecSandboxRequest,
+    EditDraftChunkResponse, ExchangeProviderSubjectTokenRequest,
+    ExchangeProviderSubjectTokenResponse, ExecSandboxEvent, ExecSandboxInput, ExecSandboxRequest,
     ExposeServiceRequest, GatewayMessage, GetCurrentUserRequest, GetCurrentUserResponse,
     GetDraftHistoryRequest, GetDraftHistoryResponse, GetDraftPolicyRequest, GetDraftPolicyResponse,
     GetGatewayConfigRequest, GetGatewayConfigResponse, GetGatewayInfoRequest,
@@ -541,6 +542,13 @@ impl OpenShell for OpenShellService {
         request: Request<GetSandboxProviderEnvironmentRequest>,
     ) -> Result<Response<GetSandboxProviderEnvironmentResponse>, Status> {
         policy::handle_get_sandbox_provider_environment(&self.state, request).await
+    }
+
+    async fn exchange_provider_subject_token(
+        &self,
+        request: Request<ExchangeProviderSubjectTokenRequest>,
+    ) -> Result<Response<ExchangeProviderSubjectTokenResponse>, Status> {
+        provider::handle_exchange_provider_subject_token(&self.state, request).await
     }
 
     async fn update_config(

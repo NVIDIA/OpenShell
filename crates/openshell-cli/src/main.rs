@@ -811,7 +811,7 @@ impl From<CliEditor> for openshell_cli::ssh::Editor {
 #[derive(Subcommand, Debug)]
 enum ProviderCommands {
     /// Create a provider config.
-    #[command(group = clap::ArgGroup::new("cred_source").required(true).args(["from_existing", "credentials", "from_gcloud_adc", "runtime_credentials"]), help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    #[command(group = clap::ArgGroup::new("cred_source").required(true).multiple(true).args(["from_existing", "credentials", "from_gcloud_adc", "runtime_credentials", "from_oidc_token"]), help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Create {
         /// Provider name.
         #[arg(long)]
@@ -822,7 +822,7 @@ enum ProviderCommands {
         provider_type: String,
 
         /// Load provider credentials/config from existing local state.
-        #[arg(long, conflicts_with_all = ["credentials", "from_gcloud_adc", "runtime_credentials"])]
+        #[arg(long, conflicts_with_all = ["credentials", "from_gcloud_adc", "runtime_credentials", "from_oidc_token"])]
         from_existing: bool,
 
         /// Provider credential pair (`KEY=VALUE`) or env lookup key (`KEY`).
@@ -836,11 +836,15 @@ enum ProviderCommands {
         /// Configure credentials from gcloud Application Default Credentials
         /// (`~/.config/gcloud/application_default_credentials.json`).
         /// Valid for providers whose profile declares an ADC-compatible credential.
-        #[arg(long, group = "cred_source", conflicts_with_all = ["from_existing", "credentials", "runtime_credentials"])]
+        #[arg(long, group = "cred_source", conflicts_with_all = ["from_existing", "credentials", "runtime_credentials", "from_oidc_token"])]
         from_gcloud_adc: bool,
 
+        /// Store the active gateway OIDC access token as the named provider credential.
+        #[arg(long, group = "cred_source", conflicts_with_all = ["from_existing", "from_gcloud_adc", "runtime_credentials"])]
+        from_oidc_token: bool,
+
         /// Create a provider whose required credentials are resolved at runtime by the gateway/sandbox.
-        #[arg(long, conflicts_with_all = ["from_existing", "credentials", "from_gcloud_adc"])]
+        #[arg(long, conflicts_with_all = ["from_existing", "credentials", "from_gcloud_adc", "from_oidc_token"])]
         runtime_credentials: bool,
 
         /// Provider config key/value pair.
@@ -913,8 +917,12 @@ enum ProviderCommands {
         name: String,
 
         /// Re-discover credentials from existing local state (e.g. env vars, config files).
-        #[arg(long, conflicts_with = "credentials")]
+        #[arg(long, conflicts_with_all = ["credentials", "from_oidc_token"])]
         from_existing: bool,
+
+        /// Store the active gateway OIDC access token as the named provider credential.
+        #[arg(long, conflicts_with = "from_existing")]
+        from_oidc_token: bool,
 
         /// Provider credential pair (`KEY=VALUE`) or env lookup key (`KEY`).
         #[arg(
@@ -3369,24 +3377,34 @@ async fn run_async() -> Result<()> {
                     from_existing,
                     credentials,
                     from_gcloud_adc,
+                    from_oidc_token,
                     runtime_credentials,
                     config,
                     global_profile,
                 } => {
                     let profile_ws = if global_profile { "" } else { &cli.workspace };
-                    run::provider_create_with_options(
-                        endpoint,
-                        &name,
-                        provider_type.as_str(),
-                        from_existing,
-                        &credentials,
-                        from_gcloud_adc,
-                        runtime_credentials,
-                        &config,
-                        &cli.workspace,
-                        profile_ws,
-                        &tls,
-                    )
+                    let credential_source = if from_existing {
+                        run::ProviderCreateCredentialSource::Existing
+                    } else if from_gcloud_adc {
+                        run::ProviderCreateCredentialSource::GcloudAdc
+                    } else if from_oidc_token {
+                        run::ProviderCreateCredentialSource::OidcToken
+                    } else if runtime_credentials {
+                        run::ProviderCreateCredentialSource::Runtime
+                    } else {
+                        run::ProviderCreateCredentialSource::ExplicitCredentials
+                    };
+                    run::provider_create_with_options(run::ProviderCreateOptions {
+                        server: endpoint,
+                        name: &name,
+                        provider_type: provider_type.as_str(),
+                        credentials: &credentials,
+                        credential_source,
+                        config: &config,
+                        workspace: &cli.workspace,
+                        profile_workspace: profile_ws,
+                        tls: &tls,
+                    })
                     .await?;
                 }
                 ProviderCommands::Refresh(command) => match command {
@@ -3539,20 +3557,22 @@ async fn run_async() -> Result<()> {
                 ProviderCommands::Update {
                     name,
                     from_existing,
+                    from_oidc_token,
                     credentials,
                     config,
                     credential_expires_at,
                 } => {
-                    run::provider_update(
-                        endpoint,
-                        &name,
+                    run::provider_update(run::ProviderUpdateOptions {
+                        server: endpoint,
+                        name: &name,
                         from_existing,
-                        &credentials,
-                        &config,
-                        &credential_expires_at,
-                        &cli.workspace,
-                        &tls,
-                    )
+                        from_oidc_token,
+                        credentials: &credentials,
+                        config: &config,
+                        credential_expires_at: &credential_expires_at,
+                        workspace: &cli.workspace,
+                        tls: &tls,
+                    })
                     .await?;
                 }
                 ProviderCommands::Delete { names } => {

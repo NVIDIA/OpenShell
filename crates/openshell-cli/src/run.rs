@@ -47,13 +47,14 @@ use openshell_core::proto::{
     LintProviderProfilesRequest, ListProviderProfilesRequest, ListProvidersRequest,
     ListSandboxPoliciesRequest, ListSandboxProvidersRequest, ListSandboxesRequest,
     ListServicesRequest, PolicySource, PolicyStatus, Provider, ProviderCredentialRefreshStatus,
-    ProviderCredentialRefreshStrategy, ProviderProfile, ProviderProfileDiagnostic,
-    ProviderProfileImportItem, RejectDraftChunkRequest, ResourceRequirements,
-    RevokeSshSessionRequest, RotateProviderCredentialRequest, Sandbox, SandboxPhase, SandboxPolicy,
-    SandboxSpec, SandboxTemplate, ServiceEndpointResponse, SetInferenceRouteRequest, SettingScope,
-    StartSandboxRequest, StopSandboxRequest, TcpForwardFrame, TcpForwardInit, TcpRelayTarget,
-    UpdateConfigRequest, UpdateProviderProfilesRequest, UpdateProviderRequest, WatchSandboxRequest,
-    exec_sandbox_event, setting_value, tcp_forward_init,
+    ProviderCredentialRefreshStrategy, ProviderCredentialTokenGrantType, ProviderProfile,
+    ProviderProfileDiagnostic, ProviderProfileImportItem, RejectDraftChunkRequest,
+    ResourceRequirements, RevokeSshSessionRequest, RotateProviderCredentialRequest, Sandbox,
+    SandboxPhase, SandboxPolicy, SandboxSpec, SandboxTemplate, ServiceEndpointResponse,
+    SetInferenceRouteRequest, SettingScope, StartSandboxRequest, StopSandboxRequest,
+    TcpForwardFrame, TcpForwardInit, TcpRelayTarget, UpdateConfigRequest,
+    UpdateProviderProfilesRequest, UpdateProviderRequest, WatchSandboxRequest, exec_sandbox_event,
+    setting_value, tcp_forward_init,
 };
 use openshell_core::settings;
 use openshell_core::{ObjectId, ObjectName, ObjectWorkspace};
@@ -3373,6 +3374,126 @@ fn missing_credentials_error(provider_type: &str) -> miette::Report {
     )
 }
 
+async fn provider_credential_from_oidc_token(
+    credentials: &[String],
+    profile: Option<&ProviderProfile>,
+    tls: &TlsOptions,
+) -> Result<(HashMap<String, String>, HashMap<String, i64>)> {
+    let credential_key = oidc_subject_credential_key(credentials, profile)?;
+
+    let gateway_name = tls.gateway_name().ok_or_else(|| {
+        miette::miette!("--from-oidc-token requires an active named OIDC gateway")
+    })?;
+    let bundle =
+        crate::oidc_auth::ensure_valid_oidc_token_bundle(gateway_name, tls.gateway_insecure)
+            .await
+            .map_err(|err| {
+                miette::miette!(
+                    "failed to load or refresh OIDC token for gateway '{gateway_name}' while preparing provider credential: {err}"
+                )
+            })?;
+
+    let mut credential_map = HashMap::new();
+    credential_map.insert(credential_key.clone(), bundle.access_token);
+
+    let mut credential_expires_at_ms = HashMap::new();
+    if let Some(expires_at) = bundle.expires_at {
+        let expires_at_ms = i64::try_from(expires_at)
+            .unwrap_or(i64::MAX / 1000)
+            .saturating_mul(1000);
+        credential_expires_at_ms.insert(credential_key, expires_at_ms);
+    }
+
+    Ok((credential_map, credential_expires_at_ms))
+}
+
+fn oidc_subject_credential_key(
+    credentials: &[String],
+    profile: Option<&ProviderProfile>,
+) -> Result<String> {
+    if credentials.len() > 1 {
+        return Err(miette::miette!(
+            "--from-oidc-token accepts at most one --credential KEY destination"
+        ));
+    }
+
+    if let Some(credential) = credentials.first() {
+        let credential = credential.trim();
+        if credential.is_empty() || credential.contains('=') {
+            return Err(miette::miette!(
+                "--from-oidc-token requires --credential KEY without an inline value"
+            ));
+        }
+        if let Some(profile) = profile {
+            ensure_profile_declares_subject_credential(profile, credential)?;
+        }
+        return Ok(credential.to_string());
+    }
+
+    let Some(profile) = profile else {
+        return Err(miette::miette!(
+            "--from-oidc-token requires --credential KEY when the provider profile is unavailable"
+        ));
+    };
+
+    infer_oidc_subject_credential_from_profile(profile)
+}
+
+fn ensure_profile_declares_subject_credential(
+    profile: &ProviderProfile,
+    credential: &str,
+) -> Result<()> {
+    let matches = token_exchange_subject_credentials(profile);
+    if matches.iter().any(|candidate| candidate == credential) {
+        return Ok(());
+    }
+    Err(miette::miette!(
+        "credential '{credential}' is not declared as a token-exchange subject credential in provider profile '{}'; expected one of: {}",
+        profile.id,
+        matches.join(", ")
+    ))
+}
+
+fn infer_oidc_subject_credential_from_profile(profile: &ProviderProfile) -> Result<String> {
+    let matches = token_exchange_subject_credentials(profile);
+    match matches.as_slice() {
+        [credential] => Ok(credential.clone()),
+        [] => Err(miette::miette!(
+            "provider profile '{}' does not declare a token-exchange subject credential; pass --credential KEY",
+            profile.id
+        )),
+        _ => Err(miette::miette!(
+            "provider profile '{}' declares multiple token-exchange subject credentials ({}); pass --credential KEY",
+            profile.id,
+            matches.join(", ")
+        )),
+    }
+}
+
+fn token_exchange_subject_credentials(profile: &ProviderProfile) -> Vec<String> {
+    let mut matches = Vec::new();
+    for credential in &profile.credentials {
+        let Some(token_grant) = credential.token_grant.as_ref() else {
+            continue;
+        };
+        if ProviderCredentialTokenGrantType::try_from(token_grant.grant_type).ok()
+            != Some(ProviderCredentialTokenGrantType::TokenExchange)
+        {
+            continue;
+        }
+        let Some(subject_token) = token_grant.subject_token.as_ref() else {
+            continue;
+        };
+        if subject_token.source != "provider_credential" || subject_token.credential.is_empty() {
+            continue;
+        }
+        if !matches.contains(&subject_token.credential) {
+            matches.push(subject_token.credential.clone());
+        }
+    }
+    matches
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn provider_create(
     server: &str,
@@ -3385,44 +3506,77 @@ pub async fn provider_create(
     workspace: &str,
     tls: &TlsOptions,
 ) -> Result<()> {
-    provider_create_with_options(
+    let credential_source = match (from_existing, from_gcloud_adc) {
+        (true, true) => {
+            return Err(miette::miette!(
+                "--from-gcloud-adc cannot be combined with --from-existing, --from-oidc-token, or --credential; it also cannot be combined with --runtime-credentials"
+            ));
+        }
+        (true, false) => ProviderCreateCredentialSource::Existing,
+        (false, true) => ProviderCreateCredentialSource::GcloudAdc,
+        (false, false) => ProviderCreateCredentialSource::ExplicitCredentials,
+    };
+    provider_create_with_options(ProviderCreateOptions {
         server,
         name,
         provider_type,
-        from_existing,
         credentials,
-        from_gcloud_adc,
-        false,
+        credential_source,
         config,
         workspace,
-        workspace,
+        profile_workspace: workspace,
         tls,
-    )
+    })
     .await
 }
 
-#[allow(clippy::too_many_arguments)]
-pub async fn provider_create_with_options(
-    server: &str,
-    name: &str,
-    provider_type: &str,
-    from_existing: bool,
-    credentials: &[String],
-    from_gcloud_adc: bool,
-    runtime_credentials: bool,
-    config: &[String],
-    workspace: &str,
-    profile_workspace: &str,
-    tls: &TlsOptions,
-) -> Result<()> {
-    if from_gcloud_adc && (from_existing || !credentials.is_empty() || runtime_credentials) {
+pub struct ProviderCreateOptions<'a> {
+    pub server: &'a str,
+    pub name: &'a str,
+    pub provider_type: &'a str,
+    pub credentials: &'a [String],
+    pub credential_source: ProviderCreateCredentialSource,
+    pub config: &'a [String],
+    pub workspace: &'a str,
+    pub profile_workspace: &'a str,
+    pub tls: &'a TlsOptions,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProviderCreateCredentialSource {
+    ExplicitCredentials,
+    Existing,
+    GcloudAdc,
+    OidcToken,
+    Runtime,
+}
+
+pub async fn provider_create_with_options(options: ProviderCreateOptions<'_>) -> Result<()> {
+    let ProviderCreateOptions {
+        server,
+        name,
+        provider_type,
+        credentials,
+        credential_source,
+        config,
+        workspace,
+        profile_workspace,
+        tls,
+    } = options;
+
+    let from_existing = credential_source == ProviderCreateCredentialSource::Existing;
+    let from_gcloud_adc = credential_source == ProviderCreateCredentialSource::GcloudAdc;
+    let from_oidc_token = credential_source == ProviderCreateCredentialSource::OidcToken;
+    let runtime_credentials = credential_source == ProviderCreateCredentialSource::Runtime;
+
+    if from_gcloud_adc && !credentials.is_empty() {
         return Err(miette::miette!(
-            "--from-gcloud-adc cannot be combined with --from-existing, --credential, or --runtime-credentials"
+            "--from-gcloud-adc cannot be combined with --from-existing, --from-oidc-token, or --credential; it also cannot be combined with --runtime-credentials"
         ));
     }
-    if from_existing && (!credentials.is_empty() || runtime_credentials) {
+    if from_existing && !credentials.is_empty() {
         return Err(miette::miette!(
-            "--from-existing cannot be combined with --credential or --runtime-credentials"
+            "--from-existing cannot be combined with --credential"
         ));
     }
     if runtime_credentials && !credentials.is_empty() {
@@ -3492,7 +3646,17 @@ pub async fn provider_create_with_options(
         None
     };
 
-    let mut credential_map = parse_credential_pairs(credentials)?;
+    let oidc_profile = if from_oidc_token {
+        Some(fetch_provider_profile(&mut client, &provider_type, profile_workspace).await?)
+    } else {
+        None
+    };
+
+    let (mut credential_map, oidc_credential_expires_at_ms) = if from_oidc_token {
+        provider_credential_from_oidc_token(credentials, oidc_profile.as_ref(), tls).await?
+    } else {
+        (parse_credential_pairs(credentials)?, HashMap::new())
+    };
     let mut config_map = parse_key_value_pairs(config, "--config")?;
 
     if from_existing {
@@ -3566,7 +3730,7 @@ pub async fn provider_create_with_options(
                 r#type: provider_type.clone(),
                 credentials: credential_map,
                 config: config_map,
-                credential_expires_at_ms: HashMap::new(),
+                credential_expires_at_ms: oidc_credential_expires_at_ms,
                 profile_workspace: profile_workspace.to_string(),
                 credential_handles: HashMap::new(),
             }),
@@ -4594,28 +4758,73 @@ fn print_provider_type_row(
     );
 }
 
-#[allow(clippy::too_many_arguments)]
-pub async fn provider_update(
-    server: &str,
-    name: &str,
-    from_existing: bool,
-    credentials: &[String],
-    config: &[String],
-    credential_expires_at: &[String],
-    workspace: &str,
-    tls: &TlsOptions,
-) -> Result<()> {
+pub struct ProviderUpdateOptions<'a> {
+    pub server: &'a str,
+    pub name: &'a str,
+    pub from_existing: bool,
+    pub from_oidc_token: bool,
+    pub credentials: &'a [String],
+    pub config: &'a [String],
+    pub credential_expires_at: &'a [String],
+    pub workspace: &'a str,
+    pub tls: &'a TlsOptions,
+}
+
+pub async fn provider_update(options: ProviderUpdateOptions<'_>) -> Result<()> {
+    let ProviderUpdateOptions {
+        server,
+        name,
+        from_existing,
+        from_oidc_token,
+        credentials,
+        config,
+        credential_expires_at,
+        workspace,
+        tls,
+    } = options;
+
     if from_existing && !credentials.is_empty() {
         return Err(miette::miette!(
             "--from-existing cannot be combined with --credential"
         ));
     }
+    if from_existing && from_oidc_token {
+        return Err(miette::miette!(
+            "--from-existing cannot be combined with --from-oidc-token"
+        ));
+    }
 
     let mut client = grpc_client(server, tls).await?;
 
-    let mut credential_map = parse_credential_pairs(credentials)?;
+    let oidc_profile = if from_oidc_token {
+        let existing = client
+            .get_provider(GetProviderRequest {
+                name: name.to_string(),
+                workspace: workspace.to_string(),
+            })
+            .await
+            .into_diagnostic()?
+            .into_inner()
+            .provider
+            .ok_or_else(|| miette::miette!("provider '{name}' not found"))?;
+        let profile_workspace = if existing.profile_workspace.is_empty() {
+            workspace
+        } else {
+            &existing.profile_workspace
+        };
+        Some(fetch_provider_profile(&mut client, &existing.r#type, profile_workspace).await?)
+    } else {
+        None
+    };
+
+    let (mut credential_map, oidc_credential_expires_at_ms) = if from_oidc_token {
+        provider_credential_from_oidc_token(credentials, oidc_profile.as_ref(), tls).await?
+    } else {
+        (parse_credential_pairs(credentials)?, HashMap::new())
+    };
     let mut config_map = parse_key_value_pairs(config, "--config")?;
-    let credential_expires_at_ms = parse_credential_expiry_pairs(credential_expires_at)?;
+    let mut credential_expires_at_ms = parse_credential_expiry_pairs(credential_expires_at)?;
+    credential_expires_at_ms.extend(oidc_credential_expires_at_ms);
 
     if from_existing {
         // Fetch the existing provider to discover its type for credential lookup.
