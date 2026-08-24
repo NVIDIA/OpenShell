@@ -255,54 +255,111 @@ fn run_podman_capture(args: &[&str]) -> Option<Vec<u8>> {
 
 /// Run `program <args>` with a deadline, capturing stdout.
 ///
-/// Unlike `Command::output()`, which blocks until the child exits, this kills
-/// and reaps the child once `timeout` elapses so a hung probe cannot stall the
-/// caller. Returns the captured stdout only on a successful exit within the
-/// deadline; otherwise `None`.
+/// Unlike `Command::output()`, which blocks until the child exits, the deadline
+/// bounds the whole call so a hung probe cannot stall gateway startup. The
+/// probe runs in its own process group and the deadline covers both waiting for
+/// the child and draining its stdout: a Podman probe can leave a daemonized
+/// descendant (an SSH multiplexer, `gvproxy`, etc.) that inherited the stdout
+/// pipe, so `read_to_end` would otherwise wait for EOF forever even after the
+/// direct child exits. On expiry the entire process group is killed, which
+/// terminates such descendants and releases the pipe. Returns the captured
+/// stdout only on a successful exit within the deadline; otherwise `None`.
 fn run_bounded_command(program: &str, args: &[&str], timeout: Duration) -> Option<Vec<u8>> {
     use std::io::Read as _;
+    use std::sync::mpsc;
 
-    let mut child = Command::new(program)
+    let mut command = Command::new(program);
+    command
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
+        .stderr(Stdio::null());
+    // Run the probe as its own process-group leader so a daemonized descendant
+    // that inherited the stdout pipe can be terminated as a group on timeout.
+    set_new_process_group(&mut command);
+    let mut child = command.spawn().ok()?;
 
     // Drain stdout on a separate thread so a child that fills the pipe buffer
-    // cannot deadlock against the polling loop below.
+    // cannot deadlock against the polling loop below. The reader signals through
+    // a channel so the drain can itself be bounded by the deadline.
     let mut stdout = child.stdout.take()?;
-    let reader = std::thread::spawn(move || {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
         let mut buf = Vec::new();
         let _ = stdout.read_to_end(&mut buf);
-        buf
+        let _ = tx.send(buf);
     });
 
-    let start = Instant::now();
+    let deadline = Instant::now() + timeout;
+
+    // Wait for the direct child to exit, bounded by the deadline.
     let status = loop {
         match child.try_wait() {
-            Ok(Some(status)) => break status,
+            Ok(Some(status)) => break Some(status),
             Ok(None) => {
-                if start.elapsed() >= timeout {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    let _ = reader.join();
-                    return None;
+                if Instant::now() >= deadline {
+                    break None;
                 }
                 std::thread::sleep(PODMAN_DISCOVERY_POLL_INTERVAL);
             }
-            Err(_) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                let _ = reader.join();
-                return None;
-            }
+            Err(_) => break None,
         }
     };
 
-    let stdout = reader.join().ok()?;
-    status.success().then_some(stdout)
+    // If the child is still running at the deadline, kill its whole process
+    // group so any descendants (and the child) are terminated together.
+    if status.is_none() {
+        terminate_process_group(&mut child);
+    }
+
+    // Collect stdout, but never past the deadline. A surviving descendant can
+    // hold the pipe open after the direct child exits, so cap the wait and, on
+    // expiry, kill the group to force EOF before collecting what was written.
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    let stdout = match rx.recv_timeout(remaining) {
+        Ok(buf) => buf,
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            terminate_process_group(&mut child);
+            rx.recv().unwrap_or_default()
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => Vec::new(),
+    };
+
+    let _ = child.wait();
+    match status {
+        Some(status) if status.success() => Some(stdout),
+        _ => None,
+    }
+}
+
+/// Configure `command` to start its child as a new process-group leader so the
+/// group can be signaled as a unit. No-op on non-Unix platforms.
+#[cfg(unix)]
+fn set_new_process_group(command: &mut Command) {
+    use std::os::unix::process::CommandExt as _;
+    command.process_group(0);
+}
+
+#[cfg(not(unix))]
+fn set_new_process_group(_command: &mut Command) {}
+
+/// Kill the child's whole process group so daemonized descendants that inherited
+/// the stdout pipe are terminated too. Falls back to killing just the child.
+#[cfg(unix)]
+fn terminate_process_group(child: &mut std::process::Child) {
+    // `set_new_process_group` made the child a group leader, so its PID doubles
+    // as the group ID; signaling the negated PID targets the entire group. The
+    // group stays valid while a descendant is alive, so this reaches survivors
+    // even after the leader has been reaped.
+    let raw_pid = i32::try_from(child.id()).unwrap_or(i32::MAX);
+    let pgid = nix::unistd::Pid::from_raw(-raw_pid);
+    let _ = nix::sys::signal::kill(pgid, nix::sys::signal::Signal::SIGKILL);
+    let _ = child.kill();
+}
+
+#[cfg(not(unix))]
+fn terminate_process_group(child: &mut std::process::Child) {
+    let _ = child.kill();
 }
 
 /// Query the Podman CLI to discover the host-side API socket path.
@@ -2078,6 +2135,29 @@ mod tests {
             elapsed < Duration::from_secs(5),
             "bounded command did not return promptly: {elapsed:?}"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_bounded_command_bounds_drain_when_descendant_holds_stdout() {
+        // The shell exits immediately after `echo`, but the backgrounded child
+        // inherits and holds the stdout pipe open. Without bounding the drain
+        // (and killing the process group), `read_to_end` would wait ~30s for
+        // EOF even though the direct child already exited.
+        let start = Instant::now();
+        let result = run_bounded_command(
+            "sh",
+            &["-c", "sleep 30 & echo done"],
+            Duration::from_millis(300),
+        );
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "drain blocked on a descendant holding stdout: {elapsed:?}"
+        );
+        // The direct child exited 0 and its flushed output is still collected
+        // once the group is killed and the pipe reaches EOF.
+        assert_eq!(result, Some(b"done\n".to_vec()));
     }
 
     #[cfg(unix)]
