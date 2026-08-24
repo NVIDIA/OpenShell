@@ -272,26 +272,47 @@ pub fn draw_detail_popup(
         );
     }
 
-    // Hit count (accumulated real denial count) and first/last seen.
-    lines.push(Line::from(vec![
-        Span::styled("Denied:     ", t.muted),
-        Span::styled(
-            format!(
-                "{} connection{}",
-                chunk.hit_count,
-                if chunk.hit_count == 1 { "" } else { "s" }
-            ),
-            t.accent,
-        ),
-        Span::styled(
-            format!(
-                "  (first {} / last {})",
-                format_short_time(chunk.first_seen_ms),
-                format_short_time(chunk.last_seen_ms),
-            ),
+    // Hit count (accumulated real denial count) and first/last seen. Kept on one
+    // row while it fits, so a narrow terminal wraps it instead of losing the tail.
+    let denied_label = "Denied:     ";
+    let denied_count = format!(
+        "{} connection{}",
+        chunk.hit_count,
+        if chunk.hit_count == 1 { "" } else { "s" }
+    );
+    let denied_seen = format!(
+        "(first {} / last {})",
+        format_short_time(chunk.first_seen_ms),
+        format_short_time(chunk.last_seen_ms),
+    );
+    let denied_width = denied_label.chars().count()
+        + denied_count.chars().count()
+        + 2
+        + denied_seen.chars().count();
+    if denied_width <= text_width {
+        lines.push(Line::from(vec![
+            Span::styled(denied_label, t.muted),
+            Span::styled(denied_count, t.accent),
+            Span::styled(format!("  {denied_seen}"), t.muted),
+        ]));
+    } else {
+        push_wrapped(
+            &mut lines,
+            denied_label,
             t.muted,
-        ),
-    ]));
+            &denied_count,
+            t.accent,
+            text_width,
+        );
+        push_wrapped(
+            &mut lines,
+            &" ".repeat(denied_label.chars().count()),
+            t.muted,
+            &denied_seen,
+            t.muted,
+            text_width,
+        );
+    }
 
     // Endpoints.
     if let Some(ref rule) = chunk.proposed_rule {
@@ -349,15 +370,36 @@ pub fn draw_detail_popup(
         );
     }
 
-    // Split the inner area into a scrollable body and a pinned hint row, so the
-    // action and close controls stay on screen however long the content is.
+    // Split the inner area into a scrollable body and pinned hint rows, so the
+    // action and close controls stay on screen however long the content is. The
+    // hints need a second row on a narrow terminal and that shrinks the body, so
+    // settle the two together.
     let inner = block.inner(popup_area);
+    let inner_height = usize::from(inner.height);
+    let total_rows = lines.len();
+    let max_footer = inner_height.saturating_sub(1).max(1);
+
+    let mut footer_rows = 1usize;
+    let mut hint_rows = Vec::new();
+    for _ in 0..2 {
+        let body = inner_height.saturating_sub(footer_rows);
+        let scrollable = total_rows.saturating_sub(body) > 0;
+        hint_rows = pack_hints(&hint_units(chunk, t, scrollable), text_width);
+        let needed = hint_rows.len().clamp(1, max_footer);
+        if needed == footer_rows {
+            break;
+        }
+        footer_rows = needed;
+    }
+
     let parts = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(0), Constraint::Length(1)])
+        .constraints([
+            Constraint::Min(0),
+            Constraint::Length(u16::try_from(footer_rows).unwrap_or(1)),
+        ])
         .split(inner);
     let body_height = usize::from(parts[0].height);
-    let total_rows = lines.len();
     let max_scroll = total_rows.saturating_sub(body_height);
     let scroll = scroll.min(max_scroll);
 
@@ -378,43 +420,7 @@ pub fn draw_detail_popup(
         Paragraph::new(lines).scroll((u16::try_from(scroll).unwrap_or(u16::MAX), 0)),
         parts[0],
     );
-
-    // Action hints — state-aware toggle keys, pinned below the scrolling body.
-    let mut hint_spans: Vec<Span<'_>> = Vec::new();
-    match chunk.status.as_str() {
-        "pending" => {
-            hint_spans.extend([
-                Span::styled("[a]", t.key_hint),
-                Span::styled(" Approve  ", t.text),
-                Span::styled("[x]", t.key_hint),
-                Span::styled(" Reject  ", t.text),
-            ]);
-        }
-        "approved" => {
-            hint_spans.extend([
-                Span::styled("[x]", t.key_hint),
-                Span::styled(" Revoke  ", t.text),
-            ]);
-        }
-        "rejected" => {
-            hint_spans.extend([
-                Span::styled("[a]", t.key_hint),
-                Span::styled(" Approve  ", t.text),
-            ]);
-        }
-        _ => {}
-    }
-    if max_scroll > 0 {
-        hint_spans.extend([
-            Span::styled("[j/k]", t.key_hint),
-            Span::styled(" Scroll  ", t.text),
-        ]);
-    }
-    hint_spans.extend([
-        Span::styled("[Esc]", t.muted),
-        Span::styled(" Close", t.muted),
-    ]);
-    frame.render_widget(Paragraph::new(Line::from(hint_spans)), parts[1]);
+    frame.render_widget(Paragraph::new(hint_rows), parts[1]);
 
     DetailMetrics {
         total_rows,
@@ -612,6 +618,64 @@ fn push_wrapped(
         };
         lines.push(Line::from(vec![head, Span::styled(row, text_style)]));
     }
+}
+
+/// One footer hint: the spans that render it, and its display width.
+type HintUnit = (Vec<Span<'static>>, usize);
+
+/// State-aware hints for the detail popup footer.
+fn hint_units(chunk: &PolicyChunk, t: &crate::theme::Theme, scrollable: bool) -> Vec<HintUnit> {
+    let mut units: Vec<HintUnit> = Vec::new();
+    {
+        let mut add = |key: &str, label: &str, key_style: Style, label_style: Style| {
+            units.push((
+                vec![
+                    Span::styled(key.to_string(), key_style),
+                    Span::styled(label.to_string(), label_style),
+                ],
+                key.chars().count() + label.chars().count(),
+            ));
+        };
+        match chunk.status.as_str() {
+            "pending" => {
+                add("[a]", " Approve  ", t.key_hint, t.text);
+                add("[x]", " Reject  ", t.key_hint, t.text);
+            }
+            "approved" => add("[x]", " Revoke  ", t.key_hint, t.text),
+            "rejected" => add("[a]", " Approve  ", t.key_hint, t.text),
+            _ => {}
+        }
+        if scrollable {
+            add("[j/k]", " Scroll  ", t.key_hint, t.text);
+        }
+        add("[Esc]", " Close", t.muted, t.muted);
+    }
+    units
+}
+
+/// Pack hint units into rows no wider than `width`, never splitting a unit.
+///
+/// A narrow terminal would otherwise clip the trailing hints, and `[Esc] Close`
+/// is the last one.
+fn pack_hints(units: &[HintUnit], width: usize) -> Vec<Line<'static>> {
+    let mut rows: Vec<Line<'static>> = Vec::new();
+    let mut current: Vec<Span<'static>> = Vec::new();
+    let mut current_width = 0usize;
+    for (spans, unit_width) in units {
+        if current_width + unit_width > width && !current.is_empty() {
+            rows.push(Line::from(std::mem::take(&mut current)));
+            current_width = 0;
+        }
+        current.extend(spans.iter().cloned());
+        current_width += unit_width;
+    }
+    if !current.is_empty() {
+        rows.push(Line::from(current));
+    }
+    if rows.is_empty() {
+        rows.push(Line::from(String::new()));
+    }
+    rows
 }
 
 /// The reviewer's persisted note for a rejected chunk.
@@ -1095,5 +1159,75 @@ mod tests {
             !screen.contains("Scroll"),
             "scroll hint should be hidden when everything fits"
         );
+    }
+
+    fn denied_chunk(status: &str, reason: &str) -> PolicyChunk {
+        PolicyChunk {
+            status: status.to_string(),
+            rejection_reason: reason.to_string(),
+            rule_name: "allow-github".to_string(),
+            confidence: 0.82,
+            hit_count: 3,
+            first_seen_ms: 1_700_000_000_000,
+            last_seen_ms: 1_700_000_100_000,
+            ..Default::default()
+        }
+    }
+
+    /// Dropping `Wrap` means anything not routed through `push_wrapped` clips
+    /// horizontally, so the denial timestamps have to wrap on a narrow popup.
+    #[test]
+    fn denied_timestamps_survive_a_narrow_popup() {
+        for width in [60u16, 70u16, 80u16] {
+            let chunk = denied_chunk("rejected", "scope this to docs/ paths only");
+            let (screen, _) = render(&chunk, width, 24, 0);
+            assert!(
+                screen.contains("22:13:20"),
+                "first-seen lost at width {width}"
+            );
+            assert!(
+                screen.contains("22:15:00"),
+                "last-seen lost at width {width}"
+            );
+        }
+    }
+
+    /// The close hint is the last one, so a narrow footer would drop it first.
+    #[test]
+    fn close_hint_survives_a_narrow_popup_with_scrollable_content() {
+        for width in [60u16, 70u16, 80u16] {
+            let chunk = denied_chunk("pending", "");
+            let chunk = PolicyChunk {
+                rationale: long_reason(),
+                ..chunk
+            };
+            let (screen, max_scroll) = render(&chunk, width, 24, 0);
+            assert!(max_scroll > 0, "content should overflow at width {width}");
+            assert!(screen.contains("Close"), "close hint lost at width {width}");
+            assert!(
+                screen.contains("Approve"),
+                "approve hint lost at width {width}"
+            );
+            assert!(
+                screen.contains("Reject"),
+                "reject hint lost at width {width}"
+            );
+        }
+    }
+
+    #[test]
+    fn hints_pack_onto_one_row_when_they_fit() {
+        let theme = Theme::dark();
+        let chunk = denied_chunk("pending", "");
+        let rows = pack_hints(&hint_units(&chunk, &theme, true), 200);
+        assert_eq!(rows.len(), 1);
+    }
+
+    #[test]
+    fn hints_spill_onto_a_second_row_when_they_do_not_fit() {
+        let theme = Theme::dark();
+        let chunk = denied_chunk("pending", "");
+        let rows = pack_hints(&hint_units(&chunk, &theme, true), 30);
+        assert!(rows.len() > 1, "hints should wrap at 30 columns");
     }
 }
