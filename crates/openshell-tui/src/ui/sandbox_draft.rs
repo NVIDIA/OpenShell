@@ -150,6 +150,12 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
             if chunk.hit_count > 1 {
                 spans.push(Span::styled(format!("  {}x", chunk.hit_count), t.accent));
             }
+            if let Some(reason) = rejection_guidance(chunk) {
+                spans.push(Span::styled(
+                    format!("  \"{}\"", truncate_str(reason, 32)),
+                    t.muted,
+                ));
+            }
 
             let mut line = Line::from(spans);
             if is_selected {
@@ -218,6 +224,14 @@ pub fn draw_detail_popup(
         lines.push(Line::from(vec![
             Span::styled("Review:     ", t.muted),
             Span::styled(annotation.detail_label, annotation_style),
+        ]));
+    }
+
+    // Reviewer's persisted rejection guidance.
+    if let Some(reason) = rejection_guidance(chunk) {
+        lines.push(Line::from(vec![
+            Span::styled("Guidance:   ", t.muted),
+            Span::styled(reason, t.status_err),
         ]));
     }
 
@@ -460,6 +474,19 @@ fn truncate_str(s: &str, max_len: usize) -> String {
     }
 }
 
+/// The reviewer's persisted note for a rejected chunk.
+///
+/// Gated on status rather than on the field alone: the gateway's
+/// `update_draft_chunk_status` leaves `rejection_reason` untouched when a chunk
+/// is later approved, so an approved chunk can still carry a stale note.
+fn rejection_guidance(chunk: &PolicyChunk) -> Option<&str> {
+    if chunk.status != "rejected" {
+        return None;
+    }
+    let reason = chunk.rejection_reason.trim();
+    (!reason.is_empty()).then_some(reason)
+}
+
 #[derive(Clone, Copy)]
 enum ApprovalAnnotationKind {
     AutoApproved,
@@ -700,4 +727,65 @@ fn format_short_time(epoch_ms: i64) -> String {
     let minutes = (time_of_day % 3600) / 60;
     let seconds = time_of_day % 60;
     format!("{hours:02}:{minutes:02}:{seconds:02}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_chunk(status: &str, rejection_reason: &str) -> PolicyChunk {
+        PolicyChunk {
+            status: status.to_string(),
+            rejection_reason: rejection_reason.to_string(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn rejected_chunk_exposes_its_reason() {
+        let chunk = make_chunk("rejected", "too broad: allows any port");
+        assert_eq!(
+            rejection_guidance(&chunk),
+            Some("too broad: allows any port")
+        );
+    }
+
+    #[test]
+    fn approved_chunk_hides_stale_reason() {
+        // Approving passes None for the reason, which leaves the stored value in
+        // place, so a chunk rejected and later approved still carries the note.
+        let chunk = make_chunk("approved", "too broad: allows any port");
+        assert_eq!(rejection_guidance(&chunk), None);
+    }
+
+    #[test]
+    fn pending_chunk_has_no_guidance() {
+        assert_eq!(rejection_guidance(&make_chunk("pending", "")), None);
+    }
+
+    #[test]
+    fn blank_reason_is_dropped() {
+        assert_eq!(rejection_guidance(&make_chunk("rejected", "")), None);
+        assert_eq!(rejection_guidance(&make_chunk("rejected", "   \n")), None);
+    }
+
+    #[test]
+    fn reason_is_trimmed() {
+        let chunk = make_chunk("rejected", "  needs a narrower host  ");
+        assert_eq!(rejection_guidance(&chunk), Some("needs a narrower host"));
+    }
+
+    #[test]
+    fn long_reason_truncates_for_the_list_row() {
+        let reason = "rejected because the endpoint list is far too permissive";
+        let shown = truncate_str(reason, 32);
+        assert_eq!(shown.chars().count(), 32);
+        assert!(shown.ends_with("..."));
+        assert!(shown.starts_with("rejected because"));
+    }
+
+    #[test]
+    fn short_reason_is_not_truncated() {
+        assert_eq!(truncate_str("too broad", 32), "too broad");
+    }
 }
