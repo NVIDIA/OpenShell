@@ -158,6 +158,8 @@ func TestParseMetadata_OIDCFields(t *testing.T) {
 		"name":"oidc-gw",
 		"oidc_issuer":"https://auth.example.com",
 		"oidc_client_id":"my-client-id"
+		,"oidc_audience":"openshell-api",
+		"oidc_scopes":"sandbox:read sandbox:write"
 	}`)
 
 	cfg, err := parseMetadata(dir)
@@ -166,6 +168,8 @@ func TestParseMetadata_OIDCFields(t *testing.T) {
 	assert.Equal(t, AuthModeOIDC, cfg.AuthMode)
 	assert.Equal(t, "https://auth.example.com", cfg.OIDCIssuer)
 	assert.Equal(t, "my-client-id", cfg.OIDCClientID)
+	assert.Equal(t, "openshell-api", cfg.OIDCAudience)
+	assert.Equal(t, "sandbox:read sandbox:write", cfg.OIDCScopes)
 }
 
 func TestParseMetadata_OIDCFieldsMissing(t *testing.T) {

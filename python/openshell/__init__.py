@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 from .sandbox import (
+    ClientCredentialsAuth,
     ExecChunk,
     ExecResult,
     InferenceRouteClient,
@@ -29,6 +30,7 @@ except Exception:
     __version__ = "0.0.0"
 
 __all__ = [
+    "ClientCredentialsAuth",
     "ExecChunk",
     "ExecResult",
     "InferenceRouteClient",

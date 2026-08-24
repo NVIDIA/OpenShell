@@ -76,6 +76,12 @@ type Config struct {
 	// OIDCClientID is the OAuth2 client ID read from metadata.json.
 	// Empty when the gateway does not use OIDC auth.
 	OIDCClientID string
+
+	// OIDCAudience is the optional resource-server audience.
+	OIDCAudience string
+
+	// OIDCScopes contains the configured space-separated OAuth2 scopes.
+	OIDCScopes string
 }
 
 // Info is a lightweight summary of a gateway for listing purposes.
@@ -100,6 +106,8 @@ type metadataJSON struct {
 	Name         string `json:"name"`
 	OIDCIssuer   string `json:"oidc_issuer"`
 	OIDCClientID string `json:"oidc_client_id"`
+	OIDCAudience string `json:"oidc_audience"`
+	OIDCScopes   string `json:"oidc_scopes"`
 }
 
 // parseAuthMode converts a raw auth_mode string to the typed AuthMode.
@@ -153,5 +161,7 @@ func parseMetadata(dir string) (*Config, error) {
 		Dir:          dir,
 		OIDCIssuer:   meta.OIDCIssuer,
 		OIDCClientID: meta.OIDCClientID,
+		OIDCAudience: meta.OIDCAudience,
+		OIDCScopes:   meta.OIDCScopes,
 	}, nil
 }

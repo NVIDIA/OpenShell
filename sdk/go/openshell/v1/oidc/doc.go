@@ -48,7 +48,7 @@
 //
 // For non-interactive service accounts:
 //
-//	token, err := oidc.ClientCredentials(ctx,
+//	auth, err := oidc.NewClientCredentialsAuth(
 //	    oidc.WithIssuer("https://auth.example.com"),
 //	    oidc.WithClientID("my-service"),
 //	    oidc.WithClientSecret("secret"),

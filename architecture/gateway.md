@@ -189,6 +189,12 @@ reuses them when refreshing an access token. This preserves the intended API
 resource selection for identity providers that bind access-token audiences to
 OAuth scopes.
 
+SDK client-credentials providers use the same registered issuer, client ID,
+audience, and scope metadata but own a separate in-memory lifecycle. They repeat
+the grant before expiry and never persist the client secret or acquired access
+token into the CLI token cache. This keeps non-interactive SDK authentication
+independent from refresh-token rotation and shared disk state.
+
 Gateway health and user authentication are separate probes. `OpenShell.Health`
 remains unauthenticated so deployment and load-balancer health checks do not
 depend on user credentials. The CLI uses the existing, side-effect-free

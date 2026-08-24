@@ -63,6 +63,12 @@ describe('buildTransport token exclusivity', () => {
     }
   });
 
+  it('rejects a renewable provider combined with another token', () => {
+    const oidcTokenProvider = { getToken: async () => 'token' };
+    const fn = () => buildTransport({ gateway: 'https://gw.local', oidcToken: 'a', oidcTokenProvider });
+    expect(fn).toThrow(/mutually exclusive/);
+  });
+
   it('rejects edge tokens that could inject cookies or headers', () => {
     for (const edgeToken of ['', 'jwt; other=value', 'jwt\r\nx-injected: yes', 'jwt with spaces']) {
       const fn = () => buildTransport({ gateway: 'https://gw.local', edgeToken });
