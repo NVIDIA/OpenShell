@@ -9,4 +9,5 @@
 //! - Parsing CLI output (ANSI stripping, field extraction)
 //! - TCP port utilities (wait for port, find free port)
 
+pub mod conformance;
 pub mod harness;
