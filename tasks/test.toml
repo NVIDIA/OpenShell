@@ -87,9 +87,10 @@ run = [
 ]
 
 ["e2e:cli-conformance"]
-description = "Run the portable CLI conformance baseline against a Docker-backed gateway"
+description = "Run the portable CLI conformance baseline against the configured gateway"
 run = [
-  "e2e/with-docker-gateway.sh cargo test --manifest-path e2e/rust/Cargo.toml --features e2e-docker,e2e-cli-conformance --test smoke --test sandbox_lifecycle --test sandbox_labels",
+  "if [ -z \"${OPENSHELL_BIN:-}\" ]; then cargo build -p openshell-cli; fi",
+  "cargo test --manifest-path e2e/rust/Cargo.toml --features e2e-cli-conformance --test smoke --test sandbox_lifecycle --test sandbox_labels",
 ]
 
 ["e2e:websocket-conformance"]

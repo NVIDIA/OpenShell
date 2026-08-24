@@ -172,18 +172,23 @@ Run the Docker-backed Rust CLI e2e suite:
 mise run e2e:rust
 ```
 
-Run the minimal portable CLI conformance profile against a Docker-backed
-gateway:
+Run the minimal portable CLI conformance profile against the gateway selected
+in your OpenShell CLI configuration:
 
 ```shell
 mise run e2e:cli-conformance
 ```
 
+The gateway must already be installed, reachable, and selected before the task
+starts. The task does not provision a gateway or select a compute driver. Set
+`OPENSHELL_BIN` to test a prebuilt CLI; otherwise, the task builds the CLI from
+the current checkout.
+
 The conformance task selects existing test targets explicitly. Driver suites
-enable the same profile when they run overlapping portable targets; the test
-implementations are shared instead of duplicated as driver-specific coverage.
-VM overlay and TLS-key permission assertions remain in the VM suite instead of
-the portable smoke workflow.
+provision their own gateways and enable the same profile when they run
+overlapping portable targets; the test implementations are shared instead of
+duplicated as driver-specific coverage. VM overlay and TLS-key permission
+assertions remain in the VM suite instead of the portable smoke workflow.
 
 Run the Podman-backed Rust CLI e2e suite:
 
