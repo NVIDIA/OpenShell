@@ -153,6 +153,10 @@ For maintainer-level implementation details, refer to the [Docker driver README]
 
 Select Docker with `compute_drivers = ["docker"]` in `[openshell.gateway]`. Configure Docker driver values such as `socket_path`, `grpc_endpoint`, `network_name`, `supervisor_bin`, `supervisor_image`, `image_pull_policy`, `ssh_socket_path`, `sandbox_pids_limit`, and `guest_tls_*` in `[openshell.drivers.docker]`. When `socket_path` is unset, the driver uses the same responsive local socket selected by auto-detection. An explicitly selected Docker driver falls back to `/var/run/docker.sock` when no candidate responds.
 
+When operating `openshell-driver-docker` as an external driver, set
+`OPENSHELL_OTLP_ENDPOINT` to export its spans. The driver continues W3C trace
+context from gateway RPCs and reports as `openshell-driver-docker`.
+
 Stop stops the existing Docker container without removing its writable
 layer or attached volumes. Start starts that same container. A durably
 stopped container stays stopped across gateway restart, and delete remains
