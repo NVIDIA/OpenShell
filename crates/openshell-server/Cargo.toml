@@ -146,7 +146,7 @@ telemetry = ["openshell-core/telemetry"]
 ## enabling it alongside `telemetry` is a compile error rather than a silent
 ## telemetry-on build. Kept in sync with `default` by
 ## `rust:verify:defaults-without-telemetry`.
-defaults-without-telemetry = []
+defaults-without-telemetry = ["in-tree-compute-drivers"]
 bundled-z3 = ["openshell-prover/bundled-z3"]
 test-support = []
 
