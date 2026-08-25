@@ -328,6 +328,11 @@ pub fn draw_detail_popup(
                 text_width,
             );
 
+            if let Some(warning) = scope_warning(ep) {
+                let warn = t.status_warn.add_modifier(Modifier::BOLD);
+                push_wrapped(&mut lines, "     ! ", warn, warning, warn, text_width);
+            }
+
             for detail in format_endpoint_details(ep) {
                 push_wrapped(&mut lines, "     ", t.text, &detail, t.text, text_width);
             }
@@ -863,6 +868,36 @@ fn format_endpoint_details(endpoint: &NetworkEndpoint) -> Vec<String> {
     details
 }
 
+/// Why a proposed endpoint is broader than the denial that prompted it.
+///
+/// An L4 endpoint allows the whole TCP port. A REST endpoint with no allow
+/// rules, or with an allow rule that leaves the method or path unset — rendered
+/// as `*` by `format_allow_rule` — still permits far more than the single
+/// request that was denied. Protocols other than REST scope on `command`
+/// instead, so they are left alone rather than warned about incorrectly.
+fn scope_warning(endpoint: &NetworkEndpoint) -> Option<&'static str> {
+    if endpoint.protocol.trim().is_empty() {
+        return Some(
+            "L4 rule: allows every connection to this host and port, not only the denied request",
+        );
+    }
+    if !endpoint.protocol.eq_ignore_ascii_case("rest") {
+        return None;
+    }
+    if endpoint.rules.is_empty() {
+        return Some("no method or path scope: allows every request to this host");
+    }
+    let unscoped = endpoint
+        .rules
+        .iter()
+        .filter_map(|rule| rule.allow.as_ref())
+        .any(|allow| allow.method.trim().is_empty() || allow.path.trim().is_empty());
+    if unscoped {
+        return Some("an allow rule leaves the method or path unset (*), widening the scope");
+    }
+    None
+}
+
 fn endpoint_layer_label(endpoint: &NetworkEndpoint) -> &str {
     if endpoint.protocol.eq_ignore_ascii_case("rest") {
         "L7 rest"
@@ -976,6 +1011,7 @@ fn format_short_time(epoch_ms: i64) -> String {
 mod tests {
     use super::*;
     use crate::theme::Theme;
+    use openshell_core::proto::{L7Rule, NetworkPolicyRule};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
@@ -1362,5 +1398,113 @@ mod tests {
         let chunk = denied_chunk("pending", "");
         let rows = pack_hints(&hint_units(&chunk, &theme, true), 30);
         assert!(rows.len() > 1, "hints should wrap at 30 columns");
+    }
+
+    // --- L4 / no-method-path scope warning ---------------------------------
+
+    fn scoped_endpoint(protocol: &str, rules: Vec<L7Rule>) -> NetworkEndpoint {
+        NetworkEndpoint {
+            host: "api.github.com".to_string(),
+            port: 443,
+            protocol: protocol.to_string(),
+            rules,
+            ..Default::default()
+        }
+    }
+
+    fn allow_rule(method: &str, path: &str) -> L7Rule {
+        L7Rule {
+            allow: Some(L7Allow {
+                method: method.to_string(),
+                path: path.to_string(),
+                ..Default::default()
+            }),
+        }
+    }
+
+    fn chunk_with(endpoint: NetworkEndpoint) -> PolicyChunk {
+        PolicyChunk {
+            status: "pending".to_string(),
+            rule_name: "allow-github".to_string(),
+            proposed_rule: Some(NetworkPolicyRule {
+                endpoints: vec![endpoint],
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// Rebuild a matchable string from a rendered buffer.
+    ///
+    /// Cells are joined row-major, so a wrapped phrase is split by row padding
+    /// and by the popup's own box-drawing border. Both become whitespace, then
+    /// whitespace collapses.
+    fn squash(text: &str) -> String {
+        text.chars()
+            .map(|c| {
+                if "│┌┐└┘─".contains(c) {
+                    ' '
+                } else {
+                    c
+                }
+            })
+            .collect::<String>()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    #[test]
+    fn l4_endpoint_is_flagged_as_unscoped() {
+        let warning = scope_warning(&scoped_endpoint("", vec![]));
+        assert!(warning.is_some_and(|w| w.starts_with("L4 rule:")));
+    }
+
+    #[test]
+    fn rest_endpoint_without_allow_rules_is_flagged() {
+        let warning = scope_warning(&scoped_endpoint("rest", vec![]));
+        assert!(warning.is_some_and(|w| w.contains("no method or path scope")));
+    }
+
+    #[test]
+    fn rest_allow_rule_without_method_or_path_is_flagged() {
+        for rule in [allow_rule("", "/repos/**"), allow_rule("GET", "")] {
+            let warning = scope_warning(&scoped_endpoint("rest", vec![rule]));
+            assert!(
+                warning.is_some_and(|w| w.contains("leaves the method or path unset")),
+                "unscoped allow rule should be flagged"
+            );
+        }
+    }
+
+    #[test]
+    fn fully_scoped_rest_endpoint_is_not_flagged() {
+        let endpoint = scoped_endpoint("rest", vec![allow_rule("GET", "/repos/**")]);
+        assert_eq!(scope_warning(&endpoint), None);
+    }
+
+    /// Non-REST protocols scope on `command`, so method and path say nothing
+    /// about how broad they are.
+    #[test]
+    fn non_rest_protocol_is_left_alone() {
+        assert_eq!(scope_warning(&scoped_endpoint("ssh", vec![])), None);
+    }
+
+    #[test]
+    fn scope_warning_is_rendered_in_the_detail_popup() {
+        let (screen, _) = render(&chunk_with(scoped_endpoint("", vec![])), 80, 24, 0);
+        assert!(
+            squash(&screen).contains("allows every connection to this host and port"),
+            "L4 warning should appear in the popup"
+        );
+    }
+
+    #[test]
+    fn a_scoped_endpoint_renders_no_warning() {
+        let endpoint = scoped_endpoint("rest", vec![allow_rule("GET", "/repos/**")]);
+        let (screen, _) = render(&chunk_with(endpoint), 80, 24, 0);
+        let seen = squash(&screen);
+        assert!(!seen.contains("allows every"), "unexpected warning: {seen}");
+        assert!(!seen.contains("no method or path scope"));
     }
 }
