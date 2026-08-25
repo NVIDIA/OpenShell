@@ -179,14 +179,34 @@ token, err := oidc.DeviceLogin(ctx,
 )
 ```
 
-For service accounts, use client credentials:
+For a one-shot service-account token exchange, use `ClientCredentials`. For a
+long-running SDK client, attach the renewable, memory-only auth provider:
 
 ```go
-token, err := oidc.ClientCredentials(ctx,
+auth, err := oidc.NewClientCredentialsAuth(
     oidc.WithGateway("my-gateway"),
-    oidc.WithClientSecret("service-secret"),
+    oidc.WithClientSecretProvider(func(context.Context) (string, error) {
+        return os.Getenv("OPENSHELL_OIDC_CLIENT_SECRET"), nil
+    }),
 )
+if err != nil {
+    log.Fatal(err)
+}
+
+client, err := v1.NewClient(v1.Config{
+    Address: "gateway.example.com:443",
+    Auth:    auth,
+    TLS:     tlsConfig,
+})
+if err != nil {
+    log.Fatal(err)
+}
+defer client.Close()
 ```
+
+You can use explicit `WithIssuer`, `WithClientID`, `WithScopes`, and
+`WithAudience` options instead of `WithGateway`. The provider repeats the grant
+before expiry and never writes the secret or access token to disk.
 
 See the [oidc package docs](https://pkg.go.dev/github.com/NVIDIA/OpenShell/sdk/go/openshell/v1/oidc) for all options and flows.
 
@@ -281,7 +301,7 @@ consumers import a single package. See the [Architecture](https://ro14nd.de/open
 | Typed errors (`IsNotFound`, `IsAlreadyExists`, `IsConflict`, ...) | `StatusError` | [Error Handling](https://ro14nd.de/openshell-sdk-go/error-handling.html) |
 | Real-time watch with auto-stop on terminal phase | `WatchInterface[T]` | [Sandboxes](https://ro14nd.de/openshell-sdk-go/api/sandboxes.html) |
 | Fake client for testing (no gRPC server needed) | `fake.Client` | [Testing](https://ro14nd.de/openshell-sdk-go/testing.html) |
-| OIDC login (browser, keyboard, device code, client credentials) | `oidc.Login`, `oidc.DeviceLogin`, `oidc.ClientCredentials` | [OIDC](https://pkg.go.dev/github.com/NVIDIA/OpenShell/sdk/go/openshell/v1/oidc) |
+| OIDC login and renewable service auth | `oidc.Login`, `oidc.DeviceLogin`, `oidc.ClientCredentials`, `oidc.NewClientCredentialsAuth` | [OIDC](https://pkg.go.dev/github.com/NVIDIA/OpenShell/sdk/go/openshell/v1/oidc) |
 | Gateway config convenience (load CLI gateway configs, auto-wire auth) | `gateway.NewClient`, `gateway.LoadConfig` | [Gateway](https://ro14nd.de/openshell-sdk-go/api/gateway.html) |
 
 ## Prerequisites

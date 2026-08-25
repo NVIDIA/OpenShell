@@ -122,6 +122,59 @@ openshell gateway add https://gateway.example.com \
 
 When you register or log in to an OIDC gateway, the CLI uses the Authorization Code flow with PKCE. It opens a browser, receives the authorization code on a localhost callback, exchanges the code for tokens, and stores the token bundle under the gateway credential directory. After `openshell gateway logout`, the next browser login asks the identity provider for a fresh login prompt so you can choose a different browser user instead of silently reusing the previous session. If `OPENSHELL_OIDC_CLIENT_SECRET` is set, the CLI uses the client credentials flow instead. Use that mode for CI and other non-interactive automation.
 
+Official Python, TypeScript, and Go SDKs can perform renewable client-credentials
+authentication directly. Configure the service account at the identity provider
+with the audience, roles, scopes, and workspace membership required by the
+gateway. The SDKs discover the token endpoint, attach the bearer token to each
+RPC, and repeat the grant before expiry. They keep the client secret and access
+token in memory and do not update the CLI's `oidc_token.json`. SDK clients
+require TLS when sending these credentials to a non-loopback gateway.
+
+<Tabs>
+  <Tab title="Python">
+
+```python
+from openshell import ClientCredentialsAuth, SandboxClient
+
+auth = ClientCredentialsAuth(
+    client_secret=lambda: load_secret(),
+    # Omit issuer/client_id/scopes/audience to use active gateway metadata.
+)
+client = SandboxClient.from_active_cluster(client_credentials=auth)
+```
+
+  </Tab>
+  <Tab title="TypeScript">
+
+```ts
+import { clientCredentials, OpenShellClient } from '@nvidia/openshell-sdk'
+
+const client = await OpenShellClient.connect({
+  gateway: 'https://gateway.example.com',
+  oidcTokenProvider: clientCredentials({
+    issuer: 'https://idp.example.com/realms/openshell',
+    clientId: 'openshell-service',
+    clientSecret: () => loadSecret(),
+    audience: 'openshell-gateway',
+    scopes: ['sandbox:read', 'sandbox:write'],
+  }),
+})
+```
+
+  </Tab>
+  <Tab title="Go">
+
+```go
+auth, err := oidc.NewClientCredentialsAuth(
+    oidc.WithGateway("production"),
+    oidc.WithClientSecretProvider(loadSecret),
+)
+client, err := v1.NewClient(v1.Config{Address: address, Auth: auth, TLS: tlsConfig})
+```
+
+  </Tab>
+</Tabs>
+
 The connection flow:
 
 For a headless environment, set `OPENSHELL_NO_BROWSER=1` before registering or logging in to the gateway. When this variable is set and `OPENSHELL_OIDC_CLIENT_SECRET` is not configured, the CLI uses the Device Authorization Grant (RFC 8628) with S256 PKCE. This flow prompts the user to visit a verification URL on any device with a browser and enter a displayed code. The CLI polls the token endpoint until the user completes authorization. This requires the OIDC client to have the device authorization grant enabled on the identity provider.

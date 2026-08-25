@@ -46,7 +46,8 @@ use openshell_core::proto::{
     GetSandboxRequest, GetServiceRequest, GpuResourceRequirements, ImportProviderProfilesRequest,
     LintProviderProfilesRequest, ListProviderProfilesRequest, ListProvidersRequest,
     ListSandboxPoliciesRequest, ListSandboxProvidersRequest, ListSandboxesRequest,
-    ListServicesRequest, PolicySource, PolicyStatus, Provider, ProviderCredentialRefreshStatus,
+    ListServicesRequest, PolicySource, PolicyStatus, Provider,
+    ProviderCredentialRefreshRecoveryAction, ProviderCredentialRefreshStatus,
     ProviderCredentialRefreshStrategy, ProviderCredentialTokenGrantType, ProviderProfile,
     ProviderProfileDiagnostic, ProviderProfileImportItem, RejectDraftChunkRequest,
     ResourceRequirements, RevokeSshSessionRequest, RotateProviderCredentialRequest, Sandbox,
@@ -4338,14 +4339,16 @@ pub async fn provider_refresh_status(
 
 fn refresh_status_header() -> String {
     format!(
-        "{:<24}  {:<28}  {:<28}  {:<18}  {:<20}  {:<20}  {:<20}  {}",
+        "{:<24}  {:<28}  {:<28}  {:<24}  {:<18}  {:<20}  {:<20}  {:<20}  {:<44}  {}",
         "PROVIDER".bold(),
         "CREDENTIAL_KEY".bold(),
         "STRATEGY".bold(),
         "STATUS".bold(),
+        "RECOVERY".bold(),
         "EXPIRES_AT".bold(),
         "NEXT_REFRESH".bold(),
         "LAST_REFRESH".bold(),
+        "FAILURE_CODE".bold(),
         "LAST_ERROR".bold(),
     )
 }
@@ -4497,17 +4500,41 @@ fn print_refresh_status_row(status: &ProviderCredentialRefreshStatus) {
 fn refresh_status_row(status: &ProviderCredentialRefreshStatus) -> String {
     let strategy = ProviderCredentialRefreshStrategy::try_from(status.strategy)
         .unwrap_or(ProviderCredentialRefreshStrategy::Unspecified);
+    let recovery_action = ProviderCredentialRefreshRecoveryAction::try_from(status.recovery_action)
+        .unwrap_or(ProviderCredentialRefreshRecoveryAction::Unspecified);
     format!(
-        "{:<24}  {:<28}  {:<28}  {:<18}  {:<20}  {:<20}  {:<20}  {}",
+        "{:<24}  {:<28}  {:<28}  {:<24}  {:<18}  {:<20}  {:<20}  {:<20}  {:<44}  {}",
         status.provider_name,
         status.credential_key,
         provider_refresh_strategy_name(strategy),
         status.status,
+        provider_refresh_recovery_action_name(recovery_action),
         format_optional_epoch_ms(status.expires_at_ms),
-        format_optional_epoch_ms(status.next_refresh_at_ms),
+        format_refresh_next_at_ms(status.next_refresh_at_ms),
         format_optional_epoch_ms(status.last_refresh_at_ms),
+        status.failure_code,
         truncate_status_field(&status.last_error, 72),
     )
+}
+
+fn format_refresh_next_at_ms(next_refresh_at_ms: i64) -> String {
+    if next_refresh_at_ms == i64::MAX {
+        "-".to_string()
+    } else {
+        format_optional_epoch_ms(next_refresh_at_ms)
+    }
+}
+
+fn provider_refresh_recovery_action_name(
+    action: ProviderCredentialRefreshRecoveryAction,
+) -> &'static str {
+    match action {
+        ProviderCredentialRefreshRecoveryAction::Retry => "retry",
+        ProviderCredentialRefreshRecoveryAction::Reauthorize => "reauthorize",
+        ProviderCredentialRefreshRecoveryAction::FixConfiguration => "fix_configuration",
+        ProviderCredentialRefreshRecoveryAction::Investigate => "investigate",
+        ProviderCredentialRefreshRecoveryAction::Unspecified => "-",
+    }
 }
 
 fn provider_refresh_strategy_name(strategy: ProviderCredentialRefreshStrategy) -> &'static str {
@@ -7403,10 +7430,11 @@ mod tests {
     };
     use openshell_core::proto::{
         GetSandboxConfigResponse, GpuResourceRequirements, PolicySource, PolicyStatus, Provider,
-        ProviderCredentialRefresh, ProviderCredentialRefreshStatus,
-        ProviderCredentialRefreshStrategy, ProviderCredentialTokenGrant, ProviderProfile,
-        ProviderProfileCredential, ResourceRequirements, Sandbox, SandboxCondition, SandboxPhase,
-        SandboxPolicyRevision, SandboxStatus, datamodel::v1::ObjectMeta,
+        ProviderCredentialRefresh, ProviderCredentialRefreshRecoveryAction,
+        ProviderCredentialRefreshStatus, ProviderCredentialRefreshStrategy,
+        ProviderCredentialTokenGrant, ProviderProfile, ProviderProfileCredential,
+        ResourceRequirements, Sandbox, SandboxCondition, SandboxPhase, SandboxPolicyRevision,
+        SandboxStatus, datamodel::v1::ObjectMeta,
     };
 
     #[test]
@@ -7645,6 +7673,8 @@ mod tests {
         let header = refresh_status_header();
         assert!(header.contains("NEXT_REFRESH"));
         assert!(header.contains("LAST_REFRESH"));
+        assert!(header.contains("RECOVERY"));
+        assert!(header.contains("FAILURE_CODE"));
         assert!(header.contains("LAST_ERROR"));
 
         let row = refresh_status_row(&ProviderCredentialRefreshStatus {
@@ -7654,17 +7684,24 @@ mod tests {
             strategy: ProviderCredentialRefreshStrategy::Oauth2ClientCredentials as i32,
             status: "error".to_string(),
             expires_at_ms: 1_767_225_600_000,
-            next_refresh_at_ms: 1_767_225_660_000,
+            next_refresh_at_ms: i64::MAX,
             last_refresh_at_ms: 1_767_225_000_000,
             last_error: "token endpoint returned a very long error message that should be truncated for table readability"
                 .to_string(),
+            recovery_action: ProviderCredentialRefreshRecoveryAction::Reauthorize as i32,
+            failure_code: "oauth_rotated_refresh_token_handle_missing".to_string(),
+            provider_error_subtype: "invalid_rapt".to_string(),
+            last_error_at_ms: 1_767_225_000_000,
         });
 
         assert!(row.contains("my-graph"));
         assert!(row.contains("MS_GRAPH_ACCESS_TOKEN"));
         assert!(row.contains("oauth2_client_credentials"));
         assert!(row.contains("error"));
+        assert!(row.contains("reauthorize"));
+        assert!(row.contains("oauth_rotated_refresh_token_handle_missing"));
         assert!(row.contains("2026-01-01 00:00:00"));
+        assert!(!row.contains("292278994"));
         assert!(row.contains("..."));
     }
 

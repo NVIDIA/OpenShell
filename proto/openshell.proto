@@ -1620,9 +1620,23 @@ message ProviderCredentialRefreshStatus {
   ProviderCredentialRefreshStrategy strategy = 4;
   string status = 5;
   int64 expires_at_ms = 6;
+  // Next automatic refresh time in Unix epoch milliseconds. A value of
+  // 9223372036854775807 (int64 max) means no automatic retry is scheduled;
+  // consumers should render it as unset and use recovery_action to determine
+  // the required recovery workflow.
   int64 next_refresh_at_ms = 7;
   int64 last_refresh_at_ms = 8;
   string last_error = 9;
+  ProviderCredentialRefreshRecoveryAction recovery_action = 10;
+  // Stable gateway-owned failure identifier, for example
+  // "oauth_invalid_grant". This is not provider-controlled prose and
+  // incorporates any recognized top-level OAuth error classification.
+  string failure_code = 11;
+  // A bounded, recognized provider subtype that refines failure_code; clients
+  // do not need a separate provider_error field. Unknown provider-controlled
+  // values are not persisted or returned.
+  string provider_error_subtype = 12;
+  int64 last_error_at_ms = 13;
 }
 
 // Provider profile local discovery declaration.
@@ -1643,6 +1657,7 @@ message StoredProviderCredentialRefreshState {
   // are not automatically migrated before OpenShell 0.1.0.
   repeated string secret_material_keys = 7;
   int64 expires_at_ms = 8;
+  // int64 max parks the refresh until an explicit rotation or reconfiguration.
   int64 next_refresh_at_ms = 9;
   int64 last_refresh_at_ms = 10;
   string status = 11;
@@ -1671,6 +1686,12 @@ message StoredProviderCredentialRefreshState {
   // Cleanup is retried by the refresh worker so a gateway crash or temporary
   // credential-backend outage does not lose the deletion reference.
   repeated StoredRefreshMaterialDeletion pending_secret_deletions = 20;
+  // Structured recovery details for the most recent refresh failure. These
+  // fields contain only gateway-owned codes and recognized bounded values.
+  ProviderCredentialRefreshRecoveryAction recovery_action = 21;
+  string failure_code = 22;
+  string provider_error_subtype = 23;
+  int64 last_error_at_ms = 24;
 }
 
 message StoredRefreshMaterialDeletion {
@@ -2785,6 +2806,18 @@ enum WorkspaceRole {
   WORKSPACE_ROLE_UNSPECIFIED = 0;
   WORKSPACE_ROLE_USER = 1;
   WORKSPACE_ROLE_ADMIN = 2;
+}
+
+// Stable recovery action for the most recent provider credential refresh
+// failure. Kept after the pre-existing enums so adding it does not renumber
+// their generated descriptors. Clients should use this field instead of
+// parsing last_error.
+enum ProviderCredentialRefreshRecoveryAction {
+  PROVIDER_CREDENTIAL_REFRESH_RECOVERY_ACTION_UNSPECIFIED = 0;
+  PROVIDER_CREDENTIAL_REFRESH_RECOVERY_ACTION_RETRY = 1;
+  PROVIDER_CREDENTIAL_REFRESH_RECOVERY_ACTION_REAUTHORIZE = 2;
+  PROVIDER_CREDENTIAL_REFRESH_RECOVERY_ACTION_FIX_CONFIGURATION = 3;
+  PROVIDER_CREDENTIAL_REFRESH_RECOVERY_ACTION_INVESTIGATE = 4;
 }
 
 // Workspace membership record.

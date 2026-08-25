@@ -228,11 +228,11 @@ impl InferenceContext {
     }
 }
 
-#[derive(Debug)]
 pub struct ProxyHandle {
     #[allow(dead_code)]
     http_addr: Option<SocketAddr>,
     join: JoinHandle<()>,
+    exited_rx: Option<tokio::sync::oneshot::Receiver<()>>,
 }
 
 impl ProxyHandle {
@@ -337,7 +337,13 @@ impl ProxyHandle {
             ocsf_emit!(event);
         }
 
+        let (exited_tx, exited_rx) = tokio::sync::oneshot::channel::<()>();
         let join = tokio::spawn(async move {
+            // Hold the sender for the lifetime of this task — when the task
+            // exits (panic, abort, or loop break), the sender drops and the
+            // receiver fires, notifying the sandbox that the proxy is gone.
+            let _proxy_exit_guard = exited_tx;
+
             // Wait for the OPA engine's symlink resolution reload to complete
             // before accepting connections. This prevents requests from
             // observing a generation transition mid-flight, which would cause
@@ -422,23 +428,36 @@ impl ProxyHandle {
                         });
                     }
                     Err(err) => {
-                        let outcome = handle_accept_error(
+                        match classify_accept_error(
                             &err,
                             &mut consecutive_resource_errors,
                             &mut consecutive_unknown_errors,
-                        );
-
-                        let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
-                            .activity(ActivityId::Fail)
-                            .severity(outcome.severity)
-                            .status(StatusId::Failure)
-                            .message(outcome.message)
-                            .build();
-                        ocsf_emit!(event);
-
-                        match outcome.backoff {
-                            Some(backoff) => tokio::time::sleep(backoff).await,
-                            None => break,
+                        ) {
+                            AcceptAction::Terminal => {
+                                let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
+                                    .activity(ActivityId::Fail)
+                                    .severity(SeverityId::High)
+                                    .status(StatusId::Failure)
+                                    .message(format!(
+                                        "Proxy accept loop exiting on terminal error: {err}",
+                                    ))
+                                    .build();
+                                ocsf_emit!(event);
+                                break;
+                            }
+                            AcceptAction::Retry { backoff, severity } => {
+                                let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
+                                    .activity(ActivityId::Fail)
+                                    .severity(severity)
+                                    .status(StatusId::Failure)
+                                    .message(format!(
+                                        "Proxy accept error (retrying in {}ms): {err}",
+                                        backoff.as_millis(),
+                                    ))
+                                    .build();
+                                ocsf_emit!(event);
+                                tokio::time::sleep(backoff).await;
+                            }
                         }
                     }
                 }
@@ -448,12 +467,17 @@ impl ProxyHandle {
         Ok(Self {
             http_addr: Some(local_addr),
             join,
+            exited_rx: Some(exited_rx),
         })
     }
 
     #[allow(dead_code)]
     pub const fn http_addr(&self) -> Option<SocketAddr> {
         self.http_addr
+    }
+
+    pub fn take_exit_receiver(&mut self) -> Option<tokio::sync::oneshot::Receiver<()>> {
+        self.exited_rx.take()
     }
 }
 
@@ -972,142 +996,106 @@ fn emit_transparent_policy_denial(
     );
 }
 
-fn emit_activity(tx: &Option<ActivitySender>, denied: bool, deny_group: &'static str) {
-    if let Some(tx) = tx {
-        let _ = try_record_activity(tx, denied, deny_group);
-    }
-}
+const MAX_CONSECUTIVE_UNKNOWN_ACCEPT_ERRORS: u32 = 10;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AcceptErrorClass {
-    Transient,
+#[derive(Debug, PartialEq)]
+enum AcceptAction {
     Terminal,
-    Unknown,
+    Retry {
+        backoff: std::time::Duration,
+        severity: SeverityId,
+    },
 }
 
-#[cfg(unix)]
-fn classify_accept_error(err: &std::io::Error) -> AcceptErrorClass {
-    match err.raw_os_error() {
-        Some(
-            libc::EMFILE
-            | libc::ENFILE
-            | libc::ENOBUFS
-            | libc::ENOMEM
-            | libc::ECONNABORTED
-            | libc::ECONNRESET
-            | libc::EINTR
-            | libc::ENETDOWN
-            | libc::EPROTO
-            | libc::ENOPROTOOPT
-            | libc::EHOSTDOWN
-            | libc::EHOSTUNREACH
-            | libc::EOPNOTSUPP
-            | libc::ENETUNREACH
-            | libc::ENOSR
-            | libc::ESOCKTNOSUPPORT
-            | libc::EPROTONOSUPPORT
-            | libc::ETIMEDOUT,
-        ) => AcceptErrorClass::Transient,
-        #[cfg(target_os = "linux")]
-        Some(libc::ENONET) => AcceptErrorClass::Transient,
-        Some(libc::EBADF | libc::EINVAL | libc::ENOTSOCK) => AcceptErrorClass::Terminal,
-        _ => AcceptErrorClass::Unknown,
-    }
-}
-
-#[cfg(not(unix))]
-fn classify_accept_error(_err: &std::io::Error) -> AcceptErrorClass {
-    AcceptErrorClass::Unknown
-}
-
-#[cfg(unix)]
-fn is_resource_pressure_error(err: &std::io::Error) -> bool {
-    matches!(
-        err.raw_os_error(),
-        Some(libc::EMFILE | libc::ENFILE | libc::ENOBUFS | libc::ENOMEM | libc::ENOSR)
-    )
-}
-
-#[cfg(not(unix))]
-fn is_resource_pressure_error(_err: &std::io::Error) -> bool {
-    false
-}
-
-const ACCEPT_BACKOFF_BASE_MS: u64 = 100;
-const ACCEPT_BACKOFF_MAX_MS: u64 = 5_000;
-const MAX_CONSECUTIVE_UNKNOWN_ERRORS: u32 = 5;
-
-fn accept_backoff(consecutive_errors: u32) -> std::time::Duration {
-    let exponent = consecutive_errors.saturating_sub(1).min(7);
-    let ms = ACCEPT_BACKOFF_BASE_MS
-        .saturating_mul(1u64 << exponent)
-        .min(ACCEPT_BACKOFF_MAX_MS);
-    std::time::Duration::from_millis(ms)
-}
-
-struct AcceptErrorOutcome {
-    severity: SeverityId,
-    message: String,
-    backoff: Option<std::time::Duration>,
-}
-
-fn handle_accept_error(
+fn classify_accept_error(
     err: &std::io::Error,
     consecutive_resource_errors: &mut u32,
     consecutive_unknown_errors: &mut u32,
-) -> AcceptErrorOutcome {
-    let class = classify_accept_error(err);
+) -> AcceptAction {
+    #[cfg(unix)]
+    if matches!(
+        err.raw_os_error(),
+        Some(libc::EBADF | libc::EINVAL | libc::ENOTSOCK)
+    ) {
+        return AcceptAction::Terminal;
+    }
 
-    match class {
-        AcceptErrorClass::Terminal => AcceptErrorOutcome {
-            severity: SeverityId::High,
-            message: format!("Proxy accept error (terminal, exiting): {err}"),
-            backoff: None,
-        },
-        AcceptErrorClass::Unknown => {
-            *consecutive_unknown_errors = consecutive_unknown_errors.saturating_add(1);
-            if *consecutive_unknown_errors > MAX_CONSECUTIVE_UNKNOWN_ERRORS {
-                AcceptErrorOutcome {
-                    severity: SeverityId::High,
-                    message: format!(
-                        "Proxy accept error (exceeded {MAX_CONSECUTIVE_UNKNOWN_ERRORS} retries, exiting): {err}"
-                    ),
-                    backoff: None,
-                }
-            } else {
-                let backoff = accept_backoff(*consecutive_unknown_errors);
-                AcceptErrorOutcome {
-                    severity: SeverityId::Medium,
-                    message: format!(
-                        "Proxy accept error (retry {}/{MAX_CONSECUTIVE_UNKNOWN_ERRORS} in {}ms): {err}",
-                        *consecutive_unknown_errors,
-                        backoff.as_millis(),
-                    ),
-                    backoff: Some(backoff),
-                }
-            }
+    #[cfg(unix)]
+    if matches!(
+        err.raw_os_error(),
+        Some(
+            libc::EMFILE
+                | libc::ENFILE
+                | libc::ENOBUFS
+                | libc::ENOMEM
+                | libc::ECONNABORTED
+                | libc::ECONNRESET
+                | libc::EINTR
+                | libc::ENETDOWN
+                | libc::EPROTO
+                | libc::ENOPROTOOPT
+                | libc::EHOSTDOWN
+                | libc::EHOSTUNREACH
+                | libc::EOPNOTSUPP
+                | libc::ENETUNREACH
+                | libc::ENOSR
+                | libc::ESOCKTNOSUPPORT
+                | libc::EPROTONOSUPPORT
+                | libc::ETIMEDOUT
+        )
+    ) {
+        *consecutive_unknown_errors = 0;
+
+        #[cfg(unix)]
+        let is_resource_pressure = matches!(
+            err.raw_os_error(),
+            Some(libc::EMFILE | libc::ENFILE | libc::ENOBUFS | libc::ENOMEM | libc::ENOSR)
+        );
+        #[cfg(not(unix))]
+        let is_resource_pressure = false;
+
+        if is_resource_pressure {
+            *consecutive_resource_errors = consecutive_resource_errors.saturating_add(1);
+            let backoff_ms = 100u64
+                .saturating_mul(1u64 << (*consecutive_resource_errors).min(7).saturating_sub(1))
+                .min(5_000);
+            return AcceptAction::Retry {
+                backoff: std::time::Duration::from_millis(backoff_ms),
+                severity: SeverityId::Medium,
+            };
         }
-        AcceptErrorClass::Transient => {
-            *consecutive_unknown_errors = 0;
-            if is_resource_pressure_error(err) {
-                *consecutive_resource_errors = consecutive_resource_errors.saturating_add(1);
-                let backoff = accept_backoff(*consecutive_resource_errors);
-                AcceptErrorOutcome {
-                    severity: SeverityId::Medium,
-                    message: format!(
-                        "Proxy accept error (retrying in {}ms): {err}",
-                        backoff.as_millis(),
-                    ),
-                    backoff: Some(backoff),
-                }
-            } else {
-                AcceptErrorOutcome {
-                    severity: SeverityId::Low,
-                    message: format!("Proxy accept error (retrying in 100ms): {err}"),
-                    backoff: Some(std::time::Duration::from_millis(100)),
-                }
-            }
-        }
+
+        *consecutive_resource_errors = 0;
+        return AcceptAction::Retry {
+            backoff: std::time::Duration::from_millis(100),
+            severity: SeverityId::Low,
+        };
+    }
+
+    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
+    if matches!(err.raw_os_error(), Some(libc::ENONET)) {
+        *consecutive_unknown_errors = 0;
+        *consecutive_resource_errors = 0;
+        return AcceptAction::Retry {
+            backoff: std::time::Duration::from_millis(100),
+            severity: SeverityId::Low,
+        };
+    }
+
+    *consecutive_unknown_errors = consecutive_unknown_errors.saturating_add(1);
+    if *consecutive_unknown_errors >= MAX_CONSECUTIVE_UNKNOWN_ACCEPT_ERRORS {
+        return AcceptAction::Terminal;
+    }
+    AcceptAction::Retry {
+        backoff: std::time::Duration::from_millis(100),
+        severity: SeverityId::Low,
+    }
+}
+
+fn emit_activity(tx: &Option<ActivitySender>, denied: bool, deny_group: &'static str) {
+    if let Some(tx) = tx {
+        let _ = try_record_activity(tx, denied, deny_group);
     }
 }
 
@@ -12711,335 +12699,318 @@ network_policies:
         }
     }
 
-    #[test]
-    fn accept_backoff_exponential_progression() {
-        let ms = |n| accept_backoff(n).as_millis();
-        assert_eq!(ms(1), 100);
-        assert_eq!(ms(2), 200);
-        assert_eq!(ms(3), 400);
-        assert_eq!(ms(4), 800);
-        assert_eq!(ms(5), 1_600);
-        assert_eq!(ms(6), 3_200);
-        assert_eq!(ms(7), 5_000); // 6400 capped to 5000
-        assert_eq!(ms(8), 5_000); // stays at cap
+    #[tokio::test]
+    async fn test_exit_receiver_fires_when_task_exits() {
+        let (exited_tx, exited_rx) = tokio::sync::oneshot::channel::<()>();
+        let handle = tokio::spawn(async move {
+            let _guard = exited_tx;
+        });
+        handle.await.unwrap();
+        // The sender was dropped when the task completed, so the receiver
+        // should resolve immediately with an Err (sender dropped).
+        assert!(exited_rx.await.is_err());
     }
 
-    #[test]
-    fn accept_backoff_zero_consecutive_errors() {
-        assert_eq!(accept_backoff(0).as_millis(), 100);
+    #[tokio::test]
+    async fn test_exit_receiver_fires_when_task_is_aborted() {
+        let (exited_tx, exited_rx) = tokio::sync::oneshot::channel::<()>();
+        let handle = tokio::spawn(async move {
+            let _guard = exited_tx;
+            std::future::pending::<()>().await;
+        });
+        handle.abort();
+        // Abort drops the task's locals, including the sender guard.
+        assert!(exited_rx.await.is_err());
     }
 
-    #[test]
-    fn accept_backoff_saturates_at_cap() {
-        assert_eq!(accept_backoff(100).as_millis(), 5_000);
-        assert_eq!(accept_backoff(u32::MAX).as_millis(), 5_000);
+    #[tokio::test]
+    async fn test_take_exit_receiver_returns_real_receiver() {
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let join = tokio::spawn(std::future::pending::<()>());
+        let mut handle = ProxyHandle {
+            http_addr: None,
+            join,
+            exited_rx: Some(rx),
+        };
+        let mut taken = handle
+            .take_exit_receiver()
+            .expect("first take should return Some");
+        assert!(taken.try_recv().is_err());
+        drop(tx);
+        assert!(taken.await.is_err());
     }
 
-    #[cfg(unix)]
-    #[test]
-    fn is_resource_pressure_detects_emfile() {
-        let err = std::io::Error::from_raw_os_error(libc::EMFILE);
-        assert!(is_resource_pressure_error(&err));
+    #[tokio::test]
+    async fn test_take_exit_receiver_second_call_returns_none() {
+        let (_tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let join = tokio::spawn(std::future::pending::<()>());
+        let mut handle = ProxyHandle {
+            http_addr: None,
+            join,
+            exited_rx: Some(rx),
+        };
+        let _first = handle.take_exit_receiver();
+        assert!(handle.take_exit_receiver().is_none());
     }
 
-    #[cfg(unix)]
-    #[test]
-    fn is_resource_pressure_detects_enfile() {
-        let err = std::io::Error::from_raw_os_error(libc::ENFILE);
-        assert!(is_resource_pressure_error(&err));
+    #[tokio::test]
+    async fn test_proxy_handle_drop_fires_exit_receiver() {
+        let (exited_tx, exited_rx) = tokio::sync::oneshot::channel::<()>();
+        let join = tokio::spawn(async move {
+            let _guard = exited_tx;
+            std::future::pending::<()>().await;
+        });
+        let mut handle = ProxyHandle {
+            http_addr: None,
+            join,
+            exited_rx: Some(exited_rx),
+        };
+        let rx = handle.take_exit_receiver().expect("should return Some");
+        drop(handle);
+        assert!(rx.await.is_err());
     }
 
-    #[cfg(unix)]
-    #[test]
-    fn is_resource_pressure_detects_memory_pressure() {
-        assert!(is_resource_pressure_error(
-            &std::io::Error::from_raw_os_error(libc::ENOBUFS)
-        ));
-        assert!(is_resource_pressure_error(
-            &std::io::Error::from_raw_os_error(libc::ENOMEM)
-        ));
-        assert!(is_resource_pressure_error(
-            &std::io::Error::from_raw_os_error(libc::ENOSR)
-        ));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn is_resource_pressure_rejects_other_errors() {
-        let err = std::io::Error::from_raw_os_error(libc::ECONNABORTED);
-        assert!(!is_resource_pressure_error(&err));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn classify_accept_error_fd_exhaustion_is_transient() {
-        assert_eq!(
-            classify_accept_error(&std::io::Error::from_raw_os_error(libc::EMFILE)),
-            AcceptErrorClass::Transient,
-        );
-        assert_eq!(
-            classify_accept_error(&std::io::Error::from_raw_os_error(libc::ENFILE)),
-            AcceptErrorClass::Transient,
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn classify_accept_error_connection_errors_are_transient() {
-        assert_eq!(
-            classify_accept_error(&std::io::Error::from_raw_os_error(libc::ECONNABORTED)),
-            AcceptErrorClass::Transient,
-        );
-        assert_eq!(
-            classify_accept_error(&std::io::Error::from_raw_os_error(libc::ECONNRESET)),
-            AcceptErrorClass::Transient,
-        );
-        assert_eq!(
-            classify_accept_error(&std::io::Error::from_raw_os_error(libc::EINTR)),
-            AcceptErrorClass::Transient,
-        );
-    }
+    // --- classify_accept_error tests ---
 
     #[cfg(unix)]
     #[test]
-    fn classify_accept_error_broken_listener_is_terminal() {
-        assert_eq!(
-            classify_accept_error(&std::io::Error::from_raw_os_error(libc::EBADF)),
-            AcceptErrorClass::Terminal,
-        );
-        assert_eq!(
-            classify_accept_error(&std::io::Error::from_raw_os_error(libc::EINVAL)),
-            AcceptErrorClass::Terminal,
-        );
-        assert_eq!(
-            classify_accept_error(&std::io::Error::from_raw_os_error(libc::ENOTSOCK)),
-            AcceptErrorClass::Terminal,
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn classify_accept_error_unrecognized_errno_is_unknown() {
-        assert_eq!(
-            classify_accept_error(&std::io::Error::from_raw_os_error(libc::EPERM)),
-            AcceptErrorClass::Unknown,
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn handle_accept_error_terminal_exits_immediately() {
-        let mut res = 0;
-        let mut unk = 0;
+    fn test_classify_terminal_error_ebadf() {
         let err = std::io::Error::from_raw_os_error(libc::EBADF);
-        let outcome = handle_accept_error(&err, &mut res, &mut unk);
-        assert!(outcome.backoff.is_none());
-        assert_eq!(outcome.severity, SeverityId::High);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn handle_accept_error_transient_retries_indefinitely() {
-        let mut res = 0;
+        let mut fd = 0;
         let mut unk = 0;
-        let err = std::io::Error::from_raw_os_error(libc::EMFILE);
-        for i in 1..=20 {
-            let outcome = handle_accept_error(&err, &mut res, &mut unk);
-            assert!(outcome.backoff.is_some(), "should retry on attempt {i}");
-            assert_eq!(outcome.severity, SeverityId::Medium);
-        }
-        assert_eq!(res, 20);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn handle_accept_error_unknown_exits_after_limit() {
-        let mut res = 0;
-        let mut unk = 0;
-        let err = std::io::Error::from_raw_os_error(libc::EPERM);
-        for i in 1..=MAX_CONSECUTIVE_UNKNOWN_ERRORS {
-            let outcome = handle_accept_error(&err, &mut res, &mut unk);
-            assert!(
-                outcome.backoff.is_some(),
-                "should retry on attempt {i}/{MAX_CONSECUTIVE_UNKNOWN_ERRORS}",
-            );
-            assert_eq!(outcome.severity, SeverityId::Medium);
-        }
-        let outcome = handle_accept_error(&err, &mut res, &mut unk);
-        assert!(
-            outcome.backoff.is_none(),
-            "should exit after limit exceeded"
+        assert_eq!(
+            classify_accept_error(&err, &mut fd, &mut unk),
+            AcceptAction::Terminal
         );
-        assert_eq!(outcome.severity, SeverityId::High);
     }
 
     #[cfg(unix)]
     #[test]
-    fn handle_accept_error_transient_resets_unknown_counter() {
-        let mut res = 0;
+    fn test_classify_terminal_error_einval() {
+        let err = std::io::Error::from_raw_os_error(libc::EINVAL);
+        let mut fd = 0;
         let mut unk = 0;
-        let unknown_err = std::io::Error::from_raw_os_error(libc::EPERM);
-        let transient_err = std::io::Error::from_raw_os_error(libc::ECONNABORTED);
-
-        // Accumulate unknowns up to the limit.
-        for _ in 1..=MAX_CONSECUTIVE_UNKNOWN_ERRORS {
-            handle_accept_error(&unknown_err, &mut res, &mut unk);
-        }
-        assert_eq!(unk, MAX_CONSECUTIVE_UNKNOWN_ERRORS);
-
-        // A transient error resets the unknown counter.
-        let outcome = handle_accept_error(&transient_err, &mut res, &mut unk);
-        assert!(outcome.backoff.is_some());
-        assert_eq!(unk, 0);
-
-        // Unknown errors can retry again from zero.
-        let outcome = handle_accept_error(&unknown_err, &mut res, &mut unk);
-        assert!(outcome.backoff.is_some());
-        assert_eq!(unk, 1);
+        assert_eq!(
+            classify_accept_error(&err, &mut fd, &mut unk),
+            AcceptAction::Terminal
+        );
     }
 
     #[cfg(unix)]
     #[test]
-    fn handle_accept_error_fd_exhaustion_uses_exponential_backoff() {
-        let mut res = 0;
+    fn test_classify_terminal_error_enotsock() {
+        let err = std::io::Error::from_raw_os_error(libc::ENOTSOCK);
+        let mut fd = 0;
+        let mut unk = 0;
+        assert_eq!(
+            classify_accept_error(&err, &mut fd, &mut unk),
+            AcceptAction::Terminal
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_classify_fd_exhaustion_returns_retry_medium() {
+        let err = std::io::Error::from_raw_os_error(libc::EMFILE);
+        let mut fd = 0;
+        let mut unk = 0;
+        let action = classify_accept_error(&err, &mut fd, &mut unk);
+        assert!(
+            matches!(
+                action,
+                AcceptAction::Retry {
+                    severity: SeverityId::Medium,
+                    ..
+                }
+            ),
+            "expected Retry/Medium for EMFILE, got {action:?}",
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_classify_unknown_error_returns_retry_low() {
+        let err = std::io::Error::from_raw_os_error(libc::ECONNREFUSED);
+        let mut fd = 0;
+        let mut unk = 0;
+        let action = classify_accept_error(&err, &mut fd, &mut unk);
+        assert!(
+            matches!(
+                action,
+                AcceptAction::Retry {
+                    severity: SeverityId::Low,
+                    ..
+                }
+            ),
+            "expected Retry/Low for unknown error, got {action:?}",
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_classify_fd_exhaustion_backoff_increases_and_caps() {
+        let mut fd = 0;
         let mut unk = 0;
         let err = std::io::Error::from_raw_os_error(libc::EMFILE);
 
-        let b1 = handle_accept_error(&err, &mut res, &mut unk)
-            .backoff
-            .unwrap();
-        let b2 = handle_accept_error(&err, &mut res, &mut unk)
-            .backoff
-            .unwrap();
-        let b3 = handle_accept_error(&err, &mut res, &mut unk)
-            .backoff
-            .unwrap();
+        let mut prev_backoff = std::time::Duration::ZERO;
+        for _ in 0..6 {
+            match classify_accept_error(&err, &mut fd, &mut unk) {
+                AcceptAction::Retry { backoff, .. } => {
+                    assert!(
+                        backoff > prev_backoff,
+                        "backoff should increase: {backoff:?} <= {prev_backoff:?}",
+                    );
+                    prev_backoff = backoff;
+                }
+                AcceptAction::Terminal => panic!("expected Retry, got Terminal"),
+            }
+        }
 
-        assert_eq!(b1.as_millis(), 100);
-        assert_eq!(b2.as_millis(), 200);
-        assert_eq!(b3.as_millis(), 400);
+        // After enough consecutive errors the backoff should hit the 5s cap.
+        for _ in 6..12 {
+            classify_accept_error(&err, &mut fd, &mut unk);
+        }
+        match classify_accept_error(&err, &mut fd, &mut unk) {
+            AcceptAction::Retry { backoff, .. } => {
+                assert_eq!(
+                    backoff,
+                    std::time::Duration::from_secs(5),
+                    "backoff should cap at 5000ms",
+                );
+            }
+            AcceptAction::Terminal => panic!("expected Retry, got Terminal"),
+        }
     }
 
     #[cfg(unix)]
     #[test]
-    fn classify_accept_error_network_errors_are_transient() {
+    fn test_classify_unknown_errors_exit_after_threshold() {
+        let mut fd = 0;
+        let mut unk = 0;
+        let err = std::io::Error::from_raw_os_error(libc::ECONNREFUSED);
+
+        for i in 1..MAX_CONSECUTIVE_UNKNOWN_ACCEPT_ERRORS {
+            let action = classify_accept_error(&err, &mut fd, &mut unk);
+            assert!(
+                matches!(action, AcceptAction::Retry { .. }),
+                "call {i} should be Retry, got {action:?}",
+            );
+        }
+        let final_action = classify_accept_error(&err, &mut fd, &mut unk);
+        assert_eq!(
+            final_action,
+            AcceptAction::Terminal,
+            "call {MAX_CONSECUTIVE_UNKNOWN_ACCEPT_ERRORS} should be Terminal",
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_classify_success_resets_counters() {
+        let mut fd = 0;
+        let mut unk = 0;
+        let err = std::io::Error::from_raw_os_error(libc::ECONNREFUSED);
+
+        for _ in 1..MAX_CONSECUTIVE_UNKNOWN_ACCEPT_ERRORS {
+            classify_accept_error(&err, &mut fd, &mut unk);
+        }
+
+        fd = 0;
+        unk = 0;
+
+        for i in 1..MAX_CONSECUTIVE_UNKNOWN_ACCEPT_ERRORS {
+            let action = classify_accept_error(&err, &mut fd, &mut unk);
+            assert!(
+                matches!(action, AcceptAction::Retry { .. }),
+                "after reset, call {i} should be Retry, got {action:?}",
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_classify_fd_error_resets_unknown_counter() {
+        let mut fd = 0;
+        let mut unk = 0;
+        let unknown_err = std::io::Error::from_raw_os_error(libc::ECONNREFUSED);
+        let fd_err = std::io::Error::from_raw_os_error(libc::EMFILE);
+
+        for _ in 0..5 {
+            classify_accept_error(&unknown_err, &mut fd, &mut unk);
+        }
+
+        classify_accept_error(&fd_err, &mut fd, &mut unk);
+
+        for i in 1..MAX_CONSECUTIVE_UNKNOWN_ACCEPT_ERRORS {
+            let action = classify_accept_error(&unknown_err, &mut fd, &mut unk);
+            assert!(
+                matches!(action, AcceptAction::Retry { .. }),
+                "after FD reset, call {i} should be Retry, got {action:?}",
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_classify_transient_and_terminal_are_disjoint() {
+        let mut res = 0;
+        let mut unk = 0;
+
         for errno in [
+            libc::EMFILE,
+            libc::ENFILE,
+            libc::ENOBUFS,
+            libc::ENOMEM,
+            libc::ECONNABORTED,
+            libc::ECONNRESET,
+            libc::EINTR,
             libc::ENETDOWN,
-            libc::EPROTO,
-            libc::ENOPROTOOPT,
             libc::EHOSTDOWN,
             libc::EHOSTUNREACH,
             libc::EOPNOTSUPP,
             libc::ENETUNREACH,
-            libc::ESOCKTNOSUPPORT,
-            libc::EPROTONOSUPPORT,
+            libc::ENOSR,
             libc::ETIMEDOUT,
         ] {
+            let err = std::io::Error::from_raw_os_error(errno);
+            assert!(
+                matches!(
+                    classify_accept_error(&err, &mut res, &mut unk),
+                    AcceptAction::Retry { .. }
+                ),
+                "errno {errno} should be Retry",
+            );
+            res = 0;
+            unk = 0;
+        }
+
+        for errno in [libc::EBADF, libc::EINVAL, libc::ENOTSOCK] {
+            let err = std::io::Error::from_raw_os_error(errno);
             assert_eq!(
-                classify_accept_error(&std::io::Error::from_raw_os_error(errno)),
-                AcceptErrorClass::Transient,
-                "errno {errno} should be transient",
+                classify_accept_error(&err, &mut res, &mut unk),
+                AcceptAction::Terminal,
+                "errno {errno} should be Terminal",
             );
         }
     }
 
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn classify_accept_error_enonet_is_transient() {
-        assert_eq!(
-            classify_accept_error(&std::io::Error::from_raw_os_error(libc::ENONET)),
-            AcceptErrorClass::Transient,
-        );
-    }
-
     #[cfg(unix)]
     #[test]
-    fn classify_accept_error_resource_pressure_is_transient() {
-        assert_eq!(
-            classify_accept_error(&std::io::Error::from_raw_os_error(libc::ENOBUFS)),
-            AcceptErrorClass::Transient,
-        );
-        assert_eq!(
-            classify_accept_error(&std::io::Error::from_raw_os_error(libc::ENOMEM)),
-            AcceptErrorClass::Transient,
-        );
-        assert_eq!(
-            classify_accept_error(&std::io::Error::from_raw_os_error(libc::ENOSR)),
-            AcceptErrorClass::Transient,
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn handle_accept_error_non_resource_transient_uses_fixed_backoff() {
+    fn test_transient_errors_never_hit_unknown_budget() {
         let mut res = 0;
         let mut unk = 0;
         let err = std::io::Error::from_raw_os_error(libc::ECONNABORTED);
 
-        let o1 = handle_accept_error(&err, &mut res, &mut unk);
-        let o2 = handle_accept_error(&err, &mut res, &mut unk);
-
-        assert_eq!(o1.severity, SeverityId::Low);
-        assert_eq!(o1.backoff.unwrap().as_millis(), 100);
-        assert_eq!(o2.backoff.unwrap().as_millis(), 100);
-        assert_eq!(res, 0);
+        for i in 0..(MAX_CONSECUTIVE_UNKNOWN_ACCEPT_ERRORS + 5) {
+            let action = classify_accept_error(&err, &mut res, &mut unk);
+            assert!(
+                matches!(action, AcceptAction::Retry { .. }),
+                "transient error on call {i} should always Retry, got {action:?}",
+            );
+        }
     }
 
-    #[cfg(unix)]
-    #[test]
-    fn handle_accept_error_unknown_uses_exponential_backoff() {
-        let mut res = 0;
-        let mut unk = 0;
-        let err = std::io::Error::from_raw_os_error(libc::EPERM);
-
-        let b1 = handle_accept_error(&err, &mut res, &mut unk)
-            .backoff
-            .unwrap();
-        let b2 = handle_accept_error(&err, &mut res, &mut unk)
-            .backoff
-            .unwrap();
-        let b3 = handle_accept_error(&err, &mut res, &mut unk)
-            .backoff
-            .unwrap();
-
-        assert_eq!(b1.as_millis(), 100);
-        assert_eq!(b2.as_millis(), 200);
-        assert_eq!(b3.as_millis(), 400);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn handle_accept_error_resource_counter_persists_across_mixed_transient() {
-        let mut res = 0;
-        let mut unk = 0;
-        let resource_err = std::io::Error::from_raw_os_error(libc::EMFILE);
-        let transient_err = std::io::Error::from_raw_os_error(libc::ECONNABORTED);
-
-        let o1 = handle_accept_error(&resource_err, &mut res, &mut unk);
-        assert_eq!(res, 1);
-        assert_eq!(o1.backoff.unwrap().as_millis(), 100);
-
-        let o2 = handle_accept_error(&transient_err, &mut res, &mut unk);
-        assert_eq!(res, 1);
-        assert_eq!(o2.backoff.unwrap().as_millis(), 100);
-
-        let o3 = handle_accept_error(&resource_err, &mut res, &mut unk);
-        assert_eq!(res, 2);
-        assert_eq!(o3.backoff.unwrap().as_millis(), 200);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn handle_accept_error_terminal_leaves_counters_unchanged() {
-        let mut res = 3;
-        let mut unk = 2;
-        let err = std::io::Error::from_raw_os_error(libc::EBADF);
-
-        let outcome = handle_accept_error(&err, &mut res, &mut unk);
-        assert!(outcome.backoff.is_none());
-        assert_eq!(res, 3);
-        assert_eq!(unk, 2);
-    }
     #[path = "compatibility.rs"]
     mod compatibility;
 }

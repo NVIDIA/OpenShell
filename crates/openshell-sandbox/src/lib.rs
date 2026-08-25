@@ -16,6 +16,7 @@ mod sidecar_control;
 
 use miette::{IntoDiagnostic, Result, WrapErr};
 use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 #[cfg(target_os = "linux")]
 use std::sync::atomic::Ordering;
@@ -62,6 +63,7 @@ use openshell_core::policy::{NetworkMode, NetworkPolicy, ProxyPolicy, SandboxPol
 use openshell_core::proposals::AgentProposals;
 use openshell_core::provider_credentials::ProviderCredentialState;
 use openshell_supervisor_network::opa::OpaEngine;
+use openshell_supervisor_network::proxy::ProxyHandle;
 use openshell_supervisor_process::process::ProcessEnforcementMode;
 pub use openshell_supervisor_process::process::{ProcessHandle, ProcessStatus};
 use openshell_supervisor_process::skills;
@@ -514,7 +516,7 @@ pub async fn run_sandbox(
     // API read the current value so proposals target the correct workspace.
     let (workspace_tx, workspace_rx) = tokio::sync::watch::channel(String::new());
 
-    let networking = if network_enabled {
+    let mut networking = if network_enabled {
         #[cfg(target_os = "linux")]
         let proxy_bind_ip = netns
             .as_ref()
@@ -823,6 +825,19 @@ pub async fn run_sandbox(
             .zip(bootstrap.proxy_ca_bundle_path.clone())
     });
 
+    let proxy_exited: Pin<Box<dyn Future<Output = ()> + Send>> = if let Some(rx) = networking
+        .as_mut()
+        .and_then(|n| n.proxy.as_mut())
+        .and_then(ProxyHandle::take_exit_receiver)
+    {
+        Box::pin(async {
+            let _ = rx.await;
+        })
+    } else {
+        Box::pin(std::future::pending())
+    };
+    tokio::pin!(proxy_exited);
+
     let exit_code = if process_enabled {
         let ca_file_paths = networking
             .as_ref()
@@ -935,9 +950,41 @@ pub async fn run_sandbox(
                         "authoritative network-sidecar control channel closed"
                     ));
                 }
+                () = &mut proxy_exited => {
+                    ocsf_emit!(
+                        AppLifecycleBuilder::new(ocsf_ctx())
+                            .activity(ActivityId::Fail)
+                            .severity(SeverityId::High)
+                            .status(StatusId::Failure)
+                            .message(
+                                "Proxy accept loop exited unexpectedly; terminating sandbox"
+                            )
+                            .build()
+                    );
+                    return Err(miette::miette!(
+                        "proxy accept loop exited unexpectedly"
+                    ));
+                }
             }
         } else {
-            process.await?
+            tokio::select! {
+                result = process => result?,
+                () = &mut proxy_exited => {
+                    ocsf_emit!(
+                        AppLifecycleBuilder::new(ocsf_ctx())
+                            .activity(ActivityId::Fail)
+                            .severity(SeverityId::High)
+                            .status(StatusId::Failure)
+                            .message(
+                                "Proxy accept loop exited unexpectedly; terminating sandbox"
+                            )
+                            .build()
+                    );
+                    return Err(miette::miette!(
+                        "proxy accept loop exited unexpectedly"
+                    ));
+                }
+            }
         }
     } else {
         // Network-only sidecar mode: keep the proxy and its background
@@ -953,15 +1000,62 @@ pub async fn run_sandbox(
                     warn!(?result, "Authoritative sidecar control channel exited; restarting sidecar");
                     1
                 }
+                () = &mut proxy_exited => {
+                    ocsf_emit!(
+                        AppLifecycleBuilder::new(ocsf_ctx())
+                            .activity(ActivityId::Fail)
+                            .severity(SeverityId::High)
+                            .status(StatusId::Failure)
+                            .message(
+                                "Proxy accept loop exited unexpectedly; terminating sandbox"
+                            )
+                            .build()
+                    );
+                    return Err(miette::miette!(
+                        "proxy accept loop exited unexpectedly"
+                    ));
+                }
             }
         } else {
-            wait_for_shutdown_signal().await;
-            0
+            tokio::select! {
+                () = wait_for_shutdown_signal() => 0,
+                () = &mut proxy_exited => {
+                    ocsf_emit!(
+                        AppLifecycleBuilder::new(ocsf_ctx())
+                            .activity(ActivityId::Fail)
+                            .severity(SeverityId::High)
+                            .status(StatusId::Failure)
+                            .message(
+                                "Proxy accept loop exited unexpectedly; terminating sandbox"
+                            )
+                            .build()
+                    );
+                    return Err(miette::miette!(
+                        "proxy accept loop exited unexpectedly"
+                    ));
+                }
+            }
         }
         #[cfg(not(target_os = "linux"))]
         {
-            wait_for_shutdown_signal().await;
-            0
+            tokio::select! {
+                () = wait_for_shutdown_signal() => 0,
+                () = &mut proxy_exited => {
+                    ocsf_emit!(
+                        AppLifecycleBuilder::new(ocsf_ctx())
+                            .activity(ActivityId::Fail)
+                            .severity(SeverityId::High)
+                            .status(StatusId::Failure)
+                            .message(
+                                "Proxy accept loop exited unexpectedly; terminating sandbox"
+                            )
+                            .build()
+                    );
+                    return Err(miette::miette!(
+                        "proxy accept loop exited unexpectedly"
+                    ));
+                }
+            }
         }
     };
 
@@ -3157,7 +3251,7 @@ type MiddlewareConnector = Arc<
     dyn Fn(
             Vec<openshell_core::proto::SupervisorMiddlewareService>,
             MiddlewareAuthentication,
-        ) -> std::pin::Pin<
+        ) -> Pin<
             Box<
                 dyn std::future::Future<
                         Output = Result<openshell_supervisor_middleware::MiddlewareRegistry>,

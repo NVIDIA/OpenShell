@@ -750,6 +750,10 @@ impl OpenShell for TestOpenShell {
             next_refresh_at_ms: 0,
             last_refresh_at_ms: 0,
             last_error: String::new(),
+            recovery_action: 0,
+            failure_code: String::new(),
+            provider_error_subtype: String::new(),
+            last_error_at_ms: 0,
         };
         drop(providers);
         self.state

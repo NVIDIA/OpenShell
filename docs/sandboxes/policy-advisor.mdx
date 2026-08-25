@@ -231,6 +231,8 @@ openshell rule reject <sandbox-name> \
 
 The rejection reason is returned to the agent through `policy.local`. The agent can use it to draft a narrower proposal.
 
+Reviewers see the same guidance in the terminal UI. Run `openshell term`, open the sandbox's draft inbox, and select a rejected chunk to open its detail popup. The stored reason appears on a `Guidance:` line, and the list row shows a shortened copy of it. Rejection reasons have no length limit, so long guidance wraps and the popup body scrolls with `j`/`k`, `PageUp`/`PageDown`, and `g`/`G`; the approve and close controls stay pinned below the body, and the bottom border shows the scroll position.
+
 ## Agent API
 
 `policy.local` is available only inside the sandbox and uses plain HTTP:

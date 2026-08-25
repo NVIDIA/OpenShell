@@ -267,6 +267,18 @@ with SandboxClient.from_active_cluster() as client:
     assert sandbox.id in {s.id for s in matches}
 ```
 
+For non-interactive automation, pass a renewable client-credentials provider.
+Omitted issuer, client ID, audience, and scopes are read from the active
+gateway's metadata. The client requires TLS for non-loopback gateways:
+
+```python
+from openshell import ClientCredentialsAuth, SandboxClient
+
+auth = ClientCredentialsAuth(client_secret=lambda: load_secret())
+with SandboxClient.from_active_cluster(client_credentials=auth) as client:
+    sandboxes = client.list(workspace="default")
+```
+
 ## Expose Long Running Services
 
 Service forwarding makes a long-running process inside a sandbox reachable through a gateway-managed URL. Use it for development servers, notebooks, dashboards, or other services that keep listening after the sandbox starts. Run the service on loopback inside the sandbox, expose its port, then open the URL printed by OpenShell.

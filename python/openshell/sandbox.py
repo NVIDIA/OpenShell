@@ -6,7 +6,9 @@ from __future__ import annotations
 import base64
 import contextlib
 import errno
+import ipaddress
 import json
+import math
 import os
 import pathlib
 import sys
@@ -33,6 +35,8 @@ _ClientCallDetailsBase = namedtuple(
     "_ClientCallDetailsBase",
     ("method", "timeout", "metadata", "credentials", "wait_for_ready", "compression"),
 )
+
+_OAUTH_MAX_RESPONSE_BYTES = 1 << 20
 
 
 class _ClientCallDetails(_ClientCallDetailsBase, grpc.ClientCallDetails):
@@ -124,6 +128,238 @@ def _normalize_bearer(
         return cast("Callable[[], str]", bearer)
     token = bearer
     return lambda: token
+
+
+def _is_loopback_host(hostname: str | None) -> bool:
+    if hostname is None:
+        return False
+    if hostname.lower() == "localhost":
+        return True
+    with contextlib.suppress(ValueError):
+        return ipaddress.ip_address(hostname).is_loopback
+    return False
+
+
+def _is_local_grpc_endpoint(endpoint: str) -> bool:
+    if endpoint.startswith("unix:"):
+        return True
+    return _is_loopback_host(urlparse(f"//{endpoint}").hostname)
+
+
+def _validate_oauth_url(name: str, raw: str) -> str:
+    """Validate an OAuth endpoint without reflecting attacker-controlled URLs."""
+    parsed = urlparse(raw)
+    if not parsed.scheme or not parsed.hostname or parsed.username or parsed.password:
+        raise SandboxError(f"invalid OAuth {name} URL")
+    if parsed.fragment:
+        raise SandboxError(f"OAuth {name} URL must not contain a fragment")
+    if parsed.scheme == "https":
+        return raw
+    if parsed.scheme == "http" and _is_loopback_host(parsed.hostname):
+        return raw
+    raise SandboxError(
+        f"OAuth {name} URL must use HTTPS (HTTP is allowed only for loopback hosts)"
+    )
+
+
+def _oauth_json_request(
+    client: httpx.Client,
+    method: str,
+    url: str,
+    *,
+    kind: str,
+    headers: Mapping[str, str],
+    data: Mapping[str, str] | None = None,
+) -> tuple[int, dict[str, object]]:
+    """Read a bounded JSON response without retaining arbitrary error bodies."""
+    with client.stream(method, url, headers=headers, data=data) as response:
+        if response.status_code != 200:
+            return response.status_code, {}
+        content = bytearray()
+        for chunk in response.iter_bytes():
+            content.extend(chunk)
+            if len(content) > _OAUTH_MAX_RESPONSE_BYTES:
+                raise SandboxError(f"OAuth {kind} response is too large")
+    try:
+        payload = json.loads(content)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        raise SandboxError(f"OAuth {kind} returned invalid JSON") from None
+    if not isinstance(payload, dict):
+        raise SandboxError(f"OAuth {kind} returned invalid JSON")
+    return 200, payload
+
+
+class ClientCredentialsAuth:
+    """Renewable OAuth 2.0 client-credentials bearer provider.
+
+    Tokens and client secrets remain in memory. The first RPC lazily performs
+    discovery and an exchange; later RPCs share the cached token until it is
+    within 30 seconds of expiry. Concurrent callers share one exchange.
+    """
+
+    def __init__(
+        self,
+        *,
+        client_secret: str | Callable[[], str],
+        issuer: str | None = None,
+        client_id: str | None = None,
+        scopes: Sequence[str] | None = None,
+        audience: str | None = None,
+        insecure: bool = False,
+        timeout: float = 30.0,
+        _transport: httpx.BaseTransport | None = None,
+    ) -> None:
+        if not isinstance(client_secret, str) and not callable(client_secret):
+            raise TypeError("client_secret must be a string or zero-argument callable")
+        if isinstance(client_secret, str) and not client_secret:
+            raise SandboxError("OAuth client secret must not be empty")
+        self._secret = client_secret
+        self._issuer = issuer
+        self._client_id = client_id
+        self._scopes = tuple(scopes) if scopes is not None else None
+        self._audience = audience
+        self._insecure = insecure
+        self._timeout = timeout
+        self._transport = _transport
+        self._lock = threading.Lock()
+        self._access_token: str | None = None
+        self._expires_at = 0.0
+        self._token_endpoint: str | None = None
+
+    def __repr__(self) -> str:
+        return (
+            "ClientCredentialsAuth(issuer="
+            f"{self._issuer!r}, client_id={self._client_id!r}, "
+            f"scopes={self._scopes!r}, audience={self._audience!r})"
+        )
+
+    def _apply_gateway_metadata(
+        self, metadata: Mapping[str, object], *, insecure: bool = False
+    ) -> None:
+        """Fill omitted fields and apply active-gateway transport settings."""
+        if self._issuer is None:
+            value = metadata.get("oidc_issuer")
+            self._issuer = value if isinstance(value, str) and value else None
+        if self._client_id is None:
+            value = metadata.get("oidc_client_id")
+            self._client_id = value if isinstance(value, str) and value else None
+        if self._audience is None:
+            value = metadata.get("oidc_audience")
+            self._audience = value if isinstance(value, str) and value else None
+        if self._scopes is None:
+            value = metadata.get("oidc_scopes")
+            if isinstance(value, str):
+                self._scopes = tuple(value.split())
+        # Preserve an explicit provider-level opt-in while also honoring the
+        # active-gateway construction flag used by the existing OIDC refresher.
+        self._insecure = self._insecure or insecure
+
+    def __call__(self) -> str:
+        if (
+            self._access_token is not None
+            and time.time() + _OIDC_TOKEN_EXPIRY_GRACE_SECONDS < self._expires_at
+        ):
+            return self._access_token
+        with self._lock:
+            if (
+                self._access_token is not None
+                and time.time() + _OIDC_TOKEN_EXPIRY_GRACE_SECONDS < self._expires_at
+            ):
+                return self._access_token
+            token, expires_at = self._exchange()
+            self._access_token = token
+            self._expires_at = expires_at
+            return token
+
+    def _exchange(self) -> tuple[str, float]:
+        if not self._issuer or not self._client_id:
+            raise SandboxError("OAuth client credentials require issuer and client_id")
+        issuer = _validate_oauth_url("issuer", self._issuer).rstrip("/")
+        headers = {"accept": "application/json"}
+        try:
+            with httpx.Client(
+                verify=not self._insecure,
+                follow_redirects=False,
+                timeout=self._timeout,
+                transport=self._transport,
+            ) as client:
+                if self._token_endpoint is None:
+                    status, discovery = _oauth_json_request(
+                        client,
+                        "GET",
+                        f"{issuer}/.well-known/openid-configuration",
+                        kind="discovery",
+                        headers=headers,
+                    )
+                    if status != 200:
+                        raise SandboxError(f"OAuth discovery failed with HTTP {status}")
+                    discovered = discovery.get("issuer")
+                    if (
+                        not isinstance(discovered, str)
+                        or discovered.rstrip("/") != issuer
+                    ):
+                        raise SandboxError("OAuth discovery issuer mismatch")
+                    endpoint = discovery.get("token_endpoint")
+                    if not isinstance(endpoint, str) or not endpoint:
+                        raise SandboxError(
+                            "OAuth discovery document is missing token_endpoint"
+                        )
+                    self._token_endpoint = _validate_oauth_url(
+                        "token endpoint", endpoint
+                    )
+                secret = self._resolve_secret()
+                data = {
+                    "grant_type": "client_credentials",
+                    "client_id": self._client_id,
+                    "client_secret": secret,
+                }
+                if self._scopes:
+                    data["scope"] = " ".join(self._scopes)
+                if self._audience:
+                    data["audience"] = self._audience
+                status, payload = _oauth_json_request(
+                    client,
+                    "POST",
+                    self._token_endpoint,
+                    kind="client credentials response",
+                    data=data,
+                    headers=headers,
+                )
+        except SandboxError:
+            raise
+        except httpx.HTTPError:
+            raise SandboxError("OAuth client credentials request failed") from None
+        if status != 200:
+            raise SandboxError(
+                f"OAuth client credentials exchange failed with HTTP {status}"
+            )
+        access_token = payload.get("access_token")
+        expires_in = payload.get("expires_in")
+        if not isinstance(access_token, str) or not access_token:
+            raise SandboxError(
+                "OAuth client credentials response is missing access_token"
+            )
+        if (
+            isinstance(expires_in, bool)
+            or not isinstance(expires_in, (int, float))
+            or not math.isfinite(expires_in)
+            or expires_in <= 0
+        ):
+            raise SandboxError(
+                "OAuth client credentials response requires a positive finite expires_in"
+            )
+        return access_token, time.time() + float(expires_in)
+
+    def _resolve_secret(self) -> str:
+        if isinstance(self._secret, str):
+            return self._secret
+        try:
+            value = self._secret()
+        except Exception:
+            raise SandboxError("OAuth client secret supplier failed") from None
+        if not isinstance(value, str) or not value:
+            raise SandboxError("OAuth client secret supplier returned an empty secret")
+        return value
 
 
 @dataclass(frozen=True)
@@ -270,6 +506,7 @@ class SandboxClient:
         *,
         tls: TlsConfig | None = None,
         bearer_token: str | Callable[[], str] | None = None,
+        client_credentials: ClientCredentialsAuth | None = None,
         timeout: float = 30.0,
         cluster_name: str | None = None,
         _bearer_close: Callable[[], None] | None = None,
@@ -284,6 +521,9 @@ class SandboxClient:
                 runtime refresh). Combines with `tls` — pass both when
                 the gateway uses mTLS for transport identity and OIDC
                 for user identity.
+            client_credentials: renewable OAuth client-credentials provider.
+                Mutually exclusive with `bearer_token`. A non-loopback endpoint
+                requires `tls` so the acquired bearer is never sent in cleartext.
             timeout: default per-call timeout in seconds.
             cluster_name: optional friendly name for error messages.
             _bearer_close: internal — wired by `from_active_cluster`
@@ -293,6 +533,18 @@ class SandboxClient:
                 lifecycle of any callable they supplied as
                 `bearer_token`.
         """
+        if bearer_token is not None and client_credentials is not None:
+            raise SandboxError(
+                "bearer_token and client_credentials are mutually exclusive"
+            )
+        if (
+            client_credentials is not None
+            and tls is None
+            and not _is_local_grpc_endpoint(endpoint)
+        ):
+            raise SandboxError(
+                "OAuth client credentials require TLS for non-loopback gateway endpoints"
+            )
         self._endpoint = endpoint
         self._timeout = timeout
         self._cluster_name = cluster_name
@@ -312,7 +564,7 @@ class SandboxClient:
                 ),
             )
             self._channel = grpc.secure_channel(endpoint, credentials)
-        provider = _normalize_bearer(bearer_token)
+        provider = _normalize_bearer(client_credentials or bearer_token)
         if provider is not None:
             self._channel = grpc.intercept_channel(
                 self._channel,
@@ -329,6 +581,7 @@ class SandboxClient:
         auto_refresh: bool = True,
         write_back: bool = True,
         insecure: bool = False,
+        client_credentials: ClientCredentialsAuth | None = None,
     ) -> SandboxClient:
         """Construct a `SandboxClient` from the active gateway's on-disk state.
 
@@ -357,6 +610,10 @@ class SandboxClient:
                 for OIDC discovery and refresh calls. Mirrors the Rust
                 CLI's `--insecure` flag for issuers behind self-signed
                 certs. Off by default.
+            client_credentials: renewable OAuth client-credentials provider.
+                Omitted issuer, client ID, audience, and scopes are filled from
+                the registered gateway metadata. This provider does not read or
+                write `oidc_token.json`. Remote plaintext gateways are rejected.
         """
         cluster_name = cluster or _resolve_active_cluster()
         gateway_dir = _xdg_config_home() / "openshell" / "gateways" / cluster_name
@@ -396,7 +653,13 @@ class SandboxClient:
         # a non-OIDC gateway should NOT cause us to attach a bearer.
         bearer_token: Callable[[], str] | None = None
         bearer_close: Callable[[], None] | None = None
-        if metadata.get("auth_mode") == "oidc":
+        if client_credentials is not None:
+            if metadata.get("auth_mode") != "oidc":
+                raise SandboxError(
+                    f"gateway '{cluster_name}' is not configured for OIDC"
+                )
+            client_credentials._apply_gateway_metadata(metadata, insecure=insecure)
+        elif metadata.get("auth_mode") == "oidc":
             bearer_token, bearer_close = _make_cluster_bearer_provider(
                 gateway_dir,
                 cluster_name,
@@ -409,6 +672,7 @@ class SandboxClient:
             endpoint,
             tls=tls,
             bearer_token=bearer_token,
+            client_credentials=client_credentials,
             timeout=timeout,
             cluster_name=cluster_name,
             _bearer_close=bearer_close,
@@ -905,10 +1169,12 @@ class Sandbox:
         auto_refresh: bool = True,
         write_back: bool = True,
         insecure: bool = False,
+        client_credentials: ClientCredentialsAuth | None = None,
     ) -> None:
         """Bind a Sandbox context to the active gateway.
 
-        OIDC kwargs (`auto_refresh`, `write_back`, `insecure`) forward
+        OIDC kwargs (`auto_refresh`, `write_back`, `insecure`, and
+        `client_credentials`) forward
         directly to `SandboxClient.from_active_cluster` and have the
         same semantics. They're surfaced on `Sandbox` so callers using
         the higher-level wrapper get parity with `SandboxClient` for
@@ -928,6 +1194,7 @@ class Sandbox:
         self._auto_refresh = auto_refresh
         self._write_back = write_back
         self._insecure = insecure
+        self._client_credentials = client_credentials
         self._client: SandboxClient | None = None
         self._session: SandboxSession | None = None
 
@@ -959,6 +1226,7 @@ class Sandbox:
             auto_refresh=self._auto_refresh,
             write_back=self._write_back,
             insecure=self._insecure,
+            client_credentials=self._client_credentials,
         )
         self._client = client
 

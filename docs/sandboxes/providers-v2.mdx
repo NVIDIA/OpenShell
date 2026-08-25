@@ -663,6 +663,21 @@ The gateway sends a complete host, port, and path binding for every emitted stat
 
 Refresh configuration is stored separately from the current injectable credential value. Non-secret refresh configuration remains in the refresh-state record. Secret material is resolved from the active credential driver only while the gateway mints a new short-lived token. The gateway writes the token back through credential storage and updates credential expiry metadata. If an OAuth issuer rotates its refresh token, the gateway stages the replacement through credential storage before committing the refresh generation and removes the previous handle afterward.
 
+For OAuth token endpoint failures, the gateway parses the bounded standard OAuth
+error response and reports a structured recovery action through `provider
+refresh status`. It does not retain provider error descriptions or raw response
+bodies. The recovery actions are:
+
+- `retry`: a network, rate-limit, or temporary issuer failure; the worker retries automatically.
+- `reauthorize`: a user refresh grant is no longer usable, such as `invalid_grant`; obtain a new grant and run `provider refresh configure`.
+- `fix_configuration`: the OAuth client, scopes, grant type, or administrator policy must be corrected.
+- `investigate`: the issuer returned an unrecognized response; the worker retries, but the operator should investigate persistent failures.
+
+The gateway parks `reauthorize` and `fix_configuration` failures instead of
+retrying them every worker tick. A manual `provider refresh rotate` still
+attempts the exchange. The current access token remains available only until
+its recorded expiry, after which credential resolution fails closed.
+
 Before OpenShell 0.1.0, refresh-state and credential-driver migrations are not
 supported. Upgrading from a build that stored refresh material inline requires
 reconfiguring the refresh grant. To change credential drivers, delete or
@@ -770,11 +785,22 @@ Check refresh status:
 openshell provider refresh status my-graph
 ```
 
+The status table includes `RECOVERY` and `FAILURE_CODE`. Clients should use the
+structured recovery action rather than parsing `LAST_ERROR`. For example,
+`oauth_invalid_grant` with recovery action `reauthorize` means the user must
+complete OAuth authorization again; `oauth_invalid_client` with
+`fix_configuration` means changing the user login alone will not repair the
+grant. OpenShell parks `reauthorize` failures until an explicit rotation or
+reconfiguration. It retries `fix_configuration` failures hourly so externally
+repaired clocks, policies, or credential-store values can recover without
+creating rapid token-endpoint traffic. Transient and unrecognized failures use
+the existing bounded 60-second retry interval.
+
 The status table reports operational state without printing token values or refresh material:
 
 ```text
-PROVIDER                CREDENTIAL_KEY                STRATEGY                     STATUS              EXPIRES_AT            NEXT_REFRESH          LAST_REFRESH          LAST_ERROR
-my-graph                MS_GRAPH_ACCESS_TOKEN         oauth2_refresh_token         refreshed           2026-06-01 00:00:00   2026-05-31 23:50:00   2026-05-31 23:00:00   -
+PROVIDER                  CREDENTIAL_KEY                STRATEGY                      STATUS                    RECOVERY            EXPIRES_AT            NEXT_REFRESH          LAST_REFRESH          FAILURE_CODE                                  LAST_ERROR
+my-graph                  MS_GRAPH_ACCESS_TOKEN         oauth2_refresh_token          reauthorization_required  reauthorize         2026-06-01 00:00:00   -                     2026-05-31 23:00:00   oauth_invalid_grant                           OAuth refresh grant is no longer usable
 ```
 
 When no refresh configuration exists, the CLI distinguishes whole-provider checks from credential-specific checks:
