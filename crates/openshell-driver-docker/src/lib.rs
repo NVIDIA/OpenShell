@@ -24,10 +24,10 @@ use openshell_core::config::{
 };
 use openshell_core::driver_mounts;
 use openshell_core::driver_utils::{
-    LABEL_MANAGED_BY, LABEL_MANAGED_BY_VALUE, LABEL_SANDBOX_ID, LABEL_SANDBOX_NAME,
-    LABEL_SANDBOX_NAMESPACE, LABEL_SANDBOX_WORKSPACE, SUPERVISOR_IMAGE_BINARY_PATH,
-    extract_first_tar_entry, supervisor_image_should_refresh, temp_extract_container_name,
-    validate_linux_elf_binary, write_cache_binary_atomic,
+    CONDITION_EXITED, CONDITION_RUNTIME_RESTART, LABEL_MANAGED_BY, LABEL_MANAGED_BY_VALUE,
+    LABEL_SANDBOX_ID, LABEL_SANDBOX_NAME, LABEL_SANDBOX_NAMESPACE, LABEL_SANDBOX_WORKSPACE,
+    SUPERVISOR_IMAGE_BINARY_PATH, extract_first_tar_entry, supervisor_image_should_refresh,
+    temp_extract_container_name, validate_linux_elf_binary, write_cache_binary_atomic,
 };
 use openshell_core::gpu::{
     CdiGpuDefaultSelector, CdiGpuInventory, CdiGpuSelectionError, driver_gpu_requirements,
@@ -688,10 +688,37 @@ impl DockerComputeDriver {
 
     async fn current_snapshots(&self) -> Result<Vec<DriverSandbox>, Status> {
         let containers = self.list_managed_container_summaries().await?;
-        let container_sandboxes = containers
-            .iter()
-            .filter_map(sandbox_from_container_summary)
-            .collect::<Vec<_>>();
+        let mut container_sandboxes = Vec::with_capacity(containers.len());
+        for summary in &containers {
+            let Some(mut sandbox) = sandbox_from_container_summary(summary) else {
+                continue;
+            };
+            // Docker's list summary carries no exit code, so an exited
+            // container is reported as the generic terminal `ContainerExited`.
+            // Inspect it to tell a machine/daemon-restart signal kill apart
+            // from an ordinary application exit, mirroring the Podman driver,
+            // so startup recovery can revive restart victims while leaving
+            // crashes terminal.
+            if summary.state == Some(ContainerSummaryStateEnum::EXITED)
+                && let Some(container_id) = summary.id.as_deref()
+            {
+                match self.docker.inspect_container(container_id, None).await {
+                    Ok(inspected) => {
+                        if let Some(state) = inspected.state.as_ref() {
+                            apply_docker_exit_classification(&mut sandbox, state);
+                        }
+                    }
+                    Err(err) => {
+                        debug!(
+                            container_id,
+                            error = %err,
+                            "Could not inspect exited Docker container to classify its exit"
+                        );
+                    }
+                }
+            }
+            container_sandboxes.push(sandbox);
+        }
         let mut by_id = self.pending_snapshot_map().await;
         for sandbox in container_sandboxes {
             by_id.insert(sandbox.id.clone(), sandbox);
@@ -3092,6 +3119,34 @@ fn driver_status_from_summary(
     }
 }
 
+/// Refine an exited Docker sandbox's `Ready` condition from inspected state.
+///
+/// A signal kill (exit 137/143 = SIGKILL/SIGTERM, not OOM) is the signature of
+/// a machine/daemon restart terminating a running container. Reclassify it from
+/// the generic terminal `ContainerExited` to the recoverable
+/// `ContainerRuntimeRestart` so gateway startup can revive it. OOM kills and
+/// ordinary application exits stay `ContainerExited` and terminal.
+fn apply_docker_exit_classification(sandbox: &mut DriverSandbox, state: &ContainerState) {
+    if state.oom_killed == Some(true) {
+        return;
+    }
+    let Some(code) = state.exit_code.filter(|&code| matches!(code, 137 | 143)) else {
+        return;
+    };
+    let Some(condition) = sandbox
+        .status
+        .as_mut()
+        .and_then(|status| status.conditions.iter_mut().find(|c| c.r#type == "Ready"))
+    else {
+        return;
+    };
+    if condition.reason != CONDITION_EXITED {
+        return;
+    }
+    condition.reason = CONDITION_RUNTIME_RESTART.to_string();
+    condition.message = format!("Container terminated by signal (exit code {code})");
+}
+
 fn container_ready_condition(
     state: ContainerSummaryStateEnum,
 ) -> (&'static str, &'static str, &'static str, bool) {
@@ -3115,12 +3170,7 @@ fn container_ready_condition(
         ContainerSummaryStateEnum::PAUSED => {
             ("False", "ContainerPaused", "Container is paused", false)
         }
-        ContainerSummaryStateEnum::EXITED => (
-            "False",
-            openshell_core::driver_utils::CONDITION_EXITED,
-            "Container exited",
-            false,
-        ),
+        ContainerSummaryStateEnum::EXITED => ("False", CONDITION_EXITED, "Container exited", false),
         ContainerSummaryStateEnum::DEAD => ("False", "ContainerDead", "Container is dead", false),
     }
 }
