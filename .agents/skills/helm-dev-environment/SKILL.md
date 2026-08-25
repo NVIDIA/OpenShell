@@ -26,6 +26,8 @@ mise run helm:k3s:create
 ```
 
 Creates a k3d cluster and merges its kubeconfig into the worktree-local `kubeconfig` file.
+When the named cluster already exists, the task starts any stopped containers and refreshes
+same-named kubeconfig entries so a recreated load balancer's current API port takes effect.
 Also applies the upstream agent-sandbox CRDs/controller (pinned via `AGENT_SANDBOX_VERSION`
 in `tasks/scripts/helm-k3s-local.sh`, fetched from `github.com/kubernetes-sigs/agent-sandbox`
 releases), enables its OTLP tracing on v0.5 and later, installs an OTLP trace
