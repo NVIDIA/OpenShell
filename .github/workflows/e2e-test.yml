@@ -290,6 +290,10 @@ jobs:
       - name: Run Podman E2E
         run: ${{ matrix.cmd }}
 
+      - name: Print AppArmor denials
+        if: always()
+        run: sudo dmesg | grep -E 'apparmor=.*DENIED|profile="unprivileged_userns"' | tail -100 || true
+
       - name: Fail on pasta SIGTERM AppArmor denial
         if: always()
         run: |
