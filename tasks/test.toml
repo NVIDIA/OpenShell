@@ -86,6 +86,14 @@ run = [
   "e2e/with-docker-gateway.sh cargo test --manifest-path e2e/rust/Cargo.toml --features e2e-docker",
 ]
 
+["e2e:cli-conformance"]
+description = "Run the portable CLI conformance baseline against the configured gateway"
+run = [
+  "if [ -z \"${OPENSHELL_BIN:-}\" ]; then cargo build -p openshell-cli; fi",
+  "OPENSHELL_BIN=\"${OPENSHELL_BIN:-$PWD/target/debug/openshell}\" cargo test --manifest-path e2e/rust/Cargo.toml --features e2e-cli-conformance --lib harness::conformance::tests",
+  "OPENSHELL_BIN=\"${OPENSHELL_BIN:-$PWD/target/debug/openshell}\" cargo test --manifest-path e2e/rust/Cargo.toml --features e2e-cli-conformance --test smoke",
+]
+
 ["e2e:websocket-conformance"]
 description = "Run focused WebSocket conformance e2e tests against a Docker-backed gateway"
 run = [

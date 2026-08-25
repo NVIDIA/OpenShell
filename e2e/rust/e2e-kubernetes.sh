@@ -26,6 +26,7 @@ E2E_FEATURES="${OPENSHELL_E2E_KUBERNETES_FEATURES:-e2e,e2e-host-gateway,e2e-kube
 # local CLI needs to be built when CI has not supplied a prebuilt one.
 if [ -z "${OPENSHELL_BIN:-}" ]; then
   cargo build -p openshell-cli
+  export OPENSHELL_BIN="${ROOT}/target/debug/openshell"
 fi
 
 test_filter=()
