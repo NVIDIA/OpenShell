@@ -1,0 +1,34 @@
+---
+title: OpenShell conformance CLI
+---
+
+`openshell-conformance` runs portable conformance scenarios against an existing OpenShell gateway. It is a standalone binary: the target system needs the OpenShell CLI and its configured gateway, but does not need Rust, Cargo, or Mise.
+
+Build a release binary on the system that prepares the test artifact:
+
+```shell
+cargo build --release -p openshell-conformance-cli
+```
+
+Copy `target/release/openshell-conformance` to the target system and ensure `openshell` is on `PATH`. Run all installed scenarios:
+
+```shell
+openshell-conformance run
+```
+
+Run one scenario or select an explicit OpenShell CLI binary:
+
+```shell
+openshell-conformance run smoke --openshell-bin /opt/openshell/bin/openshell
+```
+
+Use JSON for automation:
+
+```shell
+openshell-conformance list --output json
+openshell-conformance run --output json
+```
+
+The initial `smoke` scenario verifies gateway status, creates a base sandbox, checks that it is ready and listed, executes a marker command, and deletes the sandbox. It cleans up any tracked sandbox when a later assertion fails.
+
+Scenario implementations live under `crates/openshell-conformance/src/scenarios/`. Add a scenario there and register it in the library's `SCENARIOS` list.

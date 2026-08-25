@@ -3,12 +3,15 @@
 
 //! Reusable support for portable `OpenShell` CLI conformance scenarios.
 
-mod executor;
+pub mod executor;
+mod scenarios;
 
 use std::collections::BTreeSet;
 use std::error::Error;
 use std::fmt;
+use std::future::Future;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::process::ExitStatus;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -19,6 +22,36 @@ use serde::de::DeserializeOwned;
 use tokio::time::sleep;
 
 use self::executor::{CliExecutionError, CliExecutor, ProcessCli};
+
+pub use scenarios::SMOKE_SCENARIO;
+
+/// An installed conformance scenario.
+#[derive(Debug)]
+pub struct Scenario {
+    pub name: &'static str,
+    pub description: &'static str,
+    run: for<'a> fn(&'a mut OpenShellRunner) -> ScenarioFuture<'a>,
+}
+
+pub type ScenarioFuture<'a> = Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
+
+impl Scenario {
+    pub async fn run(&self, runner: &mut OpenShellRunner) -> Result<(), String> {
+        (self.run)(runner).await
+    }
+}
+
+const SCENARIOS: &[Scenario] = &[SMOKE_SCENARIO];
+
+/// Returns every scenario compiled into this distribution.
+pub fn scenarios() -> &'static [Scenario] {
+    SCENARIOS
+}
+
+/// Finds a scenario by its stable command-line name.
+pub fn scenario(name: &str) -> Option<&'static Scenario> {
+    scenarios().iter().find(|candidate| candidate.name == name)
+}
 
 const CLEANUP_TIMEOUT: Duration = Duration::from_secs(120);
 pub const STATUS_TIMEOUT: Duration = Duration::from_secs(30);
@@ -235,27 +268,28 @@ pub struct OpenShellCommand<'a> {
 
 impl OpenShellRunner {
     pub fn new(scenario: &str) -> Result<Self, RunnerError> {
-        let binary = std::env::var_os("OPENSHELL_BIN")
-            .map(PathBuf::from)
-            .ok_or_else(|| {
-                RunnerError::BinaryUnavailable(
-                    "OPENSHELL_BIN is required for CLI conformance tests".to_string(),
-                )
-            })?;
-        Self::with_binary(binary, scenario)
+        Ok(Self::with_executor(
+            Arc::new(ProcessCli::new(PathBuf::from("openshell"))),
+            scenario,
+        ))
     }
 
-    fn with_binary(binary: PathBuf, scenario: &str) -> Result<Self, RunnerError> {
+    /// Uses an explicit `openshell` binary rather than resolving it on `PATH`.
+    pub fn with_binary(binary: PathBuf, scenario: &str) -> Result<Self, RunnerError> {
         if !binary.is_file() {
             return Err(RunnerError::BinaryUnavailable(format!(
                 "OpenShell CLI binary not found at {}",
                 binary.display()
             )));
         }
-        Ok(Self::with_cli(Arc::new(ProcessCli::new(binary)), scenario))
+        Ok(Self::with_executor(
+            Arc::new(ProcessCli::new(binary)),
+            scenario,
+        ))
     }
 
-    fn with_cli(cli: Arc<dyn CliExecutor>, scenario: &str) -> Self {
+    /// Creates a runner with an injected executor. This is useful for harness tests.
+    pub fn with_executor(cli: Arc<dyn CliExecutor>, scenario: &str) -> Self {
         Self {
             cli,
             run_id: generate_run_id(),
@@ -317,7 +351,7 @@ impl OpenShellRunner {
             .await
             .map_err(|error| error.to_string())?;
 
-        println!(
+        eprintln!(
             "gateway preflight connected: gateway={}, server={}, version={}, authentication={}",
             status.gateway.as_deref().unwrap_or("unknown"),
             status.server.as_deref().unwrap_or("unknown"),
@@ -351,7 +385,7 @@ impl OpenShellRunner {
         mut observe: F,
     ) -> Result<T, RunnerError>
     where
-        F: AsyncFnMut(&mut OpenShellRunner) -> Poll<T>,
+        F: AsyncFnMut(&mut Self) -> Poll<T>,
     {
         let started = Instant::now();
         let context = self.context(step);
@@ -394,7 +428,7 @@ impl OpenShellRunner {
     ) -> Result<CommandResult, RunnerError> {
         let context = self.context(step);
         let command = sanitized_command(&args);
-        println!("{context} running: {command}");
+        eprintln!("{context} running: {command}");
 
         let started = Instant::now();
         let output =
@@ -414,7 +448,7 @@ impl OpenShellRunner {
                     },
                 })?;
         let elapsed = started.elapsed();
-        println!(
+        eprintln!(
             "{context} completed in {:.1?}: exit {}",
             elapsed,
             exit_description(output.status)
@@ -433,7 +467,7 @@ impl OpenShellRunner {
         })
     }
 
-    async fn cleanup(&mut self) -> Result<(), String> {
+    async fn cleanup(&self) -> Result<(), String> {
         if self.known_sandboxes.is_empty() {
             return Ok(());
         }
@@ -703,7 +737,7 @@ mod tests {
 
     fn test_runner(responses: Vec<MockResponse>) -> (OpenShellRunner, Arc<MockCli>) {
         let cli = Arc::new(MockCli::new(responses));
-        let runner = OpenShellRunner::with_cli(cli.clone(), "smoke");
+        let runner = OpenShellRunner::with_executor(cli.clone(), "smoke");
         (runner, cli)
     }
 

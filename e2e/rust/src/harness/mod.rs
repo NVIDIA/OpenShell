@@ -5,7 +5,6 @@
 
 pub mod binary;
 pub mod cli;
-pub mod conformance;
 pub mod container;
 pub mod gateway;
 pub mod output;

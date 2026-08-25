@@ -3888,6 +3888,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "openshell-conformance"
+version = "0.0.0"
+dependencies = [
+ "rand 0.9.4",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
+name = "openshell-conformance-cli"
+version = "0.0.0"
+dependencies = [
+ "clap",
+ "openshell-conformance",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "openshell-core"
 version = "0.0.0"
 dependencies = [

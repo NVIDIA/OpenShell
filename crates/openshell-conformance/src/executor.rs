@@ -11,24 +11,24 @@ use std::time::Duration;
 
 use tokio::time::timeout;
 
-pub(super) type CliExecution<'a> =
+pub type CliExecution<'a> =
     Pin<Box<dyn Future<Output = Result<Output, CliExecutionError>> + Send + 'a>>;
 
-pub(super) trait CliExecutor: Send + Sync {
+pub trait CliExecutor: Send + Sync {
     fn execute(&self, args: Vec<String>, command_timeout: Duration) -> CliExecution<'_>;
 }
 
-pub(super) enum CliExecutionError {
+pub enum CliExecutionError {
     Spawn(std::io::Error),
     Timeout,
 }
 
-pub(super) struct ProcessCli {
+pub struct ProcessCli {
     binary: PathBuf,
 }
 
 impl ProcessCli {
-    pub(super) fn new(binary: PathBuf) -> Self {
+    pub fn new(binary: PathBuf) -> Self {
         Self { binary }
     }
 }

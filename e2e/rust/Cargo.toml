@@ -16,10 +16,8 @@ license = "Apache-2.0"
 publish = false
 
 [features]
-# Selects the minimal portable CLI conformance profile.
-e2e-cli-conformance = []
-# Selects the common E2E suite, including the CLI conformance baseline.
-e2e = ["e2e-cli-conformance"]
+# Selects the common E2E suite.
+e2e = []
 # Selects tests that rely on `host.openshell.internal` (the sandbox's stable
 # alias to the host running test fixtures). docker, podman, and vm wire the
 # alias unconditionally; the kube driver only does so when the chart's
@@ -49,11 +47,6 @@ required-features = ["e2e-oidc-pkce"]
 name = "provider_refresh_keycloak"
 path = "tests/provider_refresh_keycloak.rs"
 required-features = ["e2e-provider-refresh-keycloak"]
-
-[[test]]
-name = "smoke"
-path = "tests/smoke.rs"
-required-features = ["e2e-cli-conformance"]
 
 [[test]]
 name = "vm_overlay"

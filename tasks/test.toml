@@ -87,11 +87,11 @@ run = [
 ]
 
 ["e2e:cli-conformance"]
-description = "Run the portable CLI conformance baseline against the configured gateway"
+description = "Build and run the standalone CLI conformance suite against the configured gateway"
 run = [
   "if [ -z \"${OPENSHELL_BIN:-}\" ]; then cargo build -p openshell-cli; fi",
-  "OPENSHELL_BIN=\"${OPENSHELL_BIN:-$PWD/target/debug/openshell}\" cargo test --manifest-path e2e/rust/Cargo.toml --features e2e-cli-conformance --lib harness::conformance::tests",
-  "OPENSHELL_BIN=\"${OPENSHELL_BIN:-$PWD/target/debug/openshell}\" cargo test --manifest-path e2e/rust/Cargo.toml --features e2e-cli-conformance --test smoke",
+  "cargo build -p openshell-conformance-cli",
+  "target/debug/openshell-conformance run --openshell-bin \"${OPENSHELL_BIN:-$PWD/target/debug/openshell}\"",
 ]
 
 ["e2e:websocket-conformance"]

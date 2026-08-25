@@ -1,14 +1,13 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-#![cfg(feature = "e2e-cli-conformance")]
-
 //! Portable phase-1 CLI conformance scenario.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use openshell_e2e::harness::conformance::{OpenShellRunner, Poll, STATUS_TIMEOUT};
+use crate::{OpenShellRunner, STATUS_TIMEOUT, Scenario, ScenarioFuture};
 use serde::Deserialize;
+use tokio::time::sleep;
 
 const CREATE_TIMEOUT: Duration = Duration::from_secs(600);
 const LIST_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -24,23 +23,17 @@ struct SandboxListEntry {
 }
 
 /// Certify status -> create -> list Ready -> exec -> delete -> list empty.
-#[tokio::test]
-async fn gateway_smoke() {
-    let mut runner = OpenShellRunner::new("smoke")
-        .unwrap_or_else(|error| panic!("failed to initialize conformance runner: {error}"));
-    println!("CLI conformance run ID: {}", runner.id());
-    let scenario_result = match runner.check_gateway_status().await {
-        Ok(()) => run_smoke(&mut runner).await,
-        Err(error) => Err(error),
-    };
+pub const SMOKE_SCENARIO: Scenario = Scenario {
+    name: "smoke",
+    description: "Create, inspect, execute in, and delete a base sandbox.",
+    run: run_smoke,
+};
 
-    runner
-        .finish(scenario_result)
-        .await
-        .unwrap_or_else(|error| panic!("CLI conformance smoke failed:\n{error}"));
+fn run_smoke(runner: &mut OpenShellRunner) -> ScenarioFuture<'_> {
+    Box::pin(async move { run_smoke_inner(runner).await })
 }
 
-async fn run_smoke(runner: &mut OpenShellRunner) -> Result<(), String> {
+async fn run_smoke_inner(runner: &mut OpenShellRunner) -> Result<(), String> {
     let status = runner
         .step("status")
         .description("openshell status succeeds")
@@ -145,23 +138,21 @@ async fn check_sandbox_listed(runner: &OpenShellRunner, sandbox_name: &str) -> R
     ))
 }
 
-async fn check_empty_list(runner: &mut OpenShellRunner, sandbox_name: &str) -> Result<(), String> {
-    runner
-        .poll_until(
-            "list-empty",
-            DELETE_TIMEOUT,
-            DELETE_POLL_INTERVAL,
-            async |runner| match find_sandbox(runner, sandbox_name, "list-empty/query").await {
-                Ok(None) => Poll::Ready(()),
-                Ok(Some(sandbox)) => Poll::Pending(format!(
-                    "sandbox '{sandbox_name}' remains listed in phase {:?}",
+async fn check_empty_list(runner: &OpenShellRunner, sandbox_name: &str) -> Result<(), String> {
+    let started = Instant::now();
+
+    loop {
+        match find_sandbox(runner, sandbox_name, "list-empty/query").await? {
+            None => return Ok(()),
+            Some(sandbox) if started.elapsed() >= DELETE_TIMEOUT => {
+                return Err(format!(
+                    "sandbox '{sandbox_name}' remains listed in phase {:?} after {DELETE_TIMEOUT:.1?}",
                     sandbox.phase
-                )),
-                Err(error) => Poll::Failed(error),
-            },
-        )
-        .await
-        .map_err(|error| error.to_string())
+                ));
+            }
+            Some(_) => sleep(DELETE_POLL_INTERVAL).await,
+        }
+    }
 }
 
 async fn find_sandbox(

@@ -12,6 +12,7 @@ OpenShell builds these main artifacts:
 |---|---|
 | Gateway binary | `crates/openshell-server` |
 | CLI binaries and system packages | `crates/openshell-cli` plus release packaging |
+| E2E conformance CLI | `crates/openshell-conformance-cli` |
 | Python SDK wheel | `python/openshell` |
 | TypeScript SDK package | `sdk/typescript` |
 | Gateway container image | `deploy/docker/Dockerfile.gateway` |
