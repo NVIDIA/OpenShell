@@ -49,9 +49,21 @@ pub fn openshell_sandbox_label_selector() -> String {
 // Sandbox condition reason strings set by compute drivers.
 // ---------------------------------------------------------------------------
 
-/// Ready-condition reason when a container exits on its own (e.g. SIGTERM
-/// from a machine restart, OOM kill, application crash).
+/// Ready-condition reason when a container exits on its own.
+///
+/// Covers an ordinary application exit or crash (exit 0, a non-zero error code,
+/// or an uncaught fault). This is a terminal reason: gateway startup does NOT
+/// auto-restart it, so a genuine failure keeps its error signal instead of
+/// being relaunched.
 pub const CONDITION_EXITED: &str = "ContainerExited";
+
+/// Ready-condition reason when a container was terminated by an external signal.
+///
+/// SIGKILL/SIGTERM (exit 137/143) is what a Podman/Docker machine or daemon
+/// restart does to running containers. Distinct from `CONDITION_EXITED` so
+/// gateway startup can recover machine-restart victims while leaving ordinary
+/// application exits terminal.
+pub const CONDITION_RUNTIME_RESTART: &str = "ContainerRuntimeRestart";
 
 /// Ready-condition reason when a container is explicitly stopped via the
 /// runtime API (e.g. `podman stop`, gateway-initiated shutdown).

@@ -2147,9 +2147,11 @@ impl ComputeRuntime {
     /// requires running compute for drivers that request gateway-managed
     /// lifecycle. Stable stopped and deleting states are deliberately left
     /// alone. Error-phase sandboxes are included only when their Ready
-    /// condition indicates a container exit or stop (e.g. after a Podman/Docker
-    /// machine restart): if the container still exists it is restarted and the
-    /// sandbox is moved back to `Provisioning`; otherwise it stays in `Error`.
+    /// condition indicates the runtime went away underneath a running container
+    /// — a signal-kill from a machine/daemon restart or an explicit runtime
+    /// stop. If the container still exists it is restarted and the sandbox is
+    /// moved back to `Provisioning`; otherwise it stays in `Error`. Ordinary
+    /// application exits and crashes stay terminal and are not relaunched.
     ///
     /// Should be called once at gateway startup, before watchers spawn,
     /// so the watch loop sees the post-start state on its first poll.
@@ -4109,16 +4111,19 @@ fn sandbox_phase_should_be_running(phase: SandboxPhase) -> bool {
 }
 
 /// Error-phase sandboxes are only eligible for startup recovery when their
-/// Ready condition reason indicates a container exit or stop — i.e. the
-/// runtime went away (machine restart, daemon restart) rather than a genuine
-/// application or infrastructure failure.
+/// Ready condition reason indicates the runtime went away underneath a running
+/// container — a machine/daemon restart that terminated it by signal
+/// (`CONDITION_RUNTIME_RESTART`) or an explicit runtime stop
+/// (`CONDITION_STOPPED`). Ordinary application exits (`CONDITION_EXITED`, which
+/// covers crashes and non-zero exits) stay terminal so a genuine failure keeps
+/// its error signal instead of being relaunched on every gateway startup.
 fn is_recoverable_error_reason(sandbox: &Sandbox) -> bool {
-    use openshell_core::driver_utils::{CONDITION_EXITED, CONDITION_STOPPED};
+    use openshell_core::driver_utils::{CONDITION_RUNTIME_RESTART, CONDITION_STOPPED};
     sandbox
         .status
         .as_ref()
         .and_then(|s| s.conditions.iter().find(|c| c.r#type == "Ready"))
-        .is_some_and(|c| c.reason == CONDITION_EXITED || c.reason == CONDITION_STOPPED)
+        .is_some_and(|c| c.reason == CONDITION_RUNTIME_RESTART || c.reason == CONDITION_STOPPED)
 }
 
 fn is_terminal_failure_reason(reason: &str) -> bool {
@@ -8881,7 +8886,9 @@ mod tests {
             let sandbox = sandbox_record(id, name, phase);
             runtime.store.put_message(&sandbox).await.unwrap();
         }
-        // A non-recoverable error is skipped; a container-exit error is retried.
+        // Terminal errors are skipped: a backend-missing error and an ordinary
+        // container exit (crash) both stay in Error. Only a signal-kill from a
+        // machine/daemon restart is retried.
         runtime
             .store
             .put_message(&error_sandbox_record(
@@ -8900,6 +8907,15 @@ mod tests {
             ))
             .await
             .unwrap();
+        runtime
+            .store
+            .put_message(&error_sandbox_record(
+                "sb-error-restart",
+                "error-restart",
+                "ContainerRuntimeRestart",
+            ))
+            .await
+            .unwrap();
 
         runtime.start_persisted_sandboxes().await.unwrap();
 
@@ -8912,7 +8928,7 @@ mod tests {
         assert_eq!(
             called_ids,
             vec![
-                "sb-error-exit".to_string(),
+                "sb-error-restart".to_string(),
                 "sb-prov".to_string(),
                 "sb-ready".to_string(),
                 "sb-unknown".to_string(),
@@ -9088,7 +9104,7 @@ mod tests {
         // Default start outcome is Ok: the container is restarted successfully.
         let runtime = test_runtime_with_gateway_managed_lifecycle(driver.clone(), "podman").await;
 
-        let sandbox = error_sandbox_record("sb-err-recover", "recover", "ContainerExited");
+        let sandbox = error_sandbox_record("sb-err-recover", "recover", "ContainerRuntimeRestart");
         runtime.store.put_message(&sandbox).await.unwrap();
 
         runtime.start_persisted_sandboxes().await.unwrap();
@@ -9119,7 +9135,7 @@ mod tests {
         driver.set_start_outcome(ControlledLifecycleOutcome::NotFound);
         let runtime = test_runtime_with_gateway_managed_lifecycle(driver.clone(), "podman").await;
 
-        let sandbox = error_sandbox_record("sb-err-gone", "gone", "ContainerExited");
+        let sandbox = error_sandbox_record("sb-err-gone", "gone", "ContainerRuntimeRestart");
         runtime.store.put_message(&sandbox).await.unwrap();
 
         runtime.start_persisted_sandboxes().await.unwrap();
@@ -9142,7 +9158,7 @@ mod tests {
             .as_ref()
             .and_then(|s| s.conditions.iter().find(|c| c.r#type == "Ready"))
             .expect("Ready condition present");
-        assert_eq!(ready.reason, "ContainerExited");
+        assert_eq!(ready.reason, "ContainerRuntimeRestart");
     }
 
     #[tokio::test]
@@ -9199,6 +9215,42 @@ mod tests {
             SandboxPhase::try_from(stored.phase()).unwrap(),
             SandboxPhase::Error
         );
+    }
+
+    #[tokio::test]
+    async fn start_persisted_sandboxes_leaves_generic_container_exit_terminal() {
+        // A container that exited on its own — an ordinary application crash or
+        // non-zero exit — is stored as Error with `ContainerExited`. Startup
+        // recovery must NOT relaunch it: doing so would erase the failure
+        // signal and repeatedly revive a crash-prone workload. Only a
+        // signal-kill (`ContainerRuntimeRestart`) from a machine/daemon restart
+        // is recoverable.
+        let driver = ControlledDriver::new();
+        let runtime = test_runtime_with_gateway_managed_lifecycle(driver.clone(), "podman").await;
+
+        let sandbox = error_sandbox_record("sb-err-crash", "crash", "ContainerExited");
+        runtime.store.put_message(&sandbox).await.unwrap();
+
+        runtime.start_persisted_sandboxes().await.unwrap();
+
+        assert_eq!(driver.start_calls(), 0);
+
+        let stored = runtime
+            .store
+            .get_message::<Sandbox>("sb-err-crash")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            SandboxPhase::try_from(stored.phase()).unwrap(),
+            SandboxPhase::Error
+        );
+        let ready = stored
+            .status
+            .as_ref()
+            .and_then(|s| s.conditions.iter().find(|c| c.r#type == "Ready"))
+            .expect("Ready condition present");
+        assert_eq!(ready.reason, "ContainerExited");
     }
 
     #[test]

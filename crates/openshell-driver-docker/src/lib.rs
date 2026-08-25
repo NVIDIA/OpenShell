@@ -3115,14 +3115,12 @@ fn container_ready_condition(
         ContainerSummaryStateEnum::PAUSED => {
             ("False", "ContainerPaused", "Container is paused", false)
         }
-        ContainerSummaryStateEnum::EXITED => {
-            (
-                "False",
-                openshell_core::driver_utils::CONDITION_EXITED,
-                "Container exited",
-                false,
-            )
-        }
+        ContainerSummaryStateEnum::EXITED => (
+            "False",
+            openshell_core::driver_utils::CONDITION_EXITED,
+            "Container exited",
+            false,
+        ),
         ContainerSummaryStateEnum::DEAD => ("False", "ContainerDead", "Container is dead", false),
     }
 }
