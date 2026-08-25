@@ -48,6 +48,11 @@ path = "tests/provider_refresh_keycloak.rs"
 required-features = ["e2e-provider-refresh-keycloak"]
 
 [[test]]
+name = "vm_overlay"
+path = "tests/vm_overlay.rs"
+required-features = ["e2e-vm"]
+
+[[test]]
 name = "custom_image"
 path = "tests/custom_image.rs"
 required-features = ["e2e-docker"]

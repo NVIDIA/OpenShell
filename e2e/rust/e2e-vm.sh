@@ -371,7 +371,6 @@ fi
 # The CLI uses the raw endpoint but still resolves matching metadata so it
 # can find the mTLS client bundle.
 
-export OPENSHELL_E2E_EXPECT_VM_OVERLAY=1
 export OPENSHELL_E2E_DRIVER="vm"
 export OPENSHELL_E2E_VM_STATE_DIR="${RUN_STATE_DIR}"
 e2e_export_gateway_restart_metadata \
@@ -405,5 +404,6 @@ if [ -n "${E2E_TEST_OVERRIDE}" ]; then
 else
   run_e2e_test smoke
   run_e2e_test host_gateway_alias
+  run_e2e_test vm_overlay
   run_e2e_test vm_gateway_start
 fi
