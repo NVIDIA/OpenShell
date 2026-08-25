@@ -7,11 +7,6 @@ use std::path::{Path, PathBuf};
 
 use crate::proto::compute::v1::DriverSandbox;
 
-pub use crate::container_paths::{
-    SANDBOX_TOKEN_MOUNT_PATH, SUPERVISOR_CONTAINER_BINARY, SUPERVISOR_CONTAINER_DIR,
-    TLS_CA_MOUNT_PATH, TLS_CERT_MOUNT_PATH, TLS_KEY_MOUNT_PATH, UPSTREAM_PROXY_AUTH_MOUNT_PATH,
-};
-
 // ---------------------------------------------------------------------------
 // Sandbox container/pod label keys (openshell.ai/ namespace)
 // ---------------------------------------------------------------------------
@@ -54,6 +49,60 @@ pub fn openshell_sandbox_label_selector() -> String {
 /// path used when building the `openshell-sandbox` image layer.
 pub const SUPERVISOR_IMAGE_BINARY_PATH: &str = "/openshell-sandbox";
 
+/// Directory inside sandbox containers where the supervisor binary is mounted.
+///
+/// Compute drivers that side-load the supervisor into a shared volume mount
+/// the binary here so the sandbox container can execute it from a fixed path.
+pub const SUPERVISOR_CONTAINER_DIR: &str = "/opt/openshell/bin";
+
+/// Full path to the supervisor binary inside sandbox containers.
+///
+/// Equals `SUPERVISOR_CONTAINER_DIR + "/openshell-sandbox"`. Use this when
+/// the full executable path is needed (Docker entrypoint, Podman entrypoint,
+/// VM rootfs injection). Use `SUPERVISOR_CONTAINER_DIR` when only the
+/// directory mount-point is needed (Kubernetes emptyDir volume mount).
+pub const SUPERVISOR_CONTAINER_BINARY: &str = "/opt/openshell/bin/openshell-sandbox";
+
+// ---------------------------------------------------------------------------
+// In-container mount paths for guest TLS materials and the sandbox token.
+//
+// All container-based drivers (Docker, Podman, Kubernetes) mount the gateway's
+// mTLS client credentials at these fixed paths inside every sandbox container.
+// The supervisor reads these paths on startup to establish its gRPC-over-mTLS
+// connection back to the gateway. The paths must remain stable across driver
+// versions since the supervisor binary is built and packaged separately.
+// ---------------------------------------------------------------------------
+
+/// Container-side mount path for the guest mTLS CA certificate.
+pub const TLS_CA_MOUNT_PATH: &str = "/etc/openshell/tls/client/ca.crt";
+
+/// Container-side mount path for the guest mTLS client certificate.
+pub const TLS_CERT_MOUNT_PATH: &str = "/etc/openshell/tls/client/tls.crt";
+
+/// Container-side mount path for the guest mTLS client private key.
+pub const TLS_KEY_MOUNT_PATH: &str = "/etc/openshell/tls/client/tls.key";
+
+/// Container-side mount path for the per-sandbox JWT token.
+pub const SANDBOX_TOKEN_MOUNT_PATH: &str = "/etc/openshell/auth/sandbox.jwt";
+
+/// Container-side mount path for the corporate upstream-proxy credentials.
+///
+/// The file holds the `user:pass` userinfo used to build the
+/// `Proxy-Authorization` header. It is delivered through a root-only secret
+/// mount so the credential never appears in container environment/metadata.
+pub const UPSTREAM_PROXY_AUTH_MOUNT_PATH: &str = "/etc/openshell/auth/upstream-proxy";
+
+/// Container-side mount path for the corporate proxy CA bundle.
+///
+/// Drivers with a `proxy_ca_bundle` operator setting bind-mount the host PEM
+/// file here (read-only) and pass the path on the supervisor's argv via
+/// `--upstream-proxy-ca-bundle`. The supervisor trusts it for the TLS
+/// handshake with an `https://` corporate egress proxy and for server
+/// certificates re-signed by a TLS-intercepting proxy. Unlike the proxy
+/// credential, a CA certificate is not secret, so a plain read-only bind
+/// mount is used rather than a driver secret.
+pub const PROXY_CA_MOUNT_PATH: &str = "/etc/openshell/tls/proxy/ca-bundle.pem";
+
 /// A validated corporate upstream-proxy address.
 ///
 /// Produced by [`parse_upstream_proxy_url`], which is the single source of
@@ -68,6 +117,9 @@ pub struct UpstreamProxyAddr {
     pub host: String,
     /// Proxy TCP port (always explicit in the accepted URL grammar).
     pub port: u16,
+    /// `true` when the proxy URL used the `https://` scheme, so the supervisor
+    /// wraps the connection to the proxy in TLS before the CONNECT handshake.
+    pub secure: bool,
 }
 
 /// Why an upstream proxy URL was rejected by [`parse_upstream_proxy_url`].
@@ -88,11 +140,11 @@ pub enum UpstreamProxyUrlError {
     /// `http://host:port` contract exactly.
     #[error("proxy URL must include an explicit scheme, e.g. http://proxy.corp.com:3128")]
     MissingScheme,
-    /// The URL uses a scheme other than `http` (TLS and SOCKS proxies are
+    /// The URL uses a scheme other than `http` or `https` (SOCKS proxies are
     /// not supported by the sandbox supervisor).
     #[error(
-        "unsupported proxy scheme '{0}': only http:// forward proxies are \
-         supported by the sandbox supervisor"
+        "unsupported proxy scheme '{0}': only http:// and https:// forward \
+         proxies are supported by the sandbox supervisor"
     )]
     UnsupportedScheme(String),
     /// The URL has no explicit port. Corporate proxies rarely listen on the
@@ -122,11 +174,13 @@ pub enum UpstreamProxyUrlError {
 
 /// Parse and validate a corporate upstream-proxy URL.
 ///
-/// The accepted grammar is exactly `http://host:port`: the scheme and the
-/// port must both be explicit, only `http://` proxies are accepted, and
-/// inline userinfo is rejected. The URL must address the proxy only: a path
-/// (other than a bare trailing `/`), query, or fragment is rejected rather
-/// than silently discarded.
+/// The accepted grammar is exactly `http://host:port` or `https://host:port`:
+/// the scheme and the port must both be explicit, only `http://` and
+/// `https://` proxies are accepted, and inline userinfo is rejected. The URL
+/// must address the proxy only: a path (other than a bare trailing `/`),
+/// query, or fragment is rejected rather than silently discarded. The
+/// returned [`UpstreamProxyAddr::secure`] records whether the `https://`
+/// scheme was used so the supervisor knows to TLS-wrap the proxy connection.
 ///
 /// # Errors
 ///
@@ -142,11 +196,15 @@ pub fn parse_upstream_proxy_url(raw: &str) -> Result<UpstreamProxyAddr, Upstream
     }
     let parsed = url::Url::parse(trimmed).map_err(UpstreamProxyUrlError::Invalid)?;
 
-    if !parsed.scheme().eq_ignore_ascii_case("http") {
+    let secure = if parsed.scheme().eq_ignore_ascii_case("https") {
+        true
+    } else if parsed.scheme().eq_ignore_ascii_case("http") {
+        false
+    } else {
         return Err(UpstreamProxyUrlError::UnsupportedScheme(
             parsed.scheme().to_string(),
         ));
-    }
+    };
     if !parsed.username().is_empty() || parsed.password().is_some() {
         return Err(UpstreamProxyUrlError::InlineCredentials);
     }
@@ -174,14 +232,14 @@ pub fn parse_upstream_proxy_url(raw: &str) -> Result<UpstreamProxyAddr, Upstream
     if !authority_has_explicit_port(trimmed) {
         return Err(UpstreamProxyUrlError::MissingPort);
     }
-    // Explicit-port presence was verified above; `port()` is `None` only
-    // when the URL spells out the scheme default (`:80`), which the url crate
-    // normalizes away.
-    let port = parsed.port().unwrap_or(80);
+    // Explicit-port presence was verified above; `port()` is `None` only when
+    // the URL spells out the scheme default (`:80` for http, `:443` for
+    // https), which the url crate normalizes away.
+    let port = parsed.port().unwrap_or(if secure { 443 } else { 80 });
     if port == 0 {
         return Err(UpstreamProxyUrlError::ZeroPort);
     }
-    Ok(UpstreamProxyAddr { host, port })
+    Ok(UpstreamProxyAddr { host, port, secure })
 }
 
 /// Return `true` when the raw URL's authority carries an explicit `:port`.
@@ -572,6 +630,20 @@ mod tests {
         let addr = parse_upstream_proxy_url("http://proxy.corp.com:8080").unwrap();
         assert_eq!(addr.host, "proxy.corp.com");
         assert_eq!(addr.port, 8080);
+        assert!(!addr.secure, "http:// is not TLS-wrapped");
+    }
+
+    #[test]
+    fn upstream_proxy_url_accepts_https_with_port() {
+        let addr = parse_upstream_proxy_url("https://proxy.corp.com:3130").unwrap();
+        assert_eq!(addr.host, "proxy.corp.com");
+        assert_eq!(addr.port, 3130);
+        assert!(addr.secure, "https:// is TLS-wrapped");
+        // An explicit scheme-default port (:443) is accepted even though the
+        // url crate normalizes it away in the parsed form.
+        let addr = parse_upstream_proxy_url("https://proxy.corp.com:443").unwrap();
+        assert_eq!(addr.port, 443);
+        assert!(addr.secure);
     }
 
     #[test]
@@ -631,12 +703,21 @@ mod tests {
     }
 
     #[test]
-    fn upstream_proxy_url_rejects_tls_and_socks_schemes() {
-        for url in ["https://proxy:443", "socks5://proxy:1080"] {
-            assert!(matches!(
-                parse_upstream_proxy_url(url),
-                Err(UpstreamProxyUrlError::UnsupportedScheme(_))
-            ));
+    fn upstream_proxy_url_rejects_socks_schemes() {
+        // http:// and https:// are supported; only other schemes (SOCKS, etc.)
+        // are rejected.
+        for url in [
+            "socks5://proxy:1080",
+            "socks4://proxy:1080",
+            "ftp://proxy:21",
+        ] {
+            assert!(
+                matches!(
+                    parse_upstream_proxy_url(url),
+                    Err(UpstreamProxyUrlError::UnsupportedScheme(_))
+                ),
+                "{url}"
+            );
         }
     }
 

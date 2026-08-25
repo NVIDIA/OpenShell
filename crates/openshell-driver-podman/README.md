@@ -388,16 +388,17 @@ Podman resources after out-of-band container removal or label drift.
 | `OPENSHELL_PODMAN_TLS_CA` | `--podman-tls-ca` | unset | Host path to the CA certificate mounted for sandbox mTLS. |
 | `OPENSHELL_PODMAN_TLS_CERT` | `--podman-tls-cert` | unset | Host path to the client certificate mounted for sandbox mTLS. |
 | `OPENSHELL_PODMAN_TLS_KEY` | `--podman-tls-key` | unset | Host path to the client private key mounted for sandbox mTLS. |
-| `OPENSHELL_SANDBOX_HTTPS_PROXY` | `--sandbox-https-proxy` | unset | Corporate forward proxy URL for the supervisor's upstream TLS dials, chained with HTTP CONNECT. Only credential-free `http://host:port` URLs are supported (scheme and port required). Plain-HTTP requests always dial directly. |
+| `OPENSHELL_SANDBOX_HTTPS_PROXY` | `--sandbox-https-proxy` | unset | Corporate forward proxy URL for the supervisor's upstream TLS dials, chained with HTTP CONNECT. Credential-free `http://host:port` and `https://host:port` URLs are supported (scheme and port required). For an `https://` proxy the supervisor TLS-wraps the proxy connection, verifying the proxy certificate against the built-in and system roots plus `--sandbox-proxy-ca-bundle`. Plain-HTTP requests always dial directly. |
 | `OPENSHELL_SANDBOX_NO_PROXY` | `--sandbox-no-proxy` | unset | Comma-separated `NO_PROXY` list (hostnames, domain suffixes, IPs, CIDRs, each with an optional `:port` qualifier) dialed directly instead of through the corporate proxy. IP/CIDR entries also match hostnames through their validated DNS resolution. |
 | `OPENSHELL_SANDBOX_PROXY_AUTH_FILE` | `--sandbox-proxy-auth-file` | unset | Path to a file containing the proxy credentials as `user:pass`. Staged as a root-only Podman secret so credentials never appear in config or container metadata. Requires the insecure-auth acknowledgement below. |
-| `OPENSHELL_SANDBOX_PROXY_AUTH_ALLOW_INSECURE` | `--sandbox-proxy-auth-allow-insecure` | unset | Explicit acknowledgement (`true`) that the credential is sent as cleartext Basic auth over the plain-TCP connection to the `http://` proxy. Required when the auth file is set; rejected when it is not. |
+| `OPENSHELL_SANDBOX_PROXY_AUTH_ALLOW_INSECURE` | `--sandbox-proxy-auth-allow-insecure` | unset | Explicit acknowledgement (`true`) that the credential is sent as cleartext Basic auth over the plain-TCP connection to the `http://` proxy. Required when the auth file is set with an `http://` proxy; not required for `https://` proxies (the credential travels inside the verified TLS session) but tolerated if set. Rejected when no auth file is configured. |
 | `OPENSHELL_SANDBOX_PROXY_CONNECT_BY_HOSTNAME` | `--sandbox-proxy-connect-by-hostname` | unset | Send the destination hostname in CONNECT requests instead of a validated IP. Last resort for proxies whose ACLs filter on hostnames: the proxy then resolves the name itself, so sandbox SSRF/`allowed_ips` validation no longer binds the connection. |
 | `OPENSHELL_PODMAN_USERNS` | `--userns` | unset | User namespace mode for sandbox containers (e.g. `auto`). When unset, containers use the default user namespace. |
+| `OPENSHELL_SANDBOX_PROXY_CA_BUNDLE` | `--sandbox-proxy-ca-bundle` | unset | Path (on the gateway host) to a PEM CA bundle trusted for the corporate proxy. Bind-mounted read-only into the sandbox (a CA certificate is not secret). Trusted for the `https://` proxy TLS handshake and, because TLS-intercepting proxies re-sign tunneled certificates, folded into the sandbox trust bundle and upstream verification. Requires a proxy URL; the file must exist and hold at least one certificate. |
 
 Through the gateway, the same settings are the `https_proxy`, `no_proxy`,
-`proxy_auth_file`, `proxy_auth_allow_insecure`, and
-`proxy_connect_by_hostname` keys under `[openshell.drivers.podman]`; see
+`proxy_auth_file`, `proxy_auth_allow_insecure`, `proxy_connect_by_hostname`,
+and `proxy_ca_bundle` keys under `[openshell.drivers.podman]`; see
 `docs/reference/gateway-config.mdx`.
 
 This is an operator-owned egress boundary: the driver passes the settings on

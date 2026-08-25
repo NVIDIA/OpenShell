@@ -23,9 +23,32 @@ const START_FILE: &str = "/sandbox/podman-gateway-start-state";
 const MANAGED_BY_LABEL_FILTER: &str = "label=openshell.managed=true";
 const SANDBOX_NAME_LABEL: &str = "openshell.ai/sandbox-name";
 
+/// Build a `podman` command that targets the same API socket the gateway uses.
+///
+/// The e2e harness (`e2e/with-podman-gateway.sh`) exports
+/// `OPENSHELL_PODMAN_SOCKET` (discovered via `podman machine inspect` on macOS,
+/// or the rootless socket on Linux) and also clobbers `XDG_CONFIG_HOME` with an
+/// empty directory to isolate CLI/SDK gateway metadata. On macOS the podman
+/// client resolves its VM connection through `XDG_CONFIG_HOME`, so a bare
+/// `podman ps` here falls back to a nonexistent native rootless socket and
+/// fails. Pinning `--url` to the exported socket bypasses connection-config
+/// resolution entirely and mirrors the shell's `podman_cmd` helper.
+///
+/// When `OPENSHELL_PODMAN_SOCKET` is unset (e.g. running this test outside the
+/// harness), fall back to plain `podman`, leaving Linux behavior unchanged.
+fn podman_command() -> Command {
+    let mut command = Command::new("podman");
+    if let Ok(socket) = std::env::var("OPENSHELL_PODMAN_SOCKET") {
+        if !socket.is_empty() {
+            command.arg("--url").arg(format!("unix://{socket}"));
+        }
+    }
+    command
+}
+
 fn sandbox_container_running(sandbox_name: &str) -> Result<bool, String> {
     let sandbox_name_filter = format!("label={SANDBOX_NAME_LABEL}={sandbox_name}");
-    let output = Command::new("podman")
+    let output = podman_command()
         .args(["ps", "-aq", "--filter", MANAGED_BY_LABEL_FILTER, "--filter"])
         .arg(sandbox_name_filter)
         .stdout(Stdio::piped())
@@ -50,7 +73,7 @@ fn sandbox_container_running(sandbox_name: &str) -> Result<bool, String> {
             "expected one Podman container for sandbox '{sandbox_name}', found {ids:?}"
         ));
     };
-    let output = Command::new("podman")
+    let output = podman_command()
         .args(["inspect", "-f", "{{.State.Running}}", container_id])
         .output()
         .map_err(|err| format!("failed to run podman inspect: {err}"))?;

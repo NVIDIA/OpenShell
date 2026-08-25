@@ -1482,7 +1482,7 @@ mod tests {
     #[test]
     fn upstream_proxy_config_rejects_unsupported_proxy_scheme() {
         let cfg = KubernetesComputeConfig {
-            https_proxy: Some("https://proxy.corp.example:8443".to_string()),
+            https_proxy: Some("socks5://proxy.corp.example:1080".to_string()),
             ..KubernetesComputeConfig::default()
         };
         let err = cfg.validate_upstream_proxy_config().unwrap_err();

@@ -657,10 +657,13 @@ health_check_interval_secs = 10
 # Corporate forward proxy for sandbox egress. When set, the in-container
 # supervisor chains policy-approved TLS tunnels through this proxy with HTTP
 # CONNECT instead of dialing destinations directly. Plain-HTTP requests are
-# not proxied and always dial the destination directly. Only http:// proxy
-# URLs in explicit http://host:port form are supported: the scheme and port
-# are both required, and a URL carrying a path, query, or fragment is
-# rejected rather than silently truncated.
+# not proxied and always dial the destination directly. http:// and https://
+# proxy URLs in explicit scheme://host:port form are supported: the scheme and
+# port are both required, and a URL carrying a path, query, or fragment is
+# rejected rather than silently truncated. For an https:// proxy the supervisor
+# wraps the connection to the proxy in TLS before the CONNECT handshake,
+# verifying the proxy certificate against the built-in and system roots plus
+# the optional proxy_ca_bundle below.
 # NO_PROXY entries (hostnames, domain suffixes, IPs, CIDRs, each with an
 # optional :port qualifier) are dialed directly. A port-qualified entry only
 # bypasses that destination port. IP and CIDR entries also match hostnames
@@ -700,20 +703,35 @@ health_check_interval_secs = 10
 # supervisor, so a credential accepted here is never rejected in-container.
 # Keep gateway.toml and the auth file owner-readable only (mode 0600).
 #
-# WARNING: the supervisor sends the credential as a Proxy-Authorization:
-# Basic header over the plain-TCP connection to the http:// proxy. Basic
+# WARNING: with an http:// proxy the supervisor sends the credential as a
+# Proxy-Authorization: Basic header over the plain-TCP connection. Basic
 # auth is base64, not encryption: anyone on the network path between the
 # sandbox host and the proxy can recover the credential. Because of that,
-# proxy_auth_file requires the explicit acknowledgement
-# proxy_auth_allow_insecure = true; without it the configuration is
-# rejected at gateway startup. Only opt in when the path to the proxy is a
-# trusted network segment.
+# proxy_auth_file with an http:// proxy requires the explicit
+# acknowledgement proxy_auth_allow_insecure = true; without it the
+# configuration is rejected at gateway startup. Only opt in when the path
+# to the proxy is a trusted network segment. For an https:// proxy the
+# credential is sent inside the verified TLS session, so the
+# acknowledgement is not required (but tolerated if set).
+#
+# proxy_ca_bundle points at a PEM CA bundle (on the gateway host) trusted for
+# the corporate proxy. A CA certificate is not secret, so the gateway
+# bind-mounts it read-only into the sandbox. It is trusted in two places: the
+# TLS handshake with an https:// proxy, and — because a TLS-intercepting proxy
+# (mitmproxy, squid ssl-bump) re-signs tunneled server certificates with the
+# same CA — the sandbox trust bundle and the supervisor's upstream
+# re-encryption, so intercepted upstream TLS keeps working and sandbox
+# workloads trust the re-signed certificates. It is valid with either an
+# http:// or https:// proxy and requires a proxy URL; the file must exist and
+# contain at least one certificate, or the sandbox fails closed at startup.
 # https_proxy               = "http://proxy.corp.com:8080"
 # no_proxy                  = "*.svc.cluster.local,10.0.0.0/8"
 # proxy_auth_file           = "/etc/openshell/secrets/proxy-auth"
 # proxy_auth_allow_insecure = true
 # Last resort for hostname-filtering proxy ACLs; see the warning above.
 # proxy_connect_by_hostname = true
+# Corporate CA trusted for an https:// proxy and TLS-intercepting proxies.
+# proxy_ca_bundle           = "/etc/openshell/tls/proxy-ca.pem"
 ```
 
 ### MicroVM

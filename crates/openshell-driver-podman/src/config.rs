@@ -138,13 +138,16 @@ pub struct PodmanComputeConfig {
     /// Defaults to [`DEFAULT_HEALTH_CHECK_INTERVAL_SECS`] (10 seconds).
     pub health_check_interval_secs: u64,
     /// Corporate forward proxy URL passed to the in-container supervisor
-    /// (e.g. `http://proxy.corp.com:8080`).
+    /// (e.g. `http://proxy.corp.com:8080` or `https://proxy.corp.com:3130`).
     ///
     /// The supervisor chains policy-approved TLS tunnels through this proxy
     /// with HTTP CONNECT instead of dialing upstream destinations directly.
-    /// Only `http://` proxy URLs in explicit `http://host:port` form (scheme
-    /// and port required) are supported. This is an operator-owned egress
-    /// boundary delivered on the supervisor's command line, so
+    /// `http://` and `https://` proxy URLs in explicit `scheme://host:port`
+    /// form (scheme and port required) are supported; for an `https://` proxy
+    /// the supervisor wraps the proxy connection in TLS, verifying the proxy
+    /// certificate against the built-in and system roots plus the optional
+    /// [`proxy_ca_bundle`](Self::proxy_ca_bundle). This is an operator-owned
+    /// egress boundary delivered on the supervisor's command line, so
     /// sandbox/template environment cannot override it, and the conventional
     /// `HTTPS_PROXY` variables are not used.
     pub https_proxy: Option<String>,
@@ -188,6 +191,19 @@ pub struct PodmanComputeConfig {
     /// pointing the gateway host at the corporate resolver so validated-IP
     /// CONNECT works in split-horizon networks.
     pub proxy_connect_by_hostname: Option<bool>,
+    /// Path (on the gateway host) to a PEM CA bundle trusted for the corporate
+    /// proxy.
+    ///
+    /// A CA certificate is not secret, so the gateway bind-mounts this file
+    /// read-only into the sandbox (at
+    /// [`PROXY_CA_MOUNT_PATH`](openshell_core::driver_utils::PROXY_CA_MOUNT_PATH))
+    /// and passes its path to the supervisor via `--upstream-proxy-ca-bundle`.
+    /// The supervisor trusts it for the TLS handshake with an `https://`
+    /// proxy and, because a TLS-intercepting proxy re-signs tunneled server
+    /// certificates with the same CA, folds it into the sandbox trust bundle
+    /// and upstream verification. Only meaningful with `https_proxy` set; the
+    /// bundle must exist and contain at least one certificate.
+    pub proxy_ca_bundle: Option<String>,
     /// User namespace mode for sandbox containers (e.g. `auto`, `private`).
     /// When unset, containers use the default user namespace.
     pub userns: Option<String>,
@@ -295,16 +311,16 @@ impl PodmanComputeConfig {
     /// Shares validation semantics with the in-container supervisor through
     /// [`openshell_core::driver_utils::parse_upstream_proxy_url`], so a value
     /// accepted here can never be rejected by the supervisor at sandbox
-    /// startup (or vice versa). The supervisor only supports `http://`
-    /// forward proxies, so other schemes are rejected at config time instead
-    /// of failing inside every sandbox. Credentials must be supplied through
-    /// `proxy_auth_file`; an inline `user:pass@` in the URL is rejected
-    /// because it would otherwise be stored in `gateway.toml` and exposed in
-    /// container metadata.
+    /// startup (or vice versa). The supervisor supports `http://` and
+    /// `https://` forward proxies, so other schemes (SOCKS, etc.) are rejected
+    /// at config time instead of failing inside every sandbox. Credentials
+    /// must be supplied through `proxy_auth_file`; an inline `user:pass@` in
+    /// the URL is rejected because it would otherwise be stored in
+    /// `gateway.toml` and exposed in container metadata.
     pub fn validate_proxy_config(&self) -> Result<(), crate::client::PodmanApiError> {
         use openshell_core::driver_utils::{UpstreamProxyUrlError, parse_upstream_proxy_url};
-        if let Some(url) = &self.https_proxy {
-            parse_upstream_proxy_url(url).map_err(|err| {
+        let proxy_secure = if let Some(url) = &self.https_proxy {
+            let addr = parse_upstream_proxy_url(url).map_err(|err| {
                 crate::client::PodmanApiError::InvalidInput(match err {
                     UpstreamProxyUrlError::Empty => {
                         "https_proxy must not be empty when set".to_string()
@@ -317,7 +333,10 @@ impl PodmanComputeConfig {
                     err => format!("https_proxy {err}"),
                 })
             })?;
-        }
+            addr.secure
+        } else {
+            false
+        };
 
         // The supervisor treats a present-but-empty driver-supplied argument
         // as a fatal misconfiguration, so never accept (and later pass) one.
@@ -351,8 +370,10 @@ impl PodmanComputeConfig {
             // Basic auth over the plain-TCP proxy connection is readable by
             // anyone on the network path; sending it requires an explicit
             // operator acknowledgement rather than being an implicit side
-            // effect of configuring credentials.
-            if self.proxy_auth_allow_insecure != Some(true) {
+            // effect of configuring credentials. For an https:// proxy the
+            // credential is inside the verified TLS session, so the
+            // acknowledgement is unnecessary (but tolerated).
+            if self.proxy_auth_allow_insecure != Some(true) && !proxy_secure {
                 return Err(crate::client::PodmanApiError::InvalidInput(
                     "proxy_auth_file sends the credential as cleartext Basic auth over the \
                      plain-TCP connection to the http:// proxy; set proxy_auth_allow_insecure \
@@ -374,6 +395,25 @@ impl PodmanComputeConfig {
             return Err(crate::client::PodmanApiError::InvalidInput(
                 "proxy_connect_by_hostname is set but no https_proxy is configured".to_string(),
             ));
+        }
+
+        // A CA bundle only makes sense relative to a proxy boundary (an
+        // https:// proxy handshake, or a TLS-intercepting proxy's re-sign CA).
+        // Mirror the proxy_auth_file pairing so a stray setting cannot hide a
+        // fail-open state. The file's readability and certificate content are
+        // checked at sandbox-create time (see the driver) and fail closed in
+        // the supervisor.
+        if let Some(path) = self.proxy_ca_bundle.as_deref() {
+            if path.trim().is_empty() {
+                return Err(crate::client::PodmanApiError::InvalidInput(
+                    "proxy_ca_bundle must not be empty when set".to_string(),
+                ));
+            }
+            if self.https_proxy.is_none() {
+                return Err(crate::client::PodmanApiError::InvalidInput(
+                    "proxy_ca_bundle is set but no https_proxy is configured".to_string(),
+                ));
+            }
         }
         Ok(())
     }
@@ -513,6 +553,7 @@ impl Default for PodmanComputeConfig {
             proxy_auth_file: None,
             proxy_auth_allow_insecure: None,
             proxy_connect_by_hostname: None,
+            proxy_ca_bundle: None,
             userns: None,
             uidmap: Vec::new(),
             gidmap: Vec::new(),
@@ -552,6 +593,7 @@ impl std::fmt::Debug for PodmanComputeConfig {
             .field("proxy_auth_file", &self.proxy_auth_file.is_some())
             .field("proxy_auth_allow_insecure", &self.proxy_auth_allow_insecure)
             .field("proxy_connect_by_hostname", &self.proxy_connect_by_hostname)
+            .field("proxy_ca_bundle", &self.proxy_ca_bundle)
             .field("userns", &self.userns)
             .field("uidmap", &self.uidmap)
             .field("gidmap", &self.gidmap)
@@ -625,7 +667,7 @@ mod tests {
     // ── Proxy config validation ───────────────────────────────────────
 
     #[test]
-    fn validate_proxy_config_accepts_unset_and_http() {
+    fn validate_proxy_config_accepts_unset_http_and_https() {
         assert!(
             PodmanComputeConfig::default()
                 .validate_proxy_config()
@@ -637,11 +679,18 @@ mod tests {
             ..PodmanComputeConfig::default()
         };
         assert!(cfg.validate_proxy_config().is_ok());
+        // An https:// proxy URL is now supported (scheme and port required).
+        let cfg = PodmanComputeConfig {
+            https_proxy: Some("https://proxy.corp.com:3130".to_string()),
+            ..PodmanComputeConfig::default()
+        };
+        assert!(cfg.validate_proxy_config().is_ok());
     }
 
     #[test]
-    fn validate_proxy_config_rejects_non_http_schemes() {
-        for url in ["https://proxy:443", "socks5://proxy:1080"] {
+    fn validate_proxy_config_rejects_socks_schemes() {
+        // http:// and https:// are supported; only other schemes are rejected.
+        for url in ["socks5://proxy:1080", "ftp://proxy:21"] {
             let cfg = PodmanComputeConfig {
                 https_proxy: Some(url.to_string()),
                 ..PodmanComputeConfig::default()
@@ -652,6 +701,46 @@ mod tests {
                 "{url}: {err}"
             );
         }
+    }
+
+    #[test]
+    fn validate_proxy_config_accepts_ca_bundle_with_proxy() {
+        let cfg = PodmanComputeConfig {
+            https_proxy: Some("https://proxy.corp.com:3130".to_string()),
+            proxy_ca_bundle: Some("/etc/openshell/proxy-ca.pem".to_string()),
+            ..PodmanComputeConfig::default()
+        };
+        assert!(cfg.validate_proxy_config().is_ok());
+        // A CA bundle is also valid with an http:// proxy: a TLS-intercepting
+        // proxy reached over plain HTTP still re-signs upstream certificates.
+        let cfg = PodmanComputeConfig {
+            https_proxy: Some("http://proxy.corp.com:8080".to_string()),
+            proxy_ca_bundle: Some("/etc/openshell/proxy-ca.pem".to_string()),
+            ..PodmanComputeConfig::default()
+        };
+        assert!(cfg.validate_proxy_config().is_ok());
+    }
+
+    #[test]
+    fn validate_proxy_config_rejects_ca_bundle_without_proxy() {
+        let cfg = PodmanComputeConfig {
+            proxy_ca_bundle: Some("/etc/openshell/proxy-ca.pem".to_string()),
+            ..PodmanComputeConfig::default()
+        };
+        let err = cfg.validate_proxy_config().unwrap_err();
+        assert!(err.to_string().contains("proxy_ca_bundle"), "{err}");
+        assert!(err.to_string().contains("no https_proxy"), "{err}");
+    }
+
+    #[test]
+    fn validate_proxy_config_rejects_empty_ca_bundle() {
+        let cfg = PodmanComputeConfig {
+            https_proxy: Some("https://proxy.corp.com:3130".to_string()),
+            proxy_ca_bundle: Some("  ".to_string()),
+            ..PodmanComputeConfig::default()
+        };
+        let err = cfg.validate_proxy_config().unwrap_err();
+        assert!(err.to_string().contains("proxy_ca_bundle"), "{err}");
     }
 
     #[test]
@@ -776,6 +865,16 @@ mod tests {
             );
             assert!(err.to_string().contains("cleartext"), "{allow:?}: {err}");
         }
+    }
+
+    #[test]
+    fn validate_proxy_config_accepts_auth_file_without_acknowledgement_for_https_proxy() {
+        let cfg = PodmanComputeConfig {
+            https_proxy: Some("https://proxy.corp.com:3130".to_string()),
+            proxy_auth_file: Some("/etc/openshell/secrets/proxy-auth".to_string()),
+            ..PodmanComputeConfig::default()
+        };
+        assert!(cfg.validate_proxy_config().is_ok());
     }
 
     #[test]

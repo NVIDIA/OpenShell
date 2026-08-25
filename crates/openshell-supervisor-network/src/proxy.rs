@@ -1784,8 +1784,9 @@ async fn handle_tcp_connection(
         .await;
     }
 
-    let (host, port) = parse_target(target)?;
-    let host_lc = host.to_ascii_lowercase();
+    let (raw_host, port) = parse_target(target)?;
+    let host = normalize_host(&raw_host);
+    let (host_lc, raw_host_lc) = (host.to_ascii_lowercase(), raw_host.to_ascii_lowercase());
 
     if host_lc == INFERENCE_LOCAL_HOST && port == INFERENCE_LOCAL_PORT {
         respond(&mut client, b"HTTP/1.1 200 Connection Established\r\n\r\n").await?;
@@ -1976,7 +1977,7 @@ async fn handle_tcp_connection(
     // Defense-in-depth: resolve DNS and reject connections to internal IPs.
     let dns_connect_start = std::time::Instant::now();
     let connector = match validate_destination(DestinationRequest {
-        host: &host,
+        host: &raw_host,
         port,
         sandbox_entrypoint_pid,
         plan: destination_plan,
@@ -2104,7 +2105,7 @@ async fn handle_tcp_connection(
     }
 
     let upstream_result = tokio::select! {
-        result = dial_upstream(&upstream_proxy, &host_lc, port, connector.addrs()) => Some(result),
+        result = dial_upstream(&upstream_proxy, &host_lc, &raw_host_lc, port, connector.addrs()) => Some(result),
         () = connect_generation_guard.wait_until_stale() => None,
     };
     let Some(upstream_result) = upstream_result else {
@@ -3633,9 +3634,11 @@ fn implicit_allowed_ips_for_ip_host(host: &str) -> Vec<String> {
 }
 
 fn normalize_host_lookup_key(host: &str) -> &str {
-    host.strip_prefix('[')
+    let h = host
+        .strip_prefix('[')
         .and_then(|trimmed| trimmed.strip_suffix(']'))
-        .unwrap_or(host)
+        .unwrap_or(host);
+    h.strip_suffix('.').unwrap_or(h)
 }
 
 /// Returns `true` if `host` is one of the well-known driver-injected aliases
@@ -3876,15 +3879,18 @@ async fn resolve_socket_addrs(
         return Ok(addrs);
     }
 
-    let lookup_host = normalize_host_lookup_key(host);
-    let addrs: Vec<SocketAddr> = tokio::net::lookup_host((lookup_host, port))
+    let dns_host = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    let addrs: Vec<SocketAddr> = tokio::net::lookup_host((dns_host, port))
         .await
-        .map_err(|e| format!("DNS resolution failed for {lookup_host}:{port}: {e}"))?
+        .map_err(|e| format!("DNS resolution failed for {dns_host}:{port}: {e}"))?
         .collect();
 
     if addrs.is_empty() {
         return Err(format!(
-            "DNS resolution returned no addresses for {lookup_host}:{port}"
+            "DNS resolution returned no addresses for {dns_host}:{port}"
         ));
     }
 
@@ -4015,6 +4021,7 @@ fn validate_declared_endpoint_resolved_addrs(
 async fn dial_upstream(
     upstream_proxy: &Option<UpstreamProxyConfig>,
     host_lc: &str,
+    raw_host_lc: &str,
     port: u16,
     addrs: &[SocketAddr],
 ) -> std::io::Result<upstream_proxy::PrefixedStream> {
@@ -4024,7 +4031,7 @@ async fn dial_upstream(
                 if cfg.connect_by_hostname() {
                     upstream_proxy::connect_via(
                         endpoint,
-                        host_lc,
+                        raw_host_lc,
                         port,
                         upstream_proxy::ConnectTarget::Hostname,
                     )
@@ -4851,6 +4858,9 @@ async fn handle_forward_proxy(
         respond(client, b"HTTP/1.1 400 Bad Request\r\n\r\n").await?;
         return Ok(());
     };
+
+    let raw_host = host;
+    let host = normalize_host(&raw_host);
     let host_lc = host.to_ascii_lowercase();
 
     if host_lc == POLICY_LOCAL_HOST {
@@ -5613,7 +5623,7 @@ async fn handle_forward_proxy(
         .expect("destination plan hydrated");
 
     let connector = match validate_destination(DestinationRequest {
-        host: &host,
+        host: &raw_host,
         port,
         sandbox_entrypoint_pid,
         plan: destination_plan,
@@ -6156,6 +6166,10 @@ fn parse_target(target: &str) -> Result<(String, u16)> {
         .parse()
         .map_err(|_| miette::miette!("Invalid port in CONNECT target: {target}"))?;
     Ok((host.to_string(), port))
+}
+
+fn normalize_host(raw_host: &str) -> &str {
+    raw_host.strip_suffix('.').unwrap_or(raw_host)
 }
 
 async fn respond(client: &mut TcpStream, bytes: &[u8]) -> Result<()> {
@@ -6847,6 +6861,49 @@ network_policies:
                     .any(|window| window == b"invalid_policy_local_scheme")
             );
         }
+    }
+
+    #[tokio::test]
+    async fn dial_upstream_preserves_trailing_dot_in_hostname_connect() {
+        // Fake upstream proxy: capture the request line, then 200.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0_u8; 1024_usize];
+            let n = sock.read(&mut buf).await.unwrap();
+            sock.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
+                .await
+                .unwrap();
+            String::from_utf8_lossy(&buf[..n]).into_owned()
+        });
+
+        // Operator config: proxy set + connect-by-hostname opt-in.
+        let cfg = UpstreamProxyConfig::from_args(&upstream_proxy::UpstreamProxyArgs {
+            https_proxy: Some(format!("http://{proxy_addr}")),
+            proxy_connect_by_hostname: true,
+            ..Default::default()
+        })
+        .unwrap();
+
+        // host_lc = normalized (undotted), raw_host_lc = absolute (dotted).
+        let stream = dial_upstream(
+            &cfg,
+            "api.example.com",
+            "api.example.com.",
+            443,
+            &[], // addrs unused in the hostname branch
+        )
+        .await
+        .unwrap();
+
+        drop(stream);
+
+        let request = handle.await.unwrap();
+        assert!(
+            request.starts_with("CONNECT api.example.com.:443 HTTP/1.1\r\n"),
+            "proxy must receive the absolute FQDN: {request}"
+        );
     }
 
     #[test]
@@ -10627,6 +10684,16 @@ network_policies:
     }
 
     #[test]
+    fn test_normalize_host_strips_single_trailing_dot() {
+        assert_eq!(normalize_host("api.example.com."), "api.example.com");
+    }
+
+    #[test]
+    fn test_normalize_host_remains_the_same() {
+        assert_eq!(normalize_host("api.example.com"), "api.example.com");
+    }
+
+    #[test]
     fn test_parse_target_preserves_case() {
         let (host, port) = parse_target("EXAMPLE.COM:443").unwrap();
         assert_eq!(host, "EXAMPLE.COM", "parse_target should preserve case");
@@ -10784,6 +10851,14 @@ network_policies:
     }
 
     // -- parse_proxy_uri: hostname parser regression tests --
+
+    #[test]
+    fn test_parse_proxy_uri_trailing_dot_host() {
+        let (_, host, port, _) = parse_proxy_uri("http://api.example.com.:80/path").unwrap();
+        let host = normalize_host(&host);
+        assert_eq!(host, "api.example.com");
+        assert_eq!(port, 80_u16);
+    }
 
     #[test]
     fn test_parse_proxy_uri_nul_byte_in_host() {
