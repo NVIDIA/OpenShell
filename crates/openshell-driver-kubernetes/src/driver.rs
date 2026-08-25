@@ -4656,7 +4656,7 @@ mod tests {
     }
 
     #[test]
-    fn stopped_status_requires_published_condition() {
+    fn stopped_status_requires_suspended_true_condition() {
         let resource = ApiResource::from_gvk(&GroupVersionKind::gvk(
             SANDBOX_GROUP,
             SANDBOX_VERSION_V1ALPHA1,
@@ -4672,9 +4672,26 @@ mod tests {
 
         sandbox.data = serde_json::json!({
             "status": {
-                "conditions": [{"type": "Suspended", "status": "True"}]
+                "conditions": [{
+                    "type": "Suspended",
+                    "status": "False",
+                    "reason": "NotSuspended"
+                }]
             }
         });
+        assert!(
+            !kubernetes_sandbox_has_stopped_condition(&sandbox),
+            "v0.5.4 publishes Suspended=False while the sandbox is running"
+        );
+
+        sandbox.data["status"]["conditions"][0]["reason"] = serde_json::json!("PodTerminating");
+        assert!(
+            !kubernetes_sandbox_has_stopped_condition(&sandbox),
+            "Suspended=False remains a progress signal while the pod terminates"
+        );
+
+        sandbox.data["status"]["conditions"][0]["status"] = serde_json::json!("True");
+        sandbox.data["status"]["conditions"][0]["reason"] = serde_json::json!("PodTerminated");
         assert!(kubernetes_sandbox_has_stopped_condition(&sandbox));
     }
 

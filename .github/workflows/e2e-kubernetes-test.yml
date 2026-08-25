@@ -36,7 +36,7 @@ on:
         description: "Agent Sandbox release to install before OpenShell"
         required: false
         type: string
-        default: "v0.5.0"
+        default: "v0.5.4"
       e2e-task:
         description: "mise task to run for the Kubernetes e2e job"
         required: false

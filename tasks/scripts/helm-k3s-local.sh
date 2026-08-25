@@ -36,7 +36,7 @@ PRELOAD_SANDBOX_IMAGE="${HELM_K3S_PRELOAD_SANDBOX_IMAGE-${DEFAULT_SANDBOX_PRELOA
 # The Kubernetes driver supports the v1beta1 Sandbox API introduced in v0.5.0
 # and falls back to v1alpha1 for v0.4.6 clusters. Override this env var to
 # exercise the v1alpha1 controller release.
-AGENT_SANDBOX_VERSION="${AGENT_SANDBOX_VERSION:-v0.5.0}"
+AGENT_SANDBOX_VERSION="${AGENT_SANDBOX_VERSION:-v0.5.4}"
 
 default_kubeconfig="${ROOT}/kubeconfig"
 if [[ -n "${HELM_K3S_KUBECONFIG:-}" ]]; then
@@ -142,8 +142,28 @@ merge_kubeconfig() {
 apply_base_manifests() {
   require_kubectl
   local base="https://github.com/kubernetes-sigs/agent-sandbox/releases/download/${AGENT_SANDBOX_VERSION}"
+  local manifest
+  manifest="$(agent_sandbox_manifest_asset "${AGENT_SANDBOX_VERSION}")"
   echo "Applying agent-sandbox manifest (${AGENT_SANDBOX_VERSION})..."
-  kubectl --kubeconfig="${KUBECONFIG_TARGET}" apply -f "${base}/manifest.yaml"
+  kubectl --kubeconfig="${KUBECONFIG_TARGET}" apply -f "${base}/${manifest}"
+}
+
+agent_sandbox_manifest_asset() {
+  local version="${1#v}"
+  local major minor patch
+  IFS=. read -r major minor patch <<<"${version}"
+  patch="${patch%%[-+]*}"
+
+  if [[ ! "${major}" =~ ^[0-9]+$ || ! "${minor}" =~ ^[0-9]+$ || ! "${patch}" =~ ^[0-9]+$ ]]; then
+    echo "error: invalid Agent Sandbox release version: $1" >&2
+    return 1
+  fi
+
+  if (( 10#${major} > 0 || 10#${minor} > 5 || (10#${minor} == 5 && 10#${patch} >= 2) )); then
+    echo "sandbox.yaml"
+  else
+    echo "manifest.yaml"
+  fi
 }
 
 configure_ghcr_credentials() {
