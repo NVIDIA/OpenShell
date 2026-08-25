@@ -1055,43 +1055,6 @@ pub enum ComputeDriverInstance {
     ManagedRemote(AcquiredRemoteDriverEndpoint),
 }
 
-/// Type-erased tracing layer contributed by a compiled compute driver.
-pub type ComputeDriverTracingLayer =
-    Box<dyn tracing_subscriber::Layer<tracing_subscriber::Registry> + Send + Sync>;
-
-/// Shutdown callback for resources owned by a compute-driver tracing layer.
-pub type ComputeDriverTracingShutdown =
-    Box<dyn Fn() -> std::result::Result<(), String> + Send + Sync>;
-
-/// Optional process-wide tracing integration supplied by a compiled driver.
-#[derive(Default)]
-pub struct ComputeDriverTracingSetup {
-    layer: Option<ComputeDriverTracingLayer>,
-    shutdown: Option<ComputeDriverTracingShutdown>,
-    error: Option<String>,
-    target_prefix: Option<&'static str>,
-}
-
-impl ComputeDriverTracingSetup {
-    #[must_use]
-    pub fn new(
-        layer: Option<ComputeDriverTracingLayer>,
-        shutdown: Option<ComputeDriverTracingShutdown>,
-        error: Option<String>,
-        target_prefix: Option<&'static str>,
-    ) -> Self {
-        Self {
-            layer,
-            shutdown,
-            error,
-            target_prefix,
-        }
-    }
-}
-
-/// Factory for a compiled driver's optional tracing integration.
-pub type ComputeDriverTracingFactory = fn(Option<&str>, Option<&str>) -> ComputeDriverTracingSetup;
-
 /// Factory for a compute driver linked into a gateway binary.
 #[async_trait::async_trait]
 pub trait ComputeDriverFactory: Send + Sync {
@@ -1109,7 +1072,7 @@ pub struct ComputeDriverRegistration {
     inherited_config_keys: &'static [&'static str],
     local_singleplayer: bool,
     supports_mtls_user_auth: bool,
-    tracing_setup: Option<ComputeDriverTracingFactory>,
+    in_process_tracing: Option<openshell_otel::ComputeDriverTracing>,
 }
 
 impl std::fmt::Debug for ComputeDriverRegistration {
@@ -1142,7 +1105,7 @@ impl ComputeDriverRegistration {
             inherited_config_keys: &[],
             local_singleplayer: false,
             supports_mtls_user_auth: true,
-            tracing_setup: None,
+            in_process_tracing: None,
         })
     }
 
@@ -1175,10 +1138,13 @@ impl ComputeDriverRegistration {
         self
     }
 
-    /// Attach optional process-wide tracing for this compiled driver.
+    /// Attach process-wide tracing for this in-process compiled driver.
     #[must_use]
-    pub fn with_tracing_setup(mut self, setup: ComputeDriverTracingFactory) -> Self {
-        self.tracing_setup = Some(setup);
+    pub fn with_in_process_tracing(
+        mut self,
+        tracing: openshell_otel::ComputeDriverTracing,
+    ) -> Self {
+        self.in_process_tracing = Some(tracing);
         self
     }
 
@@ -1190,6 +1156,11 @@ impl ComputeDriverRegistration {
     #[must_use]
     pub(crate) fn supports_mtls_user_auth(&self) -> bool {
         self.supports_mtls_user_auth
+    }
+
+    #[must_use]
+    pub fn in_process_tracing(&self) -> Option<openshell_otel::ComputeDriverTracing> {
+        self.in_process_tracing
     }
 }
 
@@ -1259,22 +1230,17 @@ impl ComputeDriverRegistry {
         self.drivers.get(name)
     }
 
-    fn tracing_setup(
+    fn in_process_tracing(
         &self,
         selection: &ComputeDriverSelection,
         endpoint_overrides: &BTreeMap<String, PathBuf>,
-        otlp_endpoint: Option<&str>,
-        gateway_name: Option<&str>,
-    ) -> ComputeDriverTracingSetup {
+    ) -> Option<openshell_otel::ComputeDriverTracing> {
         let name = selection.name();
         if endpoint_overrides.contains_key(name) {
-            return ComputeDriverTracingSetup::default();
+            return None;
         }
         self.get(name)
-            .and_then(|registration| registration.tracing_setup)
-            .map_or_else(ComputeDriverTracingSetup::default, |setup| {
-                setup(otlp_endpoint, gateway_name)
-            })
+            .and_then(ComputeDriverRegistration::in_process_tracing)
     }
 
     fn detect(&self) -> ComputeDriverDetection {

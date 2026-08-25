@@ -51,6 +51,15 @@ impl<'a> GatewayResourceAttributes<'a> {
             compute_driver,
         }
     }
+    /// The configured gateway installation name, if any.
+    pub fn name(&self) -> Option<&'a str> {
+        self.name
+    }
+
+    /// The configured compute-driver name, if any.
+    pub fn compute_driver(&self) -> Option<&'a str> {
+        self.compute_driver
+    }
 }
 
 fn trace_config<'cfg>(
@@ -67,29 +76,14 @@ fn trace_config<'cfg>(
             ServiceName::Fixed,
         );
 
-    let mut resource_attributes = Vec::new();
-    if let Some(name) = gateway.name.map(str::trim).filter(|s| !s.is_empty()) {
-        resource_attributes.push(opentelemetry::KeyValue::new(
-            "openshell.gateway.name",
-            name.to_string(),
-        ));
-    }
-    if let Some(compute_driver) = gateway
-        .compute_driver
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
-        resource_attributes.push(opentelemetry::KeyValue::new(
-            "openshell.gateway.compute_driver",
-            compute_driver.to_string(),
-        ));
-    }
-
     OtlpTraceConfig {
         endpoint: &cfg.endpoint,
         service_name,
         service_version: Some(openshell_core::VERSION),
-        resource_attributes,
+        resource_attributes: openshell_otel::gateway_resource_attributes(
+            gateway.name(),
+            gateway.compute_driver(),
+        ),
     }
 }
 
@@ -135,15 +129,17 @@ pub fn provider_for(
 /// OpenTelemetry crates are excluded to prevent recursive export traffic.
 pub fn layer<S>(
     provider: &SdkTracerProvider,
-    excluded_target_prefix: Option<&'static str>,
+    driver: Option<openshell_otel::ComputeDriverTracing>,
 ) -> openshell_otel::TargetOtlpLayer<S>
 where
     S: Subscriber + for<'span> LookupSpan<'span>,
 {
-    openshell_otel::layer_excluding_target_prefix(
+    openshell_otel::layer_excluding_target_prefixes(
         provider,
         INSTRUMENTATION_SCOPE,
-        excluded_target_prefix,
+        driver
+            .into_iter()
+            .flat_map(openshell_otel::ComputeDriverTracing::in_process_targets),
     )
 }
 

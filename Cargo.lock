@@ -4178,6 +4178,7 @@ dependencies = [
 name = "openshell-otel"
 version = "0.0.0"
 dependencies = [
+ "futures",
  "http 1.4.0",
  "opentelemetry",
  "opentelemetry-otlp",
@@ -4195,10 +4196,13 @@ dependencies = [
 name = "openshell-otel-test-support"
 version = "0.0.0"
 dependencies = [
+ "openshell-otel",
  "opentelemetry-proto",
  "tokio",
  "tokio-stream",
  "tonic",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
