@@ -632,7 +632,8 @@ fn endpoint_attributes_cover(loaded: &NetworkEndpoint, proposed: &NetworkEndpoin
         return false;
     }
 
-    // Widened fields (list appends and `|=` flags) use containment: merging
+    // Widened fields (list appends and authorization flags) use containment:
+    // merging
     // into an endpoint that already carries them leaves the loaded copy a
     // superset of the proposal, so equality would report "not covered" for a
     // proposal that did land.
@@ -648,7 +649,6 @@ fn endpoint_attributes_cover(loaded: &NetworkEndpoint, proposed: &NetworkEndpoin
             loaded.request_body_credential_rewrite,
             proposed.request_body_credential_rewrite,
         )
-        && flag_covers(loaded.advisor_proposed, proposed.advisor_proposed)
         // Fields the merge neither widens nor retains: it drops them entirely.
         // An unset proposal value asks for nothing and is satisfied by whatever
         // is loaded; a set value that differs was dropped, so the proposal is
@@ -1374,7 +1374,11 @@ fn merge_endpoint(
     existing.websocket_credential_rewrite |= incoming.websocket_credential_rewrite;
     existing.request_body_credential_rewrite |= incoming.request_body_credential_rewrite;
     existing.allow_uninspected_credentials |= incoming.allow_uninspected_credentials;
-    existing.advisor_proposed |= incoming.advisor_proposed;
+    // Provenance is not an authorization bit. If either declaration came
+    // directly from a user or provider, keep the endpoint explicit. This
+    // mirrors binary provenance and prevents an advisor overlay from tainting
+    // an already explicit endpoint for exact-host SSRF evaluation.
+    existing.advisor_proposed &= incoming.advisor_proposed;
     normalize_endpoint(existing);
     Ok(())
 }
@@ -3025,7 +3029,7 @@ mod tests {
     }
 
     #[test]
-    fn policy_coverage_requires_endpoint_advisor_provenance_to_be_loaded() {
+    fn policy_coverage_ignores_endpoint_advisor_provenance() {
         let loaded_endpoint = endpoint("api.example.com", 443);
         let mut proposed_endpoint = loaded_endpoint.clone();
         proposed_endpoint.advisor_proposed = true;
@@ -3036,7 +3040,37 @@ mod tests {
         let proposed =
             rule_with_authorizations("proposed", vec![proposed_endpoint], &["/usr/bin/client"]);
 
-        assert!(!policy_covers_rule(&loaded, &proposed));
+        assert!(policy_covers_rule(&loaded, &proposed));
+    }
+
+    #[test]
+    fn explicit_endpoint_provenance_wins_in_either_merge_order() {
+        let explicit_endpoint = endpoint("api.example.com", 443);
+        let mut proposed_endpoint = explicit_endpoint.clone();
+        proposed_endpoint.advisor_proposed = true;
+
+        for (existing_endpoint, incoming_endpoint) in [
+            (explicit_endpoint.clone(), proposed_endpoint.clone()),
+            (proposed_endpoint, explicit_endpoint),
+        ] {
+            let incoming =
+                rule_with_authorizations("api", vec![incoming_endpoint], &["/usr/bin/client"]);
+            let merged = merge_policy(
+                policy_with_rule(
+                    "api",
+                    rule_with_authorizations("api", vec![existing_endpoint], &["/usr/bin/client"]),
+                ),
+                &[PolicyMergeOp::AddRule {
+                    rule_name: "api".to_string(),
+                    rule: incoming.clone(),
+                }],
+            )
+            .expect("compatible explicit and advisor rules should merge");
+
+            let endpoint = &merged.policy.network_policies["api"].endpoints[0];
+            assert!(!endpoint.advisor_proposed);
+            assert!(policy_covers_rule(&merged.policy, &incoming));
+        }
     }
 
     #[test]

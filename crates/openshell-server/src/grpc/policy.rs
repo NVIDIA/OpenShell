@@ -11342,7 +11342,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn approve_all_skips_later_batch_conflict_and_applies_compatible_prefix() {
+    async fn approve_all_skips_later_tls_conflict_and_applies_compatible_prefix() {
         let state = test_server_state().await;
         let sandbox_id = "sb-approve-all-conflict";
         let sandbox_name = "approve-all-conflict";
@@ -11389,6 +11389,7 @@ mod tests {
                             endpoints: vec![NetworkEndpoint {
                                 host: "shared.example.com".to_string(),
                                 port: 443,
+                                tls: "skip".to_string(),
                                 advisor_proposed: true,
                                 ..Default::default()
                             }],
@@ -14364,10 +14365,11 @@ mod tests {
             .await
             .unwrap();
 
+        let sandbox_id = "sb-agent-provider-effective-policy";
         let sandbox_name = "agent-provider-effective-policy".to_string();
         let mut sandbox = Sandbox {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
-                id: "sb-agent-provider-effective-policy".to_string(),
+                id: sandbox_id.to_string(),
                 name: sandbox_name.clone(),
                 created_at_ms: 1_000_000,
                 labels: HashMap::new(),
@@ -14393,6 +14395,7 @@ mod tests {
         sandbox.set_phase(SandboxPhase::Ready as i32);
         state.store.put_message(&sandbox).await.unwrap();
 
+        #[allow(deprecated)]
         let proposed_rule = NetworkPolicyRule {
             name: "github_contents_write".to_string(),
             endpoints: vec![NetworkEndpoint {
@@ -14410,15 +14413,16 @@ mod tests {
                         ..Default::default()
                     }),
                 }],
+                advisor_proposed: true,
                 ..Default::default()
             }],
             binaries: vec![NetworkBinary {
                 path: "/usr/bin/curl".to_string(),
-                ..Default::default()
+                harness: true,
             }],
         };
 
-        handle_submit_policy_analysis(
+        let submit = handle_submit_policy_analysis(
             &state,
             with_user(Request::new(SubmitPolicyAnalysisRequest {
                 name: sandbox_name.clone(),
@@ -14433,12 +14437,16 @@ mod tests {
             })),
         )
         .await
-        .unwrap();
+        .unwrap()
+        .into_inner();
+        assert_eq!(submit.accepted_chunks, 1);
+        assert_eq!(submit.rejected_chunks, 0);
+        let chunk_id = submit.accepted_chunk_ids[0].clone();
 
         let draft = handle_get_draft_policy(
             &state,
             with_user(Request::new(GetDraftPolicyRequest {
-                name: sandbox_name,
+                name: sandbox_name.clone(),
                 status_filter: String::new(),
                 workspace: "default".to_string(),
             })),
@@ -14446,7 +14454,13 @@ mod tests {
         .await
         .unwrap()
         .into_inner();
-        let verdict = &draft.chunks[0].validation_result;
+        let chunk = draft
+            .chunks
+            .iter()
+            .find(|chunk| chunk.id == chunk_id)
+            .expect("provider-overlap proposal should reach the draft inbox");
+        assert_eq!(chunk.status, "pending");
+        let verdict = &chunk.validation_result;
         let first_line = verdict.lines().next().unwrap_or("");
         assert!(
             first_line.starts_with("prover: "),
@@ -14456,7 +14470,49 @@ mod tests {
         assert!(
             !verdict.contains("validation unavailable"),
             "providers-v2 composition must not break the prover pipeline; \
-             got: {verdict}"
+            got: {verdict}"
+        );
+
+        handle_approve_draft_chunk(
+            &state,
+            authed_request(ApproveDraftChunkRequest {
+                name: sandbox_name,
+                chunk_id,
+                workspace: "default".to_string(),
+                review_token: chunk.review_token.clone(),
+            }),
+        )
+        .await
+        .expect("provider-overlap proposal should approve");
+
+        let stored = state
+            .store
+            .get_latest_policy(sandbox_id)
+            .await
+            .unwrap()
+            .expect("approval should persist a base-policy revision");
+        let base_policy = ProtoSandboxPolicy::decode(stored.policy_payload.as_slice()).unwrap();
+        assert!(
+            base_policy
+                .network_policies
+                .contains_key("github_contents_write")
+        );
+        assert!(
+            !base_policy
+                .network_policies
+                .contains_key("_provider_work_custom"),
+            "provider-composed rules must not be copied into the mutable base policy"
+        );
+
+        let effective_policy = get_sandbox_policy(&state, sandbox_id).await;
+        let provider_rule = &effective_policy.network_policies["_provider_work_custom"];
+        assert_eq!(provider_rule.endpoints[0].access, "full");
+        assert_eq!(provider_rule.endpoints[0].deny_rules.len(), 1);
+        assert!(!provider_rule.endpoints[0].advisor_proposed);
+        assert!(
+            effective_policy
+                .network_policies
+                .contains_key("github_contents_write")
         );
     }
 
