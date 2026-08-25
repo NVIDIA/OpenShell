@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+use std::os::unix::fs::{FileTypeExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -8,14 +9,17 @@ use clap::{Args, Parser, Subcommand};
 use openshell_core::policy::{
     FilesystemPolicy, LandlockPolicy, NetworkPolicy, ProcessPolicy, SandboxPolicy,
 };
+use openshell_core::proto::compute::v1::compute_driver_server::ComputeDriverServer;
 use openshell_driver_firecracker::{
-    BACKEND_NAME, DEFAULT_GUEST_CONFIG_PATH, FirecrackerHostBackend, FirecrackerLaunchConfig,
-    FirecrackerTopology, FirecrackerVm, run_guest,
+    BACKEND_NAME, DEFAULT_GUEST_CONFIG_PATH, FirecrackerComputeConfig, FirecrackerComputeDriver,
+    FirecrackerHostBackend, FirecrackerLaunchConfig, FirecrackerTopology, FirecrackerVm, run_guest,
 };
 use openshell_isolation::AgentSpec;
 use openshell_isolation::contract::{
     BackendRegistry, BoundaryExitStatus, INTERFACE_VERSION, SandboxContext, TopologyDescriptor,
 };
+use tokio::net::UnixListener;
+use tokio_stream::wrappers::UnixListenerStream;
 
 #[derive(Debug, Parser)]
 #[command(about = "Experimental OpenShell Firecracker isolation driver")]
@@ -32,6 +36,8 @@ enum Command {
     Supervise(SuperviseArgs),
     /// Run the private process-supervisor leaf transport inside the guest.
     Guest(GuestArgs),
+    /// Serve the gateway compute-driver contract over a Unix socket.
+    ComputeDriver(ComputeDriverArgs),
 }
 
 #[derive(Debug, Args)]
@@ -87,6 +93,30 @@ struct GuestArgs {
     config: PathBuf,
 }
 
+#[derive(Debug, Args)]
+struct ComputeDriverArgs {
+    #[arg(long, env = "OPENSHELL_COMPUTE_DRIVER_SOCKET")]
+    bind_socket: PathBuf,
+    #[arg(long, env = "OPENSHELL_GRPC_ENDPOINT")]
+    gateway_endpoint: String,
+    #[arg(long, env = "OPENSHELL_FIRECRACKER_STATE_DIR")]
+    state_dir: PathBuf,
+    #[arg(long, env = "OPENSHELL_FIRECRACKER_BINARY")]
+    firecracker_binary: PathBuf,
+    #[arg(long, env = "OPENSHELL_FIRECRACKER_KERNEL_IMAGE")]
+    kernel_image: PathBuf,
+    #[arg(long, env = "OPENSHELL_FIRECRACKER_ROOT_DISK")]
+    root_disk: PathBuf,
+    #[arg(long, env = "OPENSHELL_FIRECRACKER_SUPERVISOR_BIN")]
+    supervisor_binary: PathBuf,
+    #[arg(long, default_value = "firecracker-rootfs")]
+    default_image: String,
+    #[arg(long, default_value_t = 2)]
+    vcpus: u8,
+    #[arg(long, default_value_t = 512)]
+    mem_mib: u32,
+}
+
 fn main() {
     if let Err(error) = run() {
         eprintln!("Firecracker driver failed: {error}");
@@ -113,6 +143,68 @@ fn run() -> Result<(), String> {
                 .map_err(|error| format!("create host runtime: {error}"))?;
             runtime.block_on(supervise(args))
         }
+        Command::ComputeDriver(args) => {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .map_err(|error| format!("create compute-driver runtime: {error}"))?;
+            runtime.block_on(serve_compute_driver(args))
+        }
+    }
+}
+
+async fn serve_compute_driver(args: ComputeDriverArgs) -> Result<(), String> {
+    nix::sys::prctl::set_pdeathsig(nix::sys::signal::Signal::SIGTERM)
+        .map_err(|error| format!("arm compute-driver parent-death signal: {error}"))?;
+    prepare_compute_socket(&args.bind_socket)?;
+    let driver_binary = std::env::current_exe()
+        .map_err(|error| format!("resolve Firecracker driver binary: {error}"))?;
+    let driver = FirecrackerComputeDriver::new(FirecrackerComputeConfig {
+        gateway_endpoint: args.gateway_endpoint,
+        state_dir: args.state_dir,
+        firecracker_binary: resolve_executable(&args.firecracker_binary)?,
+        kernel_image: args.kernel_image,
+        root_disk: args.root_disk,
+        supervisor_binary: args.supervisor_binary,
+        driver_binary,
+        default_image: args.default_image,
+        vcpus: args.vcpus,
+        mem_mib: args.mem_mib,
+    })?;
+    let listener = UnixListener::bind(&args.bind_socket)
+        .map_err(|error| format!("bind compute-driver socket: {error}"))?;
+    std::fs::set_permissions(&args.bind_socket, std::fs::Permissions::from_mode(0o600))
+        .map_err(|error| format!("restrict compute-driver socket: {error}"))?;
+    eprintln!(
+        "Firecracker compute driver listening on {}",
+        args.bind_socket.display()
+    );
+    let result = tonic::transport::Server::builder()
+        .add_service(ComputeDriverServer::new(driver))
+        .serve_with_incoming(UnixListenerStream::new(listener))
+        .await
+        .map_err(|error| format!("serve compute driver: {error}"));
+    let _ = std::fs::remove_file(&args.bind_socket);
+    result
+}
+
+fn prepare_compute_socket(path: &Path) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| "compute-driver socket requires a parent directory".to_string())?;
+    std::fs::create_dir_all(parent)
+        .map_err(|error| format!("create compute-driver socket directory: {error}"))?;
+    std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
+        .map_err(|error| format!("restrict compute-driver socket directory: {error}"))?;
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_socket() => std::fs::remove_file(path)
+            .map_err(|error| format!("remove stale compute-driver socket: {error}")),
+        Ok(_) => Err(format!(
+            "refusing to replace non-socket compute-driver path {}",
+            path.display()
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("inspect compute-driver socket: {error}")),
     }
 }
 

@@ -270,9 +270,11 @@ struct NoGuestNetwork;
 #[async_trait]
 impl NetworkMediationSource for NoGuestNetwork {
     async fn accept(&self) -> Result<MediatedConnection, BackendError> {
-        Err(BackendError::Unavailable(
-            "Firecracker guest has no NIC; mediated egress is unavailable".to_string(),
-        ))
+        // No NIC means there is no connection source to drain. Keeping the
+        // accept future pending lets the host network supervisor remain alive
+        // without treating the structurally closed boundary as a transport
+        // failure.
+        std::future::pending().await
     }
 }
 

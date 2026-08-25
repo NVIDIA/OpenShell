@@ -21,6 +21,7 @@ Current scope:
 - authenticates host-to-guest control over virtio-vsock;
 - implements the RFC lifecycle and agent wait/signal operations;
 - delegates guest process enforcement to the existing process supervisor leaf;
+- serves the gateway compute-driver contract over a private Unix socket;
 - provides an unprivileged KVM end-to-end smoke runner.
 
 Exec, PTY, port forwarding, mediated guest egress, and per-connection binary
@@ -33,5 +34,19 @@ Run the smoke test with:
 ```shell
 mise run e2e:firecracker
 ```
+
+Start a plaintext local gateway backed by the driver with:
+
+```shell
+mise run gateway:firecracker
+```
+
+If the account is configured in the `kvm` group but the current process has
+stale supplementary groups, the launcher re-enters that group with `sg`. It
+does not use `sudo`.
+
+The gateway mode currently boots the configured rootfs fixture rather than
+materializing the requested OCI image. Set `driver_config.command` to a string
+array to override its default long-running shell workload.
 
 See `e2e/firecracker/README.md` for fixture overrides.

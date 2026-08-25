@@ -24,13 +24,20 @@ openshell-isolation = { path = "../openshell-isolation" }
 openshell-supervisor-process = { path = "../openshell-supervisor-process" }
 
 async-trait = "0.1"
+base64 = { workspace = true }
 clap = { workspace = true }
+futures = { workspace = true }
 libc = "0.2"
 nix = { workspace = true }
+rand = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
+tokio-stream = { workspace = true, features = ["net"] }
+tonic = { workspace = true, features = ["transport"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"

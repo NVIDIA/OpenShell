@@ -19,3 +19,7 @@ run = "bash tasks/scripts/gateway-docker.sh"
 ["gateway:vm"]
 description = "Run a standalone gateway with the bundled VM compute driver"
 run = "bash tasks/scripts/gateway-vm.sh"
+
+["gateway:firecracker"]
+description = "Run a standalone gateway with the experimental Firecracker compute driver"
+run = "bash tasks/scripts/gateway-firecracker.sh"
