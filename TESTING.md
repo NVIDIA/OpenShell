@@ -153,6 +153,9 @@ Suites:
 - VM suite (`--features e2e-vm`) - runs e2e tests on a VM.
 - Kubernetes credential-driver suite (`--features e2e-kubernetes-credential-drivers`) - targeted Kubernetes Secrets and Vault provider credential storage coverage.
 
+VM overlay and TLS-key permission assertions run only in the VM suite; the
+driver-neutral smoke test does not include them.
+
 GPU device-selection tests compare OpenShell sandboxes against a plain Docker or
 Podman container that requests `--device nvidia.com/gpu=all`. The probe image
 defaults to the image used by the `gateway` stage in

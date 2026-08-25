@@ -42,6 +42,11 @@ path = "tests/oidc_pkce.rs"
 required-features = ["e2e-oidc-pkce"]
 
 [[test]]
+name = "vm_overlay"
+path = "tests/vm_overlay.rs"
+required-features = ["e2e-vm"]
+
+[[test]]
 name = "custom_image"
 path = "tests/custom_image.rs"
 required-features = ["e2e-docker"]
