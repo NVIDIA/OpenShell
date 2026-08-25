@@ -267,6 +267,29 @@ with SandboxClient.from_active_cluster() as client:
     assert sandbox.id in {s.id for s in matches}
 ```
 
+## Use the Async Python Client
+
+Use `AsyncSandboxClient` in asyncio applications to avoid blocking the event
+loop. It mirrors the synchronous sandbox lifecycle and execution methods with
+`async`/`await`, uses `grpc.aio`, and requires the same explicit workspace
+selection:
+
+```python
+from openshell import AsyncSandboxClient
+
+async with AsyncSandboxClient.from_active_cluster() as client:
+    sandbox = await client.create(workspace="default", name="async-agent")
+    result = await client.exec(sandbox.id, ["python", "-c", "print('ready')"])
+    print(result.stdout)
+    await client.delete(sandbox.name, workspace=sandbox.workspace)
+```
+
+`AsyncSandbox` provides the corresponding high-level async context manager.
+`AsyncWorkspaceClient` and `AsyncInferenceRouteClient` expose async workspace
+lifecycle and workspace-scoped inference route operations. Authentication,
+TLS, OIDC refresh, command timeouts, and streaming execution follow the same
+semantics as the synchronous clients.
+
 ## Expose Long Running Services
 
 Service forwarding makes a long-running process inside a sandbox reachable through a gateway-managed URL. Use it for development servers, notebooks, dashboards, or other services that keep listening after the sandbox starts. Run the service on loopback inside the sandbox, expose its port, then open the URL printed by OpenShell.
