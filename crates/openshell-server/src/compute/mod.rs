@@ -3980,10 +3980,24 @@ fn derive_phase(status: Option<&DriverSandboxStatus>) -> SandboxPhase {
             return SandboxPhase::Deleting;
         }
 
-        if status.conditions.iter().any(|condition| {
-            condition.r#type.eq_ignore_ascii_case("Suspended")
+        // `Ready=True` means the sandbox is usable through this gateway and must
+        // win over a `Suspended=True` condition. Agent Sandbox v1beta1 sets
+        // `Suspended=True (PodTerminated)` on stop and does not clear it on resume,
+        // so a resumed CR carries both `Ready=True` and a stale `Suspended=True`.
+        // Treating any `Suspended=True` as Stopped would pin the resumed sandbox at
+        // Starting forever (issue #2932). A genuine stop leaves `Ready` unset or
+        // False, so `Suspended` still resolves to Stopped in that case.
+        let ready = status.conditions.iter().any(|condition| {
+            condition.r#type.eq_ignore_ascii_case("Ready")
                 && condition.status.eq_ignore_ascii_case("true")
-        }) {
+        });
+
+        if !ready
+            && status.conditions.iter().any(|condition| {
+                condition.r#type.eq_ignore_ascii_case("Suspended")
+                    && condition.status.eq_ignore_ascii_case("true")
+            })
+        {
             return SandboxPhase::Stopped;
         }
 
@@ -6456,6 +6470,56 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(current.phase(), SandboxPhase::Stopped as i32);
+    }
+
+    #[tokio::test]
+    async fn resumed_v1beta1_snapshot_with_stale_suspended_reaches_ready() {
+        // Reproduces issue #2932: on Agent Sandbox v1beta1 a resumed CR reports
+        // Ready=True (DependenciesReady) alongside a stale Suspended=True
+        // (PodTerminated). Starting from the Starting phase that `start` sets, the
+        // reconciled sandbox must advance to Ready rather than being pinned at
+        // Starting by the stale Suspended condition.
+        let runtime = test_runtime(Arc::new(TestDriver::default())).await;
+        let sandbox = sandbox_record("sb-resumed", "sandbox-resumed", SandboxPhase::Starting);
+        runtime.store.put_message(&sandbox).await.unwrap();
+        register_test_supervisor_session(&runtime, sandbox.object_id());
+
+        let mut resumed = ready_driver_sandbox(sandbox.object_id(), sandbox.object_name());
+        resumed.status = Some(DriverSandboxStatus {
+            sandbox_name: sandbox.object_name().to_string(),
+            instance_id: format!("{}-pod", sandbox.object_name()),
+            conditions: vec![
+                DriverCondition {
+                    r#type: "Ready".to_string(),
+                    status: "True".to_string(),
+                    reason: "DependenciesReady".to_string(),
+                    message: "Sandbox is ready".to_string(),
+                    last_transition_time: String::new(),
+                },
+                DriverCondition {
+                    r#type: "Suspended".to_string(),
+                    status: "True".to_string(),
+                    reason: "PodTerminated".to_string(),
+                    message: "Pod terminated".to_string(),
+                    last_transition_time: String::new(),
+                },
+            ],
+            ..Default::default()
+        });
+
+        runtime.apply_sandbox_update(resumed).await.unwrap();
+
+        let current = runtime
+            .store
+            .get_message::<Sandbox>(sandbox.object_id())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            current.phase(),
+            SandboxPhase::Ready as i32,
+            "a resumed, Ready sandbox must not stay Starting because of a stale Suspended condition"
+        );
     }
 
     #[tokio::test]
