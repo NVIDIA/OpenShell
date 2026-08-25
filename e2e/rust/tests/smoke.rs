@@ -1,97 +1,215 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-#![cfg(feature = "e2e")]
+#![cfg(feature = "e2e-cli-conformance")]
 
-//! Smoke test: verify the gateway is healthy, create a sandbox, exec a
-//! command inside it, and tear it down.
-//!
-//! This test is cluster-agnostic — it works against any running gateway
-//! (Docker-based cluster or openshell-driver-vm microVM).  The `e2e:vm` mise
-//! task uses it to validate the VM gateway after boot.
+//! Portable phase-1 CLI conformance scenario.
 
-use std::process::Stdio;
 use std::time::Duration;
 
-use openshell_e2e::harness::binary::openshell_cmd;
-use openshell_e2e::harness::output::strip_ansi;
-use openshell_e2e::harness::sandbox::SandboxGuard;
+use openshell_e2e::harness::conformance::{OpenShellRunner, Poll, STATUS_TIMEOUT};
+use serde::Deserialize;
 
-/// End-to-end smoke test: status → create → exec → list → delete.
+const CREATE_TIMEOUT: Duration = Duration::from_secs(600);
+const LIST_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(10);
+const LIST_PAGE_SIZE: u32 = 1_000;
+const EXEC_TIMEOUT: Duration = Duration::from_secs(120);
+const DELETE_TIMEOUT: Duration = Duration::from_secs(120);
+const DELETE_POLL_INTERVAL: Duration = Duration::from_secs(1);
+
+#[derive(Debug, Deserialize)]
+struct SandboxListEntry {
+    name: String,
+    phase: String,
+}
+
+/// Certify status -> create -> list Ready -> exec -> delete -> list empty.
 #[tokio::test]
 async fn gateway_smoke() {
-    // ── 1. Gateway must be reachable ──────────────────────────────────
-    let mut clean_status = String::new();
-    let mut status_ok = false;
-    for _ in 0..15 {
-        let mut status_cmd = openshell_cmd();
-        status_cmd
-            .arg("status")
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+    let mut runner = OpenShellRunner::new("smoke")
+        .unwrap_or_else(|error| panic!("failed to initialize conformance runner: {error}"));
+    println!("CLI conformance run ID: {}", runner.id());
+    let scenario_result = match runner.check_gateway_status().await {
+        Ok(()) => run_smoke(&mut runner).await,
+        Err(error) => Err(error),
+    };
 
-        let status_out = status_cmd
-            .output()
-            .await
-            .expect("failed to run openshell status");
+    runner
+        .finish(scenario_result)
+        .await
+        .unwrap_or_else(|error| panic!("CLI conformance smoke failed:\n{error}"));
+}
 
-        let status_text = format!(
-            "{}{}",
-            String::from_utf8_lossy(&status_out.stdout),
-            String::from_utf8_lossy(&status_out.stderr),
-        );
-        clean_status = strip_ansi(&status_text);
+async fn run_smoke(runner: &mut OpenShellRunner) -> Result<(), String> {
+    let status = runner
+        .step("status")
+        .description("openshell status succeeds")
+        .with_timeout(STATUS_TIMEOUT)
+        .run(&["status"])
+        .await
+        .map_err(|error| error.to_string())?;
+    status.require_success()?;
 
-        if status_out.status.success() && clean_status.contains("Connected") {
-            status_ok = true;
-            break;
-        }
+    let sandbox_name = format!("ct-{}-01", runner.id());
+    runner.track_sandbox(&sandbox_name);
+    let create = runner
+        .step("create")
+        .description("sandbox creation succeeds")
+        .with_timeout(CREATE_TIMEOUT)
+        .run(&[
+            "sandbox",
+            "create",
+            "--name",
+            &sandbox_name,
+            "--from",
+            "base",
+            "--detach",
+        ])
+        .await
+        .map_err(|error| error.to_string())?;
+    create.require_success()?;
 
-        tokio::time::sleep(Duration::from_secs(2)).await;
+    let get = runner
+        .step("get-ready")
+        .description(format!("sandbox '{sandbox_name}' can be retrieved"))
+        .with_timeout(LIST_ATTEMPT_TIMEOUT)
+        .run(&["sandbox", "get", &sandbox_name, "--output", "json"])
+        .await
+        .map_err(|error| error.to_string())?;
+    get.require_success()?;
+
+    let sandbox = get
+        .json::<SandboxListEntry>()
+        .map_err(|error| error.to_string())?;
+    if sandbox.name != sandbox_name {
+        return Err(format!(
+            "sandbox get returned {:?}; expected sandbox '{sandbox_name}'",
+            sandbox.name
+        ));
+    }
+    if sandbox.phase != "Ready" {
+        return Err(format!(
+            "sandbox '{sandbox_name}' is in phase {:?}; expected Ready",
+            sandbox.phase
+        ));
     }
 
-    assert!(
-        status_ok,
-        "openshell status never became healthy:\n{clean_status}",
-    );
+    check_sandbox_listed(runner, &sandbox_name).await?;
 
-    // ── 2. Create a sandbox and exec a command ───────────────────────
-    // Default behaviour keeps the sandbox alive after the command exits,
-    // so we can verify it in the list before cleaning up.
-    let mut sb = SandboxGuard::create(&["--", "echo", "smoke-ok"])
+    let marker = format!("openshell-conformance-{}", runner.id());
+    let exec = runner
+        .step("exec")
+        .description("sandbox exec exits successfully")
+        .with_timeout(EXEC_TIMEOUT)
+        .run(&[
+            "sandbox",
+            "exec",
+            "--name",
+            &sandbox_name,
+            "--no-tty",
+            "--",
+            "echo",
+            &marker,
+        ])
         .await
-        .expect("sandbox create should succeed");
+        .map_err(|error| error.to_string())?;
+    exec.require_success()?;
+    let expected_stdout = format!("{marker}\n");
+    if exec.stdout() != expected_stdout {
+        return Err(exec.failure_diagnostic(&format!("stdout is exactly {expected_stdout:?}")));
+    }
 
-    assert!(
-        sb.create_output.contains("smoke-ok"),
-        "expected 'smoke-ok' in sandbox output:\n{}",
-        sb.create_output,
-    );
-
-    // ── 3. Verify the sandbox appeared in the list ───────────────────
-    let mut list_cmd = openshell_cmd();
-    list_cmd
-        .args(["sandbox", "list", "--names"])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-
-    let list_out = list_cmd
-        .output()
+    let delete = runner
+        .step("delete")
+        .description("sandbox deletion succeeds")
+        .with_timeout(DELETE_TIMEOUT)
+        .run(&["sandbox", "delete", &sandbox_name])
         .await
-        .expect("failed to run openshell sandbox list");
+        .map_err(|error| error.to_string())?;
+    delete.require_success()?;
 
-    let list_text = strip_ansi(&format!(
-        "{}{}",
-        String::from_utf8_lossy(&list_out.stdout),
-        String::from_utf8_lossy(&list_out.stderr),
-    ));
+    check_empty_list(runner, &sandbox_name).await?;
+    runner.forget_sandbox(&sandbox_name);
+    Ok(())
+}
 
-    assert!(
-        list_text.contains(&sb.name),
-        "sandbox '{}' should appear in list output:\n{list_text}",
-        sb.name,
-    );
+async fn check_sandbox_listed(runner: &OpenShellRunner, sandbox_name: &str) -> Result<(), String> {
+    if find_sandbox(runner, sandbox_name, "list-visible")
+        .await?
+        .is_some()
+    {
+        return Ok(());
+    }
+    Err(format!(
+        "sandbox '{sandbox_name}' does not appear in sandbox list"
+    ))
+}
 
-    // ── 4. Cleanup ───────────────────────────────────────────────────
-    sb.cleanup().await;
+async fn check_empty_list(runner: &mut OpenShellRunner, sandbox_name: &str) -> Result<(), String> {
+    runner
+        .poll_until(
+            "list-empty",
+            DELETE_TIMEOUT,
+            DELETE_POLL_INTERVAL,
+            async |runner| match find_sandbox(runner, sandbox_name, "list-empty/query").await {
+                Ok(None) => Poll::Ready(()),
+                Ok(Some(sandbox)) => Poll::Pending(format!(
+                    "sandbox '{sandbox_name}' remains listed in phase {:?}",
+                    sandbox.phase
+                )),
+                Err(error) => Poll::Failed(error),
+            },
+        )
+        .await
+        .map_err(|error| error.to_string())
+}
+
+async fn find_sandbox(
+    runner: &OpenShellRunner,
+    sandbox_name: &str,
+    step: &str,
+) -> Result<Option<SandboxListEntry>, String> {
+    let mut offset = 0u32;
+
+    loop {
+        let limit = LIST_PAGE_SIZE.to_string();
+        let page_offset = offset.to_string();
+        let result = runner
+            .step(format!("{step}/{offset}"))
+            .description(format!("sandbox list page at offset {offset} succeeds"))
+            .with_timeout(LIST_ATTEMPT_TIMEOUT)
+            .run(&[
+                "sandbox",
+                "list",
+                "--limit",
+                &limit,
+                "--offset",
+                &page_offset,
+                "--output",
+                "json",
+            ])
+            .await
+            .map_err(|error| error.to_string())?;
+        result.require_success()?;
+
+        let sandboxes = result
+            .json::<Vec<SandboxListEntry>>()
+            .map_err(|error| error.to_string())?;
+        if let Some(sandbox) = sandboxes
+            .iter()
+            .find(|sandbox| sandbox.name == sandbox_name)
+        {
+            return Ok(Some(SandboxListEntry {
+                name: sandbox.name.clone(),
+                phase: sandbox.phase.clone(),
+            }));
+        }
+        if sandboxes.len() < LIST_PAGE_SIZE as usize {
+            return Ok(None);
+        }
+
+        offset = offset
+            .checked_add(LIST_PAGE_SIZE)
+            .ok_or_else(|| "sandbox list pagination offset overflowed".to_string())?;
+    }
 }
