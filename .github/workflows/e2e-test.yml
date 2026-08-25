@@ -290,9 +290,16 @@ jobs:
       - name: Run Podman E2E
         run: ${{ matrix.cmd }}
 
-      - name: Print AppArmor denials
+      - name: Fail on pasta SIGTERM AppArmor denial
         if: always()
-        run: sudo dmesg | grep -E 'apparmor=.*DENIED|profile="unprivileged_userns"' | tail -100 || true
+        run: |
+          set -euo pipefail
+          denials="$(sudo dmesg | grep -E 'profile="pasta".*requested_mask="receive".*signal=term.*peer="podman"' || true)"
+          if [ -n "${denials}" ]; then
+            echo "::error::pasta denied Podman's SIGTERM; Podman will use its SIGKILL fallback"
+            printf '%s\n' "${denials}"
+            exit 1
+          fi
 
   e2e-vm:
     name: E2E (rust-vm-${{ matrix.suite }})
