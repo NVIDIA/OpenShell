@@ -197,6 +197,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
+            apparmor \
             build-essential \
             clang \
             fuse-overlayfs \
@@ -218,6 +219,20 @@ jobs:
             > "${podman_config}"
           echo "/usr/bin" >> "${GITHUB_PATH}"
           echo "CONTAINERS_CONF_OVERRIDE=${podman_config}" >> "${GITHUB_ENV}"
+
+      - name: Allow pasta to receive Podman stop signals
+        # Ubuntu's packaged pasta profile currently blocks this signal, forcing
+        # Podman to wait for its SIGKILL fallback. Keep this narrow allowance
+        # until the distribution package includes the upstream profile fix.
+        run: |
+          set -euo pipefail
+          profile=/etc/apparmor.d/usr.bin.pasta
+          rule='  signal (receive) peer=podman,'
+          if ! sudo grep -Fqx "${rule}" "${profile}"; then
+            sudo sed -i '\|^  include <abstractions/pasta>$|a\  signal (receive) peer=podman,' "${profile}"
+          fi
+          sudo grep -Fqx "${rule}" "${profile}"
+          sudo apparmor_parser --replace "${profile}"
 
       - name: Configure rootless Podman
         run: |
@@ -278,6 +293,17 @@ jobs:
       - name: Print AppArmor denials
         if: always()
         run: sudo dmesg | grep -E 'apparmor=.*DENIED|profile="unprivileged_userns"' | tail -100 || true
+
+      - name: Fail on pasta SIGTERM AppArmor denial
+        if: always()
+        run: |
+          set -euo pipefail
+          denials="$(sudo dmesg | grep -E 'profile="pasta".*requested_mask="receive".*signal=term.*peer="podman"' || true)"
+          if [ -n "${denials}" ]; then
+            echo "::error::pasta denied Podman's SIGTERM; Podman will use its SIGKILL fallback"
+            printf '%s\n' "${denials}"
+            exit 1
+          fi
 
   e2e-vm:
     name: E2E (rust-vm-${{ matrix.suite }})

@@ -32,6 +32,11 @@ on:
         required: false
         type: string
         default: ""
+      auditable:
+        description: "Embed cargo-auditable dependency metadata in image binaries"
+        required: false
+        type: boolean
+        default: false
       image-tag:
         description: "Image tag base to build/push (defaults to the GitHub SHA)"
         required: false
@@ -177,6 +182,7 @@ jobs:
       image-tag: ${{ needs.resolve.outputs.image_tag_base }}
       checkout-ref: ${{ inputs['checkout-ref'] }}
       features: ${{ needs.resolve.outputs.features }}
+      auditable: ${{ inputs.auditable }}
       artifact-name: ${{ needs.resolve.outputs.artifact_prefix }}-linux-${{ matrix.arch }}
     secrets: inherit
 

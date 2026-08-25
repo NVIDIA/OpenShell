@@ -3,13 +3,17 @@
 
 # PROTOTYPE: Composable distro VMs for installing and exercising artifacts.
 
-{ pkgs }:
+{
+  pkgs,
+  qemuPkgs ? pkgs,
+  firmwarePkgs ? pkgs,
+}:
 
 let
   isAarch64 = pkgs.stdenv.hostPlatform.isAarch64;
   isDarwin = pkgs.stdenv.hostPlatform.isDarwin;
   architecture = if isAarch64 then "aarch64" else "x86_64";
-  qemu = pkgs.qemu.override { hostCpuOnly = true; };
+  qemu = qemuPkgs.qemu.override { hostCpuOnly = true; };
   qemuBinary =
     if isAarch64 then "${qemu}/bin/qemu-system-aarch64" else "${qemu}/bin/qemu-system-x86_64";
 
@@ -75,8 +79,8 @@ let
     export OPENSHELL_TEST_GUEST_RUNNER=${./run.sh}
     export TEST_GUEST_BASH=${pkgs.bash}/bin/bash
     export TEST_GUEST_QEMU=${qemuBinary}
-    export TEST_GUEST_FIRMWARE_CODE=${pkgs.OVMF.firmware}
-    export TEST_GUEST_FIRMWARE_VARS=${pkgs.OVMF.variables}
+    export TEST_GUEST_FIRMWARE_CODE=${firmwarePkgs.OVMF.firmware}
+    export TEST_GUEST_FIRMWARE_VARS=${firmwarePkgs.OVMF.variables}
     export TEST_GUEST_MACHINE=${if isAarch64 then "virt" else "q35"}
     export TEST_GUEST_ACCELERATOR=${if isDarwin then "hvf" else "kvm"}
     export TEST_GUEST_ARCHITECTURE=${architecture}

@@ -18,8 +18,8 @@ depends = [
 
 ["test:docs-website"]
 description = "Test the docs-website sync script"
-# --no-project skips the workspace (maturin) build; --with supplies pytest and
-# the script's runtime dep (PyYAML), which live outside the project env.
+# --no-project skips installing the OpenShell package; --with supplies pytest
+# and the script's runtime dependency (PyYAML), which lives outside the project env.
 run = "uv run --no-project --with pytest --with pyyaml pytest tasks/scripts/sync_docs_website_test.py"
 
 ["test:sbom"]

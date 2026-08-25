@@ -20,6 +20,12 @@ The script detects your operating system and installs the OpenShell CLI and gate
 
 You can also download release artifacts directly from the [OpenShell GitHub Releases](https://github.com/NVIDIA/OpenShell/releases) page.
 
+The `openshell` package on PyPI provides the Python SDK only. It does not install the `openshell` CLI. Add the SDK to a Python project with:
+
+```shell
+uv add openshell
+```
+
 Use `openshell status` to confirm the CLI can reach the gateway.
 
 ## Supported Compute Drivers

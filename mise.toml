@@ -42,6 +42,7 @@ k3d = { version = "5.8.3", os = ["macos"] }
 "github:EmbarkStudios/cargo-about" = { version = "0.8.4", version_prefix = "" }
 "github:EmbarkStudios/cargo-deny" = { version = "0.20.2", version_prefix = "" }
 zig = "0.14.1"
+"github:rust-secure-code/cargo-auditable" = "0.7.5"
 "github:rust-cross/cargo-zigbuild" = "0.22.3"
 "npm:markdownlint-cli2" = "0.22.0"
 
