@@ -197,6 +197,18 @@ The driver log defaults below `/tmp/openshell-firecracker-<user>-<gateway>/`.
 The prototype creates no TAP device or guest NIC and needs neither `sudo` nor
 `CAP_NET_ADMIN`.
 
+If an older checkout fails while compiling `z3-sys` or another bindgen consumer
+with `fatal error: 'stdbool.h' file not found`, set the GCC architecture header
+path before retrying:
+
+```bash
+export BINDGEN_EXTRA_CLANG_ARGS="${BINDGEN_EXTRA_CLANG_ARGS:+${BINDGEN_EXTRA_CLANG_ARGS} }-isystem $(gcc -print-file-name=include)"
+mise run gateway:firecracker
+```
+
+The current Firecracker gateway task applies this fallback automatically after
+its optional `sg kvm` re-exec.
+
 ### Step 5: Check Podman-Backed Gateways
 
 ```bash

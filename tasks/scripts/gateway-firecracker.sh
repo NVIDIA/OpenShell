@@ -44,6 +44,19 @@ ensure_kvm_access() {
   fail "/dev/kvm is not readable and writable; add $(id -un) to the kvm group"
 }
 
+configure_bindgen_include() {
+  local gcc_include
+  command -v gcc >/dev/null 2>&1 || return 0
+  gcc_include="$(gcc -print-file-name=include)"
+  [ -f "${gcc_include}/stdbool.h" ] || return 0
+  case " ${BINDGEN_EXTRA_CLANG_ARGS:-} " in
+    *" -isystem ${gcc_include} "*) ;;
+    *)
+      export BINDGEN_EXTRA_CLANG_ARGS="${BINDGEN_EXTRA_CLANG_ARGS:+${BINDGEN_EXTRA_CLANG_ARGS} }-isystem ${gcc_include}"
+      ;;
+  esac
+}
+
 fail() {
   echo "ERROR: $*" >&2
   exit 1
@@ -94,6 +107,7 @@ EOF
 
 [ "$(uname -s)" = "Linux" ] || fail "gateway:firecracker requires Linux"
 ensure_kvm_access
+configure_bindgen_include
 [ -x "${FIRECRACKER_BIN}" ] || fail "Firecracker binary is not executable: ${FIRECRACKER_BIN}"
 [ -f "${KERNEL_IMAGE}" ] || fail "kernel image not found: ${KERNEL_IMAGE}"
 [ -f "${ROOT_DISK}" ] || fail "root disk fixture not found: ${ROOT_DISK}"

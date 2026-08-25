@@ -45,6 +45,10 @@ If the account is configured in the `kvm` group but the current process has
 stale supplementary groups, the launcher re-enters that group with `sg`. It
 does not use `sudo`.
 
+On Linux toolchains where bindgen does not discover GCC's architecture-specific
+headers, the task derives the include directory from
+`gcc -print-file-name=include` and appends it to `BINDGEN_EXTRA_CLANG_ARGS`.
+
 The gateway mode currently boots the configured rootfs fixture rather than
 materializing the requested OCI image. Set `driver_config.command` to a string
 array to override its default long-running shell workload.
