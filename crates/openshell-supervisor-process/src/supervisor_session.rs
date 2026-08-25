@@ -315,8 +315,9 @@ async fn run_session_loop(
             &ssh_socket_path,
             netns_fd,
             expected_ssh_peer_pid,
-            Arc::clone(&terminating),
             &instance_id,
+            attempt,
+            Arc::clone(&terminating),
         )
         .await
         {
@@ -341,14 +342,16 @@ async fn run_session_loop(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_single_session(
     endpoint: &str,
     sandbox_id: &str,
     ssh_socket_path: &std::path::Path,
     netns_fd: Option<i32>,
     expected_ssh_peer_pid: Option<u32>,
-    terminating: Arc<AtomicBool>,
     instance_id: &str,
+    connection_epoch: u64,
+    terminating: Arc<AtomicBool>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Connect to the gateway. The same `Channel` is used for both the
     // long-lived control stream and all data-plane `RelayStream` calls, so
@@ -368,6 +371,7 @@ async fn run_single_session(
         payload: Some(supervisor_message::Payload::Hello(SupervisorHello {
             sandbox_id: sandbox_id.to_string(),
             instance_id: instance_id.to_string(),
+            connection_epoch,
         })),
     })
     .await

@@ -28,6 +28,7 @@ e2e-docker = ["e2e", "e2e-host-gateway", "e2e-local-container-driver"]
 e2e-gpu = ["e2e"]
 e2e-docker-gpu = ["e2e-docker", "e2e-gpu"]
 e2e-kubernetes = ["e2e"]
+e2e-kubernetes-ha = ["e2e-kubernetes"]
 e2e-kubernetes-credential-drivers = ["e2e-kubernetes"]
 e2e-kubernetes-workspace-managed = ["e2e-kubernetes"]
 e2e-kubernetes-workspace-operator = ["e2e-kubernetes"]
@@ -97,14 +98,14 @@ path = "tests/vm_gateway_start.rs"
 required-features = ["e2e-vm"]
 
 [[test]]
+name = "kubernetes_ha_rebalancing"
+path = "tests/kubernetes_ha_rebalancing.rs"
+required-features = ["e2e-kubernetes-ha"]
+
+[[test]]
 name = "provider_token_exchange"
 path = "tests/provider_token_exchange.rs"
 required-features = ["e2e-podman"]
-
-[[test]]
-name = "readyz_health"
-path = "tests/readyz_health.rs"
-required-features = ["e2e-kubernetes"]
 
 [[test]]
 name = "kubernetes_corporate_proxy"

@@ -40,7 +40,7 @@ use openshell_core::proto::{
     ListProvidersResponse, ListSandboxPoliciesRequest, ListSandboxPoliciesResponse,
     ListSandboxProvidersRequest, ListSandboxProvidersResponse, ListSandboxesRequest,
     ListSandboxesResponse, ListServicesRequest, ListServicesResponse, ListWorkspaceMembersRequest,
-    ListWorkspaceMembersResponse, ListWorkspacesRequest, ListWorkspacesResponse,
+    ListWorkspaceMembersResponse, ListWorkspacesRequest, ListWorkspacesResponse, PeerRelayFrame,
     ProviderProfileResponse, ProviderResponse, PushSandboxLogsRequest, PushSandboxLogsResponse,
     RefreshSandboxTokenRequest, RefreshSandboxTokenResponse, RejectDraftChunkRequest,
     RejectDraftChunkResponse, RelayFrame, RemoveWorkspaceMemberRequest,
@@ -754,6 +754,16 @@ impl OpenShell for OpenShellService {
         request: Request<ListWorkspaceMembersRequest>,
     ) -> Result<Response<ListWorkspaceMembersResponse>, Status> {
         workspace::handle_list_workspace_members(&self.state, request).await
+    }
+
+    type PeerRelayStream =
+        Pin<Box<dyn tokio_stream::Stream<Item = Result<PeerRelayFrame, Status>> + Send + 'static>>;
+
+    async fn peer_relay(
+        &self,
+        request: Request<tonic::Streaming<PeerRelayFrame>>,
+    ) -> Result<Response<Self::PeerRelayStream>, Status> {
+        crate::supervisor_session::handle_peer_relay(&self.state, request).await
     }
 }
 

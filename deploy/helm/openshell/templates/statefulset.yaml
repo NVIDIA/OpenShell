@@ -9,7 +9,7 @@ metadata:
   labels:
     {{- include "openshell.labels" . | nindent 4 }}
 spec:
-  serviceName: {{ include "openshell.fullname" . }}
+  serviceName: {{ include "openshell.peerServiceName" . }}
   replicas: {{ .Values.replicaCount }}
   selector:
     matchLabels:

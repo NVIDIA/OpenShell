@@ -25,6 +25,7 @@ use crate::persistence::{
 };
 use crate::sandbox_index::SandboxIndex;
 use crate::sandbox_watch::SandboxWatchBus;
+use crate::supervisor_owner::{OWNER_TTL, SupervisorOwnerIndex};
 use crate::supervisor_session::SupervisorSessionRegistry;
 use crate::tracing_bus::TracingLogBus;
 use futures::{Stream, StreamExt};
@@ -570,6 +571,13 @@ pub struct ComputeRuntime {
     replica_id: String,
 }
 
+pub struct SandboxSyncGuard {
+    // Drop the database guard before the local mutex so another local waiter
+    // cannot race ahead while this replica still owns the cluster-wide lock.
+    _distributed: crate::persistence::DistributedMutationGuard,
+    _local: tokio::sync::OwnedMutexGuard<()>,
+}
+
 impl fmt::Debug for ComputeRuntime {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ComputeRuntime").finish_non_exhaustive()
@@ -690,13 +698,21 @@ impl ComputeRuntime {
     }
 
     /// Serializes sandbox/provider-profile invariant checks and object writes
-    /// within this gateway process.
+    /// across gateway replicas.
     ///
-    /// This is a temporary single-gateway guard for cross-object invariants.
-    /// It is not HA-safe; replace it with DB-backed CAS/resource-version writes
-    /// tracked by #1255 before enabling multiple gateway writers.
-    pub(crate) async fn sandbox_sync_guard(&self) -> tokio::sync::OwnedMutexGuard<()> {
-        self.sync_lock.clone().lock_owned().await
+    /// The local mutex preserves lock ordering within one process. `PostgreSQL`
+    /// deployments additionally acquire a database advisory lock so the
+    /// validation and related writes remain atomic with respect to other
+    /// gateway replicas.
+    pub(crate) async fn sandbox_sync_guard(
+        &self,
+    ) -> crate::persistence::PersistenceResult<SandboxSyncGuard> {
+        let local = self.sync_lock.clone().lock_owned().await;
+        let distributed = self.store.acquire_distributed_mutation_guard().await?;
+        Ok(SandboxSyncGuard {
+            _distributed: distributed,
+            _local: local,
+        })
     }
 
     /// Acquires the process-wide lock for code that already holds the
@@ -2766,7 +2782,7 @@ impl ComputeRuntime {
         expected_resource_version: u64,
         existing_phase: SandboxPhase,
     ) -> Result<(), String> {
-        let session_connected = self.supervisor_sessions.has_session(&incoming.id);
+        let session_connected = self.supervisor_session_ready(&incoming.id).await?;
         let sandbox = self
             .store
             .update_message_cas::<Sandbox, _>(
@@ -2801,30 +2817,85 @@ impl ComputeRuntime {
         sandbox_id: &str,
         instance_id: &str,
     ) -> Result<(), String> {
-        self.set_supervisor_session_state(sandbox_id, true, Some(instance_id))
-            .await
+        let _guard = self.sync_lock.lock().await;
+        let sandbox = self
+            .update_supervisor_session_state(sandbox_id, true, Some(instance_id))
+            .await?;
+        self.publish_supervisor_session_state(sandbox_id, sandbox);
+        Ok(())
     }
 
     pub async fn supervisor_session_disconnected(&self, sandbox_id: &str) -> Result<(), String> {
-        self.set_supervisor_session_state(sandbox_id, false, None)
-            .await
+        let _guard = self.sync_lock.lock().await;
+
+        // A replacement session may already be owned by another replica. Do
+        // not let cleanup from this replica overwrite the new owner's Ready
+        // state. Recheck after the demotion as well: if ownership changed
+        // between the first read and the CAS, restore Ready before releasing
+        // the synchronization lock. A new owner published after the second
+        // read will run supervisor_session_connected and promote the sandbox.
+        if self.supervisor_session_ready(sandbox_id).await? {
+            return Ok(());
+        }
+
+        let demoted = self
+            .update_supervisor_session_state(sandbox_id, false, None)
+            .await?;
+        let replacement_instance_id = self
+            .supervisor_session_owner_instance_id(sandbox_id)
+            .await?;
+        let sandbox = if let Some(instance_id) = replacement_instance_id.as_deref() {
+            self.update_supervisor_session_state(sandbox_id, true, Some(instance_id))
+                .await?
+        } else {
+            demoted
+        };
+        self.publish_supervisor_session_state(sandbox_id, sandbox);
+        Ok(())
     }
 
-    async fn set_supervisor_session_state(
+    async fn supervisor_session_ready(&self, sandbox_id: &str) -> Result<bool, String> {
+        if self.supervisor_sessions.has_session(sandbox_id) {
+            return Ok(true);
+        }
+
+        Ok(self
+            .supervisor_session_owner_instance_id(sandbox_id)
+            .await?
+            .is_some())
+    }
+
+    async fn supervisor_session_owner_instance_id(
+        &self,
+        sandbox_id: &str,
+    ) -> Result<Option<String>, String> {
+        let owner_index = SupervisorOwnerIndex::new(self.store.clone(), OWNER_TTL);
+        let Some(owner) = owner_index
+            .read(sandbox_id)
+            .await
+            .map_err(|err| err.to_string())?
+        else {
+            return Ok(None);
+        };
+
+        let age_ms = openshell_core::time::now_ms() - owner.updated_at_ms;
+        let ttl_ms = i64::try_from(OWNER_TTL.as_millis()).unwrap_or(i64::MAX);
+        Ok((age_ms < ttl_ms).then_some(owner.supervisor_instance_id))
+    }
+
+    async fn update_supervisor_session_state(
         &self,
         sandbox_id: &str,
         connected: bool,
         instance_id: Option<&str>,
-    ) -> Result<(), String> {
-        let _guard = self.sync_lock.lock().await;
-
+    ) -> Result<Option<Sandbox>, String> {
         let Some(existing) = self
             .store
             .get_message::<Sandbox>(sandbox_id)
             .await
             .map_err(|err| err.to_string())?
         else {
-            return Ok(());
+            return Ok(None);
         };
         let current_phase =
             SandboxPhase::try_from(existing.phase()).unwrap_or(SandboxPhase::Unknown);
@@ -2835,10 +2906,10 @@ impl ComputeRuntime {
                 | SandboxPhase::Stopping
                 | SandboxPhase::Stopped
         ) {
-            return Ok(());
+            return Ok(None);
         }
         if !connected && current_phase != SandboxPhase::Ready {
-            return Ok(());
+            return Ok(None);
         }
         let expected_resource_version = sandbox_resource_version(&existing);
 
@@ -2866,7 +2937,7 @@ impl ComputeRuntime {
             Err(crate::persistence::PersistenceError::Database(ref msg))
                 if msg.contains("not found") =>
             {
-                return Ok(());
+                return Ok(None);
             }
             Err(crate::persistence::PersistenceError::Conflict {
                 current_resource_version,
@@ -2880,9 +2951,14 @@ impl ComputeRuntime {
             Err(e) => return Err(e.to_string()),
         };
 
-        self.sandbox_index.update_from_sandbox(&sandbox);
-        self.sandbox_watch_bus.notify(sandbox_id);
-        Ok(())
+        Ok(Some(sandbox))
+    }
+
+    fn publish_supervisor_session_state(&self, sandbox_id: &str, sandbox: Option<Sandbox>) {
+        if let Some(sandbox) = sandbox {
+            self.sandbox_index.update_from_sandbox(&sandbox);
+            self.sandbox_watch_bus.notify(sandbox_id);
+        }
     }
 
     /// Persist a terminal canonical-process result. Exit code zero is still a
@@ -3926,7 +4002,7 @@ fn ensure_supervisor_not_ready_status(status: &mut Option<SandboxStatus>, sandbo
             r#type: "Ready".to_string(),
             status: "False".to_string(),
             reason: "DependenciesNotReady".to_string(),
-            message: "Supervisor session disconnected".to_string(),
+            message: "Supervisor session not connected".to_string(),
             last_transition_time: String::new(),
         },
     );
@@ -7879,7 +7955,43 @@ mod tests {
             .unwrap();
         assert_eq!(ready.status, "False");
         assert_eq!(ready.reason, "DependenciesNotReady");
-        assert_eq!(ready.message, "Supervisor session disconnected");
+        assert_eq!(ready.message, "Supervisor session not connected");
+    }
+
+    #[tokio::test]
+    async fn stale_session_disconnect_preserves_new_remote_owner_ready_state() {
+        let runtime = test_runtime(Arc::new(TestDriver::default())).await;
+        let mut sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Ready);
+        sandbox.set_phase(SandboxPhase::Ready as i32);
+        runtime.store.put_message(&sandbox).await.unwrap();
+
+        SupervisorOwnerIndex::new(runtime.store.clone(), OWNER_TTL)
+            .publish(
+                "sb-1",
+                "replacement-session",
+                "supervisor-instance",
+                2,
+                "gateway-b",
+                "http://gateway-b:8080",
+            )
+            .await
+            .unwrap();
+
+        runtime
+            .supervisor_session_disconnected("sb-1")
+            .await
+            .unwrap();
+
+        let stored = runtime
+            .store
+            .get_message::<Sandbox>("sb-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            SandboxPhase::try_from(stored.phase()).unwrap(),
+            SandboxPhase::Ready
+        );
     }
 
     // --- Composition rule tests ---

@@ -130,6 +130,28 @@ Append these flags to any of the PostgreSQL commands above for OpenShift:
 --set securityContext.runAsUser=null
 ```
 
+### High availability
+
+Set `replicaCount` above `1` only with `server.externalDbSecret`; the default
+SQLite database is per pod and cannot coordinate multiple gateway replicas.
+The chart creates a headless peer Service for gateway-to-gateway relay traffic.
+StatefulSet pods use stable pod DNS names through that headless Service.
+Deployment pods advertise their pod IP with `OPENSHELL_PEER_ENDPOINT`, because
+Kubernetes does not assign stable per-pod DNS names to Deployment replicas.
+
+Gateway peer traffic uses Kubernetes ServiceAccount identity. Each gateway pod
+mounts a projected, pod-bound ServiceAccount token with audience
+`openshell-gateway-peer`; receiving replicas validate that token with the
+Kubernetes TokenReview API, verify the live pod UID and Helm selector labels,
+and authorize only the internal `PeerRelay` RPC. The chart does not create or
+accept a shared gateway peer Secret.
+
+With gateway TLS enabled, peer calls use the chart CA and client TLS Secret for
+server verification and mTLS. The client verifies the stable gateway Service
+DNS name while connecting directly to the owning pod. Custom TLS Secrets must
+include that Service DNS name in the server certificate and provide the CA and
+client credentials configured by `server.tls`.
+
 ## Secret bootstrap
 
 By default, a pre-install/pre-upgrade hook Job runs `openshell-gateway generate-certs`
