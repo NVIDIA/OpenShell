@@ -10,6 +10,8 @@ pub use grpc::RecordGrpcFailure;
 pub use propagation::{
     EnvTraceContextInterceptor, HeaderMapExtractor, MetadataMapInjector, TraceContextInterceptor,
 };
+pub use grpc::{RecordGrpcFailure, RecordGrpcStatus};
+pub use propagation::{HeaderMapExtractor, MetadataMapInjector, TraceContextInterceptor};
 
 use opentelemetry::KeyValue;
 use opentelemetry::trace::TracerProvider as _;
@@ -20,6 +22,7 @@ pub use opentelemetry_sdk::trace::SdkTracerProvider;
 use tracing::Subscriber;
 use tracing_opentelemetry::OpenTelemetryLayer;
 use tracing_subscriber::Layer as _;
+use tracing_subscriber::layer::{Context, Filter};
 use tracing_subscriber::registry::LookupSpan;
 
 const SDK_UNKNOWN_SERVICE_PREFIX: &str = "unknown_service";
@@ -195,6 +198,26 @@ pub type OtlpLayer<S> = tracing_subscriber::filter::Filtered<
     S,
 >;
 
+pub type TargetOtlpLayer<S> =
+    tracing_subscriber::filter::Filtered<OpenTelemetryLayer<S, SdkTracer>, TargetPrefixFilter, S>;
+
+#[derive(Debug, Clone, Copy)]
+pub struct TargetPrefixFilter {
+    prefix: Option<&'static str>,
+    include: bool,
+}
+
+impl<S> Filter<S> for TargetPrefixFilter {
+    fn enabled(&self, metadata: &tracing::Metadata<'_>, _ctx: &Context<'_, S>) -> bool {
+        let matches_prefix = self
+            .prefix
+            .is_some_and(|prefix| metadata.target().starts_with(prefix));
+        metadata.is_span()
+            && !metadata.target().starts_with("opentelemetry")
+            && (matches_prefix == self.include)
+    }
+}
+
 /// Build a tracing layer that exports spans and excludes exporter callsites.
 pub fn layer<S>(provider: &SdkTracerProvider, instrumentation_scope: &'static str) -> OtlpLayer<S>
 where
@@ -207,6 +230,49 @@ where
         }))
 }
 
+/// Build a tracing layer that exports only spans from `target_prefix`.
+pub fn layer_for_target_prefix<S>(
+    provider: &SdkTracerProvider,
+    instrumentation_scope: &'static str,
+    target_prefix: &'static str,
+) -> TargetOtlpLayer<S>
+where
+    S: Subscriber + for<'span> LookupSpan<'span>,
+{
+    tracing_opentelemetry::layer()
+        .with_tracer(provider.tracer(instrumentation_scope))
+        .with_filter(TargetPrefixFilter {
+            prefix: Some(target_prefix),
+            include: true,
+        })
+}
+
+/// Build a tracing layer that excludes spans from `target_prefix`.
+///
+/// `None` excludes no application spans.
+pub fn layer_excluding_target_prefix<S>(
+    provider: &SdkTracerProvider,
+    instrumentation_scope: &'static str,
+    target_prefix: Option<&'static str>,
+) -> TargetOtlpLayer<S>
+where
+    S: Subscriber + for<'span> LookupSpan<'span>,
+{
+    tracing_opentelemetry::layer()
+        .with_tracer(provider.tracer(instrumentation_scope))
+        .with_filter(TargetPrefixFilter {
+            prefix: target_prefix,
+            include: false,
+        })
+}
+
+#[cfg(test)]
+pub(crate) fn test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -215,6 +281,7 @@ mod tests {
     fn error_status_guard_marks_only_unfinished_results() {
         use tracing_subscriber::layer::SubscriberExt as _;
 
+        let _tracing_lock = test_lock();
         let exporter = opentelemetry_sdk::trace::InMemorySpanExporterBuilder::new().build();
         let provider = SdkTracerProvider::builder()
             .with_simple_exporter(exporter.clone())
@@ -255,6 +322,89 @@ mod tests {
             .find(|span| span.name == "successful-operation")
             .unwrap();
         assert_eq!(succeeded.status, opentelemetry::trace::Status::Unset);
+    }
+
+    #[test]
+    fn target_scoped_layers_partition_in_process_driver_spans() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let _tracing_lock = test_lock();
+        let gateway_exporter = opentelemetry_sdk::trace::InMemorySpanExporterBuilder::new().build();
+        let gateway_provider = SdkTracerProvider::builder()
+            .with_simple_exporter(gateway_exporter.clone())
+            .build();
+        let driver_exporter = opentelemetry_sdk::trace::InMemorySpanExporterBuilder::new().build();
+        let driver_provider = SdkTracerProvider::builder()
+            .with_simple_exporter(driver_exporter.clone())
+            .build();
+        let subscriber = tracing_subscriber::registry()
+            .with(layer_excluding_target_prefix(
+                &gateway_provider,
+                "gateway",
+                Some("driver_target"),
+            ))
+            .with(layer_for_target_prefix(
+                &driver_provider,
+                "driver",
+                "driver_target",
+            ));
+
+        tracing::subscriber::with_default(subscriber, || {
+            let gateway = tracing::info_span!(target: "gateway_target", "gateway.span");
+            let _entered = gateway.enter();
+            drop(tracing::info_span!(target: "driver_target::operation", "driver.span"));
+        });
+
+        gateway_provider.force_flush().unwrap();
+        driver_provider.force_flush().unwrap();
+        let gateway_spans = gateway_exporter.get_finished_spans().unwrap();
+        let driver_spans = driver_exporter.get_finished_spans().unwrap();
+        assert_eq!(
+            gateway_spans
+                .iter()
+                .map(|span| span.name.as_ref())
+                .collect::<Vec<_>>(),
+            ["gateway.span"]
+        );
+        assert_eq!(
+            driver_spans
+                .iter()
+                .map(|span| span.name.as_ref())
+                .collect::<Vec<_>>(),
+            ["driver.span"]
+        );
+        assert_eq!(
+            driver_spans[0].span_context.trace_id(),
+            gateway_spans[0].span_context.trace_id()
+        );
+        assert_eq!(
+            driver_spans[0].parent_span_id,
+            gateway_spans[0].span_context.span_id()
+        );
+    }
+
+    #[test]
+    fn excluding_no_target_prefix_exports_all_application_spans() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let _tracing_lock = test_lock();
+        let exporter = opentelemetry_sdk::trace::InMemorySpanExporterBuilder::new().build();
+        let provider = SdkTracerProvider::builder()
+            .with_simple_exporter(exporter.clone())
+            .build();
+        let subscriber = tracing_subscriber::registry()
+            .with(layer_excluding_target_prefix(&provider, "gateway", None));
+
+        tracing::subscriber::with_default(subscriber, || {
+            drop(tracing::info_span!(target: "\0driver_target", "nul-prefixed.span"));
+            drop(tracing::info_span!(target: "gateway_target", "gateway.span"));
+        });
+
+        provider.force_flush().unwrap();
+        let spans = exporter.get_finished_spans().unwrap();
+        assert_eq!(spans.len(), 2);
+        assert!(spans.iter().any(|span| span.name == "nul-prefixed.span"));
+        assert!(spans.iter().any(|span| span.name == "gateway.span"));
     }
 
     #[test]

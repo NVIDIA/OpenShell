@@ -336,6 +336,7 @@ impl GovernanceInterceptorService {
                     &[GatewayInterceptorPhase::Validate],
                 ),
             ],
+            expected_audience: String::new(),
         }
     }
 

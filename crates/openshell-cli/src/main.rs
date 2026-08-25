@@ -811,7 +811,7 @@ impl From<CliEditor> for openshell_cli::ssh::Editor {
 #[derive(Subcommand, Debug)]
 enum ProviderCommands {
     /// Create a provider config.
-    #[command(group = clap::ArgGroup::new("cred_source").required(true).args(["from_existing", "credentials", "from_gcloud_adc", "runtime_credentials"]), help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    #[command(group = clap::ArgGroup::new("cred_source").required(true).multiple(true).args(["from_existing", "credentials", "from_gcloud_adc", "runtime_credentials", "from_oidc_token"]), help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Create {
         /// Provider name.
         #[arg(long)]
@@ -822,7 +822,7 @@ enum ProviderCommands {
         provider_type: String,
 
         /// Load provider credentials/config from existing local state.
-        #[arg(long, conflicts_with_all = ["credentials", "from_gcloud_adc", "runtime_credentials"])]
+        #[arg(long, conflicts_with_all = ["credentials", "from_gcloud_adc", "runtime_credentials", "from_oidc_token"])]
         from_existing: bool,
 
         /// Provider credential pair (`KEY=VALUE`) or env lookup key (`KEY`).
@@ -836,11 +836,15 @@ enum ProviderCommands {
         /// Configure credentials from gcloud Application Default Credentials
         /// (`~/.config/gcloud/application_default_credentials.json`).
         /// Valid for providers whose profile declares an ADC-compatible credential.
-        #[arg(long, group = "cred_source", conflicts_with_all = ["from_existing", "credentials", "runtime_credentials"])]
+        #[arg(long, group = "cred_source", conflicts_with_all = ["from_existing", "credentials", "runtime_credentials", "from_oidc_token"])]
         from_gcloud_adc: bool,
 
+        /// Store the active gateway OIDC access token as the named provider credential.
+        #[arg(long, group = "cred_source", conflicts_with_all = ["from_existing", "from_gcloud_adc", "runtime_credentials"])]
+        from_oidc_token: bool,
+
         /// Create a provider whose required credentials are resolved at runtime by the gateway/sandbox.
-        #[arg(long, conflicts_with_all = ["from_existing", "credentials", "from_gcloud_adc"])]
+        #[arg(long, conflicts_with_all = ["from_existing", "credentials", "from_gcloud_adc", "from_oidc_token"])]
         runtime_credentials: bool,
 
         /// Provider config key/value pair.
@@ -913,8 +917,12 @@ enum ProviderCommands {
         name: String,
 
         /// Re-discover credentials from existing local state (e.g. env vars, config files).
-        #[arg(long, conflicts_with = "credentials")]
+        #[arg(long, conflicts_with_all = ["credentials", "from_oidc_token"])]
         from_existing: bool,
+
+        /// Store the active gateway OIDC access token as the named provider credential.
+        #[arg(long, conflicts_with = "from_existing")]
+        from_oidc_token: bool,
 
         /// Provider credential pair (`KEY=VALUE`) or env lookup key (`KEY`).
         #[arg(
@@ -1172,7 +1180,8 @@ enum GatewayCommands {
     /// Authenticate with an edge-authenticated or OIDC gateway.
     ///
     /// Opens a browser for the edge proxy's login flow and stores the
-    /// token locally. Use this to re-authenticate when a token expires.
+    /// token locally. After `gateway logout`, OIDC browser login requests a
+    /// fresh identity-provider prompt so you can switch users.
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Login {
         /// Gateway name (defaults to the active gateway).
@@ -1183,7 +1192,9 @@ enum GatewayCommands {
     /// Clear stored authentication credentials for a gateway.
     ///
     /// Removes the locally stored OIDC token or edge token so subsequent
-    /// commands require re-authentication via `gateway login`.
+    /// commands require re-authentication via `gateway login`. For OIDC
+    /// gateways, the next browser login asks the identity provider for a fresh
+    /// login instead of silently reusing an existing browser session.
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Logout {
         /// Gateway name (defaults to the active gateway).
@@ -1348,7 +1359,12 @@ enum SandboxCommands {
         /// working directory.
         /// `.gitignore` rules are applied by default; use `--no-git-ignore` to
         /// upload everything.
-        #[arg(long, value_hint = ValueHint::AnyPath, help_heading = "UPLOAD FLAGS")]
+        #[arg(
+            long,
+            value_hint = ValueHint::AnyPath,
+            help_heading = "UPLOAD FLAGS",
+            conflicts_with = "command"
+        )]
         upload: Vec<String>,
 
         /// Disable `.gitignore` filtering for `--upload`.
@@ -1418,6 +1434,10 @@ enum SandboxCommands {
         #[arg(long, overrides_with = "tty")]
         no_tty: bool,
 
+        /// Start the canonical main process without attaching to it.
+        #[arg(long, conflicts_with_all = ["editor", "no_keep"])]
+        detach: bool,
+
         /// Auto-create missing providers from local credentials.
         ///
         /// Without this flag, an interactive prompt asks per-provider;
@@ -1438,6 +1458,10 @@ enum SandboxCommands {
         /// a provider and attach it with `--provider` instead. Repeatable.
         #[arg(long = "env", value_name = "KEY=VALUE")]
         envs: Vec<String>,
+
+        /// Suppress warnings when --env values look like credentials.
+        #[arg(long = "no-credential-warnings")]
+        no_credential_warnings: bool,
 
         /// Approval mode for agent-authored policy proposals.
         ///
@@ -1520,6 +1544,22 @@ enum SandboxCommands {
         all: bool,
     },
 
+    /// Stop a sandbox while preserving its workspace.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Stop {
+        /// Sandbox name (defaults to last-used sandbox).
+        #[arg(add = ArgValueCompleter::new(completers::complete_sandbox_names))]
+        name: Option<String>,
+    },
+
+    /// Start a stopped sandbox.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Start {
+        /// Sandbox name (defaults to last-used sandbox).
+        #[arg(add = ArgValueCompleter::new(completers::complete_sandbox_names))]
+        name: Option<String>,
+    },
+
     /// Execute a command in a running sandbox.
     ///
     /// Runs a command inside an existing sandbox using the gRPC exec endpoint.
@@ -1571,6 +1611,7 @@ enum SandboxCommands {
     /// Connect to a sandbox.
     ///
     /// When no name is given, reconnects to the last-used sandbox.
+    /// Press Ctrl-P Ctrl-Q to disconnect without terminating the main process.
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Connect {
         /// Sandbox name (defaults to last-used sandbox).
@@ -1771,6 +1812,8 @@ enum PolicyCommands {
         name: Option<String>,
 
         /// Add or merge an endpoint: host:port[:access[:protocol[:enforcement[:options]]]].
+        /// Options include allowed-ip=..., credential rewrite flags, and
+        /// allow-uninspected-credentials.
         #[arg(long = "add-endpoint")]
         add_endpoints: Vec<String>,
 
@@ -2146,9 +2189,34 @@ enum WorkspaceMemberCommands {
     },
 }
 
+#[cfg(target_os = "windows")]
+fn main() -> Result<()> {
+    std::thread::Builder::new()
+        .name("openshell-main".to_string())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(run_main)
+        .map_err(|err| miette::miette!("failed to start OpenShell main thread: {err}"))?
+        .join()
+        .map_err(|_| miette::miette!("OpenShell main thread panicked"))?
+}
+
+#[cfg(not(target_os = "windows"))]
 #[tokio::main]
-#[allow(clippy::large_stack_frames)] // CLI dispatch holds many futures; OK at top level.
 async fn main() -> Result<()> {
+    run_async().await
+}
+
+#[cfg(target_os = "windows")]
+fn run_main() -> Result<()> {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|err| miette::miette!("failed to build Tokio runtime: {err}"))?
+        .block_on(run_async())
+}
+
+#[allow(clippy::large_stack_frames)] // CLI dispatch holds many futures; run on an expanded Windows stack.
+async fn run_async() -> Result<()> {
     // Install the rustls crypto provider before completion runs — completers may
     // establish TLS connections to the gateway.
     rustls::crypto::ring::default_provider()
@@ -2930,10 +2998,12 @@ async fn main() -> Result<()> {
                     forward,
                     tty,
                     no_tty,
+                    detach,
                     auto_providers,
                     no_auto_providers,
                     labels,
                     envs,
+                    no_credential_warnings,
                     approval_mode,
                     output,
                     command,
@@ -2971,6 +3041,7 @@ async fn main() -> Result<()> {
 
                     // Parse --env flags into a HashMap<String, String>.
                     let env_map = run::parse_env_pairs(&envs)?;
+                    run::warn_credential_env_vars(&env_map, no_credential_warnings);
 
                     // Parse --upload specs into [(local_path, sandbox_path, git_ignore)].
                     let upload_specs: Vec<(String, Option<String>, bool)> = upload
@@ -3023,6 +3094,7 @@ async fn main() -> Result<()> {
                             environment: env_map,
                             approval_mode: &approval_mode,
                             output: output.as_str(),
+                            detach,
                         },
                         &cli.workspace,
                         &tls,
@@ -3131,6 +3203,14 @@ async fn main() -> Result<()> {
                                 &ctx.name,
                             )
                             .await?;
+                        }
+                        SandboxCommands::Stop { name } => {
+                            let name = resolve_sandbox_name(name, &ctx.name, &cli.workspace)?;
+                            run::sandbox_stop(endpoint, &name, &cli.workspace, &tls).await?;
+                        }
+                        SandboxCommands::Start { name } => {
+                            let name = resolve_sandbox_name(name, &ctx.name, &cli.workspace)?;
+                            run::sandbox_start(endpoint, &name, &cli.workspace, &tls).await?;
                         }
                         SandboxCommands::Connect { name, editor } => {
                             let name = resolve_sandbox_name(name, &ctx.name, &cli.workspace)?;
@@ -3297,24 +3377,34 @@ async fn main() -> Result<()> {
                     from_existing,
                     credentials,
                     from_gcloud_adc,
+                    from_oidc_token,
                     runtime_credentials,
                     config,
                     global_profile,
                 } => {
                     let profile_ws = if global_profile { "" } else { &cli.workspace };
-                    run::provider_create_with_options(
-                        endpoint,
-                        &name,
-                        provider_type.as_str(),
-                        from_existing,
-                        &credentials,
-                        from_gcloud_adc,
-                        runtime_credentials,
-                        &config,
-                        &cli.workspace,
-                        profile_ws,
-                        &tls,
-                    )
+                    let credential_source = if from_existing {
+                        run::ProviderCreateCredentialSource::Existing
+                    } else if from_gcloud_adc {
+                        run::ProviderCreateCredentialSource::GcloudAdc
+                    } else if from_oidc_token {
+                        run::ProviderCreateCredentialSource::OidcToken
+                    } else if runtime_credentials {
+                        run::ProviderCreateCredentialSource::Runtime
+                    } else {
+                        run::ProviderCreateCredentialSource::ExplicitCredentials
+                    };
+                    run::provider_create_with_options(run::ProviderCreateOptions {
+                        server: endpoint,
+                        name: &name,
+                        provider_type: provider_type.as_str(),
+                        credentials: &credentials,
+                        credential_source,
+                        config: &config,
+                        workspace: &cli.workspace,
+                        profile_workspace: profile_ws,
+                        tls: &tls,
+                    })
                     .await?;
                 }
                 ProviderCommands::Refresh(command) => match command {
@@ -3467,20 +3557,22 @@ async fn main() -> Result<()> {
                 ProviderCommands::Update {
                     name,
                     from_existing,
+                    from_oidc_token,
                     credentials,
                     config,
                     credential_expires_at,
                 } => {
-                    run::provider_update(
-                        endpoint,
-                        &name,
+                    run::provider_update(run::ProviderUpdateOptions {
+                        server: endpoint,
+                        name: &name,
                         from_existing,
-                        &credentials,
-                        &config,
-                        &credential_expires_at,
-                        &cli.workspace,
-                        &tls,
-                    )
+                        from_oidc_token,
+                        credentials: &credentials,
+                        config: &config,
+                        credential_expires_at: &credential_expires_at,
+                        workspace: &cli.workspace,
+                        tls: &tls,
+                    })
                     .await?;
                 }
                 ProviderCommands::Delete { names } => {
@@ -4433,6 +4525,27 @@ mod tests {
     }
 
     #[test]
+    fn sandbox_stop_and_start_accept_optional_names() {
+        let stop = Cli::try_parse_from(["openshell", "sandbox", "stop", "demo"])
+            .expect("stop command should parse");
+        assert!(matches!(
+            stop.command,
+            Some(Commands::Sandbox {
+                command: Some(SandboxCommands::Stop { name: Some(ref name) }),
+            }) if name == "demo"
+        ));
+
+        let start = Cli::try_parse_from(["openshell", "sandbox", "start"])
+            .expect("start command should parse");
+        assert!(matches!(
+            start.command,
+            Some(Commands::Sandbox {
+                command: Some(SandboxCommands::Start { name: None }),
+            })
+        ));
+    }
+
+    #[test]
     fn sandbox_list_accepts_output_json() {
         let cli = Cli::try_parse_from(["openshell", "sandbox", "list", "-o", "json"])
             .expect("sandbox list -o json should parse");
@@ -5045,6 +5158,55 @@ mod tests {
                 panic!("expected SandboxCommands::Create");
             }
         }
+    }
+
+    #[test]
+    fn sandbox_create_detach_parses_with_main_command() {
+        let cli = Cli::try_parse_from([
+            "openshell",
+            "sandbox",
+            "create",
+            "--detach",
+            "--",
+            "worker",
+            "--serve",
+        ])
+        .expect("sandbox create --detach should parse");
+
+        match cli.command {
+            Some(Commands::Sandbox {
+                command:
+                    Some(SandboxCommands::Create {
+                        detach, command, ..
+                    }),
+                ..
+            }) => {
+                assert!(detach);
+                assert_eq!(command, ["worker", "--serve"]);
+            }
+            other => panic!("expected SandboxCommands::Create, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sandbox_create_detach_rejects_ephemeral_sandbox() {
+        let result =
+            Cli::try_parse_from(["openshell", "sandbox", "create", "--detach", "--no-keep"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn sandbox_create_rejects_upload_with_main_command() {
+        let result = Cli::try_parse_from([
+            "openshell",
+            "sandbox",
+            "create",
+            "--upload",
+            ".",
+            "--",
+            "./run-uploaded-app",
+        ]);
+        assert!(result.is_err());
     }
 
     /// `sandbox create` defaults `--approval-mode` to `"manual"`. The CLI

@@ -39,7 +39,7 @@ When enabled, OCSF JSON records are written to `/var/log/openshell-ocsf.YYYY-MM-
 
 ## JSON Record Structure
 
-Each line is a complete OCSF v1.7.0 JSON object. Here is an example of a network connection event:
+Each line is a complete OCSF v1.8.0 JSON object. Here is an example of a network connection event:
 
 ```json
 {
@@ -61,7 +61,7 @@ Each line is a complete OCSF v1.7.0 JSON object. Here is an example of a network
       "vendor_name": "NVIDIA",
       "version": "0.3.0"
     },
-    "version": "1.7.0"
+    "version": "1.8.0"
   },
   "action_id": 1,
   "action": "Allowed",
@@ -140,6 +140,33 @@ The `class_uid` field identifies the event type:
 | 2004 | Detection Finding | `FINDING:` |
 | 5019 | Device Config State Change | `CONFIG:` |
 | 6002 | Application Lifecycle | `LIFECYCLE:` |
+| 6003 | API Activity | `API:INFERENCE` |
+
+### API Activity [6003] — AI Inference
+
+When the inference proxy routes a model call through `inference.local`, an API Activity event is emitted with the `ai_operation` profile:
+
+```json
+{
+  "class_uid": 6003,
+  "class_name": "API Activity",
+  "activity_id": 99,
+  "activity_name": "Other",
+  "api": { "operation": "POST /v1/messages" },
+  "actor": { "process": { "name": "openshell-supervisor", "pid": 1 } },
+  "src_endpoint": { "ip": "127.0.0.1", "port": 3128 },
+  "ai_model": { "name": "claude-haiku-4-5-20251001", "ai_provider": "https://api.anthropic.com/v1" },
+  "metadata": { "version": "1.8.0", "profiles": ["container", "host", "ai_operation"] },
+  "status": "Success",
+  "unmapped": { "latency_ms": 701 }
+}
+```
+
+The shorthand log renders this as:
+
+```text
+OCSF API:INFERENCE [INFO] Success claude-haiku-4-5-20251001 via https://api.anthropic.com/v1 701ms [POST /v1/messages]
+```
 
 ## Integration with External Tools
 

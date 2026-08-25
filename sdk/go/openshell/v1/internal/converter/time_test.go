@@ -11,7 +11,7 @@ import (
 )
 
 func TestTimeFromMillis(t *testing.T) {
-	ms := int64(1719475200000) // 2024-06-27T08:00:00Z
+	ms := int64(1719475200000) // 2024-06-27T12:00:00Z
 	tm := TimeFromMillis(ms)
 	assert.Equal(t, 2024, tm.Year())
 	assert.Equal(t, time.June, tm.Month())

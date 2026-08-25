@@ -11,9 +11,9 @@ use openshell_core::proto::gateway_interceptor::v1::{
 };
 use prost::Message as _;
 use sha2::Digest as _;
-use tonic::{Request, transport::Channel};
+use tonic::Request;
 
-use crate::{InterceptorError, Result};
+use crate::{ExtensionChannel, InterceptorError, Result};
 
 #[derive(Debug, Clone)]
 pub struct ProviderProfileSourceSnapshot {
@@ -26,7 +26,7 @@ pub struct GatewayInterceptorProfileSource {
     interceptor_name: String,
     source_id: String,
     timeout: Duration,
-    client: GatewayInterceptorClient<Channel>,
+    client: GatewayInterceptorClient<ExtensionChannel>,
 }
 
 impl GatewayInterceptorProfileSource {
@@ -34,7 +34,7 @@ impl GatewayInterceptorProfileSource {
         interceptor_name: String,
         source_id: String,
         timeout: Duration,
-        client: GatewayInterceptorClient<Channel>,
+        client: GatewayInterceptorClient<ExtensionChannel>,
     ) -> Self {
         Self {
             interceptor_name,

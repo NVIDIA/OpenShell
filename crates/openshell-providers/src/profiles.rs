@@ -9,11 +9,14 @@ use openshell_core::proto::{
     GraphqlOperation, L7Allow, L7DenyRule, L7QueryMatcher, L7Rule, McpOptions, NetworkBinary,
     NetworkEndpoint, NetworkPolicyRule, ProviderCredentialRefresh,
     ProviderCredentialRefreshMaterial, ProviderCredentialRefreshOutput,
-    ProviderCredentialRefreshStrategy, ProviderProfile, ProviderProfileCategory,
+    ProviderCredentialRefreshStrategy, ProviderCredentialTokenGrantSubjectToken,
+    ProviderCredentialTokenGrantType, ProviderProfile, ProviderProfileCategory,
     ProviderProfileCredential, ProviderProfileDiscovery,
 };
 use openshell_core::secrets::uses_reserved_revision_namespace;
-use openshell_policy::{L7EndpointFields, validate_l7_endpoint_semantics};
+use openshell_policy::{
+    L7EndpointFields, validate_explicit_tcp_additional_fields, validate_l7_endpoint_semantics,
+};
 use serde::ser::SerializeStruct;
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use std::collections::{HashMap, HashSet};
@@ -111,6 +114,13 @@ pub struct CredentialProfile {
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct TokenGrantProfile {
+    #[serde(
+        default = "default_token_grant_type",
+        deserialize_with = "deserialize_token_grant_type",
+        serialize_with = "serialize_token_grant_type",
+        skip_serializing_if = "is_client_credentials_grant"
+    )]
+    pub grant_type: ProviderCredentialTokenGrantType,
     pub token_endpoint: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub audience: String,
@@ -124,6 +134,18 @@ pub struct TokenGrantProfile {
     pub cache_ttl_seconds: i64,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub audience_overrides: Vec<TokenGrantAudienceOverrideProfile>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject_token: Option<TokenGrantSubjectTokenProfile>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub requested_token_type: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct TokenGrantSubjectTokenProfile {
+    pub source: String,
+    pub credential: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub subject_token_type: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -195,6 +217,10 @@ pub struct DiscoveryProfile {
 // GraphqlOperation, or NetworkBinary, add it here and in both conversion
 // directions unless the import/lint path explicitly rejects it.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "Endpoint profile mirrors independent policy schema toggles."
+)]
 pub struct EndpointProfile {
     pub host: String,
     #[serde(default, skip_serializing_if = "is_zero")]
@@ -221,6 +247,8 @@ pub struct EndpointProfile {
     pub websocket_credential_rewrite: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     pub request_body_credential_rewrite: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub allow_uninspected_credentials: bool,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub persisted_queries: String,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
@@ -651,6 +679,21 @@ impl ProviderTypeProfile {
         }
         diagnostics
     }
+
+    /// Whether attaching this profile makes its network endpoints credentialed.
+    ///
+    /// Profiles do not currently map individual credentials to individual
+    /// endpoints, so the safe interpretation is that any declared credential
+    /// can be used with every endpoint in the same profile. Endpoint signing is
+    /// also credential-bearing even when placement metadata is implicit.
+    #[must_use]
+    pub fn has_credentialed_endpoints(&self) -> bool {
+        !self.credentials.is_empty()
+            || self
+                .endpoints
+                .iter()
+                .any(|endpoint| !endpoint.credential_signing.trim().is_empty())
+    }
 }
 
 #[allow(clippy::trivially_copy_pass_by_ref)]
@@ -816,6 +859,26 @@ fn default_refresh_strategy() -> ProviderCredentialRefreshStrategy {
     ProviderCredentialRefreshStrategy::Unspecified
 }
 
+fn default_token_grant_type() -> ProviderCredentialTokenGrantType {
+    ProviderCredentialTokenGrantType::ClientCredentials
+}
+
+fn effective_token_grant_type(
+    grant_type: ProviderCredentialTokenGrantType,
+) -> ProviderCredentialTokenGrantType {
+    match grant_type {
+        ProviderCredentialTokenGrantType::Unspecified => {
+            ProviderCredentialTokenGrantType::ClientCredentials
+        }
+        other => other,
+    }
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_client_credentials_grant(value: &ProviderCredentialTokenGrantType) -> bool {
+    effective_token_grant_type(*value) == ProviderCredentialTokenGrantType::ClientCredentials
+}
+
 fn deserialize_category<'de, D>(deserializer: D) -> Result<ProviderProfileCategory, D::Error>
 where
     D: Deserializer<'de>,
@@ -856,6 +919,28 @@ where
     S: Serializer,
 {
     serializer.serialize_str(provider_refresh_strategy_to_yaml(*strategy))
+}
+
+fn deserialize_token_grant_type<'de, D>(
+    deserializer: D,
+) -> Result<ProviderCredentialTokenGrantType, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let raw = String::deserialize(deserializer)?;
+    provider_token_grant_type_from_yaml(&raw)
+        .ok_or_else(|| de::Error::custom(format!("unsupported provider token grant type: {raw}")))
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn serialize_token_grant_type<S>(
+    grant_type: &ProviderCredentialTokenGrantType,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    serializer.serialize_str(provider_token_grant_type_to_yaml(*grant_type))
 }
 
 #[must_use]
@@ -915,6 +1000,26 @@ pub fn provider_refresh_strategy_to_yaml(
         ProviderCredentialRefreshStrategy::GoogleServiceAccountJwt => "google_service_account_jwt",
         ProviderCredentialRefreshStrategy::AwsStsAssumeRole => "aws_sts_assume_role",
         ProviderCredentialRefreshStrategy::Unspecified => "unspecified",
+    }
+}
+
+#[must_use]
+pub fn provider_token_grant_type_from_yaml(raw: &str) -> Option<ProviderCredentialTokenGrantType> {
+    match raw.trim().to_ascii_lowercase().replace('-', "_").as_str() {
+        "" | "client_credentials" => Some(ProviderCredentialTokenGrantType::ClientCredentials),
+        "token_exchange" => Some(ProviderCredentialTokenGrantType::TokenExchange),
+        _ => None,
+    }
+}
+
+#[must_use]
+pub fn provider_token_grant_type_to_yaml(
+    grant_type: ProviderCredentialTokenGrantType,
+) -> &'static str {
+    match grant_type {
+        ProviderCredentialTokenGrantType::TokenExchange => "token_exchange",
+        ProviderCredentialTokenGrantType::ClientCredentials
+        | ProviderCredentialTokenGrantType::Unspecified => "client_credentials",
     }
 }
 
@@ -979,6 +1084,10 @@ fn token_grant_from_proto(
     token_grant: &openshell_core::proto::ProviderCredentialTokenGrant,
 ) -> TokenGrantProfile {
     TokenGrantProfile {
+        grant_type: effective_token_grant_type(
+            ProviderCredentialTokenGrantType::try_from(token_grant.grant_type)
+                .unwrap_or(ProviderCredentialTokenGrantType::ClientCredentials),
+        ),
         token_endpoint: token_grant.token_endpoint.clone(),
         audience: token_grant.audience.clone(),
         jwt_svid_audience: token_grant.jwt_svid_audience.clone(),
@@ -990,6 +1099,11 @@ fn token_grant_from_proto(
             .iter()
             .map(token_grant_audience_override_from_proto)
             .collect(),
+        subject_token: token_grant
+            .subject_token
+            .as_ref()
+            .map(token_grant_subject_token_from_proto),
+        requested_token_type: token_grant.requested_token_type.clone(),
     }
 }
 
@@ -997,6 +1111,7 @@ fn token_grant_to_proto(
     token_grant: &TokenGrantProfile,
 ) -> openshell_core::proto::ProviderCredentialTokenGrant {
     openshell_core::proto::ProviderCredentialTokenGrant {
+        grant_type: token_grant.grant_type as i32,
         token_endpoint: token_grant.token_endpoint.clone(),
         audience: token_grant.audience.clone(),
         jwt_svid_audience: token_grant.jwt_svid_audience.clone(),
@@ -1008,6 +1123,31 @@ fn token_grant_to_proto(
             .iter()
             .map(token_grant_audience_override_to_proto)
             .collect(),
+        subject_token: token_grant
+            .subject_token
+            .as_ref()
+            .map(token_grant_subject_token_to_proto),
+        requested_token_type: token_grant.requested_token_type.clone(),
+    }
+}
+
+fn token_grant_subject_token_from_proto(
+    subject_token: &ProviderCredentialTokenGrantSubjectToken,
+) -> TokenGrantSubjectTokenProfile {
+    TokenGrantSubjectTokenProfile {
+        source: subject_token.source.clone(),
+        credential: subject_token.credential.clone(),
+        subject_token_type: subject_token.subject_token_type.clone(),
+    }
+}
+
+fn token_grant_subject_token_to_proto(
+    subject_token: &TokenGrantSubjectTokenProfile,
+) -> ProviderCredentialTokenGrantSubjectToken {
+    ProviderCredentialTokenGrantSubjectToken {
+        source: subject_token.source.clone(),
+        credential: subject_token.credential.clone(),
+        subject_token_type: subject_token.subject_token_type.clone(),
     }
 }
 
@@ -1074,6 +1214,8 @@ fn endpoint_to_proto(endpoint: &EndpointProfile) -> NetworkEndpoint {
         allow_encoded_slash: endpoint.allow_encoded_slash,
         websocket_credential_rewrite: endpoint.websocket_credential_rewrite,
         request_body_credential_rewrite: endpoint.request_body_credential_rewrite,
+        allow_uninspected_credentials: endpoint.allow_uninspected_credentials,
+        provider_credentialed: false,
         advisor_proposed: false,
         persisted_queries: endpoint.persisted_queries.clone(),
         graphql_persisted_queries: endpoint
@@ -1123,6 +1265,7 @@ fn endpoint_from_proto(endpoint: &NetworkEndpoint) -> EndpointProfile {
         allow_encoded_slash: endpoint.allow_encoded_slash,
         websocket_credential_rewrite: endpoint.websocket_credential_rewrite,
         request_body_credential_rewrite: endpoint.request_body_credential_rewrite,
+        allow_uninspected_credentials: endpoint.allow_uninspected_credentials,
         persisted_queries: endpoint.persisted_queries.clone(),
         graphql_persisted_queries: endpoint
             .graphql_persisted_queries
@@ -1545,6 +1688,10 @@ pub fn validate_profile_set(
             }
         }
 
+        diagnostics.extend(validate_broker_only_subject_credentials(
+            source, profile_id, profile,
+        ));
+
         let mut env_vars = HashSet::new();
         for credential in &profile.credentials {
             for env_var in &credential.env_vars {
@@ -1816,6 +1963,12 @@ pub fn validate_profile_set(
                     message,
                 ));
             }
+            diagnostics.extend(validate_token_grant_subject_token(
+                source,
+                profile_id,
+                credential,
+                &credential_names,
+            ));
             diagnostics.extend(validate_token_grant_audience_overrides(
                 source,
                 profile_id,
@@ -1892,6 +2045,17 @@ pub fn validate_profile_set(
                     .unwrap_or(false),
             };
             for msg in validate_l7_endpoint_semantics(&l7_fields) {
+                diagnostics.push(ProfileValidationDiagnostic::error(
+                    source,
+                    profile_id,
+                    format!("endpoints[{index}]"),
+                    msg,
+                ));
+            }
+            for msg in validate_explicit_tcp_additional_fields(
+                &endpoint.protocol,
+                &additional_l7_profile_fields(endpoint),
+            ) {
                 diagnostics.push(ProfileValidationDiagnostic::error(
                     source,
                     profile_id,
@@ -2189,6 +2353,27 @@ pub fn validate_profile_set(
                     }
                 }
             }
+
+            if profile.has_credentialed_endpoints()
+                && !endpoint.allow_uninspected_credentials
+                && (endpoint.protocol.trim().is_empty()
+                    || endpoint.tls.trim().eq_ignore_ascii_case("skip"))
+            {
+                let mode = if endpoint.protocol.trim().is_empty() {
+                    "L4-only"
+                } else {
+                    "tls: skip"
+                };
+                diagnostics.push(ProfileValidationDiagnostic::error(
+                    source,
+                    profile_id,
+                    format!("endpoints[{index}].allow_uninspected_credentials"),
+                    format!(
+                        "credentialed endpoint '{}:{}' uses {mode}; configure L7 inspection or explicitly set allow_uninspected_credentials: true",
+                        endpoint.host, endpoint.port
+                    ),
+                ));
+            }
         }
 
         for (index, binary) in profile.binaries.iter().enumerate() {
@@ -2218,6 +2403,49 @@ fn endpoint_is_valid(endpoint: &EndpointProfile) -> bool {
     (1..=65_535).contains(&endpoint.port)
 }
 
+fn additional_l7_profile_fields(endpoint: &EndpointProfile) -> Vec<&'static str> {
+    let mut fields = Vec::new();
+    for (name, present) in [
+        ("enforcement", !endpoint.enforcement.is_empty()),
+        ("path", !endpoint.path.is_empty()),
+        ("allow_encoded_slash", endpoint.allow_encoded_slash),
+        (
+            "websocket_credential_rewrite",
+            endpoint.websocket_credential_rewrite,
+        ),
+        (
+            "request_body_credential_rewrite",
+            endpoint.request_body_credential_rewrite,
+        ),
+        ("persisted_queries", !endpoint.persisted_queries.is_empty()),
+        (
+            "graphql_persisted_queries",
+            !endpoint.graphql_persisted_queries.is_empty(),
+        ),
+        (
+            "graphql_max_body_bytes",
+            endpoint.graphql_max_body_bytes > 0,
+        ),
+        (
+            "json_rpc_max_body_bytes",
+            endpoint.json_rpc_max_body_bytes > 0,
+        ),
+        ("mcp", endpoint.mcp.is_some()),
+        (
+            "credential_signing",
+            !endpoint.credential_signing.is_empty(),
+        ),
+        ("signing_service", !endpoint.signing_service.is_empty()),
+        ("signing_region", !endpoint.signing_region.is_empty()),
+    ] {
+        if present {
+            fields.push(name);
+        }
+    }
+
+    fields
+}
+
 #[derive(Debug, Clone)]
 struct TokenGrantOverrideBinding {
     override_index: usize,
@@ -2225,6 +2453,133 @@ struct TokenGrantOverrideBinding {
     port: u32,
     path: String,
     score: u32,
+}
+
+fn validate_token_grant_subject_token(
+    source: &str,
+    profile_id: &str,
+    credential: &CredentialProfile,
+    credential_names: &HashSet<String>,
+) -> Vec<ProfileValidationDiagnostic> {
+    let Some(token_grant) = credential.token_grant.as_ref() else {
+        return Vec::new();
+    };
+    let grant_type = effective_token_grant_type(token_grant.grant_type);
+    let mut diagnostics = Vec::new();
+
+    match grant_type {
+        ProviderCredentialTokenGrantType::ClientCredentials => {
+            if token_grant.subject_token.is_some() {
+                diagnostics.push(ProfileValidationDiagnostic::error(
+                    source,
+                    profile_id,
+                    "credentials.token_grant.subject_token",
+                    "subject_token is only valid for token_exchange grants",
+                ));
+            }
+        }
+        ProviderCredentialTokenGrantType::TokenExchange => {
+            let Some(subject_token) = token_grant.subject_token.as_ref() else {
+                diagnostics.push(ProfileValidationDiagnostic::error(
+                    source,
+                    profile_id,
+                    "credentials.token_grant.subject_token",
+                    "token_exchange grants require subject_token",
+                ));
+                return diagnostics;
+            };
+
+            let source_value = subject_token.source.trim();
+            if source_value != "provider_credential" {
+                diagnostics.push(ProfileValidationDiagnostic::error(
+                    source,
+                    profile_id,
+                    "credentials.token_grant.subject_token.source",
+                    "subject_token.source must be provider_credential",
+                ));
+            }
+
+            let subject_credential = subject_token.credential.trim();
+            if subject_credential.is_empty() {
+                diagnostics.push(ProfileValidationDiagnostic::error(
+                    source,
+                    profile_id,
+                    "credentials.token_grant.subject_token.credential",
+                    "subject_token.credential is required",
+                ));
+            } else if !credential_names.contains(subject_credential) {
+                diagnostics.push(ProfileValidationDiagnostic::error(
+                    source,
+                    profile_id,
+                    "credentials.token_grant.subject_token.credential",
+                    format!("unknown subject token credential: {subject_credential}"),
+                ));
+            }
+        }
+        ProviderCredentialTokenGrantType::Unspecified => {
+            unreachable!("effective_token_grant_type must normalize unspecified token grant type")
+        }
+    }
+
+    diagnostics
+}
+
+fn validate_broker_only_subject_credentials(
+    source: &str,
+    profile_id: &str,
+    profile: &ProviderTypeProfile,
+) -> Vec<ProfileValidationDiagnostic> {
+    let subject_credentials = token_exchange_subject_credential_names(profile);
+    if subject_credentials.is_empty() {
+        return Vec::new();
+    }
+
+    let mut diagnostics = Vec::new();
+    for credential in &profile.credentials {
+        let credential_name = credential.name.trim();
+        if !subject_credentials.contains(credential_name) {
+            continue;
+        }
+        if credential_has_workload_injection_metadata(credential) {
+            diagnostics.push(ProfileValidationDiagnostic::error(
+                source,
+                profile_id,
+                "credentials.token_grant.subject_token.credential",
+                format!(
+                    "subject token credential '{credential_name}' is broker-only and cannot declare workload injection metadata"
+                ),
+            ));
+        }
+    }
+    diagnostics
+}
+
+fn token_exchange_subject_credential_names(profile: &ProviderTypeProfile) -> HashSet<&str> {
+    profile
+        .credentials
+        .iter()
+        .filter_map(|credential| credential.token_grant.as_ref())
+        .filter(|token_grant| {
+            effective_token_grant_type(token_grant.grant_type)
+                == ProviderCredentialTokenGrantType::TokenExchange
+        })
+        .filter_map(|token_grant| token_grant.subject_token.as_ref())
+        .filter(|subject_token| subject_token.source.trim() == "provider_credential")
+        .filter_map(|subject_token| {
+            let credential = subject_token.credential.trim();
+            (!credential.is_empty()).then_some(credential)
+        })
+        .collect()
+}
+
+fn credential_has_workload_injection_metadata(credential: &CredentialProfile) -> bool {
+    !credential.env_vars.is_empty()
+        || !credential.auth_style.trim().is_empty()
+        || !credential.header_name.trim().is_empty()
+        || !credential.query_param.trim().is_empty()
+        || !credential.path_template.trim().is_empty()
+        || credential.refresh.is_some()
+        || credential.token_grant.is_some()
 }
 
 fn validate_token_grant_audience_overrides(
@@ -2556,7 +2911,7 @@ pub fn builtin_profiles() -> &'static [ProviderTypeProfile] {
 mod tests {
     use std::collections::HashMap;
 
-    use openshell_core::proto::ProviderProfileCategory;
+    use openshell_core::proto::{ProviderCredentialTokenGrantType, ProviderProfileCategory};
 
     use super::{
         DiscoveryProfile, L7AllowProfile, L7QueryMatcherProfile, ProfileError, ProviderTypeProfile,
@@ -3141,6 +3496,204 @@ credentials:
     }
 
     #[test]
+    fn token_exchange_grant_round_trips_through_proto_and_yaml() {
+        let profile = parse_profile_yaml(
+            r"
+id: keycloak-token-exchange
+display_name: Keycloak Token Exchange
+credentials:
+  - name: USER_OIDC_TOKEN
+    required: true
+  - name: access_token
+    auth_style: bearer
+    header_name: Authorization
+    token_grant:
+      grant_type: token_exchange
+      token_endpoint: https://keycloak.example.com/realms/openshell/protocol/openid-connect/token
+      subject_token:
+        source: provider_credential
+        credential: USER_OIDC_TOKEN
+        subject_token_type: urn:ietf:params:oauth:token-type:access_token
+      jwt_svid_audience: https://keycloak.example.com/realms/openshell
+      client_assertion_type: urn:ietf:params:oauth:client-assertion-type:jwt-bearer
+      audience: https://graph.example.com
+      scopes: [graph.read]
+      requested_token_type: urn:ietf:params:oauth:token-type:access_token
+",
+        )
+        .expect("profile should parse");
+
+        let diagnostics =
+            validate_profile_set(&[("keycloak-token-exchange.yaml".to_string(), profile.clone())]);
+        assert!(
+            diagnostics.is_empty(),
+            "unexpected diagnostics: {diagnostics:?}"
+        );
+
+        let token_grant = profile.credentials[1]
+            .token_grant
+            .as_ref()
+            .expect("token grant should parse");
+        assert_eq!(
+            token_grant.grant_type,
+            ProviderCredentialTokenGrantType::TokenExchange
+        );
+        assert_eq!(
+            token_grant
+                .subject_token
+                .as_ref()
+                .map(|subject| subject.credential.as_str()),
+            Some("USER_OIDC_TOKEN")
+        );
+
+        let from_proto = ProviderTypeProfile::from_proto(&profile.to_proto());
+        assert_eq!(
+            from_proto.credentials[1].token_grant,
+            profile.credentials[1].token_grant
+        );
+
+        let exported = profile_to_yaml(&from_proto).expect("yaml");
+        assert!(exported.contains("grant_type: token_exchange"));
+        assert!(exported.contains("subject_token:"));
+        let reparsed = parse_profile_yaml(&exported).expect("re-parse");
+        assert_eq!(
+            reparsed.credentials[1].token_grant,
+            profile.credentials[1].token_grant
+        );
+    }
+
+    #[test]
+    fn validate_profile_set_rejects_token_exchange_without_subject_token() {
+        let profile = parse_profile_yaml(
+            r"
+id: missing-subject-token
+display_name: Missing Subject Token
+credentials:
+  - name: access_token
+    auth_style: bearer
+    header_name: Authorization
+    token_grant:
+      grant_type: token_exchange
+      token_endpoint: https://keycloak.example.com/realms/openshell/protocol/openid-connect/token
+",
+        )
+        .expect("profile should parse");
+
+        let diagnostics = validate_profile_set(&[("missing.yaml".to_string(), profile)]);
+        let diagnostic = diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.field == "credentials.token_grant.subject_token")
+            .expect("expected subject_token diagnostic");
+        assert_eq!(
+            diagnostic.message,
+            "token_exchange grants require subject_token"
+        );
+    }
+
+    #[test]
+    fn validate_profile_set_rejects_token_exchange_unknown_subject_credential() {
+        let profile = parse_profile_yaml(
+            r"
+id: unknown-subject-token
+display_name: Unknown Subject Token
+credentials:
+  - name: access_token
+    auth_style: bearer
+    header_name: Authorization
+    token_grant:
+      grant_type: token_exchange
+      token_endpoint: https://keycloak.example.com/realms/openshell/protocol/openid-connect/token
+      subject_token:
+        source: provider_credential
+        credential: USER_OIDC_TOKEN
+",
+        )
+        .expect("profile should parse");
+
+        let diagnostics = validate_profile_set(&[("unknown.yaml".to_string(), profile)]);
+        let diagnostic = diagnostics
+            .iter()
+            .find(|diagnostic| {
+                diagnostic.field == "credentials.token_grant.subject_token.credential"
+            })
+            .expect("expected subject token credential diagnostic");
+        assert!(
+            diagnostic
+                .message
+                .contains("unknown subject token credential: USER_OIDC_TOKEN")
+        );
+    }
+
+    #[test]
+    fn validate_profile_set_rejects_injectable_token_exchange_subject_credential() {
+        let profile = parse_profile_yaml(
+            r"
+id: injectable-subject-token
+display_name: Injectable Subject Token
+credentials:
+  - name: USER_OIDC_TOKEN
+    auth_style: header
+    header_name: X-Subject-Token
+  - name: access_token
+    auth_style: bearer
+    header_name: Authorization
+    token_grant:
+      grant_type: token_exchange
+      token_endpoint: https://keycloak.example.com/realms/openshell/protocol/openid-connect/token
+      subject_token:
+        source: provider_credential
+        credential: USER_OIDC_TOKEN
+",
+        )
+        .expect("profile should parse");
+
+        let diagnostics = validate_profile_set(&[("injectable.yaml".to_string(), profile)]);
+        let diagnostic = diagnostics
+            .iter()
+            .find(|diagnostic| {
+                diagnostic.field == "credentials.token_grant.subject_token.credential"
+                    && diagnostic.message.contains("broker-only")
+            })
+            .expect("expected broker-only subject token diagnostic");
+        assert!(
+            diagnostic
+                .message
+                .contains("cannot declare workload injection metadata")
+        );
+    }
+
+    #[test]
+    fn validate_profile_set_rejects_subject_token_on_client_credentials_grant() {
+        let profile = parse_profile_yaml(
+            r"
+id: misplaced-subject-token
+display_name: Misplaced Subject Token
+credentials:
+  - name: USER_OIDC_TOKEN
+  - name: access_token
+    auth_style: bearer
+    header_name: Authorization
+    token_grant:
+      token_endpoint: https://keycloak.example.com/realms/openshell/protocol/openid-connect/token
+      subject_token:
+        source: provider_credential
+        credential: USER_OIDC_TOKEN
+",
+        )
+        .expect("profile should parse");
+
+        let diagnostics = validate_profile_set(&[("misplaced.yaml".to_string(), profile)]);
+        let diagnostic = diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.field == "credentials.token_grant.subject_token")
+            .expect("expected subject_token diagnostic");
+        assert_eq!(
+            diagnostic.message,
+            "subject_token is only valid for token_exchange grants"
+        );
+    }
+
+    #[test]
     fn validate_profile_set_rejects_plain_http_token_endpoint() {
         for token_endpoint in [
             "http://auth.example.com/token",
@@ -3338,6 +3891,8 @@ endpoints:
   - host: alpha.default.svc.cluster.local
     port: 80
     path: /v1/**
+    protocol: rest
+    access: full
 ",
         )
         .expect("profile should parse");
@@ -3378,6 +3933,8 @@ endpoints:
   - host: alpha.default.svc.cluster.local
     port: 80
     path: /v1/**
+    protocol: rest
+    access: full
 ",
         )
         .expect("profile should parse");
@@ -3470,6 +4027,7 @@ endpoints:
       - method: POST
         path: /admin/**
     allow_encoded_slash: true
+    allow_uninspected_credentials: true
 binaries:
   - path: /usr/bin/custom
     harness: true
@@ -3503,6 +4061,8 @@ binaries:
         assert_eq!(rest_ep.tls, "terminate");
         assert_eq!(rest_ep.allowed_ips, vec!["10.0.0.0/24"]);
         assert!(rest_ep.allow_encoded_slash);
+        assert!(rest_ep.allow_uninspected_credentials);
+        assert!(!rest_ep.provider_credentialed);
         assert_eq!(
             rest_ep
                 .rules
@@ -3521,7 +4081,91 @@ binaries:
         assert_eq!(reprotoo.endpoints[1].rules.len(), 1);
         assert_eq!(reprotoo.endpoints[1].deny_rules.len(), 1);
         assert_eq!(reprotoo.endpoints[1].ports, vec![443, 8443]);
+        assert!(reprotoo.endpoints[1].allow_uninspected_credentials);
+        assert!(!reprotoo.endpoints[1].provider_credentialed);
         assert!(reprotoo.binaries[0].harness);
+    }
+
+    #[test]
+    fn profile_classifies_declared_credentials_and_signing_as_credentialed() {
+        let with_declared_credential = parse_profile_yaml(
+            r"
+id: credentialed
+display_name: Credentialed
+credentials:
+  - name: token
+    env_vars: [TOKEN]
+endpoints:
+  - host: api.example.com
+    port: 443
+",
+        )
+        .expect("profile should parse");
+        assert!(with_declared_credential.has_credentialed_endpoints());
+
+        let with_signing = parse_profile_yaml(
+            r"
+id: signed
+display_name: Signed
+credentials: []
+endpoints:
+  - host: s3.example.com
+    port: 443
+    credential_signing: sigv4
+",
+        )
+        .expect("profile should parse");
+        assert!(with_signing.has_credentialed_endpoints());
+
+        let plain = parse_profile_yaml(
+            r"
+id: plain
+display_name: Plain
+credentials: []
+endpoints:
+  - host: pypi.org
+    port: 443
+",
+        )
+        .expect("profile should parse");
+        assert!(!plain.has_credentialed_endpoints());
+    }
+
+    #[test]
+    fn credentialed_profile_requires_opt_in_for_l4_endpoint() {
+        let profile = parse_profile_yaml(
+            r"
+id: raw
+display_name: Raw
+credentials:
+  - name: token
+    env_vars: [TOKEN]
+endpoints:
+  - host: raw.example.com
+    port: 443
+",
+        )
+        .expect("profile should parse");
+        let diagnostics = validate_profile_set(&[("raw.yaml".to_string(), profile)]);
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.field == "endpoints[0].allow_uninspected_credentials"
+        }));
+
+        let opted_in = parse_profile_yaml(
+            r"
+id: raw
+display_name: Raw
+credentials:
+  - name: token
+    env_vars: [TOKEN]
+endpoints:
+  - host: raw.example.com
+    port: 443
+    allow_uninspected_credentials: true
+",
+        )
+        .expect("profile should parse");
+        assert!(validate_profile_set(&[("raw.yaml".to_string(), opted_in)]).is_empty());
     }
 
     #[test]
@@ -4213,6 +4857,112 @@ binaries:
             .filter(|d| d.severity == "error")
             .collect();
         assert!(errors.is_empty(), "unexpected errors: {errors:?}");
+    }
+
+    #[test]
+    fn validate_accepts_explicit_tcp_without_l7_fields() {
+        let profile = parse_profile_yaml(
+            r"
+id: valid-tcp
+display_name: Valid TCP
+credentials:
+  - name: api_key
+    env_vars: [API_KEY]
+    auth_style: bearer
+    header_name: authorization
+discovery:
+  credentials: [api_key]
+endpoints:
+  - host: database.example.com
+    port: 5432
+    protocol: tcp
+    tls: skip
+    allow_uninspected_credentials: true
+    allowed_ips: [10.0.0.0/8]
+binaries:
+  - /usr/bin/psql
+",
+        )
+        .expect("profile should parse");
+
+        let diagnostics = validate_profile_set(&[("profile.yaml".to_string(), profile)]);
+        let errors: Vec<_> = diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.severity == "error")
+            .collect();
+        assert!(errors.is_empty(), "unexpected errors: {errors:?}");
+    }
+
+    #[test]
+    fn validate_rejects_additional_l7_field_families_with_explicit_tcp() {
+        let profile = parse_profile_yaml(
+            r"
+id: invalid-tcp-l7
+display_name: Invalid TCP L7
+credentials:
+  - name: api_key
+    env_vars: [API_KEY]
+    auth_style: bearer
+    header_name: authorization
+discovery:
+  credentials: [api_key]
+endpoints:
+  - host: database.example.com
+    port: 5432
+    protocol: tcp
+    enforcement: enforce
+    path: /query
+    allow_encoded_slash: true
+    websocket_credential_rewrite: true
+    request_body_credential_rewrite: true
+    persisted_queries: allow_registered
+    graphql_persisted_queries:
+      hash:
+        operation_type: query
+    graphql_max_body_bytes: 1024
+    json_rpc_max_body_bytes: 1024
+    mcp:
+      strict_tool_names: false
+    credential_signing: sigv4
+    signing_service: rds
+    signing_region: us-west-2
+binaries:
+  - /usr/bin/psql
+",
+        )
+        .expect("profile should parse");
+
+        let diagnostics = validate_profile_set(&[("profile.yaml".to_string(), profile)]);
+        let tcp_error = diagnostics
+            .iter()
+            .find(|diagnostic| {
+                diagnostic
+                    .message
+                    .contains("protocol tcp does not support L7-only fields")
+            })
+            .expect("explicit TCP should reject additional L7 fields");
+
+        for field in [
+            "enforcement",
+            "path",
+            "allow_encoded_slash",
+            "websocket_credential_rewrite",
+            "request_body_credential_rewrite",
+            "persisted_queries",
+            "graphql_persisted_queries",
+            "graphql_max_body_bytes",
+            "json_rpc_max_body_bytes",
+            "mcp",
+            "credential_signing",
+            "signing_service",
+            "signing_region",
+        ] {
+            assert!(
+                tcp_error.message.contains(field),
+                "missing {field}: {}",
+                tcp_error.message
+            );
+        }
     }
 
     #[test]

@@ -10,11 +10,16 @@ import (
 	"time"
 
 	"golang.org/x/oauth2"
+	"golang.org/x/sync/singleflight"
 
 	"github.com/NVIDIA/OpenShell/sdk/go/openshell/v1/types"
 )
 
-const defaultLeeway = 10 * time.Second
+const (
+	defaultLeeway  = 10 * time.Second
+	initialBackoff = 1 * time.Second
+	maxBackoff     = 30 * time.Second
+)
 
 var errNilTokenSource = errors.New("openshell: TokenSource must not be nil")
 
@@ -52,11 +57,14 @@ func WithLogger(l types.Logger) RefreshOption {
 }
 
 type refreshableAuth struct {
-	source oauth2.TokenSource
-	mu     sync.RWMutex
-	tok    *oauth2.Token
-	leeway time.Duration
-	logger types.Logger
+	source    oauth2.TokenSource
+	mu        sync.Mutex
+	group     singleflight.Group
+	tok       *oauth2.Token
+	leeway    time.Duration
+	logger    types.Logger
+	nextRetry time.Time
+	backoff   time.Duration
 }
 
 func (r *refreshableAuth) isTokenValid() bool {
@@ -69,26 +77,56 @@ func (r *refreshableAuth) isTokenValid() bool {
 	return time.Now().Before(r.tok.Expiry.Add(-r.leeway))
 }
 
-func (r *refreshableAuth) GetRequestMetadata(_ context.Context, _ ...string) (map[string]string, error) {
-	// Fast path: RLock, return cached token if valid.
-	r.mu.RLock()
+func (r *refreshableAuth) GetRequestMetadata(ctx context.Context, _ ...string) (map[string]string, error) {
+	r.mu.Lock()
 	if r.isTokenValid() {
 		tok := r.tok.AccessToken
-		r.mu.RUnlock()
+		r.mu.Unlock()
 		return map[string]string{"authorization": "Bearer " + tok}, nil
 	}
-	r.mu.RUnlock()
 
-	// Slow path: Lock, re-check, fetch if still stale.
+	if !r.nextRetry.IsZero() && time.Now().Before(r.nextRetry) {
+		if r.tok != nil {
+			tok := r.tok.AccessToken
+			r.mu.Unlock()
+			return map[string]string{"authorization": "Bearer " + tok}, nil
+		}
+		r.mu.Unlock()
+		return nil, errors.New("openshell: token refresh failed and backoff is active")
+	}
+	r.mu.Unlock()
+
+	resultCh := r.group.DoChan("refresh", func() (any, error) {
+		return r.source.Token()
+	})
+	var val any
+	var err error
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case result := <-resultCh:
+		val = result.Val
+		err = result.Err
+	}
+
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	if r.isTokenValid() {
-		return map[string]string{"authorization": "Bearer " + r.tok.AccessToken}, nil
-	}
-
-	newTok, err := r.source.Token()
 	if err != nil {
+		if r.nextRetry.IsZero() || !time.Now().Before(r.nextRetry) {
+			bo := r.backoff
+			if bo == 0 {
+				bo = initialBackoff
+			} else {
+				bo *= 2
+				if bo > maxBackoff {
+					bo = maxBackoff
+				}
+			}
+			r.backoff = bo
+			r.nextRetry = time.Now().Add(bo)
+		}
+
 		if r.tok != nil {
 			if r.logger != nil {
 				r.logger.Error(err, "token refresh failed, using cached token")
@@ -98,17 +136,13 @@ func (r *refreshableAuth) GetRequestMetadata(_ context.Context, _ ...string) (ma
 		return nil, err
 	}
 
-	if newTok == nil {
-		if r.tok != nil {
-			if r.logger != nil {
-				r.logger.Error(errors.New("token source returned nil token"), "token refresh returned nil, using cached token")
-			}
-			return map[string]string{"authorization": "Bearer " + r.tok.AccessToken}, nil
-		}
-		return nil, errors.New("openshell: token source returned nil token")
+	tok, ok := val.(*oauth2.Token)
+	if !ok || tok == nil {
+		return nil, errors.New("openshell: token source returned nil token without error")
 	}
-
-	r.tok = newTok
+	r.tok = tok
+	r.backoff = 0
+	r.nextRetry = time.Time{}
 	return map[string]string{"authorization": "Bearer " + r.tok.AccessToken}, nil
 }
 
@@ -118,7 +152,8 @@ func (r *refreshableAuth) RequireTransportSecurity() bool {
 
 // RefreshableToken returns an AuthProvider that caches tokens from src
 // and refreshes them before expiry. Concurrent callers share a single
-// refresh call (coalesced via RWMutex double-checked locking).
+// in-flight refresh via singleflight. Failed refreshes trigger exponential
+// backoff (1s, 2s, 4s, ..., 30s cap) to avoid amplifying token endpoint outages.
 func RefreshableToken(src oauth2.TokenSource, opts ...RefreshOption) (AuthProvider, error) {
 	if src == nil {
 		return nil, errNilTokenSource

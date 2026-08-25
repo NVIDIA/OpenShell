@@ -143,6 +143,56 @@ func TestProviderToProto_Full(t *testing.T) {
 	assert.Equal(t, map[string]string{"k": "v"}, h.Metadata)
 }
 
+func TestProviderFromProto_DeepCopyCredentialHandles(t *testing.T) {
+	proto := &dm.Provider{
+		Metadata: &dm.ObjectMeta{Name: "deep-copy-test"},
+		Type:     "test",
+		CredentialHandles: map[string]*dm.CredentialHandle{
+			"key": {
+				Driver:   "vault",
+				Handle:   "secret/test",
+				Metadata: map[string]string{"version": "1"},
+			},
+		},
+	}
+
+	result := ProviderFromProto(proto)
+	require.Len(t, result.Spec.CredentialHandles, 1)
+
+	proto.CredentialHandles["key"].Metadata["version"] = "mutated"
+	proto.CredentialHandles["key"].Driver = "mutated"
+
+	assert.Equal(t, "1", result.Spec.CredentialHandles["key"].Metadata["version"])
+	assert.Equal(t, "vault", result.Spec.CredentialHandles["key"].Driver)
+}
+
+func TestProviderToProto_DeepCopyCredentialHandles(t *testing.T) {
+	provider := &types.Provider{
+		Name: "deep-copy-test",
+		Type: "test",
+		Spec: types.ProviderSpec{
+			CredentialHandles: map[string]types.CredentialHandle{
+				"token": {
+					Driver:   "k8s",
+					Handle:   "ns/secret",
+					Metadata: map[string]string{"k": "v"},
+				},
+			},
+		},
+	}
+
+	result := ProviderToProto(provider)
+	require.Len(t, result.CredentialHandles, 1)
+
+	provider.Spec.CredentialHandles["token"] = types.CredentialHandle{
+		Driver: "mutated", Handle: "mutated", Metadata: map[string]string{"k": "mutated"},
+	}
+
+	assert.Equal(t, "k8s", result.CredentialHandles["token"].Driver)
+	assert.Equal(t, "ns/secret", result.CredentialHandles["token"].Handle)
+	assert.Equal(t, "v", result.CredentialHandles["token"].Metadata["k"])
+}
+
 func TestProviderRoundTrip(t *testing.T) {
 	original := &types.Provider{
 		ID:              "rt-1",

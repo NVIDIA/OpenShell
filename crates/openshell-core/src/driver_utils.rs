@@ -3,14 +3,9 @@
 
 //! Utility helpers shared across compute-driver crates.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-use crate::proto::compute::v1::{DriverSandbox, GetCapabilitiesResponse};
-
-pub use crate::container_paths::{
-    SANDBOX_TOKEN_MOUNT_PATH, SUPERVISOR_CONTAINER_BINARY, SUPERVISOR_CONTAINER_DIR,
-    TLS_CA_MOUNT_PATH, TLS_CERT_MOUNT_PATH, TLS_KEY_MOUNT_PATH, UPSTREAM_PROXY_AUTH_MOUNT_PATH,
-};
+use crate::proto::compute::v1::DriverSandbox;
 
 // ---------------------------------------------------------------------------
 // Sandbox container/pod label keys (openshell.ai/ namespace)
@@ -35,6 +30,9 @@ pub const LABEL_SANDBOX_NAMESPACE: &str = "openshell.ai/sandbox-namespace";
 /// Container/pod label carrying the sandbox workspace.
 pub const LABEL_SANDBOX_WORKSPACE: &str = "openshell.ai/sandbox-workspace";
 
+/// Label carrying the gateway identity on managed namespaces.
+pub const LABEL_GATEWAY_ID: &str = "openshell.ai/gateway-id";
+
 /// Label selector that matches all OpenShell-managed resources which carry a
 /// sandbox ID label.  Used by list and watch operations to exclude foreign
 /// resources from the same namespace.
@@ -51,6 +49,60 @@ pub fn openshell_sandbox_label_selector() -> String {
 /// path used when building the `openshell-sandbox` image layer.
 pub const SUPERVISOR_IMAGE_BINARY_PATH: &str = "/openshell-sandbox";
 
+/// Directory inside sandbox containers where the supervisor binary is mounted.
+///
+/// Compute drivers that side-load the supervisor into a shared volume mount
+/// the binary here so the sandbox container can execute it from a fixed path.
+pub const SUPERVISOR_CONTAINER_DIR: &str = "/opt/openshell/bin";
+
+/// Full path to the supervisor binary inside sandbox containers.
+///
+/// Equals `SUPERVISOR_CONTAINER_DIR + "/openshell-sandbox"`. Use this when
+/// the full executable path is needed (Docker entrypoint, Podman entrypoint,
+/// VM rootfs injection). Use `SUPERVISOR_CONTAINER_DIR` when only the
+/// directory mount-point is needed (Kubernetes emptyDir volume mount).
+pub const SUPERVISOR_CONTAINER_BINARY: &str = "/opt/openshell/bin/openshell-sandbox";
+
+// ---------------------------------------------------------------------------
+// In-container mount paths for guest TLS materials and the sandbox token.
+//
+// All container-based drivers (Docker, Podman, Kubernetes) mount the gateway's
+// mTLS client credentials at these fixed paths inside every sandbox container.
+// The supervisor reads these paths on startup to establish its gRPC-over-mTLS
+// connection back to the gateway. The paths must remain stable across driver
+// versions since the supervisor binary is built and packaged separately.
+// ---------------------------------------------------------------------------
+
+/// Container-side mount path for the guest mTLS CA certificate.
+pub const TLS_CA_MOUNT_PATH: &str = "/etc/openshell/tls/client/ca.crt";
+
+/// Container-side mount path for the guest mTLS client certificate.
+pub const TLS_CERT_MOUNT_PATH: &str = "/etc/openshell/tls/client/tls.crt";
+
+/// Container-side mount path for the guest mTLS client private key.
+pub const TLS_KEY_MOUNT_PATH: &str = "/etc/openshell/tls/client/tls.key";
+
+/// Container-side mount path for the per-sandbox JWT token.
+pub const SANDBOX_TOKEN_MOUNT_PATH: &str = "/etc/openshell/auth/sandbox.jwt";
+
+/// Container-side mount path for the corporate upstream-proxy credentials.
+///
+/// The file holds the `user:pass` userinfo used to build the
+/// `Proxy-Authorization` header. It is delivered through a root-only secret
+/// mount so the credential never appears in container environment/metadata.
+pub const UPSTREAM_PROXY_AUTH_MOUNT_PATH: &str = "/etc/openshell/auth/upstream-proxy";
+
+/// Container-side mount path for the corporate proxy CA bundle.
+///
+/// Drivers with a `proxy_ca_bundle` operator setting bind-mount the host PEM
+/// file here (read-only) and pass the path on the supervisor's argv via
+/// `--upstream-proxy-ca-bundle`. The supervisor trusts it for the TLS
+/// handshake with an `https://` corporate egress proxy and for server
+/// certificates re-signed by a TLS-intercepting proxy. Unlike the proxy
+/// credential, a CA certificate is not secret, so a plain read-only bind
+/// mount is used rather than a driver secret.
+pub const PROXY_CA_MOUNT_PATH: &str = "/etc/openshell/tls/proxy/ca-bundle.pem";
+
 /// A validated corporate upstream-proxy address.
 ///
 /// Produced by [`parse_upstream_proxy_url`], which is the single source of
@@ -65,6 +117,9 @@ pub struct UpstreamProxyAddr {
     pub host: String,
     /// Proxy TCP port (always explicit in the accepted URL grammar).
     pub port: u16,
+    /// `true` when the proxy URL used the `https://` scheme, so the supervisor
+    /// wraps the connection to the proxy in TLS before the CONNECT handshake.
+    pub secure: bool,
 }
 
 /// Why an upstream proxy URL was rejected by [`parse_upstream_proxy_url`].
@@ -85,11 +140,11 @@ pub enum UpstreamProxyUrlError {
     /// `http://host:port` contract exactly.
     #[error("proxy URL must include an explicit scheme, e.g. http://proxy.corp.com:3128")]
     MissingScheme,
-    /// The URL uses a scheme other than `http` (TLS and SOCKS proxies are
+    /// The URL uses a scheme other than `http` or `https` (SOCKS proxies are
     /// not supported by the sandbox supervisor).
     #[error(
-        "unsupported proxy scheme '{0}': only http:// forward proxies are \
-         supported by the sandbox supervisor"
+        "unsupported proxy scheme '{0}': only http:// and https:// forward \
+         proxies are supported by the sandbox supervisor"
     )]
     UnsupportedScheme(String),
     /// The URL has no explicit port. Corporate proxies rarely listen on the
@@ -119,11 +174,13 @@ pub enum UpstreamProxyUrlError {
 
 /// Parse and validate a corporate upstream-proxy URL.
 ///
-/// The accepted grammar is exactly `http://host:port`: the scheme and the
-/// port must both be explicit, only `http://` proxies are accepted, and
-/// inline userinfo is rejected. The URL must address the proxy only: a path
-/// (other than a bare trailing `/`), query, or fragment is rejected rather
-/// than silently discarded.
+/// The accepted grammar is exactly `http://host:port` or `https://host:port`:
+/// the scheme and the port must both be explicit, only `http://` and
+/// `https://` proxies are accepted, and inline userinfo is rejected. The URL
+/// must address the proxy only: a path (other than a bare trailing `/`),
+/// query, or fragment is rejected rather than silently discarded. The
+/// returned [`UpstreamProxyAddr::secure`] records whether the `https://`
+/// scheme was used so the supervisor knows to TLS-wrap the proxy connection.
 ///
 /// # Errors
 ///
@@ -139,11 +196,15 @@ pub fn parse_upstream_proxy_url(raw: &str) -> Result<UpstreamProxyAddr, Upstream
     }
     let parsed = url::Url::parse(trimmed).map_err(UpstreamProxyUrlError::Invalid)?;
 
-    if !parsed.scheme().eq_ignore_ascii_case("http") {
+    let secure = if parsed.scheme().eq_ignore_ascii_case("https") {
+        true
+    } else if parsed.scheme().eq_ignore_ascii_case("http") {
+        false
+    } else {
         return Err(UpstreamProxyUrlError::UnsupportedScheme(
             parsed.scheme().to_string(),
         ));
-    }
+    };
     if !parsed.username().is_empty() || parsed.password().is_some() {
         return Err(UpstreamProxyUrlError::InlineCredentials);
     }
@@ -171,14 +232,14 @@ pub fn parse_upstream_proxy_url(raw: &str) -> Result<UpstreamProxyAddr, Upstream
     if !authority_has_explicit_port(trimmed) {
         return Err(UpstreamProxyUrlError::MissingPort);
     }
-    // Explicit-port presence was verified above; `port()` is `None` only
-    // when the URL spells out the scheme default (`:80`), which the url crate
-    // normalizes away.
-    let port = parsed.port().unwrap_or(80);
+    // Explicit-port presence was verified above; `port()` is `None` only when
+    // the URL spells out the scheme default (`:80` for http, `:443` for
+    // https), which the url crate normalizes away.
+    let port = parsed.port().unwrap_or(if secure { 443 } else { 80 });
     if port == 0 {
         return Err(UpstreamProxyUrlError::ZeroPort);
     }
-    Ok(UpstreamProxyAddr { host, port })
+    Ok(UpstreamProxyAddr { host, port, secure })
 }
 
 /// Return `true` when the raw URL's authority carries an explicit `:port`.
@@ -292,6 +353,20 @@ pub const MAX_UPSTREAM_PROXY_CREDENTIAL_BYTES: u64 = 4096;
 pub fn read_upstream_proxy_credential_file(path: &str) -> Result<String, String> {
     use std::io::Read as _;
 
+    // Windows rejects opening a directory before a file handle is available,
+    // while Unix permits the open and rejects it via handle metadata below.
+    // Preflight the path so every platform reports the intended non-regular
+    // file error. The post-open check remains necessary to close the TOCTOU
+    // window if the path is replaced between these operations.
+    #[cfg(target_os = "windows")]
+    {
+        let path_metadata = std::fs::metadata(path)
+            .map_err(|e| format!("failed to open proxy auth file '{path}': {e}"))?;
+        if !path_metadata.is_file() {
+            return Err(format!("proxy auth file '{path}' is not a regular file"));
+        }
+    }
+
     // On Unix, open non-blocking so a FIFO with no writer does not hang the
     // open() call indefinitely; the regular-file check below then rejects it.
     // O_NONBLOCK has no effect on the subsequent read of a regular file.
@@ -331,6 +406,9 @@ pub fn read_upstream_proxy_credential_file(path: &str) -> Result<String, String>
     Ok(buf)
 }
 
+/// Container-side directory where the provider SPIFFE Workload API socket is mounted.
+pub const PROVIDER_SPIFFE_WORKLOAD_API_SOCKET_MOUNT_DIR: &str = "/spiffe-workload-api";
+
 /// Return the XDG state path for a driver's sandbox JWT token file.
 ///
 /// The resulting path is `$XDG_STATE_HOME/openshell/<driver_subdir>[/<namespace>]/<sandbox_id>/sandbox.jwt`.
@@ -353,22 +431,6 @@ pub fn sandbox_token_path(
         path = path.join(ns.replace(['/', '\\'], "-"));
     }
     Ok(path.join(sandbox_id).join("sandbox.jwt"))
-}
-
-/// Build a [`GetCapabilitiesResponse`] from the common driver capability fields.
-///
-/// Every compute driver constructs this response with the same fields. Shared
-/// here to avoid repeating the struct literal in each driver crate.
-pub fn build_capabilities_response(
-    driver_name: &str,
-    driver_version: impl Into<String>,
-    default_image: impl Into<String>,
-) -> GetCapabilitiesResponse {
-    GetCapabilitiesResponse {
-        driver_name: driver_name.to_string(),
-        driver_version: driver_version.into(),
-        default_image: default_image.into(),
-    }
 }
 
 /// Return the effective log level for a sandbox.
@@ -420,6 +482,145 @@ pub fn supervisor_image_should_refresh(image: &str) -> bool {
     matches!(supervisor_image_tag(image), Some("dev" | "latest"))
 }
 
+// ---------------------------------------------------------------------------
+// Supervisor binary extraction helpers (shared by Docker and Podman drivers)
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "driver-extraction")]
+/// Extract the payload of the first regular-file entry in a tar archive.
+///
+/// Container archive endpoints return a single-file tar when `path` points to
+/// a file, so only the first entry is consumed. Returns an error when the
+/// archive is empty, the first entry is not a regular file, or the payload is
+/// empty.
+pub fn extract_first_tar_entry(tar_bytes: &[u8]) -> Result<Vec<u8>, String> {
+    let mut archive = tar::Archive::new(std::io::Cursor::new(tar_bytes));
+    let mut entries = archive
+        .entries()
+        .map_err(|err| format!("open tar archive: {err}"))?;
+    let mut entry = entries
+        .next()
+        .ok_or_else(|| "tar archive was empty".to_string())?
+        .map_err(|err| format!("read tar entry: {err}"))?;
+    let kind = entry.header().entry_type();
+    if !kind.is_file() {
+        return Err(format!(
+            "expected a regular file in tar archive, got type {kind:?}"
+        ));
+    }
+    let mut bytes = Vec::new();
+    std::io::Read::read_to_end(&mut entry, &mut bytes)
+        .map_err(|err| format!("read tar entry payload: {err}"))?;
+    if bytes.is_empty() {
+        return Err("tar entry payload was empty".to_string());
+    }
+    Ok(bytes)
+}
+
+#[cfg(feature = "driver-extraction")]
+/// Atomically write `bytes` to `final_path` via a sibling temp file.
+///
+/// Creates parent directories as needed. The temp file is synced, `chmod 755`
+/// (on Unix), and renamed into place so concurrent readers never observe a
+/// partial write. Returns a human-readable error string on failure.
+pub fn write_cache_binary_atomic(final_path: &Path, bytes: &[u8]) -> Result<(), String> {
+    let dir = final_path
+        .parent()
+        .ok_or_else(|| format!("cache path '{}' has no parent", final_path.display()))?;
+    std::fs::create_dir_all(dir)
+        .map_err(|err| format!("failed to create cache dir '{}': {err}", dir.display()))?;
+
+    let mut temp = tempfile::Builder::new()
+        .prefix(".openshell-sandbox-")
+        .tempfile_in(dir)
+        .map_err(|err| format!("failed to create temp file in '{}': {err}", dir.display()))?;
+    std::io::Write::write_all(&mut temp, bytes)
+        .map_err(|err| format!("failed to write supervisor binary: {err}"))?;
+    temp.as_file()
+        .sync_all()
+        .map_err(|err| format!("failed to sync supervisor binary: {err}"))?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o755))
+            .map_err(|err| format!("failed to chmod supervisor binary: {err}"))?;
+    }
+
+    temp.persist(final_path).map_err(|err| {
+        format!(
+            "failed to persist supervisor binary to '{}': {}",
+            final_path.display(),
+            err.error,
+        )
+    })?;
+    Ok(())
+}
+
+/// Return the host-side cache path for an extracted supervisor binary.
+///
+/// The path is `$XDG_DATA_HOME/openshell/<driver_subdir>/<sanitized-digest>/openshell-sandbox`.
+/// `driver_subdir` distinguishes caches across drivers (e.g. `"docker-supervisor"`,
+/// `"podman-supervisor"`).
+pub fn supervisor_cache_path(driver_subdir: &str, digest: &str) -> Result<PathBuf, String> {
+    let base = crate::paths::xdg_data_dir()
+        .map_err(|err| format!("failed to resolve XDG data dir: {err}"))?;
+    Ok(supervisor_cache_path_with_base(
+        &base,
+        driver_subdir,
+        digest,
+    ))
+}
+
+/// [`supervisor_cache_path`] with an explicit base directory (for testing).
+pub fn supervisor_cache_path_with_base(base: &Path, driver_subdir: &str, digest: &str) -> PathBuf {
+    let sanitized = digest.replace(':', "-");
+    base.join("openshell")
+        .join(driver_subdir)
+        .join(sanitized)
+        .join("openshell-sandbox")
+}
+
+/// Generate a unique container name for supervisor binary extraction.
+///
+/// Uses the process ID and an atomic counter to avoid collisions across
+/// concurrent gateway starts.
+pub fn temp_extract_container_name() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let pid = std::process::id();
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    format!("openshell-supervisor-extract-{pid}-{seq}")
+}
+
+/// Validate that the file at `path` starts with the ELF magic bytes (`\x7fELF`).
+///
+/// Returns a human-readable error when the file cannot be read or is not a
+/// Linux ELF binary.
+pub fn validate_linux_elf_binary(path: &Path) -> Result<(), String> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path).map_err(|err| {
+        format!(
+            "failed to open supervisor binary '{}': {err}",
+            path.display()
+        )
+    })?;
+    let mut magic = [0u8; 4];
+    file.read_exact(&mut magic).map_err(|err| {
+        format!(
+            "failed to read supervisor binary '{}': {err}",
+            path.display()
+        )
+    })?;
+    if magic != [0x7f, b'E', b'L', b'F'] {
+        return Err(format!(
+            "supervisor binary '{}' is not a Linux ELF executable",
+            path.display(),
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -429,6 +630,20 @@ mod tests {
         let addr = parse_upstream_proxy_url("http://proxy.corp.com:8080").unwrap();
         assert_eq!(addr.host, "proxy.corp.com");
         assert_eq!(addr.port, 8080);
+        assert!(!addr.secure, "http:// is not TLS-wrapped");
+    }
+
+    #[test]
+    fn upstream_proxy_url_accepts_https_with_port() {
+        let addr = parse_upstream_proxy_url("https://proxy.corp.com:3130").unwrap();
+        assert_eq!(addr.host, "proxy.corp.com");
+        assert_eq!(addr.port, 3130);
+        assert!(addr.secure, "https:// is TLS-wrapped");
+        // An explicit scheme-default port (:443) is accepted even though the
+        // url crate normalizes it away in the parsed form.
+        let addr = parse_upstream_proxy_url("https://proxy.corp.com:443").unwrap();
+        assert_eq!(addr.port, 443);
+        assert!(addr.secure);
     }
 
     #[test]
@@ -488,12 +703,21 @@ mod tests {
     }
 
     #[test]
-    fn upstream_proxy_url_rejects_tls_and_socks_schemes() {
-        for url in ["https://proxy:443", "socks5://proxy:1080"] {
-            assert!(matches!(
-                parse_upstream_proxy_url(url),
-                Err(UpstreamProxyUrlError::UnsupportedScheme(_))
-            ));
+    fn upstream_proxy_url_rejects_socks_schemes() {
+        // http:// and https:// are supported; only other schemes (SOCKS, etc.)
+        // are rejected.
+        for url in [
+            "socks5://proxy:1080",
+            "socks4://proxy:1080",
+            "ftp://proxy:21",
+        ] {
+            assert!(
+                matches!(
+                    parse_upstream_proxy_url(url),
+                    Err(UpstreamProxyUrlError::UnsupportedScheme(_))
+                ),
+                "{url}"
+            );
         }
     }
 
@@ -611,7 +835,7 @@ mod tests {
         let err = read_upstream_proxy_credential_file(dir.path().to_str().unwrap()).unwrap_err();
         assert!(err.contains("regular file"), "{err}");
 
-        if std::path::Path::new("/dev/zero").exists() {
+        if Path::new("/dev/zero").exists() {
             let err = read_upstream_proxy_credential_file("/dev/zero").unwrap_err();
             assert!(err.contains("regular file"), "{err}");
         }

@@ -165,7 +165,8 @@ build_component_for_arch() {
   local target
   local stage
   local features
-  local cargo_subcommand
+  local -a cargo_subcommand
+  local -a cargo_env
   local build_target
   local current_host_os
   local current_host_arch
@@ -183,6 +184,7 @@ build_component_for_arch() {
   current_host_arch="$(host_arch)"
 
   cargo_subcommand=(cargo build)
+  cargo_env=()
   build_target="$target"
   build_rustflags="${RUSTFLAGS:-}"
 
@@ -221,6 +223,13 @@ build_component_for_arch() {
     fi
   fi
 
+  if [[ "${OPENSHELL_AUDITABLE:-0}" == "1" ]]; then
+    cargo_subcommand=("${cargo_subcommand[0]}" auditable "${cargo_subcommand[@]:1}")
+    # mise.toml injects RUSTC_WRAPPER=sccache. Unset it after mise constructs
+    # the environment so it cannot wrap cargo-auditable's workspace wrapper.
+    cargo_env=(env -u RUSTC_WRAPPER)
+  fi
+
   echo "Building ${binary} for linux/${arch} (${build_target}, libc: ${target_libc})..."
   mise x -- rustup target add "$target" >/dev/null 2>&1 || true
 
@@ -245,7 +254,7 @@ build_component_for_arch() {
     if [[ -n "$build_rustflags" ]]; then
       export RUSTFLAGS="$build_rustflags"
     fi
-    CARGO_INCREMENTAL=0 mise x -- "${cargo_subcommand[@]}" "${args[@]}"
+    CARGO_INCREMENTAL=0 mise x -- "${cargo_env[@]}" "${cargo_subcommand[@]}" "${args[@]}"
   )
 
   binary_path="${ROOT}/target/${target}/release/${binary}"
@@ -268,6 +277,14 @@ if [[ "$#" -gt 0 ]]; then
   usage
   exit 1
 fi
+
+case "${OPENSHELL_AUDITABLE:-0}" in
+  0|1) ;;
+  *)
+    echo "unsupported OPENSHELL_AUDITABLE: ${OPENSHELL_AUDITABLE} (expected 0 or 1)" >&2
+    exit 1
+    ;;
+esac
 
 restore_cargo_toml=0
 trap restore_workspace_version EXIT

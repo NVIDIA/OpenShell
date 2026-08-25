@@ -29,6 +29,8 @@ func TestConverterCoversAllProtoFields_SandboxSpec(t *testing.T) {
 		"policy":                true,
 		"providers":             true,
 		"resource_requirements": true,
+		"command":               true,
+		"tty":                   true,
 	}
 
 	assertAllFieldsCovered(t, (&pb.SandboxSpec{}).ProtoReflect().Descriptor(), handled, nil)
@@ -59,9 +61,13 @@ func TestConverterCoversAllProtoFields_SandboxStatus(t *testing.T) {
 		"phase":                  true,
 		"conditions":             true,
 		"current_policy_version": true,
+		"exit_code":              true,
 	}
+	// The instance ID is an internal gateway/supervisor fencing token exposed
+	// only through the raw protobuf API.
+	skipped := fieldSet{"main_process_instance_id": true}
 
-	assertAllFieldsCovered(t, (&pb.SandboxStatus{}).ProtoReflect().Descriptor(), handled, nil)
+	assertAllFieldsCovered(t, (&pb.SandboxStatus{}).ProtoReflect().Descriptor(), handled, skipped)
 }
 
 func TestConverterCoversAllProtoFields_SandboxCondition(t *testing.T) {
@@ -78,20 +84,37 @@ func TestConverterCoversAllProtoFields_SandboxCondition(t *testing.T) {
 
 func TestConverterCoversAllProtoFields_SandboxPolicy(t *testing.T) {
 	handled := fieldSet{
-		"version":          true,
-		"filesystem":       true,
-		"network_policies": true,
-		"process":          true,
-		"landlock":         true,
-	}
-
-	skipped := fieldSet{
-		// Middleware support is not yet exposed in the SDK domain model.
-		// Tracked in GitHub issue #36 for Drop D.
+		"version":             true,
+		"filesystem":          true,
+		"network_policies":    true,
+		"process":             true,
+		"landlock":            true,
 		"network_middlewares": true,
 	}
 
-	assertAllFieldsCovered(t, (&sandboxpb.SandboxPolicy{}).ProtoReflect().Descriptor(), handled, skipped)
+	assertAllFieldsCovered(t, (&sandboxpb.SandboxPolicy{}).ProtoReflect().Descriptor(), handled, nil)
+}
+
+func TestConverterCoversAllProtoFields_NetworkMiddlewareConfig(t *testing.T) {
+	handled := fieldSet{
+		"name":       true,
+		"middleware": true,
+		"config":     true,
+		"on_error":   true,
+		"endpoints":  true,
+		"order":      true,
+	}
+
+	assertAllFieldsCovered(t, (&sandboxpb.NetworkMiddlewareConfig{}).ProtoReflect().Descriptor(), handled, nil)
+}
+
+func TestConverterCoversAllProtoFields_MiddlewareEndpointSelector(t *testing.T) {
+	handled := fieldSet{
+		"include": true,
+		"exclude": true,
+	}
+
+	assertAllFieldsCovered(t, (&sandboxpb.MiddlewareEndpointSelector{}).ProtoReflect().Descriptor(), handled, nil)
 }
 
 func TestConverterCoversAllProtoFields_NetworkEndpoint(t *testing.T) {
@@ -113,6 +136,8 @@ func TestConverterCoversAllProtoFields_NetworkEndpoint(t *testing.T) {
 		"path":                            true,
 		"websocket_credential_rewrite":    true,
 		"request_body_credential_rewrite": true,
+		"allow_uninspected_credentials":   true,
+		"provider_credentialed":           true,
 		"advisor_proposed":                true,
 		"credential_signing":              true,
 		"signing_service":                 true,
@@ -177,6 +202,87 @@ func TestConverterCoversAllProtoFields_CredentialHandle(t *testing.T) {
 	}
 
 	assertAllFieldsCovered(t, (&dm.CredentialHandle{}).ProtoReflect().Descriptor(), handled, nil)
+}
+
+func TestConverterCoversAllProtoFields_SandboxPolicyRevision(t *testing.T) {
+	handled := fieldSet{
+		"version":       true,
+		"policy_hash":   true,
+		"status":        true,
+		"load_error":    true,
+		"created_at_ms": true,
+		"loaded_at_ms":  true,
+		"policy":        true,
+		"provenance":    true,
+	}
+
+	assertAllFieldsCovered(t, (&pb.SandboxPolicyRevision{}).ProtoReflect().Descriptor(), handled, nil)
+}
+
+func TestConverterCoversAllProtoFields_ProviderProfile(t *testing.T) {
+	handled := fieldSet{
+		"id":                true,
+		"display_name":      true,
+		"description":       true,
+		"category":          true,
+		"credentials":       true,
+		"endpoints":         true,
+		"binaries":          true,
+		"inference_capable": true,
+		"discovery":         true,
+		"resource_version":  true,
+		"annotations":       true,
+		"source":            true,
+		"scope":             true,
+	}
+
+	assertAllFieldsCovered(t, (&pb.ProviderProfile{}).ProtoReflect().Descriptor(), handled, nil)
+}
+
+func TestConverterCoversAllProtoFields_ProviderProfileCredential(t *testing.T) {
+	handled := fieldSet{
+		"name":          true,
+		"description":   true,
+		"env_vars":      true,
+		"required":      true,
+		"auth_style":    true,
+		"header_name":   true,
+		"query_param":   true,
+		"refresh":       true,
+		"path_template": true,
+		"token_grant":   true,
+	}
+
+	assertAllFieldsCovered(t, (&pb.ProviderProfileCredential{}).ProtoReflect().Descriptor(), handled, nil)
+}
+
+func TestConverterCoversAllProtoFields_ProviderCredentialTokenGrant(t *testing.T) {
+	handled := fieldSet{
+		"token_endpoint":        true,
+		"audience":              true,
+		"jwt_svid_audience":     true,
+		"scopes":                true,
+		"cache_ttl_seconds":     true,
+		"audience_overrides":    true,
+		"client_assertion_type": true,
+		"grant_type":            true,
+		"subject_token":         true,
+		"requested_token_type":  true,
+	}
+
+	assertAllFieldsCovered(t, (&pb.ProviderCredentialTokenGrant{}).ProtoReflect().Descriptor(), handled, nil)
+}
+
+func TestConverterCoversAllProtoFields_ProviderCredentialTokenGrantAudienceOverride(t *testing.T) {
+	handled := fieldSet{
+		"host":     true,
+		"port":     true,
+		"path":     true,
+		"audience": true,
+		"scopes":   true,
+	}
+
+	assertAllFieldsCovered(t, (&pb.ProviderCredentialTokenGrantAudienceOverride{}).ProtoReflect().Descriptor(), handled, nil)
 }
 
 func TestConverterCoversAllProtoFields_McpOptions(t *testing.T) {

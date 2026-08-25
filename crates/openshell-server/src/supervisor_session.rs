@@ -13,8 +13,9 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use openshell_core::proto::{
-    GatewayMessage, RelayFrame, RelayInit, RelayOpen, Sandbox, SandboxPhase, SessionAccepted,
-    SshRelayTarget, SupervisorMessage, gateway_message, relay_open, supervisor_message,
+    GatewayMessage, RelayFrame, RelayInit, RelayOpen, ReportMainProcessExitRequest,
+    ReportMainProcessExitResponse, Sandbox, SandboxPhase, SessionAccepted, SshRelayTarget,
+    SupervisorMessage, gateway_message, relay_open, supervisor_message,
 };
 use openshell_core::transport_errors::is_expected_transport_close_status;
 
@@ -139,6 +140,20 @@ impl SupervisorSessionRegistry {
     /// Remove the session for a sandbox.
     fn remove(&self, sandbox_id: &str) {
         self.sessions.lock().unwrap().remove(sandbox_id);
+    }
+
+    /// Disconnect the current supervisor session for a sandbox.
+    ///
+    /// Lifecycle stop uses this to ensure a later start must establish
+    /// a fresh session before the sandbox can return to Ready.
+    pub fn disconnect(&self, sandbox_id: &str) -> bool {
+        let session = self.sessions.lock().unwrap().remove(sandbox_id);
+        if let Some(session) = session {
+            let _ = session.shutdown.send(());
+            true
+        } else {
+            false
+        }
     }
 
     /// Remove the session only if its `session_id` matches the one we are
@@ -699,7 +714,7 @@ pub async fn handle_connect_supervisor(
         "supervisor session: accepted"
     );
 
-    // Step 2: Create the outbound channel and register the session.
+    // Step 2: Create and register the outbound channel.
     let (tx, rx) = mpsc::channel::<GatewayMessage>(64);
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     let superseded = state.supervisor_sessions.register(
@@ -741,7 +756,7 @@ pub async fn handle_connect_supervisor(
 
     if let Err(err) = state
         .compute
-        .supervisor_session_connected(&sandbox_id)
+        .supervisor_session_connected(&sandbox_id, &hello.instance_id)
         .await
     {
         warn!(
@@ -799,6 +814,29 @@ pub async fn handle_connect_supervisor(
     > = Box::pin(tokio_stream::StreamExt::map(stream, Ok));
 
     Ok(Response::new(stream))
+}
+
+pub async fn handle_report_main_process_exit(
+    state: &Arc<ServerState>,
+    request: Request<ReportMainProcessExitRequest>,
+) -> Result<Response<ReportMainProcessExitResponse>, Status> {
+    let principal = request.extensions().get::<Principal>().cloned();
+    let report = request.into_inner();
+    if report.sandbox_id.is_empty() {
+        return Err(Status::invalid_argument("sandbox_id is required"));
+    }
+    if report.instance_id.is_empty() {
+        return Err(Status::invalid_argument("instance_id is required"));
+    }
+    if let Some(principal) = principal.as_ref() {
+        crate::auth::guard::ensure_sandbox_principal_scope(principal, &report.sandbox_id)?;
+    }
+    state
+        .compute
+        .main_process_exited(&report.sandbox_id, &report.instance_id, report.exit_code)
+        .await
+        .map_err(Status::failed_precondition)?;
+    Ok(Response::new(ReportMainProcessExitResponse {}))
 }
 
 async fn run_session_loop(

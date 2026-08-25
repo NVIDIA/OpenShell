@@ -5,7 +5,7 @@
 
 pub use crate::commands::common::{
     PolicyGetView, parse_credential_expiry_cli_value, parse_env_pairs, parse_key_value_pairs,
-    parse_secret_material_env_pairs,
+    parse_secret_material_env_pairs, warn_credential_env_vars,
 };
 use crate::commands::common::{
     ProvisioningDisplay, ProvisioningStep, confirm_global_setting_delete,
@@ -47,10 +47,11 @@ use openshell_core::proto::{
     LintProviderProfilesRequest, ListProviderProfilesRequest, ListProvidersRequest,
     ListSandboxPoliciesRequest, ListSandboxProvidersRequest, ListSandboxesRequest,
     ListServicesRequest, PolicySource, PolicyStatus, Provider, ProviderCredentialRefreshStatus,
-    ProviderCredentialRefreshStrategy, ProviderProfile, ProviderProfileDiagnostic,
-    ProviderProfileImportItem, RejectDraftChunkRequest, ResourceRequirements,
-    RevokeSshSessionRequest, RotateProviderCredentialRequest, Sandbox, SandboxPhase, SandboxPolicy,
-    SandboxSpec, SandboxTemplate, ServiceEndpointResponse, SetInferenceRouteRequest, SettingScope,
+    ProviderCredentialRefreshStrategy, ProviderCredentialTokenGrantType, ProviderProfile,
+    ProviderProfileDiagnostic, ProviderProfileImportItem, RejectDraftChunkRequest,
+    ResourceRequirements, RevokeSshSessionRequest, RotateProviderCredentialRequest, Sandbox,
+    SandboxPhase, SandboxPolicy, SandboxSpec, SandboxTemplate, ServiceEndpointResponse,
+    SetInferenceRouteRequest, SettingScope, StartSandboxRequest, StopSandboxRequest,
     TcpForwardFrame, TcpForwardInit, TcpRelayTarget, UpdateConfigRequest,
     UpdateProviderProfilesRequest, UpdateProviderRequest, WatchSandboxRequest, exec_sandbox_event,
     setting_value, tcp_forward_init,
@@ -383,6 +384,7 @@ pub struct SandboxCreateConfig<'a> {
     pub environment: HashMap<String, String>,
     pub approval_mode: &'a str,
     pub output: &'a str,
+    pub detach: bool,
 }
 
 impl Default for SandboxCreateConfig<'_> {
@@ -407,6 +409,7 @@ impl Default for SandboxCreateConfig<'_> {
             environment: HashMap::new(),
             approval_mode: "manual",
             output: "table",
+            detach: false,
         }
     }
 }
@@ -439,11 +442,17 @@ pub async fn sandbox_create(
         environment,
         approval_mode,
         output,
+        detach,
     } = config;
 
     if editor.is_some() && !command.is_empty() {
         return Err(miette::miette!(
             "--editor cannot be used with a trailing command; use `openshell sandbox connect <name> --editor ...` after the sandbox is ready"
+        ));
+    }
+    if !uploads.is_empty() && !command.is_empty() {
+        return Err(miette::miette!(
+            "--upload cannot be combined with a trailing main command yet because uploads complete after the canonical process starts"
         ));
     }
 
@@ -521,6 +530,13 @@ pub async fn sandbox_create(
 
     let resource_requirements = gpu_requirements.map(|gpu| ResourceRequirements { gpu: Some(gpu) });
 
+    let main_terminal = tty_override
+        .unwrap_or_else(|| std::io::stdin().is_terminal() && std::io::stdout().is_terminal());
+    let main_command = if command.is_empty() {
+        vec!["/bin/bash".to_string(), "-l".to_string()]
+    } else {
+        command.to_vec()
+    };
     let request = CreateSandboxRequest {
         spec: Some(SandboxSpec {
             resource_requirements,
@@ -528,6 +544,8 @@ pub async fn sandbox_create(
             policy,
             providers: configured_providers,
             template,
+            command: main_command,
+            tty: main_terminal,
             ..SandboxSpec::default()
         }),
         name: name.unwrap_or_default().to_string(),
@@ -766,16 +784,10 @@ pub async fn sandbox_create(
                 // the deadline when applicable.
                 let handled = match &mut display {
                     ProgressOutput::Interactive(d) => {
-                        let mut opt = Some(std::mem::replace(d, ProvisioningDisplay::new()));
-                        let h = handle_platform_progress_event(&ev, &mut opt, provision_start);
-                        if let Some(inner) = opt {
-                            *d = inner;
-                        }
-                        h
+                        handle_platform_progress_event(&ev, Some(d), provision_start)
                     }
                     ProgressOutput::Plain => {
-                        let mut opt: Option<ProvisioningDisplay> = None;
-                        handle_platform_progress_event(&ev, &mut opt, provision_start)
+                        handle_platform_progress_event(&ev, None, provision_start)
                     }
                     ProgressOutput::Silent => false,
                 };
@@ -945,53 +957,23 @@ pub async fn sandbox_create(
                 return Ok(());
             }
 
-            if command.is_empty() {
-                let connect_result = if persist {
-                    sandbox_connect(&effective_server, &sandbox_name, &effective_tls, workspace)
-                        .await
-                } else {
-                    crate::ssh::sandbox_connect_without_exec(
-                        &effective_server,
-                        &sandbox_name,
-                        &effective_tls,
-                        workspace,
-                    )
-                    .await
-                };
-
-                return finalize_sandbox_create_session(
-                    &effective_server,
-                    &sandbox_name,
-                    persist,
-                    connect_result,
-                    workspace,
-                    &effective_tls,
-                    gateway_name,
-                )
-                .await;
+            // Persistent non-interactive creates detach implicitly. An
+            // explicitly ephemeral (`--no-keep`) create must still attach so
+            // it can observe the canonical process and delete the sandbox when
+            // that session ends.
+            if detach
+                || (persist
+                    && (!std::io::stdin().is_terminal() || !std::io::stdout().is_terminal()))
+            {
+                return Ok(());
             }
 
-            // Resolve TTY mode: explicit --tty / --no-tty wins, otherwise
-            // auto-detect from the local terminal.
-            let tty = tty_override.unwrap_or_else(|| {
-                std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
-            });
-            let exec_result = if persist {
-                sandbox_exec(
-                    &effective_server,
-                    &sandbox_name,
-                    command,
-                    tty,
-                    &effective_tls,
-                    workspace,
-                )
-                .await
+            let connect_result = if persist {
+                sandbox_connect(&effective_server, &sandbox_name, &effective_tls, workspace).await
             } else {
-                crate::ssh::sandbox_exec_without_exec(
+                crate::ssh::sandbox_connect_without_exec(
                     &effective_server,
                     &sandbox_name,
-                    command,
-                    tty,
                     &effective_tls,
                     workspace,
                 )
@@ -1002,7 +984,7 @@ pub async fn sandbox_create(
                 &effective_server,
                 &sandbox_name,
                 persist,
-                exec_result,
+                connect_result,
                 workspace,
                 &effective_tls,
                 gateway_name,
@@ -1010,7 +992,9 @@ pub async fn sandbox_create(
             .await
         }
         SandboxPhase::Error => {
-            if last_error_reason.is_empty() {
+            drop(stream);
+            drop(client);
+            let create_result = if last_error_reason.is_empty() {
                 Err(miette::miette!(
                     "sandbox entered error phase while provisioning"
                 ))
@@ -1019,7 +1003,17 @@ pub async fn sandbox_create(
                     "sandbox entered error phase while provisioning: {}",
                     last_error_reason
                 ))
-            }
+            };
+            finalize_sandbox_create_session(
+                &effective_server,
+                &sandbox_name,
+                persist,
+                create_result,
+                workspace,
+                &effective_tls,
+                gateway_name,
+            )
+            .await
         }
         _ => Err(miette::miette!(
             "sandbox provisioning stream ended before reaching terminal phase"
@@ -1820,8 +1814,10 @@ impl Drop for RawModeGuard {
     }
 }
 
+#[cfg(unix)]
 struct TaskGuard(tokio::task::JoinHandle<()>);
 
+#[cfg(unix)]
 impl Drop for TaskGuard {
     fn drop(&mut self) {
         self.0.abort();
@@ -1836,7 +1832,9 @@ async fn sandbox_exec_interactive_grpc(
     timeout_seconds: u32,
     environment: &HashMap<String, String>,
 ) -> Result<i32> {
-    use openshell_core::proto::{ExecSandboxInput, ExecSandboxWindowResize, exec_sandbox_input};
+    #[cfg(unix)]
+    use openshell_core::proto::ExecSandboxWindowResize;
+    use openshell_core::proto::{ExecSandboxInput, exec_sandbox_input};
     use tokio_stream::wrappers::ReceiverStream;
 
     let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
@@ -1875,31 +1873,26 @@ async fn sandbox_exec_interactive_grpc(
     // spawn_blocking) so the tokio runtime shutdown doesn't wait for a
     // thread blocked on stdin.read(). The thread exits when the channel
     // closes (blocking_send returns Err) or stdin hits EOF.
-    #[cfg(unix)]
-    {
-        let stdin_tx = input_tx.clone();
-        std::thread::spawn(move || {
-            let mut stdin = std::io::stdin().lock();
-            let mut buf = [0u8; 4096];
-            loop {
-                match stdin.read(&mut buf) {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => {
-                        if stdin_tx
-                            .blocking_send(ExecSandboxInput {
-                                payload: Some(exec_sandbox_input::Payload::Stdin(
-                                    buf[..n].to_vec(),
-                                )),
-                            })
-                            .is_err()
-                        {
-                            break;
-                        }
+    let stdin_tx = input_tx.clone();
+    std::thread::spawn(move || {
+        let mut stdin = std::io::stdin().lock();
+        let mut buf = [0u8; 4096];
+        loop {
+            match stdin.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if stdin_tx
+                        .blocking_send(ExecSandboxInput {
+                            payload: Some(exec_sandbox_input::Payload::Stdin(buf[..n].to_vec())),
+                        })
+                        .is_err()
+                    {
+                        break;
                     }
                 }
             }
-        });
-    }
+        }
+    });
 
     // SIGWINCH handler: forward terminal resize events.
     #[cfg(unix)]
@@ -2417,6 +2410,135 @@ pub async fn sandbox_delete(
     }
 
     Ok(())
+}
+
+/// Stop a sandbox while retaining its persistent workspace.
+pub async fn sandbox_stop(
+    server: &str,
+    name: &str,
+    workspace: &str,
+    tls: &TlsOptions,
+) -> Result<()> {
+    if let Ok(stopped) = stop_forwards_for_sandbox(name) {
+        for port in stopped {
+            eprintln!(
+                "{} Stopped forward of port {port} for sandbox {name}",
+                "✓".green().bold(),
+            );
+        }
+    }
+
+    let mut client = grpc_client(server, tls).await?;
+    let sandbox = client
+        .stop_sandbox(StopSandboxRequest {
+            name: name.to_string(),
+            workspace: workspace.to_string(),
+        })
+        .await
+        .into_diagnostic()?
+        .into_inner()
+        .sandbox
+        .ok_or_else(|| miette!("gateway returned no sandbox after stop"))?;
+    wait_for_lifecycle_phase(&mut client, sandbox, SandboxPhase::Stopped).await?;
+    println!("{} Stopped sandbox {name}", "✓".green().bold());
+    Ok(())
+}
+
+/// Start a stopped sandbox and wait until it is ready.
+pub async fn sandbox_start(
+    server: &str,
+    name: &str,
+    workspace: &str,
+    tls: &TlsOptions,
+) -> Result<()> {
+    let mut client = grpc_client(server, tls).await?;
+    let sandbox = client
+        .start_sandbox(StartSandboxRequest {
+            name: name.to_string(),
+            workspace: workspace.to_string(),
+        })
+        .await
+        .into_diagnostic()?
+        .into_inner()
+        .sandbox
+        .ok_or_else(|| miette!("gateway returned no sandbox after start"))?;
+    wait_for_lifecycle_phase(&mut client, sandbox, SandboxPhase::Ready).await?;
+    println!("{} Started sandbox {name}", "✓".green().bold());
+    Ok(())
+}
+
+async fn wait_for_lifecycle_phase(
+    client: &mut crate::tls::GrpcClient,
+    sandbox: Sandbox,
+    target: SandboxPhase,
+) -> Result<Sandbox> {
+    let current = SandboxPhase::try_from(sandbox.phase()).unwrap_or(SandboxPhase::Unknown);
+    if current == target {
+        return Ok(sandbox);
+    }
+    if current == SandboxPhase::Error {
+        return Err(miette!(
+            "sandbox entered Error while waiting for {target:?}"
+        ));
+    }
+
+    let timeout = Duration::from_secs(
+        std::env::var("OPENSHELL_LIFECYCLE_TIMEOUT")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(300),
+    );
+    let sandbox_id = sandbox.object_id().to_string();
+    let mut stream = client
+        .watch_sandbox(WatchSandboxRequest {
+            id: sandbox_id,
+            follow_status: true,
+            follow_logs: false,
+            follow_events: false,
+            log_tail_lines: 0,
+            event_tail: 0,
+            stop_on_terminal: false,
+            log_since_ms: 0,
+            log_sources: Vec::new(),
+            log_min_level: String::new(),
+        })
+        .await
+        .into_diagnostic()?
+        .into_inner();
+
+    let deadline = Instant::now() + timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(miette!(
+                "timed out after {}s waiting for sandbox to reach {target:?}",
+                timeout.as_secs()
+            ));
+        }
+        let event = tokio::time::timeout(remaining, stream.next())
+            .await
+            .map_err(|_| {
+                miette!(
+                    "timed out after {}s waiting for sandbox to reach {target:?}",
+                    timeout.as_secs()
+                )
+            })?
+            .ok_or_else(|| miette!("sandbox watch ended before reaching {target:?}"))?
+            .into_diagnostic()?;
+        if let Some(openshell_core::proto::sandbox_stream_event::Payload::Sandbox(sandbox)) =
+            event.payload
+        {
+            let phase = SandboxPhase::try_from(sandbox.phase()).unwrap_or(SandboxPhase::Unknown);
+            if phase == target {
+                return Ok(sandbox);
+            }
+            if phase == SandboxPhase::Error {
+                let detail = ready_false_condition_message(sandbox.status.as_ref())
+                    .unwrap_or_else(|| "sandbox entered Error".to_string());
+                return Err(miette!(detail));
+            }
+        }
+    }
 }
 
 /// Return the provider type inferred from the trailing command, if any.
@@ -3252,6 +3374,126 @@ fn missing_credentials_error(provider_type: &str) -> miette::Report {
     )
 }
 
+async fn provider_credential_from_oidc_token(
+    credentials: &[String],
+    profile: Option<&ProviderProfile>,
+    tls: &TlsOptions,
+) -> Result<(HashMap<String, String>, HashMap<String, i64>)> {
+    let credential_key = oidc_subject_credential_key(credentials, profile)?;
+
+    let gateway_name = tls.gateway_name().ok_or_else(|| {
+        miette::miette!("--from-oidc-token requires an active named OIDC gateway")
+    })?;
+    let bundle =
+        crate::oidc_auth::ensure_valid_oidc_token_bundle(gateway_name, tls.gateway_insecure)
+            .await
+            .map_err(|err| {
+                miette::miette!(
+                    "failed to load or refresh OIDC token for gateway '{gateway_name}' while preparing provider credential: {err}"
+                )
+            })?;
+
+    let mut credential_map = HashMap::new();
+    credential_map.insert(credential_key.clone(), bundle.access_token);
+
+    let mut credential_expires_at_ms = HashMap::new();
+    if let Some(expires_at) = bundle.expires_at {
+        let expires_at_ms = i64::try_from(expires_at)
+            .unwrap_or(i64::MAX / 1000)
+            .saturating_mul(1000);
+        credential_expires_at_ms.insert(credential_key, expires_at_ms);
+    }
+
+    Ok((credential_map, credential_expires_at_ms))
+}
+
+fn oidc_subject_credential_key(
+    credentials: &[String],
+    profile: Option<&ProviderProfile>,
+) -> Result<String> {
+    if credentials.len() > 1 {
+        return Err(miette::miette!(
+            "--from-oidc-token accepts at most one --credential KEY destination"
+        ));
+    }
+
+    if let Some(credential) = credentials.first() {
+        let credential = credential.trim();
+        if credential.is_empty() || credential.contains('=') {
+            return Err(miette::miette!(
+                "--from-oidc-token requires --credential KEY without an inline value"
+            ));
+        }
+        if let Some(profile) = profile {
+            ensure_profile_declares_subject_credential(profile, credential)?;
+        }
+        return Ok(credential.to_string());
+    }
+
+    let Some(profile) = profile else {
+        return Err(miette::miette!(
+            "--from-oidc-token requires --credential KEY when the provider profile is unavailable"
+        ));
+    };
+
+    infer_oidc_subject_credential_from_profile(profile)
+}
+
+fn ensure_profile_declares_subject_credential(
+    profile: &ProviderProfile,
+    credential: &str,
+) -> Result<()> {
+    let matches = token_exchange_subject_credentials(profile);
+    if matches.iter().any(|candidate| candidate == credential) {
+        return Ok(());
+    }
+    Err(miette::miette!(
+        "credential '{credential}' is not declared as a token-exchange subject credential in provider profile '{}'; expected one of: {}",
+        profile.id,
+        matches.join(", ")
+    ))
+}
+
+fn infer_oidc_subject_credential_from_profile(profile: &ProviderProfile) -> Result<String> {
+    let matches = token_exchange_subject_credentials(profile);
+    match matches.as_slice() {
+        [credential] => Ok(credential.clone()),
+        [] => Err(miette::miette!(
+            "provider profile '{}' does not declare a token-exchange subject credential; pass --credential KEY",
+            profile.id
+        )),
+        _ => Err(miette::miette!(
+            "provider profile '{}' declares multiple token-exchange subject credentials ({}); pass --credential KEY",
+            profile.id,
+            matches.join(", ")
+        )),
+    }
+}
+
+fn token_exchange_subject_credentials(profile: &ProviderProfile) -> Vec<String> {
+    let mut matches = Vec::new();
+    for credential in &profile.credentials {
+        let Some(token_grant) = credential.token_grant.as_ref() else {
+            continue;
+        };
+        if ProviderCredentialTokenGrantType::try_from(token_grant.grant_type).ok()
+            != Some(ProviderCredentialTokenGrantType::TokenExchange)
+        {
+            continue;
+        }
+        let Some(subject_token) = token_grant.subject_token.as_ref() else {
+            continue;
+        };
+        if subject_token.source != "provider_credential" || subject_token.credential.is_empty() {
+            continue;
+        }
+        if !matches.contains(&subject_token.credential) {
+            matches.push(subject_token.credential.clone());
+        }
+    }
+    matches
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn provider_create(
     server: &str,
@@ -3264,44 +3506,77 @@ pub async fn provider_create(
     workspace: &str,
     tls: &TlsOptions,
 ) -> Result<()> {
-    provider_create_with_options(
+    let credential_source = match (from_existing, from_gcloud_adc) {
+        (true, true) => {
+            return Err(miette::miette!(
+                "--from-gcloud-adc cannot be combined with --from-existing, --from-oidc-token, or --credential; it also cannot be combined with --runtime-credentials"
+            ));
+        }
+        (true, false) => ProviderCreateCredentialSource::Existing,
+        (false, true) => ProviderCreateCredentialSource::GcloudAdc,
+        (false, false) => ProviderCreateCredentialSource::ExplicitCredentials,
+    };
+    provider_create_with_options(ProviderCreateOptions {
         server,
         name,
         provider_type,
-        from_existing,
         credentials,
-        from_gcloud_adc,
-        false,
+        credential_source,
         config,
         workspace,
-        workspace,
+        profile_workspace: workspace,
         tls,
-    )
+    })
     .await
 }
 
-#[allow(clippy::too_many_arguments)]
-pub async fn provider_create_with_options(
-    server: &str,
-    name: &str,
-    provider_type: &str,
-    from_existing: bool,
-    credentials: &[String],
-    from_gcloud_adc: bool,
-    runtime_credentials: bool,
-    config: &[String],
-    workspace: &str,
-    profile_workspace: &str,
-    tls: &TlsOptions,
-) -> Result<()> {
-    if from_gcloud_adc && (from_existing || !credentials.is_empty() || runtime_credentials) {
+pub struct ProviderCreateOptions<'a> {
+    pub server: &'a str,
+    pub name: &'a str,
+    pub provider_type: &'a str,
+    pub credentials: &'a [String],
+    pub credential_source: ProviderCreateCredentialSource,
+    pub config: &'a [String],
+    pub workspace: &'a str,
+    pub profile_workspace: &'a str,
+    pub tls: &'a TlsOptions,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProviderCreateCredentialSource {
+    ExplicitCredentials,
+    Existing,
+    GcloudAdc,
+    OidcToken,
+    Runtime,
+}
+
+pub async fn provider_create_with_options(options: ProviderCreateOptions<'_>) -> Result<()> {
+    let ProviderCreateOptions {
+        server,
+        name,
+        provider_type,
+        credentials,
+        credential_source,
+        config,
+        workspace,
+        profile_workspace,
+        tls,
+    } = options;
+
+    let from_existing = credential_source == ProviderCreateCredentialSource::Existing;
+    let from_gcloud_adc = credential_source == ProviderCreateCredentialSource::GcloudAdc;
+    let from_oidc_token = credential_source == ProviderCreateCredentialSource::OidcToken;
+    let runtime_credentials = credential_source == ProviderCreateCredentialSource::Runtime;
+
+    if from_gcloud_adc && !credentials.is_empty() {
         return Err(miette::miette!(
-            "--from-gcloud-adc cannot be combined with --from-existing, --credential, or --runtime-credentials"
+            "--from-gcloud-adc cannot be combined with --from-existing, --from-oidc-token, or --credential; it also cannot be combined with --runtime-credentials"
         ));
     }
-    if from_existing && (!credentials.is_empty() || runtime_credentials) {
+    if from_existing && !credentials.is_empty() {
         return Err(miette::miette!(
-            "--from-existing cannot be combined with --credential or --runtime-credentials"
+            "--from-existing cannot be combined with --credential"
         ));
     }
     if runtime_credentials && !credentials.is_empty() {
@@ -3371,7 +3646,17 @@ pub async fn provider_create_with_options(
         None
     };
 
-    let mut credential_map = parse_credential_pairs(credentials)?;
+    let oidc_profile = if from_oidc_token {
+        Some(fetch_provider_profile(&mut client, &provider_type, profile_workspace).await?)
+    } else {
+        None
+    };
+
+    let (mut credential_map, oidc_credential_expires_at_ms) = if from_oidc_token {
+        provider_credential_from_oidc_token(credentials, oidc_profile.as_ref(), tls).await?
+    } else {
+        (parse_credential_pairs(credentials)?, HashMap::new())
+    };
     let mut config_map = parse_key_value_pairs(config, "--config")?;
 
     if from_existing {
@@ -3445,7 +3730,7 @@ pub async fn provider_create_with_options(
                 r#type: provider_type.clone(),
                 credentials: credential_map,
                 config: config_map,
-                credential_expires_at_ms: HashMap::new(),
+                credential_expires_at_ms: oidc_credential_expires_at_ms,
                 profile_workspace: profile_workspace.to_string(),
                 credential_handles: HashMap::new(),
             }),
@@ -4473,28 +4758,73 @@ fn print_provider_type_row(
     );
 }
 
-#[allow(clippy::too_many_arguments)]
-pub async fn provider_update(
-    server: &str,
-    name: &str,
-    from_existing: bool,
-    credentials: &[String],
-    config: &[String],
-    credential_expires_at: &[String],
-    workspace: &str,
-    tls: &TlsOptions,
-) -> Result<()> {
+pub struct ProviderUpdateOptions<'a> {
+    pub server: &'a str,
+    pub name: &'a str,
+    pub from_existing: bool,
+    pub from_oidc_token: bool,
+    pub credentials: &'a [String],
+    pub config: &'a [String],
+    pub credential_expires_at: &'a [String],
+    pub workspace: &'a str,
+    pub tls: &'a TlsOptions,
+}
+
+pub async fn provider_update(options: ProviderUpdateOptions<'_>) -> Result<()> {
+    let ProviderUpdateOptions {
+        server,
+        name,
+        from_existing,
+        from_oidc_token,
+        credentials,
+        config,
+        credential_expires_at,
+        workspace,
+        tls,
+    } = options;
+
     if from_existing && !credentials.is_empty() {
         return Err(miette::miette!(
             "--from-existing cannot be combined with --credential"
         ));
     }
+    if from_existing && from_oidc_token {
+        return Err(miette::miette!(
+            "--from-existing cannot be combined with --from-oidc-token"
+        ));
+    }
 
     let mut client = grpc_client(server, tls).await?;
 
-    let mut credential_map = parse_credential_pairs(credentials)?;
+    let oidc_profile = if from_oidc_token {
+        let existing = client
+            .get_provider(GetProviderRequest {
+                name: name.to_string(),
+                workspace: workspace.to_string(),
+            })
+            .await
+            .into_diagnostic()?
+            .into_inner()
+            .provider
+            .ok_or_else(|| miette::miette!("provider '{name}' not found"))?;
+        let profile_workspace = if existing.profile_workspace.is_empty() {
+            workspace
+        } else {
+            &existing.profile_workspace
+        };
+        Some(fetch_provider_profile(&mut client, &existing.r#type, profile_workspace).await?)
+    } else {
+        None
+    };
+
+    let (mut credential_map, oidc_credential_expires_at_ms) = if from_oidc_token {
+        provider_credential_from_oidc_token(credentials, oidc_profile.as_ref(), tls).await?
+    } else {
+        (parse_credential_pairs(credentials)?, HashMap::new())
+    };
     let mut config_map = parse_key_value_pairs(config, "--config")?;
-    let credential_expires_at_ms = parse_credential_expiry_pairs(credential_expires_at)?;
+    let mut credential_expires_at_ms = parse_credential_expiry_pairs(credential_expires_at)?;
+    credential_expires_at_ms.extend(oidc_credential_expires_at_ms);
 
     if from_existing {
         // Fetch the existing provider to discover its type for credential lookup.
@@ -6757,8 +7087,23 @@ pub async fn sandbox_draft_get(
         if !chunk.validation_result.is_empty() {
             println!(
                 "  {} {}",
-                "Validation:".dimmed(),
+                "Prover:".dimmed(),
                 chunk.validation_result.cyan()
+            );
+        }
+        if !chunk.application_error.is_empty() {
+            println!(
+                "  {} {}",
+                "Application:".dimmed(),
+                chunk.application_error.red()
+            );
+        }
+        if !chunk.candidate_effective_policy_hash.is_empty() {
+            println!(
+                "  {} {}",
+                "Candidate:".dimmed(),
+                &chunk.candidate_effective_policy_hash
+                    [..12.min(chunk.candidate_effective_policy_hash.len())]
             );
         }
 
@@ -6794,12 +7139,27 @@ pub async fn sandbox_draft_approve(
     tls: &TlsOptions,
 ) -> Result<()> {
     let mut client = grpc_client(server, tls).await?;
+    let review_token = client
+        .get_draft_policy(GetDraftPolicyRequest {
+            name: name.to_string(),
+            status_filter: String::new(),
+            workspace: workspace.to_string(),
+        })
+        .await
+        .into_diagnostic()?
+        .into_inner()
+        .chunks
+        .into_iter()
+        .find(|chunk| chunk.id == chunk_id)
+        .ok_or_else(|| miette::miette!("draft chunk '{chunk_id}' not found"))?
+        .review_token;
 
     let response = client
         .approve_draft_chunk(ApproveDraftChunkRequest {
             name: name.to_string(),
             chunk_id: chunk_id.to_string(),
             workspace: workspace.to_string(),
+            review_token,
         })
         .await
         .into_diagnostic()?;
@@ -6850,12 +7210,29 @@ pub async fn sandbox_draft_approve_all(
     tls: &TlsOptions,
 ) -> Result<()> {
     let mut client = grpc_client(server, tls).await?;
+    let approvals = client
+        .get_draft_policy(GetDraftPolicyRequest {
+            name: name.to_string(),
+            status_filter: "pending".to_string(),
+            workspace: workspace.to_string(),
+        })
+        .await
+        .into_diagnostic()?
+        .into_inner()
+        .chunks
+        .into_iter()
+        .map(|chunk| openshell_core::proto::DraftChunkApproval {
+            chunk_id: chunk.id,
+            review_token: chunk.review_token,
+        })
+        .collect();
 
     let response = client
         .approve_all_draft_chunks(ApproveAllDraftChunksRequest {
             name: name.to_string(),
             include_security_flagged,
             workspace: workspace.to_string(),
+            approvals,
         })
         .await
         .into_diagnostic()?;

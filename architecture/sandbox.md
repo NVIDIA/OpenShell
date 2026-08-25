@@ -29,10 +29,11 @@ only when the set is already empty; any other outcome fails the spawn.
    gateway, depending on mode.
 3. It prepares filesystem access, process restrictions, network namespace
    routing, trust stores, provider credential resolution, and inference routes.
-4. It starts the policy proxy and local SSH server.
-5. It opens a supervisor session back to the gateway for connect, exec, file
+4. It launches the persisted canonical main-process argv and retains its PTY
+   or pipes in the main-session multiplexer.
+5. It starts the policy proxy and local SSH server.
+6. It opens a supervisor session back to the gateway for connect, exec, file
    sync, config polling, and log push.
-6. It launches the agent command as the resolved restricted identity.
 
 ## Isolation Layers
 
@@ -51,6 +52,9 @@ paths, such as proxy support files or GPU device paths when a GPU is present.
 
 ## Network and Inference
 
+See [Sandbox Limits](sandbox-limits.md) for the current numeric safety ceilings,
+their ownership, terminal behavior, and known gaps.
+
 All ordinary agent egress is routed through the sandbox proxy. The proxy
 identifies the calling binary, checks trust-on-first-use binary identity, rejects
 unsafe internal destinations, and evaluates the active policy. On Linux, it
@@ -60,10 +64,10 @@ socket inode.
 
 CONNECT and absolute-form forward HTTP are explicit-proxy adapters over the same
 egress pipeline. Each adapter normalizes its request into an egress intent, and
-the shared authorization result carries the process evidence used by destination
-validation and relay selection. During the compatibility migration, endpoint
-state is hydrated at the adapters' existing policy query points; it is not yet
-one atomic, generation-consistent authorization result. Destination validation
+the shared authorization result carries the process evidence and endpoint
+metadata used by destination validation and relay selection. Network action,
+matched policy, endpoint configuration, and exact-host authorization are
+evaluated as one atomic snapshot from one policy generation. Destination validation
 returns an unopened connector so adapters retain their existing response and
 upstream-dial timing. CONNECT prepares a generation-pinned relay context before
 entering shared TLS-terminated or plaintext HTTP relays; non-HTTP traffic uses
@@ -71,6 +75,39 @@ the shared raw byte relay after the existing adapter gates. Forward HTTP retains
 its guarded single-request relay while sharing authorization, request context,
 policy-pinning, and destination boundaries.
 Adapter-specific response and OCSF event shapes remain at the protocol boundary.
+An explicit `protocol: tcp` endpoint with a valid DNS hostname opts into native
+DNS and transparent TCP when the selected runtime advertises that substrate.
+Hostless `allowed_ips` and literal-IP selectors remain available only to the
+legacy explicit-proxy path when `protocol` is omitted. The shared supervisor
+answers only eligible DNS names, returns an epoch-scoped synthetic address, and
+publishes the expiring name, endpoint, ports, policy generation, and validated
+real addresses as one correlation. A connection to that synthetic address is
+captured before the bypass fence, mapped back to its workload process, authorized
+through the same egress pipeline, and dialed only through the pinned addresses.
+Omitted protocol endpoints retain explicit-proxy behavior.
+
+The DNS store is in-memory and sandbox-local. A combined-supervisor restart also
+restarts its workload; before execution, the supervisor advances a persisted
+boot epoch and installs only that epoch's synthetic capture ranges. An address
+cached from the preceding epoch therefore falls through to the bypass fence
+instead of inheriting a new mapping. Policy reload, expiry, wrong ports, direct real-IP access, missing
+mappings, or pool exhaustion fail closed. Resolver injection, DNS listeners,
+capture rules, and the transparent listener are all ready before workload
+execution. A runtime that cannot provide the complete contract rejects a policy
+containing explicit TCP endpoints rather than partially activating it. Because
+that substrate is startup infrastructure, a sandbox created without explicit
+TCP endpoints rejects a hot reload that introduces one and keeps its complete
+previous policy active; recreating the sandbox installs the substrate before
+the workload starts. A sandbox that started with the substrate may continue to
+remove and re-add TCP endpoints through ordinary atomic policy reloads.
+Workload DNS targets port 53, while nftables redirects eligible IPv4 DNS traffic
+to an unprivileged supervisor listener. The filter admits DNS and transparent
+TCP only when the kernel records the traffic as DNATed to the corresponding
+supervisor listener, so direct dials to either unprivileged listener port remain
+fenced. `SO_ORIGINAL_DST`, synthetic mapping lookup, endpoint correlation, and
+generation-pinned authorization form the transparent TCP security boundary.
+Docker and Podman do not currently advertise usable IPv6 egress for this
+substrate, so AAAA queries return NOERROR/NODATA and IPv6 DNS remains fenced.
 
 Provider credential placeholders are resolved through the live provider state
 for each HTTP request, after destination and L7 policy admission. A static
@@ -84,6 +121,25 @@ partially active or last-known-good static set. Invalid metadata preserves the
 supplied dynamic snapshot, while a fetch failure preserves the currently active
 dynamic snapshot.
 
+In the Kubernetes sidecar topology, the provider environment revision remains
+an opaque content fingerprint and has no numeric ordering semantics. The
+network supervisor assigns a separate, connection-local monotonic generation
+to each distinct environment it publishes. The process supervisor applies only
+newer generations, which accepts descending fingerprint values while rejecting
+duplicate or delayed sidecar messages.
+
+Gateway-managed refresh credentials use an opaque workload handle derived from
+the sandbox, provider identity, credential key, refresh authorization epoch,
+and canonical endpoint boundary. The handle remains stable while the gateway
+rotates the short-lived value, so an already-running process keeps one
+placeholder and each request resolves against the current token. Explicit
+refresh reconfiguration, provider replacement or detachment, and endpoint
+boundary changes produce a new handle and revoke the old one. Supervisors do
+not retain old values for these handles. Public provider updates cannot replace
+or delete the refresh-owned primary credential or co-minted outputs; internal
+CAS rotation and explicit refresh lifecycle operations own those values.
+Unmanaged static credentials retain the bounded revision-generation behavior.
+
 Route selection and policy evaluation use a syntax-only redacted request target;
 they do not materialize real credentials. Cross-endpoint placeholder use returns
 HTTP 403. After a WebSocket upgrade it closes the connection with policy
@@ -93,12 +149,11 @@ finding without logging the placeholder, environment key, secret, or query.
 For inspected HTTP traffic, the proxy can enforce REST method/path rules,
 WebSocket upgrade and text-message rules, GraphQL operation rules, and
 MCP method, tool, and supported params rules or generic JSON-RPC method rules
-on sandbox-to-server request bodies. MCP and JSON-RPC inspection buffers up to
-the endpoint `mcp.max_body_bytes` or `json_rpc.max_body_bytes` limit. MCP
-`tools/call` tool names are checked against the spec-recommended syntax by
-default before policy evaluation, with a per-endpoint `mcp.strict_tool_names`
-compatibility opt-out. Generic JSON-RPC policies do not support `params`
-matchers; generic JSON-RPC rules match only the method.
+on sandbox-to-server request bodies. MCP and JSON-RPC inspection buffers
+bounded request bodies. MCP `tools/call` tool names are checked against the
+spec-recommended syntax by default before policy evaluation, with a per-endpoint
+`mcp.strict_tool_names` compatibility opt-out. Generic JSON-RPC policies do not
+support `params` matchers; generic JSON-RPC rules match only the method.
 JSON-RPC responses and server-to-client MCP messages on response or SSE streams
 are relayed but are not currently parsed for policy enforcement.
 
@@ -108,20 +163,51 @@ host selectors choose the chain independently of the network rule that admitted
 the request. Policy-local map keys identify configs, while built-in names or
 operator-owned registration names identify implementations.
 
-Built-ins run in-process against a borrowed view of the chain's current request state. Operator services retain the bounded protobuf/gRPC contract, and the remote adapter materializes an owned evaluation only when the request crosses that transport boundary. `openshell-policy` validates policy-owned structure, and the active middleware registry validates implementation-owned config. The generic registry and chain runner live in `openshell-supervisor-middleware`; first-party implementations live in `openshell-supervisor-middleware-builtins`.
+Built-ins run in-process against a borrowed view of the chain's current HTTP
+request state. Operator services retain the bounded protobuf/gRPC contract, and
+the remote adapter materializes an owned HTTP evaluation only when a request
+crosses that transport boundary. Both paths support bounded bidirectional
+WebSocket sessions, so a manifest advertises capabilities independently of
+transport.
+The runtime keeps three states distinct: host selection attaches policy configs,
+manifest operation and phase bindings select the active chain, and the parsed
+message type determines whether that chain can inspect an individual payload.
+An attachment without a WebSocket binding is not a failed WebSocket stage.
+Binary messages are outside the V1 text-message binding. Both cases pass through
+with informational coverage telemetry rather than applying `on_error`.
+The chain runner owns shared sequencing, deadlines, backpressure, and response
+validation. `openshell-policy` validates policy-owned structure, and the active
+middleware registry validates implementation-owned config. The generic
+registry and chain runner live in `openshell-supervisor-middleware`; first-party
+implementations live in `openshell-supervisor-middleware-builtins`.
 
 The supervisor installs policy and middleware registry changes as one runtime
 generation and preserves the last-known-good generation if preparation fails.
 Policy-only updates reuse the connected registry, so an external middleware
 outage cannot block unrelated policy changes.
 
+For authenticated operator middleware, the supervisor requests credentials by
+registration name through `RefreshSandboxToken`. The gateway resolves names
+against the effective policy and mints exact-audience credentials. The
+supervisor keeps them in refreshable in-memory slots outside stable middleware
+configuration, so rotation neither changes `config_revision` nor reconnects
+the registry. Public custom-CA PEM travels with the stable registration.
+
+The slots live in a supervisor-owned `ExtensionCredentialStore` shared by every
+gateway connection the supervisor opens, so the registry's clients and the
+polling loop that rotates them observe the same credentials. Configuration
+polling runs far more frequently than credentials expire, so the loop rotates
+only when a credential is missing or has passed four fifths of its lifetime,
+and bounds its sleep by the soonest rotation deadline.
+
 Middleware cannot observe injected credentials or mutate supervisor-owned
 credential, routing, or framing headers. Body transformations are re-evaluated
 against body-aware L7 policy before later stages or the upstream can observe
 them. Requests, results, chain length, execution time, and diagnostics are
 bounded; external free-form diagnostic text is not exposed in responses or
-security logs. See [Supervisor Middleware](../docs/extensibility/supervisor-middleware.mdx)
-for configuration and protocol details.
+security logs. See
+[Supervisor Middleware](../docs/extensibility/supervisor-middleware.mdx) for
+configuration and protocol details.
 
 `https://inference.local` is special. It bypasses OPA network policy and is
 handled by the inference interception path:
@@ -152,9 +238,12 @@ loopback always dial directly; add driver-injected host aliases (e.g.
 proxy cannot reach the container host. `NO_PROXY` matching is port-aware and
 resolution-aware: an entry with a `:port` qualifier only bypasses that port,
 and IP/CIDR entries also match hostnames through their validated resolved
-addresses, with the direct dial limited to the addresses the entry contains. Only `http://` proxy URLs in explicit
-`http://host:port` form are supported — the scheme and port are both
-required, and a path, query, or fragment is rejected. Local DNS resolution
+addresses, with the direct dial limited to the addresses the entry contains. `http://` and `https://` proxy URLs in explicit
+`scheme://host:port` form are supported — the scheme and port are both
+required, and a path, query, or fragment is rejected. For an `https://` proxy
+the supervisor wraps the connection to the proxy in TLS before the CONNECT
+handshake, verifying the proxy certificate against the built-in and system
+roots plus the optional operator CA bundle (see below). Local DNS resolution
 and SSRF validation still run before the proxied dial, and the CONNECT
 target sent to the corporate proxy is a validated resolved address, so the
 proxy performs no DNS resolution of its own and the tunnel stays bound to
@@ -171,15 +260,30 @@ enhancement and out of scope.) The workload child's proxy variables are
 unaffected — they are always rewritten to point at the local policy proxy.
 
 The configuration is fail-closed: a setting that is present but invalid — an
-empty value, an unsupported or malformed proxy URL, an unreadable auth file,
-a malformed credential, or an auth file or `NO_PROXY` list set while no proxy
-URL is configured — is fatal to supervisor startup instead of being treated
-as unset, so a misconfiguration can never silently degrade to direct dialing
-or unauthenticated proxy access. Only an omitted argument means "no proxy".
-The driver validates the same rules at sandbox-create time through
-validators shared with the supervisor
+empty value, an unsupported or malformed proxy URL, an unreadable auth file or
+CA bundle, a malformed credential, or an auth file, `NO_PROXY` list, or CA
+bundle set while no proxy URL is configured — is fatal to supervisor startup
+instead of being treated as unset, so a misconfiguration can never silently
+degrade to direct dialing or unauthenticated proxy access. Only an omitted
+argument means "no proxy". The driver validates the same rules at
+sandbox-create time through validators shared with the supervisor
 (`openshell_core::driver_utils::parse_upstream_proxy_url` and
 `parse_upstream_proxy_credential`).
+
+An optional operator CA bundle (`--upstream-proxy-ca-bundle`, a PEM path the
+driver bind-mounts read-only into the sandbox) extends the trust boundary for
+corporate proxies. A CA certificate is not secret, so unlike the auth file it
+travels as a plain read-only bind mount rather than a driver secret. It is
+trusted in two places: the TLS handshake with an `https://` proxy, and —
+because a TLS-intercepting proxy (mitmproxy, squid `ssl-bump`) re-signs
+tunneled server certificates with the same CA — the sandbox combined trust
+bundle (`write_ca_files`) and the L7 upstream re-encryption store
+(`build_upstream_client_config`). Folding it into both means intercepted
+upstream handshakes succeed and sandbox workload processes trust the re-signed
+certificates; trusting it only for the proxy-listener handshake would leave
+every intercepted upstream connection failing. The bundle is valid with either
+an `http://` or `https://` proxy (an intercepting proxy can be reached over
+plain HTTP) and is fail-closed: an unreadable or certificate-free file is fatal.
 
 Proxy credentials are never embedded in the URL: an inline `user:pass@` is
 rejected because it would be stored in `gateway.toml` and exposed in container
@@ -189,6 +293,14 @@ that path on the supervisor's command line. The supervisor reads the
 file and builds the `Proxy-Authorization: Basic` header; a credential that is
 empty, contains control characters, or is not in `user:pass` form is fatal on
 both sides.
+
+For Kubernetes sandboxes, the operator configures a Secret name and key rather
+than a gateway-host file path. Kubernetes projects that Secret only into the
+container that runs network supervision. Proxy credential Secrets require the
+sidecar topology, which gives them a separate container boundary from the
+workload. Combined topology is rejected because Kubernetes `fsGroup` volume
+permission handling can make a shared credential mount readable by the sandbox
+group.
 
 The Basic header travels over the plain-TCP connection to the `http://` proxy,
 so it is readable on the network path between sandbox host and proxy.
@@ -217,17 +329,35 @@ when policy allows the target endpoint. For GCP providers, a loopback metadata
 server inside the network namespace serves placeholders to SDKs that bypass the
 proxy (e.g. Go's `cloud.google.com/go/compute/metadata`). Secrets must not be
 logged in OCSF or plain tracing output. The supervisor uses revision-scoped
-placeholders for rotating provider credentials; provider environment keys
-beginning with `v<digits>_` are reserved for that placeholder namespace.
+placeholders for unmanaged rotating credentials and identity-stable opaque
+handles for gateway-managed refresh credentials. Provider environment keys
+beginning with `v<digits>_` or `s<64 lowercase hex characters>_` are reserved
+for those placeholder namespaces.
 
 Provider profiles can also declare dynamic token grants. For matching HTTP
-endpoints, the supervisor obtains a SPIFFE JWT-SVID from the local Workload API,
-exchanges it for an OAuth2 access token, caches the token, and injects it as an
-`Authorization: Bearer` header before forwarding the request. Token grant
-endpoints are HTTPS-only except for loopback and Kubernetes service DNS hosts,
-and returned access tokens must be bearer-compatible before they are cached or
-injected. Token response lifetimes are capped and cached with an expiry margin
-unless a profile supplies an explicit cache TTL override.
+endpoints, the supervisor obtains or exchanges OAuth2 access tokens, caches
+them, and injects them before forwarding the request. `client_credentials`
+grants use the supervisor SPIFFE JWT-SVID directly as the client assertion.
+`token_exchange` grants ask the gateway to broker an intermediate token using a
+stored provider subject credential and the gateway's own SPIFFE JWT-SVID; the
+supervisor then exchanges that intermediate token for the final upstream token
+using its own JWT-SVID. The gateway validates that its own JWT-SVID has the
+requested audience, a SPIFFE subject, and a non-expired `exp` claim when
+present. It also validates that the stored subject credential is declared by the
+provider profile, and that the supervisor JWT-SVID is a well-formed
+three-segment JWT with a SPIFFE subject in the same trust domain as the gateway
+SVID. The gateway verifies the supervisor JWT-SVID signature with JWT bundles
+fetched from its SPIFFE Workload API. Token grant endpoints are HTTPS-only
+except for loopback and Kubernetes service DNS hosts, and returned access tokens
+must be bearer-compatible before they are cached or injected. Token response
+lifetimes are capped and cached with an expiry margin unless a profile supplies
+an explicit cache TTL override. Cache entries are scoped by the sandbox provider
+environment revision so provider credential updates miss the old token cache
+without changing endpoint matching semantics. Gateway-brokered intermediate
+tokens are cached separately by provider resource version, supervisor SPIFFE
+subject, and gateway SPIFFE subject, and their cache lifetime is capped by the
+intermediate token response, stored subject-token expiry, and supervisor SVID
+expiry.
 
 For AWS endpoints that require request-level signing, the proxy supports SigV4
 re-signing. When `credential_signing: sigv4` is set on an L7 endpoint, the proxy
@@ -240,9 +370,8 @@ an attached endpointless AWS profile explicitly named by the endpoint's
 sources atomically. The signing mode is auto-detected from the client SDK's
 `x-amz-content-sha256` header:
 
-- **Signed body** (hex hash): buffers the request body (up to 10 MiB), computes
-  its SHA-256, and includes the hash in the signature. Used by Bedrock and most
-  AWS services.
+- **Signed body** (hex hash): buffers the request body, computes its SHA-256,
+  and includes the hash in the signature. Used by Bedrock and most AWS services.
 - **Streaming unsigned** (`STREAMING-UNSIGNED-PAYLOAD-TRAILER`): signs headers
   only and streams the body through without buffering. Used by S3 uploads with
   `aws-chunked` encoding.
@@ -273,8 +402,10 @@ The supervisor runs an SSH server on a Unix socket inside the sandbox. The
 gateway reaches it through the outbound supervisor relay, not by dialing the
 sandbox workload directly. The relay supports:
 
-- Interactive shell sessions.
-- Command execution.
+- Attachment to the canonical main process through the `openshell-main` SSH
+  subsystem. The supervisor owns its retained PTY or pipes, a 1 MiB replay
+  buffer, and a single stdin lease across client disconnects.
+- Independent shell and command execution sessions.
 - Tar-based file sync.
 - Port forwarding where supported by the CLI/TUI surface.
 
@@ -350,3 +481,7 @@ engine with a gateway policy revision.
   re-evaluate.
 - If the supervisor relay drops, the sandbox can keep running, but connect and
   exec operations fail until the supervisor registers again.
+- If the canonical main process exits, including with code 0, the supervisor
+  reports its normalized exit code before shutdown. The gateway persists the
+  code on sandbox status, records `MainProcessExited`, and makes the sandbox
+  terminal `Error`; runtime restart policies must not replace the process.

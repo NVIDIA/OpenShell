@@ -5,8 +5,6 @@
 //!
 //! This module re-exports the generated protobuf types and service definitions.
 
-#![allow(unexpected_cfgs)]
-
 #[allow(
     clippy::all,
     clippy::pedantic,
@@ -17,10 +15,6 @@
     rust_2018_idioms
 )]
 mod generated {
-    #[cfg(bazel)]
-    include!(env!("OPENSHELL_PROTO_PATH"));
-
-    #[cfg(not(bazel))]
     include!(concat!(env!("OUT_DIR"), "/openshell.rs"));
 }
 
@@ -56,10 +50,6 @@ pub mod compute {
     rust_2018_idioms
 )]
 pub mod credentials {
-    #[cfg(bazel)]
-    pub use super::generated::openshell::credentials::v1;
-
-    #[cfg(not(bazel))]
     pub mod v1 {
         include!(concat!(env!("OUT_DIR"), "/openshell.credentials.v1.rs"));
     }

@@ -1,6 +1,6 @@
 # Contributing to OpenShell
 
-OpenShell is built agent-first. We design systems and use agents to implement them. Your agent is your first collaborator — point it at this repo before opening issues, asking questions, or submitting code.
+OpenShell is built agent-first. We use agents to design and implement systems, while humans manage product decisions and the project roadmap.
 
 ## The Critical Rule
 
@@ -34,30 +34,38 @@ We use a vouch system. This exists because AI makes it trivial to generate plaus
 
 Issues labeled [`good first issue`](https://github.com/NVIDIA/OpenShell/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22) are scoped, well-documented, and friendly to new contributors. Start there. If you need guidance, comment on the issue.
 
-An open issue is not necessarily accepted or ready to be worked on. Human contributors should look for `state:accepted`, `good first issue`, or `help wanted`, or ask a maintainer before starting. Unattended agents additionally require the appropriate human-applied `agent:*` request label; an agent directly asked to work on a specific issue does not. Roadmap placement describes sequencing and does not authorize work.
+An open issue is not necessarily accepted or ready to be worked on. Human contributors should look for `state:accepted`, roadmap placement, `good first issue`, or `help wanted`, or ask a maintainer before starting. Unattended agents require the expected lifecycle state and the appropriate human-applied `agent:*` request label. An agent directly asked to work on a specific issue warns about missing or incomplete expected labels and continues with the requested phase without changing them.
 
 ## Before You Open an Issue
 
-This project ships with [agent skills](#agent-skills-for-contributors) that can diagnose problems, explore the codebase, generate policies, and walk you through common workflows. Before filing an issue:
+Search open and closed issues for the same need. Bug reports and feature requests must include:
 
-1. Clone the repo and point your coding agent at it.
-2. Load the relevant skill - `debug-openshell-cluster` for gateway or deployment problems, `debug-inference` for inference setup problems, `openshell-cli` for usage questions, `generate-sandbox-policy` for policy help.
-3. Have your agent investigate. Let it run diagnostics, read the architecture docs, and attempt a fix.
-4. If the agent cannot resolve it, open an issue **with the agent's diagnostic output attached**. The issue template requires this.
+1. **User Story:** who needs the change and what they need to do.
+2. **Problem Statement:** a concise summary of what is broken or missing in the current behavior.
+3. **Impact / Why This Matters:** the consequences of the current behavior, the current workaround, and why that workaround is insufficient.
+4. **Acceptance Criteria:** specific, observable outcomes that define success.
+
+Feature requests must also propose a user-facing workflow and describe alternatives considered. Define the externally observable behavior and leave internal implementation choices open. Bug reports instead include minimal reproduction steps, the OpenShell version and relevant environment, and a small, redacted log excerpt when it materially clarifies the behavior.
+
+The project includes optional [agent skills](#agent-skills-for-contributors) for self-service troubleshooting and exploration. Use them when they help you, but summarize any useful result in your own words rather than pasting a diagnostic transcript.
 
 ### When to Open an Issue
 
-- A real bug that your agent confirmed and could not fix.
-- A feature proposal with a design — not a "please build this" request.
-- An infrastructure problem that the gateway deployment troubleshooting skill could not resolve.
-- An inference setup problem that the `debug-inference` skill could not resolve.
+- A workflow behaves differently from what you need or reasonably expect.
+- OpenShell does not support an outcome that matters to your workflow.
+- The available documentation or configuration does not explain how to complete a supported workflow.
 - Security vulnerabilities must follow [SECURITY.md](SECURITY.md) — **not** GitHub issues.
 
 ### When NOT to Open an Issue
 
-- Questions about how things work — your agent can answer these from the codebase and architecture docs.
-- Configuration problems - your agent can diagnose these with `openshell-cli`, `debug-openshell-cluster`, and `debug-inference`.
-- "How do I..." requests — the skills cover CLI usage, policy generation, TUI development, and more.
+- General questions or open-ended discussion — use [GitHub Discussions](https://github.com/NVIDIA/OpenShell/discussions).
+- Security vulnerabilities — follow [SECURITY.md](SECURITY.md) instead.
+
+## Before You Submit a Change
+
+Do not start substantial issue-backed work until a maintainer has accepted the issue, unless a maintainer directly asks you to investigate or implement it. Once the work is authorized, use your agent to investigate the current code and behavior. If the issue contains earlier diagnostics, verify them rather than relying on them.
+
+Use agents and the repository skills as needed to understand the affected code, evaluate tradeoffs, implement the smallest coherent change, and verify it. The pull request should explain what changed and how it was tested; it should not substitute an agent transcript for the contributor's understanding.
 
 ## Agent Skills for Contributors
 
@@ -74,7 +82,6 @@ Skills live in `.agents/skills/`. Your agent's harness can discover and load the
 | Contributing    | `create-github-issue`     | Create well-structured GitHub issues                                                                |
 | Contributing    | `create-github-pr`        | Create pull requests with proper conventions                                                        |
 | Reviewing       | `review-github-pr`        | Summarize PR diffs and key design decisions                                                         |
-| Reviewing       | `review-security-changes` | Review code changes for security vulnerabilities and boundary regressions                           |
 | Reviewing       | `review-security-issue`   | Assess security issues for severity and remediation                                                 |
 | Reviewing       | `fix-security-issue`      | Implement an approved security remediation plan                                                     |
 | Reviewing       | `watch-github-actions`    | Monitor CI pipeline status and logs                                                                 |
@@ -84,6 +91,7 @@ Skills live in `.agents/skills/`. Your agent's harness can discover and load the
 | Platform        | `generate-sandbox-policy` | Generate YAML sandbox policies from requirements or API docs                                        |
 | Platform        | `helm-dev-environment`    | Start and manage the local Kubernetes development environment                                       |
 | Platform        | `tui-development`         | Development guide for the ratatui-based terminal UI                                                 |
+| Platform        | `build-openshell-mxc-windows` | Maintain and validate the build-only x64 and ARM64 Windows MSVC lane                             |
 | Documentation   | `update-docs`             | Scan recent commits and draft doc updates for user-facing changes                                   |
 | Maintenance     | `sync-agent-infra`        | Detect and fix drift across agent-first infrastructure files                                        |
 | Reference       | `sbom`                    | Generate SBOMs and resolve dependency licenses                                                      |
@@ -110,11 +118,11 @@ Each issue can require four independent decisions:
 | Decision | Question | Recorded by |
 |---|---|---|
 | Assessment | Is the report technically valid, and is there enough evidence to act on it? | `state:*` |
-| Disposition | Should OpenShell pursue the work? | `state:accepted` or closure as not planned |
+| Disposition | Should OpenShell pursue the work? | `state:accepted`, roadmap placement, or closure as not planned |
 | Sequencing | Where does accepted work sit relative to everything else? | Placement on the [OpenShell Roadmap](https://github.com/orgs/NVIDIA/projects/233) |
 | Ownership | Will a human implement the issue, will a user directly instruct an agent, or will a maintainer queue it for an unattended agent? | Direct instruction or optional `agent:*` workflow |
 
-Completing one decision does not imply the others. `state:validated` confirms that the factual assessment is complete, but it does not mean the project has accepted the work. Roadmap placement communicates sequencing, but it does not authorize an agent to begin.
+`state:validated` confirms that the factual assessment is complete, but it does not mean the project has accepted the work. A maintainer signals acceptance with `state:accepted` or roadmap placement. Roadmap placement also communicates sequencing, but it does not assign an owner or queue an unattended agent.
 
 #### Who Controls Each Decision
 
@@ -125,7 +133,7 @@ Agents investigate issues, collect evidence, and report technical findings. Huma
 | Assess technical validity and impact | Triage agent or human triager |
 | Request missing evidence | Triage agent or human triager |
 | Mark the assessment complete with `state:validated` | Triage agent or human triager |
-| Accept or decline the work | Maintainer |
+| Accept or decline the work with `state:accepted`, roadmap placement, or closure | Maintainer |
 | Place the issue on the roadmap or move it | Maintainer |
 | Directly request an agent plan | User |
 | Queue an agent plan with `agent:plan-requested` | Maintainer |
@@ -133,7 +141,7 @@ Agents investigate issues, collect evidence, and report technical findings. Huma
 | Directly request agent implementation | User |
 | Queue approved implementation with `agent:implementation-requested` | Maintainer |
 
-Agents do not apply `state:accepted`, place issues on the roadmap, or apply `agent:plan-requested` or `agent:implementation-requested`.
+Agents do not apply `state:accepted`, place issues on the roadmap, or apply `agent:plan-requested` or `agent:implementation-requested`. A direct request may authorize work outside the recorded workflow, but it does not alter the issue's disposition or make the labels accurate.
 
 #### Issue State
 
@@ -152,7 +160,7 @@ Keep one of these states on an open issue. When new evidence resolves a `state:n
 
 #### Assessing an Incoming Issue
 
-Triage checks the report, its diagnostic evidence, related issues, current releases, and the relevant code paths. The assessment ends in one of these outcomes:
+Triage checks the user story, reproduction or workflow, environment, related issues, current releases, and the relevant code paths. The assessment ends in one of these outcomes:
 
 | Outcome | State or resolution |
 |---|---|
@@ -171,17 +179,17 @@ Triage establishes facts and impact. It does not decide whether the project shou
 
 When an issue reaches `state:validated`, a maintainer chooses one of three paths:
 
-- **Accept:** replace `state:validated` with `state:accepted` and place it on the roadmap.
+- **Accept:** apply `state:accepted`, place the issue on the roadmap, or do both. Either action signals that OpenShell should pursue the work; roadmap placement additionally records sequencing.
 - **Decline:** close it as not planned and record the rationale.
 - **Await more evidence:** replace `state:validated` with `state:needs-info` and leave it off the roadmap.
 
-Do not use `state:accepted` as shorthand for technical validity, roadmap sequencing, or agent authorization. It records only the human decision that OpenShell should pursue the work.
+Do not use `state:accepted` as shorthand for technical validity, roadmap sequencing, or agent authorization. It records the human decision that OpenShell should pursue the work. Roadmap placement records the same acceptance decision plus sequencing.
 
 #### Roadmap
 
-OpenShell does not use priority labels. Sequencing comes from the [OpenShell Roadmap](https://github.com/orgs/NVIDIA/projects/233): a maintainer associates an accepted issue with a roadmap item, and the roadmap item's own timing carries the urgency. Issues tracked on the roadmap carry the `roadmap` label.
+OpenShell does not use priority labels. Sequencing comes from the [OpenShell Roadmap](https://github.com/orgs/NVIDIA/projects/233): a maintainer associates an issue with a roadmap item, signaling acceptance and giving it timing. Issues tracked on the roadmap carry the `roadmap` label.
 
-An accepted issue with no roadmap association is real work the project intends to do, but it is not scheduled. Ask a maintainer before starting on one.
+An issue with `state:accepted` and no roadmap association is real work the project intends to do, but it is not scheduled. Ask a maintainer before starting on one.
 
 Roadmap placement does not assign an owner. A roadmap issue still needs a human contributor, a direct user instruction to an agent, or an unattended-agent queue label.
 
@@ -191,7 +199,7 @@ Roadmap placement does not assign an owner. A roadmap issue still needs a human 
 
 A human contributor may implement an accepted issue without any `agent:*` label. Before starting, check for an assignee, linked pull request, active branch, or comment that shows someone else is already working on it.
 
-Maintainers use the `agent:*` workflow to queue work for always-on or unattended agents that scan issues. Keep exactly one agent-workflow label on the issue at a time. When a user directly asks an agent to plan or implement a specific issue, that instruction authorizes the requested phase and the corresponding request label is not required.
+Maintainers use the `agent:*` workflow to queue work for always-on or unattended agents that scan issues. Keep exactly one agent-workflow label on the issue at a time. When a user directly asks an agent to plan or implement a specific issue, that instruction authorizes the requested phase even if the issue does not match the normal lifecycle or agent-workflow state. The agent warns about each missing or incomplete expected label and continues without changing the labels.
 
 | Agent workflow | Applied by | Meaning |
 |---|---|---|
@@ -204,7 +212,7 @@ Maintainers use the `agent:*` workflow to queue work for always-on or unattended
 The normal delegated workflow is:
 
 ```text
-state:accepted
+(state:accepted OR roadmap placement)
   |
   +-- agent:plan-requested
         |
@@ -241,18 +249,18 @@ Maintainers use the specialized security review and remediation workflow for an 
 3. A maintainer reviews the plan and applies `agent:implementation-requested`.
 4. The remediation agent implements the approved plan.
 
-A user may instead directly request review or remediation from the specialized skill. The direct request replaces the corresponding queue label, but a request for review still does not authorize remediation. General implementation agents do not process issues labeled `topic:security`.
+A user may instead directly request review or remediation from the specialized skill. If the corresponding queue label is missing, the agent warns and continues without changing it, but a request for review still does not authorize remediation. General implementation agents do not process issues labeled `topic:security`.
 
 #### When an Issue Is Ready for Work
 
 | You are | Ready when |
 |---|---|
-| A human contributor | The issue has `state:accepted`, invites contribution or has maintainer confirmation, and has no conflicting owner or implementation. |
-| An unattended agent scanning for planning work | The issue has `state:accepted` and the human-applied `agent:plan-requested` label. |
-| An unattended agent scanning for implementation work | The issue has `state:accepted`, an approved plan, and the human-applied `agent:implementation-requested` label. |
-| An agent directly instructed by a user | The issue has `state:accepted`, no conflicting owner or implementation, and the instruction explicitly requests the phase the agent will perform. |
+| A human contributor | The issue has `state:accepted`, roadmap placement, an invitation to contribute, or maintainer confirmation, and has no conflicting owner or implementation. |
+| An unattended agent scanning for planning work | The issue has `state:accepted` or roadmap placement, plus the human-applied `agent:plan-requested` label. |
+| An unattended agent scanning for implementation work | The issue has `state:accepted` or roadmap placement, plus an approved plan and the human-applied `agent:implementation-requested` label. |
+| An agent directly instructed by a user | The instruction explicitly requests the phase the agent will perform and the issue has no conflicting owner or implementation. Missing or incomplete workflow labels produce a warning, not a stop. |
 
-Issues with `state:triage-needed`, `state:needs-info`, or `state:validated` are not ready for implementation. Roadmap placement alone never makes an issue ready.
+For unattended agents, `state:needs-info` blocks work until the requested evidence arrives, and `state:triage-needed` or `state:validated` blocks work unless a maintainer has separately placed the issue on the roadmap or applied `state:accepted`. For a directly instructed agent, these labels require a warning but do not themselves block the requested work. If information actually needed to do the work is unavailable, the agent reports that concrete blocker rather than treating the label as the blocker.
 
 #### Stale Issues
 
@@ -287,48 +295,11 @@ Project requirements:
 - Rust 1.90+
 - Python 3.11+
 - Docker (running)
-- Z3 solver library (for the policy prover crate)
-
-### Optional: Bazel (experimental)
-
-Install [Bazelisk](https://github.com/bazelbuild/bazelisk), which auto-downloads the Bazel version pinned in `.bazelversion`:
-
-```bash
-# macOS
-brew install bazelisk
-
-# npm (any platform)
-npm install -g @bazel/bazelisk
-```
-
-Bazel builds Z3 from source, so no system Z3 installation is needed when using Bazel. If you have previously built with Cargo, add Cargo's output directory to `.bazelignore` to prevent conflicts:
-
-```bash
-echo "target" >> .bazelignore
-```
-
-### macOS build tools
-
-Install Apple Command Line Tools before building locally:
-
-```bash
-xcode-select --install
-```
-
-If Cargo fails while building `protobuf-src` with an error such as
-`fatal error: 'utility' file not found`, `fatal error: 'cstdlib' file not
-found`, or `A compiler with support for C++11 language features is required`,
-your Command Line Tools install may not expose the libc++ headers on the
-compiler's default include path. Reinstall Command Line Tools to correct the error:
-
-```bash
-sudo rm -rf /Library/Developer/CommandLineTools
-xcode-select --install
-```
 
 ### Z3 installation
 
-The `openshell-prover` crate links against the system Z3 library via pkg-config.
+The `openshell-prover` crate links against Z3. On macOS and Linux, install the
+system Z3 development package; `z3-sys` discovers it through `pkg-config`.
 
 ```bash
 # macOS
@@ -341,10 +312,44 @@ sudo apt install libz3-dev
 sudo dnf install z3-devel
 ```
 
-If you prefer not to install Z3 system-wide, you can compile it from source as a one-time step:
+If you prefer not to install Z3 system-wide, use the bundled Z3 feature. This
+compiles Z3 from source during the Rust build:
 
 ```bash
 cargo build -p openshell-prover --features bundled-z3
+```
+
+For x86-64 Windows MSVC builds, use one of these Z3 paths:
+
+- System Z3: point `Z3_LIBRARY_PATH_OVERRIDE` at the directory containing the
+  64-bit MSVC Z3 library and `Z3_SYS_Z3_HEADER` at the full path to `z3.h`.
+  The `windows:*` tasks use this path automatically when `Z3_LIBRARY_PATH_OVERRIDE`
+  is set.
+- Bundled Z3: pass `--features bundled-z3` so `z3-sys` builds Z3 from source.
+
+Both Windows paths still require `libclang.dll` for `bindgen`. If LLVM is not on
+the default search path, set `LIBCLANG_PATH` to the directory containing
+`libclang.dll`.
+
+```powershell
+$env:LIBCLANG_PATH='C:\Program Files\Microsoft Visual Studio\2022\<Edition>\VC\Tools\Llvm\x64\bin'
+cargo build -p openshell-cli --target x86_64-pc-windows-msvc --features bundled-z3
+```
+
+To use a local x64 Z3 release with the Windows task wrapper:
+
+```powershell
+$env:Z3_LIBRARY_PATH_OVERRIDE='C:\path\to\z3-4.16.0-x64-win\bin'
+$env:Z3_SYS_Z3_HEADER='C:\path\to\z3-4.16.0-x64-win\include\z3.h'
+mise run --skip-tools windows:build:x64
+```
+
+### macOS build tools
+
+Install Apple Command Line Tools before building locally:
+
+```bash
+xcode-select --install
 ```
 
 ## Getting Started
@@ -408,26 +413,6 @@ These are the primary `mise` tasks for day-to-day development:
 | `mise run helm:docs` | Regenerate the Helm chart README                        |
 | `mise run clean`     | Clean build artifacts                                   |
 
-### Bazel targets (experimental)
-
-> [!IMPORTANT]
-> Bazel support is experimental and under evaluation via [RFC 0012](https://github.com/NVIDIA/OpenShell/pull/2543).
-> It may be removed at any time depending on the RFC outcome.
-> Feedback is welcome: [open an issue](https://github.com/NVIDIA/OpenShell/issues/new) or find us on CNCF Slack in [#openshell-dev](https://cloud-native.slack.com/archives/openshell-dev).
-
-The following Bazel commands are available alongside the mise tasks above. Cargo and mise remain the primary build system.
-
-| Task | Bazel command | Notes |
-| ---- | ------------- | ----- |
-| Build everything | `bazel build //...` | All crates and protos |
-| Run all tests | `bazel test //...` | Unit tests only, no E2E |
-| Build the CLI | `bazel build //crates/openshell-cli:openshell` | |
-| Build the gateway | `bazel build //crates/openshell-server:openshell-gateway` | |
-| Build the supervisor | `bazel build //crates/openshell-sandbox:openshell-sandbox-bin` | |
-| Clean | `bazel clean` | |
-
-Bazel does not yet cover `mise run gateway`, `mise run sandbox`, `mise run e2e`, `mise run docs`, or `mise run helm:docs`. Those are runtime and infrastructure tasks that remain with mise. Additional Bazel targets will be added over time as the experiment progresses.
-
 ## Project Structure
 
 | Path            | Purpose                                       |
@@ -435,6 +420,7 @@ Bazel does not yet cover `mise run gateway`, `mise run sandbox`, `mise run e2e`,
 | `crates/`       | Rust crates                                   |
 | `python/`       | Python SDK and bindings                       |
 | `sdk/go/`       | Go SDK (types, gRPC clients, converters)      |
+| `sdk/typescript/` | TypeScript SDK (Connect client and generated protobuf bindings) |
 | `proto/`        | Protocol buffer definitions                   |
 | `tasks/`        | `mise` task definitions and build scripts     |
 | `deploy/`       | Dockerfiles, Helm chart, Kubernetes manifests |

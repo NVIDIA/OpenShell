@@ -9,14 +9,18 @@ use crate::managed_children;
 #[cfg(target_os = "linux")]
 use crate::netns::NetworkNamespace;
 use crate::sandbox;
+#[cfg(target_os = "linux")]
+use miette::WrapErr;
 use miette::{IntoDiagnostic, Result};
 use nix::sys::signal::{self, Signal};
 use nix::unistd::{Gid, Group, Pid, Uid, User};
 use openshell_core::policy::{NetworkMode, SandboxPolicy};
 use std::collections::HashMap;
 use std::ffi::CString;
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
 #[cfg(target_os = "linux")]
-use std::os::fd::{AsRawFd, OwnedFd, RawFd};
+use std::os::fd::RawFd;
 #[cfg(target_os = "linux")]
 use std::os::unix::ffi::OsStrExt;
 #[cfg(unix)]
@@ -27,8 +31,22 @@ use std::path::PathBuf;
 use std::process::Stdio;
 #[cfg(target_os = "linux")]
 use std::sync::OnceLock;
-use tokio::process::{Child, Command};
+#[cfg(target_os = "linux")]
+use std::sync::mpsc;
+use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
 use tracing::{debug, info};
+
+// `libc::TIOCSCTTY` and the request parameter accepted by `ioctl` vary across
+// glibc, musl, and BSD targets. The conversion is a no-op on some targets but
+// is required on others.
+#[cfg(unix)]
+#[allow(unsafe_code, clippy::useless_conversion)]
+fn set_controlling_tty(fd: libc::c_int) -> std::io::Result<()> {
+    if unsafe { libc::ioctl(fd, libc::TIOCSCTTY.into(), 0) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
 
 /// Process/filesystem enforcement performed by the process supervisor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -151,6 +169,7 @@ const SUPERVISOR_ONLY_ENV_VARS: &[&str] = &[
     openshell_core::sandbox_env::TLS_CERT,
     openshell_core::sandbox_env::TLS_KEY,
     openshell_core::sandbox_env::PROVIDER_SPIFFE_WORKLOAD_API_SOCKET,
+    openshell_core::sandbox_env::NETWORK_RUNTIME_CAPABILITIES,
 ];
 
 pub fn is_supervisor_only_env_var(key: &str) -> bool {
@@ -170,6 +189,67 @@ fn inject_provider_env(cmd: &mut Command, provider_env: &HashMap<String, String>
         }
         cmd.env(key, value);
     }
+}
+
+/// Derive the child USER and HOME from the policy's sandbox identity.
+///
+/// Name-based identities use their passwd entry. Numeric identities have no
+/// reliable passwd entry, so their workspace remains the portable fallback.
+pub(crate) fn session_user_and_home(
+    policy: &SandboxPolicy,
+    workdir_home: Option<&str>,
+) -> (String, String) {
+    let (user, default_home) = match policy.process.run_as_user.as_deref() {
+        Some(user) if !user.is_empty() => {
+            if user.parse::<u32>().is_ok() {
+                (user.to_string(), "/sandbox".to_string())
+            } else {
+                let home = User::from_name(user).ok().flatten().map_or_else(
+                    || format!("/home/{user}"),
+                    |entry| entry.dir.to_string_lossy().into_owned(),
+                );
+                (user.to_string(), home)
+            }
+        }
+        _ => ("sandbox".to_string(), "/sandbox".to_string()),
+    };
+    let home = workdir_home.map_or(default_home, str::to_string);
+    (user, home)
+}
+
+fn apply_canonical_process_environment(
+    cmd: &mut Command,
+    policy: &SandboxPolicy,
+    workspace: &ResolvedWorkspace,
+    interactive: bool,
+    user_environment: &HashMap<String, String>,
+) {
+    let (session_user, session_home) = session_user_and_home(policy, workspace.home());
+
+    for (key, value) in [
+        ("HOME", session_home.as_str()),
+        ("USER", session_user.as_str()),
+        ("SHELL", "/bin/bash"),
+        (
+            "TERM",
+            if interactive {
+                "xterm-256color"
+            } else {
+                "dumb"
+            },
+        ),
+    ] {
+        if !user_environment.contains_key(key) {
+            cmd.env(key, value);
+        }
+    }
+}
+
+fn configured_user_environment() -> HashMap<String, String> {
+    std::env::var(openshell_core::sandbox_env::USER_ENVIRONMENT)
+        .ok()
+        .and_then(|json| serde_json::from_str(&json).ok())
+        .unwrap_or_default()
 }
 
 #[cfg(unix)]
@@ -321,11 +401,13 @@ static SUPERVISOR_IDENTITY_MOUNT_NS: OnceLock<Option<SupervisorIdentityMountName
 
 #[cfg(target_os = "linux")]
 pub struct SupervisorIdentityMountNamespace {
-    fd: OwnedFd,
+    spawn_tx: mpsc::Sender<SupervisorIdentitySpawnJob>,
 }
 
 #[cfg(target_os = "linux")]
 type SupervisorIdentityNsRef = &'static SupervisorIdentityMountNamespace;
+#[cfg(target_os = "linux")]
+type SupervisorIdentitySpawnJob = Box<dyn FnOnce() + Send + 'static>;
 
 #[cfg(target_os = "linux")]
 impl SupervisorIdentityMountNamespace {
@@ -334,12 +416,8 @@ impl SupervisorIdentityMountNamespace {
             return Ok(None);
         };
         Ok(Some(Self {
-            fd: create_supervisor_identity_mount_namespace(&target)?,
+            spawn_tx: start_supervisor_identity_spawn_worker(target)?,
         }))
-    }
-
-    pub fn enter_for_child(&self) -> std::io::Result<()> {
-        set_mount_namespace(self.fd.as_raw_fd())
     }
 }
 
@@ -372,6 +450,100 @@ pub fn supervisor_identity_mount_from_env() -> Result<Option<SupervisorIdentityN
 }
 
 #[cfg(target_os = "linux")]
+pub fn spawn_command_with_supervisor_identity_namespace(
+    mut cmd: Command,
+) -> std::io::Result<Child> {
+    let namespace = supervisor_identity_mount_from_env()
+        .map_err(|err| std::io::Error::other(err.to_string()))?;
+    let Some(namespace) = namespace else {
+        return cmd.spawn();
+    };
+    namespace.spawn_tokio_command(cmd)
+}
+
+#[cfg(target_os = "linux")]
+pub fn spawn_std_command_with_supervisor_identity_namespace(
+    mut cmd: std::process::Command,
+) -> std::io::Result<std::process::Child> {
+    let namespace = supervisor_identity_mount_from_env()
+        .map_err(|err| std::io::Error::other(err.to_string()))?;
+    let Some(namespace) = namespace else {
+        return cmd.spawn();
+    };
+    namespace.spawn_std_command(cmd)
+}
+
+#[cfg(target_os = "linux")]
+impl SupervisorIdentityMountNamespace {
+    fn spawn_tokio_command(&self, mut cmd: Command) -> std::io::Result<Child> {
+        let (result_tx, result_rx) = mpsc::channel();
+        let handle = tokio::runtime::Handle::current();
+        self.spawn_tx
+            .send(Box::new(move || {
+                let _guard = handle.enter();
+                let _ = result_tx.send(cmd.spawn());
+            }))
+            .map_err(|_| std::io::Error::other("supervisor identity spawn worker stopped"))?;
+        result_rx
+            .recv()
+            .map_err(|_| std::io::Error::other("supervisor identity spawn worker dropped result"))?
+    }
+
+    fn spawn_std_command(
+        &self,
+        mut cmd: std::process::Command,
+    ) -> std::io::Result<std::process::Child> {
+        let (result_tx, result_rx) = mpsc::channel();
+        self.spawn_tx
+            .send(Box::new(move || {
+                let _ = result_tx.send(cmd.spawn());
+            }))
+            .map_err(|_| std::io::Error::other("supervisor identity spawn worker stopped"))?;
+        result_rx
+            .recv()
+            .map_err(|_| std::io::Error::other("supervisor identity spawn worker dropped result"))?
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn start_supervisor_identity_spawn_worker(
+    target: PathBuf,
+) -> Result<mpsc::Sender<SupervisorIdentitySpawnJob>> {
+    let (spawn_tx, spawn_rx) = mpsc::channel::<SupervisorIdentitySpawnJob>();
+    let (ready_tx, ready_rx) = mpsc::channel::<std::io::Result<()>>();
+    std::thread::Builder::new()
+        .name("openshell-identity-spawn".into())
+        .spawn(move || {
+            let setup = (|| -> std::io::Result<()> {
+                private_mount_namespace()?;
+                let target =
+                    cstring_path(&target).map_err(|err| std::io::Error::other(err.to_string()))?;
+                mount_empty_tmpfs(&target)
+            })();
+            let ready = match &setup {
+                Ok(()) => Ok(()),
+                Err(err) => Err(std::io::Error::new(
+                    err.kind(),
+                    format!("supervisor identity setup failed: {err}"),
+                )),
+            };
+            let _ = ready_tx.send(ready);
+            if setup.is_err() {
+                return;
+            }
+            while let Ok(job) = spawn_rx.recv() {
+                job();
+            }
+        })
+        .map_err(|err| miette::miette!("failed to spawn supervisor identity worker: {err}"))?;
+    ready_rx
+        .recv()
+        .map_err(|err| miette::miette!("supervisor identity worker did not start: {err}"))?
+        .map_err(|err| miette::miette!("{err}"))?;
+    Ok(spawn_tx)
+}
+
+#[cfg(target_os = "linux")]
 fn supervisor_identity_socket_path_from_env() -> Option<(&'static str, String)> {
     std::env::var(openshell_core::sandbox_env::PROVIDER_SPIFFE_WORKLOAD_API_SOCKET)
         .ok()
@@ -391,10 +563,7 @@ fn supervisor_identity_mount_target(socket_path: &str) -> Result<Option<PathBuf>
         return Ok(None);
     }
     if trimmed.starts_with("tcp:") {
-        return Err(miette::miette!(
-            "{} must be a UNIX socket path so sandbox child processes can hide it",
-            openshell_core::sandbox_env::PROVIDER_SPIFFE_WORKLOAD_API_SOCKET
-        ));
+        return Ok(None);
     }
     let path = trimmed.strip_prefix("unix:").unwrap_or(trimmed);
     let path = Path::new(path);
@@ -438,51 +607,11 @@ fn cstring_path(path: &Path) -> Result<CString> {
 }
 
 #[cfg(target_os = "linux")]
-fn create_supervisor_identity_mount_namespace(target: &Path) -> Result<OwnedFd> {
-    let original_ns = open_current_mount_namespace()
-        .map_err(|err| miette::miette!("failed to open original mount namespace: {err}"))?;
-
-    private_mount_namespace()
-        .map_err(|err| miette::miette!("failed to create supervisor identity namespace: {err}"))?;
-
-    let target = cstring_path(target)?;
-    let result = (|| -> Result<OwnedFd> {
-        mount_empty_tmpfs(&target).map_err(|err| {
-            miette::miette!("failed to hide supervisor identity mount from child namespace: {err}")
-        })?;
-        open_current_mount_namespace()
-            .map_err(|err| miette::miette!("failed to open sanitized mount namespace: {err}"))
-    })();
-
-    set_mount_namespace(original_ns.as_raw_fd()).map_err(|restore_err| {
-        let result_msg = result.as_ref().err().map_or_else(
-            || "sanitized namespace was created".to_string(),
-            ToString::to_string,
-        );
-        miette::miette!(
-            "failed to restore original mount namespace after supervisor identity isolation setup: \
-             {restore_err}; setup result: {result_msg}"
-        )
-    })?;
-
-    result
-}
-
-#[cfg(target_os = "linux")]
-fn open_current_mount_namespace() -> std::io::Result<OwnedFd> {
-    let file = std::fs::File::open("/proc/thread-self/ns/mnt")?;
-    Ok(file.into())
-}
-
-#[cfg(target_os = "linux")]
 fn private_mount_namespace() -> std::io::Result<()> {
     #[allow(unsafe_code)]
     let rc = unsafe { libc::unshare(libc::CLONE_NEWNS) };
     if rc != 0 {
-        return Err(std::io::Error::other(format!(
-            "failed to create private mount namespace: {}",
-            std::io::Error::last_os_error()
-        )));
+        return Err(std::io::Error::last_os_error());
     }
 
     #[allow(unsafe_code)]
@@ -497,23 +626,7 @@ fn private_mount_namespace() -> std::io::Result<()> {
         )
     };
     if rc != 0 {
-        return Err(std::io::Error::other(format!(
-            "failed to mark mount namespace private: {}",
-            std::io::Error::last_os_error()
-        )));
-    }
-    Ok(())
-}
-
-#[cfg(target_os = "linux")]
-fn set_mount_namespace(fd: RawFd) -> std::io::Result<()> {
-    #[allow(unsafe_code)]
-    let rc = unsafe { libc::setns(fd, libc::CLONE_NEWNS) };
-    if rc != 0 {
-        return Err(std::io::Error::other(format!(
-            "failed to enter mount namespace: {}",
-            std::io::Error::last_os_error()
-        )));
+        return Err(std::io::Error::last_os_error());
     }
     Ok(())
 }
@@ -533,10 +646,7 @@ fn mount_empty_tmpfs(target: &CString) -> std::io::Result<()> {
         )
     };
     if rc != 0 {
-        return Err(std::io::Error::other(format!(
-            "failed to hide supervisor identity mount from child process: {}",
-            std::io::Error::last_os_error()
-        )));
+        return Err(std::io::Error::last_os_error());
     }
     Ok(())
 }
@@ -545,6 +655,18 @@ fn mount_empty_tmpfs(target: &CString) -> std::io::Result<()> {
 pub struct ProcessHandle {
     child: Child,
     pid: u32,
+    io: Option<ProcessIo>,
+}
+
+/// Supervisor-owned canonical-process I/O. These handles outlive individual
+/// SSH attachments and are consumed by the main-session multiplexer.
+pub enum ProcessIo {
+    Pty(std::fs::File),
+    Pipes {
+        stdin: ChildStdin,
+        stdout: ChildStdout,
+        stderr: ChildStderr,
+    },
 }
 
 impl ProcessHandle {
@@ -628,11 +750,31 @@ impl ProcessHandle {
     ) -> Result<Self> {
         let mut cmd = Command::new(program);
         cmd.args(args)
-            .stdin(Stdio::inherit())
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit())
             .kill_on_drop(true)
             .env(openshell_core::sandbox_env::SANDBOX, "1");
+
+        let mut pty_master = None;
+        let mut terminal_slave_fd = None;
+        if interactive {
+            let winsize = nix::pty::Winsize {
+                ws_row: 24,
+                ws_col: 80,
+                ws_xpixel: 0,
+                ws_ypixel: 0,
+            };
+            let pty = nix::pty::openpty(Some(&winsize), None).into_diagnostic()?;
+            let master = std::fs::File::from(pty.master);
+            let slave = std::fs::File::from(pty.slave);
+            terminal_slave_fd = Some(slave.as_raw_fd());
+            cmd.stdin(slave.try_clone().into_diagnostic()?)
+                .stdout(slave.try_clone().into_diagnostic()?)
+                .stderr(slave);
+            pty_master = Some(master);
+        } else {
+            cmd.stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+        }
 
         // Strip supervisor-only identity material from the entrypoint's
         // inherited environment. The entrypoint drops to the sandbox user
@@ -641,12 +783,16 @@ impl ProcessHandle {
         strip_supervisor_only_env(&mut cmd);
 
         inject_provider_env(&mut cmd, provider_env);
+        apply_canonical_process_environment(
+            &mut cmd,
+            policy,
+            workspace,
+            interactive,
+            &configured_user_environment(),
+        );
 
         if let Some(dir) = workspace.root() {
             cmd.current_dir(dir);
-        }
-        if let Some(home) = workspace.home() {
-            cmd.env("HOME", home);
         }
 
         if matches!(policy.network.mode, NetworkMode::Proxy) {
@@ -696,15 +842,6 @@ impl ProcessHandle {
         #[cfg(target_os = "linux")]
         let prepared_sandbox = prepare_child_sandbox(policy, workspace.root(), enforcement_mode)
             .map_err(|err| miette::miette!("Failed to prepare sandbox: {err}"))?;
-        #[cfg(target_os = "linux")]
-        let supervisor_identity_mount = if enforcement_mode.uses_privileged_process_setup() {
-            supervisor_identity_mount_from_env().map_err(|err| {
-                miette::miette!("Failed to prepare supervisor identity isolation: {err}")
-            })?
-        } else {
-            None
-        };
-
         // Set up process group for signal handling (non-interactive mode only).
         // In interactive mode, we inherit the parent's process group to maintain
         // proper terminal control for shells and interactive programs.
@@ -719,22 +856,24 @@ impl ProcessHandle {
             #[allow(unsafe_code)]
             unsafe {
                 cmd.pre_exec(move || {
-                    if !interactive {
-                        // Create new process group
-                        libc::setpgid(0, 0);
+                    if let Some(slave_fd) = terminal_slave_fd {
+                        if libc::setsid() < 0 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                        set_controlling_tty(slave_fd)?;
+                    } else if libc::setpgid(0, 0) < 0 {
+                        return Err(std::io::Error::last_os_error());
                     }
 
-                    // Enter network namespace before applying other restrictions
+                    // Enter network namespace before applying other restrictions.
                     if let Some(fd) = netns_fd {
                         let result = libc::setns(fd, libc::CLONE_NEWNET);
                         if result != 0 {
-                            return Err(std::io::Error::last_os_error());
+                            return Err(std::io::Error::other(format!(
+                                "failed to enter network namespace: {}",
+                                std::io::Error::last_os_error()
+                            )));
                         }
-                    }
-
-                    #[cfg(target_os = "linux")]
-                    if let Some(mount) = supervisor_identity_mount {
-                        mount.enter_for_child()?;
                     }
 
                     // Drop privileges. initgroups/setgid/setuid need access to
@@ -761,13 +900,35 @@ impl ProcessHandle {
             }
         }
 
-        let child = cmd.spawn().into_diagnostic()?;
+        #[cfg(target_os = "linux")]
+        let mut child = spawn_command_with_supervisor_identity_namespace(cmd)
+            .into_diagnostic()
+            .wrap_err("failed to spawn sandbox entrypoint process")?;
+        #[cfg(not(target_os = "linux"))]
+        let mut child = cmd
+            .spawn()
+            .into_diagnostic()
+            .wrap_err("failed to spawn sandbox entrypoint process")?;
         let pid = child.id().unwrap_or(0);
         managed_children::register(pid);
 
+        let io = if let Some(master) = pty_master {
+            ProcessIo::Pty(master)
+        } else {
+            ProcessIo::Pipes {
+                stdin: child.stdin.take().expect("canonical stdin must be piped"),
+                stdout: child.stdout.take().expect("canonical stdout must be piped"),
+                stderr: child.stderr.take().expect("canonical stderr must be piped"),
+            }
+        };
+
         debug!(pid, program, "Process spawned");
 
-        Ok(Self { child, pid })
+        Ok(Self {
+            child,
+            pid,
+            io: Some(io),
+        })
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -785,23 +946,49 @@ impl ProcessHandle {
     ) -> Result<Self> {
         let mut cmd = Command::new(program);
         cmd.args(args)
-            .stdin(Stdio::inherit())
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit())
             .kill_on_drop(true)
             .env(openshell_core::sandbox_env::SANDBOX, "1");
+
+        let mut pty_master = None;
+        let mut terminal_slave_fd = None;
+        #[cfg(unix)]
+        if interactive {
+            let winsize = nix::pty::Winsize {
+                ws_row: 24,
+                ws_col: 80,
+                ws_xpixel: 0,
+                ws_ypixel: 0,
+            };
+            let pty = nix::pty::openpty(Some(&winsize), None).into_diagnostic()?;
+            let master = std::fs::File::from(pty.master);
+            let slave = std::fs::File::from(pty.slave);
+            terminal_slave_fd = Some(slave.as_raw_fd());
+            cmd.stdin(slave.try_clone().into_diagnostic()?)
+                .stdout(slave.try_clone().into_diagnostic()?)
+                .stderr(slave);
+            pty_master = Some(master);
+        }
+        if !interactive {
+            cmd.stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+        }
 
         // Strip supervisor-only identity material from the entrypoint's
         // inherited environment.
         strip_supervisor_only_env(&mut cmd);
 
         inject_provider_env(&mut cmd, provider_env);
+        apply_canonical_process_environment(
+            &mut cmd,
+            policy,
+            workspace,
+            interactive,
+            &configured_user_environment(),
+        );
 
         if let Some(dir) = workspace.root() {
             cmd.current_dir(dir);
-        }
-        if let Some(home) = workspace.home() {
-            cmd.env("HOME", home);
         }
 
         if matches!(policy.network.mode, NetworkMode::Proxy) {
@@ -825,9 +1012,9 @@ impl ProcessHandle {
             }
         }
 
-        // Set up process group for signal handling (non-interactive mode only).
-        // In interactive mode, we inherit the parent's process group to maintain
-        // proper terminal control for shells and interactive programs.
+        // Create a dedicated session for PTY children and a dedicated process
+        // group for pipe children so attachment signals target only the
+        // canonical workload tree.
         // SAFETY: pre_exec runs after fork but before exec in the child process.
         // setpgid is async-signal-safe and safe to call in this context.
         #[cfg(unix)]
@@ -837,9 +1024,13 @@ impl ProcessHandle {
             #[allow(unsafe_code)]
             unsafe {
                 cmd.pre_exec(move || {
-                    if !interactive {
-                        // Create new process group
-                        libc::setpgid(0, 0);
+                    if let Some(slave_fd) = terminal_slave_fd {
+                        if libc::setsid() < 0 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                        set_controlling_tty(slave_fd)?;
+                    } else if libc::setpgid(0, 0) < 0 {
+                        return Err(std::io::Error::last_os_error());
                     }
 
                     // Drop privileges before applying sandbox restrictions.
@@ -862,20 +1053,39 @@ impl ProcessHandle {
             }
         }
 
-        let child = cmd.spawn().into_diagnostic()?;
+        let mut child = cmd.spawn().into_diagnostic()?;
         let pid = child.id().unwrap_or(0);
         #[cfg(target_os = "linux")]
         managed_children::register(pid);
 
         debug!(pid, program, "Process spawned");
 
-        Ok(Self { child, pid })
+        let io = if let Some(master) = pty_master {
+            ProcessIo::Pty(master)
+        } else {
+            ProcessIo::Pipes {
+                stdin: child.stdin.take().expect("canonical stdin must be piped"),
+                stdout: child.stdout.take().expect("canonical stdout must be piped"),
+                stderr: child.stderr.take().expect("canonical stderr must be piped"),
+            }
+        };
+
+        Ok(Self {
+            child,
+            pid,
+            io: Some(io),
+        })
     }
 
     /// Get the process ID.
     #[must_use]
     pub const fn pid(&self) -> u32 {
         self.pid
+    }
+
+    /// Transfer retained stdio to the main-session multiplexer.
+    pub fn take_io(&mut self) -> ProcessIo {
+        self.io.take().expect("canonical process I/O already taken")
     }
 
     /// Wait for the process to exit.
@@ -889,6 +1099,16 @@ impl ProcessHandle {
         managed_children::unregister(self.pid);
         let status = status?;
         Ok(ProcessStatus::from(status))
+    }
+
+    /// Observe an already-terminated child without blocking.
+    pub fn try_wait(&mut self) -> std::io::Result<Option<ProcessStatus>> {
+        let status = self.child.try_wait()?;
+        if status.is_some() {
+            #[cfg(target_os = "linux")]
+            managed_children::unregister(self.pid);
+        }
+        Ok(status.map(ProcessStatus::from))
     }
 
     /// Send a signal to the process.
@@ -2150,6 +2370,12 @@ pub struct ProcessStatus {
 }
 
 impl ProcessStatus {
+    /// Get the conventional exit code when the process exited normally.
+    #[must_use]
+    pub const fn exit_code(&self) -> Option<i32> {
+        self.code
+    }
+
     /// Get the exit code, or 128 + signal number if killed by signal.
     #[must_use]
     pub fn code(&self) -> i32 {
@@ -2217,6 +2443,42 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn canonical_tty_environment_replaces_supervisor_identity_defaults() {
+        let current_user = User::from_uid(nix::unistd::geteuid())
+            .expect("look up current user")
+            .expect("current user entry");
+        let policy = policy_with_process(ProcessPolicy {
+            run_as_user: Some(current_user.name.clone()),
+            run_as_group: None,
+        });
+        let workspace = ResolvedWorkspace::default();
+        let mut cmd = Command::new("/usr/bin/env");
+        cmd.env_clear()
+            .env("HOME", "/root")
+            .env("TERM", "dumb")
+            .stdout(StdStdio::piped());
+
+        apply_canonical_process_environment(&mut cmd, &policy, &workspace, true, &HashMap::new());
+
+        let output = cmd.output().await.expect("run environment probe");
+        assert!(output.status.success());
+        let environment = String::from_utf8(output.stdout).expect("environment is UTF-8");
+        let variables: HashMap<_, _> = environment
+            .lines()
+            .filter_map(|line| line.split_once('='))
+            .collect();
+
+        assert_eq!(
+            variables.get("HOME"),
+            Some(&current_user.dir.to_string_lossy().as_ref())
+        );
+        assert_eq!(variables.get("USER"), Some(&current_user.name.as_str()));
+        assert_eq!(variables.get("SHELL"), Some(&"/bin/bash"));
+        assert_eq!(variables.get("TERM"), Some(&"xterm-256color"));
+    }
+
     /// Unknown names may yield `Ok(None)` (`… not found …`) or `Err` when NSS fails first
     /// (e.g. `ENOENT: No such file or directory`).
     fn assert_unknown_identity_lookup_failed(msg: &str) {
@@ -2230,14 +2492,14 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
-    fn explicit_identity_rejects_non_root_system_ids() {
+    fn explicit_identity_accepts_non_root_system_ids() {
         let policy = policy_with_process(ProcessPolicy {
             run_as_user: Some("101".into()),
             run_as_group: Some("102".into()),
         });
 
-        assert!(validate_sandbox_user(&policy).is_err());
-        assert!(validate_sandbox_group(&policy).is_err());
+        assert!(validate_sandbox_user(&policy).is_ok());
+        assert!(validate_sandbox_group(&policy).is_ok());
     }
 
     #[test]
@@ -3642,7 +3904,11 @@ mod tests {
 
     #[test]
     fn supervisor_identity_mount_target_rejects_unhideable_endpoints() {
-        assert!(supervisor_identity_mount_target("tcp:127.0.0.1:8081").is_err());
+        assert_eq!(
+            supervisor_identity_mount_target("tcp:127.0.0.1:8081")
+                .expect("tcp endpoint should not require mount hiding"),
+            None
+        );
         assert!(supervisor_identity_mount_target("spiffe-workload-api/spire-agent.sock").is_err());
         assert!(supervisor_identity_mount_target("/spire-agent.sock").is_err());
     }

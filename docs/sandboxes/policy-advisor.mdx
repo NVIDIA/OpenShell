@@ -102,9 +102,23 @@ The loop has seven steps:
 2. For inspected REST traffic, OpenShell returns a structured `403` body with fields such as `layer`, `host`, `port`, `binary`, `method`, `path`, `rule_missing`, `agent_guidance`, and `next_steps`.
 3. The agent reads the policy advisor skill, inspects the current policy, and optionally reads recent denial log lines.
 4. The agent submits one or more `addRule` proposals to `http://policy.local/v1/proposals`.
-5. The gateway stores accepted proposals as pending draft chunks for the sandbox and runs the [policy prover](#what-auto-approval-checks) against the proposed delta.
-6. Before auto-approval, the gateway reloads the current stored rule, recalculates its prover verdict, and regenerates its security notes. Under `auto` mode, it approves the proposal only when both the prover delta and security notes are empty. Any finding or security note keeps the proposal pending. Under `manual` mode, every accepted proposal lands in the draft inbox for a developer to approve or reject.
-7. The agent waits on `/v1/proposals/{chunk_id}/wait` until a decision is available. Approved proposals hot-reload into the sandbox; rejected proposals return `rejection_reason` and `validation_result` so the agent can revise.
+5. The gateway turns the proposal into the exact effective-policy candidate it would apply. It preserves any existing L7 or provider-owned endpoint contract, adds the proposed binary as a sandbox overlay, validates the full merge, and runs the [policy prover](#what-auto-approval-checks) against that candidate.
+6. The gateway stores the candidate, its prover result, any application error, and a review token tied to the live policy, provider rules, and credential metadata. Provider rules remain immutable inputs.
+7. Before approval, the gateway cheaply recomputes the candidate token from live inputs. An unchanged token reuses the stored prover result. A changed token leaves the proposal pending with a refreshed candidate and requires a fresh review. Under `auto` mode, an unchanged candidate is approved only when the prover delta and security notes are empty. Under `manual` mode, every valid proposal lands in the draft inbox.
+8. The agent waits on `/v1/proposals/{chunk_id}/wait` until a decision is available. Approved proposals hot-reload into the sandbox; rejected proposals return `rejection_reason` and `validation_result` so the agent can revise.
+
+```mermaid
+flowchart TD
+  A["Denied request creates a narrow proposal"] --> B["Gateway builds the exact effective-policy candidate"]
+  B --> C["Validate merge, L7 contract, providers, and credentials"]
+  C -->|Invalid| D["Keep pending and show application error"]
+  C -->|Valid| E["Run prover once and store candidate plus review token"]
+  E --> F["Reviewer approves using that token"]
+  F --> G["Recompute token from live inputs"]
+  G -->|Unchanged| H["Reuse stored prover result and apply candidate"]
+  G -->|Changed| I["Refresh candidate and token; require fresh review"]
+  I --> F
+```
 
 When a proposal is approved, `/wait` reports `policy_reloaded: true` only after the local sandbox policy covers the approved rule. At that point the agent can retry the original denied action once. If a proposal is rejected, `/wait` returns `rejection_reason` and `validation_result` so the agent can revise or stop. `validation_result` carries the categorical prover findings — `link_local_reach`, `l7_bypass_credentialed`, `credential_reach_expansion`, `capability_expansion` — so the agent can narrow the next attempt to the specific concern the prover flagged.
 
@@ -179,7 +193,7 @@ The policy prover runs against mechanistic and agent-authored proposals alike an
 
 Findings are categorical. There is no severity tier. The reviewer reads the category and the structured evidence to decide.
 
-Before auto-approval, the gateway reloads the draft chunk, recomputes its prover verdict, and regenerates security notes from its current rule. These checks apply after edits and deduplicated resubmissions: an edited stored rule controls the decision even when the duplicate incoming proposal has an empty prover delta. The recalculated verdict is used for this decision but is not written back, so a later `validation_result` read can still show the submit-time verdict. Failures leave the chunk pending. Security notes flag concerns such as internal or private destinations and `allowed_ips`, wildcard hosts, hostless `allowed_ips`, ephemeral ports, and well-known database or service ports. Draft reads and bulk approval also regenerate notes from the stored rule. Any prover finding or security note keeps the chunk pending.
+Before approval, the gateway rebuilds the candidate token from the live base policy, immutable provider rules, and non-secret credential metadata. When that token is unchanged, it reuses the persisted prover result instead of rerunning the prover. When it changes, the gateway evaluates and persists the refreshed candidate, leaves the chunk pending, and requires the reviewer to inspect and approve the new token. Edits and deduplicated resubmissions follow the same path. Merge, policy-shape, provider-composition, credential, or prover failures are shown as application errors and cannot be approved. Security notes flag concerns such as internal or private destinations and `allowed_ips`, wildcard hosts, hostless `allowed_ips`, ephemeral ports, and well-known database or service ports. Any prover finding or security note keeps the chunk pending in auto mode.
 
 The full reasoning model lives in [`crates/openshell-prover/README.md`](https://github.com/NVIDIA/OpenShell/blob/main/crates/openshell-prover/README.md). Provider profiles composed in via [Providers v2](/sandboxes/providers-v2) are part of the effective policy the prover reasons over.
 
@@ -193,7 +207,7 @@ openshell rule get <sandbox-name> --status pending
 
 Under `auto` mode, proposals with a prover finding or any recalculated security note remain pending for human review. Proposals that pass both checks are visible under `--status approved` with the auto-approval audit fields described in [Approval Modes](#approval-modes). Under `manual` mode, every accepted proposal shows up as pending regardless of the prover verdict or security notes.
 
-The output shows the chunk ID, status, rationale, binary, and endpoint summary. For L7 proposals, the endpoint summary includes the protocol, method, and path:
+The output shows the chunk ID, status, rationale, binary, endpoint summary, prover result, application error (if any), and candidate hash. For L7 proposals, the endpoint summary includes the protocol, method, and path:
 
 ```text
 Endpoints: api.github.com:443 [L7 rest, allow PUT /repos/NVIDIA/OpenShell/contents/docs/**]
@@ -204,6 +218,8 @@ Approve only when the structured rule matches the access you intend to grant:
 ```shell
 openshell rule approve <sandbox-name> --chunk-id <chunk-id>
 ```
+
+The CLI fetches the current review token and submits it with the approval. If policy, provider, or credential inputs changed after the proposal was displayed, the gateway leaves it pending and asks you to review the refreshed candidate. Run `rule get` again before retrying. Bulk approval binds each selected chunk to its own review token in the same way.
 
 Reject with guidance when the rule is too broad or points at the wrong target:
 

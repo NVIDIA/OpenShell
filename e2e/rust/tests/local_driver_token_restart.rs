@@ -3,11 +3,11 @@
 
 #![cfg(feature = "e2e")]
 
-//! Local-driver E2E regression for sandbox supervisor restart from bootstrap
-//! JWT material. Docker and Podman supervisors reload their mounted token file
-//! after a container restart. VM sandboxes reboot from persisted driver state
-//! after the VM driver restarts. Local single-player gateway configs should
-//! mint that token with `exp = 0` so reconnect does not depend on token refresh.
+//! Local-driver E2E regression for sandbox bootstrap JWT material and terminal
+//! main-process semantics. Local single-player gateways mint non-expiring
+//! bootstrap tokens. Stopping a Docker or Podman sandbox container is terminal
+//! and must not relaunch its canonical process; restarting the VM gateway still
+//! exercises driver recovery without deliberately stopping the sandbox.
 
 use std::fs;
 use std::path::PathBuf;
@@ -18,6 +18,7 @@ use base64::Engine as _;
 use openshell_e2e::harness::cli::{wait_for_healthy, wait_for_sandbox_exec_contains};
 use openshell_e2e::harness::container::{ContainerEngine, e2e_driver};
 use openshell_e2e::harness::gateway::ManagedGateway;
+use openshell_e2e::harness::output::strip_ansi;
 use openshell_e2e::harness::sandbox::SandboxGuard;
 use prost::Message;
 use tokio::time::sleep;
@@ -266,7 +267,7 @@ fn require_non_expiring_token(token: &str, context: &str) -> Result<(), String> 
     Ok(())
 }
 
-async fn restart_container_sandbox(
+async fn stop_container_sandbox(
     engine: &ContainerEngine,
     driver: LocalDriver,
     namespace: &str,
@@ -277,10 +278,34 @@ async fn restart_container_sandbox(
     require_non_expiring_token(&token, "local-driver bootstrap JWT")?;
 
     run_engine(engine, &["stop".to_string(), container_id.clone()])?;
-    wait_for_container_running(engine, &container_id, false, Duration::from_secs(60)).await?;
+    wait_for_container_running(engine, &container_id, false, Duration::from_secs(60)).await
+}
 
-    run_engine(engine, &["start".to_string(), container_id.clone()])?;
-    wait_for_container_running(engine, &container_id, true, Duration::from_secs(60)).await
+async fn wait_for_sandbox_error(sandbox_name: &str, timeout: Duration) -> Result<(), String> {
+    let deadline = Instant::now() + timeout;
+    let mut last_output = String::new();
+    while Instant::now() < deadline {
+        let mut cmd = openshell_e2e::harness::binary::openshell_cmd();
+        cmd.args(["sandbox", "get", sandbox_name])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let output = cmd
+            .output()
+            .await
+            .map_err(|err| format!("failed to run sandbox get: {err}"))?;
+        last_output = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if output.status.success() && strip_ansi(&last_output).contains("Phase: Error") {
+            return Ok(());
+        }
+        sleep(Duration::from_millis(250)).await;
+    }
+    Err(format!(
+        "sandbox {sandbox_name} did not enter Error within {timeout:?}:\n{last_output}"
+    ))
 }
 
 async fn restart_vm_sandbox(gateway: &ManagedGateway, sandbox_name: &str) -> Result<(), String> {
@@ -316,11 +341,9 @@ async fn wait_for_driver_reconnect(driver: LocalDriver, sandbox_name: &str) -> R
 }
 
 #[tokio::test]
-async fn local_driver_sandbox_restarts_with_non_expiring_bootstrap_jwt() {
+async fn local_driver_restart_or_stop_respects_main_process_lifecycle() {
     let Some(driver) = LocalDriver::from_env() else {
-        eprintln!(
-            "Skipping local-driver token restart test: e2e driver is not Docker, Podman, or VM"
-        );
+        eprintln!("Skipping local-driver lifecycle test: e2e driver is not Docker, Podman, or VM");
         return;
     };
     let namespace = if driver.is_container() {
@@ -329,7 +352,7 @@ async fn local_driver_sandbox_restarts_with_non_expiring_bootstrap_jwt() {
             .filter(|value| !value.trim().is_empty())
         else {
             eprintln!(
-                "Skipping local-driver token restart test: OPENSHELL_E2E_SANDBOX_NAMESPACE is unavailable"
+                "Skipping local-driver lifecycle test: OPENSHELL_E2E_SANDBOX_NAMESPACE is unavailable"
             );
             return;
         };
@@ -349,7 +372,7 @@ async fn local_driver_sandbox_restarts_with_non_expiring_bootstrap_jwt() {
         let Some(gateway) = ManagedGateway::from_env().expect("load managed e2e gateway metadata")
         else {
             eprintln!(
-                "Skipping local-driver token restart test: VM e2e gateway is not managed by this test run"
+                "Skipping local-driver lifecycle test: VM e2e gateway is not managed by this test run"
             );
             return;
         };
@@ -375,9 +398,12 @@ async fn local_driver_sandbox_restarts_with_non_expiring_bootstrap_jwt() {
             let namespace = namespace
                 .as_deref()
                 .expect("container namespace should be set");
-            restart_container_sandbox(engine, driver, namespace, &sandbox.name)
+            stop_container_sandbox(engine, driver, namespace, &sandbox.name)
                 .await
-                .expect("restart sandbox container");
+                .expect("stop sandbox container");
+            wait_for_sandbox_error(&sandbox.name, Duration::from_secs(30))
+                .await
+                .expect("stopped canonical process should make sandbox terminal");
         }
         LocalDriver::Vm => {
             let gateway = gateway.as_ref().expect("managed VM gateway should be set");
@@ -387,9 +413,11 @@ async fn local_driver_sandbox_restarts_with_non_expiring_bootstrap_jwt() {
         }
     }
 
-    wait_for_driver_reconnect(driver, &sandbox.name)
-        .await
-        .expect("sandbox supervisor should reconnect after local-driver restart");
+    if driver == LocalDriver::Vm {
+        wait_for_driver_reconnect(driver, &sandbox.name)
+            .await
+            .expect("sandbox supervisor should reconnect after VM driver restart");
+    }
 
     sandbox.cleanup().await;
 }

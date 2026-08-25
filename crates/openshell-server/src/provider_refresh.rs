@@ -5,13 +5,14 @@
 
 #![allow(clippy::result_large_err)]
 
+use crate::credentials::RefreshMaterialScope;
 use crate::persistence::{ObjectType, PersistenceError, Store, WriteCondition, current_time_ms};
 use openshell_core::ObjectWorkspace;
 use openshell_core::proto::{
     CredentialHandle, Provider, ProviderCredentialRefreshStatus, ProviderCredentialRefreshStrategy,
-    StoredProviderCredentialRefreshState,
+    StoredProviderCredentialRefreshState, StoredRefreshMaterialDeletion,
 };
-use openshell_core::{ObjectId, ObjectName};
+use openshell_core::{ObjectId, ObjectName, SetResourceVersion};
 use prost::Message;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -23,6 +24,17 @@ const DEFAULT_REFRESH_BEFORE_SECONDS: i64 = 300;
 const DEFAULT_MAX_LIFETIME_SECONDS: i64 = 3600;
 const REFRESH_ERROR_RETRY_SECONDS: i64 = 60;
 const REFRESH_WORKER_PAGE_SIZE: u32 = 1000;
+
+pub fn refresh_material_scope(
+    state: &StoredProviderCredentialRefreshState,
+) -> RefreshMaterialScope<'_> {
+    RefreshMaterialScope {
+        provider_name: &state.provider_name,
+        workspace: state.object_workspace(),
+        provider_id: &state.provider_id,
+        credential_key: &state.credential_key,
+    }
+}
 
 impl ObjectType for StoredProviderCredentialRefreshState {
     fn object_type() -> &'static str {
@@ -39,6 +51,29 @@ pub fn refresh_state_name(provider_id: &str, credential_key: &str) -> String {
     format!("provider-refresh-{provider_id}-{key}")
 }
 
+/// Return the durable authorization epoch for one configured refresh grant.
+///
+/// Records created before the explicit epoch field was introduced use their
+/// gateway-generated object ID as a stable migration epoch. An explicit
+/// reconfiguration writes a new random epoch while preserving object metadata,
+/// so reauthorization still revokes handles derived from the legacy value.
+pub fn effective_authorization_epoch(
+    state: &StoredProviderCredentialRefreshState,
+) -> Result<&str, Status> {
+    if !state.authorization_epoch.is_empty() {
+        return Ok(&state.authorization_epoch);
+    }
+    state
+        .metadata
+        .as_ref()
+        .map(|metadata| metadata.id.as_str())
+        .filter(|id| !id.is_empty())
+        .ok_or_else(|| {
+            Status::failed_precondition("provider refresh state has no authorization epoch")
+        })
+}
+
+#[cfg(test)]
 pub async fn put_refresh_state(
     store: &Store,
     state: &StoredProviderCredentialRefreshState,
@@ -47,6 +82,37 @@ pub async fn put_refresh_state(
         .put_scoped_message(state, &state.provider_id)
         .await
         .map_err(|e| Status::internal(format!("persist provider refresh state failed: {e}")))
+}
+
+/// Atomically claim a new provider-and-credential refresh identity.
+///
+/// The refresh name is unique within a workspace. A concurrent creator must
+/// lose instead of overwriting the winner so its caller can delete any secret
+/// material staged before this write.
+pub async fn create_refresh_state(
+    store: &Store,
+    state: &StoredProviderCredentialRefreshState,
+) -> Result<(), Status> {
+    match store
+        .create_scoped(
+            StoredProviderCredentialRefreshState::object_type(),
+            state.object_id(),
+            state.object_name(),
+            state.object_workspace(),
+            &state.provider_id,
+            &state.encode_to_vec(),
+            None,
+        )
+        .await
+    {
+        Ok(_) => Ok(()),
+        Err(PersistenceError::UniqueViolation { .. }) => Err(Status::aborted(
+            "provider refresh was concurrently configured",
+        )),
+        Err(err) => Err(Status::internal(format!(
+            "create provider refresh state failed: {err}"
+        ))),
+    }
 }
 
 /// Persist an updated refresh state only if the row still exists with the
@@ -85,6 +151,18 @@ async fn persist_refresh_state_if_current(
     }
 }
 
+pub async fn replace_refresh_state_if_current(
+    store: &Store,
+    state: &StoredProviderCredentialRefreshState,
+    expected_version: u64,
+) -> Result<bool, Status> {
+    Ok(
+        persist_refresh_state_if_current(store, state, expected_version)
+            .await?
+            .is_some(),
+    )
+}
+
 pub async fn list_refresh_states_for_provider(
     store: &Store,
     provider_id: &str,
@@ -101,11 +179,10 @@ pub async fn list_refresh_states_for_provider(
 
     let mut states = Vec::with_capacity(records.len());
     for record in records {
-        states.push(
-            StoredProviderCredentialRefreshState::decode(record.payload.as_slice()).map_err(
-                |e| Status::internal(format!("decode provider refresh state failed: {e}")),
-            )?,
-        );
+        let mut state = StoredProviderCredentialRefreshState::decode(record.payload.as_slice())
+            .map_err(|e| Status::internal(format!("decode provider refresh state failed: {e}")))?;
+        state.set_resource_version(record.resource_version);
+        states.push(state);
     }
     Ok(states)
 }
@@ -116,30 +193,23 @@ pub async fn list_all_refresh_states(
     let mut states = Vec::new();
     let mut offset = 0;
     loop {
-        let records = store
-            .list_by_type(
-                StoredProviderCredentialRefreshState::object_type(),
+        let page = store
+            .list_all_messages::<StoredProviderCredentialRefreshState>(
                 REFRESH_WORKER_PAGE_SIZE,
                 offset,
             )
             .await
             .map_err(|e| Status::internal(format!("list provider refresh states failed: {e}")))?;
-        if records.is_empty() {
+        if page.is_empty() {
             break;
         }
         offset = offset
             .checked_add(
-                u32::try_from(records.len())
+                u32::try_from(page.len())
                     .map_err(|_| Status::internal("provider refresh page size exceeded u32"))?,
             )
             .ok_or_else(|| Status::internal("provider refresh pagination offset overflow"))?;
-        for record in records {
-            states.push(
-                StoredProviderCredentialRefreshState::decode(record.payload.as_slice()).map_err(
-                    |e| Status::internal(format!("decode provider refresh state failed: {e}")),
-                )?,
-            );
-        }
+        states.extend(page);
     }
     Ok(states)
 }
@@ -157,38 +227,80 @@ pub async fn get_refresh_state(
         .map_err(|e| Status::internal(format!("fetch provider refresh state failed: {e}")))
 }
 
-pub async fn delete_refresh_state(
+pub async fn delete_refresh_state_with_credentials(
     store: &Store,
+    credentials: &crate::credentials::CredentialRuntime,
     workspace: &str,
     provider_id: &str,
     credential_key: &str,
 ) -> Result<bool, Status> {
-    let name = refresh_state_name(provider_id, credential_key);
+    let Some(mut state) = get_refresh_state(store, workspace, provider_id, credential_key).await?
+    else {
+        return Ok(false);
+    };
+    let mut version = state
+        .metadata
+        .as_ref()
+        .map_or(0, |metadata| metadata.resource_version);
+    if state
+        .metadata
+        .as_ref()
+        .is_some_and(|metadata| metadata.deletion_timestamp_ms == 0)
+    {
+        if let Some(metadata) = state.metadata.as_mut() {
+            metadata.deletion_timestamp_ms = current_time_ms();
+        }
+        state.authorization_epoch = uuid::Uuid::new_v4().to_string();
+        state.status = "deleting".to_string();
+        state.next_refresh_at_ms = i64::MAX;
+        version = persist_refresh_state_if_current(store, &state, version)
+            .await?
+            .ok_or_else(|| {
+                Status::aborted("provider refresh was concurrently modified during deletion")
+            })?;
+        if let Some(metadata) = state.metadata.as_mut() {
+            metadata.resource_version = version;
+        }
+    }
+
+    delete_pending_secret_handles(credentials, &state).await?;
+    credentials
+        .delete_refresh_material_handles(
+            refresh_material_scope(&state),
+            &state.secret_material_handles,
+        )
+        .await?;
     store
-        .delete_by_name(
+        .delete_if(
             StoredProviderCredentialRefreshState::object_type(),
-            workspace,
-            &name,
+            state.object_id(),
+            version,
         )
         .await
-        .map_err(|e| Status::internal(format!("delete provider refresh state failed: {e}")))
+        .map_err(|err| match err {
+            PersistenceError::Conflict { .. } => {
+                Status::aborted("provider refresh was concurrently modified during deletion")
+            }
+            other => Status::internal(format!("delete provider refresh state failed: {other}")),
+        })
 }
 
-pub async fn delete_refresh_states_for_provider(
+pub async fn delete_refresh_states_for_provider_with_credentials(
     store: &Store,
+    credentials: &crate::credentials::CredentialRuntime,
     provider_id: &str,
 ) -> Result<u64, Status> {
     let states = list_refresh_states_for_provider(store, provider_id).await?;
     let mut deleted = 0;
     for state in &states {
-        if store
-            .delete_by_name(
-                StoredProviderCredentialRefreshState::object_type(),
-                state.object_workspace(),
-                state.object_name(),
-            )
-            .await
-            .map_err(|e| Status::internal(format!("delete provider refresh state failed: {e}")))?
+        if delete_refresh_state_with_credentials(
+            store,
+            credentials,
+            state.object_workspace(),
+            provider_id,
+            &state.credential_key,
+        )
+        .await?
         {
             deleted += 1;
         }
@@ -270,6 +382,9 @@ pub fn new_refresh_state(
         refresh_before_seconds: config.refresh_before_seconds,
         max_lifetime_seconds: config.max_lifetime_seconds,
         additional_output_keys: config.additional_output_keys,
+        authorization_epoch: uuid::Uuid::new_v4().to_string(),
+        secret_material_handles: HashMap::new(),
+        pending_secret_deletions: Vec::new(),
     })
 }
 
@@ -339,10 +454,157 @@ pub fn refresh_strategy_name(strategy: i32) -> &'static str {
 
 pub use openshell_providers::is_gateway_mintable_strategy;
 
+/// Secret source-material fields that are security-sensitive by strategy even
+/// when a direct API caller omits `secret_material_keys`.
+pub fn strategy_secret_material_keys(
+    strategy: ProviderCredentialRefreshStrategy,
+) -> &'static [&'static str] {
+    match strategy {
+        ProviderCredentialRefreshStrategy::Oauth2RefreshToken => {
+            &["refresh_token", "client_secret"]
+        }
+        ProviderCredentialRefreshStrategy::Oauth2ClientCredentials => &["client_secret"],
+        ProviderCredentialRefreshStrategy::GoogleServiceAccountJwt => &["private_key"],
+        ProviderCredentialRefreshStrategy::AwsStsAssumeRole => {
+            &["aws_secret_access_key", "aws_session_token"]
+        }
+        ProviderCredentialRefreshStrategy::Static
+        | ProviderCredentialRefreshStrategy::External
+        | ProviderCredentialRefreshStrategy::Unspecified => &[],
+    }
+}
+
+async fn resolve_refresh_material(
+    credentials: Option<&crate::credentials::CredentialRuntime>,
+    state: &StoredProviderCredentialRefreshState,
+) -> Result<StoredProviderCredentialRefreshState, Status> {
+    if state.secret_material_handles.is_empty() {
+        return Ok(state.clone());
+    }
+    let credentials = credentials.ok_or_else(|| {
+        Status::failed_precondition(
+            "provider refresh material requires the configured credential runtime",
+        )
+    })?;
+    let resolved = credentials
+        .resolve_refresh_material(
+            refresh_material_scope(state),
+            &state.secret_material_handles,
+        )
+        .await?;
+    let mut transient = state.clone();
+    transient.material.extend(resolved);
+    Ok(transient)
+}
+
+pub fn enqueue_pending_secret_deletion(
+    state: &mut StoredProviderCredentialRefreshState,
+    material_key: &str,
+    handle: CredentialHandle,
+) {
+    state
+        .pending_secret_deletions
+        .push(StoredRefreshMaterialDeletion {
+            material_key: material_key.to_string(),
+            handle: Some(handle),
+        });
+}
+
+async fn delete_pending_secret_handles(
+    credentials: &crate::credentials::CredentialRuntime,
+    state: &StoredProviderCredentialRefreshState,
+) -> Result<(), Status> {
+    credentials
+        .delete_refresh_material_deletions(
+            refresh_material_scope(state),
+            &state.pending_secret_deletions,
+        )
+        .await
+}
+
+async fn cleanup_pending_secret_deletions(
+    store: &Store,
+    credentials: Option<&crate::credentials::CredentialRuntime>,
+    state: &mut StoredProviderCredentialRefreshState,
+    expected_version: u64,
+) -> Result<u64, Status> {
+    if state.pending_secret_deletions.is_empty() {
+        return Ok(expected_version);
+    }
+    let credentials = credentials.ok_or_else(|| {
+        Status::failed_precondition(
+            "provider refresh cleanup requires the configured credential runtime",
+        )
+    })?;
+    delete_pending_secret_handles(credentials, state).await?;
+    // Keep the caller's in-memory state unchanged unless the CAS succeeds. A
+    // failed cleanup must not let the live refresh path persist a locally
+    // cleared tombstone list over the durable retry references.
+    let mut cleaned = state.clone();
+    cleaned.pending_secret_deletions.clear();
+    let new_version = persist_refresh_state_if_current(store, &cleaned, expected_version)
+        .await?
+        .ok_or_else(|| {
+            Status::aborted("provider refresh was deleted or superseded during secret cleanup")
+        })?;
+    if let Some(metadata) = cleaned.metadata.as_mut() {
+        metadata.resource_version = new_version;
+    }
+    *state = cleaned;
+    Ok(new_version)
+}
+
+async fn persist_refresh_error_state(
+    store: &Store,
+    state: &mut StoredProviderCredentialRefreshState,
+    expected_version: u64,
+    error: &Status,
+) -> Result<u64, Status> {
+    let now_ms = current_time_ms();
+    state.status = "error".to_string();
+    state.last_error = error.message().to_string();
+    state.next_refresh_at_ms =
+        now_ms.saturating_add(REFRESH_ERROR_RETRY_SECONDS.saturating_mul(1000));
+    let new_version = persist_refresh_state_if_current(store, state, expected_version)
+        .await?
+        .ok_or_else(|| {
+            Status::aborted(
+                "provider refresh was deleted or superseded while recording a refresh error",
+            )
+        })?;
+    if let Some(metadata) = state.metadata.as_mut() {
+        metadata.resource_version = new_version;
+    }
+    Ok(new_version)
+}
+
+fn validate_secret_material_references(
+    state: &StoredProviderCredentialRefreshState,
+) -> Result<(), Status> {
+    let mut missing: Vec<_> = state
+        .secret_material_keys
+        .iter()
+        .filter(|key| {
+            !state.material.contains_key(*key) && !state.secret_material_handles.contains_key(*key)
+        })
+        .cloned()
+        .collect();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    missing.sort();
+    missing.dedup();
+    Err(Status::failed_precondition(format!(
+        "provider refresh secret material is missing both inline values and credential handles for {}; a mixed-version gateway upgrade may have discarded the handles, so restore the refresh state or reconfigure the grant",
+        missing.join(", ")
+    )))
+}
+
 pub async fn refresh_provider_credential(
     store: &Store,
     workspace: &str,
-    credentials: Option<&crate::credentials::CredentialRuntime>,
+    credentials: &crate::credentials::CredentialRuntime,
+    compute: Option<&crate::compute::ComputeRuntime>,
     provider_name: &str,
     credential_key: &str,
 ) -> Result<StoredProviderCredentialRefreshState, Status> {
@@ -351,11 +613,22 @@ pub async fn refresh_provider_credential(
         .await
         .map_err(|e| Status::internal(format!("fetch provider failed: {e}")))?
         .ok_or_else(|| Status::not_found("provider not found"))?;
-    let Some(mut state) =
+    let Some(state) =
         get_refresh_state(store, workspace, provider.object_id(), credential_key).await?
     else {
         return Err(Status::not_found("provider refresh state not found"));
     };
+    if state
+        .metadata
+        .as_ref()
+        .is_some_and(|metadata| metadata.deletion_timestamp_ms != 0)
+    {
+        return Err(Status::failed_precondition(
+            "provider refresh is being deleted",
+        ));
+    }
+    let mut state = state;
+    validate_secret_material_references(&state)?;
     // Generation of the refresh at the start of the rotation. Terminal persists
     // match on it so a concurrent delete or rotation is detected rather than
     // clobbered, and a deleted refresh is never recreated (CWE-362).
@@ -363,6 +636,25 @@ pub async fn refresh_provider_credential(
         .metadata
         .as_ref()
         .map_or(0, |meta| meta.resource_version);
+    let expected_version = match cleanup_pending_secret_deletions(
+        store,
+        Some(credentials),
+        &mut state,
+        expected_version,
+    )
+    .await
+    {
+        Ok(new_version) => new_version,
+        Err(err) => {
+            warn!(
+                provider = %state.provider_name,
+                credential_key = %state.credential_key,
+                error = %err,
+                "provider refresh material cleanup failed; continuing with live refresh"
+            );
+            expected_version
+        }
+    };
 
     info!(
         provider = %state.provider_name,
@@ -378,12 +670,7 @@ pub async fn refresh_provider_credential(
     // Otherwise disabling providers_v2_enabled leaves already-configured refresh
     // states that the worker and manual rotation keep minting from.
     if let Err(err) = ensure_refresh_providers_v2_gate(store, &state).await {
-        let now_ms = current_time_ms();
-        state.status = "error".to_string();
-        state.last_error = err.message().to_string();
-        state.next_refresh_at_ms =
-            now_ms.saturating_add(REFRESH_ERROR_RETRY_SECONDS.saturating_mul(1000));
-        persist_refresh_state_if_current(store, &state, expected_version).await?;
+        persist_refresh_error_state(store, &mut state, expected_version, &err).await?;
         warn!(
             provider = %state.provider_name,
             credential_key = %state.credential_key,
@@ -395,13 +682,15 @@ pub async fn refresh_provider_credential(
         return Err(err);
     }
 
-    match mint_credential(&state).await {
+    let mint_result = match resolve_refresh_material(Some(credentials), &state).await {
+        Ok(transient_state) => mint_credential(&transient_state).await,
+        Err(err) => Err(err),
+    };
+    match mint_result {
         Ok(minted) => {
             let now_ms = current_time_ms();
+            let mut staged_refresh_token_handles = HashMap::new();
             if let Some(ref refresh_token) = minted.refresh_token {
-                state
-                    .material
-                    .insert("refresh_token".to_string(), refresh_token.clone());
                 if !state
                     .secret_material_keys
                     .iter()
@@ -409,6 +698,54 @@ pub async fn refresh_provider_credential(
                 {
                     state.secret_material_keys.push("refresh_token".to_string());
                 }
+                let material =
+                    HashMap::from([("refresh_token".to_string(), refresh_token.clone())]);
+                let staging_id = format!(
+                    "{}-refresh-material-{}",
+                    state.object_id(),
+                    uuid::Uuid::new_v4()
+                );
+                staged_refresh_token_handles = match credentials
+                    .store_refresh_material_with_object_id(
+                        refresh_material_scope(&state),
+                        &staging_id,
+                        &material,
+                        &HashMap::new(),
+                    )
+                    .await
+                {
+                    Ok(handles) => handles,
+                    Err(store_err) => {
+                        let err = Status::failed_precondition(format!(
+                            "the OAuth provider rotated the refresh token, but the replacement could not be stored; the grant must be re-authorized: {}",
+                            store_err.message()
+                        ));
+                        persist_refresh_error_state(store, &mut state, expected_version, &err)
+                            .await?;
+                        return Err(err);
+                    }
+                };
+                let Some(handle) = staged_refresh_token_handles.get("refresh_token").cloned()
+                else {
+                    let err = Status::failed_precondition(
+                        "the OAuth provider rotated the refresh token, but the credential driver returned no replacement handle; the grant must be re-authorized",
+                    );
+                    cleanup_staged_refresh_material_handles(
+                        credentials,
+                        &state,
+                        &staged_refresh_token_handles,
+                    )
+                    .await;
+                    persist_refresh_error_state(store, &mut state, expected_version, &err).await?;
+                    return Err(err);
+                };
+                if let Some(previous) = state
+                    .secret_material_handles
+                    .insert("refresh_token".to_string(), handle)
+                {
+                    enqueue_pending_secret_deletion(&mut state, "refresh_token", previous);
+                }
+                state.material.remove("refresh_token");
             }
             state.expires_at_ms = minted.expires_at_ms;
             state.next_refresh_at_ms = next_refresh_at_ms(
@@ -429,38 +766,60 @@ pub async fn refresh_provider_credential(
             // from a stale generation are written, and a deleted refresh is not
             // resurrected (CWE-362). This makes generation ownership the gate on
             // the provider credential write.
-            let Some(new_version) =
-                persist_refresh_state_if_current(store, &state, expected_version).await?
-            else {
-                warn!(
-                    provider = %state.provider_name,
-                    credential_key = %state.credential_key,
-                    strategy = %refresh_strategy_name(state.strategy),
-                    "provider credential refresh deleted or superseded during rotation; discarding minted credentials"
-                );
-                return Err(Status::aborted(
-                    "provider refresh was deleted or superseded during rotation",
-                ));
+            let new_version = match persist_refresh_state_if_current(
+                store,
+                &state,
+                expected_version,
+            )
+            .await
+            {
+                Ok(Some(new_version)) => new_version,
+                Ok(None) => {
+                    if !staged_refresh_token_handles.is_empty() {
+                        cleanup_staged_refresh_material_handles(
+                            credentials,
+                            &state,
+                            &staged_refresh_token_handles,
+                        )
+                        .await;
+                    }
+                    warn!(
+                        provider = %state.provider_name,
+                        credential_key = %state.credential_key,
+                        strategy = %refresh_strategy_name(state.strategy),
+                        "provider credential refresh deleted or superseded during rotation; discarding minted credentials"
+                    );
+                    return Err(Status::aborted(
+                        "provider refresh was deleted or superseded during rotation",
+                    ));
+                }
+                Err(err) => {
+                    // The replacement refresh token is already in credential
+                    // storage. Retry the same CAS with error/backoff state so a
+                    // transient database failure does not discard the only
+                    // upstream-valid grant. If that also fails, leave the
+                    // staged object intact for operator recovery rather than
+                    // deleting an irreplaceable rotated token.
+                    persist_refresh_error_state(store, &mut state, expected_version, &err).await?;
+                    return Err(err);
+                }
             };
 
             // Generation is ours; write the minted credentials into the provider.
             if let Err(err) = apply_minted_credential(
                 store,
                 workspace,
-                credentials,
+                Some(credentials),
+                compute,
                 &provider,
                 credential_key,
                 &minted,
             )
             .await
             {
-                state.status = "error".to_string();
-                state.last_error = err.message().to_string();
-                state.next_refresh_at_ms =
-                    now_ms.saturating_add(REFRESH_ERROR_RETRY_SECONDS.saturating_mul(1000));
                 // Reflect the failure on the state we just wrote; skip silently
                 // if it was deleted concurrently (it is not recreated).
-                persist_refresh_state_if_current(store, &state, new_version).await?;
+                persist_refresh_error_state(store, &mut state, new_version, &err).await?;
                 warn!(
                     provider = %state.provider_name,
                     credential_key = %state.credential_key,
@@ -483,15 +842,27 @@ pub async fn refresh_provider_credential(
                 seconds_until_refresh = seconds_until_ms(now_ms, state.next_refresh_at_ms),
                 "provider credential refresh completed"
             );
+            if !state.pending_secret_deletions.is_empty()
+                && let Err(err) = cleanup_pending_secret_deletions(
+                    store,
+                    Some(credentials),
+                    &mut state,
+                    new_version,
+                )
+                .await
+            {
+                warn!(
+                    provider = %state.provider_name,
+                    credential_key = %state.credential_key,
+                    error = %err,
+                    "failed to clean up replaced refresh material; retrying on the next sweep"
+                );
+            }
             Ok(state)
         }
         Err(err) => {
             let now_ms = current_time_ms();
-            state.status = "error".to_string();
-            state.last_error = err.message().to_string();
-            state.next_refresh_at_ms =
-                now_ms.saturating_add(REFRESH_ERROR_RETRY_SECONDS.saturating_mul(1000));
-            persist_refresh_state_if_current(store, &state, expected_version).await?;
+            persist_refresh_error_state(store, &mut state, expected_version, &err).await?;
             warn!(
                 provider = %state.provider_name,
                 credential_key = %state.credential_key,
@@ -507,10 +878,29 @@ pub async fn refresh_provider_credential(
     }
 }
 
+async fn cleanup_staged_refresh_material_handles(
+    credentials: &crate::credentials::CredentialRuntime,
+    state: &StoredProviderCredentialRefreshState,
+    handles: &HashMap<String, CredentialHandle>,
+) {
+    if let Err(err) = credentials
+        .delete_refresh_material_handles(refresh_material_scope(state), handles)
+        .await
+    {
+        warn!(
+            provider = %state.provider_name,
+            credential_key = %state.credential_key,
+            error = %err,
+            "failed to clean up staged provider refresh material"
+        );
+    }
+}
+
 async fn apply_minted_credential(
     store: &Store,
     workspace: &str,
     credentials: Option<&crate::credentials::CredentialRuntime>,
+    compute: Option<&crate::compute::ComputeRuntime>,
     provider: &Provider,
     credential_key: &str,
     minted: &MintedCredential,
@@ -520,6 +910,9 @@ async fn apply_minted_credential(
     let staged_handles = if let Some(credentials) = credentials
         && credentials.stores_provider_credentials()
     {
+        if let Some(compute) = compute {
+            compute.ensure_workspace(workspace).await?;
+        }
         let mut creds_to_store =
             HashMap::from([(credential_key.to_string(), minted.access_token.clone())]);
         for (key, value) in &minted.additional_credentials {
@@ -781,6 +1174,8 @@ async fn mint_oauth2_client_credentials(
 async fn mint_google_service_account_jwt(
     state: &StoredProviderCredentialRefreshState,
 ) -> Result<MintedCredential, Status> {
+    crate::install_jsonwebtoken_crypto_provider();
+
     let token_url = google_token_url(state);
     let client_email = required_material(&state.material, "client_email")?;
     let private_key = required_material(&state.material, "private_key")?;
@@ -1115,8 +1510,12 @@ pub fn spawn_refresh_worker(state: std::sync::Arc<crate::ServerState>, interval:
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             ticker.tick().await;
-            if let Err(err) =
-                run_refresh_worker_tick(state.store.as_ref(), Some(&state.credentials)).await
+            if let Err(err) = run_refresh_worker_tick(
+                state.store.as_ref(),
+                Some(&state.credentials),
+                Some(&state.compute),
+            )
+            .await
             {
                 warn!(error = %err, "provider credential refresh worker tick failed");
             }
@@ -1136,6 +1535,7 @@ pub fn spawn_refresh_worker(state: std::sync::Arc<crate::ServerState>, interval:
 async fn run_refresh_worker_tick(
     store: &Store,
     credentials: Option<&crate::credentials::CredentialRuntime>,
+    compute: Option<&crate::compute::ComputeRuntime>,
 ) -> Result<(), Status> {
     let now_ms = current_time_ms();
     let states = list_all_refresh_states(store).await.inspect_err(|_| {
@@ -1158,8 +1558,64 @@ async fn run_refresh_worker_tick(
         due_count, rotation_requested_count, "provider credential refresh worker sweep"
     );
     for state in states {
+        if state
+            .metadata
+            .as_ref()
+            .is_some_and(|metadata| metadata.deletion_timestamp_ms != 0)
+        {
+            let Some(credentials) = credentials else {
+                warn!(
+                    provider = %state.provider_name,
+                    credential_key = %state.credential_key,
+                    "cannot finalize tombstoned provider refresh without credential runtime"
+                );
+                continue;
+            };
+            if let Err(err) = delete_refresh_state_with_credentials(
+                store,
+                credentials,
+                state.object_workspace(),
+                &state.provider_id,
+                &state.credential_key,
+            )
+            .await
+            {
+                warn!(
+                    provider = %state.provider_name,
+                    credential_key = %state.credential_key,
+                    error = %err,
+                    "failed to finalize tombstoned provider refresh; retrying on the next sweep"
+                );
+            }
+            continue;
+        }
+        let mut state = state;
+        let expected_version = state
+            .metadata
+            .as_ref()
+            .map_or(0, |metadata| metadata.resource_version);
+        if let Err(err) =
+            cleanup_pending_secret_deletions(store, credentials, &mut state, expected_version).await
+        {
+            warn!(
+                provider = %state.provider_name,
+                credential_key = %state.credential_key,
+                error = %err,
+                "provider refresh material cleanup failed; continuing with live refresh"
+            );
+        }
         let strategy = ProviderCredentialRefreshStrategy::try_from(state.strategy)
             .unwrap_or(ProviderCredentialRefreshStrategy::Unspecified);
+        if !is_gateway_mintable_strategy(strategy) {
+            warn!(
+                provider = %state.provider_name,
+                credential_key = %state.credential_key,
+                strategy = %refresh_strategy_name(state.strategy),
+                status = %state.status,
+                "skipping non-gateway-mintable provider credential refresh state"
+            );
+            continue;
+        }
         let due = state.next_refresh_at_ms <= 0 || state.next_refresh_at_ms <= now_ms;
         let rotation_requested = state.status == "rotation_requested";
         info!(
@@ -1179,16 +1635,14 @@ async fn run_refresh_worker_tick(
         if !due && !rotation_requested {
             continue;
         }
-        if !is_gateway_mintable_strategy(strategy) {
+        let Some(credentials) = credentials else {
             warn!(
                 provider = %state.provider_name,
                 credential_key = %state.credential_key,
-                strategy = %refresh_strategy_name(state.strategy),
-                status = %state.status,
-                "skipping non-gateway-mintable provider credential refresh state"
+                "cannot refresh provider credential without credential runtime"
             );
             continue;
-        }
+        };
         info!(
             provider = %state.provider_name,
             credential_key = %state.credential_key,
@@ -1200,6 +1654,7 @@ async fn run_refresh_worker_tick(
             store,
             state.object_workspace(),
             credentials,
+            compute,
             &state.provider_name,
             &state.credential_key,
         )
@@ -1222,21 +1677,30 @@ async fn run_refresh_worker_tick(
 #[cfg(test)]
 mod tests {
     use super::{
-        NewRefreshStateConfig, delete_refresh_state, get_refresh_state, new_refresh_state,
-        put_refresh_state, refresh_provider_credential, refresh_state_name, refresh_strategy_name,
-        run_refresh_worker_tick, seconds_until_ms,
+        NewRefreshStateConfig, delete_refresh_state_with_credentials,
+        effective_authorization_epoch, enqueue_pending_secret_deletion, get_refresh_state,
+        list_all_refresh_states, list_refresh_states_for_provider, new_refresh_state,
+        put_refresh_state, refresh_material_scope, refresh_provider_credential, refresh_state_name,
+        refresh_strategy_name, run_refresh_worker_tick, seconds_until_ms,
+        validate_secret_material_references,
     };
     use crate::credentials::CredentialRuntime;
     use crate::persistence::{current_time_ms, test_store};
     use openshell_core::Config;
     use openshell_core::proto::datamodel::v1::ObjectMeta;
     use openshell_core::proto::{
-        Provider, ProviderCredentialRefreshStrategy, Sandbox, SandboxSpec,
+        CredentialHandle, Provider, ProviderCredentialRefreshStrategy, Sandbox, SandboxSpec,
+        StoredProviderCredentialRefreshState,
     };
     use openshell_core::{ObjectId, ObjectName, ObjectWorkspace};
     use std::collections::HashMap;
     use wiremock::matchers::{body_string_contains, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn test_credentials() -> CredentialRuntime {
+        CredentialRuntime::from_config(&Config::new(None).with_credential_drivers(["test-static"]))
+            .expect("test credential runtime")
+    }
 
     #[test]
     fn refresh_state_name_preserves_distinct_credential_keys() {
@@ -1253,6 +1717,68 @@ mod tests {
         assert_ne!(
             refresh_state_name(provider_id, "Alex-API"),
             refresh_state_name(provider_id, "alex-api")
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_state_lists_hydrate_authoritative_resource_versions() {
+        let store = test_store().await;
+        let provider_id = "provider-id";
+        let state = StoredProviderCredentialRefreshState {
+            metadata: Some(ObjectMeta {
+                id: "refresh-id".to_string(),
+                name: refresh_state_name(provider_id, "ACCESS_TOKEN"),
+                workspace: "default".to_string(),
+                ..Default::default()
+            }),
+            provider_id: provider_id.to_string(),
+            credential_key: "ACCESS_TOKEN".to_string(),
+            ..Default::default()
+        };
+        put_refresh_state(&store, &state).await.unwrap();
+
+        let scoped = list_refresh_states_for_provider(&store, provider_id)
+            .await
+            .unwrap();
+        let all = list_all_refresh_states(&store).await.unwrap();
+        assert_eq!(scoped[0].metadata.as_ref().unwrap().resource_version, 1);
+        assert_eq!(all[0].metadata.as_ref().unwrap().resource_version, 1);
+    }
+
+    #[test]
+    fn new_refresh_configuration_rotates_authorization_epoch_and_legacy_state_is_stable() {
+        let provider = Provider {
+            metadata: Some(ObjectMeta {
+                id: "provider-id".to_string(),
+                name: "provider".to_string(),
+                workspace: "default".to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let config = || NewRefreshStateConfig {
+            strategy: ProviderCredentialRefreshStrategy::Oauth2RefreshToken,
+            material: HashMap::new(),
+            secret_material_keys: Vec::new(),
+            expires_at_ms: 0,
+            token_url: "https://issuer.example/token".to_string(),
+            scopes: vec!["scope".to_string()],
+            refresh_before_seconds: 300,
+            max_lifetime_seconds: 3600,
+            additional_output_keys: HashMap::new(),
+        };
+        let first = new_refresh_state(&provider, "default", "ACCESS_TOKEN", config())
+            .expect("first refresh configuration");
+        let second = new_refresh_state(&provider, "default", "ACCESS_TOKEN", config())
+            .expect("second refresh configuration");
+        assert!(!first.authorization_epoch.is_empty());
+        assert_ne!(first.authorization_epoch, second.authorization_epoch);
+
+        let mut legacy = first;
+        legacy.authorization_epoch.clear();
+        assert_eq!(
+            effective_authorization_epoch(&legacy).expect("legacy migration epoch"),
+            legacy.metadata.as_ref().expect("metadata").id
         );
     }
 
@@ -1278,6 +1804,62 @@ mod tests {
             "google_service_account_jwt"
         );
         assert_eq!(refresh_strategy_name(i32::MAX), "unspecified");
+    }
+
+    #[test]
+    fn pending_secret_deletions_preserve_multiple_generations_for_one_key() {
+        let mut state = StoredProviderCredentialRefreshState::default();
+        for handle in ["first", "second"] {
+            enqueue_pending_secret_deletion(
+                &mut state,
+                "refresh_token",
+                CredentialHandle {
+                    driver: "test-static".to_string(),
+                    handle: handle.to_string(),
+                    metadata: HashMap::new(),
+                },
+            );
+        }
+
+        assert_eq!(state.pending_secret_deletions.len(), 2);
+        assert_eq!(
+            state.pending_secret_deletions[0]
+                .handle
+                .as_ref()
+                .unwrap()
+                .handle,
+            "first"
+        );
+        assert_eq!(
+            state.pending_secret_deletions[1]
+                .handle
+                .as_ref()
+                .unwrap()
+                .handle,
+            "second"
+        );
+    }
+
+    #[test]
+    fn refresh_rejects_secret_material_lost_by_mixed_version_gateway() {
+        let mut state = StoredProviderCredentialRefreshState {
+            secret_material_keys: vec!["refresh_token".to_string()],
+            ..Default::default()
+        };
+        let err = validate_secret_material_references(&state).unwrap_err();
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(err.message().contains("mixed-version gateway"));
+        assert!(err.message().contains("refresh_token"));
+
+        state.secret_material_handles.insert(
+            "refresh_token".to_string(),
+            CredentialHandle {
+                driver: "test-static".to_string(),
+                handle: "stored-token".to_string(),
+                metadata: HashMap::new(),
+            },
+        );
+        validate_secret_material_references(&state).unwrap();
     }
 
     #[tokio::test]
@@ -1323,16 +1905,20 @@ mod tests {
         )
         .unwrap();
         put_refresh_state(&store, &state).await.unwrap();
+        let authorization_epoch = state.authorization_epoch.clone();
+        let credentials = test_credentials();
 
         let refreshed = refresh_provider_credential(
             &store,
             "default",
+            &credentials,
             None,
             "my-graph",
             "MS_GRAPH_ACCESS_TOKEN",
         )
         .await
         .unwrap();
+        assert_eq!(refreshed.authorization_epoch, authorization_epoch);
         assert_eq!(refreshed.status, "refreshed");
         assert!(refreshed.expires_at_ms > 0);
         assert!(refreshed.next_refresh_at_ms > 0);
@@ -1344,8 +1930,12 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+        let resolved = credentials
+            .resolve_provider_handles(&stored, current_time_ms())
+            .await
+            .unwrap();
         assert_eq!(
-            stored.credentials.get("MS_GRAPH_ACCESS_TOKEN"),
+            resolved.values.get("MS_GRAPH_ACCESS_TOKEN"),
             Some(&"minted-graph-token".to_string())
         );
         assert_eq!(
@@ -1370,7 +1960,7 @@ mod tests {
         let store = test_store().await;
         let provider = provider("my-stored-graph", "outlook");
         store.put_message(&provider).await.unwrap();
-        let state = new_refresh_state(
+        let mut state = new_refresh_state(
             &provider,
             "default",
             "MS_GRAPH_ACCESS_TOKEN",
@@ -1390,19 +1980,47 @@ mod tests {
             },
         )
         .unwrap();
-        put_refresh_state(&store, &state).await.unwrap();
         let config = Config::new(None).with_credential_drivers(["test-static"]);
         let credentials = CredentialRuntime::from_config(&config).unwrap();
+        state.secret_material_handles = credentials
+            .store_refresh_material_with_object_id(
+                refresh_material_scope(&state),
+                "configured-client-secret",
+                &HashMap::from([("client_secret".to_string(), "client-secret".to_string())]),
+                &HashMap::new(),
+            )
+            .await
+            .unwrap();
+        state.material.remove("client_secret");
+        put_refresh_state(&store, &state).await.unwrap();
+        let authorization_epoch = state.authorization_epoch.clone();
 
         let refreshed = refresh_provider_credential(
             &store,
             "default",
-            Some(&credentials),
+            &credentials,
+            None,
             "my-stored-graph",
             "MS_GRAPH_ACCESS_TOKEN",
         )
         .await
         .unwrap();
+        assert_eq!(refreshed.authorization_epoch, authorization_epoch);
+        let stored_refresh = get_refresh_state(
+            &store,
+            "default",
+            provider.object_id(),
+            "MS_GRAPH_ACCESS_TOKEN",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(!stored_refresh.material.contains_key("client_secret"));
+        assert!(
+            stored_refresh
+                .secret_material_handles
+                .contains_key("client_secret")
+        );
 
         let stored = store
             .get_message_by_name::<Provider>("default", "my-stored-graph")
@@ -1493,10 +2111,12 @@ mod tests {
         )
         .unwrap();
         put_refresh_state(&store, &state).await.unwrap();
+        let credentials = test_credentials();
 
         let err = refresh_provider_credential(
             &store,
             "default",
+            &credentials,
             None,
             "refreshing-graph",
             "MS_GRAPH_ACCESS_TOKEN",
@@ -1573,10 +2193,15 @@ mod tests {
         )
         .unwrap();
         put_refresh_state(&store, &state).await.unwrap();
+        let credentials = CredentialRuntime::from_config(
+            &Config::new(None).with_credential_drivers(["test-static"]),
+        )
+        .unwrap();
 
         let refreshed = refresh_provider_credential(
             &store,
             "default",
+            &credentials,
             None,
             "my-delegated-graph",
             "MS_GRAPH_ACCESS_TOKEN",
@@ -1591,9 +2216,15 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(
-            stored_provider.credentials.get("MS_GRAPH_ACCESS_TOKEN"),
-            Some(&"delegated-graph-token".to_string())
+        assert!(
+            !stored_provider
+                .credentials
+                .contains_key("MS_GRAPH_ACCESS_TOKEN")
+        );
+        assert!(
+            stored_provider
+                .credential_handles
+                .contains_key("MS_GRAPH_ACCESS_TOKEN")
         );
         assert_eq!(
             stored_provider
@@ -1611,8 +2242,22 @@ mod tests {
         .await
         .unwrap()
         .unwrap();
+        assert!(!stored_state.material.contains_key("refresh_token"));
+        assert!(
+            stored_state
+                .secret_material_handles
+                .contains_key("refresh_token")
+        );
+        assert!(stored_state.pending_secret_deletions.is_empty());
         assert_eq!(
-            stored_state.material.get("refresh_token"),
+            credentials
+                .resolve_refresh_material(
+                    refresh_material_scope(&stored_state),
+                    &stored_state.secret_material_handles,
+                )
+                .await
+                .unwrap()
+                .get("refresh_token"),
             Some(&"rotated-refresh-token".to_string())
         );
         assert!(
@@ -1621,6 +2266,200 @@ mod tests {
                 .iter()
                 .any(|key| key == "refresh_token")
         );
+        assert_eq!(
+            credentials.stored_credential_count(),
+            Some(2),
+            "only the access token and current refresh token remain"
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_continues_when_pending_secret_cleanup_temporarily_fails() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "minted-after-cleanup-failure",
+                "expires_in": 3600,
+                "token_type": "Bearer"
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let store = test_store().await;
+        let provider = provider("cleanup-retry", "outlook");
+        store.put_message(&provider).await.unwrap();
+        let credentials = test_credentials();
+        let mut state = new_refresh_state(
+            &provider,
+            "default",
+            "MS_GRAPH_ACCESS_TOKEN",
+            NewRefreshStateConfig {
+                strategy: ProviderCredentialRefreshStrategy::Oauth2ClientCredentials,
+                material: HashMap::from([
+                    ("client_id".to_string(), "client-id".to_string()),
+                    ("client_secret".to_string(), "client-secret".to_string()),
+                ]),
+                secret_material_keys: vec!["client_secret".to_string()],
+                expires_at_ms: 0,
+                token_url: format!("{}/token", mock_server.uri()),
+                scopes: Vec::new(),
+                refresh_before_seconds: 30,
+                max_lifetime_seconds: 60,
+                additional_output_keys: HashMap::new(),
+            },
+        )
+        .unwrap();
+        state.secret_material_handles = credentials
+            .store_refresh_material_with_object_id(
+                refresh_material_scope(&state),
+                "current-refresh-object",
+                &HashMap::from([("client_secret".to_string(), "client-secret".to_string())]),
+                &HashMap::new(),
+            )
+            .await
+            .unwrap();
+        state.material.remove("client_secret");
+        let old = credentials
+            .store_refresh_material_with_object_id(
+                refresh_material_scope(&state),
+                "old-refresh-object",
+                &HashMap::from([("client_secret".to_string(), "obsolete".to_string())]),
+                &HashMap::new(),
+            )
+            .await
+            .unwrap()
+            .remove("client_secret")
+            .unwrap();
+        enqueue_pending_secret_deletion(&mut state, "client_secret", old);
+        put_refresh_state(&store, &state).await.unwrap();
+        credentials.fail_next_delete();
+
+        let refreshed = refresh_provider_credential(
+            &store,
+            "default",
+            &credentials,
+            None,
+            "cleanup-retry",
+            "MS_GRAPH_ACCESS_TOKEN",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(refreshed.status, "refreshed");
+        assert!(refreshed.pending_secret_deletions.is_empty());
+        let stored = get_refresh_state(
+            &store,
+            "default",
+            provider.object_id(),
+            "MS_GRAPH_ACCESS_TOKEN",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(stored.pending_secret_deletions.is_empty());
+        assert_eq!(
+            credentials.stored_credential_count(),
+            Some(2),
+            "the current client secret and minted access token remain"
+        );
+    }
+
+    #[tokio::test]
+    async fn rotated_refresh_token_store_failure_persists_error_and_backoff() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "access-token-that-must-not-be-applied",
+                "refresh_token": "replacement-refresh-token",
+                "expires_in": 3600,
+                "token_type": "Bearer"
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let store = test_store().await;
+        let provider = provider("rotation-store-failure", "outlook");
+        store.put_message(&provider).await.unwrap();
+        let credentials = test_credentials();
+        let mut state = new_refresh_state(
+            &provider,
+            "default",
+            "MS_GRAPH_ACCESS_TOKEN",
+            NewRefreshStateConfig {
+                strategy: ProviderCredentialRefreshStrategy::Oauth2RefreshToken,
+                material: HashMap::from([
+                    ("client_id".to_string(), "client-id".to_string()),
+                    ("refresh_token".to_string(), "old-refresh-token".to_string()),
+                ]),
+                secret_material_keys: vec!["refresh_token".to_string()],
+                expires_at_ms: 0,
+                token_url: format!("{}/token", mock_server.uri()),
+                scopes: Vec::new(),
+                refresh_before_seconds: 30,
+                max_lifetime_seconds: 60,
+                additional_output_keys: HashMap::new(),
+            },
+        )
+        .unwrap();
+        state.secret_material_handles = credentials
+            .store_refresh_material_with_object_id(
+                refresh_material_scope(&state),
+                "original-grant",
+                &HashMap::from([("refresh_token".to_string(), "old-refresh-token".to_string())]),
+                &HashMap::new(),
+            )
+            .await
+            .unwrap();
+        state.material.remove("refresh_token");
+        put_refresh_state(&store, &state).await.unwrap();
+        credentials.fail_next_store();
+        let before = current_time_ms();
+
+        let err = refresh_provider_credential(
+            &store,
+            "default",
+            &credentials,
+            None,
+            "rotation-store-failure",
+            "MS_GRAPH_ACCESS_TOKEN",
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(err.message().contains("must be re-authorized"));
+        let stored = get_refresh_state(
+            &store,
+            "default",
+            provider.object_id(),
+            "MS_GRAPH_ACCESS_TOKEN",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(stored.status, "error");
+        assert!(stored.last_error.contains("must be re-authorized"));
+        assert!(stored.next_refresh_at_ms > before);
+        assert_eq!(credentials.stored_credential_count(), Some(1));
+        assert_eq!(
+            credentials
+                .resolve_refresh_material(
+                    refresh_material_scope(&stored),
+                    &stored.secret_material_handles,
+                )
+                .await
+                .unwrap()
+                .get("refresh_token"),
+            Some(&"old-refresh-token".to_string())
+        );
+        let stored_provider = store
+            .get_message_by_name::<Provider>("default", "rotation-store-failure")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(stored_provider.credential_handles.is_empty());
     }
 
     #[tokio::test]
@@ -1667,10 +2506,12 @@ mod tests {
         )
         .unwrap();
         put_refresh_state(&store, &state).await.unwrap();
+        let credentials = test_credentials();
 
         let refreshed = refresh_provider_credential(
             &store,
             "default",
+            &credentials,
             None,
             "my-drive",
             "GOOGLE_DRIVE_ACCESS_TOKEN",
@@ -1685,8 +2526,12 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+        let resolved = credentials
+            .resolve_provider_handles(&stored, current_time_ms())
+            .await
+            .unwrap();
         assert_eq!(
-            stored.credentials.get("GOOGLE_DRIVE_ACCESS_TOKEN"),
+            resolved.values.get("GOOGLE_DRIVE_ACCESS_TOKEN"),
             Some(&"minted-drive-token".to_string())
         );
     }
@@ -1715,7 +2560,7 @@ mod tests {
         .unwrap();
         put_refresh_state(&store, &state).await.unwrap();
 
-        run_refresh_worker_tick(&store, None).await.unwrap();
+        run_refresh_worker_tick(&store, None, None).await.unwrap();
 
         let stored_state = get_refresh_state(
             &store,
@@ -1741,6 +2586,62 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn refresh_worker_finalizes_tombstoned_refresh_material() {
+        let store = test_store().await;
+        let provider = provider("tombstoned-refresh", "outlook");
+        store.put_message(&provider).await.unwrap();
+        let credentials = test_credentials();
+        let mut state = new_refresh_state(
+            &provider,
+            "default",
+            "MS_GRAPH_ACCESS_TOKEN",
+            NewRefreshStateConfig {
+                strategy: ProviderCredentialRefreshStrategy::Oauth2RefreshToken,
+                material: HashMap::from([("refresh_token".to_string(), "delete-me".to_string())]),
+                secret_material_keys: vec!["refresh_token".to_string()],
+                expires_at_ms: 0,
+                token_url: "https://issuer.example/token".to_string(),
+                scopes: Vec::new(),
+                refresh_before_seconds: 30,
+                max_lifetime_seconds: 60,
+                additional_output_keys: HashMap::new(),
+            },
+        )
+        .unwrap();
+        state.secret_material_handles = credentials
+            .store_refresh_material_with_object_id(
+                refresh_material_scope(&state),
+                "tombstoned-grant",
+                &state.material,
+                &HashMap::new(),
+            )
+            .await
+            .unwrap();
+        state.material.clear();
+        state.metadata.as_mut().unwrap().deletion_timestamp_ms = current_time_ms();
+        state.status = "deleting".to_string();
+        put_refresh_state(&store, &state).await.unwrap();
+        assert_eq!(credentials.stored_credential_count(), Some(1));
+
+        run_refresh_worker_tick(&store, Some(&credentials), None)
+            .await
+            .unwrap();
+
+        assert!(
+            get_refresh_state(
+                &store,
+                "default",
+                provider.object_id(),
+                "MS_GRAPH_ACCESS_TOKEN",
+            )
+            .await
+            .unwrap()
+            .is_none()
+        );
+        assert_eq!(credentials.stored_credential_count(), Some(0));
+    }
+
     /// The worker ticks on a timer with no inbound request, so without a span
     /// of its own its store reads export as anonymous single-span traces.
     #[tokio::test]
@@ -1751,7 +2652,7 @@ mod tests {
         let store = test_store().await;
 
         let traced = test_exporter::install_traced();
-        run_refresh_worker_tick(&store, None).await.unwrap();
+        run_refresh_worker_tick(&store, None, None).await.unwrap();
 
         let spans = traced.finished_spans();
         let root = spans
@@ -1868,10 +2769,12 @@ mod tests {
         )
         .unwrap();
         put_refresh_state(&store, &state).await.unwrap();
+        let credentials = test_credentials();
 
         let refreshed = refresh_provider_credential(
             &store,
             "default",
+            &credentials,
             None,
             "aws-sts-test",
             "AWS_ACCESS_KEY_ID",
@@ -1886,16 +2789,20 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+        let resolved = credentials
+            .resolve_provider_handles(&stored, current_time_ms())
+            .await
+            .unwrap();
         assert_eq!(
-            stored.credentials.get("AWS_ACCESS_KEY_ID"),
+            resolved.values.get("AWS_ACCESS_KEY_ID"),
             Some(&"ASIAMOCKKEY".to_string())
         );
         assert_eq!(
-            stored.credentials.get("AWS_SECRET_ACCESS_KEY"),
+            resolved.values.get("AWS_SECRET_ACCESS_KEY"),
             Some(&"MockSecretAccessKey123".to_string())
         );
         assert_eq!(
-            stored.credentials.get("AWS_SESSION_TOKEN"),
+            resolved.values.get("AWS_SESSION_TOKEN"),
             Some(&"MockSessionTokenXYZ".to_string())
         );
     }
@@ -1965,10 +2872,12 @@ mod tests {
         )
         .unwrap();
         put_refresh_state(&store, &state).await.unwrap();
+        let credentials = test_credentials();
 
         refresh_provider_credential(
             &store,
             "default",
+            &credentials,
             None,
             "aws-sts-custom",
             "AWS_ACCESS_KEY_ID",
@@ -1981,19 +2890,23 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+        let resolved = credentials
+            .resolve_provider_handles(&stored, current_time_ms())
+            .await
+            .unwrap();
         assert_eq!(
-            stored.credentials.get("AWS_ACCESS_KEY_ID"),
+            resolved.values.get("AWS_ACCESS_KEY_ID"),
             Some(&"ASIAMOCKKEY".to_string())
         );
         assert_eq!(
-            stored.credentials.get("CUSTOM_SECRET"),
+            resolved.values.get("CUSTOM_SECRET"),
             Some(&"MockSecretAccessKey123".to_string())
         );
         assert_eq!(
-            stored.credentials.get("CUSTOM_SESSION"),
+            resolved.values.get("CUSTOM_SESSION"),
             Some(&"MockSessionTokenXYZ".to_string())
         );
-        assert!(!stored.credentials.contains_key("AWS_SECRET_ACCESS_KEY"));
+        assert!(!resolved.values.contains_key("AWS_SECRET_ACCESS_KEY"));
     }
 
     #[tokio::test]
@@ -2041,10 +2954,12 @@ mod tests {
         )
         .unwrap();
         put_refresh_state(&store, &state).await.unwrap();
+        let credentials = test_credentials();
 
         let err = refresh_provider_credential(
             &store,
             "default",
+            &credentials,
             None,
             "aws-sts-partial",
             "AWS_ACCESS_KEY_ID",
@@ -2088,9 +3003,17 @@ mod tests {
             ]),
         };
 
-        apply_minted_credential(&store, "default", None, &prov, "AWS_ACCESS_KEY_ID", &minted)
-            .await
-            .unwrap();
+        apply_minted_credential(
+            &store,
+            "default",
+            None,
+            None,
+            &prov,
+            "AWS_ACCESS_KEY_ID",
+            &minted,
+        )
+        .await
+        .unwrap();
 
         let stored = store
             .get_message_by_name::<Provider>("default", "aws-test")
@@ -2163,6 +3086,7 @@ mod tests {
             &store,
             "default",
             Some(&credentials),
+            None,
             &prov,
             "AWS_ACCESS_KEY_ID",
             &minted,
@@ -2266,6 +3190,7 @@ mod tests {
             &store,
             "default",
             Some(&credentials),
+            None,
             &refreshing_provider,
             "AWS_ACCESS_KEY_ID",
             &minted,
@@ -2371,10 +3296,12 @@ mod tests {
         )
         .unwrap();
         put_refresh_state(&store, &state).await.unwrap();
+        let credentials = test_credentials();
 
         let refreshed = refresh_provider_credential(
             &store,
             "default",
+            &credentials,
             None,
             "aws-sts-session",
             "AWS_ACCESS_KEY_ID",
@@ -2387,8 +3314,12 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+        let resolved = credentials
+            .resolve_provider_handles(&stored, current_time_ms())
+            .await
+            .unwrap();
         assert_eq!(
-            stored.credentials.get("AWS_ACCESS_KEY_ID"),
+            resolved.values.get("AWS_ACCESS_KEY_ID"),
             Some(&"ASIAMOCKKEY".to_string())
         );
     }
@@ -2439,10 +3370,12 @@ mod tests {
         )
         .unwrap();
         put_refresh_state(&store, &state).await.unwrap();
+        let credentials = test_credentials();
 
         let err = refresh_provider_credential(
             &store,
             "default",
+            &credentials,
             None,
             "aws-sts-lonesession",
             "AWS_ACCESS_KEY_ID",
@@ -2525,9 +3458,16 @@ mod tests {
         )
         .unwrap();
         put_refresh_state(&store, &state).await.unwrap();
+        let credentials = test_credentials();
 
-        let rotate =
-            refresh_provider_credential(&store, "default", None, "aws-race", "AWS_ACCESS_KEY_ID");
+        let rotate = refresh_provider_credential(
+            &store,
+            "default",
+            &credentials,
+            None,
+            "aws-race",
+            "AWS_ACCESS_KEY_ID",
+        );
         let interfere = async {
             // Wait until the rotation is inside the STS call (its state read has
             // already happened), then delete the refresh and release STS.
@@ -2537,9 +3477,15 @@ mod tests {
             {
                 return;
             }
-            delete_refresh_state(&store, "default", &provider_id, "AWS_ACCESS_KEY_ID")
-                .await
-                .unwrap();
+            delete_refresh_state_with_credentials(
+                &store,
+                &credentials,
+                "default",
+                &provider_id,
+                "AWS_ACCESS_KEY_ID",
+            )
+            .await
+            .unwrap();
             let _ = release_tx.send(());
         };
         let (rotate_result, ()) = tokio::join!(rotate, interfere);
@@ -2640,10 +3586,12 @@ mod tests {
         )
         .unwrap();
         put_refresh_state(&store, &state).await.unwrap();
+        let credentials = test_credentials();
 
         let rotate = refresh_provider_credential(
             &store,
             "default",
+            &credentials,
             None,
             "aws-superseded",
             "AWS_ACCESS_KEY_ID",

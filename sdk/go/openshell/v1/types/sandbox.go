@@ -27,7 +27,9 @@ type SandboxSpec struct {
 	Providers   []string
 	GPUCount    *uint32
 	// Policy is the security policy for the sandbox. Nil means no policy specified.
-	Policy *SandboxPolicy
+	Policy  *SandboxPolicy
+	Command []string
+	TTY     bool
 }
 
 // SandboxTemplate defines the container template for a sandbox.
@@ -38,8 +40,8 @@ type SandboxTemplate struct {
 	Labels           map[string]string
 	Annotations      map[string]string
 	Environment      map[string]string
-	Resources        map[string]any
 	UserNamespaces   *bool
+	Resources        map[string]any
 	DriverConfig     map[string]any
 }
 
@@ -52,6 +54,7 @@ type SandboxStatus struct {
 	Phase                SandboxPhase
 	Conditions           []SandboxCondition
 	CurrentPolicyVersion uint32
+	ExitCode             *int32
 }
 
 // SandboxCondition describes an observed condition of a sandbox.

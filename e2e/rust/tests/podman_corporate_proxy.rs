@@ -30,6 +30,7 @@ use openshell_e2e::harness::cli::wait_for_healthy;
 use openshell_e2e::harness::container::{ContainerEngine, SupportContainer};
 use openshell_e2e::harness::gateway::ManagedGateway;
 use openshell_e2e::harness::sandbox::SandboxGuard;
+use serial_test::serial;
 use tempfile::NamedTempFile;
 
 const PROXY_ALIAS: &str = "corp-proxy.openshell.test";
@@ -134,6 +135,151 @@ while True:
     threading.Thread(target=handle, args=(client,), daemon=True).start()
 "#
     )
+}
+
+// Delimits the proxy's CA certificate in its stdout, so the test can recover
+// it and hand it back as the corporate CA bundle.
+const CA_BEGIN: &str = "---PROXY-CA-BEGIN---";
+const CA_END: &str = "---PROXY-CA-END---";
+
+/// A forward proxy that terminates TLS with a CA-signed certificate and logs
+/// every CONNECT it sees.
+///
+/// The container generates a corporate CA and a separate listener leaf signed
+/// by it (SAN = the proxy alias, which is the name the supervisor uses for
+/// SNI), serves the leaf, and prints the CA between [`CA_BEGIN`]/[`CA_END`] so
+/// the test can trust it via `proxy_ca_bundle`. The listener certificate must
+/// be a leaf: rustls rejects a `CA:TRUE` certificate presented as an
+/// end-entity certificate (`CaUsedAsEndEntity`), so a single self-signed
+/// `openssl req -x509` certificate — which is a CA by default — cannot serve
+/// as both the anchor and the listener identity. Signing a leaf also matches
+/// what a real intercepting proxy does. No Basic auth: this test isolates the
+/// `https://` proxy + corporate-CA path; credential delivery is covered by the
+/// plaintext-proxy test.
+fn tls_proxy_script() -> String {
+    format!(
+        r"
+import os, select, socket, ssl, subprocess, tempfile, threading
+
+workdir = tempfile.mkdtemp()
+ca_key = os.path.join(workdir, 'ca-key.pem')
+ca_crt = os.path.join(workdir, 'ca.pem')
+leaf_key = os.path.join(workdir, 'leaf-key.pem')
+leaf_csr = os.path.join(workdir, 'leaf.csr')
+leaf_crt = os.path.join(workdir, 'leaf.pem')
+chain = os.path.join(workdir, 'chain.pem')
+ext = os.path.join(workdir, 'leaf.ext')
+
+def run(*args):
+    subprocess.run(args, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+run('openssl', 'req', '-x509', '-newkey', 'rsa:2048', '-nodes',
+    '-keyout', ca_key, '-out', ca_crt, '-days', '1',
+    '-subj', '/CN=corp-proxy-e2e-ca')
+
+with open(ext, 'w') as fh:
+    fh.write('basicConstraints=critical,CA:FALSE\n'
+             'subjectAltName=DNS:{PROXY_ALIAS}\n'
+             'extendedKeyUsage=serverAuth\n')
+run('openssl', 'req', '-newkey', 'rsa:2048', '-nodes',
+    '-keyout', leaf_key, '-out', leaf_csr, '-subj', '/CN={PROXY_ALIAS}')
+run('openssl', 'x509', '-req', '-in', leaf_csr, '-CA', ca_crt, '-CAkey', ca_key,
+    '-CAcreateserial', '-out', leaf_crt, '-days', '1', '-extfile', ext)
+
+with open(chain, 'w') as out:
+    for part in (leaf_crt, ca_crt):
+        with open(part) as fh:
+            out.write(fh.read())
+
+with open(ca_crt) as fh:
+    print('{CA_BEGIN}\n' + fh.read() + '{CA_END}', flush=True)
+
+def log(msg):
+    print(msg, flush=True)
+
+def read_head(conn):
+    data = b''
+    while b'\r\n\r\n' not in data:
+        chunk = conn.recv(4096)
+        if not chunk:
+            return None
+        data += chunk
+        if len(data) > 65536:
+            return None
+    return data
+
+def pipe(a, b):
+    try:
+        while True:
+            ready, _, _ = select.select([a, b], [], [])
+            for sock in ready:
+                chunk = sock.recv(65536)
+                if not chunk:
+                    return
+                (b if sock is a else a).sendall(chunk)
+    except OSError:
+        return
+
+def handle(conn):
+    try:
+        head = read_head(conn)
+        if head is None:
+            return
+        lines = head.decode('latin-1').split('\r\n')
+        parts = lines[0].split()
+        if len(parts) < 2 or parts[0].upper() != 'CONNECT':
+            log('NON_CONNECT %s' % lines[0])
+            conn.sendall(b'HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\n\r\n')
+            return
+        target = parts[1]
+        host, _, port = target.rpartition(':')
+        host = host.strip('[]')
+        try:
+            upstream = socket.create_connection((host, int(port)), timeout=10)
+        except OSError:
+            log('CONNECT %s dial=fail' % target)
+            conn.sendall(b'HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n')
+            return
+        log('CONNECT %s ok' % target)
+        conn.sendall(b'HTTP/1.1 200 Connection Established\r\n\r\n')
+        pipe(conn, upstream)
+        upstream.close()
+    except OSError:
+        pass
+    finally:
+        conn.close()
+
+ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+ctx.load_cert_chain(chain, leaf_key)
+server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+server.bind(('0.0.0.0', {PROXY_PORT}))
+server.listen(64)
+log('tls-proxy-listening')
+while True:
+    raw, _ = server.accept()
+    try:
+        conn = ctx.wrap_socket(raw, server_side=True)
+    except OSError:
+        # Readiness probes open a bare TCP connection; the failed handshake is
+        # expected and must not spam the log.
+        raw.close()
+        continue
+    threading.Thread(target=handle, args=(conn,), daemon=True).start()
+"
+    )
+}
+
+/// Extract the proxy's CA certificate PEM from its stdout.
+fn ca_cert_from_logs(logs: &str) -> Result<String, String> {
+    let start = logs
+        .find(CA_BEGIN)
+        .ok_or_else(|| format!("proxy CA begin marker not found in logs:\n{logs}"))?
+        + CA_BEGIN.len();
+    let end = logs[start..]
+        .find(CA_END)
+        .ok_or_else(|| format!("proxy CA end marker not found in logs:\n{logs}"))?;
+    Ok(logs[start..start + end].trim().to_string())
 }
 
 /// A TLS server with a self-signed certificate, serving one identifying marker.
@@ -302,6 +448,16 @@ impl GatewayProxyConfig {
     /// Rewrite the gateway config with corporate-proxy settings and restart the
     /// gateway so the Podman driver picks them up.
     async fn apply(proxy_url: &str, auth_file: &str) -> Result<Self, String> {
+        Self::apply_with(proxy_url, Some(auth_file), None).await
+    }
+
+    /// Like [`apply`], but with optional proxy credentials and an optional
+    /// corporate CA bundle path (for an `https://` proxy).
+    async fn apply_with(
+        proxy_url: &str,
+        auth_file: Option<&str>,
+        ca_bundle: Option<&str>,
+    ) -> Result<Self, String> {
         let config_path = Self::config_path_from_args()?;
         let original = std::fs::read(&config_path)
             .map_err(|err| format!("read gateway config '{}': {err}", config_path.display()))?;
@@ -310,14 +466,19 @@ impl GatewayProxyConfig {
         if !updated.ends_with(b"\n") {
             updated.push(b'\n');
         }
-        updated.extend_from_slice(
-            format!(
-                "https_proxy = \"{proxy_url}\"\n\
-                 proxy_auth_file = \"{auth_file}\"\n\
-                 proxy_auth_allow_insecure = true\n"
-            )
-            .as_bytes(),
-        );
+        updated.extend_from_slice(format!("https_proxy = \"{proxy_url}\"\n").as_bytes());
+        if let Some(auth_file) = auth_file {
+            updated.extend_from_slice(
+                format!(
+                    "proxy_auth_file = \"{auth_file}\"\n\
+                     proxy_auth_allow_insecure = true\n"
+                )
+                .as_bytes(),
+            );
+        }
+        if let Some(ca_bundle) = ca_bundle {
+            updated.extend_from_slice(format!("proxy_ca_bundle = \"{ca_bundle}\"\n").as_bytes());
+        }
         std::fs::write(&config_path, &updated)
             .map_err(|err| format!("write gateway config '{}': {err}", config_path.display()))?;
 
@@ -480,6 +641,7 @@ fn assert_proxied_egress(output: &str, proxy_logs: &str, allowed_ip: &str, denie
 }
 
 #[tokio::test]
+#[serial(corporate_proxy)]
 async fn podman_corporate_proxy_routes_approved_tls_egress() {
     if std::env::var("OPENSHELL_E2E_DRIVER").as_deref() != Ok("podman") {
         eprintln!("Skipping corporate proxy test: e2e driver is not podman");
@@ -586,6 +748,134 @@ async fn podman_corporate_proxy_routes_approved_tls_egress() {
     wait_for_secret_removal(&sandbox_secret, Duration::from_secs(60))
         .await
         .expect("sandbox deletion should remove the proxy-auth secret");
+
+    gateway_config
+        .restore()
+        .await
+        .expect("restore gateway config");
+}
+
+/// Assert the approved destination reached the `https://` proxy over the
+/// tunnel and the denied one never did. The TLS proxy logs `CONNECT
+/// <ip>:<port> ok` (no auth dimension in this test).
+fn assert_https_proxied_egress(output: &str, proxy_logs: &str, allowed_ip: &str, denied_ip: &str) {
+    assert!(
+        output.contains(READY_MARKER),
+        "workload did not finish; output:\n{output}"
+    );
+    assert!(
+        output.contains(&format!(
+            "\"body\": \"{{\\\"upstream\\\":\\\"{ALLOWED_MARKER}\\\""
+        )),
+        "approved upstream body missing — egress did not complete through the https proxy:\n{output}"
+    );
+    assert!(
+        proxy_logs.contains(&format!("CONNECT {allowed_ip}:{UPSTREAM_PORT} ok")),
+        "https proxy should have seen a validated-IP CONNECT to the approved upstream:\n{proxy_logs}"
+    );
+    assert!(
+        !proxy_logs.contains(DENIED_ALIAS)
+            && !proxy_logs.contains(&format!("{denied_ip}:{UPSTREAM_PORT}")),
+        "policy-denied destination {denied_ip} ({DENIED_ALIAS}) must never reach the https proxy:\n{proxy_logs}"
+    );
+}
+
+#[tokio::test]
+#[serial(corporate_proxy)]
+async fn podman_corporate_proxy_trusts_ca_bundle_for_https_proxy() {
+    if std::env::var("OPENSHELL_E2E_DRIVER").as_deref() != Ok("podman") {
+        eprintln!("Skipping https corporate proxy test: e2e driver is not podman");
+        return;
+    }
+    if ManagedGateway::from_env()
+        .expect("load managed e2e gateway metadata")
+        .is_none()
+    {
+        eprintln!(
+            "Skipping https corporate proxy test: e2e gateway is not managed by this test run"
+        );
+        return;
+    }
+
+    // ── Fixtures on the shared e2e network ────────────────────────────
+    let proxy = SupportContainer::start_python(PROXY_ALIAS, &tls_proxy_script(), PROXY_PORT)
+        .await
+        .expect("start fake https corporate proxy");
+    let allowed = SupportContainer::start_python(
+        ALLOWED_ALIAS,
+        &tls_upstream_script(ALLOWED_ALIAS, ALLOWED_MARKER),
+        UPSTREAM_PORT,
+    )
+    .await
+    .expect("start approved TLS upstream");
+    let denied = SupportContainer::start_python(
+        DENIED_ALIAS,
+        &tls_upstream_script(DENIED_ALIAS, DENIED_MARKER),
+        UPSTREAM_PORT,
+    )
+    .await
+    .expect("start denied TLS upstream");
+
+    let allowed_ip = allowed.ip().expect("resolve approved upstream IP");
+    let denied_ip = denied.ip().expect("resolve denied upstream IP");
+    assert_ne!(
+        allowed_ip, denied_ip,
+        "approved and denied upstreams must have distinct IPs"
+    );
+
+    // Recover the proxy's self-signed CA from its logs and hand it back as the
+    // corporate CA bundle the supervisor must trust for the proxy handshake.
+    let ca_pem = ca_cert_from_logs(&proxy.logs().expect("read proxy logs for CA"))
+        .expect("extract proxy CA certificate");
+    let mut ca_file = NamedTempFile::new().expect("create proxy CA bundle file");
+    ca_file
+        .write_all(ca_pem.as_bytes())
+        .expect("write proxy CA bundle");
+    ca_file.flush().expect("flush proxy CA bundle");
+    let ca_path = ca_file
+        .path()
+        .to_str()
+        .expect("CA bundle path should be utf-8")
+        .to_string();
+
+    // ── Point the gateway at the https:// proxy with the CA bundle ─────
+    let mut gateway_config = GatewayProxyConfig::apply_with(
+        &format!("https://{PROXY_ALIAS}:{PROXY_PORT}"),
+        None,
+        Some(&ca_path),
+    )
+    .await
+    .expect("apply https corporate proxy gateway config");
+
+    // ── Run the workload ──────────────────────────────────────────────
+    let mut policy = NamedTempFile::new().expect("create policy file");
+    policy
+        .write_all(policy_yaml().as_bytes())
+        .expect("write policy file");
+    policy.flush().expect("flush policy file");
+    let policy_path = policy
+        .path()
+        .to_str()
+        .expect("policy path should be utf-8")
+        .to_string();
+
+    let script = workload_script();
+    let mut sandbox = SandboxGuard::create_keep_with_args(
+        &["--policy", &policy_path],
+        &["python3", "-c", &script],
+        READY_MARKER,
+    )
+    .await
+    .expect("create sandbox behind the https corporate proxy");
+
+    assert_https_proxied_egress(
+        &sandbox.create_output,
+        &proxy.logs().expect("read fake proxy logs"),
+        &allowed_ip,
+        &denied_ip,
+    );
+
+    sandbox.cleanup().await;
 
     gateway_config
         .restore()

@@ -1,4 +1,0 @@
-exports_files([
-    "cargo_version.bzl",
-    "vm_runtime.bzl",
-])

@@ -216,8 +216,8 @@ topology = "sidecar"
 proxy_uid = 1337
 ```
 
-`proxy_uid` configures only the relaxed endpoint/L7-only sidecar. It must be a
-non-root UID and must not match the sandbox UID. The default binary-aware mode
+`proxy_uid` configures only the relaxed endpoint/L7-only sidecar. It must be at
+least `1000` and must not match the sandbox UID. The default binary-aware mode
 runs the sidecar as UID 0 instead. The network init container exempts the
 effective sidecar UID from proxy redirection so the sidecar can reach the
 gateway.

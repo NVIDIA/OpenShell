@@ -39,6 +39,9 @@ func NewConnection(address string, tlsCfg *TLSParams, auth credentials.PerRPCCre
 	opts := []grpc.DialOption{}
 
 	if usePlaintext {
+		if tlsCfg != nil && (tlsCfg.CAFile != "" || tlsCfg.CertFile != "" || tlsCfg.KeyFile != "") {
+			return nil, fmt.Errorf("grpc connect: TLS parameters (CAFile/CertFile/KeyFile) are ignored with plaintext (http://) address")
+		}
 		opts = append(opts, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	} else if tlsCfg != nil {
 		creds, err := buildTLSCredentials(tlsCfg)

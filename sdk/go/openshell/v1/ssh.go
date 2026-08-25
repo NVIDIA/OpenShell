@@ -31,28 +31,7 @@ func WithTunnelServiceID(id string) TunnelOption {
 
 // SSHInterface defines operations for managing SSH sessions.
 type SSHInterface interface {
-	// CreateSession creates a new SSH session for the given sandbox.
-	// The returned SSHSession contains connection details including the
-	// sensitive Token field that must not be logged.
-	//
-	// Note: CreateSession accepts a raw sandbox ID, not a name.
-	// For name-based access with automatic session lifecycle management,
-	// prefer [SSHInterface.Tunnel] which resolves sandbox names internally
-	// and revokes the session on Close.
 	CreateSession(ctx context.Context, workspace, sandboxID string) (*SSHSession, error)
-	// RevokeSession revokes an existing SSH session by its token.
-	// Returns true if the session was actively revoked, false if it was
-	// already expired or not found.
 	RevokeSession(ctx context.Context, workspace, token string) (bool, error)
-	// Tunnel opens a bidirectional SSH tunnel to the given port inside a
-	// sandbox. It combines CreateSession and ForwardTcp(SshRelayTarget)
-	// into a single call with automatic session cleanup on Close.
-	//
-	// The sandboxName is resolved to a sandbox ID internally. Port must
-	// be in the range 1-65535.
-	//
-	// Errors: InvalidArgument if port is out of range or sandboxName is
-	// empty; NotFound if the sandbox does not exist; Unimplemented by
-	// the fake client; Unavailable if the client is closed.
 	Tunnel(ctx context.Context, workspace, sandboxName string, port uint32, opts ...TunnelOption) (io.ReadWriteCloser, error)
 }

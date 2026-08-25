@@ -13,6 +13,8 @@
 //! `ct state` without `nf_conntrack`, `log` without `nf_log`) rolls back the
 //! entire transaction including table/chain creation.
 
+const DNS_DESTINATION_PORT: &str = "53";
+
 /// A single nft command with metadata about whether it is required.
 pub struct NftCommand {
     /// The nft command arguments (e.g. `["add", "table", "inet", "openshell_bypass"]`).
@@ -200,6 +202,190 @@ pub fn generate_bypass_commands(
         ],
     ));
 
+    cmds
+}
+
+/// Generate the combined policy-DNS, transparent-TCP, and bypass fence.
+///
+/// DNS may reach only the supervisor's trusted listener. TCP addressed to the
+/// reserved synthetic pools is redirected before the terminal bypass reject;
+/// all other direct TCP/UDP retains the existing fast-fail behavior.
+pub fn generate_transparent_tcp_commands(
+    host_ip: &str,
+    proxy_port: u16,
+    dns_port: u16,
+    transparent_port: u16,
+    synthetic_ipv4_cidr: &str,
+    synthetic_ipv6_cidr: &str,
+    log_prefix: Option<&str>,
+) -> Vec<NftCommand> {
+    let mut cmds = vec![
+        nft_cmd(true, &["add", "table", "inet", "openshell_transparent"]),
+        nft_cmd(true, &["flush", "table", "inet", "openshell_transparent"]),
+        nft_cmd(
+            true,
+            &[
+                "add",
+                "chain",
+                "inet",
+                "openshell_transparent",
+                "output",
+                "{ type nat hook output priority dstnat; policy accept; }",
+            ],
+        ),
+        nft_cmd(
+            true,
+            &[
+                "add",
+                "rule",
+                "inet",
+                "openshell_transparent",
+                "output",
+                "meta",
+                "nfproto",
+                "ipv4",
+                "udp",
+                "dport",
+                DNS_DESTINATION_PORT,
+                "redirect",
+                "to",
+                &format!(":{dns_port}"),
+            ],
+        ),
+        nft_cmd(
+            true,
+            &[
+                "add",
+                "rule",
+                "inet",
+                "openshell_transparent",
+                "output",
+                "ip",
+                "daddr",
+                synthetic_ipv4_cidr,
+                "tcp",
+                "dport",
+                "1-65535",
+                "redirect",
+                "to",
+                &format!(":{transparent_port}"),
+            ],
+        ),
+        // Synthetic destinations must take precedence over the generic TCP
+        // DNS capture. A policy endpoint may legitimately use TCP port 53;
+        // that connection belongs to transparent TCP, not the DNS listener.
+        nft_cmd(
+            true,
+            &[
+                "add",
+                "rule",
+                "inet",
+                "openshell_transparent",
+                "output",
+                "meta",
+                "nfproto",
+                "ipv4",
+                "tcp",
+                "dport",
+                DNS_DESTINATION_PORT,
+                "redirect",
+                "to",
+                &format!(":{dns_port}"),
+            ],
+        ),
+        nft_cmd(
+            true,
+            &[
+                "add",
+                "rule",
+                "inet",
+                "openshell_transparent",
+                "output",
+                "ip6",
+                "daddr",
+                synthetic_ipv6_cidr,
+                "tcp",
+                "dport",
+                "1-65535",
+                "redirect",
+                "to",
+                &format!(":{transparent_port}"),
+            ],
+        ),
+    ];
+    let mut bypass = generate_bypass_commands(host_ip, proxy_port, log_prefix);
+    // NAT REDIRECT rewrites both DNS and synthetic TCP to loopback before the
+    // filter hook. Some kernels retain the packet's pre-REDIRECT output
+    // interface for filter matching, so `oifname lo accept` alone is not
+    // portable. Admit only packets that the kernel records as DNATed to the
+    // supervisor listeners. A direct dial to either port has no DNAT status
+    // and still reaches the terminal bypass reject. Transparent TCP
+    // authorization after accept remains bound by SO_ORIGINAL_DST plus the
+    // synthetic-address mapping.
+    let insertion = bypass
+        .iter()
+        .position(|command| {
+            command.args.iter().any(|arg| arg == "log")
+                || command.args.iter().any(|arg| arg == "reject")
+        })
+        .unwrap_or(bypass.len());
+    bypass.splice(
+        insertion..insertion,
+        [
+            nft_cmd(
+                true,
+                &[
+                    "add",
+                    "rule",
+                    "inet",
+                    "openshell_bypass",
+                    "output",
+                    "ct",
+                    "status",
+                    "dnat",
+                    "udp",
+                    "dport",
+                    &dns_port.to_string(),
+                    "accept",
+                ],
+            ),
+            nft_cmd(
+                true,
+                &[
+                    "add",
+                    "rule",
+                    "inet",
+                    "openshell_bypass",
+                    "output",
+                    "ct",
+                    "status",
+                    "dnat",
+                    "tcp",
+                    "dport",
+                    &dns_port.to_string(),
+                    "accept",
+                ],
+            ),
+            nft_cmd(
+                true,
+                &[
+                    "add",
+                    "rule",
+                    "inet",
+                    "openshell_bypass",
+                    "output",
+                    "ct",
+                    "status",
+                    "dnat",
+                    "tcp",
+                    "dport",
+                    &transparent_port.to_string(),
+                    "accept",
+                ],
+            ),
+        ],
+    );
+    cmds.extend(bypass);
     cmds
 }
 
@@ -431,6 +617,78 @@ mod tests {
         assert!(proxy_pos < lo_pos);
         assert!(lo_pos < ct_pos);
         assert!(ct_pos < reject_pos);
+    }
+
+    #[test]
+    fn transparent_rules_precede_bypass_rejects_and_scope_dns() {
+        let commands = generate_transparent_tcp_commands(
+            "10.200.0.1",
+            3128,
+            15053,
+            15001,
+            "198.18.0.0/24",
+            "fd23:6f70:656e::/48",
+            None,
+        );
+        let text = all_strs(&commands);
+        assert!(text.contains("meta nfproto ipv4 udp dport 53 redirect to :15053"));
+        assert!(text.contains("meta nfproto ipv4 tcp dport 53 redirect to :15053"));
+        assert!(!text.contains("udp dport 53 accept"));
+        assert!(text.contains("ip daddr 198.18.0.0/24 tcp dport 1-65535 redirect to :15001"));
+        assert!(
+            text.contains("ip6 daddr fd23:6f70:656e::/48 tcp dport 1-65535 redirect to :15001")
+        );
+        assert!(!text.contains("meta mark"));
+        assert!(text.contains("ct status dnat udp dport 15053 accept"));
+        assert!(text.contains("ct status dnat tcp dport 15053 accept"));
+        assert!(text.contains("ct status dnat tcp dport 15001 accept"));
+        for (protocol, port) in [("udp", "15053"), ("tcp", "15053"), ("tcp", "15001")] {
+            assert!(!commands.iter().any(|command| {
+                command.args.ends_with(&[
+                    protocol.to_string(),
+                    "dport".to_string(),
+                    port.to_string(),
+                    "accept".to_string(),
+                ]) && !command.args.windows(3).any(|window| {
+                    window == ["ct".to_string(), "status".to_string(), "dnat".to_string()]
+                })
+            }));
+        }
+        assert!(text.contains("oifname lo accept"));
+        assert!(
+            text.find("ct status dnat tcp dport 15053 accept").unwrap()
+                < text
+                    .find("meta nfproto ipv4 meta l4proto tcp reject")
+                    .unwrap()
+        );
+        assert!(
+            text.find("ct status dnat udp dport 15053 accept").unwrap()
+                < text
+                    .find("meta nfproto ipv4 meta l4proto udp reject")
+                    .unwrap()
+        );
+        assert!(
+            text.find("ct status dnat tcp dport 15001 accept").unwrap()
+                < text
+                    .find("meta nfproto ipv4 meta l4proto tcp reject")
+                    .unwrap()
+        );
+        assert!(
+            text.find("ip daddr 198.18.0.0/24 tcp dport 1-65535 redirect to :15001")
+                .unwrap()
+                < text
+                    .find("meta nfproto ipv4 meta l4proto tcp reject")
+                    .unwrap()
+        );
+        assert!(!text.contains("meta nfproto ipv6 udp dport 53 redirect"));
+        assert!(
+            text.find("ip daddr 198.18.0.0/24 tcp dport 1-65535 redirect to :15001")
+                .unwrap()
+                < text
+                    .find("meta nfproto ipv4 tcp dport 53 redirect to :15053")
+                    .unwrap(),
+            "synthetic TCP:53 must reach transparent TCP before generic DNS capture"
+        );
     }
 
     #[test]

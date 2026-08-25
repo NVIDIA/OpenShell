@@ -5,13 +5,15 @@
 
 #![allow(clippy::result_large_err)]
 
+pub mod otel_tracing;
+
 use bollard::Docker;
 use bollard::errors::Error as BollardError;
 use bollard::models::{
-    ContainerCreateBody, ContainerSummary, ContainerSummaryStateEnum, CreateImageInfo,
-    DeviceRequest, EndpointSettings, HostConfig, Mount, MountTmpfsOptions, MountTypeEnum,
-    MountVolumeOptions, NetworkCreateRequest, NetworkingConfig, ProgressDetail, RestartPolicy,
-    RestartPolicyNameEnum, SystemInfo,
+    ContainerCreateBody, ContainerState, ContainerStateStatusEnum, ContainerSummary,
+    ContainerSummaryStateEnum, CreateImageInfo, DeviceRequest, EndpointSettings, HostConfig, Mount,
+    MountTmpfsOptions, MountTypeEnum, MountVolumeOptions, NetworkCreateRequest, NetworkingConfig,
+    ProgressDetail, SystemInfo,
 };
 use bollard::query_parameters::{
     CreateContainerOptionsBuilder, CreateImageOptions, DownloadFromContainerOptionsBuilder,
@@ -26,7 +28,8 @@ use openshell_core::driver_mounts;
 use openshell_core::driver_utils::{
     LABEL_MANAGED_BY, LABEL_MANAGED_BY_VALUE, LABEL_SANDBOX_ID, LABEL_SANDBOX_NAME,
     LABEL_SANDBOX_NAMESPACE, LABEL_SANDBOX_WORKSPACE, SUPERVISOR_IMAGE_BINARY_PATH,
-    supervisor_image_should_refresh,
+    extract_first_tar_entry, supervisor_image_should_refresh, temp_extract_container_name,
+    validate_linux_elf_binary, write_cache_binary_atomic,
 };
 use openshell_core::gpu::{
     CdiGpuDefaultSelector, CdiGpuInventory, CdiGpuSelectionError, driver_gpu_requirements,
@@ -38,32 +41,37 @@ use openshell_core::progress::{
 };
 use openshell_core::proto::compute::v1::{
     CreateSandboxRequest, CreateSandboxResponse, DeleteSandboxRequest, DeleteSandboxResponse,
-    DriverCondition, DriverPlatformEvent, DriverSandbox, DriverSandboxStatus,
-    DriverSandboxTemplate, GatewayListenerRequirement, GetCapabilitiesRequest,
+    DeleteWorkspaceRequest, DeleteWorkspaceResponse, DriverCondition, DriverPlatformEvent,
+    DriverSandbox, DriverSandboxStatus, DriverSandboxTemplate, EnsureWorkspaceRequest,
+    EnsureWorkspaceResponse, GatewayListenerRequirement, GetCapabilitiesRequest,
     GetCapabilitiesResponse, GetGatewayListenerRequirementsRequest,
     GetGatewayListenerRequirementsResponse, GetSandboxRequest, GetSandboxResponse,
-    GpuResourceRequirements, ListSandboxesRequest, ListSandboxesResponse, StopSandboxRequest,
-    StopSandboxResponse, ValidateSandboxCreateRequest, ValidateSandboxCreateResponse,
-    WatchSandboxesDeletedEvent, WatchSandboxesEvent, WatchSandboxesPlatformEvent,
-    WatchSandboxesRequest, WatchSandboxesSandboxEvent, compute_driver_server::ComputeDriver,
-    gateway_listener_requirement::Selector, watch_sandboxes_event,
+    GpuResourceRequirements, ListSandboxesRequest, ListSandboxesResponse, StartSandboxRequest,
+    StartSandboxResponse, StopSandboxRequest, StopSandboxResponse, ValidateSandboxCreateRequest,
+    ValidateSandboxCreateResponse, WatchSandboxesDeletedEvent, WatchSandboxesEvent,
+    WatchSandboxesPlatformEvent, WatchSandboxesRequest, WatchSandboxesSandboxEvent,
+    compute_driver_server::ComputeDriver, gateway_listener_requirement::Selector,
+    watch_sandboxes_event,
 };
 use openshell_core::proto_struct::{
     deserialize_optional_non_empty_string_list, struct_to_json_value,
 };
 use openshell_core::{Config, Error, Result as CoreResult};
+use opentelemetry::trace::TraceContextExt as _;
 use std::collections::{HashMap, HashSet};
-use std::io::Read;
-use std::net::{IpAddr, SocketAddr};
+use std::future::Future;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::sync::{Mutex, broadcast, mpsc};
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
-use tracing::{info, warn};
+use tracing::{Instrument as _, debug, info, warn};
+use tracing_opentelemetry::OpenTelemetrySpanExt as _;
 use url::Url;
 
 const WATCH_BUFFER: usize = 128;
@@ -75,11 +83,32 @@ const TLS_CA_MOUNT_PATH: &str = openshell_core::driver_utils::TLS_CA_MOUNT_PATH;
 const TLS_CERT_MOUNT_PATH: &str = openshell_core::driver_utils::TLS_CERT_MOUNT_PATH;
 const TLS_KEY_MOUNT_PATH: &str = openshell_core::driver_utils::TLS_KEY_MOUNT_PATH;
 const SANDBOX_TOKEN_MOUNT_PATH: &str = openshell_core::driver_utils::SANDBOX_TOKEN_MOUNT_PATH;
-const SANDBOX_COMMAND: &str = "sleep infinity";
 const SUPERVISOR_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 const HOST_OPENSHELL_INTERNAL: &str = "host.openshell.internal";
 const HOST_DOCKER_INTERNAL: &str = "host.docker.internal";
 const DOCKER_NETWORK_DRIVER: &str = "bridge";
+
+fn provisioning_span(
+    parent: &opentelemetry::Context,
+    sandbox: &DriverSandbox,
+    image_ref: &str,
+) -> tracing::Span {
+    let span = tracing::info_span!(
+        parent: None,
+        "docker.provision",
+        otel.name = "docker.provision",
+        otel.status_code = tracing::field::Empty,
+        sandbox.id = %sandbox.id,
+        sandbox.name = %sandbox.name,
+        image.ref = %image_ref,
+    );
+    let parent_span_context = parent.span().span_context().clone();
+    if parent_span_context.is_valid() {
+        let parent = opentelemetry::Context::new().with_remote_span_context(parent_span_context);
+        let _ = span.set_parent(parent);
+    }
+    span
+}
 
 /// Gateway-local configuration for the Docker compute driver.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -176,6 +205,7 @@ struct DockerDriverRuntimeConfig {
     grpc_endpoint: String,
     network_name: String,
     gateway_route: DockerGatewayRoute,
+    gateway_callback_bind_address: Option<SocketAddr>,
     ssh_socket_path: String,
     stop_timeout_secs: u32,
     log_level: String,
@@ -204,6 +234,85 @@ pub struct DockerComputeDriver {
     events: broadcast::Sender<WatchSandboxesEvent>,
     pending: Arc<Mutex<HashMap<String, PendingSandboxRecord>>>,
     gpu_selector: Arc<CdiGpuDefaultSelector>,
+    lifecycle_event_fences: DockerLifecycleEventFences,
+}
+
+/// Per-sandbox container exit timestamps that fence snapshots from an earlier run.
+///
+/// Docker's polling loop can observe the stopped container before a restart and
+/// publish that snapshot after the gateway has moved the sandbox to `Starting`.
+/// Comparing the container's transition timestamp prevents that old observation
+/// from regressing the new lifecycle operation to `Error`.
+#[derive(Clone, Debug, Default)]
+struct DockerLifecycleEventFences {
+    state: Arc<std::sync::Mutex<DockerLifecycleFenceState>>,
+}
+
+#[derive(Debug, Default)]
+struct DockerLifecycleFenceState {
+    previous_finished_at: HashMap<String, String>,
+    starts_in_progress: HashSet<String>,
+}
+
+impl DockerLifecycleEventFences {
+    fn begin_start(&self, sandbox_id: &str) {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .starts_in_progress
+            .insert(sandbox_id.to_string());
+    }
+
+    fn finish_start(&self, sandbox_id: &str) {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .starts_in_progress
+            .remove(sandbox_id);
+    }
+
+    fn start_in_progress(&self, sandbox_id: &str) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .starts_in_progress
+            .contains(sandbox_id)
+    }
+
+    fn record_previous_exit(&self, sandbox_id: &str, finished_at: Option<&str>) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match finished_at.filter(|finished_at| !finished_at.is_empty()) {
+            Some(finished_at) => {
+                state
+                    .previous_finished_at
+                    .insert(sandbox_id.to_string(), finished_at.to_string());
+            }
+            None => {
+                state.previous_finished_at.remove(sandbox_id);
+            }
+        }
+    }
+
+    fn previous_exit(&self, sandbox_id: &str) -> Option<String> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .previous_finished_at
+            .get(sandbox_id)
+            .cloned()
+    }
+
+    fn remove(&self, sandbox_id: &str) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.previous_finished_at.remove(sandbox_id);
+        state.starts_in_progress.remove(sandbox_id);
+    }
 }
 
 struct PendingSandboxRecord {
@@ -306,6 +415,119 @@ fn default_true() -> bool {
 type WatchStream =
     Pin<Box<dyn Stream<Item = Result<WatchSandboxesEvent, Status>> + Send + 'static>>;
 
+struct TracedWatchStream {
+    inner: WatchStream,
+    span: tracing::Span,
+    finished: bool,
+}
+
+impl Stream for TracedWatchStream {
+    type Item = Result<WatchSandboxesEvent, Status>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let span = self.span.clone();
+        let _entered = span.enter();
+        let result = self.inner.as_mut().poll_next(cx);
+        if !self.finished {
+            match &result {
+                Poll::Ready(Some(Err(status))) => {
+                    openshell_otel::mark_error(&self.span);
+                    self.span
+                        .record("rpc.grpc.status_code", status.code() as i32);
+                    self.finished = true;
+                }
+                Poll::Ready(None) => {
+                    self.span
+                        .record("rpc.grpc.status_code", tonic::Code::Ok as i32);
+                    self.finished = true;
+                }
+                Poll::Pending | Poll::Ready(Some(Ok(_))) => {}
+            }
+        }
+        result
+    }
+}
+
+impl Drop for TracedWatchStream {
+    fn drop(&mut self) {
+        if !self.finished {
+            openshell_otel::mark_error(&self.span);
+            self.span
+                .record("rpc.grpc.status_code", tonic::Code::Cancelled as i32);
+        }
+    }
+}
+
+/// Compute-driver service wrapper that preserves the standalone RPC trace
+/// boundary while Docker runs in the gateway process.
+#[derive(Clone)]
+pub struct ComputeDriverService {
+    driver: DockerComputeDriver,
+    trace_in_process_rpc: bool,
+}
+
+impl ComputeDriverService {
+    #[must_use]
+    pub fn new(driver: DockerComputeDriver) -> Self {
+        Self {
+            driver,
+            trace_in_process_rpc: false,
+        }
+    }
+
+    #[must_use]
+    pub fn new_in_process(driver: DockerComputeDriver) -> Self {
+        Self {
+            driver,
+            trace_in_process_rpc: true,
+        }
+    }
+
+    fn in_process_rpc_span(
+        &self,
+        operation: &'static str,
+        method: &'static str,
+    ) -> Option<tracing::Span> {
+        self.trace_in_process_rpc.then(|| {
+            tracing::info_span!(
+                target: "openshell_driver_docker::otel_tracing",
+                "driver_rpc",
+                otel.name = operation,
+                otel.kind = "server",
+                otel.status_code = tracing::field::Empty,
+                rpc.system = "grpc",
+                rpc.service = "openshell.compute.v1.ComputeDriver",
+                rpc.method = method,
+                rpc.grpc.status_code = tracing::field::Empty,
+            )
+        })
+    }
+
+    async fn trace_rpc<T>(
+        &self,
+        operation: &'static str,
+        method: &'static str,
+        future: impl Future<Output = Result<T, Status>>,
+    ) -> Result<T, Status> {
+        use tracing::Instrument as _;
+
+        let Some(span) = self.in_process_rpc_span(operation, method) else {
+            return future.await;
+        };
+        let result = future.instrument(span.clone()).await;
+        match &result {
+            Ok(_) => {
+                span.record("rpc.grpc.status_code", tonic::Code::Ok as i32);
+            }
+            Err(status) => {
+                openshell_otel::mark_error(&span);
+                span.record("rpc.grpc.status_code", status.code() as i32);
+            }
+        }
+        result
+    }
+}
+
 impl DockerComputeDriver {
     pub async fn new(config: &Config, docker_config: &DockerComputeConfig) -> CoreResult<Self> {
         let socket_path = docker_config
@@ -348,6 +570,8 @@ impl DockerComputeDriver {
         let host_gateway_ip = parse_optional_host_gateway_ip(&docker_config.host_gateway_ip)?;
         let gateway_route =
             docker_gateway_route(&info, bridge_gateway_ip, gateway_port, host_gateway_ip);
+        let gateway_callback_bind_address =
+            docker_gateway_callback_bind_address(&gateway_route, config.bind_address);
         let mut docker_config = docker_config.clone();
         if docker_config.grpc_endpoint.trim().is_empty() {
             let scheme = if docker_guest_tls_configured(&docker_config) {
@@ -376,6 +600,7 @@ impl DockerComputeDriver {
                 grpc_endpoint,
                 network_name,
                 gateway_route,
+                gateway_callback_bind_address,
                 ssh_socket_path: docker_config.ssh_socket_path.clone(),
                 stop_timeout_secs: DEFAULT_STOP_TIMEOUT_SECS,
                 log_level: config.log_level.clone(),
@@ -393,6 +618,7 @@ impl DockerComputeDriver {
                 cdi_gpu_inventory,
                 allow_all_default_gpu,
             )),
+            lifecycle_event_fences: DockerLifecycleEventFences::default(),
         };
 
         let poll_driver = driver.clone();
@@ -404,11 +630,12 @@ impl DockerComputeDriver {
     }
 
     fn capabilities(&self) -> GetCapabilitiesResponse {
-        openshell_core::driver_utils::build_capabilities_response(
-            "docker",
-            &self.config.daemon_version,
-            &self.config.default_image,
-        )
+        GetCapabilitiesResponse {
+            driver_name: "docker".to_string(),
+            driver_version: self.config.daemon_version.clone(),
+            default_image: self.config.default_image.clone(),
+            gateway_manages_lifecycle: true,
+        }
     }
 
     #[cfg(test)]
@@ -642,7 +869,7 @@ impl DockerComputeDriver {
             &sandbox.id,
             "Scheduled",
             format!("Docker sandbox accepted for image \"{image}\""),
-            HashMap::from([("image_ref".to_string(), image)]),
+            HashMap::from([("image_ref".to_string(), image.clone())]),
         );
         self.publish_sandbox_snapshot(pending_sandbox_snapshot(
             sandbox,
@@ -654,9 +881,14 @@ impl DockerComputeDriver {
         let driver = self.clone();
         let sandbox_for_task = sandbox.clone();
         let sandbox_id = sandbox.id.clone();
-        let task = tokio::spawn(async move {
-            driver.provision_sandbox(sandbox_for_task).await;
-        });
+        let parent = tracing::Span::current().context();
+        let provisioning_span = provisioning_span(&parent, sandbox, &image);
+        let task = tokio::spawn(
+            async move {
+                driver.provision_sandbox(sandbox_for_task).await;
+            }
+            .instrument(provisioning_span),
+        );
 
         let mut pending = self.pending.lock().await;
         if let Some(record) = pending.get_mut(&sandbox_id) {
@@ -679,20 +911,42 @@ impl DockerComputeDriver {
         }
     }
 
+    #[tracing::instrument(
+        name = "docker.provision_sandbox",
+        skip(self, sandbox),
+        fields(
+            otel.name = "docker.provision_sandbox",
+            otel.status_code = tracing::field::Empty,
+            sandbox.id = %sandbox.id,
+            sandbox.name = %sandbox.name,
+        )
+    )]
     async fn provision_sandbox_inner(
         &self,
         sandbox: &DriverSandbox,
     ) -> Result<(), DockerProvisioningFailure> {
+        let span_status = openshell_otel::ErrorStatusGuard::current();
         let validated = Self::validated_sandbox(sandbox, &self.config).map_err(|status| {
             DockerProvisioningFailure::new("ContainerCreateFailed", status.message())
         })?;
         let template = validated.template;
-        let image = self
-            .ensure_image_available(&sandbox.id, &template.image)
-            .await
-            .map_err(|status| {
-                DockerProvisioningFailure::new("ImagePullFailed", status.message())
-            })?;
+        let image = async {
+            openshell_otel::record_error_result(
+                self.ensure_image_available(&sandbox.id, &template.image)
+                    .await
+                    .map_err(|status| {
+                        DockerProvisioningFailure::new("ImagePullFailed", status.message())
+                    }),
+            )
+        }
+        .instrument(tracing::info_span!(
+            "docker.prepare_image",
+            otel.name = "docker.prepare_image",
+            otel.status_code = tracing::field::Empty,
+            sandbox.id = %sandbox.id,
+            image.ref = %template.image,
+        ))
+        .await?;
         let token_file_created = write_sandbox_token_file(sandbox, &self.config)
             .await
             .map_err(|status| {
@@ -726,25 +980,37 @@ impl DockerComputeDriver {
             }
             DockerProvisioningFailure::new("ContainerCreateFailed", status.message())
         })?;
-        self.docker
-            .create_container(
-                Some(
-                    CreateContainerOptionsBuilder::default()
-                        .name(container_name.as_str())
-                        .build(),
-                ),
-                create_body,
+        async {
+            openshell_otel::record_error_result(
+                self.docker
+                    .create_container(
+                        Some(
+                            CreateContainerOptionsBuilder::default()
+                                .name(container_name.as_str())
+                                .build(),
+                        ),
+                        create_body,
+                    )
+                    .await
+                    .map_err(|err| {
+                        if token_file_created {
+                            cleanup_sandbox_token_file(sandbox, &self.config);
+                        }
+                        DockerProvisioningFailure::from_status(
+                            "ContainerCreateFailed",
+                            create_status_from_docker_error("create docker sandbox container", err),
+                        )
+                    }),
             )
-            .await
-            .map_err(|err| {
-                if token_file_created {
-                    cleanup_sandbox_token_file(sandbox, &self.config);
-                }
-                DockerProvisioningFailure::from_status(
-                    "ContainerCreateFailed",
-                    create_status_from_docker_error("create docker sandbox container", err),
-                )
-            })?;
+        }
+        .instrument(tracing::info_span!(
+            "docker.create_container",
+            otel.name = "docker.create_container",
+            otel.status_code = tracing::field::Empty,
+            sandbox.id = %sandbox.id,
+            container.name = %container_name,
+        ))
+        .await?;
         self.publish_docker_progress(
             &sandbox.id,
             "Created",
@@ -752,7 +1018,20 @@ impl DockerComputeDriver {
             HashMap::from([("container_name".to_string(), container_name.clone())]),
         );
 
-        if let Err(err) = self.docker.start_container(&container_name, None).await {
+        let start_result = async {
+            openshell_otel::record_error_result(
+                self.docker.start_container(&container_name, None).await,
+            )
+        }
+        .instrument(tracing::info_span!(
+            "docker.start_container",
+            otel.name = "docker.start_container",
+            otel.status_code = tracing::field::Empty,
+            sandbox.id = %sandbox.id,
+            container.name = %container_name,
+        ))
+        .await;
+        if let Err(err) = start_result {
             let cleanup = self
                 .docker
                 .remove_container(
@@ -793,7 +1072,7 @@ impl DockerComputeDriver {
             );
         }
 
-        Ok(())
+        span_status.finish(Ok(()))
     }
 
     async fn delete_sandbox_inner(
@@ -900,14 +1179,39 @@ impl DockerComputeDriver {
     }
 
     /// Start a managed sandbox container that was previously stopped. Used
-    /// by the gateway to resume sandboxes after a restart so that running
+    /// by the gateway to start sandboxes after a restart so that running
     /// state in the gateway store is matched by an actually-running
     /// container.
     ///
     /// Returns `Ok(true)` when a container existed and was started (or was
     /// already running), `Ok(false)` when no managed container is found for
     /// the sandbox, and `Err(...)` for any Docker failure.
-    pub async fn resume_sandbox(
+    #[tracing::instrument(
+        name = "docker.start_sandbox",
+        skip(self),
+        fields(
+            otel.name = "docker.start_sandbox",
+            otel.status_code = tracing::field::Empty,
+            sandbox.id = %sandbox_id,
+            sandbox.name = %sandbox_name,
+        )
+    )]
+    pub async fn start_sandbox(
+        &self,
+        sandbox_id: &str,
+        sandbox_name: &str,
+    ) -> Result<bool, Status> {
+        let span_status = openshell_otel::ErrorStatusGuard::current();
+        require_sandbox_identifier(sandbox_id, sandbox_name)?;
+        self.lifecycle_event_fences.begin_start(sandbox_id);
+        let result = self
+            .start_sandbox_with_lifecycle_fence(sandbox_id, sandbox_name)
+            .await;
+        self.lifecycle_event_fences.finish_start(sandbox_id);
+        span_status.finish(result)
+    }
+
+    async fn start_sandbox_with_lifecycle_fence(
         &self,
         sandbox_id: &str,
         sandbox_name: &str,
@@ -922,81 +1226,38 @@ impl DockerComputeDriver {
             return Ok(false);
         };
         let state = container.state.unwrap_or(ContainerSummaryStateEnum::EMPTY);
-        if !container_state_needs_resume(state) {
+        if !container_state_needs_start(state) {
             return Ok(true);
         }
 
+        // Fence a poll that observed this stopped run but has not published it
+        // yet. Use Docker's transition timestamp so a later, genuine exit from
+        // the restarted container remains observable.
+        let previous_finished_at = if state == ContainerSummaryStateEnum::EXITED {
+            let inspected = self
+                .docker
+                .inspect_container(&target, None)
+                .await
+                .map_err(|err| internal_status("inspect docker sandbox before start", err))?;
+            inspected
+                .state
+                .as_ref()
+                .filter(|state| state.status == Some(ContainerStateStatusEnum::EXITED))
+                .and_then(|state| state.finished_at.clone())
+        } else {
+            None
+        };
+        self.lifecycle_event_fences
+            .record_previous_exit(sandbox_id, previous_finished_at.as_deref());
+
         match self.docker.start_container(&target, None).await {
             Ok(()) => Ok(true),
-            // Already running — race with another resume path or the
+            // Already running — race with another start path or the
             // restart policy. Treat as success.
             Err(err) if is_not_modified_error(&err) => Ok(true),
             Err(err) if is_not_found_error(&err) => Ok(false),
             Err(err) => Err(internal_status("start docker sandbox container", err)),
         }
-    }
-
-    pub async fn stop_managed_containers_on_shutdown(&self) -> Result<usize, Status> {
-        let containers = self.list_managed_container_summaries().await?;
-        let targets = containers
-            .into_iter()
-            .filter_map(|container| {
-                let state = container.state.unwrap_or(ContainerSummaryStateEnum::EMPTY);
-                if container_state_needs_shutdown_stop(state) {
-                    summary_container_target(&container)
-                } else {
-                    None
-                }
-            })
-            .collect::<Vec<_>>();
-        let target_count = targets.len();
-        let mut stopped = 0usize;
-        let mut failures = Vec::new();
-        let stop_timeout_secs = self.config.stop_timeout_secs;
-
-        let mut stop_results = futures::stream::iter(targets.into_iter().map(|target| {
-            let docker = self.docker.clone();
-            async move {
-                let result = docker
-                    .stop_container(
-                        &target,
-                        Some(
-                            StopContainerOptionsBuilder::default()
-                                .t(docker_stop_timeout_secs(stop_timeout_secs))
-                                .build(),
-                        ),
-                    )
-                    .await;
-                (target, result)
-            }
-        }))
-        .buffer_unordered(16);
-
-        while let Some((target, result)) = stop_results.next().await {
-            match result {
-                Ok(()) => {
-                    stopped += 1;
-                }
-                Err(err) if is_not_found_error(&err) || is_not_modified_error(&err) => {}
-                Err(err) => {
-                    warn!(
-                        container = %target,
-                        error = %err,
-                        "Failed to stop Docker sandbox container during shutdown"
-                    );
-                    failures.push(target);
-                }
-            }
-        }
-
-        if !failures.is_empty() {
-            return Err(Status::internal(format!(
-                "failed to stop {} of {target_count} Docker sandbox containers during shutdown",
-                failures.len()
-            )));
-        }
-
-        Ok(stopped)
     }
 
     async fn reserve_pending_sandbox(&self, sandbox: &DriverSandbox) -> Result<(), Status> {
@@ -1176,7 +1437,7 @@ impl DockerComputeDriver {
             tokio::time::sleep(backoff).await;
             match self.current_snapshot_map().await {
                 Ok(current) => {
-                    emit_snapshot_diff(&self.events, &previous, &current);
+                    self.publish_snapshot_diff(&previous, &current).await;
                     previous = current;
                     backoff = WATCH_POLL_INTERVAL;
                 }
@@ -1199,6 +1460,78 @@ impl DockerComputeDriver {
                 .map(|sandbox| (sandbox.id.clone(), sandbox))
                 .collect()
         })
+    }
+
+    async fn publish_snapshot_diff(
+        &self,
+        previous: &HashMap<String, DriverSandbox>,
+        current: &HashMap<String, DriverSandbox>,
+    ) {
+        for (sandbox_id, sandbox) in current {
+            if previous.get(sandbox_id) == Some(sandbox) {
+                continue;
+            }
+            if self.stale_polled_exit(sandbox).await {
+                continue;
+            }
+            self.publish_sandbox_snapshot(sandbox.clone());
+        }
+
+        for sandbox_id in previous.keys() {
+            if current.contains_key(sandbox_id) {
+                continue;
+            }
+            self.publish_deleted(sandbox_id.clone());
+        }
+    }
+
+    async fn stale_polled_exit(&self, sandbox: &DriverSandbox) -> bool {
+        if !driver_sandbox_reports_container_exit(sandbox) {
+            return false;
+        }
+        if self.lifecycle_event_fences.start_in_progress(&sandbox.id) {
+            debug!(
+                sandbox_id = %sandbox.id,
+                "Ignoring Docker container exit snapshot while sandbox start is in progress"
+            );
+            return true;
+        }
+        let Some(previous_finished_at) = self.lifecycle_event_fences.previous_exit(&sandbox.id)
+        else {
+            return false;
+        };
+        let Some(container_id) = sandbox
+            .status
+            .as_ref()
+            .map(|status| status.instance_id.as_str())
+            .filter(|container_id| !container_id.is_empty())
+        else {
+            return false;
+        };
+
+        let inspected = match self.docker.inspect_container(container_id, None).await {
+            Ok(inspected) => inspected,
+            Err(err) => {
+                debug!(
+                    sandbox_id = %sandbox.id,
+                    container_id,
+                    error = %err,
+                    "Could not verify whether polled Docker exit predates sandbox start"
+                );
+                return false;
+            }
+        };
+        if !docker_polled_exit_is_stale(&previous_finished_at, inspected.state.as_ref()) {
+            return false;
+        }
+
+        debug!(
+            sandbox_id = %sandbox.id,
+            container_id,
+            previous_finished_at,
+            "Ignoring Docker container exit snapshot from before the latest sandbox start"
+        );
+        true
     }
 
     async fn list_managed_container_summaries(&self) -> Result<Vec<ContainerSummary>, Status> {
@@ -1377,6 +1710,168 @@ impl DockerComputeDriver {
 }
 
 #[tonic::async_trait]
+impl ComputeDriver for ComputeDriverService {
+    type WatchSandboxesStream = WatchStream;
+
+    async fn get_capabilities(
+        &self,
+        request: Request<GetCapabilitiesRequest>,
+    ) -> Result<Response<GetCapabilitiesResponse>, Status> {
+        self.trace_rpc(
+            "driver.get_capabilities",
+            "get_capabilities",
+            ComputeDriver::get_capabilities(&self.driver, request),
+        )
+        .await
+    }
+
+    async fn get_gateway_listener_requirements(
+        &self,
+        request: Request<GetGatewayListenerRequirementsRequest>,
+    ) -> Result<Response<GetGatewayListenerRequirementsResponse>, Status> {
+        self.trace_rpc(
+            "driver.get_gateway_listener_requirements",
+            "get_gateway_listener_requirements",
+            ComputeDriver::get_gateway_listener_requirements(&self.driver, request),
+        )
+        .await
+    }
+
+    async fn validate_sandbox_create(
+        &self,
+        request: Request<ValidateSandboxCreateRequest>,
+    ) -> Result<Response<ValidateSandboxCreateResponse>, Status> {
+        self.trace_rpc(
+            "driver.validate_sandbox_create",
+            "validate_sandbox_create",
+            ComputeDriver::validate_sandbox_create(&self.driver, request),
+        )
+        .await
+    }
+
+    async fn get_sandbox(
+        &self,
+        request: Request<GetSandboxRequest>,
+    ) -> Result<Response<GetSandboxResponse>, Status> {
+        self.trace_rpc(
+            "driver.get_sandbox",
+            "get_sandbox",
+            ComputeDriver::get_sandbox(&self.driver, request),
+        )
+        .await
+    }
+
+    async fn list_sandboxes(
+        &self,
+        request: Request<ListSandboxesRequest>,
+    ) -> Result<Response<ListSandboxesResponse>, Status> {
+        self.trace_rpc(
+            "driver.list_sandboxes",
+            "list_sandboxes",
+            ComputeDriver::list_sandboxes(&self.driver, request),
+        )
+        .await
+    }
+
+    async fn create_sandbox(
+        &self,
+        request: Request<CreateSandboxRequest>,
+    ) -> Result<Response<CreateSandboxResponse>, Status> {
+        self.trace_rpc(
+            "driver.create_sandbox",
+            "create_sandbox",
+            ComputeDriver::create_sandbox(&self.driver, request),
+        )
+        .await
+    }
+
+    async fn stop_sandbox(
+        &self,
+        request: Request<StopSandboxRequest>,
+    ) -> Result<Response<StopSandboxResponse>, Status> {
+        self.trace_rpc(
+            "driver.stop_sandbox",
+            "stop_sandbox",
+            ComputeDriver::stop_sandbox(&self.driver, request),
+        )
+        .await
+    }
+
+    async fn start_sandbox(
+        &self,
+        request: Request<StartSandboxRequest>,
+    ) -> Result<Response<StartSandboxResponse>, Status> {
+        self.trace_rpc(
+            "driver.start_sandbox",
+            "start_sandbox",
+            ComputeDriver::start_sandbox(&self.driver, request),
+        )
+        .await
+    }
+
+    async fn delete_sandbox(
+        &self,
+        request: Request<DeleteSandboxRequest>,
+    ) -> Result<Response<DeleteSandboxResponse>, Status> {
+        self.trace_rpc(
+            "driver.delete_sandbox",
+            "delete_sandbox",
+            ComputeDriver::delete_sandbox(&self.driver, request),
+        )
+        .await
+    }
+
+    async fn watch_sandboxes(
+        &self,
+        request: Request<WatchSandboxesRequest>,
+    ) -> Result<Response<Self::WatchSandboxesStream>, Status> {
+        use tracing::Instrument as _;
+
+        let create_stream = ComputeDriver::watch_sandboxes(&self.driver, request);
+        let Some(span) = self.in_process_rpc_span("driver.watch_sandboxes", "watch_sandboxes")
+        else {
+            return create_stream.await;
+        };
+        match create_stream.instrument(span.clone()).await {
+            Ok(response) => Ok(Response::new(Box::pin(TracedWatchStream {
+                inner: response.into_inner(),
+                span,
+                finished: false,
+            }))),
+            Err(status) => {
+                openshell_otel::mark_error(&span);
+                span.record("rpc.grpc.status_code", status.code() as i32);
+                Err(status)
+            }
+        }
+    }
+
+    async fn ensure_workspace(
+        &self,
+        request: Request<EnsureWorkspaceRequest>,
+    ) -> Result<Response<EnsureWorkspaceResponse>, Status> {
+        self.trace_rpc(
+            "driver.ensure_workspace",
+            "ensure_workspace",
+            ComputeDriver::ensure_workspace(&self.driver, request),
+        )
+        .await
+    }
+
+    async fn delete_workspace(
+        &self,
+        request: Request<DeleteWorkspaceRequest>,
+    ) -> Result<Response<DeleteWorkspaceResponse>, Status> {
+        self.trace_rpc(
+            "driver.delete_workspace",
+            "delete_workspace",
+            ComputeDriver::delete_workspace(&self.driver, request),
+        )
+        .await
+    }
+}
+
+#[tonic::async_trait]
 impl ComputeDriver for DockerComputeDriver {
     type WatchSandboxesStream = WatchStream;
 
@@ -1391,15 +1886,19 @@ impl ComputeDriver for DockerComputeDriver {
         &self,
         _request: Request<GetGatewayListenerRequirementsRequest>,
     ) -> Result<Response<GetGatewayListenerRequirementsResponse>, Status> {
-        let requirements = match self.config.gateway_route {
-            DockerGatewayRoute::Bridge { bind_address, .. } => {
-                vec![GatewayListenerRequirement {
-                    reason: "docker managed bridge gateway".to_string(),
-                    selector: Some(Selector::ExactBindAddress(bind_address.to_string())),
-                }]
-            }
-            DockerGatewayRoute::HostGateway => Vec::new(),
-        };
+        let requirements =
+            self.config
+                .gateway_callback_bind_address
+                .map_or_else(Vec::new, |bind_address| {
+                    vec![GatewayListenerRequirement {
+                        reason: match self.config.gateway_route {
+                            DockerGatewayRoute::Bridge { .. } => "docker managed bridge gateway",
+                            DockerGatewayRoute::HostGateway => "docker host-gateway IPv4 loopback",
+                        }
+                        .to_string(),
+                        selector: Some(Selector::ExactBindAddress(bind_address.to_string())),
+                    }]
+                });
         Ok(Response::new(GetGatewayListenerRequirementsResponse {
             requirements,
         }))
@@ -1458,34 +1957,82 @@ impl ComputeDriver for DockerComputeDriver {
         }))
     }
 
+    #[tracing::instrument(
+        name = "docker.schedule_sandbox",
+        skip(self, request),
+        fields(
+            otel.name = "docker.schedule_sandbox",
+            otel.status_code = tracing::field::Empty,
+            sandbox.id = %request.get_ref().sandbox.as_ref().map_or("", |sandbox| sandbox.id.as_str()),
+            sandbox.name = %request.get_ref().sandbox.as_ref().map_or("", |sandbox| sandbox.name.as_str()),
+        )
+    )]
     async fn create_sandbox(
         &self,
         request: Request<CreateSandboxRequest>,
     ) -> Result<Response<CreateSandboxResponse>, Status> {
+        let span_status = openshell_otel::ErrorStatusGuard::current();
         let sandbox = request
             .into_inner()
             .sandbox
             .ok_or_else(|| Status::invalid_argument("sandbox is required"))?;
         self.create_sandbox_inner(&sandbox).await?;
-        Ok(Response::new(CreateSandboxResponse {}))
+        span_status.finish(Ok(Response::new(CreateSandboxResponse {})))
     }
 
+    #[tracing::instrument(
+        name = "docker.stop_sandbox",
+        skip(self, request),
+        fields(
+            otel.name = "docker.stop_sandbox",
+            otel.status_code = tracing::field::Empty,
+            sandbox.id = %request.get_ref().sandbox_id,
+            sandbox.name = %request.get_ref().sandbox_name,
+        )
+    )]
     async fn stop_sandbox(
         &self,
         request: Request<StopSandboxRequest>,
     ) -> Result<Response<StopSandboxResponse>, Status> {
+        let span_status = openshell_otel::ErrorStatusGuard::current();
         let request = request.into_inner();
         require_sandbox_identifier(&request.sandbox_id, &request.sandbox_name)?;
 
         self.stop_sandbox_inner(&request.sandbox_id, &request.sandbox_name)
             .await?;
-        Ok(Response::new(StopSandboxResponse {}))
+        self.publish_container_snapshot(&request.sandbox_id, &request.sandbox_name)
+            .await?;
+        span_status.finish(Ok(Response::new(StopSandboxResponse {})))
     }
 
+    async fn start_sandbox(
+        &self,
+        request: Request<StartSandboxRequest>,
+    ) -> Result<Response<StartSandboxResponse>, Status> {
+        let request = request.into_inner();
+        if !Self::start_sandbox(self, &request.sandbox_id, &request.sandbox_name).await? {
+            return Err(Status::not_found("sandbox not found"));
+        }
+        self.publish_container_snapshot(&request.sandbox_id, &request.sandbox_name)
+            .await?;
+        Ok(Response::new(StartSandboxResponse {}))
+    }
+
+    #[tracing::instrument(
+        name = "docker.delete_sandbox",
+        skip(self, request),
+        fields(
+            otel.name = "docker.delete_sandbox",
+            otel.status_code = tracing::field::Empty,
+            sandbox.id = %request.get_ref().sandbox_id,
+            sandbox.name = %request.get_ref().sandbox_name,
+        )
+    )]
     async fn delete_sandbox(
         &self,
         request: Request<DeleteSandboxRequest>,
     ) -> Result<Response<DeleteSandboxResponse>, Status> {
+        let span_status = openshell_otel::ErrorStatusGuard::current();
         let request = request.into_inner();
         require_sandbox_identifier(&request.sandbox_id, &request.sandbox_name)?;
 
@@ -1493,6 +2040,7 @@ impl ComputeDriver for DockerComputeDriver {
         let deleted = self
             .delete_sandbox_inner(&request.sandbox_id, &request.sandbox_name)
             .await?;
+        self.lifecycle_event_fences.remove(&event_sandbox_id);
         if deleted && !event_sandbox_id.is_empty() {
             let _ = self.events.send(WatchSandboxesEvent {
                 payload: Some(watch_sandboxes_event::Payload::Deleted(
@@ -1503,7 +2051,7 @@ impl ComputeDriver for DockerComputeDriver {
             });
         }
 
-        Ok(Response::new(DeleteSandboxResponse { deleted }))
+        span_status.finish(Ok(Response::new(DeleteSandboxResponse { deleted })))
     }
 
     async fn watch_sandboxes(
@@ -1549,6 +2097,20 @@ impl ComputeDriver for DockerComputeDriver {
         });
 
         Ok(Response::new(Box::pin(ReceiverStream::new(out_rx))))
+    }
+
+    async fn ensure_workspace(
+        &self,
+        _request: Request<EnsureWorkspaceRequest>,
+    ) -> Result<Response<EnsureWorkspaceResponse>, Status> {
+        Ok(Response::new(EnsureWorkspaceResponse {}))
+    }
+
+    async fn delete_workspace(
+        &self,
+        _request: Request<DeleteWorkspaceRequest>,
+    ) -> Result<Response<DeleteWorkspaceResponse>, Status> {
+        Ok(Response::new(DeleteWorkspaceResponse {}))
     }
 }
 
@@ -2222,13 +2784,20 @@ fn build_environment_for_oci_user(
         openshell_core::sandbox_env::SSH_SOCKET_PATH.to_string(),
         config.ssh_socket_path.clone(),
     );
+    let main_process =
+        openshell_core::sandbox_env::MainProcessConfig::encode_driver_spec(sandbox.spec.as_ref())
+            .expect("main process config serialization cannot fail");
     environment.insert(
-        openshell_core::sandbox_env::SANDBOX_COMMAND.to_string(),
-        SANDBOX_COMMAND.to_string(),
+        openshell_core::sandbox_env::MAIN_PROCESS_SPEC.to_string(),
+        main_process,
     );
     environment.insert(
         openshell_core::sandbox_env::TELEMETRY_ENABLED.to_string(),
         openshell_core::telemetry::enabled_env_value().to_string(),
+    );
+    environment.insert(
+        openshell_core::sandbox_env::NETWORK_RUNTIME_CAPABILITIES.to_string(),
+        openshell_core::sandbox_env::POLICY_DNS_TRANSPARENT_TCP_CAPABILITY.to_string(),
     );
     // The root supervisor executes namespace helpers during bootstrap; keep
     // their search path driver-owned even when the template/spec set PATH.
@@ -2250,6 +2819,11 @@ fn build_environment_for_oci_user(
 
     environment.remove(openshell_core::sandbox_env::SANDBOX_TOKEN);
     environment.remove(openshell_core::sandbox_env::SANDBOX_TOKEN_FILE);
+    // Prevent user-supplied environment from overriding the TLS server name
+    // the supervisor verifies — a sandbox user who can redirect the gateway
+    // hostname could otherwise present a certificate for a name they control
+    // and intercept the sandbox JWT.
+    environment.remove(openshell_core::sandbox_env::GATEWAY_TLS_SERVER_NAME);
     environment.insert(
         openshell_core::sandbox_env::OCI_IMAGE_USER.to_string(),
         oci_user.to_string(),
@@ -2465,10 +3039,9 @@ fn build_container_create_body_for_image(
                 Some(binds)
             },
             mounts: Some(user_mounts),
-            restart_policy: Some(RestartPolicy {
-                name: Some(RestartPolicyNameEnum::UNLESS_STOPPED),
-                maximum_retry_count: None,
-            }),
+            // Canonical main-process exit is terminal. Runtime restart would
+            // silently create a new process generation behind the gateway.
+            restart_policy: None,
             cap_add: Some(vec![
                 "SYS_ADMIN".to_string(),
                 "NET_ADMIN".to_string(),
@@ -2582,6 +3155,22 @@ fn docker_gateway_route_for_host(
             bind_address: SocketAddr::new(bridge_gateway_ip, port),
             host_alias_ip: bridge_gateway_ip,
         }
+    }
+}
+
+fn docker_gateway_callback_bind_address(
+    route: &DockerGatewayRoute,
+    primary_bind_address: SocketAddr,
+) -> Option<SocketAddr> {
+    match route {
+        DockerGatewayRoute::Bridge { bind_address, .. } => Some(*bind_address),
+        DockerGatewayRoute::HostGateway => match primary_bind_address.ip() {
+            IpAddr::V4(ip) if ip.is_unspecified() || ip == Ipv4Addr::LOCALHOST => None,
+            _ => Some(SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::LOCALHOST),
+                primary_bind_address.port(),
+            )),
+        },
     }
 }
 
@@ -2953,20 +3542,11 @@ fn summary_container_target(summary: &ContainerSummary) -> Option<String> {
         .or_else(|| summary_container_name(summary))
 }
 
-fn container_state_needs_shutdown_stop(state: ContainerSummaryStateEnum) -> bool {
-    matches!(
-        state,
-        ContainerSummaryStateEnum::RUNNING
-            | ContainerSummaryStateEnum::RESTARTING
-            | ContainerSummaryStateEnum::PAUSED
-    )
-}
-
 /// States from which a managed container can be brought back to running by
 /// `start_container`. Skip `Restarting` (already coming up), `Removing`,
 /// `Dead` (terminal), `Paused` (needs `unpause`, not `start`), and
 /// `Running` (nothing to do).
-fn container_state_needs_resume(state: ContainerSummaryStateEnum) -> bool {
+fn container_state_needs_start(state: ContainerSummaryStateEnum) -> bool {
     matches!(
         state,
         ContainerSummaryStateEnum::EXITED | ContainerSummaryStateEnum::CREATED
@@ -2977,36 +3557,31 @@ fn docker_stop_timeout_secs(timeout_secs: u32) -> i32 {
     i32::try_from(timeout_secs).unwrap_or(i32::MAX)
 }
 
-fn emit_snapshot_diff(
-    events: &broadcast::Sender<WatchSandboxesEvent>,
-    previous: &HashMap<String, DriverSandbox>,
-    current: &HashMap<String, DriverSandbox>,
-) {
-    for (sandbox_id, sandbox) in current {
-        if previous.get(sandbox_id) == Some(sandbox) {
-            continue;
-        }
-        let _ = events.send(WatchSandboxesEvent {
-            payload: Some(watch_sandboxes_event::Payload::Sandbox(
-                WatchSandboxesSandboxEvent {
-                    sandbox: Some(sandbox.clone()),
-                },
-            )),
-        });
+fn driver_sandbox_reports_container_exit(sandbox: &DriverSandbox) -> bool {
+    sandbox.status.as_ref().is_some_and(|status| {
+        status.conditions.iter().any(|condition| {
+            condition.r#type == "Ready"
+                && condition.status.eq_ignore_ascii_case("false")
+                && condition.reason == "ContainerExited"
+        })
+    })
+}
+
+fn docker_polled_exit_is_stale(
+    previous_finished_at: &str,
+    current_state: Option<&ContainerState>,
+) -> bool {
+    let Some(current_state) = current_state else {
+        return false;
+    };
+
+    if current_state.status != Some(ContainerStateStatusEnum::EXITED) {
+        // The list response said Exited, but inspect has already observed a
+        // newer state. Publishing the older list result would regress it.
+        return true;
     }
 
-    for sandbox_id in previous.keys() {
-        if current.contains_key(sandbox_id) {
-            continue;
-        }
-        let _ = events.send(WatchSandboxesEvent {
-            payload: Some(watch_sandboxes_event::Payload::Deleted(
-                WatchSandboxesDeletedEvent {
-                    sandbox_id: sandbox_id.clone(),
-                },
-            )),
-        });
-    }
+    current_state.finished_at.as_deref() == Some(previous_finished_at)
 }
 
 fn label_filters(values: impl IntoIterator<Item = String>) -> HashMap<String, Vec<String>> {
@@ -3116,7 +3691,7 @@ fn resolve_supervisor_bin_source(
     // Tier 1: explicit supervisor_bin in [openshell.drivers.docker].
     if let Some(path) = docker_config.supervisor_bin.clone() {
         let path = canonicalize_existing_file(&path, "docker supervisor binary")?;
-        validate_linux_elf_binary(&path)?;
+        validate_linux_elf_binary(&path).map_err(Error::config)?;
         return Ok(SupervisorBinSource::Binary(path));
     }
 
@@ -3256,24 +3831,13 @@ async fn extract_supervisor_bin_from_image(docker: &Docker, image: &str) -> Core
         ))
     })?;
 
-    let cache_path = supervisor_cache_path(&digest)?;
+    let cache_path =
+        openshell_core::driver_utils::supervisor_cache_path("docker-supervisor", &digest)
+            .map_err(Error::config)?;
     if cache_path.is_file() {
-        validate_linux_elf_binary(&cache_path)?;
+        validate_linux_elf_binary(&cache_path).map_err(Error::config)?;
         return Ok(cache_path);
     }
-
-    let cache_dir = cache_path.parent().ok_or_else(|| {
-        Error::config(format!(
-            "docker supervisor cache path '{}' has no parent directory",
-            cache_path.display(),
-        ))
-    })?;
-    std::fs::create_dir_all(cache_dir).map_err(|err| {
-        Error::config(format!(
-            "failed to create docker supervisor cache dir '{}': {err}",
-            cache_dir.display(),
-        ))
-    })?;
 
     info!(
         image = image,
@@ -3283,8 +3847,8 @@ async fn extract_supervisor_bin_from_image(docker: &Docker, image: &str) -> Core
     );
 
     let binary_bytes = extract_supervisor_binary_bytes(docker, image).await?;
-    write_cache_binary_atomic(&cache_path, &binary_bytes)?;
-    validate_linux_elf_binary(&cache_path)?;
+    write_cache_binary_atomic(&cache_path, &binary_bytes).map_err(Error::config)?;
+    validate_linux_elf_binary(&cache_path).map_err(Error::config)?;
     Ok(cache_path)
 }
 
@@ -3377,98 +3941,6 @@ async fn download_binary_from_container(
     })
 }
 
-/// Extract the payload of the first regular-file entry in a tar archive.
-/// Docker's `/containers/<id>/archive` endpoint returns a single-file tar
-/// when `path` points to a file, so we only need the first entry.
-fn extract_first_tar_entry(tar_bytes: &[u8]) -> Result<Vec<u8>, String> {
-    let mut archive = tar::Archive::new(std::io::Cursor::new(tar_bytes));
-    let mut entries = archive
-        .entries()
-        .map_err(|err| format!("open tar archive: {err}"))?;
-    let mut entry = entries
-        .next()
-        .ok_or_else(|| "tar archive was empty".to_string())?
-        .map_err(|err| format!("read tar entry: {err}"))?;
-    let mut bytes = Vec::new();
-    entry
-        .read_to_end(&mut bytes)
-        .map_err(|err| format!("read tar entry payload: {err}"))?;
-    Ok(bytes)
-}
-
-fn write_cache_binary_atomic(final_path: &Path, bytes: &[u8]) -> CoreResult<()> {
-    let dir = final_path.parent().ok_or_else(|| {
-        Error::config(format!(
-            "docker supervisor cache path '{}' has no parent directory",
-            final_path.display(),
-        ))
-    })?;
-    let mut temp = tempfile::Builder::new()
-        .prefix(".openshell-sandbox-")
-        .tempfile_in(dir)
-        .map_err(|err| {
-            Error::config(format!(
-                "failed to create temp file for supervisor binary in '{}': {err}",
-                dir.display(),
-            ))
-        })?;
-    std::io::Write::write_all(&mut temp, bytes).map_err(|err| {
-        Error::config(format!(
-            "failed to write supervisor binary to temp file: {err}",
-        ))
-    })?;
-    temp.as_file().sync_all().map_err(|err| {
-        Error::config(format!("failed to sync supervisor binary temp file: {err}"))
-    })?;
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o755)).map_err(
-            |err| {
-                Error::config(format!(
-                    "failed to chmod supervisor binary temp file: {err}",
-                ))
-            },
-        )?;
-    }
-
-    temp.persist(final_path).map_err(|err| {
-        Error::config(format!(
-            "failed to rename supervisor binary into '{}': {}",
-            final_path.display(),
-            err.error,
-        ))
-    })?;
-    Ok(())
-}
-
-/// Cache path for an extracted supervisor binary, keyed by the image's
-/// content-addressable digest (e.g. `sha256:abc123…`). The digest-prefixed
-/// directory keeps stale extractions from earlier releases isolated so they
-/// can be GC'd without affecting the active binary.
-fn supervisor_cache_path(digest: &str) -> CoreResult<PathBuf> {
-    let base = openshell_core::paths::xdg_data_dir()
-        .map_err(|err| Error::config(format!("failed to resolve XDG data dir: {err}")))?;
-    Ok(supervisor_cache_path_with_base(&base, digest))
-}
-
-fn supervisor_cache_path_with_base(base: &Path, digest: &str) -> PathBuf {
-    let sanitized = digest.replace(':', "-");
-    base.join("openshell")
-        .join("docker-supervisor")
-        .join(sanitized)
-        .join("openshell-sandbox")
-}
-
-fn temp_extract_container_name() -> String {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static SEQ: AtomicU64 = AtomicU64::new(0);
-    let pid = std::process::id();
-    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
-    format!("openshell-supervisor-extract-{pid}-{seq}")
-}
-
 fn canonicalize_existing_file(path: &Path, description: &str) -> CoreResult<PathBuf> {
     if !path.is_file() {
         return Err(Error::config(format!(
@@ -3482,29 +3954,6 @@ fn canonicalize_existing_file(path: &Path, description: &str) -> CoreResult<Path
             path.display()
         ))
     })
-}
-
-pub(crate) fn validate_linux_elf_binary(path: &Path) -> CoreResult<()> {
-    let mut file = std::fs::File::open(path).map_err(|err| {
-        Error::config(format!(
-            "failed to open docker supervisor binary '{}': {err}",
-            path.display()
-        ))
-    })?;
-    let mut magic = [0_u8; 4];
-    file.read_exact(&mut magic).map_err(|err| {
-        Error::config(format!(
-            "failed to read docker supervisor binary '{}': {err}",
-            path.display()
-        ))
-    })?;
-    if magic != [0x7f, b'E', b'L', b'F'] {
-        return Err(Error::config(format!(
-            "docker supervisor binary '{}' must be a Linux ELF executable",
-            path.display()
-        )));
-    }
-    Ok(())
 }
 
 fn docker_guest_tls_configured(docker_config: &DockerComputeConfig) -> bool {

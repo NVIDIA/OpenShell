@@ -1,0 +1,10 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# E2E overlay: deploy the gateway in operator workspace mode.
+# Namespaces must be pre-provisioned and labeled before sandbox creation.
+server:
+  drivers:
+    kubernetes:
+      workspaceMode: "operator"
+      operatorNamespaceLabel: "openshell.ai/e2e-operator-workspace=true"

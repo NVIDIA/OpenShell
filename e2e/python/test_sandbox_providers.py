@@ -39,7 +39,7 @@ def _is_placeholder_for_env_key(value: str, key: str) -> bool:
     token = value.removeprefix(prefix)
     if token == value:
         return False
-    return token.startswith("v") and token.endswith(f"_{key}")
+    return token.startswith(("v", "s")) and token.endswith(f"_{key}")
 
 
 def _default_policy() -> sandbox_pb2.SandboxPolicy:

@@ -78,6 +78,20 @@ type PolicyChunk struct {
 	ValidationResult string
 	// RejectionReason is the operator-supplied text accompanying a rejection.
 	RejectionReason string
+	// ApplicationError is the complete-candidate preflight/application failure.
+	ApplicationError string
+	// ReviewToken binds an approval to the exact evaluated candidate.
+	ReviewToken                  string
+	CurrentEffectivePolicyHash   string
+	CandidateEffectivePolicyHash string
+	CurrentEffectivePolicy       *SandboxPolicy
+	CandidateEffectivePolicy     *SandboxPolicy
+}
+
+// DraftChunkApproval binds one bulk approval decision to a reviewed chunk.
+type DraftChunkApproval struct {
+	ChunkID     string
+	ReviewToken string
 }
 
 // DraftPolicy contains the full draft policy state returned by GetDraft.
@@ -110,6 +124,27 @@ type SandboxPolicy struct {
 	// NetworkPolicies contains named network access rules.
 	// Nil means no network policies are specified; an empty map is distinct from nil.
 	NetworkPolicies map[string]NetworkPolicyRule
+	// NetworkMiddlewares contains named middleware pipeline configurations for
+	// network egress. Nil means no middleware is specified; an empty map is distinct from nil.
+	NetworkMiddlewares map[string]NetworkMiddlewareConfig
+}
+
+// NetworkMiddlewareConfig configures a supervisor middleware pipeline for
+// network egress. Middleware configs are referenced by name in the policy.
+type NetworkMiddlewareConfig struct {
+	Name       string
+	Middleware string
+	Config     map[string]any
+	OnError    string
+	Endpoints  *MiddlewareEndpointSelector
+	Order      int32
+}
+
+// MiddlewareEndpointSelector controls which admitted destinations use a
+// middleware config, using host glob patterns.
+type MiddlewareEndpointSelector struct {
+	Include []string
+	Exclude []string
 }
 
 // FilesystemPolicy controls which directories the sandbox can access
@@ -155,6 +190,8 @@ type SandboxPolicyRevision struct {
 	LoadedAt time.Time
 	// Policy is the typed security policy for this revision. Nil when not requested or absent.
 	Policy *SandboxPolicy
+	// Provenance is immutable metadata supplied with this policy revision.
+	Provenance map[string]string
 }
 
 // PolicyStatusResult contains the status of a sandbox's policy.
@@ -243,6 +280,14 @@ func (c *getDraftConfig) StatusFilter() string {
 // approveAllConfig holds configuration for ApproveAllDraftChunks calls.
 type approveAllConfig struct {
 	includeSecurityFlagged bool
+	approvals              []DraftChunkApproval
+}
+
+// WithDraftApprovals supplies the exact reviewed chunk tokens for bulk approval.
+func WithDraftApprovals(approvals ...DraftChunkApproval) ApproveAllOption {
+	return func(c *approveAllConfig) {
+		c.approvals = append([]DraftChunkApproval(nil), approvals...)
+	}
 }
 
 // ApproveAllOption configures an ApproveAllDraftChunks call.
@@ -269,9 +314,15 @@ func (c *approveAllConfig) IncludeSecurityFlagged() bool {
 	return c.includeSecurityFlagged
 }
 
+// Approvals returns a copy of the configured token-bound approvals.
+func (c *approveAllConfig) Approvals() []DraftChunkApproval {
+	return append([]DraftChunkApproval(nil), c.approvals...)
+}
+
 // getStatusConfig holds configuration for GetStatus calls.
 type getStatusConfig struct {
 	version uint32
+	global  bool
 }
 
 // GetStatusOption configures a GetStatus call.
@@ -281,6 +332,15 @@ type GetStatusOption func(*getStatusConfig)
 func WithVersion(version uint32) GetStatusOption {
 	return func(c *getStatusConfig) {
 		c.version = version
+	}
+}
+
+// WithStatusGlobal enables global policy mode on GetStatus. When true,
+// the query retrieves gateway-global policy status instead of sandbox-scoped
+// status, and the sandbox name and workspace parameters are ignored.
+func WithStatusGlobal(global bool) GetStatusOption {
+	return func(c *getStatusConfig) {
+		c.global = global
 	}
 }
 
@@ -298,10 +358,16 @@ func (c *getStatusConfig) Version() uint32 {
 	return c.version
 }
 
+// Global returns whether global policy mode is enabled.
+func (c *getStatusConfig) Global() bool {
+	return c.global
+}
+
 // listPolicyConfig holds configuration for List calls.
 type listPolicyConfig struct {
 	limit  uint32
 	offset uint32
+	global bool
 }
 
 // ListPolicyOption configures a List call.
@@ -318,6 +384,15 @@ func WithLimit(limit uint32) ListPolicyOption {
 func WithOffset(offset uint32) ListPolicyOption {
 	return func(c *listPolicyConfig) {
 		c.offset = offset
+	}
+}
+
+// WithListGlobal enables global policy mode on List. When true, the query
+// retrieves gateway-global policy revisions instead of sandbox-scoped ones,
+// and the workspace parameter is ignored.
+func WithListGlobal(global bool) ListPolicyOption {
+	return func(c *listPolicyConfig) {
+		c.global = global
 	}
 }
 
@@ -338,4 +413,9 @@ func (c *listPolicyConfig) Limit() uint32 {
 // Offset returns the configured offset.
 func (c *listPolicyConfig) Offset() uint32 {
 	return c.offset
+}
+
+// Global returns whether global policy mode is enabled.
+func (c *listPolicyConfig) Global() bool {
+	return c.global
 }

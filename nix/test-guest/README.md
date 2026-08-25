@@ -16,6 +16,12 @@ This prototype uses Nix, QEMU, and Ansible to boot and configure disposable Linu
 
 The first run downloads the selected cloud image and VM runtime. Nix reuses those immutable inputs on later runs, while each guest starts from a fresh writable overlay.
 
+On Apple Silicon, test guests deliberately take QEMU 11.0.2 and its matching OVMF
+firmware from a separately pinned Nixpkgs revision. All other guest-runtime tools,
+development dependencies, and cross-toolchain dependencies continue to use the main
+current Nixpkgs input. This avoids a QEMU 11.1 HVF guest boot regression. Update
+this pair only after validating an ARM64 Ubuntu guest boot with HVF.
+
 ## Directory structure
 
 ```text

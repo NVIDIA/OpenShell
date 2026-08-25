@@ -1,6 +1,6 @@
 # Compute Runtimes
 
-Compute runtimes create, stop, delete, and watch sandbox workloads for the
+Compute runtimes create, stop, start, delete, and watch sandbox workloads for the
 gateway. They do not replace sandbox policy enforcement. Every runtime starts a
 workload that runs the `openshell-sandbox` supervisor, and the supervisor
 enforces the sandbox contract locally.
@@ -13,6 +13,9 @@ Each runtime receives a sandbox spec from the gateway and is responsible for:
 - Injecting sandbox identity and gateway callback configuration.
 - Supplying TLS or secret material for supervisor callbacks.
 - Providing the supervisor binary or image in the workload.
+- Forwarding the exact canonical main-process argv and TTY mode without shell
+  reconstruction. The sandbox-level environment and policy workspace apply to
+  the main process.
 - Reporting lifecycle and platform events back to the gateway.
 - Cleaning up runtime-owned resources.
 
@@ -22,6 +25,17 @@ nothing more. Drivers must not gate on supervisor session state or hold
 references to gateway-internal types. The gateway owns the public
 `SandboxPhase::Ready` decision. This applies equally to extension drivers
 implementing `ComputeDriver` out of tree.
+
+`compute_driver.proto` is the supported gateway/driver extension boundary.
+At initialization the gateway snapshots the driver's identity, version,
+default image, and gateway-lifecycle preference from `GetCapabilities`.
+Process-identity omissions are preserved across this boundary so every driver
+can apply its native image or runtime defaults. Driver-requested listeners are
+structurally validated and remain restricted to sandbox callback RPCs.
+
+Canonical main-process support is part of the `ComputeDriver` contract. Every
+in-tree and extension driver must forward the exact specification; it is not an
+optional capability that drivers can omit or negotiate.
 
 Drivers own runtime-specific platform event interpretation. When an event should
 drive client provisioning UI, the driver attaches the shared
@@ -84,19 +98,91 @@ The gateway records driver identity and version from the startup capability
 response. Elevated gateway info reports that initialized driver snapshot instead
 of re-querying drivers on each request.
 
+## Compiled Driver Selection
+
+The gateway binary explicitly installs the compute drivers compiled into that
+binary before entering server startup. The server selects a configured driver
+by normalized registry name. When no driver is configured, it evaluates only
+the installed drivers' probes in registered priority order, records every
+available registration, and selects the first. Drivers without a probe,
+including VM, remain opt-in.
+
+Startup computes this selection once after merging configuration. The same
+selection drives authentication defaults and runtime construction, so a probe
+result cannot change which driver is constructed later in startup.
+
+This follows the same composition model as SQLx's `Any` drivers: the binary
+defines the available implementation set, while the runtime consumes a generic
+registry. Adding or removing a compiled driver therefore changes registration
+rather than the server's selection flow. Alternate gateway binaries can install
+their own `ComputeDriverFactory` registrations and hand the completed registry
+to `run_cli_with_compute_drivers`; factories receive merged driver config and
+finish through the same in-process runtime adapter. A configured UDS endpoint
+still takes precedence over a compiled registration with the same name.
+
+The standard server crate groups first-party registrations behind the
+`in-tree-compute-drivers` feature. Protocol-only gateway builds disable that
+feature and link no compute-driver crates. E2E lanes compose that gateway with
+Docker, Podman, Kubernetes, and VM driver executables over the public UDS gRPC
+contract so an in-tree driver cannot silently depend on a server-only API.
+External Kubernetes drivers support shared and managed workspace modes.
+Operator mode requires an in-process dynamic namespace allowlist and is
+rejected when Kubernetes is configured through an external endpoint.
+
+## Stop and Start Lifecycle
+
+The gateway persists lifecycle intent before mutating compute:
+
+```text
+Ready -> Stopping -> Stopped -> Starting -> Ready
+```
+
+`StopSandbox` and `StartSandbox` are idempotent driver operations. Stop
+retains the driver resource and its persistent workspace boundary while making
+exec, SSH, forwarding, and exposed services unavailable. Start reactivates the
+same resource. The gateway requires a fresh supervisor session before a
+starting sandbox returns to `Ready`; stale driver snapshots and supervisor
+sessions cannot promote a `Stopped` row.
+
+A driver stop operation does not complete while its backend still reports an
+in-progress stop. This prevents an immediate start from racing the previous
+run's delayed exit event and regressing the new run to `Error`.
+
+Persisted `Stopping` and `Starting` rows are retried at startup. Stable
+`Stopped` rows remain stopped. Docker and Podman retain the stopped container
+and attached storage, Kubernetes retains the Sandbox CR and PVC while scaling
+compute to zero, and VM retains its launch request and writable overlay beside
+a stop marker. Delete remains a separate operation that removes these
+resources.
+
+On graceful gateway shutdown, persisted running intent for Docker, Podman, and
+VM is stopped through the shared `StopSandbox` RPC before any gateway-managed
+driver process exits. The gateway does not persist `Stopped` for this
+infrastructure event. On startup, it reconciles the retained intent through the
+shared idempotent `StartSandbox` RPC before watch processing begins. Explicitly
+`Stopped` sandboxes are excluded from both sweeps. Kubernetes workloads are
+cluster-owned and continue running without gateway shutdown or startup
+lifecycle calls.
+
+The driver reports this behavior through
+`GetCapabilities.gateway_manages_lifecycle`. The same declaration works for
+in-process and external drivers. Older drivers omit the field and retain the
+conservative operator-managed behavior.
+
 ## Deletion Lifecycle
 
-Delete requests use per-sandbox gates to serialize delete attempts. A request
+Lifecycle requests use per-sandbox gates to serialize stop, start, and
+delete attempts. A delete request
 resolves the name once and remains bound to that stable ID. The only
-combined lock order is delete gate, then the gateway-wide state guard; external
+combined lock order is lifecycle gate, then the gateway-wide state guard; external
 driver calls run without the global guard.
 
-Delete gates are process-local and do not coordinate gateway replicas. They
+Lifecycle gates are process-local and do not coordinate gateway replicas. They
 serialize attempts rather than share results: if one attempt fails and recovery
 restores a deletable state, a request waiting on the gate may retry the driver.
 Persisted resource-version checks remain the cross-replica safety boundary.
 
-Watcher events do not acquire delete gates. Exact resource-version checks allow
+Watcher events do not acquire lifecycle gates. Exact resource-version checks allow
 them to interleave safely: status snapshots are no-ops for `Deleting` rows,
 deleted events are idempotent, and snapshots for absent rows are ignored.
 
@@ -109,18 +195,18 @@ sessions, indexes, and watch/log buses are cleaned after confirmed removal.
 The request acquires both locks before starting owned work, so cancellation
 while queued does not leave a delete armed. After that commitment point, the
 owned task prevents cancellation from stranding a mutation. A gateway restart
-does not resume a persisted `Deleting` operation. If the backend completed the
+does not start a persisted `Deleting` operation. If the backend completed the
 delete, reconciliation removes the row; otherwise it can remain `Deleting`.
 
 ## Runtime Summary
 
 | Runtime | Best fit | Sandbox boundary | Notes |
 |---|---|---|---|
-| Docker | Local development with Docker available. | Container plus nested sandbox namespace. | Uses host networking so loopback gateway endpoints work from the supervisor. |
-| Podman | Rootless or single-machine deployments. | Container plus nested sandbox namespace. | Uses the Podman REST API, OCI image volumes, and CDI GPU devices when available. |
+| Docker | Local development with Docker available. | Container plus nested sandbox namespace. | Uses host networking so loopback gateway endpoints work from the supervisor. Advertises the combined-supervisor policy-DNS and transparent-TCP substrate. |
+| Podman | Rootless or single-machine deployments. | Container plus nested sandbox namespace. | Uses the Podman REST API and CDI GPU devices when available. Delivers the supervisor via OCI image volume by default; falls back to extracting the binary to a host-side cache and bind-mounting it when `userns` is configured (overlay does not support idmapped mounts). Advertises the combined-supervisor policy-DNS and transparent-TCP substrate. |
 | Kubernetes | Cluster deployment through Helm. | Pod plus nested sandbox namespace. | Uses Kubernetes API objects, service accounts, secrets, PVC-backed workspace storage, and GPU resources. |
 | VM | Experimental microVM isolation. | Per-sandbox libkrun VM. | Managed endpoint-backed driver. The gateway spawns `openshell-driver-vm`, waits for its Unix socket, and then consumes it through the same remote `compute_driver.proto` path used by unmanaged endpoint drivers. The VM driver boots a cached bootstrap `rootfs.ext4`, prepares requested OCI images inside a bootstrap VM with `umoci`, attaches the prepared image disk read-only, and gives each sandbox a writable `overlay.ext4` for merged-root changes and runtime material. The driver persists each accepted launch request beside the overlay and restarts those VMs on driver startup without recreating the overlay. |
-| Extension | Out-of-tree drivers operated alongside the gateway. | Whatever boundary the driver implements. | Selected by a non-reserved custom `compute_drivers = ["<name>"]` entry with `[openshell.drivers.<name>].socket_path`, or at launch time by pairing `--drivers <name>` with `--compute-driver-socket=<path>`. Reserved built-in names such as `vm`, `docker`, `podman`, and `kubernetes` cannot be used as unmanaged socket endpoints. The gateway connects to a UDS the operator already provisioned, runs `GetCapabilities`, logs the advertised `driver_name`, and dispatches all sandbox lifecycle calls through `compute_driver.proto`. The driver process and socket lifecycle are operator-owned; the gateway does not spawn, supervise, or remove unmanaged extension drivers. The trust boundary is the socket's filesystem permissions: the operator must ensure only the gateway uid can read/write it. |
+| Extension | Out-of-tree drivers operated alongside the gateway. | Whatever boundary the driver implements. | Selected by a custom `compute_drivers = ["<name>"]` entry with `[openshell.drivers.<name>].socket_path`, or at launch time by pairing `--drivers <name>` with `--compute-driver-socket=<path>`. A launch-time endpoint may use a canonical built-in name to preserve its driver-config key while replacing in-process construction. The gateway connects to an operator-provisioned UDS, snapshots `GetCapabilities`, and dispatches all sandbox lifecycle calls through `compute_driver.proto`. The driver process and socket lifecycle are operator-owned; the gateway does not spawn, supervise, or remove unmanaged extension drivers. The trust boundary is the socket's filesystem permissions: the operator must ensure only the gateway uid can read/write it. |
 
 Per-sandbox CPU and memory values currently enter the driver layer through
 template resource limits. Docker and Podman apply them as runtime limits.
@@ -136,6 +222,16 @@ active local driver table of `gateway.toml`. Host bind mounts are an unsafe
 operator override because they place gateway-host filesystem state inside the
 sandbox and can negate OpenShell workspace isolation and filesystem-policy
 controls. Driver-owned supervisor, token, and TLS bind mounts stay reserved.
+
+Network features follow the existing driver/substrate split. Compute drivers
+advertise only the runtime mechanics they can guarantee: namespace and
+capability ownership, DNS/TCP capture installation, and coupled
+restart ordering. The shared supervisor remains the sole owner of DNS
+eligibility, synthetic mappings, process authorization, destination filtering,
+pinned dialing, relay behavior, and OCSF decisions. Docker and Podman advertise
+`policy-dns-transparent-tcp`; other runtimes reject explicit TCP policy until
+they implement and validate the same complete contract. The capability marker
+is driver-owned supervisor input and is removed from workload environments.
 
 Kubernetes deployments may set an AppArmor profile on sandbox agent containers
 through the driver configuration. The Helm chart defaults sandbox agents to
@@ -170,7 +266,7 @@ The supervisor must be available inside each sandbox workload:
 | Runtime | Delivery model |
 |---|---|
 | Docker | Bind-mounted local supervisor binary, or a binary extracted from the configured supervisor image. |
-| Podman | Read-only OCI image volume containing the supervisor binary. |
+| Podman | Read-only OCI image volume by default; host-cached bind mount when `userns` is configured. |
 | Kubernetes | Supervisor image side-loaded into the sandbox pod by image volume or init container. |
 | VM | Embedded in the guest rootfs bundle. |
 | Extension | Defined by the out-of-tree driver. |
@@ -190,6 +286,13 @@ driver then supplies one authoritative identity input to the supervisor:
 - Kubernetes passes its platform-resolved numeric UID/GID, including OpenShift
   SCC-derived values.
 - VM keeps its existing guest identity behavior.
+
+Explicit numeric workload identities may use any Linux UID/GID from `1`
+through `u32::MAX - 1`. UID/GID `0` remains prohibited as root, and
+`u32::MAX` remains prohibited because Linux APIs and POSIX ACLs use it as an
+invalid identity sentinel. Infrastructure identities use separate validation:
+the Kubernetes network proxy UID remains at least `1000` and must not match the
+workload UID because its traffic bypasses the pod egress fence.
 
 For Docker and Podman, policy values take precedence independently. An omitted
 `run_as_user` or `run_as_group` falls back to the corresponding identity from
@@ -281,10 +384,106 @@ chart deploys the gateway and sandbox runtime integration. The default gateway
 workload is a StatefulSet for SQLite-backed single-replica installs. External
 database-backed installs can render a Deployment with `workload.kind=deployment`;
 HA deployments must point `server.externalDbSecret` at an operator-managed
-PostgreSQL database.
+PostgreSQL database. Agent Sandbox CRDs and controller lifecycle remain
+operator-owned; the chart can optionally preflight for a served supported API
+but does not install the cluster-scoped dependency.
 Standalone local deployments start the gateway with a selected runtime such as
 Docker, Podman, or VM. The CLI can register multiple gateways and switch between
 them without changing the sandbox architecture.
+
+## Workspace Namespace Modes (Kubernetes)
+
+The Kubernetes driver maps workspaces to namespaces through the `workspace_mode`
+configuration field (`WorkspaceMode` in `crates/openshell-driver-kubernetes/src/config.rs`).
+The mode controls namespace resolution, resource naming, sandbox CR watching, SA
+token authentication, and RBAC requirements.
+
+| Mode | Namespace resolution | Resource name | Namespace lifecycle |
+|---|---|---|---|
+| **Shared** (default) | Single static namespace from config | `{workspace}--{name}` | None |
+| **Managed** | `openshell-{gateway_id}-{workspace}` | bare sandbox name | Driver creates and deletes |
+| **Operator** | Workspace name maps 1:1 to a pre-provisioned namespace | bare sandbox name | External (platform team) |
+
+**Shared** renders all sandboxes into one configured namespace. Resource names
+embed the workspace prefix for collision avoidance. No namespace lifecycle
+management. RBAC uses a namespace-scoped Role.
+
+**Managed** auto-creates a K8s namespace per workspace on first sandbox create.
+Each new namespace receives a ServiceAccount and the configured gateway-only
+SSH ingress NetworkPolicy. Configured image-pull Secrets are copied from the
+driver's source namespace on every sandbox create so registry credential
+rotations propagate. The namespace also copies OpenShift SCC UID-range and
+supplemental-group annotations from the gateway namespace when present. The
+driver deletes the namespace during workspace deletion. The workspace remains
+durably `Terminating` until the Kubernetes API accepts namespace cleanup, so a
+transient failure can be retried. Namespace deletion uses the fetched UID as a
+precondition to avoid deleting a replacement namespace. Requires a non-empty
+`gateway_id` (validated as a
+DNS-1123 label at startup) so the namespace prefix fits within the K8s 63-character
+limit. RBAC promotes sandbox CRD permissions to a ClusterRole and adds namespace
+`create`/`delete` and ServiceAccount `create`/`get` permissions.
+
+Secret copies use server-side apply. Kubernetes authorizes an apply to an
+existing Secret as `patch`, but also requires `create` authorization when the
+target does not exist. RBAC cannot constrain `create` by `resourceNames`, so
+managed mode grants cluster-wide Secret `create` while keeping source reads and
+subsequent patches restricted to the explicitly configured TLS and image-pull
+Secret names. The driver exercises `create` only in gateway-owned managed
+namespaces. This depends on the managed-mode ownership invariant described
+below; the gateway ServiceAccount must not be shared with unrelated workloads.
+
+Operator mode does not create NetworkPolicies or copy image-pull Secrets.
+Platform teams must apply the gateway ingress boundary and provision configured
+image-pull Secrets in every operator-managed namespace.
+
+**Operator** uses pre-provisioned namespaces discovered through two optional
+sources: a K8s label selector (`operator_namespace_label`) and a drop-in
+allowlist file (`operator_namespace_file`). At least one must be configured.
+The `OperatorNamespaceAllowlist` (`Arc<RwLock<BTreeSet<String>>>`) is populated
+at runtime by background watchers and read by the namespace resolver. Sandbox
+creation fails closed if the workspace is not in the current allowlist. Platform
+teams manage namespace lifecycle externally. RBAC uses the same ClusterRole as
+managed mode but without namespace `create`/`delete` or ServiceAccount
+permissions.
+
+### Watching and Querying
+
+Managed and operator modes set `is_multi_namespace() == true`, which switches
+sandbox CR watchers from namespace-scoped `Api::namespaced` to cluster-wide
+`Api::all_with`. In managed mode the driver scopes cluster-wide queries with a
+`LABEL_GATEWAY_ID` label selector to support multiple gateways on the same
+cluster. K8s Events are not watched in cluster-wide mode — the cluster-wide
+watcher emits only sandbox CR changes, not platform events.
+
+### SA Token Authentication
+
+The gateway's `K8sServiceAccountAuthenticator` adapts its `NamespaceValidator`
+per mode (`crates/openshell-server/src/auth/k8s_sa.rs`):
+
+- **Shared:** `Exact` — accepts only the single configured namespace.
+- **Managed:** `Prefix` — accepts any namespace starting with `openshell-{gateway_id}-`.
+- **Operator:** `Allowlist` — accepts namespaces present in the dynamic
+  `BTreeSet` populated by the label/file watchers. Starts empty (fail-closed)
+  until the first watcher update.
+
+These checks rely on an ownership invariant. In shared and managed modes, the
+gateway and its trusted Agent Sandbox controller exclusively administer the
+sandbox namespace, Sandbox CRs, sandbox pods, and configured sandbox
+ServiceAccount. Other principals must not create or mutate those resources or
+use that ServiceAccount. In operator mode, the platform operator retains
+namespace lifecycle ownership, but must preserve the same exclusive control of
+Sandbox CRs and the pods and ServiceAccount used for sandbox token bootstrap.
+An allowlisted namespace is therefore a trust grant, not a tenant isolation
+boundary. Kubernetes owner references alone do not prove which controller
+created a pod, so admitting principals that can fabricate that resource chain
+would allow them to claim an existing sandbox identity.
+
+### Credential Driver Integration
+
+The Kubernetes Secrets credential driver (`openshell-driver-kubernetes-secrets`)
+stores secrets in workspace-specific namespaces when `workspace_mode` is managed
+or operator. In shared mode, all secrets render into the single configured
+namespace.
 
 When runtime infrastructure changes, validate the relevant sandbox e2e path and
 update the matching driver README if a maintainer-facing constraint changes.

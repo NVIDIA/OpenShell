@@ -197,10 +197,12 @@ pub trait PolicyStoreExt {
         rejection_reason: &str,
     ) -> PersistenceResult<bool>;
 
-    async fn update_draft_chunk_rule(
+    /// Replace the policy-dependent evaluation payload for a pending chunk.
+    /// Status and observation counters remain owned by their dedicated
+    /// columns and are not changed by this update.
+    async fn update_draft_chunk_evaluation(
         &self,
-        id: &str,
-        proposed_rule: &[u8],
+        chunk: &DraftChunkRecord,
     ) -> PersistenceResult<bool>;
 
     async fn delete_draft_chunks(&self, sandbox_id: &str, status: &str) -> PersistenceResult<u64>;
@@ -394,14 +396,13 @@ impl PolicyStoreExt for Store {
         }
     }
 
-    async fn update_draft_chunk_rule(
+    async fn update_draft_chunk_evaluation(
         &self,
-        id: &str,
-        proposed_rule: &[u8],
+        chunk: &DraftChunkRecord,
     ) -> PersistenceResult<bool> {
         match self {
-            Self::Postgres(store) => store.update_draft_chunk_rule(id, proposed_rule).await,
-            Self::Sqlite(store) => store.update_draft_chunk_rule(id, proposed_rule).await,
+            Self::Postgres(store) => store.update_draft_chunk_evaluation(chunk).await,
+            Self::Sqlite(store) => store.update_draft_chunk_evaluation(chunk).await,
         }
     }
 
@@ -497,6 +498,12 @@ pub fn draft_chunk_payload_from_record(chunk: &DraftChunkRecord) -> PersistenceR
         draft_version: chunk.draft_version,
         validation_result: chunk.validation_result.clone(),
         rejection_reason: chunk.rejection_reason.clone(),
+        application_error: chunk.application_error.clone(),
+        review_token: chunk.review_token.clone(),
+        current_effective_policy_hash: chunk.current_effective_policy_hash.clone(),
+        candidate_effective_policy_hash: chunk.candidate_effective_policy_hash.clone(),
+        current_effective_policy: chunk.current_effective_policy.clone(),
+        candidate_effective_policy: chunk.candidate_effective_policy.clone(),
     }
     .encode_to_vec())
 }
@@ -536,5 +543,11 @@ pub fn draft_chunk_record_from_parts(
         last_seen_ms: updated_at_ms,
         validation_result: wrapper.validation_result,
         rejection_reason: wrapper.rejection_reason,
+        application_error: wrapper.application_error,
+        review_token: wrapper.review_token,
+        current_effective_policy_hash: wrapper.current_effective_policy_hash,
+        candidate_effective_policy_hash: wrapper.candidate_effective_policy_hash,
+        current_effective_policy: wrapper.current_effective_policy,
+        candidate_effective_policy: wrapper.candidate_effective_policy,
     })
 }

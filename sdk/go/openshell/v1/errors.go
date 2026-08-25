@@ -56,5 +56,5 @@ func IsUnimplemented(err error) bool { return types.IsUnimplemented(err) }
 // optimistic concurrency or an invalid state transition.
 func IsConflict(err error) bool { return types.IsConflict(err) }
 
-// IsUnauthenticated returns true if the error indicates missing or invalid credentials.
+// IsUnauthenticated returns true if the error indicates invalid or missing credentials.
 func IsUnauthenticated(err error) bool { return types.IsUnauthenticated(err) }

@@ -165,6 +165,12 @@ fn connection_conflicts(left: &NetworkEndpoint, right: &NetworkEndpoint) -> Vec<
     let mut conflicts = Vec::new();
     push_conflict(
         &mut conflicts,
+        "transparent_tcp_eligible",
+        &is_explicit_tcp(&left.protocol),
+        &is_explicit_tcp(&right.protocol),
+    );
+    push_conflict(
+        &mut conflicts,
         "tls",
         &normalized_tls(&left.tls),
         &normalized_tls(&right.tls),
@@ -184,13 +190,17 @@ fn connection_conflicts(left: &NetworkEndpoint, right: &NetworkEndpoint) -> Vec<
     conflicts
 }
 
+fn is_explicit_tcp(protocol: &str) -> bool {
+    protocol.eq_ignore_ascii_case("tcp")
+}
+
 /// Keep request-pipeline ambiguity checks aligned with Rego's
 /// `endpoint_has_extended_config` predicate. Plain L4 endpoints authorize a
 /// destination but do not participate in endpoint-config selection, so they
 /// cannot compete with the single L7/connection-config endpoint selected for
 /// that request.
 fn endpoint_contributes_request_pipeline_metadata(endpoint: &NetworkEndpoint) -> bool {
-    !endpoint.protocol.is_empty()
+    (!endpoint.protocol.is_empty() && !endpoint.protocol.eq_ignore_ascii_case("tcp"))
         || !endpoint.allowed_ips.is_empty()
         || !endpoint.tls.is_empty()
         || endpoint.credential_binding.is_some()
@@ -201,8 +211,8 @@ fn request_pipeline_conflicts(left: &NetworkEndpoint, right: &NetworkEndpoint) -
     push_conflict(
         &mut conflicts,
         "protocol",
-        &left.protocol.to_ascii_lowercase(),
-        &right.protocol.to_ascii_lowercase(),
+        &normalized_request_protocol(&left.protocol),
+        &normalized_request_protocol(&right.protocol),
     );
     push_conflict(
         &mut conflicts,
@@ -298,6 +308,14 @@ fn request_pipeline_conflicts(left: &NetworkEndpoint, right: &NetworkEndpoint) -
         );
     }
     conflicts
+}
+
+fn normalized_request_protocol(protocol: &str) -> String {
+    if protocol.eq_ignore_ascii_case("tcp") {
+        String::new()
+    } else {
+        protocol.to_ascii_lowercase()
+    }
 }
 
 fn websocket_graphql_policy(endpoint: &NetworkEndpoint) -> bool {
@@ -1025,6 +1043,24 @@ mod tests {
         assert_eq!(
             find_endpoint_ambiguities(&policy_with(left, right)).len(),
             1
+        );
+    }
+
+    #[test]
+    fn explicit_tcp_and_omitted_protocol_are_ambiguous_for_native_tcp_eligibility() {
+        let mut explicit_tcp = endpoint("api.example.com", 443);
+        explicit_tcp.protocol = "tcp".to_string();
+        explicit_tcp.tls = "skip".to_string();
+        let mut omitted = endpoint("api.example.com", 443);
+        omitted.tls = "skip".to_string();
+
+        let ambiguities = find_endpoint_ambiguities(&policy_with(explicit_tcp, omitted));
+        assert_eq!(ambiguities.len(), 1);
+        assert!(
+            ambiguities[0]
+                .conflicts
+                .iter()
+                .any(|conflict| conflict.contains("transparent_tcp_eligible"))
         );
     }
 }

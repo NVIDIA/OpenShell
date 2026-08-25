@@ -27,7 +27,7 @@ For gator's PR/issue validation policy, load `gator-gate` inside the launched sa
 | `scripts/agents/gator/Dockerfile` | Gator sandbox image source. Local launches build this image through OpenShell. |
 | `scripts/agents/gator/policy.yaml` | Sandbox policy for the gator agent. |
 | `scripts/agents/gator/bin/gh` | Gator-specific `gh` wrapper and same-SHA duplicate-post guard. |
-| `scripts/agents/gator/bin/review-feedback-ledger` | Builds tree-aware review scope, durable findings, convergence telemetry, and checkpoint state. |
+| `scripts/agents/gator/bin/review-feedback-ledger` | Builds tree-aware review scope, durable findings, convergence telemetry, and review-budget state. |
 | `scripts/agents/gator/bin/validate-review-findings` | Enforces the blocker evidence schema and downgrades unsupported hypotheses. |
 | `scripts/agents/gator/prompts/gator.md` | Rendered top-level prompt template baked into the payload. |
 | `scripts/agents/gator/skills/gator-gate/SKILL.md` | In-sandbox gator state-machine skill. |
@@ -217,7 +217,7 @@ sandbox_name="gator-pr-${pr_number}-supervised"
   --name "$sandbox_name" \
   --watch \
   --background \
-  "Review and monitor PR #${pr_number} through the gator-gate workflow. Scope this invocation only to PR #${pr_number}. The operator explicitly authorizes applying the test:e2e label and posting /ok to test for the current head SHA if gator determines that is required."
+  "Review and monitor PR #${pr_number} through the gator-gate workflow. Scope this invocation only to PR #${pr_number}. The operator explicitly authorizes applying the test:e2e label, posting /ok to test for the current head SHA, and rerunning the relevant current-head workflow when the E2E Label Help bot says that is required."
 ```
 
 ## Model Or Image Experiments

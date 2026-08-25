@@ -11,7 +11,9 @@ OpenShell builds these main artifacts:
 | Artifact | Source |
 |---|---|
 | Gateway binary | `crates/openshell-server` |
-| CLI package and Python SDK | `python/openshell` plus Rust binaries where packaged |
+| CLI binaries and system packages | `crates/openshell-cli` plus release packaging |
+| Python SDK wheel | `python/openshell` |
+| TypeScript SDK package | `sdk/typescript` |
 | Gateway container image | `deploy/docker/Dockerfile.gateway` |
 | Supervisor container image | `deploy/docker/Dockerfile.supervisor` |
 | Helm chart | `deploy/helm/openshell` |
@@ -129,6 +131,27 @@ step via the `rust-native-build.yml` workflow (per-architecture, per-component)
 and uploads the result as an artifact that the image build job downloads back
 into the staging directory before running Buildx.
 
+Gateway and supervisor binaries staged into Release Dev and Release Tag images
+are compiled through `cargo auditable` (pinned in `mise.toml`), which embeds a
+`.dep-v0` section describing the Rust dependencies actually compiled into the
+binary. That section holds data rather than symbols, so it survives the
+workspace's `strip = true` release profile, and Syft can catalog the crates
+present in image binaries instead of inferring them from the source tree. This
+is a different artifact from the source SBOM produced by `syft dir:.` in
+`tasks/sbom.toml`, which describes the checkout, and from an OCI SBOM
+attestation, which remains out of scope.
+
+Only release image builds are auditable. `docker-build.yml` and
+`rust-native-build.yml` take an `auditable` input that defaults to false, so PR
+and E2E image builds and standalone release artifacts remain non-auditable. The
+CI image gains the pinned `cargo-auditable` tool through `mise install --locked`
+but ships no auditable OpenShell binary of its own. Local staging opts in with
+`OPENSHELL_AUDITABLE=1`. sccache's `RUSTC_WRAPPER` is unset only around auditable
+builds, because it would otherwise wrap `cargo-auditable`'s workspace wrapper and
+be misidentified as `rustc`. Auditable builds are verified by scanning the built
+binary with Syft and requiring at least one decoded Cargo package; the check runs
+only for those builds.
+
 Runtime layout:
 
 - **Gateway**: `gcr.io/distroless/cc-debian13:nonroot` base, GNU-linked binary at
@@ -204,14 +227,32 @@ for explicit publication.
 ## Python Wheel Packaging
 
 The generated protobuf/gRPC stubs under `python/openshell/_proto/` are gitignored
-build outputs of `mise run python:proto`. The task uses `uv run --frozen` to
-synchronize the current worktree's `.venv` from `uv.lock` before generation.
-maturin honors `.gitignore` when collecting `python-source` files, so native
-builds (Linux CI, local `pip install .`) would drop them and ship an unimportable
-wheel. `pyproject.toml`
-pins them back in with `[tool.maturin].include` globs. The release workflows
-install each Linux wheel in a clean image and import `openshell.sandbox` as a
-smoke check.
+build outputs of `mise run python:proto`. Setuptools includes them through the
+package-data configuration in `pyproject.toml`. Release workflows build the
+wheel directly and do not produce a source distribution. Setuptools SCM derives
+local versions from Git and accepts the release workflow's computed version
+through its distribution-specific override.
+
+The build produces one platform-independent `py3-none-any` wheel. A verifier
+checks its tag, metadata, version, required package files, and the absence of
+native files or an `openshell` executable entry point. Release workflows build
+the wheel once, install it in a clean virtual environment, import the public
+package modules, and confirm that installation did not create an `openshell`
+command.
+
+## TypeScript SDK Packaging
+
+The native TypeScript SDK in `sdk/typescript` uses Connect over the generated
+OpenShell protobuf surface. `sdk/typescript/buf.gen.yaml` selects the client
+proto closure, and `mise run sdk:ts:proto` generates gitignored sources under
+`src/gen`. TypeScript compilation includes those sources in `dist`, so package
+consumers do not run code generation.
+
+Branch checks run `mise run sdk:ts:ci`, enforce an 80% line-coverage floor, and
+exercise version stamping plus `npm publish --dry-run`. Tagged releases publish
+`@nvidia/openshell-sdk` to GitHub Packages. The repository keeps package version
+`0.0.0`; the release task derives and temporarily stamps the npm version from
+the release tag.
 
 ## CI and E2E
 

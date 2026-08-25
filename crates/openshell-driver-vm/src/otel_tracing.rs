@@ -5,8 +5,8 @@
 
 use http::Request;
 use openshell_otel::{
-    HeaderMapExtractor, OtlpTraceConfig, RecordGrpcFailure, SdkTracerProvider, ServiceName,
-    SetupError,
+    HeaderMapExtractor, OtlpTraceConfig, RecordGrpcFailure, RecordGrpcStatus, SdkTracerProvider,
+    ServiceName, SetupError,
 };
 use opentelemetry::propagation::TextMapPropagator;
 use opentelemetry::trace::TraceContextExt as _;
@@ -21,14 +21,21 @@ const INSTRUMENTATION_SCOPE: &str = "openshell-driver-vm";
 const COMPUTE_DRIVER_SERVICE: &str = "openshell.compute.v1.ComputeDriver";
 
 /// Trace every inbound compute-driver RPC at the tonic service boundary.
-pub fn compute_driver_rpc_layer()
--> TraceLayer<GrpcMakeClassifier, ComputeDriverRpcSpan, (), (), (), (), RecordGrpcFailure> {
+pub fn compute_driver_rpc_layer() -> TraceLayer<
+    GrpcMakeClassifier,
+    ComputeDriverRpcSpan,
+    (),
+    RecordGrpcStatus,
+    (),
+    RecordGrpcStatus,
+    RecordGrpcFailure,
+> {
     TraceLayer::new_for_grpc()
         .make_span_with(ComputeDriverRpcSpan)
         .on_request(())
-        .on_response(())
+        .on_response(RecordGrpcStatus)
         .on_body_chunk(())
-        .on_eos(())
+        .on_eos(RecordGrpcStatus)
         .on_failure(RecordGrpcFailure)
 }
 
@@ -74,6 +81,7 @@ fn compute_driver_rpc_operation(path: &str) -> (&'static str, &'static str) {
         Some("GetSandbox") => ("driver.get_sandbox", "get_sandbox"),
         Some("ListSandboxes") => ("driver.list_sandboxes", "list_sandboxes"),
         Some("StopSandbox") => ("driver.stop_sandbox", "stop_sandbox"),
+        Some("StartSandbox") => ("driver.start_sandbox", "start_sandbox"),
         Some("DeleteSandbox") => ("driver.delete_sandbox", "delete_sandbox"),
         Some("WatchSandboxes") => ("driver.watch_sandboxes", "watch_sandboxes"),
         _ => ("driver.unknown", "unknown"),
@@ -101,59 +109,8 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
-
-    use opentelemetry_proto::tonic::collector::trace::v1::{
-        ExportTraceServiceRequest, ExportTraceServiceResponse,
-        trace_service_server::{TraceService, TraceServiceServer},
-    };
-    use opentelemetry_proto::tonic::trace::v1::Span;
+    use openshell_otel_test_support::OtlpTestServer;
     use tracing_subscriber::layer::SubscriberExt as _;
-
-    #[derive(Default)]
-    struct Received {
-        spans: Vec<Span>,
-        service_names: Vec<String>,
-    }
-
-    #[derive(Clone)]
-    struct Collector {
-        received: Arc<Mutex<Received>>,
-        exported: Arc<tokio::sync::Notify>,
-    }
-
-    #[tonic::async_trait]
-    impl TraceService for Collector {
-        async fn export(
-            &self,
-            request: tonic::Request<ExportTraceServiceRequest>,
-        ) -> Result<tonic::Response<ExportTraceServiceResponse>, tonic::Status> {
-            {
-                let mut received = self.received.lock().unwrap();
-                for resource_span in request.into_inner().resource_spans {
-                    if let Some(resource) = resource_span.resource {
-                        received.service_names.extend(
-                            resource
-                                .attributes
-                                .into_iter()
-                                .filter(|attribute| attribute.key == "service.name")
-                                .filter_map(|attribute| attribute.value)
-                                .filter_map(|value| value.value)
-                                .filter_map(|value| match value {
-                                    opentelemetry_proto::tonic::common::v1::any_value::Value::StringValue(value) => Some(value),
-                                    _ => None,
-                                }),
-                        );
-                    }
-                    for scope_span in resource_span.scope_spans {
-                        received.spans.extend(scope_span.spans);
-                    }
-                }
-            }
-            self.exported.notify_one();
-            Ok(tonic::Response::new(ExportTraceServiceResponse::default()))
-        }
-    }
 
     #[test]
     fn compute_driver_rpc_names_are_explicitly_mapped_and_schema_bounded() {
@@ -177,6 +134,7 @@ mod tests {
             ("GetSandbox", "driver.get_sandbox", "get_sandbox"),
             ("ListSandboxes", "driver.list_sandboxes", "list_sandboxes"),
             ("StopSandbox", "driver.stop_sandbox", "stop_sandbox"),
+            ("StartSandbox", "driver.start_sandbox", "start_sandbox"),
             ("DeleteSandbox", "driver.delete_sandbox", "delete_sandbox"),
             (
                 "WatchSandboxes",
@@ -203,28 +161,9 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn vm_driver_spans_reach_otlp_collector_with_distinct_service_name() {
-        let received = Arc::new(Mutex::new(Received::default()));
-        let exported = Arc::new(tokio::sync::Notify::new());
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let collector = Collector {
-            received: Arc::clone(&received),
-            exported: Arc::clone(&exported),
-        };
-        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
-        let server = tokio::spawn(async move {
-            tonic::transport::Server::builder()
-                .add_service(TraceServiceServer::new(collector))
-                .serve_with_incoming_shutdown(
-                    tokio_stream::wrappers::TcpListenerStream::new(listener),
-                    async {
-                        let _ = shutdown_rx.await;
-                    },
-                )
-                .await
-        });
+        let collector = OtlpTestServer::start().await;
 
-        let (provider, error) = super::provider_for(Some(&format!("http://{address}")));
+        let (provider, error) = super::provider_for(Some(collector.endpoint()));
         assert!(error.is_none(), "valid OTLP endpoint should configure");
         let provider = provider.expect("provider");
         let subscriber = tracing_subscriber::registry().with(super::layer(&provider));
@@ -233,23 +172,11 @@ mod tests {
             drop(span.enter());
             drop(span);
         });
-        let export_completed = exported.notified();
         provider.force_flush().unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(5), export_completed)
-            .await
-            .expect("OTLP export should complete");
+        collector.wait_for_export().await;
         provider.shutdown().unwrap();
+        let received = collector.shutdown().await;
 
-        shutdown_tx
-            .send(())
-            .expect("collector server should be running");
-        tokio::time::timeout(std::time::Duration::from_secs(5), server)
-            .await
-            .expect("collector server shutdown should not deadlock")
-            .expect("collector server task should not panic")
-            .expect("collector server should shut down cleanly");
-
-        let received = received.lock().unwrap();
         received
             .spans
             .iter()
