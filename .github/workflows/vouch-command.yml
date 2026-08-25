@@ -53,6 +53,16 @@ jobs:
               await github.graphql(mutation, { discussionId, body });
             }
 
+            async function closeDiscussion() {
+              const discussionId = await getDiscussionId();
+              const mutation = `mutation($discussionId: ID!) {
+                closeDiscussion(input: {discussionId: $discussionId}) {
+                  discussion { id }
+                }
+              }`;
+              await github.graphql(mutation, { discussionId });
+            }
+
             // --- Authorization ---
 
             let isMaintainer = false;
@@ -134,6 +144,7 @@ jobs:
               await postDiscussionComment(
                 `@${discussionAuthor} is already vouched. They can submit pull requests.`
               );
+              await closeDiscussion();
               return;
             }
 
@@ -185,4 +196,6 @@ jobs:
               'Please read [CONTRIBUTING.md](https://github.com/NVIDIA/OpenShell/blob/main/CONTRIBUTING.md) before submitting.',
             ].join('\n'));
 
-            console.log(`Vouched ${discussionAuthor} (approved by ${commenter}).`);
+            await closeDiscussion();
+
+            console.log(`Vouched ${discussionAuthor} (approved by ${commenter}) and closed the discussion.`);
