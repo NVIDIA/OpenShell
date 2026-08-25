@@ -213,6 +213,8 @@ The output shows the chunk ID, status, rationale, binary, endpoint summary, prov
 Endpoints: api.github.com:443 [L7 rest, allow PUT /repos/NVIDIA/OpenShell/contents/docs/**]
 ```
 
+The terminal UI flags proposals that are broader than the request that was denied. In the detail popup, `openshell term` shows a warning under any endpoint that is L4, that is REST with no allow rules, or whose allow rule leaves the method or path unset. Protocols other than REST scope on `command`, so they are not flagged.
+
 Approve only when the structured rule matches the access you intend to grant:
 
 ```shell
