@@ -362,32 +362,46 @@ pub async fn run_sandbox(
         let mediation_ready = Arc::new(AtomicBool::new(false));
         let ca_file_paths = Arc::new(std::sync::Mutex::new(None));
         let proxy_bind_ip = Arc::new(std::sync::Mutex::new(None));
-        let backend = Arc::new(inpod::InPodBackend::new(inpod::InPodConfig {
-            require_exclusive_pid_namespace: true,
-            network_enabled,
-            process_enabled,
-            entrypoint_pid: entrypoint_pid.clone(),
-            provider_credentials: provider_credentials.clone(),
-            provider_env: std::sync::Mutex::new(provider_env),
-            process_enforcement_mode,
-            resolved_process_identity,
-            agent_proposals: agent_proposals.clone(),
-            openshell_endpoint: openshell_endpoint_for_proxy.clone(),
-            ssh_socket_path,
-            #[cfg(target_os = "linux")]
-            bypass_denial_tx: std::sync::Mutex::new(bypass_denial_tx),
-            #[cfg(target_os = "linux")]
-            bypass_activity_tx: std::sync::Mutex::new(bypass_activity_tx),
-            mediation_ready: mediation_ready.clone(),
-            ca_file_paths: ca_file_paths.clone(),
-            proxy_bind_ip: proxy_bind_ip.clone(),
-        }));
+        let admitted_backend_name = descriptor.backend_name.clone();
+        let backend: Arc<dyn openshell_isolation::contract::IsolationBackend> =
+            match admitted_backend_name.as_str() {
+                inpod::IN_POD_BACKEND_NAME => {
+                    Arc::new(inpod::InPodBackend::new(inpod::InPodConfig {
+                        require_exclusive_pid_namespace: true,
+                        network_enabled,
+                        process_enabled,
+                        entrypoint_pid: entrypoint_pid.clone(),
+                        provider_credentials: provider_credentials.clone(),
+                        provider_env: std::sync::Mutex::new(provider_env),
+                        process_enforcement_mode,
+                        resolved_process_identity,
+                        agent_proposals: agent_proposals.clone(),
+                        openshell_endpoint: openshell_endpoint_for_proxy.clone(),
+                        ssh_socket_path,
+                        #[cfg(target_os = "linux")]
+                        bypass_denial_tx: std::sync::Mutex::new(bypass_denial_tx),
+                        #[cfg(target_os = "linux")]
+                        bypass_activity_tx: std::sync::Mutex::new(bypass_activity_tx),
+                        mediation_ready: mediation_ready.clone(),
+                        ca_file_paths: ca_file_paths.clone(),
+                        proxy_bind_ip: proxy_bind_ip.clone(),
+                    }))
+                }
+                openshell_driver_firecracker::BACKEND_NAME => {
+                    Arc::new(openshell_driver_firecracker::FirecrackerHostBackend)
+                }
+                other => {
+                    return Err(miette::miette!(
+                        "unsupported admitted isolation backend {other:?}"
+                    ));
+                }
+            };
         let mut registry = openshell_isolation::contract::BackendRegistry::new();
         registry
             .register(backend)
             .map_err(|error| miette::miette!(error.to_string()))?;
         let (backend, verified) = registry
-            .resolve(descriptor, inpod::IN_POD_BACKEND_NAME)
+            .resolve(descriptor, &admitted_backend_name)
             .map_err(|error| miette::miette!(error.to_string()))?;
         let context = openshell_isolation::contract::SandboxContext {
             sandbox_id: sandbox_id.clone().unwrap_or_default(),
@@ -565,14 +579,15 @@ pub async fn run_sandbox(
         drop(running);
         drop(networking);
 
-        // This admitted topology exclusively owns its PID namespace and the
+        // The in-pod topology exclusively owns its PID namespace and the
         // supervisor is PID 1. Exiting namespace init is the kernel's
-        // race-free whole-boundary teardown: no workload descendant can
-        // escape it by changing process group or forking during cleanup.
+        // race-free whole-boundary teardown. Delegated backends, including
+        // Firecracker, own their boundary teardown and return normally.
         #[cfg(target_os = "linux")]
-        std::process::exit(result?);
+        if admitted_backend_name == inpod::IN_POD_BACKEND_NAME {
+            std::process::exit(result?);
+        }
 
-        #[cfg(not(target_os = "linux"))]
         return result;
     }
 

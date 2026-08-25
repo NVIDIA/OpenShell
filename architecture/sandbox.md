@@ -70,6 +70,14 @@ by default. The co-located backend requires the
 supervisor to own the execution environment's PID namespace so boundary
 teardown can terminate every remaining workload process.
 
+The experimental Firecracker backend exercises a delegated placement. The
+logical supervisor stays on the host and sends the admitted policy and workload
+spec over an authenticated, backend-private virtio-vsock channel only after the
+RFC lifecycle reaches `start_agent`. A private guest mode of the Firecracker
+driver invokes the existing process-supervisor implementation as the in-VM
+leaf. The prototype attaches no guest NIC, so network access is blocked by the
+VM topology while mediated egress remains unimplemented.
+
 For proxy-mode boundaries, the co-located backend verifies its default-deny
 kernel egress ceiling before exposing any workload execution surface and then
 rechecks it every 250 milliseconds. Each check has a two-second deadline.

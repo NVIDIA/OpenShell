@@ -184,6 +184,31 @@ For source checkout development, restart the local gateway with:
 mise run gateway:docker
 ```
 
+For the experimental host-supervised Firecracker path, use:
+
+```bash
+mise run gateway:firecracker
+```
+
+This task requires Linux, read/write `/dev/kvm`, `debugfs`, and the Firecracker,
+kernel, and ext4 fixtures documented under `e2e/firecracker/`. It starts an
+operator-managed `firecracker` compute-driver socket and a plaintext gateway.
+The driver log defaults below `/tmp/openshell-firecracker-<user>-<gateway>/`.
+The prototype creates no TAP device or guest NIC and needs neither `sudo` nor
+`CAP_NET_ADMIN`.
+
+If an older checkout fails while compiling `z3-sys` or another bindgen consumer
+with `fatal error: 'stdbool.h' file not found`, set the GCC architecture header
+path before retrying:
+
+```bash
+export BINDGEN_EXTRA_CLANG_ARGS="${BINDGEN_EXTRA_CLANG_ARGS:+${BINDGEN_EXTRA_CLANG_ARGS} }-isystem $(gcc -print-file-name=include)"
+mise run gateway:firecracker
+```
+
+The current Firecracker gateway task applies this fallback automatically after
+its optional `sg kvm` re-exec.
+
 ### Step 5: Check Podman-Backed Gateways
 
 ```bash
@@ -428,6 +453,14 @@ Use the VM driver logs and host diagnostics available in the user's environment.
 - The runtime rootfs exists and matches the expected architecture.
 - Host virtualization support is enabled.
 - The sandbox supervisor can establish its callback connection to the gateway.
+
+For Firecracker, also verify the configured external socket and driver log:
+
+```bash
+rg -n 'firecracker|socket_path' .cache/gateway-firecracker/gateway.toml
+stat /tmp/openshell-firecracker-*/compute-driver.sock
+tail -n 200 /tmp/openshell-firecracker-*/driver.log
+```
 
 Then run:
 
