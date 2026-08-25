@@ -152,7 +152,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
             }
             if let Some(reason) = rejection_guidance(chunk) {
                 spans.push(Span::styled(
-                    format!("  \"{}\"", truncate_str(reason, 32)),
+                    format!("  \"{}\"", truncate_display(reason, 32)),
                     t.muted,
                 ));
             }
@@ -285,10 +285,10 @@ pub fn draw_detail_popup(
         format_short_time(chunk.first_seen_ms),
         format_short_time(chunk.last_seen_ms),
     );
-    let denied_width = denied_label.chars().count()
-        + denied_count.chars().count()
+    let denied_width = display_width(denied_label)
+        + display_width(&denied_count)
         + 2
-        + denied_seen.chars().count();
+        + display_width(&denied_seen);
     if denied_width <= text_width {
         lines.push(Line::from(vec![
             Span::styled(denied_label, t.muted),
@@ -306,7 +306,7 @@ pub fn draw_detail_popup(
         );
         push_wrapped(
             &mut lines,
-            &" ".repeat(denied_label.chars().count()),
+            &" ".repeat(display_width(denied_label)),
             t.muted,
             &denied_seen,
             t.muted,
@@ -548,9 +548,19 @@ fn truncate_str(s: &str, max_len: usize) -> String {
     }
 }
 
-/// Word-wrap `text` into rows of at most `width` columns.
+/// Terminal display width of `text` in columns.
 ///
-/// A word longer than `width` is hard-broken rather than allowed to overflow.
+/// Uses the same measurement ratatui applies when it lays cells out, so a
+/// double-width glyph such as CJK counts as the two columns it will occupy.
+/// Counting `chars` here instead would let CJK text render past the popup edge
+/// with no way to scroll to the missing tail.
+fn display_width(text: &str) -> usize {
+    Span::raw(text).width()
+}
+
+/// Word-wrap `text` into rows of at most `width` display columns.
+///
+/// A word wider than `width` is hard-broken rather than allowed to overflow.
 /// Always returns at least one row so callers can index the first row safely.
 fn wrap_value(text: &str, width: usize) -> Vec<String> {
     if width == 0 {
@@ -558,44 +568,73 @@ fn wrap_value(text: &str, width: usize) -> Vec<String> {
     }
     let mut rows: Vec<String> = Vec::new();
     let mut cur = String::new();
-    let mut cur_len = 0usize;
+    let mut cur_width = 0usize;
+    let mut buf = [0u8; 4];
     for word in text.split_whitespace() {
-        let word_len = word.chars().count();
-        if word_len > width {
-            if cur_len > 0 {
+        let word_width = display_width(word);
+        if word_width > width {
+            if cur_width > 0 {
                 rows.push(std::mem::take(&mut cur));
-                cur_len = 0;
+                cur_width = 0;
             }
             for ch in word.chars() {
-                if cur_len == width {
+                let ch_width = display_width(ch.encode_utf8(&mut buf));
+                if cur_width + ch_width > width && cur_width > 0 {
                     rows.push(std::mem::take(&mut cur));
-                    cur_len = 0;
+                    cur_width = 0;
                 }
                 cur.push(ch);
-                cur_len += 1;
+                cur_width += ch_width;
             }
             continue;
         }
-        let needed = if cur_len == 0 {
-            word_len
+        let needed = if cur_width == 0 {
+            word_width
         } else {
-            cur_len + 1 + word_len
+            cur_width + 1 + word_width
         };
         if needed > width {
             rows.push(std::mem::take(&mut cur));
-            cur_len = 0;
+            cur_width = 0;
         }
-        if cur_len > 0 {
+        if cur_width > 0 {
             cur.push(' ');
-            cur_len += 1;
+            cur_width += 1;
         }
         cur.push_str(word);
-        cur_len += word_len;
+        cur_width += word_width;
     }
-    if cur_len > 0 || rows.is_empty() {
+    if cur_width > 0 || rows.is_empty() {
         rows.push(cur);
     }
     rows
+}
+
+/// Truncate `text` to `max_columns` display columns, appending `...` when cut.
+///
+/// `truncate_str` counts chars, which is right for its existing callers but
+/// would let a CJK value take twice its budget on the list row.
+fn truncate_display(text: &str, max_columns: usize) -> String {
+    if display_width(text) <= max_columns {
+        return text.to_string();
+    }
+    if max_columns <= 3 {
+        return ".".repeat(max_columns);
+    }
+    let budget = max_columns - 3;
+    let mut out = String::new();
+    let mut width = 0usize;
+    let mut buf = [0u8; 4];
+    for ch in text.chars() {
+        let ch_width = display_width(ch.encode_utf8(&mut buf));
+        if width + ch_width > budget {
+            break;
+        }
+        out.push(ch);
+        width += ch_width;
+    }
+    out.push_str("...");
+    out
 }
 
 /// Push `text` wrapped to `width`, with `prefix` on the first row and a matching
@@ -608,7 +647,7 @@ fn push_wrapped(
     text_style: Style,
     width: usize,
 ) {
-    let indent = prefix.chars().count();
+    let indent = display_width(prefix);
     let available = width.saturating_sub(indent).max(1);
     for (i, row) in wrap_value(text, available).into_iter().enumerate() {
         let head = if i == 0 {
@@ -633,7 +672,7 @@ fn hint_units(chunk: &PolicyChunk, t: &crate::theme::Theme, scrollable: bool) ->
                     Span::styled(key.to_string(), key_style),
                     Span::styled(label.to_string(), label_style),
                 ],
-                key.chars().count() + label.chars().count(),
+                display_width(key) + display_width(label),
             ));
         };
         match chunk.status.as_str() {
@@ -940,6 +979,25 @@ mod tests {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
+    /// Column width computed independently of the production `display_width`.
+    ///
+    /// Asserting with the helper under test would be tautological: if it
+    /// regressed to counting chars, the assertion would regress with it.
+    fn expected_columns(text: &str) -> usize {
+        text.chars()
+            .map(|c| {
+                let wide = ('\u{1100}'..='\u{115f}').contains(&c)
+                    || ('\u{2e80}'..='\u{a4cf}').contains(&c)
+                    || ('\u{ac00}'..='\u{d7a3}').contains(&c)
+                    || ('\u{f900}'..='\u{faff}').contains(&c)
+                    || ('\u{fe30}'..='\u{fe6f}').contains(&c)
+                    || ('\u{ff00}'..='\u{ff60}').contains(&c)
+                    || ('\u{ffe0}'..='\u{ffe6}').contains(&c);
+                usize::from(wide) + 1
+            })
+            .sum()
+    }
+
     fn make_chunk(status: &str, rejection_reason: &str) -> PolicyChunk {
         PolicyChunk {
             status: status.to_string(),
@@ -985,8 +1043,8 @@ mod tests {
     #[test]
     fn long_reason_truncates_for_the_list_row() {
         let reason = "rejected because the endpoint list is far too permissive";
-        let shown = truncate_str(reason, 32);
-        assert_eq!(shown.chars().count(), 32);
+        let shown = truncate_display(reason, 32);
+        assert_eq!(display_width(&shown), 32);
         assert!(shown.ends_with("..."));
         assert!(shown.starts_with("rejected because"));
     }
@@ -1020,8 +1078,45 @@ mod tests {
     fn wrap_value_never_exceeds_the_width() {
         let text = "reject this rule because the endpoint list is far too permissive";
         for row in wrap_value(text, 17) {
-            assert!(row.chars().count() <= 17, "row too wide: {row:?}");
+            assert!(display_width(&row) <= 17, "row too wide: {row:?}");
         }
+    }
+
+    #[test]
+    fn wrap_value_measures_display_columns_not_chars() {
+        // CJK glyphs occupy two columns each, and with no spaces the whole
+        // string takes the hard-break path.
+        let cjk = "这条规则的范围太广".repeat(20);
+        for row in wrap_value(&cjk, 40) {
+            assert!(
+                expected_columns(&row) <= 40,
+                "row is {} columns: {row:?}",
+                expected_columns(&row)
+            );
+        }
+
+        // Mixed script exercises the word-packing path instead.
+        let mixed = "scope 这条规则 to docs 路径 only ".repeat(20);
+        for row in wrap_value(&mixed, 33) {
+            assert!(
+                expected_columns(&row) <= 33,
+                "row is {} columns: {row:?}",
+                expected_columns(&row)
+            );
+        }
+    }
+
+    #[test]
+    fn truncate_display_counts_columns_not_chars() {
+        let cjk = "这条规则的范围太广".repeat(10);
+        let shown = truncate_display(&cjk, 32);
+        assert!(
+            expected_columns(&shown) <= 32,
+            "truncated value is {} columns",
+            expected_columns(&shown)
+        );
+        assert!(shown.ends_with("..."));
+        assert_eq!(truncate_display("too broad", 32), "too broad");
     }
 
     // --- rendering --------------------------------------------------------
@@ -1142,6 +1237,44 @@ mod tests {
         let (bottom, _) = render(&chunk, 80, 24, max_scroll);
         assert!(bottom.contains("SUFFIX_MARKER"));
         assert!(bottom.contains("Close"));
+    }
+
+    /// Double-width guidance must stay reachable too. Counting chars rather than
+    /// columns made every wrapped row about twice as wide as the popup, so the
+    /// right half of each row was clipped with nowhere to scroll. Markers are
+    /// interleaved through the text rather than appended, because a trailing
+    /// marker lands on its own short row either way and would not detect this.
+    #[test]
+    fn cjk_guidance_is_fully_reachable_at_80x24() {
+        use std::fmt::Write as _;
+
+        const MARKERS: usize = 16;
+        let mut reason = String::new();
+        for i in 0..MARKERS {
+            let _ = write!(reason, "M{i:02}");
+            reason.push_str(&"这条规则范围太广".repeat(4));
+        }
+        let chunk = PolicyChunk {
+            status: "rejected".to_string(),
+            rejection_reason: reason,
+            rule_name: "allow-github".to_string(),
+            ..Default::default()
+        };
+
+        let (_, max_scroll) = render(&chunk, 80, 24, 0);
+        assert!(max_scroll > 0, "content should overflow an 80x24 popup");
+
+        let mut seen = String::new();
+        for scroll in 0..=max_scroll {
+            seen.push_str(&render(&chunk, 80, 24, scroll).0);
+        }
+        for i in 0..MARKERS {
+            let marker = format!("M{i:02}");
+            assert!(
+                seen.contains(&marker),
+                "guidance marker {marker} was clipped and is unreachable at every scroll offset"
+            );
+        }
     }
 
     #[test]
