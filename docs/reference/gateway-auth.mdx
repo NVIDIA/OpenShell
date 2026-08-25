@@ -127,7 +127,8 @@ authentication directly. Configure the service account at the identity provider
 with the audience, roles, scopes, and workspace membership required by the
 gateway. The SDKs discover the token endpoint, attach the bearer token to each
 RPC, and repeat the grant before expiry. They keep the client secret and access
-token in memory and do not update the CLI's `oidc_token.json`.
+token in memory and do not update the CLI's `oidc_token.json`. SDK clients
+require TLS when sending these credentials to a non-loopback gateway.
 
 <Tabs>
   <Tab title="Python">

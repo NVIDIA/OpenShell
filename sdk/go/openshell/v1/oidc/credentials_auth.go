@@ -47,7 +47,7 @@ func (a *clientCredentialsAuth) GetRequestMetadata(ctx context.Context, _ ...str
 	result := a.group.DoChan("exchange", func() (any, error) {
 		exchangeCtx, cancel := context.WithTimeout(context.Background(), a.cfg.timeout)
 		defer cancel()
-		token, err := exchangeClientCredentials(exchangeCtx, a.cfg)
+		token, err := exchangeClientCredentials(exchangeCtx, a.cfg, true)
 		if err != nil {
 			return nil, err
 		}

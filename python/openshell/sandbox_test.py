@@ -1565,6 +1565,68 @@ def test_from_active_cluster_fills_client_credentials_from_metadata(
         client.close()
 
 
+def test_sandbox_client_rejects_client_credentials_on_remote_plaintext(
+    monkeypatch: Any,
+) -> None:
+    channel_opened = False
+
+    def insecure_channel(_endpoint: str) -> Any:
+        nonlocal channel_opened
+        channel_opened = True
+        raise AssertionError("plaintext channel must not be opened")
+
+    monkeypatch.setattr(sandbox_module.grpc, "insecure_channel", insecure_channel)
+    auth = ClientCredentialsAuth(
+        issuer="https://issuer.example.com",
+        client_id="client",
+        client_secret="secret",
+    )
+    with pytest.raises(SandboxError, match="require TLS"):
+        SandboxClient("gateway.example.com:50051", client_credentials=auth)
+    assert not channel_opened
+
+
+@pytest.mark.parametrize(
+    "endpoint",
+    ["localhost:50051", "127.42.0.1:50051", "[::1]:50051"],
+)
+def test_sandbox_client_allows_client_credentials_on_plaintext_loopback(
+    endpoint: str,
+) -> None:
+    auth = ClientCredentialsAuth(
+        issuer="https://issuer.example.com",
+        client_id="client",
+        client_secret="secret",
+    )
+    client = SandboxClient(endpoint, client_credentials=auth)
+    client.close()
+
+
+def test_from_active_cluster_rejects_client_credentials_on_remote_plaintext(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    gateway_dir = _setup_gateway_dir(
+        tmp_path,
+        monkeypatch,
+        endpoint="http://gateway.example.com:8080",
+        auth_mode="oidc",
+    )
+    metadata_path = gateway_dir / "metadata.json"
+    metadata = json.loads(metadata_path.read_text())
+    metadata.update(
+        {
+            "oidc_issuer": "https://issuer.example.com",
+            "oidc_client_id": "service-client",
+        }
+    )
+    metadata_path.write_text(json.dumps(metadata))
+
+    auth = ClientCredentialsAuth(client_secret="secret")
+    with pytest.raises(SandboxError, match="require TLS"):
+        SandboxClient.from_active_cluster(client_credentials=auth)
+
+
 def test_sandbox_client_rejects_ambiguous_bearer_configuration() -> None:
     auth = ClientCredentialsAuth(
         issuer="https://issuer.example.com",

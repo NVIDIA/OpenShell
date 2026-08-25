@@ -193,8 +193,9 @@ Python and Go SDK client-credentials providers can use the same registered
 issuer, client ID, audience, and scope metadata; the TypeScript provider accepts
 those fields explicitly. All three own a separate in-memory lifecycle, repeat
 the grant before expiry, and never persist the client secret or acquired access
-token into the CLI token cache. This keeps non-interactive SDK authentication
-independent from refresh-token rotation and shared disk state.
+token into the CLI token cache. They require TLS when sending renewable bearer
+credentials to non-loopback gateways. This keeps non-interactive SDK
+authentication independent from refresh-token rotation and shared disk state.
 
 Gateway health and user authentication are separate probes. `OpenShell.Health`
 remains unauthenticated so deployment and load-balancer health checks do not

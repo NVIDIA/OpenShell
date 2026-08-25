@@ -130,6 +130,22 @@ def _normalize_bearer(
     return lambda: token
 
 
+def _is_loopback_host(hostname: str | None) -> bool:
+    if hostname is None:
+        return False
+    if hostname.lower() == "localhost":
+        return True
+    with contextlib.suppress(ValueError):
+        return ipaddress.ip_address(hostname).is_loopback
+    return False
+
+
+def _is_local_grpc_endpoint(endpoint: str) -> bool:
+    if endpoint.startswith("unix:"):
+        return True
+    return _is_loopback_host(urlparse(f"//{endpoint}").hostname)
+
+
 def _validate_oauth_url(name: str, raw: str) -> str:
     """Validate an OAuth endpoint without reflecting attacker-controlled URLs."""
     parsed = urlparse(raw)
@@ -139,11 +155,7 @@ def _validate_oauth_url(name: str, raw: str) -> str:
         raise SandboxError(f"OAuth {name} URL must not contain a fragment")
     if parsed.scheme == "https":
         return raw
-    loopback = parsed.hostname.lower() == "localhost"
-    if not loopback:
-        with contextlib.suppress(ValueError):
-            loopback = ipaddress.ip_address(parsed.hostname).is_loopback
-    if parsed.scheme == "http" and loopback:
+    if parsed.scheme == "http" and _is_loopback_host(parsed.hostname):
         return raw
     raise SandboxError(
         f"OAuth {name} URL must use HTTPS (HTTP is allowed only for loopback hosts)"
@@ -510,7 +522,8 @@ class SandboxClient:
                 the gateway uses mTLS for transport identity and OIDC
                 for user identity.
             client_credentials: renewable OAuth client-credentials provider.
-                Mutually exclusive with `bearer_token`.
+                Mutually exclusive with `bearer_token`. A non-loopback endpoint
+                requires `tls` so the acquired bearer is never sent in cleartext.
             timeout: default per-call timeout in seconds.
             cluster_name: optional friendly name for error messages.
             _bearer_close: internal — wired by `from_active_cluster`
@@ -523,6 +536,14 @@ class SandboxClient:
         if bearer_token is not None and client_credentials is not None:
             raise SandboxError(
                 "bearer_token and client_credentials are mutually exclusive"
+            )
+        if (
+            client_credentials is not None
+            and tls is None
+            and not _is_local_grpc_endpoint(endpoint)
+        ):
+            raise SandboxError(
+                "OAuth client credentials require TLS for non-loopback gateway endpoints"
             )
         self._endpoint = endpoint
         self._timeout = timeout
@@ -592,7 +613,7 @@ class SandboxClient:
             client_credentials: renewable OAuth client-credentials provider.
                 Omitted issuer, client ID, audience, and scopes are filled from
                 the registered gateway metadata. This provider does not read or
-                write `oidc_token.json`.
+                write `oidc_token.json`. Remote plaintext gateways are rejected.
         """
         cluster_name = cluster or _resolve_active_cluster()
         gateway_dir = _xdg_config_home() / "openshell" / "gateways" / cluster_name
@@ -638,7 +659,6 @@ class SandboxClient:
                     f"gateway '{cluster_name}' is not configured for OIDC"
                 )
             client_credentials._apply_gateway_metadata(metadata, insecure=insecure)
-            bearer_token = client_credentials
         elif metadata.get("auth_mode") == "oidc":
             bearer_token, bearer_close = _make_cluster_bearer_provider(
                 gateway_dir,
@@ -652,6 +672,7 @@ class SandboxClient:
             endpoint,
             tls=tls,
             bearer_token=bearer_token,
+            client_credentials=client_credentials,
             timeout=timeout,
             cluster_name=cluster_name,
             _bearer_close=bearer_close,

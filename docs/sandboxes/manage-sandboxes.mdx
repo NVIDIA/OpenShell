@@ -269,7 +269,7 @@ with SandboxClient.from_active_cluster() as client:
 
 For non-interactive automation, pass a renewable client-credentials provider.
 Omitted issuer, client ID, audience, and scopes are read from the active
-gateway's metadata:
+gateway's metadata. The client requires TLS for non-loopback gateways:
 
 ```python
 from openshell import ClientCredentialsAuth, SandboxClient

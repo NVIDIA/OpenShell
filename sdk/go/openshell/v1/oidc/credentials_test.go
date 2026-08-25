@@ -105,6 +105,39 @@ func TestClientCredentialsRejectsInvalidExpiryConformance(t *testing.T) {
 	}
 }
 
+func TestClientCredentialsMissingExpiryCompatibility(t *testing.T) {
+	resetDiscoveryCache()
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/.well-known/openid-configuration" {
+			_ = json.NewEncoder(w).Encode(map[string]string{
+				"issuer":                 server.URL,
+				"authorization_endpoint": server.URL + "/authorize",
+				"token_endpoint":         server.URL + "/token",
+			})
+			return
+		}
+		_, _ = w.Write([]byte(`{"access_token":"token","token_type":"Bearer"}`))
+	}))
+	t.Cleanup(server.Close)
+
+	opts := []LoginOption{
+		WithIssuer(server.URL),
+		WithClientID("client"),
+		WithClientSecret("secret"),
+	}
+	token, err := ClientCredentials(context.Background(), opts...)
+	require.NoError(t, err)
+	assert.True(t, token.Expiry.IsZero())
+
+	auth, err := NewClientCredentialsAuth(opts...)
+	require.NoError(t, err)
+	metadata, err := auth.GetRequestMetadata(context.Background())
+	require.Error(t, err)
+	assert.Nil(t, metadata)
+	assert.Contains(t, err.Error(), "positive expires_in")
+}
+
 func TestClientCredentialsRefusesRedirectsConformance(t *testing.T) {
 	fixture := loadClientCredentialsFixture(t)
 	for _, status := range fixture.Discovery.RedirectStatuses {

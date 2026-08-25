@@ -32,7 +32,7 @@ func ClientCredentials(ctx context.Context, opts ...LoginOption) (*oauth2.Token,
 	if err != nil {
 		return nil, err
 	}
-	return exchangeClientCredentials(ctx, cfg)
+	return exchangeClientCredentials(ctx, cfg, false)
 }
 
 func resolveClientCredentialsConfig(opts ...LoginOption) (*loginConfig, error) {
@@ -89,7 +89,7 @@ func resolveClientCredentialsConfig(opts ...LoginOption) (*loginConfig, error) {
 	return cfg, nil
 }
 
-func exchangeClientCredentials(ctx context.Context, cfg *loginConfig) (*oauth2.Token, error) {
+func exchangeClientCredentials(ctx context.Context, cfg *loginConfig, requirePositiveExpiry bool) (*oauth2.Token, error) {
 	secret := cfg.clientSecret
 	if cfg.secretProvider != nil {
 		value, err := cfg.secretProvider(ctx)
@@ -153,6 +153,10 @@ func exchangeClientCredentials(ctx context.Context, cfg *loginConfig) (*oauth2.T
 	if err := json.Unmarshal(body, &tokResp); err != nil {
 		return nil, fmt.Errorf("%w: invalid token response JSON", ErrClientCredentials)
 	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(body, &fields); err != nil {
+		return nil, fmt.Errorf("%w: invalid token response JSON", ErrClientCredentials)
+	}
 
 	if resp.StatusCode != http.StatusOK || tokResp.Error != "" {
 		return nil, fmt.Errorf("%w: provider rejected the exchange (HTTP %d)", ErrClientCredentials, resp.StatusCode)
@@ -167,8 +171,15 @@ func exchangeClientCredentials(ctx context.Context, cfg *loginConfig) (*oauth2.T
 		RefreshToken: tokResp.RefreshToken,
 		TokenType:    tokResp.TokenType,
 	}
-	if tokResp.ExpiresIn <= 0 {
+	_, expiresInPresent := fields["expires_in"]
+	if expiresInPresent && tokResp.ExpiresIn <= 0 {
 		return nil, fmt.Errorf("%w: token response requires a positive expires_in", ErrClientCredentials)
+	}
+	if !expiresInPresent {
+		if requirePositiveExpiry {
+			return nil, fmt.Errorf("%w: token response requires a positive expires_in", ErrClientCredentials)
+		}
+		return tok, nil
 	}
 	tok.Expiry = time.Now().Add(time.Duration(tokResp.ExpiresIn) * time.Second)
 
