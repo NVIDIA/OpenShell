@@ -158,6 +158,7 @@ Runtime-specific implementation notes belong in the driver crate README:
 - `crates/openshell-driver-podman/README.md`
 - `crates/openshell-driver-kubernetes/README.md`
 - `crates/openshell-driver-vm/README.md`
+- `crates/openshell-driver-firecracker/README.md`
 
 The combined VM topology runs `openshell-sandbox` as guest PID 1. libkrun
 executes the driver-owned guest bootstrap as PID 1, and the bootstrap preserves

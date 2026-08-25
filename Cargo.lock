@@ -3921,6 +3921,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "openshell-driver-firecracker"
+version = "0.0.0"
+dependencies = [
+ "async-trait",
+ "clap",
+ "libc",
+ "nix 0.29.0",
+ "openshell-core",
+ "openshell-isolation",
+ "openshell-supervisor-process",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
 name = "openshell-driver-kubernetes"
 version = "0.0.0"
 dependencies = [

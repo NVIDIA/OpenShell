@@ -155,6 +155,10 @@ run = "e2e/rust/e2e-kubernetes.sh"
 description = "Start openshell-gateway with the VM compute driver and run VM e2e tests"
 run = "e2e/rust/e2e-vm.sh"
 
+["e2e:firecracker"]
+description = "Boot Firecracker and run the host-supervised RFC 0012 lifecycle smoke test"
+run = "e2e/firecracker/smoke.sh"
+
 ["e2e:docker"]
 description = "Run smoke e2e against a standalone gateway with the Docker compute driver"
 run = "e2e/rust/e2e-docker.sh"
