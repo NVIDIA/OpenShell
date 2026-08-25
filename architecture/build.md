@@ -58,16 +58,14 @@ HTTP/TLS support behind explicit build features, so default system-Z3 builds do
 not reintroduce bundled Mozilla roots. Release builds that need bundled Z3
 continue to opt in with `bundled-z3`.
 
-A feature opt-in adds a capability; removing a feature to disable something is a
-build mode, not the absence of a feature flag. Document it as such rather than
-creating a mirror feature just to name the absence. When a feature is meant to
-exclude a dependency, verify the crate is physically absent from the dependency
-graph — not just disabled at the call site. Use `cargo tree -e features -p
-<crate>` to confirm the excluded crate does not appear through a transitive path.
-A common source of leaks is crates that enable `rustls-tls` or similar features
-by default in their own `[features]` table. Verify the exclusion holds in CI with
-a `mise` task that builds without the feature and checks `cargo tree` output; a
-compile-time guard alone does not catch a transitive re-introduction.
+When a feature is meant to exclude a dependency, verify the crate is
+physically absent from the dependency graph — not just disabled at the call
+site. Use `cargo tree -e features -p <crate>` to confirm the excluded crate
+does not appear through a transitive path. A common source of leaks is crates
+that enable `rustls-tls` or similar features by default in their own
+`[features]` table. Verify the exclusion holds in CI with a `mise` task that
+builds without the feature and checks `cargo tree` output; a compile-time
+guard alone does not catch a transitive re-introduction.
 
 ## Linux Runtime Environments
 
