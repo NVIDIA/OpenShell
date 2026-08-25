@@ -3,6 +3,7 @@
 
 use std::collections::HashMap;
 use std::pin::Pin;
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -666,9 +667,23 @@ async fn expected_transport_close_during_session_teardown(
     let session_no_longer_current = !state
         .supervisor_sessions
         .is_current_session(sandbox_id, session_id);
+    expected_transport_close_during_session_state(
+        status,
+        state.gateway_shutting_down.load(Ordering::Acquire),
+        session_no_longer_current,
+        sandbox_is_terminating_or_gone(state, sandbox_id).await,
+    )
+}
+
+fn expected_transport_close_during_session_state(
+    status: &Status,
+    gateway_shutting_down: bool,
+    session_no_longer_current: bool,
+    sandbox_terminating_or_gone: bool,
+) -> bool {
     expected_transport_close_during_shutdown(
         status,
-        session_no_longer_current || sandbox_is_terminating_or_gone(state, sandbox_id).await,
+        gateway_shutting_down || session_no_longer_current || sandbox_terminating_or_gone,
     )
 }
 
@@ -1445,6 +1460,16 @@ mod tests {
         let status = Status::internal("policy evaluation failed");
 
         assert!(!expected_transport_close_during_shutdown(&status, true));
+    }
+
+    #[test]
+    fn gateway_shutdown_makes_session_transport_close_nonfatal() {
+        let status =
+            Status::unknown("h2 protocol error: error reading a body from connection: broken pipe");
+
+        assert!(expected_transport_close_during_session_state(
+            &status, true, false, false,
+        ));
     }
 
     #[test]
