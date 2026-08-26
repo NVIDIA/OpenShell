@@ -983,9 +983,12 @@ impl VmDriver {
             .is_some();
         let driver_config =
             VmSandboxDriverConfig::from_sandbox(&sandbox).map_err(Status::invalid_argument)?;
+        let driver_config_had_rootfs_tar = driver_config.rootfs_tar_path.is_some();
         let rootfs_tar_path = match driver_config.rootfs_tar_path {
-            Some(raw) => Some(self.validate_rootfs_tar_path(Path::new(&raw)).await?),
-            None => None,
+            Some(raw) if overlay_preparation == OverlayPreparation::Fresh => {
+                Some(self.validate_rootfs_tar_path(Path::new(&raw)).await?)
+            }
+            Some(_) | None => None,
         };
 
         self.publish_platform_event(
@@ -998,9 +1001,32 @@ impl VmDriver {
             ),
         );
 
-        let image_plan = self
-            .prepare_runtime_images(&sandbox.id, &image_ref, rootfs_tar_path.as_deref())
-            .await?;
+        let image_plan = if overlay_preparation == OverlayPreparation::PreserveExisting
+            && driver_config_had_rootfs_tar
+        {
+            let persisted_identity =
+                read_persisted_image_identity(&state_dir).await.map_err(|err| {
+                    Status::internal(format!(
+                        "cannot restore rootfs-tar sandbox: persisted image identity not found: {err}"
+                    ))
+                })?;
+            let bootstrap_image_ref = self.bootstrap_image_ref(&image_ref);
+            let bootstrap_image_identity = self
+                .ensure_cached_bootstrap_rootfs_image(&sandbox.id, &bootstrap_image_ref)
+                .await?;
+            let root_disk =
+                image_cache_rootfs_image(&self.config.state_dir, &bootstrap_image_identity);
+            let image_disk = image_cache_rootfs_image(&self.config.state_dir, &persisted_identity);
+            RuntimeImagePlan {
+                root_disk,
+                image_disk: Some(image_disk),
+                image_identity: persisted_identity,
+                bootstrap_image_identity,
+            }
+        } else {
+            self.prepare_runtime_images(&sandbox.id, &image_ref, rootfs_tar_path.as_deref())
+                .await?
+        };
         let image_identity = image_plan.image_identity.clone();
         self.ensure_provisioning_active(&sandbox.id).await?;
         info!(
@@ -5448,6 +5474,11 @@ async fn write_sandbox_image_metadata(
     .await?;
 
     Ok(())
+}
+
+async fn read_persisted_image_identity(state_dir: &Path) -> Result<String, std::io::Error> {
+    let raw = tokio::fs::read_to_string(state_dir.join(IMAGE_IDENTITY_FILE)).await?;
+    Ok(raw.trim().to_string())
 }
 
 async fn write_sandbox_request(state_dir: &Path, sandbox: &Sandbox) -> Result<(), std::io::Error> {
