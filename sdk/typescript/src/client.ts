@@ -28,6 +28,7 @@ import {
 } from './gen/openshell_pb.js';
 import type { EffectiveSetting, GetSandboxConfigResponse, SandboxPolicy, SettingValue } from './gen/sandbox_pb.js';
 import { PolicySource, type SandboxPolicySchema, SettingScope, type SettingValueSchema } from './gen/sandbox_pb.js';
+import { ProviderClient } from './provider.js';
 import { validateSshResponse } from './ssh-validate.js';
 import { buildTransport, type ConnectOptions } from './transport.js';
 
@@ -1203,6 +1204,8 @@ export class SandboxClient {
 export class OpenShellClient {
   /** Sandbox lifecycle + exec: create/get/list/delete, waitReady/waitDeleted, exec. */
   readonly sandbox: SandboxClient;
+  /** Provider lifecycle and credential updates. */
+  readonly providers: ProviderClient;
 
   /**
    * Advanced escape hatch: a generated client for every gateway RPC, including
@@ -1222,6 +1225,7 @@ export class OpenShellClient {
     this.grpc = createClient(OpenShell, transport);
     this.raw = this.grpc;
     this.sandbox = new SandboxClient(transport, this.grpc);
+    this.providers = new ProviderClient(transport, this.grpc);
   }
 
   /**

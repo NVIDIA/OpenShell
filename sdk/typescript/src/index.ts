@@ -39,3 +39,5 @@ export type { SdkErrorCode } from './errors.js';
 export { SdkError } from './errors.js';
 export type { ClientCredentialsOptions, OidcTokenProvider } from './oidc.js';
 export { clientCredentials } from './oidc.js';
+export type { ProviderDefinition, ProviderListOptions, ProviderRecord } from './provider.js';
+export { ProviderClient } from './provider.js';
