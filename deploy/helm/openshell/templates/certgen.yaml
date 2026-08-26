@@ -34,7 +34,7 @@ rules:
   {{- if .Values.grpcRoute.backendTLSPolicy.enabled }}
   - apiGroups: [""]
     resources: ["configmaps"]
-    verbs: ["get", "create"]
+    verbs: ["get", "create", "update"]
   {{- end }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
@@ -119,14 +119,65 @@ spec:
             - --server-san={{ . }}
             {{- end }}
             {{- end }}
-            {{- if .Values.grpcRoute.backendTLSPolicy.enabled }}
+            {{- if and .Values.grpcRoute.backendTLSPolicy.enabled (not .Values.certManager.enabled) }}
             - --backend-ca-configmap-name={{ include "openshell.backendCaConfigMapName" . }}
-            {{- if .Values.certManager.enabled }}
+            {{- end }}
+{{- if and .Values.certManager.enabled .Values.grpcRoute.backendTLSPolicy.enabled }}
+---
+# Post-install Job that polls for the cert-manager-issued server Secret and
+# creates / reconciles the backend CA ConfigMap.  Runs after regular resources
+# (including the cert-manager Certificate objects) are applied so cert-manager
+# has started issuing before the poll begins.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ $hookName }}-backend-ca
+  namespace: {{ $ns }}
+  labels:
+    {{- include "openshell.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/hook: post-install,post-upgrade
+    helm.sh/hook-weight: "0"
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: 3
+  activeDeadlineSeconds: {{ add .Values.pkiInitJob.timeoutSeconds 30 }}
+  ttlSecondsAfterFinished: 300
+  template:
+    metadata:
+      labels:
+        {{- include "openshell.selectorLabels" . | nindent 8 }}
+    spec:
+      restartPolicy: OnFailure
+      serviceAccountName: {{ $hookName }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: certgen
+          image: {{ include "openshell.image" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          env:
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+          command: ["/usr/local/bin/openshell-gateway"]
+          args:
+            - generate-certs
+            - --jwt-only
+            - --jwt-secret-name={{ include "openshell.sandboxJwtSecretName" . }}
+            - --backend-ca-configmap-name={{ include "openshell.backendCaConfigMapName" . }}
             - --backend-ca-source-secret={{ .Values.server.tls.certSecretName }}
             - --backend-ca-poll-timeout-seconds={{ .Values.pkiInitJob.timeoutSeconds }}
             {{- if .Values.pkiInitJob.failOnTimeout }}
             - --backend-ca-fail-on-timeout
             {{- end }}
-            {{- end }}
-            {{- end }}
+{{- end }}
 {{- end }}
