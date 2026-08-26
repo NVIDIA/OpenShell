@@ -2727,6 +2727,54 @@ fn pending_sandbox_snapshot_uses_docker_namespace_and_starting_condition() {
     assert_eq!(status.conditions[0].message, "Docker container is starting");
 }
 
+#[tokio::test]
+async fn failed_provisioning_removes_pending_sandbox_and_publishes_deleted() {
+    let driver = test_driver_with_config(runtime_config());
+    let sandbox = test_sandbox();
+    let mut events = driver.events.subscribe();
+
+    driver.reserve_pending_sandbox(&sandbox).await.unwrap();
+    driver
+        .fail_pending_sandbox(
+            &sandbox,
+            &DockerProvisioningFailure::new("ImagePullFailed", "image not found"),
+        )
+        .await;
+
+    assert!(
+        driver
+            .pending_snapshot(&sandbox.id, &sandbox.name)
+            .await
+            .is_none()
+    );
+
+    let mut saw_error_snapshot = false;
+    let mut deleted = false;
+    while let Ok(event) = events.try_recv() {
+        match event.payload {
+            Some(watch_sandboxes_event::Payload::Sandbox(event)) => {
+                let snapshot = event.sandbox.expect("sandbox snapshot");
+                saw_error_snapshot = snapshot
+                    .status
+                    .and_then(|status| status.conditions.into_iter().next())
+                    .is_some_and(|condition| condition.reason == "ImagePullFailed");
+            }
+            Some(watch_sandboxes_event::Payload::Deleted(event)) => {
+                deleted = event.sandbox_id == sandbox.id;
+            }
+            _ => {}
+        }
+    }
+    assert!(
+        saw_error_snapshot,
+        "failed provisioning should publish the failure before deletion"
+    );
+    assert!(
+        deleted,
+        "failed provisioning should publish a deletion event"
+    );
+}
+
 #[test]
 fn validate_linux_elf_binary_rejects_non_elf_files() {
     let tempdir = TempDir::new().unwrap();
