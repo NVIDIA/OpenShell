@@ -529,6 +529,7 @@ impl PodmanComputeDriver {
                     count_selection_supported: true,
                 }),
             }),
+            rootfs_tar_staging_dir: String::new(),
         })
     }
 

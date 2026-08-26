@@ -839,6 +839,10 @@ message ComputeDriverCapabilities {
 
   // Static portable resource request forms reported by the driver.
   ResourceCapabilities resource_capabilities = 3;
+
+  // Absolute path where rootfs tar files must be staged before creating a
+  // sandbox. Empty when the driver does not support rootfs tar sources.
+  string rootfs_tar_staging_dir = 4;
 }
 
 // Static portable resource request forms reported by a compute driver.

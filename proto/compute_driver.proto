@@ -93,6 +93,10 @@ message GetCapabilitiesResponse {
   bool driver_reports_runtime_readiness = 8;
   // Static portable resource request forms supported by this configured driver.
   ResourceCapabilities resource_capabilities = 9;
+  // Absolute path to the directory where rootfs tar files must be staged
+  // before being referenced in a CreateSandbox request. The driver rejects
+  // paths outside this directory.
+  string rootfs_tar_staging_dir = 10;
 }
 
 message AuthenticateSandboxRequest {
