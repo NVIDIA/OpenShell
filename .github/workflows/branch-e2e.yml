@@ -134,6 +134,21 @@ jobs:
       driver-targets: >-
         [{"arch":"amd64","runner":"linux-amd64-cpu8","target":"x86_64-unknown-linux-gnu","zig_target":"x86_64-unknown-linux-gnu.2.28","platform":"linux-x86_64","guest_arch":"x86_64"}]
 
+  publish-sha-artifacts:
+    needs: [pr_metadata, build-gateway, build-gateway-external, build-cli]
+    if: needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_core_e2e == 'true'
+    permissions:
+      actions: read
+      attestations: write
+      artifact-metadata: write
+      contents: read
+      id-token: write
+      packages: write
+    uses: ./.github/workflows/publish-sha-artifacts.yml
+    with:
+      source-sha: ${{ github.sha }}
+      artifact-set: branch-e2e
+
   e2e:
     needs: [pr_metadata, build-gateway, build-gateway-external, build-supervisor, build-cli, build-driver-vm-linux]
     if: needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_core_e2e == 'true'

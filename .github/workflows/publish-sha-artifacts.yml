@@ -1,0 +1,96 @@
+name: Publish SHA Artifacts
+
+on:
+  workflow_call:
+    inputs:
+      source-sha:
+        description: "Full source commit SHA represented by the artifacts"
+        required: true
+        type: string
+      artifact-set:
+        description: "Named build-profile variant for this artifact set"
+        required: true
+        type: string
+      artifact-pattern:
+        description: "GitHub Actions artifact pattern to publish"
+        required: false
+        type: string
+        default: "rust-binary-*"
+    outputs:
+      manifest-ref:
+        description: "Digest-pinned OCI manifest reference"
+        value: ${{ jobs.publish.outputs.manifest_ref }}
+
+permissions:
+  actions: read
+  attestations: write
+  artifact-metadata: write
+  contents: read
+  id-token: write
+  packages: write
+
+jobs:
+  publish:
+    name: Publish SHA artifact manifest
+    runs-on: linux-amd64-cpu8
+    timeout-minutes: 15
+    outputs:
+      manifest_ref: ${{ steps.publish.outputs.manifest_ref }}
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: ${{ inputs.artifact-pattern }}
+          path: artifacts
+
+      - name: Install ORAS
+        uses: oras-project/setup-oras@22ce207df3b08e061f537244349aac6ae1d214f6 # v2.0.1
+
+      - name: Assemble deterministic artifact bundle
+        env:
+          SOURCE_SHA: ${{ inputs.source-sha }}
+          ARTIFACT_SET: ${{ inputs.artifact-set }}
+        run: |
+          set -euo pipefail
+          test "${#SOURCE_SHA}" -eq 40
+          mkdir -p bundle
+          cp -a artifacts/. bundle/
+          find bundle -type f -print0 | sort -z | xargs -0 sha256sum > artifact-checksums.txt
+          jq -n \
+            --arg schema_version "1" \
+            --arg source_sha "$SOURCE_SHA" \
+            --arg artifact_set "$ARTIFACT_SET" \
+            --argjson artifacts "$(jq -R -s -c 'split("\n") | map(select(length > 0) | capture("^(?<sha256>[0-9a-f]{64})  (?<path>.+)$"))' artifact-checksums.txt)" \
+            '{schema_version: ($schema_version | tonumber), source: {repository: env.GITHUB_REPOSITORY, sha: $source_sha}, artifact_set: $artifact_set, artifacts: $artifacts}' \
+            > sha-artifacts.json
+          tar --sort=name --mtime='@0' --owner=0 --group=0 --numeric-owner -C bundle -cf - . | gzip -n > sha-artifacts.tar.gz
+
+      - name: Publish immutable OCI artifact
+        id: publish
+        env:
+          SOURCE_SHA: ${{ inputs.source-sha }}
+          ARTIFACT_SET: ${{ inputs.artifact-set }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          repository="ghcr.io/${GITHUB_REPOSITORY,,}/ci-artifacts"
+          tag="sha-${SOURCE_SHA}-${ARTIFACT_SET}"
+          ref="${repository}:${tag}"
+          echo "$GH_TOKEN" | oras login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          if oras manifest fetch --descriptor "$ref" >/dev/null 2>&1; then
+            echo "refusing to overwrite existing SHA artifact manifest: $ref" >&2
+            exit 1
+          fi
+          digest="$(oras push --format json \
+            --artifact-type application/vnd.nvidia.openshell.sha-artifacts.v1 \
+            --annotation "org.opencontainers.image.revision=${SOURCE_SHA}" \
+            --annotation "io.openshell.artifact-set=${ARTIFACT_SET}" \
+            "$ref" \
+            sha-artifacts.json:application/vnd.nvidia.openshell.sha-artifacts.manifest.v1+json \
+            sha-artifacts.tar.gz:application/vnd.nvidia.openshell.sha-artifacts.bundle.v1+gzip | jq -r '.digest')"
+          echo "manifest_ref=${repository}@${digest}" >> "$GITHUB_OUTPUT"
+
+      - name: Attest SHA artifact manifest
+        uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4.2.1
+        with:
+          subject-path: sha-artifacts.json
