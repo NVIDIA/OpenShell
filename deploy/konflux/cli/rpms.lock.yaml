@@ -1,6 +1,3 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0
-
 ---
 lockfileVersion: 1
 lockfileVendor: redhat
@@ -77,13 +74,13 @@ arches:
     name: glibc-devel
     evr: 2.34-275.el9_8
     sourcerpm: glibc-2.34-275.el9_8.src.rpm
-  - url: https://cdn-ubi.redhat.com/content/public/ubi/dist/ubi9/9/aarch64/appstream/os/Packages/k/kernel-headers-5.14.0-687.36.1.el9_8.aarch64.rpm
+  - url: https://cdn-ubi.redhat.com/content/public/ubi/dist/ubi9/9/aarch64/appstream/os/Packages/k/kernel-headers-5.14.0-687.41.1.el9_8.aarch64.rpm
     repoid: ubi-9-appstream-rpms
-    size: 2864573
-    checksum: sha256:aa680c8c0622822ce53d2ffdc3341d3083d897f6c1f8102e8a0729b6376f0d3e
+    size: 2872021
+    checksum: sha256:badc73a635a0552aa4d86eeaba804ccbbe811065e4fbbf3531fe1f9cf646fcd9
     name: kernel-headers
-    evr: 5.14.0-687.36.1.el9_8
-    sourcerpm: kernel-5.14.0-687.36.1.el9_8.src.rpm
+    evr: 5.14.0-687.41.1.el9_8
+    sourcerpm: kernel-5.14.0-687.41.1.el9_8.src.rpm
   - url: https://cdn-ubi.redhat.com/content/public/ubi/dist/ubi9/9/aarch64/appstream/os/Packages/l/libasan-11.5.0-14.el9.aarch64.rpm
     repoid: ubi-9-appstream-rpms
     size: 409047
@@ -483,13 +480,13 @@ arches:
     name: libcom_err
     evr: 1.46.5-8.el9
     sourcerpm: e2fsprogs-1.46.5-8.el9.src.rpm
-  - url: https://cdn-ubi.redhat.com/content/public/ubi/dist/ubi9/9/aarch64/baseos/os/Packages/l/libcurl-7.76.1-40.el9.aarch64.rpm
+  - url: https://cdn-ubi.redhat.com/content/public/ubi/dist/ubi9/9/aarch64/baseos/os/Packages/l/libcurl-7.76.1-40.el9_8.5.aarch64.rpm
     repoid: ubi-9-baseos-rpms
-    size: 291404
-    checksum: sha256:4d77a96282b20b10d8e221e1208f0be8ec21274c090ee44866f36646e7b7206a
+    size: 292322
+    checksum: sha256:ea6c3ade86939df7a985ae71e4c5100731962add54295fd40660a2f2c2f85f1d
     name: libcurl
-    evr: 7.76.1-40.el9
-    sourcerpm: curl-7.76.1-40.el9.src.rpm
+    evr: 7.76.1-40.el9_8.5
+    sourcerpm: curl-7.76.1-40.el9_8.5.src.rpm
   - url: https://cdn-ubi.redhat.com/content/public/ubi/dist/ubi9/9/aarch64/baseos/os/Packages/l/libdb-5.3.28-57.el9_6.aarch64.rpm
     repoid: ubi-9-baseos-rpms
     size: 727417
@@ -581,13 +578,13 @@ arches:
     name: libmount
     evr: 2.37.4-25.el9
     sourcerpm: util-linux-2.37.4-25.el9.src.rpm
-  - url: https://cdn-ubi.redhat.com/content/public/ubi/dist/ubi9/9/aarch64/baseos/os/Packages/l/libnghttp2-1.43.0-6.el9_8.1.aarch64.rpm
+  - url: https://cdn-ubi.redhat.com/content/public/ubi/dist/ubi9/9/aarch64/baseos/os/Packages/l/libnghttp2-1.43.0-6.el9_8.2.aarch64.rpm
     repoid: ubi-9-baseos-rpms
-    size: 79620
-    checksum: sha256:69ae21fe69981041b43d3420800b691b854a32df2a26e84ce367bcfe4a4cac69
+    size: 79650
+    checksum: sha256:eefb6d331e38314bce55c28e02d67d022c83e41b4d5de91f86d9d846b381ac48
     name: libnghttp2
-    evr: 1.43.0-6.el9_8.1
-    sourcerpm: nghttp2-1.43.0-6.el9_8.1.src.rpm
+    evr: 1.43.0-6.el9_8.2
+    sourcerpm: nghttp2-1.43.0-6.el9_8.2.src.rpm
   - url: https://cdn-ubi.redhat.com/content/public/ubi/dist/ubi9/9/aarch64/baseos/os/Packages/l/libpkgconf-1.7.3-10.el9.aarch64.rpm
     repoid: ubi-9-baseos-rpms
     size: 38310
@@ -1096,13 +1093,13 @@ arches:
     name: glibc-headers
     evr: 2.34-275.el9_8
     sourcerpm: glibc-2.34-275.el9_8.src.rpm
-  - url: https://cdn-ubi.redhat.com/content/public/ubi/dist/ubi9/9/x86_64/appstream/os/Packages/k/kernel-headers-5.14.0-687.36.1.el9_8.x86_64.rpm
+  - url: https://cdn-ubi.redhat.com/content/public/ubi/dist/ubi9/9/x86_64/appstream/os/Packages/k/kernel-headers-5.14.0-687.41.1.el9_8.x86_64.rpm
     repoid: ubi-9-appstream-rpms
-    size: 2903853
-    checksum: sha256:aa8f8d4579635787d6dda7323d472de1f2f630f97d694ebf5e0208791b76555c
+    size: 2911313
+    checksum: sha256:7fab4963bb2f80e238051586a6df2b0ffea787daf7ef59659ba8d0fa3648f46e
     name: kernel-headers
-    evr: 5.14.0-687.36.1.el9_8
-    sourcerpm: kernel-5.14.0-687.36.1.el9_8.src.rpm
+    evr: 5.14.0-687.41.1.el9_8
+    sourcerpm: kernel-5.14.0-687.41.1.el9_8.src.rpm
   - url: https://cdn-ubi.redhat.com/content/public/ubi/dist/ubi9/9/x86_64/appstream/os/Packages/l/libmpc-1.2.1-4.el9.x86_64.rpm
     repoid: ubi-9-appstream-rpms
     size: 66075
@@ -1481,13 +1478,13 @@ arches:
     name: libcom_err
     evr: 1.46.5-8.el9
     sourcerpm: e2fsprogs-1.46.5-8.el9.src.rpm
-  - url: https://cdn-ubi.redhat.com/content/public/ubi/dist/ubi9/9/x86_64/baseos/os/Packages/l/libcurl-7.76.1-40.el9.x86_64.rpm
+  - url: https://cdn-ubi.redhat.com/content/public/ubi/dist/ubi9/9/x86_64/baseos/os/Packages/l/libcurl-7.76.1-40.el9_8.5.x86_64.rpm
     repoid: ubi-9-baseos-rpms
-    size: 296527
-    checksum: sha256:d89db646d90f8342e097cf03c7979d0da1c2df45bcb4e2b9fe7437b7895a7df5
+    size: 297551
+    checksum: sha256:428b87ca3eb808d769f6f0f68019a97d3c487c86268ccff2ab7ad7223beab01e
     name: libcurl
-    evr: 7.76.1-40.el9
-    sourcerpm: curl-7.76.1-40.el9.src.rpm
+    evr: 7.76.1-40.el9_8.5
+    sourcerpm: curl-7.76.1-40.el9_8.5.src.rpm
   - url: https://cdn-ubi.redhat.com/content/public/ubi/dist/ubi9/9/x86_64/baseos/os/Packages/l/libdb-5.3.28-57.el9_6.x86_64.rpm
     repoid: ubi-9-baseos-rpms
     size: 755192
@@ -1579,13 +1576,13 @@ arches:
     name: libmount
     evr: 2.37.4-25.el9
     sourcerpm: util-linux-2.37.4-25.el9.src.rpm
-  - url: https://cdn-ubi.redhat.com/content/public/ubi/dist/ubi9/9/x86_64/baseos/os/Packages/l/libnghttp2-1.43.0-6.el9_8.1.x86_64.rpm
+  - url: https://cdn-ubi.redhat.com/content/public/ubi/dist/ubi9/9/x86_64/baseos/os/Packages/l/libnghttp2-1.43.0-6.el9_8.2.x86_64.rpm
     repoid: ubi-9-baseos-rpms
-    size: 80371
-    checksum: sha256:3e99ec9ac85e7b1bf8348a503b14eb8d41e6df788c181202484a8cbc399f630a
+    size: 80410
+    checksum: sha256:adb3260b6610917c07bda0a6bc521d5628bb1892a66d008f0fea81dc022ac699
     name: libnghttp2
-    evr: 1.43.0-6.el9_8.1
-    sourcerpm: nghttp2-1.43.0-6.el9_8.1.src.rpm
+    evr: 1.43.0-6.el9_8.2
+    sourcerpm: nghttp2-1.43.0-6.el9_8.2.src.rpm
   - url: https://cdn-ubi.redhat.com/content/public/ubi/dist/ubi9/9/x86_64/baseos/os/Packages/l/libpkgconf-1.7.3-10.el9.x86_64.rpm
     repoid: ubi-9-baseos-rpms
     size: 38387
