@@ -14,7 +14,7 @@ Create and manage providers that supply credentials to sandboxes.
 
 <Info>
 Provider profiles define provider credentials, policy, and refresh behavior. See
-[Provider profiles](/sandboxes/providers-v2) for the profile format and custom
+[Profiles](/providers/profiles) for the profile format and custom
 profile workflow.
 </Info>
 
@@ -296,7 +296,7 @@ be resolved.
 <Warning>
 Legacy provider attachment is fixed at sandbox creation time. Provider profiles add
 `openshell sandbox provider attach` and `openshell sandbox provider detach` for
-running sandboxes. See [Provider profiles](/sandboxes/providers-v2#attach-and-detach-providers)
+running sandboxes. See [Profiles](/providers/profiles#attach-and-detach-providers)
 for runtime attach and detach behavior.
 
 </Warning>
@@ -345,7 +345,7 @@ profile.
 
 Credential resolution requires the proxy to handle the request as HTTP. Raw
 `tls: skip` and non-HTTP tunnels remain opaque and do not support credential
-rewrite. Refer to [Provider profiles](/sandboxes/providers-v2#understand-static-credential-endpoint-binding)
+rewrite. Refer to [Profiles](/providers/profiles#understand-static-credential-endpoint-binding)
 for endpoint matching and migration guidance.
 
 ### Supported injection locations
@@ -391,8 +391,8 @@ there returns `credential_endpoint_mismatch`.
 
 For a custom service, define the credential in a custom provider profile. Put
 stable endpoints in the profile, or leave the profile endpointless and bind
-each concrete provider instance from sandbox policy. Refer to [Provider
-Profiles](/sandboxes/providers-v2#provider-profiles) for the profile workflow
+each concrete provider instance from sandbox policy. Refer to
+[Profiles](/providers/profiles#provider-profiles) for the profile workflow
 and schema.
 
 ## Supported Provider Types

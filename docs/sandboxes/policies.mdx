@@ -374,7 +374,7 @@ Static provider placeholders resolve only when the request host, port, and path
 also match an endpoint in the provider profile. A sandbox policy allow does not
 expand that binding. A mismatch returns HTTP 403 with
 `credential_endpoint_mismatch`. Refer to [Static Credential Endpoint
-Binding](/sandboxes/providers-v2#understand-static-credential-endpoint-binding).
+Binding](/providers/profiles#understand-static-credential-endpoint-binding).
 
 For example:
 
@@ -614,7 +614,7 @@ Do not fix `credential_endpoint_mismatch` by widening sandbox policy. Export the
 provider profile with `openshell provider profile export <profile-id> -o yaml`.
 Update the custom provider profile only when the destination is an intended
 credential recipient. Refer to [Static Credential Endpoint
-Binding](/sandboxes/providers-v2#understand-static-credential-endpoint-binding)
+Binding](/providers/profiles#understand-static-credential-endpoint-binding)
 for the complete authorization model.
 
 For small changes, prefer `openshell policy update` over rewriting the full YAML:

@@ -214,7 +214,7 @@ Findings are categorical. There is no severity tier. The reviewer reads the cate
 
 Before approval, the gateway rebuilds the candidate token from the live base policy, immutable provider rules, and non-secret credential metadata. When that token is unchanged, it reuses the persisted prover result instead of rerunning the prover. When it changes, the gateway evaluates and persists the refreshed candidate, leaves the chunk pending, and requires the reviewer to inspect and approve the new token. Edits and deduplicated resubmissions follow the same path. Merge, policy-shape, provider-composition, credential, or prover failures are shown as application errors and cannot be approved. Security notes flag concerns such as internal or private destinations and `allowed_ips`, wildcard hosts, hostless `allowed_ips`, ephemeral ports, and well-known database or service ports. Any prover finding or security note keeps the chunk pending in auto mode.
 
-The full reasoning model lives in [`crates/openshell-prover/README.md`](https://github.com/NVIDIA/OpenShell/blob/main/crates/openshell-prover/README.md). Provider profiles composed in via [Provider profiles](/sandboxes/providers-v2) are part of the effective policy the prover reasons over.
+The full reasoning model lives in [`crates/openshell-prover/README.md`](https://github.com/NVIDIA/OpenShell/blob/main/crates/openshell-prover/README.md). Provider profiles composed in via [Profiles](/providers/profiles) are part of the effective policy the prover reasons over.
 
 ## Review Proposals
 
