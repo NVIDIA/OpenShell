@@ -40,6 +40,11 @@ on:
         required: false
         type: string
         default: ""
+      no-default-features:
+        description: "Build without Cargo default features"
+        required: false
+        type: boolean
+        default: false
       auditable:
         description: "Embed cargo-auditable dependency metadata in the binary"
         required: false
@@ -299,6 +304,9 @@ jobs:
           )
           if [[ -n "$FEATURES" ]]; then
             args+=(--features "$FEATURES")
+          fi
+          if [[ "${{ inputs['no-default-features'] }}" == "true" ]]; then
+            args+=(--no-default-features)
           fi
           if [[ -n "${{ steps.version.outputs.cargo_version }}" ]]; then
             export GIT_DIR=/nonexistent

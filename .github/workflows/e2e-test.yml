@@ -27,6 +27,11 @@ on:
         required: false
         type: string
         default: ""
+      external-gateway-artifact-prefix:
+        description: "Prebuilt gateway artifact prefix for external-driver suites"
+        required: false
+        type: string
+        default: ""
       vm-driver-artifact-name:
         description: "Optional prebuilt VM driver artifact name"
         required: false
@@ -60,7 +65,7 @@ jobs:
             cmd: "mise run --no-deps --skip-deps e2e:rust"
             apt_packages: "openssh-client"
           - suite: rust-docker-external-driver
-            cmd: "env -u OPENSHELL_GATEWAY_BIN mise run --no-deps --skip-deps e2e:docker:external-driver"
+            cmd: "mise run --no-deps --skip-deps e2e:docker:external-driver"
             apt_packages: "openssh-client"
           - suite: mcp
             cmd: "mise run --no-deps --skip-deps e2e:mcp"
@@ -95,10 +100,16 @@ jobs:
           artifact-prefix: ${{ inputs.cli-artifact-prefix }}
 
       - name: Use prebuilt OpenShell gateway
-        if: inputs.gateway-artifact-prefix != ''
+        if: inputs.gateway-artifact-prefix != '' && matrix.suite != 'rust-docker-external-driver'
         uses: ./.github/actions/setup-e2e-gateway
         with:
           artifact-prefix: ${{ inputs.gateway-artifact-prefix }}
+
+      - name: Use prebuilt external-driver gateway
+        if: inputs.external-gateway-artifact-prefix != '' && matrix.suite == 'rust-docker-external-driver'
+        uses: ./.github/actions/setup-e2e-gateway
+        with:
+          artifact-prefix: ${{ inputs.external-gateway-artifact-prefix }}
 
       - name: Check out MCP conformance tests
         if: matrix.suite == 'mcp'
@@ -156,7 +167,7 @@ jobs:
             podman_major: "5"
             podman_package_version: "5.7.0+ds2-3build1"
             conmon_package_version: "2.1.13+ds1-2"
-            cmd: "env -u OPENSHELL_GATEWAY_BIN mise run --no-deps --skip-deps e2e:podman:external-driver"
+            cmd: "mise run --no-deps --skip-deps e2e:podman:external-driver"
           - suite: provider-refresh-keycloak
             runner: ubuntu-26.04
             podman_major: "5"
@@ -185,10 +196,16 @@ jobs:
           artifact-prefix: ${{ inputs.cli-artifact-prefix }}
 
       - name: Use prebuilt OpenShell gateway
-        if: inputs.gateway-artifact-prefix != ''
+        if: inputs.gateway-artifact-prefix != '' && matrix.suite != 'external-driver'
         uses: ./.github/actions/setup-e2e-gateway
         with:
           artifact-prefix: ${{ inputs.gateway-artifact-prefix }}
+
+      - name: Use prebuilt external-driver gateway
+        if: inputs.external-gateway-artifact-prefix != '' && matrix.suite == 'external-driver'
+        uses: ./.github/actions/setup-e2e-gateway
+        with:
+          artifact-prefix: ${{ inputs.external-gateway-artifact-prefix }}
 
       - name: Install mise
         run: |
@@ -325,7 +342,7 @@ jobs:
           - suite: managed
             cmd: "mise run --no-deps --skip-deps e2e:vm"
           - suite: external-driver
-            cmd: "env -u OPENSHELL_GATEWAY_BIN mise run --no-deps --skip-deps e2e:vm:external-driver"
+            cmd: "mise run --no-deps --skip-deps e2e:vm:external-driver"
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -342,10 +359,16 @@ jobs:
           artifact-prefix: ${{ inputs.cli-artifact-prefix }}
 
       - name: Use prebuilt OpenShell gateway
-        if: inputs.gateway-artifact-prefix != ''
+        if: inputs.gateway-artifact-prefix != '' && matrix.suite != 'external-driver'
         uses: ./.github/actions/setup-e2e-gateway
         with:
           artifact-prefix: ${{ inputs.gateway-artifact-prefix }}
+
+      - name: Use prebuilt external-driver gateway
+        if: inputs.external-gateway-artifact-prefix != '' && matrix.suite == 'external-driver'
+        uses: ./.github/actions/setup-e2e-gateway
+        with:
+          artifact-prefix: ${{ inputs.external-gateway-artifact-prefix }}
 
       - name: Use prebuilt OpenShell VM driver
         if: inputs.vm-driver-artifact-name != ''

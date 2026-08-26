@@ -77,6 +77,7 @@ jobs:
       artifact_prefix: ${{ steps.resolve.outputs.artifact_prefix }}
       image_tag_base: ${{ steps.resolve.outputs.image_tag_base }}
       features: ${{ steps.resolve.outputs.features }}
+      no_default_features: ${{ steps.resolve.outputs.no_default_features }}
       has_image: ${{ steps.resolve.outputs.has_image }}
     steps:
       - name: Resolve component and platform matrix
@@ -91,6 +92,13 @@ jobs:
               binary_name=openshell-gateway
               features="bundled-z3"
               has_image=true
+              ;;
+            gateway-external)
+              binary_component=gateway
+              binary_name=openshell-gateway
+              features="telemetry"
+              no_default_features=true
+              has_image=false
               ;;
             supervisor)
               binary_component=sandbox
@@ -162,6 +170,7 @@ jobs:
             echo "artifact_prefix=rust-binary-${component}"
             echo "image_tag_base=$image_tag_base"
             echo "features=$features"
+            echo "no_default_features=${no_default_features:-false}"
             echo "has_image=$has_image"
           } >> "$GITHUB_OUTPUT"
 
