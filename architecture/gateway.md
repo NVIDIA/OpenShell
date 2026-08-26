@@ -675,6 +675,25 @@ requested present -> generate and write. This guards continuity across restarts
 and upgrades while still recovering cleanly if an operator deletes everything
 and starts over.
 
+When `grpcRoute.backendTLSPolicy.enabled=true`, the certgen hook also creates a
+`ConfigMap` containing the CA certificate (`ca.crt`) used by the Gateway proxy
+to validate the backend pod's TLS certificate. The CA is always read from the
+authoritative server Secret (not the in-memory bundle) so that enabling
+BackendTLSPolicy on an existing release uses the CA that actually signed the
+server certificate. The ConfigMap is reconciled on every hook run: if the CA
+changes (rotation, re-issue), the ConfigMap is updated in place. In built-in PKI
+mode the ConfigMap is created in the same pre-install hook. In cert-manager
+mode, a separate post-install/post-upgrade hook Job polls for the cert-manager-
+issued server Secret and then creates or updates the ConfigMap, because
+cert-manager Certificate resources are regular release objects applied after
+pre-install hooks.
+
+The `server.tls.enableMtls` value controls whether the gateway requires client
+certificates. When `enableMtls` is `false`, the gateway runs HTTPS-only without
+client certificate verification (use OIDC for identity instead). BackendTLSPolicy
+requires `enableMtls=false` because the ingress proxy cannot present client
+certificates to the backend.
+
 Operators who manage TLS PKI with cert-manager enable `certManager.enabled`;
 cert-manager takes precedence over built-in TLS generation and the chart still
 renders the JWT-only hook. Operators who pre-create all TLS and JWT Secrets can

@@ -405,6 +405,31 @@ label, supervisor env vars `OPENSHELL_K8S_SA_TOKEN_FILE` and
 `OPENSHELL_PROVIDER_SPIFFE_WORKLOAD_API_SOCKET`, plus both the projected
 `openshell-sa-token` volume and the `spiffe-workload-api` CSI volume.
 
+If `grpcRoute.backendTLSPolicy.enabled=true`, the Gateway proxy validates the
+backend pod's TLS certificate against a CA in a ConfigMap. Check that the
+ConfigMap exists and contains the correct CA, that `enableMtls` is disabled,
+and that the BackendTLSPolicy resource is present:
+
+```bash
+kubectl -n openshell get backendtlspolicy
+kubectl -n openshell get configmap openshell-backend-ca -o yaml
+helm -n openshell get values openshell | grep -E 'backendTLSPolicy|enableMtls|failOnTimeout|timeoutSeconds|caCertificateConfigMapName'
+```
+
+If the ConfigMap is missing after a cert-manager install, the post-install
+certgen hook may have timed out waiting for cert-manager to issue the server
+certificate. Check the certgen Job logs:
+
+```bash
+kubectl -n openshell get jobs | grep certgen
+kubectl -n openshell logs job/openshell-certgen-backend-ca
+```
+
+Increase `pkiInitJob.timeoutSeconds` and run `helm upgrade` to retry. If the
+Gateway proxy reports `TLS error: Secret is not supplied by SDS` or similar
+backend TLS errors, the ConfigMap CA likely does not match the server
+certificate CA — verify both are from the same issuer.
+
 Check the image references currently used by the gateway deployment:
 
 ```bash

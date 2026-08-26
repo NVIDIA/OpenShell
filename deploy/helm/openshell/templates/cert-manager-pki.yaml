@@ -8,9 +8,6 @@ metadata:
   namespace: {{ .Release.Namespace }}
   labels:
     {{- include "openshell.labels" . | nindent 4 }}
-  annotations:
-    helm.sh/hook: pre-install,pre-upgrade
-    helm.sh/hook-weight: "-30"
 spec:
   selfSigned: {}
 ---
@@ -21,9 +18,6 @@ metadata:
   namespace: {{ .Release.Namespace }}
   labels:
     {{- include "openshell.labels" . | nindent 4 }}
-  annotations:
-    helm.sh/hook: pre-install,pre-upgrade
-    helm.sh/hook-weight: "-30"
 spec:
   isCA: true
   commonName: openshell-ca
@@ -43,9 +37,6 @@ metadata:
   namespace: {{ .Release.Namespace }}
   labels:
     {{- include "openshell.labels" . | nindent 4 }}
-  annotations:
-    helm.sh/hook: pre-install,pre-upgrade
-    helm.sh/hook-weight: "-30"
 spec:
   ca:
     secretName: {{ .Values.certManager.caSecretName | quote }}
@@ -75,9 +66,6 @@ metadata:
   namespace: {{ .Release.Namespace }}
   labels:
     {{- include "openshell.labels" . | nindent 4 }}
-  annotations:
-    helm.sh/hook: pre-install,pre-upgrade
-    helm.sh/hook-weight: "-30"
 spec:
   secretName: {{ .Values.server.tls.certSecretName | quote }}
   duration: {{ .Values.certManager.certificateDuration | quote }}
@@ -119,9 +107,6 @@ metadata:
   namespace: {{ .Release.Namespace }}
   labels:
     {{- include "openshell.labels" . | nindent 4 }}
-  annotations:
-    helm.sh/hook: pre-install,pre-upgrade
-    helm.sh/hook-weight: "-30"
 spec:
   secretName: {{ include "openshell.fullname" . }}-server-external-tls
   duration: {{ .Values.certManager.certificateDuration | quote }}
@@ -153,9 +138,6 @@ metadata:
   namespace: {{ .Release.Namespace }}
   labels:
     {{- include "openshell.labels" . | nindent 4 }}
-  annotations:
-    helm.sh/hook: pre-install,pre-upgrade
-    helm.sh/hook-weight: "-30"
 spec:
   secretName: {{ .Values.server.tls.clientTlsSecretName | quote }}
   duration: {{ .Values.certManager.certificateDuration | quote }}

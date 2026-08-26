@@ -80,9 +80,9 @@ pub struct CertgenArgs {
     dry_run: bool,
 
     /// Name of a `ConfigMap` to create containing the CA certificate (key: ca.crt)
-    /// for `BackendTLSPolicy` backend validation. In full PKI mode, the CA comes
-    /// from the generated bundle. In --jwt-only mode, the CA is read from
-    /// --backend-ca-source-secret.
+    /// for `BackendTLSPolicy` backend validation. The CA is always read from the
+    /// authoritative server Secret: --server-secret-name in full PKI mode,
+    /// --backend-ca-source-secret in --jwt-only mode.
     #[arg(long, value_name = "NAME")]
     backend_ca_configmap_name: Option<String>,
 
@@ -127,7 +127,7 @@ pub async fn run(args: CertgenArgs) -> Result<()> {
         run_kubernetes(&args, &bundle).await?;
 
         if let Some(ref cm_name) = args.backend_ca_configmap_name {
-            create_backend_ca_configmap_if_needed(&args, &bundle, cm_name).await?;
+            create_backend_ca_configmap_if_needed(&args, cm_name).await?;
         }
 
         Ok(())
@@ -326,9 +326,21 @@ async fn create_tls_secrets(
     Ok(())
 }
 
+fn extract_ca_from_secret(secret: &Secret, name: &str) -> Result<String> {
+    let data = secret
+        .data
+        .as_ref()
+        .ok_or_else(|| miette::miette!("secret {name} has no data"))?;
+    let ca = data
+        .get("ca.crt")
+        .ok_or_else(|| miette::miette!("secret {name} has no ca.crt key"))?;
+    String::from_utf8(ca.0.clone())
+        .into_diagnostic()
+        .wrap_err("ca.crt is not valid UTF-8")
+}
+
 async fn create_backend_ca_configmap_if_needed(
     args: &CertgenArgs,
-    bundle: &PkiBundle,
     configmap_name: &str,
 ) -> Result<()> {
     let namespace = args
@@ -340,31 +352,13 @@ async fn create_backend_ca_configmap_if_needed(
         .await
         .into_diagnostic()
         .wrap_err("failed to construct Kubernetes client for backend CA ConfigMap")?;
-    let api: Api<ConfigMap> = Api::namespaced(client.clone(), namespace);
+    let secret_api: Api<Secret> = Api::namespaced(client.clone(), namespace);
+    let cm_api: Api<ConfigMap> = Api::namespaced(client, namespace);
 
-    if api
-        .get_opt(configmap_name)
-        .await
-        .into_diagnostic()
-        .wrap_err_with(|| format!("failed to read configmap {configmap_name}"))?
-        .is_some()
-    {
-        info!(
-            namespace = %namespace,
-            configmap = %configmap_name,
-            "Backend CA ConfigMap already exists, skipping."
-        );
-        return Ok(());
-    }
-
-    let ca_pem = if !args.jwt_only {
-        bundle.ca_cert_pem.clone()
-    } else if let Some(source_secret) = &args.backend_ca_source_secret {
-        let secret_api: Api<Secret> = Api::namespaced(client, namespace);
-
-        // Poll for the cert-manager Secret with timeout to handle cert issuance delay.
-        // The Helm chart sets this to (Job activeDeadlineSeconds - 30) leaving
-        // margin for ConfigMap creation and hook completion.
+    // Resolve the CA from the authoritative server Secret rather than the
+    // in-memory bundle so upgrades that enable BackendTLSPolicy on an
+    // existing release use the CA that actually signed the server cert.
+    let ca_pem = if let Some(source_secret) = &args.backend_ca_source_secret {
         let poll_timeout = std::time::Duration::from_secs(args.backend_ca_poll_timeout_seconds);
         let poll_interval = std::time::Duration::from_secs(2);
         let start = std::time::Instant::now();
@@ -416,22 +410,57 @@ async fn create_backend_ca_configmap_if_needed(
             elapsed_secs = start.elapsed().as_secs(),
             "cert-manager TLS certificate found."
         );
-
-        let data = secret
-            .data
-            .ok_or_else(|| miette::miette!("secret {source_secret} has no data"))?;
-        let ca = data
-            .get("ca.crt")
-            .ok_or_else(|| miette::miette!("secret {source_secret} has no ca.crt key"))?;
-        String::from_utf8(ca.0.clone())
+        extract_ca_from_secret(&secret, source_secret)?
+    } else if let Some(server_secret) = &args.server_secret_name {
+        let secret = secret_api
+            .get(server_secret)
+            .await
             .into_diagnostic()
-            .wrap_err("ca.crt is not valid UTF-8")?
+            .wrap_err_with(|| format!("failed to read server secret {server_secret}"))?;
+        extract_ca_from_secret(&secret, server_secret)?
     } else {
         return Err(miette::miette!(
-            "--backend-ca-source-secret is required with --jwt-only \
-             and --backend-ca-configmap-name"
+            "--backend-ca-source-secret or --server-secret-name is required \
+             with --backend-ca-configmap-name"
         ));
     };
+
+    // Reconcile: create or update so the backend CA stays current across
+    // CA rotations and upgrades.
+    if let Some(existing) = cm_api
+        .get_opt(configmap_name)
+        .await
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed to read configmap {configmap_name}"))?
+    {
+        let up_to_date = existing
+            .data
+            .as_ref()
+            .and_then(|d| d.get("ca.crt"))
+            .map(String::as_str)
+            == Some(&ca_pem);
+        if up_to_date {
+            info!(
+                namespace = %namespace,
+                configmap = %configmap_name,
+                "Backend CA ConfigMap is up-to-date, skipping."
+            );
+            return Ok(());
+        }
+        let mut updated = existing;
+        updated.data = Some(BTreeMap::from([("ca.crt".to_string(), ca_pem)]));
+        cm_api
+            .replace(configmap_name, &PostParams::default(), &updated)
+            .await
+            .into_diagnostic()
+            .wrap_err_with(|| format!("failed to update configmap {configmap_name}"))?;
+        info!(
+            namespace = %namespace,
+            configmap = %configmap_name,
+            "Backend CA ConfigMap updated with current CA."
+        );
+        return Ok(());
+    }
 
     let configmap = ConfigMap {
         metadata: ObjectMeta {
@@ -442,7 +471,8 @@ async fn create_backend_ca_configmap_if_needed(
         ..Default::default()
     };
 
-    api.create(&PostParams::default(), &configmap)
+    cm_api
+        .create(&PostParams::default(), &configmap)
         .await
         .into_diagnostic()
         .wrap_err_with(|| format!("failed to create configmap {configmap_name}"))?;
