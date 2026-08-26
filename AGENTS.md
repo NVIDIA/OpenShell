@@ -32,6 +32,7 @@ These pipelines connect skills into end-to-end workflows. Individual skill files
 | `crates/openshell-cli/` | CLI binary | User-facing command-line interface |
 | `crates/openshell-server/` | Gateway server | Control-plane API, sandbox lifecycle, auth boundary |
 | `crates/openshell-sandbox/` | Sandbox runtime | Container supervision, policy-enforced egress routing |
+| `crates/openshell-isolation/` | Isolation backend contract | RFC 0012 `IsolationBackend` trait + types; the supervisor-facing runtime contract for the boundary |
 | `crates/openshell-policy/` | Policy engine | Filesystem, network, process, and inference constraints |
 | `crates/openshell-router/` | Privacy router | Privacy-aware LLM routing |
 | `crates/openshell-bootstrap/` | Gateway metadata | Gateway registration metadata, auth token storage, mTLS bundle storage |
