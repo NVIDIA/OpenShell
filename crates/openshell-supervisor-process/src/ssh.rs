@@ -1192,7 +1192,7 @@ impl Default for PtyRequest {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn apply_child_env(
+pub(crate) fn apply_child_env(
     cmd: &mut Command,
     session_home: &str,
     session_user: &str,
@@ -1604,7 +1604,7 @@ fn spawn_pipe_exec(
     Ok(sender)
 }
 
-mod unsafe_pty {
+pub(crate) mod unsafe_pty {
     #[cfg(not(target_os = "linux"))]
     use super::sandbox;
     use super::{
