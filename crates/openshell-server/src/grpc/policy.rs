@@ -1582,8 +1582,8 @@ async fn auto_approve_chunk(
 }
 
 // TODO: share effective-policy lookup with `load_sandbox_policy` /
-// `GetSandboxConfig`. They re-implement very similar global-settings +
-// providers_v2 + compose logic; consolidating them is out of scope for the
+// `GetSandboxConfig`. They re-implement very similar global-settings and
+// profile-composition logic; consolidating them is out of scope for the
 // agent-authored proposal validation slice.
 async fn current_effective_policy_for_sandbox(
     state: &ServerState,
@@ -1632,8 +1632,6 @@ async fn effective_policy_for_source(
         },
     );
 
-    let providers_v2_enabled =
-        bool_setting_enabled(&global_settings, settings::PROVIDERS_V2_ENABLED_KEY)?;
     clear_provider_credentialed_markers(&mut policy);
     let mut provider_context = provider_policy_context_with_catalog(
         state.store.as_ref(),
@@ -1642,10 +1640,7 @@ async fn effective_policy_for_source(
         provider_names,
     )
     .await?;
-    if providers_v2_enabled
-        && !matches!(policy_source, PolicySource::Global)
-        && !provider_context.layers.is_empty()
-    {
+    if !matches!(policy_source, PolicySource::Global) && !provider_context.layers.is_empty() {
         policy = compose_effective_policy(&policy, &provider_context.layers);
     }
     let policy_credential_bindings = policy_static_credential_endpoint_bindings(Some(&policy))?;
@@ -1966,9 +1961,7 @@ async fn provider_policy_layers_for_sandbox(
     provider_names: &[String],
 ) -> Result<Vec<ProviderPolicyLayer>, Status> {
     let global_settings = load_global_settings(state.store.as_ref()).await?;
-    if decode_policy_from_global_settings(&global_settings)?.is_some()
-        || !bool_setting_enabled(&global_settings, settings::PROVIDERS_V2_ENABLED_KEY)?
-    {
+    if decode_policy_from_global_settings(&global_settings)?.is_some() {
         return Ok(Vec::new());
     }
     let catalog = state
@@ -2046,8 +2039,7 @@ pub(super) async fn provider_policy_composition_enabled(store: &Store) -> Result
 }
 
 fn provider_policy_composition_enabled_in(settings: &StoredSettings) -> Result<bool, Status> {
-    Ok(decode_policy_from_global_settings(settings)?.is_none()
-        && bool_setting_enabled(settings, settings::PROVIDERS_V2_ENABLED_KEY)?)
+    Ok(decode_policy_from_global_settings(settings)?.is_none())
 }
 
 async fn validate_provider_composition_for_existing_sandboxes(
@@ -2408,8 +2400,6 @@ pub(super) async fn handle_get_sandbox_config(
     let global_settings = load_global_settings(state.store.as_ref()).await?;
     let sandbox_settings =
         load_sandbox_settings(state.store.as_ref(), &workspace, sandbox.object_name()).await?;
-    let providers_v2_enabled =
-        bool_setting_enabled(&global_settings, settings::PROVIDERS_V2_ENABLED_KEY)?;
     let mut provider_policy_context = provider_policy_context_with_catalog(
         state.store.as_ref(),
         &provider_profile_catalog,
@@ -2442,8 +2432,7 @@ pub(super) async fn handle_get_sandbox_config(
         clear_provider_credentialed_markers(source_policy);
     }
 
-    if providers_v2_enabled
-        && !matches!(policy_source, PolicySource::Global)
+    if !matches!(policy_source, PolicySource::Global)
         && let Some(source_policy) = policy.as_ref()
         && !provider_policy_context.layers.is_empty()
     {
@@ -3002,16 +2991,6 @@ fn report_uninspected_credentialed_endpoints(policy: &ProtoSandboxPolicy, sandbo
             mode = violation.mode,
             "delivering credentialed endpoint without L7 inspection; the sandbox proxy will deny this traffic unless allow_uninspected_credentials is set"
         );
-    }
-}
-
-pub(super) fn bool_setting_enabled(settings: &StoredSettings, key: &str) -> Result<bool, Status> {
-    match settings.settings.get(key) {
-        None => Ok(false),
-        Some(StoredSettingValue::Bool(value)) => Ok(*value),
-        Some(_) => Err(Status::internal(format!(
-            "setting '{key}' has invalid value type; expected bool"
-        ))),
     }
 }
 
@@ -6721,30 +6700,6 @@ pub(super) async fn load_global_settings(store: &Store) -> Result<StoredSettings
     load_settings_record(store, GLOBAL_SETTINGS_OBJECT_TYPE, "", GLOBAL_SETTINGS_NAME).await
 }
 
-/// Whether a boolean global setting is enabled, loading global settings from the
-/// store. Exposed to sibling modules that need a gate check without depending on
-/// the private `StoredSettings` type.
-pub async fn global_bool_setting_enabled(store: &Store, key: &str) -> Result<bool, Status> {
-    let global_settings = load_global_settings(store).await?;
-    bool_setting_enabled(&global_settings, key)
-}
-
-/// Test helper: set a boolean global setting, loading current settings first so
-/// the CAS write succeeds whether the record already exists or not. Available to
-/// sibling test modules without exposing the private `StoredSettings` type.
-#[cfg(test)]
-pub async fn set_global_bool_setting_for_test(
-    store: &Store,
-    key: &str,
-    value: bool,
-) -> Result<(), Status> {
-    let mut settings = load_global_settings(store).await?;
-    settings
-        .settings
-        .insert(key.to_string(), StoredSettingValue::Bool(value));
-    save_global_settings(store, &settings).await
-}
-
 pub(super) async fn save_global_settings(
     store: &Store,
     settings: &StoredSettings,
@@ -8087,21 +8042,6 @@ mod tests {
         sandbox
     }
 
-    async fn enable_providers_v2(state: &Arc<ServerState>) {
-        let global_settings = StoredSettings {
-            revision: 1,
-            settings: std::iter::once((
-                settings::PROVIDERS_V2_ENABLED_KEY.to_string(),
-                StoredSettingValue::Bool(true),
-            ))
-            .collect(),
-            ..Default::default()
-        };
-        save_global_settings(state.store.as_ref(), &global_settings)
-            .await
-            .unwrap();
-    }
-
     async fn get_sandbox_policy(state: &Arc<ServerState>, sandbox_id: &str) -> ProtoSandboxPolicy {
         handle_get_sandbox_config(
             state,
@@ -8199,7 +8139,6 @@ mod tests {
             Arc::clone(&fetch_count),
         );
         let state = Arc::new(state);
-        enable_providers_v2(&state).await;
 
         let mut provider_a = test_provider("provider-a", "moving-a");
         provider_a.credentials = HashMap::from([("TOKEN_A".to_string(), "a".to_string())]);
@@ -8671,65 +8610,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn providers_v2_enabled_defaults_false_when_unset() {
-        assert!(
-            !bool_setting_enabled(
-                &StoredSettings::default(),
-                settings::PROVIDERS_V2_ENABLED_KEY
-            )
-            .unwrap()
-        );
-    }
-
-    #[test]
-    fn providers_v2_enabled_reads_global_bool_setting() {
-        let mut settings = StoredSettings::default();
-        settings.settings.insert(
-            settings::PROVIDERS_V2_ENABLED_KEY.to_string(),
-            StoredSettingValue::Bool(true),
-        );
-
-        assert!(bool_setting_enabled(&settings, settings::PROVIDERS_V2_ENABLED_KEY).unwrap());
-    }
-
     #[tokio::test]
-    async fn sandbox_config_omits_provider_layers_when_v2_disabled() {
+    async fn sandbox_config_always_composes_provider_layers() {
         let state = test_server_state().await;
-        state
-            .store
-            .put_message(&test_provider("work-github", "github"))
-            .await
-            .unwrap();
-        state
-            .store
-            .put_message(&test_sandbox(
-                "sb-v2-disabled",
-                "v2-disabled",
-                test_policy_with_rule("sandbox_only", "sandbox.example.com"),
-                vec!["work-github".to_string()],
-            ))
-            .await
-            .unwrap();
-
-        let effective_policy = get_sandbox_policy(&state, "sb-v2-disabled").await;
-
-        assert!(
-            effective_policy
-                .network_policies
-                .contains_key("sandbox_only")
-        );
-        assert!(
-            !effective_policy
-                .network_policies
-                .contains_key("_provider_work_github")
-        );
-    }
-
-    #[tokio::test]
-    async fn sandbox_config_composes_provider_layers_when_v2_enabled() {
-        let state = test_server_state().await;
-        enable_providers_v2(&state).await;
         state
             .store
             .put_message(&test_provider("work-github", "github"))
@@ -9190,12 +9073,17 @@ mod tests {
         sandbox.spec.as_mut().unwrap().policy = None;
         state.store.put_message(&sandbox).await.unwrap();
 
+        let mut policy = test_sigv4_policy("bucket.s3.amazonaws.com", None);
+        let endpoint = &mut policy.network_policies.get_mut("aws").unwrap().endpoints[0];
+        endpoint.access = "read-write".to_string();
+        endpoint.enforcement = "enforce".to_string();
+
         handle_update_config(
             &state,
             with_user(Request::new(UpdateConfigRequest {
                 name: "signing-profile-endpoint".to_string(),
                 workspace: "default".to_string(),
-                policy: Some(test_sigv4_policy("bucket.s3.amazonaws.com", None)),
+                policy: Some(policy),
                 ..Default::default()
             })),
         )
@@ -9287,7 +9175,6 @@ mod tests {
         };
 
         let state = test_server_state().await;
-        enable_providers_v2(&state).await;
         state
             .store
             .put_message(&StoredProviderProfile {
@@ -9360,7 +9247,6 @@ mod tests {
         };
 
         let state = test_server_state().await;
-        enable_providers_v2(&state).await;
 
         let profile = StoredProviderProfile {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
@@ -9434,9 +9320,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sandbox_config_skips_profileless_provider_types_when_v2_enabled() {
+    async fn sandbox_config_skips_profileless_provider_types() {
         let state = test_server_state().await;
-        enable_providers_v2(&state).await;
         state
             .store
             .put_message(&test_provider("legacy-generic", "generic"))
@@ -9471,7 +9356,6 @@ mod tests {
     #[tokio::test]
     async fn sandbox_config_composition_is_jit_and_does_not_persist_provider_layers() {
         let state = test_server_state().await;
-        enable_providers_v2(&state).await;
         state
             .store
             .put_message(&test_provider("work-github", "github"))
@@ -9558,7 +9442,6 @@ mod tests {
         }
 
         let state = test_server_state().await;
-        enable_providers_v2(&state).await;
         state
             .store
             .put_message(&stored_profile("api.before.example"))
@@ -9661,7 +9544,6 @@ mod tests {
     #[tokio::test]
     async fn sandbox_config_composes_user_and_provider_rules() {
         let state = test_server_state().await;
-        enable_providers_v2(&state).await;
         state
             .store
             .put_message(&test_provider("work-github", "github"))
@@ -9710,7 +9592,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn provider_environment_resolution_is_unchanged_by_providers_v2_setting() {
+    async fn provider_environment_resolution_is_stable_across_policy_composition() {
         use openshell_core::proto::GetSandboxProviderEnvironmentRequest;
 
         let state = test_server_state().await;
@@ -9742,7 +9624,6 @@ mod tests {
         .into_inner()
         .environment;
 
-        enable_providers_v2(&state).await;
         let v2_env = handle_get_sandbox_provider_environment(
             &state,
             with_user(Request::new(GetSandboxProviderEnvironmentRequest {
@@ -9805,7 +9686,7 @@ mod tests {
             .put_message(&test_provider("work-github", "github"))
             .await
             .unwrap();
-        let mut profileless_openai = test_provider("gateway-openai", "openai");
+        let mut profileless_openai = test_provider("gateway-openai", "legacy-openai");
         profileless_openai.credentials =
             HashMap::from([("OPENAI_API_KEY".to_string(), "openai-secret".to_string())]);
         state.store.put_message(&profileless_openai).await.unwrap();
@@ -10769,7 +10650,6 @@ mod tests {
         };
 
         let state = test_server_state().await;
-        enable_providers_v2(&state).await;
         state
             .store
             .put_message(&test_provider("work-github", "github"))
@@ -10892,7 +10772,6 @@ mod tests {
         };
 
         let state = test_server_state().await;
-        enable_providers_v2(&state).await;
         handle_import_provider_profiles(
             &state,
             authed_request(ImportProviderProfilesRequest {
@@ -11051,7 +10930,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn global_policy_suppresses_provider_profile_layers_when_v2_enabled() {
+    async fn global_policy_suppresses_provider_profile_layers() {
         use openshell_core::proto::{
             GetSandboxConfigRequest, NetworkEndpoint, NetworkPolicyRule, SandboxPhase,
             SandboxPolicy, SandboxSpec,
@@ -11119,17 +10998,10 @@ mod tests {
         };
         let global_settings = StoredSettings {
             revision: 1,
-            settings: [
-                (
-                    settings::PROVIDERS_V2_ENABLED_KEY.to_string(),
-                    StoredSettingValue::Bool(true),
-                ),
-                (
-                    POLICY_SETTING_KEY.to_string(),
-                    StoredSettingValue::Bytes(hex::encode(global_policy.encode_to_vec())),
-                ),
-            ]
-            .into_iter()
+            settings: std::iter::once((
+                POLICY_SETTING_KEY.to_string(),
+                StoredSettingValue::Bytes(hex::encode(global_policy.encode_to_vec())),
+            ))
             .collect(),
             ..Default::default()
         };
@@ -12655,13 +12527,13 @@ mod tests {
             .find(|c| c.id == mechanistic_chunk_id)
             .expect("mechanistic chunk present");
         assert_eq!(mech.status, "pending");
-        // Mechanistic L4 with credential in scope flags as new credentialed
-        // reach for the binary on the host.
+        // The attached GitHub profile already grants credentialed reach for
+        // this host, so the mechanistic proposal does not expand reach.
         assert!(
-            mech.validation_result
+            !mech
+                .validation_result
                 .contains("credential_reach_expansion"),
-            "mechanistic L4 with credential in scope should emit \
-             credential_reach_expansion; got: {}",
+            "profile-composed reach should prevent a duplicate expansion finding; got: {}",
             mech.validation_result
         );
 
@@ -14348,7 +14220,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn agent_authored_validation_uses_providers_v2_effective_policy() {
+    async fn agent_authored_validation_uses_profile_composed_effective_policy() {
         use openshell_core::proto::{
             FilesystemPolicy, L7Allow, L7DenyRule, L7Rule, NetworkBinary, NetworkEndpoint,
             ProviderProfile, ProviderProfileCategory, SandboxPhase, SandboxPolicy, SandboxSpec,
@@ -14356,7 +14228,6 @@ mod tests {
         };
 
         let state = test_server_state().await;
-        enable_providers_v2(&state).await;
         state
             .store
             .put_message(&test_provider("work-custom", "custom-api"))
@@ -14580,7 +14451,6 @@ mod tests {
         };
 
         let state = test_server_state().await;
-        enable_providers_v2(&state).await;
 
         // Github provider attached: a credential ends up in scope for
         // api.github.com (PUT proposal flags MEDIUM). raw.githubusercontent.com
@@ -16555,32 +16425,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn enabling_provider_composition_rejects_existing_ambiguous_binding() {
-        let state = test_server_state().await;
-        install_ambiguous_provider_binding(&state, "enable").await;
-
-        let error = handle_update_config(
-            &state,
-            with_user(Request::new(UpdateConfigRequest {
-                global: true,
-                setting_key: settings::PROVIDERS_V2_ENABLED_KEY.to_string(),
-                setting_value: Some(SettingValue {
-                    value: Some(setting_value::Value::BoolValue(true)),
-                }),
-                ..Default::default()
-            })),
-        )
-        .await
-        .expect_err("provider composition must be validated before activation");
-
-        assert_eq!(error.code(), Code::FailedPrecondition);
-        assert!(error.message().contains("sandbox-enable"));
-        assert!(error.message().contains("tls"));
-        let settings = load_global_settings(state.store.as_ref()).await.unwrap();
-        assert!(!bool_setting_enabled(&settings, settings::PROVIDERS_V2_ENABLED_KEY).unwrap());
-    }
-
-    #[tokio::test]
     async fn deleting_global_policy_rejects_reactivated_ambiguous_provider_binding() {
         let state = test_server_state().await;
         install_ambiguous_provider_binding(&state, "delete-policy").await;
@@ -16595,20 +16439,6 @@ mod tests {
         )
         .await
         .expect("global policy should suppress provider composition");
-        handle_update_config(
-            &state,
-            with_user(Request::new(UpdateConfigRequest {
-                global: true,
-                setting_key: settings::PROVIDERS_V2_ENABLED_KEY.to_string(),
-                setting_value: Some(SettingValue {
-                    value: Some(setting_value::Value::BoolValue(true)),
-                }),
-                ..Default::default()
-            })),
-        )
-        .await
-        .expect("providers may be enabled while a global policy is active");
-
         let error = handle_update_config(
             &state,
             with_user(Request::new(UpdateConfigRequest {
@@ -16631,17 +16461,10 @@ mod tests {
     fn merge_effective_settings_global_overrides_sandbox_key() {
         let global = StoredSettings {
             revision: 2,
-            settings: [
-                (
-                    settings::PROVIDERS_V2_ENABLED_KEY.to_string(),
-                    StoredSettingValue::Bool(false),
-                ),
-                (
-                    settings::AGENT_POLICY_PROPOSALS_ENABLED_KEY.to_string(),
-                    StoredSettingValue::Bool(false),
-                ),
-            ]
-            .into_iter()
+            settings: std::iter::once((
+                settings::AGENT_POLICY_PROPOSALS_ENABLED_KEY.to_string(),
+                StoredSettingValue::Bool(false),
+            ))
             .collect(),
             ..Default::default()
         };
@@ -16649,7 +16472,7 @@ mod tests {
             revision: 1,
             settings: [
                 (
-                    settings::PROVIDERS_V2_ENABLED_KEY.to_string(),
+                    settings::AGENT_POLICY_PROPOSALS_ENABLED_KEY.to_string(),
                     StoredSettingValue::Bool(true),
                 ),
                 (
@@ -16663,15 +16486,6 @@ mod tests {
         };
 
         let merged = merge_effective_settings(&global, &sandbox).unwrap();
-        let providers_v2 = merged
-            .get(settings::PROVIDERS_V2_ENABLED_KEY)
-            .expect("providers_v2_enabled present");
-        assert_eq!(providers_v2.scope, SettingScope::Global as i32);
-        assert_eq!(
-            providers_v2.value.as_ref().and_then(|v| v.value.as_ref()),
-            Some(&setting_value::Value::BoolValue(false))
-        );
-
         let ocsf_json = merged
             .get("ocsf_json_enabled")
             .expect("ocsf_json_enabled present");

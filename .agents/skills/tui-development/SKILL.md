@@ -43,8 +43,8 @@ Gateway (discovered via openshell_bootstrap::list_gateways())
 
 - **Gateways** are discovered from on-disk config via `openshell_bootstrap::list_gateways()`. Each gateway has a name, endpoint, local/remote flag, and source label.
 - **Workspaces** are fetched via `ListWorkspaces`. The user cycles through workspaces with `[w]`, or views all workspaces at once. The current workspace scopes provider and sandbox lists.
-- **Provider Profiles** are fetched per-workspace via `ListProviderProfiles` when `providers_v2_enabled` is true. Profiles are cached in a `ProviderProfileCache` keyed by `(workspace, profile_id)` and matched to providers by type. They provide category, credential metadata, endpoint/binary counts, and inference capability.
-- **Providers** are fetched via `ListProviders` scoped to the current workspace. Each `ProviderListEntry` pairs a provider with its optional cached profile. When `providers_v2_enabled` is true, CRUD operations are read-only in the TUI; when false, the TUI supports create/update/delete.
+- **Provider Profiles** are fetched per-workspace via `ListProviderProfiles`. Profiles are cached in a `ProviderProfileCache` keyed by `(workspace, profile_id)` and matched to providers by type. They provide category, credential metadata, endpoint/binary counts, and inference capability.
+- **Providers** are fetched via `ListProviders` scoped to the current workspace. Each `ProviderListEntry` pairs a provider with its optional cached profile. The TUI supports profile-backed create, update, and delete operations.
 - **Global Settings** are fetched via `GetGatewayConfig` and displayed in a tabbed pane alongside providers on the dashboard. Each setting is a registered key with a typed value (bool/int/string). Platform-admin access is required; `PermissionDenied` disables the pane.
 - **Sandboxes** belong to the active gateway and workspace. Fetched via `ListSandboxes` with a periodic tick refresh.
 - **Sandbox Settings** are effective settings returned by `GetSandboxConfig`, each with a scope (sandbox, global, or unset). Globally-managed settings are blocked from sandbox-level edits.
@@ -170,7 +170,7 @@ Phase 2: WatchSandbox(follow_logs: true)  →  live tail  →  send via Event::L
 
 **Sandboxes**: Fetched via `ListSandboxes` on a 2-second tick, scoped to the current workspace (or all workspaces).
 
-**Providers**: Fetched via `ListProviders` on each tick. When `providers_v2_enabled` is true, provider profiles are also fetched per-workspace via `ListProviderProfiles` and cached in a `ProviderProfileCache` keyed by `(workspace, profile_id)`.
+**Providers**: Fetched via `ListProviders` on each tick. Provider profiles are fetched per-workspace via `ListProviderProfiles` and cached in a `ProviderProfileCache` keyed by `(workspace, profile_id)`.
 
 **Settings**: Global settings are fetched via `GetGatewayConfig` on each tick. Sandbox settings are fetched alongside the sandbox policy via `GetSandboxConfig` and refreshed on each tick when viewing a sandbox.
 
@@ -321,7 +321,7 @@ TUI actions should parallel `openshell` CLI commands so users have familiar ment
 | `openshell sandbox connect` | `[s]` on sandbox policy view to launch SSH shell |
 | `openshell logs <name>` | `[l]` on sandbox detail to open log viewer |
 | `openshell provider list` | Provider table on Dashboard (middle pane) |
-| `openshell provider create` | `[c]` on provider panel (when not providers_v2) |
+| `openshell provider create` | `[c]` on provider panel |
 | `openshell status` | Status in title bar + gateway list |
 
 When adding new TUI features, check what the CLI offers and maintain consistency.
@@ -383,10 +383,7 @@ All actions are accessible via keyboard shortcuts displayed in the nav bar. The 
 **Dashboard (Gateways focus):**
 `[Tab] Switch Panel  [Enter] Select  [j/k] Navigate  │  [:] Command  [q] Quit`
 
-**Dashboard (Providers focus, providers_v2):**
-`[Tab] Switch Panel  [h/l] Switch Tab  [j/k] Navigate  [Enter] Detail  read-only  │  [:] Command  [q] Quit`
-
-**Dashboard (Providers focus, legacy):**
+**Dashboard (Providers focus):**
 `[Tab] Switch Panel  [h/l] Switch Tab  [j/k] Navigate  [Enter] Detail  [c] Create  [u] Update  [d] Delete  │  [:] Command  [q] Quit`
 
 **Dashboard (Global Settings focus):**
@@ -412,7 +409,7 @@ All actions are accessible via keyboard shortcuts displayed in the nav bar. The 
 | File | Purpose |
 | --- | --- |
 | `crates/openshell-tui/Cargo.toml` | Crate manifest — dependencies on `openshell-core`, `openshell-bootstrap`, `ratatui`, `crossterm`, `tonic`, `tokio` |
-| `crates/openshell-tui/src/lib.rs` | Entry point. Event loop, gRPC calls (`refresh_data`, `refresh_providers`, `refresh_global_settings`, `refresh_workspaces`, `refresh_sandboxes`, `spawn_log_stream`, `handle_sandbox_delete`, `fetch_providers_v2_setting`), gateway switching, mTLS channel building, provider CRUD spawners, settings CRUD spawners, draft approval spawners |
+| `crates/openshell-tui/src/lib.rs` | Entry point. Event loop, gRPC calls (`refresh_data`, `refresh_providers`, `refresh_global_settings`, `refresh_workspaces`, `refresh_sandboxes`, `spawn_log_stream`, `handle_sandbox_delete`), gateway switching, mTLS channel building, provider CRUD spawners, settings CRUD spawners, draft approval spawners |
 | `crates/openshell-tui/src/app.rs` | `App` state struct, `Screen`/`Focus`/`InputMode`/`LogSourceFilter`/`MiddlePaneTab`/`SandboxPolicyTab` enums, `LogLine`/`GatewayEntry`/`GlobalSettingEntry`/`SandboxSettingEntry`/`ProviderListEntry`/`ProviderDetailView` structs, create sandbox/provider form state, all key handling logic |
 | `crates/openshell-tui/src/event.rs` | `Event` enum (`Key`, `Mouse`, `Tick`, `Redraw`, `Resize`, `LogLines`, `CreateResult`, `ProviderCreateResult`, `ProviderDetailFetched`, `ProviderUpdateResult`, `ProviderDeleteResult`, `DraftActionResult`, `GlobalSettingsFetched`, `GlobalSettingSetResult`, `GlobalSettingDeleteResult`, `SandboxSettingSetResult`, `SandboxSettingDeleteResult`, `ForwardWarnings`), `EventHandler` with mpsc channels and crossterm polling |
 | `crates/openshell-tui/src/theme.rs` | `colors` module (NVIDIA_GREEN, EVERGLADE, BG, FG) and `styles` module (all `Style` constants) |
@@ -526,7 +523,6 @@ The connect timeout for gateway switching is 10 seconds with HTTP/2 keepalive at
 4. On success:
    - `app.client` is replaced with a new intercepted client
    - `reset_sandbox_state()` clears all sandbox/log/draft/policy data
-   - `fetch_providers_v2_setting()` probes the new gateway's `GetGatewayConfig` to determine whether providers_v2 mode is enabled, so provider CRUD controls render correctly
    - `refresh_data()` runs the full capability refresh sequence: `refresh_health` → `refresh_global_settings` → `refresh_workspaces` → `refresh_providers` → `refresh_sandboxes`
 5. On failure: `status_text` shows the error
 
@@ -534,9 +530,8 @@ The connect timeout for gateway switching is 10 seconds with HTTP/2 keepalive at
 
 On launch, before the event loop starts:
 
-1. `fetch_providers_v2_setting()` — probe gateway capability
-2. `refresh_gateway_list()` — discover gateways from disk
-3. `refresh_data()` — full refresh (health, global settings, workspaces, providers, sandboxes)
+1. `refresh_gateway_list()` — discover gateways from disk
+2. `refresh_data()` — full refresh (health, global settings, workspaces, providers, sandboxes)
 
 ### Workspace switching lifecycle
 

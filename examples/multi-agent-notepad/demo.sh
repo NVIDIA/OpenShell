@@ -143,15 +143,15 @@ create_providers() {
 
     "$OPENSHELL_BIN" provider create \
         --name "$DEMO_CODEX_PROVIDER_NAME" \
-        --type generic \
+        --type codex \
         --credential CODEX_AUTH_ACCESS_TOKEN \
         --credential CODEX_AUTH_REFRESH_TOKEN \
         --credential CODEX_AUTH_ACCOUNT_ID >/dev/null
 
     "$OPENSHELL_BIN" provider create \
         --name "$DEMO_GITHUB_PROVIDER_NAME" \
-        --type generic \
-        --credential DEMO_GITHUB_TOKEN >/dev/null
+        --type github \
+        --credential "GITHUB_TOKEN=$DEMO_GITHUB_TOKEN" >/dev/null
 }
 
 run_sandbox() {

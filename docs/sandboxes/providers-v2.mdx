@@ -1,24 +1,24 @@
 ---
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-title: "Providers v2"
-sidebar-title: "Providers v2"
+title: "Provider profiles"
+sidebar-title: "Provider profiles"
 description: "Use provider profiles to attach credentials, network policy, and refresh metadata to OpenShell sandboxes."
 keywords: "Generative AI, Cybersecurity, Providers, Provider Profiles, Credentials, Policy, Sandbox"
 position: 5
 ---
 
-Providers v2 turns providers from credential records into profile-backed access bundles. A provider profile describes the credentials, endpoints, binaries, policy rules, and refresh behavior for a provider type. A provider instance stores the concrete credential and config values for one gateway.
+Provider profiles turn providers from credential records into profile-backed access bundles. A provider profile describes the credentials, endpoints, binaries, policy rules, and refresh behavior for a provider type. A provider instance stores the concrete credential and config values for one gateway.
 
-Use Providers v2 when you want provider-owned policy rules to travel with provider credentials. For example, a GitHub provider can describe both `GITHUB_TOKEN` and the GitHub API endpoints that a sandbox needs, so users do not have to copy the same network policy into every sandbox.
+Use provider profiles when you want provider-owned policy rules to travel with provider credentials. For example, a GitHub provider can describe both `GITHUB_TOKEN` and the GitHub API endpoints that a sandbox needs, so users do not have to copy the same network policy into every sandbox.
 
-## Why Providers v2 Exists
+## Why Provider Profiles Exist
 
 Provider credentials and network policy were previously configured through separate workflows. A user could create a GitHub provider that stored `GITHUB_TOKEN`, but the sandbox still needed a separate policy that allowed `api.github.com`, selected the right binaries, and configured REST enforcement.
 
-Providers v2 keeps those pieces together:
+Provider profiles keep those pieces together:
 
-| Need | Providers v2 behavior |
+| Need | Profile-backed behavior |
 |---|---|
 | Repeatable provider setup | Built-in and custom provider profiles define reusable provider types. |
 | Provider-aware policy | Attached providers contribute `_provider_*` network policy entries to the effective sandbox policy. |
@@ -27,29 +27,9 @@ Providers v2 keeps those pieces together:
 | Credential rotation | Provider refresh metadata lets the gateway refresh short-lived access tokens and update provider records. |
 | Credential transport | Credential delivery uses environment placeholders and proxy rewrite. Static placeholders resolve only at profile endpoints or explicitly bound sandbox policy endpoints for endpointless profiles. |
 
-## Enable Providers v2
-
-Provider profile policy composition is controlled by the gateway-level `providers_v2_enabled` setting. Enable it on the active gateway:
-
-```shell
-openshell settings set --global --key providers_v2_enabled --value true
-```
-
-When the setting is disabled or unset, attached provider profiles do not add network policy entries to the effective policy. Static provider credential placeholders still use the profile endpoints as a resolution boundary.
-
-To disable provider profile policy composition, delete the setting:
-
-```shell
-openshell settings delete --global --key providers_v2_enabled
-```
-
-<Note>
-The feature flag controls provider-derived policy layers. It does not disable endpoint binding for static credential placeholders. Provider profiles can also declare dynamic token grants that the sandbox proxy resolves on demand for matching HTTP endpoints.
-</Note>
-
 ## Available Features
 
-Providers v2 currently includes these user-facing features:
+Provider profiles include these user-facing features:
 
 - Built-in provider profiles loaded by the gateway by default.
 - Gateway configuration can compose built-in, user-managed, and interceptor-vended profile sources. Selecting only an interceptor makes its catalog authoritative by omission.
@@ -209,7 +189,7 @@ Later access-token rotations do not require workload restarts.
 
 ## Roadmap
 
-The following Providers v2 design items are not part of the current behavior:
+The following provider profile design items are not part of the current behavior:
 
 | Roadmap item | Current behavior |
 |---|---|
@@ -241,10 +221,11 @@ of truth: list, export, provider creation, policy composition, and sandbox
 provider environment resolution use the interceptor-vended profiles instead of
 built-in or user-imported profiles.
 
-Built-in Providers v2 profiles currently include:
+Built-in provider profiles currently include:
 
 | Profile ID | Category | Credential environment variables |
 |---|---|---|
+| `anthropic` | `inference` | `ANTHROPIC_API_KEY` |
 | `claude-code` | `agent` | `ANTHROPIC_API_KEY`, `CLAUDE_API_KEY` |
 | `codex` | `agent` | `CODEX_AUTH_ACCESS_TOKEN`, `CODEX_AUTH_REFRESH_TOKEN`, `CODEX_AUTH_ACCOUNT_ID`, `CODEX_AUTH_ID_TOKEN` |
 | `copilot` | `agent` | `COPILOT_GITHUB_TOKEN`, `GH_TOKEN`, `GITHUB_TOKEN` |
@@ -253,6 +234,7 @@ Built-in Providers v2 profiles currently include:
 | `github` | `source_control` | `GITHUB_TOKEN`, `GH_TOKEN` |
 | `google-vertex-ai` | `inference` | `GOOGLE_SERVICE_ACCOUNT_KEY`, `GOOGLE_VERTEX_AI_SERVICE_ACCOUNT_TOKEN`, `VERTEX_AI_SERVICE_ACCOUNT_TOKEN`, `GOOGLE_VERTEX_AI_TOKEN`, `VERTEX_AI_TOKEN` |
 | `nvidia` | `inference` | `NVIDIA_API_KEY` |
+| `openai` | `inference` | `OPENAI_API_KEY` |
 | `pypi` | `data` | None |
 
 Export a built-in profile as YAML:
@@ -440,8 +422,8 @@ binaries:
 
 `credentials` declares the credential names, environment variables, auth metadata, optional refresh metadata, and optional dynamic token grant metadata for the provider type. The `auth_style` field accepts `basic`, `bearer`, `header`, `query`, or `path`. When `auth_style` is `path`, set `path_template` to a URL path containing the `{credential}` placeholder exactly once (for example, `/v1/{credential}/resources`). Static credentials are exposed as placeholder environment variables and resolved in outbound HTTP requests only at their binding endpoints. Every static credential environment key receives the full profile endpoint set when the profile defines endpoints. An endpointless profile requires explicit sandbox policy bindings for each attached provider instance. Dynamic token grants are resolved by the sandbox proxy on demand for matching profile endpoints and support `bearer` or `header` placement. Credential environment variable names must not use the reserved `v<digits>_` prefix, such as `v10_GITHUB_TOKEN`, because OpenShell uses that namespace for revision-scoped placeholders.
 
-`discovery` controls what `--from-existing` scans when
-`providers_v2_enabled=true`. Each entry in `discovery.credentials` must name a
+`discovery` controls what `--from-existing` scans. Each entry in
+`discovery.credentials` must name a
 credential declared under `credentials`. OpenShell scans the referenced
 credential's `env_vars` in order and stores the first non-empty local
 environment value under the actual environment variable key.
@@ -465,7 +447,7 @@ Profile YAML can declare these refresh strategies:
 | `oauth2_refresh_token` | The gateway exchanges a refresh token for a short-lived access token. |
 | `oauth2_client_credentials` | The gateway mints a short-lived access token with OAuth2 client credentials. |
 | `google_service_account_jwt` | The gateway signs a Google service account JWT and exchanges it for an access token. |
-| `aws_sts_assume_role` | The gateway calls `sts:AssumeRole` and mints `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, and `AWS_SESSION_TOKEN` in one operation. Requires `providers_v2_enabled=true`. |
+| `aws_sts_assume_role` | The gateway calls `sts:AssumeRole` and mints `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, and `AWS_SESSION_TOKEN` in one operation. |
 
 `openshell provider refresh configure` accepts only gateway-mintable strategies: `oauth2-refresh-token`, `oauth2-client-credentials`, `google-service-account-jwt`, and `aws-sts-assume-role`. Use `openshell provider update` for `static` and `external` refresh patterns.
 
@@ -582,15 +564,11 @@ openshell provider create \
   --from-existing
 ```
 
-When `providers_v2_enabled=true`, `--from-existing` uses the provider profile's
-`discovery` section. If no profile exists for the requested type, the command
-fails instead of falling back to the legacy provider registry. When
-`providers_v2_enabled=false`, `--from-existing` uses the legacy provider
-registry and ignores profile `discovery` metadata.
-
-For example, with Providers v2 enabled, `--type openai --from-existing`
-requires an imported `openai` profile with a `discovery` section. Setting
-`OPENAI_API_KEY` alone is not enough for v2 profile discovery.
+`--from-existing` uses the provider profile's `discovery` section. If no
+profile exists for the requested type, the command fails instead of falling
+back to the retired provider registry. The built-in `openai` profile discovers
+`OPENAI_API_KEY`; the built-in `anthropic` profile discovers
+`ANTHROPIC_API_KEY`.
 
 Create a provider from an imported custom profile:
 
@@ -699,7 +677,7 @@ cannot replace or delete its primary credential or any co-minted output. Use
 management. You can still update unrelated credentials, configuration, and
 credential expiry metadata.
 
-For a complete Microsoft Graph OAuth2 refresh-token walkthrough, see [Refresh Microsoft Graph Credentials with Providers v2](/get-started/tutorials/microsoft-graph-provider-refresh).
+For a complete Microsoft Graph OAuth2 refresh-token walkthrough, see [Refresh Microsoft Graph Credentials with a Provider Profile](/get-started/tutorials/microsoft-graph-provider-refresh).
 
 The profile YAML strategy values use underscores, while the CLI `--strategy` values use kebab-case:
 
@@ -846,13 +824,14 @@ openshell sandbox create \
   -- claude
 ```
 
-When `providers_v2_enabled=true`, each attached provider with a matching profile contributes a provider policy layer to the sandbox effective policy. The base policy is the user-authored sandbox policy that you can edit and apply. The effective policy is the composed policy that the sandbox enforces: base policy plus provider policy layers. When the setting is disabled, the sandbox still receives endpoint-bound provider credentials but not provider-derived policy entries.
+Each attached provider with a matching profile contributes a provider policy layer to the sandbox effective policy. The base policy is the user-authored sandbox policy that you can edit and apply. The effective policy is the composed policy that the sandbox enforces: base policy plus provider policy layers. A gateway-global policy suppresses provider-derived policy layers.
 
 Updating a custom provider profile affects every provider instance whose `type` matches that profile ID. Provider instances are not rewritten, and sandbox-authored policies are not modified. Running sandboxes observe the updated provider-derived policy on their next config sync. If a gateway-global policy is active, provider-derived policy layers remain suppressed.
 
-Providers v2 does not infer or auto-attach providers from the sandbox command.
-Attach providers explicitly with `--provider` during sandbox creation, or use
-`openshell sandbox provider attach` after creation.
+The CLI can infer a provider profile from a recognized sandbox command and
+auto-create the provider from profile discovery. Attach a different existing
+provider explicitly with `--provider`, or use `openshell sandbox provider
+attach` after creation.
 
 List providers attached to a sandbox:
 

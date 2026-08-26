@@ -121,9 +121,8 @@ The `--from-existing` flag discovers credentials from local state (e.g., `gh aut
 ### Create a provider with explicit credentials
 
 ```bash
-openshell provider create --name my-api --type generic \
-  --credential API_KEY \
-  --config base_url=https://api.example.com
+openshell provider create --name my-openai --type openai \
+  --credential OPENAI_API_KEY
 ```
 
 Bare `KEY` reads the value from the environment variable of that name and avoids placing the secret in shell history. Use `KEY=VALUE` only when the user explicitly accepts that exposure.
@@ -143,14 +142,9 @@ must match. For a tunnel to `api.example.com:8443`, send
 port and is rejected. An absolute-form request target must use the same
 authority.
 
-Profile-backed provider policy composition is controlled by the gateway-global
-`providers_v2_enabled` setting. Static credential endpoint binding remains
-active even when policy composition is disabled:
-
-```bash
-openshell settings get --global
-openshell settings set --global --key providers_v2_enabled --value true
-```
+Profile-backed providers always contribute policy unless a gateway-global
+policy is active. Static credential endpoint binding remains independently
+enforced.
 
 ### Inspect and manage provider profiles
 
@@ -177,13 +171,13 @@ openshell provider delete my-github
 Use refresh commands only when the provider profile and gateway support refreshable credentials:
 
 ```bash
-openshell provider refresh status my-outlook
-openshell provider refresh configure my-outlook \
+openshell provider refresh status my-provider
+openshell provider refresh configure my-provider \
   --credential-key MS_GRAPH_ACCESS_TOKEN \
   --strategy oauth2-refresh-token \
   --secret-material-env REFRESH_TOKEN=MS_GRAPH_REFRESH_TOKEN \
   --credential-expires-at 2026-07-16T00:00:00Z
-openshell provider refresh rotate my-outlook --credential-key MS_GRAPH_ACCESS_TOKEN
+openshell provider refresh rotate my-provider --credential-key ACCESS_TOKEN
 ```
 
 Prefer `--secret-material-env KEY[=ENVVAR]` for secret refresh material. `--material KEY=VALUE` is for non-secret material; `--secret-material-key` marks supplied material keys as secret.
@@ -729,7 +723,7 @@ openshell settings set work-session --key ocsf_json_enabled --value true
 openshell settings delete work-session --key ocsf_json_enabled
 
 openshell settings get --global --json
-openshell settings set --global --key providers_v2_enabled --value true
+openshell settings set --global --key ocsf_json_enabled --value true
 ```
 
 Global mutations prompt for confirmation. Use `--yes` only in reviewed automation.

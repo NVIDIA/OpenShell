@@ -167,13 +167,18 @@ async fn create_provider_record_validating(
             "provider.credential_handles is internal gateway state and cannot be supplied",
         ));
     }
+
     if !provider.profile_workspace.is_empty() && provider.profile_workspace != workspace {
         return Err(Status::invalid_argument(
             "profile_workspace must be empty (global) or match the provider workspace",
         ));
     }
     if provider.credentials.is_empty()
-        && !provider_type_allows_empty_credentials(catalog, &provider.r#type)
+        && !provider_type_allows_empty_credentials(
+            catalog,
+            &provider.r#type,
+            &provider.profile_workspace,
+        )
     {
         return Err(Status::invalid_argument(
             "provider.credentials must not be empty",
@@ -2373,14 +2378,21 @@ pub(super) async fn handle_create_provider(
     if let Some(metadata) = provider.metadata.as_mut() {
         metadata.workspace.clone_from(&workspace);
     }
-    let provider_type = provider.r#type.clone();
-    if state.credentials.stores_provider_credentials() && !provider.credentials.is_empty() {
-        state.compute.ensure_workspace(&workspace).await?;
+    if !provider.credential_handles.is_empty() {
+        return Err(Status::invalid_argument(
+            "provider.credential_handles is internal gateway state and cannot be supplied",
+        ));
     }
+    let provider_type = provider.r#type.clone();
     let catalog = state
         .provider_profile_sources
         .snapshot_catalog(state.store.as_ref(), &workspace)
         .await?;
+    let profile = resolve_provider_create_profile(&catalog, &mut provider)?;
+    validate_provider_create_credentials(&profile, &provider)?;
+    if state.credentials.stores_provider_credentials() && !provider.credentials.is_empty() {
+        state.compute.ensure_workspace(&workspace).await?;
+    }
     let result = create_provider_record_validating(
         state.store.as_ref(),
         &workspace,
@@ -2841,13 +2853,6 @@ pub(super) async fn handle_delete_provider_profile(
     Ok(Response::new(DeleteProviderProfileResponse { deleted }))
 }
 
-pub(super) fn get_provider_type_profile_with_catalog(
-    catalog: &EffectiveProviderProfileCatalog,
-    id: &str,
-) -> Option<ProviderTypeProfile> {
-    catalog.get_type_profile(id)
-}
-
 pub(super) fn get_provider_type_profile_for_scope(
     catalog: &EffectiveProviderProfileCatalog,
     id: &str,
@@ -3004,11 +3009,108 @@ fn validate_refresh_material(
 fn provider_type_allows_empty_credentials(
     catalog: &EffectiveProviderProfileCatalog,
     provider_type: &str,
+    profile_workspace: &str,
 ) -> bool {
-    let Some(profile) = get_provider_type_profile_with_catalog(catalog, provider_type) else {
+    let Some(profile) =
+        get_provider_type_profile_for_scope(catalog, provider_type, profile_workspace)
+    else {
         return false;
     };
     profile.allows_empty_provider_credentials()
+}
+
+fn resolve_provider_create_profile(
+    catalog: &EffectiveProviderProfileCatalog,
+    provider: &mut Provider,
+) -> Result<ProviderTypeProfile, Status> {
+    let requested_type = provider.r#type.trim();
+    if requested_type.is_empty() {
+        return Err(Status::invalid_argument("provider.type is required"));
+    }
+    let profile_id = normalize_provider_type(requested_type).unwrap_or(requested_type);
+    let profile = get_provider_type_profile_for_scope(
+        catalog,
+        profile_id,
+        &provider.profile_workspace,
+    )
+    .ok_or_else(|| {
+        Status::invalid_argument(format!(
+            "provider profile '{profile_id}' was not found in the requested scope; import a matching profile before creating this provider"
+        ))
+    })?;
+    provider.r#type.clone_from(&profile.id);
+    Ok(profile)
+}
+
+fn validate_provider_create_credentials(
+    profile: &ProviderTypeProfile,
+    provider: &Provider,
+) -> Result<(), Status> {
+    validate_provider_credential_keys(profile, provider)?;
+    validate_required_static_credentials(profile, provider, &HashMap::new())
+}
+
+fn validate_provider_credential_keys(
+    profile: &ProviderTypeProfile,
+    provider: &Provider,
+) -> Result<(), Status> {
+    let declared_keys = profile
+        .credentials
+        .iter()
+        .flat_map(|credential| credential.env_vars.iter())
+        .collect::<HashSet<_>>();
+    let mut unknown_keys = provider
+        .credentials
+        .keys()
+        .filter(|key| !declared_keys.contains(key))
+        .cloned()
+        .collect::<Vec<_>>();
+    unknown_keys.sort();
+    if !unknown_keys.is_empty() {
+        return Err(Status::invalid_argument(format!(
+            "provider credentials are not declared by profile '{}': {}",
+            profile.id,
+            unknown_keys.join(", ")
+        )));
+    }
+
+    Ok(())
+}
+
+fn validate_required_static_credentials(
+    profile: &ProviderTypeProfile,
+    provider: &Provider,
+    pending_credentials: &HashMap<String, String>,
+) -> Result<(), Status> {
+    let mut missing = Vec::new();
+    for credential in profile.required_static_credentials() {
+        let supplied = credential.env_vars.iter().any(|key| {
+            provider
+                .credentials
+                .get(key)
+                .is_some_and(|value| !value.trim().is_empty())
+                || provider.credential_handles.contains_key(key)
+                || pending_credentials
+                    .get(key)
+                    .is_some_and(|value| !value.trim().is_empty())
+        });
+        if !supplied {
+            missing.push(
+                credential
+                    .env_vars
+                    .first()
+                    .map_or_else(|| credential.name.clone(), Clone::clone),
+            );
+        }
+    }
+    if !missing.is_empty() {
+        return Err(Status::invalid_argument(format!(
+            "provider profile '{}' requires static credentials: {}",
+            profile.id,
+            missing.join(", ")
+        )));
+    }
+    Ok(())
 }
 
 fn normalize_profile_id_request(id: &str) -> Result<String, Status> {
@@ -4126,18 +4228,6 @@ pub(super) async fn handle_configure_provider_refresh(
             crate::provider_refresh::refresh_strategy_name(strategy as i32)
         )));
     }
-    if strategy == ProviderCredentialRefreshStrategy::AwsStsAssumeRole {
-        let global_settings =
-            crate::grpc::policy::load_global_settings(state.store.as_ref()).await?;
-        if !crate::grpc::policy::bool_setting_enabled(
-            &global_settings,
-            openshell_core::settings::PROVIDERS_V2_ENABLED_KEY,
-        )? {
-            return Err(Status::failed_precondition(
-                "aws_sts_assume_role requires providers_v2_enabled=true",
-            ));
-        }
-    }
     if request.material.len() > MAX_PROVIDER_CONFIG_ENTRIES {
         return Err(Status::invalid_argument(format!(
             "material exceeds maximum entries ({} > {MAX_PROVIDER_CONFIG_ENTRIES})",
@@ -4755,11 +4845,10 @@ mod tests {
         ImportProviderProfilesRequest, L7Allow, L7Rule, LintProviderProfilesRequest,
         ListProviderProfilesRequest, ListProvidersRequest, NetworkBinary, NetworkEndpoint,
         NetworkPolicyRule, ProviderCredentialRefresh, ProviderCredentialRefreshMaterial,
-        ProviderCredentialRefreshRecoveryAction, ProviderCredentialTokenGrant,
-        ProviderCredentialTokenGrantAudienceOverride, ProviderProfile, ProviderProfileCategory,
-        ProviderProfileCredential, ProviderProfileImportItem, RotateProviderCredentialRequest,
-        Sandbox, SandboxPolicy, SandboxSpec, StoredProviderProfile, UpdateProviderProfilesRequest,
-        UpdateProviderRequest,
+        ProviderCredentialTokenGrant, ProviderCredentialTokenGrantAudienceOverride,
+        ProviderProfile, ProviderProfileCategory, ProviderProfileCredential,
+        ProviderProfileImportItem, RotateProviderCredentialRequest, Sandbox, SandboxPolicy,
+        SandboxSpec, StoredProviderProfile, UpdateProviderProfilesRequest, UpdateProviderRequest,
     };
     use openshell_core::{ObjectId, ObjectName};
     use tonic::{Code, Request};
@@ -4797,11 +4886,11 @@ mod tests {
         );
         assert_eq!(
             telemetry_provider_profile("glab"),
-            TelemetryProviderProfile::Gitlab
+            TelemetryProviderProfile::Custom
         );
         assert_eq!(
             telemetry_provider_profile("outlook"),
-            TelemetryProviderProfile::Outlook
+            TelemetryProviderProfile::Custom
         );
         assert_eq!(
             telemetry_provider_profile("generic"),
@@ -5657,6 +5746,7 @@ mod tests {
         assert_eq!(
             ids,
             vec![
+                "anthropic",
                 "aws",
                 "aws-bedrock",
                 "aws-s3",
@@ -5669,6 +5759,7 @@ mod tests {
                 "google-cloud",
                 "google-vertex-ai",
                 "nvidia",
+                "openai",
                 "pypi"
             ]
         );
@@ -5773,20 +5864,6 @@ mod tests {
     #[tokio::test]
     async fn profile_update_rejects_fanout_endpoint_ambiguity_without_persisting() {
         let state = test_server_state().await;
-        crate::grpc::policy::save_global_settings(
-            state.store.as_ref(),
-            &crate::grpc::StoredSettings {
-                revision: 1,
-                settings: std::iter::once((
-                    openshell_core::settings::PROVIDERS_V2_ENABLED_KEY.to_string(),
-                    crate::grpc::StoredSettingValue::Bool(true),
-                ))
-                .collect(),
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap();
 
         let mut initial_profile = custom_profile("fanout-ambiguity");
         initial_profile.endpoints.push(NetworkEndpoint {
@@ -7105,17 +7182,7 @@ mod tests {
 
     #[tokio::test]
     async fn delete_aws_sts_refresh_clears_all_pinned_output_expiries() {
-        use crate::grpc::policy::set_global_bool_setting_for_test;
-
         let state = test_server_state().await;
-        set_global_bool_setting_for_test(
-            state.store.as_ref(),
-            openshell_core::settings::PROVIDERS_V2_ENABLED_KEY,
-            true,
-        )
-        .await
-        .unwrap();
-
         create_provider_record(
             state.store.as_ref(),
             "default",
@@ -8122,6 +8189,96 @@ mod tests {
 
         assert_eq!(err.code(), Code::InvalidArgument);
         assert!(err.message().contains("internal gateway state"));
+    }
+
+    #[tokio::test]
+    async fn handle_create_provider_rejects_profileless_type() {
+        let state = test_server_state().await;
+        let err = handle_create_provider(
+            &state,
+            authed_request(CreateProviderRequest {
+                provider: Some(provider_with_values("legacy-gitlab", "gitlab")),
+                workspace: "default".to_string(),
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(
+            err.message()
+                .contains("provider profile 'gitlab' was not found")
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_create_provider_allows_credentialless_policy_profile() {
+        let state = test_server_state().await;
+        let response = handle_create_provider(
+            &state,
+            authed_request(CreateProviderRequest {
+                provider: Some(Provider {
+                    metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                        name: "pypi".to_string(),
+                        workspace: "default".to_string(),
+                        ..Default::default()
+                    }),
+                    r#type: "pypi".to_string(),
+                    profile_workspace: "default".to_string(),
+                    ..Default::default()
+                }),
+                workspace: "default".to_string(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner()
+        .provider
+        .expect("provider");
+
+        assert_eq!(response.r#type, "pypi");
+        assert!(response.credentials.is_empty());
+    }
+
+    #[tokio::test]
+    async fn handle_create_provider_allows_retired_type_with_imported_profile() {
+        let state = test_server_state().await;
+        handle_import_provider_profiles(
+            &state,
+            authed_request(ImportProviderProfilesRequest {
+                profiles: vec![ProviderProfileImportItem {
+                    profile: Some(custom_profile("gitlab")),
+                    source: "custom-gitlab.yaml".to_string(),
+                }],
+                workspace: "default".to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+
+        let response = handle_create_provider(
+            &state,
+            authed_request(CreateProviderRequest {
+                provider: Some(Provider {
+                    metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                        name: "private-gitlab".to_string(),
+                        workspace: "default".to_string(),
+                        ..Default::default()
+                    }),
+                    r#type: "gitlab".to_string(),
+                    profile_workspace: "default".to_string(),
+                    ..Default::default()
+                }),
+                workspace: "default".to_string(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner()
+        .provider
+        .expect("provider");
+
+        assert_eq!(response.r#type, "gitlab");
     }
 
     #[tokio::test]
@@ -10894,7 +11051,8 @@ mod tests {
         let state = test_server_state().await;
 
         // Create a provider
-        let mut provider = provider_with_values("test-provider", "generic");
+        let mut provider =
+            provider_with_credential_value("test-provider", "openai", "OPENAI_API_KEY", "sk-test");
         provider.metadata.as_mut().unwrap().id = String::new();
         handle_create_provider(
             &state,
@@ -10965,7 +11123,8 @@ mod tests {
         let state = test_server_state().await;
 
         // Create a provider
-        let mut provider = provider_with_values("test-provider", "generic");
+        let mut provider =
+            provider_with_credential_value("test-provider", "openai", "OPENAI_API_KEY", "sk-test");
         provider.metadata.as_mut().unwrap().id = String::new();
         handle_create_provider(
             &state,
@@ -11107,7 +11266,8 @@ mod tests {
         let state = Arc::new(test_server_state().await);
 
         // Create a provider
-        let mut provider = provider_with_values("test-provider", "generic");
+        let mut provider =
+            provider_with_credential_value("test-provider", "openai", "OPENAI_API_KEY", "sk-test");
         provider.metadata.as_mut().unwrap().id = String::new();
         handle_create_provider(
             &state,
@@ -11199,79 +11359,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn configure_aws_sts_requires_v2_enabled() {
+    async fn configure_aws_sts_succeeds_without_feature_gate() {
         let state = test_server_state().await;
-        create_provider_record(
-            state.store.as_ref(),
-            "default",
-            Provider {
-                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
-                    id: String::new(),
-                    name: "my-aws".to_string(),
-                    created_at_ms: 0,
-                    labels: HashMap::new(),
-                    resource_version: 0,
-                    annotations: HashMap::new(),
-                    workspace: "default".to_string(),
-                    deletion_timestamp_ms: 0,
-                }),
-                r#type: "aws".to_string(),
-                credentials: std::iter::once((
-                    "AWS_ACCESS_KEY_ID".to_string(),
-                    "placeholder".to_string(),
-                ))
-                .collect(),
-                config: HashMap::new(),
-                credential_expires_at_ms: HashMap::new(),
-                profile_workspace: "default".to_string(),
-                credential_handles: HashMap::new(),
-            },
-        )
-        .await
-        .unwrap();
-
-        let err = handle_configure_provider_refresh(
-            &state,
-            authed_request(ConfigureProviderRefreshRequest {
-                provider: "my-aws".to_string(),
-                credential_key: "AWS_ACCESS_KEY_ID".to_string(),
-                strategy: ProviderCredentialRefreshStrategy::AwsStsAssumeRole as i32,
-                material: HashMap::from([(
-                    "role_arn".to_string(),
-                    "arn:aws:iam::123456789012:role/Test".to_string(),
-                )]),
-                secret_material_keys: Vec::new(),
-                expires_at_ms: None,
-                workspace: "default".to_string(),
-            }),
-        )
-        .await
-        .unwrap_err();
-
-        assert_eq!(err.code(), Code::FailedPrecondition);
-        assert!(err.message().contains("providers_v2_enabled"));
-    }
-
-    #[tokio::test]
-    async fn configure_aws_sts_succeeds_with_v2_enabled() {
-        use crate::grpc::StoredSettingValue;
-        use crate::grpc::StoredSettings;
-        use crate::grpc::policy::save_global_settings;
-
-        let state = test_server_state().await;
-
-        let global_settings = StoredSettings {
-            revision: 1,
-            settings: std::iter::once((
-                openshell_core::settings::PROVIDERS_V2_ENABLED_KEY.to_string(),
-                StoredSettingValue::Bool(true),
-            ))
-            .collect(),
-            ..Default::default()
-        };
-        save_global_settings(state.store.as_ref(), &global_settings)
-            .await
-            .unwrap();
 
         create_provider_record(
             state.store.as_ref(),
@@ -11332,24 +11421,7 @@ mod tests {
 
     #[tokio::test]
     async fn configure_aws_sts_rejects_endpoint_override_material() {
-        use crate::grpc::StoredSettingValue;
-        use crate::grpc::StoredSettings;
-        use crate::grpc::policy::save_global_settings;
-
         let state = test_server_state().await;
-        let global_settings = StoredSettings {
-            revision: 1,
-            settings: std::iter::once((
-                openshell_core::settings::PROVIDERS_V2_ENABLED_KEY.to_string(),
-                StoredSettingValue::Bool(true),
-            ))
-            .collect(),
-            ..Default::default()
-        };
-        save_global_settings(state.store.as_ref(), &global_settings)
-            .await
-            .unwrap();
-
         create_provider_record(
             state.store.as_ref(),
             "default",
@@ -11424,24 +11496,7 @@ mod tests {
 
     #[tokio::test]
     async fn configure_aws_sts_rejects_partial_source_credentials() {
-        use crate::grpc::StoredSettingValue;
-        use crate::grpc::StoredSettings;
-        use crate::grpc::policy::save_global_settings;
-
         let state = test_server_state().await;
-        let global_settings = StoredSettings {
-            revision: 1,
-            settings: std::iter::once((
-                openshell_core::settings::PROVIDERS_V2_ENABLED_KEY.to_string(),
-                StoredSettingValue::Bool(true),
-            ))
-            .collect(),
-            ..Default::default()
-        };
-        save_global_settings(state.store.as_ref(), &global_settings)
-            .await
-            .unwrap();
-
         create_provider_record(
             state.store.as_ref(),
             "default",
@@ -11496,17 +11551,7 @@ mod tests {
 
     #[tokio::test]
     async fn configure_aws_sts_rejects_session_token_without_pair() {
-        use crate::grpc::policy::set_global_bool_setting_for_test;
-
         let state = test_server_state().await;
-        set_global_bool_setting_for_test(
-            state.store.as_ref(),
-            openshell_core::settings::PROVIDERS_V2_ENABLED_KEY,
-            true,
-        )
-        .await
-        .unwrap();
-
         create_provider_record(
             state.store.as_ref(),
             "default",
@@ -11562,24 +11607,7 @@ mod tests {
 
     #[tokio::test]
     async fn configure_aws_sts_persists_resolved_additional_output_keys() {
-        use crate::grpc::StoredSettingValue;
-        use crate::grpc::StoredSettings;
-        use crate::grpc::policy::save_global_settings;
-
         let state = test_server_state().await;
-        let global_settings = StoredSettings {
-            revision: 1,
-            settings: std::iter::once((
-                openshell_core::settings::PROVIDERS_V2_ENABLED_KEY.to_string(),
-                StoredSettingValue::Bool(true),
-            ))
-            .collect(),
-            ..Default::default()
-        };
-        save_global_settings(state.store.as_ref(), &global_settings)
-            .await
-            .unwrap();
-
         create_provider_record(
             state.store.as_ref(),
             "default",
@@ -11651,17 +11679,7 @@ mod tests {
 
     #[tokio::test]
     async fn update_provider_rejects_gateway_refresh_primary_and_additional_output_keys() {
-        use crate::grpc::policy::set_global_bool_setting_for_test;
-
         let state = test_server_state().await;
-        set_global_bool_setting_for_test(
-            state.store.as_ref(),
-            openshell_core::settings::PROVIDERS_V2_ENABLED_KEY,
-            true,
-        )
-        .await
-        .unwrap();
-
         let original_credentials = HashMap::from([
             (
                 "AWS_ACCESS_KEY_ID".to_string(),
@@ -11751,24 +11769,7 @@ mod tests {
 
     #[tokio::test]
     async fn configure_aws_sts_requires_profile_declaring_the_refresh() {
-        use crate::grpc::StoredSettingValue;
-        use crate::grpc::StoredSettings;
-        use crate::grpc::policy::save_global_settings;
-
         let state = test_server_state().await;
-        let global_settings = StoredSettings {
-            revision: 1,
-            settings: std::iter::once((
-                openshell_core::settings::PROVIDERS_V2_ENABLED_KEY.to_string(),
-                StoredSettingValue::Bool(true),
-            ))
-            .collect(),
-            ..Default::default()
-        };
-        save_global_settings(state.store.as_ref(), &global_settings)
-            .await
-            .unwrap();
-
         // A generic provider has no profile, so it declares no STS refresh
         // binding. STS must not be configurable against it.
         create_provider_record(
@@ -11824,24 +11825,7 @@ mod tests {
 
     #[tokio::test]
     async fn configure_aws_sts_rejects_non_canonical_credential_key() {
-        use crate::grpc::StoredSettingValue;
-        use crate::grpc::StoredSettings;
-        use crate::grpc::policy::save_global_settings;
-
         let state = test_server_state().await;
-        let global_settings = StoredSettings {
-            revision: 1,
-            settings: std::iter::once((
-                openshell_core::settings::PROVIDERS_V2_ENABLED_KEY.to_string(),
-                StoredSettingValue::Bool(true),
-            ))
-            .collect(),
-            ..Default::default()
-        };
-        save_global_settings(state.store.as_ref(), &global_settings)
-            .await
-            .unwrap();
-
         create_provider_record(
             state.store.as_ref(),
             "default",
@@ -11889,116 +11873,6 @@ mod tests {
 
         assert_eq!(err.code(), Code::FailedPrecondition);
         assert!(err.message().contains("AWS_ACCESS_KEY_ID"));
-    }
-
-    #[tokio::test]
-    async fn rotate_aws_sts_blocked_after_providers_v2_disabled() {
-        use crate::grpc::policy::set_global_bool_setting_for_test;
-
-        let state = test_server_state().await;
-
-        set_global_bool_setting_for_test(
-            state.store.as_ref(),
-            openshell_core::settings::PROVIDERS_V2_ENABLED_KEY,
-            true,
-        )
-        .await
-        .unwrap();
-
-        create_provider_record(
-            state.store.as_ref(),
-            "default",
-            Provider {
-                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
-                    id: String::new(),
-                    name: "aws-gate".to_string(),
-                    created_at_ms: 0,
-                    labels: HashMap::new(),
-                    resource_version: 0,
-                    annotations: HashMap::new(),
-                    workspace: "default".to_string(),
-                    deletion_timestamp_ms: 0,
-                }),
-                r#type: "aws".to_string(),
-                credentials: HashMap::new(),
-                config: HashMap::new(),
-                credential_expires_at_ms: HashMap::new(),
-                profile_workspace: "default".to_string(),
-                credential_handles: HashMap::new(),
-            },
-        )
-        .await
-        .unwrap();
-
-        handle_configure_provider_refresh(
-            &state,
-            authed_request(ConfigureProviderRefreshRequest {
-                provider: "aws-gate".to_string(),
-                credential_key: "AWS_ACCESS_KEY_ID".to_string(),
-                strategy: ProviderCredentialRefreshStrategy::AwsStsAssumeRole as i32,
-                material: HashMap::from([(
-                    "role_arn".to_string(),
-                    "arn:aws:iam::123456789012:role/Test".to_string(),
-                )]),
-                secret_material_keys: Vec::new(),
-                expires_at_ms: None,
-                workspace: "default".to_string(),
-            }),
-        )
-        .await
-        .unwrap();
-
-        // Disable the gate after the refresh is already configured.
-        set_global_bool_setting_for_test(
-            state.store.as_ref(),
-            openshell_core::settings::PROVIDERS_V2_ENABLED_KEY,
-            false,
-        )
-        .await
-        .unwrap();
-
-        let err = handle_rotate_provider_credential(
-            &state,
-            authed_request(RotateProviderCredentialRequest {
-                provider: "aws-gate".to_string(),
-                credential_key: "AWS_ACCESS_KEY_ID".to_string(),
-                workspace: "default".to_string(),
-            }),
-        )
-        .await
-        .unwrap_err();
-
-        assert_eq!(err.code(), Code::FailedPrecondition);
-        assert!(err.message().contains("providers_v2_enabled"));
-
-        // The gate rejection is recorded on the refresh state, and no credential
-        // was minted into the provider.
-        let provider = state
-            .store
-            .get_message_by_name::<Provider>("default", "aws-gate")
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(!provider.credentials.contains_key("AWS_ACCESS_KEY_ID"));
-        let refresh_state = crate::provider_refresh::get_refresh_state(
-            state.store.as_ref(),
-            "default",
-            provider.object_id(),
-            "AWS_ACCESS_KEY_ID",
-        )
-        .await
-        .unwrap()
-        .expect("refresh state should exist");
-        assert_eq!(refresh_state.status, "configuration_required");
-        assert_eq!(
-            refresh_state.recovery_action,
-            ProviderCredentialRefreshRecoveryAction::FixConfiguration as i32
-        );
-        assert_eq!(refresh_state.failure_code, "refresh_configuration_invalid");
-        assert_eq!(
-            refresh_state.next_refresh_at_ms - refresh_state.last_error_at_ms,
-            60 * 60 * 1000
-        );
     }
 
     #[tokio::test]
@@ -12078,24 +11952,7 @@ mod tests {
 
     #[tokio::test]
     async fn configure_aws_sts_validates_additional_credential_key_collision() {
-        use crate::grpc::StoredSettingValue;
-        use crate::grpc::StoredSettings;
-        use crate::grpc::policy::save_global_settings;
-
         let state = test_server_state().await;
-
-        let global_settings = StoredSettings {
-            revision: 1,
-            settings: std::iter::once((
-                openshell_core::settings::PROVIDERS_V2_ENABLED_KEY.to_string(),
-                StoredSettingValue::Bool(true),
-            ))
-            .collect(),
-            ..Default::default()
-        };
-        save_global_settings(state.store.as_ref(), &global_settings)
-            .await
-            .unwrap();
 
         let mut existing_provider = Provider {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
@@ -12198,17 +12055,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_configure_aws_sts_reserves_key_exactly_once() {
-        use crate::grpc::policy::set_global_bool_setting_for_test;
-
         let state = test_server_state().await;
-        set_global_bool_setting_for_test(
-            state.store.as_ref(),
-            openshell_core::settings::PROVIDERS_V2_ENABLED_KEY,
-            true,
-        )
-        .await
-        .unwrap();
-
         for name in ["aws-a", "aws-b"] {
             create_provider_record(
                 state.store.as_ref(),
@@ -12454,8 +12301,8 @@ mod tests {
         // Create same-named provider in each workspace via handlers.
         let make_provider = || Provider {
             metadata: None,
-            r#type: "custom".to_string(),
-            credentials: HashMap::from([("TOKEN".to_string(), "secret".to_string())]),
+            r#type: "pypi".to_string(),
+            credentials: HashMap::new(),
             config: HashMap::new(),
             credential_expires_at_ms: HashMap::new(),
             profile_workspace: String::new(),

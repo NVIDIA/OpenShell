@@ -427,6 +427,7 @@ impl EffectiveProviderProfileCatalog {
             .map(|entry| entry.effective.response.clone())
     }
 
+    #[cfg(test)]
     pub(crate) fn get_type_profile(&self, id: &str) -> Option<ProviderTypeProfile> {
         let id = normalize_profile_id(id)?;
         self.profiles

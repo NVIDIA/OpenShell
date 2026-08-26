@@ -368,10 +368,9 @@ const POLICY_EXAMPLES: &str = "\x1b[1mALIAS\x1b[0m
 const SETTINGS_EXAMPLES: &str = "\x1b[1mEXAMPLES\x1b[0m
   $ openshell settings get my-sandbox
   $ openshell settings get --global
-  $ openshell settings set --global --key providers_v2_enabled --value true
   $ openshell settings set my-sandbox --key ocsf_json_enabled --value true
   $ openshell settings set --global --key ocsf_json_enabled --value true
-  $ openshell settings delete --global --key providers_v2_enabled
+  $ openshell settings delete --global --key ocsf_json_enabled
 ";
 
 const PROVIDER_EXAMPLES: &str = "\x1b[1mEXAMPLES\x1b[0m
@@ -811,7 +810,7 @@ impl From<CliEditor> for openshell_cli::ssh::Editor {
 #[derive(Subcommand, Debug)]
 enum ProviderCommands {
     /// Create a provider config.
-    #[command(group = clap::ArgGroup::new("cred_source").required(true).multiple(true).args(["from_existing", "credentials", "from_gcloud_adc", "runtime_credentials", "from_oidc_token"]), help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    #[command(group = clap::ArgGroup::new("cred_source").required(false).multiple(true).args(["from_existing", "credentials", "from_gcloud_adc", "runtime_credentials", "from_oidc_token"]), help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Create {
         /// Provider name.
         #[arg(long)]
@@ -4944,8 +4943,8 @@ mod tests {
     }
 
     #[test]
-    fn provider_create_requires_credential_source() {
-        let err = Cli::try_parse_from([
+    fn provider_create_accepts_no_credential_source() {
+        let cli = Cli::try_parse_from([
             "openshell",
             "provider",
             "create",
@@ -4954,9 +4953,21 @@ mod tests {
             "--type",
             "spiffe-token-demo",
         ])
-        .expect_err("provider create should require a credential source");
+        .expect("provider create should allow profiles without static credentials");
 
-        assert!(err.to_string().contains("--runtime-credentials"));
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Provider {
+                command: Some(ProviderCommands::Create {
+                    from_existing: false,
+                    credentials,
+                    from_gcloud_adc: false,
+                    from_oidc_token: false,
+                    runtime_credentials: false,
+                    ..
+                })
+            }) if credentials.is_empty()
+        ));
     }
 
     #[test]

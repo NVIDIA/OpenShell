@@ -11,6 +11,7 @@ use openshell_core::auth::EdgeAuthInterceptor;
 use openshell_core::proto::open_shell_client::OpenShellClient;
 use openshell_core::proto::setting_value;
 use openshell_core::settings::{self, SettingValueKind};
+use openshell_providers::{ProviderTypeProfile, RealDiscoveryContext, discover_from_profile};
 use tonic::service::interceptor::InterceptedService;
 use tonic::transport::Channel;
 
@@ -350,9 +351,9 @@ pub enum ProviderKeyField {
     Name,
     /// Focused credential row for known types (index via `cred_cursor`).
     Credential,
-    /// Custom env var name (generic / no-known-env-vars types only).
+    /// Custom env var name (legacy no-known-env-vars types only).
     EnvVarName,
-    /// Custom env var value (generic / no-known-env-vars types only).
+    /// Custom env var value (legacy no-known-env-vars types only).
     GenericValue,
     /// Browsing/deleting existing config entries (Up/Down/Ctrl+D).
     ConfigList,
@@ -385,13 +386,13 @@ pub struct CreateProviderForm {
     pub config_key_input: String,
     /// Config value being entered.
     pub config_value_input: String,
-    /// For generic / types with no known env vars: custom env var name.
+    /// For legacy types with no known env vars: custom env var name.
     pub generic_env_name: String,
-    /// For generic / types with no known env vars: custom value.
+    /// For legacy types with no known env vars: custom value.
     pub generic_value: String,
     /// Which field is focused in the key entry form.
     pub key_field: ProviderKeyField,
-    /// True when the provider type has no known env vars (generic, outlook).
+    /// True when the selected profile has no credential environment variables.
     pub is_generic: bool,
     /// Status message (errors, validation).
     pub status: Option<String>,
@@ -590,7 +591,7 @@ pub struct App {
     pub pending_workspace_refresh: bool,
 
     // Provider list
-    pub providers_v2_enabled: bool,
+    pub provider_profiles: Vec<openshell_core::proto::ProviderProfile>,
     pub provider_entries: Vec<ProviderListEntry>,
     pub provider_names: Vec<String>,
     pub provider_types: Vec<String>,
@@ -970,7 +971,7 @@ impl App {
             all_workspaces: false,
             workspace_names: Vec::new(),
             pending_workspace_refresh: false,
-            providers_v2_enabled: false,
+            provider_profiles: Vec::new(),
             provider_entries: Vec::new(),
             provider_names: Vec::new(),
             provider_types: Vec::new(),
@@ -1410,7 +1411,7 @@ impl App {
                     self.overflow_focus_up();
                 }
             }
-            KeyCode::Char('c') if !self.providers_v2_enabled => {
+            KeyCode::Char('c') => {
                 if self.all_workspaces {
                     self.status_text =
                         "Switch to a specific workspace to create providers.".to_string();
@@ -1423,10 +1424,10 @@ impl App {
                 self.pending_provider_get = true;
             }
             // Open update form for the selected provider.
-            KeyCode::Char('u') if self.provider_count > 0 && !self.providers_v2_enabled => {
+            KeyCode::Char('u') if self.provider_count > 0 => {
                 self.open_update_provider_form();
             }
-            KeyCode::Char('d') if self.provider_count > 0 && !self.providers_v2_enabled => {
+            KeyCode::Char('d') if self.provider_count > 0 => {
                 self.confirm_provider_delete = true;
             }
             KeyCode::Char('h' | 'l') | KeyCode::Left | KeyCode::Right => {
@@ -2383,8 +2384,13 @@ impl App {
     // ------------------------------------------------------------------
 
     fn open_create_provider_form(&mut self) {
-        let known = openshell_providers::ProviderRegistry::new().known_types();
-        let types: Vec<String> = known.into_iter().map(String::from).collect();
+        let mut types = self
+            .provider_profiles
+            .iter()
+            .map(|profile| profile.id.clone())
+            .collect::<Vec<_>>();
+        types.sort();
+        types.dedup();
 
         self.create_provider_form = Some(CreateProviderForm {
             types,
@@ -2410,8 +2416,17 @@ impl App {
                 }
                 KeyCode::Enter => {
                     let selected = form.types[form.type_cursor].clone();
-                    let registry = openshell_providers::ProviderRegistry::new();
-                    let env_vars = registry.credential_env_vars(&selected);
+                    let Some(profile) = self
+                        .provider_profiles
+                        .iter()
+                        .find(|profile| profile.id == selected)
+                        .cloned()
+                    else {
+                        form.status = Some(format!("Provider profile '{selected}' is unavailable"));
+                        return;
+                    };
+                    let profile = ProviderTypeProfile::from_proto(&profile);
+                    let env_vars = profile.credential_env_vars();
                     form.is_generic = env_vars.is_empty();
 
                     // Populate credential rows from all known env vars.
@@ -2425,11 +2440,11 @@ impl App {
                     form.name = unique_provider_name(&selected, &self.provider_names);
 
                     if form.is_generic {
-                        // No known env vars — skip straight to manual entry.
-                        form.phase = CreateProviderPhase::EnterKey;
-                        form.key_field = ProviderKeyField::Name;
-                        form.status = None;
-                        form.warning = None;
+                        // Credential-less profiles can be created directly.
+                        form.discovered_credentials = Some(HashMap::new());
+                        form.phase = CreateProviderPhase::Creating;
+                        form.anim_start = Some(Instant::now());
+                        self.pending_provider_create = true;
                     } else {
                         form.phase = CreateProviderPhase::ChooseMethod;
                         form.method_cursor = 0;
@@ -2450,9 +2465,17 @@ impl App {
                 KeyCode::Enter => {
                     let ptype = form.types[form.type_cursor].clone();
                     if form.method_cursor == 0 {
-                        // Autodetect — synchronous since we only check env vars now.
-                        let registry = openshell_providers::ProviderRegistry::new();
-                        if let Ok(Some(discovered)) = registry.discover_existing(&ptype) {
+                        let discovered = self
+                            .provider_profiles
+                            .iter()
+                            .find(|profile| profile.id == ptype)
+                            .map(ProviderTypeProfile::from_proto)
+                            .and_then(|profile| {
+                                discover_from_profile(&profile, &RealDiscoveryContext)
+                                    .ok()
+                                    .flatten()
+                            });
+                        if let Some(discovered) = discovered {
                             form.discovered_credentials = Some(discovered.credentials);
                             if form.name.is_empty() {
                                 form.name = unique_provider_name(&ptype, &self.provider_names);
@@ -2893,13 +2916,19 @@ impl App {
             })
             .unwrap_or_default();
 
-        // If we don't know the credential key, derive from registry.
+        // If we don't know the credential key, derive it from the profile.
         let key = if cred_key.is_empty() {
-            let registry = openshell_providers::ProviderRegistry::new();
-            registry
-                .credential_env_vars(&ptype)
-                .first()
-                .map_or(String::new(), ToString::to_string)
+            self.provider_entries
+                .get(self.provider_selected)
+                .and_then(|entry| entry.profile.as_ref())
+                .map(ProviderTypeProfile::from_proto)
+                .and_then(|profile| {
+                    profile
+                        .credential_env_vars()
+                        .first()
+                        .map(ToString::to_string)
+                })
+                .unwrap_or_default()
         } else {
             cred_key
         };
@@ -3336,7 +3365,7 @@ impl App {
         );
 
         let raw_profile_yaml = profile.and_then(|profile| {
-            let dto = openshell_providers::ProviderTypeProfile::from_proto(profile);
+            let dto = ProviderTypeProfile::from_proto(profile);
             openshell_providers::profile_to_yaml(&dto).ok()
         });
 
@@ -3435,7 +3464,7 @@ impl App {
         self.global_policy_active = false;
         self.global_policy_version = 0;
         // Reset provider state too.
-        self.providers_v2_enabled = false;
+        self.provider_profiles.clear();
         self.provider_entries.clear();
         self.provider_names.clear();
         self.provider_types.clear();
@@ -3499,24 +3528,6 @@ mod tests {
             "default".to_string(),
             crate::theme::Theme::dark(),
         )
-    }
-
-    #[tokio::test]
-    async fn global_settings_do_not_override_provider_api_capability() {
-        let mut app = test_app();
-        app.providers_v2_enabled = true;
-        let mut values = HashMap::new();
-        values.insert(
-            settings::PROVIDERS_V2_ENABLED_KEY.to_string(),
-            openshell_core::proto::SettingValue {
-                value: Some(setting_value::Value::BoolValue(false)),
-            },
-        );
-
-        app.apply_global_settings(values, 7);
-
-        assert!(app.providers_v2_enabled);
-        assert_eq!(app.global_settings_revision, 7);
     }
 
     #[tokio::test]

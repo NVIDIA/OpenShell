@@ -78,7 +78,6 @@ pub async fn run(
 
     let mut events = EventHandler::new(Duration::from_secs(2));
 
-    fetch_providers_v2_setting(&mut app).await;
     refresh_gateway_list(&mut app);
     refresh_data(&mut app).await;
 
@@ -500,10 +499,6 @@ async fn handle_gateway_switch(app: &mut App) {
             app.gateway_name = name;
             app.endpoint = endpoint;
             app.reset_sandbox_state();
-            // Re-fetch the providers_v2 capability for the new gateway
-            // before refreshing data, so provider CRUD controls reflect
-            // the correct mode.
-            fetch_providers_v2_setting(app).await;
             refresh_data(app).await;
         }
         Err(e) => {
@@ -2018,30 +2013,6 @@ fn format_draft_approve_all_result(
 // Data refresh
 // ---------------------------------------------------------------------------
 
-async fn fetch_providers_v2_setting(app: &mut App) {
-    let req = openshell_core::proto::GetGatewayConfigRequest {};
-    match tokio::time::timeout(Duration::from_secs(5), app.client.get_gateway_config(req)).await {
-        Ok(Ok(resp)) => {
-            let response = resp.into_inner();
-            let enabled = response
-                .settings
-                .get(openshell_core::settings::PROVIDERS_V2_ENABLED_KEY)
-                .and_then(|s| match &s.value {
-                    Some(openshell_core::proto::setting_value::Value::BoolValue(v)) => Some(*v),
-                    _ => None,
-                })
-                .unwrap_or(false);
-            app.providers_v2_enabled = enabled;
-        }
-        Ok(Err(e)) => {
-            app.status_text = format!("failed to fetch gateway config: {}", e.message());
-        }
-        Err(_) => {
-            app.status_text = "gateway config fetch timed out".to_string();
-        }
-    }
-}
-
 async fn refresh_data(app: &mut App) {
     refresh_health(app).await;
     refresh_global_settings(app).await;
@@ -2141,36 +2112,39 @@ async fn refresh_providers(app: &mut App) {
         };
     let providers = response.providers;
 
-    let profiles: ProviderProfileCache = if app.providers_v2_enabled {
-        let workspaces: std::collections::HashSet<String> = providers
-            .iter()
-            .map(|provider| provider_profile_query_workspace(provider).to_string())
-            // Legacy provider records can decode without an object workspace. Do not
-            // turn that missing context into a platform-scoped profile request.
-            .filter(|workspace| !workspace.is_empty())
-            .collect();
-        let mut all_profiles = HashMap::new();
-        for ws in &workspaces {
-            let req = openshell_core::proto::ListProviderProfilesRequest {
-                limit: 100,
-                offset: 0,
-                workspace: ws.clone(),
-            };
-            if let Ok(Ok(resp)) = tokio::time::timeout(
-                Duration::from_secs(5),
-                app.client.list_provider_profiles(req),
-            )
-            .await
-            {
-                for profile in resp.into_inner().profiles {
-                    cache_provider_profile(&mut all_profiles, ws, profile);
-                }
+    let mut workspaces: std::collections::HashSet<String> = providers
+        .iter()
+        .map(|provider| provider_profile_query_workspace(provider).to_string())
+        // Legacy provider records can decode without an object workspace. Do not
+        // turn that missing context into a platform-scoped profile request.
+        .filter(|workspace| !workspace.is_empty())
+        .collect();
+    if !app.all_workspaces {
+        workspaces.insert(app.current_workspace.clone());
+    }
+    let mut profiles = HashMap::new();
+    app.provider_profiles.clear();
+    for ws in &workspaces {
+        let req = openshell_core::proto::ListProviderProfilesRequest {
+            limit: 100,
+            offset: 0,
+            workspace: ws.clone(),
+        };
+        if let Ok(Ok(resp)) = tokio::time::timeout(
+            Duration::from_secs(5),
+            app.client.list_provider_profiles(req),
+        )
+        .await
+        {
+            let listed = resp.into_inner().profiles;
+            if !app.all_workspaces && ws == &app.current_workspace {
+                app.provider_profiles.clone_from(&listed);
+            }
+            for profile in listed {
+                cache_provider_profile(&mut profiles, ws, profile);
             }
         }
-        all_profiles
-    } else {
-        HashMap::new()
-    };
+    }
 
     app.provider_count = providers.len();
     app.provider_entries = providers

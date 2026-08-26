@@ -55,14 +55,14 @@ use openshell_core::proto::{
     SetInferenceRouteRequest, SettingScope, StartSandboxRequest, StopSandboxRequest,
     TcpForwardFrame, TcpForwardInit, TcpRelayTarget, UpdateConfigRequest,
     UpdateProviderProfilesRequest, UpdateProviderRequest, WatchSandboxRequest, exec_sandbox_event,
-    setting_value, tcp_forward_init,
+    tcp_forward_init,
 };
 use openshell_core::settings;
 use openshell_core::{ObjectId, ObjectName, ObjectWorkspace};
 use openshell_providers::{
-    ProviderRegistry, ProviderTypeProfile, RealDiscoveryContext, detect_provider_from_command,
-    discover_from_profile, normalize_provider_type, parse_profile_json, parse_profile_yaml,
-    profile_to_json, profile_to_yaml, profiles_to_json, profiles_to_yaml,
+    ProviderTypeProfile, RealDiscoveryContext, detect_provider_from_command, discover_from_profile,
+    normalize_provider_type, parse_profile_json, parse_profile_yaml, profile_to_json,
+    profile_to_yaml, profiles_to_json, profiles_to_yaml,
 };
 use owo_colors::OwoColorize;
 use std::borrow::Cow;
@@ -515,18 +515,7 @@ pub async fn sandbox_create(
         }
         None => None,
     };
-    let inferred_provider = inferred_provider_type(command);
-    let providers_v2_enabled =
-        if inferred_provider.is_some() && auto_providers_override != Some(false) {
-            gateway_providers_v2_enabled(&mut client).await?
-        } else {
-            false
-        };
-    let inferred_types: Vec<String> = if providers_v2_enabled {
-        Vec::new()
-    } else {
-        inferred_provider.into_iter().collect()
-    };
+    let inferred_types: Vec<String> = inferred_provider_type(command).into_iter().collect();
     let configured_providers = ensure_required_providers(
         &mut client,
         providers,
@@ -2761,10 +2750,20 @@ pub async fn ensure_required_providers(
             if seen_names.insert(name.clone()) {
                 configured_names.push(name.clone());
             }
-        } else if let Some(provider_type) = normalize_provider_type(name) {
+        } else {
+            let profile_id = normalize_provider_type(name).unwrap_or(name);
+            let profile = fetch_provider_profile(client, profile_id, workspace)
+                .await
+                .map_err(|_| {
+                    miette::miette!(
+                        "provider '{name}' not found and no provider profile named '{profile_id}' is available. \
+                         Create or import the profile first, then create the provider"
+                    )
+                })?;
+            let provider_type = profile.id;
             auto_create_provider(
                 client,
-                provider_type,
+                &provider_type,
                 Some(name),
                 auto_providers_override,
                 &mut seen_names,
@@ -2777,11 +2776,6 @@ pub async fn ensure_required_providers(
             type_to_name
                 .entry(provider_type.to_ascii_lowercase())
                 .or_insert_with(|| name.clone());
-        } else {
-            return Err(miette::miette!(
-                "provider '{name}' not found and '{name}' is not a recognized provider type. \
-                 Create it first with `openshell provider create --type <type> --name {name}`"
-            ));
         }
     }
 
@@ -2872,17 +2866,21 @@ async fn auto_create_provider(
         return Ok(());
     }
 
+    let profile = fetch_provider_profile(client, provider_type, workspace).await?;
     let discovered = discover_existing_provider_data(client, provider_type, workspace)
         .await
         .map_err(|err| miette::miette!("failed to discover provider '{provider_type}': {err}"))?;
-    let Some(discovered) = discovered else {
-        eprintln!(
-            "{} No existing local credentials/config found for '{}'. You can configure it from inside the sandbox.",
-            "!".yellow(),
-            provider_type
-        );
-        eprintln!();
-        return Ok(());
+    let discovered = match discovered {
+        Some(discovered) => discovered,
+        None if provider_profile_allows_empty_credentials(&profile) => {
+            openshell_providers::DiscoveredProvider::default()
+        }
+        None => {
+            return Err(miette::miette!(
+                "no existing local credentials found for provider profile '{provider_type}'. \
+                 Create it first with `openshell provider create --type {provider_type} --name {provider_type} --credential <KEY>`"
+            ));
+        }
     };
 
     if let Some(exact_name) = preferred_name {
@@ -3441,25 +3439,6 @@ fn service_url_for_gateway(service_url: &str, gateway_endpoint: &str) -> String 
     service_url.to_string()
 }
 
-async fn gateway_providers_v2_enabled(client: &mut crate::tls::GrpcClient) -> Result<bool> {
-    let response = client
-        .get_gateway_config(GetGatewayConfigRequest {})
-        .await
-        .into_diagnostic()?
-        .into_inner();
-    let Some(setting) = response.settings.get(settings::PROVIDERS_V2_ENABLED_KEY) else {
-        return Ok(false);
-    };
-    match setting.value.as_ref() {
-        Some(setting_value::Value::BoolValue(enabled)) => Ok(*enabled),
-        None => Ok(false),
-        Some(_) => Err(miette::miette!(
-            "gateway setting '{}' has invalid value type; expected bool",
-            settings::PROVIDERS_V2_ENABLED_KEY
-        )),
-    }
-}
-
 async fn fetch_provider_profile(
     client: &mut crate::tls::GrpcClient,
     provider_type: &str,
@@ -3474,7 +3453,7 @@ async fn fetch_provider_profile(
         .map_err(|status| {
             if status.code() == Code::NotFound {
                 miette::miette!(
-                    "provider profile '{provider_type}' not found; providers v2 discovery requires a provider profile"
+                    "provider profile '{provider_type}' not found; import a matching profile before using this provider type"
                 )
             } else {
                 miette::miette!(status.to_string())
@@ -3492,36 +3471,28 @@ async fn discover_existing_provider_data(
     provider_type: &str,
     workspace: &str,
 ) -> Result<Option<openshell_providers::DiscoveredProvider>> {
-    if gateway_providers_v2_enabled(client).await? {
-        let profile = fetch_provider_profile(client, provider_type, workspace).await?;
-        let profile = ProviderTypeProfile::from_proto(&profile);
-        let mut discovered =
-            discover_from_profile(&profile, &RealDiscoveryContext).map_err(|err| {
-                miette::miette!("failed to discover existing provider data from profile: {err}")
-            })?;
+    let profile = fetch_provider_profile(client, provider_type, workspace).await?;
+    let profile = ProviderTypeProfile::from_proto(&profile);
+    let mut discovered = discover_from_profile(&profile, &RealDiscoveryContext).map_err(|err| {
+        miette::miette!("failed to discover existing provider data from profile: {err}")
+    })?;
 
-        // Vertex AI config keys (project ID, region, base URL, publisher) are not
-        // declared in the profile's discovery.credentials list, so discover_from_profile
-        // does not scan them. Scan them directly here so --from-existing captures them.
-        if provider_type == VERTEX_AI_PROVIDER_TYPE {
-            let discovered = discovered.get_or_insert_with(Default::default);
-            for key in openshell_core::inference::VERTEX_AI_CONFIG_KEY_NAMES {
-                if let Ok(val) = std::env::var(key) {
-                    let val = val.trim().to_string();
-                    if !val.is_empty() {
-                        discovered.config.entry(key.to_string()).or_insert(val);
-                    }
+    // Vertex AI config keys (project ID, region, base URL, publisher) are not
+    // declared in the profile's discovery.credentials list, so discover_from_profile
+    // does not scan them. Scan them directly here so --from-existing captures them.
+    if provider_type == VERTEX_AI_PROVIDER_TYPE {
+        let discovered = discovered.get_or_insert_with(Default::default);
+        for key in openshell_core::inference::VERTEX_AI_CONFIG_KEY_NAMES {
+            if let Ok(val) = std::env::var(key) {
+                let val = val.trim().to_string();
+                if !val.is_empty() {
+                    discovered.config.entry(key.to_string()).or_insert(val);
                 }
             }
         }
-
-        Ok(discovered)
-    } else {
-        let registry = ProviderRegistry::new();
-        registry
-            .discover_existing(provider_type)
-            .map_err(|err| miette::miette!("failed to discover existing provider data: {err}"))
     }
+
+    Ok(discovered)
 }
 
 /// Canonical provider type string for Google Vertex AI.
@@ -3768,44 +3739,19 @@ pub async fn provider_create_with_options(options: ProviderCreateOptions<'_>) ->
 
     let mut client = grpc_client(server, tls).await?;
 
-    let provider_type = if let Some(provider_type) = normalize_provider_type(provider_type) {
-        provider_type.to_string()
-    } else {
-        let profile_id = provider_type.trim();
-        if profile_id.is_empty() {
-            return Err(miette::miette!("provider type is required"));
-        }
-        let response = client
-            .get_provider_profile(GetProviderProfileRequest {
-                id: profile_id.to_string(),
-                workspace: profile_workspace.to_string(),
-            })
-            .await;
-        match response {
-            Ok(response) => response
-                .into_inner()
-                .profile
-                .map(|profile| profile.id)
-                .filter(|id| !id.trim().is_empty())
-                .unwrap_or_else(|| profile_id.to_string()),
-            Err(status) if status.code() == Code::NotFound => {
-                return Err(miette::miette!(
-                    "unsupported provider type or profile: {provider_type}"
-                ));
-            }
-            Err(status) => return Err(status).into_diagnostic(),
-        }
-    };
+    let profile_id = normalize_provider_type(provider_type).unwrap_or_else(|| provider_type.trim());
+    if profile_id.is_empty() {
+        return Err(miette::miette!("provider type is required"));
+    }
+    let provider_profile = fetch_provider_profile(&mut client, profile_id, profile_workspace)
+        .await
+        .map_err(|err| {
+            miette::miette!("unsupported provider type or profile: {profile_id} ({err})")
+        })?;
+    let provider_type = provider_profile.id.clone();
 
     let adc_credential_key = if from_gcloud_adc {
-        let profile = fetch_provider_profile(&mut client, &provider_type, profile_workspace)
-            .await
-            .map_err(|err| {
-                miette::miette!(
-                    "--from-gcloud-adc is not supported for '{provider_type}' providers ({err})"
-                )
-            })?;
-        let profile = ProviderTypeProfile::from_proto(&profile);
+        let profile = ProviderTypeProfile::from_proto(&provider_profile);
         let adc_cred = profile.adc_credential().ok_or_else(|| {
             miette::miette!(
                 "--from-gcloud-adc is not supported for '{provider_type}' providers \
@@ -3828,7 +3774,7 @@ pub async fn provider_create_with_options(options: ProviderCreateOptions<'_>) ->
     };
 
     let oidc_profile = if from_oidc_token {
-        Some(fetch_provider_profile(&mut client, &provider_type, profile_workspace).await?)
+        Some(provider_profile.clone())
     } else {
         None
     };
@@ -3861,25 +3807,12 @@ pub async fn provider_create_with_options(options: ProviderCreateOptions<'_>) ->
         if from_existing {
             return Err(missing_credentials_error(&provider_type));
         }
-        if !from_gcloud_adc && !runtime_credentials {
-            return Err(missing_credentials_error(&provider_type));
+        if runtime_credentials && !provider_profile_allows_runtime_credentials(&provider_profile) {
+            return Err(miette::miette!(
+                "--runtime-credentials is only valid for provider profiles whose required credentials are resolved at runtime"
+            ));
         }
-        let allows_empty_credentials = if runtime_credentials {
-            provider_profile_allows_empty_credentials(
-                &fetch_provider_profile(&mut client, &provider_type, profile_workspace).await?,
-            )
-        } else {
-            fetch_provider_profile(&mut client, &provider_type, profile_workspace)
-                .await
-                .ok()
-                .is_some_and(|profile| provider_profile_allows_empty_credentials(&profile))
-        };
-        if !allows_empty_credentials {
-            if runtime_credentials {
-                return Err(miette::miette!(
-                    "--runtime-credentials is only valid for provider profiles whose required credentials are resolved at runtime"
-                ));
-            }
+        if !provider_profile_allows_empty_credentials(&provider_profile) {
             return Err(missing_credentials_error(&provider_type));
         }
     }
@@ -3988,6 +3921,10 @@ pub async fn provider_create_with_options(options: ProviderCreateOptions<'_>) ->
 
 fn provider_profile_allows_empty_credentials(profile: &ProviderProfile) -> bool {
     ProviderTypeProfile::from_proto(profile).allows_empty_provider_credentials()
+}
+
+fn provider_profile_allows_runtime_credentials(profile: &ProviderProfile) -> bool {
+    ProviderTypeProfile::from_proto(profile).allows_runtime_provider_credentials()
 }
 
 pub async fn provider_get(
@@ -8335,9 +8272,10 @@ mod tests {
 
     #[test]
     fn inferred_provider_type_normalizes_aliases() {
-        // `glab` should resolve to `gitlab`
+        // Retired legacy types are not inferred, even when a custom profile
+        // with the same ID could be imported and attached explicitly.
         let result = inferred_provider_type(&["glab".to_string()]);
-        assert_eq!(result, Some("gitlab".to_string()));
+        assert_eq!(result, None);
 
         // `gh` should resolve to `github`
         let result = inferred_provider_type(&["gh".to_string()]);

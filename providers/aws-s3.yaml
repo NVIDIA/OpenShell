@@ -71,7 +71,6 @@ endpoints:
     enforcement: enforce
     credential_signing: sigv4
     signing_service: s3
-    signing_region: us-east-1
   - host: "s3.amazonaws.com"
     port: 443
     protocol: rest
@@ -80,7 +79,6 @@ endpoints:
     enforcement: enforce
     credential_signing: sigv4
     signing_service: s3
-    signing_region: us-east-1
   - host: "*.s3.*.amazonaws.com"
     port: 443
     protocol: rest

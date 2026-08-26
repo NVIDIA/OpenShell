@@ -434,7 +434,6 @@ configure_gateway() {
     --gateway-endpoint "$GATEWAY_ENDPOINT"
   )
 
-  run_setup_step "enabling provider profile policy composition" "${CLI[@]}" settings set --global --key providers_v2_enabled --value true --yes
   wait_for_profile "github"
   wait_for_profile "slack"
 }

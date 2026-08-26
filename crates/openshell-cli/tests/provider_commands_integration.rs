@@ -27,7 +27,7 @@ use openshell_core::proto::{
     ProviderProfileDiscovery, ProviderResponse, RevokeSshSessionRequest, RevokeSshSessionResponse,
     RotateProviderCredentialRequest, RotateProviderCredentialResponse, Sandbox, SandboxResponse,
     SandboxStreamEvent, ServiceStatus, SettingValue, SupervisorMessage, UpdateProviderRequest,
-    WatchSandboxRequest, setting_value,
+    WatchSandboxRequest,
 };
 use openshell_core::{ObjectId, ObjectName};
 use std::collections::HashMap;
@@ -1173,11 +1173,19 @@ async fn run_server() -> TestServer {
     }
 }
 
-async fn enable_providers_v2(ts: &TestServer) {
-    ts.state.global_settings.lock().await.insert(
-        openshell_core::settings::PROVIDERS_V2_ENABLED_KEY.to_string(),
-        SettingValue {
-            value: Some(setting_value::Value::BoolValue(true)),
+async fn install_test_profile(ts: &TestServer, id: &str, credential_key: &str) {
+    ts.state.profiles.lock().await.insert(
+        id.to_string(),
+        ProviderProfile {
+            id: id.to_string(),
+            display_name: id.to_string(),
+            credentials: vec![ProviderProfileCredential {
+                name: "access_token".to_string(),
+                env_vars: vec![credential_key.to_string()],
+                required: true,
+                ..Default::default()
+            }],
+            ..Default::default()
         },
     );
 }
@@ -1362,11 +1370,12 @@ async fn provider_list_json_empty() {
 #[tokio::test]
 async fn provider_refresh_cli_run_functions_wire_requests() {
     let ts = run_server().await;
+    install_test_profile(&ts, "custom-graph", "MS_GRAPH_ACCESS_TOKEN").await;
 
     run::provider_create(
         &ts.endpoint,
         "my-graph",
-        "outlook",
+        "custom-graph",
         false,
         &["MS_GRAPH_ACCESS_TOKEN=token".to_string()],
         false,
@@ -1451,11 +1460,12 @@ async fn provider_refresh_cli_run_functions_wire_requests() {
 #[tokio::test]
 async fn provider_refresh_configure_reads_secret_material_from_env_off_argv() {
     let ts = run_server().await;
+    install_test_profile(&ts, "custom-chat", "GOOGLE_CHAT_ACCESS_TOKEN").await;
 
     run::provider_create(
         &ts.endpoint,
         "gc-bridge",
-        "outlook",
+        "custom-chat",
         false,
         &["GOOGLE_CHAT_ACCESS_TOKEN=pending".to_string()],
         false,
@@ -1606,7 +1616,7 @@ async fn provider_create_allows_empty_credentials_for_gateway_refresh_profiles()
 }
 
 #[tokio::test]
-async fn provider_create_requires_runtime_credentials_for_empty_gateway_refresh_profiles() {
+async fn provider_create_allows_no_source_for_runtime_resolved_profiles() {
     let ts = run_server().await;
     ts.state.profiles.lock().await.insert(
         "custom-refresh".to_string(),
@@ -1626,7 +1636,7 @@ async fn provider_create_requires_runtime_credentials_for_empty_gateway_refresh_
         },
     );
 
-    let err = run::provider_create(
+    run::provider_create(
         &ts.endpoint,
         "custom-refresh-provider",
         "custom-refresh",
@@ -1638,16 +1648,45 @@ async fn provider_create_requires_runtime_credentials_for_empty_gateway_refresh_
         &ts.tls,
     )
     .await
-    .expect_err("empty runtime-resolved providers should require an explicit source");
+    .expect("runtime-resolved provider should not require a credential source");
 
-    assert!(err.to_string().contains("--runtime-credentials"));
     assert!(
-        !ts.state
+        ts.state
             .providers
             .lock()
             .await
             .contains_key("custom-refresh-provider")
     );
+}
+
+#[tokio::test]
+async fn provider_create_allows_credentialless_policy_profile() {
+    let ts = run_server().await;
+
+    run::provider_create(
+        &ts.endpoint,
+        "pypi",
+        "pypi",
+        false,
+        &[],
+        false,
+        &[],
+        "default",
+        &ts.tls,
+    )
+    .await
+    .expect("credential-less provider create");
+
+    let provider = ts
+        .state
+        .providers
+        .lock()
+        .await
+        .get("pypi")
+        .cloned()
+        .expect("pypi provider");
+    assert!(provider.credentials.is_empty());
+    assert_eq!(provider.r#type, "pypi");
 }
 
 #[tokio::test]
@@ -1872,9 +1911,8 @@ binaries: [/usr/bin/custom]
 }
 
 #[tokio::test]
-async fn provider_create_from_existing_uses_profile_discovery_when_v2_enabled() {
+async fn provider_create_from_existing_uses_profile_discovery() {
     let ts = run_server().await;
-    enable_providers_v2(&ts).await;
     ts.state.profiles.lock().await.insert(
         "custom-discovery".to_string(),
         ProviderProfile {
@@ -1924,7 +1962,7 @@ async fn provider_create_from_existing_uses_profile_discovery_when_v2_enabled() 
 }
 
 #[tokio::test]
-async fn provider_create_from_existing_uses_registry_discovery_when_v2_disabled() {
+async fn provider_create_from_existing_uses_builtin_profile_discovery() {
     let ts = run_server().await;
     let _env = EnvVarGuard::set(&[("OPENAI_API_KEY", "legacy-openai-secret")]);
 
@@ -1958,9 +1996,8 @@ async fn provider_create_from_existing_uses_registry_discovery_when_v2_disabled(
 }
 
 #[tokio::test]
-async fn provider_create_from_existing_vertex_discovers_credentials_and_config_when_v2_enabled() {
+async fn provider_create_from_existing_vertex_discovers_credentials_and_config() {
     let ts = run_server().await;
-    enable_providers_v2(&ts).await;
     let _env = EnvVarGuard::set(&[
         ("VERTEX_AI_TOKEN", "ya29.vertex-v2-fallback"),
         ("VERTEX_AI_PROJECT_ID", "vertex-v2-project"),
@@ -2021,9 +2058,8 @@ async fn provider_create_from_existing_vertex_discovers_credentials_and_config_w
 }
 
 #[tokio::test]
-async fn provider_create_from_existing_requires_profile_when_v2_enabled() {
+async fn provider_create_from_existing_requires_profile() {
     let ts = run_server().await;
-    enable_providers_v2(&ts).await;
     // Use "generic" which is a normalised type but has no built-in provider
     // profile, so v2 profile-based discovery fails with the expected message.
     let _env = EnvVarGuard::set(&[("GENERIC_API_KEY", "some-secret")]);
@@ -2044,7 +2080,7 @@ async fn provider_create_from_existing_requires_profile_when_v2_enabled() {
 
     assert!(
         err.to_string()
-            .contains("providers v2 discovery requires a provider profile"),
+            .contains("import a matching profile before using this provider type"),
         "unexpected error: {err}"
     );
     assert!(!ts.state.providers.lock().await.contains_key("v2-generic"));
@@ -2053,7 +2089,6 @@ async fn provider_create_from_existing_requires_profile_when_v2_enabled() {
 #[tokio::test]
 async fn provider_create_from_existing_fails_when_profile_discovery_finds_nothing() {
     let ts = run_server().await;
-    enable_providers_v2(&ts).await;
     ts.state.profiles.lock().await.insert(
         "empty-discovery".to_string(),
         ProviderProfile {
@@ -2101,9 +2136,8 @@ async fn provider_create_from_existing_fails_when_profile_discovery_finds_nothin
 }
 
 #[tokio::test]
-async fn provider_update_from_existing_uses_profile_discovery_when_v2_enabled() {
+async fn provider_update_from_existing_uses_profile_discovery() {
     let ts = run_server().await;
-    enable_providers_v2(&ts).await;
     ts.state.profiles.lock().await.insert(
         "custom-update-discovery".to_string(),
         ProviderProfile {
@@ -2363,11 +2397,11 @@ async fn provider_create_rejects_key_only_credentials_without_local_env_value() 
 }
 
 #[tokio::test]
-async fn provider_create_supports_generic_type_and_env_lookup_credentials() {
+async fn provider_create_rejects_profileless_generic_type() {
     let ts = run_server().await;
     let _guard = EnvVarGuard::set(&[("NAV_GENERIC_TEST_KEY", "generic-value")]);
 
-    run::provider_create(
+    let err = run::provider_create(
         &ts.endpoint,
         "my-generic",
         "generic",
@@ -2379,24 +2413,12 @@ async fn provider_create_supports_generic_type_and_env_lookup_credentials() {
         &ts.tls,
     )
     .await
-    .expect("provider create");
+    .expect_err("profileless generic provider creation should fail");
 
-    let mut client = openshell_cli::tls::grpc_client(&ts.endpoint, &ts.tls)
-        .await
-        .expect("grpc client should connect");
-    let response = client
-        .get_provider(GetProviderRequest {
-            name: "my-generic".to_string(),
-            workspace: String::new(),
-        })
-        .await
-        .expect("get provider should succeed")
-        .into_inner();
-    let provider = response.provider.expect("provider should exist");
-    assert_eq!(provider.r#type, "generic");
-    assert_eq!(
-        provider.credentials.get("NAV_GENERIC_TEST_KEY"),
-        Some(&"generic-value".to_string())
+    assert!(
+        err.to_string()
+            .contains("provider profile 'generic' not found"),
+        "unexpected error: {err}"
     );
 }
 
@@ -2515,14 +2537,14 @@ async fn provider_create_rejects_combined_from_gcloud_adc_and_credentials() {
 #[tokio::test]
 async fn provider_create_rejects_empty_env_var_for_key_only_credential() {
     let ts = run_server().await;
-    let _guard = EnvVarGuard::set(&[("NAV_EMPTY_ENV_KEY", "")]);
+    let _guard = EnvVarGuard::set(&[("NVIDIA_API_KEY", "")]);
 
     let err = run::provider_create(
         &ts.endpoint,
         "bad-provider",
-        "generic",
+        "nvidia",
         false,
-        &["NAV_EMPTY_ENV_KEY".to_string()],
+        &["NVIDIA_API_KEY".to_string()],
         false,
         &[],
         "default",
@@ -2533,7 +2555,7 @@ async fn provider_create_rejects_empty_env_var_for_key_only_credential() {
 
     assert!(
         err.to_string()
-            .contains("requires local env var 'NAV_EMPTY_ENV_KEY' to be set to a non-empty value"),
+            .contains("requires local env var 'NVIDIA_API_KEY' to be set to a non-empty value"),
         "unexpected error: {err}"
     );
 }
@@ -2928,7 +2950,6 @@ async fn provider_create_from_gcloud_adc_rolls_back_provider_when_initial_rotate
 #[tokio::test]
 async fn provider_create_from_existing_vertex_config_only_reports_missing_vertex_credentials() {
     let ts = run_server().await;
-    enable_providers_v2(&ts).await;
     let _env = EnvVarGuard::set(&[
         ("VERTEX_AI_PROJECT_ID", "vertex-config-only-project"),
         ("VERTEX_AI_REGION", "us-central1"),

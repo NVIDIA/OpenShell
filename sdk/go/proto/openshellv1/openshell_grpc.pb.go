@@ -183,9 +183,8 @@ type OpenShellClient interface {
 	DeleteProviderProfile(ctx context.Context, in *DeleteProviderProfileRequest, opts ...grpc.CallOption) (*DeleteProviderProfileResponse, error)
 	// Get sandbox settings by id (called by sandbox entrypoint and poll loop).
 	GetSandboxConfig(ctx context.Context, in *sandboxv1.GetSandboxConfigRequest, opts ...grpc.CallOption) (*sandboxv1.GetSandboxConfigResponse, error)
-	// Get gateway-global settings (read-only feature flags; any authenticated
-	// user may read these so the CLI and TUI can discover capabilities like
-	// providers_v2_enabled without requiring Platform Admin).
+	// Get gateway-global settings (read-only runtime configuration; any
+	// authenticated user may read these without requiring Platform Admin).
 	//
 	// Scope-only (no role): scopes are granted by the IdP at token issuance,
 	// orthogonal to workspace membership. Deployments that enable scope
@@ -1107,9 +1106,8 @@ type OpenShellServer interface {
 	DeleteProviderProfile(context.Context, *DeleteProviderProfileRequest) (*DeleteProviderProfileResponse, error)
 	// Get sandbox settings by id (called by sandbox entrypoint and poll loop).
 	GetSandboxConfig(context.Context, *sandboxv1.GetSandboxConfigRequest) (*sandboxv1.GetSandboxConfigResponse, error)
-	// Get gateway-global settings (read-only feature flags; any authenticated
-	// user may read these so the CLI and TUI can discover capabilities like
-	// providers_v2_enabled without requiring Platform Admin).
+	// Get gateway-global settings (read-only runtime configuration; any
+	// authenticated user may read these without requiring Platform Admin).
 	//
 	// Scope-only (no role): scopes are granted by the IdP at token issuance,
 	// orthogonal to workspace membership. Deployments that enable scope

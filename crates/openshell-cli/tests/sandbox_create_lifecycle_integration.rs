@@ -28,7 +28,6 @@ use openshell_core::proto::{
     RevokeSshSessionResponse, Sandbox, SandboxCondition, SandboxLogLine, SandboxPhase,
     SandboxResponse, SandboxStatus, SandboxStreamEvent, ServiceStatus, SettingValue,
     SupervisorMessage, UpdateProviderRequest, WatchSandboxRequest, sandbox_stream_event,
-    setting_value,
 };
 use std::collections::HashMap;
 use std::fs;
@@ -340,14 +339,30 @@ impl OpenShell for TestOpenShell {
         &self,
         _request: tonic::Request<openshell_core::proto::ListProviderProfilesRequest>,
     ) -> Result<Response<openshell_core::proto::ListProviderProfilesResponse>, Status> {
-        Err(Status::unimplemented("not implemented in test"))
+        let profiles = openshell_providers::builtin_profiles()
+            .iter()
+            .map(openshell_providers::ProviderTypeProfile::to_proto)
+            .collect();
+        Ok(Response::new(
+            openshell_core::proto::ListProviderProfilesResponse { profiles },
+        ))
     }
 
     async fn get_provider_profile(
         &self,
-        _request: tonic::Request<openshell_core::proto::GetProviderProfileRequest>,
+        request: tonic::Request<openshell_core::proto::GetProviderProfileRequest>,
     ) -> Result<Response<openshell_core::proto::ProviderProfileResponse>, Status> {
-        Err(Status::unimplemented("not implemented in test"))
+        let id = request.into_inner().id;
+        let profile = openshell_providers::builtin_profiles()
+            .iter()
+            .find(|profile| profile.id == id)
+            .ok_or_else(|| Status::not_found("provider profile not found"))?
+            .to_proto();
+        Ok(Response::new(
+            openshell_core::proto::ProviderProfileResponse {
+                profile: Some(profile),
+            },
+        ))
     }
 
     async fn import_provider_profiles(
@@ -1189,15 +1204,6 @@ async fn create_requests(server: &TestServer) -> Vec<CreateSandboxRequest> {
     server.openshell.state.create_requests.lock().await.clone()
 }
 
-async fn enable_providers_v2(server: &TestServer) {
-    server.openshell.state.global_settings.lock().await.insert(
-        openshell_core::settings::PROVIDERS_V2_ENABLED_KEY.to_string(),
-        SettingValue {
-            value: Some(setting_value::Value::BoolValue(true)),
-        },
-    );
-}
-
 fn test_tls(server: &TestServer) -> TlsOptions {
     server.tls.with_gateway_name("openshell")
 }
@@ -1553,9 +1559,8 @@ async fn sandbox_create_sends_gpu_count_request() {
 }
 
 #[tokio::test]
-async fn sandbox_create_does_not_infer_command_providers_when_v2_enabled() {
+async fn sandbox_create_skips_inferred_provider_without_local_credentials() {
     let server = run_server().await;
-    enable_providers_v2(&server).await;
     let fake_ssh_dir = tempfile::tempdir().unwrap();
     let xdg_dir = tempfile::tempdir().unwrap();
     let _env = test_env(&fake_ssh_dir, &xdg_dir);
@@ -1566,7 +1571,7 @@ async fn sandbox_create_does_not_infer_command_providers_when_v2_enabled() {
         &server.endpoint,
         "openshell",
         run::SandboxCreateConfig {
-            name: Some("v2-no-inferred-provider"),
+            name: Some("no-inferred-provider"),
             command: &["claude".into(), "--version".into()],
             tty_override: Some(true),
             ..test_config()
@@ -1586,7 +1591,7 @@ async fn sandbox_create_does_not_infer_command_providers_when_v2_enabled() {
         .clone();
     assert!(
         providers.is_empty(),
-        "providers v2 should not infer command providers, got {providers:?}"
+        "missing local credentials should skip inferred providers, got {providers:?}"
     );
 }
 

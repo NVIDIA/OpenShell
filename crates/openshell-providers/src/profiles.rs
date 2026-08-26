@@ -29,6 +29,7 @@ const BUILT_IN_PROFILE_YAMLS: &[&str] = &[
     include_str!("../../../providers/aws.yaml"),
     include_str!("../../../providers/aws-bedrock.yaml"),
     include_str!("../../../providers/aws-s3.yaml"),
+    include_str!("../../../providers/anthropic.yaml"),
     include_str!("../../../providers/claude-code.yaml"),
     include_str!("../../../providers/codex.yaml"),
     include_str!("../../../providers/copilot.yaml"),
@@ -38,6 +39,7 @@ const BUILT_IN_PROFILE_YAMLS: &[&str] = &[
     include_str!("../../../providers/google-cloud.yaml"),
     include_str!("../../../providers/google-vertex-ai.yaml"),
     include_str!("../../../providers/nvidia.yaml"),
+    include_str!("../../../providers/openai.yaml"),
     include_str!("../../../providers/pypi.yaml"),
 ];
 
@@ -492,13 +494,25 @@ impl ProviderTypeProfile {
 
     /// Whether this profile can be created without initial static credentials.
     ///
-    /// Empty provider creation is allowed when at least one credential can be
-    /// resolved at runtime, and every required credential can be resolved at
-    /// runtime. Runtime-resolvable credentials are either gateway-mintable
-    /// refresh credentials, sandbox-side dynamic token grants, or additional
-    /// outputs co-minted by another credential's gateway-mintable refresh.
+    /// Empty provider creation is allowed when every required credential can
+    /// be resolved at runtime. This includes profiles with no credentials and
+    /// profiles whose credentials are all optional.
     #[must_use]
     pub fn allows_empty_provider_credentials(&self) -> bool {
+        let co_minted = self.co_minted_credential_names();
+        self.credentials.iter().all(|credential| {
+            let is_runtime_resolvable =
+                credential.is_runtime_resolvable() || co_minted.contains(credential.name.as_str());
+            !credential.required || is_runtime_resolvable
+        })
+    }
+
+    /// Whether `--runtime-credentials` is meaningful for this profile.
+    ///
+    /// At least one credential must be runtime-resolvable and every required
+    /// credential must be resolvable without an initial static value.
+    #[must_use]
+    pub fn allows_runtime_provider_credentials(&self) -> bool {
         let co_minted = self.co_minted_credential_names();
         let mut has_runtime_resolvable_credential = false;
         for credential in &self.credentials {
@@ -510,6 +524,20 @@ impl ProviderTypeProfile {
             has_runtime_resolvable_credential |= is_runtime_resolvable;
         }
         has_runtime_resolvable_credential
+    }
+
+    /// Required credentials that must have an initial static value.
+    #[must_use]
+    pub fn required_static_credentials(&self) -> Vec<&CredentialProfile> {
+        let co_minted = self.co_minted_credential_names();
+        self.credentials
+            .iter()
+            .filter(|credential| {
+                credential.required
+                    && !credential.is_runtime_resolvable()
+                    && !co_minted.contains(credential.name.as_str())
+            })
+            .collect()
     }
 
     /// Names of credentials produced as `additional_outputs` of a
@@ -3081,8 +3109,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_provider_credentials_require_a_runtime_resolvable_path_and_no_required_static_credentials()
-     {
+    fn empty_provider_credentials_require_no_required_static_credentials() {
         let optional_refresh_profile = parse_profile_yaml(
             r"
 id: optional-refresh
@@ -3096,6 +3123,7 @@ credentials:
         )
         .expect("profile");
         assert!(optional_refresh_profile.allows_empty_provider_credentials());
+        assert!(optional_refresh_profile.allows_runtime_provider_credentials());
 
         let token_grant_profile = parse_profile_yaml(
             r"
@@ -3110,6 +3138,7 @@ credentials:
         )
         .expect("profile");
         assert!(token_grant_profile.allows_empty_provider_credentials());
+        assert!(token_grant_profile.allows_runtime_provider_credentials());
 
         let mixed_required_profile = parse_profile_yaml(
             r"
@@ -3126,6 +3155,7 @@ credentials:
         )
         .expect("profile");
         assert!(!mixed_required_profile.allows_empty_provider_credentials());
+        assert!(!mixed_required_profile.allows_runtime_provider_credentials());
 
         let static_only_profile = parse_profile_yaml(
             r"
@@ -3137,7 +3167,21 @@ credentials:
 ",
         )
         .expect("profile");
-        assert!(!static_only_profile.allows_empty_provider_credentials());
+        assert!(static_only_profile.allows_empty_provider_credentials());
+        assert!(!static_only_profile.allows_runtime_provider_credentials());
+
+        let policy_only_profile = parse_profile_yaml(
+            r"
+id: policy-only
+display_name: Policy Only
+endpoints:
+  - host: example.com
+    port: 443
+",
+        )
+        .expect("profile");
+        assert!(policy_only_profile.allows_empty_provider_credentials());
+        assert!(!policy_only_profile.allows_runtime_provider_credentials());
     }
 
     #[test]

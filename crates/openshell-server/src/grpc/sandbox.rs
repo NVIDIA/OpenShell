@@ -3145,6 +3145,15 @@ mod tests {
         let state = test_server_state().await;
         state
             .store
+            .put_message(&test_provider_with_credential_key(
+                "other",
+                "github",
+                "GITHUB_TOKEN",
+            ))
+            .await
+            .unwrap();
+        state
+            .store
             .put_message(&test_sandbox(
                 "work",
                 vec![
