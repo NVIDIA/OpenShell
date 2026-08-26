@@ -147,6 +147,7 @@ jobs:
     with:
       source-sha: ${{ github.sha }}
       artifact-set: branch-e2e
+    secrets: inherit
 
   verify-sha-artifacts:
     needs: [pr_metadata, publish-sha-artifacts]
