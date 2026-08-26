@@ -3861,6 +3861,7 @@ dependencies = [
  "oauth2",
  "openshell-bootstrap",
  "openshell-core",
+ "openshell-otel",
  "openshell-policy",
  "openshell-providers",
  "openshell-sdk",

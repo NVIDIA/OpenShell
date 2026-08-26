@@ -6,6 +6,10 @@
 mod grpc;
 mod propagation;
 
+pub use grpc::RecordGrpcFailure;
+pub use propagation::{
+    EnvTraceContextInterceptor, HeaderMapExtractor, MetadataMapInjector, TraceContextInterceptor,
+};
 pub use grpc::{RecordGrpcFailure, RecordGrpcStatus};
 pub use propagation::{HeaderMapExtractor, MetadataMapInjector, TraceContextInterceptor};
 
