@@ -1422,16 +1422,12 @@ async fn validate_and_stage_rootfs_tar(
         }
     }
 
-    let request_dir = staging_dir.join(format!("req-{}", std::process::id()));
-    tokio::fs::create_dir_all(&request_dir)
-        .await
+    let request_dir = tempfile::Builder::new()
+        .prefix("req-")
+        .tempdir_in(&staging_dir)
         .into_diagnostic()
-        .wrap_err_with(|| {
-            format!(
-                "failed to create staging directory {}",
-                request_dir.display()
-            )
-        })?;
+        .wrap_err("failed to create request staging directory")?
+        .keep();
 
     let file_name = tar_path
         .file_name()
@@ -1443,7 +1439,7 @@ async fn validate_and_stage_rootfs_tar(
         tar_path.display().to_string().cyan(),
         gateway_name,
     );
-    if let Err(err) = tokio::fs::copy(tar_path, &staged_path).await {
+    if let Err(err) = copy_with_byte_limit(tar_path, &staged_path, max_bytes).await {
         let _ = tokio::fs::remove_dir_all(&request_dir).await;
         return Err(miette!(
             "failed to stage rootfs tar to {}: {err}",
@@ -1453,6 +1449,48 @@ async fn validate_and_stage_rootfs_tar(
     eprintln!();
 
     Ok(staged_path)
+}
+
+/// Copy `src` to `dst`, aborting if total bytes written exceeds `limit`.
+/// A limit of 0 disables enforcement.
+async fn copy_with_byte_limit(
+    src: &Path,
+    dst: &Path,
+    limit: u64,
+) -> std::result::Result<(), String> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut reader = tokio::fs::File::open(src)
+        .await
+        .map_err(|e| format!("open source: {e}"))?;
+    let mut writer = tokio::fs::File::create(dst)
+        .await
+        .map_err(|e| format!("create destination: {e}"))?;
+
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut total: u64 = 0;
+    loop {
+        let n = reader
+            .read(&mut buf)
+            .await
+            .map_err(|e| format!("read: {e}"))?;
+        if n == 0 {
+            break;
+        }
+        total += n as u64;
+        if limit > 0 && total > limit {
+            return Err(format!(
+                "{} exceeds the {} byte limit",
+                src.display(),
+                limit
+            ));
+        }
+        writer
+            .write_all(&buf[..n])
+            .await
+            .map_err(|e| format!("write: {e}"))?;
+    }
+    Ok(())
 }
 
 /// Build a `driver_config` struct carrying the rootfs tar path for the VM driver.
