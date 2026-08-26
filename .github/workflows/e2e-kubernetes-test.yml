@@ -52,6 +52,11 @@ on:
         required: false
         type: string
         default: ""
+      conformance-artifact-prefix:
+        description: "Optional prebuilt conformance CLI artifact prefix (artifact suffix is <triple>)"
+        required: false
+        type: string
+        default: ""
       external-driver-binary:
         description: "Optional standalone compute driver binary used to compose a local test image"
         required: false
@@ -92,6 +97,8 @@ jobs:
 
       - name: Use prebuilt OpenShell CLI
         uses: ./.github/actions/setup-e2e-cli
+        with:
+          conformance-artifact-prefix: ${{ inputs.conformance-artifact-prefix }}
 
       - name: Use prebuilt OpenShell gateway
         if: inputs.gateway-artifact != ''

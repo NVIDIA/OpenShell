@@ -171,7 +171,7 @@ key.
 Run the Docker-backed Rust CLI e2e suite:
 
 ```shell
-mise run e2e:rust
+mise run e2e:docker
 ```
 
 Run the minimal portable CLI conformance profile against the gateway selected
@@ -210,7 +210,9 @@ openshell sandbox list --output json
 openshell sandbox delete <sandbox-name>
 ```
 
-Run the Podman-backed Rust CLI e2e suite:
+Gateway-backed Rust E2E tasks build the standalone conformance CLI, run its
+registered scenarios against the configured gateway, then run any lane-specific
+Rust tests that still apply. Run the Podman-backed Rust CLI e2e suite:
 
 ```shell
 mise run e2e:podman

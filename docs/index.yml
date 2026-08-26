@@ -27,9 +27,6 @@ navigation:
   title: "Kubernetes"
 - folder: reference
   title: "Reference"
-  contents:
-  - page: "OpenShell conformance CLI"
-    path: reference/conformance-cli.mdx
 - folder: security
   title: "Security"
 - folder: resources

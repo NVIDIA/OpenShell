@@ -7,6 +7,11 @@ on:
         description: "Image tag to test (typically the commit SHA)"
         required: true
         type: string
+      conformance-artifact-prefix:
+        description: "Optional prebuilt conformance CLI artifact prefix (artifact suffix is <triple>)"
+        required: false
+        type: string
+        default: ""
 
 permissions:
   actions: read
@@ -61,6 +66,8 @@ jobs:
 
       - name: Use prebuilt OpenShell CLI
         uses: ./.github/actions/setup-e2e-cli
+        with:
+          conformance-artifact-prefix: ${{ inputs.conformance-artifact-prefix }}
 
       - name: Use prebuilt OpenShell gateway
         uses: ./.github/actions/setup-e2e-gateway

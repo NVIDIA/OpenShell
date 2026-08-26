@@ -46,13 +46,15 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 source "${ROOT}/e2e/support/gateway-common.sh"
+# shellcheck source=e2e/support/conformance.sh
+source "${ROOT}/e2e/support/conformance.sh"
 
 COMPRESSED_DIR="${ROOT}/target/vm-runtime-compressed"
 GATEWAY_BIN="${OPENSHELL_GATEWAY_BIN:-${ROOT}/target/debug/openshell-gateway}"
 DRIVER_BIN="${OPENSHELL_VM_DRIVER_BIN:-${ROOT}/target/debug/openshell-driver-vm}"
 CLI_BIN="${OPENSHELL_BIN:-${ROOT}/target/debug/openshell}"
 E2E_TEST_OVERRIDE="${OPENSHELL_E2E_VM_TEST:-}"
-E2E_FEATURES="${OPENSHELL_E2E_VM_FEATURES:-e2e-vm}"
+E2E_FEATURES="${OPENSHELL_E2E_VM_FEATURES-e2e-vm}"
 SANDBOX_IMAGE="${OPENSHELL_SANDBOX_IMAGE:-${COMMUNITY_SANDBOX_IMAGE:-ghcr.io/nvidia/openshell-community/sandboxes/base:latest}}"
 
 # The VM driver places `compute-driver.sock` under `[openshell.drivers.vm].state_dir`.
@@ -385,6 +387,8 @@ e2e_export_gateway_restart_metadata \
 # preparation; allow 180s for slower CI runners.
 export OPENSHELL_PROVISION_TIMEOUT="${SANDBOX_PROVISION_TIMEOUT}"
 
+e2e_run_openshell_conformance "VM"
+
 run_e2e_test() {
   local test_target="$1"
   shift
@@ -402,7 +406,6 @@ run_e2e_test() {
 if [ -n "${E2E_TEST_OVERRIDE}" ]; then
   run_e2e_test "${E2E_TEST_OVERRIDE}"
 else
-  run_e2e_test smoke
   run_e2e_test host_gateway_alias
   run_e2e_test vm_overlay
   run_e2e_test vm_gateway_start

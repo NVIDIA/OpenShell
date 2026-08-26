@@ -22,6 +22,10 @@ on:
         required: false
         type: string
         default: e2e:vm
+      conformance-artifact-prefix:
+        required: false
+        type: string
+        default: ""
 
 permissions:
   actions: read
@@ -43,6 +47,8 @@ jobs:
           persist-credentials: false
 
       - uses: ./.github/actions/setup-e2e-cli
+        with:
+          conformance-artifact-prefix: ${{ inputs.conformance-artifact-prefix }}
 
       - uses: ./.github/actions/setup-e2e-gateway
         with:
