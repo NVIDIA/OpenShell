@@ -319,10 +319,9 @@ pub struct ServerState {
     /// presenting a freshly minted token are recognized.
     pub sandbox_jwt_authenticator: Option<Arc<auth::sandbox_jwt::SandboxJwtAuthenticator>>,
 
-    /// Optional K8s `ServiceAccount` authenticator that backs the
-    /// `IssueSandboxToken` bootstrap path. Only present when the gateway
-    /// runs in-cluster.
-    pub k8s_sa_authenticator: Option<Arc<auth::k8s_sa::K8sServiceAccountAuthenticator>>,
+    /// Optional selected-driver authenticator for the `IssueSandboxToken`
+    /// bootstrap path.
+    pub compute_driver_authenticator: Option<Arc<auth::compute_driver::ComputeDriverAuthenticator>>,
 
     /// Gateway-wide gRPC request rate limiter shared by every multiplex path.
     pub(crate) grpc_rate_limiter: Option<multiplex::GrpcRateLimiter>,
@@ -424,7 +423,7 @@ impl ServerState {
             oidc_cache,
             sandbox_jwt_issuer: None,
             sandbox_jwt_authenticator: None,
-            k8s_sa_authenticator: None,
+            compute_driver_authenticator: None,
             grpc_rate_limiter,
             gateway_interceptors: None,
             provider_profile_sources:
@@ -593,7 +592,7 @@ pub(crate) async fn run_server(
     let supervisor_sessions = Arc::new(supervisor_session::SupervisorSessionRegistry::new());
     let driver_startup =
         compute_driver_startup_context(&config, config_file.as_ref(), guest_tls.as_ref());
-    let (compute, operator_allowlist) = build_compute_runtime(
+    let (compute, _operator_allowlist) = build_compute_runtime(
         &config,
         driver_startup,
         compute_driver,
@@ -663,43 +662,14 @@ pub(crate) async fn run_server(
         spawn_gateway_extension_token_refresh(issuer, gateway_extension_credentials);
     }
 
-    // K8s ServiceAccount bootstrap authenticator. Only constructed when
-    // the gateway is running in-cluster (kubelet provides the API host
-    // env var) and has a sandbox JWT issuer to mint replacements against;
-    // outside the cluster we can't call the apiserver's TokenReview API,
-    // and without the issuer there's nothing to exchange the SA token for.
-    #[cfg(not(target_os = "windows"))]
-    if state.sandbox_jwt_issuer.is_some() && std::env::var_os("KUBERNETES_SERVICE_HOST").is_some() {
-        // Pod lookups and TokenReview identity checks must match the sandbox
-        // namespace and service account used by the Kubernetes driver.
-        let kubernetes_config =
-            compute::driver_config::kubernetes_sa_bootstrap_config(config_file.as_ref())?;
-        let sandbox_namespace = kubernetes_config.namespace.clone();
-        let sandbox_service_account = kubernetes_config.service_account_name.clone();
-        let namespace_validator =
-            kubernetes_namespace_validator(&kubernetes_config, &operator_allowlist)?;
-        match kube::Client::try_default().await {
-            Ok(client) => {
-                let resolver = Arc::new(auth::k8s_sa::LiveK8sResolver::new(
-                    client,
-                    namespace_validator,
-                    "openshell-gateway".to_string(),
-                    sandbox_service_account.clone(),
-                ));
-                let authenticator = auth::k8s_sa::K8sServiceAccountAuthenticator::new(resolver);
-                state.k8s_sa_authenticator = Some(Arc::new(authenticator));
-                info!(
-                    namespace = %sandbox_namespace,
-                    service_account = %sandbox_service_account,
-                    "K8s ServiceAccount bootstrap authenticator enabled"
-                );
-            }
-            Err(e) => warn!(
-                error = %e,
-                "in-cluster K8s client construction failed; \
-                 K8s ServiceAccount bootstrap is disabled"
-            ),
-        }
+    if state.sandbox_jwt_issuer.is_some() && state.compute.supports_sandbox_authentication() {
+        state.compute_driver_authenticator = Some(Arc::new(
+            auth::compute_driver::ComputeDriverAuthenticator::new(state.compute.clone()),
+        ));
+        info!(
+            driver = state.compute.selected_driver_name(),
+            "compute-driver sandbox bootstrap authenticator enabled"
+        );
     }
 
     let state = Arc::new(state);
@@ -1070,51 +1040,6 @@ fn unsupported_builtin_compute_driver(driver: ComputeDriverKind) -> compute::Com
 
 type OperatorAllowlistArc = Option<openshell_core::OperatorNamespaceAllowlist>;
 pub use compute::{DriverWatchStream, SharedComputeDriver};
-
-fn kubernetes_namespace_validator(
-    config: &compute::driver_config::KubernetesSaBootstrapConfig,
-    operator_allowlist: &OperatorAllowlistArc,
-) -> Result<auth::k8s_sa::NamespaceValidator> {
-    match config.workspace_mode.as_str() {
-        "shared" => Ok(auth::k8s_sa::NamespaceValidator::Exact(
-            config.namespace.clone(),
-        )),
-        "managed" => Ok(auth::k8s_sa::NamespaceValidator::Prefix(format!(
-            "openshell-{}-",
-            config.gateway_id
-        ))),
-        "operator" => operator_allowlist
-            .clone()
-            .map(auth::k8s_sa::NamespaceValidator::Allowlist)
-            .ok_or_else(|| {
-                Error::config("Kubernetes operator namespace allowlist was not initialized")
-            }),
-        mode => Err(Error::config(format!(
-            "invalid Kubernetes workspace_mode '{mode}' for ServiceAccount bootstrap"
-        ))),
-    }
-}
-
-fn validate_remote_compute_driver_config(
-    name: &str,
-    file: Option<&config_file::ConfigFile>,
-) -> Result<()> {
-    if name != "kubernetes"
-        || !file.is_some_and(|file| file.openshell.drivers.contains_key("kubernetes"))
-    {
-        return Ok(());
-    }
-
-    let config = compute::driver_config::kubernetes_sa_bootstrap_config(file)?;
-    if config.workspace_mode == "operator" {
-        return Err(Error::config(
-            "Kubernetes workspace_mode 'operator' requires an in-process Kubernetes driver; \
-             external Kubernetes compute drivers do not support operator mode",
-        ));
-    }
-
-    Ok(())
-}
 
 /// Opaque result returned by a compiled compute-driver factory.
 pub struct ComputeDriverBuildOutput {
@@ -1644,7 +1569,6 @@ async fn build_compute_runtime(
             (output.runtime, output.operator_allowlist)
         }
         ConfiguredComputeDriver::Remote { name } => {
-            validate_remote_compute_driver_config(&name, driver_startup.file)?;
             let remote_config =
                 compute::driver_config::remote_driver_config_from_context(driver_startup, &name)?;
             info!(
@@ -1823,7 +1747,6 @@ mod tests {
         allow_plaintext_service_http, bind_gateway_listeners, classify_initial_bytes,
         is_benign_tls_handshake_failure, kubernetes_sandbox_jwt_expiry_disabled,
         mint_gateway_extension_credential, serve_gateway_listener,
-        validate_remote_compute_driver_config,
     };
     use openshell_core::{
         ComputeDriverKind, Config,
@@ -1858,28 +1781,6 @@ mod tests {
             )
             .expect("issuer"),
         )
-    }
-
-    #[test]
-    fn external_kubernetes_operator_workspace_mode_is_rejected() {
-        let file: crate::config_file::ConfigFile = toml::from_str(
-            r#"
-[openshell.drivers.kubernetes]
-socket_path = "/run/openshell/kubernetes.sock"
-workspace_mode = "operator"
-operator_namespace_label = "openshell.ai/workspace=true"
-"#,
-        )
-        .expect("valid config");
-
-        let error = validate_remote_compute_driver_config("kubernetes", Some(&file))
-            .expect_err("external operator mode must fail closed");
-
-        assert!(
-            error
-                .to_string()
-                .contains("external Kubernetes compute drivers do not support operator mode")
-        );
     }
 
     #[test]

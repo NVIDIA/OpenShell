@@ -33,7 +33,7 @@ annotation. An OTLP-enabled Agent Sandbox controller can therefore attach its
 asynchronous reconciliation spans to the originating OpenShell create trace.
 
 Workspace namespace modes assume exclusive control of the sandbox identity
-resource chain. In shared and managed modes, only the gateway and its trusted
+resource chain. In shared and managed modes, only the driver and its trusted
 Agent Sandbox controller may administer the sandbox namespace, Sandbox CRs,
 sandbox pods, or configured sandbox ServiceAccount. In operator mode, the
 platform operator owns namespace lifecycle but must prevent other principals
@@ -103,7 +103,9 @@ Sandbox pods run as `service_account_name` and keep
 `automountServiceAccountToken: false`. The only Kubernetes token exposed to the
 supervisor is an explicit, audience-bound projected token mounted at
 `/var/run/secrets/openshell/token` for the one-shot `IssueSandboxToken`
-bootstrap exchange.
+bootstrap exchange. The Kubernetes driver authenticates that token through the
+compute-driver protocol using its own `service_account_name` and workspace-mode
+namespace policy; the gateway receives only the verified sandbox ID.
 
 The gateway uses the supervisor relay for connect, exec, and file sync. Sandbox
 pods do not need direct external ingress for SSH.

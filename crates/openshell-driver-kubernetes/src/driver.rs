@@ -8,9 +8,12 @@ use crate::config::{
     DEFAULT_PROXY_UID, DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME, DEFAULT_SANDBOX_UID,
     DEFAULT_WORKSPACE_STORAGE_SIZE, KubernetesComputeConfig, OperatorNamespaceAllowlist,
     SupervisorSideloadMethod, SupervisorTopology, WorkspaceMode, is_dns_1123_label,
-    managed_namespace, validate_managed_namespace_name,
+    managed_namespace, managed_namespace_prefix, validate_managed_namespace_name,
 };
 use futures::{Stream, StreamExt, TryStreamExt};
+use k8s_openapi::api::authentication::v1::{
+    TokenReview, TokenReviewSpec, TokenReviewStatus, UserInfo,
+};
 use k8s_openapi::api::core::v1::{
     Event as KubeEventObj, Namespace, Node, PersistentVolumeClaimVolumeSource, Pod, Secret,
     ServiceAccount, Volume, VolumeMount,
@@ -19,7 +22,7 @@ use k8s_openapi::api::networking::v1::{
     NetworkPolicy, NetworkPolicyIngressRule, NetworkPolicyPeer, NetworkPolicyPort,
     NetworkPolicySpec,
 };
-use k8s_openapi::apimachinery::pkg::apis::meta::v1::LabelSelector;
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, OwnerReference};
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use kube::api::{
     Api, ApiResource, DeleteParams, ListParams, Patch, PatchParams, PostParams, Preconditions,
@@ -119,6 +122,9 @@ pub const SANDBOX_KIND: &str = "Sandbox";
 const SANDBOX_POD_NAME_ANNOTATION: &str = "agents.x-k8s.io/pod-name";
 const SANDBOX_SUSPENDED_CONDITION: &str = "Suspended";
 const SANDBOX_SUSPENDED_POD_NOT_OWNED_REASON: &str = "PodNotOwned";
+const SANDBOX_TOKEN_AUDIENCE: &str = "openshell-gateway";
+const POD_NAME_EXTRA: &str = "authentication.kubernetes.io/pod-name";
+const POD_UID_EXTRA: &str = "authentication.kubernetes.io/pod-uid";
 
 const GPU_RESOURCE_NAME: &str = "nvidia.com/gpu";
 const SPIFFE_WORKLOAD_API_VOLUME_NAME: &str = "spiffe-workload-api";
@@ -568,7 +574,102 @@ impl KubernetesComputeDriver {
             driver_version: openshell_core::VERSION.to_string(),
             default_image: self.config.default_image.clone(),
             gateway_manages_lifecycle: false,
+            supports_sandbox_authentication: true,
         })
+    }
+
+    /// Authenticate the projected `ServiceAccount` token used by a sandbox pod.
+    pub async fn authenticate_sandbox(&self, credential: &str) -> Result<String, tonic::Status> {
+        let reviews: Api<TokenReview> = Api::all(self.client.clone());
+        let review = TokenReview {
+            metadata: ObjectMeta::default(),
+            spec: TokenReviewSpec {
+                audiences: Some(vec![SANDBOX_TOKEN_AUDIENCE.to_string()]),
+                token: Some(credential.to_string()),
+            },
+            status: None,
+        };
+        let review = reviews
+            .create(&PostParams::default(), &review)
+            .await
+            .map_err(|error| {
+                warn!(%error, "Kubernetes TokenReview failed");
+                tonic::Status::internal("Kubernetes TokenReview failed")
+            })?;
+        let status = review
+            .status
+            .ok_or_else(|| tonic::Status::internal("TokenReview response missing status"))?;
+        let identity = token_review_identity(&status, &self.config.service_account_name)?
+            .ok_or_else(|| tonic::Status::unauthenticated("sandbox credential was not accepted"))?;
+        if !self.accepts_auth_namespace(&identity.namespace) {
+            return Err(tonic::Status::permission_denied(
+                "sandbox credential namespace is not accepted by the driver",
+            ));
+        }
+
+        let pods: Api<Pod> = Api::namespaced(self.client.clone(), &identity.namespace);
+        let pod = pods
+            .get_opt(&identity.pod_name)
+            .await
+            .map_err(|error| {
+                warn!(pod = %identity.pod_name, %error, "failed to read authenticated sandbox pod");
+                tonic::Status::internal("failed to read authenticated sandbox pod")
+            })?
+            .ok_or_else(|| {
+                tonic::Status::permission_denied("authenticated sandbox pod not found")
+            })?;
+        if pod.metadata.uid.as_deref() != Some(identity.pod_uid.as_str()) {
+            return Err(tonic::Status::permission_denied(
+                "sandbox credential pod UID mismatch",
+            ));
+        }
+        let sandbox_id = pod
+            .metadata
+            .annotations
+            .as_ref()
+            .and_then(|annotations| annotations.get(LABEL_SANDBOX_ID))
+            .filter(|value| !value.is_empty())
+            .cloned()
+            .ok_or_else(|| {
+                tonic::Status::permission_denied("pod is not bound to a sandbox identity")
+            })?;
+        let owner = sandbox_owner_reference(&pod)?;
+        let sandboxes = self
+            .supported_agent_sandbox_api(self.client.clone(), &identity.namespace)
+            .await
+            .map_err(|error| {
+                tonic::Status::internal(format!("failed to select Sandbox API: {error}"))
+            })?;
+        let sandbox = sandboxes.api.get_opt(&owner.name).await.map_err(|error| {
+            warn!(sandbox = %owner.name, %error, "failed to read authenticated Sandbox resource");
+            tonic::Status::internal("failed to read authenticated Sandbox resource")
+        })?.ok_or_else(|| tonic::Status::permission_denied("sandbox owner not found"))?;
+        if sandbox.metadata.uid.as_deref() != Some(owner.uid.as_str())
+            || sandbox
+                .metadata
+                .labels
+                .as_ref()
+                .and_then(|labels| labels.get(LABEL_SANDBOX_ID))
+                != Some(&sandbox_id)
+        {
+            return Err(tonic::Status::permission_denied(
+                "pod identity does not match its Sandbox owner",
+            ));
+        }
+        Ok(sandbox_id)
+    }
+
+    fn accepts_auth_namespace(&self, namespace: &str) -> bool {
+        match self.config.workspace_mode {
+            WorkspaceMode::Shared => namespace == self.config.namespace,
+            WorkspaceMode::Managed => {
+                namespace.starts_with(&managed_namespace_prefix(&self.config.gateway_id))
+            }
+            WorkspaceMode::Operator => self
+                .operator_allowlist
+                .as_ref()
+                .is_some_and(|allowlist| allowlist.contains(namespace)),
+        }
     }
 
     pub fn operator_allowlist(&self) -> Option<&OperatorNamespaceAllowlist> {
@@ -2278,6 +2379,103 @@ fn sandbox_id_from_object(obj: &DynamicObject) -> Result<String, String> {
         return Ok(id.clone());
     }
     Err("sandbox id not found on object".to_string())
+}
+
+#[derive(Debug)]
+struct TokenReviewIdentity {
+    namespace: String,
+    pod_name: String,
+    pod_uid: String,
+}
+
+#[allow(clippy::result_large_err)]
+fn token_review_identity(
+    status: &TokenReviewStatus,
+    expected_service_account: &str,
+) -> Result<Option<TokenReviewIdentity>, tonic::Status> {
+    if status.authenticated != Some(true) {
+        return Ok(None);
+    }
+    if !status
+        .audiences
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .any(|audience| audience == SANDBOX_TOKEN_AUDIENCE)
+    {
+        return Err(tonic::Status::unauthenticated(
+            "sandbox credential audience not accepted",
+        ));
+    }
+    let user = status
+        .user
+        .as_ref()
+        .ok_or_else(|| tonic::Status::permission_denied("TokenReview response missing user"))?;
+    let rest = user
+        .username
+        .as_deref()
+        .unwrap_or_default()
+        .strip_prefix("system:serviceaccount:")
+        .ok_or_else(|| tonic::Status::permission_denied("credential is not a service account"))?;
+    let (namespace, service_account) = rest
+        .split_once(':')
+        .filter(|(namespace, service_account)| !namespace.is_empty() && !service_account.is_empty())
+        .ok_or_else(|| tonic::Status::permission_denied("invalid service account identity"))?;
+    if service_account != expected_service_account {
+        return Err(tonic::Status::permission_denied(
+            "credential is not from the configured sandbox service account",
+        ));
+    }
+    Ok(Some(TokenReviewIdentity {
+        namespace: namespace.to_string(),
+        pod_name: user_extra_one(user, POD_NAME_EXTRA)?,
+        pod_uid: user_extra_one(user, POD_UID_EXTRA)?,
+    }))
+}
+
+#[allow(clippy::result_large_err)]
+fn user_extra_one(user: &UserInfo, key: &str) -> Result<String, tonic::Status> {
+    let values = user
+        .extra
+        .as_ref()
+        .and_then(|extra| extra.get(key))
+        .ok_or_else(|| tonic::Status::permission_denied("sandbox credential is not pod-bound"))?;
+    if values.len() != 1 || values[0].is_empty() {
+        return Err(tonic::Status::permission_denied(
+            "sandbox credential has invalid pod binding",
+        ));
+    }
+    Ok(values[0].clone())
+}
+
+#[allow(clippy::result_large_err)]
+fn sandbox_owner_reference(pod: &Pod) -> Result<&OwnerReference, tonic::Status> {
+    let mut owners = pod
+        .metadata
+        .owner_references
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .filter(|owner| {
+            owner.kind == SANDBOX_KIND
+                && matches!(
+                    owner.api_version.as_str(),
+                    "agents.x-k8s.io/v1beta1" | "agents.x-k8s.io/v1alpha1"
+                )
+        });
+    let owner = owners
+        .next()
+        .ok_or_else(|| tonic::Status::permission_denied("pod is not controlled by a Sandbox"))?;
+    if owners.next().is_some()
+        || owner.controller != Some(true)
+        || owner.name.is_empty()
+        || owner.uid.is_empty()
+    {
+        return Err(tonic::Status::permission_denied(
+            "pod has an invalid Sandbox owner",
+        ));
+    }
+    Ok(owner)
 }
 
 fn annotation_or_label(obj: &DynamicObject, key: &str) -> Option<String> {
@@ -4903,6 +5101,40 @@ mod tests {
             stream.next().await.is_none(),
             "source closure must be preserved"
         );
+    }
+
+    fn authenticated_token_review(username: &str) -> TokenReviewStatus {
+        TokenReviewStatus {
+            authenticated: Some(true),
+            audiences: Some(vec![SANDBOX_TOKEN_AUDIENCE.to_string()]),
+            user: Some(UserInfo {
+                username: Some(username.to_string()),
+                extra: Some(BTreeMap::from([
+                    (POD_NAME_EXTRA.to_string(), vec!["sandbox-pod".to_string()]),
+                    (POD_UID_EXTRA.to_string(), vec!["pod-uid".to_string()]),
+                ])),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn token_review_uses_configured_service_account_and_pod_binding() {
+        let status = authenticated_token_review("system:serviceaccount:workspaces:sandbox-sa");
+        let identity = token_review_identity(&status, "sandbox-sa")
+            .unwrap()
+            .expect("authenticated identity");
+        assert_eq!(identity.namespace, "workspaces");
+        assert_eq!(identity.pod_name, "sandbox-pod");
+        assert_eq!(identity.pod_uid, "pod-uid");
+    }
+
+    #[test]
+    fn token_review_rejects_a_different_service_account() {
+        let status = authenticated_token_review("system:serviceaccount:workspaces:other");
+        let error = token_review_identity(&status, "sandbox-sa").unwrap_err();
+        assert_eq!(error.code(), tonic::Code::PermissionDenied);
     }
 
     #[test]

@@ -745,7 +745,7 @@ fn gateway_principal_fields(principal: &Principal) -> BTreeMap<String, String> {
                 match &sandbox.source {
                     SandboxIdentitySource::BootstrapJwt { .. } => "bootstrap_jwt",
                     SandboxIdentitySource::BootstrapCert { .. } => "bootstrap_cert",
-                    SandboxIdentitySource::K8sServiceAccount { .. } => "k8s_service_account",
+                    SandboxIdentitySource::ComputeDriver { .. } => "compute_driver",
                 }
                 .to_string(),
             );
@@ -976,10 +976,9 @@ where
 /// Assemble the authenticator chain for the gateway.
 ///
 /// Chain order (first-match-wins):
-/// 1. `K8sServiceAccountAuthenticator` (path-scoped to `IssueSandboxToken`)
-///    — exchanges a projected SA token for a `Principal::Sandbox` so the
-///    `IssueSandboxToken` handler can mint a gateway JWT. No-op on every
-///    other path; only present when the gateway runs in-cluster.
+/// 1. `ComputeDriverAuthenticator` (path-scoped to `IssueSandboxToken`)
+///    — delegates a driver-native credential and receives a sandbox identity
+///    so the handler can mint a gateway JWT. No-op on every other path.
 /// 2. `SandboxJwtAuthenticator` — validates gateway-minted JWTs. Recognized
 ///    via a distinctive `kid` so non-matching Bearer tokens fall through.
 /// 3. `OidcAuthenticator` — validates user Bearer tokens against the
@@ -997,8 +996,8 @@ where
 /// to pass-through unless mTLS or local unauthenticated users are enabled.
 fn build_authenticator_chain(state: &ServerState) -> Option<AuthenticatorChain> {
     let mut authenticators: Vec<Arc<dyn crate::auth::authenticator::Authenticator>> = Vec::new();
-    if let Some(k8s) = state.k8s_sa_authenticator.clone() {
-        authenticators.push(k8s);
+    if let Some(driver) = state.compute_driver_authenticator.clone() {
+        authenticators.push(driver);
     }
     if let Some(jwt) = state.sandbox_jwt_authenticator.clone() {
         authenticators.push(jwt);

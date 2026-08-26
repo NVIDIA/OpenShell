@@ -23,6 +23,12 @@ service ComputeDriver {
   // Report driver capabilities and defaults.
   rpc GetCapabilities(GetCapabilitiesRequest) returns (GetCapabilitiesResponse);
 
+  // Authenticate a driver-native bootstrap credential and return the stable
+  // sandbox identity it represents. The gateway remains responsible for
+  // checking that the sandbox exists and minting gateway credentials.
+  rpc AuthenticateSandbox(AuthenticateSandboxRequest)
+      returns (AuthenticateSandboxResponse);
+
   // Report additional gateway listeners required by this driver instance.
   //
   // A requirement is not authorization to expose the gateway. The gateway
@@ -78,6 +84,18 @@ message GetCapabilitiesResponse {
   // Whether the gateway should stop running sandbox compute during graceful
   // shutdown and restart the retained running intent on startup.
   bool gateway_manages_lifecycle = 6;
+  // Whether AuthenticateSandbox is implemented by this driver.
+  bool supports_sandbox_authentication = 7;
+}
+
+message AuthenticateSandboxRequest {
+  // Opaque credential whose format and verification are owned by the driver.
+  string credential = 1 [(openshell.options.v1.secret) = true];
+}
+
+message AuthenticateSandboxResponse {
+  // Stable gateway-assigned sandbox ID authenticated by the driver.
+  string sandbox_id = 1;
 }
 
 message GetGatewayListenerRequirementsRequest {}

@@ -635,6 +635,7 @@ impl DockerComputeDriver {
             driver_version: self.config.daemon_version.clone(),
             default_image: self.config.default_image.clone(),
             gateway_manages_lifecycle: true,
+            supports_sandbox_authentication: false,
         }
     }
 
@@ -1900,6 +1901,15 @@ impl ComputeDriver for ComputeDriverService {
 
 #[tonic::async_trait]
 impl ComputeDriver for DockerComputeDriver {
+    async fn authenticate_sandbox(
+        &self,
+        _request: Request<openshell_core::proto::compute::v1::AuthenticateSandboxRequest>,
+    ) -> Result<Response<openshell_core::proto::compute::v1::AuthenticateSandboxResponse>, Status> {
+        Err(Status::unimplemented(
+            "docker does not authenticate sandbox credentials",
+        ))
+    }
+
     type WatchSandboxesStream = WatchStream;
 
     async fn get_capabilities(

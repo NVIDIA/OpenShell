@@ -5,7 +5,7 @@
 //!
 //! Hosts authenticated identity RPCs:
 //! - `GetCurrentUser` — report the gateway-validated caller identity
-//! - `IssueSandboxToken` — bootstrap exchange (K8s SA token → gateway JWT)
+//! - `IssueSandboxToken` — driver-native bootstrap exchange → gateway JWT
 //! - `RefreshSandboxToken` — renew a still-valid gateway JWT
 //!
 //! Both end in a fresh gateway-signed JWT minted by
@@ -71,13 +71,9 @@ pub async fn handle_issue_sandbox_token(
         ));
     };
 
-    // Only the bootstrap K8s ServiceAccount path can mint a fresh gateway JWT
-    // via this RPC. Sandboxes already holding a gateway JWT use
-    // `RefreshSandboxToken` instead.
-    if !matches!(
-        sandbox.source,
-        SandboxIdentitySource::K8sServiceAccount { .. }
-    ) {
+    // Only a selected compute driver may establish the bootstrap sandbox
+    // identity. Sandboxes already holding a gateway JWT use refresh instead.
+    if !matches!(sandbox.source, SandboxIdentitySource::ComputeDriver { .. }) {
         debug!(
             sandbox_id = %sandbox.sandbox_id,
             "IssueSandboxToken rejected: non-bootstrap principal source"
@@ -518,9 +514,8 @@ mod tests {
         req.extensions_mut()
             .insert(Principal::Sandbox(SandboxPrincipal {
                 sandbox_id: "sandbox-a".to_string(),
-                source: SandboxIdentitySource::K8sServiceAccount {
-                    pod_name: "pod-a".to_string(),
-                    pod_uid: "uid-a".to_string(),
+                source: SandboxIdentitySource::ComputeDriver {
+                    driver_name: "kubernetes".to_string(),
                 },
                 trust_domain: Some("openshell".to_string()),
             }));
@@ -541,9 +536,8 @@ mod tests {
         req.extensions_mut()
             .insert(Principal::Sandbox(SandboxPrincipal {
                 sandbox_id: "sandbox-deleted".to_string(),
-                source: SandboxIdentitySource::K8sServiceAccount {
-                    pod_name: "pod-a".to_string(),
-                    pod_uid: "uid-a".to_string(),
+                source: SandboxIdentitySource::ComputeDriver {
+                    driver_name: "kubernetes".to_string(),
                 },
                 trust_domain: Some("openshell".to_string()),
             }));
@@ -576,8 +570,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn refresh_rejects_k8s_sa_principal() {
-        // K8s SA-bootstrap principals must use IssueSandboxToken, not
+    async fn refresh_rejects_compute_driver_principal() {
+        // Driver-bootstrap principals must use IssueSandboxToken, not
         // RefreshSandboxToken — the refresh path assumes a still-valid
         // gateway-minted JWT exists.
         use crate::auth::principal::SandboxIdentitySource;
@@ -588,9 +582,8 @@ mod tests {
         req.extensions_mut()
             .insert(Principal::Sandbox(SandboxPrincipal {
                 sandbox_id: "sandbox-a".to_string(),
-                source: SandboxIdentitySource::K8sServiceAccount {
-                    pod_name: "pod-a".to_string(),
-                    pod_uid: "uid-a".to_string(),
+                source: SandboxIdentitySource::ComputeDriver {
+                    driver_name: "kubernetes".to_string(),
                 },
                 trust_domain: Some("openshell".to_string()),
             }));

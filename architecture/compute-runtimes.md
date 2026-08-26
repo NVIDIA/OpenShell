@@ -177,6 +177,15 @@ The driver reports this behavior through
 in-process and external drivers. Older drivers omit the field and retain the
 conservative operator-managed behavior.
 
+Drivers that can verify a platform-native sandbox credential advertise
+`GetCapabilities.supports_sandbox_authentication`. On the path-scoped
+`IssueSandboxToken` exchange, the gateway forwards the opaque bearer credential
+to that selected driver through `AuthenticateSandbox`. The driver returns only
+the authenticated sandbox ID. The gateway then verifies that its durable
+sandbox record exists and mints the gateway JWT. The driver socket is therefore
+a sandbox-identity trust boundary, but it does not grant user or administrator
+authority.
+
 ## Deletion Lifecycle
 
 Lifecycle requests use per-sandbox gates to serialize stop, start, and
@@ -465,8 +474,8 @@ watcher emits only sandbox CR changes, not platform events.
 
 ### SA Token Authentication
 
-The gateway's `K8sServiceAccountAuthenticator` adapts its `NamespaceValidator`
-per mode (`crates/openshell-server/src/auth/k8s_sa.rs`):
+The Kubernetes driver's `AuthenticateSandbox` implementation applies its named
+`[openshell.drivers.kubernetes]` configuration per mode:
 
 - **Shared:** `Exact` — accepts only the single configured namespace.
 - **Managed:** `Prefix` — accepts any namespace starting with `openshell-{gateway_id}-`.
@@ -474,11 +483,14 @@ per mode (`crates/openshell-server/src/auth/k8s_sa.rs`):
   `BTreeSet` populated by the label/file watchers. Starts empty (fail-closed)
   until the first watcher update.
 
-These checks rely on an ownership invariant. In shared and managed modes, the
-gateway and its trusted Agent Sandbox controller exclusively administer the
-sandbox namespace, Sandbox CRs, sandbox pods, and configured sandbox
-ServiceAccount. Other principals must not create or mutate those resources or
-use that ServiceAccount. In operator mode, the platform operator retains
+It validates the projected token with Kubernetes `TokenReview`, checks the live
+pod UID, and verifies the pod's controlling Sandbox CR UID and sandbox ID before
+returning the identity to the gateway. These checks rely on an ownership
+invariant. In shared and managed modes, the Kubernetes driver and its trusted
+Agent Sandbox controller exclusively administer the sandbox namespace, Sandbox
+CRs, sandbox pods, and configured sandbox ServiceAccount. Other principals must
+not create or mutate those resources or use that ServiceAccount. In operator
+mode, the platform operator retains
 namespace lifecycle ownership, but must preserve the same exclusive control of
 Sandbox CRs and the pods and ServiceAccount used for sandbox token bootstrap.
 An allowlisted namespace is therefore a trust grant, not a tenant isolation
