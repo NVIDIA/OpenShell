@@ -720,6 +720,15 @@ impl VmDriver {
             )));
         }
 
+        let relative = canonical.strip_prefix(&canonical_staging).unwrap();
+        let depth = relative.components().count();
+        if depth != 2 {
+            return Err(Status::permission_denied(format!(
+                "rootfs tar path {} must be inside a request subdirectory of the staging root",
+                canonical.display(),
+            )));
+        }
+
         let metadata = tokio::fs::symlink_metadata(&canonical)
             .await
             .map_err(|err| {
@@ -763,6 +772,7 @@ impl VmDriver {
                 .rootfs_tar_staging_dir()
                 .to_string_lossy()
                 .into_owned(),
+            rootfs_tar_max_bytes: self.config.rootfs_tar_max_bytes(),
         }
     }
 
@@ -2845,6 +2855,13 @@ impl VmDriver {
         tar_path: &Path,
         bootstrap_root_disk: &Path,
     ) -> Result<PreparedImageDisk, Status> {
+        let request_staging_dir = tar_path.parent().map(Path::to_path_buf);
+        let cleanup_request_staging = || async {
+            if let Some(d) = &request_staging_dir {
+                let _ = tokio::fs::remove_dir_all(d).await;
+            }
+        };
+
         let metadata = tokio::fs::metadata(tar_path).await.map_err(|err| {
             Status::failed_precondition(format!(
                 "rootfs tar not accessible at {}: {err}",
@@ -2869,6 +2886,7 @@ impl VmDriver {
                 "rootfs_tar",
                 &cache_identity,
             );
+            cleanup_request_staging().await;
             return Ok(PreparedImageDisk {
                 image_identity: cache_identity,
                 disk_path: image_path,
@@ -2884,6 +2902,7 @@ impl VmDriver {
                 "rootfs_tar",
                 &cache_identity,
             );
+            cleanup_request_staging().await;
             return Ok(PreparedImageDisk {
                 image_identity: cache_identity,
                 disk_path: image_path,
@@ -2906,10 +2925,12 @@ impl VmDriver {
         );
         if let Err(err) = tokio::fs::copy(tar_path, &rootfs_archive).await {
             let _ = tokio::fs::remove_dir_all(&staging_dir).await;
+            cleanup_request_staging().await;
             return Err(Status::internal(format!(
                 "failed to copy rootfs tar to staging: {err}"
             )));
         }
+        cleanup_request_staging().await;
 
         let payload = GuestImagePayload {
             image_ref: tar_display.clone(),

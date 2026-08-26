@@ -307,6 +307,8 @@ pub struct ComputeDriverInfoSnapshot {
     pub driver_reports_runtime_readiness: bool,
     /// Directory where rootfs tar files must be staged.
     pub rootfs_tar_staging_dir: String,
+    /// Maximum rootfs tar file size in bytes.
+    pub rootfs_tar_max_bytes: u64,
 }
 
 /// Interval between store-vs-backend reconciliation sweeps.
@@ -656,6 +658,7 @@ impl ComputeRuntime {
             supports_sandbox_authentication: capabilities.supports_sandbox_authentication,
             driver_reports_runtime_readiness: capabilities.driver_reports_runtime_readiness,
             rootfs_tar_staging_dir: capabilities.rootfs_tar_staging_dir,
+            rootfs_tar_max_bytes: capabilities.rootfs_tar_max_bytes,
         };
         let default_image = capabilities.default_image;
         let gateway_listener_requirements = match driver
@@ -4659,6 +4662,7 @@ impl ComputeDriver for NoopTestDriver {
                 supports_sandbox_authentication: self.sandbox_authentication.is_some(),
                 driver_reports_runtime_readiness: false,
                 rootfs_tar_staging_dir: String::new(),
+                rootfs_tar_max_bytes: 0,
             },
         ))
     }
@@ -4804,6 +4808,7 @@ pub async fn new_test_runtime_with_driver(
             supports_sandbox_authentication,
             driver_reports_runtime_readiness: false,
             rootfs_tar_staging_dir: String::new(),
+            rootfs_tar_max_bytes: 0,
         },
         telemetry_compute_driver: TelemetryComputeDriver::custom(),
         driver_process: None,
@@ -4983,6 +4988,7 @@ mod tests {
                 supports_sandbox_authentication: false,
                 driver_reports_runtime_readiness: false,
                 rootfs_tar_staging_dir: String::new(),
+                rootfs_tar_max_bytes: 0,
             }))
         }
 
@@ -5325,6 +5331,7 @@ mod tests {
                 supports_sandbox_authentication: false,
                 driver_reports_runtime_readiness: false,
                 rootfs_tar_staging_dir: String::new(),
+                rootfs_tar_max_bytes: 0,
             }))
         }
 
@@ -5536,6 +5543,7 @@ mod tests {
                 supports_sandbox_authentication: false,
                 driver_reports_runtime_readiness: false,
                 rootfs_tar_staging_dir: String::new(),
+                rootfs_tar_max_bytes: 0,
             },
             telemetry_compute_driver: TelemetryComputeDriver::custom(),
             driver_process: None,

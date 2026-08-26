@@ -95,6 +95,9 @@ message GetCapabilitiesResponse {
   // before being referenced in a CreateSandbox request. The driver rejects
   // paths outside this directory.
   string rootfs_tar_staging_dir = 9;
+  // Maximum rootfs tar file size in bytes accepted by the driver. Zero means
+  // the driver does not support rootfs tar sources.
+  uint64 rootfs_tar_max_bytes = 10;
 }
 
 message AuthenticateSandboxRequest {

@@ -840,6 +840,9 @@ message ComputeDriverCapabilities {
   // Absolute path where rootfs tar files must be staged before creating a
   // sandbox. Empty when the driver does not support rootfs tar sources.
   string rootfs_tar_staging_dir = 3;
+
+  // Maximum rootfs tar file size in bytes accepted by the driver.
+  uint64 rootfs_tar_max_bytes = 4;
 }
 
 // Public sandbox resource exposed by the OpenShell API.
