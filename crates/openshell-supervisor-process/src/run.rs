@@ -57,7 +57,7 @@ fn ocsf_ctx() -> &'static openshell_ocsf::SandboxContext {
 /// Returns an error if SSH server startup fails, if the entrypoint child
 /// fails to spawn, or if waiting for the child returns an OS error.
 #[allow(clippy::too_many_arguments, clippy::implicit_hasher)]
-pub async fn run_process(
+pub async fn spawn_workload(
     program: &str,
     args: &[String],
     workspace: ResolvedWorkspace,
@@ -83,7 +83,8 @@ pub async fn run_process(
         tokio::sync::mpsc::UnboundedSender<DenialEvent>,
     >,
     #[cfg(target_os = "linux")] bypass_activity_tx: Option<ActivitySender>,
-) -> Result<i32> {
+    boundary_runtime: Option<Arc<crate::boundary_io::BoundaryRuntimeState>>,
+) -> Result<SpawnedAgent> {
     // Platform drivers with a resolved numeric UID/GID retain the legacy
     // account-file update. OCI-image identity leaves those environment values
     // empty, so the image's account files remain unchanged.
@@ -266,6 +267,27 @@ pub async fn run_process(
     let main_session = crate::main_session::MainSession::new(handle.take_io(), main_pid);
     let main_instance_id = uuid::Uuid::new_v4().to_string();
 
+    #[cfg(target_os = "linux")]
+    let boundary_netns_fd = netns
+        .map(NetworkNamespace::try_clone_ns_fd)
+        .transpose()?
+        .flatten()
+        .map(Arc::new);
+    #[cfg(not(target_os = "linux"))]
+    let boundary_netns_fd = None;
+    let boundary_runtime =
+        boundary_runtime.unwrap_or_else(crate::boundary_io::BoundaryRuntimeState::new);
+    let port_forward: Arc<dyn openshell_isolation::contract::BoundaryPortForward> =
+        Arc::new(crate::boundary_io::NetnsPortForward::new(
+            boundary_netns_fd.clone(),
+            Some(boundary_runtime.clone()),
+        ));
+    let user_environment: std::collections::HashMap<String, String> =
+        std::env::var(openshell_core::sandbox_env::USER_ENVIRONMENT)
+            .ok()
+            .and_then(|json| serde_json::from_str(&json).ok())
+            .unwrap_or_default();
+
     // SSH-spawned shells get http_proxy=http://<host_ip>:<port> exported into
     // their env so cooperative tools (curl, npm, Node) route through the
     // CONNECT proxy. Linux uses the netns host_ip; on other targets fall back
@@ -274,6 +296,20 @@ pub async fn run_process(
     let ssh_proxy_url = ssh_proxy_url_for_policy(policy, netns.map(NetworkNamespace::host_ip));
     #[cfg(not(target_os = "linux"))]
     let ssh_proxy_url = ssh_proxy_url_for_policy(policy, None);
+
+    let boundary_exec: Arc<dyn openshell_isolation::contract::BoundaryExec> =
+        Arc::new(crate::boundary_exec::LocalBoundaryExec::new(
+            policy.clone(),
+            workspace.owned_root(),
+            boundary_netns_fd,
+            ssh_proxy_url.clone(),
+            ca_file_paths.clone().map(Arc::new),
+            provider_credentials.clone(),
+            user_environment,
+            resolved_process_identity,
+            enforcement_mode,
+            boundary_runtime.clone(),
+        ));
 
     let ssh_socket_path: Option<std::path::PathBuf> = ssh_socket_path.map(std::path::PathBuf::from);
     if let Some(listen_path) = ssh_socket_path.clone() {
@@ -382,6 +418,11 @@ pub async fn run_process(
 
     // Store the entrypoint PID so the proxy can resolve TCP peer identity
     entrypoint_pid.store(handle.pid(), Ordering::Release);
+    let terminal = Arc::new(AtomicBool::new(false));
+    let signal_lock = Arc::new(std::sync::Mutex::new(()));
+    boundary_runtime
+        .register_process_group(handle.pid(), terminal.clone(), signal_lock.clone())
+        .map_err(|error| miette::miette!(error.to_string()))?;
     if early_exit.is_none()
         && let Some(tx) = entrypoint_started_tx
     {
@@ -400,70 +441,250 @@ pub async fn run_process(
             .build()
     );
 
-    let outcome = if let Some(status) = early_exit {
-        ProcessWaitOutcome::Exited(status)
-    } else {
-        wait_for_process_exit_or_shutdown(&mut handle, timeout_secs, &supervisor_terminating)
+    Ok(SpawnedAgent {
+        handle,
+        early_exit,
+        timeout_secs,
+        supervisor_terminating,
+        supervisor_session_task,
+        main_session,
+        main_instance_id,
+        sidecar_exit_tx,
+        openshell_endpoint: openshell_endpoint.map(str::to_string),
+        sandbox_id: sandbox_id.map(str::to_string),
+        boundary_exec,
+        port_forward,
+        boundary_runtime,
+        terminal,
+        signal_lock,
+    })
+}
+
+/// Run a command through the legacy orchestration entry point.
+///
+/// This is intentionally a thin adapter over the owned RFC lifecycle. Existing
+/// callers still receive an exit code, while runtime-selectable backends retain
+/// the running process and its boundary capabilities.
+#[allow(clippy::too_many_arguments, clippy::implicit_hasher)]
+pub async fn run_process(
+    program: &str,
+    args: &[String],
+    workspace: ResolvedWorkspace,
+    timeout_secs: u64,
+    interactive: bool,
+    sandbox_id: Option<&str>,
+    openshell_endpoint: Option<&str>,
+    ssh_socket_path: Option<String>,
+    shared_ssh_socket: bool,
+    ssh_exit_tx: Option<tokio::sync::oneshot::Sender<()>>,
+    policy: &SandboxPolicy,
+    resolved_process_identity: ResolvedProcessIdentity,
+    enforcement_mode: ProcessEnforcementMode,
+    entrypoint_pid: Arc<AtomicU32>,
+    entrypoint_started_tx: Option<tokio::sync::oneshot::Sender<(u32, String)>>,
+    sidecar_exit_tx: Option<tokio::sync::mpsc::Sender<SidecarExitReport>>,
+    provider_credentials: ProviderCredentialState,
+    provider_env: std::collections::HashMap<String, String>,
+    ca_file_paths: Option<(std::path::PathBuf, std::path::PathBuf)>,
+    agent_proposals: AgentProposals,
+    #[cfg(target_os = "linux")] netns: Option<&NetworkNamespace>,
+    #[cfg(target_os = "linux")] bypass_denial_tx: Option<
+        tokio::sync::mpsc::UnboundedSender<DenialEvent>,
+    >,
+    #[cfg(target_os = "linux")] bypass_activity_tx: Option<ActivitySender>,
+) -> Result<i32> {
+    let mut spawned = spawn_workload(
+        program,
+        args,
+        workspace,
+        timeout_secs,
+        interactive,
+        sandbox_id,
+        openshell_endpoint,
+        ssh_socket_path,
+        shared_ssh_socket,
+        ssh_exit_tx,
+        policy,
+        resolved_process_identity,
+        enforcement_mode,
+        entrypoint_pid,
+        entrypoint_started_tx,
+        sidecar_exit_tx,
+        provider_credentials,
+        provider_env,
+        ca_file_paths,
+        agent_proposals,
+        #[cfg(target_os = "linux")]
+        netns,
+        #[cfg(target_os = "linux")]
+        bypass_denial_tx,
+        #[cfg(target_os = "linux")]
+        bypass_activity_tx,
+        None,
+    )
+    .await?;
+    Ok(spawned.wait().await?.code())
+}
+
+/// Owned canonical workload plus the boundary capabilities tied to it.
+pub struct SpawnedAgent {
+    handle: ProcessHandle,
+    early_exit: Option<ProcessStatus>,
+    timeout_secs: u64,
+    supervisor_terminating: Arc<AtomicBool>,
+    supervisor_session_task: Option<tokio::task::JoinHandle<()>>,
+    main_session: Arc<crate::main_session::MainSession>,
+    main_instance_id: String,
+    sidecar_exit_tx: Option<tokio::sync::mpsc::Sender<SidecarExitReport>>,
+    openshell_endpoint: Option<String>,
+    sandbox_id: Option<String>,
+    boundary_exec: Arc<dyn openshell_isolation::contract::BoundaryExec>,
+    port_forward: Arc<dyn openshell_isolation::contract::BoundaryPortForward>,
+    boundary_runtime: Arc<crate::boundary_io::BoundaryRuntimeState>,
+    terminal: Arc<AtomicBool>,
+    signal_lock: Arc<std::sync::Mutex<()>>,
+}
+
+impl SpawnedAgent {
+    #[must_use]
+    pub fn signaler(&self) -> AgentSignaler {
+        AgentSignaler {
+            pid: self.handle.pid(),
+            terminal: self.terminal.clone(),
+            signal_lock: self.signal_lock.clone(),
+        }
+    }
+
+    #[must_use]
+    pub fn boundary_exec(&self) -> Arc<dyn openshell_isolation::contract::BoundaryExec> {
+        self.boundary_exec.clone()
+    }
+
+    #[must_use]
+    pub fn port_forward(&self) -> Arc<dyn openshell_isolation::contract::BoundaryPortForward> {
+        self.port_forward.clone()
+    }
+
+    #[must_use]
+    pub fn boundary_runtime(&self) -> Arc<crate::boundary_io::BoundaryRuntimeState> {
+        self.boundary_runtime.clone()
+    }
+
+    /// Wait for the canonical process and finalize every existing reporting
+    /// and retained-I/O obligation before publishing the boundary exit.
+    pub async fn wait(&mut self) -> Result<ProcessStatus> {
+        let pid = self.handle.pid();
+        let outcome = if let Some(status) = self.early_exit.take() {
+            ProcessWaitOutcome::Exited(status)
+        } else {
+            wait_for_process_exit_or_shutdown(
+                &mut self.handle,
+                self.timeout_secs,
+                &self.supervisor_terminating,
+            )
             .await?
-    };
+        };
+        let status = match outcome {
+            ProcessWaitOutcome::Exited(status) => status,
+            ProcessWaitOutcome::TimedOut => {
+                ocsf_emit!(
+                    ProcessActivityBuilder::new(ocsf_ctx())
+                        .activity(ActivityId::Close)
+                        .action(ActionId::Denied)
+                        .disposition(DispositionId::Blocked)
+                        .severity(SeverityId::Critical)
+                        .status(StatusId::Failure)
+                        .message("Process timed out, killing")
+                        .build()
+                );
+                ProcessStatus::exited(124)
+            }
+            ProcessWaitOutcome::ShutdownSignal { signal, status } => {
+                info!(
+                    signal,
+                    exit_code = status.code(),
+                    "Entrypoint exited after supervisor shutdown signal"
+                );
+                status
+            }
+        };
+        let rendered_code = status.code();
+        self.terminal.store(true, Ordering::Release);
+        self.boundary_runtime
+            .unregister_process_group(pid, &self.terminal);
+        self.boundary_runtime.deactivate();
+        self.supervisor_terminating.store(true, Ordering::Release);
+        self.main_session.finish(rendered_code).await;
 
-    let rendered_code = match outcome {
-        ProcessWaitOutcome::Exited(status) => status.code(),
-        ProcessWaitOutcome::TimedOut => {
-            ocsf_emit!(
-                ProcessActivityBuilder::new(ocsf_ctx())
-                    .activity(ActivityId::Close)
-                    .action(ActionId::Denied)
-                    .disposition(DispositionId::Blocked)
-                    .severity(SeverityId::Critical)
-                    .status(StatusId::Failure)
-                    .message("Process timed out, killing")
-                    .build()
-            );
-            124
+        ocsf_emit!(
+            ProcessActivityBuilder::new(ocsf_ctx())
+                .activity(ActivityId::Close)
+                .action(ActionId::Allowed)
+                .disposition(DispositionId::Allowed)
+                .severity(SeverityId::Informational)
+                .status(StatusId::Success)
+                .exit_code(rendered_code)
+                .message(format!("Process exited with code {rendered_code}"))
+                .build()
+        );
+        if let Some(task) = self.supervisor_session_task.take() {
+            task.abort();
         }
-        ProcessWaitOutcome::ShutdownSignal { signal, status } => {
-            info!(
-                signal,
-                exit_code = status.code(),
-                "Entrypoint exited after supervisor shutdown signal"
-            );
-            status.code()
+        if let Some(tx) = self.sidecar_exit_tx.take() {
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+            tx.send((self.main_instance_id.clone(), rendered_code, ack_tx))
+                .await
+                .map_err(|_| miette::miette!("sidecar exit reporter closed"))?;
+            ack_rx
+                .await
+                .map_err(|_| miette::miette!("sidecar exit reporter dropped acknowledgement"))?
+                .map_err(|error| miette::miette!(error))?;
+        } else if let (Some(endpoint), Some(id)) = (
+            self.openshell_endpoint.as_deref(),
+            self.sandbox_id.as_deref(),
+        ) {
+            report_main_process_exit_until_ack(endpoint, id, &self.main_instance_id, rendered_code)
+                .await;
+            info!(instance_id = %self.main_instance_id, "main-process exit acknowledged");
         }
-    };
-    supervisor_terminating.store(true, Ordering::Release);
-    main_session.finish(rendered_code).await;
-
-    ocsf_emit!(
-        ProcessActivityBuilder::new(ocsf_ctx())
-            .activity(ActivityId::Close)
-            .action(ActionId::Allowed)
-            .disposition(DispositionId::Allowed)
-            .severity(SeverityId::Informational)
-            .status(StatusId::Success)
-            .exit_code(rendered_code)
-            .message(format!("Process exited with code {rendered_code}"))
-            .build()
-    );
-
-    if let Some(task) = supervisor_session_task {
-        task.abort();
+        Ok(status)
     }
-    if let Some(tx) = sidecar_exit_tx {
-        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
-        tx.send((main_instance_id.clone(), rendered_code, ack_tx))
-            .await
-            .map_err(|_| miette::miette!("sidecar exit reporter closed"))?;
-        ack_rx
-            .await
-            .map_err(|_| miette::miette!("sidecar exit reporter dropped acknowledgement"))?
-            .map_err(|error| miette::miette!(error))?;
-    } else if let (Some(endpoint), Some(id)) = (openshell_endpoint, sandbox_id) {
-        report_main_process_exit_until_ack(endpoint, id, &main_instance_id, rendered_code).await;
-        info!(instance_id = %main_instance_id, "main-process exit acknowledged");
+}
+
+/// Concurrent signal handle for a running canonical agent process group.
+#[derive(Clone)]
+pub struct AgentSignaler {
+    pid: u32,
+    terminal: Arc<AtomicBool>,
+    signal_lock: Arc<std::sync::Mutex<()>>,
+}
+
+#[cfg(unix)]
+impl AgentSignaler {
+    fn deliver(&self, signal: nix::sys::signal::Signal) -> Result<()> {
+        let _guard = self
+            .signal_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.terminal.load(Ordering::Acquire) {
+            return Err(miette::miette!("agent has exited"));
+        }
+        let pid = i32::try_from(self.pid).unwrap_or(i32::MAX);
+        nix::sys::signal::killpg(nix::unistd::Pid::from_raw(pid), signal).into_diagnostic()
     }
 
-    Ok(rendered_code)
+    pub fn term(&self) -> Result<()> {
+        self.deliver(nix::sys::signal::Signal::SIGTERM)
+    }
+    pub fn kill(&self) -> Result<()> {
+        self.deliver(nix::sys::signal::Signal::SIGKILL)
+    }
+    pub fn interrupt(&self) -> Result<()> {
+        self.deliver(nix::sys::signal::Signal::SIGINT)
+    }
+    pub fn hangup(&self) -> Result<()> {
+        self.deliver(nix::sys::signal::Signal::SIGHUP)
+    }
 }
 
 async fn report_main_process_exit_until_ack(

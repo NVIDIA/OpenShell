@@ -3402,6 +3402,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8ca58f447f06ed17d5fc4043ce1b10dd205e060fb3ce5b979b8ed8e59ff3f79"
 
 [[package]]
+name = "memoffset"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "488016bfae457b036d996092f6cb448677611ce4449e970ceaf42695203f218a"
+dependencies = [
+ "autocfg",
+]
+
+[[package]]
 name = "metrics"
 version = "0.24.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3573,6 +3582,7 @@ dependencies = [
  "cfg-if",
  "cfg_aliases",
  "libc",
+ "memoffset",
 ]
 
 [[package]]
@@ -3948,6 +3958,7 @@ dependencies = [
  "futures",
  "miette",
  "openshell-core",
+ "openshell-isolation",
  "openshell-otel",
  "openshell-otel-test-support",
  "opentelemetry",
@@ -3980,6 +3991,7 @@ dependencies = [
  "miette",
  "notify",
  "openshell-core",
+ "openshell-isolation",
  "openshell-policy",
  "prost",
  "prost-types",
@@ -4027,6 +4039,7 @@ dependencies = [
  "miette",
  "nix 0.29.0",
  "openshell-core",
+ "openshell-isolation",
  "openshell-otel",
  "openshell-otel-test-support",
  "opentelemetry",
@@ -4083,6 +4096,7 @@ dependencies = [
  "nix 0.29.0",
  "oci-client",
  "openshell-core",
+ "openshell-isolation",
  "openshell-otel",
  "openshell-otel-test-support",
  "openshell-policy",
@@ -4257,12 +4271,15 @@ dependencies = [
 name = "openshell-sandbox"
 version = "0.0.0"
 dependencies = [
+ "async-trait",
+ "base64 0.22.1",
  "clap",
  "futures",
  "miette",
  "nix 0.29.0",
  "openshell-core",
  "openshell-extension-core",
+ "openshell-isolation",
  "openshell-ocsf",
  "openshell-policy",
  "openshell-supervisor-middleware",

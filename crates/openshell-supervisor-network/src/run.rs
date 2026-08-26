@@ -37,6 +37,7 @@ use crate::l7::tls::{
 use crate::opa::OpaEngine;
 use crate::policy_local::PolicyLocalContext;
 use crate::proxy::ProxyHandle;
+use openshell_isolation::contract::NetworkMediationSource;
 
 #[cfg(target_os = "linux")]
 pub struct TransparentRuntimeSetup {
@@ -196,6 +197,7 @@ pub async fn run_networking(
     agent_proposals: AgentProposals,
     workspace_rx: tokio::sync::watch::Receiver<String>,
     upstream_proxy_args: &crate::upstream_proxy::UpstreamProxyArgs,
+    network_mediation_source: Option<Arc<dyn NetworkMediationSource>>,
     #[cfg(target_os = "linux")] transparent_runtime: Option<TransparentRuntimeSetup>,
 ) -> Result<Networking> {
     // Build the policy-local route context. The orchestrator's policy poll
@@ -447,6 +449,7 @@ pub async fn run_networking(
             activity_tx.clone(),
             engine_ready_rx,
             upstream_proxy_args,
+            network_mediation_source,
         )
         .await?;
         Some(proxy_handle)

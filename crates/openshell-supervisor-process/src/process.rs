@@ -2370,6 +2370,16 @@ pub struct ProcessStatus {
 }
 
 impl ProcessStatus {
+    /// Construct a synthetic normal exit status for supervisor-generated
+    /// terminal outcomes such as a policy timeout.
+    #[must_use]
+    pub const fn exited(code: i32) -> Self {
+        Self {
+            code: Some(code),
+            signal: None,
+        }
+    }
+
     /// Get the conventional exit code when the process exited normally.
     #[must_use]
     pub const fn exit_code(&self) -> Option<i32> {

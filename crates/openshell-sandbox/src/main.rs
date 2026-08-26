@@ -235,6 +235,18 @@ struct Args {
     /// re-signed upstream certificates and the sandbox trust bundle.
     #[arg(long)]
     upstream_proxy_ca_bundle: Option<String>,
+
+    /// Backend selected by the compute driver's admitted topology descriptor.
+    #[arg(long)]
+    topology_backend_name: Option<String>,
+
+    /// Isolation Backend interface version.
+    #[arg(long)]
+    topology_version: Option<u32>,
+
+    /// Base64-encoded opaque backend payload.
+    #[arg(long)]
+    topology_payload_base64: Option<String>,
 }
 
 /// Internal one-shot command used by the privileged supervisor to validate an
@@ -683,6 +695,28 @@ fn main() -> Result<()> {
             proxy_connect_by_hostname: args.upstream_proxy_connect_by_hostname,
             proxy_ca_bundle: args.upstream_proxy_ca_bundle,
         };
+        let topology_descriptor = match (
+            args.topology_backend_name,
+            args.topology_version,
+            args.topology_payload_base64,
+        ) {
+            (None, None, None) => None,
+            (Some(backend_name), Some(version), Some(payload)) => {
+                use base64::Engine as _;
+                Some(openshell_isolation::contract::TopologyDescriptor {
+                    backend_name,
+                    version,
+                    payload: base64::engine::general_purpose::STANDARD
+                        .decode(payload)
+                        .into_diagnostic()?,
+                })
+            }
+            _ => {
+                return Err(miette::miette!(
+                    "topology descriptor requires backend name, version, and payload"
+                ));
+            }
+        };
 
         run_sandbox(
             command,
@@ -702,6 +736,7 @@ fn main() -> Result<()> {
             args.mode.network,
             args.mode.process,
             upstream_proxy_args,
+            topology_descriptor,
         )
         .await
     })?;

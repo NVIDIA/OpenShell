@@ -4453,10 +4453,12 @@ fn build_guest_environment(
         || guest_visible_openshell_endpoint(&config.openshell_endpoint),
         String::from,
     );
-    // 1. User-supplied environment (lowest priority).
+    // User-supplied values travel only through the serialized child-environment
+    // channel. They must not become guest-init or supervisor environment
+    // variables: guest init runs as root and sources only driver-owned keys,
+    // while the supervisor applies this map when it launches workload code.
     let user_env = merged_environment(sandbox);
     let mut environment: HashMap<String, String> = HashMap::new();
-    environment.extend(user_env.clone());
     if !user_env.is_empty()
         && let Ok(json) = serde_json::to_string(&user_env)
     {

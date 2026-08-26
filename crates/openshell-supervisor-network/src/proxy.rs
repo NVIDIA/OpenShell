@@ -24,6 +24,10 @@ use openshell_core::net::{
 use openshell_core::policy::ProxyPolicy;
 use openshell_core::provider_credentials::{ProviderCredentialSnapshot, ProviderCredentialState};
 use openshell_core::secrets::{self, SecretResolver, rewrite_header_line_checked};
+use openshell_isolation::contract::{
+    BinaryIdentity as ContractBinaryIdentity, BoundaryDuplexStream, NetworkMediationSource,
+    ResolveError,
+};
 use openshell_ocsf::{
     ActionId, ActivityId, AiModel, ApiActivityBuilder, DispositionId, Endpoint,
     HttpActivityBuilder, HttpRequest, NetworkActivityBuilder, Process, SeverityId, StatusId,
@@ -36,9 +40,17 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use tokio::io::{
-    AsyncRead as TokioAsyncRead, AsyncReadExt, AsyncWrite as TokioAsyncWrite, AsyncWriteExt,
+    AsyncBufReadExt, AsyncRead as TokioAsyncRead, AsyncReadExt, AsyncWrite as TokioAsyncWrite,
+    AsyncWriteExt,
 };
 use tokio::net::{TcpListener, TcpStream};
+
+type ProxyClient = tokio::io::BufReader<BoundaryDuplexStream>;
+
+enum ProxyAcceptError {
+    Listener(std::io::Error),
+    Source(openshell_isolation::contract::BackendError),
+}
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tracing::{debug, warn};
@@ -233,6 +245,7 @@ pub struct ProxyHandle {
     http_addr: Option<SocketAddr>,
     join: JoinHandle<()>,
     exited_rx: Option<tokio::sync::oneshot::Receiver<()>>,
+    source_failure: tokio::sync::watch::Receiver<Option<String>>,
 }
 
 impl ProxyHandle {
@@ -255,6 +268,7 @@ impl ProxyHandle {
         activity_tx: Option<ActivitySender>,
         engine_ready: tokio::sync::watch::Receiver<bool>,
         upstream_proxy_args: &upstream_proxy::UpstreamProxyArgs,
+        network_mediation_source: Option<Arc<dyn NetworkMediationSource>>,
     ) -> Result<Self> {
         // Use override bind_addr, fall back to policy http_addr, then default
         // to loopback:3128.  The default allows the proxy to function when no
@@ -270,8 +284,15 @@ impl ProxyHandle {
             ));
         }
 
-        let listener = TcpListener::bind(http_addr).await.into_diagnostic()?;
-        let local_addr = listener.local_addr().into_diagnostic()?;
+        let listener = if network_mediation_source.is_none() {
+            Some(TcpListener::bind(http_addr).await.into_diagnostic()?)
+        } else {
+            None
+        };
+        let local_addr = match listener.as_ref() {
+            Some(listener) => listener.local_addr().into_diagnostic()?,
+            None => http_addr,
+        };
         {
             let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
                 .activity(ActivityId::Listen)
@@ -338,6 +359,7 @@ impl ProxyHandle {
         }
 
         let (exited_tx, exited_rx) = tokio::sync::oneshot::channel::<()>();
+        let (source_failure_tx, source_failure) = tokio::sync::watch::channel(None);
         let join = tokio::spawn(async move {
             // Hold the sender for the lifetime of this task — when the task
             // exits (panic, abort, or loop break), the sender drops and the
@@ -371,11 +393,34 @@ impl ProxyHandle {
             let mut consecutive_resource_errors: u32 = 0;
             let mut consecutive_unknown_errors: u32 = 0;
             loop {
-                match listener.accept().await {
-                    Ok((stream, _addr)) => {
+                let accepted = if let Some(source) = network_mediation_source.as_ref() {
+                    source
+                        .accept()
+                        .await
+                        .map(|connection| {
+                            (connection.stream, Some(connection.binary_identity), None)
+                        })
+                        .map_err(ProxyAcceptError::Source)
+                } else {
+                    let listener = listener
+                        .as_ref()
+                        .expect("listener exists without a mediation source");
+                    listener
+                        .accept()
+                        .await
+                        .map(|(stream, _)| {
+                            set_tcp_nodelay_best_effort(&stream);
+                            let workload_addr = stream.peer_addr().ok();
+                            let proxy_addr = stream.local_addr().ok();
+                            let stream: BoundaryDuplexStream = Box::new(stream);
+                            (stream, None, workload_addr.zip(proxy_addr))
+                        })
+                        .map_err(ProxyAcceptError::Listener)
+                };
+                match accepted {
+                    Ok((stream, supplied_identity, socket_addrs)) => {
                         consecutive_resource_errors = 0;
                         consecutive_unknown_errors = 0;
-                        set_tcp_nodelay_best_effort(&stream);
                         let opa = opa_engine.clone();
                         let cache = identity_cache.clone();
                         let spid = entrypoint_pid.clone();
@@ -398,8 +443,10 @@ impl ProxyHandle {
                         let atx = activity_tx.clone();
                         tokio::spawn(async move {
                             #[allow(clippy::large_futures)]
-                            if let Err(err) = handle_tcp_connection(
-                                stream,
+                            if let Err(err) = handle_mediated_connection(
+                                tokio::io::BufReader::new(stream),
+                                supplied_identity,
+                                socket_addrs,
                                 opa,
                                 cache,
                                 spid,
@@ -427,7 +474,18 @@ impl ProxyHandle {
                             }
                         });
                     }
-                    Err(err) => {
+                    Err(ProxyAcceptError::Source(err)) => {
+                        let _ = source_failure_tx.send(Some(err.to_string()));
+                        let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
+                            .activity(ActivityId::Fail)
+                            .severity(SeverityId::High)
+                            .status(StatusId::Failure)
+                            .message(format!("Network-mediation source failed: {err}"))
+                            .build();
+                        ocsf_emit!(event);
+                        break;
+                    }
+                    Err(ProxyAcceptError::Listener(err)) => {
                         match classify_accept_error(
                             &err,
                             &mut consecutive_resource_errors,
@@ -468,6 +526,7 @@ impl ProxyHandle {
             http_addr: Some(local_addr),
             join,
             exited_rx: Some(exited_rx),
+            source_failure,
         })
     }
 
@@ -478,6 +537,20 @@ impl ProxyHandle {
 
     pub fn take_exit_receiver(&mut self) -> Option<tokio::sync::oneshot::Receiver<()>> {
         self.exited_rx.take()
+    }
+
+    /// Wait until a backend-provided mediation source fails terminally.
+    pub async fn wait_for_source_failure(&self) -> String {
+        let mut receiver = self.source_failure.clone();
+        loop {
+            let current = receiver.borrow().clone();
+            if let Some(error) = current {
+                return error;
+            }
+            if receiver.changed().await.is_err() {
+                return "network mediation stopped".to_string();
+            }
+        }
     }
 }
 
@@ -1192,21 +1265,24 @@ fn middleware_uninspectable_gate(
     Ok(crate::l7::middleware::uninspectable_traffic_gate(&chain))
 }
 
-async fn peek_tunnel_protocol(client: &TcpStream) -> Result<Option<TunnelProtocol>> {
-    let mut peek_buf = [0u8; TUNNEL_PROTOCOL_PEEK_BYTES];
+async fn peek_tunnel_protocol<C>(client: &mut C) -> Result<Option<TunnelProtocol>>
+where
+    C: tokio::io::AsyncBufRead + Unpin,
+{
     let deadline = tokio::time::Instant::now() + TUNNEL_PROTOCOL_PEEK_TIMEOUT;
 
     loop {
-        let n = client.peek(&mut peek_buf).await.into_diagnostic()?;
-        if n == 0 {
+        let available = client.fill_buf().await.into_diagnostic()?;
+        if available.is_empty() {
             return Ok(None);
         }
 
-        let peek = &peek_buf[..n];
+        let n = available.len().min(TUNNEL_PROTOCOL_PEEK_BYTES);
+        let peek = &available[..n];
         let protocol = classify_tunnel_protocol(peek);
         if protocol != TunnelProtocol::Unsupported
             || !could_be_supported_tunnel_protocol_prefix(peek)
-            || n == peek_buf.len()
+            || n == TUNNEL_PROTOCOL_PEEK_BYTES
             || tokio::time::Instant::now() >= deadline
         {
             return Ok(Some(protocol));
@@ -1585,7 +1661,7 @@ fn build_forward_destination_deny_ocsf_event(
 
 #[allow(clippy::too_many_arguments)]
 async fn deny_connect_destination(
-    client: &mut TcpStream,
+    client: &mut (impl TokioAsyncWrite + Unpin),
     denial: &DestinationDenial,
     peer_addr: SocketAddr,
     host: &str,
@@ -1631,7 +1707,7 @@ async fn deny_connect_destination(
 
 #[allow(clippy::too_many_arguments)]
 async fn deny_forward_destination(
-    client: &mut TcpStream,
+    client: &mut (impl TokioAsyncWrite + Unpin),
     denial: &DestinationDenial,
     peer_addr: SocketAddr,
     method: &str,
@@ -1681,9 +1757,58 @@ async fn deny_forward_destination(
 // Many distinct, non-related context parameters are required for a CONNECT
 // dispatch; bundling them into a struct would just shift the noise into call
 // sites.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 async fn handle_tcp_connection(
-    mut client: TcpStream,
+    client: TcpStream,
+    opa_engine: Arc<OpaEngine>,
+    identity_cache: Arc<BinaryIdentityCache>,
+    entrypoint_pid: Arc<AtomicU32>,
+    tls_state: Option<Arc<ProxyTlsState>>,
+    inference_ctx: Option<Arc<InferenceContext>>,
+    policy_local_ctx: Option<Arc<PolicyLocalContext>>,
+    agent_proposals: openshell_core::proposals::AgentProposals,
+    trusted_host_gateway: Arc<Option<IpAddr>>,
+    upstream_proxy: Arc<Option<UpstreamProxyConfig>>,
+    secret_resolver: Option<Arc<SecretResolver>>,
+    dynamic_credentials: Option<
+        Arc<
+            std::sync::RwLock<
+                std::collections::HashMap<String, openshell_core::proto::ProviderProfileCredential>,
+            >,
+        >,
+    >,
+    denial_tx: Option<mpsc::UnboundedSender<DenialEvent>>,
+    activity_tx: Option<ActivitySender>,
+) -> Result<()> {
+    let socket_addrs = client.peer_addr().ok().zip(client.local_addr().ok());
+    let stream: BoundaryDuplexStream = Box::new(client);
+    Box::pin(handle_mediated_connection(
+        tokio::io::BufReader::new(stream),
+        None,
+        socket_addrs,
+        opa_engine,
+        identity_cache,
+        entrypoint_pid,
+        tls_state,
+        inference_ctx,
+        policy_local_ctx,
+        agent_proposals,
+        trusted_host_gateway,
+        upstream_proxy,
+        secret_resolver,
+        dynamic_credentials,
+        denial_tx,
+        activity_tx,
+    ))
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_mediated_connection(
+    mut client: ProxyClient,
+    supplied_identity: Option<Result<ContractBinaryIdentity, ResolveError>>,
+    socket_addrs: Option<(SocketAddr, SocketAddr)>,
     opa_engine: Arc<OpaEngine>,
     identity_cache: Arc<BinaryIdentityCache>,
     entrypoint_pid: Arc<AtomicU32>,
@@ -1757,6 +1882,8 @@ async fn handle_tcp_connection(
             &buf[..],
             used,
             &mut client,
+            supplied_identity.as_ref(),
+            socket_addrs,
             opa_engine,
             identity_cache,
             entrypoint_pid,
@@ -1803,22 +1930,27 @@ async fn handle_tcp_connection(
         return Ok(());
     }
 
-    let workload_addr = client.peer_addr().into_diagnostic()?;
-    let proxy_addr = client.local_addr().into_diagnostic()?;
-    let connection = crate::procfs::WorkloadProxyTcpConnection::new(workload_addr, proxy_addr);
-
-    // Evaluate OPA policy with process-identity binding.
-    // Wrapped in spawn_blocking because identity resolution does heavy sync I/O:
-    // /proc scanning + SHA256 hashing of binaries (e.g. node at 124MB).
-    let opa_clone = opa_engine.clone();
-    let cache_clone = identity_cache.clone();
-    let pid_clone = entrypoint_pid.clone();
+    let workload_addr = socket_addrs.map_or_else(
+        || SocketAddr::from(([0, 0, 0, 0], 0)),
+        |(workload, _)| workload,
+    );
     let intent = EgressIntent::connect(host_lc.clone(), port);
-    let mut decision = tokio::task::spawn_blocking(move || {
-        authorize_egress_intent(connection, &opa_clone, &cache_clone, &pid_clone, intent)
-    })
-    .await
-    .map_err(|e| miette::miette!("identity resolution task panicked: {e}"))?;
+    let mut decision = if let Some(identity) = supplied_identity.as_ref() {
+        authorize_supplied_identity(&opa_engine, intent, identity)
+    } else {
+        let (workload_addr, proxy_addr) = socket_addrs.ok_or_else(|| {
+            miette::miette!("legacy proxy connection is missing socket addresses")
+        })?;
+        let connection = crate::procfs::WorkloadProxyTcpConnection::new(workload_addr, proxy_addr);
+        let opa_clone = opa_engine.clone();
+        let cache_clone = identity_cache.clone();
+        let pid_clone = entrypoint_pid.clone();
+        tokio::task::spawn_blocking(move || {
+            authorize_egress_intent(connection, &opa_clone, &cache_clone, &pid_clone, intent)
+        })
+        .await
+        .map_err(|e| miette::miette!("identity resolution task panicked: {e}"))?
+    };
 
     debug!(
         transport = ?decision.intent.transport,
@@ -2205,7 +2337,7 @@ async fn handle_tcp_connection(
     // Auto-detect the tunnel payload. L7-configured endpoints must only
     // enter relays that can enforce their configured protocol; unsupported
     // bytes fail closed below instead of falling through to raw relay.
-    let Some(tunnel_protocol) = peek_tunnel_protocol(&client).await? else {
+    let Some(tunnel_protocol) = peek_tunnel_protocol(&mut client).await? else {
         return Ok(());
     };
 
@@ -2780,6 +2912,77 @@ fn evaluate_endpoint_only_opa(engine: &OpaEngine, intent: EgressIntent) -> Egres
     }
 }
 
+/// Evaluate an egress intent using identity already bound to the accepted
+/// connection by an isolation backend. This is the RFC 0012 path; legacy
+/// listeners continue to resolve through procfs in `authorize_egress_intent`.
+fn authorize_supplied_identity(
+    engine: &OpaEngine,
+    intent: EgressIntent,
+    identity: &Result<ContractBinaryIdentity, ResolveError>,
+) -> EgressDecision {
+    let deny = |reason: String,
+                binary: Option<PathBuf>,
+                ancestors: Vec<PathBuf>,
+                cmdline_paths: Vec<PathBuf>| EgressDecision {
+        intent: intent.clone(),
+        action: NetworkAction::Deny { reason },
+        policy_generation: engine.current_generation(),
+        identity: ProcessIdentityEvidence::Unavailable(IdentityUnavailableReason::LookupFailed),
+        endpoint: EndpointDecision::default(),
+        binary,
+        binary_pid: None,
+        ancestors,
+        cmdline_paths,
+    };
+
+    let identity = match identity {
+        Ok(identity) => identity,
+        Err(error) => {
+            return deny(
+                format!("backend identity resolution failed: {error}"),
+                None,
+                vec![],
+                vec![],
+            );
+        }
+    };
+    let Some(digest) = identity.binary_digest else {
+        return deny(
+            "backend identity did not include the required binary digest".to_string(),
+            Some(identity.binary_path.clone()),
+            identity.ancestors.clone(),
+            identity.cmdline_paths.clone(),
+        );
+    };
+    let input = crate::opa::NetworkInput {
+        host: intent.destination.host.clone(),
+        port: intent.destination.port,
+        binary_path: identity.binary_path.clone(),
+        binary_sha256: digest.to_string(),
+        ancestors: identity.ancestors.clone(),
+        cmdline_paths: identity.cmdline_paths.clone(),
+    };
+    match engine.evaluate_network_action_with_generation(&input) {
+        Ok((action, generation)) => EgressDecision {
+            intent,
+            action,
+            policy_generation: generation,
+            identity: ProcessIdentityEvidence::Available,
+            endpoint: EndpointDecision::default(),
+            binary: Some(identity.binary_path.clone()),
+            binary_pid: None,
+            ancestors: identity.ancestors.clone(),
+            cmdline_paths: identity.cmdline_paths.clone(),
+        },
+        Err(error) => deny(
+            format!("policy evaluation error: {error}"),
+            Some(identity.binary_path.clone()),
+            identity.ancestors.clone(),
+            identity.cmdline_paths.clone(),
+        ),
+    }
+}
+
 /// Non-Linux stub: OPA identity binding requires /proc.
 #[cfg(not(target_os = "linux"))]
 fn authorize_egress_intent(
@@ -2825,7 +3028,7 @@ const INITIAL_INFERENCE_BUF: usize = 65536;
 /// Returns [`InferenceOutcome::Routed`] if at least one request was successfully
 /// routed, or [`InferenceOutcome::Denied`] with a reason for all denial cases.
 async fn handle_inference_interception(
-    client: TcpStream,
+    client: ProxyClient,
     host: &str,
     port: u16,
     tls_state: Option<&Arc<ProxyTlsState>>,
@@ -3420,7 +3623,7 @@ fn emit_l7_tunnel_close_after_policy_change(host: &str, port: u16, error: miette
 }
 
 async fn reject_stale_connect_policy(
-    client: &mut TcpStream,
+    client: &mut ProxyClient,
     host: &str,
     port: u16,
     activity_tx: Option<&ActivitySender>,
@@ -4818,7 +5021,9 @@ async fn handle_forward_proxy(
     target_uri: &str,
     buf: &[u8],
     used: usize,
-    client: &mut TcpStream,
+    client: &mut ProxyClient,
+    supplied_identity: Option<&Result<ContractBinaryIdentity, ResolveError>>,
+    socket_addrs: Option<(SocketAddr, SocketAddr)>,
     opa_engine: Arc<OpaEngine>,
     identity_cache: Arc<BinaryIdentityCache>,
     entrypoint_pid: Arc<AtomicU32>,
@@ -4922,19 +5127,27 @@ async fn handle_forward_proxy(
         canonicalize_forward_host_header(&buf[..used], &canonical_authority)?;
 
     // 2. Evaluate OPA policy (same identity binding as CONNECT)
-    let workload_addr = client.peer_addr().into_diagnostic()?;
-    let proxy_addr = client.local_addr().into_diagnostic()?;
-    let connection = crate::procfs::WorkloadProxyTcpConnection::new(workload_addr, proxy_addr);
-
-    let opa_clone = opa_engine.clone();
-    let cache_clone = identity_cache.clone();
-    let pid_clone = entrypoint_pid.clone();
+    let workload_addr = socket_addrs.map_or_else(
+        || SocketAddr::from(([0, 0, 0, 0], 0)),
+        |(workload, _)| workload,
+    );
     let intent = EgressIntent::forward_http(host_lc.clone(), port);
-    let mut decision = tokio::task::spawn_blocking(move || {
-        authorize_egress_intent(connection, &opa_clone, &cache_clone, &pid_clone, intent)
-    })
-    .await
-    .map_err(|e| miette::miette!("identity resolution task panicked: {e}"))?;
+    let mut decision = if let Some(identity) = supplied_identity {
+        authorize_supplied_identity(&opa_engine, intent, identity)
+    } else {
+        let (workload_addr, proxy_addr) = socket_addrs.ok_or_else(|| {
+            miette::miette!("legacy proxy connection is missing socket addresses")
+        })?;
+        let connection = crate::procfs::WorkloadProxyTcpConnection::new(workload_addr, proxy_addr);
+        let opa_clone = opa_engine.clone();
+        let cache_clone = identity_cache.clone();
+        let pid_clone = entrypoint_pid.clone();
+        tokio::task::spawn_blocking(move || {
+            authorize_egress_intent(connection, &opa_clone, &cache_clone, &pid_clone, intent)
+        })
+        .await
+        .map_err(|e| miette::miette!("identity resolution task panicked: {e}"))?
+    };
 
     debug!(
         transport = ?decision.intent.transport,
@@ -6160,7 +6373,7 @@ fn normalize_host(raw_host: &str) -> &str {
     raw_host.strip_suffix('.').unwrap_or(raw_host)
 }
 
-async fn respond(client: &mut TcpStream, bytes: &[u8]) -> Result<()> {
+async fn respond(client: &mut (impl TokioAsyncWrite + Unpin), bytes: &[u8]) -> Result<()> {
     client.write_all(bytes).await.into_diagnostic()?;
     Ok(())
 }
@@ -6301,7 +6514,7 @@ const TLS_TERMINATION_UNAVAILABLE_DETAIL: &str = "TLS termination unavailable (C
 /// refused (the caller must stop) and `false` when the caller should proceed to
 /// establish the tunnel.
 async fn refuse_connect_when_tls_unavailable(
-    client: &mut TcpStream,
+    client: &mut (impl TokioAsyncWrite + Unpin),
     tls_state_present: bool,
     effective_tls_skip: bool,
 ) -> Result<bool> {
@@ -6497,6 +6710,22 @@ mod tests {
         }
     }
 
+    struct FailedMediationSource;
+
+    #[async_trait::async_trait]
+    impl NetworkMediationSource for FailedMediationSource {
+        async fn accept(
+            &self,
+        ) -> std::result::Result<
+            openshell_isolation::contract::MediatedConnection,
+            openshell_isolation::contract::BackendError,
+        > {
+            Err(openshell_isolation::contract::BackendError::Unavailable(
+                "test source unavailable".to_string(),
+            ))
+        }
+    }
+
     async fn drive_raw_request_through_handler(raw: Vec<u8>) -> Vec<u8> {
         let policy = include_str!("../data/sandbox-policy.rego");
         let data = r#"
@@ -6539,6 +6768,50 @@ network_policies: {}
         .await
         .expect("malformed request should be handled");
         client.await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn terminal_mediation_source_failure_stops_accepting_fail_static() {
+        let policy = include_str!("../data/sandbox-policy.rego");
+        let engine = Arc::new(
+            OpaEngine::from_strings_with_binary_identity_required(
+                policy,
+                "network_policies: {}",
+                true,
+            )
+            .expect("engine"),
+        );
+        let (_ready_tx, ready_rx) = tokio::sync::watch::channel(true);
+        let handle = ProxyHandle::start_with_bind_addr(
+            &ProxyPolicy { http_addr: None },
+            Some(([127, 0, 0, 1], 3128).into()),
+            engine,
+            Arc::new(BinaryIdentityCache::new()),
+            Arc::new(AtomicU32::new(1)),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            ready_rx,
+            &upstream_proxy::UpstreamProxyArgs::default(),
+            Some(Arc::new(FailedMediationSource)),
+        )
+        .await
+        .expect("proxy starts before source accept");
+
+        let failure = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            handle.wait_for_source_failure(),
+        )
+        .await
+        .expect("source failure must be observed");
+        assert!(failure.contains("test source unavailable"));
+        assert!(
+            handle.join.is_finished(),
+            "accept loop must stop after source loss"
+        );
     }
 
     #[tokio::test]
@@ -7294,6 +7567,59 @@ network_policies:
         );
     }
 
+    #[test]
+    fn backend_supplied_unresolved_identity_denies_an_allowed_endpoint() {
+        let policy = include_str!("../data/sandbox-policy.rego");
+        let data = r#"
+network_policies:
+  test_allow:
+    name: test_allow
+    endpoints:
+      - { host: api.example.com, port: 443 }
+    binaries:
+      - { path: /usr/bin/curl }
+"#;
+        let engine = OpaEngine::from_strings_with_binary_identity_required(policy, data, true)
+            .expect("identity-aware engine");
+        let decision = authorize_supplied_identity(
+            &engine,
+            EgressIntent::connect("api.example.com".to_string(), 443),
+            &Err(ResolveError::NotFound),
+        );
+
+        assert!(matches!(decision.action, NetworkAction::Deny { .. }));
+        assert!(matches!(
+            decision.identity,
+            ProcessIdentityEvidence::Unavailable(IdentityUnavailableReason::LookupFailed)
+        ));
+    }
+
+    #[test]
+    fn backend_supplied_unresolved_identity_denies_in_endpoint_only_mode() {
+        let policy = include_str!("../data/sandbox-policy.rego");
+        let data = r#"
+network_policies:
+  test_allow:
+    name: test_allow
+    endpoints:
+      - { host: api.example.com, port: 443 }
+"#;
+        let engine = OpaEngine::from_strings_with_binary_identity_required(policy, data, false)
+            .expect("endpoint-only engine");
+        temp_env::with_var(
+            openshell_core::sandbox_env::NETWORK_BINARY_IDENTITY,
+            Some("false"),
+            || {
+                let decision = authorize_supplied_identity(
+                    &engine,
+                    EgressIntent::connect("api.example.com".to_string(), 443),
+                    &Err(ResolveError::NotFound),
+                );
+                assert!(matches!(decision.action, NetworkAction::Deny { .. }));
+            },
+        );
+    }
+
     fn websocket_l7_config(
         protocol: crate::l7::L7Protocol,
         websocket_credential_rewrite: bool,
@@ -7354,13 +7680,14 @@ network_policies:
         let addr = listener.local_addr().unwrap();
         let mut client = TcpStream::connect(addr).await.unwrap();
         let (server, _) = listener.accept().await.unwrap();
+        let mut server = tokio::io::BufReader::new(server);
 
         client
             .write_all(crate::l7::rest::HTTP2_PRIOR_KNOWLEDGE_PREFACE)
             .await
             .unwrap();
 
-        let protocol = peek_tunnel_protocol(&server)
+        let protocol = peek_tunnel_protocol(&mut server)
             .await
             .expect("peek should succeed")
             .expect("client sent bytes");
@@ -10243,9 +10570,10 @@ network_policies:
 
     #[tokio::test]
     async fn test_resolve_check_allowed_ips_rejects_outside_allowlist() {
-        // 8.8.8.8 resolves to a public IP which is NOT in 10.0.0.0/8
+        // A public IP outside 10.0.0.0/8 must be rejected. Use the literal so
+        // this security check does not depend on external DNS availability.
         let nets = parse_allowed_ips(&["10.0.0.0/8".to_string()]).unwrap();
-        let result = resolve_and_check_allowed_ips("dns.google", 443, &nets, 0).await;
+        let result = resolve_and_check_allowed_ips("8.8.8.8", 443, &nets, 0).await;
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(
@@ -11644,9 +11972,9 @@ network_policies:
 
     #[tokio::test]
     async fn test_forward_public_ip_allowed_without_allowed_ips() {
-        // Public IPs (e.g. dns.google -> 8.8.8.8) should pass through
-        // resolve_and_reject_internal without needing allowed_ips.
-        let result = resolve_and_reject_internal("dns.google", 80, 0).await;
+        // Public IPs should pass through resolve_and_reject_internal without
+        // needing allowed_ips. Use a literal to keep the test hermetic.
+        let result = resolve_and_reject_internal("8.8.8.8", 80, 0).await;
         assert!(
             result.is_ok(),
             "Public IP should be allowed without allowed_ips: {result:?}"
@@ -11657,7 +11985,7 @@ network_policies:
         for addr in &addrs {
             assert!(
                 !is_internal_ip(addr.ip()),
-                "dns.google should resolve to public IPs, got {}",
+                "expected a public IP, got {}",
                 addr.ip()
             );
         }

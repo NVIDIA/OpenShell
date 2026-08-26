@@ -75,6 +75,8 @@ jobs:
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
+      volumes:
+        - /var/run/docker.sock:/var/run/docker.sock
     env:
       MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       OPENSHELL_IMAGE_TAG: ${{ inputs['image-tag'] }}
@@ -100,8 +102,12 @@ jobs:
           cache-directories: .cache/sccache
           cache-targets: "true"
 
-      - name: Install zstd
-        run: apt-get update && apt-get install -y --no-install-recommends zstd && rm -rf /var/lib/apt/lists/*
+      - name: Install zstd and verify Docker
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends zstd
+          rm -rf /var/lib/apt/lists/*
+          docker info
 
       - name: Build bundled supervisor
         run: |
@@ -116,7 +122,9 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: driver-vm-supervisor-arm64
-          path: target/vm-runtime-compressed/openshell-sandbox.zst
+          path: |
+            target/vm-runtime-compressed/openshell-sandbox.zst
+            target/vm-runtime-compressed/openshell-runtime.tar.zst
           retention-days: 1
 
   build-driver-vm-macos:
@@ -180,12 +188,13 @@ jobs:
         run: |
           set -euo pipefail
           test -f target/vm-runtime-compressed-macos/openshell-sandbox.zst
-          ls -lh target/vm-runtime-compressed-macos/openshell-sandbox.zst
+          test -f target/vm-runtime-compressed-macos/openshell-runtime.tar.zst
+          ls -lh target/vm-runtime-compressed-macos/openshell-{sandbox,runtime.tar}.zst
 
       - name: Verify embedded driver inputs
         run: |
           set -euo pipefail
-          for file in libkrun.dylib.zst libkrunfw.5.dylib.zst gvproxy.zst umoci.zst openshell-sandbox.zst; do
+          for file in libkrun.dylib.zst libkrunfw.5.dylib.zst gvproxy.zst umoci.zst openshell-sandbox.zst openshell-runtime.tar.zst; do
             test -s "target/vm-runtime-compressed-macos/${file}"
           done
 

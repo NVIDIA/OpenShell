@@ -21,6 +21,7 @@ fn main() {
             "libkrunfw.5.dylib.zst",
             "gvproxy.zst",
             "openshell-sandbox.zst",
+            "openshell-runtime.tar.zst",
             "umoci.zst",
         ] {
             println!("cargo:rerun-if-changed={dir}/{name}");
@@ -38,7 +39,13 @@ fn main() {
             println!("cargo:warning=VM runtime not available for {target_os}-{target_arch}");
             generate_stub_resources(
                 &out_dir,
-                &["libkrun", "libkrunfw", "openshell-sandbox.zst", "umoci.zst"],
+                &[
+                    "libkrun",
+                    "libkrunfw",
+                    "openshell-sandbox.zst",
+                    "openshell-runtime.tar.zst",
+                    "umoci.zst",
+                ],
             );
             return;
         }
@@ -56,6 +63,7 @@ fn main() {
                 &format!("{libkrunfw_name}.zst"),
                 "gvproxy.zst",
                 "openshell-sandbox.zst",
+                "openshell-runtime.tar.zst",
                 "umoci.zst",
             ],
         );
@@ -75,6 +83,7 @@ fn main() {
                 &format!("{libkrunfw_name}.zst"),
                 "gvproxy.zst",
                 "openshell-sandbox.zst",
+                "openshell-runtime.tar.zst",
                 "umoci.zst",
             ],
         );
@@ -91,6 +100,10 @@ fn main() {
         (
             "openshell-sandbox.zst".to_string(),
             "openshell-sandbox.zst".to_string(),
+        ),
+        (
+            "openshell-runtime.tar.zst".to_string(),
+            "openshell-runtime.tar.zst".to_string(),
         ),
         ("umoci.zst".to_string(), "umoci.zst".to_string()),
     ];
@@ -135,6 +148,7 @@ fn main() {
                 &format!("{libkrunfw_name}.zst"),
                 "gvproxy.zst",
                 "openshell-sandbox.zst",
+                "openshell-runtime.tar.zst",
                 "umoci.zst",
             ],
         );
