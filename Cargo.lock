@@ -4164,6 +4164,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "openshell-isolation"
+version = "0.0.0"
+dependencies = [
+ "async-trait",
+ "openshell-core",
+ "tokio",
+]
+
+[[package]]
 name = "openshell-ocsf"
 version = "0.0.0"
 dependencies = [
