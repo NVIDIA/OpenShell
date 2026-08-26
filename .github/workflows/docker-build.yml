@@ -191,6 +191,7 @@ jobs:
       image-tag: ${{ needs.resolve.outputs.image_tag_base }}
       checkout-ref: ${{ inputs['checkout-ref'] }}
       features: ${{ needs.resolve.outputs.features }}
+      no-default-features: ${{ needs.resolve.outputs.no_default_features == 'true' }}
       auditable: ${{ inputs.auditable }}
       artifact-name: ${{ needs.resolve.outputs.artifact_prefix }}-linux-${{ matrix.arch }}
     secrets: inherit

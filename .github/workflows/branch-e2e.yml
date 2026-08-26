@@ -92,7 +92,7 @@ jobs:
     if: needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_core_e2e == 'true'
     permissions:
       contents: read
-      packages: read
+      packages: write
     uses: ./.github/workflows/docker-build.yml
     with:
       component: gateway-external
