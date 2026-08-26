@@ -1,0 +1,45 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# OpenShift overlay for the Kubernetes e2e harness.
+#
+# Bundles the OpenShift-specific settings the harness needs: the Route/mTLS
+# transport, and an image pull policy that avoids stale cached images.
+#
+# Route/mTLS transport: on OpenShift, `kubectl port-forward` stalls the SSH-relay
+# `sandbox connect` path (round-trip-heavy SSH over SPDY), so the harness drives
+# the gateway through a passthrough OpenShift Route with mTLS instead. This
+# overlay turns TLS back on (values-skaffold.yaml disables it), enables the Route,
+# and promotes the cert-verified caller to a dev principal.
+#
+# Image pull policy: force `Always` so runs against the `latest` upstream image
+# actually use it, instead of a stale copy cached on the cluster nodes.
+#
+# Layered by e2e/with-kube-gateway.sh AFTER ci/values-skaffold.yaml and
+# ci/values-openshift-scc.yaml when an OpenShift cluster is detected. The harness
+# supplies `openshiftRoute.host` and `pkiInitJob.serverDnsNames[0]` via --set at
+# install time (both are the cluster-derived Route hostname).
+#
+# Security: this is NOT an open gateway. `server.tls.clientCaSecretName` defaults
+# to `openshell-server-client-ca` and there is no OIDC, so `require_client_auth`
+# is true and mTLS is MANDATORY at the TLS handshake — a caller with only the
+# Route URL and no client certificate is rejected before any RPC. The passthrough
+# Route terminates TLS at the gateway pod, so this holds end-to-end.
+# `allowUnauthenticatedUsers` only promotes the already cert-verified caller to a
+# dev principal at the app layer (mtls_auth is unsupported with the Kubernetes
+# driver). Both are required together; the client certificate is the access gate.
+image:
+  pullPolicy: Always
+
+supervisor:
+  image:
+    pullPolicy: Always
+
+server:
+  disableTls: false
+  auth:
+    allowUnauthenticatedUsers: true
+
+openshiftRoute:
+  enabled: true
+  # host is supplied via --set at install time (cluster-derived Route hostname).

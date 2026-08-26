@@ -1,0 +1,20 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# OpenShift SCC compatibility overlay. Removes the hardcoded runAsUser and
+# fsGroup so that OpenShift's restricted-v2 SCC can inject the namespace-
+# assigned UID/GID range. Layer after values.yaml:
+#   helm install openshell deploy/helm/openshell -f ci/values-openshift-scc.yaml
+#
+# The e2e Kubernetes harness applies this automatically when it detects an
+# OpenShift cluster (route.openshift.io API present).
+
+podSecurityContext: null
+
+securityContext:
+  runAsNonRoot: true
+  runAsUser: null
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop:
+      - ALL
