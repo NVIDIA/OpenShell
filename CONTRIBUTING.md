@@ -25,7 +25,8 @@ We use a vouch system. This exists because AI makes it trivial to generate plaus
 1. Open a [Vouch Request](https://github.com/NVIDIA/OpenShell/discussions/new?category=vouch-request) discussion.
 2. Describe what you want to change and why.
 3. Write in your own words. AI-generated vouch requests will be denied.
-4. A maintainer will comment `/vouch` if approved.
+4. A maintainer will comment `/vouch` if approved, and the request discussion
+   will close automatically.
 5. Once vouched, you can submit pull requests.
 
 **If you are not vouched, any pull request you open will be automatically closed.** Org members and collaborators with push access bypass this check.

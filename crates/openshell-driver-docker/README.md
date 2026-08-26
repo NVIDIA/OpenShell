@@ -8,6 +8,11 @@ spans export to the same OTLP/gRPC collector with the service name
 context and emits the compute-driver RPC boundary that a standalone driver
 would expose.
 
+The standalone `openshell-driver-docker` binary accepts
+`OPENSHELL_OTLP_ENDPOINT`. When set, it exports Docker driver spans to that
+collector, continues W3C trace context from gateway RPC metadata, and flushes
+spans during graceful shutdown.
+
 The driver manages sandbox containers through the local Docker daemon with the
 `bollard` client. It is intended for developer environments where Docker is
 already available and running Kubernetes would be unnecessary.
