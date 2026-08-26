@@ -50,6 +50,34 @@ OpenShell uses overlapping controls rather than a single sandbox primitive:
 The supervisor may enrich baseline filesystem allowances for runtime-required
 paths, such as proxy support files or GPU device paths when a GPU is present.
 
+## Isolation Backend
+
+[RFC 0012](../rfc/0012-isolation-backend/README.md) defines the Isolation
+Backend contract for topology-specific boundary construction and process
+operations. The contract uses consuming
+lifecycle states (`attach` → `Bound` → `confirm` → `Ready` → `start_agent` →
+`Running`) so untrusted workload execution cannot begin before standing
+enforcement is confirmed.
+
+The logical supervisor remains the trusted bridge between the gateway and the
+workload. It drives the backend and applies approved network policy through
+supervisor-owned mediation; the backend routes workload egress to that
+mediation. The trusted Kubernetes driver selects the co-located backend for
+combined topology and supplies its topology descriptor to the supervisor.
+Sidecar topology remains on its pre-RFC lifecycle; a conforming backend for
+that placement requires separate design and implementation. Docker, Podman,
+and VM drivers provision the same co-located topology and supply its descriptor
+by default. The co-located backend requires the
+supervisor to own the execution environment's PID namespace so boundary
+teardown can terminate every remaining workload process.
+
+For proxy-mode boundaries, the co-located backend verifies its default-deny
+kernel egress ceiling before exposing any workload execution surface and then
+rechecks it every 250 milliseconds. Each check has a two-second deadline.
+Verification failure or timeout ends the boundary and triggers process cleanup;
+the PID-1 supervisor exits so the kernel terminates the complete workload PID
+namespace. The topology's detection-and-termination bound is five seconds.
+
 ## Network and Inference
 
 See [Sandbox Limits](sandbox-limits.md) for the current numeric safety ceilings,

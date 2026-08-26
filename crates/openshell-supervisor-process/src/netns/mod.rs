@@ -53,6 +53,13 @@ pub struct NetworkNamespace {
     ns_fd: Option<RawFd>,
 }
 
+/// Cloneable coordinates for continuously verifying a live RFC boundary.
+#[derive(Clone, Debug)]
+pub struct EgressCeilingVerifier {
+    namespace: String,
+    host_ip: IpAddr,
+}
+
 impl NetworkNamespace {
     /// Create a new isolated network namespace with veth pair.
     ///
@@ -249,6 +256,21 @@ impl NetworkNamespace {
         self.ns_fd
     }
 
+    /// Duplicate the namespace descriptor for a boundary-owned asynchronous
+    /// operation whose lifetime may outlive this borrow.
+    pub fn try_clone_ns_fd(&self) -> Result<Option<std::os::fd::OwnedFd>> {
+        use std::os::fd::FromRawFd;
+
+        let Some(fd) = self.ns_fd else {
+            return Ok(None);
+        };
+        let duplicated = nix::unistd::dup(fd).into_diagnostic()?;
+        // nix 0.29 returns a raw descriptor from dup.
+        Ok(Some(unsafe {
+            std::os::fd::OwnedFd::from_raw_fd(duplicated)
+        }))
+    }
+
     /// Install nftables rules for bypass detection inside the namespace.
     ///
     /// Sets up OUTPUT chain rules that:
@@ -321,6 +343,30 @@ impl NetworkNamespace {
         );
 
         Ok(())
+    }
+
+    /// Install the mandatory RFC default-deny fence. Unlike legacy bypass
+    /// diagnostics, absence or failure of nftables is fatal.
+    pub fn install_egress_ceiling(&self, proxy_port: u16) -> Result<()> {
+        let nft = find_nft().ok_or_else(|| {
+            miette::miette!("nft not found; cannot establish default-deny egress ceiling")
+        })?;
+        let log_prefix = format!("openshell:bypass:{}:", self.name);
+        enable_nf_log_all_netns();
+        let commands = nft_ruleset::generate_egress_ceiling_commands(
+            &self.host_ip.to_string(),
+            proxy_port,
+            Some(&log_prefix),
+        );
+        run_nft_commands_netns(&self.name, &nft, &commands)
+    }
+
+    #[must_use]
+    pub fn egress_ceiling_verifier(&self) -> EgressCeilingVerifier {
+        EgressCeilingVerifier {
+            namespace: self.name.clone(),
+            host_ip: self.host_ip,
+        }
     }
 
     /// Replace the ordinary bypass fence with the policy-DNS and transparent
@@ -548,6 +594,81 @@ impl NetworkNamespace {
     }
 }
 
+impl EgressCeilingVerifier {
+    /// Read the installed kernel rules under a deadline. Validation requires a
+    /// policy-drop output chain and explicit proxy/loopback accepts; any other
+    /// accept in that chain fails closed.
+    pub async fn verify_bounded(
+        &self,
+        proxy_port: u16,
+        deadline: std::time::Duration,
+    ) -> Result<()> {
+        let nft = find_nft().ok_or_else(|| miette::miette!("nft not found"))?;
+        let nsenter = find_trusted_binary("nsenter", NSENTER_SEARCH_PATHS)?;
+        let net_flag = format!(
+            "--net={}",
+            openshell_core::container_paths::netns_path(&self.namespace).display()
+        );
+        let mut command = tokio::process::Command::new(nsenter);
+        command.kill_on_drop(true).args([
+            &net_flag,
+            "--",
+            &nft,
+            "-j",
+            "list",
+            "chain",
+            "inet",
+            "openshell_bypass",
+            "output",
+        ]);
+        let output = tokio::time::timeout(deadline, command.output())
+            .await
+            .map_err(|_| miette::miette!("egress ceiling verification timed out"))?
+            .into_diagnostic()?;
+        if !output.status.success() {
+            return Err(miette::miette!(
+                "could not read back egress ceiling: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        verify_egress_ceiling_json(&output.stdout, &self.host_ip.to_string(), proxy_port)
+    }
+}
+
+fn verify_egress_ceiling_json(json: &[u8], host_ip: &str, proxy_port: u16) -> Result<()> {
+    let document: serde_json::Value = serde_json::from_slice(json).into_diagnostic()?;
+    let objects = document
+        .get("nftables")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| miette::miette!("nft response has no object list"))?;
+    let default_deny = objects.iter().any(|object| {
+        object.get("chain").is_some_and(|chain| {
+            chain.get("family").and_then(serde_json::Value::as_str) == Some("inet")
+                && chain.get("table").and_then(serde_json::Value::as_str)
+                    == Some("openshell_bypass")
+                && chain.get("name").and_then(serde_json::Value::as_str) == Some("output")
+                && chain.get("hook").and_then(serde_json::Value::as_str) == Some("output")
+                && chain.get("policy").and_then(serde_json::Value::as_str) == Some("drop")
+        })
+    });
+    if !default_deny {
+        return Err(miette::miette!(
+            "egress ceiling output chain is not policy drop"
+        ));
+    }
+    let rendered = serde_json::to_string(&document).into_diagnostic()?;
+    if !rendered.contains(host_ip)
+        || !rendered.contains(&proxy_port.to_string())
+        || !rendered.contains("oifname")
+        || !rendered.contains("lo")
+    {
+        return Err(miette::miette!(
+            "egress ceiling is missing the proxy or loopback allow"
+        ));
+    }
+    Ok(())
+}
+
 impl Drop for NetworkNamespace {
     fn drop(&mut self) {
         debug!(namespace = %self.name, "Cleaning up network namespace");
@@ -636,6 +757,27 @@ pub fn create_netns_for_proxy(
              Error: {e}"
         )),
     }
+}
+
+/// Create the RFC in-pod namespace with mandatory standing egress
+/// enforcement. The legacy helper remains best-effort for compatibility.
+pub fn create_conformant_netns_for_proxy(
+    policy: &openshell_core::policy::SandboxPolicy,
+) -> Result<Option<NetworkNamespace>> {
+    use openshell_core::policy::NetworkMode;
+
+    if !matches!(policy.network.mode, NetworkMode::Proxy) {
+        return Ok(None);
+    }
+    let namespace = NetworkNamespace::create()?;
+    let proxy_port = policy
+        .network
+        .proxy
+        .as_ref()
+        .and_then(|proxy| proxy.http_addr)
+        .map_or(3128, |address| address.port());
+    namespace.install_egress_ceiling(proxy_port)?;
+    Ok(Some(namespace))
 }
 
 /// Install pod-network bypass enforcement for Kubernetes sidecar topology.

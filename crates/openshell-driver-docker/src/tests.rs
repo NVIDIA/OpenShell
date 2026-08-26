@@ -112,6 +112,7 @@ fn runtime_config() -> DockerDriverRuntimeConfig {
         stop_timeout_secs: DEFAULT_STOP_TIMEOUT_SECS,
         log_level: "info".to_string(),
         supervisor_bin: PathBuf::from("/tmp/openshell-sandbox"),
+        supervisor_runtime: PathBuf::from("/tmp/openshell-runtime"),
         guest_tls: Some(DockerGuestTlsPaths {
             ca: PathBuf::from("/tmp/ca.crt"),
             cert: PathBuf::from("/tmp/tls.crt"),
@@ -1069,6 +1070,17 @@ fn container_create_body_sets_driver_owned_pids_limit() {
 }
 
 #[test]
+fn admitted_container_does_not_restart() {
+    let body = build_container_create_body(&test_sandbox(), &runtime_config()).unwrap();
+    let restart_policy = body
+        .host_config
+        .expect("host config")
+        .restart_policy
+        .expect("restart policy");
+    assert_eq!(restart_policy.name, Some(RestartPolicyNameEnum::NO));
+}
+
+#[test]
 fn build_environment_sets_docker_tls_paths() {
     let env = build_environment(&test_sandbox(), &runtime_config());
     assert!(env.contains(&format!("OPENSHELL_TLS_CA={TLS_CA_MOUNT_PATH}")));
@@ -1417,14 +1429,15 @@ fn build_binds_uses_docker_tls_directory() {
         .filter_map(|bind| bind.split(':').nth(1).map(String::from))
         .collect::<Vec<_>>();
     assert!(targets.contains(&SUPERVISOR_MOUNT_PATH.to_string()));
+    assert!(targets.contains(&SUPERVISOR_RUNTIME_MOUNT_PATH.to_string()));
     assert!(targets.contains(&TLS_CA_MOUNT_PATH.to_string()));
     assert!(targets.contains(&TLS_CERT_MOUNT_PATH.to_string()));
     assert!(targets.contains(&TLS_KEY_MOUNT_PATH.to_string()));
-    assert!(
-        targets
-            .iter()
-            .all(|target| target.starts_with(TLS_MOUNT_DIR) || target == SUPERVISOR_MOUNT_PATH)
-    );
+    assert!(targets.iter().all(|target| {
+        target.starts_with(TLS_MOUNT_DIR)
+            || target == SUPERVISOR_MOUNT_PATH
+            || target == SUPERVISOR_RUNTIME_MOUNT_PATH
+    }));
 }
 
 #[test]

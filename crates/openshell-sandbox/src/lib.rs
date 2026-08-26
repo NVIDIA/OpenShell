@@ -9,6 +9,7 @@ mod activity_aggregator;
 mod denial_aggregator;
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod google_cloud_metadata;
+mod inpod;
 mod mechanistic_mapper;
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod metadata_server;
@@ -116,6 +117,7 @@ pub async fn run_sandbox(
     network_enabled: bool,
     process_enabled: bool,
     upstream_proxy_args: openshell_supervisor_network::upstream_proxy::UpstreamProxyArgs,
+    topology_descriptor: Option<openshell_isolation::contract::TopologyDescriptor>,
 ) -> Result<i32> {
     let (program, args) = command
         .split_first()
@@ -145,7 +147,12 @@ pub async fn run_sandbox(
     }
 
     let sidecar_network_enforcement = sidecar_network_enforcement_enabled();
-    let process_enforcement_mode = process_enforcement_mode();
+    let admitted_topology = topology_descriptor.is_some();
+    let process_enforcement_mode = if admitted_topology {
+        ProcessEnforcementMode::Full
+    } else {
+        process_enforcement_mode()
+    };
     let process_uses_sidecar_control =
         process_enabled && !network_enabled && sidecar_network_enforcement;
     let mut process_control_connection = None;
@@ -390,7 +397,7 @@ pub async fn run_sandbox(
     // it via setns(). The RAII handle lives in this frame for the duration
     // of the sandbox.
     #[cfg(target_os = "linux")]
-    let netns = if network_enabled && !sidecar_network_enforcement {
+    let netns = if network_enabled && !sidecar_network_enforcement && !admitted_topology {
         openshell_supervisor_process::netns::create_netns_for_proxy(&policy)?
     } else {
         None
@@ -402,6 +409,12 @@ pub async fn run_sandbox(
         .map(|engine| engine.policy_dns_eligibility_snapshot())
         .transpose()?
         .is_some_and(|snapshot| !snapshot.endpoints.is_empty());
+    #[cfg(target_os = "linux")]
+    if admitted_topology && transparent_tcp_requested {
+        return Err(miette::miette!(
+            "the RFC 0012 in-pod prototype does not yet compose its strict egress ceiling with policy DNS and transparent TCP"
+        ));
+    }
     #[cfg(target_os = "linux")]
     let runtime_capabilities =
         std::env::var(openshell_core::sandbox_env::NETWORK_RUNTIME_CAPABILITIES).ok();
@@ -516,7 +529,98 @@ pub async fn run_sandbox(
     // API read the current value so proposals target the correct workspace.
     let (workspace_tx, workspace_rx) = tokio::sync::watch::channel(String::new());
 
-    let mut networking = if network_enabled {
+    let mut admitted_ready: Option<Box<dyn openshell_isolation::contract::ReadyBoundary>> = None;
+    let mut networking = if let Some(descriptor) = topology_descriptor {
+        if sidecar_network_enforcement || !network_enabled || !process_enabled {
+            return Err(miette::miette!(
+                "an admitted isolation backend requires the co-located network,process topology"
+            ));
+        }
+        let mediation_ready = Arc::new(AtomicBool::new(false));
+        let ca_file_paths = Arc::new(std::sync::Mutex::new(None));
+        let proxy_bind_ip = Arc::new(std::sync::Mutex::new(None));
+        let backend = Arc::new(inpod::InPodBackend::new(inpod::InPodConfig {
+            require_exclusive_pid_namespace: true,
+            network_enabled,
+            process_enabled,
+            entrypoint_pid: entrypoint_pid.clone(),
+            provider_credentials: provider_credentials.clone(),
+            provider_env: std::sync::Mutex::new(provider_env.clone()),
+            process_enforcement_mode,
+            resolved_process_identity,
+            workspace: workspace.clone(),
+            agent_proposals: agent_proposals.clone(),
+            openshell_endpoint: openshell_endpoint_for_proxy.clone(),
+            ssh_socket_path: ssh_socket_path.clone(),
+            #[cfg(target_os = "linux")]
+            bypass_denial_tx: std::sync::Mutex::new(bypass_denial_tx.clone()),
+            #[cfg(target_os = "linux")]
+            bypass_activity_tx: std::sync::Mutex::new(bypass_activity_tx.clone()),
+            mediation_ready: mediation_ready.clone(),
+            ca_file_paths: ca_file_paths.clone(),
+            proxy_bind_ip: proxy_bind_ip.clone(),
+        }));
+        let mut registry = openshell_isolation::contract::BackendRegistry::new();
+        registry
+            .register(backend)
+            .map_err(|error| miette::miette!(error.to_string()))?;
+        let (backend, verified) = registry
+            .resolve(descriptor, inpod::IN_POD_BACKEND_NAME)
+            .map_err(|error| miette::miette!(error.to_string()))?;
+        let bound = backend
+            .attach(
+                verified,
+                openshell_isolation::contract::SandboxContext {
+                    sandbox_id: sandbox_id.clone().unwrap_or_default(),
+                    policy: policy.clone(),
+                    agent: openshell_isolation::AgentSpec {
+                        program: program.clone(),
+                        args: args.to_vec(),
+                        workdir: workdir.clone(),
+                        timeout_secs,
+                        interactive,
+                    },
+                },
+            )
+            .await
+            .map_err(|error| miette::miette!(error.to_string()))?;
+        let source = bound.network_mediation_source();
+        let bind_ip = *proxy_bind_ip.lock().expect("proxy bind IP lock");
+        let networking = openshell_supervisor_network::run::run_networking(
+            &policy,
+            bind_ip,
+            opa_engine.as_ref(),
+            retained_proto.as_ref(),
+            entrypoint_pid.clone(),
+            process_enabled,
+            &provider_credentials,
+            sandbox_id.as_deref(),
+            sandbox_name_for_agg.as_deref(),
+            openshell_endpoint_for_proxy.as_deref(),
+            inference_routes.as_deref(),
+            denial_tx,
+            activity_tx,
+            agent_proposals.clone(),
+            workspace_rx.clone(),
+            &upstream_proxy_args,
+            Some(source),
+            #[cfg(target_os = "linux")]
+            None,
+        )
+        .await?;
+        ca_file_paths
+            .lock()
+            .expect("ca paths lock")
+            .clone_from(&networking.ca_file_paths);
+        mediation_ready.store(true, Ordering::Release);
+        admitted_ready = Some(
+            bound
+                .confirm()
+                .await
+                .map_err(|error| miette::miette!(error.to_string()))?,
+        );
+        Some(networking)
+    } else if network_enabled {
         #[cfg(target_os = "linux")]
         let proxy_bind_ip = netns
             .as_ref()
@@ -542,6 +646,7 @@ pub async fn run_sandbox(
                 agent_proposals.clone(),
                 workspace_rx.clone(),
                 &upstream_proxy_args,
+                None,
                 #[cfg(target_os = "linux")]
                 transparent_runtime,
             )
@@ -839,36 +944,57 @@ pub async fn run_sandbox(
     tokio::pin!(proxy_exited);
 
     let exit_code = if process_enabled {
-        let ca_file_paths = networking
-            .as_ref()
-            .and_then(|n| n.ca_file_paths.clone())
-            .or_else(|| {
-                if sidecar_network_enforcement {
-                    sidecar_bootstrap_ca_file_paths
-                        .clone()
-                        .or_else(sidecar_ca_file_paths)
-                } else {
-                    None
+        if let Some(ready) = admitted_ready.take() {
+            let running = ready
+                .start_agent()
+                .await
+                .map_err(|error| miette::miette!(error.to_string()))?;
+            let agent = running.agent();
+            let exit = tokio::select! {
+                result = agent.wait() => result.map_err(|error| miette::miette!(error.to_string()))?,
+                () = &mut proxy_exited => {
+                    return Err(miette::miette!("RFC boundary mediation exited unexpectedly"));
                 }
-            });
-
-        let (ssh_exit_tx, ssh_exit_rx) = if ssh_socket_path.is_some() {
-            let (tx, rx) = tokio::sync::oneshot::channel::<()>();
-            (Some(tx), Some(rx))
+            };
+            match exit {
+                openshell_isolation::contract::BoundaryExitStatus::Exited(code) => code,
+                openshell_isolation::contract::BoundaryExitStatus::Signaled(signal) => {
+                    128_i32.saturating_add(signal)
+                }
+            }
         } else {
-            (None, None)
-        };
-        let ssh_exited: Pin<Box<dyn Future<Output = ()> + Send>> = if let Some(rx) = ssh_exit_rx {
-            Box::pin(async {
-                let _ = rx.await;
-            })
-        } else {
-            Box::pin(std::future::pending())
-        };
-        tokio::pin!(ssh_exited);
+            let ca_file_paths = networking
+                .as_ref()
+                .and_then(|n| n.ca_file_paths.clone())
+                .or_else(|| {
+                    if sidecar_network_enforcement {
+                        sidecar_bootstrap_ca_file_paths
+                            .clone()
+                            .or_else(sidecar_ca_file_paths)
+                    } else {
+                        None
+                    }
+                });
 
-        let entrypoint_started_tx =
-            if process_uses_sidecar_control && let Some(writer) = process_control_writer.clone() {
+            let (ssh_exit_tx, ssh_exit_rx) = if ssh_socket_path.is_some() {
+                let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+                (Some(tx), Some(rx))
+            } else {
+                (None, None)
+            };
+            let ssh_exited: Pin<Box<dyn Future<Output = ()> + Send>> = if let Some(rx) = ssh_exit_rx
+            {
+                Box::pin(async {
+                    let _ = rx.await;
+                })
+            } else {
+                Box::pin(std::future::pending())
+            };
+            tokio::pin!(ssh_exited);
+
+            let entrypoint_started_tx = if process_uses_sidecar_control
+                && let Some(writer) = process_control_writer.clone()
+            {
                 let (tx, rx) = tokio::sync::oneshot::channel();
                 tokio::spawn(async move {
                     match rx.await {
@@ -889,8 +1015,9 @@ pub async fn run_sandbox(
             } else {
                 None
             };
-        let sidecar_exit_tx =
-            if process_uses_sidecar_control && let Some(writer) = process_control_writer.clone() {
+            let sidecar_exit_tx = if process_uses_sidecar_control
+                && let Some(writer) = process_control_writer.clone()
+            {
                 let exit_ack = Arc::clone(&process_exit_ack);
                 let (tx, mut rx) = tokio::sync::mpsc::channel::<
                     openshell_supervisor_process::run::SidecarExitReport,
@@ -919,116 +1046,117 @@ pub async fn run_sandbox(
                 None
             };
 
-        let process = openshell_supervisor_process::run::run_process(
-            program,
-            args,
-            workspace,
-            timeout_secs,
-            interactive,
-            sandbox_id.as_deref(),
-            openshell_endpoint.as_deref(),
-            ssh_socket_path,
-            sidecar_network_enforcement,
-            ssh_exit_tx,
-            &process_policy,
-            resolved_process_identity,
-            process_enforcement_mode,
-            entrypoint_pid,
-            entrypoint_started_tx,
-            sidecar_exit_tx,
-            provider_credentials,
-            main_env,
-            ca_file_paths,
-            agent_proposals.clone(),
-            #[cfg(target_os = "linux")]
-            netns.as_ref(),
-            #[cfg(target_os = "linux")]
-            bypass_denial_tx,
-            #[cfg(target_os = "linux")]
-            bypass_activity_tx,
-        );
+            let process = openshell_supervisor_process::run::run_process(
+                program,
+                args,
+                workspace,
+                timeout_secs,
+                interactive,
+                sandbox_id.as_deref(),
+                openshell_endpoint.as_deref(),
+                ssh_socket_path,
+                sidecar_network_enforcement,
+                ssh_exit_tx,
+                &process_policy,
+                resolved_process_identity,
+                process_enforcement_mode,
+                entrypoint_pid,
+                entrypoint_started_tx,
+                sidecar_exit_tx,
+                provider_credentials,
+                main_env,
+                ca_file_paths,
+                agent_proposals.clone(),
+                #[cfg(target_os = "linux")]
+                netns.as_ref(),
+                #[cfg(target_os = "linux")]
+                bypass_denial_tx,
+                #[cfg(target_os = "linux")]
+                bypass_activity_tx,
+            );
 
-        if let Some(control_closed) = process_control_closed.as_mut() {
-            tokio::select! {
-                result = process => result?,
-                _ = control_closed => {
-                    ocsf_emit!(
-                        AppLifecycleBuilder::new(ocsf_ctx())
-                            .activity(ActivityId::Fail)
-                            .severity(SeverityId::High)
-                            .status(StatusId::Failure)
-                            .message(
-                                "Authoritative network-sidecar control channel closed; terminating process container"
-                            )
-                            .build()
-                    );
-                    return Err(miette::miette!(
-                        "authoritative network-sidecar control channel closed"
-                    ));
+            if let Some(control_closed) = process_control_closed.as_mut() {
+                tokio::select! {
+                    result = process => result?,
+                    _ = control_closed => {
+                        ocsf_emit!(
+                            AppLifecycleBuilder::new(ocsf_ctx())
+                                .activity(ActivityId::Fail)
+                                .severity(SeverityId::High)
+                                .status(StatusId::Failure)
+                                .message(
+                                    "Authoritative network-sidecar control channel closed; terminating process container"
+                                )
+                                .build()
+                        );
+                        return Err(miette::miette!(
+                            "authoritative network-sidecar control channel closed"
+                        ));
+                    }
+                    () = &mut proxy_exited => {
+                        ocsf_emit!(
+                            AppLifecycleBuilder::new(ocsf_ctx())
+                                .activity(ActivityId::Fail)
+                                .severity(SeverityId::High)
+                                .status(StatusId::Failure)
+                                .message(
+                                    "Proxy accept loop exited unexpectedly; terminating sandbox"
+                                )
+                                .build()
+                        );
+                        return Err(miette::miette!(
+                            "proxy accept loop exited unexpectedly"
+                        ));
+                    }
+                    () = &mut ssh_exited => {
+                        ocsf_emit!(
+                            AppLifecycleBuilder::new(ocsf_ctx())
+                                .activity(ActivityId::Fail)
+                                .severity(SeverityId::High)
+                                .status(StatusId::Failure)
+                                .message(
+                                    "SSH accept loop exited unexpectedly; terminating sandbox"
+                                )
+                                .build()
+                        );
+                        return Err(miette::miette!(
+                            "SSH accept loop exited unexpectedly"
+                        ));
+                    }
                 }
-                () = &mut proxy_exited => {
-                    ocsf_emit!(
-                        AppLifecycleBuilder::new(ocsf_ctx())
-                            .activity(ActivityId::Fail)
-                            .severity(SeverityId::High)
-                            .status(StatusId::Failure)
-                            .message(
-                                "Proxy accept loop exited unexpectedly; terminating sandbox"
-                            )
-                            .build()
-                    );
-                    return Err(miette::miette!(
-                        "proxy accept loop exited unexpectedly"
-                    ));
-                }
-                () = &mut ssh_exited => {
-                    ocsf_emit!(
-                        AppLifecycleBuilder::new(ocsf_ctx())
-                            .activity(ActivityId::Fail)
-                            .severity(SeverityId::High)
-                            .status(StatusId::Failure)
-                            .message(
-                                "SSH accept loop exited unexpectedly; terminating sandbox"
-                            )
-                            .build()
-                    );
-                    return Err(miette::miette!(
-                        "SSH accept loop exited unexpectedly"
-                    ));
-                }
-            }
-        } else {
-            tokio::select! {
-                result = process => result?,
-                () = &mut proxy_exited => {
-                    ocsf_emit!(
-                        AppLifecycleBuilder::new(ocsf_ctx())
-                            .activity(ActivityId::Fail)
-                            .severity(SeverityId::High)
-                            .status(StatusId::Failure)
-                            .message(
-                                "Proxy accept loop exited unexpectedly; terminating sandbox"
-                            )
-                            .build()
-                    );
-                    return Err(miette::miette!(
-                        "proxy accept loop exited unexpectedly"
-                    ));
-                }
-                () = &mut ssh_exited => {
-                    ocsf_emit!(
-                        AppLifecycleBuilder::new(ocsf_ctx())
-                            .activity(ActivityId::Fail)
-                            .severity(SeverityId::High)
-                            .status(StatusId::Failure)
-                            .message(
-                                "SSH accept loop exited unexpectedly; terminating sandbox"
-                            )
-                            .build()
-                    );
-                    return Err(miette::miette!(
-                        "SSH accept loop exited unexpectedly"
-                    ));
+            } else {
+                tokio::select! {
+                    result = process => result?,
+                    () = &mut proxy_exited => {
+                        ocsf_emit!(
+                            AppLifecycleBuilder::new(ocsf_ctx())
+                                .activity(ActivityId::Fail)
+                                .severity(SeverityId::High)
+                                .status(StatusId::Failure)
+                                .message(
+                                    "Proxy accept loop exited unexpectedly; terminating sandbox"
+                                )
+                                .build()
+                        );
+                        return Err(miette::miette!(
+                            "proxy accept loop exited unexpectedly"
+                        ));
+                    }
+                    () = &mut ssh_exited => {
+                        ocsf_emit!(
+                            AppLifecycleBuilder::new(ocsf_ctx())
+                                .activity(ActivityId::Fail)
+                                .severity(SeverityId::High)
+                                .status(StatusId::Failure)
+                                .message(
+                                    "SSH accept loop exited unexpectedly; terminating sandbox"
+                                )
+                                .build()
+                        );
+                        return Err(miette::miette!(
+                            "SSH accept loop exited unexpectedly"
+                        ));
+                    }
                 }
             }
         }

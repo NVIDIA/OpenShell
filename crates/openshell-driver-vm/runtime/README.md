@@ -36,7 +36,7 @@ VM sandboxes can run the same supervisor enforcement path as other backends.
 # Download the current pre-built runtime and stage compressed artifacts
 mise run vm:setup
 
-# Build the bundled guest supervisor
+# Build the bundled guest supervisor and trusted helper runtime (requires Docker Buildx)
 mise run vm:supervisor
 
 # Build the gateway and VM driver with embedded runtime artifacts

@@ -161,6 +161,61 @@ jobs:
           fi
           exit 0
 
+  isolation-conformance:
+    name: Isolation conformance (privileged Linux)
+    needs: pr_metadata
+    if: needs.pr_metadata.outputs.should_run == 'true'
+    runs-on: linux-amd64-cpu8
+    timeout-minutes: 20
+    container:
+      image: ghcr.io/nvidia/openshell/ci:latest
+      options: --privileged
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install tools and network helpers
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends iproute2 nftables iptables util-linux
+          mise install --locked
+
+      - name: Materialize the Alpine trusted helper runtime fixture
+        run: |
+          alpine_root="${RUNNER_TEMP}/openshell-alpine-root"
+          runtime="${RUNNER_TEMP}/openshell-runtime"
+          archive="${RUNNER_TEMP}/alpine-minirootfs.tar.gz"
+          curl -fsSL \
+            https://dl-cdn.alpinelinux.org/alpine/v3.22/releases/x86_64/alpine-minirootfs-3.22.5-x86_64.tar.gz \
+            -o "$archive"
+          echo "4b4daa9fe2fc696c4919c4412a4c3d3e770d8fb70292a004a2c72f5096175282  $archive" \
+            | sha256sum -c -
+          mkdir -p "$alpine_root" "$runtime"
+          tar -xzf "$archive" -C "$alpine_root"
+          cp /etc/resolv.conf "$alpine_root/etc/resolv.conf"
+          chroot "$alpine_root" /sbin/apk add --no-cache \
+            iproute2 nftables iptables iptables-legacy
+          for path in /bin /sbin /lib /lib64 /usr/bin /usr/sbin /usr/lib /usr/lib64 /etc/iproute2 /usr/share/nftables; do
+            if [ -e "$alpine_root$path" ]; then
+              (cd "$alpine_root" && cp -aL --parents ".$path" "$runtime")
+            fi
+          done
+          chmod -R go-w "$runtime"
+
+      - name: Exercise the live default-deny ceiling
+        run: |
+          cargo test -p openshell-isolation -p openshell-supervisor-process \
+            -p openshell-supervisor-network -p openshell-sandbox
+          OPENSHELL_TEST_TRUSTED_RUNTIME_ROOT="${RUNNER_TEMP}/openshell-runtime" \
+            cargo test -p openshell-supervisor-process \
+            installed_egress_ceiling_ -- \
+            --ignored --nocapture --test-threads=1
+          cargo test -p openshell-sandbox \
+            pid_one_exit_kills_unregistered_setsid_descendant_within_bound -- \
+            --ignored --nocapture --test-threads=1
+
   rust-macos:
     name: Rust lint (macOS)
     needs: pr_metadata

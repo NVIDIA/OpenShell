@@ -60,6 +60,7 @@ esac
 
 SUPERVISOR_BIN="${ROOT}/target/${RUST_TARGET}/release/openshell-sandbox"
 SUPERVISOR_OUTPUT="${OUTPUT_DIR}/openshell-sandbox.zst"
+SUPERVISOR_RUNTIME_OUTPUT="${OUTPUT_DIR}/openshell-runtime.tar.zst"
 
 echo "==> Building openshell-sandbox supervisor bundle"
 echo "    Guest arch: ${GUEST_ARCH}"
@@ -123,6 +124,51 @@ fi
 
 zstd -19 -T0 -f "${SUPERVISOR_BIN}" -o "${SUPERVISOR_OUTPUT}"
 
+case "${GUEST_ARCH}" in
+    aarch64|arm64) DOCKER_ARCH="arm64" ;;
+    x86_64|amd64) DOCKER_ARCH="amd64" ;;
+esac
+
+echo "==> Building trusted supervisor helper runtime"
+STAGED_SUPERVISOR="${ROOT}/deploy/docker/.build/prebuilt-binaries/${DOCKER_ARCH}/openshell-sandbox"
+RUNTIME_IMAGE="openshell-vm-helper-runtime:${DOCKER_ARCH}-$$"
+mkdir -p "$(dirname "${STAGED_SUPERVISOR}")"
+cp "${SUPERVISOR_BIN}" "${STAGED_SUPERVISOR}"
+
+case "$(uname -m)" in
+    aarch64|arm64) HOST_DOCKER_ARCH="arm64" ;;
+    x86_64|amd64) HOST_DOCKER_ARCH="amd64" ;;
+    *) HOST_DOCKER_ARCH="" ;;
+esac
+
+if [ "${HOST_DOCKER_ARCH}" = "${DOCKER_ARCH}" ]; then
+    docker build \
+        --build-arg "TARGETARCH=${DOCKER_ARCH}" \
+        --file "${ROOT}/deploy/docker/Dockerfile.supervisor" \
+        --tag "${RUNTIME_IMAGE}" \
+        "${ROOT}"
+else
+    docker buildx build \
+        --load \
+        --platform "linux/${DOCKER_ARCH}" \
+        --build-arg "TARGETARCH=${DOCKER_ARCH}" \
+        --file "${ROOT}/deploy/docker/Dockerfile.supervisor" \
+        --tag "${RUNTIME_IMAGE}" \
+        "${ROOT}"
+fi
+
+RUNTIME_CONTAINER="$(docker create "${RUNTIME_IMAGE}")"
+cleanup_runtime_image() {
+    docker rm -f "${RUNTIME_CONTAINER}" >/dev/null 2>&1 || true
+    docker image rm "${RUNTIME_IMAGE}" >/dev/null 2>&1 || true
+}
+trap cleanup_runtime_image EXIT
+docker cp "${RUNTIME_CONTAINER}:/openshell-runtime" - \
+    | zstd -19 -T0 -f -o "${SUPERVISOR_RUNTIME_OUTPUT}"
+cleanup_runtime_image
+trap - EXIT
+
 echo "==> Bundled supervisor ready"
 echo "    Binary: $(du -sh "${SUPERVISOR_BIN}" | cut -f1)"
 echo "    Compressed: $(du -sh "${SUPERVISOR_OUTPUT}" | cut -f1)"
+echo "    Helper runtime: $(du -sh "${SUPERVISOR_RUNTIME_OUTPUT}" | cut -f1)"

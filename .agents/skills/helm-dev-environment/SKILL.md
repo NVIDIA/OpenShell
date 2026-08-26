@@ -65,6 +65,9 @@ mise run helm:skaffold:run
 mise run helm:skaffold:run:sidecar
 ```
 
+Combined topology selects RFC 0012's in-pod backend and supplies its descriptor;
+sidecar topology remains on its separate lifecycle.
+
 **Supervisor sidecar topology with TLS/mTLS enabled** (build once and leave running):
 ```bash
 mise run helm:skaffold:run:sidecar-mtls

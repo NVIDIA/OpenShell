@@ -344,6 +344,24 @@ mod tests {
     }
 
     #[test]
+    fn container_target_rejects_parents_that_shadow_reserved_trees() {
+        for target in ["/opt", "/etc", "/run"] {
+            let err = validate_container_mount_target(target).unwrap_err();
+            assert!(
+                err.contains("reserved OpenShell path"),
+                "expected {target} to be rejected: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn container_target_rejects_proc_shadowing() {
+        for target in ["/proc", "/proc/self", "/"] {
+            assert!(validate_container_mount_target(target).is_err());
+        }
+    }
+
+    #[test]
     fn container_target_does_not_prefix_match_unrelated_paths() {
         validate_container_mount_target("/etc/openshell-tools").unwrap();
         validate_container_mount_target("/run/openshell-tools").unwrap();

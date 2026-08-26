@@ -468,6 +468,18 @@ fn upstream_proxy_cli_args(config: &PodmanComputeConfig) -> Vec<String> {
     args
 }
 
+fn in_pod_topology_descriptor_args() -> Vec<String> {
+    vec![
+        "--topology-backend-name=in-pod".to_string(),
+        format!(
+            "--topology-version={}",
+            openshell_isolation::contract::INTERFACE_VERSION
+        ),
+        "--topology-payload-base64=".to_string(),
+        "--".to_string(),
+    ]
+}
+
 fn build_env(
     sandbox: &DriverSandbox,
     config: &PodmanComputeConfig,
@@ -1072,6 +1084,7 @@ pub fn build_container_spec_for_image(
         driver_mounts::DEFAULT_WORKSPACE_ROOT.to_string(),
     ];
     command.extend(upstream_proxy_cli_args(config));
+    command.extend(in_pod_topology_descriptor_args());
 
     let container_spec = ContainerSpec {
         name,
@@ -1094,9 +1107,9 @@ pub fn build_container_spec_for_image(
         // the supervisor path as an argument instead of executing it directly.
         entrypoint: vec![SUPERVISOR_BINARY_PATH.into()],
         // Keep Podman's existing /sandbox workspace contract explicit while
-        // the supervisor supports driver-selected workdirs. Operator-owned
-        // corporate proxy flags follow it; the workload command comes from
-        // the reserved environment variable.
+        // the supervisor supports driver-selected workdirs. Trusted operator
+        // proxy and topology arguments follow it; workload argv remains in
+        // the reserved environment transport.
         command,
         // Force the supervisor to run as root (UID 0). Sandbox images may
         // set a non-root USER directive (e.g. `USER sandbox`), but the
@@ -2096,6 +2109,20 @@ mod tests {
                     .to_string()
             })
             .collect()
+    }
+
+    #[test]
+    fn container_spec_admits_the_in_pod_backend_by_default() {
+        let spec = build_container_spec(&test_sandbox("test-id", "test-name"), &test_config());
+        let command = spec_command(&spec);
+
+        assert!(command.contains(&"--topology-backend-name=in-pod".to_string()));
+        assert!(command.contains(&format!(
+            "--topology-version={}",
+            openshell_isolation::contract::INTERFACE_VERSION
+        )));
+        assert!(command.contains(&"--topology-payload-base64=".to_string()));
+        assert_eq!(command.last().map(String::as_str), Some("--"));
     }
 
     #[test]
