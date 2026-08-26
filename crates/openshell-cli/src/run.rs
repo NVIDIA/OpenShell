@@ -1396,10 +1396,8 @@ async fn validate_and_stage_rootfs_tar(
         ));
     }
 
-    let staging_dir = driver
-        .capabilities
-        .as_ref()
-        .map_or("", |c| c.rootfs_tar_staging_dir.as_str());
+    let caps = driver.capabilities.as_ref();
+    let staging_dir = caps.map_or("", |c| c.rootfs_tar_staging_dir.as_str());
     if staging_dir.is_empty() {
         return Err(miette!(
             "gateway '{}' VM driver did not advertise a rootfs tar staging directory",
@@ -1408,21 +1406,50 @@ async fn validate_and_stage_rootfs_tar(
     }
     let staging_dir = PathBuf::from(staging_dir);
 
+    let max_bytes = caps.map_or(0, |c| c.rootfs_tar_max_bytes);
+    if max_bytes > 0 {
+        let source_meta = tokio::fs::metadata(tar_path)
+            .await
+            .into_diagnostic()
+            .wrap_err_with(|| format!("failed to read {}", tar_path.display()))?;
+        if source_meta.len() > max_bytes {
+            return Err(miette!(
+                "rootfs tar {} is {} bytes, exceeding the gateway limit of {} bytes",
+                tar_path.display(),
+                source_meta.len(),
+                max_bytes
+            ));
+        }
+    }
+
+    let request_dir = staging_dir.join(format!("req-{}", std::process::id()));
+    tokio::fs::create_dir_all(&request_dir)
+        .await
+        .into_diagnostic()
+        .wrap_err_with(|| {
+            format!(
+                "failed to create staging directory {}",
+                request_dir.display()
+            )
+        })?;
+
     let file_name = tar_path
         .file_name()
         .ok_or_else(|| miette!("rootfs tar path has no filename"))?;
-    let staged_name = format!("{}-{}", std::process::id(), file_name.to_string_lossy());
-    let staged_path = staging_dir.join(&staged_name);
+    let staged_path = request_dir.join(file_name);
 
     eprintln!(
         "Staging rootfs tar {} for gateway '{}'",
         tar_path.display().to_string().cyan(),
         gateway_name,
     );
-    tokio::fs::copy(tar_path, &staged_path)
-        .await
-        .into_diagnostic()
-        .wrap_err_with(|| format!("failed to stage rootfs tar to {}", staged_path.display()))?;
+    if let Err(err) = tokio::fs::copy(tar_path, &staged_path).await {
+        let _ = tokio::fs::remove_dir_all(&request_dir).await;
+        return Err(miette!(
+            "failed to stage rootfs tar to {}: {err}",
+            staged_path.display()
+        ));
+    }
     eprintln!();
 
     Ok(staged_path)

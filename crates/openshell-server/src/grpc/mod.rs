@@ -265,6 +265,7 @@ impl OpenShell for OpenShellService {
                         .as_ref()
                         .map(|resources| public_resource_capabilities(*resources)),
                     rootfs_tar_staging_dir: driver.rootfs_tar_staging_dir.clone(),
+                    rootfs_tar_max_bytes: driver.rootfs_tar_max_bytes,
                 }),
             })
             .collect();

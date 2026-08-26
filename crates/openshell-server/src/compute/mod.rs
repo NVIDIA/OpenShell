@@ -309,6 +309,8 @@ pub struct ComputeDriverInfoSnapshot {
     pub resource_capabilities: Option<DriverResourceCapabilities>,
     /// Directory where rootfs tar files must be staged.
     pub rootfs_tar_staging_dir: String,
+    /// Maximum rootfs tar file size in bytes.
+    pub rootfs_tar_max_bytes: u64,
 }
 
 /// Interval between store-vs-backend reconciliation sweeps.
@@ -659,6 +661,7 @@ impl ComputeRuntime {
             driver_reports_runtime_readiness: capabilities.driver_reports_runtime_readiness,
             resource_capabilities: capabilities.resource_capabilities,
             rootfs_tar_staging_dir: capabilities.rootfs_tar_staging_dir,
+            rootfs_tar_max_bytes: capabilities.rootfs_tar_max_bytes,
         };
         let default_image = capabilities.default_image;
         let gateway_listener_requirements = match driver
@@ -4663,6 +4666,7 @@ impl ComputeDriver for NoopTestDriver {
                 driver_reports_runtime_readiness: false,
                 resource_capabilities: None,
                 rootfs_tar_staging_dir: String::new(),
+                rootfs_tar_max_bytes: 0,
             },
         ))
     }
@@ -4809,6 +4813,7 @@ pub async fn new_test_runtime_with_driver(
             driver_reports_runtime_readiness: false,
             resource_capabilities: None,
             rootfs_tar_staging_dir: String::new(),
+            rootfs_tar_max_bytes: 0,
         },
         telemetry_compute_driver: TelemetryComputeDriver::custom(),
         driver_process: None,
@@ -4989,6 +4994,7 @@ mod tests {
                 driver_reports_runtime_readiness: false,
                 resource_capabilities: None,
                 rootfs_tar_staging_dir: String::new(),
+                rootfs_tar_max_bytes: 0,
             }))
         }
 
@@ -5332,6 +5338,7 @@ mod tests {
                 driver_reports_runtime_readiness: false,
                 resource_capabilities: None,
                 rootfs_tar_staging_dir: String::new(),
+                rootfs_tar_max_bytes: 0,
             }))
         }
 
@@ -5544,6 +5551,7 @@ mod tests {
                 driver_reports_runtime_readiness: false,
                 resource_capabilities: None,
                 rootfs_tar_staging_dir: String::new(),
+                rootfs_tar_max_bytes: 0,
             },
             telemetry_compute_driver: TelemetryComputeDriver::custom(),
             driver_process: None,
