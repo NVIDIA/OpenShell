@@ -80,14 +80,9 @@ impl Inference for InferenceService {
             .await
             .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
             .ok_or_else(|| Status::not_found(format!("sandbox '{sandbox_id}' not found")))?;
-        let workspace = sandbox.object_workspace();
-        resolve_inference_bundle_with_credentials(
-            self.state.store.as_ref(),
-            workspace,
-            Some(&self.state.credentials),
-        )
-        .await
-        .map(Response::new)
+        build_inference_bundle_snapshot(&self.state, &sandbox)
+            .await
+            .map(Response::new)
     }
 
     async fn set_inference_route(
@@ -1097,6 +1092,22 @@ async fn resolve_inference_bundle_with_credentials(
         revision,
         generated_at_ms: now_ms,
     })
+}
+
+/// Build the resolved gateway-owned inference bundle for an authorized sandbox.
+///
+/// The public fetch RPC and supervisor session delivery share this boundary so
+/// route resolution, credential loading, and revision calculation cannot drift.
+pub async fn build_inference_bundle_snapshot(
+    state: &ServerState,
+    sandbox: &Sandbox,
+) -> Result<GetInferenceBundleResponse, Status> {
+    resolve_inference_bundle_with_credentials(
+        state.store.as_ref(),
+        sandbox.object_workspace(),
+        Some(&state.credentials),
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -3764,6 +3775,64 @@ mod tests {
             bundle.routes.is_empty(),
             "bundle should be empty after route deletion"
         );
+    }
+
+    #[tokio::test]
+    async fn inference_snapshot_builder_matches_fetch_rpc_payload() {
+        use crate::grpc::test_support::test_server_state;
+        use openshell_core::proto::SandboxSpec;
+        use openshell_core::proto::datamodel::v1::ObjectMeta;
+
+        let state = test_server_state().await;
+        let provider = make_provider("openai-dev", "openai", "OPENAI_API_KEY", "sk-test");
+        state
+            .store
+            .put_message(&provider)
+            .await
+            .expect("persist provider");
+        upsert_inference_route(
+            state.store.as_ref(),
+            "default",
+            CLUSTER_INFERENCE_ROUTE_NAME,
+            "openai-dev",
+            "gpt-4",
+            0,
+            false,
+        )
+        .await
+        .expect("set inference route");
+        let sandbox = Sandbox {
+            metadata: Some(ObjectMeta {
+                id: "sandbox-a".to_string(),
+                name: "sandbox-a".to_string(),
+                workspace: "default".to_string(),
+                ..Default::default()
+            }),
+            spec: Some(SandboxSpec::default()),
+            ..Default::default()
+        };
+        state
+            .store
+            .put_message(&sandbox)
+            .await
+            .expect("persist sandbox");
+
+        let built = build_inference_bundle_snapshot(&state, &sandbox)
+            .await
+            .expect("build snapshot");
+        let service = InferenceService::new(state);
+        let mut request = Request::new(GetInferenceBundleRequest {});
+        request.extensions_mut().insert(test_sandbox_principal());
+        let fetched = service
+            .get_inference_bundle(request)
+            .await
+            .expect("fetch bundle")
+            .into_inner();
+
+        assert_eq!(built.routes, fetched.routes);
+        assert_eq!(built.revision, fetched.revision);
+        assert!(built.generated_at_ms > 0);
+        assert!(fetched.generated_at_ms > 0);
     }
 
     /// Non-member callers must receive `PERMISSION_DENIED` — not `NOT_FOUND` —

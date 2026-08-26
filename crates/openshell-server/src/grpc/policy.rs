@@ -2321,6 +2321,21 @@ pub(super) async fn handle_get_sandbox_config(
 
     let sandbox =
         super::sandbox::fetch_and_authorize_sandbox(state, &principal, &sandbox_id).await?;
+    build_sandbox_config_snapshot(state, &sandbox)
+        .await
+        .map(Response::new)
+}
+
+/// Build the effective gateway-owned configuration for an authorized sandbox.
+///
+/// Keeping request authentication outside this function lets supervisor session
+/// bootstrap and reconciliation reuse the same snapshot construction path as
+/// the public `GetSandboxConfig` RPC.
+pub async fn build_sandbox_config_snapshot(
+    state: &ServerState,
+    sandbox: &Sandbox,
+) -> Result<GetSandboxConfigResponse, Status> {
+    let sandbox_id = sandbox.object_id().to_string();
     let workspace = sandbox.object_workspace().to_string();
     let sandbox_provider_names = sandbox
         .spec
@@ -2498,7 +2513,7 @@ pub(super) async fn handle_get_sandbox_config(
     );
     if let Some(policy) = policy.as_ref() {
         validate_policy_credential_bindings_for_sandbox(
-            state.as_ref(),
+            state,
             &provider_profile_catalog,
             &workspace,
             &sandbox_provider_names,
@@ -2515,7 +2530,7 @@ pub(super) async fn handle_get_sandbox_config(
     )
     .await?;
 
-    Ok(Response::new(GetSandboxConfigResponse {
+    Ok(GetSandboxConfigResponse {
         policy,
         version,
         policy_hash,
@@ -2532,7 +2547,7 @@ pub(super) async fn handle_get_sandbox_config(
             .as_str()
             .to_string(),
         extension_authentication_enabled: state.sandbox_jwt_issuer.is_some(),
-    }))
+    })
 }
 
 #[cfg(test)]
@@ -3042,6 +3057,23 @@ pub(super) async fn handle_get_sandbox_provider_environment(
         .await
         .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
         .ok_or_else(|| Status::not_found("sandbox not found"))?;
+
+    build_provider_environment_snapshot(state, &sandbox, supports_static_credential_bindings)
+        .await
+        .map(Response::new)
+}
+
+/// Build the gateway-owned provider environment for an authorized sandbox.
+///
+/// `supports_static_credential_bindings` preserves the existing fetch RPC's
+/// compatibility behavior. The required session protocol introduced by
+/// #1731 will call this builder with binding support enabled.
+pub async fn build_provider_environment_snapshot(
+    state: &ServerState,
+    sandbox: &Sandbox,
+    supports_static_credential_bindings: bool,
+) -> Result<GetSandboxProviderEnvironmentResponse, Status> {
+    let sandbox_id = sandbox.object_id().to_string();
     let workspace = sandbox.object_workspace().to_string();
 
     let spec = sandbox
@@ -3061,10 +3093,10 @@ pub(super) async fn handle_get_sandbox_provider_environment(
     )
     .await?;
     let effective_policy = current_effective_policy_for_sandbox(
-        state.as_ref(),
+        state,
         &provider_profile_catalog,
         &workspace,
-        &sandbox,
+        sandbox,
         &sandbox_id,
     )
     .await?;
@@ -3136,14 +3168,14 @@ pub(super) async fn handle_get_sandbox_provider_environment(
         .cloned()
         .collect();
 
-    Ok(Response::new(GetSandboxProviderEnvironmentResponse {
+    Ok(GetSandboxProviderEnvironmentResponse {
         environment: provider_environment.environment,
         provider_env_revision,
         credential_expires_at_ms: provider_environment.credential_expires_at_ms,
         dynamic_credentials: provider_environment.dynamic_credentials,
         static_credential_bindings: provider_environment.static_credential_bindings,
         non_secret_environment_keys,
-    }))
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -9671,6 +9703,54 @@ mod tests {
                 .host,
             "api.github.com"
         );
+    }
+
+    #[tokio::test]
+    async fn snapshot_builders_match_existing_fetch_rpc_payloads() {
+        use openshell_core::proto::GetSandboxProviderEnvironmentRequest;
+
+        let state = test_server_state().await;
+        state
+            .store
+            .put_message(&test_provider("work-github", "github"))
+            .await
+            .unwrap();
+        let sandbox = test_sandbox(
+            "sb-builder-parity",
+            "builder-parity",
+            test_policy_with_rule("sandbox_only", "sandbox.example.com"),
+            vec!["work-github".to_string()],
+        );
+        state.store.put_message(&sandbox).await.unwrap();
+
+        let built_config = build_sandbox_config_snapshot(&state, &sandbox)
+            .await
+            .unwrap();
+        let fetched_config = handle_get_sandbox_config(
+            &state,
+            with_user(Request::new(GetSandboxConfigRequest {
+                sandbox_id: sandbox.object_id().to_string(),
+            })),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(built_config, fetched_config);
+
+        let built_environment = build_provider_environment_snapshot(&state, &sandbox, true)
+            .await
+            .unwrap();
+        let fetched_environment = handle_get_sandbox_provider_environment(
+            &state,
+            with_user(Request::new(GetSandboxProviderEnvironmentRequest {
+                sandbox_id: sandbox.object_id().to_string(),
+                supports_static_credential_bindings: true,
+            })),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(built_environment, fetched_environment);
     }
 
     #[tokio::test]

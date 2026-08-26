@@ -3948,47 +3948,12 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
             {
                 Ok(env_result) => {
                     let provider_env_revision = env_result.provider_env_revision;
-                    let install_result = ctx.provider_credentials.install_bound_environment(
-                        provider_env_revision,
-                        env_result.environment,
-                        env_result.credential_expires_at_ms,
-                        env_result.dynamic_credentials,
-                        env_result.static_credential_bindings,
-                        env_result.non_secret_environment_keys,
-                    );
-                    if let Err(error) = install_result {
-                        ocsf_emit!(
-                            ConfigStateChangeBuilder::new(ocsf_ctx())
-                                .severity(SeverityId::High)
-                                .status(StatusId::Failure)
-                                .state(StateId::Disabled, "fail_closed")
-                                .message(format!(
-                                    "Rejected provider environment refresh; static provider credentials were revoked; fetched dynamic token grants remain active: {error}"
-                                ))
-                                .build()
-                        );
-                    } else {
-                        let child_env = ctx.provider_credentials.child_env_with_gcp_resolved();
-                        let env_count = child_env.len();
-                        if let Some(publisher) = ctx.sidecar_control_publisher.as_ref() {
-                            publisher
-                                .publish_provider_env(provider_env_revision, child_env.clone());
-                        }
+                    if apply_provider_environment_snapshot(
+                        &ctx.provider_credentials,
+                        env_result,
+                        ctx.sidecar_control_publisher.as_ref(),
+                    ) {
                         current_provider_env_revision = provider_env_revision;
-                        ocsf_emit!(
-                            ConfigStateChangeBuilder::new(ocsf_ctx())
-                                .severity(SeverityId::Informational)
-                                .status(StatusId::Success)
-                                .state(StateId::Enabled, "loaded")
-                                .unmapped(
-                                    "provider_env_revision",
-                                    serde_json::json!(provider_env_revision)
-                                )
-                                .message(format!(
-                                    "Provider environment refreshed [revision:{provider_env_revision} env_count:{env_count}]"
-                                ))
-                                .build()
-                        );
                     }
                 }
                 Err(e) => {
@@ -4262,6 +4227,61 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
     }
 }
 
+/// Apply one complete provider-environment snapshot to the live credential state.
+///
+/// The caller remains responsible for serializing snapshots and deciding whether
+/// a failed application should be retried. Keeping transport outside this helper
+/// lets polling and supervisor-session updates share the same installation path.
+fn apply_provider_environment_snapshot(
+    provider_credentials: &ProviderCredentialState,
+    snapshot: openshell_core::grpc_client::ProviderEnvironmentResult,
+    sidecar_control_publisher: Option<&sidecar_control::Publisher>,
+) -> bool {
+    let provider_env_revision = snapshot.provider_env_revision;
+    let install_result = provider_credentials.install_bound_environment(
+        provider_env_revision,
+        snapshot.environment,
+        snapshot.credential_expires_at_ms,
+        snapshot.dynamic_credentials,
+        snapshot.static_credential_bindings,
+        snapshot.non_secret_environment_keys,
+    );
+    if let Err(error) = install_result {
+        ocsf_emit!(
+            ConfigStateChangeBuilder::new(ocsf_ctx())
+                .severity(SeverityId::High)
+                .status(StatusId::Failure)
+                .state(StateId::Disabled, "fail_closed")
+                .message(format!(
+                    "Rejected provider environment refresh; static provider credentials were revoked; fetched dynamic token grants remain active: {error}"
+                ))
+                .build()
+        );
+        return false;
+    }
+
+    let child_env = provider_credentials.child_env_with_gcp_resolved();
+    let env_count = child_env.len();
+    if let Some(publisher) = sidecar_control_publisher {
+        publisher.publish_provider_env(provider_env_revision, child_env);
+    }
+    ocsf_emit!(
+        ConfigStateChangeBuilder::new(ocsf_ctx())
+            .severity(SeverityId::Informational)
+            .status(StatusId::Success)
+            .state(StateId::Enabled, "loaded")
+            .unmapped(
+                "provider_env_revision",
+                serde_json::json!(provider_env_revision)
+            )
+            .message(format!(
+                "Provider environment refreshed [revision:{provider_env_revision} env_count:{env_count}]"
+            ))
+            .build()
+    );
+    true
+}
+
 fn apply_ocsf_json_setting(
     enabled: &AtomicBool,
     settings: &std::collections::HashMap<String, openshell_core::proto::EffectiveSetting>,
@@ -4495,6 +4515,35 @@ mod tests {
                 .proxy
                 .and_then(|proxy| proxy.http_addr)
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn provider_environment_snapshot_apply_installs_complete_snapshot() {
+        let provider_credentials =
+            ProviderCredentialState::from_child_env_snapshot(1, std::collections::HashMap::new());
+        let applied = apply_provider_environment_snapshot(
+            &provider_credentials,
+            openshell_core::grpc_client::ProviderEnvironmentResult {
+                environment: std::collections::HashMap::from([(
+                    "API_BASE".to_string(),
+                    "https://example.test".to_string(),
+                )]),
+                provider_env_revision: 7,
+                credential_expires_at_ms: std::collections::HashMap::new(),
+                dynamic_credentials: std::collections::HashMap::new(),
+                static_credential_bindings: std::collections::HashMap::new(),
+                non_secret_environment_keys: vec!["API_BASE".to_string()],
+            },
+            None,
+        );
+
+        assert!(applied);
+        let snapshot = provider_credentials.snapshot();
+        assert_eq!(snapshot.revision, 7);
+        assert_eq!(
+            snapshot.child_env.get("API_BASE").map(String::as_str),
+            Some("openshell:resolve:env:v7_API_BASE")
         );
     }
 

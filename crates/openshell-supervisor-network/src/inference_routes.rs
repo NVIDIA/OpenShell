@@ -363,25 +363,8 @@ pub fn spawn_route_refresh(
                         continue;
                     }
 
-                    let routes = bundle_to_resolved_routes(&bundle);
-                    let (user_routes, system_routes) = partition_routes(routes);
-                    ocsf_emit!(ConfigStateChangeBuilder::new(ocsf_ctx())
-                        .severity(SeverityId::Informational)
-                        .status(StatusId::Success)
-                        .state(StateId::Enabled, "updated")
-                        .unmapped("user_route_count", serde_json::json!(user_routes.len()))
-                        .unmapped("system_route_count", serde_json::json!(system_routes.len()))
-                        .unmapped("revision", serde_json::json!(&bundle.revision))
-                        .message(format!(
-                            "Inference routes updated [user_route_count:{} system_route_count:{} revision:{}]",
-                            user_routes.len(),
-                            system_routes.len(),
-                            bundle.revision
-                        ))
-                        .build());
-                    current_revision = Some(bundle.revision);
-                    *user_cache.write().await = user_routes;
-                    *system_cache.write().await = system_routes;
+                    current_revision =
+                        Some(apply_inference_bundle(&user_cache, &system_cache, bundle).await);
                 }
                 Err(e) => {
                     ocsf_emit!(ConfigStateChangeBuilder::new(ocsf_ctx())
@@ -397,6 +380,38 @@ pub fn spawn_route_refresh(
             }
         }
     });
+}
+
+/// Apply one complete inference bundle to the live user and system route caches.
+///
+/// Fetching and revision comparison stay with the caller so polling and future
+/// supervisor-session updates can share this cache-installation boundary.
+pub async fn apply_inference_bundle(
+    user_cache: &tokio::sync::RwLock<Vec<openshell_router::config::ResolvedRoute>>,
+    system_cache: &tokio::sync::RwLock<Vec<openshell_router::config::ResolvedRoute>>,
+    bundle: openshell_core::proto::GetInferenceBundleResponse,
+) -> String {
+    let routes = bundle_to_resolved_routes(&bundle);
+    let (user_routes, system_routes) = partition_routes(routes);
+    ocsf_emit!(
+        ConfigStateChangeBuilder::new(ocsf_ctx())
+            .severity(SeverityId::Informational)
+            .status(StatusId::Success)
+            .state(StateId::Enabled, "updated")
+            .unmapped("user_route_count", serde_json::json!(user_routes.len()))
+            .unmapped("system_route_count", serde_json::json!(system_routes.len()))
+            .unmapped("revision", serde_json::json!(&bundle.revision))
+            .message(format!(
+                "Inference routes updated [user_route_count:{} system_route_count:{} revision:{}]",
+                user_routes.len(),
+                system_routes.len(),
+                bundle.revision
+            ))
+            .build()
+    );
+    *user_cache.write().await = user_routes;
+    *system_cache.write().await = system_routes;
+    bundle.revision
 }
 
 #[cfg(test)]
@@ -487,6 +502,36 @@ mod tests {
 
         let routes = bundle_to_resolved_routes(&bundle);
         assert!(routes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn inference_bundle_apply_replaces_both_route_caches() {
+        let user_cache = tokio::sync::RwLock::new(Vec::new());
+        let system_cache = tokio::sync::RwLock::new(Vec::new());
+        let bundle = openshell_core::proto::GetInferenceBundleResponse {
+            routes: vec![
+                openshell_core::proto::ResolvedRoute {
+                    name: "inference.local".to_string(),
+                    base_url: "http://local.test/v1".to_string(),
+                    model_id: "local-model".to_string(),
+                    ..Default::default()
+                },
+                openshell_core::proto::ResolvedRoute {
+                    name: SANDBOX_SYSTEM_ROUTE_NAME.to_string(),
+                    base_url: "https://system.test/v1".to_string(),
+                    model_id: "system-model".to_string(),
+                    ..Default::default()
+                },
+            ],
+            revision: "revision-7".to_string(),
+            generated_at_ms: 0,
+        };
+
+        let revision = apply_inference_bundle(&user_cache, &system_cache, bundle).await;
+
+        assert_eq!(revision, "revision-7");
+        assert_eq!(user_cache.read().await[0].model, "local-model");
+        assert_eq!(system_cache.read().await[0].model, "system-model");
     }
 
     #[test]
