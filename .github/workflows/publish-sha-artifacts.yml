@@ -32,7 +32,7 @@ permissions:
 jobs:
   publish:
     name: Publish SHA artifact manifest
-    runs-on: linux-amd64-cpu8
+    runs-on: ubuntu-latest
     timeout-minutes: 15
     outputs:
       manifest_ref: ${{ steps.publish.outputs.manifest_ref }}
