@@ -41,6 +41,43 @@ The `openshell` package on PyPI provides the Python SDK only. It does not instal
 uv add openshell
 ```
 
+Curated SDK methods cover common sandbox workflows. For gateway RPCs that do
+not yet have a curated wrapper, `SandboxClient.raw` exposes the complete
+generated OpenShell service over the same authenticated channel. The public
+wire types are available from `openshell.raw`:
+
+```python
+import os
+
+from openshell import SandboxClient, raw
+
+with SandboxClient.from_active_cluster() as client:
+    response = client.raw.UpdateProvider(
+        raw.openshell_pb2.UpdateProviderRequest(
+            workspace="my-workspace",
+            provider=raw.datamodel_pb2.Provider(
+                metadata=raw.datamodel_pb2.ObjectMeta(
+                    name="user-token",
+                    workspace="my-workspace",
+                ),
+                credentials={"TOKEN": os.environ["USER_TOKEN"]},
+            ),
+        ),
+        timeout=30,
+    )
+```
+
+The raw layer returns protobuf messages verbatim. Prefer curated methods when
+available, pass an explicit timeout to raw calls, and keep the owning
+`SandboxClient` open for the lifetime of calls or streams. Exposing an RPC does
+not grant permission to invoke it; the gateway applies the same authentication
+and authorization checks to curated and raw calls.
+
+`SandboxClient.channel` exposes the same authenticated channel when an
+additional generated service client is needed, for example
+`raw.InferenceStub(client.channel)`. The `SandboxClient` continues to own that
+channel and its lifecycle.
+
 **Helm chart:**
 
 > **Experimental** — the Kubernetes deployment path is under active development. Expect rough edges and breaking changes.
