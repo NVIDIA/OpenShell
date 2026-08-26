@@ -290,6 +290,20 @@ openshell logs my-sandbox --tail --source sandbox --level warn
 openshell logs my-sandbox --since 5m
 ```
 
+### Recover from failed creation
+
+When an accepted sandbox reaches `Error`, its name remains reserved because the
+compute backend may still own resources. Inspect the failure and delete the
+sandbox explicitly before retrying the name:
+
+```bash
+openshell sandbox get my-sandbox
+openshell sandbox delete my-sandbox
+openshell sandbox create --name my-sandbox
+```
+
+Do not assume that an `Error` phase means the backend resource is gone.
+
 ### Delete sandboxes
 
 ```bash

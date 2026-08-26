@@ -229,6 +229,10 @@ Create a sandbox through the selected gateway, wait for readiness, then connect,
 | `--no-git-ignore` | Disable `.gitignore` filtering for `--upload` |
 | `[-- COMMAND...]` | Initial command (defaults to an interactive shell) |
 
+If the name already exists, the error includes its phase and condition reason
+when available. Inspect the existing sandbox and delete it explicitly before
+retrying the name.
+
 ### `openshell sandbox get [name]`
 
 Show sandbox details and the active policy. Metadata identifies sandbox or global policy source and the corresponding revision. The name defaults to the last-used sandbox.

@@ -891,31 +891,11 @@ impl ComputeRuntime {
         sandbox: Sandbox,
         sandbox_token: Option<String>,
     ) -> Result<Sandbox, Status> {
-        let _guard = self.sync_lock.lock().await;
-        self.create_sandbox_locked(sandbox, sandbox_token).await
-    }
-
-    pub(crate) async fn create_sandbox_with_sync_guard(
-        &self,
-        sandbox: Sandbox,
-        sandbox_token: Option<String>,
-    ) -> Result<Sandbox, Status> {
-        self.create_sandbox_locked(sandbox, sandbox_token).await
-    }
-
-    async fn create_sandbox_locked(
-        &self,
-        sandbox: Sandbox,
-        sandbox_token: Option<String>,
-    ) -> Result<Sandbox, Status> {
         let sandbox_id = sandbox.object_id().to_string();
         let mut driver_sandbox = driver_sandbox_from_public(&sandbox, &self.driver_info.name)
             .map_err(|status| *status)?;
 
-        self.remove_failed_sandbox_for_create(&sandbox).await?;
-
         // Create with MustCreate condition to prevent duplicate creation race
-        self.sandbox_index.update_from_sandbox(&sandbox);
         let mut sandbox = sandbox;
         let labels_map = sandbox.object_labels();
         let labels_json = if labels_map.as_ref().is_none_or(HashMap::is_empty) {
@@ -926,7 +906,7 @@ impl ComputeRuntime {
                     .map_err(|e| Status::internal(format!("failed to serialize labels: {e}")))?,
             )
         };
-        let result = self
+        let result = match self
             .store
             .put_if(
                 Sandbox::object_type(),
@@ -938,19 +918,30 @@ impl ComputeRuntime {
                 WriteCondition::MustCreate,
             )
             .await
-            .map_err(|e| {
-                if matches!(
-                    e,
-                    crate::persistence::PersistenceError::UniqueViolation { .. }
-                ) {
-                    Status::already_exists(format!(
-                        "sandbox '{}' already exists",
-                        sandbox.object_name()
-                    ))
-                } else {
-                    Status::internal(format!("persist sandbox failed: {e}"))
-                }
-            })?;
+        {
+            Ok(result) => result,
+            Err(crate::persistence::PersistenceError::UniqueViolation { .. }) => {
+                let message = self
+                    .store
+                    .get_message_by_name::<Sandbox>(
+                        sandbox.object_workspace(),
+                        sandbox.object_name(),
+                    )
+                    .await
+                    .ok()
+                    .flatten()
+                    .as_ref()
+                    .map_or_else(
+                        || format!("sandbox '{}' already exists", sandbox.object_name()),
+                        sandbox_already_exists_message,
+                    );
+                return Err(Status::already_exists(message));
+            }
+            Err(err) => {
+                return Err(Status::internal(format!("persist sandbox failed: {err}")));
+            }
+        };
+        self.sandbox_index.update_from_sandbox(&sandbox);
 
         if let Some(token) = sandbox_token
             && let Some(spec) = driver_sandbox.spec.as_mut()
@@ -1442,38 +1433,6 @@ impl ComputeRuntime {
                 debug!(sandbox_id, error = %err, "Skipped lifecycle rollback after concurrent change");
             }
         }
-    }
-
-    async fn remove_failed_sandbox_for_create(&self, sandbox: &Sandbox) -> Result<(), Status> {
-        let Some(record) = self
-            .store
-            .get_by_name(
-                Sandbox::object_type(),
-                sandbox.object_workspace(),
-                sandbox.object_name(),
-            )
-            .await
-            .map_err(|e| Status::internal(format!("fetch existing sandbox failed: {e}")))?
-        else {
-            return Ok(());
-        };
-        let existing = decode_sandbox_record(&record)
-            .map_err(|e| Status::internal(format!("decode existing sandbox failed: {e}")))?;
-        if SandboxPhase::try_from(existing.phase()).unwrap_or(SandboxPhase::Unknown)
-            != SandboxPhase::Error
-        {
-            return Ok(());
-        }
-
-        self.cleanup_sandbox_owned_records(&existing)
-            .await
-            .map_err(|e| Status::internal(format!("cleanup failed sandbox: {e}")))?;
-        self.store
-            .delete(Sandbox::object_type(), existing.object_id())
-            .await
-            .map_err(|e| Status::internal(format!("delete failed sandbox: {e}")))?;
-        self.cleanup_removed_sandbox_state(existing.object_id());
-        Ok(())
     }
 
     pub(crate) async fn delete_sandbox(
@@ -3453,6 +3412,32 @@ fn decode_sandbox_record(record: &ObjectRecord) -> Result<Sandbox, String> {
     Sandbox::decode(record.payload.as_slice()).map_err(|e| e.to_string())
 }
 
+fn sandbox_already_exists_message(sandbox: &Sandbox) -> String {
+    let phase = SandboxPhase::try_from(sandbox.phase()).unwrap_or(SandboxPhase::Unknown);
+    let reason = sandbox.status.as_ref().and_then(|status| {
+        status
+            .conditions
+            .iter()
+            .find(|condition| condition.r#type == "Ready" && !condition.reason.is_empty())
+            .map(|condition| condition.reason.as_str())
+    });
+
+    reason.map_or_else(
+        || {
+            format!(
+                "sandbox '{}' already exists (phase: {phase:?})",
+                sandbox.object_name()
+            )
+        },
+        |reason| {
+            format!(
+                "sandbox '{}' already exists (phase: {phase:?}, reason: {reason})",
+                sandbox.object_name()
+            )
+        },
+    )
+}
+
 fn sandbox_resource_version(sandbox: &Sandbox) -> u64 {
     sandbox
         .metadata
@@ -4093,6 +4078,7 @@ mod tests {
     struct TestDriver {
         listed_sandboxes: Vec<DriverSandbox>,
         current_sandboxes: Vec<DriverSandbox>,
+        create_calls: AtomicUsize,
     }
 
     #[tonic::async_trait]
@@ -4174,6 +4160,7 @@ mod tests {
             &self,
             _request: Request<CreateSandboxRequest>,
         ) -> Result<tonic::Response<CreateSandboxResponse>, Status> {
+            self.create_calls.fetch_add(1, Ordering::Relaxed);
             Ok(tonic::Response::new(CreateSandboxResponse {}))
         }
 
@@ -7580,6 +7567,7 @@ mod tests {
                 }),
                 workspace: "default".to_string(),
             }],
+            create_calls: AtomicUsize::new(0),
         }))
         .await;
 
@@ -7750,6 +7738,7 @@ mod tests {
                 })),
                 workspace: "default".to_string(),
             }],
+            create_calls: AtomicUsize::new(0),
         }))
         .await;
 
@@ -8488,22 +8477,41 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_sandbox_replaces_failed_same_name_without_waiting_for_deleted_event() {
-        let runtime = test_runtime(Arc::new(TestDriver::default())).await;
-        let failed = sandbox_record("sb-failed", "retryable-sandbox", SandboxPhase::Error);
+    async fn create_sandbox_preserves_failed_same_name_with_actionable_error() {
+        let driver = Arc::new(TestDriver::default());
+        let runtime = test_runtime(driver.clone()).await;
+        let mut failed = sandbox_record("sb-failed", "retryable-sandbox", SandboxPhase::Error);
+        failed.status = Some(SandboxStatus {
+            sandbox_name: "retryable-sandbox".to_string(),
+            conditions: vec![SandboxCondition {
+                r#type: "Ready".to_string(),
+                status: "False".to_string(),
+                reason: "ImagePullFailed".to_string(),
+                message: "image not found".to_string(),
+                last_transition_time: String::new(),
+            }],
+            ..Default::default()
+        });
+        failed.set_phase(SandboxPhase::Error as i32);
         runtime.store.put_message(&failed).await.unwrap();
+        runtime.sandbox_index.update_from_sandbox(&failed);
 
         let retry = sandbox_record("sb-retry", "retryable-sandbox", SandboxPhase::Provisioning);
-        let created = runtime.create_sandbox(retry, None).await.unwrap();
+        let error = runtime.create_sandbox(retry, None).await.unwrap_err();
 
-        assert_eq!(created.object_id(), "sb-retry");
+        assert_eq!(error.code(), Code::AlreadyExists);
+        assert_eq!(driver.create_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            error.message(),
+            "sandbox 'retryable-sandbox' already exists (phase: Error, reason: ImagePullFailed)"
+        );
         assert!(
             runtime
                 .store
                 .get_message::<Sandbox>("sb-failed")
                 .await
                 .unwrap()
-                .is_none()
+                .is_some()
         );
         assert!(
             runtime
@@ -8511,7 +8519,14 @@ mod tests {
                 .get_message::<Sandbox>("sb-retry")
                 .await
                 .unwrap()
-                .is_some()
+                .is_none()
+        );
+        assert_eq!(
+            runtime
+                .sandbox_index
+                .sandbox_id_for_sandbox_name("default", "retryable-sandbox")
+                .as_deref(),
+            Some("sb-failed")
         );
     }
 

@@ -2169,7 +2169,7 @@ fn pending_sandbox_snapshot_uses_docker_namespace_and_starting_condition() {
 }
 
 #[tokio::test]
-async fn failed_provisioning_removes_pending_sandbox_and_publishes_deleted() {
+async fn failed_provisioning_retains_terminal_snapshot_without_publishing_deleted() {
     let driver = test_driver_with_config(runtime_config());
     let sandbox = test_sandbox();
     let mut events = driver.events.subscribe();
@@ -2182,12 +2182,16 @@ async fn failed_provisioning_removes_pending_sandbox_and_publishes_deleted() {
         )
         .await;
 
-    assert!(
-        driver
-            .pending_snapshot(&sandbox.id, &sandbox.name)
-            .await
-            .is_none()
-    );
+    let retained = driver
+        .pending_snapshot(&sandbox.id, &sandbox.name)
+        .await
+        .expect("failed sandbox should remain queryable until explicit deletion");
+    let condition = retained
+        .status
+        .and_then(|status| status.conditions.into_iter().next())
+        .expect("failed sandbox should retain its terminal condition");
+    assert_eq!(condition.reason, "ImagePullFailed");
+    assert_eq!(condition.message, "image not found");
 
     let mut saw_error_snapshot = false;
     let mut deleted = false;
@@ -2208,11 +2212,11 @@ async fn failed_provisioning_removes_pending_sandbox_and_publishes_deleted() {
     }
     assert!(
         saw_error_snapshot,
-        "failed provisioning should publish the failure before deletion"
+        "failed provisioning should publish the terminal failure"
     );
     assert!(
-        deleted,
-        "failed provisioning should publish a deletion event"
+        !deleted,
+        "failed provisioning must not publish deletion before explicit cleanup"
     );
 }
 

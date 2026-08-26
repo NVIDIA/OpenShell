@@ -480,6 +480,16 @@ Every sandbox moves through a defined set of phases:
 | Error        | Something went wrong during provisioning or execution. Check logs with `openshell logs` for details.                                                           |
 | Deleting     | The sandbox is being torn down. The system releases resources and purges credentials.                                                                          |
 
+An accepted sandbox keeps its record and name if it reaches `Error`. Inspect
+the failure, delete the sandbox explicitly to clean up backend resources, and
+then retry the name:
+
+```shell
+openshell sandbox get my-sandbox
+openshell sandbox delete my-sandbox
+openshell sandbox create --name my-sandbox
+```
+
 The compute backend can become ready before the sandbox supervisor connects to
 the gateway. During this interval, the sandbox remains in `Provisioning` and
 reports a `Ready=False` condition with the reason `SupervisorNotConnected`.

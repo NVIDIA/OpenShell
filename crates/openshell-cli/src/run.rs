@@ -222,6 +222,19 @@ fn sandbox_should_persist(keep: bool, forward: Option<&ForwardSpec>) -> bool {
     keep || forward.is_some()
 }
 
+fn sandbox_already_exists_message(server_message: &str, sandbox_name: &str) -> String {
+    let sandbox_name = if sandbox_name.is_empty() {
+        "<name>"
+    } else {
+        sandbox_name
+    };
+    format!(
+        "{server_message}\n\n\
+         hint: inspect with: openshell sandbox get {sandbox_name}\n      \
+         delete with: openshell sandbox delete {sandbox_name}, then retry"
+    )
+}
+
 fn build_sandbox_resource_limits(
     cpu: Option<&str>,
     memory: Option<&str>,
@@ -535,14 +548,15 @@ pub async fn sandbox_create(
         annotations: HashMap::new(),
         workspace: workspace.to_string(),
     };
+    let requested_name = request.name.clone();
 
     let response = match client.create_sandbox(request).await {
         Ok(resp) => resp,
         Err(status) if status.code() == Code::AlreadyExists => {
-            return Err(miette::miette!(
-                "{}\n\nhint: delete it first with: openshell sandbox delete <name>\n      or use a different name",
-                status.message()
-            ));
+            return Err(miette::miette!(sandbox_already_exists_message(
+                status.message(),
+                &requested_name
+            )));
         }
         Err(status) => return Err(miette::miette!(status.to_string())),
     };
@@ -7135,8 +7149,8 @@ mod tests {
         parse_credential_pairs, parse_driver_config_json, parse_secret_material_env_pairs,
         policy_revision_to_json, provider_profile_allows_empty_credentials,
         provisioning_timeout_message, ready_false_condition_message, refresh_status_header,
-        refresh_status_row, resolve_from, sandbox_should_persist, sandbox_upload_plan,
-        service_expose_status_error, service_url_for_gateway,
+        refresh_status_row, resolve_from, sandbox_already_exists_message, sandbox_should_persist,
+        sandbox_upload_plan, service_expose_status_error, service_url_for_gateway,
     };
     use crate::TEST_ENV_LOCK;
     use crate::commands::common::progress_step_from_metadata;
@@ -7673,6 +7687,21 @@ mod tests {
     fn sandbox_should_persist_when_forward_is_requested() {
         let spec = openshell_core::forward::ForwardSpec::new(8080);
         assert!(sandbox_should_persist(false, Some(&spec)));
+    }
+
+    #[test]
+    fn sandbox_already_exists_message_names_inspect_and_delete_workflow() {
+        let message = sandbox_already_exists_message(
+            "sandbox 'demo' already exists (phase: Error, reason: ImagePullFailed)",
+            "demo",
+        );
+
+        assert_eq!(
+            message,
+            "sandbox 'demo' already exists (phase: Error, reason: ImagePullFailed)\n\n\
+             hint: inspect with: openshell sandbox get demo\n      \
+             delete with: openshell sandbox delete demo, then retry"
+        );
     }
 
     #[test]

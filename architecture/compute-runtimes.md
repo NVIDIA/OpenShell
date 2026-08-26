@@ -84,6 +84,18 @@ The gateway records driver identity and version from the startup capability
 response. Elevated gateway info reports that initialized driver snapshot instead
 of re-querying drivers on each request.
 
+## Creation Failure and Name Reuse
+
+The gateway store is authoritative for sandbox name reservations. Creating a
+sandbox with a reserved name returns `AlreadyExists` without calling the compute
+driver. The error includes the existing phase and condition reason when they are
+available.
+
+An `Error` phase describes the last reported state; it does not prove that the
+backend resource is absent. The gateway therefore retains failed sandbox records
+and does not replace them implicitly. Explicit deletion, or reconciliation that
+confirms backend absence, releases the name for reuse.
+
 ## Stop and Start Lifecycle
 
 The gateway persists lifecycle intent before mutating compute:

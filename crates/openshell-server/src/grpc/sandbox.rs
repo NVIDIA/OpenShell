@@ -243,7 +243,7 @@ async fn handle_create_sandbox_inner(
         .await?
         .ensure_active()?;
 
-    let sandbox_sync_guard = if spec.providers.is_empty() {
+    let _sandbox_sync_guard = if spec.providers.is_empty() {
         None
     } else {
         Some(state.compute.sandbox_sync_guard().await)
@@ -345,14 +345,7 @@ async fn handle_create_sandbox_inner(
         None => None,
     };
 
-    let sandbox = if sandbox_sync_guard.is_some() {
-        state
-            .compute
-            .create_sandbox_with_sync_guard(sandbox, sandbox_token)
-            .await?
-    } else {
-        state.compute.create_sandbox(sandbox, sandbox_token).await?
-    };
+    let sandbox = state.compute.create_sandbox(sandbox, sandbox_token).await?;
 
     info!(
         sandbox_id = %id,
