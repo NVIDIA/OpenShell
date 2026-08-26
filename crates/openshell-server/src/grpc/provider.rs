@@ -3057,12 +3057,12 @@ fn validate_provider_credential_keys(
     let declared_keys = profile
         .credentials
         .iter()
-        .flat_map(|credential| credential.env_vars.iter())
+        .flat_map(|credential| credential.accepted_stored_keys())
         .collect::<HashSet<_>>();
     let mut unknown_keys = provider
         .credentials
         .keys()
-        .filter(|key| !declared_keys.contains(key))
+        .filter(|key| !declared_keys.contains(key.as_str()))
         .cloned()
         .collect::<Vec<_>>();
     unknown_keys.sort();
@@ -3084,22 +3084,22 @@ fn validate_required_static_credentials(
 ) -> Result<(), Status> {
     let mut missing = Vec::new();
     for credential in profile.required_static_credentials() {
-        let supplied = credential.env_vars.iter().any(|key| {
+        let accepted_keys = credential.accepted_stored_keys();
+        let supplied = accepted_keys.iter().any(|key| {
             provider
                 .credentials
-                .get(key)
+                .get(*key)
                 .is_some_and(|value| !value.trim().is_empty())
-                || provider.credential_handles.contains_key(key)
+                || provider.credential_handles.contains_key(*key)
                 || pending_credentials
-                    .get(key)
+                    .get(*key)
                     .is_some_and(|value| !value.trim().is_empty())
         });
         if !supplied {
             missing.push(
-                credential
-                    .env_vars
+                accepted_keys
                     .first()
-                    .map_or_else(|| credential.name.clone(), Clone::clone),
+                    .map_or_else(|| credential.name.clone(), |key| (*key).to_string()),
             );
         }
     }
@@ -4846,6 +4846,7 @@ mod tests {
         ListProviderProfilesRequest, ListProvidersRequest, NetworkBinary, NetworkEndpoint,
         NetworkPolicyRule, ProviderCredentialRefresh, ProviderCredentialRefreshMaterial,
         ProviderCredentialTokenGrant, ProviderCredentialTokenGrantAudienceOverride,
+        ProviderCredentialTokenGrantSubjectToken, ProviderCredentialTokenGrantType,
         ProviderProfile, ProviderProfileCategory, ProviderProfileCredential,
         ProviderProfileImportItem, RotateProviderCredentialRequest, Sandbox, SandboxPolicy,
         SandboxSpec, StoredProviderProfile, UpdateProviderProfilesRequest, UpdateProviderRequest,
@@ -4868,6 +4869,40 @@ mod tests {
         assert!(!is_valid_env_key("BAD KEY"));
         assert!(!is_valid_env_key("X=Y"));
         assert!(!is_valid_env_key("X;rm -rf /"));
+    }
+
+    #[test]
+    fn create_validation_accepts_broker_only_credential_by_logical_name() {
+        let profile = ProviderTypeProfile::from_proto(&ProviderProfile {
+            id: "token-exchange".to_string(),
+            credentials: vec![
+                ProviderProfileCredential {
+                    name: "subject_token".to_string(),
+                    required: true,
+                    ..Default::default()
+                },
+                ProviderProfileCredential {
+                    name: "access_token".to_string(),
+                    token_grant: Some(ProviderCredentialTokenGrant {
+                        grant_type: ProviderCredentialTokenGrantType::TokenExchange as i32,
+                        subject_token: Some(ProviderCredentialTokenGrantSubjectToken {
+                            source: "provider_credential".to_string(),
+                            credential: "subject_token".to_string(),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        });
+        let provider = Provider {
+            credentials: HashMap::from([("subject_token".to_string(), "test-token".to_string())]),
+            ..Default::default()
+        };
+
+        validate_provider_create_credentials(&profile, &provider).unwrap();
     }
 
     #[test]
@@ -8343,6 +8378,94 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(result.get("OPENAI_API_KEY"), Some(&"sk-test".to_string()));
+    }
+
+    #[tokio::test]
+    async fn handle_create_provider_accepts_broker_only_subject_token() {
+        let mut state = test_server_state().await;
+        let config = state
+            .config
+            .clone()
+            .with_credential_drivers(["test-static"]);
+        let credentials = crate::credentials::CredentialRuntime::from_config(&config).unwrap();
+        let state_mut = Arc::get_mut(&mut state).unwrap();
+        state_mut.config = config;
+        state_mut.credentials = credentials;
+
+        let mut profile = custom_profile("spiffe-token-exchange-demo");
+        profile.credentials = vec![
+            ProviderProfileCredential {
+                name: "subject_token".to_string(),
+                description: "Broker-only subject token".to_string(),
+                required: true,
+                ..Default::default()
+            },
+            ProviderProfileCredential {
+                name: "access_token".to_string(),
+                required: false,
+                auth_style: "bearer".to_string(),
+                header_name: "Authorization".to_string(),
+                token_grant: Some(ProviderCredentialTokenGrant {
+                    grant_type: ProviderCredentialTokenGrantType::TokenExchange as i32,
+                    token_endpoint: "https://issuer.example.com/token".to_string(),
+                    jwt_svid_audience: "https://issuer.example.com".to_string(),
+                    client_assertion_type: "urn:ietf:params:oauth:client-assertion-type:jwt-bearer"
+                        .to_string(),
+                    subject_token: Some(ProviderCredentialTokenGrantSubjectToken {
+                        source: "provider_credential".to_string(),
+                        credential: "subject_token".to_string(),
+                        subject_token_type: "urn:ietf:params:oauth:token-type:access_token"
+                            .to_string(),
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        ];
+        profile.endpoints = vec![NetworkEndpoint {
+            host: "api.example.com".to_string(),
+            port: 443,
+            allow_uninspected_credentials: true,
+            ..Default::default()
+        }];
+        let imported = handle_import_provider_profiles(
+            &state,
+            authed_request(ImportProviderProfilesRequest {
+                profiles: vec![ProviderProfileImportItem {
+                    profile: Some(profile),
+                    source: "provider-profile.yaml".to_string(),
+                }],
+                workspace: "default".to_string(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert!(imported.imported, "diagnostics: {:?}", imported.diagnostics);
+
+        handle_create_provider(
+            &state,
+            authed_request(CreateProviderRequest {
+                provider: Some(provider_with_credential_value(
+                    "exchange",
+                    "spiffe-token-exchange-demo",
+                    "subject_token",
+                    "test-token",
+                )),
+                workspace: "default".to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+
+        let stored: Provider = state
+            .store
+            .get_message_by_name("default", "exchange")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(stored.credentials.is_empty());
+        assert!(stored.credential_handles.contains_key("subject_token"));
     }
 
     #[tokio::test]

@@ -82,22 +82,30 @@ fn draw_select_type(
         form.type_cursor,
         usize::from(chunks[2].height),
     );
-    let lines: Vec<Line<'_>> = form
-        .types
-        .iter()
-        .enumerate()
-        .skip(visible_range.start)
-        .take(visible_range.len())
-        .map(|(i, ty)| {
-            let is_cursor = i == form.type_cursor;
-            let marker = if is_cursor { ">" } else { " " };
-            let style = if is_cursor { t.accent } else { t.text };
-            Line::from(vec![
-                Span::styled(format!("  {marker} "), style),
-                Span::styled(ty.as_str(), style),
-            ])
-        })
-        .collect();
+    let lines: Vec<Line<'_>> = if form.types.is_empty() {
+        vec![Line::from(Span::styled(
+            form.status
+                .as_deref()
+                .unwrap_or("No provider profiles available."),
+            t.status_warn,
+        ))]
+    } else {
+        form.types
+            .iter()
+            .enumerate()
+            .skip(visible_range.start)
+            .take(visible_range.len())
+            .map(|(i, ty)| {
+                let is_cursor = i == form.type_cursor;
+                let marker = if is_cursor { ">" } else { " " };
+                let style = if is_cursor { t.accent } else { t.text };
+                Line::from(vec![
+                    Span::styled(format!("  {marker} "), style),
+                    Span::styled(ty.as_str(), style),
+                ])
+            })
+            .collect()
+    };
     frame.render_widget(Paragraph::new(lines), chunks[2]);
 
     let hint = Line::from(vec![

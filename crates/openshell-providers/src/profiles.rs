@@ -730,6 +730,21 @@ fn is_u64_zero(value: &u64) -> bool {
 }
 
 impl CredentialProfile {
+    /// Keys accepted when storing this credential on a provider.
+    ///
+    /// Workload-injectable credentials use their declared environment aliases.
+    /// Broker-only credentials have no environment aliases and use their
+    /// logical profile name instead.
+    #[must_use]
+    pub fn accepted_stored_keys(&self) -> Vec<&str> {
+        if self.env_vars.is_empty() {
+            let name = self.name.trim();
+            return (!name.is_empty()).then_some(name).into_iter().collect();
+        }
+
+        self.env_vars.iter().map(String::as_str).collect()
+    }
+
     #[must_use]
     pub fn is_runtime_resolvable(&self) -> bool {
         self.token_grant.is_some()
@@ -3067,6 +3082,31 @@ mod tests {
         assert_eq!(
             profile.credential_env_vars(),
             vec!["ANTHROPIC_API_KEY", "CLAUDE_API_KEY"]
+        );
+    }
+
+    #[test]
+    fn accepted_stored_keys_use_logical_name_for_broker_only_credentials() {
+        let profile = parse_profile_yaml(
+            r"
+id: token-exchange
+display_name: Token Exchange
+credentials:
+  - name: subject_token
+    required: true
+  - name: access_token
+    env_vars: [ACCESS_TOKEN, ACCESS_TOKEN_FALLBACK]
+",
+        )
+        .expect("profile");
+
+        assert_eq!(
+            profile.credentials[0].accepted_stored_keys(),
+            vec!["subject_token"]
+        );
+        assert_eq!(
+            profile.credentials[1].accepted_stored_keys(),
+            vec!["ACCESS_TOKEN", "ACCESS_TOKEN_FALLBACK"]
         );
     }
 

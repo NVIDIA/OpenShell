@@ -392,8 +392,10 @@ pub struct CreateProviderForm {
     pub generic_value: String,
     /// Which field is focused in the key entry form.
     pub key_field: ProviderKeyField,
-    /// True when the selected profile has no credential environment variables.
+    /// True when the selected profile has no accepted stored credential keys.
     pub is_generic: bool,
+    /// True when the selected profile permits creation without stored credentials.
+    pub allows_empty_credentials: bool,
     /// Status message (errors, validation).
     pub status: Option<String>,
     /// Warning shown at top of `EnterKey` modal (e.g. autodetect failure).
@@ -2384,6 +2386,18 @@ impl App {
     // ------------------------------------------------------------------
 
     fn open_create_provider_form(&mut self) {
+        let types = self.available_provider_profile_types();
+
+        self.create_provider_form = Some(CreateProviderForm {
+            types,
+            status: self.provider_profiles.is_empty().then(|| {
+                "Provider profiles unavailable. Wait for refresh, then retry.".to_string()
+            }),
+            ..CreateProviderForm::default()
+        });
+    }
+
+    fn available_provider_profile_types(&self) -> Vec<String> {
         let mut types = self
             .provider_profiles
             .iter()
@@ -2391,11 +2405,24 @@ impl App {
             .collect::<Vec<_>>();
         types.sort();
         types.dedup();
+        types
+    }
 
-        self.create_provider_form = Some(CreateProviderForm {
-            types,
-            ..CreateProviderForm::default()
-        });
+    pub(crate) fn sync_create_provider_types(&mut self) {
+        let types = self.available_provider_profile_types();
+        let Some(form) = self.create_provider_form.as_mut() else {
+            return;
+        };
+        if form.phase != CreateProviderPhase::SelectType {
+            return;
+        }
+
+        form.types = types;
+        form.type_cursor = form.type_cursor.min(form.types.len().saturating_sub(1));
+        form.status = form
+            .types
+            .is_empty()
+            .then(|| "Provider profiles unavailable. Wait for refresh, then retry.".to_string());
     }
 
     fn handle_create_provider_key(&mut self, key: KeyEvent) {
@@ -2415,7 +2442,13 @@ impl App {
                     form.type_cursor = form.type_cursor.saturating_sub(1);
                 }
                 KeyCode::Enter => {
-                    let selected = form.types[form.type_cursor].clone();
+                    let Some(selected) = form.types.get(form.type_cursor).cloned() else {
+                        form.status = Some(
+                            "Provider profiles unavailable. Wait for refresh, then retry."
+                                .to_string(),
+                        );
+                        return;
+                    };
                     let Some(profile) = self
                         .provider_profiles
                         .iter()
@@ -2426,20 +2459,31 @@ impl App {
                         return;
                     };
                     let profile = ProviderTypeProfile::from_proto(&profile);
-                    let env_vars = profile.credential_env_vars();
-                    form.is_generic = env_vars.is_empty();
-
-                    // Populate credential rows from all known env vars.
-                    form.credentials = env_vars
+                    let mut credential_keys = Vec::new();
+                    for key in profile
+                        .credentials
                         .iter()
-                        .map(|s| (s.to_string(), String::new()))
+                        .flat_map(|credential| credential.accepted_stored_keys())
+                    {
+                        if !credential_keys.iter().any(|existing| existing == key) {
+                            credential_keys.push(key.to_string());
+                        }
+                    }
+                    form.is_generic = credential_keys.is_empty();
+                    form.allows_empty_credentials = profile.allows_empty_provider_credentials();
+
+                    // Populate credential rows from all accepted storage keys,
+                    // including logical names for broker-only credentials.
+                    form.credentials = credential_keys
+                        .into_iter()
+                        .map(|key| (key, String::new()))
                         .collect();
                     form.cred_cursor = 0;
 
                     // Auto-generate a unique name.
                     form.name = unique_provider_name(&selected, &self.provider_names);
 
-                    if form.is_generic {
+                    if form.credentials.is_empty() {
                         // Credential-less profiles can be created directly.
                         form.discovered_credentials = Some(HashMap::new());
                         form.phase = CreateProviderPhase::Creating;
@@ -2488,7 +2532,12 @@ impl App {
                             form.phase = CreateProviderPhase::EnterKey;
                             form.key_field = ProviderKeyField::Name;
                             form.warning = Some(
-                                "No credentials found in environment. Enter manually.".to_string(),
+                                if form.allows_empty_credentials {
+                                    "No credentials found in environment. Enter credentials or submit without them."
+                                } else {
+                                    "No credentials found in environment. Enter manually."
+                                }
+                                .to_string(),
                             );
                             form.status = None;
                         }
@@ -2812,7 +2861,7 @@ impl App {
                                         creds.insert(name.clone(), value.clone());
                                     }
                                 }
-                                if creds.is_empty() {
+                                if creds.is_empty() && !form.allows_empty_credentials {
                                     form.status =
                                         Some("At least one credential is required.".to_string());
                                     return;
@@ -3528,6 +3577,117 @@ mod tests {
             "default".to_string(),
             crate::theme::Theme::dark(),
         )
+    }
+
+    fn provider_profile(
+        id: &str,
+        credentials: Vec<openshell_core::proto::ProviderProfileCredential>,
+    ) -> openshell_core::proto::ProviderProfile {
+        openshell_core::proto::ProviderProfile {
+            id: id.to_string(),
+            credentials,
+            ..Default::default()
+        }
+    }
+
+    fn credential(
+        name: &str,
+        env_vars: &[&str],
+        required: bool,
+        runtime_resolvable: bool,
+    ) -> openshell_core::proto::ProviderProfileCredential {
+        openshell_core::proto::ProviderProfileCredential {
+            name: name.to_string(),
+            env_vars: env_vars.iter().map(ToString::to_string).collect(),
+            required,
+            token_grant: runtime_resolvable.then(Default::default),
+            ..Default::default()
+        }
+    }
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    #[tokio::test]
+    async fn create_provider_enter_with_empty_profile_catalog_is_recoverable() {
+        let mut app = test_app();
+        app.open_create_provider_form();
+
+        app.handle_create_provider_key(key(KeyCode::Enter));
+
+        let form = app
+            .create_provider_form
+            .as_ref()
+            .expect("form remains open");
+        assert_eq!(form.phase, CreateProviderPhase::SelectType);
+        assert!(
+            form.status
+                .as_deref()
+                .is_some_and(|status| status.contains("profiles unavailable"))
+        );
+        assert!(!app.pending_provider_create);
+
+        app.provider_profiles = vec![provider_profile("recovered", Vec::new())];
+        app.sync_create_provider_types();
+        let form = app
+            .create_provider_form
+            .as_ref()
+            .expect("form remains open");
+        assert_eq!(form.types, vec!["recovered"]);
+        assert!(form.status.is_none());
+    }
+
+    #[tokio::test]
+    async fn create_provider_accepts_empty_credentials_when_profile_allows_them() {
+        for profile in [
+            provider_profile("policy-only", Vec::new()),
+            provider_profile(
+                "optional-static",
+                vec![credential("api_key", &["API_KEY"], false, false)],
+            ),
+            provider_profile(
+                "runtime-token",
+                vec![credential("access_token", &["ACCESS_TOKEN"], true, true)],
+            ),
+        ] {
+            let mut app = test_app();
+            app.provider_profiles = vec![profile];
+            app.open_create_provider_form();
+            app.handle_create_provider_key(key(KeyCode::Enter));
+
+            let form = app.create_provider_form.as_mut().expect("form");
+            if form.phase != CreateProviderPhase::Creating {
+                form.phase = CreateProviderPhase::EnterKey;
+                form.key_field = ProviderKeyField::Submit;
+                app.handle_create_provider_key(key(KeyCode::Enter));
+            }
+
+            let form = app.create_provider_form.as_ref().expect("form");
+            assert_eq!(form.phase, CreateProviderPhase::Creating);
+            assert_eq!(form.discovered_credentials, Some(HashMap::new()));
+            assert!(app.pending_provider_create);
+        }
+    }
+
+    #[tokio::test]
+    async fn create_provider_uses_logical_key_for_broker_only_credential() {
+        let mut app = test_app();
+        app.provider_profiles = vec![provider_profile(
+            "token-exchange",
+            vec![credential("subject_token", &[], true, false)],
+        )];
+        app.open_create_provider_form();
+
+        app.handle_create_provider_key(key(KeyCode::Enter));
+
+        let form = app.create_provider_form.as_ref().expect("form");
+        assert_eq!(form.phase, CreateProviderPhase::ChooseMethod);
+        assert_eq!(
+            form.credentials,
+            vec![("subject_token".to_string(), String::new())]
+        );
+        assert!(!form.allows_empty_credentials);
     }
 
     #[tokio::test]
