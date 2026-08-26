@@ -81,7 +81,17 @@ sidecar-mTLS profile reuses `ci/values-sidecar.yaml` and restores
 Job that runs `openshell-gateway generate-certs`) generates mTLS secrets on first
 install. Envoy Gateway opt-in; see the Optional Add-ons section below.
 
-The gateway Service uses ClusterIP. Access is via Envoy Gateway (port `8080`) or `kubectl port-forward`.
+The gateway Service uses ClusterIP. Access is via Envoy Gateway (port `8080`) or
+the local forwarding task:
+
+```bash
+mise run helm:k3s:forward
+```
+
+The task forwards the Kubernetes gateway to `http://127.0.0.1:8090`. A
+successful plaintext `helm:skaffold:run` or `helm:skaffold:run:sidecar`
+registers and selects the gateway under the worktree-specific k3d cluster name.
+Keep the forwarding task running while using the endpoint.
 
 **HA test deploy** (two gateway replicas + external PostgreSQL Secret): uncomment
 `#- ci/values-high-availability.yaml` in `deploy/helm/openshell/skaffold.yaml`,
@@ -99,19 +109,20 @@ plaintext by default. To test sidecar topology with TLS enabled, use
 | Skaffold dev (default) | `true` | `http://` |
 | TLS enabled | `false` (or omitted) | `https://` |
 
-### Connecting via port-forward
+### Connecting through the forwarding task
 
-Port `8080` is already bound by the k3d load balancer when Envoy Gateway is active, so
-the port-forward uses local port `8090` to avoid a collision:
+Port `8080` is already bound by the k3d load balancer when Envoy Gateway is
+active, so the forwarding task uses local port `8090` for the gateway. In a
+second terminal, confirm that the gateway is registered and active:
 
 ```bash
-KUBECONFIG=kubeconfig kubectl port-forward -n openshell svc/openshell 8090:8080
+openshell gateway list
 ```
 
 **Plaintext (default Skaffold deploy):**
 
 ```bash
-openshell sandbox list --gateway-endpoint http://localhost:8090
+openshell sandbox list
 ```
 
 **With mTLS enabled** — extract the client cert the PKI hook wrote to the cluster,

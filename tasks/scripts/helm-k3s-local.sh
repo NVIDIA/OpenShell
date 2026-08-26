@@ -38,6 +38,13 @@ PRELOAD_SANDBOX_IMAGE="${HELM_K3S_PRELOAD_SANDBOX_IMAGE-${DEFAULT_SANDBOX_PRELOA
 # exercise the v1alpha1 controller release.
 AGENT_SANDBOX_VERSION="${AGENT_SANDBOX_VERSION:-v0.5.0}"
 
+# Host endpoint registered for the Skaffold-deployed gateway. Derive the
+# gateway name from the worktree-specific cluster name so concurrent local
+# clusters do not overwrite each other's CLI metadata.
+GATEWAY_NAMESPACE="openshell"
+GATEWAY_HOST_PORT="${HELM_K3S_GATEWAY_HOST_PORT:-8090}"
+GATEWAY_NAME="${HELM_K3S_GATEWAY_NAME:-${CLUSTER_NAME}}"
+
 default_kubeconfig="${ROOT}/kubeconfig"
 if [[ -n "${HELM_K3S_KUBECONFIG:-}" ]]; then
   KUBECONFIG_TARGET="${HELM_K3S_KUBECONFIG}"
@@ -54,7 +61,7 @@ fi
 
 usage() {
   cat >&2 <<EOF
-usage: $(basename "$0") <create|delete|start|stop|status>
+usage: $(basename "$0") <create|delete|start|stop|status|register|forward>
 
 Environment:
   HELM_K3S_CLUSTER_NAME        k3d cluster name (default: openshell-dev-<branch-suffix>)
@@ -65,6 +72,9 @@ Environment:
   HELM_K3S_PRELOAD_SANDBOX_IMAGE
                                Sandbox image to docker pull and import into k3d
                                (default: ${DEFAULT_SANDBOX_PRELOAD_IMAGE}; set empty to skip)
+  HELM_K3S_GATEWAY_HOST_PORT   Host port forwarded to the gateway (default: 8090)
+  HELM_K3S_GATEWAY_NAME        CLI gateway registration name
+                               (default: worktree-specific k3d cluster name)
 
 macOS uses k3d from mise (Docker required). Linux can use this flow only when
 k3d is installed explicitly; otherwise use kind or an existing cluster context.
@@ -312,6 +322,50 @@ cmd_status() {
   k3d cluster list
 }
 
+register_local_gateway() {
+  local config_home openshell_dir gateway_dir endpoint
+
+  if [[ ! "${GATEWAY_NAME}" =~ ^[A-Za-z0-9._-]+$ ]]; then
+    echo "error: HELM_K3S_GATEWAY_NAME must contain only letters, numbers, dots, underscores, or dashes" >&2
+    return 2
+  fi
+
+  config_home="${XDG_CONFIG_HOME:-${HOME}/.config}"
+  openshell_dir="${config_home}/openshell"
+  gateway_dir="${openshell_dir}/gateways/${GATEWAY_NAME}"
+  endpoint="http://127.0.0.1:${GATEWAY_HOST_PORT}"
+
+  mkdir -p "${gateway_dir}"
+  chmod 700 "${gateway_dir}" 2>/dev/null || true
+  cat >"${gateway_dir}/metadata.json" <<EOF
+{
+  "name": "${GATEWAY_NAME}",
+  "gateway_endpoint": "${endpoint}",
+  "is_remote": false,
+  "gateway_port": ${GATEWAY_HOST_PORT},
+  "auth_mode": "plaintext"
+}
+EOF
+  chmod 600 "${gateway_dir}/metadata.json" 2>/dev/null || true
+  printf '%s' "${GATEWAY_NAME}" >"${openshell_dir}/active_gateway"
+  chmod 600 "${openshell_dir}/active_gateway" 2>/dev/null || true
+
+  echo "Registered and selected local gateway '${GATEWAY_NAME}' at ${endpoint}."
+}
+
+cmd_forward() {
+  require_supported_os
+  require_kubectl
+
+  echo "Forwarding gateway to http://127.0.0.1:${GATEWAY_HOST_PORT}"
+  echo "Press Ctrl-C to stop."
+  kubectl \
+    --kubeconfig="${KUBECONFIG_TARGET}" \
+    --context="$(k3d_context_name)" \
+    --namespace="${GATEWAY_NAMESPACE}" \
+    port-forward service/openshell "${GATEWAY_HOST_PORT}:8080"
+}
+
 main() {
   local sub="${1:-}"
   case "${sub}" in
@@ -320,6 +374,8 @@ main() {
     start) cmd_start ;;
     stop) cmd_stop ;;
     status) cmd_status ;;
+    register) register_local_gateway ;;
+    forward) cmd_forward ;;
     -h | --help | help | "") usage ; [[ -n "${sub}" ]] || exit 1 ;;
     *)
       echo "error: unknown command '${sub}'" >&2

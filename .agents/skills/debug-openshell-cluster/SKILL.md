@@ -435,10 +435,13 @@ kubectl -n openshell get endpoints openshell
 For local port-forward testing:
 
 ```bash
-kubectl -n openshell port-forward svc/openshell 8080:8080
-openshell gateway add http://127.0.0.1:8080 --local --name local
+mise run helm:k3s:forward
+openshell gateway list
 openshell status
 ```
+
+A successful plaintext `helm:skaffold:run` registers and selects the local
+gateway; the forwarding task does not modify gateway metadata.
 
 If the gateway is healthy but sandbox creation fails:
 
