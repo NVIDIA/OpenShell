@@ -69,8 +69,25 @@ jobs:
       cargo-version: ${{ needs.compute-versions.outputs.cargo_version }}
       auditable: true
 
+  build-cli:
+    needs: [compute-versions]
+    uses: ./.github/workflows/docker-build.yml
+    with:
+      component: cli
+      cargo-version: ${{ needs.compute-versions.outputs.cargo_version }}
+      auditable: true
+      platform: linux/amd64,linux/arm64
+
+  build-gateway-external:
+    needs: [compute-versions]
+    uses: ./.github/workflows/docker-build.yml
+    with:
+      component: gateway-external
+      cargo-version: ${{ needs.compute-versions.outputs.cargo_version }}
+      auditable: true
+
   e2e:
-    needs: [build-gateway, build-supervisor]
+    needs: [build-gateway, build-supervisor, build-cli, build-gateway-external]
     permissions:
       actions: read
       contents: read
@@ -79,6 +96,9 @@ jobs:
     with:
       image-tag: ${{ github.sha }}
       runner: linux-arm64-cpu8
+      cli-artifact-prefix: rust-binary-cli
+      gateway-artifact-prefix: rust-binary-gateway
+      external-gateway-artifact-prefix: rust-binary-gateway-external
 
   tag-ghcr-dev:
     name: Tag GHCR Images as Dev
