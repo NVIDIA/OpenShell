@@ -80,8 +80,9 @@ use tonic::{Request, Response, Status};
 use tracing::{debug, info, warn};
 
 use super::validation::{
-    level_matches, source_matches, validate_annotations, validate_no_reserved_provider_policy_keys,
-    validate_policy_safety, validate_static_fields_unchanged,
+    level_matches, source_matches, validate_and_canonicalize_policy, validate_annotations,
+    validate_no_reserved_provider_policy_keys, validate_policy_safety,
+    validate_static_fields_unchanged,
 };
 use super::{MAX_PAGE_SIZE, StoredSettingValue, StoredSettings, clamp_limit};
 use crate::persistence::current_time_ms;
@@ -99,6 +100,10 @@ pub const SANDBOX_SETTINGS_OBJECT_TYPE: &str = "sandbox_settings";
 const POLICY_SETTING_KEY: &str = "policy";
 /// Sentinel `sandbox_id` used to store global policy revisions.
 const GLOBAL_POLICY_SANDBOX_ID: &str = "__global__";
+/// Stable labels used when stored policy state fails validation.
+const STORED_POLICY_SOURCE_HISTORY: &str = "sandbox policy history";
+const STORED_POLICY_SOURCE_SPEC: &str = "sandbox spec policy";
+const STORED_POLICY_SOURCE_GLOBAL: &str = "global policy setting";
 /// Maximum number of optimistic retry attempts for policy version conflicts.
 const MERGE_RETRY_LIMIT: usize = 5;
 
@@ -1595,23 +1600,51 @@ async fn current_effective_policy_for_sandbox(
         .as_ref()
         .map(|spec| spec.providers.clone())
         .unwrap_or_default();
+    let global_settings = load_global_settings(state.store.as_ref()).await?;
+    let providers_v2_enabled =
+        bool_setting_enabled(&global_settings, settings::PROVIDERS_V2_ENABLED_KEY)?;
+    if let Some(global_policy) = decode_policy_from_global_settings(&global_settings)? {
+        // A global policy is the complete effective policy. Dormant sandbox
+        // history and specs may predate the current schema, but they must not
+        // prevent the valid global policy from being served.
+        return apply_effective_policy_context(
+            state,
+            catalog,
+            workspace,
+            &provider_names,
+            global_policy,
+            providers_v2_enabled,
+            PolicySource::Global,
+        )
+        .await;
+    }
+
     let policy = if let Some(record) = state
         .store
         .get_latest_policy(sandbox_id)
         .await
         .map_err(|e| Status::internal(format!("fetch latest policy failed: {e}")))?
     {
-        ProtoSandboxPolicy::decode(record.policy_payload.as_slice())
-            .map_err(|e| Status::internal(format!("decode current policy failed: {e}")))?
+        canonical_policy_record_identity(&record)?.0
     } else {
-        sandbox
-            .spec
-            .as_ref()
-            .and_then(|spec| spec.policy.clone())
-            .unwrap_or_default()
+        match sandbox.spec.as_ref().and_then(|spec| spec.policy.clone()) {
+            Some(policy) => {
+                validate_and_canonicalize_stored_policy(policy, STORED_POLICY_SOURCE_SPEC)?
+            }
+            None => ProtoSandboxPolicy::default(),
+        }
     };
 
-    effective_policy_for_source(state, catalog, workspace, &provider_names, policy).await
+    apply_effective_policy_context(
+        state,
+        catalog,
+        workspace,
+        &provider_names,
+        policy,
+        providers_v2_enabled,
+        PolicySource::Sandbox,
+    )
+    .await
 }
 
 async fn effective_policy_for_source(
@@ -1630,6 +1663,29 @@ async fn effective_policy_for_source(
         },
     );
 
+    let providers_v2_enabled =
+        bool_setting_enabled(&global_settings, settings::PROVIDERS_V2_ENABLED_KEY)?;
+    apply_effective_policy_context(
+        state,
+        catalog,
+        workspace,
+        provider_names,
+        policy,
+        providers_v2_enabled,
+        policy_source,
+    )
+    .await
+}
+
+async fn apply_effective_policy_context(
+    state: &ServerState,
+    catalog: &EffectiveProviderProfileCatalog,
+    workspace: &str,
+    provider_names: &[String],
+    mut policy: ProtoSandboxPolicy,
+    providers_v2_enabled: bool,
+    policy_source: PolicySource,
+) -> Result<ProtoSandboxPolicy, Status> {
     clear_provider_credentialed_markers(&mut policy);
     let mut provider_context = provider_policy_context_with_catalog(
         state.store.as_ref(),
@@ -1987,14 +2043,17 @@ pub(super) async fn current_base_policy_for_sandbox(
         .await
         .map_err(|e| Status::internal(format!("fetch latest policy failed: {e}")))?
     {
-        return ProtoSandboxPolicy::decode(record.policy_payload.as_slice())
-            .map_err(|e| Status::internal(format!("decode current policy failed: {e}")));
+        let (policy, _) = canonical_policy_record_identity(&record)?;
+        return Ok(policy);
     }
-    Ok(sandbox
+    sandbox
         .spec
         .as_ref()
         .and_then(|spec| spec.policy.clone())
-        .unwrap_or_default())
+        .map_or_else(
+            || Ok(ProtoSandboxPolicy::default()),
+            |policy| validate_and_canonicalize_stored_policy(policy, STORED_POLICY_SOURCE_SPEC),
+        )
 }
 
 pub(super) async fn validate_candidate_provider_attachments(
@@ -2327,26 +2386,46 @@ pub(super) async fn handle_get_sandbox_config(
         .snapshot_catalog(state.store.as_ref(), &workspace)
         .await?;
 
-    // Try to get the latest policy from the policy history table.
+    let global_settings = load_global_settings(state.store.as_ref()).await?;
+    let global_policy = decode_policy_from_global_settings(&global_settings)?;
+    let sandbox_settings =
+        load_sandbox_settings(state.store.as_ref(), &workspace, sandbox.object_name()).await?;
+    let providers_v2_enabled =
+        bool_setting_enabled(&global_settings, settings::PROVIDERS_V2_ENABLED_KEY)?;
+
+    let mut global_policy_version: u32 = 0;
+
+    // Try to get the latest policy from the policy history table. Under a
+    // global override, only the sandbox version metadata is observed; the
+    // dormant payload is neither decoded nor validated.
     let latest = state
         .store
         .get_latest_policy(&sandbox_id)
         .await
         .map_err(|e| Status::internal(format!("fetch policy history failed: {e}")))?;
 
-    let mut policy_source = PolicySource::Sandbox;
-    let (mut policy, mut version, mut policy_hash) = if let Some(record) = latest {
-        let decoded = ProtoSandboxPolicy::decode(record.policy_payload.as_slice())
-            .map_err(|e| Status::internal(format!("decode policy failed: {e}")))?;
+    let (mut policy, version, mut policy_hash, policy_source) = if let Some(global_policy) =
+        global_policy
+    {
+        let version = latest
+            .as_ref()
+            .map(|record| u32::try_from(record.version).unwrap_or(0))
+            .filter(|version| *version > 0)
+            .unwrap_or(1);
+        let hash = deterministic_policy_hash(&global_policy);
+        (Some(global_policy), version, hash, PolicySource::Global)
+    } else if let Some(record) = latest {
+        let (policy, hash) = canonical_policy_record_identity(&record)?;
         debug!(
             sandbox_id = %sandbox_id,
             version = record.version,
             "GetSandboxConfig served from policy history"
         );
         (
-            Some(decoded),
+            Some(policy),
             u32::try_from(record.version).unwrap_or(0),
-            record.policy_hash,
+            hash,
+            PolicySource::Sandbox,
         )
     } else {
         // Lazy backfill: no policy history exists yet.
@@ -2361,9 +2440,16 @@ pub(super) async fn handle_get_sandbox_config(
                     sandbox_id = %sandbox_id,
                     "GetSandboxConfig: no policy configured, returning empty response"
                 );
-                (None, 0, String::new())
+                (None, 0, String::new(), PolicySource::Sandbox)
             }
             Some(spec_policy) => {
+                // Stored specs may predate the current schema. Validate before
+                // creating policy history so malformed state is never copied or
+                // marked loaded, and hash the canonical representation.
+                let spec_policy = validate_and_canonicalize_stored_policy(
+                    spec_policy,
+                    STORED_POLICY_SOURCE_SPEC,
+                )?;
                 let hash = deterministic_policy_hash(&spec_policy);
                 let payload = spec_policy.encode_to_vec();
                 let policy_id = uuid::Uuid::new_v4().to_string();
@@ -2395,7 +2481,7 @@ pub(super) async fn handle_get_sandbox_config(
                     "GetSandboxConfig served from spec (backfilled version 1)"
                 );
 
-                (Some(spec_policy), 1, hash)
+                (Some(spec_policy), 1, hash, PolicySource::Sandbox)
             }
         }
     };
@@ -2411,22 +2497,13 @@ pub(super) async fn handle_get_sandbox_config(
     )
     .await?;
 
-    let mut global_policy_version: u32 = 0;
-
-    if let Some(global_policy) = decode_policy_from_global_settings(&global_settings)? {
-        policy = Some(global_policy.clone());
-        policy_hash = deterministic_policy_hash(&global_policy);
-        policy_source = PolicySource::Global;
-        if version == 0 {
-            version = 1;
-        }
-        if let Ok(Some(global_rev)) = state
+    if matches!(policy_source, PolicySource::Global)
+        && let Ok(Some(global_rev)) = state
             .store
             .get_latest_policy(GLOBAL_POLICY_SANDBOX_ID)
             .await
-        {
-            global_policy_version = u32::try_from(global_rev.version).unwrap_or(0);
-        }
+    {
+        global_policy_version = u32::try_from(global_rev.version).unwrap_or(0);
     }
 
     if let Some(source_policy) = policy.as_mut() {
@@ -2441,6 +2518,13 @@ pub(super) async fn handle_get_sandbox_config(
     {
         let effective_policy =
             compose_effective_policy(source_policy, &provider_policy_context.layers);
+        let effective_policy =
+            validate_and_canonicalize_policy(effective_policy).map_err(|error| {
+                Status::failed_precondition(format!(
+                    "provider composition produced an invalid effective policy: {}",
+                    error.message()
+                ))
+            })?;
         validate_policy_safety(&effective_policy).map_err(|error| {
             Status::failed_precondition(format!(
                 "provider composition produced an invalid effective policy: {}",
@@ -3234,6 +3318,7 @@ async fn handle_update_config_inner(
             })?;
             clear_provider_credentialed_markers(&mut new_policy);
             validate_no_reserved_provider_policy_keys(&new_policy)?;
+            new_policy = validate_and_canonicalize_policy(new_policy)?;
             validate_policy_safety(&new_policy)?;
             crate::middleware::validate_policy(state.middleware_registry.as_ref(), &new_policy)
                 .await?;
@@ -3254,7 +3339,7 @@ async fn handle_update_config_inner(
                 .map_err(|e| Status::internal(format!("fetch latest global policy failed: {e}")))?;
 
             if let Some(ref current) = latest
-                && current.policy_hash == hash
+                && canonical_policy_record_matches_for_deduplication(current, &hash)
                 && current.status == "loaded"
             {
                 let mut global_settings = load_global_settings(state.store.as_ref()).await?;
@@ -3626,14 +3711,16 @@ async fn handle_update_config_inner(
         validate_no_reserved_provider_policy_keys(&new_policy)?;
     }
 
-    let backfill_policy = if let Some(baseline_policy) = spec.policy.as_ref() {
+    let should_backfill_policy = if let Some(baseline_policy) = spec.policy.as_ref() {
         let comparable_baseline = baseline_policy.clone();
         validate_static_fields_unchanged(&comparable_baseline, &new_policy)?;
-        None
+        false
     } else {
-        Some(new_policy.clone())
+        true
     };
 
+    new_policy = validate_and_canonicalize_policy(new_policy)?;
+    let backfill_policy = should_backfill_policy.then(|| new_policy.clone());
     validate_policy_safety(&new_policy)?;
     crate::middleware::validate_policy(state.middleware_registry.as_ref(), &new_policy).await?;
     let provider_layers =
@@ -3687,7 +3774,7 @@ async fn handle_update_config_inner(
                 .map_err(|e| Status::internal(format!("fetch latest policy failed: {e}")))?;
 
             if let Some(ref current) = latest
-                && current.policy_hash == hash
+                && canonical_policy_record_matches_for_deduplication(current, &hash)
                 && current.provenance == req.annotations
             {
                 response_annotations = persist_existing_policy_projection(
@@ -3777,7 +3864,7 @@ async fn handle_update_config_inner(
     let hash = deterministic_policy_hash(&new_policy);
 
     if let Some(ref current) = latest
-        && current.policy_hash == hash
+        && canonical_policy_record_matches_for_deduplication(current, &hash)
     {
         return Ok(Response::new(UpdateConfigResponse {
             version: u32::try_from(current.version).unwrap_or(0),
@@ -3895,7 +3982,7 @@ pub(super) async fn handle_get_sandbox_policy_status(
     let record = record.ok_or_else(|| Status::not_found(not_found_msg))?;
 
     Ok(Response::new(GetSandboxPolicyStatusResponse {
-        revision: Some(policy_record_to_revision(&record, true)),
+        revision: Some(policy_record_to_revision(&record, true)?),
         active_version,
     }))
 }
@@ -3948,7 +4035,7 @@ pub(super) async fn handle_list_sandbox_policies(
     let revisions = records
         .iter()
         .map(|r| policy_record_to_revision(r, false))
-        .collect();
+        .collect::<Result<Vec<_>, Status>>()?;
 
     Ok(Response::new(ListSandboxPoliciesResponse { revisions }))
 }
@@ -5711,6 +5798,46 @@ fn deterministic_policy_hash(policy: &ProtoSandboxPolicy) -> String {
     hex::encode(Sha256::digest(canonical_policy_bytes(policy)))
 }
 
+/// Rebuilds a policy revision's identity from its checked canonical payload.
+///
+/// `PolicyRecord::policy_hash` is persisted metadata and cannot prove what the
+/// payload contains. Decode and validate every record before using its identity
+/// so legacy encodings deduplicate semantically and damaged rows fail closed.
+fn canonical_policy_record_identity(
+    record: &PolicyRecord,
+) -> Result<(ProtoSandboxPolicy, String), Status> {
+    let decoded = ProtoSandboxPolicy::decode(record.policy_payload.as_slice())
+        .map_err(|error| Status::internal(format!("decode policy revision failed: {error}")))?;
+    let policy = validate_and_canonicalize_stored_policy(decoded, STORED_POLICY_SOURCE_HISTORY)?;
+    let hash = deterministic_policy_hash(&policy);
+    Ok((policy, hash))
+}
+
+/// Compare a stored revision during no-op detection without blocking repair.
+///
+/// Invalid durable state remains unusable everywhere that loads or serves a
+/// policy. A full, already-validated replacement is different: treating an
+/// unreadable current row as non-matching lets the write path append a good
+/// revision instead of making the corrupt or legacy row permanently terminal.
+fn canonical_policy_record_matches_for_deduplication(
+    record: &PolicyRecord,
+    expected_hash: &str,
+) -> bool {
+    match canonical_policy_record_identity(record) {
+        Ok((_, hash)) => hash == expected_hash,
+        Err(error) => {
+            warn!(
+                policy_id = %record.id,
+                sandbox_id = %record.sandbox_id,
+                version = record.version,
+                error = %error,
+                "Invalid stored policy revision cannot satisfy deduplication; a valid replacement may proceed"
+            );
+            false
+        }
+    }
+}
+
 /// Compute a fingerprint for the effective sandbox configuration.
 fn compute_config_revision_with_validation_mode(
     policy: Option<&ProtoSandboxPolicy>,
@@ -5830,8 +5957,11 @@ fn draft_chunk_record_to_proto(record: &DraftChunkRecord) -> Result<PolicyChunk,
     })
 }
 
-fn policy_record_to_revision(record: &PolicyRecord, include_policy: bool) -> SandboxPolicyRevision {
-    let status = match record.status.as_str() {
+fn policy_record_to_revision(
+    record: &PolicyRecord,
+    include_policy: bool,
+) -> Result<SandboxPolicyRevision, Status> {
+    let stored_status = match record.status.as_str() {
         "pending" => PolicyStatus::Pending,
         "loaded" => PolicyStatus::Loaded,
         "failed" => PolicyStatus::Failed,
@@ -5839,21 +5969,49 @@ fn policy_record_to_revision(record: &PolicyRecord, include_policy: bool) -> San
         _ => PolicyStatus::Unspecified,
     };
 
-    let policy = if include_policy {
-        ProtoSandboxPolicy::decode(record.policy_payload.as_slice()).ok()
-    } else {
-        None
-    };
-
-    SandboxPolicyRevision {
-        version: u32::try_from(record.version).unwrap_or(0),
-        policy_hash: record.policy_hash.clone(),
-        status: status.into(),
-        load_error: record.load_error.clone().unwrap_or_default(),
-        created_at_ms: record.created_at_ms,
-        loaded_at_ms: record.loaded_at_ms.unwrap_or(0),
-        policy,
-        provenance: record.provenance.clone(),
+    match canonical_policy_record_identity(record) {
+        Ok((policy, policy_hash)) => Ok(SandboxPolicyRevision {
+            version: u32::try_from(record.version).unwrap_or(0),
+            policy_hash,
+            status: stored_status.into(),
+            load_error: record.load_error.clone().unwrap_or_default(),
+            created_at_ms: record.created_at_ms,
+            loaded_at_ms: record.loaded_at_ms.unwrap_or(0),
+            policy: include_policy.then_some(policy),
+            provenance: record.provenance.clone(),
+        }),
+        Err(error) if !include_policy => {
+            // History listing is a recovery surface, not an enforcement path.
+            // Preserve row metadata so one legacy or damaged payload cannot
+            // hide every usable revision in the page, but blank the untrusted
+            // hash and mark the projection failed. Detail and runtime callers
+            // still receive the hard error through the branch below.
+            let identity_error = format!(
+                "policy revision is invalid under the current schema: {}",
+                error.message()
+            );
+            let load_error = record.load_error.as_deref().map_or_else(
+                || identity_error.clone(),
+                |stored_error| {
+                    if stored_error.is_empty() {
+                        identity_error.clone()
+                    } else {
+                        format!("{stored_error}; {identity_error}")
+                    }
+                },
+            );
+            Ok(SandboxPolicyRevision {
+                version: u32::try_from(record.version).unwrap_or(0),
+                policy_hash: String::new(),
+                status: PolicyStatus::Failed.into(),
+                load_error,
+                created_at_ms: record.created_at_ms,
+                loaded_at_ms: record.loaded_at_ms.unwrap_or(0),
+                policy: None,
+                provenance: record.provenance.clone(),
+            })
+        }
+        Err(error) => Err(error),
     }
 }
 
@@ -6183,13 +6341,15 @@ fn validate_merge_operations_for_server(operations: &[PolicyMergeOp]) -> Result<
 
 fn map_policy_merge_error(error: openshell_policy::PolicyMergeError) -> Status {
     match error {
-        openshell_policy::PolicyMergeError::MissingRuleNameForAddRule
+        openshell_policy::PolicyMergeError::InvalidOperationPolicy { .. }
+        | openshell_policy::PolicyMergeError::MissingRuleNameForAddRule
         | openshell_policy::PolicyMergeError::EmptyAddRuleEndpoints { .. }
         | openshell_policy::PolicyMergeError::InvalidEndpointReference { .. }
         | openshell_policy::PolicyMergeError::UnsupportedAccessPreset { .. } => {
             Status::invalid_argument(error.to_string())
         }
-        openshell_policy::PolicyMergeError::McpContractConflict { .. }
+        openshell_policy::PolicyMergeError::InvalidInputPolicy { .. }
+        | openshell_policy::PolicyMergeError::McpContractConflict { .. }
         | openshell_policy::PolicyMergeError::NewBinaryWouldInheritAuthorization { .. }
         | openshell_policy::PolicyMergeError::ExistingBinariesWouldInheritAuthorization {
             ..
@@ -6203,6 +6363,9 @@ fn map_policy_merge_error(error: openshell_policy::PolicyMergeError) -> Status {
         | openshell_policy::PolicyMergeError::UnsupportedEndpointProtocol { .. }
         | openshell_policy::PolicyMergeError::EndpointHasNoAllowBase { .. } => {
             Status::failed_precondition(error.to_string())
+        }
+        openshell_policy::PolicyMergeError::InvalidMergedPolicy { .. } => {
+            Status::internal(error.to_string())
         }
     }
 }
@@ -6373,11 +6536,11 @@ async fn apply_merge_operations_with_retry(
             .await
             .map_err(|e| Status::internal(format!("fetch latest policy failed: {e}")))?;
 
-        let current_policy = if let Some(ref record) = latest {
-            ProtoSandboxPolicy::decode(record.policy_payload.as_slice())
-                .map_err(|e| Status::internal(format!("decode current policy failed: {e}")))?
+        let (current_policy, current_hash) = if let Some(ref record) = latest {
+            let (policy, hash) = canonical_policy_record_identity(record)?;
+            (policy, Some(hash))
         } else {
-            baseline_policy.cloned().unwrap_or_default()
+            (baseline_policy.cloned().unwrap_or_default(), None)
         };
 
         if let Some(expected_hash) = expected_current_effective_hash {
@@ -6421,7 +6584,7 @@ async fn apply_merge_operations_with_retry(
         }
 
         if let Some(ref current) = latest
-            && current.policy_hash == hash
+            && current_hash.as_deref() == Some(hash.as_str())
             && atomic_context.is_none_or(|context| current.provenance == *context.provenance)
         {
             return Ok((current.version, hash, None));
@@ -6809,7 +6972,23 @@ fn decode_policy_from_global_settings(
         .map_err(|e| Status::internal(format!("global policy decode failed: {e}")))?;
     let policy = ProtoSandboxPolicy::decode(raw.as_slice())
         .map_err(|e| Status::internal(format!("global policy protobuf decode failed: {e}")))?;
-    Ok(Some(policy))
+    validate_and_canonicalize_stored_policy(policy, STORED_POLICY_SOURCE_GLOBAL).map(Some)
+}
+
+/// Validate a decoded stored policy before it is trusted, hashed, or copied.
+///
+/// Stored rows may have been written by an older schema or damaged outside the
+/// normal request path. Treat invalid durable state as a failed precondition and
+/// return the canonical value so callers cannot accidentally reuse raw bytes.
+fn validate_and_canonicalize_stored_policy(
+    policy: ProtoSandboxPolicy,
+    source: &'static str,
+) -> Result<ProtoSandboxPolicy, Status> {
+    openshell_policy::validate_and_canonicalize_sandbox_policy(policy).map_err(|error| {
+        Status::failed_precondition(format!(
+            "stored policy source '{source}' is invalid: {error}"
+        ))
+    })
 }
 
 fn merge_effective_settings(
@@ -6939,6 +7118,980 @@ mod tests {
             }],
             ..Default::default()
         })
+    }
+
+    fn mcp_policy_with_versions(versions: &[&str]) -> ProtoSandboxPolicy {
+        let mut policy = openshell_policy::restrictive_default_policy();
+        policy.network_policies.insert(
+            "mcp".to_string(),
+            NetworkPolicyRule {
+                name: "mcp".to_string(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "mcp.example.com".to_string(),
+                    port: 443,
+                    protocol: "mcp".to_string(),
+                    rules: vec![L7Rule {
+                        allow: Some(openshell_core::proto::L7Allow {
+                            method: "tools/list".to_string(),
+                            ..Default::default()
+                        }),
+                    }],
+                    mcp: Some(openshell_core::proto::McpOptions {
+                        versions: versions.iter().map(ToString::to_string).collect(),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        policy
+    }
+
+    fn mcp_policy_without_options() -> ProtoSandboxPolicy {
+        let mut policy = mcp_policy_with_versions(&[]);
+        policy
+            .network_policies
+            .get_mut("mcp")
+            .expect("MCP test rule")
+            .endpoints
+            .first_mut()
+            .expect("MCP test endpoint")
+            .mcp = None;
+        policy
+    }
+
+    fn legacy_non_mcp_policy_with_mcp_options() -> ProtoSandboxPolicy {
+        let mut policy = mcp_policy_with_versions(&[]);
+        let endpoint = policy
+            .network_policies
+            .get_mut("mcp")
+            .expect("MCP test rule")
+            .endpoints
+            .first_mut()
+            .expect("MCP test endpoint");
+        endpoint.protocol = "rest".to_string();
+        endpoint.mcp = Some(openshell_core::proto::McpOptions {
+            strict_tool_names: Some(true),
+            ..Default::default()
+        });
+        policy
+    }
+
+    fn mcp_versions(policy: &ProtoSandboxPolicy) -> &[String] {
+        policy
+            .network_policies
+            .get("mcp")
+            .and_then(|rule| rule.endpoints.first())
+            .and_then(|endpoint| endpoint.mcp.as_ref())
+            .map(|mcp| mcp.versions.as_slice())
+            .expect("canonical MCP test endpoint options")
+    }
+
+    fn defaulted_mcp_policy_cases() -> [(&'static str, ProtoSandboxPolicy); 3] {
+        [
+            ("omitted-options", mcp_policy_without_options()),
+            ("empty-versions", mcp_policy_with_versions(&[])),
+            (
+                "explicit-default",
+                mcp_policy_with_versions(&["2025-11-25"]),
+            ),
+        ]
+    }
+
+    /// Install a global policy through the normal write path and return the
+    /// canonical value that subsequent read paths must serve.
+    async fn install_test_global_policy(state: &Arc<ServerState>) -> ProtoSandboxPolicy {
+        handle_update_config(
+            state,
+            with_user(Request::new(UpdateConfigRequest {
+                global: true,
+                policy: Some(mcp_policy_with_versions(&[])),
+                ..Default::default()
+            })),
+        )
+        .await
+        .expect("test global policy update must succeed");
+
+        let settings = load_global_settings(state.store.as_ref())
+            .await
+            .expect("test global settings lookup");
+        decode_policy_from_global_settings(&settings)
+            .expect("test global policy must decode")
+            .expect("test global policy must be present")
+    }
+
+    #[tokio::test]
+    async fn get_sandbox_config_rejects_invalid_spec_policy_before_history_backfill() {
+        let state = test_server_state().await;
+        let cases = [
+            (
+                "duplicate",
+                mcp_policy_with_versions(&["2025-11-25", "2025-11-25"]),
+            ),
+            ("unsupported", mcp_policy_with_versions(&["latest"])),
+        ];
+
+        for (case, policy) in cases {
+            let sandbox_id = format!("stored-invalid-{case}");
+            state
+                .store
+                .put_message(&test_sandbox(
+                    &sandbox_id,
+                    &format!("stored-invalid-{case}"),
+                    policy,
+                    Vec::new(),
+                ))
+                .await
+                .expect("store legacy sandbox spec");
+
+            let error = handle_get_sandbox_config(
+                &state,
+                with_sandbox(
+                    Request::new(GetSandboxConfigRequest {
+                        sandbox_id: sandbox_id.clone(),
+                    }),
+                    &sandbox_id,
+                ),
+            )
+            .await
+            .expect_err("invalid stored spec must fail before history backfill");
+
+            assert_eq!(error.code(), Code::FailedPrecondition, "{case}");
+            assert!(
+                error.message().contains(STORED_POLICY_SOURCE_SPEC),
+                "{case}"
+            );
+            assert!(
+                state
+                    .store
+                    .get_latest_policy(&sandbox_id)
+                    .await
+                    .expect("policy history lookup")
+                    .is_none(),
+                "{case} must not create policy history"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn get_sandbox_config_backfills_canonical_spec_policy_bytes_and_hash() {
+        let state = test_server_state().await;
+        let sandbox_id = "stored-canonical-backfill";
+        let raw = mcp_policy_with_versions(&["2025-11-25", "2025-03-26", "2025-06-18"]);
+        let canonical = validate_and_canonicalize_policy(raw.clone())
+            .expect("supported stored MCP policy must canonicalize");
+        state
+            .store
+            .put_message(&test_sandbox(
+                sandbox_id,
+                "stored-canonical-backfill",
+                raw,
+                Vec::new(),
+            ))
+            .await
+            .expect("store legacy sandbox spec");
+
+        let response = handle_get_sandbox_config(
+            &state,
+            with_sandbox(
+                Request::new(GetSandboxConfigRequest {
+                    sandbox_id: sandbox_id.to_string(),
+                }),
+                sandbox_id,
+            ),
+        )
+        .await
+        .expect("valid stored spec must backfill")
+        .into_inner();
+
+        let canonical_hash = deterministic_policy_hash(&canonical);
+        assert_eq!(response.policy.as_ref(), Some(&canonical));
+        assert_eq!(response.policy_hash, canonical_hash);
+        assert_eq!(response.version, 1);
+
+        let persisted = state
+            .store
+            .get_latest_policy(sandbox_id)
+            .await
+            .expect("policy history lookup")
+            .expect("canonical history revision");
+        assert_eq!(persisted.policy_payload, canonical.encode_to_vec());
+        assert_eq!(persisted.policy_hash, canonical_hash);
+        assert_eq!(persisted.status, "loaded");
+    }
+
+    #[tokio::test]
+    async fn get_sandbox_config_backfills_defaulted_mcp_policy_as_canonical_bytes_and_hash() {
+        let state = test_server_state().await;
+        let canonical = validate_and_canonicalize_policy(mcp_policy_with_versions(&["2025-11-25"]))
+            .expect("explicit default MCP policy must canonicalize");
+        assert_eq!(mcp_versions(&canonical), &["2025-11-25".to_string()]);
+        let canonical_payload = canonical.encode_to_vec();
+        let canonical_hash = deterministic_policy_hash(&canonical);
+        let cases = [
+            ("omitted-options", mcp_policy_without_options()),
+            ("empty-versions", mcp_policy_with_versions(&[])),
+            (
+                "explicit-default",
+                mcp_policy_with_versions(&["2025-11-25"]),
+            ),
+        ];
+
+        for (case, raw) in cases {
+            let sandbox_id = format!("stored-default-{case}");
+            state
+                .store
+                .put_message(&test_sandbox(&sandbox_id, &sandbox_id, raw, Vec::new()))
+                .await
+                .expect("store legacy sandbox spec");
+
+            let response = handle_get_sandbox_config(
+                &state,
+                with_sandbox(
+                    Request::new(GetSandboxConfigRequest {
+                        sandbox_id: sandbox_id.clone(),
+                    }),
+                    &sandbox_id,
+                ),
+            )
+            .await
+            .expect("defaulted stored spec must backfill")
+            .into_inner();
+
+            assert_eq!(response.policy.as_ref(), Some(&canonical), "{case}");
+            assert_eq!(response.policy_hash, canonical_hash, "{case}");
+            assert_eq!(response.version, 1, "{case}");
+            assert_eq!(
+                mcp_versions(response.policy.as_ref().expect("backfilled policy")),
+                &["2025-11-25".to_string()],
+                "{case}"
+            );
+
+            let persisted = state
+                .store
+                .get_latest_policy(&sandbox_id)
+                .await
+                .expect("policy history lookup")
+                .expect("canonical history revision");
+            assert_eq!(persisted.policy_payload, canonical_payload, "{case}");
+            assert_eq!(persisted.policy_hash, canonical_hash, "{case}");
+            assert_eq!(persisted.status, "loaded", "{case}");
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_defaulted_mcp_policy_canonicalizes_for_current_base_and_history_export() {
+        let store = test_store().await;
+        let canonical = validate_and_canonicalize_policy(mcp_policy_with_versions(&["2025-11-25"]))
+            .expect("explicit default MCP policy must canonicalize");
+        let canonical_hash = deterministic_policy_hash(&canonical);
+        let cases = [
+            ("omitted-options", mcp_policy_without_options()),
+            ("empty-versions", mcp_policy_with_versions(&[])),
+            (
+                "explicit-default",
+                mcp_policy_with_versions(&["2025-11-25"]),
+            ),
+        ];
+
+        for (case, raw) in cases {
+            let sandbox_id = format!("legacy-default-history-{case}");
+            let sandbox = test_sandbox(&sandbox_id, &sandbox_id, raw.clone(), Vec::new());
+
+            let spec_base = current_base_policy_for_sandbox(&store, &sandbox)
+                .await
+                .expect("legacy spec policy must canonicalize");
+            assert_eq!(spec_base, canonical, "{case}");
+            assert_eq!(
+                mcp_versions(&spec_base),
+                &["2025-11-25".to_string()],
+                "{case}"
+            );
+
+            store
+                .put_policy_revision(
+                    &format!("legacy-default-history-revision-{case}"),
+                    &sandbox_id,
+                    "default",
+                    1,
+                    &raw.encode_to_vec(),
+                    "legacy-uncanonicalized-hash",
+                )
+                .await
+                .expect("store legacy policy history");
+
+            let history_base = current_base_policy_for_sandbox(&store, &sandbox)
+                .await
+                .expect("legacy history policy must canonicalize");
+            assert_eq!(history_base, canonical, "{case}");
+
+            let record = store
+                .get_latest_policy(&sandbox_id)
+                .await
+                .expect("policy history lookup")
+                .expect("legacy policy history");
+            let revision = policy_record_to_revision(&record, true)
+                .expect("legacy history export must canonicalize");
+            assert_eq!(revision.policy_hash, canonical_hash, "{case}");
+            let exported = revision.policy.expect("exported history policy");
+            assert_eq!(exported, canonical, "{case}");
+            assert_eq!(
+                mcp_versions(&exported),
+                &["2025-11-25".to_string()],
+                "{case}"
+            );
+
+            let listed = policy_record_to_revision(&record, false)
+                .expect("legacy history list projection must canonicalize");
+            assert_eq!(listed.policy_hash, canonical_hash, "{case}");
+            assert!(listed.policy.is_none(), "{case}");
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_legacy_latest_history_fails_closed_but_remains_listable() {
+        let state = test_server_state().await;
+        let sandbox_id = "stored-invalid-history";
+        let valid = validate_and_canonicalize_policy(mcp_policy_with_versions(&[]))
+            .expect("valid history policy must canonicalize");
+        let valid_hash = deterministic_policy_hash(&valid);
+        state
+            .store
+            .put_message(&test_sandbox(
+                sandbox_id,
+                "stored-invalid-history",
+                valid.clone(),
+                Vec::new(),
+            ))
+            .await
+            .expect("store sandbox");
+        state
+            .store
+            .put_policy_revision(
+                "stored-valid-history-revision",
+                sandbox_id,
+                "default",
+                1,
+                &valid.encode_to_vec(),
+                &valid_hash,
+            )
+            .await
+            .expect("store valid history");
+        let invalid = legacy_non_mcp_policy_with_mcp_options();
+        state
+            .store
+            .put_policy_revision(
+                "stored-invalid-history-revision",
+                sandbox_id,
+                "default",
+                2,
+                &invalid.encode_to_vec(),
+                "uncanonicalized-hash",
+            )
+            .await
+            .expect("store legacy invalid history");
+
+        let error = handle_get_sandbox_config(
+            &state,
+            with_sandbox(
+                Request::new(GetSandboxConfigRequest {
+                    sandbox_id: sandbox_id.to_string(),
+                }),
+                sandbox_id,
+            ),
+        )
+        .await
+        .expect_err("invalid latest history must fail closed");
+
+        assert_eq!(error.code(), Code::FailedPrecondition);
+        assert!(error.message().contains(STORED_POLICY_SOURCE_HISTORY));
+
+        let record = state
+            .store
+            .get_latest_policy(sandbox_id)
+            .await
+            .expect("policy history lookup")
+            .expect("invalid policy history");
+        let listed_invalid = policy_record_to_revision(&record, false)
+            .expect("list projection must preserve invalid legacy history metadata");
+        assert_eq!(listed_invalid.version, 2);
+        assert_eq!(listed_invalid.status, PolicyStatus::Failed as i32);
+        assert!(listed_invalid.policy_hash.is_empty());
+        assert!(listed_invalid.policy.is_none());
+        assert!(
+            listed_invalid
+                .load_error
+                .contains(STORED_POLICY_SOURCE_HISTORY)
+        );
+
+        let detail_error = handle_get_sandbox_policy_status(
+            &state,
+            with_user(Request::new(GetSandboxPolicyStatusRequest {
+                name: "stored-invalid-history".to_string(),
+                version: 2,
+                ..Default::default()
+            })),
+        )
+        .await
+        .expect_err("invalid history detail must remain fail-closed");
+        assert_eq!(detail_error.code(), Code::FailedPrecondition);
+        assert!(
+            detail_error
+                .message()
+                .contains(STORED_POLICY_SOURCE_HISTORY)
+        );
+
+        let listed = handle_list_sandbox_policies(
+            &state,
+            with_user(Request::new(ListSandboxPoliciesRequest {
+                name: "stored-invalid-history".to_string(),
+                limit: 10,
+                ..Default::default()
+            })),
+        )
+        .await
+        .expect("one invalid revision must not hide the rest of the history")
+        .into_inner();
+
+        assert_eq!(listed.revisions.len(), 2);
+        assert_eq!(listed.revisions[0], listed_invalid);
+        assert_eq!(listed.revisions[1].version, 1);
+        assert_eq!(listed.revisions[1].policy_hash, valid_hash);
+        assert_eq!(listed.revisions[1].status, PolicyStatus::Pending as i32);
+        assert!(listed.revisions[1].load_error.is_empty());
+        assert!(listed.revisions[1].policy.is_none());
+    }
+
+    #[tokio::test]
+    async fn valid_global_policy_overrides_invalid_legacy_history() {
+        let state = test_server_state().await;
+        let global_policy = install_test_global_policy(&state).await;
+        let sandbox_id = "global-overrides-invalid-history";
+        let sandbox = test_sandbox(
+            sandbox_id,
+            sandbox_id,
+            ProtoSandboxPolicy::default(),
+            Vec::new(),
+        );
+        state
+            .store
+            .put_message(&sandbox)
+            .await
+            .expect("store sandbox");
+
+        let invalid = legacy_non_mcp_policy_with_mcp_options();
+        state
+            .store
+            .put_policy_revision(
+                "global-overrides-invalid-history-revision",
+                sandbox_id,
+                "default",
+                2,
+                &invalid.encode_to_vec(),
+                "untrusted-legacy-hash",
+            )
+            .await
+            .expect("store invalid legacy policy history");
+
+        let response = handle_get_sandbox_config(
+            &state,
+            with_sandbox(
+                Request::new(GetSandboxConfigRequest {
+                    sandbox_id: sandbox_id.to_string(),
+                }),
+                sandbox_id,
+            ),
+        )
+        .await
+        .expect("valid global policy must override invalid local history")
+        .into_inner();
+
+        assert_eq!(response.policy.as_ref(), Some(&global_policy));
+        assert_eq!(
+            response.policy_hash,
+            deterministic_policy_hash(&global_policy)
+        );
+        assert_eq!(response.policy_source, PolicySource::Global as i32);
+        assert_eq!(response.version, 2);
+        assert_eq!(response.global_policy_version, 1);
+
+        let catalog = state
+            .provider_profile_sources
+            .snapshot_catalog(state.store.as_ref(), "default")
+            .await
+            .expect("provider profile catalog");
+        let effective = current_effective_policy_for_sandbox(
+            state.as_ref(),
+            &catalog,
+            "default",
+            &sandbox,
+            sandbox_id,
+        )
+        .await
+        .expect("effective-policy lookup must bypass invalid local history");
+        assert_eq!(effective, global_policy);
+    }
+
+    #[tokio::test]
+    async fn valid_global_policy_overrides_invalid_legacy_spec_without_backfill() {
+        let state = test_server_state().await;
+        let global_policy = install_test_global_policy(&state).await;
+        let sandbox_id = "global-overrides-invalid-spec";
+        let sandbox = test_sandbox(
+            sandbox_id,
+            sandbox_id,
+            legacy_non_mcp_policy_with_mcp_options(),
+            Vec::new(),
+        );
+        state
+            .store
+            .put_message(&sandbox)
+            .await
+            .expect("store sandbox with invalid legacy spec");
+
+        let response = handle_get_sandbox_config(
+            &state,
+            with_sandbox(
+                Request::new(GetSandboxConfigRequest {
+                    sandbox_id: sandbox_id.to_string(),
+                }),
+                sandbox_id,
+            ),
+        )
+        .await
+        .expect("valid global policy must override invalid local spec")
+        .into_inner();
+
+        assert_eq!(response.policy.as_ref(), Some(&global_policy));
+        assert_eq!(
+            response.policy_hash,
+            deterministic_policy_hash(&global_policy)
+        );
+        assert_eq!(response.policy_source, PolicySource::Global as i32);
+        assert_eq!(response.version, 1);
+        assert_eq!(response.global_policy_version, 1);
+        assert!(
+            state
+                .store
+                .get_latest_policy(sandbox_id)
+                .await
+                .expect("policy history lookup")
+                .is_none(),
+            "global override must not backfill invalid dormant spec state"
+        );
+
+        let catalog = state
+            .provider_profile_sources
+            .snapshot_catalog(state.store.as_ref(), "default")
+            .await
+            .expect("provider profile catalog");
+        let effective = current_effective_policy_for_sandbox(
+            state.as_ref(),
+            &catalog,
+            "default",
+            &sandbox,
+            sandbox_id,
+        )
+        .await
+        .expect("effective-policy lookup must bypass invalid local spec");
+        assert_eq!(effective, global_policy);
+        assert!(
+            state
+                .store
+                .get_latest_policy(sandbox_id)
+                .await
+                .expect("policy history lookup")
+                .is_none(),
+            "effective-policy lookup must not create policy history"
+        );
+    }
+
+    #[tokio::test]
+    async fn canonical_mcp_version_order_produces_identical_policy_bytes_and_hashes() {
+        let state = test_server_state().await;
+        let forward = mcp_policy_with_versions(&["2025-03-26", "2025-06-18", "2025-11-25"]);
+        let forward =
+            validate_and_canonicalize_policy(forward).expect("forward policy must validate");
+        let reverse = mcp_policy_with_versions(&["2025-11-25", "2025-06-18", "2025-03-26"]);
+        let reverse =
+            validate_and_canonicalize_policy(reverse).expect("reverse policy must validate");
+
+        assert_eq!(forward.encode_to_vec(), reverse.encode_to_vec());
+        assert_eq!(
+            deterministic_policy_hash(&forward),
+            deterministic_policy_hash(&reverse)
+        );
+
+        handle_update_config(
+            &state,
+            with_user(Request::new(UpdateConfigRequest {
+                global: true,
+                policy: Some(mcp_policy_with_versions(&[
+                    "2025-11-25",
+                    "2025-06-18",
+                    "2025-03-26",
+                ])),
+                ..Default::default()
+            })),
+        )
+        .await
+        .expect("global policy ingress must accept supported versions");
+
+        let persisted = state
+            .store
+            .get_latest_policy(GLOBAL_POLICY_SANDBOX_ID)
+            .await
+            .expect("global policy lookup")
+            .expect("global policy revision");
+        assert_eq!(persisted.policy_payload, forward.encode_to_vec());
+        assert_eq!(persisted.policy_hash, deterministic_policy_hash(&forward));
+    }
+
+    #[tokio::test]
+    async fn global_policy_ingress_persists_defaulted_mcp_versions_identically() {
+        let state = test_server_state().await;
+        let canonical = mcp_policy_with_versions(&["2025-11-25"]);
+        let canonical = validate_and_canonicalize_policy(canonical)
+            .expect("explicit default MCP policy must canonicalize");
+        let canonical_payload = canonical.encode_to_vec();
+        let canonical_hash = deterministic_policy_hash(&canonical);
+        let cases = [
+            ("omitted-options", mcp_policy_without_options()),
+            ("empty-versions", mcp_policy_with_versions(&[])),
+            (
+                "explicit-default",
+                mcp_policy_with_versions(&["2025-11-25"]),
+            ),
+        ];
+
+        for (case, policy) in cases {
+            let response = handle_update_config(
+                &state,
+                with_user(Request::new(UpdateConfigRequest {
+                    global: true,
+                    policy: Some(policy),
+                    ..Default::default()
+                })),
+            )
+            .await
+            .expect("defaulted global policy ingress must succeed")
+            .into_inner();
+
+            assert_eq!(response.version, 1, "{case}");
+            assert_eq!(response.policy_hash, canonical_hash, "{case}");
+            let persisted = state
+                .store
+                .get_latest_policy(GLOBAL_POLICY_SANDBOX_ID)
+                .await
+                .expect("global policy lookup")
+                .expect("global policy revision");
+            assert_eq!(persisted.policy_payload, canonical_payload, "{case}");
+            assert_eq!(persisted.policy_hash, canonical_hash, "{case}");
+
+            let global_settings = load_global_settings(state.store.as_ref())
+                .await
+                .expect("global settings lookup");
+            let stored_policy = decode_policy_from_global_settings(&global_settings)
+                .expect("stored global policy must decode")
+                .expect("stored global policy");
+            assert_eq!(stored_policy, canonical, "{case}");
+            assert_eq!(
+                mcp_versions(&stored_policy),
+                &["2025-11-25".to_string()],
+                "{case}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn policy_record_identity_global_deduplicates_defaulted_mcp_history() {
+        for (case, legacy_policy) in defaulted_mcp_policy_cases() {
+            let state = test_server_state().await;
+            let canonical = mcp_policy_with_versions(&["2025-11-25"]);
+            let canonical = validate_and_canonicalize_policy(canonical)
+                .expect("explicit default MCP policy must canonicalize");
+            let canonical_hash = deterministic_policy_hash(&canonical);
+
+            state
+                .store
+                .put_policy_revision(
+                    &format!("global-legacy-default-{case}"),
+                    GLOBAL_POLICY_SANDBOX_ID,
+                    "",
+                    1,
+                    &legacy_policy.encode_to_vec(),
+                    "untrusted-legacy-hash",
+                )
+                .await
+                .expect("store legacy global policy revision");
+            state
+                .store
+                .update_policy_status(
+                    GLOBAL_POLICY_SANDBOX_ID,
+                    1,
+                    "loaded",
+                    None,
+                    Some(current_time_ms()),
+                )
+                .await
+                .expect("mark legacy global policy loaded");
+
+            let response = handle_update_config(
+                &state,
+                with_user(Request::new(UpdateConfigRequest {
+                    global: true,
+                    policy: Some(mcp_policy_with_versions(&["2025-11-25"])),
+                    ..Default::default()
+                })),
+            )
+            .await
+            .expect("semantic default must reuse the legacy global revision")
+            .into_inner();
+
+            assert_eq!(response.version, 1, "{case}");
+            assert_eq!(response.policy_hash, canonical_hash, "{case}");
+            let revisions = state
+                .store
+                .list_policies(GLOBAL_POLICY_SANDBOX_ID, 10, 0)
+                .await
+                .expect("list global policy revisions");
+            assert_eq!(revisions.len(), 1, "{case}");
+            let settings = load_global_settings(state.store.as_ref())
+                .await
+                .expect("load canonical global setting");
+            assert_eq!(
+                decode_policy_from_global_settings(&settings)
+                    .expect("decode canonical global setting")
+                    .expect("global policy setting"),
+                canonical,
+                "{case}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn policy_record_identity_sandbox_deduplicates_defaulted_mcp_history() {
+        let state = test_server_state().await;
+        let canonical = mcp_policy_with_versions(&["2025-11-25"]);
+        let canonical = validate_and_canonicalize_policy(canonical)
+            .expect("explicit default MCP policy must canonicalize");
+        let canonical_hash = deterministic_policy_hash(&canonical);
+
+        for (case, legacy_policy) in defaulted_mcp_policy_cases() {
+            let sandbox_id = format!("identity-default-{case}");
+            let sandbox_name = format!("identity-default-{case}");
+            state
+                .store
+                .put_message(&test_sandbox(
+                    &sandbox_id,
+                    &sandbox_name,
+                    canonical.clone(),
+                    Vec::new(),
+                ))
+                .await
+                .expect("store sandbox");
+            state
+                .store
+                .put_policy_revision(
+                    &format!("policy-identity-default-{case}"),
+                    &sandbox_id,
+                    "default",
+                    1,
+                    &legacy_policy.encode_to_vec(),
+                    "untrusted-legacy-hash",
+                )
+                .await
+                .expect("store legacy sandbox policy revision");
+
+            let response = handle_update_config(
+                &state,
+                with_user(Request::new(UpdateConfigRequest {
+                    name: sandbox_name,
+                    policy: Some(mcp_policy_with_versions(&["2025-11-25"])),
+                    ..Default::default()
+                })),
+            )
+            .await
+            .expect("semantic default must reuse the legacy sandbox revision")
+            .into_inner();
+
+            assert_eq!(response.version, 1, "{case}");
+            assert_eq!(response.policy_hash, canonical_hash, "{case}");
+            let revisions = state
+                .store
+                .list_policies(&sandbox_id, 10, 0)
+                .await
+                .expect("list sandbox policy revisions");
+            assert_eq!(revisions.len(), 1, "{case}");
+        }
+    }
+
+    #[tokio::test]
+    async fn policy_record_identity_merge_deduplicates_defaulted_mcp_history() {
+        let store = test_store().await;
+        let canonical = validate_and_canonicalize_policy(mcp_policy_with_versions(&["2025-11-25"]))
+            .expect("explicit default MCP policy must canonicalize");
+        let canonical_hash = deterministic_policy_hash(&canonical);
+
+        for (case, legacy_policy) in defaulted_mcp_policy_cases() {
+            let sandbox_id = format!("identity-merge-default-{case}");
+            store
+                .put_policy_revision(
+                    &format!("policy-identity-merge-default-{case}"),
+                    &sandbox_id,
+                    "default",
+                    1,
+                    &legacy_policy.encode_to_vec(),
+                    "untrusted-legacy-hash",
+                )
+                .await
+                .expect("store legacy merge base");
+
+            let (version, hash, _) = apply_merge_operations_with_retry(
+                &store,
+                &sandbox_id,
+                "default",
+                None,
+                &[],
+                PolicyMergeValidationContext {
+                    provider_layers: &[],
+                    credential_binding: None,
+                },
+                None,
+                None,
+            )
+            .await
+            .expect("empty merge must reuse the semantic policy revision");
+
+            assert_eq!(version, 1, "{case}");
+            assert_eq!(hash, canonical_hash, "{case}");
+            let revisions = store
+                .list_policies(&sandbox_id, 10, 0)
+                .await
+                .expect("list merge policy revisions");
+            assert_eq!(revisions.len(), 1, "{case}");
+        }
+    }
+
+    #[tokio::test]
+    async fn policy_record_identity_ignores_stale_matching_metadata() {
+        let state = test_server_state().await;
+        let candidate = mcp_policy_with_versions(&["2025-11-25"]);
+        let candidate = validate_and_canonicalize_policy(candidate)
+            .expect("candidate MCP policy must canonicalize");
+        let candidate_hash = deterministic_policy_hash(&candidate);
+        let different = mcp_policy_with_versions(&["2025-06-18"]);
+        let different = validate_and_canonicalize_policy(different)
+            .expect("different MCP policy must canonicalize");
+        let sandbox_id = "identity-stale-metadata";
+        let sandbox_name = "identity-stale-metadata";
+
+        state
+            .store
+            .put_message(&test_sandbox(
+                sandbox_id,
+                sandbox_name,
+                candidate.clone(),
+                Vec::new(),
+            ))
+            .await
+            .expect("store sandbox");
+        state
+            .store
+            .put_policy_revision(
+                "policy-identity-stale-metadata",
+                sandbox_id,
+                "default",
+                1,
+                &different.encode_to_vec(),
+                &candidate_hash,
+            )
+            .await
+            .expect("store policy with stale matching metadata");
+
+        let response = handle_update_config(
+            &state,
+            with_user(Request::new(UpdateConfigRequest {
+                name: sandbox_name.to_string(),
+                policy: Some(candidate.clone()),
+                ..Default::default()
+            })),
+        )
+        .await
+        .expect("different payload must create a new revision")
+        .into_inner();
+
+        assert_eq!(response.version, 2);
+        assert_eq!(response.policy_hash, candidate_hash);
+        let latest = state
+            .store
+            .get_latest_policy(sandbox_id)
+            .await
+            .expect("load latest policy")
+            .expect("new policy revision");
+        assert_eq!(latest.version, 2);
+        assert_eq!(latest.policy_payload, candidate.encode_to_vec());
+    }
+
+    #[tokio::test]
+    async fn valid_full_replacement_recovers_from_malformed_payload_with_matching_metadata() {
+        let state = test_server_state().await;
+        let candidate = mcp_policy_with_versions(&["2025-11-25"]);
+        let candidate = validate_and_canonicalize_policy(candidate)
+            .expect("candidate MCP policy must canonicalize");
+        let candidate_hash = deterministic_policy_hash(&candidate);
+        let malformed = mcp_policy_with_versions(&["2025-11-25", "2025-11-25"]);
+        let sandbox_id = "identity-malformed-payload";
+        let sandbox_name = "identity-malformed-payload";
+
+        state
+            .store
+            .put_message(&test_sandbox(
+                sandbox_id,
+                sandbox_name,
+                candidate.clone(),
+                Vec::new(),
+            ))
+            .await
+            .expect("store sandbox");
+        state
+            .store
+            .put_policy_revision(
+                "policy-identity-malformed-payload",
+                sandbox_id,
+                "default",
+                1,
+                &malformed.encode_to_vec(),
+                &candidate_hash,
+            )
+            .await
+            .expect("store malformed policy payload");
+
+        let response = handle_update_config(
+            &state,
+            with_user(Request::new(UpdateConfigRequest {
+                name: sandbox_name.to_string(),
+                policy: Some(candidate.clone()),
+                ..Default::default()
+            })),
+        )
+        .await
+        .expect("valid full replacement must repair malformed latest history")
+        .into_inner();
+
+        assert_eq!(response.version, 2);
+        assert_eq!(response.policy_hash, candidate_hash);
+        let revisions = state
+            .store
+            .list_policies(sandbox_id, 10, 0)
+            .await
+            .expect("list sandbox policy revisions");
+        assert_eq!(revisions.len(), 2);
+        assert_eq!(revisions[0].version, 2);
+        assert_eq!(revisions[0].policy_payload, candidate.encode_to_vec());
+        assert_eq!(revisions[0].policy_hash, candidate_hash);
+        assert_eq!(revisions[1].version, 1);
     }
 
     #[test]
@@ -7471,6 +8624,13 @@ mod tests {
 
     #[test]
     fn policy_merge_error_mapping_distinguishes_request_shape_from_state_conflicts() {
+        let invalid_operation =
+            map_policy_merge_error(openshell_policy::PolicyMergeError::InvalidOperationPolicy {
+                operation_index: 0,
+                violations: Vec::new(),
+            });
+        assert_eq!(invalid_operation.code(), Code::InvalidArgument);
+
         let empty =
             map_policy_merge_error(openshell_policy::PolicyMergeError::EmptyAddRuleEndpoints {
                 operation_index: 0,
@@ -7564,6 +8724,18 @@ mod tests {
         );
         assert_eq!(any_binary.code(), Code::FailedPrecondition);
         assert!(any_binary.message().contains("/usr/bin/untrusted"));
+
+        let invalid_input =
+            map_policy_merge_error(openshell_policy::PolicyMergeError::InvalidInputPolicy {
+                violations: Vec::new(),
+            });
+        assert_eq!(invalid_input.code(), Code::FailedPrecondition);
+
+        let invalid_merged =
+            map_policy_merge_error(openshell_policy::PolicyMergeError::InvalidMergedPolicy {
+                violations: Vec::new(),
+            });
+        assert_eq!(invalid_merged.code(), Code::Internal);
     }
 
     // ---- Sandbox IDOR guard (issue #1354) ----
@@ -8691,6 +9863,96 @@ mod tests {
                 .endpoints
                 .iter()
                 .any(|endpoint| endpoint.host == "api.github.com")
+        );
+    }
+
+    #[tokio::test]
+    async fn sandbox_config_materializes_default_mcp_version_after_provider_composition() {
+        use openshell_core::proto::{
+            ProviderProfile, ProviderProfileCategory, StoredProviderProfile,
+        };
+
+        let state = test_server_state().await;
+        enable_providers_v2(&state).await;
+        state
+            .store
+            .put_message(&StoredProviderProfile {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: "profile-mcp-default".to_string(),
+                    name: "mcp-default".to_string(),
+                    created_at_ms: 1_000_000,
+                    labels: HashMap::new(),
+                    resource_version: 0,
+                    annotations: HashMap::new(),
+                    workspace: "default".to_string(),
+                    deletion_timestamp_ms: 0,
+                }),
+                profile: Some(ProviderProfile {
+                    id: "mcp-default".to_string(),
+                    display_name: "MCP default".to_string(),
+                    category: ProviderProfileCategory::Other as i32,
+                    endpoints: vec![NetworkEndpoint {
+                        host: "mcp.example.com".to_string(),
+                        port: 443,
+                        protocol: "mcp".to_string(),
+                        mcp: None,
+                        rules: vec![L7Rule {
+                            allow: Some(openshell_core::proto::L7Allow {
+                                method: "tools/list".to_string(),
+                                ..Default::default()
+                            }),
+                        }],
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }),
+            })
+            .await
+            .expect("store versionless MCP provider profile");
+        state
+            .store
+            .put_message(&test_provider("work-mcp-default", "mcp-default"))
+            .await
+            .expect("store MCP provider");
+        state
+            .store
+            .put_message(&test_sandbox(
+                "sb-mcp-default-composed",
+                "mcp-default-composed",
+                test_policy_with_rule("sandbox_only", "sandbox.example.com"),
+                vec!["work-mcp-default".to_string()],
+            ))
+            .await
+            .expect("store MCP sandbox");
+
+        let response = handle_get_sandbox_config(
+            &state,
+            with_user(Request::new(GetSandboxConfigRequest {
+                sandbox_id: "sb-mcp-default-composed".to_string(),
+            })),
+        )
+        .await
+        .expect("provider-composed MCP policy must materialize")
+        .into_inner();
+        let effective_policy = response.policy.expect("effective composed policy");
+        let endpoint = effective_policy
+            .network_policies
+            .values()
+            .flat_map(|rule| &rule.endpoints)
+            .find(|endpoint| endpoint.host == "mcp.example.com")
+            .expect("composed MCP endpoint");
+
+        assert_eq!(
+            endpoint
+                .mcp
+                .as_ref()
+                .expect("canonical MCP options")
+                .versions,
+            ["2025-11-25".to_string()]
+        );
+        assert_eq!(
+            response.policy_hash,
+            deterministic_policy_hash(&effective_policy)
         );
     }
 
@@ -16240,6 +17502,44 @@ mod tests {
     }
 
     #[test]
+    fn decode_policy_from_global_settings_validates_and_canonicalizes_stored_policy() {
+        let invalid = mcp_policy_with_versions(&["latest"]);
+        let invalid_global = StoredSettings {
+            revision: 1,
+            settings: std::iter::once((
+                POLICY_SETTING_KEY.to_string(),
+                StoredSettingValue::Bytes(hex::encode(invalid.encode_to_vec())),
+            ))
+            .collect(),
+            ..Default::default()
+        };
+        let error = decode_policy_from_global_settings(&invalid_global)
+            .expect_err("invalid global policy must fail closed");
+        assert_eq!(error.code(), Code::FailedPrecondition);
+        assert!(error.message().contains(STORED_POLICY_SOURCE_GLOBAL));
+
+        let reversed = mcp_policy_with_versions(&["2025-11-25", "2025-06-18", "2025-03-26"]);
+        let canonical = validate_and_canonicalize_policy(reversed.clone())
+            .expect("supported global policy must canonicalize");
+        let valid_global = StoredSettings {
+            revision: 1,
+            settings: std::iter::once((
+                POLICY_SETTING_KEY.to_string(),
+                StoredSettingValue::Bytes(hex::encode(reversed.encode_to_vec())),
+            ))
+            .collect(),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            decode_policy_from_global_settings(&valid_global)
+                .expect("valid global policy")
+                .expect("global policy present"),
+            canonical
+        );
+    }
+
+    #[test]
     fn config_revision_changes_when_effective_setting_changes() {
         let policy = ProtoSandboxPolicy::default();
         let mut settings = HashMap::new();
@@ -18093,6 +19393,321 @@ mod tests {
         assert!(
             stored.spec.as_ref().unwrap().policy.is_some(),
             "policy should still be backfilled"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_config_reports_immutable_removal_before_policy_safety_errors() {
+        let state = test_server_state().await;
+        let sandbox_id = "sb-static-error-priority";
+        let sandbox_name = "static-error-priority";
+        let baseline = openshell_policy::restrictive_default_policy();
+        state
+            .store
+            .put_message(&test_sandbox(
+                sandbox_id,
+                sandbox_name,
+                baseline.clone(),
+                Vec::new(),
+            ))
+            .await
+            .unwrap();
+
+        let current = state
+            .store
+            .get_message_by_name::<Sandbox>("default", sandbox_name)
+            .await
+            .unwrap()
+            .unwrap();
+        let current_version = current.metadata.as_ref().unwrap().resource_version;
+
+        // The replacement removes baseline paths and adds an unsafe traversal.
+        // Live-policy immutability is the earlier contract, so it must remain
+        // the stable failure even when later whole-policy validation would fail.
+        let mut unsafe_replacement = baseline;
+        unsafe_replacement.filesystem.as_mut().unwrap().read_only =
+            vec!["/usr/../etc/shadow".to_string()];
+
+        let error = handle_update_config(
+            &state,
+            with_user(Request::new(UpdateConfigRequest {
+                name: sandbox_name.to_string(),
+                policy: Some(unsafe_replacement),
+                expected_resource_version: current_version,
+                workspace: "default".to_string(),
+                ..Default::default()
+            })),
+        )
+        .await
+        .expect_err("immutable removal must fail before whole-policy validation");
+
+        assert_eq!(error.code(), Code::InvalidArgument);
+        assert!(error.message().contains("cannot be removed"));
+        let unchanged = state
+            .store
+            .get_message_by_name::<Sandbox>("default", sandbox_name)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            unchanged
+                .spec
+                .as_ref()
+                .and_then(|spec| spec.policy.as_ref()),
+            Some(&openshell_policy::restrictive_default_policy())
+        );
+        assert!(
+            state
+                .store
+                .get_latest_policy(sandbox_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn update_config_policy_backfill_validates_before_persistence() {
+        use openshell_core::proto::{SandboxPhase, SandboxSpec};
+
+        let state = test_server_state().await;
+        let sandbox_id = "sb-invalid-first-sync";
+        let sandbox_name = "invalid-first-sync";
+        let mut sandbox = Sandbox {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: sandbox_id.to_string(),
+                name: sandbox_name.to_string(),
+                created_at_ms: 1_000_000,
+                labels: HashMap::new(),
+                resource_version: 0,
+                annotations: HashMap::new(),
+                workspace: "default".to_string(),
+                deletion_timestamp_ms: 0,
+            }),
+            spec: Some(SandboxSpec {
+                policy: None,
+                providers: Vec::new(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        sandbox.set_phase(SandboxPhase::Provisioning as i32);
+        state.store.put_message(&sandbox).await.unwrap();
+
+        let current = state
+            .store
+            .get_message_by_name::<Sandbox>("default", sandbox_name)
+            .await
+            .unwrap()
+            .unwrap();
+        let current_version = current.metadata.as_ref().unwrap().resource_version;
+
+        let invalid_version_sets: &[&[&str]] = &[&["latest"], &["2025-11-25", "2025-11-25"]];
+        for versions in invalid_version_sets {
+            let error = handle_update_config(
+                &state,
+                with_user(Request::new(UpdateConfigRequest {
+                    name: sandbox_name.to_string(),
+                    policy: Some(mcp_policy_with_versions(versions)),
+                    expected_resource_version: current_version,
+                    workspace: "default".to_string(),
+                    ..Default::default()
+                })),
+            )
+            .await
+            .expect_err("invalid first-sync policy must fail before backfill");
+
+            assert_eq!(error.code(), Code::InvalidArgument);
+            let unchanged = state
+                .store
+                .get_message_by_name::<Sandbox>("default", sandbox_name)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(unchanged.spec.as_ref().unwrap().policy.is_none());
+            assert!(
+                state
+                    .store
+                    .get_latest_policy(sandbox_id)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn update_config_policy_backfill_persists_defaulted_mcp_versions_identically() {
+        use openshell_core::proto::{SandboxPhase, SandboxSpec};
+
+        let state = test_server_state().await;
+        let canonical_policy = mcp_policy_with_versions(&["2025-11-25"]);
+        let canonical_policy = validate_and_canonicalize_policy(canonical_policy)
+            .expect("explicit default MCP policy must canonicalize");
+        let canonical_payload = canonical_policy.encode_to_vec();
+        let canonical_hash = deterministic_policy_hash(&canonical_policy);
+        let cases = [
+            ("omitted-options", mcp_policy_without_options()),
+            ("empty-versions", mcp_policy_with_versions(&[])),
+            (
+                "explicit-default",
+                mcp_policy_with_versions(&["2025-11-25"]),
+            ),
+        ];
+
+        for (case, policy) in cases {
+            let sandbox_id = format!("sb-default-first-sync-{case}");
+            let sandbox_name = format!("default-first-sync-{case}");
+            let mut sandbox = Sandbox {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: sandbox_id.clone(),
+                    name: sandbox_name.clone(),
+                    created_at_ms: 1_000_000,
+                    labels: HashMap::new(),
+                    resource_version: 0,
+                    annotations: HashMap::new(),
+                    workspace: "default".to_string(),
+                    deletion_timestamp_ms: 0,
+                }),
+                spec: Some(SandboxSpec {
+                    policy: None,
+                    providers: Vec::new(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            sandbox.set_phase(SandboxPhase::Provisioning as i32);
+            state.store.put_message(&sandbox).await.unwrap();
+
+            let current = state
+                .store
+                .get_message_by_name::<Sandbox>("default", &sandbox_name)
+                .await
+                .unwrap()
+                .unwrap();
+            let current_version = current.metadata.as_ref().unwrap().resource_version;
+            let response = handle_update_config(
+                &state,
+                with_user(Request::new(UpdateConfigRequest {
+                    name: sandbox_name.clone(),
+                    policy: Some(policy),
+                    expected_resource_version: current_version,
+                    workspace: "default".to_string(),
+                    ..Default::default()
+                })),
+            )
+            .await
+            .expect("defaulted first-sync policy must persist")
+            .into_inner();
+
+            assert_eq!(response.version, 1, "{case}");
+            assert_eq!(response.policy_hash, canonical_hash, "{case}");
+            let stored = state
+                .store
+                .get_message_by_name::<Sandbox>("default", &sandbox_name)
+                .await
+                .unwrap()
+                .unwrap();
+            let stored_policy = stored
+                .spec
+                .as_ref()
+                .and_then(|spec| spec.policy.as_ref())
+                .expect("backfilled sandbox policy");
+            assert_eq!(stored_policy, &canonical_policy, "{case}");
+            assert_eq!(
+                mcp_versions(stored_policy),
+                &["2025-11-25".to_string()],
+                "{case}"
+            );
+
+            let revision = state
+                .store
+                .get_latest_policy(&sandbox_id)
+                .await
+                .unwrap()
+                .expect("first-sync policy revision must exist");
+            assert_eq!(revision.policy_payload, canonical_payload, "{case}");
+            assert_eq!(revision.policy_hash, canonical_hash, "{case}");
+        }
+    }
+
+    #[tokio::test]
+    async fn update_config_policy_backfill_canonicalizes_mcp_versions_before_persistence() {
+        use openshell_core::proto::{SandboxPhase, SandboxSpec};
+
+        let state = test_server_state().await;
+        let sandbox_id = "sb-canonical-first-sync";
+        let sandbox_name = "canonical-first-sync";
+        let mut sandbox = Sandbox {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: sandbox_id.to_string(),
+                name: sandbox_name.to_string(),
+                created_at_ms: 1_000_000,
+                labels: HashMap::new(),
+                resource_version: 0,
+                annotations: HashMap::new(),
+                workspace: "default".to_string(),
+                deletion_timestamp_ms: 0,
+            }),
+            spec: Some(SandboxSpec {
+                policy: None,
+                providers: Vec::new(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        sandbox.set_phase(SandboxPhase::Provisioning as i32);
+        state.store.put_message(&sandbox).await.unwrap();
+
+        let current = state
+            .store
+            .get_message_by_name::<Sandbox>("default", sandbox_name)
+            .await
+            .unwrap()
+            .unwrap();
+        let current_version = current.metadata.as_ref().unwrap().resource_version;
+        let canonical_policy =
+            mcp_policy_with_versions(&["2025-03-26", "2025-06-18", "2025-11-25"]);
+        let canonical_policy = validate_and_canonicalize_policy(canonical_policy)
+            .expect("canonical MCP policy must validate");
+
+        handle_update_config(
+            &state,
+            with_user(Request::new(UpdateConfigRequest {
+                name: sandbox_name.to_string(),
+                policy: Some(mcp_policy_with_versions(&[
+                    "2025-11-25",
+                    "2025-06-18",
+                    "2025-03-26",
+                ])),
+                expected_resource_version: current_version,
+                workspace: "default".to_string(),
+                ..Default::default()
+            })),
+        )
+        .await
+        .expect("valid first-sync policy must persist");
+
+        let stored = state
+            .store
+            .get_message_by_name::<Sandbox>("default", sandbox_name)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored.spec.as_ref().and_then(|spec| spec.policy.as_ref()),
+            Some(&canonical_policy)
+        );
+        let revision = state
+            .store
+            .get_latest_policy(sandbox_id)
+            .await
+            .unwrap()
+            .expect("first-sync policy revision must exist");
+        assert_eq!(revision.policy_payload, canonical_policy.encode_to_vec());
+        assert_eq!(
+            revision.policy_hash,
+            deterministic_policy_hash(&canonical_policy)
         );
     }
 

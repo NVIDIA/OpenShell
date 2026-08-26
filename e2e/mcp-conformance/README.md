@@ -35,12 +35,7 @@ bridge at `host.openshell.internal` (the alias `e2e/with-docker-gateway.sh`
 attaches to the CI job container on the e2e network), at `host.docker.internal`
 on local Docker Desktop, or via `--add-host ...:host-gateway` on local Linux.
 
-The generated policy uses `protocol: mcp` and sets
-`mcp.allow_all_known_mcp_methods: true` so omitted rule methods use the endpoint
-MCP method profile. That keeps OpenShell deny-by-default at the network boundary
-while allowing the upstream scenarios to exercise MCP behavior. The policy body
-lives in `policy-template.yaml`; the wrapper renders its host, port, and path
-placeholders from the upstream server URL.
+The generated policy uses `protocol: mcp`, inserts the conformance runner's spec revision into the endpoint allowlist, and sets `mcp.allow_all_known_mcp_methods: true` so omitted rule methods use the endpoint MCP method profile. This schema declaration does not yet make OpenShell select or enforce that wire profile; the conformance runner still owns the revision used by its client and server. The policy keeps OpenShell deny-by-default at the network boundary while allowing the upstream scenarios to exercise MCP behavior. The policy body lives in `policy-template.yaml`; the wrapper renders its MCP revision, host, port, and path placeholders from the upstream server URL.
 
 For local runs, the wrapper builds `openshell/supervisor:dev` automatically
 when no supervisor image override is set. Set `OPENSHELL_DOCKER_SUPERVISOR_IMAGE`

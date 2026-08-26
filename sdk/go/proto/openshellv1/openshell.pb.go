@@ -291,6 +291,8 @@ const (
 	// Sandbox successfully applied this policy version.
 	PolicyStatus_POLICY_STATUS_LOADED PolicyStatus = 2
 	// Sandbox attempted to apply but failed; LKG policy remains active.
+	// ListSandboxPolicies also uses FAILED for historical payloads that are
+	// invalid under the current schema; load_error contains the diagnostic.
 	PolicyStatus_POLICY_STATUS_FAILED PolicyStatus = 3
 	// A newer version was persisted before the sandbox loaded this one.
 	PolicyStatus_POLICY_STATUS_SUPERSEDED PolicyStatus = 4
@@ -9823,7 +9825,9 @@ func (x *ListSandboxPoliciesRequest) GetWorkspace() string {
 
 // List sandbox policies response.
 type ListSandboxPoliciesResponse struct {
-	state         protoimpl.MessageState   `protogen:"open.v1"`
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Invalid historical payloads remain visible as failed projections so one
+	// legacy row cannot hide the rest of the policy history.
 	Revisions     []*SandboxPolicyRevision `protobuf:"bytes,1,rep,name=revisions,proto3" json:"revisions,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -9981,11 +9985,16 @@ type SandboxPolicyRevision struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Policy version (monotonically increasing per sandbox).
 	Version uint32 `protobuf:"varint,1,opt,name=version,proto3" json:"version,omitempty"`
-	// SHA-256 hash of the serialized policy payload.
+	// SHA-256 hash of the canonical serialized policy payload. Empty in a
+	// ListSandboxPolicies projection when the stored payload is invalid under
+	// the current schema and therefore has no trusted canonical identity.
 	PolicyHash string `protobuf:"bytes,2,opt,name=policy_hash,json=policyHash,proto3" json:"policy_hash,omitempty"`
-	// Load status of this revision.
+	// Load status of this revision. ListSandboxPolicies reports FAILED when a
+	// stored historical payload is invalid under the current schema, regardless
+	// of its persisted sandbox load status.
 	Status PolicyStatus `protobuf:"varint,3,opt,name=status,proto3,enum=openshell.v1.PolicyStatus" json:"status,omitempty"`
-	// Error message if status is FAILED.
+	// Sandbox load error, or the schema-validation diagnostic for an invalid
+	// historical row returned by ListSandboxPolicies.
 	LoadError string `protobuf:"bytes,4,opt,name=load_error,json=loadError,proto3" json:"load_error,omitempty"`
 	// Milliseconds since epoch when this revision was created.
 	CreatedAtMs int64 `protobuf:"varint,5,opt,name=created_at_ms,json=createdAtMs,proto3" json:"created_at_ms,omitempty"`

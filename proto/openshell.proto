@@ -2255,6 +2255,8 @@ message ListSandboxPoliciesRequest {
 
 // List sandbox policies response.
 message ListSandboxPoliciesResponse {
+  // Invalid historical payloads remain visible as failed projections so one
+  // legacy row cannot hide the rest of the policy history.
   repeated SandboxPolicyRevision revisions = 1;
 }
 
@@ -2277,11 +2279,16 @@ message ReportPolicyStatusResponse {}
 message SandboxPolicyRevision {
   // Policy version (monotonically increasing per sandbox).
   uint32 version = 1;
-  // SHA-256 hash of the serialized policy payload.
+  // SHA-256 hash of the canonical serialized policy payload. Empty in a
+  // ListSandboxPolicies projection when the stored payload is invalid under
+  // the current schema and therefore has no trusted canonical identity.
   string policy_hash = 2;
-  // Load status of this revision.
+  // Load status of this revision. ListSandboxPolicies reports FAILED when a
+  // stored historical payload is invalid under the current schema, regardless
+  // of its persisted sandbox load status.
   PolicyStatus status = 3;
-  // Error message if status is FAILED.
+  // Sandbox load error, or the schema-validation diagnostic for an invalid
+  // historical row returned by ListSandboxPolicies.
   string load_error = 4;
   // Milliseconds since epoch when this revision was created.
   int64 created_at_ms = 5;
@@ -2301,6 +2308,8 @@ enum PolicyStatus {
   // Sandbox successfully applied this policy version.
   POLICY_STATUS_LOADED = 2;
   // Sandbox attempted to apply but failed; LKG policy remains active.
+  // ListSandboxPolicies also uses FAILED for historical payloads that are
+  // invalid under the current schema; load_error contains the diagnostic.
   POLICY_STATUS_FAILED = 3;
   // A newer version was persisted before the sandbox loaded this one.
   POLICY_STATUS_SUPERSEDED = 4;

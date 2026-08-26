@@ -14,7 +14,7 @@ mod l7_validate;
 mod merge;
 mod middleware;
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::net::IpAddr;
 use std::path::Path;
@@ -25,12 +25,13 @@ pub use ambiguity::{EndpointAmbiguity, find_endpoint_ambiguities};
 
 use hickory_proto::rr::Name;
 use miette::{IntoDiagnostic, Result, WrapErr};
+use openshell_core::mcp::{DEFAULT_MCP_PROTOCOL_VERSION, McpProtocolVersion};
 use openshell_core::proto::{
     FilesystemPolicy, GraphqlOperation, L7Allow, L7DenyRule, L7QueryMatcher, L7Rule,
     LandlockPolicy, McpOptions, NetworkBinary, NetworkEndpoint, NetworkPolicyRule, ProcessPolicy,
     SandboxPolicy,
 };
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 pub use compose::{
     PROVIDER_RULE_NAME_PREFIX, ProviderPolicyLayer, compose_effective_policy,
@@ -173,7 +174,11 @@ struct NetworkEndpointDef {
     credential_binding: Option<NetworkCredentialBindingDef>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     json_rpc: Option<JsonRpcConfigDef>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_optional_field",
+        skip_serializing_if = "Option::is_none"
+    )]
     mcp: Option<McpConfigDef>,
 }
 
@@ -195,6 +200,19 @@ fn is_zero_u32(v: &u32) -> bool {
     *v == 0
 }
 
+fn deserialize_non_null_optional_field<'de, D, T>(
+    deserializer: D,
+) -> std::result::Result<Option<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    // Serde skips this function when the field is absent because the field has
+    // `default`. When it is present, deserialize `T` directly so an explicit
+    // YAML or JSON null is rejected instead of collapsing into omission.
+    T::deserialize(deserializer).map(Some)
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct JsonRpcConfigDef {
@@ -212,6 +230,15 @@ fn json_rpc_config_from_proto(max_body_bytes: u32) -> Option<JsonRpcConfigDef> {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct McpConfigDef {
+    // Presence is retained until authored-policy validation so an omitted
+    // allowlist can select the pinned default while an explicit empty list is
+    // rejected as an authoring mistake.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_optional_field",
+        skip_serializing_if = "Option::is_none"
+    )]
+    versions: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     max_body_bytes: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -220,15 +247,49 @@ struct McpConfigDef {
     allow_all_known_mcp_methods: Option<bool>,
 }
 
+const MCP_VERSION_REMEDIATION: &str = "omit mcp.versions to use the pinned default revision, use an exact supported revision, or omit protocol and mcp for deliberate uninspected L4 passthrough only when that weaker boundary is acceptable";
+
+fn validate_authored_mcp_versions(versions: Option<&[String]>, context: &str) -> Result<()> {
+    let Some(versions) = versions else {
+        return Ok(());
+    };
+    if versions.is_empty() {
+        return Err(miette::miette!(
+            "{context} has an empty mcp.versions list; omit mcp.versions to use the pinned default revision"
+        ));
+    }
+
+    let mut seen = BTreeSet::new();
+    for value in versions {
+        let version = value
+            .parse::<McpProtocolVersion>()
+            .map_err(|error| miette::miette!("{context}: {error}; {MCP_VERSION_REMEDIATION}"))?;
+        if !seen.insert(version) {
+            return Err(miette::miette!(
+                "{context} has duplicate protocol version '{value}'"
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn mcp_config_from_proto(max_body_bytes: u32, mcp: Option<&McpOptions>) -> Option<McpConfigDef> {
+    let mut versions = mcp
+        .map(|config| config.versions.clone())
+        .unwrap_or_default();
+    canonicalize_mcp_versions(&mut versions);
     let strict_tool_names = mcp.and_then(|config| config.strict_tool_names);
     let allow_all_known_mcp_methods = mcp.and_then(|config| config.allow_all_known_mcp_methods);
-    (max_body_bytes > 0 || strict_tool_names.is_some() || allow_all_known_mcp_methods.is_some())
-        .then_some(McpConfigDef {
-            max_body_bytes,
-            strict_tool_names,
-            allow_all_known_mcp_methods,
-        })
+    (!versions.is_empty()
+        || max_body_bytes > 0
+        || strict_tool_names.is_some()
+        || allow_all_known_mcp_methods.is_some())
+    .then_some(McpConfigDef {
+        versions: Some(versions),
+        max_body_bytes,
+        strict_tool_names,
+        allow_all_known_mcp_methods,
+    })
 }
 
 /// Nested L7 config stanzas accepted by the YAML policy schema.
@@ -255,7 +316,9 @@ impl L7ConfigStanza {
 ///
 /// The stanza schema stays tied to this crate's canonical serde definitions, so
 /// adding a new supported field requires updating this conversion next to the
-/// type that parses it.
+/// type that parses it. MCP revision fields are validated before the alias is
+/// flattened so invalid authoring cannot disappear when version metadata is
+/// omitted from the returned runtime-only fields.
 pub fn l7_config_alias_runtime_fields(
     stanza: L7ConfigStanza,
     value: serde_json::Value,
@@ -271,12 +334,15 @@ pub fn l7_config_alias_runtime_fields(
             Ok(fields)
         }
         L7ConfigStanza::Mcp => {
+            let config: McpConfigDef = serde_json::from_value(value)
+                .map_err(|error| miette::miette!("invalid mcp config: {error}"))?;
+            validate_authored_mcp_versions(config.versions.as_deref(), "invalid mcp config")?;
             let McpConfigDef {
+                versions: _,
                 max_body_bytes,
                 strict_tool_names,
                 allow_all_known_mcp_methods,
-            } = serde_json::from_value(value)
-                .map_err(|error| miette::miette!("invalid mcp config: {error}"))?;
+            } = config;
             let mut fields = Vec::new();
             if max_body_bytes > 0 {
                 fields.push(("json_rpc_max_body_bytes", serde_json::json!(max_body_bytes)));
@@ -580,27 +646,60 @@ fn json_rpc_max_body_bytes(json_rpc: &Option<JsonRpcConfigDef>, mcp: &Option<Mcp
     )
 }
 
-fn mcp_strict_tool_names(mcp: &Option<McpConfigDef>) -> Option<bool> {
-    mcp.as_ref().and_then(|config| config.strict_tool_names)
-}
+fn mcp_options(protocol: &str, mcp: &Option<McpConfigDef>) -> Option<McpOptions> {
+    if !is_mcp_protocol(protocol) {
+        return None;
+    }
 
-fn mcp_allow_all_known_mcp_methods(mcp: &Option<McpConfigDef>) -> Option<bool> {
-    mcp.as_ref()
-        .and_then(|config| config.allow_all_known_mcp_methods)
-}
-
-fn mcp_options(mcp: &Option<McpConfigDef>) -> Option<McpOptions> {
-    let strict_tool_names = mcp_strict_tool_names(mcp);
-    let allow_all_known_mcp_methods = mcp_allow_all_known_mcp_methods(mcp);
-    (strict_tool_names.is_some() || allow_all_known_mcp_methods.is_some()).then_some(McpOptions {
-        strict_tool_names,
-        allow_all_known_mcp_methods,
-        versions: Vec::new(),
+    let mut versions = mcp
+        .as_ref()
+        .and_then(|config| config.versions.clone())
+        .unwrap_or_else(default_mcp_versions);
+    // Authored YAML is validated before this conversion. Sort only after that
+    // boundary so duplicate or unsupported input cannot be hidden.
+    canonicalize_mcp_versions(&mut versions);
+    Some(McpOptions {
+        strict_tool_names: mcp.as_ref().and_then(|config| config.strict_tool_names),
+        allow_all_known_mcp_methods: mcp
+            .as_ref()
+            .and_then(|config| config.allow_all_known_mcp_methods),
+        versions,
     })
 }
 
 fn is_mcp_protocol(protocol: &str) -> bool {
     protocol.eq_ignore_ascii_case("mcp")
+}
+
+fn default_mcp_versions() -> Vec<String> {
+    // The single pinned constant is intentionally independent of the registry
+    // size and order, so adding support for a revision cannot widen an
+    // existing versionless policy.
+    vec![DEFAULT_MCP_PROTOCOL_VERSION.as_str().to_string()]
+}
+
+fn canonicalize_mcp_versions(versions: &mut [String]) {
+    // Unknown and duplicate values remain present so canonicalization cannot
+    // erase evidence that the raw policy was invalid.
+    versions.sort_by(|left, right| {
+        match (
+            left.parse::<McpProtocolVersion>(),
+            right.parse::<McpProtocolVersion>(),
+        ) {
+            (Ok(left), Ok(right)) => left.cmp(&right),
+            (Ok(_), Err(_)) => std::cmp::Ordering::Less,
+            (Err(_), Ok(_)) => std::cmp::Ordering::Greater,
+            (Err(_), Err(_)) => left.cmp(right),
+        }
+    });
+}
+
+/// Sort one protobuf MCP contract without hiding invalid input.
+///
+/// Exact supported revisions use semantic catalog order. Duplicate and
+/// unsupported identifiers remain present for subsequent validation.
+pub(crate) fn canonicalize_mcp_options(options: &mut McpOptions) {
+    canonicalize_mcp_versions(&mut options.versions);
 }
 
 fn split_tool_param(
@@ -791,7 +890,7 @@ fn to_proto(raw: PolicyFile) -> Result<SandboxPolicy> {
                                 }
                             }),
                             json_rpc_max_body_bytes: json_rpc_max_body_bytes(&e.json_rpc, &e.mcp),
-                            mcp: mcp_options(&e.mcp),
+                            mcp: mcp_options(&protocol, &e.mcp),
                         }
                     })
                     .collect(),
@@ -1023,11 +1122,46 @@ pub fn is_valid_sandbox_identity(value: &str) -> bool {
 // Public API
 // ---------------------------------------------------------------------------
 
+// Validate raw authored values and their relationship to the endpoint protocol
+// before conversion. Keeping validation outside the Serde error wrapper makes
+// actionable MCP diagnostics the top-level user-facing error.
+fn validate_mcp_version_schema(policy: &PolicyFile) -> Result<()> {
+    for (policy_key, rule) in &policy.network_policies {
+        let policy_name = if rule.name.is_empty() {
+            policy_key
+        } else {
+            &rule.name
+        };
+        for endpoint in &rule.endpoints {
+            if is_mcp_protocol(&endpoint.protocol) {
+                let context = format!(
+                    "network policy '{policy_name}': MCP endpoint '{}'",
+                    endpoint.host
+                );
+                validate_authored_mcp_versions(
+                    endpoint
+                        .mcp
+                        .as_ref()
+                        .and_then(|config| config.versions.as_deref()),
+                    &context,
+                )?;
+            } else if endpoint.mcp.is_some() {
+                return Err(miette::miette!(
+                    "network policy '{policy_name}': non-MCP endpoint '{}' cannot configure mcp options",
+                    endpoint.host
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Parse a sandbox policy from a YAML string.
 pub fn parse_sandbox_policy(yaml: &str) -> Result<SandboxPolicy> {
     let raw: PolicyFile = serde_yml::from_str(yaml)
         .into_diagnostic()
         .wrap_err("failed to parse sandbox policy YAML")?;
+    validate_mcp_version_schema(&raw)?;
     to_proto(raw)
 }
 
@@ -1037,7 +1171,9 @@ pub fn parse_sandbox_policy(yaml: &str) -> Result<SandboxPolicy> {
 /// canonical YAML field names (e.g. `filesystem_policy`, not `filesystem`)
 /// and is round-trippable through `parse_sandbox_policy`.
 pub fn serialize_sandbox_policy(policy: &SandboxPolicy) -> Result<String> {
-    let yaml_repr = from_proto(policy);
+    let canonical = validate_and_canonicalize_mcp_policy_schema(policy.clone())
+        .map_err(|error| miette::miette!("cannot serialize invalid sandbox policy: {error}"))?;
+    let yaml_repr = from_proto(&canonical);
     serde_yml::to_string(&yaml_repr)
         .into_diagnostic()
         .wrap_err("failed to serialize policy to YAML")
@@ -1048,7 +1184,9 @@ pub fn serialize_sandbox_policy(policy: &SandboxPolicy) -> Result<String> {
 /// The shape mirrors the YAML schema used by [`serialize_sandbox_policy`], so
 /// automation can use the same documented field names in either format.
 pub fn sandbox_policy_to_json_value(policy: &SandboxPolicy) -> Result<serde_json::Value> {
-    let json_repr = from_proto(policy);
+    let canonical = validate_and_canonicalize_mcp_policy_schema(policy.clone())
+        .map_err(|error| miette::miette!("cannot serialize invalid sandbox policy: {error}"))?;
+    let json_repr = from_proto(&canonical);
     serde_json::to_value(&json_repr)
         .into_diagnostic()
         .wrap_err("failed to serialize policy to JSON")
@@ -1231,6 +1369,26 @@ pub enum PolicyViolation {
         policy_name: String,
         host: String,
     },
+    /// An effective MCP endpoint has not materialized a protocol revision.
+    MissingMcpVersions { policy_name: String, host: String },
+    /// A non-MCP endpoint carries MCP-only configuration.
+    McpOptionsOnNonMcpEndpoint {
+        policy_name: String,
+        host: String,
+        protocol: String,
+    },
+    /// An MCP revision allowlist contains an unsupported exact identifier.
+    UnsupportedMcpVersion {
+        policy_name: String,
+        host: String,
+        version: String,
+    },
+    /// An MCP revision allowlist contains the same identifier more than once.
+    DuplicateMcpVersion {
+        policy_name: String,
+        host: String,
+        version: String,
+    },
 }
 
 impl fmt::Display for PolicyViolation {
@@ -1393,6 +1551,42 @@ impl fmt::Display for PolicyViolation {
                      '{policy_name}' tls: skip endpoint '{host}'"
                 )
             }
+            Self::MissingMcpVersions { policy_name, host } => {
+                write!(
+                    f,
+                    "network policy '{policy_name}': MCP endpoint '{host}' has no materialized protocol version"
+                )
+            }
+            Self::McpOptionsOnNonMcpEndpoint {
+                policy_name,
+                host,
+                protocol,
+            } => {
+                write!(
+                    f,
+                    "network policy '{policy_name}': endpoint '{host}' uses protocol '{protocol}' and cannot configure mcp options"
+                )
+            }
+            Self::UnsupportedMcpVersion {
+                policy_name,
+                host,
+                version,
+            } => {
+                write!(
+                    f,
+                    "network policy '{policy_name}': MCP endpoint '{host}' has unsupported protocol version '{version}'; {MCP_VERSION_REMEDIATION}"
+                )
+            }
+            Self::DuplicateMcpVersion {
+                policy_name,
+                host,
+                version,
+            } => {
+                write!(
+                    f,
+                    "network policy '{policy_name}': MCP endpoint '{host}' repeats protocol version '{version}'"
+                )
+            }
         }
     }
 }
@@ -1414,8 +1608,24 @@ impl fmt::Display for PolicyViolation {
 /// - Middleware names, implementations, failure modes, selectors, and built-in
 ///   configurations must be valid
 /// - Middleware selectors must not match endpoints that skip TLS inspection
+/// - MCP endpoints must carry a nonempty, unique allowlist of exact supported
+///   revisions
+/// - Non-MCP endpoints must not carry MCP options
 pub fn validate_sandbox_policy(
     policy: &SandboxPolicy,
+) -> std::result::Result<(), Vec<PolicyViolation>> {
+    validate_sandbox_policy_with_mcp_presence(policy, McpVersionPresence::RequireMaterialized)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum McpVersionPresence {
+    RequireMaterialized,
+    AllowDefaultable,
+}
+
+fn validate_sandbox_policy_with_mcp_presence(
+    policy: &SandboxPolicy,
+    mcp_version_presence: McpVersionPresence,
 ) -> std::result::Result<(), Vec<PolicyViolation>> {
     let mut violations = Vec::new();
 
@@ -1483,8 +1693,13 @@ pub fn validate_sandbox_policy(
         }
     }
 
+    // Protobuf maps do not preserve iteration order. Sort rule keys so callers
+    // receive stable validation errors for equivalent policy inputs.
+    let mut network_policies: Vec<_> = policy.network_policies.iter().collect();
+    network_policies.sort_by_key(|(name, _)| *name);
+
     // Check network policy endpoint hosts for TLD wildcards.
-    for (key, rule) in &policy.network_policies {
+    for (key, rule) in network_policies {
         let name = if rule.name.is_empty() {
             key.clone()
         } else {
@@ -1650,9 +1865,6 @@ pub fn validate_sandbox_policy(
                     "SQL enforcement requires full SQL parsing; use enforcement: audit".to_string(),
                 );
             }
-            if ep.mcp.is_some() && ep.protocol != "mcp" {
-                l7_errors.push("mcp options are only valid for protocol mcp".to_string());
-            }
             if ep.protocol == "graphql" {
                 for (rule_index, rule) in ep.rules.iter().enumerate() {
                     let operation_type = rule
@@ -1694,6 +1906,7 @@ pub fn validate_sandbox_policy(
                     reason,
                 }
             }));
+            collect_mcp_endpoint_violations(&name, ep, mcp_version_presence, &mut violations);
         }
     }
 
@@ -1756,6 +1969,186 @@ fn validate_tcp_dns_host_selector(host: &str) -> std::result::Result<(), String>
         return Err("DNS root is not a destination hostname".to_string());
     }
     Ok(())
+}
+
+fn collect_mcp_endpoint_violations(
+    policy_name: &str,
+    endpoint: &NetworkEndpoint,
+    mcp_version_presence: McpVersionPresence,
+    violations: &mut Vec<PolicyViolation>,
+) {
+    if is_mcp_protocol(&endpoint.protocol) {
+        let Some(mcp) = endpoint.mcp.as_ref() else {
+            if mcp_version_presence == McpVersionPresence::RequireMaterialized {
+                violations.push(PolicyViolation::MissingMcpVersions {
+                    policy_name: policy_name.to_string(),
+                    host: endpoint.host.clone(),
+                });
+            }
+            return;
+        };
+        if mcp.versions.is_empty() {
+            if mcp_version_presence == McpVersionPresence::RequireMaterialized {
+                violations.push(PolicyViolation::MissingMcpVersions {
+                    policy_name: policy_name.to_string(),
+                    host: endpoint.host.clone(),
+                });
+            }
+            return;
+        }
+
+        let mut seen = BTreeSet::new();
+        for version in &mcp.versions {
+            if !seen.insert(version.as_str()) {
+                violations.push(PolicyViolation::DuplicateMcpVersion {
+                    policy_name: policy_name.to_string(),
+                    host: endpoint.host.clone(),
+                    version: version.clone(),
+                });
+            }
+            if version.parse::<McpProtocolVersion>().is_err() {
+                violations.push(PolicyViolation::UnsupportedMcpVersion {
+                    policy_name: policy_name.to_string(),
+                    host: endpoint.host.clone(),
+                    version: version.clone(),
+                });
+            }
+        }
+    } else if endpoint.mcp.is_some() {
+        violations.push(PolicyViolation::McpOptionsOnNonMcpEndpoint {
+            policy_name: policy_name.to_string(),
+            host: endpoint.host.clone(),
+            protocol: endpoint.protocol.clone(),
+        });
+    }
+}
+
+fn validate_mcp_policy_schema(
+    policy: &SandboxPolicy,
+    mcp_version_presence: McpVersionPresence,
+) -> std::result::Result<(), Vec<PolicyViolation>> {
+    let mut violations = Vec::new();
+    let mut network_policies: Vec<_> = policy.network_policies.iter().collect();
+    network_policies.sort_by_key(|(name, _)| *name);
+    for (key, rule) in network_policies {
+        let policy_name = if rule.name.is_empty() {
+            key.as_str()
+        } else {
+            rule.name.as_str()
+        };
+        for endpoint in &rule.endpoints {
+            collect_mcp_endpoint_violations(
+                policy_name,
+                endpoint,
+                mcp_version_presence,
+                &mut violations,
+            );
+        }
+    }
+    if violations.is_empty() {
+        Ok(())
+    } else {
+        Err(violations)
+    }
+}
+
+/// Error returned when a checked policy boundary receives invalid protobuf state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PolicyValidationError {
+    violations: Vec<PolicyViolation>,
+}
+
+impl PolicyValidationError {
+    /// Borrow every violation found while validating the policy.
+    #[must_use]
+    pub fn violations(&self) -> &[PolicyViolation] {
+        &self.violations
+    }
+
+    /// Consume the error and return every violation.
+    #[must_use]
+    pub fn into_violations(self) -> Vec<PolicyViolation> {
+        self.violations
+    }
+}
+
+impl fmt::Display for PolicyValidationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "sandbox policy validation failed")?;
+        for violation in &self.violations {
+            write!(formatter, "; {violation}")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for PolicyValidationError {}
+
+fn validate_and_canonicalize_mcp_policy_schema(
+    mut policy: SandboxPolicy,
+) -> std::result::Result<SandboxPolicy, PolicyValidationError> {
+    validate_mcp_policy_schema(&policy, McpVersionPresence::AllowDefaultable)
+        .map_err(|violations| PolicyValidationError { violations })?;
+    materialize_default_mcp_versions(&mut policy);
+    canonicalize_mcp_version_allowlists(&mut policy);
+    validate_mcp_policy_schema(&policy, McpVersionPresence::RequireMaterialized)
+        .map_err(|violations| PolicyValidationError { violations })?;
+    Ok(policy)
+}
+
+/// Validate raw protobuf policy state, then return its canonical representation.
+///
+/// Validation deliberately runs before default materialization and sorting so
+/// malformed, duplicate, or misplaced MCP state cannot be repaired or hidden
+/// by normalization. Missing or empty protobuf MCP options select the pinned
+/// default because proto3 repeated fields do not preserve authoring presence.
+/// Canonicalization only inserts the known pinned default and sorts allowlists
+/// that the first pass already proved valid, so it cannot invalidate another
+/// policy field. Debug builds recheck that local transformation invariant
+/// without imposing a second whole-policy traversal on production read paths.
+pub fn validate_and_canonicalize_sandbox_policy(
+    mut policy: SandboxPolicy,
+) -> std::result::Result<SandboxPolicy, PolicyValidationError> {
+    validate_sandbox_policy_with_mcp_presence(&policy, McpVersionPresence::AllowDefaultable)
+        .map_err(|violations| PolicyValidationError { violations })?;
+    materialize_default_mcp_versions(&mut policy);
+    canonicalize_mcp_version_allowlists(&mut policy);
+    debug_assert!(
+        validate_sandbox_policy(&policy).is_ok(),
+        "validated MCP canonicalization must preserve every policy invariant"
+    );
+    Ok(policy)
+}
+
+/// Replace absent protobuf MCP options and empty revision lists with the
+/// single pinned policy default while preserving every explicit MCP option.
+pub(crate) fn materialize_default_mcp_versions(policy: &mut SandboxPolicy) {
+    for rule in policy.network_policies.values_mut() {
+        for endpoint in &mut rule.endpoints {
+            if !is_mcp_protocol(&endpoint.protocol) {
+                continue;
+            }
+            let options = endpoint.mcp.get_or_insert_default();
+            if options.versions.is_empty() {
+                options.versions = default_mcp_versions();
+            }
+        }
+    }
+}
+
+/// Canonicalize every MCP revision allowlist without deleting invalid input.
+///
+/// This helper is crate-private because external callers should use
+/// [`validate_and_canonicalize_sandbox_policy`] and cannot safely normalize an
+/// unvalidated policy in place.
+pub(crate) fn canonicalize_mcp_version_allowlists(policy: &mut SandboxPolicy) {
+    for rule in policy.network_policies.values_mut() {
+        for endpoint in &mut rule.endpoints {
+            if let Some(options) = endpoint.mcp.as_mut() {
+                canonicalize_mcp_options(options);
+            }
+        }
+    }
 }
 
 /// Truncate a string for safe inclusion in error messages.
@@ -2156,6 +2549,7 @@ network_policies:
         let fields = l7_config_alias_runtime_fields(
             L7ConfigStanza::Mcp,
             serde_json::json!({
+                "versions": ["2025-11-25", "2025-03-26", "2025-06-18"],
                 "max_body_bytes": 131_072,
                 "strict_tool_names": false,
                 "allow_all_known_mcp_methods": true
@@ -2172,12 +2566,442 @@ network_policies:
             ]
         );
 
+        let runtime_only_fields = l7_config_alias_runtime_fields(
+            L7ConfigStanza::Mcp,
+            serde_json::json!({"strict_tool_names": false}),
+        )
+        .expect("runtime alias parsing does not select a wire profile yet");
+        assert_eq!(
+            runtime_only_fields,
+            vec![("mcp_strict_tool_names", serde_json::json!(false))]
+        );
+
         let err = l7_config_alias_runtime_fields(
             L7ConfigStanza::JsonRpc,
             serde_json::json!({"on_parse_error": "allow"}),
         )
         .expect_err("unknown JSON-RPC config fields must be rejected");
         assert!(err.to_string().contains("on_parse_error"));
+    }
+
+    #[test]
+    fn l7_mcp_alias_rejects_invalid_raw_version_authoring() {
+        let cases = [
+            ("null config", serde_json::Value::Null),
+            ("null versions", serde_json::json!({"versions": null})),
+            ("empty versions", serde_json::json!({"versions": []})),
+            (
+                "duplicate revision",
+                serde_json::json!({"versions": ["2025-11-25", "2025-11-25"]}),
+            ),
+            (
+                "unsupported revision",
+                serde_json::json!({"versions": ["2025-11-26"]}),
+            ),
+            (
+                "leading whitespace",
+                serde_json::json!({"versions": [" 2025-11-25"]}),
+            ),
+            (
+                "trailing whitespace",
+                serde_json::json!({"versions": ["2025-11-25 "]}),
+            ),
+        ];
+
+        for (case, value) in cases {
+            let error = l7_config_alias_runtime_fields(L7ConfigStanza::Mcp, value)
+                .expect_err("invalid raw MCP version authoring must fail");
+            assert!(
+                error.to_string().contains("invalid mcp config"),
+                "{case} returned an unexpected diagnostic: {error}"
+            );
+        }
+    }
+
+    const MCP_VERSIONS: [&str; 3] = ["2025-03-26", "2025-06-18", "2025-11-25"];
+
+    fn mcp_version_options(versions: &[&str]) -> McpOptions {
+        McpOptions {
+            versions: versions.iter().map(ToString::to_string).collect(),
+            ..Default::default()
+        }
+    }
+
+    fn mcp_version_policy(protocol: &str, mcp: Option<McpOptions>) -> SandboxPolicy {
+        let mut policy = restrictive_default_policy();
+        policy.network_policies.insert(
+            "versioned".to_string(),
+            NetworkPolicyRule {
+                name: "versioned".to_string(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "mcp.example.com".to_string(),
+                    port: 443,
+                    protocol: protocol.to_string(),
+                    rules: vec![L7Rule {
+                        allow: Some(L7Allow {
+                            method: "tools/list".to_string(),
+                            ..Default::default()
+                        }),
+                    }],
+                    mcp,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        policy
+    }
+
+    fn mcp_version_endpoint_yaml(protocol: &str, mcp_body: Option<&str>) -> String {
+        let mcp = mcp_body.map_or_else(String::new, |body| format!("        mcp:\n{body}"));
+        format!(
+            "version: 1\nnetwork_policies:\n  versioned:\n    endpoints:\n      - host: mcp.example.com\n        port: 443\n        protocol: {protocol}\n{mcp}"
+        )
+    }
+
+    #[test]
+    fn mcp_version_profile_fixture_round_trips_in_canonical_order() {
+        let fixture = include_str!("../testdata/mcp-version-profiles.yaml");
+        let policy = parse_sandbox_policy(fixture).expect("fixed MCP profile fixture must parse");
+        let endpoint = &policy.network_policies["versioned_mcp"].endpoints[0];
+        assert_eq!(
+            endpoint.mcp.as_ref().expect("MCP options").versions,
+            MCP_VERSIONS
+        );
+
+        let canonical =
+            serialize_sandbox_policy(&policy).expect("MCP profile fixture must serialize");
+        let positions =
+            MCP_VERSIONS.map(|version| canonical.find(version).expect("serialized revision"));
+        assert!(positions.windows(2).all(|pair| pair[0] < pair[1]));
+        assert_eq!(
+            parse_sandbox_policy(&canonical).expect("canonical fixture must parse"),
+            policy
+        );
+    }
+
+    #[test]
+    fn omitted_authored_mcp_versions_materialize_the_pinned_default() {
+        let omitted_stanza = parse_sandbox_policy(&mcp_version_endpoint_yaml("mcp", None))
+            .expect("an omitted MCP stanza must select the default revision");
+        let explicit_default = parse_sandbox_policy(&mcp_version_endpoint_yaml(
+            "mcp",
+            Some("          versions: [\"2025-11-25\"]\n"),
+        ))
+        .expect("the explicit default revision must parse");
+        assert_eq!(omitted_stanza, explicit_default);
+
+        let omitted_versions = parse_sandbox_policy(&mcp_version_endpoint_yaml(
+            "mcp",
+            Some("          strict_tool_names: false\n"),
+        ))
+        .expect("an omitted versions key must select the default revision");
+        let options = omitted_versions.network_policies["versioned"].endpoints[0]
+            .mcp
+            .as_ref()
+            .expect("MCP options must be materialized");
+        assert_eq!(options.versions, default_mcp_versions());
+        assert_eq!(options.strict_tool_names, Some(false));
+
+        let yaml = serialize_sandbox_policy(&omitted_stanza)
+            .expect("the materialized default must serialize");
+        assert!(yaml.contains("versions:"));
+        assert!(yaml.contains(DEFAULT_MCP_PROTOCOL_VERSION.as_str()));
+    }
+
+    #[test]
+    fn pinned_mcp_default_does_not_expand_to_the_supported_registry() {
+        assert_eq!(default_mcp_versions().len(), 1);
+        assert_eq!(
+            default_mcp_versions(),
+            [DEFAULT_MCP_PROTOCOL_VERSION.as_str()]
+        );
+        assert!(McpProtocolVersion::ALL.len() > default_mcp_versions().len());
+    }
+
+    #[test]
+    fn mcp_version_yaml_rejects_explicit_empty_duplicate_unknown_and_misplaced_values() {
+        let cases = [
+            ("null allowlist", "mcp", Some("          versions: null\n")),
+            ("empty allowlist", "mcp", Some("          versions: []\n")),
+            (
+                "empty identifier",
+                "mcp",
+                Some("          versions: [\"\"]\n"),
+            ),
+            (
+                "duplicate revision",
+                "mcp",
+                Some("          versions: [\"2025-03-26\", \"2025-03-26\"]\n"),
+            ),
+            (
+                "unsupported revision",
+                "mcp",
+                Some("          versions: [\"2025-03-27\"]\n"),
+            ),
+            (
+                "unsupported alias",
+                "mcp",
+                Some("          versions: [\"latest\"]\n"),
+            ),
+            (
+                "moving draft alias",
+                "mcp",
+                Some("          versions: [\"draft\"]\n"),
+            ),
+            (
+                "leading whitespace",
+                "mcp",
+                Some("          versions: [\" 2025-03-26\"]\n"),
+            ),
+            (
+                "trailing whitespace",
+                "mcp",
+                Some("          versions: [\"2025-03-26 \"]\n"),
+            ),
+            (
+                "non-MCP placement",
+                "json-rpc",
+                Some("          versions: [\"2025-03-26\"]\n"),
+            ),
+        ];
+
+        for (case, protocol, body) in cases {
+            let yaml = mcp_version_endpoint_yaml(protocol, body);
+            assert!(parse_sandbox_policy(&yaml).is_err(), "{case} must fail");
+        }
+
+        let mut null_mcp = mcp_version_endpoint_yaml("mcp", None);
+        null_mcp.push_str("        mcp: null\n");
+        assert!(
+            parse_sandbox_policy(&null_mcp).is_err(),
+            "an explicit null MCP stanza must fail"
+        );
+    }
+
+    #[test]
+    fn mcp_version_proto_validation_preserves_raw_invalid_values() {
+        let cases = [
+            ("empty identifier", vec![""]),
+            ("unsupported revision", vec!["2025-03-27"]),
+            ("unsupported alias", vec!["latest"]),
+            ("moving draft alias", vec!["draft"]),
+            ("leading whitespace", vec![" 2025-03-26"]),
+            ("trailing whitespace", vec!["2025-03-26 "]),
+        ];
+        for (case, versions) in cases {
+            let policy = mcp_version_policy("mcp", Some(mcp_version_options(&versions)));
+            let violations = validate_sandbox_policy(&policy).expect_err(case);
+            assert!(violations.iter().any(|violation| matches!(
+                violation,
+                PolicyViolation::UnsupportedMcpVersion { version, .. }
+                    if version == versions[0]
+            )));
+        }
+
+        let duplicate = mcp_version_policy(
+            "mcp",
+            Some(mcp_version_options(&["2025-03-26", "2025-03-26"])),
+        );
+        assert!(
+            validate_sandbox_policy(&duplicate)
+                .expect_err("duplicate must fail")
+                .iter()
+                .any(|violation| matches!(
+                    violation,
+                    PolicyViolation::DuplicateMcpVersion { version, .. }
+                        if version == "2025-03-26"
+                ))
+        );
+
+        for misplaced in [McpOptions::default(), mcp_version_options(&["2025-03-26"])] {
+            let policy = mcp_version_policy("rest", Some(misplaced));
+            assert!(matches!(
+                validate_sandbox_policy(&policy)
+                    .expect_err("misplaced options must fail")
+                    .as_slice(),
+                [PolicyViolation::McpOptionsOnNonMcpEndpoint { .. }]
+            ));
+        }
+    }
+
+    #[test]
+    fn protobuf_missing_and_empty_mcp_options_materialize_the_same_default() {
+        let missing = mcp_version_policy("mcp", None);
+        let empty = mcp_version_policy("mcp", Some(McpOptions::default()));
+        let explicit = mcp_version_policy(
+            "mcp",
+            Some(mcp_version_options(
+                &[DEFAULT_MCP_PROTOCOL_VERSION.as_str()],
+            )),
+        );
+
+        for raw in [&missing, &empty] {
+            assert!(matches!(
+                validate_sandbox_policy(raw)
+                    .expect_err("borrowed validation requires canonical effective state")
+                    .as_slice(),
+                [PolicyViolation::MissingMcpVersions { .. }]
+            ));
+            let canonical = validate_and_canonicalize_sandbox_policy(raw.clone())
+                .expect("checked protobuf boundaries must materialize the default");
+            assert_eq!(canonical, explicit);
+            assert_eq!(
+                canonical.network_policies["versioned"].endpoints[0]
+                    .mcp
+                    .as_ref()
+                    .expect("MCP options must be materialized")
+                    .versions,
+                default_mcp_versions()
+            );
+        }
+
+        assert_eq!(
+            serialize_sandbox_policy(&missing).expect("missing options must serialize"),
+            serialize_sandbox_policy(&explicit).expect("explicit options must serialize")
+        );
+        let defaulted_json =
+            sandbox_policy_to_json_value(&empty).expect("empty options must serialize");
+        assert_eq!(
+            defaulted_json,
+            sandbox_policy_to_json_value(&explicit).expect("explicit options must serialize")
+        );
+        assert_eq!(
+            defaulted_json["network_policies"]["versioned"]["endpoints"][0]["mcp"]["versions"],
+            serde_json::json!([DEFAULT_MCP_PROTOCOL_VERSION.as_str()])
+        );
+    }
+
+    #[test]
+    fn unsupported_mcp_version_errors_explain_the_explicit_l4_escape_hatch() {
+        const DEFAULT_REMEDIATION: &str = "omit mcp.versions to use the pinned default revision";
+        const L4_REMEDIATION: &str =
+            "omit protocol and mcp for deliberate uninspected L4 passthrough";
+
+        let yaml = mcp_version_endpoint_yaml("mcp", Some("          versions: [\"draft\"]\n"));
+        let authored_diagnostic = parse_sandbox_policy(&yaml)
+            .expect_err("moving draft aliases must fail closed")
+            .to_string();
+        assert!(
+            authored_diagnostic.contains(DEFAULT_REMEDIATION)
+                && authored_diagnostic.contains(L4_REMEDIATION),
+            "rendered diagnostic omitted remediation choices: {authored_diagnostic}"
+        );
+
+        let policy = mcp_version_policy("mcp", Some(mcp_version_options(&["2026-07-28"])));
+        let violations = validate_sandbox_policy(&policy)
+            .expect_err("unsupported protobuf revisions must fail closed");
+        assert!(violations.iter().map(ToString::to_string).any(|message| {
+            message.contains(DEFAULT_REMEDIATION) && message.contains(L4_REMEDIATION)
+        }));
+    }
+
+    #[test]
+    fn mcp_version_canonicalization_preserves_invalid_and_duplicate_entries() {
+        let mut policy = mcp_version_policy(
+            "mcp",
+            Some(mcp_version_options(&[
+                "unknown-z",
+                "2025-11-25",
+                "2025-03-26",
+                "2025-03-26",
+                "unknown-a",
+            ])),
+        );
+
+        canonicalize_mcp_version_allowlists(&mut policy);
+
+        assert_eq!(
+            policy.network_policies["versioned"].endpoints[0]
+                .mcp
+                .as_ref()
+                .expect("MCP options")
+                .versions,
+            [
+                "2025-03-26",
+                "2025-03-26",
+                "2025-11-25",
+                "unknown-a",
+                "unknown-z",
+            ]
+        );
+        let violations = validate_sandbox_policy(&policy)
+            .expect_err("normalization must not repair invalid input");
+        assert!(
+            violations
+                .iter()
+                .any(|violation| matches!(violation, PolicyViolation::DuplicateMcpVersion { .. }))
+        );
+        assert!(
+            violations.iter().any(|violation| matches!(
+                violation,
+                PolicyViolation::UnsupportedMcpVersion { .. }
+            ))
+        );
+    }
+
+    #[test]
+    fn canonical_serializers_reject_invalid_mcp_policy_before_conversion() {
+        let invalid = [
+            mcp_version_policy(
+                "mcp",
+                Some(mcp_version_options(&["2025-03-26", "2025-03-26"])),
+            ),
+            mcp_version_policy("mcp", Some(mcp_version_options(&["latest"]))),
+            mcp_version_policy("mcp", Some(mcp_version_options(&["2025-03-26 "]))),
+            mcp_version_policy("rest", Some(McpOptions::default())),
+            mcp_version_policy("json-rpc", Some(mcp_version_options(&["2025-03-26"]))),
+        ];
+
+        for policy in invalid {
+            assert!(serialize_sandbox_policy(&policy).is_err());
+            assert!(sandbox_policy_to_json_value(&policy).is_err());
+            assert!(serialize_sandbox_policy_json(&policy).is_err());
+        }
+    }
+
+    #[test]
+    fn canonical_serializers_do_not_enforce_unrelated_mutation_safety_rules() {
+        let mut policy = mcp_version_policy(
+            "mcp",
+            Some(mcp_version_options(&["2025-11-25", "2025-03-26"])),
+        );
+        policy.process = Some(ProcessPolicy {
+            run_as_user: "root".to_string(),
+            run_as_group: "sandbox".to_string(),
+        });
+        assert!(validate_sandbox_policy(&policy).is_err());
+
+        let yaml = serialize_sandbox_policy(&policy)
+            .expect("serialization must remain available for policy inspection");
+        let first = yaml.find("2025-03-26").expect("first version");
+        let second = yaml.find("2025-11-25").expect("second version");
+        assert!(first < second);
+        assert!(sandbox_policy_to_json_value(&policy).is_ok());
+    }
+
+    #[test]
+    fn mcp_version_checked_canonicalization_returns_valid_semantic_order() {
+        let policy = mcp_version_policy(
+            "mcp",
+            Some(mcp_version_options(&[
+                "2025-11-25",
+                "2025-03-26",
+                "2025-06-18",
+            ])),
+        );
+        let canonical = validate_and_canonicalize_sandbox_policy(policy)
+            .expect("valid policy must canonicalize");
+
+        assert_eq!(
+            canonical.network_policies["versioned"].endpoints[0]
+                .mcp
+                .as_ref()
+                .expect("MCP options")
+                .versions,
+            MCP_VERSIONS
+        );
+        assert!(validate_sandbox_policy(&canonical).is_ok());
     }
 
     #[test]
@@ -3824,6 +4648,7 @@ network_policies:
         protocol: mcp
         enforcement: enforce
         mcp:
+          versions: [2025-03-26]
           max_body_bytes: 131072
           strict_tool_names: false
         rules:
@@ -3875,6 +4700,7 @@ network_policies:
         port: 443
         protocol: mcp
         mcp:
+          versions: [2025-03-26]
           max_body_bytes: 131072
           strict_tool_names: false
         rules:

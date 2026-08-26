@@ -4,7 +4,7 @@
 //! Request validation helpers for the gRPC service.
 //!
 //! All functions in this module are pure — they take proto types or primitives
-//! and return `Result<(), Status>`.  No server state is required.
+//! and return validated values or `Status` errors. No server state is required.
 
 #![allow(clippy::result_large_err)] // Validation returns Result<_, Status>
 
@@ -876,6 +876,19 @@ pub(super) fn validate_policy_safety(policy: &ProtoSandboxPolicy) -> Result<(), 
         )));
     }
     Ok(())
+}
+
+/// Validate a policy and return the canonical value safe to hash and persist.
+///
+/// Validation runs before canonicalization so sorting cannot hide duplicate or
+/// unsupported MCP revisions. Callers must use the returned value because the
+/// input may carry an equivalent but noncanonical revision order.
+pub(super) fn validate_and_canonicalize_policy(
+    policy: ProtoSandboxPolicy,
+) -> Result<ProtoSandboxPolicy, Status> {
+    openshell_policy::validate_and_canonicalize_sandbox_policy(policy).map_err(|error| {
+        Status::invalid_argument(format!("policy contains unsafe content: {error}"))
+    })
 }
 
 /// Validate that user-authored policy does not use provider-derived rule keys.
