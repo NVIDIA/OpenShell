@@ -17,7 +17,7 @@ on:
         type: string
         default: "rust-binary-*"
     outputs:
-      manifest-ref:
+      manifest_ref:
         description: "Digest-pinned OCI manifest reference"
         value: ${{ jobs.publish.outputs.manifest_ref }}
 
