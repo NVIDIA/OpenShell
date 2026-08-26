@@ -293,13 +293,13 @@ Profile-managed providers also contribute provider-generated network policy
 entries. Endpoint binding independently limits where each static credential can
 be resolved.
 
-<Warning>
-Legacy provider attachment is fixed at sandbox creation time. Provider profiles add
-`openshell sandbox provider attach` and `openshell sandbox provider detach` for
-running sandboxes. See [Profiles](/providers/profiles#attach-and-detach-providers)
-for runtime attach and detach behavior.
+<Info>
+Use `--provider` to attach providers when creating a sandbox. To change the
+providers attached to a running sandbox, use `openshell sandbox provider attach`
+and `openshell sandbox provider detach`. See
+[Profiles](/providers/profiles#attach-and-detach-providers) for details.
 
-</Warning>
+</Info>
 
 ### Auto-Discovery Shortcut
 
