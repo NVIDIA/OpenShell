@@ -167,6 +167,12 @@ struct Args {
     #[arg(long, env = "OPENSHELL_VM_PROXY_CA_BUNDLE")]
     proxy_ca_bundle: Option<String>,
 
+    #[arg(long, env = "OPENSHELL_VM_ROOTFS_TAR_STAGING_DIR")]
+    rootfs_tar_staging_dir: Option<PathBuf>,
+
+    #[arg(long, env = "OPENSHELL_VM_ROOTFS_TAR_MAX_BYTES")]
+    rootfs_tar_max_bytes: Option<u64>,
+
     #[arg(long, hide = true)]
     vm_backend: Option<String>,
 
@@ -261,6 +267,8 @@ async fn main() -> Result<()> {
         proxy_auth_allow_insecure: args.proxy_auth_allow_insecure,
         proxy_connect_by_hostname: args.proxy_connect_by_hostname,
         proxy_ca_bundle: args.proxy_ca_bundle.clone(),
+        rootfs_tar_staging_dir: args.rootfs_tar_staging_dir.clone(),
+        rootfs_tar_max_bytes: args.rootfs_tar_max_bytes,
     })
     .await
     .map_err(|err| miette::miette!("{err}"))?;

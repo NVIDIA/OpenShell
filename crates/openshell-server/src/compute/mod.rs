@@ -305,6 +305,8 @@ pub struct ComputeDriverInfoSnapshot {
     pub supports_sandbox_authentication: bool,
     /// Whether the driver reports runtime readiness without a supervisor session.
     pub driver_reports_runtime_readiness: bool,
+    /// Directory where rootfs tar files must be staged.
+    pub rootfs_tar_staging_dir: String,
 }
 
 /// Interval between store-vs-backend reconciliation sweeps.
@@ -653,6 +655,7 @@ impl ComputeRuntime {
             gateway_manages_lifecycle: capabilities.gateway_manages_lifecycle,
             supports_sandbox_authentication: capabilities.supports_sandbox_authentication,
             driver_reports_runtime_readiness: capabilities.driver_reports_runtime_readiness,
+            rootfs_tar_staging_dir: capabilities.rootfs_tar_staging_dir,
         };
         let default_image = capabilities.default_image;
         let gateway_listener_requirements = match driver
@@ -4655,6 +4658,7 @@ impl ComputeDriver for NoopTestDriver {
                 gateway_manages_lifecycle: false,
                 supports_sandbox_authentication: self.sandbox_authentication.is_some(),
                 driver_reports_runtime_readiness: false,
+                rootfs_tar_staging_dir: String::new(),
             },
         ))
     }
@@ -4799,6 +4803,7 @@ pub async fn new_test_runtime_with_driver(
             gateway_manages_lifecycle: false,
             supports_sandbox_authentication,
             driver_reports_runtime_readiness: false,
+            rootfs_tar_staging_dir: String::new(),
         },
         telemetry_compute_driver: TelemetryComputeDriver::custom(),
         driver_process: None,
@@ -4977,6 +4982,7 @@ mod tests {
                 gateway_manages_lifecycle: false,
                 supports_sandbox_authentication: false,
                 driver_reports_runtime_readiness: false,
+                rootfs_tar_staging_dir: String::new(),
             }))
         }
 
@@ -5318,6 +5324,7 @@ mod tests {
                 gateway_manages_lifecycle: false,
                 supports_sandbox_authentication: false,
                 driver_reports_runtime_readiness: false,
+                rootfs_tar_staging_dir: String::new(),
             }))
         }
 
@@ -5528,6 +5535,7 @@ mod tests {
                 gateway_manages_lifecycle: false,
                 supports_sandbox_authentication: false,
                 driver_reports_runtime_readiness: false,
+                rootfs_tar_staging_dir: String::new(),
             },
             telemetry_compute_driver: TelemetryComputeDriver::custom(),
             driver_process: None,

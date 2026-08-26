@@ -546,8 +546,9 @@ pub async fn sandbox_create(
                         (Some(tag), None)
                     }
                     ResolvedSource::RootfsTar { path } => {
-                        validate_rootfs_tar_source(gateway_name, &mut client, &path).await?;
-                        (None, Some(path))
+                        let staged =
+                            validate_and_stage_rootfs_tar(gateway_name, &mut client, &path).await?;
+                        (None, Some(staged))
                     }
                 }
             }
@@ -1358,12 +1359,13 @@ async fn build_from_dockerfile(
     Ok(tag)
 }
 
-/// Validate that a rootfs tar source is usable with the current gateway.
-async fn validate_rootfs_tar_source(
+/// Validate that a rootfs tar source is usable with the current gateway, then
+/// copy it into the driver's staging directory. Returns the staged path.
+async fn validate_and_stage_rootfs_tar(
     gateway_name: &str,
     client: &mut crate::tls::GrpcClient,
     tar_path: &Path,
-) -> Result<()> {
+) -> Result<PathBuf> {
     let metadata = get_gateway_metadata(gateway_name);
     if !dockerfile_sources_supported_for_gateway(metadata.as_ref()) {
         return Err(miette!(
@@ -1379,7 +1381,11 @@ async fn validate_rootfs_tar_source(
         .wrap_err("failed to query gateway compute driver")?
         .into_inner();
 
-    let driver_name = info.compute_drivers.first().map_or("", |d| d.name.as_str());
+    let driver = info
+        .compute_drivers
+        .first()
+        .ok_or_else(|| miette!("gateway '{}' has no compute drivers", gateway_name))?;
+    let driver_name = driver.name.as_str();
 
     if driver_name != "vm" {
         return Err(miette!(
@@ -1390,14 +1396,36 @@ async fn validate_rootfs_tar_source(
         ));
     }
 
+    let staging_dir = driver
+        .capabilities
+        .as_ref()
+        .map_or("", |c| c.rootfs_tar_staging_dir.as_str());
+    if staging_dir.is_empty() {
+        return Err(miette!(
+            "gateway '{}' VM driver did not advertise a rootfs tar staging directory",
+            gateway_name
+        ));
+    }
+    let staging_dir = PathBuf::from(staging_dir);
+
+    let file_name = tar_path
+        .file_name()
+        .ok_or_else(|| miette!("rootfs tar path has no filename"))?;
+    let staged_name = format!("{}-{}", std::process::id(), file_name.to_string_lossy());
+    let staged_path = staging_dir.join(&staged_name);
+
     eprintln!(
-        "Using rootfs tar {} for gateway '{}'",
+        "Staging rootfs tar {} for gateway '{}'",
         tar_path.display().to_string().cyan(),
         gateway_name,
     );
+    tokio::fs::copy(tar_path, &staged_path)
+        .await
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed to stage rootfs tar to {}", staged_path.display()))?;
     eprintln!();
 
-    Ok(())
+    Ok(staged_path)
 }
 
 /// Build a `driver_config` struct carrying the rootfs tar path for the VM driver.

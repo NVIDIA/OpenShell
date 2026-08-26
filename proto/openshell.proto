@@ -837,6 +837,9 @@ message ComputeDriverCapabilities {
   // Driver-reported implementation version from the startup capability snapshot.
   string driver_version = 2;
 
+  // Absolute path where rootfs tar files must be staged before creating a
+  // sandbox. Empty when the driver does not support rootfs tar sources.
+  string rootfs_tar_staging_dir = 3;
 }
 
 // Public sandbox resource exposed by the OpenShell API.

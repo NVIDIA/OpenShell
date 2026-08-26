@@ -91,6 +91,9 @@ const MAX_REGISTRY_LAYER_DOWNLOAD_CONCURRENCY: usize = 16;
 const REGISTRY_REQUEST_MAX_ATTEMPTS: usize = 4;
 const REGISTRY_RETRY_INITIAL_DELAY: Duration = Duration::from_millis(250);
 const REGISTRY_RETRY_MAX_DELAY: Duration = Duration::from_secs(1);
+/// 10 GiB — configurable via `rootfs_tar_max_bytes`.
+const DEFAULT_ROOTFS_TAR_MAX_BYTES: u64 = 10 * 1024 * 1024 * 1024;
+const ROOTFS_TAR_STAGING_DIR: &str = "rootfs-tar-staging";
 
 #[derive(Debug, Clone, Default, serde::Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -325,6 +328,13 @@ pub struct VmDriverConfig {
     /// TLS-intercepting proxy.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proxy_ca_bundle: Option<String>,
+    /// Directory where rootfs tar files must be staged before they can be
+    /// referenced in a `CreateSandbox` request. Defaults to `<state_dir>/rootfs-tar-staging`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rootfs_tar_staging_dir: Option<PathBuf>,
+    /// Maximum rootfs tar file size in bytes. Defaults to 10 GiB.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rootfs_tar_max_bytes: Option<u64>,
 }
 
 /// Redacting `Debug` so a proxy URL or credential path never reaches a log.
@@ -358,6 +368,8 @@ impl std::fmt::Debug for VmDriverConfig {
             .field("proxy_auth_allow_insecure", &self.proxy_auth_allow_insecure)
             .field("proxy_connect_by_hostname", &self.proxy_connect_by_hostname)
             .field("proxy_ca_bundle", &self.proxy_ca_bundle)
+            .field("rootfs_tar_staging_dir", &self.rootfs_tar_staging_dir)
+            .field("rootfs_tar_max_bytes", &self.rootfs_tar_max_bytes)
             .finish()
     }
 }
@@ -392,6 +404,8 @@ impl Default for VmDriverConfig {
             proxy_auth_allow_insecure: None,
             proxy_connect_by_hostname: None,
             proxy_ca_bundle: None,
+            rootfs_tar_staging_dir: None,
+            rootfs_tar_max_bytes: None,
         }
     }
 }
@@ -451,6 +465,17 @@ impl VmDriverConfig {
                 ca_bundle: self.proxy_ca_bundle.as_deref(),
             },
         )
+    }
+
+    fn rootfs_tar_staging_dir(&self) -> PathBuf {
+        self.rootfs_tar_staging_dir
+            .clone()
+            .unwrap_or_else(|| self.state_dir.join(ROOTFS_TAR_STAGING_DIR))
+    }
+
+    fn rootfs_tar_max_bytes(&self) -> u64 {
+        self.rootfs_tar_max_bytes
+            .unwrap_or(DEFAULT_ROOTFS_TAR_MAX_BYTES)
     }
 
     fn requires_tls_materials(&self) -> bool {
@@ -624,6 +649,13 @@ impl VmDriver {
                     image_cache_root.display()
                 )
             })?;
+        let staging_dir = config.rootfs_tar_staging_dir();
+        create_private_dir_all(&staging_dir).await.map_err(|err| {
+            format!(
+                "failed to create rootfs tar staging dir '{}': {err}",
+                staging_dir.display()
+            )
+        })?;
 
         let launcher_bin = if let Some(path) = config.launcher_bin.clone() {
             path
@@ -664,6 +696,59 @@ impl VmDriver {
         Ok(driver)
     }
 
+    async fn validate_rootfs_tar_path(&self, raw: &Path) -> Result<PathBuf, Status> {
+        let staging_dir = self.config.rootfs_tar_staging_dir();
+        let canonical_staging = tokio::fs::canonicalize(&staging_dir).await.map_err(|err| {
+            Status::internal(format!(
+                "rootfs tar staging dir not accessible at {}: {err}",
+                staging_dir.display()
+            ))
+        })?;
+
+        let canonical = tokio::fs::canonicalize(raw).await.map_err(|err| {
+            Status::failed_precondition(format!(
+                "rootfs tar path not accessible at {}: {err}",
+                raw.display()
+            ))
+        })?;
+
+        if !canonical.starts_with(&canonical_staging) {
+            return Err(Status::permission_denied(format!(
+                "rootfs tar path {} is outside the staging directory {}",
+                canonical.display(),
+                canonical_staging.display()
+            )));
+        }
+
+        let metadata = tokio::fs::symlink_metadata(&canonical)
+            .await
+            .map_err(|err| {
+                Status::failed_precondition(format!(
+                    "rootfs tar not accessible at {}: {err}",
+                    canonical.display()
+                ))
+            })?;
+        if !metadata.file_type().is_file() {
+            return Err(Status::invalid_argument(format!(
+                "rootfs tar path {} is not a regular file",
+                canonical.display()
+            )));
+        }
+
+        let max_bytes = self.config.rootfs_tar_max_bytes();
+        let file_size = metadata.len();
+        if file_size > max_bytes {
+            return Err(Status::invalid_argument(format!(
+                "rootfs tar {} is {} bytes, exceeding the {} byte limit",
+                canonical.display(),
+                file_size,
+                max_bytes
+            )));
+        }
+
+        Ok(canonical)
+    }
+
     #[must_use]
     pub fn capabilities(&self) -> GetCapabilitiesResponse {
         GetCapabilitiesResponse {
@@ -673,6 +758,11 @@ impl VmDriver {
             gateway_manages_lifecycle: true,
             supports_sandbox_authentication: false,
             driver_reports_runtime_readiness: false,
+            rootfs_tar_staging_dir: self
+                .config
+                .rootfs_tar_staging_dir()
+                .to_string_lossy()
+                .into_owned(),
         }
     }
 
@@ -883,7 +973,10 @@ impl VmDriver {
             .is_some();
         let driver_config =
             VmSandboxDriverConfig::from_sandbox(&sandbox).map_err(Status::invalid_argument)?;
-        let rootfs_tar_path = driver_config.rootfs_tar_path.map(PathBuf::from);
+        let rootfs_tar_path = match driver_config.rootfs_tar_path {
+            Some(raw) => Some(self.validate_rootfs_tar_path(Path::new(&raw)).await?),
+            None => None,
+        };
 
         self.publish_platform_event(
             sandbox.id.clone(),
