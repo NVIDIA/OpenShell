@@ -29,7 +29,7 @@ The manifest-driven launcher at `scripts/agents/run.sh` reads `agent.yaml`, whic
 
 The launcher:
 
-- Scans `profile_paths` in manifest order and imports `providers/github-gator.yaml`.
+- Scans `profile_paths` in manifest order and imports or updates `providers/github-gator.yaml`.
 - Creates or updates the `github-gator` provider from `gh auth token`.
 - Selects the requested harness and bakes the common runtime into the immutable sandbox payload.
 - For `--harness codex`, imports `providers/codex-gator.yaml`, creates or updates the `codex-gator` provider from `$HOME/.codex/auth.json`, and stores the refresh token as gateway-only refresh material.
@@ -38,14 +38,18 @@ The launcher:
 - Uses the gator image policy copied to `/etc/openshell/policy.yaml`.
 - Installs the gator-specific `gh` wrapper from `gator/bin/gh` as `/usr/local/bin/gh` to fail closed when same-head-SHA history cannot be checked, prevent duplicate dispositions, and require versioned review payloads.
 - Installs `gator/bin/review-feedback-ledger` as `/usr/local/bin/review-feedback-ledger` so reviews receive tree- and patch-aware scope, prior summaries and findings, resolution state, convergence telemetry, and the three-round Warning budget.
+- Installs `gator/bin/resolve-gator-review-threads` so a follow-up commit that
+  demonstrably fixes a Gator inline finding can resolve the corresponding
+  Gator-owned GitHub review thread without touching human review threads.
 - Installs `gator/bin/validate-review-findings` to downgrade blockers that lack the required reachability, ownership, base-vs-head, impact, and reproducer evidence.
+- Keeps that normalized evidence as Gator's internal review contract, then renders validated blockers for people as a read-aloud `Summary`, an actionable `Fix`, and a deterministic `Verify`. Exact paths and only the additional provenance an implementation agent needs appear in collapsed `Agent context`; raw evidence headings such as `Base` and `Head` are not posted publicly. Review-process provenance, docs and E2E disposition, SHAs, and state codes appear at the end of the summary in collapsed `Gator metadata`, while required human actions remain visible.
 - Bakes `scripts/agents/gator/skills/gator-gate/SKILL.md` into `/etc/openshell/agent-payload`.
 - Bakes `.claude/agents/principal-engineer-reviewer.md` so the selected harness can run a deterministic independent reviewer execution through `/etc/openshell/agent-payload/runtime/subagent.sh principal-engineer-reviewer < task.md`.
 - For `--harness codex`, optionally bakes a host Codex executable as `/etc/openshell/agent-payload/runtime/harnesses/codex/codex`.
 - Starts the selected harness without a TTY.
 - Runs gator in `watch` mode by default. The sandbox stays alive while the supervisor sleeps between bounded Codex cycles, so Codex is not connected during passive PR waits. The supervisor prints periodic heartbeat lines during active cycles and passive sleeps.
 - Makes each watch cycle compare its immutable payload version with the version published on the default branch. A stale watcher stops without GitHub writes and must be relaunched.
-The GitHub provider profile allows read-only GraphQL queries on `api.github.com/graphql` so `gh` read paths can use GraphQL when needed. Write operations remain REST-only and scoped to the two allowed repositories.
+The GitHub provider profile allows read-only GraphQL queries on `api.github.com/graphql` so `gh` read paths can use GraphQL when needed. Its only GraphQL mutation is the named `ResolveGatorReviewThread` operation, restricted to the `resolveReviewThread` root field. All other writes remain REST-only and scoped to the two allowed repositories.
 
 Set `GATOR_CODEX_ACCESS_CREDENTIAL_KEY` or pass `--codex-access-key` if the gator Codex profile uses a credential key other than `CODEX_AUTH_ACCESS_TOKEN` for the short-lived access token.
 
@@ -58,4 +62,6 @@ The launcher preserves existing gateway-owned Codex refresh material by default 
 ```shell
 bash scripts/agents/gator/bin/gh_guard_test.sh
 bash scripts/agents/gator/bin/review_feedback_ledger_test.sh
+bash scripts/agents/gator/bin/resolve_gator_review_threads_test.sh
+bash scripts/agents/runtime/harnesses/codex/exec_test.sh
 ```
