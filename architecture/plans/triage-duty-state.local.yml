@@ -1,0 +1,38 @@
+duty_period_start: "2026-08-18T15:00:00Z"
+last_successful_scan: "2026-08-25T10:04:15Z"
+latest_report: "triage-duty-reports/2026-08-25T100415Z.md"
+source_cursors:
+  slack:
+    C0AE9P50JVA: "1787586131.104459"
+    C0AR6QP0CKH: "1787638907.908979"
+  github:
+    observed_at: "2026-08-25T10:04:15Z"
+historical_unlabelled_open_issue_count: 71
+superseded_recommendations:
+  2026-08-19T135856Z/R-01: "Drew intentionally removed state:triage-needed; no action required."
+dispositions:
+  2026-08-20T183437Z/R-01:
+    status: deferred
+    report: "triage-duty-reports/2026-08-20T183437Z.md"
+    action_record: "triage-duty-reports/2026-08-20T184911Z-actions.md"
+    outcome: "deferred; #2830 is relevant context, but R-01 remains open"
+  2026-08-20T183437Z/R-02:
+    status: applied
+    report: "triage-duty-reports/2026-08-20T183437Z.md"
+    action_record: "triage-duty-reports/2026-08-20T184255Z-actions.md"
+    outcome: "added state:triage-needed to #2841"
+  2026-08-20T183437Z/R-03:
+    status: applied
+    report: "triage-duty-reports/2026-08-20T183437Z.md"
+    action_record: "triage-duty-reports/2026-08-20T184417Z-actions.md"
+    outcome: "added state:triage-needed to #2845"
+  2026-08-24T081721Z/R-02:
+    status: applied
+    report: "triage-duty-reports/2026-08-24T081721Z.md"
+    action_record: "triage-duty-reports/2026-08-24T084601Z-actions.md"
+    outcome: "resolved by existing tracking issue #1988; no external write"
+  R-01:
+    status: applied
+    report: "triage-duty-reports/2026-08-20T091625Z.md"
+    action_record: "triage-duty-reports/2026-08-20T091849Z-actions.md"
+    outcome: "no-op; maintainer response already present"

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Apply Triage Action"
+  short_description: "Apply one approved triage recommendation safely"
+  default_prompt: "Use $apply-triage-action to process recommendation R-01."
