@@ -22,7 +22,11 @@ if [ -z "${E2E_TEST}" ] || [ "${E2E_TEST}" = "provider_token_exchange" ]; then
   export OPENSHELL_E2E_SPIFFE_FIXTURE="${OPENSHELL_E2E_SPIFFE_FIXTURE:-1}"
 fi
 
-cargo build -p openshell-cli
+if [ -z "${OPENSHELL_BIN:-}" ]; then
+  cargo build -p openshell-cli
+else
+  echo "Using prebuilt openshell CLI at ${OPENSHELL_BIN}"
+fi
 
 TEST_ARGS=(
   cargo test --manifest-path "${ROOT}/e2e/rust/Cargo.toml"
