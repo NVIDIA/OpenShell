@@ -129,6 +129,21 @@ port_is_in_use() {
   (echo >/dev/tcp/127.0.0.1/"${port}") >/dev/null 2>&1
 }
 
+append_local_otlp_config_if_available() {
+  local config_path=$1
+  if ! port_is_in_use 4317; then
+    echo "OTLP collector not detected on 127.0.0.1:4317; trace export disabled."
+    return
+  fi
+
+  cat >>"${config_path}" <<'EOF'
+
+[openshell.gateway.otlp]
+endpoint = "http://127.0.0.1:4317"
+EOF
+  echo "OTLP trace export enabled for http://127.0.0.1:4317."
+}
+
 register_gateway_metadata() {
   local name=$1
   local endpoint=$2
@@ -207,9 +222,6 @@ compute_drivers = ["podman"]
 default_image = "${SANDBOX_IMAGE}"
 disable_tls = true
 
-[openshell.gateway.otlp]
-endpoint = "http://127.0.0.1:4317"
-
 [openshell.gateway.auth]
 allow_unauthenticated_users = true
 
@@ -265,6 +277,8 @@ fi
 if [[ -n "${OPENSHELL_SANDBOX_PROXY_CA_BUNDLE+x}" ]]; then
   printf 'proxy_ca_bundle = "%s"\n' "$(toml_escape "${OPENSHELL_SANDBOX_PROXY_CA_BUNDLE}")" >>"${CONFIG_PATH}"
 fi
+
+append_local_otlp_config_if_available "${CONFIG_PATH}"
 
 GATEWAY_ENDPOINT="http://${CLI_ENDPOINT_HOST}:${PORT}"
 register_gateway_metadata "${GATEWAY_NAME}" "${GATEWAY_ENDPOINT}" "${PORT}"

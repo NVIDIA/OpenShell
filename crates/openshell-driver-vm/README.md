@@ -44,6 +44,7 @@ By default `mise run gateway:vm`:
 - Persists the gateway SQLite DB under `.cache/gateway-vm/gateway.db`.
 - Places the VM driver state (per-sandbox `overlay.ext4`, image cache, and `run/compute-driver.sock`) under `/tmp/openshell-vm-driver-$USER-vm-dev/` so the AF_UNIX socket path stays under macOS `SUN_LEN`.
 - Writes `.cache/gateway-vm/gateway.toml` with `[openshell.drivers.vm].driver_dir = "$PWD/target/debug"` so the freshly built `openshell-driver-vm` is used instead of an older installed copy from `~/.local/libexec/openshell`, `/usr/libexec/openshell`, or `/usr/local/libexec`.
+- Enables OTLP trace export to `http://127.0.0.1:4317` only when a local collector is listening there. Otherwise, it omits the OTLP configuration to avoid repeated export failures.
 
 For GPU passthrough (VFIO), pass `-- --gpu` and run with root privileges:
 

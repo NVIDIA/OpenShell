@@ -120,8 +120,9 @@ Kubernetes compute-driver spans under their distinct service names, along with
 Agent Sandbox controller reconciliation spans linked through the Sandbox
 trace-context annotation. The same command exposes OTLP/gRPC on
 `http://127.0.0.1:4317` and, when deployed, the Kubernetes gateway on
-`http://127.0.0.1:8090`; the local `gateway`, `gateway:docker`, and `gateway:vm`
-tasks export to the collector endpoint automatically.
+`http://127.0.0.1:8090`. The local `gateway:docker`, `gateway:podman`, and
+`gateway:vm` tasks detect the collector listener at startup and enable trace
+export only while it is reachable.
 
 **HA test deploy** (two gateway replicas + external PostgreSQL Secret): uncomment
 `#- ci/values-high-availability.yaml` in `deploy/helm/openshell/skaffold.yaml`,

@@ -13,6 +13,10 @@ spans export to the same OTLP/gRPC collector with the service name
 uses the same compute-driver RPC span names in its in-process and standalone
 forms.
 
+`mise run gateway:podman` enables this export only when a local collector is
+listening on `127.0.0.1:4317`. Otherwise, it omits the gateway OTLP configuration
+so the development gateway does not repeatedly report export failures.
+
 Before creating the container, the driver inspects the final sandbox image and
 captures its immutable image ID and raw OCI `Config.User`. Container creation
 uses that image ID with pulling disabled, preventing a mutable tag from changing
