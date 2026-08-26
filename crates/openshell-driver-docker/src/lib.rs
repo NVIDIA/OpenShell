@@ -1904,7 +1904,8 @@ impl ComputeDriver for DockerComputeDriver {
     async fn authenticate_sandbox(
         &self,
         _request: Request<openshell_core::proto::compute::v1::AuthenticateSandboxRequest>,
-    ) -> Result<Response<openshell_core::proto::compute::v1::AuthenticateSandboxResponse>, Status> {
+    ) -> Result<Response<openshell_core::proto::compute::v1::AuthenticateSandboxResponse>, Status>
+    {
         Err(Status::unimplemented(
             "docker does not authenticate sandbox credentials",
         ))

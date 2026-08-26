@@ -33,7 +33,7 @@ rules:
       - watch
   # Per-sandbox identity: TokenReview authenticates the projected token from
   # the configured sandbox service account, then the gateway resolves the
-  # returned pod name and UID to the pod's `openshell.io/sandbox-id`
+  # returned pod name and UID to the pod's `openshell.ai/sandbox-id`
   # annotation. patch is intentionally NOT granted — the annotation is set
   # once at pod create and must remain immutable for the lifetime of the
   # sandbox.

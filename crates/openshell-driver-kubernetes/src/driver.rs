@@ -623,16 +623,7 @@ impl KubernetesComputeDriver {
                 "sandbox credential pod UID mismatch",
             ));
         }
-        let sandbox_id = pod
-            .metadata
-            .annotations
-            .as_ref()
-            .and_then(|annotations| annotations.get(LABEL_SANDBOX_ID))
-            .filter(|value| !value.is_empty())
-            .cloned()
-            .ok_or_else(|| {
-                tonic::Status::permission_denied("pod is not bound to a sandbox identity")
-            })?;
+        let sandbox_id = pod_sandbox_id(&pod)?;
         let owner = sandbox_owner_reference(&pod)?;
         let sandboxes = self
             .supported_agent_sandbox_api(self.client.clone(), &identity.namespace)
@@ -2449,6 +2440,17 @@ fn user_extra_one(user: &UserInfo, key: &str) -> Result<String, tonic::Status> {
 }
 
 #[allow(clippy::result_large_err)]
+fn pod_sandbox_id(pod: &Pod) -> Result<String, tonic::Status> {
+    pod.metadata
+        .annotations
+        .as_ref()
+        .and_then(|annotations| annotations.get(LABEL_SANDBOX_ID))
+        .filter(|value| !value.is_empty())
+        .cloned()
+        .ok_or_else(|| tonic::Status::permission_denied("pod is not bound to a sandbox identity"))
+}
+
+#[allow(clippy::result_large_err)]
 fn sandbox_owner_reference(pod: &Pod) -> Result<&OwnerReference, tonic::Status> {
     let mut owners = pod
         .metadata
@@ -3804,7 +3806,7 @@ fn sandbox_template_to_k8s_with_validated_config(
         .unwrap_or_default();
     if !params.sandbox_id.is_empty() {
         pod_annotations.insert(
-            "openshell.io/sandbox-id".to_string(),
+            LABEL_SANDBOX_ID.to_string(),
             serde_json::Value::String(params.sandbox_id.to_string()),
         );
     }
@@ -7511,6 +7513,24 @@ mod tests {
             serde_json::json!(false),
             "explicit service account selection must not re-enable default token automounting"
         );
+    }
+
+    #[test]
+    fn sandbox_template_annotation_is_accepted_by_bootstrap_authentication() {
+        let params = SandboxPodParams {
+            sandbox_id: "sandbox-a",
+            ..Default::default()
+        };
+        let pod_template = sandbox_template_to_k8s(
+            &SandboxTemplate::default(),
+            false,
+            &std::collections::HashMap::new(),
+            true,
+            &params,
+        );
+        let pod: Pod = serde_json::from_value(pod_template).expect("valid pod template");
+
+        assert_eq!(pod_sandbox_id(&pod).unwrap(), "sandbox-a");
     }
 
     #[test]
