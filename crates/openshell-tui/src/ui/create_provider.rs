@@ -9,6 +9,7 @@ use ratatui::widgets::{Block, Borders, Clear, Padding, Paragraph};
 use crate::app::{App, CreateProviderPhase, ProviderKeyField, UpdateProviderField};
 
 use indexmap::IndexMap;
+use std::ops::Range;
 
 use super::centered_rect;
 
@@ -76,10 +77,17 @@ fn draw_select_type(
         chunks[0],
     );
 
+    let visible_range = visible_type_range(
+        form.types.len(),
+        form.type_cursor,
+        usize::from(chunks[2].height),
+    );
     let lines: Vec<Line<'_>> = form
         .types
         .iter()
         .enumerate()
+        .skip(visible_range.start)
+        .take(visible_range.len())
         .map(|(i, ty)| {
             let is_cursor = i == form.type_cursor;
             let marker = if is_cursor { ">" } else { " " };
@@ -95,12 +103,33 @@ fn draw_select_type(
     let hint = Line::from(vec![
         Span::styled("[j/k]", t.key_hint),
         Span::styled(" Navigate ", t.muted),
+        Span::styled(
+            format!(
+                "[{}/{}] ",
+                form.type_cursor.saturating_add(1).min(form.types.len()),
+                form.types.len()
+            ),
+            t.muted,
+        ),
         Span::styled("[Enter]", t.key_hint),
         Span::styled(" Select ", t.muted),
         Span::styled("[Esc]", t.key_hint),
         Span::styled(" Cancel", t.muted),
     ]);
     frame.render_widget(Paragraph::new(hint), chunks[4]);
+}
+
+fn visible_type_range(total: usize, cursor: usize, visible_rows: usize) -> Range<usize> {
+    if total == 0 || visible_rows == 0 {
+        return 0..0;
+    }
+
+    let visible_rows = visible_rows.min(total);
+    let cursor = cursor.min(total - 1);
+    let start = cursor
+        .saturating_sub(visible_rows - 1)
+        .min(total - visible_rows);
+    start..start + visible_rows
 }
 
 // ---------------------------------------------------------------------------
@@ -1092,5 +1121,25 @@ fn render_status(
             Paragraph::new(Line::from(Span::styled(format!("  {status}"), style))),
             area,
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::visible_type_range;
+
+    #[test]
+    fn type_list_window_follows_cursor_past_visible_rows() {
+        assert_eq!(visible_type_range(25, 0, 10), 0..10);
+        assert_eq!(visible_type_range(25, 9, 10), 0..10);
+        assert_eq!(visible_type_range(25, 10, 10), 1..11);
+        assert_eq!(visible_type_range(25, 24, 10), 15..25);
+    }
+
+    #[test]
+    fn type_list_window_handles_short_and_empty_lists() {
+        assert_eq!(visible_type_range(3, 2, 10), 0..3);
+        assert_eq!(visible_type_range(0, 0, 10), 0..0);
+        assert_eq!(visible_type_range(3, 2, 0), 0..0);
     }
 }
