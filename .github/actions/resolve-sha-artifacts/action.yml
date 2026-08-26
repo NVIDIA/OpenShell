@@ -1,0 +1,73 @@
+name: Resolve SHA Artifacts
+description: Download and verify a digest-pinned OpenShell SHA artifact bundle from GHCR.
+
+inputs:
+  manifest-ref:
+    description: "Digest-pinned OCI artifact manifest reference"
+    required: true
+  source-sha:
+    description: "Expected full source commit SHA"
+    required: true
+  token:
+    description: "Token with packages:read permission"
+    required: true
+  path:
+    description: "Directory into which the verified bundle is extracted"
+    required: false
+    default: .sha-artifacts
+
+outputs:
+  path:
+    description: "Directory containing the verified artifact files"
+    value: ${{ steps.resolve.outputs.path }}
+
+runs:
+  using: composite
+  steps:
+    - name: Install ORAS
+      uses: oras-project/setup-oras@22ce207df3b08e061f537244349aac6ae1d214f6 # v2.0.1
+
+    - name: Download and verify SHA artifacts
+      id: resolve
+      shell: bash
+      env:
+        MANIFEST_REF: ${{ inputs.manifest-ref }}
+        EXPECTED_SOURCE_SHA: ${{ inputs.source-sha }}
+        GH_TOKEN: ${{ inputs.token }}
+        OUTPUT_PATH: ${{ inputs.path }}
+      run: |
+        set -euo pipefail
+        test "${#EXPECTED_SOURCE_SHA}" -eq 40
+        case "$MANIFEST_REF" in
+          ghcr.io/*@sha256:*) ;;
+          *)
+            echo "manifest-ref must be a digest-pinned GHCR reference" >&2
+            exit 1
+            ;;
+        esac
+        if [ -e "$OUTPUT_PATH" ]; then
+          echo "artifact output path already exists: $OUTPUT_PATH" >&2
+          exit 1
+        fi
+        mkdir -p "$OUTPUT_PATH"
+        echo "$GH_TOKEN" | oras login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+        oras pull "$MANIFEST_REF" -o "$OUTPUT_PATH"
+        manifest="$OUTPUT_PATH/sha-artifacts.json"
+        bundle="$OUTPUT_PATH/sha-artifacts.tar.gz"
+        test -f "$manifest"
+        test -f "$bundle"
+        actual_source_sha="$(jq -r '.source.sha' "$manifest")"
+        if [ "$actual_source_sha" != "$EXPECTED_SOURCE_SHA" ]; then
+          echo "artifact manifest source SHA does not match the expected commit" >&2
+          exit 1
+        fi
+        jq -e '.schema_version == 1 and (.artifacts | type == "array" and length > 0)' "$manifest" >/dev/null
+        mkdir "$OUTPUT_PATH/bundle"
+        tar -xzf "$bundle" --no-same-owner -C "$OUTPUT_PATH/bundle"
+        jq -e 'all(.artifacts[]; (.sha256 | test("^[0-9a-f]{64}$")) and (.path | test("^(?!/)(?!.*(^|/)\\.\\.(/|$)).+$")))' "$manifest" >/dev/null
+        jq -r '.artifacts[] | "\(.sha256)  \(.path)"' "$manifest" > "$OUTPUT_PATH/checksums.txt"
+        (
+          cd "$OUTPUT_PATH/bundle"
+          sha256sum -c ../checksums.txt
+        )
+        echo "path=$OUTPUT_PATH/bundle" >> "$GITHUB_OUTPUT"

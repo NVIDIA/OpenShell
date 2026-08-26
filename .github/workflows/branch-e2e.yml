@@ -149,6 +149,31 @@ jobs:
       source-sha: ${{ github.sha }}
       artifact-set: branch-e2e
 
+  verify-sha-artifacts:
+    needs: [pr_metadata, publish-sha-artifacts]
+    if: needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_core_e2e == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - name: Resolve published SHA artifacts
+        id: artifacts
+        uses: ./.github/actions/resolve-sha-artifacts
+        with:
+          manifest-ref: ${{ needs.publish-sha-artifacts.outputs.manifest-ref }}
+          source-sha: ${{ github.sha }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Verify amd64 binaries execute
+        env:
+          ARTIFACTS_DIR: ${{ steps.artifacts.outputs.path }}
+        run: |
+          set -euo pipefail
+          "$ARTIFACTS_DIR/rust-binary-cli-linux-amd64/openshell" --version
+          "$ARTIFACTS_DIR/rust-binary-gateway-linux-amd64/openshell-gateway" --version
+          "$ARTIFACTS_DIR/rust-binary-gateway-external-linux-amd64/openshell-gateway" --version
+
   e2e:
     needs: [pr_metadata, build-gateway, build-gateway-external, build-supervisor, build-cli, build-driver-vm-linux]
     if: needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_core_e2e == 'true'
