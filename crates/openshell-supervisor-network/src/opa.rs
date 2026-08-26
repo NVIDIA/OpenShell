@@ -1624,19 +1624,6 @@ fn normalize_l7_rule_aliases(
     }
 }
 
-/// Resolve a policy binary path through the container's root filesystem.
-///
-/// On Linux, `/proc/<pid>/root/` provides access to the container's mount
-/// namespace. If the policy path is a symlink inside the container
-/// (e.g., `/usr/bin/python3` → `/usr/bin/python3.11`), returns the
-/// canonical target path. Returns `None` if:
-/// - Not on Linux
-/// - `entrypoint_pid` is 0 (container not yet started)
-/// - Path contains glob characters
-/// - Path is not a symlink
-/// - Resolution fails (binary doesn't exist in container)
-/// - Resolved path equals the original
-///
 /// Normalize a path by resolving `.` and `..` components without touching
 /// the filesystem. Only works correctly for absolute paths.
 #[cfg(any(target_os = "linux", test))]
@@ -1690,6 +1677,23 @@ impl BinaryResolution {
     }
 }
 
+/// Resolve a policy binary path through the container's root filesystem.
+///
+/// On Linux, `/proc/<pid>/root/` provides access to the container's mount
+/// namespace. If the policy path is a symlink inside the container
+/// (e.g., `/usr/bin/python3` → `/usr/bin/python3.11`), the canonical target is
+/// returned as [`BinaryResolution::Resolved`]. The outcome is classified as:
+/// - [`BinaryResolution::Literal`] — not on Linux, `entrypoint_pid` is 0
+///   (container not yet started), the path contains glob characters, it is not
+///   a symlink, or the resolved path equals the original.
+/// - [`BinaryResolution::Absent`] — the candidate does not exist under an
+///   otherwise reachable process root (expected; the caller logs it quietly).
+/// - [`BinaryResolution::Inaccessible`] — `/proc/<pid>/root` itself is
+///   unreachable (pid gone or access denied).
+/// - [`BinaryResolution::CandidateInaccessible`] — the process root is
+///   reachable but the candidate path failed for a non-NotFound reason.
+/// - [`BinaryResolution::ChainBroken`] — a component mid symlink-chain failed,
+///   or the chain forms a cycle / exceeds the kernel symlink limit.
 #[cfg(target_os = "linux")]
 fn resolve_binary_in_container(policy_path: &str, entrypoint_pid: u32) -> BinaryResolution {
     if policy_path.contains('*') || entrypoint_pid == 0 {
@@ -1780,14 +1784,26 @@ fn resolve_binary_in_container(policy_path: &str, entrypoint_pid: u32) -> Binary
     }
 
     if !reached_target {
-        // The cap was exhausted while every component was still a symlink: a
-        // cycle such as a -> b -> a. read_link resolves one hop at a time, so
-        // the kernel never surfaces ELOOP; without this the current mid-cycle
-        // path would be accepted as Resolved/Literal with no warning. Treat it
-        // as a broken chain so the caller logs it and matches literally only.
-        return BinaryResolution::ChainBroken(
-            std::io::Error::from_raw_os_error(libc::ELOOP).kind(),
-        );
+        // The cap was exhausted while following symlinks. Linux SYMLOOP_MAX is
+        // 40, so a chain of exactly 40 symlinks ending at a real file is still
+        // valid — after the 40th hop `resolved` may already point at that file.
+        // Inspect it once more without following another link: a non-symlink is
+        // the valid final target (fall through to the Literal/Resolved logic
+        // below), while another symlink (or an error) is a genuine cycle
+        // (a -> b -> a) or a chain deeper than the kernel allows. read_link
+        // resolves one hop at a time, so the kernel never surfaces ELOOP; treat
+        // those as a broken chain so the caller logs it and matches literally.
+        let container_path = format!("/proc/{entrypoint_pid}/root{}", resolved.display());
+
+        match std::fs::symlink_metadata(&container_path) {
+            Ok(meta) if !meta.file_type().is_symlink() => {}
+            Ok(_) => {
+                return BinaryResolution::ChainBroken(
+                    std::io::Error::from_raw_os_error(libc::ELOOP).kind(),
+                );
+            }
+            Err(e) => return BinaryResolution::ChainBroken(e.kind()),
+        }
     }
 
     let resolved_str = resolved.to_string_lossy().into_owned();
@@ -7610,16 +7626,76 @@ network_policies:
 
     #[test]
     #[cfg(target_os = "linux")]
-    fn absent_candidates_emit_no_warnings() {
-        // Regression for #2883: several expected-but-absent compatibility
-        // candidates under an accessible process root must not produce a burst
-        // of WARN-level noise. Logging now lives at the caller, so drive the
-        // real caller (proto_to_opa_data_json) and count WARN events.
+    fn symlink_chain_at_limit_resolves_to_target() {
+        // Linux SYMLOOP_MAX is 40: a chain of exactly 40 symlinks ending at a
+        // real file resolves successfully in the kernel. The manual walk must
+        // follow all 40 hops and accept the final target rather than exhausting
+        // the cap and reporting ChainBroken (off-by-one regression).
+        use std::os::unix::fs::symlink;
+
         if !procfs_root_accessible() {
             eprintln!("Skipping: /proc/<pid>/root/ not accessible in this environment");
             return;
         }
 
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("real");
+        std::fs::write(&target, b"").unwrap();
+
+        // link0 -> link1 -> ... -> link39 -> real (40 symlinks, absolute
+        // targets so the resolver takes the is_absolute() branch).
+        let link = |i: usize| dir.path().join(format!("link{i}"));
+        symlink(&target, link(39)).unwrap();
+        for i in (0..39).rev() {
+            symlink(link(i + 1), link(i)).unwrap();
+        }
+
+        let pid = std::process::id();
+        let result = resolve_binary_in_container(link(0).to_str().unwrap(), pid);
+        assert!(
+            matches!(result, BinaryResolution::Resolved(_)),
+            "a 40-link chain ending at a real file must resolve, got {result:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn symlink_chain_over_limit_is_chain_broken() {
+        // A chain of 41 symlinks exceeds SYMLOOP_MAX: the walk must give up and
+        // classify as ChainBroken, proving the 40-hop budget stays enforced.
+        use std::os::unix::fs::symlink;
+
+        if !procfs_root_accessible() {
+            eprintln!("Skipping: /proc/<pid>/root/ not accessible in this environment");
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("real");
+        std::fs::write(&target, b"").unwrap();
+
+        // link0 -> ... -> link40 -> real (41 symlinks).
+        let link = |i: usize| dir.path().join(format!("link{i}"));
+        symlink(&target, link(40)).unwrap();
+        for i in (0..40).rev() {
+            symlink(link(i + 1), link(i)).unwrap();
+        }
+
+        let pid = std::process::id();
+        let result = resolve_binary_in_container(link(0).to_str().unwrap(), pid);
+        assert!(
+            matches!(result, BinaryResolution::ChainBroken(_)),
+            "a 41-link chain must classify as ChainBroken, got {result:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn absent_candidates_emit_no_warnings() {
+        // Regression for #2883: several expected-but-absent compatibility
+        // candidates under an accessible process root must not produce a burst
+        // of WARN-level noise. Logging now lives at the caller, so drive the
+        // real caller (proto_to_opa_data_json) and count WARN events.
         use std::sync::Arc;
         use std::sync::atomic::{AtomicUsize, Ordering};
         use tracing::Subscriber;
@@ -7634,6 +7710,11 @@ network_policies:
                     self.0.fetch_add(1, Ordering::SeqCst);
                 }
             }
+        }
+
+        if !procfs_root_accessible() {
+            eprintln!("Skipping: /proc/<pid>/root/ not accessible in this environment");
+            return;
         }
 
         let warns = Arc::new(AtomicUsize::new(0));
