@@ -17,14 +17,13 @@ on:
         type: string
         default: "rust-binary-*"
     outputs:
-      manifest_ref:
+      manifest-ref:
         description: "Digest-pinned OCI manifest reference"
         value: ${{ jobs.publish.outputs.manifest_ref }}
 
 permissions:
   actions: read
   attestations: write
-  artifact-metadata: write
   contents: read
   id-token: write
   packages: write

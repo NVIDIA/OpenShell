@@ -140,7 +140,6 @@ jobs:
     permissions:
       actions: read
       attestations: write
-      artifact-metadata: write
       contents: read
       id-token: write
       packages: write
@@ -163,7 +162,7 @@ jobs:
         id: artifacts
         uses: ./.github/actions/resolve-sha-artifacts
         with:
-          manifest-ref: ${{ needs.publish-sha-artifacts.outputs.manifest_ref }}
+          manifest-ref: ${{ needs.publish-sha-artifacts.outputs.manifest-ref }}
           source-sha: ${{ github.sha }}
           token: ${{ secrets.GITHUB_TOKEN }}
 
