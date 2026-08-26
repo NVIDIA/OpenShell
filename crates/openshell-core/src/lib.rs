@@ -30,6 +30,7 @@ pub mod image;
 pub mod inference;
 pub mod jwt;
 pub mod local_api_socket;
+pub mod mcp;
 pub mod metadata;
 pub mod middleware;
 pub mod net;

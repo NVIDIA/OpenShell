@@ -345,6 +345,7 @@ func TestConverterCoversAllProtoFields_McpOptions(t *testing.T) {
 	handled := fieldSet{
 		"strict_tool_names":           true,
 		"allow_all_known_mcp_methods": true,
+		"versions":                    true,
 	}
 
 	assertAllFieldsCovered(t, (&sandboxpb.McpOptions{}).ProtoReflect().Descriptor(), handled, nil)

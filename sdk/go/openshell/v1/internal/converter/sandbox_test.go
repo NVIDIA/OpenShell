@@ -10,6 +10,7 @@ import (
 	v1 "github.com/NVIDIA/OpenShell/sdk/go/openshell/v1/types"
 	dm "github.com/NVIDIA/OpenShell/sdk/go/proto/datamodelv1"
 	pb "github.com/NVIDIA/OpenShell/sdk/go/proto/openshellv1"
+	sandboxpb "github.com/NVIDIA/OpenShell/sdk/go/proto/sandboxv1"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/protobuf/proto"
@@ -569,6 +570,38 @@ func TestSandboxRoundTrip(t *testing.T) {
 	assert.Equal(t, "api.example.com", webRule.Endpoints[0].Host)
 	require.NotNil(t, webRule.Endpoints[0].CredentialBinding)
 	assert.Equal(t, "api-credentials", webRule.Endpoints[0].CredentialBinding.Provider)
+}
+
+func TestMcpOptionsConversionCopiesVersions(t *testing.T) {
+	wire := &sandboxpb.McpOptions{
+		Versions: []string{"2025-03-26", "2025-11-25"},
+	}
+
+	sdk := mcpOptionsFromProto(wire)
+	require.NotNil(t, sdk)
+	assert.Equal(t, []string{"2025-03-26", "2025-11-25"}, sdk.Versions)
+	wire.Versions[0] = "mutated-wire-value"
+	assert.Equal(t, "2025-03-26", sdk.Versions[0])
+
+	roundTrip := mcpOptionsToProto(sdk)
+	require.NotNil(t, roundTrip)
+	assert.Equal(t, []string{"2025-03-26", "2025-11-25"}, roundTrip.Versions)
+	sdk.Versions[0] = "mutated-sdk-value"
+	assert.Equal(t, "2025-03-26", roundTrip.Versions[0])
+}
+
+func TestMcpOptionsConversionDoesNotMaterializeDefaultVersions(t *testing.T) {
+	wire := &sandboxpb.McpOptions{Versions: []string{}}
+
+	sdk := mcpOptionsFromProto(wire)
+	require.NotNil(t, sdk)
+	assert.NotNil(t, sdk.Versions)
+	assert.Empty(t, sdk.Versions)
+
+	roundTrip := mcpOptionsToProto(sdk)
+	require.NotNil(t, roundTrip)
+	assert.NotNil(t, roundTrip.Versions)
+	assert.Empty(t, roundTrip.Versions)
 }
 
 func TestSandboxSpecToProto(t *testing.T) {

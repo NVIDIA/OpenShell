@@ -101,6 +101,12 @@ type L7QueryMatcher struct {
 type McpOptions struct {
 	StrictToolNames         *bool
 	AllowAllKnownMcpMethods *bool
+	// Versions lists the exact MCP protocol revisions accepted by the endpoint.
+	// An empty list represents omission at the protobuf transport boundary; the
+	// checked policy or server ingress materializes the pinned default
+	// "2025-11-25" before storing canonical state. Nonempty lists remain exact
+	// allowlists.
+	Versions []string
 }
 
 // GraphqlOperation describes a GraphQL operation for persisted-query validation.

@@ -595,6 +595,7 @@ fn mcp_options(mcp: &Option<McpConfigDef>) -> Option<McpOptions> {
     (strict_tool_names.is_some() || allow_all_known_mcp_methods.is_some()).then_some(McpOptions {
         strict_tool_names,
         allow_all_known_mcp_methods,
+        versions: Vec::new(),
     })
 }
 
