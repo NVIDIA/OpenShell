@@ -1383,7 +1383,7 @@ async fn acquire_forward_connection_guard(
     Ok(ForwardConnectionGuard {
         state: state.clone(),
         token: Some(token.to_string()),
-        sandbox_id,
+        sandbox_id: sandbox_id.clone(),
     })
 }
 
@@ -1888,6 +1888,16 @@ const EXEC_KEEPALIVE_MAX: usize = 4;
 /// Max wait for a trailing `Close` after `ExitStatus`.
 const EXEC_POST_EXIT_CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
 
+/// Supervisor SSH banner software token that signals no-login-shell support.
+const OPENSHELL_SSHID_PREFIX: &[u8] = b"SSH-2.0-OpenShell_";
+
+/// A supervisor honors `OPENSHELL_NO_LOGIN_SHELL` only if it identifies as
+/// `OpenShell`. Older sandboxes present russh's default banner and silently
+/// ignore the env request, so gate the opt-out on the `OpenShell` identity.
+fn supervisor_supports_no_login_shell(remote_sshid: &[u8]) -> bool {
+    remote_sshid.starts_with(OPENSHELL_SSHID_PREFIX)
+}
+
 /// russh client config for exec relays.
 fn exec_ssh_client_config() -> russh::client::Config {
     russh::client::Config {
@@ -2136,7 +2146,11 @@ async fn run_interactive_exec_with_russh(
     set_tcp_nodelay_best_effort(&stream);
 
     let config = Arc::new(exec_ssh_client_config());
-    let mut client = russh::client::connect_stream(config, stream, SandboxSshClientHandler)
+    let remote_sshid = Arc::new(std::sync::Mutex::new(None));
+    let handler = SandboxSshClientHandler {
+        remote_sshid: remote_sshid.clone(),
+    };
+    let mut client = russh::client::connect_stream(config, stream, handler)
         .await
         .map_err(|e| Status::internal(format!("failed to establish ssh transport: {e}")))?;
 
@@ -2166,6 +2180,12 @@ async fn run_interactive_exec_with_russh(
     }
 
     if no_login_shell {
+        let banner = remote_sshid.lock().unwrap().clone().unwrap_or_default();
+        if !supervisor_supports_no_login_shell(&banner) {
+            return Err(Status::failed_precondition(
+                "sandbox supervisor is too old to honor --no-login-shell; recreate the sandbox on a current gateway",
+            ));
+        }
         channel
             .set_env(false, NO_LOGIN_SHELL_ENV.0, NO_LOGIN_SHELL_ENV.1)
             .await
@@ -2283,8 +2303,10 @@ async fn start_single_use_ssh_proxy_over_relay(
     Ok((port, task))
 }
 
-#[derive(Debug, Clone, Copy)]
-struct SandboxSshClientHandler;
+#[derive(Debug, Clone)]
+struct SandboxSshClientHandler {
+    remote_sshid: Arc<std::sync::Mutex<Option<Vec<u8>>>>,
+}
 
 impl russh::client::Handler for SandboxSshClientHandler {
     type Error = russh::Error;
@@ -2294,6 +2316,16 @@ impl russh::client::Handler for SandboxSshClientHandler {
         _server_public_key: &russh::keys::PublicKey,
     ) -> Result<bool, Self::Error> {
         Ok(true)
+    }
+
+    async fn kex_done(
+        &mut self,
+        _shared_secret: Option<&[u8]>,
+        _names: &russh::Names,
+        session: &mut russh::client::Session,
+    ) -> Result<(), Self::Error> {
+        *self.remote_sshid.lock().unwrap() = Some(session.remote_sshid().to_vec());
+        Ok(())
     }
 }
 
@@ -2325,7 +2357,11 @@ async fn run_exec_with_russh(
     set_tcp_nodelay_best_effort(&stream);
 
     let config = Arc::new(exec_ssh_client_config());
-    let mut client = russh::client::connect_stream(config, stream, SandboxSshClientHandler)
+    let remote_sshid = Arc::new(std::sync::Mutex::new(None));
+    let handler = SandboxSshClientHandler {
+        remote_sshid: remote_sshid.clone(),
+    };
+    let mut client = russh::client::connect_stream(config, stream, handler)
         .await
         .map_err(|e| Status::internal(format!("failed to establish ssh transport: {e}")))?;
 
@@ -2355,6 +2391,12 @@ async fn run_exec_with_russh(
     }
 
     if no_shell_login {
+        let banner = remote_sshid.lock().unwrap().clone().unwrap_or_default();
+        if !supervisor_supports_no_login_shell(&banner) {
+            return Err(Status::failed_precondition(
+                "sandbox supervisor is too old to honor --no-login-shell; recreate the sandbox on a current gateway",
+            ));
+        }
         channel
             .set_env(false, NO_LOGIN_SHELL_ENV.0, NO_LOGIN_SHELL_ENV.1)
             .await
@@ -4685,5 +4727,43 @@ mod tests {
             .expect("session should still exist after revocation");
         assert!(session.revoked);
         assert_eq!(session.object_workspace(), "default");
+    }
+
+    // ---- supervisor_supports_no_login_shell ----
+
+    /// A current supervisor identifies itself with the `OpenShell` banner, so the
+    /// gateway may forward the login-shell opt-out.
+    #[test]
+    fn no_login_shell_gate_accepts_openshell_banner() {
+        assert!(supervisor_supports_no_login_shell(
+            b"SSH-2.0-OpenShell_0.0.4-dev.3+g2bf9969"
+        ));
+        assert!(supervisor_supports_no_login_shell(
+            b"SSH-2.0-OpenShell_0.1.0"
+        ));
+    }
+
+    /// A supervisor predating this feature presents russh's default banner and
+    /// silently ignores the env request, so the gate must reject the opt-out.
+    #[test]
+    fn no_login_shell_gate_rejects_pre_feature_banner() {
+        assert!(!supervisor_supports_no_login_shell(b"SSH-2.0-Russh_0.62.5"));
+        assert!(!supervisor_supports_no_login_shell(b"SSH-2.0-OpenSSH_9.6"));
+    }
+
+    /// A missing banner (kex callback never populated the slot) must fail
+    /// closed rather than forwarding the opt-out to an unknown supervisor.
+    #[test]
+    fn no_login_shell_gate_rejects_empty_banner() {
+        assert!(!supervisor_supports_no_login_shell(b""));
+    }
+
+    /// The banner prefix must match at the start; an `OpenShell` token appearing
+    /// only in the comment tail does not signal support.
+    #[test]
+    fn no_login_shell_gate_requires_prefix_position() {
+        assert!(!supervisor_supports_no_login_shell(
+            b"SSH-2.0-Russh_0.62.5 OpenShell_0.1.0"
+        ));
     }
 }

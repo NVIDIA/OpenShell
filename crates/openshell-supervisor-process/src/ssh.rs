@@ -15,6 +15,7 @@ use crate::sandbox;
 use miette::{IntoDiagnostic, Result};
 use nix::pty::{Winsize, openpty};
 use nix::unistd::setsid;
+use openshell_core::VERSION;
 use openshell_core::net::set_tcp_nodelay_best_effort;
 use openshell_core::policy::SandboxPolicy;
 use openshell_core::provider_credentials::ProviderCredentialState;
@@ -24,6 +25,7 @@ use openshell_ocsf::{
 use russh::keys::{Algorithm, PrivateKey};
 use russh::server::{Auth, ChannelOpenHandle, Handle, Session};
 use russh::{ChannelId, ChannelOpenFailure, Sig};
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, RawFd};
@@ -54,7 +56,9 @@ fn ssh_server_init(
     let mut rng = rand::rng();
     let host_key = PrivateKey::random(&mut rng, Algorithm::Ed25519).into_diagnostic()?;
 
+    // TODO: while building the SSH config, refactor the server_id to be "SSH-2.0-OpenShell_<version>" from `openshell_core::VERSION`
     let mut config = russh::server::Config {
+        server_id: russh::SshId::Standard(Cow::Owned(format!("SSH-2.0-OpenShell_{VERSION}"))),
         auth_rejection_time: Duration::from_secs(1),
         ..Default::default()
     };
