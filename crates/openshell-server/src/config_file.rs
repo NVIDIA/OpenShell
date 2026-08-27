@@ -738,10 +738,11 @@ timeout = "2s"
             SupervisorMiddlewareService::try_from(&file.openshell.supervisor.middleware[0])
                 .expect("valid CA resolves");
         assert_eq!(registration.timeout, "2s");
-        assert_eq!(
-            registration.tls_ca_cert_pem,
-            certificate.cert.pem().as_bytes()
-        );
+        let registered_pem = String::from_utf8(registration.tls_ca_cert_pem)
+            .expect("registered CA remains PEM text")
+            .replace("\r\n", "\n");
+        let generated_pem = certificate.cert.pem().replace("\r\n", "\n");
+        assert_eq!(registered_pem, generated_pem);
         assert_eq!(
             registration.audience,
             "urn:openshell:middleware:local-guard"

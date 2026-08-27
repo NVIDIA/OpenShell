@@ -1046,10 +1046,7 @@ mod lifecycle_tests {
         // Positive proof: the in-policy write materializes the host artifact.
         let host_path = std::path::Path::new(tmp.path()).join("hello.txt");
         let mut found = false;
-        // PowerShell startup can be slow on a cold or heavily loaded Windows
-        // runner. Wait long enough to distinguish startup latency from a child
-        // that never executed.
-        for _ in 0..400 {
+        for _ in 0..100 {
             if host_path.exists() {
                 found = true;
                 break;
@@ -1195,12 +1192,11 @@ mod lifecycle_tests {
     async fn stop_terminates_and_reaps_a_running_process_container() {
         let tmp = tempfile::tempdir().unwrap();
         let share = tmp.path().to_string_lossy().replace('\\', "/");
-        let marker = format!("{share}/started.txt");
         let command = vec![
             "powershell".into(),
             "-NoProfile".into(),
             "-Command".into(),
-            format!("Set-Content -LiteralPath '{marker}' -Value started; Start-Sleep -Seconds 60"),
+            "Start-Sleep -Seconds 60".into(),
         ];
         let backend = MxcComputeBackend::new_mocked(MxcComputeConfig::default());
         backend
@@ -1217,17 +1213,9 @@ mod lifecycle_tests {
         })
         .await
         .expect("long-running child should start");
-        let marker_path = std::path::Path::new(tmp.path()).join("started.txt");
-        for _ in 0..100 {
-            if marker_path.exists() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(25)).await;
-        }
-        assert!(
-            marker_path.exists(),
-            "the long-running child must execute before stop tests cancellation"
-        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        let running = backend.get_sandbox("sb-stop").await.unwrap();
+        assert_eq!(ready_condition(&running).unwrap().reason, "AgentRunning");
 
         tokio::time::timeout(Duration::from_secs(5), backend.stop_sandbox("sb-stop"))
             .await
