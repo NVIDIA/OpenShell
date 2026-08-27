@@ -47,11 +47,6 @@ on:
         required: false
         type: string
         default: "v2026.4.25"
-      cli-artifact-prefix:
-        description: "Optional prebuilt CLI artifact prefix (artifact suffix is linux-<arch>)"
-        required: false
-        type: string
-        default: ""
 
 permissions:
   actions: read
@@ -81,10 +76,7 @@ jobs:
           ref: ${{ inputs['checkout-ref'] || github.sha }}
 
       - name: Use prebuilt OpenShell CLI
-        if: inputs.cli-artifact-prefix != ''
         uses: ./.github/actions/setup-e2e-cli
-        with:
-          artifact-prefix: ${{ inputs.cli-artifact-prefix }}
 
       - name: Install mise
         run: |
@@ -94,19 +86,6 @@ jobs:
 
       - name: Install tools
         run: mise install --locked
-
-      # The openshell-policy crate transitively pulls in z3-sys, whose
-      # build script needs the z3 C/C++ headers, clang/bindgen, and CMake to
-      # compile both system-linked and bundled-Z3 builds. The bare runner
-      # doesn't ship them; the CI container
-      # image used by other Rust e2e jobs does, but we can't run this job
-      # there (the runner's container handler injects its own --network
-      # bridge, which conflicts with the --network host we need so kind's
-      # API server is reachable from the test process).
-      - name: Install z3 build deps
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends libz3-dev clang cmake
 
       - name: Log in to GHCR
         run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
