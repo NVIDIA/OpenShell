@@ -201,11 +201,12 @@ jobs:
           mise x -- e2e/run.sh \
             --vm ubuntu-26-04 \
             --with podman-rootless \
-            --host-cli-bin "$OPENSHELL_BIN" \
+            --tests-in-vm \
+            --cli-bin "$OPENSHELL_BIN" \
             --gateway-bin "$OPENSHELL_GATEWAY_BIN" \
             --sandbox-bin "$OPENSHELL_SANDBOX_BIN" \
             --gateway-config e2e/configs/gateway/podman.toml \
-            --suite smoke
+            --features e2e_podman
 
   e2e-vm:
     name: E2E (rust-vm-${{ matrix.suite }})

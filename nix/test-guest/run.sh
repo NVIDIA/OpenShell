@@ -49,7 +49,7 @@ preserved_file_mode() {
 	local source_mode
 
 	if [ "$(uname -s)" = Darwin ]; then
-		if ! source_mode=$(stat -f '%Lp' "${source_path}"); then
+		if ! source_mode=$(/usr/bin/stat -f '%Lp' "${source_path}"); then
 			echo "could not determine mode for --copy source: ${source_path}" >&2
 			return 1
 		fi
