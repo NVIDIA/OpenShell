@@ -6,11 +6,11 @@ jobs:
     runs-on: windows-2025
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: jdx/mise-action@7e36c90d9ab29c415a2384db3006f3ec8a8cc654 # v4.2.4
+      - uses: jdx/mise-action@ca0c5fc9c8a8386dae8ba5d37608a083a307991c # v4.2.4
         with:
           install: false
           experimental: true
-      - uses: dtolnay/rust-toolchain@master
+      - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88
         with:
           toolchain: "1.95.0"
           targets: x86_64-pc-windows-msvc
@@ -31,11 +31,11 @@ jobs:
     if: false # flip to true once the runner is online
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: jdx/mise-action@7e36c90d9ab29c415a2384db3006f3ec8a8cc654 # v4.2.4
+      - uses: jdx/mise-action@ca0c5fc9c8a8386dae8ba5d37608a083a307991c # v4.2.4
         with:
           install: false
           experimental: true
-      - uses: dtolnay/rust-toolchain@master
+      - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88
         with:
           toolchain: "1.95.0"
           targets: aarch64-pc-windows-msvc
