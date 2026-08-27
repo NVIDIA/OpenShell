@@ -299,11 +299,12 @@ impl MxcComputeBackend {
     }
 
     pub fn capabilities(&self) -> GetCapabilitiesResponse {
-        openshell_core::driver_utils::build_capabilities_response(
-            DRIVER_NAME,
-            DRIVER_VERSION,
-            DEFAULT_IMAGE_SENTINEL,
-        )
+        GetCapabilitiesResponse {
+            driver_name: DRIVER_NAME.to_string(),
+            driver_version: DRIVER_VERSION.to_string(),
+            default_image: DEFAULT_IMAGE_SENTINEL.to_string(),
+            gateway_manages_lifecycle: false,
+        }
     }
 
     pub fn validate_sandbox_create(&self, sandbox: &DriverSandbox) -> Result<(), tonic::Status> {
