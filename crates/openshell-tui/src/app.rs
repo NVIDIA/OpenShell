@@ -656,6 +656,10 @@ pub struct App {
     pub sandbox_ages: Vec<String>,
     pub sandbox_created: Vec<String>,
     pub sandbox_images: Vec<String>,
+    pub sandbox_restart_policies: Vec<String>,
+    pub sandbox_restart_counts: Vec<u32>,
+    pub sandbox_exit_codes: Vec<Option<i32>>,
+    pub sandbox_next_restart_at: Vec<String>,
     pub sandbox_notes: Vec<String>,
     pub sandbox_detail_notes: Vec<String>,
     /// Formatted labels for each sandbox (e.g., "env=prod,team=platform" or empty string).
@@ -1019,6 +1023,10 @@ impl App {
             sandbox_ages: Vec::new(),
             sandbox_created: Vec::new(),
             sandbox_images: Vec::new(),
+            sandbox_restart_policies: Vec::new(),
+            sandbox_restart_counts: Vec::new(),
+            sandbox_exit_codes: Vec::new(),
+            sandbox_next_restart_at: Vec::new(),
             sandbox_notes: Vec::new(),
             sandbox_detail_notes: Vec::new(),
             sandbox_labels: Vec::new(),
@@ -3523,6 +3531,10 @@ impl App {
         self.sandbox_ages.clear();
         self.sandbox_created.clear();
         self.sandbox_images.clear();
+        self.sandbox_restart_policies.clear();
+        self.sandbox_restart_counts.clear();
+        self.sandbox_exit_codes.clear();
+        self.sandbox_next_restart_at.clear();
         self.sandbox_notes.clear();
         self.sandbox_detail_notes.clear();
         self.sandbox_labels.clear();

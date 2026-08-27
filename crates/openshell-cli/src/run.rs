@@ -73,9 +73,8 @@ use openshell_core::proto::{
     ProviderProfileDiagnostic, ProviderProfileImportItem, RejectDraftChunkRequest,
     ResourceRequirements, RevokeSshSessionRequest, RotateProviderCredentialRequest, Sandbox,
     SandboxPhase, SandboxPolicy, SandboxRestartPolicy, SandboxSpec, SandboxTemplate,
-    ServiceEndpointResponse,
-    SetInferenceRouteRequest, SettingScope, StartSandboxRequest, StopSandboxRequest,
-    TcpForwardFrame, TcpForwardInit, TcpRelayTarget, UpdateConfigRequest,
+    ServiceEndpointResponse, SetInferenceRouteRequest, SettingScope, StartSandboxRequest,
+    StopSandboxRequest, TcpForwardFrame, TcpForwardInit, TcpRelayTarget, UpdateConfigRequest,
     UpdateProviderProfilesRequest, UpdateProviderRequest, WatchSandboxRequest, exec_sandbox_event,
     setting_value, tcp_forward_init,
 };
@@ -6540,8 +6539,7 @@ mod tests {
         ProviderCredentialRefreshStatus, ProviderCredentialRefreshStrategy,
         ProviderCredentialTokenGrant, ProviderProfile, ProviderProfileCredential,
         ResourceRequirements, Sandbox, SandboxCondition, SandboxPhase, SandboxPolicyRevision,
-        SandboxRestartPolicy, SandboxSpec, SandboxStatus,
-        datamodel::v1::ObjectMeta,
+        SandboxRestartPolicy, SandboxSpec, SandboxStatus, datamodel::v1::ObjectMeta,
     };
 
     #[test]
@@ -7820,7 +7818,7 @@ mod tests {
             ..Default::default()
         });
         sandbox.status = Some(SandboxStatus {
-            phase: SandboxPhase::Restarting as i32,
+            phase: SandboxPhase::Starting as i32,
             main_process_instance_id: "main-2".to_string(),
             exit_code: Some(9),
             restart_count: 2,
@@ -7839,7 +7837,7 @@ mod tests {
 
         assert_eq!(json["id"], "sb-123");
         assert_eq!(json["name"], "test-sb");
-        assert_eq!(json["phase"], "Restarting");
+        assert_eq!(json["phase"], "Starting");
         assert_eq!(json["restart_policy"], "on-failure");
         assert_eq!(json["main_process_instance_id"], "main-2");
         assert_eq!(json["exit_code"], 9);

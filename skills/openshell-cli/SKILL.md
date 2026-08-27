@@ -380,8 +380,8 @@ openshell sandbox ssh-config my-sandbox >> ~/.ssh/config
 If `connect` reports `canonical main process already finished`, inspect the
 result with `sandbox get`. A pending foreground attachment can still retrieve
 retained output in `Completed` or `Error`; phase alone does not determine
-whether attachment is available. When policy selects a replacement, the
-sandbox enters `Starting` during backoff and resource replacement. Connect
+whether attachment is available. A nonzero main-process exit under `on-failure`, or any exit under `always`,
+moves the sandbox to `Starting` during backoff and resource replacement. Connect
 and exec commands resume after the new supervisor session makes it `Ready`.
 An explicit `sandbox stop` cancels a pending restart.
 

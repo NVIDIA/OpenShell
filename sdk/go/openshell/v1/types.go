@@ -21,7 +21,6 @@ const (
 	SandboxStopped      = types.SandboxStopped
 	SandboxStarting     = types.SandboxStarting
 	SandboxCompleted    = types.SandboxCompleted
-	SandboxRestarting   = types.SandboxRestarting
 )
 
 // SandboxRestartPolicy controls replacement after the canonical main process exits.
