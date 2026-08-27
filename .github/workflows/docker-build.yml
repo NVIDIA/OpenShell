@@ -45,15 +45,6 @@ jobs:
             runner: linux-arm64-cpu8
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 20
-    container:
-      image: ghcr.io/nvidia/openshell/ci:latest
-      credentials:
-        username: ${{ github.actor }}
-        password: ${{ secrets.GITHUB_TOKEN }}
-      options: --privileged
-      volumes:
-        - /var/run/docker.sock:/var/run/docker.sock
-        - /etc/buildkit:/etc/buildkit:ro
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -74,14 +65,11 @@ jobs:
     needs: build
     runs-on: linux-amd64-cpu8
     timeout-minutes: 10
-    container:
-      image: ghcr.io/nvidia/openshell/ci:latest
-      credentials:
-        username: ${{ github.actor }}
-        password: ${{ secrets.GITHUB_TOKEN }}
-      volumes:
-        - /var/run/docker.sock:/var/run/docker.sock
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs['checkout-ref'] || github.sha }}
+
       - name: Log in to GHCR
         shell: bash
         run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
@@ -97,3 +85,9 @@ jobs:
             --tag "$image:${IMAGE_TAG}" \
             "$image:${IMAGE_TAG}-amd64" \
             "$image:${IMAGE_TAG}-arm64"
+
+      - name: Verify merged manifest SBOM attestation
+        shell: bash
+        env:
+          IMAGE_REF: ghcr.io/nvidia/openshell/${{ inputs.component }}:${{ inputs.image-tag || github.sha }}
+        run: tasks/scripts/verify-image-sbom.sh "${IMAGE_REF}" --require-cargo

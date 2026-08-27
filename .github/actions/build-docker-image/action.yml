@@ -61,6 +61,7 @@ runs:
           --tag ghcr.io/nvidia/openshell/${{ inputs.component }}:${IMAGE_TAG}-${{ inputs.arch }} \
           --cache-from type=gha,scope=${{ inputs.component }}-${{ inputs.arch }} \
           --cache-to type=gha,mode=max,scope=${{ inputs.component }}-${{ inputs.arch }} \
-          --provenance=false \
-          --push \
+          --provenance=mode=min \
+          --attest type=sbom \
+          --output type=image,push=true,oci-mediatypes=true,oci-artifact=true \
           .
