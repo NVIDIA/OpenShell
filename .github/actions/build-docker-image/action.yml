@@ -43,10 +43,7 @@ runs:
 
     - name: Stage ${{ inputs.binary }}
       shell: bash
-      run: |
-        install -d deploy/docker/.build/prebuilt-binaries/${{ inputs.arch }}
-        tar -xzf artifact/${{ inputs.binary }}-${{ inputs.triple }}.tar.gz -C artifact
-        install -m 0755 artifact/${{ inputs.binary }} deploy/docker/.build/prebuilt-binaries/${{ inputs.arch }}/${{ inputs.binary }}
+      run: install -Dm0755 artifact/${{ inputs.binary }} deploy/docker/.build/prebuilt-binaries/${{ inputs.arch }}/${{ inputs.binary }}
 
     - name: Build ${{ inputs.component }} image
       shell: bash

@@ -13,7 +13,6 @@ runs:
     - name: Configure prebuilt VM driver
       shell: bash
       run: |
-        tar -xzf "$GITHUB_WORKSPACE"/.e2e/prebuilt-vm-driver/*.tar.gz -C "$GITHUB_WORKSPACE/.e2e/prebuilt-vm-driver"
         driver="$GITHUB_WORKSPACE/.e2e/prebuilt-vm-driver/openshell-driver-vm"
         chmod +x "$driver"
         "$driver" --version

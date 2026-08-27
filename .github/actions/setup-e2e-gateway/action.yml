@@ -13,7 +13,6 @@ runs:
     - name: Configure prebuilt gateway
       shell: bash
       run: |
-        tar -xzf "$GITHUB_WORKSPACE"/.e2e/prebuilt-gateway/*.tar.gz -C "$GITHUB_WORKSPACE/.e2e/prebuilt-gateway"
         gateway="$GITHUB_WORKSPACE/.e2e/prebuilt-gateway/openshell-gateway"
         chmod +x "$gateway"
         "$gateway" --version

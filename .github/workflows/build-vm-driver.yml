@@ -82,9 +82,7 @@ jobs:
           zstd -19 -T0 result/umoci -o target/vm-runtime-compressed/umoci.zst
 
       - name: Add openshell-sandbox to VM runtime
-        run: |
-          tar -xzf sandbox/openshell-sandbox-${{ matrix.arch }}-unknown-linux-musl.tar.gz -C sandbox
-          zstd -19 -T0 sandbox/openshell-sandbox -o target/vm-runtime-compressed/openshell-sandbox.zst
+        run: zstd -19 -T0 sandbox/openshell-sandbox -o target/vm-runtime-compressed/openshell-sandbox.zst
 
       - name: Build openshell-driver-vm
         uses: ./.github/actions/build-rust-binary

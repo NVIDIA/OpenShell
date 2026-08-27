@@ -13,7 +13,6 @@ runs:
     - name: Configure prebuilt CLI
       shell: bash
       run: |
-        tar -xzf "$GITHUB_WORKSPACE"/.e2e/prebuilt-cli/*.tar.gz -C "$GITHUB_WORKSPACE/.e2e/prebuilt-cli"
         cli="$GITHUB_WORKSPACE/.e2e/prebuilt-cli/openshell"
         chmod +x "$cli"
         "$cli" --version
