@@ -25,7 +25,7 @@ This is your primary fallback. Use it freely -- the CLI's help output is authori
 
 ## Prerequisites
 
-- `openshell` is on the PATH. Follow the published [installation guide](https://docs.nvidia.com/openshell/latest/about/installation) when it is not installed.
+- `openshell` is on the PATH. Follow the published [installation guide](https://docs.nvidia.com/openshell/latest/about/installation.md) when it is not installed.
 - A reachable OpenShell gateway backed by Docker, Podman, Kubernetes, or the experimental VM driver
 - Docker is running only when using BYOC local builds or a Docker-backed gateway
 - For Kubernetes deployments: `kubectl` and Helm access to the target cluster
@@ -34,11 +34,11 @@ This is your primary fallback. Use it freely -- the CLI's help output is authori
 
 Use `openshell --help` and nested `--help` output as the authority for the installed CLI version. Use the published documentation for product concepts and supported workflows:
 
-- [Manage gateways](https://docs.nvidia.com/openshell/latest/sandboxes/manage-gateways)
-- [Manage sandboxes](https://docs.nvidia.com/openshell/latest/sandboxes/manage-sandboxes)
-- [Manage providers](https://docs.nvidia.com/openshell/latest/sandboxes/manage-providers)
-- [Sandbox policies](https://docs.nvidia.com/openshell/latest/sandboxes/policies)
-- [Inference routing](https://docs.nvidia.com/openshell/latest/sandboxes/inference-routing)
+- [Manage gateways](https://docs.nvidia.com/openshell/latest/sandboxes/manage-gateways.md)
+- [Manage sandboxes](https://docs.nvidia.com/openshell/latest/sandboxes/manage-sandboxes.md)
+- [Manage providers](https://docs.nvidia.com/openshell/latest/sandboxes/manage-providers.md)
+- [Sandbox policies](https://docs.nvidia.com/openshell/latest/sandboxes/policies.md)
+- [Inference routing](https://docs.nvidia.com/openshell/latest/sandboxes/inference-routing.md)
 
 ---
 

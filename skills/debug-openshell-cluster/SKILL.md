@@ -37,7 +37,7 @@ For local evaluation only, TLS may be disabled and the gateway can be reached th
 - For Kubernetes: `kubectl` must target the cluster that hosts OpenShell and Helm version 3 or later must be available.
 - For Docker or Podman: the runtime socket must be reachable from the gateway host.
 
-Use `openshell --help` and nested `--help` output as the authority for the installed CLI version. Use the published [installation guide](https://docs.nvidia.com/openshell/latest/about/installation), [compute-driver reference](https://docs.nvidia.com/openshell/latest/reference/sandbox-compute-drivers), [gateway configuration reference](https://docs.nvidia.com/openshell/latest/reference/gateway-config), and [Kubernetes setup guide](https://docs.nvidia.com/openshell/latest/kubernetes/setup) as the authority for deployment and configuration behavior.
+Use `openshell --help` and nested `--help` output as the authority for the installed CLI version. Use the published [installation guide](https://docs.nvidia.com/openshell/latest/about/installation.md), [compute-driver reference](https://docs.nvidia.com/openshell/latest/reference/sandbox-compute-drivers.md), [gateway configuration reference](https://docs.nvidia.com/openshell/latest/reference/gateway-config.md), and [Kubernetes setup guide](https://docs.nvidia.com/openshell/latest/kubernetes/setup.md) as the authority for deployment and configuration behavior.
 
 ## Workflow
 
