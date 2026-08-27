@@ -40,6 +40,7 @@ jobs:
             dev_shell: .#devShells.aarch64-darwin.default
     uses: ./.github/workflows/build-binaries.yml
     with:
+      package: openshell-cli
       binary: openshell
       triple: ${{ matrix.triple }}
       runner: ${{ matrix.runner }}

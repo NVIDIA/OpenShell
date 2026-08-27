@@ -6,6 +6,9 @@ name: Build Binary
 on:
   workflow_call:
     inputs:
+      package:
+        required: true
+        type: string
       binary:
         required: true
         type: string
@@ -64,6 +67,7 @@ jobs:
 
       - uses: ./.github/actions/build-rust-binary
         with:
+          package: ${{ inputs.package }}
           binary: ${{ inputs.binary }}
           triple: ${{ inputs.triple }}
           dev-shell: ${{ inputs['dev-shell'] }}

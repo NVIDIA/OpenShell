@@ -37,6 +37,7 @@ jobs:
             dev_shell: .#devShells.aarch64-linux.musl
     uses: ./.github/workflows/build-binaries.yml
     with:
+      package: openshell-sandbox
       binary: openshell-sandbox
       triple: ${{ matrix.triple }}
       runner: ${{ matrix.runner }}

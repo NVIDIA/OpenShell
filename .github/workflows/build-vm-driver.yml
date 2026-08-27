@@ -93,6 +93,7 @@ jobs:
         env:
           OPENSHELL_VM_RUNTIME_COMPRESSED_DIR: ${{ github.workspace }}/target/vm-runtime-compressed
         with:
+          package: openshell-driver-vm
           binary: openshell-driver-vm
           triple: ${{ matrix.triple }}
           dev-shell: ${{ matrix.dev_shell }}
