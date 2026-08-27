@@ -1,0 +1,141 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: Build Binaries
+
+on:
+  workflow_call:
+    inputs:
+      checkout-ref:
+        required: false
+        type: string
+        default: ""
+    secrets:
+      CACHIX_AUTH_TOKEN:
+        required: true
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  version:
+    name: Version
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      cargo: ${{ steps.version.outputs.cargo }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs['checkout-ref'] || github.sha }}
+          fetch-depth: 0
+
+      - name: Compute version
+        id: version
+        shell: bash
+        run: |
+          cargo="$(python3 tasks/scripts/release.py get-version --cargo)"
+          echo "cargo=$cargo" >> "$GITHUB_OUTPUT"
+
+  binary:
+    name: ${{ matrix.binary }} (${{ matrix.triple }})
+    needs: version
+    strategy:
+      matrix:
+        include:
+          - binary: openshell
+            triple: x86_64-unknown-linux-musl
+            runner: linux-amd64-cpu8
+            dev_shell: .#devShells.x86_64-linux.musl
+          - binary: openshell
+            triple: aarch64-unknown-linux-musl
+            runner: linux-arm64-cpu8
+            dev_shell: .#devShells.aarch64-linux.musl
+          - binary: openshell
+            triple: aarch64-apple-darwin
+            runner: macos-15-xlarge
+            dev_shell: .#devShells.aarch64-darwin.default
+          - binary: openshell-gateway
+            triple: x86_64-unknown-linux-gnu
+            runner: linux-amd64-cpu8
+            dev_shell: .#devShells.x86_64-linux.glibc-2-28
+            interpreter: /lib64/ld-linux-x86-64.so.2
+          - binary: openshell-gateway
+            triple: aarch64-unknown-linux-gnu
+            runner: linux-arm64-cpu8
+            dev_shell: .#devShells.aarch64-linux.glibc-2-28
+            interpreter: /lib/ld-linux-aarch64.so.1
+          - binary: openshell-gateway
+            triple: aarch64-apple-darwin
+            runner: macos-15-xlarge
+            dev_shell: .#devShells.aarch64-darwin.default
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: nix develop ${{ matrix.dev_shell }} -c bash -euo pipefail {0}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs['checkout-ref'] || github.sha }}
+
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
+        with:
+          github_access_token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: cachix/cachix-action@5f2d7c5294214f71b873db4b969586b980625e71 # v17
+        with:
+          name: openshell
+          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: binaries-${{ matrix.binary }}-${{ matrix.triple }}
+          cache-on-failure: "true"
+          cache-workspace-crates: "true"
+          cache-bin: "false"
+          cmd-format: nix develop ${{ matrix.dev_shell }} -c {0}
+
+      - name: Set version
+        run: sed -i 's/^version = "0\.0\.0"$/version = "${{ needs.version.outputs.cargo }}"/' Cargo.toml
+
+      - name: Build ${{ matrix.binary }}
+        run: GIT_DIR=/nonexistent cargo auditable build --release --bin "${{ matrix.binary }}"
+
+      - name: Verify ${{ matrix.binary }}
+        run: |
+          # Confirm the binary runs and reports the expected name.
+          target/release/${{ matrix.binary }} --version | grep -q '^${{ matrix.binary }} '
+          # Confirm Syft can decode the embedded cargo-auditable metadata.
+          SYFT_CHECK_FOR_APP_UPDATE=false syft "file:target/release/${{ matrix.binary }}" -o cyclonedx-json | grep 'pkg:cargo/' > /dev/null
+
+      - name: Verify static linkage
+        if: endsWith(matrix.triple, '-linux-musl')
+        run: tasks/scripts/verify-static-binary.sh target/release/${{ matrix.binary }}
+
+      - name: Normalize Linux dynamic binary
+        if: endsWith(matrix.triple, '-linux-gnu')
+        run: |
+          binary=target/release/${{ matrix.binary }}
+          # Remove Nix store paths so the binary can run on other distributions.
+          patchelf --set-interpreter "${{ matrix.interpreter }}" --remove-rpath "$binary"
+          # Z3 must be embedded instead of loaded from the target system.
+          test -z "$(patchelf --print-needed "$binary" | grep '^libz3')"
+          # Reject symbols introduced after glibc 2.28.
+          tasks/scripts/verify-glibc-symbols.sh 2.28 "$binary"
+
+      - name: Package ${{ matrix.binary }}
+        run: |
+          mkdir -p artifacts
+          install -m0755 target/release/${{ matrix.binary }} artifacts/${{ matrix.binary }}
+          tar -czf artifacts/${{ matrix.binary }}-${{ matrix.triple }}.tar.gz -C artifacts ${{ matrix.binary }}
+
+      - name: Upload ${{ matrix.binary }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: ${{ matrix.binary }}-${{ matrix.triple }}
+          path: artifacts/*.tar.gz
+          retention-days: 5
+          if-no-files-found: error
