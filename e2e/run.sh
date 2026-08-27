@@ -158,7 +158,7 @@ if [ -n "${vm}" ] || [ "${#with_configurations[@]}" -gt 0 ]; then
 		if [ "${gateway_driver}" = podman ]; then
 			vm=fedora
 		else
-			vm=ubuntu
+			vm=ubuntu-24-04
 		fi
 	fi
 fi
@@ -171,8 +171,8 @@ if [ "${mode}" = vm ]; then
 			die "invalid VM configuration name: ${configuration}"
 		fi
 	done
-	if [ "${gateway_driver}" = podman ] && [ "${vm}" = ubuntu ]; then
-		die "the Ubuntu 24.04 guest lacks the Podman 5 pasta helper required for sandbox callbacks; use --vm fedora --with podman"
+	if [ "${gateway_driver}" = podman ] && [ "${vm}" = ubuntu-24-04 ]; then
+		die "the Ubuntu 24.04 guest lacks the Podman 5 pasta helper required for sandbox callbacks; use --vm ubuntu-26-04 --with podman"
 	fi
 	if ! command -v nix >/dev/null 2>&1; then
 		die "Nix is required for VM mode"
@@ -231,14 +231,14 @@ target_dir="$(e2e_cargo_target_dir "${ROOT}" mise x -- cargo)"
 ensure_build_nofile_limit
 
 echo "==> Building native host openshell CLI"
-mise x -- cargo build "${cargo_jobs[@]}" -p openshell-cli --bin openshell
+mise x -- cargo build "${cargo_jobs[@]+"${cargo_jobs[@]}"}" -p openshell-cli --bin openshell
 host_cli_bin="${target_dir}/debug/openshell"
 
 echo "==> Preparing ${linux_musl_target} build target"
 mise x -- rustup target add "${linux_musl_target}" >/dev/null
 
 echo "==> Building Linux openshell-sandbox (${linux_musl_target})"
-mise x -- cargo zigbuild "${cargo_jobs[@]}" \
+mise x -- cargo zigbuild "${cargo_jobs[@]+"${cargo_jobs[@]}"}" \
 	--release \
 	--target "${linux_musl_target}" \
 	-p openshell-sandbox \
@@ -249,7 +249,7 @@ host_gateway_bin=
 guest_gateway_bin=
 if [ "${mode}" = host ]; then
 	echo "==> Building native host openshell-gateway"
-	mise x -- cargo build "${cargo_jobs[@]}" \
+	mise x -- cargo build "${cargo_jobs[@]+"${cargo_jobs[@]}"}" \
 		-p openshell-server \
 		--bin openshell-gateway \
 		--features bundled-z3
@@ -265,7 +265,7 @@ else
 				"${linux_gateway_zig_target}" \
 				"${target_dir}/zig-gnu-wrapper/e2e"
 		)"
-		mise x -- cargo zigbuild "${cargo_jobs[@]}" \
+		mise x -- cargo zigbuild "${cargo_jobs[@]+"${cargo_jobs[@]}"}" \
 			--release \
 			--target "${linux_gateway_zig_target}" \
 			-p openshell-server \

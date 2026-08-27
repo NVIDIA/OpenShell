@@ -175,6 +175,12 @@ Run the Podman-backed Rust CLI e2e suite:
 mise run e2e:podman
 ```
 
+Run the rootless Podman smoke suite in an Ubuntu 26.04 Nix test guest:
+
+```shell
+mise run e2e:podman:rootless
+```
+
 Run the VM-backed Rust CLI e2e suite:
 
 ```shell

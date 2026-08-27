@@ -129,6 +129,54 @@ jobs:
           OPENSHELL_MCP_CONFORMANCE_CLIENT_IMAGE: ${{ format('openshell-mcp-conformance-client:{0}', inputs.image-tag) }}
         run: ${{ matrix.cmd }}
 
+  e2e-podman-rootless:
+    name: E2E (rust-podman-rootless, Ubuntu 26.04 Nix VM)
+    # Run rootless Podman inside a Nix-managed Ubuntu guest so Podman, pasta,
+    # and user-namespace setup are provisioned by versioned repository tooling
+    # rather than mutable hosted-runner packages.
+    runs-on: ubuntu-26.04
+    timeout-minutes: 60
+    env:
+      MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs['checkout-ref'] || github.sha }}
+          persist-credentials: false
+
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
+        with:
+          github_access_token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: cachix/cachix-action@5f2d7c5294214f71b873db4b969586b980625e71 # v17
+        with:
+          name: openshell
+
+      - name: Install mise
+        run: |
+          curl https://mise.run | MISE_VERSION=v2026.4.25 sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          echo "$HOME/.local/share/mise/shims" >> "$GITHUB_PATH"
+
+      - name: Install tools
+        run: mise install --locked
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            clang \
+            cmake \
+            libclang-dev \
+            libssl-dev \
+            libz3-dev \
+            openssh-client \
+            pkg-config
+
+      - name: Run rootless Podman E2E
+        run: mise run --no-deps --skip-deps e2e:podman:rootless
+
   e2e-vm:
     name: E2E (rust-vm-${{ matrix.suite }})
     # libkrun needs KVM, so this job must run directly on a GitHub-hosted

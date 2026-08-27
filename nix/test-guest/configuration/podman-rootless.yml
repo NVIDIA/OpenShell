@@ -1,0 +1,71 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# PROTOTYPE: Configure rootless Podman in a disposable test guest.
+
+- name: Configure rootless Podman
+  hosts: test_vm
+  become: true
+  gather_facts: true
+
+  tasks:
+    - name: Validate rootless Podman support
+      ansible.builtin.assert:
+        that:
+          - ansible_facts.distribution == "Ubuntu"
+          - ansible_facts.distribution_version is version("26.04", ">=")
+        fail_msg: >-
+          Rootless Podman requires Ubuntu 26.04 or newer, not
+          {{ ansible_facts.distribution }} {{ ansible_facts.distribution_version }}.
+
+    - name: Refresh Ubuntu package metadata
+      ansible.builtin.apt:
+        update_cache: true
+
+    - name: Install Ubuntu rootless Podman
+      ansible.builtin.apt:
+        name:
+          - fuse-overlayfs
+          - passt
+          - podman
+          - uidmap
+        state: present
+
+    - name: Enable the rootless Podman API socket
+      ansible.builtin.systemd_service:
+        name: podman.socket
+        scope: user
+        enabled: true
+        state: started
+      become: false
+
+    - name: Verify rootless Podman
+      ansible.builtin.command:
+        cmd: podman info
+      become: false
+      changed_when: false
+
+    - name: Verify rootless Podman mode
+      ansible.builtin.command:
+        argv:
+          - podman
+          - info
+          - --format
+          - "{% raw %}{{.Host.Security.Rootless}}{% endraw %}"
+      become: false
+      changed_when: false
+      register: podman_rootless
+      failed_when: podman_rootless.stdout != "true"
+
+    - name: Verify rootless Podman uses pasta
+      ansible.builtin.command:
+        argv:
+          - podman
+          - info
+          - --format
+          - "{% raw %}{{.Host.RootlessNetworkCmd}}{% endraw %}"
+      become: false
+      changed_when: false
+      register: podman_rootless_network
+      failed_when: podman_rootless_network.stdout != "pasta"
