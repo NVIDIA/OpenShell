@@ -31,6 +31,8 @@ use futures::{Stream, StreamExt};
 #[cfg(unix)]
 use hyper_util::rt::TokioIo;
 use openshell_core::ComputeDriverKind;
+#[cfg(target_os = "windows")]
+use openshell_core::proto::SandboxPolicy;
 use openshell_core::proto::compute::v1::{
     CreateSandboxRequest, DeleteSandboxRequest, DeleteWorkspaceRequest, DeleteWorkspaceResponse,
     DriverCondition, DriverPlatformEvent, DriverResourceRequirements, DriverSandbox,
@@ -56,6 +58,8 @@ use openshell_driver_kubernetes::{
     ComputeDriverService as KubernetesDriverService, KubernetesComputeDriver,
     OperatorNamespaceAllowlist,
 };
+#[cfg(target_os = "windows")]
+use openshell_driver_mxc::{ComputeDriverService as MxcDriverService, MxcComputeConfig};
 #[cfg(all(not(target_os = "windows"), feature = "in-tree-compute-drivers"))]
 use openshell_driver_podman::{ComputeDriverService as PodmanDriverService, PodmanComputeDriver};
 use prost::Message;
@@ -568,6 +572,14 @@ pub struct ComputeRuntime {
     lifecycle_gates: Arc<LifecycleGateRegistry>,
     gateway_listener_requirements: Vec<GatewayListenerRequirement>,
     replica_id: String,
+    /// A1 policy side channel for the in-process MXC driver. `create_sandbox`
+    /// stages the typed `SandboxPolicy` here by sandbox id immediately before
+    /// dispatching to the driver, which consumes it. `None` for all other
+    /// drivers. The proto driver contract has no `policy` field and there is no
+    /// driver-side `GetSandboxConfig`, so this in-process map is how the policy
+    /// reaches the MXC backend without changing the cross-process contract.
+    #[cfg(target_os = "windows")]
+    mxc_policy_sink: Option<Arc<Mutex<HashMap<String, SandboxPolicy>>>>,
 }
 
 impl fmt::Debug for ComputeRuntime {
@@ -686,6 +698,8 @@ impl ComputeRuntime {
             lifecycle_gates: Arc::new(LifecycleGateRegistry::default()),
             gateway_listener_requirements,
             replica_id: lease::replica_id(),
+            #[cfg(target_os = "windows")]
+            mxc_policy_sink: None,
         })
     }
 
@@ -818,6 +832,38 @@ impl ComputeRuntime {
         .await
     }
 
+    /// Construct a `ComputeRuntime` backed by the MXC compute driver.
+    ///
+    /// MXC is Windows-only, in-process, and self-reports `Ready` — there is
+    /// no supervisor session argument because no surrogate or relay is used.
+    #[cfg(target_os = "windows")]
+    pub async fn new_mxc(
+        mxc_config: MxcComputeConfig,
+        store: Arc<Store>,
+        sandbox_index: SandboxIndex,
+        sandbox_watch_bus: SandboxWatchBus,
+        tracing_log_bus: TracingLogBus,
+        supervisor_sessions: Arc<SupervisorSessionRegistry>,
+    ) -> Result<Self, ComputeError> {
+        let backend = openshell_driver_mxc::MxcComputeBackend::new(mxc_config);
+        // Grab the A1 policy side channel before moving `backend` into the service.
+        let sink = backend.policy_sink();
+        let service: SharedComputeDriver = Arc::new(MxcDriverService::new(backend));
+        let mut runtime = Self::from_driver(
+            ComputeDriverKind::Mxc.as_str().to_string(),
+            service,
+            None,
+            store,
+            sandbox_index,
+            sandbox_watch_bus,
+            tracing_log_bus,
+            supervisor_sessions,
+        )
+        .await?;
+        runtime.mxc_policy_sink = Some(sink);
+        Ok(runtime)
+    }
+
     #[must_use]
     pub fn default_image(&self) -> &str {
         &self.default_image
@@ -942,6 +988,16 @@ impl ComputeRuntime {
             && let Some(spec) = driver_sandbox.spec.as_mut()
         {
             spec.sandbox_token = token;
+        }
+        // A1: stage the typed SandboxPolicy out-of-band into the MXC backend's
+        // side channel, keyed by sandbox id (== DriverSandbox.id), immediately
+        // before dispatch. The driver removes/consumes it in create_sandbox. The
+        // proto driver contract has no policy field, so this is the only path.
+        #[cfg(target_os = "windows")]
+        if let Some(sink) = &self.mxc_policy_sink
+            && let Some(p) = sandbox.spec.as_ref().and_then(|s| s.policy.clone())
+        {
+            sink.lock().await.insert(sandbox_id.clone(), p);
         }
         match self
             .driver
@@ -4258,6 +4314,8 @@ pub async fn new_test_runtime_with_driver(
         lifecycle_gates: Arc::new(LifecycleGateRegistry::default()),
         gateway_listener_requirements: Vec::new(),
         replica_id: "test-replica".to_string(),
+        #[cfg(target_os = "windows")]
+        mxc_policy_sink: None,
     }
 }
 
@@ -4942,6 +5000,8 @@ mod tests {
             lifecycle_gates: Arc::new(LifecycleGateRegistry::default()),
             gateway_listener_requirements: Vec::new(),
             replica_id: "test-replica".to_string(),
+            #[cfg(target_os = "windows")]
+            mxc_policy_sink: None,
         }
     }
 

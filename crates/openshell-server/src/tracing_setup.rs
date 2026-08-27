@@ -38,16 +38,16 @@ impl TracingHandle {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InProcessDriverTracing {
-    #[cfg(feature = "in-tree-compute-drivers")]
+    #[cfg(all(not(target_os = "windows"), feature = "in-tree-compute-drivers"))]
     Docker,
-    #[cfg(feature = "in-tree-compute-drivers")]
+    #[cfg(all(not(target_os = "windows"), feature = "in-tree-compute-drivers"))]
     Kubernetes,
-    #[cfg(feature = "in-tree-compute-drivers")]
+    #[cfg(all(not(target_os = "windows"), feature = "in-tree-compute-drivers"))]
     Podman,
 }
 
 impl InProcessDriverTracing {
-    #[cfg(feature = "in-tree-compute-drivers")]
+    #[cfg(all(not(target_os = "windows"), feature = "in-tree-compute-drivers"))]
     fn target_prefix(self) -> &'static str {
         match self {
             Self::Docker => openshell_driver_docker::otel_tracing::IN_PROCESS_TARGET_PREFIX,
@@ -58,7 +58,7 @@ impl InProcessDriverTracing {
 }
 
 fn in_process_driver_tracing(driver: &ConfiguredComputeDriver) -> Option<InProcessDriverTracing> {
-    #[cfg(feature = "in-tree-compute-drivers")]
+    #[cfg(all(not(target_os = "windows"), feature = "in-tree-compute-drivers"))]
     match driver {
         ConfiguredComputeDriver::Registered(registration) if registration.name == "docker" => {
             Some(InProcessDriverTracing::Docker)
@@ -71,7 +71,7 @@ fn in_process_driver_tracing(driver: &ConfiguredComputeDriver) -> Option<InProce
         }
         _ => None,
     }
-    #[cfg(not(feature = "in-tree-compute-drivers"))]
+    #[cfg(not(all(not(target_os = "windows"), feature = "in-tree-compute-drivers")))]
     {
         let _ = driver;
         None
@@ -79,18 +79,18 @@ fn in_process_driver_tracing(driver: &ConfiguredComputeDriver) -> Option<InProce
 }
 
 fn in_process_driver_target_prefix(driver: Option<InProcessDriverTracing>) -> Option<&'static str> {
-    #[cfg(feature = "in-tree-compute-drivers")]
+    #[cfg(all(not(target_os = "windows"), feature = "in-tree-compute-drivers"))]
     {
         driver.map(InProcessDriverTracing::target_prefix)
     }
-    #[cfg(not(feature = "in-tree-compute-drivers"))]
+    #[cfg(not(all(not(target_os = "windows"), feature = "in-tree-compute-drivers")))]
     {
         let _ = driver;
         None
     }
 }
 
-#[cfg(feature = "in-tree-compute-drivers")]
+#[cfg(all(not(target_os = "windows"), feature = "in-tree-compute-drivers"))]
 fn in_process_driver_provider(
     driver: Option<InProcessDriverTracing>,
     endpoint: Option<&str>,
@@ -109,7 +109,7 @@ fn in_process_driver_provider(
     }
 }
 
-#[cfg(not(feature = "in-tree-compute-drivers"))]
+#[cfg(not(all(not(target_os = "windows"), feature = "in-tree-compute-drivers")))]
 fn in_process_driver_provider(
     _driver: Option<InProcessDriverTracing>,
     _endpoint: Option<&str>,
@@ -117,7 +117,7 @@ fn in_process_driver_provider(
     (None, None)
 }
 
-#[cfg(feature = "in-tree-compute-drivers")]
+#[cfg(all(not(target_os = "windows"), feature = "in-tree-compute-drivers"))]
 fn in_process_driver_layer<S>(
     provider: &Option<SdkTracerProvider>,
     driver: Option<InProcessDriverTracing>,
@@ -139,7 +139,7 @@ where
     })
 }
 
-#[cfg(not(feature = "in-tree-compute-drivers"))]
+#[cfg(not(all(not(target_os = "windows"), feature = "in-tree-compute-drivers")))]
 fn in_process_driver_layer<S>(
     _provider: &Option<SdkTracerProvider>,
     _driver: Option<InProcessDriverTracing>,

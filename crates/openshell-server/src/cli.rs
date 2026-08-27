@@ -796,7 +796,12 @@ fn normalize_compute_driver_socket_args(args: &mut RunArgs, matches: &ArgMatches
 fn is_singleplayer_driver(driver: Option<ComputeDriverKind>) -> bool {
     matches!(
         driver,
-        Some(ComputeDriverKind::Docker | ComputeDriverKind::Podman | ComputeDriverKind::Vm)
+        Some(
+            ComputeDriverKind::Docker
+                | ComputeDriverKind::Podman
+                | ComputeDriverKind::Vm
+                | ComputeDriverKind::Mxc
+        )
     )
 }
 
@@ -1667,6 +1672,7 @@ ssh_session_ttl_secs = 1234
             openshell_core::ComputeDriverKind::Docker,
             openshell_core::ComputeDriverKind::Podman,
             openshell_core::ComputeDriverKind::Vm,
+            openshell_core::ComputeDriverKind::Mxc,
         ] {
             assert!(
                 super::is_singleplayer_driver(Some(driver)),

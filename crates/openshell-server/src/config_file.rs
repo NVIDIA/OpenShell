@@ -483,7 +483,9 @@ fn inheritable_keys(driver_name: &str) -> &'static [&'static str] {
             "guest_tls_cert",
             "guest_tls_key",
         ],
-        None => &[],
+        // MXC reads its own settings from the driver config table and has no
+        // gateway-inherited required fields.
+        Some(ComputeDriverKind::Mxc) | None => &[],
     }
 }
 
@@ -712,7 +714,7 @@ allow_unauthenticated_users = true
 [[openshell.supervisor.middleware]]
 name = "local-guard"
 grpc_endpoint = "https://127.0.0.1:50051"
-tls_ca_cert_path = "CA_PATH"
+tls_ca_cert_path = 'CA_PATH'
 audience = "urn:openshell:middleware:local-guard"
 max_payload_bytes = 262144
 timeout = "2s"
@@ -736,10 +738,11 @@ timeout = "2s"
             SupervisorMiddlewareService::try_from(&file.openshell.supervisor.middleware[0])
                 .expect("valid CA resolves");
         assert_eq!(registration.timeout, "2s");
-        assert_eq!(
-            registration.tls_ca_cert_pem,
-            certificate.cert.pem().as_bytes()
-        );
+        let registered_pem = String::from_utf8(registration.tls_ca_cert_pem)
+            .expect("registered CA remains PEM text")
+            .replace("\r\n", "\n");
+        let generated_pem = certificate.cert.pem().replace("\r\n", "\n");
+        assert_eq!(registered_pem, generated_pem);
         assert_eq!(
             registration.audience,
             "urn:openshell:middleware:local-guard"

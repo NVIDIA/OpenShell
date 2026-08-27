@@ -4025,6 +4025,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "openshell-driver-mxc"
+version = "0.0.0"
+dependencies = [
+ "base64 0.22.1",
+ "futures",
+ "openshell-core",
+ "openshell-policy",
+ "serde",
+ "serde_json",
+ "serde_yml",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "openshell-driver-podman"
 version = "0.0.0"
 dependencies = [
@@ -4351,6 +4371,7 @@ dependencies = [
  "openshell-driver-docker",
  "openshell-driver-kubernetes",
  "openshell-driver-kubernetes-secrets",
+ "openshell-driver-mxc",
  "openshell-driver-podman",
  "openshell-driver-vault",
  "openshell-extension-core",

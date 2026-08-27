@@ -1324,18 +1324,26 @@ pub fn install_default_compute_drivers() -> ComputeDriverRegistry {
             .expect("unique vm registration");
     }
     #[cfg(all(target_os = "windows", feature = "in-tree-compute-drivers"))]
-    for name in ["kubernetes", "podman", "docker", "vm"] {
+    {
         registry
             .install(
-                ComputeDriverRegistration::new(
-                    name,
-                    u16::MAX,
-                    None,
-                    UnsupportedComputeDriverFactory,
-                )
-                .expect("valid unsupported registration"),
+                ComputeDriverRegistration::new("mxc", u16::MAX, None, MxcComputeDriverFactory)
+                    .expect("valid mxc registration"),
             )
-            .expect("unique unsupported registration");
+            .expect("unique mxc registration");
+        for name in ["kubernetes", "podman", "docker", "vm"] {
+            registry
+                .install(
+                    ComputeDriverRegistration::new(
+                        name,
+                        u16::MAX,
+                        None,
+                        UnsupportedComputeDriverFactory,
+                    )
+                    .expect("valid unsupported registration"),
+                )
+                .expect("unique unsupported registration");
+        }
     }
     registry
 }
@@ -1408,6 +1416,35 @@ impl ComputeDriverBuildContext<'_> {
             self.sandbox_watch_bus,
             self.tracing_log_bus,
             self.supervisor_sessions,
+        )
+        .await
+        .map_err(|error| Error::execution(format!("failed to create compute runtime: {error}")))?;
+        Ok(ComputeDriverBuildOutput {
+            runtime,
+            operator_allowlist: None,
+        })
+    }
+}
+
+#[cfg(all(target_os = "windows", feature = "in-tree-compute-drivers"))]
+#[derive(Clone, Copy)]
+struct MxcComputeDriverFactory;
+
+#[cfg(all(target_os = "windows", feature = "in-tree-compute-drivers"))]
+#[async_trait::async_trait]
+impl ComputeDriverFactory for MxcComputeDriverFactory {
+    async fn build(
+        &self,
+        context: ComputeDriverBuildContext<'_>,
+    ) -> Result<ComputeDriverBuildOutput> {
+        let mxc_config = compute::driver_config::mxc_config_from_context(context.driver_startup)?;
+        let runtime = ComputeRuntime::new_mxc(
+            mxc_config,
+            context.store,
+            context.sandbox_index,
+            context.sandbox_watch_bus,
+            context.tracing_log_bus,
+            context.supervisor_sessions,
         )
         .await
         .map_err(|error| Error::execution(format!("failed to create compute runtime: {error}")))?;
