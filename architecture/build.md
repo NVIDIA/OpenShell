@@ -160,10 +160,11 @@ Runtime layout:
   `GLIBC_2.28`; release workflows verify this before publishing artifacts. The
   gateway bundles z3, so the image does not need a distro-provided z3 runtime.
 - **VM driver**: host GNU-linked binary installed at
-  `/usr/libexec/openshell/openshell-driver-vm` in Linux packages and published
-  as a release artifact. Linux GNU VM driver binaries must not reference
-  `GLIBC_*` symbols newer than `GLIBC_2.28`; release workflows verify this
-  before publishing artifacts.
+  `/usr/libexec/openshell/openshell-driver-vm` in Linux packages (Debian, RPM) and at
+  `$SNAP/usr/libexec/openshell` in the snap (also exposed inside the snapped environment
+  via symlink at `/usr/libexec/openshell/openshe`), and published as a release artifact.
+  Linux GNU VM driver binaries must not reference `GLIBC_*` symbols newer than
+  `GLIBC_2.28`; release workflows verify this before publishing artifacts.
 - **Supervisor**: Alpine base with `nftables`, static binary at
   `/openshell-sandbox` (musl by default; see `SUPERVISOR_LIBC` above). Static
   linkage keeps the binary usable when the image is mounted/extracted into

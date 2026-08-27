@@ -285,6 +285,23 @@ in `post_install`, and owns the `brew services` gateway lifecycle. The service
 also leaves `OPENSHELL_DRIVERS` unset so driver choice remains automatic unless
 the user explicitly overrides it.
 
+On Linux, the OpenShell snap stages the prebuilt driver into `usr/libexec/openshell/` and a
+`layout:` symlink exposes it at `/usr/libexec/openshell` inside snap confinement. Operators must
+connect the `kvm` interface to grant the gateway access to `/dev/kvm`:
+
+```shell
+sudo snap connect openshell:kvm
+```
+
+Without the `kvm` interface connected, the VM driver cannot create VMs.
+
+The snap also vendors `e2fsprogs` into `$SNAP/usr/sbin`. The driver shells out to
+`mke2fs`/`mkfs.ext4` to format sandbox root disks and to `debugfs` to inject the supervisor and
+guest init script. The `core24` base ships those binaries under `/usr/sbin`, but the snap
+AppArmor profile does not permit executing base-snap `sbin` binaries: they resolve on `PATH`
+and then fail `execve` with `EACCES`. The snap `PATH` prefers `$SNAP/usr/sbin`, so the vendored
+copies win.
+
 ## TODOs
 
 - The gateway still configures the driver via CLI args; this will move to a gRPC bootstrap call so the driver interface is uniform across backends. See the `TODO(driver-abstraction)` notes in `crates/openshell-server/src/lib.rs` and `crates/openshell-server/src/compute/vm.rs`.

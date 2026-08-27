@@ -204,6 +204,16 @@ jobs:
           openshell gateway select snap-docker
           openshell status
 
+      - name: Verify VM driver resolves at its layout path
+        run: |
+          set -euo pipefail
+          # Enters the snap's mount namespace: /usr/libexec/openshell only exists
+          # there, via the snapcraft layout: symlink into $SNAP.
+          OUTPUT="$(snap run --shell openshell.gateway -c \
+            '/usr/libexec/openshell/openshell-driver-vm --version')"
+          echo "$OUTPUT"
+          grep -q '^openshell-driver-vm ' <<<"$OUTPUT"
+
   kubernetes:
     name: Kubernetes Helm (kind)
     if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}

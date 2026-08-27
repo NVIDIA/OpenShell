@@ -27,12 +27,33 @@ description = "Build all Rust crates in release mode"
 run = "cargo build --workspace --release"
 hide = true
 
+# The VM driver embeds its runtime from OPENSHELL_VM_RUNTIME_COMPRESSED_DIR, which has no
+# default in crates/openshell-driver-vm/build.rs. When the directory is missing or incomplete,
+# build.rs still exits 0 but embeds empty stub resources, and the driver only fails later at
+# sandbox creation with "VM runtime not embedded" — so guard it here instead.
+#
+# Use $MISE_PROJECT_ROOT, not {{config_root}}: this file is pulled in through
+# [task_config] includes, so {{config_root}} renders as <repo>/tasks.
 ["build:rust:snap"]
 description = "Build release Rust binaries consumed by the hand-staged snap"
 run = [
+  """
+  runtime_dir="$MISE_PROJECT_ROOT/target/vm-runtime-compressed"
+  for f in libkrun.so.zst libkrunfw.so.5.zst gvproxy.zst umoci.zst openshell-sandbox.zst; do
+    if [ ! -f "$runtime_dir/$f" ]; then
+      echo "ERROR: missing $runtime_dir/$f" >&2
+      echo "Run 'mise run vm:setup && mise run vm:supervisor' before building the snap." >&2
+      exit 1
+    fi
+  done
+  """,
   "cargo build --release -p openshell-cli",
   "cargo build --release -p openshell-server --features bundled-z3",
   "cargo build --release -p openshell-sandbox",
+  """
+  OPENSHELL_VM_RUNTIME_COMPRESSED_DIR="$MISE_PROJECT_ROOT/target/vm-runtime-compressed" \
+    cargo build --release -p openshell-driver-vm
+  """,
 ]
 
 [check]
