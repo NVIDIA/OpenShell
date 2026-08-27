@@ -444,9 +444,49 @@ pub fn noninteractive_active_label(step: ProvisioningStep) -> String {
     step.active_label().trim_end_matches('.').to_string()
 }
 
+/// Completed-step bookkeeping for plain (non-interactive) progress output.
+///
+/// [`ProvisioningDisplay`] holds this state internally, so an interactive
+/// terminal renders one line per step no matter how many times the gateway
+/// repeats a completion event. Plain output has no display to hold it, so it
+/// lives here and keeps both modes reporting the same step list.
+#[derive(Debug, Default)]
+pub struct PlainProgress {
+    /// Steps already reported, in order.
+    completed_steps: Vec<ProvisioningStep>,
+}
+
+impl PlainProgress {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Line to print for a completed step, or `None` when the step was already
+    /// reported and this event is a repeat.
+    pub fn complete_step(
+        &mut self,
+        step: ProvisioningStep,
+        label: &str,
+        elapsed: Duration,
+    ) -> Option<String> {
+        if self.completed_steps.contains(&step) {
+            return None;
+        }
+        self.completed_steps.push(step);
+        let ts = format_timestamp(elapsed);
+        Some(format!("{} {}", ts.dimmed(), label))
+    }
+}
+
+/// Where a provisioning progress event is rendered.
+pub enum ProgressTarget<'a> {
+    Interactive(&'a mut ProvisioningDisplay),
+    Plain(&'a mut PlainProgress),
+}
+
 pub fn handle_platform_progress_event(
     event: &PlatformEvent,
-    mut display: Option<&mut ProvisioningDisplay>,
+    mut target: ProgressTarget<'_>,
     provision_start: Instant,
 ) -> bool {
     let completed_step = event
@@ -472,34 +512,39 @@ pub fn handle_platform_progress_event(
             .metadata
             .get(PROGRESS_COMPLETE_LABEL_KEY)
             .map_or_else(|| step.completed_label(), String::as_str);
-        if let Some(d) = display.as_deref_mut() {
-            d.complete_step_with_label(step, label);
-        } else {
-            let ts = format_timestamp(provision_start.elapsed());
-            println!("{} {}", ts.dimmed(), label);
+        match &mut target {
+            ProgressTarget::Interactive(d) => d.complete_step_with_label(step, label),
+            ProgressTarget::Plain(p) => {
+                // The gateway repeats the completion event while a step is slow
+                // (notably an uncached image pull), so print the first one only.
+                if let Some(line) = p.complete_step(step, label, provision_start.elapsed()) {
+                    println!("{line}");
+                }
+            }
         }
     }
 
     if let Some(step) = active_step
-        && let Some(d) = display.as_deref_mut()
+        && let ProgressTarget::Interactive(d) = &mut target
     {
         d.set_active_step(step);
     }
 
     if let Some(detail) = active_detail {
-        if let Some(d) = display {
-            d.set_active_detail(detail);
-        } else {
-            let ts = format_timestamp(provision_start.elapsed());
-            if let Some(step) = active_step {
-                println!(
-                    "{} {} {}",
-                    ts.dimmed(),
-                    noninteractive_active_label(step),
-                    detail
-                );
-            } else {
-                println!("{} {}", ts.dimmed(), detail);
+        match &mut target {
+            ProgressTarget::Interactive(d) => d.set_active_detail(detail),
+            ProgressTarget::Plain(_) => {
+                let ts = format_timestamp(provision_start.elapsed());
+                if let Some(step) = active_step {
+                    println!(
+                        "{} {} {}",
+                        ts.dimmed(),
+                        noninteractive_active_label(step),
+                        detail
+                    );
+                } else {
+                    println!("{} {}", ts.dimmed(), detail);
+                }
             }
         }
     }
@@ -1072,31 +1117,32 @@ mod tests {
         assert!(err.to_string().contains("invalid duration"));
     }
 
-    #[test]
-    fn platform_progress_events_update_borrowed_display_without_duplicate_steps() {
-        let event = PlatformEvent {
+    fn completion_event(step: &str) -> PlatformEvent {
+        PlatformEvent {
             metadata: HashMap::from([
-                (
-                    PROGRESS_COMPLETE_STEP_KEY.to_string(),
-                    PROGRESS_STEP_REQUESTING_SANDBOX.to_string(),
-                ),
+                (PROGRESS_COMPLETE_STEP_KEY.to_string(), step.to_string()),
                 (
                     PROGRESS_ACTIVE_STEP_KEY.to_string(),
                     PROGRESS_STEP_STARTING_SANDBOX.to_string(),
                 ),
             ]),
             ..PlatformEvent::default()
-        };
+        }
+    }
+
+    #[test]
+    fn platform_progress_events_update_borrowed_display_without_duplicate_steps() {
+        let event = completion_event(PROGRESS_STEP_REQUESTING_SANDBOX);
         let mut display = ProvisioningDisplay::new();
 
         assert!(handle_platform_progress_event(
             &event,
-            Some(&mut display),
+            ProgressTarget::Interactive(&mut display),
             Instant::now(),
         ));
         assert!(handle_platform_progress_event(
             &event,
-            Some(&mut display),
+            ProgressTarget::Interactive(&mut display),
             Instant::now(),
         ));
 
@@ -1110,6 +1156,93 @@ mod tests {
             ProvisioningStep::StartingSandbox.active_label()
         );
         display.clear();
+    }
+
+    #[test]
+    fn plain_progress_reports_a_completed_step_once() {
+        let mut plain = PlainProgress::new();
+
+        let first = plain
+            .complete_step(
+                ProvisioningStep::RequestingSandbox,
+                "Sandbox allocated",
+                Duration::from_secs(0),
+            )
+            .expect("first completion should print");
+        assert!(first.contains("Sandbox allocated"));
+
+        // The gateway repeats the same completion event while the step is slow.
+        for _ in 0..5 {
+            assert!(
+                plain
+                    .complete_step(
+                        ProvisioningStep::RequestingSandbox,
+                        "Sandbox allocated",
+                        Duration::from_secs(30),
+                    )
+                    .is_none(),
+                "repeat completion events must not print again"
+            );
+        }
+
+        assert_eq!(
+            plain.completed_steps,
+            vec![ProvisioningStep::RequestingSandbox]
+        );
+    }
+
+    #[test]
+    fn plain_progress_still_reports_each_distinct_step() {
+        let mut plain = PlainProgress::new();
+
+        for step in [
+            ProvisioningStep::RequestingSandbox,
+            ProvisioningStep::PullingSandboxImage,
+            ProvisioningStep::StartingSandbox,
+        ] {
+            let line = plain
+                .complete_step(step, step.completed_label(), Duration::from_secs(1))
+                .expect("each distinct step should print once");
+            assert!(line.contains(step.completed_label()));
+        }
+
+        assert_eq!(
+            plain.completed_steps,
+            vec![
+                ProvisioningStep::RequestingSandbox,
+                ProvisioningStep::PullingSandboxImage,
+                ProvisioningStep::StartingSandbox,
+            ]
+        );
+    }
+
+    #[test]
+    fn platform_progress_events_deduplicate_completed_steps_in_plain_output() {
+        let allocated = completion_event(PROGRESS_STEP_REQUESTING_SANDBOX);
+        let started = completion_event(PROGRESS_STEP_STARTING_SANDBOX);
+        let mut plain = PlainProgress::new();
+
+        // Ten polls while the image pulls, all carrying the same completed step.
+        for _ in 0..10 {
+            assert!(handle_platform_progress_event(
+                &allocated,
+                ProgressTarget::Plain(&mut plain),
+                Instant::now(),
+            ));
+        }
+        assert!(handle_platform_progress_event(
+            &started,
+            ProgressTarget::Plain(&mut plain),
+            Instant::now(),
+        ));
+
+        assert_eq!(
+            plain.completed_steps,
+            vec![
+                ProvisioningStep::RequestingSandbox,
+                ProvisioningStep::StartingSandbox,
+            ]
+        );
     }
 
     // helper for building input
