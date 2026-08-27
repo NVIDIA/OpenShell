@@ -14,7 +14,7 @@ Detect and fix drift across the agent-first infrastructure files. These files re
 | `AGENTS.md` | Project identity, workflow chains, architecture overview, issue/PR conventions, skill maintenance pointer |
 | `CONTRIBUTING.md` | Skills table, workflow chains, "When to Open an Issue" guidance, skill references |
 | `CONTRIBUTING.md` issue lifecycle section | Human-facing issue states, roadmap decisions, acceptance signals, and direct-versus-queued agent ownership |
-| `README.md` | "Built With Agents" section, "Explore with your agent" skill references |
+| `README.md` | "Use OpenShell with Your Agent" and "Built With Agents" sections |
 | `.github/ISSUE_TEMPLATE/bug_report.yml` | Skill name references in diagnostic guidance |
 | `.github/ISSUE_TEMPLATE/feature_request.yml` | Skill name references in investigation guidance |
 | `.github/ISSUE_TEMPLATE/config.yml` | Contact link text referencing skills |
@@ -150,7 +150,7 @@ For each file in the table above, check for the following inconsistencies:
 3. **Unique names** — Parse the `name` field from every `SKILL.md` under both roots. Every name must be globally unique and match the documented inventory.
 4. **Local references** — Every relative Markdown link and referenced file in a skill must resolve within that installed skill directory unless the reference is an explicit published URL.
 5. **Canonical paths** — Contributor skills that name the source location of a public skill must use `skills/<name>/...`, never `.agents/skills/<name>/...`.
-6. **Public portability** — Public skills must not require repository-relative files under `docs/`, `architecture/`, `crates/`, `deploy/`, or `.agents/`; source builds; `mise`; or repository E2E workflows. Use installed `openshell --help` for command syntax and `https://docs.nvidia.com/openshell/latest/` links for product documentation.
+6. **Public portability** — Public skills must not require repository-relative files under `docs/`, `architecture/`, `crates/`, `deploy/`, or `.agents/`; source builds; `mise`; or repository E2E workflows. Use installed `openshell --help` for command syntax and Markdown endpoints under `https://docs.nvidia.com/openshell/latest/` (URLs ending in `.md`) for product documentation.
 7. **No canonical documentation copies** — Review public reference files and large command/schema blocks. Remove material that merely copies CLI help, policy schemas, architecture docs, or published operational documentation; retain only skill-specific reasoning and worked interactions.
 8. **Discovery** — Run `npx -y skills add . --list` from a clean checkout or disposable copy. It must list exactly the four public skills. Remove any generated lock file or installed directory after the check.
 

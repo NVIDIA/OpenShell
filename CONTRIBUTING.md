@@ -442,7 +442,8 @@ These are the primary `mise` tasks for day-to-day development:
 | `fern/`         | Fern site config, components, and theme assets |
 | `architecture/` | Architecture docs and plans                   |
 | `rfc/`          | Request for Comments proposals                |
-| `.agents/`      | Agent skills and persona definitions          |
+| `skills/`       | Public skills for using and operating OpenShell |
+| `.agents/`      | Contributor skills and persona definitions    |
 
 ## RFCs
 

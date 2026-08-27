@@ -64,7 +64,7 @@ The user provides full API documentation. Accepted formats:
 
 | Format | How to consume |
 |--------|----------------|
-| **URL** | Fetch with `WebFetch` and parse the endpoint list |
+| **URL** | Fetch with the agent's web access and parse the endpoint list |
 | **File path** | Read the file (OpenAPI JSON/YAML, markdown, etc.) |
 | **Pasted text** | Parse inline from the conversation |
 | **OpenAPI/Swagger spec** | Extract `paths` object for all method+path combinations |
@@ -128,9 +128,9 @@ When the user mentions a recognizable API host but hasn't provided docs, and the
 **How to do it:**
 1. Tell the user: "I can look up the REST API docs for [service] to help generate a more precise policy. Want me to do that?"
 2. If the user agrees (or hasn't declined), search for the docs:
-   - Use `WebSearch` with a query like `"[service name] REST API documentation endpoints"` or `"[service name] OpenAPI spec"`
+   - Search the web with a query like `"[service name] REST API documentation endpoints"` or `"[service name] OpenAPI spec"`
    - Look for official documentation URLs in the results
-3. Fetch the docs page with `WebFetch` and extract the endpoint inventory (method + path pairs)
+3. Fetch the documentation page and extract the endpoint inventory (method + path pairs)
 4. Use the discovered endpoints to offer tighter scoping: "I found [N] endpoints in the [service] API. Based on your intent, I can narrow the policy to just [subset]. Want me to do that, or keep the broader preset?"
 
 **When to skip:**

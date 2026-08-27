@@ -16,7 +16,7 @@
 
 OpenShell is the safe, private runtime for autonomous AI agents. It provides sandboxed execution environments that protect your data, credentials, and infrastructure — governed by declarative YAML policies that prevent unauthorized file access, data exfiltration, and uncontrolled network activity.
 
-OpenShell is built agent-first. The project ships with agent skills for everything from gateway troubleshooting to policy generation, and we expect contributors to use them.
+OpenShell is built agent-first. It ships public agent skills for using and operating OpenShell, plus separate repository-aware workflows for contributors and maintainers.
 
 ## Quickstart
 
@@ -225,7 +225,7 @@ OpenShell is developed using the same agent-driven workflows it enables. Contrib
 - **Security review:** `review-security-issue` produces a severity assessment and remediation plan. `fix-security-issue` implements it.
 - **Repository maintenance:** `sync-agent-infra`, `update-docs-from-commits`, and other internal workflows keep code, documentation, and agent infrastructure consistent.
 
-All agent implementation work is human-gated: maintainers explicitly request a plan, agents propose it, maintainers approve it, and agents build. See [AGENTS.md](AGENTS.md) for the full workflow chain documentation.
+Agent implementation is human-directed: a user may request a phase directly, or maintainers may use the optional `agent:*` workflow to queue and approve planning and implementation. See [AGENTS.md](AGENTS.md) for the full workflow chain documentation.
 
 ## Getting Help
 
@@ -248,7 +248,7 @@ All agent implementation work is human-gated: maintainers explicitly request a p
 
 ## Contributing
 
-OpenShell is built agent-first. Issues should include a user story, problem statement, impact, and acceptance criteria. The impact should explain the consequences of the current behavior and why existing workarounds are insufficient. Feature requests also require a workflow-level proposed design and alternatives; bug reports add reproduction steps, environment details, and relevant logs. Once maintainers accept work, contributors should use the skills in `.agents/skills/` to investigate the current code and behavior, implement the change, and verify it. If an issue contains earlier diagnostics, verify them rather than relying on them. See [CONTRIBUTING.md](CONTRIBUTING.md) for the full agent skills table, contribution workflow, and development setup.
+OpenShell is built agent-first. Issues should include a user story, problem statement, impact, and acceptance criteria. The impact should explain the consequences of the current behavior and why existing workarounds are insufficient. Feature requests also require a workflow-level proposed design and alternatives; bug reports add reproduction steps, environment details, and relevant logs. Once work is authorized through the project workflow or a direct request, contributors should use the skills in `.agents/skills/` to investigate the current code and behavior, implement the change, and verify it. If an issue contains earlier diagnostics, verify them rather than relying on them. See [CONTRIBUTING.md](CONTRIBUTING.md) for the full agent skills table, contribution workflow, and development setup.
 
 ## Telemetry
 

@@ -138,8 +138,8 @@ Same preset applied to multiple hosts in one policy because the binary set is th
 1. Recognize `api.openai.com` as a well-known service
 2. Ask: "I can look up OpenAI's REST API docs to generate a more precise policy. Want me to do that, or should I use a broad preset?"
 3. User says: "Yeah go ahead"
-4. `WebSearch` for "OpenAI REST API documentation endpoints"
-5. `WebFetch` the docs page, extract endpoints:
+4. Search the web for "OpenAI REST API documentation endpoints"
+5. Fetch the documentation page and extract endpoints:
    - `POST /v1/chat/completions`
    - `POST /v1/embeddings`
    - `GET /v1/models`
@@ -748,7 +748,7 @@ An exact IP is treated as `/32` — only that specific address is permitted.
       - { path: /usr/bin/curl }
 ```
 
-The agent uses `StrReplace` to insert after the last existing policy in the `network_policies` block. All other sections (`filesystem_policy`, `landlock`, `process`) are untouched.
+The agent inserts the new entry after the last existing policy in the `network_policies` block. All other sections (`filesystem_policy`, `landlock`, `process`) are untouched.
 
 ---
 

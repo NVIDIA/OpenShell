@@ -13,7 +13,7 @@ Use `openshell` first to identify the active endpoint. Then use the platform too
 
 The target deployment flow is:
 
-1. Operator starts or deploys the gateway with system packages, systemd, Helm, or a development task. The CLI does not start, stop, or destroy gateway services.
+1. Operator starts or deploys the gateway with system packages, systemd, or Helm. The CLI does not start, stop, or destroy gateway services.
 2. Operator configures the compute driver.
 3. Operator provides the CLI and supervisor authentication material required by the deployment mode: edge or OIDC user auth, optional CLI mTLS, and gateway-minted sandbox JWTs.
 4. The CLI registers a reachable gateway endpoint with `openshell gateway add`.
@@ -439,17 +439,15 @@ kubectl -n openshell get endpoints openshell
 For local port-forward testing:
 
 ```bash
-mise run helm:k3s:forward
-openshell gateway list
-openshell status
+kubectl -n openshell port-forward service/openshell 8080:8080
 ```
 
-The forwarding task always exposes the collector on ports `4317` and `18888`.
-It exposes the gateway on port `8090` only when the `openshell` Service exists,
-so collector-only Docker or Podman development remains valid before a Skaffold
-deployment. A successful plaintext `helm:skaffold:run` registers the local
-gateway and selects it as active; the forwarding task does not modify gateway
-metadata.
+Leave the port forward running. In another terminal, register the local endpoint if needed and verify it:
+
+```bash
+openshell gateway add http://127.0.0.1:8080 --local --name local-kubernetes
+openshell status
+```
 
 If the gateway is healthy but sandbox creation fails:
 
