@@ -1426,7 +1426,7 @@ async fn build_compute_runtime(
                 inherited_config_keys: registration.inherited_config_keys,
             };
             let instance = registration.factory.build(build_context).await?;
-            let runtime = match instance {
+            match instance {
                 ComputeDriverInstance::InProcess(driver) => ComputeRuntime::from_driver(
                     registration.name,
                     driver,
@@ -1456,8 +1456,7 @@ async fn build_compute_runtime(
                         Error::execution(format!("failed to create compute runtime: {error}"))
                     })?
                 }
-            };
-            runtime
+            }
         }
         ConfiguredComputeDriver::Remote { name } => {
             let remote_config =
@@ -1470,7 +1469,7 @@ async fn build_compute_runtime(
             let endpoint = compute::connect_remote_compute_driver(name, &remote_config.socket_path)
                 .await
                 .map_err(|e| Error::execution(format!("failed to create compute runtime: {e}")))?;
-            let runtime = ComputeRuntime::new_remote_driver(
+            ComputeRuntime::new_remote_driver(
                 endpoint,
                 store,
                 sandbox_index,
@@ -1479,8 +1478,7 @@ async fn build_compute_runtime(
                 supervisor_sessions,
             )
             .await
-            .map_err(|e| Error::execution(format!("failed to create compute runtime: {e}")))?;
-            runtime
+            .map_err(|e| Error::execution(format!("failed to create compute runtime: {e}")))?
         }
     };
 
