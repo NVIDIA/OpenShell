@@ -2458,6 +2458,34 @@ async fn provider_create_sends_inline_credentials() {
 }
 
 #[tokio::test]
+async fn provider_create_prefers_exact_imported_alias_profile() {
+    let ts = run_server().await;
+    install_test_profile(&ts, "gh", "GITHUB_TOKEN").await;
+
+    run::provider_create_with_options(run::ProviderCreateOptions {
+        server: &ts.endpoint,
+        name: "enterprise-github",
+        provider_type: "gh",
+        credentials: &["GITHUB_TOKEN=test-token".to_string()],
+        credential_source: run::ProviderCreateCredentialSource::ExplicitCredentials,
+        config: &[],
+        workspace: "default",
+        profile_workspace: "default",
+        tls: &ts.tls,
+    })
+    .await
+    .expect("create provider from exact imported alias profile");
+
+    let stored = ts.state.providers.lock().await;
+    let provider = stored.get("enterprise-github").expect("provider");
+    assert_eq!(provider.r#type, "gh");
+    assert_eq!(
+        provider.credentials.get("GITHUB_TOKEN").map(String::as_str),
+        Some("test-token")
+    );
+}
+
+#[tokio::test]
 async fn provider_create_rejects_combined_from_existing_and_credentials() {
     let ts = run_server().await;
 

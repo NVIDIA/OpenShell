@@ -1099,10 +1099,11 @@ pub(super) async fn resolve_provider_environment_from_records_with_policy_bindin
         let name = &record.name;
         let provider = &record.provider;
         let mut provider_env = HashMap::new();
-        let profile_id =
-            normalize_provider_type(&provider.r#type).unwrap_or(provider.r#type.as_str());
-        let profile =
-            get_provider_type_profile_for_scope(catalog, profile_id, &provider.profile_workspace);
+        let profile = get_provider_type_profile_for_scope(
+            catalog,
+            &provider.r#type,
+            &provider.profile_workspace,
+        );
         let profile_proto = profile.as_ref().map(ProviderTypeProfile::to_proto);
         let broker_only_credential_keys = profile_proto
             .as_ref()
@@ -1279,7 +1280,7 @@ pub(super) async fn resolve_provider_environment_from_records_with_policy_bindin
         // provider's earlier output cannot change how this provider classifies
         // or populates its own keys. Cross-provider credential/config
         // collisions have already been rejected by the validation above.
-        registry.inject_env(provider, &mut provider_env);
+        inject_provider_plugin_environment(catalog, provider, &registry, &mut provider_env);
         for (key, value) in provider_env {
             env.entry(key).or_insert(value);
         }
@@ -1405,11 +1406,11 @@ fn resolve_dynamic_credentials_from_records(
     let mut dynamic_creds = HashMap::new();
     for record in records {
         let provider = &record.provider;
-        let profile_id =
-            normalize_provider_type(&provider.r#type).unwrap_or(provider.r#type.as_str());
-        let Some(profile) =
-            get_provider_type_profile_for_scope(catalog, profile_id, &provider.profile_workspace)
-        else {
+        let Some(profile) = get_provider_type_profile_for_scope(
+            catalog,
+            &provider.r#type,
+            &provider.profile_workspace,
+        ) else {
             continue;
         };
         insert_dynamic_credentials_for_profile(
@@ -1812,7 +1813,7 @@ async fn validate_provider_environment_keys_unique_at(
             &mut seen_plugin_config,
             &provider_name,
             active_provider_environment_keys(store, catalog, &provider, now_ms).await?,
-            provider_plugin_environment_keys(&provider),
+            provider_plugin_environment_keys(catalog, &provider),
         )?;
         dynamic_bindings.extend(dynamic_token_grant_bindings_for_provider_with_catalog(
             catalog, &provider,
@@ -1845,7 +1846,7 @@ async fn validate_provider_environment_records_unique_at(
                 now_ms,
             )
             .await?,
-            provider_plugin_environment_keys(provider),
+            provider_plugin_environment_keys(catalog, provider),
         )?;
         dynamic_bindings.extend(dynamic_token_grant_bindings_for_provider_with_catalog(
             catalog, provider,
@@ -1855,10 +1856,31 @@ async fn validate_provider_environment_records_unique_at(
     Ok(())
 }
 
-fn provider_plugin_environment_keys(provider: &Provider) -> Vec<String> {
+fn provider_plugin_environment_keys(
+    catalog: &EffectiveProviderProfileCatalog,
+    provider: &Provider,
+) -> Vec<String> {
     let mut plugin_environment = HashMap::new();
-    openshell_providers::ProviderRegistry::new().inject_env(provider, &mut plugin_environment);
+    let registry = openshell_providers::ProviderRegistry::new();
+    inject_provider_plugin_environment(catalog, provider, &registry, &mut plugin_environment);
     plugin_environment.into_keys().collect()
+}
+
+fn inject_provider_plugin_environment(
+    catalog: &EffectiveProviderProfileCatalog,
+    provider: &Provider,
+    registry: &openshell_providers::ProviderRegistry,
+    environment: &mut HashMap<String, String>,
+) {
+    if let Some(profile) =
+        get_provider_type_profile_for_scope(catalog, &provider.r#type, &provider.profile_workspace)
+    {
+        registry.inject_env_for_profile_id(provider, &profile.id, environment);
+    } else {
+        // Preserve config projection for legacy records when their profile
+        // source is temporarily unavailable.
+        registry.inject_env(provider, environment);
+    }
 }
 
 fn validate_provider_environment_key_ownership(
@@ -1931,9 +1953,8 @@ fn dynamic_token_grant_bindings_for_provider_with_catalog(
     provider: &Provider,
 ) -> Vec<DynamicTokenGrantBinding> {
     let provider_name = provider.object_name().to_string();
-    let profile_id = normalize_provider_type(&provider.r#type).unwrap_or(provider.r#type.as_str());
     let Some(profile) =
-        get_provider_type_profile_for_scope(catalog, profile_id, &provider.profile_workspace)
+        get_provider_type_profile_for_scope(catalog, &provider.r#type, &provider.profile_workspace)
     else {
         return Vec::new();
     };
@@ -2146,8 +2167,7 @@ fn broker_only_provider_credential_keys_for_provider(
     catalog: &EffectiveProviderProfileCatalog,
     provider: &Provider,
 ) -> HashSet<String> {
-    let profile_id = normalize_provider_type(&provider.r#type).unwrap_or(provider.r#type.as_str());
-    get_provider_type_profile_for_scope(catalog, profile_id, &provider.profile_workspace)
+    get_provider_type_profile_for_scope(catalog, &provider.r#type, &provider.profile_workspace)
         .as_ref()
         .map(ProviderTypeProfile::to_proto)
         .map(|profile| broker_only_provider_credential_keys(&profile))
@@ -3027,15 +3047,14 @@ fn resolve_provider_create_profile(
     if requested_type.is_empty() {
         return Err(Status::invalid_argument("provider.type is required"));
     }
-    let profile_id = normalize_provider_type(requested_type).unwrap_or(requested_type);
     let profile = get_provider_type_profile_for_scope(
         catalog,
-        profile_id,
+        requested_type,
         &provider.profile_workspace,
     )
     .ok_or_else(|| {
         Status::invalid_argument(format!(
-            "provider profile '{profile_id}' was not found in the requested scope; import a matching profile before creating this provider"
+            "provider profile '{requested_type}' was not found in the requested scope; import a matching profile before creating this provider"
         ))
     })?;
     provider.r#type.clone_from(&profile.id);
@@ -3363,8 +3382,15 @@ async fn profile_attached_sandbox_diagnostics(
             else {
                 continue;
             };
-            let profile_id =
-                normalize_provider_type(&provider.r#type).unwrap_or(provider.r#type.as_str());
+            let requested_profile_id = normalize_profile_id(&provider.r#type)
+                .unwrap_or_else(|| provider.r#type.trim().to_string());
+            let profile_id = if candidate_profiles.contains_key(&requested_profile_id) {
+                requested_profile_id
+            } else {
+                normalize_provider_type(&provider.r#type)
+                    .filter(|alias| candidate_profiles.contains_key(*alias))
+                    .map_or(requested_profile_id, str::to_string)
+            };
             let scope_mismatch = (is_platform_scope && !provider.profile_workspace.is_empty())
                 || (!is_platform_scope && provider.profile_workspace.is_empty());
             if scope_mismatch {
@@ -3374,7 +3400,7 @@ async fn profile_attached_sandbox_diagnostics(
                 if validate_policy_composition
                     && let Some(profile) = get_provider_type_profile_for_scope(
                         catalog,
-                        profile_id,
+                        &provider.r#type,
                         &provider.profile_workspace,
                     )
                 {
@@ -3386,7 +3412,7 @@ async fn profile_attached_sandbox_diagnostics(
                 }
                 continue;
             }
-            if let Some((source, profile)) = candidate_profiles.get(profile_id) {
+            if let Some((source, profile)) = candidate_profiles.get(&profile_id) {
                 let has_static_credentials = provider
                     .credentials
                     .keys()
@@ -3402,7 +3428,7 @@ async fn profile_attached_sandbox_diagnostics(
                 if has_static_credentials && !has_usable_endpoint && !has_policy_binding {
                     diagnostics.push(ProfileValidationDiagnostic {
                         source: source.clone(),
-                        profile_id: profile_id.to_string(),
+                        profile_id: profile_id.clone(),
                         field: "endpoints".to_string(),
                         message: format!(
                             "{operation} would leave static provider credentials without an authorized endpoint on sandbox '{sandbox_name}'"
@@ -3413,7 +3439,7 @@ async fn profile_attached_sandbox_diagnostics(
                 if has_usable_endpoint && has_policy_binding {
                     diagnostics.push(ProfileValidationDiagnostic {
                         source: source.clone(),
-                        profile_id: profile_id.to_string(),
+                        profile_id: profile_id.clone(),
                         field: "endpoints".to_string(),
                         message: format!(
                             "{operation} would give provider '{provider_name}' both profile endpoint bindings and sandbox policy credential bindings on sandbox '{sandbox_name}'"
@@ -3432,7 +3458,7 @@ async fn profile_attached_sandbox_diagnostics(
                         rule_name,
                     });
                 }
-                let used = (source.clone(), profile_id.to_string());
+                let used = (source.clone(), profile_id.clone());
                 if !imported_profiles_used.contains(&used) {
                     imported_profiles_used.push(used);
                 }
@@ -3443,7 +3469,7 @@ async fn profile_attached_sandbox_diagnostics(
                 if validate_policy_composition
                     && let Some(profile) = get_provider_type_profile_for_scope(
                         catalog,
-                        profile_id,
+                        &provider.r#type,
                         &provider.profile_workspace,
                     )
                 {
@@ -3717,14 +3743,16 @@ pub(super) async fn handle_exchange_provider_subject_token(
         .await
         .map_err(|e| Status::internal(format!("fetch provider failed: {e}")))?
         .ok_or_else(|| Status::not_found("provider not found"))?;
-    let profile_id = normalize_provider_type(&provider.r#type).unwrap_or(provider.r#type.as_str());
     let catalog = state
         .provider_profile_sources
         .snapshot_catalog(state.store.as_ref(), &workspace)
         .await?;
-    let profile =
-        get_provider_type_profile_for_scope(&catalog, profile_id, &provider.profile_workspace)
-            .ok_or_else(|| Status::failed_precondition("provider profile not found"))?;
+    let profile = get_provider_type_profile_for_scope(
+        &catalog,
+        &provider.r#type,
+        &provider.profile_workspace,
+    )
+    .ok_or_else(|| Status::failed_precondition("provider profile not found"))?;
     let profile_proto = profile.to_proto();
     let credential = profile_proto
         .credentials
@@ -8314,6 +8342,75 @@ mod tests {
         .expect("provider");
 
         assert_eq!(response.r#type, "gitlab");
+    }
+
+    #[tokio::test]
+    async fn handle_create_provider_prefers_exact_imported_alias_profile() {
+        let mut state = test_server_state().await;
+        let config = state
+            .config
+            .clone()
+            .with_credential_drivers(["test-static"]);
+        let credentials = crate::credentials::CredentialRuntime::from_config(&config).unwrap();
+        let state_mut = Arc::get_mut(&mut state).unwrap();
+        state_mut.config = config;
+        state_mut.credentials = credentials;
+
+        let mut profile = custom_profile("gh");
+        profile.credentials = vec![static_credential("token", "GITHUB_TOKEN", true)];
+        profile.endpoints = vec![NetworkEndpoint {
+            host: "github.enterprise.example".to_string(),
+            port: 443,
+            allow_uninspected_credentials: true,
+            ..Default::default()
+        }];
+        let imported = handle_import_provider_profiles(
+            &state,
+            authed_request(ImportProviderProfilesRequest {
+                profiles: vec![ProviderProfileImportItem {
+                    profile: Some(profile),
+                    source: "enterprise-github.yaml".to_string(),
+                }],
+                workspace: "default".to_string(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert!(imported.imported, "diagnostics: {:?}", imported.diagnostics);
+
+        let provider = handle_create_provider(
+            &state,
+            authed_request(CreateProviderRequest {
+                provider: Some(provider_with_credential_value(
+                    "enterprise-github",
+                    "gh",
+                    "GITHUB_TOKEN",
+                    "test-token",
+                )),
+                workspace: "default".to_string(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner()
+        .provider
+        .expect("provider");
+
+        assert_eq!(provider.r#type, "gh");
+        let catalog = state
+            .provider_profile_sources
+            .snapshot_catalog(state.store.as_ref(), "default")
+            .await
+            .unwrap();
+        let resolved = get_provider_type_profile_for_scope(
+            &catalog,
+            &provider.r#type,
+            &provider.profile_workspace,
+        )
+        .expect("exact imported profile");
+        assert_eq!(resolved.id, "gh");
+        assert_eq!(resolved.endpoints[0].host, "github.enterprise.example");
     }
 
     #[tokio::test]

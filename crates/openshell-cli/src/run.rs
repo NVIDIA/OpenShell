@@ -61,8 +61,8 @@ use openshell_core::settings;
 use openshell_core::{ObjectId, ObjectName, ObjectWorkspace};
 use openshell_providers::{
     ProviderTypeProfile, RealDiscoveryContext, detect_provider_from_command, discover_from_profile,
-    normalize_provider_type, parse_profile_json, parse_profile_yaml, profile_to_json,
-    profile_to_yaml, profiles_to_json, profiles_to_yaml,
+    normalize_profile_id, normalize_provider_type, parse_profile_json, parse_profile_yaml,
+    profile_to_json, profile_to_yaml, profiles_to_json, profiles_to_yaml,
 };
 use owo_colors::OwoColorize;
 use std::borrow::Cow;
@@ -2751,7 +2751,7 @@ pub async fn ensure_required_providers(
                 configured_names.push(name.clone());
             }
         } else {
-            let profile_id = normalize_provider_type(name).unwrap_or(name);
+            let profile_id = name.trim();
             let profile = fetch_provider_profile(client, profile_id, workspace)
                 .await
                 .map_err(|_| {
@@ -3444,26 +3444,52 @@ async fn fetch_provider_profile(
     provider_type: &str,
     workspace: &str,
 ) -> Result<ProviderProfile> {
-    let response = client
+    let requested = provider_type.trim();
+    let response = match fetch_provider_profile_exact(client, requested, workspace).await {
+        Ok(response) => response,
+        Err(status) if status.code() == Code::NotFound => {
+            let Some(alias) = normalize_provider_type(requested)
+                .filter(|alias| normalize_profile_id(requested).as_deref() != Some(*alias))
+            else {
+                return Err(miette::miette!(
+                    "provider profile '{requested}' not found; import a matching profile before using this provider type"
+                ));
+            };
+            fetch_provider_profile_exact(client, alias, workspace)
+                .await
+                .map_err(|fallback_status| {
+                    if fallback_status.code() == Code::NotFound {
+                        miette::miette!(
+                            "provider profile '{requested}' not found; import a matching profile before using this provider type"
+                        )
+                    } else {
+                        miette::miette!(fallback_status.to_string())
+                    }
+                })?
+        }
+        Err(status) => return Err(miette::miette!(status.to_string())),
+    };
+
+    Ok(response)
+}
+
+async fn fetch_provider_profile_exact(
+    client: &mut crate::tls::GrpcClient,
+    provider_type: &str,
+    workspace: &str,
+) -> std::result::Result<ProviderProfile, Status> {
+    client
         .get_provider_profile(GetProviderProfileRequest {
             id: provider_type.to_string(),
             workspace: workspace.to_string(),
         })
         .await
-        .map_err(|status| {
-            if status.code() == Code::NotFound {
-                miette::miette!(
-                    "provider profile '{provider_type}' not found; import a matching profile before using this provider type"
-                )
-            } else {
-                miette::miette!(status.to_string())
-            }
-        })?;
-
-    response
-        .into_inner()
-        .profile
-        .ok_or_else(|| miette::miette!("provider profile '{provider_type}' missing from response"))
+        .and_then(|response| {
+            response
+                .into_inner()
+                .profile
+                .ok_or_else(|| Status::internal("provider profile missing from response"))
+        })
 }
 
 async fn discover_existing_provider_data(
@@ -3739,7 +3765,7 @@ pub async fn provider_create_with_options(options: ProviderCreateOptions<'_>) ->
 
     let mut client = grpc_client(server, tls).await?;
 
-    let profile_id = normalize_provider_type(provider_type).unwrap_or_else(|| provider_type.trim());
+    let profile_id = provider_type.trim();
     if profile_id.is_empty() {
         return Err(miette::miette!("provider type is required"));
     }

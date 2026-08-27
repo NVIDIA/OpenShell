@@ -71,7 +71,6 @@ use openshell_prover::{
     registry::load_embedded_binary_registry,
     report::finding_shorthand,
 };
-use openshell_providers::normalize_provider_type;
 use prost::Message;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -809,10 +808,9 @@ async fn build_credential_set_for_sandbox_with_catalog(
         };
 
         let provider_type = provider.r#type.trim();
-        let profile_id = normalize_provider_type(provider_type).unwrap_or(provider_type);
         let Some(profile) = super::provider::get_provider_type_profile_for_scope(
             catalog,
-            profile_id,
+            provider_type,
             &provider.profile_workspace,
         ) else {
             warn!(
@@ -1777,11 +1775,9 @@ fn validate_policy_credential_binding_context(
                     "credential_binding references provider '{provider_name}', but that provider is not attached to the sandbox"
                 ))
             })?;
-        let profile_id = normalize_provider_type(&record.provider.r#type)
-            .unwrap_or(record.provider.r#type.as_str());
         let profile = super::provider::get_provider_type_profile_for_scope(
             catalog,
-            profile_id,
+            &record.provider.r#type,
             &record.provider.profile_workspace,
         )
         .ok_or_else(|| {
@@ -1854,11 +1850,9 @@ fn signing_profile_for_record(
     catalog: &EffectiveProviderProfileCatalog,
     record: &super::provider::ProviderEnvironmentRecord,
 ) -> Option<openshell_providers::ProviderTypeProfile> {
-    let profile_id =
-        normalize_provider_type(&record.provider.r#type).unwrap_or(record.provider.r#type.as_str());
     super::provider::get_provider_type_profile_for_scope(
         catalog,
-        profile_id,
+        &record.provider.r#type,
         &record.provider.profile_workspace,
     )
 }
@@ -2732,8 +2726,7 @@ fn hash_provider_profile_revision(
     profile_workspace: &str,
     hasher: &mut Sha256,
 ) {
-    let profile_id = normalize_provider_type(provider_type).unwrap_or(provider_type);
-    catalog.hash_type_profile_revision_for_scope(profile_id, profile_workspace, hasher);
+    catalog.hash_type_profile_revision_for_scope(provider_type, profile_workspace, hasher);
 }
 
 #[cfg(test)]
@@ -2793,10 +2786,9 @@ async fn provider_policy_context_with_catalog(
             .ok_or_else(|| Status::failed_precondition(format!("provider '{name}' not found")))?;
 
         let provider_type = provider.r#type.trim();
-        let profile_id = normalize_provider_type(provider_type).unwrap_or(provider_type);
         let Some(profile) = super::provider::get_provider_type_profile_for_scope(
             catalog,
-            profile_id,
+            provider_type,
             &provider.profile_workspace,
         ) else {
             warn!(
@@ -8319,6 +8311,48 @@ mod tests {
 
         assert_eq!(layers.len(), 1);
         assert_eq!(layers[0].rule.endpoints[0].host, "backdoor.example");
+    }
+
+    #[tokio::test]
+    async fn provider_policy_layers_prefer_exact_imported_alias_profile() {
+        let store = test_store().await;
+        store
+            .put_message(&test_provider("enterprise-github", "gh"))
+            .await
+            .unwrap();
+        store
+            .put_message(&openshell_core::proto::StoredProviderProfile {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: "profile-gh".to_string(),
+                    name: "gh".to_string(),
+                    workspace: "default".to_string(),
+                    ..Default::default()
+                }),
+                profile: Some(openshell_core::proto::ProviderProfile {
+                    id: "gh".to_string(),
+                    display_name: "Enterprise GitHub".to_string(),
+                    endpoints: vec![NetworkEndpoint {
+                        host: "github.enterprise.example".to_string(),
+                        port: 443,
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }),
+            })
+            .await
+            .unwrap();
+
+        let layers =
+            profile_provider_policy_layers(&store, "default", &["enterprise-github".to_string()])
+                .await
+                .unwrap();
+
+        assert_eq!(layers.len(), 1);
+        assert_eq!(layers[0].rule.endpoints.len(), 1);
+        assert_eq!(
+            layers[0].rule.endpoints[0].host,
+            "github.enterprise.example"
+        );
     }
 
     #[tokio::test]

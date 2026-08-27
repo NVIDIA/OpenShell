@@ -110,6 +110,20 @@ impl ProviderRegistry {
             plugin.inject_env(provider, env);
         }
     }
+
+    /// Inject config for an already-resolved profile ID without alias
+    /// normalization. This prevents an exact custom profile whose ID resembles
+    /// a legacy alias from selecting an unrelated built-in compatibility plugin.
+    pub fn inject_env_for_profile_id(
+        &self,
+        provider: &Provider,
+        profile_id: &str,
+        env: &mut HashMap<String, String>,
+    ) {
+        if let Some(plugin) = self.get(profile_id) {
+            plugin.inject_env(provider, env);
+        }
+    }
 }
 
 #[must_use]
