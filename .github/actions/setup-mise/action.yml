@@ -1,0 +1,26 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: Setup mise
+description: Install mise and the tools pinned by the repository
+
+inputs:
+  version:
+    description: mise release to install
+    required: false
+    default: v2026.4.25
+
+runs:
+  using: composite
+  steps:
+    - name: Install mise and tools
+      shell: bash
+      env:
+        MISE_VERSION: ${{ inputs.version }}
+      run: |
+        set -euo pipefail
+        curl https://mise.run | sh
+        export PATH="$HOME/.local/bin:$HOME/.local/share/mise/shims:$PATH"
+        echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+        echo "$HOME/.local/share/mise/shims" >> "$GITHUB_PATH"
+        mise install --locked
