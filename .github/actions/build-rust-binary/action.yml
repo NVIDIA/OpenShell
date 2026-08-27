@@ -33,10 +33,17 @@ inputs:
 runs:
   using: composite
   steps:
+    - name: Hash development shell
+      id: dev-shell
+      shell: bash
+      env:
+        DEV_SHELL: ${{ inputs.dev-shell }}
+      run: echo "hash=$(nix hash file --type sha256 --base16 "$(nix eval --raw "${DEV_SHELL}.drvPath")")" >> "$GITHUB_OUTPUT"
+
     - name: Cache Rust artifacts
       uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       with:
-        shared-key: binaries-${{ inputs.binary }}-${{ inputs.triple }}
+        shared-key: binaries-${{ inputs.binary }}-${{ inputs.triple }}-${{ steps.dev-shell.outputs.hash }}
         cache-on-failure: "true"
         cache-workspace-crates: "true"
         cache-bin: "false"
