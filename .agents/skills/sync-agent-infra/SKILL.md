@@ -20,7 +20,7 @@ Detect and fix drift across the agent-first infrastructure files. These files re
 | `.github/ISSUE_TEMPLATE/config.yml` | Contact link text referencing skills |
 | `.github/workflows/issue-triage.yml` | Comment text referencing skills |
 | `.agents/skills/triage-issue/SKILL.md` | Skill name references in gate check and diagnosis steps |
-| `skills/*/SKILL.md` | Public skill portability, references, and companion skill links |
+| `skills/*/SKILL.md` | Standalone user instructions and links to documentation, included files, and related skills |
 | `.agents/skills/create-github-pr/SKILL.md` | Pre-PR agent infrastructure check |
 | `.agents/skills/review-github-pr/SKILL.md` | Review-time agent infrastructure check |
 | `.agents/skills/build-from-issue/SKILL.md` | Label awareness and pre-commit agent infrastructure check |
