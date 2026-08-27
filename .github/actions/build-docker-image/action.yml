@@ -20,6 +20,9 @@ inputs:
   platform:
     description: Docker platform
     required: true
+  image-tag:
+    description: Docker image tag
+    required: true
   github-token:
     description: Token used to push the image
     required: true
@@ -47,13 +50,15 @@ runs:
 
     - name: Build ${{ inputs.component }} image
       shell: bash
+      env:
+        IMAGE_TAG: ${{ inputs.image-tag }}
       run: |
         docker buildx build \
           --builder openshell \
           --platform ${{ inputs.platform }} \
           --file deploy/docker/Dockerfile.${{ inputs.component }} \
           --target ${{ inputs.component }} \
-          --tag ghcr.io/nvidia/openshell/${{ inputs.component }}:${{ github.sha }}-${{ inputs.arch }} \
+          --tag ghcr.io/nvidia/openshell/${{ inputs.component }}:${IMAGE_TAG}-${{ inputs.arch }} \
           --cache-from type=gha,scope=${{ inputs.component }}-${{ inputs.arch }} \
           --cache-to type=gha,mode=max,scope=${{ inputs.component }}-${{ inputs.arch }} \
           --provenance=false \

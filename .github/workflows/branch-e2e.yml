@@ -100,24 +100,9 @@ jobs:
     needs: version
     permissions:
       contents: read
-    strategy:
-      matrix:
-        include:
-          - triple: x86_64-unknown-linux-musl
-            runner: linux-amd64-cpu8
-            dev_shell: .#devShells.x86_64-linux.musl
-          - triple: aarch64-unknown-linux-musl
-            runner: linux-arm64-cpu8
-            dev_shell: .#devShells.aarch64-linux.musl
-          - triple: aarch64-apple-darwin
-            runner: macos-15-xlarge
-            dev_shell: .#devShells.aarch64-darwin.default
-    uses: ./.github/workflows/build-binaries.yml
+    uses: ./.github/workflows/build-platform-binaries.yml
     with:
-      binary: openshell
-      triple: ${{ matrix.triple }}
-      runner: ${{ matrix.runner }}
-      dev-shell: ${{ matrix.dev_shell }}
+      component: cli
       cargo-version: ${{ needs.version.outputs.cargo }}
     secrets: inherit
 
@@ -125,21 +110,9 @@ jobs:
     needs: version
     permissions:
       contents: read
-    strategy:
-      matrix:
-        include:
-          - triple: x86_64-unknown-linux-musl
-            runner: linux-amd64-cpu8
-            dev_shell: .#devShells.x86_64-linux.musl
-          - triple: aarch64-unknown-linux-musl
-            runner: linux-arm64-cpu8
-            dev_shell: .#devShells.aarch64-linux.musl
-    uses: ./.github/workflows/build-binaries.yml
+    uses: ./.github/workflows/build-platform-binaries.yml
     with:
-      binary: openshell-sandbox
-      triple: ${{ matrix.triple }}
-      runner: ${{ matrix.runner }}
-      dev-shell: ${{ matrix.dev_shell }}
+      component: sandbox-musl
       cargo-version: ${{ needs.version.outputs.cargo }}
     secrets: inherit
 
@@ -147,28 +120,10 @@ jobs:
     needs: version
     permissions:
       contents: read
-    strategy:
-      matrix:
-        include:
-          - triple: x86_64-unknown-linux-gnu
-            runner: linux-amd64-cpu8
-            dev_shell: .#devShells.x86_64-linux.glibc-2-28
-            interpreter: /lib64/ld-linux-x86-64.so.2
-          - triple: aarch64-unknown-linux-gnu
-            runner: linux-arm64-cpu8
-            dev_shell: .#devShells.aarch64-linux.glibc-2-28
-            interpreter: /lib/ld-linux-aarch64.so.1
-          - triple: aarch64-apple-darwin
-            runner: macos-15-xlarge
-            dev_shell: .#devShells.aarch64-darwin.default
-    uses: ./.github/workflows/build-binaries.yml
+    uses: ./.github/workflows/build-platform-binaries.yml
     with:
-      binary: openshell-gateway
-      triple: ${{ matrix.triple }}
-      runner: ${{ matrix.runner }}
-      dev-shell: ${{ matrix.dev_shell }}
+      component: gateway
       cargo-version: ${{ needs.version.outputs.cargo }}
-      interpreter: ${{ matrix.interpreter }}
     secrets: inherit
 
   build-gateway-plain:
@@ -256,7 +211,11 @@ jobs:
 
   build-gateway-image:
     needs: [pr_metadata, build-gateway]
-    if: needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_any_e2e == 'true'
+    if: >-
+      needs.pr_metadata.outputs.should_run == 'true' &&
+      (needs.pr_metadata.outputs.run_core_e2e == 'true' ||
+      needs.pr_metadata.outputs.run_kubernetes_ha_e2e == 'true' ||
+      needs.pr_metadata.outputs.run_kubernetes_credential_drivers_e2e == 'true')
     permissions:
       contents: read
       packages: write
@@ -280,20 +239,84 @@ jobs:
       target-suffix: unknown-linux-musl
     secrets: inherit
 
-  e2e:
-    needs: [pr_metadata, build-cli, build-vm-driver, build-gateway-image, build-supervisor-image]
+  docker-e2e:
+    needs: [pr_metadata, build-cli, build-gateway, build-supervisor-image]
     if: needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_core_e2e == 'true'
     permissions:
       actions: read
       contents: read
       packages: read
-    uses: ./.github/workflows/e2e-test.yml
+    uses: ./.github/workflows/e2e-docker-test.yml
     with:
       image-tag: ${{ github.sha }}
       runner: linux-arm64-cpu8
 
+  podman-e2e:
+    needs: [pr_metadata, build-cli, build-gateway, build-supervisor-image]
+    if: needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_core_e2e == 'true'
+    permissions:
+      actions: read
+      contents: read
+      packages: read
+    uses: ./.github/workflows/e2e-podman-test.yml
+    with:
+      image-tag: ${{ github.sha }}
+
+  vm-e2e:
+    needs: [pr_metadata, build-cli, build-gateway, build-vm-driver]
+    if: needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_core_e2e == 'true'
+    permissions:
+      actions: read
+      contents: read
+      packages: read
+    uses: ./.github/workflows/e2e-vm-test.yml
+
+  docker-external-driver-e2e:
+    needs: [pr_metadata, build-cli, build-gateway-plain, build-driver-docker, build-supervisor-image]
+    if: needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_core_e2e == 'true'
+    permissions:
+      actions: read
+      contents: read
+      packages: read
+    uses: ./.github/workflows/e2e-docker-test.yml
+    with:
+      image-tag: ${{ github.sha }}
+      runner: linux-arm64-cpu8
+      gateway-artifact: openshell-gateway-plain-aarch64-unknown-linux-gnu
+      external-driver-binary: openshell-driver-docker
+      suite-matrix: >-
+        [{"suite":"external-driver","cmd":"mise run --no-deps --skip-deps e2e:docker:external-driver","apt_packages":"openssh-client","python_proto":false,"mcp":false}]
+
+  podman-external-driver-e2e:
+    needs: [pr_metadata, build-cli, build-gateway-plain, build-driver-podman, build-supervisor-image]
+    if: needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_core_e2e == 'true'
+    permissions:
+      actions: read
+      contents: read
+      packages: read
+    uses: ./.github/workflows/e2e-podman-test.yml
+    with:
+      image-tag: ${{ github.sha }}
+      gateway-artifact: openshell-gateway-plain-x86_64-unknown-linux-gnu
+      external-driver-binary: openshell-driver-podman
+      suite-matrix: >-
+        [{"suite":"external-driver","runner":"ubuntu-26.04","podman_major":"5","podman_package_version":"5.7.0+ds2-3build1","conmon_package_version":"2.1.13+ds1-2","cmd":"mise run --no-deps --skip-deps e2e:podman:external-driver"}]
+
+  vm-external-driver-e2e:
+    needs: [pr_metadata, build-cli, build-gateway-plain, build-vm-driver]
+    if: needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_core_e2e == 'true'
+    permissions:
+      actions: read
+      contents: read
+      packages: read
+    uses: ./.github/workflows/e2e-vm-test.yml
+    with:
+      gateway-artifact: openshell-gateway-plain-x86_64-unknown-linux-gnu
+      suite-name: external-driver
+      e2e-task: e2e:vm:external-driver
+
   gpu-e2e:
-    needs: [pr_metadata, build-cli, build-gateway-image, build-supervisor-image]
+    needs: [pr_metadata, build-cli, build-gateway, build-supervisor-image]
     if: needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_gpu_e2e == 'true'
     permissions:
       actions: read
@@ -346,8 +369,21 @@ jobs:
       job-name: Kubernetes E2E (workspace managed mode)
       e2e-task: e2e:kubernetes:workspace-managed
 
-  # External Kubernetes driver E2E stays disabled while its standalone binary
-  # is not a release artifact.
+  kubernetes-external-driver-e2e:
+    needs: [pr_metadata, build-cli, build-gateway-plain, build-driver-kubernetes, build-supervisor-image]
+    if: needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_core_e2e == 'true'
+    permissions:
+      actions: read
+      contents: read
+      packages: read
+    uses: ./.github/workflows/e2e-kubernetes-test.yml
+    with:
+      image-tag: ${{ github.sha }}
+      job-name: Kubernetes E2E (external compute driver)
+      e2e-task: e2e:kubernetes:external-driver
+      gateway-artifact: openshell-gateway-plain-x86_64-unknown-linux-gnu
+      external-driver-binary: openshell-driver-kubernetes
+      cluster-images: supervisor
 
   kubernetes-workspace-operator-e2e:
     needs: [pr_metadata, build-cli, build-gateway-image, build-supervisor-image]
@@ -391,124 +427,40 @@ jobs:
 
   core-e2e-result:
     name: Core E2E result
-    needs: [pr_metadata, build-cli, build-vm-driver, build-gateway-image, build-supervisor-image, e2e, kubernetes-e2e, kubernetes-workspace-managed-e2e, kubernetes-workspace-operator-e2e]
+    needs: [pr_metadata, docker-e2e, podman-e2e, vm-e2e, docker-external-driver-e2e, podman-external-driver-e2e, vm-external-driver-e2e, kubernetes-e2e, kubernetes-external-driver-e2e, kubernetes-workspace-managed-e2e, kubernetes-workspace-operator-e2e]
     if: always() && needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_core_e2e == 'true'
     runs-on: ubuntu-latest
     steps:
-      - name: Verify core E2E jobs
-        env:
-          BUILD_CLI_RESULT: ${{ needs.build-cli.result }}
-          BUILD_VM_DRIVER_RESULT: ${{ needs.build-vm-driver.result }}
-          BUILD_GATEWAY_IMAGE_RESULT: ${{ needs.build-gateway-image.result }}
-          BUILD_SUPERVISOR_IMAGE_RESULT: ${{ needs.build-supervisor-image.result }}
-          E2E_RESULT: ${{ needs.e2e.result }}
-          KUBERNETES_E2E_RESULT: ${{ needs.kubernetes-e2e.result }}
-          KUBERNETES_WORKSPACE_MANAGED_E2E_RESULT: ${{ needs.kubernetes-workspace-managed-e2e.result }}
-          KUBERNETES_WORKSPACE_OPERATOR_E2E_RESULT: ${{ needs.kubernetes-workspace-operator-e2e.result }}
-        run: |
-          set -euo pipefail
-          failed=0
-          for item in \
-            "build-cli:$BUILD_CLI_RESULT" \
-            "build-vm-driver:$BUILD_VM_DRIVER_RESULT" \
-            "build-gateway-image:$BUILD_GATEWAY_IMAGE_RESULT" \
-            "build-supervisor-image:$BUILD_SUPERVISOR_IMAGE_RESULT" \
-            "e2e:$E2E_RESULT" \
-            "kubernetes-e2e:$KUBERNETES_E2E_RESULT" \
-            "kubernetes-workspace-managed-e2e:$KUBERNETES_WORKSPACE_MANAGED_E2E_RESULT" \
-            "kubernetes-workspace-operator-e2e:$KUBERNETES_WORKSPACE_OPERATOR_E2E_RESULT"; do
-            name="${item%%:*}"
-            result="${item#*:}"
-            if [ "$result" != "success" ]; then
-              echo "::error::$name concluded $result"
-              failed=1
-            fi
-          done
-          exit "$failed"
+      - uses: ./.github/actions/check-job-results
+        with:
+          results: ${{ toJSON(needs) }}
 
   gpu-e2e-result:
     name: GPU E2E result
-    needs: [pr_metadata, build-cli, build-gateway-image, build-supervisor-image, gpu-e2e]
+    needs: [pr_metadata, gpu-e2e]
     if: always() && needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_gpu_e2e == 'true'
     runs-on: ubuntu-latest
     steps:
-      - name: Verify GPU E2E jobs
-        env:
-          BUILD_CLI_RESULT: ${{ needs.build-cli.result }}
-          BUILD_GATEWAY_IMAGE_RESULT: ${{ needs.build-gateway-image.result }}
-          BUILD_SUPERVISOR_IMAGE_RESULT: ${{ needs.build-supervisor-image.result }}
-          GPU_E2E_RESULT: ${{ needs.gpu-e2e.result }}
-        run: |
-          set -euo pipefail
-          failed=0
-          for item in \
-            "build-cli:$BUILD_CLI_RESULT" \
-            "build-gateway-image:$BUILD_GATEWAY_IMAGE_RESULT" \
-            "build-supervisor-image:$BUILD_SUPERVISOR_IMAGE_RESULT" \
-            "gpu-e2e:$GPU_E2E_RESULT"; do
-            name="${item%%:*}"
-            result="${item#*:}"
-            if [ "$result" != "success" ]; then
-              echo "::error::$name concluded $result"
-              failed=1
-            fi
-          done
-          exit "$failed"
+      - uses: ./.github/actions/check-job-results
+        with:
+          results: ${{ toJSON(needs) }}
 
   kubernetes-ha-e2e-result:
     name: Kubernetes HA E2E result
-    needs: [pr_metadata, build-cli, build-gateway-image, build-supervisor-image, kubernetes-ha-e2e]
+    needs: [pr_metadata, kubernetes-ha-e2e]
     if: always() && needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_kubernetes_ha_e2e == 'true'
     runs-on: ubuntu-latest
     steps:
-      - name: Verify Kubernetes HA E2E jobs
-        env:
-          BUILD_CLI_RESULT: ${{ needs.build-cli.result }}
-          BUILD_GATEWAY_IMAGE_RESULT: ${{ needs.build-gateway-image.result }}
-          BUILD_SUPERVISOR_IMAGE_RESULT: ${{ needs.build-supervisor-image.result }}
-          KUBERNETES_HA_E2E_RESULT: ${{ needs.kubernetes-ha-e2e.result }}
-        run: |
-          set -euo pipefail
-          failed=0
-          for item in \
-            "build-cli:$BUILD_CLI_RESULT" \
-            "build-gateway-image:$BUILD_GATEWAY_IMAGE_RESULT" \
-            "build-supervisor-image:$BUILD_SUPERVISOR_IMAGE_RESULT" \
-            "kubernetes-ha-e2e:$KUBERNETES_HA_E2E_RESULT"; do
-            name="${item%%:*}"
-            result="${item#*:}"
-            if [ "$result" != "success" ]; then
-              echo "::error::$name concluded $result"
-              failed=1
-            fi
-          done
-          exit "$failed"
+      - uses: ./.github/actions/check-job-results
+        with:
+          results: ${{ toJSON(needs) }}
 
   kubernetes-credential-drivers-e2e-result:
     name: Kubernetes Credential Drivers E2E result
-    needs: [pr_metadata, build-cli, build-gateway-image, build-supervisor-image, kubernetes-credential-drivers-e2e]
+    needs: [pr_metadata, kubernetes-credential-drivers-e2e]
     if: always() && needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_kubernetes_credential_drivers_e2e == 'true'
     runs-on: ubuntu-latest
     steps:
-      - name: Verify Kubernetes credential drivers E2E jobs
-        env:
-          BUILD_CLI_RESULT: ${{ needs.build-cli.result }}
-          BUILD_GATEWAY_IMAGE_RESULT: ${{ needs.build-gateway-image.result }}
-          BUILD_SUPERVISOR_IMAGE_RESULT: ${{ needs.build-supervisor-image.result }}
-          KUBERNETES_CREDENTIAL_DRIVERS_E2E_RESULT: ${{ needs.kubernetes-credential-drivers-e2e.result }}
-        run: |
-          set -euo pipefail
-          failed=0
-          for item in \
-            "build-cli:$BUILD_CLI_RESULT" \
-            "build-gateway-image:$BUILD_GATEWAY_IMAGE_RESULT" \
-            "build-supervisor-image:$BUILD_SUPERVISOR_IMAGE_RESULT" \
-            "kubernetes-credential-drivers-e2e:$KUBERNETES_CREDENTIAL_DRIVERS_E2E_RESULT"; do
-            name="${item%%:*}"
-            result="${item#*:}"
-            if [ "$result" != "success" ]; then
-              echo "::error::$name concluded $result"
-              failed=1
-            fi
-          done
-          exit "$failed"
+      - uses: ./.github/actions/check-job-results
+        with:
+          results: ${{ toJSON(needs) }}

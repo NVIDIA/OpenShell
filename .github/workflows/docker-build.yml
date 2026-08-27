@@ -15,6 +15,10 @@ on:
       target-suffix:
         required: true
         type: string
+      image-tag:
+        required: false
+        type: string
+        default: ""
       checkout-ref:
         required: false
         type: string
@@ -62,6 +66,7 @@ jobs:
           triple: ${{ matrix.rust_arch }}-${{ inputs['target-suffix'] }}
           arch: ${{ matrix.arch }}
           platform: ${{ matrix.platform }}
+          image-tag: ${{ inputs.image-tag || github.sha }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
 
   manifest:
@@ -83,10 +88,12 @@ jobs:
 
       - name: Create manifest
         shell: bash
+        env:
+          IMAGE_TAG: ${{ inputs.image-tag || github.sha }}
         run: |
           image=ghcr.io/nvidia/openshell/${{ inputs.component }}
           docker buildx imagetools create \
             --prefer-index=false \
-            --tag "$image:${{ github.sha }}" \
-            "$image:${{ github.sha }}-amd64" \
-            "$image:${{ github.sha }}-arm64"
+            --tag "$image:${IMAGE_TAG}" \
+            "$image:${IMAGE_TAG}-amd64" \
+            "$image:${IMAGE_TAG}-arm64"

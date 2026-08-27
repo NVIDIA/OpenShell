@@ -1,0 +1,119 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: Setup E2E Podman
+description: Configure the supported rootless Podman environment for E2E tests
+
+inputs:
+  mise-version:
+    description: mise release to install
+    required: false
+    default: v2026.4.25
+  podman-major:
+    description: Expected Podman major version
+    required: true
+  podman-package-version:
+    description: Exact Ubuntu Podman package version
+    required: true
+  conmon-package-version:
+    description: Exact Ubuntu conmon package version
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - uses: jdx/mise-action@7e36c90d9ab29c415a2384db3006f3ec8a8cc654 # v4.2.4
+      with:
+        version: ${{ inputs.mise-version }}
+
+    - name: Install Podman and build dependencies
+      shell: bash
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y --no-install-recommends \
+          apparmor \
+          build-essential \
+          fuse-overlayfs \
+          libssl-dev \
+          openssh-client \
+          passt \
+          pkg-config \
+          "conmon=${{ inputs.conmon-package-version }}" \
+          "podman=${{ inputs.podman-package-version }}" \
+          uidmap
+        # Hosted runners can place newer binaries under /usr/local. Select the
+        # distro CLI and use Podman's supported final conmon-path override.
+        podman_config="${RUNNER_TEMP}/openshell-containers.conf"
+        printf '%s\n' \
+          '[engine]' \
+          'conmon_path = ["/usr/bin/conmon"]' \
+          > "${podman_config}"
+        echo "/usr/bin" >> "${GITHUB_PATH}"
+        echo "CONTAINERS_CONF_OVERRIDE=${podman_config}" >> "${GITHUB_ENV}"
+
+    - name: Allow pasta to receive Podman stop signals
+      shell: bash
+      run: |
+        set -euo pipefail
+        # Ubuntu's packaged profile blocks this signal and makes Podman wait
+        # for its SIGKILL fallback.
+        profile=/etc/apparmor.d/usr.bin.pasta
+        rule='  signal (receive) peer=podman,'
+        if ! sudo grep -Fqx "${rule}" "${profile}"; then
+          sudo sed -i '\|^  include <abstractions/pasta>$|a\  signal (receive) peer=podman,' "${profile}"
+        fi
+        sudo grep -Fqx "${rule}" "${profile}"
+        sudo apparmor_parser --replace "${profile}"
+
+    - name: Configure rootless Podman
+      shell: bash
+      run: |
+        set -euo pipefail
+        if ! grep -q "^${USER}:" /etc/subuid; then
+          sudo usermod --add-subuids 100000-165535 "$USER"
+        fi
+        if ! grep -q "^${USER}:" /etc/subgid; then
+          sudo usermod --add-subgids 100000-165535 "$USER"
+        fi
+        runtime_dir="/run/user/$(id -u)"
+        sudo install -d -m 0700 -o "$(id -u)" -g "$(id -g)" "$runtime_dir"
+        echo "XDG_RUNTIME_DIR=$runtime_dir" >> "$GITHUB_ENV"
+
+    - name: Verify rootless Podman environment
+      shell: bash
+      run: |
+        set -euo pipefail
+        podman_version="$(podman version --format '{{.Client.Version}}')"
+        case "$podman_version" in
+          "${{ inputs.podman-major }}".*) ;;
+          *) echo "ERROR: expected Podman ${{ inputs.podman-major }}.x, found $podman_version" >&2; exit 1 ;;
+        esac
+        test "$(dpkg-query -W -f='${Version}' podman)" = "${{ inputs.podman-package-version }}"
+        test "$(dpkg-query -W -f='${Version}' conmon)" = "${{ inputs.conmon-package-version }}"
+        test "$(command -v podman)" = "/usr/bin/podman"
+        test "$(podman info --format '{{.Host.Conmon.Path}}')" = "/usr/bin/conmon"
+        test "$(podman info --format '{{.Host.Security.Rootless}}')" = "true"
+        test "$(podman info --format '{{.Host.RootlessNetworkCmd}}')" = "pasta"
+        test "$(sudo sysctl -n kernel.apparmor_restrict_unprivileged_userns)" = "1"
+        echo "=== host ==="
+        uname -a
+        echo "=== AppArmor ==="
+        cat /proc/self/attr/current
+        sudo aa-status || true
+        echo "=== Podman ==="
+        podman version
+        podman info --debug
+
+    - name: Probe rootless capability bounding set
+      shell: bash
+      run: |
+        set -euo pipefail
+        probe="$RUNNER_TEMP/openshell-capbset-probe"
+        cc -static -O2 -Wall -Wextra -Werror \
+          e2e/support/capbset-probe.c \
+          -o "$probe"
+        podman run --rm \
+          --cap-add=SETPCAP \
+          --volume "$probe:/openshell-capbset-probe:ro" \
+          docker.io/library/alpine:3.22 \
+          /openshell-capbset-probe

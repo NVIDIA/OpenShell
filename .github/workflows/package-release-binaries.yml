@@ -1,0 +1,77 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: Package Release Binaries
+
+on:
+  workflow_call:
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  package:
+    name: Package ${{ matrix.artifact }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - artifact: openshell-x86_64-unknown-linux-musl
+            binary: openshell
+            package: cli-linux-amd64
+          - artifact: openshell-aarch64-unknown-linux-musl
+            binary: openshell
+            package: cli-linux-arm64
+          - artifact: openshell-aarch64-apple-darwin
+            binary: openshell
+            package: cli-macos
+          - artifact: openshell-gateway-x86_64-unknown-linux-gnu
+            binary: openshell-gateway
+            package: gateway-binary-linux-amd64
+          - artifact: openshell-gateway-aarch64-unknown-linux-gnu
+            binary: openshell-gateway
+            package: gateway-binary-linux-arm64
+          - artifact: openshell-gateway-aarch64-apple-darwin
+            binary: openshell-gateway
+            package: gateway-binary-macos
+          - artifact: openshell-sandbox-x86_64-unknown-linux-musl
+            binary: openshell-sandbox
+            package: supervisor-binary-linux-amd64
+          - artifact: openshell-sandbox-aarch64-unknown-linux-musl
+            binary: openshell-sandbox
+            package: supervisor-binary-linux-arm64
+          - artifact: openshell-driver-vm-x86_64-unknown-linux-gnu
+            binary: openshell-driver-vm
+            package: driver-vm-linux-amd64
+          - artifact: openshell-driver-vm-aarch64-unknown-linux-gnu
+            binary: openshell-driver-vm
+            package: driver-vm-linux-arm64
+          - artifact: openshell-driver-vm-aarch64-apple-darwin
+            binary: openshell-driver-vm
+            package: driver-vm-macos
+    steps:
+      - name: Download ${{ matrix.artifact }}
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ matrix.artifact }}
+          path: raw
+
+      - name: Create archive
+        env:
+          ARTIFACT: ${{ matrix.artifact }}
+          BINARY: ${{ matrix.binary }}
+        run: |
+          set -euo pipefail
+          chmod +x "raw/${BINARY}"
+          tar -czf "${ARTIFACT}.tar.gz" -C raw "${BINARY}"
+
+      - name: Upload ${{ matrix.package }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: ${{ matrix.package }}
+          path: ${{ matrix.artifact }}.tar.gz
+          retention-days: 5
+          if-no-files-found: error

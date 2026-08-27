@@ -21,6 +21,10 @@ on:
       cargo-version:
         required: true
         type: string
+      image-tag:
+        required: false
+        type: string
+        default: ""
       artifact-name:
         required: false
         type: string
@@ -64,6 +68,7 @@ jobs:
           triple: ${{ inputs.triple }}
           dev-shell: ${{ inputs['dev-shell'] }}
           cargo-version: ${{ inputs['cargo-version'] }}
+          image-tag: ${{ inputs['image-tag'] }}
           artifact-name: ${{ inputs['artifact-name'] }}
           extra-cargo-flags: ${{ inputs['extra-cargo-flags'] }}
           interpreter: ${{ inputs.interpreter }}

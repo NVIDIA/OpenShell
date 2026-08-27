@@ -9,6 +9,10 @@ on:
       cargo-version:
         required: true
         type: string
+      image-tag:
+        required: false
+        type: string
+        default: ""
       checkout-ref:
         required: false
         type: string
@@ -93,4 +97,5 @@ jobs:
           triple: ${{ matrix.triple }}
           dev-shell: ${{ matrix.dev_shell }}
           cargo-version: ${{ inputs['cargo-version'] }}
+          image-tag: ${{ inputs['image-tag'] }}
           interpreter: ${{ matrix.interpreter }}

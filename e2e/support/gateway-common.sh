@@ -220,7 +220,7 @@ e2e_build_gateway_binaries() {
     if [ "${OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" = "1" ]; then
       cargo build "${jobs[@]}" \
         -p openshell-server --bin openshell-gateway \
-        --no-default-features --features telemetry
+        --no-default-features
     else
       cargo build "${jobs[@]}" \
         -p openshell-server --bin openshell-gateway
@@ -259,9 +259,14 @@ e2e_build_external_driver() {
     jobs=(-j "${CARGO_BUILD_JOBS}")
   fi
   target_dir="$(e2e_cargo_target_dir "${root}")"
-  printf -v "${output_var}" '%s' "${target_dir}/debug/${binary}"
-  echo "Building external ${binary}..."
-  cargo build "${jobs[@]}" -p "${package}" --bin "${binary}"
+  if [ -n "${OPENSHELL_EXTERNAL_DRIVER_BIN:-}" ]; then
+    printf -v "${output_var}" '%s' "${OPENSHELL_EXTERNAL_DRIVER_BIN}"
+    echo "Using prebuilt external driver at ${OPENSHELL_EXTERNAL_DRIVER_BIN}"
+  else
+    printf -v "${output_var}" '%s' "${target_dir}/debug/${binary}"
+    echo "Building external ${binary}..."
+    cargo build "${jobs[@]}" -p "${package}" --bin "${binary}"
+  fi
   if [ ! -x "${!output_var}" ]; then
     echo "ERROR: expected external driver binary at ${!output_var}" >&2
     exit 1
