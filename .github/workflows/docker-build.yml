@@ -72,14 +72,15 @@ jobs:
 
       - name: Log in to GHCR
         shell: bash
-        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${GITHUB_ACTOR}" --password-stdin
 
       - name: Create manifest
         shell: bash
         env:
           IMAGE_TAG: ${{ inputs.image-tag || github.sha }}
+          INPUTS_COMPONENT: ${{ inputs.component }}
         run: |
-          image=ghcr.io/nvidia/openshell/${{ inputs.component }}
+          image=ghcr.io/nvidia/openshell/${INPUTS_COMPONENT}
           docker buildx imagetools create \
             --prefer-index=false \
             --tag "$image:${IMAGE_TAG}" \

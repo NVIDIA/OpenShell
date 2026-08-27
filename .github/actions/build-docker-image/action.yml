@@ -36,7 +36,9 @@ runs:
 
     - name: Log in to GHCR
       shell: bash
-      run: echo "${{ inputs.github-token }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+      run: echo "${INPUTS_GITHUB_TOKEN}" | docker login ghcr.io -u "${GITHUB_ACTOR}" --password-stdin
+      env:
+        INPUTS_GITHUB_TOKEN: ${{ inputs.github-token }}
 
     - name: Download ${{ inputs.binary }}
       uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
@@ -46,21 +48,27 @@ runs:
 
     - name: Stage ${{ inputs.binary }}
       shell: bash
-      run: install -Dm0755 artifact/${{ inputs.binary }} deploy/docker/.build/prebuilt-binaries/${{ inputs.arch }}/${{ inputs.binary }}
+      run: install -Dm0755 artifact/${INPUTS_BINARY} deploy/docker/.build/prebuilt-binaries/${INPUTS_ARCH}/${INPUTS_BINARY}
+      env:
+        INPUTS_BINARY: ${{ inputs.binary }}
+        INPUTS_ARCH: ${{ inputs.arch }}
 
     - name: Build ${{ inputs.component }} image
       shell: bash
       env:
         IMAGE_TAG: ${{ inputs.image-tag }}
+        INPUTS_PLATFORM: ${{ inputs.platform }}
+        INPUTS_COMPONENT: ${{ inputs.component }}
+        INPUTS_ARCH: ${{ inputs.arch }}
       run: |
         docker buildx build \
           --builder openshell \
-          --platform ${{ inputs.platform }} \
-          --file deploy/docker/Dockerfile.${{ inputs.component }} \
-          --target ${{ inputs.component }} \
-          --tag ghcr.io/nvidia/openshell/${{ inputs.component }}:${IMAGE_TAG}-${{ inputs.arch }} \
-          --cache-from type=gha,scope=${{ inputs.component }}-${{ inputs.arch }} \
-          --cache-to type=gha,mode=max,scope=${{ inputs.component }}-${{ inputs.arch }} \
+          --platform ${INPUTS_PLATFORM} \
+          --file deploy/docker/Dockerfile.${INPUTS_COMPONENT} \
+          --target ${INPUTS_COMPONENT} \
+          --tag ghcr.io/nvidia/openshell/${INPUTS_COMPONENT}:${IMAGE_TAG}-${INPUTS_ARCH} \
+          --cache-from type=gha,scope=${INPUTS_COMPONENT}-${INPUTS_ARCH} \
+          --cache-to type=gha,mode=max,scope=${INPUTS_COMPONENT}-${INPUTS_ARCH} \
           --provenance=mode=min \
           --attest type=sbom \
           --output type=image,push=true,oci-mediatypes=true,oci-artifact=true \

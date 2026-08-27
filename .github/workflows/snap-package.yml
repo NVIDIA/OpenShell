@@ -163,6 +163,7 @@ jobs:
       - name: Upload snap to Snap Store
         env:
           SNAPCRAFT_STORE_CREDENTIALS: ${{ secrets.publish-credentials }}
+          INPUTS_UPLOAD_CHANNEL: ${{ inputs.upload-channel }}
         run: |
           set -euo pipefail
           SNAP_FILE="${{ steps.capture.outputs.snap-file }}"
@@ -176,5 +177,5 @@ jobs:
             COMPONENT_ARGS+=(--component "$comp")
           done
 
-          echo "Uploading $SNAP_FILE to ${{ inputs.upload-channel }}"
-          snapcraft upload --release "${{ inputs.upload-channel }}" "$SNAP_FILE" "${COMPONENT_ARGS[@]}"
+          echo "Uploading $SNAP_FILE to ${INPUTS_UPLOAD_CHANNEL}"
+          snapcraft upload --release "${INPUTS_UPLOAD_CHANNEL}" "$SNAP_FILE" "${COMPONENT_ARGS[@]}"

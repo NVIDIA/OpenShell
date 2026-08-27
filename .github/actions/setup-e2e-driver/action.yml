@@ -21,7 +21,9 @@ runs:
     - name: Configure prebuilt ${{ inputs.binary }}
       shell: bash
       run: |
-        driver="$GITHUB_WORKSPACE/.e2e/prebuilt-driver/${{ inputs.binary }}"
+        driver="$GITHUB_WORKSPACE/.e2e/prebuilt-driver/${INPUTS_BINARY}"
         chmod +x "$driver"
         "$driver" --version
         echo "OPENSHELL_EXTERNAL_DRIVER_BIN=$driver" >> "$GITHUB_ENV"
+      env:
+        INPUTS_BINARY: ${{ inputs.binary }}

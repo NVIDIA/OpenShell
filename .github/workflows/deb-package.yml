@@ -76,10 +76,12 @@ jobs:
           OPENSHELL_CLI_BINARY="${PWD}/package-binaries/openshell" \
           OPENSHELL_GATEWAY_BINARY="${PWD}/package-binaries/openshell-gateway" \
           OPENSHELL_DRIVER_VM_BINARY="${PWD}/package-binaries/openshell-driver-vm" \
-          OPENSHELL_DEB_VERSION="${{ inputs['deb-version'] }}" \
+          OPENSHELL_DEB_VERSION="${INPUTS_DEB_VERSION}" \
           OPENSHELL_DEB_ARCH="${{ matrix.deb_arch }}" \
           OPENSHELL_OUTPUT_DIR=artifacts \
             tasks/scripts/package-deb.sh
+        env:
+          INPUTS_DEB_VERSION: ${{ inputs['deb-version'] }}
 
       - name: Upload Debian package artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7

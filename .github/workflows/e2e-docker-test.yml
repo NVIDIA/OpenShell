@@ -97,7 +97,7 @@ jobs:
           rm -rf /var/lib/apt/lists/*
 
       - name: Log in to GHCR
-        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${GITHUB_ACTOR}" --password-stdin
 
       - name: Install Python dependencies and generate protobuf stubs
         if: matrix.python_proto

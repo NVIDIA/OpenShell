@@ -38,8 +38,8 @@ runs:
           openssh-client \
           passt \
           pkg-config \
-          "conmon=${{ inputs.conmon-package-version }}" \
-          "podman=${{ inputs.podman-package-version }}" \
+          "conmon=${INPUTS_CONMON_PACKAGE_VERSION}" \
+          "podman=${INPUTS_PODMAN_PACKAGE_VERSION}" \
           uidmap
         # Hosted runners can place newer binaries under /usr/local. Select the
         # distro CLI and use Podman's supported final conmon-path override.
@@ -50,6 +50,9 @@ runs:
           > "${podman_config}"
         echo "/usr/bin" >> "${GITHUB_PATH}"
         echo "CONTAINERS_CONF_OVERRIDE=${podman_config}" >> "${GITHUB_ENV}"
+      env:
+        INPUTS_CONMON_PACKAGE_VERSION: ${{ inputs.conmon-package-version }}
+        INPUTS_PODMAN_PACKAGE_VERSION: ${{ inputs.podman-package-version }}
 
     - name: Allow pasta to receive Podman stop signals
       shell: bash
@@ -85,11 +88,11 @@ runs:
         set -euo pipefail
         podman_version="$(podman version --format '{{.Client.Version}}')"
         case "$podman_version" in
-          "${{ inputs.podman-major }}".*) ;;
-          *) echo "ERROR: expected Podman ${{ inputs.podman-major }}.x, found $podman_version" >&2; exit 1 ;;
+          "${INPUTS_PODMAN_MAJOR}".*) ;;
+          *) echo "ERROR: expected Podman ${INPUTS_PODMAN_MAJOR}.x, found $podman_version" >&2; exit 1 ;;
         esac
-        test "$(dpkg-query -W -f='${Version}' podman)" = "${{ inputs.podman-package-version }}"
-        test "$(dpkg-query -W -f='${Version}' conmon)" = "${{ inputs.conmon-package-version }}"
+        test "$(dpkg-query -W -f='${Version}' podman)" = "${INPUTS_PODMAN_PACKAGE_VERSION}"
+        test "$(dpkg-query -W -f='${Version}' conmon)" = "${INPUTS_CONMON_PACKAGE_VERSION}"
         test "$(command -v podman)" = "/usr/bin/podman"
         test "$(podman info --format '{{.Host.Conmon.Path}}')" = "/usr/bin/conmon"
         test "$(podman info --format '{{.Host.Security.Rootless}}')" = "true"
@@ -103,6 +106,10 @@ runs:
         echo "=== Podman ==="
         podman version
         podman info --debug
+      env:
+        INPUTS_PODMAN_MAJOR: ${{ inputs.podman-major }}
+        INPUTS_PODMAN_PACKAGE_VERSION: ${{ inputs.podman-package-version }}
+        INPUTS_CONMON_PACKAGE_VERSION: ${{ inputs.conmon-package-version }}
 
     - name: Probe rootless capability bounding set
       shell: bash
