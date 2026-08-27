@@ -118,6 +118,12 @@ openshell provider create \
 
 Replace the base URL and API key with the values from your provider. For supported providers out of the box, refer to [Supported Inference Providers](/sandboxes/manage-providers#supported-inference-providers). For other providers, refer to your provider's documentation for the correct base URL, available models, and API key setup.
 
+This override is used by gateway inference routing. It disables the built-in
+public OpenAI endpoint policy and credential binding for direct sandbox
+traffic, so the alternate-upstream key cannot be substituted at
+`api.openai.com`. Import an endpoint-bearing custom profile if a sandbox must
+contact the alternate upstream directly.
+
 </Tab>
 
 <Tab title="Google Vertex AI">
@@ -146,6 +152,9 @@ openshell provider create \
 ```
 
 Use `--config OPENAI_BASE_URL` to point to any OpenAI-compatible server running where the gateway runs. For host-backed local inference, use `host.openshell.internal` or the host's LAN IP. Avoid `127.0.0.1` and `localhost`. Set `OPENAI_API_KEY` to a dummy value if the server does not require authentication.
+
+The override is route-only and does not add the local endpoint to sandbox
+network policy.
 
 <Tip>
 For a self-contained setup, the Ollama sandbox bundles Ollama inside the sandbox itself, so no host-level provider is needed. Refer to [Inference Ollama](/get-started/tutorials/inference-ollama) for details.

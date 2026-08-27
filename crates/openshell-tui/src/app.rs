@@ -11,7 +11,9 @@ use openshell_core::auth::EdgeAuthInterceptor;
 use openshell_core::proto::open_shell_client::OpenShellClient;
 use openshell_core::proto::setting_value;
 use openshell_core::settings::{self, SettingValueKind};
-use openshell_providers::{ProviderTypeProfile, RealDiscoveryContext, discover_from_profile};
+use openshell_providers::{
+    DiscoveredProvider, ProviderTypeProfile, RealDiscoveryContext, discover_from_profile,
+};
 use tonic::service::interceptor::InterceptedService;
 use tonic::transport::Channel;
 
@@ -406,6 +408,12 @@ pub struct CreateProviderForm {
     pub create_result: Option<Result<String, String>>,
     /// Credentials to send (filled by autodetect or built from form fields on submit).
     pub discovered_credentials: Option<HashMap<String, String>>,
+}
+
+fn apply_discovered_provider(form: &mut CreateProviderForm, discovered: DiscoveredProvider) {
+    form.discovered_credentials = Some(discovered.credentials);
+    form.config = discovered.config.into_iter().collect();
+    form.config_cursor = 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -2520,7 +2528,7 @@ impl App {
                                     .flatten()
                             });
                         if let Some(discovered) = discovered {
-                            form.discovered_credentials = Some(discovered.credentials);
+                            apply_discovered_provider(form, discovered);
                             if form.name.is_empty() {
                                 form.name = unique_provider_name(&ptype, &self.provider_names);
                             }
@@ -4101,5 +4109,35 @@ mod tests {
             "submit guard must not trigger after successful flush"
         );
         assert_eq!(config.get("FOO"), Some(&"bar".to_string()));
+    }
+
+    #[test]
+    fn autodetected_provider_configuration_is_preserved_in_create_form() {
+        let mut form = CreateProviderForm::default();
+        apply_discovered_provider(
+            &mut form,
+            DiscoveredProvider {
+                credentials: HashMap::from([("VERTEX_AI_TOKEN".to_string(), "token".to_string())]),
+                config: HashMap::from([
+                    ("VERTEX_AI_PROJECT_ID".to_string(), "project-a".to_string()),
+                    ("VERTEX_AI_REGION".to_string(), "us-central1".to_string()),
+                ]),
+            },
+        );
+
+        assert_eq!(
+            form.discovered_credentials
+                .as_ref()
+                .and_then(|credentials| credentials.get("VERTEX_AI_TOKEN")),
+            Some(&"token".to_string())
+        );
+        assert_eq!(
+            form.config.get("VERTEX_AI_PROJECT_ID"),
+            Some(&"project-a".to_string())
+        );
+        assert_eq!(
+            form.config.get("VERTEX_AI_REGION"),
+            Some(&"us-central1".to_string())
+        );
     }
 }

@@ -552,7 +552,9 @@ Create a provider configuration.
 | `--runtime-credentials` | Resolve required credentials at runtime in the gateway or sandbox |
 | `--config KEY=VALUE` | Config key/value pair. Repeatable. |
 
-Exactly one credential source is required. Credential-source flags conflict with one another.
+Credential-source flags conflict with one another when supplied. A credential
+source is optional when the selected profile declares no required static
+credentials or can resolve its required credentials at runtime.
 
 ### `openshell provider get <name>`
 

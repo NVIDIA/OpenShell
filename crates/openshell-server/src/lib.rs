@@ -678,6 +678,14 @@ pub(crate) async fn run_server(
     // first snapshots observe the post-start backend state. Explicitly stopped
     // sandboxes remain stopped.
     ensure_default_workspace(&store).await?;
+    grpc::policy::validate_provider_composition_startup_preflight(&state)
+        .await
+        .map_err(|error| {
+            Error::config(format!(
+                "provider policy composition startup preflight failed: {}",
+                error.message()
+            ))
+        })?;
 
     let gateway_listeners = bind_gateway_listeners(
         config.bind_address,

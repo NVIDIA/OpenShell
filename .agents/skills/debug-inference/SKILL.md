@@ -136,6 +136,11 @@ Check:
 - Required credential key exists
 - `*_BASE_URL` override is correct when using a self-hosted endpoint
 
+An `OPENAI_BASE_URL` or `ANTHROPIC_BASE_URL` override is route-only. It does not
+authorize the fixed public-vendor endpoint or expose the alternate-upstream key
+for substitution there. Use an imported endpoint-bearing custom profile when a
+sandbox needs direct access to the alternate upstream.
+
 Fix examples:
 
 ```bash

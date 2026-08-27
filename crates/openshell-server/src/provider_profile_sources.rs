@@ -238,6 +238,7 @@ struct ScopedProfileEntry {
 struct EffectiveProfileEntry {
     effective: ScopedProfileEntry,
     platform_fallback: Option<ScopedProfileEntry>,
+    static_fallback: Option<ScopedProfileEntry>,
 }
 
 #[derive(Debug, Clone)]
@@ -415,6 +416,9 @@ impl EffectiveProviderProfileCatalog {
             if let Some(fallback) = &entry.platform_fallback {
                 result.push((fallback.scope, fallback.response.clone()));
             }
+            if let Some(fallback) = &entry.static_fallback {
+                result.push((fallback.scope, fallback.response.clone()));
+            }
         }
         result
     }
@@ -476,7 +480,7 @@ impl EffectiveProviderProfileCatalog {
             match &entry.platform_fallback {
                 Some(fallback) => Some(fallback),
                 None if entry.effective.scope == ProfileScope::Platform => Some(&entry.effective),
-                None => None,
+                None => entry.static_fallback.as_ref(),
             }
         } else {
             Some(&entry.effective)
@@ -487,8 +491,14 @@ impl EffectiveProviderProfileCatalog {
         let id = normalize_profile_id(id)?;
         self.profiles
             .get(&id)
-            .filter(|entry| !entry.effective.user_managed)
-            .map(|entry| entry.effective.source_id.clone())
+            .and_then(|entry| {
+                if entry.effective.user_managed {
+                    entry.static_fallback.as_ref()
+                } else {
+                    Some(&entry.effective)
+                }
+            })
+            .map(|entry| entry.source_id.clone())
     }
 
     pub(crate) fn hash_type_profile_revision_for_scope(
@@ -640,6 +650,19 @@ fn build_effective_profiles(
                 let new_scope = new_entry.scope;
 
                 match (existing_scope, new_scope) {
+                    (ProfileScope::Static, _)
+                        if existing.effective.source_id == BUILTIN_SOURCE_ID
+                            && new_entry.user_managed =>
+                    {
+                        let fallback = std::mem::replace(&mut existing.effective, new_entry);
+                        existing.static_fallback = Some(fallback);
+                    }
+                    (_, ProfileScope::Static)
+                        if new_entry.source_id == BUILTIN_SOURCE_ID
+                            && existing.effective.user_managed =>
+                    {
+                        existing.static_fallback = Some(new_entry);
+                    }
                     (ProfileScope::Static, _) | (_, ProfileScope::Static) => {
                         let location = if existing.effective.source_id == source_id {
                             format!("within source '{source_id}'")
@@ -673,6 +696,7 @@ fn build_effective_profiles(
                     EffectiveProfileEntry {
                         effective: new_entry,
                         platform_fallback: None,
+                        static_fallback: None,
                     },
                 );
             }
@@ -1522,28 +1546,46 @@ mod tests {
     }
 
     #[test]
-    fn same_id_static_vs_user_still_errors() {
-        let err = build_effective_profiles(vec![
+    fn user_managed_profiles_shadow_new_builtins_in_scope() {
+        let catalog = build_effective_profiles(vec![
             CollectedProviderProfileSnapshot {
                 source_id: "builtin".to_string(),
                 revision: "v1".to_string(),
-                profiles: vec![scoped(ProfileScope::Static, "openai")],
+                profiles: vec![
+                    scoped(ProfileScope::Static, "openai"),
+                    scoped(ProfileScope::Static, "anthropic"),
+                ],
                 user_managed: false,
                 allow_empty: false,
             },
             CollectedProviderProfileSnapshot {
                 source_id: "user".to_string(),
                 revision: "v1".to_string(),
-                profiles: vec![scoped(ProfileScope::Platform, "openai")],
+                profiles: vec![
+                    scoped(ProfileScope::Platform, "openai"),
+                    scoped(ProfileScope::Workspace, "anthropic"),
+                ],
                 user_managed: true,
                 allow_empty: true,
             },
         ])
-        .unwrap_err();
+        .unwrap();
 
-        assert!(
-            err.message()
-                .contains("duplicate provider profile id 'openai'")
+        let openai = catalog
+            .get_type_profile_for_scope("openai", "default")
+            .expect("platform override");
+        assert_eq!(openai.source, "user");
+        let anthropic = catalog
+            .get_type_profile_for_scope("anthropic", "default")
+            .expect("workspace override");
+        assert_eq!(anthropic.source, "user");
+        let platform_anthropic = catalog
+            .get_type_profile_for_scope("anthropic", "")
+            .expect("built-in fallback outside workspace scope");
+        assert_eq!(platform_anthropic.source, "builtin");
+        assert_eq!(
+            catalog.static_source_for_profile("openai").as_deref(),
+            Some("builtin")
         );
     }
 

@@ -33,6 +33,7 @@ Provider profiles include these user-facing features:
 
 - Built-in provider profiles loaded by the gateway by default.
 - Gateway configuration can compose built-in, user-managed, and interceptor-vended profile sources. Selecting only an interceptor makes its catalog authoritative by omission.
+- A user-managed profile shadows a built-in profile with the same ID in its applicable workspace or platform scope. The built-in remains the fallback outside that scope. Source-managed interceptor collisions still fail closed.
 - `openshell provider list-profiles` with table, YAML, and JSON output.
 - `openshell provider profile export`, `import`, `update`, `lint`, and `delete` for custom profiles.
 - Provider instances created from built-in or imported profile IDs with `openshell provider create --type <id>`.
@@ -53,6 +54,12 @@ static credential environment key with an endpoint boundary. Profile endpoints
 supply that boundary by default. For an endpointless profile, a sandbox policy
 endpoint can name the attached provider instance explicitly. The proxy checks
 the resulting association before it substitutes the real value.
+
+The built-in `openai` and `anthropic` profiles use their public vendor
+endpoints. Configuring an alternate base URL makes those providers route-only:
+OpenShell withholds their static credentials and fixed-vendor policy from
+direct sandbox traffic while gateway inference routing continues to use the
+configured upstream.
 
 A request can use a static credential only when all of these checks pass:
 

@@ -467,6 +467,13 @@ async fn update_provider_record_validating(
 
     let cas_result = async {
         validate_provider_mutable_fields(&candidate)?;
+        if let Some(profile) = get_provider_type_profile_for_scope(
+            catalog,
+            &candidate.r#type,
+            &candidate.profile_workspace,
+        ) {
+            validate_provider_credentials(&profile, &candidate, &updated_credential_values)?;
+        }
         validate_provider_update_against_attached_sandboxes_with_catalog(
             store, catalog, workspace, &candidate,
         )
@@ -1104,12 +1111,26 @@ pub(super) async fn resolve_provider_environment_from_records_with_policy_bindin
             &provider.r#type,
             &provider.profile_workspace,
         );
+        let accepted_stored_credential_keys = profile.as_ref().map(|profile| {
+            profile
+                .credentials
+                .iter()
+                .flat_map(|credential| credential.accepted_stored_keys())
+                .map(str::to_string)
+                .collect::<HashSet<_>>()
+        });
+        let profile_endpoints_are_active = profile
+            .as_ref()
+            .is_none_or(|profile| provider_profile_endpoints_are_active(profile, provider));
         let profile_proto = profile.as_ref().map(ProviderTypeProfile::to_proto);
         let broker_only_credential_keys = profile_proto
             .as_ref()
             .map(broker_only_provider_credential_keys)
             .unwrap_or_default();
         let profile_endpoints = profile_proto.as_ref().map(|profile| {
+            if !profile_endpoints_are_active {
+                return Vec::new();
+            }
             profile
                 .endpoints
                 .iter()
@@ -1149,6 +1170,17 @@ pub(super) async fn resolve_provider_environment_from_records_with_policy_bindin
         let refresh_epochs = refresh_authorization_epochs_by_key(record)?;
 
         for (key, value) in &provider.credentials {
+            if accepted_stored_credential_keys
+                .as_ref()
+                .is_some_and(|accepted| !accepted.contains(key))
+            {
+                warn!(
+                    provider_name = %name,
+                    key = %key,
+                    "withholding provider credential not declared by resolved profile"
+                );
+                continue;
+            }
             if is_non_injectable_provider_credential(provider, key)
                 || broker_only_credential_keys.contains(key)
             {
@@ -1221,6 +1253,17 @@ pub(super) async fn resolve_provider_environment_from_records_with_policy_bindin
             .resolve_provider_handles(provider, now_ms)
             .await?;
         for (key, value) in resolved_refs.values {
+            if accepted_stored_credential_keys
+                .as_ref()
+                .is_some_and(|accepted| !accepted.contains(&key))
+            {
+                warn!(
+                    provider_name = %name,
+                    key = %key,
+                    "withholding provider credential handle not declared by resolved profile"
+                );
+                continue;
+            }
             if is_non_injectable_provider_credential(provider, &key)
                 || broker_only_credential_keys.contains(&key)
             {
@@ -2881,6 +2924,33 @@ pub(super) fn get_provider_type_profile_for_scope(
     catalog.get_type_profile_for_scope(id, profile_workspace)
 }
 
+pub(super) fn provider_profile_endpoints_are_active(
+    profile: &ProviderTypeProfile,
+    provider: &Provider,
+) -> bool {
+    if profile.source != "builtin" {
+        return true;
+    }
+    let Some(inference_profile) = openshell_core::inference::profile_for(&profile.id) else {
+        return true;
+    };
+    if !matches!(inference_profile.provider_type, "openai" | "anthropic") {
+        return true;
+    }
+
+    let configured_base_url = inference_profile
+        .base_url_config_keys
+        .iter()
+        .find_map(|key| provider.config.get(*key))
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty());
+    configured_base_url.is_none_or(|configured| {
+        configured
+            .trim_end_matches('/')
+            .eq_ignore_ascii_case(inference_profile.default_base_url.trim_end_matches('/'))
+    })
+}
+
 #[cfg(test)]
 pub(super) async fn get_provider_type_profile(
     store: &Store,
@@ -3065,13 +3135,13 @@ fn validate_provider_create_credentials(
     profile: &ProviderTypeProfile,
     provider: &Provider,
 ) -> Result<(), Status> {
-    validate_provider_credential_keys(profile, provider)?;
-    validate_required_static_credentials(profile, provider, &HashMap::new())
+    validate_provider_credentials(profile, provider, &HashMap::new())
 }
 
-fn validate_provider_credential_keys(
+fn validate_provider_credentials(
     profile: &ProviderTypeProfile,
     provider: &Provider,
+    pending_credentials: &HashMap<String, String>,
 ) -> Result<(), Status> {
     let declared_keys = profile
         .credentials
@@ -3081,10 +3151,13 @@ fn validate_provider_credential_keys(
     let mut unknown_keys = provider
         .credentials
         .keys()
+        .chain(provider.credential_handles.keys())
+        .chain(pending_credentials.keys())
         .filter(|key| !declared_keys.contains(key.as_str()))
         .cloned()
         .collect::<Vec<_>>();
     unknown_keys.sort();
+    unknown_keys.dedup();
     if !unknown_keys.is_empty() {
         return Err(Status::invalid_argument(format!(
             "provider credentials are not declared by profile '{}': {}",
@@ -3093,7 +3166,7 @@ fn validate_provider_credential_keys(
         )));
     }
 
-    Ok(())
+    validate_required_static_credentials(profile, provider, pending_credentials)
 }
 
 fn validate_required_static_credentials(
@@ -8099,7 +8172,7 @@ mod tests {
         create_provider_record(
             &store,
             "default",
-            provider_with_values("legacy-provider", "openai"),
+            provider_with_values("legacy-provider", "legacy-custom"),
         )
         .await
         .unwrap();
@@ -8164,7 +8237,7 @@ mod tests {
         create_provider_record(
             &store,
             "default",
-            provider_with_values("legacy-provider", "openai"),
+            provider_with_values("legacy-provider", "legacy-custom"),
         )
         .await
         .unwrap();
@@ -8693,7 +8766,7 @@ mod tests {
         let store = test_store().await;
 
         // Create provider and verify resource_version: 1 in response
-        let created = provider_with_values("test-provider", "openai");
+        let created = provider_with_values("test-provider", "legacy-custom");
         let persisted = create_provider_record(&store, "default", created)
             .await
             .unwrap();
@@ -8718,7 +8791,7 @@ mod tests {
                     workspace: "default".to_string(),
                     deletion_timestamp_ms: 0,
                 }),
-                r#type: "openai".to_string(),
+                r#type: "legacy-custom".to_string(),
                 credentials: std::iter::once((
                     "OPENAI_API_KEY".to_string(),
                     "updated-key".to_string(),
@@ -8753,7 +8826,7 @@ mod tests {
                     workspace: "default".to_string(),
                     deletion_timestamp_ms: 0,
                 }),
-                r#type: "openai".to_string(),
+                r#type: "legacy-custom".to_string(),
                 credentials: std::iter::once((
                     "OPENAI_API_KEY".to_string(),
                     "third-key".to_string(),
@@ -9067,7 +9140,7 @@ mod tests {
     async fn update_provider_empty_maps_is_noop() {
         let store = test_store().await;
 
-        let created = provider_with_values("noop-test", "nvidia");
+        let created = provider_with_values("noop-test", "legacy-custom");
         let persisted = create_provider_record(&store, "default", created)
             .await
             .unwrap();
@@ -9098,7 +9171,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(updated.object_id(), persisted.object_id());
-        assert_eq!(updated.r#type, "nvidia");
+        assert_eq!(updated.r#type, "legacy-custom");
         assert_eq!(updated.credentials.len(), 2);
         assert_eq!(
             updated.credentials.get("API_TOKEN"),
@@ -9122,7 +9195,7 @@ mod tests {
     async fn update_provider_empty_value_deletes_key() {
         let store = test_store().await;
 
-        let created = provider_with_values("delete-key-test", "openai");
+        let created = provider_with_values("delete-key-test", "legacy-custom");
         create_provider_record(&store, "default", created)
             .await
             .unwrap();
@@ -9181,7 +9254,7 @@ mod tests {
     async fn update_provider_empty_type_preserves_existing() {
         let store = test_store().await;
 
-        let created = provider_with_values("type-preserve-test", "anthropic");
+        let created = provider_with_values("type-preserve-test", "legacy-custom");
         create_provider_record(&store, "default", created)
             .await
             .unwrap();
@@ -9211,7 +9284,7 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(updated.r#type, "anthropic");
+        assert_eq!(updated.r#type, "legacy-custom");
     }
 
     #[tokio::test]
@@ -9861,6 +9934,151 @@ mod tests {
                 .is_some_and(|binding| !binding.endpoints.is_empty()),
             "the valid credential must retain its endpoint binding"
         );
+    }
+
+    #[tokio::test]
+    async fn resolve_provider_env_withholds_undeclared_legacy_credentials() {
+        let store = test_store().await;
+        let mut legacy = provider_with_values("legacy-openai", "openai");
+        legacy.credentials = HashMap::from([
+            ("OPENAI_API_KEY".to_string(), "openai-key".to_string()),
+            (
+                "AWS_SECRET_ACCESS_KEY".to_string(),
+                "unrelated-secret".to_string(),
+            ),
+        ]);
+        create_provider_record(&store, "default", legacy)
+            .await
+            .unwrap();
+
+        let result =
+            resolve_provider_environment(&store, "default", &["legacy-openai".to_string()])
+                .await
+                .unwrap();
+
+        assert_eq!(
+            result.get("OPENAI_API_KEY"),
+            Some(&"openai-key".to_string())
+        );
+        assert!(
+            result
+                .static_credential_bindings
+                .contains_key("OPENAI_API_KEY")
+        );
+        assert!(!result.contains_key("AWS_SECRET_ACCESS_KEY"));
+        assert!(
+            !result
+                .static_credential_bindings
+                .contains_key("AWS_SECRET_ACCESS_KEY")
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_provider_env_withholds_undeclared_legacy_credential_handles() {
+        let store = test_store().await;
+        let config = openshell_core::Config::new(None).with_credential_drivers(["test-static"]);
+        let credentials = crate::credentials::CredentialRuntime::from_config(&config).unwrap();
+        let catalog = ProviderProfileSources::with_default_sources()
+            .snapshot_catalog(&store, "default")
+            .await
+            .unwrap();
+        create_provider_record_validating(
+            &store,
+            "default",
+            &catalog,
+            provider_with_credential_value(
+                "legacy-openai-handle",
+                "openai",
+                "AWS_SECRET_ACCESS_KEY",
+                "unrelated-secret",
+            ),
+            Some(&credentials),
+        )
+        .await
+        .unwrap();
+
+        let records = load_provider_environment_records(
+            &store,
+            "default",
+            &["legacy-openai-handle".to_string()],
+        )
+        .await
+        .unwrap();
+        assert!(records[0].provider.credentials.is_empty());
+        assert!(
+            records[0]
+                .provider
+                .credential_handles
+                .contains_key("AWS_SECRET_ACCESS_KEY")
+        );
+
+        let result =
+            resolve_provider_environment_from_records_with_policy_bindings_and_credentials(
+                &store,
+                &catalog,
+                &records,
+                &HashMap::new(),
+                &credentials,
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(!result.contains_key("AWS_SECRET_ACCESS_KEY"));
+        assert!(
+            !result
+                .static_credential_bindings
+                .contains_key("AWS_SECRET_ACCESS_KEY")
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_provider_env_does_not_bind_alternate_upstream_keys_to_public_vendors() {
+        let store = test_store().await;
+        let cases = [
+            (
+                "alternate-openai",
+                "openai",
+                "OPENAI_API_KEY",
+                "OPENAI_BASE_URL",
+            ),
+            (
+                "alternate-anthropic",
+                "anthropic",
+                "ANTHROPIC_API_KEY",
+                "ANTHROPIC_BASE_URL",
+            ),
+        ];
+        for (name, provider_type, credential_key, base_url_key) in cases {
+            let mut provider =
+                provider_with_credential_value(name, provider_type, credential_key, "private-key");
+            provider.config.insert(
+                base_url_key.to_string(),
+                "https://api.example.com/v1".to_string(),
+            );
+            create_provider_record(&store, "default", provider)
+                .await
+                .unwrap();
+        }
+
+        let result = resolve_provider_environment(
+            &store,
+            "default",
+            &[
+                "alternate-openai".to_string(),
+                "alternate-anthropic".to_string(),
+            ],
+        )
+        .await
+        .unwrap();
+
+        for credential_key in ["OPENAI_API_KEY", "ANTHROPIC_API_KEY"] {
+            assert!(!result.contains_key(credential_key));
+            assert!(
+                !result
+                    .static_credential_bindings
+                    .contains_key(credential_key)
+            );
+        }
     }
 
     #[tokio::test]
@@ -10727,10 +10945,11 @@ mod tests {
                 .await
                 .unwrap();
 
-        // Credential value wins over the injected static value.
+        // Profile-authoritative runtime projection withholds the undeclared
+        // credential, so the provider plugin's declared config wins.
         assert_eq!(
             result.get("GOOSE_PROVIDER"),
-            Some(&"custom-value".to_string())
+            Some(&"gcp_vertex_ai".to_string())
         );
     }
 
@@ -11267,6 +11486,97 @@ mod tests {
     // ---- CAS (Client-driven optimistic concurrency) tests for UpdateProvider ----
 
     #[tokio::test]
+    async fn update_provider_rejects_undeclared_profile_credential() {
+        let state = test_server_state().await;
+        handle_create_provider(
+            &state,
+            authed_request(CreateProviderRequest {
+                provider: Some(provider_with_credential_value(
+                    "profile-backed-openai",
+                    "openai",
+                    "OPENAI_API_KEY",
+                    "sk-test",
+                )),
+                workspace: "default".to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+
+        let current = state
+            .store
+            .get_message_by_name::<Provider>("default", "profile-backed-openai")
+            .await
+            .unwrap()
+            .unwrap();
+        let mut update = current;
+        update.credential_handles.clear();
+        update.credentials.insert(
+            "AWS_SECRET_ACCESS_KEY".to_string(),
+            "unrelated-secret".to_string(),
+        );
+
+        let error = handle_update_provider(
+            &state,
+            authed_request(UpdateProviderRequest {
+                provider: Some(update),
+                credential_expires_at_ms: HashMap::new(),
+                workspace: "default".to_string(),
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.code(), Code::InvalidArgument);
+        assert!(error.message().contains("AWS_SECRET_ACCESS_KEY"));
+    }
+
+    #[tokio::test]
+    async fn update_provider_rejects_deleting_required_profile_credential() {
+        let state = test_server_state().await;
+        handle_create_provider(
+            &state,
+            authed_request(CreateProviderRequest {
+                provider: Some(provider_with_credential_value(
+                    "required-openai",
+                    "openai",
+                    "OPENAI_API_KEY",
+                    "sk-test",
+                )),
+                workspace: "default".to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+
+        let current = state
+            .store
+            .get_message_by_name::<Provider>("default", "required-openai")
+            .await
+            .unwrap()
+            .unwrap();
+        let mut update = current;
+        update.credential_handles.clear();
+        update
+            .credentials
+            .insert("OPENAI_API_KEY".to_string(), String::new());
+
+        let error = handle_update_provider(
+            &state,
+            authed_request(UpdateProviderRequest {
+                provider: Some(update),
+                credential_expires_at_ms: HashMap::new(),
+                workspace: "default".to_string(),
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.code(), Code::InvalidArgument);
+        assert!(error.message().contains("requires static credentials"));
+    }
+
+    #[tokio::test]
     async fn update_provider_client_driven_cas_succeeds_with_correct_version() {
         let state = test_server_state().await;
 
@@ -11297,8 +11607,8 @@ mod tests {
         let mut updated_provider = current.clone();
         updated_provider.credential_handles.clear();
         updated_provider
-            .credentials
-            .insert("NEW_KEY".to_string(), "new-value".to_string());
+            .config
+            .insert("NEW_CONFIG".to_string(), "new-value".to_string());
         updated_provider.metadata.as_mut().unwrap().resource_version = current_version;
 
         // Update should succeed
@@ -11329,13 +11639,7 @@ mod tests {
                 .resource_version,
             current_version + 1
         );
-        assert!(
-            response
-                .provider
-                .unwrap()
-                .credentials
-                .contains_key("NEW_KEY")
-        );
+        assert!(response.provider.unwrap().config.contains_key("NEW_CONFIG"));
     }
 
     #[tokio::test]
@@ -11369,8 +11673,8 @@ mod tests {
         let mut stale_provider = current.clone();
         stale_provider.credential_handles.clear();
         stale_provider
-            .credentials
-            .insert("NEW_KEY".to_string(), "new-value".to_string());
+            .config
+            .insert("NEW_CONFIG".to_string(), "new-value".to_string());
         stale_provider.metadata.as_mut().unwrap().resource_version = 99; // stale version
 
         // Update should fail with ABORTED
@@ -11404,8 +11708,7 @@ mod tests {
             unchanged.metadata.as_ref().unwrap().resource_version,
             current_version
         );
-        assert!(!unchanged.credentials.contains_key("NEW_KEY"));
-        assert!(!unchanged.credential_handles.contains_key("NEW_KEY"));
+        assert!(!unchanged.config.contains_key("NEW_CONFIG"));
     }
 
     #[tokio::test]
@@ -11515,7 +11818,7 @@ mod tests {
             let mut updated = initial.clone();
             updated.credential_handles.clear();
             updated
-                .credentials
+                .config
                 .insert(format!("KEY_{i}"), format!("value-{i}"));
             updated.metadata.as_mut().unwrap().resource_version = initial_version;
 
@@ -11567,13 +11870,9 @@ mod tests {
             initial_version + 1
         );
 
-        // Exactly one of KEY_0, KEY_1, or KEY_2 should be present
+        // Exactly one of KEY_0, KEY_1, or KEY_2 should be present.
         let new_keys_count = (0..3)
-            .filter(|i| {
-                final_provider
-                    .credential_handles
-                    .contains_key(&format!("KEY_{i}"))
-            })
+            .filter(|i| final_provider.config.contains_key(&format!("KEY_{i}")))
             .count();
         assert_eq!(new_keys_count, 1);
     }

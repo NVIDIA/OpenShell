@@ -2100,6 +2100,15 @@ async fn validate_provider_composition_for_existing_sandboxes(
     Ok(())
 }
 
+pub async fn validate_provider_composition_startup_preflight(
+    state: &ServerState,
+) -> Result<(), Status> {
+    if provider_policy_composition_enabled(state.store.as_ref()).await? {
+        validate_provider_composition_for_existing_sandboxes(state).await?;
+    }
+    Ok(())
+}
+
 pub(super) async fn validate_candidate_sandbox_credential_policy(
     state: &ServerState,
     workspace: &str,
@@ -2798,6 +2807,11 @@ async fn provider_policy_context_with_catalog(
             );
             continue;
         };
+
+        if !super::provider::provider_profile_endpoints_are_active(&profile, &provider) {
+            endpointless_provider_names.insert(name.clone());
+            continue;
+        }
 
         let rule_name = openshell_policy::provider_rule_name(provider.object_name());
         let mut rule = profile.network_policy_rule(&rule_name);
@@ -8572,6 +8586,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn provider_policy_layers_skip_public_vendor_endpoints_for_alternate_upstreams() {
+        let store = test_store().await;
+        let mut openai = test_provider("alternate-openai", "openai");
+        openai.config.insert(
+            "OPENAI_BASE_URL".to_string(),
+            "https://api.example.com/v1".to_string(),
+        );
+        let mut anthropic = test_provider("alternate-anthropic", "anthropic");
+        anthropic.config.insert(
+            "ANTHROPIC_BASE_URL".to_string(),
+            "https://api.example.com/v1".to_string(),
+        );
+        store.put_message(&openai).await.unwrap();
+        store.put_message(&anthropic).await.unwrap();
+
+        let layers = profile_provider_policy_layers(
+            &store,
+            "default",
+            &[
+                "alternate-openai".to_string(),
+                "alternate-anthropic".to_string(),
+            ],
+        )
+        .await
+        .unwrap();
+
+        assert!(layers.is_empty());
+    }
+
+    #[tokio::test]
     async fn provider_policy_layers_respect_profile_workspace_scope() {
         let store = test_store().await;
 
@@ -9786,6 +9830,11 @@ mod tests {
                     id: "endpointless".to_string(),
                     display_name: "Endpointless".to_string(),
                     category: ProviderProfileCategory::Other as i32,
+                    credentials: vec![openshell_core::proto::ProviderProfileCredential {
+                        name: "cloud_token".to_string(),
+                        env_vars: vec!["CLOUD_TOKEN".to_string()],
+                        ..Default::default()
+                    }],
                     endpoints: Vec::new(),
                     ..Default::default()
                 }),
@@ -10309,6 +10358,7 @@ mod tests {
                     category: ProviderProfileCategory::Other as i32,
                     credentials: vec![ProviderProfileCredential {
                         name: "access_token".to_string(),
+                        env_vars: vec!["GITHUB_TOKEN".to_string()],
                         auth_style: "bearer".to_string(),
                         header_name: "authorization".to_string(),
                         token_grant: Some(ProviderCredentialTokenGrant {
@@ -16489,6 +16539,20 @@ mod tests {
         assert!(error.message().contains("sandbox-delete-policy"));
         let settings = load_global_settings(state.store.as_ref()).await.unwrap();
         assert!(settings.settings.contains_key(POLICY_SETTING_KEY));
+    }
+
+    #[tokio::test]
+    async fn startup_preflight_rejects_persisted_ambiguous_provider_binding() {
+        let state = test_server_state().await;
+        install_ambiguous_provider_binding(&state, "upgrade").await;
+
+        let error = validate_provider_composition_startup_preflight(&state)
+            .await
+            .expect_err("startup must reject policy that unconditional composition would activate");
+
+        assert_eq!(error.code(), Code::FailedPrecondition);
+        assert!(error.message().contains("sandbox-upgrade"));
+        assert!(error.message().contains("invalid effective policy"));
     }
 
     #[test]

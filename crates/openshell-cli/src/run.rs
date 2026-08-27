@@ -3499,24 +3499,9 @@ async fn discover_existing_provider_data(
 ) -> Result<Option<openshell_providers::DiscoveredProvider>> {
     let profile = fetch_provider_profile(client, provider_type, workspace).await?;
     let profile = ProviderTypeProfile::from_proto(&profile);
-    let mut discovered = discover_from_profile(&profile, &RealDiscoveryContext).map_err(|err| {
+    let discovered = discover_from_profile(&profile, &RealDiscoveryContext).map_err(|err| {
         miette::miette!("failed to discover existing provider data from profile: {err}")
     })?;
-
-    // Vertex AI config keys (project ID, region, base URL, publisher) are not
-    // declared in the profile's discovery.credentials list, so discover_from_profile
-    // does not scan them. Scan them directly here so --from-existing captures them.
-    if provider_type == VERTEX_AI_PROVIDER_TYPE {
-        let discovered = discovered.get_or_insert_with(Default::default);
-        for key in openshell_core::inference::VERTEX_AI_CONFIG_KEY_NAMES {
-            if let Ok(val) = std::env::var(key) {
-                let val = val.trim().to_string();
-                if !val.is_empty() {
-                    discovered.config.entry(key.to_string()).or_insert(val);
-                }
-            }
-        }
-    }
 
     Ok(discovered)
 }
