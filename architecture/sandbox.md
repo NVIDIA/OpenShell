@@ -484,8 +484,10 @@ engine with a gateway policy revision.
 - If the canonical main process exits, the supervisor reports its normalized
   exit code before shutdown. The gateway persists the result and evaluates the
   sandbox's `Never`, `OnFailure`, or `Always` restart policy. A selected restart
-  moves the sandbox to `Restarting` and recreates its compute resource after
-  bounded exponential backoff; otherwise the sandbox becomes terminal `Error`.
+  moves the sandbox to `Starting` and recreates its compute resource after
+  bounded exponential backoff; restart status fields distinguish the
+  replacement from an explicit start. Otherwise the sandbox becomes terminal
+  `Error`.
 - Compute runtimes keep their native restart mechanisms disabled. This gives
   the gateway one durable restart counter, deadline, and policy decision across
   Docker, Podman, Kubernetes, and VM drivers.

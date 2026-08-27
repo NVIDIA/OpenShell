@@ -529,8 +529,7 @@ Every sandbox moves through a defined set of phases:
 | Ready        | The sandbox is running and its supervisor control session is connected. You can connect, execute commands, sync files, and view logs.                          |
 | Stopping     | The gateway accepted a stop request and is stopping compute while retaining persistent state.                                                         |
 | Stopped      | Compute is stopped and access is unavailable. The sandbox record and driver-owned persistent workspace remain.                                       |
-| Starting     | Compute is starting. The sandbox becomes usable only after a fresh supervisor session connects.                                                       |
-| Restarting   | The main process exited and its restart policy selected a restart. OpenShell is waiting for backoff or for the new supervisor session.                 |
+| Starting     | Compute is starting for an explicit start or a policy-driven replacement. During restart backoff, inspect the restart deadline in sandbox status.       |
 | Error        | Provisioning failed, a restart failed terminally, or the main process exited without a selected restart. Check logs with `openshell logs`.              |
 | Deleting     | The sandbox is being torn down. The system releases resources and purges credentials.                                                                          |
 
@@ -544,7 +543,7 @@ temporarily while its supervisor reconnects. Wait for the phase to return to
 The gateway records the normalized main-process result in `status.exit_code`;
 signal exits use the standard `128 + signal` convention. If policy selects a
 restart, status also exposes the restart count and next restart deadline while
-the sandbox is `Restarting`. Connect and exec operations remain unavailable
+the sandbox is `Starting`. Connect and exec operations remain unavailable
 until the replacement supervisor session returns the sandbox to `Ready`.
 Use `openshell sandbox get <name>` to inspect the policy, most recent exit code,
 restart count, and next attempt time.

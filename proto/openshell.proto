@@ -950,7 +950,8 @@ enum SandboxPhase {
   SANDBOX_PHASE_STOPPING = 6;
   SANDBOX_PHASE_STOPPED = 7;
   SANDBOX_PHASE_STARTING = 8;
-  SANDBOX_PHASE_RESTARTING = 9;
+  reserved 9;
+  reserved "SANDBOX_PHASE_RESTARTING";
 }
 
 // Public platform event exposed on the sandbox watch stream.

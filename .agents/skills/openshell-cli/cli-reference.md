@@ -295,10 +295,11 @@ new shell. The name defaults to the last-used sandbox.
 `--editor vscode|cursor` launches a supported remote editor instead of
 attaching to the canonical main process.
 
-With `on-failure` or `always`, a main-process exit moves the sandbox through
-`Restarting` while the gateway applies exponential backoff and replaces the
-runtime. A successful replacement returns to `Ready` with a new main-process
-instance and empty PTY history.
+A nonzero main-process exit with `on-failure`, or any exit with `always`, moves
+the sandbox through `Starting` while the gateway applies exponential backoff
+and replaces the runtime. `sandbox get` shows the restart count, prior exit
+code, and next attempt. A successful replacement returns to `Ready` with a new
+main-process instance and empty PTY history.
 
 ### `openshell sandbox upload <name> <path> [dest]`
 

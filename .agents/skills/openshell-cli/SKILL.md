@@ -286,11 +286,12 @@ VS Code Remote-SSH with:
 openshell sandbox ssh-config my-sandbox >> ~/.ssh/config
 ```
 
-When the main process exits under `on-failure` or `always`, the sandbox enters
-`Restarting` while the gateway applies exponential backoff and recreates the
-compute resource. Connect and exec commands are unavailable until the new
-supervisor session makes it `Ready`. An explicit `sandbox stop` cancels a
-pending restart.
+A nonzero main-process exit under `on-failure`, or any exit under `always`,
+moves the sandbox to `Starting` while the gateway applies exponential backoff
+and recreates the compute resource. Inspect `sandbox get` for the restart
+count, prior exit code, and next attempt. Connect and exec commands are
+unavailable until the new supervisor session makes it `Ready`. An explicit
+`sandbox stop` cancels a pending restart.
 
 ### Upload and download files
 

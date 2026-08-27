@@ -469,11 +469,11 @@ fi
     .expect("create sandbox with OnFailure restart policy");
 
     let deadline = Instant::now() + SANDBOX_RESTART_TIMEOUT;
-    let mut observed_restarting = false;
+    let mut observed_replacement_starting = false;
     let final_details = loop {
         let details = sandbox_details(&sandbox.name).await;
-        observed_restarting |= details.contains("Phase: Restarting");
-        if observed_restarting
+        observed_replacement_starting |= details.contains("Phase: Starting");
+        if observed_replacement_starting
             && details.contains("Phase: Ready")
             && details.contains("Restart count: 1")
         {

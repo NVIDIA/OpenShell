@@ -146,7 +146,6 @@ pub(super) async fn fetch_and_authorize_sandbox(
 fn require_ready_sandbox(sandbox: &Sandbox) -> Result<(), Status> {
     match SandboxPhase::try_from(sandbox.phase()).ok() {
         Some(SandboxPhase::Ready) => Ok(()),
-        Some(SandboxPhase::Restarting) => Err(Status::failed_precondition("sandbox is restarting")),
         _ => Err(Status::failed_precondition("sandbox is not ready")),
     }
 }

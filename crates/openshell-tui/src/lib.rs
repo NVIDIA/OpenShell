@@ -21,8 +21,8 @@ use miette::{IntoDiagnostic, Result};
 use openshell_bootstrap::list_gateways_with_source;
 use openshell_core::auth::EdgeAuthInterceptor;
 use openshell_core::metadata::{ObjectId, ObjectLabels, ObjectName, ObjectWorkspace};
-use openshell_core::proto::SandboxPhase;
 use openshell_core::proto::open_shell_client::OpenShellClient;
+use openshell_core::proto::{SandboxPhase, SandboxRestartPolicy};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use tokio::sync::mpsc;
@@ -2539,6 +2539,45 @@ async fn refresh_sandboxes(app: &mut App) {
                         .to_string()
                 })
                 .collect();
+            app.sandbox_restart_policies = sandboxes
+                .iter()
+                .map(|sandbox| {
+                    sandbox.spec.as_ref().map_or("never", |spec| {
+                        match SandboxRestartPolicy::try_from(spec.restart_policy)
+                            .unwrap_or(SandboxRestartPolicy::Never)
+                        {
+                            SandboxRestartPolicy::OnFailure => "on-failure",
+                            SandboxRestartPolicy::Always => "always",
+                            SandboxRestartPolicy::Unspecified | SandboxRestartPolicy::Never => {
+                                "never"
+                            }
+                        }
+                    })
+                })
+                .map(str::to_string)
+                .collect();
+            app.sandbox_restart_counts = sandboxes
+                .iter()
+                .map(|sandbox| {
+                    sandbox
+                        .status
+                        .as_ref()
+                        .map_or(0, |status| status.restart_count)
+                })
+                .collect();
+            app.sandbox_exit_codes = sandboxes
+                .iter()
+                .map(|sandbox| sandbox.status.as_ref().and_then(|status| status.exit_code))
+                .collect();
+            app.sandbox_next_restart_at = sandboxes
+                .iter()
+                .map(|sandbox| {
+                    sandbox.status.as_ref().map_or_else(
+                        || "-".to_string(),
+                        |status| format_timestamp(status.next_restart_at_ms),
+                    )
+                })
+                .collect();
             app.sandbox_ages = sandboxes
                 .iter()
                 .map(|s| {
@@ -2705,7 +2744,6 @@ fn phase_label(phase: i32) -> String {
         x if x == SandboxPhase::Stopping as i32 => "Stopping",
         x if x == SandboxPhase::Stopped as i32 => "Stopped",
         x if x == SandboxPhase::Starting as i32 => "Starting",
-        x if x == SandboxPhase::Restarting as i32 => "Restarting",
         _ => "Unknown",
     }
     .to_string()
@@ -2767,7 +2805,6 @@ mod phase_label_tests {
         assert_eq!(phase_label(SandboxPhase::Stopping as i32), "Stopping");
         assert_eq!(phase_label(SandboxPhase::Stopped as i32), "Stopped");
         assert_eq!(phase_label(SandboxPhase::Starting as i32), "Starting");
-        assert_eq!(phase_label(SandboxPhase::Restarting as i32), "Restarting");
     }
 }
 
