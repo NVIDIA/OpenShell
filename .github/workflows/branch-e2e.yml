@@ -428,6 +428,9 @@ jobs:
     if: always() && needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_core_e2e == 'true'
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: ./.github/actions/check-job-results
         with:
           results: ${{ toJSON(needs) }}
@@ -438,6 +441,9 @@ jobs:
     if: always() && needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_gpu_e2e == 'true'
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: ./.github/actions/check-job-results
         with:
           results: ${{ toJSON(needs) }}
@@ -448,6 +454,9 @@ jobs:
     if: always() && needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_kubernetes_ha_e2e == 'true'
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: ./.github/actions/check-job-results
         with:
           results: ${{ toJSON(needs) }}
@@ -458,6 +467,9 @@ jobs:
     if: always() && needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_kubernetes_credential_drivers_e2e == 'true'
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: ./.github/actions/check-job-results
         with:
           results: ${{ toJSON(needs) }}
