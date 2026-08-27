@@ -225,13 +225,14 @@ mod tests {
 
     #[test]
     fn accepts_supported_endpoint_forms() {
-        for endpoint in [
-            "http://127.0.0.1:50051",
-            "https://middleware.example:443",
-            "unix:///run/openshell/middleware.sock",
-        ] {
+        for endpoint in ["http://127.0.0.1:50051", "https://middleware.example:443"] {
             validate_config(&ExtensionChannelConfig::new(endpoint)).unwrap();
         }
+        #[cfg(unix)]
+        validate_config(&ExtensionChannelConfig::new(
+            "unix:///run/openshell/middleware.sock",
+        ))
+        .unwrap();
     }
 
     #[test]

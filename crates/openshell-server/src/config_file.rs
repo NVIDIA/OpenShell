@@ -714,7 +714,7 @@ allow_unauthenticated_users = true
 [[openshell.supervisor.middleware]]
 name = "local-guard"
 grpc_endpoint = "https://127.0.0.1:50051"
-tls_ca_cert_path = "CA_PATH"
+tls_ca_cert_path = 'CA_PATH'
 audience = "urn:openshell:middleware:local-guard"
 max_payload_bytes = 262144
 timeout = "2s"

@@ -1046,7 +1046,10 @@ mod lifecycle_tests {
         // Positive proof: the in-policy write materializes the host artifact.
         let host_path = std::path::Path::new(tmp.path()).join("hello.txt");
         let mut found = false;
-        for _ in 0..100 {
+        // PowerShell startup can be slow on a cold or heavily loaded Windows
+        // runner. Wait long enough to distinguish startup latency from a child
+        // that never executed.
+        for _ in 0..400 {
             if host_path.exists() {
                 found = true;
                 break;
