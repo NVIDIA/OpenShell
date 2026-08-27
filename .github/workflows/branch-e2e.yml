@@ -86,6 +86,7 @@ jobs:
     with:
       component: gateway
       image-tag: ${{ github.sha }}
+      auditable: true
 
   build-supervisor:
     needs: [pr_metadata]
@@ -97,6 +98,7 @@ jobs:
     with:
       component: supervisor
       image-tag: ${{ github.sha }}
+      auditable: true
 
   build-cli:
     needs: [pr_metadata]

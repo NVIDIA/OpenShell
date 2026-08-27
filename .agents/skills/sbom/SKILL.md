@@ -13,12 +13,27 @@ The OpenShell SBOM tooling produces source-tree CycloneDX JSON SBOMs using Syft,
 
 SBOMs are **release artifacts only** -- they are generated on demand and not committed to the repository. Output lands in `deploy/sbom/output/` (gitignored).
 
-Release Dev and Release Tag image builds separately embed cargo-auditable metadata in the staged gateway and supervisor binaries. This metadata describes the binary's Rust dependency graph and lets Syft discover Cargo packages from the binary itself. It is not a complete image SBOM and is not an OCI SBOM attestation; publishing such an attestation remains separate work.
+Pushed gateway and supervisor images carry an SPDX SBOM and minimal SLSA provenance as OCI attestations. Branch E2E, Release Dev, and Release Tag image binaries embed cargo-auditable metadata, so their image SBOMs include linked Rust crates.
 
 ## Prerequisites
 
 - `mise install` has been run (installs Syft and other tools)
 - The repository is checked out at the root
+
+## Inspecting an Image SBOM
+
+BuildKit uses its default Syft scanner and attaches one SPDX document per platform. Read one without pulling the image:
+
+```bash
+docker buildx imagetools inspect ghcr.io/nvidia/openshell/gateway:latest \
+  --format '{{ json (index .SBOM "linux/amd64").SPDX }}'
+```
+
+Validate the final attestation, requiring a Cargo package for an auditable image:
+
+```bash
+tasks/scripts/verify-image-sbom.sh ghcr.io/nvidia/openshell/gateway:latest --require-cargo
+```
 
 ## Inspecting an Auditable Image Binary
 

@@ -63,6 +63,11 @@ The root [`flake.nix`](../../flake.nix) exposes this directory as the `test-gues
 | Fedora 44 | No | Yes | Yes | `.rpm` |
 | Rocky Linux 9 | Yes | Yes | Yes | `.rpm` |
 
+The `snapd` configuration is available for Ubuntu and prepares snapd for
+local Snap lifecycle experiments. It does not install Docker, because the Snap
+gateway reproduction uses the Docker **Snap** and its `docker:docker-daemon`
+interface rather than the host-package Docker configuration.
+
 The Ubuntu 24.04 Podman configuration is available for runtime and packaging
 checks, but its Podman 4 release does not provide the `pasta` rootless network
 helper required by OpenShell sandbox callbacks. OpenShell Podman E2E runs use
@@ -121,9 +126,11 @@ nix run .#test-guest -- \
 
 Configurations are Ansible playbooks stored under `nix/test-guest/configuration/`. Ansible runs on the host using the VM's ephemeral SSH key and loopback port. The guest does not install Ansible.
 
-Configurations run in the order provided on the command line. OpenShell packages and copied binaries are installed after all configurations succeed.
+Configurations run in the order provided on the command line. OpenShell packages and copied files are installed after all configurations succeed.
 
-`--install` packages and `--copy` executables are applied by a dedicated per-run Ansible playbook. They are not stored in prepared VM cache entries.
+`--install` packages and `--copy` files are applied by a dedicated per-run
+Ansible playbook. `--copy` preserves each source file's ordinary permission
+bits. They are not stored in prepared VM cache entries.
 
 ## Prepared VM cache
 
@@ -212,9 +219,10 @@ For an x86_64 Linux guest, supply x86_64 binaries and use `package:deb:amd64`. T
 
 `--install` is repeatable. Debian packages are accepted by Ubuntu; RPM packages are accepted by CentOS, Fedora, and Rocky Linux. This prototype can install an existing RPM but does not build one.
 
-## Copy binaries directly
+## Copy files directly
 
-Use `--copy SOURCE:DEST` to install an executable without creating a package:
+Use `--copy SOURCE:DEST` to copy a regular file without creating a package. The
+guest file preserves the source's ordinary permission bits:
 
 ```shell
 nix run .#test-guest -- \
@@ -222,6 +230,29 @@ nix run .#test-guest -- \
   --copy ./openshell:/usr/local/bin/openshell \
   -- openshell --version
 ```
+
+## Reproduce Snap gateway startup
+
+The gateway Snap must be native to the guest architecture. Copy an existing
+Snap artifact and the reproduction script into a prepared Ubuntu guest, then
+run the script as root. It follows the Release Canary ordering exactly: install
+the Snap, connect Docker/log/system interfaces, and immediately query the
+gateway. On each failure it prints snapd and gateway journals.
+
+```shell
+nix run .#test-guest -- \
+  --distro ubuntu \
+  --with snapd \
+  --keep \
+  --copy ./openshell_*.snap:/tmp/openshell.snap \
+  --copy ./nix/test-guest/scripts/snap-gateway-repro.sh:/usr/local/bin/snap-gateway-repro \
+  -- sudo /usr/local/bin/snap-gateway-repro /tmp/openshell.snap 10 30
+```
+
+`--keep` retains the overlay and serial log when diagnosing a failure. The
+runner prints their location after shutdown. The final `30` accepts automatic
+recovery for up to 30 seconds; omit it to require the canary's immediate check.
+
 
 The destination must be an absolute guest path. Copied files are installed with mode `0755`.
 
@@ -231,7 +262,8 @@ The destination must be an absolute guest path. Copied files are installed with 
 --distro NAME       Base distro: ubuntu, centos, fedora, or rocky
 --with NAME         Apply docker, podman, or selinux; repeatable
 --install PATH      Install a .deb or .rpm package; repeatable
---copy SRC:DEST     Copy an executable into the guest; repeatable
+--copy SRC:DEST     Copy a regular file into the guest, preserving its host mode;
+                    repeatable
 --ssh-port PORT     Use a specific loopback SSH forwarding port
 --forward-port HOST_PORT:GUEST_PORT
                     Forward a loopback host port to a guest port; repeatable

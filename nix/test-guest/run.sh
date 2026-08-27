@@ -13,9 +13,10 @@ Usage:
 
 Options:
   --distro NAME       Base distro: ubuntu, centos, fedora, or rocky
-  --with NAME         Apply a configuration; repeatable (docker, podman, selinux)
+  --with NAME         Apply a configuration; repeatable (docker, podman, selinux, snapd)
   --install PATH      Install a .deb or .rpm package; repeatable
-  --copy SRC:DEST     Copy an executable to an absolute guest path; repeatable
+  --copy SRC:DEST     Copy a regular file to an absolute guest path, preserving
+                      its host mode; repeatable
   --ssh-port PORT     Use a specific loopback SSH forwarding port
   --forward-port HOST_PORT:GUEST_PORT
                       Forward a loopback host port to a guest port; repeatable
@@ -41,6 +42,26 @@ require_value() {
 		echo "$1 requires a value" >&2
 		exit 2
 	fi
+}
+
+preserved_file_mode() {
+	local source_path=$1
+	local source_mode
+
+	if [ "$(uname -s)" = Darwin ]; then
+		if ! source_mode=$(stat -f '%Lp' "${source_path}"); then
+			echo "could not determine mode for --copy source: ${source_path}" >&2
+			return 1
+		fi
+	elif ! source_mode=$(stat -c '%a' "${source_path}"); then
+		echo "could not determine mode for --copy source: ${source_path}" >&2
+		return 1
+	fi
+	if [[ ! ${source_mode} =~ ^[0-7]{3,4}$ ]]; then
+		echo "could not determine mode for --copy source: ${source_path}" >&2
+		return 1
+	fi
+	printf '%03o\n' "$((8#${source_mode} & 8#777))"
 }
 
 distro=
@@ -618,13 +639,14 @@ if [ "${#packages[@]}" -gt 0 ] || [ "${#copies[@]}" -gt 0 ]; then
 	for copy_spec in "${copies[@]}"; do
 		source_path=${copy_spec%%:*}
 		destination=${copy_spec#*:}
+		mode=$(preserved_file_mode "${source_path}") || exit 2
 		remote_path=${artifact_staging_dir}/copy-${artifact_index}
 		echo "==> Copying artifact: ${destination}"
 		scp -q "${scp_args[@]}" \
 			"${source_path}" "openshell@127.0.0.1:${remote_path}"
 		printf -v install_command \
-			'sudo install -D -m 0755 -- %q %q' \
-			"${remote_path}" "${destination}"
+			'sudo install -D -m %q -- %q %q' \
+			"${mode}" "${remote_path}" "${destination}"
 		ssh "${ssh_args[@]}" openshell@127.0.0.1 "${install_command}"
 		artifact_index=$((artifact_index + 1))
 	done

@@ -26,6 +26,41 @@ The `OpenShell / E2E` and `OpenShell / GPU E2E` required statuses are evaluated 
 
 The GitHub ruleset should require the `OpenShell / ...` statuses published by `Required CI Gates`, not the push-triggered workflow jobs directly.
 
+## Informational security reports
+
+Security analysis that does not need NVIDIA infrastructure runs directly on
+GitHub-hosted runners. These workflows receive no secrets and run on fork pull
+requests without waiting for copy-pr-bot. Scanner jobs request
+`security-events: write` to publish SARIF to Code Scanning. GitHub permits
+Code Scanning uploads from `pull_request` runs even when fork and Dependabot
+contexts receive a read-only `GITHUB_TOKEN`, so each scanner uploads results
+directly and also retains report artifacts:
+
+- `Workflow Security Reports` runs Actionlint and Zizmor. Actionlint reports
+  workflow syntax and expression findings. Zizmor reports only High severity,
+  its maximum level. Nix provides both scanners. They publish SARIF to Code
+  Scanning and retain report artifacts.
+- `Dependency Review` compares the base and head dependency graphs and reports
+  newly introduced vulnerabilities with a High-or-higher policy. It runs in
+  warn-only mode. A preflight turns an unavailable GitHub Dependency Graph into
+  a warning, so the workflow remains neutral until the repository feature is
+  available.
+- `CodeQL` analyzes product Rust code, examples, and the Go, Python, and
+  TypeScript SDKs. E2E test code is excluded. Results are uploaded to Code
+  Scanning and always retained as workflow artifacts.
+
+Findings do not fail these workflows. Tool startup, configuration, build, and
+analysis failures still fail so a broken scanner cannot appear healthy. These
+workflows also run on merge groups, but their checks are not required statuses
+and do not gate merges.
+
+Run the workflow-definition scanners locally with:
+
+```shell
+nix develop --command actionlint -shellcheck= -pyflakes=
+nix develop --command zizmor --offline --persona=regular --min-severity=high --no-exit-codes .
+```
+
 ## Commit signing
 
 copy-pr-bot decides whether to mirror a PR automatically based on whether the author is trusted. For org members and collaborators, "trusted" means **all commits in the PR are cryptographically signed**. Unsigned commits, even from an org member, force the bot to wait for a maintainer's `/ok to test <SHA>`.
@@ -138,10 +173,14 @@ The bot's full administrator documentation is internal to NVIDIA. The only comma
 | `.github/workflows/branch-checks.yml` | Required non-E2E checks. Triggers on `push: pull-request/[0-9]+` for PR mirrors and `merge_group` for queued merges. |
 | `.github/workflows/branch-e2e.yml` | Standard, GPU, Kubernetes HA, and Kubernetes credential-driver E2E. PR mirror pushes use `test:e2e`, `test:e2e-gpu`, and `test:e2e-kubernetes` labels; merge groups run core and GPU E2E. |
 | `.github/workflows/helm-lint.yml` | Helm chart validation. PR mirror pushes skip lint jobs unless Helm inputs changed; merge groups always validate Helm because they represent the final integration state. |
+| `.github/actions/setup-nix/action.yml` | Installs Nix and configures the OpenShell Cachix cache, using read-only cache access when no authentication token is available. |
 | `.github/actions/pr-gate/action.yml` | Composite action that resolves PR metadata and verifies the required label is set for PR mirror pushes. Non-push events are allowed through. |
 | `.github/actions/pr-merge-base/action.yml` | Composite action that resolves and fetches the merge-base commit for `pull-request/<N>` push workflows. |
 | `.github/workflows/required-ci-gates.yml` | Posts required PR-head and merge-group statuses for gated CI workflows. This is what branch protection and merge queue should require. |
 | `.github/workflows/e2e-label-help.yml` | When a `test:e2e*` label is applied, posts a PR comment telling the maintainer the next manual step (re-run an existing workflow run, or `/ok to test <SHA>` to refresh the mirror). |
+| `.github/workflows/workflow-security.yml` | Runs informational Actionlint and High-severity Zizmor reports on GitHub-hosted runners. |
+| `.github/workflows/dependency-review.yml` | Reports dependency changes when GitHub Dependency Graph is available; otherwise publishes a neutral warning. |
+| `.github/workflows/codeql.yml` | Runs informational CodeQL analysis for Rust and the Go, Python, and TypeScript SDKs and retains SARIF artifacts. |
 
 ## Release workflows
 
@@ -163,3 +202,6 @@ Require these statuses in the branch ruleset for PR and merge-queue CI:
 - `OpenShell / Helm Lint`
 
 Do not require the underlying workflow jobs directly. PR workflow jobs only appear after copy-pr-bot mirrors trusted code, and merge-group workflow jobs run on temporary queue branches. The stable `OpenShell / ...` contexts prove the expected workflow completed for the commit that GitHub is about to merge.
+
+Do not add the informational Actionlint, Zizmor, Dependency Review, or CodeQL
+jobs to the required status list while they remain in observation mode.
