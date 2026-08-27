@@ -205,7 +205,7 @@ jobs:
             --gateway-bin "$OPENSHELL_GATEWAY_BIN" \
             --sandbox-bin "$OPENSHELL_SANDBOX_BIN" \
             --gateway-config e2e/configs/gateway/podman.toml \
-            --features e2e-podman
+            --suite smoke
 
   e2e-vm:
     name: E2E (rust-vm-${{ matrix.suite }})
