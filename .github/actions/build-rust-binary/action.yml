@@ -1,0 +1,82 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: Build Rust Binary
+description: Build, verify, package, and upload an auditable Rust binary
+
+inputs:
+  binary:
+    description: Cargo binary name
+    required: true
+  triple:
+    description: Rust target triple
+    required: true
+  dev-shell:
+    description: Nix development shell used to build the binary
+    required: true
+  cargo-version:
+    description: Cargo package version embedded in the binary
+    required: true
+  interpreter:
+    description: ELF interpreter for a dynamically linked Linux binary
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    - name: Cache Rust artifacts
+      uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      with:
+        shared-key: binaries-${{ inputs.binary }}-${{ inputs.triple }}
+        cache-on-failure: "true"
+        cache-workspace-crates: "true"
+        cache-bin: "false"
+        cmd-format: nix develop ${{ inputs.dev-shell }} -c {0}
+
+    - name: Set version
+      shell: nix develop ${{ inputs.dev-shell }} -c bash -euo pipefail {0}
+      run: sed -i 's/^version = "0\.0\.0"$/version = "${{ inputs.cargo-version }}"/' Cargo.toml
+
+    - name: Build ${{ inputs.binary }}
+      shell: nix develop ${{ inputs.dev-shell }} -c bash -euo pipefail {0}
+      run: GIT_DIR=/nonexistent cargo auditable build --release --bin "${{ inputs.binary }}"
+
+    - name: Verify ${{ inputs.binary }}
+      shell: nix develop ${{ inputs.dev-shell }} -c bash -euo pipefail {0}
+      run: |
+        # Confirm the binary runs and reports the expected name.
+        target/release/${{ inputs.binary }} --version | grep -q '^${{ inputs.binary }} '
+        # Confirm Syft can decode the embedded cargo-auditable metadata.
+        SYFT_CHECK_FOR_APP_UPDATE=false syft file:target/release/${{ inputs.binary }} -o cyclonedx-json | grep 'pkg:cargo/' > /dev/null
+
+    - name: Verify static linkage
+      if: endsWith(inputs.triple, '-linux-musl')
+      shell: nix develop ${{ inputs.dev-shell }} -c bash -euo pipefail {0}
+      run: tasks/scripts/verify-static-binary.sh target/release/${{ inputs.binary }}
+
+    - name: Normalize Linux dynamic binary
+      if: endsWith(inputs.triple, '-linux-gnu')
+      shell: nix develop ${{ inputs.dev-shell }} -c bash -euo pipefail {0}
+      run: |
+        binary=target/release/${{ inputs.binary }}
+        # Remove Nix store paths so the binary can run on other distributions.
+        patchelf --set-interpreter "${{ inputs.interpreter }}" --remove-rpath "$binary"
+        # Z3 must be embedded instead of loaded from the target system.
+        test -z "$(patchelf --print-needed "$binary" | grep '^libz3')"
+        # Reject symbols introduced after glibc 2.28.
+        tasks/scripts/verify-glibc-symbols.sh 2.28 "$binary"
+
+    - name: Package ${{ inputs.binary }}
+      shell: nix develop ${{ inputs.dev-shell }} -c bash -euo pipefail {0}
+      run: |
+        install -Dm0755 target/release/${{ inputs.binary }} artifacts/${{ inputs.binary }}
+        tar -czf artifacts/${{ inputs.binary }}-${{ inputs.triple }}.tar.gz -C artifacts ${{ inputs.binary }}
+
+    - name: Upload ${{ inputs.binary }}
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+      with:
+        name: ${{ inputs.binary }}-${{ inputs.triple }}
+        path: artifacts/*.tar.gz
+        retention-days: 5
+        if-no-files-found: error

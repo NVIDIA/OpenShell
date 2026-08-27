@@ -38,7 +38,7 @@ jobs:
           cargo="$(python3 tasks/scripts/release.py get-version --cargo)"
           echo "cargo=$cargo" >> "$GITHUB_OUTPUT"
 
-  binary:
+  rust-binary:
     name: ${{ matrix.binary }} (${{ matrix.triple }})
     needs: version
     strategy:
@@ -56,6 +56,14 @@ jobs:
             triple: aarch64-apple-darwin
             runner: macos-15-xlarge
             dev_shell: .#devShells.aarch64-darwin.default
+          - binary: openshell-sandbox
+            triple: x86_64-unknown-linux-musl
+            runner: linux-amd64-cpu8
+            dev_shell: .#devShells.x86_64-linux.musl
+          - binary: openshell-sandbox
+            triple: aarch64-unknown-linux-musl
+            runner: linux-arm64-cpu8
+            dev_shell: .#devShells.aarch64-linux.musl
           - binary: openshell-gateway
             triple: x86_64-unknown-linux-gnu
             runner: linux-amd64-cpu8
@@ -72,6 +80,46 @@ jobs:
             dev_shell: .#devShells.aarch64-darwin.default
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs['checkout-ref'] || github.sha }}
+
+      - uses: ./.github/actions/setup-nix
+        with:
+          cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
+
+      - name: Build ${{ matrix.binary }}
+        uses: ./.github/actions/build-rust-binary
+        with:
+          binary: ${{ matrix.binary }}
+          triple: ${{ matrix.triple }}
+          dev-shell: ${{ matrix.dev_shell }}
+          cargo-version: ${{ needs.version.outputs.cargo }}
+          interpreter: ${{ matrix.interpreter }}
+
+  vm-driver:
+    name: openshell-driver-vm (${{ matrix.triple }})
+    needs: [version, rust-binary]
+    strategy:
+      matrix:
+        include:
+          - arch: x86_64
+            triple: x86_64-unknown-linux-gnu
+            runner: linux-amd64-cpu8
+            dev_shell: .#devShells.x86_64-linux.glibc-2-28
+            interpreter: /lib64/ld-linux-x86-64.so.2
+          - arch: aarch64
+            triple: aarch64-unknown-linux-gnu
+            runner: linux-arm64-cpu8
+            dev_shell: .#devShells.aarch64-linux.glibc-2-28
+            interpreter: /lib/ld-linux-aarch64.so.1
+          - arch: aarch64
+            triple: aarch64-apple-darwin
+            runner: macos-15-xlarge
+            dev_shell: .#devShells.aarch64-darwin.default
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
     defaults:
       run:
         shell: nix develop ${{ matrix.dev_shell }} -c bash -euo pipefail {0}
@@ -80,62 +128,49 @@ jobs:
         with:
           ref: ${{ inputs['checkout-ref'] || github.sha }}
 
-      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
+      - uses: ./.github/actions/setup-nix
         with:
-          github_access_token: ${{ secrets.GITHUB_TOKEN }}
+          cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
 
-      - uses: cachix/cachix-action@5f2d7c5294214f71b873db4b969586b980625e71 # v17
+      - name: Download openshell-sandbox
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: openshell
-          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+          name: openshell-sandbox-${{ matrix.arch }}-unknown-linux-musl
+          path: sandbox
 
-      - name: Cache Rust artifacts
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          shared-key: binaries-${{ matrix.binary }}-${{ matrix.triple }}
-          cache-on-failure: "true"
-          cache-workspace-crates: "true"
-          cache-bin: "false"
-          cmd-format: nix develop ${{ matrix.dev_shell }} -c {0}
+      - name: Build VM runtime
+        run: nix build .#vm-runtime
 
-      - name: Set version
-        run: sed -i 's/^version = "0\.0\.0"$/version = "${{ needs.version.outputs.cargo }}"/' Cargo.toml
-
-      - name: Build ${{ matrix.binary }}
-        run: GIT_DIR=/nonexistent cargo auditable build --release --bin "${{ matrix.binary }}"
-
-      - name: Verify ${{ matrix.binary }}
+      - name: Compress Linux VM runtime
+        if: runner.os == 'Linux'
         run: |
-          # Confirm the binary runs and reports the expected name.
-          target/release/${{ matrix.binary }} --version | grep -q '^${{ matrix.binary }} '
-          # Confirm Syft can decode the embedded cargo-auditable metadata.
-          SYFT_CHECK_FOR_APP_UPDATE=false syft "file:target/release/${{ matrix.binary }}" -o cyclonedx-json | grep 'pkg:cargo/' > /dev/null
+          install -d target/vm-runtime-compressed
+          zstd -19 -T0 result/libkrun.so -o target/vm-runtime-compressed/libkrun.so.zst
+          zstd -19 -T0 result/libkrunfw.so.5 -o target/vm-runtime-compressed/libkrunfw.so.5.zst
+          zstd -19 -T0 result/gvproxy -o target/vm-runtime-compressed/gvproxy.zst
+          zstd -19 -T0 result/umoci -o target/vm-runtime-compressed/umoci.zst
 
-      - name: Verify static linkage
-        if: endsWith(matrix.triple, '-linux-musl')
-        run: tasks/scripts/verify-static-binary.sh target/release/${{ matrix.binary }}
-
-      - name: Normalize Linux dynamic binary
-        if: endsWith(matrix.triple, '-linux-gnu')
+      - name: Compress macOS VM runtime
+        if: runner.os == 'macOS'
         run: |
-          binary=target/release/${{ matrix.binary }}
-          # Remove Nix store paths so the binary can run on other distributions.
-          patchelf --set-interpreter "${{ matrix.interpreter }}" --remove-rpath "$binary"
-          # Z3 must be embedded instead of loaded from the target system.
-          test -z "$(patchelf --print-needed "$binary" | grep '^libz3')"
-          # Reject symbols introduced after glibc 2.28.
-          tasks/scripts/verify-glibc-symbols.sh 2.28 "$binary"
+          install -d target/vm-runtime-compressed
+          zstd -19 -T0 result/libkrun.dylib -o target/vm-runtime-compressed/libkrun.dylib.zst
+          zstd -19 -T0 result/libkrunfw.5.dylib -o target/vm-runtime-compressed/libkrunfw.5.dylib.zst
+          zstd -19 -T0 result/gvproxy -o target/vm-runtime-compressed/gvproxy.zst
+          zstd -19 -T0 result/umoci -o target/vm-runtime-compressed/umoci.zst
 
-      - name: Package ${{ matrix.binary }}
+      - name: Add openshell-sandbox to VM runtime
         run: |
-          mkdir -p artifacts
-          install -m0755 target/release/${{ matrix.binary }} artifacts/${{ matrix.binary }}
-          tar -czf artifacts/${{ matrix.binary }}-${{ matrix.triple }}.tar.gz -C artifacts ${{ matrix.binary }}
+          tar -xzf sandbox/openshell-sandbox-${{ matrix.arch }}-unknown-linux-musl.tar.gz -C sandbox
+          zstd -19 -T0 sandbox/openshell-sandbox -o target/vm-runtime-compressed/openshell-sandbox.zst
 
-      - name: Upload ${{ matrix.binary }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+      - name: Build openshell-driver-vm
+        uses: ./.github/actions/build-rust-binary
+        env:
+          OPENSHELL_VM_RUNTIME_COMPRESSED_DIR: ${{ github.workspace }}/target/vm-runtime-compressed
         with:
-          name: ${{ matrix.binary }}-${{ matrix.triple }}
-          path: artifacts/*.tar.gz
-          retention-days: 5
-          if-no-files-found: error
+          binary: openshell-driver-vm
+          triple: ${{ matrix.triple }}
+          dev-shell: ${{ matrix.dev_shell }}
+          cargo-version: ${{ needs.version.outputs.cargo }}
+          interpreter: ${{ matrix.interpreter }}
