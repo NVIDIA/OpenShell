@@ -8,9 +8,11 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
+use tracing_subscriber::prelude::*;
 
 use openshell_core::VERSION;
 use openshell_core::proto::compute::v1::compute_driver_server::ComputeDriverServer;
+use openshell_driver_kubernetes::otel_tracing::compute_driver_rpc_layer;
 use openshell_driver_kubernetes::{
     AppArmorProfile, ComputeDriverService, DEFAULT_GATEWAY_ID, DEFAULT_PROXY_UID,
     DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME, KubernetesComputeConfig, KubernetesComputeDriver,
@@ -36,6 +38,9 @@ struct Args {
 
     #[arg(long, env = "OPENSHELL_LOG_LEVEL", default_value = "info")]
     log_level: String,
+
+    #[arg(long, env = "OPENSHELL_OTLP_ENDPOINT")]
+    otlp_endpoint: Option<String>,
 
     #[arg(long, env = "OPENSHELL_WORKSPACE_MODE", default_value = "shared")]
     workspace_mode: WorkspaceMode,
@@ -210,11 +215,22 @@ async fn shutdown_signal() {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&args.log_level)),
+    let (tracer_provider, setup_error) =
+        openshell_driver_kubernetes::otel_tracing::provider_for(args.otlp_endpoint.as_deref());
+    tracing_subscriber::registry()
+        .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&args.log_level)))
+        .with(tracing_subscriber::fmt::layer())
+        .with(
+            tracer_provider
+                .as_ref()
+                .map(openshell_driver_kubernetes::otel_tracing::layer),
         )
         .init();
+    if let Some(error) = setup_error {
+        tracing::error!(%error, "OTLP exporting could not be started");
+    } else if let Some(endpoint) = &args.otlp_endpoint {
+        info!(endpoint, "OTLP exporting enabled");
+    }
 
     let managed_ssh_gateway_pod_selector = args
         .managed_ssh_gateway_pod_selector
@@ -296,13 +312,14 @@ async fn main() -> Result<()> {
         shutdown_signal().await;
         let _ = shutdown_tx.send(true);
     };
-    if let Some(socket_path) = args.bind_socket {
+    let result = if let Some(socket_path) = args.bind_socket {
         let listener = openshell_core::external_driver_socket::bind_private(&socket_path)
             .map_err(|err| miette::miette!("{err}"))?;
         let _cleanup =
             openshell_core::external_driver_socket::SocketCleanup::new(socket_path.clone());
         info!(socket = %socket_path.display(), "Starting Kubernetes compute driver");
         tonic::transport::Server::builder()
+            .layer(compute_driver_rpc_layer())
             .add_service(service)
             .serve_with_incoming_shutdown(
                 openshell_core::external_driver_socket::SameUidUnixIncoming::new(listener),
@@ -313,9 +330,36 @@ async fn main() -> Result<()> {
     } else {
         info!(address = %args.bind_address, "Starting Kubernetes compute driver");
         tonic::transport::Server::builder()
+            .layer(compute_driver_rpc_layer())
             .add_service(service)
             .serve_with_shutdown(args.bind_address, shutdown)
             .await
             .into_diagnostic()
+    };
+    if let Some(provider) = &tracer_provider
+        && let Err(error) = provider.shutdown()
+    {
+        tracing::warn!(%error, "OTLP tracer provider shutdown failed");
+    }
+    result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn accepts_gateway_otlp_endpoint() {
+        let args = Args::try_parse_from([
+            "openshell-driver-kubernetes",
+            "--otlp-endpoint",
+            "http://collector.example:4317",
+        ])
+        .expect("OTLP endpoint should parse");
+
+        assert_eq!(
+            args.otlp_endpoint.as_deref(),
+            Some("http://collector.example:4317")
+        );
     }
 }

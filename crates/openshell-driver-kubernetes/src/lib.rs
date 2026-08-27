@@ -4,6 +4,7 @@
 pub mod config;
 pub mod driver;
 pub mod grpc;
+pub mod otel_tracing;
 
 pub use config::{
     AppArmorProfile, DEFAULT_GATEWAY_ID, DEFAULT_PROXY_UID, DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME,

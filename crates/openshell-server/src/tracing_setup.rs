@@ -41,6 +41,8 @@ enum InProcessDriverTracing {
     #[cfg(feature = "in-tree-compute-drivers")]
     Docker,
     #[cfg(feature = "in-tree-compute-drivers")]
+    Kubernetes,
+    #[cfg(feature = "in-tree-compute-drivers")]
     Podman,
 }
 
@@ -49,6 +51,7 @@ impl InProcessDriverTracing {
     fn target_prefix(self) -> &'static str {
         match self {
             Self::Docker => openshell_driver_docker::otel_tracing::IN_PROCESS_TARGET_PREFIX,
+            Self::Kubernetes => openshell_driver_kubernetes::otel_tracing::IN_PROCESS_TARGET_PREFIX,
             Self::Podman => openshell_driver_podman::otel_tracing::IN_PROCESS_TARGET_PREFIX,
         }
     }
@@ -62,6 +65,9 @@ fn in_process_driver_tracing(driver: &ConfiguredComputeDriver) -> Option<InProce
         }
         ConfiguredComputeDriver::Registered(registration) if registration.name == "podman" => {
             Some(InProcessDriverTracing::Podman)
+        }
+        ConfiguredComputeDriver::Registered(registration) if registration.name == "kubernetes" => {
+            Some(InProcessDriverTracing::Kubernetes)
         }
         _ => None,
     }
@@ -93,6 +99,9 @@ fn in_process_driver_provider(
         Some(InProcessDriverTracing::Docker) => {
             openshell_driver_docker::otel_tracing::provider_for(endpoint)
         }
+        Some(InProcessDriverTracing::Kubernetes) => {
+            openshell_driver_kubernetes::otel_tracing::provider_for(endpoint)
+        }
         Some(InProcessDriverTracing::Podman) => {
             openshell_driver_podman::otel_tracing::provider_for(endpoint)
         }
@@ -119,6 +128,9 @@ where
     provider.as_ref().map(|provider| match driver {
         Some(InProcessDriverTracing::Docker) => {
             openshell_driver_docker::otel_tracing::in_process_layer(provider)
+        }
+        Some(InProcessDriverTracing::Kubernetes) => {
+            openshell_driver_kubernetes::otel_tracing::in_process_layer(provider)
         }
         Some(InProcessDriverTracing::Podman) => {
             openshell_driver_podman::otel_tracing::in_process_layer(provider)
@@ -185,7 +197,7 @@ mod tests {
 
     #[cfg(all(not(target_os = "windows"), feature = "in-tree-compute-drivers"))]
     #[test]
-    fn in_process_driver_tracing_selects_docker_and_podman() {
+    fn in_process_driver_tracing_selects_registered_compute_drivers() {
         let registry = crate::install_default_compute_drivers();
         let registered = |name| {
             ConfiguredComputeDriver::Registered(
@@ -203,7 +215,10 @@ mod tests {
             in_process_driver_tracing(&registered("docker")),
             Some(InProcessDriverTracing::Docker)
         );
-        assert_eq!(in_process_driver_tracing(&registered("kubernetes")), None);
+        assert_eq!(
+            in_process_driver_tracing(&registered("kubernetes")),
+            Some(InProcessDriverTracing::Kubernetes)
+        );
         assert_eq!(
             in_process_driver_tracing(&ConfiguredComputeDriver::Remote {
                 name: "custom".to_string(),

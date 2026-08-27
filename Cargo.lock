@@ -3974,15 +3974,22 @@ dependencies = [
 name = "openshell-driver-kubernetes"
 version = "0.0.0"
 dependencies = [
+ "bytes",
  "clap",
  "futures",
+ "http 1.4.0",
+ "http-body-util",
  "k8s-openapi",
  "kube",
  "kube-runtime",
  "miette",
  "notify",
  "openshell-core",
+ "openshell-otel",
+ "openshell-otel-test-support",
  "openshell-policy",
+ "opentelemetry",
+ "opentelemetry_sdk",
  "prost",
  "prost-types",
  "serde",
@@ -3993,6 +4000,7 @@ dependencies = [
  "tokio-stream",
  "toml",
  "tonic",
+ "tower 0.5.3",
  "tracing",
  "tracing-subscriber",
 ]

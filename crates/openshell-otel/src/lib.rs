@@ -6,8 +6,13 @@
 mod grpc;
 mod propagation;
 
-pub use grpc::{RecordGrpcFailure, RecordGrpcStatus};
-pub use propagation::{HeaderMapExtractor, MetadataMapInjector, TraceContextInterceptor};
+pub use grpc::{
+    ComputeDriverRpcSpan, RecordGrpcFailure, RecordGrpcStatus, compute_driver_rpc_layer,
+    compute_driver_rpc_operation,
+};
+pub use propagation::{
+    HeaderMapExtractor, MetadataMapInjector, TraceContextInterceptor, current_trace_context_carrier,
+};
 
 use opentelemetry::KeyValue;
 use opentelemetry::trace::TracerProvider as _;

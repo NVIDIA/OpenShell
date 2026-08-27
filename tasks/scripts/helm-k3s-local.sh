@@ -38,12 +38,18 @@ PRELOAD_SANDBOX_IMAGE="${HELM_K3S_PRELOAD_SANDBOX_IMAGE-${DEFAULT_SANDBOX_PRELOA
 # exercise the v1alpha1 controller release.
 AGENT_SANDBOX_VERSION="${AGENT_SANDBOX_VERSION:-v0.5.0}"
 
+# Local OTLP receiver and trace UI. The current Aspire implementation accepts
+# OTLP/gRPC directly, so the development cluster needs only one deployment.
+OBSERVABILITY_NAMESPACE="observability"
+COLLECTOR_IMAGE="${HELM_K3S_COLLECTOR_IMAGE:-mcr.microsoft.com/dotnet/aspire-dashboard:latest}"
+COLLECTOR_HEALTH_TIMEOUT="${HELM_K3S_COLLECTOR_HEALTH_TIMEOUT:-120}"
 # Host endpoint registered for the Skaffold-deployed gateway. Derive the
 # gateway name from the worktree-specific cluster name so concurrent local
 # clusters do not overwrite each other's CLI metadata.
 GATEWAY_NAMESPACE="openshell"
 GATEWAY_HOST_PORT="${HELM_K3S_GATEWAY_HOST_PORT:-8090}"
 GATEWAY_NAME="${HELM_K3S_GATEWAY_NAME:-${CLUSTER_NAME}}"
+FORWARD_PIDS=()
 
 default_kubeconfig="${ROOT}/kubeconfig"
 if [[ -n "${HELM_K3S_KUBECONFIG:-}" ]]; then
@@ -72,6 +78,10 @@ Environment:
   HELM_K3S_PRELOAD_SANDBOX_IMAGE
                                Sandbox image to docker pull and import into k3d
                                (default: ${DEFAULT_SANDBOX_PRELOAD_IMAGE}; set empty to skip)
+  HELM_K3S_COLLECTOR_IMAGE     Image used for the local OTLP receiver and trace UI
+                               (default: mcr.microsoft.com/dotnet/aspire-dashboard:latest)
+  HELM_K3S_COLLECTOR_HEALTH_TIMEOUT
+                               Seconds to wait for collector readiness (default: 120)
   HELM_K3S_GATEWAY_HOST_PORT   Host port forwarded to the gateway (default: 8090)
   HELM_K3S_GATEWAY_NAME        CLI gateway registration name
                                (default: worktree-specific k3d cluster name)
@@ -154,6 +164,116 @@ apply_base_manifests() {
   local base="https://github.com/kubernetes-sigs/agent-sandbox/releases/download/${AGENT_SANDBOX_VERSION}"
   echo "Applying agent-sandbox manifest (${AGENT_SANDBOX_VERSION})..."
   kubectl --kubeconfig="${KUBECONFIG_TARGET}" apply -f "${base}/manifest.yaml"
+}
+
+install_trace_collector() {
+  require_kubectl
+
+  echo "Installing local trace collector in namespace '${OBSERVABILITY_NAMESPACE}'..."
+  kubectl --kubeconfig="${KUBECONFIG_TARGET}" \
+    create namespace "${OBSERVABILITY_NAMESPACE}" --dry-run=client -o yaml \
+    | kubectl --kubeconfig="${KUBECONFIG_TARGET}" apply -f -
+
+  kubectl --kubeconfig="${KUBECONFIG_TARGET}" apply -f - <<EOF
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: openshell-collector
+  namespace: ${OBSERVABILITY_NAMESPACE}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: openshell-collector
+  template:
+    metadata:
+      labels:
+        app: openshell-collector
+    spec:
+      containers:
+        - name: collector
+          image: ${COLLECTOR_IMAGE}
+          env:
+            - name: ASPIRE_DASHBOARD_UNSECURED_ALLOW_ANONYMOUS
+              value: "true"
+          ports:
+            - name: otlp-grpc
+              containerPort: 18889
+            - name: dashboard
+              containerPort: 18888
+          readinessProbe:
+            httpGet:
+              path: /
+              port: dashboard
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            failureThreshold: 12
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              memory: 1Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: openshell-collector
+  namespace: ${OBSERVABILITY_NAMESPACE}
+spec:
+  selector:
+    app: openshell-collector
+  ports:
+    - name: otlp-grpc
+      port: 4317
+      targetPort: otlp-grpc
+    - name: dashboard
+      port: 18888
+      targetPort: dashboard
+EOF
+
+  kubectl --kubeconfig="${KUBECONFIG_TARGET}" \
+    rollout status deployment/openshell-collector \
+    --namespace "${OBSERVABILITY_NAMESPACE}" \
+    --timeout="${COLLECTOR_HEALTH_TIMEOUT}s"
+}
+
+configure_agent_sandbox_tracing() {
+  require_kubectl
+
+  case "${AGENT_SANDBOX_VERSION}" in
+    v0.[0-4].*)
+      echo "Agent Sandbox ${AGENT_SANDBOX_VERSION} does not support OTLP tracing; skipping controller tracing."
+      return
+      ;;
+  esac
+
+  local namespace="agent-sandbox-system"
+  local deployment="agent-sandbox-controller"
+  local controller_args
+  controller_args="$(kubectl --kubeconfig="${KUBECONFIG_TARGET}" \
+    --namespace="${namespace}" \
+    get deployment "${deployment}" \
+    -o jsonpath='{.spec.template.spec.containers[0].args}')"
+
+  if [[ "${controller_args}" != *"--enable-tracing"* ]]; then
+    kubectl --kubeconfig="${KUBECONFIG_TARGET}" \
+      --namespace="${namespace}" \
+      patch deployment "${deployment}" \
+      --type=json \
+      -p='[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--enable-tracing"}]'
+  fi
+
+  kubectl --kubeconfig="${KUBECONFIG_TARGET}" \
+    --namespace="${namespace}" \
+    set env deployment/"${deployment}" \
+    OTEL_EXPORTER_OTLP_ENDPOINT="http://openshell-collector.${OBSERVABILITY_NAMESPACE}.svc.cluster.local:4317" \
+    OTEL_EXPORTER_OTLP_INSECURE=true
+
+  kubectl --kubeconfig="${KUBECONFIG_TARGET}" \
+    --namespace="${namespace}" \
+    rollout status deployment/"${deployment}" \
+    --timeout="${COLLECTOR_HEALTH_TIMEOUT}s"
 }
 
 configure_ghcr_credentials() {
@@ -286,11 +406,15 @@ EOF
   fi
   merge_kubeconfig
   apply_base_manifests
+  install_trace_collector
+  configure_agent_sandbox_tracing
   configure_ghcr_credentials
   preload_sandbox_image
   echo "Active context: $(k3d_context_name)"
   echo "Kubeconfig: ${KUBECONFIG_TARGET}"
   echo "Envoy Gateway LoadBalancer (port 80):  http://127.0.0.1:${HOST_LB_PORT}"
+  echo "Trace collector endpoint: http://openshell-collector.${OBSERVABILITY_NAMESPACE}.svc.cluster.local:4317"
+  echo "Gateway and trace collector host access: mise run helm:k3s:forward"
 }
 
 cmd_delete() {
@@ -353,17 +477,74 @@ EOF
   echo "Registered and selected local gateway '${GATEWAY_NAME}' at ${endpoint}."
 }
 
+cleanup_forwards() {
+  local pid
+  trap - EXIT INT TERM
+  for pid in "${FORWARD_PIDS[@]}"; do
+    kill "${pid}" 2>/dev/null || true
+  done
+  for pid in "${FORWARD_PIDS[@]}"; do
+    wait "${pid}" 2>/dev/null || true
+  done
+}
+
 cmd_forward() {
   require_supported_os
   require_kubectl
 
-  echo "Forwarding gateway to http://127.0.0.1:${GATEWAY_HOST_PORT}"
-  echo "Press Ctrl-C to stop."
   kubectl \
     --kubeconfig="${KUBECONFIG_TARGET}" \
     --context="$(k3d_context_name)" \
+    --namespace="${OBSERVABILITY_NAMESPACE}" \
+    get service/openshell-collector >/dev/null
+
+  echo "Forwarding collector OTLP/gRPC to http://127.0.0.1:4317"
+  echo "Forwarding trace UI to http://127.0.0.1:18888"
+
+  trap cleanup_forwards EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+
+  if kubectl \
+    --kubeconfig="${KUBECONFIG_TARGET}" \
+    --context="$(k3d_context_name)" \
     --namespace="${GATEWAY_NAMESPACE}" \
-    port-forward service/openshell "${GATEWAY_HOST_PORT}:8080"
+    get service/openshell >/dev/null 2>&1; then
+    echo "Forwarding gateway to http://127.0.0.1:${GATEWAY_HOST_PORT}"
+    kubectl \
+      --kubeconfig="${KUBECONFIG_TARGET}" \
+      --context="$(k3d_context_name)" \
+      --namespace="${GATEWAY_NAMESPACE}" \
+      port-forward service/openshell "${GATEWAY_HOST_PORT}:8080" &
+    FORWARD_PIDS+=("$!")
+  else
+    echo "No Kubernetes gateway service found; forwarding collector ports only."
+  fi
+
+  kubectl \
+    --kubeconfig="${KUBECONFIG_TARGET}" \
+    --context="$(k3d_context_name)" \
+    --namespace="${OBSERVABILITY_NAMESPACE}" \
+    port-forward service/openshell-collector 4317:4317 18888:18888 &
+  FORWARD_PIDS+=("$!")
+
+  echo "Press Ctrl-C to stop."
+
+  local pid status
+  while true; do
+    for pid in "${FORWARD_PIDS[@]}"; do
+      if ! kill -0 "${pid}" 2>/dev/null; then
+        status=0
+        wait "${pid}" || status=$?
+        if [[ ${status} -eq 0 ]]; then
+          status=1
+        fi
+        echo "error: a port-forward process exited; stopping the remaining forwards" >&2
+        return "${status}"
+      fi
+    done
+    sleep 1
+  done
 }
 
 main() {

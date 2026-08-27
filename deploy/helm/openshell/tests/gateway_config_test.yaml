@@ -62,6 +62,32 @@ tests:
             name: OPENSHELL_TELEMETRY_ENABLED
             value: "false"
 
+  - it: renders OTLP tracing configuration when configured
+    template: templates/gateway-config.yaml
+    set:
+      server.otlp.endpoint: http://otel-collector.observability.svc:4317
+      server.otlp.serviceName: production-gateway
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.gateway\.otlp\].*?endpoint\s*=\s*"http://otel-collector\.observability\.svc:4317".*?service_name\s*=\s*"production-gateway"'
+
+  - it: omits OTLP tracing configuration by default
+    template: templates/gateway-config.yaml
+    asserts:
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: '\[openshell\.gateway\.otlp\]'
+
+  - it: treats a null OTLP map as disabled
+    template: templates/gateway-config.yaml
+    set:
+      server.otlp: null
+    asserts:
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: '\[openshell\.gateway\.otlp\]'
+
   - it: mounts the OIDC CA bundle when TLS is disabled
     template: templates/statefulset.yaml
     set:

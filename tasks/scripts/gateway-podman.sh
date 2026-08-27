@@ -207,6 +207,9 @@ compute_drivers = ["podman"]
 default_image = "${SANDBOX_IMAGE}"
 disable_tls = true
 
+[openshell.gateway.otlp]
+endpoint = "http://127.0.0.1:4317"
+
 [openshell.gateway.auth]
 allow_unauthenticated_users = true
 

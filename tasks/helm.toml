@@ -108,7 +108,7 @@ hide = true
 # should install k3d explicitly or point workflows at an existing/kind cluster.
 
 ["helm:k3s:create"]
-description = "Create a local k3s cluster with k3d and merge kubeconfig (macOS via mise; Linux requires explicit k3d install; use with helm:skaffold:dev)"
+description = "Create a local k3s cluster with agent-sandbox and an OTLP trace collector, then merge kubeconfig"
 run = "tasks/scripts/helm-k3s-local.sh create"
 
 ["helm:k3s:delete"]
@@ -131,7 +131,7 @@ run = "tasks/scripts/helm-k3s-local.sh status"
 hide = true
 
 ["helm:k3s:forward"]
-description = "Forward the local Kubernetes gateway to port 8090"
+description = "Forward collector OTLP ingest (4317), trace UI (18888), and the local gateway (8090) when deployed"
 run = "tasks/scripts/helm-k3s-local.sh forward"
 
 # Install Envoy Gateway's GatewayClass into the cluster

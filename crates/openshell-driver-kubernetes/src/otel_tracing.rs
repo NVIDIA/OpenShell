@@ -1,16 +1,16 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! OpenTelemetry trace exporting for the Podman compute driver.
+//! OpenTelemetry trace exporting for the Kubernetes compute driver.
 
 use openshell_otel::{OtlpTraceConfig, SdkTracerProvider, ServiceName, SetupError};
 pub use openshell_otel::{compute_driver_rpc_layer, compute_driver_rpc_operation};
 use tracing::Subscriber;
 use tracing_subscriber::registry::LookupSpan;
 
-const SERVICE_NAME: &str = "openshell-driver-podman";
-const INSTRUMENTATION_SCOPE: &str = "openshell-driver-podman";
-pub const IN_PROCESS_TARGET_PREFIX: &str = "openshell_driver_podman";
+const SERVICE_NAME: &str = "openshell-driver-kubernetes";
+const INSTRUMENTATION_SCOPE: &str = "openshell-driver-kubernetes";
+pub const IN_PROCESS_TARGET_PREFIX: &str = "openshell_driver_kubernetes";
 
 #[must_use]
 pub fn provider_for(endpoint: Option<&str>) -> (Option<SdkTracerProvider>, Option<SetupError>) {
@@ -60,70 +60,30 @@ mod tests {
 
     #[test]
     fn compute_driver_rpc_names_are_explicitly_mapped_and_schema_bounded() {
-        for (rpc, operation, method) in [
-            (
-                "GetCapabilities",
-                "driver.get_capabilities",
-                "get_capabilities",
+        assert_eq!(
+            super::compute_driver_rpc_operation(
+                "/openshell.compute.v1.ComputeDriver/GetCapabilities"
             ),
-            (
-                "GetGatewayListenerRequirements",
-                "driver.get_gateway_listener_requirements",
-                "get_gateway_listener_requirements",
-            ),
-            (
-                "ValidateSandboxCreate",
-                "driver.validate_sandbox_create",
-                "validate_sandbox_create",
-            ),
-            ("CreateSandbox", "driver.create_sandbox", "create_sandbox"),
-            ("GetSandbox", "driver.get_sandbox", "get_sandbox"),
-            ("ListSandboxes", "driver.list_sandboxes", "list_sandboxes"),
-            ("StopSandbox", "driver.stop_sandbox", "stop_sandbox"),
-            ("StartSandbox", "driver.start_sandbox", "start_sandbox"),
-            ("DeleteSandbox", "driver.delete_sandbox", "delete_sandbox"),
-            (
-                "WatchSandboxes",
-                "driver.watch_sandboxes",
-                "watch_sandboxes",
-            ),
-            (
-                "EnsureWorkspace",
-                "driver.ensure_workspace",
-                "ensure_workspace",
-            ),
-            (
-                "DeleteWorkspace",
-                "driver.delete_workspace",
-                "delete_workspace",
-            ),
-        ] {
-            assert_eq!(
-                super::compute_driver_rpc_operation(&format!(
-                    "/openshell.compute.v1.ComputeDriver/{rpc}"
-                )),
-                (operation, method),
-            );
-        }
+            ("driver.get_capabilities", "get_capabilities")
+        );
         assert_eq!(
             super::compute_driver_rpc_operation(
                 "/openshell.compute.v1.ComputeDriver/AttackerControlled12345"
             ),
-            ("driver.unknown", "unknown"),
+            ("driver.unknown", "unknown")
         );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn podman_driver_spans_reach_otlp_collector_with_distinct_service_name() {
+    async fn tracing_kubernetes_driver_spans_reach_otlp_collector_with_distinct_service_name() {
         let _tracing_lock = super::test_lock().await;
         let collector = OtlpTestServer::start().await;
-
         let (provider, error) = super::provider_for(Some(collector.endpoint()));
         assert!(error.is_none());
         let provider = provider.expect("provider");
         let subscriber = tracing_subscriber::registry().with(super::layer(&provider));
         tracing::subscriber::with_default(subscriber, || {
-            let span = tracing::info_span!("podman.create", sandbox.id = "sb-otlp");
+            let span = tracing::info_span!("kubernetes.create_sandbox", sandbox.id = "sb-otlp");
             drop(span.enter());
             drop(span);
         });
@@ -136,13 +96,13 @@ mod tests {
             received
                 .spans
                 .iter()
-                .any(|span| span.name == "podman.create")
+                .any(|span| span.name == "kubernetes.create_sandbox")
         );
         assert!(
             received
                 .service_names
                 .iter()
-                .any(|name| name == "openshell-driver-podman")
+                .any(|name| name == super::SERVICE_NAME)
         );
     }
 }

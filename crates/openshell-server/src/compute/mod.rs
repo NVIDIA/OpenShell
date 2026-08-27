@@ -755,7 +755,7 @@ impl ComputeRuntime {
             .await
             .map_err(|err| ComputeError::Message(err.to_string()))?;
         let operator_allowlist_arc = driver.operator_allowlist().cloned();
-        let driver: SharedComputeDriver = Arc::new(KubernetesDriverService::new(driver));
+        let driver: SharedComputeDriver = Arc::new(KubernetesDriverService::new_in_process(driver));
         let runtime = Self::from_driver(
             ComputeDriverKind::Kubernetes.as_str().to_string(),
             driver,

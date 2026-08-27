@@ -440,8 +440,12 @@ openshell gateway list
 openshell status
 ```
 
-A successful plaintext `helm:skaffold:run` registers and selects the local
-gateway; the forwarding task does not modify gateway metadata.
+The forwarding task always exposes the collector on ports `4317` and `18888`.
+It exposes the gateway on port `8090` only when the `openshell` Service exists,
+so collector-only Docker or Podman development remains valid before a Skaffold
+deployment. A successful plaintext `helm:skaffold:run` registers the local
+gateway and selects it as active; the forwarding task does not modify gateway
+metadata.
 
 If the gateway is healthy but sandbox creation fails:
 
