@@ -148,7 +148,7 @@ where
     openshell_otel::layer_excluding_target_prefix(
         provider,
         INSTRUMENTATION_SCOPE,
-        excluded_target_prefix.unwrap_or("\0"),
+        excluded_target_prefix,
     )
 }
 
