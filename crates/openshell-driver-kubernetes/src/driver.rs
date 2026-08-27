@@ -618,11 +618,7 @@ impl KubernetesComputeDriver {
             .ok_or_else(|| {
                 tonic::Status::permission_denied("authenticated sandbox pod not found")
             })?;
-        if pod.metadata.uid.as_deref() != Some(identity.pod_uid.as_str()) {
-            return Err(tonic::Status::permission_denied(
-                "sandbox credential pod UID mismatch",
-            ));
-        }
+        validate_pod_uid(&pod, &identity.pod_uid)?;
         let sandbox_id = pod_sandbox_id(&pod)?;
         let owner = sandbox_owner_reference(&pod)?;
         let sandboxes = self
@@ -635,32 +631,12 @@ impl KubernetesComputeDriver {
             warn!(sandbox = %owner.name, %error, "failed to read authenticated Sandbox resource");
             tonic::Status::internal("failed to read authenticated Sandbox resource")
         })?.ok_or_else(|| tonic::Status::permission_denied("sandbox owner not found"))?;
-        if sandbox.metadata.uid.as_deref() != Some(owner.uid.as_str())
-            || sandbox
-                .metadata
-                .labels
-                .as_ref()
-                .and_then(|labels| labels.get(LABEL_SANDBOX_ID))
-                != Some(&sandbox_id)
-        {
-            return Err(tonic::Status::permission_denied(
-                "pod identity does not match its Sandbox owner",
-            ));
-        }
+        validate_sandbox_owner_identity(owner, &sandbox_id, &sandbox)?;
         Ok(sandbox_id)
     }
 
     fn accepts_auth_namespace(&self, namespace: &str) -> bool {
-        match self.config.workspace_mode {
-            WorkspaceMode::Shared => namespace == self.config.namespace,
-            WorkspaceMode::Managed => {
-                namespace.starts_with(&managed_namespace_prefix(&self.config.gateway_id))
-            }
-            WorkspaceMode::Operator => self
-                .operator_allowlist
-                .as_ref()
-                .is_some_and(|allowlist| allowlist.contains(namespace)),
-        }
+        accepts_auth_namespace(&self.config, self.operator_allowlist.as_ref(), namespace)
     }
 
     pub fn operator_allowlist(&self) -> Option<&OperatorNamespaceAllowlist> {
@@ -2451,6 +2427,16 @@ fn pod_sandbox_id(pod: &Pod) -> Result<String, tonic::Status> {
 }
 
 #[allow(clippy::result_large_err)]
+fn validate_pod_uid(pod: &Pod, expected_uid: &str) -> Result<(), tonic::Status> {
+    if pod.metadata.uid.as_deref() == Some(expected_uid) {
+        return Ok(());
+    }
+    Err(tonic::Status::permission_denied(
+        "sandbox credential pod UID mismatch",
+    ))
+}
+
+#[allow(clippy::result_large_err)]
 fn sandbox_owner_reference(pod: &Pod) -> Result<&OwnerReference, tonic::Status> {
     let mut owners = pod
         .metadata
@@ -2478,6 +2464,43 @@ fn sandbox_owner_reference(pod: &Pod) -> Result<&OwnerReference, tonic::Status> 
         ));
     }
     Ok(owner)
+}
+
+#[allow(clippy::result_large_err)]
+fn validate_sandbox_owner_identity(
+    owner: &OwnerReference,
+    sandbox_id: &str,
+    sandbox: &DynamicObject,
+) -> Result<(), tonic::Status> {
+    let uid_matches = sandbox.metadata.uid.as_deref() == Some(owner.uid.as_str());
+    let sandbox_id_matches = sandbox
+        .metadata
+        .labels
+        .as_ref()
+        .and_then(|labels| labels.get(LABEL_SANDBOX_ID))
+        .is_some_and(|actual| actual == sandbox_id);
+    if uid_matches && sandbox_id_matches {
+        return Ok(());
+    }
+    Err(tonic::Status::permission_denied(
+        "pod identity does not match its Sandbox owner",
+    ))
+}
+
+fn accepts_auth_namespace(
+    config: &KubernetesComputeConfig,
+    operator_allowlist: Option<&OperatorNamespaceAllowlist>,
+    namespace: &str,
+) -> bool {
+    match config.workspace_mode {
+        WorkspaceMode::Shared => namespace == config.namespace,
+        WorkspaceMode::Managed => {
+            namespace.starts_with(&managed_namespace_prefix(&config.gateway_id))
+        }
+        WorkspaceMode::Operator => {
+            operator_allowlist.is_some_and(|allowlist| allowlist.contains(namespace))
+        }
+    }
 }
 
 fn annotation_or_label(obj: &DynamicObject, key: &str) -> Option<String> {
@@ -4892,6 +4915,7 @@ mod tests {
     };
     use openshell_core::proto::compute::v1::{GpuResourceRequirements, ResourceRequirements};
     use prost_types::{Struct, Value, value::Kind};
+    use std::collections::BTreeSet;
 
     static ENV_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
         std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
@@ -5136,6 +5160,145 @@ mod tests {
     fn token_review_rejects_a_different_service_account() {
         let status = authenticated_token_review("system:serviceaccount:workspaces:other");
         let error = token_review_identity(&status, "sandbox-sa").unwrap_err();
+        assert_eq!(error.code(), tonic::Code::PermissionDenied);
+    }
+
+    #[test]
+    fn token_review_rejects_wrong_audience_and_missing_pod_binding() {
+        let mut wrong_audience =
+            authenticated_token_review("system:serviceaccount:workspaces:sandbox-sa");
+        wrong_audience.audiences = Some(vec!["kubernetes.default.svc".to_string()]);
+        let error = token_review_identity(&wrong_audience, "sandbox-sa").unwrap_err();
+        assert_eq!(error.code(), tonic::Code::Unauthenticated);
+
+        let mut missing_binding =
+            authenticated_token_review("system:serviceaccount:workspaces:sandbox-sa");
+        missing_binding.user.as_mut().unwrap().extra = None;
+        let error = token_review_identity(&missing_binding, "sandbox-sa").unwrap_err();
+        assert_eq!(error.code(), tonic::Code::PermissionDenied);
+    }
+
+    #[test]
+    fn token_review_returns_none_when_not_authenticated() {
+        let status = TokenReviewStatus {
+            authenticated: Some(false),
+            error: Some("token rejected".to_string()),
+            ..Default::default()
+        };
+
+        assert!(
+            token_review_identity(&status, "sandbox-sa")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn authentication_namespace_validation_covers_each_workspace_mode() {
+        let mut config = KubernetesComputeConfig {
+            namespace: "openshell".to_string(),
+            ..Default::default()
+        };
+        assert!(accepts_auth_namespace(&config, None, "openshell"));
+        assert!(!accepts_auth_namespace(&config, None, "other"));
+
+        config.workspace_mode = WorkspaceMode::Managed;
+        config.gateway_id = "gateway-a".to_string();
+        assert!(accepts_auth_namespace(
+            &config,
+            None,
+            "openshell-gateway-a-workspace-a"
+        ));
+        assert!(!accepts_auth_namespace(
+            &config,
+            None,
+            "openshell-gateway-b-workspace-a"
+        ));
+
+        config.workspace_mode = WorkspaceMode::Operator;
+        let allowlist = OperatorNamespaceAllowlist::from_set(BTreeSet::from([
+            "team-a".to_string(),
+            "team-b".to_string(),
+        ]));
+        assert!(accepts_auth_namespace(&config, Some(&allowlist), "team-a"));
+        assert!(!accepts_auth_namespace(&config, Some(&allowlist), "team-c"));
+        assert!(!accepts_auth_namespace(&config, None, "team-a"));
+    }
+
+    fn sandbox_owner_for_test(name: &str, uid: &str) -> OwnerReference {
+        OwnerReference {
+            api_version: "agents.x-k8s.io/v1beta1".to_string(),
+            block_owner_deletion: None,
+            controller: Some(true),
+            kind: SANDBOX_KIND.to_string(),
+            name: name.to_string(),
+            uid: uid.to_string(),
+        }
+    }
+
+    fn sandbox_object_for_test(uid: &str, sandbox_id: &str) -> DynamicObject {
+        let resource = ApiResource::from_gvk(&GroupVersionKind::gvk(
+            SANDBOX_GROUP,
+            SANDBOX_VERSION_V1BETA1,
+            SANDBOX_KIND,
+        ));
+        let mut sandbox = DynamicObject::new("sandbox-a", &resource);
+        sandbox.metadata.uid = Some(uid.to_string());
+        sandbox.metadata.labels = Some(BTreeMap::from([(
+            LABEL_SANDBOX_ID.to_string(),
+            sandbox_id.to_string(),
+        )]));
+        sandbox
+    }
+
+    #[test]
+    fn pod_identity_requires_matching_uid_annotation_and_controlling_owner() {
+        let owner = sandbox_owner_for_test("sandbox-a", "sandbox-uid-a");
+        let pod = Pod {
+            metadata: ObjectMeta {
+                uid: Some("pod-uid-a".to_string()),
+                annotations: Some(BTreeMap::from([(
+                    LABEL_SANDBOX_ID.to_string(),
+                    "sandbox-id-a".to_string(),
+                )])),
+                owner_references: Some(vec![owner.clone()]),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        validate_pod_uid(&pod, "pod-uid-a").expect("matching pod UID");
+        assert_eq!(pod_sandbox_id(&pod).unwrap(), "sandbox-id-a");
+        assert_eq!(sandbox_owner_reference(&pod).unwrap(), &owner);
+
+        let error = validate_pod_uid(&pod, "other-pod-uid").unwrap_err();
+        assert_eq!(error.code(), tonic::Code::PermissionDenied);
+
+        let mut missing_annotation = pod.clone();
+        missing_annotation.metadata.annotations = None;
+        let error = pod_sandbox_id(&missing_annotation).unwrap_err();
+        assert_eq!(error.code(), tonic::Code::PermissionDenied);
+
+        let mut non_controlling = pod;
+        non_controlling.metadata.owner_references.as_mut().unwrap()[0].controller = Some(false);
+        let error = sandbox_owner_reference(&non_controlling).unwrap_err();
+        assert_eq!(error.code(), tonic::Code::PermissionDenied);
+    }
+
+    #[test]
+    fn sandbox_owner_identity_requires_matching_uid_and_sandbox_id() {
+        let owner = sandbox_owner_for_test("sandbox-a", "sandbox-uid-a");
+        let sandbox = sandbox_object_for_test("sandbox-uid-a", "sandbox-id-a");
+        validate_sandbox_owner_identity(&owner, "sandbox-id-a", &sandbox)
+            .expect("matching owner identity");
+
+        let wrong_uid = sandbox_object_for_test("sandbox-uid-b", "sandbox-id-a");
+        let error =
+            validate_sandbox_owner_identity(&owner, "sandbox-id-a", &wrong_uid).unwrap_err();
+        assert_eq!(error.code(), tonic::Code::PermissionDenied);
+
+        let wrong_id = sandbox_object_for_test("sandbox-uid-a", "sandbox-id-b");
+        let error = validate_sandbox_owner_identity(&owner, "sandbox-id-a", &wrong_id).unwrap_err();
         assert_eq!(error.code(), tonic::Code::PermissionDenied);
     }
 

@@ -1741,6 +1741,19 @@ impl DockerComputeDriver {
 impl ComputeDriver for ComputeDriverService {
     type WatchSandboxesStream = WatchStream;
 
+    async fn authenticate_sandbox(
+        &self,
+        request: Request<openshell_core::proto::compute::v1::AuthenticateSandboxRequest>,
+    ) -> Result<Response<openshell_core::proto::compute::v1::AuthenticateSandboxResponse>, Status>
+    {
+        self.trace_rpc(
+            "driver.authenticate_sandbox",
+            "authenticate_sandbox",
+            ComputeDriver::authenticate_sandbox(&self.driver, request),
+        )
+        .await
+    }
+
     async fn get_capabilities(
         &self,
         request: Request<GetCapabilitiesRequest>,

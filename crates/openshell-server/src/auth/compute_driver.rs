@@ -58,3 +58,119 @@ impl Authenticator for ComputeDriverAuthenticator {
         })))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::auth::principal::SandboxIdentitySource;
+    use crate::compute::{NoopTestDriver, new_test_runtime_with_driver};
+    use crate::persistence::Store;
+    use std::sync::Arc;
+    use tonic::Code;
+
+    fn bearer_headers(token: &str) -> http::HeaderMap {
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            http::header::AUTHORIZATION,
+            http::HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
+        );
+        headers
+    }
+
+    async fn authenticator(driver: NoopTestDriver) -> ComputeDriverAuthenticator {
+        let store = Arc::new(Store::connect("sqlite::memory:").await.unwrap());
+        let compute =
+            new_test_runtime_with_driver(store, "external-kubernetes", Arc::new(driver)).await;
+        ComputeDriverAuthenticator::new(compute)
+    }
+
+    #[tokio::test]
+    async fn authenticates_driver_credential_on_issue_path() {
+        let auth = authenticator(NoopTestDriver::authenticating_sandbox("sandbox-a")).await;
+
+        let principal = auth
+            .authenticate(
+                &bearer_headers("driver-credential"),
+                ISSUE_SANDBOX_TOKEN_PATH,
+            )
+            .await
+            .unwrap()
+            .expect("driver credential should authenticate");
+
+        let Principal::Sandbox(principal) = principal else {
+            panic!("expected sandbox principal");
+        };
+        assert_eq!(principal.sandbox_id, "sandbox-a");
+        assert!(matches!(
+            principal.source,
+            SandboxIdentitySource::ComputeDriver { ref driver_name }
+                if driver_name == "external-kubernetes"
+        ));
+    }
+
+    #[tokio::test]
+    async fn authenticator_is_scoped_to_issue_path() {
+        let auth = authenticator(NoopTestDriver::failing_sandbox_authentication(
+            Code::Unavailable,
+            "driver must not be called",
+        ))
+        .await;
+
+        let result = auth
+            .authenticate(
+                &bearer_headers("driver-credential"),
+                "/openshell.v1.OpenShell/GetSandboxConfig",
+            )
+            .await
+            .unwrap();
+
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn missing_bearer_credential_falls_through() {
+        let auth = authenticator(NoopTestDriver::authenticating_sandbox("sandbox-a")).await;
+
+        let result = auth
+            .authenticate(&http::HeaderMap::new(), ISSUE_SANDBOX_TOKEN_PATH)
+            .await
+            .unwrap();
+
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn empty_driver_identity_is_rejected() {
+        let auth = authenticator(NoopTestDriver::authenticating_sandbox("")).await;
+
+        let error = auth
+            .authenticate(
+                &bearer_headers("driver-credential"),
+                ISSUE_SANDBOX_TOKEN_PATH,
+            )
+            .await
+            .expect_err("empty identity must fail closed");
+
+        assert_eq!(error.code(), Code::PermissionDenied);
+    }
+
+    #[tokio::test]
+    async fn driver_authentication_error_propagates() {
+        let auth = authenticator(NoopTestDriver::failing_sandbox_authentication(
+            Code::Unavailable,
+            "driver unavailable",
+        ))
+        .await;
+
+        let error = auth
+            .authenticate(
+                &bearer_headers("driver-credential"),
+                ISSUE_SANDBOX_TOKEN_PATH,
+            )
+            .await
+            .expect_err("driver errors must propagate");
+
+        assert_eq!(error.code(), Code::Unavailable);
+        assert_eq!(error.message(), "driver unavailable");
+    }
+}

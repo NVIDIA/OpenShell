@@ -392,7 +392,7 @@ kubectl -n openshell get pod -l app.kubernetes.io/name=helm-chart -o jsonpath="{
 ```
 
 Sandbox pods using provider token grants should have an
-`openshell.io/sandbox-id` annotation, an `openshell.ai/managed-by=openshell`
+`openshell.ai/sandbox-id` annotation, an `openshell.ai/managed-by=openshell`
 label, supervisor env vars `OPENSHELL_K8S_SA_TOKEN_FILE` and
 `OPENSHELL_PROVIDER_SPIFFE_WORKLOAD_API_SOCKET`, plus both the projected
 `openshell-sa-token` volume and the `spiffe-workload-api` CSI volume.
