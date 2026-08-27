@@ -28,7 +28,7 @@ runs:
 
     - name: Install Podman and build dependencies
       shell: bash
-      run: |
+      run: | # zizmor: ignore[github-env] persists only literal and trusted runner-derived paths
         sudo apt-get update
         sudo apt-get install -y --no-install-recommends \
           apparmor \
@@ -70,7 +70,7 @@ runs:
 
     - name: Configure rootless Podman
       shell: bash
-      run: |
+      run: | # zizmor: ignore[github-env] runtime path is derived solely from the runner UID
         set -euo pipefail
         if ! grep -q "^${USER}:" /etc/subuid; then
           sudo usermod --add-subuids 100000-165535 "$USER"

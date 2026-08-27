@@ -26,7 +26,7 @@ runs:
       shell: bash
       env:
         MISE_VERSION: ${{ inputs.version }}
-      run: |
+      run: | # zizmor: ignore[github-env] PATH entries are fixed beneath the runner-controlled HOME
         set -euo pipefail
         curl https://mise.run | sh
         export PATH="$HOME/.local/bin:$HOME/.local/share/mise/shims:$PATH"

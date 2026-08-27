@@ -20,7 +20,11 @@ runs:
 
     - name: Configure prebuilt ${{ inputs.binary }}
       shell: bash
-      run: |
+      run: | # zizmor: ignore[github-env] validated filename under the trusted workspace path
+        if [[ ! "${INPUTS_BINARY}" =~ ^[a-zA-Z0-9._-]+$ ]]; then
+          echo "invalid driver binary name: ${INPUTS_BINARY}" >&2
+          exit 1
+        fi
         driver="$GITHUB_WORKSPACE/.e2e/prebuilt-driver/${INPUTS_BINARY}"
         chmod +x "$driver"
         "$driver" --version

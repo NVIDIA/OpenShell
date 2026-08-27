@@ -46,7 +46,7 @@ jobs:
       matrix:
         include: ${{ fromJSON(inputs.suite-matrix) }}
     container:
-      image: ghcr.io/nvidia/openshell/ci:latest
+      image: ghcr.io/nvidia/openshell/ci:37072ee81cd7b294c714bfa5ecc829b6927b3d70
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
