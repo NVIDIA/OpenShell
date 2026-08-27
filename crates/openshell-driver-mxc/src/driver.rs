@@ -1196,7 +1196,7 @@ mod lifecycle_tests {
             "powershell".into(),
             "-NoProfile".into(),
             "-Command".into(),
-            "Start-Sleep -Seconds 60".into(),
+            format!("$null = '{share}'; Start-Sleep -Seconds 60"),
         ];
         let backend = MxcComputeBackend::new_mocked(MxcComputeConfig::default());
         backend
