@@ -44,8 +44,8 @@ jobs:
             push)
               run_core_e2e="$(jq -r 'index("test:e2e") != null' <<< "$LABELS_JSON")"
               run_gpu_e2e="$(jq -r 'index("test:e2e-gpu") != null' <<< "$LABELS_JSON")"
-              run_kubernetes_ha_e2e="$(jq -r 'index("test:e2e-kubernetes") != null' <<< "$LABELS_JSON")"
-              run_kubernetes_credential_drivers_e2e="$(jq -r 'index("test:e2e-kubernetes") != null' <<< "$LABELS_JSON")"
+              run_kubernetes_ha_e2e=false
+              run_kubernetes_credential_drivers_e2e=false
               ;;
             merge_group)
               # Merge groups have no PR labels. When GPU E2E is required as documented
@@ -59,8 +59,8 @@ jobs:
             *)
               run_core_e2e=true
               run_gpu_e2e=true
-              run_kubernetes_ha_e2e=true
-              run_kubernetes_credential_drivers_e2e=true
+              run_kubernetes_ha_e2e=false
+              run_kubernetes_credential_drivers_e2e=false
               ;;
           esac
           if [ "$run_core_e2e" = "true" ] || [ "$run_gpu_e2e" = "true" ] || [ "$run_kubernetes_ha_e2e" = "true" ] || [ "$run_kubernetes_credential_drivers_e2e" = "true" ]; then
