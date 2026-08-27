@@ -41,7 +41,9 @@ REPO = "NVIDIA/OpenShell"
 WORKFLOWS: list[str] = [
     "branch-checks.yml",
     "branch-e2e.yml",
-    "build-platform-binaries.yml",
+    "build-cli-binaries.yml",
+    "build-gateway-binaries.yml",
+    "build-sandbox-binaries.yml",
     "ci-image.yml",
     "docker-build.yml",
     "e2e-docker-test.yml",
@@ -59,7 +61,9 @@ WORKFLOWS: list[str] = [
 # workflow_run. For these, we scan all repo runs in the window and attribute
 # via `referenced_workflows`.
 REUSABLE_WORKFLOWS: set[str] = {
-    "build-platform-binaries.yml",
+    "build-cli-binaries.yml",
+    "build-gateway-binaries.yml",
+    "build-sandbox-binaries.yml",
     "docker-build.yml",
     "e2e-docker-test.yml",
     "e2e-podman-test.yml",

@@ -100,9 +100,8 @@ jobs:
     needs: version
     permissions:
       contents: read
-    uses: ./.github/workflows/build-platform-binaries.yml
+    uses: ./.github/workflows/build-cli-binaries.yml
     with:
-      component: cli
       cargo-version: ${{ needs.version.outputs.cargo }}
     secrets: inherit
 
@@ -110,9 +109,8 @@ jobs:
     needs: version
     permissions:
       contents: read
-    uses: ./.github/workflows/build-platform-binaries.yml
+    uses: ./.github/workflows/build-sandbox-binaries.yml
     with:
-      component: sandbox-musl
       cargo-version: ${{ needs.version.outputs.cargo }}
     secrets: inherit
 
@@ -120,9 +118,8 @@ jobs:
     needs: version
     permissions:
       contents: read
-    uses: ./.github/workflows/build-platform-binaries.yml
+    uses: ./.github/workflows/build-gateway-binaries.yml
     with:
-      component: gateway
       cargo-version: ${{ needs.version.outputs.cargo }}
     secrets: inherit
 

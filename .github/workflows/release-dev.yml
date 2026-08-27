@@ -57,9 +57,8 @@ jobs:
     needs: compute-versions
     permissions:
       contents: read
-    uses: ./.github/workflows/build-platform-binaries.yml
+    uses: ./.github/workflows/build-cli-binaries.yml
     with:
-      component: cli
       cargo-version: ${{ needs.compute-versions.outputs.cargo_version }}
       image-tag: dev
     secrets: inherit
@@ -68,9 +67,8 @@ jobs:
     needs: compute-versions
     permissions:
       contents: read
-    uses: ./.github/workflows/build-platform-binaries.yml
+    uses: ./.github/workflows/build-gateway-binaries.yml
     with:
-      component: gateway
       cargo-version: ${{ needs.compute-versions.outputs.cargo_version }}
       image-tag: dev
     secrets: inherit
@@ -79,9 +77,8 @@ jobs:
     needs: compute-versions
     permissions:
       contents: read
-    uses: ./.github/workflows/build-platform-binaries.yml
+    uses: ./.github/workflows/build-sandbox-binaries.yml
     with:
-      component: sandbox-musl
       cargo-version: ${{ needs.compute-versions.outputs.cargo_version }}
       image-tag: dev
     secrets: inherit
