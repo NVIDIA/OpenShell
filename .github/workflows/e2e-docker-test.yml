@@ -87,6 +87,7 @@ jobs:
 
       - name: Install OS test dependencies
         if: matrix.apt_packages != ''
+        shell: bash
         env:
           APT_PACKAGES: ${{ matrix.apt_packages }}
         run: |

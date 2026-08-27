@@ -25,7 +25,7 @@ on:
         required: false
         type: string
         default: >-
-          [{"suite":"rootless","runner":"ubuntu-26.04","podman_major":"5","podman_package_version":"5.7.0+ds2-3build1","conmon_package_version":"2.1.13+ds1-2","cmd":"mise run --no-deps --skip-deps e2e:podman:rootless"},{"suite":"provider-refresh-keycloak","runner":"ubuntu-26.04","podman_major":"5","podman_package_version":"5.7.0+ds2-3build1","conmon_package_version":"2.1.13+ds1-2","cmd":"mise run --no-deps --skip-deps e2e:provider-refresh-keycloak"}]
+          [{"suite":"provider-refresh-keycloak","runner":"ubuntu-26.04","podman_major":"5","podman_package_version":"5.7.0+ds2-3build1","conmon_package_version":"2.1.13+ds1-2","cmd":"mise run --no-deps --skip-deps e2e:provider-refresh-keycloak"}]
 
 permissions:
   actions: read
