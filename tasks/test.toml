@@ -137,8 +137,8 @@ run = [
 ]
 
 ["e2e:podman:rootless"]
-description = "Run Podman smoke e2e against a rootless Ubuntu 26.04 Nix test guest"
-run = "e2e/run.sh --vm ubuntu-26-04 --with podman-rootless --gateway-config e2e/configs/gateway/podman.toml --suite smoke"
+description = "Run Podman e2e against a rootless Ubuntu 26.04 Nix test guest"
+run = "e2e/run.sh --vm ubuntu-26-04 --with podman-rootless --gateway-config e2e/configs/gateway/podman.toml --features e2e-podman"
 
 ["e2e:podman:gpu"]
 description = "Run GPU e2e against a standalone gateway with the Podman compute driver"

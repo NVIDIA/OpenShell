@@ -27,6 +27,11 @@ on:
         required: false
         type: string
         default: ""
+      sandbox-artifact-prefix:
+        description: "Optional prebuilt sandbox artifact prefix (artifact suffix is linux-<arch>)"
+        required: false
+        type: string
+        default: ""
       vm-driver-artifact-name:
         description: "Optional prebuilt VM driver artifact name"
         required: false
@@ -144,6 +149,21 @@ jobs:
           ref: ${{ inputs['checkout-ref'] || github.sha }}
           persist-credentials: false
 
+      - name: Use prebuilt OpenShell CLI
+        uses: ./.github/actions/setup-e2e-cli
+        with:
+          artifact-prefix: ${{ inputs.cli-artifact-prefix }}
+
+      - name: Use prebuilt OpenShell gateway
+        uses: ./.github/actions/setup-e2e-gateway
+        with:
+          artifact-prefix: ${{ inputs.gateway-artifact-prefix }}
+
+      - name: Use prebuilt OpenShell sandbox
+        uses: ./.github/actions/setup-e2e-sandbox
+        with:
+          artifact-prefix: ${{ inputs.sandbox-artifact-prefix }}
+
       - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
         with:
           github_access_token: ${{ secrets.GITHUB_TOKEN }}
@@ -175,7 +195,17 @@ jobs:
             pkg-config
 
       - name: Run rootless Podman E2E
-        run: mise run --no-deps --skip-deps e2e:podman:rootless
+        run: |
+          set -euo pipefail
+
+          mise x -- e2e/run.sh \
+            --vm ubuntu-26-04 \
+            --with podman-rootless \
+            --host-cli-bin "$OPENSHELL_BIN" \
+            --gateway-bin "$OPENSHELL_GATEWAY_BIN" \
+            --sandbox-bin "$OPENSHELL_SANDBOX_BIN" \
+            --gateway-config e2e/configs/gateway/podman.toml \
+            --features e2e-podman
 
   e2e-vm:
     name: E2E (rust-vm-${{ matrix.suite }})

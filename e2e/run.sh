@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # Build the current checkout, run its gateway on the host or in a disposable
-# Nix test guest, and execute one named host-side E2E suite against that gateway.
+# Nix test guest, and execute host-side E2E tests against that gateway.
 
 set -Eeuo pipefail
 
@@ -20,13 +20,17 @@ usage() {
 	cat <<'EOF'
 Usage:
   e2e/run.sh [--vm DISTRO] [--with CONFIG ...] \
-    --gateway-config PATH --suite NAME
+    --gateway-config PATH [--features FEATURES] [--suite NAME]
 
 Options:
   --vm DISTRO          Run the gateway in a Nix test guest
   --with CONFIG        Apply a Nix test-guest configuration; repeatable
+  --host-cli-bin PATH  Use a prebuilt host openshell CLI instead of building it
+  --gateway-bin PATH   Use a prebuilt openshell-gateway instead of building it
+  --sandbox-bin PATH   Use a prebuilt openshell-sandbox instead of building it
   --gateway-config PATH
                        Fully resolved gateway TOML
+  --features FEATURES  Rust e2e feature set to enable (default: e2e)
   --suite NAME         Rust suite at e2e/rust/tests/NAME.rs
   -h, --help           Show this help
 
@@ -92,6 +96,10 @@ catalog_has_entry() {
 
 vm=
 gateway_config=
+gateway_bin=
+host_cli_bin=
+sandbox_bin=
+e2e_features=e2e
 suite_name=
 with_configurations=()
 
@@ -107,9 +115,29 @@ while [ "$#" -gt 0 ]; do
 		with_configurations+=("$2")
 		shift 2
 		;;
+	--host-cli-bin)
+		require_value "$1" "$#" "${2:-}"
+		host_cli_bin="$(resolve_file "$2")" || die "--host-cli-bin does not name a file: $2"
+		shift 2
+		;;
+	--gateway-bin)
+		require_value "$1" "$#" "${2:-}"
+		gateway_bin="$(resolve_file "$2")" || die "--gateway-bin does not name a file: $2"
+		shift 2
+		;;
+	--sandbox-bin)
+		require_value "$1" "$#" "${2:-}"
+		sandbox_bin="$(resolve_file "$2")" || die "--sandbox-bin does not name a file: $2"
+		shift 2
+		;;
 	--gateway-config)
 		require_value "$1" "$#" "${2:-}"
 		gateway_config=$2
+		shift 2
+		;;
+	--features)
+		require_value "$1" "$#" "${2:-}"
+		e2e_features=$2
 		shift 2
 		;;
 	--suite)
@@ -130,9 +158,6 @@ done
 if [ -z "${gateway_config}" ]; then
 	die "--gateway-config is required"
 fi
-if [ -z "${suite_name}" ]; then
-	die "--suite is required"
-fi
 if ! command -v python3 >/dev/null 2>&1; then
 	die "python3 is required"
 fi
@@ -144,12 +169,17 @@ gateway_driver="$(python3 -c '
 import sys, tomllib
 print(tomllib.load(open(sys.argv[1], "rb"))["openshell"]["gateway"]["compute_drivers"][0])
 ' "${gateway_config}")"
-if [[ ! ${suite_name} =~ ^[a-z0-9][a-z0-9-]*$ ]]; then
-	die "suite name must contain only lowercase letters, digits, and hyphens: ${suite_name}"
+if [ -z "${e2e_features}" ]; then
+	die "--features must not be empty"
 fi
-suite_path="${ROOT}/e2e/rust/tests/${suite_name}.rs"
-if [ ! -f "${suite_path}" ]; then
-	die "unknown suite: ${suite_name}"
+if [ -n "${suite_name}" ]; then
+	if [[ ! ${suite_name} =~ ^[a-z0-9][a-z0-9_-]*$ ]]; then
+		die "suite name must contain only lowercase letters, digits, underscores, and hyphens: ${suite_name}"
+	fi
+	suite_path="${ROOT}/e2e/rust/tests/${suite_name}.rs"
+	if [ ! -f "${suite_path}" ]; then
+		die "unknown suite: ${suite_name}"
+	fi
 fi
 mode=host
 if [ -n "${vm}" ] || [ "${#with_configurations[@]}" -gt 0 ]; then
@@ -230,49 +260,68 @@ target_dir="$(e2e_cargo_target_dir "${ROOT}" mise x -- cargo)"
 
 ensure_build_nofile_limit
 
-echo "==> Building native host openshell CLI"
-mise x -- cargo build "${cargo_jobs[@]+"${cargo_jobs[@]}"}" -p openshell-cli --bin openshell
-host_cli_bin="${target_dir}/debug/openshell"
+if [ -n "${host_cli_bin}" ]; then
+	echo "==> Using host openshell CLI: ${host_cli_bin}"
+else
+	echo "==> Building native host openshell CLI"
+	mise x -- cargo build "${cargo_jobs[@]+"${cargo_jobs[@]}"}" -p openshell-cli --bin openshell
+	host_cli_bin="${target_dir}/debug/openshell"
+fi
 
-echo "==> Preparing ${linux_musl_target} build target"
-mise x -- rustup target add "${linux_musl_target}" >/dev/null
+if [ -n "${sandbox_bin}" ]; then
+	echo "==> Using Linux openshell-sandbox: ${sandbox_bin}"
+	linux_sandbox_bin="${sandbox_bin}"
+else
+	echo "==> Preparing ${linux_musl_target} build target"
+	mise x -- rustup target add "${linux_musl_target}" >/dev/null
 
-echo "==> Building Linux openshell-sandbox (${linux_musl_target})"
-mise x -- cargo zigbuild "${cargo_jobs[@]+"${cargo_jobs[@]}"}" \
-	--release \
-	--target "${linux_musl_target}" \
-	-p openshell-sandbox \
-	--bin openshell-sandbox
-linux_sandbox_bin="${target_dir}/${linux_musl_target}/release/openshell-sandbox"
+	echo "==> Building Linux openshell-sandbox (${linux_musl_target})"
+	mise x -- cargo zigbuild "${cargo_jobs[@]+"${cargo_jobs[@]}"}" \
+		--release \
+		--target "${linux_musl_target}" \
+		-p openshell-sandbox \
+		--bin openshell-sandbox
+	linux_sandbox_bin="${target_dir}/${linux_musl_target}/release/openshell-sandbox"
+fi
 
 host_gateway_bin=
 guest_gateway_bin=
 if [ "${mode}" = host ]; then
-	echo "==> Building native host openshell-gateway"
-	mise x -- cargo build "${cargo_jobs[@]+"${cargo_jobs[@]}"}" \
-		-p openshell-server \
-		--bin openshell-gateway \
-		--features bundled-z3
-	host_gateway_bin="${target_dir}/debug/openshell-gateway"
-else
-	echo "==> Preparing ${linux_gateway_rust_target} build target"
-	mise x -- rustup target add "${linux_gateway_rust_target}" >/dev/null
-	echo "==> Building Linux openshell-gateway (${linux_gateway_zig_target})"
-	(
-		eval "$(
-			"${ROOT}/tasks/scripts/setup-zig-cc-wrapper.sh" \
-				"${linux_gateway_zig_target}" \
-				"${linux_gateway_zig_target}" \
-				"${target_dir}/zig-gnu-wrapper/e2e"
-		)"
-		mise x -- cargo zigbuild "${cargo_jobs[@]+"${cargo_jobs[@]}"}" \
-			--release \
-			--target "${linux_gateway_zig_target}" \
+	if [ -n "${gateway_bin}" ]; then
+		echo "==> Using host openshell-gateway: ${gateway_bin}"
+		host_gateway_bin="${gateway_bin}"
+	else
+		echo "==> Building native host openshell-gateway"
+		mise x -- cargo build "${cargo_jobs[@]+"${cargo_jobs[@]}"}" \
 			-p openshell-server \
 			--bin openshell-gateway \
 			--features bundled-z3
-	)
-	guest_gateway_bin="${target_dir}/${linux_gateway_rust_target}/release/openshell-gateway"
+		host_gateway_bin="${target_dir}/debug/openshell-gateway"
+	fi
+else
+	if [ -n "${gateway_bin}" ]; then
+		echo "==> Using Linux openshell-gateway: ${gateway_bin}"
+		guest_gateway_bin="${gateway_bin}"
+	else
+		echo "==> Preparing ${linux_gateway_rust_target} build target"
+		mise x -- rustup target add "${linux_gateway_rust_target}" >/dev/null
+		echo "==> Building Linux openshell-gateway (${linux_gateway_zig_target})"
+		(
+			eval "$(
+				"${ROOT}/tasks/scripts/setup-zig-cc-wrapper.sh" \
+					"${linux_gateway_zig_target}" \
+					"${linux_gateway_zig_target}" \
+					"${target_dir}/zig-gnu-wrapper/e2e"
+			)"
+			mise x -- cargo zigbuild "${cargo_jobs[@]+"${cargo_jobs[@]}"}" \
+				--release \
+				--target "${linux_gateway_zig_target}" \
+				-p openshell-server \
+				--bin openshell-gateway \
+				--features bundled-z3
+		)
+		guest_gateway_bin="${target_dir}/${linux_gateway_rust_target}/release/openshell-gateway"
+	fi
 fi
 
 expected_binaries=("${host_cli_bin}" "${linux_sandbox_bin}")
@@ -588,10 +637,17 @@ wait_for_gateway() {
 
 wait_for_gateway
 
-echo "==> Running E2E suite: ${suite_name}"
+test_args=(
+	cargo test
+	--manifest-path e2e/rust/Cargo.toml
+	--features "${e2e_features}"
+)
+echo "==> Running E2E features: ${e2e_features}"
+if [ -n "${suite_name}" ]; then
+	echo "==> Running E2E suite: ${suite_name}"
+	test_args+=(--test "${suite_name}")
+fi
+test_args+=(-- --nocapture)
+
 cd "${ROOT}"
-cargo test \
-	--manifest-path e2e/rust/Cargo.toml \
-	--features e2e \
-	--test "${suite_name}" \
-	-- --nocapture
+"${test_args[@]}"

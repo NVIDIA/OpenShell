@@ -138,6 +138,8 @@ jobs:
       runner: linux-arm64-cpu8
       cli-artifact-prefix: rust-binary-cli
       gateway-artifact-prefix: rust-binary-gateway
+      # The supervisor build uploads the openshell-sandbox binary artifact.
+      sandbox-artifact-prefix: rust-binary-supervisor
       vm-driver-artifact-name: driver-vm-linux-amd64
 
   gpu-e2e:

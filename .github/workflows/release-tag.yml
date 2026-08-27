@@ -93,8 +93,18 @@ jobs:
       checkout-ref: ${{ inputs.tag || github.ref }}
       auditable: true
 
+  build-cli:
+    needs: [compute-versions]
+    uses: ./.github/workflows/docker-build.yml
+    with:
+      component: cli
+      cargo-version: ${{ needs.compute-versions.outputs.cargo_version }}
+      image-tag: ${{ needs.compute-versions.outputs.source_sha }}
+      checkout-ref: ${{ inputs.tag || github.ref }}
+      auditable: true
+
   e2e:
-    needs: [compute-versions, build-gateway, build-supervisor]
+    needs: [compute-versions, build-gateway, build-supervisor, build-cli]
     permissions:
       actions: read
       contents: read
@@ -104,6 +114,10 @@ jobs:
       image-tag: ${{ needs.compute-versions.outputs.source_sha }}
       checkout-ref: ${{ inputs.tag || github.ref }}
       runner: linux-arm64-cpu8
+      cli-artifact-prefix: rust-binary-cli
+      gateway-artifact-prefix: rust-binary-gateway
+      # The supervisor build uploads the openshell-sandbox binary artifact.
+      sandbox-artifact-prefix: rust-binary-supervisor
 
   tag-ghcr-release:
     name: Tag GHCR Images for Release
