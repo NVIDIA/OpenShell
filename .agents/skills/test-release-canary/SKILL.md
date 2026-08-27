@@ -13,7 +13,7 @@ The Release Canary (`.github/workflows/release-canary.yml`) smoke-tests the arti
 |---|---|---|
 | `macos` | `macos-latest-xlarge` | `install.sh` resolves the Homebrew formula, brew installs the cask, and `openshell status` reaches the brew-services–backed local gateway with the VM driver. |
 | `ubuntu` | `ubuntu-latest` | `install.sh` installs the Debian package, the post-install systemd user service starts, and `openshell status` reaches the local gateway with the Docker driver. |
-| `fedora` | `fedora:latest` container | `install.sh` installs the RPM packages, the local gateway starts under Podman, and `openshell status` succeeds. |
+| `fedora` | `linux-amd64-cpu8` + Fedora Nix VM | `install.sh` installs the RPM packages, the root-owned local gateway starts with rootful Podman, and `openshell status` succeeds. |
 | `kubernetes` | `ubuntu-latest` + kind | `helm install oci://ghcr.io/nvidia/openshell/helm-chart --version 0.0.0-dev` succeeds in a kind cluster, the gateway pod becomes Ready, port-forward exposes 8080, and the released CLI registers the in-cluster gateway and runs `openshell status` against it. |
 
 All canary jobs disable anonymous OpenShell telemetry. Host package jobs inject
@@ -115,6 +115,41 @@ secret that the gateway pod always mounts.
 Swap `0.0.0-dev` for `0.0.0-dev.<sha>` to pin to a specific dev build. Tear down with `kind delete cluster --name release-canary-local`.
 
 Loopback registration auto-derives the gateway name to `openshell` if `--name` is omitted, which collides with the `install.sh`-installed local gateway — always pass `--name kind` (or another distinct name) when registering in addition to a local install.
+
+## Local Fedora reproduction
+
+The `fedora` job uses the repository's Nix test-guest harness instead of
+running Fedora inside Docker. It can be reproduced on a Linux host with Nix,
+KVM, and the repository checkout:
+
+```shell
+export INSTALL_SH_URL="https://raw.githubusercontent.com/NVIDIA/OpenShell/$(git rev-parse HEAD)/install.sh"
+nix run .#test-guest -- \
+  --distro fedora \
+  --with podman-rootful \
+  -- \
+  sudo env \
+    SUDO_USER=root \
+    HOME=/root \
+    XDG_RUNTIME_DIR=/run/user/0 \
+    DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/0/bus \
+    OPENSHELL_TELEMETRY_ENABLED=false \
+    INSTALL_SH_URL="$INSTALL_SH_URL" \
+    bash -s <<'EOF'
+set -euo pipefail
+mkdir -p "${XDG_RUNTIME_DIR}"
+chmod 700 "${XDG_RUNTIME_DIR}"
+systemctl start user-runtime-dir@0.service || true
+systemctl start user@0.service
+systemctl --user daemon-reload
+mkdir -p "${HOME}/.config/openshell"
+printf 'OPENSHELL_DRIVERS=podman\nOPENSHELL_PODMAN_SOCKET=/run/podman/podman.sock\nOPENSHELL_TELEMETRY_ENABLED=%s\n' \
+  "$OPENSHELL_TELEMETRY_ENABLED" > "${HOME}/.config/openshell/gateway.env"
+podman --url unix:///run/podman/podman.sock info
+curl -LsSf "${INSTALL_SH_URL}" | sh
+openshell status
+EOF
+```
 
 ## Diagnosing failures
 

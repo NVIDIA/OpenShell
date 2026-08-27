@@ -13,7 +13,7 @@ Usage:
 
 Options:
 	  --distro NAME       Base distro: ubuntu-24-04, ubuntu-26-04, centos, fedora, or rocky
-	  --with NAME         Apply a configuration; repeatable (docker, podman, podman-rootless, selinux, snapd)
+	  --with NAME         Apply a configuration; repeatable (docker, podman, podman-rootful, podman-rootless, selinux, snapd)
   --install PATH      Install a .deb or .rpm package; repeatable
   --copy SRC:DEST     Copy a regular file to an absolute guest path, preserving
                       its host mode; repeatable

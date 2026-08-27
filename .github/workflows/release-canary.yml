@@ -61,53 +61,43 @@ jobs:
     name: Fedora RPM
     if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
     runs-on: linux-amd64-cpu8
-    timeout-minutes: 20
+    timeout-minutes: 30
     env:
-      FEDORA_CANARY_CONTAINER: openshell-fedora-canary-${{ github.run_id }}-${{ github.run_attempt }}
+      INSTALL_SH_URL: https://raw.githubusercontent.com/NVIDIA/OpenShell/${{ github.event.workflow_run.head_sha || github.sha }}/install.sh
     steps:
-      - name: Start Fedora systemd container and root user manager
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
+        with:
+          github_access_token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: cachix/cachix-action@5f2d7c5294214f71b873db4b969586b980625e71 # v17
+        with:
+          name: openshell
+
+      - name: Install RPM in Fedora rootful Podman VM and check status
         run: |
           set -euo pipefail
 
-          docker run --detach \
-            --name "${FEDORA_CANARY_CONTAINER}" \
-            --privileged \
-            --cgroupns=host \
-            --tmpfs /run \
-            --tmpfs /tmp \
-            --volume /sys/fs/cgroup:/sys/fs/cgroup:rw \
-            fedora:latest \
-            bash -lc 'dnf install -y curl dbus-daemon podman systemd && exec /usr/sbin/init'
-
-          for _ in $(seq 1 120); do
-            if docker exec "${FEDORA_CANARY_CONTAINER}" systemctl list-units --no-pager >/dev/null 2>&1; then
-              break
-            fi
-            if [ "$(docker inspect -f '{{.State.Running}}' "${FEDORA_CANARY_CONTAINER}")" != "true" ]; then
-              echo "::error::Fedora systemd container exited before systemd became reachable"
-              docker logs "${FEDORA_CANARY_CONTAINER}" >&2 || true
-              exit 1
-            fi
-            sleep 1
-          done
-
-          if ! docker exec "${FEDORA_CANARY_CONTAINER}" systemctl list-units --no-pager >/dev/null 2>&1; then
-            echo "::error::Fedora systemd container did not become reachable within 120s"
-            docker logs "${FEDORA_CANARY_CONTAINER}" >&2 || true
-            exit 1
-          fi
-
-          docker exec --interactive "${FEDORA_CANARY_CONTAINER}" env \
+          nix run .#test-guest -- \
+            --distro fedora \
+            --with podman-rootful \
+            -- \
+            sudo env \
+            SUDO_USER=root \
             HOME=/root \
             XDG_RUNTIME_DIR=/run/user/0 \
             DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/0/bus \
+            OPENSHELL_TELEMETRY_ENABLED="$OPENSHELL_TELEMETRY_ENABLED" \
+            INSTALL_SH_URL="$INSTALL_SH_URL" \
             bash -s <<'EOF'
           set -euo pipefail
-          # install.sh manages the RPM gateway as a systemd user unit. This
-          # container is booted with systemd as PID 1, but it still has no
-          # login session. Start root's user manager explicitly so the
-          # installer can test service restart and gateway registration
-          # instead of its "restart later" fallback.
+
+          # install.sh manages the RPM gateway as a systemd user unit. Start
+          # root's user manager explicitly so the canary exercises the rootful
+          # service path on a real Fedora VM.
           mkdir -p "${XDG_RUNTIME_DIR}"
           chmod 700 "${XDG_RUNTIME_DIR}"
           systemctl start user-runtime-dir@0.service || true
@@ -125,32 +115,14 @@ jobs:
             systemctl --user status --no-pager >&2 || true
             exit 1
           fi
-          EOF
 
-      - name: Install and check status
-        run: |
-          set -euo pipefail
-
-          docker exec --interactive "${FEDORA_CANARY_CONTAINER}" env \
-            HOME=/root \
-            XDG_RUNTIME_DIR=/run/user/0 \
-            DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/0/bus \
-            OPENSHELL_TELEMETRY_ENABLED="$OPENSHELL_TELEMETRY_ENABLED" \
-            INSTALL_SH_URL="https://raw.githubusercontent.com/NVIDIA/OpenShell/${{ github.event.workflow_run.head_sha || github.sha }}/install.sh" \
-            bash -s <<'EOF'
-          set -euo pipefail
           mkdir -p "${HOME}/.config/openshell"
-          printf 'OPENSHELL_DRIVERS=podman\nOPENSHELL_TELEMETRY_ENABLED=%s\n' \
+          printf 'OPENSHELL_DRIVERS=podman\nOPENSHELL_PODMAN_SOCKET=/run/podman/podman.sock\nOPENSHELL_TELEMETRY_ENABLED=%s\n' \
             "$OPENSHELL_TELEMETRY_ENABLED" > "${HOME}/.config/openshell/gateway.env"
-          podman info
+          podman --url unix:///run/podman/podman.sock info
           curl -LsSf "${INSTALL_SH_URL}" | sh
           openshell status
           EOF
-
-      - name: Stop Fedora systemd container
-        if: always()
-        run: |
-          docker rm -f "${FEDORA_CANARY_CONTAINER}" >/dev/null 2>&1 || true
 
   ubuntu-snap:
     name: Ubuntu Snap

@@ -28,6 +28,7 @@ let
   configurations = {
     docker = ./configuration/docker.yml;
     podman = ./configuration/podman.yml;
+    podman-rootful = ./configuration/podman-rootful.yml;
     podman-rootless = ./configuration/podman-rootless.yml;
     selinux = ./configuration/selinux.yml;
     snapd = ./configuration/snapd.yml;

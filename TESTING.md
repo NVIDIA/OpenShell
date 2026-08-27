@@ -181,6 +181,12 @@ Run the rootless Podman suite in an Ubuntu 26.04 Nix test guest:
 mise run e2e:podman:rootless
 ```
 
+Run the focused rootful Podman suite in a Fedora Nix test guest:
+
+```shell
+mise run e2e:podman:fedora-rootful
+```
+
 Run the VM-backed Rust CLI e2e suite:
 
 ```shell

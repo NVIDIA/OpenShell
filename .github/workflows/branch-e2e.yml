@@ -244,6 +244,74 @@ jobs:
       contents: read
       packages: read
     uses: ./.github/workflows/e2e-podman-test.yml
+
+  podman-fedora-rootful-e2e:
+    name: E2E (rust-podman-rootful, Fedora Nix VM)
+    needs: [pr_metadata, build-cli, build-gateway, build-sandbox]
+    if: needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_core_e2e == 'true'
+    permissions:
+      actions: read
+      contents: read
+      packages: read
+    runs-on: ubuntu-26.04
+    timeout-minutes: 60
+    env:
+      MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: ./.github/actions/setup-e2e-cli
+
+      - uses: ./.github/actions/setup-e2e-gateway
+
+      - uses: ./.github/actions/setup-e2e-sandbox
+
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
+        with:
+          github_access_token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: cachix/cachix-action@5f2d7c5294214f71b873db4b969586b980625e71 # v17
+        with:
+          name: openshell
+
+      - name: Install mise
+        run: |
+          curl https://mise.run | MISE_VERSION=v2026.4.25 sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          echo "$HOME/.local/share/mise/shims" >> "$GITHUB_PATH"
+
+      - name: Install tools
+        run: mise install --locked
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            clang \
+            cmake \
+            libclang-dev \
+            libssl-dev \
+            libz3-dev \
+            openssh-client \
+            pkg-config
+
+      - name: Run Fedora rootful Podman E2E
+        run: |
+          set -euo pipefail
+
+          mise x -- e2e/run.sh \
+            --vm fedora \
+            --with podman-rootful \
+            --guest-gateway-user root \
+            --cli-bin "$OPENSHELL_BIN" \
+            --gateway-bin "$OPENSHELL_GATEWAY_BIN" \
+            --sandbox-bin "$OPENSHELL_SANDBOX_BIN" \
+            --gateway-config e2e/configs/gateway/podman-rootful.toml \
+            --features e2e-podman \
+            --suite sandbox_lifecycle
   vm-e2e:
     needs: [pr_metadata, build-cli, build-gateway, build-vm-driver]
     if: needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_core_e2e == 'true'
@@ -394,7 +462,7 @@ jobs:
 
   core-e2e-result:
     name: Core E2E result
-    needs: [pr_metadata, docker-e2e, podman-e2e, vm-e2e, docker-external-driver-e2e, vm-external-driver-e2e, kubernetes-e2e, kubernetes-external-driver-e2e, kubernetes-workspace-managed-e2e, kubernetes-workspace-operator-e2e]
+    needs: [pr_metadata, docker-e2e, podman-e2e, podman-fedora-rootful-e2e, vm-e2e, docker-external-driver-e2e, vm-external-driver-e2e, kubernetes-e2e, kubernetes-external-driver-e2e, kubernetes-workspace-managed-e2e, kubernetes-workspace-operator-e2e]
     if: always() && needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_core_e2e == 'true'
     runs-on: ubuntu-latest
     steps:
