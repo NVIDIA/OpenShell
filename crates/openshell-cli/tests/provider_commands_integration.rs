@@ -45,6 +45,7 @@ struct ProviderState {
     profiles: Arc<Mutex<HashMap<String, ProviderProfile>>>,
     refresh_statuses: Arc<Mutex<HashMap<(String, String), ProviderCredentialRefreshStatus>>>,
     refresh_requests: Arc<Mutex<Vec<ProviderRefreshRequestLog>>>,
+    provider_update_requests: Arc<Mutex<Vec<Provider>>>,
     delete_provider_requests: Arc<Mutex<Vec<String>>>,
     fail_configure_refresh_message: Arc<Mutex<Option<String>>>,
     fail_rotate_refresh_message: Arc<Mutex<Option<String>>>,
@@ -611,6 +612,11 @@ impl OpenShell for TestOpenShell {
             .into_inner()
             .provider
             .ok_or_else(|| Status::invalid_argument("provider is required"))?;
+        self.state
+            .provider_update_requests
+            .lock()
+            .await
+            .push(provider.clone());
 
         let mut providers = self.state.providers.lock().await;
         let existing = providers
@@ -1211,6 +1217,12 @@ async fn provider_cli_run_functions_support_full_crud_flow() {
     })
     .await
     .expect("provider update");
+
+    let requests = ts.state.provider_update_requests.lock().await;
+    let request = requests.last().expect("provider update request");
+    assert_eq!(request.r#type, "claude-code");
+    assert_eq!(request.profile_workspace, "default");
+    drop(requests);
 
     run::provider_delete(&ts.endpoint, &["my-claude".to_string()], "default", &ts.tls)
         .await
