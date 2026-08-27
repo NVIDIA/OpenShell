@@ -5292,13 +5292,14 @@ mod tests {
         validate_sandbox_owner_identity(&owner, "sandbox-id-a", &sandbox)
             .expect("matching owner identity");
 
-        let wrong_uid = sandbox_object_for_test("sandbox-uid-b", "sandbox-id-a");
+        let mismatched_owner = sandbox_object_for_test("sandbox-uid-b", "sandbox-id-a");
         let error =
-            validate_sandbox_owner_identity(&owner, "sandbox-id-a", &wrong_uid).unwrap_err();
+            validate_sandbox_owner_identity(&owner, "sandbox-id-a", &mismatched_owner).unwrap_err();
         assert_eq!(error.code(), tonic::Code::PermissionDenied);
 
-        let wrong_id = sandbox_object_for_test("sandbox-uid-a", "sandbox-id-b");
-        let error = validate_sandbox_owner_identity(&owner, "sandbox-id-a", &wrong_id).unwrap_err();
+        let mismatched_annotation = sandbox_object_for_test("sandbox-uid-a", "sandbox-id-b");
+        let error = validate_sandbox_owner_identity(&owner, "sandbox-id-a", &mismatched_annotation)
+            .unwrap_err();
         assert_eq!(error.code(), tonic::Code::PermissionDenied);
     }
 
