@@ -1,0 +1,64 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: Build Docker Image
+description: Build and push one architecture of an OpenShell image
+
+inputs:
+  component:
+    description: Docker image and Dockerfile name
+    required: true
+  binary:
+    description: Binary staged in the Docker build context
+    required: true
+  triple:
+    description: Binary artifact target triple
+    required: true
+  arch:
+    description: Docker architecture name
+    required: true
+  platform:
+    description: Docker platform
+    required: true
+  github-token:
+    description: Token used to push the image
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - uses: ./.github/actions/setup-buildx
+      with:
+        buildkitd-config: /etc/buildkit/buildkitd.toml
+
+    - name: Log in to GHCR
+      shell: bash
+      run: echo "${{ inputs.github-token }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+    - name: Download ${{ inputs.binary }}
+      uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      with:
+        name: ${{ inputs.binary }}-${{ inputs.triple }}
+        path: artifact
+
+    - name: Stage ${{ inputs.binary }}
+      shell: bash
+      run: |
+        install -d deploy/docker/.build/prebuilt-binaries/${{ inputs.arch }}
+        tar -xzf artifact/${{ inputs.binary }}-${{ inputs.triple }}.tar.gz -C artifact
+        install -m 0755 artifact/${{ inputs.binary }} deploy/docker/.build/prebuilt-binaries/${{ inputs.arch }}/${{ inputs.binary }}
+
+    - name: Build ${{ inputs.component }} image
+      shell: bash
+      run: |
+        docker buildx build \
+          --builder openshell \
+          --platform ${{ inputs.platform }} \
+          --file deploy/docker/Dockerfile.${{ inputs.component }} \
+          --target ${{ inputs.component }} \
+          --tag ghcr.io/nvidia/openshell/${{ inputs.component }}:${{ github.sha }}-${{ inputs.arch }} \
+          --cache-from type=gha,scope=${{ inputs.component }}-${{ inputs.arch }} \
+          --cache-to type=gha,mode=max,scope=${{ inputs.component }}-${{ inputs.arch }} \
+          --provenance=false \
+          --push \
+          .

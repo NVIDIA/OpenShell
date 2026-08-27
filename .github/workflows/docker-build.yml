@@ -6,6 +6,15 @@ name: Docker Build
 on:
   workflow_call:
     inputs:
+      component:
+        required: true
+        type: string
+      binary:
+        required: true
+        type: string
+      target-suffix:
+        required: true
+        type: string
       checkout-ref:
         required: false
         type: string
@@ -17,33 +26,17 @@ permissions:
 
 jobs:
   build:
-    name: ${{ matrix.component }} (${{ matrix.platform }})
+    name: ${{ inputs.component }} (${{ matrix.platform }})
     strategy:
       fail-fast: false
       matrix:
         include:
-          - component: gateway
-            binary: openshell-gateway
-            triple: x86_64-unknown-linux-gnu
-            arch: amd64
+          - arch: amd64
+            rust_arch: x86_64
             platform: linux/amd64
             runner: linux-amd64-cpu8
-          - component: gateway
-            binary: openshell-gateway
-            triple: aarch64-unknown-linux-gnu
-            arch: arm64
-            platform: linux/arm64
-            runner: linux-arm64-cpu8
-          - component: supervisor
-            binary: openshell-sandbox
-            triple: x86_64-unknown-linux-musl
-            arch: amd64
-            platform: linux/amd64
-            runner: linux-amd64-cpu8
-          - component: supervisor
-            binary: openshell-sandbox
-            triple: aarch64-unknown-linux-musl
-            arch: arm64
+          - arch: arm64
+            rust_arch: aarch64
             platform: linux/arm64
             runner: linux-arm64-cpu8
     runs-on: ${{ matrix.runner }}
@@ -62,48 +55,18 @@ jobs:
         with:
           ref: ${{ inputs['checkout-ref'] || github.sha }}
 
-      - uses: ./.github/actions/setup-buildx
+      - uses: ./.github/actions/build-docker-image
         with:
-          buildkitd-config: /etc/buildkit/buildkitd.toml
-
-      - name: Log in to GHCR
-        shell: bash
-        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
-
-      - name: Download ${{ matrix.binary }}
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          name: ${{ matrix.binary }}-${{ matrix.triple }}
-          path: artifact
-
-      - name: Stage ${{ matrix.binary }}
-        shell: bash
-        run: |
-          install -d deploy/docker/.build/prebuilt-binaries/${{ matrix.arch }}
-          tar -xzf artifact/${{ matrix.binary }}-${{ matrix.triple }}.tar.gz -C artifact
-          install -m 0755 artifact/${{ matrix.binary }} deploy/docker/.build/prebuilt-binaries/${{ matrix.arch }}/${{ matrix.binary }}
-
-      - name: Build ${{ matrix.component }} image
-        shell: bash
-        run: |
-          docker buildx build \
-            --builder openshell \
-            --platform ${{ matrix.platform }} \
-            --file deploy/docker/Dockerfile.${{ matrix.component }} \
-            --target ${{ matrix.component }} \
-            --tag ghcr.io/nvidia/openshell/${{ matrix.component }}:${{ github.sha }}-${{ matrix.arch }} \
-            --cache-from type=gha,scope=${{ matrix.component }}-${{ matrix.arch }} \
-            --cache-to type=gha,mode=max,scope=${{ matrix.component }}-${{ matrix.arch }} \
-            --provenance=false \
-            --push \
-            .
+          component: ${{ inputs.component }}
+          binary: ${{ inputs.binary }}
+          triple: ${{ matrix.rust_arch }}-${{ inputs['target-suffix'] }}
+          arch: ${{ matrix.arch }}
+          platform: ${{ matrix.platform }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
 
   manifest:
-    name: ${{ matrix.component }} manifest
+    name: ${{ inputs.component }} manifest
     needs: build
-    strategy:
-      matrix:
-        component: [gateway, supervisor]
     runs-on: linux-amd64-cpu8
     timeout-minutes: 10
     container:
@@ -121,7 +84,7 @@ jobs:
       - name: Create manifest
         shell: bash
         run: |
-          image=ghcr.io/nvidia/openshell/${{ matrix.component }}
+          image=ghcr.io/nvidia/openshell/${{ inputs.component }}
           docker buildx imagetools create \
             --prefer-index=false \
             --tag "$image:${{ github.sha }}" \
