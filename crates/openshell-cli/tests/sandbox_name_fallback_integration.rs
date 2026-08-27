@@ -18,13 +18,13 @@ use openshell_core::proto::{
     ExchangeProviderSubjectTokenRequest, ExchangeProviderSubjectTokenResponse, ExecSandboxEvent,
     ExecSandboxInput, ExecSandboxRequest, GatewayMessage, GetGatewayConfigRequest,
     GetGatewayConfigResponse, GetProviderRequest, GetSandboxConfigRequest,
-    GetSandboxConfigResponse, GetSandboxPolicyStatusRequest, GetSandboxPolicyStatusResponse,
-    GetSandboxProviderEnvironmentRequest, GetSandboxProviderEnvironmentResponse, GetSandboxRequest,
+    GetSandboxPolicyStatusRequest, GetSandboxPolicyStatusResponse, GetSandboxRequest,
     HealthRequest, HealthResponse, ListProvidersRequest, ListProvidersResponse,
     ListSandboxProvidersRequest, ListSandboxProvidersResponse, ListSandboxesRequest,
     ListSandboxesResponse, NetworkEndpoint, NetworkPolicyRule, PolicyStatus, ProviderResponse,
-    Sandbox, SandboxPolicy, SandboxPolicyRevision, SandboxResponse, SandboxStreamEvent,
-    ServiceStatus, SupervisorMessage, UpdateProviderRequest, WatchSandboxRequest,
+    Sandbox, SandboxConfigSnapshot, SandboxPolicy, SandboxPolicyRevision, SandboxResponse,
+    SandboxStreamEvent, ServiceStatus, SupervisorMessage, UpdateProviderRequest,
+    WatchSandboxRequest,
 };
 use std::sync::Arc;
 use tempfile::TempDir;
@@ -162,13 +162,13 @@ impl OpenShell for TestOpenShell {
     async fn get_sandbox_config(
         &self,
         request: tonic::Request<GetSandboxConfigRequest>,
-    ) -> Result<Response<GetSandboxConfigResponse>, Status> {
+    ) -> Result<Response<SandboxConfigSnapshot>, Status> {
         let req = request.into_inner();
         assert_eq!(
             req.sandbox_id, "test-id",
             "GetSandboxConfig should pass the id from GetSandbox"
         );
-        Ok(Response::new(GetSandboxConfigResponse {
+        Ok(Response::new(SandboxConfigSnapshot {
             policy: Some(SandboxPolicy {
                 version: 9,
                 network_policies: [
@@ -220,15 +220,6 @@ impl OpenShell for TestOpenShell {
         _request: tonic::Request<GetGatewayConfigRequest>,
     ) -> Result<Response<GetGatewayConfigResponse>, Status> {
         Ok(Response::new(GetGatewayConfigResponse::default()))
-    }
-
-    async fn get_sandbox_provider_environment(
-        &self,
-        _request: tonic::Request<GetSandboxProviderEnvironmentRequest>,
-    ) -> Result<Response<GetSandboxProviderEnvironmentResponse>, Status> {
-        Ok(Response::new(
-            GetSandboxProviderEnvironmentResponse::default(),
-        ))
     }
 
     async fn create_ssh_session(

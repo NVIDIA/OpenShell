@@ -75,6 +75,29 @@ The Helm chart in `deploy/helm/openshell` deploys the gateway workload, service 
 
 Sandbox images are maintained separately in the [OpenShell Community](https://github.com/NVIDIA/OpenShell-Community) repository.
 
+## Gateway and Supervisor Compatibility
+
+Run the gateway and sandbox supervisor from the same OpenShell release. The
+supervisor session protocol changes in place and does not provide a legacy
+polling fallback. A release-matched gateway supplies the supervisor image by
+default for Docker, Podman, Kubernetes, and packaged installations. If you
+override that image, pin it to the same version as the gateway and recreate
+existing sandboxes during the upgrade.
+
+Raw protobuf consumers must regenerate when upgrading to the desired-state
+session protocol. The wire-compatible payload types were renamed as follows:
+
+| Previous generated type | Current generated type |
+|---|---|
+| `GetSandboxConfigResponse` | `SandboxConfigSnapshot` |
+| `GetSandboxProviderEnvironmentResponse` | `ProviderEnvironmentSnapshot` |
+| `GetInferenceBundleResponse` | `InferenceBundleSnapshot` |
+
+`GetSandboxConfig` keeps its existing RPC path and binary payload shape. The
+supervisor-only provider-environment and inference-bundle fetch methods were
+removed. The curated Rust, Go, and TypeScript client APIs continue to return
+their existing domain models rather than these generated snapshot types.
+
 To override the default image references, use Helm values:
 
 | Helm value | Purpose |

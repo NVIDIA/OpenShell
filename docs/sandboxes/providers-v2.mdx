@@ -987,7 +987,7 @@ Attach and detach are idempotent. Attach validates that the provider exists befo
 
 ### Runtime Limitations
 
-Provider attach and detach update the persisted sandbox provider list. Running sandboxes poll for provider environment revisions and effective policy changes.
+Provider attach and detach update the persisted sandbox provider list. The gateway pushes provider environment and effective policy changes to running sandboxes over the supervisor session.
 
 The policy effect applies to future effective policy reads after the sandbox observes the update. The credential environment effect applies only to new process launches after the update is observed, such as later SSH, exec, or SFTP sessions.
 

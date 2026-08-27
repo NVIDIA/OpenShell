@@ -333,7 +333,7 @@ process-supervision leaf and launches the user workload after the sidecar
 serves bootstrap state over a local control socket. The network sidecar owns
 gateway credentials and sends policy plus workload-facing provider environment
 state to the process leaf over that socket. It also streams provider
-environment updates after settings polls so future process sessions see
+environment updates received from the gateway so future process sessions see
 updated provider env without giving the process leaf gateway access. The
 pre-workload process supervisor is the only accepted control client: the
 network sidecar verifies its UID, GID, and PID with peer credentials, removes

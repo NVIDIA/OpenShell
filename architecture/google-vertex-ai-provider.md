@@ -65,8 +65,8 @@ Gateway (openshell-server)
   │           ├── infer_vertex_publisher()       model → publisher
   │           └── vertex_location_and_host()     region → Vertex API host
   │
-  └── GetInferenceBundleRequest (from sandbox on connect)
-        └── resolve_route_by_name()             re-resolves live route+credentials
+  └── ConfigBootstrap / ConfigUpdate snapshot builder
+        └── resolve_route_by_name()             resolves live route+credentials
 
 Router (openshell-router)
   │
@@ -412,10 +412,10 @@ Provider type normalization for the `ProviderRegistry` (non-inference providers 
 
 ## 9. Inference Routing in the Sandbox
 
-When a sandbox agent connects to `https://inference.local`, the sandbox fetches the
-inference bundle from the gateway (`GetInferenceBundleRequest`). The bundle contains one
-or more `ResolvedRoute` proto messages built by `resolve_route_by_name`. For a Vertex AI
-route the bundle contains:
+Before a sandbox agent connects to `https://inference.local`, the supervisor applies the
+inference snapshot delivered through `ConnectSupervisor`. The snapshot contains one or
+more `ResolvedRoute` proto messages built by `resolve_route_by_name`. For a Vertex AI
+route the snapshot contains:
 
 ```
 ResolvedRoute {

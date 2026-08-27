@@ -10,14 +10,6 @@ import "options.proto";
 
 // Inference service provides workspace-scoped inference route configuration and bundle delivery.
 service Inference {
-  // Return the resolved inference route bundle for sandbox-local execution.
-  rpc GetInferenceBundle(GetInferenceBundleRequest)
-      returns (GetInferenceBundleResponse) {
-    option (openshell.options.v1.authorization) = {
-      auth_mode: "sandbox"
-    };
-  }
-
   // Set the inference route for a workspace.
   //
   // This controls how requests sent to `inference.local` are routed
@@ -145,6 +137,9 @@ message DeleteInferenceRouteResponse {
   bool deleted = 1;
 }
 
+// Retained as a source-compatible message for raw SDK consumers. The
+// supervisor fetch RPC was removed; desired state now arrives on
+// ConnectSupervisor.
 message GetInferenceBundleRequest {}
 
 // A single resolved route ready for sandbox-local execution.
@@ -164,7 +159,7 @@ message ResolvedRoute {
   optional string request_path_override = 9;
 }
 
-message GetInferenceBundleResponse {
+message InferenceBundleSnapshot {
   repeated ResolvedRoute routes = 1;
   // Opaque revision tag for cache freshness checks.
   string revision = 2;

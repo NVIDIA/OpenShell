@@ -24,11 +24,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::proto::{
     DenialSummary, ExchangeProviderSubjectTokenRequest, GetDraftPolicyRequest,
-    GetInferenceBundleRequest, GetInferenceBundleResponse, GetSandboxConfigRequest,
-    GetSandboxProviderEnvironmentRequest, IssueSandboxTokenRequest, NetworkActivitySummary,
-    PolicyChunk, PolicySource, PolicyStatus, RefreshSandboxTokenRequest, ReportPolicyStatusRequest,
+    GetSandboxConfigRequest, IssueSandboxTokenRequest, NetworkActivitySummary, PolicyChunk,
+    PolicySource, PolicyStatus, RefreshSandboxTokenRequest, ReportPolicyStatusRequest,
     SandboxPolicy as ProtoSandboxPolicy, SubmitPolicyAnalysisRequest, SubmitPolicyAnalysisResponse,
-    UpdateConfigRequest, inference_client::InferenceClient, open_shell_client::OpenShellClient,
+    UpdateConfigRequest, open_shell_client::OpenShellClient,
 };
 use crate::sandbox_env;
 use miette::{IntoDiagnostic, Result, WrapErr};
@@ -681,12 +680,6 @@ async fn connect(endpoint: &str) -> Result<OpenShellClient<AuthedChannel>> {
     Ok(OpenShellClient::new(channel))
 }
 
-/// Connect to the inference service.
-async fn connect_inference(endpoint: &str) -> Result<InferenceClient<AuthedChannel>> {
-    let channel = connect_channel(endpoint).await?;
-    Ok(InferenceClient::new(channel))
-}
-
 /// Fetch sandbox policy from `OpenShell` server via gRPC.
 ///
 /// Returns `Ok(Some(policy))` when the server has a policy configured,
@@ -828,38 +821,6 @@ pub async fn sync_policy_and_fetch_snapshot(
     fetch_settings_snapshot_with_client(&mut client, sandbox_id).await
 }
 
-/// Fetch provider environment variables for a sandbox from `OpenShell` server via gRPC.
-///
-/// Returns a map of environment variable names to values derived from provider
-/// credentials configured on the sandbox. Returns an empty map if the sandbox
-/// has no providers or the call fails.
-pub async fn fetch_provider_environment(
-    endpoint: &str,
-    sandbox_id: &str,
-) -> Result<ProviderEnvironmentResult> {
-    debug!(endpoint = %endpoint, sandbox_id = %sandbox_id, "Fetching provider environment");
-
-    let mut client = connect(endpoint).await?;
-
-    let response = client
-        .get_sandbox_provider_environment(GetSandboxProviderEnvironmentRequest {
-            sandbox_id: sandbox_id.to_string(),
-            supports_static_credential_bindings: true,
-        })
-        .await
-        .into_diagnostic()?;
-
-    let inner = response.into_inner();
-    Ok(ProviderEnvironmentResult {
-        environment: inner.environment,
-        provider_env_revision: inner.provider_env_revision,
-        credential_expires_at_ms: inner.credential_expires_at_ms,
-        dynamic_credentials: inner.dynamic_credentials,
-        static_credential_bindings: inner.static_credential_bindings,
-        non_secret_environment_keys: inner.non_secret_environment_keys,
-    })
-}
-
 pub async fn exchange_provider_subject_token(
     endpoint: &str,
     sandbox_id: &str,
@@ -911,19 +872,20 @@ fn provider_subject_token_exchange_status(status: Status) -> miette::Report {
 
 /// A reusable gRPC client for the `OpenShell` service.
 ///
-/// Wraps a tonic channel connected once and reused for policy polling
-/// and status reporting, avoiding per-request TLS handshake overhead.
+/// Wraps a tonic channel connected once and reused for supervisor-triggered
+/// status, analysis, credential refresh, and configuration-read RPCs.
 #[derive(Clone)]
 pub struct CachedOpenShellClient {
     client: OpenShellClient<AuthedChannel>,
     workspace: Arc<tokio::sync::OnceCell<String>>,
     /// Extension credentials for this supervisor. Cloning the client shares
-    /// the store, so the middleware registry and the polling loop that rotates
-    /// it observe the same slots.
+    /// the store, so the middleware registry and credential refresh task
+    /// observe the same slots.
     extension_credentials: ExtensionCredentialStore,
 }
 
-/// Settings poll result returned by [`CachedOpenShellClient::poll_settings`].
+/// Effective configuration representation shared by public reads and the
+/// supervisor desired-state apply path.
 #[derive(Clone, Debug)]
 pub struct SettingsPollResult {
     pub policy: Option<ProtoSandboxPolicy>,
@@ -945,7 +907,7 @@ pub struct SettingsPollResult {
     pub extension_authentication_enabled: bool,
 }
 
-fn settings_poll_result(inner: crate::proto::GetSandboxConfigResponse) -> SettingsPollResult {
+pub fn settings_poll_result(inner: crate::proto::SandboxConfigSnapshot) -> SettingsPollResult {
     SettingsPollResult {
         policy: inner.policy,
         version: inner.version,
@@ -970,11 +932,11 @@ fn settings_poll_result(inner: crate::proto::GetSandboxConfigResponse) -> Settin
 mod settings_poll_tests {
     use super::settings_poll_result;
     use crate::PolicyValidationFailureMode;
-    use crate::proto::GetSandboxConfigResponse;
+    use crate::proto::SandboxConfigSnapshot;
 
     #[test]
     fn validation_failure_mode_round_trips_from_gateway_config() {
-        let result = settings_poll_result(GetSandboxConfigResponse {
+        let result = settings_poll_result(SandboxConfigSnapshot {
             policy_validation_failure_mode: "retain_last_valid".to_string(),
             ..Default::default()
         });
@@ -986,7 +948,7 @@ mod settings_poll_tests {
 
     #[test]
     fn unknown_validation_failure_mode_fails_closed() {
-        let result = settings_poll_result(GetSandboxConfigResponse {
+        let result = settings_poll_result(SandboxConfigSnapshot {
             policy_validation_failure_mode: "future_mode".to_string(),
             ..Default::default()
         });
@@ -998,24 +960,15 @@ mod settings_poll_tests {
 
     #[test]
     fn extension_authentication_capability_round_trips_and_defaults_disabled() {
-        let enabled = settings_poll_result(GetSandboxConfigResponse {
+        let enabled = settings_poll_result(SandboxConfigSnapshot {
             extension_authentication_enabled: true,
             ..Default::default()
         });
         assert!(enabled.extension_authentication_enabled);
 
-        let legacy = settings_poll_result(GetSandboxConfigResponse::default());
+        let legacy = settings_poll_result(SandboxConfigSnapshot::default());
         assert!(!legacy.extension_authentication_enabled);
     }
-}
-
-pub struct ProviderEnvironmentResult {
-    pub environment: HashMap<String, String>,
-    pub provider_env_revision: u64,
-    pub credential_expires_at_ms: HashMap<String, i64>,
-    pub dynamic_credentials: HashMap<String, crate::proto::ProviderProfileCredential>,
-    pub static_credential_bindings: HashMap<String, crate::proto::StaticCredentialBinding>,
-    pub non_secret_environment_keys: Vec<String>,
 }
 
 pub struct ProviderSubjectTokenExchangeResult {
@@ -1031,15 +984,13 @@ impl CachedOpenShellClient {
 
     /// Connect while sharing an existing credential store.
     ///
-    /// The supervisor opens the gateway channel more than once (policy load,
-    /// then the polling loop). Both must observe the same slots, otherwise the
-    /// credentials handed to the middleware registry are not the ones the loop
-    /// rotates.
+    /// Configuration application and the independent credential refresh task
+    /// must observe the same slots as the installed middleware registry.
     pub async fn connect_with_credentials(
         endpoint: &str,
         extension_credentials: ExtensionCredentialStore,
     ) -> Result<Self> {
-        debug!(endpoint = %endpoint, "Connecting openshell gRPC client for policy polling");
+        debug!(endpoint = %endpoint, "Connecting cached openshell gRPC client");
         let client = connect(endpoint).await?;
         Ok(Self {
             client,
@@ -1130,13 +1081,12 @@ impl CachedOpenShellClient {
             .map(drop)
     }
 
-    /// Returns the workspace learned from the server, or empty if not yet polled.
+    /// Returns the workspace learned from a configuration snapshot.
     pub fn workspace(&self) -> String {
         self.workspace.get().cloned().unwrap_or_default()
     }
 
-    /// Pre-seed the workspace without polling. The value is ignored if the
-    /// workspace was already learned from `poll_settings`.
+    /// Pre-seed the workspace from a session-delivered configuration snapshot.
     pub fn set_workspace(&self, workspace: String) {
         let _ = self.workspace.set(workspace);
     }
@@ -1221,18 +1171,4 @@ impl CachedOpenShellClient {
 
         Ok(())
     }
-}
-
-/// Fetch the resolved inference route bundle from the server.
-pub async fn fetch_inference_bundle(endpoint: &str) -> Result<GetInferenceBundleResponse> {
-    debug!(endpoint = %endpoint, "Fetching inference route bundle");
-
-    let mut client = connect_inference(endpoint).await?;
-
-    let response = client
-        .get_inference_bundle(GetInferenceBundleRequest {})
-        .await
-        .into_diagnostic()?;
-
-    Ok(response.into_inner())
 }

@@ -16,13 +16,16 @@ use tonic::Status;
 #[derive(Debug, Clone)]
 pub struct SandboxWatchBus {
     inner: Arc<Mutex<HashMap<String, broadcast::Sender<()>>>>,
+    global: broadcast::Sender<()>,
 }
 
 impl SandboxWatchBus {
     #[must_use]
     pub fn new() -> Self {
+        let (global, _rx) = broadcast::channel(128);
         Self {
             inner: Arc::new(Mutex::new(HashMap::new())),
+            global,
         }
     }
 
@@ -47,6 +50,16 @@ impl SandboxWatchBus {
     /// Subscribe to sandbox updates.
     pub fn subscribe(&self, sandbox_id: &str) -> broadcast::Receiver<()> {
         self.sender_for(sandbox_id).subscribe()
+    }
+
+    /// Notify consumers whose desired state can depend on workspace-wide data.
+    pub fn notify_all(&self) {
+        let _ = self.global.send(());
+    }
+
+    /// Subscribe to workspace-wide desired-state invalidations.
+    pub fn subscribe_all(&self) -> broadcast::Receiver<()> {
+        self.global.subscribe()
     }
 
     /// Remove the bus entry for the given sandbox id.
@@ -113,5 +126,19 @@ mod tests {
         let bus = SandboxWatchBus::new();
         // Should not panic
         bus.remove("nonexistent");
+    }
+
+    #[test]
+    fn global_notifications_are_independent_from_sandbox_notifications() {
+        let bus = SandboxWatchBus::new();
+        let mut sandbox_rx = bus.subscribe("sb-1");
+        let mut global_rx = bus.subscribe_all();
+
+        bus.notify_all();
+        assert!(global_rx.try_recv().is_ok());
+        assert!(matches!(
+            sandbox_rx.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
     }
 }

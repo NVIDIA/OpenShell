@@ -352,15 +352,15 @@ message EffectiveSetting {
   SettingScope scope = 2;
 }
 
-// Source used for the policy payload in GetSandboxConfigResponse.
+// Source used for the policy payload in SandboxConfigSnapshot.
 enum PolicySource {
   POLICY_SOURCE_UNSPECIFIED = 0;
   POLICY_SOURCE_SANDBOX = 1;
   POLICY_SOURCE_GLOBAL = 2;
 }
 
-// Response containing effective sandbox settings and policy.
-message GetSandboxConfigResponse {
+// Complete effective sandbox settings and policy snapshot.
+message SandboxConfigSnapshot {
   // The sandbox policy configuration.
   SandboxPolicy policy = 1;
   // Current policy version (monotonically increasing per sandbox).

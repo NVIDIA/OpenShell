@@ -238,6 +238,11 @@ podman pull ghcr.io/nvidia/openshell/supervisor:latest
 podman pull ghcr.io/nvidia/openshell-community/sandboxes/base:latest
 ```
 
+Use the same release tag for the gateway and supervisor when the package is
+pinned to a versioned image rather than `latest`. Restart the gateway and
+recreate existing sandboxes after the upgrade. The supervisor session does not
+fall back to the legacy configuration polling protocol across mixed versions.
+
 ### Migrating from gateway.env
 
 Previous releases generated `~/.config/openshell/gateway.env` on first

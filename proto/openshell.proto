@@ -7,6 +7,7 @@ package openshell.v1;
 
 import "datamodel.proto";
 import "google/protobuf/struct.proto";
+import "inference.proto";
 import "options.proto";
 import "sandbox.proto";
 
@@ -354,9 +355,10 @@ service OpenShell {
     };
   }
 
-  // Get sandbox settings by id (called by sandbox entrypoint and poll loop).
+  // Get sandbox settings by id. This remains a public read API; supervisors
+  // receive the same snapshot through ConnectSupervisor.
   rpc GetSandboxConfig(openshell.sandbox.v1.GetSandboxConfigRequest)
-      returns (openshell.sandbox.v1.GetSandboxConfigResponse) {
+      returns (openshell.sandbox.v1.SandboxConfigSnapshot) {
     option (openshell.options.v1.authorization) = {
       auth_mode: "dual"
       scope: "config:read"
@@ -413,14 +415,6 @@ service OpenShell {
   // Report policy load result (called by sandbox after reload attempt).
   rpc ReportPolicyStatus(ReportPolicyStatusRequest)
       returns (ReportPolicyStatusResponse) {
-    option (openshell.options.v1.authorization) = {
-      auth_mode: "sandbox"
-    };
-  }
-
-  // Get provider environment for a sandbox (called by sandbox supervisor at startup).
-  rpc GetSandboxProviderEnvironment(GetSandboxProviderEnvironmentRequest)
-      returns (GetSandboxProviderEnvironmentResponse) {
     option (openshell.options.v1.authorization) = {
       auth_mode: "sandbox"
     };
@@ -1874,13 +1868,11 @@ message DeleteProviderProfileResponse {
   bool deleted = 1;
 }
 
-// Get sandbox provider environment request.
+// Retained as a source-compatible message for raw SDK consumers. The
+// supervisor fetch RPC was removed; desired state now arrives on
+// ConnectSupervisor.
 message GetSandboxProviderEnvironmentRequest {
-  // The sandbox ID.
   string sandbox_id = 1;
-  // Whether the requesting supervisor enforces endpoint bindings for static
-  // provider credentials. Gateways withhold static credential material when
-  // this capability is absent.
   bool supports_static_credential_bindings = 2;
 }
 
@@ -1906,8 +1898,8 @@ message StaticCredentialBinding {
   string workload_credential_handle = 3;
 }
 
-// Get sandbox provider environment response.
-message GetSandboxProviderEnvironmentResponse {
+// Complete provider environment and credential snapshot for a sandbox.
+message ProviderEnvironmentSnapshot {
   // Provider credential environment variables.
   map<string, string> environment = 1 [(openshell.options.v1.secret) = true];
   // Fingerprint for the provider credential inputs that produced environment.
@@ -2187,6 +2179,9 @@ message SupervisorMessage {
     SupervisorHeartbeat heartbeat = 2;
     RelayOpenResult relay_open_result = 3;
     RelayClose relay_close = 4;
+    ConfigBootstrapResult bootstrap_result = 5;
+    ConfigUpdateResult config_update_result = 6;
+    SupervisorRuntimeReady runtime_ready = 7;
   }
 }
 
@@ -2198,6 +2193,7 @@ message GatewayMessage {
     GatewayHeartbeat heartbeat = 3;
     RelayOpen relay_open = 4;
     RelayClose relay_close = 5;
+    ConfigUpdate config_update = 6;
   }
 }
 
@@ -2215,6 +2211,83 @@ message SessionAccepted {
   string session_id = 1;
   // Recommended heartbeat interval in seconds.
   uint32 heartbeat_interval_secs = 2;
+  // Complete gateway-owned desired state. Its presence is the compatibility
+  // gate for supervisors that use gateway-backed configuration.
+  ConfigBootstrap bootstrap = 3;
+}
+
+// Complete desired state required to initialize a gateway-backed supervisor.
+message ConfigBootstrap {
+  openshell.sandbox.v1.SandboxConfigSnapshot sandbox_config = 1;
+  ProviderEnvironmentSnapshot provider_environment = 2;
+  openshell.inference.v1.InferenceBundleSnapshot inference_bundle = 3;
+}
+
+enum ConfigBootstrapStatus {
+  CONFIG_BOOTSTRAP_STATUS_UNSPECIFIED = 0;
+  CONFIG_BOOTSTRAP_STATUS_READY = 1;
+  CONFIG_BOOTSTRAP_STATUS_FAILED = 2;
+}
+
+// Aggregate bootstrap acknowledgement with a terminal outcome for every
+// component. Error text is sanitized and bounded by the sender.
+message ConfigBootstrapResult {
+  ConfigBootstrapStatus status = 1;
+  string error = 2;
+  ConfigApplyOutcome sandbox_config_outcome = 3;
+  ConfigApplyOutcome provider_environment_outcome = 4;
+  ConfigApplyOutcome inference_bundle_outcome = 5;
+}
+
+// A level-triggered update for exactly one desired-state component.
+message ConfigUpdate {
+  // Opaque, non-empty identifier scoped to the active session.
+  string request_id = 1;
+  oneof component {
+    SandboxConfigUpdate sandbox_config = 2;
+    ProviderEnvironmentUpdate provider_environment = 3;
+    InferenceBundleUpdate inference_bundle = 4;
+  }
+  // Monotonic within one session and component. Snapshot revisions remain
+  // content fingerprints and are compared only for equality.
+  uint64 component_sequence = 5;
+}
+
+message SandboxConfigUpdate {
+  openshell.sandbox.v1.SandboxConfigSnapshot snapshot = 1;
+}
+
+message ProviderEnvironmentUpdate {
+  ProviderEnvironmentSnapshot snapshot = 1;
+}
+
+message InferenceBundleUpdate {
+  openshell.inference.v1.InferenceBundleSnapshot snapshot = 1;
+}
+
+enum ConfigApplyOutcome {
+  CONFIG_APPLY_OUTCOME_UNSPECIFIED = 0;
+  CONFIG_APPLY_OUTCOME_APPLIED = 1;
+  CONFIG_APPLY_OUTCOME_IGNORED_DUPLICATE = 2;
+  CONFIG_APPLY_OUTCOME_IGNORED_STALE = 3;
+  CONFIG_APPLY_OUTCOME_RETAINED_LOCAL_OVERRIDE = 4;
+  CONFIG_APPLY_OUTCOME_DEGRADED = 5;
+  CONFIG_APPLY_OUTCOME_FAILED = 6;
+  CONFIG_APPLY_OUTCOME_UNSUPPORTED = 7;
+}
+
+message ConfigUpdateResult {
+  string request_id = 1;
+  uint64 component_sequence = 2;
+  ConfigApplyOutcome outcome = 3;
+  // Sanitized error text, capped at 1 KiB by the sender.
+  string error = 4;
+}
+
+// Signals that runtime-dependent services such as SSH and relays are ready.
+message SupervisorRuntimeReady {
+  // Canonical workload instance associated with this ready runtime.
+  string instance_id = 1;
 }
 
 // Gateway rejects the supervisor session.

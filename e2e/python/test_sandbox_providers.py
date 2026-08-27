@@ -3,8 +3,8 @@
 
 """E2E tests for supervisor-managed provider placeholders in sandboxes.
 
-Provider credentials are fetched at runtime by the sandbox supervisor via the
-GetSandboxProviderEnvironment gRPC call. Sandboxed child processes should see
+Provider credentials are delivered at runtime in the supervisor session's
+bootstrap and live desired-state updates. Sandboxed child processes should see
 placeholder values (not raw secrets). Credentials must never be present in the
 persisted sandbox spec environment map.
 """

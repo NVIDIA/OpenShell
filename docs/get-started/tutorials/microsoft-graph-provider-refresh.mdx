@@ -181,7 +181,7 @@ The request uses the [Microsoft Graph list messages API](https://learn.microsoft
 
 ## Update Running Sandboxes
 
-Provider refresh updates the provider record at the gateway. Running sandboxes poll for provider environment revisions, but already-running processes keep the environment they started with.
+Provider refresh updates the provider record at the gateway. The gateway pushes the new provider environment to running sandboxes, but already-running processes keep the environment they started with.
 
 If you attach this provider to an existing sandbox or update provider credentials after a process has already started, launch a new process inside the sandbox before expecting `MS_GRAPH_ACCESS_TOKEN` to appear in that process environment.
 

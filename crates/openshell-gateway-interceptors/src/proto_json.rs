@@ -381,10 +381,7 @@ mod tests {
                 "material",
             ),
             ("openshell.v1.ConfigureProviderRefreshRequest", "material"),
-            (
-                "openshell.v1.GetSandboxProviderEnvironmentResponse",
-                "environment",
-            ),
+            ("openshell.v1.ProviderEnvironmentSnapshot", "environment"),
         ] {
             let message = codec.message_descriptor(message_name).unwrap();
             let field = message.get_field_by_name(field_name).unwrap();

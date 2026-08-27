@@ -7,11 +7,10 @@ use openshell_core::inference::{
     VERTEX_AI_PROJECT_ID_KEY, VERTEX_AI_PUBLISHER_KEY, VERTEX_AI_REGION_KEY,
 };
 use openshell_core::proto::{
-    DeleteInferenceRouteRequest, DeleteInferenceRouteResponse, GetInferenceBundleRequest,
-    GetInferenceBundleResponse, GetInferenceRouteRequest, GetInferenceRouteResponse,
-    InferenceRoute, InferenceRouteConfig, Provider, ResolvedRoute, Sandbox,
-    SetInferenceRouteRequest, SetInferenceRouteResponse, ValidatedEndpoint,
-    inference_server::Inference,
+    DeleteInferenceRouteRequest, DeleteInferenceRouteResponse, GetInferenceRouteRequest,
+    GetInferenceRouteResponse, InferenceBundleSnapshot, InferenceRoute, InferenceRouteConfig,
+    Provider, ResolvedRoute, Sandbox, SetInferenceRouteRequest, SetInferenceRouteResponse,
+    ValidatedEndpoint, inference_server::Inference,
 };
 use openshell_core::{ObjectId, ObjectLabels, ObjectWorkspace};
 use openshell_providers::normalize_provider_type;
@@ -64,27 +63,6 @@ impl ObjectType for InferenceRoute {
 
 #[tonic::async_trait]
 impl Inference for InferenceService {
-    async fn get_inference_bundle(
-        &self,
-        request: Request<GetInferenceBundleRequest>,
-    ) -> Result<Response<GetInferenceBundleResponse>, Status> {
-        let sandbox_id = authorize_inference_bundle(
-            request
-                .extensions()
-                .get::<crate::auth::principal::Principal>(),
-        )?;
-        let sandbox: Sandbox = self
-            .state
-            .store
-            .get_message::<Sandbox>(&sandbox_id)
-            .await
-            .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
-            .ok_or_else(|| Status::not_found(format!("sandbox '{sandbox_id}' not found")))?;
-        build_inference_bundle_snapshot(&self.state, &sandbox)
-            .await
-            .map(Response::new)
-    }
-
     async fn set_inference_route(
         &self,
         request: Request<SetInferenceRouteRequest>,
@@ -116,6 +94,7 @@ impl Inference for InferenceService {
             verify,
         )
         .await?;
+        self.state.sandbox_watch_bus.notify_all();
 
         let config = route
             .route
@@ -212,6 +191,9 @@ impl Inference for InferenceService {
             .delete_by_name(InferenceRoute::object_type(), &workspace, route_name)
             .await
             .map_err(|e| Status::internal(format!("delete route failed: {e}")))?;
+        if deleted {
+            self.state.sandbox_watch_bus.notify_all();
+        }
         Ok(Response::new(DeleteInferenceRouteResponse { deleted }))
     }
 }
@@ -1011,6 +993,7 @@ fn find_provider_config_value(provider: &Provider, preferred_keys: &[&str]) -> O
     None
 }
 
+#[cfg(test)]
 fn authorize_inference_bundle(
     principal: Option<&crate::auth::principal::Principal>,
 ) -> Result<String, Status> {
@@ -1030,7 +1013,7 @@ fn authorize_inference_bundle(
 async fn resolve_inference_bundle(
     store: &Store,
     workspace: &str,
-) -> Result<GetInferenceBundleResponse, Status> {
+) -> Result<InferenceBundleSnapshot, Status> {
     resolve_inference_bundle_with_credentials(store, workspace, None).await
 }
 
@@ -1038,7 +1021,7 @@ async fn resolve_inference_bundle_with_credentials(
     store: &Store,
     workspace: &str,
     credentials: Option<&crate::credentials::CredentialRuntime>,
-) -> Result<GetInferenceBundleResponse, Status> {
+) -> Result<InferenceBundleSnapshot, Status> {
     let mut routes = Vec::new();
     if let Some(r) = resolve_route_by_name_with_credentials(
         store,
@@ -1087,7 +1070,7 @@ async fn resolve_inference_bundle_with_credentials(
         format!("{:016x}", hasher.finish())
     };
 
-    Ok(GetInferenceBundleResponse {
+    Ok(InferenceBundleSnapshot {
         routes,
         revision,
         generated_at_ms: now_ms,
@@ -1101,7 +1084,7 @@ async fn resolve_inference_bundle_with_credentials(
 pub async fn build_inference_bundle_snapshot(
     state: &ServerState,
     sandbox: &Sandbox,
-) -> Result<GetInferenceBundleResponse, Status> {
+) -> Result<InferenceBundleSnapshot, Status> {
     resolve_inference_bundle_with_credentials(
         state.store.as_ref(),
         sandbox.object_workspace(),
@@ -3778,7 +3761,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn inference_snapshot_builder_matches_fetch_rpc_payload() {
+    async fn inference_snapshot_builder_resolves_complete_payload() {
         use crate::grpc::test_support::test_server_state;
         use openshell_core::proto::SandboxSpec;
         use openshell_core::proto::datamodel::v1::ObjectMeta;
@@ -3820,19 +3803,9 @@ mod tests {
         let built = build_inference_bundle_snapshot(&state, &sandbox)
             .await
             .expect("build snapshot");
-        let service = InferenceService::new(state);
-        let mut request = Request::new(GetInferenceBundleRequest {});
-        request.extensions_mut().insert(test_sandbox_principal());
-        let fetched = service
-            .get_inference_bundle(request)
-            .await
-            .expect("fetch bundle")
-            .into_inner();
-
-        assert_eq!(built.routes, fetched.routes);
-        assert_eq!(built.revision, fetched.revision);
+        assert_eq!(built.routes.len(), 1);
+        assert!(!built.revision.is_empty());
         assert!(built.generated_at_ms > 0);
-        assert!(fetched.generated_at_ms > 0);
     }
 
     /// Non-member callers must receive `PERMISSION_DENIED` — not `NOT_FOUND` —

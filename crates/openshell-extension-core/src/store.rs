@@ -26,7 +26,7 @@ struct Entry {
 /// Per-service extension credentials held by one supervisor.
 ///
 /// Cloning shares the underlying map, so the registry's middleware clients and
-/// the polling loop that rotates them observe the same slots. Ownership is
+/// the credential refresh task that rotates them observe the same slots. Ownership is
 /// explicit rather than process-global: tests construct independent stores and
 /// cannot interfere with each other.
 #[derive(Clone, Default)]

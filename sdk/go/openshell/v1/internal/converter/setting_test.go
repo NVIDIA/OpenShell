@@ -243,10 +243,10 @@ func TestEffectiveSettingFromProto_Nil(t *testing.T) {
 	assert.Nil(t, es)
 }
 
-// --- SandboxConfig (GetSandboxConfigResponse → SandboxConfig) ---
+// --- SandboxConfig (SandboxConfigSnapshot → SandboxConfig) ---
 
 func TestSandboxConfigFromProto(t *testing.T) {
-	resp := &sbv1.GetSandboxConfigResponse{
+	resp := &sbv1.SandboxConfigSnapshot{
 		Policy: &sbv1.SandboxPolicy{
 			Version: 7,
 			Filesystem: &sbv1.FilesystemPolicy{
@@ -305,7 +305,7 @@ func TestSandboxConfigFromProto(t *testing.T) {
 }
 
 func TestSandboxConfigFromProto_NilPolicy(t *testing.T) {
-	resp := &sbv1.GetSandboxConfigResponse{
+	resp := &sbv1.SandboxConfigSnapshot{
 		Version:    1,
 		PolicyHash: "sha256:empty",
 	}
@@ -324,7 +324,7 @@ func TestSandboxConfigFromProto_Nil(t *testing.T) {
 }
 
 func TestSandboxConfigFromProto_SettingsDeepCopy(t *testing.T) {
-	resp := &sbv1.GetSandboxConfigResponse{
+	resp := &sbv1.SandboxConfigSnapshot{
 		Settings: map[string]*sbv1.EffectiveSetting{
 			"key1": {
 				Value: &sbv1.SettingValue{

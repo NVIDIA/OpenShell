@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::collections::HashMap;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -13,9 +14,12 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use openshell_core::proto::{
-    GatewayMessage, RelayFrame, RelayInit, RelayOpen, ReportMainProcessExitRequest,
-    ReportMainProcessExitResponse, Sandbox, SandboxPhase, SessionAccepted, SshRelayTarget,
-    SupervisorMessage, gateway_message, relay_open, supervisor_message,
+    ConfigApplyOutcome, ConfigBootstrap, ConfigBootstrapResult, ConfigBootstrapStatus,
+    ConfigUpdate, ConfigUpdateResult, GatewayMessage, InferenceBundleUpdate,
+    ProviderEnvironmentUpdate, RelayFrame, RelayInit, RelayOpen, ReportMainProcessExitRequest,
+    ReportMainProcessExitResponse, Sandbox, SandboxConfigUpdate, SandboxPhase, SessionAccepted,
+    SshRelayTarget, SupervisorMessage, config_update, gateway_message, relay_open,
+    supervisor_message,
 };
 use openshell_core::transport_errors::is_expected_transport_close_status;
 
@@ -23,6 +27,8 @@ use crate::ServerState;
 use crate::auth::principal::Principal;
 
 const HEARTBEAT_INTERVAL_SECS: u32 = 15;
+const BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(120);
+const CONFIG_UPDATE_TIMEOUT: Duration = Duration::from_secs(60);
 const RELAY_PENDING_TIMEOUT: Duration = Duration::from_secs(10);
 /// Initial backoff between session-availability polls in `wait_for_session`.
 const SESSION_WAIT_INITIAL_BACKOFF: Duration = Duration::from_millis(100);
@@ -38,6 +44,164 @@ const MAX_PENDING_RELAYS: usize = 256;
 /// consume the entire global budget. Sits above the SSH-tunnel per-sandbox
 /// cap (20) so tunnel-specific limits still fire first for that caller.
 const MAX_PENDING_RELAYS_PER_SANDBOX: usize = 32;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DesiredStateComponent {
+    SandboxConfig,
+    ProviderEnvironment,
+    InferenceBundle,
+}
+
+#[derive(Debug)]
+struct InFlightUpdate {
+    request_id: String,
+    component_sequence: u64,
+    revision: String,
+    sent_at: Instant,
+}
+
+#[derive(Debug)]
+struct ComponentDeliveryState {
+    applied_revision: String,
+    next_sequence: u64,
+    in_flight: Option<InFlightUpdate>,
+    pending_revision: Option<String>,
+}
+
+impl ComponentDeliveryState {
+    fn new(applied_revision: impl ToString) -> Self {
+        Self {
+            applied_revision: applied_revision.to_string(),
+            next_sequence: 1,
+            in_flight: None,
+            pending_revision: None,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct DesiredStateDelivery {
+    sandbox_config: ComponentDeliveryState,
+    provider_environment: ComponentDeliveryState,
+    inference_bundle: ComponentDeliveryState,
+}
+
+#[derive(Debug)]
+struct AppliedUpdateResult {
+    component: DesiredStateComponent,
+    outcome: ConfigApplyOutcome,
+}
+
+impl DesiredStateDelivery {
+    fn new(bootstrap: &ConfigBootstrap) -> Result<Self, Status> {
+        let sandbox_config = bootstrap
+            .sandbox_config
+            .as_ref()
+            .ok_or_else(|| Status::internal("bootstrap sandbox config is missing"))?;
+        let provider_environment = bootstrap
+            .provider_environment
+            .as_ref()
+            .ok_or_else(|| Status::internal("bootstrap provider environment is missing"))?;
+        let inference_bundle = bootstrap
+            .inference_bundle
+            .as_ref()
+            .ok_or_else(|| Status::internal("bootstrap inference bundle is missing"))?;
+        Ok(Self {
+            sandbox_config: ComponentDeliveryState::new(sandbox_config.config_revision),
+            provider_environment: ComponentDeliveryState::new(
+                provider_environment.provider_env_revision,
+            ),
+            inference_bundle: ComponentDeliveryState::new(&inference_bundle.revision),
+        })
+    }
+
+    fn state_mut(&mut self, component: DesiredStateComponent) -> &mut ComponentDeliveryState {
+        match component {
+            DesiredStateComponent::SandboxConfig => &mut self.sandbox_config,
+            DesiredStateComponent::ProviderEnvironment => &mut self.provider_environment,
+            DesiredStateComponent::InferenceBundle => &mut self.inference_bundle,
+        }
+    }
+
+    fn has_pending_update(&self) -> bool {
+        self.sandbox_config.pending_revision.is_some()
+            || self.provider_environment.pending_revision.is_some()
+            || self.inference_bundle.pending_revision.is_some()
+    }
+
+    fn expire_timed_out(&mut self) -> Vec<DesiredStateComponent> {
+        let mut expired = Vec::new();
+        for (component, state) in [
+            (
+                DesiredStateComponent::SandboxConfig,
+                &mut self.sandbox_config,
+            ),
+            (
+                DesiredStateComponent::ProviderEnvironment,
+                &mut self.provider_environment,
+            ),
+            (
+                DesiredStateComponent::InferenceBundle,
+                &mut self.inference_bundle,
+            ),
+        ] {
+            if state
+                .in_flight
+                .as_ref()
+                .is_some_and(|update| update.sent_at.elapsed() >= CONFIG_UPDATE_TIMEOUT)
+            {
+                state.in_flight = None;
+                expired.push(component);
+            }
+        }
+        expired
+    }
+
+    fn handle_result(
+        &mut self,
+        result: &ConfigUpdateResult,
+    ) -> Result<Option<AppliedUpdateResult>, String> {
+        if result.request_id.is_empty() {
+            return Err("config update result has an empty request_id".to_string());
+        }
+        let matches = [
+            DesiredStateComponent::SandboxConfig,
+            DesiredStateComponent::ProviderEnvironment,
+            DesiredStateComponent::InferenceBundle,
+        ]
+        .into_iter()
+        .find(|component| {
+            self.state_mut(*component)
+                .in_flight
+                .as_ref()
+                .is_some_and(|update| update.request_id == result.request_id)
+        });
+        let Some(component) = matches else {
+            return Ok(None);
+        };
+        let state = self.state_mut(component);
+        let Some(update) = state.in_flight.take() else {
+            return Ok(None);
+        };
+        if update.component_sequence != result.component_sequence {
+            state.in_flight = Some(update);
+            return Err("config update result component_sequence mismatch".to_string());
+        }
+        let outcome = ConfigApplyOutcome::try_from(result.outcome)
+            .map_err(|_| "config update result has an unknown outcome".to_string())?;
+        let terminal_success = matches!(
+            outcome,
+            ConfigApplyOutcome::Applied
+                | ConfigApplyOutcome::IgnoredDuplicate
+                | ConfigApplyOutcome::RetainedLocalOverride
+                | ConfigApplyOutcome::Degraded
+        );
+        if terminal_success {
+            state.applied_revision = update.revision;
+        }
+        Ok(Some(AppliedUpdateResult { component, outcome }))
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Session registry
@@ -59,6 +223,8 @@ struct LiveSession {
     shutdown: oneshot::Sender<()>,
     #[allow(dead_code)]
     connected_at: Instant,
+    initialized: bool,
+    runtime_ready: bool,
 }
 
 /// Holds a oneshot sender that will deliver the upgraded relay stream or a
@@ -125,6 +291,8 @@ impl SupervisorSessionRegistry {
                 tx,
                 shutdown,
                 connected_at: Instant::now(),
+                initialized: false,
+                runtime_ready: false,
             },
         );
         match previous {
@@ -202,11 +370,54 @@ impl SupervisorSessionRegistry {
             .lock()
             .unwrap()
             .get(sandbox_id)
-            .map(|s| s.tx.clone())
+            .filter(|session| session.initialized && session.runtime_ready)
+            .map(|session| session.tx.clone())
     }
 
     pub fn has_session(&self, sandbox_id: &str) -> bool {
         self.sessions.lock().unwrap().contains_key(sandbox_id)
+    }
+
+    pub fn has_ready_session(&self, sandbox_id: &str) -> bool {
+        self.sessions
+            .lock()
+            .unwrap()
+            .get(sandbox_id)
+            .is_some_and(|session| session.initialized && session.runtime_ready)
+    }
+
+    fn is_initialized(&self, sandbox_id: &str, session_id: &str) -> bool {
+        self.sessions
+            .lock()
+            .unwrap()
+            .get(sandbox_id)
+            .is_some_and(|session| session.session_id == session_id && session.initialized)
+    }
+
+    /// Mark bootstrap complete. Returns whether runtime-ready was already set.
+    pub fn mark_initialized(&self, sandbox_id: &str, session_id: &str) -> bool {
+        let mut sessions = self.sessions.lock().unwrap();
+        let Some(session) = sessions.get_mut(sandbox_id) else {
+            return false;
+        };
+        if session.session_id != session_id {
+            return false;
+        }
+        session.initialized = true;
+        session.runtime_ready
+    }
+
+    /// Mark runtime services ready. Returns whether bootstrap is also complete.
+    pub fn mark_runtime_ready(&self, sandbox_id: &str, session_id: &str) -> bool {
+        let mut sessions = self.sessions.lock().unwrap();
+        let Some(session) = sessions.get_mut(sandbox_id) else {
+            return false;
+        };
+        if session.session_id != session_id {
+            return false;
+        }
+        session.runtime_ready = true;
+        session.initialized
     }
 
     pub fn is_current_session(&self, sandbox_id: &str, session_id: &str) -> bool {
@@ -456,16 +667,155 @@ pub fn spawn_relay_reaper(state: Arc<ServerState>, interval: Duration) {
 async fn require_persisted_sandbox(
     store: &Arc<crate::persistence::Store>,
     sandbox_id: &str,
-) -> Result<(), Status> {
+) -> Result<Sandbox, Status> {
     let sandbox = store
         .get_message::<Sandbox>(sandbox_id)
         .await
         .map_err(|err| Status::internal(format!("failed to load sandbox: {err}")))?;
 
-    if sandbox.is_none() {
-        return Err(Status::not_found("sandbox not found"));
+    sandbox.ok_or_else(|| Status::not_found("sandbox not found"))
+}
+
+fn reconciliation_interval(sandbox_id: &str) -> Duration {
+    let mut hasher = DefaultHasher::new();
+    sandbox_id.hash(&mut hasher);
+    Duration::from_secs(24 + hasher.finish() % 13)
+}
+
+async fn reconcile_desired_state(
+    state: &Arc<ServerState>,
+    sandbox_id: &str,
+    tx: &mpsc::Sender<GatewayMessage>,
+    delivery: &mut DesiredStateDelivery,
+) -> Result<(), Status> {
+    for component in delivery.expire_timed_out() {
+        let (condition_component, component_label) = match component {
+            DesiredStateComponent::SandboxConfig => ("SandboxConfig", "sandbox config"),
+            DesiredStateComponent::ProviderEnvironment => {
+                ("ProviderEnvironment", "provider environment")
+            }
+            DesiredStateComponent::InferenceBundle => ("InferenceBundle", "inference bundle"),
+        };
+        if let Err(error) = state
+            .compute
+            .supervisor_config_update_result(
+                sandbox_id,
+                condition_component,
+                false,
+                "DesiredStateApplyTimedOut",
+                &format!("Latest {component_label} desired-state update timed out"),
+            )
+            .await
+        {
+            warn!(sandbox_id = %sandbox_id, error = %error, "failed to persist desired-state update timeout");
+        }
+    }
+    let sandbox = require_persisted_sandbox(&state.store, sandbox_id).await?;
+    let (sandbox_config, provider_environment, inference_bundle) = tokio::join!(
+        crate::grpc::policy::build_sandbox_config_snapshot(state, &sandbox),
+        crate::grpc::policy::build_provider_environment_snapshot(state, &sandbox, true),
+        crate::inference::build_inference_bundle_snapshot(state, &sandbox),
+    );
+
+    let mut errors = Vec::new();
+    match sandbox_config {
+        Ok(snapshot) => {
+            if let Err(error) = send_component_update(
+                tx,
+                DesiredStateComponent::SandboxConfig,
+                snapshot.config_revision.to_string(),
+                config_update::Component::SandboxConfig(SandboxConfigUpdate {
+                    snapshot: Some(snapshot),
+                }),
+                delivery,
+            )
+            .await
+            {
+                errors.push(format!("sandbox config delivery: {error}"));
+            }
+        }
+        Err(error) => errors.push(format!("sandbox config snapshot: {error}")),
+    }
+    match provider_environment {
+        Ok(snapshot) => {
+            if let Err(error) = send_component_update(
+                tx,
+                DesiredStateComponent::ProviderEnvironment,
+                snapshot.provider_env_revision.to_string(),
+                config_update::Component::ProviderEnvironment(ProviderEnvironmentUpdate {
+                    snapshot: Some(snapshot),
+                }),
+                delivery,
+            )
+            .await
+            {
+                errors.push(format!("provider environment delivery: {error}"));
+            }
+        }
+        Err(error) => errors.push(format!("provider environment snapshot: {error}")),
+    }
+    match inference_bundle {
+        Ok(snapshot) => {
+            if let Err(error) = send_component_update(
+                tx,
+                DesiredStateComponent::InferenceBundle,
+                snapshot.revision.clone(),
+                config_update::Component::InferenceBundle(InferenceBundleUpdate {
+                    snapshot: Some(snapshot),
+                }),
+                delivery,
+            )
+            .await
+            {
+                errors.push(format!("inference bundle delivery: {error}"));
+            }
+        }
+        Err(error) => errors.push(format!("inference bundle snapshot: {error}")),
     }
 
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(Status::internal(errors.join("; ")))
+    }
+}
+
+async fn send_component_update(
+    tx: &mpsc::Sender<GatewayMessage>,
+    component: DesiredStateComponent,
+    revision: String,
+    payload: config_update::Component,
+    delivery: &mut DesiredStateDelivery,
+) -> Result<(), Status> {
+    let state = delivery.state_mut(component);
+    if revision == state.applied_revision {
+        state.pending_revision = None;
+        return Ok(());
+    }
+    if let Some(in_flight) = state.in_flight.as_ref() {
+        state.pending_revision = (revision != in_flight.revision).then_some(revision);
+        return Ok(());
+    }
+    let request_id = Uuid::new_v4().to_string();
+    let component_sequence = state.next_sequence;
+    let message = GatewayMessage {
+        payload: Some(gateway_message::Payload::ConfigUpdate(ConfigUpdate {
+            request_id: request_id.clone(),
+            component: Some(payload),
+            component_sequence,
+        })),
+    };
+    tx.send(message)
+        .await
+        .map_err(|_| Status::unavailable("supervisor session outbound queue closed"))?;
+    state.next_sequence = state.next_sequence.saturating_add(1);
+    state.in_flight = Some(InFlightUpdate {
+        request_id,
+        component_sequence,
+        revision,
+        sent_at: Instant::now(),
+    });
+    state.pending_revision = None;
     Ok(())
 }
 
@@ -704,7 +1054,19 @@ pub async fn handle_connect_supervisor(
     if let Some(principal) = principal.as_ref() {
         crate::auth::guard::ensure_sandbox_principal_scope(principal, &sandbox_id)?;
     }
-    require_persisted_sandbox(&state.store, &sandbox_id).await?;
+    let sandbox = require_persisted_sandbox(&state.store, &sandbox_id).await?;
+
+    let (sandbox_config, provider_environment, inference_bundle) = tokio::try_join!(
+        crate::grpc::policy::build_sandbox_config_snapshot(state, &sandbox),
+        crate::grpc::policy::build_provider_environment_snapshot(state, &sandbox, true),
+        crate::inference::build_inference_bundle_snapshot(state, &sandbox),
+    )?;
+    let bootstrap = ConfigBootstrap {
+        sandbox_config: Some(sandbox_config),
+        provider_environment: Some(provider_environment),
+        inference_bundle: Some(inference_bundle),
+    };
+    let delivery = DesiredStateDelivery::new(&bootstrap)?;
 
     let session_id = Uuid::new_v4().to_string();
     info!(
@@ -736,6 +1098,7 @@ pub async fn handle_connect_supervisor(
         payload: Some(gateway_message::Payload::SessionAccepted(SessionAccepted {
             session_id: session_id.clone(),
             heartbeat_interval_secs: HEARTBEAT_INTERVAL_SECS,
+            bootstrap: Some(bootstrap),
         })),
     };
     if tx.send(accepted).await.is_err() {
@@ -754,21 +1117,6 @@ pub async fn handle_connect_supervisor(
             .await;
     }
 
-    if let Err(err) = state
-        .compute
-        .supervisor_session_connected(&sandbox_id, &hello.instance_id)
-        .await
-    {
-        warn!(
-            sandbox_id = %sandbox_id,
-            session_id = %session_id,
-            error = %err,
-            "supervisor session: failed to mark sandbox ready"
-        );
-    } else {
-        state.telemetry.sandbox_session_connected(&sandbox_id);
-    }
-
     // Step 4: Spawn the session loop that reads inbound messages.
     let state_clone = Arc::clone(state);
     let sandbox_id_clone = sandbox_id.clone();
@@ -778,6 +1126,7 @@ pub async fn handle_connect_supervisor(
             &sandbox_id_clone,
             &session_id,
             &tx,
+            delivery,
             &mut inbound,
             shutdown_rx,
         )
@@ -844,6 +1193,7 @@ async fn run_session_loop(
     sandbox_id: &str,
     session_id: &str,
     tx: &mpsc::Sender<GatewayMessage>,
+    mut delivery: DesiredStateDelivery,
     inbound: &mut tonic::Streaming<SupervisorMessage>,
     mut shutdown_rx: oneshot::Receiver<()>,
 ) {
@@ -851,6 +1201,12 @@ async fn run_session_loop(
     let mut heartbeat_timer = tokio::time::interval(heartbeat_interval);
     // Skip the first immediate tick.
     heartbeat_timer.tick().await;
+    let bootstrap_timeout = tokio::time::sleep(BOOTSTRAP_TIMEOUT);
+    tokio::pin!(bootstrap_timeout);
+    let mut sandbox_updates = state.sandbox_watch_bus.subscribe(sandbox_id);
+    let mut global_updates = state.sandbox_watch_bus.subscribe_all();
+    let mut reconciliation_timer = tokio::time::interval(reconciliation_interval(sandbox_id));
+    reconciliation_timer.tick().await;
 
     loop {
         tokio::select! {
@@ -861,7 +1217,38 @@ async fn run_session_loop(
             msg = inbound.message() => {
                 match msg {
                     Ok(Some(msg)) => {
-                        handle_supervisor_message(state, sandbox_id, session_id, msg);
+                        let is_update_result = matches!(
+                            &msg.payload,
+                            Some(supervisor_message::Payload::ConfigUpdateResult(_))
+                        );
+                        if !handle_supervisor_message(
+                            state,
+                            sandbox_id,
+                            session_id,
+                            msg,
+                            &mut delivery,
+                        )
+                        .await
+                        {
+                            break;
+                        }
+                        if is_update_result
+                            && delivery.has_pending_update()
+                            && let Err(error) = reconcile_desired_state(
+                                state,
+                                sandbox_id,
+                                tx,
+                                &mut delivery,
+                            )
+                            .await
+                        {
+                            warn!(
+                                sandbox_id = %sandbox_id,
+                                session_id = %session_id,
+                                error = %error,
+                                "supervisor session: desired-state reconciliation failed"
+                            );
+                        }
                     }
                     Ok(None) => {
                         info!(sandbox_id = %sandbox_id, session_id = %session_id, "supervisor session: stream closed by supervisor");
@@ -889,6 +1276,85 @@ async fn run_session_loop(
                     }
                 }
             }
+            update = sandbox_updates.recv(),
+                if state.supervisor_sessions.is_initialized(sandbox_id, session_id) =>
+            {
+                if update.is_ok()
+                    && let Err(error) = reconcile_desired_state(
+                        state,
+                        sandbox_id,
+                        tx,
+                        &mut delivery,
+                    )
+                    .await
+                {
+                    warn!(
+                        sandbox_id = %sandbox_id,
+                        session_id = %session_id,
+                        error = %error,
+                        "supervisor session: desired-state notification failed"
+                    );
+                }
+            }
+            update = global_updates.recv(),
+                if state.supervisor_sessions.is_initialized(sandbox_id, session_id) =>
+            {
+                if update.is_ok()
+                    && let Err(error) = reconcile_desired_state(
+                        state,
+                        sandbox_id,
+                        tx,
+                        &mut delivery,
+                    )
+                    .await
+                {
+                    warn!(
+                        sandbox_id = %sandbox_id,
+                        session_id = %session_id,
+                        error = %error,
+                        "supervisor session: global desired-state notification failed"
+                    );
+                }
+            }
+            _ = reconciliation_timer.tick(),
+                if state.supervisor_sessions.is_initialized(sandbox_id, session_id) =>
+            {
+                if let Err(error) = reconcile_desired_state(
+                    state,
+                    sandbox_id,
+                    tx,
+                    &mut delivery,
+                )
+                .await
+                {
+                    warn!(
+                        sandbox_id = %sandbox_id,
+                        session_id = %session_id,
+                        error = %error,
+                        "supervisor session: periodic desired-state reconciliation failed"
+                    );
+                }
+            }
+            () = &mut bootstrap_timeout,
+                if !state.supervisor_sessions.is_initialized(sandbox_id, session_id) =>
+            {
+                warn!(
+                    sandbox_id = %sandbox_id,
+                    session_id = %session_id,
+                    "supervisor session: bootstrap result timed out"
+                );
+                if let Err(error) = state
+                    .compute
+                    .supervisor_bootstrap_failed(
+                        sandbox_id,
+                        "Supervisor configuration bootstrap timed out",
+                    )
+                    .await
+                {
+                    warn!(sandbox_id = %sandbox_id, session_id = %session_id, error = %error, "supervisor session: failed to persist bootstrap timeout");
+                }
+                break;
+            }
             _ = heartbeat_timer.tick() => {
                 let hb = GatewayMessage {
                     payload: Some(gateway_message::Payload::Heartbeat(
@@ -904,15 +1370,158 @@ async fn run_session_loop(
     }
 }
 
-fn handle_supervisor_message(
+async fn handle_supervisor_message(
     state: &Arc<ServerState>,
     sandbox_id: &str,
     session_id: &str,
     msg: SupervisorMessage,
-) {
+    delivery: &mut DesiredStateDelivery,
+) -> bool {
     match msg.payload {
         Some(supervisor_message::Payload::Heartbeat(_)) => {
             // Heartbeat received — nothing to do for now.
+        }
+        Some(supervisor_message::Payload::BootstrapResult(result)) => {
+            if let Err(error) = validate_bootstrap_result(&result) {
+                warn!(
+                    sandbox_id = %sandbox_id,
+                    session_id = %session_id,
+                    error = %error,
+                    "supervisor session: bootstrap failed"
+                );
+                if let Err(persist_error) = state
+                    .compute
+                    .supervisor_bootstrap_failed(sandbox_id, &error)
+                    .await
+                {
+                    warn!(sandbox_id = %sandbox_id, session_id = %session_id, error = %persist_error, "supervisor session: failed to persist bootstrap failure");
+                }
+                return false;
+            }
+            for (component, component_label, outcome) in [
+                (
+                    "ProviderEnvironment",
+                    "provider environment",
+                    result.provider_environment_outcome,
+                ),
+                (
+                    "InferenceBundle",
+                    "inference bundle",
+                    result.inference_bundle_outcome,
+                ),
+            ] {
+                if ConfigApplyOutcome::try_from(outcome).ok() == Some(ConfigApplyOutcome::Degraded)
+                {
+                    let message = sanitize_update_error(&result.error, component_label);
+                    if let Err(error) = state
+                        .compute
+                        .supervisor_config_update_result(
+                            sandbox_id,
+                            component,
+                            false,
+                            "DesiredStateBootstrapDegraded",
+                            &message,
+                        )
+                        .await
+                    {
+                        warn!(sandbox_id = %sandbox_id, session_id = %session_id, error = %error, "supervisor session: failed to persist degraded bootstrap component");
+                    }
+                }
+            }
+            state
+                .supervisor_sessions
+                .mark_initialized(sandbox_id, session_id);
+            info!(
+                sandbox_id = %sandbox_id,
+                session_id = %session_id,
+                "supervisor session: bootstrap applied"
+            );
+        }
+        Some(supervisor_message::Payload::RuntimeReady(ready)) => {
+            if ready.instance_id.is_empty() {
+                warn!(
+                    sandbox_id = %sandbox_id,
+                    session_id = %session_id,
+                    "supervisor session: runtime-ready signal omitted instance_id"
+                );
+                return false;
+            }
+            if !state
+                .supervisor_sessions
+                .is_initialized(sandbox_id, session_id)
+            {
+                warn!(
+                    sandbox_id = %sandbox_id,
+                    session_id = %session_id,
+                    "supervisor session: runtime-ready arrived before bootstrap result"
+                );
+                return false;
+            }
+            let became_ready = state
+                .supervisor_sessions
+                .mark_runtime_ready(sandbox_id, session_id);
+            if became_ready {
+                mark_supervisor_ready(state, sandbox_id, session_id, &ready.instance_id).await;
+            }
+        }
+        Some(supervisor_message::Payload::ConfigUpdateResult(result)) => {
+            match delivery.handle_result(&result) {
+                Ok(Some(applied)) => {
+                    let (component, component_label) = match applied.component {
+                        DesiredStateComponent::SandboxConfig => ("SandboxConfig", "sandbox config"),
+                        DesiredStateComponent::ProviderEnvironment => {
+                            ("ProviderEnvironment", "provider environment")
+                        }
+                        DesiredStateComponent::InferenceBundle => {
+                            ("InferenceBundle", "inference bundle")
+                        }
+                    };
+                    let healthy = matches!(
+                        applied.outcome,
+                        ConfigApplyOutcome::Applied
+                            | ConfigApplyOutcome::IgnoredDuplicate
+                            | ConfigApplyOutcome::RetainedLocalOverride
+                    );
+                    let reason = if healthy {
+                        "DesiredStateApplied"
+                    } else if applied.outcome == ConfigApplyOutcome::Degraded {
+                        "DesiredStateDegraded"
+                    } else {
+                        "DesiredStateApplyFailed"
+                    };
+                    let message = if healthy {
+                        format!("Latest {component_label} desired state applied")
+                    } else {
+                        sanitize_update_error(&result.error, component_label)
+                    };
+                    if let Err(error) = state
+                        .compute
+                        .supervisor_config_update_result(
+                            sandbox_id, component, healthy, reason, &message,
+                        )
+                        .await
+                    {
+                        warn!(
+                            sandbox_id = %sandbox_id,
+                            session_id = %session_id,
+                            request_id = %result.request_id,
+                            error = %error,
+                            "supervisor session: failed to persist config update result"
+                        );
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    warn!(
+                        sandbox_id = %sandbox_id,
+                        session_id = %session_id,
+                        request_id = %result.request_id,
+                        error = %error,
+                        "supervisor session: invalid config update result"
+                    );
+                    return false;
+                }
+            }
         }
         Some(supervisor_message::Payload::RelayOpenResult(result)) => {
             if result.success {
@@ -952,6 +1561,92 @@ fn handle_supervisor_message(
                 "supervisor session: unexpected message type"
             );
         }
+    }
+    true
+}
+
+fn validate_bootstrap_result(result: &ConfigBootstrapResult) -> Result<(), String> {
+    if ConfigBootstrapStatus::try_from(result.status).ok() != Some(ConfigBootstrapStatus::Ready) {
+        return Err(sanitize_session_error(&result.error));
+    }
+    let config_outcome = ConfigApplyOutcome::try_from(result.sandbox_config_outcome).ok();
+    if !matches!(
+        config_outcome,
+        Some(
+            ConfigApplyOutcome::Applied
+                | ConfigApplyOutcome::IgnoredDuplicate
+                | ConfigApplyOutcome::RetainedLocalOverride
+        )
+    ) {
+        return Err("sandbox_config: invalid required bootstrap outcome".to_string());
+    }
+    for (component, outcome) in [
+        ("provider_environment", result.provider_environment_outcome),
+        ("inference_bundle", result.inference_bundle_outcome),
+    ] {
+        if !matches!(
+            ConfigApplyOutcome::try_from(outcome).ok(),
+            Some(
+                ConfigApplyOutcome::Applied
+                    | ConfigApplyOutcome::IgnoredDuplicate
+                    | ConfigApplyOutcome::RetainedLocalOverride
+                    | ConfigApplyOutcome::Degraded
+            )
+        ) {
+            return Err(format!("{component}: invalid bootstrap outcome"));
+        }
+    }
+    Ok(())
+}
+
+fn sanitize_session_error(error: &str) -> String {
+    const MAX_ERROR_BYTES: usize = 1024;
+    let mut sanitized: String = error
+        .chars()
+        .filter(|character| !character.is_control())
+        .collect();
+    if sanitized.len() > MAX_ERROR_BYTES {
+        let mut boundary = MAX_ERROR_BYTES;
+        while !sanitized.is_char_boundary(boundary) {
+            boundary -= 1;
+        }
+        sanitized.truncate(boundary);
+    }
+    if sanitized.is_empty() {
+        "bootstrap rejected without an error".to_string()
+    } else {
+        sanitized
+    }
+}
+
+fn sanitize_update_error(error: &str, component: &str) -> String {
+    let sanitized = sanitize_session_error(error);
+    if error.is_empty() {
+        format!("Latest {component} desired state was not applied")
+    } else {
+        sanitized
+    }
+}
+
+async fn mark_supervisor_ready(
+    state: &Arc<ServerState>,
+    sandbox_id: &str,
+    session_id: &str,
+    instance_id: &str,
+) {
+    if let Err(err) = state
+        .compute
+        .supervisor_session_connected(sandbox_id, instance_id)
+        .await
+    {
+        warn!(
+            sandbox_id = %sandbox_id,
+            session_id = %session_id,
+            error = %err,
+            "supervisor session: failed to mark sandbox ready"
+        );
+    } else {
+        state.telemetry.sandbox_session_connected(sandbox_id);
     }
 }
 
@@ -1031,6 +1726,224 @@ mod tests {
                 provider: IdentityProvider::Oidc,
             },
         })
+    }
+
+    fn desired_state_bootstrap() -> ConfigBootstrap {
+        ConfigBootstrap {
+            sandbox_config: Some(openshell_core::proto::SandboxConfigSnapshot {
+                config_revision: 11,
+                ..Default::default()
+            }),
+            provider_environment: Some(openshell_core::proto::ProviderEnvironmentSnapshot {
+                provider_env_revision: 22,
+                ..Default::default()
+            }),
+            inference_bundle: Some(openshell_core::proto::InferenceBundleSnapshot {
+                revision: "inference-33".to_string(),
+                ..Default::default()
+            }),
+        }
+    }
+
+    fn mark_session_ready(
+        registry: &SupervisorSessionRegistry,
+        sandbox_id: &str,
+        session_id: &str,
+    ) {
+        assert!(!registry.mark_initialized(sandbox_id, session_id));
+        assert!(registry.mark_runtime_ready(sandbox_id, session_id));
+    }
+
+    #[test]
+    fn readiness_requires_initialized_and_runtime_ready() {
+        let registry = SupervisorSessionRegistry::new();
+        let (tx, _rx) = mpsc::channel(1);
+        registry.register(
+            "sbx".to_string(),
+            "session".to_string(),
+            tx,
+            make_shutdown(),
+        );
+
+        assert!(!registry.has_ready_session("sbx"));
+        assert!(!registry.mark_initialized("sbx", "session"));
+        assert!(!registry.has_ready_session("sbx"));
+        assert!(registry.mark_runtime_ready("sbx", "session"));
+        assert!(registry.has_ready_session("sbx"));
+    }
+
+    #[test]
+    fn desired_state_delivery_uses_bootstrap_fingerprints() {
+        let delivery = DesiredStateDelivery::new(&desired_state_bootstrap()).unwrap();
+
+        assert_eq!(delivery.sandbox_config.applied_revision, "11");
+        assert_eq!(delivery.provider_environment.applied_revision, "22");
+        assert_eq!(delivery.inference_bundle.applied_revision, "inference-33");
+    }
+
+    #[tokio::test]
+    async fn component_delivery_coalesces_while_one_update_is_in_flight() {
+        let mut delivery = DesiredStateDelivery::new(&desired_state_bootstrap()).unwrap();
+        let (tx, mut rx) = mpsc::channel(4);
+        let payload = || {
+            config_update::Component::SandboxConfig(SandboxConfigUpdate {
+                snapshot: Some(openshell_core::proto::SandboxConfigSnapshot::default()),
+            })
+        };
+
+        send_component_update(
+            &tx,
+            DesiredStateComponent::SandboxConfig,
+            "12".to_string(),
+            payload(),
+            &mut delivery,
+        )
+        .await
+        .unwrap();
+        send_component_update(
+            &tx,
+            DesiredStateComponent::SandboxConfig,
+            "13".to_string(),
+            payload(),
+            &mut delivery,
+        )
+        .await
+        .unwrap();
+
+        let first = rx.recv().await.unwrap();
+        assert!(rx.try_recv().is_err());
+        assert!(delivery.has_pending_update());
+        let gateway_message::Payload::ConfigUpdate(first) = first.payload.unwrap() else {
+            panic!("expected config update");
+        };
+        assert_eq!(first.component_sequence, 1);
+        let applied = delivery
+            .handle_result(&ConfigUpdateResult {
+                request_id: first.request_id,
+                component_sequence: first.component_sequence,
+                outcome: ConfigApplyOutcome::Applied as i32,
+                error: String::new(),
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(applied.component, DesiredStateComponent::SandboxConfig);
+        assert!(delivery.has_pending_update());
+
+        send_component_update(
+            &tx,
+            DesiredStateComponent::SandboxConfig,
+            "13".to_string(),
+            payload(),
+            &mut delivery,
+        )
+        .await
+        .unwrap();
+        let second = rx.recv().await.unwrap();
+        let gateway_message::Payload::ConfigUpdate(second) = second.payload.unwrap() else {
+            panic!("expected config update");
+        };
+        assert_eq!(second.component_sequence, 2);
+        assert!(!delivery.has_pending_update());
+    }
+
+    #[tokio::test]
+    async fn failed_update_waits_for_reconciliation_before_retrying() {
+        let mut delivery = DesiredStateDelivery::new(&desired_state_bootstrap()).unwrap();
+        let (tx, mut rx) = mpsc::channel(2);
+        let payload = || {
+            config_update::Component::SandboxConfig(SandboxConfigUpdate {
+                snapshot: Some(openshell_core::proto::SandboxConfigSnapshot::default()),
+            })
+        };
+
+        send_component_update(
+            &tx,
+            DesiredStateComponent::SandboxConfig,
+            "12".to_string(),
+            payload(),
+            &mut delivery,
+        )
+        .await
+        .unwrap();
+        let first = rx.recv().await.unwrap();
+        let gateway_message::Payload::ConfigUpdate(first) = first.payload.unwrap() else {
+            panic!("expected config update");
+        };
+        delivery
+            .handle_result(&ConfigUpdateResult {
+                request_id: first.request_id,
+                component_sequence: first.component_sequence,
+                outcome: ConfigApplyOutcome::Failed as i32,
+                error: "rejected".to_string(),
+            })
+            .unwrap();
+
+        assert!(!delivery.has_pending_update());
+        assert_eq!(delivery.sandbox_config.applied_revision, "11");
+        assert!(rx.try_recv().is_err());
+
+        send_component_update(
+            &tx,
+            DesiredStateComponent::SandboxConfig,
+            "12".to_string(),
+            payload(),
+            &mut delivery,
+        )
+        .await
+        .unwrap();
+        let retry = rx.recv().await.unwrap();
+        let gateway_message::Payload::ConfigUpdate(retry) = retry.payload.unwrap() else {
+            panic!("expected retry update");
+        };
+        assert_eq!(retry.component_sequence, 2);
+    }
+
+    #[test]
+    fn mismatched_component_sequence_is_a_protocol_error() {
+        let mut delivery = DesiredStateDelivery::new(&desired_state_bootstrap()).unwrap();
+        delivery.sandbox_config.in_flight = Some(InFlightUpdate {
+            request_id: "request".to_string(),
+            component_sequence: 4,
+            revision: "12".to_string(),
+            sent_at: Instant::now(),
+        });
+
+        let error = delivery
+            .handle_result(&ConfigUpdateResult {
+                request_id: "request".to_string(),
+                component_sequence: 5,
+                outcome: ConfigApplyOutcome::Applied as i32,
+                error: String::new(),
+            })
+            .unwrap_err();
+        assert!(error.contains("component_sequence mismatch"));
+        assert!(delivery.sandbox_config.in_flight.is_some());
+    }
+
+    #[test]
+    fn bootstrap_allows_degraded_optional_components_only() {
+        let optional_degraded = ConfigBootstrapResult {
+            status: ConfigBootstrapStatus::Ready as i32,
+            sandbox_config_outcome: ConfigApplyOutcome::Applied as i32,
+            provider_environment_outcome: ConfigApplyOutcome::Degraded as i32,
+            inference_bundle_outcome: ConfigApplyOutcome::RetainedLocalOverride as i32,
+            error: String::new(),
+        };
+        assert!(validate_bootstrap_result(&optional_degraded).is_ok());
+
+        let required_degraded = ConfigBootstrapResult {
+            sandbox_config_outcome: ConfigApplyOutcome::Degraded as i32,
+            ..optional_degraded
+        };
+        assert!(validate_bootstrap_result(&required_degraded).is_err());
+    }
+
+    #[test]
+    fn reconciliation_interval_stays_within_twenty_percent() {
+        for sandbox_id in ["a", "sandbox-1", "sandbox-2", "a-longer-sandbox-id"] {
+            let interval = reconciliation_interval(sandbox_id);
+            assert!((24..=36).contains(&interval.as_secs()));
+        }
     }
 
     // ---- registry: register / remove ----
@@ -1141,6 +2054,7 @@ mod tests {
         let registry = SupervisorSessionRegistry::new();
         let (tx, mut rx) = mpsc::channel(4);
         registry.register("sbx".to_string(), "s1".to_string(), tx, make_shutdown());
+        mark_session_ready(&registry, "sbx", "s1");
 
         let (channel_id, _relay_rx) = registry
             .open_relay("sbx", Duration::from_secs(1))
@@ -1184,6 +2098,7 @@ mod tests {
                 tx,
                 make_shutdown(),
             );
+            mark_session_ready(&registry_for_register, "sbx", "s1");
         });
 
         let result = registry.open_relay("sbx", Duration::from_secs(2)).await;
@@ -1198,6 +2113,7 @@ mod tests {
         let registry = SupervisorSessionRegistry::new();
         let (tx, rx) = mpsc::channel::<GatewayMessage>(4);
         registry.register("sbx".to_string(), "s1".to_string(), tx, make_shutdown());
+        mark_session_ready(&registry, "sbx", "s1");
 
         // Simulate the supervisor's stream going away between lookup and send:
         // the receiver held by `ReceiverStream` is dropped.
@@ -1223,6 +2139,8 @@ mod tests {
             make_shutdown(),
         );
         registry.register("sbx-b".to_string(), "s-b".to_string(), tx, make_shutdown());
+        mark_session_ready(&registry, "sbx-a", "s-a");
+        mark_session_ready(&registry, "sbx-b", "s-b");
 
         // Pre-seed pending_relays to exactly the global cap, split across two
         // sandboxes so neither hits the per-sandbox cap first.
@@ -1251,6 +2169,7 @@ mod tests {
         let registry = SupervisorSessionRegistry::new();
         let (tx, _rx) = mpsc::channel::<GatewayMessage>(8);
         registry.register("sbx".to_string(), "s".to_string(), tx, make_shutdown());
+        mark_session_ready(&registry, "sbx", "s");
 
         {
             let mut pending = registry.pending_relays.lock().unwrap();
@@ -1278,6 +2197,7 @@ mod tests {
             tx2,
             make_shutdown(),
         );
+        mark_session_ready(&registry, "sbx-other", "s-other");
         registry
             .open_relay("sbx-other", Duration::from_millis(50))
             .await
@@ -1309,6 +2229,7 @@ mod tests {
             tx_new,
             make_shutdown(),
         );
+        mark_session_ready(&registry, "sbx", "s-new");
 
         let (_channel_id, _relay_rx) = registry
             .open_relay("sbx", Duration::from_secs(1))
@@ -1369,6 +2290,7 @@ mod tests {
             tx_old,
             make_shutdown(),
         );
+        mark_session_ready(&registry, "sbx", "s-old");
 
         let (channel_id, _relay_rx) = registry
             .open_relay("sbx", Duration::from_secs(1))
@@ -1391,6 +2313,7 @@ mod tests {
             make_shutdown(),
         );
         assert!(superseded);
+        mark_session_ready(&registry, "sbx", "s-new");
 
         registry
             .replay_pending_relays("sbx", &registry.lookup_session("sbx").unwrap())

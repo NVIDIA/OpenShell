@@ -5,9 +5,9 @@
 //!
 //! Resolves inference routes from one of two sources at sandbox startup:
 //! a local YAML file (`--inference-routes`) or a cluster bundle fetched via
-//! gRPC. Builds the [`InferenceContext`] consumed by the proxy's L7 layer
-//! and spawns a background refresh loop in cluster mode so route changes
-//! propagate without restarting the sandbox.
+//! the supervisor session. Builds the [`InferenceContext`] consumed by the
+//! proxy's L7 layer. Later cluster changes replace the shared route caches
+//! through desired-state delivery.
 //!
 //! Distinct from [`crate::l7::inference`], which parses HTTP requests and
 //! matches them against API patterns at request time.
@@ -18,19 +18,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use miette::Result;
-use tracing::{info, trace, warn};
 
 use openshell_ocsf::{
     ConfigStateChangeBuilder, SeverityId, StateId, StatusId, ctx::ctx as ocsf_ctx, ocsf_emit,
 };
-
-/// Default interval (seconds) for re-fetching the inference route bundle from
-/// the gateway in cluster mode.
-///
-/// Override at runtime with the `OPENSHELL_ROUTE_REFRESH_INTERVAL_SECS`
-/// environment variable. File-based routes (`--inference-routes`) are loaded
-/// once at startup and never refreshed.
-pub const DEFAULT_ROUTE_REFRESH_INTERVAL_SECS: u64 = 5;
 
 /// Route name for the sandbox system inference route.
 const SANDBOX_SYSTEM_ROUTE_NAME: &str = "sandbox-system";
@@ -60,31 +51,6 @@ pub fn disable_inference_on_empty_routes(source: InferenceRouteSource) -> bool {
     !matches!(source, InferenceRouteSource::Cluster)
 }
 
-pub fn route_refresh_interval_secs() -> u64 {
-    let Ok(value) = std::env::var("OPENSHELL_ROUTE_REFRESH_INTERVAL_SECS") else {
-        return DEFAULT_ROUTE_REFRESH_INTERVAL_SECS;
-    };
-    match value.parse::<u64>() {
-        Ok(interval) if interval > 0 => interval,
-        Ok(_) => {
-            warn!(
-                default_interval_secs = DEFAULT_ROUTE_REFRESH_INTERVAL_SECS,
-                "Ignoring zero route refresh interval"
-            );
-            DEFAULT_ROUTE_REFRESH_INTERVAL_SECS
-        }
-        Err(error) => {
-            warn!(
-                interval = %value,
-                error = %error,
-                default_interval_secs = DEFAULT_ROUTE_REFRESH_INTERVAL_SECS,
-                "Ignoring invalid route refresh interval"
-            );
-            DEFAULT_ROUTE_REFRESH_INTERVAL_SECS
-        }
-    }
-}
-
 /// Build an [`InferenceContext`](crate::proxy::InferenceContext) by resolving
 /// inference routes from either a local YAML file or the gateway bundle.
 ///
@@ -96,25 +62,45 @@ pub fn route_refresh_interval_secs() -> u64 {
 /// # Errors
 ///
 /// Returns an error if loading the routes file fails or the file's routes
-/// cannot be resolved. gRPC errors are swallowed (logged) and produce
-/// `Ok(None)` so a missing cluster bundle disables inference routing rather
-/// than aborting sandbox startup.
+/// cannot be resolved. The caller decides whether a gateway-snapshot failure
+/// is fatal or establishes a degraded inference state.
 // `routes`/`router` are intentionally distinct nouns (the route list vs the
 // router that consumes them); both names are clearer than alternatives.
 #[allow(clippy::similar_names)]
-pub async fn build_inference_context(
+pub fn build_inference_context(
     sandbox_id: Option<&str>,
     openshell_endpoint: Option<&str>,
     inference_routes: Option<&str>,
+) -> Result<Option<Arc<crate::proxy::InferenceContext>>> {
+    build_inference_context_inner(sandbox_id, openshell_endpoint, inference_routes, None)
+}
+
+pub fn build_inference_context_from_snapshot(
+    sandbox_id: Option<&str>,
+    openshell_endpoint: Option<&str>,
+    inference_routes: Option<&str>,
+    gateway_bundle: openshell_core::proto::InferenceBundleSnapshot,
+) -> Result<Option<Arc<crate::proxy::InferenceContext>>> {
+    build_inference_context_inner(
+        sandbox_id,
+        openshell_endpoint,
+        inference_routes,
+        Some(gateway_bundle),
+    )
+}
+
+#[allow(clippy::similar_names)]
+fn build_inference_context_inner(
+    sandbox_id: Option<&str>,
+    openshell_endpoint: Option<&str>,
+    inference_routes: Option<&str>,
+    gateway_bundle: Option<openshell_core::proto::InferenceBundleSnapshot>,
 ) -> Result<Option<Arc<crate::proxy::InferenceContext>>> {
     use openshell_router::Router;
     use openshell_router::config::RouterConfig;
 
     let source = infer_route_source(sandbox_id, openshell_endpoint, inference_routes);
-
-    // Captured during the initial cluster bundle fetch so the background refresh
-    // loop can skip no-op updates from the very first tick.
-    let mut initial_revision: Option<String> = None;
+    let session_delivered = gateway_bundle.is_some();
 
     let routes = match source {
         InferenceRouteSource::File => {
@@ -150,62 +136,30 @@ pub async fn build_inference_context(
                 .map_err(|e| miette::miette!("failed to resolve routes from {path}: {e}"))?
         }
         InferenceRouteSource::Cluster => {
-            let (Some(_id), Some(endpoint)) = (sandbox_id, openshell_endpoint) else {
+            let (Some(_id), Some(_endpoint)) = (sandbox_id, openshell_endpoint) else {
                 return Ok(None);
             };
 
-            // Cluster mode: fetch bundle from gateway
-            info!(endpoint = %endpoint, "Fetching inference route bundle from gateway");
-            match openshell_core::grpc_client::fetch_inference_bundle(endpoint).await {
-                Ok(bundle) => {
-                    initial_revision = Some(bundle.revision.clone());
-                    ocsf_emit!(
-                        ConfigStateChangeBuilder::new(ocsf_ctx())
-                            .severity(SeverityId::Informational)
-                            .status(StatusId::Success)
-                            .state(StateId::Enabled, "loaded")
-                            .unmapped("route_count", serde_json::json!(bundle.routes.len()))
-                            .unmapped("revision", serde_json::json!(&bundle.revision))
-                            .message(format!(
-                                "Loaded inference route bundle [route_count:{} revision:{}]",
-                                bundle.routes.len(),
-                                bundle.revision
-                            ))
-                            .build()
-                    );
-                    bundle_to_resolved_routes(&bundle)
-                }
-                Err(e) => {
-                    // Distinguish expected "not configured" states from server errors.
-                    // gRPC PermissionDenied/NotFound means inference bundle is unavailable
-                    // for this sandbox — skip gracefully. Other errors are unexpected.
-                    let msg = e.to_string();
-                    if msg.contains("permission denied") || msg.contains("not found") {
-                        ocsf_emit!(
-                            ConfigStateChangeBuilder::new(ocsf_ctx())
-                                .severity(SeverityId::Informational)
-                                .status(StatusId::Success)
-                                .state(StateId::Disabled, "disabled")
-                                .unmapped("error", serde_json::json!(e.to_string()))
-                                .message(format!(
-                                    "Inference bundle unavailable, routing disabled [error:{e}]"
-                                ))
-                                .build()
-                        );
-                        return Ok(None);
-                    }
-                    ocsf_emit!(ConfigStateChangeBuilder::new(ocsf_ctx())
-                        .severity(SeverityId::Medium)
-                        .status(StatusId::Failure)
-                        .state(StateId::Disabled, "disabled")
-                        .unmapped("error", serde_json::json!(e.to_string()))
-                        .message(format!(
-                            "Failed to fetch inference bundle, inference routing disabled [error:{e}]"
-                        ))
-                        .build());
-                    return Ok(None);
-                }
-            }
+            let Some(bundle) = gateway_bundle else {
+                return Err(miette::miette!(
+                    "gateway-backed inference requires a supervisor-session bootstrap snapshot"
+                ));
+            };
+            ocsf_emit!(
+                ConfigStateChangeBuilder::new(ocsf_ctx())
+                    .severity(SeverityId::Informational)
+                    .status(StatusId::Success)
+                    .state(StateId::Enabled, "loaded")
+                    .unmapped("route_count", serde_json::json!(bundle.routes.len()))
+                    .unmapped("revision", serde_json::json!(&bundle.revision))
+                    .message(format!(
+                        "Loaded inference route bundle [route_count:{} revision:{}]",
+                        bundle.routes.len(),
+                        bundle.revision
+                    ))
+                    .build()
+            );
+            bundle_to_resolved_routes(&bundle)
         }
         InferenceRouteSource::None => {
             // No route source — inference routing is not configured
@@ -261,19 +215,12 @@ pub async fn build_inference_context(
         system_routes,
     ));
 
-    // Spawn background route cache refresh for cluster mode at startup so
-    // request handling never depends on control-plane latency.
-    if matches!(source, InferenceRouteSource::Cluster)
-        && let (Some(_id), Some(endpoint)) = (sandbox_id, openshell_endpoint)
-    {
-        spawn_route_refresh(
-            ctx.route_cache(),
-            ctx.system_route_cache(),
-            endpoint.to_string(),
-            route_refresh_interval_secs(),
-            initial_revision,
-        );
-    }
+    // Cluster request handling consumes only session-delivered cache state and
+    // never depends on control-plane latency.
+    debug_assert!(
+        !matches!(source, InferenceRouteSource::Cluster) || session_delivered,
+        "cluster inference must be session-delivered"
+    );
 
     Ok(Some(ctx))
 }
@@ -302,7 +249,7 @@ pub fn partition_routes(
 
 /// Convert a proto bundle response into resolved routes for the router.
 pub fn bundle_to_resolved_routes(
-    bundle: &openshell_core::proto::GetInferenceBundleResponse,
+    bundle: &openshell_core::proto::InferenceBundleSnapshot,
 ) -> Vec<openshell_router::config::ResolvedRoute> {
     bundle
         .routes
@@ -332,64 +279,14 @@ pub fn bundle_to_resolved_routes(
         .collect()
 }
 
-/// Spawn a background task that periodically refreshes both route caches from the gateway.
-///
-/// The loop uses the bundle `revision` hash to avoid unnecessary cache writes
-/// when routes haven't changed. `initial_revision` is the revision captured
-/// during the startup fetch in [`build_inference_context`] so the first refresh
-/// cycle can already skip a no-op update.
-pub fn spawn_route_refresh(
-    user_cache: Arc<tokio::sync::RwLock<Vec<openshell_router::config::ResolvedRoute>>>,
-    system_cache: Arc<tokio::sync::RwLock<Vec<openshell_router::config::ResolvedRoute>>>,
-    endpoint: String,
-    interval_secs: u64,
-    initial_revision: Option<String>,
-) {
-    tokio::spawn(async move {
-        use tokio::time::{MissedTickBehavior, interval};
-
-        let mut current_revision = initial_revision;
-
-        let mut tick = interval(Duration::from_secs(interval_secs));
-        tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
-
-        loop {
-            tick.tick().await;
-
-            match openshell_core::grpc_client::fetch_inference_bundle(&endpoint).await {
-                Ok(bundle) => {
-                    if current_revision.as_deref() == Some(&bundle.revision) {
-                        trace!(revision = %bundle.revision, "Inference bundle unchanged");
-                        continue;
-                    }
-
-                    current_revision =
-                        Some(apply_inference_bundle(&user_cache, &system_cache, bundle).await);
-                }
-                Err(e) => {
-                    ocsf_emit!(ConfigStateChangeBuilder::new(ocsf_ctx())
-                        .severity(SeverityId::Medium)
-                        .status(StatusId::Failure)
-                        .state(StateId::Other, "stale")
-                        .unmapped("error", serde_json::json!(e.to_string()))
-                        .message(format!(
-                            "Failed to refresh inference route cache, keeping stale routes [error:{e}]"
-                        ))
-                        .build());
-                }
-            }
-        }
-    });
-}
-
 /// Apply one complete inference bundle to the live user and system route caches.
 ///
-/// Fetching and revision comparison stay with the caller so polling and future
-/// supervisor-session updates can share this cache-installation boundary.
+/// Revision comparison stays with the caller so bootstrap and steady-state
+/// supervisor-session updates share this cache-installation boundary.
 pub async fn apply_inference_bundle(
     user_cache: &tokio::sync::RwLock<Vec<openshell_router::config::ResolvedRoute>>,
     system_cache: &tokio::sync::RwLock<Vec<openshell_router::config::ResolvedRoute>>,
-    bundle: openshell_core::proto::GetInferenceBundleResponse,
+    bundle: openshell_core::proto::InferenceBundleSnapshot,
 ) -> String {
     let routes = bundle_to_resolved_routes(&bundle);
     let (user_routes, system_routes) = partition_routes(routes);
@@ -422,14 +319,10 @@ pub async fn apply_inference_bundle(
 )]
 mod tests {
     use super::*;
-    use std::sync::{LazyLock, Mutex};
-    use temp_env::with_vars;
-
-    static ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
     #[test]
     fn bundle_to_resolved_routes_converts_all_fields() {
-        let bundle = openshell_core::proto::GetInferenceBundleResponse {
+        let bundle = openshell_core::proto::InferenceBundleSnapshot {
             routes: vec![
                 openshell_core::proto::ResolvedRoute {
                     name: "frontier".to_string(),
@@ -494,7 +387,7 @@ mod tests {
 
     #[test]
     fn bundle_to_resolved_routes_handles_empty_bundle() {
-        let bundle = openshell_core::proto::GetInferenceBundleResponse {
+        let bundle = openshell_core::proto::InferenceBundleSnapshot {
             routes: vec![],
             revision: "empty".to_string(),
             generated_at_ms: 0,
@@ -508,7 +401,7 @@ mod tests {
     async fn inference_bundle_apply_replaces_both_route_caches() {
         let user_cache = tokio::sync::RwLock::new(Vec::new());
         let system_cache = tokio::sync::RwLock::new(Vec::new());
-        let bundle = openshell_core::proto::GetInferenceBundleResponse {
+        let bundle = openshell_core::proto::InferenceBundleSnapshot {
             routes: vec![
                 openshell_core::proto::ResolvedRoute {
                     name: "inference.local".to_string(),
@@ -536,7 +429,7 @@ mod tests {
 
     #[test]
     fn bundle_to_resolved_routes_preserves_name_field() {
-        let bundle = openshell_core::proto::GetInferenceBundleResponse {
+        let bundle = openshell_core::proto::InferenceBundleSnapshot {
             routes: vec![openshell_core::proto::ResolvedRoute {
                 name: "sandbox-system".to_string(),
                 base_url: "https://api.example.com/v1".to_string(),
@@ -612,9 +505,8 @@ routes:
         f.write_all(yaml.as_bytes()).unwrap();
         let path = f.path().to_str().unwrap();
 
-        let ctx = build_inference_context(None, None, Some(path))
-            .await
-            .expect("should load routes from file");
+        let ctx =
+            build_inference_context(None, None, Some(path)).expect("should load routes from file");
 
         let ctx = ctx.expect("context should be Some");
         let cache = ctx.route_cache();
@@ -634,7 +526,6 @@ routes:
         let path = f.path().to_str().unwrap();
 
         let ctx = build_inference_context(None, None, Some(path))
-            .await
             .expect("empty routes file should not error");
         assert!(
             ctx.is_none(),
@@ -644,9 +535,7 @@ routes:
 
     #[tokio::test]
     async fn build_inference_context_no_sources_returns_none() {
-        let ctx = build_inference_context(None, None, None)
-            .await
-            .expect("should succeed with None");
+        let ctx = build_inference_context(None, None, None).expect("should succeed with None");
 
         assert!(ctx.is_none(), "no sources should return None");
     }
@@ -669,7 +558,6 @@ routes:
 
         // Even with sandbox_id and endpoint, route_file takes precedence
         let ctx = build_inference_context(Some("sb-1"), Some("http://localhost:50051"), Some(path))
-            .await
             .expect("should load from file");
 
         let ctx = ctx.expect("context should be Some");
@@ -717,52 +605,6 @@ routes:
         assert!(disable_inference_on_empty_routes(
             InferenceRouteSource::None
         ));
-    }
-
-    // ---- Route refresh interval + revision tests ----
-
-    #[test]
-    fn default_route_refresh_interval_is_five_seconds() {
-        assert_eq!(DEFAULT_ROUTE_REFRESH_INTERVAL_SECS, 5);
-    }
-
-    #[test]
-    fn route_refresh_interval_uses_env_override() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        with_vars(
-            [("OPENSHELL_ROUTE_REFRESH_INTERVAL_SECS", Some("9"))],
-            || {
-                assert_eq!(route_refresh_interval_secs(), 9);
-            },
-        );
-    }
-
-    #[test]
-    fn route_refresh_interval_rejects_zero() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        with_vars(
-            [("OPENSHELL_ROUTE_REFRESH_INTERVAL_SECS", Some("0"))],
-            || {
-                assert_eq!(
-                    route_refresh_interval_secs(),
-                    DEFAULT_ROUTE_REFRESH_INTERVAL_SECS
-                );
-            },
-        );
-    }
-
-    #[test]
-    fn route_refresh_interval_rejects_invalid_values() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        with_vars(
-            [("OPENSHELL_ROUTE_REFRESH_INTERVAL_SECS", Some("abc"))],
-            || {
-                assert_eq!(
-                    route_refresh_interval_secs(),
-                    DEFAULT_ROUTE_REFRESH_INTERVAL_SECS
-                );
-            },
-        );
     }
 
     #[tokio::test]

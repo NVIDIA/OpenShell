@@ -42,7 +42,7 @@ pub struct L7EvalContext {
     pub host: String,
     /// Port from the CONNECT request.
     pub port: u16,
-    /// Workspace the sandbox belongs to, learned from `GetSandboxConfigResponse`.
+    /// Workspace the sandbox belongs to, learned from `SandboxConfigSnapshot`.
     pub workspace: String,
     /// Default authority port for the inspected HTTP transport (80 for
     /// plaintext, 443 after TLS termination).

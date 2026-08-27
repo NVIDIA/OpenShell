@@ -117,8 +117,8 @@ func EffectiveSettingFromProto(pv *sbv1.EffectiveSetting) *v1.EffectiveSetting {
 
 // --- SandboxConfig ---
 
-// SandboxConfigFromProto converts a GetSandboxConfigResponse to an SDK SandboxConfig.
-func SandboxConfigFromProto(resp *sbv1.GetSandboxConfigResponse) *v1.SandboxConfig {
+// SandboxConfigFromProto converts a SandboxConfigSnapshot to an SDK SandboxConfig.
+func SandboxConfigFromProto(resp *sbv1.SandboxConfigSnapshot) *v1.SandboxConfig {
 	if resp == nil {
 		return nil
 	}

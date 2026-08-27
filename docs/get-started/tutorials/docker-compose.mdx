@@ -51,6 +51,11 @@ Docker resolves bind-mount sources against the **host filesystem**, not the cont
 
 The Compose file uses `/var/lib/openshell` for this purpose and sets `create_host_path: true` so Docker creates it on first run.
 
+Keep the Compose gateway and supervisor image tags aligned. The supervisor
+session does not support a mixed-version polling fallback. After upgrading the
+Compose images, recreate existing sandboxes so each one starts with the
+release-matched supervisor binary.
+
 ## Start the gateway
 
 ```shell

@@ -22,7 +22,6 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	Inference_GetInferenceBundle_FullMethodName   = "/openshell.inference.v1.Inference/GetInferenceBundle"
 	Inference_SetInferenceRoute_FullMethodName    = "/openshell.inference.v1.Inference/SetInferenceRoute"
 	Inference_GetInferenceRoute_FullMethodName    = "/openshell.inference.v1.Inference/GetInferenceRoute"
 	Inference_DeleteInferenceRoute_FullMethodName = "/openshell.inference.v1.Inference/DeleteInferenceRoute"
@@ -34,8 +33,6 @@ const (
 //
 // Inference service provides workspace-scoped inference route configuration and bundle delivery.
 type InferenceClient interface {
-	// Return the resolved inference route bundle for sandbox-local execution.
-	GetInferenceBundle(ctx context.Context, in *GetInferenceBundleRequest, opts ...grpc.CallOption) (*GetInferenceBundleResponse, error)
 	// Set the inference route for a workspace.
 	//
 	// This controls how requests sent to `inference.local` are routed
@@ -53,16 +50,6 @@ type inferenceClient struct {
 
 func NewInferenceClient(cc grpc.ClientConnInterface) InferenceClient {
 	return &inferenceClient{cc}
-}
-
-func (c *inferenceClient) GetInferenceBundle(ctx context.Context, in *GetInferenceBundleRequest, opts ...grpc.CallOption) (*GetInferenceBundleResponse, error) {
-	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	out := new(GetInferenceBundleResponse)
-	err := c.cc.Invoke(ctx, Inference_GetInferenceBundle_FullMethodName, in, out, cOpts...)
-	if err != nil {
-		return nil, err
-	}
-	return out, nil
 }
 
 func (c *inferenceClient) SetInferenceRoute(ctx context.Context, in *SetInferenceRouteRequest, opts ...grpc.CallOption) (*SetInferenceRouteResponse, error) {
@@ -101,8 +88,6 @@ func (c *inferenceClient) DeleteInferenceRoute(ctx context.Context, in *DeleteIn
 //
 // Inference service provides workspace-scoped inference route configuration and bundle delivery.
 type InferenceServer interface {
-	// Return the resolved inference route bundle for sandbox-local execution.
-	GetInferenceBundle(context.Context, *GetInferenceBundleRequest) (*GetInferenceBundleResponse, error)
 	// Set the inference route for a workspace.
 	//
 	// This controls how requests sent to `inference.local` are routed
@@ -122,9 +107,6 @@ type InferenceServer interface {
 // pointer dereference when methods are called.
 type UnimplementedInferenceServer struct{}
 
-func (UnimplementedInferenceServer) GetInferenceBundle(context.Context, *GetInferenceBundleRequest) (*GetInferenceBundleResponse, error) {
-	return nil, status.Error(codes.Unimplemented, "method GetInferenceBundle not implemented")
-}
 func (UnimplementedInferenceServer) SetInferenceRoute(context.Context, *SetInferenceRouteRequest) (*SetInferenceRouteResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method SetInferenceRoute not implemented")
 }
@@ -153,24 +135,6 @@ func RegisterInferenceServer(s grpc.ServiceRegistrar, srv InferenceServer) {
 		t.testEmbeddedByValue()
 	}
 	s.RegisterService(&Inference_ServiceDesc, srv)
-}
-
-func _Inference_GetInferenceBundle_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(GetInferenceBundleRequest)
-	if err := dec(in); err != nil {
-		return nil, err
-	}
-	if interceptor == nil {
-		return srv.(InferenceServer).GetInferenceBundle(ctx, in)
-	}
-	info := &grpc.UnaryServerInfo{
-		Server:     srv,
-		FullMethod: Inference_GetInferenceBundle_FullMethodName,
-	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(InferenceServer).GetInferenceBundle(ctx, req.(*GetInferenceBundleRequest))
-	}
-	return interceptor(ctx, in, info, handler)
 }
 
 func _Inference_SetInferenceRoute_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
@@ -234,10 +198,6 @@ var Inference_ServiceDesc = grpc.ServiceDesc{
 	ServiceName: "openshell.inference.v1.Inference",
 	HandlerType: (*InferenceServer)(nil),
 	Methods: []grpc.MethodDesc{
-		{
-			MethodName: "GetInferenceBundle",
-			Handler:    _Inference_GetInferenceBundle_Handler,
-		},
 		{
 			MethodName: "SetInferenceRoute",
 			Handler:    _Inference_SetInferenceRoute_Handler,

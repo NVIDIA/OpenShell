@@ -1364,10 +1364,8 @@ mod tests {
             "/openshell.v1.OpenShell/GetSandboxConfig",
             "/openshell.v1.OpenShell/ReportPolicyStatus",
             "/openshell.v1.OpenShell/PushSandboxLogs",
-            "/openshell.v1.OpenShell/GetSandboxProviderEnvironment",
             "/openshell.v1.OpenShell/SubmitPolicyAnalysis",
             "/openshell.v1.OpenShell/RefreshSandboxToken",
-            "/openshell.inference.v1.Inference/GetInferenceBundle",
         ];
 
         for path in callback_paths {
@@ -2320,7 +2318,7 @@ mod tests {
             "/openshell.v1.OpenShell/CreateSandbox",
             "/openshell.v1.OpenShell/ListSandboxes",
             "/openshell.v1.OpenShell/DeleteSandbox",
-            "/openshell.inference.v1.Inference/GetInferenceBundle",
+            "/openshell.inference.v1.Inference/GetInferenceRoute",
             "/metrics",
         ];
 
@@ -2343,7 +2341,7 @@ mod tests {
 
         let expected = [
             "GET",
-            "openshell.inference.v1.Inference/GetInferenceBundle",
+            "openshell.inference.v1.Inference/GetInferenceRoute",
             "openshell.v1.OpenShell/CreateSandbox",
             "openshell.v1.OpenShell/DeleteSandbox",
             "openshell.v1.OpenShell/ListSandboxes",
@@ -2373,9 +2371,9 @@ mod tests {
         assert_eq!(
             otel_span_name(
                 &http::Method::POST,
-                "/openshell.inference.v1.Inference/GetInferenceBundle"
+                "/openshell.inference.v1.Inference/GetInferenceRoute"
             ),
-            "openshell.inference.v1.Inference/GetInferenceBundle"
+            "openshell.inference.v1.Inference/GetInferenceRoute"
         );
     }
 
@@ -2406,8 +2404,8 @@ mod tests {
     #[test]
     fn grpc_method_extracts_inference_service() {
         assert_eq!(
-            grpc_method_from_path("/openshell.inference.v1.Inference/GetInferenceBundle"),
-            "GetInferenceBundle"
+            grpc_method_from_path("/openshell.inference.v1.Inference/GetInferenceRoute"),
+            "GetInferenceRoute"
         );
     }
 
@@ -2726,27 +2724,6 @@ mod tests {
             ));
         }
 
-        #[tokio::test]
-        async fn sandbox_principal_can_fetch_inference_bundle() {
-            let mock = Arc::new(MockAuthenticator::returning(Ok(Some(sandbox_principal()))));
-            let chain = AuthenticatorChain::new(vec![mock]);
-            let (recorder, seen) = PrincipalRecorder::new();
-            let mut router = AuthGrpcRouter::new(recorder, Some(chain), None);
-
-            let res = router
-                .call(empty_request(
-                    "/openshell.inference.v1.Inference/GetInferenceBundle",
-                ))
-                .await
-                .unwrap();
-
-            assert_eq!(res.status(), 200);
-            assert!(matches!(
-                seen.lock().unwrap().as_ref(),
-                Some(Principal::Sandbox(_))
-            ));
-        }
-
         /// A user principal — even one carrying `openshell:all` and the
         /// admin role — must not reach a `sandbox`-annotated method. The
         /// router enforces this from the per-handler auth-mode declarations
@@ -2775,12 +2752,10 @@ mod tests {
                 "/openshell.v1.OpenShell/ReportPolicyStatus",
                 "/openshell.v1.OpenShell/PushSandboxLogs",
                 "/openshell.v1.OpenShell/SubmitPolicyAnalysis",
-                "/openshell.v1.OpenShell/GetSandboxProviderEnvironment",
                 "/openshell.v1.OpenShell/ConnectSupervisor",
                 "/openshell.v1.OpenShell/RelayStream",
                 "/openshell.v1.OpenShell/IssueSandboxToken",
                 "/openshell.v1.OpenShell/RefreshSandboxToken",
-                "/openshell.inference.v1.Inference/GetInferenceBundle",
             ] {
                 let mock = Arc::new(MockAuthenticator::returning(Ok(Some(admin_user()))));
                 let chain = AuthenticatorChain::new(vec![mock]);

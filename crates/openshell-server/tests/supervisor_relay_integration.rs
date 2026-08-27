@@ -188,20 +188,13 @@ impl OpenShell for RelayGateway {
     async fn get_sandbox_config(
         &self,
         _: tonic::Request<openshell_core::proto::GetSandboxConfigRequest>,
-    ) -> Result<Response<openshell_core::proto::GetSandboxConfigResponse>, Status> {
+    ) -> Result<Response<openshell_core::proto::SandboxConfigSnapshot>, Status> {
         Err(Status::unimplemented("unused"))
     }
     async fn get_gateway_config(
         &self,
         _: tonic::Request<openshell_core::proto::GetGatewayConfigRequest>,
     ) -> Result<Response<openshell_core::proto::GetGatewayConfigResponse>, Status> {
-        Err(Status::unimplemented("unused"))
-    }
-    async fn get_sandbox_provider_environment(
-        &self,
-        _: tonic::Request<openshell_core::proto::GetSandboxProviderEnvironmentRequest>,
-    ) -> Result<Response<openshell_core::proto::GetSandboxProviderEnvironmentResponse>, Status>
-    {
         Err(Status::unimplemented("unused"))
     }
     async fn create_ssh_session(
@@ -550,6 +543,8 @@ fn register_session_with_capacity(
         tx,
         shutdown_tx,
     );
+    assert!(!registry.mark_initialized(sandbox_id, "sess-1"));
+    assert!(registry.mark_runtime_ready(sandbox_id, "sess-1"));
     rx
 }
 

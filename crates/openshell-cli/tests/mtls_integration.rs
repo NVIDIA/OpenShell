@@ -145,9 +145,9 @@ impl OpenShell for TestOpenShell {
     async fn get_sandbox_config(
         &self,
         _request: tonic::Request<openshell_core::proto::GetSandboxConfigRequest>,
-    ) -> Result<Response<openshell_core::proto::GetSandboxConfigResponse>, Status> {
+    ) -> Result<Response<openshell_core::proto::SandboxConfigSnapshot>, Status> {
         Ok(Response::new(
-            openshell_core::proto::GetSandboxConfigResponse::default(),
+            openshell_core::proto::SandboxConfigSnapshot::default(),
         ))
     }
 
@@ -157,16 +157,6 @@ impl OpenShell for TestOpenShell {
     ) -> Result<Response<openshell_core::proto::GetGatewayConfigResponse>, Status> {
         Ok(Response::new(
             openshell_core::proto::GetGatewayConfigResponse::default(),
-        ))
-    }
-
-    async fn get_sandbox_provider_environment(
-        &self,
-        _request: tonic::Request<openshell_core::proto::GetSandboxProviderEnvironmentRequest>,
-    ) -> Result<Response<openshell_core::proto::GetSandboxProviderEnvironmentResponse>, Status>
-    {
-        Ok(Response::new(
-            openshell_core::proto::GetSandboxProviderEnvironmentResponse::default(),
         ))
     }
 

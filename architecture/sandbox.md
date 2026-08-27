@@ -10,7 +10,7 @@ Each sandbox workload has two trust levels:
 
 | Process | Role |
 |---|---|
-| Supervisor | Starts as root inside the workload, prepares isolation, runs the proxy, fetches config, injects credentials, serves the relay socket, and launches child processes. |
+| Supervisor | Starts as root inside the workload, applies desired state, prepares isolation, runs the proxy, injects credentials, serves the relay socket, and launches child processes. |
 | Agent child | Runs as an unprivileged user with filesystem, process, and network restrictions applied. |
 
 The supervisor keeps enough privilege to manage the sandbox, but the agent child
@@ -25,15 +25,55 @@ only when the set is already empty; any other outcome fails the spawn.
 
 1. The compute runtime starts the workload with sandbox identity, callback
    endpoint, TLS or secret material, image metadata, and initial command.
-2. The supervisor loads policy and runtime settings from local files or the
-   gateway, depending on mode.
-3. It prepares filesystem access, process restrictions, network namespace
+2. In gateway-backed mode, the supervisor opens `ConnectSupervisor` before it
+   initializes gateway-owned runtime state. The gateway sends a complete
+   configuration, provider environment, and inference bootstrap.
+3. The supervisor applies the bootstrap, or loads explicit local files in
+   standalone mode. A required configuration or policy failure aborts startup.
+4. It prepares filesystem access, process restrictions, network namespace
    routing, trust stores, provider credential resolution, and inference routes.
-4. It launches the persisted canonical main-process argv and retains its PTY
+5. It launches the persisted canonical main-process argv and retains its PTY
    or pipes in the main-session multiplexer.
-5. It starts the policy proxy and local SSH server.
-6. It opens a supervisor session back to the gateway for connect, exec, file
-   sync, config polling, and log push.
+6. It starts the policy proxy and local SSH server, then signals runtime-ready.
+7. The gateway enables connect, exec, file sync, and other relay operations only
+   after both bootstrap initialization and runtime-ready are complete.
+
+## Desired-State Delivery
+
+`ConnectSupervisor` carries gateway-owned desired state. A fresh session always
+starts with a complete `ConfigBootstrap`. Bootstrap success marks the session
+initialized; `SupervisorRuntimeReady` separately proves that runtime-dependent
+services are available. Bootstrap failure or a 120-second timeout moves the
+sandbox to `Error`. Disconnect before initialization returns it to
+`Provisioning`.
+
+After bootstrap, the gateway sends level-triggered `ConfigUpdate` messages for
+one component at a time. Request IDs correlate results, component-local sequence
+numbers reject stale delivery, and snapshot revisions remain equality-only
+content fingerprints. The gateway keeps at most one update in flight for each
+component and coalesces newer state. Failed live updates keep the sandbox
+`Ready` and add a component-specific degraded condition. Policy and inference
+retain their last-known-good runtime state. Invalid provider bindings fail
+closed by revoking static credential material while retaining fetched dynamic
+token grants.
+
+Committed sandbox changes notify the session owner immediately. Provider and
+inference changes use a workspace-wide invalidation signal. A 30-second
+jittered reconciliation pass rebuilds snapshots for active locally owned
+sessions, repairing missed notifications and cross-replica writes. Reconnects
+discard queued state and begin again with one complete bootstrap.
+
+Explicit local policy and inference files remain authoritative. Their component
+results report `RETAINED_LOCAL_OVERRIDE`, while non-conflicting gateway settings
+and provider state continue to update. A supervisor without a gateway does not
+open or wait for a session.
+
+`GetSandboxConfig` remains a public read API. Policy status, policy analysis,
+log upload, credential refresh, and relay RPCs remain independent of desired
+state delivery. The old supervisor-only provider-environment and inference-bundle
+fetch RPCs no longer exist. Snapshot builders and component apply routines are
+shared implementation boundaries for a future direct transport; the runtime
+does not add a transport abstraction before that transport exists.
 
 ## Isolation Layers
 
@@ -195,10 +235,9 @@ the registry. Public custom-CA PEM travels with the stable registration.
 
 The slots live in a supervisor-owned `ExtensionCredentialStore` shared by every
 gateway connection the supervisor opens, so the registry's clients and the
-polling loop that rotates them observe the same credentials. Configuration
-polling runs far more frequently than credentials expire, so the loop rotates
-only when a credential is missing or has passed four fifths of its lifetime,
-and bounds its sleep by the soonest rotation deadline.
+independent credential-refresh task observe the same credentials. The task
+rotates only when a credential is missing or has passed four fifths of its
+lifetime.
 
 Middleware cannot observe injected credentials or mutate supervisor-owned
 credential, routing, or framing headers. Body transformations are re-evaluated
@@ -442,9 +481,9 @@ policy structure.
 This holds even when the initial policy is enriched with baseline paths during
 startup: the enriched revision the supervisor synced back to the gateway is the
 revision it acknowledges, so a successfully constructed initial policy never
-remains `Pending`. If the first poll returns a different revision, the supervisor
-processes it through the normal reload path instead of treating it as already
-loaded.
+remains `Pending`. If a subsequent pushed snapshot carries a different revision,
+the supervisor processes it through the normal reload path instead of treating
+it as already loaded.
 
 A newer sandbox-scoped revision can carry the same non-empty effective policy
 hash as the currently loaded revision, for example when provenance changes
@@ -459,19 +498,22 @@ Policy status delivery uses a FIFO background worker. Retryable delivery
 failures retain the ordered update and retry with capped exponential backoff;
 terminal errors are logged and discarded. The outbox is nonblocking and does
 not discard updates because of a fixed queue capacity, so status endpoint
-outages cannot block policy polling, enforcement, settings, or provider
-refreshes and cannot permanently lose the initial acknowledgement.
+outages cannot block desired-state application, enforcement, settings, or
+provider refreshes and cannot permanently lose the initial acknowledgement.
 
 Only sandbox-scoped revisions (`PolicySource::Sandbox`, version greater than
 zero) are acknowledged. Global policies and local-file development policies do
 not use the sandbox revision API and produce no acknowledgement. When explicit
-local Rego and data files are configured, the supervisor continues polling the
-gateway for settings and provider refreshes but never replaces the local OPA
-engine with a gateway policy revision.
+local Rego and data files are configured, pushed gateway updates still apply
+settings and provider changes but never replace the local OPA engine with a
+gateway policy revision.
 
 ## Failure Behavior
 
-- If gateway config polling fails, the sandbox keeps its last-known-good policy.
+- If desired-state delivery or application fails after startup, the sandbox
+  remains ready and reports a degraded condition. Policy and inference retain
+  their last-known-good state; invalid provider bindings follow the fail-closed
+  revocation behavior above.
 - If a live policy or middleware-registry update is invalid, the supervisor
   rejects the combined update and keeps the current runtime pair.
 - If an operator-run middleware call fails, the selected config's `on_error`

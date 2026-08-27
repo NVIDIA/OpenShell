@@ -171,7 +171,8 @@ the workload, the process supervisor establishes the only accepted connection.
 The sidecar validates its UID, GID, and PID with peer credentials, unlinks the
 listener, derives the SSH target from trusted configuration, and rejects later
 clients. The connection receives bootstrap state and provider-environment
-updates after settings polls. If it closes, the network sidecar exits so
+updates pushed over the network sidecar's gateway session. If it closes, the
+network sidecar exits so
 Kubernetes recreates the one-client bootstrap listener, and the process
 supervisor exits so Kubernetes terminates the workload and restarts the agent
 container. This symmetric failure behavior prevents a surviving workload from

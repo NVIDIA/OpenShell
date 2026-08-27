@@ -23,6 +23,8 @@ use crate::provider_profile_sources::EffectiveProviderProfileCatalog;
 #[cfg(test)]
 use crate::provider_profile_sources::ProviderProfileSources;
 use openshell_core::net::{is_always_blocked_ip, is_internal_ip};
+#[cfg(test)]
+use openshell_core::proto::GetSandboxProviderEnvironmentRequest;
 use openshell_core::proto::policy_merge_operation;
 use openshell_core::proto::setting_value;
 use openshell_core::proto::{
@@ -32,13 +34,12 @@ use openshell_core::proto::{
     DraftHistoryEntry, EditDraftChunkRequest, EditDraftChunkResponse, EffectiveSetting,
     GetDraftHistoryRequest, GetDraftHistoryResponse, GetDraftPolicyRequest, GetDraftPolicyResponse,
     GetGatewayConfigRequest, GetGatewayConfigResponse, GetSandboxConfigRequest,
-    GetSandboxConfigResponse, GetSandboxLogsRequest, GetSandboxLogsResponse,
-    GetSandboxPolicyStatusRequest, GetSandboxPolicyStatusResponse,
-    GetSandboxProviderEnvironmentRequest, GetSandboxProviderEnvironmentResponse,
-    ListSandboxPoliciesRequest, ListSandboxPoliciesResponse, PolicyChunk, PolicyMergeOperation,
-    PolicySource, PolicyStatus, PushSandboxLogsRequest, PushSandboxLogsResponse,
-    RejectDraftChunkRequest, RejectDraftChunkResponse, ReportPolicyStatusRequest,
-    ReportPolicyStatusResponse, SandboxLogLine, SandboxPolicyRevision, SettingScope, SettingValue,
+    GetSandboxLogsRequest, GetSandboxLogsResponse, GetSandboxPolicyStatusRequest,
+    GetSandboxPolicyStatusResponse, ListSandboxPoliciesRequest, ListSandboxPoliciesResponse,
+    PolicyChunk, PolicyMergeOperation, PolicySource, PolicyStatus, ProviderEnvironmentSnapshot,
+    PushSandboxLogsRequest, PushSandboxLogsResponse, RejectDraftChunkRequest,
+    RejectDraftChunkResponse, ReportPolicyStatusRequest, ReportPolicyStatusResponse,
+    SandboxConfigSnapshot, SandboxLogLine, SandboxPolicyRevision, SettingScope, SettingValue,
     SubmitPolicyAnalysisRequest, SubmitPolicyAnalysisResponse, UndoDraftChunkRequest,
     UndoDraftChunkResponse, UpdateConfigRequest, UpdateConfigResponse,
 };
@@ -2313,7 +2314,7 @@ async fn resolve_sandbox_by_name_for_principal(
 pub(super) async fn handle_get_sandbox_config(
     state: &Arc<ServerState>,
     request: Request<GetSandboxConfigRequest>,
-) -> Result<Response<GetSandboxConfigResponse>, Status> {
+) -> Result<Response<SandboxConfigSnapshot>, Status> {
     let principal = super::extract_principal(&request)?;
     let sandbox_id = request.get_ref().sandbox_id.clone();
     crate::auth::guard::enforce_sandbox_scope(&request, &sandbox_id)?;
@@ -2334,7 +2335,7 @@ pub(super) async fn handle_get_sandbox_config(
 pub async fn build_sandbox_config_snapshot(
     state: &ServerState,
     sandbox: &Sandbox,
-) -> Result<GetSandboxConfigResponse, Status> {
+) -> Result<SandboxConfigSnapshot, Status> {
     let sandbox_id = sandbox.object_id().to_string();
     let workspace = sandbox.object_workspace().to_string();
     let sandbox_provider_names = sandbox
@@ -2530,7 +2531,7 @@ pub async fn build_sandbox_config_snapshot(
     )
     .await?;
 
-    Ok(GetSandboxConfigResponse {
+    Ok(SandboxConfigSnapshot {
         policy,
         version,
         policy_hash,
@@ -3042,10 +3043,11 @@ pub(super) async fn handle_get_gateway_config(
     }))
 }
 
+#[cfg(test)]
 pub(super) async fn handle_get_sandbox_provider_environment(
     state: &Arc<ServerState>,
     request: Request<GetSandboxProviderEnvironmentRequest>,
-) -> Result<Response<GetSandboxProviderEnvironmentResponse>, Status> {
+) -> Result<Response<ProviderEnvironmentSnapshot>, Status> {
     let sandbox_id = request.get_ref().sandbox_id.clone();
     let supports_static_credential_bindings = request.get_ref().supports_static_credential_bindings;
     crate::auth::guard::enforce_sandbox_scope(&request, &sandbox_id)?;
@@ -3065,14 +3067,14 @@ pub(super) async fn handle_get_sandbox_provider_environment(
 
 /// Build the gateway-owned provider environment for an authorized sandbox.
 ///
-/// `supports_static_credential_bindings` preserves the existing fetch RPC's
-/// compatibility behavior. The required session protocol introduced by
-/// #1731 will call this builder with binding support enabled.
+/// Session delivery always enables static credential bindings. The capability
+/// argument remains explicit so builder tests can cover fail-closed behavior
+/// for consumers without binding support.
 pub async fn build_provider_environment_snapshot(
     state: &ServerState,
     sandbox: &Sandbox,
     supports_static_credential_bindings: bool,
-) -> Result<GetSandboxProviderEnvironmentResponse, Status> {
+) -> Result<ProviderEnvironmentSnapshot, Status> {
     let sandbox_id = sandbox.object_id().to_string();
     let workspace = sandbox.object_workspace().to_string();
 
@@ -3158,7 +3160,7 @@ pub async fn build_provider_environment_snapshot(
         provider_count = provider_names.len(),
         env_count = provider_environment.environment.len(),
         provider_env_revision,
-        "GetSandboxProviderEnvironment request completed successfully"
+        "Provider environment snapshot built successfully"
     );
 
     let non_secret_environment_keys = provider_environment
@@ -3168,7 +3170,7 @@ pub async fn build_provider_environment_snapshot(
         .cloned()
         .collect();
 
-    Ok(GetSandboxProviderEnvironmentResponse {
+    Ok(ProviderEnvironmentSnapshot {
         environment: provider_environment.environment,
         provider_env_revision,
         credential_expires_at_ms: provider_environment.credential_expires_at_ms,

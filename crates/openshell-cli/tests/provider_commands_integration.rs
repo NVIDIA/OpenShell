@@ -18,14 +18,13 @@ use openshell_core::proto::{
     ExchangeProviderSubjectTokenRequest, ExchangeProviderSubjectTokenResponse, ExecSandboxEvent,
     ExecSandboxInput, ExecSandboxRequest, GatewayMessage, GetGatewayConfigRequest,
     GetGatewayConfigResponse, GetProviderRefreshStatusRequest, GetProviderRefreshStatusResponse,
-    GetProviderRequest, GetSandboxConfigRequest, GetSandboxConfigResponse,
-    GetSandboxProviderEnvironmentRequest, GetSandboxProviderEnvironmentResponse, GetSandboxRequest,
-    HealthRequest, HealthResponse, ListProvidersRequest, ListProvidersResponse,
-    ListSandboxProvidersRequest, ListSandboxProvidersResponse, ListSandboxesRequest,
-    ListSandboxesResponse, Provider, ProviderCredentialRefresh, ProviderCredentialRefreshStatus,
-    ProviderCredentialRefreshStrategy, ProviderProfile, ProviderProfileCredential,
-    ProviderProfileDiscovery, ProviderResponse, RevokeSshSessionRequest, RevokeSshSessionResponse,
-    RotateProviderCredentialRequest, RotateProviderCredentialResponse, Sandbox, SandboxResponse,
+    GetProviderRequest, GetSandboxConfigRequest, GetSandboxRequest, HealthRequest, HealthResponse,
+    ListProvidersRequest, ListProvidersResponse, ListSandboxProvidersRequest,
+    ListSandboxProvidersResponse, ListSandboxesRequest, ListSandboxesResponse, Provider,
+    ProviderCredentialRefresh, ProviderCredentialRefreshStatus, ProviderCredentialRefreshStrategy,
+    ProviderProfile, ProviderProfileCredential, ProviderProfileDiscovery, ProviderResponse,
+    RevokeSshSessionRequest, RevokeSshSessionResponse, RotateProviderCredentialRequest,
+    RotateProviderCredentialResponse, Sandbox, SandboxConfigSnapshot, SandboxResponse,
     SandboxStreamEvent, ServiceStatus, SettingValue, SupervisorMessage, UpdateProviderRequest,
     WatchSandboxRequest, setting_value,
 };
@@ -306,8 +305,8 @@ impl OpenShell for TestOpenShell {
     async fn get_sandbox_config(
         &self,
         _request: tonic::Request<GetSandboxConfigRequest>,
-    ) -> Result<Response<GetSandboxConfigResponse>, Status> {
-        Ok(Response::new(GetSandboxConfigResponse::default()))
+    ) -> Result<Response<SandboxConfigSnapshot>, Status> {
+        Ok(Response::new(SandboxConfigSnapshot::default()))
     }
 
     async fn get_gateway_config(
@@ -318,15 +317,6 @@ impl OpenShell for TestOpenShell {
             settings: self.state.global_settings.lock().await.clone(),
             settings_revision: 1,
         }))
-    }
-
-    async fn get_sandbox_provider_environment(
-        &self,
-        _request: tonic::Request<GetSandboxProviderEnvironmentRequest>,
-    ) -> Result<Response<GetSandboxProviderEnvironmentResponse>, Status> {
-        Ok(Response::new(
-            GetSandboxProviderEnvironmentResponse::default(),
-        ))
     }
 
     async fn create_ssh_session(
