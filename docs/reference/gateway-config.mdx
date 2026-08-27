@@ -577,32 +577,6 @@ The gateway verifies supervisor JWT-SVIDs with JWT bundles fetched from the
 SPIFFE Workload API, so this validation path does not require gateway access to
 the SPIRE OIDC discovery endpoint or its TLS CA.
 
-### Windows MXC
-
-The native Windows gateway links the MXC compute driver in-process. Gateway configuration contains host runtime settings only; workload command, working directory, and environment are sandbox-scoped.
-
-```toml
-[openshell]
-version = 1
-
-[openshell.gateway]
-bind_address    = "127.0.0.1:17670"
-log_level       = "info"
-compute_drivers = ["mxc"]
-
-[openshell.drivers.mxc]
-wxc_exec_path = "C:\\mxc\\wxc-exec.exe"
-# process_container is the default and enforces default-deny filesystem access.
-# isolation_session is an explicit grant-only compatibility mode.
-backend = "process_container"
-pc_least_privilege = false
-pc_capabilities = []
-default_configuration_id = "composable"
-debug = false
-```
-
-Unknown MXC fields are rejected. Network policies and live policy mutations fail closed until the driver has a bound enforcement path. See [Sandbox Compute Drivers](sandbox-compute-drivers.mdx#windows-mxc-driver) for per-sandbox workload configuration.
-
 ### Docker
 
 Sandboxes run as containers on a local bridge network. The supervisor binary is bind-mounted from the host (no in-cluster image pull required); guest mTLS material is supplied as host paths.
