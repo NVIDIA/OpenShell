@@ -739,6 +739,7 @@ PY
 	export OPENSHELL_GATEWAY_ENDPOINT=http://127.0.0.1:${guest_port}
 	export OPENSHELL_GATEWAY=openshell-e2e-vm-${guest_port}
 	export OPENSHELL_PROVISION_TIMEOUT=\${OPENSHELL_PROVISION_TIMEOUT:-300}
+	export OPENSHELL_E2E_TESTS_IN_VM=1
 	if [ '${gateway_driver}' = podman ]; then
 		export CONTAINER_ENGINE=podman
 		export OPENSHELL_E2E_DRIVER=podman
