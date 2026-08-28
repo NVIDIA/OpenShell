@@ -14,17 +14,18 @@ use openshell_core::proto::{Sandbox, SandboxPhase, ServiceEndpoint, TcpRelayTarg
 use openshell_core::{ObjectId, VERSION};
 use openshell_ocsf::{
     ActionId, ActivityId, ConfigStateChangeBuilder, DispositionId, Endpoint, HttpActivityBuilder,
-    HttpRequest, HttpResponse as OcsfHttpResponse, NetworkActivityBuilder, OCSF_TARGET, OcsfEvent,
+    HttpRequest, HttpResponse as OcsfHttpResponse, NetworkActivityBuilder, OcsfEvent,
     SandboxContext, SeverityId, StateId, StatusId, Url as OcsfUrl,
 };
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
-use tracing::{info, warn};
+use tracing::warn;
 
 use crate::ServerState;
 use crate::persistence::{ObjectType, Store};
+use crate::sandbox_index::SandboxIndex;
 
 const ENDPOINT_OBJECT_TYPE: &str = "service_endpoint";
 const ROUTING_RULE_NAME: &str = "sandbox_service_routing";
@@ -236,7 +237,15 @@ async fn proxy_to_endpoint(
     {
         Ok(endpoint) => endpoint,
         Err(err) => {
-            emit_service_http_failure(&state, &req, &sandbox_name, &service_name, None, &err);
+            emit_service_http_failure(
+                &state,
+                &req,
+                workspace,
+                &sandbox_name,
+                &service_name,
+                None,
+                &err,
+            );
             return Err(err);
         }
     };
@@ -245,6 +254,7 @@ async fn proxy_to_endpoint(
         emit_service_http_failure(
             &state,
             &req,
+            workspace,
             &sandbox_name,
             &service_name,
             Some(&endpoint),
@@ -264,6 +274,7 @@ async fn proxy_to_endpoint(
             emit_service_http_failure(
                 &state,
                 &req,
+                workspace,
                 &sandbox_name,
                 &service_name,
                 Some(&endpoint),
@@ -277,6 +288,7 @@ async fn proxy_to_endpoint(
             emit_service_http_failure(
                 &state,
                 &req,
+                workspace,
                 &sandbox_name,
                 &service_name,
                 Some(&endpoint),
@@ -290,6 +302,7 @@ async fn proxy_to_endpoint(
         emit_service_http_failure(
             &state,
             &req,
+            workspace,
             &sandbox_name,
             &service_name,
             Some(&endpoint),
@@ -302,6 +315,7 @@ async fn proxy_to_endpoint(
         emit_service_http_failure(
             &state,
             &req,
+            workspace,
             &sandbox_name,
             &service_name,
             Some(&endpoint),
@@ -314,6 +328,7 @@ async fn proxy_to_endpoint(
         emit_service_http_failure(
             &state,
             &req,
+            workspace,
             &sandbox_name,
             &service_name,
             Some(&endpoint),
@@ -582,19 +597,19 @@ fn is_gateway_auth_cookie(name: &str) -> bool {
 
 pub fn emit_service_endpoint_config_event(endpoint: &ServiceEndpoint, url: &str, created: bool) {
     let event = build_service_endpoint_config_event(endpoint, url, created);
-    emit_gateway_ocsf_event(&endpoint.sandbox_id, event);
+    emit_gateway_ocsf_event(event);
 }
 
 pub fn emit_service_endpoint_delete_event(endpoint: &ServiceEndpoint) {
     let event = build_service_endpoint_delete_event(endpoint);
-    emit_gateway_ocsf_event(&endpoint.sandbox_id, event);
+    emit_gateway_ocsf_event(event);
 }
 
 pub fn emit_cross_origin_service_http_rejection(state: &ServerState, req: &Request<Body>) {
     let Some(host) = request_host(req) else {
         return;
     };
-    let Some((_workspace, sandbox_name, service_name)) =
+    let Some((workspace, sandbox_name, service_name)) =
         parse_host(host, &state.config.service_routing)
     else {
         return;
@@ -604,32 +619,42 @@ pub fn emit_cross_origin_service_http_rejection(state: &ServerState, req: &Reque
         "Cross-origin service request rejected",
         "cross-origin service request rejected",
     );
-    emit_service_http_failure(state, req, &sandbox_name, &service_name, None, &err);
+    emit_service_http_failure(
+        state,
+        req,
+        &workspace,
+        &sandbox_name,
+        &service_name,
+        None,
+        &err,
+    );
 }
 
 fn emit_service_http_failure(
     state: &ServerState,
     req: &Request<Body>,
+    workspace: &str,
     sandbox_name: &str,
     service_name: &str,
     endpoint: Option<&ServiceEndpoint>,
     err: &ServiceRouteError,
 ) {
+    let sandbox_id =
+        http_failure_sandbox_id(&state.sandbox_index, workspace, sandbox_name, endpoint);
     let event = build_service_http_failure_event(
         state.config.bind_address.port(),
         req,
+        &sandbox_id,
         sandbox_name,
         service_name,
-        endpoint,
         err,
     );
-    let sandbox_id = endpoint.map_or("", |endpoint| endpoint.sandbox_id.as_str());
-    emit_gateway_ocsf_event(sandbox_id, event);
+    emit_gateway_ocsf_event(event);
 }
 
 fn emit_service_relay_failure(endpoint: &ServiceEndpoint, target_port: u16, reason: &str) {
     let event = build_service_relay_failure_event(endpoint, target_port, reason);
-    emit_gateway_ocsf_event(&endpoint.sandbox_id, event);
+    emit_gateway_ocsf_event(event);
 }
 
 fn build_service_endpoint_config_event(
@@ -679,20 +704,34 @@ fn build_service_endpoint_delete_event(endpoint: &ServiceEndpoint) -> OcsfEvent 
     .build()
 }
 
+/// Resolve an endpoint's sandbox id, falling back to the workspace/name index.
+fn http_failure_sandbox_id(
+    index: &SandboxIndex,
+    workspace: &str,
+    sandbox_name: &str,
+    endpoint: Option<&ServiceEndpoint>,
+) -> String {
+    endpoint.map_or_else(
+        || {
+            index
+                .sandbox_id_for_sandbox_name(workspace, sandbox_name)
+                .unwrap_or_default()
+        },
+        |endpoint| endpoint.sandbox_id.clone(),
+    )
+}
+
 fn build_service_http_failure_event(
     bind_port: u16,
     req: &Request<Body>,
+    sandbox_id: &str,
     sandbox_name: &str,
     service_name: &str,
-    endpoint: Option<&ServiceEndpoint>,
     err: &ServiceRouteError,
 ) -> OcsfEvent {
     let host = request_host(req).unwrap_or("unknown");
     let (hostname, port) = split_authority_for_event(host, bind_port);
-    let ctx = gateway_ocsf_ctx(
-        endpoint.map_or("", |endpoint| endpoint.sandbox_id.as_str()),
-        sandbox_name,
-    );
+    let ctx = gateway_ocsf_ctx(sandbox_id, sandbox_name);
     HttpActivityBuilder::new(&ctx)
         .activity(http_activity_for_method(req.method()))
         .action(ActionId::Denied)
@@ -751,13 +790,9 @@ fn build_service_relay_failure_event(
     .build()
 }
 
-fn emit_gateway_ocsf_event(sandbox_id: &str, event: OcsfEvent) {
-    let message = event.format_shorthand();
-    info!(
-        target: OCSF_TARGET,
-        sandbox_id = %sandbox_id,
-        message = %message
-    );
+/// Emit through the structured OCSF tracing bridge.
+fn emit_gateway_ocsf_event(event: OcsfEvent) {
+    openshell_ocsf::ocsf_emit!(event);
 }
 
 fn gateway_ocsf_ctx(sandbox_id: &str, sandbox_name: &str) -> SandboxContext {
@@ -1120,8 +1155,14 @@ mod tests {
             "Cross-origin service request rejected",
             "cross-origin service request rejected",
         );
-        let event =
-            build_service_http_failure_event(18080, &request, "my-sandbox", "web", None, &err);
+        let event = build_service_http_failure_event(
+            18080,
+            &request,
+            "sandbox-1",
+            "my-sandbox",
+            "web",
+            &err,
+        );
         let json = event.to_json().unwrap();
 
         assert_eq!(json["class_uid"], 4002);
@@ -1233,5 +1274,116 @@ mod tests {
             not_found.is_err(),
             "should not find endpoint in wrong workspace"
         );
+    }
+
+    fn indexed_sandbox() -> SandboxIndex {
+        let index = SandboxIndex::new();
+        index.update_from_sandbox(&Sandbox {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: "sandbox-1".to_string(),
+                name: "my-sandbox".to_string(),
+                workspace: "default".to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        index
+    }
+
+    #[test]
+    fn http_failure_resolves_the_sandbox_id_from_the_index_without_an_endpoint() {
+        let index = indexed_sandbox();
+
+        assert_eq!(
+            http_failure_sandbox_id(&index, "default", "my-sandbox", None),
+            "sandbox-1"
+        );
+    }
+
+    #[test]
+    fn http_failure_sandbox_id_prefers_the_endpoint_and_tolerates_unknown_names() {
+        let index = indexed_sandbox();
+        let endpoint = endpoint();
+
+        assert_eq!(
+            http_failure_sandbox_id(&index, "default", "my-sandbox", Some(&endpoint)),
+            endpoint.sandbox_id
+        );
+        assert_eq!(
+            http_failure_sandbox_id(&index, "default", "does-not-exist", None),
+            ""
+        );
+        assert_eq!(
+            http_failure_sandbox_id(&index, "other-workspace", "my-sandbox", None),
+            ""
+        );
+    }
+
+    #[test]
+    fn http_failure_event_carries_the_resolved_sandbox_id() {
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/")
+            .header(header::HOST, "default--my-sandbox--web.example.test")
+            .body(Body::empty())
+            .unwrap();
+        let event = build_service_http_failure_event(
+            8443,
+            &req,
+            "sandbox-1",
+            "my-sandbox",
+            "web",
+            &ServiceRouteError::endpoint_not_found(),
+        );
+
+        assert_eq!(
+            event.base().metadata.uid.as_deref(),
+            Some("sandbox-1"),
+            "resolved sandbox id should reach the event"
+        );
+    }
+
+    /// Captures structured OCSF events during tracing dispatch.
+    #[derive(Clone, Default)]
+    struct ProbeLayer {
+        seen: Arc<std::sync::Mutex<Vec<Option<OcsfEvent>>>>,
+    }
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for ProbeLayer {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if event.metadata().target() == openshell_ocsf::OCSF_TARGET {
+                self.seen
+                    .lock()
+                    .unwrap()
+                    .push(openshell_ocsf::clone_current_event());
+            }
+        }
+    }
+
+    #[test]
+    fn gateway_ocsf_events_expose_the_structured_event_to_layers() {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let probe = ProbeLayer::default();
+        let subscriber = tracing_subscriber::registry().with(probe.clone());
+
+        let endpoint = endpoint();
+        let expected = build_service_endpoint_config_event(&endpoint, "https://example.test", true);
+        let expected_shorthand = expected.format_shorthand();
+
+        tracing::subscriber::with_default(subscriber, || {
+            emit_service_endpoint_config_event(&endpoint, "https://example.test", true);
+        });
+
+        let seen = probe.seen.lock().unwrap();
+        assert_eq!(seen.len(), 1, "expected exactly one OCSF tracing event");
+        let event = seen[0]
+            .as_ref()
+            .expect("structured OCSF event should be reachable from the layer");
+        assert_eq!(event.format_shorthand(), expected_shorthand);
     }
 }

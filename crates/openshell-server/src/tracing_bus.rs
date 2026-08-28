@@ -3,7 +3,7 @@
 
 //! Capture openshell-server tracing logs for streaming over gRPC.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use openshell_core::proto::{SandboxLogLine, SandboxStreamEvent};
@@ -24,6 +24,9 @@ pub struct TracingLogBus {
 struct Inner {
     per_id: HashMap<String, broadcast::Sender<SandboxStreamEvent>>,
     tails: HashMap<String, VecDeque<SandboxStreamEvent>>,
+    /// Recently removed sandbox ids, in eviction order.
+    removed: VecDeque<String>,
+    removed_set: HashSet<String>,
 }
 
 impl Default for TracingLogBus {
@@ -39,6 +42,8 @@ impl TracingLogBus {
             inner: Arc::new(Mutex::new(Inner {
                 per_id: HashMap::new(),
                 tails: HashMap::new(),
+                removed: VecDeque::new(),
+                removed_set: HashSet::new(),
             })),
             platform_event_bus: PlatformEventBus::new(),
         }
@@ -51,8 +56,13 @@ impl TracingLogBus {
         }
     }
 
-    fn sender_for(&self, sandbox_id: &str) -> broadcast::Sender<SandboxStreamEvent> {
+    pub fn subscribe(&self, sandbox_id: &str) -> broadcast::Receiver<SandboxStreamEvent> {
         let mut inner = self.inner.lock().expect("tracing bus lock poisoned");
+        if inner.removed_set.contains(sandbox_id) {
+            let (tx, rx) = broadcast::channel(1);
+            drop(tx);
+            return rx;
+        }
         inner
             .per_id
             .entry(sandbox_id.to_string())
@@ -60,11 +70,7 @@ impl TracingLogBus {
                 let (tx, _rx) = broadcast::channel(1024);
                 tx
             })
-            .clone()
-    }
-
-    pub fn subscribe(&self, sandbox_id: &str) -> broadcast::Receiver<SandboxStreamEvent> {
-        self.sender_for(sandbox_id).subscribe()
+            .subscribe()
     }
 
     /// Remove all bus entries for the given sandbox id.
@@ -75,6 +81,15 @@ impl TracingLogBus {
         let mut inner = self.inner.lock().expect("tracing bus lock poisoned");
         inner.per_id.remove(sandbox_id);
         inner.tails.remove(sandbox_id);
+
+        if inner.removed_set.insert(sandbox_id.to_string()) {
+            inner.removed.push_back(sandbox_id.to_string());
+            while inner.removed.len() > Self::MAX_REMEMBERED_REMOVALS {
+                if let Some(evicted) = inner.removed.pop_front() {
+                    inner.removed_set.remove(&evicted);
+                }
+            }
+        }
     }
 
     pub fn tail(&self, sandbox_id: &str, max: usize) -> Vec<SandboxStreamEvent> {
@@ -95,6 +110,9 @@ impl TracingLogBus {
     /// used by the tracing layer, so it appears in `WatchSandbox` and
     /// `GetSandboxLogs` transparently.
     pub fn publish_external(&self, log: SandboxLogLine) {
+        if log.sandbox_id.is_empty() {
+            return;
+        }
         let evt = SandboxStreamEvent {
             payload: Some(openshell_core::proto::sandbox_stream_event::Payload::Log(
                 log.clone(),
@@ -106,16 +124,42 @@ impl TracingLogBus {
     /// Default tail buffer capacity (lines per sandbox).
     const DEFAULT_TAIL: usize = 2000;
 
-    fn publish(&self, sandbox_id: &str, event: SandboxStreamEvent, tail_cap: usize) {
-        let tx = self.sender_for(sandbox_id);
-        let _ = tx.send(event.clone());
+    /// Number of `(sender, tail)` entries currently held, for leak assertions.
+    #[cfg(test)]
+    fn entry_counts(&self) -> (usize, usize) {
+        let inner = self.inner.lock().expect("tracing bus lock poisoned");
+        (inner.per_id.len(), inner.tails.len())
+    }
 
+    /// Maximum number of removed sandbox ids to retain.
+    ///
+    /// This bounds memory; after eviction, a very late publisher may create a
+    /// fresh entry for that id.
+    const MAX_REMEMBERED_REMOVALS: usize = 1024;
+
+    fn publish(&self, sandbox_id: &str, event: SandboxStreamEvent, tail_cap: usize) {
         let mut inner = self.inner.lock().expect("tracing bus lock poisoned");
+        if inner.removed_set.contains(sandbox_id) {
+            return;
+        }
+
+        let tx = inner
+            .per_id
+            .entry(sandbox_id.to_string())
+            .or_insert_with(|| {
+                let (tx, _rx) = broadcast::channel(1024);
+                tx
+            })
+            .clone();
+
         let deque = inner.tails.entry(sandbox_id.to_string()).or_default();
-        deque.push_back(event);
+        deque.push_back(event.clone());
         while deque.len() > tail_cap {
             deque.pop_front();
         }
+        drop(inner);
+
+        let _ = tx.send(event);
     }
 }
 
@@ -131,14 +175,28 @@ where
 {
     fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
         let meta = event.metadata();
-        let mut visitor = LogVisitor::default();
-        event.record(&mut visitor);
+        // OCSF tracing events carry no fields; the payload arrives out of band
+        // through a thread-local.
+        let (visitor_sandbox_id, visitor_message) = if meta.target() == OCSF_TARGET {
+            openshell_ocsf::clone_current_event().map_or((None, None), |ocsf_event| {
+                (
+                    ocsf_event.base().metadata.uid.clone(),
+                    Some(ocsf_event.format_shorthand()),
+                )
+            })
+        } else {
+            let mut visitor = LogVisitor::default();
+            event.record(&mut visitor);
+            (visitor.sandbox_id, visitor.message)
+        };
 
-        let Some(sandbox_id) = visitor.sandbox_id else {
+        // An empty id means no sandbox association; publishing would allocate a
+        // bucket nothing can subscribe to.
+        let Some(sandbox_id) = visitor_sandbox_id.filter(|id| !id.is_empty()) else {
             return;
         };
 
-        let msg = visitor.message.unwrap_or_else(|| meta.name().to_string());
+        let msg = visitor_message.unwrap_or_else(|| meta.name().to_string());
         let level = display_level(meta.target(), &meta.level().to_string());
 
         let ts = openshell_core::time::now_ms();
@@ -228,22 +286,22 @@ mod tests {
     }
 
     #[test]
-    fn tracing_log_bus_subscribe_after_remove_creates_fresh_channel() {
+    fn subscribe_after_remove_does_not_reactivate_the_bus() {
         let bus = TracingLogBus::new();
         let sandbox_id = "sb-2";
 
-        // Create and remove
         bus.publish_external(make_log_event(sandbox_id, "old message"));
         bus.remove(sandbox_id);
 
-        // Subscribe again — should get a fresh channel with no history
         let mut rx = bus.subscribe(sandbox_id);
-        assert!(bus.tail(sandbox_id, 10).is_empty());
+        bus.publish_external(make_log_event(sandbox_id, "late message"));
 
-        // New publish should reach the new subscriber
-        bus.publish_external(make_log_event(sandbox_id, "new message"));
-        let evt = rx.try_recv().expect("should receive new event");
-        assert!(evt.payload.is_some());
+        assert_eq!(bus.entry_counts(), (0, 0));
+        assert!(bus.tail(sandbox_id, 10).is_empty());
+        assert!(matches!(
+            rx.try_recv(),
+            Err(broadcast::error::TryRecvError::Closed)
+        ));
     }
 
     #[test]
@@ -268,6 +326,143 @@ mod tests {
         let bus = TracingLogBus::new();
         // Should not panic
         bus.remove("nonexistent");
+    }
+
+    #[test]
+    fn publish_after_remove_does_not_resurrect_the_bus_entry() {
+        let bus = TracingLogBus::new();
+        let sandbox_id = "sb-torn-down";
+
+        bus.publish_external(make_log_event(sandbox_id, "before teardown"));
+        assert_eq!(bus.entry_counts(), (1, 1));
+
+        bus.remove(sandbox_id);
+        assert_eq!(bus.entry_counts(), (0, 0));
+
+        bus.publish_external(make_log_event(sandbox_id, "late line"));
+        assert_eq!(bus.entry_counts(), (0, 0));
+        assert!(bus.tail(sandbox_id, 10).is_empty());
+    }
+
+    fn ocsf_ctx(sandbox_id: &str) -> openshell_ocsf::SandboxContext {
+        openshell_ocsf::SandboxContext {
+            sandbox_id: sandbox_id.to_string(),
+            sandbox_name: "gw".to_string(),
+            container_image: "openshell/gateway".to_string(),
+            hostname: "openshell-gateway".to_string(),
+            product_version: "0.0.0".to_string(),
+            proxy_ip: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            proxy_port: 0,
+        }
+    }
+
+    /// Run `f` with the bus layer installed as the active subscriber.
+    fn with_bus_layer(bus: &TracingLogBus, f: impl FnOnce()) {
+        use tracing_subscriber::layer::SubscriberExt;
+        let subscriber = tracing_subscriber::registry().with(bus.layer());
+        tracing::subscriber::with_default(subscriber, f);
+    }
+
+    fn log_message(event: &SandboxStreamEvent) -> &SandboxLogLine {
+        match event.payload {
+            Some(openshell_core::proto::sandbox_stream_event::Payload::Log(ref log)) => log,
+            _ => panic!("expected a log payload"),
+        }
+    }
+
+    #[test]
+    fn ocsf_emit_events_reach_the_bus_with_shorthand_and_sandbox_id() {
+        use openshell_ocsf::{
+            ActionId, ActivityId, DispositionId, Endpoint, NetworkActivityBuilder, SeverityId,
+            StatusId, ocsf_emit,
+        };
+
+        let bus = TracingLogBus::new();
+        let event = NetworkActivityBuilder::new(&ocsf_ctx("sb-emit"))
+            .activity(ActivityId::Open)
+            .action(ActionId::Denied)
+            .disposition(DispositionId::Blocked)
+            .severity(SeverityId::Medium)
+            .status(StatusId::Failure)
+            .dst_endpoint(Endpoint::from_domain("blocked.example.com", 443))
+            .message("CONNECT denied blocked.example.com:443")
+            .build();
+        let expected_message = event.format_shorthand();
+
+        with_bus_layer(&bus, || ocsf_emit!(event));
+
+        let tail = bus.tail("sb-emit", 10);
+        assert_eq!(tail.len(), 1, "ocsf_emit! event should reach the bus");
+        let log = log_message(&tail[0]);
+        assert_eq!(log.sandbox_id, "sb-emit");
+        assert_eq!(log.message, expected_message);
+        assert_eq!(log.level, "OCSF");
+        assert_eq!(log.target, OCSF_TARGET);
+        assert_eq!(log.source, "gateway");
+    }
+
+    #[test]
+    fn ocsf_emit_events_without_a_sandbox_are_skipped() {
+        use openshell_ocsf::{ActivityId, AppLifecycleBuilder, SeverityId, ocsf_emit};
+
+        let bus = TracingLogBus::new();
+        let event = AppLifecycleBuilder::new(&ocsf_ctx(""))
+            .activity(ActivityId::Open)
+            .severity(SeverityId::Informational)
+            .message("gateway TLS reloaded")
+            .build();
+
+        with_bus_layer(&bus, || ocsf_emit!(event));
+
+        assert_eq!(bus.entry_counts(), (0, 0));
+    }
+
+    #[test]
+    fn non_ocsf_events_still_use_the_sandbox_id_field() {
+        let bus = TracingLogBus::new();
+        with_bus_layer(&bus, || {
+            tracing::info!(sandbox_id = "sb-plain", "plain gateway line");
+        });
+
+        let tail = bus.tail("sb-plain", 10);
+        assert_eq!(tail.len(), 1);
+        let log = log_message(&tail[0]);
+        assert_eq!(log.message, "plain gateway line");
+        assert_eq!(log.level, "INFO");
+    }
+
+    #[test]
+    fn removal_tombstones_are_bounded() {
+        let bus = TracingLogBus::new();
+        let overflow = TracingLogBus::MAX_REMEMBERED_REMOVALS + 10;
+        for i in 0..overflow {
+            bus.remove(&format!("sb-{i}"));
+        }
+
+        let inner = bus.inner.lock().unwrap();
+        assert_eq!(inner.removed.len(), TracingLogBus::MAX_REMEMBERED_REMOVALS);
+        assert_eq!(
+            inner.removed_set.len(),
+            TracingLogBus::MAX_REMEMBERED_REMOVALS
+        );
+        assert!(!inner.removed_set.contains("sb-0"));
+        assert!(inner.removed_set.contains(&format!("sb-{}", overflow - 1)));
+    }
+
+    #[test]
+    fn publish_external_ignores_an_empty_sandbox_id() {
+        let bus = TracingLogBus::new();
+        bus.publish_external(make_log_event("", "no sandbox association"));
+
+        assert_eq!(bus.entry_counts(), (0, 0));
+        assert!(bus.tail("", 10).is_empty());
+    }
+
+    #[test]
+    fn publish_external_still_accepts_a_real_sandbox_id() {
+        let bus = TracingLogBus::new();
+        bus.publish_external(make_log_event("sb-real", "hello"));
+        assert_eq!(bus.tail("sb-real", 10).len(), 1);
     }
 
     #[test]
