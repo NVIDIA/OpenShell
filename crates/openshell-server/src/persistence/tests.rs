@@ -367,6 +367,116 @@ async fn sqlite_delete_behavior() {
 }
 
 #[tokio::test]
+async fn delete_many_is_bounded_idempotent_and_type_scoped() {
+    let store = test_store().await;
+    let mut ids = Vec::new();
+    for idx in 0..(super::DELETE_MANY_BATCH_SIZE + 12) {
+        let id = format!("sandbox-{idx}");
+        store
+            .put(
+                "sandbox",
+                &id,
+                &format!("name-{idx}"),
+                "default",
+                b"payload",
+                None,
+            )
+            .await
+            .unwrap();
+        ids.push(id);
+    }
+    store
+        .put(
+            "provider",
+            "other-type",
+            "other-type",
+            "default",
+            b"payload",
+            None,
+        )
+        .await
+        .unwrap();
+
+    ids.extend([
+        "missing".to_string(),
+        "other-type".to_string(),
+        "sandbox-0".to_string(),
+    ]);
+    let expected = u64::try_from(super::DELETE_MANY_BATCH_SIZE + 12).unwrap();
+    assert_eq!(store.delete_many("sandbox", &ids).await.unwrap(), expected);
+    assert_eq!(store.delete_many("sandbox", &ids).await.unwrap(), 0);
+    assert_eq!(store.delete_many("sandbox", &[]).await.unwrap(), 0);
+    assert!(store.get("provider", "other-type").await.unwrap().is_some());
+}
+
+#[tokio::test]
+async fn file_backed_sqlite_bulk_delete_allows_concurrent_control_reads() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let url = format!("sqlite:{}?mode=rwc", tmp.path().join("bulk.db").display());
+    let store = Store::connect(&url)
+        .await
+        .expect("connect file-backed store");
+    store
+        .put(
+            "provider",
+            "control-row",
+            "control-row",
+            "default",
+            b"control",
+            None,
+        )
+        .await
+        .unwrap();
+
+    let mut ids = Vec::new();
+    for idx in 0..500 {
+        let id = format!("session-{idx}");
+        store
+            .put("ssh_session", &id, &id, "default", b"payload", None)
+            .await
+            .unwrap();
+        ids.push(id);
+    }
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let read_store = store.clone();
+    let read_stop = stop.clone();
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let reader = tokio::spawn(async move {
+        let mut reads = 0_usize;
+        let mut started_tx = Some(started_tx);
+        while !read_stop.load(Ordering::Relaxed) {
+            read_store
+                .get("provider", "control-row")
+                .await
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| "control row disappeared".to_string())?;
+            reads += 1;
+            if let Some(started_tx) = started_tx.take() {
+                let _ = started_tx.send(());
+            }
+            tokio::task::yield_now().await;
+        }
+        Ok::<usize, String>(reads)
+    });
+    started_rx.await.expect("reader started");
+
+    assert_eq!(store.delete_many("ssh_session", &ids).await.unwrap(), 500);
+    stop.store(true, Ordering::Relaxed);
+    assert!(reader.await.unwrap().unwrap() > 0);
+    assert!(
+        store
+            .get("provider", "control-row")
+            .await
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[tokio::test]
 async fn sqlite_protobuf_round_trip() {
     let store = test_store().await;
 

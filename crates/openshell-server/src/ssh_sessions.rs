@@ -13,6 +13,8 @@ use tracing::{info, warn};
 
 use crate::persistence::{ObjectType, Store};
 
+const SESSION_REAPER_PAGE_SIZE: u32 = 1000;
+
 impl ObjectType for SshSession {
     fn object_type() -> &'static str {
         "ssh_session"
@@ -35,36 +37,54 @@ pub fn spawn_session_reaper(store: Arc<Store>, interval: Duration) {
 
 async fn reap_expired_sessions(store: &Store) -> Result<(), String> {
     let now_ms = now_ms();
+    let started = std::time::Instant::now();
+    let mut offset = 0_u32;
+    let mut scanned = 0_usize;
+    let mut decode_failures = 0_usize;
+    let mut session_ids = Vec::new();
 
-    let records = store
-        .list_by_type(SshSession::object_type(), 1000, 0)
-        .await
-        .map_err(|e| e.to_string())?;
+    loop {
+        let records = store
+            .list_by_type(SshSession::object_type(), SESSION_REAPER_PAGE_SIZE, offset)
+            .await
+            .map_err(|e| e.to_string())?;
+        let page_len = records.len();
+        scanned += page_len;
 
-    let mut reaped = 0u32;
-    for record in records {
-        let session: SshSession = match Message::decode(record.payload.as_slice()) {
-            Ok(s) => s,
-            Err(_) => continue,
-        };
-
-        let should_delete =
-            (session.expires_at_ms > 0 && now_ms > session.expires_at_ms) || session.revoked;
-
-        if should_delete {
-            if let Err(e) = store
-                .delete(SshSession::object_type(), session.object_id())
-                .await
-            {
-                warn!(session_id = %session.object_id(), error = %e, "Failed to reap SSH session");
-            } else {
-                reaped += 1;
+        for record in records {
+            let Ok(session) = SshSession::decode(record.payload.as_slice()) else {
+                decode_failures += 1;
+                continue;
+            };
+            if (session.expires_at_ms > 0 && now_ms > session.expires_at_ms) || session.revoked {
+                session_ids.push(session.object_id().to_string());
             }
         }
+
+        if page_len < SESSION_REAPER_PAGE_SIZE as usize {
+            break;
+        }
+        let page_len = u32::try_from(page_len)
+            .map_err(|_| "SSH session reaper page length overflow".to_string())?;
+        offset = offset
+            .checked_add(page_len)
+            .ok_or_else(|| "SSH session reaper pagination overflow".to_string())?;
     }
 
-    if reaped > 0 {
-        info!(count = reaped, "SSH session reaper: cleaned up sessions");
+    let matched = session_ids.len();
+    let deleted = store
+        .delete_many(SshSession::object_type(), &session_ids)
+        .await
+        .map_err(|e| e.to_string())?;
+    if matched > 0 || decode_failures > 0 {
+        info!(
+            scanned,
+            matched,
+            deleted,
+            decode_failures,
+            elapsed_ms = started.elapsed().as_millis(),
+            "SSH session reaper sweep complete"
+        );
     }
     Ok(())
 }
@@ -173,6 +193,40 @@ mod tests {
                 .unwrap()
                 .is_some(),
             "session with no expiry should be preserved"
+        );
+    }
+
+    #[tokio::test]
+    async fn reaper_batches_expired_and_revoked_sessions() {
+        let store = test_store().await;
+        let session_count = crate::persistence::DELETE_MANY_BATCH_SIZE + 9;
+        for idx in 0..session_count {
+            let session = make_session(
+                &format!("reap-{idx}"),
+                "sbx1",
+                if idx % 2 == 0 { now_ms() - 1 } else { 0 },
+                idx % 2 != 0,
+            );
+            store.put_message(&session).await.unwrap();
+        }
+        let active = make_session("keep", "sbx1", now_ms() + 60_000, false);
+        store.put_message(&active).await.unwrap();
+
+        reap_expired_sessions(&store).await.unwrap();
+
+        assert_eq!(
+            store
+                .count_in_workspace(SshSession::object_type(), "default")
+                .await
+                .unwrap(),
+            1
+        );
+        assert!(
+            store
+                .get_message::<SshSession>("keep")
+                .await
+                .unwrap()
+                .is_some()
         );
     }
 }

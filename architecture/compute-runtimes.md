@@ -191,6 +191,9 @@ backend is already absent (`deleted = false`), the request removes gateway state
 synchronously. Sandbox row removal remains bound to the stable ID and resource
 version. Settings retain their existing best-effort name-based cleanup; SSH
 sessions, indexes, and watch/log buses are cleaned after confirmed removal.
+Owned-record cleanup discovers records before mutating them and uses bounded
+set-based deletes so teardown cannot amplify one sandbox into an unbounded
+sequence of individual persistence writes.
 
 The request acquires both locks before starting owned work, so cancellation
 while queued does not leave a delete armed. After that commitment point, the
