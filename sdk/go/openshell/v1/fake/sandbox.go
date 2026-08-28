@@ -591,6 +591,54 @@ func (c *fakeSandboxClient) Delete(_ context.Context, workspace, name string, op
 	return deletionResult(true, deleted.ID, opts)
 }
 
+// WaitDeleted polls until the sandbox is absent from the fake store.
+func (c *fakeSandboxClient) WaitDeleted(ctx context.Context, workspace, name string, opts ...v1.WaitOptions) error {
+	if c.closedFunc() {
+		return &types.StatusError{Code: types.ErrorUnavailable, Message: "client is closed"}
+	}
+
+	interval := 500 * time.Millisecond
+	var expectedID string
+	if len(opts) > 0 && opts[0].PollInterval > 0 {
+		interval = opts[0].PollInterval
+	}
+	if len(opts) > 0 {
+		expectedID = opts[0].ExpectedSandboxID
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		if err := ctx.Err(); err != nil {
+			return &types.StatusError{Code: types.ErrorCancelled, Message: err.Error(), Cause: err}
+		}
+		sandbox, err := c.store.Get(workspace, name)
+		if types.IsNotFound(err) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if expectedID != "" && sandbox.ID != expectedID {
+			return nil
+		}
+
+		select {
+		case <-ctx.Done():
+			err := ctx.Err()
+			switch err {
+			case context.DeadlineExceeded:
+				return &types.StatusError{Code: types.ErrorDeadlineExceeded, Message: err.Error(), Cause: err}
+			case context.Canceled:
+				return &types.StatusError{Code: types.ErrorCancelled, Message: err.Error(), Cause: err}
+			default:
+				return &types.StatusError{Code: types.ErrorInternal, Message: err.Error(), Cause: err}
+			}
+		case <-ticker.C:
+		}
+	}
+}
+
 // WaitReady transitions a sandbox to the Ready phase. In the fake
 // implementation this happens synchronously — context cancellation is
 // checked first to support timeout testing.

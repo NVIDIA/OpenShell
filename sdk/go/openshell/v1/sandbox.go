@@ -78,6 +78,8 @@ type SandboxInterface interface {
 	Stop(ctx context.Context, workspace, name string) (*Sandbox, error)
 	Start(ctx context.Context, workspace, name string) (*Sandbox, error)
 	Delete(ctx context.Context, workspace, name string, opts ...DeleteOptions) (*DeletionResult, error)
+	// WaitDeleted waits for absence of the named sandbox or a different ID.
+	WaitDeleted(ctx context.Context, workspace, name string, opts ...WaitOptions) error
 	AttachProvider(ctx context.Context, workspace, sandboxName, providerName string, expectedResourceVersion uint64) (*AttachProviderResult, error)
 	DetachProvider(ctx context.Context, workspace, sandboxName, providerName string, expectedResourceVersion uint64) (*DetachProviderResult, error)
 	// ListProviders returns a lazy pager over providers attached to a sandbox.

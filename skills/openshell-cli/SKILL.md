@@ -465,10 +465,12 @@ openshell logs my-sandbox --since 5m
 openshell sandbox delete my-sandbox
 openshell sandbox delete sandbox-1 sandbox-2 sandbox-3   # Multiple at once
 openshell sandbox delete --all
+openshell sandbox delete my-sandbox --no-wait            # Async acknowledgment only
 ```
 
-`deletion accepted` means cleanup is still pending. Inspect the sandbox until
-it disappears before assuming completion. An already-absent sandbox succeeds;
+Deletion waits for the targeted sandbox to disappear by default. Use `--no-wait`
+for an acknowledgment before cleanup finishes, and `--timeout <seconds>` to
+bound each wait (300 seconds by default). An already-absent sandbox succeeds;
 missing workspaces and authorization failures remain errors. Do not blindly
 retry by name if another process might have recreated that name.
 

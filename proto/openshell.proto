@@ -168,7 +168,9 @@ service OpenShell {
     };
   }
 
-  // Delete a sandbox by name.
+  // Request sandbox deletion by name. An ACCEPTED outcome acknowledges the
+  // request; poll GetSandbox for NOT_FOUND or a different sandbox ID when
+  // terminal deletion is required.
   rpc DeleteSandbox(DeleteSandboxRequest) returns (DeleteSandboxResponse) {
     option (openshell.options.v1.authorization) = {
       auth_mode: "bearer"
@@ -1712,6 +1714,8 @@ message DeleteSandboxResponse {
   reserved 1;
   reserved "deleted";
   DeletionOutcome outcome = 2;
+  // ACCEPTED means deletion may still be in progress. COMPLETED and
+  // ALREADY_ABSENT establish logical completion.
   // Immutable identity of the targeted sandbox, empty for ALREADY_ABSENT.
   // A same-name replacement is not part of this deletion.
   string sandbox_id = 3;

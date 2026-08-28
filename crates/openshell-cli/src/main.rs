@@ -11,6 +11,7 @@ use openshell_cli::color::{self, ColorChoice, Colorize};
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use openshell_bootstrap::{
     edge_token::load_edge_token, get_gateway_metadata, list_gateways, load_active_gateway,
@@ -1667,6 +1668,14 @@ enum SandboxCommands {
         /// Delete all sandboxes.
         #[arg(long, conflicts_with = "names")]
         all: bool,
+
+        /// Return after the gateway accepts the deletion request.
+        #[arg(long, conflicts_with = "timeout")]
+        no_wait: bool,
+
+        /// Maximum seconds to wait for terminal deletion.
+        #[arg(long, value_name = "SECONDS")]
+        timeout: Option<u64>,
     },
 
     /// Stop a sandbox while preserving its workspace.
@@ -3560,7 +3569,12 @@ async fn run_async() -> Result<()> {
                             )
                             .await?;
                         }
-                        SandboxCommands::Delete { names, all } => {
+                        SandboxCommands::Delete {
+                            names,
+                            all,
+                            no_wait,
+                            timeout,
+                        } => {
                             run::sandbox_delete(
                                 endpoint,
                                 &names,
@@ -3568,6 +3582,10 @@ async fn run_async() -> Result<()> {
                                 &cli.workspace,
                                 &tls,
                                 &ctx.name,
+                                run::SandboxDeleteOptions {
+                                    no_wait,
+                                    timeout: timeout.map(Duration::from_secs),
+                                },
                             )
                             .await?;
                         }
@@ -5507,6 +5525,59 @@ mod tests {
                 command: Some(SandboxCommands::Start { name: None }),
             })
         ));
+    }
+
+    #[test]
+    fn sandbox_delete_waits_by_default_and_accepts_async_options() {
+        let default_delete = Cli::try_parse_from(["openshell", "sandbox", "delete", "demo"])
+            .expect("sandbox delete should parse");
+        assert!(matches!(
+            default_delete.command,
+            Some(Commands::Sandbox {
+                command: Some(SandboxCommands::Delete {
+                    no_wait: false,
+                    timeout: None,
+                    ..
+                })
+            })
+        ));
+
+        let no_wait = Cli::try_parse_from(["openshell", "sandbox", "delete", "demo", "--no-wait"])
+            .expect("sandbox delete --no-wait should parse");
+        assert!(matches!(
+            no_wait.command,
+            Some(Commands::Sandbox {
+                command: Some(SandboxCommands::Delete { no_wait: true, .. })
+            })
+        ));
+
+        let timeout =
+            Cli::try_parse_from(["openshell", "sandbox", "delete", "demo", "--timeout", "42"])
+                .expect("sandbox delete --timeout should parse");
+        assert!(matches!(
+            timeout.command,
+            Some(Commands::Sandbox {
+                command: Some(SandboxCommands::Delete {
+                    no_wait: false,
+                    timeout: Some(42),
+                    ..
+                })
+            })
+        ));
+
+        assert!(
+            Cli::try_parse_from([
+                "openshell",
+                "sandbox",
+                "delete",
+                "demo",
+                "--no-wait",
+                "--timeout",
+                "42",
+            ])
+            .is_err(),
+            "--no-wait and --timeout should conflict"
+        );
     }
 
     #[test]
