@@ -211,7 +211,8 @@ async fn tracing_in_process_service_preserves_the_driver_rpc_server_boundary() {
             Some(otel_tracing::IN_PROCESS_TARGET_PREFIX),
         ))
         .with(otel_tracing::in_process_layer(&driver_provider));
-    let service = ComputeDriverService::new_in_process(test_driver_with_config(runtime_config()));
+    let service =
+        ComputeDriverService::new_in_process(test_driver_with_config(runtime_config(false)));
 
     async {
         let gateway_span = tracing::info_span!(
@@ -323,7 +324,7 @@ async fn tracing_lifecycle_rpc_failures_export_docker_operation_spans() {
         .with_simple_exporter(exporter.clone())
         .build();
     let subscriber = tracing_subscriber::registry().with(otel_tracing::layer(&provider));
-    let driver = test_driver_with_config(runtime_config());
+    let driver = test_driver_with_config(runtime_config(false));
 
     async {
         ComputeDriver::create_sandbox(
@@ -377,7 +378,7 @@ async fn tracing_direct_start_exports_a_docker_start_span() {
         .with_simple_exporter(exporter.clone())
         .build();
     let subscriber = tracing_subscriber::registry().with(otel_tracing::layer(&provider));
-    let driver = test_driver_with_config(runtime_config());
+    let driver = test_driver_with_config(runtime_config(false));
 
     DockerComputeDriver::start_sandbox(&driver, "", "")
         .with_subscriber(subscriber)
@@ -409,7 +410,7 @@ async fn tracing_image_preparation_failure_exports_nested_failed_spans() {
         .with_simple_exporter(exporter.clone())
         .build();
     let subscriber = tracing_subscriber::registry().with(otel_tracing::layer(&provider));
-    let mut config = runtime_config();
+    let mut config = runtime_config(false);
     config.image_pull_policy = "unsupported".to_string();
     let driver = test_driver_with_config(config);
 
@@ -1124,7 +1125,7 @@ fn build_environment_keeps_network_capabilities_driver_controlled() {
         openshell_core::sandbox_env::NETWORK_RUNTIME_CAPABILITIES.to_string(),
         "spoofed".to_string(),
     );
-    let env = build_environment(&sandbox, &runtime_config());
+    let env = build_environment(&sandbox, &runtime_config(false), false);
     assert!(env.contains(&format!(
         "{}={}",
         openshell_core::sandbox_env::NETWORK_RUNTIME_CAPABILITIES,

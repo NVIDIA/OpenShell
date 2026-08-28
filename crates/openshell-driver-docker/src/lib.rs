@@ -1026,12 +1026,6 @@ impl DockerComputeDriver {
             image.ref = %template.image,
         ))
         .await?;
-        let token_file_created = write_sandbox_token_file(sandbox, &self.config)
-            .await
-            .map_err(|status| {
-                DockerProvisioningFailure::new("SandboxTokenWriteFailed", status.message())
-            })?;
-
         let container_name = container_name_for_sandbox(sandbox);
         let gpu_devices = self
             .resolve_gpu_cdi_devices(
