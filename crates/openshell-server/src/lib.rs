@@ -21,6 +21,7 @@ pub mod config_file;
 mod credentials;
 mod defaults;
 mod gateway_listener;
+mod gateway_ocsf;
 mod grpc;
 mod http;
 mod inference;

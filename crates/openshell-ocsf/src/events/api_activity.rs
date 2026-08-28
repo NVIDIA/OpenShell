@@ -40,12 +40,16 @@ pub struct ApiActivityEvent {
     #[serde(default)]
     pub dst_endpoint: Option<Endpoint>,
 
-    /// Action taken (allowed, denied, etc.).
-    #[serde(default)]
+    /// Action taken (typed enum serialized as `action_id` + `action` label).
+    #[serde(rename = "action_id", default, skip_serializing_if = "Option::is_none")]
     pub action: Option<ActionId>,
 
-    /// Disposition.
-    #[serde(default)]
+    /// Disposition (typed enum serialized as `disposition_id` + `disposition` label).
+    #[serde(
+        rename = "disposition_id",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub disposition: Option<DispositionId>,
 }
 
@@ -140,5 +144,23 @@ mod tests {
         assert_eq!(deserialized.base.class_uid, 6003);
         assert_eq!(deserialized.api.operation, "POST /v1/messages");
         assert!(deserialized.base.ai_model.is_some());
+    }
+
+    #[test]
+    fn action_and_disposition_survive_a_roundtrip() {
+        // `insert_enum_pair!` writes `action_id` (u8) plus an `action` label, so
+        // the field must be renamed to read the id back rather than the label.
+        let mut event = test_api_activity();
+        event.action = Some(ActionId::Allowed);
+        event.disposition = Some(DispositionId::Allowed);
+
+        let json = serde_json::to_value(&event).unwrap();
+        assert_eq!(json["action_id"], ActionId::Allowed.as_u8());
+        assert_eq!(json["action"], ActionId::Allowed.label());
+        assert_eq!(json["disposition_id"], DispositionId::Allowed.as_u8());
+
+        let deserialized: ApiActivityEvent = serde_json::from_value(json).unwrap();
+        assert_eq!(deserialized.action, Some(ActionId::Allowed));
+        assert_eq!(deserialized.disposition, Some(DispositionId::Allowed));
     }
 }

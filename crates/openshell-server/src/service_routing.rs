@@ -9,15 +9,14 @@ use axum::{
 };
 use http::{HeaderMap, HeaderValue, Method, Request, Response, StatusCode, header};
 use hyper_util::rt::TokioIo;
+use openshell_core::ObjectId;
 use openshell_core::config::ServiceRoutingConfig;
 use openshell_core::proto::{Sandbox, SandboxPhase, ServiceEndpoint, TcpRelayTarget, relay_open};
-use openshell_core::{ObjectId, VERSION};
 use openshell_ocsf::{
     ActionId, ActivityId, ConfigStateChangeBuilder, DispositionId, Endpoint, HttpActivityBuilder,
     HttpRequest, HttpResponse as OcsfHttpResponse, NetworkActivityBuilder, OcsfEvent,
     SandboxContext, SeverityId, StateId, StatusId, Url as OcsfUrl,
 };
-use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
@@ -796,15 +795,7 @@ fn emit_gateway_ocsf_event(event: OcsfEvent) {
 }
 
 fn gateway_ocsf_ctx(sandbox_id: &str, sandbox_name: &str) -> SandboxContext {
-    SandboxContext {
-        sandbox_id: sandbox_id.to_string(),
-        sandbox_name: sandbox_name.to_string(),
-        container_image: "openshell/gateway".to_string(),
-        hostname: "openshell-gateway".to_string(),
-        product_version: VERSION.to_string(),
-        proxy_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
-        proxy_port: 0,
-    }
+    crate::gateway_ocsf::context(sandbox_id, sandbox_name)
 }
 
 fn endpoint_name(endpoint: &ServiceEndpoint) -> String {
@@ -1337,7 +1328,11 @@ mod tests {
         );
 
         assert_eq!(
-            event.base().metadata.uid.as_deref(),
+            event
+                .base()
+                .container
+                .as_ref()
+                .and_then(|container| container.uid.as_deref()),
             Some("sandbox-1"),
             "resolved sandbox id should reach the event"
         );

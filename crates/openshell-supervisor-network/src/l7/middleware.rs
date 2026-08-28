@@ -1095,6 +1095,7 @@ mod tests {
             product_version: "0".into(),
             proxy_ip: [127, 0, 0, 1].into(),
             proxy_port: 3128,
+            origin: openshell_ocsf::EventOrigin::Sandbox,
         };
 
         let eval = L7EvalContext {

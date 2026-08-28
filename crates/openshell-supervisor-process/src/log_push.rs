@@ -331,6 +331,7 @@ mod tests {
             product_version: "0.0.0".to_string(),
             proxy_ip: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
             proxy_port: 8888,
+            origin: openshell_ocsf::EventOrigin::Sandbox,
         }
     }
 

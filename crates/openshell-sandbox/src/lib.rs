@@ -150,6 +150,7 @@ pub async fn run_sandbox(
             product_version: openshell_core::VERSION.to_string(),
             proxy_ip: std::net::IpAddr::from([127, 0, 0, 1]),
             proxy_port: 3128,
+            origin: openshell_ocsf::EventOrigin::Sandbox,
         }) {
             debug!("OCSF context already initialized, keeping existing");
         }

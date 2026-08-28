@@ -180,7 +180,7 @@ where
         let (visitor_sandbox_id, visitor_message) = if meta.target() == OCSF_TARGET {
             openshell_ocsf::clone_current_event().map_or((None, None), |ocsf_event| {
                 (
-                    ocsf_event.base().metadata.uid.clone(),
+                    ocsf_sandbox_id(&ocsf_event),
                     Some(ocsf_event.format_shorthand()),
                 )
             })
@@ -216,6 +216,17 @@ where
         };
         self.bus.publish(&sandbox_id, evt, self.default_tail);
     }
+}
+
+/// The sandbox an event concerns, if any.
+///
+/// `container.uid` rather than `metadata.uid`: the latter identifies the event.
+fn ocsf_sandbox_id(event: &openshell_ocsf::OcsfEvent) -> Option<String> {
+    event
+        .base()
+        .container
+        .as_ref()
+        .and_then(|container| container.uid.clone())
 }
 
 #[derive(Debug, Default)]
@@ -353,6 +364,7 @@ mod tests {
             product_version: "0.0.0".to_string(),
             proxy_ip: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
             proxy_port: 0,
+            origin: openshell_ocsf::EventOrigin::Sandbox,
         }
     }
 
