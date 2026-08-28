@@ -33,7 +33,9 @@ Use these sources:
 - All open GitHub issues labeled `state:triage-needed`, ordered by most recently updated.
 - Newly opened community issues without that label; exclude maintainer/core-contributor issues and already-routed work from label recommendations.
 - Older open, unlabelled community issues: measure first; audit all when there are at most 20, otherwise inspect the five oldest unresolved candidates per run. Age sets ordering only and never justifies closure.
-- Newly opened community pull requests.
+- Open non-draft Dependabot pull requests. Surface these explicitly so they do
+  not age out or go stale while waiting for maintainer attention.
+- Newly opened non-draft community pull requests.
 - Failed CI runs on `main`.
 - Unresolved/actionable questions in Slack channel `C0AE9P50JVA`.
 - Related engineering/design context in Slack channel `C0AR6QP0CKH`.
@@ -59,9 +61,10 @@ Include these sections:
 
 1. **Needs your decision** — at most five decision-worthy recommendations. Each entry has report-local ID (`R-01`...), priority, classification, concise proposed action, confidence, linked evidence, applicable public-doc links or `none found`, and current disposition.
 2. **Triage queue** — state the total count of open `state:triage-needed` issues and how many are unlisted. Show up to five recently updated items, each with number, title, last-update time, and a concise summary of current context and material changes since the prior review. Put the rest in overflow. Do not assess these issues; direct the engineer to `triage-issue`.
-3. **Community pull requests** — up to five new community PRs with number, title, author, check status, and link. Put the rest in overflow. Do not recommend or act on PRs in v1.
-4. **Deferred and overflow findings** — preserve lower-priority and capacity-limited findings without silently dropping them.
-5. **Local inbox follow-up** — list each inbox entry incorporated into this report, its outcome, and any resulting recommendation ID or finding. Do not copy the whole inbox.
+3. **Dependabot pull requests** — open non-draft Dependabot PRs that need maintainer action, with number, package/update, check status, whether they are waiting for `/ok to test mirror`, and link. Put this section before the general PR list so dependency updates do not become stale. Do not recommend or act on PRs in v1.
+4. **Community pull requests** — up to five new non-draft community PRs with number, title, author, check status, and link. Exclude Dependabot PRs already listed above. Put the rest in overflow. Do not list draft PRs, and do not recommend or act on PRs in v1.
+5. **Deferred and overflow findings** — preserve lower-priority and capacity-limited findings without silently dropping them.
+6. **Local inbox follow-up** — list each inbox entry incorporated into this report, its outcome, and any resulting recommendation ID or finding. Do not copy the whole inbox.
 
 Pending and deferred recommendations retain their original priority and consume the five-item decision budget. When all five slots are pending, record new ordinary findings but do not add them to **Needs your decision**. Only security findings and release blockers may exceed this cap.
 
