@@ -7117,6 +7117,10 @@ pub async fn sandbox_logs(
 }
 
 fn print_log_line(log: &openshell_core::proto::SandboxLogLine) {
+    println!("{}", format_log_line(log));
+}
+
+fn format_log_line(log: &openshell_core::proto::SandboxLogLine) -> String {
     let source = if log.source.is_empty() {
         "gateway"
     } else {
@@ -7125,10 +7129,10 @@ fn print_log_line(log: &openshell_core::proto::SandboxLogLine) {
     let secs = log.timestamp_ms / 1000;
     let millis = log.timestamp_ms % 1000;
     if log.fields.is_empty() {
-        println!(
+        format!(
             "[{secs}.{millis:03}] [{source:<7}] [{:<5}] [{}] {}",
             log.level, log.target, log.message
-        );
+        )
     } else {
         let mut fields_str = String::new();
         let mut entries: Vec<_> = log.fields.iter().collect();
@@ -7141,10 +7145,10 @@ fn print_log_line(log: &openshell_core::proto::SandboxLogLine) {
             fields_str.push('=');
             fields_str.push_str(v);
         }
-        println!(
+        format!(
             "[{secs}.{millis:03}] [{source:<7}] [{:<5}] [{}] {} {}",
             log.level, log.target, log.message, fields_str
-        );
+        )
     }
 }
 
@@ -7509,7 +7513,7 @@ fn format_endpoint(endpoint: &openshell_core::proto::NetworkEndpoint) -> String 
 mod tests {
     use super::{
         PolicyGetView, ProvisioningStep, build_sandbox_resource_limits,
-        dockerfile_sources_supported_for_gateway, format_endpoint,
+        dockerfile_sources_supported_for_gateway, format_endpoint, format_log_line,
         format_provider_attachment_table, git_sync_files, has_main_process_result,
         inferred_provider_type, parse_cli_setting_value, parse_credential_expiry_cli_value,
         parse_credential_expiry_pairs, parse_credential_pairs, parse_driver_config_json,
@@ -8973,5 +8977,107 @@ mod tests {
         assert_eq!(json["policy_source"], "sandbox");
         assert!(json["revision"].is_null());
         assert!(json["policy"].is_null());
+    }
+
+    fn log_line(
+        level: &str,
+        target: &str,
+        message: &str,
+        source: &str,
+        fields: &[(&str, &str)],
+    ) -> openshell_core::proto::SandboxLogLine {
+        openshell_core::proto::SandboxLogLine {
+            sandbox_id: "sb-1".to_string(),
+            timestamp_ms: 1_234_567,
+            level: level.to_string(),
+            target: target.to_string(),
+            message: message.to_string(),
+            source: source.to_string(),
+            fields: fields
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn format_log_line_without_fields() {
+        let log = log_line("INFO", "openshell_server", "hello world", "sandbox", &[]);
+        assert_eq!(
+            format_log_line(&log),
+            "[1234.567] [sandbox] [INFO ] [openshell_server] hello world"
+        );
+    }
+
+    #[test]
+    fn format_log_line_empty_source_defaults_to_gateway() {
+        let log = log_line("WARN", "t", "msg", "", &[]);
+        assert_eq!(
+            format_log_line(&log),
+            "[1234.567] [gateway] [WARN ] [t] msg"
+        );
+    }
+
+    #[test]
+    fn format_log_line_pads_source_and_level() {
+        let log = log_line("OCSF", "ocsf", "NET:OPEN", "gateway", &[]);
+        assert_eq!(
+            format_log_line(&log),
+            "[1234.567] [gateway] [OCSF ] [ocsf] NET:OPEN"
+        );
+
+        let short_source = log_line("ERROR", "t", "m", "vm", &[]);
+        assert_eq!(
+            format_log_line(&short_source),
+            "[1234.567] [vm     ] [ERROR] [t] m"
+        );
+    }
+
+    #[test]
+    fn format_log_line_sorts_fields_alphabetically() {
+        let log = log_line(
+            "INFO",
+            "ocsf",
+            "CONNECT",
+            "sandbox",
+            &[("dst_port", "443"), ("action", "allow"), ("dst_host", "x")],
+        );
+        assert_eq!(
+            format_log_line(&log),
+            "[1234.567] [sandbox] [INFO ] [ocsf] CONNECT action=allow dst_host=x dst_port=443"
+        );
+    }
+
+    #[test]
+    fn format_log_line_keeps_empty_field_values() {
+        let log = log_line("INFO", "t", "m", "sandbox", &[("a", ""), ("b", "1")]);
+        assert_eq!(
+            format_log_line(&log),
+            "[1234.567] [sandbox] [INFO ] [t] m a= b=1"
+        );
+    }
+
+    #[test]
+    fn format_log_line_renders_empty_target_as_empty_brackets() {
+        let log = log_line("INFO", "", "m", "sandbox", &[]);
+        assert_eq!(format_log_line(&log), "[1234.567] [sandbox] [INFO ] [] m");
+    }
+
+    #[test]
+    fn format_log_line_zero_pads_millis() {
+        let mut log = log_line("INFO", "t", "m", "sandbox", &[]);
+        log.timestamp_ms = 1_000_007;
+        assert_eq!(format_log_line(&log), "[1000.007] [sandbox] [INFO ] [t] m");
+
+        log.timestamp_ms = 0;
+        assert_eq!(format_log_line(&log), "[0.000] [sandbox] [INFO ] [t] m");
+    }
+
+    #[test]
+    fn format_log_line_preserves_message_verbatim() {
+        // OCSF shorthand must pass through unchanged.
+        let message = "NET:OPEN [MED] DENIED /usr/bin/curl(4711) -> api.example.com:443";
+        let log = log_line("OCSF", "ocsf", message, "sandbox", &[]);
+        assert!(format_log_line(&log).ends_with(message));
     }
 }
