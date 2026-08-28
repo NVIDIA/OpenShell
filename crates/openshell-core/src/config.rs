@@ -1140,8 +1140,8 @@ pub struct GatewayJwtConfig {
     pub public_key_path: PathBuf,
     /// Path to the `kid` value (plain text, one line).
     pub kid_path: PathBuf,
-    /// Stable gateway identity embedded in `iss`/`aud`. Defaults to the
-    /// hostname-or-`openshell` placeholder if unset.
+    /// Stable gateway identity embedded in `iss`/`aud`. Defaults to
+    /// `openshell`.
     #[serde(default = "default_gateway_id")]
     pub gateway_id: String,
     /// Token lifetime in seconds. A value of 0 disables expiration and is
