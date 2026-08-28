@@ -2664,8 +2664,11 @@ func (x *DetachSandboxProviderResponse) GetDetached() bool {
 
 // Delete sandbox response.
 type DeleteSandboxResponse struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Deleted       bool                   `protobuf:"varint,1,opt,name=deleted,proto3" json:"deleted,omitempty"`
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// True when backend deletion was accepted and may still be in progress.
+	// False means the backend was already absent and gateway cleanup completed.
+	// In either case, GetSandbox returning NOT_FOUND is the terminal condition.
+	Deleted       bool `protobuf:"varint,1,opt,name=deleted,proto3" json:"deleted,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }

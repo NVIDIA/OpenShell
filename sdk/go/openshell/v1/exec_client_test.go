@@ -70,6 +70,9 @@ func (r *stubSandboxResolver) Start(context.Context, string, string) (*Sandbox, 
 func (r *stubSandboxResolver) WaitStopped(context.Context, string, string, ...WaitOptions) (*Sandbox, error) {
 	panic("not implemented")
 }
+func (r *stubSandboxResolver) WaitDeleted(context.Context, string, string, ...WaitOptions) error {
+	panic("not implemented")
+}
 
 type mockExecServer struct {
 	pb.UnimplementedOpenShellServer

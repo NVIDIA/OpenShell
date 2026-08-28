@@ -97,6 +97,33 @@ func (s *sandboxClient) Delete(ctx context.Context, workspace, name string) erro
 	return nil
 }
 
+// WaitDeleted polls until Get reports that the sandbox is durably absent.
+// Use it after Delete when subsequent operations depend on terminal deletion.
+func (s *sandboxClient) WaitDeleted(ctx context.Context, workspace, name string, opts ...WaitOptions) error {
+	interval := defaultPollInterval
+	if len(opts) > 0 && opts[0].PollInterval > 0 {
+		interval = opts[0].PollInterval
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		_, err := s.Get(ctx, workspace, name)
+		if IsNotFound(err) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+
+		select {
+		case <-ctx.Done():
+			return contextError(ctx.Err())
+		case <-ticker.C:
+		}
+	}
+}
+
 func (s *sandboxClient) Stop(ctx context.Context, workspace, name string) (*Sandbox, error) {
 	resp, err := s.client.StopSandbox(ctx, &pb.StopSandboxRequest{
 		Name:      name,

@@ -1029,6 +1029,9 @@ func (r *flippableResolver) Start(context.Context, string, string) (*Sandbox, er
 func (r *flippableResolver) WaitStopped(context.Context, string, string, ...WaitOptions) (*Sandbox, error) {
 	panic("not implemented")
 }
+func (r *flippableResolver) WaitDeleted(context.Context, string, string, ...WaitOptions) error {
+	panic("not implemented")
+}
 
 // --- Failure injection tests ---
 

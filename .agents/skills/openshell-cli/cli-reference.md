@@ -22,6 +22,7 @@ Quick-reference for the `openshell` command-line interface. For workflow guidanc
 | `OPENSHELL_GATEWAY_INSECURE` | Skip TLS verification when set (same as `--gateway-insecure`) |
 | `OPENSHELL_SANDBOX_POLICY` | Path to default sandbox policy YAML (fallback when `--policy` is not provided) |
 | `OPENSHELL_COMMUNITY_REGISTRY` | Override the community sandbox image registry prefix used by `sandbox create --from <name>` |
+| `OPENSHELL_LIFECYCLE_TIMEOUT` | Maximum seconds to wait for lifecycle operations; defaults to 300 |
 | `OPENSHELL_THEME` | TUI theme: `auto`, `dark`, or `light` |
 
 ---
@@ -259,7 +260,14 @@ Show sandbox details and the active policy. Metadata identifies sandbox or globa
 
 ### `openshell sandbox delete [NAME]...`
 
-Delete one or more named sandboxes, or use `--all`. Deletion stops background port forwards.
+Delete one or more named sandboxes, or use `--all`. Deletion stops background
+port forwards and waits for terminal absence by default.
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--all` | false | Delete every sandbox in the selected workspace |
+| `--no-wait` | false | Return after the gateway accepts deletion |
+| `--timeout <SECONDS>` | 300 | Override the terminal deletion wait timeout |
 
 ### `openshell sandbox stop [name]`
 

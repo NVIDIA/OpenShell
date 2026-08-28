@@ -124,7 +124,8 @@ type OpenShellClient interface {
 	AttachSandboxProvider(ctx context.Context, in *AttachSandboxProviderRequest, opts ...grpc.CallOption) (*AttachSandboxProviderResponse, error)
 	// Detach a provider record from an existing sandbox.
 	DetachSandboxProvider(ctx context.Context, in *DetachSandboxProviderRequest, opts ...grpc.CallOption) (*DetachSandboxProviderResponse, error)
-	// Delete a sandbox by name.
+	// Request sandbox deletion by name. Success acknowledges the request; use
+	// GetSandbox until NOT_FOUND when terminal deletion is required.
 	DeleteSandbox(ctx context.Context, in *DeleteSandboxRequest, opts ...grpc.CallOption) (*DeleteSandboxResponse, error)
 	// Stop a sandbox while retaining its persistent state.
 	StopSandbox(ctx context.Context, in *StopSandboxRequest, opts ...grpc.CallOption) (*SandboxResponse, error)
@@ -1036,7 +1037,8 @@ type OpenShellServer interface {
 	AttachSandboxProvider(context.Context, *AttachSandboxProviderRequest) (*AttachSandboxProviderResponse, error)
 	// Detach a provider record from an existing sandbox.
 	DetachSandboxProvider(context.Context, *DetachSandboxProviderRequest) (*DetachSandboxProviderResponse, error)
-	// Delete a sandbox by name.
+	// Request sandbox deletion by name. Success acknowledges the request; use
+	// GetSandbox until NOT_FOUND when terminal deletion is required.
 	DeleteSandbox(context.Context, *DeleteSandboxRequest) (*DeleteSandboxResponse, error)
 	// Stop a sandbox while retaining its persistent state.
 	StopSandbox(context.Context, *StopSandboxRequest) (*SandboxResponse, error)

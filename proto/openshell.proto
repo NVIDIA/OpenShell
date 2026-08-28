@@ -99,7 +99,8 @@ service OpenShell {
     };
   }
 
-  // Delete a sandbox by name.
+  // Request sandbox deletion by name. Success acknowledges the request; use
+  // GetSandbox until NOT_FOUND when terminal deletion is required.
   rpc DeleteSandbox(DeleteSandboxRequest) returns (DeleteSandboxResponse) {
     option (openshell.options.v1.authorization) = {
       auth_mode: "bearer"
@@ -1083,6 +1084,9 @@ message DetachSandboxProviderResponse {
 
 // Delete sandbox response.
 message DeleteSandboxResponse {
+  // True when backend deletion was accepted and may still be in progress.
+  // False means the backend was already absent and gateway cleanup completed.
+  // In either case, GetSandbox returning NOT_FOUND is the terminal condition.
   bool deleted = 1;
 }
 

@@ -205,11 +205,14 @@ async fn sandbox_can_be_deleted_while_stopped() {
         "expected delete confirmation in:\n{delete_output}",
     );
 
-    if let Err(last_sandbox_list) = assert_sandbox_presence_eventually(&sandbox.name, false).await {
+    let sandbox_names = sandbox_list_names(Instant::now() + Duration::from_secs(10))
+        .await
+        .expect("sandbox list should complete after delete returns");
+    if sandbox_names.iter().any(|name| name == &sandbox.name) {
         sandbox.cleanup().await;
         panic!(
-            "stopped sandbox {} should be deleted without starting after \
-             {SANDBOX_PRESENCE_TIMEOUT:?}; last observed sandbox list: {last_sandbox_list:?}",
+            "sandbox delete returned before stopped sandbox {} reached terminal absence; \
+             observed sandbox list: {sandbox_names:?}",
             sandbox.name,
         );
     }
