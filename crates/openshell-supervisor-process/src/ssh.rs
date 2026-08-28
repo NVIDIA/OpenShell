@@ -43,6 +43,14 @@ type SshServerInit = (
     Option<Arc<(PathBuf, PathBuf)>>,
 );
 
+struct TerminalDeliveryAttempt(Arc<MainSession>);
+
+impl Drop for TerminalDeliveryAttempt {
+    fn drop(&mut self) {
+        self.0.mark_terminal_delivery_complete();
+    }
+}
+
 fn ssh_server_init(
     listen_path: &Path,
     ca_file_paths: &Option<(PathBuf, PathBuf)>,
@@ -641,7 +649,9 @@ impl russh::server::Handler for SshHandler {
                     match output.recv().await {
                         Ok(event) => {
                             if let MainOutput::Exit(code) = event {
-                                terminal_delivery.mark_terminal_delivered();
+                                terminal_delivery.mark_terminal_delivery_ready();
+                                let _delivery_attempt =
+                                    TerminalDeliveryAttempt(Arc::clone(&terminal_delivery));
                                 terminal_delivery.wait_for_terminal_reported().await;
                                 let _ = send_main_output(&handle, channel, MainOutput::Exit(code))
                                     .await;

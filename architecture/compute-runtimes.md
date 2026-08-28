@@ -141,7 +141,9 @@ A canonical main process that exits successfully follows `Ready -> Completed`.
 A nonzero or signal-normalized result follows `Ready -> Error` with a
 `MainProcessFailed` condition. Both retained results may be started explicitly,
 which creates a fresh main-process instance. Drivers must not automatically
-restart a completed or failed canonical process.
+restart a completed or failed canonical process. Before an explicit restart,
+the gateway disconnects the prior supervisor session and deletes its SSH
+sessions so credentials cannot cross runtime generations.
 
 `StopSandbox` and `StartSandbox` are idempotent driver operations. Stop
 retains the driver resource and its persistent workspace boundary while making

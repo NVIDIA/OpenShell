@@ -489,8 +489,9 @@ data remain associated with the sandbox.
 
 Stop and start are idempotent. You can also start a retained `Completed` or
 `Error/MainProcessFailed` sandbox to launch a fresh instance of its canonical
-command. Delete an inactive sandbox normally when you no longer need its
-retained state.
+command. Starting a fresh instance invalidates SSH sessions issued for the
+previous runtime generation. Delete an inactive sandbox normally when you no
+longer need its retained state.
 
 ## Delete Sandboxes
 

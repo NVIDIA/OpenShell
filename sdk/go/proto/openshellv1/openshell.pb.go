@@ -9577,9 +9577,13 @@ type ReportMainProcessExitRequest struct {
 	SandboxId  string                 `protobuf:"bytes,1,opt,name=sandbox_id,json=sandboxId,proto3" json:"sandbox_id,omitempty"`
 	InstanceId string                 `protobuf:"bytes,2,opt,name=instance_id,json=instanceId,proto3" json:"instance_id,omitempty"`
 	// Normalized process result. Signal exits use 128 + signal number.
-	ExitCode      int32 `protobuf:"varint,3,opt,name=exit_code,json=exitCode,proto3" json:"exit_code,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	ExitCode int32 `protobuf:"varint,3,opt,name=exit_code,json=exitCode,proto3" json:"exit_code,omitempty"`
+	// Keep an ephemeral sandbox reachable while an attached client drains its
+	// terminal result. The supervisor repeats the report with this field false
+	// after SSH exit delivery completes. Defaults to false for compatibility.
+	DeferEphemeralCleanup bool `protobuf:"varint,4,opt,name=defer_ephemeral_cleanup,json=deferEphemeralCleanup,proto3" json:"defer_ephemeral_cleanup,omitempty"`
+	unknownFields         protoimpl.UnknownFields
+	sizeCache             protoimpl.SizeCache
 }
 
 func (x *ReportMainProcessExitRequest) Reset() {
@@ -9631,6 +9635,13 @@ func (x *ReportMainProcessExitRequest) GetExitCode() int32 {
 		return x.ExitCode
 	}
 	return 0
+}
+
+func (x *ReportMainProcessExitRequest) GetDeferEphemeralCleanup() bool {
+	if x != nil {
+		return x.DeferEphemeralCleanup
+	}
+	return false
 }
 
 type ReportMainProcessExitResponse struct {
@@ -14037,13 +14048,14 @@ const file_openshell_proto_rawDesc = "" +
 	"\x0fSessionRejected\x12\x16\n" +
 	"\x06reason\x18\x01 \x01(\tR\x06reason\"\x15\n" +
 	"\x13SupervisorHeartbeat\"\x12\n" +
-	"\x10GatewayHeartbeat\"{\n" +
+	"\x10GatewayHeartbeat\"\xb3\x01\n" +
 	"\x1cReportMainProcessExitRequest\x12\x1d\n" +
 	"\n" +
 	"sandbox_id\x18\x01 \x01(\tR\tsandboxId\x12\x1f\n" +
 	"\vinstance_id\x18\x02 \x01(\tR\n" +
 	"instanceId\x12\x1b\n" +
-	"\texit_code\x18\x03 \x01(\x05R\bexitCode\"\x1f\n" +
+	"\texit_code\x18\x03 \x01(\x05R\bexitCode\x126\n" +
+	"\x17defer_ephemeral_cleanup\x18\x04 \x01(\bR\x15deferEphemeralCleanup\"\x1f\n" +
 	"\x1dReportMainProcessExitResponse\"\xb7\x01\n" +
 	"\tRelayOpen\x12\x1d\n" +
 	"\n" +

@@ -2159,6 +2159,10 @@ message ReportMainProcessExitRequest {
   string instance_id = 2;
   // Normalized process result. Signal exits use 128 + signal number.
   int32 exit_code = 3;
+  // Keep an ephemeral sandbox reachable while an attached client drains its
+  // terminal result. The supervisor repeats the report with this field false
+  // after SSH exit delivery completes. Defaults to false for compatibility.
+  bool defer_ephemeral_cleanup = 4;
 }
 
 message ReportMainProcessExitResponse {}

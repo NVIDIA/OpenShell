@@ -1194,6 +1194,12 @@ impl ComputeRuntime {
             )));
         }
 
+        if phase == SandboxPhase::Completed || is_failed_main_process_result(&current) {
+            self.cleanup_stopped_sandbox_sessions(&current)
+                .await
+                .map_err(Status::internal)?;
+        }
+
         let (previous, starting) = if phase == SandboxPhase::Starting {
             // Acquiring the lifecycle gate proves that no local worker still
             // owns this transition. Retry the idempotent driver operation.
@@ -2906,6 +2912,17 @@ impl ComputeRuntime {
         instance_id: &str,
         exit_code: i32,
     ) -> Result<(), String> {
+        self.report_main_process_exit(sandbox_id, instance_id, exit_code, false)
+            .await
+    }
+
+    pub async fn report_main_process_exit(
+        &self,
+        sandbox_id: &str,
+        instance_id: &str,
+        exit_code: i32,
+        defer_ephemeral_cleanup: bool,
+    ) -> Result<(), String> {
         let guard = self.sync_lock.lock().await;
         let Some(existing) = self
             .store
@@ -2918,10 +2935,7 @@ impl ComputeRuntime {
         let phase = SandboxPhase::try_from(existing.phase()).unwrap_or(SandboxPhase::Unknown);
         if matches!(
             phase,
-            SandboxPhase::Deleting
-                | SandboxPhase::Stopping
-                | SandboxPhase::Stopped
-                | SandboxPhase::Completed
+            SandboxPhase::Deleting | SandboxPhase::Stopping | SandboxPhase::Stopped
         ) {
             return Ok(());
         }
@@ -2959,19 +2973,17 @@ impl ComputeRuntime {
                         reported_exit_code = exit_code,
                         "ignoring conflicting duplicate main-process exit report"
                     );
+                    return Ok(());
+                }
+                let completed = existing.clone();
+                drop(guard);
+                if !defer_ephemeral_cleanup {
+                    self.schedule_ephemeral_sandbox_delete(&completed);
                 }
                 return Ok(());
             }
         }
         let expected_resource_version = sandbox_resource_version(&existing);
-        let ephemeral = existing.metadata.as_ref().is_some_and(|metadata| {
-            metadata
-                .annotations
-                .get("openshell.nvidia.com/retention")
-                .is_some_and(|value| value == "ephemeral")
-        });
-        let workspace = existing.object_workspace().to_string();
-        let name = existing.object_name().to_string();
         let sandbox = self
             .store
             .update_message_cas::<Sandbox, _>(sandbox_id, expected_resource_version, |sandbox| {
@@ -2982,19 +2994,35 @@ impl ComputeRuntime {
         self.sandbox_index.update_from_sandbox(&sandbox);
         self.sandbox_watch_bus.notify(sandbox_id);
         drop(guard);
-        if ephemeral {
-            let runtime = self.clone();
-            tokio::spawn(async move {
-                if let Err(error) = runtime.delete_sandbox(&workspace, &name).await {
-                    tracing::warn!(
-                        sandbox_name = %name,
-                        error = %error,
-                        "Failed to delete completed ephemeral sandbox"
-                    );
-                }
-            });
+        if !defer_ephemeral_cleanup {
+            self.schedule_ephemeral_sandbox_delete(&sandbox);
         }
         Ok(())
+    }
+
+    fn schedule_ephemeral_sandbox_delete(&self, sandbox: &Sandbox) {
+        let ephemeral = sandbox.metadata.as_ref().is_some_and(|metadata| {
+            metadata
+                .annotations
+                .get("openshell.nvidia.com/retention")
+                .is_some_and(|value| value == "ephemeral")
+        });
+        if !ephemeral {
+            return;
+        }
+
+        let runtime = self.clone();
+        let workspace = sandbox.object_workspace().to_string();
+        let name = sandbox.object_name().to_string();
+        tokio::spawn(async move {
+            if let Err(error) = runtime.delete_sandbox(&workspace, &name).await {
+                tracing::warn!(
+                    sandbox_name = %name,
+                    error = %error,
+                    "Failed to delete completed ephemeral sandbox"
+                );
+            }
+        });
     }
 
     async fn apply_deleted(&self, sandbox_id: &str) -> Result<(), String> {
@@ -5144,6 +5172,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ephemeral_cleanup_waits_for_terminal_delivery_report() {
+        let driver = ControlledDriver::new();
+        let runtime = test_runtime(driver.clone()).await;
+        let mut sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Provisioning);
+        sandbox.metadata.as_mut().unwrap().annotations.insert(
+            "openshell.nvidia.com/retention".to_string(),
+            "ephemeral".to_string(),
+        );
+        runtime.store.put_message(&sandbox).await.unwrap();
+        runtime
+            .supervisor_session_connected("sb-1", "instance-1")
+            .await
+            .unwrap();
+
+        runtime
+            .report_main_process_exit("sb-1", "instance-1", 0, true)
+            .await
+            .unwrap();
+        assert_eq!(driver.delete_calls(), 0);
+        assert_eq!(
+            runtime
+                .store
+                .get_message::<Sandbox>("sb-1")
+                .await
+                .unwrap()
+                .unwrap()
+                .phase(),
+            SandboxPhase::Completed as i32
+        );
+
+        runtime
+            .report_main_process_exit("sb-1", "instance-1", 0, false)
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while driver.delete_calls() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("terminal delivery report should release ephemeral cleanup");
+    }
+
+    #[tokio::test]
     async fn conflicting_duplicate_main_process_exit_is_acknowledged() {
         let runtime = test_runtime(Arc::new(TestDriver::default())).await;
         let sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Provisioning);
@@ -6119,6 +6191,9 @@ mod tests {
             ..Default::default()
         });
         runtime.store.put_message(&sandbox).await.unwrap();
+        let session = ssh_session_record("completed-session", sandbox.object_id());
+        runtime.store.put_message(&session).await.unwrap();
+        register_test_supervisor_session(&runtime, sandbox.object_id());
 
         let starting = runtime
             .start_sandbox("default", sandbox.object_name())
@@ -6130,6 +6205,16 @@ mod tests {
         assert_eq!(status.main_process_instance_id, "instance-old");
         assert_eq!(status.exit_code, None);
         assert_eq!(driver.start_calls(), 1);
+        assert!(!runtime.supervisor_sessions.has_session(sandbox.object_id()));
+        assert!(
+            runtime
+                .store
+                .get_message::<SshSession>(session.object_id())
+                .await
+                .unwrap()
+                .is_none(),
+            "restart revokes SSH sessions from the completed instance"
+        );
     }
 
     #[tokio::test]
@@ -6139,6 +6224,9 @@ mod tests {
         let mut sandbox = sandbox_record("sb-failed", "sandbox-failed", SandboxPhase::Ready);
         apply_main_process_exit(&mut sandbox, "instance-old", 130);
         runtime.store.put_message(&sandbox).await.unwrap();
+        let session = ssh_session_record("failed-session", sandbox.object_id());
+        runtime.store.put_message(&session).await.unwrap();
+        register_test_supervisor_session(&runtime, sandbox.object_id());
 
         let starting = runtime
             .start_sandbox("default", sandbox.object_name())
@@ -6150,6 +6238,16 @@ mod tests {
         assert_eq!(status.main_process_instance_id, "instance-old");
         assert_eq!(status.exit_code, None);
         assert_eq!(driver.start_calls(), 1);
+        assert!(!runtime.supervisor_sessions.has_session(sandbox.object_id()));
+        assert!(
+            runtime
+                .store
+                .get_message::<SshSession>(session.object_id())
+                .await
+                .unwrap()
+                .is_none(),
+            "restart revokes SSH sessions from the failed instance"
+        );
     }
 
     #[tokio::test]

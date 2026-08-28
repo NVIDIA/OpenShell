@@ -866,13 +866,16 @@ pub async fn run_sandbox(
                     openshell_supervisor_process::run::SidecarExitReport,
                 >(1);
                 tokio::spawn(async move {
-                    while let Some((instance_id, exit_code, ack)) = rx.recv().await {
+                    while let Some((instance_id, exit_code, defer_ephemeral_cleanup, ack)) =
+                        rx.recv().await
+                    {
                         let (durable_tx, durable_rx) = tokio::sync::oneshot::channel();
                         *exit_ack.lock().await = Some((instance_id.clone(), durable_tx));
                         let result = match sidecar_control::send_main_process_exited(
                             &writer,
                             instance_id,
                             exit_code,
+                            defer_ephemeral_cleanup,
                         )
                         .await
                         {
@@ -1177,7 +1180,6 @@ fn spawn_sidecar_entrypoint_handler(
         let terminating = Arc::new(AtomicBool::new(false));
         while let Some(started) = entrypoint_rx.recv().await {
             if let Some(exit_code) = started.exit_code {
-                terminating.store(true, Ordering::Release);
                 if let (Some(endpoint), Some(id)) =
                     (openshell_endpoint.as_ref(), sandbox_id.as_ref())
                 {
@@ -1188,6 +1190,7 @@ fn spawn_sidecar_entrypoint_handler(
                             id,
                             &started.instance_id,
                             exit_code,
+                            started.defer_ephemeral_cleanup,
                         )
                         .await
                         {
@@ -1203,6 +1206,10 @@ fn spawn_sidecar_entrypoint_handler(
                         publisher.publish_main_process_exit_ack(started.instance_id.clone());
                     }
                 }
+                if started.defer_ephemeral_cleanup {
+                    continue;
+                }
+                terminating.store(true, Ordering::Release);
                 break;
             }
             entrypoint_pid.store(started.pid, Ordering::Release);

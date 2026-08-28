@@ -211,6 +211,8 @@ without one, the default is `/bin/bash -l` with a PTY. Explicit commands remain
 foreground in non-interactive automation: stdout and stderr stream to the
 caller and the CLI returns the command's exact status. Exit 0 leaves
 `Completed`; nonzero leaves `Error/MainProcessFailed`.
+Starting either retained terminal result invalidates SSH sessions from the
+previous runtime generation.
 
 | Flag | Description |
 |------|-------------|

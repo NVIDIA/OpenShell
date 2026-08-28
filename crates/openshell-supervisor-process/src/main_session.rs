@@ -54,10 +54,12 @@ struct OutputLogState {
 struct OutputLog {
     state: Mutex<OutputLogState>,
     version: watch::Sender<u64>,
-    terminal_delivered: std::sync::atomic::AtomicBool,
-    terminal_delivered_notify: Notify,
+    terminal_delivery_ready: std::sync::atomic::AtomicBool,
+    terminal_delivery_ready_notify: Notify,
     terminal_reported: std::sync::atomic::AtomicBool,
     terminal_reported_notify: Notify,
+    terminal_delivery_complete: std::sync::atomic::AtomicBool,
+    terminal_delivery_complete_notify: Notify,
 }
 
 impl OutputLog {
@@ -70,10 +72,12 @@ impl OutputLog {
                 next_sequence: 0,
             }),
             version,
-            terminal_delivered: std::sync::atomic::AtomicBool::new(false),
-            terminal_delivered_notify: Notify::new(),
+            terminal_delivery_ready: std::sync::atomic::AtomicBool::new(false),
+            terminal_delivery_ready_notify: Notify::new(),
             terminal_reported: std::sync::atomic::AtomicBool::new(false),
             terminal_reported_notify: Notify::new(),
+            terminal_delivery_complete: std::sync::atomic::AtomicBool::new(false),
+            terminal_delivery_complete_notify: Notify::new(),
         })
     }
 
@@ -364,23 +368,21 @@ impl MainSession {
         self.output.subscribe()
     }
 
-    /// Wait until an attached main-session consumer receives the terminal
-    /// exit event. Callers use a bounded timeout for detached commands.
-    pub async fn wait_for_terminal_delivery(&self) {
-        let notified = self.output.terminal_delivered_notify.notified();
-        if self.output.terminal_delivered.load(Ordering::Acquire) {
+    /// Wait until an attached main-session consumer drains output through the
+    /// terminal event and is ready for the durable lifecycle report.
+    pub async fn wait_for_terminal_delivery_ready(&self) {
+        let notified = self.output.terminal_delivery_ready_notify.notified();
+        if self.output.terminal_delivery_ready.load(Ordering::Acquire) {
             return;
         }
         notified.await;
     }
 
-    /// Record that an SSH main attachment drained output through the terminal
-    /// event and is ready for the durable lifecycle report.
-    pub fn mark_terminal_delivered(&self) {
+    pub fn mark_terminal_delivery_ready(&self) {
         self.output
-            .terminal_delivered
+            .terminal_delivery_ready
             .store(true, Ordering::Release);
-        self.output.terminal_delivered_notify.notify_waiters();
+        self.output.terminal_delivery_ready_notify.notify_waiters();
     }
 
     /// Wait until the gateway durably acknowledges the main-process result.
@@ -397,6 +399,29 @@ impl MainSession {
     pub fn mark_terminal_reported(&self) {
         self.output.terminal_reported.store(true, Ordering::Release);
         self.output.terminal_reported_notify.notify_waiters();
+    }
+
+    /// Wait until the SSH attachment has finished attempting to send its exit
+    /// status after the durable lifecycle report.
+    pub async fn wait_for_terminal_delivery_complete(&self) {
+        let notified = self.output.terminal_delivery_complete_notify.notified();
+        if self
+            .output
+            .terminal_delivery_complete
+            .load(Ordering::Acquire)
+        {
+            return;
+        }
+        notified.await;
+    }
+
+    pub fn mark_terminal_delivery_complete(&self) {
+        self.output
+            .terminal_delivery_complete
+            .store(true, Ordering::Release);
+        self.output
+            .terminal_delivery_complete_notify
+            .notify_waiters();
     }
 
     pub fn acquire_input(&self) -> Result<(u64, tokio::sync::mpsc::Sender<Vec<u8>>), &'static str> {
@@ -492,7 +517,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn terminal_delivery_requires_attachment_acknowledgement() {
+    async fn terminal_delivery_readiness_requires_an_attachment() {
         let session = MainSession::inert();
         session.finish(0).await;
         assert!(session.finished());
@@ -500,26 +525,26 @@ mod tests {
         assert!(
             tokio::time::timeout(
                 std::time::Duration::from_millis(10),
-                session.wait_for_terminal_delivery(),
+                session.wait_for_terminal_delivery_ready(),
             )
             .await
             .is_err(),
             "publishing Exit alone must not count as delivery"
         );
 
-        session.mark_terminal_delivered();
+        session.mark_terminal_delivery_ready();
         tokio::time::timeout(
             std::time::Duration::from_secs(1),
-            session.wait_for_terminal_delivery(),
+            session.wait_for_terminal_delivery_ready(),
         )
         .await
-        .expect("delivery acknowledgement should wake waiter");
+        .expect("delivery readiness should wake waiter");
     }
 
     #[tokio::test]
     async fn terminal_report_acknowledgement_is_independent_from_delivery() {
         let session = MainSession::inert();
-        session.mark_terminal_delivered();
+        session.mark_terminal_delivery_ready();
 
         assert!(
             tokio::time::timeout(
@@ -538,6 +563,31 @@ mod tests {
         )
         .await
         .expect("durable report acknowledgement should wake waiter");
+    }
+
+    #[tokio::test]
+    async fn terminal_delivery_completion_is_distinct_from_readiness_and_reporting() {
+        let session = MainSession::inert();
+        session.mark_terminal_delivery_ready();
+        session.mark_terminal_reported();
+
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(10),
+                session.wait_for_terminal_delivery_complete(),
+            )
+            .await
+            .is_err(),
+            "gateway persistence must not imply SSH exit delivery"
+        );
+
+        session.mark_terminal_delivery_complete();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            session.wait_for_terminal_delivery_complete(),
+        )
+        .await
+        .expect("completed SSH delivery should wake waiter");
     }
 
     #[tokio::test]

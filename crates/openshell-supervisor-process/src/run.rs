@@ -44,6 +44,7 @@ const TERMINAL_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 pub type SidecarExitReport = (
     String,
     i32,
+    bool,
     tokio::sync::oneshot::Sender<Result<(), String>>,
 );
 
@@ -441,30 +442,43 @@ pub async fn run_process(
             .map_err(|_| miette::miette!("supervisor session registration timed out"))?
             .map_err(|_| miette::miette!("supervisor session ended before registration"))?;
     }
-    if drain_terminal && (supervisor_session_task.is_some() || sidecar_exit_tx.is_some()) {
-        // Keep the public phase Ready until a foreground attachment has
-        // drained the result. Explicitly detached commands use the bounded
-        // fallback and then publish their terminal result.
-        let _ = timeout(
-            TERMINAL_DRAIN_TIMEOUT,
-            main_session.wait_for_terminal_delivery(),
-        )
-        .await;
-    }
-    if let Some(tx) = sidecar_exit_tx {
-        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
-        tx.send((main_instance_id.clone(), rendered_code, ack_tx))
+    let terminal_delivery_ready =
+        if drain_terminal && (supervisor_session_task.is_some() || sidecar_exit_tx.is_some()) {
+            // Keep the public phase Ready until a foreground attachment has
+            // drained the result. Explicitly detached commands use the bounded
+            // fallback and then publish their terminal result.
+            timeout(
+                TERMINAL_DRAIN_TIMEOUT,
+                main_session.wait_for_terminal_delivery_ready(),
+            )
             .await
-            .map_err(|_| miette::miette!("sidecar exit reporter closed"))?;
-        ack_rx
-            .await
-            .map_err(|_| miette::miette!("sidecar exit reporter dropped acknowledgement"))?
-            .map_err(|error| miette::miette!(error))?;
+            .is_ok()
+        } else {
+            false
+        };
+    if let Some(tx) = sidecar_exit_tx.as_ref() {
+        report_sidecar_main_process_exit(tx, &main_instance_id, rendered_code, true).await?;
     } else if let (Some(endpoint), Some(id)) = (openshell_endpoint, sandbox_id) {
-        report_main_process_exit_until_ack(endpoint, id, &main_instance_id, rendered_code).await;
+        report_main_process_exit_until_ack(endpoint, id, &main_instance_id, rendered_code, true)
+            .await;
         info!(instance_id = %main_instance_id, "main-process exit acknowledged");
     }
     main_session.mark_terminal_reported();
+    if terminal_delivery_ready {
+        let _ = timeout(
+            TERMINAL_DRAIN_TIMEOUT,
+            main_session.wait_for_terminal_delivery_complete(),
+        )
+        .await;
+    }
+
+    if let Some(tx) = sidecar_exit_tx.as_ref() {
+        report_sidecar_main_process_exit(tx, &main_instance_id, rendered_code, false).await?;
+    } else if let (Some(endpoint), Some(id)) = (openshell_endpoint, sandbox_id) {
+        report_main_process_exit_until_ack(endpoint, id, &main_instance_id, rendered_code, false)
+            .await;
+        info!(instance_id = %main_instance_id, "main-process terminal delivery acknowledged");
+    }
 
     supervisor_terminating.store(true, Ordering::Release);
     if let Some(task) = supervisor_session_task {
@@ -479,6 +493,7 @@ async fn report_main_process_exit_until_ack(
     sandbox_id: &str,
     instance_id: &str,
     exit_code: i32,
+    defer_ephemeral_cleanup: bool,
 ) {
     let mut retry_delay = Duration::from_millis(250);
     loop {
@@ -487,6 +502,7 @@ async fn report_main_process_exit_until_ack(
             sandbox_id,
             instance_id,
             exit_code,
+            defer_ephemeral_cleanup,
         )
         .await
         {
@@ -498,6 +514,27 @@ async fn report_main_process_exit_until_ack(
             }
         }
     }
+}
+
+async fn report_sidecar_main_process_exit(
+    tx: &tokio::sync::mpsc::Sender<SidecarExitReport>,
+    instance_id: &str,
+    exit_code: i32,
+    defer_ephemeral_cleanup: bool,
+) -> Result<()> {
+    let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+    tx.send((
+        instance_id.to_string(),
+        exit_code,
+        defer_ephemeral_cleanup,
+        ack_tx,
+    ))
+    .await
+    .map_err(|_| miette::miette!("sidecar exit reporter closed"))?;
+    ack_rx
+        .await
+        .map_err(|_| miette::miette!("sidecar exit reporter dropped acknowledgement"))?
+        .map_err(|error| miette::miette!(error))
 }
 
 enum ProcessWaitOutcome {

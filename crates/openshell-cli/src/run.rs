@@ -222,6 +222,23 @@ fn sandbox_should_persist(keep: bool, forward: Option<&ForwardSpec>) -> bool {
     keep || forward.is_some()
 }
 
+fn has_main_process_result(sandbox: &Sandbox) -> bool {
+    let Some(status) = sandbox.status.as_ref() else {
+        return false;
+    };
+    if status.exit_code.is_none() {
+        return false;
+    }
+
+    let phase = SandboxPhase::try_from(sandbox.phase()).unwrap_or(SandboxPhase::Unknown);
+    phase != SandboxPhase::Error
+        || status.conditions.iter().any(|condition| {
+            condition.r#type == "Ready"
+                && condition.status.eq_ignore_ascii_case("false")
+                && condition.reason == "MainProcessFailed"
+        })
+}
+
 fn build_sandbox_resource_limits(
     cpu: Option<&str>,
     memory: Option<&str>,
@@ -761,14 +778,11 @@ pub async fn sandbox_create(
                     saw_non_ready = true;
                 }
 
-                let has_main_process_result = s
-                    .status
-                    .as_ref()
-                    .is_some_and(|status| status.exit_code.is_some());
+                let main_process_result = has_main_process_result(&s);
                 if matches!(
                     phase,
                     SandboxPhase::Completed | SandboxPhase::Error | SandboxPhase::Stopped
-                ) && has_main_process_result
+                ) && main_process_result
                 {
                     if let Some(d) = display.as_interactive_mut() {
                         d.clear();
@@ -856,10 +870,7 @@ pub async fn sandbox_create(
 
     // If we exited the loop without hitting the Ready break, finish the display.
     let final_phase = SandboxPhase::try_from(last_phase).unwrap_or(SandboxPhase::Unknown);
-    let final_has_main_process_result = last_sandbox
-        .status
-        .as_ref()
-        .is_some_and(|status| status.exit_code.is_some());
+    let final_has_main_process_result = has_main_process_result(&last_sandbox);
     if !(matches!(
         final_phase,
         SandboxPhase::Ready | SandboxPhase::Completed | SandboxPhase::Stopped
@@ -7206,13 +7217,14 @@ mod tests {
     use super::{
         PolicyGetView, ProvisioningStep, build_sandbox_resource_limits,
         dockerfile_sources_supported_for_gateway, format_endpoint,
-        format_provider_attachment_table, git_sync_files, inferred_provider_type,
-        parse_cli_setting_value, parse_credential_expiry_cli_value, parse_credential_expiry_pairs,
-        parse_credential_pairs, parse_driver_config_json, parse_secret_material_env_pairs,
-        policy_revision_to_json, provider_profile_allows_empty_credentials,
-        provisioning_timeout_message, ready_false_condition_message, refresh_status_header,
-        refresh_status_row, resolve_from, sandbox_should_persist, sandbox_upload_plan,
-        service_expose_status_error, service_url_for_gateway,
+        format_provider_attachment_table, git_sync_files, has_main_process_result,
+        inferred_provider_type, parse_cli_setting_value, parse_credential_expiry_cli_value,
+        parse_credential_expiry_pairs, parse_credential_pairs, parse_driver_config_json,
+        parse_secret_material_env_pairs, policy_revision_to_json,
+        provider_profile_allows_empty_credentials, provisioning_timeout_message,
+        ready_false_condition_message, refresh_status_header, refresh_status_row, resolve_from,
+        sandbox_should_persist, sandbox_upload_plan, service_expose_status_error,
+        service_url_for_gateway,
     };
     use crate::TEST_ENV_LOCK;
     use crate::commands::common::progress_step_from_metadata;
@@ -7749,6 +7761,48 @@ mod tests {
     fn sandbox_should_persist_when_forward_is_requested() {
         let spec = openshell_core::forward::ForwardSpec::new(8080);
         assert!(sandbox_should_persist(false, Some(&spec)));
+    }
+
+    #[test]
+    fn infrastructure_error_with_observed_exit_is_not_a_main_process_result() {
+        let mut sandbox = Sandbox {
+            status: Some(SandboxStatus {
+                exit_code: Some(137),
+                conditions: vec![SandboxCondition {
+                    r#type: "Ready".to_string(),
+                    status: "False".to_string(),
+                    reason: "ComputeResourceMissing".to_string(),
+                    message: "sandbox runtime disappeared".to_string(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        sandbox.set_phase(SandboxPhase::Error as i32);
+
+        assert!(!has_main_process_result(&sandbox));
+    }
+
+    #[test]
+    fn main_process_failed_condition_identifies_command_result() {
+        let mut sandbox = Sandbox {
+            status: Some(SandboxStatus {
+                exit_code: Some(7),
+                conditions: vec![SandboxCondition {
+                    r#type: "Ready".to_string(),
+                    status: "False".to_string(),
+                    reason: "MainProcessFailed".to_string(),
+                    message: "canonical main process exited with status 7".to_string(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        sandbox.set_phase(SandboxPhase::Error as i32);
+
+        assert!(has_main_process_result(&sandbox));
     }
 
     #[test]

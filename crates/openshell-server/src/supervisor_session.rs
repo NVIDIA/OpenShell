@@ -833,7 +833,12 @@ pub async fn handle_report_main_process_exit(
     }
     state
         .compute
-        .main_process_exited(&report.sandbox_id, &report.instance_id, report.exit_code)
+        .report_main_process_exit(
+            &report.sandbox_id,
+            &report.instance_id,
+            report.exit_code,
+            report.defer_ephemeral_cleanup,
+        )
         .await
         .map_err(Status::failed_precondition)?;
     Ok(Response::new(ReportMainProcessExitResponse {}))

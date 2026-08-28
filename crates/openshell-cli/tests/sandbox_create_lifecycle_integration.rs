@@ -47,6 +47,7 @@ struct SandboxState {
     deleted_names: Arc<Mutex<Vec<Vec<String>>>>,
     create_requests: Arc<Mutex<Vec<CreateSandboxRequest>>>,
     vm_error_after_started: Arc<AtomicBool>,
+    vm_error_with_observed_exit: Arc<AtomicBool>,
     vm_slow_progress_before_ready: Arc<AtomicBool>,
     vm_log_churn_before_ready: Arc<AtomicBool>,
     global_settings: Arc<Mutex<HashMap<String, SettingValue>>>,
@@ -401,6 +402,10 @@ impl OpenShell for TestOpenShell {
         let sandbox_id = request.into_inner().id;
         let (tx, rx) = mpsc::channel(4);
         let vm_error_after_started = self.state.vm_error_after_started.load(Ordering::SeqCst);
+        let vm_error_with_observed_exit = self
+            .state
+            .vm_error_with_observed_exit
+            .load(Ordering::SeqCst);
         let vm_slow_progress_before_ready = self
             .state
             .vm_slow_progress_before_ready
@@ -437,6 +442,9 @@ impl OpenShell for TestOpenShell {
                 ..provisioning.clone()
             };
             error.set_phase(SandboxPhase::Error as i32);
+            if vm_error_with_observed_exit {
+                error.status.as_mut().unwrap().exit_code = Some(137);
+            }
             let mut ready = provisioning.clone();
             ready.set_phase(SandboxPhase::Ready as i32);
 
@@ -1548,6 +1556,44 @@ async fn sandbox_create_returns_vm_error_without_waiting_for_timeout() {
     assert!(rendered.contains("sandbox entered error phase while provisioning"));
     assert!(rendered.contains("ProcessExited: VM process exited with status 0"));
     assert!(!rendered.contains("timed out"));
+}
+
+#[tokio::test]
+async fn sandbox_create_preserves_vm_error_when_exit_code_is_observed() {
+    let server = run_server().await;
+    server
+        .openshell
+        .state
+        .vm_error_after_started
+        .store(true, Ordering::SeqCst);
+    server
+        .openshell
+        .state
+        .vm_error_with_observed_exit
+        .store(true, Ordering::SeqCst);
+    let fake_ssh_dir = tempfile::tempdir().unwrap();
+    let xdg_dir = tempfile::tempdir().unwrap();
+    let _env = test_env(&fake_ssh_dir, &xdg_dir);
+    let tls = test_tls(&server);
+    install_fake_ssh(&fake_ssh_dir);
+
+    let err = run::sandbox_create(
+        &server.endpoint,
+        "openshell",
+        run::SandboxCreateConfig {
+            name: Some("vm-error-with-exit"),
+            command: &["echo".into(), "OK".into()],
+            ..test_config()
+        },
+        "default",
+        &tls,
+    )
+    .await
+    .expect_err("an observed process exit must not hide the infrastructure error");
+
+    let rendered = err.to_string();
+    assert!(rendered.contains("sandbox entered error phase while provisioning"));
+    assert!(rendered.contains("ProcessExited: VM process exited with status 0"));
 }
 
 #[tokio::test]

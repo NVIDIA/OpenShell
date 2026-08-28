@@ -358,8 +358,9 @@ Both commands default to the last-used sandbox. Stop stops background
 forwards and waits for `Stopped`; start waits for `Ready`. Connect, exec,
 file transfer, forwarding, and exposed services are unavailable while
 stopped or completed. Starting a retained `Completed` or
-`Error/MainProcessFailed` sandbox launches a fresh canonical-main instance.
-Delete remains the operation that removes retained state.
+`Error/MainProcessFailed` sandbox launches a fresh canonical-main instance and
+invalidates SSH sessions from the previous runtime generation. Delete remains
+the operation that removes retained state.
 
 ---
 
