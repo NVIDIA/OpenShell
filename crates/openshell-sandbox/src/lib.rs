@@ -28,6 +28,7 @@ mod sidecar_control;
 use miette::{IntoDiagnostic, Result, WrapErr};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::future::Future;
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 #[cfg(target_os = "linux")]
@@ -674,7 +675,7 @@ pub async fn run_sandbox(
                 retained_proto: retained_proto.clone(),
                 openshell_endpoint: openshell_endpoint.clone(),
                 sandbox_id: sandbox_id.clone(),
-                trusted_ssh_socket_path: std::path::PathBuf::from(trusted_ssh_socket_path),
+                trusted_ssh_socket_path: PathBuf::from(trusted_ssh_socket_path),
                 control_publisher: sidecar_control_publisher.clone(),
                 supervisor_session_updates: supervisor_session_updates.clone(),
             },
@@ -1382,7 +1383,7 @@ struct SidecarEntrypointHandler {
     retained_proto: Option<openshell_core::proto::SandboxPolicy>,
     openshell_endpoint: Option<String>,
     sandbox_id: Option<String>,
-    trusted_ssh_socket_path: std::path::PathBuf,
+    trusted_ssh_socket_path: PathBuf,
     control_publisher: Option<sidecar_control::Publisher>,
     supervisor_session_updates: tokio::sync::watch::Sender<Option<String>>,
 }
