@@ -18,6 +18,8 @@ Gateway CLI flag  >  gateway OPENSHELL_* env var  >  TOML file  >  built-in defa
 
 `database_url` is env-only. The loader rejects it when it appears in the file. When `OPENSHELL_DB_URL` is unset, the gateway stores its SQLite database under `$XDG_STATE_HOME/openshell/gateway/openshell.db`.
 
+`name` assigns an operator-facing identity to the gateway installation. Set it with `[openshell.gateway].name`, `--name`, or `OPENSHELL_GATEWAY_NAME`. It defaults to `openshell`; the Helm chart defaults it to the chart fullname so all replicas in one installation share a name. Chart fullnames are only unique within their Kubernetes namespace, so set `server.name` explicitly when one collector receives telemetry from multiple namespaces or clusters. This identity is independent of client-side gateway aliases, TLS names, and `gateway_jwt.gateway_id`.
+
 ## Package-Managed Locations
 
 Package-managed gateways do not require a TOML file. Create one at the package's optional config location when you need to override built-in defaults. Set `OPENSHELL_GATEWAY_CONFIG` in the launch environment to use a different file.
@@ -69,6 +71,7 @@ A complete gateway configuration covering every section. Trim to the fields you 
 version = 1
 
 [openshell.gateway]
+name                  = "production-us-west"
 bind_address          = "0.0.0.0:8080"
 health_bind_address   = "0.0.0.0:8081"
 metrics_bind_address  = "0.0.0.0:9090"
@@ -228,11 +231,32 @@ The transport is **OTLP over gRPC only**. HTTP/protobuf and HTTP/JSON are not su
 
 The OpenTelemetry SDK logs export failures after startup. Spans in a failed batch are dropped rather than retried.
 
-`service_name` sets the gateway's `service.name` resource attribute and defaults to `openshell-gateway`. The gateway also reports `service.version`.
+`service_name` sets the gateway's `service.name` resource attribute and defaults to `openshell-gateway`. The gateway also reports `service.version`, `openshell.gateway.name` from the gateway's configured `name`, and `openshell.gateway.compute_driver`.
 
 Only OpenTelemetry traces are exported. Inbound gRPC and HTTP requests produce server spans named for the RPC or HTTP method. Store and compute-driver operations appear as child spans. Internal reconciliation, credential-refresh, and driver-watch loops create operation roots for their store work because no inbound request supplies a parent. The gateway continues valid W3C `traceparent` context and starts a new trace when none is supplied. Request spans carry `method`, `path`, and the `request_id` that also appears in gateway logs. Health endpoint spans use DEBUG level and are not exported by the default INFO filter.
 
-The gateway forwards the OTLP configuration to managed external drivers. Each driver exports under its own service name.
+The gateway forwards the OTLP configuration, configured gateway name, and W3C trace context to managed external drivers. Built-in drivers also export their spans to the same collector through dedicated in-process providers. Driver spans retain the gateway trace context, use a distinct service name such as `openshell-driver-docker` or `openshell-driver-podman`, and carry the gateway name as the `openshell.gateway.name` resource attribute. Operator-run external drivers own their own telemetry configuration.
+
+For Helm deployments, set `server.otlp.endpoint` to render this table. The
+optional `server.otlp.serviceName` value overrides the gateway service name;
+driver service names remain fixed.
+
+The local `mise run helm:k3s:create` workflow installs a trace collector and UI,
+enables Agent Sandbox controller tracing on supported releases, and configures
+both the controller and the existing Skaffold deployment to export traces to it
+automatically.
+The local `gateway`, `gateway:docker`, `gateway:podman`, and `gateway:vm` tasks
+also set the gateway installation name in their generated configuration. Their
+defaults are driver-specific (`kubernetes-dev`, `docker-dev`, `podman-dev`, and
+`vm-dev`), and their documented `OPENSHELL_*_GATEWAY_NAME` overrides update both
+CLI registration and exported telemetry identity.
+Run `mise run helm:k3s:forward` to forward OTLP/gRPC to local port `4317` and
+the trace UI to local port `18888`. When Skaffold has deployed a Kubernetes
+gateway, the task also forwards it to local port `8090`; otherwise it continues
+with the collector ports only. The Skaffold run task registers the forwarded
+gateway under the worktree-specific k3d cluster name; select it with
+`openshell gateway select <name>`. The local Podman, Docker, and VM gateway
+tasks export to the forwarded receiver automatically.
 
 ### Tuning
 
@@ -553,6 +577,14 @@ In managed workspace mode, the Kubernetes driver copies each explicitly named
 namespace on sandbox creation. Shared and operator modes require the Secret to
 already exist in the sandbox namespace.
 
+For token-exchange provider profiles, the gateway also needs access to its own
+SPIFFE Workload API socket. In Helm deployments, set
+`server.providerTokenGrants.spiffe.enabled=true`; the chart mounts the socket
+into the gateway pod and sets `OPENSHELL_GATEWAY_SPIFFE_WORKLOAD_API_SOCKET`.
+The gateway verifies supervisor JWT-SVIDs with JWT bundles fetched from the
+SPIFFE Workload API, so this validation path does not require gateway access to
+the SPIRE OIDC discovery endpoint or its TLS CA.
+
 ### Docker
 
 Sandboxes run as containers on a local bridge network. The supervisor binary is bind-mounted from the host (no in-cluster image pull required); guest mTLS material is supplied as host paths.
@@ -608,8 +640,9 @@ compute_drivers = ["podman"]
 
 [openshell.drivers.podman]
 # Rootless socket path. For root Podman use /run/podman/podman.sock.
-# Omit to auto-detect: the driver probes for a responsive Podman socket and
-# fails to start if none respond.
+# Omit to auto-detect: the driver probes for a responsive Podman socket, then
+# asks the podman CLI where its socket is, and fails to start if neither finds
+# one. Set this to pin a specific Podman machine instead.
 socket_path             = "/run/user/1000/podman/podman.sock"
 default_image           = "ghcr.io/nvidia/openshell/sandbox:latest"
 image_pull_policy       = "missing"   # always | missing | never | newer
@@ -649,10 +682,13 @@ health_check_interval_secs = 10
 # Corporate forward proxy for sandbox egress. When set, the in-container
 # supervisor chains policy-approved TLS tunnels through this proxy with HTTP
 # CONNECT instead of dialing destinations directly. Plain-HTTP requests are
-# not proxied and always dial the destination directly. Only http:// proxy
-# URLs in explicit http://host:port form are supported: the scheme and port
-# are both required, and a URL carrying a path, query, or fragment is
-# rejected rather than silently truncated.
+# not proxied and always dial the destination directly. http:// and https://
+# proxy URLs in explicit scheme://host:port form are supported: the scheme and
+# port are both required, and a URL carrying a path, query, or fragment is
+# rejected rather than silently truncated. For an https:// proxy the supervisor
+# wraps the connection to the proxy in TLS before the CONNECT handshake,
+# verifying the proxy certificate against the built-in and system roots plus
+# the optional proxy_ca_bundle below.
 # NO_PROXY entries (hostnames, domain suffixes, IPs, CIDRs, each with an
 # optional :port qualifier) are dialed directly. A port-qualified entry only
 # bypasses that destination port. IP and CIDR entries also match hostnames
@@ -692,20 +728,35 @@ health_check_interval_secs = 10
 # supervisor, so a credential accepted here is never rejected in-container.
 # Keep gateway.toml and the auth file owner-readable only (mode 0600).
 #
-# WARNING: the supervisor sends the credential as a Proxy-Authorization:
-# Basic header over the plain-TCP connection to the http:// proxy. Basic
+# WARNING: with an http:// proxy the supervisor sends the credential as a
+# Proxy-Authorization: Basic header over the plain-TCP connection. Basic
 # auth is base64, not encryption: anyone on the network path between the
 # sandbox host and the proxy can recover the credential. Because of that,
-# proxy_auth_file requires the explicit acknowledgement
-# proxy_auth_allow_insecure = true; without it the configuration is
-# rejected at gateway startup. Only opt in when the path to the proxy is a
-# trusted network segment.
+# proxy_auth_file with an http:// proxy requires the explicit
+# acknowledgement proxy_auth_allow_insecure = true; without it the
+# configuration is rejected at gateway startup. Only opt in when the path
+# to the proxy is a trusted network segment. For an https:// proxy the
+# credential is sent inside the verified TLS session, so the
+# acknowledgement is not required (but tolerated if set).
+#
+# proxy_ca_bundle points at a PEM CA bundle (on the gateway host) trusted for
+# the corporate proxy. A CA certificate is not secret, so the gateway
+# bind-mounts it read-only into the sandbox. It is trusted in two places: the
+# TLS handshake with an https:// proxy, and — because a TLS-intercepting proxy
+# (mitmproxy, squid ssl-bump) re-signs tunneled server certificates with the
+# same CA — the sandbox trust bundle and the supervisor's upstream
+# re-encryption, so intercepted upstream TLS keeps working and sandbox
+# workloads trust the re-signed certificates. It is valid with either an
+# http:// or https:// proxy and requires a proxy URL; the file must exist and
+# contain at least one certificate, or the sandbox fails closed at startup.
 # https_proxy               = "http://proxy.corp.com:8080"
 # no_proxy                  = "*.svc.cluster.local,10.0.0.0/8"
 # proxy_auth_file           = "/etc/openshell/secrets/proxy-auth"
 # proxy_auth_allow_insecure = true
 # Last resort for hostname-filtering proxy ACLs; see the warning above.
 # proxy_connect_by_hostname = true
+# Corporate CA trusted for an https:// proxy and TLS-intercepting proxies.
+# proxy_ca_bundle           = "/etc/openshell/tls/proxy-ca.pem"
 ```
 
 ### MicroVM

@@ -7,16 +7,6 @@ on:
         description: "Image tag to test (typically the commit SHA)"
         required: true
         type: string
-      cli-artifact-prefix:
-        description: "Optional prebuilt CLI artifact prefix (artifact suffix is linux-<arch>)"
-        required: false
-        type: string
-        default: ""
-      gateway-artifact-prefix:
-        description: "Optional prebuilt gateway artifact prefix (artifact suffix is linux-<arch>)"
-        required: false
-        type: string
-        default: ""
 
 permissions:
   actions: read
@@ -70,16 +60,10 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Use prebuilt OpenShell CLI
-        if: inputs.cli-artifact-prefix != ''
         uses: ./.github/actions/setup-e2e-cli
-        with:
-          artifact-prefix: ${{ inputs.cli-artifact-prefix }}
 
       - name: Use prebuilt OpenShell gateway
-        if: inputs.gateway-artifact-prefix != ''
         uses: ./.github/actions/setup-e2e-gateway
-        with:
-          artifact-prefix: ${{ inputs.gateway-artifact-prefix }}
 
       - name: Log in to GHCR
         run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin

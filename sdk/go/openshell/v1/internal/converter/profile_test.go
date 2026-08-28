@@ -156,6 +156,13 @@ func TestProfileCredentialFromProto(t *testing.T) {
 			Scopes:              []string{"read", "write"},
 			CacheTtlSeconds:     300,
 			ClientAssertionType: "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
+			GrantType:           pb.ProviderCredentialTokenGrantType_PROVIDER_CREDENTIAL_TOKEN_GRANT_TYPE_TOKEN_EXCHANGE,
+			SubjectToken: &pb.ProviderCredentialTokenGrantSubjectToken{
+				Source:           "provider_credential",
+				Credential:       "UPSTREAM_TOKEN",
+				SubjectTokenType: "urn:ietf:params:oauth:token-type:access_token",
+			},
+			RequestedTokenType: "urn:ietf:params:oauth:token-type:refresh_token",
 			AudienceOverrides: []*pb.ProviderCredentialTokenGrantAudienceOverride{
 				{Host: "special.example.com", Port: 8443, Path: "/api", Audience: "https://special.example.com", Scopes: []string{"admin"}},
 			},
@@ -182,6 +189,12 @@ func TestProfileCredentialFromProto(t *testing.T) {
 	assert.Equal(t, []string{"read", "write"}, cred.TokenGrant.Scopes)
 	assert.Equal(t, int64(300), cred.TokenGrant.CacheTTLSeconds)
 	assert.Equal(t, "urn:ietf:params:oauth:client-assertion-type:jwt-bearer", cred.TokenGrant.ClientAssertionType)
+	assert.Equal(t, v1.CredentialTokenGrantTypeTokenExchange, cred.TokenGrant.GrantType)
+	require.NotNil(t, cred.TokenGrant.SubjectToken)
+	assert.Equal(t, "provider_credential", cred.TokenGrant.SubjectToken.Source)
+	assert.Equal(t, "UPSTREAM_TOKEN", cred.TokenGrant.SubjectToken.Credential)
+	assert.Equal(t, "urn:ietf:params:oauth:token-type:access_token", cred.TokenGrant.SubjectToken.SubjectTokenType)
+	assert.Equal(t, "urn:ietf:params:oauth:token-type:refresh_token", cred.TokenGrant.RequestedTokenType)
 	require.Len(t, cred.TokenGrant.AudienceOverrides, 1)
 	assert.Equal(t, "special.example.com", cred.TokenGrant.AudienceOverrides[0].Host)
 	assert.Equal(t, uint32(8443), cred.TokenGrant.AudienceOverrides[0].Port)
@@ -261,6 +274,13 @@ func TestProfileCredentialToProto(t *testing.T) {
 			Scopes:              []string{"read"},
 			CacheTTLSeconds:     300,
 			ClientAssertionType: "urn:custom",
+			GrantType:           v1.CredentialTokenGrantTypeTokenExchange,
+			SubjectToken: &v1.TokenGrantSubjectToken{
+				Source:           "provider_credential",
+				Credential:       "UPSTREAM_TOKEN",
+				SubjectTokenType: "urn:ietf:params:oauth:token-type:access_token",
+			},
+			RequestedTokenType: "urn:ietf:params:oauth:token-type:refresh_token",
 			AudienceOverrides: []v1.TokenGrantAudienceOverride{
 				{Host: "h", Port: 443, Path: "/p", Audience: "aud", Scopes: []string{"s"}},
 			},
@@ -292,6 +312,12 @@ func TestProfileCredentialToProto(t *testing.T) {
 	assert.Equal(t, []string{"read"}, proto.TokenGrant.Scopes)
 	assert.Equal(t, int64(300), proto.TokenGrant.CacheTtlSeconds)
 	assert.Equal(t, "urn:custom", proto.TokenGrant.ClientAssertionType)
+	assert.Equal(t, pb.ProviderCredentialTokenGrantType_PROVIDER_CREDENTIAL_TOKEN_GRANT_TYPE_TOKEN_EXCHANGE, proto.TokenGrant.GrantType)
+	require.NotNil(t, proto.TokenGrant.SubjectToken)
+	assert.Equal(t, "provider_credential", proto.TokenGrant.SubjectToken.Source)
+	assert.Equal(t, "UPSTREAM_TOKEN", proto.TokenGrant.SubjectToken.Credential)
+	assert.Equal(t, "urn:ietf:params:oauth:token-type:access_token", proto.TokenGrant.SubjectToken.SubjectTokenType)
+	assert.Equal(t, "urn:ietf:params:oauth:token-type:refresh_token", proto.TokenGrant.RequestedTokenType)
 	require.Len(t, proto.TokenGrant.AudienceOverrides, 1)
 	assert.Equal(t, "h", proto.TokenGrant.AudienceOverrides[0].Host)
 }

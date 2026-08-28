@@ -213,6 +213,18 @@ output. Use `provider refresh rotate`, reconfigure refresh, or delete refresh
 before returning those keys to manual management. Unrelated provider fields
 remain updateable.
 
+When OAuth refresh fails, inspect the `RECOVERY` and `FAILURE_CODE` columns from
+`provider refresh status`; do not infer the remedy from HTTP status or parse
+`LAST_ERROR`. `retry` means the worker will try again, `reauthorize` means the
+user must obtain a new OAuth grant and run `provider refresh configure`,
+`fix_configuration` means an operator must repair the OAuth client, scopes, or
+administrator policy, and `investigate` means the issuer returned an
+unrecognized response. The gateway parks `reauthorize` records until a manual
+rotate or reconfiguration. It retries
+`fix_configuration` records hourly so externally repaired configuration can
+recover without rapid token-endpoint traffic. The existing access credential
+remains usable only until its recorded expiry.
+
 ---
 
 ## Workflow 3: Sandbox Lifecycle
@@ -368,7 +380,7 @@ the operation that removes retained state.
 
 This is the most important multi-step workflow. It enables a tight feedback cycle where sandbox policy is refined based on observed activity.
 
-**Key concept**: Policies have static fields (immutable after creation: `filesystem_policy`, `landlock`, `process`) and two dynamic fields: `network_policies` and `network_middlewares`. Both dynamic fields can be updated without recreating the sandbox.
+**Key concept**: Policies have static fields (immutable after creation: `filesystem_policy`, `landlock`, `process`) and two dynamic fields: `network_policies` and `network_middlewares`. Both dynamic fields can be updated without recreating the sandbox when the selected compute driver supports live policy updates. MXC rejects live policy replacement and merge updates; delete and recreate an MXC sandbox instead.
 
 An endpoint with omitted `protocol` retains explicit-proxy behavior. Explicit
 `protocol: tcp` requests policy DNS and transparent TCP and currently requires
@@ -438,7 +450,7 @@ Edit `current-policy.yaml` to allow the blocked actions. **For policy content au
 - Binary matching patterns
 - Ordered `network_middlewares`, host selection, HTTP and WebSocket bindings, and `fail_open` or `fail_closed` behavior
 
-`network_policies` and `network_middlewares` can be modified at runtime. If `filesystem_policy`, `landlock`, or `process` need changes, the sandbox must be recreated. Built-in middleware such as `openshell/regex` needs no gateway registration. An operator-run middleware must already be registered under `[[openshell.supervisor.middleware]]`; changing that static registration requires a gateway restart.
+`network_policies` and `network_middlewares` can be modified at runtime when the selected compute driver supports live policy updates. MXC rejects live policy replacement and merge updates; delete and recreate an MXC sandbox instead. If `filesystem_policy`, `landlock`, or `process` need changes, the sandbox must be recreated. Built-in middleware such as `openshell/regex` needs no gateway registration. An operator-run middleware must already be registered under `[[openshell.supervisor.middleware]]`; changing that static registration requires a gateway restart.
 
 Middleware can inspect parsed HTTP request bodies and complete client-to-upstream WebSocket text messages over both `ws://` and `wss://` when the implementation advertises the matching binding. The built-in `openshell/regex` advertises both bindings and applies its fixed patterns to UTF-8 text. A host-matched HTTP-only attachment can inspect the upgrade GET but does not join the WebSocket chain; look for `binding_not_selected` coverage. Binary messages pass under both `on_error` modes and active stages emit `unsupported_message_type` coverage; upstream-to-client messages remain uninspected. A broken fail-open WebSocket stage is disabled for the rest of that connection; inspect sandbox OCSF logs for `openshell.middleware.websocket_stage_disabled`.
 
@@ -502,7 +514,7 @@ Avoid `--yes` during interactive work. A global policy locks policy control for 
 
 ### Review agent-authored rule proposals
 
-Sandboxes created with `--approval-mode manual` place every proposal in the review inbox. `auto` approves only proposals with an empty prover delta; findings still require review.
+Sandboxes created with `--approval-mode manual` place every proposal in the review inbox. `auto` approves only valid effective-policy candidates with an empty prover delta; findings still require review. The CLI binds approval to the candidate's current review token. If live policy, provider, or credential inputs change, approval leaves the chunk pending with a refreshed candidate and requires a fresh review.
 
 ```bash
 openshell rule get dev --status pending
@@ -511,7 +523,7 @@ openshell rule reject dev --chunk-id <chunk-id> --reason "too broad"
 openshell rule history dev
 ```
 
-Review the proposed scope and prover findings before approval. Treat `rule approve-all --include-security-flagged` as a high-risk bulk action.
+Review the proposed scope, candidate hash, prover findings, and application errors before approval. Treat `rule approve-all --include-security-flagged` as a high-risk bulk action.
 
 ---
 

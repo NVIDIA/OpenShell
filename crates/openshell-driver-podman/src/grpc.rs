@@ -432,7 +432,7 @@ mod tests {
             .with(openshell_otel::layer_excluding_target_prefix(
                 &gateway_provider,
                 "gateway-test",
-                crate::otel_tracing::IN_PROCESS_TARGET_PREFIX,
+                Some(crate::otel_tracing::IN_PROCESS_TARGET_PREFIX),
             ))
             .with(crate::otel_tracing::in_process_layer(&driver_provider));
         let service = ComputeDriverService::new_in_process(PodmanComputeDriver::for_tests(

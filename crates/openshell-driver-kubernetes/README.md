@@ -19,6 +19,19 @@ workspace namespace modes via `workspace_mode`:
   gateway state; it never deletes or otherwise accesses the operator-managed
   Kubernetes namespace.
 
+When the gateway configures `[openshell.gateway.otlp]`, Kubernetes
+compute-driver spans export to the same OTLP/gRPC collector with the service
+name `openshell-driver-kubernetes`. The driver preserves the gateway trace
+context and uses the same compute-driver RPC span names in its in-process and
+standalone forms. Standalone deployments set `--gateway-name` or
+`OPENSHELL_GATEWAY_NAME` so exported spans carry the same
+`openshell.gateway.name` resource attribute as gateway spans.
+
+When it creates an Agent Sandbox resource, the driver serializes the active W3C
+trace context into the controller-reserved `opentelemetry.io/trace-context`
+annotation. An OTLP-enabled Agent Sandbox controller can therefore attach its
+asynchronous reconciliation spans to the originating OpenShell create trace.
+
 Workspace namespace modes assume exclusive control of the sandbox identity
 resource chain. In shared and managed modes, only the gateway and its trusted
 Agent Sandbox controller may administer the sandbox namespace, Sandbox CRs,
@@ -47,7 +60,9 @@ state and platform events into the shared compute-driver protobuf surface used
 by the gateway.
 
 Kubernetes API calls use explicit timeouts so gRPC handlers do not block
-indefinitely when the API server is slow or unavailable.
+indefinitely when the API server is slow or unavailable. Resource and Event
+watches recover in place with API-friendly backoff after transient watcher
+errors, avoiding a gateway-side watch restart and its associated watch gap.
 
 ## Workspace Persistence
 

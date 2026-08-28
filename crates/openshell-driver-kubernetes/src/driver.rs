@@ -26,6 +26,7 @@ use kube::api::{
 };
 use kube::core::gvk::GroupVersionKind;
 use kube::core::{DynamicObject, ObjectMeta};
+use kube::runtime::WatchStreamExt;
 use kube::runtime::watcher::{self, Event};
 use kube::{Client, Error as KubeError};
 use openshell_core::driver_mounts;
@@ -62,6 +63,7 @@ pub type WatchStream =
     Pin<Box<dyn Stream<Item = Result<WatchSandboxesEvent, KubernetesDriverError>> + Send>>;
 
 const MANAGED_SSH_NETWORK_POLICY_NAME: &str = "openshell-sandbox-ssh";
+const AGENT_SANDBOX_TRACE_CONTEXT_ANNOTATION: &str = "opentelemetry.io/trace-context";
 
 #[derive(Debug, thiserror::Error)]
 pub enum KubernetesDriverError {
@@ -467,6 +469,23 @@ impl std::fmt::Debug for KubernetesComputeDriver {
 }
 
 impl KubernetesComputeDriver {
+    #[cfg(test)]
+    pub(crate) fn new_for_test(config: KubernetesComputeConfig) -> Self {
+        let service = tower::service_fn(|_request: http::Request<kube::client::Body>| async {
+            Ok::<_, std::convert::Infallible>(http::Response::new(http_body_util::Empty::<
+                bytes::Bytes,
+            >::new()))
+        });
+        let client = Client::new(service, "default");
+        Self {
+            client: client.clone(),
+            watch_client: client,
+            sandbox_api_version: Arc::new(OnceCell::new()),
+            config,
+            operator_allowlist: None,
+        }
+    }
+
     pub async fn new(
         config: KubernetesComputeConfig,
         shutdown_rx: tokio::sync::watch::Receiver<bool>,
@@ -1339,7 +1358,24 @@ impl KubernetesComputeDriver {
     }
 
     #[allow(clippy::similar_names)]
+    #[tracing::instrument(
+        name = "kubernetes.create_sandbox",
+        skip(self, sandbox),
+        fields(
+            otel.name = "kubernetes.create_sandbox",
+            otel.status_code = tracing::field::Empty,
+            sandbox.id = %sandbox.id,
+            sandbox.name = %sandbox.name,
+        )
+    )]
     pub async fn create_sandbox(&self, sandbox: &Sandbox) -> Result<(), KubernetesDriverError> {
+        let span_status = openshell_otel::ErrorStatusGuard::current();
+        let result = self.create_sandbox_inner(sandbox).await;
+        span_status.finish(result)
+    }
+
+    #[allow(clippy::similar_names)]
+    async fn create_sandbox_inner(&self, sandbox: &Sandbox) -> Result<(), KubernetesDriverError> {
         let gpu_requirements = sandbox
             .spec
             .as_ref()
@@ -1444,6 +1480,7 @@ impl KubernetesComputeDriver {
         let kube_name = self.config.kube_resource_name(workspace, name);
         let mut obj = DynamicObject::new(&kube_name, &agent_sandbox_api.resource);
         let mut annotations = sandbox_annotations(sandbox);
+        add_trace_context_annotation(&mut annotations);
         for key in [
             crate::config::ANNOTATION_SCC_UID_RANGE,
             crate::config::ANNOTATION_SCC_SUPPLEMENTAL_GROUPS,
@@ -1499,7 +1536,22 @@ impl KubernetesComputeDriver {
         }
     }
 
+    #[tracing::instrument(
+        name = "kubernetes.stop_sandbox",
+        skip(self),
+        fields(
+            otel.name = "kubernetes.stop_sandbox",
+            otel.status_code = tracing::field::Empty,
+            sandbox.id = %sandbox_id,
+        )
+    )]
     pub async fn stop_sandbox(&self, sandbox_id: &str) -> Result<(), KubernetesDriverError> {
+        let span_status = openshell_otel::ErrorStatusGuard::current();
+        let result = self.stop_sandbox_inner(sandbox_id).await;
+        span_status.finish(result)
+    }
+
+    async fn stop_sandbox_inner(&self, sandbox_id: &str) -> Result<(), KubernetesDriverError> {
         let (agent_sandbox_api, kube_name, pod_name, namespace, stop_timeout) = self
             .patch_sandbox_operating_state(sandbox_id, false)
             .await?;
@@ -1554,10 +1606,22 @@ impl KubernetesComputeDriver {
         }
     }
 
+    #[tracing::instrument(
+        name = "kubernetes.start_sandbox",
+        skip(self),
+        fields(
+            otel.name = "kubernetes.start_sandbox",
+            otel.status_code = tracing::field::Empty,
+            sandbox.id = %sandbox_id,
+        )
+    )]
     pub async fn start_sandbox(&self, sandbox_id: &str) -> Result<(), KubernetesDriverError> {
-        self.patch_sandbox_operating_state(sandbox_id, true)
+        let span_status = openshell_otel::ErrorStatusGuard::current();
+        let result = self
+            .patch_sandbox_operating_state(sandbox_id, true)
             .await
-            .map(|_| ())
+            .map(|_| ());
+        span_status.finish(result)
     }
 
     async fn patch_sandbox_operating_state(
@@ -1648,7 +1712,22 @@ impl KubernetesComputeDriver {
         ))
     }
 
+    #[tracing::instrument(
+        name = "kubernetes.delete_sandbox",
+        skip(self),
+        fields(
+            otel.name = "kubernetes.delete_sandbox",
+            otel.status_code = tracing::field::Empty,
+            sandbox.id = %sandbox_id,
+        )
+    )]
     pub async fn delete_sandbox(&self, sandbox_id: &str) -> Result<bool, String> {
+        let span_status = openshell_otel::ErrorStatusGuard::current();
+        let result = self.delete_sandbox_inner(sandbox_id).await;
+        span_status.finish(result)
+    }
+
+    async fn delete_sandbox_inner(&self, sandbox_id: &str) -> Result<bool, String> {
         info!(
             sandbox_id = %sandbox_id,
             workspace_mode = %self.config.workspace_mode,
@@ -1783,8 +1862,16 @@ impl KubernetesComputeDriver {
             .await?;
         let event_api: Api<KubeEventObj> = Api::namespaced(self.watch_client.clone(), &namespace);
         let watcher_config = watcher::Config::default().labels(&openshell_sandbox_label_selector());
-        let mut sandbox_stream = watcher::watcher(agent_sandbox_api.api, watcher_config).boxed();
-        let mut event_stream = watcher::watcher(event_api, watcher::Config::default()).boxed();
+        let mut sandbox_stream = recovering_watcher_stream(
+            watcher::watcher(agent_sandbox_api.api, watcher_config),
+            "sandbox-resource",
+        )
+        .boxed();
+        let mut event_stream = recovering_watcher_stream(
+            watcher::watcher(event_api, watcher::Config::default()),
+            "kubernetes-event",
+        )
+        .boxed();
         let (tx, rx) = mpsc::channel(256);
 
         tokio::spawn(async move {
@@ -1793,8 +1880,8 @@ impl KubernetesComputeDriver {
 
             loop {
                 tokio::select! {
-                    result = sandbox_stream.try_next() => match result {
-                        Ok(Some(Event::Applied(obj))) => {
+                    event = sandbox_stream.next() => match event {
+                        Some(Event::Applied(obj)) => {
                             if let Ok((kube_name, sandbox)) = sandbox_from_object(&namespace, obj) {
                                 update_indexes(&mut sandbox_name_to_id, &mut agent_pod_to_id, &kube_name, &sandbox);
                                 let event = WatchSandboxesEvent {
@@ -1807,7 +1894,7 @@ impl KubernetesComputeDriver {
                                 }
                             }
                         }
-                        Ok(Some(Event::Deleted(obj))) => {
+                        Some(Event::Deleted(obj)) => {
                             if is_openshell_managed(&obj)
                                 && let Ok(sandbox_id) = sandbox_id_from_object(&obj)
                             {
@@ -1822,7 +1909,7 @@ impl KubernetesComputeDriver {
                                 }
                             }
                         }
-                        Ok(Some(Event::Restarted(objs))) => {
+                        Some(Event::Restarted(objs)) => {
                             for obj in objs {
                                 if let Ok((kube_name, sandbox)) = sandbox_from_object(&namespace, obj) {
                                     update_indexes(&mut sandbox_name_to_id, &mut agent_pod_to_id, &kube_name, &sandbox);
@@ -1837,19 +1924,15 @@ impl KubernetesComputeDriver {
                                 }
                             }
                         }
-                        Ok(None) => {
+                        None => {
                             let _ = tx.send(Err(KubernetesDriverError::Message(
                                 "sandbox watcher stream ended unexpectedly".to_string()
                             ))).await;
                             break;
                         }
-                        Err(err) => {
-                            let _ = tx.send(Err(KubernetesDriverError::Message(err.to_string()))).await;
-                            break;
-                        }
                     },
-                    result = event_stream.try_next() => match result {
-                        Ok(Some(Event::Applied(obj))) => {
+                    event = event_stream.next() => match event {
+                        Some(Event::Applied(obj)) => {
                             if let Some((sandbox_id, event)) = map_kube_event_to_platform(
                                 &sandbox_name_to_id,
                                 &agent_pod_to_id,
@@ -1865,18 +1948,14 @@ impl KubernetesComputeDriver {
                                 }
                             }
                         }
-                        Ok(Some(Event::Deleted(_))) => {}
-                        Ok(Some(Event::Restarted(_))) => {
+                        Some(Event::Deleted(_)) => {}
+                        Some(Event::Restarted(_)) => {
                             debug!(namespace = %namespace, "Kubernetes event watcher restarted");
                         }
-                        Ok(None) => {
+                        None => {
                             let _ = tx.send(Err(KubernetesDriverError::Message(
                                 "kubernetes event watcher stream ended".to_string()
                             ))).await;
-                            break;
-                        }
-                        Err(err) => {
-                            let _ = tx.send(Err(KubernetesDriverError::Message(err.to_string()))).await;
                             break;
                         }
                     },
@@ -1896,15 +1975,59 @@ impl KubernetesComputeDriver {
             Self::cluster_wide_sandbox_api(self.watch_client.clone(), sandbox_api_version);
         let selector = self.openshell_sandbox_selector();
         let watcher_config = watcher::Config::default().labels(&selector);
-        let mut sandbox_stream = watcher::watcher(cluster_api.api, watcher_config).boxed();
-        let (tx, rx) = mpsc::channel(256);
-        let default_namespace = self.config.namespace.clone();
+        let sandbox_stream = recovering_watcher_stream(
+            watcher::watcher(cluster_api.api, watcher_config),
+            "sandbox-resource",
+        )
+        .boxed();
 
-        tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    result = sandbox_stream.try_next() => match result {
-                        Ok(Some(Event::Applied(obj))) => {
+        Ok(cluster_wide_watch_stream(
+            sandbox_stream,
+            self.config.namespace.clone(),
+        ))
+    }
+}
+
+fn cluster_wide_watch_stream<S>(mut sandbox_stream: S, default_namespace: String) -> WatchStream
+where
+    S: Stream<Item = Event<DynamicObject>> + Send + Unpin + 'static,
+{
+    let (tx, rx) = mpsc::channel(256);
+
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                event = sandbox_stream.next() => match event {
+                    Some(Event::Applied(obj)) => {
+                        let ns = obj.metadata.namespace.clone()
+                            .unwrap_or_else(|| default_namespace.clone());
+                        if let Ok((_kube_name, sandbox)) = sandbox_from_object(&ns, obj) {
+                            let event = WatchSandboxesEvent {
+                                payload: Some(watch_sandboxes_event::Payload::Sandbox(
+                                    WatchSandboxesSandboxEvent { sandbox: Some(sandbox) }
+                                )),
+                            };
+                            if tx.send(Ok(event)).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                    Some(Event::Deleted(obj)) => {
+                        if is_openshell_managed(&obj)
+                            && let Ok(sandbox_id) = sandbox_id_from_object(&obj)
+                        {
+                            let event = WatchSandboxesEvent {
+                                payload: Some(watch_sandboxes_event::Payload::Deleted(
+                                    WatchSandboxesDeletedEvent { sandbox_id }
+                                )),
+                            };
+                            if tx.send(Ok(event)).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                    Some(Event::Restarted(objs)) => {
+                        for obj in objs {
                             let ns = obj.metadata.namespace.clone()
                                 .unwrap_or_else(|| default_namespace.clone());
                             if let Ok((_kube_name, sandbox)) = sandbox_from_object(&ns, obj) {
@@ -1914,57 +2037,69 @@ impl KubernetesComputeDriver {
                                     )),
                                 };
                                 if tx.send(Ok(event)).await.is_err() {
-                                    break;
+                                    return;
                                 }
                             }
                         }
-                        Ok(Some(Event::Deleted(obj))) => {
-                            if is_openshell_managed(&obj)
-                                && let Ok(sandbox_id) = sandbox_id_from_object(&obj)
-                            {
-                                let event = WatchSandboxesEvent {
-                                    payload: Some(watch_sandboxes_event::Payload::Deleted(
-                                        WatchSandboxesDeletedEvent { sandbox_id }
-                                    )),
-                                };
-                                if tx.send(Ok(event)).await.is_err() {
-                                    break;
-                                }
-                            }
-                        }
-                        Ok(Some(Event::Restarted(objs))) => {
-                            for obj in objs {
-                                let ns = obj.metadata.namespace.clone()
-                                    .unwrap_or_else(|| default_namespace.clone());
-                                if let Ok((_kube_name, sandbox)) = sandbox_from_object(&ns, obj) {
-                                    let event = WatchSandboxesEvent {
-                                        payload: Some(watch_sandboxes_event::Payload::Sandbox(
-                                            WatchSandboxesSandboxEvent { sandbox: Some(sandbox) }
-                                        )),
-                                    };
-                                    if tx.send(Ok(event)).await.is_err() {
-                                        return;
-                                    }
-                                }
-                            }
-                        }
-                        Ok(None) => {
-                            let _ = tx.send(Err(KubernetesDriverError::Message(
-                                "sandbox watcher stream ended unexpectedly".to_string()
-                            ))).await;
-                            break;
-                        }
-                        Err(err) => {
-                            let _ = tx.send(Err(KubernetesDriverError::Message(err.to_string()))).await;
-                            break;
-                        }
-                    },
-                    () = tx.closed() => break,
-                }
+                    }
+                    None => {
+                        let _ = tx.send(Err(KubernetesDriverError::Message(
+                            "sandbox watcher stream ended unexpectedly".to_string()
+                        ))).await;
+                        break;
+                    }
+                },
+                () = tx.closed() => break,
             }
-        });
+        }
+    });
 
-        Ok(Box::pin(ReceiverStream::new(rx)))
+    Box::pin(ReceiverStream::new(rx))
+}
+
+fn recovering_watcher_stream<S, T, E>(
+    stream: S,
+    watcher: &'static str,
+) -> impl Stream<Item = Event<T>>
+where
+    S: Stream<Item = Result<Event<T>, E>>,
+    E: std::fmt::Display,
+{
+    continue_on_watcher_errors(stream.default_backoff(), watcher)
+}
+
+/// Drop kube-runtime watcher errors after logging them so continued polling can
+/// drive its built-in relist and recovery state machine. The production adapter
+/// above applies backoff first to avoid hot-looping on persistent API failures.
+fn continue_on_watcher_errors<S, T, E>(
+    stream: S,
+    watcher: &'static str,
+) -> impl Stream<Item = Event<T>>
+where
+    S: Stream<Item = Result<Event<T>, E>>,
+    E: std::fmt::Display,
+{
+    stream.filter_map(move |result| {
+        futures::future::ready(match result {
+            Ok(event) => Some(event),
+            Err(err) => {
+                warn!(
+                    watcher,
+                    error = %err,
+                    "Kubernetes watcher stream error; waiting for kube-runtime recovery"
+                );
+                None
+            }
+        })
+    })
+}
+
+fn add_trace_context_annotation(annotations: &mut BTreeMap<String, String>) {
+    let Some(carrier) = openshell_otel::current_trace_context_carrier() else {
+        return;
+    };
+    if let Ok(value) = serde_json::to_string(&carrier) {
+        annotations.insert(AGENT_SANDBOX_TRACE_CONTEXT_ANNOTATION.to_string(), value);
     }
 }
 
@@ -4561,6 +4696,74 @@ mod tests {
     static ENV_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
         std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
 
+    #[tokio::test]
+    async fn tracing_create_sandbox_failure_exports_a_kubernetes_operation_span() {
+        use opentelemetry_sdk::trace::{InMemorySpanExporterBuilder, SdkTracerProvider};
+        use tracing::instrument::WithSubscriber as _;
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let _tracing_lock = crate::otel_tracing::test_lock().await;
+        let exporter = InMemorySpanExporterBuilder::new().build();
+        let provider = SdkTracerProvider::builder()
+            .with_simple_exporter(exporter.clone())
+            .build();
+        let subscriber = tracing_subscriber::registry().with(crate::otel_tracing::layer(&provider));
+        let driver = KubernetesComputeDriver::new_for_test(KubernetesComputeConfig::default());
+
+        driver
+            .create_sandbox(&Sandbox::default())
+            .with_subscriber(subscriber)
+            .await
+            .expect_err("missing sandbox name should fail");
+        provider.force_flush().unwrap();
+
+        let spans = exporter.get_finished_spans().unwrap();
+        let span = spans
+            .iter()
+            .find(|span| span.name == "kubernetes.create_sandbox")
+            .expect("create operation span");
+        assert!(matches!(
+            span.status,
+            opentelemetry::trace::Status::Error { .. }
+        ));
+        provider.shutdown().unwrap();
+    }
+
+    #[tokio::test]
+    async fn sandbox_annotation_propagates_the_active_w3c_trace_context() {
+        use opentelemetry_sdk::trace::{InMemorySpanExporterBuilder, SdkTracerProvider};
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let _tracing_lock = crate::otel_tracing::test_lock().await;
+        let exporter = InMemorySpanExporterBuilder::new().build();
+        let provider = SdkTracerProvider::builder()
+            .with_simple_exporter(exporter)
+            .build();
+        let subscriber = tracing_subscriber::registry().with(crate::otel_tracing::layer(&provider));
+
+        let annotations = tracing::subscriber::with_default(subscriber, || {
+            let span = tracing::info_span!("kubernetes.create_sandbox");
+            let _entered = span.enter();
+            let mut annotations = BTreeMap::new();
+            add_trace_context_annotation(&mut annotations);
+            annotations
+        });
+
+        let carrier: serde_json::Value = serde_json::from_str(
+            annotations
+                .get("opentelemetry.io/trace-context")
+                .expect("agent-sandbox trace-context annotation"),
+        )
+        .expect("annotation should contain a JSON propagation carrier");
+        let traceparent = carrier["traceparent"]
+            .as_str()
+            .expect("carrier should contain traceparent");
+        assert!(traceparent.starts_with("00-"));
+        assert_eq!(traceparent.len(), 55);
+
+        provider.shutdown().unwrap();
+    }
+
     fn json_struct(value: serde_json::Value) -> Struct {
         let serde_json::Value::Object(object) = value else {
             panic!("expected JSON object");
@@ -4587,6 +4790,119 @@ mod tests {
             reason: "Failed to parse error data".to_string(),
             code,
         })
+    }
+
+    fn expired_watch_error() -> watcher::Error {
+        watcher::Error::WatchError(kube::core::ErrorResponse {
+            status: "Failure".to_string(),
+            message: "too old resource version".to_string(),
+            reason: "Expired".to_string(),
+            code: 410,
+        })
+    }
+
+    #[tokio::test]
+    async fn sandbox_watcher_error_does_not_hide_restarted_recovery_event() {
+        let recovered = DynamicObject {
+            types: None,
+            metadata: ObjectMeta {
+                name: Some("recovered-sandbox".to_string()),
+                ..Default::default()
+            },
+            data: serde_json::json!({}),
+        };
+        let source = futures::stream::iter([
+            Err(expired_watch_error()),
+            Ok(Event::Restarted(vec![recovered])),
+        ]);
+        let mut stream = continue_on_watcher_errors(source, "sandbox-resource");
+
+        let event = stream
+            .next()
+            .await
+            .expect("410 Expired must not terminate the watcher stream");
+        let Event::Restarted(objects) = event else {
+            panic!("expected kube-runtime recovery to emit Restarted");
+        };
+        assert_eq!(objects.len(), 1);
+        assert_eq!(
+            objects[0].metadata.name.as_deref(),
+            Some("recovered-sandbox")
+        );
+        assert!(
+            stream.next().await.is_none(),
+            "source closure must be preserved"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn outward_watch_stream_survives_expired_error_and_backoff_recovery() {
+        let recovered = DynamicObject {
+            types: None,
+            metadata: ObjectMeta {
+                name: Some("recovered-sandbox".to_string()),
+                namespace: Some("recovered-namespace".to_string()),
+                labels: Some(BTreeMap::from([
+                    (LABEL_SANDBOX_ID.to_string(), "sandbox-id".to_string()),
+                    (LABEL_SANDBOX_NAME.to_string(), "sandbox-name".to_string()),
+                    (LABEL_SANDBOX_WORKSPACE.to_string(), "workspace".to_string()),
+                    (
+                        LABEL_MANAGED_BY.to_string(),
+                        LABEL_MANAGED_BY_VALUE.to_string(),
+                    ),
+                ])),
+                ..Default::default()
+            },
+            data: serde_json::json!({}),
+        };
+        let source = futures::stream::iter([
+            Err(expired_watch_error()),
+            Ok(Event::Restarted(vec![recovered])),
+        ])
+        .chain(futures::stream::pending());
+        let sandbox_stream = recovering_watcher_stream(source, "sandbox-resource").boxed();
+        let mut outward = cluster_wide_watch_stream(sandbox_stream, "default".to_string());
+
+        let event = outward
+            .next()
+            .await
+            .expect("outward stream must stay open through recovery")
+            .expect("recoverable watcher error must not reach the outward stream");
+        let Some(watch_sandboxes_event::Payload::Sandbox(event)) = event.payload else {
+            panic!("expected recovered sandbox event");
+        };
+        let sandbox = event.sandbox.expect("sandbox payload must be populated");
+        assert_eq!(sandbox.id, "sandbox-id");
+        assert_eq!(sandbox.namespace, "recovered-namespace");
+
+        let next = outward.next();
+        futures::pin_mut!(next);
+        assert!(
+            futures::poll!(next).is_pending(),
+            "outward stream must remain open after the recovered event"
+        );
+    }
+
+    #[tokio::test]
+    async fn kubernetes_event_watcher_error_does_not_hide_restarted_recovery_event() {
+        let source = futures::stream::iter([
+            Err(expired_watch_error()),
+            Ok(Event::Restarted(vec![KubeEventObj::default()])),
+        ]);
+        let mut stream = continue_on_watcher_errors(source, "kubernetes-event");
+
+        let event = stream
+            .next()
+            .await
+            .expect("410 Expired must not terminate the watcher stream");
+        let Event::Restarted(events) = event else {
+            panic!("expected kube-runtime recovery to emit Restarted");
+        };
+        assert_eq!(events.len(), 1);
+        assert!(
+            stream.next().await.is_none(),
+            "source closure must be preserved"
+        );
     }
 
     #[test]

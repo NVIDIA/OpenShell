@@ -238,9 +238,12 @@ loopback always dial directly; add driver-injected host aliases (e.g.
 proxy cannot reach the container host. `NO_PROXY` matching is port-aware and
 resolution-aware: an entry with a `:port` qualifier only bypasses that port,
 and IP/CIDR entries also match hostnames through their validated resolved
-addresses, with the direct dial limited to the addresses the entry contains. Only `http://` proxy URLs in explicit
-`http://host:port` form are supported — the scheme and port are both
-required, and a path, query, or fragment is rejected. Local DNS resolution
+addresses, with the direct dial limited to the addresses the entry contains. `http://` and `https://` proxy URLs in explicit
+`scheme://host:port` form are supported — the scheme and port are both
+required, and a path, query, or fragment is rejected. For an `https://` proxy
+the supervisor wraps the connection to the proxy in TLS before the CONNECT
+handshake, verifying the proxy certificate against the built-in and system
+roots plus the optional operator CA bundle (see below). Local DNS resolution
 and SSRF validation still run before the proxied dial, and the CONNECT
 target sent to the corporate proxy is a validated resolved address, so the
 proxy performs no DNS resolution of its own and the tunnel stays bound to
@@ -257,15 +260,30 @@ enhancement and out of scope.) The workload child's proxy variables are
 unaffected — they are always rewritten to point at the local policy proxy.
 
 The configuration is fail-closed: a setting that is present but invalid — an
-empty value, an unsupported or malformed proxy URL, an unreadable auth file,
-a malformed credential, or an auth file or `NO_PROXY` list set while no proxy
-URL is configured — is fatal to supervisor startup instead of being treated
-as unset, so a misconfiguration can never silently degrade to direct dialing
-or unauthenticated proxy access. Only an omitted argument means "no proxy".
-The driver validates the same rules at sandbox-create time through
-validators shared with the supervisor
+empty value, an unsupported or malformed proxy URL, an unreadable auth file or
+CA bundle, a malformed credential, or an auth file, `NO_PROXY` list, or CA
+bundle set while no proxy URL is configured — is fatal to supervisor startup
+instead of being treated as unset, so a misconfiguration can never silently
+degrade to direct dialing or unauthenticated proxy access. Only an omitted
+argument means "no proxy". The driver validates the same rules at
+sandbox-create time through validators shared with the supervisor
 (`openshell_core::driver_utils::parse_upstream_proxy_url` and
 `parse_upstream_proxy_credential`).
+
+An optional operator CA bundle (`--upstream-proxy-ca-bundle`, a PEM path the
+driver bind-mounts read-only into the sandbox) extends the trust boundary for
+corporate proxies. A CA certificate is not secret, so unlike the auth file it
+travels as a plain read-only bind mount rather than a driver secret. It is
+trusted in two places: the TLS handshake with an `https://` proxy, and —
+because a TLS-intercepting proxy (mitmproxy, squid `ssl-bump`) re-signs
+tunneled server certificates with the same CA — the sandbox combined trust
+bundle (`write_ca_files`) and the L7 upstream re-encryption store
+(`build_upstream_client_config`). Folding it into both means intercepted
+upstream handshakes succeed and sandbox workload processes trust the re-signed
+certificates; trusting it only for the proxy-listener handshake would leave
+every intercepted upstream connection failing. The bundle is valid with either
+an `http://` or `https://` proxy (an intercepting proxy can be reached over
+plain HTTP) and is fail-closed: an unreadable or certificate-free file is fatal.
 
 Proxy credentials are never embedded in the URL: an inline `user:pass@` is
 rejected because it would be stored in `gateway.toml` and exposed in container
@@ -317,12 +335,29 @@ beginning with `v<digits>_` or `s<64 lowercase hex characters>_` are reserved
 for those placeholder namespaces.
 
 Provider profiles can also declare dynamic token grants. For matching HTTP
-endpoints, the supervisor obtains a SPIFFE JWT-SVID from the local Workload API,
-exchanges it for an OAuth2 access token, caches the token, and injects it as an
-`Authorization: Bearer` header before forwarding the request. Token grant
-endpoints are HTTPS-only except for loopback and Kubernetes service DNS hosts,
-and returned access tokens must be bearer-compatible before they are cached or
-injected. Token caching follows response-derived and profile override TTL rules.
+endpoints, the supervisor obtains or exchanges OAuth2 access tokens, caches
+them, and injects them before forwarding the request. `client_credentials`
+grants use the supervisor SPIFFE JWT-SVID directly as the client assertion.
+`token_exchange` grants ask the gateway to broker an intermediate token using a
+stored provider subject credential and the gateway's own SPIFFE JWT-SVID; the
+supervisor then exchanges that intermediate token for the final upstream token
+using its own JWT-SVID. The gateway validates that its own JWT-SVID has the
+requested audience, a SPIFFE subject, and a non-expired `exp` claim when
+present. It also validates that the stored subject credential is declared by the
+provider profile, and that the supervisor JWT-SVID is a well-formed
+three-segment JWT with a SPIFFE subject in the same trust domain as the gateway
+SVID. The gateway verifies the supervisor JWT-SVID signature with JWT bundles
+fetched from its SPIFFE Workload API. Token grant endpoints are HTTPS-only
+except for loopback and Kubernetes service DNS hosts, and returned access tokens
+must be bearer-compatible before they are cached or injected. Token response
+lifetimes are capped and cached with an expiry margin unless a profile supplies
+an explicit cache TTL override. Cache entries are scoped by the sandbox provider
+environment revision so provider credential updates miss the old token cache
+without changing endpoint matching semantics. Gateway-brokered intermediate
+tokens are cached separately by provider resource version, supervisor SPIFFE
+subject, and gateway SPIFFE subject, and their cache lifetime is capped by the
+intermediate token response, stored subject-token expiry, and supervisor SVID
+expiry.
 
 For AWS endpoints that require request-level signing, the proxy supports SigV4
 re-signing. When `credential_signing: sigv4` is set on an L7 endpoint, the proxy

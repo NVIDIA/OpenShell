@@ -31,6 +31,8 @@ use futures::{Stream, StreamExt};
 #[cfg(unix)]
 use hyper_util::rt::TokioIo;
 use openshell_core::ComputeDriverKind;
+#[cfg(target_os = "windows")]
+use openshell_core::proto::SandboxPolicy;
 use openshell_core::proto::compute::v1::{
     CreateSandboxRequest, DeleteSandboxRequest, DeleteWorkspaceRequest, DeleteWorkspaceResponse,
     DriverCondition, DriverPlatformEvent, DriverResourceRequirements, DriverSandbox,
@@ -50,12 +52,14 @@ use openshell_core::proto::{
 };
 use openshell_core::{ObjectLabels, ObjectWorkspace};
 #[cfg(all(not(target_os = "windows"), feature = "in-tree-compute-drivers"))]
-use openshell_driver_docker::DockerComputeDriver;
+use openshell_driver_docker::{ComputeDriverService as DockerDriverService, DockerComputeDriver};
 #[cfg(all(not(target_os = "windows"), feature = "in-tree-compute-drivers"))]
 use openshell_driver_kubernetes::{
     ComputeDriverService as KubernetesDriverService, KubernetesComputeDriver,
     OperatorNamespaceAllowlist,
 };
+#[cfg(target_os = "windows")]
+use openshell_driver_mxc::{ComputeDriverService as MxcDriverService, MxcComputeConfig};
 #[cfg(all(not(target_os = "windows"), feature = "in-tree-compute-drivers"))]
 use openshell_driver_podman::{ComputeDriverService as PodmanDriverService, PodmanComputeDriver};
 use prost::Message;
@@ -568,6 +572,14 @@ pub struct ComputeRuntime {
     lifecycle_gates: Arc<LifecycleGateRegistry>,
     gateway_listener_requirements: Vec<GatewayListenerRequirement>,
     replica_id: String,
+    /// A1 policy side channel for the in-process MXC driver. `create_sandbox`
+    /// stages the typed `SandboxPolicy` here by sandbox id immediately before
+    /// dispatching to the driver, which consumes it. `None` for all other
+    /// drivers. The proto driver contract has no `policy` field and there is no
+    /// driver-side `GetSandboxConfig`, so this in-process map is how the policy
+    /// reaches the MXC backend without changing the cross-process contract.
+    #[cfg(target_os = "windows")]
+    mxc_policy_sink: Option<Arc<Mutex<HashMap<String, SandboxPolicy>>>>,
 }
 
 impl fmt::Debug for ComputeRuntime {
@@ -686,6 +698,8 @@ impl ComputeRuntime {
             lifecycle_gates: Arc::new(LifecycleGateRegistry::default()),
             gateway_listener_requirements,
             replica_id: lease::replica_id(),
+            #[cfg(target_os = "windows")]
+            mxc_policy_sink: None,
         })
     }
 
@@ -724,11 +738,10 @@ impl ComputeRuntime {
         tracing_log_bus: TracingLogBus,
         supervisor_sessions: Arc<SupervisorSessionRegistry>,
     ) -> Result<Self, ComputeError> {
-        let driver: SharedComputeDriver = Arc::new(
-            DockerComputeDriver::new(&config, &docker_config)
-                .await
-                .map_err(|err| ComputeError::Message(err.to_string()))?,
-        );
+        let driver = DockerComputeDriver::new(&config, &docker_config)
+            .await
+            .map_err(|err| ComputeError::Message(err.to_string()))?;
+        let driver: SharedComputeDriver = Arc::new(DockerDriverService::new_in_process(driver));
         Self::from_driver(
             ComputeDriverKind::Docker.as_str().to_string(),
             driver,
@@ -756,7 +769,7 @@ impl ComputeRuntime {
             .await
             .map_err(|err| ComputeError::Message(err.to_string()))?;
         let operator_allowlist_arc = driver.operator_allowlist().cloned();
-        let driver: SharedComputeDriver = Arc::new(KubernetesDriverService::new(driver));
+        let driver: SharedComputeDriver = Arc::new(KubernetesDriverService::new_in_process(driver));
         let runtime = Self::from_driver(
             ComputeDriverKind::Kubernetes.as_str().to_string(),
             driver,
@@ -817,6 +830,38 @@ impl ComputeRuntime {
             supervisor_sessions,
         )
         .await
+    }
+
+    /// Construct a `ComputeRuntime` backed by the MXC compute driver.
+    ///
+    /// MXC is Windows-only, in-process, and self-reports `Ready` — there is
+    /// no supervisor session argument because no surrogate or relay is used.
+    #[cfg(target_os = "windows")]
+    pub async fn new_mxc(
+        mxc_config: MxcComputeConfig,
+        store: Arc<Store>,
+        sandbox_index: SandboxIndex,
+        sandbox_watch_bus: SandboxWatchBus,
+        tracing_log_bus: TracingLogBus,
+        supervisor_sessions: Arc<SupervisorSessionRegistry>,
+    ) -> Result<Self, ComputeError> {
+        let backend = openshell_driver_mxc::MxcComputeBackend::new(mxc_config);
+        // Grab the A1 policy side channel before moving `backend` into the service.
+        let sink = backend.policy_sink();
+        let service: SharedComputeDriver = Arc::new(MxcDriverService::new(backend));
+        let mut runtime = Self::from_driver(
+            ComputeDriverKind::Mxc.as_str().to_string(),
+            service,
+            None,
+            store,
+            sandbox_index,
+            sandbox_watch_bus,
+            tracing_log_bus,
+            supervisor_sessions,
+        )
+        .await?;
+        runtime.mxc_policy_sink = Some(sink);
+        Ok(runtime)
     }
 
     #[must_use]
@@ -943,6 +988,16 @@ impl ComputeRuntime {
             && let Some(spec) = driver_sandbox.spec.as_mut()
         {
             spec.sandbox_token = token;
+        }
+        // A1: stage the typed SandboxPolicy out-of-band into the MXC backend's
+        // side channel, keyed by sandbox id (== DriverSandbox.id), immediately
+        // before dispatch. The driver removes/consumes it in create_sandbox. The
+        // proto driver contract has no policy field, so this is the only path.
+        #[cfg(target_os = "windows")]
+        if let Some(sink) = &self.mxc_policy_sink
+            && let Some(p) = sandbox.spec.as_ref().and_then(|s| s.policy.clone())
+        {
+            sink.lock().await.insert(sandbox_id.clone(), p);
         }
         match self
             .driver
@@ -4080,10 +4135,24 @@ fn derive_phase(status: Option<&DriverSandboxStatus>) -> SandboxPhase {
             return SandboxPhase::Deleting;
         }
 
-        if status.conditions.iter().any(|condition| {
-            condition.r#type.eq_ignore_ascii_case("Suspended")
+        // `Ready=True` means the sandbox is usable through this gateway and must
+        // win over a `Suspended=True` condition. Agent Sandbox v1beta1 sets
+        // `Suspended=True (PodTerminated)` on stop and does not clear it on resume,
+        // so a resumed CR carries both `Ready=True` and a stale `Suspended=True`.
+        // Treating any `Suspended=True` as Stopped would pin the resumed sandbox at
+        // Starting forever (issue #2932). A genuine stop leaves `Ready` unset or
+        // False, so `Suspended` still resolves to Stopped in that case.
+        let ready = status.conditions.iter().any(|condition| {
+            condition.r#type.eq_ignore_ascii_case("Ready")
                 && condition.status.eq_ignore_ascii_case("true")
-        }) {
+        });
+
+        if !ready
+            && status.conditions.iter().any(|condition| {
+                condition.r#type.eq_ignore_ascii_case("Suspended")
+                    && condition.status.eq_ignore_ascii_case("true")
+            })
+        {
             return SandboxPhase::Stopped;
         }
 
@@ -4344,6 +4413,8 @@ pub async fn new_test_runtime_with_driver(
         lifecycle_gates: Arc::new(LifecycleGateRegistry::default()),
         gateway_listener_requirements: Vec::new(),
         replica_id: "test-replica".to_string(),
+        #[cfg(target_os = "windows")]
+        mxc_policy_sink: None,
     }
 }
 
@@ -5028,6 +5099,8 @@ mod tests {
             lifecycle_gates: Arc::new(LifecycleGateRegistry::default()),
             gateway_listener_requirements: Vec::new(),
             replica_id: "test-replica".to_string(),
+            #[cfg(target_os = "windows")]
+            mxc_policy_sink: None,
         }
     }
 
@@ -6707,6 +6780,56 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(current.phase(), SandboxPhase::Stopped as i32);
+    }
+
+    #[tokio::test]
+    async fn resumed_v1beta1_snapshot_with_stale_suspended_reaches_ready() {
+        // Reproduces issue #2932: on Agent Sandbox v1beta1 a resumed CR reports
+        // Ready=True (DependenciesReady) alongside a stale Suspended=True
+        // (PodTerminated). Starting from the Starting phase that `start` sets, the
+        // reconciled sandbox must advance to Ready rather than being pinned at
+        // Starting by the stale Suspended condition.
+        let runtime = test_runtime(Arc::new(TestDriver::default())).await;
+        let sandbox = sandbox_record("sb-resumed", "sandbox-resumed", SandboxPhase::Starting);
+        runtime.store.put_message(&sandbox).await.unwrap();
+        register_test_supervisor_session(&runtime, sandbox.object_id());
+
+        let mut resumed = ready_driver_sandbox(sandbox.object_id(), sandbox.object_name());
+        resumed.status = Some(DriverSandboxStatus {
+            sandbox_name: sandbox.object_name().to_string(),
+            instance_id: format!("{}-pod", sandbox.object_name()),
+            conditions: vec![
+                DriverCondition {
+                    r#type: "Ready".to_string(),
+                    status: "True".to_string(),
+                    reason: "DependenciesReady".to_string(),
+                    message: "Sandbox is ready".to_string(),
+                    last_transition_time: String::new(),
+                },
+                DriverCondition {
+                    r#type: "Suspended".to_string(),
+                    status: "True".to_string(),
+                    reason: "PodTerminated".to_string(),
+                    message: "Pod terminated".to_string(),
+                    last_transition_time: String::new(),
+                },
+            ],
+            ..Default::default()
+        });
+
+        runtime.apply_sandbox_update(resumed).await.unwrap();
+
+        let current = runtime
+            .store
+            .get_message::<Sandbox>(sandbox.object_id())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            current.phase(),
+            SandboxPhase::Ready as i32,
+            "a resumed, Ready sandbox must not stay Starting because of a stale Suspended condition"
+        );
     }
 
     #[tokio::test]

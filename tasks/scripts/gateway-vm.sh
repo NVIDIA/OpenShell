@@ -11,7 +11,7 @@
 #
 # Defaults:
 # - Plaintext HTTP on 127.0.0.1:18081
-# - Dedicated CLI gateway "vm-dev"
+# - Gateway installation and CLI registration name "vm-dev"
 # - Persistent gateway state (SQLite DB) under .cache/gateway-vm
 # - Per-sandbox VM driver state (rootfs + compute-driver.sock) under
 #   /tmp/openshell-vm-driver-<user>-<gateway-name> so the AF_UNIX socket
@@ -81,6 +81,21 @@ port_is_in_use() {
     return $?
   fi
   (echo >/dev/tcp/127.0.0.1/"${port}") >/dev/null 2>&1
+}
+
+append_local_otlp_config_if_available() {
+  local config_path=$1
+  if ! port_is_in_use 4317; then
+    echo "OTLP collector not detected on 127.0.0.1:4317; trace export disabled."
+    return
+  fi
+
+  cat >>"${config_path}" <<'EOF'
+
+[openshell.gateway.otlp]
+endpoint = "http://127.0.0.1:4317"
+EOF
+  echo "OTLP trace export enabled for http://127.0.0.1:4317."
 }
 
 invoking_user() {
@@ -324,6 +339,7 @@ cat >"${CONFIG_PATH}" <<EOF
 version = 1
 
 [openshell.gateway]
+name = "${GATEWAY_NAME}"
 compute_drivers = ["vm"]
 disable_tls = ${DISABLE_TLS}
 
@@ -344,6 +360,8 @@ grpc_endpoint = "${GRPC_ENDPOINT}"
 driver_dir = "${DRIVER_DIR}"
 state_dir = "${VM_DRIVER_STATE_DIR}"
 EOF
+
+append_local_otlp_config_if_available "${CONFIG_PATH}"
 
 GATEWAY_ENDPOINT="http://127.0.0.1:${PORT}"
 register_gateway_metadata "${GATEWAY_NAME}" "${GATEWAY_ENDPOINT}" "${PORT}" "${VM_DRIVER_STATE_DIR}"

@@ -158,6 +158,30 @@ checksum = "sha256:675804464634cf068dc206e9fafc1bd4557ffcc0b1638a1ff246d899b776f
 url = "https://github.com/rust-cross/cargo-zigbuild/releases/download/v0.22.3/cargo-zigbuild-x86_64-pc-windows-msvc.zip"
 url_api = "https://api.github.com/repos/rust-cross/cargo-zigbuild/releases/assets/405676944"
 
+[[tools."github:rust-secure-code/cargo-auditable"]]
+version = "0.7.5"
+backend = "github:rust-secure-code/cargo-auditable"
+
+[tools."github:rust-secure-code/cargo-auditable"."platforms.linux-arm64"]
+checksum = "sha256:6d364879b516fa914f98504e551faddedf35b71543b4331a6d26e4e217778cfa"
+url = "https://github.com/rust-secure-code/cargo-auditable/releases/download/v0.7.5/cargo-auditable-aarch64-unknown-linux-gnu.tar.xz"
+url_api = "https://api.github.com/repos/rust-secure-code/cargo-auditable/releases/assets/426566627"
+
+[tools."github:rust-secure-code/cargo-auditable"."platforms.linux-x64"]
+checksum = "sha256:322eda09f24e5dba97371c6c2c6949569c411ddf893852e88135cc5b51d5a719"
+url = "https://github.com/rust-secure-code/cargo-auditable/releases/download/v0.7.5/cargo-auditable-x86_64-unknown-linux-gnu.tar.xz"
+url_api = "https://api.github.com/repos/rust-secure-code/cargo-auditable/releases/assets/426566663"
+
+[tools."github:rust-secure-code/cargo-auditable"."platforms.macos-arm64"]
+checksum = "sha256:92720fff2be27492ca7b216510a27e88a835b526e9e94e46bc36b502ba17d8f0"
+url = "https://github.com/rust-secure-code/cargo-auditable/releases/download/v0.7.5/cargo-auditable-aarch64-apple-darwin.tar.xz"
+url_api = "https://api.github.com/repos/rust-secure-code/cargo-auditable/releases/assets/426566625"
+
+[tools."github:rust-secure-code/cargo-auditable"."platforms.windows-x64"]
+checksum = "sha256:83a7d5955c7ac96ede5d896ac9ede5f7ecce9ece0e95d9e47acd766b09e2ef1b"
+url = "https://github.com/rust-secure-code/cargo-auditable/releases/download/v0.7.5/cargo-auditable-x86_64-pc-windows-msvc.zip"
+url_api = "https://api.github.com/repos/rust-secure-code/cargo-auditable/releases/assets/426566657"
+
 [[tools.go]]
 version = "1.26.5"
 backend = "core:go"

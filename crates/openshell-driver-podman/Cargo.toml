@@ -43,7 +43,7 @@ miette = { workspace = true }
 url = { workspace = true }
 
 [dev-dependencies]
-opentelemetry-proto = { version = "0.32", default-features = false, features = ["gen-tonic", "trace"] }
+openshell-otel-test-support = { path = "../openshell-otel-test-support" }
 opentelemetry_sdk = { workspace = true, features = ["testing"] }
 prost-types = { workspace = true }
 temp-env = "0.3"

@@ -315,6 +315,23 @@ mod tests {
     use openshell_core::net::set_tcp_nodelay_best_effort;
     use tokio::net::TcpListener;
 
+    async fn bind_dns_test_server() -> (UdpSocket, TcpListener, SocketAddr) {
+        const MAX_BIND_ATTEMPTS: usize = 100;
+
+        for _ in 0..MAX_BIND_ATTEMPTS {
+            // Port zero only guarantees availability for the protocol being bound.
+            let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let server = tcp.local_addr().unwrap();
+            match UdpSocket::bind(server).await {
+                Ok(udp) => return (udp, tcp, server),
+                Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {}
+                Err(error) => panic!("failed to bind DNS test UDP socket: {error}"),
+            }
+        }
+
+        panic!("failed to bind DNS test TCP and UDP sockets to the same port");
+    }
+
     #[test]
     fn resolver_address_deduplication_preserves_answer_order() {
         let mut addresses = vec![
@@ -383,9 +400,7 @@ mod tests {
 
     #[tokio::test]
     async fn truncated_udp_retries_over_tcp_and_follows_cname() {
-        let udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let server = udp.local_addr().unwrap();
-        let tcp = TcpListener::bind(server).await.unwrap();
+        let (udp, tcp, server) = bind_dns_test_server().await;
 
         let udp_task = tokio::spawn(async move {
             let mut wire = [0_u8; MAX_DNS_MESSAGE_BYTES];

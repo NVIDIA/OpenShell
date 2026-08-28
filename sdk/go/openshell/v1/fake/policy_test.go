@@ -24,7 +24,7 @@ func TestFakePolicy_GetDraft_ReturnsUnimplemented(t *testing.T) {
 
 func TestFakePolicy_ApproveDraftChunk_ReturnsUnimplemented(t *testing.T) {
 	c := newFakePolicyClient(func() bool { return false })
-	_, err := c.ApproveDraftChunk(context.Background(), "default", "sb-1", "chunk-1")
+	_, err := c.ApproveDraftChunk(context.Background(), "default", "sb-1", "chunk-1", "token-1")
 	require.Error(t, err)
 	assert.True(t, types.IsUnimplemented(err))
 }
@@ -279,7 +279,7 @@ func TestFakePolicy_GetDraft_ClosedReturnsUnavailable(t *testing.T) {
 
 func TestFakePolicy_ApproveDraftChunk_ClosedReturnsUnavailable(t *testing.T) {
 	c := newFakePolicyClient(func() bool { return true })
-	_, err := c.ApproveDraftChunk(context.Background(), "default", "sb-1", "chunk-1")
+	_, err := c.ApproveDraftChunk(context.Background(), "default", "sb-1", "chunk-1", "token-1")
 	require.Error(t, err)
 	assert.True(t, types.IsUnavailable(err))
 }

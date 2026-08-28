@@ -12,6 +12,8 @@ use crate::process::{
     drop_privileges_with_identity, is_supervisor_only_env_var, session_user_and_home,
 };
 use crate::sandbox;
+#[cfg(unix)]
+use libc;
 use miette::{IntoDiagnostic, Result};
 use nix::pty::{Winsize, openpty};
 use nix::unistd::setsid;
@@ -151,44 +153,186 @@ pub async fn run_ssh_server(
         }
     };
 
-    loop {
-        let (stream, _peer) = listener.accept().await.into_diagnostic()?;
-        let config = config.clone();
-        let policy = policy.clone();
-        let workspace = workspace.clone();
-        let proxy_url = proxy_url.clone();
-        let ca_paths = ca_paths.clone();
-        let provider_credentials = provider_credentials.clone();
-        let user_environment = user_environment.clone();
-        let main_session = Arc::clone(&main_session);
+    let mut consecutive_resource_errors: u32 = 0;
+    let mut consecutive_unknown_errors: u32 = 0;
 
-        tokio::spawn(async move {
-            if let Err(err) = handle_connection(
-                stream,
-                config,
-                policy,
-                workspace,
-                netns_fd,
-                proxy_url,
-                ca_paths,
-                provider_credentials,
-                user_environment,
-                resolved_identity,
-                enforcement_mode,
-                main_session,
-            )
-            .await
-            {
-                ocsf_emit!(
-                    SshActivityBuilder::new(openshell_ocsf::ctx::ctx())
-                        .activity(ActivityId::Fail)
-                        .severity(SeverityId::Low)
-                        .status(StatusId::Failure)
-                        .message(format!("SSH connection failed: {err}"))
-                        .build()
-                );
+    loop {
+        match listener.accept().await {
+            Ok((stream, _peer)) => {
+                consecutive_resource_errors = 0;
+                consecutive_unknown_errors = 0;
+                let config = config.clone();
+                let policy = policy.clone();
+                let workspace = workspace.clone();
+                let proxy_url = proxy_url.clone();
+                let ca_paths = ca_paths.clone();
+                let provider_credentials = provider_credentials.clone();
+                let user_environment = user_environment.clone();
+                let main_session = Arc::clone(&main_session);
+
+                tokio::spawn(async move {
+                    if let Err(err) = handle_connection(
+                        stream,
+                        config,
+                        policy,
+                        workspace,
+                        netns_fd,
+                        proxy_url,
+                        ca_paths,
+                        provider_credentials,
+                        user_environment,
+                        resolved_identity,
+                        enforcement_mode,
+                        main_session,
+                    )
+                    .await
+                    {
+                        ocsf_emit!(
+                            SshActivityBuilder::new(openshell_ocsf::ctx::ctx())
+                                .activity(ActivityId::Fail)
+                                .severity(SeverityId::Low)
+                                .status(StatusId::Failure)
+                                .message(format!("SSH connection failed: {err}"))
+                                .build()
+                        );
+                    }
+                });
             }
-        });
+            Err(err) => {
+                match classify_ssh_accept_error(
+                    &err,
+                    &mut consecutive_resource_errors,
+                    &mut consecutive_unknown_errors,
+                ) {
+                    SshAcceptAction::Terminal => {
+                        ocsf_emit!(
+                            SshActivityBuilder::new(openshell_ocsf::ctx::ctx())
+                                .activity(ActivityId::Fail)
+                                .severity(SeverityId::High)
+                                .status(StatusId::Failure)
+                                .message(format!(
+                                    "SSH accept loop exiting on terminal error: {err}"
+                                ))
+                                .build()
+                        );
+                        break;
+                    }
+                    SshAcceptAction::Retry { backoff, severity } => {
+                        ocsf_emit!(
+                            SshActivityBuilder::new(openshell_ocsf::ctx::ctx())
+                                .activity(ActivityId::Fail)
+                                .severity(severity)
+                                .status(StatusId::Failure)
+                                .message(format!(
+                                    "SSH accept error (retrying in {}ms): {err}",
+                                    backoff.as_millis(),
+                                ))
+                                .build()
+                        );
+                        tokio::time::sleep(backoff).await;
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+const MAX_CONSECUTIVE_UNKNOWN_SSH_ACCEPT_ERRORS: u32 = 10;
+
+#[derive(Debug, PartialEq)]
+enum SshAcceptAction {
+    Terminal,
+    Retry {
+        backoff: Duration,
+        severity: SeverityId,
+    },
+}
+
+fn classify_ssh_accept_error(
+    err: &std::io::Error,
+    consecutive_resource_errors: &mut u32,
+    consecutive_unknown_errors: &mut u32,
+) -> SshAcceptAction {
+    #[cfg(unix)]
+    if matches!(
+        err.raw_os_error(),
+        Some(libc::EBADF | libc::EINVAL | libc::ENOTSOCK)
+    ) {
+        return SshAcceptAction::Terminal;
+    }
+
+    #[cfg(unix)]
+    if matches!(
+        err.raw_os_error(),
+        Some(
+            libc::EMFILE
+                | libc::ENFILE
+                | libc::ENOBUFS
+                | libc::ENOMEM
+                | libc::ECONNABORTED
+                | libc::ECONNRESET
+                | libc::EINTR
+                | libc::ENETDOWN
+                | libc::EPROTO
+                | libc::ENOPROTOOPT
+                | libc::EHOSTDOWN
+                | libc::EHOSTUNREACH
+                | libc::EOPNOTSUPP
+                | libc::ENETUNREACH
+                | libc::ENOSR
+                | libc::ESOCKTNOSUPPORT
+                | libc::EPROTONOSUPPORT
+                | libc::ETIMEDOUT
+        )
+    ) {
+        *consecutive_unknown_errors = 0;
+
+        #[cfg(unix)]
+        let is_resource_pressure = matches!(
+            err.raw_os_error(),
+            Some(libc::EMFILE | libc::ENFILE | libc::ENOBUFS | libc::ENOMEM | libc::ENOSR)
+        );
+        #[cfg(not(unix))]
+        let is_resource_pressure = false;
+
+        if is_resource_pressure {
+            *consecutive_resource_errors = consecutive_resource_errors.saturating_add(1);
+            let backoff_ms = 100u64
+                .saturating_mul(1u64 << (*consecutive_resource_errors).min(7).saturating_sub(1))
+                .min(5_000);
+            return SshAcceptAction::Retry {
+                backoff: Duration::from_millis(backoff_ms),
+                severity: SeverityId::Medium,
+            };
+        }
+
+        *consecutive_resource_errors = 0;
+        return SshAcceptAction::Retry {
+            backoff: Duration::from_millis(100),
+            severity: SeverityId::Low,
+        };
+    }
+
+    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
+    if matches!(err.raw_os_error(), Some(libc::ENONET)) {
+        *consecutive_unknown_errors = 0;
+        *consecutive_resource_errors = 0;
+        return SshAcceptAction::Retry {
+            backoff: Duration::from_millis(100),
+            severity: SeverityId::Low,
+        };
+    }
+
+    *consecutive_unknown_errors = consecutive_unknown_errors.saturating_add(1);
+    if *consecutive_unknown_errors >= MAX_CONSECUTIVE_UNKNOWN_SSH_ACCEPT_ERRORS {
+        return SshAcceptAction::Terminal;
+    }
+    SshAcceptAction::Retry {
+        backoff: Duration::from_millis(100),
+        severity: SeverityId::Low,
     }
 }
 
@@ -1157,9 +1301,12 @@ fn spawn_pty_shell(
             enforcement_mode,
             #[cfg(target_os = "linux")]
             prepared_sandbox,
-        )?;
+        );
     }
 
+    #[cfg(target_os = "linux")]
+    let mut child = crate::process::spawn_std_command_with_supervisor_identity_namespace(cmd)?;
+    #[cfg(not(target_os = "linux"))]
     let mut child = cmd.spawn()?;
     #[cfg(target_os = "linux")]
     let child_pid = child.id();
@@ -1312,9 +1459,12 @@ fn spawn_pipe_exec(
             enforcement_mode,
             #[cfg(target_os = "linux")]
             prepared_sandbox,
-        )?;
+        );
     }
 
+    #[cfg(target_os = "linux")]
+    let mut child = crate::process::spawn_std_command_with_supervisor_identity_namespace(cmd)?;
+    #[cfg(not(target_os = "linux"))]
     let mut child = cmd.spawn()?;
     #[cfg(target_os = "linux")]
     let child_pid = child.id();
@@ -1455,19 +1605,11 @@ mod unsafe_pty {
         resolved_identity: ResolvedProcessIdentity,
         enforcement_mode: ProcessEnforcementMode,
         #[cfg(target_os = "linux")] prepared: Option<crate::sandbox::linux::PreparedSandbox>,
-    ) -> anyhow::Result<()> {
+    ) {
         // Wrap in Option so we can .take() it out of the FnMut closure.
         // pre_exec is only called once (after fork, before exec).
         #[cfg(target_os = "linux")]
         let mut prepared = prepared;
-        #[cfg(target_os = "linux")]
-        let supervisor_identity_mount = if enforcement_mode.uses_privileged_process_setup() {
-            crate::process::supervisor_identity_mount_from_env().map_err(|err| {
-                anyhow::anyhow!("failed to prepare supervisor identity isolation: {err}")
-            })?
-        } else {
-            None
-        };
         unsafe {
             cmd.pre_exec(move || {
                 setsid().map_err(|err| std::io::Error::other(err.to_string()))?;
@@ -1479,13 +1621,10 @@ mod unsafe_pty {
                     resolved_identity,
                     enforcement_mode,
                     #[cfg(target_os = "linux")]
-                    supervisor_identity_mount,
-                    #[cfg(target_os = "linux")]
                     prepared.take(),
                 )
             });
         }
-        Ok(())
     }
 
     /// Pre-exec hook for pipe-based (non-PTY) exec.
@@ -1507,17 +1646,9 @@ mod unsafe_pty {
         resolved_identity: ResolvedProcessIdentity,
         enforcement_mode: ProcessEnforcementMode,
         #[cfg(target_os = "linux")] prepared: Option<crate::sandbox::linux::PreparedSandbox>,
-    ) -> anyhow::Result<()> {
+    ) {
         #[cfg(target_os = "linux")]
         let mut prepared = prepared;
-        #[cfg(target_os = "linux")]
-        let supervisor_identity_mount = if enforcement_mode.uses_privileged_process_setup() {
-            crate::process::supervisor_identity_mount_from_env().map_err(|err| {
-                anyhow::anyhow!("failed to prepare supervisor identity isolation: {err}")
-            })?
-        } else {
-            None
-        };
         unsafe {
             cmd.pre_exec(move || {
                 enter_netns_and_sandbox(
@@ -1526,13 +1657,10 @@ mod unsafe_pty {
                     resolved_identity,
                     enforcement_mode,
                     #[cfg(target_os = "linux")]
-                    supervisor_identity_mount,
-                    #[cfg(target_os = "linux")]
                     prepared.take(),
                 )
             });
         }
-        Ok(())
     }
 
     fn enter_netns_and_sandbox(
@@ -1540,9 +1668,6 @@ mod unsafe_pty {
         policy: &SandboxPolicy,
         resolved_identity: ResolvedProcessIdentity,
         enforcement_mode: ProcessEnforcementMode,
-        #[cfg(target_os = "linux")] supervisor_identity_mount: Option<
-            &crate::process::SupervisorIdentityMountNamespace,
-        >,
         #[cfg(target_os = "linux")] prepared: Option<crate::sandbox::linux::PreparedSandbox>,
     ) -> std::io::Result<()> {
         // Enter network namespace before dropping privileges.
@@ -1560,11 +1685,6 @@ mod unsafe_pty {
 
         #[cfg(not(target_os = "linux"))]
         let _ = netns_fd;
-
-        #[cfg(target_os = "linux")]
-        if let Some(mount) = supervisor_identity_mount {
-            mount.enter_for_child()?;
-        }
 
         // Drop privileges. initgroups/setgid/setuid need /etc/group and
         // /etc/passwd which would be blocked if Landlock were already enforced.
@@ -2216,8 +2336,7 @@ mod tests {
                 )
                 .expect("prepare should succeed in test environment"),
             ),
-        )
-        .expect("install pre_exec should succeed");
+        );
 
         let output = cmd
             .spawn()
@@ -2272,8 +2391,7 @@ mod tests {
             ProcessEnforcementMode::Full,
             #[cfg(target_os = "linux")]
             None,
-        )
-        .expect("install pre_exec should succeed");
+        );
 
         let output = cmd
             .spawn()

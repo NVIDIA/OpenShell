@@ -16,7 +16,12 @@ import (
 	"time"
 )
 
-var oidcHTTPClient = &http.Client{Timeout: 30 * time.Second}
+var oidcHTTPClient = &http.Client{
+	Timeout: 30 * time.Second,
+	CheckRedirect: func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	},
+}
 
 // providerConfig holds parsed fields from an OIDC discovery document
 // (.well-known/openid-configuration).
@@ -115,9 +120,12 @@ func fetchDiscovery(ctx context.Context, issuer string) (*providerConfig, error)
 	}
 
 	const maxResponseBytes = 1 << 20
-	body, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes))
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes+1))
 	if err != nil {
 		return nil, fmt.Errorf("%w: failed to read discovery response: %v", ErrDiscovery, err)
+	}
+	if len(body) > maxResponseBytes {
+		return nil, fmt.Errorf("%w: discovery response is too large", ErrDiscovery)
 	}
 
 	var cfg providerConfig
@@ -125,7 +133,7 @@ func fetchDiscovery(ctx context.Context, issuer string) (*providerConfig, error)
 		return nil, fmt.Errorf("%w: invalid discovery JSON: %v", ErrDiscovery, err)
 	}
 	if normalizeIssuer(cfg.Issuer) != normalizeIssuer(issuer) {
-		return nil, fmt.Errorf("%w: discovery issuer %q does not match configured issuer %q", ErrDiscovery, cfg.Issuer, issuer)
+		return nil, fmt.Errorf("%w: discovery issuer does not match configured issuer", ErrDiscovery)
 	}
 
 	if cfg.TokenEndpoint == "" {

@@ -70,6 +70,7 @@ pub async fn run_process(
     openshell_endpoint: Option<&str>,
     ssh_socket_path: Option<String>,
     shared_ssh_socket: bool,
+    ssh_exit_tx: Option<tokio::sync::oneshot::Sender<()>>,
     policy: &SandboxPolicy,
     resolved_process_identity: ResolvedProcessIdentity,
     enforcement_mode: ProcessEnforcementMode,
@@ -120,10 +121,18 @@ pub async fn run_process(
     // the flag stays at its default (false) and no skill is installed.
     install_initial_agent_skill(sandbox_id, openshell_endpoint, &agent_proposals).await;
 
+    // Provider token grants may mount supervisor-only identity sockets such as
+    // the SPIFFE Workload API. Prepare the child mount namespace that hides
+    // those mounts before supervisor seccomp hardening removes the needed
+    // namespace syscalls.
+    #[cfg(target_os = "linux")]
+    crate::process::prepare_supervisor_identity_mount_namespace_from_env()?;
+
     // Install the supervisor seccomp prelude before spawning any workload-side
     // tasks. By this point the orchestrator has finished privileged startup
-    // helpers (network namespace setup, nftables probes via run_networking),
-    // and the SSH listener and entrypoint child have not been exposed yet.
+    // helpers (network namespace setup, identity mount namespace setup,
+    // nftables probes via run_networking), and the SSH listener and entrypoint
+    // child have not been exposed yet.
     crate::sandbox::apply_supervisor_startup_hardening()?;
 
     // Spawn the bypass detection monitor. It tails dmesg for nftables LOG
@@ -287,6 +296,7 @@ pub async fn run_process(
         let (ssh_ready_tx, ssh_ready_rx) = tokio::sync::oneshot::channel();
 
         tokio::spawn(async move {
+            let _ssh_exit_guard = ssh_exit_tx;
             if let Err(err) = crate::ssh::run_ssh_server(
                 listen_path,
                 ssh_ready_tx,

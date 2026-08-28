@@ -640,9 +640,15 @@ if [ "${OPENSHELL_E2E_KUBE_BUILD_IMAGES}" = "1" ]; then
       echo "ERROR: external Kubernetes driver image composition currently requires a Linux build host." >&2
       exit 2
     fi
-    cargo build -p openshell-server --bin openshell-gateway \
-      --no-default-features --features telemetry,bundled-z3
-    cargo build -p openshell-driver-kubernetes --bin openshell-driver-kubernetes
+    external_gateway="${OPENSHELL_GATEWAY_BIN:-${ROOT}/target/debug/openshell-gateway}"
+    external_driver="${OPENSHELL_EXTERNAL_DRIVER_BIN:-${ROOT}/target/debug/openshell-driver-kubernetes}"
+    if [ -z "${OPENSHELL_GATEWAY_BIN:-}" ]; then
+      cargo build -p openshell-server --bin openshell-gateway \
+        --no-default-features --features bundled-z3
+    fi
+    if [ -z "${OPENSHELL_EXTERNAL_DRIVER_BIN:-}" ]; then
+      cargo build -p openshell-driver-kubernetes --bin openshell-driver-kubernetes
+    fi
     case "$(uname -m)" in
       x86_64) external_arch=amd64 ;;
       aarch64|arm64) external_arch=arm64 ;;
@@ -650,9 +656,8 @@ if [ "${OPENSHELL_E2E_KUBE_BUILD_IMAGES}" = "1" ]; then
     esac
     external_stage="${ROOT}/deploy/docker/.build/prebuilt-binaries/${external_arch}"
     mkdir -p "${external_stage}"
-    cp "${ROOT}/target/debug/openshell-gateway" "${external_stage}/openshell-gateway"
-    cp "${ROOT}/target/debug/openshell-driver-kubernetes" \
-      "${external_stage}/openshell-driver-kubernetes"
+    cp "${external_gateway}" "${external_stage}/openshell-gateway"
+    cp "${external_driver}" "${external_stage}/openshell-driver-kubernetes"
     docker build \
       --build-arg "TARGETARCH=${external_arch}" \
       --build-arg "SUPERVISOR_IMAGE=${REGISTRY_VALUE}/supervisor:${IMAGE_TAG_VALUE}" \

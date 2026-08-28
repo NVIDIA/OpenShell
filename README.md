@@ -33,13 +33,13 @@ OpenShell is built agent-first. The project ships with agent skills for everythi
 curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install.sh | sh
 ```
 
-**From PyPI (requires [uv](https://docs.astral.sh/uv/)):**
+The installer installs the latest stable release by default. To install a specific version, set `OPENSHELL_VERSION`. A [`dev` release](https://github.com/NVIDIA/OpenShell/releases/tag/dev) is also available that tracks the latest commit on `main`.
+
+The `openshell` package on PyPI provides the Python SDK only. It does not install the `openshell` CLI. Add the SDK to a Python project with [uv](https://docs.astral.sh/uv/):
 
 ```bash
-uv tool install -U openshell
+uv add openshell
 ```
-
-Both methods install the latest stable release by default. To install a specific version, set `OPENSHELL_VERSION` (binary) or pin the version with `uv tool install openshell==<version>`. A [`dev` release](https://github.com/NVIDIA/OpenShell/releases/tag/dev) is also available that tracks the latest commit on `main`.
 
 **Helm chart:**
 
