@@ -808,6 +808,8 @@ fn create_sandbox_request(spec: SandboxSpec) -> proto::CreateSandboxRequest {
     });
     let resource_requirements = gpu.then_some(proto::ResourceRequirements {
         gpu: Some(proto::GpuResourceRequirements { count: None }),
+        cpu: None,
+        memory: None,
     });
     proto::CreateSandboxRequest {
         spec: Some(proto::SandboxSpec {

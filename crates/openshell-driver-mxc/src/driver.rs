@@ -319,6 +319,17 @@ impl MxcComputeBackend {
                     "mxc driver does not support GPU sandboxes",
                 ));
             }
+            if spec
+                .resource_requirements
+                .as_ref()
+                .is_some_and(|requirements| {
+                    requirements.cpu.is_some() || requirements.memory.is_some()
+                })
+            {
+                return Err(tonic::Status::failed_precondition(
+                    "mxc driver does not support spec.resource_requirements.cpu or spec.resource_requirements.memory",
+                ));
+            }
             if let Some(tmpl) = &spec.template
                 && !tmpl.agent_socket_path.is_empty()
             {

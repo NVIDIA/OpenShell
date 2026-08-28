@@ -157,6 +157,10 @@ message DriverSandboxSpec {
 message ResourceRequirements {
   // GPU requirements for the sandbox. Presence indicates a GPU request.
   GpuResourceRequirements gpu = 1;
+  // CPU requirements for the sandbox workload.
+  CpuResourceRequirements cpu = 2;
+  // Memory requirements for the sandbox workload.
+  MemoryResourceRequirements memory = 3;
 }
 
 // Driver GPU resource requirements.
@@ -164,6 +168,18 @@ message GpuResourceRequirements {
   // Optional number of GPUs requested. When omitted, the request is for one
   // GPU using the selected driver's default assignment behavior.
   optional uint32 count = 1;
+}
+
+// Driver CPU resource requirements.
+message CpuResourceRequirements {
+  // CPU limit for the sandbox workload (e.g. "500m", "2").
+  string limit = 1;
+}
+
+// Driver memory resource requirements.
+message MemoryResourceRequirements {
+  // Memory limit for the sandbox workload (e.g. "512Mi", "4Gi").
+  string limit = 1;
 }
 
 // Driver-owned runtime template consumed by the compute platform.
@@ -182,8 +198,6 @@ message DriverSandboxTemplate {
   map<string, string> labels = 4;
   // Additional environment variables injected into the sandbox runtime.
   map<string, string> environment = 6;
-  // Typed compute-resource requirements for the sandbox workload.
-  DriverResourceRequirements resources = 10;
   // Opaque, platform-specific configuration passed through to the driver.
   // The gateway does not inspect this; each driver defines its own schema.
   // For the Kubernetes driver this carries fields such as runtimeClassName,
@@ -193,22 +207,8 @@ message DriverSandboxTemplate {
   // This is the inner block selected from public SandboxTemplate.driver_config.
   // The selected driver owns nested schema validation.
   google.protobuf.Struct driver_config = 12;
-}
-
-// Typed compute-resource requirements.
-//
-// Values use Kubernetes-style quantity strings (e.g. "500m", "2", "4Gi")
-// because they are a well-known, widely-adopted notation. Drivers for
-// non-Kubernetes platforms must parse these strings into their native units.
-message DriverResourceRequirements {
-  // Minimum CPU cores requested (e.g. "500m", "2").
-  string cpu_request = 1;
-  // Maximum CPU cores allowed (e.g. "500m", "4").
-  string cpu_limit = 2;
-  // Minimum memory requested (e.g. "256Mi", "4Gi").
-  string memory_request = 3;
-  // Maximum memory allowed (e.g. "512Mi", "8Gi").
-  string memory_limit = 4;
+  reserved 10;
+  reserved "resources";
 }
 
 // Raw status observed directly from the compute platform.

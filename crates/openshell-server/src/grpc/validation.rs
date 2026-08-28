@@ -195,8 +195,8 @@ pub(super) fn validate_sandbox_spec(
         validate_env_entries(&tmpl.environment, "spec.template.environment")?;
     }
 
-    // --- spec.resource_requirements.gpu ---
-    validate_gpu_request_fields(spec)?;
+    // --- spec.resource_requirements ---
+    validate_resource_requirement_fields(spec)?;
 
     if !spec.command.is_empty() {
         validate_main_process_command(&spec.command)?;
@@ -244,11 +244,105 @@ fn validate_main_process_command(command: &[String]) -> Result<(), Status> {
     Ok(())
 }
 
-fn validate_gpu_request_fields(spec: &openshell_core::proto::SandboxSpec) -> Result<(), Status> {
+fn validate_resource_requirement_fields(
+    spec: &openshell_core::proto::SandboxSpec,
+) -> Result<(), Status> {
     if openshell_core::gpu::sandbox_gpu_count(spec.resource_requirements.as_ref()) == Some(0) {
         return Err(Status::invalid_argument("gpu count must be greater than 0"));
     }
 
+    if let Some(cpu) = spec
+        .resource_requirements
+        .as_ref()
+        .and_then(|requirements| requirements.cpu.as_ref())
+    {
+        validate_cpu_quantity(&cpu.limit, "spec.resource_requirements.cpu.limit")?;
+    }
+
+    if let Some(memory) = spec
+        .resource_requirements
+        .as_ref()
+        .and_then(|requirements| requirements.memory.as_ref())
+    {
+        validate_memory_quantity(&memory.limit, "spec.resource_requirements.memory.limit")?;
+    }
+
+    Ok(())
+}
+
+fn validate_cpu_quantity(value: &str, field_name: &str) -> Result<(), Status> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(Status::invalid_argument(format!(
+            "{field_name} must not be empty"
+        )));
+    }
+
+    if let Some(millicores) = value.strip_suffix('m') {
+        if millicores.is_empty() || !millicores.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(Status::invalid_argument(format!(
+                "invalid {field_name} value '{value}': expected positive cores or millicores, for example 2, 0.5, or 500m"
+            )));
+        }
+        let millicores = millicores.parse::<u64>().map_err(|_| {
+            Status::invalid_argument(format!(
+                "invalid {field_name} value '{value}': expected positive cores or millicores, for example 2, 0.5, or 500m"
+            ))
+        })?;
+        if millicores == 0 {
+            return Err(Status::invalid_argument(format!(
+                "{field_name} must be greater than zero"
+            )));
+        }
+        return Ok(());
+    }
+
+    let cores = value.parse::<f64>().map_err(|_| {
+        Status::invalid_argument(format!(
+            "invalid {field_name} value '{value}': expected positive cores or millicores, for example 2, 0.5, or 500m"
+        ))
+    })?;
+    if !cores.is_finite() || cores <= 0.0 {
+        return Err(Status::invalid_argument(format!(
+            "{field_name} must be greater than zero"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_memory_quantity(value: &str, field_name: &str) -> Result<(), Status> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(Status::invalid_argument(format!(
+            "{field_name} must not be empty"
+        )));
+    }
+
+    let number_end = value
+        .find(|ch: char| !ch.is_ascii_digit())
+        .unwrap_or(value.len());
+    let (number, suffix) = value.split_at(number_end);
+    if number.is_empty()
+        || !matches!(
+            suffix,
+            "" | "Ki" | "Mi" | "Gi" | "Ti" | "Pi" | "Ei" | "K" | "M" | "G" | "T" | "P" | "E"
+        )
+    {
+        return Err(Status::invalid_argument(format!(
+            "invalid {field_name} value '{value}': expected positive bytes or a quantity such as 512Mi, 4Gi, or 8G"
+        )));
+    }
+
+    let amount = number.parse::<u128>().map_err(|_| {
+        Status::invalid_argument(format!(
+            "invalid {field_name} value '{value}': expected positive bytes or a quantity such as 512Mi, 4Gi, or 8G"
+        ))
+    })?;
+    if amount == 0 {
+        return Err(Status::invalid_argument(format!(
+            "{field_name} must be greater than zero"
+        )));
+    }
     Ok(())
 }
 
@@ -299,6 +393,7 @@ fn validate_sandbox_template(tmpl: &SandboxTemplate) -> Result<(), Status> {
                 "template.resources serialized size exceeds maximum ({size} > {MAX_TEMPLATE_STRUCT_SIZE})"
             )));
         }
+        reject_legacy_template_cpu_memory_resources(s)?;
     }
     if let Some(ref s) = tmpl.driver_config {
         let size = s.encoded_len();
@@ -306,6 +401,34 @@ fn validate_sandbox_template(tmpl: &SandboxTemplate) -> Result<(), Status> {
             return Err(Status::invalid_argument(format!(
                 "template.driver_config serialized size exceeds maximum ({size} > {MAX_TEMPLATE_STRUCT_SIZE})"
             )));
+        }
+    }
+
+    Ok(())
+}
+
+fn reject_legacy_template_cpu_memory_resources(
+    resources: &prost_types::Struct,
+) -> Result<(), Status> {
+    for section_name in ["limits", "requests"] {
+        let Some(section) =
+            resources
+                .fields
+                .get(section_name)
+                .and_then(|value| match value.kind.as_ref() {
+                    Some(prost_types::value::Kind::StructValue(section)) => Some(section),
+                    _ => None,
+                })
+        else {
+            continue;
+        };
+
+        for resource_name in ["cpu", "memory"] {
+            if section.fields.contains_key(resource_name) {
+                return Err(Status::invalid_argument(format!(
+                    "template.resources.{section_name}.{resource_name} is no longer supported; use spec.resource_requirements.{resource_name}.limit"
+                )));
+            }
         }
     }
 
@@ -1004,6 +1127,8 @@ mod tests {
         let spec = SandboxSpec {
             resource_requirements: Some(openshell_core::proto::ResourceRequirements {
                 gpu: Some(openshell_core::proto::GpuResourceRequirements { count: None }),
+                cpu: None,
+                memory: None,
             }),
             ..Default::default()
         };
@@ -1015,6 +1140,8 @@ mod tests {
         let spec = SandboxSpec {
             resource_requirements: Some(openshell_core::proto::ResourceRequirements {
                 gpu: Some(openshell_core::proto::GpuResourceRequirements { count: Some(2) }),
+                cpu: None,
+                memory: None,
             }),
             ..Default::default()
         };
@@ -1026,12 +1153,90 @@ mod tests {
         let spec = SandboxSpec {
             resource_requirements: Some(openshell_core::proto::ResourceRequirements {
                 gpu: Some(openshell_core::proto::GpuResourceRequirements { count: Some(0) }),
+                cpu: None,
+                memory: None,
             }),
             ..Default::default()
         };
         let err = validate_sandbox_spec("gpu-sandbox", &spec).unwrap_err();
         assert_eq!(err.code(), Code::InvalidArgument);
         assert!(err.message().contains("gpu count must be greater than 0"));
+    }
+
+    #[test]
+    fn validate_sandbox_spec_accepts_cpu_and_memory_requirements() {
+        let spec = SandboxSpec {
+            resource_requirements: Some(openshell_core::proto::ResourceRequirements {
+                gpu: None,
+                cpu: Some(openshell_core::proto::CpuResourceRequirements {
+                    limit: "500m".to_string(),
+                }),
+                memory: Some(openshell_core::proto::MemoryResourceRequirements {
+                    limit: "2Gi".to_string(),
+                }),
+            }),
+            ..Default::default()
+        };
+
+        assert!(validate_sandbox_spec("compute-sandbox", &spec).is_ok());
+    }
+
+    #[test]
+    fn validate_sandbox_spec_rejects_invalid_cpu_requirements() {
+        let spec = SandboxSpec {
+            resource_requirements: Some(openshell_core::proto::ResourceRequirements {
+                gpu: None,
+                cpu: Some(openshell_core::proto::CpuResourceRequirements {
+                    limit: "0".to_string(),
+                }),
+                memory: Some(openshell_core::proto::MemoryResourceRequirements {
+                    limit: "2Gi".to_string(),
+                }),
+            }),
+            ..Default::default()
+        };
+
+        let err = validate_sandbox_spec("compute-sandbox", &spec).unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(
+            err.message()
+                .contains("spec.resource_requirements.cpu.limit")
+        );
+    }
+
+    #[test]
+    fn validate_sandbox_spec_rejects_legacy_template_cpu_memory_resources() {
+        use prost_types::{Struct, Value, value::Kind};
+
+        let mut limits = std::collections::BTreeMap::new();
+        limits.insert(
+            "cpu".to_string(),
+            Value {
+                kind: Some(Kind::StringValue("500m".to_string())),
+            },
+        );
+        let mut fields = std::collections::BTreeMap::new();
+        fields.insert(
+            "limits".to_string(),
+            Value {
+                kind: Some(Kind::StructValue(Struct { fields: limits })),
+            },
+        );
+        let spec = SandboxSpec {
+            template: Some(SandboxTemplate {
+                resources: Some(Struct { fields }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let err = validate_sandbox_spec("legacy-resources", &spec).unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("template.resources.limits.cpu"));
+        assert!(
+            err.message()
+                .contains("spec.resource_requirements.cpu.limit")
+        );
     }
 
     #[test]

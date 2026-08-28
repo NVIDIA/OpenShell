@@ -8,7 +8,9 @@ use openshell_core::ComputeDriverError;
 use openshell_core::driver_mounts::SelinuxLabel;
 #[cfg(test)]
 use openshell_core::gpu::{driver_gpu_requirements, validate_specific_gpu_device_request};
-use openshell_core::proto::compute::v1::{DriverSandbox, DriverSandboxTemplate};
+use openshell_core::proto::compute::v1::{
+    DriverSandbox, DriverSandboxTemplate, ResourceRequirements,
+};
 use openshell_core::proto_struct::deserialize_optional_non_empty_string_list;
 use openshell_core::{driver_mounts, proto_struct};
 use serde::Serialize;
@@ -628,32 +630,57 @@ fn build_labels(sandbox: &DriverSandbox) -> BTreeMap<String, String> {
     labels
 }
 
-/// Parse resource limits from the sandbox template, falling back to defaults.
-fn build_resource_limits(sandbox: &DriverSandbox, config: &PodmanComputeConfig) -> ResourceLimits {
+/// Parse resource limits from typed sandbox requirements, falling back to defaults.
+fn build_resource_limits(
+    sandbox: &DriverSandbox,
+    config: &PodmanComputeConfig,
+) -> Result<ResourceLimits, ComputeDriverError> {
     let resources = sandbox
         .spec
         .as_ref()
-        .and_then(|s| s.template.as_ref())
-        .and_then(|t| t.resources.as_ref());
+        .and_then(|s| s.resource_requirements.as_ref());
 
-    let cpu_micros = resources
-        .filter(|r| !r.cpu_limit.is_empty())
-        .and_then(|r| parse_cpu_to_microseconds(&r.cpu_limit))
-        .unwrap_or(DEFAULT_CPU_QUOTA);
+    let cpu_micros = parse_podman_cpu_limit(resources)?.unwrap_or(DEFAULT_CPU_QUOTA);
+    let mem_bytes = parse_podman_memory_limit(resources)?.unwrap_or(DEFAULT_MEMORY_LIMIT);
 
-    let mem_bytes = resources
-        .filter(|r| !r.memory_limit.is_empty())
-        .and_then(|r| parse_memory_to_bytes(&r.memory_limit))
-        .unwrap_or(DEFAULT_MEMORY_LIMIT);
-
-    ResourceLimits {
+    Ok(ResourceLimits {
         cpu: CpuLimits {
             quota: cpu_micros,
             period: DEFAULT_CPU_PERIOD,
         },
         memory: MemoryLimits { limit: mem_bytes },
         pids_limit: podman_pids_limit(config.sandbox_pids_limit),
-    }
+    })
+}
+
+fn parse_podman_cpu_limit(
+    resources: Option<&ResourceRequirements>,
+) -> Result<Option<u64>, ComputeDriverError> {
+    let Some(cpu) = resources.and_then(|resources| resources.cpu.as_ref()) else {
+        return Ok(None);
+    };
+    parse_cpu_to_microseconds(&cpu.limit)
+        .map(Some)
+        .ok_or_else(|| {
+            ComputeDriverError::Precondition(format!(
+                "invalid podman cpu limit '{}'; expected positive cores or millicores",
+                cpu.limit
+            ))
+        })
+}
+
+fn parse_podman_memory_limit(
+    resources: Option<&ResourceRequirements>,
+) -> Result<Option<u64>, ComputeDriverError> {
+    let Some(memory) = resources.and_then(|resources| resources.memory.as_ref()) else {
+        return Ok(None);
+    };
+    parse_memory_to_bytes(&memory.limit).map(Some).ok_or_else(|| {
+        ComputeDriverError::Precondition(format!(
+            "invalid podman memory limit '{}'; expected positive bytes or a Kubernetes-style quantity",
+            memory.limit
+        ))
+    })
 }
 
 fn podman_pids_limit(value: i64) -> Option<i64> {
@@ -1022,7 +1049,7 @@ pub fn build_container_spec_for_image(
 
     let env = build_env(sandbox, config, requested_image, oci_user);
     let labels = build_labels(sandbox);
-    let resource_limits = build_resource_limits(sandbox, config);
+    let resource_limits = build_resource_limits(sandbox, config)?;
     let user_mounts = podman_user_mounts(sandbox, config.enable_bind_mounts)
         .map_err(ComputeDriverError::InvalidArgument)?;
     if sandbox
@@ -1490,7 +1517,10 @@ fn parse_memory_to_bytes(quantity: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use openshell_core::proto::compute::v1::{GpuResourceRequirements, ResourceRequirements};
+    use openshell_core::proto::compute::v1::{
+        CpuResourceRequirements, GpuResourceRequirements, MemoryResourceRequirements,
+        ResourceRequirements,
+    };
 
     static ENV_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
         std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
@@ -1506,6 +1536,8 @@ mod tests {
     fn gpu_resources(count: Option<u32>) -> ResourceRequirements {
         ResourceRequirements {
             gpu: Some(GpuResourceRequirements { count }),
+            cpu: None,
+            memory: None,
         }
     }
 
@@ -1544,19 +1576,19 @@ mod tests {
 
     #[test]
     fn container_spec_applies_cpu_and_memory_limits() {
-        use openshell_core::proto::compute::v1::{
-            DriverResourceRequirements, DriverSandboxSpec, DriverSandboxTemplate,
-        };
+        use openshell_core::proto::compute::v1::{DriverSandboxSpec, DriverSandboxTemplate};
 
         let mut sandbox = test_sandbox("test-id", "test-name");
         sandbox.spec = Some(DriverSandboxSpec {
-            template: Some(DriverSandboxTemplate {
-                resources: Some(DriverResourceRequirements {
-                    cpu_limit: "500m".to_string(),
-                    memory_limit: "2Gi".to_string(),
-                    ..Default::default()
+            template: Some(DriverSandboxTemplate::default()),
+            resource_requirements: Some(ResourceRequirements {
+                gpu: None,
+                cpu: Some(CpuResourceRequirements {
+                    limit: "500m".to_string(),
                 }),
-                ..Default::default()
+                memory: Some(MemoryResourceRequirements {
+                    limit: "2Gi".to_string(),
+                }),
             }),
             ..Default::default()
         });

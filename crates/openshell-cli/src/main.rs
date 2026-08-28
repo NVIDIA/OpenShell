@@ -19,7 +19,7 @@ use openshell_bootstrap::{
 use openshell_cli::completers;
 use openshell_cli::run;
 use openshell_cli::tls::TlsOptions;
-use openshell_core::proto::GpuResourceRequirements;
+use openshell_core::proto::{GpuResourceRequirements, ResourceRequirements};
 
 /// Resolved gateway context: name + gateway endpoint.
 struct GatewayContext {
@@ -3066,6 +3066,21 @@ async fn run_async() -> Result<()> {
                         .transpose()?;
                     let keep = keep || !no_keep || editor.is_some() || forward.is_some();
                     let gpu_requirements: Option<GpuResourceRequirements> = gpu.map(Into::into);
+                    let cpu_requirements = run::build_cpu_resource_requirements(cpu.as_deref())?;
+                    let memory_requirements =
+                        run::build_memory_resource_requirements(memory.as_deref())?;
+                    let resource_requirements = if gpu_requirements.is_some()
+                        || cpu_requirements.is_some()
+                        || memory_requirements.is_some()
+                    {
+                        Some(ResourceRequirements {
+                            gpu: gpu_requirements,
+                            cpu: cpu_requirements,
+                            memory: memory_requirements,
+                        })
+                    } else {
+                        None
+                    };
 
                     let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
                     let endpoint = &ctx.endpoint;
@@ -3079,9 +3094,7 @@ async fn run_async() -> Result<()> {
                             from: from.as_deref(),
                             uploads: &upload_specs,
                             keep,
-                            gpu_requirements,
-                            cpu: cpu.as_deref(),
-                            memory: memory.as_deref(),
+                            resource_requirements,
                             driver_config_json: driver_config_json.as_deref(),
                             editor,
                             providers: &providers,

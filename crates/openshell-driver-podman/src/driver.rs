@@ -1643,6 +1643,8 @@ mod tests {
     fn gpu_resources(count: Option<u32>) -> ResourceRequirements {
         ResourceRequirements {
             gpu: Some(GpuResourceRequirements { count }),
+            cpu: None,
+            memory: None,
         }
     }
 

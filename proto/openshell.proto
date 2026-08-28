@@ -845,6 +845,10 @@ message SandboxSpec {
 message ResourceRequirements {
   // GPU requirements for the sandbox. Presence indicates a GPU request.
   GpuResourceRequirements gpu = 1;
+  // CPU requirements for the sandbox workload.
+  CpuResourceRequirements cpu = 2;
+  // Memory requirements for the sandbox workload.
+  MemoryResourceRequirements memory = 3;
 }
 
 // Public GPU resource requirements.
@@ -852,6 +856,18 @@ message GpuResourceRequirements {
   // Optional number of GPUs requested. When omitted, the request is for one
   // GPU using the selected driver's default assignment behavior.
   optional uint32 count = 1;
+}
+
+// Public CPU resource requirements.
+message CpuResourceRequirements {
+  // CPU limit for the sandbox workload (e.g. "500m", "2").
+  string limit = 1;
+}
+
+// Public memory resource requirements.
+message MemoryResourceRequirements {
+  // Memory limit for the sandbox workload (e.g. "512Mi", "4Gi").
+  string limit = 1;
 }
 
 // Public sandbox template mapped onto compute-driver template inputs.
@@ -868,7 +884,8 @@ message SandboxTemplate {
   map<string, string> annotations = 5;
   // Additional environment variables injected by the template.
   map<string, string> environment = 6;
-  // Platform-specific compute resource requirements and limits.
+  // Platform-specific resource passthrough. CPU and memory under
+  // limits/requests are rejected; use ResourceRequirements.cpu/memory instead.
   google.protobuf.Struct resources = 7;
   reserved 9;
   reserved "volume_claim_templates";
