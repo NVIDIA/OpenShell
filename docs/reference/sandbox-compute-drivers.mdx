@@ -125,6 +125,20 @@ request. The VM driver accepts `gpu_device_ids`, for example
 accepts at most one entry and allows either `--gpu` or `--gpu 1` when
 `gpu_device_ids` is set.
 
+## Resource Capability Reporting
+
+API clients can read each configured driver's static resource request support
+from the protected `GetGatewayInfo` response. The capability response describes
+which request forms a driver implements. It does not report live resource
+inventory, availability, or scheduling capacity, so a supported request can
+still fail when the selected runtime cannot provide the resource.
+
+CPU and memory capabilities report whether the driver enforces a resource
+limit. GPU capabilities report whether the driver accepts a default GPU request
+and an explicit GPU count. An omitted `resource_capabilities` message, or an
+omitted CPU, memory, or GPU capability, means the driver did not report that
+capability. A reported `false` value means that request form is unsupported.
+
 For Kubernetes, `pod.runtime_class_name` maps to PodSpec `runtimeClassName`.
 It overrides the gateway's configured default runtime class for that sandbox,
 while a typed `SandboxTemplate.runtime_class_name` value from the API still
