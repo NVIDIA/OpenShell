@@ -749,6 +749,7 @@ PY
 		export CONTAINER_HOST="unix://\${OPENSHELL_PODMAN_SOCKET}"
 		export OPENSHELL_E2E_CONTAINER_ENGINE_UNSET_XDG_CONFIG_HOME=1
 		insert_podman_config_key socket_path "\$(toml_string "\${OPENSHELL_PODMAN_SOCKET}")"
+		insert_podman_config_key enable_bind_mounts true
 
 		provider_spiffe_port=\$(pick_free_port)
 		export OPENSHELL_E2E_GATEWAY_SPIFFE_SOCKET="\${spiffe_root}/gateway.sock"

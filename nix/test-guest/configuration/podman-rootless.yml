@@ -26,11 +26,29 @@
     - name: Install Ubuntu rootless Podman
       ansible.builtin.apt:
         name:
+          - apparmor
           - fuse-overlayfs
           - passt
           - podman
           - uidmap
         state: present
+
+    - name: Allow pasta to receive Podman stop signals
+      ansible.builtin.lineinfile:
+        path: /etc/apparmor.d/usr.bin.pasta
+        insertafter: "^  include <abstractions/pasta>$"
+        line: "  signal (receive) peer=podman,"
+        state: present
+      register: pasta_apparmor_profile
+
+    - name: Reload pasta AppArmor profile
+      ansible.builtin.command:
+        argv:
+          - apparmor_parser
+          - --replace
+          - /etc/apparmor.d/usr.bin.pasta
+      when: pasta_apparmor_profile.changed
+      changed_when: pasta_apparmor_profile.changed
 
     - name: Enable the rootless Podman API socket
       ansible.builtin.systemd_service:
