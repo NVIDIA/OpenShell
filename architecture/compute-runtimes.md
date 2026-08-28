@@ -246,9 +246,17 @@ through the driver configuration. The Helm chart defaults sandbox agents to
 `Unconfined` so runtime/default AppArmor profiles do not block supervisor
 network namespace setup on AppArmor-enabled nodes.
 
-Resource requirements enter the driver layer through `SandboxSpec.resource_requirements`. This includes a set of GPU requirements, where a user
-can request a specific number of GPUs or the driver-specific default behaviour.
-For all in-tree drivers, this is equivalent to selecting a single GPU.
+Resource requirements enter the driver layer through `SandboxSpec.resource_requirements`,
+which carries typed GPU, CPU, and memory requirements as portable sandbox-sizing intent.
+GPU requests let a user ask for a specific number of GPUs or the driver-specific default
+behaviour; for all in-tree drivers, an unspecified count is equivalent to selecting a
+single GPU. CPU and memory requests use Kubernetes-style quantity strings (e.g. `"500m"`,
+`"4Gi"`). Docker, Podman, and Kubernetes apply typed CPU/memory requirements as native
+resource limits; the VM and MXC drivers reject typed CPU/memory requirements with a clear
+error until sizing support lands there, rather than silently ignoring them.
+`SandboxTemplate.resources` remains a platform-native escape hatch for non-portable fields
+only — CPU/memory keys under it are rejected in favor of
+`resource_requirements.cpu`/`resource_requirements.memory`.
 
 VM runtime state paths are derived only from driver-validated sandbox IDs
 matching `[A-Za-z0-9._-]{1,128}`. The gateway-owned VM driver socket uses a

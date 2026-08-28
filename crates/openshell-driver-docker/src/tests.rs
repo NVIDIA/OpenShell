@@ -13,9 +13,9 @@ use openshell_core::progress::{
     PROGRESS_STEP_STARTING_SANDBOX,
 };
 use openshell_core::proto::compute::v1::{
-    DriverResourceRequirements, DriverSandboxSpec, DriverSandboxTemplate,
-    GetGatewayListenerRequirementsRequest, GpuResourceRequirements, ResourceRequirements,
-    gateway_listener_requirement::Selector,
+    CpuResourceRequirements, DriverSandboxSpec, DriverSandboxTemplate,
+    GetGatewayListenerRequirementsRequest, GpuResourceRequirements, MemoryResourceRequirements,
+    ResourceRequirements, gateway_listener_requirement::Selector,
 };
 use std::fs;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -88,6 +88,20 @@ fn list_string_driver_config(field: &str, values: &[&str]) -> prost_types::Struc
 fn gpu_resources(count: Option<u32>) -> ResourceRequirements {
     ResourceRequirements {
         gpu: Some(GpuResourceRequirements { count }),
+        cpu: None,
+        memory: None,
+    }
+}
+
+fn cpu_memory_resources(cpu: Option<&str>, memory: Option<&str>) -> ResourceRequirements {
+    ResourceRequirements {
+        gpu: None,
+        cpu: cpu.map(|limit| CpuResourceRequirements {
+            limit: limit.to_string(),
+        }),
+        memory: memory.map(|limit| MemoryResourceRequirements {
+            limit: limit.to_string(),
+        }),
     }
 }
 
@@ -1006,42 +1020,10 @@ fn parse_memory_limit_supports_binary_quantities() {
 }
 
 #[test]
-fn docker_resource_limits_rejects_requests() {
-    let template = DriverSandboxTemplate {
-        image: "img".to_string(),
-        agent_socket_path: String::new(),
-        labels: HashMap::new(),
-        environment: HashMap::new(),
-        resources: Some(DriverResourceRequirements {
-            cpu_request: "250m".to_string(),
-            cpu_limit: String::new(),
-            memory_request: String::new(),
-            memory_limit: String::new(),
-        }),
-        ..Default::default()
-    };
-
-    let err = docker_resource_limits(&template).unwrap_err();
-    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
-    assert!(err.message().contains("resources.requests.cpu"));
-}
-
-#[test]
 fn docker_resource_limits_applies_cpu_and_memory_limits() {
-    let template = DriverSandboxTemplate {
-        image: "img".to_string(),
-        agent_socket_path: String::new(),
-        labels: HashMap::new(),
-        environment: HashMap::new(),
-        resources: Some(DriverResourceRequirements {
-            cpu_limit: "500m".to_string(),
-            memory_limit: "2Gi".to_string(),
-            ..Default::default()
-        }),
-        ..Default::default()
-    };
+    let resources = cpu_memory_resources(Some("500m"), Some("2Gi"));
 
-    let limits = docker_resource_limits(&template).unwrap();
+    let limits = docker_resource_limits(Some(&resources)).unwrap();
     assert_eq!(limits.nano_cpus, Some(500_000_000));
     assert_eq!(limits.memory_bytes, Some(2_147_483_648));
 }
