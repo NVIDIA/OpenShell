@@ -180,7 +180,11 @@ where
         let (visitor_sandbox_id, visitor_message) = if meta.target() == OCSF_TARGET {
             openshell_ocsf::clone_current_event().map_or((None, None), |ocsf_event| {
                 (
-                    ocsf_event.base().metadata.uid.clone(),
+                    ocsf_event
+                        .base()
+                        .container
+                        .as_ref()
+                        .and_then(|container| container.uid.clone()),
                     Some(ocsf_event.format_shorthand()),
                 )
             })

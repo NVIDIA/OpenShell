@@ -1337,7 +1337,11 @@ mod tests {
         );
 
         assert_eq!(
-            event.base().metadata.uid.as_deref(),
+            event
+                .base()
+                .container
+                .as_ref()
+                .and_then(|container| container.uid.as_deref()),
             Some("sandbox-1"),
             "resolved sandbox id should reach the event"
         );
