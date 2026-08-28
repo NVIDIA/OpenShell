@@ -74,8 +74,8 @@ fn draw_sandbox_screen(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Percentage(20), // metadata
-            Constraint::Percentage(80), // policy or logs
+            Constraint::Length(11), // metadata and restart status
+            Constraint::Min(0),     // policy or logs
         ])
         .split(area);
 

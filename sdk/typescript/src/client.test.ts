@@ -20,7 +20,7 @@ import {
   SCOPE_NAMES,
   STATUS_NAMES,
 } from './client.js';
-import { OpenShell, SandboxPhase, ServiceStatus } from './gen/openshell_pb.js';
+import { OpenShell, SandboxPhase, SandboxRestartPolicy, ServiceStatus } from './gen/openshell_pb.js';
 import { PolicySource, SettingScope } from './gen/sandbox_pb.js';
 
 function client(impl: Partial<ServiceImpl<typeof OpenShell>>): SandboxClient {
@@ -234,6 +234,20 @@ describe('create', () => {
     expect(created.spec?.tty).toBe(true);
   });
 
+  it('sends the restart policy', async () => {
+    let created: { spec?: { restartPolicy?: SandboxRestartPolicy } } = {};
+    const sandbox = client({
+      createSandbox: (req) => {
+        created = req;
+        return readySandbox('sb', 'sb-id');
+      },
+    });
+
+    await sandbox.create({ image: 'img', restartPolicy: 'on-failure' });
+
+    expect(created.spec?.restartPolicy).toBe(SandboxRestartPolicy.ON_FAILURE);
+  });
+
   it('rawSpec reaches an ungated field and overrides a curated one', async () => {
     let created: {
       spec?: {
@@ -286,6 +300,29 @@ describe('create', () => {
       phase: 'error',
       mainProcessInstanceId: 'main-1',
       exitCode: 9,
+    });
+  });
+
+  it('maps restart controller status', async () => {
+    const sandbox = client({
+      getSandbox: () => ({
+        sandbox: {
+          metadata: { id: 'sb-id', name: 'sb', resourceVersion: 8n },
+          status: {
+            phase: SandboxPhase.RESTARTING,
+            restartCount: 3,
+            nextRestartAtMs: 1_700_000_000_000n,
+            mainProcessStartedAtMs: 1_699_999_000_000n,
+          },
+        },
+      }),
+    });
+
+    await expect(sandbox.get('sb')).resolves.toMatchObject({
+      phase: 'restarting',
+      restartCount: 3,
+      nextRestartAtMs: 1_700_000_000_000,
+      mainProcessStartedAtMs: 1_699_999_000_000,
     });
   });
 });

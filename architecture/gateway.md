@@ -15,9 +15,10 @@ workloads.
 - Resolve provider credentials and inference bundles for sandbox supervisors.
 - Coordinate supervisor relay sessions for connect, exec, file sync, and
   service forwarding.
-- Persist the canonical main-process instance ID and normalized exit code on
-  sandbox status. Any main process exit transitions the sandbox to `Error`,
-  including exit code zero.
+- Persist the canonical main-process instance ID, normalized exit code, restart
+  count, and restart deadline on sandbox status. Evaluate the sandbox restart
+  policy when that process exits and either transition to `Error` or restart
+  the sandbox compute resource with bounded exponential backoff.
 
 The gateway does not enforce agent network policy at request time. That happens
 inside each sandbox, where the supervisor and proxy can observe local process

@@ -367,6 +367,9 @@ class SandboxStatusRef:
     phase: int
     current_policy_version: int
     exit_code: int | None = None
+    restart_count: int = 0
+    next_restart_at_ms: int | None = None
+    main_process_started_at_ms: int | None = None
 
 
 class _ImmutableLabels(dict[str, str]):
@@ -1363,6 +1366,13 @@ def _sandbox_ref(sandbox: openshell_pb2.Sandbox) -> SandboxRef:
             current_policy_version=status.current_policy_version if status else 0,
             exit_code=status.exit_code
             if status is not None and status.HasField("exit_code")
+            else None,
+            restart_count=status.restart_count if status is not None else 0,
+            next_restart_at_ms=status.next_restart_at_ms
+            if status is not None and status.next_restart_at_ms > 0
+            else None,
+            main_process_started_at_ms=status.main_process_started_at_ms
+            if status is not None and status.main_process_started_at_ms > 0
             else None,
         ),
         labels=sandbox.metadata.labels if sandbox.metadata else {},

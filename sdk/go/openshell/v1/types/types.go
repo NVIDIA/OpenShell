@@ -20,6 +20,16 @@ const (
 	SandboxStarting     SandboxPhase = "Starting"
 )
 
+// SandboxRestartPolicy controls replacement after the canonical main process exits.
+type SandboxRestartPolicy string
+
+// Sandbox restart policy values.
+const (
+	SandboxRestartNever     SandboxRestartPolicy = "Never"
+	SandboxRestartOnFailure SandboxRestartPolicy = "OnFailure"
+	SandboxRestartAlways    SandboxRestartPolicy = "Always"
+)
+
 // EventType classifies watch events.
 type EventType string
 

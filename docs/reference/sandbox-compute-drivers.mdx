@@ -28,8 +28,10 @@ running independently of the gateway process.
 The gateway forwards one exact, persisted main-process specification to every
 driver. Drivers serialize that specification in
 `OPENSHELL_MAIN_PROCESS_SPEC`; they do not install an idle `sleep` workload or
-reconstruct argv with shell parsing. Runtime restart policies are disabled so
-an exited canonical process remains a terminal sandbox error.
+reconstruct argv with shell parsing. Native runtime restart policies remain
+disabled. The gateway either records the exit as terminal or replaces the
+whole compute resource according to the sandbox's `never`, `on-failure`, or
+`always` policy.
 
 ## Configure a Compute Driver
 

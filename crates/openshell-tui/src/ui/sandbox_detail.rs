@@ -73,6 +73,32 @@ pub fn draw(frame: &mut Frame<'_>, app: &App, area: Rect) {
         Span::styled(age, t.text),
     ]);
 
+    let restart_policy = app
+        .sandbox_restart_policies
+        .get(idx)
+        .map_or("never", String::as_str);
+    let restart_count = app.sandbox_restart_counts.get(idx).copied().unwrap_or(0);
+    let exit_code = app
+        .sandbox_exit_codes
+        .get(idx)
+        .copied()
+        .flatten()
+        .map_or_else(|| "-".to_string(), |code| code.to_string());
+    let next_restart = app
+        .sandbox_next_restart_at
+        .get(idx)
+        .map_or("-", String::as_str);
+    let row_restart = Line::from(vec![
+        Span::styled("  Restart: ", t.muted),
+        Span::styled(restart_policy, t.text),
+        Span::styled("   Count: ", t.muted),
+        Span::styled(restart_count.to_string(), t.text),
+        Span::styled("   Exit: ", t.muted),
+        Span::styled(exit_code, t.text),
+        Span::styled("   Next: ", t.muted),
+        Span::styled(next_restart, t.text),
+    ]);
+
     // Row 3: Labels
     let labels_str = app
         .sandbox_labels
@@ -117,7 +143,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &App, area: Rect) {
         Span::styled(forwards_str, t.text),
     ]);
 
-    let mut lines = vec![row1, row2, row3, row4, row5, row6];
+    let mut lines = vec![row1, row2, row_restart, row3, row4, row5, row6];
 
     // Show global policy indicator when the sandbox's policy is managed at
     // gateway scope.

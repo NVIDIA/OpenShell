@@ -245,6 +245,7 @@ Key flags:
 - `--label KEY=VALUE`: Add labels for later selection (repeatable)
 - `--env KEY=VALUE`: Set non-secret sandbox environment variables (repeatable); use `--provider` for credentials
 - `--tty`: Allocate a retained PTY for the canonical main process
+- `--restart-policy never|on-failure|always`: Select gateway-owned main-process restart behavior; `never` is the default
 - `--approval-mode manual|auto`: Control handling of agent-authored policy proposals; `manual` is the default
 - `--upload <PATH>[:<DEST>]`: Upload local files into the container working directory or an explicit destination
 - `--no-git-ignore`: Disable `.gitignore` filtering for uploads
@@ -284,6 +285,13 @@ VS Code Remote-SSH with:
 ```bash
 openshell sandbox ssh-config my-sandbox >> ~/.ssh/config
 ```
+
+A nonzero main-process exit under `on-failure`, or any exit under `always`,
+moves the sandbox to `Starting` while the gateway applies exponential backoff
+and recreates the compute resource. Inspect `sandbox get` for the restart
+count, prior exit code, and next attempt. Connect and exec commands are
+unavailable until the new supervisor session makes it `Ready`. An explicit
+`sandbox stop` cancels a pending restart.
 
 ### Upload and download files
 

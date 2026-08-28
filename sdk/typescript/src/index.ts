@@ -26,6 +26,7 @@ export type {
   SandboxPhaseName,
   SandboxPolicy,
   SandboxRef,
+  SandboxRestartPolicyName,
   SandboxSpec,
   SetPolicyOptions,
   SettingScopeName,

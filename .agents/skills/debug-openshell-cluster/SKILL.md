@@ -211,6 +211,16 @@ not follow this local gateway lifecycle. Internal and external drivers follow
 the same rule: `GetCapabilities.gateway_manages_lifecycle` must be true for the
 gateway to run shutdown and startup sweeps.
 
+Canonical main-process restart policy is gateway-owned on every compute
+platform. Drivers must keep native runtime restart disabled. A nonzero exit
+under `on-failure`, or any exit under `always`, leaves the public phase
+`Starting` while `openshell sandbox get <name>` shows the prior exit code,
+restart count, and next attempt. During backoff, no compute resource should be
+running. After the deadline, check gateway logs for the stop/start replacement
+attempt and supervisor registration. An explicit `sandbox stop` clears pending
+restart state; if compute remains active behind `Stopped` or `Deleting`, inspect
+for a stale gateway replica and driver stop/delete failures.
+
 ### Step 5: Check Podman-Backed Gateways
 
 ```bash
@@ -625,6 +635,7 @@ openshell logs <sandbox-name>
 | Supervisor repeatedly fails to install middleware after enabling gateway JWT signing | Extension credential minting, distribution, or authenticated service connection failed; last-known-good registry remains active | Gateway `RefreshSandboxToken` logs, sandbox configuration events, service token-verification logs, registration TLS/audience settings |
 | Custom compute driver is unavailable | Driver process/socket missing, inaccessible, or selected name does not match its endpoint/config key | Socket ownership/mode, driver service logs, gateway `GetCapabilities` logs |
 | Sandbox remains `Stopping` or `Starting` | Driver stop/start failed, retained resource is missing, or a fresh supervisor has not connected | Gateway and driver logs; `docker inspect`, `podman inspect`, Agent Sandbox status/PVC, or VM state marker and launcher process |
+| Sandbox remains `Starting` with restart count and prior exit code | Policy restart is in backoff, replacement stop/start failed, or the new supervisor did not register | `openshell sandbox get <name>` deadline and conditions; gateway restart-controller logs; driver runtime state |
 | Image pull failure | Gateway or sandbox image cannot be pulled | Runtime events and image pull credentials |
 | `K8s namespace not ready` with `envoy-gateway-openshell.yaml: the server could not find the requested resource` | Optional Gateway API manifest was applied without Envoy Gateway CRDs, or k3s Helm controller startup exceeded the namespace wait | Apply `deploy/kube/manifests/envoy-gateway-openshell.yaml` manually only after Envoy Gateway is installed and `grpcRoute` is enabled |
 | HTTPS ingress (`grpcRoute.gateway.listener.protocol=HTTPS`) connection resets or TLS handshake hangs | Envoy terminates TLS but the gateway pod still expects TLS, so the plaintext backend hop fails | Set `server.disableTls=true` so Envoy forwards plaintext to the pod; verify the listener `certificateRefs` Secret exists in the release namespace and `openshell status` over `https://<host>` |

@@ -83,6 +83,25 @@ impl From<proto::SandboxPhase> for SandboxPhase {
     }
 }
 
+/// Policy applied when the canonical main process exits unexpectedly.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum SandboxRestartPolicy {
+    #[default]
+    Never,
+    OnFailure,
+    Always,
+}
+
+impl From<SandboxRestartPolicy> for proto::SandboxRestartPolicy {
+    fn from(value: SandboxRestartPolicy) -> Self {
+        match value {
+            SandboxRestartPolicy::Never => Self::Never,
+            SandboxRestartPolicy::OnFailure => Self::OnFailure,
+            SandboxRestartPolicy::Always => Self::Always,
+        }
+    }
+}
+
 impl From<i32> for SandboxPhase {
     fn from(value: i32) -> Self {
         proto::SandboxPhase::try_from(value).map_or(Self::Unspecified, Self::from)
@@ -113,6 +132,8 @@ pub struct SandboxSpec {
     pub command: Vec<String>,
     /// Allocate a retained pseudo-terminal for the canonical command.
     pub tty: bool,
+    /// Restart behavior after the canonical process exits.
+    pub restart_policy: SandboxRestartPolicy,
 }
 
 /// Reference to a sandbox owned by the gateway.
@@ -126,12 +147,26 @@ pub struct SandboxRef {
     pub labels: HashMap<String, String>,
     pub resource_version: u64,
     pub exit_code: Option<i32>,
+    pub restart_count: u32,
+    pub next_restart_at_ms: Option<i64>,
+    pub main_process_started_at_ms: Option<i64>,
 }
 
 impl SandboxRef {
     pub(crate) fn from_proto(sandbox: proto::Sandbox) -> Self {
         let phase = sandbox.phase().into();
-        let exit_code = sandbox.status.as_ref().and_then(|status| status.exit_code);
+        let (exit_code, restart_count, next_restart_at_ms, main_process_started_at_ms) = sandbox
+            .status
+            .as_ref()
+            .map_or((None, 0, None, None), |status| {
+                (
+                    status.exit_code,
+                    status.restart_count,
+                    (status.next_restart_at_ms > 0).then_some(status.next_restart_at_ms),
+                    (status.main_process_started_at_ms > 0)
+                        .then_some(status.main_process_started_at_ms),
+                )
+            });
         let meta = sandbox.metadata.unwrap_or_default();
         Self {
             id: meta.id,
@@ -141,6 +176,9 @@ impl SandboxRef {
             labels: meta.labels,
             resource_version: meta.resource_version,
             exit_code,
+            restart_count,
+            next_restart_at_ms,
+            main_process_started_at_ms,
         }
     }
 }

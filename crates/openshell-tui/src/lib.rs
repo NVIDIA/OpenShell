@@ -21,8 +21,8 @@ use miette::{IntoDiagnostic, Result};
 use openshell_bootstrap::list_gateways_with_source;
 use openshell_core::auth::EdgeAuthInterceptor;
 use openshell_core::metadata::{ObjectId, ObjectLabels, ObjectName, ObjectWorkspace};
-use openshell_core::proto::SandboxPhase;
 use openshell_core::proto::open_shell_client::OpenShellClient;
+use openshell_core::proto::{SandboxPhase, SandboxRestartPolicy};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use tokio::sync::mpsc;
@@ -2537,6 +2537,45 @@ async fn refresh_sandboxes(app: &mut App) {
                         .filter(|img| !img.is_empty())
                         .unwrap_or("-")
                         .to_string()
+                })
+                .collect();
+            app.sandbox_restart_policies = sandboxes
+                .iter()
+                .map(|sandbox| {
+                    sandbox.spec.as_ref().map_or("never", |spec| {
+                        match SandboxRestartPolicy::try_from(spec.restart_policy)
+                            .unwrap_or(SandboxRestartPolicy::Never)
+                        {
+                            SandboxRestartPolicy::OnFailure => "on-failure",
+                            SandboxRestartPolicy::Always => "always",
+                            SandboxRestartPolicy::Unspecified | SandboxRestartPolicy::Never => {
+                                "never"
+                            }
+                        }
+                    })
+                })
+                .map(str::to_string)
+                .collect();
+            app.sandbox_restart_counts = sandboxes
+                .iter()
+                .map(|sandbox| {
+                    sandbox
+                        .status
+                        .as_ref()
+                        .map_or(0, |status| status.restart_count)
+                })
+                .collect();
+            app.sandbox_exit_codes = sandboxes
+                .iter()
+                .map(|sandbox| sandbox.status.as_ref().and_then(|status| status.exit_code))
+                .collect();
+            app.sandbox_next_restart_at = sandboxes
+                .iter()
+                .map(|sandbox| {
+                    sandbox.status.as_ref().map_or_else(
+                        || "-".to_string(),
+                        |status| format_timestamp(status.next_restart_at_ms),
+                    )
                 })
                 .collect();
             app.sandbox_ages = sandboxes

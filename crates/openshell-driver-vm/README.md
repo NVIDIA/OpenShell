@@ -212,8 +212,10 @@ the normal persisted restore path with the existing overlay. Delete removes the
 entire sandbox state directory, including a stop marker and overlay.
 
 The driver records a terminal tombstone when the canonical main process exits.
-Driver startup reports that sandbox as terminal instead of relaunching the VM,
-even when the process exited successfully.
+Driver startup reports that sandbox as terminal instead of relaunching the VM
+on its own. When gateway-owned restart policy selects a replacement, the
+gateway's explicit start clears the tombstone and uses the retained restore
+path.
 
 ## Logs and debugging
 
