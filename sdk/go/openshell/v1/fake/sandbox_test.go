@@ -366,6 +366,28 @@ func TestSandbox_WaitReady_IncrementsResourceVersion(t *testing.T) {
 	assert.Greater(t, ready.ResourceVersion, initialVersion)
 }
 
+func TestSandbox_WaitDeleted(t *testing.T) {
+	sc := newTestSandboxClient()
+	ctx := context.Background()
+
+	_, err := sc.Create(ctx, "default", "test-sb", &types.SandboxSpec{}, nil)
+	require.NoError(t, err)
+	require.NoError(t, sc.Delete(ctx, "default", "test-sb"))
+	require.NoError(t, sc.WaitDeleted(ctx, "default", "test-sb"))
+}
+
+func TestSandbox_WaitDeleted_HonorsPreCanceledContext(t *testing.T) {
+	sc := newTestSandboxClient()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	err := sc.WaitDeleted(ctx, "default", "already-absent")
+
+	require.Error(t, err)
+	assert.True(t, types.IsCancelled(err))
+	assert.ErrorIs(t, err, context.Canceled)
+}
+
 func TestSandbox_WaitReady_ContextTimeout(t *testing.T) {
 	sc := newTestSandboxClient()
 

@@ -459,6 +459,9 @@ func (c *fakeSandboxClient) WaitDeleted(ctx context.Context, workspace, name str
 	if c.closedFunc() {
 		return &types.StatusError{Code: types.ErrorUnavailable, Message: "client is closed"}
 	}
+	if err := ctx.Err(); err != nil {
+		return sandboxWaitContextError(err)
+	}
 
 	interval := 500 * time.Millisecond
 	if len(opts) > 0 && opts[0].PollInterval > 0 {
@@ -478,17 +481,20 @@ func (c *fakeSandboxClient) WaitDeleted(ctx context.Context, workspace, name str
 
 		select {
 		case <-ctx.Done():
-			err := ctx.Err()
-			switch err {
-			case context.DeadlineExceeded:
-				return &types.StatusError{Code: types.ErrorDeadlineExceeded, Message: err.Error(), Cause: err}
-			case context.Canceled:
-				return &types.StatusError{Code: types.ErrorCancelled, Message: err.Error(), Cause: err}
-			default:
-				return &types.StatusError{Code: types.ErrorInternal, Message: err.Error(), Cause: err}
-			}
+			return sandboxWaitContextError(ctx.Err())
 		case <-ticker.C:
 		}
+	}
+}
+
+func sandboxWaitContextError(err error) error {
+	switch err {
+	case context.DeadlineExceeded:
+		return &types.StatusError{Code: types.ErrorDeadlineExceeded, Message: err.Error(), Cause: err}
+	case context.Canceled:
+		return &types.StatusError{Code: types.ErrorCancelled, Message: err.Error(), Cause: err}
+	default:
+		return &types.StatusError{Code: types.ErrorInternal, Message: err.Error(), Cause: err}
 	}
 }
 

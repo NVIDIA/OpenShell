@@ -504,9 +504,10 @@ openshell sandbox delete my-sandbox
 The CLI waits until the sandbox is durably absent before it reports success, so
 you can safely compose deletion with operations such as workspace deletion. Use
 `--no-wait` to return after the gateway accepts the asynchronous request. Set
-`--timeout <seconds>` to override the terminal wait timeout; otherwise the CLI
-uses `OPENSHELL_LIFECYCLE_TIMEOUT`, which defaults to 300 seconds. A timeout
-returns an error while deletion continues asynchronously.
+`--timeout <seconds>` with a positive value to override the terminal wait
+timeout for each sandbox; otherwise the CLI uses
+`OPENSHELL_LIFECYCLE_TIMEOUT`, which defaults to 300 seconds. A timeout returns
+an error while deletion continues asynchronously.
 
 ## Sandbox Lifecycle
 

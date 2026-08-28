@@ -2361,7 +2361,7 @@ fn format_provider_attachment_table(providers: &[Provider], color: bool) -> Stri
 pub struct SandboxDeleteOptions {
     /// Return after the gateway acknowledges an asynchronous delete.
     pub no_wait: bool,
-    /// Override the lifecycle timeout. The environment/default applies when unset.
+    /// Override the per-sandbox lifecycle timeout. The environment/default applies when unset.
     pub timeout: Option<Duration>,
 }
 

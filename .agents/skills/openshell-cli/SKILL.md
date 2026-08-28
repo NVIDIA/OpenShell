@@ -353,9 +353,10 @@ openshell sandbox delete my-sandbox --no-wait            # Async acknowledgment 
 
 Delete waits for terminal absence by default, so a following workspace delete
 can run immediately. Use `--no-wait` only when the caller does not depend on
-cleanup completion. Override the default 300-second lifecycle timeout with
-`--timeout <seconds>` or `OPENSHELL_LIFECYCLE_TIMEOUT`; a timeout reports an
-error while gateway deletion continues asynchronously.
+cleanup completion. Override the default 300-second per-sandbox lifecycle
+timeout with a positive `--timeout <seconds>` value or
+`OPENSHELL_LIFECYCLE_TIMEOUT`; a timeout reports an error while gateway
+deletion continues asynchronously.
 
 ### Stop and start sandboxes
 

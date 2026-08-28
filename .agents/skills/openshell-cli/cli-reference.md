@@ -267,7 +267,7 @@ port forwards and waits for terminal absence by default.
 |------|---------|-------------|
 | `--all` | false | Delete every sandbox in the selected workspace |
 | `--no-wait` | false | Return after the gateway accepts deletion |
-| `--timeout <SECONDS>` | 300 | Override the terminal deletion wait timeout |
+| `--timeout <SECONDS>` | 300 | Positive per-sandbox terminal deletion wait timeout |
 
 ### `openshell sandbox stop [name]`
 
