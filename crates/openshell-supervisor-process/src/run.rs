@@ -39,8 +39,6 @@ use crate::process::{
     ResolvedWorkspace,
 };
 
-const TERMINAL_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
-
 pub type SidecarExitReport = (
     String,
     i32,
@@ -357,31 +355,29 @@ pub async fn run_process(
 
     let supervisor_terminating = Arc::new(AtomicBool::new(false));
     // A canonical process may have completed while the SSH socket was being
-    // prepared. Its relay must still register so a foreground create can
-    // attach and replay retained output before runtime shutdown.
+    // prepared. Detect that exit before entering the main wait path.
     let early_exit = handle.try_wait().into_diagnostic()?;
 
     // Spawn the persistent supervisor session if we have a gateway endpoint
     // and sandbox identity. The session provides relay channels for SSH
     // connect and ExecSandbox through the gateway.
-    let (supervisor_session_task, supervisor_session_ready) =
-        if let (Some(endpoint), Some(id), Some(socket)) =
-            (openshell_endpoint, sandbox_id, ssh_socket_path.as_ref())
-        {
-            let (task, ready) = crate::supervisor_session::spawn_with_ready(
-                endpoint.to_string(),
-                id.to_string(),
-                socket.clone(),
-                ssh_netns_fd,
-                None,
-                Arc::clone(&supervisor_terminating),
-                main_instance_id.clone(),
-            );
-            info!("supervisor session task spawned");
-            (Some(task), Some(ready))
-        } else {
-            (None, None)
-        };
+    let supervisor_session_task = if let (Some(endpoint), Some(id), Some(socket)) =
+        (openshell_endpoint, sandbox_id, ssh_socket_path.as_ref())
+    {
+        let task = crate::supervisor_session::spawn(
+            endpoint.to_string(),
+            id.to_string(),
+            socket.clone(),
+            ssh_netns_fd,
+            None,
+            Arc::clone(&supervisor_terminating),
+            main_instance_id.clone(),
+        );
+        info!("supervisor session task spawned");
+        Some(task)
+    } else {
+        None
+    };
 
     // Store the entrypoint PID so the proxy can resolve TCP peer identity
     entrypoint_pid.store(handle.pid(), Ordering::Release);
@@ -432,7 +428,7 @@ pub async fn run_process(
             (status.code(), false)
         }
     };
-    main_session.finish(rendered_code).await;
+    let terminal_attached = main_session.finish(rendered_code).await;
 
     ocsf_emit!(
         ProcessActivityBuilder::new(ocsf_ctx())
@@ -446,48 +442,46 @@ pub async fn run_process(
             .build()
     );
 
-    if drain_terminal && let Some(ready) = supervisor_session_ready {
-        timeout(TERMINAL_DRAIN_TIMEOUT, ready)
-            .await
-            .map_err(|_| miette::miette!("supervisor session registration timed out"))?
-            .map_err(|_| miette::miette!("supervisor session ended before registration"))?;
-    }
-    let terminal_delivery_ready =
-        if drain_terminal && (supervisor_session_task.is_some() || sidecar_exit_tx.is_some()) {
-            // Keep the public phase Ready until a foreground attachment has
-            // drained the result. Explicitly detached commands use the bounded
-            // fallback and then publish their terminal result.
-            timeout(
-                TERMINAL_DRAIN_TIMEOUT,
-                main_session.wait_for_terminal_delivery_ready(),
-            )
-            .await
-            .is_ok()
-        } else {
-            false
-        };
+    let defer_ephemeral_cleanup = drain_terminal && terminal_attached;
     if let Some(tx) = sidecar_exit_tx.as_ref() {
-        report_sidecar_main_process_exit(tx, &main_instance_id, rendered_code, true).await?;
+        report_sidecar_main_process_exit(
+            tx,
+            &main_instance_id,
+            rendered_code,
+            defer_ephemeral_cleanup,
+        )
+        .await?;
     } else if let (Some(endpoint), Some(id)) = (openshell_endpoint, sandbox_id) {
-        report_main_process_exit_until_ack(endpoint, id, &main_instance_id, rendered_code, true)
-            .await;
+        report_main_process_exit_until_ack(
+            endpoint,
+            id,
+            &main_instance_id,
+            rendered_code,
+            defer_ephemeral_cleanup,
+        )
+        .await;
         info!(instance_id = %main_instance_id, "main-process exit acknowledged");
     }
     main_session.mark_terminal_reported();
-    if terminal_delivery_ready {
-        let _ = timeout(
-            TERMINAL_DRAIN_TIMEOUT,
-            main_session.wait_for_terminal_delivery_complete(),
-        )
-        .await;
-    }
+    if defer_ephemeral_cleanup {
+        // The peer's SSH channel-close confirms that the terminal frames sent
+        // above traversed russh and the relay. Detached commands have no active
+        // attachment and never enter this wait.
+        main_session.wait_for_terminal_attachments().await;
 
-    if let Some(tx) = sidecar_exit_tx.as_ref() {
-        report_sidecar_main_process_exit(tx, &main_instance_id, rendered_code, false).await?;
-    } else if let (Some(endpoint), Some(id)) = (openshell_endpoint, sandbox_id) {
-        report_main_process_exit_until_ack(endpoint, id, &main_instance_id, rendered_code, false)
+        if let Some(tx) = sidecar_exit_tx.as_ref() {
+            report_sidecar_main_process_exit(tx, &main_instance_id, rendered_code, false).await?;
+        } else if let (Some(endpoint), Some(id)) = (openshell_endpoint, sandbox_id) {
+            report_main_process_exit_until_ack(
+                endpoint,
+                id,
+                &main_instance_id,
+                rendered_code,
+                false,
+            )
             .await;
-        info!(instance_id = %main_instance_id, "main-process terminal delivery acknowledged");
+            info!(instance_id = %main_instance_id, "main-process terminal delivery acknowledged");
+        }
     }
 
     supervisor_terminating.store(true, Ordering::Release);

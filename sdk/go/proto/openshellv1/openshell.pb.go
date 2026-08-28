@@ -9992,7 +9992,8 @@ type ReportMainProcessExitRequest struct {
 	ExitCode int32 `protobuf:"varint,3,opt,name=exit_code,json=exitCode,proto3" json:"exit_code,omitempty"`
 	// Keep an ephemeral sandbox reachable while an attached client drains its
 	// terminal result. The supervisor repeats the report with this field false
-	// after SSH exit delivery completes. Defaults to false for compatibility.
+	// after the attached SSH connection closes naturally. Defaults to false for
+	// compatibility.
 	DeferEphemeralCleanup bool `protobuf:"varint,4,opt,name=defer_ephemeral_cleanup,json=deferEphemeralCleanup,proto3" json:"defer_ephemeral_cleanup,omitempty"`
 	unknownFields         protoimpl.UnknownFields
 	sizeCache             protoimpl.SizeCache

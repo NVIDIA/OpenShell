@@ -2242,7 +2242,8 @@ message ReportMainProcessExitRequest {
   int32 exit_code = 3;
   // Keep an ephemeral sandbox reachable while an attached client drains its
   // terminal result. The supervisor repeats the report with this field false
-  // after SSH exit delivery completes. Defaults to false for compatibility.
+  // after the attached SSH connection closes naturally. Defaults to false for
+  // compatibility.
   bool defer_ephemeral_cleanup = 4;
 }
 

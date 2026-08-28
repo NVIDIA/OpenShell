@@ -259,6 +259,10 @@ Key flags:
 - `--forward [BIND_ADDRESS:]PORT`: Forward a local port and keep the sandbox alive
 - `--editor vscode|cursor`: Open a remote editor after creation and keep the sandbox alive
 
+`--detach` adds no attachment grace period. When the canonical process exits,
+its terminal phase is reported immediately. A foreground create instead keeps
+ephemeral cleanup deferred until its active SSH connection closes naturally.
+
 Do not combine `--upload` with a trailing main command. Uploads currently finish
 after the canonical process starts; create a scratch sandbox and use
 `sandbox exec`, or build the files into the image.

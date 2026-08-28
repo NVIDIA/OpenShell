@@ -283,35 +283,6 @@ pub fn spawn(
     terminating: Arc<AtomicBool>,
     instance_id: String,
 ) -> tokio::task::JoinHandle<()> {
-    spawn_with_ready(
-        endpoint,
-        sandbox_id,
-        ssh_socket_path,
-        netns_fd,
-        expected_ssh_peer_pid,
-        terminating,
-        instance_id,
-    )
-    .0
-}
-
-/// Spawn the supervisor session with an acceptance notification.
-///
-/// The notification orders a fast main-process exit after relay registration
-/// so terminal output remains attachable.
-pub fn spawn_with_ready(
-    endpoint: String,
-    sandbox_id: String,
-    ssh_socket_path: std::path::PathBuf,
-    netns_fd: Option<i32>,
-    expected_ssh_peer_pid: Option<u32>,
-    terminating: Arc<AtomicBool>,
-    instance_id: String,
-) -> (
-    tokio::task::JoinHandle<()>,
-    tokio::sync::oneshot::Receiver<()>,
-) {
-    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
     let config = SessionConfig {
         endpoint,
         sandbox_id,
@@ -321,8 +292,7 @@ pub fn spawn_with_ready(
         terminating,
         instance_id,
     };
-    let task = tokio::spawn(run_session_loop(config, Some(ready_tx)));
-    (task, ready_rx)
+    tokio::spawn(run_session_loop(config))
 }
 
 struct SessionConfig {
@@ -335,17 +305,14 @@ struct SessionConfig {
     instance_id: String,
 }
 
-async fn run_session_loop(
-    config: SessionConfig,
-    mut ready_tx: Option<tokio::sync::oneshot::Sender<()>>,
-) {
+async fn run_session_loop(config: SessionConfig) {
     let mut backoff = INITIAL_BACKOFF;
     let mut attempt: u64 = 0;
 
     loop {
         attempt += 1;
 
-        match run_single_session(&config, &mut ready_tx).await {
+        match run_single_session(&config).await {
             Ok(()) => {
                 let event = session_closed_event(
                     openshell_ocsf::ctx::ctx(),
@@ -372,7 +339,6 @@ async fn run_session_loop(
 
 async fn run_single_session(
     config: &SessionConfig,
-    ready_tx: &mut Option<tokio::sync::oneshot::Sender<()>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Connect to the gateway. The same `Channel` is used for both the
     // long-lived control stream and all data-plane `RelayStream` calls, so
@@ -426,10 +392,6 @@ async fn run_single_session(
         heartbeat_secs,
     );
     ocsf_emit!(event);
-    if let Some(ready_tx) = ready_tx.take() {
-        let _ = ready_tx.send(());
-    }
-
     // Main loop: receive gateway messages + send heartbeats.
     let mut heartbeat_interval =
         tokio::time::interval(Duration::from_secs(u64::from(heartbeat_secs)));

@@ -29,9 +29,11 @@ The live supervisor session is the readiness authority for its main-process
 instance. The supervisor reports its normalized result through the
 sandbox-authenticated `ReportMainProcessExit` RPC, and the gateway rejects
 results from stale instance IDs. The process supervisor keeps the main SSH
-session alive until an attached foreground client drains output to the terminal
-event or a bounded detached timeout expires. It durably reports the result,
-sends the SSH exit status, and only then releases deferred ephemeral cleanup.
+session alive only when a foreground attachment is active at process exit. It
+durably reports the result immediately, sends the SSH exit status, and waits for
+the peer's SSH channel close before releasing deferred ephemeral cleanup.
+Detached commands have no attachment to drain, so they report their result and
+exit immediately without a grace period.
 
 ## Protocol and Auth
 

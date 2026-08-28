@@ -481,9 +481,11 @@ engine with a gateway policy revision.
   re-evaluate.
 - If the supervisor relay drops, the sandbox can keep running, but connect and
   exec operations fail until the supervisor registers again.
-- If the canonical main process exits, the supervisor drains its retained main
-  output, durably reports the normalized result, sends the SSH exit status, and
-  releases deferred ephemeral cleanup before shutdown. Exit code 0 records
+- If the canonical main process exits, the supervisor durably reports the
+  normalized result immediately. When a foreground main attachment is active,
+  it sends the retained output and SSH exit status, waits for the peer's channel
+  close, and then releases deferred ephemeral cleanup. With no active
+  attachment, it exits without a grace period. Exit code 0 records
   `Completed/MainProcessCompleted`; nonzero and signal-normalized exits record
   `Error/MainProcessFailed`. Infrastructure failures also use `Error`, with a
   distinct condition reason and no fabricated canonical-process result. Runtime

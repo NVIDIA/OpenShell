@@ -54,12 +54,8 @@ struct OutputLogState {
 struct OutputLog {
     state: Mutex<OutputLogState>,
     version: watch::Sender<u64>,
-    terminal_delivery_ready: std::sync::atomic::AtomicBool,
-    terminal_delivery_ready_notify: Notify,
     terminal_reported: std::sync::atomic::AtomicBool,
     terminal_reported_notify: Notify,
-    terminal_delivery_complete: std::sync::atomic::AtomicBool,
-    terminal_delivery_complete_notify: Notify,
 }
 
 impl OutputLog {
@@ -72,12 +68,8 @@ impl OutputLog {
                 next_sequence: 0,
             }),
             version,
-            terminal_delivery_ready: std::sync::atomic::AtomicBool::new(false),
-            terminal_delivery_ready_notify: Notify::new(),
             terminal_reported: std::sync::atomic::AtomicBool::new(false),
             terminal_reported_notify: Notify::new(),
-            terminal_delivery_complete: std::sync::atomic::AtomicBool::new(false),
-            terminal_delivery_complete_notify: Notify::new(),
         })
     }
 
@@ -116,6 +108,12 @@ impl OutputLog {
             version,
         }
     }
+}
+
+#[derive(Debug)]
+struct TerminalAttachmentState {
+    accepting: bool,
+    active: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -183,6 +181,8 @@ pub struct MainSession {
     readers_remaining: AtomicUsize,
     readers_done: Notify,
     finished: std::sync::atomic::AtomicBool,
+    terminal_attachments: Mutex<TerminalAttachmentState>,
+    terminal_attachments_done: Notify,
 }
 
 impl MainSession {
@@ -200,6 +200,11 @@ impl MainSession {
             readers_remaining: AtomicUsize::new(0),
             readers_done: Notify::new(),
             finished: std::sync::atomic::AtomicBool::new(false),
+            terminal_attachments: Mutex::new(TerminalAttachmentState {
+                accepting: true,
+                active: 0,
+            }),
+            terminal_attachments_done: Notify::new(),
         })
     }
 
@@ -245,6 +250,11 @@ impl MainSession {
             readers_remaining: AtomicUsize::new(if terminal { 1 } else { 2 }),
             readers_done: Notify::new(),
             finished: std::sync::atomic::AtomicBool::new(false),
+            terminal_attachments: Mutex::new(TerminalAttachmentState {
+                accepting: true,
+                active: 0,
+            }),
+            terminal_attachments_done: Notify::new(),
         });
         Self::start_io(&session, io, input_rx);
         session
@@ -355,34 +365,29 @@ impl MainSession {
         }
     }
 
-    pub async fn finish(&self, exit_code: i32) {
+    /// Publish the terminal event and stop accepting new main attachments.
+    ///
+    /// Returns whether a foreground attachment was active at process exit.
+    pub async fn finish(&self, exit_code: i32) -> bool {
         let notified = self.readers_done.notified();
         if self.readers_remaining.load(Ordering::Acquire) != 0 {
-            let _ = tokio::time::timeout(std::time::Duration::from_secs(2), notified).await;
+            notified.await;
         }
+        let attached = {
+            let mut state = self
+                .terminal_attachments
+                .lock()
+                .expect("terminal attachment lock poisoned");
+            state.accepting = false;
+            state.active != 0
+        };
         self.finished.store(true, Ordering::Release);
         self.publish(MainOutput::Exit(exit_code));
+        attached
     }
 
     pub fn subscribe(&self) -> MainOutputCursor {
         self.output.subscribe()
-    }
-
-    /// Wait until an attached main-session consumer drains output through the
-    /// terminal event and is ready for the durable lifecycle report.
-    pub async fn wait_for_terminal_delivery_ready(&self) {
-        let notified = self.output.terminal_delivery_ready_notify.notified();
-        if self.output.terminal_delivery_ready.load(Ordering::Acquire) {
-            return;
-        }
-        notified.await;
-    }
-
-    pub fn mark_terminal_delivery_ready(&self) {
-        self.output
-            .terminal_delivery_ready
-            .store(true, Ordering::Release);
-        self.output.terminal_delivery_ready_notify.notify_waiters();
     }
 
     /// Wait until the gateway durably acknowledges the main-process result.
@@ -401,27 +406,56 @@ impl MainSession {
         self.output.terminal_reported_notify.notify_waiters();
     }
 
-    /// Wait until the SSH attachment has finished attempting to send its exit
-    /// status after the durable lifecycle report.
-    pub async fn wait_for_terminal_delivery_complete(&self) {
-        let notified = self.output.terminal_delivery_complete_notify.notified();
-        if self
-            .output
-            .terminal_delivery_complete
-            .load(Ordering::Acquire)
-        {
-            return;
+    /// Register a foreground main attachment while the process is live.
+    pub fn begin_terminal_attachment(&self) -> Result<(), &'static str> {
+        let mut state = self
+            .terminal_attachments
+            .lock()
+            .expect("terminal attachment lock poisoned");
+        if !state.accepting {
+            return Err("canonical main process already finished");
         }
-        notified.await;
+        state.active = state
+            .active
+            .checked_add(1)
+            .expect("terminal attachment count exhausted");
+        Ok(())
     }
 
-    pub fn mark_terminal_delivery_complete(&self) {
-        self.output
-            .terminal_delivery_complete
-            .store(true, Ordering::Release);
-        self.output
-            .terminal_delivery_complete_notify
-            .notify_waiters();
+    /// Release a foreground main attachment after its SSH channel closes.
+    pub fn end_terminal_attachment(&self) {
+        let completed = {
+            let mut state = self
+                .terminal_attachments
+                .lock()
+                .expect("terminal attachment lock poisoned");
+            debug_assert!(state.active != 0, "terminal attachment count underflow");
+            if state.active == 0 {
+                return;
+            }
+            state.active -= 1;
+            state.active == 0
+        };
+        if completed {
+            self.terminal_attachments_done.notify_waiters();
+        }
+    }
+
+    /// Wait for all attachments that existed at process exit to close.
+    pub async fn wait_for_terminal_attachments(&self) {
+        loop {
+            let notified = self.terminal_attachments_done.notified();
+            if self
+                .terminal_attachments
+                .lock()
+                .expect("terminal attachment lock poisoned")
+                .active
+                == 0
+            {
+                return;
+            }
+            notified.await;
+        }
     }
 
     pub fn acquire_input(&self) -> Result<(u64, tokio::sync::mpsc::Sender<Vec<u8>>), &'static str> {
@@ -517,34 +551,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn terminal_delivery_readiness_requires_an_attachment() {
+    async fn finish_without_attachment_does_not_defer_shutdown() {
         let session = MainSession::inert();
-        session.finish(0).await;
+        assert!(!session.finish(0).await);
         assert!(session.finished());
-
-        assert!(
-            tokio::time::timeout(
-                std::time::Duration::from_millis(10),
-                session.wait_for_terminal_delivery_ready(),
-            )
-            .await
-            .is_err(),
-            "publishing Exit alone must not count as delivery"
-        );
-
-        session.mark_terminal_delivery_ready();
-        tokio::time::timeout(
-            std::time::Duration::from_secs(1),
-            session.wait_for_terminal_delivery_ready(),
-        )
-        .await
-        .expect("delivery readiness should wake waiter");
+        assert!(session.begin_terminal_attachment().is_err());
     }
 
     #[tokio::test]
     async fn terminal_report_acknowledgement_is_independent_from_delivery() {
         let session = MainSession::inert();
-        session.mark_terminal_delivery_ready();
 
         assert!(
             tokio::time::timeout(
@@ -566,34 +582,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn terminal_delivery_completion_is_distinct_from_readiness_and_reporting() {
+    async fn finish_waits_for_an_active_attachment_to_close_naturally() {
         let session = MainSession::inert();
-        session.mark_terminal_delivery_ready();
-        session.mark_terminal_reported();
+        session
+            .begin_terminal_attachment()
+            .expect("begin terminal attachment");
+        assert!(session.finish(0).await);
 
         assert!(
             tokio::time::timeout(
                 std::time::Duration::from_millis(10),
-                session.wait_for_terminal_delivery_complete(),
+                session.wait_for_terminal_attachments(),
             )
             .await
             .is_err(),
-            "gateway persistence must not imply SSH exit delivery"
+            "an active attachment must keep terminal delivery open"
         );
 
-        session.mark_terminal_delivery_complete();
+        session.end_terminal_attachment();
         tokio::time::timeout(
             std::time::Duration::from_secs(1),
-            session.wait_for_terminal_delivery_complete(),
+            session.wait_for_terminal_attachments(),
         )
         .await
-        .expect("completed SSH delivery should wake waiter");
+        .expect("closing the attachment should wake the waiter");
     }
 
     #[tokio::test]
-    async fn exit_is_replayed_once_to_late_subscribers() {
+    async fn exit_is_retained_in_the_output_log() {
         let session = MainSession::inert();
-        session.finish(0).await;
+        let _ = session.finish(0).await;
 
         let mut output = session.subscribe();
         assert!(matches!(
