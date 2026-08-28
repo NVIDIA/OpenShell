@@ -71,6 +71,36 @@ runs:
         INPUTS_EXTRA_CARGO_FLAGS: ${{ inputs.extra-cargo-flags }}
       run: GIT_DIR=/nonexistent cargo auditable build --release --package "${INPUTS_PACKAGE}" --bin "${INPUTS_BINARY}" ${INPUTS_EXTRA_CARGO_FLAGS}
 
+    - name: Normalize Darwin dynamic binary
+      if: endsWith(inputs.triple, '-apple-darwin')
+      shell: bash -euo pipefail {0}
+      env:
+        INPUTS_BINARY: ${{ inputs.binary }}
+      run: |
+        binary=target/release/${INPUTS_BINARY}
+        nix_iconv_paths=$(otool -L "$binary" | awk '$1 ~ "^/nix/store/.*/lib/libiconv\\.2\\.dylib$" { print $1 }')
+        if [[ -n "$nix_iconv_paths" ]]; then
+          while IFS= read -r nix_iconv_path; do
+            install_name_tool -change "$nix_iconv_path" /usr/lib/libiconv.2.dylib "$binary"
+          done <<< "$nix_iconv_paths"
+          codesign --force --sign - "$binary"
+        fi
+
+    - name: Verify Darwin portability
+      if: endsWith(inputs.triple, '-apple-darwin')
+      shell: bash -euo pipefail {0}
+      env:
+        INPUTS_BINARY: ${{ inputs.binary }}
+      run: |
+        binary=target/release/${INPUTS_BINARY}
+        nix_dependencies=$(otool -L "$binary" | awk '$1 ~ "^/nix/store/" { print $1 }')
+        if [[ -n "$nix_dependencies" ]]; then
+          echo "error: $binary has non-portable Nix store dependencies:" >&2
+          printf '  %s\n' "$nix_dependencies" >&2
+          exit 1
+        fi
+        codesign --verify --verbose=2 "$binary"
+
     - name: Verify ${{ inputs.binary }}
       shell: nix develop ${{ inputs.dev-shell }} -c bash -euo pipefail {0}
       env:
