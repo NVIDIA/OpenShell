@@ -51,11 +51,6 @@ impl<'a> GatewayResourceAttributes<'a> {
             compute_driver,
         }
     }
-
-    /// The configured gateway installation name, if any.
-    pub fn name(&self) -> Option<&'a str> {
-        self.name
-    }
 }
 
 fn trace_config<'cfg>(

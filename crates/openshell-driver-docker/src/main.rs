@@ -6,8 +6,8 @@ use std::path::PathBuf;
 
 use clap::Parser;
 use miette::{IntoDiagnostic, Result};
-use openshell_core::proto::compute::v1::compute_driver_server::ComputeDriverServer;
 use openshell_core::VERSION;
+use openshell_core::proto::compute::v1::compute_driver_server::ComputeDriverServer;
 use openshell_driver_docker::otel_tracing::compute_driver_rpc_layer;
 use openshell_driver_docker::{ComputeDriverService, DockerComputeConfig, DockerComputeDriver};
 use tracing::info;

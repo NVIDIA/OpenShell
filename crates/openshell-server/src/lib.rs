@@ -1051,6 +1051,12 @@ pub use compute::{
 pub enum ComputeDriverInstance {
     /// A driver hosted in the gateway process.
     InProcess(SharedComputeDriver),
+    /// An in-process driver with a typed sandbox-policy side channel.
+    #[cfg(target_os = "windows")]
+    InProcessWithSandboxPolicy {
+        driver: SharedComputeDriver,
+        sink: Arc<tokio::sync::Mutex<HashMap<String, openshell_core::proto::SandboxPolicy>>>,
+    },
     /// A driver process launched and owned by the gateway.
     ManagedRemote(AcquiredRemoteDriverEndpoint),
 }
@@ -1090,7 +1096,7 @@ impl ComputeDriverTracingSetup {
 }
 
 /// Factory for a compiled driver's optional tracing integration.
-pub type ComputeDriverTracingFactory = fn(Option<&str>) -> ComputeDriverTracingSetup;
+pub type ComputeDriverTracingFactory = fn(Option<&str>, Option<&str>) -> ComputeDriverTracingSetup;
 
 /// Factory for a compute driver linked into a gateway binary.
 #[async_trait::async_trait]
@@ -1264,6 +1270,7 @@ impl ComputeDriverRegistry {
         selection: &ComputeDriverSelection,
         endpoint_overrides: &BTreeMap<String, PathBuf>,
         otlp_endpoint: Option<&str>,
+        gateway_name: Option<&str>,
     ) -> ComputeDriverTracingSetup {
         let name = selection.name();
         if endpoint_overrides.contains_key(name) {
@@ -1272,7 +1279,7 @@ impl ComputeDriverRegistry {
         self.get(name)
             .and_then(|registration| registration.tracing_setup)
             .map_or_else(ComputeDriverTracingSetup::default, |setup| {
-                setup(otlp_endpoint)
+                setup(otlp_endpoint, gateway_name)
             })
     }
 
@@ -1322,6 +1329,7 @@ impl ComputeDriverRegistry {
 
 pub struct ComputeDriverBuildContext<'a> {
     driver_name: String,
+    gateway_name: &'a str,
     gateway_bind_address: SocketAddr,
     gateway_log_level: &'a str,
     driver_startup: compute::driver_config::DriverStartupContext<'a>,
@@ -1333,6 +1341,11 @@ impl ComputeDriverBuildContext<'_> {
     #[must_use]
     pub fn driver_name(&self) -> &str {
         &self.driver_name
+    }
+
+    #[must_use]
+    pub fn gateway_name(&self) -> &str {
+        self.gateway_name
     }
 
     #[must_use]
@@ -1419,6 +1432,7 @@ async fn build_compute_runtime(
         ConfiguredComputeDriver::Registered(registration) => {
             let build_context = ComputeDriverBuildContext {
                 driver_name: registration.name.clone(),
+                gateway_name: &config.name,
                 gateway_bind_address: config.bind_address,
                 gateway_log_level: &config.log_level,
                 driver_startup,
@@ -1441,6 +1455,24 @@ async fn build_compute_runtime(
                 .map_err(|error| {
                     Error::execution(format!("failed to create compute runtime: {error}"))
                 })?,
+                #[cfg(target_os = "windows")]
+                ComputeDriverInstance::InProcessWithSandboxPolicy { driver, sink } => {
+                    ComputeRuntime::from_driver(
+                        registration.name,
+                        driver,
+                        None,
+                        store,
+                        sandbox_index,
+                        sandbox_watch_bus,
+                        tracing_log_bus,
+                        supervisor_sessions,
+                    )
+                    .await
+                    .map_err(|error| {
+                        Error::execution(format!("failed to create compute runtime: {error}"))
+                    })?
+                    .with_sandbox_policy_sink(sink)
+                }
                 ComputeDriverInstance::ManagedRemote(mut endpoint) => {
                     endpoint.name = registration.name;
                     ComputeRuntime::new_remote_driver(

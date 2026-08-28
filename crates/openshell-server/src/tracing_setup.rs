@@ -12,6 +12,7 @@ use tracing_subscriber::EnvFilter;
 use tracing_subscriber::prelude::*;
 
 use crate::config_file::OtlpConfig;
+use crate::otel_tracing::GatewayResourceAttributes;
 use crate::tracing_bus::TracingLogBus;
 use crate::{ComputeDriverTracingSetup, ComputeDriverTracingShutdown};
 
@@ -40,8 +41,9 @@ pub fn install(
     tracing_log_bus: &TracingLogBus,
     otlp_config: Option<&OtlpConfig>,
     compute_driver_tracing: ComputeDriverTracingSetup,
+    gateway: GatewayResourceAttributes<'_>,
 ) -> (TracingHandle, Option<String>) {
-    let (tracer_provider, setup_error) = crate::otel_tracing::provider_for(otlp_config);
+    let (tracer_provider, setup_error) = crate::otel_tracing::provider_for(otlp_config, gateway);
     let ComputeDriverTracingSetup {
         layer,
         shutdown,

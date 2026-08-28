@@ -22,6 +22,7 @@ path = "src/main.rs"
 openshell-core = { path = "../openshell-core", default-features = false }
 openshell-otel = { path = "../openshell-otel" }
 openshell-policy = { path = "../openshell-policy" }
+openshell-driver-podman = { path = "../openshell-driver-podman" }
 openshell-vfio = { path = "../openshell-vfio" }
 
 bollard = { version = "0.20", features = ["ssh"] }

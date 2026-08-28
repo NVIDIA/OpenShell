@@ -4069,6 +4069,7 @@ dependencies = [
  "nix 0.29.0",
  "oci-client",
  "openshell-core",
+ "openshell-driver-podman",
  "openshell-otel",
  "openshell-otel-test-support",
  "openshell-policy",
@@ -4111,6 +4112,30 @@ dependencies = [
  "tokio-stream",
  "tonic",
  "tower 0.5.3",
+]
+
+[[package]]
+name = "openshell-gateway"
+version = "0.0.0"
+dependencies = [
+ "async-trait",
+ "hyper-util",
+ "miette",
+ "nix 0.29.0",
+ "openshell-core",
+ "openshell-driver-docker",
+ "openshell-driver-kubernetes",
+ "openshell-driver-mxc",
+ "openshell-driver-podman",
+ "openshell-otel",
+ "openshell-server",
+ "rustix 1.1.4",
+ "serde",
+ "tempfile",
+ "tokio",
+ "tonic",
+ "tower 0.5.3",
+ "tracing",
 ]
 
 [[package]]
@@ -4324,11 +4349,7 @@ dependencies = [
  "openshell-bootstrap",
  "openshell-core",
  "openshell-driver-db-credstore",
- "openshell-driver-docker",
- "openshell-driver-kubernetes",
  "openshell-driver-kubernetes-secrets",
- "openshell-driver-mxc",
- "openshell-driver-podman",
  "openshell-driver-vault",
  "openshell-extension-core",
  "openshell-gateway-interceptors",

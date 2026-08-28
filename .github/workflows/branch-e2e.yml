@@ -166,7 +166,7 @@ jobs:
             interpreter: /lib/ld-linux-aarch64.so.1
     uses: ./.github/workflows/build-binaries.yml
     with:
-      package: openshell-server
+      package: openshell-gateway
       binary: openshell-gateway
       artifact-name: openshell-gateway-plain-${{ matrix.triple }}
       triple: ${{ matrix.triple }}

@@ -564,14 +564,10 @@ pub struct ComputeRuntime {
     lifecycle_gates: Arc<LifecycleGateRegistry>,
     gateway_listener_requirements: Vec<GatewayListenerRequirement>,
     replica_id: String,
-    /// A1 policy side channel for the in-process MXC driver. `create_sandbox`
-    /// stages the typed `SandboxPolicy` here by sandbox id immediately before
-    /// dispatching to the driver, which consumes it. `None` for all other
-    /// drivers. The proto driver contract has no `policy` field and there is no
-    /// driver-side `GetSandboxConfig`, so this in-process map is how the policy
-    /// reaches the MXC backend without changing the cross-process contract.
+    /// Optional policy side channel supplied by an in-process driver whose
+    /// public RPC contract cannot carry the typed sandbox policy.
     #[cfg(target_os = "windows")]
-    mxc_policy_sink: Option<Arc<Mutex<HashMap<String, SandboxPolicy>>>>,
+    sandbox_policy_sink: Option<Arc<Mutex<HashMap<String, SandboxPolicy>>>>,
 }
 
 impl fmt::Debug for ComputeRuntime {
@@ -691,7 +687,7 @@ impl ComputeRuntime {
             gateway_listener_requirements,
             replica_id: lease::replica_id(),
             #[cfg(target_os = "windows")]
-            mxc_policy_sink: None,
+            sandbox_policy_sink: None,
         })
     }
 
@@ -790,6 +786,16 @@ impl ComputeRuntime {
         telemetry_compute_driver: TelemetryComputeDriver,
     ) -> Self {
         self.telemetry_compute_driver = telemetry_compute_driver;
+        self
+    }
+
+    #[cfg(target_os = "windows")]
+    #[must_use]
+    pub(crate) fn with_sandbox_policy_sink(
+        mut self,
+        sink: Arc<Mutex<HashMap<String, SandboxPolicy>>>,
+    ) -> Self {
+        self.sandbox_policy_sink = Some(sink);
         self
     }
 
@@ -912,7 +918,7 @@ impl ComputeRuntime {
         // before dispatch. The driver removes/consumes it in create_sandbox. The
         // proto driver contract has no policy field, so this is the only path.
         #[cfg(target_os = "windows")]
-        if let Some(sink) = &self.mxc_policy_sink
+        if let Some(sink) = &self.sandbox_policy_sink
             && let Some(p) = sandbox.spec.as_ref().and_then(|s| s.policy.clone())
         {
             sink.lock().await.insert(sandbox_id.clone(), p);
@@ -4310,10 +4316,24 @@ fn derive_phase(status: Option<&DriverSandboxStatus>) -> SandboxPhase {
             return SandboxPhase::Deleting;
         }
 
-        if status.conditions.iter().any(|condition| {
-            condition.r#type.eq_ignore_ascii_case("Suspended")
+        // `Ready=True` means the sandbox is usable through this gateway and must
+        // win over a `Suspended=True` condition. Agent Sandbox v1beta1 sets
+        // `Suspended=True (PodTerminated)` on stop and does not clear it on resume,
+        // so a resumed CR carries both `Ready=True` and a stale `Suspended=True`.
+        // Treating any `Suspended=True` as Stopped would pin the resumed sandbox at
+        // Starting forever (issue #2932). A genuine stop leaves `Ready` unset or
+        // False, so `Suspended` still resolves to Stopped in that case.
+        let ready = status.conditions.iter().any(|condition| {
+            condition.r#type.eq_ignore_ascii_case("Ready")
                 && condition.status.eq_ignore_ascii_case("true")
-        }) {
+        });
+
+        if !ready
+            && status.conditions.iter().any(|condition| {
+                condition.r#type.eq_ignore_ascii_case("Suspended")
+                    && condition.status.eq_ignore_ascii_case("true")
+            })
+        {
             return SandboxPhase::Stopped;
         }
 
@@ -4641,7 +4661,7 @@ pub async fn new_test_runtime_with_driver(
         gateway_listener_requirements: Vec::new(),
         replica_id: "test-replica".to_string(),
         #[cfg(target_os = "windows")]
-        mxc_policy_sink: None,
+        sandbox_policy_sink: None,
     }
 }
 
@@ -5369,7 +5389,7 @@ mod tests {
             gateway_listener_requirements: Vec::new(),
             replica_id: "test-replica".to_string(),
             #[cfg(target_os = "windows")]
-            mxc_policy_sink: None,
+            sandbox_policy_sink: None,
         }
     }
 
@@ -7215,6 +7235,56 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(current.phase(), SandboxPhase::Stopped as i32);
+    }
+
+    #[tokio::test]
+    async fn resumed_v1beta1_snapshot_with_stale_suspended_reaches_ready() {
+        // Reproduces issue #2932: on Agent Sandbox v1beta1 a resumed CR reports
+        // Ready=True (DependenciesReady) alongside a stale Suspended=True
+        // (PodTerminated). Starting from the Starting phase that `start` sets, the
+        // reconciled sandbox must advance to Ready rather than being pinned at
+        // Starting by the stale Suspended condition.
+        let runtime = test_runtime(Arc::new(TestDriver::default())).await;
+        let sandbox = sandbox_record("sb-resumed", "sandbox-resumed", SandboxPhase::Starting);
+        runtime.store.put_message(&sandbox).await.unwrap();
+        register_test_supervisor_session(&runtime, sandbox.object_id());
+
+        let mut resumed = ready_driver_sandbox(sandbox.object_id(), sandbox.object_name());
+        resumed.status = Some(DriverSandboxStatus {
+            sandbox_name: sandbox.object_name().to_string(),
+            instance_id: format!("{}-pod", sandbox.object_name()),
+            conditions: vec![
+                DriverCondition {
+                    r#type: "Ready".to_string(),
+                    status: "True".to_string(),
+                    reason: "DependenciesReady".to_string(),
+                    message: "Sandbox is ready".to_string(),
+                    last_transition_time: String::new(),
+                },
+                DriverCondition {
+                    r#type: "Suspended".to_string(),
+                    status: "True".to_string(),
+                    reason: "PodTerminated".to_string(),
+                    message: "Pod terminated".to_string(),
+                    last_transition_time: String::new(),
+                },
+            ],
+            ..Default::default()
+        });
+
+        runtime.apply_sandbox_update(resumed).await.unwrap();
+
+        let current = runtime
+            .store
+            .get_message::<Sandbox>(sandbox.object_id())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            current.phase(),
+            SandboxPhase::Ready as i32,
+            "a resumed, Ready sandbox must not stay Starting because of a stale Suspended condition"
+        );
     }
 
     #[tokio::test]

@@ -34,6 +34,9 @@ tonic = { workspace = true, optional = true }
 tower = { workspace = true, optional = true }
 tracing = { workspace = true, optional = true }
 
+[target.'cfg(target_os = "windows")'.dependencies]
+openshell-driver-mxc = { path = "../openshell-driver-mxc", optional = true }
+
 [features]
 default = ["telemetry", "in-tree-compute-drivers"]
 in-tree-compute-drivers = [
@@ -48,6 +51,7 @@ in-tree-compute-drivers = [
     "dep:tonic",
     "dep:tower",
     "dep:tracing",
+    "dep:openshell-driver-mxc",
 ]
 telemetry = ["openshell-core/telemetry", "openshell-server/telemetry"]
 ## Convenience alias: every default feature except `telemetry`. Build a

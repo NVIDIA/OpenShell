@@ -3136,12 +3136,11 @@ pub(super) async fn handle_get_sandbox_provider_environment(
 // ---------------------------------------------------------------------------
 
 fn validate_live_policy_update_support(
-    driver_kind: Option<openshell_core::ComputeDriverKind>,
+    driver_name: &str,
     has_policy: bool,
     has_merge_ops: bool,
 ) -> Result<(), Status> {
-    if (has_policy || has_merge_ops) && driver_kind == Some(openshell_core::ComputeDriverKind::Mxc)
-    {
+    if (has_policy || has_merge_ops) && driver_name == "mxc" {
         return Err(Status::failed_precondition(
             "live policy updates are not supported for MXC sandboxes; recreate the sandbox so the new policy is mapped before launch",
         ));
@@ -3223,7 +3222,11 @@ async fn handle_update_config_inner(
             "one of policy, setting_key, or merge_operations must be provided",
         ));
     }
-    validate_live_policy_update_support(state.compute.driver_kind(), has_policy, has_merge_ops)?;
+    validate_live_policy_update_support(
+        state.compute.configured_driver_name(),
+        has_policy,
+        has_merge_ops,
+    )?;
     if req.global {
         if !req.annotations.is_empty() {
             return Err(Status::invalid_argument(
@@ -6914,21 +6917,14 @@ mod tests {
     #[test]
     fn mxc_rejects_sandbox_policy_replacement_and_merge_updates() {
         for (has_policy, has_merge_ops) in [(true, false), (false, true)] {
-            let error = validate_live_policy_update_support(
-                Some(openshell_core::ComputeDriverKind::Mxc),
-                has_policy,
-                has_merge_ops,
-            )
-            .expect_err("MXC must reject policy mutations after launch");
+            let error = validate_live_policy_update_support("mxc", has_policy, has_merge_ops)
+                .expect_err("MXC must reject policy mutations after launch");
             assert_eq!(error.code(), Code::FailedPrecondition);
         }
 
-        let error = validate_live_policy_update_support(
-            Some(openshell_core::ComputeDriverKind::Mxc),
-            true,
-            false,
-        )
-        .expect_err("global policy replacement also changes desired state for live MXC sandboxes");
+        let error = validate_live_policy_update_support("mxc", true, false).expect_err(
+            "global policy replacement also changes desired state for live MXC sandboxes",
+        );
         assert_eq!(error.code(), Code::FailedPrecondition);
     }
 

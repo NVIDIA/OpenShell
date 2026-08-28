@@ -3679,28 +3679,7 @@ async fn connect_local_container_engine() -> Option<Docker> {
 }
 
 fn detect_podman_socket() -> Option<PathBuf> {
-    let mut candidates = Vec::new();
-    if let Ok(path) = std::env::var("OPENSHELL_PODMAN_SOCKET")
-        && !path.trim().is_empty()
-    {
-        candidates.push(PathBuf::from(path));
-    }
-    if let Some(runtime_dir) = std::env::var_os("XDG_RUNTIME_DIR") {
-        candidates.push(PathBuf::from(runtime_dir).join("podman/podman.sock"));
-    }
-    #[cfg(target_os = "linux")]
-    candidates.push(PathBuf::from(format!(
-        "/run/user/{}/podman/podman.sock",
-        rustix::process::geteuid().as_raw()
-    )));
-    if let Some(home) = std::env::var_os("HOME") {
-        candidates
-            .push(PathBuf::from(home).join(".local/share/containers/podman/machine/podman.sock"));
-    }
-    openshell_core::local_api_socket::first_responsive_socket(&candidates, |response| {
-        openshell_core::local_api_socket::http_response_is_success(response)
-            && openshell_core::local_api_socket::contains_ascii(response, b"Libpod-Api-Version:")
-    })
+    openshell_driver_podman::driver::detect_socket()
 }
 
 fn is_openshell_local_build_image_ref(image_ref: &str) -> bool {
