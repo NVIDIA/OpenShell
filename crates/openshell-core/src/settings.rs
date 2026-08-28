@@ -69,7 +69,8 @@ impl RegisteredSetting {
 ///    (supervisor). No database migration is needed -- new keys are stored in
 ///    the existing settings JSON blob.
 /// 3. Add sandbox-side consumption in `openshell-sandbox` to read and act on
-///    the new key from the poll loop's `SettingsPollResult::settings` map.
+///    the new key from `SandboxConfigSnapshot.settings` during desired-state
+///    application.
 /// 4. The key will automatically appear in `settings get` (CLI/TUI) and be
 ///    settable via `settings set`. The server validates that only registered
 ///    keys are accepted.

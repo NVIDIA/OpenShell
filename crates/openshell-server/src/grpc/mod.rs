@@ -30,29 +30,27 @@ use openshell_core::proto::{
     GetGatewayConfigRequest, GetGatewayConfigResponse, GetGatewayInfoRequest,
     GetGatewayInfoResponse, GetProviderProfileRequest, GetProviderRefreshStatusRequest,
     GetProviderRefreshStatusResponse, GetProviderRequest, GetSandboxConfigRequest,
-    GetSandboxConfigResponse, GetSandboxLogsRequest, GetSandboxLogsResponse,
-    GetSandboxPolicyStatusRequest, GetSandboxPolicyStatusResponse,
-    GetSandboxProviderEnvironmentRequest, GetSandboxProviderEnvironmentResponse, GetSandboxRequest,
-    GetServiceRequest, GetWorkspaceRequest, GetWorkspaceResponse, HealthRequest, HealthResponse,
-    ImportProviderProfilesRequest, ImportProviderProfilesResponse, IssueSandboxTokenRequest,
-    IssueSandboxTokenResponse, LintProviderProfilesRequest, LintProviderProfilesResponse,
-    ListProviderProfilesRequest, ListProviderProfilesResponse, ListProvidersRequest,
-    ListProvidersResponse, ListSandboxPoliciesRequest, ListSandboxPoliciesResponse,
-    ListSandboxProvidersRequest, ListSandboxProvidersResponse, ListSandboxesRequest,
-    ListSandboxesResponse, ListServicesRequest, ListServicesResponse, ListWorkspaceMembersRequest,
-    ListWorkspaceMembersResponse, ListWorkspacesRequest, ListWorkspacesResponse,
-    ProviderProfileResponse, ProviderResponse, PushSandboxLogsRequest, PushSandboxLogsResponse,
-    RefreshSandboxTokenRequest, RefreshSandboxTokenResponse, RejectDraftChunkRequest,
-    RejectDraftChunkResponse, RelayFrame, RemoveWorkspaceMemberRequest,
-    RemoveWorkspaceMemberResponse, ReportMainProcessExitRequest, ReportMainProcessExitResponse,
-    ReportPolicyStatusRequest, ReportPolicyStatusResponse, RevokeSshSessionRequest,
-    RevokeSshSessionResponse, RotateProviderCredentialRequest, RotateProviderCredentialResponse,
-    SandboxResponse, ServiceEndpointResponse, ServiceStatus, StartSandboxRequest,
-    StopSandboxRequest, SubmitPolicyAnalysisRequest, SubmitPolicyAnalysisResponse,
-    SupervisorMessage, TcpForwardFrame, UndoDraftChunkRequest, UndoDraftChunkResponse,
-    UpdateConfigRequest, UpdateConfigResponse, UpdateProviderProfilesRequest,
-    UpdateProviderProfilesResponse, UpdateProviderRequest, WatchSandboxRequest,
-    open_shell_server::OpenShell,
+    GetSandboxLogsRequest, GetSandboxLogsResponse, GetSandboxPolicyStatusRequest,
+    GetSandboxPolicyStatusResponse, GetSandboxRequest, GetServiceRequest, GetWorkspaceRequest,
+    GetWorkspaceResponse, HealthRequest, HealthResponse, ImportProviderProfilesRequest,
+    ImportProviderProfilesResponse, IssueSandboxTokenRequest, IssueSandboxTokenResponse,
+    LintProviderProfilesRequest, LintProviderProfilesResponse, ListProviderProfilesRequest,
+    ListProviderProfilesResponse, ListProvidersRequest, ListProvidersResponse,
+    ListSandboxPoliciesRequest, ListSandboxPoliciesResponse, ListSandboxProvidersRequest,
+    ListSandboxProvidersResponse, ListSandboxesRequest, ListSandboxesResponse, ListServicesRequest,
+    ListServicesResponse, ListWorkspaceMembersRequest, ListWorkspaceMembersResponse,
+    ListWorkspacesRequest, ListWorkspacesResponse, ProviderProfileResponse, ProviderResponse,
+    PushSandboxLogsRequest, PushSandboxLogsResponse, RefreshSandboxTokenRequest,
+    RefreshSandboxTokenResponse, RejectDraftChunkRequest, RejectDraftChunkResponse, RelayFrame,
+    RemoveWorkspaceMemberRequest, RemoveWorkspaceMemberResponse, ReportMainProcessExitRequest,
+    ReportMainProcessExitResponse, ReportPolicyStatusRequest, ReportPolicyStatusResponse,
+    RevokeSshSessionRequest, RevokeSshSessionResponse, RotateProviderCredentialRequest,
+    RotateProviderCredentialResponse, SandboxConfigSnapshot, SandboxResponse,
+    ServiceEndpointResponse, ServiceStatus, StartSandboxRequest, StopSandboxRequest,
+    SubmitPolicyAnalysisRequest, SubmitPolicyAnalysisResponse, SupervisorMessage, TcpForwardFrame,
+    UndoDraftChunkRequest, UndoDraftChunkResponse, UpdateConfigRequest, UpdateConfigResponse,
+    UpdateProviderProfilesRequest, UpdateProviderProfilesResponse, UpdateProviderRequest,
+    WatchSandboxRequest, open_shell_server::OpenShell,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -420,7 +418,9 @@ impl OpenShell for OpenShellService {
         &self,
         request: Request<CreateProviderRequest>,
     ) -> Result<Response<ProviderResponse>, Status> {
-        provider::handle_create_provider(&self.state, request).await
+        let response = provider::handle_create_provider(&self.state, request).await?;
+        self.state.sandbox_watch_bus.notify_all();
+        Ok(response)
     }
 
     async fn get_provider(
@@ -455,14 +455,18 @@ impl OpenShell for OpenShellService {
         &self,
         request: Request<ImportProviderProfilesRequest>,
     ) -> Result<Response<ImportProviderProfilesResponse>, Status> {
-        provider::handle_import_provider_profiles(&self.state, request).await
+        let response = provider::handle_import_provider_profiles(&self.state, request).await?;
+        self.state.sandbox_watch_bus.notify_all();
+        Ok(response)
     }
 
     async fn update_provider_profiles(
         &self,
         request: Request<UpdateProviderProfilesRequest>,
     ) -> Result<Response<UpdateProviderProfilesResponse>, Status> {
-        provider::handle_update_provider_profiles(&self.state, request).await
+        let response = provider::handle_update_provider_profiles(&self.state, request).await?;
+        self.state.sandbox_watch_bus.notify_all();
+        Ok(response)
     }
 
     async fn lint_provider_profiles(
@@ -476,7 +480,9 @@ impl OpenShell for OpenShellService {
         &self,
         request: Request<UpdateProviderRequest>,
     ) -> Result<Response<ProviderResponse>, Status> {
-        provider::handle_update_provider(&self.state, request).await
+        let response = provider::handle_update_provider(&self.state, request).await?;
+        self.state.sandbox_watch_bus.notify_all();
+        Ok(response)
     }
 
     async fn get_provider_refresh_status(
@@ -490,35 +496,45 @@ impl OpenShell for OpenShellService {
         &self,
         request: Request<ConfigureProviderRefreshRequest>,
     ) -> Result<Response<ConfigureProviderRefreshResponse>, Status> {
-        provider::handle_configure_provider_refresh(&self.state, request).await
+        let response = provider::handle_configure_provider_refresh(&self.state, request).await?;
+        self.state.sandbox_watch_bus.notify_all();
+        Ok(response)
     }
 
     async fn rotate_provider_credential(
         &self,
         request: Request<RotateProviderCredentialRequest>,
     ) -> Result<Response<RotateProviderCredentialResponse>, Status> {
-        provider::handle_rotate_provider_credential(&self.state, request).await
+        let response = provider::handle_rotate_provider_credential(&self.state, request).await?;
+        self.state.sandbox_watch_bus.notify_all();
+        Ok(response)
     }
 
     async fn delete_provider_refresh(
         &self,
         request: Request<DeleteProviderRefreshRequest>,
     ) -> Result<Response<DeleteProviderRefreshResponse>, Status> {
-        provider::handle_delete_provider_refresh(&self.state, request).await
+        let response = provider::handle_delete_provider_refresh(&self.state, request).await?;
+        self.state.sandbox_watch_bus.notify_all();
+        Ok(response)
     }
 
     async fn delete_provider(
         &self,
         request: Request<DeleteProviderRequest>,
     ) -> Result<Response<DeleteProviderResponse>, Status> {
-        provider::handle_delete_provider(&self.state, request).await
+        let response = provider::handle_delete_provider(&self.state, request).await?;
+        self.state.sandbox_watch_bus.notify_all();
+        Ok(response)
     }
 
     async fn delete_provider_profile(
         &self,
         request: Request<DeleteProviderProfileRequest>,
     ) -> Result<Response<DeleteProviderProfileResponse>, Status> {
-        provider::handle_delete_provider_profile(&self.state, request).await
+        let response = provider::handle_delete_provider_profile(&self.state, request).await?;
+        self.state.sandbox_watch_bus.notify_all();
+        Ok(response)
     }
 
     // --- Config / Policy ---
@@ -526,7 +542,7 @@ impl OpenShell for OpenShellService {
     async fn get_sandbox_config(
         &self,
         request: Request<GetSandboxConfigRequest>,
-    ) -> Result<Response<GetSandboxConfigResponse>, Status> {
+    ) -> Result<Response<SandboxConfigSnapshot>, Status> {
         policy::handle_get_sandbox_config(&self.state, request).await
     }
 
@@ -535,13 +551,6 @@ impl OpenShell for OpenShellService {
         request: Request<GetGatewayConfigRequest>,
     ) -> Result<Response<GetGatewayConfigResponse>, Status> {
         policy::handle_get_gateway_config(&self.state, request).await
-    }
-
-    async fn get_sandbox_provider_environment(
-        &self,
-        request: Request<GetSandboxProviderEnvironmentRequest>,
-    ) -> Result<Response<GetSandboxProviderEnvironmentResponse>, Status> {
-        policy::handle_get_sandbox_provider_environment(&self.state, request).await
     }
 
     async fn exchange_provider_subject_token(

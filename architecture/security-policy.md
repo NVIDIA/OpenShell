@@ -166,9 +166,10 @@ detection finding at startup naming the inactive controls.
 The gateway stores sandbox-authored policy revisions separately from derived
 effective sandbox configuration. Effective configuration can include
 gateway-global policy overrides and provider-profile policy layers. The
-supervisor polls for config revisions and attempts to load new dynamic policy
-into the in-process OPA engine; CLI reads of the latest sandbox policy use the
-same effective configuration path.
+gateway pushes effective configuration revisions over the supervisor session.
+The supervisor validates and loads changed dynamic policy into the in-process
+OPA engine; CLI reads of the latest sandbox policy use the same effective
+configuration path.
 
 The supervisor validates complete effective policy generations before
 activation. Overlapping endpoint selectors may contribute request allow and

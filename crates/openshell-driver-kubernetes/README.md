@@ -47,7 +47,7 @@ not a tenant isolation boundary.
 The gateway stores platform state and delegates sandbox workload creation to
 this driver. Kubernetes owns scheduling and pod lifecycle. The
 `openshell-sandbox` supervisor inside each workload owns agent isolation,
-credential injection, policy polling, logs, and the gateway relay.
+credential injection, desired-state application, logs, and the gateway relay.
 
 ## Sandbox Resource
 

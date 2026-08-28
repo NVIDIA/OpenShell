@@ -500,9 +500,10 @@ impl ProviderCredentialState {
     /// Install one gateway provider-environment snapshot.
     ///
     /// Callers must serialize this operation with other bound-environment
-    /// installs and revocations. The sandbox settings refresh loop is the sole
-    /// writer today. The internal lock makes each mutation memory-safe, but it
-    /// does not establish revision ordering between concurrent snapshots.
+    /// installs and revocations. The sandbox's provider desired-state handler
+    /// is the sole writer today. The internal lock makes each mutation
+    /// memory-safe, but it does not establish revision ordering between
+    /// concurrent snapshots.
     pub fn install_bound_environment(
         &self,
         revision: u64,

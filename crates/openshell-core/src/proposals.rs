@@ -4,7 +4,7 @@
 //! Shared state controlling agent-driven policy proposals.
 //!
 //! Initialised once during sandbox start from the `agent_policy_proposals_enabled`
-//! setting and updated by the policy poll loop or authoritative sidecar control
+//! setting and updated by desired-state delivery or authoritative sidecar control
 //! when the setting changes. Read by the `policy.local` route handler and by
 //! the skills installer to gate the agent-controlled mutation surface.
 
@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 ///
 /// Clones point at the same atomic value, so the sandbox orchestrator can pass
 /// this into the process and network supervisors and then update it from the
-/// settings poll loop or sidecar control.
+/// desired-state handler or sidecar control.
 #[derive(Clone, Debug)]
 pub struct AgentProposals {
     enabled: Arc<AtomicBool>,

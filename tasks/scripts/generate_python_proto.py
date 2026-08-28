@@ -49,6 +49,10 @@ LINE_REWRITES = {
             "from . import datamodel_pb2 as datamodel__pb2",
         ),
         (
+            r"^import inference_pb2 as inference__pb2$",
+            "from . import inference_pb2 as inference__pb2",
+        ),
+        (
             r"^import options_pb2 as options__pb2$",
             "from . import options_pb2 as options__pb2",
         ),

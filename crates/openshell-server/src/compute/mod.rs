@@ -1405,7 +1405,7 @@ impl ComputeRuntime {
     ) -> Option<Sandbox> {
         let sandbox_id = transition.object_id().to_string();
         let expected_resource_version = sandbox_resource_version(transition);
-        let session_connected = self.supervisor_sessions.has_session(&sandbox_id);
+        let session_connected = self.supervisor_sessions.has_ready_session(&sandbox_id);
         match self
             .store
             .update_message_cas::<Sandbox, _>(&sandbox_id, expected_resource_version, |sandbox| {
@@ -1852,7 +1852,7 @@ impl ComputeRuntime {
 
         match observed {
             Ok(Some(snapshot)) if snapshot.id == sandbox_id && snapshot.status.is_some() => {
-                let session_connected = self.supervisor_sessions.has_session(sandbox_id);
+                let session_connected = self.supervisor_sessions.has_ready_session(sandbox_id);
                 self.write_delete_recovery_with_retry(
                     sandbox_id,
                     deleting_resource_version,
@@ -2822,7 +2822,7 @@ impl ComputeRuntime {
         expected_resource_version: u64,
         existing_phase: SandboxPhase,
     ) -> Result<(), String> {
-        let session_connected = self.supervisor_sessions.has_session(&incoming.id);
+        let session_connected = self.supervisor_sessions.has_ready_session(&incoming.id);
         let sandbox = self
             .store
             .update_message_cas::<Sandbox, _>(
@@ -2866,6 +2866,58 @@ impl ComputeRuntime {
             .await
     }
 
+    pub async fn supervisor_bootstrap_failed(
+        &self,
+        sandbox_id: &str,
+        message: &str,
+    ) -> Result<(), String> {
+        let Some(sandbox) = self
+            .store
+            .get_message::<Sandbox>(sandbox_id)
+            .await
+            .map_err(|error| error.to_string())?
+        else {
+            return Ok(());
+        };
+        self.mark_sandbox_error(&sandbox, "SupervisorBootstrapFailed", message)
+            .await;
+        Ok(())
+    }
+
+    pub async fn supervisor_config_update_result(
+        &self,
+        sandbox_id: &str,
+        component: &str,
+        applied: bool,
+        reason: &str,
+        message: &str,
+    ) -> Result<(), String> {
+        let _guard = self.sync_lock.lock().await;
+        let condition_type = format!("DesiredState{component}");
+        let reason = reason.to_string();
+        let message = message.to_string();
+        let updated = self
+            .store
+            .update_message_cas::<Sandbox, _>(sandbox_id, 0, |sandbox| {
+                let sandbox_name = sandbox.object_name().to_string();
+                upsert_sandbox_condition(
+                    &mut sandbox.status,
+                    &sandbox_name,
+                    SandboxCondition {
+                        r#type: condition_type.clone(),
+                        status: if applied { "True" } else { "False" }.to_string(),
+                        reason: reason.clone(),
+                        message: message.clone(),
+                        last_transition_time: String::new(),
+                    },
+                );
+            })
+            .await
+            .map_err(|error| error.to_string())?;
+        self.sandbox_index.update_from_sandbox(&updated);
+        Ok(())
+    }
+
     async fn set_supervisor_session_state(
         &self,
         sandbox_id: &str,
@@ -2893,7 +2945,7 @@ impl ComputeRuntime {
         ) {
             return Ok(());
         }
-        if !connected && current_phase != SandboxPhase::Ready {
+        if !connected && current_phase == SandboxPhase::Provisioning {
             return Ok(());
         }
         let expected_resource_version = sandbox_resource_version(&existing);
@@ -3836,6 +3888,13 @@ fn apply_driver_snapshot(sandbox: &mut Sandbox, incoming: &DriverSandbox, sessio
             .main_process_instance_id
             .clone_from(&current_status.main_process_instance_id);
         status.exit_code = current_status.exit_code;
+        for condition in current_status
+            .conditions
+            .iter()
+            .filter(|condition| condition.r#type.starts_with("DesiredState"))
+        {
+            upsert_sandbox_condition_value(status, condition.clone());
+        }
     }
     if old_phase != phase {
         info!(
@@ -3998,10 +4057,26 @@ fn upsert_ready_condition(
         ..Default::default()
     });
 
+    upsert_sandbox_condition_value(status, condition);
+}
+
+fn upsert_sandbox_condition(
+    status: &mut Option<SandboxStatus>,
+    sandbox_name: &str,
+    condition: SandboxCondition,
+) {
+    let status = status.get_or_insert_with(|| SandboxStatus {
+        sandbox_name: sandbox_name.to_string(),
+        ..Default::default()
+    });
+    upsert_sandbox_condition_value(status, condition);
+}
+
+fn upsert_sandbox_condition_value(status: &mut SandboxStatus, condition: SandboxCondition) {
     if let Some(existing) = status
         .conditions
         .iter_mut()
-        .find(|existing| existing.r#type == "Ready")
+        .find(|existing| existing.r#type == condition.r#type)
     {
         *existing = condition;
     } else {
@@ -5023,6 +5098,16 @@ mod tests {
             tx,
             shutdown_tx,
         );
+        assert!(
+            !runtime
+                .supervisor_sessions
+                .mark_initialized(sandbox_id, "session-1")
+        );
+        assert!(
+            runtime
+                .supervisor_sessions
+                .mark_runtime_ready(sandbox_id, "session-1")
+        );
     }
 
     fn sandbox_record(id: &str, name: &str, phase: SandboxPhase) -> Sandbox {
@@ -6037,7 +6122,11 @@ mod tests {
             .unwrap();
         assert_eq!(stopped.phase(), SandboxPhase::Stopped as i32);
         assert_eq!(driver.stop_calls(), 1);
-        assert!(!runtime.supervisor_sessions.has_session(sandbox.object_id()));
+        assert!(
+            !runtime
+                .supervisor_sessions
+                .has_ready_session(sandbox.object_id())
+        );
         assert!(
             runtime
                 .store
@@ -6146,7 +6235,11 @@ mod tests {
 
         assert_eq!(stopped.phase(), SandboxPhase::Stopped as i32);
         assert_eq!(driver.stop_calls(), 0);
-        assert!(!runtime.supervisor_sessions.has_session(sandbox.object_id()));
+        assert!(
+            !runtime
+                .supervisor_sessions
+                .has_ready_session(sandbox.object_id())
+        );
         assert!(
             runtime
                 .store
@@ -6184,7 +6277,11 @@ mod tests {
                 .unwrap()
                 .unwrap();
             assert_eq!(stored.phase(), SandboxPhase::Stopped as i32);
-            assert!(!runtime.supervisor_sessions.has_session(sandbox.object_id()));
+            assert!(
+                !runtime
+                    .supervisor_sessions
+                    .has_ready_session(sandbox.object_id())
+            );
             assert!(
                 runtime
                     .store
@@ -6307,7 +6404,11 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(stored.phase(), SandboxPhase::Stopped as i32);
-        assert!(!runtime.supervisor_sessions.has_session(sandbox.object_id()));
+        assert!(
+            !runtime
+                .supervisor_sessions
+                .has_ready_session(sandbox.object_id())
+        );
         assert!(
             runtime
                 .store
@@ -6364,7 +6465,11 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(stored.phase(), SandboxPhase::Stopping as i32);
-        assert!(runtime.supervisor_sessions.has_session(sandbox.object_id()));
+        assert!(
+            runtime
+                .supervisor_sessions
+                .has_ready_session(sandbox.object_id())
+        );
 
         progressing.status.as_mut().unwrap().conditions[0].status = "True".to_string();
         progressing.status.as_mut().unwrap().conditions[0].reason = "PodTerminated".to_string();
@@ -6377,7 +6482,11 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(stored.phase(), SandboxPhase::Stopped as i32);
-        assert!(!runtime.supervisor_sessions.has_session(sandbox.object_id()));
+        assert!(
+            !runtime
+                .supervisor_sessions
+                .has_ready_session(sandbox.object_id())
+        );
         assert!(
             runtime
                 .store
@@ -6482,7 +6591,11 @@ mod tests {
         )));
         runtime.apply_sandbox_update(stopped.clone()).await.unwrap();
 
-        assert!(!runtime.supervisor_sessions.has_session(sandbox.object_id()));
+        assert!(
+            !runtime
+                .supervisor_sessions
+                .has_ready_session(sandbox.object_id())
+        );
         assert!(
             runtime
                 .store
@@ -6498,7 +6611,11 @@ mod tests {
         register_test_supervisor_session(&runtime, sandbox.object_id());
         runtime.apply_sandbox_update(stopped).await.unwrap();
 
-        assert!(runtime.supervisor_sessions.has_session(sandbox.object_id()));
+        assert!(
+            runtime
+                .supervisor_sessions
+                .has_ready_session(sandbox.object_id())
+        );
         assert!(
             runtime
                 .store
@@ -8004,6 +8121,97 @@ mod tests {
         assert_eq!(ready.status, "False");
         assert_eq!(ready.reason, "DependenciesNotReady");
         assert_eq!(ready.message, "Supervisor session disconnected");
+    }
+
+    #[tokio::test]
+    async fn supervisor_disconnect_before_bootstrap_returns_starting_to_provisioning() {
+        let runtime = test_runtime(Arc::new(TestDriver::default())).await;
+        let sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Starting);
+        runtime.store.put_message(&sandbox).await.unwrap();
+
+        runtime
+            .supervisor_session_disconnected("sb-1")
+            .await
+            .unwrap();
+
+        let stored = runtime
+            .store
+            .get_message::<Sandbox>("sb-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            SandboxPhase::try_from(stored.phase()).unwrap(),
+            SandboxPhase::Provisioning
+        );
+        let ready = ready_condition(&stored).unwrap();
+        assert_eq!(ready.reason, "DependenciesNotReady");
+    }
+
+    #[tokio::test]
+    async fn live_config_update_failure_preserves_ready_with_degraded_condition() {
+        let runtime = test_runtime(Arc::new(TestDriver::default())).await;
+        let sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Ready);
+        runtime.store.put_message(&sandbox).await.unwrap();
+
+        runtime
+            .supervisor_config_update_result(
+                "sb-1",
+                "ProviderEnvironment",
+                false,
+                "DesiredStateApplyFailed",
+                "provider snapshot rejected",
+            )
+            .await
+            .unwrap();
+
+        let stored = runtime
+            .store
+            .get_message::<Sandbox>("sb-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            SandboxPhase::try_from(stored.phase()).unwrap(),
+            SandboxPhase::Ready
+        );
+        let condition = stored
+            .status
+            .as_ref()
+            .unwrap()
+            .conditions
+            .iter()
+            .find(|condition| condition.r#type == "DesiredStateProviderEnvironment")
+            .unwrap();
+        assert_eq!(condition.status, "False");
+        assert_eq!(condition.reason, "DesiredStateApplyFailed");
+
+        runtime
+            .supervisor_config_update_result(
+                "sb-1",
+                "ProviderEnvironment",
+                true,
+                "DesiredStateApplied",
+                "Latest provider environment desired state applied",
+            )
+            .await
+            .unwrap();
+        let stored = runtime
+            .store
+            .get_message::<Sandbox>("sb-1")
+            .await
+            .unwrap()
+            .unwrap();
+        let condition = stored
+            .status
+            .as_ref()
+            .unwrap()
+            .conditions
+            .iter()
+            .find(|condition| condition.r#type == "DesiredStateProviderEnvironment")
+            .unwrap();
+        assert_eq!(condition.status, "True");
+        assert_eq!(condition.reason, "DesiredStateApplied");
     }
 
     // --- Composition rule tests ---

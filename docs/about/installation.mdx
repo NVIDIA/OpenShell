@@ -28,6 +28,11 @@ uv add openshell
 
 Use `openshell status` to confirm the CLI can reach the gateway.
 
+Package upgrades install a matched CLI and gateway release. The gateway uses
+the corresponding supervisor image by default. Restart the gateway service and
+recreate existing sandboxes after an upgrade; overriding the supervisor image
+with a different OpenShell version is unsupported.
+
 ## Supported Compute Drivers
 
 OpenShell supports several local compute drivers. Package-managed gateways leave the driver unset by default so the gateway can auto-detect an available driver. Set `compute_drivers` in the gateway TOML when you need to pin a specific driver.

@@ -881,7 +881,7 @@ fn is_terminal_status(status: &str) -> bool {
 /// The polling cadence here is faster than `PROPOSAL_WAIT_POLL_INTERVAL`
 /// (which paces upstream gateway calls). This loop only reads in-memory
 /// state, so 200ms gives a responsive handoff to the agent's retry once
-/// the supervisor's own policy poll catches up.
+/// the supervisor's desired-state update catches up.
 async fn wait_for_local_policy_to_cover(
     ctx: &PolicyLocalContext,
     proposed_rule: &NetworkPolicyRule,

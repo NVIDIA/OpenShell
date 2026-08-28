@@ -6,7 +6,7 @@
 //! Spawns the SSH server, optional supervisor session, the entrypoint child
 //! process, and waits for it to exit (with optional timeout). Long-running
 //! background tasks that aren't strictly tied to the workload's lifetime
-//! (policy poll loop, denial aggregator, symlink resolver) live in the
+//! (desired-state application, denial aggregation, symlink resolution) live in the
 //! orchestrator, not here.
 
 use miette::{IntoDiagnostic, Result};
@@ -78,6 +78,7 @@ pub async fn run_process(
     provider_env: std::collections::HashMap<String, String>,
     ca_file_paths: Option<(std::path::PathBuf, std::path::PathBuf)>,
     agent_proposals: AgentProposals,
+    runtime_ready: Option<crate::supervisor_session::RuntimeReadySender>,
     #[cfg(target_os = "linux")] netns: Option<&NetworkNamespace>,
     #[cfg(target_os = "linux")] bypass_denial_tx: Option<
         tokio::sync::mpsc::UnboundedSender<DenialEvent>,
@@ -112,11 +113,9 @@ pub async fn run_process(
         )?;
     }
 
-    // Eagerly fetch initial settings and install the agent skill if the
-    // proposals flag is on at startup, rather than waiting for the policy
-    // poll loop's first tick. In offline/file-mode there is no gateway, so
-    // the flag stays at its default (false) and no skill is installed.
-    install_initial_agent_skill(sandbox_id, openshell_endpoint, &agent_proposals).await;
+    // The orchestrator initializes this shared flag from the session bootstrap
+    // (or sidecar bootstrap) before starting the process runtime.
+    install_initial_agent_skill(&agent_proposals);
 
     // Provider token grants may mount supervisor-only identity sockets such as
     // the SPIFFE Workload API. Prepare the child mount namespace that hides
@@ -358,27 +357,18 @@ pub async fn run_process(
     // that is already terminal.
     let early_exit = handle.try_wait().into_diagnostic()?;
 
-    // Spawn the persistent supervisor session if we have a gateway endpoint
-    // and sandbox identity. The session provides relay channels for SSH
-    // connect and ExecSandbox through the gateway.
-    let supervisor_session_task = if early_exit.is_none()
-        && let (Some(endpoint), Some(id), Some(socket)) =
-            (openshell_endpoint, sandbox_id, ssh_socket_path.as_ref())
+    if early_exit.is_none()
+        && let (Some(runtime_ready), Some(socket)) = (runtime_ready.as_ref(), ssh_socket_path)
     {
-        let task = crate::supervisor_session::spawn(
-            endpoint.to_string(),
-            id.to_string(),
-            socket.clone(),
-            ssh_netns_fd,
-            None,
-            Arc::clone(&supervisor_terminating),
-            main_instance_id.clone(),
-        );
-        info!("supervisor session task spawned");
-        Some(task)
-    } else {
-        None
-    };
+        runtime_ready
+            .send(Some(crate::supervisor_session::RuntimeReadyState {
+                instance_id: main_instance_id.clone(),
+                ssh_socket_path: socket,
+                netns_fd: ssh_netns_fd,
+                expected_ssh_peer_pid: None,
+            }))
+            .map_err(|_| miette::miette!("supervisor session runtime-ready channel closed"))?;
+    }
 
     // Store the entrypoint PID so the proxy can resolve TCP peer identity
     entrypoint_pid.store(handle.pid(), Ordering::Release);
@@ -446,8 +436,8 @@ pub async fn run_process(
             .build()
     );
 
-    if let Some(task) = supervisor_session_task {
-        task.abort();
+    if let Some(runtime_ready) = runtime_ready {
+        let _ = runtime_ready.send(None);
     }
     if let Some(tx) = sidecar_exit_tx {
         let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
@@ -620,40 +610,9 @@ fn ssh_proxy_url_for_policy(
     proxy.http_addr.map(|addr| format!("http://{addr}"))
 }
 
-/// Eagerly fetch initial settings and install the agent-driven policy
-/// proposal skill if the flag is on at startup.
-///
-/// Without this, the skill would only get installed on the policy poll
-/// loop's first false→true transition, which can be ~10 s after launch —
-/// long enough for an agent to start running without seeing it.
-///
-/// Best-effort: any failure (no gateway, RPC error, install failure) is
-/// logged but does not fail sandbox startup.
-async fn install_initial_agent_skill(
-    sandbox_id: Option<&str>,
-    openshell_endpoint: Option<&str>,
-    agent_proposals: &AgentProposals,
-) {
-    use openshell_core::proto::setting_value;
-
-    if let (Some(id), Some(endpoint)) = (sandbox_id, openshell_endpoint)
-        && let Ok(client) =
-            openshell_core::grpc_client::CachedOpenShellClient::connect(endpoint).await
-        && let Ok(result) = client.poll_settings(id).await
-    {
-        let initial = result
-            .settings
-            .get(openshell_core::settings::AGENT_POLICY_PROPOSALS_ENABLED_KEY)
-            .and_then(|es| es.value.as_ref())
-            .and_then(|sv| sv.value.as_ref())
-            .and_then(|v| match v {
-                setting_value::Value::BoolValue(b) => Some(*b),
-                _ => None,
-            })
-            .unwrap_or(false);
-        agent_proposals.set_enabled(initial);
-    }
-
+/// Install the agent-driven policy proposal skill when bootstrap enabled it.
+/// Installation is best-effort and never fails sandbox startup.
+fn install_initial_agent_skill(agent_proposals: &AgentProposals) {
     if agent_proposals.enabled() {
         match crate::skills::install_static_skills() {
             Ok(installed) => info!(

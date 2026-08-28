@@ -151,10 +151,15 @@ pub struct Networking {
     pub proxy: Option<ProxyHandle>,
 
     pub ca_file_paths: Option<(std::path::PathBuf, std::path::PathBuf)>,
-    /// Policy-local route context: shared with the orchestrator's policy poll
+    /// Policy-local route context: shared with the orchestrator's desired-state
     /// loop so it can publish updated `SandboxPolicy` snapshots that the
     /// `policy.local` route handler returns to the workload.
     pub policy_local_ctx: Arc<PolicyLocalContext>,
+    /// Shared inference route caches for desired-state updates.
+    pub inference_context: Option<Arc<crate::proxy::InferenceContext>>,
+    /// The gateway inference snapshot could not initialize a safe live router.
+    /// Local route-file failures remain fatal and never set this flag.
+    pub inference_degraded: bool,
     #[cfg(target_os = "linux")]
     _policy_dns: Option<crate::policy_dns::PolicyDnsRuntime>,
     #[cfg(target_os = "linux")]
@@ -191,6 +196,7 @@ pub async fn run_networking(
     sandbox_name: Option<&str>,
     openshell_endpoint: Option<&str>,
     #[allow(unused_variables)] inference_routes: Option<&str>,
+    inference_bundle: Option<openshell_core::proto::InferenceBundleSnapshot>,
     denial_tx: Option<UnboundedSender<DenialEvent>>,
     activity_tx: Option<ActivitySender>,
     agent_proposals: AgentProposals,
@@ -198,7 +204,7 @@ pub async fn run_networking(
     upstream_proxy_args: &crate::upstream_proxy::UpstreamProxyArgs,
     #[cfg(target_os = "linux")] transparent_runtime: Option<TransparentRuntimeSetup>,
 ) -> Result<Networking> {
-    // Build the policy-local route context. The orchestrator's policy poll
+    // Build the policy-local route context. The orchestrator's desired-state
     // loop also holds an `Arc` clone (via `Networking::policy_local_ctx`) so
     // it can publish updated policy snapshots after a successful reload.
     let policy_local_ctx = Arc::new(PolicyLocalContext::new(
@@ -402,6 +408,8 @@ pub async fn run_networking(
         (None, None)
     };
 
+    let mut inference_context = None;
+    let mut inference_degraded = false;
     let proxy_handle = if matches!(policy.network.mode, NetworkMode::Proxy) {
         let proxy_policy = policy.network.proxy.as_ref().ok_or_else(|| {
             miette::miette!("Network mode is set to proxy but no proxy configuration was provided")
@@ -426,12 +434,39 @@ pub async fn run_networking(
         });
 
         // Build inference context for local routing of intercepted inference calls.
-        let inference_ctx = crate::inference_routes::build_inference_context(
-            sandbox_id,
-            openshell_endpoint,
-            inference_routes,
-        )
-        .await?;
+        let inference_ctx = if let Some(bundle) = inference_bundle {
+            match crate::inference_routes::build_inference_context_from_snapshot(
+                sandbox_id,
+                openshell_endpoint,
+                inference_routes,
+                bundle,
+            ) {
+                Ok(context) => context,
+                Err(error) if inference_routes.is_none() => {
+                    inference_degraded = true;
+                    warn!(error = %error, "Gateway inference bootstrap degraded; inference routing disabled");
+                    ocsf_emit!(
+                        ConfigStateChangeBuilder::new(ocsf_ctx())
+                            .severity(SeverityId::Medium)
+                            .status(StatusId::Failure)
+                            .state(StateId::Disabled, "degraded")
+                            .message(
+                                "Gateway inference bootstrap degraded; inference routing disabled"
+                            )
+                            .build()
+                    );
+                    None
+                }
+                Err(error) => return Err(error),
+            }
+        } else {
+            crate::inference_routes::build_inference_context(
+                sandbox_id,
+                openshell_endpoint,
+                inference_routes,
+            )?
+        };
+        inference_context.clone_from(&inference_ctx);
 
         let proxy_handle = ProxyHandle::start_with_bind_addr(
             proxy_policy,
@@ -492,6 +527,8 @@ pub async fn run_networking(
         proxy: proxy_handle,
         ca_file_paths,
         policy_local_ctx,
+        inference_context,
+        inference_degraded,
         #[cfg(target_os = "linux")]
         _policy_dns: policy_dns,
         #[cfg(target_os = "linux")]

@@ -542,7 +542,7 @@ async fn initial_sparse_policy_is_acknowledged_as_loaded() {
     .expect("create keep sandbox with sparse policy");
 
     // The enriched revision (2) is synced during startup; the acknowledgement
-    // (LOADED) is delivered by the supervisor's poll loop shortly after Ready.
+    // (LOADED) is delivered after the supervisor applies its session bootstrap.
     // Poll until the effective policy is version 2 and no revision is Pending.
     let mut acknowledged = false;
     let mut last_list = String::new();

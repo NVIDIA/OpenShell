@@ -488,8 +488,8 @@ impl OpenShell for TestOpenShell {
     async fn get_sandbox_config(
         &self,
         _: tonic::Request<proto::GetSandboxConfigRequest>,
-    ) -> Result<Response<proto::GetSandboxConfigResponse>, Status> {
-        Ok(Response::new(proto::GetSandboxConfigResponse::default()))
+    ) -> Result<Response<proto::SandboxConfigSnapshot>, Status> {
+        Ok(Response::new(proto::SandboxConfigSnapshot::default()))
     }
 
     async fn get_gateway_config(
@@ -534,15 +534,6 @@ impl OpenShell for TestOpenShell {
         _: tonic::Request<proto::ReportPolicyStatusRequest>,
     ) -> Result<Response<proto::ReportPolicyStatusResponse>, Status> {
         Err(Status::unimplemented("unused"))
-    }
-
-    async fn get_sandbox_provider_environment(
-        &self,
-        _: tonic::Request<proto::GetSandboxProviderEnvironmentRequest>,
-    ) -> Result<Response<proto::GetSandboxProviderEnvironmentResponse>, Status> {
-        Ok(Response::new(
-            proto::GetSandboxProviderEnvironmentResponse::default(),
-        ))
     }
 
     async fn get_sandbox_logs(

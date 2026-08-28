@@ -42,15 +42,15 @@ use openshell_core::proto::{
     ExposeServiceRequest, GetCurrentUserRequest, GetDraftHistoryRequest, GetDraftPolicyRequest,
     GetGatewayConfigRequest, GetInferenceRouteRequest, GetProviderProfileRequest,
     GetProviderRefreshStatusRequest, GetProviderRequest, GetSandboxConfigRequest,
-    GetSandboxConfigResponse, GetSandboxLogsRequest, GetSandboxPolicyStatusRequest,
-    GetSandboxRequest, GetServiceRequest, GpuResourceRequirements, ImportProviderProfilesRequest,
-    LintProviderProfilesRequest, ListProviderProfilesRequest, ListProvidersRequest,
-    ListSandboxPoliciesRequest, ListSandboxProvidersRequest, ListSandboxesRequest,
-    ListServicesRequest, PolicySource, PolicyStatus, Provider,
-    ProviderCredentialRefreshRecoveryAction, ProviderCredentialRefreshStatus,
-    ProviderCredentialRefreshStrategy, ProviderCredentialTokenGrantType, ProviderProfile,
-    ProviderProfileDiagnostic, ProviderProfileImportItem, RejectDraftChunkRequest,
-    ResourceRequirements, RevokeSshSessionRequest, RotateProviderCredentialRequest, Sandbox,
+    GetSandboxLogsRequest, GetSandboxPolicyStatusRequest, GetSandboxRequest, GetServiceRequest,
+    GpuResourceRequirements, ImportProviderProfilesRequest, LintProviderProfilesRequest,
+    ListProviderProfilesRequest, ListProvidersRequest, ListSandboxPoliciesRequest,
+    ListSandboxProvidersRequest, ListSandboxesRequest, ListServicesRequest, PolicySource,
+    PolicyStatus, Provider, ProviderCredentialRefreshRecoveryAction,
+    ProviderCredentialRefreshStatus, ProviderCredentialRefreshStrategy,
+    ProviderCredentialTokenGrantType, ProviderProfile, ProviderProfileDiagnostic,
+    ProviderProfileImportItem, RejectDraftChunkRequest, ResourceRequirements,
+    RevokeSshSessionRequest, RotateProviderCredentialRequest, Sandbox, SandboxConfigSnapshot,
     SandboxPhase, SandboxPolicy, SandboxSpec, SandboxTemplate, ServiceEndpointResponse,
     SetInferenceRouteRequest, SettingScope, StartSandboxRequest, StopSandboxRequest,
     TcpForwardFrame, TcpForwardInit, TcpRelayTarget, UpdateConfigRequest,
@@ -2109,7 +2109,7 @@ fn sandbox_to_json(sandbox: &Sandbox) -> serde_json::Value {
 
 fn sandbox_detail_to_json(
     sandbox: &Sandbox,
-    config: &GetSandboxConfigResponse,
+    config: &SandboxConfigSnapshot,
 ) -> Result<serde_json::Value> {
     let mut value = sandbox_to_json(sandbox);
     let obj = value
@@ -5935,7 +5935,7 @@ pub async fn gateway_settings_get(server: &str, json: bool, tls: &TlsOptions) ->
 fn settings_to_json_sandbox(
     name: &str,
     workspace: &str,
-    response: &GetSandboxConfigResponse,
+    response: &SandboxConfigSnapshot,
 ) -> serde_json::Value {
     let policy_source = if response.policy_source == PolicySource::Global as i32 {
         "global"
@@ -7429,12 +7429,12 @@ mod tests {
         PROGRESS_STEP_STARTING_SANDBOX,
     };
     use openshell_core::proto::{
-        GetSandboxConfigResponse, GpuResourceRequirements, PolicySource, PolicyStatus, Provider,
-        ProviderCredentialRefresh, ProviderCredentialRefreshRecoveryAction,
-        ProviderCredentialRefreshStatus, ProviderCredentialRefreshStrategy,
-        ProviderCredentialTokenGrant, ProviderProfile, ProviderProfileCredential,
-        ResourceRequirements, Sandbox, SandboxCondition, SandboxPhase, SandboxPolicyRevision,
-        SandboxStatus, datamodel::v1::ObjectMeta,
+        GpuResourceRequirements, PolicySource, PolicyStatus, Provider, ProviderCredentialRefresh,
+        ProviderCredentialRefreshRecoveryAction, ProviderCredentialRefreshStatus,
+        ProviderCredentialRefreshStrategy, ProviderCredentialTokenGrant, ProviderProfile,
+        ProviderProfileCredential, ResourceRequirements, Sandbox, SandboxCondition,
+        SandboxConfigSnapshot, SandboxPhase, SandboxPolicyRevision, SandboxStatus,
+        datamodel::v1::ObjectMeta,
     };
 
     #[test]
@@ -8789,7 +8789,7 @@ mod tests {
         sandbox.set_phase(SandboxPhase::Ready as i32);
         sandbox.set_current_policy_version(2);
 
-        let config = GetSandboxConfigResponse {
+        let config = SandboxConfigSnapshot {
             policy_source: PolicySource::Global as i32,
             global_policy_version: 3,
             ..Default::default()
@@ -8815,7 +8815,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        let config = GetSandboxConfigResponse {
+        let config = SandboxConfigSnapshot {
             policy_source: PolicySource::Sandbox as i32,
             version: 0,
             ..Default::default()

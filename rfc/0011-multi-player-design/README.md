@@ -104,8 +104,8 @@ layer and per-handler scope guards (`ensure_sandbox_principal_scope`) that
 verify the JWT's sandbox UUID matches the request target. The supervisor never
 goes through the RBAC role check or workspace membership lookup.
 
-The supervisor learns its workspace from the `GetSandboxConfigResponse.workspace`
-field returned by its first settings poll. It caches this value and passes it
+The supervisor learns its workspace from the `SandboxConfigSnapshot.workspace`
+field in its session bootstrap. It caches this value and passes it
 in subsequent workspace-scoped RPCs (policy sync, policy analysis, draft
 policy queries). This avoids server-side special-casing for sandbox principals
 while keeping the supervisor's JWT scoped to a single sandbox UUID.
@@ -135,7 +135,7 @@ Supervisor section above).
 | Policy draft inspection (`GetDraftPolicy`, `GetDraftHistory`) | read | read (own ws) | read (own ws) | `GetDraftPolicy` for own sandbox only |
 | Policy draft decisions (`Approve`, `Reject`, `Edit`, `Undo`, `Clear`) | read-write | read-write (own ws) | none | none |
 | Policy analysis submission (`SubmitPolicyAnalysis`) | none | none | none | own sandbox |
-| Supervisor path (`ConnectSupervisor`, `RelayStream`, `IssueSandboxToken`, `RefreshSandboxToken`, `GetSandboxProviderEnvironment`, `PushSandboxLogs`, `ReportPolicyStatus`) | none | none | none | own sandbox |
+| Supervisor path (`ConnectSupervisor`, `RelayStream`, `IssueSandboxToken`, `RefreshSandboxToken`, `PushSandboxLogs`, `ReportPolicyStatus`) | none | none | none | own sandbox |
 
 **Control-plane audit log.** Every mutating gRPC call emits an OCSF
 `ApiActivity` event recording the principal, action, target resource, and
@@ -1535,38 +1535,39 @@ Auth: Bearer <sandbox-jwt>
 → router: is_sandbox_callable("ConnectSupervisor") → yes
 → supervisor sends SupervisorHello { sandbox_id: "uuid-a" }
 → ensure_sandbox_principal_scope: JWT sandbox_id == hello sandbox_id → pass
-→ register session, send SessionAccepted, notify driver: sandbox ready
+→ register connected session, send SessionAccepted + ConfigBootstrap
+→ bootstrap result marks the session initialized
+→ SupervisorRuntimeReady marks the sandbox ready
 ```
 
-**9. Supervisor fetches provider credentials.**
+**9. Gateway delivers provider credentials.**
 
 ```text
-GetSandboxProviderEnvironment { sandbox_id: "uuid-a" }
-→ enforce_sandbox_scope: JWT sandbox_id == request sandbox_id → pass
+SessionAccepted.bootstrap.provider_environment
 → gateway resolves providers for sandbox uuid-a (workspace-internal lookup)
-→ return { ANTHROPIC_API_KEY: "sk-...", ... }
+→ supervisor installs placeholders and bound credential material
 ```
 
 **10. Cross-sandbox and cross-principal access is rejected.**
 
 ```text
-Supervisor-A → GetSandboxProviderEnvironment { sandbox_id: "uuid-b" }
-→ enforce_sandbox_scope: "uuid-a" != "uuid-b" → PERMISSION_DENIED
+Supervisor-A → SupervisorHello { sandbox_id: "uuid-b" }
+→ ensure_sandbox_principal_scope: "uuid-a" != "uuid-b" → PERMISSION_DENIED
 
 Supervisor-A → ListSandboxes { workspace: "team-ml" }
 → router: is_sandbox_callable("ListSandboxes") → false → PERMISSION_DENIED
 ```
 
-**11. Supervisor learns its workspace from the config response.**
+**11. Supervisor learns its workspace from the session bootstrap.**
 
 ```text
-GetSandboxConfig { sandbox_id: "uuid-a" }
-→ response includes workspace: "team-ml"
+SessionAccepted.bootstrap.sandbox_config
+→ snapshot includes workspace: "team-ml"
 → supervisor caches workspace for subsequent RPCs
 ```
 
 The supervisor discovers its workspace from the `workspace` field in
-`GetSandboxConfigResponse`, returned by its first settings poll. It caches
+`SandboxConfigSnapshot`, delivered in its session bootstrap. It caches
 this value and uses it for workspace-scoped RPCs such as `UpdateConfig`
 (policy sync), `SubmitPolicyAnalysis`, and `GetDraftPolicy`. The supervisor's
 authorization surface remains a single sandbox UUID — the workspace is used

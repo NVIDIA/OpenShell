@@ -28,7 +28,7 @@ type mockConfigServer struct {
 	mu sync.Mutex
 
 	// Canned responses.
-	sandboxResp *sbv1.GetSandboxConfigResponse
+	sandboxResp *sbv1.SandboxConfigSnapshot
 	gatewayResp *sbv1.GetGatewayConfigResponse
 	updateResp  *pb.UpdateConfigResponse
 
@@ -47,7 +47,7 @@ func newMockConfigServer() *mockConfigServer {
 	return &mockConfigServer{}
 }
 
-func (s *mockConfigServer) GetSandboxConfig(_ context.Context, req *sbv1.GetSandboxConfigRequest) (*sbv1.GetSandboxConfigResponse, error) {
+func (s *mockConfigServer) GetSandboxConfig(_ context.Context, req *sbv1.GetSandboxConfigRequest) (*sbv1.SandboxConfigSnapshot, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.lastSandboxReq = req
@@ -104,7 +104,7 @@ func setupConfigTest(t *testing.T, mock *mockConfigServer) (*configClient, func(
 
 func TestConfigGetSandbox(t *testing.T) {
 	mock := newMockConfigServer()
-	mock.sandboxResp = &sbv1.GetSandboxConfigResponse{
+	mock.sandboxResp = &sbv1.SandboxConfigSnapshot{
 		Policy: &sbv1.SandboxPolicy{
 			Version: 4,
 			Filesystem: &sbv1.FilesystemPolicy{
@@ -176,7 +176,7 @@ func TestConfigGetSandbox(t *testing.T) {
 
 func TestConfigGetSandbox_DeepCopy(t *testing.T) {
 	mock := newMockConfigServer()
-	mock.sandboxResp = &sbv1.GetSandboxConfigResponse{
+	mock.sandboxResp = &sbv1.SandboxConfigSnapshot{
 		Version: 1,
 		Settings: map[string]*sbv1.EffectiveSetting{
 			"key": {
@@ -224,7 +224,7 @@ func TestConfigGetSandbox_Error(t *testing.T) {
 
 func TestConfigGetSandbox_ResolvesNameToID(t *testing.T) {
 	mock := newMockConfigServer()
-	mock.sandboxResp = &sbv1.GetSandboxConfigResponse{Version: 1}
+	mock.sandboxResp = &sbv1.SandboxConfigSnapshot{Version: 1}
 
 	client, cleanup := setupConfigTest(t, mock)
 	defer cleanup()

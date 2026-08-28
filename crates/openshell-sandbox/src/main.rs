@@ -596,7 +596,7 @@ fn main() -> Result<()> {
         let push_layer = log_push_state.as_ref().map(|(layer, _)| layer.clone());
         let _log_push_handle = log_push_state.map(|(_, handle)| handle);
 
-        // Shared flag: the sandbox poll loop toggles this when the
+        // Shared flag: desired-state delivery toggles this when the
         // `ocsf_json_enabled` setting changes. The JSONL layer checks it
         // on each event and short-circuits when false.
         let ocsf_enabled = Arc::new(AtomicBool::new(false));

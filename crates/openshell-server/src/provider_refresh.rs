@@ -1880,14 +1880,18 @@ pub fn spawn_refresh_worker(state: std::sync::Arc<crate::ServerState>, interval:
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             ticker.tick().await;
-            if let Err(err) = run_refresh_worker_tick(
+            match run_refresh_worker_tick(
                 state.store.as_ref(),
                 Some(&state.credentials),
                 Some(&state.compute),
             )
             .await
             {
-                warn!(error = %err, "provider credential refresh worker tick failed");
+                Ok(true) => state.sandbox_watch_bus.notify_all(),
+                Ok(false) => {}
+                Err(err) => {
+                    warn!(error = %err, "provider credential refresh worker tick failed");
+                }
             }
         }
     });
@@ -1906,7 +1910,7 @@ async fn run_refresh_worker_tick(
     store: &Store,
     credentials: Option<&crate::credentials::CredentialRuntime>,
     compute: Option<&crate::compute::ComputeRuntime>,
-) -> Result<(), Status> {
+) -> Result<bool, Status> {
     let now_ms = current_time_ms();
     let states = list_all_refresh_states(store).await.inspect_err(|_| {
         crate::otel_tracing::mark_error(&tracing::Span::current());
@@ -1927,6 +1931,7 @@ async fn run_refresh_worker_tick(
         watched_count,
         due_count, rotation_requested_count, "provider credential refresh worker sweep"
     );
+    let mut desired_state_changed = false;
     for state in states {
         if state
             .metadata
@@ -1956,6 +1961,8 @@ async fn run_refresh_worker_tick(
                     error = %err,
                     "failed to finalize tombstoned provider refresh; retrying on the next sweep"
                 );
+            } else {
+                desired_state_changed = true;
             }
             continue;
         }
@@ -2039,9 +2046,11 @@ async fn run_refresh_worker_tick(
                 error = %err,
                 "provider credential refresh failed"
             );
+        } else {
+            desired_state_changed = true;
         }
     }
-    Ok(())
+    Ok(desired_state_changed)
 }
 
 #[cfg(test)]

@@ -467,8 +467,8 @@ still referenced by a sandbox.
 
 Policy and runtime settings are delivered together through the effective sandbox
 config path. A gateway-global policy can override sandbox-scoped policy. The
-sandbox supervisor polls for config revisions and hot-reloads dynamic policy
-when the policy engine accepts the update.
+gateway pushes changed snapshots over `ConnectSupervisor`, and the sandbox
+supervisor hot-reloads dynamic policy when the policy engine accepts the update.
 
 External supervisor middleware registration is operator-owned configuration
 under `[[openshell.supervisor.middleware]]`. At startup the gateway connects to
@@ -505,8 +505,8 @@ include profile endpoint and binding changes.
 
 Cluster inference routes store only `provider_name`, `model_id`, and optional
 timeout. The gateway resolves endpoint URLs, protocols, credentials, auth
-style, and route-shaping metadata from the provider record when supervisors call
-`GetInferenceBundle`. Supported provider types for cluster inference are
+style, and route-shaping metadata from the provider record when the gateway
+builds supervisor bootstrap and update snapshots. Supported provider types for cluster inference are
 `openai`, `anthropic`, `nvidia`, `deepinfra`, and `google-vertex-ai`.
 
 The bundle carries enough information for sandbox-local routers to construct

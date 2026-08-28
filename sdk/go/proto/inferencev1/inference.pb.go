@@ -654,6 +654,9 @@ func (x *DeleteInferenceRouteResponse) GetDeleted() bool {
 	return false
 }
 
+// Retained as a source-compatible message for raw SDK consumers. The
+// supervisor fetch RPC was removed; desired state now arrives on
+// ConnectSupervisor.
 type GetInferenceBundleRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	unknownFields protoimpl.UnknownFields
@@ -803,7 +806,7 @@ func (x *ResolvedRoute) GetRequestPathOverride() string {
 	return ""
 }
 
-type GetInferenceBundleResponse struct {
+type InferenceBundleSnapshot struct {
 	state  protoimpl.MessageState `protogen:"open.v1"`
 	Routes []*ResolvedRoute       `protobuf:"bytes,1,rep,name=routes,proto3" json:"routes,omitempty"`
 	// Opaque revision tag for cache freshness checks.
@@ -814,20 +817,20 @@ type GetInferenceBundleResponse struct {
 	sizeCache     protoimpl.SizeCache
 }
 
-func (x *GetInferenceBundleResponse) Reset() {
-	*x = GetInferenceBundleResponse{}
+func (x *InferenceBundleSnapshot) Reset() {
+	*x = InferenceBundleSnapshot{}
 	mi := &file_inference_proto_msgTypes[11]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
 
-func (x *GetInferenceBundleResponse) String() string {
+func (x *InferenceBundleSnapshot) String() string {
 	return protoimpl.X.MessageStringOf(x)
 }
 
-func (*GetInferenceBundleResponse) ProtoMessage() {}
+func (*InferenceBundleSnapshot) ProtoMessage() {}
 
-func (x *GetInferenceBundleResponse) ProtoReflect() protoreflect.Message {
+func (x *InferenceBundleSnapshot) ProtoReflect() protoreflect.Message {
 	mi := &file_inference_proto_msgTypes[11]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
@@ -839,26 +842,26 @@ func (x *GetInferenceBundleResponse) ProtoReflect() protoreflect.Message {
 	return mi.MessageOf(x)
 }
 
-// Deprecated: Use GetInferenceBundleResponse.ProtoReflect.Descriptor instead.
-func (*GetInferenceBundleResponse) Descriptor() ([]byte, []int) {
+// Deprecated: Use InferenceBundleSnapshot.ProtoReflect.Descriptor instead.
+func (*InferenceBundleSnapshot) Descriptor() ([]byte, []int) {
 	return file_inference_proto_rawDescGZIP(), []int{11}
 }
 
-func (x *GetInferenceBundleResponse) GetRoutes() []*ResolvedRoute {
+func (x *InferenceBundleSnapshot) GetRoutes() []*ResolvedRoute {
 	if x != nil {
 		return x.Routes
 	}
 	return nil
 }
 
-func (x *GetInferenceBundleResponse) GetRevision() string {
+func (x *InferenceBundleSnapshot) GetRevision() string {
 	if x != nil {
 		return x.Revision
 	}
 	return ""
 }
 
-func (x *GetInferenceBundleResponse) GetGeneratedAtMs() int64 {
+func (x *InferenceBundleSnapshot) GetGeneratedAtMs() int64 {
 	if x != nil {
 		return x.GeneratedAtMs
 	}
@@ -929,14 +932,12 @@ const file_inference_proto_rawDesc = "" +
 	"\ftimeout_secs\x18\a \x01(\x04R\vtimeoutSecs\x12\"\n" +
 	"\rmodel_in_path\x18\b \x01(\bR\vmodelInPath\x127\n" +
 	"\x15request_path_override\x18\t \x01(\tH\x00R\x13requestPathOverride\x88\x01\x01B\x18\n" +
-	"\x16_request_path_override\"\x9f\x01\n" +
-	"\x1aGetInferenceBundleResponse\x12=\n" +
+	"\x16_request_path_override\"\x9c\x01\n" +
+	"\x17InferenceBundleSnapshot\x12=\n" +
 	"\x06routes\x18\x01 \x03(\v2%.openshell.inference.v1.ResolvedRouteR\x06routes\x12\x1a\n" +
 	"\brevision\x18\x02 \x01(\tR\brevision\x12&\n" +
-	"\x0fgenerated_at_ms\x18\x03 \x01(\x03R\rgeneratedAtMs2\x82\x05\n" +
-	"\tInference\x12\x8a\x01\n" +
-	"\x12GetInferenceBundle\x121.openshell.inference.v1.GetInferenceBundleRequest\x1a2.openshell.inference.v1.GetInferenceBundleResponse\"\r\x82\xb5\x18\t\n" +
-	"\asandbox\x12\x9e\x01\n" +
+	"\x0fgenerated_at_ms\x18\x03 \x01(\x03R\rgeneratedAtMs2\xf5\x03\n" +
+	"\tInference\x12\x9e\x01\n" +
 	"\x11SetInferenceRoute\x120.openshell.inference.v1.SetInferenceRouteRequest\x1a1.openshell.inference.v1.SetInferenceRouteResponse\"$\x82\xb5\x18 \n" +
 	"\x06bearer\x12\x05admin\"\x0finference:write\x12\x9c\x01\n" +
 	"\x11GetInferenceRoute\x120.openshell.inference.v1.GetInferenceRouteRequest\x1a1.openshell.inference.v1.GetInferenceRouteResponse\"\"\x82\xb5\x18\x1e\n" +
@@ -969,24 +970,22 @@ var file_inference_proto_goTypes = []any{
 	(*DeleteInferenceRouteResponse)(nil), // 8: openshell.inference.v1.DeleteInferenceRouteResponse
 	(*GetInferenceBundleRequest)(nil),    // 9: openshell.inference.v1.GetInferenceBundleRequest
 	(*ResolvedRoute)(nil),                // 10: openshell.inference.v1.ResolvedRoute
-	(*GetInferenceBundleResponse)(nil),   // 11: openshell.inference.v1.GetInferenceBundleResponse
+	(*InferenceBundleSnapshot)(nil),      // 11: openshell.inference.v1.InferenceBundleSnapshot
 	(*datamodelv1.ObjectMeta)(nil),       // 12: openshell.datamodel.v1.ObjectMeta
 }
 var file_inference_proto_depIdxs = []int32{
 	12, // 0: openshell.inference.v1.InferenceRoute.metadata:type_name -> openshell.datamodel.v1.ObjectMeta
 	0,  // 1: openshell.inference.v1.InferenceRoute.config:type_name -> openshell.inference.v1.InferenceRouteConfig
 	3,  // 2: openshell.inference.v1.SetInferenceRouteResponse.validated_endpoints:type_name -> openshell.inference.v1.ValidatedEndpoint
-	10, // 3: openshell.inference.v1.GetInferenceBundleResponse.routes:type_name -> openshell.inference.v1.ResolvedRoute
-	9,  // 4: openshell.inference.v1.Inference.GetInferenceBundle:input_type -> openshell.inference.v1.GetInferenceBundleRequest
-	2,  // 5: openshell.inference.v1.Inference.SetInferenceRoute:input_type -> openshell.inference.v1.SetInferenceRouteRequest
-	5,  // 6: openshell.inference.v1.Inference.GetInferenceRoute:input_type -> openshell.inference.v1.GetInferenceRouteRequest
-	7,  // 7: openshell.inference.v1.Inference.DeleteInferenceRoute:input_type -> openshell.inference.v1.DeleteInferenceRouteRequest
-	11, // 8: openshell.inference.v1.Inference.GetInferenceBundle:output_type -> openshell.inference.v1.GetInferenceBundleResponse
-	4,  // 9: openshell.inference.v1.Inference.SetInferenceRoute:output_type -> openshell.inference.v1.SetInferenceRouteResponse
-	6,  // 10: openshell.inference.v1.Inference.GetInferenceRoute:output_type -> openshell.inference.v1.GetInferenceRouteResponse
-	8,  // 11: openshell.inference.v1.Inference.DeleteInferenceRoute:output_type -> openshell.inference.v1.DeleteInferenceRouteResponse
-	8,  // [8:12] is the sub-list for method output_type
-	4,  // [4:8] is the sub-list for method input_type
+	10, // 3: openshell.inference.v1.InferenceBundleSnapshot.routes:type_name -> openshell.inference.v1.ResolvedRoute
+	2,  // 4: openshell.inference.v1.Inference.SetInferenceRoute:input_type -> openshell.inference.v1.SetInferenceRouteRequest
+	5,  // 5: openshell.inference.v1.Inference.GetInferenceRoute:input_type -> openshell.inference.v1.GetInferenceRouteRequest
+	7,  // 6: openshell.inference.v1.Inference.DeleteInferenceRoute:input_type -> openshell.inference.v1.DeleteInferenceRouteRequest
+	4,  // 7: openshell.inference.v1.Inference.SetInferenceRoute:output_type -> openshell.inference.v1.SetInferenceRouteResponse
+	6,  // 8: openshell.inference.v1.Inference.GetInferenceRoute:output_type -> openshell.inference.v1.GetInferenceRouteResponse
+	8,  // 9: openshell.inference.v1.Inference.DeleteInferenceRoute:output_type -> openshell.inference.v1.DeleteInferenceRouteResponse
+	7,  // [7:10] is the sub-list for method output_type
+	4,  // [4:7] is the sub-list for method input_type
 	4,  // [4:4] is the sub-list for extension type_name
 	4,  // [4:4] is the sub-list for extension extendee
 	0,  // [0:4] is the sub-list for field type_name

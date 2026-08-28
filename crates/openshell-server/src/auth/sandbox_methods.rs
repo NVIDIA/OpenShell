@@ -30,9 +30,6 @@ mod tests {
             "/openshell.v1.OpenShell/GetSandboxConfig"
         ));
         assert!(is_sandbox_callable(
-            "/openshell.inference.v1.Inference/GetInferenceBundle"
-        ));
-        assert!(is_sandbox_callable(
             "/openshell.v1.OpenShell/ExchangeProviderSubjectToken"
         ));
     }

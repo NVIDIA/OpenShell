@@ -26,7 +26,7 @@ import {
   ServiceStatus,
   type TcpForwardFrameSchema,
 } from './gen/openshell_pb.js';
-import type { EffectiveSetting, GetSandboxConfigResponse, SandboxPolicy, SettingValue } from './gen/sandbox_pb.js';
+import type { EffectiveSetting, SandboxConfigSnapshot, SandboxPolicy, SettingValue } from './gen/sandbox_pb.js';
 import { PolicySource, type SandboxPolicySchema, SettingScope, type SettingValueSchema } from './gen/sandbox_pb.js';
 import { validateSshResponse } from './ssh-validate.js';
 import { buildTransport, type ConnectOptions } from './transport.js';
@@ -352,7 +352,7 @@ function providerRef(provider: Provider): ProviderRef {
   };
 }
 
-function sandboxConfig(resp: GetSandboxConfigResponse): SandboxConfig {
+function sandboxConfig(resp: SandboxConfigSnapshot): SandboxConfig {
   const settings: Record<string, EffectiveSettingView> = {};
   for (const [key, setting] of Object.entries(resp.settings)) {
     settings[key] = effectiveSetting(setting);
