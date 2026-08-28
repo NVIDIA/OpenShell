@@ -470,7 +470,9 @@ openshell sandbox delete my-sandbox --no-wait            # Async acknowledgment 
 
 Deletion waits for the targeted sandbox to disappear by default. Use `--no-wait`
 for an acknowledgment before cleanup finishes, and `--timeout <seconds>` to
-bound each wait (300 seconds by default). An already-absent sandbox succeeds;
+bound each wait (300 seconds by default). `OPENSHELL_LIFECYCLE_TIMEOUT` also
+sets the default. A timeout reports an error while deletion continues. An
+already-absent sandbox succeeds;
 missing workspaces and authorization failures remain errors. Do not blindly
 retry by name if another process might have recreated that name.
 

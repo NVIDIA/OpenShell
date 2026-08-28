@@ -1673,8 +1673,8 @@ enum SandboxCommands {
         #[arg(long, conflicts_with = "timeout")]
         no_wait: bool,
 
-        /// Maximum seconds to wait for terminal deletion.
-        #[arg(long, value_name = "SECONDS")]
+        /// Positive seconds to wait for each sandbox to reach terminal deletion.
+        #[arg(long, value_name = "SECONDS", value_parser = clap::value_parser!(u64).range(1..))]
         timeout: Option<u64>,
     },
 
@@ -5577,6 +5577,11 @@ mod tests {
             ])
             .is_err(),
             "--no-wait and --timeout should conflict"
+        );
+        assert!(
+            Cli::try_parse_from(["openshell", "sandbox", "delete", "demo", "--timeout", "0",])
+                .is_err(),
+            "--timeout must be positive"
         );
     }
 
