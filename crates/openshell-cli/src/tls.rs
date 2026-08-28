@@ -24,6 +24,14 @@ use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity
 use tracing::debug;
 use url::{Host, Url};
 
+#[derive(Debug, thiserror::Error, miette::Diagnostic)]
+#[error(transparent)]
+pub(crate) struct GrpcConnectError(#[from] tonic::transport::Error);
+
+fn grpc_connect_error(error: tonic::transport::Error) -> miette::Report {
+    miette::Report::new(GrpcConnectError(error))
+}
+
 /// Concrete gRPC client type used by all commands.
 pub type GrpcClient = OpenShellClient<InterceptedService<Channel, EdgeAuthInterceptor>>;
 /// Concrete inference client type.
@@ -370,7 +378,7 @@ pub async fn build_channel(server: &str, tls: &TlsOptions) -> Result<Channel> {
             .http2_adaptive_window(true)
             .http2_keep_alive_interval(Duration::from_secs(10))
             .keep_alive_while_idle(true);
-        return endpoint.connect().await.into_diagnostic();
+        return endpoint.connect().await.map_err(grpc_connect_error);
     }
 
     // When Cloudflare edge bearer auth is active and the server is HTTPS,
@@ -391,7 +399,7 @@ pub async fn build_channel(server: &str, tls: &TlsOptions) -> Result<Channel> {
             .http2_adaptive_window(true)
             .http2_keep_alive_interval(Duration::from_secs(10))
             .keep_alive_while_idle(true);
-        return endpoint.connect().await.into_diagnostic();
+        return endpoint.connect().await.map_err(grpc_connect_error);
     }
 
     if tls.gateway_insecure && server.starts_with("https://") {
@@ -410,7 +418,7 @@ pub async fn build_channel(server: &str, tls: &TlsOptions) -> Result<Channel> {
         return endpoint
             .connect_with_connector(connector)
             .await
-            .into_diagnostic();
+            .map_err(grpc_connect_error);
     }
 
     let mut endpoint = Endpoint::from_shared(server.to_string())
@@ -441,14 +449,14 @@ pub async fn build_channel(server: &str, tls: &TlsOptions) -> Result<Channel> {
     } else if tls.edge_token.is_some() {
         // Edge bearer mode — routed through tunnel above; if we reach here
         // the server is not HTTPS so connect plaintext.
-        return endpoint.connect().await.into_diagnostic();
+        return endpoint.connect().await.map_err(grpc_connect_error);
     } else {
         // Standard mTLS: private CA + client cert.
         let materials = require_tls_materials(server, tls)?;
         build_tonic_tls_config(server, &materials)?
     };
     endpoint = endpoint.tls_config(tls_config).into_diagnostic()?;
-    endpoint.connect().await.into_diagnostic()
+    endpoint.connect().await.map_err(grpc_connect_error)
 }
 
 /// Build a gRPC [`OpenShellClient`].
