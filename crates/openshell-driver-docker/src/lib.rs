@@ -60,7 +60,6 @@ use openshell_core::proto_struct::{
 use openshell_core::{Error, Result as CoreResult};
 use opentelemetry::trace::TraceContextExt as _;
 use std::collections::{HashMap, HashSet};
-use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -979,12 +978,6 @@ impl DockerComputeDriver {
             image.ref = %template.image,
         ))
         .await?;
-        let token_file_created = write_sandbox_token_file(sandbox, &self.config)
-            .await
-            .map_err(|status| {
-                DockerProvisioningFailure::new("SandboxTokenWriteFailed", status.message())
-            })?;
-
         let container_name = container_name_for_sandbox(sandbox);
         let gpu_devices = self
             .resolve_gpu_cdi_devices(
