@@ -746,6 +746,7 @@ PY
 		export OPENSHELL_E2E_SANDBOX_NAMESPACE='${guest_e2e_network_name}'
 		export XDG_RUNTIME_DIR="\${XDG_RUNTIME_DIR:-/run/user/\$(id -u)}"
 		export OPENSHELL_PODMAN_SOCKET="\${XDG_RUNTIME_DIR}/podman/podman.sock"
+		export CONTAINER_HOST="unix://\${OPENSHELL_PODMAN_SOCKET}"
 		export OPENSHELL_E2E_CONTAINER_ENGINE_UNSET_XDG_CONFIG_HOME=1
 		insert_podman_config_key socket_path "\$(toml_string "\${OPENSHELL_PODMAN_SOCKET}")"
 
