@@ -792,11 +792,11 @@ PY
 		exit 1
 	fi
 
-	while IFS= read -r test_bin; do
+	while IFS= read -r test_bin <&3; do
 		[ -n "\${test_bin}" ] || continue
 		echo "==> Running guest E2E artifact: \${test_bin##*/}"
-		"\${test_bin}" --nocapture
-	done <"${guest_test_manifest_path}"
+		"\${test_bin}" --nocapture </dev/null
+	done 3<"${guest_test_manifest_path}"
 	exit 0
 fi
 
