@@ -10,7 +10,7 @@ let
     if architecture == "aarch64" then
       "sha256-PhE/3UHznhNyk3UXO7KueT+H3G20KU5SUf8kdpcXiLo="
     else
-      "sha256-ncfFNjwBRqCLoMmqg02CwsbfuxxHGtmi8KuhGJ4hvgU=";
+      "sha256-gZa+nXlYBZy1bGx1yA/fbO6KiIW8FJ6nkdfbHH75MDU=";
 in
 {
   osId = "ubuntu";
