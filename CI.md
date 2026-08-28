@@ -29,12 +29,12 @@ The GitHub ruleset should require the `OpenShell / ...` statuses published by `R
 ## Informational security reports
 
 Security analysis that does not need NVIDIA infrastructure runs directly on
-GitHub-hosted runners. These workflows receive no secrets and run on fork pull
-requests without waiting for copy-pr-bot. Scanner jobs request
-`security-events: write` to publish SARIF to Code Scanning. GitHub permits
-Code Scanning uploads from `pull_request` runs even when fork and Dependabot
-contexts receive a read-only `GITHUB_TOKEN`, so each scanner uploads results
-directly and also retains report artifacts:
+GitHub-hosted runners. These workflows receive no secrets. The PR-oriented
+reports run on fork pull requests without waiting for copy-pr-bot. Scanner jobs
+request `security-events: write` to publish SARIF to Code Scanning. GitHub
+permits Code Scanning uploads from `pull_request` runs even when fork and
+Dependabot contexts receive a read-only `GITHUB_TOKEN`, so those scanners upload
+results directly and also retain report artifacts:
 
 - `Workflow Security Reports` runs Actionlint and Zizmor. Actionlint reports
   workflow syntax and expression findings. Zizmor reports only High severity,
@@ -46,13 +46,15 @@ directly and also retains report artifacts:
   a warning, so the workflow remains neutral until the repository feature is
   available.
 - `CodeQL` analyzes product Rust code, examples, and the Go, Python, and
-  TypeScript SDKs. E2E test code is excluded. Results are uploaded to Code
-  Scanning and always retained as workflow artifacts.
+  TypeScript SDKs. Rust `cfg(test)` blocks, Rust integration-test targets, and
+  E2E test code are excluded. It runs nightly on `main`, remains manually
+  dispatchable for diagnostics, uploads results to Code Scanning, and retains
+  workflow artifacts.
 
 Findings do not fail these workflows. Tool startup, configuration, build, and
-analysis failures still fail so a broken scanner cannot appear healthy. These
-workflows also run on merge groups, but their checks are not required statuses
-and do not gate merges.
+analysis failures still fail so a broken scanner cannot appear healthy. The
+PR-oriented reports also run on merge groups; CodeQL is not a PR or merge-queue
+check. None of these reports are required statuses or gate merges.
 
 Run the workflow-definition scanners locally with:
 
@@ -184,7 +186,7 @@ The bot's full administrator documentation is internal to NVIDIA. The only comma
 | `.github/workflows/e2e-label-help.yml` | When a `test:e2e*` label is applied, posts a PR comment telling the maintainer the next manual step (re-run an existing workflow run, or `/ok to test <SHA>` to refresh the mirror). |
 | `.github/workflows/workflow-security.yml` | Runs informational Actionlint and High-severity Zizmor reports on GitHub-hosted runners. |
 | `.github/workflows/dependency-review.yml` | Reports dependency changes when GitHub Dependency Graph is available; otherwise publishes a neutral warning. |
-| `.github/workflows/codeql.yml` | Runs informational CodeQL analysis for Rust and the Go, Python, and TypeScript SDKs and retains SARIF artifacts. |
+| `.github/workflows/codeql.yml` | Runs nightly informational CodeQL analysis on `main` for Rust and the Go, Python, and TypeScript SDKs and retains SARIF artifacts. |
 
 ## Release workflows
 

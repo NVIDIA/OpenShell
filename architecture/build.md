@@ -284,18 +284,22 @@ disables emission for Rust tests, E2E runs, and release canaries. This prevents
 synthetic activity from contributing to product usage metrics.
 
 Static security checks are deliberately outside the mirror-branch path. They run
-directly on GitHub-hosted runners with no secrets, so they also cover fork pull
-requests and consume no NVIDIA self-hosted capacity. Scanner jobs request
-`security-events: write` and upload SARIF to Code Scanning directly on every
-event they run on, including fork and Dependabot pull requests, which Code
-Scanning permits for `pull_request` runs despite their read-only `GITHUB_TOKEN`.
-Each scanner also retains its report as a workflow artifact. No privileged
-intermediate workflow relays those uploads.
-Triggers differ by workflow: `.github/workflows/workflow-security.yml` and
-`.github/workflows/codeql.yml` run on `pull_request`, `merge_group`, `main`, and
-a weekly schedule; `.github/workflows/dependency-review.yml` runs on
-`pull_request` and `merge_group` only, because it needs a base and head commit
-to compare.
+directly on GitHub-hosted runners with no secrets, so the pull-request-triggered
+ones also cover fork pull requests, and none of them consume NVIDIA self-hosted
+capacity. Scanner jobs request `security-events: write` and upload SARIF to Code
+Scanning directly on every event they run on, including fork and Dependabot pull
+requests, which Code Scanning permits for `pull_request` runs despite their
+read-only `GITHUB_TOKEN`. Each scanner also retains its report as a workflow
+artifact. No privileged intermediate workflow relays those uploads.
+Triggers differ by workflow: `.github/workflows/workflow-security.yml` runs on
+`pull_request`, `merge_group`, `main`, and a weekly schedule;
+`.github/workflows/dependency-review.yml` runs on `pull_request` and
+`merge_group` only, because it needs a base and head commit to compare; and
+`.github/workflows/codeql.yml` runs nightly on the default branch (`main`) via
+`schedule`, with `workflow_dispatch` kept for manual diagnostics. CodeQL does
+not run on `pull_request`, `merge_group`, or pushes to `main`, so it reports
+repository-level Code Scanning state on the default branch instead of per-PR
+results, and its four-language matrix stays off the per-change critical path.
 
 - **Actionlint and Zizmor** analyze the workflow definitions themselves.
   Repository configuration lives in `.github/actionlint.yml` (self-hosted runner
@@ -311,10 +315,15 @@ to compare.
   reporting on its own once the feature is enabled. Reviews run in warn-only
   mode.
 - **CodeQL** analyzes product Rust code, examples, and the Go, Python, and
-  TypeScript SDKs, scoped by `.github/codeql/codeql-config.yml`; E2E test code is
-  excluded. Only Go requires a build; the other languages use build mode `none`.
-  Results are uploaded to Code Scanning and always retained as workflow
-  artifacts.
+  TypeScript SDKs, scoped by `.github/codeql/codeql-config.yml`. Rust test code
+  is excluded in two layers: the analyze job sets
+  `CODEQL_EXTRACTOR_RUST_OPTION_CARGO_CFG_OVERRIDES=-test` so the extractor skips
+  `#[cfg(test)]` blocks, and `paths-ignore` drops `crates/*/tests`, whose
+  integration targets the cfg override does not reach. Examples remain in scope,
+  and E2E test code stays excluded because `e2e/` is not an analyzed path. Only
+  Go requires a build; the other languages use build mode `none`. Analysis runs
+  on the nightly schedule or by manual dispatch. Results are uploaded to Code
+  Scanning and always retained as workflow artifacts.
 
 Findings never fail these checks; scanner and build failures do. A scanner that
 cannot run, a CodeQL analyzer that does not complete, and an unexpected
