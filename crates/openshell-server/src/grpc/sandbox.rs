@@ -60,6 +60,7 @@ use super::{MAX_PAGE_SIZE, MAX_PROVIDERS, MAX_ROUTABLE_NAME_LEN, clamp_limit};
 use crate::persistence::current_time_ms;
 
 const TCP_FORWARD_CHUNK_SIZE: usize = 64 * 1024;
+const SANDBOX_STORE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 
 #[derive(Debug)]
 pub struct WatchSandboxStream {
@@ -1014,10 +1015,12 @@ pub(super) async fn handle_watch_sandbox(
             } else {
                 None
             };
+            let mut last_sandbox_resource_version = None;
 
             // Re-read the snapshot now that we have subscriptions active.
             match state.store.get_message::<Sandbox>(&sandbox_id).await {
                 Ok(Some(sandbox)) => {
+                    last_sandbox_resource_version = Some(sandbox.get_resource_version());
                     state.sandbox_index.update_from_sandbox(&sandbox);
                     let _ = tx
                         .send(Ok(SandboxStreamEvent {
@@ -1085,6 +1088,16 @@ pub(super) async fn handle_watch_sandbox(
                 }
             }
 
+            // The in-memory status bus only observes writes made by this gateway
+            // process. Poll the shared store at a bounded rate for updates made by
+            // another gateway process.
+            let mut store_poll = tokio::time::interval_at(
+                tokio::time::Instant::now() + SANDBOX_STORE_POLL_INTERVAL,
+                SANDBOX_STORE_POLL_INTERVAL,
+            );
+            store_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut store_poll_error_reported = false;
+
             loop {
                 tokio::select! {
                     () = tx.closed() => {
@@ -1100,6 +1113,8 @@ pub(super) async fn handle_watch_sandbox(
                             Ok(()) => {
                                 match state.store.get_message::<Sandbox>(&sandbox_id).await {
                                     Ok(Some(sandbox)) => {
+                                        last_sandbox_resource_version =
+                                            Some(sandbox.get_resource_version());
                                         state.sandbox_index.update_from_sandbox(&sandbox);
                                         if tx.send(Ok(SandboxStreamEvent { payload: Some(openshell_core::proto::sandbox_stream_event::Payload::Sandbox(sandbox.clone()))})).await.is_err() {
                                             return;
@@ -1123,6 +1138,38 @@ pub(super) async fn handle_watch_sandbox(
                             Err(err) => {
                                 let _ = tx.send(Err(crate::sandbox_watch::broadcast_to_status(err))).await;
                                 return;
+                            }
+                        }
+                    }
+                    _ = store_poll.tick(), if follow_status => {
+                        match state.store.get_message::<Sandbox>(&sandbox_id).await {
+                            Ok(Some(sandbox)) => {
+                                store_poll_error_reported = false;
+                                let resource_version = sandbox.get_resource_version();
+                                if last_sandbox_resource_version == Some(resource_version) {
+                                    continue;
+                                }
+                                last_sandbox_resource_version = Some(resource_version);
+                                state.sandbox_index.update_from_sandbox(&sandbox);
+                                if tx.send(Ok(SandboxStreamEvent {
+                                    payload: Some(openshell_core::proto::sandbox_stream_event::Payload::Sandbox(sandbox.clone())),
+                                })).await.is_err() {
+                                    return;
+                                }
+                                if stop_on_terminal {
+                                    let phase = SandboxPhase::try_from(sandbox.phase())
+                                        .unwrap_or(SandboxPhase::Unknown);
+                                    if phase == SandboxPhase::Ready {
+                                        return;
+                                    }
+                                }
+                            }
+                            Ok(None) => return,
+                            Err(error) => {
+                                if !store_poll_error_reported {
+                                    warn!(sandbox_id = %sandbox_id, %error, "WatchSandbox store poll failed; retrying");
+                                    store_poll_error_reported = true;
+                                }
                             }
                         }
                     }
