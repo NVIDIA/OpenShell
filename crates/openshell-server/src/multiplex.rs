@@ -17,15 +17,19 @@ use hyper_util::{
     service::TowerToHyperService,
 };
 use metrics::{counter, histogram};
-use openshell_core::Config;
 use openshell_core::proto::{
     inference_server::InferenceServer, open_shell_server::OpenShellServer,
+};
+use openshell_core::{
+    Config,
+    proto::{Provider, UpdateProviderRequest},
 };
 use openshell_gateway_interceptors::{EvaluationContext, GatewayInterceptorRuntime};
 use openshell_otel::HeaderMapExtractor;
 use opentelemetry::propagation::TextMapPropagator;
 use opentelemetry::trace::TraceContextExt as _;
 use opentelemetry_sdk::propagation::TraceContextPropagator;
+use prost::Message;
 use std::collections::BTreeMap;
 use std::convert::Infallible;
 use std::future::Future;
@@ -46,6 +50,7 @@ use crate::{
     auth::identity::Identity,
     auth::oidc::{self, OidcAuthenticator},
     auth::principal::{Principal, UserPrincipal},
+    auth::workspace_authz::{MinWorkspaceRole, authorize_workspace},
     gateway_listener::GatewayListenerScope,
     http_router,
     inference::InferenceService,
@@ -267,8 +272,11 @@ impl MultiplexService {
     {
         let openshell = OpenShellServer::new(OpenShellService::new(self.state.clone()))
             .max_decoding_message_size(MAX_GRPC_DECODE_SIZE);
-        let openshell =
-            GatewayInterceptorGrpcService::new(openshell, self.state.gateway_interceptors.clone());
+        let openshell = GatewayInterceptorGrpcService::new(
+            openshell,
+            self.state.gateway_interceptors.clone(),
+            Some(self.state.clone()),
+        );
         let inference = InferenceServer::new(InferenceService::new(self.state.clone()))
             .max_decoding_message_size(MAX_GRPC_DECODE_SIZE);
         let authz_policy = self.state.config.oidc.as_ref().map(|oidc| AuthzPolicy {
@@ -394,13 +402,19 @@ where
 struct GatewayInterceptorGrpcService<S> {
     inner: S,
     interceptors: Option<GatewayInterceptorRuntime>,
+    state: Option<Arc<ServerState>>,
 }
 
 impl<S> GatewayInterceptorGrpcService<S> {
-    fn new(inner: S, interceptors: Option<GatewayInterceptorRuntime>) -> Self {
+    fn new(
+        inner: S,
+        interceptors: Option<GatewayInterceptorRuntime>,
+        state: Option<Arc<ServerState>>,
+    ) -> Self {
         Self {
             inner,
             interceptors,
+            state,
         }
     }
 }
@@ -424,6 +438,7 @@ where
 
     fn call(&mut self, req: Request<BoxBody>) -> Self::Future {
         let interceptors = self.interceptors.clone();
+        let state = self.state.clone();
         let mut inner = self.inner.clone();
 
         Box::pin(async move {
@@ -437,11 +452,21 @@ where
             }
 
             let context = gateway_interceptor_context(req.extensions());
+            let principal = req.extensions().get::<Principal>().cloned();
             let (parts, body) = req.into_parts();
-            let body = match collect_intercepted_grpc_body(body).await {
+            let mut body = match collect_intercepted_grpc_body(body).await {
                 Ok(body) => body,
                 Err(status) => return Ok(status.into_http()),
             };
+            if let Some(state) = state.as_ref() {
+                body =
+                    match hydrate_update_provider_identity(&path, body, state, principal.as_ref())
+                        .await
+                    {
+                        Ok(body) => body,
+                        Err(status) => return Ok(status.into_http()),
+                    };
+            }
 
             let intercepted = match interceptors.evaluate_request(&path, &body, &context).await {
                 Ok(intercepted) => intercepted,
@@ -495,6 +520,104 @@ where
             Ok(response)
         })
     }
+}
+
+const UPDATE_PROVIDER_PATH: &str = "/openshell.v1.OpenShell/UpdateProvider";
+const GRPC_FRAME_HEADER_LEN: usize = 5;
+
+/// Complete immutable provider identity before policy interception.
+///
+/// Update requests intentionally omit immutable fields. Loading them here keeps
+/// `provider update` a write-only operation while giving policy interceptors a
+/// canonical proposed operation derived from trusted gateway state.
+async fn hydrate_update_provider_identity(
+    path: &str,
+    body: Bytes,
+    state: &ServerState,
+    principal: Option<&Principal>,
+) -> Result<Bytes, tonic::Status> {
+    if path != UPDATE_PROVIDER_PATH {
+        return Ok(body);
+    }
+
+    let mut request = decode_unary_grpc_message::<UpdateProviderRequest>(&body)?;
+    let Some(provider) = request.provider.as_mut() else {
+        return Ok(body);
+    };
+    if !provider.r#type.is_empty() && !provider.profile_workspace.is_empty() {
+        return Ok(body);
+    }
+    let name = provider
+        .metadata
+        .as_ref()
+        .map(|metadata| metadata.name.as_str())
+        .unwrap_or_default();
+    if name.is_empty() {
+        return Ok(body);
+    }
+
+    let principal =
+        principal.ok_or_else(|| tonic::Status::unauthenticated("authentication required"))?;
+    let authorized = authorize_workspace(
+        state.store.as_ref(),
+        &state.admin_role,
+        principal,
+        &request.workspace,
+        MinWorkspaceRole::Admin,
+    )
+    .await?;
+    let workspace =
+        crate::grpc::workspace::resolve_workspace(state.store.as_ref(), &authorized.workspace)
+            .await?
+            .name;
+    let existing = state
+        .store
+        .get_message_by_name::<Provider>(&workspace, name)
+        .await
+        .map_err(|error| tonic::Status::internal(format!("provider lookup failed: {error}")))?
+        .ok_or_else(|| tonic::Status::not_found(format!("provider '{name}' not found")))?;
+
+    if provider.r#type.is_empty() {
+        provider.r#type = existing.r#type;
+    }
+    if provider.profile_workspace.is_empty() {
+        provider.profile_workspace = existing.profile_workspace;
+    }
+
+    encode_unary_grpc_message(&request)
+}
+
+fn decode_unary_grpc_message<M>(body: &[u8]) -> Result<M, tonic::Status>
+where
+    M: Message + Default,
+{
+    if body.len() < GRPC_FRAME_HEADER_LEN {
+        return Err(tonic::Status::invalid_argument("gRPC frame is too short"));
+    }
+    if body[0] != 0 {
+        return Err(tonic::Status::unimplemented(
+            "gateway interceptors do not support compressed gRPC frames",
+        ));
+    }
+    let message_len = u32::from_be_bytes([body[1], body[2], body[3], body[4]]) as usize;
+    if body.len() != GRPC_FRAME_HEADER_LEN + message_len {
+        return Err(tonic::Status::invalid_argument(
+            "gRPC body must contain exactly one frame",
+        ));
+    }
+    M::decode(&body[GRPC_FRAME_HEADER_LEN..])
+        .map_err(|error| tonic::Status::invalid_argument(format!("invalid gRPC message: {error}")))
+}
+
+fn encode_unary_grpc_message<M: Message>(message: &M) -> Result<Bytes, tonic::Status> {
+    let message = message.encode_to_vec();
+    let message_len = u32::try_from(message.len())
+        .map_err(|_| tonic::Status::resource_exhausted("gRPC message exceeds u32"))?;
+    let mut frame = Vec::with_capacity(GRPC_FRAME_HEADER_LEN + message.len());
+    frame.push(0);
+    frame.extend_from_slice(&message_len.to_be_bytes());
+    frame.extend_from_slice(&message);
+    Ok(Bytes::from(frame))
 }
 
 async fn collect_intercepted_grpc_body(body: BoxBody) -> Result<Bytes, tonic::Status> {
@@ -1325,7 +1448,6 @@ mod tests {
         ProviderProfileSnapshotRequest,
         gateway_interceptor_server::{GatewayInterceptor, GatewayInterceptorServer},
     };
-    use prost::Message as _;
     use std::convert::Infallible;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1654,6 +1776,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn update_provider_interception_hydrates_identity_from_trusted_state() {
+        let state = crate::grpc::test_support::test_server_state().await;
+        let existing = Provider {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: "provider-id".to_string(),
+                name: "managed-provider".to_string(),
+                workspace: "default".to_string(),
+                ..Default::default()
+            }),
+            r#type: "agent-tool-gateway".to_string(),
+            profile_workspace: "default".to_string(),
+            ..Default::default()
+        };
+        state.store.put_message(&existing).await.unwrap();
+
+        let request = UpdateProviderRequest {
+            provider: Some(Provider {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    name: "managed-provider".to_string(),
+                    workspace: "default".to_string(),
+                    ..Default::default()
+                }),
+                credentials: std::collections::HashMap::from([(
+                    "TOKEN".to_string(),
+                    "rotated".to_string(),
+                )]),
+                ..Default::default()
+            }),
+            workspace: "default".to_string(),
+            ..Default::default()
+        };
+        let authed = crate::grpc::test_support::authed_request(());
+        let principal = authed.extensions().get::<Principal>().unwrap();
+
+        let hydrated = hydrate_update_provider_identity(
+            UPDATE_PROVIDER_PATH,
+            grpc_frame(&request.encode_to_vec()),
+            state.as_ref(),
+            Some(principal),
+        )
+        .await
+        .unwrap();
+        let hydrated = decode_unary_grpc_message::<UpdateProviderRequest>(&hydrated).unwrap();
+        let provider = hydrated.provider.unwrap();
+
+        assert_eq!(provider.r#type, "agent-tool-gateway");
+        assert_eq!(provider.profile_workspace, "default");
+        assert_eq!(provider.credentials.get("TOKEN").unwrap(), "rotated");
+    }
+
+    #[tokio::test]
     async fn intercepted_grpc_response_preserves_body_and_trailers() {
         let bytes = Bytes::from_static(b"committed-response");
         let mut trailers = http::HeaderMap::new();
@@ -1720,7 +1893,7 @@ mod tests {
                 )))
             }
         });
-        let mut service = GatewayInterceptorGrpcService::new(inner, Some(runtime));
+        let mut service = GatewayInterceptorGrpcService::new(inner, Some(runtime), None);
         let request_body = grpc_frame(&CreateSandboxRequest::default().encode_to_vec());
         let request = Request::builder()
             .uri("/openshell.v1.OpenShell/CreateSandbox")
@@ -2539,6 +2712,18 @@ mod tests {
             })
         }
 
+        fn provider_writer_principal() -> Principal {
+            Principal::User(UserPrincipal {
+                identity: Identity {
+                    subject: "provider-rotation-job".to_string(),
+                    display_name: None,
+                    roles: vec!["openshell-admin".to_string()],
+                    scopes: vec!["provider:write".to_string()],
+                    provider: IdentityProvider::Oidc,
+                },
+            })
+        }
+
         fn mtls_identity(subject: &str) -> Identity {
             Identity {
                 subject: subject.to_string(),
@@ -2793,6 +2978,41 @@ mod tests {
                 // grpc-status=7 (PERMISSION_DENIED).
                 assert_eq!(grpc_status(&res).as_deref(), Some("7"), "{path}");
             }
+        }
+
+        #[tokio::test]
+        async fn provider_write_scope_allows_update_without_provider_read() {
+            let policy = AuthzPolicy {
+                admin_role: "openshell-admin".to_string(),
+                user_role: "openshell-user".to_string(),
+                scopes_enabled: true,
+            };
+
+            let mock = Arc::new(MockAuthenticator::returning(Ok(Some(
+                provider_writer_principal(),
+            ))));
+            let chain = AuthenticatorChain::new(vec![mock]);
+            let (recorder, seen) = PrincipalRecorder::new();
+            let mut router = AuthGrpcRouter::new(recorder, Some(chain), Some(policy.clone()));
+            let response = router
+                .call(empty_request(UPDATE_PROVIDER_PATH))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert!(seen.lock().unwrap().is_some());
+
+            let mock = Arc::new(MockAuthenticator::returning(Ok(Some(
+                provider_writer_principal(),
+            ))));
+            let chain = AuthenticatorChain::new(vec![mock]);
+            let (recorder, seen) = PrincipalRecorder::new();
+            let mut router = AuthGrpcRouter::new(recorder, Some(chain), Some(policy));
+            let response = router
+                .call(empty_request("/openshell.v1.OpenShell/GetProvider"))
+                .await
+                .unwrap();
+            assert_eq!(grpc_status(&response).as_deref(), Some("7"));
+            assert!(seen.lock().unwrap().is_none());
         }
 
         #[tokio::test]

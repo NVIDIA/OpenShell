@@ -4822,22 +4822,17 @@ pub async fn provider_update(options: ProviderUpdateOptions<'_>) -> Result<()> {
     }
 
     let mut client = grpc_client(server, tls).await?;
-    // Preserve the managed profile identity in the update request. Policy
-    // interceptors evaluate this request before the server merges it with the
-    // stored provider, so an empty type/profile workspace makes a legitimate
-    // credential rotation indistinguishable from an unbound mutation.
-    let existing = client
-        .get_provider(GetProviderRequest {
-            name: name.to_string(),
-            workspace: workspace.to_string(),
-        })
-        .await
-        .into_diagnostic()?
-        .into_inner()
-        .provider
-        .ok_or_else(|| miette::miette!("provider '{name}' not found"))?;
-
     let oidc_profile = if from_oidc_token {
+        let existing = client
+            .get_provider(GetProviderRequest {
+                name: name.to_string(),
+                workspace: workspace.to_string(),
+            })
+            .await
+            .into_diagnostic()?
+            .into_inner()
+            .provider
+            .ok_or_else(|| miette::miette!("provider '{name}' not found"))?;
         let profile_workspace = if existing.profile_workspace.is_empty() {
             workspace
         } else {
@@ -4858,9 +4853,21 @@ pub async fn provider_update(options: ProviderUpdateOptions<'_>) -> Result<()> {
     credential_expires_at_ms.extend(oidc_credential_expires_at_ms);
 
     if from_existing {
-        let provider_type = &existing.r#type;
+        // Fetch the existing provider to discover its type for credential lookup.
+        let existing = client
+            .get_provider(GetProviderRequest {
+                name: name.to_string(),
+                workspace: workspace.to_string(),
+            })
+            .await
+            .into_diagnostic()?
+            .into_inner()
+            .provider
+            .ok_or_else(|| miette::miette!("provider '{name}' not found"))?;
+
+        let provider_type = existing.r#type;
         let discovered =
-            discover_existing_provider_data(&mut client, provider_type, workspace).await?;
+            discover_existing_provider_data(&mut client, &provider_type, workspace).await?;
         let Some(discovered) = discovered else {
             return Err(miette::miette!(
                 "no existing local credentials/config found for provider type '{provider_type}'"
@@ -4888,11 +4895,11 @@ pub async fn provider_update(options: ProviderUpdateOptions<'_>) -> Result<()> {
                     workspace: workspace.to_string(),
                     deletion_timestamp_ms: 0,
                 }),
-                r#type: existing.r#type,
+                r#type: String::new(),
                 credentials: credential_map,
                 config: config_map,
                 credential_expires_at_ms: HashMap::new(),
-                profile_workspace: existing.profile_workspace,
+                profile_workspace: String::new(),
                 credential_handles: HashMap::new(),
             }),
             credential_expires_at_ms,
