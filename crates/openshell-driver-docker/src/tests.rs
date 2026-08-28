@@ -169,6 +169,28 @@ fn test_driver_with_config(config: DockerDriverRuntimeConfig) -> DockerComputeDr
     }
 }
 
+#[test]
+fn capabilities_report_static_resource_support() {
+    let mut config = runtime_config();
+    let capabilities = test_driver_with_config(config.clone()).capabilities();
+    let resources = capabilities.resource_capabilities.unwrap();
+    assert!(resources.cpu.unwrap().limit_supported);
+    assert!(resources.memory.unwrap().limit_supported);
+    let gpu = resources.gpu.unwrap();
+    assert!(!gpu.default_selection_supported);
+    assert!(!gpu.count_selection_supported);
+
+    config.gpu.cdi_supported = true;
+    let gpu = test_driver_with_config(config)
+        .capabilities()
+        .resource_capabilities
+        .unwrap()
+        .gpu
+        .unwrap();
+    assert!(gpu.default_selection_supported);
+    assert!(gpu.count_selection_supported);
+}
+
 #[tokio::test]
 async fn tracing_in_process_service_preserves_the_driver_rpc_server_boundary() {
     use opentelemetry_sdk::trace::{InMemorySpanExporterBuilder, SdkTracerProvider};

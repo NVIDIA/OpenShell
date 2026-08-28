@@ -25,8 +25,9 @@ use openshell_core::proto::compute::v1::GatewayDefaultRouteInterfaceRequirement;
 #[cfg(target_os = "macos")]
 use openshell_core::proto::compute::v1::GatewayLoopbackInterfaceRequirement;
 use openshell_core::proto::compute::v1::{
-    DriverSandbox, GatewayListenerRequirement, GetCapabilitiesResponse, GpuResourceRequirements,
-    gateway_listener_requirement::Selector,
+    CpuResourceCapabilities, DriverSandbox, GatewayListenerRequirement, GetCapabilitiesResponse,
+    GpuResourceCapabilities, GpuResourceRequirements, MemoryResourceCapabilities,
+    ResourceCapabilities, gateway_listener_requirement::Selector,
 };
 #[cfg(target_os = "linux")]
 use std::net::{IpAddr, SocketAddr};
@@ -508,6 +509,18 @@ impl PodmanComputeDriver {
             default_image: self.config.default_image.clone(),
             gateway_manages_lifecycle: true,
             supports_sandbox_authentication: false,
+            resource_capabilities: Some(ResourceCapabilities {
+                cpu: Some(CpuResourceCapabilities {
+                    limit_supported: true,
+                }),
+                memory: Some(MemoryResourceCapabilities {
+                    limit_supported: true,
+                }),
+                gpu: Some(GpuResourceCapabilities {
+                    default_selection_supported: true,
+                    count_selection_supported: true,
+                }),
+            }),
         })
     }
 
@@ -1587,6 +1600,21 @@ mod tests {
     use std::collections::HashMap;
     use std::fs;
     use std::path::{Path, PathBuf};
+
+    #[test]
+    fn capabilities_report_static_resource_support() {
+        let driver = PodmanComputeDriver::for_tests(PodmanComputeConfig::default());
+        let resources = driver
+            .capabilities()
+            .unwrap()
+            .resource_capabilities
+            .unwrap();
+        assert!(resources.cpu.unwrap().limit_supported);
+        assert!(resources.memory.unwrap().limit_supported);
+        let gpu = resources.gpu.unwrap();
+        assert!(gpu.default_selection_supported);
+        assert!(gpu.count_selection_supported);
+    }
 
     // ── socket resolution ───────────────────────────────────────────────
     //

@@ -96,6 +96,7 @@ impl FakeComputeDriver {
                     default_image: "openshell/sandbox:test".to_string(),
                     gateway_manages_lifecycle: false,
                     supports_sandbox_authentication: false,
+                    resource_capabilities: None,
                 },
                 gateway_listener_requirements: Vec::new(),
                 gateway_listener_requirements_supported: true,
