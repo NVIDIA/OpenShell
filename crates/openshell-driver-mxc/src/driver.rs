@@ -291,6 +291,7 @@ impl MxcComputeBackend {
             gateway_manages_lifecycle: false,
             supports_sandbox_authentication: false,
             driver_reports_runtime_readiness: true,
+            resource_capabilities: None,
         }
     }
 
