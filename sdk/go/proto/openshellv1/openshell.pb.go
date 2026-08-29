@@ -14820,13 +14820,13 @@ const file_openshell_proto_rawDesc = "" +
 	"\x0fSessionRejected\x12\x16\n" +
 	"\x06reason\x18\x01 \x01(\tR\x06reason\"\x15\n" +
 	"\x13SupervisorHeartbeat\"\x12\n" +
-	"\x10GatewayHeartbeat\"\x81\x01\n" +
+	"\x10GatewayHeartbeat\"{\n" +
 	"\x1cReportMainProcessExitRequest\x12\x1d\n" +
 	"\n" +
 	"sandbox_id\x18\x01 \x01(\tR\tsandboxId\x12\x1f\n" +
 	"\vinstance_id\x18\x02 \x01(\tR\n" +
 	"instanceId\x12\x1b\n" +
-	"\texit_code\x18\x03 \x01(\x05R\bexitCodeJ\x04\b\x04\x10\x05\"\x1f\n" +
+	"\texit_code\x18\x03 \x01(\x05R\bexitCode\"\x1f\n" +
 	"\x1dReportMainProcessExitResponse\"`\n" +
 	"\x1eFinalizeMainProcessExitRequest\x12\x1d\n" +
 	"\n" +
