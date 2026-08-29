@@ -565,6 +565,8 @@ The Kubernetes driver auto-detects the sandbox UID from OpenShift SCC namespace 
 
 You can override autodetection with explicit `sandbox_uid` / `sandbox_gid` config in `[openshell.drivers.kubernetes]`. When set, the driver skips namespace annotation lookup entirely.
 
+On a Helm-installed gateway, set the `server.sandboxUid` / `server.sandboxGid` chart values; they render into those same config keys. This is the platform-agnostic way to pin a sandbox identity on non-OpenShift clusters, where the SCC annotation is not otherwise used.
+
 The resolved UID/GID appear in:
 
 - Supervisor container environment variables (`OPENSHELL_SANDBOX_UID`, `OPENSHELL_SANDBOX_GID`) for direct kernel-level privilege dropping without `/etc/passwd` lookups.

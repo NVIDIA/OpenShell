@@ -204,6 +204,12 @@ data:
     {{- if .Values.server.appArmorProfile }}
     app_armor_profile            = {{ .Values.server.appArmorProfile | quote }}
     {{- end }}
+    {{- if .Values.server.sandboxUid }}
+    sandbox_uid                  = {{ .Values.server.sandboxUid }}
+    {{- end }}
+    {{- if .Values.server.sandboxGid }}
+    sandbox_gid                  = {{ .Values.server.sandboxGid }}
+    {{- end }}
     {{- if .Values.supervisor.image.pullPolicy }}
     supervisor_image_pull_policy = {{ .Values.supervisor.image.pullPolicy | quote }}
     {{- end }}
