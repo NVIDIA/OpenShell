@@ -28,12 +28,15 @@ identity.
 The live supervisor session is the readiness authority for its main-process
 instance. The supervisor reports its normalized result through the
 sandbox-authenticated `ReportMainProcessExit` RPC, and the gateway rejects
-results from stale instance IDs. The process supervisor keeps the main SSH
-session alive only when a foreground attachment is active at process exit. It
-durably reports the result immediately, sends the SSH exit status, and waits for
-the peer's SSH channel close before releasing deferred ephemeral cleanup.
-Detached commands have no attachment to drain, so they report their result and
-exit immediately without a grace period.
+results from stale instance IDs. Foreground creation carries a one-shot
+attachment intent to the process supervisor. The supervisor durably reports the
+result immediately, accepts that declared SSH attachment even when the process
+has already exited, sends the retained output and exit status, and waits for the
+peer's channel close before finalizing the result for ephemeral cleanup.
+Detached commands carry no attachment intent, so they finalize and exit
+immediately without a grace period. Finalization is persisted separately from
+the exit result; the gateway deletes an ephemeral sandbox only after the
+finalized supervisor session disconnects.
 
 ## Protocol and Auth
 

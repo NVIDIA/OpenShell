@@ -260,8 +260,9 @@ Key flags:
 - `--editor vscode|cursor`: Open a remote editor after creation and keep the sandbox alive
 
 `--detach` adds no attachment grace period. When the canonical process exits,
-its terminal phase is reported immediately. A foreground create instead keeps
-ephemeral cleanup deferred until its active SSH connection closes naturally.
+its terminal phase is reported immediately. A foreground create declares one
+expected main-process SSH attachment; cleanup finalizes after that connection
+closes naturally.
 
 Do not combine `--upload` with a trailing main command. Uploads currently finish
 after the canonical process starts; create a scratch sandbox and use

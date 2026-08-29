@@ -71,6 +71,7 @@ const (
 	OpenShell_PushSandboxLogs_FullMethodName               = "/openshell.v1.OpenShell/PushSandboxLogs"
 	OpenShell_ConnectSupervisor_FullMethodName             = "/openshell.v1.OpenShell/ConnectSupervisor"
 	OpenShell_ReportMainProcessExit_FullMethodName         = "/openshell.v1.OpenShell/ReportMainProcessExit"
+	OpenShell_FinalizeMainProcessExit_FullMethodName       = "/openshell.v1.OpenShell/FinalizeMainProcessExit"
 	OpenShell_RelayStream_FullMethodName                   = "/openshell.v1.OpenShell/RelayStream"
 	OpenShell_WatchSandbox_FullMethodName                  = "/openshell.v1.OpenShell/WatchSandbox"
 	OpenShell_SubmitPolicyAnalysis_FullMethodName          = "/openshell.v1.OpenShell/SubmitPolicyAnalysis"
@@ -218,6 +219,8 @@ type OpenShellClient interface {
 	ConnectSupervisor(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[SupervisorMessage, GatewayMessage], error)
 	// Persist the canonical main process result before the supervisor exits.
 	ReportMainProcessExit(ctx context.Context, in *ReportMainProcessExitRequest, opts ...grpc.CallOption) (*ReportMainProcessExitResponse, error)
+	// Confirm that foreground terminal delivery completed naturally.
+	FinalizeMainProcessExit(ctx context.Context, in *FinalizeMainProcessExitRequest, opts ...grpc.CallOption) (*FinalizeMainProcessExitResponse, error)
 	// Raw byte relay between supervisor and gateway.
 	//
 	// The supervisor initiates this call after receiving a RelayOpen message
@@ -793,6 +796,16 @@ func (c *openShellClient) ReportMainProcessExit(ctx context.Context, in *ReportM
 	return out, nil
 }
 
+func (c *openShellClient) FinalizeMainProcessExit(ctx context.Context, in *FinalizeMainProcessExitRequest, opts ...grpc.CallOption) (*FinalizeMainProcessExitResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(FinalizeMainProcessExitResponse)
+	err := c.cc.Invoke(ctx, OpenShell_FinalizeMainProcessExit_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *openShellClient) RelayStream(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[RelayFrame, RelayFrame], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	stream, err := c.cc.NewStream(ctx, &OpenShell_ServiceDesc.Streams[5], OpenShell_RelayStream_FullMethodName, cOpts...)
@@ -1130,6 +1143,8 @@ type OpenShellServer interface {
 	ConnectSupervisor(grpc.BidiStreamingServer[SupervisorMessage, GatewayMessage]) error
 	// Persist the canonical main process result before the supervisor exits.
 	ReportMainProcessExit(context.Context, *ReportMainProcessExitRequest) (*ReportMainProcessExitResponse, error)
+	// Confirm that foreground terminal delivery completed naturally.
+	FinalizeMainProcessExit(context.Context, *FinalizeMainProcessExitRequest) (*FinalizeMainProcessExitResponse, error)
 	// Raw byte relay between supervisor and gateway.
 	//
 	// The supervisor initiates this call after receiving a RelayOpen message
@@ -1347,6 +1362,9 @@ func (UnimplementedOpenShellServer) ConnectSupervisor(grpc.BidiStreamingServer[S
 }
 func (UnimplementedOpenShellServer) ReportMainProcessExit(context.Context, *ReportMainProcessExitRequest) (*ReportMainProcessExitResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ReportMainProcessExit not implemented")
+}
+func (UnimplementedOpenShellServer) FinalizeMainProcessExit(context.Context, *FinalizeMainProcessExitRequest) (*FinalizeMainProcessExitResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method FinalizeMainProcessExit not implemented")
 }
 func (UnimplementedOpenShellServer) RelayStream(grpc.BidiStreamingServer[RelayFrame, RelayFrame]) error {
 	return status.Error(codes.Unimplemented, "method RelayStream not implemented")
@@ -2242,6 +2260,24 @@ func _OpenShell_ReportMainProcessExit_Handler(srv interface{}, ctx context.Conte
 	return interceptor(ctx, in, info, handler)
 }
 
+func _OpenShell_FinalizeMainProcessExit_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(FinalizeMainProcessExitRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(OpenShellServer).FinalizeMainProcessExit(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: OpenShell_FinalizeMainProcessExit_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(OpenShellServer).FinalizeMainProcessExit(ctx, req.(*FinalizeMainProcessExitRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _OpenShell_RelayStream_Handler(srv interface{}, stream grpc.ServerStream) error {
 	return srv.(OpenShellServer).RelayStream(&grpc.GenericServerStream[RelayFrame, RelayFrame]{ServerStream: stream})
 }
@@ -2762,6 +2798,10 @@ var OpenShell_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "ReportMainProcessExit",
 			Handler:    _OpenShell_ReportMainProcessExit_Handler,
+		},
+		{
+			MethodName: "FinalizeMainProcessExit",
+			Handler:    _OpenShell_FinalizeMainProcessExit_Handler,
 		},
 		{
 			MethodName: "SubmitPolicyAnalysis",

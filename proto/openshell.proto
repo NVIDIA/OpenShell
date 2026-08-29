@@ -471,6 +471,14 @@ service OpenShell {
     };
   }
 
+  // Confirm that foreground terminal delivery completed naturally.
+  rpc FinalizeMainProcessExit(FinalizeMainProcessExitRequest)
+      returns (FinalizeMainProcessExitResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "sandbox"
+    };
+  }
+
   // Raw byte relay between supervisor and gateway.
   //
   // The supervisor initiates this call after receiving a RelayOpen message
@@ -910,6 +918,9 @@ message SandboxStatus {
   // Presence indicates that the canonical main process exited. Exit code 0
   // produces Completed; nonzero and signal-normalized exits produce Error.
   optional int32 exit_code = 9;
+  // True after every expected foreground main-process attachment has closed
+  // naturally and the supervisor is ready to exit.
+  bool main_process_exit_finalized = 10;
 }
 
 // User-facing sandbox condition derived from driver-native conditions.
@@ -971,6 +982,10 @@ message CreateSandboxRequest {
   map<string, string> annotations = 4;
   // Workspace for the sandbox. Empty defaults to "default".
   string workspace = 5;
+  // One-shot launch hint indicating that the creating client will attach to
+  // the canonical main process. The supervisor keeps the terminal transport
+  // alive until that attachment connects and closes naturally.
+  bool await_main_process_attachment = 6;
 }
 
 // Get sandbox request.
@@ -2240,14 +2255,20 @@ message ReportMainProcessExitRequest {
   string instance_id = 2;
   // Normalized process result. Signal exits use 128 + signal number.
   int32 exit_code = 3;
-  // Keep an ephemeral sandbox reachable while an attached client drains its
-  // terminal result. The supervisor repeats the report with this field false
-  // after the attached SSH connection closes naturally. Defaults to false for
-  // compatibility.
-  bool defer_ephemeral_cleanup = 4;
+  reserved 4;
+  reserved "defer_ephemeral_cleanup";
 }
 
 message ReportMainProcessExitResponse {}
+
+// Terminal-delivery completion reported after all expected foreground SSH
+// attachments close. A successful response permits ephemeral cleanup.
+message FinalizeMainProcessExitRequest {
+  string sandbox_id = 1;
+  string instance_id = 2;
+}
+
+message FinalizeMainProcessExitResponse {}
 
 // Gateway requests the supervisor to open a relay channel.
 //

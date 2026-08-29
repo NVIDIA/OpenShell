@@ -226,8 +226,9 @@ previous runtime generation.
 | `--memory <QUANTITY>` | Memory limit (for example: `512Mi`, `4Gi`, `8G`) |
 
 `--detach` adds no attachment grace period: the sandbox reports the canonical
-process result immediately when it exits. Foreground creation defers ephemeral
-cleanup only while its active SSH connection drains and closes naturally.
+process result immediately when it exits. Foreground creation declares one
+expected main-process SSH attachment; cleanup finalizes after that connection
+drains and closes naturally.
 | `--driver-config-json <JSON>` | Experimental driver-keyed configuration object |
 | `--provider <NAME>` | Provider to attach (repeatable) |
 | `--policy <PATH>` | Custom policy YAML; overrides the built-in default and `OPENSHELL_SANDBOX_POLICY` |

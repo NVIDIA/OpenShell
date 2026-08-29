@@ -33,8 +33,9 @@ openshell sandbox create --name worker --detach -- ./worker
 
 Detached commands have no attachment grace period. When the command exits,
 OpenShell records its terminal phase immediately. For a foreground command,
-ephemeral cleanup remains deferred only until the active SSH connection drains
-and closes naturally.
+the create request declares one expected SSH attachment. OpenShell retains the
+terminal transport until that connection drains and closes naturally, then
+finalizes ephemeral cleanup.
 
 Use `--no-keep` for an ephemeral command. OpenShell drains stdout and stderr,
 captures the command result, and deletes the sandbox after the command exits:

@@ -2577,7 +2577,7 @@ mod tests {
         .await
         .expect("main subsystem should register its attachment");
 
-        assert!(main_session.finish(7).await);
+        assert!(main_session.finish(7, false).await);
         main_session.mark_terminal_reported();
 
         let exit_status = tokio::time::timeout(Duration::from_secs(1), async {

@@ -941,6 +941,7 @@ impl ComputeRuntime {
         &self,
         sandbox: Sandbox,
         sandbox_token: Option<String>,
+        await_main_process_attachment: bool,
     ) -> Result<Sandbox, Status> {
         let sandbox_id = sandbox.object_id().to_string();
         let mut driver_sandbox = driver_sandbox_from_public(&sandbox, &self.driver_info.name)
@@ -988,6 +989,9 @@ impl ComputeRuntime {
             && let Some(spec) = driver_sandbox.spec.as_mut()
         {
             spec.sandbox_token = token;
+        }
+        if let Some(spec) = driver_sandbox.spec.as_mut() {
+            spec.await_main_process_attachment = await_main_process_attachment;
         }
         // A1: stage the typed SandboxPolicy out-of-band into the MXC backend's
         // side channel, keyed by sandbox id (== DriverSandbox.id), immediately
@@ -2889,7 +2893,7 @@ impl ComputeRuntime {
         connected: bool,
         instance_id: Option<&str>,
     ) -> Result<(), String> {
-        let _guard = self.sync_lock.lock().await;
+        let guard = self.sync_lock.lock().await;
 
         let Some(existing) = self
             .store
@@ -2901,6 +2905,17 @@ impl ComputeRuntime {
         };
         let current_phase =
             SandboxPhase::try_from(existing.phase()).unwrap_or(SandboxPhase::Unknown);
+        if !connected
+            && matches!(current_phase, SandboxPhase::Error | SandboxPhase::Completed)
+            && existing
+                .status
+                .as_ref()
+                .is_some_and(|status| status.main_process_exit_finalized)
+        {
+            drop(guard);
+            self.schedule_ephemeral_sandbox_delete(&existing);
+            return Ok(());
+        }
         if matches!(
             current_phase,
             SandboxPhase::Deleting
@@ -2926,6 +2941,7 @@ impl ComputeRuntime {
                     let status = sandbox.status.get_or_insert_with(Default::default);
                     status.main_process_instance_id = instance_id.unwrap_or_default().to_string();
                     status.exit_code = None;
+                    status.main_process_exit_finalized = false;
                     sandbox.set_phase(SandboxPhase::Ready as i32);
                 } else {
                     ensure_supervisor_not_ready_status(&mut sandbox.status, &sandbox_name);
@@ -2967,7 +2983,7 @@ impl ComputeRuntime {
         instance_id: &str,
         exit_code: i32,
     ) -> Result<(), String> {
-        self.report_main_process_exit(sandbox_id, instance_id, exit_code, false)
+        self.report_main_process_exit(sandbox_id, instance_id, exit_code)
             .await
     }
 
@@ -2976,9 +2992,8 @@ impl ComputeRuntime {
         sandbox_id: &str,
         instance_id: &str,
         exit_code: i32,
-        defer_ephemeral_cleanup: bool,
     ) -> Result<(), String> {
-        let guard = self.sync_lock.lock().await;
+        let _guard = self.sync_lock.lock().await;
         let Some(existing) = self
             .store
             .get_message::<Sandbox>(sandbox_id)
@@ -3030,11 +3045,6 @@ impl ComputeRuntime {
                     );
                     return Ok(());
                 }
-                let completed = existing.clone();
-                drop(guard);
-                if !defer_ephemeral_cleanup {
-                    self.schedule_ephemeral_sandbox_delete(&completed);
-                }
                 return Ok(());
             }
         }
@@ -3048,10 +3058,51 @@ impl ComputeRuntime {
             .map_err(|error| error.to_string())?;
         self.sandbox_index.update_from_sandbox(&sandbox);
         self.sandbox_watch_bus.notify(sandbox_id);
-        drop(guard);
-        if !defer_ephemeral_cleanup {
-            self.schedule_ephemeral_sandbox_delete(&sandbox);
+        Ok(())
+    }
+
+    /// Permit cleanup after the main-process terminal transport has finished.
+    pub async fn finalize_main_process_exit(
+        &self,
+        sandbox_id: &str,
+        instance_id: &str,
+    ) -> Result<(), String> {
+        let _guard = self.sync_lock.lock().await;
+        let Some(sandbox) = self
+            .store
+            .get_message::<Sandbox>(sandbox_id)
+            .await
+            .map_err(|error| error.to_string())?
+        else {
+            return Ok(());
+        };
+        let Some(status) = sandbox.status.as_ref() else {
+            return Err("main-process exit has not been reported".to_string());
+        };
+        if status.exit_code.is_none() {
+            return Err("main-process exit has not been reported".to_string());
         }
+        if !status.main_process_instance_id.is_empty()
+            && status.main_process_instance_id != instance_id
+        {
+            return Err("main-process instance does not match the terminal result".to_string());
+        }
+        if status.main_process_exit_finalized {
+            return Ok(());
+        }
+        let expected_resource_version = sandbox_resource_version(&sandbox);
+        let finalized = self
+            .store
+            .update_message_cas::<Sandbox, _>(sandbox_id, expected_resource_version, |sandbox| {
+                sandbox
+                    .status
+                    .get_or_insert_with(Default::default)
+                    .main_process_exit_finalized = true;
+            })
+            .await
+            .map_err(|error| error.to_string())?;
+        self.sandbox_index.update_from_sandbox(&finalized);
+        self.sandbox_watch_bus.notify(sandbox_id);
         Ok(())
     }
 
@@ -3448,6 +3499,7 @@ fn apply_main_process_exit(sandbox: &mut Sandbox, instance_id: &str, exit_code: 
     });
     status.main_process_instance_id = instance_id.to_string();
     status.exit_code = Some(exit_code);
+    status.main_process_exit_finalized = false;
     if preserve_infrastructure_error {
         return;
     }
@@ -3584,6 +3636,7 @@ fn driver_sandbox_spec_from_public(
         sandbox_token: String::new(),
         command: spec.command.clone(),
         tty: spec.tty,
+        await_main_process_attachment: false,
     })
 }
 
@@ -3857,6 +3910,7 @@ fn public_status_from_driver(
         current_policy_version,
         main_process_instance_id: String::new(),
         exit_code: None,
+        main_process_exit_finalized: false,
     }
 }
 
@@ -5245,7 +5299,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ephemeral_cleanup_waits_for_terminal_delivery_report() {
+    async fn ephemeral_cleanup_waits_for_terminal_finalization() {
         let driver = ControlledDriver::new();
         let runtime = test_runtime(driver.clone()).await;
         let mut sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Provisioning);
@@ -5260,7 +5314,7 @@ mod tests {
             .unwrap();
 
         runtime
-            .report_main_process_exit("sb-1", "instance-1", 0, true)
+            .report_main_process_exit("sb-1", "instance-1", 0)
             .await
             .unwrap();
         assert_eq!(driver.delete_calls(), 0);
@@ -5276,7 +5330,23 @@ mod tests {
         );
 
         runtime
-            .report_main_process_exit("sb-1", "instance-1", 0, false)
+            .finalize_main_process_exit("sb-1", "instance-1")
+            .await
+            .unwrap();
+        assert_eq!(driver.delete_calls(), 0);
+        assert!(
+            runtime
+                .store
+                .get_message::<Sandbox>("sb-1")
+                .await
+                .unwrap()
+                .unwrap()
+                .status
+                .unwrap()
+                .main_process_exit_finalized
+        );
+        runtime
+            .supervisor_session_disconnected("sb-1")
             .await
             .unwrap();
         tokio::time::timeout(Duration::from_secs(1), async {
@@ -5285,7 +5355,7 @@ mod tests {
             }
         })
         .await
-        .expect("terminal delivery report should release ephemeral cleanup");
+        .expect("terminal finalization should release ephemeral cleanup");
     }
 
     #[tokio::test]
@@ -6014,7 +6084,7 @@ mod tests {
         let traced = test_exporter::install_traced();
         async {
             runtime
-                .create_sandbox(sandbox, None)
+                .create_sandbox(sandbox, None, false)
                 .await
                 .expect("create succeeds");
         }
@@ -6159,7 +6229,7 @@ mod tests {
         let traced = test_exporter::install_traced();
         async {
             runtime
-                .create_sandbox(sandbox, None)
+                .create_sandbox(sandbox, None, false)
                 .await
                 .expect_err("driver refuses the create");
         }
@@ -7045,7 +7115,7 @@ mod tests {
             ..Default::default()
         });
 
-        runtime.create_sandbox(sandbox, None).await.unwrap();
+        runtime.create_sandbox(sandbox, None, false).await.unwrap();
         runtime
             .apply_sandbox_update(ready_driver_sandbox("sb-1", "sandbox-a"))
             .await
@@ -9647,7 +9717,7 @@ mod tests {
         });
 
         runtime.validate_sandbox_create(&sandbox).await.unwrap();
-        runtime.create_sandbox(sandbox, None).await.unwrap();
+        runtime.create_sandbox(sandbox, None, false).await.unwrap();
         let calls = driver.calls();
         assert_eq!(calls.len(), 4, "unexpected calls: {calls:?}");
         let validated = match &calls[2] {
@@ -9760,7 +9830,7 @@ mod tests {
             deletion_timestamp_ms: 0,
         });
 
-        let created = runtime.create_sandbox(sandbox, None).await.unwrap();
+        let created = runtime.create_sandbox(sandbox, None, false).await.unwrap();
 
         assert_eq!(
             created.metadata.as_ref().unwrap().resource_version,
@@ -9795,7 +9865,7 @@ mod tests {
             .labels
             .insert("env".to_string(), "prod".to_string());
 
-        runtime.create_sandbox(sandbox, None).await.unwrap();
+        runtime.create_sandbox(sandbox, None, false).await.unwrap();
 
         let matching = runtime
             .store
@@ -9819,11 +9889,13 @@ mod tests {
         // Spawn two concurrent creation attempts for the same sandbox
         let runtime1 = runtime.clone();
         let sandbox1 = sandbox.clone();
-        let handle1 = tokio::spawn(async move { runtime1.create_sandbox(sandbox1, None).await });
+        let handle1 =
+            tokio::spawn(async move { runtime1.create_sandbox(sandbox1, None, false).await });
 
         let runtime2 = runtime.clone();
         let sandbox2 = sandbox.clone();
-        let handle2 = tokio::spawn(async move { runtime2.create_sandbox(sandbox2, None).await });
+        let handle2 =
+            tokio::spawn(async move { runtime2.create_sandbox(sandbox2, None, false).await });
 
         // Wait for both to complete
         let result1 = handle1.await.unwrap();

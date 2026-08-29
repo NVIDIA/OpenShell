@@ -19,9 +19,9 @@ use std::time::Duration;
 
 use openshell_core::proto::open_shell_client::OpenShellClient;
 use openshell_core::proto::{
-    GatewayMessage, RelayFrame, RelayInit, RelayOpen, RelayOpenResult,
-    ReportMainProcessExitRequest, SupervisorHeartbeat, SupervisorHello, SupervisorMessage,
-    TcpRelayTarget, gateway_message, relay_open, supervisor_message,
+    FinalizeMainProcessExitRequest, GatewayMessage, RelayFrame, RelayInit, RelayOpen,
+    RelayOpenResult, ReportMainProcessExitRequest, SupervisorHeartbeat, SupervisorHello,
+    SupervisorMessage, TcpRelayTarget, gateway_message, relay_open, supervisor_message,
 };
 use openshell_ocsf::{
     ActivityId, ConnectionInfo, Endpoint, NetworkActivityBuilder, OcsfEvent, SandboxContext,
@@ -442,7 +442,6 @@ pub async fn report_main_process_exit(
     sandbox_id: &str,
     instance_id: &str,
     exit_code: i32,
-    defer_ephemeral_cleanup: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let channel = grpc_client::connect_channel_pub(endpoint)
         .await
@@ -453,7 +452,25 @@ pub async fn report_main_process_exit(
             sandbox_id: sandbox_id.to_string(),
             instance_id: instance_id.to_string(),
             exit_code,
-            defer_ephemeral_cleanup,
+        })
+        .await?;
+    Ok(())
+}
+
+/// Confirm terminal delivery and permit ephemeral cleanup.
+pub async fn finalize_main_process_exit(
+    endpoint: &str,
+    sandbox_id: &str,
+    instance_id: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let channel = grpc_client::connect_channel_pub(endpoint)
+        .await
+        .map_err(|error| format!("connect failed: {error}"))?;
+    let mut client = OpenShellClient::new(channel);
+    client
+        .finalize_main_process_exit(FinalizeMainProcessExitRequest {
+            sandbox_id: sandbox_id.to_string(),
+            instance_id: instance_id.to_string(),
         })
         .await?;
     Ok(())

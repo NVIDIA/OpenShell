@@ -152,6 +152,9 @@ message DriverSandboxSpec {
   repeated string command = 12;
   // Allocate a retained pseudo-terminal for the canonical process.
   bool tty = 13;
+  // One-shot launch hint forwarded by the gateway when the creating client
+  // will attach to the canonical main process.
+  bool await_main_process_attachment = 14;
 }
 
 message ResourceRequirements {

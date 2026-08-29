@@ -69,6 +69,13 @@ impl OpenShell for TestOpenShell {
         Err(Status::unimplemented("not used by this test server"))
     }
 
+    async fn finalize_main_process_exit(
+        &self,
+        _request: tonic::Request<openshell_core::proto::FinalizeMainProcessExitRequest>,
+    ) -> Result<Response<openshell_core::proto::FinalizeMainProcessExitResponse>, Status> {
+        Err(Status::unimplemented("not used by this test server"))
+    }
+
     async fn get_current_user(
         &self,
         _request: tonic::Request<openshell_core::proto::GetCurrentUserRequest>,
@@ -1349,6 +1356,35 @@ async fn sandbox_create_persists_exact_trailing_argv_as_main_process() {
         .expect("sandbox spec should be persisted at create time");
     assert_eq!(spec.command, command);
     assert!(!spec.tty);
+    assert!(requests[0].await_main_process_attachment);
+}
+
+#[tokio::test]
+async fn detached_command_does_not_declare_main_process_attachment() {
+    let server = run_server().await;
+    let fake_ssh_dir = tempfile::tempdir().unwrap();
+    let xdg_dir = tempfile::tempdir().unwrap();
+    let _env = test_env(&fake_ssh_dir, &xdg_dir);
+    let tls = test_tls(&server);
+    install_fake_ssh(&fake_ssh_dir);
+
+    run::sandbox_create(
+        &server.endpoint,
+        "openshell",
+        run::SandboxCreateConfig {
+            name: Some("detached-main"),
+            command: &["echo".into(), "OK".into()],
+            detach: true,
+            ..test_config()
+        },
+        "default",
+        &tls,
+    )
+    .await
+    .expect("detached sandbox create should succeed");
+
+    let requests = create_requests(&server).await;
+    assert!(!requests[0].await_main_process_attachment);
 }
 
 #[tokio::test]

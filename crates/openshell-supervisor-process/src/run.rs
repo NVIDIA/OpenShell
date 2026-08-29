@@ -39,12 +39,17 @@ use crate::process::{
     ResolvedWorkspace,
 };
 
-pub type SidecarExitReport = (
-    String,
-    i32,
-    bool,
-    tokio::sync::oneshot::Sender<Result<(), String>>,
-);
+pub enum SidecarExitReport {
+    Exited {
+        instance_id: String,
+        exit_code: i32,
+        ack: tokio::sync::oneshot::Sender<Result<(), String>>,
+    },
+    Finalized {
+        instance_id: String,
+        ack: tokio::sync::oneshot::Sender<Result<(), String>>,
+    },
+}
 
 fn ocsf_ctx() -> &'static openshell_ocsf::SandboxContext {
     openshell_ocsf::ctx::ctx()
@@ -64,6 +69,7 @@ pub async fn run_process(
     workspace: ResolvedWorkspace,
     timeout_secs: u64,
     interactive: bool,
+    await_main_process_attachment: bool,
     sandbox_id: Option<&str>,
     openshell_endpoint: Option<&str>,
     ssh_socket_path: Option<String>,
@@ -428,7 +434,12 @@ pub async fn run_process(
             (status.code(), false)
         }
     };
-    let terminal_attached = main_session.finish(rendered_code).await;
+    let terminal_delivery_pending = main_session
+        .finish(
+            rendered_code,
+            drain_terminal && await_main_process_attachment,
+        )
+        .await;
 
     ocsf_emit!(
         ProcessActivityBuilder::new(ocsf_ctx())
@@ -442,46 +453,24 @@ pub async fn run_process(
             .build()
     );
 
-    let defer_ephemeral_cleanup = drain_terminal && terminal_attached;
     if let Some(tx) = sidecar_exit_tx.as_ref() {
-        report_sidecar_main_process_exit(
-            tx,
-            &main_instance_id,
-            rendered_code,
-            defer_ephemeral_cleanup,
-        )
-        .await?;
+        report_sidecar_main_process_exit(tx, &main_instance_id, rendered_code).await?;
     } else if let (Some(endpoint), Some(id)) = (openshell_endpoint, sandbox_id) {
-        report_main_process_exit_until_ack(
-            endpoint,
-            id,
-            &main_instance_id,
-            rendered_code,
-            defer_ephemeral_cleanup,
-        )
-        .await;
+        report_main_process_exit_until_ack(endpoint, id, &main_instance_id, rendered_code).await;
         info!(instance_id = %main_instance_id, "main-process exit acknowledged");
     }
     main_session.mark_terminal_reported();
-    if defer_ephemeral_cleanup {
+    if drain_terminal && terminal_delivery_pending {
         // The peer's SSH channel-close confirms that the terminal frames sent
         // above traversed russh and the relay. Detached commands have no active
         // attachment and never enter this wait.
         main_session.wait_for_terminal_attachments().await;
-
-        if let Some(tx) = sidecar_exit_tx.as_ref() {
-            report_sidecar_main_process_exit(tx, &main_instance_id, rendered_code, false).await?;
-        } else if let (Some(endpoint), Some(id)) = (openshell_endpoint, sandbox_id) {
-            report_main_process_exit_until_ack(
-                endpoint,
-                id,
-                &main_instance_id,
-                rendered_code,
-                false,
-            )
-            .await;
-            info!(instance_id = %main_instance_id, "main-process terminal delivery acknowledged");
-        }
+    }
+    if let Some(tx) = sidecar_exit_tx.as_ref() {
+        finalize_sidecar_main_process_exit(tx, &main_instance_id).await?;
+    } else if let (Some(endpoint), Some(id)) = (openshell_endpoint, sandbox_id) {
+        finalize_main_process_exit_until_ack(endpoint, id, &main_instance_id).await;
+        info!(instance_id = %main_instance_id, "main-process terminal delivery finalized");
     }
 
     supervisor_terminating.store(true, Ordering::Release);
@@ -497,7 +486,6 @@ async fn report_main_process_exit_until_ack(
     sandbox_id: &str,
     instance_id: &str,
     exit_code: i32,
-    defer_ephemeral_cleanup: bool,
 ) {
     let mut retry_delay = Duration::from_millis(250);
     loop {
@@ -506,7 +494,6 @@ async fn report_main_process_exit_until_ack(
             sandbox_id,
             instance_id,
             exit_code,
-            defer_ephemeral_cleanup,
         )
         .await
         {
@@ -520,19 +507,54 @@ async fn report_main_process_exit_until_ack(
     }
 }
 
+async fn finalize_main_process_exit_until_ack(endpoint: &str, sandbox_id: &str, instance_id: &str) {
+    let mut retry_delay = Duration::from_millis(250);
+    loop {
+        match crate::supervisor_session::finalize_main_process_exit(
+            endpoint,
+            sandbox_id,
+            instance_id,
+        )
+        .await
+        {
+            Ok(()) => return,
+            Err(error) => {
+                tracing::warn!(%error, "main-process terminal finalization failed; retrying");
+                tokio::time::sleep(retry_delay).await;
+                retry_delay = (retry_delay * 2).min(Duration::from_secs(2));
+            }
+        }
+    }
+}
+
 async fn report_sidecar_main_process_exit(
     tx: &tokio::sync::mpsc::Sender<SidecarExitReport>,
     instance_id: &str,
     exit_code: i32,
-    defer_ephemeral_cleanup: bool,
 ) -> Result<()> {
     let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
-    tx.send((
-        instance_id.to_string(),
+    tx.send(SidecarExitReport::Exited {
+        instance_id: instance_id.to_string(),
         exit_code,
-        defer_ephemeral_cleanup,
-        ack_tx,
-    ))
+        ack: ack_tx,
+    })
+    .await
+    .map_err(|_| miette::miette!("sidecar exit reporter closed"))?;
+    ack_rx
+        .await
+        .map_err(|_| miette::miette!("sidecar exit reporter dropped acknowledgement"))?
+        .map_err(|error| miette::miette!(error))
+}
+
+async fn finalize_sidecar_main_process_exit(
+    tx: &tokio::sync::mpsc::Sender<SidecarExitReport>,
+    instance_id: &str,
+) -> Result<()> {
+    let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+    tx.send(SidecarExitReport::Finalized {
+        instance_id: instance_id.to_string(),
+        ack: ack_tx,
+    })
     .await
     .map_err(|_| miette::miette!("sidecar exit reporter closed"))?;
     ack_rx

@@ -112,8 +112,16 @@ impl OutputLog {
 
 #[derive(Debug)]
 struct TerminalAttachmentState {
-    accepting: bool,
     active: usize,
+    process_finished: bool,
+    expectation: AttachmentExpectation,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AttachmentExpectation {
+    None,
+    Pending,
+    Satisfied,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -201,8 +209,9 @@ impl MainSession {
             readers_done: Notify::new(),
             finished: std::sync::atomic::AtomicBool::new(false),
             terminal_attachments: Mutex::new(TerminalAttachmentState {
-                accepting: true,
                 active: 0,
+                process_finished: false,
+                expectation: AttachmentExpectation::None,
             }),
             terminal_attachments_done: Notify::new(),
         })
@@ -251,8 +260,9 @@ impl MainSession {
             readers_done: Notify::new(),
             finished: std::sync::atomic::AtomicBool::new(false),
             terminal_attachments: Mutex::new(TerminalAttachmentState {
-                accepting: true,
                 active: 0,
+                process_finished: false,
+                expectation: AttachmentExpectation::None,
             }),
             terminal_attachments_done: Notify::new(),
         });
@@ -365,25 +375,35 @@ impl MainSession {
         }
     }
 
-    /// Publish the terminal event and stop accepting new main attachments.
+    /// Publish the terminal event and retain the transport only when a real
+    /// foreground attachment exists or the creating client declared one.
     ///
-    /// Returns whether a foreground attachment was active at process exit.
-    pub async fn finish(&self, exit_code: i32) -> bool {
+    /// Returns whether terminal delivery must complete before shutdown.
+    pub async fn finish(&self, exit_code: i32, attachment_expected: bool) -> bool {
         let notified = self.readers_done.notified();
         if self.readers_remaining.load(Ordering::Acquire) != 0 {
             notified.await;
         }
-        let attached = {
+        let delivery_pending = {
             let mut state = self
                 .terminal_attachments
                 .lock()
                 .expect("terminal attachment lock poisoned");
-            state.accepting = false;
-            state.active != 0
+            state.process_finished = true;
+            state.expectation = if attachment_expected {
+                if state.active == 0 && state.expectation != AttachmentExpectation::Satisfied {
+                    AttachmentExpectation::Pending
+                } else {
+                    AttachmentExpectation::Satisfied
+                }
+            } else {
+                AttachmentExpectation::None
+            };
+            attachment_expected || state.active != 0
         };
         self.finished.store(true, Ordering::Release);
         self.publish(MainOutput::Exit(exit_code));
-        attached
+        delivery_pending
     }
 
     pub fn subscribe(&self) -> MainOutputCursor {
@@ -412,13 +432,15 @@ impl MainSession {
             .terminal_attachments
             .lock()
             .expect("terminal attachment lock poisoned");
-        if !state.accepting {
+        if state.process_finished && state.expectation != AttachmentExpectation::Pending {
             return Err("canonical main process already finished");
         }
         state.active = state
             .active
             .checked_add(1)
             .expect("terminal attachment count exhausted");
+        state.expectation = AttachmentExpectation::Satisfied;
+        self.terminal_attachments_done.notify_waiters();
         Ok(())
     }
 
@@ -441,17 +463,19 @@ impl MainSession {
         }
     }
 
-    /// Wait for all attachments that existed at process exit to close.
+    /// Wait for the declared foreground attachment to start, then for every
+    /// accepted attachment to close naturally.
     pub async fn wait_for_terminal_attachments(&self) {
         loop {
             let notified = self.terminal_attachments_done.notified();
-            if self
-                .terminal_attachments
-                .lock()
-                .expect("terminal attachment lock poisoned")
-                .active
-                == 0
-            {
+            let complete = {
+                let state = self
+                    .terminal_attachments
+                    .lock()
+                    .expect("terminal attachment lock poisoned");
+                state.active == 0 && state.expectation != AttachmentExpectation::Pending
+            };
+            if complete {
                 return;
             }
             notified.await;
@@ -553,7 +577,7 @@ mod tests {
     #[tokio::test]
     async fn finish_without_attachment_does_not_defer_shutdown() {
         let session = MainSession::inert();
-        assert!(!session.finish(0).await);
+        assert!(!session.finish(0, false).await);
         assert!(session.finished());
         assert!(session.begin_terminal_attachment().is_err());
     }
@@ -587,7 +611,7 @@ mod tests {
         session
             .begin_terminal_attachment()
             .expect("begin terminal attachment");
-        assert!(session.finish(0).await);
+        assert!(session.finish(0, false).await);
 
         assert!(
             tokio::time::timeout(
@@ -609,9 +633,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn declared_attachment_waits_for_connection_then_natural_close() {
+        let session = MainSession::inert();
+        assert!(session.finish(0, true).await);
+
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(10),
+                session.wait_for_terminal_attachments(),
+            )
+            .await
+            .is_err(),
+            "declared attachment must connect before delivery is complete"
+        );
+
+        session
+            .begin_terminal_attachment()
+            .expect("declared post-exit attachment");
+        session.end_terminal_attachment();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            session.wait_for_terminal_attachments(),
+        )
+        .await
+        .expect("natural attachment close should complete delivery");
+    }
+
+    #[tokio::test]
     async fn exit_is_retained_in_the_output_log() {
         let session = MainSession::inert();
-        let _ = session.finish(0).await;
+        let _ = session.finish(0, false).await;
 
         let mut output = session.subscribe();
         assert!(matches!(

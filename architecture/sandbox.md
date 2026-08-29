@@ -482,10 +482,13 @@ engine with a gateway policy revision.
 - If the supervisor relay drops, the sandbox can keep running, but connect and
   exec operations fail until the supervisor registers again.
 - If the canonical main process exits, the supervisor durably reports the
-  normalized result immediately. When a foreground main attachment is active,
-  it sends the retained output and SSH exit status, waits for the peer's channel
-  close, and then releases deferred ephemeral cleanup. With no active
-  attachment, it exits without a grace period. Exit code 0 records
+  normalized result immediately. A foreground create declares a one-shot main
+  attachment, so the supervisor accepts it even after a fast process exits,
+  sends the retained output and SSH exit status, waits for the peer's channel
+  close, and then finalizes ephemeral cleanup. With no declared or active
+  attachment, it finalizes and exits without a grace period. The gateway waits
+  for that finalized supervisor session to disconnect before deleting an
+  ephemeral sandbox. Exit code 0 records
   `Completed/MainProcessCompleted`; nonzero and signal-normalized exits record
   `Error/MainProcessFailed`. Infrastructure failures also use `Error`, with a
   distinct condition reason and no fabricated canonical-process result. Runtime

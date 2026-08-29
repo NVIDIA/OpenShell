@@ -848,15 +848,35 @@ pub async fn handle_report_main_process_exit(
     }
     state
         .compute
-        .report_main_process_exit(
-            &report.sandbox_id,
-            &report.instance_id,
-            report.exit_code,
-            report.defer_ephemeral_cleanup,
-        )
+        .report_main_process_exit(&report.sandbox_id, &report.instance_id, report.exit_code)
         .await
         .map_err(Status::failed_precondition)?;
     Ok(Response::new(ReportMainProcessExitResponse {}))
+}
+
+pub async fn handle_finalize_main_process_exit(
+    state: &Arc<ServerState>,
+    request: Request<openshell_core::proto::FinalizeMainProcessExitRequest>,
+) -> Result<Response<openshell_core::proto::FinalizeMainProcessExitResponse>, Status> {
+    let principal = request.extensions().get::<Principal>().cloned();
+    let report = request.into_inner();
+    if report.sandbox_id.is_empty() {
+        return Err(Status::invalid_argument("sandbox_id is required"));
+    }
+    if report.instance_id.is_empty() {
+        return Err(Status::invalid_argument("instance_id is required"));
+    }
+    if let Some(principal) = principal.as_ref() {
+        crate::auth::guard::ensure_sandbox_principal_scope(principal, &report.sandbox_id)?;
+    }
+    state
+        .compute
+        .finalize_main_process_exit(&report.sandbox_id, &report.instance_id)
+        .await
+        .map_err(Status::failed_precondition)?;
+    Ok(Response::new(
+        openshell_core::proto::FinalizeMainProcessExitResponse {},
+    ))
 }
 
 async fn run_session_loop(

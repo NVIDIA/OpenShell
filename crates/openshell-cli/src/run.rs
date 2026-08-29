@@ -563,6 +563,11 @@ pub async fn sandbox_create(
         command.to_vec()
     };
     let persist = sandbox_should_persist(keep, forward.as_ref());
+    let create_detaches = detach
+        || (persist
+            && command.is_empty()
+            && (!std::io::stdin().is_terminal() || !std::io::stdout().is_terminal()));
+    let await_main_process_attachment = output == "table" && editor.is_none() && !create_detaches;
     let annotations = if persist {
         HashMap::new()
     } else {
@@ -586,6 +591,7 @@ pub async fn sandbox_create(
         labels,
         annotations,
         workspace: workspace.to_string(),
+        await_main_process_attachment,
     };
 
     let response = match client.create_sandbox(request).await {
