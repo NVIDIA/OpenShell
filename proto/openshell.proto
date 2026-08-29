@@ -2256,7 +2256,6 @@ message ReportMainProcessExitRequest {
   // Normalized process result. Signal exits use 128 + signal number.
   int32 exit_code = 3;
   reserved 4;
-  reserved "defer_ephemeral_cleanup";
 }
 
 message ReportMainProcessExitResponse {}
