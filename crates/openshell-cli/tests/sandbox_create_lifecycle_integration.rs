@@ -51,6 +51,9 @@ struct SandboxState {
     vm_error_with_observed_exit: Arc<AtomicBool>,
     vm_slow_progress_before_ready: Arc<AtomicBool>,
     vm_log_churn_before_ready: Arc<AtomicBool>,
+    terminal_before_relay: Arc<AtomicBool>,
+    ssh_session_failures_remaining: Arc<AtomicUsize>,
+    ssh_session_requests: Arc<AtomicUsize>,
     global_settings: Arc<Mutex<HashMap<String, SettingValue>>>,
     gateway_config_requests: Arc<AtomicUsize>,
 }
@@ -244,6 +247,19 @@ impl OpenShell for TestOpenShell {
         &self,
         request: tonic::Request<CreateSshSessionRequest>,
     ) -> Result<Response<CreateSshSessionResponse>, Status> {
+        self.state
+            .ssh_session_requests
+            .fetch_add(1, Ordering::SeqCst);
+        if self
+            .state
+            .ssh_session_failures_remaining
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .is_ok()
+        {
+            return Err(Status::failed_precondition("sandbox is not ready"));
+        }
         let sandbox_id = request.into_inner().sandbox_id;
         Ok(Response::new(CreateSshSessionResponse {
             sandbox_id,
@@ -426,6 +442,7 @@ impl OpenShell for TestOpenShell {
             .vm_slow_progress_before_ready
             .load(Ordering::SeqCst);
         let vm_log_churn_before_ready = self.state.vm_log_churn_before_ready.load(Ordering::SeqCst);
+        let terminal_before_relay = self.state.terminal_before_relay.load(Ordering::SeqCst);
 
         tokio::spawn(async move {
             let mut provisioning = Sandbox {
@@ -462,6 +479,12 @@ impl OpenShell for TestOpenShell {
             }
             let mut ready = provisioning.clone();
             ready.set_phase(SandboxPhase::Ready as i32);
+            let mut completed = provisioning.clone();
+            completed.status = Some(SandboxStatus {
+                exit_code: Some(0),
+                ..SandboxStatus::default()
+            });
+            completed.set_phase(SandboxPhase::Completed as i32);
 
             let _ = tx
                 .send(Ok(SandboxStreamEvent {
@@ -507,6 +530,14 @@ impl OpenShell for TestOpenShell {
                 let _ = tx
                     .send(Ok(SandboxStreamEvent {
                         payload: Some(sandbox_stream_event::Payload::Sandbox(ready)),
+                    }))
+                    .await;
+                return;
+            }
+            if terminal_before_relay {
+                let _ = tx
+                    .send(Ok(SandboxStreamEvent {
+                        payload: Some(sandbox_stream_event::Payload::Sandbox(completed)),
                     }))
                     .await;
                 return;
@@ -1711,6 +1742,50 @@ async fn sandbox_create_times_out_when_only_logs_arrive() {
         "logs should not extend the provisioning timeout"
     );
     assert!(err.to_string().contains("sandbox provisioning timed out"));
+}
+
+#[tokio::test]
+async fn sandbox_create_retries_terminal_attachment_until_relay_registers() {
+    let server = run_server().await;
+    server
+        .openshell
+        .state
+        .terminal_before_relay
+        .store(true, Ordering::SeqCst);
+    server
+        .openshell
+        .state
+        .ssh_session_failures_remaining
+        .store(1, Ordering::SeqCst);
+    let fake_ssh_dir = tempfile::tempdir().unwrap();
+    let xdg_dir = tempfile::tempdir().unwrap();
+    let _env = test_env(&fake_ssh_dir, &xdg_dir);
+    let tls = test_tls(&server);
+    install_fake_ssh(&fake_ssh_dir);
+
+    let exit_code = run::sandbox_create(
+        &server.endpoint,
+        "openshell",
+        run::SandboxCreateConfig {
+            name: Some("fast-command"),
+            command: &["echo".into(), "OK".into()],
+            ..test_config()
+        },
+        "default",
+        &tls,
+    )
+    .await
+    .expect("sandbox create should wait for the declared terminal attachment relay");
+
+    assert_eq!(exit_code, 0);
+    assert_eq!(
+        server
+            .openshell
+            .state
+            .ssh_session_requests
+            .load(Ordering::SeqCst),
+        2
+    );
 }
 
 #[tokio::test]

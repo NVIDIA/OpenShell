@@ -63,9 +63,12 @@ func TestConverterCoversAllProtoFields_SandboxStatus(t *testing.T) {
 		"current_policy_version": true,
 		"exit_code":              true,
 	}
-	// The instance ID is an internal gateway/supervisor fencing token exposed
-	// only through the raw protobuf API.
-	skipped := fieldSet{"main_process_instance_id": true}
+	// These fields coordinate internal gateway/supervisor lifecycle fencing and
+	// terminal delivery. They are exposed only through the raw protobuf API.
+	skipped := fieldSet{
+		"main_process_instance_id":    true,
+		"main_process_exit_finalized": true,
+	}
 
 	assertAllFieldsCovered(t, (&pb.SandboxStatus{}).ProtoReflect().Descriptor(), handled, skipped)
 }

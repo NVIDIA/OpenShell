@@ -1054,7 +1054,7 @@ pub async fn sandbox_create(
             if detach {
                 return Ok(0);
             }
-            let connect_result = crate::ssh::sandbox_connect_without_exec(
+            let connect_result = crate::ssh::sandbox_connect_terminal_main(
                 &effective_server,
                 &sandbox_name,
                 &effective_tls,

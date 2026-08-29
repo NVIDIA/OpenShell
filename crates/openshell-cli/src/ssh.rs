@@ -29,6 +29,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::process::{Child, Command as TokioCommand};
 use tokio_stream::wrappers::ReceiverStream;
+use tonic::Code;
 
 /// Time budget for the local listener to become reachable after `ssh` starts.
 /// This is a user-visible readiness deadline for both foreground and background
@@ -39,6 +40,10 @@ const FORWARD_LISTENER_PROBE_INTERVAL: Duration = Duration::from_millis(50);
 /// Per-attempt connect timeout, so one hung probe cannot consume the whole
 /// grace period.
 const FORWARD_LISTENER_CONNECT_TIMEOUT: Duration = Duration::from_millis(200);
+/// Time budget for the supervisor relay to register after a fast canonical
+/// command has already reported its terminal result.
+const TERMINAL_RELAY_REGISTRATION_TIMEOUT: Duration = Duration::from_secs(5);
+const TERMINAL_RELAY_REGISTRATION_INTERVAL: Duration = Duration::from_millis(50);
 
 #[derive(Clone, Copy, Debug)]
 pub enum Editor {
@@ -79,6 +84,7 @@ async fn ssh_session_config(
     name: &str,
     tls: &TlsOptions,
     workspace: &str,
+    terminal_relay_registration_timeout: Option<Duration>,
 ) -> Result<SshSessionConfig> {
     let mut client = grpc_client(server, tls).await?;
 
@@ -94,12 +100,26 @@ async fn ssh_session_config(
         .sandbox
         .ok_or_else(|| miette::miette!("sandbox not found"))?;
 
-    let response = client
-        .create_ssh_session(CreateSshSessionRequest {
-            sandbox_id: sandbox.object_id().to_string(),
-        })
-        .await
-        .into_diagnostic()?;
+    let relay_registration_deadline =
+        terminal_relay_registration_timeout.map(|timeout| tokio::time::Instant::now() + timeout);
+    let response = loop {
+        match client
+            .create_ssh_session(CreateSshSessionRequest {
+                sandbox_id: sandbox.object_id().to_string(),
+            })
+            .await
+        {
+            Ok(response) => break response,
+            Err(status)
+                if status.code() == Code::FailedPrecondition
+                    && relay_registration_deadline
+                        .is_some_and(|deadline| tokio::time::Instant::now() < deadline) =>
+            {
+                tokio::time::sleep(TERMINAL_RELAY_REGISTRATION_INTERVAL).await;
+            }
+            Err(status) => return Err(status).into_diagnostic(),
+        }
+    };
     let session = response.into_inner();
     validate_ssh_session_response(&session)
         .map_err(|err| miette::miette!("gateway returned invalid SSH session response: {err}"))?;
@@ -257,8 +277,16 @@ async fn sandbox_connect_with_mode(
     tls: &TlsOptions,
     replace_process: bool,
     workspace: &str,
+    terminal_relay_registration_timeout: Option<Duration>,
 ) -> Result<i32> {
-    let session = ssh_session_config(server, name, tls, workspace).await?;
+    let session = ssh_session_config(
+        server,
+        name,
+        tls,
+        workspace,
+        terminal_relay_registration_timeout,
+    )
+    .await?;
 
     let mut command = ssh_base_command(&session.proxy_command);
     if session.main_terminal {
@@ -290,7 +318,7 @@ pub async fn sandbox_connect(
     tls: &TlsOptions,
     workspace: &str,
 ) -> Result<i32> {
-    sandbox_connect_with_mode(server, name, tls, true, workspace).await
+    sandbox_connect_with_mode(server, name, tls, true, workspace, None).await
 }
 
 pub(crate) async fn sandbox_connect_without_exec(
@@ -299,7 +327,24 @@ pub(crate) async fn sandbox_connect_without_exec(
     tls: &TlsOptions,
     workspace: &str,
 ) -> Result<i32> {
-    sandbox_connect_with_mode(server, name, tls, false, workspace).await
+    sandbox_connect_with_mode(server, name, tls, false, workspace, None).await
+}
+
+pub(crate) async fn sandbox_connect_terminal_main(
+    server: &str,
+    name: &str,
+    tls: &TlsOptions,
+    workspace: &str,
+) -> Result<i32> {
+    sandbox_connect_with_mode(
+        server,
+        name,
+        tls,
+        false,
+        workspace,
+        Some(TERMINAL_RELAY_REGISTRATION_TIMEOUT),
+    )
+    .await
 }
 
 pub async fn sandbox_connect_editor(
@@ -310,7 +355,7 @@ pub async fn sandbox_connect_editor(
     tls: &TlsOptions,
     workspace: &str,
 ) -> Result<()> {
-    let session = ssh_session_config(server, name, tls, workspace).await?;
+    let session = ssh_session_config(server, name, tls, workspace, None).await?;
     let workspace_root = discover_workspace_root(&session).await?;
 
     let host_alias = host_alias(name, workspace);
@@ -339,7 +384,7 @@ pub async fn sandbox_forward(
 ) -> Result<()> {
     openshell_core::forward::check_port_available(spec)?;
 
-    let session = ssh_session_config(server, name, tls, workspace).await?;
+    let session = ssh_session_config(server, name, tls, workspace, None).await?;
 
     let mut command = TokioCommand::from(ssh_base_command(&session.proxy_command));
     command
@@ -554,7 +599,7 @@ async fn sandbox_exec_with_mode(
         return Err(miette::miette!("no command provided"));
     }
 
-    let session = ssh_session_config(server, name, tls, workspace).await?;
+    let session = ssh_session_config(server, name, tls, workspace, None).await?;
     let mut ssh = ssh_base_command(&session.proxy_command);
 
     if tty {
@@ -767,7 +812,7 @@ async fn ssh_tar_upload(
     tls: &TlsOptions,
     workspace: &str,
 ) -> Result<()> {
-    let session = ssh_session_config(server, name, tls, workspace).await?;
+    let session = ssh_session_config(server, name, tls, workspace, None).await?;
 
     let dest_dir = dest_dir.unwrap_or(".");
     let escaped_dest = shell_escape(dest_dir);
@@ -1200,7 +1245,7 @@ pub async fn sandbox_sync_down(
     tls: &TlsOptions,
     workspace: &str,
 ) -> Result<()> {
-    let session = ssh_session_config(server, name, tls, workspace).await?;
+    let session = ssh_session_config(server, name, tls, workspace, None).await?;
     let sandbox_path = resolve_sandbox_source_path(&session, sandbox_path).await?;
     let kind = probe_sandbox_source_kind(&session, &sandbox_path).await?;
 
@@ -1482,7 +1527,7 @@ pub async fn sandbox_ssh_proxy_by_name(
     tls: &TlsOptions,
     workspace: &str,
 ) -> Result<()> {
-    let session = ssh_session_config(server, name, tls, workspace).await?;
+    let session = ssh_session_config(server, name, tls, workspace, None).await?;
     sandbox_ssh_proxy(
         &session.gateway_url,
         &session.sandbox_id,
