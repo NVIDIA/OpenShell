@@ -38,7 +38,7 @@ app.kubernetes.io/managed-by: {{ .Release.Service }}
 Validate required cross-namespace gateway identity values.
 */}}
 {{- define "openshell-workspace.validateValues" -}}
-{{- required "gateway.serviceAccount.name is required" .Values.gateway.serviceAccount.name -}}
-{{- required "gateway.serviceAccount.namespace is required" .Values.gateway.serviceAccount.namespace -}}
-{{- required "sandboxServiceAccount.name is required" .Values.sandboxServiceAccount.name -}}
+{{- $gatewayServiceAccountName := required "gateway.serviceAccount.name is required" .Values.gateway.serviceAccount.name -}}
+{{- $gatewayServiceAccountNamespace := required "gateway.serviceAccount.namespace is required" .Values.gateway.serviceAccount.namespace -}}
+{{- $sandboxServiceAccountName := required "sandboxServiceAccount.name is required" .Values.sandboxServiceAccount.name -}}
 {{- end }}
