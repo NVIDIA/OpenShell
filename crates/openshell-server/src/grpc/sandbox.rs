@@ -1327,7 +1327,10 @@ pub(super) async fn handle_forward_tcp(
 
     let sandbox = fetch_and_authorize_sandbox(state, &principal, &init.sandbox_id).await?;
 
-    if SandboxPhase::try_from(sandbox.phase()).ok() != Some(SandboxPhase::Ready) {
+    // The main process may finish between minting the SSH token and opening
+    // its transport. Keep the relay reachable until terminal delivery is
+    // finalized so fast commands can attach without a readiness race.
+    if !sandbox_relay_reachable(state, &sandbox) {
         return Err(Status::failed_precondition("sandbox is not ready"));
     }
 
@@ -1708,6 +1711,17 @@ pub(super) async fn handle_exec_sandbox_interactive(
 // SSH session handlers
 // ---------------------------------------------------------------------------
 
+fn sandbox_relay_reachable(state: &ServerState, sandbox: &Sandbox) -> bool {
+    let phase = SandboxPhase::try_from(sandbox.phase()).ok();
+    matches!(phase, Some(SandboxPhase::Ready))
+        || (matches!(phase, Some(SandboxPhase::Completed | SandboxPhase::Error))
+            && sandbox
+                .status
+                .as_ref()
+                .is_some_and(|status| !status.main_process_exit_finalized)
+            && state.supervisor_sessions.has_session(sandbox.object_id()))
+}
+
 pub(super) async fn handle_create_ssh_session(
     state: &Arc<ServerState>,
     request: Request<CreateSshSessionRequest>,
@@ -1720,15 +1734,7 @@ pub(super) async fn handle_create_ssh_session(
 
     let sandbox = fetch_and_authorize_sandbox(state, &principal, &req.sandbox_id).await?;
 
-    let phase = SandboxPhase::try_from(sandbox.phase()).ok();
-    let ssh_reachable = matches!(phase, Some(SandboxPhase::Ready))
-        || (matches!(phase, Some(SandboxPhase::Completed | SandboxPhase::Error))
-            && sandbox
-                .status
-                .as_ref()
-                .is_some_and(|status| !status.main_process_exit_finalized)
-            && state.supervisor_sessions.has_session(&req.sandbox_id));
-    if !ssh_reachable {
+    if !sandbox_relay_reachable(state, &sandbox) {
         return Err(Status::failed_precondition("sandbox is not ready"));
     }
 
@@ -4002,6 +4008,14 @@ mod tests {
         .await;
 
         assert!(response.is_ok());
+
+        let mut finalized = sandbox;
+        finalized
+            .status
+            .as_mut()
+            .expect("sandbox status")
+            .main_process_exit_finalized = true;
+        assert!(!sandbox_relay_reachable(&state, &finalized));
     }
 
     #[tokio::test]
