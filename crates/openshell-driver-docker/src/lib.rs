@@ -815,6 +815,14 @@ impl DockerComputeDriver {
         sandbox_id: &str,
         sandbox_name: &str,
     ) -> Result<Option<DriverSandbox>, Status> {
+        let pending = self.pending_snapshot(sandbox_id, sandbox_name).await;
+        if pending
+            .as_ref()
+            .is_some_and(pending_sandbox_has_provisioning_failure)
+        {
+            return Ok(pending);
+        }
+
         let container = self
             .find_managed_container_summary(sandbox_id, sandbox_name)
             .await?;
@@ -824,19 +832,17 @@ impl DockerComputeDriver {
             return Ok(Some(sandbox));
         }
 
-        Ok(self.pending_snapshot(sandbox_id, sandbox_name).await)
+        Ok(pending)
     }
 
     async fn current_snapshots(&self) -> Result<Vec<DriverSandbox>, Status> {
         let containers = self.list_managed_container_summaries().await?;
-        let container_sandboxes = containers
+        let mut by_id = containers
             .iter()
             .filter_map(sandbox_from_container_summary)
-            .collect::<Vec<_>>();
-        let mut by_id = self.pending_snapshot_map().await;
-        for sandbox in container_sandboxes {
-            by_id.insert(sandbox.id.clone(), sandbox);
-        }
+            .map(|sandbox| (sandbox.id.clone(), sandbox))
+            .collect::<HashMap<_, _>>();
+        merge_pending_sandbox_snapshots(&mut by_id, self.pending_snapshot_map().await);
         let mut sandboxes = by_id.into_values().collect::<Vec<_>>();
         sandboxes.sort_by(|left, right| left.id.cmp(&right.id));
         Ok(sandboxes)
@@ -2162,6 +2168,33 @@ fn pending_sandbox_snapshot(
 fn pending_sandbox_matches(sandbox: &DriverSandbox, sandbox_id: &str, sandbox_name: &str) -> bool {
     (!sandbox_id.is_empty() && sandbox.id == sandbox_id)
         || (!sandbox_name.is_empty() && sandbox.name == sandbox_name)
+}
+
+/// A pending sandbox holds either the ordinary in-progress snapshot or the
+/// explicit error published by its provisioning task. The latter is more
+/// informative than a transient Docker state observed while that task cleans
+/// up a failed start, so it must win during snapshot reconciliation.
+fn pending_sandbox_has_provisioning_failure(sandbox: &DriverSandbox) -> bool {
+    sandbox.status.as_ref().is_some_and(|status| {
+        status.conditions.iter().any(|condition| {
+            condition.r#type == "Ready"
+                && condition.status.eq_ignore_ascii_case("false")
+                && condition.reason != "Starting"
+        })
+    })
+}
+
+fn merge_pending_sandbox_snapshots(
+    snapshots: &mut HashMap<String, DriverSandbox>,
+    pending: HashMap<String, DriverSandbox>,
+) {
+    for (sandbox_id, sandbox) in pending {
+        if pending_sandbox_has_provisioning_failure(&sandbox) {
+            snapshots.insert(sandbox_id, sandbox);
+        } else {
+            snapshots.entry(sandbox_id).or_insert(sandbox);
+        }
+    }
 }
 
 fn provisioning_condition() -> DriverCondition {
