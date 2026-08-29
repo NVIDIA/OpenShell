@@ -1715,11 +1715,10 @@ fn sandbox_relay_reachable(state: &ServerState, sandbox: &Sandbox) -> bool {
     let phase = SandboxPhase::try_from(sandbox.phase()).ok();
     matches!(phase, Some(SandboxPhase::Ready))
         || (matches!(phase, Some(SandboxPhase::Completed | SandboxPhase::Error))
-            && sandbox
-                .status
-                .as_ref()
-                .is_some_and(|status| !status.main_process_exit_finalized)
-            && state.supervisor_sessions.has_session(sandbox.object_id()))
+            && state.supervisor_sessions.has_session(sandbox.object_id())
+            && !state
+                .supervisor_sessions
+                .terminal_delivery_finalized(sandbox.object_id()))
 }
 
 pub(super) async fn handle_create_ssh_session(
@@ -4009,13 +4008,12 @@ mod tests {
 
         assert!(response.is_ok());
 
-        let mut finalized = sandbox;
-        finalized
-            .status
-            .as_mut()
-            .expect("sandbox status")
-            .main_process_exit_finalized = true;
-        assert!(!sandbox_relay_reachable(&state, &finalized));
+        assert!(
+            state
+                .supervisor_sessions
+                .finalize_main_process_exit("sandbox-work")
+        );
+        assert!(!sandbox_relay_reachable(&state, &sandbox));
     }
 
     #[tokio::test]

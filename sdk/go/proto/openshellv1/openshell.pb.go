@@ -1565,12 +1565,9 @@ type SandboxStatus struct {
 	// Normalized main process result. Signal exits use 128 + signal number.
 	// Presence indicates that the canonical main process exited. Exit code 0
 	// produces Completed; nonzero and signal-normalized exits produce Error.
-	ExitCode *int32 `protobuf:"varint,9,opt,name=exit_code,json=exitCode,proto3,oneof" json:"exit_code,omitempty"`
-	// True after every expected foreground main-process attachment has closed
-	// naturally and the supervisor is ready to exit.
-	MainProcessExitFinalized bool `protobuf:"varint,10,opt,name=main_process_exit_finalized,json=mainProcessExitFinalized,proto3" json:"main_process_exit_finalized,omitempty"`
-	unknownFields            protoimpl.UnknownFields
-	sizeCache                protoimpl.SizeCache
+	ExitCode      *int32 `protobuf:"varint,9,opt,name=exit_code,json=exitCode,proto3,oneof" json:"exit_code,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *SandboxStatus) Reset() {
@@ -1664,13 +1661,6 @@ func (x *SandboxStatus) GetExitCode() int32 {
 		return *x.ExitCode
 	}
 	return 0
-}
-
-func (x *SandboxStatus) GetMainProcessExitFinalized() bool {
-	if x != nil {
-		return x.MainProcessExitFinalized
-	}
-	return false
 }
 
 // User-facing sandbox condition derived from driver-native conditions.
@@ -14153,7 +14143,7 @@ const file_openshell_proto_rawDesc = "" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01B\x12\n" +
 	"\x10_user_namespacesJ\x04\b\t\x10\n" +
-	"R\x16volume_claim_templates\"\xd9\x03\n" +
+	"R\x16volume_claim_templates\"\x9a\x03\n" +
 	"\rSandboxStatus\x12!\n" +
 	"\fsandbox_name\x18\x01 \x01(\tR\vsandboxName\x12\x1b\n" +
 	"\tagent_pod\x18\x02 \x01(\tR\bagentPod\x12\x19\n" +
@@ -14166,9 +14156,7 @@ const file_openshell_proto_rawDesc = "" +
 	"\x05phase\x18\x06 \x01(\x0e2\x1a.openshell.v1.SandboxPhaseR\x05phase\x124\n" +
 	"\x16current_policy_version\x18\a \x01(\rR\x14currentPolicyVersion\x127\n" +
 	"\x18main_process_instance_id\x18\b \x01(\tR\x15mainProcessInstanceId\x12 \n" +
-	"\texit_code\x18\t \x01(\x05H\x00R\bexitCode\x88\x01\x01\x12=\n" +
-	"\x1bmain_process_exit_finalized\x18\n" +
-	" \x01(\bR\x18mainProcessExitFinalizedB\f\n" +
+	"\texit_code\x18\t \x01(\x05H\x00R\bexitCode\x88\x01\x01B\f\n" +
 	"\n" +
 	"_exit_code\"\xa2\x01\n" +
 	"\x10SandboxCondition\x12\x12\n" +

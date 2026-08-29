@@ -2878,12 +2878,16 @@ impl ComputeRuntime {
         sandbox_id: &str,
         instance_id: &str,
     ) -> Result<(), String> {
-        self.set_supervisor_session_state(sandbox_id, true, Some(instance_id))
+        self.set_supervisor_session_state(sandbox_id, true, Some(instance_id), false)
             .await
     }
 
-    pub async fn supervisor_session_disconnected(&self, sandbox_id: &str) -> Result<(), String> {
-        self.set_supervisor_session_state(sandbox_id, false, None)
+    pub async fn supervisor_session_disconnected(
+        &self,
+        sandbox_id: &str,
+        terminal_delivery_finalized: bool,
+    ) -> Result<(), String> {
+        self.set_supervisor_session_state(sandbox_id, false, None, terminal_delivery_finalized)
             .await
     }
 
@@ -2892,6 +2896,7 @@ impl ComputeRuntime {
         sandbox_id: &str,
         connected: bool,
         instance_id: Option<&str>,
+        terminal_delivery_finalized: bool,
     ) -> Result<(), String> {
         let guard = self.sync_lock.lock().await;
 
@@ -2907,10 +2912,7 @@ impl ComputeRuntime {
             SandboxPhase::try_from(existing.phase()).unwrap_or(SandboxPhase::Unknown);
         if !connected
             && matches!(current_phase, SandboxPhase::Error | SandboxPhase::Completed)
-            && existing
-                .status
-                .as_ref()
-                .is_some_and(|status| status.main_process_exit_finalized)
+            && terminal_delivery_finalized
         {
             drop(guard);
             self.schedule_ephemeral_sandbox_delete(&existing);
@@ -2941,7 +2943,6 @@ impl ComputeRuntime {
                     let status = sandbox.status.get_or_insert_with(Default::default);
                     status.main_process_instance_id = instance_id.unwrap_or_default().to_string();
                     status.exit_code = None;
-                    status.main_process_exit_finalized = false;
                     sandbox.set_phase(SandboxPhase::Ready as i32);
                 } else {
                     ensure_supervisor_not_ready_status(&mut sandbox.status, &sandbox_name);
@@ -3087,22 +3088,6 @@ impl ComputeRuntime {
         {
             return Err("main-process instance does not match the terminal result".to_string());
         }
-        if status.main_process_exit_finalized {
-            return Ok(());
-        }
-        let expected_resource_version = sandbox_resource_version(&sandbox);
-        let finalized = self
-            .store
-            .update_message_cas::<Sandbox, _>(sandbox_id, expected_resource_version, |sandbox| {
-                sandbox
-                    .status
-                    .get_or_insert_with(Default::default)
-                    .main_process_exit_finalized = true;
-            })
-            .await
-            .map_err(|error| error.to_string())?;
-        self.sandbox_index.update_from_sandbox(&finalized);
-        self.sandbox_watch_bus.notify(sandbox_id);
         Ok(())
     }
 
@@ -3499,7 +3484,6 @@ fn apply_main_process_exit(sandbox: &mut Sandbox, instance_id: &str, exit_code: 
     });
     status.main_process_instance_id = instance_id.to_string();
     status.exit_code = Some(exit_code);
-    status.main_process_exit_finalized = false;
     if preserve_infrastructure_error {
         return;
     }
@@ -3910,7 +3894,6 @@ fn public_status_from_driver(
         current_policy_version,
         main_process_instance_id: String::new(),
         exit_code: None,
-        main_process_exit_finalized: false,
     }
 }
 
@@ -5334,19 +5317,8 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(driver.delete_calls(), 0);
-        assert!(
-            runtime
-                .store
-                .get_message::<Sandbox>("sb-1")
-                .await
-                .unwrap()
-                .unwrap()
-                .status
-                .unwrap()
-                .main_process_exit_finalized
-        );
         runtime
-            .supervisor_session_disconnected("sb-1")
+            .supervisor_session_disconnected("sb-1", true)
             .await
             .unwrap();
         tokio::time::timeout(Duration::from_secs(1), async {
@@ -7054,7 +7026,7 @@ mod tests {
         let mut watch_rx = runtime.sandbox_watch_bus.subscribe("sb-1");
 
         runtime
-            .supervisor_session_disconnected("sb-1")
+            .supervisor_session_disconnected("sb-1", false)
             .await
             .unwrap();
 
@@ -8329,7 +8301,7 @@ mod tests {
         runtime.store.put_message(&sandbox).await.unwrap();
 
         runtime
-            .supervisor_session_disconnected("sb-1")
+            .supervisor_session_disconnected("sb-1", false)
             .await
             .unwrap();
 
@@ -8573,7 +8545,7 @@ mod tests {
         // Session drops.
         runtime.supervisor_sessions.cleanup_sandbox("sb-1");
         runtime
-            .supervisor_session_disconnected("sb-1")
+            .supervisor_session_disconnected("sb-1", false)
             .await
             .unwrap();
         let stored = runtime

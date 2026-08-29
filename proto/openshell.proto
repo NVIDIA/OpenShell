@@ -918,9 +918,6 @@ message SandboxStatus {
   // Presence indicates that the canonical main process exited. Exit code 0
   // produces Completed; nonzero and signal-normalized exits produce Error.
   optional int32 exit_code = 9;
-  // True after every expected foreground main-process attachment has closed
-  // naturally and the supervisor is ready to exit.
-  bool main_process_exit_finalized = 10;
 }
 
 // User-facing sandbox condition derived from driver-native conditions.
