@@ -136,12 +136,8 @@ data:
     {{- if .Values.server.oidc.rolesClaim }}
     roles_claim   = {{ .Values.server.oidc.rolesClaim | quote }}
     {{- end }}
-    {{- if .Values.server.oidc.adminRole }}
     admin_role    = {{ .Values.server.oidc.adminRole | quote }}
-    {{- end }}
-    {{- if .Values.server.oidc.userRole }}
     user_role     = {{ .Values.server.oidc.userRole | quote }}
-    {{- end }}
     {{- if .Values.server.oidc.scopesClaim }}
     scopes_claim  = {{ .Values.server.oidc.scopesClaim | quote }}
     {{- end }}

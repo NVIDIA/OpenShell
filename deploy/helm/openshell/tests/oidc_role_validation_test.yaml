@@ -1,0 +1,52 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+suite: OIDC role validation
+templates:
+  - templates/gateway-config.yaml
+  - templates/statefulset.yaml
+
+tests:
+  - it: rejects an admin role without a user role
+    template: templates/statefulset.yaml
+    set:
+      server.oidc.issuer: https://issuer.example.com
+      server.oidc.adminRole: openshell-admin
+    asserts:
+      - failedTemplate:
+          errorPattern: "server.oidc.adminRole and server.oidc.userRole must both be set or both be empty"
+
+  - it: rejects a user role without an admin role
+    template: templates/statefulset.yaml
+    set:
+      server.oidc.issuer: https://issuer.example.com
+      server.oidc.userRole: openshell-user
+    asserts:
+      - failedTemplate:
+          errorPattern: "server.oidc.adminRole and server.oidc.userRole must both be set or both be empty"
+
+  - it: renders both roles when RBAC mode is configured
+    template: templates/gateway-config.yaml
+    set:
+      server.oidc.issuer: https://issuer.example.com
+      server.oidc.adminRole: openshell-admin
+      server.oidc.userRole: openshell-user
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^admin_role\s*=\s*"openshell-admin"$'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^user_role\s*=\s*"openshell-user"$'
+
+  - it: renders empty roles for authentication-only mode
+    template: templates/gateway-config.yaml
+    set:
+      server.oidc.issuer: https://issuer.example.com
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^admin_role\s*=\s*""$'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^user_role\s*=\s*""$'

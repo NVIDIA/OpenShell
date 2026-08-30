@@ -274,6 +274,11 @@ Validate chart values that Helm would otherwise accept silently.
 {{- if and (eq $workloadKind "statefulset") (gt $replicaCount 1) (not (get $workload "allowMultiReplicaStatefulSet" | default false)) -}}
 {{- fail "replicaCount > 1 with workload.kind=statefulset requires workload.allowMultiReplicaStatefulSet=true; use workload.kind=deployment for external database-backed multi-replica gateways." -}}
 {{- end -}}
+{{- $adminRole := .Values.server.oidc.adminRole | default "" -}}
+{{- $userRole := .Values.server.oidc.userRole | default "" -}}
+{{- if and .Values.server.oidc.issuer (or (and $adminRole (not $userRole)) (and $userRole (not $adminRole))) -}}
+{{- fail "server.oidc.adminRole and server.oidc.userRole must both be set or both be empty." -}}
+{{- end -}}
 {{- $workspaceMode := .Values.server.drivers.kubernetes.workspaceMode | default "shared" -}}
 {{- if not (has $workspaceMode (list "shared" "managed" "operator")) -}}
 {{- fail "server.drivers.kubernetes.workspaceMode must be one of: shared, managed, operator." -}}
