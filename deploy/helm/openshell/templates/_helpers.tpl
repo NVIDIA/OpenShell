@@ -591,6 +591,24 @@ Validate chart values that Helm would otherwise accept silently.
 {{- if and (eq $workloadKind "statefulset") (gt $maxReplicas 1) (not (get $workload "allowMultiReplicaStatefulSet" | default false)) -}}
 {{- fail (printf "%s > 1 with workload.kind=statefulset requires workload.allowMultiReplicaStatefulSet=true; use workload.kind=deployment for external database-backed multi-replica gateways." $maxReplicasSource) -}}
 {{- end -}}
+{{- $servicePort := int .Values.service.port -}}
+{{- $healthPort := int .Values.service.healthPort -}}
+{{- $metricsPort := int (default 0 .Values.service.metricsPort) -}}
+{{- if or (lt $servicePort 1) (gt $servicePort 65535) -}}
+{{- fail "service.port must be between 1 and 65535." -}}
+{{- end -}}
+{{- if or (lt $healthPort 1) (gt $healthPort 65535) -}}
+{{- fail "service.healthPort must be between 1 and 65535 because gateway probes require it." -}}
+{{- end -}}
+{{- if eq $servicePort $healthPort -}}
+{{- fail "service.port and service.healthPort must be different." -}}
+{{- end -}}
+{{- if and (ne $metricsPort 0) (or (lt $metricsPort 1) (gt $metricsPort 65535)) -}}
+{{- fail "service.metricsPort must be 0 (disabled) or between 1 and 65535." -}}
+{{- end -}}
+{{- if and (ne $metricsPort 0) (or (eq $metricsPort $servicePort) (eq $metricsPort $healthPort)) -}}
+{{- fail "service.metricsPort must differ from service.port and service.healthPort." -}}
+{{- end -}}
 {{- if and .Values.grpcRoute.enabled (dig "replicaRouting" "enabled" false .Values.grpcRoute) -}}
 {{- if ne $workloadKind "statefulset" -}}
 {{- fail "grpcRoute.replicaRouting.enabled requires workload.kind=statefulset so each replica has a stable name." -}}
