@@ -1,0 +1,72 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+suite: gateway listener port validation
+templates:
+  - templates/gateway-config.yaml
+  - templates/statefulset.yaml
+
+tests:
+  - it: rejects a disabled primary gateway listener
+    template: templates/statefulset.yaml
+    set:
+      service.port: 0
+    asserts:
+      - failedTemplate:
+          errorPattern: "service.port must be between 1 and 65535"
+
+  - it: rejects a primary gateway listener above the valid port range
+    template: templates/statefulset.yaml
+    set:
+      service.port: 65536
+    asserts:
+      - failedTemplate:
+          errorPattern: "service.port must be between 1 and 65535"
+
+  - it: rejects a disabled health listener because probes require it
+    template: templates/statefulset.yaml
+    set:
+      service.healthPort: 0
+    asserts:
+      - failedTemplate:
+          errorPattern: "service.healthPort must be between 1 and 65535 because gateway probes require it"
+
+  - it: rejects a health listener above the valid port range
+    template: templates/statefulset.yaml
+    set:
+      service.healthPort: 65536
+    asserts:
+      - failedTemplate:
+          errorPattern: "service.healthPort must be between 1 and 65535 because gateway probes require it"
+
+  - it: rejects a health listener that collides with the primary listener
+    template: templates/statefulset.yaml
+    set:
+      service.healthPort: 8080
+    asserts:
+      - failedTemplate:
+          errorPattern: "service.port and service.healthPort must be different"
+
+  - it: rejects a metrics listener that collides with the primary listener
+    template: templates/statefulset.yaml
+    set:
+      service.metricsPort: 8080
+    asserts:
+      - failedTemplate:
+          errorPattern: "service.metricsPort must differ from service.port and service.healthPort"
+
+  - it: rejects a metrics listener that collides with the health listener
+    template: templates/statefulset.yaml
+    set:
+      service.metricsPort: 8081
+    asserts:
+      - failedTemplate:
+          errorPattern: "service.metricsPort must differ from service.port and service.healthPort"
+
+  - it: rejects a negative metrics listener port
+    template: templates/statefulset.yaml
+    set:
+      service.metricsPort: -1
+    asserts:
+      - failedTemplate:
+          errorPattern: "service.metricsPort must be 0 \\(disabled\\) or between 1 and 65535"
