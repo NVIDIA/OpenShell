@@ -3,6 +3,7 @@
 
 //! Shared helpers, types, and parsing utilities used across CLI command groups.
 
+use crate::color::Colorize;
 use chrono::DateTime;
 use dialoguer::{Confirm, theme::ColorfulTheme};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
@@ -17,7 +18,6 @@ use openshell_core::proto::{
 };
 use openshell_core::settings::{self, SettingValueKind};
 use openshell_providers::builtin_profiles;
-use owo_colors::OwoColorize;
 use std::collections::HashMap;
 use std::io::IsTerminal;
 use std::process::Command;

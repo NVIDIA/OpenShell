@@ -22,6 +22,7 @@ pub use crate::commands::gateway::{
     gateway_logout, gateway_remove, gateway_select, gateway_status, gateway_use,
 };
 
+use crate::color::Colorize;
 use crate::policy_update::build_policy_update_plan;
 use crate::tls::{TlsOptions, grpc_client, grpc_inference_client};
 use dialoguer::Confirm;
@@ -64,7 +65,6 @@ use openshell_providers::{
     discover_from_profile, normalize_provider_type, parse_profile_json, parse_profile_yaml,
     profile_to_json, profile_to_yaml, profiles_to_json, profiles_to_yaml,
 };
-use owo_colors::OwoColorize;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::io::{ErrorKind, IsTerminal, Read, Write};

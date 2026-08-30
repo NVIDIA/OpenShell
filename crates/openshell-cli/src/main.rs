@@ -7,7 +7,7 @@ use clap::{CommandFactory, Parser, Subcommand, ValueEnum, ValueHint};
 use clap_complete::engine::ArgValueCompleter;
 use clap_complete::env::CompleteEnv;
 use miette::Result;
-use owo_colors::OwoColorize;
+use openshell_cli::color::{self, ColorChoice, Colorize};
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::PathBuf;
@@ -468,6 +468,18 @@ struct Cli {
     /// Increase verbosity (-v, -vv, -vvv).
     #[arg(short, long, action = clap::ArgAction::Count, global = true, help_heading = "GLOBAL FLAGS")]
     verbose: u8,
+
+    /// When to colorize output. `auto` colorizes only when stdout is a terminal.
+    #[arg(
+        long,
+        global = true,
+        value_enum,
+        default_value_t = ColorChoice::Auto,
+        value_name = "WHEN",
+        env = "OPENSHELL_COLOR",
+        help_heading = "GLOBAL FLAGS"
+    )]
+    color: ColorChoice,
 
     /// Print help.
     #[arg(short = 'h', long, action = clap::ArgAction::Help, global = true, help_heading = "GLOBAL FLAGS")]
@@ -2255,6 +2267,11 @@ async fn run_async() -> Result<()> {
     CompleteEnv::with_factory(Cli::command).complete();
 
     let cli = Cli::parse();
+
+    // Resolve colorization before anything is printed, so no command can emit
+    // escape sequences into a pipe.
+    color::init(cli.color);
+
     let mut tls = TlsOptions::default();
     tls.gateway_insecure = cli.gateway_insecure;
 
@@ -2266,7 +2283,11 @@ async fn run_async() -> Result<()> {
         _ => "trace",
     };
 
+    // The fmt formatter defaults to ANSI on with no terminal detection, and it
+    // writes to stdout, so without this `openshell -v ... | ...` pipes escapes
+    // to the caller.
     tracing_subscriber::fmt()
+        .with_ansi(color::enabled())
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(log_level)),

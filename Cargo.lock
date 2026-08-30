@@ -3782,6 +3782,7 @@ dependencies = [
  "chrono",
  "clap",
  "clap_complete",
+ "console",
  "crossterm 0.28.1",
  "dialoguer",
  "futures",
