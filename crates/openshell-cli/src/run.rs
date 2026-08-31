@@ -4380,23 +4380,25 @@ pub async fn provider_profile_lint(
 
 pub async fn provider_profile_delete(
     server: &str,
-    id: &str,
+    ids: &[String],
     workspace: &str,
     tls: &TlsOptions,
 ) -> Result<()> {
     let mut client = grpc_client(server, tls).await?;
-    let response = client
-        .delete_provider_profile(DeleteProviderProfileRequest {
-            id: id.to_string(),
-            workspace: workspace.to_string(),
-        })
-        .await
-        .into_diagnostic()?
-        .into_inner();
-    if response.deleted {
-        println!("Deleted provider profile '{id}'.");
-    } else {
-        println!("Provider profile '{id}' was not deleted.");
+    for id in ids {
+        let response = client
+            .delete_provider_profile(DeleteProviderProfileRequest {
+                id: id.clone(),
+                workspace: workspace.to_string(),
+            })
+            .await
+            .into_diagnostic()?
+            .into_inner();
+        if response.deleted {
+            println!("{} Deleted provider profile {id}", "✓".green().bold());
+        } else {
+            println!("{} Provider profile {id} not found", "!".yellow());
+        }
     }
     Ok(())
 }

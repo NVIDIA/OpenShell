@@ -1093,8 +1093,9 @@ enum ProviderProfileCommands {
     /// Delete a custom provider profile.
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Delete {
-        /// Provider profile id.
-        id: String,
+        /// Provider profile id(s).
+        #[arg(required = true, num_args = 1.., value_name = "ID")]
+        ids: Vec<String>,
 
         /// Target platform-scoped profile (ignores --workspace).
         #[arg(long)]
@@ -3551,10 +3552,10 @@ async fn run_async() -> Result<()> {
                             )
                             .await?;
                         }
-                        ProviderProfileCommands::Delete { id, global } => {
+                        ProviderProfileCommands::Delete { ids, global } => {
                             run::provider_profile_delete(
                                 endpoint,
-                                &id,
+                                &ids,
                                 profile_workspace(global),
                                 &tls,
                             )
@@ -4502,17 +4503,23 @@ mod tests {
             }) if id == "custom-api"
         ));
 
-        let delete =
-            Cli::try_parse_from(["openshell", "provider", "profile", "delete", "custom-api"])
-                .expect("provider profile delete should parse");
+        let delete = Cli::try_parse_from([
+            "openshell",
+            "provider",
+            "profile",
+            "delete",
+            "custom-api",
+            "custom-alt",
+        ])
+        .expect("provider profile delete should parse");
         assert!(matches!(
             delete.command,
             Some(Commands::Provider {
                 command: Some(ProviderCommands::Profile(ProviderProfileCommands::Delete {
-                    id,
+                    ids,
                     ..
                 }))
-            }) if id == "custom-api"
+            }) if ids == vec!["custom-api".to_string(), "custom-alt".to_string()]
         ));
     }
 

@@ -1858,6 +1858,21 @@ binaries: [/usr/bin/custom]
         .expect("custom provider should be stored");
     assert_eq!(provider.r#type, "custom-api");
 
+    let mut custom_alt_profile = ts
+        .state
+        .profiles
+        .lock()
+        .await
+        .get("custom-api")
+        .cloned()
+        .expect("custom-api profile should be stored");
+    custom_alt_profile.id = "custom-alt".to_string();
+    ts.state
+        .profiles
+        .lock()
+        .await
+        .insert("custom-alt".to_string(), custom_alt_profile);
+
     run::provider_delete(
         &ts.endpoint,
         &["custom-provider".to_string()],
@@ -1866,9 +1881,17 @@ binaries: [/usr/bin/custom]
     )
     .await
     .expect("custom provider delete");
-    run::provider_profile_delete(&ts.endpoint, "custom-api", "default", &ts.tls)
-        .await
-        .expect("profile delete");
+    run::provider_profile_delete(
+        &ts.endpoint,
+        &["custom-api".to_string(), "custom-alt".to_string()],
+        "default",
+        &ts.tls,
+    )
+    .await
+    .expect("profile delete");
+    let profiles = ts.state.profiles.lock().await;
+    assert!(!profiles.contains_key("custom-api"));
+    assert!(!profiles.contains_key("custom-alt"));
 }
 
 #[tokio::test]

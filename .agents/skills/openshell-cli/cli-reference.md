@@ -555,7 +555,7 @@ Delete one or more providers by name.
 - `openshell provider profile import (--file <path>|--from <dir>)`
 - `openshell provider profile update <id> --file <path>`
 - `openshell provider profile lint (--file <path>|--from <dir>)`
-- `openshell provider profile delete <id>`
+- `openshell provider profile delete <id>...`
 
 ### Provider credential refresh
 
