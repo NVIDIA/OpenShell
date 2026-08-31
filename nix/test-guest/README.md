@@ -61,8 +61,8 @@ The root [`flake.nix`](../../flake.nix) exposes this directory as the `test-gues
 
 | Distro | Docker | Podman | Rootful Podman | Rootless Podman | SELinux | Package format |
 | --- | --- | --- | --- | --- | --- | --- |
-| Ubuntu 24.04 | Yes | Yes | No | No | No | `.deb` |
-| Ubuntu 26.04 | Yes | Yes | No | Yes | No | `.deb` |
+| Ubuntu 24.04 | Yes | Yes | Yes | No | No | `.deb` |
+| Ubuntu 26.04 | Yes | Yes | Yes | Yes | No | `.deb` |
 | CentOS Stream 10 | No | Yes | Yes | No | Yes | `.rpm` |
 | Fedora 44 | No | Yes | Yes | No | Yes | `.rpm` |
 | Rocky Linux 9 | Yes | Yes | Yes | No | Yes | `.rpm` |
@@ -104,6 +104,7 @@ nix run .#test-guest -- --distro rocky --with docker
 nix run .#test-guest -- --distro centos --with podman
 nix run .#test-guest -- --distro fedora --with podman
 nix run .#test-guest -- --distro fedora --with podman-rootful
+nix run .#test-guest -- --distro ubuntu-24-04 --with podman-rootful
 nix run .#test-guest -- --distro ubuntu-26-04 --with podman-rootless
 ```
 

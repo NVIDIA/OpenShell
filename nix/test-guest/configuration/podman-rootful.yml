@@ -7,17 +7,9 @@
 - name: Configure rootful Podman
   hosts: test_vm
   become: true
-  gather_facts: true
+  gather_facts: false
 
   tasks:
-    - name: Validate rootful Podman support
-      ansible.builtin.assert:
-        that:
-          - ansible_facts.distribution in ["CentOS", "Fedora", "Rocky"]
-        fail_msg: >-
-          Rootful Podman guest coverage is supported on RPM-family guests, not
-          {{ ansible_facts.distribution }}.
-
     - name: Install rootful Podman
       ansible.builtin.package:
         name: podman
