@@ -1,0 +1,181 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: SDK Proto Sync
+
+on:
+  schedule:
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+
+env:
+  MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+permissions:
+  actions: read
+  contents: read
+  packages: read
+  issues: write
+
+concurrency:
+  group: sdk-proto-sync
+  cancel-in-progress: true
+
+jobs:
+  sdk_sync_check:
+    name: Sync Check
+    runs-on: linux-amd64-cpu8
+    container:
+      image: ghcr.io/nvidia/openshell/ci:latest
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    outputs:
+      go_drift_report: ${{ steps.go_drift.outputs.report }}
+      go_has_drift: ${{ steps.go_drift.outputs.has_drift }}
+      go_build_report: ${{ steps.go_build.outputs.report }}
+      go_build_failed: ${{ steps.go_build.outputs.build_failed || 'false' }}
+      ts_drift_report: ${{ steps.ts_drift.outputs.report }}
+      ts_has_drift: ${{ steps.ts_drift.outputs.has_drift }}
+      ts_build_report: ${{ steps.ts_build.outputs.report }}
+      ts_build_failed: ${{ steps.ts_build.outputs.build_failed || 'false' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install tools
+        run: mise install --locked
+
+      - name: Check Go proto drift
+        id: go_drift
+        run: |
+          REPORT=$(mise run go:proto:drift 2>"$RUNNER_TEMP/go_drift_stderr.log") || true
+          if echo "$REPORT" | jq -e '.synced' >/dev/null 2>&1; then
+            SYNCED=$(echo "$REPORT" | jq -r '.synced')
+            {
+              echo "report<<REPORT_EOF"
+              echo "$REPORT"
+              echo "REPORT_EOF"
+            } >> "$GITHUB_OUTPUT"
+            [ "$SYNCED" = "true" ] && echo "has_drift=false" >> "$GITHUB_OUTPUT" || echo "has_drift=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::error::Go proto drift check failed"
+            echo "stderr: $(cat "$RUNNER_TEMP/go_drift_stderr.log")"
+            echo "report={}" >> "$GITHUB_OUTPUT"
+            echo "has_drift=error" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Go build check
+        id: go_build
+        if: steps.go_drift.outputs.has_drift == 'true'
+        run: |
+          REPORT=$(mise run go:proto:build-check 2>"$RUNNER_TEMP/go_build_stderr.log") && BUILD_OK=true || BUILD_OK=false
+          if echo "$REPORT" | jq -e '.sdk' >/dev/null 2>&1; then
+            { echo "report<<REPORT_EOF"; echo "$REPORT"; echo "REPORT_EOF"; } >> "$GITHUB_OUTPUT"
+          else
+            echo "stderr: $(cat "$RUNNER_TEMP/go_build_stderr.log")"
+            echo "report={}" >> "$GITHUB_OUTPUT"
+          fi
+          [ "$BUILD_OK" = "true" ] && echo "build_failed=false" >> "$GITHUB_OUTPUT" || echo "build_failed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Check TypeScript proto drift
+        id: ts_drift
+        run: |
+          REPORT=$(mise run sdk:ts:proto:drift 2>"$RUNNER_TEMP/ts_drift_stderr.log") || true
+          if echo "$REPORT" | jq -e '.synced' >/dev/null 2>&1; then
+            SYNCED=$(echo "$REPORT" | jq -r '.synced')
+            {
+              echo "report<<REPORT_EOF"
+              echo "$REPORT"
+              echo "REPORT_EOF"
+            } >> "$GITHUB_OUTPUT"
+            [ "$SYNCED" = "true" ] && echo "has_drift=false" >> "$GITHUB_OUTPUT" || echo "has_drift=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::error::TypeScript proto drift check failed"
+            echo "stderr: $(cat "$RUNNER_TEMP/ts_drift_stderr.log")"
+            echo "report={}" >> "$GITHUB_OUTPUT"
+            echo "has_drift=error" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: TypeScript build check
+        id: ts_build
+        if: steps.ts_drift.outputs.has_drift == 'true'
+        run: |
+          REPORT=$(mise run sdk:ts:proto:build-check 2>"$RUNNER_TEMP/ts_build_stderr.log") && BUILD_OK=true || BUILD_OK=false
+          if echo "$REPORT" | jq -e '.sdk' >/dev/null 2>&1; then
+            { echo "report<<REPORT_EOF"; echo "$REPORT"; echo "REPORT_EOF"; } >> "$GITHUB_OUTPUT"
+          else
+            echo "stderr: $(cat "$RUNNER_TEMP/ts_build_stderr.log")"
+            echo "report={}" >> "$GITHUB_OUTPUT"
+          fi
+          [ "$BUILD_OK" = "true" ] && echo "build_failed=false" >> "$GITHUB_OUTPUT" || echo "build_failed=true" >> "$GITHUB_OUTPUT"
+
+  issue_management:
+    name: Manage Drift Issue (${{ matrix.sdk.name }})
+    needs: sdk_sync_check
+    if: always() && needs.sdk_sync_check.result == 'success'
+    runs-on: linux-amd64-cpu8
+    container:
+      image: ghcr.io/nvidia/openshell/ci:latest
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    strategy:
+      fail-fast: false
+      matrix:
+        sdk:
+          - name: go
+            label: "sdk:go:sync"
+            has_drift: ${{ needs.sdk_sync_check.outputs.go_has_drift }}
+            build_failed: ${{ needs.sdk_sync_check.outputs.go_build_failed }}
+            drift_report: ${{ needs.sdk_sync_check.outputs.go_drift_report }}
+            build_report: ${{ needs.sdk_sync_check.outputs.go_build_report }}
+          - name: typescript
+            label: "sdk:typescript:sync"
+            has_drift: ${{ needs.sdk_sync_check.outputs.ts_has_drift }}
+            build_failed: ${{ needs.sdk_sync_check.outputs.ts_build_failed }}
+            drift_report: ${{ needs.sdk_sync_check.outputs.ts_drift_report }}
+            build_report: ${{ needs.sdk_sync_check.outputs.ts_build_report }}
+    steps:
+      - name: Warn on drift detection error
+        if: matrix.sdk.has_drift == 'error'
+        run: |
+          echo "::error::Drift detection failed for ${{ matrix.sdk.name }} SDK — check the sdk_sync_check job logs"
+          exit 1
+
+      - if: matrix.sdk.has_drift == 'true' && matrix.sdk.build_failed == 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install tools
+        if: matrix.sdk.has_drift == 'true' && matrix.sdk.build_failed == 'true'
+        run: mise install --locked
+
+      - name: Create or update drift issue
+        if: matrix.sdk.has_drift == 'true' && matrix.sdk.build_failed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DRIFT_REPORT: ${{ matrix.sdk.drift_report }}
+          BUILD_REPORT: ${{ matrix.sdk.build_report }}
+        run: |
+          RESULT=$(uv run python tasks/scripts/sdk_sync.py manage-issue \
+            --drift-report "${DRIFT_REPORT:-{}}" \
+            --build-report "${BUILD_REPORT:-{}}" \
+            --sdk "${{ matrix.sdk.name }}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --label "${{ matrix.sdk.label }}")
+          echo "$RESULT" | jq .
+          ACTION=$(echo "$RESULT" | jq -r '.action // "unknown"')
+          if [ "$ACTION" = "error" ] || [ "$ACTION" = "unknown" ]; then
+            echo "::error::Issue management for ${{ matrix.sdk.name }} failed: $ACTION"
+            exit 1
+          fi
+
+      - name: Close resolved drift issue
+        if: matrix.sdk.has_drift == 'false' || (matrix.sdk.has_drift == 'true' && matrix.sdk.build_failed == 'false')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          ISSUE=$(gh issue list --repo "$GITHUB_REPOSITORY" --label "${{ matrix.sdk.label }}" --state open --json number --jq '.[0].number')
+          if [ -n "$ISSUE" ]; then
+            gh issue close "$ISSUE" --repo "$GITHUB_REPOSITORY" --comment "SDK builds and tests pass after proto regeneration. Closing automatically."
+            echo "Closed issue #$ISSUE"
+          fi

@@ -1,0 +1,91 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: SDK Proto Check
+
+on:
+  merge_group:
+    types: [checks_requested]
+  push:
+    branches:
+      - "pull-request/[0-9]+"
+  workflow_dispatch:
+
+env:
+  MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+permissions:
+  contents: read
+  packages: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  pr_metadata:
+    name: Resolve PR metadata
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      should_run: ${{ steps.gate.outputs.should_run }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - id: gate
+        uses: ./.github/actions/pr-gate
+
+  sdk_proto_drift:
+    name: Proto Drift (${{ matrix.sdk.name }})
+    needs: pr_metadata
+    if: needs.pr_metadata.outputs.should_run == 'true'
+    runs-on: linux-amd64-cpu8
+    container:
+      image: ghcr.io/nvidia/openshell/ci:latest
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    strategy:
+      fail-fast: false
+      matrix:
+        sdk:
+          - name: go
+            drift_task: "go:proto:drift"
+          - name: typescript
+            drift_task: "sdk:ts:proto:drift"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install tools
+        run: mise install --locked
+
+      - name: Check proto drift
+        id: drift
+        run: |
+          REPORT=$(mise run ${{ matrix.sdk.drift_task }} 2>"$RUNNER_TEMP/drift_stderr.log") || true
+
+          if echo "$REPORT" | jq -e '.synced' >/dev/null 2>&1; then
+            SYNCED=$(echo "$REPORT" | jq -r '.synced')
+            {
+              echo "report<<REPORT_EOF"
+              echo "$REPORT"
+              echo "REPORT_EOF"
+            } >> "$GITHUB_OUTPUT"
+            echo "synced=$SYNCED" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::Proto drift check failed: unable to parse report"
+            echo "stderr: $(cat "$RUNNER_TEMP/drift_stderr.log")"
+            echo "synced=error" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Annotate drift warning
+        if: steps.drift.outputs.synced == 'false'
+        env:
+          DRIFT_REPORT: ${{ steps.drift.outputs.report }}
+          SDK_NAME: ${{ matrix.sdk.name }}
+        run: |
+          SUMMARY=$(echo "$DRIFT_REPORT" | jq -r '.summary')
+          FILES=$(echo "$DRIFT_REPORT" | jq -r '.files[] | select(.status != "synced") | "  - \(.name) (\(.status), \(.diff_lines) lines changed)"' | sed ':a;N;$!ba;s/\n/%0A/g')
+          echo "::warning::SDK proto drift detected for ${SDK_NAME}: ${SUMMARY}%0A${FILES}"
