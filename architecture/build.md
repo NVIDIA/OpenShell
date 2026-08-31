@@ -174,7 +174,12 @@ Runtime layout:
   `/usr/libexec/openshell/openshell-driver-vm` in Linux packages and published
   as a release artifact. Linux GNU VM driver binaries must not reference
   `GLIBC_*` symbols newer than `GLIBC_2.28`; release workflows verify this
-  before publishing artifacts.
+  before publishing artifacts. Nix produces the platform-specific compressed
+  runtime inputs. CI combines them with the matching supervisor artifact in a
+  runner-temporary directory outside Cargo's `target/` before the shared Rust
+  cache action runs. An explicitly configured VM runtime bundle is required to
+  contain every non-empty embedding input; the driver build fails before
+  packaging when an input is absent or empty.
 - **Supervisor**: Alpine base with `nftables`, static binary at
   `/openshell-sandbox` (musl by default; see `SUPERVISOR_LIBC` above). Static
   linkage keeps the binary usable when the image is mounted/extracted into

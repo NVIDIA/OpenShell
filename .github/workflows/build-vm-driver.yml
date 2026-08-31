@@ -67,31 +67,17 @@ jobs:
       - name: Build VM runtime
         run: nix build .#vm-runtime
 
-      - name: Compress Linux VM runtime
-        if: runner.os == 'Linux'
+      - name: Assemble compressed VM runtime
         run: |
-          install -d target/vm-runtime-compressed
-          zstd -19 -T0 result/libkrun.so -o target/vm-runtime-compressed/libkrun.so.zst
-          zstd -19 -T0 result/libkrunfw.so.5 -o target/vm-runtime-compressed/libkrunfw.so.5.zst
-          zstd -19 -T0 result/gvproxy -o target/vm-runtime-compressed/gvproxy.zst
-          zstd -19 -T0 result/umoci -o target/vm-runtime-compressed/umoci.zst
-
-      - name: Compress macOS VM runtime
-        if: runner.os == 'macOS'
-        run: |
-          install -d target/vm-runtime-compressed
-          zstd -19 -T0 result/libkrun.dylib -o target/vm-runtime-compressed/libkrun.dylib.zst
-          zstd -19 -T0 result/libkrunfw.5.dylib -o target/vm-runtime-compressed/libkrunfw.5.dylib.zst
-          zstd -19 -T0 result/gvproxy -o target/vm-runtime-compressed/gvproxy.zst
-          zstd -19 -T0 result/umoci -o target/vm-runtime-compressed/umoci.zst
-
-      - name: Add openshell-sandbox to VM runtime
-        run: zstd -19 -T0 sandbox/openshell-sandbox -o target/vm-runtime-compressed/openshell-sandbox.zst
+          compressed_dir="${RUNNER_TEMP}/vm-runtime-compressed"
+          install -d "$compressed_dir"
+          cp result/compressed/*.zst "$compressed_dir/"
+          zstd -19 -T1 sandbox/openshell-sandbox -o "$compressed_dir/openshell-sandbox.zst"
 
       - name: Build openshell-driver-vm
         uses: ./.github/actions/build-rust-binary
         env:
-          OPENSHELL_VM_RUNTIME_COMPRESSED_DIR: ${{ github.workspace }}/target/vm-runtime-compressed
+          OPENSHELL_VM_RUNTIME_COMPRESSED_DIR: ${{ runner.temp }}/vm-runtime-compressed
         with:
           package: openshell-driver-vm
           binary: openshell-driver-vm
