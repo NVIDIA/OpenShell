@@ -564,6 +564,13 @@ enum Commands {
         command: Option<ProviderCommands>,
     },
 
+    /// Manage profiles.
+    #[command(help_template = SUBCOMMAND_HELP_TEMPLATE)]
+    Profile {
+        #[command(subcommand)]
+        command: Option<ProfileCommands>,
+    },
+
     /// Manage workspaces.
     #[command(alias = "ws", after_help = WORKSPACE_EXAMPLES, help_template = SUBCOMMAND_HELP_TEMPLATE)]
     Workspace {
@@ -1023,6 +1030,130 @@ enum ProviderRefreshCommands {
         /// Injectable credential key, for example `MS_GRAPH_ACCESS_TOKEN`.
         #[arg(long = "credential-key")]
         credential_key: String,
+    },
+}
+
+/// Profile type filter for `openshell profile list`.
+///
+/// Every profile is currently a provider profile. The filter exists so the
+/// command stays usable unchanged when other profile types are introduced.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum ProfileType {
+    Provider,
+}
+
+impl ProfileType {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Provider => "provider",
+        }
+    }
+}
+
+#[derive(Subcommand, Debug)]
+enum ProfileCommands {
+    /// List available profiles.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    List {
+        /// Only list profiles of this type.
+        #[arg(long = "type", value_enum)]
+        profile_type: Option<ProfileType>,
+
+        /// Output format.
+        #[arg(short = 'o', long = "output", value_enum, default_value_t = OutputFormat::Table)]
+        output: OutputFormat,
+
+        /// List platform-scoped profiles (ignores --workspace).
+        #[arg(long)]
+        global: bool,
+    },
+
+    /// Show the full contents of a single profile.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Describe {
+        /// Profile id.
+        id: String,
+
+        /// Output format.
+        #[arg(short = 'o', long = "output", value_enum, default_value_t = OutputFormat::Table)]
+        output: OutputFormat,
+
+        /// Target platform-scoped profiles (ignores --workspace).
+        #[arg(long)]
+        global: bool,
+    },
+
+    /// Export a profile.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Export {
+        /// Profile id.
+        id: String,
+
+        /// Output format.
+        #[arg(short = 'o', long = "output", value_enum, default_value_t = OutputFormat::Yaml)]
+        output: OutputFormat,
+
+        /// Target platform-scoped profiles (ignores --workspace).
+        #[arg(long)]
+        global: bool,
+    },
+
+    /// Import profiles from a file or directory.
+    #[command(group = clap::ArgGroup::new("profile_import_source").required(true).args(["file", "from"]), help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Import {
+        /// Profile file to import.
+        #[arg(short = 'f', long = "file", value_hint = ValueHint::FilePath)]
+        file: Option<PathBuf>,
+
+        /// Directory containing profile files to import.
+        #[arg(long = "from", value_hint = ValueHint::DirPath)]
+        from: Option<PathBuf>,
+
+        /// Import as platform-scoped profiles (ignores --workspace).
+        #[arg(long)]
+        global: bool,
+    },
+
+    /// Update an existing custom profile from a file.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Update {
+        /// Existing profile id to update.
+        id: String,
+
+        /// Profile file to update.
+        #[arg(short = 'f', long = "file", value_hint = ValueHint::FilePath)]
+        file: PathBuf,
+
+        /// Target platform-scoped profile (ignores --workspace).
+        #[arg(long)]
+        global: bool,
+    },
+
+    /// Validate profile files without registering them.
+    #[command(group = clap::ArgGroup::new("profile_lint_source").required(true).args(["file", "from"]), help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Lint {
+        /// Profile file to lint.
+        #[arg(short = 'f', long = "file", value_hint = ValueHint::FilePath)]
+        file: Option<PathBuf>,
+
+        /// Directory containing profile files to lint.
+        #[arg(long = "from", value_hint = ValueHint::DirPath)]
+        from: Option<PathBuf>,
+
+        /// Lint against platform scope (ignores --workspace).
+        #[arg(long)]
+        global: bool,
+    },
+
+    /// Delete a custom profile.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Delete {
+        /// Profile id.
+        id: String,
+
+        /// Target platform-scoped profile (ignores --workspace).
+        #[arg(long)]
+        global: bool,
     },
 }
 
@@ -3730,6 +3861,94 @@ async fn run_async() -> Result<()> {
                 .print_help()
                 .expect("Failed to print help");
         }
+        Some(Commands::Profile {
+            command: Some(command),
+        }) => {
+            let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
+            let endpoint = &ctx.endpoint;
+            let mut tls = tls.with_gateway_name(&ctx.name);
+            apply_auth(&mut tls, &ctx.name);
+            let profile_workspace =
+                |global: bool| -> &str { if global { "" } else { &cli.workspace } };
+
+            match command {
+                ProfileCommands::List {
+                    profile_type,
+                    output,
+                    global,
+                } => {
+                    run::profile_list(
+                        endpoint,
+                        profile_type.map(ProfileType::as_str),
+                        output.as_str(),
+                        profile_workspace(global),
+                        &tls,
+                    )
+                    .await?;
+                }
+                ProfileCommands::Describe { id, output, global } => {
+                    run::profile_describe(
+                        endpoint,
+                        &id,
+                        output.as_str(),
+                        profile_workspace(global),
+                        &tls,
+                    )
+                    .await?;
+                }
+                ProfileCommands::Export { id, output, global } => {
+                    run::provider_profile_export(
+                        endpoint,
+                        &id,
+                        output.as_str(),
+                        profile_workspace(global),
+                        &tls,
+                    )
+                    .await?;
+                }
+                ProfileCommands::Import { file, from, global } => {
+                    run::provider_profile_import(
+                        endpoint,
+                        file.as_deref(),
+                        from.as_deref(),
+                        profile_workspace(global),
+                        &tls,
+                    )
+                    .await?;
+                }
+                ProfileCommands::Update { id, file, global } => {
+                    run::provider_profile_update(
+                        endpoint,
+                        &id,
+                        &file,
+                        profile_workspace(global),
+                        &tls,
+                    )
+                    .await?;
+                }
+                ProfileCommands::Lint { file, from, global } => {
+                    run::provider_profile_lint(
+                        endpoint,
+                        file.as_deref(),
+                        from.as_deref(),
+                        profile_workspace(global),
+                        &tls,
+                    )
+                    .await?;
+                }
+                ProfileCommands::Delete { id, global } => {
+                    run::provider_profile_delete(endpoint, &id, profile_workspace(global), &tls)
+                        .await?;
+                }
+            }
+        }
+        Some(Commands::Profile { command: None }) => {
+            Cli::command()
+                .find_subcommand_mut("profile")
+                .expect("profile subcommand exists")
+                .print_help()
+                .expect("Failed to print help");
+        }
         Some(Commands::Gateway { command: None }) => {
             Cli::command()
                 .find_subcommand_mut("gateway")
@@ -4190,6 +4409,110 @@ mod tests {
 
         assert_eq!(from.get_value_hint(), ValueHint::AnyPath);
         assert_eq!(dest.get_value_hint(), ValueHint::AnyPath);
+    }
+
+    #[test]
+    fn profile_list_accepts_type_and_output_flags() {
+        let cli = Cli::try_parse_from([
+            "openshell",
+            "profile",
+            "list",
+            "--type",
+            "provider",
+            "-o",
+            "json",
+        ])
+        .expect("profile list should parse");
+
+        let Some(Commands::Profile {
+            command:
+                Some(ProfileCommands::List {
+                    profile_type,
+                    output,
+                    global,
+                }),
+        }) = cli.command
+        else {
+            panic!("expected profile list command");
+        };
+        assert_eq!(profile_type, Some(ProfileType::Provider));
+        assert_eq!(output.as_str(), "json");
+        assert!(!global);
+    }
+
+    #[test]
+    fn profile_list_defaults_to_table_and_no_type_filter() {
+        let cli = Cli::try_parse_from(["openshell", "profile", "list"])
+            .expect("profile list should parse");
+
+        let Some(Commands::Profile {
+            command:
+                Some(ProfileCommands::List {
+                    profile_type,
+                    output,
+                    ..
+                }),
+        }) = cli.command
+        else {
+            panic!("expected profile list command");
+        };
+        assert_eq!(profile_type, None);
+        assert_eq!(output.as_str(), "table");
+    }
+
+    #[test]
+    fn profile_list_rejects_unknown_type() {
+        Cli::try_parse_from(["openshell", "profile", "list", "--type", "nonsense"])
+            .expect_err("unknown profile type should be rejected");
+    }
+
+    #[test]
+    fn profile_describe_parses_id_and_output() {
+        let cli = Cli::try_parse_from(["openshell", "profile", "describe", "openai", "-o", "yaml"])
+            .expect("profile describe should parse");
+
+        let Some(Commands::Profile {
+            command: Some(ProfileCommands::Describe { id, output, .. }),
+        }) = cli.command
+        else {
+            panic!("expected profile describe command");
+        };
+        assert_eq!(id, "openai");
+        assert_eq!(output.as_str(), "yaml");
+    }
+
+    #[test]
+    fn profile_import_requires_a_source() {
+        Cli::try_parse_from(["openshell", "profile", "import"])
+            .expect_err("import without --file or --from should be rejected");
+
+        Cli::try_parse_from(["openshell", "profile", "import", "--file", "p.yaml"])
+            .expect("import with --file should parse");
+    }
+
+    #[test]
+    fn profile_subcommands_accept_global_scope() {
+        for args in [
+            vec!["openshell", "profile", "list", "--global"],
+            vec!["openshell", "profile", "describe", "openai", "--global"],
+            vec!["openshell", "profile", "export", "openai", "--global"],
+            vec!["openshell", "profile", "delete", "custom", "--global"],
+        ] {
+            Cli::try_parse_from(args.clone())
+                .unwrap_or_else(|err| panic!("{args:?} should parse: {err}"));
+        }
+    }
+
+    /// The issue promotes `profile` to a top-level noun without removing the
+    /// original commands, so both spellings must keep parsing.
+    #[test]
+    fn legacy_provider_profile_commands_still_parse() {
+        Cli::try_parse_from(["openshell", "provider", "list-profiles"])
+            .expect("provider list-profiles should still parse");
+        Cli::try_parse_from(["openshell", "provider", "profile", "export", "openai"])
+            .expect("provider profile export should still parse");
+        Cli::try_parse_from(["openshell", "provider", "profile", "delete", "custom"])
+            .expect("provider profile delete should still parse");
     }
 
     #[test]

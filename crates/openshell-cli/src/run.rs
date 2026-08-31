@@ -4156,6 +4156,9 @@ pub async fn provider_list(
     Ok(())
 }
 
+/// The only profile type the gateway currently stores.
+const PROVIDER_PROFILE_TYPE: &str = "provider";
+
 pub async fn provider_list_profiles(
     server: &str,
     output: &str,
@@ -4212,6 +4215,171 @@ pub async fn provider_list_profiles(
     }
 
     Ok(())
+}
+
+/// List profiles, optionally narrowed to a single profile type.
+///
+/// Every profile the gateway stores is currently a provider profile, so a
+/// `Some("provider")` filter is a no-op and any other value yields an empty
+/// collection rather than an error. That keeps `--type` forward-compatible:
+/// callers can pin the type they expect without the command failing once other
+/// types exist.
+pub async fn profile_list(
+    server: &str,
+    profile_type: Option<&str>,
+    output: &str,
+    workspace: &str,
+    tls: &TlsOptions,
+) -> Result<()> {
+    if profile_type.is_some_and(|requested| requested != PROVIDER_PROFILE_TYPE) {
+        return print_empty_profile_list(output);
+    }
+    provider_list_profiles(server, output, workspace, tls).await
+}
+
+/// Render an empty profile collection for a type filter that matches nothing.
+fn print_empty_profile_list(output: &str) -> Result<()> {
+    let empty: Vec<ProviderTypeProfile> = Vec::new();
+    if crate::output::print_output_direct(
+        output,
+        || profiles_to_json(&empty).into_diagnostic(),
+        || profiles_to_yaml(&empty).into_diagnostic(),
+    )? {
+        return Ok(());
+    }
+    println!("No provider profiles found.");
+    Ok(())
+}
+
+/// Show a single profile in full.
+///
+/// Structured output reuses the same serializer as `profile export`, so the
+/// records stay identical across both commands. Table output is a
+/// human-readable rendering that keeps full values rather than the abbreviated
+/// columns used by `profile list`.
+pub async fn profile_describe(
+    server: &str,
+    id: &str,
+    output: &str,
+    workspace: &str,
+    tls: &TlsOptions,
+) -> Result<()> {
+    if matches!(output, "json" | "yaml") {
+        let rendered = provider_profile_export_text(server, id, output, workspace, tls).await?;
+        if output == "json" {
+            println!("{rendered}");
+        } else {
+            print!("{rendered}");
+        }
+        return Ok(());
+    }
+
+    let mut client = grpc_client(server, tls).await?;
+    let response = client
+        .get_provider_profile(GetProviderProfileRequest {
+            id: id.to_string(),
+            workspace: workspace.to_string(),
+        })
+        .await
+        .into_diagnostic()?;
+    let profile = response
+        .into_inner()
+        .profile
+        .ok_or_else(|| miette!("provider profile '{id}' not found"))?;
+    print!(
+        "{}",
+        render_profile_describe(&ProviderTypeProfile::from_proto(&profile))
+    );
+    Ok(())
+}
+
+/// Format a profile for `profile describe` table output.
+///
+/// Returned as a string rather than printed so tests can assert on the exact
+/// rendering without capturing stdout.
+fn render_profile_describe(profile: &ProviderTypeProfile) -> String {
+    use std::fmt::Write as _;
+
+    let mut out = String::new();
+    let _ = writeln!(out, "{} ({PROVIDER_PROFILE_TYPE})", profile.id);
+    if !profile.display_name.is_empty() {
+        let _ = writeln!(out, "{}", profile.display_name);
+    }
+    if !profile.description.is_empty() {
+        let _ = writeln!(out, "{}", profile.description);
+    }
+
+    let _ = writeln!(out);
+    let _ = writeln!(
+        out,
+        "Category:      {}",
+        display_provider_category(profile.category as i32)
+    );
+
+    if !profile.credentials.is_empty() {
+        let _ = writeln!(out, "Credentials:");
+        for credential in &profile.credentials {
+            let env = if credential.env_vars.is_empty() {
+                String::new()
+            } else {
+                format!(" [{}]", credential.env_vars.join(", "))
+            };
+            let auth = if credential.auth_style.is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", credential.auth_style)
+            };
+            let required = if credential.required {
+                " required"
+            } else {
+                " optional"
+            };
+            let _ = writeln!(out, "  {}{env}{auth}{required}", credential.name);
+        }
+    }
+
+    if !profile.endpoints.is_empty() {
+        let _ = writeln!(out, "Endpoints:");
+        for endpoint in &profile.endpoints {
+            let mut attrs = Vec::new();
+            for value in [
+                endpoint.protocol.as_str(),
+                endpoint.access.as_str(),
+                endpoint.enforcement.as_str(),
+            ] {
+                if !value.is_empty() {
+                    attrs.push(value);
+                }
+            }
+            let suffix = if attrs.is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", attrs.join(", "))
+            };
+            let _ = writeln!(out, "  {}:{}{suffix}", endpoint.host, endpoint.port);
+        }
+    }
+
+    if !profile.binaries.is_empty() {
+        let paths = profile
+            .binaries
+            .iter()
+            .map(|binary| binary.path.clone())
+            .collect::<Vec<_>>();
+        let _ = writeln!(out, "Binaries:      {}", paths.join(", "));
+    }
+
+    if profile.inference_capable {
+        let _ = writeln!(out, "Inference:     capable");
+    }
+    if !profile.scope.is_empty() {
+        let _ = writeln!(out, "Scope:         {}", profile.scope);
+    }
+    if !profile.source.is_empty() {
+        let _ = writeln!(out, "Source:        {}", profile.source);
+    }
+
+    out
 }
 
 pub async fn provider_profile_export(
@@ -7511,6 +7679,82 @@ fn format_endpoint(endpoint: &openshell_core::proto::NetworkEndpoint) -> String 
 
 #[cfg(test)]
 mod tests {
+    /// Build a proto profile and convert it, so the fixture exercises the same
+    /// `from_proto` path the command uses rather than a hand-built DTO.
+    fn describe_fixture() -> ProviderTypeProfile {
+        let proto = ProviderProfile {
+            id: "openai".to_string(),
+            display_name: "OpenAI".to_string(),
+            description: "OpenAI-compatible inference".to_string(),
+            credentials: vec![ProviderProfileCredential {
+                name: "OPENAI_API_KEY".to_string(),
+                env_vars: vec!["OPENAI_API_KEY".to_string()],
+                required: true,
+                auth_style: "bearer".to_string(),
+                ..Default::default()
+            }],
+            endpoints: vec![openshell_core::proto::NetworkEndpoint {
+                host: "api.openai.com".to_string(),
+                port: 443,
+                protocol: "rest".to_string(),
+                enforcement: "enforce".to_string(),
+                ..Default::default()
+            }],
+            binaries: vec![openshell_core::proto::NetworkBinary {
+                path: "/usr/bin/curl".to_string(),
+                ..Default::default()
+            }],
+            inference_capable: true,
+            source: "built-in".to_string(),
+            ..Default::default()
+        };
+        ProviderTypeProfile::from_proto(&proto)
+    }
+
+    #[test]
+    fn render_profile_describe_includes_identity_and_sections() {
+        let rendered = render_profile_describe(&describe_fixture());
+
+        assert!(rendered.starts_with("openai (provider)\n"), "{rendered}");
+        assert!(
+            rendered.contains("OpenAI-compatible inference"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("OPENAI_API_KEY"), "{rendered}");
+        assert!(rendered.contains("api.openai.com:443"), "{rendered}");
+        assert!(rendered.contains("/usr/bin/curl"), "{rendered}");
+        assert!(rendered.contains("built-in"), "{rendered}");
+    }
+
+    #[test]
+    fn render_profile_describe_keeps_full_values_without_ansi() {
+        let rendered = render_profile_describe(&describe_fixture());
+
+        assert!(
+            !rendered.contains('\u{1b}'),
+            "describe output must not contain ANSI escapes: {rendered}"
+        );
+        assert!(
+            !rendered.contains('\u{2026}'),
+            "describe output must not truncate values: {rendered}"
+        );
+    }
+
+    #[test]
+    fn render_profile_describe_omits_empty_sections() {
+        let profile = ProviderTypeProfile::from_proto(&ProviderProfile {
+            id: "bare".to_string(),
+            ..Default::default()
+        });
+        let rendered = render_profile_describe(&profile);
+
+        assert!(rendered.starts_with("bare (provider)\n"), "{rendered}");
+        assert!(!rendered.contains("Credentials:"), "{rendered}");
+        assert!(!rendered.contains("Endpoints:"), "{rendered}");
+        assert!(!rendered.contains("Binaries:"), "{rendered}");
+        assert!(!rendered.contains("Inference:"), "{rendered}");
+    }
+
     use super::{
         PolicyGetView, ProvisioningStep, build_sandbox_resource_limits,
         dockerfile_sources_supported_for_gateway, format_endpoint, format_log_line,
@@ -7519,13 +7763,14 @@ mod tests {
         parse_credential_expiry_pairs, parse_credential_pairs, parse_driver_config_json,
         parse_secret_material_env_pairs, policy_revision_to_json,
         provider_profile_allows_empty_credentials, provisioning_timeout_message,
-        ready_false_condition_message, refresh_status_header, refresh_status_row, resolve_from,
-        sandbox_should_persist, sandbox_upload_plan, service_expose_status_error,
-        service_url_for_gateway,
+        ready_false_condition_message, refresh_status_header, refresh_status_row,
+        render_profile_describe, resolve_from, sandbox_should_persist, sandbox_upload_plan,
+        service_expose_status_error, service_url_for_gateway,
     };
     use crate::TEST_ENV_LOCK;
     use crate::commands::common::progress_step_from_metadata;
     use crate::test_utils::EnvVarGuard;
+    use openshell_providers::ProviderTypeProfile;
     use std::fs;
     use std::io::Write;
     use std::path::Path;
