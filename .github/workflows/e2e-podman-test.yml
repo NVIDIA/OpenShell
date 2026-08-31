@@ -14,6 +14,34 @@ on:
         required: false
         type: string
         default: ""
+      test-name:
+        required: false
+        type: string
+        default: rust-podman-rootless, Ubuntu 26.04 Nix VM
+      distro:
+        required: false
+        type: string
+        default: ubuntu-26-04
+      configuration:
+        required: false
+        type: string
+        default: podman-rootless
+      guest-gateway-user:
+        required: false
+        type: string
+        default: openshell
+      gateway-config:
+        required: false
+        type: string
+        default: e2e/configs/gateway/podman.toml
+      tests-in-vm:
+        required: false
+        type: boolean
+        default: true
+      suite:
+        required: false
+        type: string
+        default: ""
 
 permissions:
   actions: read
@@ -22,11 +50,10 @@ permissions:
 
 jobs:
   e2e:
-    name: E2E (rust-podman-rootless, Ubuntu 26.04 Nix VM)
+    name: E2E (${{ inputs.test-name }})
     runs-on: ubuntu-26.04
-    # Run rootless Podman inside a Nix-managed Ubuntu guest so Podman, pasta,
-    # and user-namespace setup are provisioned by versioned repository tooling
-    # rather than mutable hosted-runner packages.
+    # Run Podman inside a Nix-managed guest so runtime setup is provisioned by
+    # versioned repository tooling rather than mutable hosted-runner packages.
     timeout-minutes: 60
     env:
       MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -75,15 +102,33 @@ jobs:
             pkg-config
 
       - name: Run tests
+        env:
+          TEST_GUEST_DISTRO: ${{ inputs.distro }}
+          TEST_GUEST_CONFIGURATION: ${{ inputs.configuration }}
+          TESTS_IN_VM: ${{ inputs.tests-in-vm }}
+          GUEST_GATEWAY_USER: ${{ inputs.guest-gateway-user }}
+          GATEWAY_CONFIG: ${{ inputs.gateway-config }}
+          E2E_SUITE: ${{ inputs.suite }}
         run: |
           set -euo pipefail
 
-          mise x -- e2e/run.sh \
-            --vm ubuntu-26-04 \
-            --with podman-rootless \
-            --tests-in-vm \
-            --cli-bin "$OPENSHELL_BIN" \
-            --gateway-bin "$OPENSHELL_GATEWAY_BIN" \
-            --sandbox-bin "$OPENSHELL_SANDBOX_BIN" \
-            --gateway-config e2e/configs/gateway/podman.toml \
+          args=(
+            mise x -- e2e/run.sh
+            --vm "$TEST_GUEST_DISTRO"
+            --with "$TEST_GUEST_CONFIGURATION"
+            --cli-bin "$OPENSHELL_BIN"
+            --gateway-bin "$OPENSHELL_GATEWAY_BIN"
+            --sandbox-bin "$OPENSHELL_SANDBOX_BIN"
+            --gateway-config "$GATEWAY_CONFIG"
             --features e2e-podman
+          )
+          if [ "$TESTS_IN_VM" = true ]; then
+            args+=(--tests-in-vm)
+          fi
+          if [ "$GUEST_GATEWAY_USER" != openshell ]; then
+            args+=(--guest-gateway-user "$GUEST_GATEWAY_USER")
+          fi
+          if [ -n "$E2E_SUITE" ]; then
+            args+=(--suite "$E2E_SUITE")
+          fi
+          "${args[@]}"

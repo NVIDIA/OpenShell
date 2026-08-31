@@ -123,6 +123,17 @@ jobs:
       cargo-version: ${{ needs.version.outputs.cargo }}
     secrets: inherit
 
+  build-rpm:
+    needs: [pr_metadata, version, build-cli, build-gateway]
+    if: needs.pr_metadata.outputs.run_core_e2e == 'true'
+    permissions:
+      contents: read
+    uses: ./.github/workflows/rpm-package.yml
+    with:
+      checkout-ref: ${{ github.sha }}
+      cargo-version: ${{ needs.version.outputs.cargo }}
+    secrets: inherit
+
   build-gateway-plain:
     needs: [pr_metadata, version]
     if: needs.pr_metadata.outputs.run_core_e2e == 'true'
@@ -246,27 +257,36 @@ jobs:
     uses: ./.github/workflows/e2e-podman-test.yml
 
   podman-fedora-rootful-e2e:
-    name: E2E (rust-podman-rootful, Fedora Nix VM)
     needs: [pr_metadata, build-cli, build-gateway, build-sandbox]
     if: needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_core_e2e == 'true'
     permissions:
       actions: read
       contents: read
       packages: read
-    runs-on: ubuntu-26.04
-    timeout-minutes: 60
-    env:
-      MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    uses: ./.github/workflows/e2e-podman-test.yml
+    with:
+      test-name: rust-podman-rootful, Fedora Nix VM
+      distro: fedora
+      configuration: podman-rootful
+      guest-gateway-user: root
+      gateway-config: e2e/configs/gateway/podman-rootful.toml
+      tests-in-vm: false
+      suite: sandbox_lifecycle
+
+  podman-fedora-rootful-rpm:
+    name: RPM install (rootful Podman, Fedora Nix VM)
+    needs: [pr_metadata, build-rpm]
+    if: needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_core_e2e == 'true'
+    permissions:
+      actions: read
+      contents: read
+      packages: read
+    runs-on: linux-amd64-cpu8
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-
-      - uses: ./.github/actions/setup-e2e-cli
-
-      - uses: ./.github/actions/setup-e2e-gateway
-
-      - uses: ./.github/actions/setup-e2e-sandbox
 
       - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
         with:
@@ -276,42 +296,41 @@ jobs:
         with:
           name: openshell
 
-      - name: Install mise
-        run: |
-          curl https://mise.run | MISE_VERSION=v2026.4.25 sh
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-          echo "$HOME/.local/share/mise/shims" >> "$GITHUB_PATH"
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: rpm-linux-x86_64
+          path: package-input
 
-      - name: Install tools
-        run: mise install --locked
-
-      - name: Install system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            build-essential \
-            clang \
-            cmake \
-            libclang-dev \
-            libssl-dev \
-            libz3-dev \
-            openssh-client \
-            pkg-config
-
-      - name: Run Fedora rootful Podman E2E
+      - name: Install PR RPMs and start rootful Podman gateway
         run: |
           set -euo pipefail
 
-          mise x -- e2e/run.sh \
-            --vm fedora \
+          nix run .#test-guest -- \
+            --distro fedora \
             --with podman-rootful \
-            --guest-gateway-user root \
-            --cli-bin "$OPENSHELL_BIN" \
-            --gateway-bin "$OPENSHELL_GATEWAY_BIN" \
-            --sandbox-bin "$OPENSHELL_SANDBOX_BIN" \
-            --gateway-config e2e/configs/gateway/podman-rootful.toml \
-            --features e2e-podman \
-            --suite sandbox_lifecycle
+            --install package-input/openshell-[0-9]*.rpm \
+            --install package-input/openshell-gateway-*.rpm \
+            -- \
+            sudo env \
+            SUDO_USER=root \
+            HOME=/root \
+            XDG_RUNTIME_DIR=/run/user/0 \
+            DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/0/bus \
+            OPENSHELL_TELEMETRY_ENABLED=false \
+            bash -s <<'EOF'
+          set -euo pipefail
+          mkdir -p "${XDG_RUNTIME_DIR}"
+          chmod 700 "${XDG_RUNTIME_DIR}"
+          systemctl start user-runtime-dir@0.service || true
+          systemctl start user@0.service
+          systemctl --user daemon-reload
+          mkdir -p "${HOME}/.config/openshell"
+          printf 'OPENSHELL_DRIVERS=podman\nOPENSHELL_PODMAN_SOCKET=/run/podman/podman.sock\nOPENSHELL_TELEMETRY_ENABLED=%s\n' \
+            "$OPENSHELL_TELEMETRY_ENABLED" > "${HOME}/.config/openshell/gateway.env"
+          podman --url unix:///run/podman/podman.sock info
+          systemctl --user enable --now openshell-gateway
+          openshell status
+          EOF
   vm-e2e:
     needs: [pr_metadata, build-cli, build-gateway, build-vm-driver]
     if: needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_core_e2e == 'true'
@@ -462,7 +481,7 @@ jobs:
 
   core-e2e-result:
     name: Core E2E result
-    needs: [pr_metadata, docker-e2e, podman-e2e, podman-fedora-rootful-e2e, vm-e2e, docker-external-driver-e2e, vm-external-driver-e2e, kubernetes-e2e, kubernetes-external-driver-e2e, kubernetes-workspace-managed-e2e, kubernetes-workspace-operator-e2e]
+    needs: [pr_metadata, docker-e2e, podman-e2e, podman-fedora-rootful-e2e, podman-fedora-rootful-rpm, vm-e2e, docker-external-driver-e2e, vm-external-driver-e2e, kubernetes-e2e, kubernetes-external-driver-e2e, kubernetes-workspace-managed-e2e, kubernetes-workspace-operator-e2e]
     if: always() && needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_core_e2e == 'true'
     runs-on: ubuntu-latest
     steps:
