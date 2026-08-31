@@ -136,15 +136,12 @@ jobs:
       runner: linux-arm64-cpu8
 
   podman-e2e:
-    needs: [build-cli, build-gateway, build-supervisor-image]
+    needs: [build-cli, build-gateway, build-sandbox]
     permissions:
       actions: read
       contents: read
       packages: read
     uses: ./.github/workflows/e2e-podman-test.yml
-    with:
-      image-tag: ${{ github.sha }}
-
   vm-e2e:
     needs: [build-cli, build-gateway, build-vm-driver]
     permissions:

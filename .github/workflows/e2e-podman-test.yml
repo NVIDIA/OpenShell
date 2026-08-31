@@ -6,9 +6,6 @@ name: Podman E2E Test
 on:
   workflow_call:
     inputs:
-      image-tag:
-        required: true
-        type: string
       checkout-ref:
         required: false
         type: string
@@ -17,15 +14,6 @@ on:
         required: false
         type: string
         default: ""
-      external-driver-binary:
-        required: false
-        type: string
-        default: ""
-      suite-matrix:
-        required: false
-        type: string
-        default: >-
-          [{"suite":"provider-refresh-keycloak","runner":"ubuntu-26.04","podman_major":"5","podman_package_version":"5.7.0+ds2-3build1","conmon_package_version":"2.1.13+ds1-2","cmd":"mise run --no-deps --skip-deps e2e:provider-refresh-keycloak"}]
 
 permissions:
   actions: read
@@ -34,18 +22,14 @@ permissions:
 
 jobs:
   e2e:
-    name: E2E (rust-podman-${{ matrix.suite }}, ${{ matrix.runner }})
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 30
-    strategy:
-      fail-fast: false
-      matrix:
-        include: ${{ fromJSON(inputs.suite-matrix) }}
+    name: E2E (rust-podman-rootless, Ubuntu 26.04 Nix VM)
+    runs-on: ubuntu-26.04
+    # Run rootless Podman inside a Nix-managed Ubuntu guest so Podman, pasta,
+    # and user-namespace setup are provisioned by versioned repository tooling
+    # rather than mutable hosted-runner packages.
+    timeout-minutes: 60
     env:
-      IMAGE_TAG: ${{ inputs.image-tag }}
       MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      OPENSHELL_REGISTRY: ghcr.io/nvidia/openshell
-      OPENSHELL_SUPERVISOR_IMAGE: ${{ format('ghcr.io/nvidia/openshell/supervisor:{0}', inputs.image-tag) }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -58,34 +42,48 @@ jobs:
         with:
           artifact-name: ${{ inputs.gateway-artifact }}
 
-      - if: inputs.external-driver-binary != ''
-        uses: ./.github/actions/setup-e2e-driver
-        with:
-          binary: ${{ inputs.external-driver-binary }}
+      - uses: ./.github/actions/setup-e2e-sandbox
 
-      - uses: ./.github/actions/setup-e2e-podman
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
         with:
-          podman-major: ${{ matrix.podman_major }}
-          podman-package-version: ${{ matrix.podman_package_version }}
-          conmon-package-version: ${{ matrix.conmon_package_version }}
+          github_access_token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Log in to GHCR
-        run: echo "${{ secrets.GITHUB_TOKEN }}" | podman login ghcr.io -u "${GITHUB_ACTOR}" --password-stdin
+      - uses: cachix/cachix-action@5f2d7c5294214f71b873db4b969586b980625e71 # v17
+        with:
+          name: openshell
+
+      - name: Install mise
+        run: |
+          curl https://mise.run | MISE_VERSION=v2026.4.25 sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          echo "$HOME/.local/share/mise/shims" >> "$GITHUB_PATH"
+
+      - name: Install tools
+        run: mise install --locked
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            clang \
+            cmake \
+            libclang-dev \
+            libssl-dev \
+            libz3-dev \
+            openssh-client \
+            pkg-config
 
       - name: Run tests
-        run: ${{ matrix.cmd }}
-
-      - name: Print AppArmor denials
-        if: always()
-        run: sudo dmesg | grep -E 'apparmor=.*DENIED|profile="unprivileged_userns"' | tail -100 || true
-
-      - name: Fail on pasta SIGTERM AppArmor denial
-        if: always()
         run: |
           set -euo pipefail
-          denials="$(sudo dmesg | grep -E 'profile="pasta".*requested_mask="receive".*signal=term.*peer="podman"' || true)"
-          if [ -n "${denials}" ]; then
-            echo "::error::pasta denied Podman's SIGTERM; Podman will use its SIGKILL fallback"
-            printf '%s\n' "${denials}"
-            exit 1
-          fi
+
+          mise x -- e2e/run.sh \
+            --vm ubuntu-26-04 \
+            --with podman-rootless \
+            --tests-in-vm \
+            --cli-bin "$OPENSHELL_BIN" \
+            --gateway-bin "$OPENSHELL_GATEWAY_BIN" \
+            --sandbox-bin "$OPENSHELL_SANDBOX_BIN" \
+            --gateway-config e2e/configs/gateway/podman.toml \
+            --features e2e-podman
