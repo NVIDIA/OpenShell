@@ -91,9 +91,14 @@ hide = true
 
 ["test:python"]
 description = "Run Python tests"
-depends = ["python:proto"]
+depends = ["python:proto", "test:sdk-sync"]
 env = { UV_NO_SYNC = "1" }
 run = "uv run pytest python/"
+hide = true
+
+["test:sdk-sync"]
+description = "Test SDK drift reports and issue lifecycle management"
+run = "uv run --no-project --with pytest --with pyyaml pytest tasks/scripts/sdk_sync_test.py"
 hide = true
 
 ["e2e:rust"]
