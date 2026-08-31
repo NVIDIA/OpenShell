@@ -3183,6 +3183,17 @@ impl ComputeRuntime {
         else {
             return Ok(());
         };
+        let phase = SandboxPhase::try_from(sandbox.phase()).unwrap_or(SandboxPhase::Unknown);
+        if matches!(
+            phase,
+            SandboxPhase::Deleting | SandboxPhase::Stopping | SandboxPhase::Stopped
+        ) {
+            // Lifecycle shutdown intentionally discards the canonical process
+            // result. Finalization must still acknowledge that discarded
+            // result so the supervisor can exit before the compute backend's
+            // termination grace period expires.
+            return Ok(());
+        }
         let Some(status) = sandbox.status.as_ref() else {
             return Err("main-process exit has not been reported".to_string());
         };
@@ -5600,6 +5611,10 @@ mod tests {
                 .main_process_exited(id, "instance-1", 143)
                 .await
                 .unwrap();
+            runtime
+                .finalize_main_process_exit(id, "instance-1")
+                .await
+                .expect("intentional shutdown finalization should be acknowledged");
 
             let stored = runtime
                 .store

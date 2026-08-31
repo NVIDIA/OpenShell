@@ -1623,8 +1623,7 @@ impl KubernetesComputeDriver {
         let (agent_sandbox_api, kube_name, pod_name, namespace, stop_timeout) = self
             .patch_sandbox_operating_state(sandbox_id, false)
             .await?;
-        let legacy_pod_api = (agent_sandbox_api.resource.version == SANDBOX_VERSION_V1ALPHA1)
-            .then(|| Api::<Pod>::namespaced(self.client.clone(), &namespace));
+        let pod_api = Api::<Pod>::namespaced(self.client.clone(), &namespace);
 
         let deadline = tokio::time::Instant::now() + stop_timeout;
         let mut poll_interval = STOP_INITIAL_POLL_INTERVAL;
@@ -1649,17 +1648,18 @@ impl KubernetesComputeDriver {
                 ))
             })?
             .map_err(KubernetesDriverError::from_kube)?;
-            if kubernetes_sandbox_has_stopped_condition(&object) {
-                return Ok(());
-            }
             if let Some(error) = kubernetes_sandbox_stop_failure(&object) {
                 return Err(KubernetesDriverError::Message(error));
             }
-            if let Some(pod_api) = legacy_pod_api.as_ref()
-                && kubernetes_sandbox_pod_is_gone(pod_api, &pod_name, deadline)
-                    .await
-                    .map_err(KubernetesDriverError::Message)?
-            {
+            let pod_is_gone = kubernetes_sandbox_pod_is_gone(&pod_api, &pod_name, deadline)
+                .await
+                .map_err(KubernetesDriverError::Message)?;
+            let stop_is_complete = kubernetes_sandbox_stop_is_complete(
+                &agent_sandbox_api.resource.version,
+                &object,
+                pod_is_gone,
+            );
+            if stop_is_complete {
                 return Ok(());
             }
             let now = tokio::time::Instant::now();
@@ -4560,6 +4560,19 @@ fn kubernetes_sandbox_has_stopped_condition(obj: &DynamicObject) -> bool {
         })
 }
 
+fn kubernetes_sandbox_stop_is_complete(
+    api_version: &str,
+    obj: &DynamicObject,
+    pod_is_gone: bool,
+) -> bool {
+    if api_version == SANDBOX_VERSION_V1ALPHA1 {
+        // v1alpha1 omits a usable stopped condition.
+        pod_is_gone
+    } else {
+        kubernetes_sandbox_has_stopped_condition(obj) && pod_is_gone
+    }
+}
+
 fn kubernetes_sandbox_stop_failure(obj: &DynamicObject) -> Option<String> {
     obj.data
         .get("status")?
@@ -5390,6 +5403,43 @@ mod tests {
             }
         });
         assert!(kubernetes_sandbox_has_stopped_condition(&sandbox));
+    }
+
+    #[test]
+    fn beta_stop_requires_suspended_condition_and_deleted_pod() {
+        let resource = ApiResource::from_gvk(&GroupVersionKind::gvk(
+            SANDBOX_GROUP,
+            SANDBOX_VERSION_V1BETA1,
+            SANDBOX_KIND,
+        ));
+        let mut sandbox = DynamicObject::new("sandbox", &resource);
+
+        assert!(!kubernetes_sandbox_stop_is_complete(
+            SANDBOX_VERSION_V1BETA1,
+            &sandbox,
+            true,
+        ));
+
+        sandbox.data = serde_json::json!({
+            "status": {
+                "conditions": [{"type": "Suspended", "status": "True"}]
+            }
+        });
+        assert!(!kubernetes_sandbox_stop_is_complete(
+            SANDBOX_VERSION_V1BETA1,
+            &sandbox,
+            false,
+        ));
+        assert!(kubernetes_sandbox_stop_is_complete(
+            SANDBOX_VERSION_V1BETA1,
+            &sandbox,
+            true,
+        ));
+        assert!(kubernetes_sandbox_stop_is_complete(
+            SANDBOX_VERSION_V1ALPHA1,
+            &DynamicObject::new("sandbox", &resource),
+            true,
+        ));
     }
 
     #[test]

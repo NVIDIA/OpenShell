@@ -436,7 +436,9 @@ The Kubernetes driver creates namespaced `agents.x-k8s.io` `Sandbox` resources f
 Stop patches the existing resource rather than deleting it. For `v1beta1`,
 the driver sets `spec.operatingMode` to `Suspended` or `Running`. For
 `v1alpha1`, it sets `spec.replicas` to `0` or `1`. The Sandbox resource and its
-workspace PVC keep their identity across both operations.
+workspace PVC keep their identity across both operations. Stop returns only
+after the controller reports suspension and deletes the old pod, so an
+immediate start cannot race the prior pod's termination.
 
 If Agent Sandbox is upgraded in place, restart the OpenShell gateway after the controller and CRD rollout completes so the gateway can detect the served API versions again.
 
