@@ -262,6 +262,10 @@ When `userns` is configured (e.g. `userns = "auto"` or `userns = "keep-id"`):
   rootful Podman uses absolute host IDs (e.g. `uidmap = ["0:1000:1", "1:100000:65536"]`).
 - `nomap` (without hyphen) is accepted as input but canonicalized to `no-map`
   for Podman's API.
+- A workload remains in `stopping` until Podman resorts to `SIGKILL`: inspect
+  supervisor logs for `failed to signal entrypoint process group`. The
+  supervisor must retain `CAP_KILL` so its root process can forward `SIGTERM`
+  to a workload that runs as the sandbox user.
 
 ### Step 6: Check Kubernetes Helm Gateways
 
