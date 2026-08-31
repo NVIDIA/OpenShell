@@ -840,7 +840,20 @@ guest_tls_key    = "/var/lib/openshell/guest-tls/client-key.pem"
 # proxy_connect_by_hostname = true
 # Corporate CA trusted for an https:// proxy and TLS-intercepting proxies.
 # proxy_ca_bundle           = "/etc/openshell/tls/proxy-ca.pem"
+# Where the gateway stages rootfs tar archives for `--from ./rootfs.tar`.
+# Defaults to <state_dir>/rootfs-tar-staging. The gateway creates one
+# request-scoped subdirectory per staging slot and removes it after use.
+# rootfs_tar_staging_dir = "/var/lib/openshell/vm/rootfs-tar-staging"
+# Largest rootfs tar archive the driver accepts, in bytes. Defaults to 10 GiB.
+# rootfs_tar_max_bytes = 10737418240
 ```
+
+Rootfs tar staging requires the gateway and the VM driver to share a filesystem
+and run as the same user. That holds for the managed VM driver, which the
+gateway starts as a subprocess. If you point `compute_driver_endpoints` at an
+externally managed `vm` socket owned by another user, the driver cannot read the
+gateway's staging directory and rootfs tar sources fail with a
+`FAILED_PRECONDITION` error; use a registry image reference instead.
 
 ### Extension Driver
 

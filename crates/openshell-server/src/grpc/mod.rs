@@ -14,22 +14,22 @@ pub mod workspace;
 use openshell_core::proto::{
     AddWorkspaceMemberRequest, AddWorkspaceMemberResponse, ApproveAllDraftChunksRequest,
     ApproveAllDraftChunksResponse, ApproveDraftChunkRequest, ApproveDraftChunkResponse,
-    AttachSandboxProviderRequest, AttachSandboxProviderResponse, ClearDraftChunksRequest,
-    ClearDraftChunksResponse, ComputeDriverCapabilities, ComputeDriverInfo,
-    ConfigureProviderRefreshRequest, ConfigureProviderRefreshResponse, CpuResourceCapabilities,
-    CreateProviderRequest, CreateSandboxRequest, CreateSandboxTemplateRequest,
-    CreateSshSessionRequest, CreateSshSessionResponse, CreateWorkspaceRequest,
-    CreateWorkspaceResponse, DeleteProviderProfileRequest, DeleteProviderProfileResponse,
-    DeleteProviderRefreshRequest, DeleteProviderRefreshResponse, DeleteProviderRequest,
-    DeleteProviderResponse, DeleteSandboxRequest, DeleteSandboxResponse,
-    DeleteSandboxTemplateRequest, DeleteSandboxTemplateResponse, DeleteServiceRequest,
-    DeleteServiceResponse, DeleteWorkspaceRequest, DeleteWorkspaceResponse,
-    DetachSandboxProviderRequest, DetachSandboxProviderResponse, EditDraftChunkRequest,
-    EditDraftChunkResponse, ExchangeProviderSubjectTokenRequest,
-    ExchangeProviderSubjectTokenResponse, ExecSandboxEvent, ExecSandboxInput, ExecSandboxRequest,
-    ExposeServiceRequest, FinalizeMainProcessExitRequest, FinalizeMainProcessExitResponse,
-    GatewayMessage, GetCurrentUserRequest, GetCurrentUserResponse, GetDraftHistoryRequest,
-    GetDraftHistoryResponse, GetDraftPolicyRequest, GetDraftPolicyResponse,
+    AttachSandboxProviderRequest, AttachSandboxProviderResponse, BeginRootfsTarStagingRequest,
+    BeginRootfsTarStagingResponse, ClearDraftChunksRequest, ClearDraftChunksResponse,
+    ComputeDriverCapabilities, ComputeDriverInfo, ConfigureProviderRefreshRequest,
+    ConfigureProviderRefreshResponse, CpuResourceCapabilities, CreateProviderRequest,
+    CreateSandboxRequest, CreateSandboxTemplateRequest, CreateSshSessionRequest,
+    CreateSshSessionResponse, CreateWorkspaceRequest, CreateWorkspaceResponse,
+    DeleteProviderProfileRequest, DeleteProviderProfileResponse, DeleteProviderRefreshRequest,
+    DeleteProviderRefreshResponse, DeleteProviderRequest, DeleteProviderResponse,
+    DeleteSandboxRequest, DeleteSandboxResponse, DeleteSandboxTemplateRequest,
+    DeleteSandboxTemplateResponse, DeleteServiceRequest, DeleteServiceResponse,
+    DeleteWorkspaceRequest, DeleteWorkspaceResponse, DetachSandboxProviderRequest,
+    DetachSandboxProviderResponse, EditDraftChunkRequest, EditDraftChunkResponse,
+    ExchangeProviderSubjectTokenRequest, ExchangeProviderSubjectTokenResponse, ExecSandboxEvent,
+    ExecSandboxInput, ExecSandboxRequest, ExposeServiceRequest, FinalizeMainProcessExitRequest,
+    FinalizeMainProcessExitResponse, GatewayMessage, GetCurrentUserRequest, GetCurrentUserResponse,
+    GetDraftHistoryRequest, GetDraftHistoryResponse, GetDraftPolicyRequest, GetDraftPolicyResponse,
     GetGatewayConfigRequest, GetGatewayConfigResponse, GetGatewayInfoRequest,
     GetGatewayInfoResponse, GetProviderProfileRequest, GetProviderRefreshStatusRequest,
     GetProviderRefreshStatusResponse, GetProviderRequest, GetSandboxConfigRequest,
@@ -264,8 +264,6 @@ impl OpenShell for OpenShellService {
                         .resource_capabilities
                         .as_ref()
                         .map(|resources| public_resource_capabilities(*resources)),
-                    rootfs_tar_staging_dir: driver.rootfs_tar_staging_dir.clone(),
-                    rootfs_tar_max_bytes: driver.rootfs_tar_max_bytes,
                 }),
             })
             .collect();
@@ -284,6 +282,13 @@ impl OpenShell for OpenShellService {
         request: Request<CreateSandboxRequest>,
     ) -> Result<Response<SandboxResponse>, Status> {
         sandbox::handle_create_sandbox(&self.state, request).await
+    }
+
+    async fn begin_rootfs_tar_staging(
+        &self,
+        request: Request<BeginRootfsTarStagingRequest>,
+    ) -> Result<Response<BeginRootfsTarStagingResponse>, Status> {
+        sandbox::handle_begin_rootfs_tar_staging(&self.state, request).await
     }
 
     type WatchSandboxStream = sandbox::WatchSandboxStream;
