@@ -2249,6 +2249,7 @@ fn sandbox_detail_to_json(
 pub async fn sandbox_provider_list(
     server: &str,
     name: &str,
+    output: &str,
     workspace: &str,
     tls: &TlsOptions,
 ) -> Result<()> {
@@ -2261,6 +2262,10 @@ pub async fn sandbox_provider_list(
         .await
         .into_diagnostic()?;
     let providers = response.into_inner().providers;
+
+    if crate::output::print_output_collection(output, &providers, attached_provider_to_json)? {
+        return Ok(());
+    }
 
     if providers.is_empty() {
         println!("No providers attached to sandbox {name}.");
@@ -2385,6 +2390,18 @@ pub async fn sandbox_provider_detach(
 
 fn print_provider_attachment_table(providers: &[Provider]) {
     print!("{}", format_provider_attachment_table(providers, true));
+}
+
+fn attached_provider_to_json(provider: &Provider) -> serde_json::Value {
+    let mut config_keys = provider.config.keys().cloned().collect::<Vec<_>>();
+    config_keys.sort();
+
+    serde_json::json!({
+        "name": provider.object_name(),
+        "type": provider.r#type,
+        "credential_keys": provider_credential_keys(provider),
+        "config_keys": config_keys,
+    })
 }
 
 fn format_provider_attachment_table(providers: &[Provider], color: bool) -> String {
@@ -3003,6 +3020,7 @@ fn service_expose_status_error(status: Status) -> miette::Report {
     service_status_error("expose service", "sandbox:write", status)
 }
 
+#[allow(clippy::too_many_arguments)] // user-facing CLI command
 pub async fn service_list(
     server: &str,
     sandbox: Option<&str>,
@@ -3010,6 +3028,7 @@ pub async fn service_list(
     offset: u32,
     workspace: &str,
     all_workspaces: bool,
+    output: &str,
     tls: &TlsOptions,
 ) -> Result<()> {
     let mut client = grpc_client(server, tls).await?;
@@ -3028,6 +3047,15 @@ pub async fn service_list(
         .await
         .map_err(|status| service_status_error("list services", "sandbox:read", status))?
         .into_inner();
+
+    let services = response
+        .services
+        .iter()
+        .filter_map(|response| service_endpoint_to_json(response, server))
+        .collect::<Vec<_>>();
+    if crate::output::print_output_collection(output, &services, Clone::clone)? {
+        return Ok(());
+    }
 
     if response.services.is_empty() {
         if let Some(sandbox) = sandbox {
@@ -3215,6 +3243,30 @@ fn print_service_endpoint_table(
             );
         }
     }
+}
+
+fn service_endpoint_to_json(
+    response: &ServiceEndpointResponse,
+    gateway_endpoint: &str,
+) -> Option<serde_json::Value> {
+    let endpoint = response.endpoint.as_ref()?;
+    let workspace = endpoint
+        .metadata
+        .as_ref()
+        .map_or("", |metadata| metadata.workspace.as_str());
+    let url = if response.url.is_empty() {
+        String::new()
+    } else {
+        service_url_for_gateway(&response.url, gateway_endpoint)
+    };
+
+    Some(serde_json::json!({
+        "workspace": workspace,
+        "sandbox": endpoint.sandbox_name,
+        "service": endpoint.service_name,
+        "target_port": endpoint.target_port,
+        "url": url,
+    }))
 }
 
 fn service_display_name(service: &str) -> &str {
@@ -5317,9 +5369,10 @@ pub async fn workspace_member_list(
     workspace: &str,
     limit: u32,
     offset: u32,
+    output: &str,
     tls: &TlsOptions,
 ) -> Result<()> {
-    use openshell_core::proto::{ListWorkspaceMembersRequest, WorkspaceRole};
+    use openshell_core::proto::ListWorkspaceMembersRequest;
 
     let mut client = grpc_client(server, tls).await?;
     let response = client
@@ -5331,6 +5384,10 @@ pub async fn workspace_member_list(
         .await
         .into_diagnostic()?;
     let members = response.into_inner().members;
+
+    if crate::output::print_output_collection(output, &members, workspace_member_to_json)? {
+        return Ok(());
+    }
 
     if members.is_empty() {
         println!("No members found in workspace {workspace}.");
@@ -5347,15 +5404,28 @@ pub async fn workspace_member_list(
     println!("{:<subject_width$}  {}", "SUBJECT".bold(), "ROLE".bold());
 
     for member in &members {
-        let role_str = match WorkspaceRole::try_from(member.role) {
-            Ok(WorkspaceRole::Admin) => "admin",
-            Ok(WorkspaceRole::User) => "user",
-            _ => "unknown",
-        };
+        let role_str = workspace_member_role_name(member.role);
         println!("{:<subject_width$}  {}", member.principal_subject, role_str);
     }
 
     Ok(())
+}
+
+fn workspace_member_role_name(role: i32) -> &'static str {
+    use openshell_core::proto::WorkspaceRole;
+
+    match WorkspaceRole::try_from(role) {
+        Ok(WorkspaceRole::Admin) => "admin",
+        Ok(WorkspaceRole::User) => "user",
+        _ => "unknown",
+    }
+}
+
+fn workspace_member_to_json(member: &openshell_core::proto::WorkspaceMember) -> serde_json::Value {
+    serde_json::json!({
+        "subject": member.principal_subject,
+        "role": workspace_member_role_name(member.role),
+    })
 }
 
 fn workspace_phase_str(workspace: &openshell_core::proto::Workspace) -> &'static str {
@@ -6924,6 +6994,7 @@ pub async fn sandbox_policy_list(
     server: &str,
     name: &str,
     limit: u32,
+    output: &str,
     workspace: &str,
     tls: &TlsOptions,
 ) -> Result<()> {
@@ -6941,6 +7012,11 @@ pub async fn sandbox_policy_list(
         .into_diagnostic()?;
 
     let revisions = resp.into_inner().revisions;
+    let structured = policy_revision_list_json("sandbox", Some(name), &revisions)?;
+    if crate::output::print_output_collection(output, &structured, Clone::clone)? {
+        return Ok(());
+    }
+
     if revisions.is_empty() {
         eprintln!("No policy history found for sandbox '{name}'");
         return Ok(());
@@ -6953,6 +7029,7 @@ pub async fn sandbox_policy_list(
 pub async fn sandbox_policy_list_global(
     server: &str,
     limit: u32,
+    output: &str,
     workspace: &str,
     tls: &TlsOptions,
 ) -> Result<()> {
@@ -6970,6 +7047,11 @@ pub async fn sandbox_policy_list_global(
         .into_diagnostic()?;
 
     let revisions = resp.into_inner().revisions;
+    let structured = policy_revision_list_json("global", None, &revisions)?;
+    if crate::output::print_output_collection(output, &structured, Clone::clone)? {
+        return Ok(());
+    }
+
     if revisions.is_empty() {
         eprintln!("No global policy history found");
         return Ok(());
@@ -6977,6 +7059,28 @@ pub async fn sandbox_policy_list_global(
 
     print_policy_revision_table(&revisions);
     Ok(())
+}
+
+fn policy_revision_list_json(
+    scope: &str,
+    sandbox: Option<&str>,
+    revisions: &[openshell_core::proto::SandboxPolicyRevision],
+) -> Result<Vec<serde_json::Value>> {
+    revisions
+        .iter()
+        .map(|revision| {
+            let status =
+                PolicyStatus::try_from(revision.status).unwrap_or(PolicyStatus::Unspecified);
+            policy_revision_to_json(
+                scope,
+                sandbox,
+                None,
+                revision,
+                status,
+                PolicyGetView::Metadata,
+            )
+        })
+        .collect()
 }
 
 fn print_policy_revision_table(revisions: &[openshell_core::proto::SandboxPolicyRevision]) {
@@ -7512,16 +7616,16 @@ fn format_endpoint(endpoint: &openshell_core::proto::NetworkEndpoint) -> String 
 #[cfg(test)]
 mod tests {
     use super::{
-        PolicyGetView, ProvisioningStep, build_sandbox_resource_limits,
+        PolicyGetView, ProvisioningStep, attached_provider_to_json, build_sandbox_resource_limits,
         dockerfile_sources_supported_for_gateway, format_endpoint, format_log_line,
         format_provider_attachment_table, git_sync_files, has_main_process_result,
         inferred_provider_type, parse_cli_setting_value, parse_credential_expiry_cli_value,
         parse_credential_expiry_pairs, parse_credential_pairs, parse_driver_config_json,
-        parse_secret_material_env_pairs, policy_revision_to_json,
+        parse_secret_material_env_pairs, policy_revision_list_json, policy_revision_to_json,
         provider_profile_allows_empty_credentials, provisioning_timeout_message,
         ready_false_condition_message, refresh_status_header, refresh_status_row, resolve_from,
-        sandbox_should_persist, sandbox_upload_plan, service_expose_status_error,
-        service_url_for_gateway,
+        sandbox_should_persist, sandbox_upload_plan, service_endpoint_to_json,
+        service_expose_status_error, service_url_for_gateway, workspace_member_to_json,
     };
     use crate::TEST_ENV_LOCK;
     use crate::commands::common::progress_step_from_metadata;
@@ -7538,12 +7642,13 @@ mod tests {
         PROGRESS_STEP_STARTING_SANDBOX,
     };
     use openshell_core::proto::{
-        GetSandboxConfigResponse, GpuResourceRequirements, PolicySource, PolicyStatus, Provider,
-        ProviderCredentialRefresh, ProviderCredentialRefreshRecoveryAction,
+        CredentialHandle, GetSandboxConfigResponse, GpuResourceRequirements, PolicySource,
+        PolicyStatus, Provider, ProviderCredentialRefresh, ProviderCredentialRefreshRecoveryAction,
         ProviderCredentialRefreshStatus, ProviderCredentialRefreshStrategy,
         ProviderCredentialTokenGrant, ProviderProfile, ProviderProfileCredential,
-        ResourceRequirements, Sandbox, SandboxCondition, SandboxPhase, SandboxPolicyRevision,
-        SandboxStatus, datamodel::v1::ObjectMeta,
+        ResourceRequirements, Sandbox, SandboxCondition, SandboxPhase, SandboxPolicy,
+        SandboxPolicyRevision, SandboxStatus, ServiceEndpoint, ServiceEndpointResponse,
+        WorkspaceMember, WorkspaceRole, datamodel::v1::ObjectMeta,
     };
 
     #[test]
@@ -7572,6 +7677,174 @@ mod tests {
             json["provenance"]["openshell.nvidia.com/policy-signature"],
             "signed"
         );
+    }
+
+    #[test]
+    fn policy_list_json_reuses_metadata_contract() {
+        let load_error = "policy failed after checking café.example/非常に長いパス";
+        let revisions = vec![SandboxPolicyRevision {
+            version: 7,
+            policy_hash: "0123456789abcdef".to_string(),
+            status: PolicyStatus::Failed as i32,
+            load_error: load_error.to_string(),
+            created_at_ms: 100,
+            loaded_at_ms: 200,
+            policy: Some(SandboxPolicy::default()),
+            provenance: std::collections::HashMap::from([(
+                "source".to_string(),
+                "provider-composition".to_string(),
+            )]),
+        }];
+
+        let values = policy_revision_list_json("sandbox", Some("dev"), &revisions)
+            .expect("policy list JSON");
+
+        assert_eq!(
+            values[0],
+            serde_json::json!({
+                "scope": "sandbox",
+                "sandbox": "dev",
+                "version": 7,
+                "hash": "0123456789abcdef",
+                "status": "failed",
+                "created_at_ms": 100,
+                "loaded_at_ms": 200,
+                "load_error": load_error,
+                "provenance": {"source": "provider-composition"},
+            })
+        );
+        assert!(values[0].get("policy").is_none());
+        assert!(values[0].get("active_version").is_none());
+
+        let unknown = policy_revision_list_json(
+            "global",
+            None,
+            &[SandboxPolicyRevision {
+                version: 8,
+                status: 999,
+                ..Default::default()
+            }],
+        )
+        .expect("global policy list JSON");
+        assert_eq!(unknown[0]["scope"], "global");
+        assert_eq!(unknown[0]["status"], "unspecified");
+        assert!(unknown[0].get("sandbox").is_none());
+    }
+
+    #[test]
+    fn attached_provider_json_is_sorted_and_secret_safe() {
+        let provider = Provider {
+            metadata: Some(ObjectMeta {
+                name: "github".to_string(),
+                ..Default::default()
+            }),
+            r#type: "github".to_string(),
+            credentials: std::collections::HashMap::from([
+                ("Z_TOKEN".to_string(), "inline-secret".to_string()),
+                ("SHARED".to_string(), "shared-secret".to_string()),
+            ]),
+            config: std::collections::HashMap::from([
+                ("Z_URL".to_string(), "https://secret.example".to_string()),
+                ("A_MODE".to_string(), "sensitive-config".to_string()),
+            ]),
+            credential_expires_at_ms: std::collections::HashMap::from([(
+                "Z_TOKEN".to_string(),
+                123,
+            )]),
+            profile_workspace: "internal".to_string(),
+            credential_handles: std::collections::HashMap::from([
+                (
+                    "A_HANDLE".to_string(),
+                    CredentialHandle {
+                        driver: "vault".to_string(),
+                        handle: "opaque-secret-handle".to_string(),
+                        metadata: std::collections::HashMap::from([(
+                            "internal".to_string(),
+                            "metadata-value".to_string(),
+                        )]),
+                    },
+                ),
+                ("SHARED".to_string(), CredentialHandle::default()),
+            ]),
+        };
+
+        let value = attached_provider_to_json(&provider);
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "name": "github",
+                "type": "github",
+                "credential_keys": ["A_HANDLE", "SHARED", "Z_TOKEN"],
+                "config_keys": ["A_MODE", "Z_URL"],
+            })
+        );
+        let serialized = value.to_string();
+        for secret in [
+            "inline-secret",
+            "shared-secret",
+            "https://secret.example",
+            "sensitive-config",
+            "opaque-secret-handle",
+            "metadata-value",
+            "internal",
+            "123",
+        ] {
+            assert!(!serialized.contains(secret), "leaked {secret}");
+        }
+    }
+
+    #[test]
+    fn service_endpoint_json_has_raw_fields_and_normalized_url() {
+        let response = ServiceEndpointResponse {
+            endpoint: Some(ServiceEndpoint {
+                metadata: Some(ObjectMeta {
+                    workspace: "team-a".to_string(),
+                    ..Default::default()
+                }),
+                sandbox_name: "api".to_string(),
+                service_name: String::new(),
+                target_port: 8080,
+                ..Default::default()
+            }),
+            url: "https://api.openshell.localhost:3000/".to_string(),
+        };
+
+        let value = service_endpoint_to_json(&response, "https://gateway.example:17670")
+            .expect("service endpoint JSON");
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "workspace": "team-a",
+                "sandbox": "api",
+                "service": "",
+                "target_port": 8080,
+                "url": "https://api.openshell.localhost:17670/",
+            })
+        );
+        assert!(service_endpoint_to_json(&ServiceEndpointResponse::default(), "unused").is_none());
+    }
+
+    #[test]
+    fn workspace_member_json_uses_stable_role_names() {
+        for (role, expected) in [
+            (WorkspaceRole::Admin as i32, "admin"),
+            (WorkspaceRole::User as i32, "user"),
+            (999, "unknown"),
+        ] {
+            let value = workspace_member_to_json(&WorkspaceMember {
+                metadata: Some(ObjectMeta {
+                    id: "internal-id".to_string(),
+                    ..Default::default()
+                }),
+                principal_subject: "oidc-subject".to_string(),
+                role,
+            });
+            assert_eq!(
+                value,
+                serde_json::json!({"subject": "oidc-subject", "role": expected})
+            );
+            assert!(!value.to_string().contains("internal-id"));
+        }
     }
 
     #[test]

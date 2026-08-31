@@ -861,6 +861,9 @@ openshell sandbox provider list provider-demo
 ```
 
 The list output includes provider name, provider type, credential key count, and config key count.
+Add `--output json` or `--output yaml` to return the provider name and type plus
+sorted `credential_keys` and `config_keys` arrays. Structured output never
+includes credential values, opaque credential handles, or config values.
 
 ## Policy Composition
 

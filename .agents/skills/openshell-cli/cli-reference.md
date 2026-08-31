@@ -57,17 +57,17 @@ openshell
 │   ├── download <name> <path> [dest]
 │   ├── ssh-config [name]
 │   └── provider
-│       ├── list [name]
+│       ├── list [name] [-o table|yaml|json]
 │       ├── attach <name> <provider>
 │       └── detach <name> <provider>
 ├── forward
 │   ├── start <port> [name] [-d]
 │   ├── stop <port> [name]
-│   ├── list
+│   ├── list [-o table|yaml|json]
 │   └── service [name] --target-port <port> [opts]
 ├── service
 │   ├── expose <sandbox> <target-port> [service]
-│   ├── list [sandbox]
+│   ├── list [sandbox] [-o table|yaml|json]
 │   ├── get <sandbox> [service]
 │   └── delete <sandbox> [service]
 ├── logs [name] [opts]
@@ -75,7 +75,7 @@ openshell
 │   ├── set [name] --policy <path> [--global] [--wait]
 │   ├── update [name] [opts]
 │   ├── get [name] [--full|--base] [--global]
-│   ├── list [name] [--global]
+│   ├── list [name] [--global] [-o table|yaml|json]
 │   ├── delete --global
 │   └── prove --policy <path> --credentials <path> [opts]
 ├── settings
@@ -107,6 +107,15 @@ openshell
 │   │   └── delete <id>
 │   ├── update <name> [opts]
 │   └── delete <name>...
+├── workspace
+│   ├── create <name>
+│   ├── get <name>
+│   ├── list [opts]
+│   ├── delete <name>...
+│   └── member
+│       ├── add --workspace <name> --subject <subject> --role <role>
+│       ├── remove --workspace <name> --subject <subject>
+│       └── list --workspace <name> [-o table|yaml|json]
 ├── doctor
 │   └── check
 ├── term
@@ -321,9 +330,12 @@ Print an SSH config `Host` block. The name defaults to the last-used sandbox.
 
 Manage providers on an existing sandbox:
 
-- `openshell sandbox provider list [name]`
+- `openshell sandbox provider list [name] [--output table|yaml|json]`
 - `openshell sandbox provider attach <name> <provider>`
 - `openshell sandbox provider detach <name> <provider>`
+
+Structured list output contains `name`, `type`, and sorted `credential_keys`
+and `config_keys` arrays. It excludes all credential, handle, and config values.
 
 ---
 
@@ -343,9 +355,15 @@ Start forwarding a local port to a sandbox.
 
 Stop a background port forward. When the sandbox name is omitted, it is inferred from active forwards.
 
-### `openshell forward list`
+### `openshell forward list [--output table|yaml|json]`
 
-List all active port forwards (sandbox, port, PID, status).
+List all tracked port forwards. Table output shows the sandbox, bind address,
+port, PID, and status. JSON and YAML output expose `sandbox`, `bind_address`,
+`port`, `pid`, and the boolean `alive`; an empty result is an empty collection.
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `-o`, `--output <FORMAT>` | `table` | Output format: `table`, `yaml`, or `json` |
 
 ### `openshell forward service [name] --target-port <port>`
 
@@ -364,9 +382,12 @@ Forward a local TCP port to a loopback service inside a sandbox over the gRPC re
 Gateway-managed HTTP service endpoints:
 
 - `openshell service expose <sandbox> <target-port> [service]`
-- `openshell service list [sandbox] [--limit N] [--offset N]`
+- `openshell service list [sandbox] [--limit N] [--offset N] [--output table|yaml|json]`
 - `openshell service get <sandbox> [service]`
 - `openshell service delete <sandbox> [service]`
+
+Structured list records contain `workspace`, `sandbox`, `service`,
+`target_port`, and `url`. Empty lists serialize as empty collections.
 
 ---
 
@@ -454,6 +475,11 @@ List policy revision history (version, hash, status, created, error).
 |------|---------|-------------|
 | `--limit <N>` | 20 | Max revisions to return |
 | `--global` | false | List global policy revisions |
+| `-o`, `--output <FORMAT>` | `table` | Output format: `table`, `yaml`, or `json` |
+
+Structured records use the policy metadata contract from `policy get`: scope,
+sandbox when applicable, version, full hash, normalized status, and available
+timestamps, load error, and provenance.
 
 ### `openshell policy delete --global`
 
@@ -483,6 +509,16 @@ Review agent-authored network rule proposals. This command group is intentionall
 - `openshell rule history [name]`
 
 Sandbox names default to the last-used sandbox. The CLI fetches and submits each proposal's current review token; a changed live candidate remains pending until it is reviewed again. Bulk approval of security-flagged proposals requires explicit `--include-security-flagged`.
+
+---
+
+## Workspace Member Commands
+
+### `openshell workspace member list --workspace <name>`
+
+List workspace members. Add `--output table|yaml|json` to select the format.
+Structured records contain `subject` and a normalized `role` of `admin`,
+`user`, or `unknown`; empty lists serialize as empty collections.
 
 ---
 

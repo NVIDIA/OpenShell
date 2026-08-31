@@ -121,6 +121,10 @@ openshell workspace member remove \
   --subject 'oidc-subject-for-user'
 ```
 
+Add `--output json` or `--output yaml` to list membership records for
+automation. Each record contains `subject` and a normalized `role` of `admin`,
+`user`, or `unknown`. An empty result is an empty collection.
+
 To change a member's role, remove the existing membership and add it again
 with the new role. A Platform Admin must perform any change to `admin`.
 

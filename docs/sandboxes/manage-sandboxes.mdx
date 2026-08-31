@@ -335,6 +335,17 @@ List endpoints for one sandbox:
 openshell service list my-sandbox
 ```
 
+Use structured output for automation:
+
+```shell
+openshell service list --output json
+openshell service list my-sandbox --output yaml
+```
+
+Each record contains `workspace`, `sandbox`, `service`, `target_port`, and
+`url`. The unnamed service uses an empty `service` string. An empty result is
+an empty collection.
+
 Show or delete one endpoint:
 
 ```shell
@@ -432,6 +443,18 @@ List and stop active forwards:
 openshell forward list
 openshell forward stop 8000 my-sandbox
 ```
+
+Use JSON or YAML output when inspecting tracked forwards from automation:
+
+```shell
+openshell forward list --output json
+openshell forward list --output yaml
+```
+
+Structured output includes `sandbox`, `bind_address`, `port`, `pid`, and
+`alive`. The `alive` boolean reports whether the tracked PID still matches the
+expected OpenShell SSH forward; it does not probe the forwarded socket. When no
+forwards are tracked, structured output returns an empty collection.
 
 <Tip>
 You can also forward a port at creation time with `--forward`:

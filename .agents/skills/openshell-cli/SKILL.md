@@ -333,9 +333,14 @@ provider instead of passing API keys, tokens, or other secrets to `sandbox exec`
 
 ```bash
 openshell sandbox provider list my-sandbox
+openshell sandbox provider list my-sandbox --output json
 openshell sandbox provider attach my-sandbox my-github
 openshell sandbox provider detach my-sandbox my-github
 ```
+
+Structured attachment output contains provider names, types, and sorted
+credential and config key names. It never contains credential, handle, or
+config values.
 
 ### View logs
 
@@ -498,6 +503,7 @@ View all revisions to understand how the policy evolved:
 
 ```bash
 openshell policy list dev --limit 50
+openshell policy list dev --output json
 ```
 
 Fetch a specific historical revision:
@@ -575,6 +581,17 @@ openshell forward stop 8080 my-app
 openshell sandbox delete my-app
 openshell sandbox create --from ./Dockerfile --name my-app --forward 8080
 ```
+
+Use structured output when automation needs the tracked forward metadata and
+validated process state:
+
+```bash
+openshell forward list --output json
+```
+
+Each record includes `sandbox`, `bind_address`, `port`, `pid`, and `alive`.
+The `alive` boolean validates the tracked process identity; it does not probe
+the forwarded socket.
 
 Create and forward in one command:
 
@@ -738,6 +755,7 @@ openshell forward service my-app --target-port 8000 --local 127.0.0.1:0
 # Expose and manage an HTTP service through the gateway.
 openshell service expose my-app 8080 web
 openshell service list my-app
+openshell service list my-app --output json
 openshell service get my-app web
 openshell service delete my-app web
 ```

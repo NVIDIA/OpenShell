@@ -1686,7 +1686,7 @@ async fn sandbox_provider_cli_run_functions_wire_requests_and_idempotent_results
     )
     .await
     .expect("sandbox provider attach is idempotent");
-    run::sandbox_provider_list(&ts.endpoint, "dev-sandbox", "default", &ts.tls)
+    run::sandbox_provider_list(&ts.endpoint, "dev-sandbox", "table", "default", &ts.tls)
         .await
         .expect("sandbox provider list");
     run::sandbox_provider_detach(

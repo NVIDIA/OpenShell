@@ -742,7 +742,7 @@ fn normalize_completion_script(output: Vec<u8>, executable: &std::path::Path) ->
     Ok(script.replace(executable.to_string_lossy().as_ref(), "openshell"))
 }
 
-#[derive(Clone, Debug, ValueEnum)]
+#[derive(Clone, Debug, PartialEq, Eq, ValueEnum)]
 enum OutputFormat {
     Table,
     Yaml,
@@ -1691,6 +1691,10 @@ enum SandboxProviderCommands {
         /// Sandbox name (defaults to last-used sandbox).
         #[arg(add = ArgValueCompleter::new(completers::complete_sandbox_names))]
         name: Option<String>,
+
+        /// Output format.
+        #[arg(short = 'o', long = "output", value_enum, default_value_t = OutputFormat::Table)]
+        output: OutputFormat,
     },
 
     /// Attach a provider to a sandbox.
@@ -1905,6 +1909,10 @@ enum PolicyCommands {
         /// List global policy revisions.
         #[arg(long)]
         global: bool,
+
+        /// Output format.
+        #[arg(short = 'o', long = "output", value_enum, default_value_t = OutputFormat::Table)]
+        output: OutputFormat,
     },
 
     /// Delete the gateway-global policy lock, restoring sandbox-level policy control.
@@ -2011,9 +2019,13 @@ enum ForwardCommands {
         name: Option<String>,
     },
 
-    /// List active port forwards.
+    /// List tracked port forwards.
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
-    List,
+    List {
+        /// Output format.
+        #[arg(short = 'o', long = "output", value_enum, default_value_t = OutputFormat::Table)]
+        output: OutputFormat,
+    },
 
     /// Forward a local TCP port to a loopback service inside a sandbox over gRPC.
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
@@ -2071,6 +2083,10 @@ enum ServiceCommands {
         /// List services across all workspaces (overrides --workspace).
         #[arg(long)]
         all_workspaces: bool,
+
+        /// Output format.
+        #[arg(short = 'o', long = "output", value_enum, default_value_t = OutputFormat::Table)]
+        output: OutputFormat,
     },
 
     /// Show one exposed sandbox service endpoint.
@@ -2195,6 +2211,10 @@ enum WorkspaceMemberCommands {
         /// Offset into the member list.
         #[arg(long, default_value_t = 0)]
         offset: u32,
+
+        /// Output format.
+        #[arg(short = 'o', long = "output", value_enum, default_value_t = OutputFormat::Table)]
+        output: OutputFormat,
     },
 }
 
@@ -2445,8 +2465,23 @@ async fn run_async() -> Result<()> {
                     );
                 }
             }
-            ForwardCommands::List => {
+            ForwardCommands::List { output } => {
                 let forwards = run::list_forwards()?;
+                if openshell_cli::output::print_output_collection(
+                    output.as_str(),
+                    &forwards,
+                    |forward| {
+                        serde_json::json!({
+                            "sandbox": forward.sandbox_name,
+                            "bind_address": forward.bind_addr,
+                            "port": forward.port,
+                            "pid": forward.pid,
+                            "alive": forward.validated_alive,
+                        })
+                    },
+                )? {
+                    return Ok(());
+                }
                 if forwards.is_empty() {
                     eprintln!("No active forwards.");
                 } else {
@@ -2574,6 +2609,7 @@ async fn run_async() -> Result<()> {
                     limit,
                     offset,
                     all_workspaces,
+                    output,
                 } => {
                     run::service_list(
                         &ctx.endpoint,
@@ -2582,6 +2618,7 @@ async fn run_async() -> Result<()> {
                         offset,
                         &cli.workspace,
                         all_workspaces,
+                        output.as_str(),
                         &tls,
                     )
                     .await?;
@@ -2745,14 +2782,28 @@ async fn run_async() -> Result<()> {
                     name,
                     limit,
                     global,
+                    output,
                 } => {
                     if global {
-                        run::sandbox_policy_list_global(&ctx.endpoint, limit, &cli.workspace, &tls)
-                            .await?;
+                        run::sandbox_policy_list_global(
+                            &ctx.endpoint,
+                            limit,
+                            output.as_str(),
+                            &cli.workspace,
+                            &tls,
+                        )
+                        .await?;
                     } else {
                         let name = resolve_sandbox_name(name, &ctx.name, &cli.workspace)?;
-                        run::sandbox_policy_list(&ctx.endpoint, &name, limit, &cli.workspace, &tls)
-                            .await?;
+                        run::sandbox_policy_list(
+                            &ctx.endpoint,
+                            &name,
+                            limit,
+                            output.as_str(),
+                            &cli.workspace,
+                            &tls,
+                        )
+                        .await?;
                     }
                 }
                 PolicyCommands::Delete { global, yes } => {
@@ -3289,10 +3340,16 @@ async fn run_async() -> Result<()> {
                             run::print_ssh_config(&ctx.name, &name, &cli.workspace);
                         }
                         SandboxCommands::Provider(command) => match command {
-                            SandboxProviderCommands::List { name } => {
+                            SandboxProviderCommands::List { name, output } => {
                                 let name = resolve_sandbox_name(name, &ctx.name, &cli.workspace)?;
-                                run::sandbox_provider_list(endpoint, &name, &cli.workspace, &tls)
-                                    .await?;
+                                run::sandbox_provider_list(
+                                    endpoint,
+                                    &name,
+                                    output.as_str(),
+                                    &cli.workspace,
+                                    &tls,
+                                )
+                                .await?;
                             }
                             SandboxProviderCommands::Attach { name, provider } => {
                                 run::sandbox_provider_attach(
@@ -3373,9 +3430,17 @@ async fn run_async() -> Result<()> {
                         workspace,
                         limit,
                         offset,
+                        output,
                     } => {
-                        run::workspace_member_list(endpoint, &workspace, limit, offset, &tls)
-                            .await?;
+                        run::workspace_member_list(
+                            endpoint,
+                            &workspace,
+                            limit,
+                            offset,
+                            output.as_str(),
+                            &tls,
+                        )
+                        .await?;
                     }
                 },
             }
@@ -4525,6 +4590,152 @@ mod tests {
                 }))
             }) if id == "custom-api"
         ));
+    }
+
+    #[test]
+    fn forward_list_default_output_is_table() {
+        let cli = Cli::try_parse_from(["openshell", "forward", "list"])
+            .expect("forward list should parse");
+
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Forward {
+                command: Some(ForwardCommands::List {
+                    output: OutputFormat::Table,
+                })
+            })
+        ));
+    }
+
+    #[test]
+    fn forward_list_accepts_structured_output() {
+        for (format, expected) in [("json", OutputFormat::Json), ("yaml", OutputFormat::Yaml)] {
+            let cli = Cli::try_parse_from(["openshell", "forward", "list", "-o", format])
+                .unwrap_or_else(|error| panic!("forward list -o {format} should parse: {error}"));
+
+            let Some(Commands::Forward {
+                command: Some(ForwardCommands::List { output }),
+            }) = cli.command
+            else {
+                panic!("expected forward list command");
+            };
+            assert_eq!(output, expected, "unexpected output format for {format}");
+        }
+    }
+
+    #[test]
+    fn remaining_list_commands_default_output_to_table() {
+        let sandbox_provider = Cli::try_parse_from(["openshell", "sandbox", "provider", "list"])
+            .expect("sandbox provider list should parse");
+        assert!(matches!(
+            sandbox_provider.command,
+            Some(Commands::Sandbox {
+                command: Some(SandboxCommands::Provider(SandboxProviderCommands::List {
+                    output: OutputFormat::Table,
+                    ..
+                })),
+            })
+        ));
+
+        let policy =
+            Cli::try_parse_from(["openshell", "policy", "list"]).expect("policy list should parse");
+        assert!(matches!(
+            policy.command,
+            Some(Commands::Policy {
+                command: Some(PolicyCommands::List {
+                    output: OutputFormat::Table,
+                    ..
+                }),
+            })
+        ));
+
+        let service = Cli::try_parse_from(["openshell", "service", "list"])
+            .expect("service list should parse");
+        assert!(matches!(
+            service.command,
+            Some(Commands::Service {
+                command: Some(ServiceCommands::List {
+                    output: OutputFormat::Table,
+                    ..
+                }),
+            })
+        ));
+
+        let workspace_member = Cli::try_parse_from([
+            "openshell",
+            "workspace",
+            "member",
+            "list",
+            "--workspace",
+            "default",
+        ])
+        .expect("workspace member list should parse");
+        assert!(matches!(
+            workspace_member.command,
+            Some(Commands::Workspace {
+                command: Some(WorkspaceCommands::Member(WorkspaceMemberCommands::List {
+                    output: OutputFormat::Table,
+                    ..
+                })),
+            })
+        ));
+    }
+
+    #[test]
+    fn remaining_list_commands_accept_structured_output() {
+        for (format, expected) in [("json", OutputFormat::Json), ("yaml", OutputFormat::Yaml)] {
+            let sandbox_provider =
+                Cli::try_parse_from(["openshell", "sandbox", "provider", "list", "-o", format])
+                    .unwrap_or_else(|error| panic!("sandbox provider list -o {format}: {error}"));
+            let Some(Commands::Sandbox {
+                command:
+                    Some(SandboxCommands::Provider(SandboxProviderCommands::List { output, .. })),
+            }) = sandbox_provider.command
+            else {
+                panic!("expected sandbox provider list command");
+            };
+            assert_eq!(output, expected);
+
+            let policy = Cli::try_parse_from(["openshell", "policy", "list", "--output", format])
+                .unwrap_or_else(|error| panic!("policy list --output {format}: {error}"));
+            let Some(Commands::Policy {
+                command: Some(PolicyCommands::List { output, .. }),
+            }) = policy.command
+            else {
+                panic!("expected policy list command");
+            };
+            assert_eq!(output, expected);
+
+            let service = Cli::try_parse_from(["openshell", "service", "list", "-o", format])
+                .unwrap_or_else(|error| panic!("service list -o {format}: {error}"));
+            let Some(Commands::Service {
+                command: Some(ServiceCommands::List { output, .. }),
+            }) = service.command
+            else {
+                panic!("expected service list command");
+            };
+            assert_eq!(output, expected);
+
+            let workspace_member = Cli::try_parse_from([
+                "openshell",
+                "workspace",
+                "member",
+                "list",
+                "--workspace",
+                "default",
+                "-o",
+                format,
+            ])
+            .unwrap_or_else(|error| panic!("workspace member list -o {format}: {error}"));
+            let Some(Commands::Workspace {
+                command:
+                    Some(WorkspaceCommands::Member(WorkspaceMemberCommands::List { output, .. })),
+            }) = workspace_member.command
+            else {
+                panic!("expected workspace member list command");
+            };
+            assert_eq!(output, expected);
+        }
     }
 
     #[test]

@@ -232,6 +232,11 @@ The following steps outline the hot-reload policy update workflow.
    openshell policy list <name>
    ```
 
+   Add `--output json` or `--output yaml` for automation. Structured policy
+   history contains the scope, sandbox name when applicable, version, full
+   hash, status, and available revision timestamps, load error, and provenance.
+   Use `openshell policy list --global --output json` for global history.
+
 ### Validation failures
 
 OpenShell validates a complete candidate policy before activating any part of it. Endpoints may overlap when their connection and request-processing metadata agree. For example, two `api.example.com:443` REST entries can contribute different allow and deny rules when they use the same TLS, destination, credential, parser, and enforcement settings. A plain L4 endpoint may overlap an L7 endpoint because it authorizes the destination without contributing request-processing metadata. A more-specific path endpoint may override request-processing metadata from a broader endpoint, such as a `/graphql` GraphQL endpoint alongside a general REST endpoint for the same host. OpenShell rejects the candidate when overlapping exact or wildcard host selectors can both contribute equally specific endpoint configuration and disagree on those fields.
