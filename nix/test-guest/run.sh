@@ -12,8 +12,8 @@ Usage:
   nix run .#test-guest -- --distro DISTRO [OPTIONS] [-- COMMAND...]
 
 Options:
-  --distro NAME       Base distro: ubuntu, centos, fedora, or rocky
-  --with NAME         Apply a configuration; repeatable (docker, podman, selinux, snapd)
+	  --distro NAME       Base distro: ubuntu-24-04, ubuntu-26-04, centos, fedora, or rocky
+	  --with NAME         Apply a configuration; repeatable (docker, podman, podman-rootless, selinux, snapd)
   --install PATH      Install a .deb or .rpm package; repeatable
   --copy SRC:DEST     Copy a regular file to an absolute guest path, preserving
                       its host mode; repeatable
@@ -49,7 +49,7 @@ preserved_file_mode() {
 	local source_mode
 
 	if [ "$(uname -s)" = Darwin ]; then
-		if ! source_mode=$(stat -f '%Lp' "${source_path}"); then
+		if ! source_mode=$(/usr/bin/stat -f '%Lp' "${source_path}"); then
 			echo "could not determine mode for --copy source: ${source_path}" >&2
 			return 1
 		fi
