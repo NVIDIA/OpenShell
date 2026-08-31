@@ -3249,6 +3249,13 @@ impl ComputeRuntime {
             .await
             .map_err(|e| e.to_string())?;
         if let Some(sandbox) = sandbox.as_ref() {
+            // The watcher told us this sandbox's compute resource is gone, so
+            // no request-side DeleteSandbox call is coming — release
+            // driver-owned resources in the background. Watch events are
+            // processed sequentially, so this must not block on the driver
+            // call itself, only on the (instant, non-blocking) decision to
+            // make it.
+            self.spawn_driver_sandbox_cleanup(sandbox.object_id(), sandbox.object_name());
             self.cleanup_sandbox_owned_records(sandbox).await?;
         }
 
@@ -3298,6 +3305,97 @@ impl ComputeRuntime {
         }
 
         Ok(())
+    }
+
+    /// Best-effort driver-side cleanup for a sandbox discovered gone
+    /// out-of-band during the periodic prune sweep, rather than through an
+    /// explicit `DeleteSandbox` request.
+    ///
+    /// Skips the driver call entirely if a request-side lifecycle operation
+    /// (e.g. an in-flight explicit delete) already holds this sandbox's
+    /// lifecycle gate: that operation already owns driver-side cleanup for
+    /// it, and calling `DeleteSandbox` again here would race its own
+    /// in-flight call. Awaited inline: the prune sweep already makes a
+    /// blocking `GetSandbox` call per sandbox as part of its normal
+    /// operation, unlike the watch loop (see `spawn_driver_sandbox_cleanup`).
+    async fn cleanup_driver_sandbox_resources(&self, sandbox_id: &str, sandbox_name: &str) {
+        let gate = self.lifecycle_gates.gate_for(sandbox_id);
+        let Ok(_guard) = gate.try_lock_owned() else {
+            debug!(
+                sandbox_id,
+                sandbox_name,
+                "Skipping driver cleanup while a lifecycle operation is already in flight for this sandbox"
+            );
+            return;
+        };
+
+        self.call_driver_delete_sandbox(sandbox_id, sandbox_name)
+            .await;
+    }
+
+    /// Same lifecycle-gate-guarded driver cleanup as
+    /// `cleanup_driver_sandbox_resources`, but for the watch path: the
+    /// actual `DeleteSandbox` call is deferred to a background task rather
+    /// than awaited inline. Watch events are processed sequentially, so a
+    /// slow or stuck driver call here must never delay notifying
+    /// subscribers of other sandboxes (see `LifecycleGateRegistry`).
+    ///
+    /// The gate itself is still checked — and, on success, held for the
+    /// background call's duration — synchronously before returning, so this
+    /// cannot race a concurrent request-side operation for the same
+    /// sandbox; only the potentially-slow RPC is backgrounded.
+    fn spawn_driver_sandbox_cleanup(&self, sandbox_id: &str, sandbox_name: &str) {
+        let gate = self.lifecycle_gates.gate_for(sandbox_id);
+        let Ok(guard) = gate.try_lock_owned() else {
+            debug!(
+                sandbox_id,
+                sandbox_name,
+                "Skipping driver cleanup while a lifecycle operation is already in flight for this sandbox"
+            );
+            return;
+        };
+
+        let runtime = self.clone();
+        let sandbox_id = sandbox_id.to_string();
+        let sandbox_name = sandbox_name.to_string();
+        tokio::spawn(async move {
+            let _guard = guard;
+            runtime
+                .call_driver_delete_sandbox(&sandbox_id, &sandbox_name)
+                .await;
+        });
+    }
+
+    /// `DeleteSandbox` is idempotent: drivers must reclaim owned
+    /// secrets/volumes/etc. even when the underlying compute resource is
+    /// already gone. Failures here are logged, not propagated — callers
+    /// already consider this sandbox gone, so a driver hiccup must not
+    /// block store cleanup.
+    async fn call_driver_delete_sandbox(&self, sandbox_id: &str, sandbox_name: &str) {
+        let result = self
+            .driver
+            .call("driver.delete_sandbox", Some(sandbox_id), |driver| {
+                let sandbox_id = sandbox_id.to_string();
+                let sandbox_name = sandbox_name.to_string();
+                async move {
+                    driver
+                        .delete_sandbox(Request::new(DeleteSandboxRequest {
+                            sandbox_id,
+                            sandbox_name,
+                        }))
+                        .await
+                }
+            })
+            .await;
+
+        if let Err(status) = result {
+            warn!(
+                sandbox_id,
+                sandbox_name,
+                error = %status,
+                "Failed to release driver-owned resources while cleaning up a sandbox discovered gone out-of-band"
+            );
+        }
     }
 
     async fn cleanup_sandbox_ssh_sessions(
@@ -3553,6 +3651,11 @@ impl ComputeRuntime {
             age_secs = age_ms / 1000,
             "Removing sandbox from store after it disappeared from the compute driver snapshot"
         );
+        // The driver's own snapshot never reported this sandbox, so no
+        // request-side DeleteSandbox call is coming for it either — release
+        // driver-owned resources here, before the store record disappears.
+        self.cleanup_driver_sandbox_resources(&sandbox_id, &sandbox_name)
+            .await;
         self.apply_deleted_if_version_locked(&sandbox, expected_resource_version)
             .await
     }
@@ -4984,6 +5087,7 @@ mod tests {
         delete_release: Semaphore,
         delete_blocked: AtomicBool,
         delete_calls: AtomicUsize,
+        delete_requests: TestMutex<Vec<(String, String)>>,
         delete_outcome: TestMutex<ControlledDeleteOutcome>,
         stop_started: Notify,
         stop_finished: Notify,
@@ -5016,6 +5120,7 @@ mod tests {
                 delete_release: Semaphore::new(0),
                 delete_blocked: AtomicBool::new(false),
                 delete_calls: AtomicUsize::new(0),
+                delete_requests: TestMutex::new(Vec::new()),
                 delete_outcome: TestMutex::new(ControlledDeleteOutcome::Ok(true)),
                 stop_started: Notify::new(),
                 stop_finished: Notify::new(),
@@ -5097,6 +5202,13 @@ mod tests {
 
         fn delete_calls(&self) -> usize {
             self.delete_calls.load(Ordering::SeqCst)
+        }
+
+        fn delete_requests(&self) -> Vec<(String, String)> {
+            self.delete_requests
+                .lock()
+                .expect("delete requests lock poisoned")
+                .clone()
         }
 
         fn stop_calls(&self) -> usize {
@@ -5286,8 +5398,13 @@ mod tests {
 
         async fn delete_sandbox(
             &self,
-            _request: Request<DeleteSandboxRequest>,
+            request: Request<DeleteSandboxRequest>,
         ) -> Result<tonic::Response<DeleteSandboxResponse>, Status> {
+            let request = request.into_inner();
+            self.delete_requests
+                .lock()
+                .expect("delete requests lock poisoned")
+                .push((request.sandbox_id, request.sandbox_name));
             self.delete_calls.fetch_add(1, Ordering::SeqCst);
             self.delete_started.notify_one();
             if self.delete_blocked.load(Ordering::SeqCst) {
@@ -7972,6 +8089,107 @@ mod tests {
             watch_rx.try_recv(),
             Err(tokio::sync::broadcast::error::TryRecvError::Closed)
         ));
+    }
+
+    #[tokio::test]
+    async fn apply_deleted_releases_driver_resources_for_out_of_band_removal() {
+        // Regression test for #2352: a container removed without going
+        // through OpenShell's own DeleteSandbox (e.g. `podman rm -f`) must
+        // still release driver-owned secrets/volumes, not just the store
+        // record. This never calls `runtime.delete_sandbox`, matching the
+        // out-of-band removal the issue reports.
+        let driver = ControlledDriver::new();
+        let runtime = test_runtime(driver.clone()).await;
+        let sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Ready);
+        runtime.store.put_message(&sandbox).await.unwrap();
+        let session = seed_sandbox_owned_records(&runtime, &sandbox).await;
+
+        assert_eq!(driver.delete_calls(), 0);
+
+        runtime.apply_deleted("sb-1").await.unwrap();
+
+        // The driver call is backgrounded (see `spawn_driver_sandbox_cleanup`)
+        // so it can't block the watch loop; wait for it to actually land
+        // before asserting on it.
+        tokio::time::timeout(Duration::from_secs(1), driver.delete_started.notified())
+            .await
+            .expect("background driver cleanup did not run");
+        assert_eq!(
+            driver.delete_requests(),
+            vec![("sb-1".to_string(), "sandbox-a".to_string())]
+        );
+        assert_sandbox_owned_records(&runtime, &sandbox, &session, false).await;
+        assert!(
+            runtime
+                .store
+                .get_message::<Sandbox>("sb-1")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_deleted_removes_store_record_even_when_driver_cleanup_fails() {
+        // The driver has already told us (via the watch/prune path that led
+        // here) that this sandbox is gone. A failure releasing its
+        // secrets/volumes must be logged, not block store cleanup — retrying
+        // forever on a driver hiccup would leave the store permanently out
+        // of sync with reality.
+        let driver = ControlledDriver::new();
+        driver.set_delete_outcome(ControlledDeleteOutcome::Error("podman unreachable"));
+        let runtime = test_runtime(driver.clone()).await;
+        let sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Ready);
+        runtime.store.put_message(&sandbox).await.unwrap();
+
+        runtime.apply_deleted("sb-1").await.unwrap();
+
+        // Store cleanup happens synchronously in `apply_deleted_locked`, so
+        // this is already true even though the driver call is backgrounded.
+        assert!(
+            runtime
+                .store
+                .get_message::<Sandbox>("sb-1")
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        tokio::time::timeout(Duration::from_secs(1), driver.delete_started.notified())
+            .await
+            .expect("background driver cleanup did not run");
+        assert_eq!(driver.delete_calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn prune_missing_sandbox_releases_driver_resources() {
+        // Regression test for #2352's second reproduction: a sandbox whose
+        // container never survived to exist at all (e.g. the gateway was
+        // killed mid-create) is discovered missing by the periodic sweep,
+        // not the watcher. That path must also release driver resources.
+        let driver = ControlledDriver::new();
+        driver.set_get_outcome(ControlledGetOutcome::Missing);
+        let runtime = test_runtime(driver.clone()).await;
+        let sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Provisioning);
+        runtime.store.put_message(&sandbox).await.unwrap();
+
+        runtime
+            .reconcile_store_with_backend(Duration::ZERO)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            driver.delete_requests(),
+            vec![("sb-1".to_string(), "sandbox-a".to_string())]
+        );
+        assert!(
+            runtime
+                .store
+                .get_message::<Sandbox>("sb-1")
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]

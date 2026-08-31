@@ -209,6 +209,19 @@ synchronously. Sandbox row removal remains bound to the stable ID and resource
 version. Settings retain their existing best-effort name-based cleanup; SSH
 sessions, indexes, and watch/log buses are cleaned after confirmed removal.
 
+When a sandbox is instead discovered gone out-of-band — a watcher deletion
+event, or the periodic prune sweep finding no matching driver resource, with
+no explicit `DeleteSandbox` request involved at all — the gateway also
+releases driver-owned resources (for example Podman's per-sandbox secrets and
+workspace volume) by calling the driver's idempotent `DeleteSandbox`, not just
+gateway state. Both paths skip that call when a request-side lifecycle
+operation already holds the sandbox's gate, since that operation already owns
+driver-side cleanup. The watch path defers the call itself to a background
+task after a non-blocking gate check, so a slow driver call cannot stall the
+sequential watch loop; the prune sweep calls the driver inline, since it
+already makes a blocking `GetSandbox` call per sandbox as part of its normal
+operation.
+
 The request acquires both locks before starting owned work, so cancellation
 while queued does not leave a delete armed. After that commitment point, the
 owned task prevents cancellation from stranding a mutation. A gateway restart
