@@ -26,3 +26,5 @@ image_pull_policy = "missing"
 network_name = "openshell-e2e"
 grpc_endpoint = "http://host.containers.internal:8080"
 supervisor_image = "localhost/openshell/supervisor:e2e-vm"
+# Keep rootless Podman E2E teardown bounded.
+stop_timeout_secs = 15
