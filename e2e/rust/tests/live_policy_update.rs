@@ -56,6 +56,11 @@ ENV OPENSHELL_POLICY_POLL_INTERVAL_SECS=1
 CMD ["sleep", "infinity"]
 "#;
 
+const SPARSE_POLICY: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../examples/policy-advisor/sandbox-policy.yaml"
+));
+
 // ---------------------------------------------------------------------------
 // Policy YAML builders
 // ---------------------------------------------------------------------------
@@ -140,6 +145,15 @@ landlock:
 ";
 
     file.write_all(policy.as_bytes())
+        .map_err(|e| format!("write temp policy file: {e}"))?;
+    file.flush()
+        .map_err(|e| format!("flush temp policy file: {e}"))?;
+    Ok(file)
+}
+
+fn write_sparse_policy() -> Result<NamedTempFile, String> {
+    let mut file = NamedTempFile::new().map_err(|e| format!("create temp policy file: {e}"))?;
+    file.write_all(SPARSE_POLICY.as_bytes())
         .map_err(|e| format!("write temp policy file: {e}"))?;
     file.flush()
         .map_err(|e| format!("flush temp policy file: {e}"))?;
@@ -521,18 +535,18 @@ async fn live_policy_update_from_empty_network_policies() {
 /// no revision remaining `Pending` once the acknowledgement lands.
 #[tokio::test]
 async fn initial_sparse_policy_is_acknowledged_as_loaded() {
-    // Repo-relative path to the sparse network-only policy fixture.
-    let sparse_policy = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../examples/policy-advisor/sandbox-policy.yaml"
-    );
+    let sparse_policy = write_sparse_policy().expect("write sparse policy fixture");
+    let sparse_policy_path = sparse_policy
+        .path()
+        .to_str()
+        .expect("sparse policy path is not UTF-8");
 
     let mut guard = SandboxGuard::create_keep_with_args(
         &[
             "--name",
             "e2e-sparse-enrich",
             "--policy",
-            sparse_policy,
+            sparse_policy_path,
             "--no-tty",
         ],
         &["sh", "-c", "echo Ready && sleep infinity"],
