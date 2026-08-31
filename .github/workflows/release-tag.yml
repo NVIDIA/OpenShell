@@ -203,16 +203,14 @@ jobs:
       conformance-artifact-prefix: openshell-conformance
 
   podman-e2e:
-    needs: [compute-versions, build-cli, build-conformance, build-gateway, build-supervisor-image]
+    needs: [compute-versions, build-cli, build-gateway, build-sandbox]
     permissions:
       actions: read
       contents: read
       packages: read
     uses: ./.github/workflows/e2e-podman-test.yml
     with:
-      image-tag: ${{ needs.compute-versions.outputs.source_sha }}
       checkout-ref: ${{ inputs.tag || github.ref }}
-      conformance-artifact-prefix: openshell-conformance
 
   vm-e2e:
     needs: [compute-versions, build-cli, build-conformance, build-gateway, build-vm-driver]
