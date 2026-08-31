@@ -335,7 +335,7 @@ jobs:
       matrix:
         include:
           - agent_sandbox_api: v1beta1
-            agent_sandbox_version: v0.5.0
+            agent_sandbox_version: v0.5.4
             topology: combined
             extra_helm_values: ""
           - agent_sandbox_api: v1alpha1
@@ -343,7 +343,7 @@ jobs:
             topology: combined
             extra_helm_values: ""
           - agent_sandbox_api: v1beta1
-            agent_sandbox_version: v0.5.0
+            agent_sandbox_version: v0.5.4
             topology: sidecar
             extra_helm_values: deploy/helm/openshell/ci/values-sidecar.yaml
     permissions:

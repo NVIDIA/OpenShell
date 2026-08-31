@@ -4279,9 +4279,10 @@ fn derive_phase(status: Option<&DriverSandboxStatus>) -> SandboxPhase {
         }
 
         // `Ready=True` means the sandbox is usable through this gateway and must
-        // win over a `Suspended=True` condition. Agent Sandbox v1beta1 sets
-        // `Suspended=True (PodTerminated)` on stop and does not clear it on resume,
-        // so a resumed CR carries both `Ready=True` and a stale `Suspended=True`.
+        // win over a `Suspended=True` condition. Older Agent Sandbox v1beta1
+        // releases set `Suspended=True (PodTerminated)` on stop and do not clear it
+        // on resume, so a resumed CR carries both `Ready=True` and a stale
+        // `Suspended=True`.
         // Treating any `Suspended=True` as Stopped would pin the resumed sandbox at
         // Starting forever (issue #2932). A genuine stop leaves `Ready` unset or
         // False, so `Suspended` still resolves to Stopped in that case.
@@ -6065,6 +6066,31 @@ mod tests {
                 last_transition_time: String::new(),
             }],
             ..make_driver_status(make_driver_condition("", ""))
+        };
+
+        assert_eq!(derive_phase(Some(&status)), SandboxPhase::Ready);
+    }
+
+    #[test]
+    fn derive_phase_returns_ready_for_v054_running_conditions() {
+        let status = DriverSandboxStatus {
+            conditions: vec![
+                DriverCondition {
+                    r#type: "Suspended".to_string(),
+                    status: "False".to_string(),
+                    reason: "NotSuspended".to_string(),
+                    message: "Sandbox is not suspended".to_string(),
+                    last_transition_time: String::new(),
+                },
+                DriverCondition {
+                    r#type: "Ready".to_string(),
+                    status: "True".to_string(),
+                    reason: "DependenciesReady".to_string(),
+                    message: "Pod is Ready; Service Exists".to_string(),
+                    last_transition_time: String::new(),
+                },
+            ],
+            ..Default::default()
         };
 
         assert_eq!(derive_phase(Some(&status)), SandboxPhase::Ready);

@@ -214,7 +214,7 @@ jobs:
       RELEASE_NAME: openshell
       RELEASE_NAMESPACE: openshell
       KIND_GATEWAY_NAME: kind
-      AGENT_SANDBOX_VERSION: v0.5.0
+      AGENT_SANDBOX_VERSION: v0.5.4
     steps:
       - name: Checkout Agent Sandbox helper
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
