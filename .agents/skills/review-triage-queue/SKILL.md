@@ -17,7 +17,7 @@ Use these ignored local paths:
 
 On the first run, ask for the triage-duty start date and store it. Do not infer it. Use that date as the initial Slack baseline. Update source cursors only after the report is complete. Search with an overlap window and deduplicate source items.
 
-Keep the checkpoint minimal: duty-period start, last successful scan, source cursors, and explicit local dispositions. Never store copied Slack content, credentials, or personal data.
+Keep the checkpoint minimal: duty-period start, last successful scan, source cursors, explicit local dispositions, and the next issue in the report-local triage continuation order. Never store copied Slack content, credentials, or personal data.
 
 Read unchecked inbox entries at the start of every review. Treat them as local
 follow-up prompts, not as independent evidence or authorization for an external
@@ -53,6 +53,19 @@ Recommend work for repeated questions, defects, documentation/support gaps, requ
 
 Classify recommendations as bug, feature, documentation/support improvement, duplicate, intake-gap routing, release blocker, or security finding. The agent may infer a release blocker only with concrete evidence, source links, and confidence. Keep `critical` for security findings and release blockers; use `high`, `normal`, or `low` for all other items. Set confidence to `high`, `medium`, or `low`, and explain uncertainty unless it is high.
 
+## Resume an in-progress triage pass
+
+When the on-duty engineer asks for the “next issue” without asking for a new
+queue review, resume from the latest local report's **Triage queue** order.
+Select the first item that has not been explicitly dispositioned in local duty
+state. Do not query live GitHub data to silently reorder an in-progress pass:
+newly opened or newly updated issues belong in the next queue review.
+
+An engineer can explicitly request a refresh or the newest live issue; either
+request supersedes the report-local continuation order. If the report has no
+remaining listed candidate, say so and offer a fresh queue review rather than
+choosing an item from an older overflow list.
+
 ## Write the report
 
 Create a dated immutable report. Include generation time, duty-period start, source/checkpoint coverage, and scan limitations. Use links and short paraphrases only.
@@ -60,7 +73,7 @@ Create a dated immutable report. Include generation time, duty-period start, sou
 Include these sections:
 
 1. **Needs your decision** — at most five decision-worthy recommendations. Each entry has report-local ID (`R-01`...), priority, classification, concise proposed action, confidence, linked evidence, applicable public-doc links or `none found`, and current disposition.
-2. **Triage queue** — state the total count of open `state:triage-needed` issues and how many are unlisted. Show up to five recently updated items, each with number, title, last-update time, and a concise summary of current context and material changes since the prior review. Put the rest in overflow. Do not assess these issues; direct the engineer to `triage-issue`.
+2. **Triage queue** — state the total count of open `state:triage-needed` issues and how many are unlisted. Show up to five recently updated items, each with number, title, last-update time, and a concise summary of current context and material changes since the prior review. Put the rest in overflow. Do not assess these issues; direct the engineer to `triage-issue`. Record the first listed item as the report's `next_triage_issue` in the checkpoint.
 3. **Dependabot pull requests** — open non-draft Dependabot PRs that need maintainer action, with number, package/update, check status, whether they are waiting for `/ok to test mirror`, and link. Put this section before the general PR list so dependency updates do not become stale. Do not recommend or act on PRs in v1.
 4. **Community pull requests** — up to five new non-draft community PRs with number, title, author, check status, and link. Exclude Dependabot PRs already listed above. Put the rest in overflow. Do not list draft PRs, and do not recommend or act on PRs in v1.
 5. **Deferred and overflow findings** — preserve lower-priority and capacity-limited findings without silently dropping them.
