@@ -19,48 +19,62 @@
 //!
 //! - `tracing_subscriber` formats with ANSI on, does no terminal detection, and
 //!   writes to stdout. Left alone, `openshell -v ... | ...` leaks escapes into a
-//!   pipe exactly like the styled tables did. `main` passes [`enabled`] to
-//!   `with_ansi`.
+//!   pipe exactly like the styled tables did. `main` passes [`stdout_enabled`]
+//!   to `with_ansi`.
 //! - `indicatif` and `dialoguer` both style through `console`, which has its own
 //!   detection and honors `NO_COLOR` but cannot know about `--color`. [`init`]
 //!   overrides it globally, which covers every progress bar and prompt rather
 //!   than the specific ones the CLI happens to construct today.
 //! - `miette` renders errors to stderr with its own detection, likewise unaware
-//!   of `--color`. [`init`] installs a report handler built from the same
-//!   setting.
+//!   of `--color`. [`init`] installs a report handler built from
+//!   [`stderr_enabled`].
 //!
 //! Resolution order, highest precedence first:
 //!
 //! 1. `--color always|never` on the command line.
-//! 2. `NO_COLOR` set to any non-empty value disables color (<https://no-color.org>).
-//! 3. `CLICOLOR_FORCE` set to a non-empty value other than `0` forces color on.
-//! 4. Otherwise color is on only when stdout is a terminal.
+//! 2. `NO_COLOR`, set and non-empty, disables color (<https://no-color.org>).
+//! 3. `FORCE_COLOR`, set and non-empty, forces color on (<https://force-color.org>).
+//! 4. Otherwise the stream is styled only when that stream is a terminal.
 //!
-//! The decision is made against stdout even for text written to stderr. A single
-//! switch keeps every call site consistent without each one having to declare
-//! its destination stream, and stdout is the stream that gets parsed. Users who
-//! redirect stdout but still want styled diagnostics can pass `--color always`.
+//! Step 4 is resolved per stream. Redirecting one must not decide for the other:
+//! `openshell ... 2> build.log` from a terminal should keep a styled stdout and
+//! write a plain-text log, and `openshell ... | grep` should keep styled
+//! diagnostics on the terminal while feeding the pipe clean bytes. [`init`]
+//! therefore stores one answer per stream and hands each library the one for the
+//! stream it writes to.
+//!
+//! The `owo-colors` wrapper is the exception, because its call sites are split
+//! across `println!` and `eprintln!` and a [`Painted`] value cannot tell which
+//! macro will consume it. It styles only when both streams accept escapes, which
+//! errs toward plain text rather than risk writing escapes to a redirected
+//! stream.
 
-use std::ffi::OsString;
+use std::ffi::OsStr;
 use std::fmt::{self, Display};
 use std::io::IsTerminal;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use owo_colors::OwoColorize;
+use owo_colors::{OwoColorize, Style};
 
-/// Process-wide switch consulted by every [`Painted`] value when it renders.
+/// Whether stdout may carry escapes. Consulted for `tracing` and console's
+/// stdout switch.
 ///
 /// Defaults to disabled so that any output produced before [`init`] runs — and
 /// output from unit tests, which never call `init` — stays free of escapes.
-static ENABLED: AtomicBool = AtomicBool::new(false);
+static STDOUT_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// Whether stderr may carry escapes. Consulted for `miette` and console's stderr
+/// switch.
+static STDERR_ENABLED: AtomicBool = AtomicBool::new(false);
 
 /// When to colorize CLI output.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
 pub enum ColorChoice {
-    /// Colorize only when stdout is a terminal and no environment override applies.
+    /// Colorize a stream only when that stream is a terminal and no environment
+    /// override applies.
     #[default]
     Auto,
-    /// Always colorize, even when stdout is redirected.
+    /// Always colorize, even when output is redirected.
     Always,
     /// Never colorize.
     Never,
@@ -71,46 +85,81 @@ pub enum ColorChoice {
 /// Call once, as early as possible after argument parsing and before any output
 /// is written.
 pub fn init(choice: ColorChoice) {
-    let enabled = resolve(
+    let no_color = std::env::var_os("NO_COLOR");
+    let force_color = std::env::var_os("FORCE_COLOR");
+
+    // Under `auto` each stream answers for itself. Redirecting one must not
+    // decide for the other: `openshell ... 2> build.log` from a terminal has a
+    // styled stdout and a plain-text stderr, and vice versa for `| grep`.
+    let stdout_enabled = resolve(
         choice,
-        std::env::var_os("NO_COLOR"),
-        std::env::var_os("CLICOLOR_FORCE"),
+        no_color.as_deref(),
+        force_color.as_deref(),
         std::io::stdout().is_terminal(),
     );
-    ENABLED.store(enabled, Ordering::Relaxed);
+    let stderr_enabled = resolve(
+        choice,
+        no_color.as_deref(),
+        force_color.as_deref(),
+        std::io::stderr().is_terminal(),
+    );
+    STDOUT_ENABLED.store(stdout_enabled, Ordering::Relaxed);
+    STDERR_ENABLED.store(stderr_enabled, Ordering::Relaxed);
 
     // `indicatif` and `dialoguer` both style through `console`, which keeps its
     // own detection. Override it so progress bars and prompts follow the same
-    // setting as everything else — including `--color always`, which console
-    // has no way to learn about on its own. Both switches matter: prompts and
-    // progress bars draw to stderr.
-    console::set_colors_enabled(enabled);
-    console::set_colors_enabled_stderr(enabled);
+    // setting as everything else — including `--color`, which console has no way
+    // to learn about on its own.
+    console::set_colors_enabled(stdout_enabled);
+    console::set_colors_enabled_stderr(stderr_enabled);
 
-    // miette renders errors to stderr with its own color detection. The hook can
-    // only be installed once per process; a failure means something already
-    // installed one, and error rendering is not worth aborting the command over.
+    // miette renders errors to stderr. The hook can only be installed once per
+    // process; a failure means something already installed one, and error
+    // rendering is not worth aborting the command over.
     let _ = miette::set_hook(Box::new(move |_| {
-        Box::new(miette::MietteHandlerOpts::new().color(enabled).build())
+        Box::new(
+            miette::MietteHandlerOpts::new()
+                .color(stderr_enabled)
+                .build(),
+        )
     }));
 }
 
-/// Whether ANSI escapes should be emitted.
+/// Whether stdout may carry ANSI escapes.
 ///
 /// [`init`] configures `console` and `miette` directly; `tracing` is wired up by
-/// the caller, which passes this to `with_ansi`.
+/// the caller, which writes to stdout and passes this to `with_ansi`.
 #[must_use]
-pub fn enabled() -> bool {
-    ENABLED.load(Ordering::Relaxed)
+pub fn stdout_enabled() -> bool {
+    STDOUT_ENABLED.load(Ordering::Relaxed)
 }
 
-/// Decide whether to colorize. Split out from [`init`] so the precedence rules
-/// are testable without mutating process state.
+/// Whether stderr may carry ANSI escapes.
+#[must_use]
+pub fn stderr_enabled() -> bool {
+    STDERR_ENABLED.load(Ordering::Relaxed)
+}
+
+/// Whether a [`Painted`] value should render styled.
+///
+/// The `owo-colors` call sites are split across `println!` and `eprintln!` and
+/// the wrapper cannot tell which one will consume it, so it styles only when
+/// *both* streams accept escapes. Erring toward plain text keeps a redirected
+/// stream clean, which is the whole point of the switch; the cost is that
+/// `openshell ... 2>/dev/null` from a terminal prints an uncolored table.
+/// `--color always` overrides it.
+#[must_use]
+fn painted_enabled() -> bool {
+    stdout_enabled() && stderr_enabled()
+}
+
+/// Decide whether one stream may carry escapes. Split out from [`init`] so the
+/// precedence rules are testable without mutating process state.
 fn resolve(
     choice: ColorChoice,
-    no_color: Option<OsString>,
-    clicolor_force: Option<OsString>,
-    stdout_is_terminal: bool,
+    no_color: Option<&OsStr>,
+    force_color: Option<&OsStr>,
+    stream_is_terminal: bool,
 ) -> bool {
     match choice {
         ColorChoice::Always => return true,
@@ -118,33 +167,22 @@ fn resolve(
         ColorChoice::Auto => {}
     }
 
-    // no-color.org: any non-empty value disables color, regardless of content.
-    if no_color.is_some_and(|value| !value.is_empty()) {
+    // Both conventions key on presence rather than value: set and non-empty
+    // means yes, regardless of what the value is. <https://no-color.org> and
+    // <https://force-color.org>.
+    if is_set(no_color) {
         return false;
     }
-
-    // CLICOLOR_FORCE is the companion convention for forcing color on in
-    // pipelines. `0` is the documented opt-out and falls through to detection.
-    let forced = clicolor_force.is_some_and(|value| {
-        let value = value.to_string_lossy();
-        !value.is_empty() && value != "0"
-    });
-    if forced {
+    if is_set(force_color) {
         return true;
     }
 
-    stdout_is_terminal
+    stream_is_terminal
 }
 
-/// The styles the CLI actually uses.
-#[derive(Clone, Copy)]
-enum Paint {
-    Bold,
-    Cyan,
-    Dimmed,
-    Green,
-    Red,
-    Yellow,
+/// Whether an environment variable counts as set: present and not empty.
+fn is_set(value: Option<&OsStr>) -> bool {
+    value.is_some_and(|value| !value.is_empty())
 }
 
 /// A value tagged with a style, rendered only when color is enabled.
@@ -154,25 +192,73 @@ enum Paint {
 /// text plus escapes.
 pub struct Painted<'a, T: ?Sized> {
     value: &'a T,
-    paint: Paint,
+    style: Style,
 }
 
 impl<T: Display + ?Sized> Display for Painted<'_, T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if !enabled() {
+        if !painted_enabled() {
             return Display::fmt(&self.value, f);
         }
-        // Delegate to owo-colors so the escape sequences stay identical to what
-        // the CLI emitted before this switch existed. These calls must be
-        // fully qualified: `Colorize` below is also in scope and shadows the
-        // same method names, which would recurse instead of emitting anything.
-        match self.paint {
-            Paint::Bold => Display::fmt(&OwoColorize::bold(&self.value), f),
-            Paint::Cyan => Display::fmt(&OwoColorize::cyan(&self.value), f),
-            Paint::Dimmed => Display::fmt(&OwoColorize::dimmed(&self.value), f),
-            Paint::Green => Display::fmt(&OwoColorize::green(&self.value), f),
-            Paint::Red => Display::fmt(&OwoColorize::red(&self.value), f),
-            Paint::Yellow => Display::fmt(&OwoColorize::yellow(&self.value), f),
+        // Hand the whole style to owo-colors in one go. `Styled` writes the
+        // prefix, forwards `f` to the inner `Display` so padding still measures
+        // the text, then writes the reset.
+        Display::fmt(&OwoColorize::style(&self.value, self.style), f)
+    }
+}
+
+/// Style-combining methods, so `x.green().bold()` renders as one escape
+/// sequence rather than nesting two.
+///
+/// These are inherent so they take precedence over the [`Colorize`] blanket
+/// impl, which would otherwise wrap a `Painted` in another `Painted`.
+impl<T: ?Sized> Painted<'_, T> {
+    /// Add bold to the current style.
+    #[must_use]
+    pub fn bold(self) -> Self {
+        Self {
+            style: self.style.bold(),
+            ..self
+        }
+    }
+    /// Add cyan to the current style.
+    #[must_use]
+    pub fn cyan(self) -> Self {
+        Self {
+            style: self.style.cyan(),
+            ..self
+        }
+    }
+    /// Add dimmed to the current style.
+    #[must_use]
+    pub fn dimmed(self) -> Self {
+        Self {
+            style: self.style.dimmed(),
+            ..self
+        }
+    }
+    /// Add green to the current style.
+    #[must_use]
+    pub fn green(self) -> Self {
+        Self {
+            style: self.style.green(),
+            ..self
+        }
+    }
+    /// Add red to the current style.
+    #[must_use]
+    pub fn red(self) -> Self {
+        Self {
+            style: self.style.red(),
+            ..self
+        }
+    }
+    /// Add yellow to the current style.
+    #[must_use]
+    pub fn yellow(self) -> Self {
+        Self {
+            style: self.style.yellow(),
+            ..self
         }
     }
 }
@@ -202,37 +288,37 @@ impl<T: ?Sized> Colorize for T {
     fn bold(&self) -> Painted<'_, Self> {
         Painted {
             value: self,
-            paint: Paint::Bold,
+            style: Style::new().bold(),
         }
     }
     fn cyan(&self) -> Painted<'_, Self> {
         Painted {
             value: self,
-            paint: Paint::Cyan,
+            style: Style::new().cyan(),
         }
     }
     fn dimmed(&self) -> Painted<'_, Self> {
         Painted {
             value: self,
-            paint: Paint::Dimmed,
+            style: Style::new().dimmed(),
         }
     }
     fn green(&self) -> Painted<'_, Self> {
         Painted {
             value: self,
-            paint: Paint::Green,
+            style: Style::new().green(),
         }
     }
     fn red(&self) -> Painted<'_, Self> {
         Painted {
             value: self,
-            paint: Paint::Red,
+            style: Style::new().red(),
         }
     }
     fn yellow(&self) -> Painted<'_, Self> {
         Painted {
             value: self,
-            paint: Paint::Yellow,
+            style: Style::new().yellow(),
         }
     }
 }
@@ -241,19 +327,35 @@ impl<T: ?Sized> Colorize for T {
 mod tests {
     // Deliberately not `use super::*`: that would also pull in `OwoColorize`
     // and make every `.green()` below ambiguous.
-    use super::{ColorChoice, Colorize, ENABLED, Ordering, OsString, resolve};
+    use super::{
+        ColorChoice, Colorize, Ordering, STDERR_ENABLED, STDOUT_ENABLED, Style, painted_enabled,
+        resolve,
+    };
+    use std::ffi::OsStr;
 
-    /// Serializes tests that flip the process-wide switch.
+    /// Serializes tests that flip the process-wide switches.
     static SWITCH_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    /// Set both stream switches, since [`Painted`] requires both.
     fn with_color<R>(on: bool, body: impl FnOnce() -> R) -> R {
+        with_streams(on, on, body)
+    }
+
+    fn with_streams<R>(stdout: bool, stderr: bool, body: impl FnOnce() -> R) -> R {
         let _guard = SWITCH_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let previous = ENABLED.swap(on, Ordering::Relaxed);
+        let prev_out = STDOUT_ENABLED.swap(stdout, Ordering::Relaxed);
+        let prev_err = STDERR_ENABLED.swap(stderr, Ordering::Relaxed);
         let result = body();
-        ENABLED.store(previous, Ordering::Relaxed);
+        STDOUT_ENABLED.store(prev_out, Ordering::Relaxed);
+        STDERR_ENABLED.store(prev_err, Ordering::Relaxed);
         result
+    }
+
+    /// Helper so the `resolve` cases read as plain strings.
+    fn env(value: &str) -> &OsStr {
+        OsStr::new(value)
     }
 
     #[test]
@@ -266,17 +368,19 @@ mod tests {
     }
 
     #[test]
-    fn enabled_output_matches_owo_colors_bytes() {
+    fn enabled_output_is_wrapped_in_the_expected_escapes() {
         with_color(true, || {
-            // The exact sequence the bug report observed from `forward list`.
-            assert_eq!("running".green().to_string(), "\u{1b}[32mrunning\u{1b}[39m");
+            // The styling the bug report observed from `forward list`.
+            assert_eq!("running".green().to_string(), "\u{1b}[32mrunning\u{1b}[0m");
+            // Delegation is to owo-colors, so the bytes match what it would
+            // produce for the same style.
             assert_eq!(
                 "running".green().to_string(),
-                owo_colors::OwoColorize::green(&"running").to_string()
+                owo_colors::OwoColorize::style(&"running", Style::new().green()).to_string()
             );
             assert_eq!(
                 "x".dimmed().to_string(),
-                owo_colors::OwoColorize::dimmed(&"x").to_string()
+                owo_colors::OwoColorize::style(&"x", Style::new().dimmed()).to_string()
             );
         });
     }
@@ -289,20 +393,23 @@ mod tests {
         let colored = with_color(true, || format!("[{:<10}]", "running".green()));
 
         assert_eq!(plain, "[running   ]");
-        assert_eq!(colored, "[\u{1b}[32mrunning   \u{1b}[39m]");
+        assert_eq!(colored, "[\u{1b}[32mrunning   \u{1b}[0m]");
     }
 
     #[test]
-    fn styles_compose() {
+    fn styles_merge_into_one_escape_sequence() {
         with_color(true, || {
+            // Chaining combines into a single style rather than nesting two
+            // wrappers, so there is one prefix and one reset.
+            assert_eq!("hi".green().bold().to_string(), "\u{1b}[32;1mhi\u{1b}[0m");
             assert_eq!(
                 "hi".green().bold().to_string(),
-                "\u{1b}[1m\u{1b}[32mhi\u{1b}[39m\u{1b}[0m"
+                owo_colors::OwoColorize::style(&"hi", Style::new().green().bold()).to_string()
             );
-            // Nesting must stay byte-identical to owo-colors composing directly.
+            // Order of the calls does not change the resulting style.
             assert_eq!(
                 "hi".green().bold().to_string(),
-                owo_colors::OwoColorize::bold(&owo_colors::OwoColorize::green(&"hi")).to_string()
+                "hi".bold().green().to_string()
             );
         });
         with_color(false, || {
@@ -363,36 +470,60 @@ mod tests {
 
     #[test]
     fn explicit_choice_overrides_environment_and_terminal() {
-        assert!(resolve(ColorChoice::Always, Some("1".into()), None, false));
-        assert!(!resolve(ColorChoice::Never, None, Some("1".into()), true));
+        assert!(resolve(ColorChoice::Always, Some(env("1")), None, false));
+        assert!(!resolve(ColorChoice::Never, None, Some(env("1")), true));
     }
 
     #[test]
-    fn no_color_disables_when_non_empty() {
-        assert!(!resolve(ColorChoice::Auto, Some("1".into()), None, true));
-        // Any value counts, including ones that look falsy.
-        assert!(!resolve(ColorChoice::Auto, Some("0".into()), None, true));
+    fn no_color_disables_when_set_and_non_empty() {
+        assert!(!resolve(ColorChoice::Auto, Some(env("1")), None, true));
+        // Presence is what counts; the value is not interpreted, so a value that
+        // reads as falsy still disables color.
+        assert!(!resolve(ColorChoice::Auto, Some(env("0")), None, true));
+        // NO_COLOR outranks FORCE_COLOR.
         assert!(!resolve(
             ColorChoice::Auto,
-            Some("1".into()),
-            Some("1".into()),
+            Some(env("1")),
+            Some(env("1")),
             true
         ));
         // An empty value is not "set" for the purposes of the convention.
-        assert!(resolve(
-            ColorChoice::Auto,
-            Some(OsString::new()),
-            None,
-            true
-        ));
+        assert!(resolve(ColorChoice::Auto, Some(env("")), None, true));
     }
 
     #[test]
-    fn clicolor_force_enables_without_a_terminal() {
-        assert!(resolve(ColorChoice::Auto, None, Some("1".into()), false));
-        // `0` is the documented opt-out; fall through to terminal detection.
-        assert!(!resolve(ColorChoice::Auto, None, Some("0".into()), false));
-        assert!(resolve(ColorChoice::Auto, None, Some("0".into()), true));
+    fn force_color_enables_when_set_and_non_empty() {
+        assert!(resolve(ColorChoice::Auto, None, Some(env("1")), false));
+        // Same presence rule as NO_COLOR: `0` is a value, not an opt-out.
+        // <https://force-color.org> keys on presence and non-emptiness only.
+        assert!(resolve(ColorChoice::Auto, None, Some(env("0")), false));
+        assert!(!resolve(ColorChoice::Auto, None, Some(env("")), false));
+    }
+
+    #[test]
+    fn auto_resolves_each_stream_independently() {
+        // `openshell ... 2> build.log` from a terminal: stdout is styled, the
+        // log file is not. Resolving both from stdout's answer would put escapes
+        // in the log.
+        assert!(resolve(ColorChoice::Auto, None, None, true));
+        assert!(!resolve(ColorChoice::Auto, None, None, false));
+    }
+
+    #[test]
+    fn painted_requires_both_streams() {
+        // A `Painted` value cannot tell whether it is bound for stdout or
+        // stderr, so it stays plain unless both streams accept escapes.
+        assert!(with_streams(true, true, painted_enabled));
+        assert!(!with_streams(true, false, painted_enabled));
+        assert!(!with_streams(false, true, painted_enabled));
+        assert!(!with_streams(false, false, painted_enabled));
+
+        // The rendered consequence: stderr redirected to a file leaves the
+        // styled text plain rather than writing escapes into it.
+        assert_eq!(
+            with_streams(true, false, || "running".green().to_string()),
+            "running"
+        );
     }
 
     #[test]

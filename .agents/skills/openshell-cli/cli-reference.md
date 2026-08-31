@@ -12,7 +12,7 @@ Quick-reference for the `openshell` command-line interface. For workflow guidanc
 | `-g`, `--gateway <NAME>` | Gateway to operate on. Also settable via `OPENSHELL_GATEWAY` env var. Falls back to active gateway in `~/.config/openshell/active_gateway`. |
 | `--gateway-endpoint <URL>` | Connect directly to a gateway endpoint without looking up stored metadata. Also settable via `OPENSHELL_GATEWAY_ENDPOINT`. |
 | `--gateway-insecure` | Skip TLS certificate verification. Also settable via `OPENSHELL_GATEWAY_INSECURE`; use only for trusted development endpoints. |
-| `--color <WHEN>` | `auto` (default), `always`, or `never`. `auto` colorizes only when stdout is a terminal, so piped or redirected output is plain text. Covers tables, `-v` log lines, progress spinners, prompts, and error messages. Also settable via `OPENSHELL_COLOR`. |
+| `--color <WHEN>` | `auto` (default), `always`, or `never`. `auto` decides per stream, so a redirected stream is plain text while a stream still on the terminal stays styled. Covers tables, `-v` log lines, progress spinners, prompts, and error messages. Also settable via `OPENSHELL_COLOR`. |
 
 ## Environment Variables
 
@@ -23,7 +23,7 @@ Quick-reference for the `openshell` command-line interface. For workflow guidanc
 | `OPENSHELL_GATEWAY_INSECURE` | Skip TLS verification when set (same as `--gateway-insecure`) |
 | `OPENSHELL_COLOR` | When to colorize output: `auto`, `always`, `never` (same as `--color`) |
 | `NO_COLOR` | Disable colorized output when set to any non-empty value ([no-color.org](https://no-color.org)) |
-| `CLICOLOR_FORCE` | Force colorized output when set to a non-empty value other than `0` |
+| `FORCE_COLOR` | Force colorized output when set to any non-empty value ([force-color.org](https://force-color.org)) |
 | `OPENSHELL_SANDBOX_POLICY` | Path to default sandbox policy YAML (fallback when `--policy` is not provided) |
 | `OPENSHELL_COMMUNITY_REGISTRY` | Override the community sandbox image registry prefix used by `sandbox create --from <name>` |
 | `OPENSHELL_THEME` | TUI theme: `auto`, `dark`, or `light` |

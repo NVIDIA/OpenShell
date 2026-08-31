@@ -2287,7 +2287,7 @@ async fn run_async() -> Result<()> {
     // writes to stdout, so without this `openshell -v ... | ...` pipes escapes
     // to the caller.
     tracing_subscriber::fmt()
-        .with_ansi(color::enabled())
+        .with_ansi(color::stdout_enabled())
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(log_level)),

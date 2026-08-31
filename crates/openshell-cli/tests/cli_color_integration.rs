@@ -41,7 +41,7 @@ fn forward_list(config_dir: &Path, args: &[&str], no_color: Option<&str>) -> Str
         .args(args)
         .env("XDG_CONFIG_HOME", config_dir)
         .env_remove("NO_COLOR")
-        .env_remove("CLICOLOR_FORCE")
+        .env_remove("FORCE_COLOR")
         .env_remove("OPENSHELL_COLOR");
     if let Some(value) = no_color {
         command.env("NO_COLOR", value);
@@ -143,7 +143,7 @@ fn failing_connect(args: &[&str]) -> (String, String) {
         .env("XDG_CONFIG_HOME", tmpdir.path())
         .env("RUST_LOG", "debug")
         .env_remove("NO_COLOR")
-        .env_remove("CLICOLOR_FORCE")
+        .env_remove("FORCE_COLOR")
         .env_remove("OPENSHELL_COLOR")
         .output()
         .expect("run openshell sandbox list");
@@ -173,6 +173,94 @@ fn tracing_output_is_free_of_escape_sequences_when_piped() {
     assert!(
         !plain.contains(ESC),
         "piped log output must not emit ANSI escapes, got: {plain:?}"
+    );
+}
+
+/// Run a failing command with stdout attached to a pseudo-terminal and stderr
+/// on a pipe, returning what each stream received.
+///
+/// `Command::output` gives both streams pipes, so it cannot distinguish a
+/// per-stream decision from a single one resolved off stdout. This asymmetric
+/// setup is the only way to catch a stream being handed the other stream's
+/// answer.
+#[cfg(target_os = "linux")]
+fn split_streams_stdout_tty(args: &[&str]) -> (String, String) {
+    use std::io::Read;
+    use std::os::fd::{AsRawFd, OwnedFd};
+
+    let pty = nix::pty::openpty(None, None).expect("openpty");
+    let controller: OwnedFd = pty.master;
+    let follower: OwnedFd = pty.slave;
+
+    let tmpdir = tempfile::tempdir().expect("create tmpdir");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_openshell"))
+        .args([
+            "sandbox",
+            "list",
+            "--gateway",
+            "test-gateway",
+            "--gateway-endpoint",
+            "http://127.0.0.1:1",
+        ])
+        .args(args)
+        .env("XDG_CONFIG_HOME", tmpdir.path())
+        .env("RUST_LOG", "debug")
+        .env_remove("NO_COLOR")
+        .env_remove("FORCE_COLOR")
+        .env_remove("OPENSHELL_COLOR")
+        .stdout(follower.try_clone().expect("dup pty follower"))
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn openshell");
+
+    // Drop every follower handle in this process, or reading the controller
+    // blocks forever instead of returning EIO once the child exits.
+    drop(follower);
+
+    let mut stderr_buf = String::new();
+    child
+        .stderr
+        .take()
+        .expect("stderr pipe")
+        .read_to_string(&mut stderr_buf)
+        .expect("read stderr");
+    child.wait().expect("wait for openshell");
+
+    // The pty read ends with EIO rather than a clean EOF; treat that as done.
+    let mut stdout_buf = Vec::new();
+    let mut chunk = [0u8; 4096];
+    loop {
+        match nix::unistd::read(controller.as_raw_fd(), &mut chunk) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => stdout_buf.extend_from_slice(&chunk[..n]),
+        }
+    }
+
+    (
+        String::from_utf8_lossy(&stdout_buf).into_owned(),
+        stderr_buf,
+    )
+}
+
+/// Regression test for a redirected stream inheriting the other stream's
+/// terminal check.
+///
+/// With stdout on a terminal and stderr redirected, `openshell ... 2> build.log`
+/// must leave the log free of escapes while stdout stays styled.
+#[cfg(target_os = "linux")]
+#[test]
+fn redirected_stderr_stays_plain_while_stdout_is_a_terminal() {
+    let (stdout, stderr) = split_streams_stdout_tty(&[]);
+
+    // Positive control: stdout really is a terminal here, so something must be
+    // styled. Otherwise the stderr assertion could pass for the wrong reason.
+    assert!(
+        stdout.contains(ESC),
+        "expected styled stdout on a pty; got: {stdout:?}"
+    );
+    assert!(
+        !stderr.contains(ESC),
+        "redirected stderr must not receive escapes, got: {stderr:?}"
     );
 }
 
