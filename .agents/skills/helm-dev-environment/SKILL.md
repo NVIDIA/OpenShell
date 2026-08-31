@@ -254,8 +254,12 @@ SPIFFE JWT-SVIDs for dynamic provider token grants:
 3. Redeploy: `mise run helm:skaffold:run`
 
 `ci/values-spire-stack.yaml` configures the local SPIRE trust domain as
-`openshell.local` and adds a `ClusterSPIFFEID` that maps sandbox pod
-annotations to `spiffe://openshell.local/openshell/sandbox/<sandbox-id>`.
+`openshell.local` and adds a `ClusterSPIFFEID` that maps each sandbox pod to
+`spiffe://openshell.local/openshell/sandbox/<namespace>.<pod-name>.<sandbox-id>`,
+joining the pod's namespace, name, and `openshell.ai/sandbox-id` annotation into
+one opaque final segment. Its `namespaceSelector` is left broad so SVIDs are
+issued in all workspace modes; the overlay carries a commented-out stricter
+selector for operators who label their managed namespaces.
 OpenShell mounts the SPIFFE CSI Workload API socket at
 `/spiffe-workload-api/spire-agent.sock` into sandbox pods for provider token
 grants. Supervisor-to-gateway authentication remains on the Kubernetes
