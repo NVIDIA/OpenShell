@@ -3308,42 +3308,24 @@ impl ComputeRuntime {
     }
 
     /// Best-effort driver-side cleanup for a sandbox discovered gone
-    /// out-of-band during the periodic prune sweep, rather than through an
+    /// out-of-band — a watch deletion event, or the periodic prune sweep
+    /// finding no matching driver resource — rather than through an
     /// explicit `DeleteSandbox` request.
     ///
     /// Skips the driver call entirely if a request-side lifecycle operation
     /// (e.g. an in-flight explicit delete) already holds this sandbox's
     /// lifecycle gate: that operation already owns driver-side cleanup for
     /// it, and calling `DeleteSandbox` again here would race its own
-    /// in-flight call. Awaited inline: the prune sweep already makes a
-    /// blocking `GetSandbox` call per sandbox as part of its normal
-    /// operation, unlike the watch loop (see `spawn_driver_sandbox_cleanup`).
-    async fn cleanup_driver_sandbox_resources(&self, sandbox_id: &str, sandbox_name: &str) {
-        let gate = self.lifecycle_gates.gate_for(sandbox_id);
-        let Ok(_guard) = gate.try_lock_owned() else {
-            debug!(
-                sandbox_id,
-                sandbox_name,
-                "Skipping driver cleanup while a lifecycle operation is already in flight for this sandbox"
-            );
-            return;
-        };
-
-        self.call_driver_delete_sandbox(sandbox_id, sandbox_name)
-            .await;
-    }
-
-    /// Same lifecycle-gate-guarded driver cleanup as
-    /// `cleanup_driver_sandbox_resources`, but for the watch path: the
-    /// actual `DeleteSandbox` call is deferred to a background task rather
-    /// than awaited inline. Watch events are processed sequentially, so a
-    /// slow or stuck driver call here must never delay notifying
-    /// subscribers of other sandboxes (see `LifecycleGateRegistry`).
+    /// in-flight call.
     ///
-    /// The gate itself is still checked — and, on success, held for the
-    /// background call's duration — synchronously before returning, so this
-    /// cannot race a concurrent request-side operation for the same
-    /// sandbox; only the potentially-slow RPC is backgrounded.
+    /// The gate check is synchronous, but the actual `DeleteSandbox` RPC is
+    /// always deferred to a background task, never awaited inline: both
+    /// call sites run while holding a broader lock (the watch loop's
+    /// sequential event processing; the prune sweep's gateway-wide
+    /// `sync_lock`), and a slow or stuck driver call must never block that
+    /// wider scope. The gate itself is held for the background call's
+    /// duration, so this still can't race a concurrent request-side
+    /// operation — only the potentially-slow RPC is backgrounded.
     fn spawn_driver_sandbox_cleanup(&self, sandbox_id: &str, sandbox_name: &str) {
         let gate = self.lifecycle_gates.gate_for(sandbox_id);
         let Ok(guard) = gate.try_lock_owned() else {
@@ -3653,9 +3635,12 @@ impl ComputeRuntime {
         );
         // The driver's own snapshot never reported this sandbox, so no
         // request-side DeleteSandbox call is coming for it either — release
-        // driver-owned resources here, before the store record disappears.
-        self.cleanup_driver_sandbox_resources(&sandbox_id, &sandbox_name)
-            .await;
+        // driver-owned resources in the background. This function holds
+        // `sync_lock` (the gateway-wide state guard) through the rest of its
+        // body, so the driver call must not be awaited here: doing so would
+        // block every other sandbox operation gateway-wide on a single,
+        // potentially slow or stuck driver RPC.
+        self.spawn_driver_sandbox_cleanup(&sandbox_id, &sandbox_name);
         self.apply_deleted_if_version_locked(&sandbox, expected_resource_version)
             .await
     }
@@ -8178,10 +8163,6 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(
-            driver.delete_requests(),
-            vec![("sb-1".to_string(), "sandbox-a".to_string())]
-        );
         assert!(
             runtime
                 .store
@@ -8190,6 +8171,51 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+
+        // The driver call is backgrounded (see `spawn_driver_sandbox_cleanup`)
+        // so the prune sweep never awaits it while holding the gateway-wide
+        // sync_lock; wait for it to actually land before asserting on it.
+        tokio::time::timeout(Duration::from_secs(1), driver.delete_started.notified())
+            .await
+            .expect("background driver cleanup did not run");
+        assert_eq!(
+            driver.delete_requests(),
+            vec![("sb-1".to_string(), "sandbox-a".to_string())]
+        );
+    }
+
+    #[tokio::test]
+    async fn prune_sweep_does_not_block_on_a_stuck_driver_delete_call() {
+        // Regression test: the prune sweep's driver cleanup must not be
+        // awaited while holding `sync_lock` (the gateway-wide state guard).
+        // Block the driver's delete call indefinitely and confirm the sweep
+        // itself still completes promptly and removes the store record.
+        let driver = ControlledDriver::new();
+        driver.block_delete();
+        driver.set_get_outcome(ControlledGetOutcome::Missing);
+        let runtime = test_runtime(driver.clone()).await;
+        let sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Provisioning);
+        runtime.store.put_message(&sandbox).await.unwrap();
+
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            runtime.reconcile_store_with_backend(Duration::ZERO),
+        )
+        .await
+        .expect("prune sweep blocked on the stuck driver delete call")
+        .unwrap();
+
+        assert!(
+            runtime
+                .store
+                .get_message::<Sandbox>("sb-1")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        tokio::time::timeout(Duration::from_secs(1), driver.delete_started.notified())
+            .await
+            .expect("background driver cleanup did not run");
     }
 
     #[tokio::test]
