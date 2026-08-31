@@ -11,6 +11,97 @@ use crate::is_provider_rule_name;
 
 const DEFAULT_JSON_RPC_MAX_BODY_BYTES: u32 = 64 * 1024;
 
+/// Rewrite an observation-only advisor rule against the live effective policy.
+///
+/// A denial reports only `(host, port, binary)`. If that destination already
+/// has one unambiguous endpoint contract, proposing a second generic L4
+/// endpoint loses inspection metadata and can make the effective policy
+/// ambiguous. Preserve the existing contract instead. Sandbox-owned rules are
+/// expanded in place; provider-owned rules remain immutable and are mirrored
+/// into the requested sandbox-owned overlay.
+pub fn canonicalize_advisor_add_rule(
+    base_policy: &SandboxPolicy,
+    effective_policy: &SandboxPolicy,
+    requested_rule_name: &str,
+    incoming_rule: &NetworkPolicyRule,
+) -> Result<(String, NetworkPolicyRule), String> {
+    if incoming_rule.endpoints.len() != 1 || incoming_rule.binaries.is_empty() {
+        return Ok((requested_rule_name.to_string(), incoming_rule.clone()));
+    }
+
+    let incoming_endpoint = &incoming_rule.endpoints[0];
+    let incoming_ports = canonical_ports(incoming_endpoint);
+    if incoming_endpoint.host.trim().is_empty() || incoming_ports.len() != 1 {
+        return Ok((requested_rule_name.to_string(), incoming_rule.clone()));
+    }
+    let port = incoming_ports[0];
+    let contracts = effective_policy
+        .network_policies
+        .values()
+        .flat_map(|rule| &rule.endpoints)
+        .filter(|endpoint| {
+            endpoint.host.eq_ignore_ascii_case(&incoming_endpoint.host)
+                && canonical_ports(endpoint).contains(&port)
+        })
+        .cloned()
+        .map(|mut endpoint| {
+            // This marker is derived from provider/credential context by the
+            // gateway and must never be persisted from an advisor proposal.
+            endpoint.provider_credentialed = false;
+            // A denial observes one binary-to-port authorization. Preserve the
+            // existing inspection contract, but never copy sibling ports from
+            // a multi-port endpoint into the proposal.
+            endpoint.port = port;
+            endpoint.ports = vec![port];
+            normalize_endpoint(&mut endpoint);
+            endpoint
+        })
+        .collect::<Vec<_>>();
+    let mut unique_contracts = Vec::new();
+    for contract in contracts {
+        if !unique_contracts.contains(&contract) {
+            unique_contracts.push(contract);
+        }
+    }
+
+    let Some(contract) = unique_contracts.first().cloned() else {
+        return Ok((requested_rule_name.to_string(), incoming_rule.clone()));
+    };
+    if unique_contracts.len() != 1 {
+        return Err(format!(
+            "cannot infer one existing endpoint contract for {}:{}",
+            incoming_endpoint.host, port
+        ));
+    }
+
+    let mut sandbox_owners = base_policy
+        .network_policies
+        .iter()
+        .filter(|(name, _)| !is_provider_rule_name(name))
+        .filter_map(|(name, rule)| {
+            rule.endpoints
+                .iter()
+                .any(|endpoint| {
+                    let mut normalized = endpoint.clone();
+                    normalized.provider_credentialed = false;
+                    normalize_endpoint(&mut normalized);
+                    normalized == contract
+                })
+                .then_some(name.clone())
+        })
+        .collect::<Vec<_>>();
+    sandbox_owners.sort();
+
+    let target_name = sandbox_owners
+        .first()
+        .cloned()
+        .unwrap_or_else(|| requested_rule_name.to_string());
+    let mut canonical = incoming_rule.clone();
+    canonical.name.clone_from(&target_name);
+    canonical.endpoints = vec![contract];
+    Ok((target_name, canonical))
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum PolicyMergeOp {
     AddRule {
@@ -1994,7 +2085,8 @@ mod tests {
 
     use super::{
         ANY_BINARY_SCOPE, DEFAULT_JSON_RPC_MAX_BODY_BYTES, PolicyMergeError, PolicyMergeOp,
-        PolicyMergeWarning, canonical_ports, generated_rule_name, merge_policy, policy_covers_rule,
+        PolicyMergeWarning, canonical_ports, canonicalize_advisor_add_rule, generated_rule_name,
+        merge_policy, policy_covers_rule,
     };
     use crate::restrictive_default_policy;
     use openshell_core::proto::{
@@ -2044,6 +2136,154 @@ mod tests {
                 params: HashMap::default(),
             }),
         }
+    }
+
+    #[test]
+    fn canonicalize_advisor_expands_existing_inspected_rule_without_l7_downgrade() {
+        let mut existing_endpoint = endpoint("index.crates.io", 443);
+        existing_endpoint.protocol = "rest".to_string();
+        existing_endpoint.enforcement = "enforce".to_string();
+        existing_endpoint.access = "read-only".to_string();
+        let existing = NetworkPolicyRule {
+            name: "cargo-registry".to_string(),
+            endpoints: vec![existing_endpoint.clone()],
+            binaries: vec![NetworkBinary {
+                path: "/usr/bin/cargo".to_string(),
+                ..Default::default()
+            }],
+        };
+        let mut base = SandboxPolicy::default();
+        base.network_policies
+            .insert("cargo_registry".to_string(), existing);
+        let effective = base.clone();
+        let mut observed = endpoint("index.crates.io", 443);
+        observed.advisor_proposed = true;
+        let incoming = NetworkPolicyRule {
+            name: "allow_index_crates_io_443".to_string(),
+            endpoints: vec![observed],
+            binaries: vec![advisor_binary("/usr/bin/curl")],
+        };
+
+        let (rule_name, canonical) = canonicalize_advisor_add_rule(
+            &base,
+            &effective,
+            "allow_index_crates_io_443",
+            &incoming,
+        )
+        .unwrap();
+
+        assert_eq!(rule_name, "cargo_registry");
+        assert_eq!(canonical.endpoints, vec![existing_endpoint]);
+        assert_eq!(canonical.binaries[0].path, "/usr/bin/curl");
+        #[allow(deprecated)]
+        {
+            assert!(canonical.binaries[0].harness);
+        }
+    }
+
+    #[test]
+    fn canonicalize_advisor_mirrors_provider_contract_into_sandbox_overlay() {
+        let base = SandboxPolicy::default();
+        let mut provider_endpoint = endpoint("api.example.com", 443);
+        provider_endpoint.protocol = "rest".to_string();
+        provider_endpoint.enforcement = "enforce".to_string();
+        provider_endpoint.access = "read-only".to_string();
+        provider_endpoint.provider_credentialed = true;
+        let mut effective = SandboxPolicy::default();
+        effective.network_policies.insert(
+            "_provider_example".to_string(),
+            NetworkPolicyRule {
+                name: "provider-example".to_string(),
+                endpoints: vec![provider_endpoint.clone()],
+                binaries: Vec::new(),
+            },
+        );
+        let incoming = NetworkPolicyRule {
+            name: "advisor_example".to_string(),
+            endpoints: vec![NetworkEndpoint {
+                host: "api.example.com".to_string(),
+                port: 443,
+                advisor_proposed: true,
+                ..Default::default()
+            }],
+            binaries: vec![advisor_binary("/usr/bin/curl")],
+        };
+
+        let (rule_name, canonical) =
+            canonicalize_advisor_add_rule(&base, &effective, "advisor_example", &incoming).unwrap();
+
+        assert_eq!(rule_name, "advisor_example");
+        assert_eq!(canonical.endpoints[0].protocol, "rest");
+        assert_eq!(canonical.endpoints[0].access, "read-only");
+        assert!(!canonical.endpoints[0].provider_credentialed);
+        assert_eq!(
+            effective.network_policies["_provider_example"].endpoints[0],
+            provider_endpoint
+        );
+    }
+
+    #[test]
+    fn canonicalize_advisor_narrows_multi_port_contract_and_keeps_overlay() {
+        let mut existing_endpoint = endpoint("index.crates.io", 443);
+        existing_endpoint.port = 80;
+        existing_endpoint.ports = vec![80, 443];
+        existing_endpoint.protocol = "rest".to_string();
+        existing_endpoint.enforcement = "enforce".to_string();
+        existing_endpoint.access = "read-only".to_string();
+        let existing = NetworkPolicyRule {
+            name: "cargo-registry".to_string(),
+            endpoints: vec![existing_endpoint],
+            binaries: vec![binary("/usr/bin/cargo")],
+        };
+        let mut base = SandboxPolicy::default();
+        base.network_policies
+            .insert("cargo_registry".to_string(), existing);
+        let effective = base.clone();
+        let incoming = NetworkPolicyRule {
+            name: "allow_index_crates_io_443".to_string(),
+            endpoints: vec![NetworkEndpoint {
+                host: "index.crates.io".to_string(),
+                port: 443,
+                advisor_proposed: true,
+                ..Default::default()
+            }],
+            binaries: vec![advisor_binary("/usr/bin/curl")],
+        };
+
+        let (rule_name, canonical) = canonicalize_advisor_add_rule(
+            &base,
+            &effective,
+            "allow_index_crates_io_443",
+            &incoming,
+        )
+        .unwrap();
+
+        assert_eq!(rule_name, "allow_index_crates_io_443");
+        assert_eq!(canonical.endpoints[0].ports, vec![443]);
+        assert_eq!(canonical.endpoints[0].protocol, "rest");
+        assert_eq!(canonical.endpoints[0].access, "read-only");
+
+        let merged = merge_policy(
+            base,
+            &[PolicyMergeOp::AddRule {
+                rule_name,
+                rule: canonical,
+            }],
+        )
+        .unwrap()
+        .policy;
+        assert_eq!(
+            merged.network_policies["cargo_registry"].endpoints[0].ports,
+            vec![80, 443]
+        );
+        assert_eq!(
+            merged.network_policies["allow_index_crates_io_443"].endpoints[0].ports,
+            vec![443]
+        );
+        assert_eq!(
+            merged.network_policies["allow_index_crates_io_443"].binaries[0].path,
+            "/usr/bin/curl"
+        );
     }
 
     fn binary(path: &str) -> NetworkBinary {

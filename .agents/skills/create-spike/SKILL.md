@@ -211,7 +211,7 @@ gh issue create \
 - <what tests exist for the affected area today, what patterns should be followed, any test infrastructure gaps>
 
 ---
-*Created by spike investigation. `state:validated` means the issue is ready for human disposition; `state:needs-info` means specific evidence is still required. A human applies `state:accepted` or places the issue on the roadmap if OpenShell should pursue the work. To queue unattended agent planning, a human applies `agent:plan-requested`; a direct request to an agent does not require that label.*
+*Created by spike investigation. `state:validated` means the issue is ready for human disposition; `state:needs-info` means specific evidence is still required. A human applies `state:accepted` or places the issue on the roadmap if OpenShell should pursue the work. To queue unattended agent planning, a human applies `agent:plan-requested`; on a direct request, the agent warns about missing expected workflow labels and continues without changing them.*
 EOF
 )"
 ```
@@ -235,7 +235,7 @@ After creating the issue, report:
 
 For `state:validated`:
 
-> Review the issue and decide whether OpenShell should pursue it. If yes, apply `state:accepted`, associate it with a roadmap item, or do both. Either action records acceptance; roadmap placement additionally records sequencing. The work may remain human-owned. Apply `agent:plan-requested` to queue planning for an unattended agent, or directly ask an agent to use `build-from-issue`. If no, close it as not planned and record the rationale.
+> Review the issue and decide whether OpenShell should pursue it. If yes, apply `state:accepted`, associate it with a roadmap item, or do both. Either action records acceptance; roadmap placement additionally records sequencing. The work may remain human-owned. Apply `agent:plan-requested` to queue planning for an unattended agent, or directly ask an agent to use `build-from-issue`; on a direct request, the agent warns about missing expected workflow labels and continues without changing them. If no, close it as not planned and record the rationale.
 
 For `state:needs-info`:
 

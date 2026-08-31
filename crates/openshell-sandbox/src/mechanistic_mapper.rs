@@ -228,6 +228,7 @@ pub fn generate_proposals(summaries: &[DenialSummary]) -> Vec<PolicyChunk> {
             binary: binary.clone(),
             validation_result: String::new(),
             rejection_reason: String::new(),
+            ..Default::default()
         });
     }
 

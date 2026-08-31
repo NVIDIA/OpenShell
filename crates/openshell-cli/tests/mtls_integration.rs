@@ -13,10 +13,11 @@ use openshell_cli::{
 };
 use openshell_core::proto::{
     CreateProviderRequest, CreateSshSessionRequest, CreateSshSessionResponse,
-    DeleteProviderRequest, DeleteProviderResponse, ExecSandboxEvent, ExecSandboxInput,
-    ExecSandboxRequest, GetProviderRequest, HealthRequest, HealthResponse, ListProvidersRequest,
-    ListProvidersResponse, ProviderResponse, RevokeSshSessionRequest, RevokeSshSessionResponse,
-    ServiceStatus, UpdateProviderRequest,
+    DeleteProviderRequest, DeleteProviderResponse, ExchangeProviderSubjectTokenRequest,
+    ExchangeProviderSubjectTokenResponse, ExecSandboxEvent, ExecSandboxInput, ExecSandboxRequest,
+    GetProviderRequest, HealthRequest, HealthResponse, ListProvidersRequest, ListProvidersResponse,
+    ProviderResponse, RevokeSshSessionRequest, RevokeSshSessionResponse, ServiceStatus,
+    UpdateProviderRequest,
     open_shell_server::{OpenShell, OpenShellServer},
 };
 use tempfile::tempdir;
@@ -37,6 +38,13 @@ impl OpenShell for TestOpenShell {
         &self,
         _request: tonic::Request<openshell_core::proto::ReportMainProcessExitRequest>,
     ) -> Result<Response<openshell_core::proto::ReportMainProcessExitResponse>, Status> {
+        Err(Status::unimplemented("not used by this test server"))
+    }
+
+    async fn finalize_main_process_exit(
+        &self,
+        _request: tonic::Request<openshell_core::proto::FinalizeMainProcessExitRequest>,
+    ) -> Result<Response<openshell_core::proto::FinalizeMainProcessExitResponse>, Status> {
         Err(Status::unimplemented("not used by this test server"))
     }
 
@@ -211,6 +219,13 @@ impl OpenShell for TestOpenShell {
         _request: tonic::Request<RevokeSshSessionRequest>,
     ) -> Result<Response<RevokeSshSessionResponse>, Status> {
         Ok(Response::new(RevokeSshSessionResponse::default()))
+    }
+
+    async fn exchange_provider_subject_token(
+        &self,
+        _request: tonic::Request<ExchangeProviderSubjectTokenRequest>,
+    ) -> Result<Response<ExchangeProviderSubjectTokenResponse>, Status> {
+        Err(Status::unimplemented("unused"))
     }
 
     async fn create_provider(

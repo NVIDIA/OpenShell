@@ -23,9 +23,11 @@ use openshell_core::proto::{
     DeleteProviderRequest, DeleteProviderResponse, DeleteSandboxRequest, DeleteSandboxResponse,
     DeleteServiceRequest, DeleteServiceResponse, DeleteWorkspaceRequest, DeleteWorkspaceResponse,
     DetachSandboxProviderRequest, DetachSandboxProviderResponse, EditDraftChunkRequest,
-    EditDraftChunkResponse, ExecSandboxEvent, ExecSandboxInput, ExecSandboxRequest,
-    ExposeServiceRequest, GatewayMessage, GetCurrentUserRequest, GetCurrentUserResponse,
-    GetDraftHistoryRequest, GetDraftHistoryResponse, GetDraftPolicyRequest, GetDraftPolicyResponse,
+    EditDraftChunkResponse, ExchangeProviderSubjectTokenRequest,
+    ExchangeProviderSubjectTokenResponse, ExecSandboxEvent, ExecSandboxInput, ExecSandboxRequest,
+    ExposeServiceRequest, FinalizeMainProcessExitRequest, FinalizeMainProcessExitResponse,
+    GatewayMessage, GetCurrentUserRequest, GetCurrentUserResponse, GetDraftHistoryRequest,
+    GetDraftHistoryResponse, GetDraftPolicyRequest, GetDraftPolicyResponse,
     GetGatewayConfigRequest, GetGatewayConfigResponse, GetGatewayInfoRequest,
     GetGatewayInfoResponse, GetProviderProfileRequest, GetProviderRefreshStatusRequest,
     GetProviderRefreshStatusResponse, GetProviderRequest, GetSandboxConfigRequest,
@@ -543,6 +545,13 @@ impl OpenShell for OpenShellService {
         policy::handle_get_sandbox_provider_environment(&self.state, request).await
     }
 
+    async fn exchange_provider_subject_token(
+        &self,
+        request: Request<ExchangeProviderSubjectTokenRequest>,
+    ) -> Result<Response<ExchangeProviderSubjectTokenResponse>, Status> {
+        provider::handle_exchange_provider_subject_token(&self.state, request).await
+    }
+
     async fn update_config(
         &self,
         request: Request<UpdateConfigRequest>,
@@ -685,6 +694,13 @@ impl OpenShell for OpenShellService {
         request: Request<ReportMainProcessExitRequest>,
     ) -> Result<Response<ReportMainProcessExitResponse>, Status> {
         crate::supervisor_session::handle_report_main_process_exit(&self.state, request).await
+    }
+
+    async fn finalize_main_process_exit(
+        &self,
+        request: Request<FinalizeMainProcessExitRequest>,
+    ) -> Result<Response<FinalizeMainProcessExitResponse>, Status> {
+        crate::supervisor_session::handle_finalize_main_process_exit(&self.state, request).await
     }
 
     type RelayStreamStream =

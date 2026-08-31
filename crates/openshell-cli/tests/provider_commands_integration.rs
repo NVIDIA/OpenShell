@@ -14,7 +14,8 @@ use openshell_core::proto::{
     CreateSandboxRequest, CreateSshSessionRequest, CreateSshSessionResponse,
     DeleteProviderRefreshRequest, DeleteProviderRefreshResponse, DeleteProviderRequest,
     DeleteProviderResponse, DeleteSandboxRequest, DeleteSandboxResponse,
-    DetachSandboxProviderRequest, DetachSandboxProviderResponse, ExecSandboxEvent,
+    DetachSandboxProviderRequest, DetachSandboxProviderResponse,
+    ExchangeProviderSubjectTokenRequest, ExchangeProviderSubjectTokenResponse, ExecSandboxEvent,
     ExecSandboxInput, ExecSandboxRequest, GatewayMessage, GetGatewayConfigRequest,
     GetGatewayConfigResponse, GetProviderRefreshStatusRequest, GetProviderRefreshStatusResponse,
     GetProviderRequest, GetSandboxConfigRequest, GetSandboxConfigResponse,
@@ -31,6 +32,7 @@ use openshell_core::proto::{
 use openshell_core::{ObjectId, ObjectName};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tempfile::TempDir;
 use tokio::net::TcpListener;
 use tokio::sync::{Mutex, mpsc};
@@ -44,6 +46,8 @@ struct ProviderState {
     profiles: Arc<Mutex<HashMap<String, ProviderProfile>>>,
     refresh_statuses: Arc<Mutex<HashMap<(String, String), ProviderCredentialRefreshStatus>>>,
     refresh_requests: Arc<Mutex<Vec<ProviderRefreshRequestLog>>>,
+    provider_update_requests: Arc<Mutex<Vec<Provider>>>,
+    deny_provider_reads: Arc<AtomicBool>,
     delete_provider_requests: Arc<Mutex<Vec<String>>>,
     fail_configure_refresh_message: Arc<Mutex<Option<String>>>,
     fail_rotate_refresh_message: Arc<Mutex<Option<String>>>,
@@ -102,6 +106,13 @@ impl OpenShell for TestOpenShell {
         &self,
         _request: tonic::Request<openshell_core::proto::ReportMainProcessExitRequest>,
     ) -> Result<Response<openshell_core::proto::ReportMainProcessExitResponse>, Status> {
+        Err(Status::unimplemented("not used by this test server"))
+    }
+
+    async fn finalize_main_process_exit(
+        &self,
+        _request: tonic::Request<openshell_core::proto::FinalizeMainProcessExitRequest>,
+    ) -> Result<Response<openshell_core::proto::FinalizeMainProcessExitResponse>, Status> {
         Err(Status::unimplemented("not used by this test server"))
     }
 
@@ -372,6 +383,13 @@ impl OpenShell for TestOpenShell {
         Ok(Response::new(RevokeSshSessionResponse::default()))
     }
 
+    async fn exchange_provider_subject_token(
+        &self,
+        _request: tonic::Request<ExchangeProviderSubjectTokenRequest>,
+    ) -> Result<Response<ExchangeProviderSubjectTokenResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
     async fn create_provider(
         &self,
         request: tonic::Request<CreateProviderRequest>,
@@ -424,6 +442,9 @@ impl OpenShell for TestOpenShell {
         &self,
         request: tonic::Request<GetProviderRequest>,
     ) -> Result<Response<ProviderResponse>, Status> {
+        if self.state.deny_provider_reads.load(Ordering::SeqCst) {
+            return Err(Status::permission_denied("scope 'provider:read' required"));
+        }
         let name = request.into_inner().name;
         let providers = self.state.providers.lock().await;
         let provider = providers
@@ -603,6 +624,11 @@ impl OpenShell for TestOpenShell {
             .into_inner()
             .provider
             .ok_or_else(|| Status::invalid_argument("provider is required"))?;
+        self.state
+            .provider_update_requests
+            .lock()
+            .await
+            .push(provider.clone());
 
         let mut providers = self.state.providers.lock().await;
         let existing = providers
@@ -742,6 +768,10 @@ impl OpenShell for TestOpenShell {
             next_refresh_at_ms: 0,
             last_refresh_at_ms: 0,
             last_error: String::new(),
+            recovery_action: 0,
+            failure_code: String::new(),
+            provider_error_subtype: String::new(),
+            last_error_at_ms: 0,
         };
         drop(providers);
         self.state
@@ -1186,18 +1216,29 @@ async fn provider_cli_run_functions_support_full_crud_flow() {
     .await
     .expect("provider list");
 
-    run::provider_update(
-        &ts.endpoint,
-        "my-claude",
-        false,
-        &["API_KEY=rotated".to_string()],
-        &["profile=prod".to_string()],
-        &[],
-        "default",
-        &ts.tls,
-    )
+    // A credential-only update must remain available to callers that have
+    // provider:write but not provider:read.
+    ts.state.deny_provider_reads.store(true, Ordering::SeqCst);
+
+    run::provider_update(run::ProviderUpdateOptions {
+        server: &ts.endpoint,
+        name: "my-claude",
+        from_existing: false,
+        from_oidc_token: false,
+        credentials: &["API_KEY=rotated".to_string()],
+        config: &["profile=prod".to_string()],
+        credential_expires_at: &[],
+        workspace: "default",
+        tls: &ts.tls,
+    })
     .await
     .expect("provider update");
+
+    let requests = ts.state.provider_update_requests.lock().await;
+    let request = requests.last().expect("provider update request");
+    assert!(request.r#type.is_empty());
+    assert!(request.profile_workspace.is_empty());
+    drop(requests);
 
     run::provider_delete(&ts.endpoint, &["my-claude".to_string()], "default", &ts.tls)
         .await
@@ -1544,19 +1585,17 @@ async fn provider_create_allows_empty_credentials_for_gateway_refresh_profiles()
         },
     );
 
-    run::provider_create_with_options(
-        &ts.endpoint,
-        "custom-refresh-provider",
-        "custom-refresh",
-        false,
-        &[],
-        false,
-        true,
-        &[],
-        "default",
-        "default",
-        &ts.tls,
-    )
+    run::provider_create_with_options(run::ProviderCreateOptions {
+        server: &ts.endpoint,
+        name: "custom-refresh-provider",
+        provider_type: "custom-refresh",
+        credentials: &[],
+        credential_source: run::ProviderCreateCredentialSource::Runtime,
+        config: &[],
+        workspace: "default",
+        profile_workspace: "default",
+        tls: &ts.tls,
+    })
     .await
     .expect("provider create");
 
@@ -2100,16 +2139,17 @@ async fn provider_update_from_existing_uses_profile_discovery_when_v2_enabled() 
     );
     let _env = EnvVarGuard::set(&[("CUSTOM_UPDATE_DISCOVERY_API_KEY", "updated-profile-secret")]);
 
-    run::provider_update(
-        &ts.endpoint,
-        "custom-update",
-        true,
-        &[],
-        &[],
-        &[],
-        "default",
-        &ts.tls,
-    )
+    run::provider_update(run::ProviderUpdateOptions {
+        server: &ts.endpoint,
+        name: "custom-update",
+        from_existing: true,
+        from_oidc_token: false,
+        credentials: &[],
+        config: &[],
+        credential_expires_at: &[],
+        workspace: "default",
+        tls: &ts.tls,
+    })
     .await
     .expect("profile-backed provider update --from-existing");
 
@@ -2364,19 +2404,17 @@ async fn provider_create_supports_generic_type_and_env_lookup_credentials() {
 async fn provider_create_sends_inline_credentials() {
     let ts = run_server().await;
 
-    run::provider_create_with_options(
-        &ts.endpoint,
-        "openai-inline",
-        "openai",
-        false,
-        &["OPENAI_API_KEY=sk-test".to_string()],
-        false,
-        false,
-        &[],
-        "default",
-        "default",
-        &ts.tls,
-    )
+    run::provider_create_with_options(run::ProviderCreateOptions {
+        server: &ts.endpoint,
+        name: "openai-inline",
+        provider_type: "openai",
+        credentials: &["OPENAI_API_KEY=sk-test".to_string()],
+        credential_source: run::ProviderCreateCredentialSource::ExplicitCredentials,
+        config: &[],
+        workspace: "default",
+        profile_workspace: "default",
+        tls: &ts.tls,
+    })
     .await
     .expect("provider create with inline credential");
 
@@ -2442,7 +2480,7 @@ async fn provider_create_rejects_combined_from_gcloud_adc_and_from_existing() {
 
     assert!(
         err.to_string()
-            .contains("--from-gcloud-adc cannot be combined with --from-existing, --credential"),
+            .contains("--from-gcloud-adc cannot be combined with --from-existing, --from-oidc-token, or --credential"),
         "unexpected error: {err}"
     );
     assert!(ts.state.providers.lock().await.is_empty());
@@ -2468,7 +2506,7 @@ async fn provider_create_rejects_combined_from_gcloud_adc_and_credentials() {
 
     assert!(
         err.to_string()
-            .contains("--from-gcloud-adc cannot be combined with --from-existing, --credential"),
+            .contains("--from-gcloud-adc cannot be combined with --from-existing, --from-oidc-token, or --credential"),
         "unexpected error: {err}"
     );
     assert!(ts.state.providers.lock().await.is_empty());

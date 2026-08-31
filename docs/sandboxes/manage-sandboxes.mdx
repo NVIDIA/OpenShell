@@ -21,12 +21,27 @@ openshell sandbox create -- claude
 ```
 
 The trailing command is the sandbox's canonical main process. OpenShell starts
-it once and attaches your terminal to it. With no trailing command, OpenShell
+it once, streams its output, and returns its exit status. Exit code 0 leaves a
+retained sandbox in `Completed`; a nonzero exit leaves it in `Error` with a
+`MainProcessFailed` condition. With no trailing command, OpenShell
 starts `/bin/bash -l` in a retained pseudo-terminal. Add `--detach` to create
 the sandbox without attaching:
 
 ```shell
 openshell sandbox create --name worker --detach -- ./worker
+```
+
+Detached commands have no attachment grace period. When the command exits,
+OpenShell records its terminal phase immediately. For a foreground command,
+the create request declares one expected SSH attachment. OpenShell retains the
+terminal transport until that connection drains and closes naturally, then
+finalizes ephemeral cleanup.
+
+Use `--no-keep` for an ephemeral command. OpenShell drains stdout and stderr,
+captures the command result, and deletes the sandbox after the command exits:
+
+```shell
+openshell sandbox create --no-keep -- sh -c 'echo done; exit 0'
 ```
 
 `--upload` cannot yet be combined with a trailing main command because uploads
@@ -206,14 +221,27 @@ openshell sandbox exec -n my-sandbox --tty -- /bin/bash
 
 OpenShell allocates a TTY automatically when both stdin and stdout are terminals. Force the behavior with `--tty` or disable it with `--no-tty`.
 
-| Flag           | Purpose                                                  |
-| -------------- | -------------------------------------------------------- |
-| `-n`, `--name` | Sandbox to target.                                       |
-| `--workdir`    | Working directory for the command inside the sandbox.    |
-| `--timeout`    | Command timeout in seconds. `0` disables the timeout.    |
-| `--tty`        | Force TTY allocation.                                    |
-| `--no-tty`     | Disable TTY allocation even when attached to a terminal. |
-| `--env`        | Set an environment variable for the command (`KEY=VALUE`, repeatable). |
+| Flag              | Purpose                                                  |
+| ----------------- | -------------------------------------------------------- |
+| `-n`, `--name`    | Sandbox to target.                                       |
+| `--workdir`       | Working directory for the command inside the sandbox.    |
+| `--timeout`       | Command timeout in seconds. `0` disables the timeout.    |
+| `--tty`           | Force TTY allocation.                                    |
+| `--no-tty`        | Disable TTY allocation even when attached to a terminal. |
+| `--no-login-shell`| Run the command without sourcing shell login startup files. |
+| `--env`           | Set an environment variable for the command (`KEY=VALUE`, repeatable). |
+
+### Skip shell startup files
+
+By default `sandbox exec` runs the command through a login shell (`bash -lc`), so the sandbox user's first available `.bash_profile`, `.bash_login`, or `.profile` is sourced first (and `.bashrc` only if that login file sources it). This makes tool-specific environment configuration available automatically, which suits interactive and tool-discovery use.
+
+For automation and managed checks that need predictable output and side effects, pass `--no-login-shell` so those startup files are not sourced before the command runs:
+
+```shell
+openshell sandbox exec -n my-sandbox --no-login-shell -- /usr/local/bin/managed-probe
+```
+
+In this mode a sandbox user's login startup files cannot write to the command's output, create files, or otherwise affect the requested command before it starts. The command still runs under `bash -c`, which reads `BASH_ENV` if it is set in the command's environment. The default (login-shell) behavior is unchanged when the flag is omitted.
 
 ## Set Environment Variables
 
@@ -265,6 +293,18 @@ with SandboxClient.from_active_cluster() as client:
 
     matches = client.list(workspace="default", label_selector="env=dev,team=platform")
     assert sandbox.id in {s.id for s in matches}
+```
+
+For non-interactive automation, pass a renewable client-credentials provider.
+Omitted issuer, client ID, audience, and scopes are read from the active
+gateway's metadata. The client requires TLS for non-loopback gateways:
+
+```python
+from openshell import ClientCredentialsAuth, SandboxClient
+
+auth = ClientCredentialsAuth(client_secret=lambda: load_secret())
+with SandboxClient.from_active_cluster(client_credentials=auth) as client:
+    sandboxes = client.list(workspace="default")
 ```
 
 ## Expose Long Running Services
@@ -478,8 +518,11 @@ commands, transfer files, forward ports, or reach exposed services. Policies,
 provider attachments, settings, service definitions, and persistent workspace
 data remain associated with the sandbox.
 
-Stop and start are idempotent. Delete a stopped sandbox normally when you
-no longer need its retained state.
+Stop and start are idempotent. You can also start a retained `Completed` or
+`Error/MainProcessFailed` sandbox to launch a fresh instance of its canonical
+command. Starting a fresh instance invalidates SSH sessions issued for the
+previous runtime generation. Delete an inactive sandbox normally when you no
+longer need its retained state.
 
 ## Delete Sandboxes
 
@@ -498,9 +541,10 @@ Every sandbox moves through a defined set of phases:
 | Provisioning | The runtime is setting up the sandbox environment, or the gateway is waiting for the sandbox supervisor to establish its authenticated control session.       |
 | Ready        | The sandbox is running and its supervisor control session is connected. You can connect, execute commands, sync files, and view logs.                          |
 | Stopping     | The gateway accepted a stop request and is stopping compute while retaining persistent state.                                                         |
-| Stopped      | Compute is stopped and access is unavailable. The sandbox record and driver-owned persistent workspace remain.                                       |
+| Stopped      | Compute was stopped explicitly and access is unavailable.                                                                                 |
 | Starting     | Compute is starting. The sandbox becomes usable only after a fresh supervisor session connects.                                                       |
-| Error        | Provisioning failed or the canonical main process exited unexpectedly. Main-process exit is terminal even with exit code 0. Check logs with `openshell logs`.       |
+| Completed    | The canonical main process exited with code 0. Its normalized result is available in `status.exit_code`.                                           |
+| Error        | The canonical main process failed, or sandbox infrastructure failed. Inspect the condition reason and `status.exit_code`.                  |
 | Deleting     | The sandbox is being torn down. The system releases resources and purges credentials.                                                                          |
 
 The compute backend can become ready before the sandbox supervisor connects to
@@ -510,10 +554,11 @@ After a gateway restart, an existing sandbox can return to `Provisioning`
 temporarily while its supervisor reconnects. Wait for the phase to return to
 `Ready` before you connect to the sandbox or execute commands.
 
-The gateway records a canonical main-process exit as `Ready=False` with reason
-`MainProcessExited`. It also sets `status.exit_code`; signal exits use the
-standard `128 + signal` convention. Compute runtimes do not automatically
-restart that process.
+The gateway records a successful canonical main-process exit as `Ready=False`
+with reason `MainProcessCompleted`. Nonzero and signal-normalized results use
+`MainProcessFailed` and the `Error` phase. It also sets `status.exit_code`;
+signal exits use the standard `128 + signal` convention. Compute runtimes do
+not automatically restart that process.
 
 ## Sandbox Compute Drivers
 

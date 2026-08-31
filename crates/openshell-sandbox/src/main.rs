@@ -229,6 +229,12 @@ struct Args {
     /// (for proxies whose ACLs filter on hostnames).
     #[arg(long)]
     upstream_proxy_connect_by_hostname: bool,
+
+    /// Path to a PEM CA bundle trusted for the corporate proxy: the TLS
+    /// handshake with an `https://` proxy and, for TLS-intercepting proxies,
+    /// re-signed upstream certificates and the sandbox trust bundle.
+    #[arg(long)]
+    upstream_proxy_ca_bundle: Option<String>,
 }
 
 /// Internal one-shot command used by the privileged supervisor to validate an
@@ -653,15 +659,23 @@ fn main() -> Result<()> {
         // drivers otherwise provide a versioned JSON transport so argument
         // boundaries are never reconstructed with shell parsing.
         let workdir = args.workdir.clone();
-        let (command, interactive) = if !args.command.is_empty() {
-            (args.command, args.interactive)
+        let (command, interactive, await_main_process_attachment) = if !args.command.is_empty() {
+            (args.command, args.interactive, false)
         } else if let Ok(json) = std::env::var(openshell_core::sandbox_env::MAIN_PROCESS_SPEC) {
             let config = openshell_core::sandbox_env::MainProcessConfig::decode(&json)
                 .map_err(|error| miette::miette!("{error}"))?;
-            (config.command, config.tty)
+            (
+                config.command,
+                config.tty,
+                config.await_main_process_attachment,
+            )
         } else {
             let config = openshell_core::sandbox_env::MainProcessConfig::scratch();
-            (config.command, config.tty)
+            (
+                config.command,
+                config.tty,
+                config.await_main_process_attachment,
+            )
         };
 
         info!(command = ?command, "Starting sandbox");
@@ -675,6 +689,7 @@ fn main() -> Result<()> {
             proxy_auth_file: args.upstream_proxy_auth_file,
             proxy_auth_allow_insecure: args.upstream_proxy_auth_allow_insecure,
             proxy_connect_by_hostname: args.upstream_proxy_connect_by_hostname,
+            proxy_ca_bundle: args.upstream_proxy_ca_bundle,
         };
 
         run_sandbox(
@@ -682,6 +697,7 @@ fn main() -> Result<()> {
             workdir,
             args.timeout,
             interactive,
+            await_main_process_attachment,
             args.sandbox_id,
             args.sandbox,
             args.openshell_endpoint,

@@ -14,7 +14,8 @@ use openshell_core::proto::{
     AttachSandboxProviderRequest, AttachSandboxProviderResponse, CreateProviderRequest,
     CreateSandboxRequest, CreateSshSessionRequest, CreateSshSessionResponse, DeleteProviderRequest,
     DeleteProviderResponse, DeleteSandboxRequest, DeleteSandboxResponse,
-    DetachSandboxProviderRequest, DetachSandboxProviderResponse, ExecSandboxEvent,
+    DetachSandboxProviderRequest, DetachSandboxProviderResponse,
+    ExchangeProviderSubjectTokenRequest, ExchangeProviderSubjectTokenResponse, ExecSandboxEvent,
     ExecSandboxInput, ExecSandboxRequest, GatewayMessage, GetGatewayConfigRequest,
     GetGatewayConfigResponse, GetProviderRequest, GetSandboxConfigRequest,
     GetSandboxConfigResponse, GetSandboxPolicyStatusRequest, GetSandboxPolicyStatusResponse,
@@ -52,6 +53,13 @@ impl OpenShell for TestOpenShell {
         &self,
         _request: tonic::Request<openshell_core::proto::ReportMainProcessExitRequest>,
     ) -> Result<Response<openshell_core::proto::ReportMainProcessExitResponse>, Status> {
+        Err(Status::unimplemented("not used by this test server"))
+    }
+
+    async fn finalize_main_process_exit(
+        &self,
+        _request: tonic::Request<openshell_core::proto::FinalizeMainProcessExitRequest>,
+    ) -> Result<Response<openshell_core::proto::FinalizeMainProcessExitResponse>, Status> {
         Err(Status::unimplemented("not used by this test server"))
     }
 
@@ -274,6 +282,13 @@ impl OpenShell for TestOpenShell {
         Ok(Response::new(
             openshell_core::proto::RevokeSshSessionResponse::default(),
         ))
+    }
+
+    async fn exchange_provider_subject_token(
+        &self,
+        _request: tonic::Request<ExchangeProviderSubjectTokenRequest>,
+    ) -> Result<Response<ExchangeProviderSubjectTokenResponse>, Status> {
+        Err(Status::unimplemented("unused"))
     }
 
     async fn create_provider(

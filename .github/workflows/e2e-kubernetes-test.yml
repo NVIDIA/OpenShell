@@ -47,11 +47,21 @@ on:
         required: false
         type: string
         default: "v2026.4.25"
-      cli-artifact-prefix:
-        description: "Optional prebuilt CLI artifact prefix (artifact suffix is linux-<arch>)"
+      gateway-artifact:
+        description: "Optional prebuilt gateway artifact used to compose a local test image"
         required: false
         type: string
         default: ""
+      external-driver-binary:
+        description: "Optional standalone compute driver binary used to compose a local test image"
+        required: false
+        type: string
+        default: ""
+      cluster-images:
+        description: "Space-separated published images to preload into kind"
+        required: false
+        type: string
+        default: "gateway supervisor"
 
 permissions:
   actions: read
@@ -81,62 +91,29 @@ jobs:
           ref: ${{ inputs['checkout-ref'] || github.sha }}
 
       - name: Use prebuilt OpenShell CLI
-        if: inputs.cli-artifact-prefix != ''
         uses: ./.github/actions/setup-e2e-cli
+
+      - name: Use prebuilt OpenShell gateway
+        if: inputs.gateway-artifact != ''
+        uses: ./.github/actions/setup-e2e-gateway
         with:
-          artifact-prefix: ${{ inputs.cli-artifact-prefix }}
+          artifact-name: ${{ inputs.gateway-artifact }}
 
-      - name: Install mise
-        run: |
-          curl https://mise.run | MISE_VERSION=v2026.4.25 sh
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-          echo "$HOME/.local/share/mise/shims" >> "$GITHUB_PATH"
-
-      - name: Install tools
-        run: mise install --locked
-
-      # The openshell-policy crate transitively pulls in z3-sys, whose
-      # build script needs the z3 C/C++ headers, clang/bindgen, and CMake to
-      # compile both system-linked and bundled-Z3 builds. The bare runner
-      # doesn't ship them; the CI container
-      # image used by other Rust e2e jobs does, but we can't run this job
-      # there (the runner's container handler injects its own --network
-      # bridge, which conflicts with the --network host we need so kind's
-      # API server is reachable from the test process).
-      - name: Install z3 build deps
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends libz3-dev clang cmake
-
-      - name: Log in to GHCR
-        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
-
-      - name: Create kind cluster
-        uses: helm/kind-action@ef37e7f390d99f746eb8b610417061a60e82a6cc # v1.14.0
+      - name: Use prebuilt external compute driver
+        if: inputs.external-driver-binary != ''
+        uses: ./.github/actions/setup-e2e-driver
         with:
-          cluster_name: ${{ env.KIND_CLUSTER_NAME }}
-          wait: 120s
+          binary: ${{ inputs.external-driver-binary }}
 
-      # mise.toml sets KUBECONFIG="{{config_root}}/kubeconfig"; helm/kind-action
-      # writes to ~/.kube/config. Materialize the kind context at the mise path
-      # so `mise run e2e:kubernetes` (and the wrapper's `kubectl --context=...`)
-      # finds the kind cluster.
-      - name: Export kind kubeconfig to mise path
-        run: |
-          set -euo pipefail
-          kind get kubeconfig --name "$KIND_CLUSTER_NAME" > "$GITHUB_WORKSPACE/kubeconfig"
-          chmod 600 "$GITHUB_WORKSPACE/kubeconfig"
-
-      - name: Load gateway and supervisor images into kind
-        run: |
-          set -euo pipefail
-          for component in gateway supervisor; do
-            image="ghcr.io/nvidia/openshell/${component}:${{ inputs.image-tag }}"
-            archive="${RUNNER_TEMP:-/tmp}/openshell-${component}-linux-amd64.tar"
-            docker pull --platform linux/amd64 "$image"
-            docker image save --platform linux/amd64 --output "$archive" "$image"
-            kind load image-archive "$archive" --name "$KIND_CLUSTER_NAME"
-          done
+      - name: Set up kind cluster
+        uses: ./.github/actions/setup-e2e-kind
+        with:
+          cluster-name: ${{ env.KIND_CLUSTER_NAME }}
+          image-tag: ${{ inputs.image-tag }}
+          images: ${{ inputs.cluster-images }}
+          registry-username: ${{ github.actor }}
+          registry-password: ${{ secrets.GITHUB_TOKEN }}
+          mise-version: ${{ inputs.mise-version }}
 
       - name: Run Kubernetes E2E
         env:

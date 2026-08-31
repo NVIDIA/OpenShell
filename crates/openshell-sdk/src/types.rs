@@ -65,6 +65,7 @@ pub enum SandboxPhase {
     Stopping,
     Stopped,
     Starting,
+    Completed,
 }
 
 impl From<proto::SandboxPhase> for SandboxPhase {
@@ -79,6 +80,7 @@ impl From<proto::SandboxPhase> for SandboxPhase {
             proto::SandboxPhase::Stopping => Self::Stopping,
             proto::SandboxPhase::Stopped => Self::Stopped,
             proto::SandboxPhase::Starting => Self::Starting,
+            proto::SandboxPhase::Completed => Self::Completed,
         }
     }
 }
@@ -195,6 +197,9 @@ pub struct ExecOptions {
     pub timeout: Option<Duration>,
     /// Optional stdin payload.
     pub stdin: Option<Vec<u8>>,
+    /// Skip sourcing shell login/profile startup files before the command.
+    /// Default (`false`) preserves login-shell behavior.
+    pub no_login_shell: bool,
 }
 
 /// Result of a non-streaming exec call.

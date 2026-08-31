@@ -207,18 +207,28 @@ identity provider. Requires an authenticated gateway connection.
 Create a sandbox through the selected gateway and launch its canonical main
 process. By default, the CLI attaches to that retained process after the
 sandbox becomes ready. A trailing command defines the canonical main process;
-without one, the default is `/bin/bash -l` with a PTY.
+without one, the default is `/bin/bash -l` with a PTY. Explicit commands remain
+foreground in non-interactive automation: stdout and stderr stream to the
+caller and the CLI returns the command's exact status. Exit 0 leaves
+`Completed`; nonzero leaves `Error/MainProcessFailed`.
+Starting either retained terminal result invalidates SSH sessions from the
+previous runtime generation.
 
 | Flag | Description |
 |------|-------------|
 | `--name <NAME>` | Sandbox name (auto-generated if omitted) |
 | `--from <SOURCE>` | Community name, Dockerfile path, directory, or image reference (BYOC) |
-| `--no-keep` | Delete the sandbox after the initial command or shell exits |
+| `--no-keep` | Delete the sandbox after main output and the result drain |
 | `--detach` | Start the canonical main process without attaching |
 | `--editor vscode|cursor` | Launch a remote editor and keep the sandbox alive |
 | `--gpu [COUNT]` | Request the driver's default GPU selection or a specific count |
 | `--cpu <QUANTITY>` | CPU limit (for example: `500m`, `1`, `2.5`) |
 | `--memory <QUANTITY>` | Memory limit (for example: `512Mi`, `4Gi`, `8G`) |
+
+`--detach` adds no attachment grace period: the sandbox reports the canonical
+process result immediately when it exits. Foreground creation declares one
+expected main-process SSH attachment; cleanup finalizes after that connection
+drains and closes naturally.
 | `--driver-config-json <JSON>` | Experimental driver-keyed configuration object |
 | `--provider <NAME>` | Provider to attach (repeatable) |
 | `--policy <PATH>` | Custom policy YAML; overrides the built-in default and `OPENSHELL_SANDBOX_POLICY` |
@@ -269,8 +279,9 @@ and waits for the `Stopped` phase.
 
 ### `openshell sandbox start [name]`
 
-Start a stopped sandbox and wait for `Ready`. The name defaults to the
-last-used sandbox.
+Start a stopped, failed, or completed sandbox and wait for `Ready`. This
+launches a fresh canonical-main instance. The name defaults to the last-used
+sandbox.
 
 ### `openshell sandbox exec [OPTIONS] -- COMMAND...`
 
@@ -381,7 +392,7 @@ The sandbox name defaults to the last-used sandbox.
 
 ### `openshell policy update [name]`
 
-Incrementally merge live network policy changes into the current sandbox policy. Multiple flags in one invocation are applied as one atomic batch and create at most one new revision.
+Incrementally merge live network policy changes into the current sandbox policy when the selected compute driver supports live updates. Multiple flags in one invocation are applied as one atomic batch and create at most one new revision. MXC rejects live policy merges; delete and recreate an MXC sandbox instead.
 
 | Flag | Default | Description |
 |------|---------|-------------|
@@ -411,7 +422,7 @@ Notes:
 
 ### `openshell policy set [name] --policy <PATH>`
 
-Replace the full policy on a live sandbox. Only the dynamic `network_policies` field can be changed at runtime.
+Replace the full policy on a live sandbox when the selected compute driver supports live updates. Only the dynamic `network_policies` field can be changed at runtime. MXC rejects live policy replacement; delete and recreate an MXC sandbox instead.
 
 | Flag | Default | Description |
 |------|---------|-------------|
@@ -471,7 +482,7 @@ Review agent-authored network rule proposals. This command group is intentionall
 - `openshell rule clear [name]`
 - `openshell rule history [name]`
 
-Sandbox names default to the last-used sandbox. Bulk approval of security-flagged proposals requires explicit `--include-security-flagged`.
+Sandbox names default to the last-used sandbox. The CLI fetches and submits each proposal's current review token; a changed live candidate remains pending until it is reviewed again. Bulk approval of security-flagged proposals requires explicit `--include-security-flagged`.
 
 ---
 

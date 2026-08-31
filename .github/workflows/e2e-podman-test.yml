@@ -1,0 +1,91 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: Podman E2E Test
+
+on:
+  workflow_call:
+    inputs:
+      image-tag:
+        required: true
+        type: string
+      checkout-ref:
+        required: false
+        type: string
+        default: ""
+      gateway-artifact:
+        required: false
+        type: string
+        default: ""
+      external-driver-binary:
+        required: false
+        type: string
+        default: ""
+      suite-matrix:
+        required: false
+        type: string
+        default: >-
+          [{"suite":"provider-refresh-keycloak","runner":"ubuntu-26.04","podman_major":"5","podman_package_version":"5.7.0+ds2-3build1","conmon_package_version":"2.1.13+ds1-2","cmd":"mise run --no-deps --skip-deps e2e:provider-refresh-keycloak"}]
+
+permissions:
+  actions: read
+  contents: read
+  packages: read
+
+jobs:
+  e2e:
+    name: E2E (rust-podman-${{ matrix.suite }}, ${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(inputs.suite-matrix) }}
+    env:
+      IMAGE_TAG: ${{ inputs.image-tag }}
+      MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      OPENSHELL_REGISTRY: ghcr.io/nvidia/openshell
+      OPENSHELL_SUPERVISOR_IMAGE: ${{ format('ghcr.io/nvidia/openshell/supervisor:{0}', inputs.image-tag) }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.checkout-ref || github.sha }}
+          persist-credentials: false
+
+      - uses: ./.github/actions/setup-e2e-cli
+
+      - uses: ./.github/actions/setup-e2e-gateway
+        with:
+          artifact-name: ${{ inputs.gateway-artifact }}
+
+      - if: inputs.external-driver-binary != ''
+        uses: ./.github/actions/setup-e2e-driver
+        with:
+          binary: ${{ inputs.external-driver-binary }}
+
+      - uses: ./.github/actions/setup-e2e-podman
+        with:
+          podman-major: ${{ matrix.podman_major }}
+          podman-package-version: ${{ matrix.podman_package_version }}
+          conmon-package-version: ${{ matrix.conmon_package_version }}
+
+      - name: Log in to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | podman login ghcr.io -u "${GITHUB_ACTOR}" --password-stdin
+
+      - name: Run tests
+        run: ${{ matrix.cmd }}
+
+      - name: Print AppArmor denials
+        if: always()
+        run: sudo dmesg | grep -E 'apparmor=.*DENIED|profile="unprivileged_userns"' | tail -100 || true
+
+      - name: Fail on pasta SIGTERM AppArmor denial
+        if: always()
+        run: |
+          set -euo pipefail
+          denials="$(sudo dmesg | grep -E 'profile="pasta".*requested_mask="receive".*signal=term.*peer="podman"' || true)"
+          if [ -n "${denials}" ]; then
+            echo "::error::pasta denied Podman's SIGTERM; Podman will use its SIGKILL fallback"
+            printf '%s\n' "${denials}"
+            exit 1
+          fi

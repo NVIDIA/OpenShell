@@ -13,6 +13,7 @@
 import type { Interceptor, Transport } from '@connectrpc/connect';
 import { createGrpcTransport } from '@connectrpc/connect-node';
 import { SdkError } from './errors.js';
+import type { OidcTokenProvider } from './oidc.js';
 
 export interface ConnectOptions {
   /** Gateway URL (`http://...` or `https://...`). */
@@ -29,23 +30,29 @@ export interface ConnectOptions {
   clientKey?: Buffer;
   /** Bearer token for direct OIDC auth. Mutually exclusive with edgeToken. */
   oidcToken?: string;
+  /** Renewable OIDC bearer provider. Mutually exclusive with oidcToken and edgeToken. */
+  oidcTokenProvider?: OidcTokenProvider;
   /** Cloudflare Access token. See the sidecar note above for CF-fronted gateways. */
   edgeToken?: string;
   /** Disable TLS verification (dev/debug only). */
   insecureSkipVerify?: boolean;
   /**
-   * Permit sending an auth token (oidcToken/edgeToken) over plaintext `http://`
-   * to a non-loopback host. Off by default: tokens over cleartext to a remote
-   * host leak credentials on the wire. Loopback hosts are always allowed.
+   * Permit sending an auth token (oidcToken/oidcTokenProvider/edgeToken) over
+   * plaintext `http://` to a non-loopback host. Off by default: tokens over
+   * cleartext to a remote host leak credentials on the wire. Loopback hosts are
+   * always allowed.
    */
   allowInsecureAuth?: boolean;
 }
 
 // OIDC bearer takes precedence; otherwise attach the Cloudflare Access header +
 // cookie. No-op when neither token is set.
-function authInterceptor(opts: ConnectOptions): Interceptor {
+/** @internal Exported for transport contract tests; not part of the package root API. */
+export function authInterceptor(opts: ConnectOptions): Interceptor {
   return (next) => async (req) => {
-    if (opts.oidcToken) {
+    if (opts.oidcTokenProvider) {
+      req.header.set('authorization', `Bearer ${await opts.oidcTokenProvider.getToken(req.signal)}`);
+    } else if (opts.oidcToken) {
       req.header.set('authorization', `Bearer ${opts.oidcToken}`);
     } else if (opts.edgeToken) {
       req.header.set('cf-access-jwt-assertion', opts.edgeToken);
@@ -71,8 +78,11 @@ function assertMtlsPair(opts: ConnectOptions): void {
 // silently prefers OIDC when both are set. Reject that ambiguity up front so a
 // caller does not think an edge token is in effect when it is being ignored.
 function assertTokenExclusivity(opts: ConnectOptions): void {
-  if (opts.oidcToken !== undefined && opts.edgeToken !== undefined) {
-    throw new SdkError('invalid_config', 'oidcToken and edgeToken are mutually exclusive');
+  const configured = [opts.oidcToken, opts.oidcTokenProvider, opts.edgeToken].filter(
+    (value) => value !== undefined,
+  ).length;
+  if (configured > 1) {
+    throw new SdkError('invalid_config', 'oidcToken, oidcTokenProvider, and edgeToken are mutually exclusive');
   }
 }
 
@@ -96,7 +106,7 @@ function isLoopbackHost(host: string): boolean {
 // host puts the credential on the wire in the clear. Refuse it unless the caller
 // explicitly opts in. Loopback (local-dev / edge-sidecar) is always fine.
 function assertTokenTransportSecurity(opts: ConnectOptions): void {
-  const hasToken = opts.oidcToken !== undefined || opts.edgeToken !== undefined;
+  const hasToken = opts.oidcToken !== undefined || opts.oidcTokenProvider !== undefined || opts.edgeToken !== undefined;
   if (!hasToken || opts.allowInsecureAuth || opts.gateway.startsWith('https://')) return;
   let host: string;
   try {

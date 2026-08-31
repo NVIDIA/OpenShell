@@ -156,7 +156,7 @@ cat > "$tmp/reviews.json" <<'JSON'
       "login": "drew"
     },
     "author_association": "MEMBER",
-    "body": "> **gator-agent**\n\n## PR Review Status\n\nHead SHA: `1111111111111111111111111111111111111111`\nBase SHA: `aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa`\nMerge base SHA: `bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb`\nPatch ID: `cccccccccccccccccccccccccccccccccccccccc`\nGator payload: `2`\n\nGeneral findings:\n- Finding ID: GATOR-11111111-01 — Keep package verification.",
+    "body": "> **gator-agent**\n\n## PR Review Status\n\nGeneral findings:\n- Finding ID: GATOR-11111111-01 — Keep package verification.\n\n<details>\n<summary>Gator metadata</summary>\n\n- Head SHA: `1111111111111111111111111111111111111111`\n- Base SHA: `aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa`\n- Merge base SHA: `bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb`\n- Patch ID: `cccccccccccccccccccccccccccccccccccccccc`\n- Gator payload: `2`\n\n</details>",
     "state": "COMMENTED",
     "submitted_at": "2026-07-28T19:53:23Z",
     "commit_id": "1111111111111111111111111111111111111111"
@@ -342,12 +342,14 @@ if "$LEDGER" --input "$tmp/missing-pr.json" >/dev/null 2>&1; then
 fi
 
 rg -q 'COPY bin/review-feedback-ledger /usr/local/bin/review-feedback-ledger' \
-    "$GATOR_DIR/Dockerfile"
+  "$GATOR_DIR/Dockerfile"
+rg -q 'COPY bin/resolve-gator-review-threads /usr/local/bin/resolve-gator-review-threads' \
+  "$GATOR_DIR/Dockerfile"
 rg -q 'COPY bin/validate-review-findings /usr/local/bin/validate-review-findings' \
-    "$GATOR_DIR/Dockerfile"
+  "$GATOR_DIR/Dockerfile"
 ruby -ryaml -e '
   manifest = YAML.load_file(ARGV.fetch(0))
-  abort unless manifest.fetch("payload_version") == 4
+  abort unless manifest.fetch("payload_version") == 7
   resource = manifest.fetch("resources").find {
     |entry| entry.fetch("id") == "gator-review-findings-schema"
   }
@@ -384,5 +386,13 @@ rg -q '`test_dispatch_required`' \
     "$GATOR_DIR/skills/gator-gate/SKILL.md"
 rg -q 'attacker_or_operator_prerequisite' \
     "$GATOR_DIR/skills/gator-gate/references/review-findings-schema.md"
+rg -Fq 'Write `Summary` as natural prose that can be read aloud' \
+    "$GATOR_DIR/skills/gator-gate/SKILL.md"
+rg -Fq '<summary>Agent context</summary>' \
+    "$GATOR_DIR/skills/gator-gate/SKILL.md"
+rg -Fq '<summary>Gator metadata</summary>' \
+    "$GATOR_DIR/skills/gator-gate/SKILL.md"
+rg -Fq 'Those fields validate the finding;' \
+    "$GATOR_DIR/skills/gator-gate/SKILL.md"
 
 printf 'PASS: gator review feedback ledger tests\n'

@@ -4,6 +4,7 @@
 package oidc
 
 import (
+	"context"
 	"io"
 	"time"
 
@@ -22,17 +23,20 @@ const defaultTimeout = 2 * time.Minute
 // attempt. It is built by applying [LoginOption] functions to a
 // zero-value struct and then filling in defaults.
 type loginConfig struct {
-	issuer       string
-	clientID     string
-	clientSecret string
-	scopes       []string
-	scopesSet    bool
-	callbackPort int
-	timeout      time.Duration
-	keyboardFlow bool
-	inMemory     bool
-	displayFunc  func(verificationURL, userCode string)
-	gateway      string
+	issuer         string
+	clientID       string
+	clientSecret   string
+	secretProvider func(context.Context) (string, error)
+	audience       string
+	audienceSet    bool
+	scopes         []string
+	scopesSet      bool
+	callbackPort   int
+	timeout        time.Duration
+	keyboardFlow   bool
+	inMemory       bool
+	displayFunc    func(verificationURL, userCode string)
+	gateway        string
 
 	// Internal fields for testing. Not exposed via public API.
 	tokenDir        string                                     // override token directory
@@ -75,10 +79,26 @@ func WithClientID(id string) LoginOption {
 }
 
 // WithClientSecret sets the client secret for the client credentials
-// grant. Required for [ClientCredentials].
+// grant. Required for [ClientCredentials] and [NewClientCredentialsAuth].
 func WithClientSecret(secret string) LoginOption {
 	return func(c *loginConfig) {
 		c.clientSecret = secret
+	}
+}
+
+// WithClientSecretProvider resolves the client secret for each exchange.
+// Provider errors and returned secrets are never included in SDK errors.
+func WithClientSecretProvider(provider func(context.Context) (string, error)) LoginOption {
+	return func(c *loginConfig) {
+		c.secretProvider = provider
+	}
+}
+
+// WithAudience sets the optional OAuth2 resource-server audience.
+func WithAudience(audience string) LoginOption {
+	return func(c *loginConfig) {
+		c.audience = audience
+		c.audienceSet = true
 	}
 }
 
@@ -134,10 +154,9 @@ func WithDisplayFunc(fn func(verificationURL, userCode string)) LoginOption {
 	}
 }
 
-// WithGateway sets the gateway name for [DeviceLogin] and
-// [ClientCredentials]. When set, OIDC config is read from the
-// gateway's metadata.json and tokens are persisted to the gateway
-// directory.
+// WithGateway sets the gateway name for [DeviceLogin], [ClientCredentials],
+// and [NewClientCredentialsAuth]. OIDC configuration is read from the
+// gateway's metadata.json. Client-credentials tokens are never persisted.
 func WithGateway(name string) LoginOption {
 	return func(c *loginConfig) {
 		c.gateway = name

@@ -28,8 +28,6 @@ use url::Url;
 
 static SANDBOX_LIFECYCLE_LOCK: Mutex<()> = Mutex::const_new(());
 
-const DURABLE_MAIN_SCRIPT: &str = r#"echo "$1"; exec sleep infinity"#;
-
 #[derive(Clone, Copy)]
 struct IdentityScenario {
     gateway_name: &'static str,
@@ -915,10 +913,7 @@ async fn workspace_user_cannot_create_sandbox_in_another_workspace() {
             "oidc-xcreate-denied",
             "--no-tty",
             "--",
-            "sh",
-            "-c",
-            DURABLE_MAIN_SCRIPT,
-            "_",
+            "echo",
             "denied",
         ],
     )
@@ -1388,12 +1383,8 @@ async fn assert_can_create_sandbox(session: &LoginSession, workspace: &str, sand
             "--name",
             sandbox_name,
             "--no-tty",
-            "--detach",
             "--",
-            "sh",
-            "-c",
-            DURABLE_MAIN_SCRIPT,
-            "_",
+            "echo",
             &marker,
         ],
     )
@@ -1413,6 +1404,10 @@ async fn assert_can_create_sandbox(session: &LoginSession, workspace: &str, sand
     let list_output = combined_output(&list);
     let cleanup = run_workspace_cli(session, workspace, &["sandbox", "delete", sandbox_name]).await;
 
+    assert!(
+        create_output.contains(&marker),
+        "sandbox command output should contain {marker}:\n{create_output}"
+    );
     assert!(
         list.status.success() && list_output.contains(sandbox_name),
         "created sandbox {sandbox_name} should appear in the sandbox list:\n{list_output}"
@@ -1435,12 +1430,8 @@ async fn assert_can_delete_sandbox(session: &LoginSession, workspace: &str, sand
             "--name",
             sandbox_name,
             "--no-tty",
-            "--detach",
             "--",
-            "sh",
-            "-c",
-            DURABLE_MAIN_SCRIPT,
-            "_",
+            "echo",
             &marker,
         ],
     )

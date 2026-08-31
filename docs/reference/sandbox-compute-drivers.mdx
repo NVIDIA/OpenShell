@@ -29,7 +29,9 @@ The gateway forwards one exact, persisted main-process specification to every
 driver. Drivers serialize that specification in
 `OPENSHELL_MAIN_PROCESS_SPEC`; they do not install an idle `sleep` workload or
 reconstruct argv with shell parsing. Runtime restart policies are disabled so
-an exited canonical process remains a terminal sandbox error.
+an exited canonical process remains a terminal sandbox result. Exit code zero
+produces `Completed`; a nonzero or signal-normalized exit produces `Error`
+with the exact exit code. Driver and supervisor failures remain `Error`.
 
 ## Configure a Compute Driver
 
@@ -152,6 +154,10 @@ that already covers loopback. Otherwise, the Docker driver requests a separate
 For maintainer-level implementation details, refer to the [Docker driver README](https://github.com/NVIDIA/OpenShell/blob/main/crates/openshell-driver-docker/README.md).
 
 Select Docker with `compute_drivers = ["docker"]` in `[openshell.gateway]`. Configure Docker driver values such as `socket_path`, `grpc_endpoint`, `network_name`, `supervisor_bin`, `supervisor_image`, `image_pull_policy`, `ssh_socket_path`, `sandbox_pids_limit`, and `guest_tls_*` in `[openshell.drivers.docker]`. When `socket_path` is unset, the driver uses the same responsive local socket selected by auto-detection. An explicitly selected Docker driver falls back to `/var/run/docker.sock` when no candidate responds.
+
+When operating `openshell-driver-docker` as an external driver, set
+`OPENSHELL_OTLP_ENDPOINT` to export its spans. The driver continues W3C trace
+context from gateway RPCs and reports as `openshell-driver-docker`.
 
 Stop stops the existing Docker container without removing its writable
 layer or attached volumes. Start starts that same container. A durably
@@ -369,7 +375,7 @@ For maintainer-level implementation details, refer to the [Kubernetes driver REA
 |---|---|---|
 | `compute_drivers = ["kubernetes"]` | Not applicable | Select the Kubernetes compute driver. |
 | `[openshell.drivers.kubernetes].namespace` | `server.sandboxNamespace` | Set the namespace for sandbox resources. The Helm chart defaults to the release namespace when left empty. |
-| `service_account_name` | `sandboxServiceAccount.name` | Set the Kubernetes service account assigned to sandbox pods and accepted by the gateway TokenReview bootstrap path. The Helm chart creates a dedicated sandbox service account by default. |
+| `service_account_name` | `sandboxServiceAccount.name` | Set the Kubernetes service account assigned to sandbox pods and accepted by the Kubernetes driver's TokenReview bootstrap path. The Helm chart creates a dedicated sandbox service account by default. |
 | `default_image` | `server.sandboxImage` | Set the default sandbox image. |
 | `image_pull_policy` | `server.sandboxImagePullPolicy` | Set the Kubernetes image pull policy for sandbox pods. |
 | `image_pull_secrets` | `server.sandboxImagePullSecrets` | Attach Kubernetes image-pull Secrets to sandbox pods. Managed mode copies these explicitly named Secrets from the configured source namespace into each workspace namespace. In shared and operator modes, the Secrets must already exist in the sandbox namespace. |

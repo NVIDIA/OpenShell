@@ -33,11 +33,12 @@ func (p *policyClient) GetDraft(ctx context.Context, workspace, sandboxName stri
 	return converter.DraftPolicyFromProto(resp), nil
 }
 
-func (p *policyClient) ApproveDraftChunk(ctx context.Context, workspace, sandboxName, chunkID string) (*ApproveResult, error) {
+func (p *policyClient) ApproveDraftChunk(ctx context.Context, workspace, sandboxName, chunkID, reviewToken string) (*ApproveResult, error) {
 	resp, err := p.client.ApproveDraftChunk(ctx, &pb.ApproveDraftChunkRequest{
-		Name:      sandboxName,
-		ChunkId:   chunkID,
-		Workspace: workspace,
+		Name:        sandboxName,
+		ChunkId:     chunkID,
+		Workspace:   workspace,
+		ReviewToken: reviewToken,
 	})
 	if err != nil {
 		return nil, converter.FromGRPCError(err)
@@ -60,10 +61,18 @@ func (p *policyClient) RejectDraftChunk(ctx context.Context, workspace, sandboxN
 
 func (p *policyClient) ApproveAllDraftChunks(ctx context.Context, workspace, sandboxName string, opts ...ApproveAllOption) (*ApproveAllResult, error) {
 	cfg := types.ApplyApproveAllOptions(opts)
+	approvals := make([]*pb.DraftChunkApproval, 0, len(cfg.Approvals()))
+	for _, approval := range cfg.Approvals() {
+		approvals = append(approvals, &pb.DraftChunkApproval{
+			ChunkId:     approval.ChunkID,
+			ReviewToken: approval.ReviewToken,
+		})
+	}
 	resp, err := p.client.ApproveAllDraftChunks(ctx, &pb.ApproveAllDraftChunksRequest{
 		Name:                   sandboxName,
 		IncludeSecurityFlagged: cfg.IncludeSecurityFlagged(),
 		Workspace:              workspace,
+		Approvals:              approvals,
 	})
 	if err != nil {
 		return nil, converter.FromGRPCError(err)

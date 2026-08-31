@@ -60,6 +60,11 @@ Critical or Warning missing any evidence field becomes a non-blocking
 list sibling sites on the first finding instead. Suggestions always remain
 non-blocking.
 
+These fields are Gator's internal evidence contract, not the public comment
+format. After validation, render blockers using the human-first
+`Summary`/`Fix`/`Verify` card and conditional `Agent context` defined in the
+gator-gate skill. Do not expose the schema's evidence labels as prose headings.
+
 For a finite family, put every known member in `sibling_sites` under one
 invariant and one finding ID. On later rounds, update that finding instead of
 creating a sibling finding.

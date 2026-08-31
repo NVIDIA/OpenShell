@@ -303,7 +303,7 @@ pub struct KubernetesComputeConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub operator_namespace_file: Option<String>,
     /// Kubernetes `ServiceAccount` assigned to sandbox pods and accepted by
-    /// the gateway's `TokenReview` bootstrap authenticator.
+    /// the driver's `TokenReview` bootstrap authenticator.
     pub service_account_name: String,
     pub default_image: String,
     pub image_pull_policy: String,
@@ -1482,7 +1482,7 @@ mod tests {
     #[test]
     fn upstream_proxy_config_rejects_unsupported_proxy_scheme() {
         let cfg = KubernetesComputeConfig {
-            https_proxy: Some("https://proxy.corp.example:8443".to_string()),
+            https_proxy: Some("socks5://proxy.corp.example:1080".to_string()),
             ..KubernetesComputeConfig::default()
         };
         let err = cfg.validate_upstream_proxy_config().unwrap_err();

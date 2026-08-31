@@ -18,8 +18,8 @@ depends = [
 
 ["test:docs-website"]
 description = "Test the docs-website sync script"
-# --no-project skips the workspace (maturin) build; --with supplies pytest and
-# the script's runtime dep (PyYAML), which live outside the project env.
+# --no-project skips installing the OpenShell package; --with supplies pytest
+# and the script's runtime dependency (PyYAML), which lives outside the project env.
 run = "uv run --no-project --with pytest --with pyyaml pytest tasks/scripts/sync_docs_website_test.py"
 
 ["test:sbom"]
@@ -122,6 +122,12 @@ run = [
   "CONTAINER_RUNTIME=podman e2e/with-keycloak.sh env OPENSHELL_E2E_OIDC_GATEWAY=1 e2e/with-podman-gateway.sh cargo test --manifest-path e2e/rust/Cargo.toml --features e2e-oidc-pkce --test oidc_pkce",
 ]
 
+["e2e:provider-refresh-keycloak"]
+description = "Run provider refresh recovery e2e against Keycloak and a Podman gateway"
+run = [
+  "CONTAINER_RUNTIME=podman e2e/with-keycloak.sh e2e/with-podman-gateway.sh cargo test --manifest-path e2e/rust/Cargo.toml --features e2e-provider-refresh-keycloak --test provider_refresh_keycloak -- --nocapture",
+]
+
 ["e2e:oidc-pkce:docker"]
 description = "Run Linux browser PKCE and RBAC e2e tests against Keycloak and a Docker gateway"
 run = [
@@ -135,10 +141,6 @@ env = { UV_NO_SYNC = "1", PYTHONPATH = "python" }
 run = [
   "CONTAINER_RUNTIME=docker e2e/with-keycloak.sh env OPENSHELL_E2E_OIDC_GATEWAY=1 e2e/with-docker-gateway.sh uv run pytest -m 'not gpu' e2e/python/oidc",
 ]
-
-["e2e:podman:rootless"]
-description = "Run Rust CLI e2e tests against a rootless Podman-backed gateway"
-run = "e2e/rust/e2e-podman-rootless.sh"
 
 ["e2e:podman:gpu"]
 description = "Run GPU e2e against a standalone gateway with the Podman compute driver"
@@ -223,6 +225,13 @@ description = "Run mechanistic L4 smoke against a Docker-backed gateway"
 run = [
   "cargo build -p openshell-cli",
   "e2e/with-docker-gateway.sh bash -lc 'target/debug/openshell settings set --global --key agent_policy_proposals_enabled --value true --yes && OPENSHELL_BIN=$PWD/target/debug/openshell bash e2e/policy-advisor/mechanistic-smoke.sh'",
+]
+
+["e2e:mechanistic-existing-endpoint"]
+description = "Run #2821 existing inspected-endpoint auto-approval regression"
+run = [
+  "cargo build -p openshell-cli",
+  "e2e/with-docker-gateway.sh bash -lc 'target/debug/openshell settings set --global --key agent_policy_proposals_enabled --value true --yes && OPENSHELL_BIN=$PWD/target/debug/openshell bash e2e/policy-advisor/existing-endpoint-auto-approve.sh'",
 ]
 
 ["e2e:docker:gpu"]

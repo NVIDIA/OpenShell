@@ -45,10 +45,29 @@ await client.sandbox.delete(sandbox.name)
 ```
 
 `connect()` constructs a lazy client; call `health()` when startup must verify
-gateway reachability. Authentication material is static for the client's
-lifetime, so create a new client after refreshing an OIDC or edge token. The
-root client has no explicit close method because Connect does not retain a
-dedicated session. Close operation-scoped streams and forward handles instead.
+gateway reachability. Static `oidcToken` and `edgeToken` values remain fixed for
+the client's lifetime. For long-running service automation, use the renewable
+client-credentials provider:
+
+```ts
+import { clientCredentials, OpenShellClient } from '@nvidia/openshell-sdk'
+
+const client = await OpenShellClient.connect({
+  gateway,
+  oidcTokenProvider: clientCredentials({
+    issuer: 'https://idp.example.com/realms/openshell',
+    clientId: 'openshell-service',
+    clientSecret: () => process.env.OPENSHELL_OIDC_CLIENT_SECRET!,
+    scopes: ['sandbox:read', 'sandbox:write'],
+    audience: 'openshell-gateway',
+  }),
+})
+```
+
+The provider discovers and validates the issuer, keeps credentials and tokens
+in memory, and renews before expiry. The root client has no explicit close
+method because Connect does not retain a dedicated session. Close
+operation-scoped streams and forward handles instead.
 
 Express the create-time safety boundary with `policy`. Sandbox-scoped `setPolicy`
 cannot introduce static policy fields later, so set filesystem, landlock,

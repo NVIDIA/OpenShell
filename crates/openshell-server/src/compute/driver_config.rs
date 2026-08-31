@@ -12,7 +12,11 @@ pub mod builtin;
 
 use crate::config_file;
 use crate::defaults::LocalTlsPaths;
+#[cfg(target_os = "windows")]
+use openshell_core::ComputeDriverKind;
 use openshell_core::{Error, Result};
+#[cfg(target_os = "windows")]
+use openshell_driver_mxc::MxcComputeConfig;
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -49,6 +53,15 @@ pub struct DriverStartupContext<'a> {
     pub endpoint_overrides: &'a BTreeMap<String, PathBuf>,
 }
 
+/// Build the selected MXC config from TOML. MXC is Windows-only and has no
+/// runtime-default overlay; the driver reads its own settings from the config.
+/// The Linux built-in driver configs now live in the `builtin` submodule
+/// (compiled only off Windows).
+#[cfg(target_os = "windows")]
+pub fn mxc_config_from_context(context: DriverStartupContext<'_>) -> Result<MxcComputeConfig> {
+    driver_config_from_context(context, ComputeDriverKind::Mxc.as_str())
+}
+
 pub fn remote_driver_config_from_context(
     context: DriverStartupContext<'_>,
     name: &str,
@@ -73,51 +86,6 @@ pub fn remote_driver_config_from_context(
 pub struct RemoteDriverConfig {
     #[serde(default)]
     pub socket_path: PathBuf,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(default)]
-pub struct KubernetesSaBootstrapConfig {
-    pub namespace: String,
-    pub service_account_name: String,
-    pub workspace_mode: String,
-    pub gateway_id: String,
-}
-
-impl Default for KubernetesSaBootstrapConfig {
-    fn default() -> Self {
-        Self {
-            namespace: "openshell".to_string(),
-            service_account_name: "default".to_string(),
-            workspace_mode: "shared".to_string(),
-            gateway_id: "openshell".to_string(),
-        }
-    }
-}
-
-pub fn kubernetes_sa_bootstrap_config(
-    file: Option<&config_file::ConfigFile>,
-) -> Result<KubernetesSaBootstrapConfig> {
-    let Some(file) = file else {
-        return Err(Error::config(
-            "K8s ServiceAccount bootstrap requires [openshell.drivers.kubernetes] when sandbox JWT issuing is enabled in-cluster",
-        ));
-    };
-    if !file.openshell.drivers.contains_key("kubernetes") {
-        return Err(Error::config(
-            "K8s ServiceAccount bootstrap requires [openshell.drivers.kubernetes] when sandbox JWT issuing is enabled in-cluster",
-        ));
-    }
-    let merged = config_file::driver_table(
-        "kubernetes",
-        &file.openshell.gateway,
-        file.openshell.drivers.get("kubernetes"),
-    );
-    merged.try_into().map_err(|error| {
-        Error::config(format!(
-            "invalid Kubernetes ServiceAccount bootstrap config: {error}"
-        ))
-    })
 }
 
 pub fn driver_config_from_context<T>(
@@ -232,29 +200,6 @@ service_account_name = "sandbox-sa"
             cfg.socket_path,
             PathBuf::from("/run/openshell/kubernetes.sock")
         );
-    }
-
-    #[test]
-    fn kubernetes_sa_bootstrap_uses_public_gateway_config() {
-        let file: config_file::ConfigFile = toml::from_str(
-            r#"
-[openshell.gateway]
-sandbox_namespace = "sandboxes"
-
-[openshell.drivers.kubernetes]
-socket_path = "/run/openshell/kubernetes.sock"
-workspace_mode = "managed"
-gateway_id = "gateway-a"
-service_account_name = "sandbox-sa"
-"#,
-        )
-        .expect("valid config");
-
-        let cfg = kubernetes_sa_bootstrap_config(Some(&file)).expect("bootstrap config");
-        assert_eq!(cfg.namespace, "sandboxes");
-        assert_eq!(cfg.workspace_mode, "managed");
-        assert_eq!(cfg.gateway_id, "gateway-a");
-        assert_eq!(cfg.service_account_name, "sandbox-sa");
     }
 
     #[test]

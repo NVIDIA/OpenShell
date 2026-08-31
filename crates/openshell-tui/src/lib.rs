@@ -1407,6 +1407,7 @@ fn spawn_create_sandbox(app: &mut App, tx: mpsc::UnboundedSender<Event>) {
             labels: HashMap::new(),
             annotations: HashMap::new(),
             workspace: workspace.clone(),
+            await_main_process_attachment: false,
         };
 
         let sandbox_name =
@@ -1862,8 +1863,8 @@ fn spawn_draft_approve(app: &App, tx: mpsc::UnboundedSender<Event>) {
         None => return,
     };
     let abs = app.draft_scroll + app.draft_selected;
-    let chunk_id = match app.draft_chunks.get(abs) {
-        Some(c) => c.id.clone(),
+    let (chunk_id, review_token) = match app.draft_chunks.get(abs) {
+        Some(c) => (c.id.clone(), c.review_token.clone()),
         None => return,
     };
     let rule_name = app
@@ -1877,6 +1878,7 @@ fn spawn_draft_approve(app: &App, tx: mpsc::UnboundedSender<Event>) {
             name,
             chunk_id,
             workspace,
+            review_token,
         };
         match tokio::time::timeout(Duration::from_secs(5), client.approve_draft_chunk(req)).await {
             Ok(Ok(resp)) => {
@@ -1949,7 +1951,7 @@ fn spawn_draft_reject(app: &App, tx: mpsc::UnboundedSender<Event>) {
 /// modal count display but is not iterated for per-chunk approval.
 fn spawn_draft_approve_all(
     app: &App,
-    _snapshot: Vec<openshell_core::proto::PolicyChunk>,
+    snapshot: Vec<openshell_core::proto::PolicyChunk>,
     tx: mpsc::UnboundedSender<Event>,
 ) {
     let mut client = app.client.clone();
@@ -1960,10 +1962,18 @@ fn spawn_draft_approve_all(
     let workspace = app.selected_sandbox_workspace();
 
     tokio::spawn(async move {
+        let approvals = snapshot
+            .into_iter()
+            .map(|chunk| openshell_core::proto::DraftChunkApproval {
+                chunk_id: chunk.id,
+                review_token: chunk.review_token,
+            })
+            .collect();
         let req = openshell_core::proto::ApproveAllDraftChunksRequest {
             name,
             include_security_flagged: false,
             workspace,
+            approvals,
         };
         match tokio::time::timeout(
             Duration::from_secs(30),
@@ -1973,17 +1983,7 @@ fn spawn_draft_approve_all(
         {
             Ok(Ok(resp)) => {
                 let inner = resp.into_inner();
-                let msg = if inner.chunks_skipped > 0 {
-                    format!(
-                        "Approved {} chunks, skipped {} security-flagged -> policy v{}",
-                        inner.chunks_approved, inner.chunks_skipped, inner.policy_version
-                    )
-                } else {
-                    format!(
-                        "Approved {} chunks -> policy v{}",
-                        inner.chunks_approved, inner.policy_version
-                    )
-                };
+                let msg = format_draft_approve_all_result(&inner);
                 let _ = tx.send(Event::DraftActionResult(Ok(msg)));
             }
             Ok(Err(e)) => {
@@ -1996,6 +1996,22 @@ fn spawn_draft_approve_all(
             }
         }
     });
+}
+
+fn format_draft_approve_all_result(
+    result: &openshell_core::proto::ApproveAllDraftChunksResponse,
+) -> String {
+    if result.chunks_skipped > 0 {
+        format!(
+            "Approved {} chunks, skipped {}; review remaining pending chunks -> policy v{}",
+            result.chunks_approved, result.chunks_skipped, result.policy_version
+        )
+    } else {
+        format!(
+            "Approved {} chunks -> policy v{}",
+            result.chunks_approved, result.policy_version
+        )
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2690,6 +2706,7 @@ fn phase_label(phase: i32) -> String {
         x if x == SandboxPhase::Stopping as i32 => "Stopping",
         x if x == SandboxPhase::Stopped as i32 => "Stopped",
         x if x == SandboxPhase::Starting as i32 => "Starting",
+        x if x == SandboxPhase::Completed as i32 => "Completed",
         _ => "Unknown",
     }
     .to_string()
@@ -2720,6 +2737,29 @@ fn format_age(epoch_ms: i64) -> String {
 }
 
 #[cfg(test)]
+mod draft_approve_all_message_tests {
+    use super::*;
+
+    #[test]
+    fn skipped_chunks_are_not_assumed_to_be_security_flagged() {
+        let message = format_draft_approve_all_result(
+            &openshell_core::proto::ApproveAllDraftChunksResponse {
+                policy_version: 7,
+                chunks_approved: 2,
+                chunks_skipped: 1,
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(
+            message,
+            "Approved 2 chunks, skipped 1; review remaining pending chunks -> policy v7"
+        );
+        assert!(!message.contains("security-flagged"));
+    }
+}
+
+#[cfg(test)]
 mod phase_label_tests {
     use super::*;
 
@@ -2728,6 +2768,7 @@ mod phase_label_tests {
         assert_eq!(phase_label(SandboxPhase::Stopping as i32), "Stopping");
         assert_eq!(phase_label(SandboxPhase::Stopped as i32), "Stopped");
         assert_eq!(phase_label(SandboxPhase::Starting as i32), "Starting");
+        assert_eq!(phase_label(SandboxPhase::Completed as i32), "Completed");
     }
 }
 

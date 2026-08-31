@@ -35,12 +35,18 @@ e2e-podman = ["e2e", "e2e-host-gateway", "e2e-local-container-driver"]
 e2e-podman-gpu = ["e2e-podman", "e2e-gpu"]
 e2e-supervisor-middleware = ["e2e-docker"]
 e2e-oidc-pkce = []
+e2e-provider-refresh-keycloak = []
 e2e-vm = ["e2e", "e2e-host-gateway"]
 
 [[test]]
 name = "oidc_pkce"
 path = "tests/oidc_pkce.rs"
 required-features = ["e2e-oidc-pkce"]
+
+[[test]]
+name = "provider_refresh_keycloak"
+path = "tests/provider_refresh_keycloak.rs"
+required-features = ["e2e-provider-refresh-keycloak"]
 
 [[test]]
 name = "custom_image"
@@ -96,6 +102,11 @@ required-features = ["e2e-podman"]
 name = "vm_gateway_start"
 path = "tests/vm_gateway_start.rs"
 required-features = ["e2e-vm"]
+
+[[test]]
+name = "provider_token_exchange"
+path = "tests/provider_token_exchange.rs"
+required-features = ["e2e-podman"]
 
 [[test]]
 name = "readyz_health"
@@ -185,8 +196,10 @@ futures-util = "0.3"
 http-body-util = "0.1"
 hyper = { version = "1", features = ["client", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
+jsonwebtoken = "9"
 prost = "0.14"
 tokio = { version = "1.43", features = ["full"] }
+tokio-stream = { version = "0.1", features = ["net"] }
 tempfile = "3"
 sha1 = "0.10"
 sha2 = "0.10"
@@ -195,6 +208,9 @@ rand = "0.9"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yml = "0.0.12"
+tonic = { version = "0.14", features = ["transport"] }
+tonic-prost = "0.14"
+tower = "0.5"
 url = "2"
 nix = { version = "0.29", features = ["user"] }
 

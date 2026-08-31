@@ -74,6 +74,12 @@ This creates a sandbox whose canonical main process is `/bin/bash -l` and
 attaches your terminal to that retained process. Add `--detach` to return after
 the sandbox becomes ready without attaching.
 
+An explicit trailing command is foreground even when stdin or stdout is not a
+terminal. The CLI streams its stdout and stderr and returns its exact exit
+status. Exit code 0 leaves a retained sandbox in `Completed`; nonzero leaves it
+in `Error` with `MainProcessFailed`. Use `--no-keep` to delete either result
+after output drains, or `--detach` for a long-running service.
+
 When supplying `--name`, use a portable DNS-1123 label: at most 63 lowercase alphanumeric or `-` characters, beginning and ending with an alphanumeric character. The Kubernetes driver rejects uppercase letters, underscores, dots, and other names that cannot become Kubernetes resource labels.
 
 **Shortcut for known tools**: When the trailing command is a recognized tool, the CLI auto-creates the required provider from local credentials:
@@ -207,6 +213,18 @@ output. Use `provider refresh rotate`, reconfigure refresh, or delete refresh
 before returning those keys to manual management. Unrelated provider fields
 remain updateable.
 
+When OAuth refresh fails, inspect the `RECOVERY` and `FAILURE_CODE` columns from
+`provider refresh status`; do not infer the remedy from HTTP status or parse
+`LAST_ERROR`. `retry` means the worker will try again, `reauthorize` means the
+user must obtain a new OAuth grant and run `provider refresh configure`,
+`fix_configuration` means an operator must repair the OAuth client, scopes, or
+administrator policy, and `investigate` means the issuer returned an
+unrecognized response. The gateway parks `reauthorize` records until a manual
+rotate or reconfiguration. It retries
+`fix_configuration` records hourly so externally repaired configuration can
+recover without rapid token-endpoint traffic. The existing access credential
+remains usable only until its recorded expiry.
+
 ---
 
 ## Workflow 3: Sandbox Lifecycle
@@ -236,10 +254,15 @@ Key flags:
 - `--approval-mode manual|auto`: Control handling of agent-authored policy proposals; `manual` is the default
 - `--upload <PATH>[:<DEST>]`: Upload local files into the container working directory or an explicit destination
 - `--no-git-ignore`: Disable `.gitignore` filtering for uploads
-- `--no-keep`: Delete the sandbox after the initial command or shell exits
+- `--no-keep`: Delete the sandbox after main output and the exit result drain
 - `--detach`: Start the canonical main process without attaching
 - `--forward [BIND_ADDRESS:]PORT`: Forward a local port and keep the sandbox alive
 - `--editor vscode|cursor`: Open a remote editor after creation and keep the sandbox alive
+
+`--detach` adds no attachment grace period. When the canonical process exits,
+its terminal phase is reported immediately. A foreground create declares one
+expected main-process SSH attachment; cleanup finalizes after that connection
+closes naturally.
 
 Do not combine `--upload` with a trailing main command. Uploads currently finish
 after the canonical process starts; create a scratch sandbox and use
@@ -351,7 +374,10 @@ openshell sandbox start [name]
 Both commands default to the last-used sandbox. Stop stops background
 forwards and waits for `Stopped`; start waits for `Ready`. Connect, exec,
 file transfer, forwarding, and exposed services are unavailable while
-stopped. Delete remains the operation that removes retained state.
+stopped or completed. Starting a retained `Completed` or
+`Error/MainProcessFailed` sandbox launches a fresh canonical-main instance and
+invalidates SSH sessions from the previous runtime generation. Delete remains
+the operation that removes retained state.
 
 ---
 
@@ -359,7 +385,7 @@ stopped. Delete remains the operation that removes retained state.
 
 This is the most important multi-step workflow. It enables a tight feedback cycle where sandbox policy is refined based on observed activity.
 
-**Key concept**: Policies have static fields (immutable after creation: `filesystem_policy`, `landlock`, `process`) and two dynamic fields: `network_policies` and `network_middlewares`. Both dynamic fields can be updated without recreating the sandbox.
+**Key concept**: Policies have static fields (immutable after creation: `filesystem_policy`, `landlock`, `process`) and two dynamic fields: `network_policies` and `network_middlewares`. Both dynamic fields can be updated without recreating the sandbox when the selected compute driver supports live policy updates. MXC rejects live policy replacement and merge updates; delete and recreate an MXC sandbox instead.
 
 An endpoint with omitted `protocol` retains explicit-proxy behavior. Explicit
 `protocol: tcp` requests policy DNS and transparent TCP and currently requires
@@ -429,7 +455,7 @@ Edit `current-policy.yaml` to allow the blocked actions. **For policy content au
 - Binary matching patterns
 - Ordered `network_middlewares`, host selection, HTTP and WebSocket bindings, and `fail_open` or `fail_closed` behavior
 
-`network_policies` and `network_middlewares` can be modified at runtime. If `filesystem_policy`, `landlock`, or `process` need changes, the sandbox must be recreated. Built-in middleware such as `openshell/regex` needs no gateway registration. An operator-run middleware must already be registered under `[[openshell.supervisor.middleware]]`; changing that static registration requires a gateway restart.
+`network_policies` and `network_middlewares` can be modified at runtime when the selected compute driver supports live policy updates. MXC rejects live policy replacement and merge updates; delete and recreate an MXC sandbox instead. If `filesystem_policy`, `landlock`, or `process` need changes, the sandbox must be recreated. Built-in middleware such as `openshell/regex` needs no gateway registration. An operator-run middleware must already be registered under `[[openshell.supervisor.middleware]]`; changing that static registration requires a gateway restart.
 
 Middleware can inspect parsed HTTP request bodies and complete client-to-upstream WebSocket text messages over both `ws://` and `wss://` when the implementation advertises the matching binding. The built-in `openshell/regex` advertises both bindings and applies its fixed patterns to UTF-8 text. A host-matched HTTP-only attachment can inspect the upgrade GET but does not join the WebSocket chain; look for `binding_not_selected` coverage. Binary messages pass under both `on_error` modes and active stages emit `unsupported_message_type` coverage; upstream-to-client messages remain uninspected. A broken fail-open WebSocket stage is disabled for the rest of that connection; inspect sandbox OCSF logs for `openshell.middleware.websocket_stage_disabled`.
 
@@ -493,7 +519,7 @@ Avoid `--yes` during interactive work. A global policy locks policy control for 
 
 ### Review agent-authored rule proposals
 
-Sandboxes created with `--approval-mode manual` place every proposal in the review inbox. `auto` approves only proposals with an empty prover delta; findings still require review.
+Sandboxes created with `--approval-mode manual` place every proposal in the review inbox. `auto` approves only valid effective-policy candidates with an empty prover delta; findings still require review. The CLI binds approval to the candidate's current review token. If live policy, provider, or credential inputs change, approval leaves the chunk pending with a refreshed candidate and requires a fresh review.
 
 ```bash
 openshell rule get dev --status pending
@@ -502,7 +528,7 @@ openshell rule reject dev --chunk-id <chunk-id> --reason "too broad"
 openshell rule history dev
 ```
 
-Review the proposed scope and prover findings before approval. Treat `rule approve-all --include-security-flagged` as a high-risk bulk action.
+Review the proposed scope, candidate hash, prover findings, and application errors before approval. Treat `rule approve-all --include-security-flagged` as a high-risk bulk action.
 
 ---
 

@@ -1,0 +1,55 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: Build Gateway Binaries
+
+on:
+  workflow_call:
+    inputs:
+      cargo-version:
+        required: true
+        type: string
+      image-tag:
+        required: false
+        type: string
+        default: ""
+      checkout-ref:
+        required: false
+        type: string
+        default: ""
+    secrets:
+      CACHIX_AUTH_TOKEN:
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - triple: x86_64-unknown-linux-gnu
+            runner: linux-amd64-cpu8
+            dev_shell: .#devShells.x86_64-linux.glibc-2-28
+            interpreter: /lib64/ld-linux-x86-64.so.2
+          - triple: aarch64-unknown-linux-gnu
+            runner: linux-arm64-cpu8
+            dev_shell: .#devShells.aarch64-linux.glibc-2-28
+            interpreter: /lib/ld-linux-aarch64.so.1
+          - triple: aarch64-apple-darwin
+            runner: macos-15-xlarge
+            dev_shell: .#devShells.aarch64-darwin.default
+            interpreter: ""
+    uses: ./.github/workflows/build-binaries.yml
+    with:
+      package: openshell-server
+      binary: openshell-gateway
+      triple: ${{ matrix.triple }}
+      runner: ${{ matrix.runner }}
+      dev-shell: ${{ matrix.dev_shell }}
+      cargo-version: ${{ inputs.cargo-version }}
+      image-tag: ${{ inputs.image-tag }}
+      interpreter: ${{ matrix.interpreter }}
+      checkout-ref: ${{ inputs.checkout-ref }}
+    secrets: inherit

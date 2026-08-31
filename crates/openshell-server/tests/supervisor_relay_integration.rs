@@ -55,6 +55,13 @@ impl OpenShell for RelayGateway {
         Err(Status::unimplemented("not used by this test server"))
     }
 
+    async fn finalize_main_process_exit(
+        &self,
+        _request: tonic::Request<openshell_core::proto::FinalizeMainProcessExitRequest>,
+    ) -> Result<Response<openshell_core::proto::FinalizeMainProcessExitResponse>, Status> {
+        Err(Status::unimplemented("not used by this test server"))
+    }
+
     async fn get_current_user(
         &self,
         _request: tonic::Request<openshell_core::proto::GetCurrentUserRequest>,
@@ -241,6 +248,12 @@ impl OpenShell for RelayGateway {
         &self,
         _: tonic::Request<openshell_core::proto::RevokeSshSessionRequest>,
     ) -> Result<Response<openshell_core::proto::RevokeSshSessionResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+    async fn exchange_provider_subject_token(
+        &self,
+        _: tonic::Request<openshell_core::proto::ExchangeProviderSubjectTokenRequest>,
+    ) -> Result<Response<openshell_core::proto::ExchangeProviderSubjectTokenResponse>, Status> {
         Err(Status::unimplemented("unused"))
     }
     async fn create_provider(

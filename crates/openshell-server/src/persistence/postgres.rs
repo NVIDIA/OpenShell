@@ -1179,6 +1179,28 @@ WHERE object_type = $1 AND id = $2 AND status = 'pending'
         Ok(result.rows_affected() > 0)
     }
 
+    pub async fn update_draft_chunk_evaluation(
+        &self,
+        chunk: &DraftChunkRecord,
+    ) -> PersistenceResult<bool> {
+        let payload = draft_chunk_payload_from_record(chunk)?;
+        let result = sqlx::query(
+            r#"
+UPDATE "objects"
+SET "payload" = $3, "updated_at_ms" = $4
+WHERE "object_type" = $1 AND "id" = $2 AND "status" IN ('pending', 'rejected')
+"#,
+        )
+        .bind(DRAFT_CHUNK_OBJECT_TYPE)
+        .bind(&chunk.id)
+        .bind(payload)
+        .bind(chunk.last_seen_ms)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| map_db_error(&e))?;
+        Ok(result.rows_affected() > 0)
+    }
+
     pub async fn delete_draft_chunks(
         &self,
         sandbox_id: &str,

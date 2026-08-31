@@ -426,6 +426,15 @@ service OpenShell {
     };
   }
 
+  // Exchange a stored provider subject token for an intermediate token scoped
+  // to the calling supervisor's SPIFFE identity.
+  rpc ExchangeProviderSubjectToken(ExchangeProviderSubjectTokenRequest)
+      returns (ExchangeProviderSubjectTokenResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "sandbox"
+    };
+  }
+
   // Fetch recent sandbox logs (one-shot).
   rpc GetSandboxLogs(GetSandboxLogsRequest) returns (GetSandboxLogsResponse) {
     option (openshell.options.v1.authorization) = {
@@ -457,6 +466,14 @@ service OpenShell {
 
   // Persist the canonical main process result before the supervisor exits.
   rpc ReportMainProcessExit(ReportMainProcessExitRequest) returns (ReportMainProcessExitResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "sandbox"
+    };
+  }
+
+  // Confirm that foreground terminal delivery completed naturally.
+  rpc FinalizeMainProcessExit(FinalizeMainProcessExitRequest)
+      returns (FinalizeMainProcessExitResponse) {
     option (openshell.options.v1.authorization) = {
       auth_mode: "sandbox"
     };
@@ -898,7 +915,8 @@ message SandboxStatus {
   // The gateway uses this to reject stale exit reports after a restart.
   string main_process_instance_id = 8;
   // Normalized main process result. Signal exits use 128 + signal number.
-  // Presence indicates that the main process exited and the sandbox is in Error.
+  // Presence indicates that the canonical main process exited. Exit code 0
+  // produces Completed; nonzero and signal-normalized exits produce Error.
   optional int32 exit_code = 9;
 }
 
@@ -930,6 +948,8 @@ enum SandboxPhase {
   SANDBOX_PHASE_STOPPING = 6;
   SANDBOX_PHASE_STOPPED = 7;
   SANDBOX_PHASE_STARTING = 8;
+  // The canonical main process exited successfully and its result is final.
+  SANDBOX_PHASE_COMPLETED = 9;
 }
 
 // Public platform event exposed on the sandbox watch stream.
@@ -959,6 +979,10 @@ message CreateSandboxRequest {
   map<string, string> annotations = 4;
   // Workspace for the sandbox. Empty defaults to "default".
   string workspace = 5;
+  // One-shot launch hint indicating that the creating client will attach to
+  // the canonical main process. The supervisor keeps the terminal transport
+  // alive until that attachment connects and closes naturally.
+  bool await_main_process_attachment = 6;
 }
 
 // Get sandbox request.
@@ -1238,6 +1262,13 @@ message ExecSandboxRequest {
 
   // Initial terminal rows (used when tty=true, 0 = use default).
   uint32 rows = 9;
+
+  // Skip sourcing shell login/profile startup files before running the command.
+  // When false (the default), the command runs through a login shell
+  // (`bash -lc`) so user startup files (.bash_profile/.profile, and .bashrc if
+  // sourced by them) are applied. When true, the command runs without those
+  // files (`bash -c`), for automation that needs predictable startup behavior.
+  bool no_login_shell = 10;
 }
 
 // One stdout chunk from a sandbox exec.
@@ -1346,7 +1377,8 @@ message WatchSandboxRequest {
   // Replay the last N platform events (best-effort) before following.
   uint32 event_tail = 6;
 
-  // Stop streaming once the sandbox reaches a terminal phase (READY or ERROR).
+  // Stop streaming once the sandbox reaches READY or a terminal result phase
+  // (COMPLETED, STOPPED, or ERROR).
   bool stop_on_terminal = 7;
 
   // Only include log lines with timestamp >= this value (milliseconds since epoch).
@@ -1498,6 +1530,25 @@ message ProviderCredentialTokenGrantAudienceOverride {
 
 // Provider credential token grant configuration.
 // When present, the credential is obtained dynamically via OAuth2 grant when needed.
+enum ProviderCredentialTokenGrantType {
+  PROVIDER_CREDENTIAL_TOKEN_GRANT_TYPE_UNSPECIFIED = 0;
+  PROVIDER_CREDENTIAL_TOKEN_GRANT_TYPE_CLIENT_CREDENTIALS = 1;
+  PROVIDER_CREDENTIAL_TOKEN_GRANT_TYPE_TOKEN_EXCHANGE = 2;
+}
+
+message ProviderCredentialTokenGrantSubjectToken {
+  // Source for the token exchange subject token. Phase one supports
+  // "provider_credential".
+  string source = 1;
+
+  // Provider credential key that stores the subject token.
+  string credential = 2;
+
+  // OAuth2 subject_token_type. If omitted, OpenShell uses
+  // urn:ietf:params:oauth:token-type:access_token.
+  string subject_token_type = 3;
+}
+
 message ProviderCredentialTokenGrant {
   // OAuth2 token endpoint URL (e.g., https://keycloak.example.com/realms/my-realm/protocol/openid-connect/token)
   string token_endpoint = 1;
@@ -1522,6 +1573,17 @@ message ProviderCredentialTokenGrant {
   // Optional: OAuth2 client_assertion_type value. If omitted, OpenShell uses
   // urn:ietf:params:oauth:client-assertion-type:jwt-bearer.
   string client_assertion_type = 7;
+
+  // Grant type. If omitted/unspecified, OpenShell treats this as client_credentials
+  // for backwards compatibility.
+  ProviderCredentialTokenGrantType grant_type = 8;
+
+  // Subject token metadata for token_exchange grants.
+  ProviderCredentialTokenGrantSubjectToken subject_token = 9;
+
+  // OAuth2 requested_token_type. If omitted for token_exchange, OpenShell uses
+  // urn:ietf:params:oauth:token-type:access_token.
+  string requested_token_type = 10;
 }
 
 // Provider credential declaration.
@@ -1581,9 +1643,23 @@ message ProviderCredentialRefreshStatus {
   ProviderCredentialRefreshStrategy strategy = 4;
   string status = 5;
   int64 expires_at_ms = 6;
+  // Next automatic refresh time in Unix epoch milliseconds. A value of
+  // 9223372036854775807 (int64 max) means no automatic retry is scheduled;
+  // consumers should render it as unset and use recovery_action to determine
+  // the required recovery workflow.
   int64 next_refresh_at_ms = 7;
   int64 last_refresh_at_ms = 8;
   string last_error = 9;
+  ProviderCredentialRefreshRecoveryAction recovery_action = 10;
+  // Stable gateway-owned failure identifier, for example
+  // "oauth_invalid_grant". This is not provider-controlled prose and
+  // incorporates any recognized top-level OAuth error classification.
+  string failure_code = 11;
+  // A bounded, recognized provider subtype that refines failure_code; clients
+  // do not need a separate provider_error field. Unknown provider-controlled
+  // values are not persisted or returned.
+  string provider_error_subtype = 12;
+  int64 last_error_at_ms = 13;
 }
 
 // Provider profile local discovery declaration.
@@ -1604,6 +1680,7 @@ message StoredProviderCredentialRefreshState {
   // are not automatically migrated before OpenShell 0.1.0.
   repeated string secret_material_keys = 7;
   int64 expires_at_ms = 8;
+  // int64 max parks the refresh until an explicit rotation or reconfiguration.
   int64 next_refresh_at_ms = 9;
   int64 last_refresh_at_ms = 10;
   string status = 11;
@@ -1632,6 +1709,12 @@ message StoredProviderCredentialRefreshState {
   // Cleanup is retried by the refresh worker so a gateway crash or temporary
   // credential-backend outage does not lose the deletion reference.
   repeated StoredRefreshMaterialDeletion pending_secret_deletions = 20;
+  // Structured recovery details for the most recent refresh failure. These
+  // fields contain only gateway-owned codes and recognized bounded values.
+  ProviderCredentialRefreshRecoveryAction recovery_action = 21;
+  string failure_code = 22;
+  string provider_error_subtype = 23;
+  int64 last_error_at_ms = 24;
 }
 
 message StoredRefreshMaterialDeletion {
@@ -1866,6 +1949,27 @@ message GetSandboxProviderEnvironmentResponse {
   // Environment variables that contain provider configuration rather than
   // credentials and therefore do not require endpoint-scoped resolution.
   repeated string non_secret_environment_keys = 6;
+}
+
+message ExchangeProviderSubjectTokenRequest {
+  // The sandbox ID. Must match the authenticated sandbox principal.
+  string sandbox_id = 1;
+
+  // Attached provider record holding the configured subject token credential.
+  string provider = 2;
+
+  // Provider profile credential that declares the token_exchange grant.
+  string credential_key = 3;
+
+  // Supervisor JWT-SVID. The gateway verifies this and uses its `sub` claim
+  // as the requested audience for the intermediate token.
+  string supervisor_jwt_svid = 4 [(openshell.options.v1.secret) = true];
+}
+
+message ExchangeProviderSubjectTokenResponse {
+  string access_token = 1 [(openshell.options.v1.secret) = true];
+  int64 expires_in = 2;
+  string token_type = 3;
 }
 
 // ---------------------------------------------------------------------------
@@ -2159,6 +2263,15 @@ message ReportMainProcessExitRequest {
 
 message ReportMainProcessExitResponse {}
 
+// Terminal-delivery completion reported after all expected foreground SSH
+// attachments close. A successful response permits ephemeral cleanup.
+message FinalizeMainProcessExitRequest {
+  string sandbox_id = 1;
+  string instance_id = 2;
+}
+
+message FinalizeMainProcessExitResponse {}
+
 // Gateway requests the supervisor to open a relay channel.
 //
 // On receiving this, the supervisor should initiate a RelayStream RPC to
@@ -2352,6 +2465,20 @@ message PolicyChunk {
   // back to the in-sandbox agent so it can revise the proposal.
   // Empty for non-rejected chunks.
   string rejection_reason = 18;
+  // Gateway-side merge/application preflight failure. Kept separate from
+  // prover output and operator rejection so clients can explain why a
+  // prover-clean proposal is not currently applicable.
+  string application_error = 19;
+  // Opaque digest binding review to the exact live inputs and complete
+  // effective candidate evaluated by the gateway.
+  string review_token = 20;
+  // Deterministic hashes for compact candidate display and diagnostics.
+  string current_effective_policy_hash = 21;
+  string candidate_effective_policy_hash = 22;
+  // Complete effective policies used for review. These contain policy
+  // configuration only; credential secret values are never materialized.
+  openshell.sandbox.v1.SandboxPolicy current_effective_policy = 23;
+  openshell.sandbox.v1.SandboxPolicy candidate_effective_policy = 24;
 }
 
 // Notification that the draft policy was updated.
@@ -2430,6 +2557,9 @@ message ApproveDraftChunkRequest {
   string chunk_id = 2;
   // Workspace scope. Empty defaults to "default".
   string workspace = 3;
+  // Token returned with the reviewed PolicyChunk. Approval fails with
+  // FAILED_PRECONDITION if live decision inputs no longer match it.
+  string review_token = 4;
 }
 
 message ApproveDraftChunkResponse {
@@ -2454,6 +2584,11 @@ message RejectDraftChunkRequest {
 message RejectDraftChunkResponse {}
 
 // Approve all pending chunks.
+message DraftChunkApproval {
+  string chunk_id = 1;
+  string review_token = 2;
+}
+
 message ApproveAllDraftChunksRequest {
   // Sandbox name.
   string name = 1;
@@ -2461,6 +2596,9 @@ message ApproveAllDraftChunksRequest {
   bool include_security_flagged = 2;
   // Workspace scope. Empty defaults to "default".
   string workspace = 3;
+  // Exact reviewed chunks and tokens. The server validates them against one
+  // live snapshot, stages compatible operations in order, and writes once.
+  repeated DraftChunkApproval approvals = 4;
 }
 
 message ApproveAllDraftChunksResponse {
@@ -2470,7 +2608,8 @@ message ApproveAllDraftChunksResponse {
   string policy_hash = 2;
   // Number of chunks approved.
   uint32 chunks_approved = 3;
-  // Number of chunks skipped (security-flagged).
+  // Number of chunks skipped for any reason, including security flags,
+  // stale or invalid candidates, and conflicts within the staged batch.
   uint32 chunks_skipped = 4;
 }
 
@@ -2585,6 +2724,12 @@ message DraftChunkPayload {
   // Operator-supplied free-form rejection text; empty for non-rejected
   // chunks. Mirrors PolicyChunk.rejection_reason.
   string rejection_reason = 12;
+  string application_error = 13;
+  string review_token = 14;
+  string current_effective_policy_hash = 15;
+  string candidate_effective_policy_hash = 16;
+  openshell.sandbox.v1.SandboxPolicy current_effective_policy = 17;
+  openshell.sandbox.v1.SandboxPolicy candidate_effective_policy = 18;
 }
 
 // Internal stored policy revision row materialized from the generic objects table.
@@ -2624,6 +2769,12 @@ message StoredDraftChunk {
   string validation_result = 18;
   // Operator-supplied free-form rejection text. See PolicyChunk.
   string rejection_reason = 19;
+  string application_error = 20;
+  string review_token = 21;
+  string current_effective_policy_hash = 22;
+  string candidate_effective_policy_hash = 23;
+  openshell.sandbox.v1.SandboxPolicy current_effective_policy = 24;
+  openshell.sandbox.v1.SandboxPolicy candidate_effective_policy = 25;
 }
 
 // ---------------------------------------------------------------------------
@@ -2687,6 +2838,18 @@ enum WorkspaceRole {
   WORKSPACE_ROLE_UNSPECIFIED = 0;
   WORKSPACE_ROLE_USER = 1;
   WORKSPACE_ROLE_ADMIN = 2;
+}
+
+// Stable recovery action for the most recent provider credential refresh
+// failure. Kept after the pre-existing enums so adding it does not renumber
+// their generated descriptors. Clients should use this field instead of
+// parsing last_error.
+enum ProviderCredentialRefreshRecoveryAction {
+  PROVIDER_CREDENTIAL_REFRESH_RECOVERY_ACTION_UNSPECIFIED = 0;
+  PROVIDER_CREDENTIAL_REFRESH_RECOVERY_ACTION_RETRY = 1;
+  PROVIDER_CREDENTIAL_REFRESH_RECOVERY_ACTION_REAUTHORIZE = 2;
+  PROVIDER_CREDENTIAL_REFRESH_RECOVERY_ACTION_FIX_CONFIGURATION = 3;
+  PROVIDER_CREDENTIAL_REFRESH_RECOVERY_ACTION_INVESTIGATE = 4;
 }
 
 // Workspace membership record.

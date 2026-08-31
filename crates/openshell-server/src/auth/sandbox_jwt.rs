@@ -112,6 +112,8 @@ impl SandboxJwtIssuer {
         gateway_id: &str,
         ttl: Duration,
     ) -> Result<Self, String> {
+        crate::install_jsonwebtoken_crypto_provider();
+
         let encoding_key = EncodingKey::from_ed_pem(signing_key_pem)
             .map_err(|e| format!("failed to parse Ed25519 signing key PEM: {e}"))?;
         let identity = format!("openshell-gateway:{gateway_id}");
@@ -127,6 +129,8 @@ impl SandboxJwtIssuer {
     /// Mint a fresh token for `sandbox_id`.
     #[allow(clippy::result_large_err)] // `tonic::Status` is the natural error here
     pub fn mint(&self, sandbox_id: &str) -> Result<MintedToken, Status> {
+        crate::install_jsonwebtoken_crypto_provider();
+
         let now = now_secs();
         let exp = if self.ttl.is_zero() {
             0
@@ -248,6 +252,8 @@ impl std::fmt::Debug for SandboxJwtAuthenticator {
 
 impl SandboxJwtAuthenticator {
     pub fn from_pem(public_key_pem: &[u8], kid: String, gateway_id: &str) -> Result<Self, String> {
+        crate::install_jsonwebtoken_crypto_provider();
+
         let decoding_key = DecodingKey::from_ed_pem(public_key_pem)
             .map_err(|e| format!("failed to parse Ed25519 public key PEM: {e}"))?;
         let jwks = GatewayJwks::from_public_key_pem(public_key_pem, kid.clone())?;
@@ -276,6 +282,8 @@ impl SandboxJwtAuthenticator {
 
     #[allow(clippy::result_large_err)]
     fn validate_bearer(&self, token: &str) -> Result<Option<Principal>, Status> {
+        crate::install_jsonwebtoken_crypto_provider();
+
         let header = decode_header(token).map_err(|e| {
             debug!(error = %e, "sandbox JWT header decode failed");
             Status::unauthenticated("invalid token")

@@ -84,129 +84,88 @@ jobs:
     needs: pr_metadata
     if: needs.pr_metadata.outputs.should_run == 'true'
     runs-on: linux-amd64-cpu8
-    container:
-      image: ghcr.io/nvidia/openshell/ci:latest
-      credentials:
-        username: ${{ github.actor }}
-        password: ${{ secrets.GITHUB_TOKEN }}
+    defaults:
+      run:
+        shell: nix develop .#devShells.x86_64-linux.default -c bash -euo pipefail {0}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Install tools
-        run: mise install --locked
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
+        with:
+          github_access_token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: cachix/cachix-action@5f2d7c5294214f71b873db4b969586b980625e71 # v17
+        with:
+          name: openshell
+          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
 
       - name: Check dependencies
-        run: mise run rust:deny:policy
+        run: cargo deny check licenses bans sources
 
   rust:
-    name: Rust (${{ matrix.runner }})
+    name: Rust (${{ matrix.system }})
     needs: pr_metadata
     if: needs.pr_metadata.outputs.should_run == 'true'
     strategy:
       fail-fast: false
       matrix:
-        runner: [linux-amd64-cpu8, linux-arm64-cpu8]
+        include:
+          - runner: linux-amd64-cpu8
+            system: x86_64-linux
+          - runner: linux-arm64-cpu8
+            system: aarch64-linux
+          - runner: macos-15-xlarge
+            system: aarch64-darwin
     runs-on: ${{ matrix.runner }}
-    env:
-      SCCACHE_GHA_ENABLED: "true"
-      SCCACHE_GHA_VERSION: branch-checks-rust-${{ matrix.runner }}
-    container:
-      image: ghcr.io/nvidia/openshell/ci:latest
-      credentials:
-        username: ${{ github.actor }}
-        password: ${{ secrets.GITHUB_TOKEN }}
+    defaults:
+      run:
+        shell: nix develop .#devShells.${{ matrix.system }}.default -c bash -euo pipefail {0}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Configure GHA sccache backend
-        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
+        with:
+          github_access_token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Install tools
-        run: mise install --locked
+      - uses: cachix/cachix-action@5f2d7c5294214f71b873db4b969586b980625e71 # v17
+        with:
+          name: openshell
+          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+
+      - name: Realize Nix development shell
+        shell: bash
+        run: nix build --no-link ".#devShells.${{ matrix.system }}.default"
 
       - name: Cache Rust target and registry
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          # Keep branch-check caches partitioned by runner architecture; lint
+          # Keep branch-check caches partitioned by target system; lint
           # and test intentionally share the same job-local target directory.
-          shared-key: rust-checks-${{ matrix.runner }}
+          shared-key: rust-checks-${{ matrix.system }}
           # Preserve compiled artifacts from failed lint/test runs so the next
           # push to the same PR branch does not start from a cold cache.
           cache-on-failure: "true"
+          cache-workspace-crates: "true"
+          cache-bin: "false"
+          cmd-format: nix develop .#devShells.${{ matrix.system }}.default -c {0}
 
       - name: Format
-        run: mise run rust:format:check
+        run: |
+          cargo fmt --all -- --check
+          cargo fmt --manifest-path e2e/rust/Cargo.toml --all -- --check
+          cargo fmt --manifest-path examples/governance-interceptor/Cargo.toml --all -- --check
 
       - name: Lint
-        run: mise run rust:lint
+        run: |
+          cargo clippy --workspace --all-targets -- -D warnings
+          cargo clippy --manifest-path e2e/rust/Cargo.toml --all-targets -- -D warnings
+          cargo check --manifest-path examples/governance-interceptor/Cargo.toml --all-targets
 
       - name: Test
-        run: mise run test:rust
-
-      - name: Verify telemetry can be compiled out
-        run: mise run rust:verify:telemetry-off
-
-      - name: Verify system CA roots build mode compiles and excludes bundled Mozilla roots
-        run: mise run rust:verify:system-ca-roots
-
-      - name: sccache stats
-        if: always()
+        env:
+          OPENSHELL_TELEMETRY_ENABLED: "false"
         run: |
-          set +e
-          stats_bin="${SCCACHE_PATH:-sccache}"
-          "$stats_bin" --show-stats
-          status=$?
-          if [ "$status" -ne 0 ]; then
-            echo "::warning::sccache stats unavailable (exit $status)"
-          fi
-          exit 0
-
-  rust-macos:
-    name: Rust lint (macOS)
-    needs: pr_metadata
-    if: needs.pr_metadata.outputs.should_run == 'true'
-    runs-on: macos-latest
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - name: Install mise
-        run: |
-          curl --proto '=https' --tlsv1.2 -sSf https://mise.run | MISE_VERSION=v2026.4.25 sh
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-          echo "$HOME/.local/share/mise/shims" >> "$GITHUB_PATH"
-
-      - name: Configure GHA sccache backend
-        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
-
-      - name: Install Rust and Clippy
-        run: |
-          mise install --locked rust
-          rustup component add clippy
-
-      - name: Cache Rust target and registry
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          shared-key: rust-clippy-macos
-          cache-on-failure: "true"
-
-      - name: Lint macOS-sensitive crates
-        # Formatting is target-independent and already checked by the Linux jobs.
-        # The full mise lint covers every workspace/E2E target and requires extra
-        # native dependencies such as Z3; keep this guard focused on macOS cfgs.
-        run: |
-          cargo clippy \
-            -p openshell-sandbox \
-            -p openshell-core \
-            -p openshell-cli \
-            -p openshell-driver-db-credstore \
-            -p openshell-driver-docker \
-            -p openshell-driver-kubernetes \
-            -p openshell-driver-kubernetes-secrets \
-            -p openshell-driver-podman \
-            -p openshell-driver-vault \
-            --all-targets \
-            -- -D warnings
+          cargo nextest run --profile ci --workspace --features openshell-server/test-support
 
   python:
     name: Python (${{ matrix.runner }})

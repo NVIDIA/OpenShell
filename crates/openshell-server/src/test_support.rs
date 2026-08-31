@@ -95,6 +95,7 @@ impl FakeComputeDriver {
                     driver_version: "test".to_string(),
                     default_image: "openshell/sandbox:test".to_string(),
                     gateway_manages_lifecycle: false,
+                    supports_sandbox_authentication: false,
                 },
                 gateway_listener_requirements: Vec::new(),
                 gateway_listener_requirements_supported: true,
@@ -235,6 +236,16 @@ impl Stream for UnixIncoming {
 
 #[tonic::async_trait]
 impl ComputeDriver for FakeComputeDriver {
+    async fn authenticate_sandbox(
+        &self,
+        _request: Request<openshell_core::proto::compute::v1::AuthenticateSandboxRequest>,
+    ) -> Result<Response<openshell_core::proto::compute::v1::AuthenticateSandboxResponse>, Status>
+    {
+        Err(Status::unimplemented(
+            "fake driver does not authenticate sandbox credentials",
+        ))
+    }
+
     type WatchSandboxesStream = WatchStream;
 
     async fn get_capabilities(

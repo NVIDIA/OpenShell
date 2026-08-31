@@ -38,6 +38,7 @@ pub struct EntrypointStarted {
     pub start_session: bool,
     pub instance_id: String,
     pub exit_code: Option<i32>,
+    pub finalized: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -176,6 +177,7 @@ enum WireClientMessage {
     BootstrapRequest { supervisor_pid: u32 },
     EntrypointStarted { pid: u32, instance_id: String },
     MainProcessExited { instance_id: String, exit_code: i32 },
+    MainProcessFinalized { instance_id: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -466,12 +468,14 @@ async fn handle_connection(
                     start_session: false,
                     instance_id: String::new(),
                     exit_code: None,
+                    finalized: false,
                 })
                 .await
                 .map_err(|_| miette::miette!("sidecar entrypoint receiver closed"))?;
         }
         WireClientMessage::EntrypointStarted { .. }
-        | WireClientMessage::MainProcessExited { .. } => {
+        | WireClientMessage::MainProcessExited { .. }
+        | WireClientMessage::MainProcessFinalized { .. } => {
             return Err(miette::miette!(
                 "sidecar control client sent entrypoint event before bootstrap"
             ));
@@ -509,6 +513,7 @@ async fn handle_connection(
                                 start_session: true,
                                 instance_id,
                                 exit_code: None,
+                                finalized: false,
                             })
                             .await
                             .map_err(|_| miette::miette!("sidecar entrypoint receiver closed"))?;
@@ -523,6 +528,19 @@ async fn handle_connection(
                                 start_session: false,
                                 instance_id,
                                 exit_code: Some(exit_code),
+                                finalized: false,
+                            })
+                            .await
+                            .map_err(|_| miette::miette!("sidecar entrypoint receiver closed"))?;
+                    }
+                    WireClientMessage::MainProcessFinalized { instance_id } => {
+                        entrypoint_tx
+                            .send(EntrypointStarted {
+                                pid: 0,
+                                start_session: false,
+                                instance_id,
+                                exit_code: None,
+                                finalized: true,
                             })
                             .await
                             .map_err(|_| miette::miette!("sidecar entrypoint receiver closed"))?;
@@ -636,6 +654,15 @@ pub async fn send_main_process_exited(
         instance_id,
         exit_code,
     };
+    let mut writer = writer.lock().await;
+    write_json_line(&mut *writer, &message).await
+}
+
+pub async fn send_main_process_finalized(
+    writer: &Arc<Mutex<OwnedWriteHalf>>,
+    instance_id: String,
+) -> Result<()> {
+    let message = WireClientMessage::MainProcessFinalized { instance_id };
     let mut writer = writer.lock().await;
     write_json_line(&mut *writer, &message).await
 }
@@ -893,6 +920,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(terminal.exit_code, Some(0));
+        assert!(!terminal.finalized);
 
         assert!(
             tokio::time::timeout(Duration::from_millis(20), connection.updates.recv())
@@ -909,6 +937,16 @@ mod tests {
             ack,
             ControlUpdate::MainProcessExitAck { instance_id } if instance_id == "instance-1"
         ));
+
+        send_main_process_finalized(&connection.writer, "instance-1".to_string())
+            .await
+            .unwrap();
+        let delivered = tokio::time::timeout(Duration::from_secs(1), entrypoint_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(delivered.exit_code.is_none());
+        assert!(delivered.finalized);
     }
 
     #[tokio::test]

@@ -44,8 +44,8 @@ jobs:
             push)
               run_core_e2e="$(jq -r 'index("test:e2e") != null' <<< "$LABELS_JSON")"
               run_gpu_e2e="$(jq -r 'index("test:e2e-gpu") != null' <<< "$LABELS_JSON")"
-              run_kubernetes_ha_e2e="$(jq -r 'index("test:e2e-kubernetes") != null' <<< "$LABELS_JSON")"
-              run_kubernetes_credential_drivers_e2e="$(jq -r 'index("test:e2e-kubernetes") != null' <<< "$LABELS_JSON")"
+              run_kubernetes_ha_e2e=false
+              run_kubernetes_credential_drivers_e2e=false
               ;;
             merge_group)
               # Merge groups have no PR labels. When GPU E2E is required as documented
@@ -59,8 +59,8 @@ jobs:
             *)
               run_core_e2e=true
               run_gpu_e2e=true
-              run_kubernetes_ha_e2e=true
-              run_kubernetes_credential_drivers_e2e=true
+              run_kubernetes_ha_e2e=false
+              run_kubernetes_credential_drivers_e2e=false
               ;;
           esac
           if [ "$run_core_e2e" = "true" ] || [ "$run_gpu_e2e" = "true" ] || [ "$run_kubernetes_ha_e2e" = "true" ] || [ "$run_kubernetes_credential_drivers_e2e" = "true" ]; then
@@ -76,19 +76,159 @@ jobs:
             echo "run_any_e2e=$run_any_e2e"
           } >> "$GITHUB_OUTPUT"
 
-  build-gateway:
+  version:
     needs: [pr_metadata]
     if: needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_any_e2e == 'true'
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      cargo: ${{ steps.version.outputs.cargo }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Compute version
+        id: version
+        run: |
+          cargo="$(python3 tasks/scripts/release.py get-version --cargo)"
+          echo "cargo=$cargo" >> "$GITHUB_OUTPUT"
+
+  build-cli:
+    needs: version
+    permissions:
+      contents: read
+    uses: ./.github/workflows/build-cli-binaries.yml
+    with:
+      cargo-version: ${{ needs.version.outputs.cargo }}
+    secrets: inherit
+
+  build-sandbox:
+    needs: version
+    permissions:
+      contents: read
+    uses: ./.github/workflows/build-sandbox-binaries.yml
+    with:
+      cargo-version: ${{ needs.version.outputs.cargo }}
+    secrets: inherit
+
+  build-gateway:
+    needs: version
+    permissions:
+      contents: read
+    uses: ./.github/workflows/build-gateway-binaries.yml
+    with:
+      cargo-version: ${{ needs.version.outputs.cargo }}
+    secrets: inherit
+
+  build-gateway-plain:
+    needs: [pr_metadata, version]
+    if: needs.pr_metadata.outputs.run_core_e2e == 'true'
+    permissions:
+      contents: read
+    strategy:
+      matrix:
+        include:
+          - triple: x86_64-unknown-linux-gnu
+            runner: linux-amd64-cpu8
+            dev_shell: .#devShells.x86_64-linux.glibc-2-28
+            interpreter: /lib64/ld-linux-x86-64.so.2
+          - triple: aarch64-unknown-linux-gnu
+            runner: linux-arm64-cpu8
+            dev_shell: .#devShells.aarch64-linux.glibc-2-28
+            interpreter: /lib/ld-linux-aarch64.so.1
+    uses: ./.github/workflows/build-binaries.yml
+    with:
+      package: openshell-server
+      binary: openshell-gateway
+      artifact-name: openshell-gateway-plain-${{ matrix.triple }}
+      triple: ${{ matrix.triple }}
+      runner: ${{ matrix.runner }}
+      dev-shell: ${{ matrix.dev_shell }}
+      cargo-version: ${{ needs.version.outputs.cargo }}
+      extra-cargo-flags: --no-default-features
+      interpreter: ${{ matrix.interpreter }}
+    secrets: inherit
+
+  build-driver-docker:
+    needs: [pr_metadata, version]
+    if: needs.pr_metadata.outputs.run_core_e2e == 'true'
+    permissions:
+      contents: read
+    uses: ./.github/workflows/build-binaries.yml
+    with:
+      package: openshell-driver-docker
+      binary: openshell-driver-docker
+      triple: aarch64-unknown-linux-gnu
+      runner: linux-arm64-cpu8
+      dev-shell: .#devShells.aarch64-linux.glibc-2-28
+      cargo-version: ${{ needs.version.outputs.cargo }}
+      interpreter: /lib/ld-linux-aarch64.so.1
+    secrets: inherit
+
+  build-driver-podman:
+    needs: [pr_metadata, version]
+    if: needs.pr_metadata.outputs.run_core_e2e == 'true'
+    permissions:
+      contents: read
+    uses: ./.github/workflows/build-binaries.yml
+    with:
+      package: openshell-driver-podman
+      binary: openshell-driver-podman
+      triple: x86_64-unknown-linux-gnu
+      runner: linux-amd64-cpu8
+      dev-shell: .#devShells.x86_64-linux.glibc-2-28
+      cargo-version: ${{ needs.version.outputs.cargo }}
+      interpreter: /lib64/ld-linux-x86-64.so.2
+    secrets: inherit
+
+  build-driver-kubernetes:
+    needs: [pr_metadata, version]
+    if: needs.pr_metadata.outputs.run_core_e2e == 'true'
+    permissions:
+      contents: read
+    uses: ./.github/workflows/build-binaries.yml
+    with:
+      package: openshell-driver-kubernetes
+      binary: openshell-driver-kubernetes
+      triple: x86_64-unknown-linux-gnu
+      runner: linux-amd64-cpu8
+      dev-shell: .#devShells.x86_64-linux.glibc-2-28
+      cargo-version: ${{ needs.version.outputs.cargo }}
+      interpreter: /lib64/ld-linux-x86-64.so.2
+    secrets: inherit
+
+  build-vm-driver:
+    needs: [pr_metadata, version, build-sandbox]
+    if: needs.pr_metadata.outputs.run_core_e2e == 'true'
+    permissions:
+      contents: read
+    uses: ./.github/workflows/build-vm-driver.yml
+    with:
+      cargo-version: ${{ needs.version.outputs.cargo }}
+    secrets: inherit
+
+  build-gateway-image:
+    needs: [pr_metadata, build-gateway]
+    if: >-
+      needs.pr_metadata.outputs.should_run == 'true' &&
+      (needs.pr_metadata.outputs.run_core_e2e == 'true' ||
+      needs.pr_metadata.outputs.run_kubernetes_ha_e2e == 'true' ||
+      needs.pr_metadata.outputs.run_kubernetes_credential_drivers_e2e == 'true')
     permissions:
       contents: read
       packages: write
     uses: ./.github/workflows/docker-build.yml
     with:
       component: gateway
-      image-tag: ${{ github.sha }}
+      binary: openshell-gateway
+      target-suffix: unknown-linux-gnu
+    secrets: inherit
 
-  build-supervisor:
-    needs: [pr_metadata]
+  build-supervisor-image:
+    needs: [pr_metadata, build-sandbox]
     if: needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_any_e2e == 'true'
     permissions:
       contents: read
@@ -96,50 +236,88 @@ jobs:
     uses: ./.github/workflows/docker-build.yml
     with:
       component: supervisor
-      image-tag: ${{ github.sha }}
+      binary: openshell-sandbox
+      target-suffix: unknown-linux-musl
+    secrets: inherit
 
-  build-cli:
-    needs: [pr_metadata]
-    if: needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_any_e2e == 'true'
-    permissions:
-      contents: read
-      packages: write
-    uses: ./.github/workflows/docker-build.yml
-    with:
-      component: cli
-      platform: linux/amd64,linux/arm64
-
-  build-driver-vm-linux:
-    needs: [pr_metadata]
-    if: needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_core_e2e == 'true'
-    permissions:
-      contents: read
-      packages: read
-    uses: ./.github/workflows/driver-vm-linux.yml
-    with:
-      image-tag: ${{ github.sha }}
-      checkout-ref: ${{ github.sha }}
-      runtime-platforms: linux-x86_64
-      driver-targets: >-
-        [{"arch":"amd64","runner":"linux-amd64-cpu8","target":"x86_64-unknown-linux-gnu","zig_target":"x86_64-unknown-linux-gnu.2.28","platform":"linux-x86_64","guest_arch":"x86_64"}]
-
-  e2e:
-    needs: [pr_metadata, build-gateway, build-supervisor, build-cli, build-driver-vm-linux]
+  docker-e2e:
+    needs: [pr_metadata, build-cli, build-gateway, build-supervisor-image]
     if: needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_core_e2e == 'true'
     permissions:
       actions: read
       contents: read
       packages: read
-    uses: ./.github/workflows/e2e-test.yml
+    uses: ./.github/workflows/e2e-docker-test.yml
     with:
       image-tag: ${{ github.sha }}
       runner: linux-arm64-cpu8
-      cli-artifact-prefix: rust-binary-cli
-      gateway-artifact-prefix: rust-binary-gateway
-      vm-driver-artifact-name: driver-vm-linux-amd64
+
+  podman-e2e:
+    needs: [pr_metadata, build-cli, build-gateway, build-supervisor-image]
+    if: needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_core_e2e == 'true'
+    permissions:
+      actions: read
+      contents: read
+      packages: read
+    uses: ./.github/workflows/e2e-podman-test.yml
+    with:
+      image-tag: ${{ github.sha }}
+
+  vm-e2e:
+    needs: [pr_metadata, build-cli, build-gateway, build-vm-driver]
+    if: needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_core_e2e == 'true'
+    permissions:
+      actions: read
+      contents: read
+      packages: read
+    uses: ./.github/workflows/e2e-vm-test.yml
+
+  docker-external-driver-e2e:
+    needs: [pr_metadata, build-cli, build-gateway-plain, build-driver-docker, build-supervisor-image]
+    if: needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_core_e2e == 'true'
+    permissions:
+      actions: read
+      contents: read
+      packages: read
+    uses: ./.github/workflows/e2e-docker-test.yml
+    with:
+      image-tag: ${{ github.sha }}
+      runner: linux-arm64-cpu8
+      gateway-artifact: openshell-gateway-plain-aarch64-unknown-linux-gnu
+      external-driver-binary: openshell-driver-docker
+      suite-matrix: >-
+        [{"suite":"external-driver","cmd":"mise run --no-deps --skip-deps e2e:docker:external-driver","apt_packages":"openssh-client","python_proto":false,"mcp":false}]
+
+  podman-external-driver-e2e:
+    needs: [pr_metadata, build-cli, build-gateway-plain, build-driver-podman, build-supervisor-image]
+    if: needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_core_e2e == 'true'
+    permissions:
+      actions: read
+      contents: read
+      packages: read
+    uses: ./.github/workflows/e2e-podman-test.yml
+    with:
+      image-tag: ${{ github.sha }}
+      gateway-artifact: openshell-gateway-plain-x86_64-unknown-linux-gnu
+      external-driver-binary: openshell-driver-podman
+      suite-matrix: >-
+        [{"suite":"external-driver","runner":"ubuntu-26.04","podman_major":"5","podman_package_version":"5.7.0+ds2-3build1","conmon_package_version":"2.1.13+ds1-2","cmd":"mise run --no-deps --skip-deps e2e:podman:external-driver"}]
+
+  vm-external-driver-e2e:
+    needs: [pr_metadata, build-cli, build-gateway-plain, build-vm-driver]
+    if: needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_core_e2e == 'true'
+    permissions:
+      actions: read
+      contents: read
+      packages: read
+    uses: ./.github/workflows/e2e-vm-test.yml
+    with:
+      gateway-artifact: openshell-gateway-plain-x86_64-unknown-linux-gnu
+      suite-name: external-driver
+      e2e-task: e2e:vm:external-driver
 
   gpu-e2e:
-    needs: [pr_metadata, build-gateway, build-supervisor, build-cli]
+    needs: [pr_metadata, build-cli, build-gateway, build-supervisor-image]
     if: needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_gpu_e2e == 'true'
     permissions:
       actions: read
@@ -148,11 +326,9 @@ jobs:
     uses: ./.github/workflows/e2e-gpu-test.yaml
     with:
       image-tag: ${{ github.sha }}
-      cli-artifact-prefix: rust-binary-cli
-      gateway-artifact-prefix: rust-binary-gateway
 
   kubernetes-e2e:
-    needs: [pr_metadata, build-gateway, build-supervisor, build-cli]
+    needs: [pr_metadata, build-cli, build-gateway-image, build-supervisor-image]
     if: needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_core_e2e == 'true'
     strategy:
       fail-fast: false
@@ -180,10 +356,9 @@ jobs:
       job-name: Kubernetes E2E (Rust smoke, ${{ matrix.topology }}, Agent Sandbox ${{ matrix.agent_sandbox_api }})
       agent-sandbox-version: ${{ matrix.agent_sandbox_version }}
       extra-helm-values: ${{ matrix.extra_helm_values }}
-      cli-artifact-prefix: rust-binary-cli
 
   kubernetes-workspace-managed-e2e:
-    needs: [pr_metadata, build-gateway, build-supervisor, build-cli]
+    needs: [pr_metadata, build-cli, build-gateway-image, build-supervisor-image]
     if: needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_core_e2e == 'true'
     permissions:
       actions: read
@@ -194,10 +369,9 @@ jobs:
       image-tag: ${{ github.sha }}
       job-name: Kubernetes E2E (workspace managed mode)
       e2e-task: e2e:kubernetes:workspace-managed
-      cli-artifact-prefix: rust-binary-cli
 
   kubernetes-external-driver-e2e:
-    needs: [pr_metadata, build-gateway, build-supervisor, build-cli]
+    needs: [pr_metadata, build-cli, build-gateway-plain, build-driver-kubernetes, build-supervisor-image]
     if: needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_core_e2e == 'true'
     permissions:
       actions: read
@@ -208,10 +382,12 @@ jobs:
       image-tag: ${{ github.sha }}
       job-name: Kubernetes E2E (external compute driver)
       e2e-task: e2e:kubernetes:external-driver
-      cli-artifact-prefix: rust-binary-cli
+      gateway-artifact: openshell-gateway-plain-x86_64-unknown-linux-gnu
+      external-driver-binary: openshell-driver-kubernetes
+      cluster-images: supervisor
 
   kubernetes-workspace-operator-e2e:
-    needs: [pr_metadata, build-gateway, build-supervisor, build-cli]
+    needs: [pr_metadata, build-cli, build-gateway-image, build-supervisor-image]
     if: needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_core_e2e == 'true'
     permissions:
       actions: read
@@ -222,10 +398,9 @@ jobs:
       image-tag: ${{ github.sha }}
       job-name: Kubernetes E2E (workspace operator mode)
       e2e-task: e2e:kubernetes:workspace-operator
-      cli-artifact-prefix: rust-binary-cli
 
   kubernetes-ha-e2e:
-    needs: [pr_metadata, build-gateway, build-supervisor, build-cli]
+    needs: [pr_metadata, build-cli, build-gateway-image, build-supervisor-image]
     if: needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_kubernetes_ha_e2e == 'true'
     permissions:
       actions: read
@@ -237,10 +412,9 @@ jobs:
       job-name: Kubernetes HA E2E (Rust smoke)
       extra-helm-values: deploy/helm/openshell/ci/values-high-availability.yaml
       external-postgres-secret: openshell-ha-pg
-      cli-artifact-prefix: rust-binary-cli
 
   kubernetes-credential-drivers-e2e:
-    needs: [pr_metadata, build-gateway, build-supervisor]
+    needs: [pr_metadata, build-cli, build-gateway-image, build-supervisor-image]
     if: needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_kubernetes_credential_drivers_e2e == 'true'
     permissions:
       actions: read
@@ -254,124 +428,52 @@ jobs:
 
   core-e2e-result:
     name: Core E2E result
-    needs: [pr_metadata, build-gateway, build-supervisor, build-cli, build-driver-vm-linux, e2e, kubernetes-e2e, kubernetes-external-driver-e2e, kubernetes-workspace-managed-e2e, kubernetes-workspace-operator-e2e]
+    needs: [pr_metadata, docker-e2e, podman-e2e, vm-e2e, docker-external-driver-e2e, podman-external-driver-e2e, vm-external-driver-e2e, kubernetes-e2e, kubernetes-external-driver-e2e, kubernetes-workspace-managed-e2e, kubernetes-workspace-operator-e2e]
     if: always() && needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_core_e2e == 'true'
     runs-on: ubuntu-latest
     steps:
-      - name: Verify core E2E jobs
-        env:
-          BUILD_GATEWAY_RESULT: ${{ needs.build-gateway.result }}
-          BUILD_SUPERVISOR_RESULT: ${{ needs.build-supervisor.result }}
-          BUILD_CLI_RESULT: ${{ needs.build-cli.result }}
-          BUILD_DRIVER_VM_RESULT: ${{ needs.build-driver-vm-linux.result }}
-          E2E_RESULT: ${{ needs.e2e.result }}
-          KUBERNETES_E2E_RESULT: ${{ needs.kubernetes-e2e.result }}
-          KUBERNETES_EXTERNAL_DRIVER_E2E_RESULT: ${{ needs.kubernetes-external-driver-e2e.result }}
-          KUBERNETES_WORKSPACE_MANAGED_E2E_RESULT: ${{ needs.kubernetes-workspace-managed-e2e.result }}
-          KUBERNETES_WORKSPACE_OPERATOR_E2E_RESULT: ${{ needs.kubernetes-workspace-operator-e2e.result }}
-        run: |
-          set -euo pipefail
-          failed=0
-          for item in \
-            "build-gateway:$BUILD_GATEWAY_RESULT" \
-            "build-supervisor:$BUILD_SUPERVISOR_RESULT" \
-            "build-cli:$BUILD_CLI_RESULT" \
-            "build-driver-vm-linux:$BUILD_DRIVER_VM_RESULT" \
-            "e2e:$E2E_RESULT" \
-            "kubernetes-e2e:$KUBERNETES_E2E_RESULT" \
-            "kubernetes-external-driver-e2e:$KUBERNETES_EXTERNAL_DRIVER_E2E_RESULT" \
-            "kubernetes-workspace-managed-e2e:$KUBERNETES_WORKSPACE_MANAGED_E2E_RESULT" \
-            "kubernetes-workspace-operator-e2e:$KUBERNETES_WORKSPACE_OPERATOR_E2E_RESULT"; do
-            name="${item%%:*}"
-            result="${item#*:}"
-            if [ "$result" != "success" ]; then
-              echo "::error::$name concluded $result"
-              failed=1
-            fi
-          done
-          exit "$failed"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/check-job-results
+        with:
+          results: ${{ toJSON(needs) }}
 
   gpu-e2e-result:
     name: GPU E2E result
-    needs: [pr_metadata, build-gateway, build-supervisor, build-cli, gpu-e2e]
+    needs: [pr_metadata, gpu-e2e]
     if: always() && needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_gpu_e2e == 'true'
     runs-on: ubuntu-latest
     steps:
-      - name: Verify GPU E2E jobs
-        env:
-          BUILD_GATEWAY_RESULT: ${{ needs.build-gateway.result }}
-          BUILD_SUPERVISOR_RESULT: ${{ needs.build-supervisor.result }}
-          BUILD_CLI_RESULT: ${{ needs.build-cli.result }}
-          GPU_E2E_RESULT: ${{ needs.gpu-e2e.result }}
-        run: |
-          set -euo pipefail
-          failed=0
-          for item in \
-            "build-gateway:$BUILD_GATEWAY_RESULT" \
-            "build-supervisor:$BUILD_SUPERVISOR_RESULT" \
-            "build-cli:$BUILD_CLI_RESULT" \
-            "gpu-e2e:$GPU_E2E_RESULT"; do
-            name="${item%%:*}"
-            result="${item#*:}"
-            if [ "$result" != "success" ]; then
-              echo "::error::$name concluded $result"
-              failed=1
-            fi
-          done
-          exit "$failed"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/check-job-results
+        with:
+          results: ${{ toJSON(needs) }}
 
   kubernetes-ha-e2e-result:
     name: Kubernetes HA E2E result
-    needs: [pr_metadata, build-gateway, build-supervisor, build-cli, kubernetes-ha-e2e]
+    needs: [pr_metadata, kubernetes-ha-e2e]
     if: always() && needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_kubernetes_ha_e2e == 'true'
     runs-on: ubuntu-latest
     steps:
-      - name: Verify Kubernetes HA E2E jobs
-        env:
-          BUILD_GATEWAY_RESULT: ${{ needs.build-gateway.result }}
-          BUILD_SUPERVISOR_RESULT: ${{ needs.build-supervisor.result }}
-          BUILD_CLI_RESULT: ${{ needs.build-cli.result }}
-          KUBERNETES_HA_E2E_RESULT: ${{ needs.kubernetes-ha-e2e.result }}
-        run: |
-          set -euo pipefail
-          failed=0
-          for item in \
-            "build-gateway:$BUILD_GATEWAY_RESULT" \
-            "build-supervisor:$BUILD_SUPERVISOR_RESULT" \
-            "build-cli:$BUILD_CLI_RESULT" \
-            "kubernetes-ha-e2e:$KUBERNETES_HA_E2E_RESULT"; do
-            name="${item%%:*}"
-            result="${item#*:}"
-            if [ "$result" != "success" ]; then
-              echo "::error::$name concluded $result"
-              failed=1
-            fi
-          done
-          exit "$failed"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/check-job-results
+        with:
+          results: ${{ toJSON(needs) }}
 
   kubernetes-credential-drivers-e2e-result:
     name: Kubernetes Credential Drivers E2E result
-    needs: [pr_metadata, build-gateway, build-supervisor, kubernetes-credential-drivers-e2e]
+    needs: [pr_metadata, kubernetes-credential-drivers-e2e]
     if: always() && needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_kubernetes_credential_drivers_e2e == 'true'
     runs-on: ubuntu-latest
     steps:
-      - name: Verify Kubernetes credential drivers E2E jobs
-        env:
-          BUILD_GATEWAY_RESULT: ${{ needs.build-gateway.result }}
-          BUILD_SUPERVISOR_RESULT: ${{ needs.build-supervisor.result }}
-          KUBERNETES_CREDENTIAL_DRIVERS_E2E_RESULT: ${{ needs.kubernetes-credential-drivers-e2e.result }}
-        run: |
-          set -euo pipefail
-          failed=0
-          for item in \
-            "build-gateway:$BUILD_GATEWAY_RESULT" \
-            "build-supervisor:$BUILD_SUPERVISOR_RESULT" \
-            "kubernetes-credential-drivers-e2e:$KUBERNETES_CREDENTIAL_DRIVERS_E2E_RESULT"; do
-            name="${item%%:*}"
-            result="${item#*:}"
-            if [ "$result" != "success" ]; then
-              echo "::error::$name concluded $result"
-              failed=1
-            fi
-          done
-          exit "$failed"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/check-job-results
+        with:
+          results: ${{ toJSON(needs) }}
