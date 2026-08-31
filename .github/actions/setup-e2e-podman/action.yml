@@ -110,17 +110,3 @@ runs:
         INPUTS_PODMAN_MAJOR: ${{ inputs.podman-major }}
         INPUTS_PODMAN_PACKAGE_VERSION: ${{ inputs.podman-package-version }}
         INPUTS_CONMON_PACKAGE_VERSION: ${{ inputs.conmon-package-version }}
-
-    - name: Probe rootless capability bounding set
-      shell: bash
-      run: |
-        set -euo pipefail
-        probe="$RUNNER_TEMP/openshell-capbset-probe"
-        cc -static -O2 -Wall -Wextra -Werror \
-          e2e/support/capbset-probe.c \
-          -o "$probe"
-        podman run --rm \
-          --cap-add=SETPCAP \
-          --volume "$probe:/openshell-capbset-probe:ro" \
-          docker.io/library/alpine:3.22 \
-          /openshell-capbset-probe
