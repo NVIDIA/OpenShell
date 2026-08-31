@@ -108,6 +108,7 @@ CORPORATE_PROXY_FIXTURE_DEPLOYED=0
 CORPORATE_PROXY_FIXTURE_SECRET="openshell-e2e-proxy-auth"
 OPENSHIFT_DETECTED=0
 OPENSHIFT_SANDBOX_SCC_GRANTED=0
+OPENSHIFT_POSTGRES_SCC_GRANTED=0
 OPENSHIFT_ROUTE_HOST=""
 # Temp dir holding the client mTLS material extracted from openshell-client-tls
 # for the OpenShift Route transport. Removed by cleanup().
@@ -157,6 +158,9 @@ deploy_postgres_fixture() {
     oc adm policy add-scc-to-user anyuid \
       --context "${KUBE_CONTEXT}" \
       -z "${EXTERNAL_PG_FIXTURE_SERVICE}" -n "${NAMESPACE}"
+    # Record the grant before applying the fixture so cleanup revokes it even if
+    # the apply below fails and EXTERNAL_PG_FIXTURE_DEPLOYED is never set.
+    OPENSHIFT_POSTGRES_SCC_GRANTED=1
   fi
 
   kctl -n "${NAMESPACE}" apply -f "${EXTERNAL_PG_FIXTURE_MANIFEST}"
@@ -183,11 +187,12 @@ cleanup_postgres_fixture() {
   kctl -n "${NAMESPACE}" delete secret "${secret_name}" \
     --ignore-not-found >/dev/null 2>&1 || true
 
-  if [ "${OPENSHIFT_DETECTED}" = "1" ]; then
+  if [ "${OPENSHIFT_POSTGRES_SCC_GRANTED}" = "1" ]; then
     oc adm policy remove-scc-from-user anyuid \
       --context "${KUBE_CONTEXT}" \
       -z "${EXTERNAL_PG_FIXTURE_SERVICE}" -n "${NAMESPACE}" \
       2>/dev/null || true
+    OPENSHIFT_POSTGRES_SCC_GRANTED=0
   fi
 
   EXTERNAL_PG_FIXTURE_DEPLOYED=0
@@ -274,7 +279,8 @@ cleanup() {
     fi
   fi
 
-  if [ "${EXTERNAL_PG_FIXTURE_DEPLOYED}" = "1" ]; then
+  if [ "${EXTERNAL_PG_FIXTURE_DEPLOYED}" = "1" ] \
+     || [ "${OPENSHIFT_POSTGRES_SCC_GRANTED}" = "1" ]; then
     cleanup_postgres_fixture "${EXTERNAL_PG_FIXTURE_SECRET}"
   fi
 
@@ -541,11 +547,31 @@ openshift_register_route_gateway() {
 
   # Security gate: a caller with no client certificate MUST be rejected during
   # the TLS handshake (clientCaSecretName set + no OIDC => mTLS mandatory).
-  if curl -sk --max-time 10 -o /dev/null "https://${OPENSHIFT_ROUTE_HOST}/"; then
-    echo "ERROR: SECURITY HOLE — gateway accepted a certless request over the Route" >&2
-    return 1
-  fi
-  echo "OK: Route reachable over mTLS; certless request rejected at TLS."
+  #
+  # Validate the server cert with --cacert (no -k) and inspect curl's exit code
+  # so an unrelated TLS/DNS/timeout failure is not silently accepted as "certless
+  # rejected". Only a handshake abort by the server (no client cert presented)
+  # counts as the expected rejection.
+  local certless_rc=0
+  curl -s --max-time 10 -o /dev/null \
+    --cacert "${pki_dir}/ca.crt" \
+    "https://${OPENSHIFT_ROUTE_HOST}/" || certless_rc=$?
+  case "${certless_rc}" in
+    0)
+      echo "ERROR: SECURITY HOLE — gateway accepted a certless request over the Route" >&2
+      return 1
+      ;;
+    35 | 56)
+      # 35 CURLE_SSL_CONNECT_ERROR / 56 CURLE_RECV_ERROR: the server aborted the
+      # TLS handshake because no client certificate was presented — the expected
+      # mTLS rejection.
+      echo "OK: Route reachable over mTLS; certless request rejected at TLS (curl ${certless_rc})."
+      ;;
+    *)
+      echo "ERROR: certless probe to ${OPENSHIFT_ROUTE_HOST} failed with curl exit ${certless_rc}, not a TLS client-auth rejection; cannot confirm mTLS is enforced" >&2
+      return 1
+      ;;
+  esac
 
   GATEWAY_NAME="openshell-e2e-openshift"
   GATEWAY_ENDPOINT="https://${OPENSHIFT_ROUTE_HOST}"

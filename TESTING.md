@@ -235,7 +235,9 @@ mise run e2e:kubernetes:credential-drivers
 ### Kubernetes E2E (`e2e/rust/e2e-kubernetes.sh`)
 
 Kubernetes e2e tests deploy an OpenShell gateway into a real Kubernetes cluster
-via Helm, port-forward the gateway, and run the Rust e2e suite against it.
+via Helm and run the Rust e2e suite against it. On vanilla Kubernetes the harness
+reaches the gateway through `kubectl port-forward`; on OpenShift it instead uses a
+passthrough Route secured with mandatory mTLS (see the OpenShift note below).
 
 Run with an ephemeral k3d cluster (macOS; created and torn down automatically):
 
@@ -256,8 +258,14 @@ OPENSHELL_E2E_KUBE_TEST=smoke mise run e2e:kubernetes
 ```
 
 **OpenShift**: when the target cluster exposes the `route.openshift.io` API
-group, the harness automatically applies SCC-compatible Helm overrides and
-grants the required SCCs. No extra flags or steps are needed.
+group, the harness automatically applies SCC-compatible Helm overrides, grants
+the required SCCs (`privileged` to `openshell-sandbox`, and `anyuid` to the
+PostgreSQL fixture for DB scenarios), and drives the gateway through a
+passthrough Route with mandatory mTLS instead of port-forward. No extra flags are
+needed, but `oc` must be installed and authenticated against the target cluster
+with permission to modify SCC bindings (`oc adm policy add-scc-to-user`) — the
+harness exits early if `oc` is missing. The SCC grants and extracted client
+mTLS material are removed during cleanup, including on failure or interrupt.
 
 On a **remote** cluster, drop the `e2e-host-gateway` feature. Those tests rely
 on the sandbox-side `host.openshell.internal` alias reaching the machine running
@@ -311,8 +319,12 @@ OPENSHELL_E2E_KUBE_CONTEXT=$(oc config current-context) \
 A semver tag matches a released commit, which may be behind `main`; if your
 branch CLI needs a newer feature, pin the SHA of your branch's base instead.
 
-Confirm a tag exists before relying on it:
-`skopeo inspect docker://ghcr.io/nvidia/openshell/gateway:<tag>`.
+Confirm a tag exists before relying on it (set `TAG` to the tag you plan to use):
+
+```shell
+TAG=0.0.115
+skopeo inspect "docker://ghcr.io/nvidia/openshell/gateway:${TAG}"
+```
 
 `IMAGE_TAG` sets only the gateway/supervisor image; the CLI under test is always
 built from your branch. To validate against images from your exact commit
