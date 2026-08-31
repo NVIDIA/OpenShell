@@ -61,7 +61,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::future::Future;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -2888,20 +2888,30 @@ impl VmDriver {
             }
         };
 
-        let metadata = tokio::fs::metadata(tar_path).await.map_err(|err| {
-            Status::failed_precondition(format!(
-                "rootfs tar not accessible at {}: {err}",
-                tar_path.display()
-            ))
-        })?;
-        let mtime = metadata
-            .modified()
-            .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
-            .duration_since(std::time::SystemTime::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        let tar_identity = format!("rootfs-tar:{}:{mtime}", tar_path.display());
-        let cache_identity = prepared_image_cache_identity(&tar_identity);
+        // Identity comes from the archive contents. See `rootfs_tar_cache_identity`.
+        let hash_source = tar_path.to_path_buf();
+        let source_digest = match tokio::task::spawn_blocking(move || {
+            compute_file_sha256_hex(&hash_source)
+        })
+        .await
+        {
+            Ok(Ok(digest)) => digest,
+            Ok(Err(err)) => {
+                cleanup_request_staging().await;
+                return Err(Status::failed_precondition(format!(
+                    "rootfs tar not readable at {}: {err}",
+                    tar_path.display()
+                )));
+            }
+            Err(err) => {
+                cleanup_request_staging().await;
+                return Err(Status::internal(format!(
+                    "failed to hash rootfs tar at {}: {err}",
+                    tar_path.display()
+                )));
+            }
+        };
+        let cache_identity = rootfs_tar_cache_identity(&source_digest);
         let image_path = image_cache_rootfs_image(&self.config.state_dir, &cache_identity);
         let tar_display = tar_path.display().to_string();
 
@@ -2949,11 +2959,37 @@ impl VmDriver {
                 ("image_identity".to_string(), cache_identity.clone()),
             ]),
         );
-        if let Err(err) = tokio::fs::copy(tar_path, &rootfs_archive).await {
+        let copy_src = tar_path.to_path_buf();
+        let copy_dst = rootfs_archive.clone();
+        let copied_digest =
+            match tokio::task::spawn_blocking(move || copy_file_sha256_hex(&copy_src, &copy_dst))
+                .await
+            {
+                Ok(Ok(digest)) => digest,
+                Ok(Err(err)) => {
+                    let _ = tokio::fs::remove_dir_all(&staging_dir).await;
+                    cleanup_request_staging().await;
+                    return Err(Status::internal(format!(
+                        "failed to copy rootfs tar to staging: {err}"
+                    )));
+                }
+                Err(err) => {
+                    let _ = tokio::fs::remove_dir_all(&staging_dir).await;
+                    cleanup_request_staging().await;
+                    return Err(Status::internal(format!(
+                        "failed to copy rootfs tar to staging: {err}"
+                    )));
+                }
+            };
+
+        // The archive changed between the hash pass and the copy: the prepared
+        // disk we are about to build would not match the identity it is cached
+        // under. Reject rather than poison the cache.
+        if copied_digest != source_digest {
             let _ = tokio::fs::remove_dir_all(&staging_dir).await;
             cleanup_request_staging().await;
-            return Err(Status::internal(format!(
-                "failed to copy rootfs tar to staging: {err}"
+            return Err(Status::aborted(format!(
+                "rootfs tar {tar_display} changed while it was being staged; retry the request"
             )));
         }
         cleanup_request_staging().await;
@@ -4776,6 +4812,46 @@ fn compute_bytes_sha256_hex(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
     format!("{:x}", hasher.finalize())
+}
+
+/// Copy `src` to `dst` and return the SHA-256 of the bytes actually written.
+///
+/// Hashing the copy rather than re-reading the source is what lets the caller
+/// detect an archive that changed underneath it during staging: the digest
+/// describes exactly the bytes that landed in the image cache.
+fn copy_file_sha256_hex(src: &Path, dst: &Path) -> Result<String, String> {
+    let mut reader = fs::File::open(src).map_err(|err| format!("open {}: {err}", src.display()))?;
+    let mut writer =
+        fs::File::create(dst).map_err(|err| format!("create {}: {err}", dst.display()))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0_u8; 64 * 1024].into_boxed_slice();
+    loop {
+        let read = reader
+            .read(&mut buffer)
+            .map_err(|err| format!("read {}: {err}", src.display()))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+        writer
+            .write_all(&buffer[..read])
+            .map_err(|err| format!("write {}: {err}", dst.display()))?;
+    }
+    writer
+        .flush()
+        .map_err(|err| format!("flush {}: {err}", dst.display()))?;
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+/// Cache identity for a rootfs tar archive, derived from its contents.
+///
+/// Deliberately not path- or mtime-derived: staging directories are unique per
+/// request, so a path-based key would never hit the cache, and a
+/// seconds-truncated mtime cannot distinguish two writes within the same
+/// second. A fixed-length digest also keeps the cache directory name inside
+/// filesystem component limits regardless of how long the source path was.
+fn rootfs_tar_cache_identity(digest: &str) -> String {
+    prepared_image_cache_identity(&format!("rootfs-tar:sha256:{digest}"))
 }
 
 fn extract_layer_blob_to_dir(
@@ -8920,6 +8996,238 @@ mod tests {
         LifecycleResult,
     };
     use crate::runtime::VmBackend;
+
+    /// Driver whose rootfs tar staging root is an isolated temp directory.
+    fn rootfs_tar_test_driver(staging_root: &Path, max_bytes: Option<u64>) -> VmDriver {
+        let (events, _) = broadcast::channel(WATCH_BUFFER);
+        VmDriver {
+            config: VmDriverConfig {
+                rootfs_tar_staging_dir: Some(staging_root.to_path_buf()),
+                rootfs_tar_max_bytes: max_bytes,
+                ..Default::default()
+            },
+            launcher_bin: PathBuf::from("openshell-driver-vm"),
+            registry: Arc::new(Mutex::new(HashMap::new())),
+            image_cache_lock: Arc::new(Mutex::new(())),
+            events,
+            gpu_inventory: None,
+            subnet_allocator: Arc::new(std::sync::Mutex::new(SubnetAllocator::new(
+                Ipv4Addr::new(10, 0, 128, 0),
+                17,
+            ))),
+            lifecycle_extensions: Arc::new(LifecycleExtensionRegistry::new()),
+        }
+    }
+
+    /// `<staging_root>/req-<name>/<file>` with `contents`, the shape the
+    /// gateway allocates for one create request.
+    fn staged_rootfs_tar(staging_root: &Path, request: &str, contents: &[u8]) -> PathBuf {
+        let request_dir = staging_root.join(format!("req-{request}"));
+        std::fs::create_dir_all(&request_dir).expect("create request dir");
+        let archive = request_dir.join("rootfs.tar");
+        std::fs::write(&archive, contents).expect("write archive");
+        archive
+    }
+
+    #[tokio::test]
+    async fn validate_rootfs_tar_path_accepts_staged_archive() {
+        let root = unique_temp_dir();
+        std::fs::create_dir_all(&root).expect("create staging root");
+        let archive = staged_rootfs_tar(&root, "a", b"payload");
+        let driver = rootfs_tar_test_driver(&root, None);
+
+        let resolved = driver
+            .validate_rootfs_tar_path(&archive)
+            .await
+            .expect("a correctly staged archive is accepted");
+
+        assert_eq!(
+            resolved,
+            archive.canonicalize().expect("canonicalize archive")
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The core of the fix: a caller-named host path must never reach
+    /// privileged driver I/O, even if the caller is authenticated.
+    #[tokio::test]
+    async fn validate_rootfs_tar_path_rejects_arbitrary_host_paths() {
+        let root = unique_temp_dir();
+        std::fs::create_dir_all(&root).expect("create staging root");
+        let driver = rootfs_tar_test_driver(&root, None);
+
+        for candidate in ["/etc/passwd", "/dev/zero"] {
+            let path = Path::new(candidate);
+            if !path.exists() {
+                continue;
+            }
+            let Err(err) = driver.validate_rootfs_tar_path(path).await else {
+                panic!("{candidate} must be rejected");
+            };
+            assert_eq!(
+                err.code(),
+                Code::PermissionDenied,
+                "{candidate} should be denied, got: {err}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn validate_rootfs_tar_path_rejects_symlink_escape() {
+        let root = unique_temp_dir();
+        let request_dir = root.join("req-a");
+        std::fs::create_dir_all(&request_dir).expect("create request dir");
+        let target = unique_temp_dir();
+        std::fs::create_dir_all(&target).expect("create escape target dir");
+        let secret = target.join("secret.tar");
+        std::fs::write(&secret, b"not yours").expect("write escape target");
+        let link = request_dir.join("rootfs.tar");
+        std::os::unix::fs::symlink(&secret, &link).expect("create symlink");
+        let driver = rootfs_tar_test_driver(&root, None);
+
+        let err = driver
+            .validate_rootfs_tar_path(&link)
+            .await
+            .expect_err("a symlink out of the staging root must be rejected");
+
+        assert_eq!(err.code(), Code::PermissionDenied, "{err}");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&target);
+    }
+
+    #[tokio::test]
+    async fn validate_rootfs_tar_path_rejects_wrong_depth() {
+        let root = unique_temp_dir();
+        std::fs::create_dir_all(&root).expect("create staging root");
+        let shallow = root.join("rootfs.tar");
+        std::fs::write(&shallow, b"payload").expect("write shallow archive");
+        let deep_dir = root.join("req-a").join("nested");
+        std::fs::create_dir_all(&deep_dir).expect("create deep dir");
+        let deep = deep_dir.join("rootfs.tar");
+        std::fs::write(&deep, b"payload").expect("write deep archive");
+        let driver = rootfs_tar_test_driver(&root, None);
+
+        for path in [&shallow, &deep] {
+            let err = driver
+                .validate_rootfs_tar_path(path)
+                .await
+                .expect_err("only request-directory depth is accepted");
+            assert_eq!(err.code(), Code::PermissionDenied, "{err}");
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn validate_rootfs_tar_path_rejects_directory() {
+        let root = unique_temp_dir();
+        let request_dir = root.join("req-a");
+        let not_a_file = request_dir.join("rootfs.tar");
+        std::fs::create_dir_all(&not_a_file).expect("create directory in archive position");
+        let driver = rootfs_tar_test_driver(&root, None);
+
+        let err = driver
+            .validate_rootfs_tar_path(&not_a_file)
+            .await
+            .expect_err("a directory is not a rootfs tar");
+
+        assert_eq!(err.code(), Code::InvalidArgument, "{err}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn validate_rootfs_tar_path_enforces_max_bytes() {
+        let root = unique_temp_dir();
+        std::fs::create_dir_all(&root).expect("create staging root");
+        let archive = staged_rootfs_tar(&root, "a", &[0_u8; 64]);
+        let driver = rootfs_tar_test_driver(&root, Some(16));
+
+        let err = driver
+            .validate_rootfs_tar_path(&archive)
+            .await
+            .expect_err("an oversized archive must be rejected");
+
+        assert_eq!(err.code(), Code::InvalidArgument, "{err}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Identity must follow the bytes, not the path. The gateway hands every
+    /// request its own staging directory, so a path-derived key would miss the
+    /// cache on every single create.
+    #[test]
+    fn rootfs_tar_cache_identity_tracks_contents_not_path() {
+        let same_a = rootfs_tar_cache_identity(&compute_bytes_sha256_hex(b"rootfs-bytes"));
+        let same_b = rootfs_tar_cache_identity(&compute_bytes_sha256_hex(b"rootfs-bytes"));
+        let different = rootfs_tar_cache_identity(&compute_bytes_sha256_hex(b"other-bytes"));
+
+        assert_eq!(
+            same_a, same_b,
+            "identical contents must share one prepared disk"
+        );
+        assert_ne!(
+            same_a, different,
+            "different contents must not collide on one prepared disk"
+        );
+    }
+
+    /// The old key was `path + seconds-truncated mtime` run through a
+    /// punctuation sanitizer, so `/tmp/a/b.tar` and `/tmp/a-b.tar` collided and
+    /// a long path could blow past filesystem component limits.
+    #[test]
+    fn rootfs_tar_cache_identity_is_bounded_and_separator_safe() {
+        let long_path_digest = compute_bytes_sha256_hex(&vec![7_u8; 4096]);
+        let identity = rootfs_tar_cache_identity(&long_path_digest);
+        let sanitized = sanitize_image_identity(&identity);
+
+        assert!(
+            sanitized.len() < 255,
+            "cache directory component must stay within filesystem limits, got {}",
+            sanitized.len()
+        );
+        assert_ne!(
+            rootfs_tar_cache_identity(&compute_bytes_sha256_hex(b"/tmp/a/b.tar")),
+            rootfs_tar_cache_identity(&compute_bytes_sha256_hex(b"/tmp/a-b.tar")),
+            "separator-colliding inputs must not share an identity"
+        );
+    }
+
+    #[test]
+    fn copy_file_sha256_hex_matches_source_digest() {
+        let base = unique_temp_dir();
+        std::fs::create_dir_all(&base).expect("create base dir");
+        let src = base.join("src.tar");
+        let dst = base.join("dst.tar");
+        let payload = vec![3_u8; 200 * 1024];
+        std::fs::write(&src, &payload).expect("write source");
+
+        let copied = copy_file_sha256_hex(&src, &dst).expect("copy should succeed");
+
+        assert_eq!(copied, compute_file_sha256_hex(&src).expect("hash source"));
+        assert_eq!(copied, compute_bytes_sha256_hex(&payload));
+        assert_eq!(std::fs::read(&dst).expect("read copy"), payload);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// An archive rewritten between the hash pass and the copy pass yields a
+    /// different digest, which is what lets the caller reject it instead of
+    /// caching a disk under an identity that does not describe it.
+    #[test]
+    fn copy_file_sha256_hex_detects_content_change_between_passes() {
+        let base = unique_temp_dir();
+        std::fs::create_dir_all(&base).expect("create base dir");
+        let src = base.join("src.tar");
+        std::fs::write(&src, b"original").expect("write source");
+        let first = compute_file_sha256_hex(&src).expect("hash source");
+
+        std::fs::write(&src, b"replaced").expect("rewrite source");
+        let second = copy_file_sha256_hex(&src, &base.join("dst.tar")).expect("copy");
+
+        assert_ne!(
+            first, second,
+            "a mid-staging rewrite must produce a different digest"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
 
     fn test_driver_with_extensions(extensions: LifecycleExtensionRegistry) -> VmDriver {
         let (events, _) = broadcast::channel(WATCH_BUFFER);
