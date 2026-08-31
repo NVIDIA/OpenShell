@@ -1554,11 +1554,15 @@ fn assert_platform_admin_denial(output: &Output, action: &str) {
 
 fn assert_non_member_denial(output: &Output, action: &str) {
     let denied = combined_output(output);
+    let compact_denial: String = denied
+        .chars()
+        .filter(|character| !character.is_whitespace() && *character != '│')
+        .collect();
     assert!(
         !output.status.success()
-            && denied
+            && compact_denial
                 .to_ascii_lowercase()
-                .contains("not a member of workspace"),
+                .contains("notamemberofworkspace"),
         "non-member unexpectedly authorized to {action}, or denial omitted membership context:\n{denied}"
     );
 }
