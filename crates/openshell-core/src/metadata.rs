@@ -6,7 +6,8 @@
 //! These traits provide uniform access to `ObjectMeta` fields across all resource types.
 
 use crate::proto::{
-    InferenceRoute, ObjectForTest, Provider, Sandbox, SandboxStatus, ServiceEndpoint, SshSession,
+    DelegatedIdentityCredential, InferenceRoute, ObjectForTest, Provider, Sandbox,
+    SandboxDelegatedIdentityRecord, SandboxStatus, ServiceEndpoint, SshSession,
     StoredProviderCredentialRefreshState, StoredProviderProfile, Workspace, WorkspaceMember,
 };
 use std::collections::HashMap;
@@ -265,6 +266,90 @@ impl GetResourceVersion for StoredProviderCredentialRefreshState {
 }
 
 impl ObjectWorkspace for StoredProviderCredentialRefreshState {
+    fn object_workspace(&self) -> &str {
+        self.metadata.as_ref().map_or("", |m| m.workspace.as_str())
+    }
+    fn requires_workspace() -> bool {
+        true
+    }
+}
+
+// Implementations for DelegatedIdentityCredential
+impl ObjectId for DelegatedIdentityCredential {
+    fn object_id(&self) -> &str {
+        self.metadata.as_ref().map_or("", |m| m.id.as_str())
+    }
+}
+
+impl ObjectName for DelegatedIdentityCredential {
+    fn object_name(&self) -> &str {
+        self.metadata.as_ref().map_or("", |m| m.name.as_str())
+    }
+}
+
+impl ObjectLabels for DelegatedIdentityCredential {
+    fn object_labels(&self) -> Option<HashMap<String, String>> {
+        self.metadata.as_ref().map(|m| m.labels.clone())
+    }
+}
+
+impl SetResourceVersion for DelegatedIdentityCredential {
+    fn set_resource_version(&mut self, version: u64) {
+        if let Some(meta) = self.metadata.as_mut() {
+            meta.resource_version = version;
+        }
+    }
+}
+
+impl GetResourceVersion for DelegatedIdentityCredential {
+    fn get_resource_version(&self) -> u64 {
+        self.metadata.as_ref().map_or(0, |m| m.resource_version)
+    }
+}
+
+impl ObjectWorkspace for DelegatedIdentityCredential {
+    fn object_workspace(&self) -> &str {
+        self.metadata.as_ref().map_or("", |m| m.workspace.as_str())
+    }
+    fn requires_workspace() -> bool {
+        false
+    }
+}
+
+// Implementations for SandboxDelegatedIdentityRecord
+impl ObjectId for SandboxDelegatedIdentityRecord {
+    fn object_id(&self) -> &str {
+        self.metadata.as_ref().map_or("", |m| m.id.as_str())
+    }
+}
+
+impl ObjectName for SandboxDelegatedIdentityRecord {
+    fn object_name(&self) -> &str {
+        self.metadata.as_ref().map_or("", |m| m.name.as_str())
+    }
+}
+
+impl ObjectLabels for SandboxDelegatedIdentityRecord {
+    fn object_labels(&self) -> Option<HashMap<String, String>> {
+        self.metadata.as_ref().map(|m| m.labels.clone())
+    }
+}
+
+impl SetResourceVersion for SandboxDelegatedIdentityRecord {
+    fn set_resource_version(&mut self, version: u64) {
+        if let Some(meta) = self.metadata.as_mut() {
+            meta.resource_version = version;
+        }
+    }
+}
+
+impl GetResourceVersion for SandboxDelegatedIdentityRecord {
+    fn get_resource_version(&self) -> u64 {
+        self.metadata.as_ref().map_or(0, |m| m.resource_version)
+    }
+}
+
+impl ObjectWorkspace for SandboxDelegatedIdentityRecord {
     fn object_workspace(&self) -> &str {
         self.metadata.as_ref().map_or("", |m| m.workspace.as_str())
     }

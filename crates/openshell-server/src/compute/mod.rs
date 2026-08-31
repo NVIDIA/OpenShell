@@ -47,8 +47,8 @@ use openshell_core::proto::compute::v1::{
     gateway_listener_requirement::Selector, watch_sandboxes_event,
 };
 use openshell_core::proto::{
-    PlatformEvent, Sandbox, SandboxCondition, SandboxPhase, SandboxSpec, SandboxStatus,
-    SandboxTemplate, ServiceEndpoint, SshSession,
+    PlatformEvent, Sandbox, SandboxCondition, SandboxDelegatedIdentityRecord, SandboxPhase,
+    SandboxSpec, SandboxStatus, SandboxTemplate, ServiceEndpoint, SshSession,
 };
 use openshell_core::{ObjectLabels, ObjectWorkspace};
 #[cfg(all(not(target_os = "windows"), feature = "in-tree-compute-drivers"))]
@@ -3156,6 +3156,15 @@ impl ComputeRuntime {
             .await?;
         self.cleanup_sandbox_service_endpoints(sandbox.object_id(), sandbox.object_workspace())
             .await?;
+        self.store
+            .delete(
+                SandboxDelegatedIdentityRecord::object_type(),
+                &crate::delegated_identity::sandbox_delegated_identity_record_id(
+                    sandbox.object_id(),
+                ),
+            )
+            .await
+            .map_err(|e| format!("delete sandbox delegated identity: {e}"))?;
 
         self.store
             .delete_by_name(

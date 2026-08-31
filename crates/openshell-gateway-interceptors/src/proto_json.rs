@@ -317,6 +317,7 @@ mod tests {
             annotations: HashMap::new(),
             workspace: String::new(),
             await_main_process_attachment: false,
+            delegated_identity: None,
         };
         let bytes = request.encode_to_vec();
         let json = codec

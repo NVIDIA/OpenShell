@@ -456,6 +456,13 @@ fn prepare_server_config(
         config = config.with_ssh_session_ttl_secs(ttl);
     }
 
+    if let Some(max_secs) = file
+        .as_ref()
+        .and_then(|f| f.openshell.gateway.max_delegated_identity_duration_secs)
+    {
+        config = config.with_max_delegated_identity_duration_secs(max_secs);
+    }
+
     if let Some(mode) = file
         .as_ref()
         .and_then(|f| f.openshell.gateway.policy_validation_failure_mode)

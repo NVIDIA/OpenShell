@@ -120,6 +120,8 @@ pub struct GatewayFileSection {
     #[serde(default)]
     pub ssh_session_ttl_secs: Option<u64>,
     #[serde(default)]
+    pub max_delegated_identity_duration_secs: Option<u64>,
+    #[serde(default)]
     pub grpc_rate_limit_requests: Option<u64>,
     #[serde(default)]
     pub grpc_rate_limit_window_seconds: Option<u64>,

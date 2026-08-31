@@ -1408,6 +1408,7 @@ fn spawn_create_sandbox(app: &mut App, tx: mpsc::UnboundedSender<Event>) {
             annotations: HashMap::new(),
             workspace: workspace.clone(),
             await_main_process_attachment: false,
+            delegated_identity: None,
         };
 
         let sandbox_name =
