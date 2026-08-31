@@ -453,24 +453,34 @@ pub async fn run_process(
             .build()
     );
 
-    if let Some(tx) = sidecar_exit_tx.as_ref() {
-        report_sidecar_main_process_exit(tx, &main_instance_id, rendered_code).await?;
-    } else if let (Some(endpoint), Some(id)) = (openshell_endpoint, sandbox_id) {
-        report_main_process_exit_until_ack(endpoint, id, &main_instance_id, rendered_code).await;
-        info!(instance_id = %main_instance_id, "main-process exit acknowledged");
+    if outcome.should_report_main_process_exit() {
+        if let Some(tx) = sidecar_exit_tx.as_ref() {
+            report_sidecar_main_process_exit(tx, &main_instance_id, rendered_code).await?;
+        } else if let (Some(endpoint), Some(id)) = (openshell_endpoint, sandbox_id) {
+            report_main_process_exit_until_ack(endpoint, id, &main_instance_id, rendered_code)
+                .await;
+            info!(instance_id = %main_instance_id, "main-process exit acknowledged");
+        }
+    } else {
+        info!(
+            instance_id = %main_instance_id,
+            "skipping main-process exit report during supervisor shutdown"
+        );
     }
     main_session.mark_terminal_reported();
-    if drain_terminal && terminal_delivery_pending {
+    if outcome.should_report_main_process_exit() && drain_terminal && terminal_delivery_pending {
         // The peer's SSH channel-close confirms that the terminal frames sent
         // above traversed russh and the relay. Detached commands have no active
         // attachment and never enter this wait.
         main_session.wait_for_terminal_attachments().await;
     }
-    if let Some(tx) = sidecar_exit_tx.as_ref() {
-        finalize_sidecar_main_process_exit(tx, &main_instance_id).await?;
-    } else if let (Some(endpoint), Some(id)) = (openshell_endpoint, sandbox_id) {
-        finalize_main_process_exit_until_ack(endpoint, id, &main_instance_id).await;
-        info!(instance_id = %main_instance_id, "main-process terminal delivery finalized");
+    if outcome.should_report_main_process_exit() {
+        if let Some(tx) = sidecar_exit_tx.as_ref() {
+            finalize_sidecar_main_process_exit(tx, &main_instance_id).await?;
+        } else if let (Some(endpoint), Some(id)) = (openshell_endpoint, sandbox_id) {
+            finalize_main_process_exit_until_ack(endpoint, id, &main_instance_id).await;
+            info!(instance_id = %main_instance_id, "main-process terminal delivery finalized");
+        }
     }
 
     supervisor_terminating.store(true, Ordering::Release);
@@ -570,6 +580,16 @@ enum ProcessWaitOutcome {
         signal: &'static str,
         status: ProcessStatus,
     },
+}
+
+impl ProcessWaitOutcome {
+    /// A gateway acknowledgement is required for ordinary canonical-process
+    /// completion, but cannot be awaited after the supervisor itself has been
+    /// asked to terminate. At that point the gateway may already be shutting
+    /// down and no longer able to acknowledge the report.
+    fn should_report_main_process_exit(&self) -> bool {
+        !matches!(self, Self::ShutdownSignal { .. })
+    }
 }
 
 async fn wait_for_process_exit_or_shutdown(
@@ -788,5 +808,23 @@ mod tests {
         let policy = policy(NetworkMode::Allow, Some(([127, 0, 0, 1], 3128).into()));
 
         assert_eq!(ssh_proxy_url_for_policy(&policy, None), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn supervisor_shutdown_exit_skips_gateway_acknowledgement() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let status = ProcessStatus::from(std::process::ExitStatus::from_raw(libc::SIGTERM));
+
+        assert!(ProcessWaitOutcome::Exited(status).should_report_main_process_exit());
+        assert!(ProcessWaitOutcome::TimedOut.should_report_main_process_exit());
+        assert!(
+            !ProcessWaitOutcome::ShutdownSignal {
+                signal: "SIGTERM",
+                status,
+            }
+            .should_report_main_process_exit()
+        );
     }
 }
