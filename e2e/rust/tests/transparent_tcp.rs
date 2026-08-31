@@ -141,6 +141,13 @@ async fn rootless_podman_musl_getaddrinfo_uses_udp_policy_dns() {
     if !is_e2e_driver("podman") {
         return;
     }
+    if std::env::var_os("OPENSHELL_E2E_TESTS_IN_VM").is_some() {
+        eprintln!(
+            "skipping musl DNS probe test in guest prebuilt-artifact mode; \
+             restore with a prebuilt probe artifact tracked in #3009"
+        );
+        return;
+    }
 
     let probe = MuslDnsProbe::build().expect("build static musl DNS probe");
     let fixture = SupportContainer::start_python(
