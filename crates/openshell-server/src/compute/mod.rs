@@ -5,6 +5,7 @@
 
 pub mod driver_config;
 pub mod lease;
+pub mod rootfs_tar;
 
 use crate::grpc::policy::SANDBOX_SETTINGS_OBJECT_TYPE;
 use crate::otel_tracing::TraceContextInterceptor;
@@ -608,6 +609,10 @@ pub struct ComputeRuntime {
     lifecycle_gates: Arc<LifecycleGateRegistry>,
     gateway_listener_requirements: Vec<GatewayListenerRequirement>,
     replica_id: String,
+    /// Gateway-issued staging slots for rootfs tar archives. Shared across
+    /// clones: `ServerState` holds `ComputeRuntime` by value, so a per-clone
+    /// table would make a token minted on one clone invisible to another.
+    rootfs_tar_staging: Arc<rootfs_tar::RootfsTarStagingRegistry>,
 }
 
 impl fmt::Debug for ComputeRuntime {
@@ -714,6 +719,12 @@ impl ComputeRuntime {
             }
             Err(status) => return Err(compute_error_from_status(status)),
         };
+        let rootfs_tar_staging = Arc::new(rootfs_tar::RootfsTarStagingRegistry::new(
+            (!driver_info.rootfs_tar_staging_dir.is_empty())
+                .then(|| PathBuf::from(&driver_info.rootfs_tar_staging_dir)),
+            driver_info.rootfs_tar_max_bytes,
+        ));
+        rootfs_tar_staging.sweep_orphans();
         Ok(Self {
             driver: TracedDriver::new(driver, driver_name),
             driver_info,
@@ -729,6 +740,7 @@ impl ComputeRuntime {
             lifecycle_gates: Arc::new(LifecycleGateRegistry::default()),
             gateway_listener_requirements,
             replica_id: lease::replica_id(),
+            rootfs_tar_staging,
         })
     }
 
@@ -789,6 +801,15 @@ impl ComputeRuntime {
         std::slice::from_ref(&self.driver_info)
     }
 
+    #[must_use]
+    pub(crate) fn rootfs_tar_staging(&self) -> &rootfs_tar::RootfsTarStagingRegistry {
+        &self.rootfs_tar_staging
+    }
+
+    /// The `template.driver_config` key whose block this gateway forwards.
+    ///
+    /// This is the *configured* driver name, which is not necessarily the name
+    /// the driver reports for itself in `driver_info.driver_name`.
     #[must_use]
     pub fn configured_driver_name(&self) -> &str {
         &self.driver_info.name
@@ -880,8 +901,14 @@ impl ComputeRuntime {
     }
 
     pub async fn validate_sandbox_create(&self, sandbox: &Sandbox) -> Result<(), Status> {
-        let driver_sandbox = driver_sandbox_from_public(sandbox, &self.driver_info.name)
+        let mut driver_sandbox = driver_sandbox_from_public(sandbox, &self.driver_info.name)
             .map_err(|status| *status)?;
+        // Peek, never consume: create runs the same path immediately after and
+        // must still find the token.
+        if let Some(token) = take_staging_token(&mut driver_sandbox) {
+            let staged = self.rootfs_tar_staging.peek(&token)?;
+            set_rootfs_tar_path(&mut driver_sandbox, &staged);
+        }
         self.driver
             .call(
                 openshell_otel::rpc::VALIDATE_SANDBOX_CREATE,
@@ -905,12 +932,25 @@ impl ComputeRuntime {
         await_main_process_attachment: bool,
     ) -> Result<Sandbox, Status> {
         let sandbox_id = sandbox.object_id().to_string();
+        let mut sandbox = sandbox;
+
+        // Strip the staging token from the public sandbox before anything
+        // persists it: the object store copy is readable by every member of the
+        // workspace, and the token is a bearer credential for the staged
+        // archive. The driver gets the resolved path instead, on its own copy.
+        let staging_token = take_public_staging_token(&mut sandbox, &self.driver_info.name);
+        let mut staged = staging_token
+            .map(|token| self.rootfs_tar_staging.consume(&token))
+            .transpose()?;
+
         let mut driver_sandbox = driver_sandbox_from_public(&sandbox, &self.driver_info.name)
             .map_err(|status| *status)?;
+        if let Some(staged) = staged.as_ref() {
+            set_rootfs_tar_path(&mut driver_sandbox, staged.path());
+        }
 
         // Create with MustCreate condition to prevent duplicate creation race
         self.sandbox_index.update_from_sandbox(&sandbox);
-        let mut sandbox = sandbox;
         let labels_map = sandbox.object_labels();
         let labels_json = if labels_map.as_ref().is_none_or(HashMap::is_empty) {
             None
@@ -970,6 +1010,12 @@ impl ComputeRuntime {
             .await
         {
             Ok(_) => {
+                // The driver now owns the staged archive and removes the
+                // request directory once it has built the disk. Every other
+                // arm lets the guard drop and clean up.
+                if let Some(staged) = staged.as_mut() {
+                    staged.disarm();
+                }
                 self.sandbox_watch_bus.notify(sandbox.object_id());
                 if let Some(metadata) = sandbox.metadata.as_mut() {
                     metadata.resource_version = result.resource_version;
@@ -2709,6 +2755,9 @@ impl ComputeRuntime {
     )]
     async fn reconcile_store_with_backend(&self, grace_period: Duration) -> Result<(), String> {
         let sweep_started_at_ms = openshell_core::time::now_ms();
+        // Reclaims staging directories whose driver failed before its own
+        // cleanup ran, which the token table cannot see once consumed.
+        self.rootfs_tar_staging.sweep_orphans();
         let backend_sandboxes = self
             .driver
             .call(
@@ -3898,6 +3947,76 @@ fn driver_sandbox_template_from_public(
     })
 }
 
+/// Remove the staging token from a driver-native sandbox, if present.
+///
+/// The driver config here has already been narrowed to the selected driver's
+/// block, so the token sits at the top level.
+fn take_staging_token(driver_sandbox: &mut DriverSandbox) -> Option<String> {
+    let config = driver_sandbox
+        .spec
+        .as_mut()?
+        .template
+        .as_mut()?
+        .driver_config
+        .as_mut()?;
+    match config.fields.remove(rootfs_tar::STAGING_TOKEN_FIELD)?.kind {
+        Some(prost_types::value::Kind::StringValue(token)) => Some(token),
+        _ => None,
+    }
+}
+
+/// Remove the staging token from the public sandbox, under the driver's key.
+///
+/// Called before the sandbox is persisted so the token never reaches the object
+/// store, where every workspace member could read it back.
+fn take_public_staging_token(sandbox: &mut Sandbox, driver_name: &str) -> Option<String> {
+    let config = sandbox
+        .spec
+        .as_mut()?
+        .template
+        .as_mut()?
+        .driver_config
+        .as_mut()?;
+    let Some(prost_types::value::Kind::StructValue(driver_config)) = config
+        .fields
+        .get_mut(driver_name)
+        .and_then(|v| v.kind.as_mut())
+    else {
+        return None;
+    };
+    match driver_config
+        .fields
+        .remove(rootfs_tar::STAGING_TOKEN_FIELD)?
+        .kind
+    {
+        Some(prost_types::value::Kind::StringValue(token)) => Some(token),
+        _ => None,
+    }
+}
+
+/// Substitute the gateway-resolved archive path into the driver-native copy.
+///
+/// This is the only writer of `rootfs_tar_path`; a caller-supplied value is
+/// rejected in request validation before it ever reaches here.
+fn set_rootfs_tar_path(driver_sandbox: &mut DriverSandbox, path: &Path) {
+    let Some(template) = driver_sandbox
+        .spec
+        .as_mut()
+        .and_then(|spec| spec.template.as_mut())
+    else {
+        return;
+    };
+    let config = template.driver_config.get_or_insert_with(Default::default);
+    config.fields.insert(
+        rootfs_tar::ROOTFS_TAR_PATH_FIELD.to_string(),
+        prost_types::Value {
+            kind: Some(prost_types::value::Kind::StringValue(
+                path.to_string_lossy().into_owned(),
+            )),
+        },
+    );
+}
+
 fn select_driver_config(
     config: &Option<prost_types::Struct>,
     driver_name: &str,
@@ -4822,6 +4941,7 @@ pub async fn new_test_runtime_with_driver(
         lifecycle_gates: Arc::new(LifecycleGateRegistry::default()),
         gateway_listener_requirements: Vec::new(),
         replica_id: "test-replica".to_string(),
+        rootfs_tar_staging: Arc::new(rootfs_tar::RootfsTarStagingRegistry::disabled()),
     }
 }
 
@@ -4938,6 +5058,139 @@ mod tests {
         let selected = selected.expect("named remote config should be selected");
 
         assert!(selected.fields.contains_key("pool"));
+    }
+
+    /// The CLI builds `--from <rootfs tar>` config as `{"vm": {...}}`. Guard the
+    /// CLI-to-driver transport: the rootfs tar field and any pre-existing VM
+    /// setting must both survive driver selection. A top-level field would be
+    /// dropped silently here and never reach the VM driver.
+    #[test]
+    fn select_driver_config_forwards_cli_rootfs_tar_template_to_vm_driver() {
+        let config = prost_types::Struct {
+            fields: std::iter::once((
+                "vm".to_string(),
+                struct_value([
+                    ("rootfs_tar_path", string_value("/staging/req-a/rootfs.tar")),
+                    ("gpu_device_ids", string_value("0000:2d:00.0")),
+                ]),
+            ))
+            .collect(),
+        };
+
+        let selected = select_driver_config(&Some(config), "vm").unwrap();
+        let selected = selected.expect("vm config should be selected");
+
+        assert!(selected.fields.contains_key("rootfs_tar_path"));
+        assert!(selected.fields.contains_key("gpu_device_ids"));
+    }
+
+    #[test]
+    fn select_driver_config_drops_top_level_rootfs_tar_path() {
+        let config = prost_types::Struct {
+            fields: std::iter::once((
+                "rootfs_tar_path".to_string(),
+                string_value("/staging/req-a/rootfs.tar"),
+            ))
+            .collect(),
+        };
+
+        assert!(
+            select_driver_config(&Some(config), "vm").unwrap().is_none(),
+            "a top-level rootfs_tar_path never reaches the vm driver"
+        );
+    }
+
+    /// The staging token is a bearer credential for the staged archive, and the
+    /// persisted public sandbox is readable by every member of the workspace.
+    /// It must be stripped before anything writes that copy.
+    #[test]
+    fn take_public_staging_token_strips_it_from_the_public_sandbox() {
+        let mut sandbox = Sandbox {
+            spec: Some(SandboxSpec {
+                template: Some(SandboxTemplate {
+                    driver_config: Some(prost_types::Struct {
+                        fields: std::iter::once((
+                            "vm".to_string(),
+                            struct_value([
+                                ("rootfs_tar_staging_token", string_value("tok-abc")),
+                                ("gpu_device_ids", string_value("0000:2d:00.0")),
+                            ]),
+                        ))
+                        .collect(),
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let token = take_public_staging_token(&mut sandbox, "vm");
+
+        assert_eq!(token.as_deref(), Some("tok-abc"));
+        let config = sandbox
+            .spec
+            .as_ref()
+            .and_then(|s| s.template.as_ref())
+            .and_then(|t| t.driver_config.as_ref())
+            .expect("driver config");
+        let Some(prost_types::value::Kind::StructValue(vm)) = config.fields["vm"].kind.as_ref()
+        else {
+            panic!("vm block must survive");
+        };
+        assert!(!vm.fields.contains_key("rootfs_tar_staging_token"));
+        assert!(
+            vm.fields.contains_key("gpu_device_ids"),
+            "other vm settings must be left intact"
+        );
+    }
+
+    #[test]
+    fn take_public_staging_token_ignores_other_drivers() {
+        let mut sandbox = Sandbox {
+            spec: Some(SandboxSpec {
+                template: Some(SandboxTemplate {
+                    driver_config: Some(prost_types::Struct {
+                        fields: std::iter::once((
+                            "docker".to_string(),
+                            struct_value([("rootfs_tar_staging_token", string_value("tok-abc"))]),
+                        ))
+                        .collect(),
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        assert!(take_public_staging_token(&mut sandbox, "vm").is_none());
+    }
+
+    #[test]
+    fn set_rootfs_tar_path_writes_into_the_driver_copy() {
+        let mut driver_sandbox = DriverSandbox {
+            spec: Some(DriverSandboxSpec {
+                template: Some(DriverSandboxTemplate::default()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        set_rootfs_tar_path(&mut driver_sandbox, Path::new("/staging/req-a/r.tar"));
+
+        let config = driver_sandbox
+            .spec
+            .as_ref()
+            .and_then(|s| s.template.as_ref())
+            .and_then(|t| t.driver_config.as_ref())
+            .expect("driver config");
+        let Some(prost_types::value::Kind::StringValue(path)) =
+            config.fields["rootfs_tar_path"].kind.as_ref()
+        else {
+            panic!("rootfs_tar_path must be a string");
+        };
+        assert_eq!(path, "/staging/req-a/r.tar");
     }
 
     #[test]
@@ -5557,6 +5810,7 @@ mod tests {
             lifecycle_gates: Arc::new(LifecycleGateRegistry::default()),
             gateway_listener_requirements: Vec::new(),
             replica_id: "test-replica".to_string(),
+            rootfs_tar_staging: Arc::new(rootfs_tar::RootfsTarStagingRegistry::disabled()),
         }
     }
 

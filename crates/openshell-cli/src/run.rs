@@ -44,11 +44,11 @@ use openshell_bootstrap::{
 };
 use openshell_core::net::set_tcp_nodelay_best_effort;
 use openshell_core::proto::{
-    ApproveAllDraftChunksRequest, ApproveDraftChunkRequest, ClearDraftChunksRequest,
-    CreateSandboxRequest, CreateSandboxTemplateRequest, CreateSshSessionRequest,
-    DeleteInferenceRouteRequest, DeleteSandboxRequest, DeleteSandboxTemplateRequest,
-    DeleteServiceRequest, ExecSandboxRequest, ExposeServiceRequest, GetCurrentUserRequest,
-    GetDraftHistoryRequest, GetDraftPolicyRequest, GetGatewayConfigRequest, GetGatewayInfoRequest,
+    ApproveAllDraftChunksRequest, ApproveDraftChunkRequest, BeginRootfsTarStagingRequest,
+    ClearDraftChunksRequest, CreateSandboxRequest, CreateSandboxTemplateRequest,
+    CreateSshSessionRequest, DeleteInferenceRouteRequest, DeleteSandboxRequest,
+    DeleteSandboxTemplateRequest, DeleteServiceRequest, ExecSandboxRequest, ExposeServiceRequest,
+    GetCurrentUserRequest, GetDraftHistoryRequest, GetDraftPolicyRequest, GetGatewayConfigRequest,
     GetInferenceRouteRequest, GetSandboxConfigRequest, GetSandboxConfigResponse,
     GetSandboxLogsRequest, GetSandboxPolicyStatusRequest, GetSandboxRequest,
     GetSandboxTemplateRequest, GetServiceRequest, GpuResourceRequirements,
@@ -526,10 +526,10 @@ pub async fn sandbox_create(
     }
 
     // Resolve the --from flag into a container image reference, building from
-    // a Dockerfile first if necessary, or a rootfs tar path for the VM driver.
-    // Template creates resolve workload shape on the gateway and skip local
-    // image handling.
-    let (image, rootfs_tar_path): (Option<String>, Option<PathBuf>) = if template.is_some() {
+    // a Dockerfile first if necessary, or staging a rootfs tar on the gateway
+    // and carrying back its staging token. Template creates resolve workload
+    // shape on the gateway and skip local image handling.
+    let (image, rootfs_tar_token): (Option<String>, Option<String>) = if template.is_some() {
         (None, None)
     } else {
         match from {
@@ -546,9 +546,9 @@ pub async fn sandbox_create(
                         (Some(tag), None)
                     }
                     ResolvedSource::RootfsTar { path } => {
-                        let staged =
-                            validate_and_stage_rootfs_tar(gateway_name, &mut client, &path).await?;
-                        (None, Some(staged))
+                        let token =
+                            stage_rootfs_tar(gateway_name, &mut client, workspace, &path).await?;
+                        (None, Some(token))
                     }
                 }
             }
@@ -579,15 +579,14 @@ pub async fn sandbox_create(
         None
     };
 
-    if let Some(tar_path) = &rootfs_tar_path {
-        let rootfs_config = rootfs_tar_driver_config(tar_path)?;
-        driver_config = Some(merge_driver_config(driver_config, rootfs_config));
+    if let Some(token) = &rootfs_tar_token {
+        driver_config = Some(merge_rootfs_tar_driver_config(driver_config, token)?);
     }
 
     let inline_template = if image.is_some()
         || resource_limits.is_some()
         || driver_config.is_some()
-        || rootfs_tar_path.is_some()
+        || rootfs_tar_token.is_some()
     {
         Some(SandboxTemplate {
             image: image.unwrap_or_default(),
@@ -1359,13 +1358,18 @@ async fn build_from_dockerfile(
     Ok(tag)
 }
 
-/// Validate that a rootfs tar source is usable with the current gateway, then
-/// copy it into the driver's staging directory. Returns the staged path.
-async fn validate_and_stage_rootfs_tar(
+/// Ask the gateway for a staging slot, then copy the archive into it.
+///
+/// The gateway owns the destination: it allocates a request-scoped directory
+/// and returns a single-use token. We never name a path of our own choosing,
+/// so a request cannot reach for another caller's archive or an arbitrary host
+/// file. Returns the token to pass on `CreateSandbox`.
+async fn stage_rootfs_tar(
     gateway_name: &str,
     client: &mut crate::tls::GrpcClient,
+    workspace: &str,
     tar_path: &Path,
-) -> Result<PathBuf> {
+) -> Result<String> {
     let metadata = get_gateway_metadata(gateway_name);
     if !dockerfile_sources_supported_for_gateway(metadata.as_ref()) {
         return Err(miette!(
@@ -1374,73 +1378,40 @@ async fn validate_and_stage_rootfs_tar(
         ));
     }
 
-    let info = client
-        .get_gateway_info(GetGatewayInfoRequest {})
-        .await
-        .into_diagnostic()
-        .wrap_err("failed to query gateway compute driver")?
-        .into_inner();
-
-    let driver = info
-        .compute_drivers
-        .first()
-        .ok_or_else(|| miette!("gateway '{}' has no compute drivers", gateway_name))?;
-    let driver_name = driver.name.as_str();
-
-    if driver_name != "vm" {
-        return Err(miette!(
-            "rootfs tar sources are only supported by the VM compute driver, \
-             but gateway '{}' uses the '{}' driver",
-            gateway_name,
-            driver_name
-        ));
-    }
-
-    let caps = driver.capabilities.as_ref();
-    let staging_dir = caps.map_or("", |c| c.rootfs_tar_staging_dir.as_str());
-    if staging_dir.is_empty() {
-        return Err(miette!(
-            "gateway '{}' VM driver did not advertise a rootfs tar staging directory",
-            gateway_name
-        ));
-    }
-    let staging_dir = PathBuf::from(staging_dir);
-
-    let max_bytes = caps.map_or(0, |c| c.rootfs_tar_max_bytes);
-    if max_bytes > 0 {
-        let source_meta = tokio::fs::metadata(tar_path)
-            .await
-            .into_diagnostic()
-            .wrap_err_with(|| format!("failed to read {}", tar_path.display()))?;
-        if source_meta.len() > max_bytes {
-            return Err(miette!(
-                "rootfs tar {} is {} bytes, exceeding the gateway limit of {} bytes",
-                tar_path.display(),
-                source_meta.len(),
-                max_bytes
-            ));
-        }
-    }
-
-    let request_dir = tempfile::Builder::new()
-        .prefix("req-")
-        .tempdir_in(&staging_dir)
-        .into_diagnostic()
-        .wrap_err("failed to create request staging directory")?
-        .keep();
-
     let file_name = tar_path
         .file_name()
-        .ok_or_else(|| miette!("rootfs tar path has no filename"))?;
-    let staged_path = request_dir.join(file_name);
+        .ok_or_else(|| miette!("rootfs tar path has no filename"))?
+        .to_string_lossy()
+        .into_owned();
+    let source_meta = tokio::fs::metadata(tar_path)
+        .await
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed to read {}", tar_path.display()))?;
 
+    // The gateway rejects a driver that cannot take rootfs tar sources, and an
+    // archive over its configured limit, before allocating anything.
+    let slot = client
+        .begin_rootfs_tar_staging(BeginRootfsTarStagingRequest {
+            workspace: workspace.to_string(),
+            file_name,
+            size_bytes: source_meta.len(),
+        })
+        .await
+        .into_diagnostic()
+        .wrap_err("failed to allocate a rootfs tar staging slot on the gateway")?
+        .into_inner();
+
+    let staged_path = PathBuf::from(&slot.upload_path);
     eprintln!(
         "Staging rootfs tar {} for gateway '{}'",
         tar_path.display().to_string().cyan(),
         gateway_name,
     );
-    if let Err(err) = copy_with_byte_limit(tar_path, &staged_path, max_bytes).await {
-        let _ = tokio::fs::remove_dir_all(&request_dir).await;
+    // Enforced while streaming, so an archive that grows after the size check
+    // above still cannot exceed the limit.
+    if let Err(err) = copy_with_byte_limit(tar_path, &staged_path, slot.max_bytes).await {
+        // The staging directory belongs to the gateway, which reclaims it when
+        // the slot expires. Removing it here would reach into its state.
         return Err(miette!(
             "failed to stage rootfs tar to {}: {err}",
             staged_path.display()
@@ -1448,7 +1419,7 @@ async fn validate_and_stage_rootfs_tar(
     }
     eprintln!();
 
-    Ok(staged_path)
+    Ok(slot.staging_token)
 }
 
 /// Copy `src` to `dst`, aborting if total bytes written exceeds `limit`.
@@ -1493,29 +1464,51 @@ async fn copy_with_byte_limit(
     Ok(())
 }
 
-/// Build a `driver_config` struct carrying the rootfs tar path for the VM driver.
-fn rootfs_tar_driver_config(tar_path: &Path) -> Result<prost_types::Struct> {
-    let fields = serde_json::Map::from_iter([(
-        "rootfs_tar_path".to_string(),
-        serde_json::Value::String(tar_path.to_string_lossy().into_owned()),
-    )]);
-    openshell_core::proto_struct::json_object_to_struct(fields)
-        .into_diagnostic()
-        .wrap_err("failed to encode rootfs_tar_path in driver_config")
-}
+/// `driver_config` key for the VM compute driver. The gateway forwards only
+/// `template.driver_config.<driver_name>` to the selected driver, so VM
+/// settings must be nested under this key or they are dropped.
+const VM_DRIVER_CONFIG_KEY: &str = "vm";
+/// VM `driver_config` field naming the gateway-issued staging slot. The
+/// gateway swaps it for the resolved archive path before the driver sees it.
+const ROOTFS_TAR_TOKEN_FIELD: &str = "rootfs_tar_staging_token";
 
-/// Merge a rootfs tar config into an existing `driver_config`, if any.
-fn merge_driver_config(
+/// Merge the staging token into `driver_config.vm`, preserving any VM settings
+/// the caller already supplied through `--driver-config-json`.
+fn merge_rootfs_tar_driver_config(
     base: Option<prost_types::Struct>,
-    overlay: prost_types::Struct,
-) -> prost_types::Struct {
-    match base {
-        Some(mut base) => {
-            base.fields.extend(overlay.fields);
-            base
-        }
-        None => overlay,
+    staging_token: &str,
+) -> Result<prost_types::Struct> {
+    use prost_types::{Struct, Value, value::Kind};
+
+    let mut config = base.unwrap_or_default();
+    let vm = config
+        .fields
+        .entry(VM_DRIVER_CONFIG_KEY.to_string())
+        .or_insert_with(|| Value {
+            kind: Some(Kind::StructValue(Struct::default())),
+        });
+
+    let Some(Kind::StructValue(vm_config)) = vm.kind.as_mut() else {
+        return Err(miette!(
+            "--driver-config-json '{VM_DRIVER_CONFIG_KEY}' must be an object"
+        ));
+    };
+
+    if vm_config.fields.contains_key(ROOTFS_TAR_TOKEN_FIELD) {
+        return Err(miette!(
+            "--driver-config-json already sets {VM_DRIVER_CONFIG_KEY}.{ROOTFS_TAR_TOKEN_FIELD}; \
+             remove it or drop the rootfs tar from --from"
+        ));
     }
+
+    vm_config.fields.insert(
+        ROOTFS_TAR_TOKEN_FIELD.to_string(),
+        Value {
+            kind: Some(Kind::StringValue(staging_token.to_string())),
+        },
+    );
+
+    Ok(config)
 }
 
 /// Load sandbox policy YAML.
@@ -6827,6 +6820,92 @@ mod tests {
         assert!(filename_looks_like_rootfs_tar(Path::new("my-image.TAR.GZ")));
         assert!(!filename_looks_like_rootfs_tar(Path::new("Dockerfile")));
         assert!(!filename_looks_like_rootfs_tar(Path::new("image.zip")));
+    }
+
+    /// The gateway forwards only `template.driver_config.<driver_name>` to the
+    /// selected driver, so a top-level key is silently dropped and the archive
+    /// never reaches the VM driver.
+    #[test]
+    fn rootfs_tar_driver_config_nests_under_vm_key() {
+        use prost_types::value::Kind;
+
+        let config =
+            super::merge_rootfs_tar_driver_config(None, "tok-abc").expect("merge should succeed");
+
+        assert_eq!(
+            config.fields.keys().collect::<Vec<_>>(),
+            vec!["vm"],
+            "rootfs tar config must live under the vm driver key"
+        );
+        let Some(Kind::StructValue(vm)) = config.fields["vm"].kind.as_ref() else {
+            panic!("vm entry must be an object");
+        };
+        let Some(Kind::StringValue(token)) = vm.fields["rootfs_tar_staging_token"].kind.as_ref()
+        else {
+            panic!("rootfs_tar_staging_token must be a string");
+        };
+        assert_eq!(token, "tok-abc");
+        assert!(
+            !vm.fields.contains_key("rootfs_tar_path"),
+            "the CLI never names a host path; the gateway resolves one"
+        );
+    }
+
+    #[test]
+    fn rootfs_tar_driver_config_preserves_existing_vm_settings() {
+        use prost_types::value::Kind;
+
+        let base = parse_driver_config_json(
+            r#"{"vm":{"gpu_device_ids":["0000:2d:00.0"]},"docker":{"userns":"host"}}"#,
+        )
+        .expect("valid driver config json");
+
+        let config = super::merge_rootfs_tar_driver_config(Some(base), "tok-abc")
+            .expect("merge should succeed");
+
+        // The sibling driver block survives untouched.
+        assert!(config.fields.contains_key("docker"));
+
+        let Some(Kind::StructValue(vm)) = config.fields["vm"].kind.as_ref() else {
+            panic!("vm entry must be an object");
+        };
+        assert!(
+            vm.fields.contains_key("gpu_device_ids"),
+            "pre-existing vm settings must not be clobbered"
+        );
+        let Some(Kind::StringValue(token)) = vm.fields["rootfs_tar_staging_token"].kind.as_ref()
+        else {
+            panic!("rootfs_tar_staging_token must be a string");
+        };
+        assert_eq!(token, "tok-abc");
+    }
+
+    #[test]
+    fn rootfs_tar_driver_config_rejects_caller_supplied_token() {
+        let base = parse_driver_config_json(r#"{"vm":{"rootfs_tar_staging_token":"stolen"}}"#)
+            .expect("valid driver config json");
+
+        let err = super::merge_rootfs_tar_driver_config(Some(base), "tok-abc")
+            .expect_err("a caller-supplied staging token must not be silently overwritten");
+
+        assert!(
+            err.to_string()
+                .contains("already sets vm.rootfs_tar_staging_token"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn rootfs_tar_driver_config_rejects_non_object_vm_block() {
+        let base = parse_driver_config_json(r#"{"vm":"nonsense"}"#).expect("valid json object");
+
+        let err = super::merge_rootfs_tar_driver_config(Some(base), "tok-abc")
+            .expect_err("a non-object vm block must be rejected");
+
+        assert!(
+            err.to_string().contains("must be an object"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
