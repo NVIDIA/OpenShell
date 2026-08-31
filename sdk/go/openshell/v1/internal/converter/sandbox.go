@@ -72,13 +72,27 @@ func sandboxSpecFromProto(spec *pb.SandboxSpec) types.SandboxSpec {
 	}
 
 	if rr := spec.GetResourceRequirements(); rr != nil {
-		if gpu := rr.GetGpu(); gpu != nil && gpu.Count != nil {
-			result.GPUCount = gpu.Count
-		}
+		result.ResourceRequirements = resourceRequirementsFromProto(rr)
 	}
 	result.Command = CopyStringSlice(spec.GetCommand())
 	result.TTY = spec.GetTty()
 
+	return result
+}
+
+// resourceRequirementsFromProto converts a proto ResourceRequirements to an
+// SDK ResourceRequirements.
+func resourceRequirementsFromProto(rr *pb.ResourceRequirements) *types.ResourceRequirements {
+	result := &types.ResourceRequirements{}
+	if gpu := rr.GetGpu(); gpu != nil {
+		result.GPU = &types.GPUResourceRequirements{Count: gpu.Count}
+	}
+	if cpu := rr.GetCpu(); cpu != nil {
+		result.CPU = &types.CPUResourceRequirements{Limit: cpu.GetLimit()}
+	}
+	if mem := rr.GetMemory(); mem != nil {
+		result.Memory = &types.MemoryResourceRequirements{Limit: mem.GetLimit()}
+	}
 	return result
 }
 
@@ -219,17 +233,32 @@ func SandboxSpecToProto(spec *types.SandboxSpec) *pb.SandboxSpec {
 		result.Template = tmpl
 	}
 
-	if spec.GPUCount != nil {
-		result.ResourceRequirements = &pb.ResourceRequirements{
-			Gpu: &pb.GpuResourceRequirements{
-				Count: spec.GPUCount,
-			},
-		}
+	if spec.ResourceRequirements != nil {
+		result.ResourceRequirements = resourceRequirementsToProto(spec.ResourceRequirements)
 	}
 
 	result.Command = CopyStringSlice(spec.Command)
 	result.Tty = spec.TTY
 
+	return result
+}
+
+// resourceRequirementsToProto converts an SDK ResourceRequirements to a
+// proto ResourceRequirements.
+func resourceRequirementsToProto(rr *types.ResourceRequirements) *pb.ResourceRequirements {
+	if rr == nil {
+		return nil
+	}
+	result := &pb.ResourceRequirements{}
+	if rr.GPU != nil {
+		result.Gpu = &pb.GpuResourceRequirements{Count: rr.GPU.Count}
+	}
+	if rr.CPU != nil {
+		result.Cpu = &pb.CpuResourceRequirements{Limit: rr.CPU.Limit}
+	}
+	if rr.Memory != nil {
+		result.Memory = &pb.MemoryResourceRequirements{Limit: rr.Memory.Limit}
+	}
 	return result
 }
 

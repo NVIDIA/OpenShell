@@ -44,12 +44,35 @@ func copySandboxSpec(s types.SandboxSpec) types.SandboxSpec {
 		t := copySandboxTemplate(*s.Template)
 		s.Template = &t
 	}
-	if s.GPUCount != nil {
-		v := *s.GPUCount
-		s.GPUCount = &v
-	}
+	s.ResourceRequirements = copyResourceRequirements(s.ResourceRequirements)
 	s.Policy = copySandboxPolicy(s.Policy)
 	return s
+}
+
+// copyResourceRequirements returns a deep copy of a ResourceRequirements
+// pointer. All nested pointer fields are duplicated to prevent aliasing.
+func copyResourceRequirements(rr *types.ResourceRequirements) *types.ResourceRequirements {
+	if rr == nil {
+		return nil
+	}
+	cp := *rr
+	if rr.GPU != nil {
+		gpu := *rr.GPU
+		if rr.GPU.Count != nil {
+			v := *rr.GPU.Count
+			gpu.Count = &v
+		}
+		cp.GPU = &gpu
+	}
+	if rr.CPU != nil {
+		cpu := *rr.CPU
+		cp.CPU = &cpu
+	}
+	if rr.Memory != nil {
+		mem := *rr.Memory
+		cp.Memory = &mem
+	}
+	return &cp
 }
 
 // copySandboxPolicy returns a deep copy of a SandboxPolicy pointer.
