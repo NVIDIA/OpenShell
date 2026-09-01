@@ -75,8 +75,8 @@ sb, err := client.CreateSandboxFromTemplate(
 ```
 
 When creating from a template, the spec should only include governance fields:
-`Providers` and `Policy`. Workload fields such as image, environment, CPU,
-memory, GPU, and driver config come from the template.
+`Providers`, `Policy`, `Command`, and `TTY`. Workload fields such as image,
+environment, CPU, memory, GPU, and driver config come from the template.
 
 ## Get
 

@@ -82,7 +82,7 @@ func validateTemplateCreateSpec(spec *SandboxSpec) error {
 		return nil
 	}
 	if spec.LogLevel != "" || len(spec.Environment) > 0 || spec.Template != nil || spec.GPU || spec.GPUCount != nil {
-		return &StatusError{Code: ErrorInvalidArgument, Message: "template creates only allow policy and providers in spec"}
+		return &StatusError{Code: ErrorInvalidArgument, Message: "template creates only allow policy, providers, command, and tty in spec"}
 	}
 	return nil
 }

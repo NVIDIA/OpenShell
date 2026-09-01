@@ -28,8 +28,8 @@ also implies `GPU`.
 
 Creates a new sandbox from a reusable sandbox workload template. The template
 provides workload fields such as image, environment, resources, and driver
-config. The create request supplies governance fields such as providers and
-policy.
+config. The create request supplies governance fields such as providers,
+policy, command, and TTY.
 
 ```go
 sb, err := client.CreateSandboxFromTemplate(ctx,

@@ -19,6 +19,8 @@ type Config = types.Config
 // ClientInterface defines the top-level SDK surface.
 type ClientInterface interface {
 	Sandboxes() SandboxInterface
+	SandboxTemplates() SandboxTemplateInterface
+	CreateSandboxFromTemplate(ctx context.Context, workspace, name, templateName string, spec *SandboxSpec, labels map[string]string, opts ...CreateOptions) (*Sandbox, error)
 	Providers() ProviderInterface
 	Services() ServiceInterface
 	Exec() ExecInterface
