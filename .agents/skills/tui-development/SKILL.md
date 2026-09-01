@@ -53,7 +53,7 @@ Gateway (discovered via openshell_bootstrap::list_gateways())
 The **title bar** always reflects this hierarchy, reading left-to-right from general to specific:
 
 ```
- OpenShell │ Current Gateway: <name> [source] (<status>) │ Workspace: <name|all> │ <screen/context>
+ OpenShell v<version> │ Current Gateway: <name> [source] (<status>) │ Workspace: <name|all> │ <screen/context>
 ```
 
 ## 3. Navigation & Screen Architecture
@@ -142,8 +142,8 @@ Every frame renders four vertical regions:
 
 ### Title bar examples
 
-- Dashboard: ` >_ OpenShell  ALPHA  | Current Gateway: openshell [local] (Healthy) | Workspace: default | Dashboard`
-- Sandbox detail: ` >_ OpenShell  ALPHA  | Current Gateway: openshell [local] (Healthy) | Workspace: team-a | Sandbox: my-sandbox`
+- Dashboard: ` >_ OpenShell v<version> | Current Gateway: openshell [local] (Healthy) | Workspace: default | Dashboard`
+- Sandbox detail: ` >_ OpenShell v<version> | Current Gateway: openshell [local] (Healthy) | Workspace: team-a | Sandbox: my-sandbox`
 
 ### Adding a new screen
 

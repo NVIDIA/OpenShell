@@ -143,10 +143,8 @@ fn draw_title_bar(frame: &mut Frame<'_>, app: &App, area: Rect) {
         .find(|gateway| gateway.name == app.gateway_name)
         .map_or("unknown", app::GatewayEntry::source_label);
 
-    let mut parts: Vec<Span<'_>> = vec![
-        Span::styled(" >_ OpenShell ", t.accent_bold),
-        Span::styled(" ALPHA ", t.badge),
-        Span::styled(" | ", t.muted),
+    let mut parts: Vec<Span<'_>> = title_bar_brand_spans(t);
+    parts.extend([
         Span::styled("Current Gateway: ", t.text),
         Span::styled(&app.gateway_name, t.heading),
         Span::styled(" [", t.muted),
@@ -155,7 +153,7 @@ fn draw_title_bar(frame: &mut Frame<'_>, app: &App, area: Rect) {
         status_span,
         Span::styled(")", t.muted),
         Span::styled(" | ", t.muted),
-    ];
+    ]);
 
     parts.push(Span::styled("Workspace: ", t.text));
     parts.push(Span::styled(app.workspace_display(), t.heading));
@@ -178,6 +176,14 @@ fn draw_title_bar(frame: &mut Frame<'_>, app: &App, area: Rect) {
 
     let title = Line::from(parts);
     frame.render_widget(Paragraph::new(title).style(t.title_bar), area);
+}
+
+fn title_bar_brand_spans(theme: &Theme) -> Vec<Span<'static>> {
+    vec![
+        Span::styled(" >_ OpenShell ", theme.accent_bold),
+        Span::styled(format!("v{}", openshell_core::VERSION), theme.muted),
+        Span::styled(" | ", theme.muted),
+    ]
 }
 
 fn draw_nav_bar(frame: &mut Frame<'_>, app: &App, area: Rect) {
@@ -706,5 +712,29 @@ mod tests {
             .map(ratatui::buffer::Cell::symbol)
             .collect();
         assert!(text.contains("[w] Workspace"), "nav bar was: {text:?}");
+    }
+
+    #[test]
+    fn title_bar_brand_renders_resolved_version_without_alpha_badge() {
+        let expected = format!(" >_ OpenShell v{} | ", openshell_core::VERSION);
+        let width = u16::try_from(expected.len()).unwrap();
+        let backend = TestBackend::new(width, 1);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal
+            .draw(|frame| {
+                frame.render_widget(
+                    Paragraph::new(Line::from(title_bar_brand_spans(&Theme::dark()))),
+                    frame.size(),
+                );
+            })
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let rendered = (0..width)
+            .map(|x| buffer.get(x, 0).symbol())
+            .collect::<String>();
+        assert_eq!(rendered, expected);
+        assert!(!rendered.contains("ALPHA"));
     }
 }
