@@ -20,30 +20,31 @@
 //! registry is the only lookup by `backend_name`, and everything past it is a
 //! `Box<dyn _>` / `Arc<dyn _>`.
 //!
-//! `attach` is atomic from the caller's perspective: it returns `Bound` or fails
-//! closed, and it never binds a resource that is already bound to an active
-//! boundary. Binary identity travels on every [`MediatedConnection`], resolved
-//! by the backend for that exact connection; an unresolved identity denies the
-//! connection and never authorizes anything.
+//! `attach` is atomic from the caller's perspective: it establishes and binds
+//! the boundary, returns `Bound`, or fails closed. It never binds a resource
+//! already bound to an active boundary. Binary identity travels on every
+//! [`MediatedConnection`], resolved by the backend for that exact connection;
+//! an unresolved identity denies the connection and never authorizes anything.
 //!
 //! The contract is transport-neutral. Concrete topology implementations keep
 //! their placement and coordination details behind these interfaces.
 
 use std::collections::HashMap;
 use std::fmt;
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::sync::oneshot;
 
 pub use openshell_core::policy::SandboxPolicy;
 
 /// The Isolation Backend contract version. The descriptor and the resolved
 /// backend must both equal the supervisor-supported version exactly.
-pub const INTERFACE_VERSION: u32 = 1;
+pub const INTERFACE_VERSION: u32 = 2;
 
 // ============================================================================
 // Errors
@@ -62,6 +63,8 @@ pub enum BackendError {
     Denied(String),
     /// Boundary temporarily unavailable.
     Unavailable(String),
+    /// The selected backend does not implement an optional contract operation.
+    Unsupported(String),
     /// Attachment-phase failure (establishment or mediation bring-up).
     Attach(String),
     /// Readiness confirmation failed (do not start workload code).
@@ -98,7 +101,7 @@ impl BackendError {
         match self {
             Self::Descriptor(_) | Self::NotRegistered(_) => BackendErrorKind::Invalid,
             Self::Denied(_) => BackendErrorKind::Denied,
-            Self::Unavailable(_) => BackendErrorKind::Unavailable,
+            Self::Unavailable(_) | Self::Unsupported(_) => BackendErrorKind::Unavailable,
             Self::Attach(_) | Self::Confirm(_) | Self::Process(_) => BackendErrorKind::Failed,
             Self::Terminated(_) => BackendErrorKind::Terminated,
         }
@@ -112,6 +115,7 @@ impl fmt::Display for BackendError {
             Self::NotRegistered(m) => write!(f, "backend not registered: {m}"),
             Self::Denied(m) => write!(f, "attachment denied: {m}"),
             Self::Unavailable(m) => write!(f, "boundary unavailable: {m}"),
+            Self::Unsupported(m) => write!(f, "operation unsupported: {m}"),
             Self::Attach(m) => write!(f, "attachment failed: {m}"),
             Self::Confirm(m) => write!(f, "confirmation failed: {m}"),
             Self::Process(m) => write!(f, "process error: {m}"),
@@ -149,10 +153,10 @@ impl std::error::Error for ResolveError {}
 
 /// The common topology descriptor envelope.
 ///
-/// The compute driver supplies one for every provisioned topology, including
-/// resources prepared before sandbox assignment. The opaque payload identifies,
-/// or gives the backend enough information to resolve, the exact
-/// driver-provisioned resource; its protection is backend-specific.
+/// The compute driver supplies one for every admitted topology. The opaque
+/// payload identifies an existing resource or carries the trusted prepared
+/// inputs the backend needs to establish one during `attach`; its protection
+/// and resource lifecycle remain topology-specific.
 #[derive(Debug, Clone)]
 pub struct TopologyDescriptor {
     /// The Isolation Backend contract version this descriptor targets.
@@ -194,13 +198,13 @@ impl VerifiedTopologyDescriptor {
 /// The trusted sandbox context, constructed by trusted common code after the
 /// control plane assigns the resource to the admitted sandbox.
 ///
-/// Carries the admitted create-time policy. Approved network-policy revisions
+/// Carries the admitted launch-time policy. Approved network-policy revisions
 /// are made effective by supervisor-owned network mediation, outside the
 /// backend lifecycle.
 pub struct SandboxContext {
     /// Which sandbox this is.
     pub sandbox_id: String,
-    /// The admitted create-time policy.
+    /// The admitted launch-time policy.
     pub policy: SandboxPolicy,
     /// The admitted agent workload.
     pub agent: AgentSpec,
@@ -313,9 +317,11 @@ pub trait IsolationBackend: Send + Sync {
     /// exactly against [`INTERFACE_VERSION`]; there is no capability negotiation.
     fn version(&self) -> u32;
 
-    /// Validate the opaque payload and atomically bind it to the trusted
-    /// sandbox context: returns `Bound` or fails closed. Never binds a resource
-    /// that is already bound to an active boundary.
+    /// Validate the opaque payload, establish any boundary-local resources,
+    /// and atomically bind them to the trusted sandbox context: returns `Bound`
+    /// or fails closed. Never binds a resource already bound to an active
+    /// boundary. Durable resource lifecycle remains owned by the compute driver
+    /// or external orchestrator that supplied the descriptor.
     async fn attach(
         &self,
         descriptor: VerifiedTopologyDescriptor,
@@ -335,6 +341,13 @@ pub trait BoundBoundary: Send {
     /// The mediation service's backend-neutral source of workload connections.
     /// Retained by the supervisor before consuming `Bound`.
     fn network_mediation_source(&self) -> Arc<dyn NetworkMediationSource>;
+
+    /// Optional transport for workload DNS exchanges. Backends that expose
+    /// this source keep DNS inside the supervisor-owned policy path rather
+    /// than granting the workload access to a resolver socket.
+    fn dns_mediation_source(&self) -> Option<Arc<dyn DnsMediationSource>> {
+        None
+    }
 
     /// Trusted host-side dial target for the well-known host-gateway aliases.
     ///
@@ -599,6 +612,9 @@ pub struct MediatedConnection {
     pub stream: BoundaryDuplexStream,
     /// Executable identity, resolved by the backend for this connection.
     pub binary_identity: Result<BinaryIdentity, ResolveError>,
+    /// Original destination captured by the backend. Explicit-proxy
+    /// transports leave this absent; transparent transports must supply it.
+    pub destination: Option<SocketAddr>,
 }
 
 /// A logical per-boundary stream of workload connections, consumed by the
@@ -614,6 +630,35 @@ pub struct MediatedConnection {
 pub trait NetworkMediationSource: Send + Sync {
     /// Await the next mediated workload connection.
     async fn accept(&self) -> Result<MediatedConnection, BackendError>;
+}
+
+/// DNS transport used by one workload exchange.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DnsTransport {
+    /// One DNS wire datagram without a TCP length prefix.
+    Udp,
+    /// One two-byte-length-prefixed DNS message.
+    Tcp,
+}
+
+/// One workload DNS request and its fail-closed response channel.
+pub struct MediatedDnsQuery {
+    /// DNS request bytes in the framing selected by [`Self::transport`].
+    pub request: Vec<u8>,
+    /// Workload DNS transport.
+    pub transport: DnsTransport,
+    /// Identity of the process that issued the DNS request.
+    pub binary_identity: Result<BinaryIdentity, ResolveError>,
+    /// Single-use response channel owned by the backend adapter.
+    pub response: oneshot::Sender<Result<Vec<u8>, BackendError>>,
+}
+
+/// Logical per-boundary stream of DNS exchanges. The backend handles syscall,
+/// packet, or guest-agent transport details; the supervisor owns policy DNS.
+#[async_trait]
+pub trait DnsMediationSource: Send + Sync {
+    /// Await the next DNS query from this boundary.
+    async fn accept(&self) -> Result<MediatedDnsQuery, BackendError>;
 }
 
 #[cfg(test)]
