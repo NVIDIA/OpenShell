@@ -4164,7 +4164,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "openshell-isolation"
+name = "openshell-isolation-interface"
 version = "0.0.0"
 dependencies = [
  "async-trait",
