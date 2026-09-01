@@ -337,6 +337,7 @@ async fn drive(
     // The mediation source is retained before consuming `Bound` and stays
     // usable across the confirm/start transitions.
     let _ingress = bound.network_mediation_source();
+    assert_eq!(bound.host_gateway_ip(), None);
     let ready = bound.confirm().await?;
     ready.start_agent().await
 }
