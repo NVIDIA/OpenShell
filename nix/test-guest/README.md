@@ -147,8 +147,9 @@ Configurations are Ansible playbooks stored under `nix/test-guest/configuration/
 Configurations run in the order provided on the command line. OpenShell packages and copied files are installed after all configurations succeed.
 
 `--install` packages and `--copy` files are applied by a dedicated per-run
-Ansible playbook. `--copy` preserves each source file's ordinary permission
-bits. They are not stored in prepared VM cache entries.
+transfer step. `--copy` preserves each source file's ordinary permission bits
+unless an octal mode is supplied. They are not stored in prepared VM cache
+entries.
 
 ## System provisioners
 
@@ -319,13 +320,14 @@ For an x86_64 Linux guest, supply x86_64 binaries and use `package:deb:amd64`. T
 
 ## Copy files directly
 
-Use `--copy SOURCE:DEST` to copy a regular file without creating a package. The
-guest file preserves the source's ordinary permission bits:
+Use `--copy SOURCE:DEST[:MODE]` to copy a regular file without creating a
+package. If `MODE` is omitted, the guest file preserves the source's ordinary
+permission bits. Supply a bare octal mode such as `755` to override them:
 
 ```shell
 nix run .#test-guest -- \
   --distro ubuntu-24-04 \
-  --copy ./openshell:/usr/local/bin/openshell \
+  --copy ./openshell:/usr/local/bin/openshell:755 \
   -- openshell --version
 ```
 
@@ -352,7 +354,8 @@ runner prints their location after shutdown. The final `30` accepts automatic
 recovery for up to 30 seconds; omit it to require the canary's immediate check.
 
 
-The destination must be an absolute guest path. Copied files are installed with mode `0755`.
+The destination must be an absolute guest path. Use bare octal permission bits
+from `000` through `777` for explicit modes.
 
 ## Runner options
 
@@ -360,8 +363,9 @@ The destination must be an absolute guest path. Copied files are installed with 
 --distro NAME       Base distro: ubuntu-24-04, ubuntu-26-04, centos, fedora, or rocky
 --with NAME         Apply docker, podman-rootless, selinux, or snapd; repeatable
 --install PATH      Install a .deb or .rpm package; repeatable
---copy SRC:DEST     Copy a regular file into the guest, preserving its host mode;
-                    repeatable
+--copy SRC:DEST[:MODE]
+                    Copy a regular file into the guest; use MODE when provided,
+                    otherwise preserve the host mode; repeatable
 --ssh-port PORT     Use a specific loopback SSH forwarding port
 --forward-port HOST_PORT:GUEST_PORT
                     Forward a loopback host port to a guest port; repeatable

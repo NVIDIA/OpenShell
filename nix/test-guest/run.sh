@@ -16,8 +16,9 @@ Options:
   --with NAME         Apply a configuration; repeatable (docker, podman-rootless, selinux, snapd)
   --provision NAME    Apply a post-artifact system provisioner; repeatable
   --install PATH      Install a .deb or .rpm package; repeatable
-  --copy SRC:DEST     Copy a regular file to an absolute guest path, preserving
-                      its host mode; repeatable
+  --copy SRC:DEST[:MODE]
+                      Copy a regular file to an absolute guest path, using MODE
+                      when provided, otherwise preserving its host mode; repeatable
   --ssh-port PORT     Use a specific loopback SSH forwarding port
   --forward-port HOST_PORT:GUEST_PORT
                       Forward a loopback host port to a guest port; repeatable
@@ -268,13 +269,16 @@ packages=("${resolved_packages[@]}")
 resolved_copies=()
 for copy_spec in "${copies[@]}"; do
 	source_path=${copy_spec%%:*}
-	destination=${copy_spec#*:}
 	if [ "${source_path}" = "${copy_spec}" ] ||
 		! source_path=$(realpath -- "${source_path}") ||
 		[ ! -f "${source_path}" ]; then
 		echo "invalid --copy source: ${copy_spec}" >&2
 		exit 2
 	fi
+	copy_remainder=${copy_spec#*:}
+	destination=${copy_remainder%%:*}
+	mode_spec=${copy_remainder#"${destination}"}
+	mode_spec=${mode_spec#:}
 	case "${destination}" in
 	/*)
 		if [[ ${destination} == *"/../"* ]] || [[ ${destination} == */.. ]]; then
@@ -291,7 +295,12 @@ for copy_spec in "${copies[@]}"; do
 		exit 2
 		;;
 	esac
-	resolved_copies+=("${source_path}:${destination}")
+	if [ -n "${mode_spec}" ]; then
+		mode=${mode_spec}
+	else
+		mode=$(preserved_file_mode "${source_path}") || exit 2
+	fi
+	resolved_copies+=("${source_path}:${destination}:${mode}")
 done
 copies=("${resolved_copies[@]}")
 
@@ -662,8 +671,9 @@ if [ "${#packages[@]}" -gt 0 ] || [ "${#copies[@]}" -gt 0 ]; then
 	artifact_index=0
 	for copy_spec in "${copies[@]}"; do
 		source_path=${copy_spec%%:*}
-		destination=${copy_spec#*:}
-		mode=$(preserved_file_mode "${source_path}") || exit 2
+		copy_remainder=${copy_spec#*:}
+		destination=${copy_remainder%%:*}
+		mode=${copy_remainder#*:}
 		remote_path=${artifact_staging_dir}/copy-${artifact_index}
 		echo "==> Copying artifact: ${destination}"
 		scp -q "${scp_args[@]}" \
