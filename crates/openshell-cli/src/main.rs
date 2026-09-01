@@ -1795,8 +1795,14 @@ enum SandboxTemplateCommands {
         annotations: Vec<String>,
 
         /// Set a non-secret environment variable in sandboxes created from this template.
+        /// Do not use this option for API keys, tokens, or other secrets; create
+        /// a provider and attach it when creating sandboxes instead. Repeatable.
         #[arg(long = "env", value_name = "KEY=VALUE")]
         envs: Vec<String>,
+
+        /// Suppress warnings when --env values look like credentials.
+        #[arg(long = "no-credential-warnings")]
+        no_credential_warnings: bool,
 
         /// Output format.
         #[arg(short = 'o', long = "output", value_enum, default_value_t = OutputFormat::Table)]
@@ -3525,12 +3531,14 @@ async fn run_async() -> Result<()> {
                                 labels,
                                 annotations,
                                 envs,
+                                no_credential_warnings,
                                 output,
                             } => {
                                 let labels = run::parse_key_value_pairs(&labels, "--label")?;
                                 let annotations =
                                     run::parse_key_value_pairs(&annotations, "--annotation")?;
                                 let environment = run::parse_env_pairs(&envs)?;
+                                run::warn_credential_env_vars(&environment, no_credential_warnings);
                                 let gpu_requirements: Option<GpuResourceRequirements> =
                                     gpu.map(Into::into);
                                 run::sandbox_template_create(
@@ -5891,6 +5899,7 @@ mod tests {
             "owner=platform",
             "--env",
             "FEATURE_FLAG=on",
+            "--no-credential-warnings",
             "--output",
             "json",
         ])
@@ -5911,6 +5920,7 @@ mod tests {
                         labels,
                         annotations,
                         envs,
+                        no_credential_warnings,
                         output,
                     })),
                 ..
@@ -5926,6 +5936,7 @@ mod tests {
                 assert_eq!(labels, vec!["team=runtime".to_string()]);
                 assert_eq!(annotations, vec!["owner=platform".to_string()]);
                 assert_eq!(envs, vec!["FEATURE_FLAG=on".to_string()]);
+                assert!(no_credential_warnings);
                 assert!(matches!(output, OutputFormat::Json));
             }
             other => panic!("expected SandboxTemplateCommands::Create, got: {other:?}"),

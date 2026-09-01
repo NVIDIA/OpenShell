@@ -2567,6 +2567,44 @@ async fn run_cli_sandbox_create(
     .unwrap()
 }
 
+async fn run_cli_sandbox_template_create(
+    server: &TestServer,
+    name: &str,
+    extra_args: &[&str],
+) -> std::process::Output {
+    let xdg_dir = tempfile::tempdir().unwrap();
+    let tls_dir = xdg_dir.path().join("openshell/gateways/openshell/mtls");
+    fs::create_dir_all(&tls_dir).unwrap();
+    for filename in ["ca.crt", "tls.crt", "tls.key"] {
+        fs::copy(server.dir.path().join(filename), tls_dir.join(filename)).unwrap();
+    }
+
+    let mut cmd = tokio::process::Command::new(env!("CARGO_BIN_EXE_openshell"));
+    for (key, _) in std::env::vars().filter(|(k, _)| k.starts_with("OPENSHELL_")) {
+        cmd.env_remove(&key);
+    }
+    cmd.args([
+        "--gateway",
+        "openshell",
+        "--gateway-endpoint",
+        &server.endpoint,
+        "sandbox",
+        "template",
+        "create",
+        name,
+        "--image",
+        "registry.example.com/agent:latest",
+        "--output=json",
+    ])
+    .args(extra_args)
+    .env("XDG_CONFIG_HOME", xdg_dir.path())
+    .env("HOME", xdg_dir.path())
+    .env("OPENSHELL_PROVISION_TIMEOUT", "5")
+    .output()
+    .await
+    .unwrap()
+}
+
 #[tokio::test]
 async fn sandbox_create_json_stdout_is_parseable() {
     let server = run_server().await;
@@ -2595,4 +2633,64 @@ async fn sandbox_create_yaml_stdout_is_parseable() {
     let stdout = String::from_utf8(result.stdout).expect("stdout should be UTF-8");
     serde_yml::from_str::<serde_yml::Value>(&stdout)
         .unwrap_or_else(|err| panic!("stdout should contain only YAML: {err}\n{stdout}"));
+}
+
+#[tokio::test]
+async fn sandbox_template_create_warns_for_credential_env_vars() {
+    let server = run_server().await;
+
+    let result = run_cli_sandbox_template_create(
+        &server,
+        "credential-env",
+        &["--env", "OPENAI_API_KEY=plain-secret"],
+    )
+    .await;
+
+    assert!(
+        result.status.success(),
+        "sandbox template create failed:\n{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        stderr.contains("OPENAI_API_KEY looks like a credential"),
+        "template create should warn for credential-looking --env values: {stderr}"
+    );
+    assert!(
+        stderr.contains("To hide it from the agent, use a provider instead"),
+        "warning should point users toward providers: {stderr}"
+    );
+
+    let requests = template_create_requests(&server).await;
+    assert_eq!(requests.len(), 1);
+}
+
+#[tokio::test]
+async fn sandbox_template_create_suppresses_credential_env_warnings() {
+    let server = run_server().await;
+
+    let result = run_cli_sandbox_template_create(
+        &server,
+        "credential-env-suppressed",
+        &[
+            "--env",
+            "OPENAI_API_KEY=plain-secret",
+            "--no-credential-warnings",
+        ],
+    )
+    .await;
+
+    assert!(
+        result.status.success(),
+        "sandbox template create failed:\n{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        !stderr.contains("OPENAI_API_KEY looks like a credential"),
+        "template create should suppress credential-looking --env warnings: {stderr}"
+    );
+
+    let requests = template_create_requests(&server).await;
+    assert_eq!(requests.len(), 1);
 }
