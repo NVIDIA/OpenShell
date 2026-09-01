@@ -7,7 +7,7 @@ load("@rules_rs//rs:rust_test.bzl", "rust_test")
 load("@rules_rust//rust:defs.bzl", "rustfmt_test")
 
 rust_library(
-    name = "openshell-isolation",
+    name = "openshell-isolation-interface",
     srcs = glob(["src/**/*.rs"]),
     aliases = aliases(),
     visibility = ["//visibility:public"],
@@ -15,16 +15,16 @@ rust_library(
 )
 
 rust_test(
-    name = "openshell-isolation_test",
-    crate = ":openshell-isolation",
+    name = "openshell-isolation-interface_test",
+    crate = ":openshell-isolation-interface",
     deps = all_crate_deps(normal_dev = True),
 )
 
 rustfmt_test(
     name = "rustfmt_test",
     targets = [
-        ":openshell-isolation",
-        ":openshell-isolation_test",
+        ":openshell-isolation-interface",
+        ":openshell-isolation-interface_test",
     ],
     visibility = ["//crates:__pkg__"],
 )
