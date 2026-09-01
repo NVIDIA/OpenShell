@@ -33,7 +33,8 @@ use tokio::sync::{OnceCell, OwnedSemaphorePermit, Semaphore};
 use tonic::{Request, Response as TonicResponse, Status as TonicStatus};
 
 pub use openshell_core::middleware::{
-    HttpRequestView, InProcessMiddleware, SupervisorMiddlewareEndpoint, WebSocketResponseStream,
+    HttpRequestView, HttpResponseResultStream, InProcessMiddleware, SupervisorMiddlewareEndpoint,
+    WebSocketResponseStream,
 };
 pub type MiddlewareService =
     dyn SupervisorMiddleware<EvaluateWebSocketSessionStream = WebSocketResponseStream>;
@@ -179,6 +180,13 @@ impl InProcessMiddleware for EndpointInProcessAdapter {
         requests: tokio::sync::mpsc::Receiver<openshell_core::proto::WebSocketSessionEvent>,
     ) -> std::result::Result<WebSocketResponseStream, tonic::Status> {
         self.endpoint.open_websocket_session(requests).await
+    }
+
+    async fn open_http_response_pre_return(
+        &self,
+        requests: tokio::sync::mpsc::Receiver<openshell_core::proto::HttpResponseEvent>,
+    ) -> std::result::Result<HttpResponseResultStream, tonic::Status> {
+        self.endpoint.open_http_response_pre_return(requests).await
     }
 }
 
@@ -823,6 +831,7 @@ fn validate_payload_limit(source: &str, binding: &MiddlewareBinding) -> Result<u
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SupportedBinding {
     HttpPreCredentials,
+    HttpResponsePreReturn,
     WebSocketPreCredentials,
 }
 
@@ -835,6 +844,10 @@ fn supported_binding(source: &str, binding: &MiddlewareBinding) -> Result<Suppor
             Some(SupervisorMiddlewareOperation::HttpRequest),
             Some(SupervisorMiddlewarePhase::PreCredentials),
         ) => Ok(SupportedBinding::HttpPreCredentials),
+        (
+            Some(SupervisorMiddlewareOperation::HttpResponse),
+            Some(SupervisorMiddlewarePhase::PreReturn),
+        ) => Ok(SupportedBinding::HttpResponsePreReturn),
         (
             Some(SupervisorMiddlewareOperation::WebsocketMessage),
             Some(SupervisorMiddlewarePhase::PreCredentials),
@@ -1430,6 +1443,20 @@ impl ChainRunner {
                 entries,
                 SupervisorMiddlewareOperation::WebsocketMessage,
                 SupervisorMiddlewarePhase::PreCredentials,
+            )
+            .await?
+            .entries)
+    }
+
+    pub async fn describe_http_response_chain(
+        &self,
+        entries: &[ChainEntry],
+    ) -> Result<Vec<DescribedChainEntry>> {
+        Ok(self
+            .describe_chain_for(
+                entries,
+                SupervisorMiddlewareOperation::HttpResponse,
+                SupervisorMiddlewarePhase::PreReturn,
             )
             .await?
             .entries)
@@ -3655,6 +3682,25 @@ mod tests {
                 .to_string()
                 .contains("duplicate middleware operation/phase pair")
         );
+    }
+
+    #[test]
+    fn manifest_accepts_http_response_pre_return_binding() {
+        let registration = external_registration(4096);
+        let manifest = MiddlewareManifest {
+            name: "example/response".into(),
+            service_version: "test".into(),
+            bindings: vec![MiddlewareBinding {
+                operation: SupervisorMiddlewareOperation::HttpResponse as i32,
+                phase: SupervisorMiddlewarePhase::PreReturn as i32,
+                max_payload_bytes: 4096,
+                timeout: "500ms".into(),
+            }],
+            expected_audience: String::new(),
+        };
+
+        validate_external_manifest(&registration, &manifest, 4096, false)
+            .expect("HTTP response pre-return binding is supported");
     }
 
     #[test]

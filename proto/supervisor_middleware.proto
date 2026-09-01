@@ -33,6 +33,14 @@ service SupervisorMiddleware {
       returns (stream WebSocketSessionEventResult);
 }
 
+// HttpResponsePreReturn evaluates one ordered response stream for one selected
+// middleware stage after OpenShell receives the final upstream response head
+// and before it returns that response to the sandbox.
+service HttpResponsePreReturn {
+  rpc Evaluate(stream HttpResponseEvent)
+      returns (stream HttpResponseEventResult);
+}
+
 // MiddlewareManifest describes one middleware service and the bindings it
 // exposes. The service is the operator-run gRPC server implementing
 // SupervisorMiddleware.
@@ -57,13 +65,12 @@ message MiddlewareManifest {
 message MiddlewareBinding {
   // Supported operation.
   SupervisorMiddlewareOperation operation = 1;
-  // Supported evaluation phase. PR 1 supports PRE_CREDENTIALS. PRE_RETURN is
-  // reserved for the return-path follow-up and is rejected by current
-  // manifest validation.
+  // Supported evaluation phase.
   SupervisorMiddlewarePhase phase = 2;
   // Maximum logical payload or replacement this binding can process. For
-  // HTTP_REQUEST this is the request body; for WEBSOCKET_MESSAGE this is one
-  // complete message. Required for every payload-bearing operation.
+  // HTTP_REQUEST this is the request body; for HTTP_RESPONSE this is a whole
+  // body or one streaming input/replacement unit; for WEBSOCKET_MESSAGE this
+  // is one complete message. Required for every payload-bearing operation.
   uint64 max_payload_bytes = 3;
   // Optional binding-specific RPC timeout. Empty uses the operator-configured
   // service timeout, or the 500ms platform default when that is also omitted.
@@ -113,7 +120,7 @@ message HttpRequestEvaluation {
   string middleware_name = 7;
 }
 
-// HttpHeader is one request header line.
+// HttpHeader is one HTTP header line.
 message HttpHeader {
   // Lowercased header name.
   string name = 1;
@@ -121,11 +128,145 @@ message HttpHeader {
   string value = 2;
 }
 
+// HttpResponseEvent is one ordered event in a stage-local response stream.
+message HttpResponseEvent {
+  oneof event {
+    HttpResponsePreflight preflight = 1;
+    HttpResponseBodyUnit body = 2;
+    HttpResponseBodyEnd body_end = 3;
+    HttpResponseTrailers trailers = 4;
+    HttpResponseSessionEnd session_end = 5;
+  }
+}
+
+// HttpResponseEventResult acknowledges response preflight, body, or trailers.
+// Body end and session end do not produce results in V1.
+message HttpResponseEventResult {
+  oneof result {
+    HttpResponsePreflightDecision preflight_decision = 1;
+    HttpResponseBodyResult body_result = 2;
+    HttpResponseTrailersResult trailers_result = 3;
+  }
+}
+
+// HttpResponsePreflight exposes the current final response head to one stage.
+message HttpResponsePreflight {
+  RequestContext context = 1;
+  HttpRequestTarget target = 2;
+  uint32 status_code = 3;
+  repeated HttpHeader headers = 4;
+  string middleware_name = 5;
+  google.protobuf.Struct config = 6;
+  // Effective minimum of the platform, registration, and binding limits.
+  uint64 max_payload_bytes = 7;
+}
+
+// HttpResponsePreflightDecision either declines the response or selects an
+// inspection mode and mutations.
+message HttpResponsePreflightDecision {
+  oneof decision {
+    HttpResponsePreflightSkip skip = 1;
+    HttpResponsePreflightInspect inspect = 2;
+  }
+}
+
+message HttpResponsePreflightSkip {
+  // Free-form diagnostic omitted from sandbox responses and OCSF fields.
+  string reason = 1;
+  string reason_code = 2;
+  repeated Finding findings = 3;
+  map<string, string> metadata = 4;
+}
+
+message HttpResponsePreflightInspect {
+  HttpResponseBodyMode body_mode = 1;
+  repeated HeaderMutation header_mutations = 2;
+  // Trailer names this stage may add after observing the final body bytes.
+  repeated string declared_trailer_names = 3;
+  // Free-form diagnostic omitted from sandbox responses and OCSF fields.
+  string reason = 4;
+  repeated Finding findings = 5;
+  map<string, string> metadata = 6;
+}
+
+enum HttpResponseBodyMode {
+  HTTP_RESPONSE_BODY_MODE_UNSPECIFIED = 0;
+  HTTP_RESPONSE_BODY_MODE_HEADERS_ONLY = 1;
+  HTTP_RESPONSE_BODY_MODE_WHOLE_BODY_BYTES = 2;
+  HTTP_RESPONSE_BODY_MODE_STREAM_BYTES = 3;
+}
+
+// HttpResponseBodyUnit contains one supervisor-defined logical body unit. Unit
+// boundaries have no HTTP transport or application semantic meaning.
+message HttpResponseBodyUnit {
+  // Contiguous and stage-local, starting at 1.
+  uint64 sequence = 1;
+  oneof payload {
+    bytes data = 2;
+  }
+}
+
+message HttpResponseBodyResult {
+  // Acknowledges exactly one outstanding body unit.
+  uint64 sequence = 1;
+  oneof decision {
+    HttpResponseBodyPassThrough pass_through = 2;
+    HttpResponseBodyTransform transform = 3;
+  }
+  // Free-form diagnostic omitted from sandbox responses and OCSF fields.
+  string reason = 4;
+  repeated Finding findings = 5;
+  map<string, string> metadata = 6;
+}
+
+message HttpResponseBodyPassThrough {}
+
+message HttpResponseBodyTransform {
+  // Presence is required. Present empty data deletes the input unit.
+  oneof replacement {
+    bytes data = 1;
+  }
+}
+
+message HttpResponseBodyEnd {
+  // Zero when streaming produced no units; otherwise the final input sequence.
+  uint64 final_sequence = 1;
+}
+
+message HttpResponseTrailers {
+  repeated HttpHeader headers = 1;
+}
+
+message HttpResponseTrailersResult {
+  repeated HeaderMutation trailer_mutations = 1;
+  // Free-form diagnostic omitted from sandbox responses and OCSF fields.
+  string reason = 2;
+  repeated Finding findings = 3;
+  map<string, string> metadata = 4;
+}
+
+enum HttpResponseSessionEndReason {
+  HTTP_RESPONSE_SESSION_END_REASON_UNSPECIFIED = 0;
+  HTTP_RESPONSE_SESSION_END_REASON_NORMAL = 1;
+  HTTP_RESPONSE_SESSION_END_REASON_STAGE_SKIPPED = 2;
+  HTTP_RESPONSE_SESSION_END_REASON_CLIENT_DISCONNECT = 3;
+  HTTP_RESPONSE_SESSION_END_REASON_UPSTREAM_ERROR = 4;
+  HTTP_RESPONSE_SESSION_END_REASON_MIDDLEWARE_FAILURE = 5;
+  HTTP_RESPONSE_SESSION_END_REASON_POLICY_RELOAD = 6;
+  HTTP_RESPONSE_SESSION_END_REASON_CANCELLATION = 7;
+  HTTP_RESPONSE_SESSION_END_REASON_PROTOCOL_ERROR = 8;
+}
+
+message HttpResponseSessionEnd {
+  HttpResponseSessionEndReason reason = 1;
+}
+
 // Supervisor operation selected for middleware evaluation.
 enum SupervisorMiddlewareOperation {
   SUPERVISOR_MIDDLEWARE_OPERATION_UNSPECIFIED = 0;
   SUPERVISOR_MIDDLEWARE_OPERATION_HTTP_REQUEST = 1;
   SUPERVISOR_MIDDLEWARE_OPERATION_WEBSOCKET_MESSAGE = 2;
+  SUPERVISOR_MIDDLEWARE_OPERATION_HTTP_RESPONSE = 3;
 }
 
 // Ordered phase within a supervisor operation.
