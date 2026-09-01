@@ -914,6 +914,41 @@ func TestFakeSandboxCreateWithNilPolicy(t *testing.T) {
 	assert.Nil(t, got.Spec.Policy)
 }
 
+func TestFakeSandboxCreateFromTemplatePreservesCommandAndTTY(t *testing.T) {
+	sc := newTestSandboxClient()
+	ctx := context.Background()
+	sc.templateStore.Insert("default", &types.SandboxWorkloadTemplate{
+		Name:            "gpu-kata",
+		ResourceVersion: 7,
+		Spec: types.SandboxWorkloadTemplateSpec{
+			Workload: &types.SandboxWorkloadConfig{
+				Image: "registry.example.com/agent:latest",
+			},
+		},
+	})
+	spec := &types.SandboxSpec{
+		Providers: []string{"github"},
+		Command:   []string{"/opt/worker", "--serve"},
+		TTY:       true,
+	}
+
+	created, err := sc.CreateFromTemplate(ctx, "default", "job-1", "gpu-kata", spec, map[string]string{"team": "runtime"})
+
+	require.NoError(t, err)
+	assert.Equal(t, []string{"/opt/worker", "--serve"}, created.Spec.Command)
+	assert.True(t, created.Spec.TTY)
+	assert.Equal(t, []string{"github"}, created.Spec.Providers)
+	require.NotNil(t, created.CreatedFromWorkloadTemplate)
+	assert.Equal(t, "gpu-kata", created.CreatedFromWorkloadTemplate.Name)
+	assert.Equal(t, "7", created.CreatedFromWorkloadTemplate.ResourceVersion)
+
+	spec.Command[0] = "mutated"
+	got, err := sc.Get(ctx, "default", "job-1")
+	require.NoError(t, err)
+	assert.Equal(t, []string{"/opt/worker", "--serve"}, got.Spec.Command)
+	assert.True(t, got.Spec.TTY)
+}
+
 // --- T032: GetLogs stub tests ---
 
 func TestSandbox_GetLogs_ReturnsUnimplemented(t *testing.T) {

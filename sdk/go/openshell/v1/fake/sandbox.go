@@ -44,6 +44,7 @@ func copySandbox(sb *types.Sandbox) *types.Sandbox {
 func copySandboxSpec(s types.SandboxSpec) types.SandboxSpec {
 	s.Environment = copyStringMap(s.Environment)
 	s.Providers = copyStringSlice(s.Providers)
+	s.Command = copyStringSlice(s.Command)
 	if s.Template != nil {
 		t := copySandboxTemplate(*s.Template)
 		s.Template = &t
@@ -352,6 +353,8 @@ func (c *fakeSandboxClient) CreateFromTemplate(_ context.Context, workspace, nam
 	resolvedSpec := sandboxSpecFromWorkloadTemplate(template)
 	resolvedSpec.Providers = copyStringSlice(spec.Providers)
 	resolvedSpec.Policy = copySandboxPolicy(spec.Policy)
+	resolvedSpec.Command = copyStringSlice(spec.Command)
+	resolvedSpec.TTY = spec.TTY
 
 	sb := &types.Sandbox{
 		Name:            name,
@@ -389,7 +392,7 @@ func validateTemplateCreateSpec(spec *types.SandboxSpec) error {
 		return nil
 	}
 	if spec.LogLevel != "" || len(spec.Environment) > 0 || spec.Template != nil || spec.GPU || spec.GPUCount != nil {
-		return &types.StatusError{Code: types.ErrorInvalidArgument, Message: "template creates only allow policy and providers in spec"}
+		return &types.StatusError{Code: types.ErrorInvalidArgument, Message: "template creates only allow policy, providers, command, and tty in spec"}
 	}
 	return nil
 }

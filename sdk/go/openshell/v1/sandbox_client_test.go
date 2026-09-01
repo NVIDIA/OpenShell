@@ -321,6 +321,31 @@ func TestSandboxCreateFromTemplateRejectsGPUOverrideBeforeRPC(t *testing.T) {
 	assert.Nil(t, mock.createRequest)
 }
 
+func TestSandboxCreateFromTemplateSendsCommandAndTTY(t *testing.T) {
+	mock := newMockSandboxServer()
+	client, cleanup := setupSandboxTest(t, mock)
+	defer cleanup()
+
+	result, err := client.CreateFromTemplate(context.Background(), "default", "job-1", "gpu-kata", &SandboxSpec{
+		Providers: []string{"github"},
+		Command:   []string{"/opt/worker", "--serve"},
+		TTY:       true,
+	}, map[string]string{"team": "runtime"})
+
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	assert.Equal(t, []string{"/opt/worker", "--serve"}, result.Spec.Command)
+	assert.True(t, result.Spec.TTY)
+
+	mock.mu.Lock()
+	defer mock.mu.Unlock()
+	require.NotNil(t, mock.createRequest)
+	assert.Equal(t, "gpu-kata", mock.createRequest.GetWorkloadTemplateName())
+	require.NotNil(t, mock.createRequest.GetSpec())
+	assert.Equal(t, []string{"/opt/worker", "--serve"}, mock.createRequest.GetSpec().GetCommand())
+	assert.True(t, mock.createRequest.GetSpec().GetTty())
+}
+
 func TestSandboxCreate_AlreadyExists(t *testing.T) {
 	mock := newMockSandboxServer()
 	mock.createErr = status.Error(codes.AlreadyExists, "sandbox already exists")
