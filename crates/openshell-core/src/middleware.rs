@@ -11,11 +11,16 @@ use tokio::sync::mpsc;
 use tonic::{Request, Response, Status};
 
 use crate::proto::{
-    HttpHeader, HttpRequestEvaluation, HttpRequestResult, HttpRequestTarget, HttpResponseEvent,
-    HttpResponseEventResult, MiddlewareManifest, RequestContext, SupervisorMiddlewarePhase,
-    ValidateConfigRequest, ValidateConfigResponse, WebSocketSessionEvent,
-    WebSocketSessionEventResult,
+    HttpHeader, HttpRequestEvaluation, HttpRequestEvent, HttpRequestEventResult, HttpRequestResult,
+    HttpRequestTarget, HttpResponseEvent, HttpResponseEventResult, MiddlewareManifest,
+    RequestContext, SupervisorMiddlewarePhase, ValidateConfigRequest, ValidateConfigResponse,
+    WebSocketSessionEvent, WebSocketSessionEventResult,
 };
+
+/// Transport-neutral result stream for one HTTP request middleware stage.
+pub type HttpRequestResultStream = Pin<
+    Box<dyn tokio_stream::Stream<Item = Result<HttpRequestEventResult, Status>> + Send + 'static>,
+>;
 
 /// Transport-neutral result stream for one HTTP response middleware stage.
 pub type HttpResponseResultStream = Pin<
@@ -48,6 +53,15 @@ pub trait SupervisorMiddlewareEndpoint: Send + Sync {
         &self,
         request: Request<HttpRequestEvaluation>,
     ) -> Result<Response<HttpRequestResult>, Status>;
+
+    async fn open_http_request_pre_credentials(
+        &self,
+        _requests: mpsc::Receiver<HttpRequestEvent>,
+    ) -> Result<HttpRequestResultStream, Status> {
+        Err(Status::unimplemented(
+            "middleware does not implement HTTP request pre-credentials evaluation",
+        ))
+    }
 
     async fn open_websocket_session(
         &self,
@@ -245,6 +259,19 @@ pub trait InProcessMiddleware: Send + Sync {
         &self,
         request: HttpRequestView<'_>,
     ) -> Result<HttpRequestResult>;
+
+    /// Open one HTTP request pre-credentials stream.
+    ///
+    /// Built-in middleware may keep using the borrowed request method. Remote
+    /// request middleware uses this stream through the transport adapter.
+    async fn open_http_request_pre_credentials(
+        &self,
+        _requests: mpsc::Receiver<HttpRequestEvent>,
+    ) -> std::result::Result<HttpRequestResultStream, Status> {
+        Err(Status::unimplemented(
+            "middleware does not implement HTTP request pre-credentials evaluation",
+        ))
+    }
 
     /// Open one persistent WebSocket middleware session.
     ///

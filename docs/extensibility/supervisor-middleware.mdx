@@ -23,8 +23,15 @@ For each inspected HTTP request, the supervisor:
 2. Selects middleware whose host selectors match the admitted destination.
 3. Buffers the request body using the largest body limit in the selected chain.
 4. Runs matching middleware by ascending `order`. Policy validation rejects duplicate order values.
-5. Re-checks body-aware protocol policy (GraphQL, JSON-RPC, MCP) after each stage that replaces the body. Every middleware receives a payload the policy admits, and a transformation cannot smuggle a denied or unparseable operation to a later stage or the upstream.
-6. Applies allowed transformations, injects provider credentials, and forwards the request.
+5. Opens `HttpRequestPreCredentials.Evaluate` for the stage. The stage first returns `DENY`, `ALLOW` with `SKIP`, or `ALLOW` with `INSPECT`.
+6. For `INSPECT`, applies request-specific restrictions and the selected `HEADERS_ONLY`, `WHOLE_BODY_BYTES`, or `STREAM_BYTES` mode. Whole-body stages receive exactly one body unit, including present empty data for an empty request. Streaming stages receive ordered units of at most 64 KiB and acknowledge each with `PASS_THROUGH`, `TRANSFORM`, or `DENY` before OpenShell sends the next unit.
+7. Sends `body_end` after the last inspected unit. OpenShell makes a best-effort `session_end` notification for every opened stream; neither notification has a result.
+8. Re-checks body-aware protocol policy (GraphQL, JSON-RPC, MCP) after each stage that replaces the body. Every middleware receives a payload the policy admits, and a transformation cannot smuggle a denied or unparseable operation to a later stage or the upstream.
+9. Applies allowed transformations, injects provider credentials, and forwards the request.
+
+Request `decision` values authorize the operation. Request `action` values control processing: preflight uses `SKIP` or `INSPECT`, while body results use `PASS_THROUGH` or `TRANSFORM`. A preflight or body `DENY` has no action. This separation leaves the processing action extensible without overloading authorization.
+
+The current HTTP/1 relay retains the complete request before opening the stage stream, so `STREAM_BYTES` provides bounded, lockstep middleware interactions but does not yet remove the relay's whole-request buffer. OpenShell does not contact the upstream or inject credentials until every selected request stage allows the request. This preserves body-time denial and prevents signed or transformed data from reaching the upstream prematurely.
 
 ### HTTP Response Flow
 
@@ -79,7 +86,7 @@ Choose an implementation, register it when it runs out of process, then attach i
 
 Operator-run services expose bindings for supported operation and phase pairs. A binding is identified by its operation and phase. V1 supports `HTTP_REQUEST/PRE_CREDENTIALS`, `HTTP_RESPONSE/PRE_RETURN`, and `WEBSOCKET_MESSAGE/PRE_CREDENTIALS`; a service may expose any combination. Policies attach the complete middleware by its operator-owned gateway registration name.
 
-The [content guard example](https://github.com/NVIDIA/OpenShell/tree/main/examples/supervisor-middleware-content-guard) implements request, response, and WebSocket bindings in one service. Its response paths demonstrate all three body modes, framing repair, and body-derived trailers.
+The [content guard example](https://github.com/NVIDIA/OpenShell/tree/main/examples/supervisor-middleware-content-guard) implements request, response, and WebSocket bindings in one service. Its response paths demonstrate all three body modes, framing repair, and body-derived trailers. The [Git signing example](https://github.com/NVIDIA/OpenShell/tree/main/examples/supervisor-middleware-git-signing) implements the request stream in whole-body mode and rewrites Git receive-pack pushes before credential injection.
 
 ### Register a Middleware Service
 
@@ -105,7 +112,7 @@ timeout = "500ms"
 | `max_payload_bytes` | Shared operator limit applied to inspectable logical payloads across every binding exposed by the service, up to the 4 MiB platform maximum. It caps HTTP bodies and complete WebSocket text messages. |
 | `timeout` | Optional service-wide RPC timeout using an integer with an `ms` or `s` suffix. Defaults to `500ms`; valid values range from `10ms` through `30s`. |
 
-Each binding returned by `Describe` may advertise a shorter `timeout` using the same syntax and bounds. The operator-configured service timeout is a ceiling: OpenShell uses the smaller of the binding and service values. An omitted binding timeout inherits the service setting, and an omitted service setting uses the 500 ms platform default. OpenShell rejects an invalid timeout before accepting the manifest. The operator-configured service timeout applies to `Describe` and `ValidateConfig`. The effective binding timeout applies to `EvaluateHttpRequest`, response preflight and each response event that expects a result, WebSocket preflight, and each WebSocket message. Persistent response and WebSocket streams have no connection-wide deadline.
+Each binding returned by `Describe` may advertise a shorter `timeout` using the same syntax and bounds. The operator-configured service timeout is a ceiling: OpenShell uses the smaller of the binding and service values. An omitted binding timeout inherits the service setting, and an omitted service setting uses the 500 ms platform default. OpenShell rejects an invalid timeout before accepting the manifest. The operator-configured service timeout applies to `Describe` and `ValidateConfig`. During the request-streaming experiment, the effective binding timeout covers the complete request stage stream. It applies per expected result for response and WebSocket streams; those persistent streams have no connection-wide deadline.
 
 The gateway connects to every registered service and verifies its capabilities before accepting traffic. Gateway startup fails when a service is unavailable, reports an invalid capability, or exposes more than one binding for the same operation and phase. The manifest `name` is diagnostic metadata and does not need to match the operator registration name. Operator-run registration names cannot claim the reserved `openshell/` namespace.
 

@@ -367,7 +367,7 @@ impl ResponseSessionState {
             result: Some(http_response_event_result::Result::BodyResult(
                 HttpResponseBodyResult {
                     sequence: body.sequence,
-                    decision: Some(http_response_body_result::Decision::Transform(
+                    action: Some(http_response_body_result::Action::Transform(
                         HttpResponseBodyTransform {
                             replacement: Some(http_response_body_transform::Replacement::Data(
                                 replacement,
@@ -431,13 +431,12 @@ fn response_preflight_skip() -> HttpResponseEventResult {
     HttpResponseEventResult {
         result: Some(http_response_event_result::Result::PreflightDecision(
             HttpResponsePreflightDecision {
-                decision: Some(http_response_preflight_decision::Decision::Skip(
-                    HttpResponsePreflightSkip {
-                        reason: "path is outside the response example".into(),
-                        reason_code: "path_not_selected".into(),
-                        ..Default::default()
-                    },
+                action: Some(http_response_preflight_decision::Action::Skip(
+                    HttpResponsePreflightSkip {},
                 )),
+                reason: "path is outside the response example".into(),
+                reason_code: "path_not_selected".into(),
+                ..Default::default()
             },
         )),
     }
@@ -460,7 +459,7 @@ fn response_preflight_inspect(selected: ResponseMode) -> HttpResponseEventResult
     HttpResponseEventResult {
         result: Some(http_response_event_result::Result::PreflightDecision(
             HttpResponsePreflightDecision {
-                decision: Some(http_response_preflight_decision::Decision::Inspect(
+                action: Some(http_response_preflight_decision::Action::Inspect(
                     HttpResponsePreflightInspect {
                         body_mode: body_mode as i32,
                         header_mutations: vec![write_header("x-example-response-mode", mode_name)],
@@ -468,6 +467,7 @@ fn response_preflight_inspect(selected: ResponseMode) -> HttpResponseEventResult
                         ..Default::default()
                     },
                 )),
+                ..Default::default()
             },
         )),
     }
@@ -731,8 +731,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 mod tests {
     use super::*;
     use openshell_core::proto::{
-        HttpRequestTarget, HttpResponseBodyUnit, HttpResponsePreflight, WebSocketPreflight,
-        WebSocketSessionEnd, WebSocketSessionStart,
+        HttpRequestTarget, HttpResponseBodyUnit, HttpResponsePreflight, MiddlewareSessionEnd,
+        WebSocketPreflight, WebSocketSessionStart,
     };
     use prost_types::{ListValue, Value};
     use std::collections::BTreeMap;
@@ -819,8 +819,7 @@ mod tests {
             else {
                 panic!("expected preflight decision");
             };
-            let Some(http_response_preflight_decision::Decision::Inspect(inspect)) =
-                decision.decision
+            let Some(http_response_preflight_decision::Action::Inspect(inspect)) = decision.action
             else {
                 panic!("expected inspect decision");
             };
@@ -845,8 +844,7 @@ mod tests {
             let Some(http_response_event_result::Result::BodyResult(body)) = result.result else {
                 panic!("expected body result");
             };
-            let Some(http_response_body_result::Decision::Transform(transform)) = body.decision
-            else {
+            let Some(http_response_body_result::Action::Transform(transform)) = body.action else {
                 panic!("expected body transform");
             };
             let Some(http_response_body_transform::Replacement::Data(data)) = transform.replacement
@@ -866,7 +864,7 @@ mod tests {
         else {
             panic!("expected preflight decision");
         };
-        let Some(http_response_preflight_decision::Decision::Inspect(inspect)) = decision.decision
+        let Some(http_response_preflight_decision::Action::Inspect(inspect)) = decision.action
         else {
             panic!("expected inspect decision");
         };
@@ -894,10 +892,10 @@ mod tests {
         else {
             panic!("expected preflight decision");
         };
-        let Some(http_response_preflight_decision::Decision::Skip(skip)) = decision.decision else {
+        let Some(http_response_preflight_decision::Action::Skip(_)) = decision.action else {
             panic!("expected skip decision");
         };
-        assert_eq!(skip.reason_code, "path_not_selected");
+        assert_eq!(decision.reason_code, "path_not_selected");
     }
 
     #[tokio::test]
@@ -920,7 +918,7 @@ mod tests {
                 )),
             })),
             event(web_socket_session_event::Event::SessionEnd(
-                WebSocketSessionEnd::default(),
+                MiddlewareSessionEnd::default(),
             )),
         ]);
         let mut results = ContentGuard::websocket_stream(events);

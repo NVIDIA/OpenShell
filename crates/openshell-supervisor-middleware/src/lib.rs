@@ -5,6 +5,7 @@
 
 pub mod headers;
 mod remote;
+mod request;
 mod response;
 mod websocket;
 
@@ -40,8 +41,8 @@ use tokio::sync::{OnceCell, OwnedSemaphorePermit, Semaphore};
 use tonic::{Request, Response as TonicResponse, Status as TonicStatus};
 
 pub use openshell_core::middleware::{
-    HttpRequestView, HttpResponseResultStream, InProcessMiddleware, SupervisorMiddlewareEndpoint,
-    WebSocketResponseStream,
+    HttpRequestResultStream, HttpRequestView, HttpResponseResultStream, InProcessMiddleware,
+    SupervisorMiddlewareEndpoint, WebSocketResponseStream,
 };
 pub type MiddlewareService =
     dyn SupervisorMiddleware<EvaluateWebSocketSessionStream = WebSocketResponseStream>;
@@ -180,6 +181,15 @@ impl InProcessMiddleware for EndpointInProcessAdapter {
             .await
             .map(tonic::Response::into_inner)
             .map_err(|error| miette!("{error}"))
+    }
+
+    async fn open_http_request_pre_credentials(
+        &self,
+        requests: tokio::sync::mpsc::Receiver<openshell_core::proto::HttpRequestEvent>,
+    ) -> std::result::Result<HttpRequestResultStream, tonic::Status> {
+        self.endpoint
+            .open_http_request_pre_credentials(requests)
+            .await
     }
 
     async fn open_websocket_session(
@@ -612,6 +622,7 @@ impl MiddlewareDispatch {
     async fn evaluate_http_request(
         &self,
         request: HttpRequestView<'_>,
+        max_payload_bytes: usize,
     ) -> std::result::Result<tonic::Response<openshell_core::proto::HttpRequestResult>, tonic::Status>
     {
         match self {
@@ -620,7 +631,14 @@ impl MiddlewareDispatch {
                 .await
                 .map(tonic::Response::new)
                 .map_err(|error| tonic::Status::invalid_argument(error.to_string())),
-            Self::Grpc(service) => service.evaluate_http_request(request).await,
+            Self::Grpc(service) => {
+                match request::evaluate_remote_request(service, request, max_payload_bytes).await {
+                    Err(status) if status.code() == tonic::Code::Unimplemented => {
+                        service.evaluate_http_request_compat(request).await
+                    }
+                    result => result,
+                }
+            }
         }
     }
 
@@ -1754,7 +1772,9 @@ impl ChainRunner {
             let mut result = match call_with_timeout(
                 entry.timeout.min(remaining),
                 "EvaluateHttpRequest",
-                service.service.evaluate_http_request(request),
+                service
+                    .service
+                    .evaluate_http_request(request, entry.max_payload_bytes),
             )
             .await
             {

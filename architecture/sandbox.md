@@ -164,11 +164,14 @@ the request. Policy-local map keys identify configs, while built-in names or
 operator-owned registration names identify implementations.
 
 Built-ins run in-process against a borrowed view of the chain's current HTTP
-request state. Operator services retain the bounded protobuf/gRPC contract, and
-the remote adapter materializes an owned HTTP evaluation only when a request
-crosses that transport boundary. Both paths support bounded bidirectional
-WebSocket sessions, so a manifest advertises capabilities independently of
-transport.
+request state. Operator services use a phase-specific bidirectional request
+stream: preflight selects headers-only, whole-body, or lockstep byte-stream
+inspection before any credential injection or upstream contact. The current
+HTTP/1 relay still retains the bounded request before opening that stream.
+Operator response and WebSocket hooks also use bounded bidirectional streams,
+so a manifest advertises capabilities independently of transport. The request
+adapter falls back to the legacy unary evaluation only when an older service
+returns `UNIMPLEMENTED` for the stream.
 The runtime keeps three states distinct: host selection attaches policy configs,
 manifest operation and phase bindings select the active chain, and the parsed
 message type determines whether that chain can inspect an individual payload.

@@ -3544,13 +3544,13 @@ where
     if committed {
         if let Err(error) = client.write_all(&streaming_head).await {
             session
-                .end(openshell_core::proto::HttpResponseSessionEndReason::ClientDisconnect)
+                .end(openshell_core::proto::MiddlewareSessionEndReason::PeerDisconnect)
                 .await;
             return Err(error).into_diagnostic();
         }
         if let Err(error) = client.flush().await {
             session
-                .end(openshell_core::proto::HttpResponseSessionEndReason::ClientDisconnect)
+                .end(openshell_core::proto::MiddlewareSessionEndReason::PeerDisconnect)
                 .await;
             return Err(error).into_diagnostic();
         }
@@ -3578,19 +3578,19 @@ where
                 .generation_guard
                 .is_some_and(PolicyGenerationGuard::is_stale)
             {
-                openshell_core::proto::HttpResponseSessionEndReason::PolicyReload
+                openshell_core::proto::MiddlewareSessionEndReason::PolicyReload
             } else if error
                 .to_string()
                 .starts_with("HTTP response client write failed:")
             {
-                openshell_core::proto::HttpResponseSessionEndReason::ClientDisconnect
+                openshell_core::proto::MiddlewareSessionEndReason::PeerDisconnect
             } else if error
                 .to_string()
                 .starts_with("HTTP response middleware failure:")
             {
-                openshell_core::proto::HttpResponseSessionEndReason::MiddlewareFailure
+                openshell_core::proto::MiddlewareSessionEndReason::MiddlewareFailure
             } else {
-                openshell_core::proto::HttpResponseSessionEndReason::UpstreamError
+                openshell_core::proto::MiddlewareSessionEndReason::UpstreamFailure
             };
             session.end(end_reason).await;
             if committed {
@@ -3624,7 +3624,7 @@ where
         && let Err(error) = guard.ensure_current()
     {
         session
-            .end(openshell_core::proto::HttpResponseSessionEndReason::PolicyReload)
+            .end(openshell_core::proto::MiddlewareSessionEndReason::PolicyReload)
             .await;
         return Err(error);
     }
@@ -4869,16 +4869,16 @@ mod tests {
                                 result: Some(
                                     http_response_event_result::Result::PreflightDecision(
                                         HttpResponsePreflightDecision {
-                                            decision: Some(
-                                                http_response_preflight_decision::Decision::Inspect(
+                                            action: Some(
+                                                http_response_preflight_decision::Action::Inspect(
                                                     HttpResponsePreflightInspect {
                                                         body_mode: body_mode as i32,
                                                         header_mutations,
                                                         declared_trailer_names,
-                                                        ..Default::default()
                                                     },
                                                 ),
                                             ),
+                                            ..Default::default()
                                         },
                                     ),
                                 ),
@@ -4913,17 +4913,15 @@ mod tests {
                                         } else {
                                             body.sequence
                                         },
-                                        decision: Some(
-                                            http_response_body_result::Decision::Transform(
-                                                HttpResponseBodyTransform {
-                                                    replacement: Some(
-                                                        http_response_body_transform::Replacement::Data(
-                                                            replacement,
-                                                        ),
+                                        action: Some(http_response_body_result::Action::Transform(
+                                            HttpResponseBodyTransform {
+                                                replacement: Some(
+                                                    http_response_body_transform::Replacement::Data(
+                                                        replacement,
                                                     ),
-                                                },
-                                            ),
-                                        ),
+                                                ),
+                                            },
+                                        )),
                                         ..Default::default()
                                     },
                                 )),

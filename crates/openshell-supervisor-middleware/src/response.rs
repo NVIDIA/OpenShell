@@ -14,11 +14,10 @@ use tokio::time::Instant;
 use openshell_core::proto::{
     Finding, HeaderMutation, HttpHeader, HttpRequestTarget, HttpResponseBodyEnd,
     HttpResponseBodyMode, HttpResponseBodyPassThrough, HttpResponseBodyUnit, HttpResponseEvent,
-    HttpResponseEventResult, HttpResponsePreflight, HttpResponseSessionEnd,
-    HttpResponseSessionEndReason, HttpResponseTrailers, RemoveHeader, RequestContext,
-    header_mutation, http_response_body_result, http_response_body_transform,
-    http_response_body_unit, http_response_event, http_response_event_result,
-    http_response_preflight_decision,
+    HttpResponseEventResult, HttpResponsePreflight, HttpResponseTrailers, MiddlewareSessionEnd,
+    MiddlewareSessionEndReason, RemoveHeader, RequestContext, header_mutation,
+    http_response_body_result, http_response_body_transform, http_response_body_unit,
+    http_response_event, http_response_event_result, http_response_preflight_decision,
 };
 
 use super::{
@@ -143,7 +142,7 @@ impl HttpResponseStage {
         self.is_active() && self.mode != StageMode::HeadersOnly
     }
 
-    async fn end(&mut self, reason: HttpResponseSessionEndReason) {
+    async fn end(&mut self, reason: MiddlewareSessionEndReason) {
         if let Some(transport) = self.transport.take() {
             let _ = tokio::time::timeout(
                 Duration::from_millis(10),
@@ -244,7 +243,7 @@ impl HttpResponseSession {
             let stage_output = match self.finish_stage(index, deadline).await {
                 Ok(output) => output,
                 Err(failure) => {
-                    self.end_all(HttpResponseSessionEndReason::MiddlewareFailure)
+                    self.end_all(MiddlewareSessionEndReason::MiddlewareFailure)
                         .await;
                     return Err(failure);
                 }
@@ -260,12 +259,12 @@ impl HttpResponseSession {
         let trailers = match self.process_trailers(trailers, deadline).await {
             Ok(trailers) => trailers,
             Err(failure) => {
-                self.end_all(HttpResponseSessionEndReason::MiddlewareFailure)
+                self.end_all(MiddlewareSessionEndReason::MiddlewareFailure)
                     .await;
                 return Err(failure);
             }
         };
-        self.end_all(HttpResponseSessionEndReason::Normal).await;
+        self.end_all(MiddlewareSessionEndReason::Normal).await;
         self.session_admission.take();
         Ok(HttpResponseFinish {
             body_units: released,
@@ -277,7 +276,7 @@ impl HttpResponseSession {
         })
     }
 
-    pub async fn end(mut self, reason: HttpResponseSessionEndReason) {
+    pub async fn end(mut self, reason: MiddlewareSessionEndReason) {
         self.end_all(reason).await;
     }
 
@@ -605,7 +604,7 @@ impl HttpResponseSession {
             failure_category: Some(response_failure_category(reason).into()),
         });
         stage
-            .end(HttpResponseSessionEndReason::MiddlewareFailure)
+            .end(MiddlewareSessionEndReason::MiddlewareFailure)
             .await;
         if stage.entry.on_error() == OnError::FailOpen {
             if original.is_empty() {
@@ -620,7 +619,7 @@ impl HttpResponseSession {
         }
     }
 
-    async fn end_all(&mut self, reason: HttpResponseSessionEndReason) {
+    async fn end_all(&mut self, reason: MiddlewareSessionEndReason) {
         for stage in &mut self.stages {
             stage.end(reason).await;
         }
@@ -661,7 +660,7 @@ impl ChainRunner {
                 if let Some(reason) =
                     collect_preflight_failure(&entry, "binding_not_described", &mut invocations)
                 {
-                    end_stages(&mut stages, HttpResponseSessionEndReason::MiddlewareFailure).await;
+                    end_stages(&mut stages, MiddlewareSessionEndReason::MiddlewareFailure).await;
                     return Ok(failed_preflight_outcome(
                         headers,
                         reason,
@@ -711,7 +710,7 @@ impl ChainRunner {
                     if let Some(reason) =
                         collect_preflight_failure(&entry, &reason, &mut invocations)
                     {
-                        end_stages(&mut stages, HttpResponseSessionEndReason::MiddlewareFailure)
+                        end_stages(&mut stages, MiddlewareSessionEndReason::MiddlewareFailure)
                             .await;
                         return Ok(failed_preflight_outcome(
                             headers,
@@ -727,7 +726,7 @@ impl ChainRunner {
                     if let Some(reason) =
                         collect_preflight_failure(&entry, "middleware_timeout", &mut invocations)
                     {
-                        end_stages(&mut stages, HttpResponseSessionEndReason::MiddlewareFailure)
+                        end_stages(&mut stages, MiddlewareSessionEndReason::MiddlewareFailure)
                             .await;
                         return Ok(failed_preflight_outcome(
                             headers,
@@ -748,7 +747,7 @@ impl ChainRunner {
                     "unexpected_response_result",
                     &mut invocations,
                 ) {
-                    end_stages(&mut stages, HttpResponseSessionEndReason::MiddlewareFailure).await;
+                    end_stages(&mut stages, MiddlewareSessionEndReason::MiddlewareFailure).await;
                     return Ok(failed_preflight_outcome(
                         headers,
                         reason,
@@ -759,37 +758,34 @@ impl ChainRunner {
                 }
                 continue;
             };
-            match decision.decision {
-                Some(http_response_preflight_decision::Decision::Skip(skip)) => {
-                    let invalid = validate_diagnostics(
-                        &skip.reason,
-                        &skip.reason_code,
-                        &skip.findings,
-                        &skip.metadata,
-                    );
-                    if let Err(reason) = invalid {
-                        if let Some(reason) =
-                            collect_preflight_failure(&entry, reason, &mut invocations)
-                        {
-                            end_stages(
-                                &mut stages,
-                                HttpResponseSessionEndReason::MiddlewareFailure,
-                            )
-                            .await;
-                            return Ok(failed_preflight_outcome(
-                                headers,
-                                reason,
-                                findings,
-                                metadata,
-                                invocations,
-                            ));
-                        }
-                        continue;
-                    }
+            let invalid = validate_diagnostics(
+                &decision.reason,
+                &decision.reason_code,
+                &decision.findings,
+                &decision.metadata,
+            );
+            if let Err(reason) = invalid {
+                if let Some(reason) = collect_preflight_failure(&entry, reason, &mut invocations) {
+                    end_stages(&mut stages, MiddlewareSessionEndReason::MiddlewareFailure).await;
+                    return Ok(failed_preflight_outcome(
+                        headers,
+                        reason,
+                        findings,
+                        metadata,
+                        invocations,
+                    ));
+                }
+                continue;
+            }
+            let reason_code = decision.reason_code;
+            let decision_findings = decision.findings;
+            let decision_metadata = decision.metadata;
+            match decision.action {
+                Some(http_response_preflight_decision::Action::Skip(_skip)) => {
                     collect_preflight_diagnostics(
                         &entry,
-                        skip.findings,
-                        skip.metadata,
+                        decision_findings,
+                        decision_metadata,
                         &mut findings,
                         &mut metadata,
                     );
@@ -802,7 +798,7 @@ impl ChainRunner {
                         output_size: None,
                         failed: false,
                         stage_disabled: false,
-                        reason_code: (!skip.reason_code.is_empty()).then_some(skip.reason_code),
+                        reason_code: (!reason_code.is_empty()).then_some(reason_code),
                         failure_category: None,
                     });
                     let mut skipped = HttpResponseStage {
@@ -813,11 +809,9 @@ impl ChainRunner {
                         declared_trailer_names: BTreeSet::new(),
                         whole_body: Vec::new(),
                     };
-                    skipped
-                        .end(HttpResponseSessionEndReason::StageSkipped)
-                        .await;
+                    skipped.end(MiddlewareSessionEndReason::StageSkipped).await;
                 }
-                Some(http_response_preflight_decision::Decision::Inspect(inspect)) => {
+                Some(http_response_preflight_decision::Action::Inspect(inspect)) => {
                     let mode = match validate_inspect(
                         &entry,
                         &inspect,
@@ -832,7 +826,7 @@ impl ChainRunner {
                             {
                                 end_stages(
                                     &mut stages,
-                                    HttpResponseSessionEndReason::MiddlewareFailure,
+                                    MiddlewareSessionEndReason::MiddlewareFailure,
                                 )
                                 .await;
                                 return Ok(failed_preflight_outcome(
@@ -862,7 +856,7 @@ impl ChainRunner {
                             {
                                 end_stages(
                                     &mut stages,
-                                    HttpResponseSessionEndReason::MiddlewareFailure,
+                                    MiddlewareSessionEndReason::MiddlewareFailure,
                                 )
                                 .await;
                                 return Ok(failed_preflight_outcome(
@@ -888,8 +882,8 @@ impl ChainRunner {
                     declared_trailer_names.extend(declared.iter().cloned());
                     collect_preflight_diagnostics(
                         &entry,
-                        inspect.findings,
-                        inspect.metadata,
+                        decision_findings,
+                        decision_metadata,
                         &mut findings,
                         &mut metadata,
                     );
@@ -906,7 +900,7 @@ impl ChainRunner {
                         output_size: None,
                         failed: false,
                         stage_disabled: false,
-                        reason_code: None,
+                        reason_code: (!reason_code.is_empty()).then_some(reason_code),
                         failure_category: None,
                     });
                     stages.push(HttpResponseStage {
@@ -924,7 +918,7 @@ impl ChainRunner {
                         "invalid_preflight_decision",
                         &mut invocations,
                     ) {
-                        end_stages(&mut stages, HttpResponseSessionEndReason::MiddlewareFailure)
+                        end_stages(&mut stages, MiddlewareSessionEndReason::MiddlewareFailure)
                             .await;
                         return Ok(failed_preflight_outcome(
                             headers,
@@ -1000,12 +994,17 @@ fn validate_body_result(
     if body.sequence != sequence {
         return Err("response_body_sequence_mismatch");
     }
-    validate_diagnostics(&body.reason, "", &body.findings, &body.metadata)?;
-    match body.decision {
-        Some(http_response_body_result::Decision::PassThrough(HttpResponseBodyPassThrough {})) => {
+    validate_diagnostics(
+        &body.reason,
+        &body.reason_code,
+        &body.findings,
+        &body.metadata,
+    )?;
+    match body.action {
+        Some(http_response_body_result::Action::PassThrough(HttpResponseBodyPassThrough {})) => {
             Ok(BodyDecision::PassThrough(body.findings, body.metadata))
         }
-        Some(http_response_body_result::Decision::Transform(transform)) => {
+        Some(http_response_body_result::Action::Transform(transform)) => {
             let Some(http_response_body_transform::Replacement::Data(replacement)) =
                 transform.replacement
             else {
@@ -1031,8 +1030,6 @@ fn validate_inspect(
     declared_body_length: Option<u64>,
     connection_nominated_headers: &[String],
 ) -> Result<StageMode, String> {
-    validate_diagnostics(&inspect.reason, "", &inspect.findings, &inspect.metadata)
-        .map_err(str::to_string)?;
     let mode = match HttpResponseBodyMode::try_from(inspect.body_mode) {
         Ok(HttpResponseBodyMode::HeadersOnly) => StageMode::HeadersOnly,
         Ok(HttpResponseBodyMode::WholeBodyBytes) => StageMode::WholeBody,
@@ -1321,11 +1318,12 @@ fn body_event(sequence: u64, data: Vec<u8>) -> HttpResponseEvent {
     }
 }
 
-fn session_end_event(reason: HttpResponseSessionEndReason) -> HttpResponseEvent {
+fn session_end_event(reason: MiddlewareSessionEndReason) -> HttpResponseEvent {
     HttpResponseEvent {
         event: Some(http_response_event::Event::SessionEnd(
-            HttpResponseSessionEnd {
+            MiddlewareSessionEnd {
                 reason: reason as i32,
+                protocol_error: None,
             },
         )),
     }
@@ -1518,7 +1516,7 @@ fn response_session_capacity_exhausted(
     }
 }
 
-async fn end_stages(stages: &mut [HttpResponseStage], reason: HttpResponseSessionEndReason) {
+async fn end_stages(stages: &mut [HttpResponseStage], reason: MiddlewareSessionEndReason) {
     for stage in stages {
         stage.end(reason).await;
     }
@@ -1629,8 +1627,8 @@ mod tests {
                                 result: Some(
                                     http_response_event_result::Result::PreflightDecision(
                                         HttpResponsePreflightDecision {
-                                            decision: Some(
-                                                http_response_preflight_decision::Decision::Inspect(
+                                            action: Some(
+                                                http_response_preflight_decision::Action::Inspect(
                                                     HttpResponsePreflightInspect {
                                                         body_mode:
                                                             HttpResponseBodyMode::HeadersOnly as i32,
@@ -1642,6 +1640,7 @@ mod tests {
                                                     },
                                                 ),
                                             ),
+                                            ..Default::default()
                                         },
                                     ),
                                 ),
@@ -1741,24 +1740,21 @@ mod tests {
                                     result: Some(
                                         http_response_event_result::Result::PreflightDecision(
                                             HttpResponsePreflightDecision {
-                                                decision: Some(
-                                                    http_response_preflight_decision::Decision::Skip(
-                                                        HttpResponsePreflightSkip {
-                                                            reason: if matches!(
-                                                                selected_script,
-                                                                Script::InvalidSkipReason
-                                                            ) {
-                                                                "x".repeat(
-                                                                    MAX_MIDDLEWARE_REASON_BYTES + 1,
-                                                                )
-                                                            } else {
-                                                                "not selected".into()
-                                                            },
-                                                            reason_code: "path_not_selected".into(),
-                                                            ..Default::default()
-                                                        },
+                                                action: Some(
+                                                    http_response_preflight_decision::Action::Skip(
+                                                        HttpResponsePreflightSkip {},
                                                     ),
                                                 ),
+                                                reason: if matches!(
+                                                    selected_script,
+                                                    Script::InvalidSkipReason
+                                                ) {
+                                                    "x".repeat(MAX_MIDDLEWARE_REASON_BYTES + 1)
+                                                } else {
+                                                    "not selected".into()
+                                                },
+                                                reason_code: "path_not_selected".into(),
+                                                ..Default::default()
                                             },
                                         ),
                                     ),
@@ -1796,16 +1792,16 @@ mod tests {
                                 result: Some(
                                     http_response_event_result::Result::PreflightDecision(
                                         HttpResponsePreflightDecision {
-                                            decision: Some(
-                                                http_response_preflight_decision::Decision::Inspect(
+                                            action: Some(
+                                                http_response_preflight_decision::Action::Inspect(
                                                     HttpResponsePreflightInspect {
                                                         body_mode: body_mode as i32,
                                                         header_mutations,
                                                         declared_trailer_names,
-                                                        ..Default::default()
                                                     },
                                                 ),
                                             ),
+                                            ..Default::default()
                                         },
                                     ),
                                 ),
@@ -1843,17 +1839,15 @@ mod tests {
                                         } else {
                                             body.sequence
                                         },
-                                        decision: Some(
-                                            http_response_body_result::Decision::Transform(
-                                                HttpResponseBodyTransform {
-                                                    replacement: Some(
-                                                        http_response_body_transform::Replacement::Data(
-                                                            replacement,
-                                                        ),
+                                        action: Some(http_response_body_result::Action::Transform(
+                                            HttpResponseBodyTransform {
+                                                replacement: Some(
+                                                    http_response_body_transform::Replacement::Data(
+                                                        replacement,
                                                     ),
-                                                },
-                                            ),
-                                        ),
+                                                ),
+                                            },
+                                        )),
                                         ..Default::default()
                                     },
                                 )),
