@@ -39,6 +39,7 @@ const BUILT_IN_PROFILE_YAMLS: &[&str] = &[
     include_str!("../../../providers/google-vertex-ai.yaml"),
     include_str!("../../../providers/nvidia.yaml"),
     include_str!("../../../providers/pypi.yaml"),
+    include_str!("../../../providers/tars.yaml"),
 ];
 
 #[derive(Debug, thiserror::Error)]

@@ -131,6 +131,7 @@ Check:
   - `anthropic` for Anthropic Messages API
   - `nvidia` for NVIDIA-hosted OpenAI-compatible endpoints
   - `deepinfra` for DeepInfra's OpenAI-compatible endpoint
+  - `tars` for Tetrate Agent Router Service; serves OpenAI Chat Completions, Responses, Embeddings, and Anthropic Messages from one base URL
   - `google-vertex-ai` for Vertex AI; Claude models use Anthropic Messages and other models use OpenAI Chat Completions
   - `aws-bedrock` only through a configured Bedrock-compatible bridge today
 - Required credential key exists

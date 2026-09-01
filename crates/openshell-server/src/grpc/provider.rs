@@ -4732,6 +4732,7 @@ fn telemetry_provider_profile(provider_type: &str) -> TelemetryProviderProfile {
         Some("openai") => TelemetryProviderProfile::Openai,
         Some("opencode") => TelemetryProviderProfile::Opencode,
         Some("outlook") => TelemetryProviderProfile::Outlook,
+        Some("tars") => TelemetryProviderProfile::Tars,
         _ => TelemetryProviderProfile::Custom,
     }
 }
@@ -5669,7 +5670,8 @@ mod tests {
                 "google-cloud",
                 "google-vertex-ai",
                 "nvidia",
-                "pypi"
+                "pypi",
+                "tars"
             ]
         );
 

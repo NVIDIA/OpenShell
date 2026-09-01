@@ -78,6 +78,19 @@ const ANTHROPIC_PROTOCOLS: &[&str] = &["anthropic_messages", "model_discovery"];
 /// base-URL-override escape hatch path.
 const VERTEX_AI_PROTOCOLS: &[&str] = &["anthropic_messages", "model_discovery"];
 
+/// Protocol set for the TARS (Tetrate Agent Router Service) profile. TARS is an
+/// LLM traffic router that serves both OpenAI-compatible endpoints and the
+/// Anthropic Messages API on the same host, so a single route advertises both
+/// protocol families and `inference.local` serves OpenAI-style and
+/// Anthropic-style clients simultaneously.
+const TARS_PROTOCOLS: &[&str] = &[
+    "openai_chat_completions",
+    "openai_responses",
+    "openai_embeddings",
+    "anthropic_messages",
+    "model_discovery",
+];
+
 // `aws_bedrock_invoke_stream` (`/model/{id}/invoke-with-response-stream`) is
 // deferred to a follow-up alongside protocol-aware AWS event-stream error
 // handling: the shared streaming relay's truncation/timeout path injects
@@ -177,6 +190,36 @@ static DEEPINFRA_PROFILE: InferenceProviderProfile = InferenceProviderProfile {
     passthrough_headers: &["x-model-id"],
 };
 
+// TARS (Tetrate Agent Router Service) — a multi-tenant LLM traffic router.
+// The default base URL is the Tetrate-hosted SaaS gateway; enterprise
+// deployments override it with `TARS_BASE_URL` (customer-specific hostname).
+// TARS accepts `Authorization: Bearer sk-<key>` on both its OpenAI-compatible
+// and Anthropic Messages routes, so `Bearer` covers the whole protocol set.
+//
+// `default_headers` is intentionally empty even though this profile serves
+// `anthropic_messages`, where `ANTHROPIC_PROFILE` injects `anthropic-version`.
+// Route default headers are applied to every request on the route regardless
+// of the request's protocol (there is no per-protocol hook — see
+// `route_headers_for_route`), so injecting `anthropic-version` here would also
+// stamp it onto `/v1/chat/completions` and `/v1/embeddings`, where a
+// translating gateway may read it as a protocol-family hint. Anthropic clients
+// send the header themselves and it is on the passthrough allowlist below.
+static TARS_PROFILE: InferenceProviderProfile = InferenceProviderProfile {
+    provider_type: "tars",
+    default_base_url: "https://api.router.tetrate.ai/v1",
+    protocols: TARS_PROTOCOLS,
+    credential_key_names: &["TARS_API_KEY", "AGENTROUTER_API_KEY"],
+    base_url_config_keys: &["TARS_BASE_URL", "AGENTROUTER_BASE_URL"],
+    auth: AuthHeader::Bearer,
+    default_headers: &[],
+    passthrough_headers: &[
+        "anthropic-version",
+        "anthropic-beta",
+        "openai-organization",
+        "x-model-id",
+    ],
+};
+
 // AWS Bedrock — registered as bridge-fronted (no router-side auth
 // injection). Real AWS Bedrock requires `SigV4` signing of every request,
 // which is deferred to a follow-up PR (see #1704 thread). Until then,
@@ -222,6 +265,7 @@ pub fn normalize_inference_provider_type(input: &str) -> Option<&'static str> {
         "anthropic" => Some("anthropic"),
         "nvidia" => Some("nvidia"),
         "deepinfra" => Some("deepinfra"),
+        "tars" | "agentrouter" | "tetrate-agent-router" => Some("tars"),
         "aws-bedrock" => Some("aws-bedrock"),
         "google-vertex-ai" | "vertex" | "vertex-ai" | "google-vertex" | "gcp-vertex" => {
             Some("google-vertex-ai")
@@ -240,6 +284,7 @@ pub fn profile_for(provider_type: &str) -> Option<&'static InferenceProviderProf
         "anthropic" => Some(&ANTHROPIC_PROFILE),
         "nvidia" => Some(&NVIDIA_PROFILE),
         "deepinfra" => Some(&DEEPINFRA_PROFILE),
+        "tars" => Some(&TARS_PROFILE),
         "google-vertex-ai" => Some(&VERTEX_AI_PROFILE),
         "aws-bedrock" => Some(&AWS_BEDROCK_PROFILE),
         _ => None,
@@ -404,8 +449,70 @@ mod tests {
     }
 
     #[test]
+    fn profile_for_tars_types() {
+        for key in &["tars", "agentrouter", "tetrate-agent-router", "TARS"] {
+            let profile = profile_for(key).expect("tars profile should be Some");
+            assert_eq!(profile.provider_type, "tars");
+        }
+    }
+
+    #[test]
+    fn tars_profile_advertises_both_protocol_families() {
+        let profile = profile_for("tars").expect("tars profile should exist");
+        assert_eq!(profile.default_base_url, "https://api.router.tetrate.ai/v1");
+        assert_eq!(profile.auth, AuthHeader::Bearer);
+        // TARS serves OpenAI-compatible and Anthropic Messages routes on the
+        // same host, so one route covers both client families.
+        for protocol in [
+            "openai_chat_completions",
+            "openai_responses",
+            "openai_embeddings",
+            "anthropic_messages",
+            "model_discovery",
+        ] {
+            assert!(
+                profile.protocols.contains(&protocol),
+                "tars should route {protocol}"
+            );
+        }
+    }
+
+    #[test]
+    fn tars_profile_omits_legacy_completions() {
+        let profile = profile_for("tars").expect("tars profile should exist");
+        assert!(!profile.protocols.contains(&"openai_completions"));
+    }
+
+    /// Unlike `ANTHROPIC_PROFILE`, the dual-family TARS profile must not inject
+    /// `anthropic-version` as a route default: route default headers apply to
+    /// every request on the route, so it would also land on the OpenAI-family
+    /// paths TARS serves from the same base URL.
+    #[test]
+    fn tars_profile_injects_no_default_headers() {
+        let profile = profile_for("tars").expect("tars profile should exist");
+        assert!(profile.default_headers.is_empty());
+        assert!(
+            profile.passthrough_headers.contains(&"anthropic-version"),
+            "anthropic clients must still be able to send anthropic-version"
+        );
+    }
+
+    #[test]
+    fn route_headers_for_tars_include_both_families_passthrough() {
+        let (auth, headers, passthrough_headers) = route_headers_for_provider_type("tars");
+        assert_eq!(auth, AuthHeader::Bearer);
+        assert!(headers.is_empty());
+        for name in ["anthropic-version", "anthropic-beta", "openai-organization"] {
+            assert!(
+                passthrough_headers.iter().any(|h| h == name),
+                "tars should pass through {name}"
+            );
+        }
+    }
+
+    #[test]
     fn openai_compatible_profiles_include_embeddings() {
-        for provider_type in ["openai", "nvidia", "deepinfra"] {
+        for provider_type in ["openai", "nvidia", "deepinfra", "tars"] {
             let profile = profile_for(provider_type).expect("provider profile should exist");
             assert!(
                 profile.protocols.contains(&"openai_embeddings"),
