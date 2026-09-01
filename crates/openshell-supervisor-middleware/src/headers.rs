@@ -13,6 +13,7 @@ pub const MAX_HEADER_MUTATION_BYTES: usize = 32 * 1024;
 pub enum HeaderAuthority {
     Request,
     Response,
+    ResponseTrailers,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -122,7 +123,7 @@ pub fn apply(
     for mutation in mutations {
         match mutation.operation.as_ref() {
             Some(header_mutation::Operation::Write(write)) => {
-                let name = validate_name(&write.name)?;
+                let name = normalize_name(&write.name)?;
                 validate_authority(authority, MutationKind::Write, &write.name, &name)?;
                 if is_connection_nominated(connection_nominated_headers, &name) {
                     return Err(HeaderMutationError::HopByHop {
@@ -163,7 +164,7 @@ pub fn apply(
                 }
             }
             Some(header_mutation::Operation::Remove(remove)) => {
-                let name = validate_name(&remove.name)?;
+                let name = normalize_name(&remove.name)?;
                 validate_authority(authority, MutationKind::Remove, &remove.name, &name)?;
                 if is_connection_nominated(connection_nominated_headers, &name) {
                     return Err(HeaderMutationError::HopByHop {
@@ -187,7 +188,7 @@ fn enforce_size_limit(mutation_bytes: usize) -> Result<(), HeaderMutationError> 
     Ok(())
 }
 
-fn validate_name(name: &str) -> Result<String, HeaderMutationError> {
+pub fn normalize_name(name: &str) -> Result<String, HeaderMutationError> {
     let lower = name.to_ascii_lowercase();
     if lower.is_empty() || !lower.bytes().all(is_name_token_byte) {
         return Err(HeaderMutationError::InvalidName {
@@ -215,6 +216,7 @@ fn validate_authority(
             is_response_protected(normalized_name)
                 || (kind == MutationKind::Write && is_response_remove_only(normalized_name))
         }
+        HeaderAuthority::ResponseTrailers => is_response_protected(normalized_name),
     };
     if protected {
         return Err(HeaderMutationError::Protected {
