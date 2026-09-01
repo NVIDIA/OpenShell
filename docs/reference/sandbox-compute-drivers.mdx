@@ -597,7 +597,7 @@ The resolved UID/GID appear in:
 
 ### VM Driver
 
-The VM driver injects the sandbox UID into the rootfs guest's `/etc/passwd`, `/etc/group`, and `/etc/gshadow` during rootfs preparation. Default UID is `10001`; configure `sandbox_uid` in `[openshell.drivers.vm]` to use a different value.
+The VM driver preserves an image-provided `sandbox` account when `sandbox_uid` and `sandbox_gid` are omitted. Images without that account use UID/GID `1000`. Explicit values in `[openshell.drivers.vm]` override the image account. Persisted overlays retain the UID/GID recorded when they were created so a driver upgrade does not rewrite their ownership contract.
 
 ### Custom Images
 

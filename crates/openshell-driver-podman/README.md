@@ -356,8 +356,12 @@ signals succeeds:
 - `test -S` on the configured supervisor Unix socket path.
 - The prior TCP check for a listener on the in-container SSH port.
 
-The Unix socket check allows relay-only readiness when the supervisor exposes
-the socket without the old marker or published-port signal.
+The Unix socket check allows relay-only backend readiness when the supervisor
+exposes the socket without the old marker or published-port signal. Omitting
+`health_check_interval_secs` disables these Podman/conmon probes, but it does
+not bypass public readiness gating: the gateway keeps a backend-ready sandbox
+in `Provisioning` with `SupervisorNotConnected` until its supervisor control
+session is connected.
 
 ### Deletion Flow
 

@@ -230,6 +230,8 @@ phases = ["validate"]
 
 [openshell.drivers.kubernetes]
 namespace              = "openshell"
+# Required in raw TOML; Helm derives this from the gateway Service.
+grpc_endpoint          = "https://openshell-gateway.openshell.svc:8080"
 default_image          = "ghcr.io/nvidia/openshell/sandbox:latest"
 # Defaults to the gateway version; override to pin a specific build.
 # supervisor_image     = "ghcr.io/nvidia/openshell/supervisor:<version>"
@@ -672,7 +674,7 @@ ssh_socket_path    = "/run/openshell/ssh.sock"
 # bind-backed volumes, expose gateway-host paths inside sandboxes and can
 # negate OpenShell isolation and filesystem controls.
 enable_bind_mounts = false
-# Omit to leave Docker's runtime default unchanged. Explicit 0 is invalid.
+# Omit to use OpenShell's 2048-process default. Explicit 0 is invalid.
 sandbox_pids_limit = 2048
 # Explicit supervisor-compatible default. RuntimeDefault requires Docker to
 # report AppArmor support; Localhost/<name> requires an operator-loaded profile.
@@ -733,7 +735,7 @@ stop_timeout_secs       = 45
 # bind-backed volumes, expose gateway-host paths inside sandboxes and can
 # negate OpenShell isolation and filesystem controls.
 enable_bind_mounts      = false
-# Omit to leave Podman's runtime default unchanged. Explicit 0 is invalid.
+# Omit to use OpenShell's 2048-process default. Explicit 0 is invalid.
 sandbox_pids_limit      = 2048
 # Health check interval in seconds. Omit to disable health checks; explicit 0
 # is invalid. Lower values detect readiness faster but increase process churn

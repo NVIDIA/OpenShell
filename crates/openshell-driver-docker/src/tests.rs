@@ -2257,11 +2257,10 @@ fn docker_container_projects_proxy_and_spiffe_without_credential_metadata() {
             .iter()
             .any(|bind| bind.contains(UPSTREAM_PROXY_AUTH_MOUNT_PATH))
     );
-    assert!(
-        binds
-            .iter()
-            .any(|bind| bind.contains(PROVIDER_SPIFFE_WORKLOAD_API_SOCKET_MOUNT_DIR))
-    );
+    assert!(binds.contains(&format!(
+        "/run/spire:{PROVIDER_SPIFFE_WORKLOAD_API_SOCKET_MOUNT_DIR}:ro"
+    )));
+    assert!(binds.iter().all(|bind| !bind.contains("rbind")));
     let env = body.env.unwrap();
     assert!(env.iter().any(|entry| entry
         == "OPENSHELL_PROVIDER_SPIFFE_WORKLOAD_API_SOCKET=/spiffe-workload-api/agent.sock"));

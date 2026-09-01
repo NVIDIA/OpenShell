@@ -320,10 +320,13 @@ can request a specific number of GPUs or the driver-specific default behaviour.
 For all in-tree drivers, this is equivalent to selecting a single GPU.
 
 VM runtime state paths are derived only from driver-validated sandbox IDs
-matching `[A-Za-z0-9._-]{1,128}`. The gateway-owned VM driver socket uses a
-private `run/` directory plus Unix peer UID/PID checks. Standalone
-unauthenticated TCP mode is disabled unless explicitly enabled for local
-development.
+matching `[A-Za-z0-9._-]{1,128}`. Each writable overlay records its effective
+sandbox UID/GID so later rootfs cache changes cannot rewrite persisted file
+ownership. Unmarked pre-migration overlays recover the account from their
+persisted prepared rootfs before falling back to explicit configuration or the
+legacy `10001:10001` default. The gateway-owned VM driver socket uses a private
+`run/` directory plus Unix peer UID/PID checks. Standalone unauthenticated TCP
+mode is disabled unless explicitly enabled for local development.
 
 Runtime-specific implementation notes belong in the driver crate README:
 

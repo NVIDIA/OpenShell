@@ -239,6 +239,15 @@ pub async fn run_cli_with_compute_drivers(compute_drivers: ComputeDriverRegistry
     }
 }
 
+fn reject_legacy_driver_selector_env() -> Result<()> {
+    if std::env::var_os("OPENSHELL_DRIVERS").is_some() {
+        return Err(miette::miette!(
+            "OPENSHELL_DRIVERS is no longer supported; use OPENSHELL_COMPUTE_DRIVER with exactly one driver name"
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 fn prepare_server_config(args: &mut RunArgs, matches: &ArgMatches) -> Result<ServerStartupConfig> {
     prepare_server_config_with_drivers(args, matches, &ComputeDriverRegistry::new())
@@ -249,6 +258,8 @@ fn prepare_server_config_with_drivers(
     matches: &ArgMatches,
     compute_drivers: &ComputeDriverRegistry,
 ) -> Result<ServerStartupConfig> {
+    reject_legacy_driver_selector_env()?;
+
     // Load TOML when explicitly requested, or from the default XDG location
     // when that file exists. Missing default config is not an error: runtime
     // defaults and OPENSHELL_* env vars are enough for package-managed starts.
@@ -847,7 +858,7 @@ fn resolve_mtls_auth_enabled(
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, command};
+    use super::{Cli, command, reject_legacy_driver_selector_env};
     use crate::TEST_ENV_LOCK as ENV_LOCK;
     use clap::Parser;
     use std::net::{IpAddr, Ipv4Addr};
@@ -1255,6 +1266,20 @@ mod tests {
             .try_get_matches_from(["openshell-gateway", "--drivers", "docker"])
             .expect_err("legacy --drivers flag must be rejected");
         assert!(error.to_string().contains("--drivers"));
+    }
+
+    #[test]
+    fn rejects_legacy_drivers_environment_variable() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for value in ["docker", ""] {
+            let _guard = EnvVarGuard::set("OPENSHELL_DRIVERS", value);
+            let error = reject_legacy_driver_selector_env()
+                .expect_err("legacy OPENSHELL_DRIVERS must be rejected when present");
+            assert!(error.to_string().contains("OPENSHELL_DRIVERS"));
+            assert!(error.to_string().contains("OPENSHELL_COMPUTE_DRIVER"));
+        }
     }
 
     #[test]

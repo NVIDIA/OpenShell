@@ -634,12 +634,28 @@ reconcile_sandbox_account() {
     mkdir -p "$etc"
     touch "$etc/passwd" "$etc/group" "$etc/shadow" "$etc/gshadow"
     if grep -q '^sandbox:' "$etc/group"; then
-        sed -i "s|^sandbox:.*|sandbox:x:${sandbox_gid}:|" "$etc/group"
+        if ! awk -F: -v OFS=: -v gid="$sandbox_gid" \
+            '$1 == "sandbox" { $3 = gid } { print }' \
+            "$etc/group" >"$etc/group.openshell"; then
+            rm -f "$etc/group.openshell"
+            ts "FATAL: failed to reconcile sandbox group"
+            exit 1
+        fi
+        mv "$etc/group.openshell" "$etc/group"
     else
         printf 'sandbox:x:%s:\n' "$sandbox_gid" >> "$etc/group"
     fi
     if grep -q '^sandbox:' "$etc/passwd"; then
-        sed -i "s|^sandbox:.*|sandbox:x:${sandbox_uid}:${sandbox_gid}:OpenShell Sandbox:/sandbox:/bin/sh|" "$etc/passwd"
+        # Preserve image-owned account metadata (home, shell, and description)
+        # while restoring the UID/GID contract recorded for this overlay.
+        if ! awk -F: -v OFS=: -v uid="$sandbox_uid" -v gid="$sandbox_gid" \
+            '$1 == "sandbox" { $3 = uid; $4 = gid } { print }' \
+            "$etc/passwd" >"$etc/passwd.openshell"; then
+            rm -f "$etc/passwd.openshell"
+            ts "FATAL: failed to reconcile sandbox account"
+            exit 1
+        fi
+        mv "$etc/passwd.openshell" "$etc/passwd"
     else
         printf 'sandbox:x:%s:%s:OpenShell Sandbox:/sandbox:/bin/sh\n' "$sandbox_uid" "$sandbox_gid" >> "$etc/passwd"
     fi

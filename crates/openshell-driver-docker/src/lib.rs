@@ -2716,7 +2716,7 @@ fn build_binds(
             Status::failed_precondition("provider SPIFFE socket has no parent directory")
         })?;
         binds.push(format!(
-            "{}:{}:ro,rbind",
+            "{}:{}:ro",
             parent.display(),
             PROVIDER_SPIFFE_WORKLOAD_API_SOCKET_MOUNT_DIR
         ));

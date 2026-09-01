@@ -165,6 +165,32 @@ tests:
           path: data["gateway.toml"]
           pattern: '(?ms)\[openshell\.drivers\.kubernetes\].*?image_pull_policy\s*=\s*"if_not_present".*?supervisor_image_pull_policy\s*=\s*"never"'
 
+  - it: translates legacy Kubernetes pull policy values to canonical gateway values
+    template: templates/gateway-config.yaml
+    set:
+      server.sandboxImagePullPolicy: Always
+      supervisor.image.pullPolicy: IfNotPresent
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.drivers\.kubernetes\].*?image_pull_policy\s*=\s*"always".*?supervisor_image_pull_policy\s*=\s*"if_not_present"'
+
+  - it: rejects unsupported sandbox image pull policies
+    template: templates/statefulset.yaml
+    set:
+      server.sandboxImagePullPolicy: Sometimes
+    asserts:
+      - failedTemplate:
+          errorMessage: 'image pull policy "Sometimes" must be one of: always, if_not_present, never, Always, IfNotPresent, Never'
+
+  - it: rejects unsupported supervisor image pull policies
+    template: templates/statefulset.yaml
+    set:
+      supervisor.image.pullPolicy: newer
+    asserts:
+      - failedTemplate:
+          errorMessage: 'image pull policy "newer" must be one of: always, if_not_present, never, Always, IfNotPresent, Never'
+
   - it: renders driver-owned Kubernetes settings only in its driver table
     template: templates/gateway-config.yaml
     set:

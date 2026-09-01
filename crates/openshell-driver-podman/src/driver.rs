@@ -428,19 +428,10 @@ impl PodmanComputeDriver {
                         info.host.cgroup_version
                     )));
                 }
-                if matches!(
-                    config.app_armor_profile,
-                    Some(
-                        openshell_core::AppArmorProfile::RuntimeDefault
-                            | openshell_core::AppArmorProfile::Localhost(_)
-                    )
-                ) && !info.host.security.apparmor_enabled
-                {
-                    return Err(PodmanApiError::InvalidInput(
-                        "app_armor_profile requires AppArmor, but Podman reports AppArmor is unavailable; install/enable AppArmor or use Unconfined explicitly"
-                            .to_string(),
-                    ));
-                }
+                validate_apparmor_support(
+                    config.app_armor_profile.as_ref(),
+                    info.host.security.apparmor_enabled,
+                )?;
                 info!(
                     cgroup_version = %info.host.cgroup_version,
                     network_backend = %info.host.network_backend,
@@ -1414,6 +1405,26 @@ impl PodmanComputeDriver {
     }
 }
 
+fn validate_apparmor_support(
+    profile: Option<&openshell_core::AppArmorProfile>,
+    apparmor_enabled: bool,
+) -> Result<(), PodmanApiError> {
+    let requires_apparmor = matches!(
+        profile,
+        Some(
+            openshell_core::AppArmorProfile::RuntimeDefault
+                | openshell_core::AppArmorProfile::Localhost(_)
+        )
+    );
+    if requires_apparmor && !apparmor_enabled {
+        return Err(PodmanApiError::InvalidInput(
+            "app_armor_profile requires AppArmor, but Podman reports AppArmor is unavailable; install/enable AppArmor or use Unconfined explicitly"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
 fn supervisor_image_pull_policy(image: &str) -> &'static str {
     if supervisor_image_should_refresh(image) {
         "newer"
@@ -2228,6 +2239,24 @@ mod tests {
             requirements[0].selector,
             Some(Selector::ExactBindAddress("10.90.1.1:17670".to_string()))
         );
+    }
+
+    #[test]
+    fn confined_apparmor_profiles_follow_podman_capability() {
+        use openshell_core::AppArmorProfile;
+
+        for profile in [
+            AppArmorProfile::RuntimeDefault,
+            AppArmorProfile::Localhost("openshell-supervisor".to_string()),
+        ] {
+            validate_apparmor_support(Some(&profile), true)
+                .expect("confined profile should be accepted when Podman reports AppArmor");
+            let error = validate_apparmor_support(Some(&profile), false)
+                .expect_err("confined profile must fail when AppArmor is unavailable");
+            assert!(error.to_string().contains("AppArmor is unavailable"));
+        }
+        validate_apparmor_support(Some(&AppArmorProfile::Unconfined), false)
+            .expect("Unconfined does not require AppArmor support");
     }
 
     #[test]

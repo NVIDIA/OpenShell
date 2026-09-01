@@ -657,6 +657,56 @@ fn debugfs_quote_argument(argument: &str) -> Option<String> {
     Some(quoted)
 }
 
+/// Read the sandbox account identity directly from an ext4 rootfs image.
+///
+/// Persisted VM overlays may outlive the prepared-image cache layout that
+/// created them. Reading the matching old lower disk lets the driver preserve
+/// that overlay's real ownership contract during an upgrade.
+pub fn sandbox_guest_user_ids_from_image(image_path: &Path) -> Result<Option<(u32, u32)>, String> {
+    let quoted_path = debugfs_quote_absolute_path("/etc/passwd")
+        .expect("the static passwd path is a valid debugfs path");
+    let command = format!("cat {quoted_path}");
+    let mut last_error = None;
+
+    for candidate in e2fs_tool_candidates("debugfs") {
+        let label = candidate.display().to_string();
+        match Command::new(&candidate)
+            .arg("-R")
+            .arg(&command)
+            .arg(image_path)
+            .output()
+        {
+            Ok(output) if output.status.success() => {
+                let passwd = String::from_utf8(output.stdout).map_err(|error| {
+                    format!(
+                        "read /etc/passwd from {} as UTF-8: {error}",
+                        image_path.display()
+                    )
+                })?;
+                return parse_sandbox_guest_user_ids(&passwd, &image_path.display().to_string());
+            }
+            Ok(output) => {
+                last_error = Some(format!(
+                    "{label} failed with status {}\nstdout: {}\nstderr: {}",
+                    output.status,
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                ));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                last_error = Some(format!("{label} not found"));
+            }
+            Err(error) => last_error = Some(format!("run {label}: {error}")),
+        }
+    }
+
+    Err(format!(
+        "debugfs command '{command}' failed for {}: {}. Install e2fsprogs (debugfs) and retry",
+        image_path.display(),
+        last_error.unwrap_or_else(|| "debugfs not found".to_string())
+    ))
+}
+
 fn sandbox_guest_user_ids(rootfs: &Path) -> Result<Option<(u32, u32)>, String> {
     let passwd_path = rootfs.join("etc/passwd");
     if !passwd_path.exists() {
@@ -665,6 +715,10 @@ fn sandbox_guest_user_ids(rootfs: &Path) -> Result<Option<(u32, u32)>, String> {
 
     let passwd = fs::read_to_string(&passwd_path)
         .map_err(|e| format!("read {}: {e}", passwd_path.display()))?;
+    parse_sandbox_guest_user_ids(&passwd, &passwd_path.display().to_string())
+}
+
+fn parse_sandbox_guest_user_ids(passwd: &str, source: &str) -> Result<Option<(u32, u32)>, String> {
     for line in passwd.lines() {
         let mut parts = line.split(':');
         if parts.next() != Some("sandbox") {
@@ -673,14 +727,14 @@ fn sandbox_guest_user_ids(rootfs: &Path) -> Result<Option<(u32, u32)>, String> {
         let _password = parts.next();
         let uid = parts
             .next()
-            .ok_or_else(|| format!("sandbox entry in {} is missing uid", passwd_path.display()))?
+            .ok_or_else(|| format!("sandbox entry in {source} is missing uid"))?
             .parse::<u32>()
-            .map_err(|e| format!("sandbox uid in {} is invalid: {e}", passwd_path.display()))?;
+            .map_err(|e| format!("sandbox uid in {source} is invalid: {e}"))?;
         let gid = parts
             .next()
-            .ok_or_else(|| format!("sandbox entry in {} is missing gid", passwd_path.display()))?
+            .ok_or_else(|| format!("sandbox entry in {source} is missing gid"))?
             .parse::<u32>()
-            .map_err(|e| format!("sandbox gid in {} is invalid: {e}", passwd_path.display()))?;
+            .map_err(|e| format!("sandbox gid in {source} is invalid: {e}"))?;
         return Ok(Some((uid, gid)));
     }
 
