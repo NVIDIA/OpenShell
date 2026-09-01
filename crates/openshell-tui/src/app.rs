@@ -1407,6 +1407,9 @@ impl App {
                 self.input_mode = InputMode::Command;
                 self.command_input.clear();
             }
+            KeyCode::Char('w') => {
+                self.cycle_workspace();
+            }
             KeyCode::Char('j') | KeyCode::Down => {
                 if self.provider_count > 0 && self.provider_selected < self.provider_count - 1 {
                     self.provider_selected += 1;
@@ -3823,6 +3826,32 @@ mod tests {
         };
 
         assert_eq!(gateway.source_label(), "unknown");
+    }
+
+    #[tokio::test]
+    async fn providers_workspace_shortcut_cycles_scope_and_resets_selections() {
+        let mut app = test_app();
+        app.screen = Screen::Dashboard;
+        app.focus = Focus::Providers;
+        app.workspace_names = vec!["default".to_string(), "team-b".to_string()];
+        app.provider_selected = 3;
+        app.sandbox_selected = 4;
+
+        app.handle_key(key(KeyCode::Char('w')));
+
+        assert_eq!(app.current_workspace, "team-b");
+        assert!(!app.all_workspaces);
+        assert_eq!(app.provider_selected, 0);
+        assert_eq!(app.sandbox_selected, 0);
+        assert!(app.pending_workspace_refresh);
+
+        app.handle_key(key(KeyCode::Char('w')));
+        assert!(app.all_workspaces);
+        assert_eq!(app.workspace_display(), "all");
+
+        app.handle_key(key(KeyCode::Char('w')));
+        assert!(!app.all_workspaces);
+        assert_eq!(app.current_workspace, "default");
     }
 
     // -- selected_sandbox_workspace ----------------------------------------
