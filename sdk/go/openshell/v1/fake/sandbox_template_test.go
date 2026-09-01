@@ -27,6 +27,22 @@ func testSandboxWorkloadTemplate(name string) *types.SandboxWorkloadTemplate {
 	}
 }
 
+func TestIsDNS1123Label(t *testing.T) {
+	tests := map[string]bool{
+		"":                      false,
+		"gpu-kata":              true,
+		"Invalid_Template_Name": false,
+		"-gpu":                  false,
+		"gpu-":                  false,
+		"gpu--kata":             false,
+		"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa": false,
+	}
+
+	for name, want := range tests {
+		assert.Equal(t, want, isDNS1123Label(name), "name %q", name)
+	}
+}
+
 func TestSandboxTemplate_CreateGetListDelete(t *testing.T) {
 	tc := newTestSandboxTemplateClient()
 	ctx := context.Background()

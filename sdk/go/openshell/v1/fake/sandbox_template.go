@@ -255,7 +255,7 @@ func paginateSandboxWorkloadTemplates(
 }
 
 func isDNS1123Label(name string) bool {
-	if len(name) > 63 || name[0] == '-' || name[len(name)-1] == '-' {
+	if len(name) == 0 || len(name) > 63 || name[0] == '-' || name[len(name)-1] == '-' {
 		return false
 	}
 	previousHyphen := false
