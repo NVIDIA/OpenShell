@@ -153,7 +153,7 @@ openshell sandbox create --from my-registry.example.com/my-image:latest
 
 Bare names such as `base` and `ollama` resolve to images under `ghcr.io/nvidia/openshell-community/sandboxes`. Set `OPENSHELL_COMMUNITY_REGISTRY` when you need to use an internal mirror.
 
-Local directories and Dockerfiles require a local gateway because the CLI builds
+Local directories, Dockerfiles, Containerfiles, or custom build files require a local gateway because the CLI builds
 through the local Docker daemon. Use a registry image reference for remote
 gateways.
 
