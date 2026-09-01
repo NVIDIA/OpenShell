@@ -61,13 +61,11 @@ scanners upload results directly:
   NVIDIA endpoint. Results are uploaded against the candidate commit on `main`
   under a category shared by the train, for example
   `codex-security/v0.1.1`, so later candidates replace earlier analyses. The
-  job summary reports token usage and estimates inference cost using the rates
-  declared in the workflow. Codex Security 0.1.24 cannot enforce `--max-cost`
-  for the slash-qualified NVIDIA model identifier, so the workflow relies on
-  its timeout, serialized concurrency, and the inference account's spend
-  controls. Raw reports are not retained as workflow artifacts. Pre-release
-  creation and stable-promotion enforcement remain part of RFC 0014 and are not
-  implemented by this workflow.
+  slash-qualified NVIDIA model identifier prevents Codex Security 0.1.24 from
+  enforcing `--max-cost`, so the workflow relies on its timeout, serialized
+  concurrency, and the inference account's spend controls. Raw reports are not
+  retained as workflow artifacts. Pre-release creation and stable-promotion
+  enforcement remain part of RFC 0014 and are not implemented by this workflow.
 
 Findings do not fail these workflows. Tool startup, configuration, build, and
 analysis failures still fail so a broken scanner cannot appear healthy. The

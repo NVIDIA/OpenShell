@@ -358,10 +358,7 @@ a pull request or merge group.
   CLI-enforced cost ceiling. Spend is bounded instead by the 120-minute job
   timeout, a single repository-wide concurrency group that serializes
   qualification so starting a newer candidate cancels an in-flight one, and
-  NVIDIA account-side controls. After the scan the workflow derives an estimated
-  cost from the reported token usage and the per-million rates declared in the
-  workflow (input `2.94`, cached input `0.29`, output `14.68` USD) and reports it
-  in the job summary. No raw report is retained.
+  NVIDIA account-side controls. No raw report is retained.
 
 Findings never fail these checks; scanner and build failures do. A scanner that
 cannot run, a CodeQL analyzer that does not complete, an unexpected Dependency
