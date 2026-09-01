@@ -107,6 +107,30 @@ pub struct ObjectRecord {
     pub resource_version: u64,
 }
 
+/// Stable position in the global object-listing order.
+///
+/// Keyset consumers must use the matching store method for the order encoded
+/// here: workspace-scoped lists use `created_at_ms`, `name`, and `id`; global
+/// lists additionally include `workspace`.
+#[derive(Debug, Clone)]
+pub struct ObjectCursor {
+    pub created_at_ms: i64,
+    pub name: String,
+    pub workspace: String,
+    pub id: String,
+}
+
+impl From<&ObjectRecord> for ObjectCursor {
+    fn from(record: &ObjectRecord) -> Self {
+        Self {
+            created_at_ms: record.created_at_ms,
+            name: record.name.clone(),
+            workspace: record.workspace.clone(),
+            id: record.id.clone(),
+        }
+    }
+}
+
 /// Write condition for compare-and-swap operations.
 #[derive(Debug, Clone, Copy)]
 pub enum WriteCondition {
@@ -519,6 +543,46 @@ impl Store {
         offset: u32,
     ) -> PersistenceResult<Vec<ObjectRecord>> {
         store_dispatch_traced!(self.list_by_type(object_type, limit, offset))
+    }
+
+    /// List workspace objects after a stable cursor, without offset drift.
+    #[tracing::instrument(
+        name = "store",
+        skip_all,
+        fields(
+            otel.name = "store.list_after",
+            otel.status_code = tracing::field::Empty,
+            object_type = %object_type,
+            workspace = %workspace,
+        )
+    )]
+    pub async fn list_after(
+        &self,
+        object_type: &str,
+        workspace: &str,
+        after: Option<&ObjectCursor>,
+        limit: u32,
+    ) -> PersistenceResult<Vec<ObjectRecord>> {
+        store_dispatch_traced!(self.list_after(object_type, workspace, after, limit))
+    }
+
+    /// List objects across workspaces after a stable cursor, without offset drift.
+    #[tracing::instrument(
+        name = "store",
+        skip_all,
+        fields(
+            otel.name = "store.list_by_type_after",
+            otel.status_code = tracing::field::Empty,
+            object_type = %object_type,
+        )
+    )]
+    pub async fn list_by_type_after(
+        &self,
+        object_type: &str,
+        after: Option<&ObjectCursor>,
+        limit: u32,
+    ) -> PersistenceResult<Vec<ObjectRecord>> {
+        store_dispatch_traced!(self.list_by_type_after(object_type, after, limit))
     }
 
     /// List objects by type and application-owned scope.

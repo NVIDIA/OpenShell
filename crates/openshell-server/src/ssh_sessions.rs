@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tracing::{info, warn};
 
-use crate::persistence::{ObjectType, Store};
+use crate::persistence::{ObjectCursor, ObjectType, Store};
 
 const SESSION_REAPER_PAGE_SIZE: u32 = 1000;
 
@@ -50,7 +50,7 @@ where
 {
     let now_ms = now_ms();
     let started = std::time::Instant::now();
-    let mut offset = 0_u32;
+    let mut cursor = None;
     let mut page_number = 0_usize;
     let mut scanned = 0_usize;
     let mut decode_failures = 0_usize;
@@ -58,12 +58,17 @@ where
 
     loop {
         let records = store
-            .list_by_type(SshSession::object_type(), SESSION_REAPER_PAGE_SIZE, offset)
+            .list_by_type_after(
+                SshSession::object_type(),
+                cursor.as_ref(),
+                SESSION_REAPER_PAGE_SIZE,
+            )
             .await
             .map_err(|e| e.to_string())?;
         let page_len = records.len();
         scanned += page_len;
 
+        cursor = records.last().map(ObjectCursor::from);
         for record in records {
             let Ok(session) = SshSession::decode(record.payload.as_slice()) else {
                 decode_failures += 1;
@@ -79,11 +84,6 @@ where
         }
         page_number += 1;
         after_page(page_number).await;
-        let page_len = u32::try_from(page_len)
-            .map_err(|_| "SSH session reaper page length overflow".to_string())?;
-        offset = offset
-            .checked_add(page_len)
-            .ok_or_else(|| "SSH session reaper pagination overflow".to_string())?;
     }
 
     let matched = session_ids.len();

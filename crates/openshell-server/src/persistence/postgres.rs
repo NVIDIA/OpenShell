@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::{
-    DraftChunkRecord, ObjectRecord, PersistenceError, PersistenceResult, PolicyRecord,
-    WriteCondition, WriteResult, current_time_ms, map_db_error, map_migrate_error,
+    DraftChunkRecord, ObjectCursor, ObjectRecord, PersistenceError, PersistenceResult,
+    PolicyRecord, WriteCondition, WriteResult, current_time_ms, map_db_error, map_migrate_error,
 };
 use crate::policy_store::{
     AtomicPolicyRevisionWrite, draft_chunk_payload_from_record, draft_chunk_record_from_parts,
@@ -520,6 +520,33 @@ LIMIT $2 OFFSET $3
         .await
         .map_err(|e| map_db_error(&e))?;
 
+        Ok(rows.into_iter().map(row_to_object_record).collect())
+    }
+    pub async fn list_after(
+        &self,
+        object_type: &str,
+        workspace: &str,
+        after: Option<&ObjectCursor>,
+        limit: u32,
+    ) -> PersistenceResult<Vec<ObjectRecord>> {
+        let rows = if let Some(cursor) = after {
+            sqlx::query("SELECT object_type, id, name, workspace, payload, created_at_ms, updated_at_ms, labels, resource_version FROM objects WHERE object_type = $1 AND workspace = $2 AND (created_at_ms, name, id) > ($3, $4, $5) ORDER BY created_at_ms, name, id LIMIT $6").bind(object_type).bind(workspace).bind(cursor.created_at_ms).bind(&cursor.name).bind(&cursor.id).bind(i64::from(limit)).fetch_all(&self.pool).await
+        } else {
+            sqlx::query("SELECT object_type, id, name, workspace, payload, created_at_ms, updated_at_ms, labels, resource_version FROM objects WHERE object_type = $1 AND workspace = $2 ORDER BY created_at_ms, name, id LIMIT $3").bind(object_type).bind(workspace).bind(i64::from(limit)).fetch_all(&self.pool).await
+        }.map_err(|e| map_db_error(&e))?;
+        Ok(rows.into_iter().map(row_to_object_record).collect())
+    }
+    pub async fn list_by_type_after(
+        &self,
+        object_type: &str,
+        after: Option<&ObjectCursor>,
+        limit: u32,
+    ) -> PersistenceResult<Vec<ObjectRecord>> {
+        let rows = if let Some(cursor) = after {
+            sqlx::query("SELECT object_type, id, name, workspace, payload, created_at_ms, updated_at_ms, labels, resource_version FROM objects WHERE object_type = $1 AND (created_at_ms, name, workspace, id) > ($2, $3, $4, $5) ORDER BY created_at_ms, name, workspace, id LIMIT $6").bind(object_type).bind(cursor.created_at_ms).bind(&cursor.name).bind(&cursor.workspace).bind(&cursor.id).bind(i64::from(limit)).fetch_all(&self.pool).await
+        } else {
+            sqlx::query("SELECT object_type, id, name, workspace, payload, created_at_ms, updated_at_ms, labels, resource_version FROM objects WHERE object_type = $1 ORDER BY created_at_ms, name, workspace, id LIMIT $2").bind(object_type).bind(i64::from(limit)).fetch_all(&self.pool).await
+        }.map_err(|e| map_db_error(&e))?;
         Ok(rows.into_iter().map(row_to_object_record).collect())
     }
 

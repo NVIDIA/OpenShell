@@ -20,8 +20,8 @@ pub use vm::VmComputeConfig;
 use crate::grpc::policy::SANDBOX_SETTINGS_OBJECT_TYPE;
 use crate::otel_tracing::TraceContextInterceptor;
 use crate::persistence::{
-    DRAFT_CHUNK_OBJECT_TYPE, ObjectId, ObjectName, ObjectRecord, ObjectType, POLICY_OBJECT_TYPE,
-    Store, WriteCondition,
+    DRAFT_CHUNK_OBJECT_TYPE, ObjectCursor, ObjectId, ObjectName, ObjectRecord, ObjectType,
+    POLICY_OBJECT_TYPE, Store, WriteCondition,
 };
 use crate::sandbox_index::SandboxIndex;
 use crate::sandbox_watch::SandboxWatchBus;
@@ -3085,7 +3085,7 @@ impl ComputeRuntime {
         workspace: &str,
     ) -> Result<(), String> {
         let started = Instant::now();
-        let mut offset = 0_u32;
+        let mut cursor = None;
         let mut scanned = 0_usize;
         let mut decode_failures = 0_usize;
         let mut session_ids = Vec::new();
@@ -3093,17 +3093,18 @@ impl ComputeRuntime {
         loop {
             let records = self
                 .store
-                .list(
+                .list_after(
                     SshSession::object_type(),
                     workspace,
+                    cursor.as_ref(),
                     LIFECYCLE_SWEEP_PAGE_SIZE,
-                    offset,
                 )
                 .await
                 .map_err(|e| format!("list SSH sessions: {e}"))?;
             let page_len = records.len();
             scanned += page_len;
 
+            cursor = records.last().map(ObjectCursor::from);
             for record in records {
                 match SshSession::decode(record.payload.as_slice()) {
                     Ok(session) if session.sandbox_id == sandbox_id => {
@@ -3117,11 +3118,6 @@ impl ComputeRuntime {
             if page_len < LIFECYCLE_SWEEP_PAGE_SIZE as usize {
                 break;
             }
-            let page_len = u32::try_from(page_len)
-                .map_err(|_| "SSH session cleanup page length overflow".to_string())?;
-            offset = offset
-                .checked_add(page_len)
-                .ok_or_else(|| "SSH session cleanup pagination overflow".to_string())?;
         }
 
         let matched = session_ids.len();
