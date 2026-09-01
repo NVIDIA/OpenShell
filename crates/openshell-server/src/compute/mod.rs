@@ -1418,11 +1418,15 @@ impl ComputeRuntime {
                     || driver_snapshot_confirms_stopped(&snapshot);
                 let suspension_progressing =
                     expected_stopped && driver_snapshot_confirms_stopping(&snapshot);
-                if suspension_progressing {
+                let runtime_restart_during_stop =
+                    expected_stopped && driver_snapshot_reports_runtime_restart(&snapshot);
+                if suspension_progressing || runtime_restart_during_stop {
                     // The Kubernetes controller has accepted the stop and
-                    // is waiting for its pod to terminate. Preserve the
-                    // durable transition so a later watch event can complete
-                    // it instead of claiming the sandbox is running again.
+                    // is waiting for its pod to terminate. A container
+                    // runtime restart can likewise be the expected SIGTERM
+                    // exit from an in-flight stop. Preserve the durable
+                    // transition so completion or recovery, rather than the
+                    // watcher, determines its terminal state.
                     debug!(sandbox_id, "Sandbox stop is still progressing");
                 } else if backend_phase == SandboxPhase::Error
                     || observed_stopped == expected_stopped
@@ -4020,8 +4024,11 @@ fn apply_driver_snapshot(sandbox: &mut Sandbox, incoming: &DriverSandbox, sessio
 
     // Infrastructure errors and successful main-process completions are
     // sticky until an explicit lifecycle operation changes desired state. A
-    // late backend snapshot must not revive either result.
-    if matches!(old_phase, SandboxPhase::Error | SandboxPhase::Completed) {
+    // late signal-exit snapshot must also not overwrite the terminal reason
+    // recorded by a completed explicit stop.
+    if matches!(old_phase, SandboxPhase::Error | SandboxPhase::Completed)
+        || (old_phase == SandboxPhase::Stopped && driver_snapshot_reports_runtime_restart(incoming))
+    {
         if let Some(metadata) = sandbox.metadata.as_mut() {
             metadata.name.clone_from(sandbox_name);
         }
@@ -4058,6 +4065,13 @@ fn apply_driver_snapshot(sandbox: &mut Sandbox, incoming: &DriverSandbox, sessio
     );
 
     phase = match old_phase {
+        // SIGTERM-driven runtime exits are reported as a runtime restart by
+        // Docker and Podman. While an explicit stop owns this durable
+        // transition, preserve Stopping so the stop result chooses whether
+        // the sandbox actually reached Stopped or needs recovery.
+        SandboxPhase::Stopping if driver_snapshot_reports_runtime_restart(incoming) => {
+            SandboxPhase::Stopping
+        }
         SandboxPhase::Stopping
             if phase == SandboxPhase::Stopped || driver_snapshot_confirms_stopped(incoming) =>
         {
@@ -4135,6 +4149,17 @@ fn driver_snapshot_confirms_stopped(incoming: &DriverSandbox) -> bool {
                     condition.reason.to_ascii_lowercase().as_str(),
                     "containerexited" | "containerstopped"
                 )
+        })
+    })
+}
+
+fn driver_snapshot_reports_runtime_restart(incoming: &DriverSandbox) -> bool {
+    incoming.status.as_ref().is_some_and(|status| {
+        status.conditions.iter().any(|condition| {
+            condition.status.eq_ignore_ascii_case("false")
+                && condition
+                    .reason
+                    .eq_ignore_ascii_case("ContainerRuntimeRestart")
         })
     })
 }
@@ -6771,6 +6796,103 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn explicit_stop_completes_after_term_runtime_restart() {
+        let driver = ControlledDriver::new();
+        driver.block_stop();
+        let runtime = test_runtime(driver.clone()).await;
+        let sandbox = sandbox_record("sb-term-stop", "sandbox-term-stop", SandboxPhase::Ready);
+        runtime.store.put_message(&sandbox).await.unwrap();
+
+        let stop_runtime = runtime.clone();
+        let stop = tokio::spawn(async move {
+            stop_runtime
+                .stop_sandbox("default", "sandbox-term-stop")
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), driver.stop_started.notified())
+            .await
+            .expect("stop did not reach the driver");
+
+        let mut runtime_restart = ready_driver_sandbox(sandbox.object_id(), sandbox.object_name());
+        runtime_restart.status = Some(make_driver_status(make_driver_condition(
+            "ContainerRuntimeRestart",
+            "container exited with status 143",
+        )));
+        runtime.apply_sandbox_update(runtime_restart).await.unwrap();
+
+        let stopping = runtime
+            .store
+            .get_message::<Sandbox>(sandbox.object_id())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stopping.phase(), SandboxPhase::Stopping as i32);
+        assert_eq!(
+            stopping.status.unwrap().conditions[0].reason,
+            "ContainerRuntimeRestart"
+        );
+
+        driver.release_stop();
+        let stopped = tokio::time::timeout(Duration::from_secs(1), stop)
+            .await
+            .expect("stop did not finish")
+            .unwrap()
+            .unwrap();
+        assert_eq!(stopped.phase(), SandboxPhase::Stopped as i32);
+        assert_eq!(stopped.status.unwrap().conditions[0].reason, "Stopped");
+    }
+
+    #[tokio::test]
+    async fn failed_stop_does_not_report_term_runtime_restart_as_stopped() {
+        let driver = ControlledDriver::new();
+        driver.block_stop();
+        driver.set_stop_outcome(ControlledLifecycleOutcome::Error("stop timed out"));
+        let runtime = test_runtime(driver.clone()).await;
+        let sandbox = sandbox_record("sb-term-fail", "sandbox-term-fail", SandboxPhase::Ready);
+        runtime.store.put_message(&sandbox).await.unwrap();
+
+        let stop_runtime = runtime.clone();
+        let stop = tokio::spawn(async move {
+            stop_runtime
+                .stop_sandbox("default", "sandbox-term-fail")
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), driver.stop_started.notified())
+            .await
+            .expect("stop did not reach the driver");
+
+        let mut runtime_restart = ready_driver_sandbox(sandbox.object_id(), sandbox.object_name());
+        runtime_restart.status = Some(make_driver_status(make_driver_condition(
+            "ContainerRuntimeRestart",
+            "container exited with status 143",
+        )));
+        driver.set_get_outcome(ControlledGetOutcome::Sandbox(Box::new(
+            runtime_restart.clone(),
+        )));
+        runtime.apply_sandbox_update(runtime_restart).await.unwrap();
+
+        driver.release_stop();
+        let err = tokio::time::timeout(Duration::from_secs(1), stop)
+            .await
+            .expect("stop did not finish")
+            .unwrap()
+            .unwrap_err();
+        assert!(err.message().contains("stop timed out"));
+
+        let stored = runtime
+            .store
+            .get_message::<Sandbox>(sandbox.object_id())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.phase(), SandboxPhase::Stopping as i32);
+        assert_eq!(
+            stored.status.unwrap().conditions[0].reason,
+            "ContainerRuntimeRestart"
+        );
+    }
+
+    #[tokio::test]
     async fn request_cancellation_does_not_cancel_start_worker() {
         let driver = ControlledDriver::new();
         driver.block_start();
@@ -8358,6 +8480,73 @@ mod tests {
         let status = stored.status.unwrap();
         assert_eq!(status.main_process_instance_id, "instance-1");
         assert_eq!(status.exit_code, None);
+    }
+
+    #[tokio::test]
+    async fn unexpected_term_runtime_restart_transitions_to_error() {
+        let runtime = test_runtime(Arc::new(TestDriver::default())).await;
+        let sandbox = sandbox_record("sb-term-exit", "sandbox-term-exit", SandboxPhase::Ready);
+        runtime.store.put_message(&sandbox).await.unwrap();
+        let mut runtime_restart = ready_driver_sandbox(sandbox.object_id(), sandbox.object_name());
+        runtime_restart.status = Some(make_driver_status(make_driver_condition(
+            "ContainerRuntimeRestart",
+            "container exited with status 143",
+        )));
+
+        runtime.apply_sandbox_update(runtime_restart).await.unwrap();
+
+        let stored = runtime
+            .store
+            .get_message::<Sandbox>(sandbox.object_id())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.phase(), SandboxPhase::Error as i32);
+        assert_eq!(
+            stored.status.unwrap().conditions[0].reason,
+            "ContainerRuntimeRestart"
+        );
+    }
+
+    #[tokio::test]
+    async fn late_term_runtime_restart_preserves_intentional_stop_status() {
+        let runtime = test_runtime(Arc::new(TestDriver::default())).await;
+        let mut sandbox = sandbox_record(
+            "sb-term-stopped",
+            "sandbox-term-stopped",
+            SandboxPhase::Stopped,
+        );
+        sandbox.status = Some(SandboxStatus {
+            sandbox_name: sandbox.object_name().to_string(),
+            phase: SandboxPhase::Stopped as i32,
+            conditions: vec![SandboxCondition {
+                r#type: "Ready".to_string(),
+                status: "False".to_string(),
+                reason: "Stopped".to_string(),
+                message: "Sandbox compute is stopped".to_string(),
+                last_transition_time: String::new(),
+            }],
+            ..Default::default()
+        });
+        runtime.store.put_message(&sandbox).await.unwrap();
+        let mut runtime_restart = ready_driver_sandbox(sandbox.object_id(), sandbox.object_name());
+        runtime_restart.status = Some(make_driver_status(make_driver_condition(
+            "ContainerRuntimeRestart",
+            "container exited with status 143",
+        )));
+
+        runtime.apply_sandbox_update(runtime_restart).await.unwrap();
+
+        let stored = runtime
+            .store
+            .get_message::<Sandbox>(sandbox.object_id())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.phase(), SandboxPhase::Stopped as i32);
+        let ready = &stored.status.unwrap().conditions[0];
+        assert_eq!(ready.reason, "Stopped");
+        assert_eq!(ready.message, "Sandbox compute is stopped");
     }
 
     #[tokio::test]
