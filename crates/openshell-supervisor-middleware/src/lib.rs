@@ -5,7 +5,14 @@
 
 pub mod headers;
 mod remote;
+mod response;
 mod websocket;
+
+pub use response::{
+    HttpResponseFinish, HttpResponseInvocation, HttpResponseInvocationOutcome,
+    HttpResponseMiddlewareFailure, HttpResponsePreflightInput, HttpResponsePreflightOutcome,
+    HttpResponseSession, MAX_HTTP_RESPONSE_STREAM_UNIT_BYTES,
+};
 
 pub use websocket::{
     WebSocketCoverage, WebSocketCoverageState, WebSocketInvocation, WebSocketInvocationOutcome,
@@ -624,6 +631,16 @@ impl MiddlewareDispatch {
         match self {
             Self::InProcess(service) => service.open_websocket_session(receiver).await,
             Self::Grpc(service) => service.open_websocket_session(receiver).await,
+        }
+    }
+
+    async fn open_http_response_pre_return(
+        &self,
+        receiver: tokio::sync::mpsc::Receiver<openshell_core::proto::HttpResponseEvent>,
+    ) -> std::result::Result<HttpResponseResultStream, tonic::Status> {
+        match self {
+            Self::InProcess(service) => service.open_http_response_pre_return(receiver).await,
+            Self::Grpc(service) => service.open_http_response_pre_return(receiver).await,
         }
     }
 }
