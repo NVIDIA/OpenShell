@@ -456,7 +456,7 @@ mise run docs
 
 PRs that touch `docs/**` or `fern/**` are validated by `.github/workflows/branch-docs.yml`, and they get a preview when `FERN_TOKEN` is available to the workflow.
 
-Fern docs publishing is handled by the `publish-fern-docs` job in `.github/workflows/release-tag.yml` when a release tag is created.
+Fern docs publishing is handled by the `publish-fern-docs` job in `.github/workflows/release-tag.yml` when a stable release tag is created.
 
 `docs/` is the source-of-truth docs tree. `fern/` contains the site config, components, and theme assets that publish those pages.
 

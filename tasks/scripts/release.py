@@ -12,8 +12,10 @@ import subprocess
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
-SEMVER_TAG_GLOB = "v[0-9]*.[0-9]*.[0-9]*"
 SEMVER_TAG_RE = re.compile(r"^v?(?P<major>\d+)\.(?P<minor>\d+)\.(?P<patch>\d+)$")
+PRERELEASE_TAG_RE = re.compile(
+    r"^v?(?P<major>\d+)\.(?P<minor>\d+)\.(?P<patch>\d+)-pre\.(?P<sequence>[1-9]\d*)$"
+)
 
 
 @dataclass(frozen=True)
@@ -66,6 +68,18 @@ def _parse_semver_tag(tag: str) -> tuple[int, int, int] | None:
     )
 
 
+def _parse_prerelease_tag(tag: str) -> tuple[int, int, int, int] | None:
+    match = PRERELEASE_TAG_RE.match(tag)
+    if match is None:
+        return None
+    return (
+        int(match.group("major")),
+        int(match.group("minor")),
+        int(match.group("patch")),
+        int(match.group("sequence")),
+    )
+
+
 def _format_semver(version: tuple[int, int, int]) -> str:
     return f"{version[0]}.{version[1]}.{version[2]}"
 
@@ -74,17 +88,22 @@ def _next_patch(version: tuple[int, int, int]) -> tuple[int, int, int]:
     return version[0], version[1], version[2] + 1
 
 
-def _latest_semver_tag() -> str | None:
-    try:
-        tag = _git(
-            ["describe", "--tags", "--match", SEMVER_TAG_GLOB, "--abbrev=0", "HEAD"]
-        )
-    except subprocess.CalledProcessError:
-        return None
+def _exact_release_tag() -> str | None:
+    tags = _git(["tag", "--points-at", "HEAD"]).splitlines()
+    stable = [(version, tag) for tag in tags if (version := _parse_semver_tag(tag))]
+    if stable:
+        return max(stable)[1]
 
-    if _parse_semver_tag(tag) is None:
-        raise RuntimeError(f"git describe returned non-semver release tag: {tag}")
-    return tag
+    prereleases = [
+        (version, tag) for tag in tags if (version := _parse_prerelease_tag(tag))
+    ]
+    return max(prereleases)[1] if prereleases else None
+
+
+def _latest_stable_tag() -> str | None:
+    tags = _git(["tag", "--merged", "HEAD", "--list", "v*.*.*"]).splitlines()
+    stable = [(version, tag) for tag in tags if (version := _parse_semver_tag(tag))]
+    return max(stable)[1] if stable else None
 
 
 def _versions_from_parts(
@@ -142,10 +161,45 @@ def _versions_from_parts(
     )
 
 
-def _compute_versions() -> Versions:
-    git_tag = _latest_semver_tag()
-    git_sha = _git(["rev-parse", "--short=9", "HEAD"])
+def _versions_from_prerelease(
+    base_version: tuple[int, int, int],
+    sequence: int,
+    git_sha: str,
+    git_tag: str,
+) -> Versions:
+    version = f"{_format_semver(base_version)}-pre.{sequence}"
+    return Versions(
+        python=version,
+        cargo=version,
+        npm=version,
+        docker=version,
+        deb=f"{_format_semver(base_version)}~pre.{sequence}-1",
+        snap=version,
+        rpm_version=_format_semver(base_version),
+        rpm_release=f"0.pre.{sequence}",
+        git_tag=git_tag,
+        git_sha=git_sha,
+        git_distance=0,
+    )
 
+
+def _compute_versions() -> Versions:
+    git_sha = _git(["rev-parse", "--short=9", "HEAD"])
+    exact_tag = _exact_release_tag()
+
+    if exact_tag is not None:
+        stable = _parse_semver_tag(exact_tag)
+        if stable is not None:
+            return _versions_from_parts(stable, 0, git_sha, exact_tag)
+
+        prerelease = _parse_prerelease_tag(exact_tag)
+        if prerelease is None:
+            raise RuntimeError(f"invalid semantic release tag: {exact_tag}")
+        return _versions_from_prerelease(
+            prerelease[:3], prerelease[3], git_sha, exact_tag
+        )
+
+    git_tag = _latest_stable_tag()
     if git_tag is None:
         base_version = (0, 0, 0)
         git_distance = int(_git(["rev-list", "--count", "HEAD"]))

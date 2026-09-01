@@ -17,6 +17,11 @@ on:
         required: true
         type: string
         description: "GitHub deployment environment for approval gates (e.g., latest/edge, latest/stable)"
+      publish:
+        required: false
+        type: boolean
+        default: true
+        description: "Whether to upload the built snap to the Snap Store"
 
     secrets:
       publish-credentials:
@@ -161,6 +166,7 @@ jobs:
           retention-days: 5
 
       - name: Upload snap to Snap Store
+        if: inputs.publish
         env:
           SNAPCRAFT_STORE_CREDENTIALS: ${{ secrets.publish-credentials }}
           INPUTS_UPLOAD_CHANNEL: ${{ inputs.upload-channel }}

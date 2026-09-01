@@ -49,6 +49,7 @@ jobs:
       semver: ${{ steps.v.outputs.semver }}
       # Commit resolved from RELEASE_TAG, used for image tags and downstream metadata
       source_sha: ${{ steps.v.outputs.source_sha }}
+      is_prerelease: ${{ steps.v.outputs.is_prerelease }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -65,14 +66,25 @@ jobs:
         id: v
         run: |
           set -euo pipefail
-          echo "python=$(uv run python tasks/scripts/release.py get-version --python)" >> "$GITHUB_OUTPUT"
-          echo "cargo=$(uv run python tasks/scripts/release.py get-version --cargo)" >> "$GITHUB_OUTPUT"
-          echo "npm=$(uv run python tasks/scripts/release.py get-version --npm)" >> "$GITHUB_OUTPUT"
-          echo "deb=$(uv run python tasks/scripts/release.py get-version --deb)" >> "$GITHUB_OUTPUT"
-          echo "rpm_version=$(uv run python tasks/scripts/release.py get-version --rpm-version)" >> "$GITHUB_OUTPUT"
-          echo "rpm_release=$(uv run python tasks/scripts/release.py get-version --rpm-release)" >> "$GITHUB_OUTPUT"
-          echo "semver=${RELEASE_TAG#v}" >> "$GITHUB_OUTPUT"
-          echo "source_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          if [[ "${RELEASE_TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-pre\.[1-9][0-9]*$ ]]; then
+            is_prerelease=true
+          elif [[ "${RELEASE_TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            is_prerelease=false
+          else
+            echo "Unsupported release tag: ${RELEASE_TAG}" >&2
+            exit 1
+          fi
+          {
+            echo "is_prerelease=${is_prerelease}"
+            echo "python=$(uv run python tasks/scripts/release.py get-version --python)"
+            echo "cargo=$(uv run python tasks/scripts/release.py get-version --cargo)"
+            echo "npm=$(uv run python tasks/scripts/release.py get-version --npm)"
+            echo "deb=$(uv run python tasks/scripts/release.py get-version --deb)"
+            echo "rpm_version=$(uv run python tasks/scripts/release.py get-version --rpm-version)"
+            echo "rpm_release=$(uv run python tasks/scripts/release.py get-version --rpm-release)"
+            echo "semver=${RELEASE_TAG#v}"
+            echo "source_sha=$(git rev-parse HEAD)"
+          } >> "$GITHUB_OUTPUT"
 
   build-cli:
     needs: compute-versions
@@ -187,7 +199,7 @@ jobs:
       checkout-ref: ${{ inputs.tag || github.ref }}
 
   tag-ghcr-release:
-    name: Tag GHCR Images for Release
+    name: Tag GHCR Images
     needs: [compute-versions, build-gateway-image, build-supervisor-image, release]
     runs-on: linux-amd64-cpu8
     timeout-minutes: 10
@@ -195,22 +207,27 @@ jobs:
       - name: Log in to GHCR
         run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${GITHUB_ACTOR}" --password-stdin
 
-      - name: Tag images with version and latest
+      - name: Tag images with release version
+        env:
+          IS_PRERELEASE: ${{ needs.compute-versions.outputs.is_prerelease }}
         run: |
           set -euo pipefail
           REGISTRY="ghcr.io/nvidia/openshell"
           VERSION="${{ needs.compute-versions.outputs.semver }}"
           SOURCE_TAG="${{ needs.compute-versions.outputs.source_sha }}"
           for component in gateway supervisor; do
-            echo "Tagging ${REGISTRY}/${component}:${SOURCE_TAG} as ${VERSION} and latest..."
+            echo "Tagging ${REGISTRY}/${component}:${SOURCE_TAG} as ${VERSION}..."
             docker buildx imagetools create \
               --prefer-index=false \
               -t "${REGISTRY}/${component}:${VERSION}" \
               "${REGISTRY}/${component}:${SOURCE_TAG}"
-            docker buildx imagetools create \
-              --prefer-index=false \
-              -t "${REGISTRY}/${component}:latest" \
-              "${REGISTRY}/${component}:${SOURCE_TAG}"
+            if [[ "${IS_PRERELEASE}" != "true" ]]; then
+              echo "Tagging ${REGISTRY}/${component}:${SOURCE_TAG} as latest..."
+              docker buildx imagetools create \
+                --prefer-index=false \
+                -t "${REGISTRY}/${component}:latest" \
+                "${REGISTRY}/${component}:${SOURCE_TAG}"
+            fi
           done
 
   build-python-wheel:
@@ -266,8 +283,9 @@ jobs:
     uses: ./.github/workflows/snap-package.yml
     with:
       checkout-ref: ${{ inputs.tag || github.ref }}
-      upload-channel: latest/stable
-      github-environment: latest/stable
+      upload-channel: ${{ needs.compute-versions.outputs.is_prerelease == 'true' && 'latest/edge' || 'latest/stable' }}
+      github-environment: ${{ needs.compute-versions.outputs.is_prerelease == 'true' && 'latest/edge' || 'latest/stable' }}
+      publish: ${{ needs.compute-versions.outputs.is_prerelease != 'true' }}
     secrets:
       publish-credentials: ${{ secrets.SNAPCRAFT_STORE_CREDENTIALS }}
 
@@ -530,6 +548,7 @@ jobs:
           cat openshell-sandbox-checksums-sha256.txt
 
       - name: Generate Homebrew formula
+        if: needs.compute-versions.outputs.is_prerelease != 'true'
         run: |
           set -euo pipefail
           python3 tasks/scripts/release.py generate-homebrew-formula \
@@ -548,6 +567,7 @@ jobs:
             release/*.whl
 
       - name: Prune removed VM checksum asset
+        if: needs.compute-versions.outputs.is_prerelease != 'true'
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
         with:
           script: |
@@ -570,6 +590,7 @@ jobs:
             }
 
       - name: Create GitHub Release
+        if: needs.compute-versions.outputs.is_prerelease != 'true'
         uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
         with:
           name: OpenShell ${{ env.RELEASE_TAG }}
@@ -606,9 +627,19 @@ jobs:
             release/openshell-gateway-checksums-sha256.txt
             release/openshell-sandbox-checksums-sha256.txt
 
+      - name: Upload pre-release artifacts
+        if: needs.compute-versions.outputs.is_prerelease == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: openshell-${{ env.RELEASE_TAG }}
+          path: release/
+          retention-days: 90
+          if-no-files-found: error
+
   publish-fern-docs:
     name: Publish Fern Docs
-    needs: [release]
+    needs: [compute-versions, release]
+    if: needs.compute-versions.outputs.is_prerelease != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -635,6 +666,7 @@ jobs:
   publish-sdk-typescript:
     name: Publish TypeScript SDK
     needs: [compute-versions, release]
+    if: needs.compute-versions.outputs.is_prerelease != 'true'
     runs-on: linux-amd64-cpu8
     timeout-minutes: 15
     permissions:
@@ -673,6 +705,7 @@ jobs:
   release-helm:
     name: Release Helm Chart (OCI)
     needs: [compute-versions, release, tag-ghcr-release]
+    if: needs.compute-versions.outputs.is_prerelease != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -691,6 +724,7 @@ jobs:
   trigger-wheel-publish:
     name: Trigger Wheel Publish
     needs: [compute-versions, release]
+    if: needs.compute-versions.outputs.is_prerelease != 'true'
     runs-on: [self-hosted, nv]
     timeout-minutes: 10
     steps:
