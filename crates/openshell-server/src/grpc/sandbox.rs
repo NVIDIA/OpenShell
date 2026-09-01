@@ -4756,6 +4756,58 @@ mod tests {
         assert_eq!(count, u64::from(MAX_TEMPLATES_PER_WORKSPACE));
     }
 
+    #[test]
+    fn template_create_sandbox_spec_field_policy_is_exhaustive() {
+        assert_proto_fields_classified(
+            "openshell.v1.SandboxSpec",
+            &["policy", "providers", "command", "tty"],
+            &[
+                "log_level",
+                "environment",
+                "template",
+                "resource_requirements",
+            ],
+        );
+    }
+
+    fn assert_proto_fields_classified(
+        message_name: &str,
+        copied_from_create_request: &[&str],
+        rejected_template_workload_overrides: &[&str],
+    ) {
+        let pool = prost_reflect::DescriptorPool::decode(openshell_core::FILE_DESCRIPTOR_SET)
+            .expect("decode descriptor set");
+        let message = pool
+            .get_message_by_name(message_name)
+            .expect("message descriptor");
+        let classified: std::collections::HashSet<&str> = copied_from_create_request
+            .iter()
+            .chain(rejected_template_workload_overrides.iter())
+            .copied()
+            .collect();
+        let actual: std::collections::HashSet<String> = message
+            .fields()
+            .map(|field| field.name().to_string())
+            .collect();
+
+        for field in &actual {
+            assert!(
+                classified.contains(field.as_str()),
+                "{message_name}.{field} is not classified for template-backed sandbox creates. \
+                 Add it to copied_from_create_request when callers own the create-time value, \
+                 or to rejected_template_workload_overrides when the workload template owns it."
+            );
+        }
+
+        for field in classified {
+            assert!(
+                actual.contains(field),
+                "{message_name}.{field} is classified for template-backed sandbox creates, \
+                 but the proto field no longer exists"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn create_sandbox_from_workload_template_resolves_workload_and_preserves_governance() {
         let state = test_server_state().await;
