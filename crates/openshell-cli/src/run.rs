@@ -1545,7 +1545,7 @@ pub async fn sandbox_exec_grpc(
     let tty = tty_override
         .unwrap_or_else(|| std::io::stdin().is_terminal() && std::io::stdout().is_terminal());
 
-    if tty_override == Some(true) && std::io::stdin().is_terminal() {
+    if tty && std::io::stdin().is_terminal() {
         return sandbox_exec_interactive_grpc(
             client,
             &sandbox,
