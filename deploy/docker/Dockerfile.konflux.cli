@@ -20,7 +20,7 @@ ARG RUST_VERSION=1.92.0
 # ---------------------------------------------------------------------------
 # Build stage: compile CLI (fully-static glibc binary)
 # ---------------------------------------------------------------------------
-FROM registry.access.redhat.com/ubi9/ubi:9.6@sha256:dec374e05cc13ebbc0975c9f521f3db6942d27f8ccdf06b180160490eef8bdbc AS builder
+FROM registry.access.redhat.com/ubi9/ubi:9.8@sha256:25a147defd01e19674714f55d17538c8dbe55d8c305fa157ecc3f9c8977b05b6 AS builder
 
 ARG RUST_VERSION
 ARG TARGETARCH
@@ -73,7 +73,7 @@ RUN . /tmp/build-env && \
 # ---------------------------------------------------------------------------
 # Runtime
 # ---------------------------------------------------------------------------
-FROM registry.access.redhat.com/ubi9/ubi-minimal:9.6@sha256:34880b64c07f28f64d95737f82f891516de9a3b43583f39970f7bf8e4cfa48b7
+FROM registry.access.redhat.com/ubi9/ubi-minimal:9.8@sha256:7fbeae18dc9476399f565e68255f602a3374ea8614ba3d14843565131a13ff93
 
 RUN microdnf install -y --nodocs ca-certificates \
     && microdnf clean all

@@ -2,7 +2,7 @@
 # Build + runtime stages combined.
 #
 # Resolved with `context.bare: true` so the lockfile pins the full dependency
-# closure. The image installs RPMs into two different bases (the ubi:9.6 build
+# closure. The image installs RPMs into two different bases (the ubi:9.8 build
 # stage and the ubi-minimal runtime stage); bare guarantees every package is
 # pinned and prefetched regardless of which base already provides it.
 #
