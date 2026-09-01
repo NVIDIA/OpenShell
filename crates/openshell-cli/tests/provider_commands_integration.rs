@@ -1211,7 +1211,7 @@ async fn install_test_profile(ts: &TestServer, id: &str, credential_key: &str) {
 /// from the request workspace. The gateway treats it as immutable, so deriving
 /// it here would look like a change and be rejected.
 #[tokio::test]
-async fn provider_update_preserves_stored_type_when_readable() {
+async fn provider_update_preserves_stored_type_and_profile_workspace_when_readable() {
     let ts = run_server().await;
 
     run::provider_create(
