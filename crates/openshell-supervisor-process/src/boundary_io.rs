@@ -7,8 +7,8 @@
 //! in this crate on purpose: the SSH server and supervisor session that consume
 //! it are here, and so is the primitive it wraps
 //! ([`connect_in_netns`](crate::ssh::connect_in_netns)). The interface trait
-//! lives in the lower `openshell-isolation` crate, so this crate depends on the
-//! trait (process -> isolation -> core, acyclic) and the SSH server drives a
+//! lives in the lower `openshell-isolation-interface` crate, so this crate
+//! depends on the trait (process -> interface -> core, acyclic) and the SSH server drives a
 //! `&dyn BoundaryPortForward` without depending on the backend.
 //!
 //! The SSH server and supervisor session are wired to this through the
@@ -17,7 +17,7 @@
 //! and touches no consumer code.
 
 use async_trait::async_trait;
-use openshell_isolation::contract::{
+use openshell_isolation_interface::contract::{
     BackendError, BoundaryDuplexStream, BoundaryPortForward, LoopbackTarget,
 };
 use std::collections::HashMap;

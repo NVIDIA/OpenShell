@@ -4,15 +4,15 @@
 //! The in-pod binary-identity resolver (RFC 0012 runtime contract).
 //!
 //! RFC 0012 delivers executable identity on every
-//! [`MediatedConnection`](openshell_isolation::contract::MediatedConnection):
+//! [`MediatedConnection`](openshell_isolation_interface::contract::MediatedConnection):
 //! the backend resolves identity for the accepted connection before mediation.
 //! An unresolved identity denies that connection. This is the in-pod
 //! resolution mechanism — procfs, keyed by the workload-side TCP peer port —
 //! kept in this crate on purpose: the proxy that consumes identity is here, and
 //! so are procfs and the binary identity cache. Stronger backends may use a
 //! different resolution mechanism without changing the contract. The result
-//! type lives in the lower `openshell-isolation` crate (network -> isolation ->
-//! core, acyclic).
+//! type lives in the lower `openshell-isolation-interface` crate (network ->
+//! interface -> core, acyclic).
 //!
 //! The legacy listener still resolves identity in the proxy hot path. The RFC
 //! 0012 co-located source invokes this resolver before returning each accepted
@@ -21,7 +21,8 @@
 use std::sync::Arc;
 use std::sync::atomic::AtomicU32;
 
-use openshell_isolation::contract::{BinaryIdentity, ResolveError, Sha256Digest};
+use openshell_binary_identity::ProcfsIdentityResolver as SharedProcfsIdentityResolver;
+use openshell_isolation_interface::contract::{BinaryIdentity, ResolveError};
 
 /// In-pod binary-identity resolver: reads and hashes the executable resolved
 /// for an accepted connection from procfs. Resolution fails closed; it never
@@ -75,9 +76,10 @@ impl ProcfsIdentityResolver {
         let connection = crate::procfs::WorkloadProxyTcpConnection::new(workload_addr, proxy_addr);
         let owners = crate::procfs::resolve_tcp_peer_socket_owners(entrypoint_pid, connection)
             .map_err(|_| ResolveError::NotFound)?;
+        let resolver = SharedProcfsIdentityResolver::for_process_tree(entrypoint_pid);
         let mut identities = Vec::with_capacity(owners.owners.len());
         for owner in owners.owners {
-            identities.push(Self::resolve_owner(owner.pid, entrypoint_pid)?);
+            identities.push(resolver.resolve(owner.pid)?);
         }
         let Some(identity) = identities.first().cloned() else {
             return Err(ResolveError::NotFound);
@@ -93,40 +95,6 @@ impl ProcfsIdentityResolver {
             ));
         }
         Ok(identity)
-    }
-
-    fn resolve_owner(owner_pid: u32, entrypoint_pid: u32) -> Result<BinaryIdentity, ResolveError> {
-        let binary_path = crate::procfs::binary_path(owner_pid.cast_signed())
-            .map_err(|error| ResolveError::Failed(error.to_string()))?;
-
-        // Hash the live `/proc/<pid>/exe` object, not the reopened resolved
-        // path: opening the magic symlink pins the inode the process is actually
-        // executing, so a post-resolution swap of the path cannot launder the
-        // hash. A missing digest is `None`, never an empty string, and an
-        // unhashable binary fails closed rather than asserting an identity the
-        // resolver could not verify.
-        let exe = std::path::PathBuf::from(format!("/proc/{owner_pid}/exe"));
-        let binary_digest = match crate::procfs::file_sha256(&exe) {
-            Ok(digest) => Some(digest.parse::<Sha256Digest>()?),
-            Err(_) => {
-                return Err(ResolveError::Failed(
-                    "could not hash resolved executable; refusing to assert identity".to_string(),
-                ));
-            }
-        };
-
-        let ancestors = crate::procfs::collect_ancestor_binaries(owner_pid, entrypoint_pid);
-        let mut exclude = ancestors.clone();
-        exclude.push(binary_path.clone());
-        let cmdline_paths =
-            crate::procfs::collect_cmdline_paths(owner_pid, entrypoint_pid, &exclude);
-
-        Ok(BinaryIdentity {
-            binary_path,
-            binary_digest,
-            ancestors,
-            cmdline_paths,
-        })
     }
 }
 

@@ -14,7 +14,7 @@ use nix::sys::signal::{Signal, killpg};
 use nix::unistd::Pid;
 use openshell_core::policy::SandboxPolicy;
 use openshell_core::provider_credentials::ProviderCredentialState;
-use openshell_isolation::contract::{
+use openshell_isolation_interface::contract::{
     BackendError, BoundaryExec, BoundaryExitStatus, BoundaryInput, BoundaryOutput, BoundaryProcess,
     BoundarySignal, BoundaryTerminal, ExecSession, ExecSpec,
 };

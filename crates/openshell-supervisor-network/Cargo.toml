@@ -11,8 +11,9 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+openshell-binary-identity = { path = "../openshell-binary-identity" }
 openshell-core = { path = "../openshell-core", features = ["oauth"] }
-openshell-isolation = { path = "../openshell-isolation" }
+openshell-isolation-interface = { path = "../openshell-isolation-interface" }
 openshell-ocsf = { path = "../openshell-ocsf" }
 openshell-policy = { path = "../openshell-policy" }
 openshell-router = { path = "../openshell-router" }

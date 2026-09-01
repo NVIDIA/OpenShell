@@ -12,7 +12,7 @@ rust-version.workspace = true
 
 [dependencies]
 openshell-core = { path = "../openshell-core" }
-openshell-isolation = { path = "../openshell-isolation" }
+openshell-isolation-interface = { path = "../openshell-isolation-interface" }
 openshell-ocsf = { path = "../openshell-ocsf" }
 openshell-policy = { path = "../openshell-policy" }
 

@@ -3754,6 +3754,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
+name = "openshell-binary-identity"
+version = "0.0.0"
+dependencies = [
+ "openshell-isolation-interface",
+ "sha2 0.10.9",
+]
+
+[[package]]
 name = "openshell-bootstrap"
 version = "0.0.0"
 dependencies = [
@@ -4481,8 +4489,9 @@ dependencies = [
  "ipnet",
  "libc",
  "miette",
+ "openshell-binary-identity",
  "openshell-core",
- "openshell-isolation",
+ "openshell-isolation-interface",
  "openshell-ocsf",
  "openshell-policy",
  "openshell-router",
@@ -4532,7 +4541,7 @@ dependencies = [
  "miette",
  "nix 0.29.0",
  "openshell-core",
- "openshell-isolation",
+ "openshell-isolation-interface",
  "openshell-ocsf",
  "openshell-policy",
  "rand 0.10.2",
