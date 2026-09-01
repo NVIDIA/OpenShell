@@ -83,6 +83,12 @@ pub struct ProcessPolicy {
 
     /// Group name to run the sandboxed process as.
     pub run_as_group: Option<String>,
+
+    /// Linux supplemental groups to apply before dropping privileges.
+    ///
+    /// Runtime-specific inputs can use different terminology; CDI
+    /// `additionalGids` are converted into this process-level representation.
+    pub supplemental_groups: Vec<u32>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -162,6 +168,7 @@ impl From<ProtoProcessPolicy> for ProcessPolicy {
             } else {
                 Some(proto.run_as_group)
             },
+            supplemental_groups: Vec::new(),
         }
     }
 }
