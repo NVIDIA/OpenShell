@@ -23,11 +23,12 @@ use openshell_core::proto::{
     HealthRequest, HealthResponse, ListProvidersRequest, ListProvidersResponse,
     ListSandboxProvidersRequest, ListSandboxProvidersResponse, ListSandboxesRequest,
     ListSandboxesResponse, Provider, ProviderCredentialRefresh, ProviderCredentialRefreshStatus,
-    ProviderCredentialRefreshStrategy, ProviderProfile, ProviderProfileCredential,
-    ProviderProfileDiscovery, ProviderResponse, RevokeSshSessionRequest, RevokeSshSessionResponse,
-    RotateProviderCredentialRequest, RotateProviderCredentialResponse, Sandbox, SandboxResponse,
-    SandboxStreamEvent, ServiceStatus, SettingValue, SupervisorMessage, UpdateProviderRequest,
-    WatchSandboxRequest, setting_value,
+    ProviderCredentialRefreshStrategy, ProviderCredentialTokenGrant,
+    ProviderCredentialTokenGrantSubjectToken, ProviderCredentialTokenGrantType, ProviderProfile,
+    ProviderProfileCredential, ProviderProfileDiscovery, ProviderResponse, RevokeSshSessionRequest,
+    RevokeSshSessionResponse, RotateProviderCredentialRequest, RotateProviderCredentialResponse,
+    Sandbox, SandboxResponse, SandboxStreamEvent, ServiceStatus, SettingValue, SupervisorMessage,
+    UpdateProviderRequest, WatchSandboxRequest, setting_value,
 };
 use openshell_core::{ObjectId, ObjectName};
 use std::collections::HashMap;
@@ -44,6 +45,7 @@ use tonic::{Response, Status};
 struct ProviderState {
     providers: Arc<Mutex<HashMap<String, Provider>>>,
     profiles: Arc<Mutex<HashMap<String, ProviderProfile>>>,
+    scoped_profiles: Arc<Mutex<HashMap<(String, String), ProviderProfile>>>,
     refresh_statuses: Arc<Mutex<HashMap<(String, String), ProviderCredentialRefreshStatus>>>,
     refresh_requests: Arc<Mutex<Vec<ProviderRefreshRequestLog>>>,
     provider_update_requests: Arc<Mutex<Vec<Provider>>>,
@@ -489,8 +491,18 @@ impl OpenShell for TestOpenShell {
         &self,
         request: tonic::Request<openshell_core::proto::GetProviderProfileRequest>,
     ) -> Result<Response<openshell_core::proto::ProviderProfileResponse>, Status> {
-        let id = request.into_inner().id;
-        let profile = if let Some(profile) = openshell_providers::builtin_profiles()
+        let request = request.into_inner();
+        let id = request.id;
+        let scoped_profile = self
+            .state
+            .scoped_profiles
+            .lock()
+            .await
+            .get(&(request.workspace, id.clone()))
+            .cloned();
+        let profile = if let Some(profile) = scoped_profile {
+            profile
+        } else if let Some(profile) = openshell_providers::builtin_profiles()
             .iter()
             .find(|profile| profile.id == id)
         {
@@ -2164,6 +2176,148 @@ async fn provider_update_from_existing_uses_profile_discovery_when_v2_enabled() 
     assert_eq!(
         provider.credentials.get("CUSTOM_UPDATE_DISCOVERY_API_KEY"),
         Some(&"updated-profile-secret".to_string())
+    );
+}
+
+#[tokio::test]
+async fn provider_update_from_existing_preserves_global_profile_scope() {
+    let ts = run_server().await;
+    enable_providers_v2(&ts).await;
+    let profile_id = "shadowed-update-discovery";
+    for (profile_workspace, env_var) in [
+        ("", "GLOBAL_UPDATE_DISCOVERY_API_KEY"),
+        ("default", "WORKSPACE_UPDATE_DISCOVERY_API_KEY"),
+    ] {
+        ts.state.scoped_profiles.lock().await.insert(
+            (profile_workspace.to_string(), profile_id.to_string()),
+            ProviderProfile {
+                id: profile_id.to_string(),
+                credentials: vec![ProviderProfileCredential {
+                    name: "api_key".to_string(),
+                    env_vars: vec![env_var.to_string()],
+                    required: true,
+                    ..Default::default()
+                }],
+                discovery: Some(ProviderProfileDiscovery {
+                    credentials: vec!["api_key".to_string()],
+                }),
+                ..Default::default()
+            },
+        );
+    }
+    ts.state.providers.lock().await.insert(
+        "global-update".to_string(),
+        Provider {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: "id-global-update".to_string(),
+                name: "global-update".to_string(),
+                workspace: "default".to_string(),
+                ..Default::default()
+            }),
+            r#type: profile_id.to_string(),
+            profile_workspace: String::new(),
+            ..Default::default()
+        },
+    );
+    let _env = EnvVarGuard::set(&[
+        ("GLOBAL_UPDATE_DISCOVERY_API_KEY", "global-secret"),
+        ("WORKSPACE_UPDATE_DISCOVERY_API_KEY", "workspace-secret"),
+    ]);
+
+    run::provider_update(run::ProviderUpdateOptions {
+        server: &ts.endpoint,
+        name: "global-update",
+        from_existing: true,
+        from_oidc_token: false,
+        credentials: &[],
+        config: &[],
+        credential_expires_at: &[],
+        workspace: "default",
+        tls: &ts.tls,
+    })
+    .await
+    .expect("global profile-backed provider update --from-existing");
+
+    let provider = ts
+        .state
+        .providers
+        .lock()
+        .await
+        .get("global-update")
+        .cloned()
+        .expect("global provider should still be stored");
+    assert_eq!(
+        provider.credentials.get("GLOBAL_UPDATE_DISCOVERY_API_KEY"),
+        Some(&"global-secret".to_string())
+    );
+    assert!(
+        !provider
+            .credentials
+            .contains_key("WORKSPACE_UPDATE_DISCOVERY_API_KEY")
+    );
+}
+
+#[tokio::test]
+async fn provider_update_from_oidc_token_preserves_global_profile_scope() {
+    let ts = run_server().await;
+    let profile_id = "shadowed-oidc-update";
+    for (profile_workspace, subject_credential) in [
+        ("", "GLOBAL_SUBJECT_TOKEN"),
+        ("default", "WORKSPACE_SUBJECT_TOKEN"),
+    ] {
+        ts.state.scoped_profiles.lock().await.insert(
+            (profile_workspace.to_string(), profile_id.to_string()),
+            ProviderProfile {
+                id: profile_id.to_string(),
+                credentials: vec![ProviderProfileCredential {
+                    name: "dynamic_token".to_string(),
+                    token_grant: Some(ProviderCredentialTokenGrant {
+                        grant_type: ProviderCredentialTokenGrantType::TokenExchange as i32,
+                        subject_token: Some(ProviderCredentialTokenGrantSubjectToken {
+                            source: "provider_credential".to_string(),
+                            credential: subject_credential.to_string(),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+    }
+    ts.state.providers.lock().await.insert(
+        "global-oidc-update".to_string(),
+        Provider {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: "id-global-oidc-update".to_string(),
+                name: "global-oidc-update".to_string(),
+                workspace: "default".to_string(),
+                ..Default::default()
+            }),
+            r#type: profile_id.to_string(),
+            profile_workspace: String::new(),
+            ..Default::default()
+        },
+    );
+
+    let err = run::provider_update(run::ProviderUpdateOptions {
+        server: &ts.endpoint,
+        name: "global-oidc-update",
+        from_existing: false,
+        from_oidc_token: true,
+        credentials: &["GLOBAL_SUBJECT_TOKEN".to_string()],
+        config: &[],
+        credential_expires_at: &[],
+        workspace: "default",
+        tls: &ts.tls,
+    })
+    .await
+    .expect_err("unnamed test gateway should stop after profile validation");
+
+    assert!(
+        err.to_string().contains("active named OIDC gateway"),
+        "global profile should accept GLOBAL_SUBJECT_TOKEN before OIDC loading: {err}"
     );
 }
 
