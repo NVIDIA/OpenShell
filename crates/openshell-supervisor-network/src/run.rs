@@ -196,6 +196,7 @@ pub async fn run_networking(
     agent_proposals: AgentProposals,
     workspace_rx: tokio::sync::watch::Receiver<String>,
     upstream_proxy_args: &crate::upstream_proxy::UpstreamProxyArgs,
+    host_gateway_ip: Option<IpAddr>,
     #[cfg(target_os = "linux")] transparent_runtime: Option<TransparentRuntimeSetup>,
 ) -> Result<Networking> {
     // Build the policy-local route context. The orchestrator's policy poll
@@ -426,10 +427,11 @@ pub async fn run_networking(
         });
 
         // Build inference context for local routing of intercepted inference calls.
-        let inference_ctx = crate::inference_routes::build_inference_context(
+        let inference_ctx = crate::inference_routes::build_inference_context_with_host_gateway(
             sandbox_id,
             openshell_endpoint,
             inference_routes,
+            host_gateway_ip,
         )
         .await?;
 
@@ -447,6 +449,7 @@ pub async fn run_networking(
             activity_tx.clone(),
             engine_ready_rx,
             upstream_proxy_args,
+            host_gateway_ip,
         )
         .await?;
         Some(proxy_handle)

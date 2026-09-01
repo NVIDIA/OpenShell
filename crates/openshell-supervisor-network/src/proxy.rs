@@ -97,7 +97,7 @@ fn emit_credential_endpoint_mismatch(host: &str, port: u16, policy_name: &str) {
 /// machine. Traffic to these names is eligible for the trusted-gateway SSRF
 /// exemption when the resolved IP matches the driver-injected value read from
 /// `/etc/hosts` at proxy startup.
-const HOST_GATEWAY_ALIASES: &[&str] = &[
+pub(crate) const HOST_GATEWAY_ALIASES: &[&str] = &[
     "host.openshell.internal",
     "host.containers.internal",
     "host.docker.internal",
@@ -255,6 +255,7 @@ impl ProxyHandle {
         activity_tx: Option<ActivitySender>,
         engine_ready: tokio::sync::watch::Receiver<bool>,
         upstream_proxy_args: &upstream_proxy::UpstreamProxyArgs,
+        backend_host_gateway: Option<IpAddr>,
     ) -> Result<Self> {
         // Use override bind_addr, fall back to policy http_addr, then default
         // to loopback:3128.  The default allows the proxy to function when no
@@ -287,6 +288,7 @@ impl ProxyHandle {
         // runs. This is read once at startup so later /etc/hosts modifications
         // by sandbox workloads cannot influence the stored value.
         let trusted_host_gateway: Arc<Option<IpAddr>> = Arc::new(detect_trusted_host_gateway());
+        let backend_host_gateway = Arc::new(backend_host_gateway);
         if let Some(ref ip) = *trusted_host_gateway {
             tracing::info!(
                 %ip,
@@ -384,6 +386,7 @@ impl ProxyHandle {
                         let policy_local = policy_local_ctx.clone();
                         let proposals = agent_proposals.clone();
                         let gw = trusted_host_gateway.clone();
+                        let backend_gw = backend_host_gateway.clone();
                         let up_proxy = upstream_proxy.clone();
                         let credentials = provider_credentials.clone();
                         let resolver = provider_credentials
@@ -407,6 +410,7 @@ impl ProxyHandle {
                                 inf,
                                 policy_local,
                                 proposals,
+                                backend_gw,
                                 gw,
                                 up_proxy,
                                 credentials,
@@ -1691,6 +1695,7 @@ async fn handle_tcp_connection(
     inference_ctx: Option<Arc<InferenceContext>>,
     policy_local_ctx: Option<Arc<PolicyLocalContext>>,
     agent_proposals: openshell_core::proposals::AgentProposals,
+    backend_host_gateway: Arc<Option<IpAddr>>,
     trusted_host_gateway: Arc<Option<IpAddr>>,
     upstream_proxy: Arc<Option<UpstreamProxyConfig>>,
     provider_credentials: Option<ProviderCredentialState>,
@@ -1762,6 +1767,7 @@ async fn handle_tcp_connection(
             entrypoint_pid,
             policy_local_ctx,
             agent_proposals,
+            backend_host_gateway,
             trusted_host_gateway,
             provider_credentials,
             secret_resolver,
@@ -1935,7 +1941,7 @@ async fn handle_tcp_connection(
 
     let sandbox_entrypoint_pid = entrypoint_pid.load(Ordering::Acquire);
 
-    match hydrate_destination_plan(&mut decision, *trusted_host_gateway) {
+    match hydrate_destination_plan(&mut decision, *backend_host_gateway, *trusted_host_gateway) {
         Ok(()) => {}
         Err(denial) => {
             deny_connect_destination(
@@ -3464,6 +3470,7 @@ fn hydrate_tls_mode(decision: &mut EgressDecision) {
 
 fn hydrate_destination_plan(
     decision: &mut EgressDecision,
+    backend_host_gateway: Option<IpAddr>,
     trusted_host_gateway: Option<IpAddr>,
 ) -> std::result::Result<(), DestinationDenial> {
     let host = decision.intent.destination.host.clone();
@@ -3472,6 +3479,7 @@ fn hydrate_destination_plan(
     let plan = build_validation_plan(
         &host,
         &host.to_ascii_lowercase(),
+        backend_host_gateway,
         trusted_host_gateway,
         &raw_allowed_ips,
         exact_declared_host,
@@ -4824,6 +4832,7 @@ async fn handle_forward_proxy(
     entrypoint_pid: Arc<AtomicU32>,
     policy_local_ctx: Option<Arc<PolicyLocalContext>>,
     agent_proposals: openshell_core::proposals::AgentProposals,
+    backend_host_gateway: Arc<Option<IpAddr>>,
     trusted_host_gateway: Arc<Option<IpAddr>>,
     provider_credentials: Option<ProviderCredentialState>,
     secret_resolver: Option<Arc<SecretResolver>>,
@@ -5580,7 +5589,7 @@ async fn handle_forward_proxy(
     //    - Otherwise: reject internal IPs, allow public IPs through.
     //    When the policy host is already a literal IP address, treat it as
     //    implicitly allowed — the user explicitly declared the destination.
-    match hydrate_destination_plan(&mut decision, *trusted_host_gateway) {
+    match hydrate_destination_plan(&mut decision, *backend_host_gateway, *trusted_host_gateway) {
         Ok(()) => {}
         Err(denial) => {
             deny_forward_destination(
@@ -6530,6 +6539,7 @@ network_policies: {}
             AgentProposals::default(),
             Arc::new(None),
             Arc::new(None),
+            Arc::new(None),
             None,
             None,
             None,
@@ -6641,6 +6651,7 @@ network_policies:
                 Arc::new(AtomicU32::new(std::process::id())),
                 None,
                 AgentProposals::default(),
+                Arc::new(None),
                 Arc::new(None),
                 None,
                 None,
@@ -6774,6 +6785,7 @@ network_policies:
                 Arc::new(AtomicU32::new(std::process::id())),
                 None,
                 AgentProposals::default(),
+                Arc::new(None),
                 Arc::new(None),
                 None,
                 None,
@@ -12098,6 +12110,7 @@ network_policies:
                 None,                      // inference_ctx
                 None,                      // policy_local_ctx
                 AgentProposals::default(), // agent_proposals
+                Arc::new(None),            // backend_host_gateway
                 Arc::new(None),            // trusted_host_gateway
                 Arc::new(None),            // upstream_proxy
                 None,                      // provider_credentials
@@ -12165,6 +12178,7 @@ network_policies:
             None,
             None,
             AgentProposals::default(),
+            Arc::new(None),
             Arc::new(None),
             Arc::new(None),
             None,

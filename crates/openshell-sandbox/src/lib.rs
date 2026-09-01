@@ -554,6 +554,7 @@ pub async fn run_sandbox(
                 agent_proposals.clone(),
                 workspace_rx.clone(),
                 &upstream_proxy_args,
+                None,
                 #[cfg(target_os = "linux")]
                 transparent_runtime,
             )
