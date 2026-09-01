@@ -648,7 +648,7 @@ fn spawn_log_stream(app: &mut App, tx: mpsc::UnboundedSender<Event>) {
         let req = openshell_core::proto::GetSandboxLogsRequest {
             sandbox_id: sandbox_id.clone(),
             lines: 500,
-            since_ms: 0,
+            since_time: None,
             sources: vec![],
             min_level: String::new(),
             workspace,
@@ -725,7 +725,11 @@ fn proto_to_log_line(log: openshell_core::proto::SandboxLogLine) -> LogLine {
         log.source
     };
     LogLine {
-        timestamp_ms: log.timestamp_ms,
+        timestamp_ms: log
+            .event_time
+            .as_ref()
+            .and_then(|value| openshell_core::time::timestamp_to_millis(value).ok())
+            .unwrap_or_default(),
         level: log.level,
         source,
         target: log.target,
@@ -1676,17 +1680,17 @@ fn spawn_create_provider(app: &App, tx: mpsc::UnboundedSender<Event>) {
                     metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                         id: String::new(),
                         name: provider_name.clone(),
-                        created_at_ms: 0,
+                        created_time: None,
                         labels: HashMap::new(),
                         resource_version: 0,
                         annotations: HashMap::new(),
                         workspace: workspace.clone(),
-                        deletion_timestamp_ms: 0,
+                        deletion_time: None,
                     }),
                     r#type: ptype.clone(),
                     credentials: credentials.clone(),
                     config: config.clone(),
-                    credential_expires_at_ms: HashMap::default(),
+                    credential_expiration_times: HashMap::default(),
                     profile_workspace: workspace.clone(),
                     credential_handles: HashMap::default(),
                 }),
@@ -1790,21 +1794,21 @@ fn spawn_update_provider(app: &App, tx: mpsc::UnboundedSender<Event>) {
                 metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                     id: String::new(),
                     name: name.clone(),
-                    created_at_ms: 0,
+                    created_time: None,
                     labels: HashMap::new(),
                     resource_version: 0,
                     annotations: HashMap::new(),
                     workspace: workspace.clone(),
-                    deletion_timestamp_ms: 0,
+                    deletion_time: None,
                 }),
                 r#type: ptype,
                 credentials,
                 config,
-                credential_expires_at_ms: HashMap::default(),
+                credential_expiration_times: HashMap::default(),
                 profile_workspace: String::new(),
                 credential_handles: HashMap::default(),
             }),
-            credential_expires_at_ms: HashMap::default(),
+            credential_expiration_times: HashMap::default(),
             workspace,
         };
 
@@ -2545,7 +2549,9 @@ async fn refresh_sandboxes(app: &mut App) {
                 .map(|s| {
                     s.metadata
                         .as_ref()
-                        .map_or_else(|| "?".to_string(), |m| format_age(m.created_at_ms))
+                        .and_then(|m| m.created_time.as_ref())
+                        .and_then(|value| openshell_core::time::timestamp_to_millis(value).ok())
+                        .map_or_else(|| "?".to_string(), format_age)
                 })
                 .collect();
             app.sandbox_created = sandboxes
@@ -2553,7 +2559,9 @@ async fn refresh_sandboxes(app: &mut App) {
                 .map(|s| {
                     s.metadata
                         .as_ref()
-                        .map_or_else(|| "?".to_string(), |m| format_timestamp(m.created_at_ms))
+                        .and_then(|m| m.created_time.as_ref())
+                        .and_then(|value| openshell_core::time::timestamp_to_millis(value).ok())
+                        .map_or_else(|| "?".to_string(), format_timestamp)
                 })
                 .collect();
 

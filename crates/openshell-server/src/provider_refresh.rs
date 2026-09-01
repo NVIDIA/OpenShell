@@ -248,10 +248,11 @@ pub async fn delete_refresh_state_with_credentials(
     if state
         .metadata
         .as_ref()
-        .is_some_and(|metadata| metadata.deletion_timestamp_ms == 0)
+        .is_some_and(|metadata| metadata.deletion_time.is_none())
     {
         if let Some(metadata) = state.metadata.as_mut() {
-            metadata.deletion_timestamp_ms = current_time_ms();
+            metadata.deletion_time =
+                openshell_core::time::timestamp_from_millis(current_time_ms()).ok();
         }
         state.authorization_epoch = uuid::Uuid::new_v4().to_string();
         state.status = "deleting".to_string();
@@ -320,14 +321,32 @@ pub fn refresh_status_from_state(
         credential_key: state.credential_key.clone(),
         strategy: state.strategy,
         status: state.status.clone(),
-        expires_at_ms: state.expires_at_ms,
-        next_refresh_at_ms: state.next_refresh_at_ms,
-        last_refresh_at_ms: state.last_refresh_at_ms,
+        expiration_time: openshell_core::time::optional_timestamp_from_legacy_millis(
+            state.expires_at_ms,
+        )
+        .ok()
+        .flatten(),
+        next_refresh_time: if state.next_refresh_at_ms == i64::MAX {
+            None
+        } else {
+            openshell_core::time::optional_timestamp_from_legacy_millis(state.next_refresh_at_ms)
+                .ok()
+                .flatten()
+        },
+        last_refresh_time: openshell_core::time::optional_timestamp_from_legacy_millis(
+            state.last_refresh_at_ms,
+        )
+        .ok()
+        .flatten(),
         last_error: state.last_error.clone(),
         recovery_action: state.recovery_action,
         failure_code: state.failure_code.clone(),
         provider_error_subtype: state.provider_error_subtype.clone(),
-        last_error_at_ms: state.last_error_at_ms,
+        last_error_time: openshell_core::time::optional_timestamp_from_legacy_millis(
+            state.last_error_at_ms,
+        )
+        .ok()
+        .flatten(),
     }
 }
 
@@ -366,12 +385,12 @@ pub fn new_refresh_state(
         metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
             id: uuid::Uuid::new_v4().to_string(),
             name: refresh_state_name(&provider_id, credential_key),
-            created_at_ms: now_ms,
+            created_time: openshell_core::time::timestamp_from_millis(now_ms).ok(),
             labels: HashMap::new(),
             resource_version: 0,
             annotations: HashMap::new(),
             workspace: workspace.to_string(),
-            deletion_timestamp_ms: 0,
+            deletion_time: None,
         }),
         provider_id,
         provider_name,
@@ -790,7 +809,7 @@ pub async fn refresh_provider_credential(
     if state
         .metadata
         .as_ref()
-        .is_some_and(|metadata| metadata.deletion_timestamp_ms != 0)
+        .is_some_and(|metadata| metadata.deletion_time.is_some())
     {
         return Err(Status::failed_precondition(
             "provider refresh is being deleted",
@@ -1149,19 +1168,22 @@ async fn apply_minted_credential(
         }
         None
     };
-    if minted.expires_at_ms > 0 {
+    let credential_expiration_time =
+        openshell_core::time::optional_timestamp_from_legacy_millis(minted.expires_at_ms)
+            .map_err(|error| Status::internal(error.to_string()))?;
+    if let Some(expiration_time) = credential_expiration_time.as_ref() {
         updated
-            .credential_expires_at_ms
-            .insert(credential_key.to_string(), minted.expires_at_ms);
+            .credential_expiration_times
+            .insert(credential_key.to_string(), *expiration_time);
         for key in minted.additional_credentials.keys() {
             updated
-                .credential_expires_at_ms
-                .insert(key.clone(), minted.expires_at_ms);
+                .credential_expiration_times
+                .insert(key.clone(), *expiration_time);
         }
     } else {
-        updated.credential_expires_at_ms.remove(credential_key);
+        updated.credential_expiration_times.remove(credential_key);
         for key in minted.additional_credentials.keys() {
-            updated.credential_expires_at_ms.remove(key);
+            updated.credential_expiration_times.remove(key);
         }
     }
     if let Err(err) = crate::grpc::provider::validate_provider_update_against_attached_sandboxes(
@@ -1202,19 +1224,19 @@ async fn apply_minted_credential(
                     current.credentials.insert(key.clone(), value.clone());
                 }
             }
-            if minted.expires_at_ms > 0 {
+            if let Some(expiration_time) = credential_expiration_time.as_ref() {
                 current
-                    .credential_expires_at_ms
-                    .insert(credential_key.to_string(), minted.expires_at_ms);
+                    .credential_expiration_times
+                    .insert(credential_key.to_string(), *expiration_time);
                 for key in minted.additional_credentials.keys() {
                     current
-                        .credential_expires_at_ms
-                        .insert(key.clone(), minted.expires_at_ms);
+                        .credential_expiration_times
+                        .insert(key.clone(), *expiration_time);
                 }
             } else {
-                current.credential_expires_at_ms.remove(credential_key);
+                current.credential_expiration_times.remove(credential_key);
                 for key in minted.additional_credentials.keys() {
-                    current.credential_expires_at_ms.remove(key);
+                    current.credential_expiration_times.remove(key);
                 }
             }
         })
@@ -1880,11 +1902,11 @@ pub fn spawn_refresh_worker(state: std::sync::Arc<crate::ServerState>, interval:
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             ticker.tick().await;
-            if let Err(err) = run_refresh_worker_tick(
+            if let Err(err) = Box::pin(run_refresh_worker_tick(
                 state.store.as_ref(),
                 Some(&state.credentials),
                 Some(&state.compute),
-            )
+            ))
             .await
             {
                 warn!(error = %err, "provider credential refresh worker tick failed");
@@ -1931,7 +1953,7 @@ async fn run_refresh_worker_tick(
         if state
             .metadata
             .as_ref()
-            .is_some_and(|metadata| metadata.deletion_timestamp_ms != 0)
+            .is_some_and(|metadata| metadata.deletion_time.is_some())
         {
             let Some(credentials) = credentials else {
                 warn!(
@@ -2069,6 +2091,10 @@ mod tests {
     use std::collections::HashMap;
     use wiremock::matchers::{body_string_contains, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn ts(milliseconds: i64) -> prost_types::Timestamp {
+        openshell_core::time::timestamp_from_millis(milliseconds).unwrap()
+    }
 
     fn test_credentials() -> CredentialRuntime {
         CredentialRuntime::from_config(&Config::new(None).with_credential_drivers(["test-static"]))
@@ -2738,8 +2764,10 @@ mod tests {
             Some(&"minted-graph-token".to_string())
         );
         assert_eq!(
-            stored.credential_expires_at_ms.get("MS_GRAPH_ACCESS_TOKEN"),
-            Some(&refreshed.expires_at_ms)
+            stored
+                .credential_expiration_times
+                .get("MS_GRAPH_ACCESS_TOKEN"),
+            Some(&ts(refreshed.expires_at_ms))
         );
     }
 
@@ -2833,8 +2861,10 @@ mod tests {
             .unwrap();
         assert_eq!(handle.driver, "test-static");
         assert_eq!(
-            stored.credential_expires_at_ms.get("MS_GRAPH_ACCESS_TOKEN"),
-            Some(&refreshed.expires_at_ms)
+            stored
+                .credential_expiration_times
+                .get("MS_GRAPH_ACCESS_TOKEN"),
+            Some(&ts(refreshed.expires_at_ms))
         );
 
         let resolved = credentials
@@ -2874,12 +2904,12 @@ mod tests {
                 metadata: Some(ObjectMeta {
                     id: "sandbox-collision".to_string(),
                     name: "collision".to_string(),
-                    created_at_ms: 1,
+                    created_time: openshell_core::time::timestamp_from_millis(1).ok(),
                     labels: HashMap::new(),
                     resource_version: 0,
                     annotations: HashMap::new(),
                     workspace: "default".to_string(),
-                    deletion_timestamp_ms: 0,
+                    deletion_time: None,
                 }),
                 spec: Some(SandboxSpec {
                     providers: vec!["existing-graph".to_string(), "refreshing-graph".to_string()],
@@ -3036,9 +3066,9 @@ mod tests {
         );
         assert_eq!(
             stored_provider
-                .credential_expires_at_ms
+                .credential_expiration_times
                 .get("MS_GRAPH_ACCESS_TOKEN"),
-            Some(&refreshed.expires_at_ms)
+            Some(&ts(refreshed.expires_at_ms))
         );
 
         let stored_state = get_refresh_state(
@@ -3375,7 +3405,9 @@ mod tests {
         .unwrap();
         put_refresh_state(&store, &state).await.unwrap();
 
-        run_refresh_worker_tick(&store, None, None).await.unwrap();
+        Box::pin(run_refresh_worker_tick(&store, None, None))
+            .await
+            .unwrap();
 
         let stored_state = get_refresh_state(
             &store,
@@ -3431,9 +3463,13 @@ mod tests {
         state.next_refresh_at_ms = i64::MAX;
         put_refresh_state(&store, &state).await.unwrap();
 
-        run_refresh_worker_tick(&store, Some(&test_credentials()), None)
-            .await
-            .unwrap();
+        Box::pin(run_refresh_worker_tick(
+            &store,
+            Some(&test_credentials()),
+            None,
+        ))
+        .await
+        .unwrap();
 
         let stored = get_refresh_state(
             &store,
@@ -3486,12 +3522,13 @@ mod tests {
             .await
             .unwrap();
         state.material.clear();
-        state.metadata.as_mut().unwrap().deletion_timestamp_ms = current_time_ms();
+        state.metadata.as_mut().unwrap().deletion_time =
+            openshell_core::time::timestamp_from_millis(current_time_ms()).ok();
         state.status = "deleting".to_string();
         put_refresh_state(&store, &state).await.unwrap();
         assert_eq!(credentials.stored_credential_count(), Some(1));
 
-        run_refresh_worker_tick(&store, Some(&credentials), None)
+        Box::pin(run_refresh_worker_tick(&store, Some(&credentials), None))
             .await
             .unwrap();
 
@@ -3519,7 +3556,9 @@ mod tests {
         let store = test_store().await;
 
         let traced = test_exporter::install_traced();
-        run_refresh_worker_tick(&store, None, None).await.unwrap();
+        Box::pin(run_refresh_worker_tick(&store, None, None))
+            .await
+            .unwrap();
 
         let spans = traced.finished_spans();
         let root = spans
@@ -3900,16 +3939,18 @@ mod tests {
             Some(&"FwoGZXIvYXdzEBYaDH...EXAMPLETOKEN".to_string())
         );
         assert_eq!(
-            stored.credential_expires_at_ms.get("AWS_ACCESS_KEY_ID"),
-            Some(&4_000_000_000_000)
+            stored.credential_expiration_times.get("AWS_ACCESS_KEY_ID"),
+            Some(&ts(4_000_000_000_000))
         );
         assert_eq!(
-            stored.credential_expires_at_ms.get("AWS_SECRET_ACCESS_KEY"),
-            Some(&4_000_000_000_000)
+            stored
+                .credential_expiration_times
+                .get("AWS_SECRET_ACCESS_KEY"),
+            Some(&ts(4_000_000_000_000))
         );
         assert_eq!(
-            stored.credential_expires_at_ms.get("AWS_SESSION_TOKEN"),
-            Some(&4_000_000_000_000)
+            stored.credential_expiration_times.get("AWS_SESSION_TOKEN"),
+            Some(&ts(4_000_000_000_000))
         );
     }
 
@@ -4020,12 +4061,12 @@ mod tests {
                 metadata: Some(ObjectMeta {
                     id: "sandbox-aws-collision".to_string(),
                     name: "aws-collision".to_string(),
-                    created_at_ms: 1,
+                    created_time: openshell_core::time::timestamp_from_millis(1).ok(),
                     labels: HashMap::new(),
                     resource_version: 0,
                     annotations: HashMap::new(),
                     workspace: "default".to_string(),
-                    deletion_timestamp_ms: 0,
+                    deletion_time: None,
                 }),
                 spec: Some(SandboxSpec {
                     providers: vec!["existing-aws".to_string(), "refreshing-aws".to_string()],
@@ -4512,17 +4553,17 @@ mod tests {
             metadata: Some(ObjectMeta {
                 id: format!("{name}-id"),
                 name: name.to_string(),
-                created_at_ms: 1,
+                created_time: openshell_core::time::timestamp_from_millis(1).ok(),
                 labels: HashMap::new(),
                 resource_version: 0,
                 annotations: HashMap::new(),
                 workspace: "default".to_string(),
-                deletion_timestamp_ms: 0,
+                deletion_time: None,
             }),
             r#type: provider_type.to_string(),
             credentials: HashMap::new(),
             config: HashMap::new(),
-            credential_expires_at_ms: HashMap::new(),
+            credential_expiration_times: HashMap::new(),
             profile_workspace: "default".to_string(),
             credential_handles: HashMap::new(),
         }

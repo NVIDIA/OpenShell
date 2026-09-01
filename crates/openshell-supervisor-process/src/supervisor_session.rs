@@ -384,17 +384,20 @@ async fn run_single_session(
         _ => return Err("expected SessionAccepted or SessionRejected".into()),
     };
 
-    let heartbeat_secs = accepted.heartbeat_interval_secs.max(5);
+    let heartbeat_secs = accepted
+        .heartbeat_interval
+        .as_ref()
+        .and_then(|value| openshell_core::time::duration_to_std(value).ok())
+        .map_or(5, |value| value.as_secs().max(5));
     let event = session_established_event(
         openshell_ocsf::ctx::ctx(),
         &config.endpoint,
         &accepted.session_id,
-        heartbeat_secs,
+        u32::try_from(heartbeat_secs).unwrap_or(u32::MAX),
     );
     ocsf_emit!(event);
     // Main loop: receive gateway messages + send heartbeats.
-    let mut heartbeat_interval =
-        tokio::time::interval(Duration::from_secs(u64::from(heartbeat_secs)));
+    let mut heartbeat_interval = tokio::time::interval(Duration::from_secs(heartbeat_secs));
     heartbeat_interval.tick().await; // skip immediate tick
 
     loop {

@@ -6,7 +6,9 @@ syntax = "proto3";
 package openshell.v1;
 
 import "datamodel.proto";
+import "google/protobuf/duration.proto";
 import "google/protobuf/struct.proto";
+import "google/protobuf/timestamp.proto";
 import "options.proto";
 import "sandbox.proto";
 
@@ -699,11 +701,12 @@ message IssueSandboxTokenRequest {}
 // memory and presents it as `Authorization: Bearer` on every subsequent
 // gateway RPC.
 message IssueSandboxTokenResponse {
+  reserved 2;
+  reserved "expires_at_ms";
   // Gateway-minted JWT bound to the calling sandbox's UUID.
   string token = 1 [(openshell.options.v1.secret) = true];
-  // Absolute expiry of the issued token, milliseconds since the epoch. 0 means
-  // the token is non-expiring.
-  int64 expires_at_ms = 2;
+  // Absolute expiry of the issued token. Absence means the token is non-expiring.
+  google.protobuf.Timestamp expiration_time = 102;
 }
 
 // RefreshSandboxToken request. The calling principal must already be a
@@ -720,11 +723,12 @@ message RefreshSandboxTokenRequest {
 // RefreshSandboxToken response. The new token replaces the supervisor's
 // in-memory bearer credential.
 message RefreshSandboxTokenResponse {
+  reserved 2;
+  reserved "expires_at_ms";
   // Fresh gateway-minted JWT bound to the same sandbox UUID.
   string token = 1 [(openshell.options.v1.secret) = true];
-  // Absolute expiry of the new token, milliseconds since the epoch. 0 means
-  // the token is non-expiring.
-  int64 expires_at_ms = 2;
+  // Absolute expiry of the new token. Absence means the token is non-expiring.
+  google.protobuf.Timestamp expiration_time = 102;
   // Fresh credentials for the requested, policy-authorized extension
   // services. These remain in supervisor memory and are never persisted.
   repeated ExtensionServiceCredential extension_credentials = 3;
@@ -922,6 +926,8 @@ message SandboxStatus {
 
 // User-facing sandbox condition derived from driver-native conditions.
 message SandboxCondition {
+  reserved 5;
+  reserved "last_transition_time";
   // Condition class, typically mirroring the underlying platform condition type.
   string type = 1;
   // Condition status value such as `True`, `False`, or `Unknown`.
@@ -931,7 +937,7 @@ message SandboxCondition {
   // Human-readable condition message.
   string message = 4;
   // Timestamp reported by the underlying platform for the last transition.
-  string last_transition_time = 5;
+  google.protobuf.Timestamp transition_time = 105;
 }
 
 // High-level sandbox lifecycle phase derived by the gateway.
@@ -954,8 +960,10 @@ enum SandboxPhase {
 
 // Public platform event exposed on the sandbox watch stream.
 message PlatformEvent {
-  // Event timestamp in milliseconds since epoch.
-  int64 timestamp_ms = 1;
+  reserved 1;
+  reserved "timestamp_ms";
+  // Time when the event occurred.
+  google.protobuf.Timestamp event_time = 101;
   // Event source (e.g. "kubernetes", "docker", "process").
   string source = 2;
   // Event type/severity (e.g. "Normal", "Warning").
@@ -1115,6 +1123,8 @@ message CreateSshSessionRequest {
 // violate it. The client's own escaping provides defense-in-depth, but
 // narrow charsets close injection vectors at the trust boundary.
 message CreateSshSessionResponse {
+  reserved 8;
+  reserved "expires_at_ms";
   // Sandbox id. [A-Za-z0-9._-]{1,128}.
   string sandbox_id = 1;
 
@@ -1137,8 +1147,8 @@ message CreateSshSessionResponse {
   // Optional host key fingerprint. If non-empty, [A-Za-z0-9:+/=-] only.
   string host_key_fingerprint = 7;
 
-  // Expiry timestamp in milliseconds since epoch. 0 means no expiry.
-  int64 expires_at_ms = 8;
+  // Absolute expiry. Absence means no expiry.
+  google.protobuf.Timestamp expiration_time = 108;
 }
 
 // Request to expose an HTTP service running inside a sandbox.
@@ -1236,6 +1246,8 @@ message RevokeSshSessionResponse {
 
 // Execute command request.
 message ExecSandboxRequest {
+  reserved 5;
+  reserved "timeout_seconds";
   // Sandbox id.
   string sandbox_id = 1;
 
@@ -1248,8 +1260,8 @@ message ExecSandboxRequest {
   // Optional environment overrides.
   map<string, string> environment = 4;
 
-  // Optional timeout in seconds. 0 means no timeout.
-  uint32 timeout_seconds = 5;
+  // Optional execution timeout. Absence means no timeout.
+  google.protobuf.Duration execution_timeout = 105;
 
   // Optional stdin payload passed to the command.
   bytes stdin = 6;
@@ -1340,6 +1352,8 @@ message ExecSandboxWindowResize {
 
 // SSH session record stored in persistence.
 message SshSession {
+  reserved 4;
+  reserved "expires_at_ms";
   // Kubernetes-style metadata (id, name, labels, timestamps, resource version).
   openshell.datamodel.v1.ObjectMeta metadata = 1;
 
@@ -1349,9 +1363,8 @@ message SshSession {
   // Session token.
   string token = 3 [(openshell.options.v1.secret) = true];
 
-  // Expiry timestamp in milliseconds since epoch. 0 means no expiry
-  // (backward-compatible default for sessions created before this field existed).
-  int64 expires_at_ms = 4;
+  // Absolute expiry. Absence means no expiry.
+  google.protobuf.Timestamp expiration_time = 104;
 
   // Revoked flag.
   bool revoked = 5;
@@ -1359,6 +1372,8 @@ message SshSession {
 
 // Watch sandbox request.
 message WatchSandboxRequest {
+  reserved 8;
+  reserved "log_since_ms";
   // Sandbox id.
   string id = 1;
 
@@ -1381,9 +1396,9 @@ message WatchSandboxRequest {
   // (COMPLETED, STOPPED, or ERROR).
   bool stop_on_terminal = 7;
 
-  // Only include log lines with timestamp >= this value (milliseconds since epoch).
-  // 0 means no time filter. Applies to both tail replay and live streaming.
-  int64 log_since_ms = 8;
+  // Only include log lines at or after this time. Absence means no time filter.
+  // Applies to both tail replay and live streaming.
+  google.protobuf.Timestamp since_time = 108;
 
   // Filter by log source (e.g. "gateway", "sandbox"). Empty means all sources.
   repeated string log_sources = 9;
@@ -1410,8 +1425,10 @@ message SandboxStreamEvent {
 
 // Log line correlated to a sandbox.
 message SandboxLogLine {
+  reserved 2;
+  reserved "timestamp_ms";
   string sandbox_id = 1;
-  int64 timestamp_ms = 2;
+  google.protobuf.Timestamp event_time = 102;
   string level = 3;
   string target = 4;
   string message = 5;
@@ -1452,10 +1469,12 @@ message ListProvidersRequest {
 
 // Update provider request.
 message UpdateProviderRequest {
+  reserved 2;
+  reserved "credential_expires_at_ms";
   openshell.datamodel.v1.Provider provider = 1;
   // Optional per-credential expiry timestamps to merge into the provider.
-  // A zero value removes the expiry for that credential.
-  map<string, int64> credential_expires_at_ms = 2;
+  // An absent map entry removes the expiry for that credential.
+  map<string, google.protobuf.Timestamp> credential_expiration_times = 102;
   // Workspace scope. Empty defaults to "default".
   string workspace = 3;
 }
@@ -1550,6 +1569,8 @@ message ProviderCredentialTokenGrantSubjectToken {
 }
 
 message ProviderCredentialTokenGrant {
+  reserved 4;
+  reserved "cache_ttl_seconds";
   // OAuth2 token endpoint URL (e.g., https://keycloak.example.com/realms/my-realm/protocol/openid-connect/token)
   string token_endpoint = 1;
 
@@ -1563,9 +1584,8 @@ message ProviderCredentialTokenGrant {
   // Optional: OAuth2 scopes to request
   repeated string scopes = 3;
 
-  // Optional: override token cache TTL (seconds)
-  // If 0 or omitted, use expires_in from token response
-  int64 cache_ttl_seconds = 4;
+  // Optional token cache TTL override. If absent, use expires_in from the token response.
+  google.protobuf.Duration cache_ttl = 104;
 
   // Optional: endpoint-specific resource audience overrides.
   repeated ProviderCredentialTokenGrantAudienceOverride audience_overrides = 5;
@@ -1627,28 +1647,30 @@ message ProviderCredentialRefreshOutput {
 }
 
 message ProviderCredentialRefresh {
+  reserved 4, 5;
+  reserved "refresh_before_seconds", "max_lifetime_seconds";
   ProviderCredentialRefreshStrategy strategy = 1;
   string token_url = 2;
   repeated string scopes = 3;
-  int64 refresh_before_seconds = 4;
-  int64 max_lifetime_seconds = 5;
+  google.protobuf.Duration refresh_before = 104;
+  google.protobuf.Duration max_lifetime = 105;
   repeated ProviderCredentialRefreshMaterial material = 6;
   repeated ProviderCredentialRefreshOutput additional_outputs = 7;
 }
 
 message ProviderCredentialRefreshStatus {
+  reserved 6, 7, 8, 13;
+  reserved "expires_at_ms", "next_refresh_at_ms", "last_refresh_at_ms", "last_error_at_ms";
   string provider_name = 1;
   string provider_id = 2;
   string credential_key = 3;
   ProviderCredentialRefreshStrategy strategy = 4;
   string status = 5;
-  int64 expires_at_ms = 6;
-  // Next automatic refresh time in Unix epoch milliseconds. A value of
-  // 9223372036854775807 (int64 max) means no automatic retry is scheduled;
-  // consumers should render it as unset and use recovery_action to determine
-  // the required recovery workflow.
-  int64 next_refresh_at_ms = 7;
-  int64 last_refresh_at_ms = 8;
+  google.protobuf.Timestamp expiration_time = 106;
+  // Next automatic refresh time. Absence means no automatic retry is scheduled;
+  // use recovery_action to determine the required recovery workflow.
+  google.protobuf.Timestamp next_refresh_time = 107;
+  google.protobuf.Timestamp last_refresh_time = 108;
   string last_error = 9;
   ProviderCredentialRefreshRecoveryAction recovery_action = 10;
   // Stable gateway-owned failure identifier, for example
@@ -1659,7 +1681,7 @@ message ProviderCredentialRefreshStatus {
   // do not need a separate provider_error field. Unknown provider-controlled
   // values are not persisted or returned.
   string provider_error_subtype = 12;
-  int64 last_error_at_ms = 13;
+  google.protobuf.Timestamp last_error_time = 113;
 }
 
 // Provider profile local discovery declaration.
@@ -1736,6 +1758,8 @@ message GetProviderRefreshStatusResponse {
 }
 
 message ConfigureProviderRefreshRequest {
+  reserved 6;
+  reserved "expires_at_ms";
   string provider = 1;
   string credential_key = 2;
   ProviderCredentialRefreshStrategy strategy = 3;
@@ -1744,7 +1768,7 @@ message ConfigureProviderRefreshRequest {
   // name must be present in material. The server also classifies secrets from
   // the authoritative provider profile and refresh strategy.
   repeated string secret_material_keys = 5;
-  optional int64 expires_at_ms = 6;
+  google.protobuf.Timestamp expiration_time = 106;
   // Workspace scope. Empty defaults to "default".
   string workspace = 7;
 }
@@ -1931,12 +1955,14 @@ message StaticCredentialBinding {
 
 // Get sandbox provider environment response.
 message GetSandboxProviderEnvironmentResponse {
+  reserved 3;
+  reserved "credential_expires_at_ms";
   // Provider credential environment variables.
   map<string, string> environment = 1 [(openshell.options.v1.secret) = true];
   // Fingerprint for the provider credential inputs that produced environment.
   uint64 provider_env_revision = 2;
   // Expiration timestamps for returned environment variables.
-  map<string, int64> credential_expires_at_ms = 3;
+  map<string, google.protobuf.Timestamp> credential_expiration_times = 103;
   // Dynamic credentials that require token grants or other runtime injection.
   // Maps endpoint-bound provider metadata to credential metadata.
   // Supervisor uses this to inject Authorization headers for token grant credentials.
@@ -1967,8 +1993,10 @@ message ExchangeProviderSubjectTokenRequest {
 }
 
 message ExchangeProviderSubjectTokenResponse {
+  reserved 2;
+  reserved "expires_in";
   string access_token = 1 [(openshell.options.v1.secret) = true];
-  int64 expires_in = 2;
+  google.protobuf.Duration expires_after = 102;
   string token_type = 3;
 }
 
@@ -2129,6 +2157,8 @@ message ReportPolicyStatusResponse {}
 
 // A versioned policy revision with metadata.
 message SandboxPolicyRevision {
+  reserved 5, 6;
+  reserved "created_at_ms", "loaded_at_ms";
   // Policy version (monotonically increasing per sandbox).
   uint32 version = 1;
   // SHA-256 hash of the serialized policy payload.
@@ -2137,10 +2167,10 @@ message SandboxPolicyRevision {
   PolicyStatus status = 3;
   // Error message if status is FAILED.
   string load_error = 4;
-  // Milliseconds since epoch when this revision was created.
-  int64 created_at_ms = 5;
-  // Milliseconds since epoch when this revision was loaded by the sandbox.
-  int64 loaded_at_ms = 6;
+  // Time when this revision was created.
+  google.protobuf.Timestamp created_time = 105;
+  // Time when this revision was loaded by the sandbox. Absent if not loaded.
+  google.protobuf.Timestamp loaded_time = 106;
   // The full policy (only populated when explicitly requested).
   openshell.sandbox.v1.SandboxPolicy policy = 7;
   // Immutable provenance supplied with this policy revision.
@@ -2166,12 +2196,14 @@ enum PolicyStatus {
 
 // Get sandbox logs request (one-shot fetch).
 message GetSandboxLogsRequest {
+  reserved 3;
+  reserved "since_ms";
   // Sandbox id.
   string sandbox_id = 1;
   // Maximum number of log lines to return. 0 means use default (2000).
   uint32 lines = 2;
-  // Only include logs with timestamp >= this value (ms since epoch). 0 means no filter.
-  int64 since_ms = 3;
+  // Only include logs at or after this time. Absence means no filter.
+  google.protobuf.Timestamp since_time = 103;
   // Filter by log source (e.g. "gateway", "sandbox"). Empty means all sources.
   repeated string sources = 4;
   // Minimum log level to include (e.g. "INFO", "WARN", "ERROR"). Empty means all levels.
@@ -2234,10 +2266,12 @@ message SupervisorHello {
 
 // Gateway accepts the supervisor session.
 message SessionAccepted {
+  reserved 2;
+  reserved "heartbeat_interval_secs";
   // Gateway-assigned session ID for this connection.
   string session_id = 1;
-  // Recommended heartbeat interval in seconds.
-  uint32 heartbeat_interval_secs = 2;
+  // Recommended heartbeat interval.
+  google.protobuf.Duration heartbeat_interval = 102;
 }
 
 // Gateway rejects the supervisor session.
@@ -2367,6 +2401,8 @@ message L7RequestSample {
 
 // Structured denial summary from sandbox aggregator.
 message DenialSummary {
+  reserved 7, 8;
+  reserved "first_seen_ms", "last_seen_ms";
   // Sandbox ID that produced this summary.
   string sandbox_id = 1;
   // Denied destination host.
@@ -2379,10 +2415,10 @@ message DenialSummary {
   repeated string ancestors = 5;
   // Denial reason from OPA evaluation.
   string deny_reason = 6;
-  // First denial timestamp (ms since epoch).
-  int64 first_seen_ms = 7;
-  // Most recent denial timestamp (ms since epoch).
-  int64 last_seen_ms = 8;
+  // Time of the first denial.
+  google.protobuf.Timestamp first_seen_time = 107;
+  // Time of the most recent denial.
+  google.protobuf.Timestamp last_seen_time = 108;
   // Number of denials in the current window.
   uint32 count = 9;
   // Events dropped during aggregator cooldown.
@@ -2424,6 +2460,8 @@ message NetworkActivitySummary {
 
 // A proposed policy rule with rationale and approval status.
 message PolicyChunk {
+  reserved 9, 10, 14, 15;
+  reserved "created_at_ms", "decided_at_ms", "first_seen_ms", "last_seen_ms";
   // Unique chunk identifier.
   string id = 1;
   // Approval status: "pending", "approved", "rejected".
@@ -2440,20 +2478,20 @@ message PolicyChunk {
   float confidence = 7;
   // IDs of denial summaries that led to this chunk.
   repeated string denial_summary_ids = 8;
-  // Creation timestamp (ms since epoch).
-  int64 created_at_ms = 9;
-  // When the user approved/rejected (ms since epoch). 0 if undecided.
-  int64 decided_at_ms = 10;
+  // Time when this chunk was created.
+  google.protobuf.Timestamp created_time = 109;
+  // Time when the user approved or rejected the chunk. Absent if undecided.
+  google.protobuf.Timestamp decided_time = 110;
   // Recommendation stage: "initial" or "refined" (progressive L7 visibility).
   string stage = 11;
   // For stage="refined": the initial chunk this replaces.
   string supersedes_chunk_id = 12;
   // How many times this endpoint has been seen across denial flush cycles.
   int32 hit_count = 13;
-  // First time this endpoint was proposed (ms since epoch).
-  int64 first_seen_ms = 14;
-  // Most recent time this endpoint was re-proposed (ms since epoch).
-  int64 last_seen_ms = 15;
+  // First time this endpoint was proposed.
+  google.protobuf.Timestamp first_seen_time = 114;
+  // Most recent time this endpoint was proposed again.
+  google.protobuf.Timestamp last_seen_time = 115;
   // Binary path that triggered the denial (denormalized for display convenience).
   string binary = 16;
   // Validation verdict from gateway-side static checks (prover output).
@@ -2539,14 +2577,16 @@ message GetDraftPolicyRequest {
 }
 
 message GetDraftPolicyResponse {
+  reserved 4;
+  reserved "last_analyzed_at_ms";
   // Draft policy chunks.
   repeated PolicyChunk chunks = 1;
   // LLM-generated summary of all analysis (empty in mechanistic mode).
   string rolling_summary = 2;
   // Current draft version.
   uint64 draft_version = 3;
-  // When the last analysis completed (ms since epoch).
-  int64 last_analyzed_at_ms = 4;
+  // Time when the last analysis completed.
+  google.protobuf.Timestamp last_analyzed_time = 104;
 }
 
 // Approve a single draft chunk.
@@ -2666,8 +2706,10 @@ message GetDraftHistoryRequest {
 }
 
 message DraftHistoryEntry {
-  // Event timestamp (ms since epoch).
-  int64 timestamp_ms = 1;
+  reserved 1;
+  reserved "timestamp_ms";
+  // Time when the event occurred.
+  google.protobuf.Timestamp event_time = 101;
   // Event type: "denial_detected", "analysis_cycle", "approved",
   // "rejected", "edited", "undone", "cleared".
   string event_type = 2;
@@ -2906,11 +2948,13 @@ message ListWorkspaceMembersResponse {
 // Kept at the end of the file so adding it does not renumber existing
 // generated message descriptors.
 message ExtensionServiceCredential {
+  reserved 3;
+  reserved "expires_at_ms";
   // Operator registration name used to correlate the credential with the
   // stable service registration delivered by GetSandboxConfig.
   string service_name = 1;
   // Gateway-minted JWT with an audience derived from the registration.
   string token = 2 [(openshell.options.v1.secret) = true];
-  // Absolute expiry of the token, milliseconds since the epoch.
-  int64 expires_at_ms = 3;
+  // Absolute expiry of the token.
+  google.protobuf.Timestamp expiration_time = 103;
 }

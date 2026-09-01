@@ -23,12 +23,12 @@ func SandboxFromProto(s *pb.Sandbox) *types.Sandbox {
 	if m := s.GetMetadata(); m != nil {
 		result.ID = m.GetId()
 		result.Name = m.GetName()
-		result.CreatedAt = TimeFromMillis(m.GetCreatedAtMs())
+		result.CreatedAt = TimeFromProto(m.GetCreatedTime())
 		result.Labels = CopyStringMap(m.GetLabels())
 		result.Annotations = CopyStringMap(m.GetAnnotations())
 		result.ResourceVersion = m.GetResourceVersion()
 		result.Workspace = m.GetWorkspace()
-		result.DeletionTimestamp = TimeFromMillisPtr(m.GetDeletionTimestampMs())
+		result.DeletionTimestamp = TimePtrFromProto(m.GetDeletionTime())
 	}
 
 	if spec := s.GetSpec(); spec != nil {
@@ -98,7 +98,7 @@ func sandboxStatusFromProto(status *pb.SandboxStatus) types.SandboxStatus {
 			Status:             c.GetStatus(),
 			Reason:             c.GetReason(),
 			Message:            c.GetMessage(),
-			LastTransitionTime: c.GetLastTransitionTime(),
+			LastTransitionTime: TimestampStringFromProto(c.GetTransitionTime()),
 		})
 	}
 	result.ExitCode = CopyInt32Ptr(status.ExitCode)
@@ -166,14 +166,14 @@ func SandboxToProto(s *types.Sandbox) *pb.Sandbox {
 
 	return &pb.Sandbox{
 		Metadata: &dm.ObjectMeta{
-			Id:                  s.ID,
-			Name:                s.Name,
-			CreatedAtMs:         MillisFromTime(s.CreatedAt),
-			Labels:              CopyStringMap(s.Labels),
-			Annotations:         CopyStringMap(s.Annotations),
-			ResourceVersion:     s.ResourceVersion,
-			Workspace:           s.Workspace,
-			DeletionTimestampMs: MillisFromTimePtr(s.DeletionTimestamp),
+			Id:              s.ID,
+			Name:            s.Name,
+			CreatedTime:     TimestampFromTime(s.CreatedAt),
+			Labels:          CopyStringMap(s.Labels),
+			Annotations:     CopyStringMap(s.Annotations),
+			ResourceVersion: s.ResourceVersion,
+			Workspace:       s.Workspace,
+			DeletionTime:    TimestampFromTimePtr(s.DeletionTimestamp),
 		},
 		Spec: SandboxSpecToProto(&s.Spec),
 	}

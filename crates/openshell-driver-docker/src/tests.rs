@@ -3121,7 +3121,7 @@ fn exited_sandbox_with_ready_reason(reason: &str) -> DriverSandbox {
                 status: "False".to_string(),
                 reason: reason.to_string(),
                 message: "Container exited".to_string(),
-                last_transition_time: String::new(),
+                transition_time: None,
             }],
             deleting: false,
         }),

@@ -8,6 +8,7 @@ import (
 	"net"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/NVIDIA/OpenShell/sdk/go/openshell/v1/types"
 	pb "github.com/NVIDIA/OpenShell/sdk/go/proto/openshellv1"
@@ -19,7 +20,12 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
 	"google.golang.org/grpc/test/bufconn"
+	"google.golang.org/protobuf/types/known/timestamppb"
 )
+
+func testTimestamp(milliseconds int64) *timestamppb.Timestamp {
+	return timestamppb.New(time.UnixMilli(milliseconds))
+}
 
 // --- Mock server for Policy RPCs ---
 
@@ -206,7 +212,7 @@ func TestPolicyGetDraft(t *testing.T) {
 				Rationale:        "DNS access needed",
 				Confidence:       0.95,
 				DenialSummaryIds: []string{"ds-1", "ds-2"},
-				CreatedAtMs:      1700000000000,
+				CreatedTime:      testTimestamp(1700000000000),
 				Stage:            "initial",
 				HitCount:         3,
 				Binary:           "/usr/bin/curl",
@@ -222,7 +228,7 @@ func TestPolicyGetDraft(t *testing.T) {
 		},
 		RollingSummary:   "Two rules proposed",
 		DraftVersion:     5,
-		LastAnalyzedAtMs: 1700000001000,
+		LastAnalyzedTime: testTimestamp(1700000001000),
 	}
 
 	client, cleanup := setupPolicyTest(t, mock)
@@ -493,13 +499,13 @@ func TestPolicyGetDraftHistory(t *testing.T) {
 	mock.historyResp = &pb.GetDraftHistoryResponse{
 		Entries: []*pb.DraftHistoryEntry{
 			{
-				TimestampMs: 1700000000000,
+				EventTime:   testTimestamp(1700000000000),
 				EventType:   "approved",
 				Description: "Chunk chunk-1 approved",
 				ChunkId:     "chunk-1",
 			},
 			{
-				TimestampMs: 1700000001000,
+				EventTime:   testTimestamp(1700000001000),
 				EventType:   "rejected",
 				Description: "Chunk chunk-2 rejected: too broad",
 				ChunkId:     "chunk-2",
@@ -567,8 +573,8 @@ func TestPolicyGetStatus(t *testing.T) {
 			Version:     3,
 			PolicyHash:  "sha256:rev3",
 			Status:      pb.PolicyStatus_POLICY_STATUS_LOADED,
-			CreatedAtMs: 1700000000000,
-			LoadedAtMs:  1700000001000,
+			CreatedTime: testTimestamp(1700000000000),
+			LoadedTime:  testTimestamp(1700000001000),
 		},
 		ActiveVersion: 3,
 	}
@@ -758,14 +764,14 @@ func TestPolicyList(t *testing.T) {
 				Version:     1,
 				PolicyHash:  "sha256:v1",
 				Status:      pb.PolicyStatus_POLICY_STATUS_SUPERSEDED,
-				CreatedAtMs: 1700000000000,
+				CreatedTime: testTimestamp(1700000000000),
 			},
 			{
 				Version:     2,
 				PolicyHash:  "sha256:v2",
 				Status:      pb.PolicyStatus_POLICY_STATUS_LOADED,
-				CreatedAtMs: 1700000001000,
-				LoadedAtMs:  1700000002000,
+				CreatedTime: testTimestamp(1700000001000),
+				LoadedTime:  testTimestamp(1700000002000),
 			},
 		},
 	}

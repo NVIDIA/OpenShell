@@ -6,6 +6,8 @@ syntax = "proto3";
 package openshell.inference.v1;
 
 import "datamodel.proto";
+import "google/protobuf/duration.proto";
+import "google/protobuf/timestamp.proto";
 import "options.proto";
 
 // Inference service provides workspace-scoped inference route configuration and bundle delivery.
@@ -57,12 +59,14 @@ service Inference {
 // Only `provider_name` and `model_id` are stored; endpoint, protocols,
 // credentials, and auth style are resolved from the provider at bundle time.
 message InferenceRouteConfig {
+  reserved 3;
+  reserved "timeout_secs";
   // Provider record name backing this route.
   string provider_name = 1;
   // Model identifier to force on generation calls.
   string model_id = 2;
-  // Per-route request timeout in seconds. 0 means use default (60s).
-  uint64 timeout_secs = 3;
+  // Per-route request timeout. Absence means use the default (60s).
+  google.protobuf.Duration request_timeout = 103;
 }
 
 // Storage envelope for a workspace-scoped inference route.
@@ -74,6 +78,8 @@ message InferenceRoute {
 }
 
 message SetInferenceRouteRequest {
+  reserved 6;
+  reserved "timeout_secs";
   // Provider record name to use for credentials + endpoint mapping.
   string provider_name = 1;
   // Model identifier to force on generation calls.
@@ -85,8 +91,8 @@ message SetInferenceRouteRequest {
   bool verify = 4;
   // Skip synchronous endpoint validation before persistence.
   bool no_verify = 5;
-  // Per-route request timeout in seconds. 0 means use default (60s).
-  uint64 timeout_secs = 6;
+  // Per-route request timeout. Absence means use the default (60s).
+  google.protobuf.Duration request_timeout = 106;
   // Target workspace. Empty string defaults to "default".
   string workspace = 7;
 }
@@ -97,6 +103,8 @@ message ValidatedEndpoint {
 }
 
 message SetInferenceRouteResponse {
+  reserved 7;
+  reserved "timeout_secs";
   string provider_name = 1;
   string model_id = 2;
   uint64 version = 3;
@@ -106,8 +114,8 @@ message SetInferenceRouteResponse {
   bool validation_performed = 5;
   // The concrete endpoints that were probed during validation, when available.
   repeated ValidatedEndpoint validated_endpoints = 6;
-  // Per-route request timeout in seconds that was persisted.
-  uint64 timeout_secs = 7;
+  // Per-route request timeout that was persisted.
+  google.protobuf.Duration request_timeout = 107;
   // Workspace the route was configured in.
   string workspace = 8;
 }
@@ -121,13 +129,15 @@ message GetInferenceRouteRequest {
 }
 
 message GetInferenceRouteResponse {
+  reserved 5;
+  reserved "timeout_secs";
   string provider_name = 1;
   string model_id = 2;
   uint64 version = 3;
   // Route name that was queried.
   string route_name = 4;
-  // Per-route request timeout in seconds. 0 means default (60s).
-  uint64 timeout_secs = 5;
+  // Per-route request timeout. Absence means the default (60s).
+  google.protobuf.Duration request_timeout = 105;
   // Workspace the route belongs to.
   string workspace = 6;
 }
@@ -149,14 +159,16 @@ message GetInferenceBundleRequest {}
 
 // A single resolved route ready for sandbox-local execution.
 message ResolvedRoute {
+  reserved 7;
+  reserved "timeout_secs";
   string name = 1;
   string base_url = 2;
   repeated string protocols = 3;
   string api_key = 4 [(openshell.options.v1.secret) = true];
   string model_id = 5;
   string provider_type = 6;
-  // Per-route request timeout in seconds. 0 means use default (60s).
-  uint64 timeout_secs = 7;
+  // Per-route request timeout. Absence means use the default (60s).
+  google.protobuf.Duration request_timeout = 107;
   // When true, the model identifier is embedded in the URL path (e.g. Vertex AI).
   bool model_in_path = 8;
   // Optional override for the request path. When set, replaces the protocol-derived path.
@@ -165,9 +177,11 @@ message ResolvedRoute {
 }
 
 message GetInferenceBundleResponse {
+  reserved 3;
+  reserved "generated_at_ms";
   repeated ResolvedRoute routes = 1;
   // Opaque revision tag for cache freshness checks.
   string revision = 2;
-  // Timestamp (epoch ms) when this bundle was generated.
-  int64 generated_at_ms = 3;
+  // Time when this bundle was generated.
+  google.protobuf.Timestamp generated_time = 103;
 }

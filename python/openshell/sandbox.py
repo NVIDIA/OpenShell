@@ -927,10 +927,11 @@ class SandboxClient:
             command=list(command),
             workdir=workdir or "",
             environment=dict(env or {}),
-            timeout_seconds=timeout_seconds or 0,
             stdin=stdin or b"",
             no_login_shell=no_login_shell,
         )
+        if timeout_seconds:
+            request.execution_timeout.seconds = timeout_seconds
         # Use whichever is larger: the default client timeout or the command
         # timeout plus headroom for SSH setup / teardown overhead.
         grpc_deadline = self._timeout

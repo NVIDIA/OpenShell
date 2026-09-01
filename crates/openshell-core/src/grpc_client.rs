@@ -31,6 +31,7 @@ use crate::proto::{
     UpdateConfigRequest, inference_client::InferenceClient, open_shell_client::OpenShellClient,
 };
 use crate::sandbox_env;
+use crate::time::{duration_to_std, timestamp_to_millis};
 use miette::{IntoDiagnostic, Result, WrapErr};
 use openshell_extension_core::{BearerTokenSlot, ExtensionCredentialStore};
 use tonic::Status;
@@ -483,10 +484,11 @@ async fn refresh_extension_credentials_with_client(
                 "gateway returned an unexpected or duplicate extension credential"
             ));
         }
-        validated.insert(
-            credential.service_name,
-            (credential.token, credential.expires_at_ms),
-        );
+        let expiration_time = credential.expiration_time.as_ref().ok_or_else(|| {
+            miette::miette!("gateway returned an extension credential without an expiration time")
+        })?;
+        let expires_at_ms = timestamp_to_millis(expiration_time).into_diagnostic()?;
+        validated.insert(credential.service_name, (credential.token, expires_at_ms));
     }
     if validated.len() != expected.len() {
         return Err(miette::miette!(
@@ -850,10 +852,19 @@ pub async fn fetch_provider_environment(
         .into_diagnostic()?;
 
     let inner = response.into_inner();
+    let credential_expires_at_ms = inner
+        .credential_expiration_times
+        .iter()
+        .map(|(name, expiration_time)| {
+            timestamp_to_millis(expiration_time)
+                .map(|value| (name.clone(), value))
+                .into_diagnostic()
+        })
+        .collect::<Result<HashMap<_, _>>>()?;
     Ok(ProviderEnvironmentResult {
         environment: inner.environment,
         provider_env_revision: inner.provider_env_revision,
-        credential_expires_at_ms: inner.credential_expires_at_ms,
+        credential_expires_at_ms,
         dynamic_credentials: inner.dynamic_credentials,
         static_credential_bindings: inner.static_credential_bindings,
         non_secret_environment_keys: inner.non_secret_environment_keys,
@@ -886,9 +897,18 @@ pub async fn exchange_provider_subject_token(
         .await
         .map_err(provider_subject_token_exchange_status)?;
     let inner = response.into_inner();
+    let expires_in = inner
+        .expires_after
+        .as_ref()
+        .map(duration_to_std)
+        .transpose()
+        .into_diagnostic()?
+        .map_or(0, |value| {
+            i64::try_from(value.as_secs()).unwrap_or(i64::MAX)
+        });
     Ok(ProviderSubjectTokenExchangeResult {
         access_token: inner.access_token,
-        expires_in: inner.expires_in,
+        expires_in,
         token_type: inner.token_type,
     })
 }

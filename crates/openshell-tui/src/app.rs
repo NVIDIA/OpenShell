@@ -881,9 +881,12 @@ fn provider_to_redacted_yaml(provider: &openshell_core::proto::Provider) -> Stri
         }
     }
 
-    if !provider.credential_expires_at_ms.is_empty() {
-        out.push_str("credential_expires_at_ms:\n");
-        let mut entries = provider.credential_expires_at_ms.iter().collect::<Vec<_>>();
+    if !provider.credential_expiration_times.is_empty() {
+        out.push_str("credential_expiration_times:\n");
+        let mut entries = provider
+            .credential_expiration_times
+            .iter()
+            .collect::<Vec<_>>();
         entries.sort_by_key(|(key, _)| *key);
         for (key, value) in entries {
             out.push_str("  ");
@@ -3189,10 +3192,9 @@ impl App {
                             .get(key)
                             .map_or_else(|| "-".to_string(), |value| mask_secret(value));
                         let expiry = provider
-                            .credential_expires_at_ms
+                            .credential_expiration_times
                             .get(key)
-                            .copied()
-                            .filter(|value| *value > 0)
+                            .and_then(|value| openshell_core::time::timestamp_to_millis(value).ok())
                             .map_or_else(String::new, |value| format!(" expires={value}"));
                         format!("{key}: {masked}{expiry}")
                     })
@@ -3219,9 +3221,8 @@ impl App {
                             credential.env_vars.join(", ")
                         };
                         let expiry = present_key
-                            .and_then(|key| provider.credential_expires_at_ms.get(key))
-                            .copied()
-                            .filter(|value| *value > 0)
+                            .and_then(|key| provider.credential_expiration_times.get(key))
+                            .and_then(|value| openshell_core::time::timestamp_to_millis(value).ok())
                             .map_or_else(String::new, |value| format!(" expires={value}"));
                         format!(
                             "{} ({required}) env=[{env_vars}] {status}{expiry}",

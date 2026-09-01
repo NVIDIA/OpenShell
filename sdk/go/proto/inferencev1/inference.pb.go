@@ -14,6 +14,8 @@ import (
 	_ "github.com/NVIDIA/OpenShell/sdk/go/proto/optionsv1"
 	protoreflect "google.golang.org/protobuf/reflect/protoreflect"
 	protoimpl "google.golang.org/protobuf/runtime/protoimpl"
+	durationpb "google.golang.org/protobuf/types/known/durationpb"
+	timestamppb "google.golang.org/protobuf/types/known/timestamppb"
 	reflect "reflect"
 	sync "sync"
 	unsafe "unsafe"
@@ -36,10 +38,10 @@ type InferenceRouteConfig struct {
 	ProviderName string `protobuf:"bytes,1,opt,name=provider_name,json=providerName,proto3" json:"provider_name,omitempty"`
 	// Model identifier to force on generation calls.
 	ModelId string `protobuf:"bytes,2,opt,name=model_id,json=modelId,proto3" json:"model_id,omitempty"`
-	// Per-route request timeout in seconds. 0 means use default (60s).
-	TimeoutSecs   uint64 `protobuf:"varint,3,opt,name=timeout_secs,json=timeoutSecs,proto3" json:"timeout_secs,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	// Per-route request timeout. Absence means use the default (60s).
+	RequestTimeout *durationpb.Duration `protobuf:"bytes,103,opt,name=request_timeout,json=requestTimeout,proto3" json:"request_timeout,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
 }
 
 func (x *InferenceRouteConfig) Reset() {
@@ -86,11 +88,11 @@ func (x *InferenceRouteConfig) GetModelId() string {
 	return ""
 }
 
-func (x *InferenceRouteConfig) GetTimeoutSecs() uint64 {
+func (x *InferenceRouteConfig) GetRequestTimeout() *durationpb.Duration {
 	if x != nil {
-		return x.TimeoutSecs
+		return x.RequestTimeout
 	}
-	return 0
+	return nil
 }
 
 // Storage envelope for a workspace-scoped inference route.
@@ -168,8 +170,8 @@ type SetInferenceRouteRequest struct {
 	Verify bool `protobuf:"varint,4,opt,name=verify,proto3" json:"verify,omitempty"`
 	// Skip synchronous endpoint validation before persistence.
 	NoVerify bool `protobuf:"varint,5,opt,name=no_verify,json=noVerify,proto3" json:"no_verify,omitempty"`
-	// Per-route request timeout in seconds. 0 means use default (60s).
-	TimeoutSecs uint64 `protobuf:"varint,6,opt,name=timeout_secs,json=timeoutSecs,proto3" json:"timeout_secs,omitempty"`
+	// Per-route request timeout. Absence means use the default (60s).
+	RequestTimeout *durationpb.Duration `protobuf:"bytes,106,opt,name=request_timeout,json=requestTimeout,proto3" json:"request_timeout,omitempty"`
 	// Target workspace. Empty string defaults to "default".
 	Workspace     string `protobuf:"bytes,7,opt,name=workspace,proto3" json:"workspace,omitempty"`
 	unknownFields protoimpl.UnknownFields
@@ -241,11 +243,11 @@ func (x *SetInferenceRouteRequest) GetNoVerify() bool {
 	return false
 }
 
-func (x *SetInferenceRouteRequest) GetTimeoutSecs() uint64 {
+func (x *SetInferenceRouteRequest) GetRequestTimeout() *durationpb.Duration {
 	if x != nil {
-		return x.TimeoutSecs
+		return x.RequestTimeout
 	}
-	return 0
+	return nil
 }
 
 func (x *SetInferenceRouteRequest) GetWorkspace() string {
@@ -318,8 +320,8 @@ type SetInferenceRouteResponse struct {
 	ValidationPerformed bool `protobuf:"varint,5,opt,name=validation_performed,json=validationPerformed,proto3" json:"validation_performed,omitempty"`
 	// The concrete endpoints that were probed during validation, when available.
 	ValidatedEndpoints []*ValidatedEndpoint `protobuf:"bytes,6,rep,name=validated_endpoints,json=validatedEndpoints,proto3" json:"validated_endpoints,omitempty"`
-	// Per-route request timeout in seconds that was persisted.
-	TimeoutSecs uint64 `protobuf:"varint,7,opt,name=timeout_secs,json=timeoutSecs,proto3" json:"timeout_secs,omitempty"`
+	// Per-route request timeout that was persisted.
+	RequestTimeout *durationpb.Duration `protobuf:"bytes,107,opt,name=request_timeout,json=requestTimeout,proto3" json:"request_timeout,omitempty"`
 	// Workspace the route was configured in.
 	Workspace     string `protobuf:"bytes,8,opt,name=workspace,proto3" json:"workspace,omitempty"`
 	unknownFields protoimpl.UnknownFields
@@ -398,11 +400,11 @@ func (x *SetInferenceRouteResponse) GetValidatedEndpoints() []*ValidatedEndpoint
 	return nil
 }
 
-func (x *SetInferenceRouteResponse) GetTimeoutSecs() uint64 {
+func (x *SetInferenceRouteResponse) GetRequestTimeout() *durationpb.Duration {
 	if x != nil {
-		return x.TimeoutSecs
+		return x.RequestTimeout
 	}
-	return 0
+	return nil
 }
 
 func (x *SetInferenceRouteResponse) GetWorkspace() string {
@@ -474,8 +476,8 @@ type GetInferenceRouteResponse struct {
 	Version      uint64                 `protobuf:"varint,3,opt,name=version,proto3" json:"version,omitempty"`
 	// Route name that was queried.
 	RouteName string `protobuf:"bytes,4,opt,name=route_name,json=routeName,proto3" json:"route_name,omitempty"`
-	// Per-route request timeout in seconds. 0 means default (60s).
-	TimeoutSecs uint64 `protobuf:"varint,5,opt,name=timeout_secs,json=timeoutSecs,proto3" json:"timeout_secs,omitempty"`
+	// Per-route request timeout. Absence means the default (60s).
+	RequestTimeout *durationpb.Duration `protobuf:"bytes,105,opt,name=request_timeout,json=requestTimeout,proto3" json:"request_timeout,omitempty"`
 	// Workspace the route belongs to.
 	Workspace     string `protobuf:"bytes,6,opt,name=workspace,proto3" json:"workspace,omitempty"`
 	unknownFields protoimpl.UnknownFields
@@ -540,11 +542,11 @@ func (x *GetInferenceRouteResponse) GetRouteName() string {
 	return ""
 }
 
-func (x *GetInferenceRouteResponse) GetTimeoutSecs() uint64 {
+func (x *GetInferenceRouteResponse) GetRequestTimeout() *durationpb.Duration {
 	if x != nil {
-		return x.TimeoutSecs
+		return x.RequestTimeout
 	}
-	return 0
+	return nil
 }
 
 func (x *GetInferenceRouteResponse) GetWorkspace() string {
@@ -699,8 +701,8 @@ type ResolvedRoute struct {
 	ApiKey       string                 `protobuf:"bytes,4,opt,name=api_key,json=apiKey,proto3" json:"api_key,omitempty"`
 	ModelId      string                 `protobuf:"bytes,5,opt,name=model_id,json=modelId,proto3" json:"model_id,omitempty"`
 	ProviderType string                 `protobuf:"bytes,6,opt,name=provider_type,json=providerType,proto3" json:"provider_type,omitempty"`
-	// Per-route request timeout in seconds. 0 means use default (60s).
-	TimeoutSecs uint64 `protobuf:"varint,7,opt,name=timeout_secs,json=timeoutSecs,proto3" json:"timeout_secs,omitempty"`
+	// Per-route request timeout. Absence means use the default (60s).
+	RequestTimeout *durationpb.Duration `protobuf:"bytes,107,opt,name=request_timeout,json=requestTimeout,proto3" json:"request_timeout,omitempty"`
 	// When true, the model identifier is embedded in the URL path (e.g. Vertex AI).
 	ModelInPath bool `protobuf:"varint,8,opt,name=model_in_path,json=modelInPath,proto3" json:"model_in_path,omitempty"`
 	// Optional override for the request path. When set, replaces the protocol-derived path.
@@ -782,11 +784,11 @@ func (x *ResolvedRoute) GetProviderType() string {
 	return ""
 }
 
-func (x *ResolvedRoute) GetTimeoutSecs() uint64 {
+func (x *ResolvedRoute) GetRequestTimeout() *durationpb.Duration {
 	if x != nil {
-		return x.TimeoutSecs
+		return x.RequestTimeout
 	}
-	return 0
+	return nil
 }
 
 func (x *ResolvedRoute) GetModelInPath() bool {
@@ -808,8 +810,8 @@ type GetInferenceBundleResponse struct {
 	Routes []*ResolvedRoute       `protobuf:"bytes,1,rep,name=routes,proto3" json:"routes,omitempty"`
 	// Opaque revision tag for cache freshness checks.
 	Revision string `protobuf:"bytes,2,opt,name=revision,proto3" json:"revision,omitempty"`
-	// Timestamp (epoch ms) when this bundle was generated.
-	GeneratedAtMs int64 `protobuf:"varint,3,opt,name=generated_at_ms,json=generatedAtMs,proto3" json:"generated_at_ms,omitempty"`
+	// Time when this bundle was generated.
+	GeneratedTime *timestamppb.Timestamp `protobuf:"bytes,103,opt,name=generated_time,json=generatedTime,proto3" json:"generated_time,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -858,38 +860,38 @@ func (x *GetInferenceBundleResponse) GetRevision() string {
 	return ""
 }
 
-func (x *GetInferenceBundleResponse) GetGeneratedAtMs() int64 {
+func (x *GetInferenceBundleResponse) GetGeneratedTime() *timestamppb.Timestamp {
 	if x != nil {
-		return x.GeneratedAtMs
+		return x.GeneratedTime
 	}
-	return 0
+	return nil
 }
 
 var File_inference_proto protoreflect.FileDescriptor
 
 const file_inference_proto_rawDesc = "" +
 	"\n" +
-	"\x0finference.proto\x12\x16openshell.inference.v1\x1a\x0fdatamodel.proto\x1a\roptions.proto\"y\n" +
+	"\x0finference.proto\x12\x16openshell.inference.v1\x1a\x0fdatamodel.proto\x1a\x1egoogle/protobuf/duration.proto\x1a\x1fgoogle/protobuf/timestamp.proto\x1a\roptions.proto\"\xae\x01\n" +
 	"\x14InferenceRouteConfig\x12#\n" +
 	"\rprovider_name\x18\x01 \x01(\tR\fproviderName\x12\x19\n" +
-	"\bmodel_id\x18\x02 \x01(\tR\amodelId\x12!\n" +
-	"\ftimeout_secs\x18\x03 \x01(\x04R\vtimeoutSecs\"\xb0\x01\n" +
+	"\bmodel_id\x18\x02 \x01(\tR\amodelId\x12B\n" +
+	"\x0frequest_timeout\x18g \x01(\v2\x19.google.protobuf.DurationR\x0erequestTimeoutJ\x04\b\x03\x10\x04R\ftimeout_secs\"\xb0\x01\n" +
 	"\x0eInferenceRoute\x12>\n" +
 	"\bmetadata\x18\x01 \x01(\v2\".openshell.datamodel.v1.ObjectMetaR\bmetadata\x12D\n" +
 	"\x06config\x18\x02 \x01(\v2,.openshell.inference.v1.InferenceRouteConfigR\x06config\x12\x18\n" +
-	"\aversion\x18\x03 \x01(\x04R\aversion\"\xef\x01\n" +
+	"\aversion\x18\x03 \x01(\x04R\aversion\"\xa4\x02\n" +
 	"\x18SetInferenceRouteRequest\x12#\n" +
 	"\rprovider_name\x18\x01 \x01(\tR\fproviderName\x12\x19\n" +
 	"\bmodel_id\x18\x02 \x01(\tR\amodelId\x12\x1d\n" +
 	"\n" +
 	"route_name\x18\x03 \x01(\tR\trouteName\x12\x16\n" +
 	"\x06verify\x18\x04 \x01(\bR\x06verify\x12\x1b\n" +
-	"\tno_verify\x18\x05 \x01(\bR\bnoVerify\x12!\n" +
-	"\ftimeout_secs\x18\x06 \x01(\x04R\vtimeoutSecs\x12\x1c\n" +
-	"\tworkspace\x18\a \x01(\tR\tworkspace\"A\n" +
+	"\tno_verify\x18\x05 \x01(\bR\bnoVerify\x12B\n" +
+	"\x0frequest_timeout\x18j \x01(\v2\x19.google.protobuf.DurationR\x0erequestTimeout\x12\x1c\n" +
+	"\tworkspace\x18\a \x01(\tR\tworkspaceJ\x04\b\x06\x10\aR\ftimeout_secs\"A\n" +
 	"\x11ValidatedEndpoint\x12\x10\n" +
 	"\x03url\x18\x01 \x01(\tR\x03url\x12\x1a\n" +
-	"\bprotocol\x18\x02 \x01(\tR\bprotocol\"\xe4\x02\n" +
+	"\bprotocol\x18\x02 \x01(\tR\bprotocol\"\x99\x03\n" +
 	"\x19SetInferenceRouteResponse\x12#\n" +
 	"\rprovider_name\x18\x01 \x01(\tR\fproviderName\x12\x19\n" +
 	"\bmodel_id\x18\x02 \x01(\tR\amodelId\x12\x18\n" +
@@ -897,43 +899,43 @@ const file_inference_proto_rawDesc = "" +
 	"\n" +
 	"route_name\x18\x04 \x01(\tR\trouteName\x121\n" +
 	"\x14validation_performed\x18\x05 \x01(\bR\x13validationPerformed\x12Z\n" +
-	"\x13validated_endpoints\x18\x06 \x03(\v2).openshell.inference.v1.ValidatedEndpointR\x12validatedEndpoints\x12!\n" +
-	"\ftimeout_secs\x18\a \x01(\x04R\vtimeoutSecs\x12\x1c\n" +
-	"\tworkspace\x18\b \x01(\tR\tworkspace\"W\n" +
+	"\x13validated_endpoints\x18\x06 \x03(\v2).openshell.inference.v1.ValidatedEndpointR\x12validatedEndpoints\x12B\n" +
+	"\x0frequest_timeout\x18k \x01(\v2\x19.google.protobuf.DurationR\x0erequestTimeout\x12\x1c\n" +
+	"\tworkspace\x18\b \x01(\tR\tworkspaceJ\x04\b\a\x10\bR\ftimeout_secs\"W\n" +
 	"\x18GetInferenceRouteRequest\x12\x1d\n" +
 	"\n" +
 	"route_name\x18\x01 \x01(\tR\trouteName\x12\x1c\n" +
-	"\tworkspace\x18\x02 \x01(\tR\tworkspace\"\xd5\x01\n" +
+	"\tworkspace\x18\x02 \x01(\tR\tworkspace\"\x8a\x02\n" +
 	"\x19GetInferenceRouteResponse\x12#\n" +
 	"\rprovider_name\x18\x01 \x01(\tR\fproviderName\x12\x19\n" +
 	"\bmodel_id\x18\x02 \x01(\tR\amodelId\x12\x18\n" +
 	"\aversion\x18\x03 \x01(\x04R\aversion\x12\x1d\n" +
 	"\n" +
-	"route_name\x18\x04 \x01(\tR\trouteName\x12!\n" +
-	"\ftimeout_secs\x18\x05 \x01(\x04R\vtimeoutSecs\x12\x1c\n" +
-	"\tworkspace\x18\x06 \x01(\tR\tworkspace\"Z\n" +
+	"route_name\x18\x04 \x01(\tR\trouteName\x12B\n" +
+	"\x0frequest_timeout\x18i \x01(\v2\x19.google.protobuf.DurationR\x0erequestTimeout\x12\x1c\n" +
+	"\tworkspace\x18\x06 \x01(\tR\tworkspaceJ\x04\b\x05\x10\x06R\ftimeout_secs\"Z\n" +
 	"\x1bDeleteInferenceRouteRequest\x12\x1d\n" +
 	"\n" +
 	"route_name\x18\x01 \x01(\tR\trouteName\x12\x1c\n" +
 	"\tworkspace\x18\x02 \x01(\tR\tworkspace\"8\n" +
 	"\x1cDeleteInferenceRouteResponse\x12\x18\n" +
 	"\adeleted\x18\x01 \x01(\bR\adeleted\"\x1b\n" +
-	"\x19GetInferenceBundleRequest\"\xd5\x02\n" +
+	"\x19GetInferenceBundleRequest\"\x8a\x03\n" +
 	"\rResolvedRoute\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x19\n" +
 	"\bbase_url\x18\x02 \x01(\tR\abaseUrl\x12\x1c\n" +
 	"\tprotocols\x18\x03 \x03(\tR\tprotocols\x12\x1d\n" +
 	"\aapi_key\x18\x04 \x01(\tB\x04\x88\xb5\x18\x01R\x06apiKey\x12\x19\n" +
 	"\bmodel_id\x18\x05 \x01(\tR\amodelId\x12#\n" +
-	"\rprovider_type\x18\x06 \x01(\tR\fproviderType\x12!\n" +
-	"\ftimeout_secs\x18\a \x01(\x04R\vtimeoutSecs\x12\"\n" +
+	"\rprovider_type\x18\x06 \x01(\tR\fproviderType\x12B\n" +
+	"\x0frequest_timeout\x18k \x01(\v2\x19.google.protobuf.DurationR\x0erequestTimeout\x12\"\n" +
 	"\rmodel_in_path\x18\b \x01(\bR\vmodelInPath\x127\n" +
 	"\x15request_path_override\x18\t \x01(\tH\x00R\x13requestPathOverride\x88\x01\x01B\x18\n" +
-	"\x16_request_path_override\"\x9f\x01\n" +
+	"\x16_request_path_overrideJ\x04\b\a\x10\bR\ftimeout_secs\"\xd1\x01\n" +
 	"\x1aGetInferenceBundleResponse\x12=\n" +
 	"\x06routes\x18\x01 \x03(\v2%.openshell.inference.v1.ResolvedRouteR\x06routes\x12\x1a\n" +
-	"\brevision\x18\x02 \x01(\tR\brevision\x12&\n" +
-	"\x0fgenerated_at_ms\x18\x03 \x01(\x03R\rgeneratedAtMs2\x82\x05\n" +
+	"\brevision\x18\x02 \x01(\tR\brevision\x12A\n" +
+	"\x0egenerated_time\x18g \x01(\v2\x1a.google.protobuf.TimestampR\rgeneratedTimeJ\x04\b\x03\x10\x04R\x0fgenerated_at_ms2\x82\x05\n" +
 	"\tInference\x12\x8a\x01\n" +
 	"\x12GetInferenceBundle\x121.openshell.inference.v1.GetInferenceBundleRequest\x1a2.openshell.inference.v1.GetInferenceBundleResponse\"\r\x82\xb5\x18\t\n" +
 	"\asandbox\x12\x9e\x01\n" +
@@ -970,26 +972,34 @@ var file_inference_proto_goTypes = []any{
 	(*GetInferenceBundleRequest)(nil),    // 9: openshell.inference.v1.GetInferenceBundleRequest
 	(*ResolvedRoute)(nil),                // 10: openshell.inference.v1.ResolvedRoute
 	(*GetInferenceBundleResponse)(nil),   // 11: openshell.inference.v1.GetInferenceBundleResponse
-	(*datamodelv1.ObjectMeta)(nil),       // 12: openshell.datamodel.v1.ObjectMeta
+	(*durationpb.Duration)(nil),          // 12: google.protobuf.Duration
+	(*datamodelv1.ObjectMeta)(nil),       // 13: openshell.datamodel.v1.ObjectMeta
+	(*timestamppb.Timestamp)(nil),        // 14: google.protobuf.Timestamp
 }
 var file_inference_proto_depIdxs = []int32{
-	12, // 0: openshell.inference.v1.InferenceRoute.metadata:type_name -> openshell.datamodel.v1.ObjectMeta
-	0,  // 1: openshell.inference.v1.InferenceRoute.config:type_name -> openshell.inference.v1.InferenceRouteConfig
-	3,  // 2: openshell.inference.v1.SetInferenceRouteResponse.validated_endpoints:type_name -> openshell.inference.v1.ValidatedEndpoint
-	10, // 3: openshell.inference.v1.GetInferenceBundleResponse.routes:type_name -> openshell.inference.v1.ResolvedRoute
-	9,  // 4: openshell.inference.v1.Inference.GetInferenceBundle:input_type -> openshell.inference.v1.GetInferenceBundleRequest
-	2,  // 5: openshell.inference.v1.Inference.SetInferenceRoute:input_type -> openshell.inference.v1.SetInferenceRouteRequest
-	5,  // 6: openshell.inference.v1.Inference.GetInferenceRoute:input_type -> openshell.inference.v1.GetInferenceRouteRequest
-	7,  // 7: openshell.inference.v1.Inference.DeleteInferenceRoute:input_type -> openshell.inference.v1.DeleteInferenceRouteRequest
-	11, // 8: openshell.inference.v1.Inference.GetInferenceBundle:output_type -> openshell.inference.v1.GetInferenceBundleResponse
-	4,  // 9: openshell.inference.v1.Inference.SetInferenceRoute:output_type -> openshell.inference.v1.SetInferenceRouteResponse
-	6,  // 10: openshell.inference.v1.Inference.GetInferenceRoute:output_type -> openshell.inference.v1.GetInferenceRouteResponse
-	8,  // 11: openshell.inference.v1.Inference.DeleteInferenceRoute:output_type -> openshell.inference.v1.DeleteInferenceRouteResponse
-	8,  // [8:12] is the sub-list for method output_type
-	4,  // [4:8] is the sub-list for method input_type
-	4,  // [4:4] is the sub-list for extension type_name
-	4,  // [4:4] is the sub-list for extension extendee
-	0,  // [0:4] is the sub-list for field type_name
+	12, // 0: openshell.inference.v1.InferenceRouteConfig.request_timeout:type_name -> google.protobuf.Duration
+	13, // 1: openshell.inference.v1.InferenceRoute.metadata:type_name -> openshell.datamodel.v1.ObjectMeta
+	0,  // 2: openshell.inference.v1.InferenceRoute.config:type_name -> openshell.inference.v1.InferenceRouteConfig
+	12, // 3: openshell.inference.v1.SetInferenceRouteRequest.request_timeout:type_name -> google.protobuf.Duration
+	3,  // 4: openshell.inference.v1.SetInferenceRouteResponse.validated_endpoints:type_name -> openshell.inference.v1.ValidatedEndpoint
+	12, // 5: openshell.inference.v1.SetInferenceRouteResponse.request_timeout:type_name -> google.protobuf.Duration
+	12, // 6: openshell.inference.v1.GetInferenceRouteResponse.request_timeout:type_name -> google.protobuf.Duration
+	12, // 7: openshell.inference.v1.ResolvedRoute.request_timeout:type_name -> google.protobuf.Duration
+	10, // 8: openshell.inference.v1.GetInferenceBundleResponse.routes:type_name -> openshell.inference.v1.ResolvedRoute
+	14, // 9: openshell.inference.v1.GetInferenceBundleResponse.generated_time:type_name -> google.protobuf.Timestamp
+	9,  // 10: openshell.inference.v1.Inference.GetInferenceBundle:input_type -> openshell.inference.v1.GetInferenceBundleRequest
+	2,  // 11: openshell.inference.v1.Inference.SetInferenceRoute:input_type -> openshell.inference.v1.SetInferenceRouteRequest
+	5,  // 12: openshell.inference.v1.Inference.GetInferenceRoute:input_type -> openshell.inference.v1.GetInferenceRouteRequest
+	7,  // 13: openshell.inference.v1.Inference.DeleteInferenceRoute:input_type -> openshell.inference.v1.DeleteInferenceRouteRequest
+	11, // 14: openshell.inference.v1.Inference.GetInferenceBundle:output_type -> openshell.inference.v1.GetInferenceBundleResponse
+	4,  // 15: openshell.inference.v1.Inference.SetInferenceRoute:output_type -> openshell.inference.v1.SetInferenceRouteResponse
+	6,  // 16: openshell.inference.v1.Inference.GetInferenceRoute:output_type -> openshell.inference.v1.GetInferenceRouteResponse
+	8,  // 17: openshell.inference.v1.Inference.DeleteInferenceRoute:output_type -> openshell.inference.v1.DeleteInferenceRouteResponse
+	14, // [14:18] is the sub-list for method output_type
+	10, // [10:14] is the sub-list for method input_type
+	10, // [10:10] is the sub-list for extension type_name
+	10, // [10:10] is the sub-list for extension extendee
+	0,  // [0:10] is the sub-list for field type_name
 }
 
 func init() { file_inference_proto_init() }

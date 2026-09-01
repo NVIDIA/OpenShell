@@ -7,6 +7,7 @@ import (
 	"context"
 	"net"
 	"testing"
+	"time"
 
 	dm "github.com/NVIDIA/OpenShell/sdk/go/proto/datamodelv1"
 	pb "github.com/NVIDIA/OpenShell/sdk/go/proto/openshellv1"
@@ -17,6 +18,7 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
 	"google.golang.org/grpc/test/bufconn"
+	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 type mockWorkspaceServer struct {
@@ -118,7 +120,7 @@ func testWorkspace() *dm.Workspace {
 		Metadata: &dm.ObjectMeta{
 			Id:              "ws-1",
 			Name:            "test-ws",
-			CreatedAtMs:     1700000000000,
+			CreatedTime:     timestamppb.New(time.UnixMilli(1700000000000)),
 			Labels:          map[string]string{"team": "platform"},
 			ResourceVersion: 1,
 		},
@@ -296,7 +298,7 @@ func testMember() *pb.WorkspaceMember {
 		Metadata: &dm.ObjectMeta{
 			Id:              "mem-1",
 			Name:            "member-auto",
-			CreatedAtMs:     1700000000000,
+			CreatedTime:     timestamppb.New(time.UnixMilli(1700000000000)),
 			ResourceVersion: 1,
 		},
 		PrincipalSubject: "user@example.com",

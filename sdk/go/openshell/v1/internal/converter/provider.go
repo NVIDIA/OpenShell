@@ -8,6 +8,7 @@ import (
 
 	"github.com/NVIDIA/OpenShell/sdk/go/openshell/v1/types"
 	dm "github.com/NVIDIA/OpenShell/sdk/go/proto/datamodelv1"
+	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 // ProviderFromProto converts a proto Provider to an SDK Provider.
@@ -27,18 +28,18 @@ func ProviderFromProto(p *dm.Provider) *types.Provider {
 	if m := p.GetMetadata(); m != nil {
 		result.ID = m.GetId()
 		result.Name = m.GetName()
-		result.CreatedAt = TimeFromMillis(m.GetCreatedAtMs())
+		result.CreatedAt = TimeFromProto(m.GetCreatedTime())
 		result.Labels = CopyStringMap(m.GetLabels())
 		result.Annotations = CopyStringMap(m.GetAnnotations())
 		result.ResourceVersion = m.GetResourceVersion()
 		result.Workspace = m.GetWorkspace()
-		result.DeletionTimestamp = TimeFromMillisPtr(m.GetDeletionTimestampMs())
+		result.DeletionTimestamp = TimePtrFromProto(m.GetDeletionTime())
 	}
 
-	if expires := p.GetCredentialExpiresAtMs(); len(expires) > 0 {
+	if expires := p.GetCredentialExpirationTimes(); len(expires) > 0 {
 		result.Spec.CredentialExpiresAt = make(map[string]time.Time, len(expires))
-		for k, ms := range expires {
-			result.Spec.CredentialExpiresAt[k] = TimeFromMillis(ms)
+		for k, timestamp := range expires {
+			result.Spec.CredentialExpiresAt[k] = TimeFromProto(timestamp)
 		}
 	}
 
@@ -64,14 +65,14 @@ func ProviderToProto(p *types.Provider) *dm.Provider {
 
 	result := &dm.Provider{
 		Metadata: &dm.ObjectMeta{
-			Id:                  p.ID,
-			Name:                p.Name,
-			CreatedAtMs:         MillisFromTime(p.CreatedAt),
-			Labels:              CopyStringMap(p.Labels),
-			Annotations:         CopyStringMap(p.Annotations),
-			ResourceVersion:     p.ResourceVersion,
-			Workspace:           p.Workspace,
-			DeletionTimestampMs: MillisFromTimePtr(p.DeletionTimestamp),
+			Id:              p.ID,
+			Name:            p.Name,
+			CreatedTime:     TimestampFromTime(p.CreatedAt),
+			Labels:          CopyStringMap(p.Labels),
+			Annotations:     CopyStringMap(p.Annotations),
+			ResourceVersion: p.ResourceVersion,
+			Workspace:       p.Workspace,
+			DeletionTime:    TimestampFromTimePtr(p.DeletionTimestamp),
 		},
 		Type:             p.Type,
 		Credentials:      CopyStringMap(p.Spec.Credentials),
@@ -80,9 +81,9 @@ func ProviderToProto(p *types.Provider) *dm.Provider {
 	}
 
 	if len(p.Spec.CredentialExpiresAt) > 0 {
-		result.CredentialExpiresAtMs = make(map[string]int64, len(p.Spec.CredentialExpiresAt))
+		result.CredentialExpirationTimes = make(map[string]*timestamppb.Timestamp, len(p.Spec.CredentialExpiresAt))
 		for k, t := range p.Spec.CredentialExpiresAt {
-			result.CredentialExpiresAtMs[k] = MillisFromTime(t)
+			result.CredentialExpirationTimes[k] = TimestampFromTime(t)
 		}
 	}
 

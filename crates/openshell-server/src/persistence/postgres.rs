@@ -40,7 +40,44 @@ impl PostgresStore {
         POSTGRES_MIGRATOR
             .run(&self.pool)
             .await
-            .map_err(|e| map_migrate_error(&e))
+            .map_err(|e| map_migrate_error(&e))?;
+        self.migrate_legacy_time_payloads().await
+    }
+
+    async fn migrate_legacy_time_payloads(&self) -> PersistenceResult<()> {
+        let mut transaction = self.pool.begin().await.map_err(|e| map_db_error(&e))?;
+        // Serialize this application-level data migration across gateway replicas.
+        sqlx::query("SELECT pg_advisory_xact_lock(3052)")
+            .execute(&mut *transaction)
+            .await
+            .map_err(|e| map_db_error(&e))?;
+        let rows =
+            sqlx::query("SELECT id, object_type, payload FROM objects ORDER BY id FOR UPDATE")
+                .fetch_all(&mut *transaction)
+                .await
+                .map_err(|e| map_db_error(&e))?;
+
+        for row in rows {
+            let id: String = row.try_get("id").map_err(|e| map_db_error(&e))?;
+            let object_type: String = row.try_get("object_type").map_err(|e| map_db_error(&e))?;
+            let payload: Vec<u8> = row.try_get("payload").map_err(|e| map_db_error(&e))?;
+            let migrated =
+                super::legacy_time_wire::migrate(&object_type, &payload).map_err(|error| {
+                    PersistenceError::Migration(format!(
+                        "failed to migrate {object_type} record {id}: {error}"
+                    ))
+                })?;
+            if migrated != payload {
+                sqlx::query("UPDATE objects SET payload = $1 WHERE id = $2")
+                    .bind(migrated)
+                    .bind(id)
+                    .execute(&mut *transaction)
+                    .await
+                    .map_err(|e| map_db_error(&e))?;
+            }
+        }
+
+        transaction.commit().await.map_err(|e| map_db_error(&e))
     }
 
     /// Verify the database is reachable by acquiring a pooled connection

@@ -48,8 +48,12 @@ async fn reap_expired_sessions(store: &Store) -> Result<(), String> {
             Err(_) => continue,
         };
 
-        let should_delete =
-            (session.expires_at_ms > 0 && now_ms > session.expires_at_ms) || session.revoked;
+        let should_delete = session
+            .expiration_time
+            .as_ref()
+            .and_then(|value| openshell_core::time::timestamp_to_millis(value).ok())
+            .is_some_and(|expiration_ms| now_ms > expiration_ms)
+            || session.revoked;
 
         if should_delete {
             if let Err(e) = store
@@ -83,16 +87,19 @@ mod tests {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: id.to_string(),
                 name: format!("session-{id}"),
-                created_at_ms: 1000,
+                created_time: openshell_core::time::timestamp_from_millis(1000).ok(),
                 labels: HashMap::new(),
                 resource_version: 0,
                 annotations: HashMap::new(),
                 workspace: "default".to_string(),
-                deletion_timestamp_ms: 0,
+                deletion_time: None,
             }),
             sandbox_id: sandbox_id.to_string(),
             token: id.to_string(),
-            expires_at_ms,
+            expiration_time: (expires_at_ms != 0)
+                .then(|| openshell_core::time::timestamp_from_millis(expires_at_ms))
+                .transpose()
+                .unwrap(),
             revoked,
         }
     }

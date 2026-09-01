@@ -1093,7 +1093,7 @@ mod tests {
             gateway_host: "gateway.example.com".to_string(),
             gateway_port: 443,
             host_key_fingerprint: String::new(),
-            expires_at_ms: 0,
+            expiration_time: None,
         }
     }
 

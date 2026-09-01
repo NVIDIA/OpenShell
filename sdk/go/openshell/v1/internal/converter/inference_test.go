@@ -28,7 +28,7 @@ func TestInferenceRouteConfigToProto(t *testing.T) {
 	assert.Equal(t, "my-route", req.GetRouteName())
 	assert.True(t, req.GetNoVerify())
 	assert.False(t, req.GetVerify())
-	assert.Equal(t, uint64(120), req.GetTimeoutSecs())
+	assert.Equal(t, int64(120), req.GetRequestTimeout().GetSeconds())
 	assert.Equal(t, "team-alpha", req.GetWorkspace())
 }
 
@@ -62,8 +62,8 @@ func TestInferenceRouteFromSetResponse(t *testing.T) {
 			{Url: "https://api.openai.com/v1", Protocol: "openai"},
 			{Url: "https://backup.openai.com/v1", Protocol: "openai"},
 		},
-		TimeoutSecs: 120,
-		Workspace:   "team-alpha",
+		RequestTimeout: DurationFromSeconds(120),
+		Workspace:      "team-alpha",
 	}
 
 	route := InferenceRouteFromSetResponse(resp)
@@ -104,12 +104,12 @@ func TestInferenceRouteFromSetResponse_NoEndpoints(t *testing.T) {
 
 func TestInferenceRouteFromGetResponse(t *testing.T) {
 	resp := &pb.GetInferenceRouteResponse{
-		ProviderName: "vertex",
-		ModelId:      "gemini-pro",
-		Version:      3,
-		RouteName:    "default",
-		TimeoutSecs:  60,
-		Workspace:    "prod",
+		ProviderName:   "vertex",
+		ModelId:        "gemini-pro",
+		Version:        3,
+		RouteName:      "default",
+		RequestTimeout: DurationFromSeconds(60),
+		Workspace:      "prod",
 	}
 
 	route := InferenceRouteFromGetResponse(resp)
@@ -163,6 +163,6 @@ func TestInferenceRoundTrip(t *testing.T) {
 	assert.Equal(t, cfg.ModelID, req.GetModelId())
 	assert.Equal(t, cfg.RouteName, req.GetRouteName())
 	assert.Equal(t, cfg.NoVerify, req.GetNoVerify())
-	assert.Equal(t, cfg.TimeoutSecs, req.GetTimeoutSecs())
+	assert.Equal(t, int64(cfg.TimeoutSecs), req.GetRequestTimeout().GetSeconds())
 	assert.Equal(t, "my-ws", req.GetWorkspace())
 }

@@ -73,7 +73,9 @@ pub(super) async fn handle_expose_service(
             existing
                 .metadata
                 .as_ref()
-                .map_or(now, |metadata| metadata.created_at_ms),
+                .and_then(|metadata| metadata.created_time.as_ref())
+                .and_then(|value| openshell_core::time::timestamp_to_millis(value).ok())
+                .unwrap_or(now),
             WriteCondition::MatchResourceVersion(resource_version),
             false,
         )
@@ -97,12 +99,12 @@ pub(super) async fn handle_expose_service(
         metadata: Some(ObjectMeta {
             id: id.clone(),
             name: key.clone(),
-            created_at_ms,
+            created_time: openshell_core::time::timestamp_from_millis(created_at_ms).ok(),
             labels: HashMap::from([("sandbox".to_string(), req.sandbox.clone())]),
             resource_version: 0,
             annotations: HashMap::new(),
             workspace: workspace.clone(),
-            deletion_timestamp_ms: 0,
+            deletion_time: None,
         }),
         sandbox_id: sandbox.object_id().to_string(),
         sandbox_name: req.sandbox.clone(),
@@ -362,12 +364,12 @@ mod tests {
             metadata: Some(ObjectMeta {
                 id: format!("sandbox-{name}"),
                 name: name.to_string(),
-                created_at_ms: 1_000,
+                created_time: openshell_core::time::timestamp_from_millis(1_000).ok(),
                 labels: HashMap::new(),
                 resource_version: 0,
                 annotations: HashMap::new(),
                 workspace: "default".to_string(),
-                deletion_timestamp_ms: 0,
+                deletion_time: None,
             }),
             spec: Some(openshell_core::proto::SandboxSpec::default()),
             ..Default::default()
@@ -666,12 +668,12 @@ mod tests {
             metadata: Some(ObjectMeta {
                 id: "sandbox-my-sandbox-beta".to_string(),
                 name: "my-sandbox".to_string(),
-                created_at_ms: 1_000,
+                created_time: openshell_core::time::timestamp_from_millis(1_000).ok(),
                 labels: HashMap::new(),
                 annotations: HashMap::new(),
                 resource_version: 0,
                 workspace: "beta".to_string(),
-                deletion_timestamp_ms: 0,
+                deletion_time: None,
             }),
             spec: Some(openshell_core::proto::SandboxSpec::default()),
             ..Default::default()

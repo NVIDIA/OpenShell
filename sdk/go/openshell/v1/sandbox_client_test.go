@@ -20,6 +20,7 @@ import (
 	"google.golang.org/grpc/status"
 	"google.golang.org/grpc/test/bufconn"
 	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 type mockSandboxServer struct {
@@ -63,7 +64,7 @@ func (s *mockSandboxServer) CreateSandbox(_ context.Context, req *pb.CreateSandb
 		Metadata: &dm.ObjectMeta{
 			Id:              "sb-" + req.GetName(),
 			Name:            req.GetName(),
-			CreatedAtMs:     1700000000000,
+			CreatedTime:     timestamppb.New(time.UnixMilli(1700000000000)),
 			Labels:          req.GetLabels(),
 			ResourceVersion: 1,
 		},
@@ -1073,8 +1074,8 @@ func TestSandboxGetLogs(t *testing.T) {
 	}
 	mock.getLogsResp = &pb.GetSandboxLogsResponse{
 		Logs: []*pb.SandboxLogLine{
-			{TimestampMs: 1700000000000, Level: "INFO", Target: "gateway", Message: "connected", Source: "gateway"},
-			{TimestampMs: 1700000001000, Level: "DEBUG", Target: "sandbox", Message: "init done", Source: "sandbox"},
+			{EventTime: timestamppb.New(time.UnixMilli(1700000000000)), Level: "INFO", Target: "gateway", Message: "connected", Source: "gateway"},
+			{EventTime: timestamppb.New(time.UnixMilli(1700000001000)), Level: "DEBUG", Target: "sandbox", Message: "init done", Source: "sandbox"},
 		},
 		BufferTotal: 42,
 	}
@@ -1106,7 +1107,7 @@ func TestSandboxGetLogs_WithOptions(t *testing.T) {
 		Status:   &pb.SandboxStatus{Phase: pb.SandboxPhase_SANDBOX_PHASE_READY},
 	}
 	mock.getLogsResp = &pb.GetSandboxLogsResponse{
-		Logs:        []*pb.SandboxLogLine{{TimestampMs: 1700000000000, Level: "WARN", Message: "high cpu"}},
+		Logs:        []*pb.SandboxLogLine{{EventTime: timestamppb.New(time.UnixMilli(1700000000000)), Level: "WARN", Message: "high cpu"}},
 		BufferTotal: 100,
 	}
 	client, cleanup := setupSandboxTest(t, mock)
@@ -1131,7 +1132,7 @@ func TestSandboxGetLogs_WithOptions(t *testing.T) {
 	mock.mu.Unlock()
 	assert.Equal(t, "sb-id-opts", req.GetSandboxId())
 	assert.Equal(t, uint32(50), req.GetLines())
-	assert.Equal(t, since.UnixMilli(), req.GetSinceMs())
+	assert.Equal(t, since, req.GetSinceTime().AsTime())
 	assert.Equal(t, []string{"gateway", "sandbox"}, req.GetSources())
 	assert.Equal(t, "WARN", req.GetMinLevel())
 }
@@ -1193,11 +1194,11 @@ func TestSandboxGetLogs_SinceZeroNotSent(t *testing.T) {
 	client, cleanup := setupSandboxTest(t, mock)
 	defer cleanup()
 
-	// Call without WithLogSince — SinceMs should be 0 (not set)
+	// Call without WithLogSince — SinceTime should be unset.
 	_, err := client.GetLogs(context.Background(), "default", "zero-sb")
 
 	require.NoError(t, err)
 	mock.mu.Lock()
-	assert.Equal(t, int64(0), mock.getLogsRequest.GetSinceMs())
+	assert.Nil(t, mock.getLogsRequest.GetSinceTime())
 	mock.mu.Unlock()
 }

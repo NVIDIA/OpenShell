@@ -404,9 +404,11 @@ impl OpenShellClient {
             command: cmd.to_vec(),
             workdir: opts.workdir.unwrap_or_default(),
             environment: opts.environment,
-            timeout_seconds: opts
+            execution_timeout: opts
                 .timeout
-                .map_or(0, |d| u32::try_from(d.as_secs()).unwrap_or(u32::MAX)),
+                .map(openshell_core::time::duration_from_std)
+                .transpose()
+                .map_err(|error| SdkError::invalid_config(error.to_string()))?,
             stdin: opts.stdin.unwrap_or_default(),
             tty: false,
             cols: 0,
@@ -710,9 +712,11 @@ impl WorkspaceScopedClient {
             command: cmd.to_vec(),
             workdir: opts.workdir.unwrap_or_default(),
             environment: opts.environment,
-            timeout_seconds: opts
+            execution_timeout: opts
                 .timeout
-                .map_or(0, |d| u32::try_from(d.as_secs()).unwrap_or(u32::MAX)),
+                .map(openshell_core::time::duration_from_std)
+                .transpose()
+                .map_err(|error| SdkError::invalid_config(error.to_string()))?,
             stdin: opts.stdin.unwrap_or_default(),
             tty: false,
             cols: 0,

@@ -6,6 +6,7 @@ syntax = "proto3";
 package openshell.sandbox.v1;
 
 import "google/protobuf/struct.proto";
+import "google/protobuf/duration.proto";
 
 // Sandbox-supervisor configuration and policy messages.
 //
@@ -399,6 +400,8 @@ message GetSandboxConfigResponse {
 // Connection details for one operator-registered supervisor middleware service.
 // V1 supports plaintext and server-authenticated TLS gRPC.
 message SupervisorMiddlewareService {
+  reserved 4;
+  reserved "timeout";
   // Operator-owned registration name used by policy attachments and diagnostics.
   string name = 1;
   // gRPC endpoint reachable from the sandbox supervisor.
@@ -406,10 +409,9 @@ message SupervisorMiddlewareService {
   // Operator-owned logical payload limit applied to every binding exposed by
   // the service. This caps HTTP bodies and complete WebSocket messages.
   uint64 max_payload_bytes = 3;
-  // Default RPC timeout for this service. Empty uses the platform default of
-  // 500ms. Values use an integer with an `ms` or `s` suffix and must be
-  // between 10ms and 30s.
-  string timeout = 4;
+  // Default RPC timeout for this service. Absence uses the platform default of
+  // 500ms. Values must be between 10ms and 30s.
+  google.protobuf.Duration request_timeout = 104;
   // PEM-encoded trust roots loaded by the gateway from the operator-configured
   // tls_ca_cert_path. Empty uses the platform trust store.
   bytes tls_ca_cert_pem = 5;

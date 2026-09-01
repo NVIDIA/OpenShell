@@ -120,12 +120,12 @@ impl OpenShell for TestOpenShell {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: format!("id-{sandbox_name}"),
                 name: sandbox_name,
-                created_at_ms: 0,
+                created_time: None,
                 labels: HashMap::new(),
                 resource_version: 0,
                 annotations: HashMap::new(),
                 workspace: String::new(),
-                deletion_timestamp_ms: 0,
+                deletion_time: None,
             }),
             ..Sandbox::default()
         };
@@ -158,12 +158,12 @@ impl OpenShell for TestOpenShell {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: format!("id-{name}"),
                 name,
-                created_at_ms: 0,
+                created_time: None,
                 labels: HashMap::new(),
                 resource_version: 0,
                 annotations: HashMap::new(),
                 workspace: String::new(),
-                deletion_timestamp_ms: 0,
+                deletion_time: None,
             }),
             ..Sandbox::default()
         };
@@ -449,12 +449,12 @@ impl OpenShell for TestOpenShell {
                 metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                     id: sandbox_id.clone(),
                     name: sandbox_id.trim_start_matches("id-").to_string(),
-                    created_at_ms: 0,
+                    created_time: None,
                     labels: HashMap::new(),
                     resource_version: 0,
                     annotations: HashMap::new(),
                     workspace: String::new(),
-                    deletion_timestamp_ms: 0,
+                    deletion_time: None,
                 }),
                 ..Sandbox::default()
             };
@@ -467,7 +467,7 @@ impl OpenShell for TestOpenShell {
                         status: "False".to_string(),
                         reason: "ProcessExited".to_string(),
                         message: "VM process exited with status 0".to_string(),
-                        last_transition_time: String::new(),
+                        transition_time: None,
                     }],
                     ..Default::default()
                 }),
@@ -517,7 +517,7 @@ impl OpenShell for TestOpenShell {
                         .send(Ok(SandboxStreamEvent {
                             payload: Some(sandbox_stream_event::Payload::Log(SandboxLogLine {
                                 sandbox_id: sandbox_id.clone(),
-                                timestamp_ms: 0,
+                                event_time: None,
                                 level: "INFO".to_string(),
                                 target: "test".to_string(),
                                 message: message.to_string(),

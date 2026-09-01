@@ -271,7 +271,21 @@ impl TryFrom<&MiddlewareServiceFileConfig> for SupervisorMiddlewareService {
             name: config.name.clone(),
             grpc_endpoint: config.grpc_endpoint.clone(),
             max_payload_bytes: config.max_payload_bytes,
-            timeout: config.timeout.clone().unwrap_or_default(),
+            request_timeout: config
+                .timeout
+                .as_deref()
+                .map(openshell_core::middleware::parse_middleware_timeout)
+                .transpose()
+                .map_err(|_| ConfigFileError::InvalidValue {
+                    field: "openshell.supervisor_middleware.services.timeout",
+                    message: "must be a duration between 10ms and 30s",
+                })?
+                .map(openshell_core::time::duration_from_std)
+                .transpose()
+                .map_err(|_| ConfigFileError::InvalidValue {
+                    field: "openshell.supervisor_middleware.services.timeout",
+                    message: "duration is outside the protobuf range",
+                })?,
             tls_ca_cert_pem,
             audience: config
                 .audience
@@ -742,7 +756,7 @@ timeout = "2s"
         let registration =
             SupervisorMiddlewareService::try_from(&file.openshell.supervisor.middleware[0])
                 .expect("valid CA resolves");
-        assert_eq!(registration.timeout, "2s");
+        assert_eq!(registration.request_timeout.unwrap().seconds, 2);
         let registered_pem = String::from_utf8(registration.tls_ca_cert_pem)
             .expect("registered CA remains PEM text")
             .replace("\r\n", "\n");

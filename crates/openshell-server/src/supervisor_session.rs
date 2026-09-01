@@ -652,7 +652,7 @@ fn sandbox_proto_is_terminating(sandbox: &Sandbox) -> bool {
         || sandbox
             .metadata
             .as_ref()
-            .is_some_and(|metadata| metadata.deletion_timestamp_ms != 0)
+            .is_some_and(|metadata| metadata.deletion_time.is_some())
 }
 
 async fn sandbox_is_terminating_or_gone(state: &Arc<ServerState>, sandbox_id: &str) -> bool {
@@ -773,7 +773,10 @@ pub async fn handle_connect_supervisor(
     let accepted = GatewayMessage {
         payload: Some(gateway_message::Payload::SessionAccepted(SessionAccepted {
             session_id: session_id.clone(),
-            heartbeat_interval_secs: HEARTBEAT_INTERVAL_SECS,
+            heartbeat_interval: openshell_core::time::duration_from_std(Duration::from_secs(
+                u64::from(HEARTBEAT_INTERVAL_SECS),
+            ))
+            .ok(),
         })),
     };
     if tx.send(accepted).await.is_err() {
@@ -1054,12 +1057,12 @@ mod tests {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: id.to_string(),
                 name: name.to_string(),
-                created_at_ms: 1_000_000,
+                created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
                 labels: HashMap::new(),
                 resource_version: 0,
                 annotations: HashMap::new(),
                 workspace: "default".to_string(),
-                deletion_timestamp_ms: 0,
+                deletion_time: None,
             }),
             ..Default::default()
         }
@@ -1550,7 +1553,8 @@ mod tests {
     #[test]
     fn sandbox_proto_terminating_detects_deletion_timestamp() {
         let mut sandbox = sandbox_record("sbx-1", "sandbox-one");
-        sandbox.metadata.as_mut().unwrap().deletion_timestamp_ms = 1;
+        sandbox.metadata.as_mut().unwrap().deletion_time =
+            openshell_core::time::timestamp_from_millis(1).ok();
 
         assert!(sandbox_proto_is_terminating(&sandbox));
     }

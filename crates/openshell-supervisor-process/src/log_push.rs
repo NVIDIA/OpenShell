@@ -72,7 +72,7 @@ impl<S: Subscriber> Layer<S> for LogPushLayer {
 
         let log = SandboxLogLine {
             sandbox_id: self.sandbox_id.clone(),
-            timestamp_ms: ts,
+            event_time: openshell_core::time::timestamp_from_millis(ts).ok(),
             level: if is_ocsf {
                 "OCSF".to_string()
             } else {

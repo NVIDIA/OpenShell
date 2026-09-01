@@ -14,6 +14,7 @@
 import type { AddressInfo } from 'node:net';
 import * as net from 'node:net';
 import type { MessageInitShape } from '@bufbuild/protobuf';
+import { durationFromMs } from '@bufbuild/protobuf/wkt';
 import { type CallOptions, type Client, createClient, type Transport } from '@connectrpc/connect';
 import { errorCode, fromConnect, SdkError } from './errors.js';
 import type { Provider } from './gen/datamodel_pb.js';
@@ -30,6 +31,16 @@ import type { EffectiveSetting, GetSandboxConfigResponse, SandboxPolicy, Setting
 import { PolicySource, type SandboxPolicySchema, SettingScope, type SettingValueSchema } from './gen/sandbox_pb.js';
 import { validateSshResponse } from './ssh-validate.js';
 import { buildTransport, type ConnectOptions } from './transport.js';
+
+function durationFromSeconds(seconds: number) {
+  return seconds > 0 ? durationFromMs(seconds * 1000) : undefined;
+}
+
+function timestampMillis(timestamp: { seconds: bigint; nanos: number } | undefined): string | undefined {
+  if (!timestamp) return undefined;
+  const millis = timestamp.seconds * 1000n + BigInt(Math.trunc(timestamp.nanos / 1_000_000));
+  return millis === 0n ? undefined : millis.toString();
+}
 
 // The policy and setting value shapes are the generated protobuf messages;
 // re-export them rather than re-curating a parallel surface. Callers round-trip
@@ -694,7 +705,7 @@ export class SandboxClient {
           command,
           workdir: options?.workdir ?? '',
           environment: options?.environment ?? {},
-          timeoutSeconds: options?.timeoutSecs ?? 0,
+          executionTimeout: durationFromSeconds(options?.timeoutSecs ?? 0),
           stdin: options?.stdin ? new Uint8Array(options.stdin) : new Uint8Array(),
           tty: false,
           noLoginShell: options?.noLoginShell ?? false,
@@ -775,7 +786,7 @@ export class SandboxClient {
           command,
           workdir: options?.workdir ?? '',
           environment: options?.environment ?? {},
-          timeoutSeconds: options?.timeoutSecs ?? 0,
+          executionTimeout: durationFromSeconds(options?.timeoutSecs ?? 0),
           stdin: new Uint8Array(),
           tty: options?.tty ?? true,
           cols: options?.cols ?? 0,
@@ -1075,7 +1086,7 @@ export class SandboxClient {
         gatewayPort: resp.gatewayPort,
         gatewayScheme: resp.gatewayScheme,
         ...(resp.hostKeyFingerprint ? { hostKeyFingerprint: resp.hostKeyFingerprint } : {}),
-        ...(resp.expiresAtMs !== 0n ? { expiresAtMs: resp.expiresAtMs.toString() } : {}),
+        ...(timestampMillis(resp.expirationTime) ? { expiresAtMs: timestampMillis(resp.expirationTime) } : {}),
       };
     } catch (e) {
       throw e instanceof SdkError ? e : fromConnect(e);

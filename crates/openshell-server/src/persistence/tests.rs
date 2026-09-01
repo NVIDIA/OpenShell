@@ -7,6 +7,7 @@ use openshell_core::proto::datamodel::v1::ObjectMeta as ProtoObjectMeta;
 use openshell_core::proto::{ObjectForTest, Sandbox, SandboxPolicy, SandboxSpec};
 use prost::Message;
 use std::collections::HashMap as StdHashMap;
+use std::str::FromStr;
 
 /// A failed store call must be visible as a failure in the trace, not as a
 /// span that merely happened to return nothing.
@@ -130,6 +131,122 @@ async fn sqlite_connect_runs_embedded_migrations() {
 
     let records = store.list("sandbox", "default", 10, 0).await.unwrap();
     assert!(records.is_empty());
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct LegacyTimeObjectMeta {
+    #[prost(string, tag = "1")]
+    id: String,
+    #[prost(string, tag = "2")]
+    name: String,
+    #[prost(int64, tag = "3")]
+    created_at_ms: i64,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct LegacyTimeSandbox {
+    #[prost(message, optional, tag = "1")]
+    metadata: Option<LegacyTimeObjectMeta>,
+}
+
+#[tokio::test]
+async fn sqlite_startup_migrates_legacy_time_payloads_idempotently() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let db_path = tmp.path().join("legacy-time.db");
+    let url = format!("sqlite:{}?mode=rwc", db_path.display());
+    let legacy = LegacyTimeSandbox {
+        metadata: Some(LegacyTimeObjectMeta {
+            id: "legacy-sandbox".into(),
+            name: "legacy".into(),
+            created_at_ms: 1_700_000_000_123,
+        }),
+    }
+    .encode_to_vec();
+
+    let store = Store::connect(&url).await.expect("create database");
+    store
+        .put(
+            "sandbox",
+            "legacy-sandbox",
+            "legacy",
+            "default",
+            &legacy,
+            None,
+        )
+        .await
+        .expect("seed legacy payload");
+    store.close().await;
+
+    let store = Store::connect(&url).await.expect("migrate legacy payload");
+    let first = store
+        .get("sandbox", "legacy-sandbox")
+        .await
+        .expect("read migrated record")
+        .expect("record exists")
+        .payload;
+    let decoded = Sandbox::decode(first.as_slice()).expect("decode current sandbox");
+    assert_eq!(
+        decoded.metadata.unwrap().created_time.unwrap().seconds,
+        1_700_000_000
+    );
+    store.close().await;
+
+    let store = Store::connect(&url).await.expect("repeat migration");
+    let second = store
+        .get("sandbox", "legacy-sandbox")
+        .await
+        .expect("read migrated record")
+        .expect("record exists")
+        .payload;
+    assert_eq!(first, second, "the startup migration is idempotent");
+}
+
+#[tokio::test]
+async fn sqlite_startup_rolls_back_all_payloads_on_malformed_legacy_data() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let db_path = tmp.path().join("malformed-legacy-time.db");
+    let url = format!("sqlite:{}?mode=rwc", db_path.display());
+    let legacy = LegacyTimeSandbox {
+        metadata: Some(LegacyTimeObjectMeta {
+            id: "a-valid".into(),
+            name: "valid".into(),
+            created_at_ms: 1_700_000_000_123,
+        }),
+    }
+    .encode_to_vec();
+
+    let store = Store::connect(&url).await.expect("create database");
+    store
+        .put("sandbox", "a-valid", "valid", "default", &legacy, None)
+        .await
+        .expect("seed valid legacy payload");
+    store
+        .put(
+            "sandbox",
+            "z-malformed",
+            "malformed",
+            "default",
+            &[0x0a, 0x02, 0x1a, 0x00],
+            None,
+        )
+        .await
+        .expect("seed malformed legacy payload");
+    store.close().await;
+
+    let error = Store::connect(&url)
+        .await
+        .expect_err("startup must reject malformed legacy payload");
+    assert!(error.to_string().contains("z-malformed"));
+
+    let options = sqlx::sqlite::SqliteConnectOptions::from_str(&url).expect("sqlite options");
+    let pool = sqlx::SqlitePool::connect_with(options)
+        .await
+        .expect("inspect rolled-back database");
+    let stored: Vec<u8> = sqlx::query_scalar("SELECT payload FROM objects WHERE id = 'a-valid'")
+        .fetch_one(&pool)
+        .await
+        .expect("read valid payload after rollback");
+    assert_eq!(stored, legacy, "the earlier update was rolled back");
 }
 
 #[cfg(unix)]
@@ -828,7 +945,7 @@ fn policy_test_sandbox(id: &str, name: &str) -> Sandbox {
         metadata: Some(ProtoObjectMeta {
             id: id.to_string(),
             name: name.to_string(),
-            created_at_ms: 1,
+            created_time: openshell_core::time::timestamp_from_millis(1).ok(),
             workspace: "default".to_string(),
             ..Default::default()
         }),
@@ -1700,12 +1817,12 @@ async fn cas_update_message_cas_succeeds() {
         metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
             id: "test-id".to_string(),
             name: "test-sandbox".to_string(),
-            created_at_ms: 1000,
+            created_time: openshell_core::time::timestamp_from_millis(1000).ok(),
             labels: std::collections::HashMap::new(),
             resource_version: 0,
             annotations: std::collections::HashMap::new(),
             workspace: "default".to_string(),
-            deletion_timestamp_ms: 0,
+            deletion_time: None,
         }),
         spec: None,
         status: None,
@@ -1742,12 +1859,12 @@ async fn cas_update_message_cas_conflicts_on_concurrent_updates() {
         metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
             id: "test-id".to_string(),
             name: "test-sandbox".to_string(),
-            created_at_ms: 1000,
+            created_time: openshell_core::time::timestamp_from_millis(1000).ok(),
             labels: std::collections::HashMap::new(),
             resource_version: 0,
             annotations: std::collections::HashMap::new(),
             workspace: "default".to_string(),
-            deletion_timestamp_ms: 0,
+            deletion_time: None,
         }),
         spec: None,
         status: None,
@@ -1812,12 +1929,12 @@ async fn cas_update_message_cas_rejects_workspace_change() {
         metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
             id: "ws-immutable".to_string(),
             name: "test-sandbox".to_string(),
-            created_at_ms: 1000,
+            created_time: openshell_core::time::timestamp_from_millis(1000).ok(),
             labels: std::collections::HashMap::new(),
             annotations: std::collections::HashMap::new(),
             resource_version: 0,
             workspace: "alpha".to_string(),
-            deletion_timestamp_ms: 0,
+            deletion_time: None,
         }),
         spec: None,
         status: None,
@@ -1854,12 +1971,12 @@ async fn cas_update_message_cas_rejects_name_change() {
         metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
             id: "name-immutable".to_string(),
             name: "original".to_string(),
-            created_at_ms: 1000,
+            created_time: openshell_core::time::timestamp_from_millis(1000).ok(),
             labels: std::collections::HashMap::new(),
             annotations: std::collections::HashMap::new(),
             resource_version: 0,
             workspace: "default".to_string(),
-            deletion_timestamp_ms: 0,
+            deletion_time: None,
         }),
         spec: None,
         status: None,

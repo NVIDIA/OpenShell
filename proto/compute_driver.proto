@@ -6,6 +6,7 @@ syntax = "proto3";
 package openshell.compute.v1;
 
 import "google/protobuf/struct.proto";
+import "google/protobuf/timestamp.proto";
 import "options.proto";
 
 // Gateway/compute-driver extension contract.
@@ -257,6 +258,8 @@ message DriverSandboxStatus {
 
 // Raw compute-platform condition.
 message DriverCondition {
+  reserved 5;
+  reserved "last_transition_time";
   // Condition class reported by the compute platform.
   string type = 1;
   // Condition status value such as `True`, `False`, or `Unknown`.
@@ -265,14 +268,16 @@ message DriverCondition {
   string reason = 3;
   // Human-readable condition message.
   string message = 4;
-  // Timestamp reported by the platform for the last transition.
-  string last_transition_time = 5;
+  // Time reported by the platform for the last transition.
+  google.protobuf.Timestamp transition_time = 105;
 }
 
 // Raw compute-platform event correlated to a sandbox.
 message DriverPlatformEvent {
-  // Event timestamp in milliseconds since epoch.
-  int64 timestamp_ms = 1;
+  reserved 1;
+  reserved "timestamp_ms";
+  // Time when the event occurred.
+  google.protobuf.Timestamp event_time = 101;
   // Event source (for example `kubernetes`).
   string source = 2;
   // Event type or severity (for example `Normal` or `Warning`).

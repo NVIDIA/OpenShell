@@ -1438,7 +1438,10 @@ impl DockerComputeDriver {
         self.publish_platform_event(
             sandbox_id.to_string(),
             DriverPlatformEvent {
-                timestamp_ms: openshell_core::time::now_ms(),
+                event_time: openshell_core::time::timestamp_from_millis(
+                    openshell_core::time::now_ms(),
+                )
+                .ok(),
                 source: "docker".to_string(),
                 r#type: "Normal".to_string(),
                 reason: reason.to_string(),
@@ -2221,7 +2224,7 @@ fn provisioning_condition() -> DriverCondition {
         status: "False".to_string(),
         reason: "Starting".to_string(),
         message: "Docker container is starting".to_string(),
-        last_transition_time: String::new(),
+        transition_time: None,
     }
 }
 
@@ -2231,7 +2234,7 @@ fn error_condition(reason: &str, message: &str) -> DriverCondition {
         status: "False".to_string(),
         reason: reason.to_string(),
         message: message.to_string(),
-        last_transition_time: String::new(),
+        transition_time: None,
     }
 }
 
@@ -2242,7 +2245,8 @@ fn platform_event(
     message: String,
 ) -> DriverPlatformEvent {
     DriverPlatformEvent {
-        timestamp_ms: openshell_core::time::now_ms(),
+        event_time: openshell_core::time::timestamp_from_millis(openshell_core::time::now_ms())
+            .ok(),
         source: source.to_string(),
         r#type: event_type.to_string(),
         reason: reason.to_string(),
@@ -2270,7 +2274,8 @@ fn docker_pull_progress_event(image: &str, info: &CreateImageInfo) -> Option<Dri
     attach_docker_progress_metadata(&mut metadata, "PullingLayer", status);
 
     Some(DriverPlatformEvent {
-        timestamp_ms: openshell_core::time::now_ms(),
+        event_time: openshell_core::time::timestamp_from_millis(openshell_core::time::now_ms())
+            .ok(),
         source: "docker".to_string(),
         r#type: "Normal".to_string(),
         reason: "PullingLayer".to_string(),
@@ -3536,7 +3541,7 @@ fn driver_status_from_summary(
             status: ready.to_string(),
             reason: reason.to_string(),
             message: message.to_string(),
-            last_transition_time: String::new(),
+            transition_time: None,
         }],
         deleting,
     }

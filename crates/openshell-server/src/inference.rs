@@ -117,7 +117,7 @@ impl Inference for InferenceService {
             route_name,
             &req.provider_name,
             &req.model_id,
-            req.timeout_secs,
+            req.request_timeout,
             verify,
         )
         .await?;
@@ -135,7 +135,7 @@ impl Inference for InferenceService {
             route_name: route_name.to_string(),
             validation_performed: !route.validation.is_empty(),
             validated_endpoints: route.validation,
-            timeout_secs: config.timeout_secs,
+            request_timeout: config.request_timeout,
             workspace,
         }))
     }
@@ -187,7 +187,7 @@ impl Inference for InferenceService {
             model_id: config.model_id.clone(),
             version: route.version,
             route_name: route_name.to_string(),
-            timeout_secs: config.timeout_secs,
+            request_timeout: config.request_timeout,
             workspace,
         }))
     }
@@ -238,7 +238,7 @@ async fn upsert_cluster_inference_route(
         route_name,
         provider_name,
         model_id,
-        timeout_secs,
+        openshell_core::time::duration_from_std(Duration::from_secs(timeout_secs)).ok(),
         verify,
     )
     .await
@@ -274,7 +274,7 @@ async fn upsert_cluster_inference_route_with_credentials(
     route_name: &str,
     provider_name: &str,
     model_id: &str,
-    timeout_secs: u64,
+    request_timeout: Option<prost_types::Duration>,
     verify: bool,
 ) -> Result<UpsertedInferenceRoute, Status> {
     if provider_name.trim().is_empty() {
@@ -302,7 +302,11 @@ async fn upsert_cluster_inference_route_with_credentials(
         Vec::new()
     };
 
-    let config = build_inference_route_config(&provider, model_id, timeout_secs);
+    if let Some(timeout) = request_timeout.as_ref() {
+        openshell_core::time::duration_to_std(timeout)
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+    }
+    let config = build_inference_route_config(&provider, model_id, request_timeout);
 
     let existing = store
         .get_message_by_name::<InferenceRoute>(workspace, route_name)
@@ -324,12 +328,12 @@ async fn upsert_cluster_inference_route_with_credentials(
         let new_metadata = Some(openshell_core::proto::datamodel::v1::ObjectMeta {
             id: new_id.clone(),
             name: route_name.to_string(),
-            created_at_ms: now_ms,
+            created_time: openshell_core::time::timestamp_from_millis(now_ms).ok(),
             labels: HashMap::new(),
             resource_version: 0,
             annotations: HashMap::new(),
             workspace: workspace.to_string(),
-            deletion_timestamp_ms: 0,
+            deletion_time: None,
         });
         (new_id, new_metadata, 1, WriteCondition::MustCreate)
     };
@@ -370,12 +374,12 @@ async fn upsert_cluster_inference_route_with_credentials(
 fn build_inference_route_config(
     provider: &Provider,
     model_id: &str,
-    timeout_secs: u64,
+    request_timeout: Option<prost_types::Duration>,
 ) -> InferenceRouteConfig {
     InferenceRouteConfig {
         provider_name: provider.object_name().to_string(),
         model_id: model_id.to_string(),
-        timeout_secs,
+        request_timeout,
     }
 }
 
@@ -1085,7 +1089,10 @@ async fn resolve_inference_bundle_with_credentials(
             r.api_key.hash(&mut hasher);
             r.protocols.hash(&mut hasher);
             r.provider_type.hash(&mut hasher);
-            r.timeout_secs.hash(&mut hasher);
+            r.request_timeout
+                .as_ref()
+                .map(|value| (value.seconds, value.nanos))
+                .hash(&mut hasher);
             r.model_in_path.hash(&mut hasher);
             r.request_path_override.hash(&mut hasher);
         }
@@ -1095,7 +1102,7 @@ async fn resolve_inference_bundle_with_credentials(
     Ok(GetInferenceBundleResponse {
         routes,
         revision,
-        generated_at_ms: now_ms,
+        generated_time: openshell_core::time::timestamp_from_millis(now_ms).ok(),
     })
 }
 
@@ -1160,7 +1167,7 @@ async fn resolve_route_by_name_with_credentials(
         api_key: resolved.route.api_key,
         protocols: resolved.route.protocols,
         provider_type: resolved.provider_type,
-        timeout_secs: config.timeout_secs,
+        request_timeout: config.request_timeout,
         model_in_path: resolved.route.model_in_path,
         request_path_override: resolved.route.request_path_override,
     }))
@@ -1188,9 +1195,9 @@ async fn resolve_provider_credentials(
     // Merge expiration times, keeping the earliest non-zero value
     for (key, driver_expires_at_ms) in resolved.expires_at_ms {
         let provider_expires_at_ms = provider
-            .credential_expires_at_ms
+            .credential_expiration_times
             .get(&key)
-            .copied()
+            .and_then(|value| openshell_core::time::timestamp_to_millis(value).ok())
             .unwrap_or(0);
 
         let effective_expires_at_ms = match (provider_expires_at_ms, driver_expires_at_ms) {
@@ -1199,10 +1206,13 @@ async fn resolve_provider_credentials(
             (provider, driver) => provider.min(driver),
         };
 
-        if effective_expires_at_ms > 0 {
+        if effective_expires_at_ms > 0
+            && let Ok(expiration_time) =
+                openshell_core::time::timestamp_from_millis(effective_expires_at_ms)
+        {
             provider
-                .credential_expires_at_ms
-                .insert(key, effective_expires_at_ms);
+                .credential_expiration_times
+                .insert(key, expiration_time);
         }
     }
     Ok(provider)
@@ -1250,17 +1260,17 @@ mod tests {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: format!("id-{name}"),
                 name: name.to_string(),
-                created_at_ms: 1_000_000,
+                created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
                 labels: HashMap::new(),
                 resource_version: 0,
                 annotations: HashMap::new(),
                 workspace: "default".to_string(),
-                deletion_timestamp_ms: 0,
+                deletion_time: None,
             }),
             config: Some(InferenceRouteConfig {
                 provider_name: provider_name.to_string(),
                 model_id: model_id.to_string(),
-                timeout_secs: 0,
+                request_timeout: None,
             }),
             version: 0,
         }
@@ -1271,17 +1281,17 @@ mod tests {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: format!("provider-{name}"),
                 name: name.to_string(),
-                created_at_ms: 1_000_000,
+                created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
                 labels: HashMap::new(),
                 resource_version: 0,
                 annotations: HashMap::new(),
                 workspace: "default".to_string(),
-                deletion_timestamp_ms: 0,
+                deletion_time: None,
             }),
             r#type: provider_type.to_string(),
             credentials: std::iter::once((key_name.to_string(), key_value.to_string())).collect(),
             config: HashMap::new(),
-            credential_expires_at_ms: HashMap::new(),
+            credential_expiration_times: HashMap::new(),
             profile_workspace: String::new(),
             credential_handles: HashMap::new(),
         }
@@ -1434,12 +1444,12 @@ mod tests {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: "provider-bedrock-bridge".to_string(),
                 name: "bedrock-bridge".to_string(),
-                created_at_ms: 1_000_000,
+                created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
                 labels: HashMap::new(),
                 resource_version: 0,
                 annotations: HashMap::new(),
                 workspace: "default".to_string(),
-                deletion_timestamp_ms: 0,
+                deletion_time: None,
             }),
             r#type: "aws-bedrock".to_string(),
             // Placeholder credential — the router ignores it because
@@ -1455,7 +1465,7 @@ mod tests {
                 "http://bedrock-bridge.demo.svc.cluster.local:8080".to_string(),
             ))
             .collect(),
-            credential_expires_at_ms: HashMap::new(),
+            credential_expiration_times: HashMap::new(),
             profile_workspace: String::new(),
             credential_handles: HashMap::new(),
         };
@@ -1516,12 +1526,12 @@ mod tests {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: "provider-bedrock-misconfigured".to_string(),
                 name: "bedrock-misconfigured".to_string(),
-                created_at_ms: 1_000_000,
+                created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
                 labels: HashMap::new(),
                 resource_version: 0,
                 annotations: HashMap::new(),
                 workspace: "default".to_string(),
-                deletion_timestamp_ms: 0,
+                deletion_time: None,
             }),
             r#type: "aws-bedrock".to_string(),
             credentials: std::iter::once((
@@ -1531,7 +1541,7 @@ mod tests {
             .collect(),
             // Intentionally no BEDROCK_BASE_URL.
             config: HashMap::new(),
-            credential_expires_at_ms: HashMap::new(),
+            credential_expiration_times: HashMap::new(),
             profile_workspace: String::new(),
             credential_handles: HashMap::new(),
         };
@@ -1570,12 +1580,12 @@ mod tests {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: "provider-bedrock-bridge".to_string(),
                 name: "bedrock-bridge".to_string(),
-                created_at_ms: 1_000_000,
+                created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
                 labels: HashMap::new(),
                 resource_version: 0,
                 annotations: HashMap::new(),
                 workspace: "default".to_string(),
-                deletion_timestamp_ms: 0,
+                deletion_time: None,
             }),
             r#type: "aws-bedrock".to_string(),
             credentials: HashMap::new(),
@@ -1584,7 +1594,7 @@ mod tests {
                 "http://bedrock-bridge.demo.svc.cluster.local:8080".to_string(),
             ))
             .collect(),
-            credential_expires_at_ms: HashMap::new(),
+            credential_expiration_times: HashMap::new(),
             profile_workspace: String::new(),
             credential_handles: HashMap::new(),
         };
@@ -1663,7 +1673,7 @@ mod tests {
         assert_eq!(resp.routes[0].api_key, "sk-test");
         assert_eq!(resp.routes[0].base_url, "https://api.openai.com/v1");
         assert!(!resp.revision.is_empty());
-        assert!(resp.generated_at_ms > 0);
+        assert!(resp.generated_time.is_some());
     }
 
     #[tokio::test]
@@ -1839,12 +1849,12 @@ mod tests {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: "provider-1".to_string(),
                 name: "openai-dev".to_string(),
-                created_at_ms: 1_000_000,
+                created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
                 labels: HashMap::new(),
                 resource_version: 0,
                 annotations: HashMap::new(),
                 workspace: "default".to_string(),
-                deletion_timestamp_ms: 0,
+                deletion_time: None,
             }),
             r#type: "openai".to_string(),
             credentials: std::iter::once(("OPENAI_API_KEY".to_string(), "sk-test".to_string()))
@@ -1854,7 +1864,7 @@ mod tests {
                 "https://station.example.com/v1".to_string(),
             ))
             .collect(),
-            credential_expires_at_ms: HashMap::new(),
+            credential_expiration_times: HashMap::new(),
             profile_workspace: String::new(),
             credential_handles: HashMap::new(),
         };
@@ -1867,17 +1877,17 @@ mod tests {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: "r-1".to_string(),
                 name: CLUSTER_INFERENCE_ROUTE_NAME.to_string(),
-                created_at_ms: 1_000_000,
+                created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
                 labels: HashMap::new(),
                 resource_version: 0,
                 annotations: HashMap::new(),
                 workspace: "default".to_string(),
-                deletion_timestamp_ms: 0,
+                deletion_time: None,
             }),
             config: Some(InferenceRouteConfig {
                 provider_name: "openai-dev".to_string(),
                 model_id: "test/model".to_string(),
-                timeout_secs: 0,
+                request_timeout: None,
             }),
             version: 1,
         };
@@ -1929,7 +1939,7 @@ mod tests {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: "provider-1".to_string(),
                 name: "openai-dev".to_string(),
-                created_at_ms: 1_000_000,
+                created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
                 labels: HashMap::new(),
                 resource_version: 0,
                 workspace: "default".to_string(),
@@ -1942,7 +1952,7 @@ mod tests {
                 "https://station.example.com/v1".to_string(),
             ))
             .collect(),
-            credential_expires_at_ms: HashMap::new(),
+            credential_expiration_times: HashMap::new(),
             credential_handles: handles,
             profile_workspace: String::new(),
         };
@@ -1958,7 +1968,7 @@ mod tests {
             CLUSTER_INFERENCE_ROUTE_NAME,
             "openai-dev",
             "test/model",
-            0,
+            None,
             false,
         )
         .await
@@ -2006,7 +2016,7 @@ mod tests {
             credentials: std::iter::once(("OPENAI_API_KEY".to_string(), "sk-rotated".to_string()))
                 .collect(),
             config: provider.config.clone(),
-            credential_expires_at_ms: provider.credential_expires_at_ms.clone(),
+            credential_expiration_times: provider.credential_expiration_times.clone(),
             profile_workspace: provider.profile_workspace.clone(),
             credential_handles: HashMap::new(),
         };
@@ -2056,12 +2066,12 @@ mod tests {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: "provider-vertex-test".to_string(),
                 name: "vertex-test".to_string(),
-                created_at_ms: 1_000_000,
+                created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
                 labels: HashMap::new(),
                 resource_version: 0,
                 annotations: HashMap::new(),
                 workspace: "default".to_string(),
-                deletion_timestamp_ms: 0,
+                deletion_time: None,
             }),
             r#type: "google-vertex-ai".to_string(),
             credentials: std::iter::once((
@@ -2078,7 +2088,7 @@ mod tests {
             ]
             .into_iter()
             .collect(),
-            credential_expires_at_ms: HashMap::new(),
+            credential_expiration_times: HashMap::new(),
             profile_workspace: String::new(),
             credential_handles: HashMap::new(),
         };
@@ -2400,12 +2410,12 @@ mod tests {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: format!("provider-{name}"),
                 name: name.to_string(),
-                created_at_ms: 1_000_000,
+                created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
                 labels: HashMap::new(),
                 resource_version: 1,
                 annotations: HashMap::new(),
                 workspace: "default".to_string(),
-                deletion_timestamp_ms: 0,
+                deletion_time: None,
             }),
             r#type: "google-vertex-ai".to_string(),
             credentials: std::iter::once((
@@ -2414,7 +2424,7 @@ mod tests {
             ))
             .collect(),
             config,
-            credential_expires_at_ms: HashMap::new(),
+            credential_expiration_times: HashMap::new(),
             profile_workspace: String::new(),
             credential_handles: HashMap::new(),
         }
@@ -3551,12 +3561,12 @@ mod tests {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: "provider-alpha".to_string(),
                 name: "openai-alpha".to_string(),
-                created_at_ms: 1_000_000,
+                created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
                 labels: HashMap::new(),
                 annotations: HashMap::new(),
                 resource_version: 0,
                 workspace: "alpha".to_string(),
-                deletion_timestamp_ms: 0,
+                deletion_time: None,
             }),
             r#type: "openai".to_string(),
             credentials: std::iter::once((
@@ -3565,7 +3575,7 @@ mod tests {
             ))
             .collect(),
             config: HashMap::new(),
-            credential_expires_at_ms: HashMap::new(),
+            credential_expiration_times: HashMap::new(),
             profile_workspace: String::new(),
             credential_handles: HashMap::new(),
         };
@@ -3578,12 +3588,12 @@ mod tests {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: "provider-beta".to_string(),
                 name: "anthropic-beta".to_string(),
-                created_at_ms: 1_000_000,
+                created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
                 labels: HashMap::new(),
                 annotations: HashMap::new(),
                 resource_version: 0,
                 workspace: "beta".to_string(),
-                deletion_timestamp_ms: 0,
+                deletion_time: None,
             }),
             r#type: "anthropic".to_string(),
             credentials: std::iter::once((
@@ -3592,7 +3602,7 @@ mod tests {
             ))
             .collect(),
             config: HashMap::new(),
-            credential_expires_at_ms: HashMap::new(),
+            credential_expiration_times: HashMap::new(),
             profile_workspace: String::new(),
             credential_handles: HashMap::new(),
         };

@@ -15,12 +15,12 @@ func InferenceRouteConfigToProto(workspace string, cfg *types.InferenceRouteConf
 		return &pb.SetInferenceRouteRequest{Workspace: workspace}
 	}
 	return &pb.SetInferenceRouteRequest{
-		ProviderName: cfg.ProviderName,
-		ModelId:      cfg.ModelID,
-		RouteName:    cfg.RouteName,
-		NoVerify:     cfg.NoVerify,
-		TimeoutSecs:  cfg.TimeoutSecs,
-		Workspace:    workspace,
+		ProviderName:   cfg.ProviderName,
+		ModelId:        cfg.ModelID,
+		RouteName:      cfg.RouteName,
+		NoVerify:       cfg.NoVerify,
+		RequestTimeout: DurationFromSeconds(cfg.TimeoutSecs),
+		Workspace:      workspace,
 	}
 }
 
@@ -35,7 +35,7 @@ func InferenceRouteFromSetResponse(resp *pb.SetInferenceRouteResponse) *types.In
 		ModelID:             resp.GetModelId(),
 		Version:             resp.GetVersion(),
 		RouteName:           resp.GetRouteName(),
-		TimeoutSecs:         resp.GetTimeoutSecs(),
+		TimeoutSecs:         DurationSecondsFromProto(resp.GetRequestTimeout()),
 		Workspace:           resp.GetWorkspace(),
 		ValidationPerformed: resp.GetValidationPerformed(),
 		ValidatedEndpoints:  validatedEndpointsFromProto(resp.GetValidatedEndpoints()),
@@ -53,7 +53,7 @@ func InferenceRouteFromGetResponse(resp *pb.GetInferenceRouteResponse) *types.In
 		ModelID:      resp.GetModelId(),
 		Version:      resp.GetVersion(),
 		RouteName:    resp.GetRouteName(),
-		TimeoutSecs:  resp.GetTimeoutSecs(),
+		TimeoutSecs:  DurationSecondsFromProto(resp.GetRequestTimeout()),
 		Workspace:    resp.GetWorkspace(),
 	}
 }

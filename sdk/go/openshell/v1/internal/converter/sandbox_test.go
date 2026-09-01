@@ -22,14 +22,14 @@ func TestSandboxFromProto(t *testing.T) {
 	exitCode := int32(0)
 	proto := &pb.Sandbox{
 		Metadata: &dm.ObjectMeta{
-			Id:                  "sb-1",
-			Name:                "my-sandbox",
-			CreatedAtMs:         1700000000000,
-			Labels:              map[string]string{"env": "dev"},
-			Annotations:         map[string]string{"owner": "team-a"},
-			ResourceVersion:     3,
-			Workspace:           "prod",
-			DeletionTimestampMs: 1700000060000,
+			Id:              "sb-1",
+			Name:            "my-sandbox",
+			CreatedTime:     TimestampFromMillis(1700000000000),
+			Labels:          map[string]string{"env": "dev"},
+			Annotations:     map[string]string{"owner": "team-a"},
+			ResourceVersion: 3,
+			Workspace:       "prod",
+			DeletionTime:    TimestampFromMillis(1700000060000),
 		},
 		Spec: &pb.SandboxSpec{
 			LogLevel:    "debug",
@@ -71,11 +71,11 @@ func TestSandboxFromProto(t *testing.T) {
 			ExitCode:              &exitCode,
 			Conditions: []*pb.SandboxCondition{
 				{
-					Type:               "Ready",
-					Status:             "True",
-					Reason:             "AllGood",
-					Message:            "Sandbox is ready",
-					LastTransitionTime: "2024-01-01T00:00:00Z",
+					Type:           "Ready",
+					Status:         "True",
+					Reason:         "AllGood",
+					Message:        "Sandbox is ready",
+					TransitionTime: TimestampFromMillis(1704067200000),
 				},
 			},
 		},
@@ -265,12 +265,12 @@ func TestSandboxToProto(t *testing.T) {
 	require.NotNil(t, p.Metadata)
 	assert.Equal(t, "sb-1", p.Metadata.Id)
 	assert.Equal(t, "my-sandbox", p.Metadata.Name)
-	assert.Equal(t, int64(1700000000000), p.Metadata.CreatedAtMs)
+	assert.Equal(t, int64(1700000000000), MillisFromProto(p.Metadata.CreatedTime))
 	assert.Equal(t, map[string]string{"env": "dev"}, p.Metadata.Labels)
 	assert.Equal(t, map[string]string{"owner": "team-a"}, p.Metadata.Annotations)
 	assert.Equal(t, uint64(3), p.Metadata.ResourceVersion)
 	assert.Equal(t, "prod", p.Metadata.Workspace)
-	assert.Equal(t, int64(1700000060000), p.Metadata.DeletionTimestampMs)
+	assert.Equal(t, int64(1700000060000), MillisFromProto(p.Metadata.DeletionTime))
 
 	require.NotNil(t, p.Spec)
 	assert.Equal(t, "info", p.Spec.LogLevel)

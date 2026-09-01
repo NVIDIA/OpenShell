@@ -310,11 +310,11 @@ pub fn bundle_to_resolved_routes(
         .map(|r| {
             let (auth, default_headers, passthrough_headers) =
                 openshell_core::inference::route_headers_for_provider_type(&r.provider_type);
-            let timeout = if r.timeout_secs == 0 {
-                openshell_router::config::DEFAULT_ROUTE_TIMEOUT
-            } else {
-                Duration::from_secs(r.timeout_secs)
-            };
+            let timeout = r
+                .request_timeout
+                .as_ref()
+                .and_then(|value| openshell_core::time::duration_to_std(value).ok())
+                .unwrap_or(openshell_router::config::DEFAULT_ROUTE_TIMEOUT);
             openshell_router::config::ResolvedRoute {
                 name: r.name.clone(),
                 endpoint: r.base_url.clone(),
@@ -426,7 +426,7 @@ mod tests {
                         "openai_responses".to_string(),
                     ],
                     provider_type: "openai".to_string(),
-                    timeout_secs: 0,
+                    request_timeout: None,
                     model_in_path: false,
                     request_path_override: None,
                 },
@@ -437,13 +437,16 @@ mod tests {
                     model_id: "llama-3".to_string(),
                     protocols: vec!["openai_chat_completions".to_string()],
                     provider_type: String::new(),
-                    timeout_secs: 120,
+                    request_timeout: Some(prost_types::Duration {
+                        seconds: 120,
+                        nanos: 0,
+                    }),
                     model_in_path: false,
                     request_path_override: None,
                 },
             ],
             revision: "abc123".to_string(),
-            generated_at_ms: 1000,
+            generated_time: openshell_core::time::timestamp_from_millis(1000).ok(),
         };
 
         let routes = bundle_to_resolved_routes(&bundle);
@@ -482,7 +485,7 @@ mod tests {
         let bundle = openshell_core::proto::GetInferenceBundleResponse {
             routes: vec![],
             revision: "empty".to_string(),
-            generated_at_ms: 0,
+            generated_time: None,
         };
 
         let routes = bundle_to_resolved_routes(&bundle);
@@ -499,12 +502,12 @@ mod tests {
                 model_id: "model".to_string(),
                 protocols: vec!["openai_chat_completions".to_string()],
                 provider_type: "openai".to_string(),
-                timeout_secs: 0,
+                request_timeout: None,
                 model_in_path: false,
                 request_path_override: None,
             }],
             revision: "rev".to_string(),
-            generated_at_ms: 0,
+            generated_time: None,
         };
 
         let routes = bundle_to_resolved_routes(&bundle);

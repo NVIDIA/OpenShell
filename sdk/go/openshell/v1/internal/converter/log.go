@@ -16,7 +16,7 @@ func LogLineFromProto(l *pb.SandboxLogLine) *types.LogLine {
 		return nil
 	}
 	return &types.LogLine{
-		Timestamp: TimeFromMillis(l.GetTimestampMs()),
+		Timestamp: TimeFromProto(l.GetEventTime()),
 		Level:     l.GetLevel(),
 		Target:    l.GetTarget(),
 		Message:   l.GetMessage(),

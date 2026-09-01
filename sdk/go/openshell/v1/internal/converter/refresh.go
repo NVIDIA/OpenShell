@@ -4,9 +4,6 @@
 package converter
 
 import (
-	"math"
-	"time"
-
 	"github.com/NVIDIA/OpenShell/sdk/go/openshell/v1/types"
 	pb "github.com/NVIDIA/OpenShell/sdk/go/proto/openshellv1"
 )
@@ -51,13 +48,6 @@ func RefreshRecoveryActionFromProto(a pb.ProviderCredentialRefreshRecoveryAction
 	}
 }
 
-func refreshNextTimeFromMillis(ms int64) time.Time {
-	if ms == math.MaxInt64 {
-		return time.Time{}
-	}
-	return TimeFromMillis(ms)
-}
-
 // RefreshStrategyToProto converts an SDK RefreshStrategy to a proto ProviderCredentialRefreshStrategy.
 func RefreshStrategyToProto(s types.RefreshStrategy) pb.ProviderCredentialRefreshStrategy {
 	switch s {
@@ -91,14 +81,14 @@ func RefreshStatusFromProto(s *pb.ProviderCredentialRefreshStatus) *types.Refres
 		CredentialKey:        s.GetCredentialKey(),
 		Strategy:             RefreshStrategyFromProto(s.GetStrategy()),
 		Status:               s.GetStatus(),
-		ExpiresAt:            TimeFromMillis(s.GetExpiresAtMs()),
-		NextRefreshAt:        refreshNextTimeFromMillis(s.GetNextRefreshAtMs()),
-		LastRefreshAt:        TimeFromMillis(s.GetLastRefreshAtMs()),
+		ExpiresAt:            TimeFromProto(s.GetExpirationTime()),
+		NextRefreshAt:        TimeFromProto(s.GetNextRefreshTime()),
+		LastRefreshAt:        TimeFromProto(s.GetLastRefreshTime()),
 		LastError:            s.GetLastError(),
 		RecoveryAction:       RefreshRecoveryActionFromProto(s.GetRecoveryAction()),
 		FailureCode:          s.GetFailureCode(),
 		ProviderErrorSubtype: s.GetProviderErrorSubtype(),
-		LastErrorAt:          TimeFromMillis(s.GetLastErrorAtMs()),
+		LastErrorAt:          TimeFromProto(s.GetLastErrorTime()),
 	}
 }
 
@@ -120,8 +110,7 @@ func RefreshConfigToProto(c *types.RefreshConfig) *pb.ConfigureProviderRefreshRe
 	}
 
 	if c.ExpiresAt != nil {
-		ms := MillisFromTime(*c.ExpiresAt)
-		result.ExpiresAtMs = &ms
+		result.ExpirationTime = TimestampFromTime(*c.ExpiresAt)
 	}
 
 	return result

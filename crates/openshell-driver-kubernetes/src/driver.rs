@@ -2629,7 +2629,7 @@ fn map_kube_event_to_platform(
     Some((
         sandbox_id,
         PlatformEvent {
-            timestamp_ms: ts,
+            event_time: openshell_core::time::timestamp_from_millis(ts).ok(),
             source: "kubernetes".to_string(),
             r#type: obj.type_.clone().unwrap_or_default(),
             reason: obj.reason.clone().unwrap_or_default(),
@@ -4663,11 +4663,10 @@ fn condition_from_value(value: &serde_json::Value) -> Option<SandboxCondition> {
             .and_then(|val| val.as_str())
             .unwrap_or_default()
             .to_string(),
-        last_transition_time: obj
+        transition_time: obj
             .get("lastTransitionTime")
             .and_then(|val| val.as_str())
-            .unwrap_or_default()
-            .to_string(),
+            .and_then(|value| value.parse().ok()),
     })
 }
 

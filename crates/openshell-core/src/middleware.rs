@@ -175,7 +175,7 @@ impl<'a> HttpRequestView<'a> {
 ///                 operation: SupervisorMiddlewareOperation::HttpRequest as i32,
 ///                 phase: SupervisorMiddlewarePhase::PreCredentials as i32,
 ///                 max_payload_bytes: 1024,
-///                 timeout: String::new(),
+///                 request_timeout: None,
 ///             }],
 ///             expected_audience: String::new(),
 ///         }

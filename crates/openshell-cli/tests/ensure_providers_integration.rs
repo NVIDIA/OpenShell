@@ -61,17 +61,17 @@ impl TestOpenShell {
                 metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                     id: format!("id-{name}"),
                     name: name.to_string(),
-                    created_at_ms: 0,
+                    created_time: None,
                     labels: HashMap::new(),
                     resource_version: 0,
                     annotations: HashMap::new(),
                     workspace: String::new(),
-                    deletion_timestamp_ms: 0,
+                    deletion_time: None,
                 }),
                 r#type: provider_type.to_string(),
                 credentials: HashMap::new(),
                 config: HashMap::new(),
-                credential_expires_at_ms: HashMap::new(),
+                credential_expiration_times: HashMap::new(),
                 profile_workspace: "default".to_string(),
                 credential_handles: HashMap::new(),
             },
@@ -382,38 +382,34 @@ impl OpenShell for TestOpenShell {
             }
             base
         };
-        let merge_expiry = |mut base: HashMap<String, i64>, incoming: HashMap<String, i64>| {
-            if incoming.is_empty() {
-                return base;
-            }
-            for (k, v) in incoming {
-                if v <= 0 {
-                    base.remove(&k);
-                } else {
-                    base.insert(k, v);
+        let merge_expiry =
+            |mut base: HashMap<String, prost_types::Timestamp>,
+             incoming: HashMap<String, prost_types::Timestamp>| {
+                if incoming.is_empty() {
+                    return base;
                 }
-            }
-            base
-        };
+                base.extend(incoming);
+                base
+            };
         let existing_metadata = existing.metadata.clone().unwrap_or_default();
         let provider_metadata = provider.metadata.clone().unwrap_or_default();
         let updated = Provider {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: existing_metadata.id,
                 name: provider_metadata.name,
-                created_at_ms: existing_metadata.created_at_ms,
+                created_time: existing_metadata.created_time,
                 labels: existing_metadata.labels,
                 resource_version: 0,
                 annotations: HashMap::new(),
                 workspace: String::new(),
-                deletion_timestamp_ms: 0,
+                deletion_time: None,
             }),
             r#type: existing.r#type,
             credentials: merge(existing.credentials, provider.credentials),
             config: merge(existing.config, provider.config),
-            credential_expires_at_ms: merge_expiry(
-                existing.credential_expires_at_ms,
-                provider.credential_expires_at_ms,
+            credential_expiration_times: merge_expiry(
+                existing.credential_expiration_times,
+                provider.credential_expiration_times,
             ),
             profile_workspace: existing.profile_workspace,
             credential_handles: if provider.credential_handles.is_empty() {

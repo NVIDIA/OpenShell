@@ -1691,12 +1691,15 @@ pub(crate) async fn ensure_default_workspace(store: &Store) -> Result<()> {
         metadata: Some(ObjectMeta {
             id: id.clone(),
             name: DEFAULT_WORKSPACE_NAME.to_string(),
-            created_at_ms: persistence::current_time_ms(),
+            created_time: openshell_core::time::timestamp_from_millis(
+                persistence::current_time_ms(),
+            )
+            .ok(),
             labels: HashMap::new(),
             annotations: HashMap::new(),
             resource_version: 0,
             workspace: String::new(),
-            deletion_timestamp_ms: 0,
+            deletion_time: None,
         }),
         status: Some(openshell_core::proto::datamodel::v1::WorkspaceStatus {
             phase: openshell_core::proto::datamodel::v1::WorkspacePhase::Active.into(),

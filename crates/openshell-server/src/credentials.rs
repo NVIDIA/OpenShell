@@ -683,14 +683,22 @@ impl CredentialRuntime {
 
                 // Check provider-level expiration
                 let provider_expires_at_ms = provider
-                    .credential_expires_at_ms
+                    .credential_expiration_times
                     .get(&credential_key)
-                    .copied()
+                    .map(openshell_core::time::timestamp_to_millis)
+                    .transpose()
+                    .map_err(|error| Status::invalid_argument(error.to_string()))?
+                    .unwrap_or(0);
+                let driver_expires_at_ms = response
+                    .expiration_time
+                    .as_ref()
+                    .map(openshell_core::time::timestamp_to_millis)
+                    .transpose()
+                    .map_err(|error| Status::internal(error.to_string()))?
                     .unwrap_or(0);
 
                 // Compute effective expiration (earliest non-zero timestamp)
-                let effective_expires_at_ms = match (provider_expires_at_ms, response.expires_at_ms)
-                {
+                let effective_expires_at_ms = match (provider_expires_at_ms, driver_expires_at_ms) {
                     (0, driver) => driver,
                     (provider, 0) => provider,
                     (provider, driver) => provider.min(driver),
@@ -701,7 +709,7 @@ impl CredentialRuntime {
                         provider_name = %provider_name,
                         credential_key = %credential_key,
                         provider_expires_at_ms,
-                        driver_expires_at_ms = response.expires_at_ms,
+                        driver_expires_at_ms,
                         effective_expires_at_ms,
                         "skipping expired handle-backed credential"
                     );
@@ -1817,7 +1825,7 @@ impl CredentialDriver for TestStaticCredentialDriver {
             responses.push(ResolvedCredential {
                 request_id: request.request_id,
                 value,
-                expires_at_ms: 0,
+                expiration_time: None,
             });
         }
 

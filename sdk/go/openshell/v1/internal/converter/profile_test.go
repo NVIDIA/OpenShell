@@ -154,7 +154,7 @@ func TestProfileCredentialFromProto(t *testing.T) {
 			Audience:            "https://api.example.com",
 			JwtSvidAudience:     "spiffe://example.com",
 			Scopes:              []string{"read", "write"},
-			CacheTtlSeconds:     300,
+			CacheTtl:            DurationFromSeconds(300),
 			ClientAssertionType: "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
 			GrantType:           pb.ProviderCredentialTokenGrantType_PROVIDER_CREDENTIAL_TOKEN_GRANT_TYPE_TOKEN_EXCHANGE,
 			SubjectToken: &pb.ProviderCredentialTokenGrantSubjectToken{
@@ -310,7 +310,7 @@ func TestProfileCredentialToProto(t *testing.T) {
 	assert.Equal(t, "https://api.example.com", proto.TokenGrant.Audience)
 	assert.Equal(t, "spiffe://example.com", proto.TokenGrant.JwtSvidAudience)
 	assert.Equal(t, []string{"read"}, proto.TokenGrant.Scopes)
-	assert.Equal(t, int64(300), proto.TokenGrant.CacheTtlSeconds)
+	assert.Equal(t, int64(300), proto.TokenGrant.CacheTtl.GetSeconds())
 	assert.Equal(t, "urn:custom", proto.TokenGrant.ClientAssertionType)
 	assert.Equal(t, pb.ProviderCredentialTokenGrantType_PROVIDER_CREDENTIAL_TOKEN_GRANT_TYPE_TOKEN_EXCHANGE, proto.TokenGrant.GrantType)
 	require.NotNil(t, proto.TokenGrant.SubjectToken)

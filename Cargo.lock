@@ -4247,6 +4247,7 @@ dependencies = [
  "glob",
  "openshell-core",
  "openshell-policy",
+ "prost-types",
  "serde",
  "serde_json",
  "serde_yml",

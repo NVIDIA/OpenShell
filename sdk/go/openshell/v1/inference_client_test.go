@@ -7,6 +7,7 @@ import (
 	"context"
 	"net"
 	"testing"
+	"time"
 
 	pb "github.com/NVIDIA/OpenShell/sdk/go/proto/inferencev1"
 	"github.com/stretchr/testify/assert"
@@ -16,7 +17,12 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
 	"google.golang.org/grpc/test/bufconn"
+	"google.golang.org/protobuf/types/known/durationpb"
 )
+
+func testDuration(seconds int64) *durationpb.Duration {
+	return durationpb.New(time.Duration(seconds) * time.Second)
+}
 
 type mockInferenceServer struct {
 	pb.UnimplementedInferenceServer
@@ -92,8 +98,8 @@ func TestSetRoute_Success(t *testing.T) {
 			ValidatedEndpoints: []*pb.ValidatedEndpoint{
 				{Url: "https://api.openai.com/v1", Protocol: "openai"},
 			},
-			TimeoutSecs: 120,
-			Workspace:   "team-alpha",
+			RequestTimeout: testDuration(120),
+			Workspace:      "team-alpha",
 		},
 	}
 	conn, cleanup := newMockInferenceServer(mock)
@@ -126,7 +132,7 @@ func TestSetRoute_Success(t *testing.T) {
 	assert.Equal(t, "gpt-4", mock.lastSetReq.GetModelId())
 	assert.Equal(t, "my-route", mock.lastSetReq.GetRouteName())
 	assert.Equal(t, "team-alpha", mock.lastSetReq.GetWorkspace())
-	assert.Equal(t, uint64(120), mock.lastSetReq.GetTimeoutSecs())
+	assert.Equal(t, int64(120), mock.lastSetReq.GetRequestTimeout().GetSeconds())
 }
 
 func TestSetRoute_EmptyWorkspace(t *testing.T) {
@@ -256,12 +262,12 @@ func TestSetRoute_NoVerify(t *testing.T) {
 func TestGetRoute_Success(t *testing.T) {
 	mock := &mockInferenceServer{
 		getResp: &pb.GetInferenceRouteResponse{
-			ProviderName: "vertex",
-			ModelId:      "gemini-pro",
-			Version:      3,
-			RouteName:    "default",
-			TimeoutSecs:  60,
-			Workspace:    "prod",
+			ProviderName:   "vertex",
+			ModelId:        "gemini-pro",
+			Version:        3,
+			RouteName:      "default",
+			RequestTimeout: testDuration(60),
+			Workspace:      "prod",
 		},
 	}
 	conn, cleanup := newMockInferenceServer(mock)

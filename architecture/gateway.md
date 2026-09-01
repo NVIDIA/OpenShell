@@ -336,6 +336,14 @@ This keeps the gateway data model portable across storage backends and leaves
 room for future stores that can provide the same object, label, version, and
 scope semantics.
 
+Public protobuf APIs represent absolute times with `google.protobuf.Timestamp`
+and elapsed time with `google.protobuf.Duration`. The integer
+`created_at_ms` and `updated_at_ms` database columns are intentionally internal
+bookkeeping values, not part of that public convention. On startup, both
+storage backends transactionally rewrite legacy scalar time fields inside
+protobuf payloads before serving requests. A malformed affected payload aborts
+and rolls back startup migration rather than silently dropping a value.
+
 The SQLite adapter tightens the on-disk database file to mode `0o600` on every
 connect so that provider API keys, SSH session tokens, and sandbox metadata are
 not readable by other local users on shared hosts. The same restriction is

@@ -5449,7 +5449,7 @@ fn provisioning_condition() -> SandboxCondition {
         status: "False".to_string(),
         reason: "Starting".to_string(),
         message: "VM is starting".to_string(),
-        last_transition_time: String::new(),
+        transition_time: None,
     }
 }
 
@@ -5459,7 +5459,7 @@ fn deleting_condition() -> SandboxCondition {
         status: "False".to_string(),
         reason: "Deleting".to_string(),
         message: "Sandbox is being deleted".to_string(),
-        last_transition_time: String::new(),
+        transition_time: None,
     }
 }
 
@@ -5469,7 +5469,7 @@ fn stopped_condition() -> SandboxCondition {
         status: "True".to_string(),
         reason: "ComputeStopped".to_string(),
         message: "VM compute is stopped and persistent state is retained".to_string(),
-        last_transition_time: String::new(),
+        transition_time: None,
     }
 }
 
@@ -5479,13 +5479,14 @@ fn error_condition(reason: &str, message: &str) -> SandboxCondition {
         status: "False".to_string(),
         reason: reason.to_string(),
         message: message.to_string(),
-        last_transition_time: String::new(),
+        transition_time: None,
     }
 }
 
 fn platform_event(source: &str, event_type: &str, reason: &str, message: String) -> PlatformEvent {
     let mut event = PlatformEvent {
-        timestamp_ms: openshell_core::time::now_ms(),
+        event_time: openshell_core::time::timestamp_from_millis(openshell_core::time::now_ms())
+            .ok(),
         source: source.to_string(),
         r#type: event_type.to_string(),
         reason: reason.to_string(),

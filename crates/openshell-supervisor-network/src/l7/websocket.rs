@@ -3523,7 +3523,10 @@ network_policies:
                     phase: SupervisorMiddlewarePhase::PreCredentials as i32,
                     max_payload_bytes: openshell_supervisor_middleware::MAX_MIDDLEWARE_PAYLOAD_BYTES
                         as u64,
-                    timeout: "1s".into(),
+                    request_timeout: Some(prost_types::Duration {
+                        seconds: 1,
+                        nanos: 0,
+                    }),
                 }],
                 expected_audience: String::new(),
             }))
@@ -3717,7 +3720,10 @@ network_policies:
                 grpc_endpoint: format!("http://{address}"),
                 max_payload_bytes: openshell_supervisor_middleware::MAX_MIDDLEWARE_PAYLOAD_BYTES
                     as u64,
-                timeout: "2s".into(),
+                request_timeout: Some(prost_types::Duration {
+                    seconds: 2,
+                    nanos: 0,
+                }),
                 tls_ca_cert_pem: Vec::new(),
                 audience: String::new(),
                 allow_insecure_transport: false,
@@ -3789,7 +3795,10 @@ network_policies:
                 grpc_endpoint: format!("http://{address}"),
                 max_payload_bytes: openshell_supervisor_middleware::MAX_MIDDLEWARE_PAYLOAD_BYTES
                     as u64,
-                timeout: "2s".into(),
+                request_timeout: Some(prost_types::Duration {
+                    seconds: 2,
+                    nanos: 0,
+                }),
                 tls_ca_cert_pem: Vec::new(),
                 audience: String::new(),
                 allow_insecure_transport: false,
@@ -4680,7 +4689,10 @@ network_policies:
                 grpc_endpoint: format!("http://{address}"),
                 max_payload_bytes: openshell_supervisor_middleware::MAX_MIDDLEWARE_PAYLOAD_BYTES
                     as u64,
-                timeout: "2s".into(),
+                request_timeout: Some(prost_types::Duration {
+                    seconds: 2,
+                    nanos: 0,
+                }),
                 tls_ca_cert_pem: Vec::new(),
                 audience: String::new(),
                 allow_insecure_transport: false,
@@ -4830,7 +4842,10 @@ network_policies:
                 grpc_endpoint: format!("http://{address}"),
                 max_payload_bytes: openshell_supervisor_middleware::MAX_MIDDLEWARE_PAYLOAD_BYTES
                     as u64,
-                timeout: "2s".into(),
+                request_timeout: Some(prost_types::Duration {
+                    seconds: 2,
+                    nanos: 0,
+                }),
                 tls_ca_cert_pem: Vec::new(),
                 audience: String::new(),
                 allow_insecure_transport: false,
