@@ -3637,7 +3637,17 @@ impl ComputeRuntime {
 
 fn apply_main_process_exit(sandbox: &mut Sandbox, instance_id: &str, exit_code: i32) {
     let sandbox_name = sandbox.object_name().to_string();
-    let preserve_infrastructure_error = sandbox.phase() == SandboxPhase::Error as i32;
+    // A driver can observe the container exit before the supervisor's
+    // authoritative main-process report arrives. In that ordering,
+    // ContainerExited is only a provisional classification: replace it with
+    // the canonical process result once its exit code is known. Preserve all
+    // other infrastructure errors.
+    let preserve_infrastructure_error = sandbox.phase() == SandboxPhase::Error as i32
+        && !sandbox.status.as_ref().is_some_and(|status| {
+            status.conditions.iter().any(|condition| {
+                condition.r#type == "Ready" && condition.reason == "ContainerExited"
+            })
+        });
     let status = sandbox.status.get_or_insert_with(|| SandboxStatus {
         sandbox_name: sandbox_name.clone(),
         ..Default::default()
@@ -5487,6 +5497,42 @@ mod tests {
             condition.r#type == "Ready"
                 && condition.status == "False"
                 && condition.reason == "MainProcessFailed"
+        }));
+    }
+
+    #[test]
+    fn main_process_exit_replaces_provisional_container_exit() {
+        let mut sandbox = error_sandbox_record("sb-1", "sandbox-a", "ContainerExited");
+        apply_main_process_exit(&mut sandbox, "instance-1", 0);
+
+        assert_eq!(
+            SandboxPhase::try_from(sandbox.phase()),
+            Ok(SandboxPhase::Completed)
+        );
+        let status = sandbox.status.as_ref().unwrap();
+        assert_eq!(status.exit_code, Some(0));
+        assert_eq!(status.main_process_instance_id, "instance-1");
+        assert!(status.conditions.iter().any(|condition| {
+            condition.r#type == "Ready"
+                && condition.status == "False"
+                && condition.reason == "MainProcessCompleted"
+        }));
+    }
+
+    #[test]
+    fn main_process_exit_preserves_specific_infrastructure_error() {
+        let mut sandbox = error_sandbox_record("sb-1", "sandbox-a", "BackendResourceMissing");
+        apply_main_process_exit(&mut sandbox, "instance-1", 0);
+
+        assert_eq!(
+            SandboxPhase::try_from(sandbox.phase()),
+            Ok(SandboxPhase::Error)
+        );
+        let status = sandbox.status.as_ref().unwrap();
+        assert_eq!(status.exit_code, Some(0));
+        assert_eq!(status.main_process_instance_id, "instance-1");
+        assert!(status.conditions.iter().any(|condition| {
+            condition.r#type == "Ready" && condition.reason == "BackendResourceMissing"
         }));
     }
 
