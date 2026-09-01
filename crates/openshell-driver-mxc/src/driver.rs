@@ -304,6 +304,7 @@ impl MxcComputeBackend {
             driver_version: DRIVER_VERSION.to_string(),
             default_image: DEFAULT_IMAGE_SENTINEL.to_string(),
             gateway_manages_lifecycle: false,
+            resource_capabilities: None,
         }
     }
 

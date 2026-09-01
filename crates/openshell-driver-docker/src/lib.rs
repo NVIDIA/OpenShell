@@ -40,14 +40,15 @@ use openshell_core::progress::{
     format_bytes, mark_progress_active, mark_progress_complete, mark_progress_detail,
 };
 use openshell_core::proto::compute::v1::{
-    CreateSandboxRequest, CreateSandboxResponse, DeleteSandboxRequest, DeleteSandboxResponse,
-    DeleteWorkspaceRequest, DeleteWorkspaceResponse, DriverCondition, DriverPlatformEvent,
-    DriverSandbox, DriverSandboxStatus, DriverSandboxTemplate, EnsureWorkspaceRequest,
-    EnsureWorkspaceResponse, GatewayListenerRequirement, GetCapabilitiesRequest,
-    GetCapabilitiesResponse, GetGatewayListenerRequirementsRequest,
+    CpuResourceCapabilities, CreateSandboxRequest, CreateSandboxResponse, DeleteSandboxRequest,
+    DeleteSandboxResponse, DeleteWorkspaceRequest, DeleteWorkspaceResponse, DriverCondition,
+    DriverPlatformEvent, DriverSandbox, DriverSandboxStatus, DriverSandboxTemplate,
+    EnsureWorkspaceRequest, EnsureWorkspaceResponse, GatewayListenerRequirement,
+    GetCapabilitiesRequest, GetCapabilitiesResponse, GetGatewayListenerRequirementsRequest,
     GetGatewayListenerRequirementsResponse, GetSandboxRequest, GetSandboxResponse,
-    GpuResourceRequirements, ListSandboxesRequest, ListSandboxesResponse, StartSandboxRequest,
-    StartSandboxResponse, StopSandboxRequest, StopSandboxResponse, ValidateSandboxCreateRequest,
+    GpuResourceCapabilities, GpuResourceRequirements, ListSandboxesRequest, ListSandboxesResponse,
+    MemoryResourceCapabilities, ResourceCapabilities, StartSandboxRequest, StartSandboxResponse,
+    StopSandboxRequest, StopSandboxResponse, ValidateSandboxCreateRequest,
     ValidateSandboxCreateResponse, WatchSandboxesDeletedEvent, WatchSandboxesEvent,
     WatchSandboxesPlatformEvent, WatchSandboxesRequest, WatchSandboxesSandboxEvent,
     compute_driver_server::ComputeDriver, gateway_listener_requirement::Selector,
@@ -212,10 +213,15 @@ struct DockerDriverRuntimeConfig {
     supervisor_bin: PathBuf,
     guest_tls: Option<DockerGuestTlsPaths>,
     daemon_version: String,
-    supports_gpu: bool,
-    allow_all_default_gpu: bool,
+    gpu: DockerGpuRuntimeCapabilities,
     sandbox_pids_limit: i64,
     enable_bind_mounts: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DockerGpuRuntimeCapabilities {
+    cdi_supported: bool,
+    wsl_all_gpu_fallback_enabled: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -552,12 +558,16 @@ impl DockerComputeDriver {
         let info = docker.info().await.map_err(|err| {
             Error::execution(format!("failed to query Docker daemon info: {err}"))
         })?;
-        let supports_gpu = info
+        let cdi_supported = info
             .cdi_spec_dirs
             .as_ref()
             .is_some_and(|dirs| !dirs.is_empty());
         let cdi_gpu_inventory = docker_cdi_gpu_inventory(&info);
-        let allow_all_default_gpu = docker_info_reports_wsl2(&info);
+        let wsl_all_gpu_fallback_enabled = docker_info_reports_wsl2(&info);
+        let gpu = DockerGpuRuntimeCapabilities {
+            cdi_supported,
+            wsl_all_gpu_fallback_enabled,
+        };
         validate_sandbox_pids_limit(docker_config.sandbox_pids_limit)?;
         let gateway_port = config.bind_address.port();
         if gateway_port == 0 {
@@ -607,8 +617,7 @@ impl DockerComputeDriver {
                 supervisor_bin,
                 guest_tls,
                 daemon_version: version.version.unwrap_or_else(|| "unknown".to_string()),
-                supports_gpu,
-                allow_all_default_gpu,
+                gpu,
                 sandbox_pids_limit: docker_config.sandbox_pids_limit,
                 enable_bind_mounts: docker_config.enable_bind_mounts,
             },
@@ -616,7 +625,7 @@ impl DockerComputeDriver {
             pending: Arc::new(Mutex::new(HashMap::new())),
             gpu_selector: Arc::new(CdiGpuDefaultSelector::new(
                 cdi_gpu_inventory,
-                allow_all_default_gpu,
+                gpu.wsl_all_gpu_fallback_enabled,
             )),
             lifecycle_event_fences: DockerLifecycleEventFences::default(),
         };
@@ -636,6 +645,18 @@ impl DockerComputeDriver {
             default_image: self.config.default_image.clone(),
             gateway_manages_lifecycle: true,
             supports_sandbox_authentication: false,
+            resource_capabilities: Some(ResourceCapabilities {
+                cpu: Some(CpuResourceCapabilities {
+                    limit_supported: true,
+                }),
+                memory: Some(MemoryResourceCapabilities {
+                    limit_supported: true,
+                }),
+                gpu: Some(GpuResourceCapabilities {
+                    default_selection_supported: self.config.gpu.cdi_supported,
+                    count_selection_supported: self.config.gpu.cdi_supported,
+                }),
+            }),
         }
     }
 
@@ -667,7 +688,7 @@ impl DockerComputeDriver {
             DockerSandboxDriverConfig::from_template(template).map_err(Status::invalid_argument)?;
         validate_docker_driver_mounts(&driver_config.mounts, config.enable_bind_mounts)?;
         let gpu_requirements = driver_gpu_requirements(spec.resource_requirements.as_ref());
-        Self::validate_gpu_request(gpu_requirements, config.supports_gpu, &driver_config)?;
+        Self::validate_gpu_request(gpu_requirements, config.gpu.cdi_supported, &driver_config)?;
         Ok(ValidatedDockerSandbox {
             template,
             driver_config,
@@ -775,7 +796,7 @@ impl DockerComputeDriver {
             .map_err(|err| internal_status("query Docker daemon info", err))?;
         self.gpu_selector.refresh(
             docker_cdi_gpu_inventory(&info),
-            self.config.allow_all_default_gpu,
+            self.config.gpu.wsl_all_gpu_fallback_enabled,
         );
         Ok(())
     }

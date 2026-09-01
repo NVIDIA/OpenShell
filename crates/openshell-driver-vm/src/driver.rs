@@ -37,14 +37,15 @@ use openshell_core::progress::{
     format_bytes, mark_progress_active, mark_progress_complete, mark_progress_detail,
 };
 use openshell_core::proto::compute::v1::{
-    CreateSandboxRequest, CreateSandboxResponse, DeleteSandboxRequest, DeleteSandboxResponse,
-    DeleteWorkspaceRequest, DeleteWorkspaceResponse, DriverCondition as SandboxCondition,
-    DriverPlatformEvent as PlatformEvent, DriverSandbox as Sandbox,
-    DriverSandboxStatus as SandboxStatus, DriverSandboxTemplate as SandboxTemplate,
-    EnsureWorkspaceRequest, EnsureWorkspaceResponse, GetCapabilitiesRequest,
-    GetCapabilitiesResponse, GetGatewayListenerRequirementsRequest,
+    CpuResourceCapabilities, CreateSandboxRequest, CreateSandboxResponse, DeleteSandboxRequest,
+    DeleteSandboxResponse, DeleteWorkspaceRequest, DeleteWorkspaceResponse,
+    DriverCondition as SandboxCondition, DriverPlatformEvent as PlatformEvent,
+    DriverSandbox as Sandbox, DriverSandboxStatus as SandboxStatus,
+    DriverSandboxTemplate as SandboxTemplate, EnsureWorkspaceRequest, EnsureWorkspaceResponse,
+    GetCapabilitiesRequest, GetCapabilitiesResponse, GetGatewayListenerRequirementsRequest,
     GetGatewayListenerRequirementsResponse, GetSandboxRequest, GetSandboxResponse,
-    ListSandboxesRequest, ListSandboxesResponse, StartSandboxRequest, StartSandboxResponse,
+    GpuResourceCapabilities, ListSandboxesRequest, ListSandboxesResponse,
+    MemoryResourceCapabilities, ResourceCapabilities, StartSandboxRequest, StartSandboxResponse,
     StopSandboxRequest, StopSandboxResponse, ValidateSandboxCreateRequest,
     ValidateSandboxCreateResponse, WatchSandboxesDeletedEvent, WatchSandboxesEvent,
     WatchSandboxesPlatformEvent, WatchSandboxesRequest, WatchSandboxesSandboxEvent,
@@ -525,6 +526,18 @@ impl VmDriver {
             default_image: self.config.default_image.clone(),
             gateway_manages_lifecycle: true,
             supports_sandbox_authentication: false,
+            resource_capabilities: Some(ResourceCapabilities {
+                cpu: Some(CpuResourceCapabilities {
+                    limit_supported: false,
+                }),
+                memory: Some(MemoryResourceCapabilities {
+                    limit_supported: false,
+                }),
+                gpu: Some(GpuResourceCapabilities {
+                    default_selection_supported: self.config.gpu_enabled,
+                    count_selection_supported: self.config.gpu_enabled,
+                }),
+            }),
         }
     }
 
@@ -8067,6 +8080,27 @@ mod tests {
             ))),
             lifecycle_extensions: Arc::new(extensions),
         }
+    }
+
+    #[test]
+    fn capabilities_report_static_resource_support() {
+        let mut driver = test_driver_with_extensions(LifecycleExtensionRegistry::new());
+        let resources = driver.capabilities().resource_capabilities.unwrap();
+        assert!(!resources.cpu.unwrap().limit_supported);
+        assert!(!resources.memory.unwrap().limit_supported);
+        let gpu = resources.gpu.unwrap();
+        assert!(!gpu.default_selection_supported);
+        assert!(!gpu.count_selection_supported);
+
+        driver.config.gpu_enabled = true;
+        let gpu = driver
+            .capabilities()
+            .resource_capabilities
+            .unwrap()
+            .gpu
+            .unwrap();
+        assert!(gpu.default_selection_supported);
+        assert!(gpu.count_selection_supported);
     }
 
     #[derive(Debug)]
