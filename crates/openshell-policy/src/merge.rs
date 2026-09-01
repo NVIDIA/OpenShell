@@ -45,9 +45,11 @@ pub fn canonicalize_advisor_add_rule(
         })
         .cloned()
         .map(|mut endpoint| {
-            // This marker is derived from provider/credential context by the
-            // gateway and must never be persisted from an advisor proposal.
+            // Provenance does not change the endpoint contract. The gateway
+            // derives the credential marker, and the advisor marker records
+            // where a persisted endpoint came from.
             endpoint.provider_credentialed = false;
+            endpoint.advisor_proposed = false;
             // A denial observes one binary-to-port authorization. Preserve the
             // existing inspection contract, but never copy sibling ports from
             // a multi-port endpoint into the proposal.
@@ -84,6 +86,7 @@ pub fn canonicalize_advisor_add_rule(
                 .any(|endpoint| {
                     let mut normalized = endpoint.clone();
                     normalized.provider_credentialed = false;
+                    normalized.advisor_proposed = false;
                     normalize_endpoint(&mut normalized);
                     normalized == contract
                 })
@@ -92,6 +95,12 @@ pub fn canonicalize_advisor_add_rule(
         .collect::<Vec<_>>();
     sandbox_owners.sort();
 
+    let mut contract = contract;
+    if sandbox_owners.is_empty() {
+        // A provider-owned contract is mirrored into a new sandbox-owned
+        // advisor overlay, so retain the incoming proposal provenance.
+        contract.advisor_proposed = incoming_endpoint.advisor_proposed;
+    }
     let target_name = sandbox_owners
         .first()
         .cloned()
@@ -2220,6 +2229,7 @@ mod tests {
         assert_eq!(canonical.endpoints[0].protocol, "rest");
         assert_eq!(canonical.endpoints[0].access, "read-only");
         assert!(!canonical.endpoints[0].provider_credentialed);
+        assert!(canonical.endpoints[0].advisor_proposed);
         assert_eq!(
             effective.network_policies["_provider_example"].endpoints[0],
             provider_endpoint

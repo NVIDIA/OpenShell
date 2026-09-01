@@ -12973,7 +12973,7 @@ mod tests {
         let canonical = chunk.proposed_rule.as_ref().unwrap();
         assert_eq!(canonical.endpoints[0].protocol, "rest");
         assert_eq!(canonical.endpoints[0].access, "read-only");
-        assert!(!canonical.endpoints[0].advisor_proposed);
+        assert!(canonical.endpoints[0].advisor_proposed);
 
         let revision = state
             .store
@@ -12994,6 +12994,7 @@ mod tests {
         assert_eq!(curl_rule.endpoints[0].ports, vec![443]);
         assert_eq!(curl_rule.endpoints[0].protocol, "rest");
         assert_eq!(curl_rule.endpoints[0].access, "read-only");
+        assert!(curl_rule.endpoints[0].advisor_proposed);
         assert_eq!(curl_rule.binaries.len(), 1);
         assert_eq!(curl_rule.binaries[0].path, "/usr/bin/curl");
     }
