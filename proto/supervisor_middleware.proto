@@ -228,11 +228,12 @@ message HttpResponsePreflight {
   bool deferral_permitted = 9;
 }
 
-// HttpResponsePreflightDecision declines, inspects, or blocks delivery of the
-// response. Diagnostics apply to any action.
+// HttpResponsePreflightDecision opts out of inspecting the response, inspects
+// it, or blocks its delivery. Diagnostics apply to any action.
 message HttpResponsePreflightDecision {
   oneof action {
-    // Successfully decline this response without invoking on_error.
+    // Opt out of inspecting this response. The response is delivered
+    // unchanged by this stage and on_error is not invoked.
     HttpResponsePreflightSkip skip = 1;
     // Inspect the response using the selected body mode and mutations.
     HttpResponsePreflightInspect inspect = 2;
