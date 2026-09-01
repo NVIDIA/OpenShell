@@ -43,10 +43,11 @@ function readySandbox(
   id: string,
   resourceVersion = 7n,
   createdFromWorkloadTemplate?: { name: string; resourceVersion: string },
+  workspace = 'default',
 ): MessageInitShape<typeof OpenShell.method.getSandbox.output> {
   return {
     sandbox: {
-      metadata: { id, name, labels: { team: 'aire' }, resourceVersion },
+      metadata: { id, name, workspace, labels: { team: 'aire' }, resourceVersion },
       status: { phase: SandboxPhase.READY },
       createdFromWorkloadTemplate,
     },
@@ -286,10 +287,10 @@ describe('create', () => {
     const sandbox = client({
       createSandbox: (req) => {
         created = req;
-        return readySandbox('sb', 'sb-id');
+        return readySandbox('job-1', 'sb-id', 7n, undefined, req.workspace || 'default');
       },
     });
-    await sandbox.createFromTemplate({
+    const ref = await sandbox.createFromTemplate({
       name: 'job-1',
       workspace: 'staging',
       templateName: 'gpu-kata',
@@ -305,6 +306,158 @@ describe('create', () => {
     expect(created.spec?.providers).toEqual(['github']);
     expect(created.spec?.policy?.version).toBe(1);
     expect(created.spec?.template).toBeUndefined();
+    expect(ref.workspace).toBe('staging');
+  });
+
+  it('propagates workspace through sandbox lifecycle calls', async () => {
+    const observed: {
+      create?: { workspace?: string };
+      get?: { workspace?: string };
+      list?: { workspace?: string; allWorkspaces?: boolean };
+      delete?: { workspace?: string };
+      attach?: { workspace?: string };
+      detach?: { workspace?: string };
+      listProviders?: { workspace?: string };
+      updatePolicy?: { workspace?: string };
+      updateSetting?: { workspace?: string };
+      configGets: string[];
+      execGet?: string;
+      interactiveGet?: string;
+      sshGet?: string;
+      forwardGet?: string;
+    } = { configGets: [] };
+    const sandbox = client({
+      createSandbox: (req) => {
+        observed.create = req;
+        return readySandbox(req.name || 'sb', 'sb-created', 7n, undefined, req.workspace || 'default');
+      },
+      getSandbox: (req) => {
+        if (req.name === 'exec') observed.execGet = req.workspace;
+        else if (req.name === 'interactive') observed.interactiveGet = req.workspace;
+        else if (req.name === 'ssh') observed.sshGet = req.workspace;
+        else if (req.name === 'forward') observed.forwardGet = req.workspace;
+        else if (req.name === 'config') observed.configGets.push(req.workspace);
+        else observed.get = req;
+        return readySandbox(req.name, `${req.name}-id`, 7n, undefined, req.workspace || 'default');
+      },
+      listSandboxes: (req) => {
+        observed.list = req;
+        return {
+          sandboxes: [
+            {
+              metadata: {
+                id: 'listed-id',
+                name: 'listed',
+                workspace: req.workspace || 'default',
+                labels: { team: 'aire' },
+                resourceVersion: 7n,
+              },
+              status: { phase: SandboxPhase.READY },
+            },
+          ],
+        };
+      },
+      deleteSandbox: (req) => {
+        observed.delete = req;
+        return { deleted: true };
+      },
+      attachSandboxProvider: (req) => {
+        observed.attach = req;
+        return {
+          sandbox: readySandbox(req.sandboxName, 'attach-id', 7n, undefined, req.workspace || 'default').sandbox,
+          attached: true,
+        };
+      },
+      detachSandboxProvider: (req) => {
+        observed.detach = req;
+        return {
+          sandbox: readySandbox(req.sandboxName, 'detach-id', 7n, undefined, req.workspace || 'default').sandbox,
+          detached: true,
+        };
+      },
+      listSandboxProviders: (req) => {
+        observed.listProviders = req;
+        return { providers: [] };
+      },
+      updateConfig: (req) => {
+        if (req.settingKey) observed.updateSetting = req;
+        else observed.updatePolicy = req;
+        return { version: 5, policyHash: 'hash', settingsRevision: 10n, deleted: false };
+      },
+      getSandboxConfig: () => ({
+        policy: { version: 1, networkPolicies: {} },
+        version: 5,
+        policyHash: 'hash',
+        settings: {},
+        configRevision: 1n,
+        policySource: PolicySource.SANDBOX,
+        globalPolicyVersion: 0,
+        providerEnvRevision: 0n,
+      }),
+      // eslint-disable-next-line require-yield
+      execSandbox: async function* () {
+        yield { payload: { case: 'exit', value: { exitCode: 0 } } };
+      },
+      // eslint-disable-next-line require-yield
+      execSandboxInteractive: async function* () {
+        yield { payload: { case: 'exit', value: { exitCode: 0 } } };
+      },
+      createSshSession: (req) => ({
+        sandboxId: req.sandboxId,
+        token: 'tok',
+        gatewayHost: 'gw',
+        gatewayPort: 443,
+        gatewayScheme: 'https',
+        hostKeyFingerprint: '',
+        expiresAtMs: 0n,
+      }),
+      revokeSshSession: () => ({ revoked: true }),
+    });
+
+    const created = await sandbox.create({ name: 'direct', workspace: 'staging', image: 'img' });
+    const got = await sandbox.get('lookup', { workspace: 'staging' });
+    const listed = await sandbox.list({ workspace: 'staging', limit: 10 });
+    const deleted = await sandbox.delete('lookup', { workspace: 'staging' });
+    await expect(sandbox.waitReady('lookup', 1, { workspace: 'staging' })).resolves.toMatchObject({
+      workspace: 'staging',
+    });
+    await expect(sandbox.exec('exec', ['true'], { workspace: 'staging' })).resolves.toMatchObject({ exitCode: 0 });
+    const interactive = await sandbox.execInteractive('interactive', ['true'], { workspace: 'staging' });
+    for await (const _event of interactive.output) {
+      // drain
+    }
+    await sandbox.createSshSession('ssh', { workspace: 'staging' });
+    const attached = await sandbox.attachProvider('lookup', 'github', { workspace: 'staging' });
+    const detached = await sandbox.detachProvider('lookup', 'github', { workspace: 'staging' });
+    await sandbox.listProviders('lookup', { workspace: 'staging' });
+    await sandbox.getConfig('config', { workspace: 'staging' });
+    await sandbox.setPolicy('lookup', { version: 1, networkPolicies: {} }, { workspace: 'staging' });
+    await sandbox.setSetting(
+      'lookup',
+      'feature.enabled',
+      { value: { case: 'boolValue', value: true } },
+      { workspace: 'staging' },
+    );
+
+    expect(created.workspace).toBe('staging');
+    expect(got.workspace).toBe('staging');
+    expect(listed[0]?.workspace).toBe('staging');
+    expect(deleted).toBe(true);
+    expect(attached.sandbox.workspace).toBe('staging');
+    expect(detached.sandbox.workspace).toBe('staging');
+    expect(observed.create?.workspace).toBe('staging');
+    expect(observed.get?.workspace).toBe('staging');
+    expect(observed.list).toMatchObject({ workspace: 'staging', allWorkspaces: false });
+    expect(observed.delete?.workspace).toBe('staging');
+    expect(observed.execGet).toBe('staging');
+    expect(observed.interactiveGet).toBe('staging');
+    expect(observed.sshGet).toBe('staging');
+    expect(observed.attach?.workspace).toBe('staging');
+    expect(observed.detach?.workspace).toBe('staging');
+    expect(observed.listProviders?.workspace).toBe('staging');
+    expect(observed.configGets).toContain('staging');
+    expect(observed.updatePolicy?.workspace).toBe('staging');
+    expect(observed.updateSetting?.workspace).toBe('staging');
   });
 
   it('createFromTemplate rejects an empty template name locally', async () => {
