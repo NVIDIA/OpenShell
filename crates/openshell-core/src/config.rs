@@ -8,7 +8,7 @@ use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::net::SocketAddr;
-use std::num::NonZeroU64;
+use std::num::{NonZeroI64, NonZeroU64};
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::time::Duration;
@@ -30,6 +30,18 @@ pub const DEFAULT_GATEWAY_NAME: &str = "openshell";
 
 /// Default container stop timeout in seconds (SIGTERM → SIGKILL).
 pub const DEFAULT_STOP_TIMEOUT_SECS: u32 = 10;
+
+/// Default cgroup PID limit for local container sandboxes.
+pub const DEFAULT_SANDBOX_PIDS_LIMIT: i64 = 2048;
+
+/// Typed default cgroup PID limit for local container sandboxes.
+#[must_use]
+pub fn default_sandbox_pids_limit() -> Option<NonZeroI64> {
+    NonZeroI64::new(DEFAULT_SANDBOX_PIDS_LIMIT)
+}
+
+/// Default Docker bridge network name for local sandboxes.
+pub const DEFAULT_DOCKER_NETWORK_NAME: &str = "openshell-docker";
 
 /// Default domain used for browser-facing sandbox service URLs.
 pub const DEFAULT_SERVICE_ROUTING_DOMAIN: &str = "openshell.localhost";
@@ -108,11 +120,6 @@ pub fn resolve_supervisor_image_tag(candidates: &[&str]) -> String {
 
 /// CDI device identifier for requesting all NVIDIA GPUs.
 pub const CDI_GPU_DEVICE_ALL: &str = "nvidia.com/gpu=all";
-
-/// Default maximum number of processes (PIDs) allowed inside a sandbox container.
-///
-/// Compute drivers may override this through backend configuration.
-pub const DEFAULT_SANDBOX_PIDS_LIMIT: i64 = 2048;
 
 /// Normalize a configured compute driver name.
 ///

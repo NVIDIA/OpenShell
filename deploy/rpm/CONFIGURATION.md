@@ -218,7 +218,7 @@ overrides that persist across package upgrades.
 | `compute_driver` | `"podman"` (RPM default) | When unset, the gateway auto-detects Kubernetes, then Podman, then Docker. The RPM default pins to Podman; legacy `compute_drivers` lists are rejected. |
 | `[openshell.drivers.podman].default_image` | `ghcr.io/nvidia/openshell-community/sandboxes/base:latest` | Default sandbox image. |
 | `[openshell.drivers.podman].supervisor_image` | `ghcr.io/nvidia/openshell/supervisor:latest` | Supervisor image mounted into Podman sandboxes. |
-| `guest_tls_ca`, `guest_tls_cert`, `guest_tls_key` | auto-generated paths | Client TLS material bind-mounted into sandbox containers. |
+| `[openshell.gateway].guest_tls_ca`, `guest_tls_cert`, `guest_tls_key` | auto-generated paths | Gateway-owned client TLS material injected into the selected local driver and mounted into sandbox containers. |
 | `[openshell.gateway.tls]` paths | auto-generated paths | Server TLS certificate, key, and client CA. |
 | `disable_tls` | unset | Set to `true` to disable TLS. |
 

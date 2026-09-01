@@ -216,8 +216,11 @@ struct ContainerSpec {
     cap_add: Vec<String>,
     no_new_privileges: bool,
     seccomp_profile_path: String,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    security_opt: Vec<String>,
+    /// Podman's container create API accepts `AppArmor` through the dedicated
+    /// `apparmor_profile` `SpecGenerator` field. This is not Docker's
+    /// `security_opt` representation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    apparmor_profile: Option<String>,
     image_pull_policy: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     healthconfig: Option<HealthConfig>,
@@ -939,6 +942,14 @@ fn validate_tmpfs_options(options: &[String]) -> Result<Vec<String>, String> {
         .collect()
 }
 
+fn podman_apparmor_profile(profile: Option<&openshell_core::AppArmorProfile>) -> Option<String> {
+    match profile {
+        None | Some(openshell_core::AppArmorProfile::RuntimeDefault) => None,
+        Some(openshell_core::AppArmorProfile::Unconfined) => Some("unconfined".to_string()),
+        Some(openshell_core::AppArmorProfile::Localhost(profile)) => Some(profile.clone()),
+    }
+}
+
 /// Build the Podman container creation JSON spec.
 #[cfg(test)]
 #[must_use]
@@ -1174,12 +1185,7 @@ pub fn build_container_spec_for_image(
         // locks itself down.
         no_new_privileges: true,
         seccomp_profile_path: "unconfined".into(),
-        security_opt: config
-            .app_armor_profile
-            .as_ref()
-            .and_then(openshell_core::AppArmorProfile::oci_security_opt)
-            .into_iter()
-            .collect(),
+        apparmor_profile: podman_apparmor_profile(config.app_armor_profile.as_ref()),
         image_pull_policy: "never".to_string(),
         healthconfig: config.health_check_interval_secs.map(|interval_secs| HealthConfig {
             test: vec![
@@ -1589,6 +1595,40 @@ mod tests {
         let spec = build_container_spec(&sandbox, &config);
 
         assert!(spec["resource_limits"].get("PidsLimit").is_none());
+    }
+
+    #[test]
+    fn container_spec_uses_podman_apparmor_profile_field() {
+        let sandbox = test_sandbox("test-id", "test-name");
+
+        for (profile, expected) in [
+            (openshell_core::AppArmorProfile::Unconfined, "unconfined"),
+            (
+                openshell_core::AppArmorProfile::Localhost("openshell-supervisor".to_string()),
+                "openshell-supervisor",
+            ),
+        ] {
+            let mut config = test_config();
+            config.app_armor_profile = Some(profile);
+            let spec = build_container_spec(&sandbox, &config);
+
+            assert_eq!(spec["apparmor_profile"].as_str(), Some(expected));
+            assert!(spec.get("security_opt").is_none());
+        }
+    }
+
+    #[test]
+    fn container_spec_omits_podman_apparmor_profile_for_runtime_default() {
+        let sandbox = test_sandbox("test-id", "test-name");
+
+        for profile in [None, Some(openshell_core::AppArmorProfile::RuntimeDefault)] {
+            let mut config = test_config();
+            config.app_armor_profile = profile;
+            let spec = build_container_spec(&sandbox, &config);
+
+            assert!(spec.get("apparmor_profile").is_none());
+            assert!(spec.get("security_opt").is_none());
+        }
     }
 
     #[test]

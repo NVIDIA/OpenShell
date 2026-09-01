@@ -77,9 +77,12 @@ pub struct PodmanComputeConfig {
     pub guest_tls_key: Option<PathBuf>,
     /// Container cgroup PID limit for Podman-managed sandboxes.
     ///
-    /// Omit the field to leave Podman's runtime/default PID limit unchanged.
-    /// Explicit zero is invalid.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Omit the field to use `OpenShell`'s 2048-process sandbox limit. Explicit
+    /// zero is invalid.
+    #[serde(
+        default = "openshell_core::config::default_sandbox_pids_limit",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub sandbox_pids_limit: Option<NonZeroI64>,
     /// Allow sandbox requests to attach host bind mounts through
     /// `template.driver_config`.
@@ -446,7 +449,7 @@ impl Default for PodmanComputeConfig {
             guest_tls_ca: None,
             guest_tls_cert: None,
             guest_tls_key: None,
-            sandbox_pids_limit: None,
+            sandbox_pids_limit: openshell_core::config::default_sandbox_pids_limit(),
             enable_bind_mounts: false,
             provider_spiffe_workload_api_socket: None,
             app_armor_profile: Some(AppArmorProfile::Unconfined),
@@ -545,10 +548,23 @@ mod tests {
     }
 
     #[test]
-    fn default_config_uses_runtime_pids_limit() {
+    fn default_config_sets_driver_owned_pids_limit() {
         let cfg = PodmanComputeConfig::default();
-        assert_eq!(cfg.sandbox_pids_limit, None);
+        assert_eq!(
+            cfg.sandbox_pids_limit.map(NonZeroI64::get),
+            Some(openshell_core::config::DEFAULT_SANDBOX_PIDS_LIMIT)
+        );
         assert!(!cfg.enable_bind_mounts);
+    }
+
+    #[test]
+    fn omitted_pids_limit_uses_driver_owned_default() {
+        let cfg: PodmanComputeConfig = serde_json::from_value(serde_json::json!({}))
+            .expect("default Podman config should deserialize");
+        assert_eq!(
+            cfg.sandbox_pids_limit.map(NonZeroI64::get),
+            Some(openshell_core::config::DEFAULT_SANDBOX_PIDS_LIMIT)
+        );
     }
 
     #[test]
