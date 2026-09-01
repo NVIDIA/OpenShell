@@ -908,7 +908,7 @@ where
                 Ok(None) => {
                     if let Some(session) = middleware_session.take() {
                         session
-                            .end(openshell_core::proto::WebSocketSessionEndReason::Cancellation)
+                            .end(openshell_core::proto::MiddlewareSessionEndReason::Cancellation)
                             .await;
                     }
                     return Ok(());
@@ -928,14 +928,14 @@ where
                 RelayOutcome::Reusable => {
                     if let Some(session) = middleware_session.take() {
                         session
-                            .end(openshell_core::proto::WebSocketSessionEndReason::UpstreamRejected)
+                            .end(openshell_core::proto::MiddlewareSessionEndReason::UpstreamFailure)
                             .await;
                     }
                 }
                 RelayOutcome::Consumed => {
                     if let Some(session) = middleware_session.take() {
                         session
-                            .end(openshell_core::proto::WebSocketSessionEndReason::UpstreamRejected)
+                            .end(openshell_core::proto::MiddlewareSessionEndReason::UpstreamFailure)
                             .await;
                     }
                     return Ok(());
@@ -1270,7 +1270,7 @@ where
         emit_policy_reload(guard, host, port, &options.policy_name);
         if let Some(session) = options.middleware_session.take() {
             session
-                .end(openshell_core::proto::WebSocketSessionEndReason::PolicyReload)
+                .end(openshell_core::proto::MiddlewareSessionEndReason::PolicyReload)
                 .await;
         }
         send_websocket_close(client, upstream, 1012).await;
@@ -1659,7 +1659,7 @@ where
                 Ok(None) => {
                     if let Some(session) = middleware_session.take() {
                         session
-                            .end(openshell_core::proto::WebSocketSessionEndReason::Cancellation)
+                            .end(openshell_core::proto::MiddlewareSessionEndReason::Cancellation)
                             .await;
                     }
                     return Ok(());
@@ -1679,14 +1679,14 @@ where
                 RelayOutcome::Reusable => {
                     if let Some(session) = middleware_session.take() {
                         session
-                            .end(openshell_core::proto::WebSocketSessionEndReason::UpstreamRejected)
+                            .end(openshell_core::proto::MiddlewareSessionEndReason::UpstreamFailure)
                             .await;
                     }
                 }
                 RelayOutcome::Consumed => {
                     if let Some(session) = middleware_session.take() {
                         session
-                            .end(openshell_core::proto::WebSocketSessionEndReason::UpstreamRejected)
+                            .end(openshell_core::proto::MiddlewareSessionEndReason::UpstreamFailure)
                             .await;
                     }
                     debug!(
@@ -1785,7 +1785,7 @@ pub(crate) async fn finalize_websocket_pre_upgrade(
                 emit_policy_reload(guard, host, port, policy_name);
                 if let Some(session) = session.take() {
                     session
-                        .end(openshell_core::proto::WebSocketSessionEndReason::PolicyReload)
+                        .end(openshell_core::proto::MiddlewareSessionEndReason::PolicyReload)
                         .await;
                 }
                 Err(error)
@@ -1796,9 +1796,9 @@ pub(crate) async fn finalize_websocket_pre_upgrade(
         Err(error) => {
             let reason = if guard.is_stale() {
                 emit_policy_reload(guard, host, port, policy_name);
-                openshell_core::proto::WebSocketSessionEndReason::PolicyReload
+                openshell_core::proto::MiddlewareSessionEndReason::PolicyReload
             } else {
-                openshell_core::proto::WebSocketSessionEndReason::UpstreamRejected
+                openshell_core::proto::MiddlewareSessionEndReason::UpstreamFailure
             };
             if let Some(session) = session.take() {
                 session.end(reason).await;

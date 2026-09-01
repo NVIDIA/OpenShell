@@ -4729,7 +4729,7 @@ mod tests {
         close_on_first_message: bool,
         messages: Arc<std::sync::atomic::AtomicUsize>,
         session_ends: Option<
-            tokio::sync::mpsc::UnboundedSender<openshell_core::proto::WebSocketSessionEndReason>,
+            tokio::sync::mpsc::UnboundedSender<openshell_core::proto::MiddlewareSessionEndReason>,
         >,
     }
 
@@ -4820,7 +4820,7 @@ mod tests {
                         Some(web_socket_session_event::Event::SessionEnd(end)) => {
                             if let Some(session_ends) = &session_ends
                                 && let Ok(reason) =
-                                    openshell_core::proto::WebSocketSessionEndReason::try_from(
+                                    openshell_core::proto::MiddlewareSessionEndReason::try_from(
                                         end.reason,
                                     )
                             {
@@ -5105,14 +5105,14 @@ mod tests {
             assert!(!text.invocations[0].failed);
 
             session
-                .end(openshell_core::proto::WebSocketSessionEndReason::NormalClose)
+                .end(openshell_core::proto::MiddlewareSessionEndReason::Normal)
                 .await;
         }
     }
 
     #[tokio::test]
     async fn explicit_websocket_preflight_denial_is_authoritative_for_both_error_modes() {
-        use openshell_core::proto::WebSocketSessionEndReason;
+        use openshell_core::proto::MiddlewareSessionEndReason;
 
         for on_error in [OnError::FailOpen, OnError::FailClosed] {
             let (session_ends_tx, mut session_ends_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -5148,7 +5148,7 @@ mod tests {
             assert!(!outcome.allowed);
             assert_eq!(
                 outcome.terminal_reason,
-                Some(WebSocketSessionEndReason::MiddlewareDenial)
+                Some(MiddlewareSessionEndReason::MiddlewareDenial)
             );
             assert_eq!(
                 outcome.reason,
@@ -5186,7 +5186,7 @@ mod tests {
             assert!(!outcome.invocations[0].failed);
             assert_eq!(
                 session_ends_rx.recv().await,
-                Some(WebSocketSessionEndReason::MiddlewareDenial)
+                Some(MiddlewareSessionEndReason::MiddlewareDenial)
             );
             assert!(
                 session_ends_rx.try_recv().is_err(),
@@ -5197,7 +5197,7 @@ mod tests {
 
     #[tokio::test]
     async fn mixed_websocket_preflight_denial_ends_every_opened_stage() {
-        use openshell_core::proto::WebSocketSessionEndReason;
+        use openshell_core::proto::MiddlewareSessionEndReason;
 
         let (first_end_tx, mut first_end_rx) = tokio::sync::mpsc::unbounded_channel();
         let (denier_end_tx, mut denier_end_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -5239,7 +5239,7 @@ mod tests {
         assert!(!outcome.allowed);
         assert_eq!(
             outcome.terminal_reason,
-            Some(WebSocketSessionEndReason::MiddlewareDenial)
+            Some(MiddlewareSessionEndReason::MiddlewareDenial)
         );
         assert_eq!(
             outcome
@@ -5256,7 +5256,7 @@ mod tests {
         for receiver in [&mut first_end_rx, &mut denier_end_rx, &mut last_end_rx] {
             assert_eq!(
                 receiver.recv().await,
-                Some(WebSocketSessionEndReason::MiddlewareDenial)
+                Some(MiddlewareSessionEndReason::MiddlewareDenial)
             );
             assert!(
                 receiver.try_recv().is_err(),
@@ -5333,7 +5333,7 @@ mod tests {
             "middleware_failed: request_message_over_capacity"
         );
         session
-            .end(openshell_core::proto::WebSocketSessionEndReason::NormalClose)
+            .end(openshell_core::proto::MiddlewareSessionEndReason::Normal)
             .await;
     }
 
@@ -5390,7 +5390,7 @@ mod tests {
         assert!(!redacted.invocations[0].stage_disabled);
 
         session
-            .end(openshell_core::proto::WebSocketSessionEndReason::NormalClose)
+            .end(openshell_core::proto::MiddlewareSessionEndReason::Normal)
             .await;
     }
 
@@ -5436,7 +5436,7 @@ mod tests {
         );
         assert!(outcome.invocations[0].transformed);
         session
-            .end(openshell_core::proto::WebSocketSessionEndReason::NormalClose)
+            .end(openshell_core::proto::MiddlewareSessionEndReason::Normal)
             .await;
     }
 
@@ -5522,7 +5522,7 @@ mod tests {
         assert!(target.query.is_empty());
         assert_eq!(observed.requested_subprotocols, ["realtime"]);
         session
-            .end(openshell_core::proto::WebSocketSessionEndReason::NormalClose)
+            .end(openshell_core::proto::MiddlewareSessionEndReason::Normal)
             .await;
         let _ = shutdown_tx.send(());
         server_task
@@ -5633,7 +5633,7 @@ mod tests {
         drop(work);
 
         session
-            .end(openshell_core::proto::WebSocketSessionEndReason::NormalClose)
+            .end(openshell_core::proto::MiddlewareSessionEndReason::Normal)
             .await;
         let _ = shutdown_tx.send(());
         server_task
@@ -5893,7 +5893,7 @@ mod tests {
         );
         assert_eq!(
             session_ends_rx.recv().await,
-            Some(openshell_core::proto::WebSocketSessionEndReason::StageSkipped)
+            Some(openshell_core::proto::MiddlewareSessionEndReason::StageSkipped)
         );
         assert!(
             session_ends_rx.try_recv().is_err(),
@@ -5939,7 +5939,7 @@ mod tests {
         sessions
             .pop()
             .expect("retained session")
-            .end(openshell_core::proto::WebSocketSessionEndReason::NormalClose)
+            .end(openshell_core::proto::MiddlewareSessionEndReason::Normal)
             .await;
         assert_eq!(runner.registry.session_admission.available_permits(), 1);
 
@@ -5981,7 +5981,7 @@ mod tests {
         sessions
             .pop()
             .expect("retained old-generation session")
-            .end(openshell_core::proto::WebSocketSessionEndReason::PolicyReload)
+            .end(openshell_core::proto::MiddlewareSessionEndReason::PolicyReload)
             .await;
         let admitted = replacement
             .preflight_websocket(&chain, websocket_preflight_input("new-generation-admitted"))
