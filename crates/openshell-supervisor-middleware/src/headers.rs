@@ -1,12 +1,19 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Validation and logical application of middleware request-header mutations.
+//! Validation and logical application of HTTP middleware header mutations.
 
 use openshell_core::proto::{ExistingHeaderAction, HeaderMutation, HttpHeader, header_mutation};
 
 pub const MAX_HEADER_MUTATIONS: usize = 64;
 pub const MAX_HEADER_MUTATION_BYTES: usize = 32 * 1024;
+
+/// Selects the protected-header rules for the HTTP message being mutated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeaderAuthority {
+    Request,
+    Response,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HeaderMutationError {
@@ -14,7 +21,6 @@ pub enum HeaderMutationError {
     InvalidName { name: String },
     Protected { name: String },
     HopByHop { name: String },
-    WriteNamespace { name: String },
     UnsafeValue { name: String },
     TooLarge,
     InvalidExistingAction,
@@ -31,7 +37,6 @@ impl HeaderMutationError {
             Self::InvalidName { .. } => "header_mutation_invalid_name",
             Self::Protected { .. } => "header_mutation_protected_header",
             Self::HopByHop { .. } => "header_mutation_hop_by_hop_header",
-            Self::WriteNamespace { .. } => "header_mutation_write_namespace",
             Self::UnsafeValue { .. } => "header_mutation_unsafe_value",
             Self::TooLarge => "header_mutation_bytes_over_capacity",
             Self::InvalidExistingAction => "header_mutation_invalid_existing_action",
@@ -67,10 +72,6 @@ impl std::fmt::Display for HeaderMutationError {
                     "middleware cannot mutate hop-by-hop header '{name}'"
                 )
             }
-            Self::WriteNamespace { name } => write!(
-                formatter,
-                "middleware can only write request headers prefixed with x-openshell-middleware- and cannot write '{name}'"
-            ),
             Self::UnsafeValue { name } => {
                 write!(
                     formatter,
@@ -105,6 +106,7 @@ impl std::error::Error for HeaderMutationError {}
 /// state observed by the next middleware. Repeated values and wire order are
 /// preserved; comparisons are case-insensitive.
 pub fn apply(
+    authority: HeaderAuthority,
     existing_headers: &[HttpHeader],
     connection_nominated_headers: &[String],
     mutations: &[HeaderMutation],
@@ -121,13 +123,9 @@ pub fn apply(
         match mutation.operation.as_ref() {
             Some(header_mutation::Operation::Write(write)) => {
                 let name = validate_name(&write.name)?;
+                validate_authority(authority, MutationKind::Write, &write.name, &name)?;
                 if is_connection_nominated(connection_nominated_headers, &name) {
                     return Err(HeaderMutationError::HopByHop {
-                        name: write.name.clone(),
-                    });
-                }
-                if !name.starts_with("x-openshell-middleware-") {
-                    return Err(HeaderMutationError::WriteNamespace {
                         name: write.name.clone(),
                     });
                 }
@@ -166,6 +164,7 @@ pub fn apply(
             }
             Some(header_mutation::Operation::Remove(remove)) => {
                 let name = validate_name(&remove.name)?;
+                validate_authority(authority, MutationKind::Remove, &remove.name, &name)?;
                 if is_connection_nominated(connection_nominated_headers, &name) {
                     return Err(HeaderMutationError::HopByHop {
                         name: remove.name.clone(),
@@ -195,12 +194,34 @@ fn validate_name(name: &str) -> Result<String, HeaderMutationError> {
             name: name.to_string(),
         });
     }
-    if is_protected(&lower) {
+    Ok(lower)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MutationKind {
+    Write,
+    Remove,
+}
+
+fn validate_authority(
+    authority: HeaderAuthority,
+    kind: MutationKind,
+    original_name: &str,
+    normalized_name: &str,
+) -> Result<(), HeaderMutationError> {
+    let protected = match authority {
+        HeaderAuthority::Request => is_request_protected(normalized_name),
+        HeaderAuthority::Response => {
+            is_response_protected(normalized_name)
+                || (kind == MutationKind::Write && is_response_remove_only(normalized_name))
+        }
+    };
+    if protected {
         return Err(HeaderMutationError::Protected {
-            name: name.to_string(),
+            name: original_name.to_string(),
         });
     }
-    Ok(lower)
+    Ok(())
 }
 
 fn is_name_token_byte(byte: u8) -> bool {
@@ -233,7 +254,7 @@ fn is_safe_value(value: &str) -> bool {
         .all(|byte| byte == b'\t' || (0x20..=0x7e).contains(&byte) || byte >= 0x80)
 }
 
-fn is_protected(name: &str) -> bool {
+fn is_request_protected(name: &str) -> bool {
     matches!(
         name,
         "authorization"
@@ -251,6 +272,38 @@ fn is_protected(name: &str) -> bool {
             | "upgrade"
     ) || name.starts_with("x-amz-")
         || name.starts_with("x-openshell-credential")
+}
+
+fn is_response_protected(name: &str) -> bool {
+    matches!(
+        name,
+        "connection"
+            | "content-encoding"
+            | "content-length"
+            | "content-range"
+            | "keep-alive"
+            | "proxy-authenticate"
+            | "proxy-authorization"
+            | "proxy-connection"
+            | "te"
+            | "trailer"
+            | "transfer-encoding"
+            | "upgrade"
+    )
+}
+
+fn is_response_remove_only(name: &str) -> bool {
+    matches!(
+        name,
+        "accept-ranges"
+            | "etag"
+            | "content-md5"
+            | "digest"
+            | "content-digest"
+            | "repr-digest"
+            | "signature"
+            | "signature-input"
+    )
 }
 
 fn is_connection_nominated(connection_nominated_headers: &[String], name: &str) -> bool {
@@ -292,6 +345,7 @@ mod tests {
     #[test]
     fn protected_header_write_is_rejected() {
         let error = apply(
+            HeaderAuthority::Request,
             &[],
             &[],
             &[write(
@@ -311,6 +365,7 @@ mod tests {
     #[test]
     fn unsafe_header_value_is_rejected() {
         let error = apply(
+            HeaderAuthority::Request,
             &[],
             &[],
             &[write(
@@ -330,6 +385,7 @@ mod tests {
             header("accept", "application/json"),
         ];
         let appended = apply(
+            HeaderAuthority::Request,
             &existing,
             &[],
             &[write(
@@ -349,6 +405,7 @@ mod tests {
         );
 
         let overwritten = apply(
+            HeaderAuthority::Request,
             &existing,
             &[],
             &[write(
@@ -367,6 +424,7 @@ mod tests {
         );
 
         let skipped = apply(
+            HeaderAuthority::Request,
             &existing,
             &[],
             &[write(
@@ -386,13 +444,25 @@ mod tests {
             header("accept", "application/json"),
             header("x-trace", "two"),
         ];
-        let updated = apply(&existing, &[], &[remove("X-Trace")]).expect("remove visible header");
+        let updated = apply(
+            HeaderAuthority::Request,
+            &existing,
+            &[],
+            &[remove("X-Trace")],
+        )
+        .expect("remove visible header");
         assert_eq!(updated, vec![header("accept", "application/json")]);
     }
 
     #[test]
     fn protected_header_remove_is_rejected_even_when_not_visible() {
-        let error = apply(&[], &[], &[remove("Authorization")]).expect_err("protected removal");
+        let error = apply(
+            HeaderAuthority::Request,
+            &[],
+            &[],
+            &[remove("Authorization")],
+        )
+        .expect_err("protected removal");
         assert!(
             error
                 .to_string()
@@ -404,6 +474,7 @@ mod tests {
     fn connection_nominated_header_is_protected() {
         let nominated = vec!["x-openshell-middleware-tag".to_string()];
         let write_error = apply(
+            HeaderAuthority::Request,
             &[],
             &nominated,
             &[write(
@@ -419,12 +490,69 @@ mod tests {
                 .contains("hop-by-hop header 'X-OpenShell-Middleware-Tag'")
         );
 
-        let remove_error = apply(&[], &nominated, &[remove("X-OpenShell-Middleware-Tag")])
-            .expect_err("hop-by-hop removal");
+        let remove_error = apply(
+            HeaderAuthority::Request,
+            &[],
+            &nominated,
+            &[remove("X-OpenShell-Middleware-Tag")],
+        )
+        .expect_err("hop-by-hop removal");
         assert!(
             remove_error
                 .to_string()
                 .contains("hop-by-hop header 'X-OpenShell-Middleware-Tag'")
         );
+    }
+
+    #[test]
+    fn request_write_accepts_end_to_end_header_without_namespace() {
+        let updated = apply(
+            HeaderAuthority::Request,
+            &[],
+            &[],
+            &[write(
+                "Cache-Control",
+                "no-store",
+                ExistingHeaderAction::Overwrite,
+            )],
+        )
+        .expect("ordinary end-to-end request header");
+
+        assert_eq!(updated, vec![header("cache-control", "no-store")]);
+    }
+
+    #[test]
+    fn response_authority_allows_end_to_end_writes_and_integrity_removal() {
+        let existing = [header("etag", "old"), header("content-type", "text/plain")];
+        let updated = apply(
+            HeaderAuthority::Response,
+            &existing,
+            &[],
+            &[
+                write("Cache-Control", "private", ExistingHeaderAction::Overwrite),
+                remove("ETag"),
+            ],
+        )
+        .expect("permitted response mutations");
+
+        assert_eq!(
+            updated,
+            vec![
+                header("content-type", "text/plain"),
+                header("cache-control", "private"),
+            ]
+        );
+    }
+
+    #[test]
+    fn response_authority_rejects_framing_and_integrity_writes() {
+        for mutation in [
+            remove("Content-Length"),
+            write("ETag", "new", ExistingHeaderAction::Overwrite),
+        ] {
+            let error = apply(HeaderAuthority::Response, &[], &[], &[mutation])
+                .expect_err("protected response mutation");
+            assert!(matches!(error, HeaderMutationError::Protected { .. }));
+        }
     }
 }

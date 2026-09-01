@@ -72,7 +72,7 @@ A future version can introduce named feature contracts, such as `pii-redaction`,
 
 ## Header mutation rules
 
-V1 preserves duplicate request headers and their wire order. Before an external invocation, OpenShell omits credential-bearing, routing, framing, hop-by-hop, and `Connection`-nominated headers. Results return ordered `write` and `remove` mutations. Writes support append, overwrite, and skip modes but may target only `x-openshell-middleware-*`. Removes may target other visible headers except the protected categories. OpenShell validates and applies a stage's mutations atomically, so one invalid mutation discards the whole set and follows that config's `on_error` behavior.
+V1 preserves duplicate request headers and their wire order. Before an external invocation, OpenShell omits credential-bearing, routing, framing, hop-by-hop, and `Connection`-nominated headers. Results return ordered `write` and `remove` mutations for visible end-to-end fields without a required prefix. Writes support append, overwrite, and skip modes. Credential-bearing, routing, framing, hop-by-hop, and `Connection`-nominated headers remain protected. OpenShell validates and applies a stage's mutations atomically, so one invalid mutation discards the whole set and follows that config's `on_error` behavior.
 
 ## Middleware authentication
 
