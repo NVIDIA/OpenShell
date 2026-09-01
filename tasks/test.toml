@@ -13,6 +13,7 @@ depends = [
   "test:install-sh",
   "test:build-env",
   "test:packaging-assets",
+  "test:codex-security-release-range",
   "test:docs-website",
 ]
 
@@ -43,6 +44,11 @@ hide = true
 description = "Run static packaging asset tests"
 run = "tasks/scripts/test-packaging-assets.sh"
 run_windows = "echo Skipping test:packaging-assets: Linux service and RPM assets do not apply on Windows."
+hide = true
+
+["test:codex-security-release-range"]
+description = "Test Codex Security release-range resolution"
+run = "node --test tasks/scripts/codex-security-release-range.test.mjs"
 hide = true
 
 [e2e]

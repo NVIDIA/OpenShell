@@ -284,22 +284,31 @@ disables emission for Rust tests, E2E runs, and release canaries. This prevents
 synthetic activity from contributing to product usage metrics.
 
 Static security checks are deliberately outside the mirror-branch path. They run
-directly on GitHub-hosted runners with no secrets, so the pull-request-triggered
-ones also cover fork pull requests, and none of them consume NVIDIA self-hosted
-capacity. Scanner jobs request `security-events: write` and upload SARIF to Code
-Scanning directly on every event they run on, including fork and Dependabot pull
-requests, which Code Scanning permits for `pull_request` runs despite their
-read-only `GITHUB_TOKEN`. Each scanner also retains its report as a workflow
-artifact. No privileged intermediate workflow relays those uploads.
+directly on GitHub-hosted runners and none of them consume NVIDIA self-hosted
+capacity. The change-oriented ones receive no secrets, so they also cover fork
+pull requests; Codex Security release qualification is the exception because it
+needs a scoped API key. That key routes Codex Security's model calls to
+NVIDIA-hosted inference; the job itself still runs on a GitHub-hosted runner and
+uses no NVIDIA self-hosted runner. Scanner jobs request `security-events: write`
+and upload SARIF to Code Scanning directly on every event they run on, including
+fork and Dependabot pull requests, which Code Scanning permits for
+`pull_request` runs despite their read-only `GITHUB_TOKEN`. No privileged
+intermediate workflow relays those uploads. Report retention differs by scanner:
+Actionlint, Zizmor, and CodeQL keep their reports as workflow artifacts, and
+Codex Security keeps no raw report.
 Triggers differ by workflow: `.github/workflows/workflow-security.yml` runs on
 `pull_request`, `merge_group`, `main`, and a weekly schedule;
 `.github/workflows/dependency-review.yml` runs on `pull_request` and
-`merge_group` only, because it needs a base and head commit to compare; and
+`merge_group` only, because it needs a base and head commit to compare;
 `.github/workflows/codeql.yml` runs nightly on the default branch (`main`) via
-`schedule`, with `workflow_dispatch` kept for manual diagnostics. CodeQL does
+`schedule`, with `workflow_dispatch` kept for manual diagnostics; and
+`.github/workflows/codex-security.yml` runs on pushed `v*.*.*-pre.*` tags, and is
+also callable through `workflow_call` and `workflow_dispatch`. CodeQL does
 not run on `pull_request`, `merge_group`, or pushes to `main`, so it reports
 repository-level Code Scanning state on the default branch instead of per-PR
 results, and its four-language matrix stays off the per-change critical path.
+Codex Security is release-scoped rather than change-scoped, so it never runs on
+a pull request or merge group.
 
 - **Actionlint and Zizmor** analyze the workflow definitions themselves.
   Repository configuration lives in `.github/actionlint.yml` (self-hosted runner
@@ -324,12 +333,52 @@ results, and its four-language matrix stays off the per-change critical path.
   Go requires a build; the other languages use build mode `none`. Analysis runs
   on the nightly schedule or by manual dispatch. Results are uploaded to Code
   Scanning and always retained as workflow artifacts.
+- **Codex Security** qualifies release candidates rather than individual
+  changes. The job installs a pinned `@openai/codex-security` release into the
+  runner temp directory before the repository is checked out and invokes it by
+  absolute path, so repository-controlled files cannot shadow the scanner. Model
+  calls go to NVIDIA-hosted inference at `https://inference-api.nvidia.com/v1`,
+  declared as a custom Codex provider named `nvidia` that uses the Responses
+  wire API with WebSockets disabled. The scan runs `openai/openai/gpt-5.6-sol`
+  at `medium` reasoning effort. The `CODEX_SECURITY_API_KEY` secret holds the
+  NVIDIA key and is exposed to the scan step alone, as `OPENAI_API_KEY` so the
+  CLI selects API-key auth and as `NVIDIA_INFERENCE_API_KEY`, the provider
+  `env_key` read by the Codex child process.
+  `tasks/scripts/codex-security-release-range.mjs` resolves the scan range: the
+  candidate must be a `vX.Y.Z-pre.N` tag that is an ancestor of `origin/main`,
+  and the base is the newest stable `vX.Y.Z` tag merged into the candidate that
+  is strictly older than the release train `vX.Y.Z` the candidate targets. A
+  full-repository scan is only possible when no such stable tag exists and the
+  caller passes `allow_full_bootstrap`. Each candidate scans the cumulative
+  stable-to-candidate diff, so later candidates re-cover earlier ones. SARIF is
+  uploaded against `refs/heads/main` at the candidate commit under the
+  train-scoped category `codex-security/vX.Y.Z`, which makes each candidate's
+  analysis replace the previous one for that train. Codex Security 0.1.24 cannot
+  apply `--max-cost` to a slash-qualified model identifier, so the run has no
+  CLI-enforced cost ceiling. Spend is bounded instead by the 120-minute job
+  timeout, a single repository-wide concurrency group that serializes
+  qualification so starting a newer candidate cancels an in-flight one, and
+  NVIDIA account-side controls. After the scan the workflow derives an estimated
+  cost from the reported token usage and the per-million rates declared in the
+  workflow (input `2.94`, cached input `0.29`, output `14.68` USD) and reports it
+  in the job summary. No raw report is retained.
 
 Findings never fail these checks; scanner and build failures do. A scanner that
-cannot run, a CodeQL analyzer that does not complete, and an unexpected
-Dependency Graph API error are all errors, which keeps an informational check
-from silently degrading into a no-op. None of these checks are required
-statuses, so they do not gate merges.
+cannot run, a CodeQL analyzer that does not complete, an unexpected Dependency
+Graph API error, and a Codex Security range, scan, or export failure are all
+errors, which keeps an informational check from silently degrading into a no-op.
+Codex Security also rejects any scan scope other than the resolved
+cumulative diff or an approved full bootstrap, so a qualification run either
+covers the whole stable-to-candidate range or fails; a separate no-permission
+job republishes the analysis job's outcome as the
+`OpenShell / Codex Security (informational)` status. None of these checks are
+required statuses, so they do not gate merges.
+
+Codex Security findings are informational during the observation phase, and the
+workflow only reports on candidates that already exist. Creating pre-release
+tags and gating stable promotion on qualification results are part of
+[RFC 0014](../rfc/0014-release-stability/release-qualification.md) and are not
+implemented yet.
 
 See `CI.md` for the contributor workflow, labels, and maintainer merge-queue workflow.
 

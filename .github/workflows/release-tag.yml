@@ -4,6 +4,7 @@ on:
   push:
     tags:
       - "v*.*.*"
+      - "!v*.*.*-pre.*"
   workflow_dispatch:
     inputs:
       tag:
