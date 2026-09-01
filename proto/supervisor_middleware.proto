@@ -199,32 +199,32 @@ message HttpResponsePreflight {
 }
 
 // HttpResponsePreflightDecision either declines the response or selects an
-// inspection mode and mutations.
+// inspection mode and mutations. Diagnostics apply to either action.
 message HttpResponsePreflightDecision {
-  oneof decision {
+  oneof action {
     // Successfully decline this response without invoking on_error.
     HttpResponsePreflightSkip skip = 1;
     // Inspect the response using the selected body mode and mutations.
     HttpResponsePreflightInspect inspect = 2;
   }
+  // Free-form service diagnostic. OpenShell never exposes this to the sandbox
+  // or security logs. Limited to 4 KiB before discarding.
+  string reason = 3;
+  // Audit-safe findings produced during preflight. At most 32 findings of at
+  // most 4 KiB encoded each are accepted.
+  repeated Finding findings = 4;
+  // Non-secret service-defined metadata included in diagnostics. At most 64
+  // entries and 32 KiB of combined key/value data are accepted.
+  map<string, string> metadata = 5;
 }
 
 // HttpResponsePreflightSkip ends this stage successfully for the current
 // response. OpenShell sends no body, body-end, or trailer events to the stage.
 message HttpResponsePreflightSkip {
-  // Free-form service diagnostic. OpenShell never exposes this to the sandbox
-  // or security logs. Limited to 4 KiB before discarding.
-  string reason = 1;
   // Optional stable machine-readable code for audit output. Codes must start
   // with a lowercase ASCII letter and contain only lowercase ASCII letters,
   // digits, and underscores, with a maximum length of 64 bytes.
-  string reason_code = 2;
-  // Audit-safe findings produced during preflight. At most 32 findings of at
-  // most 4 KiB encoded each are accepted.
-  repeated Finding findings = 3;
-  // Non-secret service-defined metadata included in diagnostics. At most 64
-  // entries and 32 KiB of combined key/value data are accepted.
-  map<string, string> metadata = 4;
+  string reason_code = 1;
 }
 
 // HttpResponsePreflightInspect selects this stage's response inspection mode
@@ -246,15 +246,6 @@ message HttpResponsePreflightInspect {
   // bytes. OpenShell validates the names before committing the response head.
   // Names count against the header-mutation count and encoded-size limits.
   repeated string declared_trailer_names = 3;
-  // Free-form service diagnostic. OpenShell never exposes this to the sandbox
-  // or security logs. Limited to 4 KiB before discarding.
-  string reason = 4;
-  // Audit-safe findings produced during preflight. At most 32 findings of at
-  // most 4 KiB encoded each are accepted.
-  repeated Finding findings = 5;
-  // Non-secret service-defined metadata included in diagnostics. At most 64
-  // entries and 32 KiB of combined key/value data are accepted.
-  map<string, string> metadata = 6;
 }
 
 // HttpResponseBodyMode controls which response-body events one stage receives.
