@@ -60,8 +60,7 @@ impl ComputeDriver for ComputeDriverService {
         let sandbox = request
             .sandbox
             .ok_or_else(|| Status::invalid_argument("sandbox is required"))?;
-        self.backend
-            .validate_sandbox_create(&sandbox, request.policy.as_ref())?;
+        self.backend.validate_sandbox_create(&sandbox)?;
         Ok(Response::new(ValidateSandboxCreateResponse {}))
     }
 
@@ -104,9 +103,7 @@ impl ComputeDriver for ComputeDriverService {
         let sandbox = request
             .sandbox
             .ok_or_else(|| Status::invalid_argument("sandbox is required"))?;
-        self.backend
-            .create_sandbox(&sandbox, request.policy.as_ref())
-            .await?;
+        self.backend.create_sandbox(&sandbox).await?;
         Ok(Response::new(CreateSandboxResponse {}))
     }
 

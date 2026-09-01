@@ -13,10 +13,11 @@ The gateway's configured compute driver determines how OpenShell creates each sa
 Most compute drivers run the OpenShell supervisor inside the sandbox workload.
 The supervisor launches the agent process, applies policy, routes egress through
 the proxy, injects configured credentials, and maintains the gateway session.
-A driver may instead advertise driver-owned runtime control. In that mode, the
-gateway sends the canonical policy in the validation and creation requests, the
-driver applies it before launch, and driver-reported readiness does not require
-a supervisor session. The Windows MXC driver uses this mode.
+A driver may instead set `driver_reports_runtime_readiness`. In that mode,
+driver-reported readiness does not require a supervisor session. The canonical
+create-time policy is part of `DriverSandboxSpec`; a driver that enforces policy
+outside the standard supervisor fetches later revisions through the existing
+sandbox configuration API. The Windows MXC driver reports its own readiness.
 
 Stop stops compute but retains the sandbox record and the driver's
 persistent workspace boundary. Start reactivates the same driver resource.

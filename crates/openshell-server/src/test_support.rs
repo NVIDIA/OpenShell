@@ -4,7 +4,6 @@
 //! Test fixtures for exercising gateway integration points.
 
 use futures::{Stream, stream};
-use openshell_core::proto::SandboxPolicy;
 #[cfg(unix)]
 use openshell_core::proto::compute::v1::compute_driver_server::ComputeDriverServer;
 use openshell_core::proto::compute::v1::{
@@ -41,7 +40,6 @@ pub enum FakeComputeDriverCall {
     GetGatewayListenerRequirements,
     ValidateSandboxCreate {
         sandbox: Option<DriverSandbox>,
-        policy: Option<SandboxPolicy>,
     },
     GetSandbox {
         sandbox_id: String,
@@ -50,7 +48,6 @@ pub enum FakeComputeDriverCall {
     ListSandboxes,
     CreateSandbox {
         sandbox: Option<DriverSandbox>,
-        policy: Option<SandboxPolicy>,
     },
     StopSandbox {
         sandbox_id: String,
@@ -99,8 +96,7 @@ impl FakeComputeDriver {
                     default_image: "openshell/sandbox:test".to_string(),
                     gateway_manages_lifecycle: false,
                     supports_sandbox_authentication: false,
-                    sandbox_runtime_control:
-                        openshell_core::proto::compute::v1::SandboxRuntimeControl::Supervisor.into(),
+                    driver_reports_runtime_readiness: false,
                 },
                 gateway_listener_requirements: Vec::new(),
                 gateway_listener_requirements_supported: true,
@@ -295,7 +291,6 @@ impl ComputeDriver for FakeComputeDriver {
                 .calls
                 .push(FakeComputeDriverCall::ValidateSandboxCreate {
                     sandbox: request.sandbox,
-                    policy: request.policy,
                 });
         });
         Ok(Response::new(ValidateSandboxCreateResponse {}))
@@ -351,10 +346,9 @@ impl ComputeDriver for FakeComputeDriver {
             if let Some(sandbox) = sandbox.as_ref() {
                 state.sandboxes.insert(sandbox.id.clone(), sandbox.clone());
             }
-            state.calls.push(FakeComputeDriverCall::CreateSandbox {
-                sandbox,
-                policy: request.policy,
-            });
+            state
+                .calls
+                .push(FakeComputeDriverCall::CreateSandbox { sandbox });
         });
         Ok(Response::new(CreateSandboxResponse {}))
     }

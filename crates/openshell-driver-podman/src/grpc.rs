@@ -508,7 +508,6 @@ mod tests {
         client
             .validate_sandbox_create(request_with_traceparent(ValidateSandboxCreateRequest {
                 sandbox: None,
-                policy: None,
             }))
             .await
             .expect_err("missing sandbox should fail");

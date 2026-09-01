@@ -23,7 +23,6 @@ use crate::provider_profile_sources::EffectiveProviderProfileCatalog;
 #[cfg(test)]
 use crate::provider_profile_sources::ProviderProfileSources;
 use openshell_core::net::{is_always_blocked_ip, is_internal_ip};
-use openshell_core::proto::compute::v1::SandboxRuntimeControl;
 use openshell_core::proto::policy_merge_operation;
 use openshell_core::proto::setting_value;
 use openshell_core::proto::{
@@ -3136,19 +3135,6 @@ pub(super) async fn handle_get_sandbox_provider_environment(
 // Update config handler (policy + settings mutations)
 // ---------------------------------------------------------------------------
 
-fn validate_live_policy_update_support(
-    sandbox_runtime_control: SandboxRuntimeControl,
-    has_policy: bool,
-    has_merge_ops: bool,
-) -> Result<(), Status> {
-    if (has_policy || has_merge_ops) && sandbox_runtime_control == SandboxRuntimeControl::Driver {
-        return Err(Status::failed_precondition(
-            "live policy updates are not supported when the selected compute driver owns runtime policy enforcement; recreate the sandbox to apply the new policy",
-        ));
-    }
-    Ok(())
-}
-
 pub(super) async fn handle_update_config(
     state: &Arc<ServerState>,
     request: Request<UpdateConfigRequest>,
@@ -3223,11 +3209,6 @@ async fn handle_update_config_inner(
             "one of policy, setting_key, or merge_operations must be provided",
         ));
     }
-    validate_live_policy_update_support(
-        state.compute.sandbox_runtime_control(),
-        has_policy,
-        has_merge_ops,
-    )?;
     if req.global {
         if !req.annotations.is_empty() {
             return Err(Status::invalid_argument(
@@ -6914,26 +6895,6 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tonic::Code;
-
-    #[test]
-    fn driver_controlled_runtime_rejects_sandbox_policy_replacement_and_merge_updates() {
-        for (has_policy, has_merge_ops) in [(true, false), (false, true)] {
-            let error = validate_live_policy_update_support(
-                SandboxRuntimeControl::Driver,
-                has_policy,
-                has_merge_ops,
-            )
-            .expect_err("driver-controlled runtimes must reject policy mutations after launch");
-            assert_eq!(error.code(), Code::FailedPrecondition);
-        }
-
-        let error = validate_live_policy_update_support(SandboxRuntimeControl::Driver, true, false)
-            .expect_err("global policy replacement also changes desired state for live sandboxes");
-        assert_eq!(error.code(), Code::FailedPrecondition);
-
-        validate_live_policy_update_support(SandboxRuntimeControl::Supervisor, true, false)
-            .expect("supervisor-controlled runtimes support live policy replacement");
-    }
 
     /// Wrap a request with a user `Principal` so handler scope guards treat
     /// the test caller as a CLI user. Most handler tests exercise

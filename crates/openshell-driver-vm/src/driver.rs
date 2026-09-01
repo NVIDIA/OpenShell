@@ -525,8 +525,7 @@ impl VmDriver {
             default_image: self.config.default_image.clone(),
             gateway_manages_lifecycle: true,
             supports_sandbox_authentication: false,
-            sandbox_runtime_control:
-                openshell_core::proto::compute::v1::SandboxRuntimeControl::Supervisor.into(),
+            driver_reports_runtime_readiness: false,
         }
     }
 
@@ -5781,7 +5780,6 @@ mod tests {
             client
                 .validate_sandbox_create(request_with_traceparent(ValidateSandboxCreateRequest {
                     sandbox: None,
-                    policy: None,
                 }))
                 .await
                 .is_err()
@@ -5790,7 +5788,6 @@ mod tests {
             client
                 .create_sandbox(request_with_traceparent(CreateSandboxRequest {
                     sandbox: None,
-                    policy: None,
                 }))
                 .await
                 .is_err()
@@ -5898,7 +5895,6 @@ mod tests {
         };
         let request = request_with_traceparent(CreateSandboxRequest {
             sandbox: Some(sandbox),
-            policy: None,
         });
 
         let mut client = traced_driver_client(driver.clone()).await;

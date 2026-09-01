@@ -43,6 +43,7 @@ fn test_sandbox() -> DriverSandbox {
                 environment: HashMap::from([("TEMPLATE_ENV".to_string(), "template".to_string())]),
                 ..Default::default()
             }),
+            policy: None,
             resource_requirements: None,
             sandbox_token: String::new(),
             command: Vec::new(),
@@ -222,10 +223,7 @@ async fn tracing_in_process_service_preserves_the_driver_rpc_server_boundary() {
         );
         ComputeDriver::validate_sandbox_create(
             &service,
-            Request::new(ValidateSandboxCreateRequest {
-                sandbox: None,
-                policy: None,
-            }),
+            Request::new(ValidateSandboxCreateRequest { sandbox: None }),
         )
         .instrument(gateway_span)
         .await
@@ -309,10 +307,7 @@ async fn tracing_lifecycle_rpc_failures_export_docker_operation_spans() {
     async {
         ComputeDriver::create_sandbox(
             &driver,
-            Request::new(CreateSandboxRequest {
-                sandbox: None,
-                policy: None,
-            }),
+            Request::new(CreateSandboxRequest { sandbox: None }),
         )
         .await
         .expect_err("missing sandbox should fail");

@@ -28,8 +28,8 @@ use openshell_core::proto::compute::v1::{
     GetGatewayListenerRequirementsRequest, GetGatewayListenerRequirementsResponse,
     GetSandboxRequest, GpuResourceRequirements as DriverGpuResourceRequirements,
     ListSandboxesRequest, ResourceRequirements as DriverSandboxResourceRequirements,
-    SandboxRuntimeControl, StartSandboxRequest, StopSandboxRequest, ValidateSandboxCreateRequest,
-    WatchSandboxesEvent, WatchSandboxesRequest, compute_driver_client::ComputeDriverClient,
+    StartSandboxRequest, StopSandboxRequest, ValidateSandboxCreateRequest, WatchSandboxesEvent,
+    WatchSandboxesRequest, compute_driver_client::ComputeDriverClient,
     compute_driver_server::ComputeDriver, gateway_listener_requirement::Selector,
     watch_sandboxes_event,
 };
@@ -263,17 +263,8 @@ pub struct ComputeDriverInfoSnapshot {
     pub gateway_manages_lifecycle: bool,
     /// Whether the driver authenticates driver-native sandbox credentials.
     pub supports_sandbox_authentication: bool,
-    /// Component responsible for runtime readiness and policy enforcement.
-    pub sandbox_runtime_control: SandboxRuntimeControl,
-}
-
-fn normalize_sandbox_runtime_control(value: i32) -> SandboxRuntimeControl {
-    match SandboxRuntimeControl::try_from(value) {
-        Ok(SandboxRuntimeControl::Driver) => SandboxRuntimeControl::Driver,
-        Ok(SandboxRuntimeControl::Unspecified | SandboxRuntimeControl::Supervisor) | Err(_) => {
-            SandboxRuntimeControl::Supervisor
-        }
-    }
+    /// Whether the driver reports runtime readiness without a supervisor session.
+    pub driver_reports_runtime_readiness: bool,
 }
 
 /// Interval between store-vs-backend reconciliation sweeps.
@@ -621,9 +612,7 @@ impl ComputeRuntime {
             driver_version: capabilities.driver_version,
             gateway_manages_lifecycle: capabilities.gateway_manages_lifecycle,
             supports_sandbox_authentication: capabilities.supports_sandbox_authentication,
-            sandbox_runtime_control: normalize_sandbox_runtime_control(
-                capabilities.sandbox_runtime_control,
-            ),
+            driver_reports_runtime_readiness: capabilities.driver_reports_runtime_readiness,
         };
         let default_image = capabilities.default_image;
         let gateway_listener_requirements = match driver
@@ -764,11 +753,6 @@ impl ComputeRuntime {
         self.driver_info.supports_sandbox_authentication
     }
 
-    #[must_use]
-    pub(crate) fn sandbox_runtime_control(&self) -> SandboxRuntimeControl {
-        self.driver_info.sandbox_runtime_control
-    }
-
     pub(crate) async fn authenticate_sandbox(&self, credential: &str) -> Result<String, Status> {
         if !self.supports_sandbox_authentication() {
             return Err(Status::unimplemented(
@@ -842,7 +826,6 @@ impl ComputeRuntime {
     pub async fn validate_sandbox_create(&self, sandbox: &Sandbox) -> Result<(), Status> {
         let driver_sandbox = driver_sandbox_from_public(sandbox, &self.driver_info.name)
             .map_err(|status| *status)?;
-        let policy = sandbox.spec.as_ref().and_then(|spec| spec.policy.clone());
         self.driver
             .call(
                 "driver.validate_sandbox_create",
@@ -851,7 +834,6 @@ impl ComputeRuntime {
                     driver
                         .validate_sandbox_create(Request::new(ValidateSandboxCreateRequest {
                             sandbox: Some(driver_sandbox),
-                            policy,
                         }))
                         .await
                 },
@@ -869,7 +851,6 @@ impl ComputeRuntime {
         let sandbox_id = sandbox.object_id().to_string();
         let mut driver_sandbox = driver_sandbox_from_public(&sandbox, &self.driver_info.name)
             .map_err(|status| *status)?;
-        let policy = sandbox.spec.as_ref().and_then(|spec| spec.policy.clone());
 
         // Create with MustCreate condition to prevent duplicate creation race
         self.sandbox_index.update_from_sandbox(&sandbox);
@@ -926,7 +907,6 @@ impl ComputeRuntime {
                     driver
                         .create_sandbox(Request::new(CreateSandboxRequest {
                             sandbox: Some(driver_sandbox),
-                            policy,
                         }))
                         .await
                 },
@@ -1347,7 +1327,7 @@ impl ComputeRuntime {
                     sandbox,
                     snapshot,
                     session_connected,
-                    self.driver_info.sandbox_runtime_control,
+                    self.driver_info.driver_reports_runtime_readiness,
                 );
             })
             .await
@@ -1801,7 +1781,7 @@ impl ComputeRuntime {
                             sandbox,
                             &snapshot,
                             session_connected,
-                            self.driver_info.sandbox_runtime_control,
+                            self.driver_info.driver_reports_runtime_readiness,
                         );
                     },
                 )
@@ -2015,7 +1995,7 @@ impl ComputeRuntime {
             let watch_runtime = runtime.clone();
             let watch_shutdown = shutdown_rx.clone();
             tokio::spawn(async move {
-                watch_runtime.watch_loop(watch_shutdown).await;
+                Box::pin(watch_runtime.watch_loop(watch_shutdown)).await;
             });
             tokio::spawn(async move {
                 runtime.reconcile_loop(shutdown_rx).await;
@@ -2541,7 +2521,7 @@ impl ComputeRuntime {
         let runtime = self.clone();
         let watch_cancel = cancel_rx.clone();
         let watch_handle = tokio::spawn(async move {
-            runtime.watch_loop(watch_cancel).await;
+            Box::pin(runtime.watch_loop(watch_cancel)).await;
         });
 
         let runtime = self.clone();
@@ -2848,7 +2828,7 @@ impl ComputeRuntime {
                         sandbox,
                         &incoming,
                         session_connected,
-                        self.driver_info.sandbox_runtime_control,
+                        self.driver_info.driver_reports_runtime_readiness,
                     );
                 },
             )
@@ -3758,6 +3738,7 @@ fn driver_sandbox_spec_from_public(
             .as_ref()
             .map(|template| driver_sandbox_template_from_public(template, driver_name))
             .transpose()?,
+        policy: spec.policy.clone(),
         resource_requirements: spec.resource_requirements.as_ref().map(|requirements| {
             DriverSandboxResourceRequirements {
                 gpu: requirements
@@ -4038,7 +4019,7 @@ fn apply_driver_snapshot(
     sandbox: &mut Sandbox,
     incoming: &DriverSandbox,
     session_connected: bool,
-    sandbox_runtime_control: SandboxRuntimeControl,
+    driver_reports_runtime_readiness: bool,
 ) {
     let old_phase = SandboxPhase::try_from(sandbox.phase()).unwrap_or(SandboxPhase::Unknown);
     let sandbox_name = &incoming.name;
@@ -4074,8 +4055,11 @@ fn apply_driver_snapshot(
             (phase, status)
         },
         |incoming_status| {
-            let composed =
-                ComposedPhase::new(incoming_status, session_connected, sandbox_runtime_control);
+            let composed = ComposedPhase::new(
+                incoming_status,
+                session_connected,
+                driver_reports_runtime_readiness,
+            );
             let mut status = Some(public_status_from_driver(
                 incoming_status,
                 composed.phase,
@@ -4229,7 +4213,7 @@ impl ComposedPhase {
     fn new(
         incoming_status: &DriverSandboxStatus,
         session_connected: bool,
-        sandbox_runtime_control: SandboxRuntimeControl,
+        driver_reports_runtime_readiness: bool,
     ) -> Self {
         let backend_phase = derive_phase(Some(incoming_status));
         // A live supervisor session is a stronger readiness signal than the backend phase.
@@ -4238,16 +4222,14 @@ impl ComposedPhase {
         // backend phase overwrite it.
         let phase = match backend_phase {
             SandboxPhase::Error | SandboxPhase::Deleting | SandboxPhase::Stopped => backend_phase,
-            SandboxPhase::Ready if sandbox_runtime_control == SandboxRuntimeControl::Driver => {
-                SandboxPhase::Ready
-            }
+            SandboxPhase::Ready if driver_reports_runtime_readiness => SandboxPhase::Ready,
             _ if session_connected => SandboxPhase::Ready,
             _ => SandboxPhase::Provisioning,
         };
         Self {
             phase,
             session_connected,
-            backend_ready_without_session: sandbox_runtime_control != SandboxRuntimeControl::Driver
+            backend_ready_without_session: !driver_reports_runtime_readiness
                 && backend_phase == SandboxPhase::Ready
                 && !session_connected,
         }
@@ -4532,7 +4514,7 @@ impl ComputeDriver for NoopTestDriver {
                 default_image: "openshell/sandbox:test".to_string(),
                 gateway_manages_lifecycle: false,
                 supports_sandbox_authentication: self.sandbox_authentication.is_some(),
-                sandbox_runtime_control: SandboxRuntimeControl::Supervisor.into(),
+                driver_reports_runtime_readiness: false,
             },
         ))
     }
@@ -4676,7 +4658,7 @@ pub async fn new_test_runtime_with_driver(
             driver_version: "test".to_string(),
             gateway_manages_lifecycle: false,
             supports_sandbox_authentication,
-            sandbox_runtime_control: SandboxRuntimeControl::Supervisor,
+            driver_reports_runtime_readiness: false,
         },
         telemetry_compute_driver: TelemetryComputeDriver::custom(),
         driver_process: None,
@@ -4854,7 +4836,7 @@ mod tests {
                 default_image: "openshell/sandbox:test".to_string(),
                 gateway_manages_lifecycle: false,
                 supports_sandbox_authentication: false,
-                sandbox_runtime_control: SandboxRuntimeControl::Supervisor.into(),
+                driver_reports_runtime_readiness: false,
             }))
         }
 
@@ -5195,7 +5177,7 @@ mod tests {
                 default_image: "openshell/sandbox:test".to_string(),
                 gateway_manages_lifecycle: false,
                 supports_sandbox_authentication: false,
-                sandbox_runtime_control: SandboxRuntimeControl::Supervisor.into(),
+                driver_reports_runtime_readiness: false,
             }))
         }
 
@@ -5405,7 +5387,7 @@ mod tests {
                 driver_version: "test".to_string(),
                 gateway_manages_lifecycle: false,
                 supports_sandbox_authentication: false,
-                sandbox_runtime_control: SandboxRuntimeControl::Supervisor,
+                driver_reports_runtime_readiness: false,
             },
             telemetry_compute_driver: TelemetryComputeDriver::custom(),
             driver_process: None,
@@ -6037,7 +6019,7 @@ mod tests {
     ) -> (watch::Sender<bool>, tokio::task::JoinHandle<()>) {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let runtime = Arc::new(runtime.clone());
-        let handle = tokio::spawn(async move { runtime.watch_loop(shutdown_rx).await });
+        let handle = tokio::spawn(async move { Box::pin(runtime.watch_loop(shutdown_rx)).await });
         tokio::time::timeout(Duration::from_secs(1), driver.watch_started.notified())
             .await
             .expect("watch loop did not start");
@@ -6062,19 +6044,7 @@ mod tests {
     }
 
     #[test]
-    fn unspecified_runtime_control_preserves_supervisor_compatibility() {
-        assert_eq!(
-            normalize_sandbox_runtime_control(SandboxRuntimeControl::Unspecified.into()),
-            SandboxRuntimeControl::Supervisor
-        );
-        assert_eq!(
-            normalize_sandbox_runtime_control(i32::MAX),
-            SandboxRuntimeControl::Supervisor
-        );
-    }
-
-    #[test]
-    fn driver_controlled_runtime_uses_driver_readiness() {
+    fn driver_reported_runtime_uses_driver_readiness() {
         let status = make_driver_status(DriverCondition {
             r#type: "Ready".to_string(),
             status: "True".to_string(),
@@ -6083,7 +6053,7 @@ mod tests {
             last_transition_time: String::new(),
         });
 
-        let composed = ComposedPhase::new(&status, false, SandboxRuntimeControl::Driver);
+        let composed = ComposedPhase::new(&status, false, true);
 
         assert_eq!(composed.phase, SandboxPhase::Ready);
         assert!(!composed.backend_ready_without_session);
@@ -10394,14 +10364,12 @@ mod tests {
             remote
                 .validate_sandbox_create(Request::new(ValidateSandboxCreateRequest {
                     sandbox: Some(sandbox.clone()),
-                    policy: None,
                 }))
                 .await
                 .unwrap();
             remote
                 .create_sandbox(Request::new(CreateSandboxRequest {
                     sandbox: Some(sandbox.clone()),
-                    policy: None,
                 }))
                 .await
                 .unwrap();
@@ -10573,11 +10541,7 @@ mod tests {
         let validated = match &calls[2] {
             FakeComputeDriverCall::ValidateSandboxCreate {
                 sandbox: Some(sandbox),
-                policy: Some(policy),
-            } => {
-                assert_eq!(policy.version, 42);
-                sandbox
-            }
+            } => sandbox,
             other => panic!("expected ValidateSandboxCreate call, got {other:?}"),
         };
         let driver_config = validated
@@ -10588,12 +10552,19 @@ mod tests {
             .expect("selected driver_config should be forwarded");
         assert!(driver_config.fields.contains_key("pool"));
         assert!(!driver_config.fields.contains_key("network_mode"));
+        assert_eq!(
+            validated
+                .spec
+                .as_ref()
+                .and_then(|spec| spec.policy.as_ref())
+                .map(|policy| policy.version),
+            Some(42)
+        );
         assert!(matches!(
             &calls[3],
-            FakeComputeDriverCall::CreateSandbox {
-                policy: Some(policy),
-                ..
-            } if policy.version == 42
+            FakeComputeDriverCall::CreateSandbox { sandbox: Some(sandbox) }
+                if sandbox.spec.as_ref().and_then(|spec| spec.policy.as_ref())
+                    .is_some_and(|policy| policy.version == 42)
         ));
 
         driver.clear_calls();

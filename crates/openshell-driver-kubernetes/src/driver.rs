@@ -575,8 +575,7 @@ impl KubernetesComputeDriver {
             default_image: self.config.default_image.clone(),
             gateway_manages_lifecycle: false,
             supports_sandbox_authentication: true,
-            sandbox_runtime_control:
-                openshell_core::proto::compute::v1::SandboxRuntimeControl::Supervisor.into(),
+            driver_reports_runtime_readiness: false,
         })
     }
 

@@ -5,10 +5,10 @@ OpenShell compute driver backed by **Microsoft MXC** (`wxc-exec`) on Windows.
 ## Design
 
 This driver implements the gateway's ordinary in-process `ComputeDriver`
-contract and is linked into `openshell-gateway`. It advertises driver-owned
-runtime control, so the gateway passes the canonical `SandboxPolicy` in both
-`ValidateSandboxCreate` and `CreateSandbox` and accepts driver-reported
-readiness without a supervisor session. `process_container` launches a one-shot
+contract and is linked into `openshell-gateway`. It sets
+`driver_reports_runtime_readiness`, so the gateway accepts driver-reported
+readiness without a supervisor session. The canonical create-time
+`SandboxPolicy` is carried by `DriverSandboxSpec.policy`. `process_container` launches a one-shot
 AppContainer and is the default. The opt-in `isolation_session` backend uses the
 state-aware `provision` → `start` → `exec` → `stop` → `deprovision` lifecycle.
 The driver launches and monitors the configured workload itself and self-reports
@@ -54,7 +54,9 @@ openshell sandbox create --name mxc-demo --policy demo.yaml `
 
 The `command` array is required and preserves Windows argument boundaries. `cwd` is optional. Environment variables come from the standard sandbox and template environment maps; the driver never copies values from the gateway host environment.
 
-Network policy and live policy replacement or merge updates are rejected while the gateway uses MXC. Delete and recreate the sandbox to apply a different filesystem policy.
+Network policy support depends on the selected containment path. Policy
+replacement and merge updates use the gateway's standard sandbox configuration
+revision contract.
 
 ## Prerequisites (live runs)
 

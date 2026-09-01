@@ -15,8 +15,8 @@ is responsible for:
 - For supervisor-controlled runtimes, injecting sandbox identity and gateway
   callback configuration, supplying callback credentials, and providing the
   supervisor binary or image.
-- For driver-controlled runtimes, validating and applying the canonical policy
-  before launching the workload.
+- For runtimes without the standard supervisor, validating and applying the
+  canonical policy before launching the workload.
 - Forwarding the exact canonical main-process argv and TTY mode without shell
   reconstruction. The sandbox-level environment and policy workspace apply to
   the main process.
@@ -27,16 +27,17 @@ Drivers report **runtime-observed state only** and must not hold references to
 gateway-internal types. For supervisor-controlled runtimes, `Ready=True` means
 only that the compute resource is healthy; the gateway also requires a
 supervisor session before publishing `SandboxPhase::Ready`. For
-driver-controlled runtimes, `Ready=True` is authoritative because the driver
+drivers that report runtime readiness, `Ready=True` is authoritative because the driver
 launches and monitors the policy-constrained workload itself.
 
 `compute_driver.proto` is the supported gateway/driver extension boundary.
 At initialization the gateway snapshots the driver's identity, version,
-default image, gateway-lifecycle preference, and `sandbox_runtime_control` from
-`GetCapabilities`. An omitted or unknown runtime-control value is treated as
-`SUPERVISOR` for compatibility. The gateway includes the canonical
-`SandboxPolicy` in both `ValidateSandboxCreate` and `CreateSandbox`; drivers
-that advertise `DRIVER` must validate and apply it before launch.
+default image, gateway-lifecycle preference, and
+`driver_reports_runtime_readiness` from `GetCapabilities`. The gateway includes
+the canonical `SandboxPolicy` in `DriverSandboxSpec.policy` for validation and
+creation. Drivers that enforce policy outside the standard supervisor fetch
+later revisions through `GetSandboxConfig` and acknowledge them through
+`ReportPolicyStatus`.
 Process-identity omissions are preserved across this boundary so every driver
 can apply its native image or runtime defaults. Driver-requested listeners are
 structurally validated and remain restricted to sandbox callback RPCs.
@@ -53,7 +54,7 @@ reason strings.
 
 ## Sandbox Readiness Composition
 
-The gateway composes driver state with the advertised runtime-control mode to
+The gateway composes driver state with the advertised readiness behavior to
 produce the public `SandboxPhase`:
 
 ```
@@ -61,7 +62,7 @@ backend_phase = derive_phase(driver_status)
 
 public_phase =
   if backend_phase in {Error, Deleting}:                     → pass through (terminal precedence)
-  if runtime_control == Driver && backend_phase == Ready:     → Ready
+  if driver_reports_runtime_readiness && backend_phase == Ready: → Ready
   if backend_phase == Ready && session connected:             → Ready
   if backend_phase == Ready && no session:                    → Provisioning
   if backend_phase in {Provisioning, Unknown} && session:    → Ready
@@ -74,7 +75,7 @@ backend reports ready but has no supervisor session yet holds `Provisioning` wit
 `Ready=False`, `SupervisorNotConnected` condition and the message
 `Backend ready; waiting for supervisor session`. This distinguishes it from a sandbox
 whose compute resource is still provisioning without exposing contradictory public
-readiness signals. For a driver-controlled runtime, the driver's ready condition
+readiness signals. When the driver reports runtime readiness, its ready condition
 is published without waiting for a supervisor session.
 
 **Session precedence over lagging driver snapshots:** A supervisor session can only be
@@ -94,11 +95,11 @@ session-owning replica. That work is deferred to GitHub issue #1868. Until then,
 deployments that require reliable readiness composition must run a single gateway
 replica.
 
-**Extension point:** Runtime control is a driver capability, not an
-operator-configurable hook. A driver may advertise `DRIVER` only when it applies
-the canonical create-time policy and owns workload readiness. Driver-controlled
-runtimes do not support live policy mutation; recreate the sandbox to apply a
-new policy. RFC-0010 lifecycle hooks may observe readiness transitions via
+**Extension point:** Driver-reported readiness is a capability, not an
+operator-configurable hook. A driver may enable it only when it owns workload
+readiness. Policy delivery remains independent: create-time policy is embedded
+in the sandbox specification, and later revisions use the existing sandbox
+configuration API. RFC-0010 lifecycle hooks may observe readiness transitions via
 `post_commit`; they do not override the composition rule.
 
 The capability RPC reports driver identity, version, and the default sandbox

@@ -413,7 +413,7 @@ The sandbox name defaults to the last-used sandbox.
 
 ### `openshell policy update [name]`
 
-Incrementally merge live network policy changes into the current sandbox policy when the selected compute driver supports live updates. Multiple flags in one invocation are applied as one atomic batch and create at most one new revision. MXC rejects live policy merges; delete and recreate an MXC sandbox instead.
+Incrementally merge live network policy changes into the current sandbox policy when the selected compute driver supports live updates. Multiple flags in one invocation are applied as one atomic batch and create at most one new revision. Use `--wait` to verify that the active runtime loaded the new revision.
 
 | Flag | Default | Description |
 |------|---------|-------------|
@@ -443,7 +443,7 @@ Notes:
 
 ### `openshell policy set [name] --policy <PATH>`
 
-Replace the full policy on a live sandbox when the selected compute driver supports live updates. Only the dynamic `network_policies` field can be changed at runtime. MXC rejects live policy replacement; delete and recreate an MXC sandbox instead.
+Replace the full policy on a live sandbox when the selected compute driver supports live updates. Only dynamic policy fields can be changed at runtime. Use `--wait` to verify that the active runtime loaded the new revision.
 
 | Flag | Default | Description |
 |------|---------|-------------|
