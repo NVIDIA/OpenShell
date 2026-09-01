@@ -60,6 +60,7 @@ These pipelines connect skills into end-to-end workflows. Individual skill files
 | `crates/openshell-driver-docker/` | Docker compute driver | In-process `ComputeDriver` backend for local Docker sandbox containers |
 | `crates/openshell-driver-mxc/` | MXC compute driver | Windows in-process `ComputeDriver` backend for MXC sandbox execution |
 | `crates/openshell-driver-podman/` | Podman compute driver | In-process `ComputeDriver` backend for local Podman sandbox containers |
+| `crates/openshell-driver-mxc/` | MXC compute driver | In-process Windows `ComputeDriver` backend for MXC isolation sessions and process containers |
 | `crates/openshell-driver-vm/` | VM compute driver | Standalone libkrun-backed `ComputeDriver` subprocess (embeds its own rootfs + runtime) |
 | `crates/openshell-driver-mxc/` | Microsoft MXC compute driver | In-process Windows AppContainer and isolation-session compute backend |
 | `crates/openshell-prover/` | Policy prover | Policy verification and proof generation |
