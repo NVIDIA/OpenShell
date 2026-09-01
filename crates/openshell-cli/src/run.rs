@@ -47,8 +47,8 @@ use openshell_core::proto::{
     ApproveAllDraftChunksRequest, ApproveDraftChunkRequest, ClearDraftChunksRequest,
     CreateSandboxRequest, CreateSandboxTemplateRequest, CreateSshSessionRequest,
     DeleteInferenceRouteRequest, DeleteSandboxRequest, DeleteSandboxTemplateRequest,
-    DeleteServiceRequest, ExecSandboxRequest, ExposeServiceRequest, GetCurrentUserRequest,
-    GetDraftHistoryRequest, GetDraftPolicyRequest, GetGatewayConfigRequest,
+    DeleteServiceRequest, DisruptionProtectionRequest, ExecSandboxRequest, ExposeServiceRequest,
+    GetCurrentUserRequest, GetDraftHistoryRequest, GetDraftPolicyRequest, GetGatewayConfigRequest,
     GetInferenceRouteRequest, GetSandboxConfigRequest, GetSandboxConfigResponse,
     GetSandboxLogsRequest, GetSandboxPolicyStatusRequest, GetSandboxRequest,
     GetSandboxTemplateRequest, GetServiceRequest, GpuResourceRequirements,
@@ -59,7 +59,6 @@ use openshell_core::proto::{
     SandboxWorkloadTemplate, SandboxWorkloadTemplateSpec, ServiceEndpointResponse,
     SetInferenceRouteRequest, SettingScope, StartSandboxRequest, StopSandboxRequest,
     TcpForwardFrame, TcpForwardInit, TcpRelayTarget, UpdateConfigRequest, WatchSandboxRequest,
-    DisruptionProtectionRequest,
     exec_sandbox_event, tcp_forward_init,
 };
 use openshell_core::settings;
@@ -5993,10 +5992,10 @@ mod tests {
         dockerfile_sources_supported_for_gateway, format_endpoint, format_log_line, git_sync_files,
         has_main_process_result, parse_cli_setting_value, parse_credential_expiry_cli_value,
         parse_disruption_protection, parse_driver_config_json, parse_secret_material_env_pairs,
-        policy_revision_list_json,
-        policy_revision_to_json, provisioning_timeout_message, ready_false_condition_message,
-        resolve_from, sandbox_should_persist, sandbox_upload_plan, service_endpoint_to_json,
-        service_expose_status_error, service_url_for_gateway, workspace_member_to_json,
+        policy_revision_list_json, policy_revision_to_json, provisioning_timeout_message,
+        ready_false_condition_message, resolve_from, sandbox_should_persist, sandbox_upload_plan,
+        service_endpoint_to_json, service_expose_status_error, service_url_for_gateway,
+        workspace_member_to_json,
     };
     use crate::TEST_ENV_LOCK;
     use crate::commands::common::{

@@ -517,16 +517,16 @@ impl PodmanComputeDriver {
             true,
         );
         capabilities.resource_capabilities = Some(ResourceCapabilities {
-                cpu: Some(CpuResourceCapabilities {
-                    limit_supported: true,
-                }),
-                memory: Some(MemoryResourceCapabilities {
-                    limit_supported: true,
-                }),
-                gpu: Some(GpuResourceCapabilities {
-                    default_selection_supported: true,
-                    count_selection_supported: true,
-                }),
+            cpu: Some(CpuResourceCapabilities {
+                limit_supported: true,
+            }),
+            memory: Some(MemoryResourceCapabilities {
+                limit_supported: true,
+            }),
+            gpu: Some(GpuResourceCapabilities {
+                default_selection_supported: true,
+                count_selection_supported: true,
+            }),
         });
         Ok(capabilities)
     }
@@ -2913,7 +2913,7 @@ mod tests {
             name: name.to_string(),
             namespace: String::new(),
             workspace: String::new(),
-            spec: None,
+            spec: Some(DriverSandboxSpec::default()),
             status: None,
         }
     }

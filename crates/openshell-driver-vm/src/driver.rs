@@ -673,16 +673,16 @@ impl VmDriver {
             true,
         );
         capabilities.resource_capabilities = Some(ResourceCapabilities {
-                cpu: Some(CpuResourceCapabilities {
-                    limit_supported: false,
-                }),
-                memory: Some(MemoryResourceCapabilities {
-                    limit_supported: false,
-                }),
-                gpu: Some(GpuResourceCapabilities {
-                    default_selection_supported: self.config.gpu_enabled,
-                    count_selection_supported: self.config.gpu_enabled,
-                }),
+            cpu: Some(CpuResourceCapabilities {
+                limit_supported: false,
+            }),
+            memory: Some(MemoryResourceCapabilities {
+                limit_supported: false,
+            }),
+            gpu: Some(GpuResourceCapabilities {
+                default_selection_supported: self.config.gpu_enabled,
+                count_selection_supported: self.config.gpu_enabled,
+            }),
         });
         capabilities
     }

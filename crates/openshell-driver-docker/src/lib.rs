@@ -591,16 +591,16 @@ impl DockerComputeDriver {
             true,
         );
         capabilities.resource_capabilities = Some(ResourceCapabilities {
-                cpu: Some(CpuResourceCapabilities {
-                    limit_supported: true,
-                }),
-                memory: Some(MemoryResourceCapabilities {
-                    limit_supported: true,
-                }),
-                gpu: Some(GpuResourceCapabilities {
-                    default_selection_supported: self.config.gpu.cdi_supported,
-                    count_selection_supported: self.config.gpu.cdi_supported,
-                }),
+            cpu: Some(CpuResourceCapabilities {
+                limit_supported: true,
+            }),
+            memory: Some(MemoryResourceCapabilities {
+                limit_supported: true,
+            }),
+            gpu: Some(GpuResourceCapabilities {
+                default_selection_supported: self.config.gpu.cdi_supported,
+                count_selection_supported: self.config.gpu.cdi_supported,
+            }),
         });
         capabilities
     }

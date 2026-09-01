@@ -280,9 +280,7 @@ fn validate_gpu_request_fields(spec: &SandboxSpec) -> Result<(), Status> {
     Ok(())
 }
 
-fn validate_disruption_protection_request(
-    spec: &openshell_core::proto::SandboxSpec,
-) -> Result<(), Status> {
+fn validate_disruption_protection_request(spec: &SandboxSpec) -> Result<(), Status> {
     const PROTOBUF_DURATION_MAX_SECONDS: i64 = 315_576_000_000;
 
     let Some(request) = spec.disruption_protection.as_ref() else {

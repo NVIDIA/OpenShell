@@ -57,7 +57,7 @@ tests:
           path: metadata.namespace
           value: other-ns
 
-  - it: grants only PodDisruptionBudget cleanup access while protection is disabled
+  - it: grants PodDisruptionBudget cleanup and ownership adoption while protection is disabled
     template: templates/role.yaml
     asserts:
       - contains:
@@ -71,6 +71,7 @@ tests:
               - delete
               - get
               - list
+              - patch
 
   - it: grants PodDisruptionBudget mutation access while protection is enabled
     template: templates/role.yaml
@@ -88,8 +89,8 @@ tests:
               - delete
               - get
               - list
-              - create
               - patch
+              - create
 
   - it: uses explicit sandboxNamespace for sandbox RoleBinding
     template: templates/rolebinding.yaml
