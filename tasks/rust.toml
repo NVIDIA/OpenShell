@@ -3,6 +3,23 @@
 
 # Rust check, lint, and format tasks
 
+["rust:cache:status"]
+description = "Show requested and active Rust compiler cache settings"
+run = '''
+echo "Requested cache directory: ${SCCACHE_DIR:-<unset>}"
+echo "Requested base directories: ${SCCACHE_BASEDIRS:-<unset>}"
+echo
+sccache --show-stats
+'''
+
+["rust:cache:refresh"]
+description = "Restart sccache with the current worktree cache settings"
+run = '''
+sccache --stop-server || true
+sccache --start-server
+sccache --show-stats
+'''
+
 ["rust:check"]
 description = "Check all Rust crates for errors"
 run = "cargo check --workspace"
