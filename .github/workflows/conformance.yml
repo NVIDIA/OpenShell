@@ -91,7 +91,7 @@ jobs:
   fedora:
     name: Fedora clean install
     needs: build-rpm
-    runs-on: linux-amd64-cpu8
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     permissions:
       actions: read
