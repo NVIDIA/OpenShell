@@ -119,6 +119,20 @@ impl ProgressOutput {
     }
 }
 
+fn aggregate_delete_failures(resource: &str, failures: &[String]) -> Result<()> {
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(miette!(
+            "failed to delete {} {}{}: {}",
+            failures.len(),
+            resource,
+            if failures.len() == 1 { "" } else { "s" },
+            failures.join(", ")
+        ))
+    }
+}
+
 #[derive(Debug, Clone)]
 struct CurrentUserView {
     subject: String,
@@ -2518,6 +2532,7 @@ pub async fn sandbox_delete(
         names.to_vec()
     };
 
+    let mut failures = Vec::new();
     for name in &names_to_delete {
         // Stop any background port forwards for this sandbox before deleting.
         if let Ok(stopped) = stop_forwards_for_sandbox(name) {
@@ -2542,7 +2557,14 @@ pub async fn sandbox_delete(
                 println!("{} Sandbox {name} already deleted", "✓".green().bold());
                 continue;
             }
-            Err(status) => return Err(status).into_diagnostic(),
+            Err(status) => {
+                eprintln!(
+                    "{} Failed to delete sandbox {name}: {status}",
+                    "!".red().bold()
+                );
+                failures.push(name.clone());
+                continue;
+            }
         };
 
         let deleted = response.into_inner().deleted;
@@ -2554,7 +2576,7 @@ pub async fn sandbox_delete(
         }
     }
 
-    Ok(())
+    aggregate_delete_failures("sandbox", &failures)
 }
 
 /// Stop a sandbox while retaining its persistent workspace.
@@ -4423,22 +4445,32 @@ pub async fn provider_profile_delete(
     tls: &TlsOptions,
 ) -> Result<()> {
     let mut client = grpc_client(server, tls).await?;
+    let mut failures = Vec::new();
     for id in ids {
-        let response = client
+        let response = match client
             .delete_provider_profile(DeleteProviderProfileRequest {
                 id: id.clone(),
                 workspace: workspace.to_string(),
             })
             .await
-            .into_diagnostic()?
-            .into_inner();
+        {
+            Ok(response) => response.into_inner(),
+            Err(status) => {
+                eprintln!(
+                    "{} Failed to delete provider profile {id}: {status}",
+                    "!".red().bold()
+                );
+                failures.push(id.clone());
+                continue;
+            }
+        };
         if response.deleted {
             println!("{} Deleted provider profile {id}", "✓".green().bold());
         } else {
             println!("{} Provider profile {id} not found", "!".yellow());
         }
     }
-    Ok(())
+    aggregate_delete_failures("provider profile", &failures)
 }
 
 pub async fn provider_refresh_status(
@@ -5070,21 +5102,32 @@ pub async fn provider_delete(
     tls: &TlsOptions,
 ) -> Result<()> {
     let mut client = grpc_client(server, tls).await?;
+    let mut failures = Vec::new();
     for name in names {
-        let response = client
+        let response = match client
             .delete_provider(DeleteProviderRequest {
                 name: name.clone(),
                 workspace: workspace.to_string(),
             })
             .await
-            .into_diagnostic()?;
+        {
+            Ok(response) => response,
+            Err(status) => {
+                eprintln!(
+                    "{} Failed to delete provider {name}: {status}",
+                    "!".red().bold()
+                );
+                failures.push(name.clone());
+                continue;
+            }
+        };
         if response.into_inner().deleted {
             println!("{} Deleted provider {name}", "✓".green().bold());
         } else {
             println!("{} Provider {name} not found", "!".yellow());
         }
     }
-    Ok(())
+    aggregate_delete_failures("provider", &failures)
 }
 
 // ---------------------------------------------------------------------------

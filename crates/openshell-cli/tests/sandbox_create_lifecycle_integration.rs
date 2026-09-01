@@ -46,6 +46,7 @@ use tonic::{Response, Status};
 struct SandboxState {
     deleted_names: Arc<Mutex<Vec<Vec<String>>>>,
     create_requests: Arc<Mutex<Vec<CreateSandboxRequest>>>,
+    fail_delete_sandbox_message: Arc<Mutex<Option<String>>>,
     vm_error_after_started: Arc<AtomicBool>,
     vm_error_with_observed_exit: Arc<AtomicBool>,
     vm_slow_progress_before_ready: Arc<AtomicBool>,
@@ -209,7 +210,11 @@ impl OpenShell for TestOpenShell {
             .deleted_names
             .lock()
             .await
-            .push(vec![request.name]);
+            .push(vec![request.name.clone()]);
+        let delete_failure = self.state.fail_delete_sandbox_message.lock().await.take();
+        if let Some(message) = delete_failure {
+            return Err(Status::internal(message));
+        }
         Ok(Response::new(DeleteSandboxResponse { deleted: true }))
     }
 
@@ -1223,6 +1228,42 @@ fn test_config() -> run::SandboxCreateConfig<'static> {
         auto_providers_override: Some(false),
         ..Default::default()
     }
+}
+
+#[tokio::test]
+async fn sandbox_delete_continues_after_entry_failure() {
+    let server = run_server().await;
+    let tls = test_tls(&server);
+    *server
+        .openshell
+        .state
+        .fail_delete_sandbox_message
+        .lock()
+        .await = Some("simulated sandbox delete failure".to_string());
+
+    let err = run::sandbox_delete(
+        &server.endpoint,
+        &["failing-sandbox".to_string(), "later-sandbox".to_string()],
+        false,
+        "default",
+        &tls,
+        "openshell",
+    )
+    .await
+    .expect_err("sandbox delete should report aggregate failure");
+
+    let msg = err.to_string();
+    assert!(
+        msg.contains("failed to delete 1 sandbox: failing-sandbox"),
+        "unexpected error: {msg}"
+    );
+    assert_eq!(
+        deleted_names(&server).await,
+        vec![
+            vec!["failing-sandbox".to_string()],
+            vec!["later-sandbox".to_string()]
+        ]
+    );
 }
 
 #[tokio::test]

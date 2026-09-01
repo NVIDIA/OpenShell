@@ -51,9 +51,11 @@ struct ProviderState {
     provider_update_requests: Arc<Mutex<Vec<Provider>>>,
     deny_provider_reads: Arc<AtomicBool>,
     delete_provider_requests: Arc<Mutex<Vec<String>>>,
+    delete_provider_profile_requests: Arc<Mutex<Vec<String>>>,
     fail_configure_refresh_message: Arc<Mutex<Option<String>>>,
     fail_rotate_refresh_message: Arc<Mutex<Option<String>>>,
     fail_delete_provider_message: Arc<Mutex<Option<String>>>,
+    fail_delete_provider_profile_message: Arc<Mutex<Option<String>>>,
     sandbox_providers: Arc<Mutex<HashMap<String, Vec<String>>>>,
     sandbox_provider_requests: Arc<Mutex<Vec<SandboxProviderRequestLog>>>,
     global_settings: Arc<Mutex<HashMap<String, SettingValue>>>,
@@ -888,6 +890,20 @@ impl OpenShell for TestOpenShell {
         request: tonic::Request<openshell_core::proto::DeleteProviderProfileRequest>,
     ) -> Result<Response<openshell_core::proto::DeleteProviderProfileResponse>, Status> {
         let id = request.into_inner().id;
+        self.state
+            .delete_provider_profile_requests
+            .lock()
+            .await
+            .push(id.clone());
+        let delete_failure = self
+            .state
+            .fail_delete_provider_profile_message
+            .lock()
+            .await
+            .take();
+        if let Some(message) = delete_failure {
+            return Err(Status::internal(message));
+        }
         let deleted = self.state.profiles.lock().await.remove(&id).is_some();
         Ok(Response::new(
             openshell_core::proto::DeleteProviderProfileResponse { deleted },
@@ -1199,6 +1215,62 @@ async fn install_test_profile(ts: &TestServer, id: &str, credential_key: &str) {
             }],
             ..Default::default()
         },
+    );
+}
+
+#[tokio::test]
+async fn provider_delete_continues_after_entry_failure() {
+    let ts = run_server().await;
+    *ts.state.fail_delete_provider_message.lock().await =
+        Some("simulated provider delete failure".to_string());
+
+    let err = run::provider_delete(
+        &ts.endpoint,
+        &["failing-provider".to_string(), "later-provider".to_string()],
+        "default",
+        &ts.tls,
+    )
+    .await
+    .expect_err("provider delete should report aggregate failure");
+
+    let msg = err.to_string();
+    assert!(
+        msg.contains("failed to delete 1 provider: failing-provider"),
+        "unexpected error: {msg}"
+    );
+    assert_eq!(
+        ts.state.delete_provider_requests.lock().await.clone(),
+        vec!["failing-provider".to_string(), "later-provider".to_string()]
+    );
+}
+
+#[tokio::test]
+async fn provider_profile_delete_continues_after_entry_failure() {
+    let ts = run_server().await;
+    *ts.state.fail_delete_provider_profile_message.lock().await =
+        Some("simulated provider profile delete failure".to_string());
+
+    let err = run::provider_profile_delete(
+        &ts.endpoint,
+        &["failing-profile".to_string(), "later-profile".to_string()],
+        "default",
+        &ts.tls,
+    )
+    .await
+    .expect_err("provider profile delete should report aggregate failure");
+
+    let msg = err.to_string();
+    assert!(
+        msg.contains("failed to delete 1 provider profile: failing-profile"),
+        "unexpected error: {msg}"
+    );
+    assert_eq!(
+        ts.state
+            .delete_provider_profile_requests
+            .lock()
+            .await
+            .clone(),
+        vec!["failing-profile".to_string(), "later-profile".to_string()]
     );
 }
 

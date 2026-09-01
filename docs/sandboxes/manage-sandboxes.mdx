@@ -555,6 +555,16 @@ Deleting a sandbox stops all processes, releases resources, and purges injected 
 openshell sandbox delete my-sandbox
 ```
 
+Delete multiple sandboxes by listing their names in one command:
+
+```shell
+openshell sandbox delete sandbox-a sandbox-b
+```
+
+When a multi-sandbox delete fails for one entry, the CLI reports that sandbox's
+failure and continues with the remaining names. The command exits with an error
+after it attempts every requested deletion if any entry failed.
+
 ## Sandbox Lifecycle
 
 Every sandbox moves through a defined set of phases:
