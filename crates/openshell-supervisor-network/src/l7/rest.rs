@@ -3531,8 +3531,18 @@ where
             server_wants_close,
             &declared_trailers,
         );
-        client.write_all(&head).await.into_diagnostic()?;
-        client.flush().await.into_diagnostic()?;
+        if let Err(error) = client.write_all(&head).await {
+            session
+                .end(openshell_core::proto::HttpResponseSessionEndReason::ClientDisconnect)
+                .await;
+            return Err(error).into_diagnostic();
+        }
+        if let Err(error) = client.flush().await {
+            session
+                .end(openshell_core::proto::HttpResponseSessionEndReason::ClientDisconnect)
+                .await;
+            return Err(error).into_diagnostic();
+        }
         true
     };
 
@@ -3557,6 +3567,11 @@ where
                 .is_some_and(PolicyGenerationGuard::is_stale)
             {
                 openshell_core::proto::HttpResponseSessionEndReason::PolicyReload
+            } else if error
+                .to_string()
+                .starts_with("HTTP response client write failed:")
+            {
+                openshell_core::proto::HttpResponseSessionEndReason::ClientDisconnect
             } else if error
                 .to_string()
                 .starts_with("HTTP response middleware failure:")
@@ -4198,9 +4213,14 @@ async fn process_response_unit<C: AsyncWrite + Unpin>(
         .map_err(|error| miette!("HTTP response middleware failure: {error}"))?;
     if committed {
         for unit in output {
-            write_chunk(client, &unit).await?;
+            write_chunk(client, &unit)
+                .await
+                .map_err(|error| miette!("HTTP response client write failed: {error}"))?;
         }
-        client.flush().await.into_diagnostic()?;
+        client
+            .flush()
+            .await
+            .map_err(|error| miette!("HTTP response client write failed: {error}"))?;
     } else if !output.is_empty() {
         return Err(miette!(
             "whole-body response middleware released output before finalization"
@@ -6700,6 +6720,19 @@ mod tests {
         openshell_supervisor_middleware::ChainRunner,
         Vec<openshell_supervisor_middleware::ChainEntry>,
     ) {
+        response_middleware_fixture_with_error(
+            script,
+            openshell_supervisor_middleware::OnError::FailClosed,
+        )
+    }
+
+    fn response_middleware_fixture_with_error(
+        script: ResponseRelayScript,
+        on_error: openshell_supervisor_middleware::OnError,
+    ) -> (
+        openshell_supervisor_middleware::ChainRunner,
+        Vec<openshell_supervisor_middleware::ChainEntry>,
+    ) {
         let runner =
             openshell_supervisor_middleware::ChainRunner::new(Arc::new(ResponseRelayService {
                 script,
@@ -6709,7 +6742,7 @@ mod tests {
             implementation: "test/response-relay".into(),
             order: 0,
             config: prost_types::Struct::default(),
-            on_error: openshell_supervisor_middleware::OnError::FailClosed,
+            on_error,
         }];
         (runner, chain)
     }
@@ -6745,7 +6778,22 @@ mod tests {
         method: &str,
         script: ResponseRelayScript,
     ) -> (Result<RelayOutcome>, Vec<u8>) {
-        let (runner, chain) = response_middleware_fixture(script);
+        run_response_middleware_relay_with_error(
+            response,
+            method,
+            script,
+            openshell_supervisor_middleware::OnError::FailClosed,
+        )
+        .await
+    }
+
+    async fn run_response_middleware_relay_with_error(
+        response: &'static [u8],
+        method: &str,
+        script: ResponseRelayScript,
+        on_error: openshell_supervisor_middleware::OnError,
+    ) -> (Result<RelayOutcome>, Vec<u8>) {
+        let (runner, chain) = response_middleware_fixture_with_error(script, on_error);
         let (mut upstream_read, mut upstream_write) = tokio::io::duplex(16 * 1024);
         let (mut client_read, mut client_write) = tokio::io::duplex(16 * 1024);
         tokio::spawn(async move {
@@ -6846,6 +6894,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn response_middleware_handles_bodyless_responses_without_body_events() {
+        for response in [
+            b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n".as_slice(),
+            b"HTTP/1.1 304 Not Modified\r\nContent-Length: 5\r\n\r\n".as_slice(),
+        ] {
+            let (outcome, delivered) =
+                run_response_middleware_relay(response, "GET", ResponseRelayScript::HeadersOnly)
+                    .await;
+            assert!(outcome.is_ok());
+            let delivered = String::from_utf8(delivered).unwrap();
+            assert!(
+                delivered.contains("cache-control: private\r\n"),
+                "{delivered}"
+            );
+            assert!(delivered.ends_with("\r\n\r\n"), "{delivered}");
+        }
+
+        let (outcome, delivered) = run_response_middleware_relay(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n",
+            "HEAD",
+            ResponseRelayScript::HeadersOnly,
+        )
+        .await;
+        assert!(outcome.is_ok());
+        let split = delivered
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .unwrap()
+            + 4;
+        assert_eq!(&delivered[split..], b"");
+    }
+
+    #[tokio::test]
+    async fn response_middleware_bypasses_protocol_upgrades() {
+        let (outcome, delivered) = run_response_middleware_relay(
+            b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n\x81\x02ok",
+            "GET",
+            ResponseRelayScript::HeadersOnly,
+        )
+        .await;
+        assert!(matches!(
+            outcome.unwrap(),
+            RelayOutcome::Upgraded { ref overflow, .. } if overflow == b"\x81\x02ok"
+        ));
+        let delivered = String::from_utf8(delivered).unwrap();
+        assert!(!delivered.contains("cache-control: private"), "{delivered}");
+    }
+
+    #[tokio::test]
     async fn response_middleware_fail_closed_before_commit_returns_canonical_502() {
         let (outcome, delivered) = run_response_middleware_relay(
             b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello",
@@ -6898,6 +6995,88 @@ mod tests {
         let delivered = String::from_utf8(delivered).unwrap();
         assert!(delivered.starts_with("HTTP/1.1 200 OK\r\n"), "{delivered}");
         assert!(!delivered.contains("502 Bad Gateway"), "{delivered}");
+    }
+
+    #[tokio::test]
+    async fn response_middleware_fail_open_preserves_input_before_and_after_commit() {
+        for (script, expected_framing) in [
+            (
+                ResponseRelayScript::InvalidWholeBodySequence,
+                "Content-Length: 5\r\n",
+            ),
+            (
+                ResponseRelayScript::InvalidBodySequence,
+                "Transfer-Encoding: chunked\r\n",
+            ),
+        ] {
+            let (outcome, delivered) = run_response_middleware_relay_with_error(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello",
+                "GET",
+                script,
+                openshell_supervisor_middleware::OnError::FailOpen,
+            )
+            .await;
+            assert!(outcome.is_ok());
+            let delivered = String::from_utf8(delivered).unwrap();
+            assert!(delivered.contains(expected_framing), "{delivered}");
+            assert!(delivered.contains("hello"), "{delivered}");
+            assert!(!delivered.contains("502 Bad Gateway"), "{delivered}");
+        }
+    }
+
+    #[tokio::test]
+    async fn response_middleware_stale_policy_generation_aborts_before_preflight() {
+        let policy_data = "network_policies: {}\n";
+        let engine = OpaEngine::from_strings(TEST_POLICY, policy_data).unwrap();
+        let guard = engine
+            .generation_guard(engine.current_generation())
+            .unwrap();
+        engine.reload(TEST_POLICY, policy_data).unwrap();
+        let (runner, chain) = response_middleware_fixture(ResponseRelayScript::Stream);
+        let (mut upstream_read, mut upstream_write) = tokio::io::duplex(4096);
+        let (mut client_read, mut client_write) = tokio::io::duplex(4096);
+        upstream_write
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello")
+            .await
+            .unwrap();
+        upstream_write.shutdown().await.unwrap();
+        let mut context = response_middleware_context(&runner, &chain, "GET");
+        context.generation_guard = Some(&guard);
+        let outcome = relay_response(
+            "GET",
+            &mut upstream_read,
+            &mut client_write,
+            RelayResponseOptions::default(),
+            Some(context),
+        )
+        .await;
+        assert!(outcome.is_err());
+        drop(client_write);
+        let mut delivered = Vec::new();
+        client_read.read_to_end(&mut delivered).await.unwrap();
+        assert!(delivered.is_empty());
+    }
+
+    #[tokio::test]
+    async fn response_middleware_client_disconnect_aborts_stream_delivery() {
+        let (runner, chain) = response_middleware_fixture(ResponseRelayScript::Stream);
+        let (mut upstream_read, mut upstream_write) = tokio::io::duplex(4096);
+        let (client_read, mut client_write) = tokio::io::duplex(4096);
+        drop(client_read);
+        upstream_write
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello")
+            .await
+            .unwrap();
+        upstream_write.shutdown().await.unwrap();
+        let outcome = relay_response(
+            "GET",
+            &mut upstream_read,
+            &mut client_write,
+            RelayResponseOptions::default(),
+            Some(response_middleware_context(&runner, &chain, "GET")),
+        )
+        .await;
+        assert!(outcome.is_err());
     }
 
     #[tokio::test]
@@ -9417,6 +9596,37 @@ mod tests {
         assert_eq!(
             detect_payload_mode(headers).unwrap(),
             SigV4PayloadMode::UnsignedPayload
+        );
+    }
+
+    #[test]
+    fn response_body_transform_strips_stale_integrity_headers() {
+        let mut headers = [
+            "accept-ranges",
+            "etag",
+            "content-md5",
+            "digest",
+            "content-digest",
+            "repr-digest",
+            "signature",
+            "signature-input",
+            "content-type",
+        ]
+        .into_iter()
+        .map(|name| HttpHeader {
+            name: name.to_string(),
+            value: "value".to_string(),
+        })
+        .collect();
+
+        strip_response_integrity_headers(&mut headers);
+
+        assert_eq!(
+            headers,
+            vec![HttpHeader {
+                name: "content-type".to_string(),
+                value: "value".to_string(),
+            }]
         );
     }
 }

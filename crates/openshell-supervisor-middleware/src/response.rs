@@ -162,6 +162,8 @@ pub struct HttpResponseSession {
     invocations: Vec<HttpResponseInvocation>,
     session_admission: Option<MiddlewareSessionPermit>,
     body_transformed: bool,
+    defer_output_until_finish: bool,
+    deferred_output: Vec<Vec<u8>>,
 }
 
 impl HttpResponseSession {
@@ -208,7 +210,13 @@ impl HttpResponseSession {
                 reason: format!("middleware_failed: {error}"),
             })?;
         let deadline = Instant::now() + MAX_MIDDLEWARE_CHAIN_TIMEOUT;
-        self.process_units_from(0, vec![data], deadline).await
+        let output = self.process_units_from(0, vec![data], deadline).await?;
+        if self.defer_output_until_finish {
+            self.deferred_output.extend(output);
+            Ok(Vec::new())
+        } else {
+            Ok(output)
+        }
     }
 
     /// Finalize every body stage, process normalized trailers, and end streams.
@@ -224,7 +232,7 @@ impl HttpResponseSession {
                 reason: format!("middleware_failed: {error}"),
             })?;
         let deadline = Instant::now() + MAX_MIDDLEWARE_CHAIN_TIMEOUT;
-        let mut released = Vec::new();
+        let mut released = std::mem::take(&mut self.deferred_output);
         for index in 0..self.stages.len() {
             let stage_output = match self.finish_stage(index, deadline).await {
                 Ok(output) => output,
@@ -934,6 +942,9 @@ impl ChainRunner {
                 session_capacity_exhausted: false,
             });
         }
+        let defer_output_until_finish = stages
+            .iter()
+            .any(|stage| stage.is_active() && stage.mode == StageMode::WholeBody);
         Ok(HttpResponsePreflightOutcome {
             allowed: true,
             reason: String::new(),
@@ -948,6 +959,8 @@ impl ChainRunner {
                 invocations: Vec::new(),
                 session_admission: Some(session_admission),
                 body_transformed: false,
+                defer_output_until_finish,
+                deferred_output: Vec::new(),
             }),
             findings,
             metadata,
@@ -1481,8 +1494,8 @@ mod tests {
     use openshell_core::proto::{
         Decision, ExistingHeaderAction, HttpRequestResult, HttpResponseBodyResult,
         HttpResponseBodyTransform, HttpResponsePreflightDecision, HttpResponsePreflightInspect,
-        HttpResponseTrailersResult, MiddlewareBinding, MiddlewareManifest, WriteHeader,
-        http_response_preflight_decision,
+        HttpResponsePreflightSkip, HttpResponseTrailersResult, MiddlewareBinding,
+        MiddlewareManifest, WriteHeader, http_response_preflight_decision,
     };
     use tokio_stream::wrappers::ReceiverStream;
     use tokio_stream::wrappers::TcpListenerStream;
@@ -1495,6 +1508,12 @@ mod tests {
         Stream,
         WholeBody,
         InvalidSequence,
+        Configured,
+        HangBody,
+        LargeStream,
+        Skip,
+        InvalidSkipReason,
+        UndeclaredTrailer,
     }
 
     struct ResponseService {
@@ -1612,8 +1631,16 @@ mod tests {
                     operation: openshell_core::proto::SupervisorMiddlewareOperation::HttpResponse
                         as i32,
                     phase: openshell_core::proto::SupervisorMiddlewarePhase::PreReturn as i32,
-                    max_payload_bytes: 4096,
-                    timeout: String::new(),
+                    max_payload_bytes: if matches!(self.script, Script::LargeStream) {
+                        128 * 1024
+                    } else {
+                        4096
+                    },
+                    timeout: if matches!(self.script, Script::HangBody) {
+                        "10ms".into()
+                    } else {
+                        String::new()
+                    },
                 }],
                 expected_audience: String::new(),
             }
@@ -1644,29 +1671,90 @@ mod tests {
             let (sender, receiver) = mpsc::channel(4);
             let script = self.script;
             tokio::spawn(async move {
+                let mut selected_script = script;
                 while let Some(event) = requests.recv().await {
                     let Some(event) = event.event else {
                         break;
                     };
                     let result = match event {
-                        http_response_event::Event::Preflight(_) => {
-                            let (body_mode, header_mutations, declared_trailer_names) = match script
-                            {
-                                Script::HeadersOnly => (
-                                    HttpResponseBodyMode::HeadersOnly,
-                                    vec![write_header("cache-control", "private")],
-                                    Vec::new(),
-                                ),
-                                Script::Stream | Script::InvalidSequence => (
-                                    HttpResponseBodyMode::StreamBytes,
-                                    Vec::new(),
-                                    vec!["digest".into()],
-                                ),
-                                Script::WholeBody => {
-                                    (HttpResponseBodyMode::WholeBodyBytes, Vec::new(), Vec::new())
+                        http_response_event::Event::Preflight(preflight) => {
+                            if matches!(script, Script::Configured) {
+                                selected_script = match preflight
+                                    .config
+                                    .as_ref()
+                                    .and_then(|config| config.fields.get("mode"))
+                                    .and_then(|value| value.kind.as_ref())
+                                {
+                                    Some(prost_types::value::Kind::StringValue(mode))
+                                        if mode == "whole" =>
+                                    {
+                                        Script::WholeBody
+                                    }
+                                    Some(prost_types::value::Kind::StringValue(mode))
+                                        if mode == "stream" =>
+                                    {
+                                        Script::Stream
+                                    }
+                                    _ => Script::HeadersOnly,
+                                };
+                            }
+                            if matches!(selected_script, Script::Skip | Script::InvalidSkipReason) {
+                                HttpResponseEventResult {
+                                    result: Some(
+                                        http_response_event_result::Result::PreflightDecision(
+                                            HttpResponsePreflightDecision {
+                                                decision: Some(
+                                                    http_response_preflight_decision::Decision::Skip(
+                                                        HttpResponsePreflightSkip {
+                                                            reason: if matches!(
+                                                                selected_script,
+                                                                Script::InvalidSkipReason
+                                                            ) {
+                                                                "x".repeat(
+                                                                    MAX_MIDDLEWARE_REASON_BYTES + 1,
+                                                                )
+                                                            } else {
+                                                                "not selected".into()
+                                                            },
+                                                            reason_code: "path_not_selected".into(),
+                                                            ..Default::default()
+                                                        },
+                                                    ),
+                                                ),
+                                            },
+                                        ),
+                                    ),
                                 }
-                            };
-                            HttpResponseEventResult {
+                            } else {
+                                let (body_mode, header_mutations, declared_trailer_names) =
+                                    match selected_script {
+                                        Script::HeadersOnly => (
+                                            HttpResponseBodyMode::HeadersOnly,
+                                            vec![write_header("cache-control", "private")],
+                                            Vec::new(),
+                                        ),
+                                        Script::Stream | Script::InvalidSequence => (
+                                            HttpResponseBodyMode::StreamBytes,
+                                            Vec::new(),
+                                            vec!["digest".into()],
+                                        ),
+                                        Script::HangBody
+                                        | Script::LargeStream
+                                        | Script::UndeclaredTrailer => (
+                                            HttpResponseBodyMode::StreamBytes,
+                                            Vec::new(),
+                                            Vec::new(),
+                                        ),
+                                        Script::WholeBody => (
+                                            HttpResponseBodyMode::WholeBodyBytes,
+                                            Vec::new(),
+                                            Vec::new(),
+                                        ),
+                                        Script::Configured
+                                        | Script::Skip
+                                        | Script::InvalidSkipReason => unreachable!(),
+                                    };
+                                HttpResponseEventResult {
                                 result: Some(
                                     http_response_event_result::Result::PreflightDecision(
                                         HttpResponsePreflightDecision {
@@ -1684,23 +1772,35 @@ mod tests {
                                     ),
                                 ),
                             }
+                            }
                         }
                         http_response_event::Event::Body(body) => {
+                            if matches!(selected_script, Script::HangBody) {
+                                continue;
+                            }
                             let Some(http_response_body_unit::Payload::Data(data)) = body.payload
                             else {
                                 break;
                             };
-                            let replacement = match script {
-                                Script::Stream | Script::InvalidSequence => {
-                                    data.to_ascii_uppercase()
-                                }
+                            let replacement = match selected_script {
+                                Script::Stream
+                                | Script::InvalidSequence
+                                | Script::LargeStream
+                                | Script::UndeclaredTrailer => data.to_ascii_uppercase(),
                                 Script::WholeBody => [b"whole:".as_slice(), &data].concat(),
-                                Script::HeadersOnly => break,
+                                Script::HeadersOnly
+                                | Script::Configured
+                                | Script::HangBody
+                                | Script::Skip
+                                | Script::InvalidSkipReason => break,
                             };
                             HttpResponseEventResult {
                                 result: Some(http_response_event_result::Result::BodyResult(
                                     HttpResponseBodyResult {
-                                        sequence: if matches!(script, Script::InvalidSequence) {
+                                        sequence: if matches!(
+                                            selected_script,
+                                            Script::InvalidSequence
+                                        ) {
                                             body.sequence + 1
                                         } else {
                                             body.sequence
@@ -1724,7 +1824,10 @@ mod tests {
                         http_response_event::Event::Trailers(_) => HttpResponseEventResult {
                             result: Some(http_response_event_result::Result::TrailersResult(
                                 HttpResponseTrailersResult {
-                                    trailer_mutations: if matches!(script, Script::Stream) {
+                                    trailer_mutations: if matches!(
+                                        selected_script,
+                                        Script::Stream | Script::UndeclaredTrailer
+                                    ) {
                                         vec![write_header("digest", "sha-256=:test:")]
                                     } else {
                                         Vec::new()
@@ -1777,6 +1880,24 @@ mod tests {
             order: 0,
             config: prost_types::Struct::default(),
             on_error,
+        }
+    }
+
+    fn configured_entry(name: &str, order: i32, mode: &str) -> ChainEntry {
+        ChainEntry {
+            name: name.into(),
+            implementation: "test/response".into(),
+            order,
+            config: prost_types::Struct {
+                fields: [(
+                    "mode".into(),
+                    prost_types::Value {
+                        kind: Some(prost_types::value::Kind::StringValue(mode.into())),
+                    },
+                )]
+                .into(),
+            },
+            on_error: OnError::FailClosed,
         }
     }
 
@@ -1893,6 +2014,148 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mixed_profile_chain_respects_policy_order_and_whole_body_barrier() {
+        let runner = ChainRunner::new(Arc::new(ResponseService {
+            script: Script::Configured,
+        }));
+        let entries = vec![
+            configured_entry("stream", 20, "stream"),
+            configured_entry("whole", 10, "whole"),
+        ];
+        let mut outcome = runner
+            .preflight_http_response(&entries, input(200))
+            .await
+            .expect("mixed response preflight");
+        let mut session = outcome.session.take().expect("mixed response session");
+        assert!(session.requires_whole_body());
+        assert!(
+            session
+                .push_body(b"hello".to_vec())
+                .await
+                .expect("buffer mixed response")
+                .is_empty()
+        );
+        let finish = session
+            .finish(Vec::new())
+            .await
+            .expect("finish mixed chain");
+        assert_eq!(finish.body_units, vec![b"WHOLE:HELLO".to_vec()]);
+    }
+
+    #[tokio::test]
+    async fn whole_body_overflow_obeys_fail_open_and_fail_closed() {
+        for (on_error, allowed) in [(OnError::FailOpen, true), (OnError::FailClosed, false)] {
+            let runner = ChainRunner::new(Arc::new(ResponseService {
+                script: Script::WholeBody,
+            }));
+            let mut outcome = runner
+                .preflight_http_response(&[entry(on_error)], input(200))
+                .await
+                .expect("whole-body response preflight");
+            let mut session = outcome.session.take().expect("whole-body session");
+            let original = vec![b'a'; 4097];
+            let pushed = session.push_body(original.clone()).await;
+            assert_eq!(pushed.is_ok(), allowed);
+            if allowed {
+                assert!(pushed.unwrap().is_empty());
+                let finish = session.finish(Vec::new()).await.expect("fail-open finish");
+                assert_eq!(finish.body_units, vec![original]);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn response_body_timeout_obeys_fail_open_and_fail_closed() {
+        for (on_error, allowed) in [(OnError::FailOpen, true), (OnError::FailClosed, false)] {
+            let runner = ChainRunner::new(Arc::new(ResponseService {
+                script: Script::HangBody,
+            }));
+            let mut outcome = runner
+                .preflight_http_response(&[entry(on_error)], input(200))
+                .await
+                .expect("timed response preflight");
+            let mut session = outcome.session.take().expect("timed response session");
+            let result = session.push_body(b"unchanged".to_vec()).await;
+            assert_eq!(result.is_ok(), allowed);
+            if let Ok(units) = result {
+                assert_eq!(units, vec![b"unchanged".to_vec()]);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_unit_limit_never_exceeds_platform_cap() {
+        let runner = ChainRunner::new(Arc::new(ResponseService {
+            script: Script::LargeStream,
+        }));
+        let mut outcome = runner
+            .preflight_http_response(&[entry(OnError::FailClosed)], input(200))
+            .await
+            .expect("large stream preflight");
+        let session = outcome.session.take().expect("large stream session");
+        assert_eq!(
+            session.stream_unit_limit(),
+            MAX_HTTP_RESPONSE_STREAM_UNIT_BYTES
+        );
+        session
+            .finish(Vec::new())
+            .await
+            .expect("finish large stream");
+    }
+
+    #[tokio::test]
+    async fn skip_reason_code_is_retained_and_oversized_reason_obeys_on_error() {
+        let runner = ChainRunner::new(Arc::new(ResponseService {
+            script: Script::Skip,
+        }));
+        let outcome = runner
+            .preflight_http_response(&[entry(OnError::FailClosed)], input(200))
+            .await
+            .expect("skip response preflight");
+        assert!(outcome.allowed);
+        assert!(outcome.session.is_none());
+        assert_eq!(
+            outcome.invocations[0].reason_code.as_deref(),
+            Some("path_not_selected")
+        );
+
+        for (on_error, allowed) in [(OnError::FailOpen, true), (OnError::FailClosed, false)] {
+            let runner = ChainRunner::new(Arc::new(ResponseService {
+                script: Script::InvalidSkipReason,
+            }));
+            let outcome = runner
+                .preflight_http_response(&[entry(on_error)], input(200))
+                .await
+                .expect("invalid skip response preflight");
+            assert_eq!(outcome.allowed, allowed);
+            assert!(outcome.session.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn undeclared_response_trailer_obeys_on_error() {
+        for (on_error, allowed) in [(OnError::FailOpen, true), (OnError::FailClosed, false)] {
+            let runner = ChainRunner::new(Arc::new(ResponseService {
+                script: Script::UndeclaredTrailer,
+            }));
+            let mut outcome = runner
+                .preflight_http_response(&[entry(on_error)], input(200))
+                .await
+                .expect("trailer response preflight");
+            let mut session = outcome.session.take().expect("trailer response session");
+            session
+                .push_body(b"body".to_vec())
+                .await
+                .expect("transform response body");
+            let finish = session.finish(Vec::new()).await;
+            assert_eq!(finish.is_ok(), allowed);
+            if let Ok(finish) = finish {
+                assert!(finish.trailers.is_empty());
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn invalid_sequence_obeys_fail_open_and_fail_closed() {
         for (on_error, allowed) in [(OnError::FailOpen, true), (OnError::FailClosed, false)] {
             let runner = ChainRunner::new(Arc::new(ResponseService {
@@ -1912,22 +2175,40 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn partial_response_rejects_body_mode_through_on_error() {
-        for (on_error, allowed) in [(OnError::FailOpen, true), (OnError::FailClosed, false)] {
-            let runner = ChainRunner::new(Arc::new(ResponseService {
-                script: Script::Stream,
-            }));
-            let outcome = runner
-                .preflight_http_response(&[entry(on_error)], input(206))
-                .await
-                .expect("partial response preflight");
-            assert_eq!(outcome.allowed, allowed);
-            assert!(outcome.session.is_none());
-            if !allowed {
-                assert_eq!(
-                    outcome.reason,
-                    "middleware_failed: unsupported_partial_response"
-                );
+    async fn body_inspection_restrictions_obey_fail_open_and_fail_closed() {
+        let mut cases = Vec::new();
+        cases.push(input(206));
+        for (name, value) in [
+            ("content-range", "bytes 0-3/10"),
+            ("content-type", "multipart/byteranges; boundary=test"),
+            ("cache-control", "private, no-transform"),
+            ("content-encoding", "gzip"),
+        ] {
+            let mut candidate = input(200);
+            candidate.headers.push(HttpHeader {
+                name: name.into(),
+                value: value.into(),
+            });
+            cases.push(candidate);
+        }
+        for status in [204, 304] {
+            cases.push(input(status));
+        }
+        let mut head = input(200);
+        head.target.method = "HEAD".into();
+        cases.push(head);
+
+        for candidate in cases {
+            for (on_error, allowed) in [(OnError::FailOpen, true), (OnError::FailClosed, false)] {
+                let runner = ChainRunner::new(Arc::new(ResponseService {
+                    script: Script::Stream,
+                }));
+                let outcome = runner
+                    .preflight_http_response(&[entry(on_error)], candidate.clone())
+                    .await
+                    .expect("restricted response preflight");
+                assert_eq!(outcome.allowed, allowed);
+                assert!(outcome.session.is_none());
             }
         }
     }
