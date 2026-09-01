@@ -336,6 +336,17 @@ pub trait BoundBoundary: Send {
     /// Retained by the supervisor before consuming `Bound`.
     fn network_mediation_source(&self) -> Arc<dyn NetworkMediationSource>;
 
+    /// Trusted host-side dial target for the well-known host-gateway aliases.
+    ///
+    /// Backends return this when the mediation service runs outside the
+    /// workload boundary and therefore cannot use the boundary's resolver
+    /// view. The supervisor preserves the original hostname for policy, HTTP,
+    /// and TLS while dialing this backend-provided address. Returning `None`
+    /// leaves host-gateway discovery to the supervisor's local environment.
+    fn host_gateway_ip(&self) -> Option<IpAddr> {
+        None
+    }
+
     /// Confirm standing enforcement. How a backend establishes confidence is
     /// private to that backend; confirmation fails closed.
     async fn confirm(self: Box<Self>) -> Result<Box<dyn ReadyBoundary>, BackendError>;
