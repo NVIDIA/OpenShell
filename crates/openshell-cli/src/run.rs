@@ -2820,7 +2820,7 @@ fn sandbox_template_to_json(template: &SandboxWorkloadTemplate) -> serde_json::V
                 if let Some(gpu) = &resources.gpu {
                     let value = gpu
                         .count
-                        .map_or_else(|| serde_json::json!(true), serde_json::Value::from);
+                        .map_or_else(|| serde_json::json!("default"), serde_json::Value::from);
                     resources_json.insert("gpu".to_string(), value);
                 }
                 if !resources_json.is_empty() {
@@ -8267,8 +8267,10 @@ mod tests {
         ProviderCredentialRefreshStatus, ProviderCredentialRefreshStrategy,
         ProviderCredentialTokenGrant, ProviderProfile, ProviderProfileCredential,
         ResourceRequirements, Sandbox, SandboxCondition, SandboxPhase, SandboxPolicy,
-        SandboxPolicyRevision, SandboxStatus, SandboxWorkloadTemplateProvenance, ServiceEndpoint,
-        ServiceEndpointResponse, WorkspaceMember, WorkspaceRole, datamodel::v1::ObjectMeta,
+        SandboxPolicyRevision, SandboxResources, SandboxStatus, SandboxWorkloadConfig,
+        SandboxWorkloadTemplate, SandboxWorkloadTemplateProvenance, SandboxWorkloadTemplateSpec,
+        ServiceEndpoint, ServiceEndpointResponse, WorkspaceMember, WorkspaceRole,
+        datamodel::v1::ObjectMeta,
     };
 
     #[test]
@@ -9733,7 +9735,7 @@ mod tests {
 
     #[test]
     fn sandbox_template_to_json_includes_metadata_labels_and_annotations() {
-        let template = openshell_core::proto::SandboxWorkloadTemplate {
+        let template = SandboxWorkloadTemplate {
             metadata: Some(ObjectMeta {
                 id: "template-123".to_string(),
                 name: "gpu-kata".to_string(),
@@ -9755,6 +9757,48 @@ mod tests {
 
         assert_eq!(json["labels"]["team"], "runtime");
         assert_eq!(json["annotations"]["owner"], "platform");
+    }
+
+    #[test]
+    fn sandbox_template_to_json_formats_default_gpu_like_display_output() {
+        let template = SandboxWorkloadTemplate {
+            spec: Some(SandboxWorkloadTemplateSpec {
+                workload: Some(SandboxWorkloadConfig {
+                    resources: Some(SandboxResources {
+                        gpu: Some(GpuResourceRequirements { count: None }),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let json = super::sandbox_template_to_json(&template);
+
+        assert_eq!(json["resources"]["gpu"], "default");
+    }
+
+    #[test]
+    fn sandbox_template_to_json_preserves_explicit_gpu_count_as_number() {
+        let template = SandboxWorkloadTemplate {
+            spec: Some(SandboxWorkloadTemplateSpec {
+                workload: Some(SandboxWorkloadConfig {
+                    resources: Some(SandboxResources {
+                        gpu: Some(GpuResourceRequirements { count: Some(2) }),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let json = super::sandbox_template_to_json(&template);
+
+        assert_eq!(json["resources"]["gpu"], 2);
     }
 
     #[test]
