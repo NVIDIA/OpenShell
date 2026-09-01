@@ -2227,6 +2227,58 @@ mod tests {
     }
 
     #[test]
+    fn canonicalize_advisor_ignores_endpoint_provenance_when_inferring_contract() {
+        let mut provider_endpoint = endpoint("api.example.com", 443);
+        provider_endpoint.protocol = "rest".to_string();
+        provider_endpoint.enforcement = "enforce".to_string();
+        provider_endpoint.access = "read-only".to_string();
+        provider_endpoint.provider_credentialed = true;
+
+        let mut advisor_endpoint = provider_endpoint.clone();
+        advisor_endpoint.provider_credentialed = false;
+        advisor_endpoint.advisor_proposed = true;
+
+        let mut base = SandboxPolicy::default();
+        base.network_policies.insert(
+            "existing_advisor".to_string(),
+            NetworkPolicyRule {
+                name: "existing-advisor".to_string(),
+                endpoints: vec![advisor_endpoint],
+                binaries: vec![advisor_binary("/usr/bin/curl")],
+            },
+        );
+
+        let mut effective = base.clone();
+        effective.network_policies.insert(
+            "_provider_example".to_string(),
+            NetworkPolicyRule {
+                name: "provider-example".to_string(),
+                endpoints: vec![provider_endpoint],
+                binaries: vec![binary("/usr/bin/gh")],
+            },
+        );
+
+        let incoming = NetworkPolicyRule {
+            name: "advisor_example".to_string(),
+            endpoints: vec![NetworkEndpoint {
+                host: "api.example.com".to_string(),
+                port: 443,
+                advisor_proposed: true,
+                ..Default::default()
+            }],
+            binaries: vec![advisor_binary("/usr/bin/python")],
+        };
+
+        let (rule_name, canonical) =
+            canonicalize_advisor_add_rule(&base, &effective, "advisor_example", &incoming)
+                .expect("provenance alone must not create multiple endpoint contracts");
+
+        assert_eq!(rule_name, "existing_advisor");
+        assert_eq!(canonical.endpoints[0].protocol, "rest");
+        assert_eq!(canonical.endpoints[0].access, "read-only");
+    }
+
+    #[test]
     fn canonicalize_advisor_narrows_multi_port_contract_and_keeps_overlay() {
         let mut existing_endpoint = endpoint("index.crates.io", 443);
         existing_endpoint.port = 80;
