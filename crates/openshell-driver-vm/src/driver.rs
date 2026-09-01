@@ -149,8 +149,6 @@ const OPENSHELL_HOST_GATEWAY_ALIAS: &str = "host.openshell.internal";
 const GVPROXY_HOST_LOOPBACK_ALIAS: &str = OPENSHELL_HOST_GATEWAY_ALIAS;
 const GUEST_SSH_SOCKET_PATH: &str = openshell_core::container_paths::SSH_SOCKET_PATH;
 const GUEST_TLS_CA_PATH: &str = openshell_core::container_paths::VM_GUEST_TLS_CA_PATH;
-const GUEST_TLS_CERT_PATH: &str = openshell_core::container_paths::VM_GUEST_TLS_CERT_PATH;
-const GUEST_TLS_KEY_PATH: &str = openshell_core::container_paths::VM_GUEST_TLS_KEY_PATH;
 const GUEST_SANDBOX_TOKEN_PATH: &str = openshell_core::container_paths::VM_GUEST_SANDBOX_TOKEN_PATH;
 const GUEST_INIT_DROPIN_DIR: &str = openshell_core::container_paths::VM_GUEST_INIT_DROPIN_DIR;
 /// Guest path of the driver-authored manifest enumerating which
@@ -186,8 +184,6 @@ static IMAGE_CACHE_BUILD_COUNTER: AtomicU64 = AtomicU64::new(0);
 #[derive(Debug, Clone)]
 struct VmDriverTlsPaths {
     ca: PathBuf,
-    cert: PathBuf,
-    key: PathBuf,
 }
 
 #[derive(Debug, Clone)]
@@ -312,15 +308,16 @@ impl VmDriverConfig {
     }
 
     fn tls_paths(&self) -> Result<Option<VmDriverTlsPaths>, String> {
-        let provided = [
-            self.guest_tls_ca.as_ref(),
-            self.guest_tls_cert.as_ref(),
-            self.guest_tls_key.as_ref(),
-        ];
-        if provided.iter().all(Option::is_none) {
+        if self.guest_tls_cert.is_some() || self.guest_tls_key.is_some() {
+            return Err(
+                "sandbox client certificates are no longer supported; remove OPENSHELL_VM_TLS_CERT and OPENSHELL_VM_TLS_KEY"
+                    .to_string(),
+            );
+        }
+        if self.guest_tls_ca.is_none() {
             return if self.requires_tls_materials() {
                 Err(
-                    "https:// openshell endpoint requires OPENSHELL_VM_TLS_CA, OPENSHELL_VM_TLS_CERT, and OPENSHELL_VM_TLS_KEY so sandbox VMs can authenticate to the gateway"
+                    "https:// openshell endpoint requires OPENSHELL_VM_TLS_CA so sandbox VMs can authenticate the gateway"
                         .to_string(),
                 )
             } else {
@@ -333,18 +330,7 @@ impl VmDriverConfig {
                 "OPENSHELL_VM_TLS_CA is required when TLS materials are configured".to_string(),
             );
         };
-        let Some(cert) = self.guest_tls_cert.clone() else {
-            return Err(
-                "OPENSHELL_VM_TLS_CERT is required when TLS materials are configured".to_string(),
-            );
-        };
-        let Some(key) = self.guest_tls_key.clone() else {
-            return Err(
-                "OPENSHELL_VM_TLS_KEY is required when TLS materials are configured".to_string(),
-            );
-        };
-
-        for path in [&ca, &cert, &key] {
+        for path in [&ca] {
             if !path.is_file() {
                 return Err(format!(
                     "TLS material '{}' does not exist or is not a file",
@@ -353,7 +339,7 @@ impl VmDriverConfig {
             }
         }
 
-        Ok(Some(VmDriverTlsPaths { ca, cert, key }))
+        Ok(Some(VmDriverTlsPaths { ca }))
     }
 }
 
@@ -4521,14 +4507,6 @@ fn build_guest_environment(
             openshell_core::sandbox_env::TLS_CA.to_string(),
             GUEST_TLS_CA_PATH.to_string(),
         );
-        environment.insert(
-            openshell_core::sandbox_env::TLS_CERT.to_string(),
-            GUEST_TLS_CERT_PATH.to_string(),
-        );
-        environment.insert(
-            openshell_core::sandbox_env::TLS_KEY.to_string(),
-            GUEST_TLS_KEY_PATH.to_string(),
-        );
     }
     environment.insert(
         openshell_core::sandbox_env::TELEMETRY_ENABLED.to_string(),
@@ -4888,21 +4866,13 @@ fn validate_restored_sandbox_state(
 #[derive(Debug, Clone)]
 struct GuestTlsMaterials {
     ca: Vec<u8>,
-    cert: Vec<u8>,
-    key: Vec<u8>,
 }
 
 async fn read_guest_tls_materials(paths: &VmDriverTlsPaths) -> Result<GuestTlsMaterials, String> {
     let ca = tokio::fs::read(&paths.ca)
         .await
         .map_err(|err| format!("read {}: {err}", paths.ca.display()))?;
-    let cert = tokio::fs::read(&paths.cert)
-        .await
-        .map_err(|err| format!("read {}: {err}", paths.cert.display()))?;
-    let key = tokio::fs::read(&paths.key)
-        .await
-        .map_err(|err| format!("read {}: {err}", paths.key.display()))?;
-    Ok(GuestTlsMaterials { ca, cert, key })
+    Ok(GuestTlsMaterials { ca })
 }
 
 async fn overlay_template_image_ready(path: &Path, size_bytes: u64) -> Result<bool, String> {
@@ -5062,14 +5032,7 @@ fn inject_guest_tls_materials(
         &overlay_upper_path(GUEST_TLS_CA_PATH),
         &materials.ca,
     )?;
-    write_rootfs_image_file(
-        overlay_disk,
-        &overlay_upper_path(GUEST_TLS_CERT_PATH),
-        &materials.cert,
-    )?;
-    let key_path = overlay_upper_path(GUEST_TLS_KEY_PATH);
-    write_rootfs_image_file(overlay_disk, &key_path, &materials.key)?;
-    set_rootfs_image_file_mode(overlay_disk, &key_path, 0o600)
+    Ok(())
 }
 
 fn inject_guest_sandbox_token(overlay_disk: &Path, token: &str) -> Result<(), String> {
@@ -5339,27 +5302,8 @@ fn stage_guest_tls_materials(
     let ca_path = staging_dir
         .join("upper")
         .join(GUEST_TLS_CA_PATH.trim_start_matches('/'));
-    let cert_path = staging_dir
-        .join("upper")
-        .join(GUEST_TLS_CERT_PATH.trim_start_matches('/'));
-    let key_path = staging_dir
-        .join("upper")
-        .join(GUEST_TLS_KEY_PATH.trim_start_matches('/'));
     fs::write(&ca_path, &materials.ca)
         .map_err(|err| format!("write guest TLS CA {}: {err}", ca_path.display()))?;
-    fs::write(&cert_path, &materials.cert)
-        .map_err(|err| format!("write guest TLS cert {}: {err}", cert_path.display()))?;
-    fs::write(&key_path, &materials.key)
-        .map_err(|err| format!("write guest TLS key {}: {err}", key_path.display()))?;
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-
-        fs::set_permissions(&key_path, fs::Permissions::from_mode(0o600))
-            .map_err(|err| format!("chmod guest TLS key {}: {err}", key_path.display()))?;
-    }
-
     Ok(())
 }
 
@@ -6829,8 +6773,8 @@ mod tests {
     #[test]
     fn overlay_upper_path_targets_overlay_upperdir() {
         assert_eq!(
-            overlay_upper_path(GUEST_TLS_KEY_PATH),
-            "/upper/opt/openshell/tls/tls.key"
+            overlay_upper_path(GUEST_TLS_CA_PATH),
+            "/upper/opt/openshell/tls/ca.crt"
         );
     }
 
@@ -7490,12 +7434,10 @@ mod tests {
     }
 
     #[test]
-    fn build_guest_environment_includes_tls_paths_for_https_endpoint() {
+    fn build_guest_environment_includes_only_tls_ca_for_https_endpoint() {
         let config = VmDriverConfig {
             openshell_endpoint: "https://127.0.0.1:8443".to_string(),
             guest_tls_ca: Some(PathBuf::from("/host/ca.crt")),
-            guest_tls_cert: Some(PathBuf::from("/host/tls.crt")),
-            guest_tls_key: Some(PathBuf::from("/host/tls.key")),
             ..Default::default()
         };
         let sandbox = Sandbox {
@@ -7507,8 +7449,14 @@ mod tests {
 
         let env = build_guest_environment(&sandbox, &config, None);
         assert!(env.contains(&format!("OPENSHELL_TLS_CA={GUEST_TLS_CA_PATH}")));
-        assert!(env.contains(&format!("OPENSHELL_TLS_CERT={GUEST_TLS_CERT_PATH}")));
-        assert!(env.contains(&format!("OPENSHELL_TLS_KEY={GUEST_TLS_KEY_PATH}")));
+        assert!(
+            !env.iter()
+                .any(|entry| entry.starts_with("OPENSHELL_TLS_CERT="))
+        );
+        assert!(
+            !env.iter()
+                .any(|entry| entry.starts_with("OPENSHELL_TLS_KEY="))
+        );
     }
 
     #[test]
@@ -7894,8 +7842,6 @@ mod tests {
 
         let err = read_guest_tls_materials(&VmDriverTlsPaths {
             ca: source_dir.join("ca.crt"),
-            cert: source_dir.join("tls.crt"),
-            key: source_dir.join("tls.key"),
         })
         .await
         .expect_err("missing TLS materials should fail before image injection");
@@ -7907,15 +7853,9 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn stage_guest_tls_materials_places_files_in_overlay_upper_with_private_key_mode() {
-        use std::os::unix::fs::PermissionsExt as _;
-
+    fn stage_guest_tls_materials_places_only_ca_in_overlay_upper() {
         let base = unique_temp_dir();
-        let materials = GuestTlsMaterials {
-            ca: b"ca".to_vec(),
-            cert: b"cert".to_vec(),
-            key: b"key".to_vec(),
-        };
+        let materials = GuestTlsMaterials { ca: b"ca".to_vec() };
 
         stage_guest_tls_materials(&base, &materials).expect("stage TLS materials");
 
@@ -7927,23 +7867,6 @@ mod tests {
             .unwrap(),
             b"ca"
         );
-        assert_eq!(
-            fs::read(
-                base.join("upper")
-                    .join(GUEST_TLS_CERT_PATH.trim_start_matches('/'))
-            )
-            .unwrap(),
-            b"cert"
-        );
-        let key_path = base
-            .join("upper")
-            .join(GUEST_TLS_KEY_PATH.trim_start_matches('/'));
-        assert_eq!(fs::read(&key_path).unwrap(), b"key");
-        assert_eq!(
-            fs::metadata(&key_path).unwrap().permissions().mode() & 0o777,
-            0o600
-        );
-
         let _ = std::fs::remove_dir_all(base);
     }
 

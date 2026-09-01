@@ -54,13 +54,9 @@ const VOLUME_PREFIX: &str = "openshell-sandbox-";
 const TOKEN_SECRET_PREFIX: &str = "openshell-token-";
 const PROXY_AUTH_SECRET_PREFIX: &str = "openshell-proxy-auth-";
 const TLS_CA_SECRET_PREFIX: &str = "openshell-tls-ca-";
-const TLS_CERT_SECRET_PREFIX: &str = "openshell-tls-cert-";
-const TLS_KEY_SECRET_PREFIX: &str = "openshell-tls-key-";
 
 /// Container-side mount paths for client TLS materials and the sandbox token.
 const TLS_CA_MOUNT_PATH: &str = openshell_core::driver_utils::TLS_CA_MOUNT_PATH;
-const TLS_CERT_MOUNT_PATH: &str = openshell_core::driver_utils::TLS_CERT_MOUNT_PATH;
-const TLS_KEY_MOUNT_PATH: &str = openshell_core::driver_utils::TLS_KEY_MOUNT_PATH;
 const SANDBOX_TOKEN_MOUNT_PATH: &str = openshell_core::driver_utils::SANDBOX_TOKEN_MOUNT_PATH;
 const UPSTREAM_PROXY_AUTH_MOUNT_PATH: &str =
     openshell_core::driver_utils::UPSTREAM_PROXY_AUTH_MOUNT_PATH;
@@ -176,14 +172,10 @@ pub fn proxy_auth_secret_name(sandbox_id: &str) -> String {
     format!("{PROXY_AUTH_SECRET_PREFIX}{sandbox_id}")
 }
 
-/// Build per-sandbox Podman secret names for TLS CA, cert, and key.
+/// Build the per-sandbox Podman secret name for the gateway CA.
 #[must_use]
-pub fn tls_secret_names(sandbox_id: &str) -> [String; 3] {
-    [
-        format!("{TLS_CA_SECRET_PREFIX}{sandbox_id}"),
-        format!("{TLS_CERT_SECRET_PREFIX}{sandbox_id}"),
-        format!("{TLS_KEY_SECRET_PREFIX}{sandbox_id}"),
-    ]
+pub fn tls_secret_names(sandbox_id: &str) -> [String; 1] {
+    [format!("{TLS_CA_SECRET_PREFIX}{sandbox_id}")]
 }
 
 /// Truncate a container ID to 12 characters (standard short form).
@@ -546,21 +538,11 @@ fn build_env(
         openshell_core::sandbox_env::POLICY_DNS_TRANSPARENT_TCP_CAPABILITY.into(),
     );
 
-    // 3. TLS client cert paths (when mTLS is enabled). These point to
-    //    the container-side mount paths where the cert files are
-    //    bind-mounted from the host.
+    // 3. Gateway CA path (when TLS is enabled).
     if config.tls_enabled() {
         env.insert(
             openshell_core::sandbox_env::TLS_CA.into(),
             TLS_CA_MOUNT_PATH.into(),
-        );
-        env.insert(
-            openshell_core::sandbox_env::TLS_CERT.into(),
-            TLS_CERT_MOUNT_PATH.into(),
-        );
-        env.insert(
-            openshell_core::sandbox_env::TLS_KEY.into(),
-            TLS_KEY_MOUNT_PATH.into(),
         );
     }
 
@@ -1015,7 +997,7 @@ pub fn build_container_spec_for_image(
     image_id: &str,
     oci_user: &str,
     supervisor_bin_path: Option<&Path>,
-    tls_secret_names: Option<&[String; 3]>,
+    tls_secret_names: Option<&[String; 1]>,
 ) -> Result<Value, ComputeDriverError> {
     let name = container_name(&sandbox.workspace, &sandbox.name, &sandbox.id);
     let vol = volume_name(&sandbox.id);
@@ -1216,24 +1198,10 @@ pub fn build_container_spec_for_image(
                     mode: 0o400,
                 });
             }
-            if let Some([ca, cert, key]) = tls_secret_names {
+            if let Some([ca]) = tls_secret_names {
                 secrets.push(SecretMount {
                     source: ca.clone(),
                     target: TLS_CA_MOUNT_PATH.into(),
-                    uid: 0,
-                    gid: 0,
-                    mode: 0o400,
-                });
-                secrets.push(SecretMount {
-                    source: cert.clone(),
-                    target: TLS_CERT_MOUNT_PATH.into(),
-                    uid: 0,
-                    gid: 0,
-                    mode: 0o400,
-                });
-                secrets.push(SecretMount {
-                    source: key.clone(),
-                    target: TLS_KEY_MOUNT_PATH.into(),
                     uid: 0,
                     gid: 0,
                     mode: 0o400,
@@ -1269,18 +1237,14 @@ pub fn build_container_spec_for_image(
                 destination: openshell_core::container_paths::NETNS_MOUNT_ROOT.into(),
                 options: vec!["rw".into(), "nosuid".into(), "nodev".into()],
             }];
-            // Deliver client TLS materials into the container when mTLS is
+            // Deliver the gateway CA into the container when TLS is
             // enabled. When userns remaps UIDs (auto, no-map), bind-mounted
             // host files are unreadable because the container root maps to a
             // different host UID. In that case TLS materials are delivered as
             // Podman secrets (handled in the `secrets` block above); otherwise
             // use bind mounts.
             if tls_secret_names.is_none()
-                && let (Some(ca), Some(cert), Some(key)) = (
-                    &config.guest_tls_ca,
-                    &config.guest_tls_cert,
-                    &config.guest_tls_key,
-                )
+                && let Some(ca) = &config.guest_tls_ca
             {
                 let mut ro = vec!["ro".into(), "rbind".into()];
                 if is_selinux_enabled() {
@@ -1291,18 +1255,6 @@ pub fn build_container_spec_for_image(
                     source: ca.display().to_string(),
                     destination: TLS_CA_MOUNT_PATH.into(),
                     options: ro.clone(),
-                });
-                m.push(Mount {
-                    kind: "bind".into(),
-                    source: cert.display().to_string(),
-                    destination: TLS_CERT_MOUNT_PATH.into(),
-                    options: ro.clone(),
-                });
-                m.push(Mount {
-                    kind: "bind".into(),
-                    source: key.display().to_string(),
-                    destination: TLS_KEY_MOUNT_PATH.into(),
-                    options: ro,
                 });
             }
             // Bind-mount the corporate proxy CA bundle read-only when
@@ -2896,12 +2848,10 @@ mod tests {
     }
 
     #[test]
-    fn container_spec_includes_tls_mounts_when_configured() {
+    fn container_spec_includes_only_tls_ca_when_configured() {
         let sandbox = test_sandbox("tls-id", "tls-name");
         let mut config = test_config();
         config.guest_tls_ca = Some(std::path::PathBuf::from("/host/ca.crt"));
-        config.guest_tls_cert = Some(std::path::PathBuf::from("/host/tls.crt"));
-        config.guest_tls_key = Some(std::path::PathBuf::from("/host/tls.key"));
 
         let spec = build_container_spec(&sandbox, &config);
 
@@ -2911,16 +2861,10 @@ mod tests {
             env_map.get("OPENSHELL_TLS_CA").and_then(|v| v.as_str()),
             Some("/etc/openshell/tls/client/ca.crt"),
         );
-        assert_eq!(
-            env_map.get("OPENSHELL_TLS_CERT").and_then(|v| v.as_str()),
-            Some("/etc/openshell/tls/client/tls.crt"),
-        );
-        assert_eq!(
-            env_map.get("OPENSHELL_TLS_KEY").and_then(|v| v.as_str()),
-            Some("/etc/openshell/tls/client/tls.key"),
-        );
+        assert!(env_map.get("OPENSHELL_TLS_CERT").is_none());
+        assert!(env_map.get("OPENSHELL_TLS_KEY").is_none());
 
-        // Verify bind mounts exist for all three cert files.
+        // Verify only the CA bind mount exists.
         let mounts = spec["mounts"]
             .as_array()
             .expect("mounts should be an array");
@@ -2933,14 +2877,7 @@ mod tests {
             bind_dests.contains(&"/etc/openshell/tls/client/ca.crt"),
             "should bind-mount CA cert"
         );
-        assert!(
-            bind_dests.contains(&"/etc/openshell/tls/client/tls.crt"),
-            "should bind-mount client cert"
-        );
-        assert!(
-            bind_dests.contains(&"/etc/openshell/tls/client/tls.key"),
-            "should bind-mount client key"
-        );
+        assert_eq!(bind_dests.len(), 1);
 
         // Verify SELinux relabel option is present iff SELinux is enabled.
         let tls_binds: Vec<&Value> = mounts

@@ -156,10 +156,6 @@ pub struct GatewayFileSection {
     pub sa_token_ttl_secs: Option<i64>,
     #[serde(default)]
     pub guest_tls_ca: Option<PathBuf>,
-    #[serde(default)]
-    pub guest_tls_cert: Option<PathBuf>,
-    #[serde(default)]
-    pub guest_tls_key: Option<PathBuf>,
 
     // ── TLS toggle ───────────────────────────────────────────────────────
     /// When `true`, the gateway listens on plaintext HTTP and ignores any
@@ -471,23 +467,14 @@ fn inheritable_keys(driver_name: &str) -> &'static [&'static str] {
             "supervisor_image",
             "host_gateway_ip",
             "guest_tls_ca",
-            "guest_tls_cert",
-            "guest_tls_key",
         ],
         Some(ComputeDriverKind::Podman) => &[
             "default_image",
             "supervisor_image",
             "host_gateway_ip",
             "guest_tls_ca",
-            "guest_tls_cert",
-            "guest_tls_key",
         ],
-        Some(ComputeDriverKind::Vm) => &[
-            "default_image",
-            "guest_tls_ca",
-            "guest_tls_cert",
-            "guest_tls_key",
-        ],
+        Some(ComputeDriverKind::Vm) => &["default_image", "guest_tls_ca"],
         // MXC reads its own settings from the driver config table and has no
         // gateway-inherited required fields.
         Some(ComputeDriverKind::Mxc) | None => &[],
@@ -505,8 +492,6 @@ fn gateway_inherited_value(g: &GatewayFileSection, key: &str) -> Option<toml::Va
         "enable_user_namespaces" => g.enable_user_namespaces.map(toml::Value::Boolean),
         "sa_token_ttl_secs" => g.sa_token_ttl_secs.map(toml::Value::Integer),
         "guest_tls_ca" => g.guest_tls_ca.as_deref().map(path_value),
-        "guest_tls_cert" => g.guest_tls_cert.as_deref().map(path_value),
-        "guest_tls_key" => g.guest_tls_key.as_deref().map(path_value),
         _ => None,
     }
 }

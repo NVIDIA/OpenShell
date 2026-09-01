@@ -80,8 +80,6 @@ const WATCH_POLL_MAX_BACKOFF: Duration = Duration::from_secs(30);
 
 const SUPERVISOR_MOUNT_PATH: &str = openshell_core::driver_utils::SUPERVISOR_CONTAINER_BINARY;
 const TLS_CA_MOUNT_PATH: &str = openshell_core::driver_utils::TLS_CA_MOUNT_PATH;
-const TLS_CERT_MOUNT_PATH: &str = openshell_core::driver_utils::TLS_CERT_MOUNT_PATH;
-const TLS_KEY_MOUNT_PATH: &str = openshell_core::driver_utils::TLS_KEY_MOUNT_PATH;
 const SANDBOX_TOKEN_MOUNT_PATH: &str = openshell_core::driver_utils::SANDBOX_TOKEN_MOUNT_PATH;
 const SUPERVISOR_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 const HOST_OPENSHELL_INTERNAL: &str = "host.openshell.internal";
@@ -139,13 +137,15 @@ pub struct DockerComputeConfig {
     /// the full resolution order.
     pub supervisor_image: Option<String>,
 
-    /// Host-side CA certificate for Docker sandbox mTLS.
+    /// Host-side CA certificate for sandbox-to-gateway TLS.
     pub guest_tls_ca: Option<PathBuf>,
 
-    /// Host-side client certificate for Docker sandbox mTLS.
+    /// Deprecated. Sandboxes authenticate with bearer tokens and must not
+    /// receive a user client certificate.
     pub guest_tls_cert: Option<PathBuf>,
 
-    /// Host-side private key for Docker sandbox mTLS.
+    /// Deprecated. Sandboxes authenticate with bearer tokens and must not
+    /// receive a user client private key.
     pub guest_tls_key: Option<PathBuf>,
 
     /// Docker bridge network that sandbox containers join.
@@ -193,8 +193,6 @@ impl Default for DockerComputeConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DockerGuestTlsPaths {
     pub(crate) ca: PathBuf,
-    pub(crate) cert: PathBuf,
-    pub(crate) key: PathBuf,
 }
 
 #[derive(Debug, Clone)]
@@ -2667,12 +2665,6 @@ fn build_binds(
     )];
     if let Some(tls) = &config.guest_tls {
         binds.push(format!("{}:{}:ro,z", tls.ca.display(), TLS_CA_MOUNT_PATH));
-        binds.push(format!(
-            "{}:{}:ro,z",
-            tls.cert.display(),
-            TLS_CERT_MOUNT_PATH
-        ));
-        binds.push(format!("{}:{}:ro,z", tls.key.display(), TLS_KEY_MOUNT_PATH));
     }
     if sandbox
         .spec
@@ -2857,14 +2849,6 @@ fn build_environment_for_oci_user(
         environment.insert(
             openshell_core::sandbox_env::TLS_CA.to_string(),
             TLS_CA_MOUNT_PATH.to_string(),
-        );
-        environment.insert(
-            openshell_core::sandbox_env::TLS_CERT.to_string(),
-            TLS_CERT_MOUNT_PATH.to_string(),
-        );
-        environment.insert(
-            openshell_core::sandbox_env::TLS_KEY.to_string(),
-            TLS_KEY_MOUNT_PATH.to_string(),
         );
     }
 
@@ -4035,8 +4019,6 @@ fn canonicalize_existing_file(path: &Path, description: &str) -> CoreResult<Path
 
 fn docker_guest_tls_configured(docker_config: &DockerComputeConfig) -> bool {
     docker_config.guest_tls_ca.is_some()
-        && docker_config.guest_tls_cert.is_some()
-        && docker_config.guest_tls_key.is_some()
 }
 
 pub(crate) fn docker_guest_tls_paths(
@@ -4046,24 +4028,25 @@ pub(crate) fn docker_guest_tls_paths(
         || docker_config.guest_tls_cert.is_some()
         || docker_config.guest_tls_key.is_some();
 
+    if docker_config.guest_tls_cert.is_some() || docker_config.guest_tls_key.is_some() {
+        return Err(Error::config(
+            "guest_tls_cert and guest_tls_key are no longer supported; sandboxes authenticate to the gateway with bearer tokens",
+        ));
+    }
+
     if !docker_config.grpc_endpoint.starts_with("https://") {
         if tls_flags_provided {
             return Err(Error::config(format!(
-                "guest_tls_ca/guest_tls_cert/guest_tls_key were provided but grpc_endpoint is '{}'; TLS materials require an https:// endpoint",
+                "guest_tls_ca was provided but grpc_endpoint is '{}'; TLS materials require an https:// endpoint",
                 docker_config.grpc_endpoint,
             )));
         }
         return Ok(None);
     }
 
-    let provided = [
-        docker_config.guest_tls_ca.as_ref(),
-        docker_config.guest_tls_cert.as_ref(),
-        docker_config.guest_tls_key.as_ref(),
-    ];
-    if provided.iter().all(Option::is_none) {
+    if docker_config.guest_tls_ca.is_none() {
         return Err(Error::config(
-            "docker compute driver requires guest_tls_ca, guest_tls_cert, and guest_tls_key when grpc_endpoint uses https://",
+            "docker compute driver requires guest_tls_ca when grpc_endpoint uses https://",
         ));
     }
 
@@ -4072,21 +4055,8 @@ pub(crate) fn docker_guest_tls_paths(
             "guest_tls_ca is required when Docker sandbox TLS materials are configured",
         ));
     };
-    let Some(cert) = docker_config.guest_tls_cert.clone() else {
-        return Err(Error::config(
-            "guest_tls_cert is required when Docker sandbox TLS materials are configured",
-        ));
-    };
-    let Some(key) = docker_config.guest_tls_key.clone() else {
-        return Err(Error::config(
-            "guest_tls_key is required when Docker sandbox TLS materials are configured",
-        ));
-    };
-
     Ok(Some(DockerGuestTlsPaths {
         ca: canonicalize_existing_file(&ca, "docker TLS CA certificate")?,
-        cert: canonicalize_existing_file(&cert, "docker TLS client certificate")?,
-        key: canonicalize_existing_file(&key, "docker TLS client private key")?,
     }))
 }
 

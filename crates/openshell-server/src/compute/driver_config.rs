@@ -24,13 +24,11 @@ use std::path::PathBuf;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GuestTlsPaths {
     ca: PathBuf,
-    cert: PathBuf,
-    key: PathBuf,
 }
 
 impl GuestTlsPaths {
-    pub(crate) fn as_paths(&self) -> (&std::path::Path, &std::path::Path, &std::path::Path) {
-        (&self.ca, &self.cert, &self.key)
+    pub(crate) fn as_path(&self) -> &std::path::Path {
+        &self.ca
     }
 }
 
@@ -38,8 +36,6 @@ impl From<&LocalTlsPaths> for GuestTlsPaths {
     fn from(paths: &LocalTlsPaths) -> Self {
         Self {
             ca: paths.ca.clone(),
-            cert: paths.client_cert.clone(),
-            key: paths.client_key.clone(),
         }
     }
 }

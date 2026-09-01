@@ -43,7 +43,7 @@ const CLIENT_TLS_DIR: &str = openshell_core::container_paths::CLIENT_TLS_DIR;
 #[cfg(target_os = "linux")]
 const SIDECAR_CLIENT_TLS_SUBDIR: &str = "client";
 #[cfg(target_os = "linux")]
-const CLIENT_TLS_FILES: [&str; 3] = ["ca.crt", "tls.crt", "tls.key"];
+const CLIENT_TLS_FILES: [&str; 1] = ["ca.crt"];
 #[cfg(target_os = "linux")]
 const SIDECAR_STATE_DIR_MODE: u32 = 0o2775;
 #[cfg(target_os = "linux")]
@@ -396,7 +396,7 @@ fn copy_sidecar_client_tls_if_present(
         let source = source_dir.join(file_name);
         if !source.exists() {
             return Err(miette::miette!(
-                "client TLS source file is missing: {}",
+                "gateway CA source file is missing: {}",
                 source.display()
             ));
         }
@@ -405,14 +405,14 @@ fn copy_sidecar_client_tls_if_present(
             std::fs::remove_file(&dest)
                 .into_diagnostic()
                 .wrap_err_with(|| {
-                    format!("failed to remove stale client TLS file {}", dest.display())
+                    format!("failed to remove stale gateway CA file {}", dest.display())
                 })?;
         }
         std::fs::copy(&source, &dest)
             .into_diagnostic()
             .wrap_err_with(|| {
                 format!(
-                    "failed to copy client TLS file {} to {}",
+                    "failed to copy gateway CA file {} to {}",
                     source.display(),
                     dest.display()
                 )
@@ -422,13 +422,13 @@ fn copy_sidecar_client_tls_if_present(
         std::fs::set_permissions(&dest, perms)
             .into_diagnostic()
             .wrap_err_with(|| {
-                format!("failed to chmod copied client TLS file {}", dest.display())
+                format!("failed to chmod copied gateway CA file {}", dest.display())
             })?;
         chown(&dest, Some(Uid::from_raw(uid)), Some(Gid::from_raw(gid)))
             .into_diagnostic()
             .wrap_err_with(|| {
                 format!(
-                    "failed to chown copied client TLS file {} to {uid}:{gid}",
+                    "failed to chown copied gateway CA file {} to {uid}:{gid}",
                     dest.display()
                 )
             })?;
@@ -824,6 +824,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn sidecar_tls_modes_preserve_proxy_owned_parent_and_private_client_dir() {
+        assert_eq!(CLIENT_TLS_FILES, ["ca.crt"]);
         assert_eq!(SIDECAR_TLS_DIR_MODE, 0o755);
         assert_eq!(SIDECAR_TLS_STAGING_DIR_MODE, 0o700);
         assert_eq!(SIDECAR_CLIENT_TLS_DIR_MODE, 0o750);

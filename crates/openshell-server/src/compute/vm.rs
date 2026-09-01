@@ -175,8 +175,6 @@ impl Default for VmComputeConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VmGuestTlsPaths {
     pub ca: PathBuf,
-    pub cert: PathBuf,
-    pub key: PathBuf,
 }
 
 /// Resolve the `openshell-driver-vm` binary path.
@@ -409,14 +407,14 @@ pub fn compute_driver_guest_tls_paths(
         return Ok(None);
     }
 
-    let provided = [
-        vm_config.guest_tls_ca.as_ref(),
-        vm_config.guest_tls_cert.as_ref(),
-        vm_config.guest_tls_key.as_ref(),
-    ];
-    if provided.iter().all(Option::is_none) {
+    if vm_config.guest_tls_cert.is_some() || vm_config.guest_tls_key.is_some() {
         return Err(Error::config(
-            "vm compute driver requires guest_tls_ca, guest_tls_cert, and guest_tls_key when grpc_endpoint uses https://",
+            "guest_tls_cert and guest_tls_key are no longer supported; sandboxes authenticate to the gateway with bearer tokens",
+        ));
+    }
+    if vm_config.guest_tls_ca.is_none() {
+        return Err(Error::config(
+            "vm compute driver requires guest_tls_ca when grpc_endpoint uses https://",
         ));
     }
 
@@ -425,18 +423,7 @@ pub fn compute_driver_guest_tls_paths(
             "guest_tls_ca is required when VM guest TLS materials are configured",
         ));
     };
-    let Some(cert) = vm_config.guest_tls_cert.clone() else {
-        return Err(Error::config(
-            "guest_tls_cert is required when VM guest TLS materials are configured",
-        ));
-    };
-    let Some(key) = vm_config.guest_tls_key.clone() else {
-        return Err(Error::config(
-            "guest_tls_key is required when VM guest TLS materials are configured",
-        ));
-    };
-
-    for path in [&ca, &cert, &key] {
+    for path in [&ca] {
         if !path.is_file() {
             return Err(Error::config(format!(
                 "vm guest TLS material '{}' does not exist or is not a file",
@@ -445,7 +432,7 @@ pub fn compute_driver_guest_tls_paths(
         }
     }
 
-    Ok(Some(VmGuestTlsPaths { ca, cert, key }))
+    Ok(Some(VmGuestTlsPaths { ca }))
 }
 
 /// Launch the VM compute-driver subprocess, wait for its UDS to come up,
@@ -501,8 +488,6 @@ pub async fn spawn(
         .arg(vm_config.overlay_disk_mib.to_string());
     if let Some(tls) = guest_tls_paths {
         command.arg("--guest-tls-ca").arg(tls.ca);
-        command.arg("--guest-tls-cert").arg(tls.cert);
-        command.arg("--guest-tls-key").arg(tls.key);
     }
 
     let mut child = command.spawn().map_err(|e| {
@@ -735,47 +720,26 @@ mod tests {
         };
 
         let err = compute_driver_guest_tls_paths(&vm_config)
-            .expect_err("https vm endpoints should require an explicit guest client bundle");
-        assert!(
-            err.to_string()
-                .contains("guest_tls_ca, guest_tls_cert, and guest_tls_key")
-        );
+            .expect_err("https vm endpoints should require an explicit gateway CA");
+        assert!(err.to_string().contains("guest_tls_ca"));
     }
 
     #[test]
-    fn vm_compute_driver_tls_uses_guest_bundle_not_gateway_server_identity() {
+    fn vm_compute_driver_tls_uses_only_gateway_ca() {
         let dir = tempdir().unwrap();
-        let server_cert = dir.path().join("server.crt");
-        let server_key = dir.path().join("server.key");
         let guest_ca = dir.path().join("guest-ca.crt");
-        let guest_cert = dir.path().join("guest.crt");
-        let guest_key = dir.path().join("guest.key");
-        for path in [
-            &server_cert,
-            &server_key,
-            &guest_ca,
-            &guest_cert,
-            &guest_key,
-        ] {
-            std::fs::write(path, path.display().to_string()).unwrap();
-        }
+        std::fs::write(&guest_ca, guest_ca.display().to_string()).unwrap();
 
         let vm_config = VmComputeConfig {
             grpc_endpoint: "https://gateway.internal:8443".to_string(),
             guest_tls_ca: Some(guest_ca.clone()),
-            guest_tls_cert: Some(guest_cert.clone()),
-            guest_tls_key: Some(guest_key.clone()),
             ..Default::default()
         };
 
         let guest_paths = compute_driver_guest_tls_paths(&vm_config)
             .unwrap()
-            .expect("https vm endpoints should pass an explicit guest client bundle");
+            .expect("https vm endpoints should pass an explicit gateway CA");
         assert_eq!(guest_paths.ca, guest_ca);
-        assert_eq!(guest_paths.cert, guest_cert);
-        assert_eq!(guest_paths.key, guest_key);
-        assert_ne!(guest_paths.cert, server_cert);
-        assert_ne!(guest_paths.key, server_key);
     }
 
     #[test]

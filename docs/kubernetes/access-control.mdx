@@ -15,7 +15,7 @@ The OpenShell gateway supports two access-control models for human callers on Ku
 | OIDC (recommended) | Production deployments. Integrates with an existing identity provider, supports role-based access control, and gives each user their own identity without distributing certificates. |
 | Reverse-proxy auth termination | An access proxy (Cloudflare Access, ngrok, corporate SSO) authenticates callers in front of the gateway. The gateway trusts the proxy and skips its own client-cert check. |
 
-The Helm chart always generates mTLS certificates at install time. The gateway uses them for transport-layer security regardless of which access-control model you choose. The client bundle in the `openshell-client-tls` secret is used internally by sandbox supervisors, not for granting access to individual users.
+The Helm chart generates a gateway TLS certificate and a user client certificate at install time. Sandbox Pods project only `ca.crt` from the client Secret so they can authenticate the gateway; the client certificate and private key are not exposed to sandboxes. Supervisors authenticate their RPCs with gateway-minted sandbox JWTs.
 
 For how the CLI resolves gateways and stores credentials, refer to [Gateway Authentication](/reference/gateway-auth).
 

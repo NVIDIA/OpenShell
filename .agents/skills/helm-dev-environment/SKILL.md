@@ -72,7 +72,7 @@ mise run helm:skaffold:run
 mise run helm:skaffold:run:sidecar
 ```
 
-**Supervisor sidecar topology with TLS/mTLS enabled** (build once and leave running):
+**Supervisor sidecar topology with gateway TLS and CLI mTLS enabled** (build once and leave running):
 ```bash
 mise run helm:skaffold:run:sidecar-mtls
 ```
@@ -85,8 +85,9 @@ Binary-aware policy mode runs that sidecar as UID 0 with `SYS_PTRACE` and
 must be at least `1000` and distinct from the workload UID. The
 sidecar-mTLS profile reuses `ci/values-sidecar.yaml` and restores
 `server.disableTls=false` inline for Skaffold. The `pkiInitJob` hook (a pre-install
-Job that runs `openshell-gateway generate-certs`) generates mTLS secrets on first
-install. The default Skaffold values export gateway and Kubernetes-driver traces to
+Job that runs `openshell-gateway generate-certs`) generates the gateway and CLI
+TLS secrets on first install. Sandbox pods project only `ca.crt`; they use bearer
+tokens, not the CLI client certificate, for gateway authentication. The default Skaffold values export gateway and Kubernetes-driver traces to
 the collector service installed by `helm:k3s:create`. Envoy Gateway opt-in; see the
 Optional Add-ons section below.
 

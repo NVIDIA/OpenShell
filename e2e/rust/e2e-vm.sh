@@ -289,8 +289,6 @@ grpc_endpoint = "https://host.openshell.internal:${HOST_PORT}"
 driver_dir = "${DRIVER_DIR}"
 state_dir = "${RUN_STATE_DIR}"
 guest_tls_ca = "${PKI_DIR}/ca.crt"
-guest_tls_cert = "${PKI_DIR}/client/tls.crt"
-guest_tls_key = "${PKI_DIR}/client/tls.key"
 EOF
 fi
 

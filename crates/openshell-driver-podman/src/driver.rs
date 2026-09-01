@@ -225,13 +225,9 @@ async fn cleanup_sandbox_proxy_auth_secret(client: &PodmanClient, secret_name: &
 async fn create_tls_secrets(
     client: &PodmanClient,
     config: &PodmanComputeConfig,
-    names: &[String; 3],
+    names: &[String; 1],
 ) -> Result<(), ComputeDriverError> {
-    let paths = [
-        config.guest_tls_ca.as_deref(),
-        config.guest_tls_cert.as_deref(),
-        config.guest_tls_key.as_deref(),
-    ];
+    let paths = [config.guest_tls_ca.as_deref()];
     let mut created = 0usize;
     for (name, path) in names.iter().zip(paths.iter()) {
         let Some(p) = path else { continue };
@@ -256,7 +252,7 @@ async fn create_tls_secrets(
     Ok(())
 }
 
-async fn cleanup_tls_secrets(client: &PodmanClient, names: &[String; 3]) {
+async fn cleanup_tls_secrets(client: &PodmanClient, names: &[String]) {
     for name in names {
         if let Err(err) = client.remove_secret(name).await {
             warn!(
@@ -2090,8 +2086,6 @@ mod tests {
         let mut cfg = PodmanComputeConfig {
             gateway_port: 8080,
             guest_tls_ca: Some(PathBuf::from("/tls/ca.crt")),
-            guest_tls_cert: Some(PathBuf::from("/tls/tls.crt")),
-            guest_tls_key: Some(PathBuf::from("/tls/tls.key")),
             ..PodmanComputeConfig::default()
         };
         if cfg.grpc_endpoint.is_empty() {
@@ -2102,26 +2096,14 @@ mod tests {
     }
 
     #[test]
-    fn partial_tls_config_returns_error() {
+    fn ca_only_tls_config_is_enabled() {
         let cfg = PodmanComputeConfig {
             gateway_port: 8080,
             guest_tls_ca: Some(PathBuf::from("/tls/ca.crt")),
-            // guest_tls_cert and guest_tls_key not set — incomplete TLS config.
             ..PodmanComputeConfig::default()
         };
-        assert!(!cfg.tls_enabled());
-        let err = cfg
-            .validate_tls_config()
-            .expect_err("partial TLS config should be rejected");
-        let msg = err.to_string();
-        assert!(
-            msg.contains("OPENSHELL_PODMAN_TLS_CERT"),
-            "error should name the missing cert: {msg}"
-        );
-        assert!(
-            msg.contains("OPENSHELL_PODMAN_TLS_KEY"),
-            "error should name the missing key: {msg}"
-        );
+        assert!(cfg.tls_enabled());
+        cfg.validate_tls_config().expect("CA-only TLS is valid");
     }
 
     #[test]

@@ -3050,16 +3050,6 @@ fn supervisor_sidecar_env(
             openshell_core::sandbox_env::TLS_CA,
             &format!("{SIDECAR_CLIENT_TLS_MOUNT_PATH}/ca.crt"),
         );
-        upsert_env(
-            &mut env,
-            openshell_core::sandbox_env::TLS_CERT,
-            &format!("{SIDECAR_CLIENT_TLS_MOUNT_PATH}/tls.crt"),
-        );
-        upsert_env(
-            &mut env,
-            openshell_core::sandbox_env::TLS_KEY,
-            &format!("{SIDECAR_CLIENT_TLS_MOUNT_PATH}/tls.key"),
-        );
     }
     copy_log_level_env(&mut env, template_environment, spec_environment);
     upsert_env(
@@ -3955,7 +3945,7 @@ fn sandbox_template_to_k8s_with_validated_config(
     }
     container.insert("securityContext".to_string(), security_context);
 
-    // Mount client TLS secret for mTLS to the server. Gateway identity uses
+    // Mount the gateway CA for server-authenticated TLS. Sandbox identity uses
     // the projected ServiceAccount bootstrap token. Provider token grants may
     // additionally mount the SPIFFE Workload API socket.
     let mut volume_mounts: Vec<serde_json::Value> = Vec::new();
@@ -4000,7 +3990,7 @@ fn sandbox_template_to_k8s_with_validated_config(
         serde_json::Value::Array(vec![serde_json::Value::Object(container)]),
     );
 
-    // Add TLS secret volume. Combined mode uses mode 0400 because the
+    // Add a CA-only view of the TLS secret. Combined mode uses mode 0400 because the
     // supervisor starts as root and drops privileges before running workload
     // children. Sidecar mode keeps the process supervisor non-root, so it uses
     // pod fsGroup + 0440 to preserve gateway session and SSH control behavior.
@@ -4014,7 +4004,11 @@ fn sandbox_template_to_k8s_with_validated_config(
             "name": CLIENT_TLS_VOLUME_NAME,
             "secret": {
                 "secretName": params.client_tls_secret_name,
-                "defaultMode": client_tls_default_mode
+                "defaultMode": client_tls_default_mode,
+                "items": [{
+                    "key": "ca.crt",
+                    "path": "ca.crt"
+                }]
             }
         }));
     }
@@ -4380,23 +4374,13 @@ fn apply_required_env(
             ssh_socket_path,
         );
     }
-    // TLS cert paths for sandbox-to-server mTLS. Only set when TLS is enabled
-    // and the client TLS secret is mounted into the sandbox pod.
+    // Gateway CA path for sandbox-to-server TLS. Sandbox identity is carried
+    // by the projected ServiceAccount token and gateway-minted JWT.
     if tls_enabled {
         upsert_env(
             env,
             openshell_core::sandbox_env::TLS_CA,
             "/etc/openshell-tls/client/ca.crt",
-        );
-        upsert_env(
-            env,
-            openshell_core::sandbox_env::TLS_CERT,
-            "/etc/openshell-tls/client/tls.crt",
-        );
-        upsert_env(
-            env,
-            openshell_core::sandbox_env::TLS_KEY,
-            "/etc/openshell-tls/client/tls.key",
         );
     }
     // Projected ServiceAccount token written by kubelet (see the volume
@@ -6894,22 +6878,13 @@ mod tests {
         };
 
         let tls_ca = get_env("OPENSHELL_TLS_CA").expect("OPENSHELL_TLS_CA must be set");
-        let tls_cert = get_env("OPENSHELL_TLS_CERT").expect("OPENSHELL_TLS_CERT must be set");
-        let tls_key = get_env("OPENSHELL_TLS_KEY").expect("OPENSHELL_TLS_KEY must be set");
-
-        // All TLS paths must be within the mount path
+        // The CA is the only TLS material exposed to the sandbox.
         assert!(
             tls_ca.starts_with(TLS_MOUNT_PATH),
             "OPENSHELL_TLS_CA path '{tls_ca}' must start with mount path '{TLS_MOUNT_PATH}'"
         );
-        assert!(
-            tls_cert.starts_with(TLS_MOUNT_PATH),
-            "OPENSHELL_TLS_CERT path '{tls_cert}' must start with mount path '{TLS_MOUNT_PATH}'"
-        );
-        assert!(
-            tls_key.starts_with(TLS_MOUNT_PATH),
-            "OPENSHELL_TLS_KEY path '{tls_key}' must start with mount path '{TLS_MOUNT_PATH}'"
-        );
+        assert!(get_env("OPENSHELL_TLS_CERT").is_none());
+        assert!(get_env("OPENSHELL_TLS_KEY").is_none());
     }
 
     #[test]
@@ -7298,7 +7273,7 @@ mod tests {
     }
 
     #[test]
-    fn tls_secret_volume_uses_restrictive_default_mode() {
+    fn tls_secret_volume_projects_only_gateway_ca() {
         let template = SandboxTemplate::default();
         let pod_template = {
             let params = SandboxPodParams {
@@ -7324,7 +7299,11 @@ mod tests {
         assert_eq!(
             tls_vol["secret"]["defaultMode"],
             256, // 0o400
-            "TLS secret volume must use mode 0400 to prevent sandbox user from reading the private key"
+            "TLS CA volume should remain read-only"
+        );
+        assert_eq!(
+            tls_vol["secret"]["items"],
+            serde_json::json!([{"key": "ca.crt", "path": "ca.crt"}])
         );
     }
 
