@@ -208,6 +208,9 @@ backend is already absent (`deleted = false`), the request removes gateway state
 synchronously. Sandbox row removal remains bound to the stable ID and resource
 version. Settings retain their existing best-effort name-based cleanup; SSH
 sessions, indexes, and watch/log buses are cleaned after confirmed removal.
+`DeleteSandbox` acknowledges that workflow; `GetSandbox` returning `NOT_FOUND`
+is the terminal, durably absent condition for clients that need to sequence
+dependent operations.
 
 The request acquires both locks before starting owned work, so cancellation
 while queued does not leave a delete armed. After that commitment point, the

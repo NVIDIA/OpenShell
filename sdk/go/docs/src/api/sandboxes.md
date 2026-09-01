@@ -47,11 +47,19 @@ sandboxes, err := client.Sandboxes().List(ctx, "default", v1.ListOptions{
 
 ## Delete
 
-Deletes a sandbox by name.
+Requests sandbox deletion by name. `Delete` returns when the gateway accepts
+the request; it does not wait for durable absence. Call `WaitDeleted` when the
+next operation depends on terminal deletion.
 
 ```go
 err := client.Sandboxes().Delete(ctx, "default", "my-sandbox")
+if err == nil {
+    err = client.Sandboxes().WaitDeleted(ctx, "default", "my-sandbox")
+}
 ```
+
+Use a context deadline to bound the wait and `WaitOptions{PollInterval: ...}`
+to customize polling.
 
 ## AttachProvider
 

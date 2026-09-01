@@ -24,21 +24,22 @@ import (
 
 type mockSandboxServer struct {
 	pb.UnimplementedOpenShellServer
-	mu                 sync.Mutex
-	sandboxes          map[string]*pb.Sandbox
-	providers          map[string][]*dm.Provider
-	createErr          error
-	getErr             error
-	listErr            error
-	deleteErr          error
-	attachErr          error
-	detachErr          error
-	listProvErr        error
-	watchEvents        []*pb.SandboxStreamEvent
-	watchErr           error
-	watchPostEventsErr error
-	watchKeepOpen      chan struct{}           // if non-nil, WatchSandbox blocks after sending events until closed
-	watchRequest       *pb.WatchSandboxRequest // recorded request
+	mu                   sync.Mutex
+	sandboxes            map[string]*pb.Sandbox
+	providers            map[string][]*dm.Provider
+	createErr            error
+	getErr               error
+	listErr              error
+	deleteErr            error
+	deleteLeavesDeleting bool
+	attachErr            error
+	detachErr            error
+	listProvErr          error
+	watchEvents          []*pb.SandboxStreamEvent
+	watchErr             error
+	watchPostEventsErr   error
+	watchKeepOpen        chan struct{}           // if non-nil, WatchSandbox blocks after sending events until closed
+	watchRequest         *pb.WatchSandboxRequest // recorded request
 
 	// GetLogs fields
 	getLogsResp    *pb.GetSandboxLogsResponse
@@ -118,6 +119,14 @@ func (s *mockSandboxServer) DeleteSandbox(_ context.Context, req *pb.DeleteSandb
 	_, ok := s.sandboxes[req.GetName()]
 	if !ok {
 		return nil, status.Errorf(codes.NotFound, "sandbox %q not found", req.GetName())
+	}
+	if s.deleteLeavesDeleting {
+		sb := s.sandboxes[req.GetName()]
+		if sb.Status == nil {
+			sb.Status = &pb.SandboxStatus{}
+		}
+		sb.Status.Phase = pb.SandboxPhase_SANDBOX_PHASE_DELETING
+		return &pb.DeleteSandboxResponse{Deleted: true}, nil
 	}
 	delete(s.sandboxes, req.GetName())
 	return &pb.DeleteSandboxResponse{Deleted: true}, nil
@@ -391,6 +400,108 @@ func TestSandboxDelete_NotFound(t *testing.T) {
 
 	require.Error(t, err)
 	assert.True(t, IsNotFound(err))
+}
+
+func TestSandboxDelete_AcknowledgesWhileDeleting(t *testing.T) {
+	mock := newMockSandboxServer()
+	mock.deleteLeavesDeleting = true
+	mock.sandboxes["async-delete"] = &pb.Sandbox{
+		Metadata: &dm.ObjectMeta{Name: "async-delete"},
+		Status:   &pb.SandboxStatus{Phase: pb.SandboxPhase_SANDBOX_PHASE_READY},
+	}
+	client, cleanup := setupSandboxTest(t, mock)
+	defer cleanup()
+
+	err := client.Delete(context.Background(), "default", "async-delete")
+
+	require.NoError(t, err)
+	assert.Equal(t, pb.SandboxPhase_SANDBOX_PHASE_DELETING, mock.sandboxes["async-delete"].GetStatus().GetPhase())
+}
+
+func TestSandboxWaitDeleted_AlreadyAbsent(t *testing.T) {
+	mock := newMockSandboxServer()
+	client, cleanup := setupSandboxTest(t, mock)
+	defer cleanup()
+
+	require.NoError(t, client.WaitDeleted(context.Background(), "default", "absent"))
+}
+
+func TestSandboxWaitDeleted_BecomesAbsent(t *testing.T) {
+	mock := newMockSandboxServer()
+	mock.sandboxes["pending-delete"] = &pb.Sandbox{
+		Metadata: &dm.ObjectMeta{Name: "pending-delete"},
+		Status:   &pb.SandboxStatus{Phase: pb.SandboxPhase_SANDBOX_PHASE_DELETING},
+	}
+	client, cleanup := setupSandboxTest(t, mock)
+	defer cleanup()
+
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		mock.mu.Lock()
+		delete(mock.sandboxes, "pending-delete")
+		mock.mu.Unlock()
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	require.NoError(t, client.WaitDeleted(ctx, "default", "pending-delete", WaitOptions{PollInterval: 20 * time.Millisecond}))
+}
+
+func TestSandboxWaitDeleted_ContextTimeoutAndCancel(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		context    func() (context.Context, context.CancelFunc)
+		assertCode func(*testing.T, error)
+	}{
+		{
+			name: "timeout",
+			context: func() (context.Context, context.CancelFunc) {
+				return context.WithTimeout(context.Background(), 75*time.Millisecond)
+			},
+			assertCode: func(t *testing.T, err error) { assert.True(t, IsDeadlineExceeded(err)) },
+		},
+		{
+			name: "cancel",
+			context: func() (context.Context, context.CancelFunc) {
+				ctx, cancel := context.WithCancel(context.Background())
+				go func() {
+					time.Sleep(50 * time.Millisecond)
+					cancel()
+				}()
+				return ctx, cancel
+			},
+			assertCode: func(t *testing.T, err error) { assert.True(t, IsCancelled(err)) },
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			mock := newMockSandboxServer()
+			mock.sandboxes["stuck-delete"] = &pb.Sandbox{
+				Metadata: &dm.ObjectMeta{Name: "stuck-delete"},
+				Status:   &pb.SandboxStatus{Phase: pb.SandboxPhase_SANDBOX_PHASE_DELETING},
+			}
+			client, cleanup := setupSandboxTest(t, mock)
+			defer cleanup()
+			ctx, cancel := test.context()
+			defer cancel()
+
+			err := client.WaitDeleted(ctx, "default", "stuck-delete", WaitOptions{PollInterval: 20 * time.Millisecond})
+
+			require.Error(t, err)
+			test.assertCode(t, err)
+		})
+	}
+}
+
+func TestSandboxWaitDeleted_UnexpectedGetError(t *testing.T) {
+	mock := newMockSandboxServer()
+	mock.getErr = status.Error(codes.Unavailable, "lookup unavailable")
+	client, cleanup := setupSandboxTest(t, mock)
+	defer cleanup()
+
+	err := client.WaitDeleted(context.Background(), "default", "pending-delete")
+
+	require.Error(t, err)
+	assert.True(t, IsUnavailable(err))
 }
 
 func TestSandboxStopAndStart(t *testing.T) {

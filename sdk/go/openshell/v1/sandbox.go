@@ -58,12 +58,15 @@ type SandboxInterface interface {
 	List(ctx context.Context, workspace string, opts ...ListOptions) ([]*Sandbox, error)
 	Stop(ctx context.Context, workspace, name string) (*Sandbox, error)
 	Start(ctx context.Context, workspace, name string) (*Sandbox, error)
+	// Delete acknowledges that sandbox deletion was accepted; it does not wait
+	// for the sandbox to become durably absent.
 	Delete(ctx context.Context, workspace, name string) error
 	AttachProvider(ctx context.Context, workspace, sandboxName, providerName string, expectedResourceVersion uint64) (*AttachProviderResult, error)
 	DetachProvider(ctx context.Context, workspace, sandboxName, providerName string, expectedResourceVersion uint64) (*DetachProviderResult, error)
 	ListProviders(ctx context.Context, workspace, sandboxName string) ([]*Provider, error)
 	WaitReady(ctx context.Context, workspace, name string, opts ...WaitOptions) (*Sandbox, error)
 	WaitStopped(ctx context.Context, workspace, name string, opts ...WaitOptions) (*Sandbox, error)
+	WaitDeleted(ctx context.Context, workspace, name string, opts ...WaitOptions) error
 	Watch(ctx context.Context, workspace, name string, opts ...WatchOptions) (WatchInterface[*Sandbox], error)
 	GetLogs(ctx context.Context, workspace, sandboxName string, opts ...LogOption) (*LogResult, error)
 }

@@ -532,6 +532,15 @@ Deleting a sandbox stops all processes, releases resources, and purges injected 
 openshell sandbox delete my-sandbox
 ```
 
+The CLI waits until the sandbox is durably absent before it reports success, so
+you can safely compose deletion with operations such as workspace deletion. Use
+`--wait=false` to return after the gateway accepts the asynchronous request.
+Set `--timeout <seconds>` with a positive value to override the terminal wait
+timeout for each sandbox; otherwise the CLI uses
+`OPENSHELL_LIFECYCLE_TIMEOUT`, which defaults to 300 seconds. A timeout returns
+an error while deletion continues asynchronously. The timeout is ignored when
+`--wait=false`.
+
 ## Sandbox Lifecycle
 
 Every sandbox moves through a defined set of phases:

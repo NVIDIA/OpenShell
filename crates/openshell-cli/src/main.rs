@@ -11,6 +11,7 @@ use owo_colors::OwoColorize;
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use openshell_bootstrap::{
     edge_token::load_edge_token, get_gateway_metadata, list_gateways, load_active_gateway,
@@ -1542,6 +1543,22 @@ enum SandboxCommands {
         /// Delete all sandboxes.
         #[arg(long, conflicts_with = "names")]
         all: bool,
+
+        /// Wait for each sandbox to reach terminal deletion.
+        ///
+        /// Pass `--wait=false` to return after the gateway accepts deletion.
+        #[arg(
+            long,
+            default_value_t = true,
+            default_missing_value = "true",
+            num_args = 0..=1,
+            action = clap::ArgAction::Set,
+        )]
+        wait: bool,
+
+        /// Positive seconds to wait for each sandbox to reach terminal deletion.
+        #[arg(long, value_name = "SECONDS", value_parser = clap::value_parser!(u64).range(1..))]
+        timeout: Option<u64>,
     },
 
     /// Stop a sandbox while preserving its workspace.
@@ -3205,7 +3222,12 @@ async fn run_async() -> Result<()> {
                             )
                             .await?;
                         }
-                        SandboxCommands::Delete { names, all } => {
+                        SandboxCommands::Delete {
+                            names,
+                            all,
+                            wait,
+                            timeout,
+                        } => {
                             run::sandbox_delete(
                                 endpoint,
                                 &names,
@@ -3213,6 +3235,10 @@ async fn run_async() -> Result<()> {
                                 &cli.workspace,
                                 &tls,
                                 &ctx.name,
+                                run::SandboxDeleteOptions {
+                                    wait,
+                                    timeout: timeout.map(Duration::from_secs),
+                                },
                             )
                             .await?;
                         }
@@ -4562,6 +4588,82 @@ mod tests {
                 command: Some(SandboxCommands::Start { name: None }),
             })
         ));
+    }
+
+    #[test]
+    fn sandbox_delete_waits_by_default_and_accepts_wait_options() {
+        let default_delete = Cli::try_parse_from(["openshell", "sandbox", "delete", "demo"])
+            .expect("sandbox delete should parse");
+        assert!(matches!(
+            default_delete.command,
+            Some(Commands::Sandbox {
+                command: Some(SandboxCommands::Delete {
+                    wait: true,
+                    timeout: None,
+                    ..
+                })
+            })
+        ));
+
+        let async_delete =
+            Cli::try_parse_from(["openshell", "sandbox", "delete", "demo", "--wait=false"])
+                .expect("sandbox delete --wait=false should parse");
+        assert!(matches!(
+            async_delete.command,
+            Some(Commands::Sandbox {
+                command: Some(SandboxCommands::Delete { wait: false, .. })
+            })
+        ));
+
+        let explicit_wait =
+            Cli::try_parse_from(["openshell", "sandbox", "delete", "demo", "--wait"])
+                .expect("sandbox delete --wait should parse");
+        assert!(matches!(
+            explicit_wait.command,
+            Some(Commands::Sandbox {
+                command: Some(SandboxCommands::Delete { wait: true, .. })
+            })
+        ));
+
+        let timeout =
+            Cli::try_parse_from(["openshell", "sandbox", "delete", "demo", "--timeout", "42"])
+                .expect("sandbox delete --timeout should parse");
+        assert!(matches!(
+            timeout.command,
+            Some(Commands::Sandbox {
+                command: Some(SandboxCommands::Delete {
+                    wait: true,
+                    timeout: Some(42),
+                    ..
+                })
+            })
+        ));
+
+        let asynchronous = Cli::try_parse_from([
+            "openshell",
+            "sandbox",
+            "delete",
+            "demo",
+            "--wait=false",
+            "--timeout",
+            "42",
+        ])
+        .expect("--wait=false should override the timeout");
+        assert!(matches!(
+            asynchronous.command,
+            Some(Commands::Sandbox {
+                command: Some(SandboxCommands::Delete {
+                    wait: false,
+                    timeout: Some(42),
+                    ..
+                })
+            })
+        ));
+        assert!(
+            Cli::try_parse_from(["openshell", "sandbox", "delete", "demo", "--timeout", "0",])
+                .is_err(),
+            "--timeout must be positive"
+        );
     }
 
     #[test]

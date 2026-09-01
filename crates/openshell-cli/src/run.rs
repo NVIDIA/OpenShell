@@ -366,7 +366,17 @@ async fn finalize_sandbox_create_session(
     }
 
     let names = [sandbox_name.to_string()];
-    if let Err(err) = sandbox_delete(server, &names, false, workspace, tls, gateway).await {
+    if let Err(err) = sandbox_delete(
+        server,
+        &names,
+        false,
+        workspace,
+        tls,
+        gateway,
+        SandboxDeleteOptions::default(),
+    )
+    .await
+    {
         if let Ok(exit_code) = session_result.as_ref() {
             return Err(miette::miette!(
                 "sandbox command exited with status {exit_code}, but ephemeral cleanup failed: {err}"
@@ -2443,6 +2453,24 @@ fn format_provider_attachment_table(providers: &[Provider], color: bool) -> Stri
     output
 }
 
+/// Controls whether sandbox deletion waits for durable absence.
+#[derive(Debug, Clone, Copy)]
+pub struct SandboxDeleteOptions {
+    /// Wait for terminal absence after deletion is acknowledged.
+    pub wait: bool,
+    /// Override the per-sandbox lifecycle timeout. The environment/default applies when unset.
+    pub timeout: Option<Duration>,
+}
+
+impl Default for SandboxDeleteOptions {
+    fn default() -> Self {
+        Self {
+            wait: true,
+            timeout: None,
+        }
+    }
+}
+
 /// Delete a sandbox by name, or all sandboxes when `all` is true.
 pub async fn sandbox_delete(
     server: &str,
@@ -2451,6 +2479,7 @@ pub async fn sandbox_delete(
     workspace: &str,
     tls: &TlsOptions,
     gateway: &str,
+    options: SandboxDeleteOptions,
 ) -> Result<()> {
     let mut client = grpc_client(server, tls).await?;
 
@@ -2506,16 +2535,89 @@ pub async fn sandbox_delete(
             Err(status) => return Err(status).into_diagnostic(),
         };
 
-        let deleted = response.into_inner().deleted;
-        if deleted {
-            clear_last_sandbox_if_matches(gateway, workspace, name);
-            println!("{} Deleted sandbox {name}", "✓".green().bold());
+        let deletion_pending = response.into_inner().deleted;
+        clear_last_sandbox_if_matches(gateway, workspace, name);
+
+        if !options.wait && deletion_pending {
+            println!(
+                "{} Deletion requested for sandbox {name}",
+                "✓".green().bold()
+            );
         } else {
-            println!("{} Sandbox {name} not found", "!".yellow());
+            if deletion_pending {
+                wait_for_sandbox_deleted(&mut client, name, workspace, options.timeout).await?;
+            }
+            println!("{} Deleted sandbox {name}", "✓".green().bold());
         }
     }
 
     Ok(())
+}
+
+fn lifecycle_timeout(explicit: Option<Duration>) -> Duration {
+    explicit.unwrap_or_else(|| {
+        Duration::from_secs(
+            std::env::var("OPENSHELL_LIFECYCLE_TIMEOUT")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(300),
+        )
+    })
+}
+
+async fn wait_for_sandbox_deleted(
+    client: &mut crate::tls::GrpcClient,
+    name: &str,
+    workspace: &str,
+    timeout_override: Option<Duration>,
+) -> Result<()> {
+    const INITIAL_POLL_INTERVAL: Duration = Duration::from_millis(100);
+    const MAX_POLL_INTERVAL: Duration = Duration::from_secs(2);
+
+    let timeout = lifecycle_timeout(timeout_override);
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .ok_or_else(|| miette!("sandbox deletion timeout is too large"))?;
+    let timeout_error = || {
+        miette!(
+            "timed out after {}s waiting for sandbox {name} deletion to complete; deletion continues asynchronously",
+            timeout.as_secs()
+        )
+    };
+    let mut poll_interval = INITIAL_POLL_INTERVAL;
+
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(timeout_error());
+        }
+
+        match tokio::time::timeout(
+            remaining,
+            client.get_sandbox(GetSandboxRequest {
+                name: name.to_string(),
+                workspace: workspace.to_string(),
+            }),
+        )
+        .await
+        {
+            Ok(Ok(_)) => {}
+            Ok(Err(status)) if status.code() == Code::NotFound => return Ok(()),
+            Ok(Err(status)) => {
+                return Err(miette!(
+                    "failed to verify deletion of sandbox {name}: {status}"
+                ));
+            }
+            Err(_) => return Err(timeout_error()),
+        }
+
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(timeout_error());
+        }
+        tokio::time::sleep(poll_interval.min(remaining)).await;
+        poll_interval = poll_interval.saturating_mul(2).min(MAX_POLL_INTERVAL);
+    }
 }
 
 /// Stop a sandbox while retaining its persistent workspace.
@@ -2588,12 +2690,7 @@ async fn wait_for_lifecycle_phase(
         return Err(miette!("{detail} while waiting for {target:?}"));
     }
 
-    let timeout = Duration::from_secs(
-        std::env::var("OPENSHELL_LIFECYCLE_TIMEOUT")
-            .ok()
-            .and_then(|value| value.parse().ok())
-            .unwrap_or(300),
-    );
+    let timeout = lifecycle_timeout(None);
     let sandbox_id = sandbox.object_id().to_string();
     let mut stream = client
         .watch_sandbox(WatchSandboxRequest {
