@@ -96,6 +96,31 @@ jobs:
       checkout-ref: ${{ inputs.tag || github.ref }}
     secrets: inherit
 
+  build-conformance:
+    needs: compute-versions
+    permissions:
+      contents: read
+    strategy:
+      matrix:
+        include:
+          - triple: x86_64-unknown-linux-musl
+            runner: linux-amd64-cpu8
+            dev_shell: .#devShells.x86_64-linux.musl
+          - triple: aarch64-unknown-linux-musl
+            runner: linux-arm64-cpu8
+            dev_shell: .#devShells.aarch64-linux.musl
+    uses: ./.github/workflows/build-binaries.yml
+    with:
+      package: openshell-conformance-cli
+      binary: openshell-conformance
+      artifact-name: openshell-conformance-${{ matrix.triple }}
+      triple: ${{ matrix.triple }}
+      runner: ${{ matrix.runner }}
+      dev-shell: ${{ matrix.dev_shell }}
+      cargo-version: ${{ needs.compute-versions.outputs.cargo_version }}
+      checkout-ref: ${{ inputs.tag || github.ref }}
+    secrets: inherit
+
   build-gateway:
     needs: compute-versions
     permissions:
@@ -165,7 +190,7 @@ jobs:
     secrets: inherit
 
   docker-e2e:
-    needs: [compute-versions, build-cli, build-gateway, build-supervisor-image]
+    needs: [compute-versions, build-cli, build-conformance, build-gateway, build-supervisor-image]
     permissions:
       actions: read
       contents: read
@@ -175,9 +200,10 @@ jobs:
       image-tag: ${{ needs.compute-versions.outputs.source_sha }}
       checkout-ref: ${{ inputs.tag || github.ref }}
       runner: linux-arm64-cpu8
+      conformance-artifact-prefix: openshell-conformance
 
   podman-e2e:
-    needs: [compute-versions, build-cli, build-gateway, build-supervisor-image]
+    needs: [compute-versions, build-cli, build-conformance, build-gateway, build-supervisor-image]
     permissions:
       actions: read
       contents: read
@@ -186,9 +212,10 @@ jobs:
     with:
       image-tag: ${{ needs.compute-versions.outputs.source_sha }}
       checkout-ref: ${{ inputs.tag || github.ref }}
+      conformance-artifact-prefix: openshell-conformance
 
   vm-e2e:
-    needs: [compute-versions, build-cli, build-gateway, build-vm-driver]
+    needs: [compute-versions, build-cli, build-conformance, build-gateway, build-vm-driver]
     permissions:
       actions: read
       contents: read
@@ -196,6 +223,7 @@ jobs:
     uses: ./.github/workflows/e2e-vm-test.yml
     with:
       checkout-ref: ${{ inputs.tag || github.ref }}
+      conformance-artifact-prefix: openshell-conformance
 
   tag-ghcr-release:
     name: Tag GHCR Images
