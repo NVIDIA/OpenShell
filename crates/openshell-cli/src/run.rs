@@ -2454,12 +2454,21 @@ fn format_provider_attachment_table(providers: &[Provider], color: bool) -> Stri
 }
 
 /// Controls whether sandbox deletion waits for durable absence.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy)]
 pub struct SandboxDeleteOptions {
-    /// Return after the gateway acknowledges an asynchronous delete.
-    pub no_wait: bool,
+    /// Wait for terminal absence after deletion is acknowledged.
+    pub wait: bool,
     /// Override the per-sandbox lifecycle timeout. The environment/default applies when unset.
     pub timeout: Option<Duration>,
+}
+
+impl Default for SandboxDeleteOptions {
+    fn default() -> Self {
+        Self {
+            wait: true,
+            timeout: None,
+        }
+    }
 }
 
 /// Delete a sandbox by name, or all sandboxes when `all` is true.
@@ -2529,7 +2538,7 @@ pub async fn sandbox_delete(
         let deletion_pending = response.into_inner().deleted;
         clear_last_sandbox_if_matches(gateway, workspace, name);
 
-        if options.no_wait && deletion_pending {
+        if !options.wait && deletion_pending {
             println!(
                 "{} Deletion requested for sandbox {name}",
                 "✓".green().bold()

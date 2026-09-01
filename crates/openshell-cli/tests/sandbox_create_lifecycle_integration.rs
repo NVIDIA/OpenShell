@@ -1251,7 +1251,7 @@ async fn sandbox_delete_waits_for_terminal_absence() {
         &test_tls(&server),
         "openshell",
         run::SandboxDeleteOptions {
-            no_wait: false,
+            wait: true,
             timeout: Some(Duration::from_secs(2)),
         },
     )
@@ -1269,7 +1269,7 @@ async fn sandbox_delete_waits_for_terminal_absence() {
 }
 
 #[tokio::test]
-async fn sandbox_delete_no_wait_returns_without_polling() {
+async fn sandbox_delete_wait_false_returns_without_polling() {
     let server = run_server().await;
     let xdg_dir = tempfile::tempdir().unwrap();
     let fake_ssh_dir = tempfile::tempdir().unwrap();
@@ -1288,12 +1288,12 @@ async fn sandbox_delete_no_wait_returns_without_polling() {
         &test_tls(&server),
         "openshell",
         run::SandboxDeleteOptions {
-            no_wait: true,
-            timeout: None,
+            wait: false,
+            timeout: Some(Duration::from_secs(1)),
         },
     )
     .await
-    .expect("--no-wait behavior should return after acknowledgment");
+    .expect("--wait=false behavior should return after acknowledgment");
 
     assert_eq!(
         server
@@ -1325,7 +1325,7 @@ async fn sandbox_delete_reports_timeout_and_unexpected_lookup_errors() {
         &test_tls(&server),
         "openshell",
         run::SandboxDeleteOptions {
-            no_wait: false,
+            wait: true,
             timeout: Some(Duration::from_millis(150)),
         },
     )
@@ -1350,7 +1350,7 @@ async fn sandbox_delete_reports_timeout_and_unexpected_lookup_errors() {
         &test_tls(&server),
         "openshell",
         run::SandboxDeleteOptions {
-            no_wait: false,
+            wait: true,
             timeout: Some(Duration::from_secs(1)),
         },
     )
