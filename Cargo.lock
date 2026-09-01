@@ -3965,6 +3965,7 @@ dependencies = [
  "base64 0.22.1",
  "futures",
  "openshell-core",
+ "openshell-ocsf",
  "openshell-policy",
  "serde",
  "serde_json",
@@ -3976,6 +3977,7 @@ dependencies = [
  "tonic",
  "tracing",
  "uuid",
+ "windows",
 ]
 
 [[package]]
@@ -4351,6 +4353,7 @@ dependencies = [
  "tower 0.5.3",
  "tower-http 0.6.8",
  "tracing",
+ "tracing-appender",
  "tracing-opentelemetry",
  "tracing-subscriber",
  "url",
