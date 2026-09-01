@@ -120,6 +120,10 @@ export interface SandboxFromTemplateSpec {
   templateName: string;
   labels?: Record<string, string>;
   providers?: string[];
+  /** Exact canonical command. Empty selects the gateway scratch shell. */
+  command?: string[];
+  /** Allocate a retained pseudo-terminal for the canonical command. */
+  tty?: boolean;
   /**
    * Create-time sandbox policy (the safety boundary). The named workload
    * template supplies runtime workload fields.
@@ -765,6 +769,8 @@ export class SandboxClient {
         workspace: spec.workspace ?? '',
         spec: {
           providers: spec.providers ?? [],
+          command: spec.command ?? [],
+          tty: spec.tty ?? false,
           policy: spec.policy,
         },
         workloadTemplateName: spec.templateName,

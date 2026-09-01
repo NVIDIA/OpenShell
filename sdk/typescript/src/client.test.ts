@@ -281,6 +281,8 @@ describe('create', () => {
       spec?: {
         policy?: { version?: number };
         providers?: string[];
+        command?: string[];
+        tty?: boolean;
         template?: { image?: string };
       };
     } = {};
@@ -296,6 +298,8 @@ describe('create', () => {
       templateName: 'gpu-kata',
       labels: { team: 'runtime' },
       providers: ['github'],
+      command: ['/opt/worker', '--serve'],
+      tty: true,
       policy: { version: 1, networkPolicies: {} },
     });
 
@@ -304,6 +308,8 @@ describe('create', () => {
     expect(created.workspace).toBe('staging');
     expect(created.labels).toEqual({ team: 'runtime' });
     expect(created.spec?.providers).toEqual(['github']);
+    expect(created.spec?.command).toEqual(['/opt/worker', '--serve']);
+    expect(created.spec?.tty).toBe(true);
     expect(created.spec?.policy?.version).toBe(1);
     expect(created.spec?.template).toBeUndefined();
     expect(ref.workspace).toBe('staging');
