@@ -17,6 +17,7 @@ from typing import Any, cast
 import pytest
 
 import openshell.sandbox as sandbox_module
+from openshell import raw
 from openshell._proto import openshell_pb2
 from openshell.sandbox import (
     _OIDC_TOKEN_EXPIRY_GRACE_SECONDS,
@@ -435,6 +436,47 @@ def _client_with_fake_stub(stub: object) -> SandboxClient:
     client._timeout = 30.0
     client._stub = cast("Any", stub)
     return client
+
+
+def test_raw_exposes_the_authenticated_generated_stub() -> None:
+    stub = object()
+    client = _client_with_fake_stub(stub)
+
+    assert client.raw is stub
+
+
+def test_raw_stub_covers_every_gateway_rpc() -> None:
+    client = SandboxClient("127.0.0.1:1")
+    try:
+        service = raw.openshell_pb2.DESCRIPTOR.services_by_name["OpenShell"]
+        missing = [
+            method.name
+            for method in service.methods
+            if not hasattr(client.raw, method.name)
+        ]
+        assert missing == []
+    finally:
+        client.close()
+
+
+def test_channel_exposes_the_authenticated_transport() -> None:
+    channel = object()
+    client = _client_with_fake_stub(object())
+    client._channel = cast("Any", channel)
+
+    assert client.channel is channel
+
+
+def test_raw_exports_gateway_wire_types() -> None:
+    request = raw.openshell_pb2.UpdateProviderRequest(workspace="example")
+    provider = raw.datamodel_pb2.Provider(type="example")
+    config_request = raw.sandbox_pb2.GetSandboxConfigRequest()
+
+    assert request.workspace == "example"
+    assert provider.type == "example"
+    assert config_request is not None
+    assert raw.InferenceStub is not None
+    assert raw.OpenShellStub is not None
 
 
 def test_exec_sends_stdin_payload() -> None:

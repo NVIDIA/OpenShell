@@ -574,6 +574,28 @@ class SandboxClient:
             )
         self._stub = openshell_pb2_grpc.OpenShellStub(self._channel)
 
+    @property
+    def raw(self) -> openshell_pb2_grpc.OpenShellStub:
+        """Generated client for every OpenShell gateway RPC.
+
+        This is the uncurated protobuf API. Request and response types are
+        available from :mod:`openshell.raw`. Calls reuse this client's channel,
+        including its TLS and bearer-token configuration. Unless overridden by
+        the caller, generated methods do not inherit this client's default
+        timeout.
+        """
+        return self._stub
+
+    @property
+    def channel(self) -> grpc.Channel:
+        """Authenticated channel for constructing additional generated clients.
+
+        The channel is owned by this client and closes when :meth:`close` is
+        called. Generated service clients are available from
+        :mod:`openshell.raw`.
+        """
+        return self._channel
+
     @classmethod
     def from_active_cluster(
         cls,
