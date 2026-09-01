@@ -1,7 +1,7 @@
 # Triage Duty Playbook — Working Draft
 
-**Duty period:** 2026-08-19 to 2026-09-01  
-**Owner:**  
+**Duty period:** 2026-08-19 to 2026-09-01
+**Owner:**
 **Status:** Discovery
 
 ## Goal
@@ -34,7 +34,7 @@ Define a semi-automated, agent-assisted triage practice that reliably identifies
 - [x] Team-internal Slack design/engineering context — [channel C0AR6QP0CKH](https://nvidia.enterprise.slack.com/archives/C0AR6QP0CKH)
 - [ ] Other:
 
-**Decision:** Include the named internal/customer Slack channel as a monitored intake source, use the team-internal design/engineering Slack channel as supporting evidence, and report newly opened GitHub issues without `state:triage-needed` as a separate intake-gap category.  
+**Decision:** Include the named internal/customer Slack channel as a monitored intake source, use the team-internal design/engineering Slack channel as supporting evidence, and report newly opened GitHub issues without `state:triage-needed` as a separate intake-gap category.
 **Rationale:** Internal users and customers ask questions in the first channel; unresolved questions may reveal support work, bugs, documentation gaps, or feature requests. The design/engineering channel supplies decisions and constraints relevant to candidate work items, but is not itself a direct-question queue. Unlabelled new issues identify gaps in the current reporting and routing process without forcing ad-hoc triage outside the normal queue.
 
 **Unlabelled-issue rule:** The queue review lists newly opened, unlabelled issues separately. The agent may recommend adding `state:triage-needed` when an issue is open, substantive, lacks a triage marker, and is not an obvious duplicate, spam, security disclosure, or already-routed roadmap item. Treat roadmap/accepted labels, milestones, Project membership, and explicit maintainer assignment/scheduling comments as routing signals. Issues created by maintainers or core contributors are also excluded because they may intentionally bypass the label. The on-duty engineer decides whether to apply the label so that an eligible community issue enters the standard triage queue on a subsequent run.
@@ -82,7 +82,7 @@ Define a semi-automated, agent-assisted triage practice that reliably identifies
 - [ ] Dedicated GitHub issue or Discussion
 - [ ] Other:
 
-**Decision:** Deferred. For the initial queue-processing iteration, use a local-only checkpoint log.  
+**Decision:** Deferred. For the initial queue-processing iteration, use a local-only checkpoint log.
 **Required properties (when revisited):** readable by the incoming owner, easy to update, links to source items, records owner and next action.
 
 ### Local queue checkpoint (initial iteration)
