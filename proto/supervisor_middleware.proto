@@ -151,7 +151,7 @@ message HttpResponseEvent {
     // Final normalized response trailers, including an empty trailer set.
     HttpResponseTrailers trailers = 4;
     // Best-effort terminal notification for this stage stream.
-    HttpResponseSessionEnd session_end = 5;
+    MiddlewareSessionEnd session_end = 5;
   }
 }
 
@@ -362,35 +362,66 @@ message HttpResponseTrailersResult {
   map<string, string> metadata = 5;
 }
 
-// Why OpenShell is ending an HTTP response middleware stream.
-enum HttpResponseSessionEndReason {
+// Why OpenShell is ending an opened middleware stage stream. This enum is a
+// stable lifecycle classification shared by every streaming middleware
+// protocol. Protocol-specific information belongs in MiddlewareSessionEnd.
+enum MiddlewareSessionEndReason {
   // Invalid or unavailable terminal reason.
-  HTTP_RESPONSE_SESSION_END_REASON_UNSPECIFIED = 0;
-  // The response stage completed normally.
-  HTTP_RESPONSE_SESSION_END_REASON_NORMAL = 1;
-  // The stage voluntarily declined inspection during preflight.
-  HTTP_RESPONSE_SESSION_END_REASON_STAGE_SKIPPED = 2;
-  // The sandbox disconnected before response delivery completed.
-  HTTP_RESPONSE_SESSION_END_REASON_CLIENT_DISCONNECT = 3;
-  // The upstream response failed before delivery completed.
-  HTTP_RESPONSE_SESSION_END_REASON_UPSTREAM_ERROR = 4;
+  MIDDLEWARE_SESSION_END_REASON_UNSPECIFIED = 0;
+  // The evaluated interaction completed normally.
+  MIDDLEWARE_SESSION_END_REASON_NORMAL = 1;
+  // A downstream or upstream peer disconnected before processing completed.
+  MIDDLEWARE_SESSION_END_REASON_PEER_DISCONNECT = 2;
+  // A policy reload replaced the active middleware chain.
+  MIDDLEWARE_SESSION_END_REASON_POLICY_RELOAD = 3;
+  // A middleware stage authoritatively denied the operation.
+  MIDDLEWARE_SESSION_END_REASON_MIDDLEWARE_DENIAL = 4;
   // This or another selected middleware stage failed.
-  HTTP_RESPONSE_SESSION_END_REASON_MIDDLEWARE_FAILURE = 5;
-  // A policy reload replaced the response chain.
-  HTTP_RESPONSE_SESSION_END_REASON_POLICY_RELOAD = 6;
-  // OpenShell cancelled response evaluation for another lifecycle reason.
-  HTTP_RESPONSE_SESSION_END_REASON_CANCELLATION = 7;
-  // The middleware exchanged an invalid event or result.
-  HTTP_RESPONSE_SESSION_END_REASON_PROTOCOL_ERROR = 8;
+  MIDDLEWARE_SESSION_END_REASON_MIDDLEWARE_FAILURE = 5;
+  // A proxied or middleware protocol contract was violated. Producers set
+  // protocol_error to identify the violated contract.
+  MIDDLEWARE_SESSION_END_REASON_PROTOCOL_ERROR = 6;
+  // OpenShell cancelled middleware evaluation for another lifecycle reason.
+  MIDDLEWARE_SESSION_END_REASON_CANCELLATION = 7;
+  // The upstream operation failed or was rejected before completion.
+  MIDDLEWARE_SESSION_END_REASON_UPSTREAM_FAILURE = 8;
+  // Network policy denied the operation.
+  MIDDLEWARE_SESSION_END_REASON_POLICY_DENIAL = 9;
+  // The middleware stage voluntarily declined inspection during preflight.
+  // This is a successful stage-local outcome, not a cancellation or denial.
+  MIDDLEWARE_SESSION_END_REASON_STAGE_SKIPPED = 10;
 }
 
-// HttpResponseSessionEnd is OpenShell's best-effort terminal notification for
-// one opened stage stream. A stage receives at most one such notification and
-// does not return a result.
-message HttpResponseSessionEnd {
-  // Reason OpenShell is ending the stage stream.
-  HttpResponseSessionEndReason reason = 1;
+// MiddlewareSessionEnd is OpenShell's best-effort terminal notification for
+// one opened stage stream. A stage receives at most one and does not return a
+// result. The reason remains meaningful when protocol_error is absent or its
+// domain is unknown to an older consumer.
+message MiddlewareSessionEnd {
+  // Stable lifecycle classification. Producers never send UNSPECIFIED.
+  MiddlewareSessionEndReason reason = 1;
+  // Structured detail set exactly when reason is PROTOCOL_ERROR. Consumers
+  // treat absent or unrecognized detail as a generic protocol error.
+  MiddlewareSessionProtocolError protocol_error = 2;
 }
+
+// MiddlewareSessionProtocolError identifies the contract violated by a
+// protocol error. OpenShell adds typed domains as it supports more protocols.
+message MiddlewareSessionProtocolError {
+  oneof domain {
+    // The proxied WebSocket traffic violated the WebSocket protocol.
+    WebSocketProtocolError web_socket = 1;
+    // The middleware event/result exchange violated the OpenShell protocol.
+    MiddlewareExchangeProtocolError middleware_exchange = 2;
+  }
+}
+
+// WebSocketProtocolError identifies a WebSocket protocol violation. Stable,
+// actionable subcategories may be added later.
+message WebSocketProtocolError {}
+
+// MiddlewareExchangeProtocolError identifies an invalid middleware
+// event/result exchange. Stable, actionable subcategories may be added later.
+message MiddlewareExchangeProtocolError {}
 
 // Supervisor operation selected for middleware evaluation.
 enum SupervisorMiddlewareOperation {
@@ -407,24 +438,6 @@ enum SupervisorMiddlewarePhase {
   SUPERVISOR_MIDDLEWARE_PHASE_PRE_RETURN = 2;
 }
 
-// Why OpenShell is ending a middleware stream.
-enum WebSocketSessionEndReason {
-  WEB_SOCKET_SESSION_END_REASON_UNSPECIFIED = 0;
-  WEB_SOCKET_SESSION_END_REASON_NORMAL_CLOSE = 1;
-  WEB_SOCKET_SESSION_END_REASON_PEER_DISCONNECT = 2;
-  WEB_SOCKET_SESSION_END_REASON_POLICY_RELOAD = 3;
-  WEB_SOCKET_SESSION_END_REASON_MIDDLEWARE_DENIAL = 4;
-  WEB_SOCKET_SESSION_END_REASON_MIDDLEWARE_FAILURE = 5;
-  WEB_SOCKET_SESSION_END_REASON_PROTOCOL_ERROR = 6;
-  WEB_SOCKET_SESSION_END_REASON_CANCELLATION = 7;
-  WEB_SOCKET_SESSION_END_REASON_UPSTREAM_REJECTED = 8;
-  WEB_SOCKET_SESSION_END_REASON_POLICY_DENIAL = 9;
-  // The middleware stage voluntarily declined inspection during preflight.
-  // This is a successful stage-local outcome, not a cancellation or denial of
-  // the WebSocket upgrade.
-  WEB_SOCKET_SESSION_END_REASON_STAGE_SKIPPED = 10;
-}
-
 // WebSocketSessionEvent is one ordered event in a stage-local stream.
 // Message sequence numbers identify logical messages session-wide. A stage
 // receives a strictly increasing subset of those numbers; gaps are valid when
@@ -434,7 +447,7 @@ message WebSocketSessionEvent {
     WebSocketPreflight preflight = 1;
     WebSocketSessionStart session_start = 2;
     WebSocketMessage message = 3;
-    WebSocketSessionEnd session_end = 4;
+    MiddlewareSessionEnd session_end = 4;
   }
 }
 
@@ -473,12 +486,6 @@ message WebSocketMessage {
     string text = 2;
     bytes binary = 3;
   }
-}
-
-// WebSocketSessionEnd is OpenShell's best-effort terminal notification for one
-// opened stage stream. A stage receives at most one such notification.
-message WebSocketSessionEnd {
-  WebSocketSessionEndReason reason = 1;
 }
 
 // WebSocketPreflightAction is the service's one-time scoping decision.

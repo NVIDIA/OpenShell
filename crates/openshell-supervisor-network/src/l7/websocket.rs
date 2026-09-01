@@ -121,21 +121,21 @@ impl WebSocketTerminationCause {
         }
     }
 
-    fn session_end_reason(self) -> openshell_core::proto::WebSocketSessionEndReason {
+    fn session_end_reason(self) -> openshell_core::proto::MiddlewareSessionEndReason {
         match self {
             Self::PeerDisconnect => {
-                openshell_core::proto::WebSocketSessionEndReason::PeerDisconnect
+                openshell_core::proto::MiddlewareSessionEndReason::PeerDisconnect
             }
-            Self::PolicyReload => openshell_core::proto::WebSocketSessionEndReason::PolicyReload,
+            Self::PolicyReload => openshell_core::proto::MiddlewareSessionEndReason::PolicyReload,
             Self::MiddlewareDenial => {
-                openshell_core::proto::WebSocketSessionEndReason::MiddlewareDenial
+                openshell_core::proto::MiddlewareSessionEndReason::MiddlewareDenial
             }
-            Self::PolicyDenial => openshell_core::proto::WebSocketSessionEndReason::PolicyDenial,
+            Self::PolicyDenial => openshell_core::proto::MiddlewareSessionEndReason::PolicyDenial,
             Self::CapacityExhausted | Self::MiddlewareFailure => {
-                openshell_core::proto::WebSocketSessionEndReason::MiddlewareFailure
+                openshell_core::proto::MiddlewareSessionEndReason::MiddlewareFailure
             }
             Self::InvalidUtf8 | Self::ProtocolError | Self::MessageTooBig => {
-                openshell_core::proto::WebSocketSessionEndReason::ProtocolError
+                openshell_core::proto::MiddlewareSessionEndReason::ProtocolError
             }
         }
     }
@@ -539,7 +539,7 @@ where
             )
         })?;
         Ok::<_, WebSocketTermination>(
-            openshell_core::proto::WebSocketSessionEndReason::PeerDisconnect,
+            openshell_core::proto::MiddlewareSessionEndReason::PeerDisconnect,
         )
     };
 
@@ -619,7 +619,7 @@ async fn relay_client_to_server<R, W>(
     host: &str,
     port: u16,
     options: &mut RelayOptions<'_>,
-) -> WebSocketRelayResult<openshell_core::proto::WebSocketSessionEndReason>
+) -> WebSocketRelayResult<openshell_core::proto::MiddlewareSessionEndReason>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
@@ -637,9 +637,9 @@ where
         else {
             let _ = writer.shutdown().await;
             return Ok(if close_seen {
-                openshell_core::proto::WebSocketSessionEndReason::NormalClose
+                openshell_core::proto::MiddlewareSessionEndReason::Normal
             } else {
-                openshell_core::proto::WebSocketSessionEndReason::PeerDisconnect
+                openshell_core::proto::MiddlewareSessionEndReason::PeerDisconnect
             });
         };
 
@@ -2216,7 +2216,7 @@ network_policies:
 
     #[test]
     fn termination_causes_map_to_protocol_close_codes_and_session_reasons() {
-        use openshell_core::proto::WebSocketSessionEndReason as EndReason;
+        use openshell_core::proto::MiddlewareSessionEndReason as EndReason;
 
         assert_eq!(
             WebSocketTerminationCause::InvalidUtf8.close_code(),
@@ -3486,7 +3486,7 @@ network_policies:
     enum ObservedWebSocketRequest {
         SessionStart,
         Message { sequence: u64, payload: String },
-        SessionEnd(openshell_core::proto::WebSocketSessionEndReason),
+        SessionEnd(openshell_core::proto::MiddlewareSessionEndReason),
     }
 
     #[derive(Clone, Default)]
@@ -3648,7 +3648,7 @@ network_policies:
                         Some(web_socket_session_event::Event::SessionEnd(end)) => {
                             if let Some(observed) = &observed
                                 && let Ok(reason) =
-                                    openshell_core::proto::WebSocketSessionEndReason::try_from(
+                                    openshell_core::proto::MiddlewareSessionEndReason::try_from(
                                         end.reason,
                                     )
                             {
@@ -3898,7 +3898,7 @@ network_policies:
         assert!(matches!(
             observed.recv().await,
             Some(ObservedWebSocketRequest::SessionEnd(
-                openshell_core::proto::WebSocketSessionEndReason::ProtocolError,
+                openshell_core::proto::MiddlewareSessionEndReason::ProtocolError,
             ))
         ));
         assert!(
@@ -4018,7 +4018,7 @@ network_policies:
         assert!(matches!(
             observed.recv().await,
             Some(ObservedWebSocketRequest::SessionEnd(
-                openshell_core::proto::WebSocketSessionEndReason::PeerDisconnect,
+                openshell_core::proto::MiddlewareSessionEndReason::PeerDisconnect,
             ))
         ));
 
@@ -4056,7 +4056,7 @@ network_policies:
         assert!(matches!(
             observed.recv().await,
             Some(ObservedWebSocketRequest::SessionEnd(
-                openshell_core::proto::WebSocketSessionEndReason::MiddlewareFailure,
+                openshell_core::proto::MiddlewareSessionEndReason::MiddlewareFailure,
             ))
         ));
         assert!(
@@ -4258,7 +4258,7 @@ network_policies:
         assert!(error.to_string().contains("policy generation is stale"));
         match observed.recv().await {
             Some(ObservedWebSocketRequest::SessionEnd(
-                openshell_core::proto::WebSocketSessionEndReason::PolicyReload,
+                openshell_core::proto::MiddlewareSessionEndReason::PolicyReload,
             )) => {}
             Some(ObservedWebSocketRequest::Message { payload, .. }) => {
                 panic!("stale message leaked {} bytes to middleware", payload.len());
@@ -4383,7 +4383,7 @@ network_policies:
         }
         assert_eq!(
             end_reason,
-            Some(openshell_core::proto::WebSocketSessionEndReason::PolicyReload)
+            Some(openshell_core::proto::MiddlewareSessionEndReason::PolicyReload)
         );
 
         let _ = shutdown_tx.send(());
@@ -4423,7 +4423,7 @@ network_policies:
         assert!(matches!(
             observed.recv().await,
             Some(ObservedWebSocketRequest::SessionEnd(
-                openshell_core::proto::WebSocketSessionEndReason::PolicyReload
+                openshell_core::proto::MiddlewareSessionEndReason::PolicyReload
             ))
         ));
 
@@ -4527,7 +4527,7 @@ network_policies:
         assert!(matches!(
             observed.recv().await,
             Some(ObservedWebSocketRequest::SessionEnd(
-                openshell_core::proto::WebSocketSessionEndReason::PolicyReload
+                openshell_core::proto::MiddlewareSessionEndReason::PolicyReload
             ))
         ));
 
@@ -4637,7 +4637,7 @@ network_policies:
         );
         match observed.recv().await {
             Some(ObservedWebSocketRequest::SessionEnd(
-                openshell_core::proto::WebSocketSessionEndReason::PolicyDenial,
+                openshell_core::proto::MiddlewareSessionEndReason::PolicyDenial,
             )) => {}
             Some(ObservedWebSocketRequest::Message { payload, .. }) => {
                 panic!(
