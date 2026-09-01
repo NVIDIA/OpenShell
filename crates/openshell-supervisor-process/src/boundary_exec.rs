@@ -98,23 +98,16 @@ impl LocalBoundaryExec {
         Ok(command)
     }
 
+    #[cfg(target_os = "linux")]
     fn prepare_sandbox(
         &self,
         workdir: Option<&str>,
     ) -> Result<Option<crate::sandbox::linux::PreparedSandbox>, BackendError> {
-        #[cfg(target_os = "linux")]
-        {
-            if self.enforcement_mode.enforces_child_sandbox() {
-                crate::sandbox::linux::log_sandbox_readiness(&self.policy, workdir);
-            }
-            crate::process::prepare_child_sandbox(&self.policy, workdir, self.enforcement_mode)
-                .map_err(|error| BackendError::Process(error.to_string()))
+        if self.enforcement_mode.enforces_child_sandbox() {
+            crate::sandbox::linux::log_sandbox_readiness(&self.policy, workdir);
         }
-        #[cfg(not(target_os = "linux"))]
-        {
-            let _ = workdir;
-            Ok(None)
-        }
+        crate::process::prepare_child_sandbox(&self.policy, workdir, self.enforcement_mode)
+            .map_err(|error| BackendError::Process(error.to_string()))
     }
 
     fn spawn_piped(&self, spec: &ExecSpec) -> Result<SpawnedExec, BackendError> {
@@ -127,6 +120,7 @@ impl LocalBoundaryExec {
         let effective_workdir = spec.workdir.as_deref().or(self.base_workdir.as_deref());
         #[cfg(target_os = "linux")]
         let prepared = self.prepare_sandbox(effective_workdir)?;
+        crate::ssh::unsafe_pty::install_dedicated_process_group(&mut command);
         crate::ssh::unsafe_pty::install_pre_exec_no_pty(
             &mut command,
             self.policy.clone(),

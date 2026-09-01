@@ -1623,6 +1623,23 @@ pub(crate) mod unsafe_pty {
         Ok(())
     }
 
+    /// Install a pre-exec hook that gives the child a dedicated process group.
+    ///
+    /// Boundary-owned pipe execs use the child's PID as the process-group ID
+    /// for signal delivery and tree cleanup. Keep this separate from
+    /// [`install_pre_exec_no_pty`] so legacy SSH exec behavior is unchanged.
+    #[allow(unsafe_code)]
+    pub fn install_dedicated_process_group(cmd: &mut Command) {
+        unsafe {
+            cmd.pre_exec(|| {
+                if libc::setpgid(0, 0) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
+
     #[allow(unsafe_code)]
     // `libc::TIOCSCTTY` is `u32` on macOS/BSD and `u64` on Linux; allow the
     // cross-platform conversion so the same expression compiles everywhere.

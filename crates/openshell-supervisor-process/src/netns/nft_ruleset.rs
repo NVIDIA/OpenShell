@@ -49,6 +49,7 @@ pub fn generate_bypass_commands(
 /// rejects are optional fast-fail behavior; the base-chain drop policy covers
 /// every address family and protocol. No blanket conntrack exception is
 /// installed because pre-existing or related flows must not bypass mediation.
+#[allow(dead_code, reason = "consumed when RFC 0012 backend activation lands")]
 pub fn generate_egress_ceiling_commands(
     host_ip: &str,
     proxy_port: u16,
