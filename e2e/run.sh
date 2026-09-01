@@ -144,9 +144,6 @@ gateway_driver="$(python3 -c '
 import sys, tomllib
 gateway = tomllib.load(open(sys.argv[1], "rb"))["openshell"]["gateway"]
 driver = gateway.get("compute_driver")
-if driver is None:
-    drivers = gateway.get("compute_drivers", [])
-    driver = drivers[0] if drivers else None
 if not driver:
     raise SystemExit("gateway config must explicitly select a compute driver")
 print(driver)

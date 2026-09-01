@@ -113,7 +113,7 @@ codesign \
 mkdir -p /tmp/openshell-vm-driver-$USER-vm-dev .cache/gateway-vm
 cat > .cache/gateway-vm/gateway.toml <<EOF
 [openshell]
-version = 1
+version = 2
 
 [openshell.gateway]
 compute_driver = "vm"
@@ -121,14 +121,15 @@ disable_tls = true
 
 [openshell.drivers.vm]
 default_image = "<compatible-image>"
-grpc_endpoint = "http://host.containers.internal:18081"
+# Optional override; the gateway derives host.openshell.internal:18081 when omitted.
+grpc_endpoint = "http://host.openshell.internal:18081"
 driver_dir = "$PWD/target/debug"
 state_dir = "/tmp/openshell-vm-driver-$USER-vm-dev"
 EOF
 
 target/debug/openshell-gateway \
   --config .cache/gateway-vm/gateway.toml \
-  --drivers vm \
+  --compute-driver vm \
   --disable-tls \
   --db-url "sqlite:.cache/gateway-vm/gateway.db?mode=rwc" \
   --port 18081
@@ -138,11 +139,11 @@ The gateway resolves `openshell-driver-vm` in this order: `[openshell.drivers.vm
 
 ## Gateway And Driver Configuration
 
-Select the VM driver with `--drivers vm`, `OPENSHELL_DRIVERS=vm`, or `compute_driver = "vm"` in `[openshell.gateway]`. Configure VM-specific settings in `[openshell.drivers.vm]`.
+Select the VM driver with `--compute-driver vm`, `OPENSHELL_COMPUTE_DRIVER=vm`, or `compute_driver = "vm"` in `[openshell.gateway]`. Configure VM-specific settings in `[openshell.drivers.vm]`.
 
 | Configuration key | Default | Purpose |
 |---|---|---|
-| `grpc_endpoint` | empty | Required. URL the sandbox guest dials to reach the gateway. Use `http://host.containers.internal:<port>` (or `host.docker.internal` / `host.openshell.internal`) so traffic flows through gvproxy's host-loopback NAT (HostIP `192.168.127.254` → host `127.0.0.1`). Loopback URLs like `http://127.0.0.1:<port>` are rewritten automatically by the driver. The bare gateway IP (`192.168.127.1`) only carries gvproxy's own services and will not reach host-bound ports. |
+| `grpc_endpoint` | topology-derived | Optional override for the URL the sandbox guest dials to reach the gateway. The gateway derives `http(s)://host.openshell.internal:<gateway-port>` when absent. Use `host.containers.internal`, `host.docker.internal`, or another routable host only for a non-standard topology. Loopback URLs are rewritten automatically by the driver. The bare gateway IP (`192.168.127.1`) only carries gvproxy's own services and will not reach host-bound ports. |
 | `state_dir` | `target/openshell-vm-driver` | Per-sandbox overlay disks, console logs, image cache, and private `run/compute-driver.sock` UDS. |
 | `driver_dir` | unset | Override the directory searched for `openshell-driver-vm`. |
 | `default_image` | OpenShell base image | Sandbox image used when a create request omits one. |
@@ -151,17 +152,21 @@ Select the VM driver with `--drivers vm`, `OPENSHELL_DRIVERS=vm`, or `compute_dr
 | `mem_mib` | `2048` | Memory per sandbox, in MiB. |
 | `overlay_disk_mib` | `4096` | Sparse writable overlay disk size per sandbox, in MiB. |
 | `krun_log_level` | `1` | libkrun verbosity (0-5). |
-| `guest_tls_ca` | unset | CA cert for the guest's mTLS client bundle. Required when `grpc_endpoint` uses `https://`. |
-| `guest_tls_cert` | unset | Guest client certificate. |
-| `guest_tls_key` | unset | Guest client private key. |
-| `https_proxy` | unset | Corporate forward proxy (`http://host:port` or `https://host:port`) the in-guest supervisor chains policy-approved TLS CONNECT egress through. On the libkrun backend a proxy on the gateway host's loopback must be addressed as `http://host.openshell.internal:<port>` — guest egress leaves through gvproxy, which NATs `192.168.127.254` to the host's `127.0.0.1`. The QEMU/TAP backend (GPU sandboxes) has no such NAT and its nftables rules expose only the gateway port to the guest, so a gateway-host proxy URL is rejected at launch there; use an address routable from the guest's masqueraded egress. |
+| `sandbox_uid` / `sandbox_gid` | image account or `1000` / UID | Explicit values override the image account. When omitted, a supplied image `sandbox` account is preserved and an image without one gets `1000:1000`; persisted legacy identity is retained when recorded in sandbox state. |
+| `https_proxy` | unset | Corporate forward proxy (`http://host:port` or `https://host:port`) the in-guest supervisor chains policy-approved TLS CONNECT egress through. On the libkrun backend a proxy on the gateway host's loopback must be addressed as `http://host.openshell.internal:<port>` — guest egress leaves through gvproxy, which NATs `192.168.127.254` to the host's `127.0.0.1`. The QEMU/TAP backend has no such NAT, so a gateway-host proxy URL is rejected before GPU sandbox launch; use an address routable from the guest's masqueraded egress. |
 | `no_proxy` | unset | Comma-separated bypass list for the corporate proxy only. OpenShell policy evaluation still applies. |
-| `proxy_auth_file` | unset | Gateway-host path to a `user:pass` credential file. Staged root-only into the per-sandbox overlay and removed with the sandbox. |
+| `proxy_auth_file` | unset | Gateway-host path to a validated `user:pass` credential file. Staged root-only into the per-sandbox overlay and removed with the sandbox; credentials never enter logs or process arguments. |
 | `proxy_auth_allow_insecure` | unset | Required with `proxy_auth_file` against an `http://` proxy: acknowledges that Basic auth is cleartext on the connection to the proxy. |
 | `proxy_connect_by_hostname` | unset | Send hostnames rather than validated IPs in CONNECT. Last resort for proxies whose ACLs reject IP targets. |
-| `proxy_ca_bundle` | unset | Gateway-host path to a PEM CA bundle trusted for an `https://` proxy and for certificates a TLS-intercepting proxy re-signs. |
+| `provider_spiffe_workload_api_tcp_endpoint` | unset | Explicit guest-reachable `tcp:IP:port` SPIFFE Workload API listener for provider token exchange. It requires `provider_spiffe_allow_guest_tcp = true`; a host UNIX socket is never silently exposed to a VM guest. |
 
-The proxy settings are operator-owned and deployment-level: they are not accepted through `template.driver_config.vm`, and they reach the supervisor on its command line through a per-sandbox argument file the driver writes into the overlay upperdir on every launch, so a sandbox image cannot forge or shadow them. Every present-but-invalid value is fatal at gateway or sandbox startup rather than degrading to a direct dial.
+The proxy settings are operator-owned and deployment-level: they are not accepted through `template.driver_config.vm`, and they reach the supervisor through a protected per-sandbox argument file the driver writes into the overlay upperdir on every launch, so a sandbox image cannot forge or shadow them. Every present-but-invalid value is fatal at gateway or sandbox startup rather than degrading to a direct dial.
+
+For gateway-managed VM drivers, configure `guest_tls_ca`, `guest_tls_cert`, and
+`guest_tls_key` together under `[openshell.gateway]`; the gateway validates and
+injects that bundle into only the selected local driver. The standalone
+`openshell-driver-vm` CLI retains its `--guest-tls-*` inputs for independent
+operation.
 
 See [`openshell-gateway --help`](../openshell-server/src/cli.rs) for the gateway process flag surface.
 
@@ -282,8 +287,8 @@ Each table is created atomically via `nft -f` on VM start and torn down atomical
 On Debian-family Linux amd64 and arm64 systems, `install.sh` installs the
 Debian package from the selected `OPENSHELL_VERSION` release tag. That package
 includes `openshell-gateway` and `openshell-driver-vm`, but leaves
-`OPENSHELL_DRIVERS` unset so the gateway uses its normal runtime
-auto-detection. Set `OPENSHELL_DRIVERS=vm` to force the VM driver.
+`OPENSHELL_COMPUTE_DRIVER` unset so the gateway uses its normal runtime
+auto-detection. Set `OPENSHELL_COMPUTE_DRIVER=vm` to force the VM driver.
 
 On RPM-family Linux x86_64 and aarch64 systems, `install.sh` installs the
 `openshell` and `openshell-gateway` RPM packages from the selected release tag.
@@ -294,7 +299,7 @@ formula from the selected release in the `nvidia/openshell` Homebrew tap.
 Homebrew installs `openshell`, `openshell-gateway`, and
 `openshell-driver-vm`, ad-hoc signs the driver with the Hypervisor entitlement
 in `post_install`, and owns the `brew services` gateway lifecycle. The service
-also leaves `OPENSHELL_DRIVERS` unset so driver choice remains automatic unless
+also leaves `OPENSHELL_COMPUTE_DRIVER` unset so driver choice remains automatic unless
 the user explicitly overrides it.
 
 ## TODOs

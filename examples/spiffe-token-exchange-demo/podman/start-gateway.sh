@@ -27,7 +27,7 @@ GATEWAY_STATE_DIR="${GATEWAY_STATE_DIR:-}"
 GATEWAY_ENV_FILE="${GATEWAY_ENV_FILE:-}"
 SANDBOX_IMAGE="${SANDBOX_IMAGE:-}"
 SUPERVISOR_IMAGE="${SUPERVISOR_IMAGE:-}"
-SANDBOX_IMAGE_PULL_POLICY="${SANDBOX_IMAGE_PULL_POLICY:-missing}"
+SANDBOX_IMAGE_PULL_POLICY="${SANDBOX_IMAGE_PULL_POLICY:-if_not_present}"
 PODMAN_STOP_TIMEOUT_SECS="${PODMAN_STOP_TIMEOUT_SECS:-3}"
 GATEWAY_OIDC_ISSUER="${GATEWAY_OIDC_ISSUER:-}"
 GATEWAY_OIDC_AUDIENCE="${GATEWAY_OIDC_AUDIENCE:-openshell-cli}"
@@ -132,7 +132,7 @@ scopes_claim = \"$(toml_string_escape "$GATEWAY_OIDC_SCOPES_CLAIM")\"
 
     cat >"$config_path" <<EOF
 [openshell]
-version = 1
+version = 2
 
 [openshell.gateway]
 bind_address = "0.0.0.0:8080"
@@ -157,6 +157,7 @@ socket_path = "${podman_socket_in_container}"
 network_name = "$(toml_string_escape "$PODMAN_NETWORK")"
 grpc_endpoint = "http://${GATEWAY_CONTAINER}:8080"
 image_pull_policy = "$(toml_string_escape "$SANDBOX_IMAGE_PULL_POLICY")"
+health_check_interval_secs = 10
 stop_timeout_secs = ${PODMAN_STOP_TIMEOUT_SECS}
 provider_spiffe_workload_api_socket = "${SPIRE_AGENT_SOCKET_HOST_PATH}"
 $sandbox_image_line

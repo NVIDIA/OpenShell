@@ -1,8 +1,9 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+pub use openshell_core::AppArmorProfile;
 pub use openshell_core::DynamicStringAllowlist as OperatorNamespaceAllowlist;
-use openshell_core::config;
+use openshell_core::{ImagePullPolicy, config};
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::BTreeMap;
 #[cfg(test)]
@@ -177,83 +178,6 @@ impl KubernetesSidecarConfig {
     }
 }
 
-/// Kubernetes `AppArmor` profile requested for the sandbox agent container.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum AppArmorProfile {
-    RuntimeDefault,
-    Unconfined,
-    Localhost(String),
-}
-
-impl AppArmorProfile {
-    #[must_use]
-    pub fn to_k8s_type(&self) -> &'static str {
-        match self {
-            Self::RuntimeDefault => "RuntimeDefault",
-            Self::Unconfined => "Unconfined",
-            Self::Localhost(_) => "Localhost",
-        }
-    }
-
-    #[must_use]
-    pub fn localhost_profile(&self) -> Option<&str> {
-        match self {
-            Self::Localhost(profile) => Some(profile),
-            Self::RuntimeDefault | Self::Unconfined => None,
-        }
-    }
-}
-
-impl std::fmt::Display for AppArmorProfile {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::RuntimeDefault => f.write_str("RuntimeDefault"),
-            Self::Unconfined => f.write_str("Unconfined"),
-            Self::Localhost(profile) => write!(f, "Localhost/{profile}"),
-        }
-    }
-}
-
-impl FromStr for AppArmorProfile {
-    type Err = String;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        match value {
-            "RuntimeDefault" => Ok(Self::RuntimeDefault),
-            "Unconfined" => Ok(Self::Unconfined),
-            other => match other.strip_prefix("Localhost/") {
-                Some("") => Err(
-                    "invalid AppArmor profile 'Localhost/'; expected non-empty profile name"
-                        .to_string(),
-                ),
-                Some(profile) => Ok(Self::Localhost(profile.to_string())),
-                None => Err(format!(
-                    "unknown AppArmor profile '{other}'; expected 'RuntimeDefault', 'Unconfined', or 'Localhost/<profile-name>'"
-                )),
-            },
-        }
-    }
-}
-
-impl Serialize for AppArmorProfile {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        serializer.serialize_str(&self.to_string())
-    }
-}
-
-impl<'de> Deserialize<'de> for AppArmorProfile {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let value = String::deserialize(deserializer)?;
-        Self::from_str(&value).map_err(serde::de::Error::custom)
-    }
-}
-
 fn deserialize_optional_app_armor_profile<'de, D>(
     deserializer: D,
 ) -> Result<Option<AppArmorProfile>, D::Error>
@@ -263,7 +187,8 @@ where
     let value = Option::<String>::deserialize(deserializer)?;
     match value.as_deref() {
         None | Some("") => Ok(None),
-        Some(value) => AppArmorProfile::from_str(value)
+        Some(value) => value
+            .parse::<AppArmorProfile>()
             .map(Some)
             .map_err(serde::de::Error::custom),
     }
@@ -306,7 +231,9 @@ pub struct KubernetesComputeConfig {
     /// the driver's `TokenReview` bootstrap authenticator.
     pub service_account_name: String,
     pub default_image: String,
-    pub image_pull_policy: String,
+    /// Pull policy for sandbox images. Omit to use Kubernetes's image default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_pull_policy: Option<ImagePullPolicy>,
     /// Kubernetes `imagePullSecrets` names attached to sandbox pods.
     pub image_pull_secrets: Vec<String>,
     /// Managed-mode SSH ingress isolation. When enabled, the driver creates a
@@ -317,9 +244,10 @@ pub struct KubernetesComputeConfig {
     /// Mounted directly as an image volume, or copied via an init container,
     /// depending on `supervisor_sideload_method`.
     pub supervisor_image: String,
-    /// Kubernetes `imagePullPolicy` for the supervisor image.
-    /// Empty string delegates to the Kubernetes default.
-    pub supervisor_image_pull_policy: String,
+    /// Pull policy for the supervisor image. Omit to use Kubernetes's image
+    /// default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supervisor_image_pull_policy: Option<ImagePullPolicy>,
     /// How the supervisor binary is delivered into sandbox pods.
     pub supervisor_sideload_method: SupervisorSideloadMethod,
     /// How the supervisor is arranged for Kubernetes sandbox pods.
@@ -439,15 +367,13 @@ impl Default for KubernetesComputeConfig {
             operator_namespace_file: None,
             service_account_name: DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME.to_string(),
             default_image: openshell_core::image::default_sandbox_image(),
-            // Default empty so the gateway omits `imagePullPolicy` from pod
-            // specs and Kubernetes applies its own default (Always for `latest`,
-            // IfNotPresent otherwise). `DEFAULT_IMAGE_PULL_POLICY` ("missing")
-            // is Podman vocabulary and is not a valid Kubernetes value.
-            image_pull_policy: String::new(),
+            // Omit the field so Kubernetes applies its own default (Always for
+            // `latest`, IfNotPresent otherwise).
+            image_pull_policy: None,
             image_pull_secrets: Vec::new(),
             managed_ssh_ingress: ManagedSshIngressConfig::default(),
             supervisor_image: config::default_supervisor_image(),
-            supervisor_image_pull_policy: String::new(),
+            supervisor_image_pull_policy: None,
             supervisor_sideload_method: SupervisorSideloadMethod::default(),
             topology: SupervisorTopology::default(),
             sidecar: KubernetesSidecarConfig::default(),
@@ -506,17 +432,52 @@ impl KubernetesComputeConfig {
         self.sidecar.validate_proxy_uid()
     }
 
+    /// Reject pull policies Kubernetes cannot express before creating pods.
+    pub fn validate_image_pull_policies(&self) -> Result<(), String> {
+        for (field, policy) in [
+            ("image_pull_policy", self.image_pull_policy),
+            (
+                "supervisor_image_pull_policy",
+                self.supervisor_image_pull_policy,
+            ),
+        ] {
+            if policy == Some(ImagePullPolicy::Newer) {
+                return Err(format!(
+                    "{field} = \"newer\" is supported only by the Podman compute driver"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Translate a validated shared policy to Kubernetes's API vocabulary.
+    #[must_use]
+    pub fn image_pull_policy_value(policy: ImagePullPolicy) -> &'static str {
+        match policy {
+            ImagePullPolicy::Always => "Always",
+            ImagePullPolicy::IfNotPresent => "IfNotPresent",
+            ImagePullPolicy::Never => "Never",
+            ImagePullPolicy::Newer => unreachable!("newer must be rejected during validation"),
+        }
+    }
+
     /// Validate the operator-owned corporate upstream proxy configuration.
     pub fn validate_upstream_proxy_config(&self) -> Result<(), String> {
         use openshell_core::driver_utils::{UpstreamProxyUrlError, parse_upstream_proxy_url};
 
-        if let Some(url) = &self.https_proxy {
-            parse_upstream_proxy_url(url).map_err(|err| match err {
-                UpstreamProxyUrlError::Empty => "https_proxy must not be empty when set".to_string(),
-                UpstreamProxyUrlError::InlineCredentials => "https_proxy must not embed credentials in the URL; supply them through proxy_auth_secret_name and proxy_auth_secret_key".to_string(),
-                err => format!("https_proxy {err}"),
-            })?;
-        }
+        let proxy_addr = self
+            .https_proxy
+            .as_deref()
+            .map(|url| {
+                parse_upstream_proxy_url(url).map_err(|err| match err {
+                    UpstreamProxyUrlError::Empty => {
+                        "https_proxy must not be empty when set".to_string()
+                    }
+                    UpstreamProxyUrlError::InlineCredentials => "https_proxy must not embed credentials in the URL; supply them through proxy_auth_secret_name and proxy_auth_secret_key".to_string(),
+                    err => format!("https_proxy {err}"),
+                })
+            })
+            .transpose()?;
 
         if let Some(list) = self.no_proxy.as_deref() {
             if list.trim().is_empty() {
@@ -575,7 +536,9 @@ impl KubernetesComputeConfig {
                             .to_string(),
                     );
                 }
-                if self.proxy_auth_allow_insecure != Some(true) {
+                if proxy_addr.as_ref().is_some_and(|proxy| !proxy.secure)
+                    && self.proxy_auth_allow_insecure != Some(true)
+                {
                     return Err("proxy credentials use cleartext Basic auth over the connection to the http:// proxy; set proxy_auth_allow_insecure = true to accept that exposure, or remove the credential Secret".to_string());
                 }
                 if self.topology == SupervisorTopology::Combined {
@@ -926,6 +889,34 @@ mod tests {
     fn default_sidecar_requires_process_binary_aware_network_policy() {
         let cfg = KubernetesComputeConfig::default();
         assert!(cfg.sidecar.process_binary_aware_network_policy);
+    }
+
+    #[test]
+    fn image_pull_policy_uses_shared_canonical_values() {
+        let cfg: KubernetesComputeConfig = serde_json::from_value(serde_json::json!({
+            "image_pull_policy": "if_not_present",
+            "supervisor_image_pull_policy": "never"
+        }))
+        .unwrap();
+        assert_eq!(cfg.image_pull_policy, Some(ImagePullPolicy::IfNotPresent));
+        assert_eq!(
+            cfg.supervisor_image_pull_policy,
+            Some(ImagePullPolicy::Never)
+        );
+        assert_eq!(
+            KubernetesComputeConfig::image_pull_policy_value(ImagePullPolicy::IfNotPresent),
+            "IfNotPresent"
+        );
+    }
+
+    #[test]
+    fn image_pull_policy_rejects_newer() {
+        let cfg = KubernetesComputeConfig {
+            image_pull_policy: Some(ImagePullPolicy::Newer),
+            ..KubernetesComputeConfig::default()
+        };
+        let error = cfg.validate_image_pull_policies().unwrap_err();
+        assert!(error.contains("supported only by the Podman"));
     }
 
     #[test]
@@ -1382,6 +1373,18 @@ mod tests {
             proxy_auth_secret_name: Some("corporate-proxy-auth".to_string()),
             proxy_auth_secret_key: Some("credentials".to_string()),
             proxy_auth_allow_insecure: Some(true),
+            ..KubernetesComputeConfig::default()
+        };
+        assert!(cfg.validate_upstream_proxy_config().is_ok());
+    }
+
+    #[test]
+    fn upstream_proxy_config_accepts_tls_protected_secret_credentials() {
+        let cfg = KubernetesComputeConfig {
+            topology: SupervisorTopology::Sidecar,
+            https_proxy: Some("https://proxy.corp.example:8443".to_string()),
+            proxy_auth_secret_name: Some("corporate-proxy-auth".to_string()),
+            proxy_auth_secret_key: Some("credentials".to_string()),
             ..KubernetesComputeConfig::default()
         };
         assert!(cfg.validate_upstream_proxy_config().is_ok());

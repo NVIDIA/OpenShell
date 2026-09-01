@@ -380,14 +380,14 @@ Podman resources after out-of-band container removal or label drift.
 |---|---|---|---|
 | `OPENSHELL_PODMAN_SOCKET` | `--podman-socket` | Probes known local Podman API sockets and uses the first responsive socket, then falls back to asking the `podman` CLI for the host-side socket. Fails to start if neither finds one. | Podman API Unix socket path. |
 | `OPENSHELL_SANDBOX_IMAGE` | `--sandbox-image` | From gateway config | Default OCI image for sandboxes. |
-| `OPENSHELL_SANDBOX_IMAGE_PULL_POLICY` | `--sandbox-image-pull-policy` | `missing` | Pull policy: `always`, `missing`, `never`, or `newer`. |
+| `OPENSHELL_SANDBOX_IMAGE_PULL_POLICY` | `--sandbox-image-pull-policy` | `if_not_present` | Pull policy: `always`, `if_not_present`, `never`, or `newer`. |
 | `OPENSHELL_GRPC_ENDPOINT` | `--grpc-endpoint` | Auto-detected via `host.containers.internal` | Gateway gRPC endpoint for sandbox callbacks. |
 | `OPENSHELL_GATEWAY_PORT` | `--gateway-port` | `17670` | Gateway port used for endpoint auto-detection by the standalone binary. |
 | `OPENSHELL_NETWORK_NAME` | `--network-name` | `openshell` | Podman bridge network name. |
 | `OPENSHELL_PODMAN_HOST_GATEWAY_IP` | `--host-gateway-ip` | empty on Linux, `192.168.127.254` on macOS | Host gateway IP used for sandbox host aliases. Empty uses Podman's `host-gateway` resolver. |
 | `OPENSHELL_SANDBOX_SSH_SOCKET_PATH` | `--sandbox-ssh-socket-path` | `/run/openshell/ssh.sock` | Supervisor Unix socket path in `PodmanComputeConfig`. |
 | `OPENSHELL_STOP_TIMEOUT` | `--stop-timeout` | `45` | Container stop timeout in seconds. |
-| `OPENSHELL_SANDBOX_PIDS_LIMIT` | `--sandbox-pids-limit` | `2048` | Podman cgroup PID limit for sandbox containers. Set `0` to inherit Podman's runtime/default PID limit. |
+| `OPENSHELL_SANDBOX_PIDS_LIMIT` | `--sandbox-pids-limit` | unset | Podman cgroup PID limit for sandbox containers. Omit it to inherit Podman's runtime/default PID limit; explicit `0` is invalid. |
 | `OPENSHELL_SUPERVISOR_IMAGE` | `--supervisor-image` | `ghcr.io/nvidia/openshell/supervisor:latest` through the gateway, required standalone | OCI image containing the supervisor binary. |
 | `OPENSHELL_PODMAN_TLS_CA` | `--podman-tls-ca` | unset | Host path to the CA certificate mounted for sandbox mTLS. |
 | `OPENSHELL_PODMAN_TLS_CERT` | `--podman-tls-cert` | unset | Host path to the client certificate mounted for sandbox mTLS. |
@@ -404,6 +404,15 @@ Through the gateway, the same settings are the `https_proxy`, `no_proxy`,
 `proxy_auth_file`, `proxy_auth_allow_insecure`, `proxy_connect_by_hostname`,
 and `proxy_ca_bundle` keys under `[openshell.drivers.podman]`; see
 `docs/reference/gateway-config.mdx`.
+
+`provider_spiffe_workload_api_socket` accepts either an absolute host UNIX
+Workload API socket, projected through a dedicated read-only mount, or an
+explicit container-reachable `tcp:IP:port` endpoint. The driver sets the
+supervisor's `OPENSHELL_PROVIDER_SPIFFE_WORKLOAD_API_SOCKET` accordingly.
+`app_armor_profile` shares the canonical
+`RuntimeDefault`, `Unconfined`, or `Localhost/<profile>` model with Docker and
+Kubernetes. Podman defaults to explicit `Unconfined` for the supervisor mount
+setup; confined choices fail early when Podman reports AppArmor unavailable.
 
 This is an operator-owned egress boundary: the driver passes the settings on
 the supervisor's command line, so sandbox and template environment — and any

@@ -462,23 +462,37 @@ impl GatewayProxyConfig {
         let original = std::fs::read(&config_path)
             .map_err(|err| format!("read gateway config '{}': {err}", config_path.display()))?;
 
-        let mut updated = original.clone();
+        let mut proxy_config = format!("https_proxy = \"{proxy_url}\"\n");
+        if let Some(auth_file) = auth_file {
+            proxy_config.push_str(&format!(
+                "proxy_auth_file = \"{auth_file}\"\n\
+                 proxy_auth_allow_insecure = true\n"
+            ));
+        }
+        if let Some(ca_bundle) = ca_bundle {
+            proxy_config.push_str(&format!("proxy_ca_bundle = \"{ca_bundle}\"\n"));
+        }
+
+        // The managed gateway config ends in nested gateway tables. Insert
+        // proxy fields before the first one, while the active TOML table is
+        // still [openshell.drivers.podman].
+        let insertion = b"\n[openshell.gateway.";
+        let offset = original
+            .windows(insertion.len())
+            .position(|window| window == insertion)
+            .ok_or_else(|| {
+                format!(
+                    "gateway config '{}' has no nested gateway table insertion point",
+                    config_path.display()
+                )
+            })?;
+        let mut updated = Vec::with_capacity(original.len() + proxy_config.len() + 1);
+        updated.extend_from_slice(&original[..offset]);
         if !updated.ends_with(b"\n") {
             updated.push(b'\n');
         }
-        updated.extend_from_slice(format!("https_proxy = \"{proxy_url}\"\n").as_bytes());
-        if let Some(auth_file) = auth_file {
-            updated.extend_from_slice(
-                format!(
-                    "proxy_auth_file = \"{auth_file}\"\n\
-                     proxy_auth_allow_insecure = true\n"
-                )
-                .as_bytes(),
-            );
-        }
-        if let Some(ca_bundle) = ca_bundle {
-            updated.extend_from_slice(format!("proxy_ca_bundle = \"{ca_bundle}\"\n").as_bytes());
-        }
+        updated.extend_from_slice(proxy_config.as_bytes());
+        updated.extend_from_slice(&original[offset..]);
         std::fs::write(&config_path, &updated)
             .map_err(|err| format!("write gateway config '{}': {err}", config_path.display()))?;
 

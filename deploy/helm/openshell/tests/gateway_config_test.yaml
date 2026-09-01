@@ -27,6 +27,16 @@ tests:
           path: data["gateway.toml"]
           pattern: '(?m)^name\s*=\s*"production-us-west"$'
 
+  - it: renders schema version 2 and the Kubernetes compute driver selector
+    template: templates/gateway-config.yaml
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\]\s*version\s*=\s*2'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.gateway\][^\[]*?compute_driver\s*=\s*"kubernetes"'
+
   # Regression for Drew's P2: a ConfigMap-only mutation in `helm upgrade`
   # must roll the StatefulSet, otherwise pods keep running with stale config.
   - it: annotates the StatefulSet pod template with a ConfigMap checksum
@@ -138,12 +148,36 @@ tests:
           path: data["gateway.toml"]
           pattern: '(?ms)\[openshell\.gateway\][^\[]*?grpc_endpoint'
 
-  - it: renders the sandbox service account name under [openshell.drivers.kubernetes]
+  - it: omits pull policies by default so Kubernetes applies its own defaults
     template: templates/gateway-config.yaml
+    asserts:
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^\s*(image_pull_policy|supervisor_image_pull_policy)\s*='
+
+  - it: renders canonical image pull policies in the Kubernetes driver table
+    template: templates/gateway-config.yaml
+    set:
+      server.sandboxImagePullPolicy: if_not_present
+      supervisor.image.pullPolicy: never
     asserts:
       - matchRegex:
           path: data["gateway.toml"]
-          pattern: '(?ms)\[openshell\.drivers\.kubernetes\].*?service_account_name\s*=\s*"openshell-sandbox"'
+          pattern: '(?ms)\[openshell\.drivers\.kubernetes\].*?image_pull_policy\s*=\s*"if_not_present".*?supervisor_image_pull_policy\s*=\s*"never"'
+
+  - it: renders driver-owned Kubernetes settings only in its driver table
+    template: templates/gateway-config.yaml
+    set:
+      server.hostGatewayIP: 10.0.0.1
+      server.enableUserNamespaces: true
+      supervisor.image.tag: test
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.drivers\.kubernetes\].*?namespace\s*=\s*"my-namespace".*?default_image\s*=.*?supervisor_image\s*=.*?host_gateway_ip\s*=\s*"10\.0\.0\.1".*?client_tls_secret_name\s*=.*?service_account_name\s*=\s*"openshell-sandbox".*?enable_user_namespaces\s*=\s*true.*?sa_token_ttl_secs\s*='
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.gateway\][^\[]*?(sandbox_namespace|default_image|supervisor_image|client_tls_secret_name|service_account_name|host_gateway_ip|enable_user_namespaces|sa_token_ttl_secs)\s*='
 
   - it: renders user namespace enablement under [openshell.drivers.kubernetes]
     template: templates/gateway-config.yaml

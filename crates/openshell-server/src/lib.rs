@@ -507,7 +507,7 @@ pub(crate) async fn run_server(
         );
         info!(
             gateway_id = %jwt.gateway_id,
-            ttl_secs = jwt.ttl_secs,
+            ttl_secs = jwt.ttl_secs.map(std::num::NonZeroU64::get),
             "gateway-minted sandbox JWT enabled"
         );
         (Some(issuer), Some(authenticator))
@@ -1263,27 +1263,23 @@ impl ComputeDriverRegistry {
         ComputeDriverDetection { available }
     }
 
-    pub(crate) fn select(&self, configured_drivers: &[String]) -> Result<ComputeDriverSelection> {
-        match configured_drivers {
-            [] => {
+    pub(crate) fn select(&self, configured_driver: Option<&str>) -> Result<ComputeDriverSelection> {
+        match configured_driver {
+            None => {
                 let detection = self.detect();
                 if detection.selected().is_none() {
                     return Err(Error::config(
                         "no compute driver configured and auto-detection found no suitable installed \
-                         driver; set --drivers <name> or OPENSHELL_DRIVERS=<name>",
+                        driver; set --compute-driver <name> or OPENSHELL_COMPUTE_DRIVER=<name>",
                     ));
                 }
                 Ok(ComputeDriverSelection::AutoDetected(detection))
             }
-            [driver] => {
+            Some(driver) => {
                 let name = openshell_core::config::normalize_compute_driver_name(driver)
                     .map_err(Error::config)?;
                 Ok(ComputeDriverSelection::Configured { name })
             }
-            drivers => Err(Error::config(format!(
-                "multiple compute drivers are not supported yet; configured drivers: {}",
-                drivers.join(",")
-            ))),
         }
     }
 }
@@ -1501,7 +1497,7 @@ fn configured_compute_driver(
     config: &Config,
     driver_startup: compute::driver_config::DriverStartupContext<'_>,
 ) -> Result<ConfiguredComputeDriver> {
-    let selection = registry.select(&config.compute_drivers)?;
+    let selection = registry.select(config.compute_driver.as_deref())?;
     resolve_configured_compute_driver(registry, selection.name(), driver_startup)
 }
 
@@ -2095,7 +2091,7 @@ mod tests {
                 .unwrap(),
             )
             .unwrap();
-        let config = Config::new(None).with_compute_drivers(std::iter::empty::<String>());
+        let config = Config::new(None);
         let result =
             configured_compute_driver(&registry, &config, test_driver_startup(&config, None))
                 .unwrap();
@@ -2165,24 +2161,8 @@ mod tests {
     }
 
     #[test]
-    fn configured_compute_driver_rejects_multiple_entries() {
-        let config = Config::new(None).with_compute_drivers(["alpha", "beta"]);
-        let err = configured_compute_driver(
-            &test_compute_drivers(),
-            &config,
-            test_driver_startup(&config, None),
-        )
-        .unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("multiple compute drivers are not supported yet")
-        );
-        assert!(err.to_string().contains("alpha,beta"));
-    }
-
-    #[test]
     fn configured_compute_driver_accepts_registered_name() {
-        let config = Config::new(None).with_compute_drivers(["beta"]);
+        let config = Config::new(None).with_compute_driver("beta");
         let registry = test_compute_drivers();
         let driver =
             configured_compute_driver(&registry, &config, test_driver_startup(&config, None))
@@ -2199,7 +2179,7 @@ mod tests {
 
     #[test]
     fn configured_compute_driver_resolves_named_remote() {
-        let config = Config::new(None).with_compute_drivers(["kyma"]);
+        let config = Config::new(None).with_compute_driver("kyma");
         let registry = test_compute_drivers();
 
         let driver =
@@ -2226,7 +2206,7 @@ mod tests {
     #[test]
     fn configured_compute_driver_uses_endpoint_override() {
         let config = Config::new(None)
-            .with_compute_drivers(["alpha"])
+            .with_compute_driver("alpha")
             .with_compute_driver_endpoint("alpha", "/run/openshell/alpha.sock");
         let registry = test_compute_drivers();
 
@@ -2246,7 +2226,7 @@ mod tests {
     #[test]
     fn configured_compute_driver_uses_builtin_endpoint_override() {
         let config = Config::new(None)
-            .with_compute_drivers(["beta"])
+            .with_compute_driver("beta")
             .with_compute_driver_endpoint("beta", "/run/openshell/beta.sock");
 
         let driver = configured_compute_driver(

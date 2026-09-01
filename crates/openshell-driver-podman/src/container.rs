@@ -216,8 +216,11 @@ struct ContainerSpec {
     cap_add: Vec<String>,
     no_new_privileges: bool,
     seccomp_profile_path: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    security_opt: Vec<String>,
     image_pull_policy: String,
-    healthconfig: HealthConfig,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    healthconfig: Option<HealthConfig>,
     resource_limits: ResourceLimits,
     /// Env-type secrets: map of `ENV_VAR_NAME → secret_name`.
     /// Podman's libpod `SpecGenerator` uses `secret_env` (a flat map) for
@@ -652,12 +655,8 @@ fn build_resource_limits(sandbox: &DriverSandbox, config: &PodmanComputeConfig) 
             period: DEFAULT_CPU_PERIOD,
         },
         memory: MemoryLimits { limit: mem_bytes },
-        pids_limit: podman_pids_limit(config.sandbox_pids_limit),
+        pids_limit: config.sandbox_pids_limit.map(std::num::NonZeroI64::get),
     }
-}
-
-fn podman_pids_limit(value: i64) -> Option<i64> {
-    if value > 0 { Some(value) } else { None }
 }
 
 pub fn podman_driver_volume_mount_sources(
@@ -1175,8 +1174,14 @@ pub fn build_container_spec_for_image(
         // locks itself down.
         no_new_privileges: true,
         seccomp_profile_path: "unconfined".into(),
+        security_opt: config
+            .app_armor_profile
+            .as_ref()
+            .and_then(openshell_core::AppArmorProfile::oci_security_opt)
+            .into_iter()
+            .collect(),
         image_pull_policy: "never".to_string(),
-        healthconfig: HealthConfig {
+        healthconfig: config.health_check_interval_secs.map(|interval_secs| HealthConfig {
             test: vec![
                 "CMD-SHELL".into(),
                 format!(
@@ -1185,11 +1190,11 @@ pub fn build_container_spec_for_image(
                     openshell_core::config::DEFAULT_SSH_PORT
                 ),
             ],
-            interval: config.health_check_interval_secs * 1_000_000_000,
+            interval: interval_secs.get() * 1_000_000_000,
             timeout: 2_000_000_000,
             retries: 10,
             start_period: 5_000_000_000,
-        },
+        }),
         resource_limits,
         secret_env: BTreeMap::new(),
         secrets: {
@@ -1561,7 +1566,8 @@ mod tests {
             }),
             ..Default::default()
         });
-        let config = test_config();
+        let mut config = test_config();
+        config.sandbox_pids_limit = std::num::NonZeroI64::new(2048);
         let spec = build_container_spec(&sandbox, &config);
 
         assert_eq!(
@@ -1572,17 +1578,14 @@ mod tests {
             spec["resource_limits"]["memory"]["limit"].as_u64(),
             Some(2 * 1024 * 1024 * 1024)
         );
-        assert_eq!(
-            spec["resource_limits"]["PidsLimit"].as_i64(),
-            Some(crate::config::DEFAULT_SANDBOX_PIDS_LIMIT)
-        );
+        assert_eq!(spec["resource_limits"]["PidsLimit"].as_i64(), Some(2048));
     }
 
     #[test]
     fn container_spec_can_inherit_runtime_pids_limit() {
         let sandbox = test_sandbox("test-id", "test-name");
         let mut config = test_config();
-        config.sandbox_pids_limit = 0;
+        config.sandbox_pids_limit = None;
         let spec = build_container_spec(&sandbox, &config);
 
         assert!(spec["resource_limits"].get("PidsLimit").is_none());
@@ -1961,7 +1964,8 @@ mod tests {
     #[test]
     fn container_spec_healthcheck_accepts_supervisor_socket() {
         let sandbox = test_sandbox("test-id", "test-name");
-        let config = test_config();
+        let mut config = test_config();
+        config.health_check_interval_secs = std::num::NonZeroU64::new(10);
         let spec = build_container_spec(&sandbox, &config);
 
         let healthcheck = spec["healthconfig"]["test"]
@@ -1978,10 +1982,17 @@ mod tests {
     }
 
     #[test]
+    fn container_spec_omits_healthcheck_when_disabled() {
+        let sandbox = test_sandbox("test-id", "test-name");
+        let spec = build_container_spec(&sandbox, &test_config());
+        assert!(spec.get("healthconfig").is_none());
+    }
+
+    #[test]
     fn container_spec_healthcheck_interval_from_config() {
         let sandbox = test_sandbox("test-id", "test-name");
         let mut config = test_config();
-        config.health_check_interval_secs = 30;
+        config.health_check_interval_secs = std::num::NonZeroU64::new(30);
         let spec = build_container_spec(&sandbox, &config);
 
         let interval = spec["healthconfig"]["Interval"]

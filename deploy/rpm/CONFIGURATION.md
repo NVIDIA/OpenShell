@@ -17,7 +17,7 @@ The defaults are tuned for rootless Podman use:
 
 ```toml
 [openshell]
-version = 1
+version = 2
 
 [openshell.gateway]
 compute_driver = "podman"
@@ -215,9 +215,9 @@ overrides that persist across package upgrades.
 | TOML option | Default | Description |
 |-------------|---------|-------------|
 | `bind_address` | `127.0.0.1:17670` (gateway default) | Address for the primary gRPC/HTTP API listener. |
-| `compute_driver` | `"podman"` (RPM default) | When unset, the gateway auto-detects Kubernetes, then Podman, then Docker. The RPM default pins to Podman. The legacy `compute_drivers` list remains accepted. |
-| `default_image` | `ghcr.io/nvidia/openshell-community/sandboxes/base:latest` | Default sandbox image. |
-| `supervisor_image` | `ghcr.io/nvidia/openshell/supervisor:latest` | Supervisor image mounted into Podman sandboxes. |
+| `compute_driver` | `"podman"` (RPM default) | When unset, the gateway auto-detects Kubernetes, then Podman, then Docker. The RPM default pins to Podman; legacy `compute_drivers` lists are rejected. |
+| `[openshell.drivers.podman].default_image` | `ghcr.io/nvidia/openshell-community/sandboxes/base:latest` | Default sandbox image. |
+| `[openshell.drivers.podman].supervisor_image` | `ghcr.io/nvidia/openshell/supervisor:latest` | Supervisor image mounted into Podman sandboxes. |
 | `guest_tls_ca`, `guest_tls_cert`, `guest_tls_key` | auto-generated paths | Client TLS material bind-mounted into sandbox containers. |
 | `[openshell.gateway.tls]` paths | auto-generated paths | Server TLS certificate, key, and client CA. |
 | `disable_tls` | unset | Set to `true` to disable TLS. |
@@ -232,14 +232,15 @@ settings:
 
 ```toml
 [openshell]
-version = 1
+version = 2
 
 [openshell.gateway]
 compute_driver = "podman"
-default_image = "ghcr.io/nvidia/openshell-community/sandboxes/base:latest"
 
 [openshell.drivers.podman]
-image_pull_policy = "missing"
+default_image = "ghcr.io/nvidia/openshell-community/sandboxes/base:latest"
+image_pull_policy = "if_not_present"
+health_check_interval_secs = 10
 network_name = "openshell"
 stop_timeout_secs = 10
 ```
@@ -247,7 +248,7 @@ stop_timeout_secs = 10
 ### Image management
 
 The gateway pulls container images automatically on first sandbox
-creation. The default pull policy is `missing`, which means images are
+creation. The default pull policy is `if_not_present`, which means images are
 pulled once and then cached by Podman.
 
 To update cached images:
@@ -260,9 +261,10 @@ podman pull ghcr.io/nvidia/openshell-community/sandboxes/base:latest
 Or set `image_pull_policy = "always"` in
 `[openshell.drivers.podman]` to pull on every sandbox creation.
 
-To pin specific image versions instead of `:latest`:
+To pin specific image versions instead of `:latest`, set these values in
+`[openshell.drivers.podman]`:
 
-```shell
+```toml
 supervisor_image = "ghcr.io/nvidia/openshell/supervisor:v0.0.37"
 default_image = "ghcr.io/nvidia/openshell-community/sandboxes/base:v0.0.37"
 ```

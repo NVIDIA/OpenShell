@@ -53,7 +53,7 @@ def test_generate_homebrew_formula_uses_tagged_macos_driver_asset_without_defaul
         "v0.0.10/openshell-driver-vm-aarch64-apple-darwin.tar.gz"
     ) in formula
     assert 'sha256 "' + "b" * 64 + '"' in formula
-    assert "OPENSHELL_DRIVERS: " not in formula
+    assert "OPENSHELL_COMPUTE_DRIVER: " not in formula
     assert 'OPENSHELL_GATEWAY_CONFIG: "#{var}/openshell/gateway.toml"' not in formula
     assert "init-gateway-config.sh" not in formula
     assert 'gateway_config = var/"openshell/gateway.toml"' in formula
@@ -69,7 +69,7 @@ def test_generate_homebrew_formula_uses_tagged_macos_driver_asset_without_defaul
     assert 'bind_address = "[::1]:17670"' in formula
     assert "gateway_config.read == legacy_ipv6_gateway_config_contents" in formula
     assert "gateway_config.write gateway_config_contents" in formula
-    assert '# compute_drivers = ["vm"]' not in formula
+    assert '# compute_driver = "vm"' not in formula
     assert (
         "openshell gateway add https://localhost:17670 --local --name openshell"
         in formula
@@ -155,7 +155,7 @@ def test_rpm_spec_uses_gateway_defaults_without_config_helper() -> None:
     )
     assert "EnvironmentFile=-%%E/openshell/gateway.env" in spec
     assert "%%S/openshell/tls" not in spec
-    assert "Environment=OPENSHELL_DRIVERS" not in spec
+    assert "Environment=OPENSHELL_COMPUTE_DRIVER" not in spec
     assert "Environment=OPENSHELL_BIND_ADDRESS" not in spec
     assert "Environment=OPENSHELL_PODMAN_TLS_CA" not in spec
     assert "ExecStart=/usr/bin/openshell-gateway" in spec

@@ -510,6 +510,9 @@ impl KubernetesComputeDriver {
             .validate_proxy_uid()
             .map_err(KubernetesDriverError::Precondition)?;
         config
+            .validate_image_pull_policies()
+            .map_err(KubernetesDriverError::Precondition)?;
+        config
             .validate_upstream_proxy_config()
             .map_err(KubernetesDriverError::Precondition)?;
         let base_config = match kube::Config::incluster() {
@@ -1520,10 +1523,16 @@ impl KubernetesComputeDriver {
 
         let params = SandboxPodParams {
             default_image: &self.config.default_image,
-            image_pull_policy: &self.config.image_pull_policy,
+            image_pull_policy: self
+                .config
+                .image_pull_policy
+                .map(KubernetesComputeConfig::image_pull_policy_value),
             image_pull_secrets: &self.config.image_pull_secrets,
             supervisor_image: &self.config.supervisor_image,
-            supervisor_image_pull_policy: &self.config.supervisor_image_pull_policy,
+            supervisor_image_pull_policy: self
+                .config
+                .supervisor_image_pull_policy
+                .map(KubernetesComputeConfig::image_pull_policy_value),
             supervisor_sideload_method: self.config.supervisor_sideload_method,
             topology: self.config.topology,
             proxy_uid: self.config.sidecar.proxy_uid,
@@ -2738,13 +2747,13 @@ fn supervisor_volume_mount() -> serde_json::Value {
 /// available at `{SUPERVISOR_MOUNT_PATH}/openshell-sandbox`.
 fn supervisor_image_volume(
     supervisor_image: &str,
-    supervisor_image_pull_policy: &str,
+    supervisor_image_pull_policy: Option<&str>,
 ) -> serde_json::Value {
     let mut image_spec = serde_json::json!({
         "reference": supervisor_image,
     });
-    if !supervisor_image_pull_policy.is_empty() {
-        image_spec["pullPolicy"] = serde_json::json!(supervisor_image_pull_policy);
+    if let Some(policy) = supervisor_image_pull_policy {
+        image_spec["pullPolicy"] = serde_json::json!(policy);
     }
     serde_json::json!({
         "name": SUPERVISOR_VOLUME_NAME,
@@ -2762,7 +2771,7 @@ fn supervisor_image_volume(
 /// emissary executor.
 fn supervisor_init_container(
     supervisor_image: &str,
-    supervisor_image_pull_policy: &str,
+    supervisor_image_pull_policy: Option<&str>,
 ) -> serde_json::Value {
     let installed_path = format!("{SUPERVISOR_MOUNT_PATH}/openshell-sandbox");
     let mut spec = serde_json::json!({
@@ -2780,8 +2789,8 @@ fn supervisor_init_container(
             "readOnly": false
         }]
     });
-    if !supervisor_image_pull_policy.is_empty() {
-        spec["imagePullPolicy"] = serde_json::json!(supervisor_image_pull_policy);
+    if let Some(policy) = supervisor_image_pull_policy {
+        spec["imagePullPolicy"] = serde_json::json!(policy);
     }
     spec
 }
@@ -2789,7 +2798,7 @@ fn supervisor_init_container(
 fn apply_supervisor_binary_source(
     spec: &mut serde_json::Map<String, serde_json::Value>,
     supervisor_image: &str,
-    supervisor_image_pull_policy: &str,
+    supervisor_image_pull_policy: Option<&str>,
     method: SupervisorSideloadMethod,
 ) {
     let volumes = spec
@@ -2923,7 +2932,7 @@ fn apply_supervisor_sideload_with_params(
 fn apply_supervisor_sideload(
     pod_template: &mut serde_json::Value,
     supervisor_image: &str,
-    supervisor_image_pull_policy: &str,
+    supervisor_image_pull_policy: Option<&str>,
     method: SupervisorSideloadMethod,
     sandbox_uid: u32,
     sandbox_gid: u32,
@@ -3133,8 +3142,8 @@ fn supervisor_sidecar_container(
                 .into_iter()
                 .map(serde_json::Value::String),
         );
-    if !params.supervisor_image_pull_policy.is_empty() {
-        container["imagePullPolicy"] = serde_json::json!(params.supervisor_image_pull_policy);
+    if let Some(policy) = params.supervisor_image_pull_policy {
+        container["imagePullPolicy"] = serde_json::json!(policy);
     }
     if params.provider_spiffe_enabled {
         container["volumeMounts"]
@@ -3196,8 +3205,8 @@ fn supervisor_network_init_container(params: &SandboxPodParams<'_>) -> serde_jso
             sidecar_tls_volume_mount(),
         ]
     });
-    if !params.supervisor_image_pull_policy.is_empty() {
-        container["imagePullPolicy"] = serde_json::json!(params.supervisor_image_pull_policy);
+    if let Some(policy) = params.supervisor_image_pull_policy {
+        container["imagePullPolicy"] = serde_json::json!(policy);
     }
     if !params.client_tls_secret_name.is_empty() {
         container["volumeMounts"]
@@ -3397,7 +3406,7 @@ fn apply_supervisor_sidecar_topology(
 fn apply_workspace_persistence(
     pod_template: &mut serde_json::Value,
     image: &str,
-    image_pull_policy: &str,
+    image_pull_policy: Option<&str>,
     sandbox_gid: u32,
 ) {
     let Some(spec) = pod_template.get_mut("spec").and_then(|v| v.as_object_mut()) else {
@@ -3487,8 +3496,8 @@ fn apply_workspace_persistence(
                 "mountPath": WORKSPACE_INIT_MOUNT_PATH
             }]
         });
-        if !image_pull_policy.is_empty() {
-            init_spec["imagePullPolicy"] = serde_json::json!(image_pull_policy);
+        if let Some(policy) = image_pull_policy {
+            init_spec["imagePullPolicy"] = serde_json::json!(policy);
         }
         init_containers.push(init_spec);
     }
@@ -3535,10 +3544,10 @@ fn default_workspace_volume_claim_templates(
 #[allow(clippy::struct_excessive_bools)]
 struct SandboxPodParams<'a> {
     default_image: &'a str,
-    image_pull_policy: &'a str,
+    image_pull_policy: Option<&'a str>,
     image_pull_secrets: &'a [String],
     supervisor_image: &'a str,
-    supervisor_image_pull_policy: &'a str,
+    supervisor_image_pull_policy: Option<&'a str>,
     supervisor_sideload_method: SupervisorSideloadMethod,
     topology: SupervisorTopology,
     proxy_uid: u32,
@@ -3576,10 +3585,10 @@ impl Default for SandboxPodParams<'_> {
     fn default() -> Self {
         Self {
             default_image: "",
-            image_pull_policy: "",
+            image_pull_policy: None,
             image_pull_secrets: &[],
             supervisor_image: "",
-            supervisor_image_pull_policy: "",
+            supervisor_image_pull_policy: None,
             supervisor_sideload_method: SupervisorSideloadMethod::default(),
             topology: SupervisorTopology::default(),
             proxy_uid: DEFAULT_PROXY_UID,
@@ -3904,11 +3913,8 @@ fn sandbox_template_to_k8s_with_validated_config(
     };
     if !image.is_empty() {
         container.insert("image".to_string(), serde_json::json!(image));
-        if !params.image_pull_policy.is_empty() {
-            container.insert(
-                "imagePullPolicy".to_string(),
-                serde_json::json!(params.image_pull_policy),
-            );
+        if let Some(policy) = params.image_pull_policy {
+            container.insert("imagePullPolicy".to_string(), serde_json::json!(policy));
         }
     }
 
@@ -4210,7 +4216,7 @@ fn image_pull_secret_refs(secrets: &[String]) -> Vec<serde_json::Value> {
 
 fn app_armor_profile_to_k8s(profile: &AppArmorProfile) -> serde_json::Value {
     let mut value = serde_json::json!({
-        "type": profile.to_k8s_type()
+        "type": profile.kubernetes_type()
     });
     if let Some(localhost_profile) = profile.localhost_profile() {
         value["localhostProfile"] = serde_json::json!(localhost_profile);
@@ -6254,7 +6260,7 @@ mod tests {
         apply_supervisor_sideload(
             &mut pod_template,
             "custom-image:latest",
-            "IfNotPresent",
+            Some("IfNotPresent"),
             SupervisorSideloadMethod::InitContainer,
             1500, // sandbox_uid
             1500, // sandbox_gid
@@ -6291,7 +6297,7 @@ mod tests {
         apply_supervisor_sideload(
             &mut pod_template,
             "supervisor-image:latest",
-            "IfNotPresent",
+            Some("IfNotPresent"),
             SupervisorSideloadMethod::InitContainer,
             1500,
             1600,
@@ -6338,7 +6344,7 @@ mod tests {
         apply_supervisor_sideload(
             &mut pod_template,
             "supervisor-image:latest",
-            "IfNotPresent",
+            Some("IfNotPresent"),
             SupervisorSideloadMethod::InitContainer,
             1000, // sandbox_uid
             1000, // sandbox_gid
@@ -6365,7 +6371,7 @@ mod tests {
         apply_supervisor_sideload(
             &mut pod_template,
             "supervisor-image:latest",
-            "IfNotPresent",
+            Some("IfNotPresent"),
             SupervisorSideloadMethod::InitContainer,
             1000, // sandbox_uid
             1000, // sandbox_gid
@@ -6452,7 +6458,7 @@ mod tests {
         apply_supervisor_sideload(
             &mut pod_template,
             "supervisor-image:latest",
-            "IfNotPresent",
+            Some("IfNotPresent"),
             SupervisorSideloadMethod::ImageVolume,
             1000, // sandbox_uid
             1000, // sandbox_gid
@@ -6495,7 +6501,7 @@ mod tests {
     }
 
     #[test]
-    fn supervisor_image_volume_omits_pull_policy_when_empty() {
+    fn supervisor_image_volume_omits_pull_policy_when_unspecified() {
         let mut pod_template = serde_json::json!({
             "spec": {
                 "containers": [{
@@ -6508,7 +6514,7 @@ mod tests {
         apply_supervisor_sideload(
             &mut pod_template,
             "supervisor-image:latest",
-            "",
+            None,
             SupervisorSideloadMethod::ImageVolume,
             1000, // sandbox_uid
             1000, // sandbox_gid
@@ -6518,7 +6524,7 @@ mod tests {
         assert_eq!(volume["image"]["reference"], "supervisor-image:latest");
         assert!(
             volume["image"].get("pullPolicy").is_none(),
-            "pullPolicy should be omitted when empty"
+            "pullPolicy should be omitted when unspecified"
         );
     }
 
@@ -6528,7 +6534,7 @@ mod tests {
             topology: SupervisorTopology::Sidecar,
             supervisor_sideload_method: SupervisorSideloadMethod::InitContainer,
             supervisor_image: "supervisor-image:latest",
-            supervisor_image_pull_policy: "IfNotPresent",
+            supervisor_image_pull_policy: Some("IfNotPresent"),
             grpc_endpoint: "https://openshell-gateway.openshell.svc:8080",
             client_tls_secret_name: "openshell-client-tls",
             proxy_uid: 2200,
@@ -7406,7 +7412,7 @@ mod tests {
         apply_workspace_persistence(
             &mut pod_template,
             "openshell/sandbox:latest",
-            "IfNotPresent",
+            Some("IfNotPresent"),
             1000, // sandbox_gid
         );
 
@@ -7465,7 +7471,7 @@ mod tests {
         apply_workspace_persistence(
             &mut pod_template,
             "my-custom-image:v2",
-            "IfNotPresent",
+            Some("IfNotPresent"),
             1000,
         );
 
@@ -7489,7 +7495,7 @@ mod tests {
             }
         });
 
-        apply_workspace_persistence(&mut pod_template, "img:latest", "Always", 1000);
+        apply_workspace_persistence(&mut pod_template, "img:latest", Some("Always"), 1000);
 
         let cmd = pod_template["spec"]["initContainers"][0]["command"]
             .as_array()
