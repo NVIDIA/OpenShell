@@ -10,6 +10,9 @@ driver. It does not make Windows a Docker, Kubernetes, Podman, or VM runtime hos
 - Keep the Linux and macOS build paths unchanged.
 - Preserve gateway configuration parsing for all existing compute driver names.
 - Build and test the in-process MXC driver on supported Windows hosts.
+- Use the ordinary in-process compute-driver composition path; MXC receives the
+  canonical sandbox policy through validate/create RPC messages and advertises
+  driver-owned runtime control for readiness.
 - Return clear unsupported errors when a Windows gateway is configured to use Docker, Kubernetes, Podman, or VM.
 - Keep dedicated `windows:*` validation tasks while allowing the repository-wide
   `pre-commit` task to delegate compiler-bearing Rust checks to the native

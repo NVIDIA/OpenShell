@@ -3,14 +3,20 @@
 # SPDX-License-Identifier: Apache-2.0
 title: "Sandbox Compute Drivers"
 sidebar-title: "Compute Drivers"
-description: "Reference for Docker, Podman, MicroVM, and Kubernetes sandbox compute drivers."
-keywords: "Generative AI, Cybersecurity, AI Agents, Sandboxing, Docker, Podman, MicroVM, Kubernetes, Reference"
+description: "Reference for Docker, Podman, MicroVM, Kubernetes, and Windows MXC sandbox compute drivers."
+keywords: "Generative AI, Cybersecurity, AI Agents, Sandboxing, Docker, Podman, MicroVM, Kubernetes, MXC, Reference"
 position: 4
 ---
 
 The gateway's configured compute driver determines how OpenShell creates each sandbox. The CLI workflow stays the same across drivers: you create, connect to, inspect, stop, start, and delete sandboxes through the gateway API.
 
-Every compute driver runs the OpenShell supervisor inside the sandbox workload. The supervisor launches the agent process, applies policy, routes egress through the proxy, injects configured credentials, and maintains the gateway session.
+Most compute drivers run the OpenShell supervisor inside the sandbox workload.
+The supervisor launches the agent process, applies policy, routes egress through
+the proxy, injects configured credentials, and maintains the gateway session.
+A driver may instead advertise driver-owned runtime control. In that mode, the
+gateway sends the canonical policy in the validation and creation requests, the
+driver applies it before launch, and driver-reported readiness does not require
+a supervisor session. The Windows MXC driver uses this mode.
 
 Stop stops compute but retains the sandbox record and the driver's
 persistent workspace boundary. Start reactivates the same driver resource.
@@ -42,7 +48,8 @@ Configure the compute driver on the gateway. Current releases accept one driver 
 compute_drivers = ["docker"]
 ```
 
-Reserved built-in values are `docker`, `podman`, `kubernetes`, and `vm`.
+Reserved built-in values are `docker`, `podman`, `kubernetes`, `vm`, and `mxc`.
+The `mxc` driver is available only in native Windows gateway builds.
 Non-reserved names select an extension driver and require a
 `socket_path` in `[openshell.drivers.<name>]`.
 

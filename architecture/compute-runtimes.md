@@ -1,34 +1,42 @@
 # Compute Runtimes
 
 Compute runtimes create, stop, start, delete, and watch sandbox workloads for the
-gateway. They do not replace sandbox policy enforcement. Every runtime starts a
-workload that runs the `openshell-sandbox` supervisor, and the supervisor
-enforces the sandbox contract locally.
+gateway. Supervisor-controlled runtimes start a workload that runs the
+`openshell-sandbox` supervisor, which enforces the sandbox contract locally.
+Driver-controlled runtimes apply the canonical sandbox policy while
+provisioning and report workload readiness directly.
 
 ## Driver Contract
 
-Each runtime receives a sandbox spec from the gateway and is responsible for:
+Each runtime receives a sandbox spec and canonical policy from the gateway and
+is responsible for:
 
 - Selecting the sandbox image.
-- Injecting sandbox identity and gateway callback configuration.
-- Supplying TLS or secret material for supervisor callbacks.
-- Providing the supervisor binary or image in the workload.
+- For supervisor-controlled runtimes, injecting sandbox identity and gateway
+  callback configuration, supplying callback credentials, and providing the
+  supervisor binary or image.
+- For driver-controlled runtimes, validating and applying the canonical policy
+  before launching the workload.
 - Forwarding the exact canonical main-process argv and TTY mode without shell
   reconstruction. The sandbox-level environment and policy workspace apply to
   the main process.
 - Reporting lifecycle and platform events back to the gateway.
 - Cleaning up runtime-owned resources.
 
-Drivers report **backend state only**. A driver snapshot with `Ready=True` means
-the underlying compute resource (container, pod, VM) is healthy and running —
-nothing more. Drivers must not gate on supervisor session state or hold
-references to gateway-internal types. The gateway owns the public
-`SandboxPhase::Ready` decision. This applies equally to extension drivers
-implementing `ComputeDriver` out of tree.
+Drivers report **runtime-observed state only** and must not hold references to
+gateway-internal types. For supervisor-controlled runtimes, `Ready=True` means
+only that the compute resource is healthy; the gateway also requires a
+supervisor session before publishing `SandboxPhase::Ready`. For
+driver-controlled runtimes, `Ready=True` is authoritative because the driver
+launches and monitors the policy-constrained workload itself.
 
 `compute_driver.proto` is the supported gateway/driver extension boundary.
 At initialization the gateway snapshots the driver's identity, version,
-default image, and gateway-lifecycle preference from `GetCapabilities`.
+default image, gateway-lifecycle preference, and `sandbox_runtime_control` from
+`GetCapabilities`. An omitted or unknown runtime-control value is treated as
+`SUPERVISOR` for compatibility. The gateway includes the canonical
+`SandboxPolicy` in both `ValidateSandboxCreate` and `CreateSandbox`; drivers
+that advertise `DRIVER` must validate and apply it before launch.
 Process-identity omissions are preserved across this boundary so every driver
 can apply its native image or runtime defaults. Driver-requested listeners are
 structurally validated and remain restricted to sandbox callback RPCs.
@@ -45,28 +53,29 @@ reason strings.
 
 ## Sandbox Readiness Composition
 
-The gateway composes driver backend state with supervisor session presence to
-produce the public `SandboxPhase`. This composition is gateway-owned and applied
-uniformly across all drivers:
+The gateway composes driver state with the advertised runtime-control mode to
+produce the public `SandboxPhase`:
 
 ```
 backend_phase = derive_phase(driver_status)
 
 public_phase =
   if backend_phase in {Error, Deleting}:                     → pass through (terminal precedence)
+  if runtime_control == Driver && backend_phase == Ready:     → Ready
   if backend_phase == Ready && session connected:             → Ready
   if backend_phase == Ready && no session:                    → Provisioning
   if backend_phase in {Provisioning, Unknown} && session:    → Ready
   if backend_phase in {Provisioning, Unknown} && no session: → Provisioning
 ```
 
-When `public_phase == Ready` the sandbox is usable through the gateway — both the
+For a supervisor-controlled runtime, `public_phase == Ready` means both the
 backend resource is healthy and a supervisor session is registered. A sandbox whose
 backend reports ready but has no supervisor session yet holds `Provisioning` with a
 `Ready=False`, `SupervisorNotConnected` condition and the message
 `Backend ready; waiting for supervisor session`. This distinguishes it from a sandbox
 whose compute resource is still provisioning without exposing contradictory public
-readiness signals.
+readiness signals. For a driver-controlled runtime, the driver's ready condition
+is published without waiting for a supervisor session.
 
 **Session precedence over lagging driver snapshots:** A supervisor session can only be
 established by a running workload. When `set_supervisor_session_state` promotes the
@@ -85,10 +94,12 @@ session-owning replica. That work is deferred to GitHub issue #1868. Until then,
 deployments that require reliable readiness composition must run a single gateway
 replica.
 
-**Extension point:** The readiness decision is a safety invariant, not an
-operator-configurable hook. The driver contract is the correct extension point for
-custom backend readiness semantics. RFC-0010 lifecycle hooks may observe readiness
-transitions via `post_commit`; they do not override the composition rule.
+**Extension point:** Runtime control is a driver capability, not an
+operator-configurable hook. A driver may advertise `DRIVER` only when it applies
+the canonical create-time policy and owns workload readiness. Driver-controlled
+runtimes do not support live policy mutation; recreate the sandbox to apply a
+new policy. RFC-0010 lifecycle hooks may observe readiness transitions via
+`post_commit`; they do not override the composition rule.
 
 The capability RPC reports driver identity, version, and the default sandbox
 image used by the gateway. GPU availability stays driver-local and is validated

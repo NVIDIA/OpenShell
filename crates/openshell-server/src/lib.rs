@@ -1051,12 +1051,6 @@ pub use compute::{
 pub enum ComputeDriverInstance {
     /// A driver hosted in the gateway process.
     InProcess(SharedComputeDriver),
-    /// An in-process driver with a typed sandbox-policy side channel.
-    #[cfg(target_os = "windows")]
-    InProcessWithSandboxPolicy {
-        driver: SharedComputeDriver,
-        sink: Arc<tokio::sync::Mutex<HashMap<String, openshell_core::proto::SandboxPolicy>>>,
-    },
     /// A driver process launched and owned by the gateway.
     ManagedRemote(AcquiredRemoteDriverEndpoint),
 }
@@ -1455,24 +1449,6 @@ async fn build_compute_runtime(
                 .map_err(|error| {
                     Error::execution(format!("failed to create compute runtime: {error}"))
                 })?,
-                #[cfg(target_os = "windows")]
-                ComputeDriverInstance::InProcessWithSandboxPolicy { driver, sink } => {
-                    ComputeRuntime::from_driver(
-                        registration.name,
-                        driver,
-                        None,
-                        store,
-                        sandbox_index,
-                        sandbox_watch_bus,
-                        tracing_log_bus,
-                        supervisor_sessions,
-                    )
-                    .await
-                    .map_err(|error| {
-                        Error::execution(format!("failed to create compute runtime: {error}"))
-                    })?
-                    .with_sandbox_policy_sink(sink)
-                }
                 ComputeDriverInstance::ManagedRemote(mut endpoint) => {
                     endpoint.name = registration.name;
                     ComputeRuntime::new_remote_driver(

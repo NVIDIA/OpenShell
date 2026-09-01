@@ -7,6 +7,7 @@ package openshell.compute.v1;
 
 import "google/protobuf/struct.proto";
 import "options.proto";
+import "sandbox.proto";
 
 // Gateway/compute-driver extension contract.
 //
@@ -71,6 +72,17 @@ service ComputeDriver {
 
 message GetCapabilitiesRequest {}
 
+// Component responsible for the sandbox runtime control plane.
+enum SandboxRuntimeControl {
+  // Compatibility default for drivers that predate this capability. The
+  // gateway treats this as SANDBOX_RUNTIME_CONTROL_SUPERVISOR.
+  SANDBOX_RUNTIME_CONTROL_UNSPECIFIED = 0;
+  // The standard OpenShell supervisor owns readiness and live policy updates.
+  SANDBOX_RUNTIME_CONTROL_SUPERVISOR = 1;
+  // The compute driver owns readiness and applies policy while provisioning.
+  SANDBOX_RUNTIME_CONTROL_DRIVER = 2;
+}
+
 message GetCapabilitiesResponse {
   reserved 4, 5;
   reserved "supports_gpu", "gpu_count";
@@ -86,6 +98,8 @@ message GetCapabilitiesResponse {
   bool gateway_manages_lifecycle = 6;
   // Whether AuthenticateSandbox is implemented by this driver.
   bool supports_sandbox_authentication = 7;
+  // Component responsible for runtime readiness and policy enforcement.
+  SandboxRuntimeControl sandbox_runtime_control = 8;
 }
 
 message AuthenticateSandboxRequest {
@@ -292,6 +306,9 @@ message DriverPlatformEvent {
 message ValidateSandboxCreateRequest {
   // Proposed sandbox configuration to validate before provisioning.
   DriverSandbox sandbox = 1;
+  // Canonical policy the selected driver must validate when it owns runtime
+  // control. Supervisor-controlled drivers may ignore this field.
+  openshell.sandbox.v1.SandboxPolicy policy = 2;
 }
 
 message ValidateSandboxCreateResponse {}
@@ -318,6 +335,9 @@ message ListSandboxesResponse {
 message CreateSandboxRequest {
   // Sandbox configuration to provision on the compute platform.
   DriverSandbox sandbox = 1;
+  // Canonical policy the selected driver must apply when it owns runtime
+  // control. Supervisor-controlled drivers may ignore this field.
+  openshell.sandbox.v1.SandboxPolicy policy = 2;
 }
 
 message CreateSandboxResponse {}

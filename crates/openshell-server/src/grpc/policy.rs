@@ -23,6 +23,7 @@ use crate::provider_profile_sources::EffectiveProviderProfileCatalog;
 #[cfg(test)]
 use crate::provider_profile_sources::ProviderProfileSources;
 use openshell_core::net::{is_always_blocked_ip, is_internal_ip};
+use openshell_core::proto::compute::v1::SandboxRuntimeControl;
 use openshell_core::proto::policy_merge_operation;
 use openshell_core::proto::setting_value;
 use openshell_core::proto::{
@@ -3136,13 +3137,13 @@ pub(super) async fn handle_get_sandbox_provider_environment(
 // ---------------------------------------------------------------------------
 
 fn validate_live_policy_update_support(
-    driver_name: &str,
+    sandbox_runtime_control: SandboxRuntimeControl,
     has_policy: bool,
     has_merge_ops: bool,
 ) -> Result<(), Status> {
-    if (has_policy || has_merge_ops) && driver_name == "mxc" {
+    if (has_policy || has_merge_ops) && sandbox_runtime_control == SandboxRuntimeControl::Driver {
         return Err(Status::failed_precondition(
-            "live policy updates are not supported for MXC sandboxes; recreate the sandbox so the new policy is mapped before launch",
+            "live policy updates are not supported when the selected compute driver owns runtime policy enforcement; recreate the sandbox to apply the new policy",
         ));
     }
     Ok(())
@@ -3223,7 +3224,7 @@ async fn handle_update_config_inner(
         ));
     }
     validate_live_policy_update_support(
-        state.compute.configured_driver_name(),
+        state.compute.sandbox_runtime_control(),
         has_policy,
         has_merge_ops,
     )?;
@@ -6915,17 +6916,23 @@ mod tests {
     use tonic::Code;
 
     #[test]
-    fn mxc_rejects_sandbox_policy_replacement_and_merge_updates() {
+    fn driver_controlled_runtime_rejects_sandbox_policy_replacement_and_merge_updates() {
         for (has_policy, has_merge_ops) in [(true, false), (false, true)] {
-            let error = validate_live_policy_update_support("mxc", has_policy, has_merge_ops)
-                .expect_err("MXC must reject policy mutations after launch");
+            let error = validate_live_policy_update_support(
+                SandboxRuntimeControl::Driver,
+                has_policy,
+                has_merge_ops,
+            )
+            .expect_err("driver-controlled runtimes must reject policy mutations after launch");
             assert_eq!(error.code(), Code::FailedPrecondition);
         }
 
-        let error = validate_live_policy_update_support("mxc", true, false).expect_err(
-            "global policy replacement also changes desired state for live MXC sandboxes",
-        );
+        let error = validate_live_policy_update_support(SandboxRuntimeControl::Driver, true, false)
+            .expect_err("global policy replacement also changes desired state for live sandboxes");
         assert_eq!(error.code(), Code::FailedPrecondition);
+
+        validate_live_policy_update_support(SandboxRuntimeControl::Supervisor, true, false)
+            .expect("supervisor-controlled runtimes support live policy replacement");
     }
 
     /// Wrap a request with a user `Principal` so handler scope guards treat

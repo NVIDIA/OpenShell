@@ -515,6 +515,8 @@ impl PodmanComputeDriver {
             default_image: self.config.default_image.clone(),
             gateway_manages_lifecycle: true,
             supports_sandbox_authentication: false,
+            sandbox_runtime_control:
+                openshell_core::proto::compute::v1::SandboxRuntimeControl::Supervisor.into(),
         })
     }
 

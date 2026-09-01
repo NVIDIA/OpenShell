@@ -438,7 +438,10 @@ mod tests {
 
             ComputeDriver::validate_sandbox_create(
                 &service,
-                Request::new(ValidateSandboxCreateRequest { sandbox: None }),
+                Request::new(ValidateSandboxCreateRequest {
+                    sandbox: None,
+                    policy: None,
+                }),
             )
             .await
         }

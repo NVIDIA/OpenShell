@@ -222,7 +222,10 @@ async fn tracing_in_process_service_preserves_the_driver_rpc_server_boundary() {
         );
         ComputeDriver::validate_sandbox_create(
             &service,
-            Request::new(ValidateSandboxCreateRequest { sandbox: None }),
+            Request::new(ValidateSandboxCreateRequest {
+                sandbox: None,
+                policy: None,
+            }),
         )
         .instrument(gateway_span)
         .await
@@ -306,7 +309,10 @@ async fn tracing_lifecycle_rpc_failures_export_docker_operation_spans() {
     async {
         ComputeDriver::create_sandbox(
             &driver,
-            Request::new(CreateSandboxRequest { sandbox: None }),
+            Request::new(CreateSandboxRequest {
+                sandbox: None,
+                policy: None,
+            }),
         )
         .await
         .expect_err("missing sandbox should fail");
