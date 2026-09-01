@@ -101,6 +101,8 @@ jobs:
         with:
           persist-credentials: false
 
+      - uses: ./.github/actions/setup-e2e-vm
+
       - uses: ./.github/actions/setup-nix
 
       - name: Download RPM artifacts
