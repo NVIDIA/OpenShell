@@ -242,7 +242,6 @@ fn has_main_process_result(sandbox: &Sandbox) -> bool {
 }
 
 pub fn build_cpu_resource_requirements(
-pub fn build_cpu_resource_requirements(
     cpu: Option<&str>,
 ) -> Result<Option<CpuResourceRequirements>> {
     let Some(cpu) = cpu else {
@@ -7436,10 +7435,10 @@ mod tests {
     use super::{
         PolicyGetView, ProvisioningStep, build_cpu_resource_requirements,
         build_memory_resource_requirements, dockerfile_sources_supported_for_gateway,
-        format_endpoint, format_provider_attachment_table, git_sync_files,
-        has_main_process_result, inferred_provider_type, parse_cli_setting_value,
-        parse_credential_expiry_cli_value, parse_credential_expiry_pairs, parse_credential_pairs,
-        parse_driver_config_json, parse_secret_material_env_pairs, policy_revision_to_json,
+        format_endpoint, format_provider_attachment_table, git_sync_files, has_main_process_result,
+        inferred_provider_type, parse_cli_setting_value, parse_credential_expiry_cli_value,
+        parse_credential_expiry_pairs, parse_credential_pairs, parse_driver_config_json,
+        parse_secret_material_env_pairs, policy_revision_to_json,
         provider_profile_allows_empty_credentials, provisioning_timeout_message,
         ready_false_condition_message, refresh_status_header, refresh_status_row, resolve_from,
         sandbox_should_persist, sandbox_upload_plan, service_expose_status_error,

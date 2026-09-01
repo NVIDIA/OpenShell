@@ -345,16 +345,13 @@ fn reject_legacy_template_cpu_memory_resources(
     resources: &prost_types::Struct,
 ) -> Result<(), Status> {
     for section_name in ["limits", "requests"] {
-        let Some(section) =
-            resources
-                .fields
-                .get(section_name)
-                .and_then(|value| match value.kind.as_ref() {
-                    Some(prost_types::value::Kind::StructValue(section)) => Some(section),
-                    _ => None,
-                })
-        else {
+        let Some(value) = resources.fields.get(section_name) else {
             continue;
+        };
+        let Some(prost_types::value::Kind::StructValue(section)) = value.kind.as_ref() else {
+            return Err(Status::invalid_argument(format!(
+                "template.resources.{section_name} must be an object"
+            )));
         };
 
         for resource_name in ["cpu", "memory"] {
@@ -1171,6 +1168,45 @@ mod tests {
             err.message()
                 .contains("spec.resource_requirements.cpu.limit")
         );
+    }
+
+    #[test]
+    fn validate_sandbox_spec_rejects_non_object_legacy_resource_sections() {
+        use prost_types::{ListValue, Struct, Value, value::Kind};
+
+        let invalid_sections = [
+            (
+                "limits",
+                "string",
+                Some(Kind::StringValue("500m".to_string())),
+            ),
+            (
+                "requests",
+                "list",
+                Some(Kind::ListValue(ListValue { values: Vec::new() })),
+            ),
+            ("limits", "null", None),
+        ];
+
+        for (section_name, name, kind) in invalid_sections {
+            let mut fields = std::collections::BTreeMap::new();
+            fields.insert(section_name.to_string(), Value { kind });
+            let spec = SandboxSpec {
+                template: Some(SandboxTemplate {
+                    resources: Some(Struct { fields }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+
+            let message = format!("{name} {section_name} section should be rejected");
+            let err = validate_sandbox_spec("legacy-resources", &spec).expect_err(&message);
+            assert_eq!(err.code(), Code::InvalidArgument, "{name}");
+            assert_eq!(
+                err.message(),
+                format!("template.resources.{section_name} must be an object")
+            );
+        }
     }
 
     #[test]
