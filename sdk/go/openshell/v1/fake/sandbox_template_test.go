@@ -123,6 +123,64 @@ func TestSandboxTemplate_ListFiltersByLabelSelector(t *testing.T) {
 	assert.Equal(t, "runtime-template", listed[0].Name)
 }
 
+func TestSandboxTemplate_ListRejectsNegativePagination(t *testing.T) {
+	tc := newTestSandboxTemplateClient()
+	ctx := context.Background()
+
+	_, err := tc.List(ctx, "default", types.ListOptions{Limit: -1})
+	require.Error(t, err)
+	assert.True(t, types.IsInvalidArgument(err))
+
+	_, err = tc.List(ctx, "default", types.ListOptions{Offset: -1})
+	require.Error(t, err)
+	assert.True(t, types.IsInvalidArgument(err))
+}
+
+func TestSandboxTemplate_ListAppliesPaginationAfterFiltering(t *testing.T) {
+	tc := newTestSandboxTemplateClient()
+	ctx := context.Background()
+
+	_, _ = tc.Create(ctx, "default", &types.SandboxWorkloadTemplate{
+		Name:   "runtime-a",
+		Labels: map[string]string{"team": "runtime"},
+		Spec: types.SandboxWorkloadTemplateSpec{
+			Workload: &types.SandboxWorkloadConfig{Image: "python:3.12"},
+		},
+	})
+	_, _ = tc.Create(ctx, "default", &types.SandboxWorkloadTemplate{
+		Name:   "batch-a",
+		Labels: map[string]string{"team": "batch"},
+		Spec: types.SandboxWorkloadTemplateSpec{
+			Workload: &types.SandboxWorkloadConfig{Image: "python:3.12"},
+		},
+	})
+	_, _ = tc.Create(ctx, "default", &types.SandboxWorkloadTemplate{
+		Name:   "runtime-b",
+		Labels: map[string]string{"team": "runtime"},
+		Spec: types.SandboxWorkloadTemplateSpec{
+			Workload: &types.SandboxWorkloadConfig{Image: "python:3.12"},
+		},
+	})
+
+	listed, err := tc.List(ctx, "default", types.ListOptions{
+		LabelSelector: "team=runtime",
+		Offset:        1,
+		Limit:         1,
+	})
+
+	require.NoError(t, err)
+	require.Len(t, listed, 1)
+	assert.Equal(t, "runtime-b", listed[0].Name)
+
+	listed, err = tc.List(ctx, "default", types.ListOptions{
+		LabelSelector: "team=runtime",
+		Offset:        2,
+	})
+
+	require.NoError(t, err)
+	assert.Empty(t, listed)
+}
+
 func TestSandboxTemplate_CreateSandboxFromTemplateRequiresExistingTemplate(t *testing.T) {
 	client := NewClient()
 	ctx := context.Background()

@@ -5,6 +5,7 @@ package fake
 
 import (
 	"context"
+	"slices"
 	"strings"
 	"time"
 
@@ -111,14 +112,25 @@ func (c *fakeSandboxTemplateClient) List(_ context.Context, workspace string, op
 	var options v1.ListOptions
 	if len(opts) > 0 {
 		options = opts[0]
+		if options.Limit < 0 {
+			return nil, &types.StatusError{Code: types.ErrorInvalidArgument, Message: "limit must not be negative"}
+		}
+		if options.Offset < 0 {
+			return nil, &types.StatusError{Code: types.ErrorInvalidArgument, Message: "offset must not be negative"}
+		}
 	}
 	var templates []*types.SandboxWorkloadTemplate
-	if len(opts) > 0 && opts[0].AllWorkspaces {
+	if options.AllWorkspaces {
 		templates = c.store.ListAll()
 	} else {
 		templates = c.store.List(workspace)
 	}
-	return filterSandboxWorkloadTemplatesByLabelSelector(templates, options.LabelSelector)
+	slices.SortFunc(templates, compareSandboxWorkloadTemplatesForList)
+	templates, err := filterSandboxWorkloadTemplatesByLabelSelector(templates, options.LabelSelector)
+	if err != nil {
+		return nil, err
+	}
+	return paginateSandboxWorkloadTemplates(templates, options), nil
 }
 
 func (c *fakeSandboxTemplateClient) Delete(_ context.Context, workspace, name string) (bool, error) {
@@ -204,6 +216,42 @@ func labelsMatchSelector(labels map[string]string, selector map[string]string) b
 		}
 	}
 	return true
+}
+
+func compareSandboxWorkloadTemplatesForList(a, b *types.SandboxWorkloadTemplate) int {
+	if a.CreatedAt.Before(b.CreatedAt) {
+		return -1
+	}
+	if a.CreatedAt.After(b.CreatedAt) {
+		return 1
+	}
+	if a.Name < b.Name {
+		return -1
+	}
+	if a.Name > b.Name {
+		return 1
+	}
+	if a.Workspace < b.Workspace {
+		return -1
+	}
+	if a.Workspace > b.Workspace {
+		return 1
+	}
+	return 0
+}
+
+func paginateSandboxWorkloadTemplates(
+	templates []*types.SandboxWorkloadTemplate,
+	options v1.ListOptions,
+) []*types.SandboxWorkloadTemplate {
+	if options.Offset >= len(templates) {
+		return templates[:0]
+	}
+	templates = templates[options.Offset:]
+	if options.Limit > 0 && options.Limit < len(templates) {
+		return templates[:options.Limit]
+	}
+	return templates
 }
 
 func isDNS1123Label(name string) bool {
