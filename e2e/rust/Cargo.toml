@@ -109,6 +109,11 @@ path = "tests/vm_gateway_start.rs"
 required-features = ["e2e-vm"]
 
 [[test]]
+name = "vm_corporate_proxy"
+path = "tests/vm_corporate_proxy.rs"
+required-features = ["e2e-vm"]
+
+[[test]]
 name = "provider_token_exchange"
 path = "tests/provider_token_exchange.rs"
 required-features = ["e2e-podman"]

@@ -162,6 +162,19 @@ const GUEST_INIT_DROPIN_DIR: &str = openshell_core::container_paths::VM_GUEST_IN
 /// upperdir on every launch, so the image cannot forge or shadow it.
 const GUEST_INIT_DROPIN_MANIFEST: &str =
     openshell_core::container_paths::VM_GUEST_INIT_DROPIN_MANIFEST;
+/// Guest path of the root-only corporate proxy credential staged by the driver.
+const GUEST_UPSTREAM_PROXY_AUTH_PATH: &str =
+    openshell_core::container_paths::VM_GUEST_UPSTREAM_PROXY_AUTH_PATH;
+/// Guest path of the corporate proxy CA bundle staged by the driver.
+const GUEST_PROXY_CA_PATH: &str = openshell_core::container_paths::VM_GUEST_PROXY_CA_PATH;
+/// Guest path of the driver-authored supervisor argument list.
+///
+/// The counterpart of [`GUEST_INIT_DROPIN_MANIFEST`] for the supervisor's own
+/// command line: written into the overlay upperdir on every launch (empty
+/// when there is nothing to pass) so the guest appends exactly the arguments
+/// the driver chose and a sandbox image cannot forge or shadow them.
+const GUEST_SUPERVISOR_ARGS_PATH: &str =
+    openshell_core::container_paths::VM_GUEST_SUPERVISOR_ARGS_PATH;
 const IMAGE_CACHE_ROOT_DIR: &str = "images";
 const IMAGE_CACHE_ROOTFS_IMAGE: &str = "rootfs.ext4";
 const OVERLAY_TEMPLATE_CACHE_DIR: &str = "overlay-templates";
@@ -217,7 +230,7 @@ enum GuestImagePayloadSource {
     LocalDocker { rootfs_archive: PathBuf },
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct VmDriverConfig {
     pub openshell_endpoint: String,
     pub state_dir: PathBuf,
@@ -243,6 +256,104 @@ pub struct VmDriverConfig {
     /// When empty, defaults to the resolved UID.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sandbox_gid: Option<u32>,
+
+    /// Corporate forward proxy URL (`http://host:port` or `https://host:port`)
+    /// passed to the in-guest supervisor.
+    ///
+    /// The supervisor chains policy-approved TLS tunnels through this proxy
+    /// with HTTP CONNECT instead of dialing destinations directly. This is an
+    /// operator-owned egress boundary: it travels on the supervisor's argv,
+    /// which sandbox spec/template environment and image `ENV` cannot
+    /// influence. A proxy on the gateway host's loopback is reachable from the
+    /// guest only through the gvproxy host alias
+    /// (`host.openshell.internal`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub https_proxy: Option<String>,
+
+    /// Comma-separated `NO_PROXY` list passed alongside the proxy URL.
+    ///
+    /// Matching destinations are dialed directly instead of through the
+    /// corporate proxy. This bypasses only the corporate proxy, never
+    /// `OpenShell` policy evaluation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub no_proxy: Option<String>,
+
+    /// Path (on the gateway host) to a file containing the corporate proxy
+    /// credential in `user:pass` form.
+    ///
+    /// The driver validates it at sandbox-create time and stages it into the
+    /// per-sandbox overlay at [`GUEST_UPSTREAM_PROXY_AUTH_PATH`], root-only.
+    /// Credentials are never embedded in the proxy URL and never reach the
+    /// guest environment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy_auth_file: Option<String>,
+
+    /// Explicit acknowledgement that proxy credentials are sent in cleartext.
+    ///
+    /// `Proxy-Authorization: Basic` over the plain-TCP connection to an
+    /// `http://` proxy is recoverable by anyone on the network path, so
+    /// [`Self::proxy_auth_file`] requires this acknowledgement. An `https://`
+    /// proxy carries the credential inside the verified TLS session and does
+    /// not need it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy_auth_allow_insecure: Option<bool>,
+
+    /// Send the destination hostname in CONNECT requests instead of a
+    /// validated IP.
+    ///
+    /// The default binds the tunnel to an address that passed the sandbox's
+    /// SSRF and `allowed_ips` validation. Set this only when the proxy's ACLs
+    /// filter on hostnames and reject IP CONNECT targets: the proxy then
+    /// resolves the name itself and its own ACLs become the effective egress
+    /// control for proxied TLS.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy_connect_by_hostname: Option<bool>,
+
+    /// Path (on the gateway host) to a PEM CA bundle trusted for the
+    /// corporate proxy.
+    ///
+    /// The driver stages it into the per-sandbox overlay at
+    /// [`GUEST_PROXY_CA_PATH`] and passes that path via
+    /// `--upstream-proxy-ca-bundle`. It is trusted both for the handshake
+    /// with an `https://` proxy and for server certificates re-signed by a
+    /// TLS-intercepting proxy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy_ca_bundle: Option<String>,
+}
+
+/// Redacting `Debug` so a proxy URL or credential path never reaches a log.
+///
+/// A validated proxy URL cannot embed credentials, but `Debug` can be emitted
+/// before validation runs, so presence is logged rather than the value.
+impl std::fmt::Debug for VmDriverConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VmDriverConfig")
+            .field("openshell_endpoint", &self.openshell_endpoint)
+            .field("state_dir", &self.state_dir)
+            .field("launcher_bin", &self.launcher_bin)
+            .field("default_image", &self.default_image)
+            .field("bootstrap_image", &self.bootstrap_image)
+            .field("log_level", &self.log_level)
+            .field("krun_log_level", &self.krun_log_level)
+            .field("vcpus", &self.vcpus)
+            .field("mem_mib", &self.mem_mib)
+            .field("overlay_disk_mib", &self.overlay_disk_mib)
+            .field("guest_tls_ca", &self.guest_tls_ca)
+            .field("guest_tls_cert", &self.guest_tls_cert)
+            .field("guest_tls_key", &self.guest_tls_key)
+            .field("gpu_enabled", &self.gpu_enabled)
+            .field("gpu_mem_mib", &self.gpu_mem_mib)
+            .field("gpu_vcpus", &self.gpu_vcpus)
+            .field("sandbox_uid", &self.sandbox_uid)
+            .field("sandbox_gid", &self.sandbox_gid)
+            .field("https_proxy", &self.https_proxy.is_some())
+            .field("no_proxy", &self.no_proxy)
+            .field("proxy_auth_file", &self.proxy_auth_file.is_some())
+            .field("proxy_auth_allow_insecure", &self.proxy_auth_allow_insecure)
+            .field("proxy_connect_by_hostname", &self.proxy_connect_by_hostname)
+            .field("proxy_ca_bundle", &self.proxy_ca_bundle)
+            .finish()
+    }
 }
 
 /// Default sandbox UID used by the VM driver when no config value is set.
@@ -269,6 +380,12 @@ impl Default for VmDriverConfig {
             gpu_vcpus: 4,
             sandbox_uid: None,
             sandbox_gid: None,
+            https_proxy: None,
+            no_proxy: None,
+            proxy_auth_file: None,
+            proxy_auth_allow_insecure: None,
+            proxy_connect_by_hostname: None,
+            proxy_ca_bundle: None,
         }
     }
 }
@@ -305,6 +422,29 @@ impl VmDriverConfig {
             ));
         }
         Ok(())
+    }
+
+    /// Validate the operator's corporate upstream-proxy settings, fail-closed.
+    ///
+    /// Delegates to the validator shared with the Podman and Kubernetes
+    /// drivers and with the in-guest supervisor, so a value accepted here is
+    /// never rejected inside the guest — and no misconfiguration can silently
+    /// degrade to a direct dial.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message naming the offending key.
+    pub fn validate_proxy_config(&self) -> Result<(), String> {
+        openshell_core::driver_utils::validate_upstream_proxy_settings(
+            &openshell_core::driver_utils::UpstreamProxySettings {
+                url: self.https_proxy.as_deref(),
+                no_proxy: self.no_proxy.as_deref(),
+                auth_file: self.proxy_auth_file.as_deref(),
+                auth_allow_insecure: self.proxy_auth_allow_insecure,
+                connect_by_hostname: self.proxy_connect_by_hostname,
+                ca_bundle: self.proxy_ca_bundle.as_deref(),
+            },
+        )
     }
 
     fn requires_tls_materials(&self) -> bool {
@@ -447,6 +587,7 @@ impl VmDriver {
             .validate()
             .map_err(|err| err.message().to_string())?;
         config.validate_sandbox_identity()?;
+        config.validate_proxy_config()?;
         if config.openshell_endpoint.trim().is_empty() {
             return Err("openshell endpoint is required".to_string());
         }
@@ -901,6 +1042,16 @@ impl VmDriver {
         }
 
         if let Err(err) = inject_guest_init_dropins(&overlay_disk, &plan.guest_init_dropins) {
+            self.lifecycle_extensions
+                .after_launch_failed(&sandbox, &state_dir, LaunchAbortReason::GuestPrepareFailed)
+                .await;
+            self.release_gpu_and_subnet(&sandbox.id);
+            return Err(err);
+        }
+
+        // Staged on every launch, including a restart onto a preserved
+        // overlay, so the driver's copy always shadows the image layer.
+        if let Err(err) = inject_guest_upstream_proxy(&overlay_disk, &self.config).await {
             self.lifecycle_extensions
                 .after_launch_failed(&sandbox, &state_dir, LaunchAbortReason::GuestPrepareFailed)
                 .await;
@@ -5130,6 +5281,192 @@ fn inject_guest_init_dropins(
     span_status.finish(Ok(()))
 }
 
+/// Build the corporate upstream-proxy arguments passed to the guest supervisor.
+///
+/// This operator-owned egress boundary travels on the supervisor's argv,
+/// which sandbox spec/template environment and image `ENV` cannot influence.
+/// Credentials are never on argv — only the root-only guest path is passed;
+/// the supervisor reads the credential from that file.
+fn upstream_proxy_cli_args(config: &VmDriverConfig) -> Vec<String> {
+    let mut args = Vec::new();
+    if let Some(url) = &config.https_proxy {
+        args.push("--upstream-proxy".to_string());
+        args.push(url.clone());
+    }
+    if let Some(list) = &config.no_proxy {
+        args.push("--upstream-no-proxy".to_string());
+        args.push(list.clone());
+    }
+    if config.proxy_auth_file.is_some() {
+        args.push("--upstream-proxy-auth-file".to_string());
+        // The guest path, never the gateway-host path the operator configured.
+        args.push(GUEST_UPSTREAM_PROXY_AUTH_PATH.to_string());
+    }
+    // Config validation guarantees the acknowledgement is `true` whenever an
+    // auth file is configured against an http:// proxy; the supervisor
+    // independently refuses credentials without it.
+    if config.proxy_auth_allow_insecure == Some(true) {
+        args.push("--upstream-proxy-auth-allow-insecure".to_string());
+    }
+    // Absent means the default validated-IP CONNECT binding; only the
+    // explicit hostname opt-in is passed through.
+    if config.proxy_connect_by_hostname == Some(true) {
+        args.push("--upstream-proxy-connect-by-hostname".to_string());
+    }
+    if config.proxy_ca_bundle.is_some() {
+        args.push("--upstream-proxy-ca-bundle".to_string());
+        args.push(GUEST_PROXY_CA_PATH.to_string());
+    }
+    args
+}
+
+/// Render the supervisor argument list as newline-separated arguments.
+///
+/// One argument per line, verbatim: the guest reads the lines into an array
+/// without word splitting or globbing, so values containing spaces survive
+/// intact. An empty list renders an empty file, which the guest reads as "no
+/// extra arguments".
+fn render_guest_supervisor_args(args: &[String]) -> Vec<u8> {
+    let mut body = args.join("\n");
+    if !body.is_empty() {
+        body.push('\n');
+    }
+    body.into_bytes()
+}
+
+/// Reject argument values the newline-delimited guest file cannot represent.
+///
+/// Every value here is operator-supplied config, so this is a guard against
+/// misconfiguration rather than an attack: a stray newline would otherwise
+/// split one value into two arguments in the guest.
+fn validate_guest_supervisor_args(args: &[String]) -> Result<(), String> {
+    for arg in args {
+        if arg.contains('\n') || arg.contains('\r') || arg.contains('\0') {
+            return Err(
+                "corporate proxy settings must not contain newline or NUL characters".to_string(),
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Read and validate the corporate proxy credential from the gateway host.
+///
+/// Uses the validators shared with the supervisor, so a credential accepted
+/// here is never rejected inside the guest. The error never carries the file
+/// contents.
+async fn read_sandbox_proxy_credential(path: &str) -> Result<String, Status> {
+    let path_owned = path.to_string();
+    let raw = tokio::task::spawn_blocking(move || {
+        openshell_core::driver_utils::read_upstream_proxy_credential_file(&path_owned)
+    })
+    .await
+    .map_err(|err| Status::internal(format!("proxy_auth_file read task failed: {err}")))?
+    .map_err(Status::invalid_argument)?;
+    let credential = openshell_core::driver_utils::parse_upstream_proxy_credential(&raw)
+        .map_err(|err| Status::invalid_argument(format!("proxy_auth_file '{path}': {err}")))?;
+    Ok(credential.to_string())
+}
+
+/// Read and validate the corporate proxy CA bundle from the gateway host.
+///
+/// Checked here rather than only in the guest so the operator gets an error
+/// attributable to `proxy_ca_bundle` instead of an opaque supervisor startup
+/// failure inside every sandbox.
+async fn read_sandbox_proxy_ca_bundle(path: &str) -> Result<Vec<u8>, Status> {
+    let path_owned = path.to_string();
+    let bytes = tokio::task::spawn_blocking(move || fs::read(&path_owned))
+        .await
+        .map_err(|err| Status::internal(format!("proxy_ca_bundle read task failed: {err}")))?
+        .map_err(|err| {
+            Status::invalid_argument(format!("proxy_ca_bundle '{path}' could not be read: {err}"))
+        })?;
+    if bytes.is_empty() {
+        return Err(Status::invalid_argument(format!(
+            "proxy_ca_bundle '{path}' is empty"
+        )));
+    }
+    if !bytes
+        .windows(PEM_CERTIFICATE_MARKER.len())
+        .any(|window| window == PEM_CERTIFICATE_MARKER)
+    {
+        return Err(Status::invalid_argument(format!(
+            "proxy_ca_bundle '{path}' contains no PEM certificate"
+        )));
+    }
+    Ok(bytes)
+}
+
+/// Marker every PEM certificate begins with, used to reject a CA bundle that
+/// holds no certificate before it reaches the guest.
+const PEM_CERTIFICATE_MARKER: &[u8] = b"-----BEGIN CERTIFICATE-----";
+
+/// Stage the corporate upstream-proxy configuration into the guest overlay.
+///
+/// Writes three files into the overlay upperdir the driver owns:
+///
+/// * the credential at [`GUEST_UPSTREAM_PROXY_AUTH_PATH`], mode `0600`;
+/// * the CA bundle at [`GUEST_PROXY_CA_PATH`], mode `0644` (a CA certificate
+///   is not secret);
+/// * the supervisor argument list at [`GUEST_SUPERVISOR_ARGS_PATH`], mode
+///   `0644`.
+///
+/// All three are written on every launch, empty when the corresponding
+/// setting is absent. Writing rather than skipping is what makes the channel
+/// unforgeable: the upperdir copy always shadows the read-only image layer, so
+/// a sandbox image cannot supply its own arguments or credential by baking a
+/// file at these paths, and cannot disable the operator's by omitting one. It
+/// also clears material a previous launch staged into a preserved overlay
+/// after the operator removed the setting.
+///
+/// A microVM has no bind mounts or container secrets, so the credential lives
+/// at rest inside the per-sandbox overlay disk on the host — the same
+/// delivery the per-sandbox gateway JWT already uses. It is removed with the
+/// sandbox when the state directory is deleted.
+#[allow(clippy::result_large_err)]
+async fn inject_guest_upstream_proxy(
+    overlay_disk: &Path,
+    config: &VmDriverConfig,
+) -> Result<(), Status> {
+    // Written whether or not they are configured. Writing empty files when
+    // the operator removed a setting clears material a previous launch staged
+    // into a preserved overlay, and shadows anything an image baked at these
+    // paths, so a staged file is only ever the one this launch produced.
+    let credential = match config.proxy_auth_file.as_deref() {
+        Some(path) => format!("{}\n", read_sandbox_proxy_credential(path).await?).into_bytes(),
+        None => Vec::new(),
+    };
+    let credential_path = overlay_upper_path(GUEST_UPSTREAM_PROXY_AUTH_PATH);
+    write_rootfs_image_file(overlay_disk, &credential_path, &credential)
+        .map_err(|err| Status::internal(format!("write VM guest proxy credential: {err}")))?;
+    set_rootfs_image_file_mode(overlay_disk, &credential_path, 0o600)
+        .map_err(|err| Status::internal(format!("set VM guest proxy credential mode: {err}")))?;
+
+    let ca_bundle = match config.proxy_ca_bundle.as_deref() {
+        Some(path) => read_sandbox_proxy_ca_bundle(path).await?,
+        None => Vec::new(),
+    };
+    let ca_path = overlay_upper_path(GUEST_PROXY_CA_PATH);
+    write_rootfs_image_file(overlay_disk, &ca_path, &ca_bundle)
+        .map_err(|err| Status::internal(format!("write VM guest proxy CA bundle: {err}")))?;
+    set_rootfs_image_file_mode(overlay_disk, &ca_path, 0o644)
+        .map_err(|err| Status::internal(format!("set VM guest proxy CA bundle mode: {err}")))?;
+
+    let args = upstream_proxy_cli_args(config);
+    validate_guest_supervisor_args(&args).map_err(Status::failed_precondition)?;
+    let guest_path = overlay_upper_path(GUEST_SUPERVISOR_ARGS_PATH);
+    write_rootfs_image_file(
+        overlay_disk,
+        &guest_path,
+        &render_guest_supervisor_args(&args),
+    )
+    .map_err(|err| Status::internal(format!("write VM guest supervisor arguments: {err}")))?;
+    set_rootfs_image_file_mode(overlay_disk, &guest_path, 0o644).map_err(|err| {
+        Status::internal(format!("set VM guest supervisor arguments mode: {err}"))
+    })?;
+    Ok(())
+}
+
 /// Render the drop-in allow-list as newline-separated, ASCII-sorted,
 /// de-duplicated names. Names are already validated to be path-safe by
 /// [`validate_guest_init_dropins`].
@@ -8402,5 +8739,334 @@ mod tests {
             .expect_err("scripted pool exhaustion should surface");
         assert!(err.is_resource_exhausted());
         assert_eq!(err.message(), "pool empty");
+    }
+
+    /// A driver config carrying only corporate proxy settings.
+    fn proxy_config(
+        https_proxy: Option<&str>,
+        auth_file: Option<&str>,
+        ca_bundle: Option<&str>,
+    ) -> VmDriverConfig {
+        VmDriverConfig {
+            openshell_endpoint: "http://127.0.0.1:8080".to_string(),
+            https_proxy: https_proxy.map(ToString::to_string),
+            proxy_auth_file: auth_file.map(ToString::to_string),
+            proxy_auth_allow_insecure: auth_file.map(|_| true),
+            proxy_ca_bundle: ca_bundle.map(ToString::to_string),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn driver_config_debug_redacts_the_proxy_url_and_credential_path() {
+        // `Debug` can be emitted before validation runs, and an unvalidated
+        // proxy URL may still carry inline `user:pass@` credentials.
+        let rendered = format!(
+            "{:?}",
+            proxy_config(
+                Some("http://user:secret@proxy.corp.test:3128"),
+                Some("/etc/openshell/secrets/proxy-auth"),
+                Some("/etc/openshell/tls/corp-ca.pem"),
+            )
+        );
+        assert!(
+            !rendered.contains("secret") && !rendered.contains("proxy.corp.test"),
+            "the proxy URL must be logged as presence only: {rendered}"
+        );
+        assert!(
+            !rendered.contains("/etc/openshell/secrets/proxy-auth"),
+            "the credential path must be logged as presence only: {rendered}"
+        );
+        assert!(
+            rendered.contains("https_proxy: true") && rendered.contains("proxy_auth_file: true"),
+            "presence of each must still be visible for debugging: {rendered}"
+        );
+        // A CA path is not sensitive and stays readable.
+        assert!(
+            rendered.contains("corp-ca.pem"),
+            "the CA bundle path is not a secret and should stay legible: {rendered}"
+        );
+    }
+
+    #[test]
+    fn proxy_material_is_staged_inside_the_per_sandbox_overlay() {
+        // Everything the driver stages lands in the overlay upperdir, which
+        // lives in the sandbox's own state directory. That is what makes the
+        // credential removable with the sandbox (remove_sandbox_state_dir
+        // deletes the whole directory) and unforgeable by the guest image
+        // (the upperdir shadows the read-only image layer).
+        for guest_path in [
+            GUEST_UPSTREAM_PROXY_AUTH_PATH,
+            GUEST_PROXY_CA_PATH,
+            GUEST_SUPERVISOR_ARGS_PATH,
+        ] {
+            assert!(
+                guest_path.starts_with("/opt/openshell/"),
+                "{guest_path} must be under the reserved guest control root"
+            );
+            assert_eq!(
+                overlay_upper_path(guest_path),
+                format!("/upper{guest_path}"),
+                "{guest_path} must be staged into the overlay upperdir"
+            );
+        }
+    }
+
+    #[test]
+    fn upstream_proxy_args_are_empty_without_a_configured_proxy() {
+        assert!(upstream_proxy_cli_args(&VmDriverConfig::default()).is_empty());
+        // The file is still written, empty, so the guest cannot fall back to
+        // an image-baked argument list.
+        assert!(render_guest_supervisor_args(&[]).is_empty());
+    }
+
+    #[test]
+    fn upstream_proxy_args_pass_guest_paths_not_host_paths() {
+        let config = proxy_config(
+            Some("http://proxy.corp.test:3128"),
+            Some("/etc/openshell/secrets/proxy-auth"),
+            Some("/etc/openshell/tls/corp-ca.pem"),
+        );
+        let args = upstream_proxy_cli_args(&config);
+
+        // The credential and CA live at fixed guest paths; the gateway-host
+        // paths the operator configured must never reach the guest argv.
+        let auth = args
+            .iter()
+            .position(|arg| arg == "--upstream-proxy-auth-file")
+            .map(|i| args[i + 1].as_str());
+        assert_eq!(auth, Some(GUEST_UPSTREAM_PROXY_AUTH_PATH));
+        let ca = args
+            .iter()
+            .position(|arg| arg == "--upstream-proxy-ca-bundle")
+            .map(|i| args[i + 1].as_str());
+        assert_eq!(ca, Some(GUEST_PROXY_CA_PATH));
+        assert!(
+            !args
+                .iter()
+                .any(|arg| arg.contains("/etc/openshell/secrets") || arg.contains("corp-ca.pem")),
+            "host paths leaked into the guest argv: {args:?}"
+        );
+    }
+
+    #[test]
+    fn upstream_proxy_args_pass_only_explicit_opt_ins() {
+        let mut config = proxy_config(Some("https://proxy.corp.test:3130"), None, None);
+        config.no_proxy = Some("10.0.0.0/8,.svc.cluster.local".to_string());
+        let args = upstream_proxy_cli_args(&config);
+        assert_eq!(
+            args,
+            vec![
+                "--upstream-proxy".to_string(),
+                "https://proxy.corp.test:3130".to_string(),
+                "--upstream-no-proxy".to_string(),
+                "10.0.0.0/8,.svc.cluster.local".to_string(),
+            ]
+        );
+
+        // `Some(false)` must not be passed as the presence flag it is on the
+        // supervisor side.
+        config.proxy_connect_by_hostname = Some(false);
+        assert!(
+            !upstream_proxy_cli_args(&config)
+                .iter()
+                .any(|arg| arg == "--upstream-proxy-connect-by-hostname")
+        );
+        config.proxy_connect_by_hostname = Some(true);
+        assert!(
+            upstream_proxy_cli_args(&config)
+                .iter()
+                .any(|arg| arg == "--upstream-proxy-connect-by-hostname")
+        );
+    }
+
+    #[test]
+    fn guest_supervisor_args_render_one_argument_per_line() {
+        let args = vec![
+            "--upstream-proxy".to_string(),
+            "http://proxy.corp.test:3128".to_string(),
+            "--upstream-no-proxy".to_string(),
+            "a.example, b.example".to_string(),
+        ];
+        // A value containing a space stays one line, so the guest reads it
+        // back as a single argument rather than word-splitting it.
+        assert_eq!(
+            String::from_utf8(render_guest_supervisor_args(&args)).unwrap(),
+            "--upstream-proxy\nhttp://proxy.corp.test:3128\n--upstream-no-proxy\na.example, b.example\n"
+        );
+    }
+
+    #[test]
+    fn guest_supervisor_args_reject_line_breaking_values() {
+        // A newline would split one operator value into two guest arguments.
+        for bad in ["a\nb", "a\rb", "a\0b"] {
+            assert!(
+                validate_guest_supervisor_args(&[bad.to_string()]).is_err(),
+                "{bad:?} must be rejected"
+            );
+        }
+        validate_guest_supervisor_args(&["--upstream-proxy".to_string()])
+            .expect("ordinary arguments are accepted");
+    }
+
+    #[test]
+    fn proxy_config_validation_rejects_settings_without_a_proxy_url() {
+        let config = VmDriverConfig {
+            no_proxy: Some("10.0.0.0/8".to_string()),
+            ..Default::default()
+        };
+        let err = config
+            .validate_proxy_config()
+            .expect_err("a bypass list without a proxy would hide a fail-open state");
+        assert!(err.contains("no_proxy"), "{err}");
+
+        let config = proxy_config(Some("http://proxy.corp.test:3128"), None, None);
+        config
+            .validate_proxy_config()
+            .expect("a lone proxy URL is a complete configuration");
+    }
+
+    #[test]
+    fn proxy_config_validation_requires_the_cleartext_acknowledgement() {
+        let mut config = proxy_config(
+            Some("http://proxy.corp.test:3128"),
+            Some("/etc/openshell/secrets/proxy-auth"),
+            None,
+        );
+        config.proxy_auth_allow_insecure = None;
+        let err = config
+            .validate_proxy_config()
+            .expect_err("Basic auth to an http:// proxy is cleartext on the wire");
+        assert!(err.contains("proxy_auth_allow_insecure"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn proxy_ca_bundle_without_a_certificate_fails_the_sandbox() {
+        let dir = std::env::temp_dir().join(format!("openshell-vm-ca-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("not-a-ca.pem");
+        std::fs::write(&path, b"this is not a certificate\n").unwrap();
+
+        let err = read_sandbox_proxy_ca_bundle(path.to_str().unwrap())
+            .await
+            .expect_err("a certificate-free bundle must fail closed");
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("no PEM certificate"), "{err}");
+
+        std::fs::write(&path, b"").unwrap();
+        let err = read_sandbox_proxy_ca_bundle(path.to_str().unwrap())
+            .await
+            .expect_err("an empty bundle must fail closed");
+        assert!(err.message().contains("is empty"), "{err}");
+
+        let err = read_sandbox_proxy_ca_bundle(dir.join("missing.pem").to_str().unwrap())
+            .await
+            .expect_err("an unreadable bundle must fail closed");
+        assert!(err.message().contains("could not be read"), "{err}");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn proxy_credential_is_validated_against_the_supervisor_rules() {
+        let dir = std::env::temp_dir().join(format!("openshell-vm-cred-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("proxy-auth");
+
+        std::fs::write(&path, "proxyuser:proxypass\n").unwrap();
+        assert_eq!(
+            read_sandbox_proxy_credential(path.to_str().unwrap())
+                .await
+                .expect("a well-formed credential is accepted"),
+            "proxyuser:proxypass"
+        );
+
+        // Rejected here rather than inside every sandbox's supervisor.
+        std::fs::write(&path, "no-separator\n").unwrap();
+        let err = read_sandbox_proxy_credential(path.to_str().unwrap())
+            .await
+            .expect_err("a malformed credential must fail closed");
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(
+            !err.message().contains("no-separator"),
+            "the error must not echo credential file contents: {err}"
+        );
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn guest_environment_carries_no_corporate_proxy_settings() {
+        // The egress boundary is argv-only: `build_guest_environment` merges
+        // user-supplied environment, so anything it emitted here would be
+        // attacker-influenced.
+        let config = proxy_config(
+            Some("http://proxy.corp.test:3128"),
+            Some("/etc/openshell/secrets/proxy-auth"),
+            Some("/etc/openshell/tls/corp-ca.pem"),
+        );
+        let sandbox = Sandbox {
+            id: "sb-proxy".to_string(),
+            name: "proxy".to_string(),
+            spec: Some(SandboxSpec {
+                environment: [
+                    (
+                        "HTTPS_PROXY".to_string(),
+                        "http://attacker:3128".to_string(),
+                    ),
+                    ("NO_PROXY".to_string(), "*".to_string()),
+                ]
+                .into_iter()
+                .collect(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let env = build_guest_environment(&sandbox, &config, None);
+        assert!(
+            !env.iter().any(|entry| entry.starts_with("--upstream")),
+            "driver environment must never carry supervisor arguments: {env:?}"
+        );
+        // A sandbox may still set the conventional variables for its own
+        // workload, but the supervisor ignores them on this path -- what
+        // matters is that the driver never derives the boundary from them.
+        assert!(
+            !env.iter()
+                .any(|entry| entry.contains("proxy.corp.test") || entry.contains("proxy-auth")),
+            "operator proxy settings must not reach the guest environment: {env:?}"
+        );
+    }
+
+    #[test]
+    fn sandbox_driver_config_cannot_carry_proxy_settings() {
+        // The upstream proxy is host network topology, not a per-sandbox
+        // setting: the caller-supplied envelope must reject it outright
+        // rather than silently ignoring it.
+        for key in [
+            "https_proxy",
+            "no_proxy",
+            "proxy_auth_file",
+            "proxy_auth_allow_insecure",
+            "proxy_connect_by_hostname",
+            "proxy_ca_bundle",
+        ] {
+            let template = SandboxTemplate {
+                driver_config: Some(Struct {
+                    fields: std::iter::once((
+                        key.to_string(),
+                        Value {
+                            kind: Some(Kind::StringValue("http://attacker:3128".to_string())),
+                        },
+                    ))
+                    .collect(),
+                }),
+                ..Default::default()
+            };
+            assert!(
+                VmSandboxDriverConfig::from_template(&template).is_err(),
+                "template.driver_config.vm must reject '{key}'"
+            );
+        }
     }
 }
