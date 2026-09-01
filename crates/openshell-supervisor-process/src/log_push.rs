@@ -7,6 +7,9 @@
 //! channel to a background task. The task batches lines and streams them to
 //! the server using the `PushSandboxLogs` client-streaming RPC.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use openshell_core::grpc_client::CachedOpenShellClient;
 use openshell_core::proto::{PushSandboxLogsRequest, SandboxLogLine};
 use tokio::sync::mpsc;
@@ -23,16 +26,79 @@ pub struct LogPushLayer {
     sandbox_id: String,
     tx: mpsc::Sender<SandboxLogLine>,
     max_level: tracing::Level,
+    drops: Arc<LogPushDrops>,
 }
 
 impl LogPushLayer {
-    pub fn new(sandbox_id: String, tx: mpsc::Sender<SandboxLogLine>) -> Self {
+    pub fn new(
+        sandbox_id: String,
+        tx: mpsc::Sender<SandboxLogLine>,
+        drops: Arc<LogPushDrops>,
+    ) -> Self {
         let max_level = parse_max_level(std::env::var("OPENSHELL_LOG_PUSH_LEVEL").ok().as_deref());
         Self {
             sandbox_id,
             tx,
             max_level,
+            drops,
         }
+    }
+}
+
+/// Counts log lines the sandbox could not deliver to the gateway.
+#[derive(Debug, Default)]
+pub struct LogPushDrops {
+    channel_full: AtomicU64,
+    backoff_overflow: AtomicU64,
+    handoff_failed: AtomicU64,
+    oversized: AtomicU64,
+}
+
+impl LogPushDrops {
+    /// Lines dropped because the layer's channel was full.
+    #[must_use]
+    pub fn channel_full(&self) -> u64 {
+        self.channel_full.load(Ordering::Relaxed)
+    }
+
+    /// Lines dropped because the reconnect buffer was full.
+    #[must_use]
+    pub fn backoff_overflow(&self) -> u64 {
+        self.backoff_overflow.load(Ordering::Relaxed)
+    }
+
+    /// Lines dropped when shutdown prevented retrying a failed stream handoff.
+    #[must_use]
+    pub fn handoff_failed(&self) -> u64 {
+        self.handoff_failed.load(Ordering::Relaxed)
+    }
+
+    /// Total lines dropped on the sandbox-to-gateway hop.
+    #[must_use]
+    pub fn total(&self) -> u64 {
+        self.channel_full() + self.backoff_overflow() + self.handoff_failed() + self.oversized()
+    }
+
+    /// Lines dropped because one line alone exceeds the gateway's decode limit.
+    #[must_use]
+    pub fn oversized(&self) -> u64 {
+        self.oversized.load(Ordering::Relaxed)
+    }
+
+    fn record_channel_full(&self) {
+        self.channel_full.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_backoff_overflow(&self) {
+        self.backoff_overflow.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_handoff_failed(&self, count: u64) {
+        self.handoff_failed.fetch_add(count, Ordering::Relaxed);
+    }
+
+    fn record_oversized(&self, count: u64) {
+        self.oversized.fetch_add(count, Ordering::Relaxed);
     }
 }
 
@@ -93,24 +159,128 @@ impl<S: Subscriber> Layer<S> for LogPushLayer {
             ocsf_json,
         };
 
-        // Best-effort: drop if the channel is full (don't block tracing).
-        let _ = self.tx.try_send(log);
+        // Best-effort: drop if the channel is full (don't block tracing), but
+        // count the loss so it is visible rather than silent.
+        if self.tx.try_send(log).is_err() {
+            self.drops.record_channel_full();
+        }
     }
 }
 
 /// Spawn a background task that batches and pushes log lines to the server.
 ///
-/// Returns the sender half of the channel (for the [`LogPushLayer`]) and the
-/// task handle. The task runs until the sender is dropped or the gRPC stream
-/// breaks.
+/// Returns the channel sender, shared drop counters, and task handle.
 pub fn spawn_log_push_task(
     endpoint: String,
     sandbox_id: String,
-) -> (mpsc::Sender<SandboxLogLine>, tokio::task::JoinHandle<()>) {
+) -> (
+    mpsc::Sender<SandboxLogLine>,
+    Arc<LogPushDrops>,
+    tokio::task::JoinHandle<()>,
+) {
     let (tx, rx) = mpsc::channel::<SandboxLogLine>(1024);
-    let handle = tokio::spawn(run_push_loop(endpoint, sandbox_id, rx));
+    let drops = Arc::new(LogPushDrops::default());
 
-    (tx, handle)
+    let handle = tokio::spawn(run_push_loop(endpoint, sandbox_id, rx, Arc::clone(&drops)));
+
+    (tx, drops, handle)
+}
+
+/// Build a push request, stamping the running drop total for gap accounting.
+fn push_request(
+    sandbox_id: &str,
+    logs: Vec<SandboxLogLine>,
+    drops: &LogPushDrops,
+) -> PushSandboxLogsRequest {
+    PushSandboxLogsRequest {
+        sandbox_id: sandbox_id.to_string(),
+        logs,
+        dropped_total: drops.total(),
+    }
+}
+
+/// Keep each request clear of the gateway's 1 MiB gRPC decode cap.
+///
+/// Exceeding the cap does not reject one request: it kills the stream, and the
+/// reconnect loop would resend the same batch forever.
+const MAX_PUSH_REQUEST_BYTES: usize = 512 * 1024;
+
+/// Bytes a request costs before any log lines.
+const ENVELOPE_BYTES: usize = 64;
+
+/// Tag and length prefix prost writes per repeated `logs` entry.
+const FIELD_OVERHEAD: usize = 8;
+
+/// Group `logs` so each group encodes below `limit`.
+///
+/// Returns the groups and the count of lines no request could carry.
+fn split_to_fit(logs: Vec<SandboxLogLine>, limit: usize) -> (Vec<Vec<SandboxLogLine>>, u64) {
+    let mut groups: Vec<Vec<SandboxLogLine>> = Vec::new();
+    let mut current: Vec<SandboxLogLine> = Vec::new();
+    let mut current_len = ENVELOPE_BYTES;
+    let mut oversized = 0;
+
+    for line in logs {
+        let line_len = prost::Message::encoded_len(&line) + FIELD_OVERHEAD;
+        if ENVELOPE_BYTES + line_len > limit {
+            oversized += 1;
+            continue;
+        }
+        if !current.is_empty() && current_len + line_len > limit {
+            groups.push(std::mem::take(&mut current));
+            current_len = ENVELOPE_BYTES;
+        }
+        current_len += line_len;
+        current.push(line);
+    }
+    if !current.is_empty() {
+        groups.push(current);
+    }
+
+    (groups, oversized)
+}
+
+/// Send `logs`, splitting to fit and counting anything undeliverable.
+///
+/// Returns the rejected group and any groups not yet handed off when the stream
+/// is gone, preserving their original order for retry after reconnecting.
+async fn send_logs(
+    push_tx: &mpsc::Sender<PushSandboxLogsRequest>,
+    sandbox_id: &str,
+    logs: Vec<SandboxLogLine>,
+    drops: &LogPushDrops,
+) -> Result<(), Vec<SandboxLogLine>> {
+    let (mut groups, oversized) = split_to_fit(logs, MAX_PUSH_REQUEST_BYTES);
+    if oversized > 0 {
+        drops.record_oversized(oversized);
+        eprintln!("openshell: dropped {oversized} log line(s) too large to deliver");
+        if groups.is_empty() {
+            // Report the loss even when the batch has no deliverable line.
+            groups.push(Vec::new());
+        }
+    }
+    let mut groups = groups.into_iter();
+    while let Some(group) = groups.next() {
+        if let Err(rejected) = push_tx.send(push_request(sandbox_id, group, drops)).await {
+            let mut unsent = rejected.0.logs;
+            unsent.extend(groups.flatten());
+            return Err(unsent);
+        }
+    }
+    Ok(())
+}
+
+/// Account for lines that cannot be retried because the log source closed.
+///
+/// A rejected synthetic request used only to report oversized drops contains
+/// no lines, so it must not produce a second, zero-line drop report.
+fn record_shutdown_handoff_failure(unsent: &[SandboxLogLine], drops: &LogPushDrops) -> Option<u64> {
+    let count = u64::try_from(unsent.len()).unwrap_or(u64::MAX);
+    if count == 0 {
+        return None;
+    }
+    drops.record_handoff_failed(count);
+    Some(count)
 }
 
 /// Maximum backoff delay between reconnection attempts.
@@ -118,10 +288,36 @@ const MAX_BACKOFF: tokio::time::Duration = tokio::time::Duration::from_secs(30);
 /// Initial backoff delay after a connection failure.
 const INITIAL_BACKOFF: tokio::time::Duration = tokio::time::Duration::from_secs(1);
 
+/// Request compression for sandbox log pushes.
+///
+/// Keep this disabled until all supported gateways accept gzip. Enabling it in
+/// the same release as server-side acceptance breaks newer supervisors that
+/// connect to an older gateway or an older replica during a rolling upgrade.
+const fn log_push_request_compression() -> Option<tonic::codec::CompressionEncoding> {
+    None
+}
+
+/// Observe why an immediately rejected handoff ended, then drain new lines
+/// during the reconnect delay unless authentication made retrying futile.
+async fn back_off_after_handoff_failure(
+    rpc_done_rx: &mut mpsc::Receiver<bool>,
+    rx: &mut mpsc::Receiver<SandboxLogLine>,
+    batch: &mut Vec<SandboxLogLine>,
+    delay: tokio::time::Duration,
+    drops: &LogPushDrops,
+) -> bool {
+    let fatal_auth = rpc_done_rx.recv().await.unwrap_or(false);
+    if !fatal_auth {
+        drain_during_backoff(rx, batch, delay, drops).await;
+    }
+    fatal_auth
+}
+
 async fn run_push_loop(
     endpoint: String,
     sandbox_id: String,
     mut rx: mpsc::Receiver<SandboxLogLine>,
+    drops: Arc<LogPushDrops>,
 ) {
     let mut batch = Vec::with_capacity(50);
     let mut backoff = INITIAL_BACKOFF;
@@ -143,8 +339,8 @@ async fn run_push_loop(
             Err(e) => {
                 eprintln!("openshell: log push connect failed: {e}");
                 // Drain the channel during backoff so the tracing layer doesn't
-                // block, but discard lines we can't deliver.
-                drain_during_backoff(&mut rx, &mut batch, backoff).await;
+                // fill while retaining the newest lines up to the buffer cap.
+                drain_during_backoff(&mut rx, &mut batch, backoff, &drops).await;
                 backoff = (backoff * 2).min(MAX_BACKOFF);
                 continue;
             }
@@ -159,6 +355,9 @@ async fn run_push_loop(
         let (rpc_done_tx, mut rpc_done_rx) = mpsc::channel::<bool>(1);
         tokio::spawn({
             let mut nav_client = client.raw_client();
+            if let Some(encoding) = log_push_request_compression() {
+                nav_client = nav_client.send_compressed(encoding);
+            }
             async move {
                 let fatal_auth = match nav_client.push_sandbox_logs(stream).await {
                     Ok(_) => false,
@@ -175,16 +374,24 @@ async fn run_push_loop(
         // --- Flush any lines buffered during reconnect ---
         if !batch.is_empty() {
             let lines = std::mem::take(&mut batch);
-            if push_tx
-                .send(PushSandboxLogsRequest {
-                    sandbox_id: sandbox_id.clone(),
-                    logs: lines,
-                })
+            if let Err(unsent) = send_logs(&push_tx, &sandbox_id, lines, &drops).await {
+                // RPC died immediately. Retain the rejected requests, observe
+                // fatal authentication, and drain during backoff before retry.
+                batch = unsent;
+                if back_off_after_handoff_failure(
+                    &mut rpc_done_rx,
+                    &mut rx,
+                    &mut batch,
+                    backoff,
+                    &drops,
+                )
                 .await
-                .is_err()
-            {
-                // RPC died immediately — go back to reconnect.
-                backoff = INITIAL_BACKOFF;
+                {
+                    eprintln!("openshell: log push disabled after authentication failure");
+                    return;
+                }
+                eprintln!("openshell: log push stream lost, reconnecting after backoff...");
+                backoff = (backoff * 2).min(MAX_BACKOFF);
                 continue;
             }
         }
@@ -203,20 +410,21 @@ async fn run_push_loop(
                         // Flush remaining and exit entirely.
                         if !batch.is_empty() {
                             let lines = std::mem::take(&mut batch);
-                            let _ = push_tx.send(PushSandboxLogsRequest {
-                                sandbox_id: sandbox_id.clone(),
-                                logs: lines,
-                            }).await;
+                            if let Err(unsent) = send_logs(&push_tx, &sandbox_id, lines, &drops).await
+                                && let Some(count) = record_shutdown_handoff_failure(&unsent, &drops)
+                            {
+                                eprintln!(
+                                    "openshell: dropped {count} log line(s) after stream handoff failed during shutdown"
+                                );
+                            }
                         }
                         return;
                     };
                     batch.push(line);
                     if batch.len() >= 50 {
                         let lines = std::mem::take(&mut batch);
-                        if push_tx.send(PushSandboxLogsRequest {
-                            sandbox_id: sandbox_id.clone(),
-                            logs: lines,
-                        }).await.is_err() {
+                        if let Err(unsent) = send_logs(&push_tx, &sandbox_id, lines, &drops).await {
+                            batch = unsent;
                             break true;
                         }
                     }
@@ -224,10 +432,8 @@ async fn run_push_loop(
                 _ = timer.tick() => {
                     if !batch.is_empty() {
                         let lines = std::mem::take(&mut batch);
-                        if push_tx.send(PushSandboxLogsRequest {
-                            sandbox_id: sandbox_id.clone(),
-                            logs: lines,
-                        }).await.is_err() {
+                        if let Err(unsent) = send_logs(&push_tx, &sandbox_id, lines, &drops).await {
+                            batch = unsent;
                             break true;
                         }
                     }
@@ -247,7 +453,7 @@ async fn run_push_loop(
 
         if stream_broken {
             eprintln!("openshell: log push stream lost, reconnecting after backoff...");
-            drain_during_backoff(&mut rx, &mut batch, backoff).await;
+            drain_during_backoff(&mut rx, &mut batch, backoff, &drops).await;
             backoff = (backoff * 2).min(MAX_BACKOFF);
         }
     }
@@ -260,6 +466,7 @@ async fn drain_during_backoff(
     rx: &mut mpsc::Receiver<SandboxLogLine>,
     batch: &mut Vec<SandboxLogLine>,
     delay: tokio::time::Duration,
+    drops: &LogPushDrops,
 ) {
     // Keep at most 200 lines across reconnect attempts to bound memory.
     const MAX_BUFFERED: usize = 200;
@@ -271,10 +478,13 @@ async fn drain_during_backoff(
             line = rx.recv() => {
                 match line {
                     Some(l) => {
-                        if batch.len() < MAX_BUFFERED {
-                            batch.push(l);
+                        if batch.len() >= MAX_BUFFERED {
+                            // Prefer current sandbox activity over the oldest
+                            // retry while keeping loss explicitly accounted.
+                            batch.remove(0);
+                            drops.record_backoff_overflow();
                         }
-                        // else: drop — we're over the reconnect buffer limit
+                        batch.push(l);
                     }
                     None => return, // channel closed, sandbox shutting down
                 }
@@ -347,6 +557,7 @@ mod tests {
             sandbox_id: "sb-test".to_string(),
             tx,
             max_level: tracing::Level::INFO,
+            drops: Arc::new(LogPushDrops::default()),
         };
         let subscriber = tracing_subscriber::registry().with(layer);
         tracing::subscriber::with_default(subscriber, f);
@@ -406,6 +617,195 @@ mod tests {
         assert!(
             now < REMOVE_FALLBACK_AFTER_UNIX_SECS,
             "remove the OCSF shorthand message fallback now that gateways predating ocsf_json are no longer supported"
+        );
+    }
+
+    #[test]
+    fn a_batch_that_fits_is_sent_as_one_request() {
+        let logs = vec![test_line("a"), test_line("b")];
+
+        let (groups, oversized) = split_to_fit(logs, MAX_PUSH_REQUEST_BYTES);
+
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].len(), 2);
+        assert_eq!(oversized, 0);
+    }
+
+    #[test]
+    fn an_empty_batch_produces_no_requests() {
+        let (groups, oversized) = split_to_fit(Vec::new(), MAX_PUSH_REQUEST_BYTES);
+
+        assert!(groups.is_empty());
+        assert_eq!(oversized, 0);
+    }
+
+    #[test]
+    fn an_oversized_batch_is_split_rather_than_dropped() {
+        // Each line carries a 1 KiB payload; a 4 KiB limit cannot hold all six.
+        let logs: Vec<SandboxLogLine> = (0..6).map(|i| padded_line(i, 1024)).collect();
+
+        let (groups, oversized) = split_to_fit(logs, 4096);
+
+        assert!(groups.len() > 1, "the batch should have been split");
+        assert_eq!(oversized, 0, "nothing should be lost to a split");
+        let total: usize = groups.iter().map(Vec::len).sum();
+        assert_eq!(total, 6);
+    }
+
+    #[test]
+    fn every_group_encodes_below_the_limit() {
+        let logs: Vec<SandboxLogLine> = (0..20).map(|i| padded_line(i, 1024)).collect();
+
+        let (groups, _) = split_to_fit(logs, 4096);
+
+        for group in &groups {
+            let request = push_request("sb", group.clone(), &LogPushDrops::default());
+            let encoded = prost::Message::encoded_len(&request);
+            assert!(
+                encoded <= 4096,
+                "a group encoded to {encoded} bytes, over the 4096 limit"
+            );
+        }
+    }
+
+    #[test]
+    fn splitting_preserves_line_order() {
+        let logs: Vec<SandboxLogLine> = (0..6).map(|i| padded_line(i, 1024)).collect();
+
+        let (groups, _) = split_to_fit(logs, 4096);
+
+        let messages: Vec<String> = groups
+            .into_iter()
+            .flatten()
+            .map(|line| line.message)
+            .collect();
+        let expected: Vec<String> = (0..6).map(|i| padded_line(i, 1024).message).collect();
+        assert_eq!(messages, expected);
+    }
+
+    #[test]
+    fn a_single_line_too_large_to_send_is_dropped_and_counted() {
+        let logs = vec![test_line("small"), padded_line(1, 8192)];
+
+        let (groups, oversized) = split_to_fit(logs, 4096);
+
+        assert_eq!(oversized, 1);
+        let kept: Vec<String> = groups
+            .into_iter()
+            .flatten()
+            .map(|line| line.message)
+            .collect();
+        assert_eq!(kept, vec!["small"], "the deliverable line still goes");
+    }
+
+    #[tokio::test]
+    async fn an_oversized_only_batch_reports_its_drop() {
+        let (push_tx, mut push_rx) = mpsc::channel(1);
+        let drops = LogPushDrops::default();
+
+        send_logs(
+            &push_tx,
+            "sb",
+            vec![padded_line(1, MAX_PUSH_REQUEST_BYTES)],
+            &drops,
+        )
+        .await
+        .expect("drop report should be handed off");
+
+        let request = push_rx
+            .try_recv()
+            .expect("the gateway should receive the updated drop total");
+        assert!(request.logs.is_empty());
+        assert_eq!(request.dropped_total, 1);
+    }
+
+    #[tokio::test]
+    async fn a_rejected_request_and_remaining_split_groups_are_returned_for_retry() {
+        let (push_tx, mut push_rx) = mpsc::channel(1);
+        let logs: Vec<SandboxLogLine> = (0..3)
+            .map(|i| padded_line(i, MAX_PUSH_REQUEST_BYTES / 2 + 1))
+            .collect();
+
+        let send =
+            tokio::spawn(
+                async move { send_logs(&push_tx, "sb", logs, &LogPushDrops::default()).await },
+            );
+
+        let accepted = push_rx
+            .recv()
+            .await
+            .expect("first group should be accepted");
+        assert_eq!(accepted.logs.len(), 1);
+        assert_eq!(
+            accepted.logs[0].message,
+            padded_line(0, MAX_PUSH_REQUEST_BYTES / 2 + 1).message
+        );
+        drop(push_rx);
+
+        let unsent = send
+            .await
+            .expect("send task should finish")
+            .expect_err("closed request channel should reject the next group");
+        let messages: Vec<_> = unsent.into_iter().map(|line| line.message).collect();
+        assert_eq!(
+            messages,
+            vec![
+                padded_line(1, MAX_PUSH_REQUEST_BYTES / 2 + 1).message,
+                padded_line(2, MAX_PUSH_REQUEST_BYTES / 2 + 1).message,
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rejected_oversized_drop_report_is_not_reported_as_a_zero_line_drop() {
+        let (push_tx, push_rx) = mpsc::channel(1);
+        drop(push_rx);
+        let drops = LogPushDrops::default();
+        let unsent = send_logs(
+            &push_tx,
+            "sb",
+            vec![padded_line(1, MAX_PUSH_REQUEST_BYTES)],
+            &drops,
+        )
+        .await
+        .expect_err("closed request channel should reject the drop report");
+
+        assert!(unsent.is_empty());
+        assert_eq!(record_shutdown_handoff_failure(&unsent, &drops), None);
+        assert_eq!(drops.handoff_failed(), 0);
+        assert_eq!(drops.oversized(), 1);
+    }
+
+    #[test]
+    fn oversized_drops_join_the_running_drop_total() {
+        let drops = LogPushDrops::default();
+        drops.record_oversized(2);
+
+        assert_eq!(drops.oversized(), 2);
+        assert_eq!(drops.total(), 2);
+    }
+
+    #[test]
+    fn push_requests_report_the_running_drop_total() {
+        let drops = LogPushDrops::default();
+        assert_eq!(push_request("sb", Vec::new(), &drops).dropped_total, 0);
+
+        drops.record_channel_full();
+        drops.record_backoff_overflow();
+        drops.record_backoff_overflow();
+        drops.record_handoff_failed(4);
+
+        let request = push_request("sb", vec![test_line("x")], &drops);
+        assert_eq!(request.dropped_total, 7);
+        assert_eq!(request.sandbox_id, "sb");
+        assert_eq!(request.logs.len(), 1);
+    }
+
+    #[test]
+    fn log_push_requests_remain_uncompressed_for_legacy_gateways() {
+        assert!(
+            log_push_request_compression().is_none(),
+            "supervisors must not require gzip until every supported gateway accepts it"
         );
     }
 
@@ -499,6 +899,55 @@ mod tests {
     }
 
     #[test]
+    fn lines_dropped_on_a_full_channel_are_counted() {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let (tx, _rx) = mpsc::channel::<SandboxLogLine>(2);
+        let drops = Arc::new(LogPushDrops::default());
+        let layer = LogPushLayer {
+            sandbox_id: "sb-test".to_string(),
+            tx,
+            max_level: tracing::Level::INFO,
+            drops: Arc::clone(&drops),
+        };
+        let subscriber = tracing_subscriber::registry().with(layer);
+
+        tracing::subscriber::with_default(subscriber, || {
+            for i in 0..5 {
+                tracing::info!(target: "test_target", "line {i}");
+            }
+        });
+
+        // Two fit in the channel; the other three are dropped and counted, so
+        // the loss is a countable gap rather than silence.
+        assert_eq!(drops.channel_full(), 3);
+        assert_eq!(drops.backoff_overflow(), 0);
+    }
+
+    #[tokio::test]
+    async fn lines_dropped_during_backoff_are_counted() {
+        let (tx, mut rx) = mpsc::channel::<SandboxLogLine>(1024);
+        for i in 0..250 {
+            tx.try_send(test_line(&format!("line {i}"))).unwrap();
+        }
+        drop(tx);
+
+        let drops = LogPushDrops::default();
+        let mut batch = Vec::new();
+        drain_during_backoff(
+            &mut rx,
+            &mut batch,
+            tokio::time::Duration::from_secs(30),
+            &drops,
+        )
+        .await;
+
+        assert_eq!(batch.len(), 200);
+        assert_eq!(drops.backoff_overflow(), 50);
+        assert_eq!(drops.channel_full(), 0);
+    }
+
+    #[test]
     fn parse_max_level_defaults_to_info() {
         assert_eq!(parse_max_level(None), tracing::Level::INFO);
         assert_eq!(parse_max_level(Some("not-a-level")), tracing::Level::INFO);
@@ -520,8 +969,15 @@ mod tests {
         }
     }
 
+    /// A line whose message is `pad` bytes long, for size-limit tests.
+    fn padded_line(index: usize, pad: usize) -> SandboxLogLine {
+        let mut line = test_line(&format!("line-{index}"));
+        line.message = format!("line-{index}-{}", "x".repeat(pad));
+        line
+    }
+
     #[tokio::test]
-    async fn drain_during_backoff_buffers_up_to_the_cap_and_drops_the_rest() {
+    async fn drain_during_backoff_keeps_the_newest_lines_at_the_cap() {
         let (tx, mut rx) = mpsc::channel::<SandboxLogLine>(1024);
         for i in 0..250 {
             tx.try_send(test_line(&format!("line {i}"))).unwrap();
@@ -529,11 +985,99 @@ mod tests {
         drop(tx);
 
         let mut batch = Vec::new();
-        drain_during_backoff(&mut rx, &mut batch, tokio::time::Duration::from_secs(30)).await;
+        let drops = LogPushDrops::default();
+        drain_during_backoff(
+            &mut rx,
+            &mut batch,
+            tokio::time::Duration::from_secs(30),
+            &drops,
+        )
+        .await;
 
         assert_eq!(batch.len(), 200);
-        assert_eq!(batch[0].message, "line 0");
-        assert_eq!(batch[199].message, "line 199");
+        assert_eq!(batch[0].message, "line 50");
+        assert_eq!(batch[199].message, "line 249");
+        assert_eq!(drops.backoff_overflow(), 50);
+    }
+
+    #[tokio::test]
+    async fn immediate_handoff_failure_observes_auth_failure_without_draining() {
+        let (rpc_done_tx, mut rpc_done_rx) = mpsc::channel(1);
+        rpc_done_tx.send(true).await.unwrap();
+        drop(rpc_done_tx);
+
+        let (tx, mut rx) = mpsc::channel(1);
+        tx.send(test_line("fresh")).await.unwrap();
+        drop(tx);
+
+        let drops = LogPushDrops::default();
+        let mut batch = vec![test_line("retry")];
+        let fatal_auth = back_off_after_handoff_failure(
+            &mut rpc_done_rx,
+            &mut rx,
+            &mut batch,
+            tokio::time::Duration::from_secs(30),
+            &drops,
+        )
+        .await;
+
+        assert!(fatal_auth);
+        assert_eq!(rx.try_recv().unwrap().message, "fresh");
+    }
+
+    #[tokio::test]
+    async fn immediate_handoff_failure_drains_new_lines_during_backoff() {
+        let (rpc_done_tx, mut rpc_done_rx) = mpsc::channel(1);
+        rpc_done_tx.send(false).await.unwrap();
+        drop(rpc_done_tx);
+
+        let (tx, mut rx) = mpsc::channel(1);
+        tx.send(test_line("fresh")).await.unwrap();
+        drop(tx);
+
+        let drops = LogPushDrops::default();
+        let mut batch = vec![test_line("retry")];
+        let fatal_auth = back_off_after_handoff_failure(
+            &mut rpc_done_rx,
+            &mut rx,
+            &mut batch,
+            tokio::time::Duration::from_secs(30),
+            &drops,
+        )
+        .await;
+
+        assert!(!fatal_auth);
+        assert_eq!(batch.len(), 2);
+        assert_eq!(batch[0].message, "retry");
+        assert_eq!(batch[1].message, "fresh");
+    }
+
+    #[tokio::test]
+    async fn immediate_handoff_failure_waits_for_the_backoff_deadline() {
+        let (rpc_done_tx, mut rpc_done_rx) = mpsc::channel(1);
+        rpc_done_tx.send(false).await.unwrap();
+        drop(rpc_done_tx);
+
+        let (_input_tx, mut rx) = mpsc::channel(1);
+        let drops = LogPushDrops::default();
+        let mut batch = vec![test_line("retry")];
+
+        let result = tokio::time::timeout(
+            tokio::time::Duration::from_millis(10),
+            back_off_after_handoff_failure(
+                &mut rpc_done_rx,
+                &mut rx,
+                &mut batch,
+                tokio::time::Duration::from_secs(1),
+                &drops,
+            ),
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "retry must not spin before backoff elapses"
+        );
     }
 
     #[tokio::test]
@@ -543,7 +1087,14 @@ mod tests {
         drop(tx);
 
         let mut batch = vec![test_line("buffered")];
-        drain_during_backoff(&mut rx, &mut batch, tokio::time::Duration::from_secs(30)).await;
+        let drops = LogPushDrops::default();
+        drain_during_backoff(
+            &mut rx,
+            &mut batch,
+            tokio::time::Duration::from_secs(30),
+            &drops,
+        )
+        .await;
 
         assert_eq!(batch.len(), 2);
         assert_eq!(batch[0].message, "buffered");
@@ -557,9 +1108,15 @@ mod tests {
         drop(tx);
 
         let mut batch = Vec::new();
+        let drops = LogPushDrops::default();
         tokio::time::timeout(
             tokio::time::Duration::from_secs(5),
-            drain_during_backoff(&mut rx, &mut batch, tokio::time::Duration::from_secs(30)),
+            drain_during_backoff(
+                &mut rx,
+                &mut batch,
+                tokio::time::Duration::from_secs(30),
+                &drops,
+            ),
         )
         .await
         .expect("closed channel should end the backoff drain");

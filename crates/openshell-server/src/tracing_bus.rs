@@ -24,6 +24,7 @@ pub struct TracingLogBus {
 struct Inner {
     per_id: HashMap<String, broadcast::Sender<SandboxStreamEvent>>,
     tails: HashMap<String, VecDeque<SandboxStreamEvent>>,
+    dropped_totals: HashMap<String, u64>,
     /// Recently removed sandbox ids, in eviction order.
     removed: VecDeque<String>,
     removed_set: HashSet<String>,
@@ -42,6 +43,7 @@ impl TracingLogBus {
             inner: Arc::new(Mutex::new(Inner {
                 per_id: HashMap::new(),
                 tails: HashMap::new(),
+                dropped_totals: HashMap::new(),
                 removed: VecDeque::new(),
                 removed_set: HashSet::new(),
             })),
@@ -81,6 +83,7 @@ impl TracingLogBus {
         let mut inner = self.inner.lock().expect("tracing bus lock poisoned");
         inner.per_id.remove(sandbox_id);
         inner.tails.remove(sandbox_id);
+        inner.dropped_totals.remove(sandbox_id);
 
         if inner.removed_set.insert(sandbox_id.to_string()) {
             inner.removed.push_back(sandbox_id.to_string());
@@ -102,6 +105,22 @@ impl TracingLogBus {
             .into_iter()
             .rev()
             .collect()
+    }
+
+    /// Return newly reported sandbox-side drops since the previous push.
+    pub(crate) fn sandbox_drop_delta(&self, sandbox_id: &str, reported_total: u64) -> u64 {
+        let mut inner = self.inner.lock().expect("tracing bus lock poisoned");
+        if inner.removed_set.contains(sandbox_id) {
+            return 0;
+        }
+
+        let seen_total = inner
+            .dropped_totals
+            .entry(sandbox_id.to_string())
+            .or_default();
+        let delta = reported_total.saturating_sub(*seen_total);
+        *seen_total = reported_total;
+        delta
     }
 
     /// Publish a log line from an external source (e.g., sandbox push).
@@ -311,6 +330,7 @@ mod tests {
         // Create entries via subscribe and publish
         let _rx = bus.subscribe(sandbox_id);
         bus.publish_external(make_log_event(sandbox_id, "hello"));
+        assert_eq!(bus.sandbox_drop_delta(sandbox_id, 3), 3);
 
         // Verify entries exist
         assert_eq!(bus.tail(sandbox_id, 10).len(), 1);
@@ -320,6 +340,33 @@ mod tests {
 
         // Verify entries are gone
         assert!(bus.tail(sandbox_id, 10).is_empty());
+        assert!(
+            !bus.inner
+                .lock()
+                .unwrap()
+                .dropped_totals
+                .contains_key(sandbox_id)
+        );
+    }
+
+    #[test]
+    fn sandbox_drop_totals_survive_stream_reconnects() {
+        let bus = TracingLogBus::new();
+
+        assert_eq!(bus.sandbox_drop_delta("sb-reconnect", 0), 0);
+        assert_eq!(bus.sandbox_drop_delta("sb-reconnect", 5), 5);
+        assert_eq!(
+            bus.sandbox_drop_delta("sb-reconnect", 5),
+            0,
+            "reconnecting must not recount the cumulative total"
+        );
+        assert_eq!(bus.sandbox_drop_delta("sb-reconnect", 9), 4);
+        assert_eq!(
+            bus.sandbox_drop_delta("sb-reconnect", 2),
+            0,
+            "a supervisor restart must not underflow the counter"
+        );
+        assert_eq!(bus.sandbox_drop_delta("sb-reconnect", 4), 2);
     }
 
     #[test]
