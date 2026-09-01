@@ -115,13 +115,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          nix run .#test-guest -- \
-            --distro fedora \
-            --with podman \
-            --with selinux \
-            --install rpm-input/openshell-[0-9]*.rpm \
-            --install rpm-input/openshell-gateway-[0-9]*.rpm \
-            -- bash -s <<'EOF'
+          guest_script="$RUNNER_TEMP/conformance.sh"
+          cat > "$guest_script" <<'EOF'
           set -euo pipefail
 
           on_exit() {
@@ -154,3 +149,12 @@ jobs:
           openshell gateway add --local https://127.0.0.1:17670 --name openshell
           openshell status
           EOF
+
+          nix run .#test-guest -- \
+            --distro fedora \
+            --with podman \
+            --with selinux \
+            --install rpm-input/openshell-[0-9]*.rpm \
+            --install rpm-input/openshell-gateway-[0-9]*.rpm \
+            --copy "$guest_script:/tmp/conformance.sh" \
+            -- bash /tmp/conformance.sh
