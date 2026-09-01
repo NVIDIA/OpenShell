@@ -210,22 +210,22 @@ message HttpResponsePreflightDecision {
   // Free-form service diagnostic. OpenShell never exposes this to the sandbox
   // or security logs. Limited to 4 KiB before discarding.
   string reason = 3;
+  // Optional stable machine-readable code for audit and diagnostic output.
+  // Codes must start with a lowercase ASCII letter and contain only lowercase
+  // ASCII letters, digits, and underscores, with a maximum length of 64 bytes.
+  // OpenShell never returns this code to the sandbox.
+  string reason_code = 4;
   // Audit-safe findings produced during preflight. At most 32 findings of at
   // most 4 KiB encoded each are accepted.
-  repeated Finding findings = 4;
+  repeated Finding findings = 5;
   // Non-secret service-defined metadata included in diagnostics. At most 64
   // entries and 32 KiB of combined key/value data are accepted.
-  map<string, string> metadata = 5;
+  map<string, string> metadata = 6;
 }
 
 // HttpResponsePreflightSkip ends this stage successfully for the current
 // response. OpenShell sends no body, body-end, or trailer events to the stage.
-message HttpResponsePreflightSkip {
-  // Optional stable machine-readable code for audit output. Codes must start
-  // with a lowercase ASCII letter and contain only lowercase ASCII letters,
-  // digits, and underscores, with a maximum length of 64 bytes.
-  string reason_code = 1;
-}
+message HttpResponsePreflightSkip {}
 
 // HttpResponsePreflightInspect selects this stage's response inspection mode
 // and proposes mutations to the current response head.
@@ -298,12 +298,16 @@ message HttpResponseBodyResult {
   // Free-form service diagnostic. OpenShell never exposes this to the sandbox
   // or security logs. Limited to 4 KiB before discarding.
   string reason = 4;
+  // Optional stable machine-readable code for audit and diagnostic output.
+  // Codes follow HttpResponsePreflightDecision.reason_code and are never
+  // returned to the sandbox.
+  string reason_code = 5;
   // Audit-safe findings produced for this body unit. At most 32 findings of at
   // most 4 KiB encoded each are accepted.
-  repeated Finding findings = 5;
+  repeated Finding findings = 6;
   // Non-secret service-defined metadata included in diagnostics. At most 64
   // entries and 32 KiB of combined key/value data are accepted.
-  map<string, string> metadata = 6;
+  map<string, string> metadata = 7;
 }
 
 // HttpResponseBodyPassThrough preserves the corresponding input unit exactly.
@@ -346,12 +350,16 @@ message HttpResponseTrailersResult {
   // Free-form service diagnostic. OpenShell never exposes this to the sandbox
   // or security logs. Limited to 4 KiB before discarding.
   string reason = 2;
+  // Optional stable machine-readable code for audit and diagnostic output.
+  // Codes follow HttpResponsePreflightDecision.reason_code and are never
+  // returned to the sandbox.
+  string reason_code = 3;
   // Audit-safe findings produced for the final trailers. At most 32 findings of
   // at most 4 KiB encoded each are accepted.
-  repeated Finding findings = 3;
+  repeated Finding findings = 4;
   // Non-secret service-defined metadata included in diagnostics. At most 64
   // entries and 32 KiB of combined key/value data are accepted.
-  map<string, string> metadata = 4;
+  map<string, string> metadata = 5;
 }
 
 // Why OpenShell is ending an HTTP response middleware stream.
