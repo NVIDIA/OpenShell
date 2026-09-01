@@ -101,7 +101,16 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: ./.github/actions/setup-e2e-vm
+      - name: Enable KVM access
+        run: |
+          set -euo pipefail
+          if [[ ! -c /dev/kvm ]]; then
+            echo "::error::The runner did not expose /dev/kvm"
+            exit 1
+          fi
+          sudo chmod 0666 /dev/kvm
+          exec 3<>/dev/kvm
+          exec 3>&-
 
       - uses: ./.github/actions/setup-nix
 
