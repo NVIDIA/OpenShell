@@ -72,6 +72,7 @@ pub struct HttpResponseInvocation {
     pub failed: bool,
     pub stage_disabled: bool,
     pub reason_code: Option<String>,
+    pub failure_category: Option<String>,
 }
 
 pub struct HttpResponsePreflightOutcome {
@@ -211,12 +212,18 @@ impl HttpResponseSession {
             })?;
         let deadline = Instant::now() + MAX_MIDDLEWARE_CHAIN_TIMEOUT;
         let output = self.process_units_from(0, vec![data], deadline).await?;
-        if self.defer_output_until_finish {
-            self.deferred_output.extend(output);
-            Ok(Vec::new())
-        } else {
-            Ok(output)
+        if !self.defer_output_until_finish {
+            return Ok(output);
         }
+        if self.requires_whole_body() {
+            self.deferred_output.extend(output);
+            return Ok(Vec::new());
+        }
+
+        self.defer_output_until_finish = false;
+        let mut released = std::mem::take(&mut self.deferred_output);
+        released.extend(output);
+        Ok(released)
     }
 
     /// Finalize every body stage, process normalized trailers, and end streams.
@@ -595,6 +602,7 @@ impl HttpResponseSession {
             failed: true,
             stage_disabled: true,
             reason_code: None,
+            failure_category: Some(response_failure_category(reason).into()),
         });
         stage
             .end(HttpResponseSessionEndReason::MiddlewareFailure)
@@ -795,6 +803,7 @@ impl ChainRunner {
                         failed: false,
                         stage_disabled: false,
                         reason_code: (!skip.reason_code.is_empty()).then_some(skip.reason_code),
+                        failure_category: None,
                     });
                     let mut skipped = HttpResponseStage {
                         entry,
@@ -898,6 +907,7 @@ impl ChainRunner {
                         failed: false,
                         stage_disabled: false,
                         reason_code: None,
+                        failure_category: None,
                     });
                     stages.push(HttpResponseStage {
                         entry,
@@ -1338,6 +1348,7 @@ fn body_invocation(
         failed: false,
         stage_disabled: false,
         reason_code: None,
+        failure_category: None,
     }
 }
 
@@ -1412,8 +1423,35 @@ fn collect_preflight_failure(
         failed: true,
         stage_disabled: true,
         reason_code: None,
+        failure_category: Some(response_failure_category(reason).into()),
     });
     fail_closed.then(|| format!("middleware_failed: {reason}"))
+}
+
+fn response_failure_category(reason: &str) -> &'static str {
+    if reason == "middleware_session_capacity_exhausted" {
+        "session_capacity"
+    } else if reason.contains("over_capacity") {
+        "payload_capacity"
+    } else if reason.contains("timeout") {
+        "timeout"
+    } else if reason.contains("stream_closed")
+        || reason.contains("stream closed")
+        || reason.contains("transport")
+        || reason.contains("unavailable")
+    {
+        "transport"
+    } else if matches!(
+        reason,
+        "bodyless_response"
+            | "partial_response"
+            | "content_coding_not_identity"
+            | "cache_control_no_transform"
+    ) {
+        "response_not_inspectable"
+    } else {
+        "invalid_result"
+    }
 }
 
 fn empty_preflight_outcome(headers: Vec<HttpHeader>) -> HttpResponsePreflightOutcome {
@@ -2057,9 +2095,20 @@ mod tests {
             let pushed = session.push_body(original.clone()).await;
             assert_eq!(pushed.is_ok(), allowed);
             if allowed {
-                assert!(pushed.unwrap().is_empty());
+                assert_eq!(pushed.unwrap(), vec![original]);
+                assert!(!session.requires_whole_body());
+                for fill in [b'b', b'c'] {
+                    let unit = vec![fill; MAX_HTTP_RESPONSE_STREAM_UNIT_BYTES];
+                    assert_eq!(
+                        session
+                            .push_body(unit.clone())
+                            .await
+                            .expect("fail-open stage must release later units"),
+                        vec![unit]
+                    );
+                }
                 let finish = session.finish(Vec::new()).await.expect("fail-open finish");
-                assert_eq!(finish.body_units, vec![original]);
+                assert!(finish.body_units.is_empty());
             }
         }
     }
