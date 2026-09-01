@@ -99,6 +99,7 @@ jobs:
       runner: linux-amd64-cpu8
       dev-shell: .#devShells.x86_64-linux.glibc-2-28
       cargo-version: ${{ needs.version.outputs.cargo }}
+      image-tag: dev
       interpreter: /lib64/ld-linux-x86-64.so.2
       checkout-ref: ${{ github.sha }}
     secrets: inherit
