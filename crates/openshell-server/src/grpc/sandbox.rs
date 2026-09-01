@@ -1195,6 +1195,16 @@ fn is_watch_terminal(phase: SandboxPhase) -> bool {
 // Exec handler
 // ---------------------------------------------------------------------------
 
+const DEFAULT_PTY_COLS: u32 = 80;
+const DEFAULT_PTY_ROWS: u32 = 24;
+
+fn pty_dimensions(cols: u32, rows: u32) -> (u32, u32) {
+    (
+        if cols == 0 { DEFAULT_PTY_COLS } else { cols },
+        if rows == 0 { DEFAULT_PTY_ROWS } else { rows },
+    )
+}
+
 pub(super) async fn handle_exec_sandbox(
     state: &Arc<ServerState>,
     request: Request<ExecSandboxRequest>,
@@ -1236,6 +1246,7 @@ pub(super) async fn handle_exec_sandbox(
     let stdin_payload = req.stdin;
     let timeout_seconds = req.timeout_seconds;
     let request_tty = req.tty;
+    let (cols, rows) = pty_dimensions(req.cols, req.rows);
 
     let sandbox_id = sandbox.object_id().to_string();
 
@@ -1260,6 +1271,8 @@ pub(super) async fn handle_exec_sandbox(
             timeout_seconds,
             request_tty,
             no_login_shell,
+            cols,
+            rows,
         )
         .await
         {
@@ -1671,8 +1684,7 @@ pub(super) async fn handle_exec_sandbox_interactive(
     let request_tty = req.tty;
     let no_login_shell = req.no_login_shell;
     let timeout_seconds = req.timeout_seconds;
-    let cols = if req.cols == 0 { 80 } else { req.cols };
-    let rows = if req.rows == 0 { 24 } else { req.rows };
+    let (cols, rows) = pty_dimensions(req.cols, req.rows);
 
     let sandbox_id = sandbox.object_id().to_string();
 
@@ -1997,6 +2009,8 @@ async fn stream_exec_over_relay(
     timeout_seconds: u32,
     request_tty: bool,
     no_login_shell: bool,
+    cols: u32,
+    rows: u32,
 ) -> Result<(), Status> {
     let command_preview: String = command
         .chars()
@@ -2022,6 +2036,7 @@ async fn stream_exec_over_relay(
         stdin_payload,
         request_tty,
         no_login_shell,
+        (cols, rows),
         tx.clone(),
     );
 
@@ -2373,8 +2388,11 @@ async fn run_exec_with_russh(
     stdin_payload: Vec<u8>,
     request_tty: bool,
     no_shell_login: bool,
+    pty_size: (u32, u32),
     tx: mpsc::Sender<Result<ExecSandboxEvent, Status>>,
 ) -> Result<i32, Status> {
+    let (cols, rows) = pty_size;
+
     // Defense-in-depth: validate command at the transport boundary.
     if command.as_bytes().contains(&0) {
         return Err(Status::invalid_argument(
@@ -2423,7 +2441,7 @@ async fn run_exec_with_russh(
 
     if request_tty {
         channel
-            .request_pty(false, "xterm-256color", 0, 0, 0, 0, &[])
+            .request_pty(false, "xterm-256color", cols, rows, 0, 0, &[])
             .await
             .map_err(|e| Status::internal(format!("failed to allocate PTY: {e}")))?;
     }
@@ -2550,6 +2568,13 @@ mod tests {
     }
 
     // ---- shell_escape ----
+
+    #[test]
+    fn pty_dimensions_default_zero_values_without_overwriting_explicit_values() {
+        assert_eq!(pty_dimensions(0, 0), (80, 24));
+        assert_eq!(pty_dimensions(120, 40), (120, 40));
+        assert_eq!(pty_dimensions(0, 40), (80, 40));
+    }
 
     #[test]
     fn watch_terminal_phases_include_command_results_and_errors() {

@@ -1477,6 +1477,12 @@ pub async fn sandbox_get(
 /// data into memory before the server rejects an oversized message.
 const MAX_STDIN_PAYLOAD: usize = 4 * 1024 * 1024;
 
+fn local_terminal_size() -> Option<(u32, u32)> {
+    crossterm::terminal::size()
+        .ok()
+        .map(|(cols, rows)| (u32::from(cols), u32::from(rows)))
+}
+
 /// Execute a command in a running sandbox via gRPC, streaming output to the terminal.
 ///
 /// Returns the remote command's exit code.
@@ -1558,6 +1564,12 @@ pub async fn sandbox_exec_grpc(
         .await;
     }
 
+    let (cols, rows) = if tty {
+        local_terminal_size().unwrap_or_default()
+    } else {
+        (0, 0)
+    };
+
     // Make the streaming gRPC call.
     let mut stream = client
         .exec_sandbox(ExecSandboxRequest {
@@ -1568,8 +1580,9 @@ pub async fn sandbox_exec_grpc(
             timeout_seconds,
             stdin: stdin_payload,
             tty,
+            cols,
+            rows,
             no_login_shell,
-            ..Default::default()
         })
         .await
         .into_diagnostic()?
@@ -1925,7 +1938,7 @@ async fn sandbox_exec_interactive_grpc(
     use openshell_core::proto::{ExecSandboxInput, exec_sandbox_input};
     use tokio_stream::wrappers::ReceiverStream;
 
-    let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+    let (cols, rows) = local_terminal_size().unwrap_or((80, 24));
 
     let (input_tx, input_rx) = tokio::sync::mpsc::channel::<ExecSandboxInput>(4096);
 
@@ -1941,8 +1954,8 @@ async fn sandbox_exec_interactive_grpc(
                 timeout_seconds,
                 stdin: Vec::new(),
                 tty: true,
-                cols: u32::from(cols),
-                rows: u32::from(rows),
+                cols,
+                rows,
             })),
         })
         .await
@@ -1992,13 +2005,10 @@ async fn sandbox_exec_interactive_grpc(
                 tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change())
                     .expect("failed to register SIGWINCH handler");
             while sig.recv().await.is_some() {
-                if let Ok((c, r)) = crossterm::terminal::size() {
+                if let Some((cols, rows)) = local_terminal_size() {
                     let msg = ExecSandboxInput {
                         payload: Some(exec_sandbox_input::Payload::Resize(
-                            ExecSandboxWindowResize {
-                                cols: u32::from(c),
-                                rows: u32::from(r),
-                            },
+                            ExecSandboxWindowResize { cols, rows },
                         )),
                     };
                     if resize_tx.send(msg).await.is_err() {
