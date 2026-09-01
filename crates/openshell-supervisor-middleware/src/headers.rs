@@ -277,19 +277,23 @@ fn is_request_protected(name: &str) -> bool {
 fn is_response_protected(name: &str) -> bool {
     matches!(
         name,
-        "connection"
+        "authentication-info"
+            | "connection"
             | "content-encoding"
             | "content-length"
             | "content-range"
             | "keep-alive"
             | "proxy-authenticate"
+            | "proxy-authentication-info"
             | "proxy-authorization"
             | "proxy-connection"
+            | "set-cookie"
             | "te"
             | "trailer"
             | "transfer-encoding"
             | "upgrade"
-    )
+            | "www-authenticate"
+    ) || name.starts_with("x-openshell-credential")
 }
 
 fn is_response_remove_only(name: &str) -> bool {
@@ -553,6 +557,32 @@ mod tests {
             let error = apply(HeaderAuthority::Response, &[], &[], &[mutation])
                 .expect_err("protected response mutation");
             assert!(matches!(error, HeaderMutationError::Protected { .. }));
+        }
+    }
+
+    #[test]
+    fn response_authority_protects_credential_headers_from_writes_and_removals() {
+        let existing = [header("set-cookie", "session=upstream")];
+        for name in [
+            "Set-Cookie",
+            "WWW-Authenticate",
+            "Authentication-Info",
+            "Proxy-Authentication-Info",
+            "X-OpenShell-Credential-Token",
+        ] {
+            for mutation in [
+                write(name, "planted", ExistingHeaderAction::Overwrite),
+                remove(name),
+            ] {
+                let error = apply(HeaderAuthority::Response, &existing, &[], &[mutation])
+                    .expect_err("credential response header mutation");
+                assert_eq!(
+                    error,
+                    HeaderMutationError::Protected {
+                        name: name.to_string()
+                    }
+                );
+            }
         }
     }
 }
