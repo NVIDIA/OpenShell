@@ -822,23 +822,32 @@ fn ensure_line_in_file(
     line: &str,
     exists: impl Fn(&str) -> bool,
 ) -> Result<(), String> {
-    let mut contents = if path.exists() {
+    let contents = if path.exists() {
         fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?
     } else {
         String::new()
     };
 
-    if contents.lines().any(exists) {
-        return Ok(());
+    let mut replaced = false;
+    let mut updated = String::new();
+    for existing in contents.lines() {
+        if exists(existing) {
+            if !replaced {
+                updated.push_str(line);
+                updated.push('\n');
+                replaced = true;
+            }
+        } else {
+            updated.push_str(existing);
+            updated.push('\n');
+        }
+    }
+    if !replaced {
+        updated.push_str(line);
+        updated.push('\n');
     }
 
-    if !contents.is_empty() && !contents.ends_with('\n') {
-        contents.push('\n');
-    }
-    contents.push_str(line);
-    contents.push('\n');
-
-    fs::write(path, contents).map_err(|e| format!("write {}: {e}", path.display()))
+    fs::write(path, updated).map_err(|e| format!("write {}: {e}", path.display()))
 }
 
 fn ensure_supervisor_binary(rootfs: &Path) -> Result<(), String> {
@@ -959,10 +968,10 @@ mod tests {
         write_fake_runtime_binaries(&rootfs);
         fs::write(
             rootfs.join("etc/passwd"),
-            "root:x:0:0:root:/root:/bin/bash\n",
+            "root:x:0:0:root:/root:/bin/bash\nsandbox:x:10001:10001:OpenShell Sandbox:/sandbox:/bin/sh\n",
         )
         .expect("write passwd");
-        fs::write(rootfs.join("etc/group"), "root:x:0:\n").expect("write group");
+        fs::write(rootfs.join("etc/group"), "root:x:0:\nsandbox:x:10001:\n").expect("write group");
         fs::write(rootfs.join("etc/hosts"), "127.0.0.1 localhost\n").expect("write hosts");
         fs::create_dir_all(rootfs.join("bin")).expect("create bin");
         fs::create_dir_all(rootfs.join("sbin")).expect("create sbin");
@@ -1001,6 +1010,12 @@ mod tests {
             fs::read_to_string(rootfs.join("etc/group"))
                 .expect("read group")
                 .contains(&format!("sandbox:x:{uid}:"))
+        );
+        assert!(
+            !fs::read_to_string(rootfs.join("etc/passwd"))
+                .expect("read passwd")
+                .contains("sandbox:x:10001:"),
+            "newly prepared rootfs must replace the legacy sandbox account"
         );
         assert_eq!(
             fs::read_to_string(rootfs.join("etc/hosts")).expect("read hosts"),

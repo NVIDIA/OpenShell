@@ -58,12 +58,11 @@ TLS.
     stores SQLite state under *~/.local/state/openshell/gateway/*.
     Environment: **OPENSHELL_DB_URL**.
 
-**--drivers** *DRIVER*\[,*DRIVER*\]
-:   Compute driver. Accepts a comma-delimited list. The gateway
-    currently requires exactly one driver. Options: **podman**,
+**--compute-driver** *DRIVER*
+:   Compute driver. Selects exactly one driver. Options: **podman**,
     **docker**, **kubernetes**, **vm**. When unset, the gateway
     auto-detects Kubernetes, then Podman, then Docker. VM is opt-in.
-    Environment: **OPENSHELL_DRIVERS**.
+    Environment: **OPENSHELL_COMPUTE_DRIVER**.
 
 **--tls-cert** *PATH*
 :   Path to server TLS certificate file. Defaults to the local generated

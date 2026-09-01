@@ -48,7 +48,7 @@ The file path is provided via:
 OPENSHELL_GATEWAY_CONFIG=/path/to/gateway.toml
 ```
 
-The file must have a `.toml` extension. A missing path is a hard error; an empty existing file is treated as "no configuration" — the gateway falls back to defaults and to whatever the CLI/env supply.
+The file must have a `.toml` extension. A missing path is a hard error. A configured file must declare the exact supported schema version; an empty existing file is rejected.
 
 ### TOML schema
 
@@ -58,7 +58,7 @@ The file is rooted at an `[openshell]` table. This namespacing reserves room for
 
 ```toml
 [openshell]
-version = 1                      # optional; reserved for future schema migrations
+version = 2                      # required schema version
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Gateway-wide settings
@@ -93,6 +93,11 @@ enable_loopback_service_http = true
 # ignores the [openshell.gateway.tls] table below.
 disable_tls           = false
 
+# Gateway-owned TLS bundle injected into the selected local driver.
+guest_tls_ca          = "/etc/openshell/certs/ca.pem"
+guest_tls_cert        = "/etc/openshell/certs/client.pem"
+guest_tls_key         = "/etc/openshell/certs/client-key.pem"
+
 [openshell.gateway.tls]
 cert_path             = "/etc/openshell/certs/gateway.pem"
 key_path              = "/etc/openshell/certs/gateway-key.pem"
@@ -118,9 +123,9 @@ scopes_claim  = ""                     # empty disables scope enforcement
 [openshell.drivers.kubernetes]
 namespace                    = "openshell"
 default_image                = "ghcr.io/nvidia/openshell-community/sandboxes/base:latest"
-image_pull_policy            = "IfNotPresent"
+image_pull_policy            = "if_not_present"
 supervisor_image             = "ghcr.io/nvidia/openshell/supervisor:latest"
-supervisor_image_pull_policy = "IfNotPresent"
+supervisor_image_pull_policy = "if_not_present"
 grpc_endpoint                = "https://host.openshell.internal:8080"
 client_tls_secret_name       = "openshell-sandbox-tls"
 host_gateway_ip              = "10.0.0.1"
@@ -128,26 +133,20 @@ ssh_socket_path              = "/run/openshell/ssh.sock"
 
 [openshell.drivers.docker]
 default_image     = "ghcr.io/nvidia/openshell-community/sandboxes/base:latest"
-image_pull_policy = "IfNotPresent"
+image_pull_policy = "if_not_present"
 sandbox_label     = "docker-dev"
 grpc_endpoint     = "https://host.openshell.internal:8080"
 network_name      = "openshell"
 supervisor_bin    = "/usr/local/libexec/openshell/openshell-sandbox"  # optional override
 supervisor_image  = "ghcr.io/nvidia/openshell/supervisor:latest"      # used to extract bin
-guest_tls_ca      = "/etc/openshell/certs/ca.pem"
-guest_tls_cert    = "/etc/openshell/certs/client.pem"
-guest_tls_key     = "/etc/openshell/certs/client-key.pem"
 
 [openshell.drivers.podman]
 socket_path       = "/run/podman/podman.sock"
 default_image     = "ghcr.io/nvidia/openshell-community/sandboxes/base:latest"
-image_pull_policy = "missing"   # Podman vocabulary: always | missing | never | newer
+image_pull_policy = "if_not_present" # always | if_not_present | never | newer
 supervisor_image  = "ghcr.io/nvidia/openshell/supervisor:latest"
 network_name      = "openshell"
 stop_timeout_secs = 10
-guest_tls_ca      = "/etc/openshell/certs/ca.pem"
-guest_tls_cert    = "/etc/openshell/certs/client.pem"
-guest_tls_key     = "/etc/openshell/certs/client-key.pem"
 
 [openshell.drivers.vm]
 state_dir       = "/var/lib/openshell/vm"
@@ -156,9 +155,6 @@ grpc_endpoint   = "https://host.containers.internal:8080"
 vcpus           = 2
 mem_mib         = 2048
 krun_log_level  = 1
-guest_tls_ca    = "/var/lib/openshell/guest-tls/ca.pem"
-guest_tls_cert  = "/var/lib/openshell/guest-tls/client.pem"
-guest_tls_key   = "/var/lib/openshell/guest-tls/client-key.pem"
 ```
 
 ### Driver configuration
@@ -166,7 +162,7 @@ guest_tls_key   = "/var/lib/openshell/guest-tls/client-key.pem"
 Each `[openshell.drivers.<name>]` table is extracted from the parsed file and handed to the driver's initialization function as a raw TOML value. The driver is then responsible for:
 
 1. **Parsing** — deserializing the table into its own typed config struct (e.g. `KubernetesComputeConfig`, `DockerComputeConfig`, `PodmanComputeConfig`, `VmComputeConfig`).
-2. **Validation** — applying cross-field checks specific to that driver (e.g. requiring TLS triplets when sandbox-side mTLS is enabled).
+2. **Validation** — applying cross-field checks specific to that driver. Gateway-owned guest TLS paths are validated as one bundle and injected only into the selected local driver before this step.
 3. **Consumption** — using the resulting struct to initialize internal state.
 
 Driver authors define and own their config schema. Adding a new driver does not require changes to the gateway's core `Config` struct or to this RFC.
@@ -208,17 +204,17 @@ The following cross-field validations are applied after merging file + env + CLI
 - `bind_address`, `health_bind_address`, and `metrics_bind_address` must all use distinct ports when set.
 - When `[openshell.gateway.tls]` is present, all three of `cert_path`, `key_path`, and `client_ca_path` must be present (either from the file or from CLI/env). Partial TLS configuration is an error.
 - `database_url` must be non-empty after merging env + CLI — every supported driver requires it. The field is not accepted from the file (see Secrets above).
-- `compute_driver` selects exactly one driver. When omitted, the gateway falls back to auto-detection. A custom driver name with no matching `[openshell.drivers.<name>]` table runs with its built-in defaults. The legacy `compute_drivers` list remains accepted: an empty list auto-detects, a singleton selects that driver, and multiple entries retain the existing startup error.
+- `compute_driver` selects exactly one driver. When omitted, the gateway falls back to auto-detection. A custom driver name with no matching `[openshell.drivers.<name>]` table runs with its built-in defaults. The legacy `compute_drivers` list is rejected.
 
-### Backwards compatibility
+### Schema compatibility
 
-The existing CLI interface is fully preserved. All flags continue to work exactly as before. The `--config` flag is new and additive. `OPENSHELL_DB_URL` remains a required process input (it is not accepted from the file). Legacy `compute_drivers = ["<driver>"]` TOML remains accepted, while canonical configurations use the singular `compute_driver = "<driver>"`.
+Schema version 2 requires `version = 2`, a singular `compute_driver` when a driver is selected, and driver-owned fields under `[openshell.drivers.<name>]`. Legacy schema versions and `compute_drivers` lists are rejected. `OPENSHELL_DB_URL` remains a required process input and is not accepted from the file.
 
 ### Example: minimal Kubernetes deployment
 
 ```toml
 [openshell]
-version = 1
+version = 2
 
 [openshell.gateway]
 bind_address  = "0.0.0.0:8080"

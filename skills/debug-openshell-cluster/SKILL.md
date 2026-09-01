@@ -84,11 +84,19 @@ Before debugging the compute platform, inspect gateway logs for failures in depe
 For out-of-tree compute drivers, confirm the selected driver name and socket agree across CLI flags or `gateway.toml`, and that the operator-owned driver is running before the gateway starts:
 
 ```bash
-rg -n 'compute_driver|compute_drivers|socket_path' /etc/openshell/gateway.toml
+rg -n '^version|compute_driver|socket_path|guest_tls_' /etc/openshell/gateway.toml
 stat /run/openshell/<driver>.sock
 journalctl -u <driver-service> --no-pager --lines=200
 journalctl -u openshell-gateway --no-pager --lines=200
 ```
+
+Gateway configuration requires `[openshell] version = 2`, a singular
+`compute_driver` selector, and driver-owned settings under
+`[openshell.drivers.<name>]`. The gateway rejects legacy `compute_drivers`,
+`--drivers`, and `OPENSHELL_DRIVERS` selectors rather than silently migrating
+them. Guest TLS CA, certificate, and key paths are the exception: configure the
+complete bundle under `[openshell.gateway]`, and the gateway injects it only
+into the selected local driver.
 
 Custom names use `[openshell.drivers.<name>].socket_path`. A launch-time `--compute-driver-socket` override may also use `docker`, `podman`, `kubernetes`, or `vm`; the endpoint then takes precedence over built-in construction. First-party standalone drivers require the socket parent directory to be owned by the driver's effective UID, force its mode to `0700`, create the socket with mode `0600`, and accept only peers with that same UID. Check the parent and socket separately with `stat`; a gateway running under a different UID cannot connect even when filesystem permissions or group membership would otherwise allow it. Operator-supplied drivers must provide equivalent access control appropriate to their implementation. Check gateway logs for connection errors, `GetCapabilities` failures, or an unexpected advertised driver name. The advertised name is diagnostic metadata; negotiated features control optional behavior. The gateway does not create or supervise operator-supplied driver processes or sockets.
 

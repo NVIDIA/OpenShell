@@ -246,10 +246,10 @@ controllers and `agents.x-k8s.io/v1alpha1` ownerReferences from existing
 deployments. Supervisors renew gateway JWTs in memory before expiry only while
 the sandbox record still exists. Older tokens are not server-revoked; shared
 deployments bound replay exposure with short `gateway_jwt.ttl_secs` lifetimes.
-The config default is
-`gateway_jwt.ttl_secs = 0` for local single-player Docker, Podman, and VM
-gateways; those tokens carry `exp = 0` and do not expire. Kubernetes and other
-shared deployments should set a positive TTL.
+Omitting `gateway_jwt.ttl_secs` selects non-expiring tokens for local
+single-player Docker, Podman, and VM gateways; those tokens carry `exp = 0`.
+Kubernetes and other shared deployments should set a positive TTL. Explicit
+zero is rejected.
 
 Gateway JWT signing-key rotation is currently an offline operator action. The
 runtime loads one active signing key and one matching public verification key
@@ -690,10 +690,9 @@ Gateway CLI flag  >  gateway OPENSHELL_* env var  >  TOML file  >  built-in defa
 ```
 
 The TOML file is opt-in via `--config <PATH>` / `OPENSHELL_GATEWAY_CONFIG`.
-Driver implementation settings live in the TOML driver tables. The canonical
-selector is the singular `[openshell.gateway] compute_driver`; the legacy
-`compute_drivers` list remains accepted and normalizes into the existing
-exactly-one-driver runtime validation. See `docs/reference/gateway-config.mdx`
+Driver implementation settings live exclusively in TOML driver tables. The
+selector is the singular `[openshell.gateway] compute_driver`; legacy
+`compute_drivers` lists are rejected. See `docs/reference/gateway-config.mdx`
 for worked per-driver examples and RFC 0003 for the full schema.
 
 Each installation has an operator-assigned gateway name. Configure it with
@@ -708,29 +707,20 @@ aliases, network names, and the sandbox JWT issuer.
 `database_url` is env-only and rejected when present in the file
 (`OPENSHELL_DB_URL` / `--db-url`).
 
-### Driver inheritance
+### Driver ownership
 
-`[openshell.gateway]` carries shared defaults such as `default_image`,
-`supervisor_image`, `guest_tls_ca/cert/key`, `client_tls_secret_name`, and
-`host_gateway_ip`. It also continues to accept the historical
-`sandbox_namespace`, `service_account_name`, and `enable_user_namespaces`
-locations as compatibility inputs. Canonical Kubernetes configuration places
-those values in `[openshell.drivers.kubernetes]` as `namespace`,
-`service_account_name`, and `enable_user_namespaces`; canonical Docker
-configuration uses `sandbox_label`. Driver-table values take precedence over
-compatibility inputs. The allowlist is per-driver so a gateway-wide default
-cannot land in a driver that does not understand it (for example,
-`client_tls_secret_name` is K8s-only).
+`[openshell.gateway]` contains gateway process settings only. Each selected
+driver reads its own configuration exclusively from
+`[openshell.drivers.<name>]`; values are never inherited from gateway scope.
+Kubernetes owns `namespace`, `default_image`, `supervisor_image`,
+`client_tls_secret_name`, `service_account_name`, `host_gateway_ip`,
+`enable_user_namespaces`, and `sa_token_ttl_secs`. Docker uses
+`sandbox_label` instead of the legacy `sandbox_namespace` name. Podman and VM
+likewise own their image, endpoint, and runtime settings in their tables.
 
-`image_pull_policy` is intentionally **not** inheritable: Kubernetes uses
-`Always | IfNotPresent | Never` (passed verbatim to the K8s API) while
-Podman uses the lowercase enum `always | missing | never | newer`. No
-value means the same thing in both, so the key lives only under each
-driver's own table.
-
-Driver-specific values that are not part of the inheritance allowlist
-(e.g. Podman `socket_path`, VM `vcpus`) only come from the driver's own
-table.
+`image_pull_policy` uses the shared canonical vocabulary
+`always | if_not_present | never | newer`. Drivers translate it to their runtime
+APIs; `newer` is supported only by Podman and rejected by Docker and Kubernetes.
 
 ### OTLP export
 

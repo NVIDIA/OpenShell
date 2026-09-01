@@ -91,11 +91,7 @@ struct Args {
     #[arg(long, env = "OPENSHELL_GATEWAY_NAME")]
     gateway_name: Option<String>,
 
-    #[arg(
-        long = "grpc-endpoint",
-        alias = "openshell-endpoint",
-        env = "OPENSHELL_GRPC_ENDPOINT"
-    )]
+    #[arg(long = "grpc-endpoint", env = "OPENSHELL_GRPC_ENDPOINT")]
     grpc_endpoint: Option<String>,
 
     #[arg(long, env = "OPENSHELL_SANDBOX_IMAGE", default_value = "")]
@@ -119,6 +115,47 @@ struct Args {
 
     #[arg(long = "guest-tls-key", env = "OPENSHELL_VM_TLS_KEY")]
     guest_tls_key: Option<PathBuf>,
+
+    /// Corporate forward proxy for supervisor TLS egress.
+    #[arg(long, env = "OPENSHELL_VM_UPSTREAM_PROXY")]
+    upstream_proxy: Option<String>,
+
+    #[arg(long, env = "OPENSHELL_VM_UPSTREAM_NO_PROXY")]
+    upstream_no_proxy: Option<String>,
+
+    /// Root-owned gateway-host file containing `user:pass` proxy credentials.
+    #[arg(long, env = "OPENSHELL_VM_UPSTREAM_PROXY_AUTH_FILE")]
+    upstream_proxy_auth_file: Option<PathBuf>,
+
+    /// Explicitly acknowledge cleartext Basic authentication to an http proxy.
+    #[arg(
+        long,
+        env = "OPENSHELL_VM_UPSTREAM_PROXY_AUTH_ALLOW_INSECURE",
+        default_value_t = false
+    )]
+    upstream_proxy_auth_allow_insecure: bool,
+
+    #[arg(
+        long,
+        env = "OPENSHELL_VM_UPSTREAM_PROXY_CONNECT_BY_HOSTNAME",
+        default_value_t = false
+    )]
+    upstream_proxy_connect_by_hostname: bool,
+
+    /// Guest-reachable SPIFFE Workload API endpoint (`tcp:IP:port`).
+    #[arg(
+        long = "provider-spiffe-workload-api-tcp-endpoint",
+        env = "OPENSHELL_PROVIDER_SPIFFE_WORKLOAD_API_TCP_ENDPOINT"
+    )]
+    provider_spiffe_workload_api_tcp_endpoint: Option<String>,
+
+    /// Explicit acknowledgement that the configured Workload API listener is exposed to VM guests.
+    #[arg(
+        long,
+        env = "OPENSHELL_PROVIDER_SPIFFE_ALLOW_GUEST_TCP",
+        default_value_t = false
+    )]
+    provider_spiffe_allow_guest_tcp: bool,
 
     #[arg(long, env = "OPENSHELL_VM_KRUN_LOG_LEVEL", default_value_t = 1)]
     krun_log_level: u32,
@@ -254,6 +291,17 @@ async fn main() -> Result<()> {
         guest_tls_ca: args.guest_tls_ca.clone(),
         guest_tls_cert: args.guest_tls_cert.clone(),
         guest_tls_key: args.guest_tls_key.clone(),
+        upstream_proxy: openshell_core::UpstreamProxyConfig {
+            https_proxy: args.upstream_proxy.clone(),
+            no_proxy: args.upstream_no_proxy.clone(),
+            proxy_auth_file: args.upstream_proxy_auth_file.clone(),
+            proxy_auth_allow_insecure: args.upstream_proxy_auth_allow_insecure.then_some(true),
+            proxy_connect_by_hostname: args.upstream_proxy_connect_by_hostname.then_some(true),
+        },
+        provider_spiffe_workload_api_tcp_endpoint: args
+            .provider_spiffe_workload_api_tcp_endpoint
+            .clone(),
+        provider_spiffe_allow_guest_tcp: args.provider_spiffe_allow_guest_tcp,
         gpu_enabled: args.gpu,
         gpu_mem_mib: args.gpu_mem_mib,
         gpu_vcpus: args.gpu_vcpus,
@@ -780,14 +828,14 @@ mod tests {
     }
 
     #[test]
-    fn accepts_legacy_openshell_endpoint_flag_alias() {
-        let args = Args::try_parse_from([
+    fn rejects_legacy_openshell_endpoint_flag() {
+        let error = Args::try_parse_from([
             "openshell-driver-vm",
             "--openshell-endpoint",
             "http://127.0.0.1:8080",
         ])
-        .unwrap();
-        assert_eq!(args.grpc_endpoint.as_deref(), Some("http://127.0.0.1:8080"));
+        .expect_err("legacy --openshell-endpoint must be rejected");
+        assert!(error.to_string().contains("--openshell-endpoint"));
     }
 
     #[test]

@@ -54,9 +54,9 @@ The `mxc` driver is available only in native Windows gateway builds.
 Non-reserved names select an extension driver and require a
 `socket_path` in `[openshell.drivers.<name>]`.
 
-When `compute_driver` is unset, the gateway auto-detects Kubernetes, then Podman, then Docker. Docker must respond on a known API socket. Podman first probes known API sockets and then asks the `podman` CLI for the active native or machine-backed socket. The VM driver is never auto-detected; configure it explicitly with `compute_driver = "vm"` or set `OPENSHELL_DRIVERS=vm` in the launch environment.
+When `compute_driver` is unset, the gateway auto-detects Kubernetes, then Podman, then Docker. Docker must respond on a known API socket. Podman first probes known API sockets and then asks the `podman` CLI for the active native or machine-backed socket. The VM driver is never auto-detected; configure it explicitly with `compute_driver = "vm"` or set `OPENSHELL_COMPUTE_DRIVER=vm` in the launch environment.
 
-The legacy `compute_drivers = ["<driver>"]` list remains accepted for compatibility. Empty legacy lists retain auto-detection, and lists with more than one entry retain the existing startup error because a gateway supports exactly one active compute driver.
+`compute_driver` accepts exactly one scalar driver name. The legacy `compute_drivers` list is rejected by schema version 2.
 
 Common gateway options:
 
@@ -83,8 +83,8 @@ socket path. The endpoint replaces normal driver construction for that name,
 including canonical built-in names:
 
 ```shell
-openshell-gateway --drivers kyma --compute-driver-socket /run/openshell/kyma.sock
-openshell-gateway --drivers docker --compute-driver-socket /run/openshell/docker.sock
+openshell-gateway --compute-driver kyma --compute-driver-socket /run/openshell/kyma.sock
+openshell-gateway --compute-driver docker --compute-driver-socket /run/openshell/docker.sock
 ```
 
 The gateway connects to the operator-provided endpoint; it does not provision
@@ -342,7 +342,7 @@ Enable VM by setting `compute_driver = "vm"` in the gateway TOML file:
 compute_driver = "vm"
 ```
 
-For a launch-time override, set `OPENSHELL_DRIVERS=vm` in the gateway environment and restart the service.
+For a launch-time override, set `OPENSHELL_COMPUTE_DRIVER=vm` in the gateway environment and restart the service.
 
 Configure VM driver values such as `grpc_endpoint`, `driver_dir`, `state_dir`, `default_image`, `bootstrap_image`, `vcpus`, `mem_mib`, `overlay_disk_mib`, `krun_log_level`, and `guest_tls_*` in `[openshell.drivers.vm]`. The VM `state_dir` stores overlay disks, console logs, runtime state, image-rootfs cache, and the private `run/compute-driver.sock` socket. The VM socket path is managed by the gateway and is not configurable through remote endpoint settings.
 
@@ -400,13 +400,13 @@ For maintainer-level implementation details, refer to the [Kubernetes driver REA
 | `[openshell.drivers.kubernetes].service_account_name` | `sandboxServiceAccount.name` | Set the Kubernetes service account assigned to sandbox pods and accepted by the Kubernetes driver's TokenReview bootstrap path. The Helm chart creates a dedicated sandbox service account by default. |
 | `[openshell.drivers.kubernetes].enable_user_namespaces` | `server.enableUserNamespaces` | Enable Kubernetes user namespaces for sandbox pods. |
 | `default_image` | `server.sandboxImage` | Set the default sandbox image. |
-| `image_pull_policy` | `server.sandboxImagePullPolicy` | Set the Kubernetes image pull policy for sandbox pods. |
+| `image_pull_policy` | `server.sandboxImagePullPolicy` | Set the canonical sandbox pull policy: `always`, `if_not_present`, or `never`. `newer` is Podman-only. |
 | `image_pull_secrets` | `server.sandboxImagePullSecrets` | Attach Kubernetes image-pull Secrets to sandbox pods. Managed mode copies these explicitly named Secrets from the configured source namespace into each workspace namespace. In shared and operator modes, the Secrets must already exist in the sandbox namespace. |
 | `[managed_ssh_ingress]` | `networkPolicy.enabled` | In managed mode, create an SSH ingress policy in every workspace namespace. Helm configures the gateway namespace and pod selector automatically. Operator mode leaves namespace policy management to the platform operator. |
 | `grpc_endpoint` | `server.grpcEndpoint` | Set the gateway callback endpoint reachable from sandbox pods. |
 | `client_tls_secret_name` | `server.tls.clientTlsSecretName` | Mount sandbox client TLS materials from a Kubernetes secret. |
 | `supervisor_image` | `supervisor.image.repository` / `supervisor.image.tag` | Override the supervisor image that provides the `openshell-sandbox` binary. The default repository with an empty tag uses the version-pinned image built into the gateway. Changing the repository uses the effective gateway image tag, while setting a tag pins that version explicitly. |
-| `supervisor_image_pull_policy` | `supervisor.image.pullPolicy` | Set the Kubernetes image pull policy for the supervisor image. |
+| `supervisor_image_pull_policy` | `supervisor.image.pullPolicy` | Set the canonical supervisor pull policy: `always`, `if_not_present`, or `never`. `newer` is Podman-only. |
 | `supervisor_sideload_method` | `supervisor.sideloadMethod` | How the supervisor binary is delivered into sandbox pods. Leave empty to auto-detect from cluster version. Set to `image-volume` to mount the supervisor OCI image directly as a volume (requires Kubernetes 1.33+ with the ImageVolume feature gate; GA in 1.36), or `init-container` to copy it through an init container on older clusters. |
 | `topology` | `supervisor.topology` | Set `combined` for the default single supervisor path, or `sidecar` to move pod-level network enforcement and the gateway session into a dedicated sidecar. |
 | `https_proxy` | `upstreamProxy.url` | Set the operator-owned `http://host:port` corporate forward proxy used for policy-approved TLS CONNECT egress. |

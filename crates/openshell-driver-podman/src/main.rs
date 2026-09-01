@@ -5,15 +5,13 @@ use clap::Parser;
 use miette::{IntoDiagnostic, Result};
 use std::future::Future;
 use std::net::SocketAddr;
+use std::num::{NonZeroI64, NonZeroU64};
 use std::path::PathBuf;
 use tracing::info;
 
-use openshell_core::VERSION;
 use openshell_core::proto::compute::v1::compute_driver_server::ComputeDriverServer;
-use openshell_driver_podman::config::{
-    DEFAULT_NETWORK_NAME, DEFAULT_PODMAN_STOP_TIMEOUT_SECS, DEFAULT_SANDBOX_PIDS_LIMIT,
-    ImagePullPolicy,
-};
+use openshell_core::{AppArmorProfile, ImagePullPolicy, VERSION};
+use openshell_driver_podman::config::{DEFAULT_NETWORK_NAME, DEFAULT_PODMAN_STOP_TIMEOUT_SECS};
 use openshell_driver_podman::{ComputeDriverService, PodmanComputeConfig, PodmanComputeDriver};
 
 #[derive(Parser)]
@@ -50,7 +48,7 @@ struct Args {
     #[arg(
         long,
         env = "OPENSHELL_SANDBOX_IMAGE_PULL_POLICY",
-        default_value_t = ImagePullPolicy::Missing
+        default_value_t = ImagePullPolicy::IfNotPresent
     )]
     sandbox_image_pull_policy: ImagePullPolicy,
 
@@ -89,14 +87,19 @@ struct Args {
     #[arg(long, env = "OPENSHELL_STOP_TIMEOUT", default_value_t = DEFAULT_PODMAN_STOP_TIMEOUT_SECS)]
     stop_timeout: u32,
 
-    /// Container cgroup PID limit for sandbox containers. Set 0 to inherit
+    /// Container cgroup PID limit for sandbox containers. Omit to inherit
     /// Podman's runtime/default PID limit.
+    #[arg(long, env = "OPENSHELL_SANDBOX_PIDS_LIMIT")]
+    sandbox_pids_limit: Option<NonZeroI64>,
+
+    /// Health check interval in seconds. Omit it in gateway TOML to disable
+    /// health checks; the standalone driver keeps its prior 10-second default.
     #[arg(
         long,
-        env = "OPENSHELL_SANDBOX_PIDS_LIMIT",
-        default_value_t = DEFAULT_SANDBOX_PIDS_LIMIT
+        env = "OPENSHELL_HEALTH_CHECK_INTERVAL_SECS",
+        default_value = "10"
     )]
-    sandbox_pids_limit: i64,
+    health_check_interval_secs: Option<NonZeroU64>,
 
     /// OCI image containing the openshell-sandbox supervisor binary.
     #[arg(long, env = "OPENSHELL_SUPERVISOR_IMAGE")]
@@ -113,6 +116,14 @@ struct Args {
     /// Host path to the client private key for sandbox mTLS.
     #[arg(long, env = "OPENSHELL_PODMAN_TLS_KEY")]
     podman_tls_key: Option<PathBuf>,
+
+    /// Host UNIX socket projected into supervisors for provider SPIFFE token exchange.
+    #[arg(long, env = "OPENSHELL_PROVIDER_SPIFFE_WORKLOAD_API_SOCKET")]
+    provider_spiffe_workload_api_socket: Option<PathBuf>,
+
+    /// `AppArmor` model: `RuntimeDefault`, `Unconfined`, or `Localhost/<profile>`.
+    #[arg(long, env = "OPENSHELL_APP_ARMOR_PROFILE")]
+    app_armor_profile: Option<AppArmorProfile>,
 
     /// Corporate forward proxy URL for the supervisor's upstream TLS dials,
     /// in explicit `http://host:port` form (scheme and port required).
@@ -202,7 +213,10 @@ async fn main() -> Result<()> {
         guest_tls_ca: args.podman_tls_ca,
         guest_tls_cert: args.podman_tls_cert,
         guest_tls_key: args.podman_tls_key,
+        provider_spiffe_workload_api_socket: args.provider_spiffe_workload_api_socket,
+        app_armor_profile: args.app_armor_profile,
         sandbox_pids_limit: args.sandbox_pids_limit,
+        health_check_interval_secs: args.health_check_interval_secs,
         https_proxy: args.sandbox_https_proxy,
         no_proxy: args.sandbox_no_proxy,
         proxy_auth_file: args.sandbox_proxy_auth_file,
@@ -213,7 +227,6 @@ async fn main() -> Result<()> {
         uidmap: args.uidmap,
         gidmap: args.gidmap,
         enable_bind_mounts: args.enable_bind_mounts,
-        ..PodmanComputeConfig::default()
     })
     .await
     .into_diagnostic()?;
@@ -308,5 +321,22 @@ mod tests {
             Some("http://collector.internal:4317")
         );
         assert_eq!(args.gateway_name.as_deref(), Some("production-us-west"));
+    }
+
+    #[test]
+    fn standalone_defaults_preserve_health_checks_and_reject_zero_limits() {
+        let defaults = Args::try_parse_from(["openshell-driver-podman"])
+            .expect("standalone driver defaults should parse");
+        assert_eq!(
+            defaults.health_check_interval_secs.map(NonZeroU64::get),
+            Some(10)
+        );
+
+        for flag in ["--sandbox-pids-limit", "--health-check-interval-secs"] {
+            let result = Args::try_parse_from(["openshell-driver-podman", flag, "0"]);
+            assert!(result.is_err(), "zero must be rejected for {flag}");
+            let error = result.err().expect("error was asserted above");
+            assert!(error.to_string().contains("invalid value"), "flag: {flag}");
+        }
     }
 }

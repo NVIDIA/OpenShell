@@ -4,7 +4,7 @@
 //! Podman compute driver.
 
 use crate::client::{ContainerListEntry, PodmanApiError, PodmanClient, VolumeInspect};
-use crate::config::PodmanComputeConfig;
+use crate::config::{PodmanComputeConfig, podman_image_pull_policy};
 use crate::container::{self, LABEL_MANAGED_FILTER, LABEL_SANDBOX_ID, PodmanSandboxDriverConfig};
 use crate::watcher::{
     self, LifecycleEventFences, WatchStream, driver_sandbox_from_inspect,
@@ -13,8 +13,9 @@ use crate::watcher::{
 use openshell_core::ComputeDriverError;
 use openshell_core::config::CDI_GPU_DEVICE_ALL;
 use openshell_core::driver_utils::{
-    SUPERVISOR_IMAGE_BINARY_PATH, extract_first_tar_entry, supervisor_image_should_refresh,
-    temp_extract_container_name, validate_linux_elf_binary, write_cache_binary_atomic,
+    GatewayCallbackTopology, SUPERVISOR_IMAGE_BINARY_PATH, extract_first_tar_entry,
+    gateway_callback_endpoint, supervisor_image_should_refresh, temp_extract_container_name,
+    validate_linux_elf_binary, write_cache_binary_atomic,
 };
 use openshell_core::gpu::{
     CdiGpuDefaultSelector, CdiGpuInventory, CdiGpuSelectionError, driver_gpu_requirements,
@@ -373,6 +374,22 @@ impl PodmanComputeDriver {
         config.validate_runtime_limits()?;
         config.validate_host_gateway_ip()?;
         config.validate_proxy_config()?;
+        config.validate_app_armor_profile()?;
+        if let Some(socket) = config.provider_spiffe_workload_api_socket.as_deref() {
+            let raw = socket.to_str().ok_or_else(|| {
+                PodmanApiError::InvalidInput(
+                    "provider_spiffe_workload_api_socket must be valid UTF-8".to_string(),
+                )
+            })?;
+            // Preserve Podman's established pass-through support for an
+            // explicitly configured container-reachable Workload API TCP
+            // endpoint. The Workload API client validates its endpoint grammar
+            // when it connects.
+            if !raw.starts_with("tcp:") {
+                openshell_core::driver_utils::validate_provider_spiffe_unix_socket(socket)
+                    .map_err(PodmanApiError::InvalidInput)?;
+            }
+        }
         config.canonicalize_userns()?;
         config.validate_userns_mappings()?;
 
@@ -411,11 +428,25 @@ impl PodmanComputeDriver {
                         info.host.cgroup_version
                     )));
                 }
+                if matches!(
+                    config.app_armor_profile,
+                    Some(
+                        openshell_core::AppArmorProfile::RuntimeDefault
+                            | openshell_core::AppArmorProfile::Localhost(_)
+                    )
+                ) && !info.host.security.apparmor_enabled
+                {
+                    return Err(PodmanApiError::InvalidInput(
+                        "app_armor_profile requires AppArmor, but Podman reports AppArmor is unavailable; install/enable AppArmor or use Unconfined explicitly"
+                            .to_string(),
+                    ));
+                }
                 info!(
                     cgroup_version = %info.host.cgroup_version,
                     network_backend = %info.host.network_backend,
                     rootless = info.host.security.rootless,
                     rootless_network_cmd = %info.host.rootless_network_cmd,
+                    apparmor_enabled = info.host.security.apparmor_enabled,
                     "Connected to Podman"
                 );
                 (info.host.security.rootless, info.host.rootless_network_cmd)
@@ -437,14 +468,10 @@ impl PodmanComputeDriver {
         // Auto-detect the gRPC callback endpoint before deciding whether this
         // topology needs the Podman bridge gateway address.
         if config.grpc_endpoint.is_empty() {
-            let scheme = if config.tls_enabled() {
-                "https"
-            } else {
-                "http"
-            };
-            config.grpc_endpoint = format!(
-                "{scheme}://host.containers.internal:{}",
-                config.gateway_port
+            config.grpc_endpoint = gateway_callback_endpoint(
+                GatewayCallbackTopology::Podman,
+                config.gateway_port,
+                config.tls_enabled(),
             );
             info!(
                 grpc_endpoint = %config.grpc_endpoint,
@@ -791,7 +818,7 @@ impl PodmanComputeDriver {
                             .to_string(),
                     ));
                 }
-                let pull_policy = self.config.image_pull_policy.as_str();
+                let pull_policy = podman_image_pull_policy(self.config.image_pull_policy);
                 info!(image = %image, policy = %pull_policy, "Ensuring sandbox image");
                 self.client
                     .pull_image(image, pull_policy)

@@ -275,6 +275,9 @@ pub struct HostInfo {
 pub struct SecurityInfo {
     #[serde(default)]
     pub rootless: bool,
+    /// Whether the Podman host has `AppArmor` support enabled.
+    #[serde(default)]
+    pub apparmor_enabled: bool,
 }
 
 // ── Client ───────────────────────────────────────────────────────────────

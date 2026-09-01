@@ -33,8 +33,9 @@ supervisor:
   image:
     # -- Supervisor image repository. Changing it uses the effective gateway image tag unless tag is also set.
     repository: ghcr.io/nvidia/openshell/supervisor
-    # -- Supervisor image pull policy. Defaults to the gateway image pull policy when empty.
-    pullPolicy: ""
+    # -- Canonical sandbox supervisor pull policy. Leave unset to use the
+    # Kubernetes image default; use always, if_not_present, or never.
+    pullPolicy: null
     # -- Supervisor image tag override. Empty uses the version pinned into the gateway unless repository is changed.
     tag: ""
   # -- How the supervisor binary is delivered into sandbox pods.
@@ -224,10 +225,10 @@ server:
   externalDbSecret: ""
   # -- Default sandbox image used when requests do not specify one.
   sandboxImage: "ghcr.io/nvidia/openshell-community/sandboxes/base:latest"
-  # -- Kubernetes imagePullPolicy for sandbox pods. Empty = Kubernetes default
-  # (Always for :latest, IfNotPresent otherwise). Set to "Always" for dev
-  # clusters so new images are picked up without manual eviction.
-  sandboxImagePullPolicy: ""
+  # -- Canonical pull policy for sandbox pods. Leave unset to use the Kubernetes
+  # image default (Always for :latest, IfNotPresent otherwise). Use always,
+  # if_not_present, or never; newer is supported only by Podman.
+  sandboxImagePullPolicy: null
   # -- Image pull secrets attached to sandbox pods. Referenced Secrets must exist
   # in the sandbox namespace.
   sandboxImagePullSecrets: []

@@ -152,14 +152,13 @@ abstract socket whose peer PID must match that authenticated supervisor. Both
 supervisors exit if the control connection closes, coupling their container
 restart lifecycle before a new authoritative client can be established.
 
-The driver can request a Kubernetes AppArmor profile through
-`app_armor_profile`.
-
+The driver uses the shared AppArmor model through `app_armor_profile`.
 Supported values are `Unconfined`, `RuntimeDefault`, and
-`Localhost/<profile-name>`. An empty or unset value omits
-`securityContext.appArmorProfile`. Helm deployments default sandbox agent
-containers to `Unconfined` because runtime/default AppArmor profiles can block
-the supervisor's network namespace mount setup on AppArmor-enabled nodes.
+`Localhost/<profile-name>`; an empty or unset value omits
+`securityContext.appArmorProfile`. Docker and Podman translate the same values
+to OCI security options. Helm deployments default sandbox agent containers to
+`Unconfined` because runtime/default AppArmor profiles can block the
+supervisor's network namespace mount setup on AppArmor-enabled nodes.
 
 ## GPU Support
 

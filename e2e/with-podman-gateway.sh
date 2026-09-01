@@ -459,15 +459,22 @@ GATEWAY_CONFIG="${STATE_DIR}/gateway.toml"
 # We append the driver-specific table and override the port via CLI flag
 # (CLI > TOML in the merge precedence) so the test can use an ephemeral port.
 cp "${ROOT}/deploy/rpm/gateway.toml.default" "${GATEWAY_CONFIG}"
-{
-  e2e_write_gateway_jwt_config "${JWT_DIR}" "openshell-e2e-podman-${HOST_PORT}"
-  if [ "${OIDC_MODE}" != "1" ]; then
-    e2e_write_gateway_mtls_auth_config
-    if [ -n "${OPENSHELL_OIDC_ISSUER:-}" ]; then
-      e2e_write_gateway_oidc_config "${OPENSHELL_OIDC_ISSUER}"
-    fi
+# The TLS listener credentials are supplied by CLI below. Schema v2 keeps the
+# supervisor client bundle gateway-owned, so add it to [openshell.gateway]
+# before the RPM template opens the Podman driver table.
+GATEWAY_CONFIG_WITH_TLS="${GATEWAY_CONFIG}.tls"
+while IFS= read -r line; do
+  if [ "${line}" = "[openshell.drivers.podman]" ]; then
+    printf 'guest_tls_ca = %s\n' "$(toml_string "${PKI_DIR}/ca.crt")"
+    printf 'guest_tls_cert = %s\n' "$(toml_string "${PKI_DIR}/client/tls.crt")"
+    printf 'guest_tls_key = %s\n\n' "$(toml_string "${PKI_DIR}/client/tls.key")"
   fi
-  printf '\n[openshell.drivers.podman]\n'
+  printf '%s\n' "${line}"
+done <"${GATEWAY_CONFIG}" >"${GATEWAY_CONFIG_WITH_TLS}"
+mv "${GATEWAY_CONFIG_WITH_TLS}" "${GATEWAY_CONFIG}"
+{
+  # The RPM template ends in [openshell.drivers.podman]. Append driver-owned
+  # overrides before opening any nested gateway tables below.
   if [ "${OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" = "1" ]; then
     printf 'socket_path = %s\n' "$(toml_string "${DRIVER_SOCKET}")"
   else
@@ -475,14 +482,12 @@ cp "${ROOT}/deploy/rpm/gateway.toml.default" "${GATEWAY_CONFIG}"
   printf 'network_name = %s\n'   "$(toml_string "${PODMAN_NETWORK_NAME}")"
   printf 'gateway_port = %s\n'   "${HOST_PORT}"
   printf 'default_image = %s\n'  "$(toml_string "${SANDBOX_IMAGE}")"
-  printf 'image_pull_policy = "missing"\n'
+  printf 'image_pull_policy = "if_not_present"\n'
+  # The RPM template already opts into the 10-second Podman health check.
   # Keep CI teardown bounded while the production Podman driver default stays
   # conservative for real user workloads.
   printf 'stop_timeout_secs = %s\n' "${PODMAN_STOP_TIMEOUT_SECS}"
   printf 'supervisor_image = %s\n' "$(toml_string "${SUPERVISOR_IMAGE}")"
-  printf 'guest_tls_ca = %s\n'     "$(toml_string "${PKI_DIR}/ca.crt")"
-  printf 'guest_tls_cert = %s\n'   "$(toml_string "${PKI_DIR}/client/tls.crt")"
-  printf 'guest_tls_key = %s\n'    "$(toml_string "${PKI_DIR}/client/tls.key")"
   printf 'enable_bind_mounts = true\n'
   if [ -n "${OPENSHELL_E2E_PROVIDER_SPIFFE_SOCKET:-}" ]; then
     printf 'provider_spiffe_workload_api_socket = %s\n' "$(toml_string "${OPENSHELL_E2E_PROVIDER_SPIFFE_SOCKET}")"
@@ -496,13 +501,22 @@ cp "${ROOT}/deploy/rpm/gateway.toml.default" "${GATEWAY_CONFIG}"
     printf 'socket_path = %s\n' "$(toml_string "${OPENSHELL_PODMAN_SOCKET}")"
   fi
   fi
+
+  e2e_write_gateway_jwt_config "${JWT_DIR}" "openshell-e2e-podman-${HOST_PORT}"
+  if [ "${OIDC_MODE}" != "1" ]; then
+    e2e_write_gateway_mtls_auth_config
+    if [ -n "${OPENSHELL_OIDC_ISSUER:-}" ]; then
+      e2e_write_gateway_oidc_config "${OPENSHELL_OIDC_ISSUER}"
+    fi
+  fi
 } >> "${GATEWAY_CONFIG}"
 
 if [ "${OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" = "1" ]; then
   OPENSHELL_COMPUTE_DRIVER_SOCKET="${DRIVER_SOCKET}" \
   OPENSHELL_PODMAN_SOCKET="${OPENSHELL_PODMAN_SOCKET:-}" \
   OPENSHELL_SANDBOX_IMAGE="${SANDBOX_IMAGE}" \
-  OPENSHELL_SANDBOX_IMAGE_PULL_POLICY="missing" \
+  OPENSHELL_SANDBOX_IMAGE_PULL_POLICY="if_not_present" \
+  OPENSHELL_HEALTH_CHECK_INTERVAL_SECS=10 \
   OPENSHELL_GATEWAY_PORT="${HOST_PORT}" \
   OPENSHELL_NETWORK_NAME="${PODMAN_NETWORK_NAME}" \
   OPENSHELL_STOP_TIMEOUT="${PODMAN_STOP_TIMEOUT_SECS}" \
@@ -549,6 +563,7 @@ e2e_export_gateway_restart_metadata \
   "${GATEWAY_LOG}" \
   "${GATEWAY_PID_FILE}"
 
+OPENSHELL_LOCAL_TLS_DIR="${PKI_DIR}" \
 OPENSHELL_SUPERVISOR_IMAGE="${SUPERVISOR_IMAGE}" \
 OPENSHELL_NETWORK_NAME="${PODMAN_NETWORK_NAME}" \
   "${GATEWAY_BIN}" "${GATEWAY_ARGS[@]}" >"${GATEWAY_LOG}" 2>&1 &

@@ -30,6 +30,7 @@ use oci_client::manifest::{
 };
 use oci_client::secrets::RegistryAuth;
 use oci_client::{Reference, RegistryOperation};
+use openshell_core::UpstreamProxyConfig;
 use openshell_core::gpu::{
     driver_gpu_requirements, effective_driver_gpu_count, validate_specific_gpu_device_request,
 };
@@ -170,8 +171,6 @@ const GUEST_INIT_DROPIN_MANIFEST: &str =
 /// Guest path of the root-only corporate proxy credential staged by the driver.
 const GUEST_UPSTREAM_PROXY_AUTH_PATH: &str =
     openshell_core::container_paths::VM_GUEST_UPSTREAM_PROXY_AUTH_PATH;
-/// Guest path of the corporate proxy CA bundle staged by the driver.
-const GUEST_PROXY_CA_PATH: &str = openshell_core::container_paths::VM_GUEST_PROXY_CA_PATH;
 /// Guest path of the driver-authored supervisor argument list.
 ///
 /// The counterpart of [`GUEST_INIT_DROPIN_MANIFEST`] for the supervisor's own
@@ -236,8 +235,8 @@ enum GuestImagePayloadSource {
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct VmDriverConfig {
-    #[serde(alias = "openshell_endpoint")]
     pub grpc_endpoint: String,
     pub state_dir: PathBuf,
     pub launcher_bin: Option<PathBuf>,
@@ -251,80 +250,27 @@ pub struct VmDriverConfig {
     pub guest_tls_ca: Option<PathBuf>,
     pub guest_tls_cert: Option<PathBuf>,
     pub guest_tls_key: Option<PathBuf>,
+    /// Corporate forward proxy settings delivered to the guest init script.
+    #[serde(flatten)]
+    pub upstream_proxy: UpstreamProxyConfig,
+    /// Guest-reachable SPIFFE Workload API TCP endpoint. A VM cannot safely
+    /// project a host UNIX socket; this must be a deliberately exposed TCP
+    /// listener and requires `provider_spiffe_allow_guest_tcp`.
+    pub provider_spiffe_workload_api_tcp_endpoint: Option<String>,
+    #[serde(default)]
+    pub provider_spiffe_allow_guest_tcp: bool,
     pub gpu_enabled: bool,
     pub gpu_mem_mib: u32,
     pub gpu_vcpus: u8,
-    /// Resolved sandbox UID for rootfs `/etc/passwd` entry.
-    /// When empty, defaults to 10001 (the legacy hardcoded value).
+    /// Resolved sandbox UID for newly prepared rootfs `/etc/passwd` entries.
+    /// When empty, new sandboxes use 1000. Existing rootfs and overlays retain
+    /// their recorded sandbox account for legacy 10001 compatibility.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sandbox_uid: Option<u32>,
     /// Resolved sandbox GID for rootfs `/etc/passwd` and `/etc/group` entries.
     /// When empty, defaults to the resolved UID.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sandbox_gid: Option<u32>,
-
-    /// Corporate forward proxy URL (`http://host:port` or `https://host:port`)
-    /// passed to the in-guest supervisor.
-    ///
-    /// The supervisor chains policy-approved TLS tunnels through this proxy
-    /// with HTTP CONNECT instead of dialing destinations directly. This is an
-    /// operator-owned egress boundary: it travels on the supervisor's argv,
-    /// which sandbox spec/template environment and image `ENV` cannot
-    /// influence. A proxy on the gateway host's loopback is reachable from the
-    /// guest only through the gvproxy host alias
-    /// (`host.openshell.internal`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub https_proxy: Option<String>,
-
-    /// Comma-separated `NO_PROXY` list passed alongside the proxy URL.
-    ///
-    /// Matching destinations are dialed directly instead of through the
-    /// corporate proxy. This bypasses only the corporate proxy, never
-    /// `OpenShell` policy evaluation.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub no_proxy: Option<String>,
-
-    /// Path (on the gateway host) to a file containing the corporate proxy
-    /// credential in `user:pass` form.
-    ///
-    /// The driver validates it at sandbox-create time and stages it into the
-    /// per-sandbox overlay at [`GUEST_UPSTREAM_PROXY_AUTH_PATH`], root-only.
-    /// Credentials are never embedded in the proxy URL and never reach the
-    /// guest environment.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub proxy_auth_file: Option<String>,
-
-    /// Explicit acknowledgement that proxy credentials are sent in cleartext.
-    ///
-    /// `Proxy-Authorization: Basic` over the plain-TCP connection to an
-    /// `http://` proxy is recoverable by anyone on the network path, so
-    /// [`Self::proxy_auth_file`] requires this acknowledgement. An `https://`
-    /// proxy carries the credential inside the verified TLS session and does
-    /// not need it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub proxy_auth_allow_insecure: Option<bool>,
-
-    /// Send the destination hostname in CONNECT requests instead of a
-    /// validated IP.
-    ///
-    /// The default binds the tunnel to an address that passed the sandbox's
-    /// SSRF and `allowed_ips` validation. Set this only when the proxy's ACLs
-    /// filter on hostnames and reject IP CONNECT targets: the proxy then
-    /// resolves the name itself and its own ACLs become the effective egress
-    /// control for proxied TLS.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub proxy_connect_by_hostname: Option<bool>,
-
-    /// Path (on the gateway host) to a PEM CA bundle trusted for the
-    /// corporate proxy.
-    ///
-    /// The driver stages it into the per-sandbox overlay at
-    /// [`GUEST_PROXY_CA_PATH`] and passes that path via
-    /// `--upstream-proxy-ca-bundle`. It is trusted both for the handshake
-    /// with an `https://` proxy and for server certificates re-signed by a
-    /// TLS-intercepting proxy.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub proxy_ca_bundle: Option<String>,
 }
 
 /// Redacting `Debug` so a proxy URL or credential path never reaches a log.
@@ -352,18 +298,44 @@ impl std::fmt::Debug for VmDriverConfig {
             .field("gpu_vcpus", &self.gpu_vcpus)
             .field("sandbox_uid", &self.sandbox_uid)
             .field("sandbox_gid", &self.sandbox_gid)
-            .field("https_proxy", &self.https_proxy.is_some())
-            .field("no_proxy", &self.no_proxy)
-            .field("proxy_auth_file", &self.proxy_auth_file.is_some())
-            .field("proxy_auth_allow_insecure", &self.proxy_auth_allow_insecure)
-            .field("proxy_connect_by_hostname", &self.proxy_connect_by_hostname)
-            .field("proxy_ca_bundle", &self.proxy_ca_bundle)
+            .field(
+                "upstream_proxy_configured",
+                &self.upstream_proxy.https_proxy.is_some(),
+            )
+            .field(
+                "no_proxy_configured",
+                &self.upstream_proxy.no_proxy.is_some(),
+            )
+            .field(
+                "proxy_auth_file_configured",
+                &self.upstream_proxy.proxy_auth_file.is_some(),
+            )
+            .field(
+                "proxy_auth_allow_insecure",
+                &self.upstream_proxy.proxy_auth_allow_insecure,
+            )
+            .field(
+                "proxy_connect_by_hostname",
+                &self.upstream_proxy.proxy_connect_by_hostname,
+            )
+            .field(
+                "provider_spiffe_workload_api_tcp_endpoint_configured",
+                &self.provider_spiffe_workload_api_tcp_endpoint.is_some(),
+            )
+            .field(
+                "provider_spiffe_allow_guest_tcp",
+                &self.provider_spiffe_allow_guest_tcp,
+            )
             .finish()
     }
 }
 
-/// Default sandbox UID used by the VM driver when no config value is set.
-pub const DEFAULT_SANDBOX_UID: u32 = 10001;
+/// Default sandbox UID used when preparing new VM rootfs images.
+///
+/// The guest-init script detects an existing `sandbox` account and preserves
+/// its UID/GID, so persisted rootfs and overlays prepared with legacy UID 10001
+/// continue to start without an ownership migration.
+pub const DEFAULT_SANDBOX_UID: u32 = 1000;
 
 impl Default for VmDriverConfig {
     fn default() -> Self {
@@ -381,17 +353,14 @@ impl Default for VmDriverConfig {
             guest_tls_ca: None,
             guest_tls_cert: None,
             guest_tls_key: None,
+            upstream_proxy: UpstreamProxyConfig::default(),
+            provider_spiffe_workload_api_tcp_endpoint: None,
+            provider_spiffe_allow_guest_tcp: false,
             gpu_enabled: false,
             gpu_mem_mib: 8192,
             gpu_vcpus: 4,
             sandbox_uid: None,
             sandbox_gid: None,
-            https_proxy: None,
-            no_proxy: None,
-            proxy_auth_file: None,
-            proxy_auth_allow_insecure: None,
-            proxy_connect_by_hostname: None,
-            proxy_ca_bundle: None,
         }
     }
 }
@@ -405,6 +374,19 @@ impl VmDriverConfig {
     /// Resolve the sandbox GID, falling back to the resolved UID.
     pub fn resolve_sandbox_gid(&self, resolved_uid: u32) -> u32 {
         self.sandbox_gid.unwrap_or(resolved_uid)
+    }
+
+    pub fn validate_runtime_security_config(&self) -> Result<(), String> {
+        self.upstream_proxy.validate()?;
+        if let Some(endpoint) = self.provider_spiffe_workload_api_tcp_endpoint.as_deref() {
+            openshell_core::driver_utils::validate_guest_spiffe_tcp_endpoint(
+                endpoint,
+                self.provider_spiffe_allow_guest_tcp,
+            )?;
+        } else if self.provider_spiffe_allow_guest_tcp {
+            return Err("provider_spiffe_allow_guest_tcp is set but no provider_spiffe_workload_api_tcp_endpoint is configured".to_string());
+        }
+        Ok(())
     }
 
     pub fn validate_sandbox_identity(&self) -> Result<(), String> {
@@ -428,29 +410,6 @@ impl VmDriverConfig {
             ));
         }
         Ok(())
-    }
-
-    /// Validate the operator's corporate upstream-proxy settings, fail-closed.
-    ///
-    /// Delegates to the validator shared with the Podman and Kubernetes
-    /// drivers and with the in-guest supervisor, so a value accepted here is
-    /// never rejected inside the guest — and no misconfiguration can silently
-    /// degrade to a direct dial.
-    ///
-    /// # Errors
-    ///
-    /// Returns a message naming the offending key.
-    pub fn validate_proxy_config(&self) -> Result<(), String> {
-        openshell_core::driver_utils::validate_upstream_proxy_settings(
-            &openshell_core::driver_utils::UpstreamProxySettings {
-                url: self.https_proxy.as_deref(),
-                no_proxy: self.no_proxy.as_deref(),
-                auth_file: self.proxy_auth_file.as_deref(),
-                auth_allow_insecure: self.proxy_auth_allow_insecure,
-                connect_by_hostname: self.proxy_connect_by_hostname,
-                ca_bundle: self.proxy_ca_bundle.as_deref(),
-            },
-        )
     }
 
     fn requires_tls_materials(&self) -> bool {
@@ -593,7 +552,7 @@ impl VmDriver {
             .validate()
             .map_err(|err| err.message().to_string())?;
         config.validate_sandbox_identity()?;
-        config.validate_proxy_config()?;
+        config.validate_runtime_security_config()?;
         if config.grpc_endpoint.trim().is_empty() {
             return Err("openshell endpoint is required".to_string());
         }
@@ -1877,7 +1836,7 @@ impl VmDriver {
         // compare against is this sandbox's own TAP host address. Fail the
         // create with the reason rather than boot a sandbox whose
         // policy-approved CONNECTs all time out against an unreachable proxy.
-        if let Some(url) = self.config.https_proxy.as_deref()
+        if let Some(url) = self.config.upstream_proxy.https_proxy.as_deref()
             && proxy_url_targets_gateway_host(url, plan.host_ip.as_deref())
         {
             let tap_host = plan.host_ip.as_deref().unwrap_or("the TAP host address");
@@ -2228,6 +2187,7 @@ impl VmDriver {
             None => None,
         };
         let sandbox_token = sandbox_token.map(str::to_string);
+        let proxy_auth = self.read_proxy_auth_credential().await?;
         let overlay_disk = overlay_disk.to_path_buf();
         let overlay_size_bytes = self
             .config
@@ -2257,6 +2217,7 @@ impl VmDriver {
                 &overlay_disk,
                 tls_materials.as_ref(),
                 sandbox_token.as_deref(),
+                proxy_auth.as_deref(),
                 preparation,
                 overlay_size_bytes,
             )
@@ -2264,6 +2225,26 @@ impl VmDriver {
         .await
         .map_err(|err| format!("overlay image preparation panicked: {err}"))?;
         span_status.finish(result)
+    }
+
+    async fn read_proxy_auth_credential(&self) -> Result<Option<String>, String> {
+        let Some(path) = self.config.upstream_proxy.proxy_auth_file.as_ref() else {
+            return Ok(None);
+        };
+        let path = path.clone();
+        Ok(Some(
+            tokio::task::spawn_blocking(move || {
+                let path = path
+                    .to_str()
+                    .ok_or_else(|| "proxy_auth_file must be valid UTF-8".to_string())?;
+                let raw = openshell_core::driver_utils::read_upstream_proxy_credential_file(path)?;
+                openshell_core::driver_utils::parse_upstream_proxy_credential(&raw)
+                    .map(str::to_owned)
+                    .map_err(|error| format!("proxy_auth_file is invalid: {error}"))
+            })
+            .await
+            .map_err(|error| format!("proxy_auth_file read task failed: {error}"))??,
+        ))
     }
 
     fn resolved_sandbox_image(&self, sandbox: &Sandbox) -> Option<String> {
@@ -2954,6 +2935,7 @@ impl VmDriver {
         Ok(())
     }
 
+    #[allow(clippy::similar_names)]
     async fn run_image_prep_vm(
         &self,
         bootstrap_root_disk: &Path,
@@ -2982,6 +2964,14 @@ impl VmDriver {
         command
             .arg("--vm-env")
             .arg(format!("OPENSHELL_VM_INIT_MODE={IMAGE_PREP_INIT_MODE}"));
+        let resolved_uid = self.config.resolve_sandbox_uid();
+        let resolved_gid = self.config.resolve_sandbox_gid(resolved_uid);
+        command
+            .arg("--vm-env")
+            .arg(format!("OPENSHELL_VM_SANDBOX_UID={resolved_uid}"));
+        command
+            .arg("--vm-env")
+            .arg(format!("OPENSHELL_VM_SANDBOX_GID={resolved_gid}"));
 
         let mut child = command
             .spawn()
@@ -4902,6 +4892,39 @@ fn build_guest_environment(
             GUEST_TLS_KEY_PATH.to_string(),
         );
     }
+    if let Some(url) = config.upstream_proxy.https_proxy.as_ref() {
+        environment.insert("OPENSHELL_VM_UPSTREAM_PROXY".to_string(), url.clone());
+    }
+    if let Some(no_proxy) = config.upstream_proxy.no_proxy.as_ref() {
+        environment.insert(
+            "OPENSHELL_VM_UPSTREAM_NO_PROXY".to_string(),
+            no_proxy.clone(),
+        );
+    }
+    if config.upstream_proxy.proxy_auth_file.is_some() {
+        environment.insert(
+            "OPENSHELL_VM_UPSTREAM_PROXY_AUTH_FILE".to_string(),
+            GUEST_UPSTREAM_PROXY_AUTH_PATH.to_string(),
+        );
+    }
+    if config.upstream_proxy.proxy_auth_allow_insecure == Some(true) {
+        environment.insert(
+            "OPENSHELL_VM_UPSTREAM_PROXY_AUTH_ALLOW_INSECURE".to_string(),
+            "true".to_string(),
+        );
+    }
+    if config.upstream_proxy.proxy_connect_by_hostname == Some(true) {
+        environment.insert(
+            "OPENSHELL_VM_UPSTREAM_PROXY_CONNECT_BY_HOSTNAME".to_string(),
+            "true".to_string(),
+        );
+    }
+    if let Some(endpoint) = config.provider_spiffe_workload_api_tcp_endpoint.as_ref() {
+        environment.insert(
+            openshell_core::sandbox_env::PROVIDER_SPIFFE_WORKLOAD_API_SOCKET.to_string(),
+            endpoint.clone(),
+        );
+    }
     environment.insert(
         openshell_core::sandbox_env::TELEMETRY_ENABLED.to_string(),
         openshell_core::telemetry::enabled_env_value().to_string(),
@@ -5363,6 +5386,7 @@ fn create_sandbox_overlay_image_from_template(
     overlay_disk: &Path,
     tls_materials: Option<&GuestTlsMaterials>,
     sandbox_token: Option<&str>,
+    proxy_auth: Option<&str>,
 ) -> Result<(), String> {
     clone_or_copy_sparse_file(template_path, overlay_disk)?;
     if let Some(tls) = tls_materials {
@@ -5370,6 +5394,9 @@ fn create_sandbox_overlay_image_from_template(
     }
     if let Some(token) = sandbox_token {
         inject_guest_sandbox_token(overlay_disk, token)?;
+    }
+    if let Some(credential) = proxy_auth {
+        inject_guest_proxy_auth(overlay_disk, credential)?;
     }
     Ok(())
 }
@@ -5379,6 +5406,7 @@ fn prepare_sandbox_overlay_image(
     overlay_disk: &Path,
     tls_materials: Option<&GuestTlsMaterials>,
     sandbox_token: Option<&str>,
+    proxy_auth: Option<&str>,
     preparation: OverlayPreparation,
     expected_size_bytes: u64,
 ) -> Result<(), String> {
@@ -5390,6 +5418,9 @@ fn prepare_sandbox_overlay_image(
                 }
                 if let Some(token) = sandbox_token {
                     inject_guest_sandbox_token(overlay_disk, token)?;
+                }
+                if let Some(credential) = proxy_auth {
+                    inject_guest_proxy_auth(overlay_disk, credential)?;
                 }
                 return Ok(());
             }
@@ -5422,6 +5453,7 @@ fn prepare_sandbox_overlay_image(
         overlay_disk,
         tls_materials,
         sandbox_token,
+        proxy_auth,
     )
 }
 
@@ -5448,6 +5480,12 @@ fn inject_guest_sandbox_token(overlay_disk: &Path, token: &str) -> Result<(), St
     let token_path = overlay_upper_path(GUEST_SANDBOX_TOKEN_PATH);
     write_rootfs_image_file(overlay_disk, &token_path, format!("{token}\n").as_bytes())?;
     set_rootfs_image_file_mode(overlay_disk, &token_path, 0o600)
+}
+
+fn inject_guest_proxy_auth(overlay_disk: &Path, credential: &str) -> Result<(), String> {
+    let path = overlay_upper_path(GUEST_UPSTREAM_PROXY_AUTH_PATH);
+    write_rootfs_image_file(overlay_disk, &path, format!("{credential}\n").as_bytes())?;
+    set_rootfs_image_file_mode(overlay_disk, &path, 0o600)
 }
 
 #[allow(clippy::result_large_err)]
@@ -5505,15 +5543,15 @@ fn inject_guest_init_dropins(
 /// the supervisor reads the credential from that file.
 fn upstream_proxy_cli_args(config: &VmDriverConfig) -> Vec<String> {
     let mut args = Vec::new();
-    if let Some(url) = &config.https_proxy {
+    if let Some(url) = &config.upstream_proxy.https_proxy {
         args.push("--upstream-proxy".to_string());
         args.push(url.clone());
     }
-    if let Some(list) = &config.no_proxy {
+    if let Some(list) = &config.upstream_proxy.no_proxy {
         args.push("--upstream-no-proxy".to_string());
         args.push(list.clone());
     }
-    if config.proxy_auth_file.is_some() {
+    if config.upstream_proxy.proxy_auth_file.is_some() {
         args.push("--upstream-proxy-auth-file".to_string());
         // The guest path, never the gateway-host path the operator configured.
         args.push(GUEST_UPSTREAM_PROXY_AUTH_PATH.to_string());
@@ -5521,17 +5559,13 @@ fn upstream_proxy_cli_args(config: &VmDriverConfig) -> Vec<String> {
     // Config validation guarantees the acknowledgement is `true` whenever an
     // auth file is configured against an http:// proxy; the supervisor
     // independently refuses credentials without it.
-    if config.proxy_auth_allow_insecure == Some(true) {
+    if config.upstream_proxy.proxy_auth_allow_insecure == Some(true) {
         args.push("--upstream-proxy-auth-allow-insecure".to_string());
     }
     // Absent means the default validated-IP CONNECT binding; only the
     // explicit hostname opt-in is passed through.
-    if config.proxy_connect_by_hostname == Some(true) {
+    if config.upstream_proxy.proxy_connect_by_hostname == Some(true) {
         args.push("--upstream-proxy-connect-by-hostname".to_string());
-    }
-    if config.proxy_ca_bundle.is_some() {
-        args.push("--upstream-proxy-ca-bundle".to_string());
-        args.push(GUEST_PROXY_CA_PATH.to_string());
     }
     args
 }
@@ -5571,53 +5605,31 @@ fn validate_guest_supervisor_args(args: &[String]) -> Result<(), String> {
 /// Uses the validators shared with the supervisor, so a credential accepted
 /// here is never rejected inside the guest. The error never carries the file
 /// contents.
-async fn read_sandbox_proxy_credential(path: &str) -> Result<String, Status> {
-    let path_owned = path.to_string();
+async fn read_sandbox_proxy_credential(path: &Path) -> Result<String, Status> {
+    let path_owned = path.to_path_buf();
+    let display_path = path.display().to_string();
     let raw = tokio::task::spawn_blocking(move || {
         openshell_core::driver_utils::read_upstream_proxy_credential_file(&path_owned)
     })
     .await
     .map_err(|err| Status::internal(format!("proxy_auth_file read task failed: {err}")))?
     .map_err(Status::invalid_argument)?;
-    let credential = openshell_core::driver_utils::parse_upstream_proxy_credential(&raw)
-        .map_err(|err| Status::invalid_argument(format!("proxy_auth_file '{path}': {err}")))?;
+    let credential =
+        openshell_core::driver_utils::parse_upstream_proxy_credential(&raw).map_err(|err| {
+            Status::invalid_argument(format!("proxy_auth_file '{display_path}': {err}"))
+        })?;
     Ok(credential.to_string())
-}
-
-/// Read and validate the corporate proxy CA bundle from the gateway host.
-///
-/// Uses the reader shared with the supervisor, so the bundle is bounded and
-/// non-regular files are rejected (an operator path such as `/dev/zero` can
-/// otherwise exhaust driver memory), and a bundle accepted here contributes at
-/// least one trust anchor rustls accepts rather than merely looking like PEM.
-/// Checked here rather than only in the guest so the operator gets an error
-/// attributable to `proxy_ca_bundle` instead of an opaque supervisor startup
-/// failure inside every sandbox. The error never carries the file contents.
-async fn read_sandbox_proxy_ca_bundle(path: &str) -> Result<Vec<u8>, Status> {
-    let path_owned = path.to_string();
-    let pem = tokio::task::spawn_blocking(move || {
-        openshell_core::driver_utils::read_upstream_proxy_ca_bundle_file(
-            &path_owned,
-            "proxy_ca_bundle",
-        )
-    })
-    .await
-    .map_err(|err| Status::internal(format!("proxy_ca_bundle read task failed: {err}")))?
-    .map_err(Status::invalid_argument)?;
-    Ok(pem.into_bytes())
 }
 
 /// Stage the corporate upstream-proxy configuration into the guest overlay.
 ///
-/// Writes three files into the overlay upperdir the driver owns:
+/// Writes two files into the overlay upperdir the driver owns:
 ///
 /// * the credential at [`GUEST_UPSTREAM_PROXY_AUTH_PATH`], mode `0600`;
-/// * the CA bundle at [`GUEST_PROXY_CA_PATH`], mode `0644` (a CA certificate
-///   is not secret);
 /// * the supervisor argument list at [`GUEST_SUPERVISOR_ARGS_PATH`], mode
 ///   `0644`.
 ///
-/// All three are written on every launch, empty when the corresponding
+/// Both are written on every launch, empty when the corresponding
 /// setting is absent. Writing rather than skipping is what makes the channel
 /// unforgeable: the upperdir copy always shadows the read-only image layer, so
 /// a sandbox image cannot supply its own arguments or credential by baking a
@@ -5638,7 +5650,7 @@ async fn inject_guest_upstream_proxy(
     // the operator removed a setting clears material a previous launch staged
     // into a preserved overlay, and shadows anything an image baked at these
     // paths, so a staged file is only ever the one this launch produced.
-    let credential = match config.proxy_auth_file.as_deref() {
+    let credential = match config.upstream_proxy.proxy_auth_file.as_deref() {
         Some(path) => format!("{}\n", read_sandbox_proxy_credential(path).await?).into_bytes(),
         None => Vec::new(),
     };
@@ -5647,16 +5659,6 @@ async fn inject_guest_upstream_proxy(
         .map_err(|err| Status::internal(format!("write VM guest proxy credential: {err}")))?;
     set_rootfs_image_file_mode(overlay_disk, &credential_path, 0o600)
         .map_err(|err| Status::internal(format!("set VM guest proxy credential mode: {err}")))?;
-
-    let ca_bundle = match config.proxy_ca_bundle.as_deref() {
-        Some(path) => read_sandbox_proxy_ca_bundle(path).await?,
-        None => Vec::new(),
-    };
-    let ca_path = overlay_upper_path(GUEST_PROXY_CA_PATH);
-    write_rootfs_image_file(overlay_disk, &ca_path, &ca_bundle)
-        .map_err(|err| Status::internal(format!("write VM guest proxy CA bundle: {err}")))?;
-    set_rootfs_image_file_mode(overlay_disk, &ca_path, 0o644)
-        .map_err(|err| Status::internal(format!("set VM guest proxy CA bundle mode: {err}")))?;
 
     let args = upstream_proxy_cli_args(config);
     validate_guest_supervisor_args(&args).map_err(Status::failed_precondition)?;
@@ -6212,7 +6214,7 @@ mod tests {
     }
 
     #[test]
-    fn vm_config_accepts_legacy_openshell_endpoint_alias() {
+    fn vm_config_rejects_legacy_openshell_endpoint() {
         let config = VmDriverConfig::default();
         let mut serialized = serde_json::to_value(config).unwrap();
         let fields = serialized.as_object_mut().unwrap();
@@ -6222,25 +6224,9 @@ mod tests {
             serde_json::json!("http://127.0.0.1:8080"),
         );
 
-        let parsed: VmDriverConfig = serde_json::from_value(serialized).unwrap();
-        assert_eq!(parsed.grpc_endpoint, "http://127.0.0.1:8080");
-    }
-
-    #[test]
-    fn vm_config_rejects_canonical_and_legacy_endpoint_names_together() {
-        let config = VmDriverConfig {
-            grpc_endpoint: "http://127.0.0.1:8080".to_string(),
-            ..Default::default()
-        };
-        let mut serialized = serde_json::to_value(config).unwrap();
-        serialized.as_object_mut().unwrap().insert(
-            "openshell_endpoint".to_string(),
-            serde_json::json!("http://127.0.0.1:9090"),
-        );
-
         let error = serde_json::from_value::<VmDriverConfig>(serialized)
-            .expect_err("canonical and legacy names must not both be accepted");
-        assert!(error.to_string().contains("duplicate field"));
+            .expect_err("legacy openshell_endpoint must be rejected");
+        assert!(!error.to_string().is_empty());
     }
 
     struct TestTracing {
@@ -7434,6 +7420,7 @@ mod tests {
             &overlay,
             None,
             None,
+            None,
             OverlayPreparation::PreserveExisting,
             "saved-overlay".len() as u64,
         )
@@ -7455,6 +7442,7 @@ mod tests {
         prepare_sandbox_overlay_image(
             &template,
             &overlay,
+            None,
             None,
             None,
             OverlayPreparation::PreserveExisting,
@@ -7707,6 +7695,16 @@ mod tests {
         assert!(env.contains(&format!(
             "OPENSHELL_SSH_SOCKET_PATH={GUEST_SSH_SOCKET_PATH}"
         )));
+    }
+
+    #[test]
+    fn new_vm_sandbox_identity_defaults_to_1000() {
+        let config = VmDriverConfig::default();
+        assert_eq!(config.resolve_sandbox_uid(), 1000);
+        assert_eq!(
+            config.resolve_sandbox_gid(config.resolve_sandbox_uid()),
+            1000
+        );
     }
 
     #[test]
@@ -8128,6 +8126,63 @@ mod tests {
                 .unwrap(),
             LayerCompression::Zstd
         );
+    }
+
+    #[test]
+    fn vm_proxy_and_spiffe_config_require_explicit_safe_acknowledgements() {
+        let config = VmDriverConfig {
+            upstream_proxy: UpstreamProxyConfig {
+                https_proxy: Some("http://proxy.example:8080".to_string()),
+                no_proxy: Some(".svc".to_string()),
+                proxy_auth_file: Some(PathBuf::from("/run/secrets/proxy-auth")),
+                proxy_auth_allow_insecure: Some(true),
+                proxy_connect_by_hostname: None,
+            },
+            provider_spiffe_workload_api_tcp_endpoint: Some("tcp:192.0.2.10:8081".to_string()),
+            provider_spiffe_allow_guest_tcp: false,
+            ..Default::default()
+        };
+        let error = config.validate_runtime_security_config().unwrap_err();
+        assert!(error.contains("provider_spiffe_allow_guest_tcp"));
+
+        let config = VmDriverConfig {
+            provider_spiffe_workload_api_tcp_endpoint: Some("tcp:192.0.2.10:8081".to_string()),
+            provider_spiffe_allow_guest_tcp: true,
+            ..Default::default()
+        };
+        assert!(config.validate_runtime_security_config().is_ok());
+    }
+
+    #[test]
+    fn build_guest_environment_projects_operator_proxy_and_spiffe_endpoint() {
+        let config = VmDriverConfig {
+            upstream_proxy: UpstreamProxyConfig {
+                https_proxy: Some("https://proxy.example:8443".to_string()),
+                no_proxy: Some(".svc".to_string()),
+                proxy_auth_file: Some(PathBuf::from("/run/secrets/proxy-auth")),
+                proxy_auth_allow_insecure: None,
+                proxy_connect_by_hostname: Some(true),
+            },
+            provider_spiffe_workload_api_tcp_endpoint: Some("tcp:192.0.2.10:8081".to_string()),
+            provider_spiffe_allow_guest_tcp: true,
+            ..Default::default()
+        };
+        let sandbox = Sandbox {
+            id: "vm-spiffe".to_string(),
+            name: "vm-spiffe".to_string(),
+            ..Default::default()
+        };
+        let env = build_guest_environment(&sandbox, &config, None);
+        assert!(
+            env.contains(&"OPENSHELL_VM_UPSTREAM_PROXY=https://proxy.example:8443".to_string())
+        );
+        assert!(env.contains(&format!(
+            "OPENSHELL_VM_UPSTREAM_PROXY_AUTH_FILE={GUEST_UPSTREAM_PROXY_AUTH_PATH}"
+        )));
+        assert!(env.contains(
+            &"OPENSHELL_PROVIDER_SPIFFE_WORKLOAD_API_SOCKET=tcp:192.0.2.10:8081".to_string()
+        ));
+        assert!(!env.iter().any(|value| value.contains("user:pass")));
     }
 
     #[test]
@@ -8712,7 +8767,7 @@ mod tests {
 
     fn test_driver_with_proxy(https_proxy: &str) -> VmDriver {
         let mut driver = test_driver_with_extensions(LifecycleExtensionRegistry::new());
-        driver.config.https_proxy = Some(https_proxy.to_string());
+        driver.config.upstream_proxy.https_proxy = Some(https_proxy.to_string());
         driver
     }
 
@@ -9047,17 +9102,15 @@ mod tests {
     }
 
     /// A driver config carrying only corporate proxy settings.
-    fn proxy_config(
-        https_proxy: Option<&str>,
-        auth_file: Option<&str>,
-        ca_bundle: Option<&str>,
-    ) -> VmDriverConfig {
+    fn proxy_config(https_proxy: Option<&str>, auth_file: Option<&str>) -> VmDriverConfig {
         VmDriverConfig {
             grpc_endpoint: "http://127.0.0.1:8080".to_string(),
-            https_proxy: https_proxy.map(ToString::to_string),
-            proxy_auth_file: auth_file.map(ToString::to_string),
-            proxy_auth_allow_insecure: auth_file.map(|_| true),
-            proxy_ca_bundle: ca_bundle.map(ToString::to_string),
+            upstream_proxy: UpstreamProxyConfig {
+                https_proxy: https_proxy.map(ToString::to_string),
+                proxy_auth_file: auth_file.map(PathBuf::from),
+                proxy_auth_allow_insecure: auth_file.map(|_| true),
+                ..UpstreamProxyConfig::default()
+            },
             ..Default::default()
         }
     }
@@ -9071,7 +9124,6 @@ mod tests {
             proxy_config(
                 Some("http://user:secret@proxy.corp.test:3128"),
                 Some("/etc/openshell/secrets/proxy-auth"),
-                Some("/etc/openshell/tls/corp-ca.pem"),
             )
         );
         assert!(
@@ -9083,13 +9135,9 @@ mod tests {
             "the credential path must be logged as presence only: {rendered}"
         );
         assert!(
-            rendered.contains("https_proxy: true") && rendered.contains("proxy_auth_file: true"),
+            rendered.contains("upstream_proxy_configured: true")
+                && rendered.contains("proxy_auth_file_configured: true"),
             "presence of each must still be visible for debugging: {rendered}"
-        );
-        // A CA path is not sensitive and stays readable.
-        assert!(
-            rendered.contains("corp-ca.pem"),
-            "the CA bundle path is not a secret and should stay legible: {rendered}"
         );
     }
 
@@ -9100,11 +9148,7 @@ mod tests {
         // credential removable with the sandbox (remove_sandbox_state_dir
         // deletes the whole directory) and unforgeable by the guest image
         // (the upperdir shadows the read-only image layer).
-        for guest_path in [
-            GUEST_UPSTREAM_PROXY_AUTH_PATH,
-            GUEST_PROXY_CA_PATH,
-            GUEST_SUPERVISOR_ARGS_PATH,
-        ] {
+        for guest_path in [GUEST_UPSTREAM_PROXY_AUTH_PATH, GUEST_SUPERVISOR_ARGS_PATH] {
             assert!(
                 guest_path.starts_with("/opt/openshell/"),
                 "{guest_path} must be under the reserved guest control root"
@@ -9130,22 +9174,16 @@ mod tests {
         let config = proxy_config(
             Some("http://proxy.corp.test:3128"),
             Some("/etc/openshell/secrets/proxy-auth"),
-            Some("/etc/openshell/tls/corp-ca.pem"),
         );
         let args = upstream_proxy_cli_args(&config);
 
-        // The credential and CA live at fixed guest paths; the gateway-host
-        // paths the operator configured must never reach the guest argv.
+        // The credential lives at a fixed guest path; the gateway-host path
+        // the operator configured must never reach the guest argv.
         let auth = args
             .iter()
             .position(|arg| arg == "--upstream-proxy-auth-file")
             .map(|i| args[i + 1].as_str());
         assert_eq!(auth, Some(GUEST_UPSTREAM_PROXY_AUTH_PATH));
-        let ca = args
-            .iter()
-            .position(|arg| arg == "--upstream-proxy-ca-bundle")
-            .map(|i| args[i + 1].as_str());
-        assert_eq!(ca, Some(GUEST_PROXY_CA_PATH));
         assert!(
             !args
                 .iter()
@@ -9156,8 +9194,8 @@ mod tests {
 
     #[test]
     fn upstream_proxy_args_pass_only_explicit_opt_ins() {
-        let mut config = proxy_config(Some("https://proxy.corp.test:3130"), None, None);
-        config.no_proxy = Some("10.0.0.0/8,.svc.cluster.local".to_string());
+        let mut config = proxy_config(Some("https://proxy.corp.test:3130"), None);
+        config.upstream_proxy.no_proxy = Some("10.0.0.0/8,.svc.cluster.local".to_string());
         let args = upstream_proxy_cli_args(&config);
         assert_eq!(
             args,
@@ -9171,13 +9209,13 @@ mod tests {
 
         // `Some(false)` must not be passed as the presence flag it is on the
         // supervisor side.
-        config.proxy_connect_by_hostname = Some(false);
+        config.upstream_proxy.proxy_connect_by_hostname = Some(false);
         assert!(
             !upstream_proxy_cli_args(&config)
                 .iter()
                 .any(|arg| arg == "--upstream-proxy-connect-by-hostname")
         );
-        config.proxy_connect_by_hostname = Some(true);
+        config.upstream_proxy.proxy_connect_by_hostname = Some(true);
         assert!(
             upstream_proxy_cli_args(&config)
                 .iter()
@@ -9217,17 +9255,20 @@ mod tests {
     #[test]
     fn proxy_config_validation_rejects_settings_without_a_proxy_url() {
         let config = VmDriverConfig {
-            no_proxy: Some("10.0.0.0/8".to_string()),
+            upstream_proxy: UpstreamProxyConfig {
+                no_proxy: Some("10.0.0.0/8".to_string()),
+                ..UpstreamProxyConfig::default()
+            },
             ..Default::default()
         };
         let err = config
-            .validate_proxy_config()
+            .validate_runtime_security_config()
             .expect_err("a bypass list without a proxy would hide a fail-open state");
         assert!(err.contains("no_proxy"), "{err}");
 
-        let config = proxy_config(Some("http://proxy.corp.test:3128"), None, None);
+        let config = proxy_config(Some("http://proxy.corp.test:3128"), None);
         config
-            .validate_proxy_config()
+            .validate_runtime_security_config()
             .expect("a lone proxy URL is a complete configuration");
     }
 
@@ -9236,76 +9277,12 @@ mod tests {
         let mut config = proxy_config(
             Some("http://proxy.corp.test:3128"),
             Some("/etc/openshell/secrets/proxy-auth"),
-            None,
         );
-        config.proxy_auth_allow_insecure = None;
+        config.upstream_proxy.proxy_auth_allow_insecure = None;
         let err = config
-            .validate_proxy_config()
+            .validate_runtime_security_config()
             .expect_err("Basic auth to an http:// proxy is cleartext on the wire");
         assert!(err.contains("proxy_auth_allow_insecure"), "{err}");
-    }
-
-    #[tokio::test]
-    async fn proxy_ca_bundle_without_a_certificate_fails_the_sandbox() {
-        let dir = std::env::temp_dir().join(format!("openshell-vm-ca-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("not-a-ca.pem");
-        std::fs::write(&path, b"this is not a certificate\n").unwrap();
-
-        let err = read_sandbox_proxy_ca_bundle(path.to_str().unwrap())
-            .await
-            .expect_err("a certificate-free bundle must fail closed");
-        assert_eq!(err.code(), Code::InvalidArgument);
-        assert!(err.message().contains("no PEM certificate"), "{err}");
-
-        std::fs::write(&path, b"").unwrap();
-        let err = read_sandbox_proxy_ca_bundle(path.to_str().unwrap())
-            .await
-            .expect_err("an empty bundle must fail closed");
-        assert!(err.message().contains("no PEM certificate"), "{err}");
-
-        // PEM framing that base64-decodes but is not X.509 DER: accepted by
-        // `rustls_pemfile` alone, contributes zero trust anchors at runtime,
-        // and so would make every guest supervisor fail after boot.
-        std::fs::write(
-            &path,
-            b"-----BEGIN CERTIFICATE-----\nAQID\n-----END CERTIFICATE-----\n",
-        )
-        .unwrap();
-        let err = read_sandbox_proxy_ca_bundle(path.to_str().unwrap())
-            .await
-            .expect_err("a bundle with invalid DER must fail closed");
-        assert_eq!(err.code(), Code::InvalidArgument);
-        assert!(err.message().contains("no usable trust anchors"), "{err}");
-
-        let err = read_sandbox_proxy_ca_bundle(dir.join("missing.pem").to_str().unwrap())
-            .await
-            .expect_err("an unreadable bundle must fail closed");
-        assert!(err.message().contains("could not be read"), "{err}");
-
-        // A special file must be rejected on its type, not read: an
-        // unbounded read of /dev/zero would exhaust driver memory.
-        #[cfg(unix)]
-        {
-            let err = read_sandbox_proxy_ca_bundle("/dev/zero")
-                .await
-                .expect_err("a non-regular bundle path must fail closed");
-            assert_eq!(err.code(), Code::InvalidArgument);
-            assert!(err.message().contains("not a regular file"), "{err}");
-        }
-
-        // Oversized regular file: rejected on the stat'd length, again
-        // without reading it whole.
-        let oversized = dir.join("oversized.pem");
-        let bound = openshell_core::driver_utils::MAX_UPSTREAM_PROXY_CA_BUNDLE_BYTES;
-        std::fs::write(&oversized, vec![b'x'; usize::try_from(bound).unwrap() + 1]).unwrap();
-        let err = read_sandbox_proxy_ca_bundle(oversized.to_str().unwrap())
-            .await
-            .expect_err("an oversized bundle must fail closed");
-        assert_eq!(err.code(), Code::InvalidArgument);
-        assert!(err.message().contains("exceeds"), "{err}");
-
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -9441,7 +9418,6 @@ mod tests {
         let config = proxy_config(
             Some("http://proxy.corp.test:3128"),
             Some("/etc/openshell/secrets/proxy-auth"),
-            Some("/etc/openshell/tls/corp-ca.pem"),
         );
         let sandbox = Sandbox {
             id: "sb-proxy".to_string(),
@@ -9487,7 +9463,6 @@ mod tests {
             "proxy_auth_file",
             "proxy_auth_allow_insecure",
             "proxy_connect_by_hostname",
-            "proxy_ca_bundle",
         ] {
             let template = SandboxTemplate {
                 driver_config: Some(Struct {

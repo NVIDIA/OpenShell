@@ -29,7 +29,7 @@ GATEWAY_NAME="${OPENSHELL_DOCKER_GATEWAY_NAME:-docker-dev}"
 STATE_DIR="${OPENSHELL_DOCKER_GATEWAY_STATE_DIR:-${ROOT}/.cache/gateway-docker}"
 SANDBOX_NAMESPACE="${OPENSHELL_SANDBOX_NAMESPACE:-docker-dev}"
 SANDBOX_IMAGE="${OPENSHELL_SANDBOX_IMAGE:-ghcr.io/nvidia/openshell-community/sandboxes/base:latest}"
-SANDBOX_IMAGE_PULL_POLICY="${OPENSHELL_SANDBOX_IMAGE_PULL_POLICY:-IfNotPresent}"
+SANDBOX_IMAGE_PULL_POLICY="${OPENSHELL_SANDBOX_IMAGE_PULL_POLICY:-if_not_present}"
 LOG_LEVEL="${OPENSHELL_LOG_LEVEL:-info}"
 GATEWAY_BIN="${ROOT}/target/debug/openshell-gateway"
 
@@ -50,6 +50,18 @@ linux_target_triple() {
       exit 2
       ;;
   esac
+}
+
+# Escape a value for a TOML basic string before copying an operator-provided
+# proxy path or URL into the generated local configuration.
+toml_escape() {
+  local s=$1
+  s=${s//\\/\\\\}
+  s=${s//\"/\\\"}
+  s=${s//$'\n'/\\n}
+  s=${s//$'\r'/\\r}
+  s=${s//$'\t'/\\t}
+  printf '%s' "${s}"
 }
 
 port_is_in_use() {
@@ -211,7 +223,7 @@ mkdir -p "${STATE_DIR}"
 CONFIG_PATH="${STATE_DIR}/gateway.toml"
 cat >"${CONFIG_PATH}" <<EOF
 [openshell]
-version = 1
+version = 2
 
 [openshell.gateway]
 name = "${GATEWAY_NAME}"
@@ -234,7 +246,31 @@ image_pull_policy = "${SANDBOX_IMAGE_PULL_POLICY}"
 sandbox_label = "${SANDBOX_NAMESPACE}"
 grpc_endpoint = "${GRPC_ENDPOINT}"
 supervisor_bin = "${SUPERVISOR_BIN}"
+# Explicit supervisor-compatible default. Set RuntimeDefault or
+# Localhost/<profile> only on a Docker host with AppArmor enabled.
+app_armor_profile = "Unconfined"
 EOF
+
+# Keep the local task's proxy inputs aligned with [openshell.drivers.docker].
+# Credentials stay in the referenced root-owned file; do not echo their value.
+if [[ -n "${OPENSHELL_SANDBOX_HTTPS_PROXY+x}" ]]; then
+  printf 'https_proxy = "%s"\n' "$(toml_escape "${OPENSHELL_SANDBOX_HTTPS_PROXY}")" >>"${CONFIG_PATH}"
+fi
+if [[ -n "${OPENSHELL_SANDBOX_NO_PROXY+x}" ]]; then
+  printf 'no_proxy = "%s"\n' "$(toml_escape "${OPENSHELL_SANDBOX_NO_PROXY}")" >>"${CONFIG_PATH}"
+fi
+if [[ -n "${OPENSHELL_SANDBOX_PROXY_AUTH_FILE+x}" ]]; then
+  printf 'proxy_auth_file = "%s"\n' "$(toml_escape "${OPENSHELL_SANDBOX_PROXY_AUTH_FILE}")" >>"${CONFIG_PATH}"
+fi
+if [[ -n "${OPENSHELL_SANDBOX_PROXY_AUTH_ALLOW_INSECURE+x}" ]]; then
+  printf 'proxy_auth_allow_insecure = %s\n' "${OPENSHELL_SANDBOX_PROXY_AUTH_ALLOW_INSECURE}" >>"${CONFIG_PATH}"
+fi
+if [[ -n "${OPENSHELL_SANDBOX_PROXY_CONNECT_BY_HOSTNAME+x}" ]]; then
+  printf 'proxy_connect_by_hostname = %s\n' "${OPENSHELL_SANDBOX_PROXY_CONNECT_BY_HOSTNAME}" >>"${CONFIG_PATH}"
+fi
+if [[ -n "${OPENSHELL_PROVIDER_SPIFFE_WORKLOAD_API_SOCKET+x}" ]]; then
+  printf 'provider_spiffe_workload_api_socket = "%s"\n' "$(toml_escape "${OPENSHELL_PROVIDER_SPIFFE_WORKLOAD_API_SOCKET}")" >>"${CONFIG_PATH}"
+fi
 
 append_local_otlp_config_if_available "${CONFIG_PATH}"
 
@@ -256,6 +292,6 @@ exec "${GATEWAY_BIN}" \
   --config "${CONFIG_PATH}" \
   --port "${PORT}" \
   --log-level "${LOG_LEVEL}" \
-  --drivers docker \
+  --compute-driver docker \
   --disable-tls \
   --db-url "sqlite:${STATE_DIR}/gateway.db?mode=rwc"

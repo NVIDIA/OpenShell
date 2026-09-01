@@ -127,11 +127,11 @@ defines the available implementation set, while the runtime consumes a generic
 registry. Adding or removing a compiled driver therefore changes registration
 rather than the server's selection flow. Alternate gateway binaries can install
 their own `ComputeDriverFactory` registrations and hand the completed registry
-to `run_cli_with_compute_drivers`; factories receive merged driver config and
-return either an in-process driver or a gateway-managed remote endpoint. The
-server constructs the common runtime adapter and snapshots `GetCapabilities`
-for either result. A configured UDS endpoint still takes precedence over a
-compiled registration with the same name.
+to `run_cli_with_compute_drivers`; factories receive only the selected
+`[openshell.drivers.<name>]` table and return either an in-process driver or a
+gateway-managed remote endpoint. The server constructs the common runtime
+adapter and snapshots `GetCapabilities` for either result. A configured UDS
+endpoint still takes precedence over a compiled registration with the same name.
 
 The `openshell-gateway` composition crate groups first-party registrations
 behind the `in-tree-compute-drivers` feature. `openshell-server` has no compute
@@ -251,7 +251,7 @@ delete, reconciliation removes the row; otherwise it can remain `Deleting`.
 | Podman | Rootless or single-machine deployments. | Container plus nested sandbox namespace. | Uses the Podman REST API and CDI GPU devices when available. Delivers the supervisor via OCI image volume by default; falls back to extracting the binary to a host-side cache and bind-mounting it when `userns` is configured (overlay does not support idmapped mounts). Advertises the combined-supervisor policy-DNS and transparent-TCP substrate. |
 | Kubernetes | Cluster deployment through Helm. | Pod plus nested sandbox namespace. | Uses Kubernetes API objects, service accounts, secrets, PVC-backed workspace storage, and GPU resources. |
 | VM | Experimental microVM isolation. | Per-sandbox libkrun VM. | Managed endpoint-backed driver. The gateway spawns `openshell-driver-vm`, waits for its Unix socket, and then consumes it through the same remote `compute_driver.proto` path used by unmanaged endpoint drivers. The VM driver boots a cached bootstrap `rootfs.ext4`, prepares requested OCI images inside a bootstrap VM with `umoci`, attaches the prepared image disk read-only, and gives each sandbox a writable `overlay.ext4` for merged-root changes and runtime material. The driver persists each accepted launch request beside the overlay and restarts those VMs on driver startup without recreating the overlay. |
-| Extension | Out-of-tree drivers operated alongside the gateway. | Whatever boundary the driver implements. | Selected by a custom `compute_driver = "<name>"` entry with `[openshell.drivers.<name>].socket_path`, or at launch time by pairing `--drivers <name>` with `--compute-driver-socket=<path>`. A launch-time endpoint may use a canonical built-in name to preserve its driver-config key while replacing in-process construction. The gateway connects to an operator-provisioned UDS, snapshots `GetCapabilities`, and dispatches all sandbox lifecycle calls through `compute_driver.proto`. The driver process and socket lifecycle are operator-owned; the gateway does not spawn, supervise, or remove unmanaged extension drivers. The trust boundary is the socket's filesystem permissions: the operator must ensure only the gateway uid can read/write it. |
+| Extension | Out-of-tree drivers operated alongside the gateway. | Whatever boundary the driver implements. | Selected by a custom `compute_driver = "<name>"` entry with `[openshell.drivers.<name>].socket_path`, or at launch time by pairing `--compute-driver <name>` with `--compute-driver-socket=<path>`. A launch-time endpoint may use a canonical built-in name to preserve its driver-config key while replacing in-process construction. The gateway connects to an operator-provisioned UDS, snapshots `GetCapabilities`, and dispatches all sandbox lifecycle calls through `compute_driver.proto`. The driver process and socket lifecycle are operator-owned; the gateway does not spawn, supervise, or remove unmanaged extension drivers. The trust boundary is the socket's filesystem permissions: the operator must ensure only the gateway uid can read/write it. |
 
 Per-sandbox CPU and memory values currently enter the driver layer through
 template resource limits. Docker and Podman apply them as runtime limits.
@@ -288,10 +288,21 @@ pinned dialing, relay behavior, and OCSF decisions. Docker and Podman advertise
 they implement and validate the same complete contract. The capability marker
 is driver-owned supervisor input and is removed from workload environments.
 
-Kubernetes deployments may set an AppArmor profile on sandbox agent containers
-through the driver configuration. The Helm chart defaults sandbox agents to
-`Unconfined` so runtime/default AppArmor profiles do not block supervisor
-network namespace setup on AppArmor-enabled nodes.
+Kubernetes, Docker, and Podman share one AppArmor configuration model:
+`RuntimeDefault`, `Unconfined`, or `Localhost/<profile>`. Each driver translates
+that model to its native API and rejects a requested confined profile when its
+backend reports AppArmor unavailable. Docker and Podman use explicit
+`Unconfined` by default because their runtime-default profiles commonly block
+the supervisor's namespace mount setup; the Helm chart uses the same default.
+
+Corporate proxy settings are driver-owned supervisor inputs. Docker, Podman,
+and VM propagate `https_proxy`, `no_proxy`, an optional root-only auth file,
+and the explicit cleartext-Basic-auth acknowledgement without allowing
+workload environment to override them. Local containers project provider SPIFFE
+through a dedicated host UNIX-socket parent mount. A VM cannot safely expose
+that host socket: it accepts only a separately operated, concrete TCP listener
+when `provider_spiffe_allow_guest_tcp = true` explicitly acknowledges guest
+access. Host-only sockets are never implicitly forwarded to VM guests.
 
 The Kubernetes deployment packaging has two ownership boundaries. The gateway
 chart owns the gateway workload, configuration, Services, PKI, and

@@ -90,7 +90,9 @@ sandbox_owner_from_passwd() {
         done < "$passwd_path"
     fi
 
-    printf '10001:10001\n'
+    # New images use the conventional sandbox UID. Existing images retain the
+    # sandbox account read above, including the legacy 10001:10001 identity.
+    printf '1000:1000\n'
 }
 
 source_overlay_env_if_present() {
@@ -103,6 +105,8 @@ source_overlay_env_if_present() {
 
 ensure_target_runtime() {
     local image_root="$1"
+    local sandbox_uid="${OPENSHELL_VM_SANDBOX_UID:-1000}"
+    local sandbox_gid="${OPENSHELL_VM_SANDBOX_GID:-$sandbox_uid}"
 
     mkdir -p \
         "$image_root/srv" \
@@ -119,14 +123,22 @@ ensure_target_runtime() {
     fi
 
     touch "$image_root/etc/passwd" "$image_root/etc/group" "$image_root/etc/shadow" "$image_root/etc/gshadow"
-    if ! grep -q '^sandbox:' "$image_root/etc/group" 2>/dev/null; then
-        printf 'sandbox:x:10001:\n' >> "$image_root/etc/group"
+    # This is a newly prepared target image, so replace a baked-in legacy
+    # sandbox account with the identity selected by the driver. Persisted
+    # overlays do not take this path; setup_sandbox_workdir preserves their
+    # existing 10001:10001 account instead.
+    if grep -q '^sandbox:' "$image_root/etc/group" 2>/dev/null; then
+        sed -i "s|^sandbox:.*|sandbox:x:${sandbox_gid}:|" "$image_root/etc/group"
+    else
+        printf 'sandbox:x:%s:\n' "$sandbox_gid" >> "$image_root/etc/group"
     fi
     if ! grep -q '^sandbox:' "$image_root/etc/gshadow" 2>/dev/null; then
         printf 'sandbox:!::\n' >> "$image_root/etc/gshadow"
     fi
-    if ! grep -q '^sandbox:' "$image_root/etc/passwd" 2>/dev/null; then
-        printf 'sandbox:x:10001:10001:OpenShell Sandbox:/sandbox:/bin/sh\n' >> "$image_root/etc/passwd"
+    if grep -q '^sandbox:' "$image_root/etc/passwd" 2>/dev/null; then
+        sed -i "s|^sandbox:.*|sandbox:x:${sandbox_uid}:${sandbox_gid}:OpenShell Sandbox:/sandbox:/bin/sh|" "$image_root/etc/passwd"
+    else
+        printf 'sandbox:x:%s:%s:OpenShell Sandbox:/sandbox:/bin/sh\n' "$sandbox_uid" "$sandbox_gid" >> "$image_root/etc/passwd"
     fi
     if ! grep -q '^sandbox:' "$image_root/etc/shadow" 2>/dev/null; then
         printf 'sandbox:!:20123:0:99999:7:::\n' >> "$image_root/etc/shadow"
@@ -136,7 +148,7 @@ ensure_target_runtime() {
     owner="$(sandbox_owner_for_root "$image_root")"
     if chown -R "$owner" "$image_root/sandbox" 2>/dev/null; then
         owner_normalized=1
-    elif chown -R 10001:10001 "$image_root/sandbox" 2>/dev/null; then
+    elif chown -R 1000:1000 "$image_root/sandbox" 2>/dev/null; then
         owner_normalized=1
     fi
     chmod 0755 "$image_root/sandbox"
@@ -275,16 +287,14 @@ exec_supervisor_in_newroot() {
                 "${bootstrap}/lib64/ld-linux-aarch64.so.1"; do
                 if [ -x "/newroot${loader}" ]; then
                     lib_path="${bootstrap}/lib:${bootstrap}/lib64:${bootstrap}/usr/lib:${bootstrap}/usr/lib64:${bootstrap}/lib/aarch64-linux-gnu:${bootstrap}/lib/x86_64-linux-gnu:${bootstrap}/usr/lib/aarch64-linux-gnu:${bootstrap}/usr/lib/x86_64-linux-gnu"
-                    exec "$chroot_bin" /newroot "$loader" --library-path "$lib_path" \
-                        "$supervisor" --workdir /sandbox "${SUPERVISOR_EXTRA_ARGS[@]+"${SUPERVISOR_EXTRA_ARGS[@]}"}"
+                    exec "$chroot_bin" /newroot "$loader" --library-path "$lib_path" "$supervisor" "$@"
                 fi
             done
-            exec "$chroot_bin" /newroot "$supervisor" --workdir /sandbox "${SUPERVISOR_EXTRA_ARGS[@]+"${SUPERVISOR_EXTRA_ARGS[@]}"}"
+            exec "$chroot_bin" /newroot "$supervisor" "$@"
         fi
 
         if [ -x /newroot/opt/openshell/bin/openshell-sandbox ]; then
-            exec "$chroot_bin" /newroot /opt/openshell/bin/openshell-sandbox \
-                --workdir /sandbox "${SUPERVISOR_EXTRA_ARGS[@]+"${SUPERVISOR_EXTRA_ARGS[@]}"}"
+            exec "$chroot_bin" /newroot /opt/openshell/bin/openshell-sandbox "$@"
         fi
     done
 
@@ -617,10 +627,13 @@ setup_sandbox_workdir() {
     owner="$(sandbox_owner)"
     mkdir -p "$sandbox_dir"
     current_owner="$(stat -c '%u:%g' "$sandbox_dir" 2>/dev/null || true)"
+    if [ "$owner" = "10001:10001" ]; then
+        ts "preserving legacy sandbox ownership (10001:10001)"
+    fi
     if [ "$current_owner" != "$owner" ] \
         || [ ! -f "$(root_path "$SANDBOX_OWNER_NORMALIZED_MARKER")" ]; then
         if ! chown -R "$owner" "$sandbox_dir" 2>/dev/null; then
-            chown -R 10001:10001 "$sandbox_dir"
+            chown -R 1000:1000 "$sandbox_dir"
         fi
     fi
     chmod 0755 "$sandbox_dir"
@@ -897,12 +910,13 @@ if [ -n "${OPENSHELL_SANDBOX_ID:-}" ]; then
 fi
 
 read_supervisor_extra_args
+set -- --workdir /sandbox "${SUPERVISOR_EXTRA_ARGS[@]+"${SUPERVISOR_EXTRA_ARGS[@]}"}"
 
 ts "starting openshell-sandbox supervisor"
 if [ "${ROOT_PREFIX:-}" = "/newroot" ]; then
-    exec_supervisor_in_newroot
+    exec_supervisor_in_newroot "$@"
 fi
-exec /opt/openshell/bin/openshell-sandbox --workdir /sandbox "${SUPERVISOR_EXTRA_ARGS[@]+"${SUPERVISOR_EXTRA_ARGS[@]}"}"
+exec /opt/openshell/bin/openshell-sandbox "$@"
 }
 
 if [ "${1:-}" != "--post-overlay" ]; then

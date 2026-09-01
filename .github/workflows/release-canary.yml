@@ -31,7 +31,7 @@ jobs:
     steps:
       - name: Ensure VM driver
         run: |
-          launchctl setenv OPENSHELL_DRIVERS vm
+          launchctl setenv OPENSHELL_COMPUTE_DRIVER vm
           launchctl setenv OPENSHELL_TELEMETRY_ENABLED "$OPENSHELL_TELEMETRY_ENABLED"
 
       - name: Install and check status
@@ -53,7 +53,7 @@ jobs:
           fi
           sudo systemctl start docker || sudo service docker start
           mkdir -p "${HOME}/.config/openshell"
-          printf 'OPENSHELL_DRIVERS=docker\nOPENSHELL_TELEMETRY_ENABLED=%s\n' \
+          printf 'OPENSHELL_COMPUTE_DRIVER=docker\nOPENSHELL_TELEMETRY_ENABLED=%s\n' \
             "$OPENSHELL_TELEMETRY_ENABLED" > "${HOME}/.config/openshell/gateway.env"
           docker info
 
@@ -145,7 +145,7 @@ jobs:
             bash -s <<'EOF'
           set -euo pipefail
           mkdir -p "${HOME}/.config/openshell"
-          printf 'OPENSHELL_DRIVERS=podman\nOPENSHELL_TELEMETRY_ENABLED=%s\n' \
+          printf 'OPENSHELL_COMPUTE_DRIVER=podman\nOPENSHELL_TELEMETRY_ENABLED=%s\n' \
             "$OPENSHELL_TELEMETRY_ENABLED" > "${HOME}/.config/openshell/gateway.env"
           podman info
           curl -LsSf "${INSTALL_SH_URL}" | sh
@@ -301,7 +301,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p "${HOME}/.config/openshell"
-          printf 'OPENSHELL_DRIVERS=docker\n' > "${HOME}/.config/openshell/gateway.env"
+          printf 'OPENSHELL_COMPUTE_DRIVER=docker\n' > "${HOME}/.config/openshell/gateway.env"
           curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/${{ github.event.workflow_run.head_sha || github.sha }}/install.sh | sh
 
       - name: Register kind gateway and check status

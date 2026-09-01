@@ -27,13 +27,68 @@ impl GuestTlsPaths {
     }
 }
 
-impl From<&LocalTlsPaths> for GuestTlsPaths {
-    fn from(paths: &LocalTlsPaths) -> Self {
-        Self {
+impl GuestTlsPaths {
+    /// Resolve gateway-owned guest TLS inputs. Explicit TOML values take
+    /// precedence over the package-managed local bundle; partial bundles are
+    /// rejected before any driver is deserialized or constructed.
+    pub(crate) fn resolve(
+        gateway: Option<&config_file::GatewayFileSection>,
+        local: Option<&LocalTlsPaths>,
+        tls_disabled: bool,
+    ) -> std::result::Result<Option<Self>, String> {
+        let configured = gateway.map(|gateway| {
+            (
+                gateway.guest_tls_ca.as_ref(),
+                gateway.guest_tls_cert.as_ref(),
+                gateway.guest_tls_key.as_ref(),
+            )
+        });
+        let provided = configured
+            .is_some_and(|(ca, cert, key)| ca.is_some() || cert.is_some() || key.is_some());
+
+        if tls_disabled {
+            if provided {
+                return Err(
+                    "guest_tls_ca, guest_tls_cert, and guest_tls_key require gateway TLS; remove them or omit --disable-tls"
+                        .to_string(),
+                );
+            }
+            return Ok(None);
+        }
+
+        if let Some((ca, cert, key)) = configured
+            && (ca.is_some() || cert.is_some() || key.is_some())
+        {
+            let (Some(ca), Some(cert), Some(key)) = (ca, cert, key) else {
+                return Err(
+                    "guest TLS requires one complete bundle: guest_tls_ca, guest_tls_cert, and guest_tls_key"
+                        .to_string(),
+                );
+            };
+            for (field, path) in [
+                ("guest_tls_ca", ca),
+                ("guest_tls_cert", cert),
+                ("guest_tls_key", key),
+            ] {
+                if !path.is_file() {
+                    return Err(format!(
+                        "{field} '{}' does not exist or is not a file",
+                        path.display()
+                    ));
+                }
+            }
+            return Ok(Some(Self {
+                ca: ca.clone(),
+                cert: cert.clone(),
+                key: key.clone(),
+            }));
+        }
+
+        Ok(local.map(|paths| Self {
             ca: paths.ca.clone(),
             cert: paths.client_cert.clone(),
             key: paths.client_key.clone(),
-        }
+        }))
     }
 }
 
@@ -57,6 +112,7 @@ pub fn remote_driver_config_from_context(
             &file.openshell.gateway,
             file.openshell.drivers.get(name),
         );
+        reject_driver_owned_guest_tls_fields(&merged)?;
         if let Some(socket_path) = merged.get("socket_path").and_then(toml::Value::as_str) {
             cfg.socket_path = PathBuf::from(socket_path);
         }
@@ -100,11 +156,29 @@ where
         file.openshell.drivers.get(driver_name),
         inherited_config_keys,
     );
+    reject_driver_owned_guest_tls_fields(&merged)?;
     merged.try_into().map_err(|e| {
         Error::config(format!(
             "invalid [openshell.drivers.{driver_name}] table: {e}"
         ))
     })
+}
+
+/// Reject TLS paths in gateway driver tables. These credentials are gateway
+/// inputs and are injected only into the selected local driver after the
+/// gateway has validated the complete bundle.
+fn reject_driver_owned_guest_tls_fields(table: &toml::Value) -> Result<()> {
+    let Some(table) = table.as_table() else {
+        return Ok(());
+    };
+    for field in ["guest_tls_ca", "guest_tls_cert", "guest_tls_key"] {
+        if table.contains_key(field) {
+            return Err(Error::config(format!(
+                "{field} belongs in [openshell.gateway], not a [openshell.drivers.*] table"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn apply_remote_driver_overrides(
@@ -151,6 +225,30 @@ mod tests {
     }
 
     #[test]
+    fn gateway_guest_tls_requires_complete_bundle() {
+        let gateway = config_file::GatewayFileSection {
+            guest_tls_ca: Some(PathBuf::from("/tmp/ca.pem")),
+            ..Default::default()
+        };
+        let error = GuestTlsPaths::resolve(Some(&gateway), None, false)
+            .expect_err("partial guest TLS must fail");
+        assert!(error.contains("one complete bundle"));
+    }
+
+    #[test]
+    fn gateway_guest_tls_rejects_plaintext_gateway() {
+        let gateway = config_file::GatewayFileSection {
+            guest_tls_ca: Some(PathBuf::from("/tmp/ca.pem")),
+            guest_tls_cert: Some(PathBuf::from("/tmp/cert.pem")),
+            guest_tls_key: Some(PathBuf::from("/tmp/key.pem")),
+            ..Default::default()
+        };
+        let error = GuestTlsPaths::resolve(Some(&gateway), None, true)
+            .expect_err("guest TLS and plaintext gateway conflict");
+        assert!(error.contains("require gateway TLS"));
+    }
+
+    #[test]
     fn remote_driver_config_reads_socket_path_from_named_table() {
         let file: config_file::ConfigFile = toml::from_str(
             r#"
@@ -167,12 +265,9 @@ socket_path = "/run/openshell/kyma.sock"
     }
 
     #[test]
-    fn remote_driver_config_ignores_in_process_driver_fields() {
+    fn remote_driver_config_reads_only_socket_path() {
         let file: config_file::ConfigFile = toml::from_str(
             r#"
-[openshell.gateway]
-sandbox_namespace = "sandboxes"
-
 [openshell.drivers.kubernetes]
 socket_path = "/run/openshell/kubernetes.sock"
 workspace_mode = "shared"

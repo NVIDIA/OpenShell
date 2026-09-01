@@ -15,7 +15,7 @@
 #   systemctl --user edit openshell-gateway
 
 [openshell]
-version = 1
+version = 2
 
 [openshell.gateway]
 # Keep the primary listener on the built-in 127.0.0.1:17670 default. The
@@ -26,3 +26,8 @@ version = 1
 # in order: Kubernetes, Podman, Docker. Pinning prevents unexpected driver
 # selection if Docker is also installed on the host.
 compute_driver = "podman"
+
+[openshell.drivers.podman]
+# Keep the packaged local-gateway readiness behavior after health checks became
+# opt-in in the Podman driver. Omit this setting only to disable health checks.
+health_check_interval_secs = 10

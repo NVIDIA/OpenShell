@@ -412,13 +412,13 @@ class Openshell < Formula
     gateway_config = var/"openshell/gateway.toml"
     gateway_config_contents = <<~TOML
       [openshell]
-      version = 1
+      version = 2
 
       [openshell.gateway]
     TOML
     legacy_ipv6_gateway_config_contents = <<~TOML
       [openshell]
-      version = 1
+      version = 2
 
       [openshell.gateway]
       bind_address = "[::1]:{LOCAL_GATEWAY_PORT}"

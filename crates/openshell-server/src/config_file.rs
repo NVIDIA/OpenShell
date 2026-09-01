@@ -6,9 +6,8 @@
 //! See `rfc/0003-gateway-configuration/README.md` for the file format. This
 //! module parses the file into [`ConfigFile`], rejects fields that must be
 //! supplied via env/CLI (database URL), and provides
-//! [`driver_table`] which overlays shared `[openshell.gateway]` defaults onto
-//! a `[openshell.drivers.<name>]` table so each driver crate's
-//! `Deserialize` impl sees a fully-populated table.
+//! [`driver_table`] which returns a driver-owned
+//! `[openshell.drivers.<name>]` table without gateway-level inheritance.
 //!
 //! The merge precedence for gateway process settings is:
 //! ```text
@@ -31,11 +30,10 @@ use openshell_core::{
     GatewayAuthConfig, GatewayInterceptorConfig, GatewayJwtConfig,
     GatewayProviderProfileSourceConfig, MtlsAuthConfig, OidcConfig, TlsConfig,
 };
-use serde::de::{SeqAccess, Visitor};
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde::{Deserialize, Serialize};
 
-/// Latest schema version this build understands.
-pub const SCHEMA_VERSION: u32 = 1;
+/// Gateway configuration schema version supported by this build.
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// Root of the gateway TOML config file.
 ///
@@ -53,8 +51,8 @@ pub struct ConfigFile {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OpenShellRoot {
-    /// Reserved for future schema migrations. Versions greater than
-    /// [`SCHEMA_VERSION`] are rejected at load time.
+    /// Gateway configuration schema version. Loaded files must set this to
+    /// [`SCHEMA_VERSION`].
     #[serde(default)]
     pub version: Option<u32>,
 
@@ -65,8 +63,8 @@ pub struct OpenShellRoot {
     pub supervisor: SupervisorFileSection,
 
     /// `[openshell.drivers.<name>]` tables — passed verbatim to each driver
-    /// crate's `Deserialize` impl after the gateway-side inheritance merge.
-    /// Stored as raw [`toml::Value`] so each driver can evolve its schema
+    /// crate's `Deserialize` impl. Stored as raw [`toml::Value`] so each
+    /// driver can evolve its schema
     /// independently of this crate.
     #[serde(default)]
     pub drivers: BTreeMap<String, toml::Value>,
@@ -81,9 +79,8 @@ pub struct OpenShellRoot {
 ///
 /// All fields are `Option<T>` so the loader can tell whether a key was set
 /// in the file (`Some`) or not (`None` — value is taken from CLI/env/default).
-///
-/// The fields under "Shared driver defaults" are inherited into
-/// `[openshell.drivers.<name>]` tables per [`inheritable_keys`].
+/// Driver-specific settings belong exclusively in
+/// `[openshell.drivers.<name>]` tables.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GatewayFileSection {
@@ -105,19 +102,9 @@ pub struct GatewayFileSection {
     pub log_level: Option<String>,
 
     // ── Drivers ──────────────────────────────────────────────────────────
-    /// Canonical TOML uses the singular `compute_driver = "..."`. The legacy
-    /// `compute_drivers = ["..."]` form remains accepted and is normalized to
-    /// this existing vector representation so Rust callers and runtime
-    /// validation retain their current behavior.
-    #[serde(
-        default,
-        rename = "compute_driver",
-        alias = "compute_drivers",
-        deserialize_with = "deserialize_compute_drivers",
-        serialize_with = "serialize_compute_drivers",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub compute_drivers: Option<Vec<String>>,
+    /// Explicit compute driver selection. `None` enables auto-detection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compute_driver: Option<String>,
     #[serde(default)]
     pub credential_drivers: Option<Vec<String>>,
     #[serde(default)]
@@ -126,11 +113,6 @@ pub struct GatewayFileSection {
     pub credential_storage: Option<toml::Table>,
 
     // ── Sandbox / SSH ────────────────────────────────────────────────────
-    /// Compatibility input for Kubernetes `namespace` and Docker
-    /// `sandbox_label`. Canonical configurations set those driver-owned
-    /// fields in their respective `[openshell.drivers.<name>]` tables.
-    #[serde(default)]
-    pub sandbox_namespace: Option<String>,
     #[serde(default)]
     pub ssh_session_ttl_secs: Option<u64>,
     #[serde(default)]
@@ -150,26 +132,7 @@ pub struct GatewayFileSection {
     #[serde(default)]
     pub enable_loopback_service_http: Option<bool>,
 
-    // ── Shared driver defaults (inherited into [openshell.drivers.<name>]) ─
-    #[serde(default)]
-    pub default_image: Option<String>,
-    #[serde(default)]
-    pub supervisor_image: Option<String>,
-    #[serde(default)]
-    pub client_tls_secret_name: Option<String>,
-    /// Compatibility input for Kubernetes `service_account_name`.
-    #[serde(default)]
-    pub service_account_name: Option<String>,
-    #[serde(default)]
-    pub host_gateway_ip: Option<String>,
-    /// Compatibility input for Kubernetes `enable_user_namespaces`.
-    #[serde(default)]
-    pub enable_user_namespaces: Option<bool>,
-    /// Lifetime (seconds) of the projected `ServiceAccount` token kubelet
-    /// writes for the `IssueSandboxToken` bootstrap exchange. Driver
-    /// clamps to `[600, 86400]`.
-    #[serde(default)]
-    pub sa_token_ttl_secs: Option<i64>,
+    // ── Sandbox client TLS ───────────────────────────────────────────────
     #[serde(default)]
     pub guest_tls_ca: Option<PathBuf>,
     #[serde(default)]
@@ -208,62 +171,6 @@ pub struct GatewayFileSection {
     // rejected in [`load`].
     #[serde(default)]
     pub database_url: Option<String>,
-}
-
-fn deserialize_compute_drivers<'de, D>(deserializer: D) -> Result<Option<Vec<String>>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    struct ComputeDriversVisitor;
-
-    impl<'de> Visitor<'de> for ComputeDriversVisitor {
-        type Value = Option<Vec<String>>;
-
-        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            formatter.write_str("a compute driver name or an array of compute driver names")
-        }
-
-        fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
-        where
-            E: serde::de::Error,
-        {
-            Ok(Some(vec![value.to_string()]))
-        }
-
-        fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
-        where
-            E: serde::de::Error,
-        {
-            Ok(Some(vec![value]))
-        }
-
-        fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
-        where
-            A: SeqAccess<'de>,
-        {
-            let mut drivers = Vec::new();
-            while let Some(driver) = sequence.next_element::<String>()? {
-                drivers.push(driver);
-            }
-            Ok(Some(drivers))
-        }
-    }
-
-    deserializer.deserialize_any(ComputeDriversVisitor)
-}
-
-fn serialize_compute_drivers<S>(
-    drivers: &Option<Vec<String>>,
-    serializer: S,
-) -> Result<S::Ok, S::Error>
-where
-    S: Serializer,
-{
-    match drivers {
-        Some(drivers) if drivers.len() == 1 => serializer.serialize_str(&drivers[0]),
-        Some(drivers) => drivers.serialize(serializer),
-        None => serializer.serialize_none(),
-    }
 }
 
 /// `[openshell.gateway.otlp]` section.
@@ -408,7 +315,11 @@ pub enum ConfigFileError {
         source: toml::de::Error,
     },
     #[error(
-        "unsupported gateway config version {version}; this build only supports version {SCHEMA_VERSION}"
+        "gateway config schema version is required; add `[openshell]` and `version = {SCHEMA_VERSION}`"
+    )]
+    MissingVersion,
+    #[error(
+        "unsupported gateway config version {version}; this build requires version {SCHEMA_VERSION}; migrate legacy fields to the version {SCHEMA_VERSION} schema"
     )]
     UnsupportedVersion { version: u32 },
     #[error(
@@ -424,6 +335,8 @@ pub enum ConfigFileError {
         field: &'static str,
         message: &'static str,
     },
+    #[error("invalid gateway config field `openshell.drivers.{name}`: expected a TOML table")]
+    InvalidDriverTable { name: String },
     #[error(
         "failed to read TLS CA certificate for supervisor middleware '{name}' from '{}': {source}",
         path.display()
@@ -447,8 +360,8 @@ pub enum ConfigFileError {
 
 /// Load and validate a TOML config file.
 ///
-/// Returns `Ok(ConfigFile::default())` for an empty file (the gateway then
-/// falls back entirely to CLI/env/built-in defaults).
+/// Configuration files must declare exactly [`SCHEMA_VERSION`]. Running
+/// without a config file still uses CLI, environment, and built-in defaults.
 #[cfg_attr(target_os = "windows", allow(clippy::result_large_err))]
 pub fn load(path: &Path) -> Result<ConfigFile, ConfigFileError> {
     let contents = std::fs::read_to_string(path).map_err(|source| ConfigFileError::Io {
@@ -456,17 +369,17 @@ pub fn load(path: &Path) -> Result<ConfigFile, ConfigFileError> {
         source,
     })?;
     if contents.trim().is_empty() {
-        return Ok(ConfigFile::default());
+        return Err(ConfigFileError::MissingVersion);
     }
     let file: ConfigFile = toml::from_str(&contents).map_err(|source| ConfigFileError::Parse {
         path: path.to_path_buf(),
         source,
     })?;
 
-    if let Some(version) = file.openshell.version
-        && version > SCHEMA_VERSION
-    {
-        return Err(ConfigFileError::UnsupportedVersion { version });
+    match file.openshell.version {
+        Some(SCHEMA_VERSION) => {}
+        Some(version) => return Err(ConfigFileError::UnsupportedVersion { version }),
+        None => return Err(ConfigFileError::MissingVersion),
     }
 
     if file.openshell.gateway.database_url.is_some() {
@@ -488,79 +401,39 @@ pub fn load(path: &Path) -> Result<ConfigFile, ConfigFileError> {
             message: "omit the field to use default encrypted gateway credential storage, or specify exactly one external credential driver",
         });
     }
+    if let Some((name, _)) = file
+        .openshell
+        .drivers
+        .iter()
+        .find(|(_, value)| !value.is_table())
+    {
+        return Err(ConfigFileError::InvalidDriverTable { name: name.clone() });
+    }
 
     Ok(file)
 }
 
-/// Build the merged TOML table for `driver` by overlaying inheritable
-/// `[openshell.gateway]` defaults onto `[openshell.drivers.<name>]`.
-///
-/// The returned [`toml::Value`] is a Table ready to feed into the driver's
-/// `Deserialize` impl — keys present in `raw` win over the gateway defaults.
-/// Keys outside [`inheritable_keys`] for this driver are never copied from
-/// the gateway section, which keeps each driver's `deny_unknown_fields`
-/// invariant intact.
+/// Return a driver's table without gateway-level inheritance.
+/// Driver-specific configuration belongs exclusively to
+/// `[openshell.drivers.<name>]` in schema version 2.
 pub fn driver_table(
-    driver_name: &str,
-    gateway: &GatewayFileSection,
+    _driver_name: &str,
+    _gateway: &GatewayFileSection,
     raw: Option<&toml::Value>,
 ) -> toml::Value {
-    driver_table_with_inherited_keys(driver_name, gateway, raw, &[])
+    match raw {
+        Some(toml::Value::Table(table)) => toml::Value::Table(table.clone()),
+        _ => toml::Value::Table(toml::Table::new()),
+    }
 }
 
 pub(crate) fn driver_table_with_inherited_keys(
-    _driver_name: &str,
+    driver_name: &str,
     gateway: &GatewayFileSection,
     raw: Option<&toml::Value>,
-    inheritable_keys: &[&str],
+    _inherited_config_keys: &[&str],
 ) -> toml::Value {
-    let mut merged = match raw {
-        Some(toml::Value::Table(table)) => table.clone(),
-        _ => toml::Table::new(),
-    };
-
-    for key in inheritable_keys {
-        if driver_field_is_present(&merged, key) {
-            continue;
-        }
-        if let Some(value) = gateway_inherited_value(gateway, key) {
-            merged.insert((*key).to_string(), value);
-        }
-    }
-
-    toml::Value::Table(merged)
-}
-
-fn driver_field_is_present(table: &toml::Table, key: &str) -> bool {
-    table.contains_key(key)
-        || (key == "sandbox_label" && table.contains_key("sandbox_namespace"))
-}
-
-fn gateway_inherited_value(g: &GatewayFileSection, key: &str) -> Option<toml::Value> {
-    match key {
-        "namespace" | "sandbox_namespace" | "sandbox_label" => {
-            g.sandbox_namespace.as_deref().map(string_value)
-        }
-        "default_image" => g.default_image.as_deref().map(string_value),
-        "supervisor_image" => g.supervisor_image.as_deref().map(string_value),
-        "client_tls_secret_name" => g.client_tls_secret_name.as_deref().map(string_value),
-        "service_account_name" => g.service_account_name.as_deref().map(string_value),
-        "host_gateway_ip" => g.host_gateway_ip.as_deref().map(string_value),
-        "enable_user_namespaces" => g.enable_user_namespaces.map(toml::Value::Boolean),
-        "sa_token_ttl_secs" => g.sa_token_ttl_secs.map(toml::Value::Integer),
-        "guest_tls_ca" => g.guest_tls_ca.as_deref().map(path_value),
-        "guest_tls_cert" => g.guest_tls_cert.as_deref().map(path_value),
-        "guest_tls_key" => g.guest_tls_key.as_deref().map(path_value),
-        _ => None,
-    }
-}
-
-fn string_value(s: &str) -> toml::Value {
-    toml::Value::String(s.to_owned())
-}
-
-fn path_value(p: &Path) -> toml::Value {
-    toml::Value::String(p.display().to_string())
+    driver_table(driver_name, gateway, raw)
 }
 
 #[cfg(test)]
@@ -568,7 +441,7 @@ mod tests {
     use super::*;
     use std::io::Write;
 
-    fn write_tmp(contents: &str) -> tempfile::NamedTempFile {
+    fn write_raw_tmp(contents: &str) -> tempfile::NamedTempFile {
         let mut tmp = tempfile::Builder::new()
             .suffix(".toml")
             .tempfile()
@@ -577,17 +450,38 @@ mod tests {
         tmp
     }
 
-    #[test]
-    fn empty_file_yields_default_config() {
-        let tmp = write_tmp("");
-        let file = load(tmp.path()).expect("empty file parses");
-        assert!(file.openshell.version.is_none());
-        assert!(file.openshell.gateway.bind_address.is_none());
-        assert!(file.openshell.drivers.is_empty());
+    fn write_tmp(contents: &str) -> tempfile::NamedTempFile {
+        if contents.contains("[openshell]") {
+            write_raw_tmp(contents)
+        } else {
+            write_raw_tmp(&format!("[openshell]\nversion = 2\n\n{contents}"))
+        }
     }
 
     #[test]
-    fn canonical_compute_driver_scalar_normalizes_to_existing_vector() {
+    fn empty_file_requires_schema_version() {
+        let tmp = write_raw_tmp("");
+        assert!(matches!(
+            load(tmp.path()),
+            Err(ConfigFileError::MissingVersion)
+        ));
+    }
+
+    #[test]
+    fn compute_driver_entries_must_be_tables() {
+        for value in ["\"not-a-table\"", "[\"also\", \"not-a-table\"]", "42"] {
+            let tmp = write_raw_tmp(&format!(
+                "[openshell]\nversion = 2\n\n[openshell.drivers]\ndocker = {value}\n"
+            ));
+            assert!(matches!(
+                load(tmp.path()),
+                Err(ConfigFileError::InvalidDriverTable { ref name }) if name == "docker"
+            ));
+        }
+    }
+
+    #[test]
+    fn canonical_compute_driver_is_singular() {
         let file: ConfigFile = toml::from_str(
             r#"
 [openshell.gateway]
@@ -597,64 +491,37 @@ compute_driver = "docker"
         .expect("canonical compute driver parses");
 
         assert_eq!(
-            file.openshell.gateway.compute_drivers,
-            Some(vec!["docker".to_string()])
+            file.openshell.gateway.compute_driver.as_deref(),
+            Some("docker")
         );
     }
 
     #[test]
-    fn legacy_compute_drivers_list_remains_accepted() {
-        for (input, expected) in [
-            ("compute_drivers = []", Vec::<String>::new()),
-            ("compute_drivers = [\"docker\"]", vec!["docker".to_string()]),
-            (
-                "compute_drivers = [\"docker\", \"podman\"]",
-                vec!["docker".to_string(), "podman".to_string()],
-            ),
-        ] {
-            let file: ConfigFile = toml::from_str(&format!("[openshell.gateway]\n{input}\n"))
-                .expect("legacy compute drivers parse");
-            assert_eq!(file.openshell.gateway.compute_drivers, Some(expected));
-        }
+    fn legacy_compute_drivers_list_is_rejected() {
+        let error =
+            toml::from_str::<ConfigFile>("[openshell.gateway]\ncompute_drivers = [\"docker\"]\n")
+                .expect_err("legacy compute_drivers must be rejected");
+        assert!(error.to_string().contains("compute_drivers"));
     }
 
     #[test]
-    fn compute_driver_rejects_non_string_values_with_a_clear_error() {
+    fn compute_driver_rejects_non_string_values() {
         let error = toml::from_str::<ConfigFile>(
             r"
 [openshell.gateway]
 compute_driver = 42
 ",
         )
-        .expect_err("compute driver must be a string or string array");
-
-        assert!(
-            error
-                .to_string()
-                .contains("a compute driver name or an array of compute driver names")
-        );
+        .expect_err("compute driver must be a string");
+        assert!(error.to_string().contains("invalid type"));
     }
 
     #[test]
-    fn canonical_and_legacy_compute_driver_names_are_rejected_together() {
-        let error = toml::from_str::<ConfigFile>(
-            r#"
-[openshell.gateway]
-compute_driver = "docker"
-compute_drivers = ["docker"]
-"#,
-        )
-        .expect_err("canonical and legacy names must not both be accepted");
-
-        assert!(error.to_string().contains("duplicate field"));
-    }
-
-    #[test]
-    fn compute_driver_serialization_uses_canonical_scalar_name() {
+    fn compute_driver_serialization_uses_scalar_name() {
         let file = ConfigFile {
             openshell: OpenShellRoot {
                 gateway: GatewayFileSection {
-                    compute_drivers: Some(vec!["docker".to_string()]),
+                    compute_driver: Some("docker".to_string()),
                     ..Default::default()
                 },
                 ..Default::default()
@@ -663,14 +530,13 @@ compute_drivers = ["docker"]
 
         let serialized = toml::to_string(&file).expect("config serializes");
         assert!(serialized.contains("compute_driver = \"docker\""));
-        assert!(!serialized.contains("compute_drivers"));
     }
 
     #[test]
     fn parses_full_example() {
         let toml = r#"
 [openshell]
-version = 1
+version = 2
 
 [openshell.gateway]
 bind_address = "0.0.0.0:8080"
@@ -678,7 +544,6 @@ health_bind_address = "0.0.0.0:8081"
 log_level = "info"
 compute_driver = "kubernetes"
 credential_drivers = ["kubernetes-secrets"]
-sandbox_namespace = "agents"
 grpc_rate_limit_requests = 120
 grpc_rate_limit_window_seconds = 60
 policy_validation_failure_mode = "retain_last_valid"
@@ -698,6 +563,10 @@ audience = "openshell-cli"
 
 [openshell.drivers.kubernetes]
 namespace = "agents"
+default_image = "ghcr.io/nvidia/openshell/sandbox:latest"
+supervisor_image = "ghcr.io/nvidia/openshell/supervisor:latest"
+client_tls_secret_name = "openshell-sandbox-tls"
+service_account_name = "openshell-sandbox"
 grpc_endpoint = "https://openshell-gateway.agents.svc:8080"
 
 [openshell.credential_drivers.kubernetes-secrets]
@@ -1056,6 +925,27 @@ nonsense = true
     }
 
     #[test]
+    fn rejects_removed_driver_fields_at_gateway_scope() {
+        for field in [
+            "sandbox_namespace = \"agents\"",
+            "default_image = \"sandbox:latest\"",
+            "supervisor_image = \"supervisor:latest\"",
+            "client_tls_secret_name = \"sandbox-tls\"",
+            "service_account_name = \"sandbox-sa\"",
+            "host_gateway_ip = \"10.0.0.1\"",
+            "enable_user_namespaces = true",
+            "sa_token_ttl_secs = 3600",
+        ] {
+            let tmp = write_tmp(&format!("[openshell.gateway]\n{field}\n"));
+            let err = load(tmp.path()).expect_err("gateway-scoped driver field must be rejected");
+            assert!(
+                matches!(err, ConfigFileError::Parse { .. }),
+                "field: {field}"
+            );
+        }
+    }
+
+    #[test]
     fn rejects_unknown_field_in_nested_gateway_jwt_table() {
         // Regression guard for the class of silent-misconfig bug fixed in
         // PR #1661: a key indented under the wrong table header (here,
@@ -1087,218 +977,41 @@ ssh_gateway_port = 8080
     }
 
     #[test]
-    fn rejects_unsupported_version() {
-        let toml = r"
-[openshell]
-version = 2
-";
-        let tmp = write_tmp(toml);
-        let err = load(tmp.path()).expect_err("version > 1 must be rejected");
+    fn rejects_legacy_version() {
+        let tmp = write_raw_tmp("[openshell]\nversion = 1\n");
+        let err = load(tmp.path()).expect_err("version 1 must be rejected");
         assert!(matches!(
             err,
-            ConfigFileError::UnsupportedVersion { version: 2 }
+            ConfigFileError::UnsupportedVersion { version: 1 }
         ));
     }
 
     #[test]
-    fn driver_table_inherits_gateway_defaults() {
-        let gateway = GatewayFileSection {
-            default_image: Some(
-                "ghcr.io/nvidia/openshell-community/sandboxes/base:latest".to_string(),
-            ),
-            supervisor_image: Some("ghcr.io/nvidia/openshell/supervisor:0.9".to_string()),
-            ..Default::default()
-        };
-        let raw = toml::toml! {
-            namespace = "agents"
-        };
-        let merged = driver_table_with_inherited_keys(
-            "alpha",
-            &gateway,
-            Some(&toml::Value::Table(raw)),
-            &["default_image", "supervisor_image"],
-        );
-        let table = merged.as_table().expect("table");
-        assert_eq!(
-            table.get("namespace").and_then(|v| v.as_str()),
-            Some("agents")
-        );
-        assert_eq!(
-            table.get("default_image").and_then(|v| v.as_str()),
-            Some("ghcr.io/nvidia/openshell-community/sandboxes/base:latest")
-        );
-        assert_eq!(
-            table.get("supervisor_image").and_then(|v| v.as_str()),
-            Some("ghcr.io/nvidia/openshell/supervisor:0.9")
-        );
-    }
-
-    #[test]
-    fn registered_driver_table_inherits_selected_gateway_defaults() {
-        let gateway = GatewayFileSection {
-            sandbox_namespace: Some("agents".to_string()),
-            default_image: Some(
-                "ghcr.io/nvidia/openshell-community/sandboxes/base:latest".to_string(),
-            ),
-            host_gateway_ip: Some("10.0.0.1".to_string()),
-            ..Default::default()
-        };
-        let merged = driver_table_with_inherited_keys(
-            "alpha",
-            &gateway,
-            None,
-            &["sandbox_label", "default_image", "host_gateway_ip"],
-        );
-        let table = merged.as_table().expect("table");
-        assert_eq!(
-            table.get("sandbox_label").and_then(|v| v.as_str()),
-            Some("agents")
-        );
-        assert_eq!(
-            table.get("default_image").and_then(|v| v.as_str()),
-            Some("ghcr.io/nvidia/openshell-community/sandboxes/base:latest")
-        );
-        assert_eq!(
-            table.get("host_gateway_ip").and_then(|v| v.as_str()),
-            Some("10.0.0.1")
-        );
-    }
-
-    #[test]
-    fn canonical_driver_label_overrides_legacy_gateway_default() {
-        let gateway = GatewayFileSection {
-            sandbox_namespace: Some("gateway-default".to_string()),
-            ..Default::default()
-        };
-        let raw = toml::toml! {
-            sandbox_label = "driver-specific"
-        };
-        let merged = driver_table_with_inherited_keys(
-            "docker",
-            &gateway,
-            Some(&toml::Value::Table(raw)),
-            &["sandbox_label"],
-        );
-        let table = merged.as_table().expect("table");
-        assert_eq!(
-            table.get("sandbox_label").and_then(toml::Value::as_str),
-            Some("driver-specific")
-        );
-        assert!(!table.contains_key("sandbox_namespace"));
-    }
-
-    #[test]
-    fn legacy_driver_label_suppresses_canonical_gateway_inheritance() {
-        let gateway = GatewayFileSection {
-            sandbox_namespace: Some("gateway-default".to_string()),
-            ..Default::default()
-        };
-        let raw = toml::toml! {
-            sandbox_namespace = "driver-specific"
-        };
-        let merged = driver_table_with_inherited_keys(
-            "docker",
-            &gateway,
-            Some(&toml::Value::Table(raw)),
-            &["sandbox_label"],
-        );
-        let table = merged.as_table().expect("table");
-        assert_eq!(
-            table
-                .get("sandbox_namespace")
-                .and_then(toml::Value::as_str),
-            Some("driver-specific")
-        );
-        assert!(!table.contains_key("sandbox_label"));
-    }
-
-    #[test]
-    fn registered_driver_table_can_select_network_defaults() {
-        let gateway = GatewayFileSection {
-            default_image: Some(
-                "ghcr.io/nvidia/openshell-community/sandboxes/base:latest".to_string(),
-            ),
-            host_gateway_ip: Some("192.168.127.254".to_string()),
-            ..Default::default()
-        };
-        let merged = driver_table_with_inherited_keys(
-            "beta",
-            &gateway,
-            None,
-            &["default_image", "host_gateway_ip"],
-        );
-        let table = merged.as_table().expect("table");
-        assert_eq!(
-            table.get("default_image").and_then(|v| v.as_str()),
-            Some("ghcr.io/nvidia/openshell-community/sandboxes/base:latest")
-        );
-        assert_eq!(
-            table.get("host_gateway_ip").and_then(|v| v.as_str()),
-            Some("192.168.127.254")
-        );
-    }
-
-    #[test]
-    fn driver_table_specific_value_overrides_gateway_default() {
-        let gateway = GatewayFileSection {
-            default_image: Some("gateway-default".to_string()),
-            ..Default::default()
-        };
+    fn driver_table_uses_only_driver_owned_values() {
         let raw = toml::toml! {
             default_image = "driver-specific"
+            socket_path = "/run/openshell/driver.sock"
         };
-        let merged = driver_table_with_inherited_keys(
+        let table = driver_table(
             "alpha",
-            &gateway,
+            &GatewayFileSection::default(),
             Some(&toml::Value::Table(raw)),
-            &["default_image"],
         );
+        let table = table.as_table().expect("driver table");
         assert_eq!(
-            merged
-                .as_table()
-                .unwrap()
-                .get("default_image")
-                .and_then(|v| v.as_str()),
+            table.get("default_image").and_then(toml::Value::as_str),
             Some("driver-specific")
         );
-    }
-
-    #[test]
-    fn driver_table_does_not_leak_keys_outside_allowlist() {
-        // Fields not selected by the registration must remain gateway-only.
-        let gateway = GatewayFileSection {
-            client_tls_secret_name: Some("openshell-sandbox-tls".to_string()),
-            ..Default::default()
-        };
-        let merged = driver_table_with_inherited_keys("alpha", &gateway, None, &["default_image"]);
-        assert!(
-            !merged
-                .as_table()
-                .unwrap()
-                .contains_key("client_tls_secret_name")
-        );
-    }
-
-    #[test]
-    fn remote_driver_table_does_not_inherit_gateway_defaults() {
-        let gateway = GatewayFileSection {
-            default_image: Some("gateway-default:1.0".to_string()),
-            host_gateway_ip: Some("10.0.0.1".to_string()),
-            ..Default::default()
-        };
-        let raw = toml::toml! {
-            socket_path = "/run/openshell/kyma.sock"
-        };
-
-        let merged = driver_table("kyma", &gateway, Some(&toml::Value::Table(raw)));
-        let table = merged.as_table().expect("table");
-
         assert_eq!(
-            table.get("socket_path").and_then(|v| v.as_str()),
-            Some("/run/openshell/kyma.sock")
+            table.get("socket_path").and_then(toml::Value::as_str),
+            Some("/run/openshell/driver.sock")
         );
-        assert!(!table.contains_key("default_image"));
-        assert!(!table.contains_key("host_gateway_ip"));
+    }
+
+    #[test]
+    fn driver_table_does_not_inject_gateway_values() {
+        let table = driver_table("alpha", &GatewayFileSection::default(), None);
+        assert!(table.as_table().expect("driver table").is_empty());
     }
 
     #[test]
@@ -1332,15 +1045,24 @@ version = 2
             );
         }
 
-        let drivers = gw
-            .compute_drivers
-            .as_ref()
-            .expect("compute_driver must be explicitly set in the RPM default config");
         assert_eq!(
-            drivers,
-            &["podman".to_string()],
+            gw.compute_driver.as_deref(),
+            Some("podman"),
             "RPM default must pin compute_driver to podman to prevent unexpected \
              driver selection when Docker is also installed"
+        );
+
+        let podman = driver_table(
+            "podman",
+            &config.openshell.gateway,
+            config.openshell.drivers.get("podman"),
+        );
+        assert_eq!(
+            podman
+                .get("health_check_interval_secs")
+                .and_then(toml::Value::as_integer),
+            Some(10),
+            "RPM defaults must retain Podman's readiness health check"
         );
     }
 }

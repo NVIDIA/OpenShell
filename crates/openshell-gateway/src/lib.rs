@@ -117,16 +117,6 @@ fn install_in_tree_compute_drivers(registry: &mut ComputeDriverRegistry) {
                 .with_telemetry_category(TelemetryComputeDriver::anonymous_category("kubernetes"))
                 .without_mtls_user_auth()
                 .with_in_process_tracing(openshell_driver_kubernetes::otel_tracing::TRACING)
-                .with_inherited_config_keys(&[
-                    "namespace",
-                    "default_image",
-                    "supervisor_image",
-                    "client_tls_secret_name",
-                    "service_account_name",
-                    "host_gateway_ip",
-                    "enable_user_namespaces",
-                    "sa_token_ttl_secs",
-                ])
         }),
         ComputeDriverRegistration::new(
             "podman",
@@ -139,14 +129,6 @@ fn install_in_tree_compute_drivers(registry: &mut ComputeDriverRegistry) {
                 .with_telemetry_category(TelemetryComputeDriver::anonymous_category("podman"))
                 .with_local_singleplayer()
                 .with_in_process_tracing(openshell_driver_podman::otel_tracing::TRACING)
-                .with_inherited_config_keys(&[
-                    "default_image",
-                    "supervisor_image",
-                    "host_gateway_ip",
-                    "guest_tls_ca",
-                    "guest_tls_cert",
-                    "guest_tls_key",
-                ])
         }),
         ComputeDriverRegistration::new(
             "docker",
@@ -159,26 +141,11 @@ fn install_in_tree_compute_drivers(registry: &mut ComputeDriverRegistry) {
                 .with_telemetry_category(TelemetryComputeDriver::anonymous_category("docker"))
                 .with_local_singleplayer()
                 .with_in_process_tracing(openshell_driver_docker::otel_tracing::TRACING)
-                .with_inherited_config_keys(&[
-                    "sandbox_label",
-                    "default_image",
-                    "supervisor_image",
-                    "host_gateway_ip",
-                    "guest_tls_ca",
-                    "guest_tls_cert",
-                    "guest_tls_key",
-                ])
         }),
         ComputeDriverRegistration::new("vm", u16::MAX, None, VmFactory).map(|registration| {
             registration
                 .with_telemetry_category(TelemetryComputeDriver::anonymous_category("vm"))
                 .with_local_singleplayer()
-                .with_inherited_config_keys(&[
-                    "default_image",
-                    "guest_tls_ca",
-                    "guest_tls_cert",
-                    "guest_tls_key",
-                ])
         }),
     ] {
         registry
